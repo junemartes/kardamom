@@ -190,15 +190,13 @@ public final class SealerWire {
     static final int RECORDED_CURSOR_LEN = RECORDED_THROUGH_OFFSET + Long.BYTES;
 
     /**
-     * Feature activation, a sequencer's system record:
+     * Feature activation, a system record:
      * {@code [kind:11][l1_origin:u64 LE][feature_id:u64 LE][activation_ms:u64 LE]}
      * ({@link #FEATURE_ACTIVATION_LEN} bytes). The upgrade transaction of the
      * epoch at {@code l1_origin} schedules {@code feature_id} at
-     * {@code activation_ms}. The sequencer sends it in front of that epoch,
-     * on the same session, and again each time it offers the epoch again.
-     * See {@link io.kardamom.sealer.DecisionRules}. A member that does not
-     * know the kind drops the frame. Matches Rust
-     * {@code KIND_FEATURE_ACTIVATION}.
+     * {@code activation_ms}. A member follows no feature: it takes the
+     * record and changes no state. A member that does not know the kind
+     * drops the frame. Matches Rust {@code KIND_FEATURE_ACTIVATION}.
      */
     public static final byte KIND_FEATURE_ACTIVATION = 11;
     /** Offset of the u64 LE L1 origin within a {@link #KIND_FEATURE_ACTIVATION} frame. */
@@ -407,14 +405,12 @@ public final class SealerWire {
     /**
      * The sealer's rules:
      * {@code [kind:17][decision_version:u8][cluster_session_id:i64 LE]}
-     * ({@link #SEALER_INFO_LEN} bytes). The service sends it under decision
-     * version 3, and after an activation also under version 2: to every
-     * open session at each switch, to each session when the session opens,
-     * and to every open session at each new term. It carries the id of that
-     * session, so a client ties it to its session whatever the order of its
-     * own session events. A state with no activation sends no frame of this
-     * kind. A sequencer reports the version that it got last for its
-     * current session. A reader that does not know the kind drops it.
+     * ({@link #SEALER_INFO_LEN} bytes). The service sends it to each session
+     * when the session opens, and to every open session at each new term.
+     * It carries the id of that session, so a client ties it to its session
+     * whatever the order of its own session events. A sequencer reports the
+     * version that it got last for its current session. A reader that does
+     * not know the kind drops it.
      * Matches Rust {@code EGRESS_KIND_SEALER_INFO}.
      */
     public static final byte EGRESS_KIND_SEALER_INFO = 17;

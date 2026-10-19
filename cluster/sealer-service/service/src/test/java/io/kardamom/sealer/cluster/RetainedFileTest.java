@@ -324,7 +324,7 @@ class RetainedFileTest {
             throws IOException {
         final RetainedEndpoint endpoint = RetainedEndpoint.start(new SegmentDir(source), () -> head, TOKEN);
         final MemberStatus status = new MemberStatus(0, MemberStatus.ROLE_LEADER, MemberStatus.ELECTION_CLOSED,
-            0, 0, MemberStatus.SnapshotVersions.of(0), MemberStatus.Rules.START, OptionalLong.empty());
+            0, 0, MemberStatus.SnapshotVersions.of(0), io.kardamom.sealer.DecisionRules.START_VIEW, OptionalLong.empty());
         try (AdminServer admin = AdminServer.start(0, () -> status, 0, Optional.of(endpoint))) {
             final URI peer = URI.create("http://127.0.0.1:" + admin.port());
             return new RetainedCopy(List.of(peer), copy.into(), TOKEN, 1).run(snapshot);

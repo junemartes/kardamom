@@ -186,7 +186,7 @@ class ClusterLogPurgeTest {
         try {
             return AdminServer.start(0, () -> new MemberStatus(node.index(), String.valueOf(node.role()),
                     String.valueOf(node.electionState()), node.commitPosition(), node.commitPosition(),
-                    MemberStatus.SnapshotVersions.of(0), MemberStatus.Rules.START, OptionalLong.empty()), 0L, Optional.empty());
+                    MemberStatus.SnapshotVersions.of(0), io.kardamom.sealer.DecisionRules.START_VIEW, OptionalLong.empty()), 0L, Optional.empty());
         } catch (final IOException e) {
             throw new UncheckedIOException(e);
         }

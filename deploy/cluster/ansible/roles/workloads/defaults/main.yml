@@ -346,14 +346,14 @@ workloads_gate_manifest_types: >-
   application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json,
   application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json
 
-# The services the upgrade check of FEATURE_SEALER_V3 reads: each job must
-# carry the job metas, and each live allocation must run that job version.
+# The services the upgrade check reads: each job must carry the job metas,
+# and each live allocation must run that job version.
 # chain_state_install: the release installs the KardamomChainState code with
 # the first setFeature system deposit on a genesis without it.
 workloads_upgrade_jobs:
   - name: sequencer
-    metas: [sealer_feature_activation, sealer_feature_off, nonce_burn]
-    does: send the feature activation, watch the rules switch on and off, and take a skip that uses its nonce
+    metas: [nonce_burn]
+    does: take a skip that uses its nonce
   - name: executor
     metas: [nonce_burn, chain_state_install]
     does: use the nonce of a skipped transaction and install the chain state code

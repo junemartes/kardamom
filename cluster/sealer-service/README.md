@@ -89,12 +89,10 @@ same layouts. All integers are little-endian. A frame starts with a one-byte kin
   - When the best cursor moves up, the sealer sends an egress kind 9 to every session. It prints `cluster RECORDED-CURSOR` at power-of-two counts of these moves.
   - The frame is shorter than a kind-0 frame. A sealer that does not know kind 9 drops it as malformed.
 - With `carryBytes`, a member drops kinds 6 and 9 as unknown kinds. Its snapshot holds no void ledger and no recorded cursor.
-- Kind 11: the feature activation is a system record of a sequencer. It has no guard header. See [Decision version](#decision-version).
-  - The upgrade transaction of the epoch at `l1_origin` schedules `feature_id` at `activation_ms`. The sequencer sends it in front of that epoch, on the same session, and again each time it offers the epoch again. An epoch that the sealer ordered is never offered again, so the record must not come after it.
-  - It applies only for `FEATURE_SEALER_V3` (2), only when `l1_origin` is the L1 origin of the state or that origin plus 1 (the epoch that it fronts), and only when `l1_origin` is above the origin of the newest activation that the state holds. The origins compare unsigned. So the copy of the twin, a record that comes again with its epoch, and the record of a later epoch change nothing. The copy of the twin is in time only while the first block of its epoch is open: see [Decision version](#decision-version) for a late record.
-  - It applies under version 2 and under version 3. It only stores the schedule: the rules switch at a block boundary. Its time replaces the time of the activation before it, as `KardamomChainState.setFeature` does, from the block after the first block of its epoch. So a record with a time ahead switches the rules off.
-  - A frame that is not 25 bytes is malformed. With `carryBytes`, a member drops kind 11 as an unknown kind.
-  - The session sends no identity, so the sealer cannot tell a sequencer session from another client. Any cluster client can already send kind 0 with any guard header, and kind 7. The cluster network is the trust boundary: it must admit only the services of the chain. The sealer does not check the record against L1; admin `/status` publishes the activation origin for a check outside the cluster.
+- Kind 11: the feature activation is a system record. It has no guard header. See [Decision version](#decision-version).
+  - The upgrade transaction of the epoch at `l1_origin` schedules `feature_id` at `activation_ms`. No sequencer sends it.
+  - The member follows no feature: the record changes no state. Each frame prints `cluster FEATURE-ACTIVATION` with the outcome `IGNORED`.
+  - A frame that is not 25 bytes is malformed.
 
 ### Relayed record types
 
@@ -135,9 +133,9 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 | 12 | Origin gap | `[kind=12][offered_origin:u64][expected_origin:u64]` | the offering session |
 | 13 | Record-lag reject | `[kind=13][sender:20][nonce:u64][sealed_index:u64][recorded_index:u64][budget:u64]` | the offering session |
 | 15 | Relayed reference | `[kind=15][index:u64][canonical_id:32][record_type:u8]` (42 bytes) | consumers, with `carryBytes` |
-| 17 | Sealer info | `[kind=17][decision_version:u8][cluster_session_id:i64]` (10 bytes) | after an activation, or under version 3: every session at each switch and at each new term, and each session when it opens |
+| 17 | Sealer info | `[kind=17][decision_version:u8][cluster_session_id:i64]` (10 bytes) | each session when it opens, and every session at each new term |
 
-- Kind 17: a sequencer reports the version that it got last for its current session (`kardamom_sequencer_sealer_version`). A member with no activation sends no kind 17. A reader that does not know kind 17 drops it.
+- Kind 17: a sequencer reports the version that it got last for its current session (`kardamom_sequencer_sealer_version`). A reader that does not know kind 17 drops it.
 
 - `index` is the 0-based canonical record index.
 - Consumers are the sessions that sent a kind 2 or a kind 1. While no consumer is known, the service sends relayed records to all sessions.
@@ -423,7 +421,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
   - When the variable is set, the deploy passes an empty `remoteOrigins`.
   - Every member mounts `/opt/kardamom/seed` read-only. The procedure is the runbook [`sealer-fleet-rebuild`](../../docs/runbooks/sealer-fleet-rebuild.md).
 - The deploy does not pass `dedupCapacity`, `voidWindow`, `readyLagBytes` or `joinWatchdogS`. They keep the code defaults. The deploy sets the bootstrap through the task file, not through the property.
-- The job spec names no decision version: every member starts on version 2, and the log switches it. The line `sealer decision rules` shows the version of the state after the start. See [Decision version](#decision-version).
+- The job spec names no decision version: every member runs version 3. The line `sealer decision rules` shows the version after the start. See [Decision version](#decision-version).
 - The Aeron settings that the node fixes: client sessions time out after 90 s, at most 256 sessions, an 8 MB log term, sparse ingress images, and the application version is 0.3.0.
 - One session message, its 32-byte session header included, holds at most 1 MiB: the 8 MB log term divided by 8.
   - A message above one MTU travels as many Aeron fragments. The consensus module and the service reassemble them.
@@ -500,46 +498,35 @@ The member list names each member by its Consul node name, for example `sealer-0
 
 ### Decision version
 
-Every member applies the same log. Two members on two rule versions can decide one entry differently, and the replicated state forks. So the version is replicated state: it changes only at a block boundary, at the same log index on every member. All the entries of one block run under one version.
+Every member applies the same log. Two members on two rule versions can decide one entry differently, and the replicated state forks.
 
-- Every member starts on version 2. No setting selects the version.
-- An upgrade transaction on L1 turns version 3 on or off: `ETHLockbox.initiateUpgrade` with feature `FEATURE_SEALER_V3` (2) and an activation time in ms. A time of 0, or a time in the past, turns it on at once. A time ahead turns it off until that time. The time `2^64 - 1` turns it off for good.
-  - The sequencer sends a feature activation (ingress kind 11) in front of the epoch that holds the upgrade, on the same session. It sends it again each time it offers the epoch again.
-  - The member takes the record only for the epoch that it fronts: its `l1_origin` is the L1 origin of the state, or that origin plus 1.
-  - The record only stores the schedule. The rules follow the executor, which reads the flag once per block: the flags of block N+1 are the chain state after block N, at the time of block N, the time that block N+1 executes with. The `setFeature` deposit runs in the first block of its epoch.
-  - So at the boundary of block N, the newest activation whose epoch is at or below the L1 origin of block N is visible. The rules of block N+1 are version 3 when such an activation exists and its time is 0 or at or below the time of block N, and version 2 otherwise. A time of 0 is due at once: `setFeature` resolves it to the time of the block of the deposit.
-  - So a deposit in block N switches the rules at block N+1 at the earliest. A time ahead switches them off from that block, and on again from the block after the first boundary at or after that time. The time `2^64 - 1` keeps them off.
-  - `crates/exec-core/testdata/feature_switch_blocks.txt` holds a block sequence with the switch block of each case. The Rust test `feature_switch_blocks` runs the executor rule (`BlockFeatures::read`) over it, and `FeatureSwitchBlocksTest` runs the sealer over it.
-  - A replay from any snapshot switches at the same boundaries. Each kind-11 frame prints `cluster FEATURE-ACTIVATION` with its outcome (`IGNORED` or `STORED`). Each switch prints `cluster DECISION-VERSION` with the new version.
-  - Each switch asks for a snapshot. Each member writes its own snapshot: a member of this release writes version 14 once it holds an activation. So a member that later rolls back to a release that reads only up to version 13 stops on its own snapshot, and does not replay the log with other rules.
-  - A member that runs an older release through the activation drops the record, writes version 10 and stays forked. No snapshot stops it. Only the upgrade check (`just sealer-upgrade-check`, below) guards that case.
-- Under version 2, the member relays a frame of kinds 0, 3, 4 and 5 that ends at the record type.
-- Under version 3, a relayed frame of kinds 0, 3, 4 and 5 needs its record-type byte. The minimum length follows the version of each entry, also after a switch back to version 2.
-- Before the first activation, the member sends no sealer info (egress kind 17). After it, the member reports its version in kind 17: to every open session at each switch, to each session when it opens, and to every open session at each new leadership term (a leader change can lose a frame of the old leader).
-- A member writes snapshot version 10 while its state holds no activation. After the activation record it writes version 14, which carries the rules. See [Snapshot](#snapshot).
-- The state holds the visible activation and the ones whose epoch is not sealed yet: at most three. Each epoch closes the first block of the epoch before it, so at most the epoch of the state and the next one wait.
-- A record that comes late is the record of a lost first copy, or a fault of the sequencer. The copy of the twin is in time only while the first block of its epoch is open. After that block is sealed, while the state is still in the epoch, the state stores it (`STORED_LATE`), and the rules switch at the next boundary, after the executor. After the next epoch got in, its epoch is below the epoch of the state: the state does not store it, and the rules do not follow it (`MISSED`). A record that comes when the state holds three activations changes nothing (`FULL`). Each of these prints `cluster FEATURE-ACTIVATION-LATE`, counts in `kardamom_sealer_feature_activation_late_total{member_id}` on `/metrics`, and shows in `decisionActivationsLate` on `/status`. Alert on any increase. Both versions decide the guard alike, so the cost is the window in which the sealer and the executor disagree on the relay shape.
-- The rule is safe while version 3 and version 2 decide every normal frame alike, as today: they differ only for a frame that ends at its record type, which no writer sends. Before a later rule of version 3 decides a normal frame differently from version 2, the schedule must move into the origin record (kind 4), so that it cannot come late. That is a follow-up.
-- A member with `carryBytes` runs version 3 from its start, and it drops kind 11. `carryBytes` comes with version 3, and every member must match it.
-- Admin `/status` reports `decisionVersion`, `decisionActivationOrigin` and `decisionActivationMs` (the newest activation that the state holds; both 0 while it holds none), and `decisionActivationsLate`. A check outside the cluster can compare the origin with the `setFeature` deposit of that epoch on L1.
+- Every member runs version 3 from its start. No setting selects the version, and no record changes it.
+- A relayed frame of kinds 0, 3, 4 and 5 needs its record-type byte. A frame that ends at the record type drops as malformed.
+- The member reports its version in the sealer info (egress kind 17): to each session when it opens, and to every open session at each new leadership term (a leader change can lose a frame of the old leader).
+- A feature activation record (ingress kind 11) changes no state. The member prints `cluster FEATURE-ACTIVATION` with the outcome `IGNORED`. No sequencer sends the record.
+- The snapshot is version 14: version 10, then the rules. See [Snapshot](#snapshot).
+- Admin `/status` reports `decisionVersion` (3), and `decisionActivationOrigin` and `decisionActivationMs`: the newest feature activation that the snapshot tail holds, both 0 when it holds none.
 
-The procedure of an upgrade transaction, on or off:
+`FEATURE_SEALER_V3` (feature id 2) is on for good on every network. The executor, the validator, the replay and the zk guest still read the flag at each block, so a replay of a block from before the activation, or from a time that the feature was off, uses no nonce on a skip. The sealer does not read the flag.
 
-1. Deploy the release that reads snapshot version 14 to every sealer member and every sequencer. Deploy the release that reads the flags once per block (frozen at the start of the block), uses the nonce of a skipped transaction and installs the chain state code to every executor, validator, ingress and sequencer. Roll the prover's zk guest and its verifying key to that release too: the guest links the same rule.
-2. Run `just sealer-upgrade-check <env>`. It must pass before the Safe signs the upgrade transaction.
-   - It reads admin `/status` of every configured member and refuses unless each one reports `snapshotReadsMax` of 14 or more. A member of an older release drops kind 11 and keeps version 2, so the state forks at the first entry that the two versions decide differently. A member of the release that reads up to 13 switches only on, at the record, and forks in the same way.
+- This release does not support an upgrade transaction of `FEATURE_SEALER_V3`, on or off. A member of an older release still switches its rules on kind 11 from a sequencer of an older release. In a mixed fleet, an off transaction forks the state. Off also stops the nonce burn: a sender is stuck after a skip at its chain nonce.
+- `just sealer-upgrade-check <env> <feature>` refuses feature 2.
+
+The procedure of an upgrade transaction of another feature:
+
+1. Deploy the release to every sealer member and to every executor, validator, ingress and sequencer. Roll the prover's zk guest and its verifying key to that release too: the guest links the same rules.
+2. Run `just sealer-upgrade-check <env> <feature>` with the feature id of the transaction. It must pass before the Safe signs the upgrade transaction.
+   - It refuses feature 2 (`FEATURE_SEALER_V3`), and a feature that is not a decimal number.
+   - It reads admin `/status` of every configured member and refuses unless each one reports `snapshotReadsMax` of 14 or more.
    - It refuses while a configured member is down.
-   - It refuses unless the sequencer job has the metas `sealer_feature_activation = "true"` and `sealer_feature_off = "true"`, and every live sequencer allocation runs that job version. An older sequencer sends no kind 11, or does not watch a switch off.
-   - It refuses unless the executor, validator, ingress and sequencer jobs have the meta `nonce_burn = "true"` and every live allocation of them runs that job version. An older executor or validator does not use the nonce of a skip and forks the state at the first one.
-   - It refuses unless the executor and validator jobs have the meta `chain_state_install = "true"` and every live allocation of them runs that job version. On a genesis without the `KardamomChainState` code, the upgrade deposit installs the code. An older executor or validator runs it as a call to an empty account and forks the state at that deposit.
-   - The release that brings `chain_state_install` also reads the flags once per block, frozen at the start of the block, which is the rule that the sealer follows. So this refusal also proves the frozen flags. An executor that reads the flag at each transaction uses the nonce of a skip in the block of the `setFeature` deposit, one block before the sealer switches.
+   - It refuses unless the executor, validator, ingress and sequencer jobs have the meta `nonce_burn = "true"` and every live allocation of them runs that job version.
+   - It refuses unless the executor and validator jobs have the meta `chain_state_install = "true"` and every live allocation of them runs that job version. On a genesis without the `KardamomChainState` code, the first upgrade deposit installs the code. An older executor or validator runs it as a call to an empty account and forks the state at that deposit.
    - The check does not cover the prover. Roll the zk guest and its verifying key with the executor release before the upgrade transaction.
-3. The Safe signs `ETHLockbox.initiateUpgrade(2, activation_ms)`.
-4. Check the switch: `decisionVersion` on admin `/status` of every member, and `kardamom_sequencer_sealer_version` on every sequencer: 3 after a switch on, 2 after a switch off. A sequencer whose sealer does not report the rules of the newest activation that it sent within 60 s after the switch logs a warning and counts `kardamom_sequencer_sealer_rules_missing_total`.
+3. The Safe signs `ETHLockbox.initiateUpgrade(feature, activation_ms)`.
 
-- After the activation record is in the log, a rollback of the sealer to an older release is not possible: its loader refuses snapshot version 14.
-- A sealer that starts from a seed file starts on version 2: the seed does not carry the rules. Send the upgrade transaction again.
-- The trust: any client of the cluster can send kind 11, as it can send kind 0 and kind 7. The sealer does not check the record against L1. The rule of the fronted epoch bounds when a record can apply, and the published origin lets a later check compare it with L1. The cluster network must admit only the services of the chain.
+- A rollback of the sealer to the release before this one is safe while `FEATURE_SEALER_V3` stays on: that release reads snapshot version 14 with version 3 and the held activation, and decides every entry as this release does.
+- A sealer that starts from a seed file, or at genesis, runs version 3.
+- The trust: any client of the cluster can send kind 11, as it can send kind 0 and kind 7. The record changes no state. The cluster network must admit only the services of the chain.
 
 | Version | Rule change |
 |---|---|
@@ -557,7 +544,7 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
 |---|---|
 | `GET /status` | Always 200 with the status JSON. |
 | `GET /ready` | 200 when the member is ready. 503 when it is not. The body is the status JSON. |
-| `GET /metrics` | 200 with the gauge `kardamom_sealer_disk_free_bytes{member_id}` and the counter `kardamom_sealer_feature_activation_late_total{member_id}` in the Prometheus text format. |
+| `GET /metrics` | 200 with the gauge `kardamom_sealer_disk_free_bytes{member_id}` in the Prometheus text format. |
 | `GET /retained` | With `carryBytes`: 200 with one `<name> <size>` line for each segment below the published head. `size` counts only the bytes below that head. 403 without the token. Else 404. |
 | `GET /retained/<name>` | With `carryBytes`: 200 with the bytes of one segment below the published head. 403 without the token. 404 for a name that is not a served segment, or a segment that the purge deleted. |
 | any other path | 404 |
@@ -567,8 +554,8 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
 - The retained file holds the bytes of every transaction above the posted head, and the server listens on all addresses. So each request under `/retained` must carry `Authorization: Bearer <KARDAMOM_RETAINED_TOKEN>`. The job passes the same token to every member.
   - The token and the segment bytes travel in cleartext HTTP on the node network. The token keeps out a client that does not have it. It does not hide the bytes from a host that reads the network.
 - `diskFreeBytes` is `null`, and the gauge is `NaN`, when the disk cannot be read. The member stays ready.
-- The status JSON has `memberId`, `role`, `election`, `commitPosition`, `servicePosition`, `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, `snapshotLatest`, `decisionVersion`, `decisionActivationOrigin`, `decisionActivationMs`, `decisionActivationsLate`, `diskFreeBytes` and `ready`.
-  - `decisionVersion` is the version of the rules of the member. `decisionActivationOrigin` and `decisionActivationMs` are the L1 origin and the time of the newest feature activation that the state holds, both 0 when it holds none. `decisionActivationsLate` counts the activation records that the rules follow late or not at all. See [Decision version](#decision-version).
+- The status JSON has `memberId`, `role`, `election`, `commitPosition`, `servicePosition`, `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, `snapshotLatest`, `decisionVersion`, `decisionActivationOrigin`, `decisionActivationMs`, `diskFreeBytes` and `ready`.
+  - `decisionVersion` is the version of the rules of the member: 3. `decisionActivationOrigin` and `decisionActivationMs` are the L1 origin and the time of the newest feature activation that the snapshot tail holds, both 0 when it holds none. See [Decision version](#decision-version).
   - `diskFreeBytes` is the free space of the disk of the cluster directory: the Raft log and the retained file. `/metrics` exports the same value.
   - `snapshotWrites`, `snapshotReadsMin` and `snapshotReadsMax` are the snapshot versions of this release, as `formats.toml` lists them.
   - `snapshotLatest` is the version of the newest snapshot this member restored or took. It is 0 before either.
@@ -678,12 +665,12 @@ The chaos suite and operators read these lines. The admin server also exports on
 
 ## Snapshot
 
-- The member reads snapshot versions 1 to 14. It writes version 10, version 14 after a feature activation is in the log, or version 12 with `carryBytes`.
-  - Version 14 is version 10, then the decision rules after the seed digest: `[decision_version:u8][sealed_origin:u64][held:u8]`, then `[origin:u64][time_ms:u64]` for each held activation, oldest first (at most three). The version is the version of the next block. `sealed_origin` is the L1 origin of the last sealed block: an activation at or below it is visible, and its time of 0 is resolved. A restore switches at the same boundaries as the member that wrote it. A member of an older release refuses it. See [Decision version](#decision-version).
-  - Version 13 is version 10, then `[decision_version:u8][activation_origin:u64][activation_ms:u64]`: the rules of the release before, with one activation. A restore takes that activation as the visible one.
+- The member reads snapshot versions 1 to 14. It writes version 14, or version 12 with `carryBytes`.
+  - Version 14 is version 10, then the decision rules after the seed digest: `[decision_version:u8][sealed_origin:u64][held:u8]`, then `[origin:u64][time_ms:u64]` for each held activation, oldest first (at most three). The member writes version 3 and `sealed_origin`, the L1 origin of the last sealed block. It keeps the held activations of the snapshot that it restored, and adds none. A member of the release before this one restores the same rules, and runs version 3 while `FEATURE_SEALER_V3` stays on. A tail of version 2 restores as version 3. See [Decision version](#decision-version).
+  - Version 13 is version 10, then `[decision_version:u8][activation_origin:u64][activation_ms:u64]`: one held activation.
   - Version 12 is the state section of version 10 without the void ledger, then the retention section of the retained file. A member with `carryBytes` takes no void request and no recorded cursor, so it holds neither.
-  - The writer stays one version behind the reader. A member of the previous release reads up to version 10, so it can restore every snapshot that this release writes. A rollback does not stop the old members.
-  - A version-10 snapshot holds no recorded cursor. A member that restores one has no cursor until the next cursor record. With the record-lag budget at `0` this changes no decision.
+  - This release does not write version 10. A member of the release before it restores version 10 with decision version 2.
+  - A version-14 snapshot, as a version-10 one, holds no recorded cursor. A member that restores one has no cursor until the next cursor record. With the record-lag budget at `0` this changes no decision.
   - The release that turns on the cursor publisher and the record-lag guard writes version 11. Before that release, a `recordLagBudget` above `0` stops the start.
   - A snapshot before version 9 restores a posted head of `0`. A snapshot before version 10 restores a state that started at genesis.
   - A snapshot before version 11 restores no recorded cursor. The record-lag guard then refuses nothing until the first cursor.

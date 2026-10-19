@@ -64,11 +64,6 @@ pub(crate) const RECEIPT_FLOORS_FORGOTTEN: &str =
 /// The decision version that the sealer reported for the current session,
 /// 0 before its report.
 pub(crate) const SEALER_VERSION: &str = "kardamom_sequencer_sealer_version";
-/// The switches of the sealer rules, by the feature activations that this
-/// replica sent, that the sealer did not report within 60 s: no version 3
-/// after a switch on, or version 3 after a switch off. Alert on any
-/// increase.
-pub(crate) const SEALER_RULES_MISSING: &str = "kardamom_sequencer_sealer_rules_missing_total";
 /// Contiguity rejects whose expected nonce stays above the chain nonce
 /// plus the refs in flight for the settle time: the sealer's nonce guard
 /// is ahead of the chain after a skip that used no nonce. While
@@ -254,10 +249,6 @@ pub(crate) fn record_floor_forgotten(partition: u32) {
 
 pub(crate) fn record_sealer_version(partition: u32, version: u8) {
     set(SEALER_VERSION, partition, f64::from(version));
-}
-
-pub(crate) fn record_sealer_rules_missing(partition: u32) {
-    bump(SEALER_RULES_MISSING, partition, 1);
 }
 
 pub(crate) fn record_sealer_nonce_ahead(partition: u32) {

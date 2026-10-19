@@ -156,19 +156,10 @@ public final class CanonicalSealerState {
      * version 10 with the decision rules of up to three activations after
      * the seed digest: see {@link DecisionRules#writeTo}.
      *
-     * <p>This is the newest version that {@link #load} reads. The writer
-     * can be one version behind: see {@link #SNAPSHOT_WRITE_VERSION}.</p>
+     * <p>This is the newest version that {@link #load} reads, and the
+     * version that {@link #takeSnapshot()} writes.</p>
      */
     private static final int SNAPSHOT_READ_VERSION = 14;
-
-    /**
-     * The version that {@link #takeSnapshot()} writes when the state holds
-     * a feature activation: version 10, then the decision rules. A state
-     * with no activation writes {@link #SNAPSHOT_WRITE_VERSION}. A loader
-     * that reads only up to version 13 refuses version 14, so the upgrade
-     * transaction comes only after every member reads version 14.
-     */
-    public static final int RULES_SNAPSHOT_VERSION = 14;
 
     /** The version with the decision rules of one activation; {@link #load} still reads it. */
     private static final int ONE_ACTIVATION_SNAPSHOT_VERSION = 13;
@@ -180,22 +171,24 @@ public final class CanonicalSealerState {
      */
     public static final int RETAINED_FILE_SNAPSHOT_VERSION = 12;
 
+    /** The only version that holds the recorded cursors. */
+    private static final int CURSORS_SNAPSHOT_VERSION = 11;
+
     /**
-     * The version that {@link #takeSnapshot()} writes. It stays one step
-     * behind {@link #SNAPSHOT_READ_VERSION}, so a member of the previous
-     * release, which reads up to version 10, can still restore every
-     * snapshot that this release writes. A rollback then does not stop the
-     * old members on the first new snapshot.
+     * The version that {@link #takeSnapshot()} writes: version 10, then the
+     * decision rules ({@link DecisionRules#writeTo}). A member of an older
+     * release that reads version 14 restores it with decision version 3.
+     * A member that restores version 10 would run decision version 2 there,
+     * so this release never writes version 10.
      *
-     * <p>A version-10 snapshot holds no recorded cursor, so a member that
-     * restores one has no cursor until the next cursor record. With the
-     * record-lag guard off (budget 0) that changes no decision: the guard
-     * refuses nothing, and the cursors reach only the status frame. With a
-     * budget above 0, a restored member could refuse less than its peers.
-     * So the release that turns the cursor publisher and the guard on also
-     * sets this value to 11, after every member reads version 11.</p>
+     * <p>Version 14 holds no recorded cursor, so a member that restores one
+     * has no cursor until the next cursor record. With the record-lag guard
+     * off (budget 0) that changes no decision: the guard refuses nothing,
+     * and the cursors reach only the status frame. With a budget above 0, a
+     * restored member could refuse less than its peers. So the guard needs a
+     * release that writes the cursors.</p>
      */
-    private static final int SNAPSHOT_WRITE_VERSION = 10;
+    private static final int SNAPSHOT_WRITE_VERSION = 14;
 
     /**
      * Whether {@link #takeSnapshot()} writes the recorded cursors. Only
@@ -203,7 +196,7 @@ public final class CanonicalSealerState {
      * snapshot without cursors refuses less than its peers that kept them.
      */
     public static boolean snapshotKeepsRecordedCursors() {
-        return SNAPSHOT_WRITE_VERSION >= 11;
+        return SNAPSHOT_WRITE_VERSION == CURSORS_SNAPSHOT_VERSION;
     }
 
     /** The oldest snapshot version that {@link #load} reads. */
@@ -957,53 +950,9 @@ public final class CanonicalSealerState {
         return voids;
     }
 
-    /** The version of the decision rules: see {@link DecisionRules}. */
-    public int decisionVersion() {
-        return rules.version();
-    }
-
     /** The decision rules as a value, for the admin endpoint. */
     public DecisionRules.View decisionRules() {
         return rules.view();
-    }
-
-    /**
-     * Run version 3 from the start: the rules of a member that keeps its
-     * retained frames in a file. Call it only on a state that started at
-     * genesis or from a seed, before the first log entry.
-     */
-    public void startOnNewestRules() {
-        rules = DecisionRules.newest();
-    }
-
-    /**
-     * Take a feature activation record. It only stores the schedule: the
-     * rules change at a block boundary ({@link #onTick}).
-     *
-     * @return what the record did
-     */
-    public DecisionRules.Outcome onFeatureActivation(final DecisionRules.FeatureActivation activation) {
-        return rules.onActivation(activation, l1Origin, lastL2Timestamp);
-    }
-
-    /**
-     * The decision version of an origin-advancing record offered at
-     * {@code leaderClockMillis}. The record opens a new block: when the open
-     * block holds a record, the record forces a boundary first, and runs
-     * under the rules that the boundary sets. It changes nothing.
-     */
-    public int decisionVersionOfOriginRecord(final long leaderClockMillis) {
-        return canonicalCount > lastBoundaryCount
-            ? rules.versionAtBoundary(l1Origin, lastL2Timestamp, nextL2Timestamp(leaderClockMillis))
-            : rules.version();
-    }
-
-    /**
-     * Whether the member tells each session the version of its rules
-     * (egress kind 17): under version 3, and after an activation.
-     */
-    public boolean reportsDecisionRules() {
-        return rules.reports();
     }
 
     /**
@@ -1040,17 +989,14 @@ public final class CanonicalSealerState {
      * produce block numbers that increase by one each time, with no
      * gaps.</p>
      *
-     * <p>The boundary closes its block and sets the decision rules of the
-     * next block: see {@link DecisionRules#atBoundary}. Every entry of a
-     * block runs under one version.</p>
+     * <p>The boundary seals its block: see {@link DecisionRules#atBoundary}.</p>
      */
     public Boundary onTick(long leaderClockMillis) {
         long l2Timestamp = nextL2Timestamp(leaderClockMillis);
         Boundary boundary = new Boundary(blockNumber, canonicalCount, l2Timestamp, l1Origin);
         blockNumber++;
         pruneExpired();
-        // The sealed block executed with the time of the boundary before it.
-        rules.atBoundary(l1Origin, lastL2Timestamp, l2Timestamp);
+        rules.atBoundary(l1Origin);
         lastL2Timestamp = l2Timestamp;
         lastBoundaryCount = canonicalCount;
         return boundary;
@@ -1548,13 +1494,9 @@ public final class CanonicalSealerState {
         return takeSnapshot(snapshotVersion());
     }
 
-    /**
-     * The version that {@link #takeSnapshot()} writes now:
-     * {@link #RULES_SNAPSHOT_VERSION} when the state holds a feature
-     * activation, else {@link #SNAPSHOT_WRITE_VERSION}.
-     */
+    /** The version that {@link #takeSnapshot()} writes: {@link #SNAPSHOT_WRITE_VERSION}. */
     public int snapshotVersion() {
-        return rules.holdsActivation() ? RULES_SNAPSHOT_VERSION : SNAPSHOT_WRITE_VERSION;
+        return SNAPSHOT_WRITE_VERSION;
     }
 
     /**
@@ -1576,8 +1518,8 @@ public final class CanonicalSealerState {
      */
     byte[] takeSnapshot(int version) {
         boolean withVoids = version != RETAINED_FILE_SNAPSHOT_VERSION;
-        boolean withCursors = version == 11;
-        boolean withRules = version == RULES_SNAPSHOT_VERSION;
+        boolean withCursors = version == CURSORS_SNAPSHOT_VERSION;
+        boolean withRules = version == SNAPSHOT_WRITE_VERSION;
         int idCount = dedup.size();
         int senderCount = expectedNonce.size();
         int remoteCount = remoteOrigins.size();
@@ -1861,20 +1803,15 @@ public final class CanonicalSealerState {
             state.seedStatus = seedStatusOf(buf.get());
             buf.get(state.seedDigest);
         }
-        if (version == 11) {
+        if (version == CURSORS_SNAPSHOT_VERSION) {
             state.recorded = RecordedCursors.readFrom(
                 buf, budgets.recordLagRecords(), state.voids::isVoter);
         }
         if (version == ONE_ACTIVATION_SNAPSHOT_VERSION) {
             state.rules = DecisionRules.readVersionThirteen(buf);
         }
-        if (version == RULES_SNAPSHOT_VERSION) {
+        if (version == SNAPSHOT_WRITE_VERSION) {
             state.rules = DecisionRules.readFrom(buf);
-        }
-        if (version == RETAINED_FILE_SNAPSHOT_VERSION) {
-            // Only a member with the retained file writes version 12, and
-            // such a member runs version 3 from its start.
-            state.rules = DecisionRules.newest();
         }
         // A version-1 snapshot (before the guard existed) restores an empty
         // guard map, so every sender re-seeds on its next record. This is
@@ -1887,8 +1824,8 @@ public final class CanonicalSealerState {
         // peer's anchor with an unknown lane cursor. The cursor seeds from
         // the peer's next record. A version-10 or older snapshot restores
         // no recorded cursor, so the record-lag guard refuses nothing until
-        // the first cursor. A snapshot before version 12 restores the
-        // rules of a state with no activation.
+        // the first cursor. A snapshot without the decision rules
+        // restores a state that holds no activation.
         state.canonicalCount = canonicalCount;
         state.restoredSnapshotVersion = version;
         return state;

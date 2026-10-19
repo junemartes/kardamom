@@ -68,12 +68,12 @@ pub const UPGRADE_TX_GAS_LIMIT: u64 = 1_000_000;
 /// Selector of `KardamomChainState.setFeature(uint256,uint64)`.
 pub const SET_FEATURE_SELECTOR: [u8; 4] = [0x8a, 0xfd, 0xb8, 0x54];
 
-/// Decision rules version 3 of the sealer, and the nonce burn of a skipped
-/// transaction. The sealer reads this feature from the feature activation
-/// record that the sequencer sends in front of the epoch. The executor
-/// reads it at each skip (`kardamom_exec_core::executor::Skip::burn_state`): a
-/// skip at the chain nonce of its sender then uses that nonce.
-/// It must match Java `DecisionRules.FEATURE_SEALER_V3`.
+/// The nonce burn of a skipped transaction. The executor reads it at each
+/// skip (`kardamom_exec_core::executor::Skip::burn_state`): a skip at the
+/// chain nonce of its sender then uses that nonce. The sealer runs decision
+/// version 3 on every chain and does not read this feature. A replay of a
+/// block reads it as the block did, so the executor keeps the check for
+/// all time.
 pub const FEATURE_SEALER_V3: u64 = 2;
 
 /// The length of `setFeature` calldata: the selector and two words.

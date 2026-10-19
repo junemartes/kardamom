@@ -32,12 +32,11 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use alloy_primitives::Address;
 use kardamom_cache::AppliedRollbacks;
-use kardamom_cluster_adapter::wire::SEALER_V3_DECISION_VERSION;
 use kardamom_types::ReceiptRollback;
 use serde::{Deserialize, Serialize};
 
@@ -78,10 +77,6 @@ pub fn elapsed_ms_saturating(now: Instant, since: Instant) -> u64 {
 pub struct SharedWatermark {
     count: Arc<AtomicU64>,
     lag_gap_ms: Arc<AtomicU64>,
-    /// The decision version that the sealer reported on the current
-    /// session, 0 before its report. The feed thread writes it; the epoch
-    /// lane reads it to see the switch of the sealer rules.
-    sealer_version: Arc<AtomicU8>,
 }
 
 impl SharedWatermark {
@@ -102,18 +97,6 @@ impl SharedWatermark {
     pub fn flag_lag(&self, gap_ms: u64) {
         self.lag_gap_ms.fetch_max(gap_ms, Ordering::AcqRel);
     }
-    /// Feed thread: the sealer reported `version` on the current session.
-    pub fn set_sealer_version(&self, version: u8) {
-        self.sealer_version.store(version, Ordering::Release);
-    }
-
-    /// Whether the sealer of the current session reported the rules of
-    /// [`kardamom_types::upgrades::FEATURE_SEALER_V3`] or newer.
-    #[must_use]
-    pub fn sealer_runs_v3(&self) -> bool {
-        self.sealer_version.load(Ordering::Acquire) >= SEALER_V3_DECISION_VERSION
-    }
-
     /// Controller: consume the pending lag flag, if any.
     #[must_use]
     pub fn take_lag(&self) -> Option<u64> {

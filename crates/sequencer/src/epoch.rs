@@ -54,8 +54,6 @@ use kardamom_types::{BPosition, EpochRecord};
 use crate::error::SequencerError;
 use crate::outbound::TxOrderingRefPublisher;
 use crate::pump::OriginLane;
-use crate::sealer_rules::ActivationWatch;
-use kardamom_cluster_adapter::wire::FeatureActivation;
 
 /// The most epochs the pump keeps without a boundary that confirms them.
 ///
@@ -131,9 +129,6 @@ pub struct EpochPump {
     /// How long a gap may stand before the pump reports it.
     grace: Duration,
     signals: Receiver<OriginSignal>,
-    /// The watch over the feature activations this lane offered; `None`
-    /// without a sealer that reports its rules.
-    rules: Option<ActivationWatch>,
 }
 
 impl EpochPump {
@@ -148,7 +143,6 @@ impl EpochPump {
             missing: None,
             grace: ORIGIN_GAP_GRACE,
             signals,
-            rules: None,
         };
         (tx, pump)
     }
@@ -158,15 +152,6 @@ impl EpochPump {
     #[must_use]
     pub fn with_gap_grace(self, grace: Duration) -> Self {
         Self { grace, ..self }
-    }
-
-    /// The same pump with a watch over the feature activations it offers.
-    #[must_use]
-    pub fn with_activation_watch(self, watch: ActivationWatch) -> Self {
-        Self {
-            rules: Some(watch),
-            ..self
-        }
     }
 
     /// Apply every signal the egress feed sent since the last call.
@@ -294,22 +279,14 @@ where
 {
     fn relay(&mut self, sub: &mut S, publ: &mut P) -> Result<bool, SequencerError> {
         self.take_signals();
-        let now = Instant::now();
-        if let Some(watch) = self.rules.as_mut() {
-            watch.check(now);
-        }
         let took = self.fill(sub)?;
         let Some(epoch) = self.to_offer() else {
             return Ok(took);
         };
-        let activation = FeatureActivation::sealer_rules_of(epoch);
         publ.try_publish_epoch(epoch)?;
         // `next` indexes the queue, which holds at most
         // `MAX_UNCONFIRMED_EPOCHS`.
         self.next += 1;
-        if let (Some(watch), Some(activation)) = (self.rules.as_mut(), activation) {
-            watch.on_offered(activation, now);
-        }
         Ok(true)
     }
 }

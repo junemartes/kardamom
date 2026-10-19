@@ -185,16 +185,16 @@ class SealerRecordLagTest {
     }
 
     /**
-     * The service writes a version-10 state section, so a member of the
+     * The service writes a version-14 state section, so a member of the
      * previous release restores it. The cursors do not survive the restore.
      */
     @Test
-    void a_snapshot_is_version_10_and_a_restore_writes_the_same_bytes() {
+    void a_snapshot_is_version_14_and_a_restore_writes_the_same_bytes() {
         start(BUDGET);
         users(0, 3);
         deliver(executor, IngressFrames.recordedCursorFrame(1, 2L));
         final byte[] snapshot = service.snapshot();
-        assertEquals(10, ByteBuffer.wrap(snapshot).getInt(4), "the state section is version 10");
+        assertEquals(14, ByteBuffer.wrap(snapshot).getInt(4), "the state section is version 14");
 
         final SealerClusteredService restored = new SealerClusteredService(
             64, 250, 0, Set.of(), VOTERS,

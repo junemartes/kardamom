@@ -191,14 +191,9 @@ pub const KIND_RECORDED_CURSOR: u8 = 9;
 /// Ingress kind: a sequencer's feature activation, a system record:
 /// `[kind:u8 = 11][l1_origin:u64][feature_id:u64][activation_ms:u64]`, 25
 /// bytes. The upgrade transaction of the epoch at `l1_origin` schedules
-/// `feature_id` at `activation_ms`. The sequencer sends it in front of
-/// that epoch, on the same session, each time it offers the epoch. For
-/// [`kardamom_types::upgrades::FEATURE_SEALER_V3`], the sealer only stores
-/// the schedule, and switches its decision rules at a block boundary, as
-/// the executor switches the flag: the deposit runs in the first block of
-/// the epoch, and takes effect from the block after it. A time ahead
-/// switches the rules off from that block, and on again at that time. A
-/// sealer that does not know the kind drops the frame.
+/// `feature_id` at `activation_ms`. No sequencer sends it: the sealer
+/// follows no feature, and a record of this kind changes no sealer state.
+/// A sealer that does not know the kind drops the frame.
 /// Matches Java `KIND_FEATURE_ACTIVATION`.
 pub const KIND_FEATURE_ACTIVATION: u8 = 11;
 /// Ingress kind: a replay request `[kind:u8 = 1][from_index:u64][from_block:u64]`.
@@ -350,20 +345,14 @@ pub const EGRESS_KIND_FEED_GAP: u8 = 16;
 
 /// Egress kind: the sealer's rules:
 /// `[kind:u8 = 17][decision_version:u8][cluster_session_id:i64]`
-/// ([`SEALER_INFO_LEN`] bytes). The sealer sends it under decision version
-/// 3, and after a feature activation also under version 2: to each open
-/// session at each switch, to each session when the session opens, and to
-/// each open session at each new term, with the id of that session. A
-/// sealer with no activation sends none. The id ties the frame to its
-/// session, so a frame that arrives before the client's session-start
-/// marker still counts. Matches Java
-/// `EGRESS_KIND_SEALER_INFO`.
+/// ([`SEALER_INFO_LEN`] bytes). The sealer sends it to each session when
+/// the session opens, and to each open session at each new term, with the
+/// id of that session. The id ties the frame to its session, so a frame
+/// that arrives before the client's session-start marker still counts.
+/// Matches Java `EGRESS_KIND_SEALER_INFO`.
 pub const EGRESS_KIND_SEALER_INFO: u8 = 17;
 /// Length of an [`EGRESS_KIND_SEALER_INFO`] frame.
 pub const SEALER_INFO_LEN: usize = 1 + 1 + 8;
-/// The decision version of the sealer after the activation of
-/// [`kardamom_types::upgrades::FEATURE_SEALER_V3`].
-pub const SEALER_V3_DECISION_VERSION: u8 = 3;
 
 /// Client-local kind: a new session starts:
 /// `[kind:u8 = 255][cluster_session_id:i64]`. The

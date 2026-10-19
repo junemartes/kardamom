@@ -34,11 +34,3 @@ def allocationGate = tasks.register('allocationGate', Test) {
 tasks.named('check') {
     dependsOn allocationGate
 }
-
-// FeatureSwitchBlocksTest reads the blocks that the Rust exec-core test
-// feature_switch_blocks also reads.
-tasks.named('test', Test) {
-    def featureSwitchBlocks = rootProject.file('../../crates/exec-core/testdata/feature_switch_blocks.txt')
-    inputs.file(featureSwitchBlocks)
-    systemProperty 'kardamom.featureSwitchBlocks', featureSwitchBlocks.canonicalPath
-}

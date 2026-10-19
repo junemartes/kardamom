@@ -48,20 +48,8 @@ final class MemberStatus {
     final long commitPosition;
     final long servicePosition;
     final SnapshotVersions snapshot;
-    /**
-     * The decision rules of the member, and the feature activation records
-     * that the rules follow late or not at all.
-     *
-     * @param view the version, and the origin and the time of the newest activation
-     * @param lateActivations the records that the rules follow late or not at all
-     */
-    record Rules(DecisionRules.View view, long lateActivations) {
-        /** The rules of a member with no activation. */
-        static final Rules START = new Rules(DecisionRules.START_VIEW, 0L);
-    }
-
-    /** The decision rules of the member. */
-    final Rules rules;
+    /** The decision rules of the member: the version, and the newest held activation. */
+    final DecisionRules.View rules;
     /**
      * The bytes that the member can still write to the disk of its retained
      * file and its log, or empty when the disk cannot be read.
@@ -75,7 +63,7 @@ final class MemberStatus {
             final long commitPosition,
             final long servicePosition,
             final SnapshotVersions snapshot,
-            final Rules rules,
+            final DecisionRules.View rules,
             final OptionalLong diskFreeBytes) {
         this.memberId = memberId;
         this.role = role;
@@ -110,26 +98,20 @@ final class MemberStatus {
             + ",\"snapshotReadsMin\":" + snapshot.readsMin()
             + ",\"snapshotReadsMax\":" + snapshot.readsMax()
             + ",\"snapshotLatest\":" + snapshot.latest()
-            + ",\"decisionVersion\":" + rules.view().version()
-            + ",\"decisionActivationOrigin\":" + Long.toUnsignedString(rules.view().activationOrigin())
-            + ",\"decisionActivationMs\":" + Long.toUnsignedString(rules.view().activationMs())
-            + ",\"decisionActivationsLate\":" + rules.lateActivations()
+            + ",\"decisionVersion\":" + rules.version()
+            + ",\"decisionActivationOrigin\":" + Long.toUnsignedString(rules.activationOrigin())
+            + ",\"decisionActivationMs\":" + Long.toUnsignedString(rules.activationMs())
             + ",\"diskFreeBytes\":" + diskFree("null")
             + ",\"ready\":" + isReady(lagBytes)
             + "}";
     }
 
-    /** The Prometheus text of the gauges and counters. An unknown value is {@code NaN}. */
+    /** The Prometheus text of the gauge. An unknown value is {@code NaN}. */
     String toMetrics() {
         return "# HELP kardamom_sealer_disk_free_bytes The free bytes of the disk of the member state.\n"
             + "# TYPE kardamom_sealer_disk_free_bytes gauge\n"
             + "kardamom_sealer_disk_free_bytes{member_id=\"" + memberId + "\"} "
-            + diskFree("NaN") + "\n"
-            + "# HELP kardamom_sealer_feature_activation_late_total The feature activation records that the "
-            + "decision rules follow late or not at all. Alert on any increase.\n"
-            + "# TYPE kardamom_sealer_feature_activation_late_total counter\n"
-            + "kardamom_sealer_feature_activation_late_total{member_id=\"" + memberId + "\"} "
-            + rules.lateActivations() + "\n";
+            + diskFree("NaN") + "\n";
     }
 
     /** The free bytes as text, or {@code unknown} when the disk cannot be read. */

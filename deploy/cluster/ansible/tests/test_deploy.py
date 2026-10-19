@@ -1276,50 +1276,53 @@ class RecordTest(Deploys):
         self.assertIn('the registered sealer job names decisionVersion=3', output)
         self.assertEqual(self.api.state['writes'], [])
 
-    def test_the_upgrade_check_passes_on_a_release_that_takes_the_activation(self):
+    def upgrade_check(self, success=True, feature='3'):
+        """Run the upgrade check for an upgrade transaction of `feature`."""
+        return self.run_deploy(playbook='upgrade-check.yml', success=success,
+                               environ={'KARDAMOM_UPGRADE_FEATURE': feature})
+
+    def test_the_upgrade_check_passes_on_a_release_that_takes_the_upgrade(self):
         self.deploy()
-        output = self.run_deploy(playbook='upgrade-check.yml')
+        output = self.upgrade_check()
         self.assertIn('The upgrade check passed: 3 sealer members read snapshot version 14', output)
         self.assertIn('the live allocations of sequencer, executor, validator, ingress', output)
+        self.assertIn('The upgrade transaction of feature 3 may go to the Safe', output)
+
+    def test_the_upgrade_check_refuses_the_sealer_feature_and_a_missing_feature(self):
+        """FEATURE_SEALER_V3 stays on for good: no transaction of it, on or off."""
+        self.deploy()
+        output = self.upgrade_check(success=False, feature='2')
+        self.assertIn('FEATURE_SEALER_V3 (feature id 2) stays on for good', output)
+        output = self.upgrade_check(success=False, feature='')
+        self.assertIn('Name the feature id of the transaction', output)
 
     def test_the_upgrade_check_refuses_a_member_of_an_older_release(self):
         self.deploy()
         self.api.state['reads_max'] = {'node-cluster-1': 12}
-        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
+        output = self.upgrade_check(success=False)
         self.assertIn('a sealer member reads only up to snapshot version 12', output)
-
-    def test_the_upgrade_check_refuses_a_member_whose_rules_switch_only_on(self):
-        """A member of the release that reads snapshot version 13 switches its rules only on."""
-        self.deploy()
-        self.api.state['reads_max'] = {'node-cluster-2': 13}
-        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
-        self.assertIn('a sealer member reads only up to snapshot version 13', output)
 
     def test_the_upgrade_check_refuses_a_member_that_is_down(self):
         self.deploy()
         self.api.state['down_groups'] = ['cluster-2']
-        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
+        output = self.upgrade_check(success=False)
         self.assertIn('the sealer members cluster-2 do not run', output)
 
     def test_the_upgrade_check_refuses_a_sequencer_of_an_older_release(self):
         self.deploy()
         meta = self.api.state['jobs']['sequencer'].pop('Meta')
-        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
-        self.assertIn('the sequencer job does not send the feature activation', output)
-        self.assertIn('sealer_feature_activation, sealer_feature_off, nonce_burn', output)
-        self.api.state['jobs']['sequencer']['Meta'] = {'sealer_feature_activation': 'true', 'nonce_burn': 'true'}
-        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
-        self.assertIn('(job meta sealer_feature_off)', output)
+        output = self.upgrade_check(success=False)
+        self.assertIn('the sequencer job does not take a skip that uses its nonce (job meta nonce_burn)', output)
         self.api.state['jobs']['sequencer']['Meta'] = meta
         self.api.state['missing_replica'] = 'sequencer'
-        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
+        output = self.upgrade_check(success=False)
         self.assertIn('an allocation of an older job version still runs', output)
 
     def test_the_upgrade_check_refuses_an_executor_or_validator_that_does_not_burn(self):
         """An older executor or validator does not use the nonce of a skip, and forks at the first one."""
         self.deploy()
         meta = self.api.state['jobs']['executor'].pop('Meta')
-        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
+        output = self.upgrade_check(success=False)
         self.assertIn(
             'the executor job does not use the nonce of a skipped transaction and install the chain state code'
             ' (job meta nonce_burn, chain_state_install)',
@@ -1327,11 +1330,11 @@ class RecordTest(Deploys):
         )
         self.api.state['jobs']['executor']['Meta'] = meta
         self.api.state['jobs']['validator'].pop('Meta')
-        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
+        output = self.upgrade_check(success=False)
         self.assertIn('Deploy the release to every validator', output)
         self.api.state['jobs']['validator']['Meta'] = meta
         self.api.state['jobs']['ingress']['Meta'] = {'nonce_burn': 'false'}
-        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
+        output = self.upgrade_check(success=False)
         self.assertIn('the ingress job does not take a skip that uses its nonce', output)
 
     def test_the_upgrade_check_refuses_an_executor_or_validator_that_does_not_install_the_chain_state(self):
@@ -1340,11 +1343,11 @@ class RecordTest(Deploys):
         for job in ('executor', 'validator'):
             meta = self.api.state['jobs'][job]['Meta']
             self.api.state['jobs'][job]['Meta'] = {'nonce_burn': 'true'}
-            output = self.run_deploy(playbook='upgrade-check.yml', success=False)
+            output = self.upgrade_check(success=False)
             self.assertIn(f'the {job} job does not', output)
             self.assertIn('(job meta chain_state_install)', output)
             self.api.state['jobs'][job]['Meta'] = meta
-        output = self.run_deploy(playbook='upgrade-check.yml')
+        output = self.upgrade_check()
         self.assertIn('The upgrade check passed', output)
 
     def test_a_shard_map_change_refuses_the_rolling_path(self):

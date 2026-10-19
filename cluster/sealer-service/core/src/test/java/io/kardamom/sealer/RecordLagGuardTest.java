@@ -159,7 +159,7 @@ class RecordLagGuardTest {
     }
 
     @Test
-    void the_writer_writes_the_version_10_bytes_with_no_cursor_section() {
+    void the_writer_writes_no_cursor_section() {
         CanonicalSealerState with = state(BUDGET);
         CanonicalSealerState without = state(BUDGET);
         users(with, 0, 6);
@@ -168,10 +168,10 @@ class RecordLagGuardTest {
         with.onRecordedCursor(2, 1L);
 
         byte[] written = with.takeSnapshot();
-        assertEquals(10, versionOf(written), "the writer stays at version 10");
-        assertArrayEquals(without.takeSnapshot(), written, "the cursors are not in a version-10 snapshot");
-        assertEquals(with.takeSnapshot(11).length - 1 - 2 * 9, written.length,
-            "a version-10 snapshot is the version-11 one without the cursor section");
+        assertEquals(14, versionOf(written), "the writer writes version 14");
+        assertArrayEquals(without.takeSnapshot(), written, "the cursors are not in a version-14 snapshot");
+        assertEquals(with.takeSnapshot(11).length - 1 - 2 * 9 + 1 + 8 + 1, written.length,
+            "a version-14 snapshot is the version-11 one with the rules tail in place of the cursor section");
     }
 
     @Test

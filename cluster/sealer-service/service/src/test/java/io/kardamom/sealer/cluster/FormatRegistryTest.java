@@ -84,9 +84,8 @@ final class FormatRegistryTest {
 
     @Test
     void ingressKindsMatchTheRegistry() {
-        // The sealer reads the recorded cursor, but no service sends it yet.
-        // The sequencer sends the feature activation only for an upgrade
-        // transaction: the activation of the format in formats.toml.
+        // The sealer reads the recorded cursor and the feature activation,
+        // but no service sends them.
         assertKinds("sealer-ingress-kinds", "KIND_",
             Set.of("KIND_RECORDED_CURSOR", "KIND_FEATURE_ACTIVATION"));
     }
@@ -95,11 +94,9 @@ final class FormatRegistryTest {
     void egressKindsMatchTheRegistry() {
         // The record-lag reject waits for recordLagBudget. The relayed
         // reference waits for carryBytes, and the feed gap for the member
-        // feed. The rules frame waits for decision version 3: the
-        // activation of the format in formats.toml.
+        // feed.
         assertKinds("sealer-egress-kinds", "EGRESS_KIND_", Set.of(
-            "EGRESS_KIND_RECORD_LAG_REJECT", "EGRESS_KIND_RELAYED_REF", "EGRESS_KIND_FEED_GAP",
-            "EGRESS_KIND_SEALER_INFO"));
+            "EGRESS_KIND_RECORD_LAG_REJECT", "EGRESS_KIND_RELAYED_REF", "EGRESS_KIND_FEED_GAP"));
     }
 
     @Test

@@ -65,9 +65,8 @@ final class EgressFrames {
      * A retained frame as an egress session gets it: a relayed canonical
      * entry becomes its relayed reference, and every other frame stays as
      * is. A retained frame is one that this member framed: a relayed frame
-     * always holds the record type, because a member with the retained file
-     * runs version 3, and version 3 takes no ingress record without one
-     * ({@link RelayShape#minLength(int)}).
+     * always holds the record type, because the service takes no ingress
+     * record without one ({@link RelayShape#minLength()}).
      */
     static byte[] forSession(final byte[] retained) {
         final boolean entry = retained[0] == SealerWire.EGRESS_KIND_RELAYED

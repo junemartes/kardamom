@@ -1,22 +1,39 @@
 ---
-# The check before each upgrade transaction of FEATURE_SEALER_V3: the
-# decision rules version 3 of the sealer, on or off. A sealer member of an
-# older release drops the feature activation (ingress kind 11) and keeps
-# version 2, so the replicated state forks at the first frame that the two
-# versions decide differently: a frame that ends at its record type. A
-# member of a release that switches only on keeps version 3 after an
-# activation that switches the rules off, so the state forks the same way.
-# So every configured member must run a release that reads snapshot
-# version 14: the layout that carries the rules of this release, which
-# switch at a block boundary, on and off. Every sequencer must run a release
-# that sends the activation, or no member gets it, and that watches the
-# rules switch on and off (job meta sealer_feature_off). Every executor,
-# validator, ingress and sequencer must run a release that uses the nonce
-# of a skipped transaction (job meta nonce_burn). Every executor and
-# validator must run a release that installs the KardamomChainState code
-# with the first setFeature system deposit, and reads the flags once per
-# block, frozen at its start (job meta chain_state_install).
-# cluster/sealer-service/README.md ("Decision version") is the procedure.
+# The check before each upgrade transaction (ETHLockbox.initiateUpgrade).
+# KARDAMOM_UPGRADE_FEATURE names the feature id of the transaction.
+#
+# The check refuses FEATURE_SEALER_V3 (feature id 2). The sealer runs
+# decision version 3 on every member and does not follow the feature. A
+# sealer member of an older release still switches its rules on the
+# feature activation (ingress kind 11) that a sequencer of an older release
+# sends. A transaction that turns the feature off, or sets a time ahead,
+# then forks the state in a mixed fleet. The executor and the validator
+# still follow the feature: a skip at the chain nonce of its sender uses no
+# nonce while it is off, and the sender is stuck. So this release does not
+# support a transaction of feature 2, on or off.
+#
+# Every configured sealer member must run a release that reads snapshot
+# version 14. Every executor, validator, ingress and sequencer must run a
+# release that uses the nonce of a skipped transaction (job meta
+# nonce_burn). Every executor and validator must run a release that
+# installs the KardamomChainState code with the first setFeature system
+# deposit, and reads the flags once per block, frozen at its start (job
+# meta chain_state_install). cluster/sealer-service/README.md ("Decision
+# version") is the procedure.
+- name: Keep the feature of the upgrade transaction
+  ansible.builtin.set_fact:
+    workloads_upgrade_feature: "{{ lookup('env', 'KARDAMOM_UPGRADE_FEATURE') | trim }}"
+
+- name: Refuse an upgrade transaction of FEATURE_SEALER_V3 or of no named feature
+  ansible.builtin.assert:
+    that:
+      - workloads_upgrade_feature is match('^[0-9]+$')
+      - workloads_upgrade_feature | int != 2
+    fail_msg: >-
+      Refused: the upgrade transaction names feature "{{ workloads_upgrade_feature }}". Name the feature id of the
+      transaction (KARDAMOM_UPGRADE_FEATURE, a decimal number). FEATURE_SEALER_V3 (feature id 2) stays on for good:
+      this release does not support a transaction of it, on or off.
+
 - name: Read the registered sealer
   ansible.builtin.include_tasks: read_job.yml
   vars:
@@ -73,9 +90,8 @@
     label: "{{ item.item }}"
   register: workloads_upgrade_status
 
-# The release that takes the activation reads snapshot version 14. An older
-# member reports a lower snapshotReadsMax: 12 or less for a release with no
-# activation, and 13 for a release whose rules switch only on.
+# A member of this release, or of the release before it, reads snapshot
+# version 14. An older member reports a lower snapshotReadsMax.
 - name: Keep the snapshot read maximum of each member
   ansible.builtin.set_fact:
     workloads_upgrade_reads_max: >-
@@ -87,9 +103,8 @@
     that: workloads_upgrade_reads_max | min >= 14
     fail_msg: >-
       Refused: a sealer member reads only up to snapshot version {{ workloads_upgrade_reads_max | min }}
-      ({{ workloads_upgrade_reads_max }}). A member of an older release drops the feature activation, or switches
-      its rules only on, and forks the state. Deploy the release that reads version 14 to every member, then run
-      the check again.
+      ({{ workloads_upgrade_reads_max }}). Deploy the release that reads version 14 to every member, then run the
+      check again.
 
 # Each service that executes or reads a skip must run this release: an
 # older executor or validator does not use the nonce of a skipped
@@ -110,4 +125,4 @@
     msg: >-
       The upgrade check passed: {{ workloads_upgrade_groups | length }} sealer members read snapshot version 14,
       and the live allocations of {{ workloads_upgrade_jobs | map(attribute='name') | join(', ') }}
-      run this release. An upgrade transaction of FEATURE_SEALER_V3, on or off, may go to the Safe.
+      run this release. The upgrade transaction of feature {{ workloads_upgrade_feature }} may go to the Safe.

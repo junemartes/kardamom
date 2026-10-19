@@ -1,7 +1,6 @@
 package io.kardamom.sealer.cluster;
 
 import io.kardamom.sealer.CanonicalSealerState;
-import io.kardamom.sealer.DecisionRules;
 import java.util.Arrays;
 import org.agrona.DirectBuffer;
 
@@ -48,15 +47,12 @@ enum RelayShape {
     }
 
     /**
-     * The shortest frame of this kind that the service takes under the
-     * decision rules {@code decisionVersion} of the state. Version 3 takes
-     * everything up to the record type, and the record type, so every
-     * relayed frame holds its record type. Version 2 takes a frame that
-     * ends at the record type: both
-     * rule sets must decide one frame alike at one log index.
+     * The shortest frame of this kind that the service takes: everything up
+     * to the record type, and the record type. So every relayed frame holds
+     * its record type.
      */
-    int minLength(final int decisionVersion) {
-        return decisionVersion == DecisionRules.NEWEST_VERSION ? tailOffset() + Byte.BYTES : tailOffset();
+    int minLength() {
+        return tailOffset() + Byte.BYTES;
     }
 
     /** The offset of the record type: the start of the relayed tail. */

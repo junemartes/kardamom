@@ -5,9 +5,8 @@
 //! time, and a time of 0 stores the time that its block executes with, as
 //! `KardamomChainState.setFeature` does. So a deposit in block N takes
 //! effect from block N+1, and the last deposit of a block decides. The
-//! Java test `FeatureSwitchBlocksTest` runs the sealer over the same
-//! blocks, and the engine test `the_table_switches_where_the_chain_switches`
-//! runs the real deposits.
+//! engine test `the_table_switches_where_the_chain_switches` runs the real
+//! deposits over the same blocks.
 
 mod feature_table;
 
