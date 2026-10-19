@@ -101,7 +101,13 @@ impl EndpointSource {
                 .borrow()
                 .entries
                 .values()
-                .filter_map(|e| ArchiveRecord::from_entry(e).ok())
+                .filter_map(|e| match ArchiveRecord::from_entry(e) {
+                    Ok(a) => Some(a),
+                    Err(err) => {
+                        warn!(error = %err, "discovery: skipping malformed archive record");
+                        None
+                    }
+                })
                 .filter(|a| a.records(*topic))
                 .map(|a| a.control.to_string())
                 .collect(),
