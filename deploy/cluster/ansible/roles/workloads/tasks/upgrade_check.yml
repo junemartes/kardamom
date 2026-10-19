@@ -1,16 +1,19 @@
 ---
 # The check before each upgrade transaction (ETHLockbox.initiateUpgrade).
-# KARDAMOM_UPGRADE_FEATURE names the feature id of the transaction.
+# KARDAMOM_UPGRADE_FEATURE names the feature id of the transaction, and
+# KARDAMOM_UPGRADE_ACTIVATION_MS its activation time in ms.
 #
-# The check refuses FEATURE_SEALER_V3 (feature id 2). The sealer runs
-# decision version 3 on every member and does not follow the feature. A
-# sealer member of an older release still switches its rules on the
-# feature activation (ingress kind 11) that a sequencer of an older release
-# sends. A transaction that turns the feature off, or sets a time ahead,
-# then forks the state in a mixed fleet. The executor and the validator
-# still follow the feature: a skip at the chain nonce of its sender uses no
-# nonce while it is off, and the sender is stuck. So this release does not
-# support a transaction of feature 2, on or off.
+# The sealer runs decision version 3 on every member and does not follow
+# FEATURE_SEALER_V3 (feature id 2). The executor and the validator use the
+# nonce of a skip at the chain nonce of its sender only while the feature
+# is on. So a new network sends initiateUpgrade(2, 0) once after its first
+# deploy, and the check allows feature 2 only with the activation time 0
+# (on at once). It refuses feature 2 with any other time (off, or on later
+# with the feature off until then). An off switch leaves a sender stuck
+# after a skip at its chain nonce. A sealer member of an older release
+# still switches its rules on the feature activation (ingress kind 11) that
+# a sequencer of an older release sends, so an off switch also forks the
+# state in a mixed fleet.
 #
 # Every configured sealer member must run a release that reads snapshot
 # version 14. Every executor, validator, ingress and sequencer must run a
@@ -20,19 +23,25 @@
 # deposit, and reads the flags once per block, frozen at its start (job
 # meta chain_state_install). cluster/sealer-service/README.md ("Decision
 # version") is the procedure.
-- name: Keep the feature of the upgrade transaction
+- name: Keep the feature and the activation time of the upgrade transaction
   ansible.builtin.set_fact:
     workloads_upgrade_feature: "{{ lookup('env', 'KARDAMOM_UPGRADE_FEATURE') | trim }}"
+    workloads_upgrade_activation_ms: "{{ lookup('env', 'KARDAMOM_UPGRADE_ACTIVATION_MS') | trim }}"
 
-- name: Refuse an upgrade transaction of FEATURE_SEALER_V3 or of no named feature
+- name: Refuse an upgrade transaction of no named feature
   ansible.builtin.assert:
-    that:
-      - workloads_upgrade_feature is match('^[0-9]+$')
-      - workloads_upgrade_feature | int != 2
+    that: workloads_upgrade_feature is match('^[0-9]+$')
     fail_msg: >-
       Refused: the upgrade transaction names feature "{{ workloads_upgrade_feature }}". Name the feature id of the
-      transaction (KARDAMOM_UPGRADE_FEATURE, a decimal number). FEATURE_SEALER_V3 (feature id 2) stays on for good:
-      this release does not support a transaction of it, on or off.
+      transaction (KARDAMOM_UPGRADE_FEATURE, a decimal number).
+
+- name: Refuse an upgrade transaction that turns FEATURE_SEALER_V3 off
+  ansible.builtin.assert:
+    that: workloads_upgrade_feature | int != 2 or workloads_upgrade_activation_ms == '0'
+    fail_msg: >-
+      Refused: the upgrade transaction of FEATURE_SEALER_V3 (feature id 2) has the activation time
+      "{{ workloads_upgrade_activation_ms }}". Only the time 0 (on at once) is allowed. This release does not
+      support an off switch of feature 2, or an on switch at a later time.
 
 - name: Read the registered sealer
   ansible.builtin.include_tasks: read_job.yml

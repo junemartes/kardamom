@@ -275,9 +275,9 @@ Each sealer member purges its own Raft log behind its snapshots.
 
 ### The upgrade check
 
-Run `just sealer-upgrade-check <env> <feature>` before the Safe signs an upgrade transaction, with the feature id of the transaction. The first `setFeature` system deposit installs the chain-state code, whatever feature it schedules (see below). The procedure is "Decision version" in the [sealer README](../../cluster/sealer-service/README.md). The check refuses:
+Run `just sealer-upgrade-check <env> <feature> <activation_ms>` before the Safe signs an upgrade transaction, with the feature id and the activation time of the transaction. A new network sends `initiateUpgrade(2, 0)` (`FEATURE_SEALER_V3` on at once) once after its first deploy: run `just sealer-upgrade-check <env> 2 0` before it. The first `setFeature` system deposit installs the chain-state code, whatever feature it schedules (see below). The procedure is "Decision version" in the [sealer README](../../cluster/sealer-service/README.md). The check refuses:
 
-- feature 2 (`FEATURE_SEALER_V3`): it is on for good, and this release supports no transaction of it, on or off;
+- feature 2 (`FEATURE_SEALER_V3`) with an activation time other than 0: off is no longer supported;
 - a configured sealer member that is down, or that reads a snapshot version below 14;
 - a job without its metas (`workloads_upgrade_jobs` in `ansible/roles/workloads/defaults/main.yml`), or a live allocation of an older job version:
   - the sequencer: `nonce_burn`;

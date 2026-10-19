@@ -54,11 +54,12 @@ rollback env:
 
 # Check that every sealer member reads snapshot version 14 and that every
 # service runs a release that takes the upgrade transaction of `feature`
-# (its feature id). Run it before the Safe signs the upgrade transaction.
-# It refuses FEATURE_SEALER_V3 (feature id 2). It records nothing.
+# (its feature id) at `activation_ms`. Run it before the Safe signs the
+# upgrade transaction. It allows FEATURE_SEALER_V3 (feature id 2) only
+# with the activation time 0. It records nothing.
 # cluster/sealer-service/README.md ("Decision version") is the procedure.
-sealer-upgrade-check env feature:
-    KARDAMOM_ENV="{{ env }}" KARDAMOM_UPGRADE_FEATURE="{{ feature }}" ansible-playbook -i localhost, ansible/upgrade-check.yml
+sealer-upgrade-check env feature activation_ms="":
+    KARDAMOM_ENV="{{ env }}" KARDAMOM_UPGRADE_FEATURE="{{ feature }}" KARDAMOM_UPGRADE_ACTIVATION_MS="{{ activation_ms }}" ansible-playbook -i localhost, ansible/upgrade-check.yml
 
 # Re-render the release before the last one when Nomad dropped the job
 # versions to revert to: a normal rolling deploy of the older images,

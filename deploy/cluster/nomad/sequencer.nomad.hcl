@@ -126,8 +126,8 @@ locals {
 
 job "sequencer" {
   # The sequencer of this release moves the nonce floor past a skip that
-  # used its nonce. The upgrade check (`just sealer-upgrade-check <env>
-  # <feature>`) reads this meta.
+  # used its nonce. The upgrade check (`just sealer-upgrade-check`) reads
+  # this meta.
   meta {
     nonce_burn = "true"
   }

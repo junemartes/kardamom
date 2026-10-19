@@ -1276,10 +1276,11 @@ class RecordTest(Deploys):
         self.assertIn('the registered sealer job names decisionVersion=3', output)
         self.assertEqual(self.api.state['writes'], [])
 
-    def upgrade_check(self, success=True, feature='3'):
-        """Run the upgrade check for an upgrade transaction of `feature`."""
+    def upgrade_check(self, success=True, feature='3', activation_ms=''):
+        """Run the upgrade check for an upgrade transaction of `feature` at `activation_ms`."""
         return self.run_deploy(playbook='upgrade-check.yml', success=success,
-                               environ={'KARDAMOM_UPGRADE_FEATURE': feature})
+                               environ={'KARDAMOM_UPGRADE_FEATURE': feature,
+                                        'KARDAMOM_UPGRADE_ACTIVATION_MS': activation_ms})
 
     def test_the_upgrade_check_passes_on_a_release_that_takes_the_upgrade(self):
         self.deploy()
@@ -1288,11 +1289,17 @@ class RecordTest(Deploys):
         self.assertIn('the live allocations of sequencer, executor, validator, ingress', output)
         self.assertIn('The upgrade transaction of feature 3 may go to the Safe', output)
 
-    def test_the_upgrade_check_refuses_the_sealer_feature_and_a_missing_feature(self):
-        """FEATURE_SEALER_V3 stays on for good: no transaction of it, on or off."""
+    def test_the_upgrade_check_allows_the_sealer_feature_only_on_at_once(self):
+        """A new network turns FEATURE_SEALER_V3 on at once. Off, or on at a later time, is refused."""
         self.deploy()
-        output = self.upgrade_check(success=False, feature='2')
-        self.assertIn('FEATURE_SEALER_V3 (feature id 2) stays on for good', output)
+        output = self.upgrade_check(feature='2', activation_ms='0')
+        self.assertIn('The upgrade transaction of feature 2 may go to the Safe', output)
+        for activation_ms in ('18446744073709551615', '1700000000000', ''):
+            output = self.upgrade_check(success=False, feature='2', activation_ms=activation_ms)
+            self.assertIn('Only the time 0 (on at once) is allowed', output)
+
+    def test_the_upgrade_check_refuses_a_missing_feature(self):
+        self.deploy()
         output = self.upgrade_check(success=False, feature='')
         self.assertIn('Name the feature id of the transaction', output)
 

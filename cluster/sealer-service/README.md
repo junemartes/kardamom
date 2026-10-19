@@ -507,16 +507,16 @@ Every member applies the same log. Two members on two rule versions can decide o
 - The snapshot is version 14: version 10, then the rules. See [Snapshot](#snapshot).
 - Admin `/status` reports `decisionVersion` (3), and `decisionActivationOrigin` and `decisionActivationMs`: the newest feature activation that the snapshot tail holds, both 0 when it holds none.
 
-`FEATURE_SEALER_V3` (feature id 2) is on for good on every network. The executor, the validator, the replay and the zk guest still read the flag at each block, so a replay of a block from before the activation, or from a time that the feature was off, uses no nonce on a skip. The sealer does not read the flag.
+`FEATURE_SEALER_V3` (feature id 2) turns on the nonce burn of a skipped transaction. The executor, the validator, the replay and the zk guest read the flag at each block, so a replay of a block from before the activation, or from a time that the feature was off, uses no nonce on a skip. The sealer does not read the flag.
 
-- This release does not support an upgrade transaction of `FEATURE_SEALER_V3`, on or off. A member of an older release still switches its rules on kind 11 from a sequencer of an older release. In a mixed fleet, an off transaction forks the state. Off also stops the nonce burn: a sender is stuck after a skip at its chain nonce.
-- `just sealer-upgrade-check <env> <feature>` refuses feature 2.
+- A new network sends `ETHLockbox.initiateUpgrade(2, 0)` once after its first deploy. Until that block, the sealer guard expects `n + 1` after a skip at nonce `n`, and the chain stays at `n`: the sender is stuck.
+- Off is no longer supported. `just sealer-upgrade-check <env> 2 0` passes. The check refuses feature 2 with any activation time other than 0: off, or on at a later time. Off stops the nonce burn, so a sender is stuck after a skip at its chain nonce. A member of an older release still switches its rules on kind 11 from a sequencer of an older release, so in a mixed fleet an off transaction also forks the state.
 
-The procedure of an upgrade transaction of another feature:
+The procedure of an upgrade transaction:
 
 1. Deploy the release to every sealer member and to every executor, validator, ingress and sequencer. Roll the prover's zk guest and its verifying key to that release too: the guest links the same rules.
-2. Run `just sealer-upgrade-check <env> <feature>` with the feature id of the transaction. It must pass before the Safe signs the upgrade transaction.
-   - It refuses feature 2 (`FEATURE_SEALER_V3`), and a feature that is not a decimal number.
+2. Run `just sealer-upgrade-check <env> <feature> <activation_ms>` with the feature id and the activation time of the transaction. It must pass before the Safe signs the upgrade transaction.
+   - It refuses a feature that is not a decimal number, and feature 2 (`FEATURE_SEALER_V3`) with an activation time other than 0.
    - It reads admin `/status` of every configured member and refuses unless each one reports `snapshotReadsMax` of 14 or more.
    - It refuses while a configured member is down.
    - It refuses unless the executor, validator, ingress and sequencer jobs have the meta `nonce_burn = "true"` and every live allocation of them runs that job version.
