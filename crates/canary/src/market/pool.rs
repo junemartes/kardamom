@@ -1,10 +1,11 @@
 //! `swap` and `liquidity`. A swap alternates direction: 0.00001 ETH in,
-//! then the token amount the pool quotes for 0.00001 ETH out. Each result
-//! is checked against the formula from the reserves the pool's event
-//! reports before the call; the product of the reserves must not fall;
-//! the pool's ETH balance must hold its ETH reserve. A reserve snapshot
-//! that moved since the canary's last call is activity of another
-//! account, counted and not paged.
+//! then the tokens that swap bought back for ETH. The swapper's token
+//! balance stays level, and the fee of each swap comes out of its ETH.
+//! Each result is checked against the formula from the reserves the
+//! pool's event reports before the call; the product of the reserves
+//! must not fall; the pool's ETH balance must hold its ETH reserve. A
+//! reserve snapshot that moved since the canary's last call is activity
+//! of another account, counted and not paged.
 
 use alloy_primitives::{TxKind, U256};
 
@@ -23,14 +24,9 @@ const LIQUIDITY_WEI: u64 = 100_000_000_000_000;
 
 impl MarketTask {
     pub(super) async fn swap(&mut self, rpc: &Rpc, pool: Pool) -> Result<(), Outcome> {
-        let eth_in = self.eth_in_next || self.last.is_none();
-        let (value, input) = if eth_in {
-            (U256::from(SWAP_WEI), Pool::swap_eth_for_token())
-        } else {
-            let (reserves, _) = self.last.ok_or(Outcome::SwapMismatch)?;
-            let amount = Pool::amount_in_for(U256::from(SWAP_WEI), reserves.token, reserves.eth)
-                .ok_or(Outcome::SwapMismatch)?;
-            (U256::ZERO, Pool::swap_token_for_eth(amount))
+        let (value, input) = match self.bought {
+            None => (U256::from(SWAP_WEI), Pool::swap_eth_for_token()),
+            Some(tokens) => (U256::ZERO, Pool::swap_token_for_eth(tokens)),
         };
         let call = Call::new(TxKind::Call(pool.0), value, input, CALL_GAS);
         let done = self.send(rpc, SWAPPER, call).await?;
@@ -38,7 +34,7 @@ impl MarketTask {
             .swap_in(&done.landed.receipt)
             .ok_or(Outcome::SwapMismatch)?;
         self.observe(event.before, event.after, event.seq);
-        self.eth_in_next = !eth_in;
+        self.bought = event.eth_in.then_some(event.amount_out);
         event.check()?;
         self.balance_holds(rpc, pool, event.after).await
     }
