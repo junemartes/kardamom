@@ -154,7 +154,7 @@ impl EgressWatermarkFeed {
         deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
         origins: OriginSignalTx,
     ) -> Self {
-        let rules = SealerRules::new(partition, watermark.clone());
+        let rules = SealerRules::new(partition);
         Self {
             rules,
             silence_ms,

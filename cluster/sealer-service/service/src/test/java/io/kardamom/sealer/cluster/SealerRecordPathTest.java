@@ -6,7 +6,6 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.kardamom.sealer.CanonicalSealerState;
-import io.kardamom.sealer.DecisionRules;
 import io.kardamom.sealer.LagBudgets;
 import io.kardamom.sealer.VoidLedger;
 import io.kardamom.sealer.cluster.ClusterStubs.StubCluster;
@@ -249,16 +248,16 @@ class SealerRecordPathTest {
     }
 
     @Test
-    void a_member_without_the_file_restores_a_version_ten_snapshot_and_decides_alike() {
+    void a_member_without_the_file_restores_a_version_fourteen_snapshot_and_decides_alike() {
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService original = member(Optional.empty(), Optional.empty());
         IntStream.range(1, 4).forEach(n -> deliver(original, sequencer, offer(n, n - 1)));
         tick(original);
         final byte[] snapshot = original.snapshot();
-        assertEquals(10, ByteBuffer.wrap(snapshot).getInt(Integer.BYTES));
+        assertEquals(14, ByteBuffer.wrap(snapshot).getInt(Integer.BYTES));
 
         final SealerClusteredService restored = member(Optional.empty(), Optional.of(snapshot));
-        assertEquals(10, restored.latestSnapshotVersion());
+        assertEquals(14, restored.latestSnapshotVersion());
         List.of(original, restored).forEach(svc -> {
             deliver(svc, sequencer, offer(9, 1));
             deliver(svc, sequencer, offer(4, 3));
@@ -293,24 +292,16 @@ class SealerRecordPathTest {
             sequencer.offered.get(0));
     }
 
-    /**
-     * A member without the file runs version 3 after the activation, and
-     * its snapshot, version 13, restores version 3. The member is a
-     * follower, so the snapshot request at the activation goes to no control
-     * toggle.
-     */
+    /** A member without the file runs version 3, and its snapshot, version 14, restores version 3. */
     @Test
     void a_member_without_the_file_restores_version_three_from_its_snapshot() {
-        cluster.role = io.aeron.cluster.service.Cluster.Role.FOLLOWER;
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService svc = member(Optional.empty(), Optional.empty());
-        // A time in the past: a 0 in block 1 would store 0, which means never.
-        deliver(svc, sequencer, IngressFrames.featureActivationFrame(1, DecisionRules.FEATURE_SEALER_V3, 1));
         deliver(svc, sequencer, IngressFrames.originRecordFrame(IngressFrames.canonicalId(1001), 1, 1, new byte[] {1}));
         sameLog(svc, sequencer);
         assertEquals(3, svc.decisionRules().version());
         final byte[] snapshot = svc.snapshot();
-        assertEquals(CanonicalSealerState.RULES_SNAPSHOT_VERSION, ByteBuffer.wrap(snapshot).getInt(Integer.BYTES));
+        assertEquals(CanonicalSealerState.snapshotWriteVersion(), ByteBuffer.wrap(snapshot).getInt(Integer.BYTES));
         final SealerClusteredService restored = member(Optional.empty(), Optional.of(snapshot));
         assertEquals(3, restored.decisionRules().version());
     }

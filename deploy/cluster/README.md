@@ -275,15 +275,16 @@ Each sealer member purges its own Raft log behind its snapshots.
 
 ### The upgrade check
 
-Run `just sealer-upgrade-check <env>` before the Safe signs the first upgrade transaction of the chain, for any feature. The first `setFeature` system deposit installs the chain-state code, whatever feature it schedules (see below). Run it also before the upgrade transaction of `FEATURE_SEALER_V3`. The procedure is "Decision version" in the [sealer README](../../cluster/sealer-service/README.md). The check refuses:
+Run `just sealer-upgrade-check <env> <feature> <activation_ms>` before the Safe signs an upgrade transaction, with the feature id and the activation time of the transaction. A new network sends `initiateUpgrade(2, 0)` (`FEATURE_SEALER_V3` on at once) once after its first deploy: run `just sealer-upgrade-check <env> 2 0` before it. The first `setFeature` system deposit installs the chain-state code, whatever feature it schedules (see below). The procedure is "Decision version" in the [sealer README](../../cluster/sealer-service/README.md). The check refuses:
 
-- a configured sealer member that is down, or that reads a snapshot version below 14 (a release with no activation, or one whose rules switch only on);
+- feature 2 (`FEATURE_SEALER_V3`) with an activation time other than 0: off is no longer supported;
+- a configured sealer member that is down, or that reads a snapshot version below 14;
 - a job without its metas (`workloads_upgrade_jobs` in `ansible/roles/workloads/defaults/main.yml`), or a live allocation of an older job version:
-  - the sequencer: `sealer_feature_activation`, `sealer_feature_off` and `nonce_burn`;
+  - the sequencer: `nonce_burn`;
   - the executor and the validator: `nonce_burn` and `chain_state_install`;
   - the ingress: `nonce_burn`.
 
-The meta `chain_state_install` marks a release that installs the `KardamomChainState` code with the first `setFeature` system deposit of any feature on a genesis without it. That release also reads the flags once per block, frozen at the start of the block, which is the rule that the sealer follows. The genesis of this deploy (`config/genesis/dev.toml`) has no such code. An older executor or validator runs the deposit as a call to an empty account and forks the state at that deposit. See "A genesis without the chain-state code" in [`../../docs/failure-modes.md`](../../docs/failure-modes.md#l1-governed-upgrades-feature-flags).
+The meta `chain_state_install` marks a release that installs the `KardamomChainState` code with the first `setFeature` system deposit of any feature on a genesis without it. That release also reads the flags once per block, frozen at the start of the block. The genesis of this deploy (`config/genesis/dev.toml`) has no such code. An older executor or validator runs the deposit as a call to an empty account and forks the state at that deposit. See "A genesis without the chain-state code" in [`../../docs/failure-modes.md`](../../docs/failure-modes.md#l1-governed-upgrades-feature-flags).
 
 ### Settlement
 

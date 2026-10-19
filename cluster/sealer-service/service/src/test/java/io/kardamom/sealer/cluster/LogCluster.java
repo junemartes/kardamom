@@ -95,7 +95,7 @@ final class LogCluster implements AutoCloseable {
     private AdminServer startAdmin(final int memberId) {
         final MemberStatus status = new MemberStatus(
                 memberId, MemberStatus.ROLE_FOLLOWER, MemberStatus.ELECTION_CLOSED, 0, 0,
-                MemberStatus.SnapshotVersions.of(0), MemberStatus.Rules.START, OptionalLong.empty());
+                MemberStatus.SnapshotVersions.of(0), io.kardamom.sealer.DecisionRules.START_VIEW, OptionalLong.empty());
         final RetainedEndpoint endpoint = RetainedEndpoint.start(new SegmentDir(retainedDir(memberId)),
                 () -> service(cluster.node(memberId)).retainedHead(), RETAINED_TOKEN);
         try {

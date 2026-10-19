@@ -10,7 +10,7 @@ use kardamom_types::DepositRef;
 use kardamom_types::TxRef;
 use kardamom_types::VoidRecord;
 use kardamom_types::epoch::EpochRecord;
-use kardamom_types::upgrades::{FEATURE_SEALER_V3, FeatureSchedule};
+use kardamom_types::upgrades::FeatureSchedule;
 use kardamom_types::xchain::RemoteEpochRecord;
 
 #[cfg(any(test, feature = "testing"))]
@@ -245,21 +245,20 @@ impl FeatureActivation {
     /// The length of the frame.
     pub const LEN: usize = 1 + 8 + 8 + 8;
 
-    /// The activation of [`FEATURE_SEALER_V3`] that `epoch` carries: the
-    /// last schedule of the feature in the epoch, because the last
-    /// `setFeature` call wins on L2. `None` when the epoch schedules no
-    /// such feature.
+    /// The activation of `feature_id` that `epoch` carries: the last
+    /// schedule of the feature in the epoch, because the last `setFeature`
+    /// call wins on L2. `None` when the epoch schedules no such feature.
     #[must_use]
-    pub fn sealer_rules_of(epoch: &EpochRecord) -> Option<Self> {
+    pub fn of(epoch: &EpochRecord, feature_id: u64) -> Option<Self> {
         epoch
             .deposits
             .iter()
             .rev()
             .filter_map(FeatureSchedule::of_deposit)
-            .find(|schedule| schedule.feature_id == U256::from(FEATURE_SEALER_V3))
+            .find(|schedule| schedule.feature_id == U256::from(feature_id))
             .map(|schedule| Self {
                 l1_origin: epoch.l1_number,
-                feature_id: FEATURE_SEALER_V3,
+                feature_id,
                 activation_ms: schedule.activation_timestamp,
             })
     }

@@ -177,8 +177,7 @@ final class ClusterNodeTest {
     }
 
     /**
-     * The job names no decision version: every member starts on version 2,
-     * and only an upgrade transaction in the log switches it to version 3
+     * The job names no decision version: every member runs version 3
      * ({@link SealerDecisionRulesTest}). A job spec that names a version is
      * replaced by a rolling deploy.
      */
@@ -186,7 +185,7 @@ final class ClusterNodeTest {
     void theSealerJobNamesNoDecisionVersion() throws IOException {
         final String job = Files.readString(Path.of(System.getProperty("kardamom.sealerJob")));
         assertFalse(job.contains("decisionVersion"), "the job names no decision version");
-        assertEquals(2, io.kardamom.sealer.DecisionRules.START_VERSION);
+        assertEquals(3, io.kardamom.sealer.DecisionRules.VERSION);
     }
 
     /** Member names under the reserved .invalid domain: no lookup can resolve them. */

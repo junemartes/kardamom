@@ -133,7 +133,7 @@ fn every_driver_on(genesis: ChainStateGenesis) {
 }
 
 /// The blocks of `exec-core/testdata/feature_switch_blocks.txt`, the table
-/// that the sealer tests share, with real `setFeature` deposits where the
+/// of the exec-core test, with real `setFeature` deposits where the
 /// table has them (one L1 epoch for each such block), and in every block
 /// one skip of the poor sender at its chain nonce. The skip of a block
 /// burns exactly when the table marks the block on, block by block, on the

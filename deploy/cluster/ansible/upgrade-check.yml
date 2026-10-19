@@ -1,5 +1,5 @@
 ---
-- name: Check that every sealer member and every sequencer takes the sealer feature activation
+- name: Check that every sealer member and every service runs a release that takes the upgrade transaction
   hosts: localhost
   connection: local
   become: false

@@ -115,7 +115,7 @@ final class WireGoldenTest {
     @Test
     void theSealerInfoNamesTheDecisionVersion() {
         assertArrayEquals(golden.get("sealer_info"), frames.copy(frames.sealerInfo(3, 0x0102)));
-        assertEquals(3, io.kardamom.sealer.DecisionRules.NEWEST_VERSION);
+        assertEquals(3, io.kardamom.sealer.DecisionRules.VERSION);
     }
 
     @Test
@@ -125,7 +125,7 @@ final class WireGoldenTest {
         assertEquals(SealerWire.FEATURE_ACTIVATION_LEN, activation.capacity());
         assertEquals(SealerWire.KIND_FEATURE_ACTIVATION, activation.getByte(SealerWire.KIND_OFFSET));
         assertEquals(5, activation.getLong(SealerWire.ACTIVATION_ORIGIN_OFFSET, ByteOrder.LITTLE_ENDIAN));
-        assertEquals(io.kardamom.sealer.DecisionRules.FEATURE_SEALER_V3,
+        assertEquals(2L,
             activation.getLong(SealerWire.ACTIVATION_FEATURE_OFFSET, ByteOrder.LITTLE_ENDIAN));
         assertEquals(1_700_000_000_250L, activation.getLong(SealerWire.ACTIVATION_MS_OFFSET, ByteOrder.LITTLE_ENDIAN));
         assertArrayEquals(frame, IngressFrames.featureActivationFrame(5, 2, 1_700_000_000_250L));

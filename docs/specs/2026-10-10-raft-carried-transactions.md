@@ -461,6 +461,9 @@ envelope, and the void goes:
   version 13. So after the first activation record is in the log, the gate of #664 refuses a
   rollback of the sealer past the release that brought the flag. A later release removes the
   version 2 rules, after the activation on every network.
+- **The switch of feature 2 is removed (#696).** After the activation on staging, every member
+  runs version 3 and ignores kind 11, and no sequencer sends it. Feature 3 must bring back a kind
+  11 sender and a block-boundary rule in the sealer.
 
 ### 5.5 Retention, the snapshot, the purge and the floor
 

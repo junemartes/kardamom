@@ -1,8 +1,9 @@
 # The blocks of one chain, and whether FEATURE_SEALER_V3 is on in each.
 # The Rust test crates/exec-core/tests/feature_switch_blocks.rs runs the
-# executor rule over these blocks, and the Java test
-# FeatureSwitchBlocksTest runs the sealer over them. Both must give the v3
-# column, so the executor and the sealer switch at the same block.
+# executor rule over these blocks, and the engine test
+# the_table_switches_where_the_chain_switches runs the real deposits. Both
+# must give the v3 column. A replay of a block of a chain that switched
+# reads the flag by this rule.
 #
 # Columns:
 #   block        the block number, from 1

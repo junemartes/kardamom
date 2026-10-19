@@ -27,23 +27,20 @@
 # The sealer's Aeron Cluster snapshot. The loader refuses a version outside
 # the read range, so a member that rolls back cannot load a newer
 # snapshot. A member that joins late can get a snapshot of another member,
-# so the format is shared. This release reads v14 and still writes v10.
+# so the format is shared. This release reads and writes v14: v10 with the
+# decision rules after the seed digest. The rules tail holds the version
+# (3), the L1 origin of the last sealed block, and the up to three feature
+# activations that a member of an older release holds. Such a member
+# restores v14 with decision version 3. It would restore v10 with version
+# 2, so this release does not write v10. A v13 snapshot holds one
+# activation; the loader still reads it.
 # With kardamom.cluster.carryBytes=true, the members write v12: the state
 # of v10 without the void ledger, then the index of the retained file in
 # place of the retained frames. A release that reads only up to v11
 # refuses v12 and stops, so switch the flag on only on a new chain or at a
-# coordinated cut-over. No release wrote v12 before this layout. After
-# the feature activation of FEATURE_SEALER_V3 (ingress kind 11) is in the
-# log, the members write v14: v10 with the decision rules after the seed
-# digest: the version of the next block, the L1 origin of the last sealed
-# block, and the up to three activations that the state holds (the
-# visible one and the ones whose epoch is not sealed yet). A v13 snapshot
-# holds one activation; the loader still reads it. A release that reads
-# only up to v13 refuses v14 and stops, also one whose rules switch only
-# on, so send the upgrade transaction only after every member runs this
-# release.
+# coordinated cut-over. No release wrote v12 before this layout.
 [format.sealer-snapshot]
-writes = 10
+writes = 14
 reads_min = 1
 reads_max = 14
 shared = true
@@ -52,25 +49,20 @@ code = [
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_WRITE_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_READ_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#RETAINED_FILE_SNAPSHOT_VERSION",
-    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#RULES_SNAPSHOT_VERSION",
 ]
 
 # The ingress message kinds of the sealer. The Rust writers send kinds 0
 # to 7. The sealer itself writes kind 8 into its log. The executor sends
 # kind 9 (the recorded cursor) only with KARDAMOM_EXEC_CURSOR on
-# (--exec-cursor); the default is off. The sequencer sends kind 11 (the
-# feature activation) in front of an epoch that holds the upgrade
-# transaction of FEATURE_SEALER_V3. No writer sends kind 10. Every member
-# drops a frame of a kind it does not know, counts it, and never orders
-# it. Kind 11 switches the rules of a member that reads it on or off, so
-# send each upgrade transaction only after every member runs this
-# release.
+# (--exec-cursor); the default is off. No writer sends kind 10 or kind 11
+# (the feature activation). A member reads kind 11 and changes no state.
+# Every member drops a frame of a kind it does not know, counts it, and
+# never orders it.
 [format.sealer-ingress-kinds]
 writes = 8
 reads_min = 0
 reads_max = 11
 shared = true
-activation = { flag = "FEATURE_SEALER_V3", writes = 11 }
 code = [
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#KIND_FEATURE_ACTIVATION",
     "crates/cluster-adapter/src/wire/mod.rs#KIND_FEATURE_ACTIVATION",
@@ -89,9 +81,8 @@ code = [
 # drops it as unknown. Kind 255 is local to the Rust client: the session
 # thread puts it on the consumer channel when a session opens. It is never
 # on the wire. The sealer sends kind 17 (its rules: the decision version)
-# after the first feature activation, or under decision version 3: to each
-# open session at each switch and at each new term, and to each session
-# when it opens. An older reader drops kind 17 as an unknown kind.
+# to each session when it opens, and to each open session at each new
+# term. An older reader drops kind 17 as an unknown kind.
 #
 # On the member feed, the answers (kinds 3, 4, 11 and 16) are 25 bytes:
 # the 17 bytes of the egress layout, then the request id. A reader reads
@@ -104,11 +95,10 @@ code = [
 # ignores a tail it does not know, and a new reader reads a frame with no
 # tail as the guard off, no snapshot and no retained bytes.
 [format.sealer-egress-kinds]
-writes = 12
+writes = 17
 reads_min = 1
 reads_max = 17
 shared = true
-activation = { flag = "FEATURE_SEALER_V3", writes = 17 }
 code = [
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#EGRESS_KIND_SEALER_INFO",
     "crates/cluster-adapter/src/wire/mod.rs#EGRESS_KIND_SEALER_INFO",

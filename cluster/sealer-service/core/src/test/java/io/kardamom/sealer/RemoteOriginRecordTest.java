@@ -404,7 +404,7 @@ class RemoteOriginRecordTest {
         pre.onOriginRecord(id(2), 100L, 1L, payload("e100"), 1_000L);
         // No peers yet: remoteCount = 0. Strip the version-7 per-id
         // deadlines, append one v4 peer entry (origin 8 + anchor 8).
-        byte[] v5 = SealerStateFixtures.downgradeToVersion(pre.takeSnapshot(), 4);
+        byte[] v5 = SealerStateFixtures.downgradeToVersion(pre.takeSnapshot(10), 4);
         ByteBuffer v4 = ByteBuffer.allocate(v5.length + 16).order(ByteOrder.BIG_ENDIAN);
         v4.put(v5, 0, v5.length - PEER_AND_VOID_TAIL); // everything before remoteCount
         v4.putInt(1);
