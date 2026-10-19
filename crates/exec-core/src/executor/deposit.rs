@@ -38,7 +38,7 @@ impl DepositFailure {
         call: &mut DerivedCall<'_, D>,
         deposit: &Deposit,
         rejection: &Rejection,
-        install: Option<&ChainStateInstall>,
+        installed: bool,
         bal: Option<(&mut revm::state::bal::Bal, u64)>,
     ) -> Result<(Receipt, WriteSet), ExecutorError>
     where
@@ -48,8 +48,8 @@ impl DepositFailure {
     {
         let info = call.account(deposit.from)?;
         let mut ws = Executor::<S>::mint_only_write_set(deposit, &info);
-        if let Some(install) = install {
-            install.add_to(&mut ws, call)?;
+        if installed {
+            ChainStateInstall::add_to(&mut ws, call)?;
         }
         Ok(Executor::<S>::failed_deposit_receipt(
             rejection.reason,
@@ -175,7 +175,7 @@ pub fn execute_deposit_tx<S: StateDatabase>(
     // no matter the inner-call outcome. The install of the chain state
     // code follows the same rule.
     call.credit_mint(deposit)?;
-    let install = call.install_chain_state(deposit)?;
+    let installed = call.install_chain_state(deposit)?;
 
     // (2) Inner EVM call. Disable the nonce check, since deposits do not
     // carry a nonce.
@@ -185,11 +185,7 @@ pub fn execute_deposit_tx<S: StateDatabase>(
         // never ran. Same artifact as the scope path.
         DerivedOutcome::Rejected(rejection) => {
             return DepositFailure::from_validation::<S, _>(
-                &mut call,
-                deposit,
-                &rejection,
-                install.as_ref(),
-                bal,
+                &mut call, deposit, &rejection, installed, bal,
             );
         }
     };

@@ -181,11 +181,11 @@ pub async fn assert_chain_state_code(
     executor_state_dir: &Path,
     validator_state_dir: &Path,
 ) -> Result<()> {
-    use kardamom_types::upgrades::CHAIN_STATE_CODE;
+    use kardamom_types::upgrades::CHAIN_STATE_CODE_HASH;
     let executor = read_chain_state(executor_state_dir)?;
     let validator =
         state_at_or_past(validator_state_dir, executor.block_number, "validator").await?;
-    let canonical = Some(alloy_primitives::keccak256(CHAIN_STATE_CODE));
+    let canonical = Some(CHAIN_STATE_CODE_HASH);
     [("executor", executor), ("validator", validator)]
         .into_iter()
         .try_for_each(|(role, v)| {

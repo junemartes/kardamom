@@ -19,8 +19,8 @@
 //!
 //! A second block runs on a genesis without the chain-state predeploy: its
 //! `setFeature` system deposit installs the code. The witness proves that
-//! the address has no account, and the guest installs the code as the
-//! capture did.
+//! the address has no account (or an account with a balance and no code),
+//! and the guest installs the code as the capture did.
 //!
 use alloy_primitives::{Address, B256, U256, address, keccak256};
 use alloy_signer_local::PrivateKeySigner;
@@ -30,7 +30,9 @@ use kardamom_engine::stateless::AnchoredBlockOutput;
 use kardamom_engine::{ExecEnv, MockStateDatabase};
 use kardamom_state::trie::{TrieTables, update_for_block};
 use kardamom_state::{Durability, StateEnv, StateEnvBuilder};
-use kardamom_types::upgrades::{CHAIN_STATE, CHAIN_STATE_CODE, FEATURE_SEALER_V3};
+use kardamom_types::upgrades::{
+    CHAIN_STATE, CHAIN_STATE_CODE, CHAIN_STATE_CODE_HASH, FEATURE_SEALER_V3,
+};
 use kardamom_types::{
     AccountChange, BPosition, BlockBoundaryStart, BlockDelta, BlockRecordsDigest, ExecutionWitness,
     ProverInput, ProverRecord, PublicOutputs, StorageChange, WitnessProofs,
@@ -113,7 +115,11 @@ fn seed_delta(sender: Address, zeroer_hash: B256, writer_hash: B256) -> BlockDel
 }
 
 /// The same pre-state as [`seed_delta`], as the mock execution database.
-fn seed_mock(sender: Address, zeroer_hash: B256, writer_hash: B256) -> MockStateDatabase {
+fn seed_mock(
+    sender: Address,
+    zeroer_hash: B256,
+    writer_hash: B256,
+) -> kardamom_exec_core::state::MockStateDatabaseBuilder {
     let mut mock = MockStateDatabase::builder()
         .account(
             sender,
@@ -135,7 +141,7 @@ fn seed_mock(sender: Address, zeroer_hash: B256, writer_hash: B256) -> MockState
             alloy_primitives::KECCAK256_EMPTY,
         );
     }
-    mock.build()
+    mock
 }
 
 /// Commit `seed` into the trie-backed `env`, and return the resulting root.
@@ -343,7 +349,7 @@ fn capture_anchor_guest_and_live_trie_agree() {
     let writer_hash = keccak256(WRITER_CODE);
 
     let seed = seed_delta(sender, zeroer_hash, writer_hash);
-    let snap = seed_mock(sender, zeroer_hash, writer_hash);
+    let snap = seed_mock(sender, zeroer_hash, writer_hash).build();
 
     let dir = tempfile::tempdir().unwrap();
     let env = StateEnvBuilder::new(dir.path())
@@ -392,10 +398,35 @@ fn upgrade_record() -> BufferedRecord {
 
 #[test]
 fn the_guest_installs_the_chain_state_code_with_the_first_upgrade() {
+    guest_installs(U256::ZERO);
+}
+
+/// The chain-state address holds a balance and no code: someone sent ETH
+/// there. The witness proves the account and its empty code, and the
+/// install keeps the balance.
+#[test]
+fn the_guest_installs_the_code_over_an_account_with_a_balance() {
+    guest_installs(U256::from(10u128.pow(18)));
+}
+
+/// One block with an upgrade deposit and a transfer, on a genesis with no
+/// code at [`CHAIN_STATE`] and `balance` there (no account for 0).
+fn guest_installs(balance: U256) {
     let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x5B)).unwrap();
     let sender = signer.address();
-    let seed = seed_delta(sender, keccak256(ZEROER_CODE), keccak256(WRITER_CODE));
-    let snap = seed_mock(sender, keccak256(ZEROER_CODE), keccak256(WRITER_CODE));
+    let mut seed = seed_delta(sender, keccak256(ZEROER_CODE), keccak256(WRITER_CODE));
+    let mut mock = seed_mock(sender, keccak256(ZEROER_CODE), keccak256(WRITER_CODE));
+    if !balance.is_zero() {
+        seed.accounts.push(AccountChange {
+            address: CHAIN_STATE,
+            nonce: 0,
+            balance,
+            code_hash: B256::ZERO,
+        });
+        mock = mock.account(CHAIN_STATE, balance, 0, alloy_primitives::KECCAK256_EMPTY);
+    }
+    let snap = mock.build();
+    let funded = !balance.is_zero();
     let dir = tempfile::tempdir().unwrap();
     let env = StateEnvBuilder::new(dir.path())
         .durability(Durability::SafeNoSync)
@@ -407,7 +438,7 @@ fn the_guest_installs_the_chain_state_code_with_the_first_upgrade() {
     let (out, mut witness, bal) =
         capture_block_witness(&snap, None, &records, exec_env()).expect("capture");
     assert!(out.receipts.iter().all(|r| r.status), "{:?}", out.receipts);
-    let code_hash = keccak256(CHAIN_STATE_CODE);
+    let code_hash = CHAIN_STATE_CODE_HASH;
     assert_eq!(
         out.delta.accounts.get(&CHAIN_STATE).map(|a| a.code_hash),
         Some(code_hash),
@@ -424,8 +455,13 @@ fn the_guest_installs_the_chain_state_code_with_the_first_upgrade() {
         witness
             .accounts
             .iter()
-            .any(|a| a.address == CHAIN_STATE && !a.exists),
-        "the witness proves that the chain-state address has no account"
+            .any(|a| a.address == CHAIN_STATE && a.exists == funded),
+        "the witness proves the account at the chain-state address, or its absence"
+    );
+    assert_eq!(
+        out.delta.accounts.get(&CHAIN_STATE).map(|a| a.balance),
+        Some(balance),
+        "the install keeps the balance"
     );
 
     let (proofs, post_root) = {
