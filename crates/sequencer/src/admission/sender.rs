@@ -7,15 +7,30 @@ use alloy_primitives::U256;
 
 use super::{AccountState, AdmissionConfig, Candidate, Refusal, Verdict};
 
+/// One forwarded transaction that no state confirmed yet.
+#[derive(Clone, Copy)]
+struct Forwarded {
+    /// Its worst-case cost.
+    cost: U256,
+    /// The ingress that published it.
+    ingress: u16,
+}
+
 pub(super) struct SenderState<T> {
     /// The newest chain state, `None` until a row or a lookup gives one.
     state: Option<AccountState>,
     /// A lookup is out for this sender.
     asked: bool,
+    /// The state came from a lookup, not from rows. The state database of
+    /// an executor commits after the receipts go out, so such a state can
+    /// be behind a nonce that the rows showed before this replica started.
+    from_lookup: bool,
+    /// A relook of this sender waits in the queue of the filter.
+    relook_due: bool,
     /// The nonce of the first forwarded transaction that no state confirmed.
     first: u64,
-    /// The worst-case costs of the forwarded run, from `first` on.
-    forwarded: VecDeque<U256>,
+    /// The forwarded run, from `first` on.
+    forwarded: VecDeque<Forwarded>,
     /// The sum of `forwarded`.
     spend: U256,
     /// The transactions that wait for a nonce gap, or for a lookup.
@@ -27,6 +42,8 @@ impl<T> Default for SenderState<T> {
         Self {
             state: None,
             asked: false,
+            from_lookup: false,
+            relook_due: false,
             first: 0,
             forwarded: VecDeque::new(),
             spend: U256::ZERO,
@@ -76,16 +93,23 @@ impl<T> SenderState<T> {
     /// Apply a newer chain state: confirm the forwarded run up to its
     /// nonce, refuse the parked transactions below it, and forward the
     /// parked ones that now continue the run.
+    /// Any answer of a lookup ends the lookup that was out, also one that
+    /// is not newer than the state held.
     pub(super) fn on_state(
         &mut self,
         state: AccountState,
+        from_lookup: bool,
         cfg: &AdmissionConfig,
         out: &mut Vec<Verdict<T>>,
     ) {
-        if self.state.is_some_and(|held| held.tx_idx >= state.tx_idx) {
+        if from_lookup {
+            self.asked = false;
+        }
+        if self.state.is_some_and(|held| !state.is_newer_than(&held)) {
             return;
         }
         self.state = Some(state);
+        self.from_lookup = from_lookup;
         self.asked = false;
         while self.confirm_one(state.nonce) {}
         let keep = self.parked.split_off(&state.nonce);
@@ -129,6 +153,31 @@ impl<T> SenderState<T> {
         held.then(|| self.parked.remove(&nonce)).flatten()
     }
 
+    /// Whether a parked transaction waits for a nonce gap over a state from
+    /// a lookup, with nothing forwarded: the gap can be the lag of the
+    /// state database, not a missing transaction.
+    pub(super) fn waits_on_lookup_gap(&self) -> bool {
+        let gap = self
+            .state
+            .zip(self.parked.first_key_value())
+            .is_some_and(|(state, (nonce, _))| *nonce > state.nonce);
+        self.from_lookup && self.forwarded.is_empty() && gap
+    }
+
+    /// Mark a relook as queued. Returns false when one is queued already.
+    pub(super) fn queue_relook(&mut self) -> bool {
+        !std::mem::replace(&mut self.relook_due, true)
+    }
+
+    /// The queued relook is due: ask again when the gap over the lookup
+    /// state is still there and no lookup is out.
+    pub(super) fn relook(&mut self) -> bool {
+        self.relook_due = false;
+        let ask = self.waits_on_lookup_gap() && !self.asked;
+        self.asked |= ask;
+        ask
+    }
+
     /// Forget the chain state: the next transaction asks for a lookup.
     pub(super) fn forget_state(&mut self) {
         self.state = None;
@@ -157,12 +206,19 @@ impl<T> SenderState<T> {
         nonce >= self.first && nonce - self.first < self.forwarded.len() as u64
     }
 
+    /// The ingress that published the forwarded transaction at `nonce`, while
+    /// no state confirmed it.
+    pub(super) fn ingress_of(&self, nonce: u64) -> Option<u16> {
+        let offset = usize::try_from(nonce.checked_sub(self.first)?).ok()?;
+        self.forwarded.get(offset).map(|f| f.ingress)
+    }
+
     /// Drop the first forwarded transaction when the chain is past it.
     fn confirm_one(&mut self, chain_nonce: u64) -> bool {
         if self.forwarded.is_empty() || self.first >= chain_nonce {
             return false;
         }
-        let cost = self.forwarded.pop_front().unwrap_or_default();
+        let cost = self.forwarded.pop_front().map_or(U256::ZERO, |f| f.cost);
         self.spend = self.spend.saturating_sub(cost);
         self.first += 1;
         true
@@ -233,7 +289,10 @@ impl<T> SenderState<T> {
         if self.forwarded.is_empty() {
             self.first = c.nonce;
         }
-        self.forwarded.push_back(c.cost);
+        self.forwarded.push_back(Forwarded {
+            cost: c.cost,
+            ingress: c.ingress,
+        });
         self.spend = self.spend.saturating_add(c.cost);
         out.push(Verdict::Forward(c));
         false

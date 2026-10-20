@@ -72,6 +72,7 @@ where
         let result = wait
             .await_with_timeout(self.cfg.pending_receipt_timeout)
             .await;
+        let result = self.answer_executed_duplicate(client_ip, &v, result).await;
 
         // Count accepted or rejected on the terminal outcome, not at
         // publish time, so a single submission never increments both.
@@ -146,6 +147,27 @@ where
     /// Shared head of both submit paths: rate-limit, size cap, decode, batch
     /// sig-verify, and receipt-cache lookup. Does not publish and rejects
     /// nothing on account state; see [`Self::admit`].
+    /// A refused copy of a transaction that executed answers the receipt of
+    /// that transaction. The sequencer refuses a copy whose nonce a
+    /// transaction used, and this ingress can miss the receipt: it reads
+    /// only its own verdicts, or it started after the receipt. The lookup
+    /// by hash finds the receipt only when the submitted transaction is the
+    /// one that executed.
+    async fn answer_executed_duplicate(
+        &self,
+        client_ip: IpAddr,
+        v: &ValidatedSubmission,
+        result: Result<ReceiptResponse, IngressError>,
+    ) -> Result<ReceiptResponse, IngressError> {
+        let Err(IngressError::Duplicate(_)) = &result else {
+            return result;
+        };
+        match self.receipt_by_hash(client_ip, v.tx_hash).await {
+            Some(receipt) => Ok(ReceiptResponse { receipt }),
+            None => result,
+        }
+    }
+
     async fn validate_submission(
         &self,
         client_ip: IpAddr,
