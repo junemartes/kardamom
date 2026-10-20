@@ -40,9 +40,9 @@ pub(crate) mod receipt_cache;
 pub(crate) mod receipt_subscription;
 pub mod rollback_log;
 pub mod routing;
-pub mod seal_latency;
 pub(crate) mod seen_receipts;
 pub mod sig_verify;
+pub mod stage_latency;
 pub(crate) mod sync_util;
 /// Shared test and bench helpers. See the module doc for what it covers.
 #[cfg(any(test, feature = "test-support"))]
