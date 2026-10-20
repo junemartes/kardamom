@@ -57,7 +57,12 @@ impl<T> SenderState<T> {
         }
         let next = self.next_nonce(&state);
         if c.nonce < next {
-            out.push(Verdict::Reject(c, Refusal::InFlight));
+            out.push(Verdict::Reject(
+                c,
+                Refusal::InFlight {
+                    expected_nonce: next,
+                },
+            ));
             return false;
         }
         if c.nonce > next {
@@ -135,6 +140,12 @@ impl<T> SenderState<T> {
         self.forwarded.is_empty() && self.parked.is_empty()
     }
 
+    /// The next nonce that the filter expects of the sender, 0 while its
+    /// state is unknown.
+    pub(super) fn expected_nonce(&self) -> u64 {
+        self.state.map_or(0, |state| self.next_nonce(&state))
+    }
+
     fn next_nonce(&self, state: &AccountState) -> u64 {
         if self.forwarded.is_empty() {
             return state.nonce;
@@ -175,12 +186,16 @@ impl<T> SenderState<T> {
     }
 
     fn park(&mut self, c: Candidate<T>, cfg: &AdmissionConfig, out: &mut Vec<Verdict<T>>) -> bool {
+        let expected_nonce = self.expected_nonce();
         if self.parked.contains_key(&c.nonce) {
-            out.push(Verdict::Reject(c, Refusal::InFlight));
+            out.push(Verdict::Reject(c, Refusal::InFlight { expected_nonce }));
             return false;
         }
         if self.parked.len() >= cfg.max_parked.get() {
-            out.push(Verdict::Reject(c, Refusal::TooManyPending));
+            out.push(Verdict::Reject(
+                c,
+                Refusal::TooManyPending { expected_nonce },
+            ));
             return false;
         }
         self.parked.insert(c.nonce, c);
