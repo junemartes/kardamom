@@ -42,10 +42,10 @@ pub mod rollback_log;
 pub mod routing;
 pub(crate) mod seen_receipts;
 pub mod sig_verify;
-/// Shared test and bench helpers. See the module doc for what it covers.
-#[cfg(any(test, feature = "test-support"))]
 pub mod stage_latency;
 pub(crate) mod sync_util;
+/// Shared test and bench helpers. See the module doc for what it covers.
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub(crate) mod tx_error_dedup;
 
