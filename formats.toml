@@ -34,6 +34,12 @@
 # restores v14 with decision version 3. It would restore v10 with version
 # 2, so this release does not write v10. A v13 snapshot holds one
 # activation; the loader still reads it.
+# After the feature activation of FEATURE_SEALER_V4 (feature 3, ingress
+# kind 11) is in the log, the members write v15: v14, then the switch to
+# decision version 4 (its version, the L1 origin of the last sealed block,
+# and up to three held activations), then the replay windows of version 4.
+# A release that reads only up to v14 refuses v15 and stops, so send the
+# upgrade transaction only after every member runs this release.
 # With kardamom.cluster.carryBytes=true, the members write v12: the state
 # of v10 without the void ledger, then the index of the retained file in
 # place of the retained frames. A release that reads only up to v11
@@ -42,20 +48,23 @@
 [format.sealer-snapshot]
 writes = 14
 reads_min = 1
-reads_max = 14
+reads_max = 15
 shared = true
 activation = { flag = "kardamom.cluster.carryBytes", writes = 12 }
 code = [
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_WRITE_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_READ_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#RETAINED_FILE_SNAPSHOT_VERSION",
+    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SWITCH_SNAPSHOT_VERSION",
 ]
 
 # The ingress message kinds of the sealer. The Rust writers send kinds 0
 # to 7. The sealer itself writes kind 8 into its log. The executor sends
 # kind 9 (the recorded cursor) only with KARDAMOM_EXEC_CURSOR on
 # (--exec-cursor); the default is off. No writer sends kind 10 or kind 11
-# (the feature activation). A member reads kind 11 and changes no state.
+# (the feature activation). A member reads kind 11: a record of feature 3
+# stores the schedule of decision version 4, and a record of another
+# feature changes no state.
 # Every member drops a frame of a kind it does not know, counts it, and
 # never orders it.
 [format.sealer-ingress-kinds]

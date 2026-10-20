@@ -138,7 +138,8 @@ class RetainedFileTest {
             assertEquals(heap.boundaryEnd(block), file.boundaryEnd(block), "block " + block));
 
         IntStream.range(0, 2 * RECORDS_PER_BLOCK + 3).forEach(i -> {
-            assertEquals(heap.front(), file.front());
+            assertEquals(heap.frontIsBoundary(), file.frontIsBoundary());
+            assertEquals(heap.frontKey(), file.frontKey());
             heap.evictFront();
             file.evictFront();
         });
@@ -220,7 +221,7 @@ class RetainedFileTest {
         final List<Path> all = segmentFiles();
         // Evict the first half of the frames: the front moves into a later segment.
         IntStream.range(0, Math.toIntExact(file.count() / 2)).forEach(i -> file.evictFront());
-        final List<byte[]> served = replay(file, file.front().key(), BLOCKS / 2 + 1);
+        final List<byte[]> served = replay(file, file.frontKey(), BLOCKS / 2 + 1);
 
         file.writeSnapshot(0, 1);
         assertEquals(all, segmentFiles(), "the first snapshot keeps the segments below its own front");
@@ -228,7 +229,7 @@ class RetainedFileTest {
         final List<Path> kept = segmentFiles();
         assertTrue(kept.size() < all.size(), "the next snapshot deletes them: " + kept);
         assertEquals(all.get(all.size() - 1), kept.get(kept.size() - 1));
-        assertSameFrames(served, replay(file, file.front().key(), BLOCKS / 2 + 1));
+        assertSameFrames(served, replay(file, file.frontKey(), BLOCKS / 2 + 1));
     }
 
     @Test

@@ -238,6 +238,46 @@ public final class SealerWire {
      */
     public static final byte RT_TX = io.kardamom.sealer.TxOffer.RT_TX;
 
+    /**
+     * Record type of a transaction reference:
+     * {@code [lane:u8][term_id:i32][term_offset:i32][session_id:i32]}, the
+     * place of the transaction in an ingress image of {@code tx_data}.
+     * Matches Rust {@code RT_TXREF}.
+     */
+    public static final byte RT_TXREF = 0;
+
+    /** The offset of the record type in a kind-0 frame. */
+    static final int RECORD_TYPE_OFFSET = CANONICAL_ID_OFFSET + CanonicalSealerState.CANONICAL_ID_LEN;
+
+    /** The offset of the lane in a kind-0 frame of a transaction reference. */
+    static final int REF_LANE_OFFSET = RECORD_TYPE_OFFSET + Byte.BYTES;
+
+    /** The offset of the session id in a kind-0 frame of a transaction reference. */
+    static final int REF_SESSION_OFFSET = REF_LANE_OFFSET + Byte.BYTES + Integer.BYTES + Integer.BYTES;
+
+    /** The length of a kind-0 frame of a transaction reference. */
+    static final int TXREF_RECORD_LEN = REF_SESSION_OFFSET + Integer.BYTES;
+
+    /** The length of the relayed payload of a transaction reference: the id, the record type and the fields. */
+    static final int TXREF_PAYLOAD_LEN = TXREF_RECORD_LEN - CANONICAL_ID_OFFSET;
+
+    /**
+     * The top byte of the deadline field, {@code 0x40}, when the field
+     * carries the stream position of a transaction reference in its ingress
+     * image. The position is below 2^56. Version 3 reads the value as a
+     * deadline far ahead. No deadline has this top byte: a block number is
+     * far below it, and "no deadline" is {@code 2^63 - 1} or {@code 2^64 - 1}.
+     */
+    static final long POSITION_TAG = 0x40L << 56;
+
+    /** The bits of the position below the tag. */
+    static final long POSITION_MASK = (1L << 56) - 1;
+
+    /** Whether a deadline field carries a position. */
+    static boolean carriesPosition(final long deadline) {
+        return (deadline & ~POSITION_MASK) == POSITION_TAG;
+    }
+
     /** Offset of the 32-byte canonical id in a {@link #KIND_ORIGIN_RECORD} frame. */
     static final int ORIGIN_ID_OFFSET = KIND_OFFSET + Byte.BYTES;
     /** Offset of the u64 L1 origin within a {@link #KIND_ORIGIN_RECORD} frame. */

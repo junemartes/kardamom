@@ -13,6 +13,7 @@ import java.util.EnumMap;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
 import org.agrona.MutableDirectBuffer;
 import org.agrona.collections.LongHashSet;
@@ -53,6 +54,10 @@ final class SealerEgress {
      * nothing goes unserved.</p>
      */
     private final LongHashSet consumerSessions = new LongHashSet();
+
+    /** The sessions that get relayed records, and whether a session change made the list old. */
+    private ClientSession[] targets = new ClientSession[0];
+    private boolean targetsStale = true;
 
     /**
      * Retained egress frames, in emission order, for replay requests from
@@ -117,6 +122,7 @@ final class SealerEgress {
     /** Mark a session as a canonical-stream consumer. */
     void addConsumer(final long sessionId) {
         consumerSessions.add(sessionId);
+        targetsStale = true;
     }
 
     /**
@@ -148,6 +154,7 @@ final class SealerEgress {
     /** Remove a closed session's consumer mark. */
     void removeConsumer(final long sessionId) {
         consumerSessions.remove(sessionId);
+        targetsStale = true;
     }
 
     /**
@@ -406,32 +413,33 @@ final class SealerEgress {
 
     /**
      * Retain the frame staged in {@link #egressBuffer} for future replays,
-     * hand it to the member feed, and return the array to offer. A retained
-     * array never changes. The window is pruned after the add: a frame
-     * leaves only when it is past the window and its block is posted.
+     * hand it to the member feed, and return its length. The window is
+     * pruned after the add: a frame leaves only when it is past the window
+     * and its block is posted.
      */
-    private byte[] retain(final int length) {
-        final byte[] frame = retained.append(egressBuffer, length);
+    private int retain(final int length) {
+        retained.append(egressBuffer, length);
         feed.onFrame(egressBuffer, length);
         prune();
-        return frame;
+        return length;
     }
 
     /** Evict from the front while the window is over its cap and the oldest frame is posted. */
     private void prune() {
-        while (retained.count() > retentionCap && isPosted(retained.front())) {
+        while (retained.count() > retentionCap && oldestIsPosted()) {
             evictFront();
         }
     }
 
     /** Evict the oldest frame, and move the floor of its axis past it. */
     private void evictFront() {
-        final FrameKey evicted = retained.front();
+        final boolean boundary = retained.frontIsBoundary();
+        final long key = retained.frontKey();
         retained.evictFront();
-        if (evicted.boundary()) {
-            firstRetainedBlock = evicted.key() + 1;
+        if (boundary) {
+            firstRetainedBlock = key + 1;
         } else {
-            firstRetainedIndex = evicted.key() + 1;
+            firstRetainedIndex = key + 1;
         }
     }
 
@@ -440,8 +448,8 @@ final class SealerEgress {
      * at the front was emitted after the last evicted boundary and before
      * the boundary of {@link #firstRetainedBlock}, so that is its block.
      */
-    private boolean isPosted(final FrameKey oldest) {
-        final long block = oldest.boundary() ? oldest.key() : firstRetainedBlock;
+    private boolean oldestIsPosted() {
+        final long block = retained.frontIsBoundary() ? retained.frontKey() : firstRetainedBlock;
         return block <= postedHead;
     }
 
@@ -572,7 +580,17 @@ final class SealerEgress {
      * that an egress session gets ({@link RetainedFrames#forSession}).
      */
     void offerRelayed(final Relayed relayed) {
-        offerToConsumers(retained.forSession(retain(frames.relayed(relayed))));
+        offerToConsumers(retained.forSession(egressBuffer, retain(frames.relayed(relayed))));
+    }
+
+    /**
+     * Relay {@code length} bytes of {@code src} at {@code offset} as the
+     * payload of record {@code index}. The record path of decision version
+     * 4 allocates nothing here: the frame goes from the staging buffer to
+     * the retained ring and to each session.
+     */
+    void offerRelayed(final long index, final DirectBuffer src, final int offset, final int length) {
+        offerToConsumers(retained.forSession(egressBuffer, retain(frames.relayed(index, src, offset, length))));
     }
 
     /**
@@ -590,20 +608,36 @@ final class SealerEgress {
      * session because the executor replicas consume the canonical stream on
      * their own sessions.</p>
      */
-    private void offerToConsumers(final byte[] frame) {
-        cluster.clientSessions().stream()
-            .filter(session -> consumerSessions.isEmpty() || consumerSessions.contains(session.id()))
-            .forEach(session -> backlogs.offer(session, frame));
+    private void offerToConsumers(final int length) {
+        for (final ClientSession session : targets()) {
+            backlogs.offer(session, egressBuffer, length);
+        }
+    }
+
+    /** The sessions of {@link #offerToConsumers}, built again after a session change. */
+    private ClientSession[] targets() {
+        if (targetsStale) {
+            targets = cluster.clientSessions().stream()
+                .filter(session -> consumerSessions.isEmpty() || consumerSessions.contains(session.id()))
+                .toArray(ClientSession[]::new);
+            targetsStale = false;
+        }
+        return targets;
+    }
+
+    /** A session opened or closed: the consumer fan-out builds its session list again. */
+    void sessionsChanged() {
+        targetsStale = true;
     }
 
     void offerBoundary(final Boundary boundary) {
-        final byte[] frame = retain(frameBoundary(boundary));
+        final int length = retain(frameBoundary(boundary));
         // Boundaries stay broadcast to every session, unlike relayed records.
         // There is at most one per tick, and the sequencer's boundary-only
         // lag feed (connect_with_egress_kind_filter) consumes them without a
         // SUBSCRIBE announcement. Filtering boundaries by consumer would
         // leave it unserved.
-        cluster.clientSessions().forEach(session -> backlogs.offer(session, frame));
+        cluster.clientSessions().forEach(session -> backlogs.offer(session, egressBuffer, length));
     }
 
     /**

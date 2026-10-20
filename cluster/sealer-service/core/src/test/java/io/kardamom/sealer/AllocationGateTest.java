@@ -78,6 +78,47 @@ final class AllocationGateTest {
         check("contiguity_reject", work.measure(state, Workload::skipNonce, Kind.CONTIGUITY_REJECT));
     }
 
+    /**
+     * A reference of decision version 4: eight ingress images take turns,
+     * each one a message further, with a tick at each block end. The window
+     * and the index are the whole record path.
+     */
+    @Test
+    void a_reference_of_version_four_allocates_at_most_its_baseline() {
+        CanonicalSealerState state = new CanonicalSealerState(DEDUP_CAPACITY);
+        state.onFeatureActivation(new VersionSwitch.FeatureActivation(1, VersionSwitch.FEATURE_SEALER_V4, 1L));
+        state.onOriginRecord(Workload.id(0), 1, 1, PAYLOAD, 0L);
+        state.onTick(CanonicalSealerState.TICK_INTERVAL_MS);
+        assertEquals(4, state.decisionVersion());
+        byte[] id = Workload.id(1);
+        RefClock clock = new RefClock();
+        for (int i = 0; i < WARMUP; i++) {
+            clock.offer(state, i, id);
+        }
+        int refused = 0;
+        long before = THREADS.getCurrentThreadAllocatedBytes();
+        for (int i = WARMUP; i < WARMUP + MEASURED; i++) {
+            refused += clock.offer(state, i, id) >= 0 ? 0 : 1;
+        }
+        long after = THREADS.getCurrentThreadAllocatedBytes();
+        assertEquals(0, refused, "measured references that the state refused");
+        check("ref_v4", (double) (after - before) / MEASURED);
+    }
+
+    /** The ticks of the version-4 case: one boundary at each block end. */
+    private static final class RefClock {
+        private long clock = 2 * CanonicalSealerState.TICK_INTERVAL_MS;
+
+        long offer(CanonicalSealerState state, int i, byte[] id) {
+            long index = state.onRef(0, i & 7, (long) (i >>> 3) * 128, id);
+            if (i % RECORDS_PER_BLOCK == RECORDS_PER_BLOCK - 1) {
+                clock += CanonicalSealerState.TICK_INTERVAL_MS;
+                state.onTick(clock);
+            }
+            return index;
+        }
+    }
+
     private static void check(String name, double bytesPerRecord) {
         double baseline = baseline(name);
         double limit = baseline + SLACK_BYTES;
@@ -179,7 +220,7 @@ final class AllocationGateTest {
             return state.onRecord(ids[filled + i], senders[s], nonces[s] + 1, NO_DEADLINE, PAYLOAD).kind;
         }
 
-        private static byte[] id(int i) {
+        static byte[] id(int i) {
             byte[] out = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
             out[0] = (byte) 0x5e;
             out[28] = (byte) (i >>> 24);

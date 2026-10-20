@@ -54,6 +54,9 @@ public final class SealerLoadBench {
         final RecordStream stream = new RecordStream(config.senders(), System.nanoTime(), config.v4Ids());
         final AtomicBoolean stop = new AtomicBoolean();
         final Consumer consumer = new Consumer(config, clock).connect(clientContext(cluster, aeronDir));
+        if (Boolean.parseBoolean(System.getProperty("bench.activate", String.valueOf(config.v4Ids())))) {
+            consumer.activateVersionFour();
+        }
         final List<Twin> twins = IntStream.range(0, config.twins())
                 .mapToObj(t -> new Twin(config, stream, clock, stop).connect(clientContext(cluster, aeronDir)))
                 .toList();

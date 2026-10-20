@@ -4,6 +4,7 @@ import io.kardamom.sealer.ClusterStatus;
 import java.nio.ByteBuffer;
 import java.util.stream.Stream;
 import org.agrona.DirectBuffer;
+import org.agrona.MutableDirectBuffer;
 
 /**
  * The egress frames that a member retains for replay, in emission order.
@@ -22,18 +23,17 @@ sealed interface RetainedFrames permits HeapFrames, RetainedFile {
     record Floors(long index, long block) {
     }
 
-    /**
-     * Retain the first {@code length} bytes of {@code staged}, a relayed
-     * frame or a boundary frame. Return a copy that the offer path can keep:
-     * a backlog keeps the array it gets.
-     */
-    byte[] append(DirectBuffer staged, int length);
+    /** Retain the first {@code length} bytes of {@code staged}, a relayed frame or a boundary frame. */
+    void append(DirectBuffer staged, int length);
 
     /** The number of retained frames. */
     long count();
 
-    /** The key of the oldest retained frame. Call it only when {@link #count()} is above 0. */
-    FrameKey front();
+    /** Whether the oldest retained frame is a boundary. Call it only when {@link #count()} is above 0. */
+    boolean frontIsBoundary();
+
+    /** The replay key of the oldest retained frame. Call it only when {@link #count()} is above 0. */
+    long frontKey();
 
     /** Drop the oldest retained frame. Call it only when {@link #count()} is above 0. */
     void evictFront();
@@ -90,6 +90,13 @@ sealed interface RetainedFrames permits HeapFrames, RetainedFile {
      * relayed reference: no egress session gets the envelope.
      */
     byte[] forSession(byte[] frame);
+
+    /**
+     * {@link #forSession(byte[])} in place: rewrite the first {@code length}
+     * bytes of {@code staged} as the session gets them, and return the new
+     * length.
+     */
+    int forSession(MutableDirectBuffer staged, int length);
 
     /** Release the files and the threads of the store. */
     void close();
