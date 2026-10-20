@@ -491,6 +491,17 @@ cluster-jar:
     JAVA_HOME="$JH" ./gradlew :service:shadowJar -q
     echo "cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar"
 
+# Run the sealer load bench: real sealer members on this host, racing twin
+# publishers and one consumer. Pass more settings as `-Pbench.<name>=<value>`
+# (see BenchConfig.java in cluster/sealer-service/service/src/bench). Set
+# BENCH_MEMBER_PROPS and BENCH_MEMBER_JVM for the member JVMs.
+sealer-bench members="3" rate="100000" seconds="10" *args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    JH="$(just java-home)"
+    cd cluster/sealer-service
+    JAVA_HOME="$JH" ./gradlew -q :service:sealerBench -Pbench.members={{ members }} -Pbench.rate={{ rate }} -Pbench.seconds={{ seconds }} {{ args }}
+
 # Run the chain-semantics e2e suite (Target L) locally: real service
 # binaries + a 1-member Java Aeron Cluster sealer + per-test media drivers,
 # driven through JSON-RPC/metrics only. Spec:

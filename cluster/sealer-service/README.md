@@ -722,6 +722,24 @@ Requires a JDK 17 (`JAVA_HOME`). The Gradle wrapper downloads Gradle 8.7 on firs
 - The `:service` tests run an in-process Aeron `TestCluster` (failover, replay, fan-out, snapshot restore, the admin server).
 - The docker e2e leader-kill test is the gated, real-cluster layer.
 
+### Load bench
+
+`just sealer-bench <members> <rate> <seconds>` measures the sealer under load. CI does not run it.
+
+- It starts 1 or 3 members from the sealer jar as local JVMs, with the settings of the deploy.
+- Two twins offer the same transaction references in kind-3 batches, as racing sequencers do. A rate of 0 offers as fast as the cluster takes.
+- One consumer subscribes and reads the canonical stream.
+- It prints the relayed rate, the latency from the due time of a batch to the relayed frame, the reject frames, and the GC pauses of each member.
+- `BENCH_MEMBER_PROPS` adds `-D` settings to each member, and `BENCH_MEMBER_JVM` replaces the member JVM options (default `-Xmx384m -XX:+UseSerialGC`, as on staging).
+- `-Pbench.<name>=<value>` sets the other options: `batch`, `twins`, `warmupSeconds`, `senders`. See `BenchConfig.java`.
+
+```sh
+just sealer-bench 3 5000 30
+BENCH_MEMBER_PROPS="-Dkardamom.cluster.tickMs=250" just sealer-bench 1 0 10
+```
+
+All members share the host, so a member gets less CPU than on its own server. Compare runs on the same host only.
+
 ## Running in a cluster
 
 Each of the three cluster nodes runs one JVM. The JVM hosts the `ConsensusModule` and a
