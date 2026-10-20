@@ -70,6 +70,29 @@ tasks.named('test') {
     maxParallelForks = 1
 }
 
+// The load bench (`just sealer-bench`): real sealer members from the jar,
+// racing twin publishers and a consumer in this JVM. It never runs in CI.
+sourceSets {
+    bench {
+        compileClasspath += sourceSets.main.output + configurations.runtimeClasspath
+        runtimeClasspath += sourceSets.main.output + configurations.runtimeClasspath
+    }
+}
+
+tasks.register('sealerBench', JavaExec) {
+    dependsOn 'shadowJar'
+    classpath = sourceSets.bench.runtimeClasspath
+    mainClass = 'io.kardamom.sealer.bench.SealerLoadBench'
+    jvmArgs(
+        '--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED',
+        '--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED',
+        '-Xmx1g'
+    )
+    systemProperty 'bench.jar', layout.buildDirectory.file('libs/kardamom-cluster-node.jar').get().asFile.path
+    systemProperty 'bench.dir', layout.buildDirectory.dir('sealer-bench').get().asFile.path
+    project.properties.findAll { k, v -> k.startsWith('bench.') }.each { k, v -> systemProperty k, v }
+}
+
 tasks.named('shadowJar') {
     archiveBaseName = 'kardamom-cluster-node'
     archiveClassifier = ''
