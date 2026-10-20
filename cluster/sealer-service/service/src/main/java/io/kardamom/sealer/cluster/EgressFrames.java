@@ -4,6 +4,7 @@ import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.ClusterStatus;
 import io.kardamom.sealer.Relayed;
 import java.nio.ByteOrder;
+import org.agrona.DirectBuffer;
 import org.agrona.MutableDirectBuffer;
 
 /**
@@ -32,16 +33,24 @@ final class EgressFrames {
      * copied through as is.
      */
     int relayed(final Relayed relayed) {
-        int pos = 0;
-        buf.putByte(pos, SealerWire.EGRESS_KIND_RELAYED);
-        pos += Byte.BYTES;
-        buf.putLong(pos, relayed.index, ByteOrder.LITTLE_ENDIAN);
-        pos += Long.BYTES;
-        buf.putInt(pos, relayed.payload.length, ByteOrder.LITTLE_ENDIAN);
-        pos += Integer.BYTES;
+        final int pos = relayedHeader(relayed.index, relayed.payload.length);
         buf.putBytes(pos, relayed.payload);
-        pos += relayed.payload.length;
-        return pos;
+        return pos + relayed.payload.length;
+    }
+
+    /** A relayed record whose payload is {@code length} bytes of {@code src} at {@code offset}. */
+    int relayed(final long index, final DirectBuffer src, final int offset, final int length) {
+        final int pos = relayedHeader(index, length);
+        buf.putBytes(pos, src, offset, length);
+        return pos + length;
+    }
+
+    /** {@code [kind:1][index:u64][payload_len:u32]}; returns the offset of the payload. */
+    private int relayedHeader(final long index, final int payloadLength) {
+        buf.putByte(0, SealerWire.EGRESS_KIND_RELAYED);
+        buf.putLong(Byte.BYTES, index, ByteOrder.LITTLE_ENDIAN);
+        buf.putInt(Byte.BYTES + Long.BYTES, payloadLength, ByteOrder.LITTLE_ENDIAN);
+        return SealerWire.RELAYED_HEADER_LEN;
     }
 
     /**
@@ -81,6 +90,25 @@ final class EgressFrames {
             CanonicalSealerState.CANONICAL_ID_LEN);
         ref[SealerWire.RELAYED_REF_LEN - 1] = SealerWire.RT_TX;
         return ref;
+    }
+
+    /**
+     * {@link #forSession(byte[])} in place, on the first {@code length} bytes
+     * of {@code staged}: a canonical entry becomes its relayed reference.
+     * Returns the new length.
+     */
+    static int forSession(final MutableDirectBuffer staged, final int length) {
+        final boolean entry = staged.getByte(0) == SealerWire.EGRESS_KIND_RELAYED
+            && staged.getByte(ENTRY_RECORD_TYPE_OFFSET) == SealerWire.RT_TX;
+        if (!entry) {
+            return length;
+        }
+        final byte[] id = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
+        staged.getBytes(SealerWire.RELAYED_HEADER_LEN, id);
+        staged.putByte(0, SealerWire.EGRESS_KIND_RELAYED_REF);
+        staged.putBytes(Byte.BYTES + Long.BYTES, id);
+        staged.putByte(SealerWire.RELAYED_REF_LEN - 1, SealerWire.RT_TX);
+        return SealerWire.RELAYED_REF_LEN;
     }
 
     /** A control message {@code [kind][a:u64][b:u64]}: the replay answers and the origin gap. */

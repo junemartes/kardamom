@@ -156,10 +156,21 @@ public final class CanonicalSealerState {
      * version 10 with the decision rules of up to three activations after
      * the seed digest: see {@link DecisionRules#writeTo}.
      *
-     * <p>This is the newest version that {@link #load} reads, and the
-     * version that {@link #takeSnapshot()} writes.</p>
+     * Version 15 is version 14 with the version switch and the replay
+     * windows after the decision rules: see {@link VersionSwitch#writeTo}
+     * and {@link SessionWindows#writeTo}.
+     *
+     * <p>This is the newest version that {@link #load} reads.</p>
      */
-    private static final int SNAPSHOT_READ_VERSION = 14;
+    private static final int SNAPSHOT_READ_VERSION = 15;
+
+    /**
+     * The version that {@link #takeSnapshot()} writes when the version
+     * switch holds a feature activation. A member of the release before
+     * reads only up to version 14, so the upgrade transaction comes only
+     * after every member reads version 15.
+     */
+    public static final int SWITCH_SNAPSHOT_VERSION = 15;
 
     /** The version with the decision rules of one activation; {@link #load} still reads it. */
     private static final int ONE_ACTIVATION_SNAPSHOT_VERSION = 13;
@@ -370,6 +381,12 @@ public final class CanonicalSealerState {
 
     /** The decision rules. Replicated state: see {@link DecisionRules}. */
     private DecisionRules rules = DecisionRules.start();
+
+    /** The switch to decision version 4. Replicated state: see {@link VersionSwitch}. */
+    private VersionSwitch versions = VersionSwitch.start();
+
+    /** The replay windows of decision version 4. Replicated state: see {@link SessionWindows}. */
+    private SessionWindows windows = new SessionWindows(SessionWindows.DEFAULT_SLOTS, SessionWindows.DEFAULT_WIDTH);
 
     /** Cumulative count of canonical (first-seen) records relayed. */
     private long canonicalCount;
@@ -955,6 +972,80 @@ public final class CanonicalSealerState {
         return rules.view();
     }
 
+    /** The decision version of the open block: 3, or 4 after its activation. */
+    public int decisionVersion() {
+        return versions.version();
+    }
+
+    /** The version switch as a value, for the admin endpoint. */
+    public VersionSwitch.View versionSwitch() {
+        return versions.view();
+    }
+
+    /**
+     * Take a feature activation record. It only stores the schedule: the
+     * version changes at a block boundary ({@link #onTick}).
+     */
+    public VersionSwitch.Outcome onFeatureActivation(final VersionSwitch.FeatureActivation activation) {
+        return versions.onActivation(activation, l1Origin, lastL2Timestamp);
+    }
+
+    /**
+     * The decision version of an origin-advancing record offered at
+     * {@code leaderClockMillis}. The record opens a new block: when the open
+     * block holds a record, the record forces a boundary first, and runs
+     * under the version that the boundary sets. It changes nothing.
+     */
+    int decisionVersionOfOriginRecord(final long leaderClockMillis) {
+        return canonicalCount > lastBoundaryCount
+            ? versions.versionAtBoundary(l1Origin, lastL2Timestamp, nextL2Timestamp(leaderClockMillis))
+            : versions.version();
+    }
+
+    /** {@link #onRef}: the replay window holds the reference already. */
+    public static final long REF_DUPLICATE = -1L;
+    /** {@link #onRef}: the reference is too far below the highest one of its image. */
+    public static final long REF_EXPIRED = -2L;
+    /** {@link #onRef}: the DA-lag guard refuses user records. */
+    public static final long REF_DA_LAG = -3L;
+    /** {@link #onRef}: the record-lag guard refuses user records. */
+    public static final long REF_RECORD_LAG = -4L;
+
+    /**
+     * Decision version 4: order one transaction reference by the replay
+     * window of its ingress image ({@link SessionWindows}). The record path
+     * allocates nothing.
+     *
+     * <p>The window decides first, so a copy of an ordered reference stays
+     * a silent duplicate while a lag guard refuses. A refused reference does
+     * not enter the window, so the copy that comes after the halt is
+     * fresh.</p>
+     *
+     * @param lane     the lane of the ingress image
+     * @param session  the Aeron session id of the ingress image
+     * @param position the stream position of the transaction in the image
+     * @param id32     the transaction hash, for the void ledger
+     * @return the canonical index of the reference, or a {@code REF_*} code
+     */
+    public long onRef(final int lane, final int session, final long position, final byte[] id32) {
+        final int seen = windows.check(lane, session, position, canonicalCount);
+        if (seen != SessionWindows.FRESH) {
+            return seen == SessionWindows.DUPLICATE ? REF_DUPLICATE : REF_EXPIRED;
+        }
+        if (recordLagHalted()) {
+            return REF_RECORD_LAG;
+        }
+        if (daLagHalted()) {
+            return REF_DA_LAG;
+        }
+        windows.mark();
+        voids.onReference(canonicalCount, id32, ZERO_SENDER, 0L);
+        return canonicalCount++;
+    }
+
+    /** The sender of a reference that decision version 4 orders: the void ledger keeps no sender for it. */
+    private static final byte[] ZERO_SENDER = new byte[SENDER_LEN];
+
     /**
      * Process a record without the contiguity guard (no sender identity)
      * and without a deadline. This is the pre-guard contract, kept for
@@ -989,7 +1080,9 @@ public final class CanonicalSealerState {
      * produce block numbers that increase by one each time, with no
      * gaps.</p>
      *
-     * <p>The boundary seals its block: see {@link DecisionRules#atBoundary}.</p>
+     * <p>The boundary seals its block, and sets the decision version of the
+     * next block: see {@link VersionSwitch#atBoundary}. Every entry of a
+     * block runs under one version.</p>
      */
     public Boundary onTick(long leaderClockMillis) {
         long l2Timestamp = nextL2Timestamp(leaderClockMillis);
@@ -997,6 +1090,8 @@ public final class CanonicalSealerState {
         blockNumber++;
         pruneExpired();
         rules.atBoundary(l1Origin);
+        // The sealed block executed with the time of the boundary before it.
+        versions.atBoundary(l1Origin, lastL2Timestamp, l2Timestamp);
         lastL2Timestamp = l2Timestamp;
         lastBoundaryCount = canonicalCount;
         return boundary;
@@ -1494,9 +1589,13 @@ public final class CanonicalSealerState {
         return takeSnapshot(snapshotVersion());
     }
 
-    /** The version that {@link #takeSnapshot()} writes: {@link #SNAPSHOT_WRITE_VERSION}. */
+    /**
+     * The version that {@link #takeSnapshot()} writes:
+     * {@link #SWITCH_SNAPSHOT_VERSION} when the version switch holds an
+     * activation, else {@link #SNAPSHOT_WRITE_VERSION}.
+     */
     public int snapshotVersion() {
-        return SNAPSHOT_WRITE_VERSION;
+        return versions.holdsActivation() ? SWITCH_SNAPSHOT_VERSION : SNAPSHOT_WRITE_VERSION;
     }
 
     /**
@@ -1510,16 +1609,18 @@ public final class CanonicalSealerState {
     /**
      * {@link #takeSnapshot()} in the layout of {@code version}: 10 has the
      * void ledger, 11 has the void ledger and the recorded cursors, 12 has
-     * neither, and 14 has the void ledger and the decision rules. A
+     * neither, 14 has the void ledger and the decision rules, and 15 has
+     * version 14 with the version switch and the replay windows. A
      * version-10 snapshot of a state is the same bytes in every release
      * that writes version 10.
      *
-     * @param version 10, 11, 12 or 14
+     * @param version 10, 11, 12, 14 or 15
      */
     byte[] takeSnapshot(int version) {
         boolean withVoids = version != RETAINED_FILE_SNAPSHOT_VERSION;
         boolean withCursors = version == CURSORS_SNAPSHOT_VERSION;
-        boolean withRules = version == SNAPSHOT_WRITE_VERSION;
+        boolean withSwitch = version == SWITCH_SNAPSHOT_VERSION;
+        boolean withRules = version == SNAPSHOT_WRITE_VERSION || withSwitch;
         int idCount = dedup.size();
         int senderCount = expectedNonce.size();
         int remoteCount = remoteOrigins.size();
@@ -1532,7 +1633,8 @@ public final class CanonicalSealerState {
                 + 8
                 + 1 + SealerSeed.HASH_LEN
                 + (withCursors ? recorded.snapshotLen() : 0)
-                + (withRules ? rules.snapshotLen() : 0);
+                + (withRules ? rules.snapshotLen() : 0)
+                + (withSwitch ? versions.snapshotLen() + windows.snapshotLen() : 0);
         ByteBuffer buf = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN);
         buf.putInt(SNAPSHOT_MAGIC);
         buf.putInt(version);
@@ -1586,9 +1688,14 @@ public final class CanonicalSealerState {
         if (withCursors) {
             recorded.writeTo(buf);
         }
-        // v14 only: the decision rules.
+        // v14 and v15: the decision rules.
         if (withRules) {
             rules.writeTo(buf);
+        }
+        // v15 only: the version switch and the replay windows.
+        if (withSwitch) {
+            versions.writeTo(buf);
+            windows.writeTo(buf);
         }
         return buf.array();
     }
@@ -1810,8 +1917,12 @@ public final class CanonicalSealerState {
         if (version == ONE_ACTIVATION_SNAPSHOT_VERSION) {
             state.rules = DecisionRules.readVersionThirteen(buf);
         }
-        if (version == SNAPSHOT_WRITE_VERSION) {
+        if (version == SNAPSHOT_WRITE_VERSION || version == SWITCH_SNAPSHOT_VERSION) {
             state.rules = DecisionRules.readFrom(buf);
+        }
+        if (version == SWITCH_SNAPSHOT_VERSION) {
+            state.versions = VersionSwitch.readFrom(buf);
+            state.windows = SessionWindows.readFrom(buf, SessionWindows.DEFAULT_SLOTS, SessionWindows.DEFAULT_WIDTH);
         }
         // A version-1 snapshot (before the guard existed) restores an empty
         // guard map, so every sender re-seeds on its next record. This is

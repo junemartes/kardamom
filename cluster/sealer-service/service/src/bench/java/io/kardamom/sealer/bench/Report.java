@@ -43,6 +43,7 @@ record Report(
         System.out.printf(
                 "relayed total=%d blocks=%d measured_rate=%.0f/s%n",
                 consumer.relayed(), consumer.blocks(), measured / (double) config.seconds());
+        System.out.println(consumer.timeline());
         final LatencyHistogram h = consumer.latency();
         if (h.count() == 0) {
             return;

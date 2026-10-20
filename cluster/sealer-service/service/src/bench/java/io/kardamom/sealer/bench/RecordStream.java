@@ -37,7 +37,8 @@ final class RecordStream {
     private static final int TERM_SHIFT = 26;
     private static final int TERM_MASK = (1 << TERM_SHIFT) - 1;
     private static final int SESSION_ID = 7;
-    private static final long POSITION_FLAG = 1L << 62;
+    /** The top byte that marks a position in the deadline field. */
+    private static final long POSITION_TAG = 0x40L << 56;
 
     private final int senders;
     private final long seed;
@@ -58,7 +59,7 @@ final class RecordStream {
         pos = writeSender(buf, pos, i % senders);
         buf.putLong(pos, i / senders, LE);
         pos += Long.BYTES;
-        buf.putLong(pos, v4Ids ? POSITION_FLAG | position : Long.MAX_VALUE, LE);
+        buf.putLong(pos, v4Ids ? POSITION_TAG | position : Long.MAX_VALUE, LE);
         pos += Long.BYTES;
         buf.setMemory(pos, TIP_LEN, (byte) 0);
         pos += TIP_LEN;

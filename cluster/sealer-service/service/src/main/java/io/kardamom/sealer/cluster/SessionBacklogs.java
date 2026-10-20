@@ -7,6 +7,7 @@ import java.util.ArrayDeque;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import org.agrona.DirectBuffer;
 import org.agrona.collections.Long2ObjectHashMap;
 import org.agrona.concurrent.UnsafeBuffer;
 
@@ -189,6 +190,46 @@ final class SessionBacklogs {
         this.memberId = memberId;
         this.stallDeadlineNs = stallDeadlineNs;
         this.byteLimit = byteLimit;
+    }
+
+    /**
+     * Offer the first {@code length} bytes of {@code frame} to one session.
+     * The offer reads the buffer in place, so a sent frame costs no copy.
+     * Only a frame that waits in a backlog is copied to an array.
+     */
+    Outcome offer(final ClientSession session, final DirectBuffer frame, final int length) {
+        final Backlog backlog = bySession.get(session.id());
+        if (backlog != null) {
+            return append(backlog, copy(frame, length));
+        }
+        if (session.isClosing()) {
+            return Outcome.DROPPED;
+        }
+        final long result = attemptInPlace(session, frame, length);
+        if (result >= 0) {
+            return Outcome.SENT;
+        }
+        if (retryable(result)) {
+            return append(open(session), copy(frame, length));
+        }
+        closeOnTerminal(session, result, copy(frame, length));
+        return Outcome.DROPPED;
+    }
+
+    private static byte[] copy(final DirectBuffer frame, final int length) {
+        final byte[] out = new byte[length];
+        frame.getBytes(0, out);
+        return out;
+    }
+
+    /** {@link #attempt} on the first {@code length} bytes of a buffer. */
+    private static long attemptInPlace(final ClientSession session, final DirectBuffer frame, final int length) {
+        try {
+            final long result = session.offer(frame, 0, length);
+            return result == Publication.ADMIN_ACTION ? session.offer(frame, 0, length) : result;
+        } catch (final IllegalArgumentException aboveMaxMessageLength) {
+            return FRAME_TOO_LONG;
+        }
     }
 
     /**

@@ -194,8 +194,9 @@ A consumer can resume past the head of the sealer. This happens after a sealer w
 
 ## Dedup window and inclusion deadline
 
-The first-seen window is the one thing that stops a lagging racing replica from getting its
-re-offer ordered twice. It never evicts an id. It prunes by deadline.
+Under version 3, the first-seen window is the one thing that stops a lagging racing replica from
+getting its re-offer ordered twice. It never evicts an id. It prunes by deadline. Under
+version 4, a reference with a position takes its replay window instead: see [Version 4](#version-4).
 
 - Each ingress record carries a `deadline`: the last block the sealer may order it into.
   - The ingress proxy stamps it as the newest block boundary it saw plus `--inclusion-horizon-blocks`.
@@ -500,12 +501,12 @@ The member list names each member by its Consul node name, for example `sealer-0
 
 Every member applies the same log. Two members on two rule versions can decide one entry differently, and the replicated state forks.
 
-- Every member runs version 3 from its start. No setting selects the version, and no record changes it.
+- Every member runs version 3 from its start. `FEATURE_SEALER_V4` (feature id 3) switches it to version 4. See [Version 4](#version-4).
 - A relayed frame of kinds 0, 3, 4 and 5 needs its record-type byte. A frame that ends at the record type drops as malformed.
-- The member reports its version in the sealer info (egress kind 17): to each session when it opens, and to every open session at each new leadership term (a leader change can lose a frame of the old leader).
-- A feature activation record (ingress kind 11) changes no state. The member prints `cluster FEATURE-ACTIVATION` with the outcome `IGNORED`. No sequencer sends the record.
-- The snapshot is version 14: version 10, then the rules. See [Snapshot](#snapshot).
-- Admin `/status` reports `decisionVersion` (3), and `decisionActivationOrigin` and `decisionActivationMs`: the newest feature activation that the snapshot tail holds, both 0 when it holds none.
+- The member reports its version in the sealer info (egress kind 17): to each session when it opens, to every open session at each new leadership term (a leader change can lose a frame of the old leader), and to every open session at a switch.
+- A feature activation record (ingress kind 11) of feature 3 stores the schedule of the switch. A record of another feature changes no state. The member prints `cluster FEATURE-ACTIVATION` with the outcome.
+- The snapshot is version 14: version 10, then the rules. A member that holds an activation of feature 3 writes version 15. See [Snapshot](#snapshot).
+- Admin `/status` reports `decisionVersion` (3 or 4), and `decisionActivationOrigin` and `decisionActivationMs`: the newest activation of feature 3, else the newest one that the snapshot tail holds, both 0 when there is none.
 
 `FEATURE_SEALER_V3` (feature id 2) turns on the nonce burn of a skipped transaction. The executor, the validator, the replay and the zk guest read the flag at each block, so a replay of a block from before the activation, or from a time that the feature was off, uses no nonce on a skip. The sealer does not read the flag.
 
@@ -526,7 +527,25 @@ The procedure of an upgrade transaction:
 
 - A rollback of the sealer to the release before this one is safe while `FEATURE_SEALER_V3` stays on: that release reads snapshot version 14 with version 3 and the held activation, and decides every entry as this release does.
 - A sealer that starts from a seed file, or at genesis, runs version 3.
-- The trust: any client of the cluster can send kind 11, as it can send kind 0 and kind 7. The record changes no state. The cluster network must admit only the services of the chain.
+- The trust: any client of the cluster can send kind 11, as it can send kind 0 and kind 7. The cluster network must admit only the services of the chain.
+
+### Version 4
+
+Version 4 orders a transaction reference by the replay window of its ingress image, not by its id. The window allocates nothing and needs no map.
+
+- **The identity.** A reference names its ingress image by the lane and the `tx_data` session id of its `TxRef` fields. Racing sequencers read the same image, so their copies carry the same values. The sequencer puts the stream position of the transaction in the deadline field of the guard header, with the top byte `0x40`. The position is below 2^56. No deadline has that top byte: a block number is far below it, and "no deadline" is `2^63 - 1` or `2^64 - 1`. Version 3 reads the value as a deadline far ahead.
+- **The window.** The member keeps a window for each image: the highest position unit (the position divided by 32), and one bit for each of the 2^18 units below it. A reference is checked in this order:
+  1. A unit 2^18 or more below the highest is expired. The member drops it and counts it (`cluster REF-EXPIRED`).
+  2. A unit whose bit is set is a copy. The member drops it.
+  3. The record-lag guard and the DA-lag guard. A refused reference does not enter the window, so the copy after the halt is ordered.
+  4. Otherwise the member sets the bit and orders the reference.
+- **The slots.** The windows are 256 fixed slots. A new image takes a free slot, else the slot whose image has been silent longest, by the canonical count. Every member picks the same slot.
+- **Other records.** A reference without a position (from an older sequencer) takes the rules of version 3. An epoch and a remote-origin record keep the id window. With priority fees on, a held reference takes the version-4 rules when the ordering window flushes it.
+- **No contiguity guard.** Version 4 does not check the nonce of a reference, and does not move the expected nonce of its sender. The executor skips a transaction whose nonce is not the next one.
+- **The switch.** At the switch, a lagging copy of a reference that version 3 ordered can be ordered again. The executor skips the second copy with its nonce. The executor must keep the first receipt of a hash before the activation.
+- **The cost.** The record path allocates nothing in the state (`AllocationGateTest`, case `ref_v4`). With no ordering window, the relay copies the payload from the log buffer into the retained ring and offers it to each session from one staging buffer. A frame is copied to an array only when a session is back-pressured.
+- **The activation.** `FEATURE_SEALER_V4` follows the same rules as the switch above: the activation becomes visible at the boundary that seals the first block of its epoch, and the version changes at the first boundary at or after its time. The member asks for a snapshot at the record and at the switch, so a replay has a start point on each side.
+- The sequencer of this release sends no activation record of feature 3, so an upgrade transaction of feature 3 changes no sealer yet.
 
 | Version | Rule change |
 |---|---|
@@ -667,6 +686,7 @@ The chaos suite and operators read these lines. The admin server also exports on
 
 - The member reads snapshot versions 1 to 14. It writes version 14, or version 12 with `carryBytes`.
   - Version 14 is version 10, then the decision rules after the seed digest: `[decision_version:u8][sealed_origin:u64][held:u8]`, then `[origin:u64][time_ms:u64]` for each held activation, oldest first (at most three). The member writes version 3 and `sealed_origin`, the L1 origin of the last sealed block. It keeps the held activations of the snapshot that it restored, and adds none. A member of the release before this one restores the same rules, and runs version 3 while `FEATURE_SEALER_V3` stays on. A tail of version 2 restores as version 3. See [Decision version](#decision-version).
+  - Version 15 is version 14, then the switch to version 4: `[decision_version:u8][sealed_origin:u64][held:u8]` and `[origin:u64][time_ms:u64]` for each held activation of feature 3, then the replay windows: `[slots:i32][width:i32][used:i32]` and, for each used slot, `[key:u64][highest:u64][last_seen:u64][bits]` (the bitmap is 32 KiB). A member writes version 15 once it holds an activation of feature 3. A member of the release before reads only up to version 14, so the upgrade transaction comes only after every member runs this release. A member checks that the snapshot was written with its own slot count and width.
   - Version 13 is version 10, then `[decision_version:u8][activation_origin:u64][activation_ms:u64]`: one held activation.
   - Version 12 is the state section of version 10 without the void ledger, then the retention section of the retained file. A member with `carryBytes` takes no void request and no recorded cursor, so it holds neither.
   - This release does not write version 10. A member of the release before it restores version 10 with decision version 2.
