@@ -296,3 +296,80 @@ fn a_rebuilt_row_matches_a_referenced_row_only_up_to_the_mark() {
         "{diffs:?}"
     );
 }
+
+/// An executed receipt, or a skip that used no nonce, of `hash` at `idx`.
+fn copy_receipt(hash: u64, idx: u64, executed: bool) -> Receipt {
+    Receipt {
+        tx_idx: BPosition::from_index(idx),
+        tx_hash: B256::from(U256::from(hash)),
+        status: executed,
+        gas_used: if executed { 21_000 } else { 0 },
+        write_set_hash: if executed {
+            B256::from(U256::from(7u64))
+        } else {
+            kardamom_types::EMPTY_WRITE_SET_HASH
+        },
+        skip_reason: (!executed).then_some(kardamom_types::SkipReason::NonceTooLow),
+        ..Default::default()
+    }
+}
+
+/// A transaction that the sealer ordered more than once: the index of its
+/// hash names the receipt that used the nonce, and the sweep counts the
+/// other copies as repeats.
+#[test]
+fn the_index_of_a_repeated_transaction_names_the_receipt_that_used_its_nonce() {
+    let dir = tempfile::tempdir().unwrap();
+    write_receipt_blocks(
+        dir.path(),
+        [
+            vec![copy_receipt(0xA1, 1, true)],
+            vec![
+                copy_receipt(0xA1, 2, false),
+                copy_receipt(0xA2, 3, false),
+                copy_receipt(0xA2, 4, true),
+                copy_receipt(0xA3, 5, false),
+            ],
+        ],
+    );
+    let env = open(dir.path());
+    let indexed = |hash: u64| {
+        crate::nonce_query::committed_receipt(&env, B256::from(U256::from(hash)))
+            .unwrap()
+            .receipt
+            .unwrap()
+            .tx_idx
+            .as_index()
+    };
+    assert_eq!(indexed(0xA1), 1, "a later copy keeps the executed receipt");
+    assert_eq!(indexed(0xA2), 4, "the executed copy wins in its block");
+    assert_eq!(indexed(0xA3), 5, "a lone skip takes the index");
+    let r = sweep(&env).unwrap();
+    assert!(r.is_clean(), "problems: {:?}", r.problems);
+    assert_eq!(r.repeated_receipts, 2);
+}
+
+/// Write blocks 1 and 2 with `blocks`, each receipt with its reference.
+fn write_receipt_blocks(dir: &std::path::Path, blocks: [Vec<Receipt>; 2]) {
+    let env = open(dir);
+    crate::genesis::seed_genesis(&env, &[], &[]).unwrap();
+    let mut handle = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
+    for (block, receipts) in (1..=2u64).zip(blocks) {
+        let end = receipts.last().unwrap().tx_idx;
+        let delta = BlockDelta {
+            block_number: block,
+            receipts,
+            ..Default::default()
+        };
+        let boundary = BlockBoundary {
+            block_number: block,
+            end_tx_idx: end,
+            l2_timestamp: 1_700_000_000 + block,
+            l1_origin: 0,
+            base_fee: 0,
+            gas_used: 0,
+        };
+        handle.delta_tx.send(with_ref(boundary, delta)).unwrap();
+    }
+    handle.shutdown().unwrap();
+}

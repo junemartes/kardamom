@@ -68,7 +68,18 @@ impl ReceiptCache {
     /// shortens only its own horizon. The indexes fill before the ring
     /// does: a concurrent insert that displaces this slot then finds
     /// the rows to remove, and no row outlives its slot.
+    ///
+    /// A skip that used no nonce, such as a copy of a transaction that the
+    /// sealer ordered again, never replaces the receipt of its
+    /// (sender, nonce): it is dropped, and takes no slot.
     pub(crate) fn insert(&self, receipt: Receipt) {
+        if !receipt.uses_nonce()
+            && self
+                .by_sender_nonce
+                .contains_key(&(receipt.from, receipt.nonce))
+        {
+            return;
+        }
         let identity = Identity::of(&receipt);
         let receipt = Arc::new(receipt);
         self.by_sender_nonce
@@ -237,5 +248,31 @@ mod tests {
         assert!(c.lookup_by_tx_hash(old).is_none());
         assert_eq!(c.lookup(s, 1).unwrap().tx_hash, new);
         assert_eq!(c.lookup_by_tx_hash(new).unwrap().tx_idx.term_offset, 2);
+    }
+
+    // A copy of a transaction that the sealer ordered again skips with no
+    // nonce. It never replaces the receipt that used the nonce, and a later
+    // receipt that uses the nonce replaces a skip.
+    #[tokio::test]
+    async fn a_skip_that_used_no_nonce_never_replaces_the_receipt_of_its_nonce() {
+        let c = ReceiptCache::new(NonZeroUsize::new(8).unwrap());
+        let s = Address::repeat_byte(0x33);
+        let h = B256::repeat_byte(0x11);
+        let skip = |at: i32| Receipt {
+            status: false,
+            gas_used: 0,
+            skip_reason: Some(kardamom_types::SkipReason::NonceTooLow),
+            ..receipt(s, 1, h, at)
+        };
+        c.insert(receipt(s, 1, h, 1));
+        c.insert(skip(2));
+        assert_eq!(c.lookup(s, 1).unwrap().tx_idx.term_offset, 1);
+        assert_eq!(c.lookup_by_tx_hash(h).unwrap().tx_idx.term_offset, 1);
+
+        let t = Address::repeat_byte(0x44);
+        c.insert(Receipt { from: t, ..skip(3) });
+        assert_eq!(c.lookup(t, 1).unwrap().tx_idx.term_offset, 3);
+        c.insert(receipt(t, 1, B256::repeat_byte(0x22), 4));
+        assert_eq!(c.lookup(t, 1).unwrap().tx_idx.term_offset, 4);
     }
 }

@@ -127,11 +127,15 @@ job "executor" {
   # state forks at the first such skip. On a genesis without the
   # KardamomChainState code, the executor of this release installs the code
   # with the first setFeature system deposit. An older executor runs that
-  # deposit as a call to an empty account and forks. The upgrade check
+  # deposit as a call to an empty account and forks. The executor of this
+  # release keeps the receipt that used the nonce as the index of its hash
+  # and of its (sender, nonce), when the sealer orders a transaction more
+  # than once (first_receipt). The upgrade check
   # (`just sealer-upgrade-check <env>`) reads these metas.
   meta {
     nonce_burn          = "true"
     chain_state_install = "true"
+    first_receipt       = "true"
   }
 
   datacenters = [var.datacenter]

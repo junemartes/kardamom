@@ -520,6 +520,7 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
   - The cache is bounded. It keeps the newest `receipt_cache_capacity` receipts (default 128 Ki, which is 131,072). It evicts the oldest receipt first.
   - On a cache miss, `eth_getTransactionReceipt` asks the state DB of an executor. A receipt found there enters the cache.
   - The `receipts` and `tx_hash_index` tables of the state DB are filled by the executor commit path. The query endpoint of the executor serves the path `eth_getTransactionReceipt(hash)` to `get_tx_position` to `get_receipt`.
+  - Under sealer decision version 4, the sealer can order one transaction more than once, when a client sends the same signed bytes again. Only one copy can use the nonce. The `tx_hash_index` row of the hash, and the Redis receipt of its `(sender, nonce)`, name the receipt that used the nonce. A skip that used no nonce takes them only while they hold no receipt. The integrity sweep counts the other copies as repeated receipts.
   - The lookup is bounded by the token bucket of the client, the in-flight bound of the query client and its timeout. A shed or failed query answers `null`. This is the same answer as "not committed yet".
   - The counter is `kardamom_cache_lookups_total{layer="receipt", outcome}`. The outcomes are `hit`, `state_hit`, `miss`, `shed` and `state_error`.
   - Proof: `ingress-pair-loss-recover` kills both ingresses under load. It requires the receipt of every accepted transaction afterwards.

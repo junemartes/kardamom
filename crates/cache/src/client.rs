@@ -390,12 +390,19 @@ impl AccountCache {
         for receipt in indexed {
             let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(receipt)
                 .map_err(|e| CacheError::Codec(e.to_string()))?;
-            pipe.cmd("SET")
+            let set = pipe
+                .cmd("SET")
                 .arg(keys::receipt(receipt.from, receipt.nonce))
                 .arg(bytes.as_slice())
                 .arg("EX")
-                .arg(self.receipt_ttl.as_secs())
-                .ignore();
+                .arg(self.receipt_ttl.as_secs());
+            // One receipt of a (sender, nonce) uses the nonce. A skip that
+            // used none, such as a copy of a transaction that the sealer
+            // ordered again, takes the key only while it has no receipt.
+            if !receipt.uses_nonce() {
+                set.arg("NX");
+            }
+            set.ignore();
         }
         if pipe.cmd_iter().next().is_none() {
             return Ok(());

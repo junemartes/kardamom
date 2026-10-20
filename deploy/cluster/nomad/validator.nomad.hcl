@@ -120,11 +120,14 @@ job "validator" {
   # older validator finds a divergence at the first such skip. The
   # validator of this release also installs the KardamomChainState code
   # with the first setFeature system deposit on a genesis without it. An
-  # older validator finds a divergence at that deposit. The upgrade check
+  # older validator finds a divergence at that deposit. The validator of
+  # this release keeps the receipt that used the nonce as the index of its
+  # hash, as the executor does (first_receipt). The upgrade check
   # (`just sealer-upgrade-check <env>`) reads these metas.
   meta {
     nonce_burn          = "true"
     chain_state_install = "true"
+    first_receipt       = "true"
   }
 
   datacenters = [var.datacenter]
