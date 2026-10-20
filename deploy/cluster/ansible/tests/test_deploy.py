@@ -250,7 +250,7 @@ class NomadAPI(BaseHTTPRequestHandler):
             node = f'node-cluster-{octet - 1}'
             default = 'LEADER' if node.endswith('-0') else 'FOLLOWER'
             self.respond({'memberId': octet - 1, 'role': state['roles'].get(node, default), 'election': 'CLOSED',
-                          'snapshotReadsMax': state.get('reads_max', {}).get(node, 14)})
+                          'snapshotReadsMax': state.get('reads_max', {}).get(node, 15)})
         elif parts[2] == 'job' and parts[4] == 'deployment':
             # A job with a scripted deployment gets one; every other job
             # has none, like a system job.
@@ -1276,7 +1276,7 @@ class RecordTest(Deploys):
         self.assertIn('the registered sealer job names decisionVersion=3', output)
         self.assertEqual(self.api.state['writes'], [])
 
-    def upgrade_check(self, success=True, feature='3', activation_ms=''):
+    def upgrade_check(self, success=True, feature='5', activation_ms=''):
         """Run the upgrade check for an upgrade transaction of `feature` at `activation_ms`."""
         return self.run_deploy(playbook='upgrade-check.yml', success=success,
                                environ={'KARDAMOM_UPGRADE_FEATURE': feature,
@@ -1287,7 +1287,7 @@ class RecordTest(Deploys):
         output = self.upgrade_check()
         self.assertIn('The upgrade check passed: 3 sealer members read snapshot version 14', output)
         self.assertIn('the live allocations of sequencer, executor, validator, ingress', output)
-        self.assertIn('The upgrade transaction of feature 3 may go to the Safe', output)
+        self.assertIn('The upgrade transaction of feature 5 may go to the Safe', output)
 
     def test_the_upgrade_check_allows_the_sealer_feature_only_on_at_once(self):
         """A new network turns FEATURE_SEALER_V3 on at once. Off, or on at a later time, is refused."""
@@ -1297,6 +1297,33 @@ class RecordTest(Deploys):
         for activation_ms in ('18446744073709551615', '1700000000000', ''):
             output = self.upgrade_check(success=False, feature='2', activation_ms=activation_ms)
             self.assertIn('Only the time 0 (on at once) is allowed', output)
+
+    def test_the_upgrade_check_refuses_feature_three_before_the_executor_keeps_the_first_receipt(self):
+        """Decision version 4 can order a copy twice at the switch: the executor must keep the first receipt."""
+        self.deploy()
+        output = self.upgrade_check(success=False, feature='3', activation_ms='0')
+        self.assertIn('the executor job does not keep the first receipt of a transaction hash', output)
+        self.assertIn('(job meta first_receipt)', output)
+        self.api.state['jobs']['executor']['Meta']['first_receipt'] = 'true'
+        output = self.upgrade_check(feature='3', activation_ms='0')
+        self.assertIn('3 sealer members read snapshot version 15', output)
+        self.assertIn('The upgrade transaction of feature 3 may go to the Safe', output)
+
+    def test_the_upgrade_check_refuses_feature_three_on_a_member_that_reads_no_version_fifteen(self):
+        self.deploy()
+        self.api.state['jobs']['executor']['Meta']['first_receipt'] = 'true'
+        self.api.state['reads_max'] = {'node-cluster-2': 14}
+        output = self.upgrade_check(success=False, feature='3', activation_ms='0')
+        self.assertIn('needs every sealer member to read snapshot version 15', output)
+        output = self.upgrade_check(feature='5')
+        self.assertIn('The upgrade transaction of feature 5 may go to the Safe', output)
+
+    def test_the_upgrade_check_refuses_feature_three_on_a_sequencer_that_sends_no_position(self):
+        self.deploy()
+        self.api.state['jobs']['executor']['Meta']['first_receipt'] = 'true'
+        del self.api.state['jobs']['sequencer']['Meta']['sealer_v4']
+        output = self.upgrade_check(success=False, feature='3', activation_ms='0')
+        self.assertIn('the sequencer job does not send the activation of decision version 4', output)
 
     def test_the_upgrade_check_refuses_a_missing_feature(self):
         self.deploy()

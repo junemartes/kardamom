@@ -289,6 +289,9 @@ struct ResyncWiring {
     fees: FeeGate,
     /// The epoch lane, whose signal sender the egress-watermark feed holds.
     epoch_lane: kardamom_sequencer::epoch::EpochPump,
+    /// The decision version that the egress-watermark feed reads off the
+    /// sealer, for the publish loop.
+    sealer_version: kardamom_sequencer::sealer_rules::SealerVersion,
     feeds: ResyncFeeds,
 }
 
@@ -366,6 +369,7 @@ impl ResyncWiring {
         // The epoch lane reads the same egress: the boundaries confirm its
         // epochs, and an origin-gap reject makes it offer them again.
         let (origins, epoch_lane) = kardamom_sequencer::epoch::EpochPump::new();
+        let sealer_version = kardamom_sequencer::sealer_rules::SealerVersion::default();
         let watermark_task = feeds::EgressWatermarkFeed::new(
             cfg.resync.boundary_silence_ms,
             cfg.partition_index,
@@ -373,6 +377,7 @@ impl ResyncWiring {
             answer_tx,
             deadline_tx,
             origins,
+            sealer_version.clone(),
         )
         .spawn(cluster_egress, shutdown.clone());
 
@@ -424,6 +429,7 @@ impl ResyncWiring {
             lookup,
             fees,
             epoch_lane,
+            sealer_version,
             feeds: ResyncFeeds {
                 watermark_task,
                 receipts_task,
@@ -541,6 +547,31 @@ async fn spawn_events_beacon(plane: &mut StreamPlane, rt: &AeronRuntime) -> Resu
     Ok(())
 }
 
+/// The start lines: the contract line for the CI drift check, which must
+/// match the cluster JVM's -Dkardamom.cluster.dedupCapacity (see
+/// cluster.nomad.hcl), and the settings of this replica.
+fn log_start(cfg: &SequencerConfig) -> anyhow::Result<()> {
+    kardamom_sequencer::metrics::record_start_time();
+    tracing::info!(
+        dedup_capacity = cfg.resync.dedup_capacity.get(),
+        enter_percent = cfg.resync.enter_percent.get(),
+        boundary_silence_ms = cfg.resync.boundary_silence_ms,
+        "resync contract: dedup_capacity must equal the cluster's -Dkardamom.cluster.dedupCapacity"
+    );
+    tracing::info!(
+        partition_index = cfg.partition_index,
+        sequencer_id = cfg.sequencer_id,
+        tx_ttl_ms = cfg.tx_ttl_ms.get(),
+        lane = cfg.lane(),
+        extra_lanes = ?cfg.extra_lanes,
+        vslots = %cfg.vslot_set().context("vslots")?,
+        shadow_vslots = %cfg.shadow_vslots,
+        shadow_warm_ms = kardamom_types::time::duration_to_ms_saturating(cfg.shadow_warm()),
+        "kardamom-sequencer starting"
+    );
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
@@ -563,27 +594,7 @@ async fn main() -> anyhow::Result<()> {
         )
     )
     .await?;
-    // Contract line for the CI drift check: this must match the cluster
-    // JVM's -Dkardamom.cluster.dedupCapacity (see cluster.nomad.hcl).
-    kardamom_sequencer::metrics::record_start_time();
-    tracing::info!(
-        dedup_capacity = cfg.resync.dedup_capacity.get(),
-        enter_percent = cfg.resync.enter_percent.get(),
-        boundary_silence_ms = cfg.resync.boundary_silence_ms,
-        "resync contract: dedup_capacity must equal the cluster's -Dkardamom.cluster.dedupCapacity"
-    );
-
-    tracing::info!(
-        partition_index = cfg.partition_index,
-        sequencer_id = cfg.sequencer_id,
-        tx_ttl_ms = cfg.tx_ttl_ms.get(),
-        lane = cfg.lane(),
-        extra_lanes = ?cfg.extra_lanes,
-        vslots = %cfg.vslot_set().context("vslots")?,
-        shadow_vslots = %cfg.shadow_vslots,
-        shadow_warm_ms = kardamom_types::time::duration_to_ms_saturating(cfg.shadow_warm()),
-        "kardamom-sequencer starting"
-    );
+    log_start(&cfg)?;
 
     let log_cfg = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
     let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
@@ -657,6 +668,7 @@ async fn main() -> anyhow::Result<()> {
         resync: Some(resync.controller),
         lookup: resync.lookup,
         fees: resync.fees,
+        sealer_version: resync.sealer_version,
         shutdown: shutdown.clone(),
         idle_cap,
     }

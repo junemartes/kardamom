@@ -191,11 +191,37 @@ pub const KIND_RECORDED_CURSOR: u8 = 9;
 /// Ingress kind: a sequencer's feature activation, a system record:
 /// `[kind:u8 = 11][l1_origin:u64][feature_id:u64][activation_ms:u64]`, 25
 /// bytes. The upgrade transaction of the epoch at `l1_origin` schedules
-/// `feature_id` at `activation_ms`. No sequencer sends it: the sealer
-/// follows no feature, and a record of this kind changes no sealer state.
-/// A sealer that does not know the kind drops the frame.
+/// `feature_id` at `activation_ms`. The sequencer sends it for
+/// [`kardamom_types::upgrades::FEATURE_SEALER_V4`] in front of that epoch,
+/// on the same session, each time it offers the epoch. The sealer stores
+/// the schedule, and switches to decision version 4 at a block boundary,
+/// as the executor switches a flag. A record of another feature changes no
+/// sealer state. A sealer that does not know the kind drops the frame.
 /// Matches Java `KIND_FEATURE_ACTIVATION`.
 pub const KIND_FEATURE_ACTIVATION: u8 = 11;
+
+/// The decision version of the sealer after the activation of
+/// [`kardamom_types::upgrades::FEATURE_SEALER_V4`].
+pub const SEALER_V4_DECISION_VERSION: u8 = 4;
+
+/// The top byte of the guard header's deadline field when the field
+/// carries the stream position of a transaction reference in its
+/// `tx_data` image. A sealer on decision version 4 orders such a reference
+/// by the replay window of its image. Version 3 reads the value as a
+/// deadline far ahead. No deadline has this top byte: a block number is far
+/// below it, and "no deadline" is `u64::MAX`. Matches Java
+/// `SealerWire.POSITION_TAG`.
+pub const POSITION_TAG: u64 = 0x40 << 56;
+
+/// The positions that [`POSITION_TAG`] leaves room for: below 2^56.
+pub const POSITION_MASK: u64 = (1 << 56) - 1;
+
+/// The deadline field that carries `stream_position`, or `None` for a
+/// position at or above 2^56, which no image reaches.
+#[must_use]
+pub fn position_deadline(stream_position: u64) -> Option<u64> {
+    (stream_position <= POSITION_MASK).then_some(POSITION_TAG | stream_position)
+}
 /// Ingress kind: a replay request `[kind:u8 = 1][from_index:u64][from_block:u64]`.
 /// The service re-offers retained egress frames with `record.index >=
 /// from_index` or `boundary.block_number >= from_block`, to the

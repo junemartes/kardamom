@@ -5,6 +5,7 @@ use kardamom_cluster_adapter::wire::{
     encode_egress_boundary, encode_record_lag_reject, encode_status,
 };
 use kardamom_sequencer::resync::{SealerRefusal, SharedWatermark};
+use kardamom_sequencer::sealer_rules::SealerVersion;
 use kardamom_types::cluster_status::RecordLagStatus;
 use kardamom_types::{ClusterStatus, TxErrorReason};
 
@@ -24,6 +25,7 @@ fn a_record_lag_reject_is_a_terminal_refusal() {
         answer_tx,
         deadline_tx,
         origins,
+        SealerVersion::default(),
     );
     let sender = Address::repeat_byte(0x13);
     let lag = RecordLagStatus {
@@ -58,8 +60,15 @@ fn a_snapshot_notice_holds_the_lag_flag_until_the_next_boundary() {
     let (reject_tx, _reject_rx) = crossbeam_channel::bounded(4);
     let (origins, _origins_rx) = crossbeam_channel::unbounded();
     let watermark = SharedWatermark::new();
-    let mut feed =
-        EgressWatermarkFeed::new(1, 0, watermark.clone(), reject_tx, deadline_tx, origins);
+    let mut feed = EgressWatermarkFeed::new(
+        1,
+        0,
+        watermark.clone(),
+        reject_tx,
+        deadline_tx,
+        origins,
+        SealerVersion::default(),
+    );
     let notice = encode_status(&ClusterStatus {
         snapshot_follows: true,
         ..ClusterStatus::default()

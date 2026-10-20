@@ -76,6 +76,14 @@ pub const SET_FEATURE_SELECTOR: [u8; 4] = [0x8a, 0xfd, 0xb8, 0x54];
 /// all time.
 pub const FEATURE_SEALER_V3: u64 = 2;
 
+/// Decision version 4 of the sealer: it orders a transaction reference by
+/// the replay window of its ingress image, not by its id. Only the sealer
+/// follows it: the sequencer sends its activation record in front of the
+/// epoch of the `setFeature` deposit, and the sealer switches at the
+/// boundary that seals the first block of that epoch. The executor does
+/// not read it.
+pub const FEATURE_SEALER_V4: u64 = 3;
+
 /// The length of `setFeature` calldata: the selector and two words.
 const SET_FEATURE_LEN: usize = 4 + 32 + 32;
 

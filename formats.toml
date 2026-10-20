@@ -61,10 +61,11 @@ code = [
 # The ingress message kinds of the sealer. The Rust writers send kinds 0
 # to 7. The sealer itself writes kind 8 into its log. The executor sends
 # kind 9 (the recorded cursor) only with KARDAMOM_EXEC_CURSOR on
-# (--exec-cursor); the default is off. No writer sends kind 10 or kind 11
-# (the feature activation). A member reads kind 11: a record of feature 3
-# stores the schedule of decision version 4, and a record of another
-# feature changes no state.
+# (--exec-cursor); the default is off. No writer sends kind 10. The
+# sequencer sends kind 11 (the feature activation) only in front of an
+# epoch that holds an upgrade transaction of feature 3. A member reads
+# kind 11: a record of feature 3 stores the schedule of decision version
+# 4, and a record of another feature changes no state.
 # Every member drops a frame of a kind it does not know, counts it, and
 # never orders it.
 [format.sealer-ingress-kinds]

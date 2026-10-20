@@ -37,6 +37,7 @@ fn one_batch_frame_fans_out_to_every_receipt_in_order() {
         bytes: codec::encode(&frame).unwrap().to_vec(),
         pos,
         session: 0,
+        stream_pos: 0,
     })
     .unwrap();
 
@@ -74,6 +75,7 @@ async fn a_rollback_frame_reads_as_a_rollback_and_batch_readers_skip_it() {
         bytes: bytes.to_vec(),
         pos,
         session,
+        stream_pos: 0,
     };
     let rollback_bytes = codec::encode(&rollback).unwrap();
     assert_eq!(rollback_bytes.len(), ReceiptFrame::ROLLBACK_LEN);
@@ -121,12 +123,14 @@ async fn recv_batch_keeps_the_rows_and_skips_a_bad_frame() {
         bytes: vec![0xFF; 3],
         pos,
         session: 0,
+        stream_pos: 0,
     })
     .unwrap();
     tx.send(RawFrame {
         bytes: codec::encode(&frame).unwrap().to_vec(),
         pos,
         session: 41,
+        stream_pos: 0,
     })
     .unwrap();
 

@@ -8,6 +8,7 @@
 //! rewind-and-retry path applies.
 
 use kardamom_types::EpochRecord;
+use kardamom_types::upgrades::FEATURE_SEALER_V4;
 use kardamom_types::xchain::RemoteEpochRecord;
 
 use crate::SequencerError;
@@ -102,6 +103,21 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
     }
 
     fn try_publish_epoch(&mut self, e: &EpochRecord) -> Result<(), SequencerError> {
+        // The activation of decision version 4 goes in front of its epoch,
+        // on this session. The pump offers the same epoch again after back
+        // pressure, a gap or a restart, so the activation goes out again
+        // with it, and the sealer ignores a copy. An epoch that the sealer
+        // ordered is never offered again, so the activation must not come
+        // after it.
+        if let Some(activation) = wire::FeatureActivation::of(e, FEATURE_SEALER_V4) {
+            self.offer(&activation.encode())?;
+            tracing::info!(
+                l1_origin = activation.l1_origin,
+                feature_id = activation.feature_id,
+                activation_ms = activation.activation_ms,
+                "sealer feature activation offered"
+            );
+        }
         // This uses KIND_ORIGIN_RECORD, not a plain record. The sealer
         // must close the open block and adopt this epoch's L1 number
         // before it relays the record. Epochs are never batched: there is
@@ -279,23 +295,54 @@ mod tests {
         assert_eq!(u32::from_le_bytes(sent[0][41..45].try_into().unwrap()), 2);
     }
 
-    /// An epoch that holds an upgrade transaction goes out alone: the
-    /// sealer follows no feature, so no feature activation record goes in
-    /// front of it.
-    #[test]
-    fn an_epoch_with_an_upgrade_goes_out_without_a_feature_activation() {
+    /// An epoch with the upgrade transaction of `feature` at time 9 000.
+    fn epoch_with_upgrade(feature: u64) -> EpochRecord {
         use kardamom_types::epoch::{LockboxLog, UpgradeLog, derive_epoch};
-        use kardamom_types::upgrades::FEATURE_SEALER_V3;
 
         let block = B256::repeat_byte(0x22);
         let upgrade = LockboxLog::Upgrade(UpgradeLog {
             block_number: 4_242,
             block_hash: block,
             log_index: 0,
-            feature_id: alloy_primitives::U256::from(FEATURE_SEALER_V3),
+            feature_id: alloy_primitives::U256::from(feature),
             activation_timestamp: 9_000,
         });
-        let e = derive_epoch(4_242, block, &[upgrade]).unwrap();
+        derive_epoch(4_242, block, &[upgrade]).unwrap()
+    }
+
+    /// The upgrade of decision version 4 goes out in front of its epoch,
+    /// and again with each new offer of the epoch.
+    #[test]
+    fn publishes_the_activation_of_version_four_in_front_of_its_epoch() {
+        let e = epoch_with_upgrade(FEATURE_SEALER_V4);
+        let ingress = FakeIngress::new();
+        let mut pubr = ClusterRefPublisher::new(ingress.clone());
+        pubr.try_publish_epoch(&e).unwrap();
+        pubr.try_publish_epoch(&e).unwrap();
+
+        let kinds: Vec<u8> = ingress.accepted().iter().map(|frame| frame[0]).collect();
+        assert_eq!(
+            kinds,
+            [
+                wire::KIND_FEATURE_ACTIVATION,
+                wire::KIND_ORIGIN_RECORD,
+                wire::KIND_FEATURE_ACTIVATION,
+                wire::KIND_ORIGIN_RECORD
+            ]
+        );
+        let activation = wire::FeatureActivation {
+            l1_origin: 4_242,
+            feature_id: FEATURE_SEALER_V4,
+            activation_ms: 9_000,
+        };
+        assert_eq!(ingress.accepted()[0], activation.encode());
+    }
+
+    /// An epoch with the upgrade of another feature goes out alone: the
+    /// sealer follows only decision version 4.
+    #[test]
+    fn an_epoch_with_another_upgrade_goes_out_without_a_feature_activation() {
+        let e = epoch_with_upgrade(kardamom_types::upgrades::FEATURE_SEALER_V3);
         let ingress = FakeIngress::new();
         let mut pubr = ClusterRefPublisher::new(ingress.clone());
         pubr.try_publish_epoch(&e).unwrap();

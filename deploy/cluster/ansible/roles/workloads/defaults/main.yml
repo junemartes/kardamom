@@ -363,3 +363,17 @@ workloads_upgrade_jobs:
   - name: ingress
     metas: [nonce_burn]
     does: take a skip that uses its nonce
+
+# The services that decision version 4 of the sealer (feature 3) also
+# needs. sealer_v4: the sequencer sends the activation record of feature 3
+# in front of its epoch, and the stream position of each reference under
+# version 4. first_receipt: the executor keeps the first receipt of a
+# transaction hash, so a copy that the switch orders a second time skips
+# without a second receipt.
+workloads_upgrade_v4_jobs:
+  - name: sequencer
+    metas: [sealer_v4]
+    does: send the activation of decision version 4 and the stream positions
+  - name: executor
+    metas: [first_receipt]
+    does: keep the first receipt of a transaction hash
