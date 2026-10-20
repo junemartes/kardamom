@@ -26,6 +26,7 @@ fn cfg() -> AdmissionConfig {
         max_forwarded: NonZeroUsize::new(64).unwrap(),
         loss_blocks: NonZeroU64::new(8).unwrap(),
         park_width: NonZeroU64::new(1 << 18).unwrap(),
+        park_ttl: Duration::from_secs(60),
         max_senders: NonZeroUsize::new(1 << 20).unwrap(),
     }
 }
@@ -46,7 +47,7 @@ impl Lane {
         let senders: Vec<Address> = (0..SENDERS)
             .map(|i| Address::left_padding_from(&(i as u64 + 1).to_be_bytes()))
             .collect();
-        let mut admission = Admission::new(cfg());
+        let mut admission = Admission::new(cfg(), Instant::now());
         let mut out = Vec::new();
         for (i, s) in senders.iter().enumerate() {
             admission.on_lookup(*s, state(0, i as u64), &mut out);
@@ -80,7 +81,7 @@ impl Lane {
         self.admission
             .on_rows(self.block, rows.iter().copied(), &mut self.out);
         self.rows = rows;
-        self.admission.sweep(&mut self.out);
+        self.admission.sweep(Instant::now(), &mut self.out);
         forwarded
     }
 

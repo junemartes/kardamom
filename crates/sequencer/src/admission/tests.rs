@@ -1,4 +1,5 @@
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, U256};
 
@@ -12,6 +13,7 @@ fn cfg() -> AdmissionConfig {
         max_forwarded: NonZeroUsize::new(8).unwrap(),
         loss_blocks: NonZeroU64::new(3).unwrap(),
         park_width: NonZeroU64::new(1_000).unwrap(),
+        park_ttl: Duration::from_secs(4),
         max_senders: NonZeroUsize::new(16).unwrap(),
     }
 }
@@ -57,7 +59,7 @@ fn names(out: &[Verdict<u64>]) -> Vec<String> {
 
 /// A filter that holds `state` for sender 1.
 fn known(s: AccountState) -> Admission<u64> {
-    let mut a = Admission::new(cfg());
+    let mut a = Admission::new(cfg(), Instant::now());
     a.on_lookup(sender(1), s, &mut Vec::new());
     a
 }
@@ -111,7 +113,7 @@ fn a_gap_parks_and_the_gap_filler_frees_the_run_behind_it() {
 
 #[test]
 fn a_sender_with_no_state_asks_once_and_the_answer_frees_its_transactions() {
-    let mut a = Admission::new(cfg());
+    let mut a = Admission::new(cfg(), Instant::now());
     assert_eq!(offer(&mut a, tx(1, 3, 1)), ["L"]);
     assert!(offer(&mut a, tx(1, 4, 2)).is_empty(), "one lookup is out");
     let mut out = Vec::new();
@@ -127,9 +129,15 @@ fn a_past_nonce_and_a_nonce_in_flight_are_refused() {
         ["R4:NonceTooLow { chain_nonce: 5 }"]
     );
     offer(&mut a, tx(1, 5, 2));
-    assert_eq!(offer(&mut a, tx(1, 5, 3)), ["R5:InFlight"]);
+    assert_eq!(
+        offer(&mut a, tx(1, 5, 3)),
+        ["R5:InFlight { expected_nonce: 6 }"]
+    );
     offer(&mut a, tx(1, 7, 4));
-    assert_eq!(offer(&mut a, tx(1, 7, 5)), ["R7:InFlight"]);
+    assert_eq!(
+        offer(&mut a, tx(1, 7, 5)),
+        ["R7:InFlight { expected_nonce: 6 }"]
+    );
 }
 
 #[test]
@@ -171,13 +179,13 @@ fn a_run_that_no_state_confirms_is_lost_after_the_loss_window() {
     offer(&mut a, tx(1, 6, 2));
     let mut out = Vec::new();
     a.on_rows(2, [], &mut out);
-    a.sweep(&mut out);
+    a.sweep(Instant::now(), &mut out);
     assert!(
         offer(&mut a, tx(1, 5, 3))[0].starts_with("R5:InFlight"),
         "two blocks are inside the window"
     );
     a.on_rows(3, [], &mut out);
-    a.sweep(&mut out);
+    a.sweep(Instant::now(), &mut out);
     assert_eq!(
         offer(&mut a, tx(1, 5, 4)),
         ["F5"],
@@ -191,20 +199,20 @@ fn a_parked_transaction_expires_when_its_image_moves_past_it() {
     offer(&mut a, tx(1, 9, 10));
     offer(&mut a, tx(2, 0, 1_009));
     let mut out = Vec::new();
-    a.sweep(&mut out);
+    a.sweep(Instant::now(), &mut out);
     assert!(out.is_empty(), "999 units is inside the width");
     offer(&mut a, tx(2, 1, 1_010));
-    a.sweep(&mut out);
-    assert_eq!(names(&out), ["R9:Expired"]);
+    a.sweep(Instant::now(), &mut out);
+    assert_eq!(names(&out), ["R9:Expired { expected_nonce: 5 }"]);
 }
 
 #[test]
 fn a_sweep_forgets_the_idle_senders_above_the_bound() {
-    let mut a: Admission<u64> = Admission::new(cfg());
+    let mut a: Admission<u64> = Admission::new(cfg(), Instant::now());
     let mut out = Vec::new();
     (0..32u8).for_each(|b| a.on_lookup(sender(b), state(0, COST, 1), &mut out));
     a.offer(tx(1, 0, 1), &mut out);
-    a.sweep(&mut out);
+    a.sweep(Instant::now(), &mut out);
     assert_eq!(a.senders(), 1, "only the sender with a forwarded run stays");
 }
 
@@ -213,4 +221,17 @@ fn a_rollback_makes_each_sender_ask_again() {
     let mut a = known(state(5, 10 * COST, 1));
     a.on_rollback();
     assert_eq!(offer(&mut a, tx(1, 5, 1)), ["L"]);
+}
+
+#[test]
+fn a_parked_transaction_expires_when_it_waited_too_long() {
+    let start = Instant::now();
+    let mut a: Admission<u64> = Admission::new(cfg(), start);
+    a.on_lookup(sender(1), state(5, 10 * COST, 1), &mut Vec::new());
+    offer(&mut a, tx(1, 9, 10));
+    let mut out = Vec::new();
+    a.sweep(start + Duration::from_secs(3), &mut out);
+    assert!(out.is_empty(), "three seconds is inside the time to live");
+    a.sweep(start + Duration::from_secs(4), &mut out);
+    assert_eq!(names(&out), ["R9:Expired { expected_nonce: 5 }"]);
 }

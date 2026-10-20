@@ -85,3 +85,7 @@ harness = false
 [[bench]]
 name = "admission"
 harness = false
+
+[[bench]]
+name = "v2_loop"
+harness = false

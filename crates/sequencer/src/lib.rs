@@ -59,6 +59,7 @@ pub(crate) mod state;
 pub mod testkit;
 mod tx_decode;
 mod unconfirmed;
+pub mod v2;
 
 pub use config::{BackpressurePolicy, SequencerConfig};
 pub use epoch::EpochSubscriber;

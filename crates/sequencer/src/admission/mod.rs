@@ -29,7 +29,10 @@
 //!   it, or the executor skipped it with no nonce. The filter forgets the
 //!   run, and the sender can send from its chain nonce again.
 //! - A parked transaction expires when its ingress image moves
-//!   [`AdmissionConfig::park_width`] position units past it.
+//!   [`AdmissionConfig::park_width`] position units past it, so the
+//!   sealer window still holds it when it goes out, or when it waited
+//!   [`AdmissionConfig::park_ttl`], so the client gets an answer on a
+//!   quiet lane. The time is the time of the last sweep.
 //!
 //! A sender with nothing forwarded and nothing parked is idle. Above
 //! [`AdmissionConfig::max_senders`], a sweep forgets the idle senders: the
@@ -39,6 +42,7 @@ mod sender;
 
 use std::collections::VecDeque;
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::time::{Duration, Instant};
 
 use alloy_primitives::map::HashMap;
 use alloy_primitives::{Address, U256};
@@ -56,6 +60,8 @@ pub struct AdmissionConfig {
     pub loss_blocks: NonZeroU64,
     /// The position units of an image after which a parked transaction expires.
     pub park_width: NonZeroU64,
+    /// The time after which a parked transaction expires.
+    pub park_ttl: Duration,
     /// The senders above which a sweep forgets the idle ones.
     pub max_senders: NonZeroUsize,
 }
@@ -100,12 +106,13 @@ pub enum Refusal {
     NonceTooLow { chain_nonce: u64 },
     /// The balance less the forwarded run does not cover the cost.
     InsufficientFunds { available: U256, cost: U256 },
-    /// The sender has too many transactions that wait.
-    TooManyPending,
+    /// The sender has too many transactions that wait. `expected_nonce`
+    /// is the next nonce of the sender, 0 while its state is unknown.
+    TooManyPending { expected_nonce: u64 },
     /// The filter forwarded or holds a transaction at this nonce already.
-    InFlight,
+    InFlight { expected_nonce: u64 },
     /// The image moved too far past the parked transaction.
-    Expired,
+    Expired { expected_nonce: u64 },
 }
 
 /// One outcome of the filter.
@@ -130,6 +137,8 @@ struct ForwardMark {
 /// A parked transaction, in arrival order within its image, for the park expiry.
 struct ParkMark {
     unit: u64,
+    /// The time of the last sweep before it parked.
+    at: Instant,
     sender: Address,
     nonce: u64,
 }
@@ -149,17 +158,20 @@ pub struct Admission<T> {
     forwards: VecDeque<ForwardMark>,
     /// The newest block of rows.
     block: u64,
+    /// The time of the last sweep.
+    now: Instant,
 }
 
 impl<T> Admission<T> {
     #[must_use]
-    pub fn new(cfg: AdmissionConfig) -> Self {
+    pub fn new(cfg: AdmissionConfig, now: Instant) -> Self {
         Self {
             cfg,
             senders: HashMap::default(),
             images: HashMap::default(),
             forwards: VecDeque::new(),
             block: 0,
+            now,
         }
     }
 
@@ -176,6 +188,7 @@ impl<T> Admission<T> {
         let key = (c.image.lane, c.image.session);
         let mark = ParkMark {
             unit: c.image.unit,
+            at: self.now,
             sender: c.sender,
             nonce: c.nonce,
         };
@@ -226,9 +239,11 @@ impl<T> Admission<T> {
     }
 
     /// Expire the forwarded runs that no state confirmed within the loss
-    /// window, and the parked transactions that their image left behind.
-    /// Forget the idle senders above the sender bound.
-    pub fn sweep(&mut self, out: &mut Vec<Verdict<T>>) {
+    /// window, and the parked transactions that their image left behind or
+    /// that waited longer than the time to live at `now`. Forget the idle
+    /// senders above the sender bound.
+    pub fn sweep(&mut self, now: Instant, out: &mut Vec<Verdict<T>>) {
+        self.now = now;
         let window = self.cfg.loss_blocks.get();
         while self
             .forwards
@@ -237,9 +252,12 @@ impl<T> Admission<T> {
         {
             self.expire_forward(out);
         }
-        let width = self.cfg.park_width.get();
+        let limit = ParkLimit {
+            width: self.cfg.park_width.get(),
+            oldest: now.checked_sub(self.cfg.park_ttl),
+        };
         for marks in self.images.values_mut() {
-            marks.expire(width, &mut self.senders, out);
+            marks.expire(limit, &mut self.senders, out);
         }
         if self.senders.len() > self.cfg.max_senders.get() {
             self.senders.retain(|_, s| !s.is_idle());
@@ -274,20 +292,33 @@ impl<T> Admission<T> {
     }
 }
 
+/// When a parked transaction expires: `width` units behind the highest
+/// unit of its image, or parked at or before `oldest`.
+#[derive(Clone, Copy)]
+struct ParkLimit {
+    width: u64,
+    oldest: Option<Instant>,
+}
+
+impl ParkLimit {
+    fn passed(self, mark: &ParkMark, highest: u64) -> bool {
+        highest - mark.unit >= self.width || self.oldest.is_some_and(|oldest| mark.at <= oldest)
+    }
+}
+
 impl ImageMarks {
-    /// Expire the parked transactions of this image that the image left
-    /// `width` units behind. The mark of a transaction that left the park
-    /// drops with no verdict.
+    /// Expire the parked transactions of this image past `limit`. The mark
+    /// of a transaction that left the park drops with no verdict.
     fn expire<T>(
         &mut self,
-        width: u64,
+        limit: ParkLimit,
         senders: &mut HashMap<Address, SenderState<T>>,
         out: &mut Vec<Verdict<T>>,
     ) {
         while self
             .parked
             .front()
-            .is_some_and(|p| self.highest - p.unit >= width)
+            .is_some_and(|p| limit.passed(p, self.highest))
         {
             self.expire_front(senders, out);
         }
@@ -299,11 +330,15 @@ impl ImageMarks {
         out: &mut Vec<Verdict<T>>,
     ) {
         let expired = self.parked.pop_front().and_then(|mark| {
-            senders
-                .get_mut(&mark.sender)
-                .and_then(|s| s.unpark(mark.nonce, mark.unit))
+            senders.get_mut(&mark.sender).and_then(|s| {
+                s.unpark(mark.nonce, mark.unit)
+                    .map(|c| (c, s.expected_nonce()))
+            })
         });
-        out.extend(expired.map(|c| Verdict::Reject(c, Refusal::Expired)));
+        out.extend(
+            expired
+                .map(|(c, expected_nonce)| Verdict::Reject(c, Refusal::Expired { expected_nonce })),
+        );
     }
 }
 
