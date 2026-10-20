@@ -18,7 +18,8 @@
 //!   --features full-pipeline-e2e --test local_load -- --ignored --nocapture
 //! ```
 //!
-//! `KARDAMOM_LOAD_TPS` sets the ramp ceiling (default 20,000 tx/s), and
+//! `KARDAMOM_LOAD_TPS` sets the ramp ceiling (default 20,000 tx/s),
+//! `KARDAMOM_LOAD_STEP` the ramp step (default 1,000 tx/s for 10 s), and
 //! `KARDAMOM_LOAD_SECS` the soak (default 60 s). The load uses 16 of the
 //! prefunded dev accounts, from index 2.
 
@@ -46,6 +47,7 @@ async fn local_stack_load_ramp() {
     let target = stack.target(Duration::from_secs(30)).expect("target");
     let tps = env_or("KARDAMOM_LOAD_TPS", 20_000).to_string();
     let secs = format!("{}s", env_or("KARDAMOM_LOAD_SECS", 60));
+    let step = env_or("KARDAMOM_LOAD_STEP", 1_000).to_string();
     let report = stack.root().join("load.json");
     let status = tokio::process::Command::new(bin("kardamom-load").expect("kardamom-load"))
         .args(["--rpc", &target.rpc.url])
@@ -59,6 +61,7 @@ async fn local_stack_load_ramp() {
             "chain",
         ])
         .args(["--target-tps", &tps, "--duration", &secs])
+        .args(["--ramp-step-tps", &step, "--ramp-step-secs", "10"])
         .args(["--max-in-flight", "4096", "--scrape", ""])
         .arg("--output")
         .arg(&report)
