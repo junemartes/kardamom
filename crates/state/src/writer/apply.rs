@@ -25,6 +25,29 @@ use crate::trie;
 
 use super::{StateWriter, TrieMode, TxRefs, WriteBatch};
 
+/// One `tx_hash_index` entry of a block: the key, the value, and whether
+/// the receipt used its nonce.
+struct IndexEntry {
+    key: [u8; 32],
+    value: Vec<u8>,
+    used_nonce: bool,
+}
+
+impl IndexEntry {
+    /// `Vec::dedup_by` over entries sorted by key: `later` drops when it
+    /// names the hash of `kept`. A later receipt that used its nonce takes
+    /// the place of a kept one that used none.
+    fn merge_copy(later: &mut Self, kept: &mut Self) -> bool {
+        if later.key != kept.key {
+            return false;
+        }
+        if later.used_nonce && !kept.used_nonce {
+            std::mem::swap(later, kept);
+        }
+        true
+    }
+}
+
 /// Per-section stopwatches for one `apply` call, reported when
 /// `KARDAMOM_WRITER_TIMING` is set.
 struct ApplyTimings {
@@ -178,6 +201,15 @@ impl<'a> BatchWriter<'a> {
     /// reads: `StateDatabase::get_tx_position(hash)`, then
     /// `StateDatabase::get_receipt(pos)`, and the batcher read where a
     /// block's bytes are once the sealer no longer retains the block.
+    ///
+    /// The sealer can order one transaction more than once: a client sends
+    /// the same signed bytes again, and the copies take different places in
+    /// the ingress stream. Only one copy can use the nonce; the others skip
+    /// and use none. So the index of a hash names the receipt that used the
+    /// nonce ([`Receipt::uses_nonce`]), and a receipt that used none takes
+    /// the index only while the hash has no entry. Every copy carries the
+    /// same bytes, so the first reference of a hash in the block serves
+    /// each copy.
     fn receipts_and_index(mut self, batch: &WriteBatch) -> Result<Self, StateError> {
         let t = Instant::now();
         let delta = &batch.delta;
@@ -187,12 +219,15 @@ impl<'a> BatchWriter<'a> {
             TxRefs::Archive(refs) => refs,
             TxRefs::RebuiltFromL1 => &[],
         };
-        let data: HashMap<_, _> = refs.iter().map(|r| (r.tx_hash, TxDataRef::of(r))).collect();
+        let mut data: HashMap<_, _> = HashMap::with_capacity(refs.len());
+        for r in refs {
+            data.entry(r.tx_hash).or_insert_with(|| TxDataRef::of(r));
+        }
         // Receipts arrive in ascending BPosition order, so use a cursor.
         // One pass writes each receipt and collects its hash-index entry,
         // instead of a second walk over `delta.receipts` just to build `hk`.
         let mut cur = self.txn.cursor(self.receipts)?;
-        let mut hk: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(delta.receipts.len());
+        let mut hk: Vec<IndexEntry> = Vec::with_capacity(delta.receipts.len());
         for r in &delta.receipts {
             let pos_key = encode_b_position(r.tx_idx);
             cur.put(&pos_key, &encode_receipt_value(r), WriteFlags::UPSERT)?;
@@ -200,17 +235,41 @@ impl<'a> BatchWriter<'a> {
                 tx_idx: r.tx_idx,
                 data: data.get(&r.tx_hash).copied(),
             };
-            hk.push((encode_tx_hash_key(r.tx_hash), encode_tx_hash_value(&value)));
+            hk.push(IndexEntry {
+                key: encode_tx_hash_key(r.tx_hash),
+                value: encode_tx_hash_value(&value),
+                used_nonce: r.uses_nonce(),
+            });
         }
         // The hash index's keys are random. Sort them first, so the cursor
-        // gets the same locality benefit.
-        hk.sort_unstable_by_key(|e| e.0);
+        // gets the same locality benefit. The sort is stable: the copies of
+        // one hash keep the order of their receipts. Then one entry stays
+        // for each hash: the receipt that used the nonce, else the first.
+        hk.sort_by_key(|e| e.key);
+        hk.dedup_by(IndexEntry::merge_copy);
+        let writes = hk
+            .iter()
+            .filter_map(|e| self.index_write(e).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
         let mut cur = self.txn.cursor(self.tx_hash_index)?;
-        for (k, v) in &hk {
-            cur.put(k, v, WriteFlags::UPSERT)?;
+        for e in writes {
+            cur.put(&e.key, &e.value, WriteFlags::UPSERT)?;
         }
         self.timing.receipts = t.elapsed();
         Ok(self)
+    }
+
+    /// The entry to write: a receipt that used its nonce always writes, and
+    /// any other receipt writes only when the hash has no entry.
+    fn index_write<'e>(&self, e: &'e IndexEntry) -> Result<Option<&'e IndexEntry>, StateError> {
+        if e.used_nonce {
+            return Ok(Some(e));
+        }
+        let held = self
+            .txn
+            .get::<Vec<u8>>(self.tx_hash_index.dbi(), &e.key)?
+            .is_some();
+        Ok((!held).then_some(e))
     }
 
     /// Write the block-level durable cursors, last so a reader never sees a

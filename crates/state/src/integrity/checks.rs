@@ -11,7 +11,7 @@ use std::ops::ControlFlow;
 
 use alloy_primitives::B256;
 use alloy_trie::KECCAK_EMPTY;
-use kardamom_types::BPosition;
+use kardamom_types::{BPosition, Receipt};
 
 use signet_libmdbx::Database;
 use signet_libmdbx::tx::aliases::RwTxSync;
@@ -237,19 +237,21 @@ impl<'a> Sweep<'a> {
         })?;
         // Check the reverse direction too: every index entry must point at
         // an existing receipt. Counts alone would let dangling entries hide
-        // behind missing ones.
+        // behind missing ones. A repeated receipt has no entry of its own.
         let index_entries = self.check_index_rows(receipts_db, tx_hash_db)?;
-        if index_entries != self.r.receipts {
+        let indexed = self.r.receipts - self.r.repeated_receipts;
+        if index_entries != indexed {
             self.problem(format!(
-                "tx_hash_index has {index_entries} entries, receipts has {}",
-                self.r.receipts
+                "tx_hash_index has {index_entries} entries, receipts has {} ({} repeated)",
+                self.r.receipts, self.r.repeated_receipts
             ));
         }
         Ok(())
     }
 
     /// One `receipts` row: it must decode, carry its own position, and have a
-    /// matching `tx_hash_index` entry that maps back to the same position.
+    /// matching `tx_hash_index` entry that maps back to the same position,
+    /// unless it repeats a transaction and used no nonce.
     fn check_receipt_row(
         &mut self,
         tx_hash_db: Database,
@@ -277,7 +279,7 @@ impl<'a> Sweep<'a> {
                 receipt.tx_idx
             ));
         }
-        self.check_receipt_indexed(tx_hash_db, receipt.tx_hash, pos)?;
+        self.check_receipt_indexed(tx_hash_db, &receipt, pos)?;
         if let Some(m) = meta_end_tx
             && pos > m
         {
@@ -287,13 +289,15 @@ impl<'a> Sweep<'a> {
     }
 
     /// The `tx_hash_index` entry for one receipt: it must exist, and it must
-    /// map `tx_hash` back to `pos`.
+    /// map the hash back to `pos`. A receipt that used no nonce may find
+    /// the entry of another copy of its transaction: it is a repeat.
     fn check_receipt_indexed(
         &mut self,
         tx_hash_db: Database,
-        tx_hash: B256,
+        receipt: &Receipt,
         pos: BPosition,
     ) -> Result<(), StateError> {
+        let tx_hash = receipt.tx_hash;
         let Some(index_bytes) = self
             .txn
             .get::<Vec<u8>>(tx_hash_db.dbi(), &encode_tx_hash_key(tx_hash))?
@@ -303,6 +307,7 @@ impl<'a> Sweep<'a> {
         };
         match decode_tx_hash_value(&index_bytes).map(|v| v.tx_idx) {
             Ok(indexed_pos) if indexed_pos == pos => (),
+            Ok(_) if !receipt.uses_nonce() => self.r.repeated_receipts += 1,
             Ok(indexed_pos) => self.problem(format!(
                 "tx_hash_index[{tx_hash}] -> {indexed_pos:?}, receipt sits at {pos:?}"
             )),

@@ -28,7 +28,8 @@
 # 4. It also needs every sealer member to read snapshot version 15, and the
 # services of workloads_upgrade_v4_jobs: a sequencer that sends the
 # activation record of feature 3 and the stream positions, and an executor
-# that keeps the first receipt of a transaction hash.
+# and a validator that keep the receipt that used the nonce of a
+# transaction that the sealer ordered more than once.
 - name: Keep the feature and the activation time of the upgrade transaction
   ansible.builtin.set_fact:
     workloads_upgrade_feature: "{{ lookup('env', 'KARDAMOM_UPGRADE_FEATURE') | trim }}"

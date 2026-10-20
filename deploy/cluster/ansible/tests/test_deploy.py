@@ -1299,19 +1299,20 @@ class RecordTest(Deploys):
             self.assertIn('Only the time 0 (on at once) is allowed', output)
 
     def test_the_upgrade_check_refuses_feature_three_before_the_executor_keeps_the_first_receipt(self):
-        """Decision version 4 can order a copy twice at the switch: the executor must keep the first receipt."""
+        """Decision version 4 orders a transaction again: the executor must keep the receipt that used the nonce."""
         self.deploy()
-        output = self.upgrade_check(success=False, feature='3', activation_ms='0')
-        self.assertIn('the executor job does not keep the first receipt of a transaction hash', output)
-        self.assertIn('(job meta first_receipt)', output)
-        self.api.state['jobs']['executor']['Meta']['first_receipt'] = 'true'
         output = self.upgrade_check(feature='3', activation_ms='0')
         self.assertIn('3 sealer members read snapshot version 15', output)
         self.assertIn('The upgrade transaction of feature 3 may go to the Safe', output)
+        for job in ('executor', 'validator'):
+            del self.api.state['jobs'][job]['Meta']['first_receipt']
+            output = self.upgrade_check(success=False, feature='3', activation_ms='0')
+            self.assertIn(f'the {job} job does not keep the receipt that used the nonce', output)
+            self.assertIn('(job meta first_receipt)', output)
+            self.api.state['jobs'][job]['Meta']['first_receipt'] = 'true'
 
     def test_the_upgrade_check_refuses_feature_three_on_a_member_that_reads_no_version_fifteen(self):
         self.deploy()
-        self.api.state['jobs']['executor']['Meta']['first_receipt'] = 'true'
         self.api.state['reads_max'] = {'node-cluster-2': 14}
         output = self.upgrade_check(success=False, feature='3', activation_ms='0')
         self.assertIn('needs every sealer member to read snapshot version 15', output)
@@ -1320,7 +1321,6 @@ class RecordTest(Deploys):
 
     def test_the_upgrade_check_refuses_feature_three_on_a_sequencer_that_sends_no_position(self):
         self.deploy()
-        self.api.state['jobs']['executor']['Meta']['first_receipt'] = 'true'
         del self.api.state['jobs']['sequencer']['Meta']['sealer_v4']
         output = self.upgrade_check(success=False, feature='3', activation_ms='0')
         self.assertIn('the sequencer job does not send the activation of decision version 4', output)
