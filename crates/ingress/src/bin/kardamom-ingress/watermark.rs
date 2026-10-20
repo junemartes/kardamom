@@ -8,7 +8,7 @@ use std::ops::ControlFlow;
 
 use kardamom_cluster_adapter::{LiveCluster, LiveEgress};
 use kardamom_ingress::cluster::{ClusterWatermarkObserver, EgressProgress, Observed};
-use kardamom_ingress::seal_latency::SealClock;
+use kardamom_ingress::stage_latency::StageClock;
 use kardamom_log::aeron_live::TxStatusPublisherHandle;
 use kardamom_types::{ClusterStatus, QuorumWatermark, TxStatus};
 use tokio::sync::{broadcast, watch};
@@ -22,7 +22,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 /// here. The status publish is fire-and-forget on the Aeron thread.
 pub(crate) struct ClusterWatermarkPump {
     observer: ClusterWatermarkObserver<LiveEgress>,
-    seal_clock: SealClock,
+    seal_clock: StageClock,
     tx: broadcast::Sender<QuorumWatermark>,
     cluster_status: watch::Sender<ClusterStatus>,
     status: TxStatusPublisherHandle,
@@ -50,7 +50,7 @@ pub(crate) struct ClusterWatermark {
 impl ClusterWatermarkPump {
     pub(crate) fn new(
         observer: ClusterWatermarkObserver<LiveEgress>,
-        seal_clock: SealClock,
+        seal_clock: StageClock,
         tx: broadcast::Sender<QuorumWatermark>,
         cluster_status: watch::Sender<ClusterStatus>,
         status: TxStatusPublisherHandle,
@@ -113,7 +113,7 @@ impl ClusterWatermarkPump {
             let _ = self.tx.send(QuorumWatermark { position });
         }
         if let Some(tx_hash) = progress.sealed {
-            self.seal_clock.sealed(tx_hash);
+            self.seal_clock.observe(tx_hash);
             self.publish_sealed(tx_hash);
         }
     }
