@@ -90,8 +90,8 @@ same layouts. All integers are little-endian. A frame starts with a one-byte kin
   - The frame is shorter than a kind-0 frame. A sealer that does not know kind 9 drops it as malformed.
 - With `carryBytes`, a member drops kinds 6 and 9 as unknown kinds. Its snapshot holds no void ledger and no recorded cursor.
 - Kind 11: the feature activation is a system record. It has no guard header. See [Decision version](#decision-version).
-  - The upgrade transaction of the epoch at `l1_origin` schedules `feature_id` at `activation_ms`. No sequencer sends it.
-  - The member follows no feature: the record changes no state. Each frame prints `cluster FEATURE-ACTIVATION` with the outcome `IGNORED`.
+  - The upgrade transaction of the epoch at `l1_origin` schedules `feature_id` at `activation_ms`. The sequencer sends it for feature 3 in front of that epoch.
+  - A record of feature 3 stores the schedule of decision version 4. A record of another feature changes no state. Each frame prints `cluster FEATURE-ACTIVATION` with its outcome.
   - A frame that is not 25 bytes is malformed.
 
 ### Relayed record types
@@ -545,7 +545,8 @@ Version 4 orders a transaction reference by the replay window of its ingress ima
 - **The switch.** At the switch, a lagging copy of a reference that version 3 ordered can be ordered again. The executor skips the second copy with its nonce. The executor must keep the first receipt of a hash before the activation.
 - **The cost.** The record path allocates nothing in the state (`AllocationGateTest`, case `ref_v4`). With no ordering window, the relay copies the payload from the log buffer into the retained ring and offers it to each session from one staging buffer. A frame is copied to an array only when a session is back-pressured.
 - **The activation.** `FEATURE_SEALER_V4` follows the same rules as the switch above: the activation becomes visible at the boundary that seals the first block of its epoch, and the version changes at the first boundary at or after its time. The member asks for a snapshot at the record and at the switch, so a replay has a start point on each side.
-- The sequencer of this release sends no activation record of feature 3, so an upgrade transaction of feature 3 changes no sealer yet.
+- **The sequencer side.** The sequencer sends the activation record of feature 3 in front of the epoch of its upgrade transaction, each time it offers that epoch. It puts the stream position in the deadline field once the sealer reports version 4 on its session (egress kind 17). A twin that learns the version later than the other offers the envelope's deadline: the sealer orders that copy by the rules of version 3.
+- **The gate.** `just sealer-upgrade-check <env> 3 <activation_ms>` also refuses feature 3 unless every member reads snapshot version 15, the sequencer job has the meta `sealer_v4`, and the executor job has the meta `first_receipt` (the executor keeps the first receipt of a transaction hash).
 
 | Version | Rule change |
 |---|---|

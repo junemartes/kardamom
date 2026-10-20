@@ -1,6 +1,6 @@
 //! `TxData`: per-shard envelope channel (proxy → seq/exec/batcher).
 
-use super::super::{AeronRuntime, PubHandle, TxDataSubscription};
+use super::super::{AeronRuntime, PositionedTxData, PubHandle, TxDataSubscription};
 use crate::aeron_live::handles::simple::declare_channel_handles;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
@@ -31,4 +31,12 @@ declare_channel_handles! {
         ch.tx_data_channel(sequencer_id),
         ch.tx_data_stream_id(sequencer_id)
     );
+}
+
+impl TxDataSubscriberHandle {
+    /// [`Self::try_recv`] with the stream position of the envelope in its
+    /// image: the position by which racing sequencers name one message.
+    pub fn try_recv_positioned(&mut self) -> Option<PositionedTxData> {
+        self.rx.try_recv_positioned()
+    }
 }

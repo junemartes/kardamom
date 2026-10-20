@@ -93,7 +93,8 @@ pub use handles::tx_receipts::{
 pub use idle::{IdleBackoff, IdleCap};
 pub use pending::BEST_EFFORT_DROPPED_TOTAL;
 pub use runtime::{
-    AeronRuntime, Destinations, PollRecv, PubHandle, TxDataSubscription, TypedSubscription,
+    AeronRuntime, Destinations, PollRecv, PositionedTxData, PubHandle, TxDataSubscription,
+    TypedSubscription,
 };
 
 use std::time::Duration;
@@ -125,6 +126,9 @@ pub struct RawFrame {
     pub bytes: Vec<u8>,
     pub pos: BPosition,
     pub session: i32,
+    /// The stream position of the frame in its image, from the same header
+    /// read as `pos`. Every subscriber of the image sees the same value.
+    pub stream_pos: i64,
 }
 
 /// Where an [`AeronRuntime::open_subscription_raw`]-family call sends its

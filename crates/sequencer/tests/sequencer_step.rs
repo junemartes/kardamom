@@ -293,3 +293,47 @@ fn a_paused_sequencer_offers_nothing_until_it_resumes() {
     assert!(rig.step(&mut seq).unwrap());
     assert_eq!(rig.refs().len(), 1, "the envelope waited in the stream");
 }
+
+/// A sequencer whose sealer reported `version` on its session.
+fn sequencer_on_sealer_version(version: u8) -> Sequencer {
+    use kardamom_sequencer::sealer_rules::{SealerRules, SealerVersion};
+
+    let shared = SealerVersion::default();
+    let mut rules = SealerRules::new(0, shared.clone());
+    rules.on_session_start(1);
+    rules.on_sealer_info(1, version);
+    let mut seq = Sequencer::new(one_partition_cfg()).unwrap();
+    seq.enable_positioned_refs(shared);
+    seq
+}
+
+/// Under decision version 4, the deadline field of an offer carries the
+/// stream position of its envelope, with the position tag.
+#[test]
+fn a_sealer_on_version_four_gets_the_position_in_the_deadline_field() {
+    let s = signer(41);
+    let mut rig = Rig::default();
+    rig.push(TxDataLoc::new(0, pos(128)), signed_tx_envelope(&s, 0, 1));
+    let mut seq = sequencer_on_sealer_version(4);
+
+    assert!(rig.step(&mut seq).unwrap());
+    let offers = rig.offers();
+    assert_eq!(offers.len(), 1);
+    assert_eq!(
+        offers[0].guard.max_inclusion_block,
+        kardamom_cluster_adapter::wire::POSITION_TAG | pos(128).as_index()
+    );
+}
+
+/// Under decision version 3, the deadline field carries the envelope's
+/// deadline, as before.
+#[test]
+fn a_sealer_on_version_three_gets_the_deadline_of_the_envelope() {
+    let s = signer(42);
+    let mut rig = Rig::default();
+    rig.push(TxDataLoc::new(0, pos(128)), signed_tx_envelope(&s, 0, 1));
+    let mut seq = sequencer_on_sealer_version(3);
+
+    assert!(rig.step(&mut seq).unwrap());
+    assert_eq!(rig.offers()[0].guard.max_inclusion_block, u64::MAX);
+}

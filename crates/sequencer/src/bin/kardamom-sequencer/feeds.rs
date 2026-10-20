@@ -46,7 +46,7 @@ use kardamom_sequencer::pump::Pump;
 use kardamom_sequencer::resync::{
     ResyncController, SealerAnswer, SealerRefusal, SharedWatermark, elapsed_ms_saturating,
 };
-use kardamom_sequencer::sealer_rules::SealerRules;
+use kardamom_sequencer::sealer_rules::{SealerRules, SealerVersion};
 use kardamom_sequencer::sequencer::{Ports, Sequencer, Shutdown};
 use kardamom_types::cluster_status::SilenceDeadline;
 pub(crate) use lookup::NonceLookupFeed;
@@ -88,11 +88,12 @@ impl TxDataSubscriber for LaneSubscriptions {
             .map(|i| self.next.saturating_add(i) % n)
             .find_map(|idx| {
                 let sub = &mut lanes[idx];
-                sub.handle.try_recv().map(|(loc, envelope)| {
+                sub.handle.try_recv_positioned().map(|data| {
                     let inbound = Inbound {
                         lane: sub.lane,
-                        loc,
-                        envelope,
+                        loc: data.loc,
+                        stream_position: data.stream_position,
+                        envelope: data.envelope,
                     };
                     (idx, inbound)
                 })
@@ -153,8 +154,9 @@ impl EgressWatermarkFeed {
         answer_tx: crossbeam_channel::Sender<SealerAnswer>,
         deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
         origins: OriginSignalTx,
+        sealer_version: SealerVersion,
     ) -> Self {
-        let rules = SealerRules::new(partition);
+        let rules = SealerRules::new(partition, sealer_version);
         Self {
             rules,
             silence_ms,
@@ -563,6 +565,8 @@ pub(crate) struct PublishLoops<P> {
     pub(crate) resync: Option<ResyncController>,
     /// `None` when the binary has no executor endpoints.
     pub(crate) lookup: Option<LookupRequester>,
+    /// The decision version that the egress feed reads off the sealer.
+    pub(crate) sealer_version: SealerVersion,
     pub(crate) shutdown: Shutdown,
     /// The idle cap of the process, for the main sequencer loop.
     pub(crate) idle_cap: IdleCap,
@@ -596,6 +600,7 @@ where
             remote_epochs: remote_epoch_subscription,
             resync,
             lookup,
+            sealer_version,
             shutdown,
             idle_cap,
         } = self;
@@ -614,6 +619,7 @@ where
             }
             sequencer.enable_pause(process().subscribe());
             sequencer.enable_fees(fees);
+            sequencer.enable_positioned_refs(sealer_version);
             let mut ports = Ports {
                 tx_data: &mut tx_data,
                 refs: &mut main_pub,

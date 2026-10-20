@@ -23,6 +23,12 @@
 # deposit, and reads the flags once per block, frozen at its start (job
 # meta chain_state_install). cluster/sealer-service/README.md ("Decision
 # version") is the procedure.
+#
+# FEATURE_SEALER_V4 (feature id 3) switches the sealer to decision version
+# 4. It also needs every sealer member to read snapshot version 15, and the
+# services of workloads_upgrade_v4_jobs: a sequencer that sends the
+# activation record of feature 3 and the stream positions, and an executor
+# that keeps the first receipt of a transaction hash.
 - name: Keep the feature and the activation time of the upgrade transaction
   ansible.builtin.set_fact:
     workloads_upgrade_feature: "{{ lookup('env', 'KARDAMOM_UPGRADE_FEATURE') | trim }}"
@@ -115,6 +121,17 @@
       ({{ workloads_upgrade_reads_max }}). Deploy the release that reads version 14 to every member, then run the
       check again.
 
+# A member writes snapshot version 15 once it holds the activation of
+# feature 3, and a member that reads only up to version 14 stops on it.
+- name: Refuse feature 3 on a member that reads no snapshot version 15
+  ansible.builtin.assert:
+    that: workloads_upgrade_feature | int != 3 or workloads_upgrade_reads_max | min >= 15
+    fail_msg: >-
+      Refused: the upgrade transaction of FEATURE_SEALER_V4 (feature id 3) needs every sealer member to read
+      snapshot version 15, and a member reads only up to {{ workloads_upgrade_reads_max | min }}
+      ({{ workloads_upgrade_reads_max }}). Deploy the release that reads version 15 to every member, then run the
+      check again.
+
 # Each service that executes or reads a skip must run this release: an
 # older executor or validator does not use the nonce of a skipped
 # transaction, and forks the state at the first such skip. On a genesis
@@ -129,9 +146,17 @@
     loop_var: workloads_upgrade_job
     label: "{{ workloads_upgrade_job.name }}"
 
+- name: Check the services of decision version 4
+  ansible.builtin.include_tasks: upgrade_check_job.yml
+  loop: "{{ workloads_upgrade_v4_jobs if workloads_upgrade_feature | int == 3 else [] }}"
+  loop_control:
+    loop_var: workloads_upgrade_job
+    label: "{{ workloads_upgrade_job.name }}"
+
 - name: Report the passing check
   ansible.builtin.debug:
     msg: >-
-      The upgrade check passed: {{ workloads_upgrade_groups | length }} sealer members read snapshot version 14,
+      The upgrade check passed: {{ workloads_upgrade_groups | length }} sealer members read snapshot version
+      {{ 15 if workloads_upgrade_feature | int == 3 else 14 }},
       and the live allocations of {{ workloads_upgrade_jobs | map(attribute='name') | join(', ') }}
       run this release. The upgrade transaction of feature {{ workloads_upgrade_feature }} may go to the Safe.

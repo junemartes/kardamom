@@ -437,6 +437,33 @@ impl<T: crate::codec::WireMessage> TypedSubscription<T> {
     }
 }
 
+/// One `tx_data` envelope with its locator and its stream position in its
+/// image. Racing sequencers read the same image, so they name the same
+/// message by the same `(session, stream_position)`.
+#[derive(Debug)]
+pub struct PositionedTxData {
+    pub loc: TxDataLoc,
+    pub stream_position: u64,
+    pub envelope: TxEnvelope,
+}
+
+/// [`decode_tx_data_frame`] with the stream position of the frame. A
+/// position is never negative, so the conversion drops no real frame.
+fn decode_positioned_tx_data_frame(frame: &RawFrame) -> ControlFlow<PositionedTxData> {
+    let Ok(stream_position) = u64::try_from(frame.stream_pos) else {
+        error!(
+            stream_pos = frame.stream_pos,
+            "negative stream position on tx_data subscription delivery"
+        );
+        return ControlFlow::Continue(());
+    };
+    decode_tx_data_frame(frame).map_break(|(loc, envelope)| PositionedTxData {
+        loc,
+        stream_position,
+        envelope,
+    })
+}
+
 /// Decode one `tx_data` fragment as a `TxEnvelope`, pairing it with a
 /// [`TxDataLoc`] built from the frame's position and publisher session.
 fn decode_tx_data_frame(frame: &RawFrame) -> ControlFlow<(TxDataLoc, TxEnvelope)> {
@@ -470,6 +497,11 @@ impl TxDataSubscription {
 
     pub fn try_recv(&mut self) -> Option<(TxDataLoc, TxEnvelope)> {
         try_recv_decoded(&mut self.rx, decode_tx_data_frame)
+    }
+
+    /// [`Self::try_recv`] with the stream position of the envelope.
+    pub fn try_recv_positioned(&mut self) -> Option<PositionedTxData> {
+        try_recv_decoded(&mut self.rx, decode_positioned_tx_data_frame)
     }
 
     /// Blocking receive, for a caller off the tokio runtime (for example
@@ -638,12 +670,14 @@ mod tests {
             bytes: vec![0xFF; 3],
             pos: BPosition::default(),
             session: 0,
+            stream_pos: 0,
         })
         .unwrap();
         tx.send(RawFrame {
             bytes: codec::encode(&42u64).unwrap().to_vec(),
             pos: BPosition::default(),
             session: 0,
+            stream_pos: 0,
         })
         .unwrap();
 

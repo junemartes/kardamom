@@ -126,10 +126,13 @@ locals {
 
 job "sequencer" {
   # The sequencer of this release moves the nonce floor past a skip that
-  # used its nonce. The upgrade check (`just sealer-upgrade-check`) reads
-  # this meta.
+  # used its nonce (nonce_burn). It sends the activation record of
+  # FEATURE_SEALER_V4 in front of its epoch, and the stream position of
+  # each reference to a sealer on decision version 4 (sealer_v4). The
+  # upgrade check (`just sealer-upgrade-check`) reads these metas.
   meta {
     nonce_burn = "true"
+    sealer_v4  = "true"
   }
 
   datacenters = [var.datacenter]

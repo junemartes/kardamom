@@ -44,11 +44,12 @@ struct AssembledDeliver {
 
 impl rusteron_client::AeronFragmentHandlerCallback for AssembledDeliver {
     fn handle_aeron_fragment_handler(&mut self, buffer: &[u8], header: Header) {
-        if let Some((pos, session)) = header_loc(&header) {
+        if let Some((pos, session, stream_pos)) = header_loc(&header) {
             self.sink.send(RawFrame {
                 bytes: buffer.to_vec(),
                 pos,
                 session,
+                stream_pos,
             });
         }
     }
@@ -681,19 +682,28 @@ impl AeronThread {
     }
 }
 
-/// Read the fragment-start [`BPosition`] and the Aeron publisher
-/// `session_id` from a single `get_values()` FFI call, the hottest
-/// per-fragment path. They must come from the same header read: returning
-/// them together guarantees the session belongs to the position's
-/// fragment, and avoids a divergent second-read error path where a
-/// transient failure could mint a spurious session 0 that collides with a
-/// genuine session-0 publisher's join key.
-fn header_loc(h: &Header) -> Option<(BPosition, i32)> {
+/// Read the fragment-start [`BPosition`], the Aeron publisher
+/// `session_id` and the stream position from a single `get_values()` FFI
+/// call, the hottest per-fragment path. They must come from the same
+/// header read: returning them together guarantees the session belongs to
+/// the position's fragment, and avoids a divergent second-read error path
+/// where a transient failure could mint a spurious session 0 that collides
+/// with a genuine session-0 publisher's join key.
+///
+/// The stream position is Aeron's `computePosition`: the terms since the
+/// initial term, shifted by the term length bits, plus the term offset.
+/// Term ids wrap, so the term count is a wrapping difference. The count is
+/// below 2^31 and the shift is at most 30 (a term holds at most 1 GiB), so
+/// the position stays below 2^61.
+fn header_loc(h: &Header) -> Option<(BPosition, i32, i64)> {
     let v = h.get_values().ok()?;
     let frame = v.frame();
     let pos = BPosition {
         term_id: frame.term_id(),
         term_offset: frame.term_offset(),
     };
-    Some((pos, frame.session_id()))
+    let terms = i64::from(frame.term_id().wrapping_sub(v.initial_term_id()));
+    let shift = u32::try_from(v.position_bits_to_shift()).ok()?;
+    let stream_pos = (terms << shift) + i64::from(frame.term_offset());
+    Some((pos, frame.session_id(), stream_pos))
 }

@@ -51,7 +51,7 @@ use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, B256};
-use kardamom_cluster_adapter::wire::GuardHeader;
+use kardamom_cluster_adapter::wire::{GuardHeader, position_deadline};
 use kardamom_log::aeron_live::{IdleBackoff, IdleCap};
 use kardamom_types::num::usize_to_u64;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
@@ -66,6 +66,7 @@ use crate::lookup::LookupRequester;
 use crate::metrics;
 use crate::nonce_ahead::NonceAheadWatch;
 use crate::outbound::{RefOffer, SideChannelPublisher, TxOrderingRefPublisher};
+use crate::sealer_rules::SealerVersion;
 use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction, ProcessResult};
 use crate::tx_decode::decode_fields;
@@ -248,6 +249,9 @@ pub struct Sequencer {
     /// The fee admission gate. Off unless the binary wired the base fee
     /// view and the setting is on.
     fees: FeeGate,
+    /// The decision version of the sealer. Under version 4 the deadline
+    /// field of each offer carries the stream position of the envelope.
+    sealer_version: SealerVersion,
 }
 
 impl Sequencer {
@@ -288,6 +292,7 @@ impl Sequencer {
             depth,
             pause: crate::pause_gate::PauseGate::default(),
             fees: FeeGate::off(),
+            sealer_version: SealerVersion::default(),
         })
     }
 
@@ -295,6 +300,26 @@ impl Sequencer {
     /// envelope, and the admitted bid rides the offer.
     pub fn enable_fees(&mut self, gate: FeeGate) {
         self.fees = gate;
+    }
+
+    /// Follow the decision version that the sealer reports: under version 4,
+    /// the deadline field of an offer carries the stream position of its
+    /// envelope, so the sealer orders it by the replay window of its image.
+    pub fn enable_positioned_refs(&mut self, version: SealerVersion) {
+        self.sealer_version = version;
+    }
+
+    /// The deadline field of an offer. Under decision version 4 it carries
+    /// the stream position. Racing replicas read the same image, so they
+    /// offer the same field for one envelope. A replica that learns the
+    /// version a moment later than its twin offers the envelope's deadline:
+    /// the sealer orders that copy by the rules of version 3, and the copy
+    /// with the position by its window.
+    fn guard_deadline(&self, max_inclusion_block: u64, stream_position: u64) -> u64 {
+        if !self.sealer_version.orders_by_position() {
+            return max_inclusion_block;
+        }
+        position_deadline(stream_position).unwrap_or(max_inclusion_block)
     }
 
     /// Offer nothing while `slots` holds a pause: the process lifecycle
@@ -805,6 +830,7 @@ impl Sequencer {
         let Some(Inbound {
             lane,
             loc: tx_data_loc,
+            stream_position,
             envelope,
         }) = channel_a.poll()?
         else {
@@ -866,7 +892,7 @@ impl Sequencer {
             lane,
             tx_data_position: tx_data_loc.position,
             tx_data_session_id: tx_data_loc.session_id,
-            max_inclusion_block: envelope.max_inclusion_block,
+            max_inclusion_block: self.guard_deadline(envelope.max_inclusion_block, stream_position),
             tip,
         };
 
