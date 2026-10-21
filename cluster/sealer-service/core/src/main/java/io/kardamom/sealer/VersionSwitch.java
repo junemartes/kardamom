@@ -65,6 +65,13 @@ public final class VersionSwitch {
      */
     public static final long FEATURE_SEALER_V4 = 3L;
 
+    /**
+     * The feature id of decision version 5, the carry flag, in
+     * {@code KardamomChainState}. Matches Rust
+     * {@code kardamom_types::upgrades::FEATURE_SEALER_V5}.
+     */
+    public static final long FEATURE_SEALER_V5 = 4L;
+
     /** The most activations that a state holds: the visible one and two that wait. */
     static final int MAX_HELD = 3;
 
