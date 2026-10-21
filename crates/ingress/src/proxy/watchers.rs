@@ -32,6 +32,7 @@ const TX_ERRORS_BUS: &str = "tx_errors";
 const RECEIPTS_BUS: &str = "tx_receipts";
 const QUORUM_WATERMARK_BUS: &str = "quorum_watermark";
 const LOCAL_FSYNC_BUS: &str = "local_fsync_watermark";
+const VERDICTS_BUS: &str = "tx_verdicts";
 
 impl<P, S> IngressProxy<P, S>
 where
@@ -64,6 +65,7 @@ where
     /// rollbacks that it applied.
     pub(super) fn spawn_verdicts_watcher(&self) {
         BroadcastWatcher::new(
+            VERDICTS_BUS,
             self.subscription.subscribe_verdicts(),
             VerdictsWatcher(self.acks.clone()),
         )
