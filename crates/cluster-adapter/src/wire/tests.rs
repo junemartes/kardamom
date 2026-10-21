@@ -755,11 +755,11 @@ fn bad_kind_and_record_type_error() {
     );
     // A relayed payload with an unknown record type.
     let mut payload = vec![0u8; 32];
-    payload.push(7); // record_type 7
+    payload.push(8); // record_type 8
     let egress = encode_egress_record(0, &payload).unwrap();
     assert_eq!(
         EgressItem::decode(&egress),
-        Err(WireError::BadRecordType(7))
+        Err(WireError::BadRecordType(8))
     );
 }
 

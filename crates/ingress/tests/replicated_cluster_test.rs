@@ -24,7 +24,6 @@ use alloy_primitives::B256;
 use alloy_signer_local::PrivateKeySigner;
 
 use kardamom_ingress::config::IngressConfig;
-use kardamom_ingress::proxy::ingress_id_of;
 use std::num::NonZeroU32;
 
 use kardamom_ingress::routing::partition_for;
@@ -244,7 +243,10 @@ async fn correlation_id_unique_and_namespaced_across_replicas() {
     // Each replica has exactly N ids, and the high bits identify that
     // replica.
     for replica in 0..K {
-        let count = ids.iter().filter(|c| ingress_id_of(**c) == replica).count();
+        let count = ids
+            .iter()
+            .filter(|c| kardamom_types::TxEnvelope::ingress_id_of(**c) == replica)
+            .count();
         assert_eq!(count, N, "replica {replica} owns exactly N correlation_ids");
     }
 }

@@ -90,27 +90,58 @@ final class AllocationGateTest {
         state.onOriginRecord(Workload.id(0), 1, 1, PAYLOAD, 0L);
         state.onTick(CanonicalSealerState.TICK_INTERVAL_MS);
         assertEquals(4, state.decisionVersion());
-        byte[] id = Workload.id(1);
-        RefClock clock = new RefClock();
-        for (int i = 0; i < WARMUP; i++) {
-            clock.offer(state, i, id);
-        }
-        int refused = 0;
-        long before = THREADS.getCurrentThreadAllocatedBytes();
-        for (int i = WARMUP; i < WARMUP + MEASURED; i++) {
-            refused += clock.offer(state, i, id) >= 0 ? 0 : 1;
-        }
-        long after = THREADS.getCurrentThreadAllocatedBytes();
-        assertEquals(0, refused, "measured references that the state refused");
-        check("ref_v4", (double) (after - before) / MEASURED);
+        check("ref_v4", new RefClock(2).bytesPerRecord(
+            state, (s, i, id) -> s.onRef(0, i & 7, (long) (i >>> 3) * 128, id)));
     }
 
-    /** The ticks of the version-4 case: one boundary at each block end. */
-    private static final class RefClock {
-        private long clock = 2 * CanonicalSealerState.TICK_INTERVAL_MS;
+    /** A full reference of decision version 5: the same images and ticks as the version-4 case. */
+    @Test
+    void a_full_reference_of_version_five_allocates_at_most_its_baseline() {
+        CanonicalSealerState state = new CanonicalSealerState(DEDUP_CAPACITY);
+        state.onFeatureActivation(new VersionSwitch.FeatureActivation(1, VersionSwitch.FEATURE_SEALER_V4, 1L));
+        state.onOriginRecord(Workload.id(0), 1, 1, PAYLOAD, 0L);
+        state.onTick(CanonicalSealerState.TICK_INTERVAL_MS);
+        state.onFeatureActivation(new VersionSwitch.FeatureActivation(2, VersionSwitch.FEATURE_SEALER_V5, 1L));
+        state.onOriginRecord(Workload.id(1), 2, 1, PAYLOAD, 0L);
+        state.onTick(2 * CanonicalSealerState.TICK_INTERVAL_MS);
+        assertEquals(5, state.decisionVersion());
+        check("ref_v5", new RefClock(3).bytesPerRecord(
+            state, (s, i, id) -> s.onCarriedRef(0, i & 7, (long) (i >>> 3) * 128)));
+    }
 
-        long offer(CanonicalSealerState state, int i, byte[] id) {
-            long index = state.onRef(0, i & 7, (long) (i >>> 3) * 128, id);
+    /** One reference of a reference case, at position {@code i} of the case. Returns its index or code. */
+    @FunctionalInterface
+    private interface RefStep {
+        long order(CanonicalSealerState state, int i, byte[] id);
+    }
+
+    /** The ticks of a reference case: one boundary at each block end. */
+    private static final class RefClock {
+        private long clock;
+
+        /** A clock whose first tick comes {@code ticksDone} intervals after time 0. */
+        RefClock(long ticksDone) {
+            clock = ticksDone * CanonicalSealerState.TICK_INTERVAL_MS;
+        }
+
+        /** Run the warmup references, then return the bytes per measured reference. */
+        double bytesPerRecord(CanonicalSealerState state, RefStep step) {
+            byte[] id = Workload.id(2);
+            for (int i = 0; i < WARMUP; i++) {
+                offer(state, step, i, id);
+            }
+            int refused = 0;
+            long before = THREADS.getCurrentThreadAllocatedBytes();
+            for (int i = WARMUP; i < WARMUP + MEASURED; i++) {
+                refused += offer(state, step, i, id) >= 0 ? 0 : 1;
+            }
+            long after = THREADS.getCurrentThreadAllocatedBytes();
+            assertEquals(0, refused, "measured references that the state refused");
+            return (double) (after - before) / MEASURED;
+        }
+
+        private long offer(CanonicalSealerState state, RefStep step, int i, byte[] id) {
+            long index = step.order(state, i, id);
             if (i % RECORDS_PER_BLOCK == RECORDS_PER_BLOCK - 1) {
                 clock += CanonicalSealerState.TICK_INTERVAL_MS;
                 state.onTick(clock);

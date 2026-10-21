@@ -40,12 +40,16 @@ use crate::error::SequencerError;
 /// header the sealer reads: `sender` and `nonce` for its per-sender
 /// contiguity guard, and `max_inclusion_block` for its inclusion check.
 /// None of the three is part of the relayed record.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct RefOffer {
     pub tx_ref: TxRef,
     /// The sealer's guard header: the sender and nonce for the contiguity
     /// guard, the inclusion deadline, and the tip the record bids.
     pub guard: GuardHeader,
+    /// The archived `TxEnvelope` of the transaction, for a sealer that
+    /// carries the bytes. With it, the offer is a full reference (record
+    /// type 7); without it, a reference (record type 0).
+    pub envelope: Option<bytes::Bytes>,
 }
 
 /// `TxOrdering` publisher contract, the canonical orderer. Publishes tiny
@@ -178,7 +182,7 @@ pub mod fakes {
             if *self.fail_with_backpressure.lock().unwrap() {
                 return Err(SequencerError::Backpressure);
             }
-            self.offers.lock().unwrap().push(*offer);
+            self.offers.lock().unwrap().push(offer.clone());
             Ok(())
         }
 
@@ -248,6 +252,7 @@ mod tests {
     /// A ref offer at `nonce`, with no deadline.
     fn offer(nonce: u64) -> RefOffer {
         RefOffer {
+            envelope: None,
             tx_ref: TxRef::new(
                 B256::ZERO,
                 u8::try_from(nonce).unwrap(),

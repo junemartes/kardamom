@@ -22,6 +22,7 @@ mod lookup;
 mod origin_pump;
 mod receipts;
 mod steps;
+mod verdicts;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -54,6 +55,7 @@ use kardamom_types::cluster_status::SilenceDeadline;
 pub(crate) use lookup::NonceLookupFeed;
 use origin_pump::OriginPump;
 pub(crate) use receipts::{ReceiptFloorFeed, ReceiptSink};
+pub(crate) use verdicts::VerdictFeed;
 
 /// One `tx_data` lane subscription: the lane index the sequencer stamps
 /// into every ref off it, and the handle that reads it.
@@ -577,10 +579,12 @@ pub(crate) struct PublishLoops<P> {
 }
 
 /// The inputs of the v2 loop: the account events of the receipts feed and
-/// of the lookup task, and the lookup queue.
+/// of the lookup task, and the lookup queue. With `verdicts`, the loop
+/// sends the receipt of each forwarded transaction to the verdict task.
 pub(crate) struct V2Wiring {
     pub(crate) accounts: crossbeam_channel::Receiver<kardamom_sequencer::v2::AccountEvent>,
     pub(crate) lookups: tokio::sync::mpsc::Sender<alloy_primitives::Address>,
+    pub(crate) verdicts: Option<tokio::sync::mpsc::Sender<kardamom_sequencer::v2::VerdictOut>>,
 }
 
 impl V2Wiring {
@@ -603,6 +607,9 @@ impl V2Wiring {
         );
         admission.enable_fees(fees);
         admission.enable_positioned_refs(sealer_version);
+        if let Some(verdicts) = self.verdicts {
+            admission.enable_verdicts(verdicts);
+        }
         tracing::info!(
             partition = cfg.partition_index,
             "sequencer v2: the admission loop runs"

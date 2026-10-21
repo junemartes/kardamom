@@ -524,6 +524,12 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
   - The lookup is bounded by the token bucket of the client, the in-flight bound of the query client and its timeout. A shed or failed query answers `null`. This is the same answer as "not committed yet".
   - The counter is `kardamom_cache_lookups_total{layer="receipt", outcome}`. The outcomes are `hit`, `state_hit`, `miss`, `shed` and `state_error`.
   - Proof: `ingress-pair-loss-recover` kills both ingresses under load. It requires the receipt of every accepted transaction afterwards.
+- **A watcher falls behind its stream bus**
+  - Each stream (receipts, errors, block boundaries, watermarks) reaches its watcher through a broadcast bus of 32,768 items. One receipt is one item, and the ingress reads the receipts of every executor.
+  - Trigger: the watcher task stalls longer than the bus can hold, for example on a loaded host.
+  - Effect: the bus drops its oldest items. A rollback that the bus drops still applies from its log. A dropped receipt or error does not release its waiter, so that client waits until the pending timeout (30 s). Its retry gets the receipt by hash.
+  - The counter is `kardamom_ingress_bus_lagged_total{bus}`.
+  - Proof: `a_gap_counts_the_receipts_that_the_bus_dropped`. On one local stack under load, a bus of 1,024 items dropped 4,684 receipts and gave a soak p99 of 30 s. The bus of 32,768 items dropped none.
 - **Admission of a cold sender**
   - The admission checks read the local account layer, then Redis. A sender that never sent and never received value has no row in either layer.
   - For such a cold sender, the ingress asks an executor for the nonce and the balance (two queries). It keeps the answer for 30 s in a map of at most 65,536 senders. So a cold sender costs one pair of queries for each 30 s, not one pair for each submit. A row in the local layer always wins.
@@ -535,6 +541,16 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
   - The counter is `kardamom_cache_lookups_total{layer="cold", outcome}`. The outcomes are `hit` (a kept answer or outcome), `miss` (a fresh answer), `stale` and `error` (a shed or failed query).
   - Each admission refusal counts `kardamom_ingress_tx_rejected_total{reason}` and logs `submit refused` at debug level, with the sender, the nonce and the reason.
   - Proof: `crates/ingress/tests/account_cache_test.rs` (`a_cold_unfunded_sender_is_refused_with_one_query`, `a_lagging_executor_answer_admits`, `an_answer_before_the_first_head_admits`, `a_cold_funded_sender_or_a_failed_query_admits`).
+- **The ack at admission (`--verdicts`)**
+  - With `--verdicts`, `eth_sendRawTransaction` answers when the v2 sequencer that owns the sender takes the transaction into its mempool, as on Ethereum. The answer comes on the `tx_verdicts` stream of the ingress. The v2 sequencers fill it (`[admission] verdicts`). The ingress reads no receipts: a client reads the result with `eth_getTransactionReceipt`, which asks Redis or an executor.
+  - A sequencer sends one verdict for each transaction: `Accepted` when its filter forwards the transaction or holds it for a nonce gap, `Rejected` with the reason otherwise. A sender with no state gets its verdict when the lookup answers. Both twins of a lane send one.
+  - The ingress answers on the first `Accepted`. A `Rejected` answers when every twin rejected (`--twins`, default 2), or 250 ms after the first rejection with no accept: a twin with stale rows can reject a transaction that the other twin took. The errors use the text of geth: `nonce too low`, `already known`, `txpool is full`, `insufficient funds for gas * price + value`.
+  - A lost verdict: the offer of a verdict is best effort. The Aeron thread holds a refused frame until the offer deadline, then drops it and logs `best-effort publish failed`. A full queue of the verdict task also drops verdicts. With no verdict in `--ack-timeout-ms` (default 2 s), the call answers `transaction not acknowledged`. The transaction can still be in a mempool: a resubmit of it answers `already known`. The counters are `kardamom_sequencer_verdicts_total{outcome}` (`sent`, `full`, `closed`, `wide`) and `kardamom_ingress_tx_rejected_total{reason="not-acknowledged"}`.
+  - An accepted transaction can still drop later, as in the mempool of an Ethereum node: a parked one expires, a forwarded one is lost, or a lane loses both twins. The call does not tell the client. The status feed and the receipt read do.
+  - A second submission of a hash that waits on the same ingress answers `already known` at once.
+  - The local account layer gets no rows, so `--verdicts` needs `--admission-checks false`. The v2 filter checks each sender.
+  - Deploy order: the sequencers with `[admission] verdicts` first, then the ingress with `--verdicts`. An ingress with `--verdicts` before its sequencers send verdicts answers every call `transaction not acknowledged`.
+  - Proof: `crates/log/tests/discovered_tx_verdicts.rs` (each ingress receives only its own verdicts), `v2::tests::each_transaction_gets_one_verdict_at_admission`, `crates/ingress/src/acks/tests.rs`, `end_to_end_test::the_ack_at_admission_answers_on_the_verdict_of_the_sequencer`, and the chain-semantics suite with `KARDAMOM_E2E_ADMISSION=1 KARDAMOM_E2E_VERDICTS=1`.
 - The JSON-RPC surface is in [`json-rpc.md`](json-rpc.md).
 
 ## Sequencer (2 shards x 2 racing replicas)
