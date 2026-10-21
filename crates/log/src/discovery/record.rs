@@ -40,6 +40,7 @@ pub enum Topic {
     ExecTxs,
     L1Blocks,
     ExecFrames,
+    EgressOrder,
 }
 
 impl Topic {
@@ -59,6 +60,7 @@ impl Topic {
             Self::ExecTxs => "exec_txs",
             Self::L1Blocks => "l1_blocks",
             Self::ExecFrames => "exec_frames",
+            Self::EgressOrder => "egress_order",
         }
     }
 
@@ -83,7 +85,8 @@ impl Topic {
             | Self::TxBal
             | Self::ExecTxs
             | Self::L1Blocks
-            | Self::ExecFrames => None,
+            | Self::ExecFrames
+            | Self::EgressOrder => None,
         }
     }
 
@@ -102,6 +105,7 @@ impl Topic {
             "exec_txs" => Some(Self::ExecTxs),
             "l1_blocks" => Some(Self::L1Blocks),
             "exec_frames" => Some(Self::ExecFrames),
+            "egress_order" => Some(Self::EgressOrder),
             _ => None,
         }
     }

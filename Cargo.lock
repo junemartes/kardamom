@@ -4018,12 +4018,23 @@ name = "kardamom-egress"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "anyhow",
+ "bytes",
+ "clap",
+ "crossbeam-channel",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "kardamom-cluster-adapter",
+ "kardamom-log",
+ "kardamom-obs",
  "kardamom-types",
  "metrics",
+ "reqwest 0.13.4",
  "rkyv",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 

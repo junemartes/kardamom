@@ -13,3 +13,15 @@ pub(crate) fn count_copy_mismatch() {
 pub(crate) fn count_waiting_dropped() {
     metrics::counter!(WAITING_DROPPED_TOTAL).increment(1);
 }
+
+/// Describe every metric of the egress for the exporter.
+pub fn describe() {
+    metrics::describe_counter!(
+        COPY_MISMATCH_TOTAL,
+        "Copies of a canonical frame whose bytes differ from the first copy."
+    );
+    metrics::describe_counter!(
+        WAITING_DROPPED_TOTAL,
+        "Times that every copy missed a frame and the merge dropped the frames behind it."
+    );
+}
