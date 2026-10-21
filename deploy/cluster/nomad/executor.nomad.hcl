@@ -116,6 +116,19 @@ variable "exec_cursor" {
   }
 }
 
+# The canonical frames to the egress, "on" or "off" (--exec-frames). On,
+# each executor publishes the frames that it executes on exec_frames for
+# the egress (egress.nomad.hcl). Off, the executor publishes no frame.
+# Ansible deployment passes -var from KARDAMOM_EXEC_FRAMES.
+variable "exec_frames" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.exec_frames)
+    error_message = "The exec_frames value must be on or off."
+  }
+}
+
 variable "executor_query_port" {
   type    = number
   default = 9024
@@ -267,7 +280,7 @@ job "executor" {
           # executor's, re-replicated in.
           "/opt/kardamom/checkpoints:/opt/kardamom/checkpoints",
         ]
-        args = [
+        args = concat([
           "--config", "/local/executor.toml",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
@@ -329,7 +342,9 @@ job "executor" {
           # cluster network; loopback scrapes (docker exec
           # curl 127.0.0.1:9004) keep working too.
           "--metrics-addr", "0.0.0.0:9004",
-        ]
+          ],
+          var.exec_frames == "on" ? ["--exec-frames"] : [],
+        )
       }
 
       # Cluster LogConfig (UDP multicast channels), read through

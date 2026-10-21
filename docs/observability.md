@@ -25,6 +25,7 @@ Set the address with `--metrics-addr` or `KARDAMOM_METRICS_ADDR`.
 | `kardamom-state-mirror` | `127.0.0.1:9007` | `0.0.0.0:9007` | `kardamom-state-mirror` |
 | `kardamom-notifier` | `127.0.0.1:9008` | `0.0.0.0:9008` | `kardamom-notifier` |
 | `kardamom-canary` | `127.0.0.1:9012` | `0.0.0.0:9012` | `kardamom-canary` |
+| `kardamom-egress` | `127.0.0.1:9013` | `0.0.0.0:9013` | none |
 | `kardamom-l1-indexer` | `127.0.0.1:9549` | `0.0.0.0:9009` | none |
 
 Notes on the table:
@@ -43,7 +44,8 @@ Notes on the table:
 - The monitoring job scrapes each exporter by its Consul node name: `<class>-<i>.node.<datacenter>.consul:<port>`.
   The job renders the targets from the node-class counts (`executor_count`, `sequencer_count`, `ingress_count`).
   A larger class gets its targets at the next deploy.
-- The services that Consul lists (the validator, the da-watcher, the batcher, the L1 follower, the notifier and the canary) are targets in every health state.
+- The services that Consul lists (the validator, the da-watcher, the batcher, the L1 follower, the notifier, the canary and the egress) are targets in every health state.
+  The monitoring job scrapes the egress only when the deploy runs it (`KARDAMOM_EGRESS=1`, the job variable `egress`).
   A halt or a pause fails `/ready` by design, so Consul marks the service critical. A healthy-only list would drop the target exactly when the halt and pause alerts need its metrics.
   A dead process stays a registered target and reads as `up == 0`.
 
@@ -559,6 +561,18 @@ See [tx-status-events.md](tx-status-events.md) for the feed and the webhooks.
 | `outbox_backlog_bytes{subscription}` | Bytes of an outbox that are not delivered. |
 | `webhook_attempts_total{outcome}` | Webhook POST attempts. The outcomes are `ok`, `status`, and `error`. |
 | `webhook_delivery_seconds` | Histogram of the time from event arrival to delivery. |
+
+### Egress
+
+The egress (`kardamom-egress`) exports these metrics on `--metrics-addr` (`KARDAMOM_METRICS_ADDR`, default `127.0.0.1:9013`). The cluster job binds `0.0.0.0:9013` and registers it as the Consul service `kardamom-egress-metrics`. Every metric carries `host_id` (`egress-<alloc index>` in the cluster job).
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_egress_copy_mismatch_total` | Copies of a canonical frame whose bytes differ from the first copy. The egress does not stop. A difference means that one executor executed other bytes than the others: the validator decides which copy is wrong. |
+| `kardamom_egress_waiting_dropped_total` | Times that every copy missed a frame and the merge dropped the frames that waited behind it. |
+
+- Any increment of `kardamom_egress_copy_mismatch_total` needs an operator.
+- The egress answers `GET /health` on its HTTP port (`:8548` in the cluster job). The Consul check of the service `kardamom-egress` reads it.
 
 ### State mirror
 

@@ -884,6 +884,71 @@ class DeployTest(Deploys):
                 env = self.api.state['plans']['executor']['TaskGroups'][0]['Tasks'][0]['Env']
                 self.assertEqual(env['KARDAMOM_EXEC_CURSOR'], expected)
 
+    # Every egress switch on: the egress job and each reader's flag.
+    EGRESS_ON = {'workloads_egress': True, 'workloads_exec_frames': 'on', 'workloads_validator_egress': 'on',
+                 'workloads_batcher_egress': 'on', 'workloads_sequencer_receipts_from_egress': 'on',
+                 'workloads_ingress_receipts_from_egress': 'on', 'workloads_notifier_receipts_from_egress': 'on'}
+    EGRESS_URL = 'http://kardamom-egress.service.dc1.consul:8548'
+
+    @staticmethod
+    def job_args(job):
+        """The arguments of every task of `job`, in one list."""
+        return [a for g in job['TaskGroups'] for t in g['Tasks'] for a in t['Config'].get('args') or []]
+
+    @staticmethod
+    def job_templates(job):
+        """The embedded templates of every task of `job`, in one text."""
+        return '\n'.join(t['EmbeddedTmpl'] for g in job['TaskGroups'] for task in g['Tasks']
+                         for t in task.get('Templates') or [])
+
+    def test_the_egress_switches_default_off(self):
+        """With every switch off, no egress job and no reader flag."""
+        self.run_deploy(check=True)
+        plans = self.api.state['plans']
+        self.assertNotIn('egress', plans)
+        flags = {'--exec-frames', '--egress', '--receipt-query-endpoints', '--receipts-from-egress'}
+        for name in ('executor', 'validator', 'batcher', 'ingress', 'notifier'):
+            self.assertEqual(flags & set(self.job_args(plans[name])), set(), name)
+        self.assertNotIn('receipts_from_egress', self.job_templates(plans['sequencer']))
+        self.assertNotIn('kardamom-egress', self.job_templates(plans['monitoring']))
+
+    def test_the_egress_switches_deploy_the_egress_and_reach_each_reader(self):
+        self.manifest.write_text(self.manifest.read_text()
+                                 + f'egress registry.example:5000/kardamom-egress:test@sha256:{"a" * 64}\n')
+        self.run_deploy(self.EGRESS_ON, check=True)
+        plans = self.api.state['plans']
+        # After the executors that it reads, before the readers after it.
+        order = list(plans)
+        self.assertLess(order.index('executor'), order.index('egress'))
+        for reader in ('notifier', 'validator', 'batcher'):
+            self.assertLess(order.index('egress'), order.index(reader), reader)
+        egress = plans['egress']
+        self.assertTrue(egress['TaskGroups'][0]['Tasks'][0]['Config']['image'].endswith('@sha256:' + 'a' * 64))
+        self.assertEqual(egress['TaskGroups'][0]['Count'], 2)
+        services = {s['Name']: s for t in egress['TaskGroups'][0]['Tasks'] for s in t['Services']}
+        self.assertEqual(services['kardamom-egress']['Checks'][0]['Path'], '/health')
+        self.assertEqual(services['kardamom-egress-metrics']['Tags'], ['metrics'])
+        self.assertIn('--exec-frames', self.job_args(plans['executor']))
+        for name, flag in (('validator', '--egress'), ('batcher', '--egress'),
+                           ('ingress', '--receipt-query-endpoints')):
+            args = self.job_args(plans[name])
+            self.assertEqual(args[args.index(flag) + 1], self.EGRESS_URL, name)
+        self.assertIn('--receipts-from-egress', self.job_args(plans['notifier']))
+        self.assertIn('receipts_from_egress = true', self.job_templates(plans['sequencer']))
+        self.assertIn('service "kardamom-egress-metrics|any"', self.job_templates(plans['monitoring']))
+
+    def test_the_egress_switches_refuse_a_reader_before_its_source(self):
+        cases = (
+            ('a reader without the egress', {'workloads_validator_egress': 'on'}),
+            ('the egress without the frames', {'workloads_egress': True}),
+            ('a value that is not on or off', {'workloads_exec_frames': 'yes'}),
+        )
+        for name, switches in cases:
+            with self.subTest(name):
+                output = self.run_deploy(switches, check=True, success=False)
+                self.assertIn('Each egress switch is on, off or empty', output)
+                self.assertNotIn('plans', self.api.state)
+
     def test_every_aeron_party_takes_the_deploy_values(self):
         """Each Aeron deploy value: its environment variable, its default,
         a second value, and the check of the plans."""

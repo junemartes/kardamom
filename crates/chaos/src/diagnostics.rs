@@ -16,7 +16,7 @@ use crate::stages::{head_lines, matching_lines, tail_lines};
 
 mod exits;
 
-const JOBS: [&str; 17] = [
+const JOBS: [&str; 18] = [
     "aeron",
     "anvil",
     "cluster",
@@ -32,6 +32,7 @@ const JOBS: [&str; 17] = [
     "redis",
     "state-mirror",
     "notifier",
+    "egress",
     "canary",
     "monitoring",
 ];

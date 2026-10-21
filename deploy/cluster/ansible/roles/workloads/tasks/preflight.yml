@@ -36,6 +36,27 @@
       ({{ workloads_budget }} blocks) at one block a second, or the guard halts an idle chain
       between posts. Lower the idle flush or raise KARDAMOM_DA_LAG_BUDGET_BLOCKS.
 
+# A reader of the egress stops when no egress serves it, and an egress
+# without the executors' frames has nothing to serve.
+- name: Validate the egress switches
+  vars:
+    workloads_reader_switches:
+      KARDAMOM_VALIDATOR_EGRESS: "{{ workloads_validator_egress }}"
+      KARDAMOM_BATCHER_EGRESS: "{{ workloads_batcher_egress }}"
+      KARDAMOM_SEQUENCER_RECEIPTS_FROM_EGRESS: "{{ workloads_sequencer_receipts_from_egress }}"
+      KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS: "{{ workloads_ingress_receipts_from_egress }}"
+      KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS: "{{ workloads_notifier_receipts_from_egress }}"
+    workloads_switches: "{{ workloads_reader_switches | combine({'KARDAMOM_EXEC_FRAMES': workloads_exec_frames}) }}"
+    workloads_readers_on: "{{ workloads_reader_switches | dict2items | selectattr('value', 'equalto', 'on') | map(attribute='key') | list }}"
+  ansible.builtin.assert:
+    that:
+      - workloads_switches.values() | reject('in', ['', 'on', 'off']) | list | length == 0
+      - workloads_readers_on | length == 0 or workloads_egress | bool
+      - not (workloads_egress | bool) or workloads_exec_frames == 'on'
+    fail_msg: >-
+      Each egress switch is on, off or empty: {{ workloads_switches }}.
+      A reader switch ({{ workloads_readers_on }}) needs KARDAMOM_EGRESS=1, and the egress needs KARDAMOM_EXEC_FRAMES=on.
+
 - name: Validate image provenance
   ansible.builtin.import_tasks: provenance.yml
 
