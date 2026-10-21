@@ -6,9 +6,9 @@
 
 use std::ops::ControlFlow;
 
+use crate::cluster::{ClusterWatermarkObserver, EgressProgress, Observed};
+use crate::stage_latency::StageClock;
 use kardamom_cluster_adapter::{LiveCluster, LiveEgress};
-use kardamom_ingress::cluster::{ClusterWatermarkObserver, EgressProgress, Observed};
-use kardamom_ingress::stage_latency::StageClock;
 use kardamom_log::aeron_live::TxStatusPublisherHandle;
 use kardamom_types::{ClusterStatus, QuorumWatermark, TxStatus};
 use tokio::sync::{broadcast, watch};

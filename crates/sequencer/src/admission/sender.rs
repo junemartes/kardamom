@@ -7,15 +7,38 @@ use alloy_primitives::U256;
 
 use super::{AccountState, AdmissionConfig, Candidate, Refusal, Verdict};
 
+/// One forwarded transaction that no state confirmed yet.
+#[derive(Clone, Copy)]
+struct Forwarded {
+    /// Its worst-case cost.
+    cost: U256,
+}
+
+/// When a parked transaction gets its ack.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// Now: the state of the sender is known, and the transaction waits
+    /// for a nonce gap or a busy run.
+    Accept,
+    /// When the state of the sender comes: a lookup is out.
+    Wait,
+}
+
 pub(super) struct SenderState<T> {
     /// The newest chain state, `None` until a row or a lookup gives one.
     state: Option<AccountState>,
     /// A lookup is out for this sender.
     asked: bool,
+    /// The state came from a lookup, not from rows. The state database of
+    /// an executor commits after the receipts go out, so such a state can
+    /// be behind a nonce that the rows showed before this replica started.
+    from_lookup: bool,
+    /// A relook of this sender waits in the queue of the filter.
+    relook_due: bool,
     /// The nonce of the first forwarded transaction that no state confirmed.
     first: u64,
-    /// The worst-case costs of the forwarded run, from `first` on.
-    forwarded: VecDeque<U256>,
+    /// The forwarded run, from `first` on.
+    forwarded: VecDeque<Forwarded>,
     /// The sum of `forwarded`.
     spend: U256,
     /// The transactions that wait for a nonce gap, or for a lookup.
@@ -27,6 +50,8 @@ impl<T> Default for SenderState<T> {
         Self {
             state: None,
             asked: false,
+            from_lookup: false,
+            relook_due: false,
             first: 0,
             forwarded: VecDeque::new(),
             spend: U256::ZERO,
@@ -66,7 +91,7 @@ impl<T> SenderState<T> {
             return false;
         }
         if c.nonce > next {
-            return self.park(c, cfg, out);
+            return self.park(c, Answer::Accept, cfg, out);
         }
         let parked = self.forward_or_park(c, &state, cfg, out);
         while self.release_one(cfg, out) {}
@@ -76,16 +101,23 @@ impl<T> SenderState<T> {
     /// Apply a newer chain state: confirm the forwarded run up to its
     /// nonce, refuse the parked transactions below it, and forward the
     /// parked ones that now continue the run.
+    /// Any answer of a lookup ends the lookup that was out, also one that
+    /// is not newer than the state held.
     pub(super) fn on_state(
         &mut self,
         state: AccountState,
+        from_lookup: bool,
         cfg: &AdmissionConfig,
         out: &mut Vec<Verdict<T>>,
     ) {
-        if self.state.is_some_and(|held| held.tx_idx >= state.tx_idx) {
+        if from_lookup {
+            self.asked = false;
+        }
+        if self.state.is_some_and(|held| !state.is_newer_than(&held)) {
             return;
         }
         self.state = Some(state);
+        self.from_lookup = from_lookup;
         self.asked = false;
         while self.confirm_one(state.nonce) {}
         let keep = self.parked.split_off(&state.nonce);
@@ -99,6 +131,18 @@ impl<T> SenderState<T> {
             )
         }));
         while self.release_one(cfg, out) {}
+        self.accept_parked(out);
+    }
+
+    /// Accept the parked transactions that waited for a state with no
+    /// answer: the state came, and they still wait for a nonce gap.
+    fn accept_parked(&mut self, out: &mut Vec<Verdict<T>>) {
+        out.extend(
+            self.parked
+                .values_mut()
+                .filter_map(Candidate::answer)
+                .map(Verdict::Accept),
+        );
     }
 
     /// The forwarded transaction at `nonce` is lost if the run still holds
@@ -127,6 +171,31 @@ impl<T> SenderState<T> {
             .get(&nonce)
             .is_some_and(|c| c.image.unit == unit);
         held.then(|| self.parked.remove(&nonce)).flatten()
+    }
+
+    /// Whether a parked transaction waits for a nonce gap over a state from
+    /// a lookup, with nothing forwarded: the gap can be the lag of the
+    /// state database, not a missing transaction.
+    pub(super) fn waits_on_lookup_gap(&self) -> bool {
+        let gap = self
+            .state
+            .zip(self.parked.first_key_value())
+            .is_some_and(|(state, (nonce, _))| *nonce > state.nonce);
+        self.from_lookup && self.forwarded.is_empty() && gap
+    }
+
+    /// Mark a relook as queued. Returns false when one is queued already.
+    pub(super) fn queue_relook(&mut self) -> bool {
+        !std::mem::replace(&mut self.relook_due, true)
+    }
+
+    /// The queued relook is due: ask again when the gap over the lookup
+    /// state is still there and no lookup is out.
+    pub(super) fn relook(&mut self) -> bool {
+        self.relook_due = false;
+        let ask = self.waits_on_lookup_gap() && !self.asked;
+        self.asked |= ask;
+        ask
     }
 
     /// Forget the chain state: the next transaction asks for a lookup.
@@ -162,7 +231,7 @@ impl<T> SenderState<T> {
         if self.forwarded.is_empty() || self.first >= chain_nonce {
             return false;
         }
-        let cost = self.forwarded.pop_front().unwrap_or_default();
+        let cost = self.forwarded.pop_front().map_or(U256::ZERO, |f| f.cost);
         self.spend = self.spend.saturating_sub(cost);
         self.first += 1;
         true
@@ -177,7 +246,7 @@ impl<T> SenderState<T> {
         out: &mut Vec<Verdict<T>>,
     ) -> bool {
         let sender = c.sender;
-        let parked = self.park(c, cfg, out);
+        let parked = self.park(c, Answer::Wait, cfg, out);
         if parked && !self.asked {
             self.asked = true;
             out.push(Verdict::Lookup(sender));
@@ -185,7 +254,16 @@ impl<T> SenderState<T> {
         parked
     }
 
-    fn park(&mut self, c: Candidate<T>, cfg: &AdmissionConfig, out: &mut Vec<Verdict<T>>) -> bool {
+    /// Park a transaction. With [`Answer::Accept`] the client gets its ack
+    /// now, once; with [`Answer::Wait`] it waits for the state of the
+    /// sender ([`Self::accept_parked`]).
+    fn park(
+        &mut self,
+        mut c: Candidate<T>,
+        answer: Answer,
+        cfg: &AdmissionConfig,
+        out: &mut Vec<Verdict<T>>,
+    ) -> bool {
         let expected_nonce = self.expected_nonce();
         if self.parked.contains_key(&c.nonce) {
             out.push(Verdict::Reject(c, Refusal::InFlight { expected_nonce }));
@@ -197,6 +275,9 @@ impl<T> SenderState<T> {
                 Refusal::TooManyPending { expected_nonce },
             ));
             return false;
+        }
+        if answer == Answer::Accept {
+            out.extend(c.answer().map(Verdict::Accept));
         }
         self.parked.insert(c.nonce, c);
         true
@@ -219,7 +300,7 @@ impl<T> SenderState<T> {
         out: &mut Vec<Verdict<T>>,
     ) -> bool {
         if self.busy(state, cfg) {
-            return self.park(c, cfg, out);
+            return self.park(c, Answer::Accept, cfg, out);
         }
         let available = state.balance.saturating_sub(self.spend);
         if available < c.cost {
@@ -233,7 +314,7 @@ impl<T> SenderState<T> {
         if self.forwarded.is_empty() {
             self.first = c.nonce;
         }
-        self.forwarded.push_back(c.cost);
+        self.forwarded.push_back(Forwarded { cost: c.cost });
         self.spend = self.spend.saturating_add(c.cost);
         out.push(Verdict::Forward(c));
         false

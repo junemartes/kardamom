@@ -193,6 +193,13 @@ struct KeyedInner<K, S> {
     /// for a key that the consumer can no longer use, so the buffer
     /// refuses it. This stops the buffer from holding dead entries.
     cursor: Option<u64>,
+    /// Counts the inserts that the buffer took. Only a change matters,
+    /// so the count wraps.
+    inserts: u64,
+    /// A take waited its whole timeout, and no insert came during the
+    /// wait. The producer is idle or gone, so a missing key does not
+    /// come: a take for it returns at once. The next insert clears it.
+    quiet: bool,
 }
 
 /// What an insert did: the reason the buffer refused the item, and how
@@ -210,6 +217,14 @@ struct Took<K, S> {
     beyond: usize,
 }
 
+/// The wait of one [`KeyedBuffer::take`]: its deadline, and the insert
+/// count at its start.
+#[derive(Clone, Copy)]
+struct Wait {
+    deadline: std::time::Instant,
+    inserts: u64,
+}
+
 /// One cycle of [`KeyedBuffer::take`]'s wait loop.
 enum TakeStep<'a, K, S> {
     /// The final result: found, or given up on.
@@ -224,6 +239,8 @@ impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
             inner: Mutex::new(KeyedInner {
                 map: BTreeMap::new(),
                 cursor: None,
+                inserts: 0,
+                quiet: false,
             }),
             cv: Condvar::new(),
             bounds,
@@ -258,6 +275,10 @@ impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
                     }
                     Entry::Occupied(mut e) => e.get_mut().join(item).err(),
                 });
+        if refused.is_none() {
+            g.inserts = g.inserts.wrapping_add(1);
+            g.quiet = false;
+        }
         let evicted = (g.map.len() > self.bounds.cap.get())
             .then(|| g.map.pop_last())
             .flatten()
@@ -312,8 +333,12 @@ impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
         let upper = g.map.split_off(&key);
         let below = std::mem::replace(&mut g.map, upper);
         let beyond = beyond.values().map(Slot::results).sum();
+        let wait = Wait {
+            deadline,
+            inserts: g.inserts,
+        };
         loop {
-            match self.take_step(g, &key, deadline) {
+            match self.take_step(g, &key, wait) {
                 TakeStep::Done(current) => {
                     return Took {
                         current,
@@ -327,14 +352,15 @@ impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
     }
 
     /// One wait cycle of [`Self::take`]: try the value, then the
-    /// catch-up check, then wait out the remaining deadline (or take the
-    /// final value at the deadline). `Done` carries the result to
-    /// return; `Retry` carries the guard for another cycle.
+    /// catch-up check, then the quiet check, then wait out the remaining
+    /// deadline (or take the final value at the deadline). `Done`
+    /// carries the result to return; `Retry` carries the guard for
+    /// another cycle.
     fn take_step<'a>(
         &'a self,
         mut g: std::sync::MutexGuard<'a, KeyedInner<K, S>>,
         key: &K,
-        deadline: std::time::Instant,
+        wait: Wait,
     ) -> TakeStep<'a, K, S> {
         if let Some(v) = g.map.remove(key) {
             return TakeStep::Done(Some(v));
@@ -354,17 +380,38 @@ impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
         if g.map.range(horizon..).nth(SKIP_EVIDENCE - 1).is_some() {
             return TakeStep::Done(None);
         }
-        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-            return TakeStep::Done(g.map.remove(key));
+        // Quiet check: a catch-up after a restart on an idle chain has no
+        // live head, so the catch-up check never fires. Each old key then
+        // waits the whole timeout, for data that the producer sent before
+        // the restart.
+        if g.quiet {
+            return TakeStep::Done(None);
+        }
+        let Some(remaining) = wait
+            .deadline
+            .checked_duration_since(std::time::Instant::now())
+        else {
+            return Self::timed_out(g, key, wait);
         };
-        let (mut g2, wait) = self
+        let (g2, waited) = self
             .cv
             .wait_timeout(g, remaining)
             .expect("verification buffer lock poisoned");
-        if wait.timed_out() {
-            return TakeStep::Done(g2.map.remove(key));
+        if waited.timed_out() {
+            return Self::timed_out(g2, key, wait);
         }
         TakeStep::Retry(g2)
+    }
+
+    /// The end of a take at its deadline: the value if it came, and the
+    /// buffer turns quiet when no insert came during the wait.
+    fn timed_out<'a>(
+        mut g: std::sync::MutexGuard<'a, KeyedInner<K, S>>,
+        key: &K,
+        wait: Wait,
+    ) -> TakeStep<'a, K, S> {
+        g.quiet = g.inserts == wait.inserts;
+        TakeStep::Done(g.map.remove(key))
     }
 
     #[cfg(test)]

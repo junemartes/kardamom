@@ -20,6 +20,8 @@ mod exporter;
 mod feed;
 pub mod plan;
 pub(crate) mod scrape;
+#[cfg(test)]
+mod tests;
 mod tracker;
 
 use std::sync::Arc;
@@ -30,7 +32,7 @@ use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClient;
 use tokio::sync::Semaphore;
 
-use crate::config::{preflight_chain_id, rpc_client};
+use crate::config::{MAX_IN_FLIGHT_SLACK, preflight_chain_id, rpc_client};
 use crate::load::accounting::{EvalInput, evaluate, print_report, step_gap_ok, step_seq_clean};
 use crate::load::engine::{
     Queues, RunHandles, SubmitMode, SubmitOpts, Tracker, join_submit_tasks, pacer,
@@ -65,7 +67,53 @@ struct BuiltQueues {
     defi_deploys: Option<Vec<PlannedTx>>,
 }
 
+/// The open files a run needs beyond its client connections: the log,
+/// the report, the metric scrapes, and the runtime.
+const OPEN_FILES_MARGIN: u64 = 256;
+
 impl LoadConfig {
+    /// Raise the soft limit of open files to what the run needs. Each
+    /// in-flight request of a client can hold one connection, and the
+    /// run has one client for `rpc` and one for each `receipt_rpcs`
+    /// entry. When a slow ingress fills a lower limit, each new submit
+    /// fails with a connect error, and its sender gets a nonce gap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the hard limit is below the need, or if the
+    /// limit call fails.
+    fn raise_open_files(&self) -> anyhow::Result<()> {
+        let clients = 1 + self.receipt_rpcs.len() as u64;
+        let per_client = u64::from(self.max_in_flight.get()) + MAX_IN_FLIGHT_SLACK as u64;
+        let need = per_client
+            .checked_mul(clients)
+            .and_then(|n| n.checked_add(OPEN_FILES_MARGIN))
+            .ok_or_else(|| anyhow::anyhow!("the open-file need of the run overflows u64"))?;
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` writes only into `limit`, which lives for the call.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if limit.rlim_cur >= need {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            limit.rlim_max >= need,
+            "the run needs {need} open files, but the hard limit is {}: lower --max-in-flight or raise the limit",
+            limit.rlim_max
+        );
+        limit.rlim_cur = need;
+        // SAFETY: `setrlimit` reads only `limit`, which lives for the call.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        tracing::info!(open_files = need, "load: raised the open-file limit");
+        Ok(())
+    }
+
     /// The scraper of the exporters this run reads.
     fn scraper(&self) -> anyhow::Result<Scraper> {
         Scraper::new(ScrapeSet {
@@ -435,6 +483,7 @@ struct RunSetup {
 /// arrives before its contract exists would revert and spoil the
 /// verdict.
 async fn prepare_run(cfg: &LoadConfig) -> anyhow::Result<RunSetup> {
+    cfg.raise_open_files()?;
     let client = Arc::new(rpc_client(&cfg.rpc, cfg.max_in_flight.get())?);
 
     let chain_id = match cfg.chain_id {

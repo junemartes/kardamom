@@ -108,6 +108,33 @@ pub struct IngressConfig {
     /// refuses a larger transaction before it decodes it. The cap bounds
     /// the bytes of each transaction on every path after the ingress.
     pub max_tx_bytes: NonZeroUsize,
+    /// The ack at admission. `Some`: `eth_sendRawTransaction` answers on
+    /// the verdict of the sequencer, as an Ethereum node answers when its
+    /// mempool takes a transaction. `None`: it waits for the receipt.
+    pub admission_ack: Option<AdmissionAck>,
+}
+
+/// The settings of the ack at admission. See [`crate::acks`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionAck {
+    /// The time a submission waits for a verdict, then fails with
+    /// `transaction not acknowledged`.
+    pub timeout: Duration,
+    /// The time a rejection waits for an accept of another twin.
+    pub reject_grace: Duration,
+    /// The sequencers of each lane that send a verdict. A rejection of
+    /// every one of them answers at once.
+    pub twins: std::num::NonZeroU8,
+}
+
+impl Default for AdmissionAck {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(2),
+            reject_grace: Duration::from_millis(250),
+            twins: std::num::NonZeroU8::new(2).unwrap_or(std::num::NonZeroU8::MIN),
+        }
+    }
 }
 
 /// The default of [`IngressConfig::max_tx_bytes`]: 128 KiB, equal to the
@@ -212,6 +239,7 @@ impl Default for IngressConfig {
             // below the stall that makes a re-offer a hazard.
             inclusion_horizon_blocks: nonzero!(64u64),
             max_tx_bytes: DEFAULT_MAX_TX_BYTES,
+            admission_ack: None,
         }
     }
 }

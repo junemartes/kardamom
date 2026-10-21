@@ -84,6 +84,14 @@ pub const FEATURE_SEALER_V3: u64 = 2;
 /// not read it.
 pub const FEATURE_SEALER_V4: u64 = 3;
 
+/// Decision version 5 of the sealer, the carry flag: a sequencer offers each
+/// transaction reference with its envelope, and the sealer orders the
+/// reference and relays its bytes. The sealer takes the activation only while
+/// decision version 4 is active, and runs version 5 only while version 4
+/// stays active. Only the sealer follows it, at a block boundary, as
+/// [`FEATURE_SEALER_V4`]. The executor does not read it.
+pub const FEATURE_SEALER_V5: u64 = 4;
+
 /// The length of `setFeature` calldata: the selector and two words.
 const SET_FEATURE_LEN: usize = 4 + 32 + 32;
 

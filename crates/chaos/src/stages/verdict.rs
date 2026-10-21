@@ -9,17 +9,26 @@ use crate::harness::Harness;
 use crate::nomad::Streams;
 use crate::poll::{self, Budget, Outcome};
 use crate::probes::VALIDATOR_PORT;
-use crate::stages::tail_lines;
+use crate::stages::{matching_lines, tail_lines};
 
 const COMMITTED: &str = "validator_committed_block";
 const VERIFIED: &str = "validator_blocks_verified_total";
 const DIVERGENCE: &str = "validator_divergence_total";
 const SHADOW_CHECKS: &str = "kardamom_state_trie_shadow_checks_total";
 const SHADOW_MISMATCH: &str = "kardamom_state_trie_shadow_mismatch_total";
+const BAL_MISSING: &str = "validator_bal_missing_total";
+const RECEIPT_MISSING: &str = "validator_receipt_missing_total";
+/// The counters that tell a stalled validator from a slow one: a cursor
+/// that does not move, and the waits that timed out with no replica data.
+const STALL_COUNTERS: [&str; 3] = [COMMITTED, BAL_MISSING, RECEIPT_MISSING];
 /// The validator must answer its exporter within two minutes.
 const FOUND_SECS: u64 = 120;
 const POLL_EVERY: Duration = Duration::from_secs(5);
 const TAIL: usize = 60;
+/// The tail after a restart holds only startup lines, so the dump also
+/// shows the last warnings and errors of the whole log.
+const WARN_MARKERS: &[&str] = &[" WARN", " ERROR"];
+const WARNINGS: usize = 60;
 const FLIGHT_RECORDER: &str = "for f in /opt/kardamom/state/divergence-*.json; do [ -f \"$f\" ] && { echo \"== $f\"; head -c 4096 \"$f\"; echo; }; done";
 
 impl Harness {
@@ -127,6 +136,14 @@ impl Harness {
     }
 
     async fn dump_validator_tails(&self) {
+        eprintln!("----- validator stall counters -----");
+        eprintln!(
+            "executor progress = {:?}",
+            self.probes.executor_progress().await
+        );
+        for metric in STALL_COUNTERS {
+            eprintln!("{metric} = {:?}", self.probes.val_metric(metric).await);
+        }
         eprintln!("----- validator alloc log tails -----");
         let Ok(allocs) = self.nomad.allocations_with_logs("validator").await else {
             return;
@@ -139,6 +156,8 @@ impl Harness {
                 .unwrap_or_default();
             eprintln!("== alloc {} (tail {TAIL})", alloc.short_id());
             eprintln!("{}", tail_lines(&logs, TAIL));
+            eprintln!("== alloc {} warnings (last {WARNINGS})", alloc.short_id());
+            eprintln!("{}", matching_lines(&logs, WARN_MARKERS, WARNINGS));
         }
     }
 }

@@ -72,6 +72,9 @@ struct HealthService {
     id: String,
     service: String,
     address: String,
+    /// Consul leaves the port out of a record that registered port 0: a
+    /// subscriber record names no port.
+    #[serde(default)]
     port: u16,
     #[serde(default)]
     meta: BTreeMap<String, String>,
@@ -318,6 +321,25 @@ mod tests {
             filter_expression(&meta),
             "Service.Meta.cluster_id == \"c1\" and Service.Meta.topic == \"tx_data\""
         );
+    }
+
+    /// The health answer of a subscriber record: Consul leaves out the
+    /// port 0 that the record registered.
+    #[test]
+    fn a_record_with_no_port_decodes_as_port_zero() {
+        let body = r#"[{"Node":{"Node":"executor-0"},"Service":{"ID":"a:sub:tx_receipts:1002",
+            "Service":"kardamom-mdc-subscriber","Address":"10.20.1.30",
+            "Meta":{"topic":"tx_receipts"}}}]"#;
+        let entries: Vec<HealthEntry> = serde_json::from_str(body).unwrap();
+        let entry = entries
+            .into_iter()
+            .next()
+            .unwrap()
+            .service
+            .into_entry()
+            .unwrap();
+        assert_eq!(entry.port, 0);
+        assert_eq!(entry.meta["topic"], "tx_receipts");
     }
 
     #[test]

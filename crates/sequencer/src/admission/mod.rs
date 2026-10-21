@@ -34,6 +34,14 @@
 //!   [`AdmissionConfig::park_ttl`], so the client gets an answer on a
 //!   quiet lane. The time is the time of the last sweep.
 //!
+//! A state from a lookup can be behind the chain: the state database of an
+//! executor commits after the receipts go out, and a replica that starts
+//! late misses the rows before its start. While a parked transaction waits
+//! for a gap over such a state, the sender asks again after
+//! [`AdmissionConfig::relook_after`], until the gap closes or the
+//! transaction expires. A gap over rows is a missing transaction, and the
+//! filter does not ask again.
+//!
 //! A sender with nothing forwarded and nothing parked is idle. Above
 //! [`AdmissionConfig::max_senders`], a sweep forgets the idle senders: the
 //! next transaction of one asks for a lookup.
@@ -45,7 +53,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::{Duration, Instant};
 
 use alloy_primitives::map::HashMap;
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 
 use self::sender::SenderState;
 
@@ -62,6 +70,9 @@ pub struct AdmissionConfig {
     pub park_width: NonZeroU64,
     /// The time after which a parked transaction expires.
     pub park_ttl: Duration,
+    /// The time after which a sender whose state came from a lookup asks
+    /// again, while a parked transaction waits for a nonce gap over it.
+    pub relook_after: Duration,
     /// The senders above which a sweep forgets the idle ones.
     pub max_senders: NonZeroUsize,
 }
@@ -75,6 +86,17 @@ pub struct AccountState {
     pub delegated: bool,
     /// The canonical position of the state. A higher position is newer.
     pub tx_idx: u64,
+}
+
+impl AccountState {
+    /// Whether this state replaces `held`: a higher position, or position 0
+    /// with a higher nonce. Position 0 names both the empty chain and the
+    /// state after its first transaction.
+    #[must_use]
+    pub fn is_newer_than(&self, held: &Self) -> bool {
+        self.tx_idx > held.tx_idx
+            || (self.tx_idx == 0 && held.tx_idx == 0 && self.nonce > held.nonce)
+    }
 }
 
 /// The place of a transaction in its ingress image. Racing replicas read
@@ -93,10 +115,42 @@ pub struct ImagePos {
 pub struct Candidate<T> {
     pub sender: Address,
     pub nonce: u64,
+    pub tx_hash: B256,
     /// The most the transaction can be charged: gas limit times fee cap, plus value.
     pub cost: U256,
     pub image: ImagePos,
+    /// The id of the ingress that published the transaction: the top 16
+    /// bits of its correlation id.
+    pub ingress: u16,
+    /// The client has its answer: the filter took the transaction into its
+    /// mempool before, with an [`Verdict::Accept`]. A later verdict of the
+    /// transaction is not an answer to the client. The caller sets it to
+    /// `false`.
+    pub answered: bool,
     pub payload: T,
+}
+
+/// The ack of one transaction that the filter took into its mempool, for
+/// the ingress that published it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ack {
+    pub ingress: u16,
+    pub sender: Address,
+    pub nonce: u64,
+    pub tx_hash: B256,
+}
+
+impl<T> Candidate<T> {
+    /// Mark the candidate answered, and return its ack. A candidate that
+    /// has its answer gives none.
+    pub fn answer(&mut self) -> Option<Ack> {
+        (!std::mem::replace(&mut self.answered, true)).then_some(Ack {
+            ingress: self.ingress,
+            sender: self.sender,
+            nonce: self.nonce,
+            tx_hash: self.tx_hash,
+        })
+    }
 }
 
 /// Why the filter refused a transaction.
@@ -125,9 +179,14 @@ pub enum Verdict<T> {
     /// The filter holds no state of the sender: ask Redis, then the
     /// executor, and give the answer to [`Admission::on_lookup`].
     Lookup(Address),
+    /// The filter holds the transaction for a nonce gap or a busy run: it is
+    /// in the mempool, so tell the client.
+    Accept(Ack),
 }
 
-/// A forwarded transaction, in forward order, for the loss expiry.
+/// A forwarded transaction, in forward order, for the loss expiry. `block`
+/// is the block of the first rows after the forward, so the loss window
+/// never starts before the forward on a quiet chain.
 struct ForwardMark {
     block: u64,
     sender: Address,
@@ -143,6 +202,12 @@ struct ParkMark {
     nonce: u64,
 }
 
+/// A sender that asks for a lookup again at `due`, if its gap is still there.
+struct Relook {
+    due: Instant,
+    sender: Address,
+}
+
 /// The highest unit seen in one image, and its parked transactions.
 #[derive(Default)]
 struct ImageMarks {
@@ -156,6 +221,11 @@ pub struct Admission<T> {
     senders: HashMap<Address, SenderState<T>>,
     images: HashMap<(u8, i32), ImageMarks>,
     forwards: VecDeque<ForwardMark>,
+    /// The marks of `forwards` that have their block: the marks from this
+    /// count on wait for the next rows.
+    stamped: usize,
+    /// The relooks in the order of their due time.
+    relooks: VecDeque<Relook>,
     /// The newest block of rows.
     block: u64,
     /// The time of the last sweep.
@@ -170,6 +240,8 @@ impl<T> Admission<T> {
             senders: HashMap::default(),
             images: HashMap::default(),
             forwards: VecDeque::new(),
+            stamped: 0,
+            relooks: VecDeque::new(),
             block: 0,
             now,
         }
@@ -194,13 +266,15 @@ impl<T> Admission<T> {
         };
         let marks = self.images.entry(key).or_default();
         marks.highest = marks.highest.max(mark.unit);
+        let sender = c.sender;
         let parked = self
             .senders
-            .entry(c.sender)
+            .entry(sender)
             .or_default()
             .offer(c, &self.cfg, out);
         if parked {
             self.images.entry(key).or_default().parked.push_back(mark);
+            self.queue_relook(sender);
         }
         self.record_forwards(&out[from..]);
     }
@@ -215,18 +289,65 @@ impl<T> Admission<T> {
     ) {
         self.block = self.block.max(block);
         for (address, state) in rows {
-            self.on_lookup(address, state, out);
+            self.apply_state(address, state, false, out);
         }
+        self.forwards
+            .range_mut(self.stamped..)
+            .for_each(|mark| mark.block = block);
+        self.stamped = self.forwards.len();
     }
 
     /// Apply the state of one account: a row, or the answer of a lookup.
     pub fn on_lookup(&mut self, address: Address, state: AccountState, out: &mut Vec<Verdict<T>>) {
+        self.apply_state(address, state, true, out);
+        self.queue_relook(address);
+    }
+
+    fn apply_state(
+        &mut self,
+        address: Address,
+        state: AccountState,
+        from_lookup: bool,
+        out: &mut Vec<Verdict<T>>,
+    ) {
         let from = out.len();
         self.senders
             .entry(address)
             .or_default()
-            .on_state(state, &self.cfg, out);
+            .on_state(state, from_lookup, &self.cfg, out);
         self.record_forwards(&out[from..]);
+    }
+
+    /// Queue a relook of `sender` when its parked transaction waits for a
+    /// gap over a state from a lookup.
+    fn queue_relook(&mut self, sender: Address) {
+        let queue = self
+            .senders
+            .get_mut(&sender)
+            .is_some_and(|s| s.waits_on_lookup_gap() && s.queue_relook());
+        if queue {
+            // An `Instant` that cannot hold the sum is due at once.
+            let due = self
+                .now
+                .checked_add(self.cfg.relook_after)
+                .unwrap_or(self.now);
+            self.relooks.push_back(Relook { due, sender });
+        }
+    }
+
+    /// Ask again for each sender whose relook is due at `now`.
+    fn relook_due(&mut self, now: Instant, out: &mut Vec<Verdict<T>>) {
+        while self.relooks.front().is_some_and(|r| r.due <= now) {
+            self.relook_front(out);
+        }
+    }
+
+    fn relook_front(&mut self, out: &mut Vec<Verdict<T>>) {
+        let asked = self.relooks.pop_front().and_then(|r| {
+            let ask = self.senders.get_mut(&r.sender)?.relook();
+            ask.then_some(r.sender)
+        });
+        out.extend(asked.map(Verdict::Lookup));
     }
 
     /// The executor rolled back: every state may name void blocks. Each
@@ -245,10 +366,11 @@ impl<T> Admission<T> {
     pub fn sweep(&mut self, now: Instant, out: &mut Vec<Verdict<T>>) {
         self.now = now;
         let window = self.cfg.loss_blocks.get();
-        while self
-            .forwards
-            .front()
-            .is_some_and(|f| f.block.saturating_add(window) <= self.block)
+        while self.stamped > 0
+            && self
+                .forwards
+                .front()
+                .is_some_and(|f| f.block.saturating_add(window) <= self.block)
         {
             self.expire_forward(out);
         }
@@ -259,6 +381,7 @@ impl<T> Admission<T> {
         for marks in self.images.values_mut() {
             marks.expire(limit, &mut self.senders, out);
         }
+        self.relook_due(now, out);
         if self.senders.len() > self.cfg.max_senders.get() {
             self.senders.retain(|_, s| !s.is_idle());
         }
@@ -267,6 +390,8 @@ impl<T> Admission<T> {
     fn expire_forward(&mut self, out: &mut Vec<Verdict<T>>) {
         let from = out.len();
         let lost = self.forwards.pop_front();
+        // The sweep calls this only while a stamped mark is at the front.
+        self.stamped -= 1;
         let freed = lost.is_some_and(|mark| {
             self.senders
                 .get_mut(&mark.sender)
@@ -278,16 +403,16 @@ impl<T> Admission<T> {
     }
 
     /// Mark each forward of `verdicts` for the loss expiry.
+    /// The next rows stamp the marks with their block.
     fn record_forwards(&mut self, verdicts: &[Verdict<T>]) {
-        let block = self.block;
         self.forwards
             .extend(verdicts.iter().filter_map(|v| match v {
                 Verdict::Forward(c) => Some(ForwardMark {
-                    block,
+                    block: 0,
                     sender: c.sender,
                     nonce: c.nonce,
                 }),
-                Verdict::Reject(..) | Verdict::Lookup(_) => None,
+                Verdict::Reject(..) | Verdict::Lookup(_) | Verdict::Accept(_) => None,
             }));
     }
 }

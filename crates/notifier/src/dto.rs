@@ -33,6 +33,7 @@ pub struct TxStatusEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Stage {
+    Accepted,
     Offered,
     Sealed,
     Executed,
@@ -42,6 +43,7 @@ pub enum Stage {
 impl From<TxStageKind> for Stage {
     fn from(kind: TxStageKind) -> Self {
         match kind {
+            TxStageKind::Accepted => Self::Accepted,
             TxStageKind::Offered => Self::Offered,
             TxStageKind::Sealed => Self::Sealed,
             TxStageKind::Executed => Self::Executed,
@@ -64,7 +66,9 @@ impl TxStatusEvent {
                 Some(reason.word().to_string()),
                 reason.expected_nonce(),
             ),
-            TxStage::Offered { .. } | TxStage::Sealed => (None, None, None),
+            TxStage::Accepted { .. } | TxStage::Offered { .. } | TxStage::Sealed => {
+                (None, None, None)
+            }
         };
         Self {
             tx_hash: status.tx_hash,

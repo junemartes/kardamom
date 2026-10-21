@@ -68,6 +68,28 @@ tasks.named('test') {
     systemProperty 'kardamom.aeronEntrypoint', aeronEntrypoint.canonicalPath
     // TestCluster spins up many threads; give the forked worker a single test fork.
     maxParallelForks = 1
+    useJUnitPlatform {
+        excludeTags 'allocation'
+    }
+}
+
+// The allocation gate of the service record path (CarriedPathAllocationTest,
+// tag "allocation") runs in its own JVM with escape analysis off, as the gate
+// of :core does. The normal test task leaves it out.
+def allocationGate = tasks.register('allocationGate', Test) {
+    description = 'Checks the heap bytes per record of the service record path against its baselines.'
+    group = 'verification'
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform {
+        includeTags 'allocation'
+    }
+    forkEvery = 1
+    jvmArgs '-XX:-DoEscapeAnalysis'
+}
+
+tasks.named('check') {
+    dependsOn allocationGate
 }
 
 // The load bench (`just sealer-bench`): real sealer members from the jar,
