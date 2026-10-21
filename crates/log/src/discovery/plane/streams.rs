@@ -7,6 +7,7 @@ use super::{StreamKey, StreamPlane};
 use crate::aeron_live::{
     AeronRuntime, TxDataPublisherHandle, TxDataSubscriberHandle, TxDataSubscription,
     TxReceiptsBoundarySubscriberHandle, TxReceiptsPublisherHandle, TxReceiptsSubscriberHandle,
+    TxVerdictsPublisherHandle,
 };
 use crate::aeron_live::{PubHandle, TypedSubscription};
 use crate::discovery::record::Topic;
@@ -126,6 +127,58 @@ impl StreamPlane {
             Some(d) => d
                 .open_subscription(rt, key)
                 .map(|rx| TxReceiptsBoundarySubscriberHandle::from_subscription(rx, rt)),
+        }
+    }
+
+    /// The `tx_verdicts` publisher of the ingress `target`. Discovered: a
+    /// dynamic MDC publication on the stream id of `target`, so only that
+    /// ingress joins it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publication fails to open or register.
+    pub async fn tx_verdicts_publisher(
+        &mut self,
+        rt: &AeronRuntime,
+        target: u8,
+    ) -> Result<TxVerdictsPublisherHandle, LogError> {
+        let key = self.tx_verdicts_key(target);
+        let inner = match &mut self.discovered {
+            None => rt.open_publication(&self.channels.tx_verdicts_channel, key.stream_id)?,
+            Some(d) => d.open_publication(rt, key).await?,
+        };
+        Ok(TxVerdictsPublisherHandle::from_publication(inner))
+    }
+
+    /// The `tx_verdicts` subscriber of the ingress `own`: the receipts of
+    /// its own transactions, in the frame format of `tx_receipts`.
+    /// Discovered: one subscription that the reconcile task fills with
+    /// every sequencer that publishes to `own`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription fails to open.
+    pub fn tx_verdicts_subscriber(
+        &mut self,
+        rt: &AeronRuntime,
+        own: u8,
+    ) -> Result<TxReceiptsSubscriberHandle, LogError> {
+        let key = self.tx_verdicts_key(own);
+        let rx = match &mut self.discovered {
+            None => {
+                rt.open_subscription_raw(&self.channels.tx_verdicts_channel, key.stream_id)?
+                    .1
+            }
+            Some(d) => d.open_raw_subscription(rt, key)?,
+        };
+        Ok(TxReceiptsSubscriberHandle::from_raw(rx, rt))
+    }
+
+    fn tx_verdicts_key(&self, ingress_id: u8) -> StreamKey {
+        StreamKey {
+            topic: Topic::TxVerdicts,
+            stream_id: self.channels.tx_verdicts_stream_id(ingress_id),
+            lane: None,
         }
     }
 

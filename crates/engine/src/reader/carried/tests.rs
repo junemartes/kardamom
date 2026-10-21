@@ -145,7 +145,7 @@ pub(super) fn tx_frame(index: u64, tx: &CanonicalTx) -> Vec<u8> {
 }
 
 /// The relayed frame of a valid entry at `index`.
-pub(super) fn tx_at(index: u64) -> Vec<u8> {
+pub(in crate::reader) fn tx_at(index: u64) -> Vec<u8> {
     tx_frame(index, &entry(index))
 }
 
