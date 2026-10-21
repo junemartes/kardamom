@@ -146,6 +146,34 @@ fn a_sealer_on_version_four_gets_the_tagged_position() {
     );
 }
 
+/// A sealer on decision version 5 takes each offer with the bytes of its
+/// transaction: the archived envelope that the ingress published.
+#[test]
+fn a_sealer_on_version_five_gets_the_bytes() {
+    let s = signer(5);
+    let (mut l, accounts, _) = new_loop();
+    let shared = SealerVersion::default();
+    let mut rules = SealerRules::new(0, shared.clone());
+    rules.on_session_start(1);
+    rules.on_sealer_info(1, 5);
+    l.enable_positioned_refs(shared);
+    accounts
+        .send(AccountEvent::Rows {
+            block: 1,
+            rows: vec![(s.address(), rich(0, 1))],
+        })
+        .unwrap();
+    let mut rig = Rig::default();
+    let envelope = signed_envelope(&s, 0, 1);
+    rig.push(TxDataLoc::new(7, pos(256)), envelope.clone());
+    l.run_once(&mut rig.ports()).unwrap();
+    let carried = rig.offers()[0].envelope.clone().expect("the bytes");
+    assert_eq!(
+        carried.as_ref(),
+        kardamom_log::codec::encode(&envelope).unwrap().as_slice()
+    );
+}
+
 /// While the sealer takes no offer, the loop takes no envelope: the offer
 /// that waits holds the intake. The offers go out in order once the sealer
 /// takes them.

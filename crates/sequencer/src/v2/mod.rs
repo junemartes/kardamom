@@ -164,6 +164,11 @@ pub struct RefPayload {
     /// The deadline field of the guard header.
     deadline: u64,
     tip: u128,
+    /// The archived envelope, when the sealer carries the bytes. A parked
+    /// transaction keeps it until it goes out: the filter bounds the parked
+    /// transactions of each sender, and the park width and time to live
+    /// bound how long they stay.
+    envelope: Option<bytes::Bytes>,
 }
 
 /// The publish loop of sequencer v2 for one replica.
@@ -378,11 +383,23 @@ impl AdmissionLoop {
                 loc: inbound.loc,
                 deadline,
                 tip,
+                envelope: self.carried(&inbound.envelope)?,
             },
         };
         self.depth.took(vslot);
         self.admission.offer(candidate, &mut self.verdicts);
         Ok(())
+    }
+
+    /// The archived envelope for the offer, when the sealer carries the
+    /// bytes.
+    fn carried(&self, envelope: &TxEnvelope) -> Result<Option<bytes::Bytes>, SequencerError> {
+        if !self.sealer_version.carries_bytes() {
+            return Ok(None);
+        }
+        kardamom_log::codec::encode(envelope)
+            .map(|archived| Some(bytes::Bytes::from(archived.into_vec())))
+            .map_err(|e| SequencerError::EncodeFailed(format!("envelope: {e}")))
     }
 
     /// The deadline field: the tagged position under decision version 4,
@@ -489,6 +506,7 @@ fn offer_of(c: &Candidate<RefPayload>) -> RefOffer {
             max_inclusion_block: c.payload.deadline,
             tip: c.payload.tip,
         },
+        envelope: c.payload.envelope.clone(),
     }
 }
 
