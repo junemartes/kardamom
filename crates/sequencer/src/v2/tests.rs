@@ -3,9 +3,12 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, U256};
 use kardamom_types::shard_map::vslot_for;
-use kardamom_types::{TxDataLoc, TxErrorReason, TxStageKind};
+use kardamom_types::{
+    AccountRow, Receipt, ReceiptRollback, TX_TYPE_DEPOSIT, TX_TYPE_LEGACY, TxDataLoc, TxEnvelope,
+    TxErrorReason, TxStageKind,
+};
 
-use super::{AccountEvent, AdmissionLoop, V2Config};
+use super::{AccountEvent, AdmissionLoop, V2Config, VerdictOut};
 use crate::admission::{AccountState, AdmissionConfig};
 use crate::sealer_rules::{SealerRules, SealerVersion};
 use crate::testkit::{Rig, one_partition_cfg, pos, signed_envelope, signer};
@@ -19,6 +22,7 @@ fn cfg() -> V2Config {
             loss_blocks: NonZeroU64::new(16).unwrap(),
             park_width: NonZeroU64::new(1 << 17).unwrap(),
             park_ttl: Duration::from_secs(4),
+            relook_after: Duration::from_millis(500),
             max_senders: NonZeroUsize::new(1 << 16).unwrap(),
         },
         sweep_every: Duration::from_millis(50),
@@ -225,4 +229,92 @@ fn a_parked_transaction_counts_in_the_depth_of_its_vslot() {
     l.run_once(&mut rig.ports()).unwrap();
     assert_eq!(l.depth.of(vslot), 0);
     assert_eq!(rig.offers().len(), 2);
+}
+
+/// A receipt of a forwarded transaction goes to the ingress that published
+/// it. A deposit, a receipt that the rows already confirmed, and a
+/// receipt of another sender go nowhere. A rollback goes to every ingress.
+#[test]
+fn a_receipt_goes_to_the_ingress_of_its_transaction() {
+    let s = signer(8);
+    let (mut l, accounts, _) = new_loop();
+    let (verdicts_tx, mut verdicts) = tokio::sync::mpsc::channel(16);
+    l.enable_verdicts(verdicts_tx);
+    accounts
+        .send(AccountEvent::Rows {
+            block: 1,
+            rows: vec![(s.address(), rich(0, 1))],
+        })
+        .unwrap();
+    let mut rig = Rig::default();
+    for (nonce, ingress) in [(0u64, 3u16), (1, 5)] {
+        let mut env = signed_envelope(&s, nonce, 1);
+        env.correlation_id = TxEnvelope::pack_correlation_id(ingress, 40 + nonce);
+        let at = pos(64 * (i32::try_from(nonce).unwrap() + 1));
+        rig.push(TxDataLoc::new(7, at), env);
+        l.run_once(&mut rig.ports()).unwrap();
+    }
+    assert_eq!(rig.offers().len(), 2);
+
+    let receipt = |nonce: u64, tx_type: u8| Receipt {
+        from: s.address(),
+        nonce,
+        tx_type,
+        ..Receipt::default()
+    };
+    let other = Receipt {
+        from: signer(9).address(),
+        ..Receipt::default()
+    };
+    let batch = vec![
+        receipt(0, TX_TYPE_LEGACY),
+        receipt(0, TX_TYPE_DEPOSIT),
+        other,
+        receipt(1, TX_TYPE_LEGACY),
+    ];
+    let row = AccountRow {
+        address: s.address(),
+        nonce: 2,
+        balance: U256::from(5u64),
+    };
+    let event = AccountEvent::Receipts {
+        receipts: batch,
+        rows: vec![row.clone()],
+    };
+    accounts.send(event.clone()).unwrap();
+    accounts
+        .send(AccountEvent::Rows {
+            block: 2,
+            rows: vec![(s.address(), rich(2, 2))],
+        })
+        .unwrap();
+    l.run_once(&mut rig.ports()).unwrap();
+    let frames: Vec<(u8, Vec<u64>, Vec<AccountRow>)> =
+        std::iter::from_fn(|| verdicts.try_recv().ok())
+            .map(|frame| match frame {
+                VerdictOut::Receipts { ingress, batch } => (
+                    ingress,
+                    batch.receipts.iter().map(|r| r.nonce).collect(),
+                    batch.accounts,
+                ),
+                VerdictOut::Rollback(_) => panic!("no rollback yet"),
+            })
+            .collect();
+    assert_eq!(
+        frames,
+        [(3, vec![0], vec![row.clone()]), (5, vec![1], vec![row])],
+        "each frame carries the row of its sender"
+    );
+
+    accounts.send(event).unwrap();
+    let rollback = ReceiptRollback {
+        to_block: 1,
+        ..ReceiptRollback::default()
+    };
+    accounts.send(AccountEvent::Rollback(rollback)).unwrap();
+    l.run_once(&mut rig.ports()).unwrap();
+    assert!(
+        matches!(verdicts.try_recv(), Ok(VerdictOut::Rollback(r)) if r == rollback),
+        "the copy of another executor goes nowhere, and the rollback goes out"
+    );
 }
