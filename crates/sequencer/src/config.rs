@@ -91,6 +91,11 @@ pub struct SequencerConfig {
     /// The `[admission]` section: the v2 loop, off by default.
     #[serde(default)]
     pub admission: crate::v2::AdmissionSettings,
+    /// Read the receipts and their account rows from the egress
+    /// (`egress_receipts`), each once, in place of the `tx_receipts` stream
+    /// of every executor. Off by default.
+    #[serde(default)]
+    pub receipts_from_egress: bool,
     /// The own `tx_data` lane. `None` means `sequencer_id`. A ref for an
     /// envelope on this lane carries this lane. See
     /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.2.
@@ -151,6 +156,7 @@ impl Default for SequencerConfig {
             live_accounts: LiveAccountsConfig::default(),
             cache: CacheConfig::default(),
             admission: crate::v2::AdmissionSettings::default(),
+            receipts_from_egress: false,
             lane: None,
             vslots: None,
             extra_lanes: Vec::new(),
@@ -485,6 +491,15 @@ mod tests {
     fn zero_ttl_rejected_at_parse() {
         let toml = format!("{BASE_TOML}tx_ttl_ms = 0\n");
         assert!(toml::from_str::<SequencerConfig>(&toml).is_err());
+    }
+
+    #[test]
+    fn the_receipts_come_from_the_executors_unless_the_config_names_the_egress() {
+        let cfg: SequencerConfig = toml::from_str(BASE_TOML).unwrap();
+        assert!(!cfg.receipts_from_egress);
+        let cfg: SequencerConfig =
+            toml::from_str(&format!("receipts_from_egress = true\n{BASE_TOML}")).unwrap();
+        assert!(cfg.receipts_from_egress);
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub enum Topic {
     L1Blocks,
     ExecFrames,
     EgressOrder,
+    EgressReceipts,
 }
 
 impl Topic {
@@ -56,6 +57,7 @@ impl Topic {
             Self::L1Blocks => "l1_blocks",
             Self::ExecFrames => "exec_frames",
             Self::EgressOrder => "egress_order",
+            Self::EgressReceipts => "egress_receipts",
         }
     }
 
@@ -80,7 +82,8 @@ impl Topic {
             | Self::ExecTxs
             | Self::L1Blocks
             | Self::ExecFrames
-            | Self::EgressOrder => None,
+            | Self::EgressOrder
+            | Self::EgressReceipts => None,
         }
     }
 
@@ -99,6 +102,7 @@ impl Topic {
             "l1_blocks" => Some(Self::L1Blocks),
             "exec_frames" => Some(Self::ExecFrames),
             "egress_order" => Some(Self::EgressOrder),
+            "egress_receipts" => Some(Self::EgressReceipts),
             _ => None,
         }
     }

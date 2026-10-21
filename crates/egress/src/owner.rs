@@ -1,9 +1,10 @@
 //! [`Owner`]: the one thread that owns the merge and the store.
 //!
 //! Everything that touches the stream comes to this thread on one channel:
-//! the messages of the executors, and the range reads of the readers that
-//! resume. So the merge, the store and the live publication need no lock,
-//! and a read sees the store as the thread left it after its last frame.
+//! the messages and the receipts of the executors, the range reads of the
+//! readers that resume, and the receipt reads. So the merges, the store and
+//! the live publications need no lock, and a read sees the state as the
+//! thread left it after its last input.
 //!
 //! The thread appends each delivered frame to the store, then publishes it
 //! live. It forces the store to disk on a fixed period, and deletes the
@@ -16,7 +17,12 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use tokio::sync::oneshot;
 
+use alloy_primitives::B256;
+use kardamom_log::aeron_live::ReceiptFrame;
+use kardamom_types::Receipt;
+
 use crate::merge::Merge;
+use crate::receipts::Receipts;
 use crate::store::{Range, Store, StoreError};
 
 /// Where the delivered frames go live.
@@ -30,6 +36,14 @@ pub enum Input {
     Frame { session: i32, message: Vec<u8> },
     /// A range read of a reader that resumes.
     Read(ReadRequest),
+    /// One receipt frame of an executor.
+    Receipts(ReceiptFrame),
+    /// A receipt read: the receipt of a hash, and the block of the newest
+    /// receipt that the egress holds.
+    Receipt {
+        tx_hash: B256,
+        reply: oneshot::Sender<(Option<Receipt>, u64)>,
+    },
 }
 
 /// A range read: the frames after the cursor, up to about `limit` bytes.
@@ -49,24 +63,31 @@ pub struct OwnerConfig {
     pub keep_blocks: NonZeroU64,
 }
 
-/// The owner of the merge, the store and the live publication.
+/// What the owner thread owns.
+pub struct Parts<P: FramePublisher> {
+    pub merge: Merge,
+    pub store: Store,
+    pub receipts: Receipts,
+    /// The live publication of the merged stream.
+    pub live: P,
+    /// The live publication of the merged receipts.
+    pub receipts_live: P,
+}
+
+/// The owner of the merges, the store and the live publications.
 pub struct Owner<P: FramePublisher> {
     cfg: OwnerConfig,
-    merge: Merge,
-    store: Store,
-    live: P,
+    parts: Parts<P>,
     delivered: Vec<Vec<u8>>,
     synced_at: Instant,
 }
 
 impl<P: FramePublisher> Owner<P> {
     #[must_use]
-    pub fn new(cfg: OwnerConfig, merge: Merge, store: Store, live: P) -> Self {
+    pub fn new(cfg: OwnerConfig, parts: Parts<P>) -> Self {
         Self {
             cfg,
-            merge,
-            store,
-            live,
+            parts,
             delivered: Vec::new(),
             synced_at: Instant::now(),
         }
@@ -92,7 +113,9 @@ impl<P: FramePublisher> Owner<P> {
         let taken = match inputs.recv_timeout(self.cfg.sync_every) {
             Ok(input) => self.on(input),
             Err(RecvTimeoutError::Timeout) => Ok(()),
-            Err(RecvTimeoutError::Disconnected) => return ControlFlow::Break(self.store.sync()),
+            Err(RecvTimeoutError::Disconnected) => {
+                return ControlFlow::Break(self.parts.store.sync());
+            }
         };
         match taken.and_then(|()| self.sync_if_due()) {
             Ok(()) => ControlFlow::Continue(()),
@@ -109,37 +132,63 @@ impl<P: FramePublisher> Owner<P> {
         match input {
             Input::Frame { session, message } => self.take(session, &message),
             Input::Read(read) => {
-                let range = self
-                    .store
-                    .read_from(read.from_index, read.from_block, read.limit);
+                let range =
+                    self.parts
+                        .store
+                        .read_from(read.from_index, read.from_block, read.limit);
                 // A reader that left takes no answer.
                 let _ = read.reply.send(range);
+                Ok(())
+            }
+            Input::Receipts(frame) => {
+                self.take_receipts(frame);
+                Ok(())
+            }
+            Input::Receipt { tx_hash, reply } => {
+                let receipts = &self.parts.receipts;
+                let _ = reply.send((receipts.receipt(&tx_hash).cloned(), receipts.block()));
                 Ok(())
             }
         }
     }
 
     fn take(&mut self, session: i32, message: &[u8]) -> Result<(), StoreError> {
-        self.merge.take(session, message, &mut self.delivered);
-        self.store.append(&self.delivered)?;
+        self.parts.merge.take(session, message, &mut self.delivered);
+        self.parts.store.append(&self.delivered)?;
         self.delivered
             .drain(..)
-            .for_each(|frame| self.live.publish(&frame));
+            .for_each(|frame| self.parts.live.publish(&frame));
         Ok(())
+    }
+
+    /// Merge one receipt frame, and publish what is new in it.
+    fn take_receipts(&mut self, frame: ReceiptFrame) {
+        let Some(frame) = self.parts.receipts.take(frame) else {
+            return;
+        };
+        let encoded = match &frame {
+            ReceiptFrame::Batch(batch) => kardamom_log::codec::encode(batch),
+            ReceiptFrame::Rollback(rollback) => kardamom_log::codec::encode(rollback),
+        };
+        match encoded {
+            Ok(bytes) => self.parts.receipts_live.publish(&bytes),
+            Err(e) => tracing::error!(error = %e, "egress: a receipt frame did not encode"),
+        }
     }
 
     fn sync_if_due(&mut self) -> Result<(), StoreError> {
         if self.synced_at.elapsed() < self.cfg.sync_every {
             return Ok(());
         }
-        self.store.sync()?;
+        self.parts.store.sync()?;
         self.synced_at = Instant::now();
         let floor = self
+            .parts
             .store
             .head()
             .next_block
             .saturating_sub(self.cfg.keep_blocks.get());
-        self.store.prune_below(floor)
+        self.parts.store.prune_below(floor)
     }
 }
 

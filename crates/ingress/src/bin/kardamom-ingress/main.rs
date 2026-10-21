@@ -209,6 +209,14 @@ struct Args {
         value_delimiter = ','
     )]
     executor_query_endpoints: Vec<String>,
+    /// The endpoints of `eth_getTransactionReceipt` on a cache miss: the
+    /// egress (`http://host:port`). Empty: the executor query endpoints.
+    #[arg(
+        long = "receipt-query-endpoints",
+        env = "KARDAMOM_RECEIPT_QUERY_ENDPOINTS",
+        value_delimiter = ','
+    )]
+    receipt_query_endpoints: Vec<String>,
     /// Whether the submit path rejects an unfunded sender from the local
     /// account layer. `false` publishes every submit, as before the
     /// layer existed.
@@ -301,6 +309,10 @@ impl IngressService {
             admission_checks: args.admission_checks,
             executor_query: ExecutorQueryConfig {
                 endpoints: args.executor_query_endpoints.clone(),
+                ..ExecutorQueryConfig::default()
+            },
+            receipt_query: ExecutorQueryConfig {
+                endpoints: args.receipt_query_endpoints.clone(),
                 ..ExecutorQueryConfig::default()
             },
             cache: self.file_cfg.cache.clone(),

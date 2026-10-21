@@ -395,9 +395,16 @@ impl ResyncWiring {
         // discovered subscription receives on OS-chosen ports, so
         // co-located replicas never collide.
         let executor_count = executor_count.or(plane.channels().tx_receipts_executor_count);
-        let receipts_sub = plane
-            .tx_receipts_subscriber(receipts_rt, executor_count)
-            .context("open tx_receipts")?;
+        let receipts_sub = if cfg.receipts_from_egress {
+            tracing::info!("sequencer: the receipts and their rows come from the egress");
+            plane
+                .egress_receipts_subscriber(receipts_rt)
+                .context("open egress_receipts")?
+        } else {
+            plane
+                .tx_receipts_subscriber(receipts_rt, executor_count)
+                .context("open tx_receipts")?
+        };
         let vslots = cfg.vslot_set().context("vslots")?;
         // The local account layer: the receipts feed writes the rows of
         // this replica's vslots, the lookup task reads them.

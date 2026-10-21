@@ -170,6 +170,9 @@ where
     /// stall. The admission path never calls it: it has its own client
     /// in `cold`.
     pub(crate) query: Option<ExecutorQuery>,
+    /// The query of a receipt on a cache miss: the egress, or `query` when
+    /// the config names no receipt endpoint.
+    pub(crate) receipt_query: Option<ExecutorQuery>,
     /// The Redis layer. `None` with `[cache]` off: no Redis call exists
     /// on any path. See `kardamom_cache::reader`.
     pub(crate) redis: Option<Arc<CacheReader>>,
@@ -238,6 +241,7 @@ where
             correlation_seq: self.correlation_seq.clone(),
             live: self.live.clone(),
             query: self.query.clone(),
+            receipt_query: self.receipt_query.clone(),
             redis: self.redis.clone(),
             cold: self.cold.clone(),
             latest_block_number: self.latest_block_number.clone(),
@@ -272,6 +276,7 @@ where
         let tx_error_dedup = Arc::new(TxErrorDedup::default());
         let live = subscription.live_accounts();
         let query = ExecutorQuery::new(&cfg.executor_query);
+        let receipt_query = ExecutorQuery::new(&cfg.receipt_query).or_else(|| query.clone());
         let redis = cfg.cache.enabled().then(|| {
             Arc::new(CacheReader::spawn(
                 &cfg.cache,
@@ -300,6 +305,7 @@ where
             correlation_seq: Arc::new(AtomicU64::new(0)),
             live,
             query,
+            receipt_query,
             redis,
             cold,
             latest_block_number: Arc::new(AtomicU64::new(0)),
@@ -478,7 +484,7 @@ where
             kardamom_cache::metrics::record_lookup("receipt", "hit");
             return Some(receipt);
         }
-        let query = self.query.as_ref()?;
+        let query = self.receipt_query.as_ref()?;
         if self.rate_limiter.check(client_ip).is_err() {
             kardamom_cache::metrics::record_lookup("receipt", "shed");
             return None;

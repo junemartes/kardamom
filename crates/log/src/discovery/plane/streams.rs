@@ -136,6 +136,57 @@ impl StreamPlane {
         }
     }
 
+    /// The `egress_receipts` publisher of this egress instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publication fails to open or register.
+    pub async fn egress_receipts_publisher(
+        &mut self,
+        rt: &AeronRuntime,
+    ) -> Result<PubHandle, LogError> {
+        let key = self.egress_receipts_key();
+        match &mut self.discovered {
+            None => rt.open_publication(
+                &self.channels.egress_receipts_channel,
+                self.channels.egress_receipts_stream_id,
+            ),
+            Some(d) => d.open_publication(rt, key).await,
+        }
+    }
+
+    /// The `egress_receipts` subscription of a reader of the egress, in the
+    /// frame format of `tx_receipts`: the frames of every egress instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription fails to open.
+    pub fn egress_receipts_subscriber(
+        &mut self,
+        rt: &AeronRuntime,
+    ) -> Result<TxReceiptsSubscriberHandle, LogError> {
+        let key = self.egress_receipts_key();
+        let rx = match &mut self.discovered {
+            None => {
+                rt.open_subscription_raw(
+                    &self.channels.egress_receipts_channel,
+                    self.channels.egress_receipts_stream_id,
+                )?
+                .1
+            }
+            Some(d) => d.open_raw_subscription(rt, key)?,
+        };
+        Ok(TxReceiptsSubscriberHandle::from_raw(rx, rt))
+    }
+
+    fn egress_receipts_key(&self) -> StreamKey {
+        StreamKey {
+            topic: Topic::EgressReceipts,
+            stream_id: self.channels.egress_receipts_stream_id,
+            lane: None,
+        }
+    }
+
     fn egress_order_key(&self) -> StreamKey {
         StreamKey {
             topic: Topic::EgressOrder,

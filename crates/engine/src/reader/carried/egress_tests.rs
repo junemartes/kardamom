@@ -6,7 +6,8 @@ use kardamom_cluster_adapter::wire::{
 };
 use kardamom_egress::http::Http;
 use kardamom_egress::merge::{Head, Merge, MergeConfig};
-use kardamom_egress::owner::{FramePublisher, Input, Owner, OwnerConfig};
+use kardamom_egress::owner::{FramePublisher, Input, Owner, OwnerConfig, Parts};
+use kardamom_egress::receipts::Receipts;
 use kardamom_egress::store::Store;
 
 use super::EgressTransport;
@@ -37,7 +38,14 @@ fn egress(rt: &tokio::runtime::Runtime, dir: &std::path::Path, frames: &[Vec<u8>
         sync_every: Duration::from_millis(10),
         keep_blocks: NonZeroU64::new(1_000).unwrap(),
     };
-    let owner = Owner::new(cfg, merge, store, NoLive);
+    let parts = Parts {
+        merge,
+        store,
+        receipts: Receipts::new(NonZeroUsize::new(16).unwrap()),
+        live: NoLive,
+        receipts_live: NoLive,
+    };
+    let owner = Owner::new(cfg, parts);
     let (inputs, rx) = crossbeam_channel::bounded(64);
     frames.iter().zip(0u64..).for_each(|(frame, seq)| {
         let message = [seq.to_le_bytes().as_slice(), frame].concat();
