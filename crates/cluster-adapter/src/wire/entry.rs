@@ -159,7 +159,8 @@ impl RelayedRef {
 
 /// Frame an answer of the member feed exactly as the Java service does:
 /// `[kind:u8][a:u64][b:u64][request_id:u64]`. The kinds are 3, 4, 11 and 16.
-#[cfg(any(test, feature = "testing"))]
+/// A source of the member feed layout that is not a member, such as the
+/// egress, answers with it too.
 #[must_use]
 pub fn encode_feed_answer(kind: u8, a: u64, b: u64, request_id: u64) -> Vec<u8> {
     encode_kind_2u64_id(kind, a, b, request_id)

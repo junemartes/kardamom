@@ -67,9 +67,9 @@ pub use egress_encode::{
     encode_egress_boundary, encode_egress_record, encode_replay_ahead, encode_replay_done,
     encode_replay_unavailable, encode_sealer_info, encode_session_start,
 };
-pub use entry::{CanonicalTx, RelayedRef, encode_feed_request};
+pub use entry::{CanonicalTx, RelayedRef, encode_feed_answer, encode_feed_request};
 #[cfg(any(test, feature = "testing"))]
-pub use entry::{TxOffer, encode_feed_answer, encode_feed_gap};
+pub use entry::{TxOffer, encode_feed_gap};
 #[cfg(any(test, feature = "testing"))]
 pub use ingress::encode_ingress_depositref;
 pub use ingress::{

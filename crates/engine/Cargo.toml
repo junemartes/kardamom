@@ -37,6 +37,7 @@ dashmap = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+reqwest = { workspace = true }
 tokio-util = { workspace = true }
 toml = { workspace = true }
 # The signed-legacy-tx fixture `actor::fixtures` re-exports. Optional,
@@ -56,6 +57,7 @@ test-support = ["dep:kardamom-test-support"]
 docker-e2e = ["kardamom-log/docker-e2e"]
 
 [dev-dependencies]
+kardamom-egress = { path = "../egress" }
 kardamom-test-support = { workspace = true }
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }

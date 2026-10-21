@@ -79,7 +79,10 @@ fn delivered_frames_go_out_live_and_a_read_finds_them_stored() {
         reply,
     }))
     .unwrap();
-    let Ok(Ok(Range::Frames { frames: read, head })) = answer.blocking_recv() else {
+    let Ok(Ok(Range::Frames {
+        frames: read, head, ..
+    })) = answer.blocking_recv()
+    else {
         panic!("the store answers the read");
     };
     assert_eq!(read, frames);

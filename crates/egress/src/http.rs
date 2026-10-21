@@ -3,9 +3,10 @@
 //!
 //! `GET /v1/frames?from_index=<i>&from_block=<b>&limit=<bytes>` answers:
 //! - `200` with the frames after the cursor, each as `[len:u32][frame]`,
-//!   little endian, and the head of the store in the headers
-//!   `x-egress-next-index` and `x-egress-next-block`. A reader that got
-//!   fewer frames than the head asks again from its new cursor;
+//!   little endian, the cursor after the last of them in the headers
+//!   `x-egress-after-index` and `x-egress-after-block`, and the head of the
+//!   store in `x-egress-next-index` and `x-egress-next-block`. A reader
+//!   whose cursor after is below the head asks again from it;
 //! - `410` when the store holds nothing that old, with its floor in
 //!   `x-egress-floor-index` and `x-egress-floor-block`;
 //! - `400` for a bad query, `503` when the owner thread is gone.
@@ -160,7 +161,11 @@ impl Cursor {
             }
         };
         match range {
-            Range::Frames { frames, head } => frames_reply(&frames, head),
+            Range::Frames {
+                frames,
+                after,
+                head,
+            } => frames_reply(&frames, after, head),
             Range::Unavailable { floor } => with_head(
                 reply(StatusCode::GONE, Bytes::from_static(b"below the floor\n")),
                 "floor",
@@ -170,14 +175,18 @@ impl Cursor {
     }
 }
 
-fn frames_reply(frames: &[Vec<u8>], head: Head) -> Response<Full<Bytes>> {
+fn frames_reply(frames: &[Vec<u8>], after: Head, head: Head) -> Response<Full<Bytes>> {
     let body = frames.iter().try_fold(Vec::new(), |mut body, frame| {
         body.extend_from_slice(&u32::try_from(frame.len()).ok()?.to_le_bytes());
         body.extend_from_slice(frame);
         Some(body)
     });
     match body {
-        Some(body) => with_head(reply(StatusCode::OK, Bytes::from(body)), "next", head),
+        Some(body) => with_head(
+            with_head(reply(StatusCode::OK, Bytes::from(body)), "next", head),
+            "after",
+            after,
+        ),
         None => reply(
             StatusCode::INTERNAL_SERVER_ERROR,
             Bytes::from_static(b"a frame above 4 GiB\n"),
