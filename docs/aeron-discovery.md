@@ -78,7 +78,7 @@ The `exec_txs` stream carries the transactions that an executor joins, in canoni
 - A slow or absent archive refuses the recorded offer. The publisher offers the record again until the archive takes it. The reader then blocks, and this executor stalls. It never executes a record that its archive did not take.
 - The validator and the batcher name the topic as their future source. No service subscribes to it yet.
 
-The `exec_frames` stream carries the canonical frames that an executor reads, byte for byte, in the order that it executes them: each relayed record (egress kind 1) and each block boundary (kind 2), once.
+The `exec_frames` stream carries the canonical frames that an executor reads, byte for byte, in the order that it executes them: each relayed record (egress kind 1) and each block boundary (kind 2), once. Each message is `[seq:u64][frame]`. The sequence counts every frame that the reader delivers, also one that the executor drops, so the egress sees a gap in one copy as a jump of the sequence.
 
 - The stream id is 1008. The channel and the stream id are the keys `exec_frames_channel` and `exec_frames_stream_id` of `[channels]`.
 - The reader holds the bytes of each frame until it delivers the item of the frame, then sends them. So a frame of a replay, a copy, or a live frame ahead of a gap goes out once, in canonical order.

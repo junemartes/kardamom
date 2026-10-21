@@ -9,6 +9,10 @@
 //! and forgets the older ones. So the egress gets each frame once, byte for
 //! byte as the source sent it, in the order that the reader executes.
 //!
+//! Each message is `[seq:u64][frame]`. The sequence counts every frame
+//! that the reader delivers, also one that the tee drops, so the egress
+//! sees a gap in this copy as a jump of the sequence.
+//!
 //! The tee never waits: a full queue drops the frame, and the egress fills
 //! the gap from the copy of another executor.
 
@@ -20,11 +24,16 @@ use kardamom_types::{BPosition, TxOrderingMessage};
 
 use super::Ordered;
 
+/// The bytes of the sequence in front of each frame.
+pub const SEQ_LEN: usize = 8;
+
 /// The held frames of one reader, and the queue to the egress publisher.
 pub struct FrameTee {
     out: Sender<Vec<u8>>,
     records: BTreeMap<u64, Vec<u8>>,
     boundaries: BTreeMap<u64, Vec<u8>>,
+    /// The sequence of the next message.
+    seq: u64,
 }
 
 impl FrameTee {
@@ -35,6 +44,7 @@ impl FrameTee {
             out,
             records: BTreeMap::new(),
             boundaries: BTreeMap::new(),
+            seq: 0,
         }
     }
 
@@ -69,9 +79,19 @@ impl FrameTee {
         let mut kept = held.split_off(&key);
         let frame = kept.remove(&key);
         *held = kept;
-        if let Some(frame) = frame
-            && let Err(TrySendError::Full(_)) = self.out.try_send(frame)
-        {
+        if let Some(frame) = frame {
+            self.send(&frame);
+        }
+    }
+
+    /// Send `frame` behind the next sequence number.
+    fn send(&mut self, frame: &[u8]) {
+        let mut message = Vec::with_capacity(SEQ_LEN + frame.len());
+        message.extend_from_slice(&self.seq.to_le_bytes());
+        message.extend_from_slice(frame);
+        // One message for each delivered item: a u64 does not wrap.
+        self.seq += 1;
+        if let Err(TrySendError::Full(_)) = self.out.try_send(message) {
             metrics::counter!(crate::metrics::TEE_DROPPED_TOTAL).increment(1);
         }
     }

@@ -41,14 +41,35 @@ fn frames_go_out_in_the_order_of_delivery_once() {
     tee.release((BPosition::from_index(2), boundary_item(1)));
     tee.release((BPosition::from_index(2), record_item()));
     let got: Vec<Vec<u8>> = rx.try_iter().collect();
+    let want: Vec<Vec<u8>> = [
+        record(0),
+        record(1),
+        encode_egress_boundary(1, 2, 0, 0),
+        record(2),
+    ]
+    .into_iter()
+    .zip(0u64..)
+    .map(|(frame, seq)| [seq.to_le_bytes().as_slice(), &frame].concat())
+    .collect();
+    assert_eq!(got, want, "each frame once, behind its sequence");
+}
+
+#[test]
+fn a_dropped_frame_still_takes_its_sequence() {
+    let (out, rx) = crossbeam_channel::bounded(1);
+    let mut tee = Forward::on(FrameTee::new(out));
+    tee.hold(&record(0));
+    tee.hold(&record(1));
+    tee.release((BPosition::from_index(0), record_item()));
+    tee.release((BPosition::from_index(1), record_item()));
+    let first = rx.try_recv().unwrap();
+    assert_eq!(first[..8], 0u64.to_le_bytes(), "the queue takes one");
+    tee.hold(&record(2));
+    tee.release((BPosition::from_index(2), record_item()));
     assert_eq!(
-        got,
-        [
-            record(0),
-            record(1),
-            encode_egress_boundary(1, 2, 0, 0),
-            record(2)
-        ]
+        rx.try_recv().unwrap()[..8],
+        2u64.to_le_bytes(),
+        "frame 1 dropped, so the next one carries 2: the egress sees the gap"
     );
 }
 
