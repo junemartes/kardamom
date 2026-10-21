@@ -25,7 +25,7 @@ use kardamom_types::{BPosition, TxOrderingMessage};
 use super::Ordered;
 
 /// The bytes of the sequence in front of each frame.
-pub const SEQ_LEN: usize = 8;
+const SEQ_LEN: usize = 8;
 
 /// The held frames of one reader, and the queue to the egress publisher.
 pub struct FrameTee {

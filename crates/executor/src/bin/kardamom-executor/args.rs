@@ -35,6 +35,10 @@ impl FromStr for CheckpointInterval {
 }
 
 #[derive(Debug, Parser)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent command-line switch"
+)]
 #[command(
     name = "kardamom-executor",
     version,
