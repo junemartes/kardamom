@@ -35,6 +35,7 @@ pub enum Topic {
     ServiceEvents,
     ExecTxs,
     L1Blocks,
+    ExecFrames,
 }
 
 impl Topic {
@@ -52,6 +53,7 @@ impl Topic {
             Self::ServiceEvents => "events",
             Self::ExecTxs => "exec_txs",
             Self::L1Blocks => "l1_blocks",
+            Self::ExecFrames => "exec_frames",
         }
     }
 
@@ -74,7 +76,8 @@ impl Topic {
             | Self::TxRemoteEpochs
             | Self::TxBal
             | Self::ExecTxs
-            | Self::L1Blocks => None,
+            | Self::L1Blocks
+            | Self::ExecFrames => None,
         }
     }
 
@@ -91,6 +94,7 @@ impl Topic {
             "events" => Some(Self::ServiceEvents),
             "exec_txs" => Some(Self::ExecTxs),
             "l1_blocks" => Some(Self::L1Blocks),
+            "exec_frames" => Some(Self::ExecFrames),
             _ => None,
         }
     }

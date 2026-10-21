@@ -1,6 +1,9 @@
 //! Metric name constants for the executor.
 
 pub const TX_APPLIED_TOTAL: &str = "kardamom_executor_tx_applied_total";
+/// The canonical frames that the reader did not forward to the egress:
+/// the queue to the egress publisher was full.
+pub const TEE_DROPPED_TOTAL: &str = "kardamom_executor_egress_frames_dropped_total";
 pub const BLOCK_APPLY_DURATION_SECONDS: &str = "kardamom_executor_block_apply_duration_seconds";
 pub const STATE_COMMIT_DURATION_SECONDS: &str = "kardamom_executor_state_commit_duration_seconds";
 pub const BLOCK_NUMBER: &str = "kardamom_executor_block_number";

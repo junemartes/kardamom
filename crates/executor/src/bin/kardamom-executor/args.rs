@@ -103,6 +103,11 @@ pub(crate) struct Args {
     /// the references of the cluster egress with `tx_data`.
     #[arg(long, env = "KARDAMOM_CARRY_BYTES", default_value_t = false)]
     pub(crate) carry_bytes: bool,
+    /// Forward the canonical frames that this executor reads, byte for
+    /// byte and in the order that it executes them, on `exec_frames` for
+    /// the egress. Off: the executor publishes no frame.
+    #[arg(long, env = "KARDAMOM_EXEC_FRAMES", default_value_t = false)]
+    pub(crate) exec_frames: bool,
     /// With `--carry-bytes`: how many committed blocks below its cursor the
     /// executor compares with the member feed at each start, before it
     /// executes a frame. A difference rolls the state back to a checkpoint

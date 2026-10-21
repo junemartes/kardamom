@@ -50,6 +50,58 @@ impl StreamPlane {
         }
     }
 
+    /// The `exec_frames` publisher of this executor, as the raw handle that
+    /// its forwarder drives. Discovered: a dynamic MDC publication that
+    /// every egress instance joins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publication fails to open or register.
+    pub async fn exec_frames_publisher(
+        &mut self,
+        rt: &AeronRuntime,
+    ) -> Result<PubHandle, LogError> {
+        let key = self.exec_frames_key();
+        match &mut self.discovered {
+            None => rt.open_publication(
+                &self.channels.exec_frames_channel,
+                self.channels.exec_frames_stream_id,
+            ),
+            Some(d) => d.open_publication(rt, key).await,
+        }
+    }
+
+    /// The `exec_frames` subscription of the egress: the raw frames of
+    /// every executor. Each executor is one image, so a reader tells the
+    /// copies apart by the session id of the frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription fails to open.
+    pub fn exec_frames_subscription(
+        &mut self,
+        rt: &AeronRuntime,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<crate::aeron_live::RawFrame>, LogError> {
+        let key = self.exec_frames_key();
+        match &mut self.discovered {
+            None => Ok(rt
+                .open_subscription_raw(
+                    &self.channels.exec_frames_channel,
+                    self.channels.exec_frames_stream_id,
+                )?
+                .1),
+            Some(d) => d.open_raw_subscription(rt, key),
+        }
+    }
+
+    fn exec_frames_key(&self) -> StreamKey {
+        StreamKey {
+            topic: Topic::ExecFrames,
+            stream_id: self.channels.exec_frames_stream_id,
+            lane: None,
+        }
+    }
+
     fn tx_bal_key(&self) -> StreamKey {
         StreamKey {
             topic: Topic::TxBal,
