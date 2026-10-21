@@ -415,3 +415,25 @@ fn status_and_lag_reject_frames_are_skipped() {
     assert_eq!(label(next(&mut sub).unwrap()), "r0");
     assert_eq!(label(next(&mut sub).unwrap()), "b1");
 }
+
+#[test]
+fn a_canonical_entry_takes_its_place_among_the_references() {
+    // Decision version 5 relays a full reference as a canonical entry with
+    // its bytes. A reference of a sequencer that has not switched yet can
+    // come next to it. Canonical order: r0 t1 b1(end2) r2.
+    let egress = FakeEgress::new();
+    egress.push(encode_egress_record(0, &relayed_txref(1, 0)).unwrap());
+    egress.push(crate::reader::carried::tests::tx_at(1));
+    egress.push(encode_egress_boundary(1, 2, 1_000, 0));
+    egress.push(encode_egress_record(2, &relayed_txref(1, 2)).unwrap());
+    egress.close();
+
+    let mut sub = ClusterTxOrderingSubscription::new(egress);
+    let got: Vec<String> = std::iter::from_fn(|| sub.next().ok())
+        .map(|(pos, item)| match item {
+            Ordered::Tx(_) => format!("t{}", pos.as_index()),
+            Ordered::Message(msg) => label((pos, msg)),
+        })
+        .collect();
+    assert_eq!(got, vec!["r0", "t1", "b1", "r2"]);
+}
