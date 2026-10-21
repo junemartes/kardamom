@@ -319,6 +319,7 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 These counters need an alert of your own. No rule in `deploy/alerts.yml` watches them:
 
 - `kardamom_executor_resync_total{outcome}` counts the full resyncs after a replay-window overrun.
+- `kardamom_executor_egress_frames_dropped_total` counts the canonical frames that the reader did not forward on `exec_frames`, because the queue to the publication was full.
   - `peer-checkpoint`: the node fell behind the retention window and repaired itself from a peer checkpoint.
   - `unrecoverable`: the node could not repair itself and waits for an operator.
   - See "Replay-window overrun" in [failure-modes.md](failure-modes.md).

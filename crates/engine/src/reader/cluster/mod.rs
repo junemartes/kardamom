@@ -15,7 +15,8 @@ use std::sync::atomic::AtomicU64;
 use kardamom_types::{BPosition, VoidRecord};
 
 use crate::ExecutorError;
-use crate::reader::{Ordered, TxOrderingSubscription};
+use crate::reader::tee::Forward;
+use crate::reader::{FrameTee, Ordered, TxOrderingSubscription};
 
 use kardamom_cluster_adapter::gateway::{ClusterEgress, ClusterIngress};
 use kardamom_cluster_adapter::wire::{self, EgressItem};
@@ -85,6 +86,8 @@ pub struct ClusterTxOrderingSubscription<E: ClusterEgress, I: ClusterIngress = N
     /// The delivery cursor and the pending set. The reader enters
     /// catch-up at each session-start marker, and after a key gap.
     reorder: Reorder,
+    /// The frames for the egress, when this reader forwards them.
+    tee: Forward,
 }
 
 impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
@@ -97,6 +100,7 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
             egress,
             ingress: NoIngress,
             reorder: Reorder::new(cursor),
+            tee: Forward::default(),
         }
     }
 
@@ -110,7 +114,17 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
             egress: self.egress,
             ingress,
             reorder: self.reorder,
+            tee: self.tee,
         }
+    }
+}
+
+impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
+    /// Forward each delivered frame to the egress through `tee`.
+    #[must_use]
+    pub fn with_tee(mut self, tee: FrameTee) -> Self {
+        self.tee = Forward::on(tee);
+        self
     }
 }
 
@@ -261,6 +275,7 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
         let Some(bytes) = self.egress.recv() else {
             return Err(ExecutorError::TxOrderingClosed);
         };
+        self.tee.hold(&bytes);
         match EgressItem::decode(&bytes) {
             Ok(item) => self.ingest(item),
             Err(e) => {
@@ -280,7 +295,7 @@ impl<E: ClusterEgress, I: ClusterIngress> TxOrderingSubscription
                 self.ingest_one_frame()?;
                 continue;
             };
-            return Ok(out);
+            return Ok(self.tee.release(out));
         }
     }
 

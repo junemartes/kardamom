@@ -48,6 +48,7 @@ pub mod cluster;
 mod join;
 mod ordered;
 mod ports;
+mod tee;
 mod threads;
 mod void;
 
@@ -58,6 +59,7 @@ pub use ports::{
     JoinRecoveryFactory, NoEpochCheck, NoExecStream, NoRemoteEpochCheck, RemoteEpochObserver,
     SinkClosed, TxDataSubscription, TxOrderingSubscription,
 };
+pub use tee::FrameTee;
 pub use threads::{ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader};
 
 #[cfg(test)]

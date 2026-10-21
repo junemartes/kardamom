@@ -66,6 +66,7 @@ The streams and their publishers:
 | `tx_bal` | executor | validator |
 | `events` | ingress, sequencer, executor, validator, batcher, DA watcher, L1 follower, state mirror | ingress, validator, DA watcher, batcher |
 | `exec_txs` | executor | validator, batcher (none subscribes yet), the archive on the node of each executor |
+| `exec_frames` | executor (with `--exec-frames`) | egress |
 | `l1_blocks` | L1 follower (two instances) | da-watcher, batcher, follower archives |
 
 The `exec_txs` stream carries the transactions that an executor joins, in canonical order: one `ExecTxRecord` for each `TxRef`.
@@ -79,6 +80,13 @@ The `tx_verdicts` stream carries the receipts of the transactions of one ingress
 - A static plane whose `exec_txs_channel` is IPC opens only the recorded publication. Its consumers read that one.
 - A slow or absent archive refuses the recorded offer. The publisher offers the record again until the archive takes it. The reader then blocks, and this executor stalls. It never executes a record that its archive did not take.
 - The validator and the batcher name the topic as their future source. No service subscribes to it yet.
+
+The `exec_frames` stream carries the canonical frames that an executor reads, byte for byte, in the order that it executes them: each relayed record (egress kind 1) and each block boundary (kind 2), once. Each message is `[seq:u64][frame]`. The sequence counts every frame that the reader delivers, also one that the executor drops, so the egress sees a gap in one copy as a jump of the sequence.
+
+- The stream id is 1008. The channel and the stream id are the keys `exec_frames_channel` and `exec_frames_stream_id` of `[channels]`.
+- The reader holds the bytes of each frame until it delivers the item of the frame, then sends them. So a frame of a replay, a copy, or a live frame ahead of a gap goes out once, in canonical order.
+- Each executor opens one dynamic MDC publication with a `kardamom-mdc-publisher` record (topic `exec_frames`). The offer is best effort. A full queue in the executor drops the frame and counts `kardamom_executor_egress_frames_dropped_total`. The egress reads every executor, so it takes a lost frame from the copy of another executor.
+- The executor publishes it only with `--exec-frames` (env `KARDAMOM_EXEC_FRAMES`).
 
 The `l1_blocks` stream carries the finalized L1 blocks: one `L1Block` for each block, in block order.
 
@@ -301,7 +309,7 @@ No job configures a publication control port.
 | Job | Publications |
 | --- | --- |
 | ingress | 8 `tx_data` lanes, `tx_status` |
-| executor | receipts, boundaries, BAL, the live `exec_txs` publication |
+| executor | receipts, boundaries, BAL, the live `exec_txs` publication, `exec_frames` (with `--exec-frames`) |
 | da-watcher | deposits, remote epochs (subscribes to `l1_blocks` and `events`) |
 | l1-indexer | `l1_blocks`, `events` |
 | sequencer lane `n` | `tx_errors`, `tx_status`, one `tx_verdicts` for each ingress that it answers |
