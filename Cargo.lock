@@ -4013,6 +4013,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-egress"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "kardamom-cluster-adapter",
+ "kardamom-types",
+ "metrics",
+ "rkyv",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "kardamom-engine"
 version = "0.1.0"
 dependencies = [
