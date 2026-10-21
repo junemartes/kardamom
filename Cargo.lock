@@ -4016,6 +4016,7 @@ dependencies = [
 name = "kardamom-egress"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "anyhow",
  "bytes",
  "clap",
@@ -4026,6 +4027,7 @@ dependencies = [
  "kardamom-cluster-adapter",
  "kardamom-log",
  "kardamom-obs",
+ "kardamom-types",
  "metrics",
  "reqwest 0.13.4",
  "rkyv",
