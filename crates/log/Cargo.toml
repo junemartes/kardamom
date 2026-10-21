@@ -47,6 +47,7 @@ kardamom-formats.workspace = true
 # not by the library crate itself.
 alloy-primitives.workspace = true
 bytes.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 testcontainers.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
