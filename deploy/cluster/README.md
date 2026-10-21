@@ -279,6 +279,7 @@ Run `just sealer-upgrade-check <env> <feature> <activation_ms>` before the Safe 
 
 - feature 2 (`FEATURE_SEALER_V3`) with an activation time other than 0: off is no longer supported;
 - a configured sealer member that is down, or that reads a snapshot version below 14;
+- feature 4 (`FEATURE_SEALER_V5`, the carry flag) when a sealer member reads a snapshot version below 16;
 - a job without its metas (`workloads_upgrade_jobs` in `ansible/roles/workloads/defaults/main.yml`), or a live allocation of an older job version:
   - the sequencer: `nonce_burn`;
   - the executor and the validator: `nonce_burn` and `chain_state_install`;
