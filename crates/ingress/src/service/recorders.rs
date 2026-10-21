@@ -4,8 +4,8 @@
 //! recorder-thread body: connect a thread-confined archive session, start
 //! recording, report the startup outcome, and hold until stop. The
 //! da-watcher's `tx_deposits` recorder shares this function. This module owns
-//! the per-shard fan-out and the barrier that `main` blocks on before it
-//! serves RPC.
+//! the per-shard fan-out and the barrier that the service start blocks on
+//! before it serves RPC.
 //!
 //! The threads stay std threads: they hold Aeron archive sessions
 //! (`!Send`). The seam to the async shell is tokio: the stop token inside

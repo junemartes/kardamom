@@ -210,7 +210,7 @@ procedure.
 
 ## Archives and readiness
 
-An ingress runs one discovery-driven recorder thread. It records every
+An ingress with `--archive-durability` runs one discovery-driven recorder thread. It records every
 `tx_data` publisher the catalog lists, its own lanes and every other
 ingress's, through the same dynamic MDC join a subscriber uses. Each
 publisher is its own recording, keyed in the catalog by its control
@@ -305,6 +305,12 @@ No job configures a publication control port.
 | da-watcher | deposits, remote epochs (subscribes to `l1_blocks` and `events`) |
 | l1-indexer | `l1_blocks`, `events` |
 | sequencer lane `n` | `tx_errors`, `tx_status`, one `tx_verdicts` for each ingress that it answers |
+| sequencer lane `n`, job variable `ingress` | the publications above, and the publications of the ingress inside the process: 8 `tx_data` lanes, `tx_status` |
+
+The ingress inside a sequencer process opens its own stream plane,
+`ingress-<id>`, beside the plane of the sequencer. It records its `tx_data`
+lanes only with `--archive-durability`, and the sequencer job turns that
+off by default.
 
 The aeron system job registers the archive record with the `archive_topics`
 meta of the node:

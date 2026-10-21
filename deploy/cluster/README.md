@@ -30,7 +30,7 @@ The local profile defines these classes:
 | Class | Count | Runs |
 |-------|-------|------|
 | `control` | 1 | Nomad and Consul server, Docker registry, anvil (the in-cluster L1) |
-| `sequencer` | 2 | 2 lanes with 2 racing replicas each. One job group per lane (`seq-<lane>`, expanded by the Nomad HCL). The metrics port is `9001 + 10 * lane`. |
+| `sequencer` | 2 | 2 lanes with 2 racing replicas each. One job group per lane (`seq-<lane>`, expanded by the Nomad HCL). The metrics port is `9001 + 10 * lane`. With the job variable `ingress`, each replica also serves the ingress JSON-RPC on `8550 + lane`. See [The ingress inside the sequencer](#the-ingress-inside-the-sequencer). |
 | `ingress` | 2 | The active/active JSON-RPC front door (`:8545`) and the notifier status feed (`:8547`). Role `redis`. Instance 1 also has role `redis-replica`. |
 | `executor` | 3 | State-machine replica appliers (libmdbx state). The state mirror runs here too. |
 | `sealer` | 3 | A 3-member Aeron Cluster (Raft). The Java `cluster` job orders the transactions. The Raft log and its archive hold the canonical log. |
@@ -395,6 +395,24 @@ The release gate (`roles/workloads/tasks/gate.yml`) refuses a release before it 
 | A shard map change | `config/shard-map.toml` against the map of the registered ingress. | Use the resize controller (`kardamom-cluster scale-sequencers`). |
 
 The gate reads only, so it also runs in check mode. A cluster without an accepted release has no formats to compare with.
+
+### The ingress inside the sequencer
+
+The sequencer process can run the ingress service. The `ingress` subcommand of `kardamom-sequencer` takes the flags of `kardamom-ingress`. The job variable `ingress` of `nomad/sequencer.nomad.hcl` turns it on. It is `false` by default, and the `ingress` job stays the front door.
+
+With `-var ingress=true`, each sequencer allocation also does these things:
+
+- It serves JSON-RPC on port `ingress_rpc_port_base + lane` (default `8550 + lane`). Two lanes can share a node, so each lane has its own port.
+- It registers the Consul service `ingress-jsonrpc` with the tags `sequencer` and `lane-<lane>`, and the `/health` check. A client of this service reads the port from the SRV record: the port is not `8545`.
+- It opens a second cluster session for the egress tap of the ingress, on the dynamic port `ingress_egress`.
+- It drains its parked submits before the sequencer loops stop. The kill timeout is `tx_ttl_ms` plus 10 seconds.
+- It renders `config/shard-map.toml` for the routing of the ingress.
+
+The ingress id of an allocation is the decimal `lane + 1` followed by the allocation index. Lane 0 has the ids 10 and 11, and lane 7 has the ids 80 and 81. Each id is unique and at most 255, so the ingress can take the verdicts of the sequencers. No id is an id of the `ingress` job, which uses the allocation index (0 or 1).
+
+The job variable `ingress_archive_durability` records the `tx_data` lanes of the ingress on the archive of the node. It is `false` by default. The sequencer nodes do not advertise a `tx_data` archive, and the ingress nodes record every `tx_data` publisher that the catalog lists, the publishers inside the sequencers too.
+
+The load balancer must target each sequencer node on each port of its lanes. Use a load balancer that reads the `ingress-jsonrpc` service from Consul, or one target for each (node, port) pair.
 
 ### Secrets
 

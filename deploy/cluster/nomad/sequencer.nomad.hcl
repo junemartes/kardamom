@@ -100,6 +100,52 @@ variable "previous_shard_table" {
   }
 }
 
+# The ingress service inside each sequencer process (the `ingress`
+# subcommand of kardamom-sequencer). Off by default: the ingress job is
+# the front door. On, each sequencer allocation also serves JSON-RPC,
+# registers the Consul service ingress-jsonrpc, and drains its parked
+# submits before it stops.
+variable "ingress" {
+  type        = bool
+  description = "Run the ingress service inside each sequencer process."
+  default     = false
+}
+
+# The JSON-RPC port of the in-process ingress of lane 0. Lane n listens on
+# this port plus n, so two lanes on one node never take the same port.
+# The load balancer targets each sequencer node on each port of its lanes,
+# or reads the ingress-jsonrpc service from Consul.
+variable "ingress_rpc_port_base" {
+  type    = number
+  default = 8550
+
+  validation {
+    condition     = var.ingress_rpc_port_base >= 1024 && var.ingress_rpc_port_base <= 65528 && floor(var.ingress_rpc_port_base) == var.ingress_rpc_port_base
+    error_message = "The ingress port base must be a whole number from 1024 to 65528."
+  }
+}
+
+# The in-process ingress records its tx_data lanes on the archive of the
+# node. Off by default: the sequencer nodes do not advertise a tx_data
+# archive, and the ingress nodes record every tx_data publisher that the
+# catalog lists, the in-process ones too.
+variable "ingress_archive_durability" {
+  type    = bool
+  default = false
+}
+
+# How far past the newest boundary the in-process ingress stamps a
+# transaction's inclusion deadline. It must equal the sealer's
+# cluster_inclusion_horizon_blocks. ansible/contract.yml checks this.
+variable "inclusion_horizon_blocks" {
+  type    = string
+  default = "64"
+}
+
+locals {
+  executor_endpoints = join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:${var.executor_query_port}"])
+}
+
 locals {
   target         = length(var.shard_table) == 0 ? [for slot in range(256) : slot % 2] : var.shard_table
   overlap        = length(var.previous_shard_table) > 0
@@ -188,6 +234,22 @@ job "sequencer" {
         port "metrics" {
           static = var.metrics_base + 10 * parseint(group.key, 10)
         }
+        # The JSON-RPC port of the in-process ingress, one port per lane.
+        dynamic "port" {
+          for_each = var.ingress ? ["jsonrpc"] : []
+          labels   = [port.value]
+          content {
+            static = var.ingress_rpc_port_base + parseint(group.key, 10)
+          }
+        }
+        # The cluster egress port of the in-process ingress: its egress tap
+        # is a cluster session of its own, beside the session of the
+        # sequencer on the egress port.
+        dynamic "port" {
+          for_each = var.ingress ? ["ingress_egress"] : []
+          labels   = [port.value]
+          content {}
+        }
       }
 
       service {
@@ -203,13 +265,42 @@ job "sequencer" {
         }
       }
 
+      # The RPC front door of the in-process ingress. GET /health answers
+      # 200 while the ingress serves, and 503 from the first moment of the
+      # drain, so a stopping sequencer leaves the rotation before its
+      # parked submits finish.
+      dynamic "service" {
+        for_each = var.ingress ? ["ingress-jsonrpc"] : []
+        content {
+          name     = service.value
+          port     = "jsonrpc"
+          provider = "consul"
+          tags     = ["sequencer", "lane-${group.key}"]
+          check {
+            type     = "http"
+            path     = "/health"
+            method   = "GET"
+            interval = "5s"
+            timeout  = "2s"
+          }
+        }
+      }
+
       dynamic "task" {
         for_each = [group.key]
         labels   = ["sequencer-${task.value}"]
         content {
           driver = "docker"
 
+          # The drain of the in-process ingress: the parked submits finish
+          # within the park bound (tx_ttl_ms), plus a margin. Without the
+          # ingress, the Nomad default of 5 seconds.
+          kill_timeout = format("%ds", var.ingress ? ceil(var.tx_ttl_ms / 1000) + 10 : 5)
+
           config {
+            # The ingress holds one connection for each parked submit, up
+            # to 8192. Without the ingress, the limits of the Docker daemon.
+            ulimit          = var.ingress ? [{ nofile = "65536:65536" }] : []
             image           = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-sequencer:dev"
             force_pull      = true
             readonly_rootfs = true
@@ -227,12 +318,31 @@ job "sequencer" {
               "--lane", group.key,
               "--vslots", join(",", group.value.slots),
               "--tx-ttl-ms", format("%d", var.tx_ttl_ms),
-              "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:${var.executor_query_port}"]),
+              "--executor-query-endpoints", local.executor_endpoints,
               "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
               ], length(group.value.incoming) == 0 ? [] : [
               "--extra-lanes", join(",", sort(distinct([for slot in group.value.incoming : var.previous_shard_table[slot]]))),
               "--shadow-vslots", join(",", group.value.incoming),
-            ])
+              ], var.ingress ? concat([
+                # The subcommand comes last: the flags after it are the
+                # flags of kardamom-ingress.
+                "ingress",
+                "--shards", format("%d", local.target_count),
+                "--shard-map", "/local/shard-map.toml",
+                "--jsonrpc-bind", "0.0.0.0:${NOMAD_PORT_jsonrpc}",
+                "--pending-receipt-timeout-ms", format("%d", var.tx_ttl_ms),
+                "--inclusion-horizon-blocks", var.inclusion_horizon_blocks,
+                # The ingress id is the decimal (lane + 1) followed by the
+                # allocation index: lane 0 has 10 and 11, lane 7 has 80 and
+                # 81. Each id is unique and at most 255, and none is an id
+                # of the ingress job (its allocation index, 0 or 1).
+                "--ingress-id", "${parseint(group.key, 10) + 1}${NOMAD_ALLOC_INDEX}",
+                "--rpc-max-connections", "8192",
+                # The L2 chain id (group_vars chain_id), as the ingress job.
+                "--chain-id", "412346",
+                "--executor-query-endpoints", local.executor_endpoints,
+                "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_ingress_egress}",
+            ], var.ingress_archive_durability ? ["--archive-durability"] : []) : [])
           }
 
           env {
@@ -257,9 +367,20 @@ job "sequencer" {
             data        = file("config/sequencer.toml.tpl")
           }
 
+          # The shard map of the in-process ingress, as the ingress job
+          # renders it.
+          dynamic "template" {
+            for_each = var.ingress ? ["local/shard-map.toml"] : []
+            content {
+              destination = template.value
+              data        = file("config/shard-map.toml")
+            }
+          }
+
+          # The ingress job asks for 500 MHz and 512 MB.
           resources {
-            cpu    = 750
-            memory = 512
+            cpu    = var.ingress ? 1250 : 750
+            memory = var.ingress ? 1024 : 512
           }
         }
       }
