@@ -81,6 +81,10 @@ pub const EXECUTE_STAMPS_DROPPED_TOTAL: &str = "kardamom_ingress_execute_stamps_
 /// gauge is unset before the listeners are up, which also reads as not
 /// ready.
 pub const DRAINING: &str = "kardamom_ingress_draining";
+/// The items that a stream bus dropped because its watcher fell behind,
+/// by `bus`. A dropped receipt or error does not release its waiter, so
+/// that client waits until the pending timeout.
+pub const BUS_LAGGED_TOTAL: &str = "kardamom_ingress_bus_lagged_total";
 
 /// Increments [`TX_REJECTED_TOTAL`] with the given `reason` label. This is
 /// the one place for the submit-path rejection counter, so every rejection
@@ -88,6 +92,13 @@ pub const DRAINING: &str = "kardamom_ingress_draining";
 #[inline]
 pub(crate) fn count_reject(reason: &'static str) {
     metrics::counter!(TX_REJECTED_TOTAL, "reason" => reason).increment(1);
+}
+
+/// Adds `dropped` to [`BUS_LAGGED_TOTAL`] for `bus`. Each read that meets
+/// a gap counts it here.
+#[inline]
+pub(crate) fn count_lagged(bus: &'static str, dropped: u64) {
+    metrics::counter!(BUS_LAGGED_TOTAL, "bus" => bus).increment(dropped);
 }
 
 pub fn describe() {
@@ -140,6 +151,10 @@ pub fn describe() {
         "publish stamps that no receipt matched within the age bound of the executed clock; the execute latency histogram has no sample for them"
     );
     metrics::describe_gauge!(DRAINING, "1 while the shutdown drain refuses new submits");
+    metrics::describe_counter!(
+        BUS_LAGGED_TOTAL,
+        "items that a stream bus dropped because its watcher fell behind, by bus"
+    );
     metrics::describe_gauge!(
         CLUSTER_POSTED_HEAD,
         "the last L2 block posted to L1, from the cluster's status frame"

@@ -27,6 +27,7 @@ fn cfg() -> AdmissionConfig {
         loss_blocks: NonZeroU64::new(8).unwrap(),
         park_width: NonZeroU64::new(1 << 18).unwrap(),
         park_ttl: Duration::from_secs(60),
+        relook_after: Duration::from_millis(500),
         max_senders: NonZeroUsize::new(1 << 20).unwrap(),
     }
 }
@@ -99,6 +100,7 @@ impl Lane {
                     session: 1,
                     unit: self.unit,
                 },
+                ingress: 0,
                 payload: nonce,
             },
             &mut self.out,

@@ -524,6 +524,12 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
   - The lookup is bounded by the token bucket of the client, the in-flight bound of the query client and its timeout. A shed or failed query answers `null`. This is the same answer as "not committed yet".
   - The counter is `kardamom_cache_lookups_total{layer="receipt", outcome}`. The outcomes are `hit`, `state_hit`, `miss`, `shed` and `state_error`.
   - Proof: `ingress-pair-loss-recover` kills both ingresses under load. It requires the receipt of every accepted transaction afterwards.
+- **A watcher falls behind its stream bus**
+  - Each stream (receipts, errors, block boundaries, watermarks) reaches its watcher through a broadcast bus of 32,768 items. One receipt is one item, and the ingress reads the receipts of every executor.
+  - Trigger: the watcher task stalls longer than the bus can hold, for example on a loaded host.
+  - Effect: the bus drops its oldest items. A rollback that the bus drops still applies from its log. A dropped receipt or error does not release its waiter, so that client waits until the pending timeout (30 s). Its retry gets the receipt by hash.
+  - The counter is `kardamom_ingress_bus_lagged_total{bus}`.
+  - Proof: `a_gap_counts_the_receipts_that_the_bus_dropped`. On one local stack under load, a bus of 1,024 items dropped 4,684 receipts and gave a soak p99 of 30 s. The bus of 32,768 items dropped none.
 - **Admission of a cold sender**
   - The admission checks read the local account layer, then Redis. A sender that never sent and never received value has no row in either layer.
   - For such a cold sender, the ingress asks an executor for the nonce and the balance (two queries). It keeps the answer for 30 s in a map of at most 65,536 senders. So a cold sender costs one pair of queries for each 30 s, not one pair for each submit. A row in the local layer always wins.
@@ -535,6 +541,14 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
   - The counter is `kardamom_cache_lookups_total{layer="cold", outcome}`. The outcomes are `hit` (a kept answer or outcome), `miss` (a fresh answer), `stale` and `error` (a shed or failed query).
   - Each admission refusal counts `kardamom_ingress_tx_rejected_total{reason}` and logs `submit refused` at debug level, with the sender, the nonce and the reason.
   - Proof: `crates/ingress/tests/account_cache_test.rs` (`a_cold_unfunded_sender_is_refused_with_one_query`, `a_lagging_executor_answer_admits`, `an_answer_before_the_first_head_admits`, `a_cold_funded_sender_or_a_failed_query_admits`).
+- **Receipts from the verdict stream (`--verdicts`)**
+  - With `--verdicts`, an ingress reads only the receipts of its own transactions, from its `tx_verdicts` stream. The v2 sequencers fill it (`[admission] verdicts`). It does not read `tx_receipts`.
+  - A sequencer sends the receipt of a transaction that its filter forwarded. Both replicas of a shard send it, and the ingress keeps the first copy by hash.
+  - A lost verdict: the offer of a verdict is best effort. The Aeron thread holds a refused frame until the offer deadline, then drops it and logs `best-effort publish failed`. A full queue of the verdict task also drops frames. The client then waits until `pending_receipt_timeout`. The counter is `kardamom_sequencer_verdicts_total{outcome}` (`sent`, `full`, `closed`, `wide`).
+  - A retry on another ingress: the filter refuses the copy of a transaction that it forwarded already (`DuplicatedTx`), and the other ingress never gets its receipt. So the retry ends with that error. The client reads the receipt with `eth_getTransactionReceipt`, which asks Redis or an executor on a cache miss.
+  - The local account layer gets no rows, so `--verdicts` needs `--admission-checks false`. The v2 filter checks each sender.
+  - Deploy order: the sequencers with `[admission] verdicts` first, then the ingress with `--verdicts`. A sequencer whose ingress does not read the stream offers to no subscriber, and each frame drops at the offer deadline.
+  - Proof: `crates/log/tests/discovered_tx_verdicts.rs` (each ingress receives only its own verdicts), `v2::tests::a_receipt_goes_to_the_ingress_of_its_transaction`, and the chain-semantics suite with `KARDAMOM_E2E_ADMISSION=1 KARDAMOM_E2E_VERDICTS=1`.
 - The JSON-RPC surface is in [`json-rpc.md`](json-rpc.md).
 
 ## Sequencer (2 shards x 2 racing replicas)

@@ -42,6 +42,8 @@ The `[admission]` section of the sequencer config turns the v2 loop on. Off, the
 | `park_width_units` | 131,072 | The 32-byte units of an image after which a parked transaction expires. |
 | `max_senders` | 1,048,576 | The senders above which a sweep forgets the idle ones. |
 | `sweep_every_ms` | 50 | The time between two sweeps. |
+| `relook_ms` | 500 | The time after which a sender whose state came from a lookup asks again, while a transaction parks behind a gap over that state. |
+| `verdicts` | `false` | Send the receipt of each forwarded transaction to the ingress that published it, on `tx_verdicts`. |
 | `outbox_cap` | 4,096 | The offers that may wait for the sealer before the loop stops taking envelopes. |
 
 A parked transaction also expires after `tx_ttl_ms`, the lifetime of the sequencer.

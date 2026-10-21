@@ -127,15 +127,22 @@ code = [
 # into its retained file, and takes no void request. The Rust reader
 # refuses a relayed type 5, and drops a frame with an unknown type, so an
 # old executor misses a canonical record.
+# This release also has the codecs of type 7 (the full reference, on
+# ingress only): the 99 bytes of a positioned type 0 reference with type 7,
+# then the envelope. A sealer on decision version 5 relays it as a type 6.
+# No writer sends type 7 yet. The Rust reader refuses a relayed type 7.
 [format.sealer-record-types]
 writes = 4
 reads_min = 0
-reads_max = 6
+reads_max = 7
 shared = true
 activation = { flag = "kardamom.cluster.carryBytes", writes = 6 }
 code = [
     "crates/cluster-adapter/src/wire/mod.rs#RT_VOID",
     "crates/cluster-adapter/src/wire/mod.rs#RT_TX",
+    "crates/cluster-adapter/src/wire/mod.rs#RT_TXREF_OFFER",
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#RT_TXREF_OFFER",
+    "crates/cluster-adapter/testdata/wire_golden.txt#txref_offer_ingress",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/VoidLedger.java#RT_VOID",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/TxOffer.java#RT_TX",
 ]

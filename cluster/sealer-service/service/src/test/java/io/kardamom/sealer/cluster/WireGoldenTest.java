@@ -2,6 +2,8 @@ package io.kardamom.sealer.cluster;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.kardamom.sealer.ClusterStatus;
 import io.kardamom.sealer.RecordedCursors;
@@ -129,6 +131,38 @@ final class WireGoldenTest {
             activation.getLong(SealerWire.ACTIVATION_FEATURE_OFFSET, ByteOrder.LITTLE_ENDIAN));
         assertEquals(1_700_000_000_250L, activation.getLong(SealerWire.ACTIVATION_MS_OFFSET, ByteOrder.LITTLE_ENDIAN));
         assertArrayEquals(frame, IngressFrames.featureActivationFrame(5, 2, 1_700_000_000_250L));
+    }
+
+    @Test
+    void aFullReferenceRelaysAsTheGoldenCanonicalEntry() {
+        final byte[] ingress = golden.get("txref_offer_ingress");
+        final UnsafeBuffer frame = new UnsafeBuffer(ingress);
+        final TxRefOffer offer = new TxRefOffer().wrap(
+            frame, SealerWire.CANONICAL_ID_OFFSET, ingress.length - SealerWire.CANONICAL_ID_OFFSET);
+
+        assertEquals(SealerWire.KIND_INGRESS_RECORD, frame.getByte(SealerWire.KIND_OFFSET));
+        assertEquals(SealerWire.RT_TXREF_OFFER, offer.recordType());
+        assertEquals(SealerWire.RT_TXREF_OFFER, frame.getByte(SealerWire.RECORD_TYPE_OFFSET));
+        assertTrue(offer.isWhole());
+        assertEquals(3, offer.lane());
+        assertEquals(5, offer.session());
+        final long deadline = frame.getLong(SealerWire.DEADLINE_OFFSET, ByteOrder.LITTLE_ENDIAN);
+        assertTrue(SealerWire.carriesPosition(deadline));
+        assertEquals(0x01_0203_0405L, deadline & SealerWire.POSITION_MASK);
+        assertEquals(ingress.length - SealerWire.TXREF_RECORD_LEN, offer.envelopeLength());
+        assertArrayEquals(golden.get("tx_egress"), frames.copy(frames.carried(INDEX, offer)));
+    }
+
+    @Test
+    void theFullReferenceIsThePositionedReferenceThenTheEnvelope() {
+        assertEquals(SealerWire.TXREF_PAYLOAD_LEN, TxRefOffer.ENVELOPE_OFFSET);
+        assertEquals(SealerWire.TXREF_PAYLOAD_LEN + SealerWire.ENVELOPE_ROOT_LEN, TxRefOffer.MIN_PAYLOAD_LEN);
+        assertEquals(SealerWire.REF_SESSION_OFFSET - SealerWire.CANONICAL_ID_OFFSET, TxRefOffer.SESSION_OFFSET);
+        assertEquals(SealerWire.REF_LANE_OFFSET - SealerWire.CANONICAL_ID_OFFSET, TxRefOffer.LANE_OFFSET);
+        final byte[] ingress = golden.get("txref_offer_ingress");
+        final TxRefOffer shortOffer = new TxRefOffer().wrap(new UnsafeBuffer(ingress),
+            SealerWire.CANONICAL_ID_OFFSET, TxRefOffer.MIN_PAYLOAD_LEN - 1);
+        assertFalse(shortOffer.isWhole());
     }
 
     @Test
