@@ -64,6 +64,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-flame.workspace = true
 hdrhistogram.workspace = true
+libc.workspace = true
 jsonrpsee = { workspace = true }
 # `frame-pointer` is required on macOS arm64: the default unwinder
 # (libunwind via `backtrace`) is not signal-safe and SIGTRAPs under load.

@@ -3830,6 +3830,7 @@ dependencies = [
  "kardamom-stm",
  "kardamom-types",
  "kardamom-validator",
+ "libc",
  "pprof",
  "rand 0.8.6",
  "reqwest 0.13.4",
