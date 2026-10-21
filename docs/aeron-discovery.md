@@ -66,6 +66,7 @@ The streams and their publishers:
 | `events` | ingress, sequencer, executor, validator, batcher, DA watcher, L1 follower, state mirror | ingress, validator, DA watcher, batcher |
 | `exec_txs` | executor | validator, batcher (none subscribes yet), the archive on the node of each executor |
 | `exec_frames` | executor (with `--exec-frames`) | egress |
+| `egress_order` | egress | the readers after the executors (batcher, validator) |
 | `l1_blocks` | L1 follower (two instances) | da-watcher, batcher, follower archives |
 
 The `exec_txs` stream carries the transactions that an executor joins, in canonical order: one `ExecTxRecord` for each `TxRef`.
@@ -84,6 +85,12 @@ The `exec_frames` stream carries the canonical frames that an executor reads, by
 - The reader holds the bytes of each frame until it delivers the item of the frame, then sends them. So a frame of a replay, a copy, or a live frame ahead of a gap goes out once, in canonical order.
 - Each executor opens one dynamic MDC publication with a `kardamom-mdc-publisher` record (topic `exec_frames`). The offer is best effort. A full queue in the executor drops the frame and counts `kardamom_executor_egress_frames_dropped_total`. The egress reads every executor, so it takes a lost frame from the copy of another executor.
 - The executor publishes it only with `--exec-frames` (env `KARDAMOM_EXEC_FRAMES`).
+
+The `egress_order` stream carries the canonical stream that the egress merged from the `exec_frames` copies, live, in canonical order: the record and boundary frames of the member feed, byte for byte, with no sequence.
+
+- The stream id is 1009. The channel and the stream id are the keys `egress_order_channel` and `egress_order_stream_id` of `[channels]`.
+- Each egress instance opens one dynamic MDC publication (topic `egress_order`). A reader gets the copies of every instance and keeps the first of each frame.
+- A reader that resumes reads the frames before the live stream from the range read of one instance: `GET /v1/frames?from_index=<i>&from_block=<b>`.
 
 The `l1_blocks` stream carries the finalized L1 blocks: one `L1Block` for each block, in block order.
 

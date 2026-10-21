@@ -94,6 +94,34 @@ impl StreamPlane {
         }
     }
 
+    /// The `egress_order` publisher of this egress instance. Discovered: a
+    /// dynamic MDC publication that every reader of the egress joins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publication fails to open or register.
+    pub async fn egress_order_publisher(
+        &mut self,
+        rt: &AeronRuntime,
+    ) -> Result<PubHandle, LogError> {
+        let key = self.egress_order_key();
+        match &mut self.discovered {
+            None => rt.open_publication(
+                &self.channels.egress_order_channel,
+                self.channels.egress_order_stream_id,
+            ),
+            Some(d) => d.open_publication(rt, key).await,
+        }
+    }
+
+    fn egress_order_key(&self) -> StreamKey {
+        StreamKey {
+            topic: Topic::EgressOrder,
+            stream_id: self.channels.egress_order_stream_id,
+            lane: None,
+        }
+    }
+
     fn exec_frames_key(&self) -> StreamKey {
         StreamKey {
             topic: Topic::ExecFrames,

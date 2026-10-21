@@ -417,6 +417,13 @@ pub struct ChannelsConfig {
     pub exec_frames_channel: ChannelUri,
     pub exec_frames_stream_id: i32,
 
+    /// `egress_order`: the canonical stream that the egress merged from the
+    /// executors, live, in canonical order: the frames of the member feed,
+    /// byte for byte. The readers after the executors subscribe to it, and
+    /// read the frames before it from the range read of the egress.
+    pub egress_order_channel: ChannelUri,
+    pub egress_order_stream_id: i32,
+
     /// `l1_blocks`: the L1 follower publishes one `L1Block` for each
     /// finalized L1 block, in block order. Every follower instance
     /// publishes every block; a consumer keeps the first record of each
@@ -507,7 +514,7 @@ impl ChannelsConfig {
 
     /// The id of every stream except the `tx_data` lanes, with the key
     /// that sets it.
-    fn single_stream_ids(&self) -> [(&'static str, i32); 12] {
+    fn single_stream_ids(&self) -> [(&'static str, i32); 13] {
         [
             ("tx_receipts_stream_id", self.tx_receipts_stream_id),
             (
@@ -525,6 +532,7 @@ impl ChannelsConfig {
             ("tx_bal_stream_id", self.tx_bal_stream_id),
             ("exec_txs_stream_id", self.exec_txs_stream_id),
             ("exec_frames_stream_id", self.exec_frames_stream_id),
+            ("egress_order_stream_id", self.egress_order_stream_id),
             ("l1_blocks_stream_id", self.l1_blocks_stream_id),
             ("fsync_watermark_stream_id", self.fsync_watermark_stream_id),
         ]
@@ -735,6 +743,9 @@ impl Default for ChannelsConfig {
             // (1010).
             exec_frames_channel: "aeron:ipc?alias=exec-frames".into(),
             exec_frames_stream_id: 1008,
+            // 1009 follows exec_frames (1008), the input of the egress.
+            egress_order_channel: "aeron:ipc?alias=egress-order".into(),
+            egress_order_stream_id: 1009,
             // 1020 follows the events stream (1019), the last of the
             // 1015..=1019 side-stream block.
             l1_blocks_channel: "aeron:ipc?alias=l1-blocks".into(),

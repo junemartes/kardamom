@@ -6,6 +6,8 @@
 //! ([`store`]). The readers after the executors (the batcher, the
 //! validator, the clients) read the egress, never an earlier stage.
 
+pub mod http;
 pub mod merge;
 pub mod metrics;
+pub mod owner;
 pub mod store;

@@ -1,0 +1,172 @@
+//! `kardamom-egress`: the stage after the executors. It merges the
+//! `exec_frames` copies of every executor into one canonical stream, keeps
+//! it on disk, publishes it live on `egress_order`, and answers the range
+//! reads of the readers that resume. See the library docs.
+
+use std::net::SocketAddr;
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use kardamom_egress::http::Http;
+use kardamom_egress::merge::{Head, Merge, MergeConfig};
+use kardamom_egress::owner::{FramePublisher, Input, Owner, OwnerConfig};
+use kardamom_egress::store::Store;
+use kardamom_log::aeron_live::{AeronRuntime, PubHandle};
+use kardamom_log::config::LogConfig;
+use kardamom_log::discovery::StreamPlane;
+use kardamom_obs::bin::wait_for_shutdown;
+
+/// The inputs that may wait for the owner thread.
+const INPUTS: usize = 64 * 1024;
+
+/// The head of an empty chain: the first record index and the first block.
+const GENESIS: Head = Head {
+    next_index: 0,
+    next_block: 1,
+    last: None,
+};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "kardamom-egress",
+    version,
+    about = "kardamom egress: the canonical stream after the executors"
+)]
+struct Args {
+    /// Optional `LogConfig` TOML supplying the Aeron `[channels]` config.
+    #[arg(long, env = "KARDAMOM_LOG_CONFIG")]
+    log_config: Option<PathBuf>,
+    /// Aeron Media Driver directory (`aeron.dir`).
+    #[arg(long)]
+    aeron_dir: Option<PathBuf>,
+    /// The directory of the stored stream.
+    #[arg(
+        long,
+        env = "KARDAMOM_EGRESS_DIR",
+        default_value = "/opt/kardamom/egress"
+    )]
+    dir: PathBuf,
+    /// The address of the range read and the health check.
+    #[arg(long, env = "KARDAMOM_EGRESS_BIND", default_value = "127.0.0.1:8548")]
+    bind: SocketAddr,
+    /// The blocks in one segment file.
+    #[arg(long, env = "KARDAMOM_EGRESS_SEGMENT_BLOCKS", default_value = "1000")]
+    segment_blocks: NonZeroU64,
+    /// The blocks the store keeps below its head.
+    #[arg(long, env = "KARDAMOM_EGRESS_KEEP_BLOCKS", default_value = "1000000")]
+    keep_blocks: NonZeroU64,
+    /// The period of the disk sync, in milliseconds.
+    #[arg(long, env = "KARDAMOM_EGRESS_SYNC_MS", default_value_t = 1_000)]
+    sync_ms: u64,
+    /// The frames of the copies ahead of the head that may wait.
+    #[arg(long, env = "KARDAMOM_EGRESS_MAX_WAITING", default_value = "1000000")]
+    max_waiting: NonZeroUsize,
+    /// The delivered frames whose digests the egress keeps, to compare
+    /// the copies.
+    #[arg(long, env = "KARDAMOM_EGRESS_COMPARED", default_value = "1000000")]
+    compared: NonZeroUsize,
+    /// Address for the Prometheus /metrics HTTP listener.
+    #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9013")]
+    metrics_addr: SocketAddr,
+    /// Host identifier. Stamped on every metric.
+    #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
+    host_id: String,
+}
+
+/// The live publication of the merged stream.
+struct Live(PubHandle);
+
+impl FramePublisher for Live {
+    fn publish(&self, frame: &[u8]) {
+        let mut bytes = rkyv::util::AlignedVec::with_capacity(frame.len());
+        bytes.extend_from_slice(frame);
+        self.0.publish_best_effort(bytes);
+    }
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+async fn main() -> Result<()> {
+    kardamom_obs::bin::init_tracing();
+    let args = Args::parse();
+    kardamom_obs::init_service!("egress", args.metrics_addr, args.host_id.as_str()).await?;
+    kardamom_egress::metrics::describe();
+
+    let log_cfg = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
+    let mut plane = StreamPlane::from_config(&log_cfg, &format!("egress-{}", args.host_id))
+        .context("build the stream plane")?;
+    let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
+    let frames = plane
+        .exec_frames_subscription(&rt)
+        .context("open exec_frames")?;
+    let live = plane
+        .egress_order_publisher(&rt)
+        .await
+        .context("open egress_order")?;
+
+    let store = Store::open(&args.dir, args.segment_blocks, GENESIS).context("open the store")?;
+    tracing::info!(head = ?store.head(), dir = %args.dir.display(), "egress: store open");
+    let merge = Merge::new(
+        MergeConfig {
+            max_waiting: args.max_waiting,
+            compared: args.compared,
+        },
+        store.head(),
+    );
+    let owner = Owner::new(
+        OwnerConfig {
+            sync_every: Duration::from_millis(args.sync_ms),
+            keep_blocks: args.keep_blocks,
+        },
+        merge,
+        store,
+        Live(live),
+    );
+    let (inputs, rx) = crossbeam_channel::bounded(INPUTS);
+    let owner_thread = std::thread::Builder::new()
+        .name("egress-owner".into())
+        .spawn(move || owner.run(&rx))
+        .context("spawn the owner thread")?;
+    let forward = inputs.clone();
+    std::thread::Builder::new()
+        .name("egress-frames".into())
+        .spawn(move || forward_frames(frames, &forward))
+        .context("spawn the frames thread")?;
+
+    let http = Http::bind(args.bind, inputs)
+        .await
+        .context("bind the range read")?;
+    tracing::info!(addr = %http.local_addr()?, "kardamom-egress starting");
+    let server = tokio::spawn(http.serve());
+
+    wait_for_shutdown().await;
+    tracing::info!("kardamom-egress: shutdown signal received");
+    server.abort();
+    plane.shutdown().await;
+    drop_runtime(rt);
+    match owner_thread.join() {
+        Ok(result) => result.context("the owner thread"),
+        Err(_) => anyhow::bail!("the owner thread panicked"),
+    }
+}
+
+/// Put each `exec_frames` message on the owner's queue, until the
+/// subscription closes or the owner is gone. A full queue holds this
+/// thread, and Aeron then holds the executors' frames.
+fn forward_frames(
+    mut frames: tokio::sync::mpsc::UnboundedReceiver<kardamom_log::aeron_live::RawFrame>,
+    inputs: &crossbeam_channel::Sender<Input>,
+) {
+    let _ = std::iter::from_fn(|| frames.blocking_recv())
+        .map(|frame| Input::Frame {
+            session: frame.session,
+            message: frame.bytes,
+        })
+        .try_for_each(|input| inputs.send(input));
+}
+
+/// End the Aeron runtime: the subscription closes, so the frames thread
+/// ends, and with it the last sender of the owner's queue.
+fn drop_runtime(_rt: AeronRuntime) {}

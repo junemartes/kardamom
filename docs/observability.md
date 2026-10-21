@@ -319,6 +319,8 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 These counters need an alert of your own. No rule in `deploy/alerts.yml` watches them:
 
 - `kardamom_executor_resync_total{outcome}` counts the full resyncs after a replay-window overrun.
+- `kardamom_egress_copy_mismatch_total` counts the copies of a canonical frame, from another executor, whose bytes differ from the first copy. Any increase means that one executor read another stream: alert on it.
+- `kardamom_egress_waiting_dropped_total` counts the times that every executor copy missed a frame, and the egress dropped the frames that waited behind it. The merged stream then stalls until a copy sends the frame.
 - `kardamom_executor_egress_frames_dropped_total` counts the canonical frames that the reader did not forward on `exec_frames`, because the queue to the publication was full.
   - `peer-checkpoint`: the node fell behind the retention window and repaired itself from a peer checkpoint.
   - `unrecoverable`: the node could not repair itself and waits for an operator.
