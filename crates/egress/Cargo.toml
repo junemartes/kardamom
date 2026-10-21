@@ -1,0 +1,23 @@
+[package]
+name = "kardamom-egress"
+version = { workspace = true }
+edition = { workspace = true }
+license = "MIT"
+publish = false
+
+# The egress: one canonical stream from the frames of every executor,
+# kept on disk and served to the readers after the executors. See
+# docs/specs/2026-10-21-one-way-pipeline.md.
+
+[lib]
+name = "kardamom_egress"
+path = "src/lib.rs"
+
+[dependencies]
+kardamom-cluster-adapter = { path = "../cluster-adapter" }
+metrics = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
