@@ -277,3 +277,79 @@ Each item is one pull request. Each passes `just style` and CI alone, and follow
 The open items of the carry spec that this plan does not need for staging: the member feed from
 the Raft log (#638), the stored cursor (#639), the recovery after a power loss (#644, #645), the
 history key (#675). They stay open in their issues.
+
+## 10. The egress as built (version 1)
+
+This section records how P6 to P10 built section 6. Where it differs from section 6, this section
+is the current state, and the difference is a follow-up.
+
+### 10.1 Streams
+
+| Stream | Id | Publisher | Content |
+|---|---|---|---|
+| `exec_frames` | 1008 | each executor with `--exec-frames` | `[seq:u64][frame]` for each canonical frame |
+| `egress_order` | 1009 | each egress | the merged canonical frames |
+| `egress_receipts` | 1011 | each egress | the merged receipts, their account rows and the rollbacks |
+
+- An executor sends best effort. It does not wait for the egress. A full publication drops the
+  frame and counts `kardamom_executor_egress_frames_dropped_total`.
+- The sequence counts the dropped frames too. So the egress sees a gap in a copy.
+
+### 10.2 The merge and the compare
+
+- The egress delivers a frame when a copy shows that the frame follows the last delivered frame:
+  the copy sent it with the next sequence, right after the last delivered frame.
+- A gap in one copy never reorders the stream. The copy of another executor fills the gap.
+- The egress keeps a digest of the last `--compared` delivered keys. It compares each later copy
+  with the first one. A difference counts `kardamom_egress_copy_mismatch_total`. The egress does
+  not stop. The validator decides which copy is wrong.
+- At most `--max-waiting` frames ahead of the head wait. A frame past that bound counts
+  `kardamom_egress_waiting_dropped_total`.
+
+### 10.3 The store
+
+- The store keeps only the frames. It does not keep the receipts on disk.
+- Each segment file holds `--segment-blocks` whole blocks. A 25-byte head starts each segment:
+  the next index, the next block and the key of the last frame. The frames follow as
+  `[len:u32][frame]`, little endian.
+- At open the store reads every segment once. It rebuilds the head and cuts a torn frame at the
+  end of the last segment.
+- The store keeps `--keep-blocks` blocks below its head. The prune does not follow
+  `min(posted_head, final_head)` yet (follow-up).
+- The store syncs to disk each `--sync-ms` milliseconds.
+
+### 10.4 The HTTP side
+
+The listener binds `--bind` (default `127.0.0.1:8548`).
+
+- `GET /v1/frames?from_index=<i>&from_block=<b>&limit=<bytes>` returns the frames after the
+  cursor. The headers `x-egress-after-*` give the cursor after the last frame, and the headers
+  `x-egress-next-*` give the head of the store. A cursor below the floor of the store gets `410`,
+  with the floor in the headers `x-egress-floor-*`.
+- `POST /` with `eth_getTransactionReceipt` answers in the format of the state query of an
+  executor: the rkyv bytes of the receipt as `0x` hex, and the header `x-state-block`. The egress
+  keeps the newest `--receipts` receipts for this call.
+- `GET /health` answers `200 ok`.
+- The metrics listener binds `--metrics-addr` (default `127.0.0.1:9013`).
+
+### 10.5 The readers
+
+| Reader | Switch | Reads |
+|---|---|---|
+| Validator | `--egress <url>` | the range read up to the head, then `egress_order` |
+| Batcher | `--egress <url>` | the range read up to the head, then `egress_order` |
+| Sequencer | `receipts_from_egress` | `egress_receipts`, with the account rows of every lane |
+| Ingress | `--receipt-query-endpoints <url>` | `eth_getTransactionReceipt` of the egress |
+| Notifier | `--receipts-from-egress` | `egress_receipts` |
+
+Each switch is off by default. Without it, the reader keeps its old source.
+
+### 10.6 Differences from section 6 (follow-ups)
+
+- **No `egress_rows`.** Each sequencer reads all of `egress_receipts` and keeps the rows of its
+  lanes. One rows stream for each lane is a follow-up.
+- **The notifier stays a separate service.** It reads `egress_receipts` in place of the
+  `tx_receipts` of the executors. The webhooks and `kardamom_subscribeTxStatus` stay in
+  `crates/notifier`. The move into the egress process is a follow-up.
+- **The prune** keeps a fixed number of blocks (section 10.3).
+- **The deploy** of the egress and the switches of the readers come with P7c.
