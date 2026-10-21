@@ -275,6 +275,14 @@ impl Handles {
     }
 }
 
+/// The account events that may wait for the v2 loop: about one for each
+/// receipt batch. A full queue holds the receipts feed back.
+const V2_ACCOUNT_EVENTS: usize = 65_536;
+
+/// The senders that may wait for a lookup of the v2 loop. A full queue
+/// drops a request; the sender's transactions then wait for its rows.
+const V2_LOOKUP_QUEUE: usize = 4_096;
+
 /// Lag detection, receipt-floor resync, and the nonce lookup: the
 /// egress-watermark task, the receipts-floor task, the lookup task, the
 /// `ResyncController` and the `LookupRequester` handed to the publish
@@ -292,6 +300,8 @@ struct ResyncWiring {
     /// The decision version that the egress-watermark feed reads off the
     /// sealer, for the publish loop.
     sealer_version: kardamom_sequencer::sealer_rules::SealerVersion,
+    /// The inputs of the v2 loop, when `[admission]` turns it on.
+    v2: Option<feeds::V2Wiring>,
     feeds: ResyncFeeds,
 }
 
@@ -402,7 +412,18 @@ impl ResyncWiring {
                 live.clone(),
             ))
         });
-        let receipts_task = feeds::ReceiptFloorFeed::new(vslots, floor_tx.clone(), live_writer)
+        // The v2 loop takes the rows of each batch and the lookup answers
+        // as account events. The v1 loop takes the receipts as floors.
+        let (accounts_tx, accounts_rx) = crossbeam_channel::bounded(V2_ACCOUNT_EVENTS);
+        let sink = if cfg.admission.enabled {
+            feeds::ReceiptSink::Accounts {
+                events: accounts_tx.clone(),
+                receipts: cfg.admission.verdicts,
+            }
+        } else {
+            feeds::ReceiptSink::Floors(floor_tx.clone())
+        };
+        let receipts_task = feeds::ReceiptFloorFeed::new(vslots, sink, live_writer)
             .spawn(receipts_sub, shutdown.clone());
 
         // The fee gate: the base fee view follows the executors' boundary
@@ -414,15 +435,26 @@ impl ResyncWiring {
                 .tx_receipt_boundaries_subscriber(receipts_rt, executor_count)
                 .context("open tx_receipts boundaries")?;
             let task = feeds::BaseFeeFeed::new(view.clone()).spawn(boundaries, shutdown.clone());
-            (FeeGate::on(view, Some(live.clone())), Some(task))
+            // The v2 filter checks the balance itself, with the forwarded
+            // run counted, so its gate holds no account layer.
+            let balances = (!cfg.admission.enabled).then(|| live.clone());
+            (FeeGate::on(view, balances), Some(task))
         } else {
             (FeeGate::off(), None)
         };
 
-        // The nonce lookup task. It shares the floor channel with the
-        // receipts feed: an executor's committed nonce is floor evidence
-        // of the same kind as a receipt.
-        let (lookup, lookup_task) = Self::spawn_lookup(cfg, floor_tx, shutdown, live, redis);
+        // The lookup task: the account lookup of the v2 loop, or the nonce
+        // lookup of the v1 loop. The nonce lookup shares the floor channel
+        // with the receipts feed: an executor's committed nonce is floor
+        // evidence of the same kind as a receipt.
+        let (lookup, lookup_task, v2) = if cfg.admission.enabled {
+            let (v2, task) =
+                Self::spawn_account_lookup(cfg, accounts_tx, accounts_rx, shutdown, live, redis);
+            (None, Some(task), Some(v2))
+        } else {
+            let (lookup, task) = Self::spawn_lookup(cfg, floor_tx, shutdown, live, redis);
+            (lookup, task, None)
+        };
 
         Ok(Self {
             controller,
@@ -430,6 +462,7 @@ impl ResyncWiring {
             fees,
             epoch_lane,
             sealer_version,
+            v2,
             feeds: ResyncFeeds {
                 watermark_task,
                 receipts_task,
@@ -438,6 +471,42 @@ impl ResyncWiring {
                 main_rt,
             },
         })
+    }
+
+    /// Spawn the account lookup task of the v2 loop. Returns the inputs of
+    /// the loop and the task handle.
+    fn spawn_account_lookup(
+        cfg: &SequencerConfig,
+        accounts_tx: crossbeam_channel::Sender<kardamom_sequencer::v2::AccountEvent>,
+        accounts_rx: crossbeam_channel::Receiver<kardamom_sequencer::v2::AccountEvent>,
+        shutdown: &Shutdown,
+        live: std::sync::Arc<kardamom_cache::LiveAccounts>,
+        redis: Option<std::sync::Arc<kardamom_cache::CacheReader>>,
+    ) -> (feeds::V2Wiring, tokio::task::JoinHandle<()>) {
+        let (lookups, rx) = tokio::sync::mpsc::channel(V2_LOOKUP_QUEUE);
+        let query = kardamom_cache::ExecutorQuery::new(&kardamom_cache::ExecutorQueryConfig {
+            endpoints: cfg.lookup.executor_endpoints.clone(),
+            timeout_ms: cfg.lookup.timeout_ms,
+            max_in_flight: cfg.lookup.max_in_flight,
+        });
+        let task = feeds::AccountLookupFeed::new(
+            rx,
+            accounts_tx,
+            live,
+            redis,
+            query,
+            shutdown.clone(),
+            cfg.partition_index,
+        )
+        .spawn();
+        (
+            feeds::V2Wiring {
+                accounts: accounts_rx,
+                lookups,
+                verdicts: None,
+            },
+            task,
+        )
     }
 
     /// Spawn the nonce lookup task when the config names executor
@@ -572,6 +641,38 @@ fn log_start(cfg: &SequencerConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Start the verdict task when the v2 loop runs with `[admission]
+/// verdicts`, and give its queue to the loop.
+fn start_verdicts(
+    resync: &mut ResyncWiring,
+    cfg: &SequencerConfig,
+    log_cfg: &LogConfig,
+    args: &Args,
+    shutdown: &Shutdown,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    let Some(v2) = resync.v2.as_mut().filter(|_| cfg.admission.verdicts) else {
+        return Ok(None);
+    };
+    let (frames, task) = feeds::VerdictFeed::start(
+        log_cfg,
+        &format!("sequencer-{}-verdicts", cfg.lane()),
+        args.aeron_dir.as_deref(),
+        shutdown,
+    )?;
+    v2.verdicts = Some(frames);
+    Ok(Some(task))
+}
+
+/// Join the verdict task. The loop dropped its end of the verdict queue,
+/// so the task ends its plane and drops its runtime.
+async fn join_verdicts(task: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = task
+        && let Err(e) = task.await
+    {
+        tracing::warn!(?e, "verdict task panicked");
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
@@ -638,7 +739,7 @@ async fn main() -> anyhow::Result<()> {
     // sustainable ingest rate.
     let receipts_rt =
         AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
-    let resync = ResyncWiring::spawn(
+    let mut resync = ResyncWiring::spawn(
         &cfg,
         rt,
         cluster_egress,
@@ -647,6 +748,7 @@ async fn main() -> anyhow::Result<()> {
         args.executor_count,
         &shutdown,
     )?;
+    let verdict_task = start_verdicts(&mut resync, &cfg, &log_cfg, &args, &shutdown)?;
 
     // Cloning shares the single session thread, and offers serialize
     // through it. All three loops use `cluster_pub` (it implements
@@ -669,6 +771,7 @@ async fn main() -> anyhow::Result<()> {
         lookup: resync.lookup,
         fees: resync.fees,
         sealer_version: resync.sealer_version,
+        v2: resync.v2,
         shutdown: shutdown.clone(),
         idle_cap,
     }
@@ -690,6 +793,7 @@ async fn main() -> anyhow::Result<()> {
     // when it returns, drops `rt` — before `receipts_rt`, still a local
     // here, drops at the end of `main`.
     loops.join_all().await;
+    join_verdicts(verdict_task).await;
     // The plane's registrations and discovery tasks end before the
     // runtime drops inside `resync.feeds.join()`.
     plane.shutdown().await;

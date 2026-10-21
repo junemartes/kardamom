@@ -131,6 +131,12 @@ pub struct ServiceSpec<'a> {
     /// settings. The `[channels]` defaults are inherited, so the topology
     /// does not change.
     pub log_config: Option<&'a Path>,
+    /// Run every sequencer on the v2 loop (the `[admission]` section).
+    pub admission: bool,
+    /// With `admission`: the sequencers send each receipt to the ingress of
+    /// its transaction, and the ingress reads its `tx_verdicts` stream in
+    /// place of `tx_receipts`.
+    pub verdicts: bool,
 }
 
 /// The parts of a stateful service's (executor, validator) bring-up that
@@ -566,10 +572,17 @@ pub fn spawn_sequencer_with(
     // flags below (`--partition-index`, `--sequencer-id`) are what the
     // binary actually uses. max_pending_per_sender and
     // backpressure_policy have no CLI flag, so they must live in the file.
-    let prefix = format!(
+    let mut prefix = format!(
         "partition_count = {partition_count}\npartition_index = 0\nsequencer_id = 0\n\
          max_pending_per_sender = 512\nbackpressure_policy = \"return_immediately\"\n\n",
     );
+    if spec.admission {
+        prefix.push_str("[admission]\nenabled = true\nmax_parked = 512\n");
+        if spec.verdicts {
+            prefix.push_str("verdicts = true\n");
+        }
+        prefix.push('\n');
+    }
     let name = format!("sequencer-{index}{}", opts.log_tag);
     let cfg_path = spec.write_cluster_config(&name, &prefix)?;
     let metrics_port = free_port().port();
@@ -873,6 +886,11 @@ pub fn spawn_ingress_at(
             "--executor-query-endpoints",
             &format!("http://{}", spec.executor_query),
         ]);
+    // The v2 sequencers check each sender, and the local account layer of
+    // the ingress gets no rows from its verdict stream.
+    if spec.verdicts {
+        cmd.args(["--verdicts", "true", "--admission-checks", "false"]);
+    }
     with_log_config(&mut cmd, spec);
     // The ingress is the tx_data recorder. With this flag, the shared
     // archive records every shard's publication. This is what makes a

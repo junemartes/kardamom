@@ -17,14 +17,17 @@
 //! Async-capable work, such as the receipts fan-in on an existing tokio
 //! channel, is a plain task. It uses `select!` on `Shutdown::cancelled`.
 
+mod account_lookup;
 mod lookup;
 mod origin_pump;
 mod receipts;
 mod steps;
+mod verdicts;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub(crate) use account_lookup::AccountLookupFeed;
 use kardamom_cluster_adapter::LiveEgress;
 use kardamom_cluster_adapter::live::EgressPoll;
 use kardamom_cluster_adapter::wire::{self, EgressItem};
@@ -51,7 +54,8 @@ use kardamom_sequencer::sequencer::{Ports, Sequencer, Shutdown};
 use kardamom_types::cluster_status::SilenceDeadline;
 pub(crate) use lookup::NonceLookupFeed;
 use origin_pump::OriginPump;
-pub(crate) use receipts::ReceiptFloorFeed;
+pub(crate) use receipts::{ReceiptFloorFeed, ReceiptSink};
+pub(crate) use verdicts::VerdictFeed;
 
 /// One `tx_data` lane subscription: the lane index the sequencer stamps
 /// into every ref off it, and the handle that reads it.
@@ -567,9 +571,51 @@ pub(crate) struct PublishLoops<P> {
     pub(crate) lookup: Option<LookupRequester>,
     /// The decision version that the egress feed reads off the sealer.
     pub(crate) sealer_version: SealerVersion,
+    /// The inputs of the v2 loop, when `[admission]` turns it on.
+    pub(crate) v2: Option<V2Wiring>,
     pub(crate) shutdown: Shutdown,
     /// The idle cap of the process, for the main sequencer loop.
     pub(crate) idle_cap: IdleCap,
+}
+
+/// The inputs of the v2 loop: the account events of the receipts feed and
+/// of the lookup task, and the lookup queue. With `verdicts`, the loop
+/// sends the receipt of each forwarded transaction to the verdict task.
+pub(crate) struct V2Wiring {
+    pub(crate) accounts: crossbeam_channel::Receiver<kardamom_sequencer::v2::AccountEvent>,
+    pub(crate) lookups: tokio::sync::mpsc::Sender<alloy_primitives::Address>,
+    pub(crate) verdicts: Option<tokio::sync::mpsc::Sender<kardamom_sequencer::v2::VerdictOut>>,
+}
+
+impl V2Wiring {
+    /// Run the v2 loop in place of the v1 loop.
+    fn run<P: kardamom_sequencer::sequencer::SequencerPorts>(
+        self,
+        cfg: &SequencerConfig,
+        fees: FeeGate,
+        sealer_version: SealerVersion,
+        ports: &mut P,
+        shutdown: &Shutdown,
+        idle_cap: IdleCap,
+    ) -> Result<(), SequencerError> {
+        let vslots = cfg.vslot_set()?;
+        let mut admission = kardamom_sequencer::v2::AdmissionLoop::new(
+            cfg.admission.loop_config(cfg.tx_ttl(), cfg.partition_index),
+            vslots,
+            self.accounts,
+            self.lookups,
+        );
+        admission.enable_fees(fees);
+        admission.enable_positioned_refs(sealer_version);
+        if let Some(verdicts) = self.verdicts {
+            admission.enable_verdicts(verdicts);
+        }
+        tracing::info!(
+            partition = cfg.partition_index,
+            "sequencer v2: the admission loop runs"
+        );
+        admission.run(ports, shutdown, idle_cap)
+    }
 }
 
 impl<P> PublishLoops<P>
@@ -601,6 +647,7 @@ where
             resync,
             lookup,
             sealer_version,
+            v2,
             shutdown,
             idle_cap,
         } = self;
@@ -610,6 +657,21 @@ where
         // the async runtime stays responsive for shutdown handling.
         let shutdown_for_main = shutdown.clone();
         let join_main = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
+            let mut ports = Ports {
+                tx_data: &mut tx_data,
+                refs: &mut main_pub,
+                errors: &mut side,
+            };
+            if let Some(v2) = v2 {
+                return v2.run(
+                    &cfg,
+                    fees,
+                    sealer_version,
+                    &mut ports,
+                    &shutdown_for_main,
+                    idle_cap,
+                );
+            }
             let mut sequencer = Sequencer::new(cfg)?;
             if let Some(controller) = resync {
                 sequencer.enable_resync(controller);
@@ -620,11 +682,6 @@ where
             sequencer.enable_pause(process().subscribe());
             sequencer.enable_fees(fees);
             sequencer.enable_positioned_refs(sealer_version);
-            let mut ports = Ports {
-                tx_data: &mut tx_data,
-                refs: &mut main_pub,
-                errors: &mut side,
-            };
             sequencer.run(&mut ports, &shutdown_for_main, idle_cap)
         });
 

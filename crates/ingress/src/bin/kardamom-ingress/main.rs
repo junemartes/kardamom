@@ -230,6 +230,18 @@ struct Args {
     /// ms. Defaults to `LiveAccountsConfig::default`.
     #[arg(long = "live-accounts-ttl-ms", env = "KARDAMOM_LIVE_ACCOUNTS_TTL_MS")]
     live_accounts_ttl_ms: Option<NonZeroU64>,
+    /// Read the receipts of this ingress's own transactions from its
+    /// `tx_verdicts` stream, which the v2 sequencers fill, in place of the
+    /// whole `tx_receipts` stream. The ingress id must be at most 255. The
+    /// local account layer then gets no rows, so `--admission-checks` must
+    /// be `false`: the v2 sequencers check each sender.
+    #[arg(
+        long,
+        env = "KARDAMOM_INGRESS_VERDICTS",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    verdicts: bool,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -288,6 +300,11 @@ impl IngressService {
     fn build_config(&self) -> Result<IngressConfig> {
         let args = &self.args;
         validate_shard_count(u32::from(args.shards.get())).context("--shards")?;
+        if args.verdicts && args.admission_checks {
+            anyhow::bail!(
+                "--verdicts needs --admission-checks false: the v2 sequencers check each sender"
+            );
+        }
         let mut cfg = IngressConfig {
             jsonrpc_bind: args.jsonrpc_bind,
             partition_count_m: NonZeroU32::from(args.shards),
@@ -428,12 +445,18 @@ impl IngressService {
                 .await
                 .context("archive durability requested but tx_data recorders failed to start")?;
         }
+        let verdicts = args
+            .verdicts
+            .then(|| u8::try_from(args.ingress_id))
+            .transpose()
+            .context("--verdicts needs an --ingress-id of at most 255")?;
         let subscription = LiveIngressSubscription::open(
             &rt,
             &mut plane,
             args.recorder_id,
             executor_count,
             live_cfg,
+            verdicts,
             executed,
         )
         .context("open IngressSubscription")?;
