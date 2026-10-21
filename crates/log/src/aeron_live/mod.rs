@@ -90,6 +90,7 @@ pub use handles::tx_receipts::{
     ReceiptFrame, TxReceiptsBoundarySubscriberHandle, TxReceiptsPublisherHandle,
     TxReceiptsReceiver, TxReceiptsSubscriberHandle,
 };
+pub use handles::tx_verdicts::TxVerdictsPublisherHandle;
 pub use idle::{IdleBackoff, IdleCap};
 pub use pending::BEST_EFFORT_DROPPED_TOTAL;
 pub use runtime::{

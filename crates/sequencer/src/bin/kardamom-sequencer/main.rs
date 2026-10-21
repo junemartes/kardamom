@@ -416,7 +416,10 @@ impl ResyncWiring {
         // as account events. The v1 loop takes the receipts as floors.
         let (accounts_tx, accounts_rx) = crossbeam_channel::bounded(V2_ACCOUNT_EVENTS);
         let sink = if cfg.admission.enabled {
-            feeds::ReceiptSink::Accounts(accounts_tx.clone())
+            feeds::ReceiptSink::Accounts {
+                events: accounts_tx.clone(),
+                receipts: cfg.admission.verdicts,
+            }
         } else {
             feeds::ReceiptSink::Floors(floor_tx.clone())
         };
@@ -500,6 +503,7 @@ impl ResyncWiring {
             feeds::V2Wiring {
                 accounts: accounts_rx,
                 lookups,
+                verdicts: None,
             },
             task,
         )
@@ -637,6 +641,38 @@ fn log_start(cfg: &SequencerConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Start the verdict task when the v2 loop runs with `[admission]
+/// verdicts`, and give its queue to the loop.
+fn start_verdicts(
+    resync: &mut ResyncWiring,
+    cfg: &SequencerConfig,
+    log_cfg: &LogConfig,
+    args: &Args,
+    shutdown: &Shutdown,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    let Some(v2) = resync.v2.as_mut().filter(|_| cfg.admission.verdicts) else {
+        return Ok(None);
+    };
+    let (frames, task) = feeds::VerdictFeed::start(
+        log_cfg,
+        &format!("sequencer-{}-verdicts", cfg.lane()),
+        args.aeron_dir.as_deref(),
+        shutdown,
+    )?;
+    v2.verdicts = Some(frames);
+    Ok(Some(task))
+}
+
+/// Join the verdict task. The loop dropped its end of the verdict queue,
+/// so the task ends its plane and drops its runtime.
+async fn join_verdicts(task: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = task
+        && let Err(e) = task.await
+    {
+        tracing::warn!(?e, "verdict task panicked");
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
@@ -703,7 +739,7 @@ async fn main() -> anyhow::Result<()> {
     // sustainable ingest rate.
     let receipts_rt =
         AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
-    let resync = ResyncWiring::spawn(
+    let mut resync = ResyncWiring::spawn(
         &cfg,
         rt,
         cluster_egress,
@@ -712,6 +748,7 @@ async fn main() -> anyhow::Result<()> {
         args.executor_count,
         &shutdown,
     )?;
+    let verdict_task = start_verdicts(&mut resync, &cfg, &log_cfg, &args, &shutdown)?;
 
     // Cloning shares the single session thread, and offers serialize
     // through it. All three loops use `cluster_pub` (it implements
@@ -756,6 +793,7 @@ async fn main() -> anyhow::Result<()> {
     // when it returns, drops `rt` — before `receipts_rt`, still a local
     // here, drops at the end of `main`.
     loops.join_all().await;
+    join_verdicts(verdict_task).await;
     // The plane's registrations and discovery tasks end before the
     // runtime drops inside `resync.feeds.join()`.
     plane.shutdown().await;
