@@ -148,3 +148,34 @@ fn a_frame_that_is_no_record_and_no_boundary_carries_nothing() {
     assert!(out.is_empty());
     assert_eq!(m.head(), Head::default());
 }
+
+/// The relayed frame of an epoch with `deposits` deposits at `index`.
+fn epoch_at(index: u64, deposits: usize) -> Vec<u8> {
+    let epoch = kardamom_types::EpochRecord {
+        l1_number: 7,
+        l1_hash: alloy_primitives::B256::repeat_byte(7),
+        deposits: vec![kardamom_types::Deposit::default(); deposits],
+    };
+    let body = rkyv::to_bytes::<rkyv::rancor::Error>(&epoch).unwrap();
+    let payload = [
+        epoch.canonical_id().as_slice(),
+        &[kardamom_cluster_adapter::wire::RT_EPOCH],
+        body.as_slice(),
+    ]
+    .concat();
+    encode_egress_record(index, &payload).unwrap()
+}
+
+/// An epoch takes its marker and one slot for each deposit: the next
+/// index after it is that many on, as a reader of the stream counts it.
+#[test]
+fn an_epoch_moves_the_next_index_by_its_slots() {
+    let mut m = merge();
+    let mut a = Copy::new(1);
+    let out: Vec<Vec<u8>> = [epoch_at(0, 2), record(3)]
+        .iter()
+        .flat_map(|f| a.send(&mut m, f))
+        .collect();
+    assert_eq!(out.len(), 2);
+    assert_eq!(m.head().next_index, 4, "the epoch at 0 takes 0, 1 and 2");
+}

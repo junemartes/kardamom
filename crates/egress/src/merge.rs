@@ -25,7 +25,11 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 
-use kardamom_cluster_adapter::wire::{EGRESS_KIND_BOUNDARY, EGRESS_KIND_RELAYED};
+use kardamom_cluster_adapter::wire::{
+    EGRESS_KIND_BOUNDARY, EGRESS_KIND_RELAYED, EgressItem, RT_EPOCH, RT_REMOTE_EPOCH, epoch_slots,
+    remote_epoch_slots,
+};
+use kardamom_types::TxOrderingMessage;
 
 use crate::metrics;
 
@@ -72,10 +76,15 @@ impl Head {
         }
     }
 
-    /// Move the head past `key`.
-    pub(crate) fn advance(&mut self, key: Key) {
+    /// Move the head past `frame`. A record moves the next index by its
+    /// slots: an epoch takes its marker and one slot for each deposit, so
+    /// the next record is that many indexes on.
+    pub(crate) fn advance(&mut self, frame: &[u8]) {
+        let Some(key) = Key::of(frame) else {
+            return;
+        };
         match key {
-            Key::Record(index) => self.next_index = index + 1,
+            Key::Record(index) => self.next_index = index + slots(frame),
             Key::Boundary(block) => self.next_block = block + 1,
         }
         self.last = Some(key);
@@ -195,7 +204,7 @@ impl Merge {
 
     fn deliver(&mut self, key: Key, frame: Vec<u8>, out: &mut Vec<Vec<u8>>) {
         self.digests.keep(key, digest(&frame));
-        self.head.advance(key);
+        self.head.advance(&frame);
         out.push(frame);
     }
 
@@ -246,6 +255,33 @@ impl Digests {
 
     fn of(&self, key: Key) -> Option<u64> {
         self.of.get(&key).copied()
+    }
+}
+
+/// The offset of the record type in a record frame:
+/// `[kind:u8][index:u64][len:u32]`, then `[canonical_id:32][record_type:u8]`.
+const RECORD_TYPE_AT: usize = 1 + 8 + 4 + 32;
+
+/// The canonical slots of a record frame. Only an epoch and a remote epoch
+/// take more than one, so only they decode.
+fn slots(frame: &[u8]) -> u64 {
+    let epoch = matches!(
+        frame.get(RECORD_TYPE_AT),
+        Some(&(RT_EPOCH | RT_REMOTE_EPOCH))
+    );
+    if !epoch {
+        return 1;
+    }
+    match EgressItem::decode(frame) {
+        Ok(EgressItem::Record {
+            msg: TxOrderingMessage::Epoch(e),
+            ..
+        }) => epoch_slots(&e),
+        Ok(EgressItem::Record {
+            msg: TxOrderingMessage::RemoteEpoch(r),
+            ..
+        }) => remote_epoch_slots(&r),
+        _ => 1,
     }
 }
 

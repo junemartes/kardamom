@@ -188,11 +188,8 @@ impl Store {
             .write_all(&len.to_le_bytes())
             .map_err(io(&self.dir))?;
         self.writer.write_all(frame).map_err(io(&self.dir))?;
-        let Some(key) = Key::of(frame) else {
-            return Ok(());
-        };
-        self.head.advance(key);
-        if matches!(key, Key::Boundary(_)) {
+        self.head.advance(frame);
+        if matches!(Key::of(frame), Some(Key::Boundary(_))) {
             self.close_block()?;
         }
         Ok(())
@@ -263,10 +260,8 @@ impl Store {
         let mut end = SEGMENT_HEAD as u64;
         std::iter::from_fn(|| read_frame(&mut reader)).for_each(|frame| {
             end += 4 + frame.len() as u64;
-            if let Some(key) = Key::of(&frame) {
-                head.advance(key);
-                blocks += u64::from(matches!(key, Key::Boundary(_)));
-            }
+            head.advance(&frame);
+            blocks += u64::from(matches!(Key::of(&frame), Some(Key::Boundary(_))));
         });
         Ok((head, blocks, end))
     }
