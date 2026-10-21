@@ -81,3 +81,11 @@ rand = "0.9"
 [[bench]]
 name = "throughput"
 harness = false
+
+[[bench]]
+name = "admission"
+harness = false
+
+[[bench]]
+name = "v2_loop"
+harness = false

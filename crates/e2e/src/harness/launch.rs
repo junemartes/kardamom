@@ -203,6 +203,10 @@ impl<'a> StackLaunch<'a> {
             chain_id: self.cfg.chain_id.get(),
             genesis,
             log_config,
+            // KARDAMOM_E2E_ADMISSION=1 runs the sequencers on the v2 loop,
+            // so the suite covers both loops.
+            admission: !self.cfg.unpayable_spends
+                && std::env::var("KARDAMOM_E2E_ADMISSION").is_ok_and(|v| v == "1"),
         }
     }
 }

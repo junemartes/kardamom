@@ -88,6 +88,9 @@ pub struct SequencerConfig {
     /// call exists on any path.
     #[serde(default)]
     pub cache: CacheConfig,
+    /// The `[admission]` section: the v2 loop, off by default.
+    #[serde(default)]
+    pub admission: crate::v2::AdmissionSettings,
     /// The own `tx_data` lane. `None` means `sequencer_id`. A ref for an
     /// envelope on this lane carries this lane. See
     /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.2.
@@ -147,6 +150,7 @@ impl Default for SequencerConfig {
             fees: crate::fees::FeesConfig::default(),
             live_accounts: LiveAccountsConfig::default(),
             cache: CacheConfig::default(),
+            admission: crate::v2::AdmissionSettings::default(),
             lane: None,
             vslots: None,
             extra_lanes: Vec::new(),

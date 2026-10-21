@@ -20,11 +20,20 @@ fn upgrade_stack_config(genesis: e2e::harness::Genesis) -> StackConfig {
     }
 }
 
-/// The tests below differ only in the genesis and the scenario they
+/// [`upgrade_stack_config`] for S13c and S13d: they send transactions
+/// that cannot pay, so the sequencers keep the v1 loop.
+fn unpayable_stack_config(genesis: e2e::harness::Genesis) -> StackConfig {
+    StackConfig {
+        unpayable_spends: true,
+        ..upgrade_stack_config(genesis)
+    }
+}
+
+/// The tests below differ only in the stack config and the scenario they
 /// drive. They share the same L1-backed, validator-carrying stack and the
 /// same `(target, l1, executor state dir, validator state dir)` hand-off.
 /// This skips the test with an early return when anvil is absent.
-async fn upgrade_case<F>(genesis: e2e::harness::Genesis, scenario: F, what: &str)
+async fn upgrade_case<F>(cfg: StackConfig, scenario: F, what: &str)
 where
     F: AsyncFn(
         &e2e::scenarios::Target,
@@ -33,7 +42,7 @@ where
         &std::path::Path,
     ) -> anyhow::Result<()>,
 {
-    let stack = launch_l1_or_skip!(upgrade_stack_config(genesis));
+    let stack = launch_l1_or_skip!(cfg);
     let t = target(&stack);
     let l1 = stack.l1().expect("l1");
     let exec_dir = stack.executor_state_dir().expect("executor state dir");
@@ -45,7 +54,7 @@ where
 /// and the validator.
 async fn s13d_on(genesis: e2e::harness::Genesis) {
     upgrade_case(
-        genesis,
+        unpayable_stack_config(genesis),
         async |t, l1, exec_dir, val_dir| {
             sealer_upgrade::skip_uses_its_nonce_only_after_the_upgrade(
                 t,
@@ -86,7 +95,7 @@ async fn s13d_the_first_upgrade_installs_the_chain_state() {
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s13a_health_check_activates_immediately() {
     upgrade_case(
-        e2e::harness::Genesis::DevWithdrawals,
+        upgrade_stack_config(e2e::harness::Genesis::DevWithdrawals),
         async |t, l1, exec_dir, val_dir| {
             upgrade::activates_immediately(t, l1, exec_dir, val_dir).await
         },
@@ -107,7 +116,7 @@ async fn s13a_health_check_activates_immediately() {
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s13b_health_check_activates_at_timestamp() {
     upgrade_case(
-        e2e::harness::Genesis::DevWithdrawals,
+        upgrade_stack_config(e2e::harness::Genesis::DevWithdrawals),
         async |t, l1, exec_dir, val_dir| {
             upgrade::activates_at_timestamp(t, l1, exec_dir, val_dir).await
         },
@@ -125,7 +134,7 @@ async fn s13b_health_check_activates_at_timestamp() {
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s13c_upgrade_authority_is_enforced() {
     upgrade_case(
-        e2e::harness::Genesis::DevWithdrawals,
+        unpayable_stack_config(e2e::harness::Genesis::DevWithdrawals),
         async |t, l1, exec_dir, _val_dir| {
             upgrade::authority_is_enforced(t, l1, exec_dir, upgrade::Params::default()).await
         },
