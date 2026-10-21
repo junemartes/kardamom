@@ -34,8 +34,9 @@ pub struct TxStatus {
 }
 
 /// The stage a transaction reached. The order per transaction is fixed:
-/// `Offered`, then `Sealed`, then `Executed`; or `Rejected` in place of
-/// the later stages. A reader orders by stage, not by arrival.
+/// `Accepted`, then `Offered`, then `Sealed`, then `Executed`; or
+/// `Rejected` in place of the later stages. A reader orders by stage, not
+/// by arrival. A variant goes only at the end: the layout is frozen.
 #[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub enum TxStage {
@@ -62,12 +63,22 @@ pub enum TxStage {
         nonce: u64,
         reason: TxErrorReason,
     },
+    /// The sequencer took the transaction into its mempool: it forwarded it
+    /// to the sealer, or it holds it for a nonce gap. This is the ack of
+    /// `eth_sendRawTransaction`. The transaction can still drop later, as in
+    /// the mempool of an Ethereum node.
+    Accepted {
+        #[rkyv(with = wire::AddressBytes)]
+        sender: Address,
+        nonce: u64,
+    },
 }
 
 /// The stage without its payload: the key a reader deduplicates on, and
 /// the word a client sees.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub enum TxStageKind {
+    Accepted,
     Offered,
     Sealed,
     Executed,
@@ -76,7 +87,13 @@ pub enum TxStageKind {
 
 impl TxStageKind {
     /// Every kind, in stage order.
-    pub const ALL: [Self; 4] = [Self::Offered, Self::Sealed, Self::Executed, Self::Rejected];
+    pub const ALL: [Self; 5] = [
+        Self::Accepted,
+        Self::Offered,
+        Self::Sealed,
+        Self::Executed,
+        Self::Rejected,
+    ];
 
     /// The lower-case word a client sees in the `stage` field.
     #[must_use]
@@ -86,6 +103,7 @@ impl TxStageKind {
             Self::Sealed => "sealed",
             Self::Executed => "executed",
             Self::Rejected => "rejected",
+            Self::Accepted => "accepted",
         }
     }
 
@@ -97,6 +115,7 @@ impl TxStageKind {
             Self::Sealed => 2,
             Self::Executed => 4,
             Self::Rejected => 8,
+            Self::Accepted => 16,
         }
     }
 }
@@ -110,6 +129,7 @@ impl TxStage {
             Self::Sealed => TxStageKind::Sealed,
             Self::Executed { .. } => TxStageKind::Executed,
             Self::Rejected { .. } => TxStageKind::Rejected,
+            Self::Accepted { .. } => TxStageKind::Accepted,
         }
     }
 
@@ -119,7 +139,8 @@ impl TxStage {
         match self {
             Self::Offered { sender, nonce }
             | Self::Executed { sender, nonce, .. }
-            | Self::Rejected { sender, nonce, .. } => Some((*sender, *nonce)),
+            | Self::Rejected { sender, nonce, .. }
+            | Self::Accepted { sender, nonce } => Some((*sender, *nonce)),
             Self::Sealed => None,
         }
     }
@@ -167,6 +188,15 @@ impl TxStatus {
                 nonce: error.nonce,
                 reason: error.reason.clone(),
             },
+        }
+    }
+
+    /// The sequencer took the transaction into its mempool.
+    #[must_use]
+    pub const fn accepted(tx_hash: B256, sender: Address, nonce: u64) -> Self {
+        Self {
+            tx_hash,
+            stage: TxStage::Accepted { sender, nonce },
         }
     }
 

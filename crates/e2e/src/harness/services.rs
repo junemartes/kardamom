@@ -133,9 +133,10 @@ pub struct ServiceSpec<'a> {
     pub log_config: Option<&'a Path>,
     /// Run every sequencer on the v2 loop (the `[admission]` section).
     pub admission: bool,
-    /// With `admission`: the sequencers send each receipt to the ingress of
-    /// its transaction, and the ingress reads its `tx_verdicts` stream in
-    /// place of `tx_receipts`.
+    /// With `admission`: the sequencers send the verdict of each
+    /// transaction to its ingress, and `eth_sendRawTransaction` answers on
+    /// it, at admission. The ingress reads its `tx_verdicts` stream and no
+    /// receipts.
     pub verdicts: bool,
 }
 
@@ -886,8 +887,8 @@ pub fn spawn_ingress_at(
             "--executor-query-endpoints",
             &format!("http://{}", spec.executor_query),
         ]);
-    // The v2 sequencers check each sender, and the local account layer of
-    // the ingress gets no rows from its verdict stream.
+    // The v2 sequencers check each sender, and the ingress reads no
+    // receipts: its local account layer gets no rows.
     if spec.verdicts {
         cmd.args(["--verdicts", "true", "--admission-checks", "false"]);
     }

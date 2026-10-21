@@ -71,7 +71,7 @@ The streams and their publishers:
 
 The `exec_txs` stream carries the transactions that an executor joins, in canonical order: one `ExecTxRecord` for each `TxRef`.
 
-The `tx_verdicts` stream carries the receipts of the transactions of one ingress, in the frame format of `tx_receipts`, with no account rows. The stream of ingress `i` has the id `tx_verdicts_stream_id_base + i` (3000 + i by default), so `i` is at most 255 and each ingress joins only its own stream. A sequencer opens the publication of an ingress on its first verdict for it. Each offer is best effort: the Aeron thread holds a refused frame until the offer deadline, so the first verdicts wait for the image of the ingress to connect. A frame past the deadline drops, and the client waits until the timeout of its ingress.
+The `tx_verdicts` stream carries the verdict of the sequencer for each transaction of one ingress: one `TxStatus` record, `Accepted` or `Rejected` with the reason. The ingress answers `eth_sendRawTransaction` on it. The stream of ingress `i` has the id `tx_verdicts_stream_id_base + i` (3000 + i by default), so `i` is at most 255 and each ingress joins only its own stream. A sequencer opens the publication of an ingress on its first verdict for it. Each offer is best effort: the Aeron thread holds a refused frame until the offer deadline, so the first verdicts wait for the image of the ingress to connect. A frame past the deadline drops, and the client gets the ack timeout of its ingress.
 
 - The stream id is 1005. The channel and the stream id are the keys `exec_txs_channel` and `exec_txs_stream_id` of `[channels]`.
 - Each executor opens two publications on stream 1005. One publisher thread writes both, in the same order:

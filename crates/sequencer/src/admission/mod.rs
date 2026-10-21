@@ -53,7 +53,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::{Duration, Instant};
 
 use alloy_primitives::map::HashMap;
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 
 use self::sender::SenderState;
 
@@ -115,13 +115,42 @@ pub struct ImagePos {
 pub struct Candidate<T> {
     pub sender: Address,
     pub nonce: u64,
+    pub tx_hash: B256,
     /// The most the transaction can be charged: gas limit times fee cap, plus value.
     pub cost: U256,
     pub image: ImagePos,
     /// The id of the ingress that published the transaction: the top 16
     /// bits of its correlation id.
     pub ingress: u16,
+    /// The client has its answer: the filter took the transaction into its
+    /// mempool before, with an [`Verdict::Accept`]. A later verdict of the
+    /// transaction is not an answer to the client. The caller sets it to
+    /// `false`.
+    pub answered: bool,
     pub payload: T,
+}
+
+/// The ack of one transaction that the filter took into its mempool, for
+/// the ingress that published it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ack {
+    pub ingress: u16,
+    pub sender: Address,
+    pub nonce: u64,
+    pub tx_hash: B256,
+}
+
+impl<T> Candidate<T> {
+    /// Mark the candidate answered, and return its ack. A candidate that
+    /// has its answer gives none.
+    pub fn answer(&mut self) -> Option<Ack> {
+        (!std::mem::replace(&mut self.answered, true)).then_some(Ack {
+            ingress: self.ingress,
+            sender: self.sender,
+            nonce: self.nonce,
+            tx_hash: self.tx_hash,
+        })
+    }
 }
 
 /// Why the filter refused a transaction.
@@ -150,6 +179,9 @@ pub enum Verdict<T> {
     /// The filter holds no state of the sender: ask Redis, then the
     /// executor, and give the answer to [`Admission::on_lookup`].
     Lookup(Address),
+    /// The filter holds the transaction for a nonce gap or a busy run: it is
+    /// in the mempool, so tell the client.
+    Accept(Ack),
 }
 
 /// A forwarded transaction, in forward order, for the loss expiry. `block`
@@ -318,14 +350,6 @@ impl<T> Admission<T> {
         out.extend(asked.map(Verdict::Lookup));
     }
 
-    /// The ingress that published the forwarded transaction of `sender` at
-    /// `nonce`, while no state confirmed it. Read it before the rows of the
-    /// same block apply: they confirm the transaction.
-    #[must_use]
-    pub fn ingress_of(&self, sender: Address, nonce: u64) -> Option<u16> {
-        self.senders.get(&sender)?.ingress_of(nonce)
-    }
-
     /// The executor rolled back: every state may name void blocks. Each
     /// sender asks again on its next transaction. The forwarded runs and
     /// the parked transactions stay.
@@ -388,7 +412,7 @@ impl<T> Admission<T> {
                     sender: c.sender,
                     nonce: c.nonce,
                 }),
-                Verdict::Reject(..) | Verdict::Lookup(_) => None,
+                Verdict::Reject(..) | Verdict::Lookup(_) | Verdict::Accept(_) => None,
             }));
     }
 }

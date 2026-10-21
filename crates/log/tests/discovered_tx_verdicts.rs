@@ -1,6 +1,6 @@
 //! Real-Aeron check of the `tx_verdicts` addressing over the in-memory
 //! catalog: a sequencer publishes to two ingress ids, and each ingress
-//! receives only the receipts of its own id.
+//! receives only the verdicts of its own id.
 //!
 //! Gated on the `docker-e2e` feature and on Docker availability.
 
@@ -10,14 +10,13 @@ use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
-use kardamom_log::aeron_live::{
-    AeronRuntime, TxReceiptsSubscriberHandle, TxVerdictsPublisherHandle,
-};
+use alloy_primitives::{Address, B256};
+use kardamom_log::aeron_live::{AeronRuntime, TxStatusSubscriberHandle, TxVerdictsPublisherHandle};
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::memory::MemoryCatalog;
 use kardamom_log::discovery::{Catalog, Instance, StreamPlane};
 use kardamom_log::testing::{AeronTestCluster, SingleNodeRig};
-use kardamom_types::{Receipt, ReceiptBatch};
+use kardamom_types::TxStatus;
 
 fn config(base: &LogConfig) -> LogConfig {
     let mut cfg = base.clone();
@@ -44,33 +43,21 @@ fn plane(cfg: &LogConfig, label: &str, catalog: &MemoryCatalog) -> StreamPlane {
     )
 }
 
-fn verdict(nonce: u64) -> ReceiptBatch {
-    ReceiptBatch {
-        receipts: vec![Receipt {
-            nonce,
-            ..Receipt::default()
-        }],
-        accounts: Vec::new(),
-    }
+fn verdict(nonce: u64) -> TxStatus {
+    TxStatus::accepted(B256::ZERO, Address::ZERO, nonce)
 }
 
 /// The nonces that `sub` receives within `budget`.
-async fn nonces_within(sub: &mut TxReceiptsSubscriberHandle, budget: Duration) -> Vec<u64> {
+async fn nonces_within(sub: &mut TxStatusSubscriberHandle, budget: Duration) -> Vec<u64> {
     let deadline = Instant::now() + budget;
     let mut seen = Vec::new();
-    while let Ok(Some((_, frame))) = tokio::time::timeout(
+    while let Ok(Some((_, status))) = tokio::time::timeout(
         deadline.saturating_duration_since(Instant::now()),
-        sub.recv_frame(),
+        sub.recv(),
     )
     .await
     {
-        seen.extend(
-            frame
-                .into_batch()
-                .into_iter()
-                .flat_map(|b| b.receipts)
-                .map(|r| r.nonce),
-        );
+        seen.extend(status.identity().map(|(_, nonce)| nonce));
     }
     seen
 }
@@ -79,13 +66,13 @@ async fn nonces_within(sub: &mut TxReceiptsSubscriberHandle, budget: Duration) -
 /// drops the frames that precede the join of the subscriber.
 async fn deliver(
     publisher: &TxVerdictsPublisherHandle,
-    sub: &mut TxReceiptsSubscriberHandle,
+    sub: &mut TxStatusSubscriberHandle,
     nonce: u64,
 ) -> Vec<u64> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut seen = Vec::new();
     while Instant::now() < deadline && !seen.contains(&nonce) {
-        publisher.publish_receipts(&verdict(nonce)).expect("encode");
+        publisher.publish_status(&verdict(nonce)).expect("encode");
         seen.extend(nonces_within(sub, Duration::from_millis(200)).await);
     }
     seen

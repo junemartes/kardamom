@@ -29,7 +29,9 @@ use clap::Parser;
 use kardamom_cache::{ExecutorQueryConfig, LiveAccountsConfig};
 use kardamom_ingress::aeron_adapters::{LiveIngressPublication, LiveIngressSubscription};
 use kardamom_ingress::cluster::cluster_watermark_observer;
-use kardamom_ingress::config::{DEFAULT_MAX_TX_BYTES, IngressConfig, IngressFileConfig};
+use kardamom_ingress::config::{
+    AdmissionAck, DEFAULT_MAX_TX_BYTES, IngressConfig, IngressFileConfig,
+};
 use kardamom_ingress::proxy::{IngressHandle, IngressProxy};
 use kardamom_ingress::stage_latency::{StageClock, StageClocks, StageStamps};
 use kardamom_log::aeron_live::{
@@ -230,11 +232,13 @@ struct Args {
     /// ms. Defaults to `LiveAccountsConfig::default`.
     #[arg(long = "live-accounts-ttl-ms", env = "KARDAMOM_LIVE_ACCOUNTS_TTL_MS")]
     live_accounts_ttl_ms: Option<NonZeroU64>,
-    /// Read the receipts of this ingress's own transactions from its
-    /// `tx_verdicts` stream, which the v2 sequencers fill, in place of the
-    /// whole `tx_receipts` stream. The ingress id must be at most 255. The
-    /// local account layer then gets no rows, so `--admission-checks` must
-    /// be `false`: the v2 sequencers check each sender.
+    /// The ack at admission: `eth_sendRawTransaction` answers when the v2
+    /// sequencer that owns the sender takes the transaction into its
+    /// mempool, as on Ethereum. The answer comes on this ingress's
+    /// `tx_verdicts` stream, and the ingress reads no receipts. The ingress
+    /// id must be at most 255. The local account layer then gets no rows,
+    /// so `--admission-checks` must be `false`: the v2 sequencers check
+    /// each sender.
     #[arg(
         long,
         env = "KARDAMOM_INGRESS_VERDICTS",
@@ -242,6 +246,13 @@ struct Args {
         action = clap::ArgAction::Set
     )]
     verdicts: bool,
+    /// With `--verdicts`, the time a submission waits for a verdict, in ms.
+    #[arg(long, env = "KARDAMOM_INGRESS_ACK_TIMEOUT_MS", default_value_t = 2_000)]
+    ack_timeout_ms: u64,
+    /// With `--verdicts`, the sequencers of each lane that send a verdict.
+    /// A rejection of every one of them answers at once.
+    #[arg(long, env = "KARDAMOM_INGRESS_TWINS", default_value_t = std::num::NonZeroU8::new(2).unwrap_or(std::num::NonZeroU8::MIN))]
+    twins: std::num::NonZeroU8,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -326,6 +337,11 @@ impl IngressService {
             mirror_count: self.executor_count().unwrap_or(NonZeroU32::MIN),
             inclusion_horizon_blocks: args.inclusion_horizon_blocks,
             max_tx_bytes: args.max_tx_bytes,
+            admission_ack: args.verdicts.then(|| AdmissionAck {
+                timeout: Duration::from_millis(args.ack_timeout_ms),
+                twins: args.twins,
+                ..AdmissionAck::default()
+            }),
             ..IngressConfig::default()
         };
         cfg.binary_tcp_bind = None;

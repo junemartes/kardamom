@@ -12,8 +12,16 @@ use super::{AccountState, AdmissionConfig, Candidate, Refusal, Verdict};
 struct Forwarded {
     /// Its worst-case cost.
     cost: U256,
-    /// The ingress that published it.
-    ingress: u16,
+}
+
+/// When a parked transaction gets its ack.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// Now: the state of the sender is known, and the transaction waits
+    /// for a nonce gap or a busy run.
+    Accept,
+    /// When the state of the sender comes: a lookup is out.
+    Wait,
 }
 
 pub(super) struct SenderState<T> {
@@ -83,7 +91,7 @@ impl<T> SenderState<T> {
             return false;
         }
         if c.nonce > next {
-            return self.park(c, cfg, out);
+            return self.park(c, Answer::Accept, cfg, out);
         }
         let parked = self.forward_or_park(c, &state, cfg, out);
         while self.release_one(cfg, out) {}
@@ -123,6 +131,18 @@ impl<T> SenderState<T> {
             )
         }));
         while self.release_one(cfg, out) {}
+        self.accept_parked(out);
+    }
+
+    /// Accept the parked transactions that waited for a state with no
+    /// answer: the state came, and they still wait for a nonce gap.
+    fn accept_parked(&mut self, out: &mut Vec<Verdict<T>>) {
+        out.extend(
+            self.parked
+                .values_mut()
+                .filter_map(Candidate::answer)
+                .map(Verdict::Accept),
+        );
     }
 
     /// The forwarded transaction at `nonce` is lost if the run still holds
@@ -206,13 +226,6 @@ impl<T> SenderState<T> {
         nonce >= self.first && nonce - self.first < self.forwarded.len() as u64
     }
 
-    /// The ingress that published the forwarded transaction at `nonce`, while
-    /// no state confirmed it.
-    pub(super) fn ingress_of(&self, nonce: u64) -> Option<u16> {
-        let offset = usize::try_from(nonce.checked_sub(self.first)?).ok()?;
-        self.forwarded.get(offset).map(|f| f.ingress)
-    }
-
     /// Drop the first forwarded transaction when the chain is past it.
     fn confirm_one(&mut self, chain_nonce: u64) -> bool {
         if self.forwarded.is_empty() || self.first >= chain_nonce {
@@ -233,7 +246,7 @@ impl<T> SenderState<T> {
         out: &mut Vec<Verdict<T>>,
     ) -> bool {
         let sender = c.sender;
-        let parked = self.park(c, cfg, out);
+        let parked = self.park(c, Answer::Wait, cfg, out);
         if parked && !self.asked {
             self.asked = true;
             out.push(Verdict::Lookup(sender));
@@ -241,7 +254,16 @@ impl<T> SenderState<T> {
         parked
     }
 
-    fn park(&mut self, c: Candidate<T>, cfg: &AdmissionConfig, out: &mut Vec<Verdict<T>>) -> bool {
+    /// Park a transaction. With [`Answer::Accept`] the client gets its ack
+    /// now, once; with [`Answer::Wait`] it waits for the state of the
+    /// sender ([`Self::accept_parked`]).
+    fn park(
+        &mut self,
+        mut c: Candidate<T>,
+        answer: Answer,
+        cfg: &AdmissionConfig,
+        out: &mut Vec<Verdict<T>>,
+    ) -> bool {
         let expected_nonce = self.expected_nonce();
         if self.parked.contains_key(&c.nonce) {
             out.push(Verdict::Reject(c, Refusal::InFlight { expected_nonce }));
@@ -253,6 +275,9 @@ impl<T> SenderState<T> {
                 Refusal::TooManyPending { expected_nonce },
             ));
             return false;
+        }
+        if answer == Answer::Accept {
+            out.extend(c.answer().map(Verdict::Accept));
         }
         self.parked.insert(c.nonce, c);
         true
@@ -275,7 +300,7 @@ impl<T> SenderState<T> {
         out: &mut Vec<Verdict<T>>,
     ) -> bool {
         if self.busy(state, cfg) {
-            return self.park(c, cfg, out);
+            return self.park(c, Answer::Accept, cfg, out);
         }
         let available = state.balance.saturating_sub(self.spend);
         if available < c.cost {
@@ -289,10 +314,7 @@ impl<T> SenderState<T> {
         if self.forwarded.is_empty() {
             self.first = c.nonce;
         }
-        self.forwarded.push_back(Forwarded {
-            cost: c.cost,
-            ingress: c.ingress,
-        });
+        self.forwarded.push_back(Forwarded { cost: c.cost });
         self.spend = self.spend.saturating_add(c.cost);
         out.push(Verdict::Forward(c));
         false

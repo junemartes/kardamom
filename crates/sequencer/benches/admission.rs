@@ -94,6 +94,7 @@ impl Lane {
             Candidate {
                 sender: self.senders[i],
                 nonce,
+                tx_hash: alloy_primitives::B256::ZERO,
                 cost: U256::from(COST),
                 image: ImagePos {
                     lane: 0,
@@ -101,6 +102,7 @@ impl Lane {
                     unit: self.unit,
                 },
                 ingress: 0,
+                answered: false,
                 payload: nonce,
             },
             &mut self.out,
