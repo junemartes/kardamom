@@ -129,6 +129,14 @@ struct Cli {
     #[arg(long, env = "KARDAMOM_VOID_VOTER_ID")]
     void_voter_id: Option<u8>,
 
+    /// Read the canonical stream from the egress at this base URL
+    /// (`http://host:port`), with its bytes, in place of the cluster egress
+    /// and the `tx_data` lanes. The batcher keeps a cluster session only to
+    /// send its posted cursor. Set it only on a chain where the carry flag
+    /// is active.
+    #[arg(long, env = "KARDAMOM_EGRESS_URL")]
+    egress: Option<String>,
+
     /// The UDP endpoint on this node where refetched `tx_data` and
     /// `tx_deposits` fragments land (join-miss recovery from the remote
     /// durability archives). If unset, refetch is disabled, and a lost
@@ -391,6 +399,7 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         aeron_dir: cli.aeron_dir.clone(),
         cluster_egress_endpoint: cli.cluster_egress_endpoint.clone(),
         void_voter_id: cli.void_voter_id,
+        egress: cli.egress.clone(),
         replay_destination_endpoint: cli.replay_destination_endpoint.clone(),
         archive_control_response_endpoint: cli.archive_control_response_endpoint.clone(),
         blocks_per_batch: cli.blocks_per_batch,

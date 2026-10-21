@@ -57,6 +57,12 @@ pub(crate) struct Args {
     /// Optional `LogConfig` TOML supplying the Aeron `[channels]` config.
     #[arg(long, env = "KARDAMOM_LOG_CONFIG")]
     pub(crate) log_config: Option<PathBuf>,
+    /// Read the canonical stream from the egress at this base URL
+    /// (`http://host:port`), with its bytes, in place of the cluster egress
+    /// and the `tx_data` lanes. Set it only on a chain where the carry flag
+    /// is active: a reference without bytes then has nothing to join.
+    #[arg(long, env = "KARDAMOM_EGRESS_URL")]
+    pub(crate) egress: Option<String>,
     /// Aeron Media Driver directory (`aeron.dir`).
     #[arg(long)]
     pub(crate) aeron_dir: Option<PathBuf>,

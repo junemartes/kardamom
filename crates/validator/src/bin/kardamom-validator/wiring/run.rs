@@ -127,7 +127,7 @@ impl ExecPorts for ValidatorWiring {
 
 impl EngineWiring for ValidatorWiring {
     type TxData = bin_support::LiveTxDataSub;
-    type TxOrdering = bin_support::LiveTxOrderingSub;
+    type TxOrdering = bin_support::LiveOrdering;
     type TxReceipts = TxReceiptsChain;
     // The validator publishes no executor stream.
     type ExecStream = kardamom_engine::NoExecStream;
@@ -375,7 +375,7 @@ impl Ready {
             streams: bin_support::LiveStreams {
                 stop: stop.drop_guard(),
                 rt,
-                cluster_guard: Some(cluster_guard),
+                cluster_guard,
             },
             plane,
             writer,

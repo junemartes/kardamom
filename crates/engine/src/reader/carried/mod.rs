@@ -17,6 +17,7 @@
 
 mod answer;
 mod compare;
+mod egress;
 mod feed;
 #[cfg(all(test, feature = "docker-e2e"))]
 mod feed_tests;
@@ -36,6 +37,7 @@ use std::time::{Instant, SystemTime};
 use kardamom_types::BPosition;
 
 pub use compare::{LocalHistory, PublishedTail};
+pub use egress::EgressTransport;
 pub use feed::AeronFeed;
 pub use transport::{NoSource, Poll, Request, Transport};
 

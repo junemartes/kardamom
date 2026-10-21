@@ -115,6 +115,28 @@ impl StreamPlane {
         }
     }
 
+    /// The `egress_order` subscription of a reader of the egress: the
+    /// frames of every egress instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription fails to open.
+    pub fn egress_order_subscription(
+        &mut self,
+        rt: &AeronRuntime,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<crate::aeron_live::RawFrame>, LogError> {
+        let key = self.egress_order_key();
+        match &mut self.discovered {
+            None => Ok(rt
+                .open_subscription_raw(
+                    &self.channels.egress_order_channel,
+                    self.channels.egress_order_stream_id,
+                )?
+                .1),
+            Some(d) => d.open_raw_subscription(rt, key),
+        }
+    }
+
     fn egress_order_key(&self) -> StreamKey {
         StreamKey {
             topic: Topic::EgressOrder,

@@ -40,9 +40,14 @@ pub enum StoreError {
 /// What a reader that resumes from a cursor gets.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Range {
-    /// The frames after the cursor, up to the limit, and the head of the
-    /// store when the read ended.
-    Frames { frames: Vec<Vec<u8>>, head: Head },
+    /// The frames after the cursor, up to the limit, the cursor after the
+    /// last of them, and the head of the store when the read ended. A
+    /// reader that resumes asks again from `after` until it reaches `head`.
+    Frames {
+        frames: Vec<Vec<u8>>,
+        after: Head,
+        head: Head,
+    },
     /// The store holds nothing that old: its oldest segment starts at
     /// `floor`.
     Unavailable { floor: Head },
@@ -156,8 +161,13 @@ impl Store {
         self.segments[at..].iter().try_for_each(|segment| {
             Self::read_after(segment, cursor, &mut frames, &mut bytes, limit)
         })?;
+        let after = frames.iter().fold(cursor, |mut after, frame| {
+            after.advance(frame);
+            after
+        });
         Ok(Range::Frames {
             frames,
+            after,
             head: self.head,
         })
     }

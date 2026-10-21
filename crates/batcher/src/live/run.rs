@@ -22,6 +22,7 @@ use tracing::{info, warn};
 
 use kardamom_engine::ExecutorError;
 use kardamom_engine::bin_support;
+use kardamom_engine::reader::cluster::PostedCursorPublisher;
 use kardamom_engine::reader::{
     JoinBuffer, JoinRecoveryFactory, NoExecStream, ReaderConfig, ReaderToExec, TxDataReader,
     TxOrderingInputs, TxOrderingReader,
@@ -132,6 +133,9 @@ pub struct LiveArgs {
     /// This batcher's voter id at the sealer; see
     /// [`ReaderConfig::voter_id`]. `None` never votes.
     pub void_voter_id: Option<u8>,
+    /// Read the canonical stream from the egress at this base URL, not from
+    /// the cluster egress.
+    pub egress: Option<String>,
     pub replay_destination_endpoint: Option<String>,
     pub archive_control_response_endpoint: Option<String>,
     pub blocks_per_batch: NonZeroUsize,
@@ -295,24 +299,20 @@ impl RunConfig {
         cursor: BatchCursor,
     ) -> Result<ReaderStack<impl Send + use<>>> {
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
-        let tx_data_subs = bin_support::open_tx_data_subs(&rt, &mut self.plane)?;
-        let join_recovery = self.join_recovery(args);
-
-        // A dedicated cluster runtime, exactly as in the executor and
-        // validator. The cluster session must never contend with the
-        // tx_data work on `rt`.
-        let (cluster_guard, cluster_sub) = bin_support::connect_cluster_ordering(
-            args.aeron_dir.as_deref(),
-            self.file_cfg.cluster.to_live(),
-            kardamom_engine::reader::cluster::ReplayCursor::new(
-                cursor.next_index,
-                cursor.next_block,
-            ),
-        )?;
-        // The kardamom_sealer_* re-export is the executor's job.
-        let tx_ordering_sub = cluster_sub.suppress_sealer_metrics();
-        let posted_cursor = PostedCursor::new(tx_ordering_sub.posted_cursor_publisher());
-        info!("kardamom-batcher: tx_ordering via Aeron Cluster");
+        let replay_cursor = kardamom_engine::reader::cluster::ReplayCursor::new(
+            cursor.next_index,
+            cursor.next_block,
+        );
+        let Ordering {
+            tx_data_subs,
+            join_recovery,
+            cluster_guard,
+            tx_ordering_sub,
+            posted_cursor,
+        } = match &args.egress {
+            Some(base) => self.egress_ordering(args, &rt, base, replay_cursor)?,
+            None => self.cluster_ordering(args, &rt, replay_cursor)?,
+        };
 
         let join_buffer = JoinBuffer::new();
         let join_handles = tx_data_subs
@@ -353,6 +353,72 @@ impl RunConfig {
             },
             feed_rx,
             posted_cursor,
+        })
+    }
+}
+
+/// The ordering source of the reader stack, and what goes with it.
+struct Ordering {
+    tx_data_subs: Vec<bin_support::LiveTxDataSub>,
+    join_recovery: Option<JoinRecoveryFactory>,
+    cluster_guard: bin_support::LiveClusterGuard,
+    tx_ordering_sub: bin_support::LiveOrdering,
+    posted_cursor: PostedCursor,
+}
+
+impl RunConfig {
+    /// The references of the cluster egress, joined with `tx_data`, and the
+    /// posted cursor over the same cluster session.
+    fn cluster_ordering(
+        &mut self,
+        args: &LiveArgs,
+        rt: &AeronRuntime,
+        cursor: kardamom_engine::reader::cluster::ReplayCursor,
+    ) -> Result<Ordering> {
+        let tx_data_subs = bin_support::open_tx_data_subs(rt, &mut self.plane)?;
+        let join_recovery = self.join_recovery(args);
+        // A dedicated cluster runtime, exactly as in the executor and
+        // validator. The cluster session must never contend with the
+        // tx_data work on `rt`.
+        let (cluster_guard, cluster_sub) = bin_support::connect_cluster_ordering(
+            args.aeron_dir.as_deref(),
+            self.file_cfg.cluster.to_live(),
+            cursor,
+        )?;
+        // The kardamom_sealer_* re-export is the executor's job.
+        let cluster_sub = cluster_sub.suppress_sealer_metrics();
+        let posted_cursor = PostedCursor::new(cluster_sub.posted_cursor_publisher());
+        info!("kardamom-batcher: tx_ordering via Aeron Cluster");
+        Ok(Ordering {
+            tx_data_subs,
+            join_recovery,
+            cluster_guard,
+            tx_ordering_sub: bin_support::LiveOrdering::Cluster(cluster_sub),
+            posted_cursor,
+        })
+    }
+
+    /// The entries with their bytes, from the egress at `base`, and the
+    /// posted cursor over a cluster session that only publishes.
+    fn egress_ordering(
+        &mut self,
+        args: &LiveArgs,
+        rt: &AeronRuntime,
+        base: &str,
+        cursor: kardamom_engine::reader::cluster::ReplayCursor,
+    ) -> Result<Ordering> {
+        let sub = bin_support::open_egress(rt, &mut self.plane, base.to_owned(), cursor)?;
+        let (cluster_guard, ingress) = bin_support::connect_cluster_publisher(
+            args.aeron_dir.as_deref(),
+            self.file_cfg.cluster.to_live(),
+        )?;
+        info!(%base, "kardamom-batcher: the canonical stream via the egress");
+        Ok(Ordering {
+            tx_data_subs: Vec::new(),
+            join_recovery: None,
+            cluster_guard,
+            tx_ordering_sub: bin_support::LiveOrdering::Egress(Box::new(sub)),
+            posted_cursor: PostedCursor::new(PostedCursorPublisher::new(ingress)),
         })
     }
 }

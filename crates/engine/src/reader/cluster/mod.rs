@@ -192,6 +192,12 @@ pub struct PostedCursorPublisher<I: ClusterIngress> {
 }
 
 impl<I: ClusterIngress> PostedCursorPublisher<I> {
+    /// A publisher over `ingress`, a session that reads no canonical
+    /// stream.
+    pub fn new(ingress: I) -> Self {
+        Self { ingress }
+    }
+
     /// Offer `posted_head` to the sealer. A refused offer is the
     /// caller's to retry: the next confirmed post publishes again, and
     /// the sealer sends its status to a session that announces itself.

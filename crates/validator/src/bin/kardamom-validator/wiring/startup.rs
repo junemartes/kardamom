@@ -282,6 +282,7 @@ impl Opened {
                 cursor: bin_support::cluster_replay_cursor(&self.state.start),
                 bin_name: "kardamom-validator",
                 suppress_sealer_metrics: true,
+                egress: args.egress.clone(),
             })?;
 
         // --- Verification streams: tx_bal (BAL) and tx_receipts. ---
@@ -370,7 +371,9 @@ impl Opened {
 /// [`Opened::open_streams`] adds.
 pub(crate) struct StreamsState {
     pub(super) inbound: kardamom_engine::Inbound<super::run::ValidatorWiring>,
-    pub(super) cluster_guard: LiveCluster,
+    /// The cluster session of the ordering. `None` when the validator reads
+    /// the egress.
+    pub(super) cluster_guard: Option<LiveCluster>,
     pub(super) divergence: Arc<Divergence>,
     pub(super) bals: Arc<BalBuffer>,
     pub(super) claims: Arc<ClaimBuffer>,

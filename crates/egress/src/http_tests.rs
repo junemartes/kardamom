@@ -83,6 +83,8 @@ async fn a_range_read_answers_the_frames_after_the_cursor_and_the_head() {
     let header = |name: &str| response.headers()[name].to_str().unwrap().to_owned();
     assert_eq!(header("x-egress-next-index"), "2");
     assert_eq!(header("x-egress-next-block"), "2");
+    assert_eq!(header("x-egress-after-index"), "2");
+    assert_eq!(header("x-egress-after-block"), "2");
     let body = response.bytes().await.unwrap();
     assert_eq!(frames_of(&body), frames[1..]);
 }

@@ -57,11 +57,17 @@ fn a_reader_gets_the_frames_after_its_cursor_across_segments() {
     let all = blocks(5);
     store.append(&all).unwrap();
     // The cursor after block 1 and record 2: the rest of block 2 on.
-    let Range::Frames { frames, head } = store.read_from(3, 2, usize::MAX).unwrap() else {
+    let Range::Frames {
+        frames,
+        after,
+        head,
+    } = store.read_from(3, 2, usize::MAX).unwrap()
+    else {
         panic!("the store holds the cursor");
     };
     assert_eq!(frames, all[4..]);
     assert_eq!(head, store.head());
+    assert_eq!(after, head, "the read reached the head");
 }
 
 #[test]
@@ -69,10 +75,15 @@ fn a_reader_gets_at_most_about_the_limit() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
     store.append(&blocks(3)).unwrap();
-    let Range::Frames { frames, .. } = store.read_from(0, 1, 1).unwrap() else {
+    let Range::Frames { frames, after, .. } = store.read_from(0, 1, 1).unwrap() else {
         panic!("the store holds the cursor");
     };
     assert_eq!(frames, [record(0)], "one frame passes a limit of one byte");
+    assert_eq!(
+        (after.next_index, after.next_block),
+        (1, 1),
+        "the next read starts after record 0"
+    );
 }
 
 #[test]
