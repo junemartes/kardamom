@@ -64,6 +64,17 @@ pub const SEAL_STAMPS_EXPIRED_TOTAL: &str = "kardamom_ingress_seal_stamps_expire
 /// The publish stamps that the submit path dropped because the channel to
 /// the seal clock was full. Each one is a seal with no latency sample.
 pub const SEAL_STAMPS_DROPPED_TOTAL: &str = "kardamom_ingress_seal_stamps_dropped_total";
+/// The time from the publish of a transaction on `tx_data` to the first
+/// executor receipt for it, in seconds. Only the ingress that published
+/// the transaction records it.
+pub const EXECUTE_LATENCY_SECONDS: &str = "kardamom_ingress_execute_latency_seconds";
+/// The publish stamps that no receipt matched within the age bound of the
+/// executed clock. A non-zero rate under load means that the histogram
+/// undercounts the tail.
+pub const EXECUTE_STAMPS_EXPIRED_TOTAL: &str = "kardamom_ingress_execute_stamps_expired_total";
+/// The publish stamps that the submit path dropped because the channel to
+/// the executed clock was full.
+pub const EXECUTE_STAMPS_DROPPED_TOTAL: &str = "kardamom_ingress_execute_stamps_dropped_total";
 /// 0 while the proxy serves, 1 from the first moment of the shutdown
 /// drain. The readiness rule requires 0: a draining replica refuses new
 /// submits, so a health check must take it out of rotation at once. The
@@ -114,6 +125,19 @@ pub fn describe() {
     metrics::describe_counter!(
         SEAL_STAMPS_EXPIRED_TOTAL,
         "publish stamps that no seal matched within the age bound of the seal clock; the seal latency histogram has no sample for them"
+    );
+    metrics::describe_histogram!(
+        EXECUTE_LATENCY_SECONDS,
+        metrics::Unit::Seconds,
+        "time from the tx_data publish to the first executor receipt for the transaction"
+    );
+    metrics::describe_counter!(
+        EXECUTE_STAMPS_DROPPED_TOTAL,
+        "publish stamps dropped because the channel to the executed clock was full; the execute latency histogram has no sample for them"
+    );
+    metrics::describe_counter!(
+        EXECUTE_STAMPS_EXPIRED_TOTAL,
+        "publish stamps that no receipt matched within the age bound of the executed clock; the execute latency histogram has no sample for them"
     );
     metrics::describe_gauge!(DRAINING, "1 while the shutdown drain refuses new submits");
     metrics::describe_gauge!(
@@ -230,6 +254,9 @@ mod tests {
             SEAL_LATENCY_SECONDS,
             SEAL_STAMPS_EXPIRED_TOTAL,
             SEAL_STAMPS_DROPPED_TOTAL,
+            EXECUTE_LATENCY_SECONDS,
+            EXECUTE_STAMPS_EXPIRED_TOTAL,
+            EXECUTE_STAMPS_DROPPED_TOTAL,
         ] {
             assert!(
                 name.starts_with("kardamom_ingress_"),

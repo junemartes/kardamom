@@ -174,6 +174,8 @@ locals {
     "kardamom-da",
     "kardamom-l1-follower",
     "kardamom-canary",
+    "kardamom-performance",
+    "kardamom-availability",
   ]
 }
 

@@ -22,26 +22,26 @@ use kardamom_log::aeron_live::{
 use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::events::BoardView;
 use kardamom_types::{
-    BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, ReceiptBatch,
-    ReceiptRollback, TxEnvelope, TxError,
+    BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, Receipt,
+    ReceiptBatch, ReceiptRollback, TxEnvelope, TxError,
 };
 
 use crate::channels::{BUS_CAPACITY, IngressPublication, IngressSubscription, ReceiptItem};
 use crate::error::IngressError;
 use crate::rollback_log::RollbackLog;
-use crate::seal_latency::SealStamps;
+use crate::stage_latency::{StageClock, StageStamps};
 
 // ---------------------------------------------------------------------------
 // IngressPublication adapter over M TxDataPublisherHandle.
 // ---------------------------------------------------------------------------
 
 /// M per-shard `tx_data` publisher handles behind the proxy's
-/// [`IngressPublication`] trait, and the seal stamps of the published
+/// [`IngressPublication`] trait, and the stage stamps of the published
 /// transactions.
 #[derive(Clone)]
 pub struct LiveIngressPublication {
     tx_data: Vec<TxDataPublisherHandle>,
-    stamps: SealStamps,
+    stamps: StageStamps,
 }
 
 impl LiveIngressPublication {
@@ -56,7 +56,7 @@ impl LiveIngressPublication {
         rt: &AeronRuntime,
         plane: &mut StreamPlane,
         lanes: NonZeroU8,
-        stamps: SealStamps,
+        stamps: StageStamps,
     ) -> Result<Self, IngressError> {
         let mut tx_data = Vec::with_capacity(usize::from(lanes.get()));
         for lane in 0..lanes.get() {
@@ -81,8 +81,8 @@ impl IngressPublication for LiveIngressPublication {
             .get(shard)
             .ok_or_else(|| IngressError::Internal(format!("shard {shard} out of range")))?
             .clone();
-        // The stamp comes before the publish, so the egress tap always
-        // has it when the seal arrives.
+        // The stamp comes before the publish, so the egress tap and the
+        // receipt pump always have it when the seal and the receipt arrive.
         self.stamps.stamp(envelope.tx_hash);
         // The Aeron publish blocks through the runtime's command channel.
         // This runs it off the reactor thread, so it does not stall the
@@ -171,9 +171,9 @@ impl_pump_source!(TxReceiptsBoundarySubscriberHandle, BlockBoundary);
 impl_pump_source!(TxErrorsSubscriberHandle, TxError);
 
 /// The `tx_receipts` pump: one batch frame in, its account rows into the
-/// local layer, then its receipts onto the bus, one by one. The rows go
-/// first, so a client its receipt releases sees the new state on its
-/// next submit. A rollback frame goes onto the same bus, so the order of
+/// local layer, then its receipts onto the bus, one by one, each timed by
+/// the executed clock. The rows go first, so a client its receipt
+/// releases sees the new state on its next submit. A rollback frame goes onto the same bus, so the order of
 /// the stream holds. The pump then puts each rollback into the rollback
 /// log, which a reader that lags on the bus reads. `TxReceiptsReceiver` has
 /// no constructor outside the log crate, so [`Self::on_frame`] is the
@@ -182,6 +182,7 @@ struct ReceiptBatchPump {
     writer: LiveAccountsWriter,
     tx: broadcast::Sender<ReceiptItem>,
     log: watch::Sender<RollbackLog>,
+    executed: StageClock,
 }
 
 impl ReceiptBatchPump {
@@ -189,8 +190,14 @@ impl ReceiptBatchPump {
         writer: LiveAccountsWriter,
         tx: broadcast::Sender<ReceiptItem>,
         log: watch::Sender<RollbackLog>,
+        executed: StageClock,
     ) -> Self {
-        Self { writer, tx, log }
+        Self {
+            writer,
+            tx,
+            log,
+            executed,
+        }
     }
 
     /// Start the pump on the runtime. It ends when the source closes, on
@@ -243,9 +250,16 @@ impl ReceiptBatchPump {
         if let Some(end) = batch.end_tx_idx() {
             self.writer.apply(end, &batch.accounts);
         }
-        for receipt in batch.receipts {
-            let _ = self.tx.send(receipt.into());
-        }
+        batch
+            .receipts
+            .into_iter()
+            .for_each(|receipt| self.fan_out(receipt));
+    }
+
+    /// Time one receipt, then put it onto the bus.
+    fn fan_out(&mut self, receipt: Receipt) {
+        self.executed.observe(receipt.tx_hash);
+        let _ = self.tx.send(receipt.into());
     }
 }
 
@@ -273,7 +287,8 @@ impl LiveIngressSubscription {
     /// receipts, boundaries, and `events` follow the plane's transport;
     /// the fsync watermark still opens on its static channel. With
     /// `verdicts`, the receipts are the `tx_verdicts` stream of that
-    /// ingress id.
+    /// ingress id. The receipt pump owns `executed`, the clock of the
+    /// executed stage.
     ///
     /// # Errors
     ///
@@ -286,6 +301,7 @@ impl LiveIngressSubscription {
         executor_count: Option<NonZeroU32>,
         live_cfg: &LiveAccountsConfig,
         verdicts: Option<u8>,
+        executed: StageClock,
     ) -> Result<Self, IngressError> {
         let channels = plane.channels().clone();
         let channels = &channels;
@@ -334,7 +350,7 @@ impl LiveIngressSubscription {
         // `AeronRuntime` clone. Holding one would keep the runtime alive
         // forever; see `TxReceiptsSubscriberHandle::into_receiver`.
         let (rollback_log, rollbacks) = watch::channel(RollbackLog::default());
-        ReceiptBatchPump::new(live_writer, receipts_tx.clone(), rollback_log)
+        ReceiptBatchPump::new(live_writer, receipts_tx.clone(), rollback_log, executed)
             .spawn(receipts_sub.into_receiver());
 
         // Quorum and durable watermark: in the cluster-only topology,
@@ -477,7 +493,12 @@ mod tests {
 
         let (live, writer) = LiveAccounts::new(&LiveAccountsConfig::default());
         let (bus, mut sub) = broadcast::channel::<ReceiptItem>(16);
-        let mut pump = ReceiptBatchPump::new(writer, bus, watch::channel(RollbackLog::default()).0);
+        let mut pump = ReceiptBatchPump::new(
+            writer,
+            bus,
+            watch::channel(RollbackLog::default()).0,
+            StageClock::pair().1.executed,
+        );
         let end = BPosition::from_index(7);
         let receipt = kardamom_types::Receipt {
             tx_idx: end,
@@ -512,7 +533,7 @@ mod tests {
         let (live, writer) = LiveAccounts::new(&LiveAccountsConfig::default());
         let (bus, mut sub) = broadcast::channel::<ReceiptItem>(16);
         let (log, mut log_rx) = watch::channel(RollbackLog::default());
-        let mut pump = ReceiptBatchPump::new(writer, bus, log);
+        let mut pump = ReceiptBatchPump::new(writer, bus, log, StageClock::pair().1.executed);
         let receipt = |block_number| kardamom_types::Receipt {
             block_number,
             ..kardamom_types::Receipt::default()
@@ -567,7 +588,7 @@ mod tests {
     async fn publication_rejects_out_of_range_shard() {
         let publication = LiveIngressPublication {
             tx_data: Vec::new(),
-            stamps: crate::seal_latency::SealClock::pair().0,
+            stamps: StageClock::pair().0,
         };
         let err = publication
             .publish_tx_data(0, TxEnvelope::default())

@@ -31,7 +31,7 @@ use kardamom_ingress::aeron_adapters::{LiveIngressPublication, LiveIngressSubscr
 use kardamom_ingress::cluster::cluster_watermark_observer;
 use kardamom_ingress::config::{DEFAULT_MAX_TX_BYTES, IngressConfig, IngressFileConfig};
 use kardamom_ingress::proxy::{IngressHandle, IngressProxy};
-use kardamom_ingress::seal_latency::{SealClock, SealStamps};
+use kardamom_ingress::stage_latency::{StageClock, StageClocks, StageStamps};
 use kardamom_log::aeron_live::{
     AeronRuntime, ServiceEventsPublisherHandle, TxStatusPublisherHandle,
 };
@@ -414,7 +414,8 @@ impl IngressService {
     async fn open_aeron_side(
         &self,
         live_cfg: &LiveAccountsConfig,
-        stamps: SealStamps,
+        stamps: StageStamps,
+        executed: StageClock,
     ) -> Result<OpenedAeron> {
         let args = &self.args;
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
@@ -456,6 +457,7 @@ impl IngressService {
             executor_count,
             live_cfg,
             verdicts,
+            executed,
         )
         .context("open IngressSubscription")?;
 
@@ -482,7 +484,7 @@ impl IngressService {
         subscription: &LiveIngressSubscription,
         ingress_endpoints: Option<String>,
         status: TxStatusPublisherHandle,
-        seal_clock: SealClock,
+        seal_clock: StageClock,
     ) -> Result<watermark::ClusterWatermark> {
         let args = &self.args;
         let mut live = self.file_cfg.cluster.to_live();
@@ -542,7 +544,7 @@ impl IngressService {
     async fn spawn_egress_tap(
         &self,
         opened: &mut OpenedAeron,
-        seal_clock: SealClock,
+        seal_clock: StageClock,
     ) -> Result<watermark::ClusterWatermark> {
         let members = opened.plane.cluster_ingress_endpoints().await?;
         let status = opened
@@ -578,11 +580,20 @@ impl IngressService {
             "kardamom-ingress starting"
         );
 
-        // The publication stamps each transaction, and the egress tap
-        // records its seal latency. Without a tap nothing reads the
-        // stamps: the full or closed channel drops them.
-        let (stamps, seal_clock) = SealClock::pair();
-        let mut opened = self.open_aeron_side(&cfg.live_accounts, stamps).await?;
+        // The publication stamps each transaction. The egress tap records
+        // its seal latency, and the receipt pump its execute latency.
+        // Without a tap nothing reads the sealed stamps: the full or closed
+        // channel drops them.
+        let (
+            stamps,
+            StageClocks {
+                sealed: seal_clock,
+                executed,
+            },
+        ) = StageClock::pair();
+        let mut opened = self
+            .open_aeron_side(&cfg.live_accounts, stamps, executed)
+            .await?;
         // The egress tap is the `Sealed` publisher of the status stream,
         // and under a quorum policy also the source of the durable
         // watermark. It runs whenever an egress channel is configured. A
