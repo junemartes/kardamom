@@ -9,21 +9,19 @@
 //! - `reversed`: each sender's nonces arrive last first, so each one parks
 //!   until nonce 0 arrives and frees the run.
 //!
-//! A third case, `with_verdicts`, takes the `in_order` input, then the
-//! receipts and the rows of each block, one block for each nonce. The loop
-//! matches each receipt to the ingress of its transaction and queues one
-//! verdict frame for each ingress and block. Eight ingress ids publish the
-//! input.
+//! A third case, `with_verdicts`, takes the `in_order` input with the
+//! verdicts on: the loop queues one verdict for each transaction, to the
+//! ingress that published it. Eight ingress ids publish the input.
 
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::U256;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use kardamom_sequencer::admission::{AccountState, AdmissionConfig};
 use kardamom_sequencer::testkit::{Rig, one_partition_cfg, signed_envelope, signer};
-use kardamom_sequencer::v2::{AccountEvent, AdmissionLoop, V2Config, VerdictOut};
-use kardamom_types::{AccountRow, BPosition, Receipt, TxDataLoc, TxEnvelope};
+use kardamom_sequencer::v2::{AccountEvent, AdmissionLoop, V2Config};
+use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 
 const SENDERS: u64 = 256;
 const NONCES: u64 = 16;
@@ -86,29 +84,6 @@ fn rows(block: u64, nonce: u64) -> AccountEvent {
     AccountEvent::Rows { block, rows }
 }
 
-/// The receipts of every sender at `nonce`, and their rows after it.
-fn receipts(nonce: u64) -> AccountEvent {
-    let senders: Vec<Address> = (1..=SENDERS).map(|n| signer(n).address()).collect();
-    AccountEvent::Receipts {
-        receipts: senders
-            .iter()
-            .map(|&from| Receipt {
-                from,
-                nonce,
-                ..Receipt::default()
-            })
-            .collect(),
-        rows: senders
-            .iter()
-            .map(|&address| AccountRow {
-                address,
-                nonce: nonce + 1,
-                balance: U256::from(10u64).pow(U256::from(24u64)),
-            })
-            .collect(),
-    }
-}
-
 /// A loop whose filter holds a rich row for every sender of the batch,
 /// and the sender side of its account events.
 fn seeded_loop() -> (AdmissionLoop, crossbeam_channel::Sender<AccountEvent>) {
@@ -148,13 +123,10 @@ fn bench_reversed(c: &mut Criterion) {
     bench_order(c, "reversed", |k| NONCES - 1 - k);
 }
 
-/// The input of `in_order`, then the receipts and the rows of one block
-/// for each nonce.
+/// The input of `in_order`, with the verdicts on.
 fn bench_with_verdicts(c: &mut Criterion) {
     let batch = batch(|k| k);
-    let blocks: Vec<(AccountEvent, AccountEvent)> = (0..NONCES)
-        .map(|k| (receipts(k), rows(k + 2, k + 1)))
-        .collect();
+    let total = usize::try_from(SENDERS * NONCES).unwrap();
     let mut group = c.benchmark_group("v2_loop");
     group.throughput(Throughput::Elements(SENDERS * NONCES));
     group.bench_function("with_verdicts", |b| {
@@ -162,52 +134,20 @@ fn bench_with_verdicts(c: &mut Criterion) {
             || {
                 let mut rig = Rig::default();
                 rig.tx_data.queue = batch.clone().into_iter().collect();
-                let (mut l, accounts) = seeded_loop();
-                let (verdicts_tx, verdicts) = tokio::sync::mpsc::channel(1024);
+                let (mut l, _) = seeded_loop();
+                let (verdicts_tx, verdicts) = tokio::sync::mpsc::channel(total);
                 l.enable_verdicts(verdicts_tx);
-                let events = blocks.clone();
-                VerdictRun {
-                    l,
-                    rig,
-                    accounts,
-                    events,
-                    verdicts,
-                }
+                (l, rig, verdicts)
             },
-            VerdictRun::run,
+            |(mut l, mut rig, mut verdicts)| {
+                while l.run_once(&mut rig.ports()).unwrap() {}
+                let sent = std::iter::from_fn(|| verdicts.try_recv().ok()).count();
+                assert_eq!(sent, total, "one verdict for each transaction");
+            },
             BatchSize::SmallInput,
         );
     });
     group.finish();
-}
-
-/// One iteration of `with_verdicts`.
-struct VerdictRun {
-    l: AdmissionLoop,
-    rig: Rig,
-    accounts: crossbeam_channel::Sender<AccountEvent>,
-    events: Vec<(AccountEvent, AccountEvent)>,
-    verdicts: tokio::sync::mpsc::Receiver<VerdictOut>,
-}
-
-impl VerdictRun {
-    /// Offer the batch, then apply each block, then check that every
-    /// receipt went to the ingress of its transaction.
-    fn run(mut self) {
-        while self.l.run_once(&mut self.rig.ports()).unwrap() {}
-        self.events
-            .into_iter()
-            .flat_map(|(receipts, rows)| [receipts, rows])
-            .for_each(|e| self.accounts.send(e).unwrap());
-        self.l.run_once(&mut self.rig.ports()).unwrap();
-        let sent: usize = std::iter::from_fn(|| self.verdicts.try_recv().ok())
-            .map(|frame| match frame {
-                VerdictOut::Receipts { batch, .. } => batch.receipts.len(),
-                VerdictOut::Rollback(_) => 0,
-            })
-            .sum();
-        assert_eq!(sent, usize::try_from(SENDERS * NONCES).unwrap());
-    }
 }
 
 /// Drain the batch through the loop, then check that every transaction

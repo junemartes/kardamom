@@ -114,6 +114,10 @@ pub enum TxErrorReason {
     /// client waits for the receipts of its earlier transactions, then
     /// resubmits.
     NonceInFlight { chain_nonce: u64 },
+    /// The sequencer holds a transaction of the sender at this nonce
+    /// already, in its pending list or its parked list. Ethereum answers a
+    /// copy of a known transaction with `already known`.
+    AlreadyKnown { expected_nonce: u64 },
 }
 
 impl TxErrorReason {
@@ -133,6 +137,7 @@ impl TxErrorReason {
             Self::RecordLag { .. } => "record-lag",
             Self::SealerNonceAhead { .. } => "sealer-nonce-ahead",
             Self::NonceInFlight { .. } => "nonce-in-flight",
+            Self::AlreadyKnown { .. } => "already-known",
         }
     }
 
@@ -147,7 +152,8 @@ impl TxErrorReason {
         match self {
             Self::DuplicatedTx { expected_nonce }
             | Self::Evicted { expected_nonce }
-            | Self::Expired { expected_nonce } => Some(*expected_nonce),
+            | Self::Expired { expected_nonce }
+            | Self::AlreadyKnown { expected_nonce } => Some(*expected_nonce),
             Self::PastDeadline { .. }
             | Self::FeeInvalid { .. }
             | Self::FeeTooLow { .. }

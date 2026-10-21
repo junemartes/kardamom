@@ -3,10 +3,7 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, U256};
 use kardamom_types::shard_map::vslot_for;
-use kardamom_types::{
-    AccountRow, Receipt, ReceiptRollback, TX_TYPE_DEPOSIT, TX_TYPE_LEGACY, TxDataLoc, TxEnvelope,
-    TxErrorReason, TxStageKind,
-};
+use kardamom_types::{TxDataLoc, TxEnvelope, TxErrorReason, TxStageKind};
 
 use super::{AccountEvent, AdmissionLoop, V2Config, VerdictOut};
 use crate::admission::{AccountState, AdmissionConfig};
@@ -231,90 +228,68 @@ fn a_parked_transaction_counts_in_the_depth_of_its_vslot() {
     assert_eq!(rig.offers().len(), 2);
 }
 
-/// A receipt of a forwarded transaction goes to the ingress that published
-/// it. A deposit, a receipt that the rows already confirmed, and a
-/// receipt of another sender go nowhere. A rollback goes to every ingress.
+/// The verdict of each transaction goes to the ingress that published it:
+/// accepted when the filter forwards it or holds it for a gap, rejected
+/// with the reason. A transaction that waits for a lookup gets its verdict
+/// with the answer.
 #[test]
-fn a_receipt_goes_to_the_ingress_of_its_transaction() {
+fn each_transaction_gets_one_verdict_at_admission() {
     let s = signer(8);
+    let cold = signer(9);
     let (mut l, accounts, _) = new_loop();
     let (verdicts_tx, mut verdicts) = tokio::sync::mpsc::channel(16);
     l.enable_verdicts(verdicts_tx);
     accounts
         .send(AccountEvent::Rows {
             block: 1,
-            rows: vec![(s.address(), rich(0, 1))],
+            rows: vec![(s.address(), rich(2, 1))],
         })
         .unwrap();
     let mut rig = Rig::default();
-    for (nonce, ingress) in [(0u64, 3u16), (1, 5)] {
-        let mut env = signed_envelope(&s, nonce, 1);
+    // Nonce 2 goes out, 4 waits for 3, 1 is below the chain, and the cold
+    // sender waits for its lookup.
+    for (who, nonce, ingress) in [(&s, 2u64, 3u16), (&s, 4, 5), (&s, 1, 6), (&cold, 0, 7)] {
+        let mut env = signed_envelope(who, nonce, 1);
         env.correlation_id = TxEnvelope::pack_correlation_id(ingress, 40 + nonce);
-        let at = pos(64 * (i32::try_from(nonce).unwrap() + 1));
+        let at = pos(64 * (i32::try_from(nonce).unwrap() + 1) + i32::from(ingress) * 640);
         rig.push(TxDataLoc::new(7, at), env);
         l.run_once(&mut rig.ports()).unwrap();
     }
-    assert_eq!(rig.offers().len(), 2);
+    l.run_once(&mut rig.ports()).unwrap();
+    let got =
+        |verdicts: &mut tokio::sync::mpsc::Receiver<VerdictOut>| -> Vec<(u8, u64, TxStageKind)> {
+            std::iter::from_fn(|| verdicts.try_recv().ok())
+                .map(|v| {
+                    let (_, nonce) = v.status.identity().unwrap();
+                    (v.ingress, nonce, v.status.kind())
+                })
+                .collect()
+        };
+    assert_eq!(
+        got(&mut verdicts),
+        [
+            (3, 2, TxStageKind::Accepted),
+            (5, 4, TxStageKind::Accepted),
+            (6, 1, TxStageKind::Rejected),
+        ],
+        "the cold sender waits for its lookup"
+    );
 
-    let receipt = |nonce: u64, tx_type: u8| Receipt {
-        from: s.address(),
-        nonce,
-        tx_type,
-        ..Receipt::default()
-    };
-    let other = Receipt {
-        from: signer(9).address(),
-        ..Receipt::default()
-    };
-    let batch = vec![
-        receipt(0, TX_TYPE_LEGACY),
-        receipt(0, TX_TYPE_DEPOSIT),
-        other,
-        receipt(1, TX_TYPE_LEGACY),
-    ];
-    let row = AccountRow {
-        address: s.address(),
-        nonce: 2,
-        balance: U256::from(5u64),
-    };
-    let event = AccountEvent::Receipts {
-        receipts: batch,
-        rows: vec![row.clone()],
-    };
-    accounts.send(event.clone()).unwrap();
     accounts
-        .send(AccountEvent::Rows {
-            block: 2,
-            rows: vec![(s.address(), rich(2, 2))],
+        .send(AccountEvent::Answer {
+            address: cold.address(),
+            state: rich(0, 1),
         })
         .unwrap();
+    // Nonce 3 closes the gap: 3 gets its verdict, 4 goes out with none.
+    let mut env = signed_envelope(&s, 3, 1);
+    env.correlation_id = TxEnvelope::pack_correlation_id(4, 43);
+    rig.push(TxDataLoc::new(7, pos(64 * 40)), env);
     l.run_once(&mut rig.ports()).unwrap();
-    let frames: Vec<(u8, Vec<u64>, Vec<AccountRow>)> =
-        std::iter::from_fn(|| verdicts.try_recv().ok())
-            .map(|frame| match frame {
-                VerdictOut::Receipts { ingress, batch } => (
-                    ingress,
-                    batch.receipts.iter().map(|r| r.nonce).collect(),
-                    batch.accounts,
-                ),
-                VerdictOut::Rollback(_) => panic!("no rollback yet"),
-            })
-            .collect();
+    l.run_once(&mut rig.ports()).unwrap();
     assert_eq!(
-        frames,
-        [(3, vec![0], vec![row.clone()]), (5, vec![1], vec![row])],
-        "each frame carries the row of its sender"
+        got(&mut verdicts),
+        [(7, 0, TxStageKind::Accepted), (4, 3, TxStageKind::Accepted)]
     );
-
-    accounts.send(event).unwrap();
-    let rollback = ReceiptRollback {
-        to_block: 1,
-        ..ReceiptRollback::default()
-    };
-    accounts.send(AccountEvent::Rollback(rollback)).unwrap();
-    l.run_once(&mut rig.ports()).unwrap();
-    assert!(
-        matches!(verdicts.try_recv(), Ok(VerdictOut::Rollback(r)) if r == rollback),
-        "the copy of another executor goes nowhere, and the rollback goes out"
-    );
+    assert_eq!(rig.offers().len(), 4, "2, the cold 0, 3 and 4");
 }

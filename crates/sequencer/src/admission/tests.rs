@@ -1,7 +1,7 @@
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::{Duration, Instant};
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 
 use super::{AccountState, Admission, AdmissionConfig, Candidate, ImagePos, Verdict};
 
@@ -29,6 +29,7 @@ fn tx(who: u8, nonce: u64, unit: u64) -> Candidate<u64> {
     Candidate {
         sender: sender(who),
         nonce,
+        tx_hash: B256::with_last_byte(u8::try_from(nonce).unwrap_or(u8::MAX)),
         cost: U256::from(COST),
         image: ImagePos {
             lane: 0,
@@ -36,6 +37,7 @@ fn tx(who: u8, nonce: u64, unit: u64) -> Candidate<u64> {
             unit,
         },
         ingress: u16::from(who) + 100,
+        answered: false,
         payload: nonce,
     }
 }
@@ -49,15 +51,22 @@ fn state(nonce: u64, balance: u64, tx_idx: u64) -> AccountState {
     }
 }
 
-/// The verdicts as short strings: `F<nonce>`, `R<nonce>:<refusal>`, `L`.
+/// The verdicts as short strings: `F<nonce>`, `R<nonce>:<refusal>`, `L`,
+/// `A<nonce>`. A forward or a reject of a transaction that has its answer
+/// gets a `*`.
 fn names(out: &[Verdict<u64>]) -> Vec<String> {
     out.iter()
         .map(|v| match v {
-            Verdict::Forward(c) => format!("F{}", c.nonce),
-            Verdict::Reject(c, r) => format!("R{}:{r:?}", c.nonce),
+            Verdict::Forward(c) => format!("F{}{}", c.nonce, star(c)),
+            Verdict::Reject(c, r) => format!("R{}{}:{r:?}", c.nonce, star(c)),
             Verdict::Lookup(_) => "L".to_owned(),
+            Verdict::Accept(ack) => format!("A{}", ack.nonce),
         })
         .collect()
+}
+
+fn star(c: &Candidate<u64>) -> &'static str {
+    if c.answered { "*" } else { "" }
 }
 
 /// A filter that holds `state` for sender 1.
@@ -109,9 +118,17 @@ fn a_state_that_is_not_newer_changes_nothing() {
 #[test]
 fn a_gap_parks_and_the_gap_filler_frees_the_run_behind_it() {
     let mut a = known(state(5, 10 * COST, 1));
-    assert!(offer(&mut a, tx(1, 7, 1)).is_empty());
-    assert!(offer(&mut a, tx(1, 6, 2)).is_empty());
-    assert_eq!(offer(&mut a, tx(1, 5, 3)), ["F5", "F6", "F7"]);
+    assert_eq!(
+        offer(&mut a, tx(1, 7, 1)),
+        ["A7"],
+        "a parked one is in the mempool"
+    );
+    assert_eq!(offer(&mut a, tx(1, 6, 2)), ["A6"]);
+    assert_eq!(
+        offer(&mut a, tx(1, 5, 3)),
+        ["F5", "F6*", "F7*"],
+        "the run goes out with no second answer"
+    );
 }
 
 #[test]
@@ -149,7 +166,7 @@ fn a_new_state_refuses_the_parked_transactions_below_its_nonce() {
     offer(&mut a, tx(1, 7, 1));
     let mut out = Vec::new();
     a.on_rows(1, [(sender(1), state(8, 10 * COST, 2))], &mut out);
-    assert_eq!(names(&out), ["R7:NonceTooLow { chain_nonce: 8 }"]);
+    assert_eq!(names(&out), ["R7*:NonceTooLow { chain_nonce: 8 }"]);
 }
 
 #[test]
@@ -159,7 +176,7 @@ fn an_account_with_delegated_code_gets_one_transaction_at_a_time() {
         ..state(5, 10 * COST, 1)
     });
     assert_eq!(offer(&mut a, tx(1, 5, 1)), ["F5"]);
-    assert!(offer(&mut a, tx(1, 6, 2)).is_empty(), "the next one waits");
+    assert_eq!(offer(&mut a, tx(1, 6, 2)), ["A6"], "the next one waits");
     let mut out = Vec::new();
     a.on_rows(
         1,
@@ -172,7 +189,7 @@ fn an_account_with_delegated_code_gets_one_transaction_at_a_time() {
         )],
         &mut out,
     );
-    assert_eq!(names(&out), ["F6"]);
+    assert_eq!(names(&out), ["F6*"]);
 }
 
 #[test]
@@ -207,7 +224,11 @@ fn a_parked_transaction_expires_when_its_image_moves_past_it() {
     assert!(out.is_empty(), "999 units is inside the width");
     offer(&mut a, tx(2, 1, 1_010));
     a.sweep(Instant::now(), &mut out);
-    assert_eq!(names(&out), ["R9:Expired { expected_nonce: 5 }"]);
+    assert_eq!(
+        names(&out),
+        ["R9*:Expired { expected_nonce: 5 }"],
+        "the client had its answer: the expiry is no second one"
+    );
 }
 
 #[test]
@@ -237,28 +258,21 @@ fn a_parked_transaction_expires_when_it_waited_too_long() {
     a.sweep(start + Duration::from_secs(3), &mut out);
     assert!(out.is_empty(), "three seconds is inside the time to live");
     a.sweep(start + Duration::from_secs(4), &mut out);
-    assert_eq!(names(&out), ["R9:Expired { expected_nonce: 5 }"]);
+    assert_eq!(names(&out), ["R9*:Expired { expected_nonce: 5 }"]);
 }
 
 #[test]
-fn a_forwarded_transaction_names_its_ingress_until_a_row_confirms_it() {
-    let mut f = Admission::new(cfg(), Instant::now());
+fn a_transaction_that_waits_for_a_lookup_gets_its_ack_with_the_state() {
+    let mut a: Admission<u64> = Admission::new(cfg(), Instant::now());
+    assert_eq!(offer(&mut a, tx(1, 5, 1)), ["L"], "no ack before the state");
+    assert_eq!(offer(&mut a, tx(1, 7, 2)), Vec::<String>::new());
     let mut out = Vec::new();
-    f.on_lookup(sender(1), state(5, 10 * COST, 1), &mut out);
-    f.offer(tx(1, 5, 1), &mut out);
-    f.offer(tx(1, 6, 2), &mut out);
-    assert_eq!(f.ingress_of(sender(1), 5), Some(101));
-    assert_eq!(f.ingress_of(sender(1), 6), Some(101));
-    assert_eq!(f.ingress_of(sender(1), 7), None, "not forwarded");
-    assert_eq!(f.ingress_of(sender(2), 5), None, "unknown sender");
-
-    f.on_rows(1, [(sender(1), state(6, 9 * COST, 2))], &mut out);
+    a.on_lookup(sender(1), state(5, 10 * COST, 1), &mut out);
     assert_eq!(
-        f.ingress_of(sender(1), 5),
-        None,
-        "the row confirmed nonce 5"
+        names(&out),
+        ["F5", "A7"],
+        "5 goes out; 7 waits for 6, accepted"
     );
-    assert_eq!(f.ingress_of(sender(1), 6), Some(101));
 }
 
 /// Position 0 names the empty chain and the state after its first
@@ -287,11 +301,15 @@ fn the_loss_window_starts_at_the_first_rows_after_the_forward() {
     f.offer(tx(1, 0, 1), &mut out);
     f.on_rows(100, [(sender(2), state(0, COST, 5))], &mut out);
     f.sweep(Instant::now(), &mut out);
-    assert_eq!(f.ingress_of(sender(1), 0), Some(101), "still forwarded");
+    assert_eq!(
+        offer(&mut f, tx(1, 0, 2)),
+        ["R0:InFlight { expected_nonce: 1 }"],
+        "still forwarded"
+    );
     let window = cfg().loss_blocks.get();
     f.on_rows(100 + window, [(sender(2), state(0, COST, 6))], &mut out);
     f.sweep(Instant::now(), &mut out);
-    assert_eq!(f.ingress_of(sender(1), 0), None, "lost after the window");
+    assert_eq!(offer(&mut f, tx(1, 0, 3)), ["F0"], "lost after the window");
 }
 
 /// A state from a lookup can be behind the chain. While a transaction
@@ -314,7 +332,7 @@ fn a_gap_over_a_lookup_state_asks_again() {
     assert_eq!(names(&out), ["L"], "the same stale answer asks again");
     out.clear();
     a.on_lookup(sender(1), state(49, 10 * COST, 392), &mut out);
-    assert_eq!(names(&out), ["F49"]);
+    assert_eq!(names(&out), ["F49*"]);
 }
 
 /// A gap over rows is a missing transaction: the sender does not ask again.

@@ -509,3 +509,61 @@ async fn a_refused_copy_of_an_executed_transaction_answers_its_receipt() {
     assert_eq!(answer.receipt.tx_hash, tx_hash);
     h.abort();
 }
+
+/// The ack at admission: `submit` answers with the hash when a sequencer
+/// takes the transaction into its mempool, before any receipt. A copy of
+/// a transaction that both twins refuse below the chain nonce gets the
+/// error text of geth.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_ack_at_admission_answers_on_the_verdict_of_the_sequencer() {
+    let signer = signer_for_shard(0, TWO_SHARDS);
+    let cfg = IngressConfig {
+        partition_count_m: TWO_SHARDS,
+        admission_checks: false,
+        admission_ack: Some(kardamom_ingress::config::AdmissionAck::default()),
+        ..IngressConfig::default()
+    };
+    let (mock, mut partition_rx) = MockChannels::new(TWO_MOCK_SHARDS);
+    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
+    let verdicts = mock.verdict_bus.clone();
+    let mut rx0 = partition_rx.remove(0);
+    let _rx1 = partition_rx.remove(0);
+    let h = tokio::spawn(async move {
+        let accepted = rx0.recv().await.expect("the first envelope");
+        let _ = verdicts.send(kardamom_types::TxStatus::accepted(
+            accepted.tx_hash,
+            accepted.sender,
+            0,
+        ));
+        let refused = rx0.recv().await.expect("the second envelope");
+        let error = kardamom_types::TxError {
+            sender: refused.sender,
+            nonce: 0,
+            reason: kardamom_types::TxErrorReason::DuplicatedTx { expected_nonce: 1 },
+        };
+        for _ in 0..2 {
+            let _ = verdicts.send(kardamom_types::TxStatus::rejected(refused.tx_hash, &error));
+        }
+    });
+
+    let raw = sign_legacy(&signer, 0);
+    let hash = proxy
+        .submit("127.0.0.1".parse().unwrap(), raw.clone())
+        .await
+        .expect("the sequencer accepts it");
+    assert_eq!(hash, alloy_primitives::keccak256(&raw));
+
+    let copy = sign_legacy(&signer, 0);
+    let err = proxy
+        .submit("127.0.0.1".parse().unwrap(), copy)
+        .await
+        .expect_err("both twins refuse the copy");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "nonce too low: address {}, tx: 0 state: 1",
+            signer.address()
+        )
+    );
+    h.abort();
+}

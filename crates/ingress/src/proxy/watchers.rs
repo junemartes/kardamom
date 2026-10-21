@@ -11,9 +11,10 @@ use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::{broadcast, watch};
 
 use kardamom_types::{
-    BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, ReceiptRollback, TxError,
+    BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, ReceiptRollback, TxError, TxStatus,
 };
 
+use crate::acks::AckWaiters;
 use crate::channels::{IngressPublication, IngressSubscription, ReceiptItem};
 use crate::cold_accounts::ColdAccounts;
 use crate::fee_history::FeeHistory;
@@ -52,6 +53,14 @@ where
 
     /// Spawn the receipt watcher. It owns `applied`, the log of the
     /// rollbacks that it applied.
+    pub(super) fn spawn_verdicts_watcher(&self) {
+        BroadcastWatcher::new(
+            self.subscription.subscribe_verdicts(),
+            VerdictsWatcher(self.acks.clone()),
+        )
+        .spawn();
+    }
+
     pub(super) fn spawn_tx_receipts_watcher(&self, applied: watch::Sender<RollbackLog>) {
         BroadcastWatcher::new(
             self.subscription.subscribe_receipts(),
@@ -94,6 +103,17 @@ where
             self.sealer.clone(),
         )
         .spawn();
+    }
+}
+
+/// Gives each verdict of the sequencer to the submission that waits for
+/// it. A verdict that the bus dropped leaves its submission to the ack
+/// timeout: the gap carries no state to recover.
+struct VerdictsWatcher(Arc<AckWaiters>);
+
+impl Watch<TxStatus> for VerdictsWatcher {
+    async fn on_item(&mut self, status: TxStatus) {
+        self.0.on_verdict(status);
     }
 }
 

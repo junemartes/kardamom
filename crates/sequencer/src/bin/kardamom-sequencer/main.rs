@@ -416,10 +416,7 @@ impl ResyncWiring {
         // as account events. The v1 loop takes the receipts as floors.
         let (accounts_tx, accounts_rx) = crossbeam_channel::bounded(V2_ACCOUNT_EVENTS);
         let sink = if cfg.admission.enabled {
-            feeds::ReceiptSink::Accounts {
-                events: accounts_tx.clone(),
-                receipts: cfg.admission.verdicts,
-            }
+            feeds::ReceiptSink::Accounts(accounts_tx.clone())
         } else {
             feeds::ReceiptSink::Floors(floor_tx.clone())
         };

@@ -1,4 +1,4 @@
-//! The verdict task: the frames of the v2 loop onto the `tx_verdicts`
+//! The verdict task: the verdicts of the v2 loop onto the `tx_verdicts`
 //! stream of each target ingress.
 //!
 //! The task owns its Aeron runtime and its stream plane, so its offers do
@@ -13,13 +13,13 @@ use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_sequencer::sequencer::Shutdown;
 use kardamom_sequencer::v2::VerdictOut;
-use kardamom_types::{ReceiptBatch, ReceiptRollback};
+use kardamom_types::TxStatus;
 use tokio::sync::mpsc;
 
-/// The verdict frames that may wait for the verdict task. A frame holds
-/// the receipts of one batch for one ingress, so this covers seconds of a
-/// full lane. A full queue drops frames, never the loop's progress.
-const QUEUE: usize = 16_384;
+/// The verdicts that may wait for the verdict task. A verdict answers one
+/// transaction, so this covers a fraction of a second of a full lane. A
+/// full queue drops verdicts, never the loop's progress.
+const QUEUE: usize = 65_536;
 
 /// One publication for each ingress id that a verdict went to.
 type Publications = Box<[Option<TxVerdictsPublisherHandle>; 256]>;
@@ -52,7 +52,7 @@ impl VerdictFeed {
             StreamPlane::from_config(log_cfg, label).context("build the verdict stream plane")?;
         let (frames, rx) = mpsc::channel(QUEUE);
         let task = Self::new(rt, plane).spawn(rx, shutdown.clone());
-        tracing::info!("sequencer v2: verdicts go to the ingress of each transaction");
+        tracing::info!("sequencer v2: the verdict of each transaction goes to its ingress");
         Ok((frames, task))
     }
 
@@ -85,28 +85,16 @@ impl VerdictFeed {
     }
 
     async fn on_frame(&mut self, frame: VerdictOut) {
-        match frame {
-            VerdictOut::Receipts { ingress, batch } => self.publish(ingress, &batch).await,
-            VerdictOut::Rollback(rollback) => self.roll_back(&rollback),
-        }
+        self.publish(frame.ingress, &frame.status).await;
     }
 
-    async fn publish(&mut self, ingress: u8, batch: &ReceiptBatch) {
+    async fn publish(&mut self, ingress: u8, status: &TxStatus) {
         let Some(publication) = self.publication(ingress).await else {
             return;
         };
-        if let Err(e) = publication.publish_receipts(batch) {
-            tracing::warn!(ingress, error = %e, "a verdict frame did not encode");
+        if let Err(e) = publication.publish_status(status) {
+            tracing::warn!(ingress, error = %e, "a verdict did not encode");
         }
-    }
-
-    /// Every ingress with a publication drops its receipts above the block.
-    fn roll_back(&self, rollback: &ReceiptRollback) {
-        self.publications
-            .iter()
-            .flatten()
-            .filter_map(|p| p.publish_rollback(rollback).err())
-            .for_each(|e| tracing::warn!(error = %e, "a verdict rollback did not encode"));
     }
 
     /// The publication of `ingress`, opened on its first frame. A failed

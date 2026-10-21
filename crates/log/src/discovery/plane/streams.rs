@@ -7,12 +7,12 @@ use super::{StreamKey, StreamPlane};
 use crate::aeron_live::{
     AeronRuntime, TxDataPublisherHandle, TxDataSubscriberHandle, TxDataSubscription,
     TxReceiptsBoundarySubscriberHandle, TxReceiptsPublisherHandle, TxReceiptsSubscriberHandle,
-    TxVerdictsPublisherHandle,
+    TxStatusSubscriberHandle, TxVerdictsPublisherHandle,
 };
 use crate::aeron_live::{PubHandle, TypedSubscription};
 use crate::discovery::record::Topic;
 use crate::error::LogError;
-use kardamom_types::BalFrame;
+use kardamom_types::{BalFrame, TxStatus};
 
 impl StreamPlane {
     /// The `tx_bal` publisher, as the raw handle the executor's BAL
@@ -150,8 +150,8 @@ impl StreamPlane {
         Ok(TxVerdictsPublisherHandle::from_publication(inner))
     }
 
-    /// The `tx_verdicts` subscriber of the ingress `own`: the receipts of
-    /// its own transactions, in the frame format of `tx_receipts`.
+    /// The `tx_verdicts` subscriber of the ingress `own`: one status
+    /// record for each of its transactions, accepted or rejected.
     /// Discovered: one subscription that the reconcile task fills with
     /// every sequencer that publishes to `own`.
     ///
@@ -162,16 +162,15 @@ impl StreamPlane {
         &mut self,
         rt: &AeronRuntime,
         own: u8,
-    ) -> Result<TxReceiptsSubscriberHandle, LogError> {
+    ) -> Result<TxStatusSubscriberHandle, LogError> {
         let key = self.tx_verdicts_key(own);
         let rx = match &mut self.discovered {
             None => {
-                rt.open_subscription_raw(&self.channels.tx_verdicts_channel, key.stream_id)?
-                    .1
+                rt.open_subscription::<TxStatus>(&self.channels.tx_verdicts_channel, key.stream_id)?
             }
-            Some(d) => d.open_raw_subscription(rt, key)?,
+            Some(d) => d.open_subscription(rt, key)?,
         };
-        Ok(TxReceiptsSubscriberHandle::from_raw(rx, rt))
+        Ok(TxStatusSubscriberHandle::from_subscription(rx))
     }
 
     fn tx_verdicts_key(&self, ingress_id: u8) -> StreamKey {

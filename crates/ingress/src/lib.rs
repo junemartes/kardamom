@@ -22,6 +22,7 @@
 // `#[must_use]` on its own. The lint fires in the macros' output, so the crate
 // allows it here.
 #![allow(clippy::double_must_use)]
+pub(crate) mod acks;
 pub mod aeron_adapters;
 pub(crate) mod binary;
 pub mod chain;

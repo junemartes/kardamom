@@ -37,14 +37,10 @@ pub(crate) struct ReceiptFloorFeed {
 }
 
 /// Where the receipts of this replica's senders go: the floor channel of
-/// the v1 loop, or the account events of the v2 loop. With `receipts`, the
-/// v2 loop also takes the receipts of each batch, for its verdicts.
+/// the v1 loop, or the account events of the v2 loop.
 pub(crate) enum ReceiptSink {
     Floors(crossbeam_channel::Sender<FloorEvent>),
-    Accounts {
-        events: crossbeam_channel::Sender<AccountEvent>,
-        receipts: bool,
-    },
+    Accounts(crossbeam_channel::Sender<AccountEvent>),
 }
 
 impl ReceiptFloorFeed {
@@ -113,9 +109,7 @@ impl ReceiptFloorFeed {
         );
         let sent = match &self.sink {
             ReceiptSink::Floors(floor_tx) => floor_tx.send(FloorEvent::Rollback(rollback)).is_ok(),
-            ReceiptSink::Accounts { events, .. } => {
-                events.send(AccountEvent::Rollback(rollback)).is_ok()
-            }
+            ReceiptSink::Accounts(accounts) => accounts.send(AccountEvent::Rollback).is_ok(),
         };
         if sent {
             ControlFlow::Continue(())
@@ -128,10 +122,6 @@ impl ReceiptFloorFeed {
     /// batch's end position, then every receipt through the floor
     /// filter. The rows go first, so a lookup request the receipt's
     /// park raises finds the entry.
-    ///
-    /// The v2 loop takes the receipts of this replica's senders first, then
-    /// the rows: the rows confirm the forwarded transactions, and the loop
-    /// reads the ingress of each one before that.
     fn forward_batch(&mut self, batch: ReceiptBatch) -> ControlFlow<()> {
         let block = batch.receipts.last().map(|r| r.block_number);
         if let Some(end) = batch.end_tx_idx() {
@@ -141,27 +131,14 @@ impl ReceiptFloorFeed {
                 .filter(|row| self.vslots.contains(vslot_for(row.address)))
                 .collect();
             self.writer.apply(end, &rows);
-            if let (ReceiptSink::Accounts { events, receipts }, Some(block)) = (&self.sink, block) {
-                let own = receipts.then(|| AccountEvent::Receipts {
-                    receipts: self.own_receipts(batch.receipts),
-                    rows: rows.clone(),
-                });
-                send_receipts(events, own)?;
-                return send_rows(events, block, end.as_index(), &rows);
+            if let (ReceiptSink::Accounts(accounts), Some(block)) = (&self.sink, block) {
+                return send_rows(accounts, block, end.as_index(), &rows);
             }
         }
         for receipt in &batch.receipts {
             self.forward_one_receipt(receipt)?;
         }
         ControlFlow::Continue(())
-    }
-
-    /// The receipts of this replica's senders.
-    fn own_receipts(&self, receipts: Vec<kardamom_types::Receipt>) -> Vec<kardamom_types::Receipt> {
-        receipts
-            .into_iter()
-            .filter(|r| self.vslots.contains(vslot_for(r.from)))
-            .collect()
     }
 
     /// Filter, build, and forward one receipt, for [`Self::tick`].
@@ -196,23 +173,6 @@ impl ReceiptFloorFeed {
             // The publish loop is gone. Exit.
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => ControlFlow::Break(()),
         }
-    }
-}
-
-/// The receipts of one batch for the verdicts of the v2 loop, when it
-/// takes them and the batch holds one of this replica's senders. `Break`
-/// means the loop is gone.
-fn send_receipts(
-    events: &crossbeam_channel::Sender<AccountEvent>,
-    receipts: Option<AccountEvent>,
-) -> ControlFlow<()> {
-    let sent = receipts
-        .filter(|e| matches!(e, AccountEvent::Receipts { receipts, .. } if !receipts.is_empty()))
-        .map_or(Ok(()), |e| events.send(e));
-    if sent.is_ok() {
-        ControlFlow::Continue(())
-    } else {
-        ControlFlow::Break(())
     }
 }
 

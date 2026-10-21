@@ -17,7 +17,7 @@ receipt fields, the errors and the limits.
 | `eth_blockNumber` | none | The newest closed block number, as a hex quantity. It comes from the block boundaries on the receipt stream. It is `0x0` before the first boundary. |
 | `eth_getBalance` | `address`, `block` | The balance in wei, as a hex quantity. |
 | `eth_getTransactionCount` | `address`, `block` | The committed nonce of the account, as a hex quantity. |
-| `eth_sendRawTransaction` | `bytes` | The transaction hash. The call waits until the receipt arrives. |
+| `eth_sendRawTransaction` | `bytes` | The transaction hash. The call waits until the receipt arrives, or with `--verdicts` until the sequencer takes the transaction into its mempool. |
 | `eth_getTransactionReceipt` | `hash` | The receipt, or `null` if the transaction is not committed. |
 | `eth_feeHistory` | `blockCount`, `newestBlock`, `rewardPercentiles` (optional) | An Ethereum `FeeHistory` object. |
 | `eth_maxPriorityFeePerGas` | none | A tip rate that a wallet can bid, in wei per gas. |
@@ -36,6 +36,10 @@ receipt fields, the errors and the limits.
   - A DA-lag reject from the sealer also ends the wait. The error is `-32010`, with the cause `da_lag` at the service `sealer`.
   - A record-lag reject from the sealer also ends the wait. The error is `-32010`, with the cause `record_lag` at the service `sealer`. The record-lag guard is off by default until a later release.
   - The timeout is 30 seconds. The `--pending-receipt-timeout-ms` flag (env `KARDAMOM_PENDING_RECEIPT_TIMEOUT_MS`) sets it.
+- With `--verdicts` (the ack at admission), `eth_sendRawTransaction` has the semantics of Ethereum. It returns the hash when the sequencer that owns the sender takes the transaction into its mempool: it forwards it to the sealer, or it holds it for a nonce gap. It does not wait for the sealer or the receipt.
+  - The errors use the text of geth: `nonce too low: address <a>, tx: <n> state: <m>`, `already known`, `txpool is full`, `insufficient funds for gas * price + value: ...`, `max fee per gas less than block base fee: ...`.
+  - With no answer of a sequencer in 2 seconds, the error is `transaction not acknowledged`. The `--ack-timeout-ms` flag (env `KARDAMOM_INGRESS_ACK_TIMEOUT_MS`) sets the time. A resubmit of the same transaction can answer `already known`: the first copy is in a mempool.
+  - An accepted transaction can still drop later, as on Ethereum. Read the result with `eth_getTransactionReceipt`, or follow the status feed.
 - `kardamom_sendRawTransactionAsync` validates the transaction and publishes it. It returns the hash at once.
   - Use it to keep many transactions in flight on one connection.
   - A rejection by the sequencer does not reach this call. It reaches the client through the receipt subscription or the status feed.

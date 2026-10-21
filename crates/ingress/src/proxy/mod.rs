@@ -29,6 +29,7 @@ use kardamom_obs::halt::{HaltRef, Pause, PauseReason};
 use kardamom_obs::lifecycle::{Lifecycle, process};
 use kardamom_types::{ClusterStatus, Receipt, TxEnvelope, TxError};
 
+use crate::acks::AckWaiters;
 use crate::chain::SealerLifecycle;
 
 use crate::channels::{IngressPublication, IngressSubscription};
@@ -136,6 +137,9 @@ where
     pub(crate) rate_limiter: Arc<PerIpLimiter>,
     pub(crate) verifier: Arc<BatchVerifier>,
     pub(crate) pending: Arc<PendingReceipts>,
+    /// The waiters of the ack at admission. Empty unless
+    /// `cfg.admission_ack` is on. See [`crate::acks`].
+    pub(crate) acks: Arc<AckWaiters>,
     pub(crate) cache: Arc<ReceiptCache>,
     /// Consumer-side `tx_errors` dedup for P racing sequencer replicas.
     /// Drops the twin's duplicate copy of each per-tx rejection, and
@@ -215,6 +219,7 @@ where
             rate_limiter: self.rate_limiter.clone(),
             verifier: self.verifier.clone(),
             pending: self.pending.clone(),
+            acks: self.acks.clone(),
             cache: self.cache.clone(),
             tx_error_dedup: self.tx_error_dedup.clone(),
             publication: self.publication.clone(),
@@ -252,6 +257,7 @@ where
             cfg.sig_verify_flush_window,
         ));
         let pending = Arc::new(PendingReceipts::new(cfg.ack_policy));
+        let acks = AckWaiters::new(cfg.admission_ack.unwrap_or_default());
         let cache = Arc::new(ReceiptCache::new(cfg.receipt_cache_capacity));
         let tx_error_dedup = Arc::new(TxErrorDedup::default());
         let live = subscription.live_accounts();
@@ -277,6 +283,7 @@ where
             rate_limiter,
             verifier,
             pending,
+            acks,
             cache,
             tx_error_dedup,
             publication,
@@ -297,6 +304,9 @@ where
         };
         me.spawn_tx_receipts_watcher(applied_tx);
         me.spawn_tx_errors_watcher();
+        if me.cfg.admission_ack.is_some() {
+            me.spawn_verdicts_watcher();
+        }
         me.spawn_chain_watch();
         // Subscribe only to the watermark streams the configured policy needs.
         if me.cfg.ack_policy.requires_quorum() {
