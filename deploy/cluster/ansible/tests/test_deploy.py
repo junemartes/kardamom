@@ -1319,6 +1319,15 @@ class RecordTest(Deploys):
         output = self.upgrade_check(feature='5')
         self.assertIn('The upgrade transaction of feature 5 may go to the Safe', output)
 
+    def test_the_upgrade_check_refuses_feature_four_on_a_member_that_reads_no_version_sixteen(self):
+        self.deploy()
+        output = self.upgrade_check(success=False, feature='4', activation_ms='0')
+        self.assertIn('needs every sealer member to read snapshot version 16', output)
+        self.api.state['reads_max'] = {f'node-cluster-{member}': 16 for member in range(3)}
+        output = self.upgrade_check(feature='4', activation_ms='0')
+        self.assertIn('3 sealer members read snapshot version 16', output)
+        self.assertIn('The upgrade transaction of feature 4 may go to the Safe', output)
+
     def test_the_upgrade_check_refuses_feature_three_on_a_sequencer_that_sends_no_position(self):
         self.deploy()
         del self.api.state['jobs']['sequencer']['Meta']['sealer_v4']

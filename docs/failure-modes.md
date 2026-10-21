@@ -524,6 +524,12 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
   - The lookup is bounded by the token bucket of the client, the in-flight bound of the query client and its timeout. A shed or failed query answers `null`. This is the same answer as "not committed yet".
   - The counter is `kardamom_cache_lookups_total{layer="receipt", outcome}`. The outcomes are `hit`, `state_hit`, `miss`, `shed` and `state_error`.
   - Proof: `ingress-pair-loss-recover` kills both ingresses under load. It requires the receipt of every accepted transaction afterwards.
+- **A watcher falls behind its stream bus**
+  - Each stream (receipts, errors, block boundaries, watermarks) reaches its watcher through a broadcast bus of 32,768 items. One receipt is one item, and the ingress reads the receipts of every executor.
+  - Trigger: the watcher task stalls longer than the bus can hold, for example on a loaded host.
+  - Effect: the bus drops its oldest items. A rollback that the bus drops still applies from its log. A dropped receipt or error does not release its waiter, so that client waits until the pending timeout (30 s). Its retry gets the receipt by hash.
+  - The counter is `kardamom_ingress_bus_lagged_total{bus}`.
+  - Proof: `a_gap_counts_the_receipts_that_the_bus_dropped`. On one local stack under load, a bus of 1,024 items dropped 4,684 receipts and gave a soak p99 of 30 s. The bus of 32,768 items dropped none.
 - **Admission of a cold sender**
   - The admission checks read the local account layer, then Redis. A sender that never sent and never received value has no row in either layer.
   - For such a cold sender, the ingress asks an executor for the nonce and the balance (two queries). It keeps the answer for 30 s in a map of at most 65,536 senders. So a cold sender costs one pair of queries for each 30 s, not one pair for each submit. A row in the local layer always wins.

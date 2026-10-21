@@ -37,6 +37,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_engine::bin_support;
+use kardamom_engine::reader::FrameTee;
 use kardamom_engine::{
     Executor, ExecutorConfig, ExecutorError, Inbound, MdbxSnapshotSource, MdbxWriterQueue,
     MdbxWriterSignal, NoTxHook, Outbound, PUBLICATION_DEAD_EXIT_CODE, RoleHooks,
@@ -285,7 +286,14 @@ fn open_lanes(
 struct Outputs {
     tx_receipts_pub: wiring::LiveTxReceiptsPub,
     exec_stream: kardamom_executor::exec_stream::ExecStream,
+    /// The tee of the canonical frames for the egress, with
+    /// `--exec-frames`.
+    frames: Option<FrameTee>,
 }
+
+/// The frames that may wait for the `exec_frames` publication: some
+/// seconds of a busy chain.
+const FRAMES_QUEUE: usize = 64 * 1024;
 
 /// What [`Outputs::open`] needs.
 struct OutputsConfig<'a> {
@@ -329,10 +337,38 @@ impl Outputs {
             },
         )
         .await?;
+        let frames = if args.exec_frames {
+            Some(Self::open_frames(rt_pub, plane).await?)
+        } else {
+            None
+        };
         Ok(Self {
             tx_receipts_pub,
             exec_stream,
+            frames,
         })
+    }
+
+    /// Open the `exec_frames` publication and its forwarder thread. The
+    /// thread ends when the reader drops the tee.
+    async fn open_frames(rt_pub: &AeronRuntime, plane: &mut StreamPlane) -> Result<FrameTee> {
+        let publication = plane
+            .exec_frames_publisher(rt_pub)
+            .await
+            .context("open exec_frames")?;
+        let (out, frames) = crossbeam_channel::bounded::<Vec<u8>>(FRAMES_QUEUE);
+        std::thread::Builder::new()
+            .name("exec-frames".into())
+            .spawn(move || {
+                frames.iter().for_each(|frame| {
+                    let mut bytes = rkyv::util::AlignedVec::with_capacity(frame.len());
+                    bytes.extend_from_slice(&frame);
+                    publication.publish_best_effort(bytes);
+                });
+            })
+            .context("spawn the exec_frames thread")?;
+        tracing::info!("kardamom-executor: the canonical frames go to the egress on exec_frames");
+        Ok(FrameTee::new(out))
     }
 }
 
@@ -515,6 +551,7 @@ async fn run_once(boot: &Boot, window: std::num::NonZeroU64) -> Result<Verdict> 
 
     let (cluster_guard, tx_ordering_sub) =
         connect_cluster(args, file_cfg, &plane, &prepared, history, &shutdown).await?;
+    let tx_ordering_sub = tx_ordering_sub.with_tee(outputs.frames);
     let state::PreparedState {
         env,
         start,

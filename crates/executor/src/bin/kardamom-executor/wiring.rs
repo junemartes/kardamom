@@ -6,8 +6,8 @@ use std::num::NonZeroUsize;
 use anyhow::{Context, Result};
 use kardamom_cluster_adapter::{LiveIngress, OfferOutcome};
 use kardamom_engine::bin_support;
-use kardamom_engine::reader::Ordered;
 use kardamom_engine::reader::cluster::RecordedCursorPublisher;
+use kardamom_engine::reader::{FrameTee, Ordered};
 use kardamom_engine::{BPosition, TxOrderingSubscription};
 use kardamom_engine::{
     CMessage, EngineWiring, ExecPorts, ExecutorError, MdbxSnapshotSource, MdbxWriterQueue,
@@ -139,6 +139,20 @@ impl ExecutorOrdering {
         match self {
             Self::Refs(sub) => Some(sub.recorded_cursor_publisher(executor_id)),
             Self::Carried(_) => None,
+        }
+    }
+}
+
+impl ExecutorOrdering {
+    /// Forward the delivered frames to the egress through `tee`, when one
+    /// is given.
+    pub(crate) fn with_tee(self, tee: Option<FrameTee>) -> Self {
+        let Some(tee) = tee else {
+            return self;
+        };
+        match self {
+            Self::Refs(sub) => Self::Refs(sub.with_tee(tee)),
+            Self::Carried(sub) => Self::Carried(Box::new(sub.with_tee(tee))),
         }
     }
 }

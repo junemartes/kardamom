@@ -24,7 +24,7 @@ mod feed_tests;
 mod memory;
 mod switch;
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 #[cfg(test)]
 mod tests_compare;
 #[cfg(test)]
@@ -48,7 +48,8 @@ use switch::Source;
 use switch::{Switch, Verdict};
 
 use super::cluster::{Reorder, ReplayCursor};
-use super::{Ordered, TxOrderingSubscription};
+use super::tee::Forward;
+use super::{FrameTee, Ordered, TxOrderingSubscription};
 use crate::ExecutorError;
 
 /// The canonical stream with its bytes, from the feed `F` or the service
@@ -65,6 +66,8 @@ pub struct CarriedSubscription<F, S> {
     switch: Switch<F, S>,
     timing: Timing,
     woke_at: Instant,
+    /// The frames for the egress, when this reader forwards them.
+    tee: Forward,
 }
 
 impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
@@ -120,7 +123,15 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
             switch: Switch::new(feed, service, timing, first_id),
             timing,
             woke_at: Instant::now(),
+            tee: Forward::default(),
         }
+    }
+
+    /// Forward each delivered frame to the egress through `tee`.
+    #[must_use]
+    pub fn with_tee(mut self, tee: FrameTee) -> Self {
+        self.tee = Forward::on(tee);
+        self
     }
 
     /// The source that the reader reads now.
@@ -133,6 +144,7 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
     fn step(&mut self) -> Result<(), ExecutorError> {
         match self.switch.poll(self.timing.poll) {
             Poll::Frame(bytes) => {
+                self.tee.hold(&bytes);
                 let step = self.switch.frame(&bytes, Instant::now());
                 self.apply(step)?;
             }
@@ -336,7 +348,7 @@ impl<F: Transport, S: Transport> TxOrderingSubscription for CarriedSubscription<
                 self.step()?;
                 continue;
             };
-            return Ok(out);
+            return Ok(self.tee.release(out));
         }
     }
 }
