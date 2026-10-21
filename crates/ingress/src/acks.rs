@@ -20,16 +20,17 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use alloy_primitives::{Address, B256};
+use std::ops::ControlFlow;
+
+use alloy_primitives::B256;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use kardamom_types::{TxErrorReason, TxStage, TxStatus};
+use kardamom_types::{TxStage, TxStatus};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::config::AdmissionAck;
 use crate::error::IngressError;
-use crate::pending::reason_to_error;
 
 /// The verdicts that can wait for one waiter: one from each twin, and room
 /// for a copy.
@@ -114,27 +115,11 @@ impl AckWait {
     /// Returns the error of the rejection, or
     /// [`IngressError::NotAcknowledged`] when no verdict came in time.
     pub(crate) async fn answer(mut self) -> Result<B256, IngressError> {
-        let cfg = self.waiters.cfg;
-        let mut deadline = Instant::now() + cfg.timeout;
-        let mut rejected = Rejections::default();
+        let mut answer = Answer::new(self.tx_hash, self.waiters.cfg);
         loop {
-            let Ok(Some(status)) = tokio::time::timeout_at(deadline, self.verdicts.recv()).await
-            else {
-                return Err(rejected.into_error(cfg.timeout));
-            };
-            match status.stage {
-                TxStage::Accepted { .. } => return Ok(self.tx_hash),
-                TxStage::Rejected {
-                    sender,
-                    nonce,
-                    reason,
-                } => {
-                    if rejected.add(verdict_error(sender, nonce, &reason), cfg.twins.get()) {
-                        return Err(rejected.into_error(cfg.timeout));
-                    }
-                    deadline = deadline.min(Instant::now() + cfg.reject_grace);
-                }
-                TxStage::Offered { .. } | TxStage::Sealed | TxStage::Executed { .. } => {}
+            let verdict = tokio::time::timeout_at(answer.deadline, self.verdicts.recv()).await;
+            if let ControlFlow::Break(result) = answer.on(verdict.ok().flatten()) {
+                return result;
             }
         }
     }
@@ -146,40 +131,68 @@ impl Drop for AckWait {
     }
 }
 
-/// The rejections of one submission so far.
-#[derive(Default)]
-struct Rejections {
+/// The state of one wait for its answer.
+struct Answer {
+    tx_hash: B256,
+    cfg: AdmissionAck,
+    /// The end of the wait: the ack timeout, or the reject grace after the
+    /// first rejection.
+    deadline: Instant,
+    /// The rejections so far.
     count: u8,
     /// The first rejection: the answer when no twin accepts.
     first: Option<IngressError>,
 }
 
-impl Rejections {
-    /// Count one rejection. Returns whether every twin rejected.
-    fn add(&mut self, error: IngressError, twins: u8) -> bool {
-        self.count += 1;
+impl Answer {
+    fn new(tx_hash: B256, cfg: AdmissionAck) -> Self {
+        Self {
+            tx_hash,
+            cfg,
+            deadline: Instant::now() + cfg.timeout,
+            count: 0,
+            first: None,
+        }
+    }
+
+    /// Take one verdict, or `None` at the deadline. `Break` carries the
+    /// answer.
+    fn on(&mut self, verdict: Option<TxStatus>) -> ControlFlow<Result<B256, IngressError>> {
+        let Some(status) = verdict else {
+            return ControlFlow::Break(Err(self.error()));
+        };
+        match status.stage {
+            TxStage::Accepted { .. } => ControlFlow::Break(Ok(self.tx_hash)),
+            TxStage::Rejected {
+                sender,
+                nonce,
+                reason,
+            } => self.reject(IngressError::of_verdict(sender, nonce, &reason)),
+            TxStage::Offered { .. } | TxStage::Sealed | TxStage::Executed { .. } => {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
+    /// Count one rejection. Every twin rejected: answer it. Otherwise wait
+    /// the reject grace for an accept of another twin.
+    fn reject(&mut self, error: IngressError) -> ControlFlow<Result<B256, IngressError>> {
+        // The wait ends at `twins`, so the count stays far below the bound.
+        self.count = self.count.saturating_add(1);
         self.first.get_or_insert(error);
-        self.count >= twins
+        if self.count >= self.cfg.twins.get() {
+            return ControlFlow::Break(Err(self.error()));
+        }
+        self.deadline = self.deadline.min(Instant::now() + self.cfg.reject_grace);
+        ControlFlow::Continue(())
     }
 
     /// The answer of a wait that no accept ended: the first rejection, or
-    /// no ack within `timeout`.
-    fn into_error(self, timeout: std::time::Duration) -> IngressError {
-        self.first.unwrap_or(IngressError::NotAcknowledged(timeout))
-    }
-}
-
-/// The client error of a rejection at admission, with the error texts of
-/// geth where geth has one.
-fn verdict_error(sender: Address, nonce: u64, reason: &TxErrorReason) -> IngressError {
-    match reason {
-        TxErrorReason::DuplicatedTx { expected_nonce } => IngressError::NonceTooLow {
-            address: sender,
-            tx_nonce: nonce,
-            state_nonce: *expected_nonce,
-        },
-        TxErrorReason::Evicted { .. } => IngressError::PoolFull,
-        other => reason_to_error(sender, nonce, other),
+    /// no ack in the timeout.
+    fn error(&mut self) -> IngressError {
+        self.first
+            .take()
+            .unwrap_or(IngressError::NotAcknowledged(self.cfg.timeout))
     }
 }
 

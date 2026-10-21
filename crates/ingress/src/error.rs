@@ -215,6 +215,24 @@ impl IngressError {
     pub(crate) fn internal(ctx: impl std::fmt::Display, e: impl std::fmt::Display) -> Self {
         Self::Internal(format!("{ctx}: {e}"))
     }
+
+    /// The client error of a rejection at admission, with the error texts
+    /// of geth where geth has one.
+    pub(crate) fn of_verdict(
+        sender: Address,
+        nonce: u64,
+        reason: &kardamom_types::TxErrorReason,
+    ) -> Self {
+        match reason {
+            kardamom_types::TxErrorReason::DuplicatedTx { expected_nonce } => Self::NonceTooLow {
+                address: sender,
+                tx_nonce: nonce,
+                state_nonce: *expected_nonce,
+            },
+            kardamom_types::TxErrorReason::Evicted { .. } => Self::PoolFull,
+            other => crate::pending::reason_to_error(sender, nonce, other),
+        }
+    }
 }
 
 impl From<IngressError> for ErrorObjectOwned {
