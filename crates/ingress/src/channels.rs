@@ -130,7 +130,13 @@ where
 /// Capacity of each `tx_receipts`, watermark, and `tx_errors` broadcast
 /// bus. [`crate::aeron_adapters::LiveIngressSubscription`] uses the same
 /// value for its live buses.
-pub(crate) const BUS_CAPACITY: usize = 1024;
+///
+/// One item is one receipt, and the ingress reads the receipts of every
+/// executor. A bus drops its oldest items when its watcher falls behind,
+/// and the waiter of a dropped receipt waits until the pending timeout.
+/// So the bus holds some seconds of receipts at full load, not a fraction
+/// of a second: a short stall of the runtime then drops nothing.
+pub(crate) const BUS_CAPACITY: usize = 32 * 1024;
 
 // ============================================================================
 // MockChannels: in-process implementation for tests and benches.

@@ -26,6 +26,13 @@ use crate::tx_error_dedup::TxErrorDedup;
 
 use super::{BroadcastWatcher, IngressProxy, Watch};
 
+/// The `bus` labels of [`crate::metrics::BUS_LAGGED_TOTAL`].
+const BOUNDARIES_BUS: &str = "block_boundaries";
+const TX_ERRORS_BUS: &str = "tx_errors";
+const RECEIPTS_BUS: &str = "tx_receipts";
+const QUORUM_WATERMARK_BUS: &str = "quorum_watermark";
+const LOCAL_FSYNC_BUS: &str = "local_fsync_watermark";
+
 impl<P, S> IngressProxy<P, S>
 where
     P: IngressPublication + Clone + 'static,
@@ -33,6 +40,7 @@ where
 {
     pub(super) fn spawn_block_boundary_watcher(&self) {
         BroadcastWatcher::new(
+            BOUNDARIES_BUS,
             self.subscription.subscribe_block_boundaries(),
             BlockBoundaryWatcher::new(self.latest_block_number.clone(), self.fee_history.clone()),
         )
@@ -41,6 +49,7 @@ where
 
     pub(super) fn spawn_tx_errors_watcher(&self) {
         BroadcastWatcher::new(
+            TX_ERRORS_BUS,
             self.subscription.subscribe_tx_errors(),
             TxErrorsWatcher::new(
                 self.pending.clone(),
@@ -63,6 +72,7 @@ where
 
     pub(super) fn spawn_tx_receipts_watcher(&self, applied: watch::Sender<RollbackLog>) {
         BroadcastWatcher::new(
+            RECEIPTS_BUS,
             self.subscription.subscribe_receipts(),
             TxReceiptsWatcher {
                 pending: self.pending.clone(),
@@ -82,6 +92,7 @@ where
 
     pub(super) fn spawn_quorum_watermark_watcher(&self) {
         BroadcastWatcher::new(
+            QUORUM_WATERMARK_BUS,
             self.subscription.subscribe_watermark(),
             WatermarkWatcher::new(self.pending.clone()),
         )
@@ -90,6 +101,7 @@ where
 
     pub(super) fn spawn_local_fsync_watermark_watcher(&self) {
         BroadcastWatcher::new(
+            LOCAL_FSYNC_BUS,
             self.subscription.subscribe_local_fsync_watermark(),
             WatermarkWatcher::new(self.pending.clone()),
         )
@@ -367,7 +379,8 @@ impl LagQueue {
                 self.items.push(item);
                 ControlFlow::Continue(())
             }
-            Err(TryRecvError::Lagged(_)) => {
+            Err(TryRecvError::Lagged(dropped)) => {
+                crate::metrics::count_lagged(RECEIPTS_BUS, dropped);
                 self.complete = false;
                 ControlFlow::Break(())
             }

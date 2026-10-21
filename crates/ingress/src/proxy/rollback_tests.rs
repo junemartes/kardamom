@@ -1,7 +1,10 @@
 //! The proxy's reaction to a rollback on the receipt bus: the cache, the
-//! first-wins dedup, the fee history, the head, and the deduped feed.
+//! first-wins dedup, the fee history, the head, and the deduped feed. And
+//! the count of the receipts that a gap of the bus drops.
 
 use std::num::NonZeroU64;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
@@ -169,6 +172,88 @@ async fn a_rollback_lost_on_bus_lag_is_still_applied() {
     );
     let applied = proxy.subscribe_rollbacks();
     assert_eq!(applied.borrow().generation(), 1, "applied once");
+}
+
+/// A watcher that falls behind the bus counts each receipt that the bus
+/// dropped. The waiter of a dropped receipt waits until its timeout, so
+/// the count names the cause of that wait.
+#[tokio::test]
+async fn a_gap_counts_the_receipts_that_the_bus_dropped() {
+    let lagged = LaggedReceipts::default();
+    // The test runtime has one thread, so the watcher task records here.
+    let _recorder = metrics::set_default_local_recorder(&lagged);
+    let (mock, _proxy) = proxy();
+
+    // The test task does not yield, so the watcher reads none of these
+    // until the bus has dropped the oldest eight.
+    send_fillers(&mock, crate::channels::BUS_CAPACITY + 8);
+    settle().await;
+    assert_eq!(lagged.0.load(Ordering::Relaxed), 8);
+}
+
+/// Records the count of [`crate::metrics::BUS_LAGGED_TOTAL`] for the
+/// `tx_receipts` bus, and nothing else.
+#[derive(Clone, Default)]
+struct LaggedReceipts(Arc<AtomicU64>);
+
+impl metrics::CounterFn for LaggedReceipts {
+    fn increment(&self, value: u64) {
+        self.0.fetch_add(value, Ordering::Relaxed);
+    }
+
+    fn absolute(&self, value: u64) {
+        self.0.store(value, Ordering::Relaxed);
+    }
+}
+
+impl metrics::Recorder for LaggedReceipts {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        let receipts = key.name() == crate::metrics::BUS_LAGGED_TOTAL
+            && key
+                .labels()
+                .any(|l| l.key() == "bus" && l.value() == "tx_receipts");
+        if receipts {
+            metrics::Counter::from_arc(Arc::new(self.clone()))
+        } else {
+            metrics::Counter::noop()
+        }
+    }
+
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
 }
 
 /// Send `count` receipts of block 3, each with a hash of its own.

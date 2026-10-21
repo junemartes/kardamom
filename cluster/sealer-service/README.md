@@ -107,6 +107,7 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 | 4 | Void record | `[index:u64]` |
 | 5 | Full entry, on ingress only | `[lane:u8][envelope]` |
 | 6 | Canonical entry, in the retained file only | `[lane:u8][envelope]` |
+| 7 | Full reference, on ingress only | `[shard_id:u8][term_id:i32][term_offset:i32][tx_data_session_id:i32][envelope]` |
 
 - The void record is the payload `[tx_hash:32][record_type=4][index:u64]`.
   - The service generates it. It never relays one from a session.
@@ -114,6 +115,12 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
   - Every consumer drops the `TxRef` at `index`. The service removes the hash from the dedup window and sets the sender nonce back.
 - With `carryBytes`, the service relays a full entry (type 5) as a canonical entry (type 6): the same payload with the record type 6. The retained file keeps the kind-1 frame with the envelope. Each egress session gets the relayed reference (egress kind 15) in its place, live and in a replay. No egress session gets the envelope.
 - Without `carryBytes`, the service relays a type 5 as is, like every other payload.
+- The full reference (type 7) is a kind-0 frame of 99 bytes, the frame of a type-0 reference with the record type 7, then the envelope.
+  - The deadline field carries the stream position of the reference in its image, as in [Version 4](#version-4).
+  - The envelope is the archived `TxEnvelope`: the raw transaction padded to 8 bytes, then the 80-byte root. So a whole frame has at least 179 bytes.
+  - Its canonical entry is `[canonical_id:32][record_type=6][lane:u8][envelope]`: the id, the lane and the envelope, without the position.
+  - No sequencer sends type 7 yet. The service relays a type 7 as is, like every other payload. The Rust reader refuses a relayed type 7.
+  - The golden frame `txref_offer_ingress` in `crates/cluster-adapter/testdata/wire_golden.txt` holds the bytes. Its canonical entry is the golden frame `tx_egress`.
 
 ### Egress kinds (cluster to client)
 

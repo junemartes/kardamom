@@ -24,7 +24,7 @@ mod feed_tests;
 mod memory;
 mod switch;
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 #[cfg(test)]
 mod tests_compare;
 #[cfg(test)]

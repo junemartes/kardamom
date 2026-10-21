@@ -62,6 +62,8 @@ pub(crate) trait Watch<T> {
 pub(crate) struct BroadcastWatcher<T, W> {
     rx: broadcast::Receiver<T>,
     watcher: W,
+    /// The `bus` label of [`crate::metrics::BUS_LAGGED_TOTAL`].
+    bus: &'static str,
 }
 
 impl<T, W> BroadcastWatcher<T, W>
@@ -69,8 +71,8 @@ where
     T: Clone + Send + 'static,
     W: Watch<T> + Send + 'static,
 {
-    pub(crate) fn new(rx: broadcast::Receiver<T>, watcher: W) -> Self {
-        Self { rx, watcher }
+    pub(crate) fn new(bus: &'static str, rx: broadcast::Receiver<T>, watcher: W) -> Self {
+        Self { rx, watcher, bus }
     }
 
     /// Start the drain on the runtime. It ends when the sender side
@@ -84,7 +86,8 @@ where
             match self.rx.recv().await {
                 Ok(item) => self.watcher.on_item(item).await,
                 Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(_)) => {
+                Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                    crate::metrics::count_lagged(self.bus, dropped);
                     self.watcher.on_lagged(&mut self.rx).await;
                 }
             }
