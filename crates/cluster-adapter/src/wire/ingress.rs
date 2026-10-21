@@ -20,8 +20,8 @@ use super::{
     INGRESS_SENDER_OFFSET, INGRESS_TIP_OFFSET, KIND_BATCH, KIND_FEATURE_ACTIVATION,
     KIND_INGRESS_RECORD, KIND_ORIGIN_RECORD, KIND_POSTED_CURSOR, KIND_RECORDED_CURSOR,
     KIND_REMOTE_ORIGIN_RECORD, KIND_REPLAY_REQUEST, KIND_SUBSCRIBE, KIND_VOID_REQUEST, RT_EPOCH,
-    RT_REMOTE_EPOCH, RT_TXREF, SENDER_LEN, WireError, encode_kind_2u64, encode_kind_2u64_id,
-    epoch_slots, rd_slice, rd_u64, rd_u128, remote_epoch_slots, too_short,
+    RT_REMOTE_EPOCH, RT_TXREF, SENDER_LEN, TXREF_RECORD_LEN, WireError, encode_kind_2u64,
+    encode_kind_2u64_id, epoch_slots, rd_slice, rd_u64, rd_u128, remote_epoch_slots, too_short,
 };
 
 /// The guard header of a kind-0 ingress frame: the fields the service
@@ -59,6 +59,33 @@ impl GuardHeader {
         b.extend_from_slice(&self.max_inclusion_block.to_le_bytes());
         b.extend_from_slice(&self.tip.to_le_bytes());
     }
+
+    /// Read the header of a kind-0 frame.
+    pub(super) fn read(buf: &[u8]) -> Result<Self, WireError> {
+        let (sender, nonce) = ingress_sender_nonce(buf)?;
+        Ok(Self {
+            sender,
+            nonce,
+            max_inclusion_block: ingress_deadline(buf)?,
+            tip: ingress_tip(buf)?,
+        })
+    }
+
+    /// Write the [`TXREF_RECORD_LEN`] bytes of a kind-0 frame of `r` with
+    /// `record_type`: the kind, this header, the canonical id, the record
+    /// type, the lane, the position and the session id.
+    pub(super) fn write_reference(&self, b: &mut Vec<u8>, r: &TxRef, record_type: u8) {
+        b.push(KIND_INGRESS_RECORD);
+        self.write(b);
+        b.extend_from_slice(r.tx_hash.as_slice()); // canonical_id (32)
+        b.push(record_type);
+        b.push(r.shard_id);
+        b.extend_from_slice(&r.tx_data_position.term_id.to_le_bytes());
+        b.extend_from_slice(&r.tx_data_position.term_offset.to_le_bytes());
+        // tx_data publisher session. This is the active/active ingress join
+        // discriminator.
+        b.extend_from_slice(&r.tx_data_session_id.to_le_bytes());
+    }
 }
 
 // ── encode (ingress: Rust to cluster) ───────────────────────────────────────
@@ -67,17 +94,8 @@ impl GuardHeader {
 /// the relayed payload.
 #[must_use]
 pub fn encode_ingress_txref(r: &TxRef, guard: GuardHeader) -> Vec<u8> {
-    let mut b = Vec::with_capacity(INGRESS_CANONICAL_ID_OFFSET + CANONICAL_ID_LEN + 1 + 1 + 8 + 4);
-    b.push(KIND_INGRESS_RECORD);
-    guard.write(&mut b);
-    b.extend_from_slice(r.tx_hash.as_slice()); // canonical_id (32)
-    b.push(RT_TXREF);
-    b.push(r.shard_id);
-    b.extend_from_slice(&r.tx_data_position.term_id.to_le_bytes());
-    b.extend_from_slice(&r.tx_data_position.term_offset.to_le_bytes());
-    // tx_data publisher session. This is the active/active ingress join
-    // discriminator.
-    b.extend_from_slice(&r.tx_data_session_id.to_le_bytes());
+    let mut b = Vec::with_capacity(TXREF_RECORD_LEN);
+    guard.write_reference(&mut b, r, RT_TXREF);
     b
 }
 

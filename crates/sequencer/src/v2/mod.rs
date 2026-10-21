@@ -10,6 +10,8 @@
 //! - A forwarded transaction goes to the sealer as a reference.
 //! - A refused one goes to the client on `tx_errors` and `tx_status`.
 //! - A sender with no state goes to the lookup task.
+//! - With verdicts on, the answer to each transaction goes to the ingress
+//!   that published it ([`verdicts`]).
 //!
 //! The loop keeps no ledger of offers and no resync: the sealer orders a
 //! reference once, and the filter forgets a forwarded run that no row
@@ -20,6 +22,9 @@
 //! the parked depth of each vslot ([`depth`]) at each sweep.
 
 mod depth;
+mod verdicts;
+
+pub use verdicts::VerdictOut;
 
 use std::collections::VecDeque;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -29,10 +34,10 @@ use alloy_primitives::{Address, B256};
 use kardamom_cluster_adapter::wire::{GuardHeader, position_deadline};
 use kardamom_log::aeron_live::{IdleBackoff, IdleCap};
 use kardamom_types::shard_map::{VslotSet, vslot_for};
-use kardamom_types::{TxDataLoc, TxError, TxErrorReason, TxStatus};
+use kardamom_types::{TxDataLoc, TxEnvelope, TxError, TxErrorReason, TxStatus};
 
 use crate::admission::{
-    AccountState, Admission, AdmissionConfig, Candidate, ImagePos, Refusal, Verdict,
+    AccountState, Ack, Admission, AdmissionConfig, Candidate, ImagePos, Refusal, Verdict,
 };
 use crate::error::SequencerError;
 use crate::fees::FeeGate;
@@ -53,6 +58,10 @@ const UNIT_SHIFT: u32 = 5;
 pub struct AdmissionSettings {
     /// Run the v2 loop in place of the v1 loop.
     pub enabled: bool,
+    /// Send the answer to each transaction to the ingress that published
+    /// it, on `tx_verdicts`: accepted into the mempool, or rejected with the
+    /// reason. Only the v2 loop sends verdicts.
+    pub verdicts: bool,
     /// The most transactions of one sender that wait for a nonce gap.
     pub max_parked: NonZeroUsize,
     /// The most forwarded transactions of one sender that no row confirmed.
@@ -68,6 +77,10 @@ pub struct AdmissionSettings {
     pub max_senders: NonZeroUsize,
     /// The time between two sweeps, in milliseconds.
     pub sweep_every_ms: u64,
+    /// The time after which a sender whose state came from a lookup asks
+    /// again, while a parked transaction waits for a gap over it, in
+    /// milliseconds.
+    pub relook_ms: u64,
     /// The offers that may wait for the sealer.
     pub outbox_cap: NonZeroUsize,
 }
@@ -76,12 +89,14 @@ impl Default for AdmissionSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            verdicts: false,
             max_parked: NonZeroUsize::new(16).unwrap_or(NonZeroUsize::MIN),
             max_forwarded: NonZeroUsize::new(64).unwrap_or(NonZeroUsize::MIN),
             loss_blocks: NonZeroU64::new(16).unwrap_or(NonZeroU64::MIN),
             park_width_units: NonZeroU64::new(1 << 17).unwrap_or(NonZeroU64::MIN),
             max_senders: NonZeroUsize::new(1 << 20).unwrap_or(NonZeroUsize::MIN),
             sweep_every_ms: 50,
+            relook_ms: 500,
             outbox_cap: NonZeroUsize::new(4096).unwrap_or(NonZeroUsize::MIN),
         }
     }
@@ -100,6 +115,7 @@ impl AdmissionSettings {
                 loss_blocks: self.loss_blocks,
                 park_width: self.park_width_units,
                 park_ttl: tx_ttl,
+                relook_after: Duration::from_millis(self.relook_ms),
                 max_senders: self.max_senders,
             },
             sweep_every: Duration::from_millis(self.sweep_every_ms),
@@ -122,7 +138,7 @@ pub struct V2Config {
 }
 
 /// One change of the chain state that the filter holds.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum AccountEvent {
     /// The account rows of a block, for the senders of this replica.
     Rows {
@@ -141,7 +157,6 @@ pub enum AccountEvent {
 /// What the loop needs to offer one forwarded transaction.
 #[derive(Debug)]
 pub struct RefPayload {
-    tx_hash: B256,
     /// The vslot of the sender, for the parked depth.
     vslot: u8,
     lane: u8,
@@ -149,6 +164,11 @@ pub struct RefPayload {
     /// The deadline field of the guard header.
     deadline: u64,
     tip: u128,
+    /// The archived envelope, when the sealer carries the bytes. A parked
+    /// transaction keeps it until it goes out: the filter bounds the parked
+    /// transactions of each sender, and the park width and time to live
+    /// bound how long they stay.
+    envelope: Option<bytes::Bytes>,
 }
 
 /// The publish loop of sequencer v2 for one replica.
@@ -165,6 +185,7 @@ pub struct AdmissionLoop {
     last_sweep: Instant,
     hot: HotMetrics,
     depth: depth::ParkDepth,
+    to_ingress: verdicts::Verdicts,
 }
 
 impl AdmissionLoop {
@@ -188,7 +209,14 @@ impl AdmissionLoop {
             last_sweep: Instant::now(),
             hot: HotMetrics::new(cfg.partition),
             depth: depth::ParkDepth::default(),
+            to_ingress: verdicts::Verdicts::off(cfg.partition),
         }
+    }
+
+    /// Send the answer to each transaction to the ingress that published
+    /// it, through `out`.
+    pub fn enable_verdicts(&mut self, out: tokio::sync::mpsc::Sender<VerdictOut>) {
+        self.to_ingress.to(out);
     }
 
     /// Follow the decision version that the sealer reports. See
@@ -317,11 +345,19 @@ impl AdmissionLoop {
         }
         self.hot.ingest.increment(1);
         let fields = decode_fields(&inbound.envelope.raw_tx)?;
+        let ingress = TxEnvelope::ingress_id_of(inbound.envelope.correlation_id);
         let tip = match self.fees.admit(sender, &fields.fees) {
             Ok(tip) => tip,
             Err(reason) => {
                 self.hot.fee_rejected.increment(1);
-                reject(side, inbound.envelope.tx_hash, sender, fields.nonce, reason);
+                let ack = Ack {
+                    ingress,
+                    sender,
+                    nonce: fields.nonce,
+                    tx_hash: inbound.envelope.tx_hash,
+                };
+                self.to_ingress.reject(ack, reason.clone());
+                reject(side, ack.tx_hash, sender, fields.nonce, reason);
                 return Ok(());
             }
         };
@@ -332,24 +368,38 @@ impl AdmissionLoop {
         let candidate = Candidate {
             sender,
             nonce: fields.nonce,
+            tx_hash: inbound.envelope.tx_hash,
             cost: fields.fees.fees.worst_case_cost(fields.fees.value),
             image: ImagePos {
                 lane: inbound.lane,
                 session: inbound.loc.session_id,
                 unit: inbound.stream_position >> UNIT_SHIFT,
             },
+            ingress,
+            answered: false,
             payload: RefPayload {
-                tx_hash: inbound.envelope.tx_hash,
                 vslot,
                 lane: inbound.lane,
                 loc: inbound.loc,
                 deadline,
                 tip,
+                envelope: self.carried(&inbound.envelope)?,
             },
         };
         self.depth.took(vslot);
         self.admission.offer(candidate, &mut self.verdicts);
         Ok(())
+    }
+
+    /// The archived envelope for the offer, when the sealer carries the
+    /// bytes.
+    fn carried(&self, envelope: &TxEnvelope) -> Result<Option<bytes::Bytes>, SequencerError> {
+        if !self.sealer_version.carries_bytes() {
+            return Ok(None);
+        }
+        kardamom_log::codec::encode(envelope)
+            .map(|archived| Some(bytes::Bytes::from(archived.into_vec())))
+            .map_err(|e| SequencerError::EncodeFailed(format!("envelope: {e}")))
     }
 
     /// The deadline field: the tagged position under decision version 4,
@@ -377,21 +427,23 @@ impl AdmissionLoop {
         side: &mut R,
     ) {
         match verdict {
-            Verdict::Forward(c) => {
+            Verdict::Forward(mut c) => {
                 self.depth.gave(c.payload.vslot);
+                if let Some(ack) = c.answer() {
+                    self.to_ingress.accept(ack);
+                }
                 self.outbox.push_back(offer_of(&c));
             }
-            Verdict::Reject(c, refusal) => {
+            Verdict::Reject(mut c, refusal) => {
                 self.depth.gave(c.payload.vslot);
                 self.count_refusal(refusal);
-                reject(
-                    side,
-                    c.payload.tx_hash,
-                    c.sender,
-                    c.nonce,
-                    reason_of(refusal),
-                );
+                let reason = reason_of(refusal);
+                if let Some(ack) = c.answer() {
+                    self.to_ingress.reject(ack, reason.clone());
+                }
+                reject(side, c.tx_hash, c.sender, c.nonce, reason);
             }
+            Verdict::Accept(ack) => self.to_ingress.accept(ack),
             Verdict::Lookup(address) => {
                 self.hot.lookup_requests.increment(1);
                 if self.lookups.try_send(address).is_err() {
@@ -443,7 +495,7 @@ impl AdmissionLoop {
 fn offer_of(c: &Candidate<RefPayload>) -> RefOffer {
     RefOffer {
         tx_ref: kardamom_types::TxRef::new(
-            c.payload.tx_hash,
+            c.tx_hash,
             c.payload.lane,
             c.payload.loc.position,
             c.payload.loc.session_id,
@@ -454,6 +506,7 @@ fn offer_of(c: &Candidate<RefPayload>) -> RefOffer {
             max_inclusion_block: c.payload.deadline,
             tip: c.payload.tip,
         },
+        envelope: c.payload.envelope.clone(),
     }
 }
 
@@ -463,7 +516,7 @@ fn reason_of(refusal: Refusal) -> TxErrorReason {
         Refusal::NonceTooLow { chain_nonce } => TxErrorReason::DuplicatedTx {
             expected_nonce: chain_nonce,
         },
-        Refusal::InFlight { expected_nonce } => TxErrorReason::DuplicatedTx { expected_nonce },
+        Refusal::InFlight { expected_nonce } => TxErrorReason::AlreadyKnown { expected_nonce },
         Refusal::InsufficientFunds { available, cost } => TxErrorReason::InsufficientFunds {
             have: available.saturating_to(),
             want: cost.saturating_to(),

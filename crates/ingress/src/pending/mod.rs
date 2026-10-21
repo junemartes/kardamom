@@ -405,9 +405,10 @@ impl PendingReceipts {
 
 /// Maps a sequencer rejection reason to the JSON-RPC error the parked
 /// client receives, for [`PendingReceipts::on_tx_error`].
-fn reason_to_error(sender: Address, nonce: u64, reason: &TxErrorReason) -> IngressError {
+pub(crate) fn reason_to_error(sender: Address, nonce: u64, reason: &TxErrorReason) -> IngressError {
     match reason {
         TxErrorReason::DuplicatedTx { .. } => IngressError::Duplicate((sender, nonce)),
+        TxErrorReason::AlreadyKnown { .. } => IngressError::AlreadyKnown,
         TxErrorReason::Evicted { .. } => IngressError::Evicted((sender, nonce)),
         TxErrorReason::Expired { .. } => IngressError::Expired((sender, nonce)),
         TxErrorReason::PastDeadline {

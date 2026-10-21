@@ -25,6 +25,11 @@ pub(crate) const FEE_REJECTED: &str = "kardamom_sequencer_fee_rejected_total";
 pub(crate) const NONCE_LOOKUP_REQUESTS: &str = "kardamom_sequencer_nonce_lookup_requests_total";
 pub(crate) const NONCE_LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
 pub(crate) const NONCE_LOOKUPS_IN_FLIGHT: &str = "kardamom_sequencer_nonce_lookups_in_flight";
+/// The receipts that the v2 loop matched to the ingress that published
+/// their transactions, by `outcome`: `sent` to the verdict task, `full`
+/// when its queue had no room, `closed` when the task is gone, and `wide`
+/// when the ingress id does not fit a verdict stream id (above 255).
+pub(crate) const VERDICTS: &str = "kardamom_sequencer_verdicts_total";
 /// Envelopes dropped by the wrong-shard guard: their vslot is not in this
 /// replica's set. During a resize, a new shard reads the old lanes whole,
 /// so this counts the other shards' traffic. It is not an error.
@@ -193,6 +198,11 @@ pub fn record_pending_depth(partition: u32, vslot: u8, depth: u32) {
 pub fn record_nonce_lookup(partition: u32, outcome: &'static str) {
     counter!(NONCE_LOOKUPS, "partition" => partition.to_string(), "outcome" => outcome)
         .increment(1);
+}
+
+pub(crate) fn record_verdicts(partition: u32, outcome: &'static str, n: usize) {
+    counter!(VERDICTS, "partition" => partition.to_string(), "outcome" => outcome)
+        .increment(u64::try_from(n).unwrap_or(u64::MAX));
 }
 
 pub fn record_nonce_lookups_in_flight(partition: u32, n: usize) {

@@ -203,11 +203,20 @@ impl<'a> StackLaunch<'a> {
             chain_id: self.cfg.chain_id.get(),
             genesis,
             log_config,
-            // KARDAMOM_E2E_ADMISSION=1 runs the sequencers on the v2 loop,
-            // so the suite covers both loops.
-            admission: !self.cfg.unpayable_spends
-                && std::env::var("KARDAMOM_E2E_ADMISSION").is_ok_and(|v| v == "1"),
+            admission: self.v2_loop(),
+            // KARDAMOM_E2E_VERDICTS=1 adds the verdict path to the v2 loop.
+            verdicts: self.v2_loop()
+                && !self.cfg.ingress_rows
+                && std::env::var("KARDAMOM_E2E_VERDICTS").is_ok_and(|v| v == "1"),
         }
+    }
+
+    /// `KARDAMOM_E2E_ADMISSION=1` runs the sequencers on the v2 loop, so the
+    /// suite covers both loops. A scenario that needs transactions that
+    /// cannot pay keeps the v1 loop: the v2 filter refuses them.
+    fn v2_loop(&self) -> bool {
+        !self.cfg.unpayable_spends
+            && std::env::var("KARDAMOM_E2E_ADMISSION").is_ok_and(|v| v == "1")
     }
 }
 

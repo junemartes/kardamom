@@ -32,6 +32,8 @@ Notes on the table:
 - A sequencer node runs one replica for each lane it serves. Lane `L` uses port `9001 + 10 * L`.
   Each lane has two racing replicas on different nodes.
   Scraping one lane port on every sequencer node gives one replica of that lane for each node.
+- The ingress inside a sequencer process (the `ingress` subcommand, the job variable `ingress`) has no exporter of its own.
+  Its `kardamom_ingress_*` metrics go to the exporter of the sequencer, with `service="sequencer"`.
 - The validator and the state mirror have the same default port. The cluster deploy binds the validator to `9006`.
   The ingress also binds `9006`. Run the two on different nodes.
 - The cluster jobs bind each exporter to `0.0.0.0`. Prometheus then scrapes the exporters from another node.
@@ -159,7 +161,7 @@ It answers 503 with the failed conditions when the rule does not hold.
 
 | Service | Rule |
 | --- | --- |
-| `kardamom-ingress` | `kardamom_ingress_draining == 0`. The RPC port `GET /health` answers 503 while the ingress drains. |
+| `kardamom-ingress` | `kardamom_ingress_draining == 0`. The RPC port `GET /health` answers 503 while the ingress drains. The ingress inside a sequencer process has only the `/health` route: the rule of the sequencer does not read the drain. |
 | `kardamom-sequencer` | `kardamom_sequencer_last_boundary_unix_seconds` is fresher than `boundary_silence_ms` (default 10000). The session is open and the egress is attached. |
 | `kardamom-executor` | `kardamom_executor_block_number` is within `--ready-lag-blocks` of `kardamom_sealer_block_number`. |
 | `kardamom-validator` | `validator_verdict_standing == 0`, and `validator_committed_block` is within `--ready-lag-blocks` of `validator_sealer_block_number`. |
@@ -497,6 +499,7 @@ the replay retention of the sealer, and the record-lag guard. See [l1-data-path.
 | `kardamom_ingress_execute_latency_seconds` | A histogram: the time from the `tx_data` publish of a transaction to the first executor receipt for it. Only the ingress that published the transaction records it. A receipt later than 180 s gives no sample. The buckets are the shared service buckets. |
 | `kardamom_ingress_execute_stamps_expired_total` | The publish stamps that no receipt matched within 180 s. A non-zero rate under load means that the execute latency histogram undercounts the tail. |
 | `kardamom_ingress_execute_stamps_dropped_total` | The publish stamps that the submit path dropped because the channel to the executed clock (65,536 stamps) was full. |
+| `kardamom_ingress_bus_lagged_total{bus}` | The items that a stream bus of the ingress (32,768 items) dropped because its watcher fell behind. `bus` is `tx_receipts`, `tx_verdicts`, `tx_errors`, `block_boundaries`, `quorum_watermark` or `local_fsync_watermark`. A dropped verdict leaves its submission to the ack timeout. A dropped receipt or error does not release its waiter, so that client waits until the pending timeout (30 s). A non-zero `tx_receipts` rate explains a 30 s tail in the submit latency. |
 
 - The sealed head minus the posted head is the DA lag. The sealer refuses new transactions when it passes the DA-lag budget.
 - The record lag is the canonical count minus the best recorded cursor plus one. The ingress takes the count from the records and boundaries that it observed before the status frame. The sealer refuses user transactions when the record lag passes `recordLagBudget`. A flat recorded head while the lag grows means that no executor records.

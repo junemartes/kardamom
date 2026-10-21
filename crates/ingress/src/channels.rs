@@ -20,7 +20,7 @@ use kardamom_cache::{LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
 use kardamom_obs::events::BoardView;
 use kardamom_types::{
     AccountRow, BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, Receipt,
-    ReceiptRollback, TxEnvelope, TxError,
+    ReceiptRollback, TxEnvelope, TxError, TxStatus,
 };
 
 use crate::error::IngressError;
@@ -91,6 +91,10 @@ pub trait IngressSubscription: Send + Sync + 'static {
     /// duplicate. Drives early release of parked client submissions with
     /// a JSON-RPC error.
     fn subscribe_tx_errors(&self) -> broadcast::Receiver<TxError>;
+    /// Stream of the verdicts on the `tx_verdicts` stream of this ingress:
+    /// one `Accepted` or `Rejected` status for each transaction from each
+    /// twin. Drives the ack at admission ([`crate::acks`]).
+    fn subscribe_verdicts(&self) -> broadcast::Receiver<TxStatus>;
     /// The local account layer this subscription feeds: the account rows
     /// of every `tx_receipts` batch, applied before the batch's receipts
     /// fan out on [`Self::subscribe_receipts`]. So a client released by
@@ -126,7 +130,13 @@ where
 /// Capacity of each `tx_receipts`, watermark, and `tx_errors` broadcast
 /// bus. [`crate::aeron_adapters::LiveIngressSubscription`] uses the same
 /// value for its live buses.
-pub(crate) const BUS_CAPACITY: usize = 1024;
+///
+/// One item is one receipt, and the ingress reads the receipts of every
+/// executor. A bus drops its oldest items when its watcher falls behind,
+/// and the waiter of a dropped receipt waits until the pending timeout.
+/// So the bus holds some seconds of receipts at full load, not a fraction
+/// of a second: a short stall of the runtime then drops nothing.
+pub(crate) const BUS_CAPACITY: usize = 32 * 1024;
 
 // ============================================================================
 // MockChannels: in-process implementation for tests and benches.
@@ -146,6 +156,7 @@ pub struct MockChannels {
     pub(crate) local_fsync_bus: broadcast::Sender<FsyncWatermark>,
     pub(crate) block_boundary_bus: broadcast::Sender<BlockBoundary>,
     pub tx_error_bus: broadcast::Sender<TxError>,
+    pub verdict_bus: broadcast::Sender<TxStatus>,
     /// The cluster status a test drives, as the egress observer would.
     pub cluster_status_bus: watch::Sender<ClusterStatus>,
     /// The board of service states a test drives, as the events stream
@@ -182,6 +193,7 @@ impl MockChannels {
         let (local_fsync_bus, _) = broadcast::channel(BUS_CAPACITY);
         let (block_boundary_bus, _) = broadcast::channel(BUS_CAPACITY);
         let (tx_error_bus, _) = broadcast::channel(BUS_CAPACITY);
+        let (verdict_bus, _) = broadcast::channel(BUS_CAPACITY);
         let (cluster_status_bus, _) = watch::channel(ClusterStatus::default());
         let (service_board_bus, _) = watch::channel(BoardView::default());
         let (live, writer) = LiveAccounts::new(live_cfg);
@@ -194,6 +206,7 @@ impl MockChannels {
                 local_fsync_bus,
                 block_boundary_bus,
                 tx_error_bus,
+                verdict_bus,
                 cluster_status_bus,
                 service_board_bus,
                 live,
@@ -258,6 +271,9 @@ impl IngressSubscription for MockChannels {
     }
     fn subscribe_tx_errors(&self) -> broadcast::Receiver<TxError> {
         self.tx_error_bus.subscribe()
+    }
+    fn subscribe_verdicts(&self) -> broadcast::Receiver<TxStatus> {
+        self.verdict_bus.subscribe()
     }
     fn live_accounts(&self) -> Arc<LiveAccounts> {
         self.live.clone()

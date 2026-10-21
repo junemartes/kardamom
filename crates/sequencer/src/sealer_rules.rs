@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use kardamom_cluster_adapter::wire::SEALER_V4_DECISION_VERSION;
+use kardamom_cluster_adapter::wire::{SEALER_V4_DECISION_VERSION, SEALER_V5_DECISION_VERSION};
 
 use crate::metrics;
 
@@ -37,6 +37,14 @@ impl SealerVersion {
     #[must_use]
     pub fn orders_by_position(&self) -> bool {
         self.get() >= SEALER_V4_DECISION_VERSION
+    }
+
+    /// Whether the sealer of the current session runs decision version 5 or
+    /// newer: it then takes each reference with the bytes of its
+    /// transaction, and orders the bytes.
+    #[must_use]
+    pub fn carries_bytes(&self) -> bool {
+        self.get() >= SEALER_V5_DECISION_VERSION
     }
 }
 

@@ -9,14 +9,20 @@
 //! [`feeds`]. The `aeron_live` handles implement the sequencer's
 //! subscriber/publisher traits directly (`kardamom_sequencer::{epoch,
 //! remote_epoch, outbound}`); the lane set is [`feeds::LaneSubscriptions`].
+//!
+//! The flags live in [`args`]. With the `ingress` subcommand, the process
+//! also runs the ingress service ([`ingress`]).
 
+mod args;
 mod feeds;
+mod ingress;
 
-use std::num::{NonZeroU32, NonZeroU64};
-use std::path::PathBuf;
+use std::num::NonZeroU32;
 
 use anyhow::{Context, Result};
+use args::Args;
 use clap::Parser;
+use feeds::{LaneSub, LaneSubscriptions, PublishLoops};
 use kardamom_cluster_adapter::LiveCluster;
 use kardamom_log::aeron_live::{
     AeronRuntime, ServiceEventsPublisherHandle, TxDepositsSubscriberHandle,
@@ -29,194 +35,6 @@ use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::fees::FeeGate;
 use kardamom_sequencer::lookup::LookupRequester;
 use kardamom_sequencer::sequencer::Shutdown;
-use kardamom_types::shard_map::VslotSet;
-
-use feeds::{LaneSub, LaneSubscriptions, PublishLoops};
-
-#[derive(Debug, Parser)]
-#[command(
-    name = "kardamom-sequencer",
-    version,
-    about = "kardamom sequencer process"
-)]
-struct Args {
-    /// Path to a TOML config file (schema: `SequencerConfig`).
-    #[arg(long)]
-    config: PathBuf,
-    /// Optional `LogConfig` TOML that supplies the Aeron `[channels]`
-    /// config. If unset, it uses built-in single-host IPC defaults (this
-    /// keeps local and e2e behavior). Multi-host deployments point this at
-    /// the rendered UDP channels config.
-    #[arg(long, env = "KARDAMOM_LOG_CONFIG")]
-    log_config: Option<PathBuf>,
-    /// Aeron Media Driver directory (`aeron.dir`).
-    #[arg(long)]
-    aeron_dir: Option<PathBuf>,
-    /// Override the partition index from the config.
-    #[arg(long)]
-    partition_index: Option<u32>,
-    /// Override the partition count (M).
-    #[arg(long)]
-    partition_count: Option<NonZeroU32>,
-    /// Replica-group shard rotation. The effective partition becomes
-    /// `(partition_index + partition_offset) % partition_count`, and
-    /// `sequencer_id` follows it, unless explicitly overridden. This lets
-    /// a second Nomad group of racing replicas reuse the same
-    /// node-derived `--partition-index` while it serves a rotated shard.
-    /// So the two replicas of any shard land on different nodes,
-    /// deterministically. This is incompatible with an explicit
-    /// `--sequencer-id`: the `tx_data` subscription and `TxRef.shard_id`
-    /// must both follow the rotated shard.
-    ///
-    /// Racing replicas are safe by construction. Refs encode
-    /// deterministically from the shared per-shard `tx_data` stream, and
-    /// the Aeron Cluster dedups records by `canonical_id` first-seen. This
-    /// is the same mechanism that already absorbs the M duplicate
-    /// `DepositRefs`.
-    #[arg(long, default_value_t = 0)]
-    partition_offset: u32,
-    /// Override the sequencer id embedded in every `tx_ordering` `TxRef`.
-    /// If omitted and the TOML did not set it, falls back to
-    /// `partition_index as u8`.
-    #[arg(long)]
-    sequencer_id: Option<u8>,
-    /// The own `tx_data` lane (`lane`). Defaults to the sequencer id.
-    #[arg(long, env = "KARDAMOM_LANE")]
-    lane: Option<u8>,
-    /// The vslots this replica serves (`vslots`), as ranges: `0-7,16`.
-    /// Defaults to the identity map over the partition count.
-    #[arg(long, env = "KARDAMOM_VSLOTS")]
-    vslots: Option<VslotSet>,
-    /// The old lanes to read during a resize (`extra_lanes`).
-    #[arg(long, env = "KARDAMOM_EXTRA_LANES", value_delimiter = ',')]
-    extra_lanes: Vec<u8>,
-    /// The incoming vslots that start in shadow mode (`shadow_vslots`).
-    #[arg(long, env = "KARDAMOM_SHADOW_VSLOTS")]
-    shadow_vslots: Option<VslotSet>,
-    /// The shadow warm-up in ms (`shadow_warm_ms`). Defaults to
-    /// `tx_ttl_ms + 5000`.
-    #[arg(long, env = "KARDAMOM_SHADOW_WARM_MS")]
-    shadow_warm_ms: Option<u64>,
-    /// The lifetime of a transaction that waits on a nonce gap, in ms
-    /// (`tx_ttl_ms`). The deploy passes the same value to the ingress as
-    /// `--pending-receipt-timeout-ms`. Zero is rejected.
-    #[arg(long, env = "KARDAMOM_TX_TTL_MS")]
-    tx_ttl_ms: Option<NonZeroU64>,
-    /// Override the CPU core to pin to.
-    #[arg(long)]
-    core_id: Option<usize>,
-    /// This node's cluster-egress endpoint `ip:port` (cluster mode). Sets
-    /// or overrides the `[cluster] egress_channel` as
-    /// `aeron:udp?endpoint=<ip:port>`. The Nomad job injects this per node
-    /// as `${meta.node_ip}:${NOMAD_HOST_PORT_egress}`.
-    #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
-    cluster_egress_endpoint: Option<String>,
-    /// Address for the Prometheus /metrics HTTP listener.
-    #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9001")]
-    metrics_addr: std::net::SocketAddr,
-    /// Host identifier; stamped on every metric.
-    #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
-    host_id: kardamom_obs::HostId,
-    /// The cluster's first-seen dedup window (`[resync] dedup_capacity`).
-    /// Must equal the JVM's `-Dkardamom.cluster.dedupCapacity`: the lag
-    /// horizon the resync mechanism protects.
-    #[arg(long, env = "KARDAMOM_CLUSTER_DEDUP_CAPACITY")]
-    cluster_dedup_capacity: Option<NonZeroU64>,
-    /// Watermark-jump enter threshold as a percent of the dedup capacity
-    /// (`[resync] enter_percent`).
-    #[arg(long, env = "KARDAMOM_RESYNC_ENTER_PERCENT")]
-    resync_enter_percent: Option<NonZeroU64>,
-    /// Boundary-silence resync trigger, ms (`[resync] boundary_silence_ms`).
-    #[arg(long, env = "KARDAMOM_RESYNC_BOUNDARY_SILENCE_MS")]
-    resync_boundary_silence_ms: Option<u64>,
-    /// The executor nonce query endpoints, as a comma-separated list of
-    /// `http://host:port` (`[lookup] executor_endpoints`). Empty means no
-    /// lookup. See `docs/specs/dynamic-sequencer-sizing.md`, section 3.4.
-    #[arg(long, env = "KARDAMOM_EXECUTOR_QUERY_ENDPOINTS", value_delimiter = ',')]
-    executor_query_endpoints: Vec<String>,
-    /// Executor replica count for the `tx_receipts` MDS fan-in (parity with
-    /// the validator). Falls back to `channels.tx_receipts_executor_count`.
-    /// Not relevant when receipts ride multicast (the cluster deploy).
-    #[arg(long)]
-    executor_count: Option<NonZeroU32>,
-    /// Priority fees on or off (`[fees] priority`). Must match the
-    /// sealer's `-Dkardamom.cluster.orderingWindow` (20 for on, 0 for
-    /// off): the deploy sets both from one value.
-    #[arg(long, env = "KARDAMOM_PRIORITY_FEES")]
-    priority_fees: Option<bool>,
-}
-
-/// Fold the CLI and env overrides into the TOML-loaded config: the
-/// plain overrides first, then the replica-group shard rotation and the
-/// sequencer id fallback, which read the overridden partition index.
-fn apply_cli_overrides(args: &Args, cfg: &mut SequencerConfig) -> Result<()> {
-    apply_plain_overrides(args, cfg);
-    if args.partition_offset != 0 {
-        // An explicit --sequencer-id combined with rotation would
-        // subscribe to tx_data stream `sequencer_id`, while the
-        // wrong-shard guard filters on the rotated `partition_index`. The
-        // replica would silently drop every envelope, and its TxRefs
-        // would stamp a shard_id its twin does not, breaking
-        // byte-identical dedup.
-        anyhow::ensure!(
-            args.sequencer_id.is_none(),
-            "--sequencer-id cannot be combined with --partition-offset: \
-             the sequencer id must follow the rotated shard \
-             (sequencer_id == partition_index)"
-        );
-        let raw_index = cfg.partition_index;
-        cfg.rotate_partition(args.partition_offset)
-            .context("rotate partition")?;
-        tracing::info!(
-            raw_index,
-            offset = args.partition_offset,
-            rotated = cfg.partition_index,
-            "partition-offset: rotated shard assignment (racing replica group)"
-        );
-    }
-    if let Some(id) = args.sequencer_id {
-        cfg.sequencer_id = id;
-    } else if cfg.sequencer_id == 0 && cfg.partition_index != 0 {
-        // A count above 256 would otherwise truncate silently:
-        // sequencer_id is a u8 on the wire (TxRef.shard_id).
-        cfg.sequencer_id = u8::try_from(cfg.partition_index)
-            .context("partition_index does not fit in sequencer_id (u8)")?;
-    }
-    Ok(())
-}
-
-/// The overrides that copy a set flag over the TOML value. A flag left
-/// unset, or an empty list, keeps the TOML value.
-fn apply_plain_overrides(args: &Args, cfg: &mut SequencerConfig) {
-    cfg.partition_index = args.partition_index.unwrap_or(cfg.partition_index);
-    cfg.partition_count = args.partition_count.map_or(
-        cfg.partition_count,
-        kardamom_sequencer::partition::PartitionCount::new,
-    );
-    cfg.tx_ttl_ms = args.tx_ttl_ms.unwrap_or(cfg.tx_ttl_ms);
-    if !args.executor_query_endpoints.is_empty() {
-        cfg.lookup
-            .executor_endpoints
-            .clone_from(&args.executor_query_endpoints);
-    }
-    cfg.lane = args.lane.or(cfg.lane);
-    cfg.vslots = args.vslots.or(cfg.vslots);
-    if !args.extra_lanes.is_empty() {
-        cfg.extra_lanes.clone_from(&args.extra_lanes);
-    }
-    cfg.shadow_vslots = args.shadow_vslots.unwrap_or(cfg.shadow_vslots);
-    cfg.shadow_warm_ms = args.shadow_warm_ms.or(cfg.shadow_warm_ms);
-    cfg.core_id = args.core_id.or(cfg.core_id);
-    cfg.cluster
-        .set_egress_endpoint(args.cluster_egress_endpoint.as_deref());
-    let resync = &mut cfg.resync;
-    resync.dedup_capacity = args.cluster_dedup_capacity.unwrap_or(resync.dedup_capacity);
-    resync.enter_percent = args.resync_enter_percent.unwrap_or(resync.enter_percent);
-    resync.boundary_silence_ms = args
-        .resync_boundary_silence_ms
-        .unwrap_or(resync.boundary_silence_ms);
-    cfg.fees.priority = args.priority_fees.unwrap_or(cfg.fees.priority);
-}
 
 /// The Aeron subscriptions and publisher this sequencer needs, all opened
 /// on the same runtime `rt`.
@@ -500,6 +318,7 @@ impl ResyncWiring {
             feeds::V2Wiring {
                 accounts: accounts_rx,
                 lookups,
+                verdicts: None,
             },
             task,
         )
@@ -637,13 +456,45 @@ fn log_start(cfg: &SequencerConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Start the verdict task when the v2 loop runs with `[admission]
+/// verdicts`, and give its queue to the loop.
+fn start_verdicts(
+    resync: &mut ResyncWiring,
+    cfg: &SequencerConfig,
+    log_cfg: &LogConfig,
+    args: &Args,
+    shutdown: &Shutdown,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    let Some(v2) = resync.v2.as_mut().filter(|_| cfg.admission.verdicts) else {
+        return Ok(None);
+    };
+    let (frames, task) = feeds::VerdictFeed::start(
+        log_cfg,
+        &format!("sequencer-{}-verdicts", cfg.lane()),
+        args.aeron_dir.as_deref(),
+        shutdown,
+    )?;
+    v2.verdicts = Some(frames);
+    Ok(Some(task))
+}
+
+/// Join the verdict task. The loop dropped its end of the verdict queue,
+/// so the task ends its plane and drops its runtime.
+async fn join_verdicts(task: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = task
+        && let Err(e) = task.await
+    {
+        tracing::warn!(?e, "verdict task panicked");
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
     let args = Args::parse();
     let raw = std::fs::read_to_string(&args.config).context("read config")?;
     let mut cfg: SequencerConfig = toml::from_str(&raw).context("parse config")?;
-    apply_cli_overrides(&args, &mut cfg)?;
+    args.apply_overrides(&mut cfg)?;
     cfg.validate().context("validate config")?;
     // Ready while the cluster egress delivered a boundary within the
     // boundary-silence window: the session is open and the twin's dedup
@@ -703,7 +554,7 @@ async fn main() -> anyhow::Result<()> {
     // sustainable ingest rate.
     let receipts_rt =
         AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
-    let resync = ResyncWiring::spawn(
+    let mut resync = ResyncWiring::spawn(
         &cfg,
         rt,
         cluster_egress,
@@ -712,6 +563,7 @@ async fn main() -> anyhow::Result<()> {
         args.executor_count,
         &shutdown,
     )?;
+    let verdict_task = start_verdicts(&mut resync, &cfg, &log_cfg, &args, &shutdown)?;
 
     // Cloning shares the single session thread, and offers serialize
     // through it. All three loops use `cluster_pub` (it implements
@@ -746,9 +598,15 @@ async fn main() -> anyhow::Result<()> {
         deposits: join_deposits,
         remote_epochs: join_remote_epochs,
     };
+    let ingress = ingress::EmbeddedIngress::start(&args, &cfg, &log_cfg).await?;
 
     wait_for_shutdown().await;
     tracing::info!("kardamom-sequencer: shutdown signal received");
+    // The ingress drains first: its parked submits wait for the verdicts
+    // of the loops.
+    if let Some(ingress) = ingress {
+        ingress.stop().await;
+    }
     // `join_all` signals the loops, then joins them. The cluster session
     // (`cluster_guard`) stays alive until every publish loop has
     // stopped; `join_all` drops it as soon as it returns.
@@ -756,6 +614,7 @@ async fn main() -> anyhow::Result<()> {
     // when it returns, drops `rt` — before `receipts_rt`, still a local
     // here, drops at the end of `main`.
     loops.join_all().await;
+    join_verdicts(verdict_task).await;
     // The plane's registrations and discovery tasks end before the
     // runtime drops inside `resync.feeds.join()`.
     plane.shutdown().await;

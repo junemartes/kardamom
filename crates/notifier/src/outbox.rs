@@ -88,6 +88,7 @@ fn stage_code(stage: Stage) -> u8 {
         Stage::Sealed => 2,
         Stage::Executed => 3,
         Stage::Rejected => 4,
+        Stage::Accepted => 5,
     }
 }
 
@@ -97,6 +98,7 @@ fn stage_from_code(code: u8) -> Option<Stage> {
         2 => Some(Stage::Sealed),
         3 => Some(Stage::Executed),
         4 => Some(Stage::Rejected),
+        5 => Some(Stage::Accepted),
         _ => None,
     }
 }
