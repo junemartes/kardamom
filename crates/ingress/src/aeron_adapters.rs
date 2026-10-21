@@ -285,8 +285,10 @@ pub struct LiveIngressSubscription {
 impl LiveIngressSubscription {
     /// Open the five subscriber handles through `plane`: `tx_errors`,
     /// receipts, boundaries, and `events` follow the plane's transport;
-    /// the fsync watermark still opens on its static channel. The
-    /// receipt pump owns `executed`, the clock of the executed stage.
+    /// the fsync watermark still opens on its static channel. With
+    /// `verdicts`, the receipts are the `tx_verdicts` stream of that
+    /// ingress id. The receipt pump owns `executed`, the clock of the
+    /// executed stage.
     ///
     /// # Errors
     ///
@@ -298,6 +300,7 @@ impl LiveIngressSubscription {
         recorder_id: u8,
         executor_count: Option<NonZeroU32>,
         live_cfg: &LiveAccountsConfig,
+        verdicts: Option<u8>,
         executed: StageClock,
     ) -> Result<Self, IngressError> {
         let channels = plane.channels().clone();
@@ -325,9 +328,24 @@ impl LiveIngressSubscription {
         // aggregates the streams: every executor publisher the plane
         // discovers, or the static channel's members. The batch frame's
         // account rows feed the local layer on the way through.
-        let receipts_sub = plane
-            .tx_receipts_subscriber(rt, executor_count)
-            .map_err(|e| IngressError::internal("open tx_receipts", e))?;
+        //
+        // With `verdicts`, the receipts of this ingress's own transactions
+        // come from its `tx_verdicts` stream instead, in the same frame
+        // format, with no account rows.
+        let receipts_sub = match verdicts {
+            None => plane
+                .tx_receipts_subscriber(rt, executor_count)
+                .map_err(|e| IngressError::internal("open tx_receipts", e))?,
+            Some(own) => {
+                tracing::info!(
+                    ingress_id = own,
+                    "receipts come from the tx_verdicts stream"
+                );
+                plane
+                    .tx_verdicts_subscriber(rt, own)
+                    .map_err(|e| IngressError::internal("open tx_verdicts", e))?
+            }
+        };
         // `into_receiver()`: the pump task must not hold an
         // `AeronRuntime` clone. Holding one would keep the runtime alive
         // forever; see `TxReceiptsSubscriberHandle::into_receiver`.

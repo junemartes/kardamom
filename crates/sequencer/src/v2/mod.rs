@@ -20,6 +20,9 @@
 //! the parked depth of each vslot ([`depth`]) at each sweep.
 
 mod depth;
+mod verdicts;
+
+pub use verdicts::VerdictOut;
 
 use std::collections::VecDeque;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -29,7 +32,9 @@ use alloy_primitives::{Address, B256};
 use kardamom_cluster_adapter::wire::{GuardHeader, position_deadline};
 use kardamom_log::aeron_live::{IdleBackoff, IdleCap};
 use kardamom_types::shard_map::{VslotSet, vslot_for};
-use kardamom_types::{TxDataLoc, TxEnvelope, TxError, TxErrorReason, TxStatus};
+use kardamom_types::{
+    AccountRow, Receipt, ReceiptRollback, TxDataLoc, TxEnvelope, TxError, TxErrorReason, TxStatus,
+};
 
 use crate::admission::{
     AccountState, Admission, AdmissionConfig, Candidate, ImagePos, Refusal, Verdict,
@@ -53,6 +58,9 @@ const UNIT_SHIFT: u32 = 5;
 pub struct AdmissionSettings {
     /// Run the v2 loop in place of the v1 loop.
     pub enabled: bool,
+    /// Send the receipt of each forwarded transaction to the ingress that
+    /// published it, on `tx_verdicts`. Only the v2 loop sends verdicts.
+    pub verdicts: bool,
     /// The most transactions of one sender that wait for a nonce gap.
     pub max_parked: NonZeroUsize,
     /// The most forwarded transactions of one sender that no row confirmed.
@@ -68,6 +76,10 @@ pub struct AdmissionSettings {
     pub max_senders: NonZeroUsize,
     /// The time between two sweeps, in milliseconds.
     pub sweep_every_ms: u64,
+    /// The time after which a sender whose state came from a lookup asks
+    /// again, while a parked transaction waits for a gap over it, in
+    /// milliseconds.
+    pub relook_ms: u64,
     /// The offers that may wait for the sealer.
     pub outbox_cap: NonZeroUsize,
 }
@@ -76,12 +88,14 @@ impl Default for AdmissionSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            verdicts: false,
             max_parked: NonZeroUsize::new(16).unwrap_or(NonZeroUsize::MIN),
             max_forwarded: NonZeroUsize::new(64).unwrap_or(NonZeroUsize::MIN),
             loss_blocks: NonZeroU64::new(16).unwrap_or(NonZeroU64::MIN),
             park_width_units: NonZeroU64::new(1 << 17).unwrap_or(NonZeroU64::MIN),
             max_senders: NonZeroUsize::new(1 << 20).unwrap_or(NonZeroUsize::MIN),
             sweep_every_ms: 50,
+            relook_ms: 500,
             outbox_cap: NonZeroUsize::new(4096).unwrap_or(NonZeroUsize::MIN),
         }
     }
@@ -100,6 +114,7 @@ impl AdmissionSettings {
                 loss_blocks: self.loss_blocks,
                 park_width: self.park_width_units,
                 park_ttl: tx_ttl,
+                relook_after: Duration::from_millis(self.relook_ms),
                 max_senders: self.max_senders,
             },
             sweep_every: Duration::from_millis(self.sweep_every_ms),
@@ -122,7 +137,7 @@ pub struct V2Config {
 }
 
 /// One change of the chain state that the filter holds.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum AccountEvent {
     /// The account rows of a block, for the senders of this replica.
     Rows {
@@ -134,8 +149,15 @@ pub enum AccountEvent {
         address: Address,
         state: AccountState,
     },
+    /// The receipts and the rows of a batch for the senders of this
+    /// replica, for the verdicts. They come before the `Rows` event of the
+    /// same batch, which confirms their transactions.
+    Receipts {
+        receipts: Vec<Receipt>,
+        rows: Vec<AccountRow>,
+    },
     /// The executor rolled back.
-    Rollback,
+    Rollback(ReceiptRollback),
 }
 
 /// What the loop needs to offer one forwarded transaction.
@@ -170,6 +192,7 @@ pub struct AdmissionLoop {
     last_sweep: Instant,
     hot: HotMetrics,
     depth: depth::ParkDepth,
+    to_ingress: verdicts::Verdicts,
 }
 
 impl AdmissionLoop {
@@ -193,7 +216,14 @@ impl AdmissionLoop {
             last_sweep: Instant::now(),
             hot: HotMetrics::new(cfg.partition),
             depth: depth::ParkDepth::default(),
+            to_ingress: verdicts::Verdicts::off(cfg.partition),
         }
+    }
+
+    /// Send the receipt of each forwarded transaction to the ingress that
+    /// published it, through `out`.
+    pub fn enable_verdicts(&mut self, out: tokio::sync::mpsc::Sender<VerdictOut>) {
+        self.to_ingress.to(out);
     }
 
     /// Follow the decision version that the sealer reports. See
@@ -295,7 +325,13 @@ impl AdmissionLoop {
             AccountEvent::Answer { address, state } => {
                 self.admission.on_lookup(address, state, &mut self.verdicts);
             }
-            AccountEvent::Rollback => self.admission.on_rollback(),
+            AccountEvent::Receipts { receipts, rows } => {
+                self.to_ingress.on_receipts(&self.admission, receipts, rows);
+            }
+            AccountEvent::Rollback(rollback) => {
+                self.admission.on_rollback();
+                self.to_ingress.on_rollback(rollback);
+            }
         }
     }
 
@@ -343,6 +379,7 @@ impl AdmissionLoop {
                 session: inbound.loc.session_id,
                 unit: inbound.stream_position >> UNIT_SHIFT,
             },
+            ingress: TxEnvelope::ingress_id_of(inbound.envelope.correlation_id),
             payload: RefPayload {
                 tx_hash: inbound.envelope.tx_hash,
                 vslot,
