@@ -40,6 +40,13 @@
 # and up to three held activations), then the replay windows of version 4.
 # A release that reads only up to v14 refuses v15 and stops, so send the
 # upgrade transaction only after every member runs this release.
+# After the feature activation of FEATURE_SEALER_V5 (feature 4, the carry
+# flag) is in the log, the members write v16: v15, then the schedule of the
+# carry flag (up to three held activations). A release that reads only up
+# to v15 refuses v16 and stops. A release before this one also ignores the
+# activation of feature 4, and stays on decision version 4 while this
+# release switches to 5. So send the upgrade transaction of feature 4 only
+# after every member runs this release.
 # With kardamom.cluster.carryBytes=true, the members write v12: the state
 # of v10 without the void ledger, then the index of the retained file in
 # place of the retained frames. A release that reads only up to v11
@@ -48,7 +55,7 @@
 [format.sealer-snapshot]
 writes = 14
 reads_min = 1
-reads_max = 15
+reads_max = 16
 shared = true
 activation = { flag = "kardamom.cluster.carryBytes", writes = 12 }
 code = [
@@ -56,6 +63,7 @@ code = [
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_READ_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#RETAINED_FILE_SNAPSHOT_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SWITCH_SNAPSHOT_VERSION",
+    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#CARRY_SNAPSHOT_VERSION",
 ]
 
 # The ingress message kinds of the sealer. The Rust writers send kinds 0
@@ -65,7 +73,9 @@ code = [
 # sequencer sends kind 11 (the feature activation) only in front of an
 # epoch that holds an upgrade transaction of feature 3. A member reads
 # kind 11: a record of feature 3 stores the schedule of decision version
-# 4, and a record of another feature changes no state.
+# 4, a record of feature 4 stores the schedule of decision version 5 while
+# version 4 or 5 runs, and a record of another feature changes no state.
+# A member on decision version 5 drops kinds 6 and 9 as unknown kinds.
 # Every member drops a frame of a kind it does not know, counts it, and
 # never orders it.
 [format.sealer-ingress-kinds]
@@ -129,8 +139,9 @@ code = [
 # old executor misses a canonical record.
 # This release also has the codecs of type 7 (the full reference, on
 # ingress only): the 99 bytes of a positioned type 0 reference with type 7,
-# then the envelope. A sealer on decision version 5 relays it as a type 6.
-# No writer sends type 7 yet. The Rust reader refuses a relayed type 7.
+# then the envelope. A sealer on decision version 5 relays it as a type 6,
+# and a sealer below version 5 relays it as is. No writer sends type 7
+# yet. The Rust reader refuses a relayed type 7.
 [format.sealer-record-types]
 writes = 4
 reads_min = 0

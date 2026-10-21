@@ -594,6 +594,17 @@ final class SealerEgress {
     }
 
     /**
+     * Relay the full reference that {@code offer} views as the canonical
+     * entry of record {@code index}. The record path of decision version 5
+     * allocates nothing here: the id and the envelope go from the log
+     * buffer to the staging buffer, then to the retained ring and to each
+     * session.
+     */
+    void offerCarried(final long index, final TxRefOffer offer) {
+        offerToConsumers(retained.forSession(egressBuffer, retain(frames.carried(index, offer))));
+    }
+
+    /**
      * Offer {@code frame} to every session that announced itself as a
      * canonical-stream consumer: the executors, the validator, and ingress
      * observers. This excludes the publisher-only sequencer sessions, which
