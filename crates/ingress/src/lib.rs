@@ -42,6 +42,7 @@ pub(crate) mod receipt_subscription;
 pub mod rollback_log;
 pub mod routing;
 pub(crate) mod seen_receipts;
+pub mod service;
 pub mod sig_verify;
 pub mod stage_latency;
 pub(crate) mod sync_util;

@@ -551,6 +551,11 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
   - The local account layer gets no rows, so `--verdicts` needs `--admission-checks false`. The v2 filter checks each sender.
   - Deploy order: the sequencers with `[admission] verdicts` first, then the ingress with `--verdicts`. An ingress with `--verdicts` before its sequencers send verdicts answers every call `transaction not acknowledged`.
   - Proof: `crates/log/tests/discovered_tx_verdicts.rs` (each ingress receives only its own verdicts), `v2::tests::each_transaction_gets_one_verdict_at_admission`, `crates/ingress/src/acks/tests.rs`, `end_to_end_test::the_ack_at_admission_answers_on_the_verdict_of_the_sequencer`, and the chain-semantics suite with `KARDAMOM_E2E_ADMISSION=1 KARDAMOM_E2E_VERDICTS=1`.
+- **The ingress inside a sequencer process (the job variable `ingress`)**
+  - The ingress and the sequencer of a lane share one process, so they die together. Only the in-flight clients of that process pay. They retry against another process. The twin keeps the lane.
+  - At a stop, the ingress drains first, while the sequencer loops still run, so a parked submit still gets its verdict. Then the loops stop. The kill timeout of the job (`tx_ttl_ms` plus 10 s) covers the drain.
+  - The ingress runs on its own Tokio runtime, so a JSON-RPC burst takes no worker of the sequencer runtime. It shares the media driver and the CPU of the node with the sequencer.
+  - Proof: `args::tests` in the sequencer binary (the subcommand and its default off), and `test_sequencer.py` (the job with the variable on and off). No chaos case covers this mode yet.
 - The JSON-RPC surface is in [`json-rpc.md`](json-rpc.md).
 
 ## Sequencer (2 shards x 2 racing replicas)
