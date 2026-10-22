@@ -743,7 +743,7 @@
     },
     {
       "type": "row",
-      "title": "Misses and retries",
+      "title": "Sealer",
       "collapsed": false,
       "id": 15,
       "gridPos": {
@@ -759,13 +759,196 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "A join miss waits for an archive refetch. Under load, misses add the refetch time to the latency.",
+      "description": "append - commit is the replication wait: the log that the member wrote and a quorum has not yet acknowledged. commit - service is the apply wait: the committed log that the service has not yet applied.",
       "id": 16,
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
         "y": 68
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          },
+          "unit": "bytes",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (member_id) (kardamom_sealer_append_position - kardamom_sealer_commit_position)",
+          "legendFormat": "append - commit, member {{member_id}}",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (member_id) (kardamom_sealer_commit_position - kardamom_sealer_service_position)",
+          "legendFormat": "commit - service, member {{member_id}}",
+          "refId": "B",
+          "range": true
+        }
+      ],
+      "title": "Sealer log positions behind (bytes)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "The longest duty cycle of the consensus module and of the service, and the archive write time. A long cycle stalls the commit of every transaction behind it.",
+      "id": 17,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 68
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "scaleDistribution": {
+              "type": "log",
+              "log": 10
+            }
+          },
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (member_id) (kardamom_sealer_consensus_max_cycle_seconds)",
+          "legendFormat": "consensus max cycle {{member_id}}",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (member_id) (kardamom_sealer_service_max_cycle_seconds)",
+          "legendFormat": "service max cycle {{member_id}}",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (member_id) (kardamom_sealer_archive_recorder_max_write_seconds)",
+          "legendFormat": "archive max write {{member_id}}",
+          "refId": "C",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (member_id) (rate(kardamom_sealer_archive_recorder_write_seconds_total[1m]))",
+          "legendFormat": "archive write s/s {{member_id}}",
+          "refId": "D",
+          "range": true
+        }
+      ],
+      "title": "Sealer cycle and disk times",
+      "type": "timeseries"
+    },
+    {
+      "type": "row",
+      "title": "Misses and retries",
+      "collapsed": false,
+      "id": 18,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 76
+      },
+      "panels": []
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "A join miss waits for an archive refetch. Under load, misses add the refetch time to the latency.",
+      "id": 19,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 77
       },
       "fieldConfig": {
         "defaults": {
@@ -843,12 +1026,12 @@
         "uid": "prometheus"
       },
       "description": "Refused offers and retries. They show back-pressure from a slow consumer.",
-      "id": 17,
+      "id": 20,
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 68
+        "y": 77
       },
       "fieldConfig": {
         "defaults": {
@@ -914,6 +1097,26 @@
           "expr": "sum(rate(kardamom_sequencer_backpressure_total[1m]))",
           "legendFormat": "sequencer back-pressure",
           "refId": "C",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (result) (rate(kardamom_sealer_egress_backpressure_total[1m]))",
+          "legendFormat": "sealer egress {{result}}",
+          "refId": "D",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(kardamom_sealer_driver_naks_received_total[1m]))",
+          "legendFormat": "sealer NAKs received",
+          "refId": "E",
           "range": true
         }
       ],
