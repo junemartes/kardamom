@@ -649,6 +649,7 @@ class DeployTest(Deploys):
             'workloads_cluster_snapshot_s': '60',
             'workloads_cluster_log_purge_keep': '5',
             'workloads_cluster_file_sync_level': '2',
+            'workloads_cluster_heap_mb': '2560',
             'workloads_archive_file_sync_level': '0',
             'workloads_remote_origins': '412399',
             'workloads_priority_fees': 'on',
@@ -676,6 +677,10 @@ class DeployTest(Deploys):
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertIn('8192', json.dumps(plans['cluster']))
         self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))
+        # The heap reaches the image entrypoint, and the job memory follows it.
+        cluster_task = plans['cluster']['TaskGroups'][0]['Tasks'][0]
+        self.assertEqual(cluster_task['Env']['KARDAMOM_CLUSTER_HEAP_MB'], '2560')
+        self.assertEqual(cluster_task['Resources']['MemoryMB'], 3200)
         self.assertIn('-Dkardamom.cluster.logPurgeKeepSnapshots=5', json.dumps(plans['cluster']))
         self.assertIn('-Daeron.archive.file.sync.level=0', json.dumps(plans['aeron']))
         self.assertIn('-Daeron.archive.catalog.file.sync.level=0', json.dumps(plans['aeron']))
@@ -884,6 +889,13 @@ class DeployTest(Deploys):
                 env = self.api.state['plans']['executor']['TaskGroups'][0]['Tasks'][0]['Env']
                 self.assertEqual(env['KARDAMOM_EXEC_CURSOR'], expected)
 
+    def test_the_checkpoint_log_switch_defaults_off_and_reaches_the_executor(self):
+        for switch, expected in (('', 'false'), ('on', 'true')):
+            with self.subTest(switch=switch):
+                self.run_deploy({'workloads_checkpoint_log': switch}, check=True)
+                env = self.api.state['plans']['executor']['TaskGroups'][0]['Tasks'][0]['Env']
+                self.assertEqual(env['KARDAMOM_CHECKPOINT_LOG'], expected)
+
     def test_every_aeron_party_takes_the_deploy_values(self):
         """Each Aeron deploy value: its environment variable, its default,
         a second value, and the check of the plans."""
@@ -944,8 +956,10 @@ class DeployTest(Deploys):
         # Each Aeron agent of a sealer counts its work cycles above 5 ms.
         self.assertIn('-Daeron.driver.sender.cycle.threshold=5ms', cluster_options)
         self.assertIn('-Daeron.cluster.service.cycle.threshold=5ms', cluster_options)
-        # Each GC pause and safepoint goes to the log with a UTC time stamp.
-        self.assertIn('-Xlog:gc,safepoint:stdout:utctime', cluster_options)
+        # Each GC pause and safepoint goes to a rotated file with a UTC time
+        # stamp, written asynchronously.
+        self.assertIn('-Xlog:async', cluster_options)
+        self.assertIn('-Xlog:gc,safepoint:file=/opt/kardamom/cluster/jvm-pauses.log:utctime:filecount=5,filesize=20m', cluster_options)
         # A restarted driver waits out the active-driver window of its
         # dead predecessor: Nomad's 15 s default at the 10 s tolerance.
         delay_ns = plans['aeron']['TaskGroups'][0]['RestartPolicy']['Delay']

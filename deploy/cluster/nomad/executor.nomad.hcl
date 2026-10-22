@@ -116,6 +116,20 @@ variable "exec_cursor" {
   }
 }
 
+# The block log of the checkpoints, "on" or "off" (--checkpoint-log). On,
+# each executor logs the write batch of each committed block next to its
+# checkpoints, and copies the state only when the base rule asks for a new
+# base, at a rate limit. Off, it copies the whole state each 20 s. Ansible
+# deployment passes -var from KARDAMOM_CHECKPOINT_LOG.
+variable "checkpoint_log" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.checkpoint_log)
+    error_message = "The checkpoint_log value must be on or off."
+  }
+}
+
 variable "executor_query_port" {
   type    = number
   default = 9024
@@ -237,6 +251,8 @@ job "executor" {
         KARDAMOM_BAL_GRANULARITY = "20"
         # The recorded cursor to the sealer, under the void voter id.
         KARDAMOM_EXEC_CURSOR = var.exec_cursor == "on" ? "true" : "false"
+        # The block log of the checkpoints.
+        KARDAMOM_CHECKPOINT_LOG = var.checkpoint_log == "on" ? "true" : "false"
         # KARDAMOM_BAL_MEASURE stays unset in deployed profiles. The
         # K-ladder measure mode re-encodes every frame 4 times, on the
         # publisher thread. Under DeFi loads, that saturated the

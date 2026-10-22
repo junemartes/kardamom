@@ -4408,6 +4408,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-trie",
  "bytes",
+ "crc32fast",
  "criterion 0.7.0",
  "crossbeam-channel",
  "kardamom-formats",

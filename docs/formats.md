@@ -42,7 +42,7 @@ The version tests:
 
 | Crate | Formats | What the test checks |
 |---|---|---|
-| `kardamom-state` | `state-db`, `checkpoint-manifest` | the constants |
+| `kardamom-state` | `state-db`, `checkpoint-manifest`, `block-log` | the constants |
 | `kardamom-batcher` | `kar1-batch` | `decode` accepts exactly `reads_min..=reads_max`, and `VERSION` is `writes` |
 | `kardamom-cluster-adapter` | sealer ingress kinds, egress kinds, record types | the egress decoder and the record type decoder accept exactly the read range; the Rust ingress kinds stay at or below `reads_max` |
 | `kardamom-cluster-client` | `cluster-app-version` | the major of the app version |
@@ -62,6 +62,7 @@ The layout tests of the frozen formats:
 | `l1-cursor` | `kardamom-da-watcher` | the line of a fixed sample, and its parse |
 | `aeron-stream-records` | `kardamom-types` | rkyv archived size and alignment of the seven record types |
 | `receipt-rollback` | `kardamom-types` | rkyv archived size and alignment of `ReceiptRollback` |
+| `block-log` | `kardamom-state` | rkyv archived size and alignment of `WriteBatch`, and the bytes of a fixed segment head |
 | `executor-markers` | `kardamom-executor` | the text of a fixed rollback marker, and its parse |
 | `receipt-ledger` | `kardamom-executor` | the slot count and the bytes of a fixed slot, and its decode |
 | `notifier-outbox` | `kardamom-notifier` | rkyv archived size and alignment of `OutboxRecord` |

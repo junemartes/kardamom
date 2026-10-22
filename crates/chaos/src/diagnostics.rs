@@ -76,6 +76,30 @@ const DISCOVERY_MARKERS: &[&str] = &[
     "aeron: image",
 ];
 const DISCOVERY_EVENTS: usize = 80;
+/// Restore lines: the checkpoint restores, the peer fetches of a base
+/// and of its block log, the replay of the log, the refused replays and
+/// the parked state. A restore loop repeats every few seconds, and the
+/// head and the tail hold none of these lines.
+const RESTORE_MARKERS: &[&str] = &[
+    "restored state",
+    "applied the block log",
+    "fetched the block log",
+    "the block log failed",
+    "replay of the block log",
+    "does not decode",
+    "fetched checkpoint",
+    "already present",
+    "created state checkpoint",
+    "cluster replay unavailable",
+    "resync",
+    "parked stale state",
+    "resuming from persisted",
+    "no checkpoint available",
+    "quarantin",
+    "next-newest",
+    "HALTING",
+];
+const RESTORE_EVENTS: usize = 80;
 /// The sealer's consensus history: roles, leadership terms, election
 /// states, failed member name lookups, snapshots, the boundary clock's
 /// heartbeat and its revivals. Session and
@@ -334,6 +358,11 @@ impl Diagnostics {
             "{}",
             matching_lines(&logs, DISCOVERY_MARKERS, DISCOVERY_EVENTS)
         );
+        println!(
+            "----- {job} alloc {}: restore events (last {RESTORE_EVENTS}) -----",
+            alloc.short_id()
+        );
+        println!("{}", matching_lines(&logs, RESTORE_MARKERS, RESTORE_EVENTS));
         if job == "cluster" {
             println!(
                 "----- {job} alloc {}: consensus timeline (last {CONSENSUS_EVENTS}) -----",
