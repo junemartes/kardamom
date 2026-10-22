@@ -32,6 +32,21 @@ final class ClusterNodeTest {
             + "|2,192.168.56.53:40200,192.168.56.53:40201,192.168.56.53:40202,192.168.56.53:40203,192.168.56.53:40204";
 
     @Test
+    void theDriverThreadingModeIsSharedByDefaultAndRefusesAnUnknownMode() {
+        final String key = "kardamom.cluster.driverThreadingMode";
+        try {
+            System.clearProperty(key);
+            assertEquals(io.aeron.driver.ThreadingMode.SHARED, ClusterNode.driverThreadingMode());
+            System.setProperty(key, "DEDICATED");
+            assertEquals(io.aeron.driver.ThreadingMode.DEDICATED, ClusterNode.driverThreadingMode());
+            System.setProperty(key, "INVOKER");
+            assertThrows(IllegalArgumentException.class, ClusterNode::driverThreadingMode);
+        } finally {
+            System.clearProperty(key);
+        }
+    }
+
+    @Test
     void memberEndpointsReturnsTheFiveEndpointsForEachId() {
         assertArrayEquals(
             new String[] {

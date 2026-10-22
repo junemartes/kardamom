@@ -3,6 +3,7 @@ package io.kardamom.sealer.cluster;
 import io.aeron.archive.ArchiveTool;
 import io.aeron.archive.ArchiveTool.VerifyOption;
 import io.aeron.cluster.ElectionState;
+import io.aeron.driver.ThreadingMode;
 import io.aeron.cluster.ClusteredMediaDriver;
 import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.Cluster;
@@ -502,6 +503,25 @@ public final class ClusterNode {
      * a container kill, never shows this: the host kernel keeps the page
      * cache.
      */
+    /**
+     * The threading mode of the member's media driver
+     * ({@code -Dkardamom.cluster.driverThreadingMode}, default SHARED).
+     * SHARED runs the conductor, the sender and the receiver on one thread,
+     * which costs the least CPU and saturates first under load.
+     * SHARED_NETWORK and DEDICATED split that work over two or three
+     * threads. Any other value stops the start.
+     */
+    static ThreadingMode driverThreadingMode() {
+        final String mode = System.getProperty("kardamom.cluster.driverThreadingMode", "SHARED");
+        return switch (mode) {
+            case "SHARED" -> ThreadingMode.SHARED;
+            case "SHARED_NETWORK" -> ThreadingMode.SHARED_NETWORK;
+            case "DEDICATED" -> ThreadingMode.DEDICATED;
+            default -> throw new IllegalArgumentException(
+                "kardamom.cluster.driverThreadingMode must be SHARED, SHARED_NETWORK or DEDICATED, not " + mode);
+        };
+    }
+
     static int fileSyncLevel() {
         final int level = Integer.getInteger("kardamom.cluster.fileSyncLevel", 0);
         if (level < 0 || level > 2) {

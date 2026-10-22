@@ -154,7 +154,13 @@ workloads_cluster_snapshot_s: "{{ lookup('env', 'KARDAMOM_CLUSTER_SNAPSHOT_S') }
 workloads_cluster_log_purge_keep: "{{ lookup('env', 'KARDAMOM_CLUSTER_LOG_PURGE_KEEP') }}"
 workloads_da_lag_budget_blocks: "{{ lookup('env', 'KARDAMOM_DA_LAG_BUDGET_BLOCKS') }}"
 workloads_cluster_file_sync_level: "{{ lookup('env', 'KARDAMOM_CLUSTER_FILE_SYNC_LEVEL') }}"
+# The threading mode of the media driver in each sealer member
+# (nomad/cluster.nomad.hcl). Empty keeps the job's SHARED default.
+workloads_cluster_driver_threading_mode: "{{ lookup('env', 'KARDAMOM_CLUSTER_DRIVER_THREADING_MODE') }}"
 workloads_archive_file_sync_level: "{{ lookup('env', 'KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL') }}"
+# The threading mode of the media driver of each node (nomad/aeron.system.nomad.hcl):
+# SHARED, SHARED_NETWORK or DEDICATED. Empty keeps the job's SHARED default.
+workloads_aeron_threading_mode: "{{ lookup('env', 'KARDAMOM_AERON_THREADING_MODE') }}"
 workloads_remote_origins: "{{ lookup('env', 'KARDAMOM_REMOTE_ORIGINS') }}"
 workloads_priority_fees: "{{ lookup('env', 'PRIORITY_FEES') }}"
 # The recorded cursor of the executors (nomad/executor.nomad.hcl): "on" or
@@ -257,6 +263,7 @@ workloads_sealer_job:
     cluster_log_purge_keep_snapshots: "{{ workloads_cluster_log_purge_keep }}"
     cluster_da_lag_budget_blocks: "{{ workloads_da_lag_budget_blocks }}"
     cluster_file_sync_level: "{{ workloads_cluster_file_sync_level }}"
+    cluster_driver_threading_mode: "{{ workloads_cluster_driver_threading_mode }}"
     cluster_remote_origins: "{{ workloads_remote_origins }}"
 # The sealer settings that every member must match (the Settings table of
 # cluster/sealer-service/README.md), as the deploy passes them in
