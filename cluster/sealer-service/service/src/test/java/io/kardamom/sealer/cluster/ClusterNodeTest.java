@@ -47,6 +47,19 @@ final class ClusterNodeTest {
         assertEquals(window, SystemUtil.parseSize("so-rcvbuf", uri.get("so-rcvbuf")));
     }
 
+    /**
+     * A snapshot opens a publication on the snapshot channel. A small sparse
+     * log buffer opens at once, and its max message length still fits the
+     * chunks of the snapshot writer.
+     */
+    @Test
+    void theSnapshotChannelOpensASmallSparseLogBuffer() {
+        final ChannelUri uri = ChannelUri.parse(ClusterNode.SNAPSHOT_CHANNEL);
+        assertEquals("ipc", uri.media());
+        assertEquals(4L << 20, SystemUtil.parseSize("term-length", uri.get("term-length")));
+        assertEquals("true", uri.get("sparse"));
+    }
+
     @Test
     void memberEndpointsReturnsTheFiveEndpointsForEachId() {
         assertArrayEquals(

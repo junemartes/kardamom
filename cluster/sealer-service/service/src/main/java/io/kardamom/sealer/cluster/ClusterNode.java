@@ -473,6 +473,25 @@ public final class ClusterNode {
      */
     static final String LOG_CHANNEL = "aeron:udp?term-length=8m|rcv-wnd=4m|so-rcvbuf=4m";
 
+    /**
+     * The channel of the snapshots of the consensus module and the service:
+     * 4 MiB terms, on a sparse log buffer.
+     *
+     * <p>Each snapshot opens a new publication on this channel, once in the
+     * service and once in the consensus module. Aeron's default IPC term is
+     * 64 MiB, so each opening made a 192 MiB log buffer, and the media
+     * driver touched each of its pages before it answered. The driver runs
+     * in SHARED mode, so its sender and receiver waited too: staging
+     * measured about 150 ms before the service snapshot and 120 ms before
+     * the snapshot of the consensus module, while the log stood still. A
+     * sparse 12 MiB buffer takes no time to open. A larger snapshot only
+     * waits on back-pressure: the writer chunks at the max message length
+     * (512 KiB here) and retries. The restore reads the recording through
+     * the replay channel, so an older snapshot with larger chunks still
+     * restores.</p>
+     */
+    static final String SNAPSHOT_CHANNEL = "aeron:ipc?alias=snapshot|term-length=4m|sparse=true";
+
     /** Launch retries past the ~10s mark-file liveness window, with margin. */
     static final int MAX_LAUNCH_ATTEMPTS = 6;
     static final long LAUNCH_RETRY_DELAY_MS = 5_000;
@@ -562,6 +581,7 @@ public final class ClusterNode {
             // 8MB terms (24MB logs) leave an order of magnitude of headroom
             // without approaching flow-control limits.
             .logChannel(LOG_CHANNEL)
+            .snapshotChannel(SNAPSHOT_CHANNEL)
             .ingressStreamId(ingressStreamId)
             // The ordering window's hold timer is 5 ms. Aeron's timer wheel
             // fires a timer on the first tick at or after its deadline, and
@@ -751,6 +771,7 @@ public final class ClusterNode {
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
             .appVersion(APP_VERSION)
+            .snapshotChannel(SNAPSHOT_CHANNEL)
             .clusteredService(service);
         // The clustered-service container has its own termination hook.
         // Instrumenting only the consensus module would still exit silently
