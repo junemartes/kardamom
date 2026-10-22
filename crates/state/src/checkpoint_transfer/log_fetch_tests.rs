@@ -10,7 +10,7 @@ use crate::checkpoint::{BlockRange, create_checkpoint, restore_best_checkpoint};
 use crate::env::{StateEnv, StateEnvBuilder};
 use crate::integrity::deep_compare;
 
-/// A peer with a base at block 3 and the block log to block 8.
+/// A peer with a base at block 3 and the block log to a head block.
 struct Peer {
     _state: tempfile::TempDir,
     dir: tempfile::TempDir,
@@ -19,14 +19,19 @@ struct Peer {
 }
 
 impl Peer {
+    /// A peer with the block log to block 8.
     fn new() -> Self {
+        Self::with_head(8)
+    }
+
+    fn with_head(head: u64) -> Self {
         let state = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let env = seeded_env(state.path());
         let log = dir.path().join(LOG_DIR);
         commit_logged(&env, &log, 1..=3);
         create_checkpoint(&env, dir.path()).unwrap();
-        commit_logged(&env, &log, 4..=8);
+        commit_logged(&env, &log, 4..=head);
         let addr = serve_checkpoints("127.0.0.1:0".parse().unwrap(), dir.path().to_path_buf())
             .unwrap()
             .addr;
@@ -123,6 +128,28 @@ async fn a_peer_with_no_log_serves_the_base_alone() {
     )
     .await;
     assert_eq!(restored, Some(3));
+}
+
+/// A node fetches from each peer in turn, and its peer list may name the
+/// node itself with a stale log. A later peer with a shorter log of the
+/// same base must not cut the log that an earlier peer gave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_with_a_shorter_log_does_not_shorten_the_local_log() {
+    let full = Peer::new();
+    let short = Peer::with_head(5);
+    let local = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let peers = [full.addr.to_string(), short.addr.to_string()];
+    let (dir, into) = (local.path().to_path_buf(), state.path().to_path_buf());
+    let restored = tokio::task::spawn_blocking(move || {
+        fetch_best_checkpoint(&peers, &dir, BlockRange::ANY, None)?;
+        restore_best_checkpoint(&dir, &into, BlockRange::ANY, None)
+            .unwrap()
+            .map(|(block, _)| block)
+    })
+    .await
+    .unwrap();
+    assert_eq!(restored, Some(8));
 }
 
 #[test]

@@ -33,7 +33,7 @@ use super::{CheckpointFetch, IO_TIMEOUT, PeerResponse, framing};
 use crate::checkpoint::block_log::{
     BlockLog, BlockLogWriter, DEFAULT_SEGMENT_BYTES, LogIdentity, Records,
 };
-use crate::checkpoint::replay::LOG_DIR;
+use crate::checkpoint::replay::{LOG_DIR, LogReplay};
 use crate::checkpoint::{BlockRange, CheckpointInfo, latest_checkpoint, read_manifest};
 use crate::error::StateError;
 use crate::meta::SCHEMA_VERSION;
@@ -149,9 +149,13 @@ impl LogRequest {
 }
 
 /// Fetch the log after `base` up to block `to` from `peer`, into the log
-/// of `checkpoints_dir`. The local log is cut after the base first, so the
-/// records of the peer follow the base. Returns the last block that the
-/// local log now holds after the base.
+/// of `checkpoints_dir`. The fetch asks only for the blocks after the
+/// local reach of the base, and cuts the local log there, so the records
+/// of the peer follow the last good local record. A fetch never shortens
+/// the local log: a peer with a shorter log sends no record. This matters
+/// because a node fetches from each peer in turn, and the peer list may
+/// name the node itself, with its own stale log. Returns the last block
+/// that the local log now holds after the base.
 ///
 /// # Errors
 ///
@@ -164,8 +168,9 @@ pub(super) fn fetch_log(
     to: u64,
 ) -> Result<u64, StateError> {
     let genesis = read_manifest(&base.path)?.genesis_digest;
-    let Some(from) = base.block.checked_add(1).and_then(NonZeroU64::new) else {
-        return Ok(base.block);
+    let reach = LogReplay::new(&base.path, genesis, to).reach(base.block)?;
+    let Some(from) = reach.checked_add(1).and_then(NonZeroU64::new) else {
+        return Ok(reach);
     };
     let request = LogRequest { from, to };
     let mut fetch = CheckpointFetch::connect(peer, &request.line(), Some(genesis))?;
@@ -173,7 +178,7 @@ pub(super) fn fetch_log(
     let mut lines = head.lines();
     let status = PeerResponse::parse_status_line(lines.next().unwrap_or_default())?;
     if status == 404 {
-        return Ok(base.block);
+        return Ok(reach);
     }
     if status != 200 {
         return Err(StateError::Recovery(format!(
@@ -197,11 +202,11 @@ pub(super) fn fetch_log(
         identity,
         DEFAULT_SEGMENT_BYTES,
     )?;
-    log.cut_after(base.block)?;
+    log.cut_after(reach)?;
     let last = Records::new(&mut fetch.reader)
         .take_while(|r| r.block <= to)
         .map_while(|r| r.batch().ok())
-        .try_fold(base.block, |_, batch| {
+        .try_fold(reach, |_, batch| {
             log.append(&batch).map(|()| batch.boundary.block_number)
         })?;
     log.sync()?;
