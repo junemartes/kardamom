@@ -12,6 +12,10 @@ use crate::poll::{self, Budget};
 
 pub(crate) const RESTORED: &str = "restored state from checkpoint";
 pub(crate) const FETCHED: &str = "fetched checkpoint from peer";
+/// The block log of a peer after its base, with `--checkpoint-log`.
+const LOG_FETCHED: &str = "fetched the block log from a peer";
+/// The block log applied after a restored base, with `--checkpoint-log`.
+const LOG_APPLIED: &str = "applied the block log after the base checkpoint";
 
 /// The restarted executor must also record a new session of its stream
 /// and move its recorded cursor (see [`ExecStreamSessions`]).
@@ -214,6 +218,30 @@ pub(crate) async fn replay_window_resync(h: &mut Harness) -> anyhow::Result<()> 
         "replay-window-resync: executor-1 self-healed from a peer checkpoint (fetch + restore + rejoin, {}s)",
         elapsed.as_secs()
     ));
+    assert_log_applied(h, &victim).await
+}
+
+/// With the block log on, the victim also fetched the log of the peer and
+/// applied it after the base: the restore reached past the base.
+async fn assert_log_applied(h: &Harness, victim: &str) -> anyhow::Result<()> {
+    if !h.knobs.checkpoint_log {
+        return Ok(());
+    }
+    let logs = match h.nodes.inner_container(victim, "executor").await {
+        Some(inner) => h.nodes.inner_logs(victim, &inner, 100_000).await,
+        None => None,
+    }
+    .unwrap_or_default();
+    let missing: Vec<&str> = [LOG_FETCHED, LOG_APPLIED]
+        .into_iter()
+        .filter(|line| !logs.contains(line))
+        .collect();
+    if !missing.is_empty() {
+        return Err(crate::chaos_fail!(
+            "replay-window-resync: the block log is on, but {victim} logged no {missing:?}"
+        ));
+    }
+    crate::log("replay-window-resync: executor-1 fetched the block log of the peer and applied it");
     Ok(())
 }
 

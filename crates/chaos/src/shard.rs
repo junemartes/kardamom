@@ -184,12 +184,21 @@ impl Shard {
     /// small egress retention so a freeze can overrun it; the L1 shard
     /// takes both, plus the fault proxy in front of the followers. The
     /// executor shard turns the recorded cursor on, so `hard-executor`
-    /// checks the sealer's best cursor while one executor is down.
+    /// checks the sealer's best cursor while one executor is down. The
+    /// executor, retention and cache shards turn the block log of the
+    /// checkpoints on: they run the checkpoint restore, the peer resync,
+    /// the retention overrun and the state mirror rebuild. The other
+    /// shards keep it off, so both modes stay tested.
     #[must_use]
     pub fn deploy_vars(self) -> DeployVars {
         match self {
             Self::Executor => DeployVars {
                 exec_cursor: true,
+                checkpoint_log: true,
+                ..DeployVars::default()
+            },
+            Self::Cache => DeployVars {
+                checkpoint_log: true,
                 ..DeployVars::default()
             },
             Self::Cluster => DeployVars {
@@ -198,6 +207,7 @@ impl Shard {
             },
             Self::Retention => DeployVars {
                 cluster_retention: Some(6144),
+                checkpoint_log: true,
                 ..DeployVars::default()
             },
             Self::L1 | Self::Follower => DeployVars {
@@ -213,7 +223,6 @@ impl Shard {
             | Self::Fleet
             | Self::Coordinated
             | Self::CombinedOrdering
-            | Self::Cache
             | Self::CombinedExec
             | Self::Integrity => DeployVars::default(),
         }
@@ -233,7 +242,11 @@ impl Shard {
                 ("SQUEEZE_S", "60"),
                 ("SQUEEZE_CPUS_PER_NODE", "0.4"),
             ],
-            Self::Retention => &[("RUN_LOAD", "0"), ("KARDAMOM_CLUSTER_RETENTION", "6144")],
+            Self::Retention => &[
+                ("RUN_LOAD", "0"),
+                ("KARDAMOM_CLUSTER_RETENTION", "6144"),
+                ("KARDAMOM_CHECKPOINT_LOG", "on"),
+            ],
             // One minute per fault: every assertion holds at one minute,
             // and four cases with their state audits must fit the job's
             // budget.
@@ -243,13 +256,17 @@ impl Shard {
                 ("KARDAMOM_CLUSTER_SNAPSHOT_S", "60"),
                 ("L1_FAULT_S", "60"),
             ],
-            Self::Executor => &[("RUN_LOAD", "0"), ("KARDAMOM_EXEC_CURSOR", "on")],
+            Self::Executor => &[
+                ("RUN_LOAD", "0"),
+                ("KARDAMOM_EXEC_CURSOR", "on"),
+                ("KARDAMOM_CHECKPOINT_LOG", "on"),
+            ],
+            Self::Cache => &[("RUN_LOAD", "0"), ("KARDAMOM_CHECKPOINT_LOG", "on")],
             Self::Ingress
             | Self::Sequencer
             | Self::Fleet
             | Self::Coordinated
             | Self::CombinedOrdering
-            | Self::Cache
             | Self::CombinedExec
             | Self::Integrity => &[("RUN_LOAD", "0")],
         }
@@ -317,6 +334,13 @@ mod tests {
         // The executor shard deploys the recorded cursor and tells its
         // cases so through the knob of the same name.
         assert!(Shard::Executor.deploy_vars().exec_cursor);
+        // The shards that turn the block log on tell their cases so, and
+        // the others keep it off.
+        for shard in [Shard::Executor, Shard::Retention, Shard::Cache] {
+            assert!(shard.deploy_vars().checkpoint_log, "{}", shard.name());
+            assert!(shard.env().contains(&("KARDAMOM_CHECKPOINT_LOG", "on")));
+        }
+        assert!(!Shard::Fleet.deploy_vars().checkpoint_log);
         assert!(
             Shard::Executor
                 .env()

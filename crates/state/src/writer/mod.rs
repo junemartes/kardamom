@@ -26,6 +26,7 @@ use kardamom_obs::pipeline::{LoopMeter, LoopState};
 use kardamom_types::{BlockBoundary, BlockDelta, TxRef};
 use tracing::{debug, error, info, warn};
 
+use crate::checkpoint::log_thread::LogFeed;
 use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::snapshot::StateSnapshot;
@@ -40,7 +41,9 @@ use crate::swap::{SnapshotHandle, SnapshotReceiver, channel as swap_channel};
 /// - The block-level cursors.
 /// - The per-key state mutations.
 /// - The per-transaction receipts, each with where its bytes are.
-#[derive(Debug, Clone)]
+///
+/// The block log of the checkpoints stores the rkyv archive of a batch.
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct WriteBatch {
     pub boundary: BlockBoundary,
     pub delta: BlockDelta,
@@ -50,7 +53,7 @@ pub struct WriteBatch {
 
 /// Where the bytes of a block's transactions are, as the writer records
 /// them in the `tx_hash_index` rows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum TxRefs {
     /// The `TxRef` of every transaction of the block, as the canonical
     /// stream carried it: where the bytes are on a `tx_data` archive. A
@@ -178,6 +181,9 @@ pub struct StateWriter {
     /// to busy. The writer has no output queue, so it is never blocked.
     meter: LoopMeter,
     steps: apply::CommitSteps,
+    /// The block log of the checkpoints, when the executor keeps one. The
+    /// writer offers each committed batch to it, and never waits.
+    log: Option<LogFeed>,
 }
 
 impl StateWriter {
@@ -189,7 +195,18 @@ impl StateWriter {
     /// Returns [`StateError`] if the schema-version check fails, or if the
     /// writer thread or its initial snapshot cannot be created.
     pub fn spawn(env: StateEnv) -> Result<WriterHandle, StateError> {
-        Self::spawn_inner(env, TrieMode::Off)
+        Self::spawn_inner(env, TrieMode::Off, None)
+    }
+
+    /// Spawn the plain writer, and offer each committed batch to the block
+    /// log of the checkpoints on `log`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if the schema-version check fails, or if the
+    /// writer thread or its initial snapshot cannot be created.
+    pub fn spawn_with_log(env: StateEnv, log: LogFeed) -> Result<WriterHandle, StateError> {
+        Self::spawn_inner(env, TrieMode::Off, Some(log))
     }
 
     /// Spawn the trie-aware writer with the given [`TrieMode`]. Each block
@@ -216,10 +233,14 @@ impl StateWriter {
                     .into(),
             ));
         }
-        Self::spawn_inner(env, mode)
+        Self::spawn_inner(env, mode, None)
     }
 
-    fn spawn_inner(env: StateEnv, trie_mode: TrieMode) -> Result<WriterHandle, StateError> {
+    fn spawn_inner(
+        env: StateEnv,
+        trie_mode: TrieMode,
+        log: Option<LogFeed>,
+    ) -> Result<WriterHandle, StateError> {
         // This channel is bounded, HORIZON_BLOCKS deep. If the writer falls
         // behind by more than the version horizon, the executor blocks
         // here. At that point, the snapshot the executor holds is about
@@ -244,6 +265,7 @@ impl StateWriter {
             trie_mode,
             meter: LoopMeter::new("state.writer"),
             steps: apply::CommitSteps::new(),
+            log,
         };
 
         let join = thread::Builder::new()
@@ -270,7 +292,7 @@ impl StateWriter {
         Ok(())
     }
 
-    /// Wait for one batch, then apply it. Returns false when the delta
+    /// Wait for one batch, then take it. Returns false when the delta
     /// channel closed.
     fn step(&mut self) -> Result<bool, StateError> {
         let received = self.delta_rx.recv();
@@ -279,9 +301,18 @@ impl StateWriter {
             info!("delta channel closed; writer shutting down");
             return Ok(false);
         };
-        self.apply_and_publish(&batch)?;
+        self.take(batch)?;
         self.meter.mark(LoopState::Busy);
         Ok(true)
+    }
+
+    /// Apply and publish one batch, then offer it to the block log.
+    fn take(&self, batch: WriteBatch) -> Result<(), StateError> {
+        self.apply_and_publish(&batch)?;
+        if let Some(log) = &self.log {
+            log.offer(batch);
+        }
+        Ok(())
     }
 
     /// Apply one batch and publish the snapshot after it. Reports a

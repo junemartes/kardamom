@@ -360,6 +360,9 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
   - See "A power loss on a majority of the sealers rolls the paired executors back" in [failure-modes.md](failure-modes.md).
 - `kardamom_sequencer_receipt_floors_forgotten_total` counts the nonce floors that a rollback of an executor reset to unknown.
 - `validator_replica_results_unchecked_total{reason="withdrawn"}` counts the buffered receipts, rows and BALs that a rollback of an executor withdrew.
+- `kardamom_checkpoint_log_dropped_total` counts the committed blocks that the state writer did not give to the block log of the checkpoints, because the queue to the log thread was full. Each one is a gap in the log.
+- `kardamom_checkpoint_log_failed_total{step}` counts the appends and syncs of the block log that failed (`step` is `append` or `sync`). The next block then starts a new segment.
+- `kardamom_checkpoint_copy_unlimited_total` counts the base copies that libmdbx refused into the pipe of the rate limit. Such a copy then ran with no limit.
 - `kardamom_checkpoint_unreadable_schema_skips_total` counts the checkpoints an executor, a validator or a state mirror skipped because the image holds a state schema the release does not read.
   - An increment after a rollback is expected: the newest checkpoint comes from the newer release.
   - Growth on a steady fleet means a node runs a release of another schema.

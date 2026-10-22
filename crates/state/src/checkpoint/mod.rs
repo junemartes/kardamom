@@ -12,9 +12,10 @@
 //! This supports peer-to-peer restore, which mirrors the archive
 //! re-replication path.
 //!
-//! Creation reuses [`compact_to`] (`mdbx_env_copy` with
-//! `MDBX_CP_COMPACT`) against an online read-only snapshot, so the live
-//! env keeps serving reads and writes throughout. The copy lands under a
+//! Creation reuses [`crate::compaction::compact_to`] (`mdbx_env_copy`
+//! with `MDBX_CP_COMPACT`), or its rate-limited form in [`copy_rate`],
+//! against an online read-only snapshot, so the live env keeps serving
+//! reads and writes throughout. The copy lands under a
 //! hidden temp name and is renamed into place when complete. So anything
 //! visible as `checkpoint-*` is a full, consistent image that will never
 //! change again, and copying one concurrently is always safe.
@@ -30,19 +31,26 @@
 //! [`manifest`]. The peer-fetch path in [`crate::checkpoint_transfer`]
 //! also uses these helpers.
 
+pub mod bases;
+pub mod block_log;
+pub mod copy_rate;
 mod image;
+pub mod log_thread;
 mod manifest;
+pub mod replay;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 pub(crate) use manifest::manifest_path;
 pub(crate) use manifest::{CheckpointManifest, read_manifest, verify_checkpoint};
 
+use copy_rate::CopyRate;
 use image::CompactedImage;
 use manifest::stored_genesis_digest;
 pub(crate) use manifest::{ImageSchema, check_image_identity, file_keccak, publish_checkpoint};
+use replay::LogReplay;
 
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
@@ -51,7 +59,6 @@ use alloy_primitives::B256;
 
 use tracing::{info, warn};
 
-use crate::compaction::compact_to;
 use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::recovery::read_recovery_point;
@@ -226,6 +233,20 @@ pub fn create_checkpoint(
     env: &StateEnv,
     checkpoints_dir: &Path,
 ) -> Result<CheckpointInfo, StateError> {
+    create_checkpoint_at(env, checkpoints_dir, CopyRate::Unlimited)
+}
+
+/// [`create_checkpoint`] with the copy at `rate`.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the checkpoints directory, the compaction,
+/// or the manifest write fails.
+pub fn create_checkpoint_at(
+    env: &StateEnv,
+    checkpoints_dir: &Path,
+    rate: CopyRate,
+) -> Result<CheckpointInfo, StateError> {
     let block = read_recovery_point(env)?.last_committed_block;
     std::fs::create_dir_all(checkpoints_dir)?;
     let dest = checkpoints_dir.join(checkpoint_name(block));
@@ -242,7 +263,7 @@ pub fn create_checkpoint(
     sweep_stale_tmp(checkpoints_dir)?;
     let tmp = checkpoints_dir.join(format!(".{}.tmp", checkpoint_name(block)));
     let tmp_data = tmp.join("mdbx.dat");
-    compact_to(env, &tmp_data)?;
+    rate.copy(env, &tmp_data)?;
     CompactedImage::new(&tmp_data).cut_to_used_pages()?;
     let manifest = CheckpointManifest {
         block,
@@ -291,6 +312,48 @@ pub fn latest_checkpoint(
     Ok(best)
 }
 
+/// The newest restore point of a checkpoint directory, as a reader can
+/// compare it across polls: the block of the newest base, and the bytes of
+/// the chain of log segments that a restore of it reads. The log grows after the base, so a restore of
+/// the same base reaches further when its log has more bytes. The bytes
+/// come from the sizes of the segments, so a poll reads no record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestorePoint {
+    pub base: u64,
+    pub log_bytes: u64,
+}
+
+impl RestorePoint {
+    /// The restore point of `checkpoints_dir`. `None` with no base.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if the directory or the log does not list.
+    pub fn newest(checkpoints_dir: &Path) -> Result<Option<Self>, StateError> {
+        let Some(base) = latest_checkpoint(checkpoints_dir, BlockRange::ANY)? else {
+            return Ok(None);
+        };
+        let segments = block_log::SegmentSize::list(&checkpoints_dir.join(replay::LOG_DIR))?;
+        let log_bytes = block_log::SegmentSize::chain_after(&segments, base.block)
+            .unwrap_or_default()
+            .iter()
+            .map(|s| s.bytes)
+            .sum();
+        Ok(Some(Self {
+            base: base.block,
+            log_bytes,
+        }))
+    }
+
+    /// Whether a restore at this point may reach further than one at
+    /// `tried`: its base is newer, or the log after the same base changed.
+    /// A log that the writer cut and wrote again counts as changed.
+    #[must_use]
+    pub fn is_after(&self, tried: &Self) -> bool {
+        self.base > tried.base || (self.base == tried.base && self.log_bytes != tried.log_bytes)
+    }
+}
+
 /// Every checkpoint in the directory, newest block first.
 ///
 /// # Errors
@@ -333,7 +396,7 @@ pub fn restore_newest_readable(
 ) -> Result<Option<(u64, PathBuf)>, StateError> {
     for ckpt in checkpoints_newest_first(checkpoints_dir)? {
         clear_dir(state_dir)?;
-        match restore_checkpoint(&ckpt.path, state_dir, expected_genesis) {
+        match restore_checkpoint(&ckpt.path, state_dir, expected_genesis, u64::MAX) {
             Ok(block) => return Ok(Some((block, ckpt.path))),
             Err(e) => warn!(
                 checkpoint = %ckpt.path.display(),
@@ -390,9 +453,10 @@ pub fn remove_checkpoints(checkpoints_dir: &Path, range: BlockRange) -> Result<u
 }
 
 /// Restore `checkpoint` into `state_dir`. `state_dir` must be empty or
-/// absent. This copies the compacted mdbx env files across, and returns
-/// the restored `last_committed_block`. The caller then opens
-/// `state_dir` normally, and the standard resume path replays the tail.
+/// absent. This copies the compacted mdbx env files across, applies the
+/// block log after the checkpoint up to block `to`, and returns the
+/// restored `last_committed_block`. The caller then opens `state_dir`
+/// normally, and the standard resume path replays the tail.
 ///
 /// # Errors
 ///
@@ -403,6 +467,7 @@ pub(crate) fn restore_checkpoint(
     checkpoint: &Path,
     state_dir: &Path,
     expected_genesis: Option<B256>,
+    to: u64,
 ) -> Result<u64, StateError> {
     // Verify before copying. An unverifiable or foreign image must never
     // become this node's state.
@@ -419,8 +484,7 @@ pub(crate) fn restore_checkpoint(
 
     let data_src = checkpoint_data_file(checkpoint)?;
     std::fs::copy(&data_src, state_dir.join("mdbx.dat"))?;
-    let env = crate::env::StateEnvBuilder::new(state_dir).open()?;
-    let block = read_recovery_point(&env)?.last_committed_block;
+    let block = LogReplay::new(checkpoint, manifest.genesis_digest, to).apply(state_dir)?;
     info!(
         block,
         manifest_block = manifest.block,
@@ -431,9 +495,11 @@ pub(crate) fn restore_checkpoint(
     Ok(block)
 }
 
-/// Restore the newest verifiable checkpoint under `checkpoints_dir` whose
-/// block is in `range`, into `state_dir`. Returns `(restored_block,
-/// checkpoint_path)`.
+/// Restore the newest verifiable checkpoint under `checkpoints_dir` that
+/// reaches `range`, into `state_dir`. Returns `(restored_block,
+/// checkpoint_path)`. A checkpoint reaches the range when its block is in
+/// it, or when the block log after it reaches the lower end. The restore
+/// applies the log up to the upper end.
 ///
 /// A checkpoint that fails verification is quarantined: renamed to a
 /// hidden `.rejected-<name>` that the scanners never pick up. The
@@ -459,9 +525,9 @@ pub fn restore_best_checkpoint(
 ) -> Result<Option<(u64, PathBuf)>, StateError> {
     checkpoints_newest_first(checkpoints_dir)?
         .into_iter()
-        .filter(|ckpt| range.contains(ckpt.block))
+        .filter(|ckpt| ckpt.reaches(range))
         .find_map(|ckpt| {
-            ckpt.restore_or_set_aside(state_dir, expected_genesis)
+            ckpt.restore_or_set_aside(state_dir, expected_genesis, range.max)
                 .map(|restored| restored.map(|block| (block, ckpt.path)))
                 .transpose()
         })
@@ -482,6 +548,21 @@ impl CheckpointInfo {
         remove_dir_or_file(&hidden)
     }
 
+    /// Whether a restore of this checkpoint reaches `range`: its block is
+    /// in the range, or the block log after it reaches the lower end. A
+    /// checkpoint whose manifest does not read reaches only by its block.
+    fn reaches(&self, range: BlockRange) -> bool {
+        if self.block > range.max {
+            return false;
+        }
+        range.contains(self.block)
+            || read_manifest(&self.path)
+                .and_then(|m| {
+                    LogReplay::new(&self.path, m.genesis_digest, range.max).reach(self.block)
+                })
+                .is_ok_and(|end| end >= range.min)
+    }
+
     /// Restore this checkpoint into `state_dir`, and return its block. When
     /// it does not restore, set it aside and return `None`, so the caller
     /// tries the next-newest. A checkpoint of a schema this release does
@@ -491,8 +572,9 @@ impl CheckpointInfo {
         &self,
         state_dir: &Path,
         expected_genesis: Option<B256>,
+        to: u64,
     ) -> Result<Option<u64>, StateError> {
-        match restore_checkpoint(&self.path, state_dir, expected_genesis) {
+        match restore_checkpoint(&self.path, state_dir, expected_genesis, to) {
             Ok(block) => Ok(Some(block)),
             Err(StateError::UnreadableCheckpointSchema { .. }) => Ok(None),
             Err(e) => quarantine_checkpoint(&self.path, state_dir, &e).map(|()| None),
