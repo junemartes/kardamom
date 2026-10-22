@@ -158,6 +158,9 @@ workloads_cluster_file_sync_level: "{{ lookup('env', 'KARDAMOM_CLUSTER_FILE_SYNC
 # (nomad/cluster.nomad.hcl). Empty keeps the job's SHARED default.
 workloads_cluster_driver_threading_mode: "{{ lookup('env', 'KARDAMOM_CLUSTER_DRIVER_THREADING_MODE') }}"
 workloads_cluster_heap_mb: "{{ lookup('env', 'KARDAMOM_CLUSTER_HEAP_MB') }}"
+# The sync level of the backup sealer's archive (nomad/cluster-backup.nomad.hcl).
+# Empty keeps the job's 1.
+workloads_backup_file_sync_level: "{{ lookup('env', 'KARDAMOM_BACKUP_FILE_SYNC_LEVEL') }}"
 workloads_archive_file_sync_level: "{{ lookup('env', 'KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL') }}"
 # The threading mode of the media driver of each node (nomad/aeron.system.nomad.hcl):
 # SHARED, SHARED_NETWORK or DEDICATED. Empty keeps the job's SHARED default.
