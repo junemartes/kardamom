@@ -155,6 +155,9 @@ workloads_cluster_log_purge_keep: "{{ lookup('env', 'KARDAMOM_CLUSTER_LOG_PURGE_
 workloads_da_lag_budget_blocks: "{{ lookup('env', 'KARDAMOM_DA_LAG_BUDGET_BLOCKS') }}"
 workloads_cluster_file_sync_level: "{{ lookup('env', 'KARDAMOM_CLUSTER_FILE_SYNC_LEVEL') }}"
 workloads_cluster_heap_mb: "{{ lookup('env', 'KARDAMOM_CLUSTER_HEAP_MB') }}"
+# The sync level of the backup sealer's archive (nomad/cluster-backup.nomad.hcl).
+# Empty keeps the job's 1.
+workloads_backup_file_sync_level: "{{ lookup('env', 'KARDAMOM_BACKUP_FILE_SYNC_LEVEL') }}"
 workloads_archive_file_sync_level: "{{ lookup('env', 'KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL') }}"
 workloads_remote_origins: "{{ lookup('env', 'KARDAMOM_REMOTE_ORIGINS') }}"
 workloads_priority_fees: "{{ lookup('env', 'PRIORITY_FEES') }}"

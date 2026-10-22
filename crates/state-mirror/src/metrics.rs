@@ -43,8 +43,8 @@ pub(crate) fn describe() {
     );
 }
 
-pub(crate) fn record_batch(disagreed: u64) {
-    metrics::counter!(BATCHES_APPLIED_TOTAL).increment(1);
+pub(crate) fn record_batches(count: usize, disagreed: u64) {
+    metrics::counter!(BATCHES_APPLIED_TOTAL).increment(u64::try_from(count).unwrap_or(u64::MAX));
     metrics::counter!(PRODUCER_DISAGREEMENT_TOTAL).increment(disagreed);
 }
 
@@ -71,30 +71,30 @@ pub(crate) fn record_wait_replica_zero() {
     metrics::counter!(WAIT_REPLICA_ZERO_TOTAL).increment(1);
 }
 
-/// The pipeline steps of the mirror: one for each Redis round trip of a
-/// batch, and one for the whole batch. The mirror owns them.
+/// The pipeline metrics of the mirror, once per group of batches. The
+/// mirror owns them.
 pub(crate) struct MirrorSteps {
-    /// The rows: one `SCRIPT LOAD`, then one pipeline of `EVALSHA`.
-    pub(crate) evalsha: Step,
-    /// The receipt index: one pipeline of `SET`.
-    pub(crate) receipts_set: Step,
+    /// The write of one group: one `SCRIPT LOAD`, then one pipeline with
+    /// the rows and the receipts of every batch.
+    pub(crate) write: Step,
     pub(crate) head_set: Step,
     pub(crate) wait_replica: Step,
-    /// A whole batch: the writes with their retries, the head, and the
+    /// A whole group: the write with its retries, the head, and the
     /// replica wait.
-    pub(crate) batch: Step,
-    pub(crate) receipt_batch: Batch,
+    pub(crate) group: Step,
+    pub(crate) group_batches: Batch,
+    pub(crate) group_receipts: Batch,
 }
 
 impl MirrorSteps {
     pub(crate) fn new() -> Self {
         Self {
-            evalsha: Step::new("state_mirror.evalsha"),
-            receipts_set: Step::new("state_mirror.receipts_set"),
+            write: Step::new("state_mirror.write"),
             head_set: Step::new("state_mirror.head_set"),
             wait_replica: Step::new("state_mirror.wait_replica"),
-            batch: Step::new("state_mirror.batch"),
-            receipt_batch: Batch::new("state_mirror.receipt_batch"),
+            group: Step::new("state_mirror.group"),
+            group_batches: Batch::new("state_mirror.group_batches"),
+            group_receipts: Batch::new("state_mirror.group_receipts"),
         }
     }
 }

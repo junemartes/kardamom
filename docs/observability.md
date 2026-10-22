@@ -692,27 +692,16 @@ See [tx-status-events.md](tx-status-events.md) for the feed and the webhooks.
 The state mirror exports `kardamom_state_mirror_serving`, `_batches_applied_total`, `_producer_disagreement_total`,
 `_head_tx_idx`, `_rebuilds_total`, `_rebuild_seconds`, `_write_retries_total`, and `_wait_replica_zero_total`.
 
-Each batch records these steps, one for each Redis round trip:
-
-| Kind | Name | Meaning |
-| --- | --- | --- |
-| step | `state_mirror.evalsha` | The account rows: one `SCRIPT LOAD`, then one pipeline of `EVALSHA`. |
-| step | `state_mirror.receipts_set` | The receipt index: one pipeline of `SET`. |
-| step | `state_mirror.head_set` | The head publish. |
-| step | `state_mirror.wait_replica` | The `WAIT` for a replica. |
-| step | `state_mirror.batch` | The whole batch: the writes with their retries, the head and the replica wait. |
-| batch | `state_mirror.receipt_batch` | The receipts in each batch. |
-
-It also records these [pipeline metrics](#pipeline-metrics), once per receipt batch:
+The mirror writes the waiting receipt batches as a group. It records these [pipeline metrics](#pipeline-metrics), once per group:
 
 | Name | Kind | Meaning |
 | --- | --- | --- |
-| `state_mirror.batch` | step | One whole batch: the writes with their retries, the head, and the replica wait. |
-| `state_mirror.evalsha` | step | The rows of one write: a `SCRIPT LOAD`, then one pipeline of `EVALSHA`. |
-| `state_mirror.receipts_set` | step | The receipt index of one write: one pipeline of `SET`. |
+| `state_mirror.group` | step | One whole group: the write with its retries, the head and the replica wait. |
+| `state_mirror.write` | step | The write of one group: a `SCRIPT LOAD`, then one pipeline with the rows and the receipts of every batch. |
 | `state_mirror.head_set` | step | The publish of the head. |
 | `state_mirror.wait_replica` | step | The Redis `WAIT` for a replica. |
-| `state_mirror.receipt_batch` | batch | The receipts in one batch. |
+| `state_mirror.group_batches` | batch | The receipt batches in one group. |
+| `state_mirror.group_receipts` | batch | The receipts in one group. |
 
 ### Validator replica checks
 

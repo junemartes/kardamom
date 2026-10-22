@@ -9,7 +9,9 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256, U256};
-use kardamom_cache::{AccountCache, CacheReader, LiveAccounts, LiveAccountsConfig, RowsWritten};
+use kardamom_cache::{
+    AccountCache, BatchWrite, CacheReader, LiveAccounts, LiveAccountsConfig, RowsWritten,
+};
 use kardamom_types::{AccountRow, BPosition, Receipt};
 use testcontainers::{ContainerAsync, GenericImage};
 
@@ -97,6 +99,45 @@ async fn rows_apply_by_position_and_disagreements_are_counted() {
             .unwrap()
             .is_none()
     );
+}
+
+/// The mirror writes a group of batches in one pipeline. Each row keeps
+/// the end position of its own batch, so a group whose copies come out of
+/// order still leaves the newest row.
+#[tokio::test]
+#[ignore = "requires Docker; run with `cargo test --features docker-e2e -- --ignored`"]
+async fn a_group_of_batches_applies_each_row_at_its_own_position() {
+    let (_container, cache) = redis().await;
+    let newer = [row(0xaa, 7, 70)];
+    let older = [row(0xaa, 3, 30), row(0xbb, 1, 10)];
+    let written = cache
+        .write_batches(&[
+            BatchWrite {
+                end: BPosition::from_index(20),
+                rows: &newer,
+                receipts: &[],
+            },
+            BatchWrite {
+                end: BPosition::from_index(12),
+                rows: &older,
+                receipts: &[],
+            },
+        ])
+        .await
+        .unwrap();
+    assert_eq!((written.applied, written.discarded), (2, 1));
+    let a = cache
+        .account(Address::repeat_byte(0xaa))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((a.nonce, a.tx_idx), (7, 20));
+    let b = cache
+        .account(Address::repeat_byte(0xbb))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((b.nonce, b.tx_idx), (1, 12));
 }
 
 #[tokio::test]

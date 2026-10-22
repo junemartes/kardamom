@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use kardamom_cache::{AccountCache, AppliedRollbacks};
+use kardamom_cache::{AccountCache, AppliedRollbacks, BatchWrite};
 use kardamom_log::aeron_live::{ReceiptFrame, TxReceiptsReceiver};
 use kardamom_types::{BPosition, ReceiptBatch, ReceiptRollback};
 use tokio_util::sync::CancellationToken;
@@ -22,6 +22,12 @@ const WRITE_RETRY: Duration = Duration::from_millis(100);
 const OUTAGE_REBUILD_AFTER: Duration = Duration::from_secs(10);
 /// How often the local head file is refreshed.
 const HEAD_PERSIST_EVERY: Duration = Duration::from_secs(1);
+/// The most batches in one write. Each executor replica publishes a batch
+/// every few milliseconds, and the mirror gets a copy from each replica.
+/// One Redis round trip for a group, instead of several for each batch,
+/// lets the mirror keep up with the chain. The bound keeps one pipeline,
+/// and its retry, small.
+const MAX_GROUP: usize = 128;
 
 /// Why a rebuild runs. The reason is the metric label.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,11 +121,30 @@ impl Mirror {
         }
     }
 
-    /// Apply one frame, in stream order.
+    /// Apply one frame, in stream order. A batch takes the batches that
+    /// already wait behind it into one group, up to [`MAX_GROUP`], and
+    /// stops at a rollback, which runs after the group.
     async fn on_frame(&mut self, frame: ReceiptFrame) -> Result<()> {
-        match frame {
-            ReceiptFrame::Batch(batch) => self.apply(batch).await,
-            ReceiptFrame::Rollback(rollback) => self.roll_back(rollback).await,
+        let first = match frame {
+            ReceiptFrame::Batch(batch) => batch,
+            ReceiptFrame::Rollback(rollback) => return self.roll_back(rollback).await,
+        };
+        let mut group = vec![first];
+        let mut after = None;
+        while group.len() < MAX_GROUP {
+            match self.receipts.try_recv_frame() {
+                Some((_, ReceiptFrame::Batch(batch))) => group.push(batch),
+                Some((_, ReceiptFrame::Rollback(rollback))) => {
+                    after = Some(rollback);
+                    break;
+                }
+                None => break,
+            }
+        }
+        self.apply(&group).await?;
+        match after {
+            Some(rollback) => self.roll_back(rollback).await,
+            None => Ok(()),
         }
     }
 
@@ -170,22 +195,25 @@ impl Mirror {
         }
     }
 
-    /// Apply one batch: rows and receipts through the write rule, then
-    /// the head. A due rebuild runs first, once the first live position is
-    /// known.
-    async fn apply(&mut self, batch: ReceiptBatch) -> Result<()> {
-        let Some(end) = batch.end_tx_idx() else {
+    /// Apply a group of batches: their rows and receipts through the write
+    /// rule in one write, then the head once. A due rebuild runs first,
+    /// with the end of the first batch as the first live position.
+    async fn apply(&mut self, group: &[ReceiptBatch]) -> Result<()> {
+        let ends: Vec<BPosition> = group.iter().filter_map(ReceiptBatch::end_tx_idx).collect();
+        let (Some(&first), Some(&end)) = (ends.first(), ends.iter().max()) else {
             return Ok(());
         };
         if let Some(reason) = self.progress.pending_rebuild.take() {
-            self.run_rebuild(reason, end).await?;
+            self.run_rebuild(reason, first).await?;
         }
         let started = Instant::now();
-        self.write_until_landed(&Write::Batch { batch: &batch, end })
-            .await?;
+        self.write_until_landed(&Write::Batches(group)).await?;
         self.advance(end).await?;
-        self.steps.batch.since(started);
-        self.steps.receipt_batch.record(batch.receipts.len());
+        self.steps.group.since(started);
+        self.steps.group_batches.record(group.len());
+        self.steps
+            .group_receipts
+            .record(group.iter().map(|batch| batch.receipts.len()).sum());
         Ok(())
     }
 
@@ -229,14 +257,21 @@ impl Mirror {
 
     async fn try_write(&self, write: &Write<'_>) -> Result<()> {
         match write {
-            Write::Batch { batch, end } => {
+            Write::Batches(group) => {
+                let writes: Vec<BatchWrite<'_>> = group
+                    .iter()
+                    .filter_map(|batch| {
+                        Some(BatchWrite {
+                            end: batch.end_tx_idx()?,
+                            rows: &batch.accounts,
+                            receipts: &batch.receipts,
+                        })
+                    })
+                    .collect();
                 let started = Instant::now();
-                let written = self.cache.write_rows(*end, &batch.accounts).await?;
-                self.steps.evalsha.since(started);
-                let started = Instant::now();
-                self.cache.write_receipts(&batch.receipts).await?;
-                self.steps.receipts_set.since(started);
-                crate::metrics::record_batch(written.disagreed);
+                let written = self.cache.write_batches(&writes).await?;
+                self.steps.write.since(started);
+                crate::metrics::record_batches(writes.len(), written.disagreed);
             }
             Write::Clear => {
                 let deleted = self.cache.clear_projection().await?;
@@ -283,11 +318,9 @@ impl Mirror {
 
 /// One Redis write of the mirror, retried as a unit.
 enum Write<'a> {
-    /// A batch's rows and receipts, at the batch end.
-    Batch {
-        batch: &'a ReceiptBatch,
-        end: BPosition,
-    },
+    /// The rows and receipts of a group of batches, each row at the end
+    /// of its own batch.
+    Batches(&'a [ReceiptBatch]),
     /// The delete of the whole projection after a rollback.
     Clear,
 }
@@ -296,7 +329,7 @@ impl Write<'_> {
     /// The `write` field of the retry log line.
     fn label(&self) -> &'static str {
         match self {
-            Self::Batch { .. } => "batch",
+            Self::Batches(_) => "batch",
             Self::Clear => "clear",
         }
     }
