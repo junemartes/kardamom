@@ -41,8 +41,8 @@ pub(crate) fn describe() {
     );
 }
 
-pub(crate) fn record_batch(disagreed: u64) {
-    metrics::counter!(BATCHES_APPLIED_TOTAL).increment(1);
+pub(crate) fn record_batches(count: usize, disagreed: u64) {
+    metrics::counter!(BATCHES_APPLIED_TOTAL).increment(u64::try_from(count).unwrap_or(u64::MAX));
     metrics::counter!(PRODUCER_DISAGREEMENT_TOTAL).increment(disagreed);
 }
 
