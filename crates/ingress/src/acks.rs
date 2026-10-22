@@ -25,6 +25,7 @@ use std::ops::ControlFlow;
 use alloy_primitives::B256;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use kardamom_obs::pipeline::Queue;
 use kardamom_types::{TxStage, TxStatus};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -47,6 +48,8 @@ pub(crate) struct AckWaiters {
     slots: DashMap<B256, Slot>,
     next_id: AtomicU64,
     cfg: AdmissionAck,
+    /// The waiting submissions, set on each insert and each remove.
+    depth: Queue,
 }
 
 impl AckWaiters {
@@ -55,6 +58,7 @@ impl AckWaiters {
             slots: DashMap::new(),
             next_id: AtomicU64::new(0),
             cfg,
+            depth: Queue::new("ingress.ack_waiters"),
         })
     }
 
@@ -77,6 +81,7 @@ impl AckWaiters {
             Entry::Occupied(_) => return Err(IngressError::AlreadyKnown),
             Entry::Vacant(v) => v.insert(Slot { id, verdicts: tx }),
         };
+        self.depth.set(self.len());
         Ok(AckWait {
             waiters: Arc::clone(self),
             tx_hash,
@@ -96,6 +101,7 @@ impl AckWaiters {
 
     fn remove(&self, tx_hash: &B256, id: u64) {
         self.slots.remove_if(tx_hash, |_, slot| slot.id == id);
+        self.depth.set(self.len());
     }
 }
 
