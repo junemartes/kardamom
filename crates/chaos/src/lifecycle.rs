@@ -56,6 +56,9 @@ pub struct DeployVars {
     /// `--exec-cursor` of the executors: each one sends its recorded
     /// cursor to the sealer.
     pub exec_cursor: bool,
+    /// `--checkpoint-log` of the executors: each one keeps the block log
+    /// of its checkpoints.
+    pub checkpoint_log: bool,
 }
 
 impl DeployVars {
@@ -81,6 +84,9 @@ impl DeployVars {
         let cursor = self
             .exec_cursor
             .then(|| ("KARDAMOM_EXEC_CURSOR", "on".to_string()));
+        let checkpoint_log = self
+            .checkpoint_log
+            .then(|| ("KARDAMOM_CHECKPOINT_LOG", "on".to_string()));
         snapshot
             .into_iter()
             .chain(retention)
@@ -89,6 +95,7 @@ impl DeployVars {
             .chain(poll)
             .chain(silence)
             .chain(cursor)
+            .chain(checkpoint_log)
             .collect()
     }
 }
