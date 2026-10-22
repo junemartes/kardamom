@@ -91,11 +91,9 @@ impl BaseRule {
     /// after it while later segments exist, or a segment of the chain
     /// after it ended before it was full.
     fn has_gap(&self, segments: &[SegmentSize], base: u64) -> bool {
-        let next = base.saturating_add(1);
-        let Some(start) = segments.iter().rposition(|s| s.first_block <= next) else {
+        let Some(chain) = SegmentSize::chain_after(segments, base) else {
             return !segments.is_empty();
         };
-        let chain = &segments[start..];
         chain
             .iter()
             .take(chain.len().saturating_sub(1))

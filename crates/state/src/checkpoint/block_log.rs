@@ -252,6 +252,16 @@ impl SegmentSize {
             .collect())
     }
 
+    /// The segments of `segments` from the one that holds the block after
+    /// `base`: the chain that a restore of `base` reads. `None` when no
+    /// segment starts at or below that block.
+    #[must_use]
+    pub fn chain_after(segments: &[Self], base: u64) -> Option<&[Self]> {
+        let next = base.saturating_add(1);
+        let start = segments.iter().rposition(|s| s.first_block <= next)?;
+        Some(&segments[start..])
+    }
+
     /// Delete each segment in `dir` whose blocks are all at or below
     /// `base`: the next segment starts at or below `base + 1`. The last
     /// segment always stays, because the writer appends to it. Returns

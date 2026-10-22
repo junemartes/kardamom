@@ -2,7 +2,7 @@ use std::num::NonZeroU64;
 use std::path::Path;
 
 use super::super::tests::{ADDR, block_batch, commit_logged, seeded_env};
-use super::super::{BlockRange, create_checkpoint, restore_best_checkpoint};
+use super::super::{BlockRange, RestorePoint, create_checkpoint, restore_best_checkpoint};
 use super::LOG_DIR;
 use crate::env::{StateEnv, StateEnvBuilder};
 use crate::integrity::deep_compare;
@@ -108,4 +108,19 @@ fn a_base_with_no_log_restores_at_its_block() {
     let source = Source::new(3, 8);
     std::fs::remove_dir_all(source.ckpt.path().join(LOG_DIR)).unwrap();
     assert_eq!(source.restore(BlockRange::ANY).1, Some(3));
+}
+
+/// The restore point of a directory counts the log segment that holds the
+/// block after the base, so a log that grows in that one segment is a new
+/// point. A reader that waits for a restore to reach a block polls it.
+#[test]
+fn the_restore_point_moves_when_the_log_after_the_base_grows() {
+    let source = Source::new(5, 10);
+    let before = RestorePoint::newest(source.ckpt.path()).unwrap().unwrap();
+    assert_eq!(before.base, 5);
+    assert!(before.log_bytes > 0, "{before:?}");
+    commit_logged(&source.env, &source.ckpt.path().join(LOG_DIR), 11..=12);
+    let after = RestorePoint::newest(source.ckpt.path()).unwrap().unwrap();
+    assert!(after.is_after(&before), "{before:?} -> {after:?}");
+    assert!(!before.is_after(&before));
 }

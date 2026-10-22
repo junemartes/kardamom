@@ -312,6 +312,48 @@ pub fn latest_checkpoint(
     Ok(best)
 }
 
+/// The newest restore point of a checkpoint directory, as a reader can
+/// compare it across polls: the block of the newest base, and the bytes of
+/// the chain of log segments that a restore of it reads. The log grows after the base, so a restore of
+/// the same base reaches further when its log has more bytes. The bytes
+/// come from the sizes of the segments, so a poll reads no record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestorePoint {
+    pub base: u64,
+    pub log_bytes: u64,
+}
+
+impl RestorePoint {
+    /// The restore point of `checkpoints_dir`. `None` with no base.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if the directory or the log does not list.
+    pub fn newest(checkpoints_dir: &Path) -> Result<Option<Self>, StateError> {
+        let Some(base) = latest_checkpoint(checkpoints_dir, BlockRange::ANY)? else {
+            return Ok(None);
+        };
+        let segments = block_log::SegmentSize::list(&checkpoints_dir.join(replay::LOG_DIR))?;
+        let log_bytes = block_log::SegmentSize::chain_after(&segments, base.block)
+            .unwrap_or_default()
+            .iter()
+            .map(|s| s.bytes)
+            .sum();
+        Ok(Some(Self {
+            base: base.block,
+            log_bytes,
+        }))
+    }
+
+    /// Whether a restore at this point may reach further than one at
+    /// `tried`: its base is newer, or the log after the same base changed.
+    /// A log that the writer cut and wrote again counts as changed.
+    #[must_use]
+    pub fn is_after(&self, tried: &Self) -> bool {
+        self.base > tried.base || (self.base == tried.base && self.log_bytes != tried.log_bytes)
+    }
+}
+
 /// Every checkpoint in the directory, newest block first.
 ///
 /// # Errors
