@@ -320,7 +320,8 @@ public final class ClusterNode {
      *
      * <p>{@code stateDir} is the directory whose disk the free-space gauge
      * reads. {@code retained} serves the retained file to a member that a
-     * peer seeds.</p>
+     * peer seeds. {@code /metrics} also renders the pipeline metrics of the
+     * service and the Aeron counters of the member ({@link MetricsPage}).</p>
      */
     private static AdminServer startAdminServer(
             final ConsensusModule.Context consensus,
@@ -341,9 +342,12 @@ public final class ClusterNode {
             consensus.commitPositionCounter(),
             service,
             stateDir);
+        // The driver created the CnC file before the launch returned.
+        final MetricsPage page = new MetricsPage(memberId, service.metrics(),
+            CncCounters.map(consensus.aeronDirectoryName(), consensus.logStreamId()));
         final AdminServer admin;
         try {
-            admin = AdminServer.start(port, source::sample, lagBytes, retained);
+            admin = AdminServer.start(port, source::sample, () -> page.render(source.sample()), lagBytes, retained);
         } catch (final java.io.IOException e) {
             throw new IllegalStateException("cluster admin endpoint bind failed on port " + port, e);
         }

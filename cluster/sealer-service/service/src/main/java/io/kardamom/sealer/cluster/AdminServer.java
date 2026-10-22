@@ -18,7 +18,7 @@ import java.util.function.Supplier;
  * answers 200 when the member is ready and 503 when it is not, with the same
  * JSON, so a service check reads the verdict from the status code and an
  * operator reads the reason from the body. {@code GET /metrics} answers the
- * gauges in the Prometheus text format.</p>
+ * metrics text in the Prometheus text format.</p>
  *
  * <p>With a retained file, {@link RetainedEndpoint} answers the paths
  * under {@code /retained} on its own threads. Every other path answers 404.
@@ -32,6 +32,8 @@ final class AdminServer implements AutoCloseable {
 
     private final HttpServer server;
     private final Supplier<MemberStatus> status;
+    /** The Prometheus text of one scrape. */
+    private final Supplier<String> metrics;
     private final long lagBytes;
     /** The segments of the retained file, or empty when the member keeps the frames on the heap. */
     private final Optional<RetainedEndpoint> retained;
@@ -39,17 +41,20 @@ final class AdminServer implements AutoCloseable {
     private AdminServer(
             final HttpServer server,
             final Supplier<MemberStatus> status,
+            final Supplier<String> metrics,
             final long lagBytes,
             final Optional<RetainedEndpoint> retained) {
         this.server = server;
         this.status = status;
+        this.metrics = metrics;
         this.lagBytes = lagBytes;
         this.retained = retained;
     }
 
     /**
      * Bind {@code 0.0.0.0:port} (0 picks a free port) and start serving,
-     * with the segments of {@code retained} when it is present.
+     * with the segments of {@code retained} when it is present. The
+     * metrics text is the text of the status sample.
      *
      * @throws IOException when the bind fails
      */
@@ -59,8 +64,24 @@ final class AdminServer implements AutoCloseable {
             final long lagBytes,
             final Optional<RetainedEndpoint> retained)
             throws IOException {
+        return start(port, status, () -> status.get().toMetrics(), lagBytes, retained);
+    }
+
+    /**
+     * {@link #start(int, Supplier, long, Optional)} with the metrics text of
+     * {@code metrics}.
+     *
+     * @throws IOException when the bind fails
+     */
+    static AdminServer start(
+            final int port,
+            final Supplier<MemberStatus> status,
+            final Supplier<String> metrics,
+            final long lagBytes,
+            final Optional<RetainedEndpoint> retained)
+            throws IOException {
         final HttpServer http = HttpServer.create(new InetSocketAddress("0.0.0.0", port), 0);
-        final AdminServer admin = new AdminServer(http, status, lagBytes, retained);
+        final AdminServer admin = new AdminServer(http, status, metrics, lagBytes, retained);
         http.createContext("/", admin::handle);
         http.setExecutor(Executors.newSingleThreadExecutor(admin::daemonThread));
         http.start();
@@ -101,14 +122,14 @@ final class AdminServer implements AutoCloseable {
     }
 
     private void respondWithMetrics(final HttpExchange exchange) throws IOException {
-        final MemberStatus sample;
+        final String text;
         try {
-            sample = status.get();
+            text = metrics.get();
         } catch (final RuntimeException e) {
             respond(exchange, UNAVAILABLE, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
             return;
         }
-        respond(exchange, OK, "text/plain; version=0.0.4", sample.toMetrics());
+        respond(exchange, OK, "text/plain; version=0.0.4", text);
     }
 
     /**
