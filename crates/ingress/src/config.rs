@@ -83,6 +83,10 @@ pub struct IngressConfig {
     /// two account RPCs. Off when the endpoint list is empty: a cold
     /// address then gets an error, not an answer.
     pub executor_query: ExecutorQueryConfig,
+    /// The query of `eth_getTransactionReceipt` on a cache miss: the
+    /// egress, which answers it as an executor does. An empty list uses
+    /// [`Self::executor_query`].
+    pub receipt_query: ExecutorQueryConfig,
     /// The Redis layer, between the local layer and the executor query.
     /// Off when no address is configured: no Redis call exists on any
     /// path. On, the submit path reads the account projection on a
@@ -226,6 +230,7 @@ impl Default for IngressConfig {
             live_accounts: LiveAccountsConfig::default(),
             admission_checks: true,
             executor_query: ExecutorQueryConfig::default(),
+            receipt_query: ExecutorQueryConfig::default(),
             cache: CacheConfig::default(),
             mirror_count: nonzero!(1u32),
             // 64 blocks is 16 s at the 250 ms production tick, and 128 s

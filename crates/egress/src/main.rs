@@ -1,7 +1,9 @@
 //! `kardamom-egress`: the stage after the executors. It merges the
 //! `exec_frames` copies of every executor into one canonical stream, keeps
 //! it on disk, publishes it live on `egress_order`, and answers the range
-//! reads of the readers that resume. See the library docs.
+//! reads of the readers that resume. It merges the receipts of every
+//! executor too, publishes them on `egress_receipts`, and answers
+//! `eth_getTransactionReceipt`. See the library docs.
 
 use std::net::SocketAddr;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -12,7 +14,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_egress::http::Http;
 use kardamom_egress::merge::{Head, Merge, MergeConfig};
-use kardamom_egress::owner::{FramePublisher, Input, Owner, OwnerConfig};
+use kardamom_egress::owner::{FramePublisher, Input, Owner, OwnerConfig, Parts};
+use kardamom_egress::receipts::Receipts;
 use kardamom_egress::store::Store;
 use kardamom_log::aeron_live::{AeronRuntime, PubHandle};
 use kardamom_log::config::LogConfig;
@@ -68,6 +71,14 @@ struct Args {
     /// the copies.
     #[arg(long, env = "KARDAMOM_EGRESS_COMPARED", default_value = "1000000")]
     compared: NonZeroUsize,
+    /// The newest receipts that the egress keeps for
+    /// `eth_getTransactionReceipt`.
+    #[arg(long, env = "KARDAMOM_EGRESS_RECEIPTS", default_value = "1000000")]
+    receipts: NonZeroUsize,
+    /// The executor replicas whose `tx_receipts` endpoints to attach under
+    /// MDS. Falls back to `channels.tx_receipts_executor_count`.
+    #[arg(long, env = "KARDAMOM_EXECUTOR_COUNT")]
+    executor_count: Option<std::num::NonZeroU32>,
     /// Address for the Prometheus /metrics HTTP listener.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9013")]
     metrics_addr: SocketAddr,
@@ -105,6 +116,17 @@ async fn main() -> Result<()> {
         .egress_order_publisher(&rt)
         .await
         .context("open egress_order")?;
+    let executor_count = args
+        .executor_count
+        .or(plane.channels().tx_receipts_executor_count);
+    let receipt_frames = plane
+        .tx_receipts_subscriber(&rt, executor_count)
+        .context("open tx_receipts")?
+        .into_receiver();
+    let receipts_live = plane
+        .egress_receipts_publisher(&rt)
+        .await
+        .context("open egress_receipts")?;
 
     let store = Store::open(&args.dir, args.segment_blocks, GENESIS).context("open the store")?;
     tracing::info!(head = ?store.head(), dir = %args.dir.display(), "egress: store open");
@@ -120,9 +142,13 @@ async fn main() -> Result<()> {
             sync_every: Duration::from_millis(args.sync_ms),
             keep_blocks: args.keep_blocks,
         },
-        merge,
-        store,
-        Live(live),
+        Parts {
+            merge,
+            store,
+            receipts: Receipts::new(args.receipts),
+            live: Live(live),
+            receipts_live: Live(receipts_live),
+        },
     );
     let (inputs, rx) = crossbeam_channel::bounded(INPUTS);
     let owner_thread = std::thread::Builder::new()
@@ -134,6 +160,12 @@ async fn main() -> Result<()> {
         .name("egress-frames".into())
         .spawn(move || forward_frames(frames, &forward))
         .context("spawn the frames thread")?;
+    let forward = inputs.clone();
+    let handle = tokio::runtime::Handle::current();
+    std::thread::Builder::new()
+        .name("egress-receipts".into())
+        .spawn(move || forward_receipts(receipt_frames, &forward, &handle))
+        .context("spawn the receipts thread")?;
 
     let http = Http::bind(args.bind, inputs)
         .await
@@ -165,6 +197,17 @@ fn forward_frames(
             message: frame.bytes,
         })
         .try_for_each(|input| inputs.send(input));
+}
+
+/// Put each receipt frame of the executors on the owner's queue, until the
+/// subscription closes or the owner is gone.
+fn forward_receipts(
+    mut frames: kardamom_log::aeron_live::TxReceiptsReceiver,
+    inputs: &crossbeam_channel::Sender<Input>,
+    handle: &tokio::runtime::Handle,
+) {
+    let _ = std::iter::from_fn(|| handle.block_on(frames.recv_frame()))
+        .try_for_each(|(_, frame)| inputs.send(Input::Receipts(frame)));
 }
 
 /// End the Aeron runtime: the subscription closes, so the frames thread

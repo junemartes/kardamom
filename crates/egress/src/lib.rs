@@ -10,4 +10,5 @@ pub mod http;
 pub mod merge;
 pub mod metrics;
 pub mod owner;
+pub mod receipts;
 pub mod store;

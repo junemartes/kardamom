@@ -68,6 +68,7 @@ The streams and their publishers:
 | `exec_txs` | executor | validator, batcher (none subscribes yet), the archive on the node of each executor |
 | `exec_frames` | executor (with `--exec-frames`) | egress |
 | `egress_order` | egress | the readers after the executors (batcher, validator) |
+| `egress_receipts` | egress | sequencers (with `receipts_from_egress = true`) |
 | `l1_blocks` | L1 follower (two instances) | da-watcher, batcher, follower archives |
 
 The `exec_txs` stream carries the transactions that an executor joins, in canonical order: one `ExecTxRecord` for each `TxRef`.
@@ -94,6 +95,13 @@ The `egress_order` stream carries the canonical stream that the egress merged fr
 - The stream id is 1009. The channel and the stream id are the keys `egress_order_channel` and `egress_order_stream_id` of `[channels]`.
 - Each egress instance opens one dynamic MDC publication (topic `egress_order`). A reader gets the copies of every instance and keeps the first of each frame.
 - A reader that resumes reads the frames before the live stream from the range read of one instance: `GET /v1/frames?from_index=<i>&from_block=<b>`.
+
+The `egress_receipts` stream carries the receipts that the egress merged from the `tx_receipts` stream of every executor, each once, in the frame format of `tx_receipts`: the batches with their account rows, and each rollback once.
+
+- The stream id is 1011. The channel and the stream id are the keys `egress_receipts_channel` and `egress_receipts_stream_id` of `[channels]`.
+- The executors cut their batches differently. The egress passes on only the receipts of a batch past the last receipt that it took, with the rows of the batch. The rows are absolute values, and a reader keeps the row of the higher position.
+- A sequencer reads it in place of `tx_receipts` with `receipts_from_egress = true` in its config.
+- The egress also answers `eth_getTransactionReceipt` as the state query of an executor does (`POST /`, the receipt as rkyv hex, the block in `x-state-block`). An ingress reads it with `--receipt-query-endpoints`.
 
 The `l1_blocks` stream carries the finalized L1 blocks: one `L1Block` for each block, in block order.
 

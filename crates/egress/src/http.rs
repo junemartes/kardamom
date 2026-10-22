@@ -11,6 +11,12 @@
 //!   `x-egress-floor-index` and `x-egress-floor-block`;
 //! - `400` for a bad query, `503` when the owner thread is gone.
 //!
+//! `POST /` with the JSON-RPC call `eth_getTransactionReceipt` answers as
+//! the state query of an executor does: the receipt as the `0x` hex of its
+//! rkyv bytes, or `null`, with the block of the newest receipt in the
+//! header `x-state-block`. So a client of the executor query reads the
+//! egress with no change.
+//!
 //! `GET /health` answers `200 ok`.
 
 use std::collections::HashMap;
@@ -18,8 +24,10 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use alloy_primitives::B256;
 use bytes::Bytes;
 use crossbeam_channel::Sender;
+use http_body_util::BodyExt;
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -80,7 +88,7 @@ impl Http {
                 tokio::spawn(async move {
                     let service = service_fn(move |req| {
                         let inputs = inputs.clone();
-                        async move { Ok::<_, Infallible>(respond(&req, &inputs).await) }
+                        async move { Ok::<_, Infallible>(respond(req, &inputs).await) }
                     });
                     if let Err(e) = http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
@@ -98,7 +106,10 @@ impl Http {
     }
 }
 
-async fn respond(req: &Request<Incoming>, inputs: &Sender<Input>) -> Response<Full<Bytes>> {
+async fn respond(req: Request<Incoming>, inputs: &Sender<Input>) -> Response<Full<Bytes>> {
+    if req.method() == hyper::Method::POST && req.uri().path() == "/" {
+        return receipt_call(req, inputs).await;
+    }
     match req.uri().path() {
         "/health" => reply(StatusCode::OK, Bytes::from_static(b"ok\n")),
         "/v1/frames" => match Cursor::parse(req.uri().query().unwrap_or_default()) {
@@ -173,6 +184,66 @@ impl Cursor {
             ),
         }
     }
+}
+
+/// The largest JSON-RPC body taken.
+const MAX_CALL: usize = 64 * 1024;
+
+/// One JSON-RPC call: `eth_getTransactionReceipt` with one hash.
+#[derive(serde::Deserialize)]
+struct Call {
+    #[serde(default)]
+    id: serde_json::Value,
+    method: String,
+    #[serde(default)]
+    params: Vec<B256>,
+}
+
+async fn receipt_call(req: Request<Incoming>, inputs: &Sender<Input>) -> Response<Full<Bytes>> {
+    let Ok(body) = http_body_util::Limited::new(req.into_body(), MAX_CALL)
+        .collect()
+        .await
+        .map(http_body_util::Collected::to_bytes)
+    else {
+        return reply(StatusCode::BAD_REQUEST, Bytes::from_static(b"body\n"));
+    };
+    let call: Call = match serde_json::from_slice(&body) {
+        Ok(call) => call,
+        Err(e) => return json_error(&serde_json::Value::Null, -32700, &e.to_string()),
+    };
+    let (Some(tx_hash), "eth_getTransactionReceipt") = (call.params.first(), call.method.as_str())
+    else {
+        return json_error(&call.id, -32601, "only eth_getTransactionReceipt");
+    };
+    let (reply_tx, answer) = oneshot::channel();
+    let asked = inputs.try_send(Input::Receipt {
+        tx_hash: *tx_hash,
+        reply: reply_tx,
+    });
+    let (Ok(()), Ok((receipt, block))) = (asked, answer.await) else {
+        return reply(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Bytes::from_static(b"the store is busy or gone\n"),
+        );
+    };
+    let result = receipt
+        .and_then(|r| rkyv::to_bytes::<rkyv::rancor::Error>(&r).ok())
+        .map(|bytes| format!("0x{}", alloy_primitives::hex::encode(bytes.as_slice())));
+    let body = serde_json::json!({"jsonrpc": "2.0", "id": call.id, "result": result});
+    let mut response = reply(StatusCode::OK, Bytes::from(body.to_string()));
+    response
+        .headers_mut()
+        .insert("x-state-block", hyper::header::HeaderValue::from(block));
+    response
+}
+
+fn json_error(id: &serde_json::Value, code: i32, message: &str) -> Response<Full<Bytes>> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": message},
+    });
+    reply(StatusCode::OK, Bytes::from(body.to_string()))
 }
 
 fn frames_reply(frames: &[Vec<u8>], after: Head, head: Head) -> Response<Full<Bytes>> {

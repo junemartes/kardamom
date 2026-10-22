@@ -4,8 +4,9 @@ use std::time::Duration;
 use kardamom_cluster_adapter::wire::{encode_egress_boundary, encode_egress_record};
 use tokio::sync::oneshot;
 
-use super::{FramePublisher, Input, Owner, OwnerConfig, ReadRequest};
+use super::{FramePublisher, Input, Owner, OwnerConfig, Parts, ReadRequest};
 use crate::merge::{Head, Merge, MergeConfig};
+use crate::receipts::Receipts;
 use crate::store::{Range, Store};
 
 /// The frames that went out live, on a channel the test reads.
@@ -43,9 +44,13 @@ fn owner(dir: &std::path::Path, live: Live) -> Owner<Live> {
             sync_every: Duration::from_millis(10),
             keep_blocks: NonZeroU64::new(1_000).unwrap(),
         },
-        merge,
-        store,
-        live,
+        Parts {
+            merge,
+            store,
+            receipts: Receipts::new(NonZeroUsize::new(16).unwrap()),
+            live: live.clone(),
+            receipts_live: live,
+        },
     )
 }
 

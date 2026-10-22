@@ -109,6 +109,10 @@ impl IngressService {
                 endpoints: args.executor_query_endpoints.clone(),
                 ..ExecutorQueryConfig::default()
             },
+            receipt_query: ExecutorQueryConfig {
+                endpoints: args.receipt_query_endpoints.clone(),
+                ..ExecutorQueryConfig::default()
+            },
             cache: self.file_cfg.cache.clone(),
             // The mirror ids are the executor indexes. One when no count
             // is known: the Redis reader then polls `head:0` only.
