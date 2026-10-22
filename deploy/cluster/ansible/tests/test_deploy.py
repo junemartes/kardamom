@@ -965,6 +965,13 @@ class DeployTest(Deploys):
         cluster_options = dict(parties)['cluster']['Env']['JAVA_TOOL_OPTIONS'].split()
         self.assertIn(f'-Daeron.archive.message.timeout={tolerance}ms', cluster_options)
         self.assertIn(f'-Daeron.archive.connect.timeout={tolerance // 2}ms', cluster_options)
+        # Each Aeron agent of a sealer counts its work cycles above 5 ms.
+        self.assertIn('-Daeron.driver.sender.cycle.threshold=5ms', cluster_options)
+        self.assertIn('-Daeron.cluster.service.cycle.threshold=5ms', cluster_options)
+        # Each GC pause and safepoint goes to a rotated file with a UTC time
+        # stamp, written asynchronously.
+        self.assertIn('-Xlog:async', cluster_options)
+        self.assertIn('-Xlog:gc,safepoint:file=/opt/kardamom/cluster/jvm-pauses.log:utctime:filecount=5,filesize=20m', cluster_options)
         # A restarted driver waits out the active-driver window of its
         # dead predecessor: Nomad's 15 s default at the 10 s tolerance.
         delay_ns = plans['aeron']['TaskGroups'][0]['RestartPolicy']['Delay']
