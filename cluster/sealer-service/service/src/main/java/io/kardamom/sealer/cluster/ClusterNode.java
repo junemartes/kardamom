@@ -24,7 +24,9 @@ import org.agrona.concurrent.status.AtomicCounter;
 /**
  * Boots an all-in-one Aeron Cluster member: a media driver, an archive, and
  * a consensus module, running {@link SealerClusteredService}.
- * Configure it with -D system properties.
+ * Configure it with -D system properties. With
+ * {@code -Dkardamom.cluster.backup=true} the process runs a
+ * {@link BackupNode} instead: no member, and no vote.
  */
 public final class ClusterNode {
     // App version shared with the Rust cluster-client (kardamom-cluster-client's
@@ -43,10 +45,17 @@ public final class ClusterNode {
     static final String DA_LAG_BUDGET_SETTING = "kardamom.cluster.daLagBudgetBlocks";
     /** The property of the record-lag budget, in canonical records. */
     static final String RECORD_LAG_BUDGET_SETTING = "kardamom.cluster.recordLagBudget";
+    /** The property of the file sync level of the Raft log and the archive of a member. */
+    static final String FILE_SYNC_LEVEL_SETTING = "kardamom.cluster.fileSyncLevel";
 
     public static void main(final String[] args) {
         // Every stdout line carries its time from here on (see the class).
         System.setOut(new TimestampedOut(System.out));
+        // A backup node is no member: it has no member id and never votes.
+        if (Boolean.getBoolean(BackupNode.SETTING)) {
+            new BackupNode(BackupSettings.parse(System.getProperties(), IdleCap.fromSettings())).run();
+            return;
+        }
         // "0,ingressHost:port,consensusHost:port,logHost:port,catchupHost:port,archiveHost:port|1,...|2,..."
         final String clusterMembers = System.getProperty("kardamom.cluster.members");
         if (clusterMembers == null) throw new IllegalStateException("kardamom.cluster.members not set");
@@ -548,10 +557,18 @@ public final class ClusterNode {
      * cache.
      */
     static int fileSyncLevel() {
-        final int level = Integer.getInteger("kardamom.cluster.fileSyncLevel", 0);
+        return checkedSyncLevel(FILE_SYNC_LEVEL_SETTING, Integer.getInteger(FILE_SYNC_LEVEL_SETTING, 0));
+    }
+
+    /**
+     * Return {@code level} when it is a file sync level of Aeron: 0, 1 or 2.
+     *
+     * @param setting the property name, for the error text
+     * @throws IllegalArgumentException for any other value
+     */
+    static int checkedSyncLevel(final String setting, final int level) {
         if (level < 0 || level > 2) {
-            throw new IllegalArgumentException(
-                "kardamom.cluster.fileSyncLevel must be 0, 1 or 2, not " + level);
+            throw new IllegalArgumentException(setting + " must be 0, 1 or 2, not " + level);
         }
         return level;
     }
@@ -821,7 +838,12 @@ public final class ClusterNode {
      * comma separated: the peers that a blank member seeds from.
      */
     static String peerConsensusEndpoints(final String clusterMembers, final int memberId) {
-        return peerEntries(clusterMembers, memberId)
+        return consensusEndpoints(peerEntries(clusterMembers, memberId));
+    }
+
+    /** The consensus endpoints of {@code entries}, comma separated. */
+    static String consensusEndpoints(final java.util.stream.Stream<String[]> entries) {
+        return entries
             .map(f -> f[2].trim())
             .collect(java.util.stream.Collectors.joining(","));
     }
@@ -831,9 +853,14 @@ public final class ClusterNode {
      * its fields {@code id,ingress,consensus,log,catchup,archive}.
      */
     static java.util.stream.Stream<String[]> peerEntries(final String clusterMembers, final int memberId) {
-        return java.util.Arrays.stream(clusterMembers.split("\\|"))
-            .map(member -> member.split(","))
+        return entries(clusterMembers)
             .filter(f -> Integer.parseInt(f[0].trim()) != memberId);
+    }
+
+    /** The entries of every member, each split into its fields {@code id,ingress,consensus,log,catchup,archive}. */
+    static java.util.stream.Stream<String[]> entries(final String clusterMembers) {
+        return java.util.Arrays.stream(clusterMembers.split("\\|"))
+            .map(member -> member.split(","));
     }
 
     /**

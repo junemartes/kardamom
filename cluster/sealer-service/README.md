@@ -333,6 +333,47 @@ A blank member without the bootstrap copies state from a running peer before it 
   - A round in which no peer serves a copy that passes ends with no result, and prints `cluster SEED retained-copy MISMATCH`. After 5 such rounds the seed prints `cluster SEED retained-copy GAVE-UP` and stops the start. See [Recover a member that stops on its retained file](#recover-a-member-that-stops-on-its-retained-file).
   - A cluster with no snapshot needs no copy: the member replays the whole log.
 
+## Backup mode
+
+A backup node keeps a recovery copy of the cluster state outside the quorum. It is not a member and never votes. The deploy runs it as the job `cluster-backup` (`deploy/cluster/nomad/cluster-backup.nomad.hcl`).
+
+- `-Dkardamom.cluster.backup=true` selects the mode. The node checks it first, before it looks for a member id.
+- The node runs an Aeron ClusterBackup until it gets a shutdown signal. It keeps the latest snapshots and the log after them in its own cluster and archive directories.
+- The backup asks the consensus endpoints of all members in `kardamom.cluster.members`. It starts at the latest snapshot, because the members purge the log below their snapshots.
+- Each `intervalS` the backup asks for new snapshots. Between the queries it records the live log through a replay that stops at the commit position of the member that it copies from.
+- A termination of the backup stops the process with the line `cluster TERMINATION component=CLUSTER_BACKUP`, and the job restarts it.
+
+Ports on the backup host:
+
+| Port | Use |
+|---|---|
+| `<nodeIp>:40201` | The consensus endpoint. The members send their answers to the backup queries here. |
+| `<nodeIp>:40204` | The control endpoint of the archive of the backup. |
+| `<nodeIp>:0` | Catch-up, replication and archive control responses, on ephemeral ports. |
+| `adminPort` | The admin server (the deploy uses `40205`). |
+
+The settings of the backup:
+
+- `kardamom.backup.fileSyncLevel` (default `1`): the sync level of the archive of the backup and of its catalog.
+  - The backup is outside the quorum, so a sync never delays a commit.
+  - Its copy is the recovery source after a power loss on a majority of the members. Level 1 keeps the copy through a power loss of the backup host too.
+- `kardamom.backup.sourceType` (default `FOLLOWER`): the members that the backup copies from. `FOLLOWER` keeps the snapshot replication and the log replay off the leader. A leader that answers a query is refused, and the backup asks the next member after 1 s.
+- `kardamom.backup.intervalS` (default `30`): the interval between two backup queries.
+- The node also reads `kardamom.cluster.members`, `kardamom.cluster.nodeIp`, `aeron.dir`, `kardamom.cluster.dir`, `kardamom.archive.dir`, `kardamom.cluster.adminPort` and `kardamom.cluster.idleCapUs`, as a member does. The media driver and the archive run in the `SHARED` mode with the idle cap of a member.
+
+The admin server of the backup:
+
+| Request | Answer |
+|---|---|
+| `GET /status` | Always 200 with the status JSON. |
+| `GET /ready` | 200 when the state is `BACKING_UP`. 503 in any other state. The body is the status JSON. |
+| `GET /metrics` | 200 with the gauges `kardamom_backup_state` (the state code; 5 is `BACKING_UP`), `kardamom_backup_live_log_position` and `kardamom_backup_snapshot_log_position`. |
+
+- The status JSON has `mode` (`backup`), `state` (the name of the `ClusterBackup.State`), `stateCode`, `liveLogPosition`, `latestSnapshotLogPosition`, `latestSnapshotLeadershipTermId` and `ready`. The snapshot fields are `-1` while the recording log of the backup holds no snapshot.
+- A watch thread samples the backup each 250 ms. The admin server answers the latest sample.
+- The backup is ready when it holds a snapshot and is in `BACKING_UP`, or in the `BACKUP_QUERY` that it starts from there at each interval. So `/ready` does not blink at each query.
+- The line `cluster BACKUP state=` prints when the latest snapshot changes, or when the backup steps out of those two states (`liveLogPosition`, `snapshotLogPosition`, `snapshotLeadershipTermId`). The query of each interval prints nothing.
+
 ## Seeded start
 
 A sealer cluster that lost all its state can start after a block `H` that `kardamom-reconstruct` rebuilt from L1. The consumers resume at `H`, so a start at genesis would put the sealer behind them. See [Replay ahead of the head](#replay-ahead-of-the-head).
@@ -375,7 +416,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 |---|---|---|---|
 | `kardamom.cluster.members` | none (required) | yes | The member list: `id,ingress,consensus,log,catchup,archive` for each member, separated by `\|`. |
 | `kardamom.cluster.memberId` | `-1` | no | This member id. A value below 0 means: find the member whose ingress host equals `nodeIp`. |
-| `kardamom.cluster.nodeIp` | none | no | This node IP. It is required when `memberId` is not set. |
+| `kardamom.cluster.nodeIp` | none | no | This node IP. It is required when `memberId` is not set, and on a backup node. |
 | `aeron.dir` | `/opt/kardamom/aeron-mount/dir` | no | The Aeron media-driver directory. |
 | `kardamom.cluster.dir` | `/opt/kardamom/cluster` | no | The cluster (Raft log and mark file) directory. |
 | `kardamom.archive.dir` | `/opt/kardamom/archive` | no | The Aeron archive directory. |
@@ -401,6 +442,10 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.joinWatchdogS` | `60` | no | The member exits with code 3 if its election stays in `INIT` for this long. It exits with code 6 when the completion of its leader election failed: the control toggle is active, but the election state is not `CLOSED`, for longer than the archive message timeout plus the driver timeout. It exits with code 7 or 8 when an election stalls for the stall limit (see [Election stalls](#election-stalls)). `0` turns the join watchdog off, and with it the exit on a closed component and the stall rules. |
 | `kardamom.cluster.catchupStallS` | `300` | no | A member that tried a catch-up, and makes no progress for this long, drops its recording log and exits with code 4, unless every peer answers with an open election. The relaunch seeds the member from a peer. `0` turns the seed off: the member then never drops its log. |
 | `kardamom.cluster.fileSyncLevel` | `0` | no | The sync level of the Raft log and the archive. Values: `0`, `1`, `2`. Any other value stops the start. |
+| `kardamom.cluster.backup` | `false` | no | `true` runs the process as a backup node, not as a member. See [Backup mode](#backup-mode). |
+| `kardamom.backup.fileSyncLevel` | `1` | no | The sync level of the archive of a backup node and of its catalog. Values: `0`, `1`, `2`. Any other value stops the start. |
+| `kardamom.backup.intervalS` | `30` | no | How often a backup node asks the members for new snapshots, in seconds. A value of `0` or below stops the start. |
+| `kardamom.backup.sourceType` | `FOLLOWER` | no | The members that a backup node copies from: `ANY`, `LEADER` or `FOLLOWER`. Any other value stops the start. |
 | `kardamom.cluster.bootstrap` | off | no | `true` starts a blank member at log position 0. The file `bootstrap` in `$NOMAD_TASK_DIR` has the same effect. See [Start modes](#start-modes). |
 | `kardamom.cluster.seedSnapshot` | none | yes, on a new seeded cluster | The path of the seed file. A cluster with no snapshot starts after the head of the seed, not at genesis. See [Seeded start](#seeded-start). |
 
@@ -706,7 +751,8 @@ The chaos suite and operators read these lines. The admin server also exports on
 | `cluster ERROR LOG` | Before each exit of the join watchdog, the member prints the error logs of its consensus module, its media driver and its service container, one line each. |
 | `cluster DNS FAILED` / `cluster DNS RESOLVED` | A lookup of a member name failed, and the media driver uses the last address of the name. The second line shows the first good lookup after the outage. A name with no last address stays unresolved, and the Aeron add fails. See [Member names](#member-names). |
 | `cluster COMPONENT CLOSED` | The consensus module or the service container closed with no stop request, for example after an error in its start. The error log in the cluster directory holds the cause. The process halts with exit code 5. |
-| `cluster TERMINATION` | The consensus module or the service container asked for a shutdown. |
+| `cluster BACKUP` | A backup node: `up` shows its settings, `state=` a change of its state or of its latest snapshot, `error` an error of its ClusterBackup, and `closed` its stop. See [Backup mode](#backup-mode). |
+| `cluster TERMINATION` | The consensus module or the service container asked for a shutdown, or the ClusterBackup of a backup node terminated. |
 | `cluster node up`, `cluster admin endpoint`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster da-lag budget`, `cluster record-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster carry bytes`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |
 
 - The lines `CONTIGUITY-REJECT`, `PAST-DEADLINE`, `DA-LAG-REJECT`, `RECORD-LAG-REJECT`, `WINDOW-FULL`, `REMOTE-ORIGIN-REJECT` and `DROPPED` print when their count is a power of two (1, 2, 4, 8, and so on).
