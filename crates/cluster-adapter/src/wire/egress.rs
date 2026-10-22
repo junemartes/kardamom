@@ -21,8 +21,8 @@ use super::{
     EGRESS_KIND_DA_LAG_REJECT, EGRESS_KIND_PAST_DEADLINE, EGRESS_KIND_RELAYED,
     EGRESS_KIND_REMOTE_ORIGIN_REJECT, EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE,
     EGRESS_KIND_STATUS, EGRESS_KIND_WINDOW_FULL, FEED_ANSWER_LEN, FEED_REQUEST_ID_OFFSET,
-    RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH, RT_TX, RT_TX_OFFER, RT_TXREF, RT_VOID,
-    RemoteOriginRejectReason, SENDER_LEN, STATUS_LEN, STATUS_RETAINED_BYTES_OFFSET,
+    RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH, RT_TX, RT_TX_OFFER, RT_TXREF, RT_TXREF_OFFER,
+    RT_VOID, RemoteOriginRejectReason, SENDER_LEN, STATUS_LEN, STATUS_RETAINED_BYTES_OFFSET,
     STATUS_WITH_RETAINED_BYTES_LEN, WireError, rd_i32, rd_i64, rd_len, rd_slice, rd_u8, rd_u64,
     too_short,
 };
@@ -364,15 +364,15 @@ impl<'a> RelayedPayload<'a> {
     }
 
     /// The egress item of this payload at canonical `index`. A canonical
-    /// entry has its own item. A full entry is an ingress type, so a
-    /// relayed one is refused.
+    /// entry has its own item. A full entry and a full reference are
+    /// ingress types, so a relayed one is refused.
     fn into_item(self, index: u64) -> Result<EgressItem, WireError> {
         match self.record_type {
             RT_TX => Ok(EgressItem::Tx {
                 index,
                 tx: CanonicalTx::parse(self.id, self.fields)?,
             }),
-            RT_TX_OFFER => Err(WireError::UnrelayedRecordType(RT_TX_OFFER)),
+            RT_TX_OFFER | RT_TXREF_OFFER => Err(WireError::UnrelayedRecordType(self.record_type)),
             _ => Ok(EgressItem::Record {
                 index,
                 msg: self.decode()?,

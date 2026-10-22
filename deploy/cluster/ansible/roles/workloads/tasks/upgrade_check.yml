@@ -30,6 +30,10 @@
 # activation record of feature 3 and the stream positions, and an executor
 # and a validator that keep the receipt that used the nonce of a
 # transaction that the sealer ordered more than once.
+#
+# FEATURE_SEALER_V5 (feature id 4, the carry flag) switches the sealer
+# from decision version 4 to 5. It needs every sealer member to read
+# snapshot version 16.
 - name: Keep the feature and the activation time of the upgrade transaction
   ansible.builtin.set_fact:
     workloads_upgrade_feature: "{{ lookup('env', 'KARDAMOM_UPGRADE_FEATURE') | trim }}"
@@ -133,6 +137,19 @@
       ({{ workloads_upgrade_reads_max }}). Deploy the release that reads version 15 to every member, then run the
       check again.
 
+# A member writes snapshot version 16 once it holds the activation of
+# feature 4, and a member that reads only up to version 15 stops on it. A
+# member of such a release also ignores the activation, and stays on
+# decision version 4 while the other members switch to 5.
+- name: Refuse feature 4 on a member that reads no snapshot version 16
+  ansible.builtin.assert:
+    that: workloads_upgrade_feature | int != 4 or workloads_upgrade_reads_max | min >= 16
+    fail_msg: >-
+      Refused: the upgrade transaction of FEATURE_SEALER_V5 (feature id 4, the carry flag) needs every sealer
+      member to read snapshot version 16, and a member reads only up to {{ workloads_upgrade_reads_max | min }}
+      ({{ workloads_upgrade_reads_max }}). Deploy the release that reads version 16 to every member, then run the
+      check again.
+
 # Each service that executes or reads a skip must run this release: an
 # older executor or validator does not use the nonce of a skipped
 # transaction, and forks the state at the first such skip. On a genesis
@@ -158,6 +175,6 @@
   ansible.builtin.debug:
     msg: >-
       The upgrade check passed: {{ workloads_upgrade_groups | length }} sealer members read snapshot version
-      {{ 15 if workloads_upgrade_feature | int == 3 else 14 }},
+      {{ {3: 15, 4: 16}.get(workloads_upgrade_feature | int, 14) }},
       and the live allocations of {{ workloads_upgrade_jobs | map(attribute='name') | join(', ') }}
       run this release. The upgrade transaction of feature {{ workloads_upgrade_feature }} may go to the Safe.

@@ -261,6 +261,11 @@ final class SessionBacklogs {
 
     /** Send what each backlog's session takes now, and close each session past a limit. */
     void drain() {
+        if (bySession.isEmpty()) {
+            // The common case on the record path: no session is back-pressured,
+            // and the drain allocates no iterator and no lambda.
+            return;
+        }
         final long nowNs = System.nanoTime();
         bySession.values().removeIf(backlog -> backlog.drain(nowNs));
     }

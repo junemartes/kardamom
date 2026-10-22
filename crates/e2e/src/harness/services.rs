@@ -133,6 +133,11 @@ pub struct ServiceSpec<'a> {
     pub log_config: Option<&'a Path>,
     /// Run every sequencer on the v2 loop (the `[admission]` section).
     pub admission: bool,
+    /// With `admission`: the sequencers send the verdict of each
+    /// transaction to its ingress, and `eth_sendRawTransaction` answers on
+    /// it, at admission. The ingress reads its `tx_verdicts` stream and no
+    /// receipts.
+    pub verdicts: bool,
 }
 
 /// The parts of a stateful service's (executor, validator) bring-up that
@@ -573,7 +578,11 @@ pub fn spawn_sequencer_with(
          max_pending_per_sender = 512\nbackpressure_policy = \"return_immediately\"\n\n",
     );
     if spec.admission {
-        prefix.push_str("[admission]\nenabled = true\nmax_parked = 512\n\n");
+        prefix.push_str("[admission]\nenabled = true\nmax_parked = 512\n");
+        if spec.verdicts {
+            prefix.push_str("verdicts = true\n");
+        }
+        prefix.push('\n');
     }
     let name = format!("sequencer-{index}{}", opts.log_tag);
     let cfg_path = spec.write_cluster_config(&name, &prefix)?;
@@ -878,6 +887,11 @@ pub fn spawn_ingress_at(
             "--executor-query-endpoints",
             &format!("http://{}", spec.executor_query),
         ]);
+    // The v2 sequencers check each sender, and the ingress reads no
+    // receipts: its local account layer gets no rows.
+    if spec.verdicts {
+        cmd.args(["--verdicts", "true", "--admission-checks", "false"]);
+    }
     with_log_config(&mut cmd, spec);
     // The ingress is the tx_data recorder. With this flag, the shared
     // archive records every shard's publication. This is what makes a

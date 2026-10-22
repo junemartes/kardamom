@@ -2,12 +2,13 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use super::*;
 
-const EVERY_TOPIC: [Topic; 11] = [
+const EVERY_TOPIC: [Topic; 12] = [
     Topic::TxData,
     Topic::TxReceipts,
     Topic::TxReceiptBoundaries,
     Topic::TxErrors,
     Topic::TxStatus,
+    Topic::TxVerdicts,
     Topic::TxDeposits,
     Topic::TxRemoteEpochs,
     Topic::TxBal,

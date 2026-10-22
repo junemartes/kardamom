@@ -231,6 +231,32 @@ fn a_stream_id_on_a_tx_data_lane_is_rejected() {
 }
 
 #[test]
+fn a_stream_id_on_a_verdict_stream_is_rejected() {
+    let err = load("[channels]\nexec_txs_stream_id = 3007\n")
+        .expect_err("exec_txs on the verdict stream of ingress 7 must be rejected");
+    assert!(
+        err.to_string().contains(
+            "exec_txs_stream_id (3007) is a tx_verdicts id: tx_verdicts_stream_id_base (3000) + 0..=255"
+        ),
+        "got {err}"
+    );
+}
+
+#[test]
+fn the_verdict_ids_and_the_tx_data_lanes_do_not_overlap() {
+    let err = load("[channels]\ntx_verdicts_stream_id_base = 2100\n")
+        .expect_err("verdict ids inside the tx_data lanes must be rejected");
+    assert!(
+        err.to_string().contains(
+            "the tx_data lane ids 2000..=2255 and the tx_verdicts ids 2100..=2355 overlap"
+        ),
+        "got {err}"
+    );
+    load("[channels]\ntx_verdicts_stream_id_base = 2256\n")
+        .expect("the block after the lanes is free");
+}
+
+#[test]
 fn round_trips_through_toml() {
     // A fully serialized config must parse back identically. This guards
     // the serde attributes against a field that serializes but will not

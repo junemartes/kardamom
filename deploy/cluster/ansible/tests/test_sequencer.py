@@ -10,8 +10,8 @@ CLUSTER = Path(__file__).resolve().parents[2]
 
 @unittest.skipUnless(shutil.which('nomad'), 'nomad required')
 class SequencerTest(unittest.TestCase):
-    def compile(self, table, previous=None, success=True):
-        args = ['nomad', 'job', 'run', '-output', '-var=shard_table=' + json.dumps(table)]
+    def compile(self, table, previous=None, success=True, extra=()):
+        args = ['nomad', 'job', 'run', '-output', '-var=shard_table=' + json.dumps(table), *extra]
         if previous is not None:
             args.append('-var=previous_shard_table=' + json.dumps(previous))
         result = subprocess.run(args + ['nomad/sequencer.nomad.hcl'], cwd=CLUSTER,
@@ -58,6 +58,37 @@ class SequencerTest(unittest.TestCase):
                     self.assertEqual(flags['--shadow-vslots'], ','.join(map(str, incoming)))
                     self.assertEqual(flags['--extra-lanes'], ','.join(map(str, sorted({current[v] for v in incoming}))))
                     self.assertEqual(flags['--vslots'], ','.join(str(v) for v in range(256) if target[v] == lane))
+
+    def test_the_ingress_is_off_by_default(self):
+        for group in self.compile([v % 4 for v in range(256)]).values():
+            task = group['Tasks'][0]
+            self.assertNotIn('ingress', task['Config']['args'])
+            self.assertEqual([s['Name'] for s in group['Services']], ['kardamom-sequencer'])
+            self.assertEqual([p['Label'] for p in group['Networks'][0]['ReservedPorts']], ['metrics'])
+            self.assertEqual(task['Config']['ulimit'], [])
+            self.assertEqual([t['DestPath'] for t in task['Templates']], ['local/channels.toml', 'local/sequencer.toml'])
+
+    def test_the_ingress_runs_in_each_sequencer_on_a_port_of_its_lane(self):
+        groups = self.compile([v % 4 for v in range(256)], extra=['-var=ingress=true', '-var=ingress_archive_durability=true'])
+        for lane in range(4):
+            group = groups[f'seq-{lane}']
+            task = group['Tasks'][0]
+            args = task['Config']['args']
+            ingress = args[args.index('ingress') + 1:]
+            flags = dict(zip(ingress[::2], ingress[1::2]))
+            self.assertEqual(ingress[-1], '--archive-durability')
+            self.assertEqual(flags['--ingress-id'], f'{lane + 1}${{NOMAD_ALLOC_INDEX}}')
+            self.assertEqual(flags['--jsonrpc-bind'], '0.0.0.0:${NOMAD_PORT_jsonrpc}')
+            self.assertEqual(flags['--shards'], '4')
+            self.assertEqual(flags['--pending-receipt-timeout-ms'], '30000')
+            self.assertEqual(flags['--cluster-egress-endpoint'], '${meta.node_ip}:${NOMAD_HOST_PORT_ingress_egress}')
+            self.assertIn('ingress_egress', [p['Label'] for p in group['Networks'][0]['DynamicPorts']])
+            ports = {p['Label']: p['Value'] for p in group['Networks'][0]['ReservedPorts']}
+            self.assertEqual(ports['jsonrpc'], 8550 + lane)
+            service = next(s for s in group['Services'] if s['Name'] == 'ingress-jsonrpc')
+            self.assertEqual((service['PortLabel'], service['Checks'][0]['Path']), ('jsonrpc', '/health'))
+            self.assertEqual(task['KillTimeout'], 40 * 10**9)
+            self.assertIn('local/shard-map.toml', [t['DestPath'] for t in task['Templates']])
 
     def test_rejects_malformed_maps(self):
         for table in [[0], [8] * 256, [-1] * 256, [0.5] * 256]:

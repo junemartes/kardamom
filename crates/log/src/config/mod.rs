@@ -366,6 +366,14 @@ pub struct ChannelsConfig {
     pub tx_status_channel: ChannelUri,
     pub tx_status_stream_id: i32,
 
+    /// `TxVerdicts`: the receipts of the transactions of one ingress, from
+    /// the sequencer that owns their senders. The stream of ingress `i` has
+    /// the id `tx_verdicts_stream_id_base + i`, so an ingress takes only
+    /// the receipts of its own transactions. RAM only, not recorded: a
+    /// client signal, not canonical state.
+    pub tx_verdicts_channel: ChannelUri,
+    pub tx_verdicts_stream_id_base: i32,
+
     /// `TxDeposits`: the DA watcher publishes full `Deposit` envelopes here.
     /// The M sequencers subscribe and republish a `DepositRef` onto
     /// `tx_ordering`, so the canonical order interleaves L1 deposits with
@@ -510,6 +518,15 @@ impl ChannelsConfig {
                 self.tx_data_stream_id_base
             ));
         }
+        // `tx_verdicts_stream_id` adds a `u8` ingress id to the base, as
+        // the lanes of `tx_data` do.
+        if self.tx_verdicts_stream_id_base > i32::MAX - 255 {
+            return Err(format!(
+                "tx_verdicts_stream_id_base ({}) too close to i32::MAX: \
+                 tx_verdicts_stream_id(ingress_id) would overflow",
+                self.tx_verdicts_stream_id_base
+            ));
+        }
         // `tx_receipts_boundary_stream_id` adds 1 to `tx_receipts_stream_id`.
         if self.tx_receipts_stream_id == i32::MAX {
             return Err("tx_receipts_stream_id must not be i32::MAX: \
@@ -549,23 +566,34 @@ impl ChannelsConfig {
     /// Two streams on one id deliver the frames of one stream to the
     /// subscribers of the other, which then decode them as the wrong type.
     /// Every single stream therefore has its own id, outside the `tx_data`
-    /// lane ids `base..=base + 255`.
+    /// lane ids `base..=base + 255` and the `tx_verdicts` ids
+    /// `base..=base + 255`. The two ranges do not overlap either.
     fn check_stream_ids(&self) -> Result<(), String> {
         let mut ids = self.single_stream_ids();
         ids.sort_unstable_by_key(|&(_, id)| id);
         if let Some([(a, id), (b, _)]) = ids.array_windows().find(|[(_, x), (_, y)]| x == y) {
             return Err(format!("{a} and {b} share the stream id {id}"));
         }
-        let lanes = self.tx_data_stream_id(0)..=self.tx_data_stream_id(u8::MAX);
-        ids.iter()
-            .find(|(_, id)| lanes.contains(id))
-            .map_or(Ok(()), |(key, id)| {
-                Err(format!(
-                    "{key} ({id}) is a tx_data lane id: tx_data_stream_id_base \
-                     ({}) + 0..=255",
-                    self.tx_data_stream_id_base
-                ))
-            })
+        let lanes = IdRange {
+            name: "tx_data lane",
+            base_key: "tx_data_stream_id_base",
+            base: self.tx_data_stream_id_base,
+            ids: self.tx_data_stream_id(0)..=self.tx_data_stream_id(u8::MAX),
+        };
+        let verdicts = IdRange {
+            name: "tx_verdicts",
+            base_key: "tx_verdicts_stream_id_base",
+            base: self.tx_verdicts_stream_id_base,
+            ids: self.tx_verdicts_stream_id(0)..=self.tx_verdicts_stream_id(u8::MAX),
+        };
+        if lanes.ids.contains(verdicts.ids.start()) || verdicts.ids.contains(lanes.ids.start()) {
+            return Err(format!(
+                "the tx_data lane ids {:?} and the tx_verdicts ids {:?} overlap",
+                lanes.ids, verdicts.ids
+            ));
+        }
+        lanes.check(&ids)?;
+        verdicts.check(&ids)
     }
 
     /// The UDP endpoint executor replica `replica_idx` publishes its
@@ -649,6 +677,16 @@ impl ChannelsConfig {
             .saturating_add(i32::from(sequencer_id))
     }
 
+    /// The `tx_verdicts` stream id of the ingress `ingress_id`. `validate`
+    /// proves `tx_verdicts_stream_id_base <= i32::MAX - 255` for a loaded
+    /// config; `saturating_add` keeps a directly built config from
+    /// wrapping into a negative id.
+    #[must_use]
+    pub fn tx_verdicts_stream_id(&self, ingress_id: u8) -> i32 {
+        self.tx_verdicts_stream_id_base
+            .saturating_add(i32::from(ingress_id))
+    }
+
     /// `TxReceipts` block-boundary side-stream id
     /// (`tx_receipts_stream_id + 1`). `validate` proves
     /// `tx_receipts_stream_id != i32::MAX` for a loaded config, so this
@@ -724,6 +762,10 @@ impl Default for ChannelsConfig {
             // (1010), tx_errors (1015), tx_deposits (1016).
             tx_status_channel: "aeron:ipc?alias=tx-status".into(),
             tx_status_stream_id: 1018,
+            // 3000..=3255 sits above the tx_data lanes (2000..=2255) and
+            // clear of every single stream.
+            tx_verdicts_channel: "aeron:ipc?alias=tx-verdicts".into(),
+            tx_verdicts_stream_id_base: 3000,
             tx_deposits_channel: "aeron:ipc?alias=tx-deposits".into(),
             tx_deposits_stream_id: 1016,
             // 1017 sits next to tx_deposits (1016), the stream it mirrors. It
@@ -765,6 +807,29 @@ impl Default for ChannelsConfig {
             fsync_watermark_channel_template: "aeron:ipc?alias=fsync-wm-{rid}".into(),
             fsync_watermark_stream_id: 1010,
         }
+    }
+}
+
+/// A block of 256 stream ids that one base sets: the `tx_data` lanes or
+/// the `tx_verdicts` streams. No single stream may take an id of it.
+struct IdRange {
+    name: &'static str,
+    base_key: &'static str,
+    base: i32,
+    ids: std::ops::RangeInclusive<i32>,
+}
+
+impl IdRange {
+    fn check(&self, single: &[(&'static str, i32)]) -> Result<(), String> {
+        single
+            .iter()
+            .find(|(_, id)| self.ids.contains(id))
+            .map_or(Ok(()), |(key, id)| {
+                Err(format!(
+                    "{key} ({id}) is a {} id: {} ({}) + 0..=255",
+                    self.name, self.base_key, self.base
+                ))
+            })
     }
 }
 

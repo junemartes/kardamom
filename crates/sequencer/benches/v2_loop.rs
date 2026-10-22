@@ -8,6 +8,10 @@
 //!   out at once;
 //! - `reversed`: each sender's nonces arrive last first, so each one parks
 //!   until nonce 0 arrives and frees the run.
+//!
+//! A third case, `with_verdicts`, takes the `in_order` input with the
+//! verdicts on: the loop queues one verdict for each transaction, to the
+//! ingress that published it. Eight ingress ids publish the input.
 
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
@@ -21,6 +25,7 @@ use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 
 const SENDERS: u64 = 256;
 const NONCES: u64 = 16;
+const INGRESS_IDS: u64 = 8;
 
 fn cfg() -> V2Config {
     V2Config {
@@ -31,6 +36,7 @@ fn cfg() -> V2Config {
             loss_blocks: NonZeroU64::new(16).unwrap(),
             park_width: NonZeroU64::new(1 << 17).unwrap(),
             park_ttl: Duration::from_secs(60),
+            relook_after: Duration::from_millis(500),
             max_senders: NonZeroUsize::new(1 << 20).unwrap(),
         },
         sweep_every: Duration::from_millis(50),
@@ -52,34 +58,43 @@ fn batch(nonce_at: fn(u64) -> u64) -> Vec<(TxDataLoc, TxEnvelope)> {
                 term_id: 0,
                 term_offset: i32::try_from(correlation).unwrap() * 64,
             };
+            let ingress = u16::try_from(correlation % INGRESS_IDS).unwrap();
+            let id = TxEnvelope::pack_correlation_id(ingress, correlation);
             (
                 TxDataLoc::new(0, position),
-                signed_envelope(s, nonce_at(k), correlation),
+                signed_envelope(s, nonce_at(k), id),
             )
         })
         .collect()
 }
 
-/// A loop whose filter holds a rich row for every sender of the batch.
-fn seeded_loop() -> AdmissionLoop {
-    let (accounts_tx, accounts_rx) = crossbeam_channel::unbounded();
-    let (lookups_tx, _) = tokio::sync::mpsc::channel(16);
-    let vslots = one_partition_cfg().vslot_set().unwrap();
+/// The rows of every sender at `nonce`, as of `block`.
+fn rows(block: u64, nonce: u64) -> AccountEvent {
     let rows = (1..=SENDERS)
         .map(|n| {
             let state = AccountState {
-                nonce: 0,
+                nonce,
                 balance: U256::from(10u64).pow(U256::from(24u64)),
                 delegated: false,
-                tx_idx: 1,
+                tx_idx: block,
             };
             (signer(n).address(), state)
         })
         .collect();
-    accounts_tx
-        .send(AccountEvent::Rows { block: 1, rows })
-        .unwrap();
-    AdmissionLoop::new(cfg(), vslots, accounts_rx, lookups_tx)
+    AccountEvent::Rows { block, rows }
+}
+
+/// A loop whose filter holds a rich row for every sender of the batch,
+/// and the sender side of its account events.
+fn seeded_loop() -> (AdmissionLoop, crossbeam_channel::Sender<AccountEvent>) {
+    let (accounts_tx, accounts_rx) = crossbeam_channel::unbounded();
+    let (lookups_tx, _) = tokio::sync::mpsc::channel(16);
+    let vslots = one_partition_cfg().vslot_set().unwrap();
+    accounts_tx.send(rows(1, 0)).unwrap();
+    (
+        AdmissionLoop::new(cfg(), vslots, accounts_rx, lookups_tx),
+        accounts_tx,
+    )
 }
 
 fn bench_order(c: &mut Criterion, name: &str, nonce_at: fn(u64) -> u64) {
@@ -91,7 +106,7 @@ fn bench_order(c: &mut Criterion, name: &str, nonce_at: fn(u64) -> u64) {
             || {
                 let mut rig = Rig::default();
                 rig.tx_data.queue = batch.clone().into_iter().collect();
-                (seeded_loop(), rig)
+                (seeded_loop().0, rig)
             },
             run_to_completion,
             BatchSize::SmallInput,
@@ -108,6 +123,33 @@ fn bench_reversed(c: &mut Criterion) {
     bench_order(c, "reversed", |k| NONCES - 1 - k);
 }
 
+/// The input of `in_order`, with the verdicts on.
+fn bench_with_verdicts(c: &mut Criterion) {
+    let batch = batch(|k| k);
+    let total = usize::try_from(SENDERS * NONCES).unwrap();
+    let mut group = c.benchmark_group("v2_loop");
+    group.throughput(Throughput::Elements(SENDERS * NONCES));
+    group.bench_function("with_verdicts", |b| {
+        b.iter_batched(
+            || {
+                let mut rig = Rig::default();
+                rig.tx_data.queue = batch.clone().into_iter().collect();
+                let (mut l, _) = seeded_loop();
+                let (verdicts_tx, verdicts) = tokio::sync::mpsc::channel(total);
+                l.enable_verdicts(verdicts_tx);
+                (l, rig, verdicts)
+            },
+            |(mut l, mut rig, mut verdicts)| {
+                while l.run_once(&mut rig.ports()).unwrap() {}
+                let sent = std::iter::from_fn(|| verdicts.try_recv().ok()).count();
+                assert_eq!(sent, total, "one verdict for each transaction");
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
 /// Drain the batch through the loop, then check that every transaction
 /// went out.
 fn run_to_completion((mut l, mut rig): (AdmissionLoop, Rig)) {
@@ -116,5 +158,5 @@ fn run_to_completion((mut l, mut rig): (AdmissionLoop, Rig)) {
     assert_eq!(published, usize::try_from(SENDERS * NONCES).unwrap());
 }
 
-criterion_group!(benches, bench_in_order, bench_reversed);
+criterion_group!(benches, bench_in_order, bench_reversed, bench_with_verdicts);
 criterion_main!(benches);

@@ -192,12 +192,10 @@ impl<Backend: ProxyBackend> IngressEthApiServer for IngressHandlers<Backend> {
     }
 
     async fn send_raw_transaction(&self, bytes: Bytes) -> RpcResult<B256> {
-        let res = self
-            .proxy
-            .submit_raw(client_ip(), bytes)
+        self.proxy
+            .submit(client_ip(), bytes)
             .await
-            .map_err(ErrorObjectOwned::from)?;
-        Ok(res.receipt.tx_hash)
+            .map_err(ErrorObjectOwned::from)
     }
 
     async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<KardamomReceipt>> {

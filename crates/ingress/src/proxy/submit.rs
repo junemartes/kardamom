@@ -72,6 +72,7 @@ where
         let result = wait
             .await_with_timeout(self.cfg.pending_receipt_timeout)
             .await;
+        let result = self.answer_executed_duplicate(client_ip, &v, result).await;
 
         // Count accepted or rejected on the terminal outcome, not at
         // publish time, so a single submission never increments both.
@@ -112,6 +113,42 @@ where
         result
     }
 
+    /// The submit of `eth_sendRawTransaction` and of the binary protocol:
+    /// the transaction hash. With the ack at admission on, the answer comes
+    /// when the sequencer takes the transaction into its mempool, as on
+    /// Ethereum ([`crate::acks`]). Off, it comes with the receipt
+    /// ([`Self::submit_raw`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an `IngressError` if the submission is rejected, here or by
+    /// the sequencer, or if no verdict comes in the ack timeout.
+    pub async fn submit(
+        &self,
+        client_ip: IpAddr,
+        raw_tx: AlloyBytes,
+    ) -> Result<B256, IngressError> {
+        if self.cfg.admission_ack.is_none() {
+            return self
+                .submit_raw(client_ip, raw_tx)
+                .await
+                .map(|resp| resp.receipt.tx_hash);
+        }
+        let v = self.validate_submission(client_ip, &raw_tx).await?;
+        let wait = self
+            .acks
+            .register(v.tx_hash)
+            .inspect_err(|_| count_reject("already-known"))?;
+        self.publish_validated(&v, raw_tx).await?;
+        let result = wait.answer().await;
+        match &result {
+            Ok(_) => metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1),
+            Err(IngressError::NotAcknowledged(_)) => count_reject("not-acknowledged"),
+            Err(_) => count_reject("sequencer-rejected"),
+        }
+        result
+    }
+
     /// Fire-and-observe submission for subscription-mode clients
     /// (`kardamom_sendRawTransactionAsync`). This method validates and
     /// publishes exactly like [`Self::submit_raw`], but it acks with the tx
@@ -146,6 +183,27 @@ where
     /// Shared head of both submit paths: rate-limit, size cap, decode, batch
     /// sig-verify, and receipt-cache lookup. Does not publish and rejects
     /// nothing on account state; see [`Self::admit`].
+    /// A refused copy of a transaction that executed answers the receipt of
+    /// that transaction. The sequencer refuses a copy whose nonce a
+    /// transaction used, and this ingress can miss the receipt: it reads
+    /// only its own verdicts, or it started after the receipt. The lookup
+    /// by hash finds the receipt only when the submitted transaction is the
+    /// one that executed.
+    async fn answer_executed_duplicate(
+        &self,
+        client_ip: IpAddr,
+        v: &ValidatedSubmission,
+        result: Result<ReceiptResponse, IngressError>,
+    ) -> Result<ReceiptResponse, IngressError> {
+        let Err(IngressError::Duplicate(_)) = &result else {
+            return result;
+        };
+        match self.receipt_by_hash(client_ip, v.tx_hash).await {
+            Some(receipt) => Ok(ReceiptResponse { receipt }),
+            None => result,
+        }
+    }
+
     async fn validate_submission(
         &self,
         client_ip: IpAddr,
@@ -160,7 +218,7 @@ where
         // more would only make the backlog worse. This applies to both
         // submit paths. A depth of 0 sheds everything, and tests use
         // this.
-        let depth = self.pending.len();
+        let depth = self.pending.len() + self.acks.len();
         if depth >= self.cfg.pending_shed_depth {
             count_reject("overloaded");
             return Err(IngressError::Overloaded(depth));
