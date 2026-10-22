@@ -57,8 +57,9 @@ final class MemberStatusTest {
                 + "\"commitPosition\":5000,\"servicePosition\":4000,"
                 + "\"snapshotWrites\":10,\"snapshotReadsMin\":1,\"snapshotReadsMax\":11,"
                 + "\"snapshotLatest\":9,\"decisionVersion\":3,\"decisionActivationOrigin\":36,"
-                + "\"decisionActivationMs\":0,\"diskFreeBytes\":0,\"ready\":true}",
-            sample("LEADER", "CLOSED", 5000, 4000).toJson(LAG));
+                + "\"decisionActivationMs\":0,\"diskFreeBytes\":0,"
+                + "\"leadershipTermId\":4,\"startHold\":true,\"ready\":true}",
+            sample("LEADER", "CLOSED", 5000, 4000).withStart(4L, true).toJson(LAG));
     }
 
     @Test

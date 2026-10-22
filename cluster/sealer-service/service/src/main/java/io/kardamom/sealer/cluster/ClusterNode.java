@@ -212,6 +212,9 @@ public final class ClusterNode {
         // leader's log fills the gap on rejoin, as on any intact-directory
         // restart. So the repair runs in-process, then the launch retries.
         final StopRequest stop = new StopRequest();
+        // One hold for the whole start: a launch retry gets a fresh service,
+        // and the hold thread watches the one that runs.
+        final StartHold startHold = new StartHold();
         ClusteredMediaDriver driver = null;
         ClusteredServiceContainer container = null;
         SealerClusteredService service = null;
@@ -229,6 +232,7 @@ public final class ClusterNode {
                     inclusionHorizonBlocks, orderingWindow,
                     new LagBudgets(daLagBudgetBlocks, recordLagBudget));
                 seed.ifPresent(service::seededFrom);
+                service.holdAtStart(startHold);
                 final SealerClusteredService built = service;
                 carryBytes.map(CarryBytes::file).ifPresent(file -> built.carryingBytes(file, feed));
                 snapshotSchedule.ifPresent(service::snapshotEvery);
@@ -268,11 +272,16 @@ public final class ClusterNode {
                  carryBytes.map(c -> c.endpoint(launched::retainedHead)))) {
             System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
             startLogPurger(purgePlanner, new LogPurger.Member(memberId, contexts, service), consensus);
+            final JoinWatchdogThread.Member watched = new JoinWatchdogThread.Member(memberId, consensus,
+                container.context(), stop, PeerProbe.forMembers(clusterMembers, memberId, adminPort()));
+            new StartHoldThread(new StartHoldThread.Member(memberId, consensus.clusterNodeRoleCounter(),
+                consensus.electionStateCounter(), launched::leadershipTermId,
+                PeerProbe.forMembers(clusterMembers, memberId, adminPort()), stop),
+                startHold, watched.timeouts().stallLimitMs()).start();
             // The watchdog starts last. A start-up step that throws before it
             // closes the components through this block, and the watchdog must
             // not read that close as a failed component.
-            startJoinWatchdog(new JoinWatchdogThread.Member(memberId, consensus, container.context(), stop,
-                PeerProbe.forMembers(clusterMembers, memberId, adminPort())), contexts.clusterState());
+            startJoinWatchdog(watched, contexts.clusterState());
             stop.await();
         }
     }
@@ -384,7 +393,8 @@ public final class ClusterNode {
             return new MemberStatus(memberId, roleName, electionName, commit, service.servicePosition(),
                 MemberStatus.SnapshotVersions.of(service.latestSnapshotVersion()),
                 service.decisionRules(),
-                diskFreeBytes());
+                diskFreeBytes())
+                .withStart(service.leadershipTermId(), service.holdingAtStart());
         }
 
         /**

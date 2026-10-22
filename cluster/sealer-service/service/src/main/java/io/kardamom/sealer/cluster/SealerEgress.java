@@ -108,13 +108,14 @@ final class SealerEgress {
             final RetainedFrames retained,
             final Feed feed,
             final long firstRetainedIndex,
-            final long firstRetainedBlock) {
+            final long firstRetainedBlock,
+            final StartHold hold) {
         this.cluster = cluster;
         this.memberId = memberId;
         this.retained = retained;
         this.feed = feed;
         this.backlogs = new SessionBacklogs(
-            memberId, SessionBacklogs.STALL_DEADLINE_NS, SessionBacklogs.BYTE_LIMIT);
+            memberId, SessionBacklogs.STALL_DEADLINE_NS, SessionBacklogs.BYTE_LIMIT, hold);
         this.firstRetainedIndex = firstRetainedIndex;
         this.firstRetainedBlock = firstRetainedBlock;
     }
