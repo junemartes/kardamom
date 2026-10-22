@@ -98,6 +98,29 @@ pub const PUBLICATION_CONNECTED: &str = "kardamom_publication_connected";
 /// seconds. 0 while the publication is connected. The escalation reopens
 /// the publication after one stall budget and exits after four.
 pub const PUBLICATION_NOT_CONNECTED_SECONDS: &str = "kardamom_publication_not_connected_seconds";
+/// Joins whose first in-band wait ended without the envelope: the
+/// `tx_data` lane fell behind by a whole wait slice. The join then
+/// refetches from an archive, or ends.
+pub(crate) const JOIN_MISSES_TOTAL: &str = "kardamom_executor_join_misses_total";
+/// Archive refetch attempts of a join, by `outcome`: `ok`, `absent` (the
+/// archive does not hold the range), or `error`.
+pub(crate) const ARCHIVE_REFETCH_TOTAL: &str = "kardamom_executor_archive_refetch_total";
+/// Envelopes that archive refetches put into the join buffer.
+pub(crate) const ARCHIVE_REFETCH_RECOVERED_TOTAL: &str =
+    "kardamom_executor_archive_refetch_recovered_total";
+/// Entries that every archive refused, for which this voter asked the
+/// sealer for a void.
+pub(crate) const VOID_VOTES_TOTAL: &str = "kardamom_executor_void_votes_total";
+/// The gas of every sealed block. Its rate is the gas per second.
+pub(crate) const GAS_USED_TOTAL: &str = "kardamom_executor_gas_used_total";
+/// Failed must-deliver attempts on `tx_receipts`. Each one pauses the
+/// commit thread before the next attempt.
+pub(crate) const RECEIPT_PUBLISH_RETRIES_TOTAL: &str =
+    "kardamom_executor_receipt_publish_retries_total";
+/// Blocks whose BAL the exec thread dropped, because the queue to the BAL
+/// publisher was full.
+pub(crate) const BAL_HANDOFF_DROPPED_TOTAL: &str = "kardamom_executor_bal_handoff_dropped_total";
+
 // The invalid-tx-skip counter comes from inside the `no_std` exec core
 // (`invalid_skip`). The constant and its `record_` helper live there. This
 // re-export keeps the metric namespace browsable in one place.
@@ -111,7 +134,7 @@ pub fn describe() {
     );
     metrics::describe_histogram!(
         STATE_COMMIT_DURATION_SECONDS,
-        "wall time spent committing state to the backing DB"
+        "the exec thread's wait for a free commit slot, when the commit pipeline is full"
     );
     metrics::describe_gauge!(BLOCK_NUMBER, "most recently committed block number");
     metrics::describe_counter!(
@@ -163,6 +186,37 @@ pub fn describe() {
         "seconds the current unconnected period of the topic has lasted; 0 while connected"
     );
     describe_footprint();
+    describe_pipeline();
+}
+
+/// The descriptions of the counters that locate a bottleneck on the
+/// executor path.
+fn describe_pipeline() {
+    metrics::describe_counter!(
+        JOIN_MISSES_TOTAL,
+        "joins whose first in-band wait ended without the tx_data envelope"
+    );
+    metrics::describe_counter!(
+        ARCHIVE_REFETCH_TOTAL,
+        "archive refetch attempts of a join, by outcome (ok|absent|error)"
+    );
+    metrics::describe_counter!(
+        ARCHIVE_REFETCH_RECOVERED_TOTAL,
+        "envelopes that archive refetches put into the join buffer"
+    );
+    metrics::describe_counter!(
+        VOID_VOTES_TOTAL,
+        "entries that every archive refused, for which this voter asked for a void"
+    );
+    metrics::describe_counter!(GAS_USED_TOTAL, "the gas of every sealed block");
+    metrics::describe_counter!(
+        RECEIPT_PUBLISH_RETRIES_TOTAL,
+        "failed must-deliver attempts on tx_receipts"
+    );
+    metrics::describe_counter!(
+        BAL_HANDOFF_DROPPED_TOTAL,
+        "blocks whose BAL the exec thread dropped: the queue to the BAL publisher was full"
+    );
 }
 
 /// The descriptions of the footprint-shadow series.

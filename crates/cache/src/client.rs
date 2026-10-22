@@ -309,6 +309,7 @@ impl AccountCache {
         if !claimed {
             return;
         }
+        crate::metrics::record_reconnect();
         let this = self.clone();
         tokio::spawn(async move {
             match connect_within(&this.source, this.connect_timeout).await {

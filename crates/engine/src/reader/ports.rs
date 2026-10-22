@@ -256,17 +256,32 @@ pub trait ExecSink: Send + 'static {
     /// Returns `Err(SinkClosed)` when the consumer (the exec thread) is
     /// gone.
     fn send(&self, msg: ReaderToExec) -> Result<(), SinkClosed>;
+
+    /// True when the sink has no room, so the next [`Self::send`] waits.
+    /// The reader's loop meter reads it. A sink that never waits keeps the
+    /// default.
+    fn is_full(&self) -> bool {
+        false
+    }
 }
 
 impl ExecSink for Sender<ReaderToExec> {
     fn send(&self, msg: ReaderToExec) -> Result<(), SinkClosed> {
         Sender::send(self, msg).map_err(|_| SinkClosed)
     }
+
+    fn is_full(&self) -> bool {
+        Sender::is_full(self)
+    }
 }
 
 impl ExecSink for tokio::sync::mpsc::Sender<ReaderToExec> {
     fn send(&self, msg: ReaderToExec) -> Result<(), SinkClosed> {
         self.blocking_send(msg).map_err(|_| SinkClosed)
+    }
+
+    fn is_full(&self) -> bool {
+        self.capacity() == 0
     }
 }
 
@@ -304,6 +319,13 @@ pub trait ExecStreamSink: Send + 'static {
     ///
     /// Returns `Err(SinkClosed)` when the stream publisher is gone.
     fn passed(&self, through: u64) -> Result<(), SinkClosed>;
+
+    /// True when the stream has no room, so the next send waits. The
+    /// reader's loop meter reads it. A stream that never waits keeps the
+    /// default.
+    fn is_full(&self) -> bool {
+        false
+    }
 }
 
 impl ExecStreamSink for Sender<ExecStreamItem> {
@@ -318,6 +340,10 @@ impl ExecStreamSink for Sender<ExecStreamItem> {
 
     fn passed(&self, through: u64) -> Result<(), SinkClosed> {
         Sender::send(self, ExecStreamItem::Passed(through)).map_err(|_| SinkClosed)
+    }
+
+    fn is_full(&self) -> bool {
+        Sender::is_full(self)
     }
 }
 

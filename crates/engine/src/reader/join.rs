@@ -9,6 +9,7 @@ use tracing::warn;
 
 use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 
+use super::meters::{JoinMeters, Refetch};
 use super::ports::{JoinRecovery, JoinRecoveryError};
 
 /// A `tx_data` join key: `(sequencer_id, session_id, tx_data_position)`.
@@ -153,12 +154,19 @@ pub(super) struct RefusedArchives(std::collections::BTreeSet<String>);
 
 impl RefusedArchives {
     pub(super) fn note(&mut self, error: &JoinRecoveryError) {
-        if let JoinRecoveryError::Archive(kardamom_log::error::LogError::RangeAbsent {
-            archive,
-            ..
-        }) = error
-        {
+        if let Some(archive) = Self::refusing(error) {
             self.0.insert(archive.clone());
+        }
+    }
+
+    /// The archive that `error` names, when the error is a refusal.
+    fn refusing(error: &JoinRecoveryError) -> Option<&String> {
+        match error {
+            JoinRecoveryError::Archive(kardamom_log::error::LogError::RangeAbsent {
+                archive,
+                ..
+            }) => Some(archive),
+            _ => None,
         }
     }
 
@@ -182,9 +190,20 @@ pub(super) struct JoinWait<'a> {
     buffer: &'a JoinBuffer,
     cfg: &'a ReaderConfig,
     key: TxDataKey,
+    started: Instant,
     deadline: Instant,
     recovery: &'a mut Option<JoinRecovery>,
     refused: RefusedArchives,
+    meters: &'a JoinMeters,
+}
+
+/// What [`JoinWait::new`] borrows from the reader: the buffer, the
+/// recovery, the config, and the join metrics.
+pub(super) struct JoinContext<'a> {
+    pub(super) buffer: &'a JoinBuffer,
+    pub(super) recovery: &'a mut Option<JoinRecovery>,
+    pub(super) cfg: &'a ReaderConfig,
+    pub(super) meters: &'a JoinMeters,
 }
 
 impl<'a> JoinWait<'a> {
@@ -194,30 +213,49 @@ impl<'a> JoinWait<'a> {
     /// panic here (the `+` operator's behavior) would take down the
     /// `tx_ordering` reader thread instead of failing this one join.
     pub(super) fn new(
-        buffer: &'a JoinBuffer,
-        recovery: &'a mut Option<JoinRecovery>,
+        ctx: JoinContext<'a>,
         tx_ref: &kardamom_types::TxRef,
-        cfg: &'a ReaderConfig,
     ) -> Result<Self, crate::error::ExecutorError> {
-        let deadline = Instant::now()
-            .checked_add(cfg.join_timeout)
-            .ok_or_else(|| {
-                crate::error::ExecutorError::State(format!(
-                    "join_timeout {:?} overflowed Instant",
-                    cfg.join_timeout
-                ))
-            })?;
+        let JoinContext {
+            buffer,
+            recovery,
+            cfg,
+            meters,
+        } = ctx;
+        let started = Instant::now();
+        let deadline = started.checked_add(cfg.join_timeout).ok_or_else(|| {
+            crate::error::ExecutorError::State(format!(
+                "join_timeout {:?} overflowed Instant",
+                cfg.join_timeout
+            ))
+        })?;
         Ok(Self {
             buffer,
             cfg,
             key: TxDataKey::from_ref(tx_ref),
+            started,
             deadline,
             recovery,
             refused: RefusedArchives::default(),
+            meters,
         })
     }
 
-    pub(super) fn run(mut self) -> JoinOutcome {
+    /// Join the envelope. A join that finds it at the first lookup records
+    /// no metric. Any other join records its wait.
+    pub(super) fn run(self) -> JoinOutcome {
+        if let Some(env) = self.buffer.take(self.key) {
+            return JoinOutcome::Joined(env);
+        }
+        let meters = self.meters;
+        let started = self.started;
+        let outcome = self.run_waiting();
+        meters.waited(started);
+        outcome
+    }
+
+    /// The join after a first lookup that missed.
+    fn run_waiting(mut self) -> JoinOutcome {
         let first_slice = match self.recovery {
             Some(_) => self.cfg.join_refetch_after.min(self.cfg.join_timeout),
             None => self.cfg.join_timeout,
@@ -225,6 +263,7 @@ impl<'a> JoinWait<'a> {
         if let Some(env) = self.wait_for(first_slice) {
             return JoinOutcome::Joined(env);
         }
+        self.meters.missed();
         loop {
             match self.poll_once() {
                 JoinStep::GiveUp => return self.give_up(),
@@ -292,7 +331,8 @@ impl<'a> JoinWait<'a> {
             "join miss on tx_data — refetching from durability archive"
         );
         let mut recovered = 0u64;
-        match r.recover_tx_data(
+        let started = Instant::now();
+        let result = r.recover_tx_data(
             key.shard,
             key.session,
             key.position,
@@ -302,7 +342,14 @@ impl<'a> JoinWait<'a> {
                 // pathological refetch wrap it back toward zero.
                 recovered = recovered.saturating_add(1);
             },
-        ) {
+        );
+        let outcome = match &result {
+            Ok(_) => Refetch::Recovered(recovered),
+            Err(e) if RefusedArchives::refusing(e).is_some() => Refetch::Absent,
+            Err(_) => Refetch::Failed,
+        };
+        self.meters.refetched(started, outcome);
+        match result {
             Ok(_) => tracing::info!(
                 target: "kardamom_executor::reader",
                 sequencer_id = key.shard,

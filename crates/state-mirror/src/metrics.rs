@@ -1,5 +1,7 @@
 //! Mirror metric names and helpers, in one place.
 
+use kardamom_obs::pipeline::{Batch, Step};
+
 const BATCHES_APPLIED_TOTAL: &str = "kardamom_state_mirror_batches_applied_total";
 const PRODUCER_DISAGREEMENT_TOTAL: &str = "kardamom_state_mirror_producer_disagreement_total";
 const HEAD_TX_IDX: &str = "kardamom_state_mirror_head_tx_idx";
@@ -67,4 +69,32 @@ pub(crate) fn record_write_retry() {
 
 pub(crate) fn record_wait_replica_zero() {
     metrics::counter!(WAIT_REPLICA_ZERO_TOTAL).increment(1);
+}
+
+/// The pipeline steps of the mirror: one for each Redis round trip of a
+/// batch, and one for the whole batch. The mirror owns them.
+pub(crate) struct MirrorSteps {
+    /// The rows: one `SCRIPT LOAD`, then one pipeline of `EVALSHA`.
+    pub(crate) evalsha: Step,
+    /// The receipt index: one pipeline of `SET`.
+    pub(crate) receipts_set: Step,
+    pub(crate) head_set: Step,
+    pub(crate) wait_replica: Step,
+    /// A whole batch: the writes with their retries, the head, and the
+    /// replica wait.
+    pub(crate) batch: Step,
+    pub(crate) receipt_batch: Batch,
+}
+
+impl MirrorSteps {
+    pub(crate) fn new() -> Self {
+        Self {
+            evalsha: Step::new("state_mirror.evalsha"),
+            receipts_set: Step::new("state_mirror.receipts_set"),
+            head_set: Step::new("state_mirror.head_set"),
+            wait_replica: Step::new("state_mirror.wait_replica"),
+            batch: Step::new("state_mirror.batch"),
+            receipt_batch: Batch::new("state_mirror.receipt_batch"),
+        }
+    }
 }
