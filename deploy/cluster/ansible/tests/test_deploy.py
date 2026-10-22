@@ -393,7 +393,8 @@ class Deploys(unittest.TestCase):
         self.git('commit', '-q', '--allow-empty', '-m', message)
         return self.git('rev-parse', 'HEAD')
 
-    def run_deploy(self, extra=None, check=False, success=True, playbook="deploy.yml", environ=None):
+    def run_deploy(self, extra=None, check=False, success=True, playbook="deploy.yml", environ=None,
+                   inventory='localhost,'):
         variables = {
             'workloads_nomad_addr': f'http://127.0.0.1:{self.api.server_port}',
             'workloads_manifest': str(self.manifest),
@@ -423,7 +424,7 @@ class Deploys(unittest.TestCase):
         env.pop('AERON_STALL_TOLERANCE_MS', None)
         env.pop('KARDAMOM_IDLE_CAP_US', None)
         env.update(environ or {})
-        cmd = ['ansible-playbook', '-i', 'localhost,', str(ANSIBLE / playbook),
+        cmd = ['ansible-playbook', '-i', inventory, str(ANSIBLE / playbook),
                '-e', json.dumps(variables)] + (['--check'] if check else [])
         result = subprocess.run(cmd, cwd=ANSIBLE.parent, env=env, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
@@ -637,6 +638,24 @@ class DeployTest(Deploys):
         Path(str(self.manifest) + '.sigbundle').write_text('invalid bundle')
         self.run_deploy({'workloads_require_signed': True, 'workloads_cosign_binary': '/usr/bin/false'}, success=False)
         self.assertEqual(self.api.state['writes'], [])
+
+    def test_the_backup_sealer_runs_only_with_a_backup_node(self):
+        # Without a node of role backup, the deploy registers no backup job.
+        self.deploy()
+        self.assertNotIn('cluster-backup', self.api.state['plans'])
+        # With one, it registers the job on the sealer image, as a backup.
+        inventory = Path(self.tmp.name) / 'backup-hosts.ini'
+        inventory.write_text('localhost ansible_connection=local\n[backup]\nbackup-0 ansible_connection=local\n')
+        self.run_deploy({'workloads_backup_file_sync_level': '1'}, inventory=str(inventory))
+        plans = self.api.state['plans']
+        self.assertIn('cluster-backup', plans)
+        task = plans['cluster-backup']['TaskGroups'][0]['Tasks'][0]
+        self.assertEqual(task['Config']['image'], plans['cluster']['TaskGroups'][0]['Tasks'][0]['Config']['image'])
+        options = task['Env']['JAVA_TOOL_OPTIONS'].split()
+        self.assertIn('-Dkardamom.cluster.backup=true', options)
+        self.assertIn('-Dkardamom.backup.fileSyncLevel=1', options)
+        self.assertIn('-Dkardamom.backup.sourceType=FOLLOWER', options)
+        self.assertEqual(plans['cluster-backup']['Constraints'][0]['RTarget'], 'backup')
 
     def test_optional_light_client_and_cluster_overrides(self):
         self.run_deploy({
