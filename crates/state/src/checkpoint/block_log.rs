@@ -39,6 +39,8 @@ const SEGMENT_HEAD: usize = 56;
 const RECORD_HEAD: usize = 16;
 /// The suffix of a segment file.
 const SUFFIX: &str = "blocks";
+/// The size at which a segment ends, when no setting gives one.
+pub const DEFAULT_SEGMENT_BYTES: NonZeroU64 = NonZeroU64::new(64 << 20).unwrap();
 
 /// The chain and the state schema of the batches in a log. A segment of
 /// another identity is not part of the log.

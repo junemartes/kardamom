@@ -884,6 +884,13 @@ class DeployTest(Deploys):
                 env = self.api.state['plans']['executor']['TaskGroups'][0]['Tasks'][0]['Env']
                 self.assertEqual(env['KARDAMOM_EXEC_CURSOR'], expected)
 
+    def test_the_checkpoint_log_switch_defaults_off_and_reaches_the_executor(self):
+        for switch, expected in (('', 'false'), ('on', 'true')):
+            with self.subTest(switch=switch):
+                self.run_deploy({'workloads_checkpoint_log': switch}, check=True)
+                env = self.api.state['plans']['executor']['TaskGroups'][0]['Tasks'][0]['Env']
+                self.assertEqual(env['KARDAMOM_CHECKPOINT_LOG'], expected)
+
     def test_every_aeron_party_takes_the_deploy_values(self):
         """Each Aeron deploy value: its environment variable, its default,
         a second value, and the check of the plans."""

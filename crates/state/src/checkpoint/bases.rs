@@ -16,13 +16,16 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::time::Duration;
 
-use super::block_log::SegmentSize;
+use super::block_log::{BlockLogWriter, DEFAULT_SEGMENT_BYTES, LogIdentity, SegmentSize};
+use super::copy_rate::CopyRate;
 use super::replay::LOG_DIR;
 use super::{
-    BlockRange, CheckpointInfo, checkpoint_data_file, checkpoints_newest_first, latest_checkpoint,
-    prune_checkpoints,
+    BlockRange, CheckpointInfo, checkpoint_data_file, checkpoints_newest_first,
+    create_checkpoint_at, latest_checkpoint, prune_checkpoints, read_manifest,
 };
+use crate::env::StateEnv;
 use crate::error::StateError;
+use crate::meta::SCHEMA_VERSION;
 
 /// Why a new base is due.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +122,63 @@ impl BaseRule {
         let made = std::fs::metadata(&base.path)?.modified()?;
         Ok(made.elapsed().is_ok_and(|age| age >= self.max_age))
     }
+}
+
+/// The bases that the rule made, by the `reason` of [`BaseDue::label`].
+const BASES_TOTAL: &str = "kardamom_checkpoint_bases_total";
+
+/// One round of the checkpointer with the block log: the rule, the rate of
+/// the copy, and the bases to keep.
+#[derive(Clone, Copy, Debug)]
+pub struct BaseRound {
+    pub rule: BaseRule,
+    pub rate: CopyRate,
+    pub keep: NonZeroUsize,
+}
+
+impl BaseRound {
+    /// Make a base of `env` in `checkpoints_dir` when one is due, then
+    /// prune. Returns why a base was made, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the rule, the copy or the prune fails.
+    pub fn run(
+        &self,
+        env: &StateEnv,
+        checkpoints_dir: &Path,
+    ) -> Result<Option<BaseDue>, StateError> {
+        let due = self.rule.due(checkpoints_dir)?;
+        if let Some(reason) = due {
+            create_checkpoint_at(env, checkpoints_dir, self.rate)?;
+            metrics::counter!(BASES_TOTAL, "reason" => reason.label()).increment(1);
+        }
+        prune_bases(checkpoints_dir, self.keep)?;
+        Ok(due)
+    }
+}
+
+/// Cut the block log of `checkpoints_dir` after `block`. A rollback drops
+/// the blocks of the stream that the cluster lost, so no restore and no
+/// peer takes them. The chain of the log is the chain of the newest base.
+/// With no base or no log, nothing is cut: the log thread cuts the log at
+/// its next start.
+///
+/// # Errors
+///
+/// Returns an error when the newest base or the log does not read, or the
+/// cut fails.
+pub fn cut_log_after(checkpoints_dir: &Path, block: u64) -> Result<(), StateError> {
+    let log = checkpoints_dir.join(LOG_DIR);
+    let Some(base) = latest_checkpoint(checkpoints_dir, BlockRange::ANY)?.filter(|_| log.exists())
+    else {
+        return Ok(());
+    };
+    let identity = LogIdentity {
+        genesis: read_manifest(&base.path)?.genesis_digest,
+        schema: SCHEMA_VERSION,
+    };
+    BlockLogWriter::open(&log, identity, DEFAULT_SEGMENT_BYTES)?.cut_after(block)
 }
 
 /// Keep the newest `keep` bases, and the log segments that they need.

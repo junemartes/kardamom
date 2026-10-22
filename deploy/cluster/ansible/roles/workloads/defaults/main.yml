@@ -160,6 +160,10 @@ workloads_priority_fees: "{{ lookup('env', 'PRIORITY_FEES') }}"
 # The recorded cursor of the executors (nomad/executor.nomad.hcl): "on" or
 # "off". Empty keeps the job's "off" default.
 workloads_exec_cursor: "{{ lookup('env', 'KARDAMOM_EXEC_CURSOR') }}"
+# The block log of the checkpoints of the executors
+# (nomad/executor.nomad.hcl): "on" or "off". Empty keeps the job's "off"
+# default.
+workloads_checkpoint_log: "{{ lookup('env', 'KARDAMOM_CHECKPOINT_LOG') }}"
 # The Aeron stall tolerance, in milliseconds (nomad/aeron.system.nomad.hcl).
 # 10000 is Aeron's default, and production keeps it: a longer value delays
 # the detection of a dead process. CI raises it, so a host stall does not

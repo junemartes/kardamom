@@ -30,14 +30,14 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 
 use super::{CheckpointFetch, IO_TIMEOUT, PeerResponse, framing};
-use crate::checkpoint::block_log::{BlockLog, BlockLogWriter, LogIdentity, Records};
+use crate::checkpoint::block_log::{
+    BlockLog, BlockLogWriter, DEFAULT_SEGMENT_BYTES, LogIdentity, Records,
+};
 use crate::checkpoint::replay::LOG_DIR;
 use crate::checkpoint::{BlockRange, CheckpointInfo, latest_checkpoint, read_manifest};
 use crate::error::StateError;
 use crate::meta::SCHEMA_VERSION;
 
-/// The size at which a fetched log segment ends.
-const SEGMENT_BYTES: NonZeroU64 = NonZeroU64::new(64 << 20).unwrap();
 /// The bytes of records that the server sends at a time.
 const CHUNK: usize = 256 * 1024;
 
@@ -192,7 +192,11 @@ pub(super) fn fetch_log(
         genesis,
         schema: SCHEMA_VERSION,
     };
-    let mut log = BlockLogWriter::open(&checkpoints_dir.join(LOG_DIR), identity, SEGMENT_BYTES)?;
+    let mut log = BlockLogWriter::open(
+        &checkpoints_dir.join(LOG_DIR),
+        identity,
+        DEFAULT_SEGMENT_BYTES,
+    )?;
     log.cut_after(base.block)?;
     let last = Records::new(&mut fetch.reader)
         .take_while(|r| r.block <= to)
