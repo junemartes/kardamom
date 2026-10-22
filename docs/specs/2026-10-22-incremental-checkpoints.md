@@ -60,7 +60,7 @@ The short period exists for two of these uses:
   block, in 20 digits, with the suffix `.blocks`. So the names sort in block order.
 - A segment starts with a head: a magic value, the format version, the genesis digest, the state
   schema version, and the first block.
-- Then each record follows: `[len:u32][block:u64][crc32c:u32][rkyv bytes of the batch]`, little
+- Then each record follows: `[len:u32][block:u64][crc32:u32][rkyv bytes of the batch]`, little
   endian.
 - A reader stops at the first torn or bad record. At start, the log writer cuts the last segment
   after its last good record.
