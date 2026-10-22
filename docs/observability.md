@@ -140,6 +140,32 @@ Each cause has a runbook in [runbooks/README.md](runbooks/README.md).
 
 The range is 100 µs to 5 s.
 
+Some histograms have their own buckets:
+
+| Histogram | Buckets |
+| --- | --- |
+| `kardamom_step_seconds` | 1 µs to 10 s |
+| `kardamom_batch_items`, `kardamom_validator_parallel_batches` | The powers of 2 from 1 to 65,536 |
+| `kardamom_executor_bal_frame_bytes` | The powers of 4 from 64 B to 64 MiB |
+| `kardamom_canary_*` | 5 ms to 1 h |
+
+### Pipeline metrics
+
+Four names locate a bottleneck on the transaction path. Every service records them through
+`kardamom_obs::pipeline`. The `service` label tells the services apart.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `kardamom_loop_nanoseconds_total` | counter | `loop`, `state` | The time of a thread loop in each state: `busy`, `idle` or `blocked`. |
+| `kardamom_queue_depth` | gauge | `queue` | The items that wait in a queue between two loops. |
+| `kardamom_step_seconds` | histogram | `step` | The duration of one step of work. A hot loop records it per batch. |
+| `kardamom_batch_items` | histogram | `batch` | The items in one batch. |
+
+- The busy share of a loop is `busy / (busy + idle + blocked)`. A share near 1 means that the loop is saturated.
+- `blocked` is time with work but no room on the output: a full queue or a back-pressured publication.
+- A queue that grows sits in front of the bottleneck.
+- A loop adds its time to the counter at most every 100 ms.
+
 ## Readiness
 
 Each exporter serves `/ready` beside `/metrics` on the same port. The check answers 200 `ready` when the rule of the service holds.
