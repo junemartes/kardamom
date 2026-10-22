@@ -14,7 +14,7 @@ Each stage sends only to the next stage, and each stage sends the transaction da
 
 ```text
 client ─TLS─▶ LB ─HTTP─▶ ingress ─▶ sequencer ─▶ sealer ─▶ executor ─▶ egress ─▶ batcher
-                         (one process)                                     ├──▶ validator
+                         (own fleet)                                       ├──▶ validator
                                                                            ├──▶ clients (webhooks, WebSocket, receipt reads)
                                                                            └──▶ sequencers (account rows)
 ```
@@ -33,7 +33,7 @@ client ─TLS─▶ LB ─HTTP─▶ ingress ─▶ sequencer ─▶ sealer ─�
 |---|---|
 | D1 | `eth_sendRawTransaction` has the semantics of Ethereum. It returns the hash when the sequencer that owns the sender accepts the transaction into its mempool. It does not wait for the sealer or for the execution (section 3). |
 | D2 | The ingress reads no receipts. Receipts go only to the egress. The strong confirmation goes through the egress: webhooks and the WebSocket status feed. `eth_sendRawTransactionSync` (EIP-7966) is not served. |
-| D3 | The ingress runs inside the sequencer process (#706 step 4). The ingress fleet goes. |
+| D3 | The ingress runs on its own fleet, apart from the sequencers (the user, 2026-10-22). It keeps no storage. This replaces the first form of D3, the ingress inside the sequencer process: the in-process mode of #725 goes. |
 | D4 | Each twin sequencer offers one cluster message for each transaction: the reference first, then the envelope. The sealer reads the reference, checks the window of decision version 4, and skips the bytes of a reference that it saw. Otherwise it orders the reference and its bytes (section 5). |
 | D5 | The executors read the transaction bytes from the order. They do not join with `tx_data`. The void votes, the voter ids, `VoidLedger`, the archive refetch, the peer fetch (#543) and the `tx_data` recorders go. #709 cannot happen. |
 | D6 | The executors send their output to the egress only: the order with its bytes, the receipts and the account rows (section 6). |
@@ -116,20 +116,18 @@ replaced: the sealer may have ordered it.
   until every client moved. The load tools and the canary measure the executed latency through
   the egress after the switch.
 
-## 4. The ingress inside the sequencer (D3)
+## 4. The ingress fleet (D3)
 
-- The sequencer binary runs the ingress service on its own runtime. The JSON-RPC port and the
-  Consul service `ingress-jsonrpc` move to the sequencer job. The load balancer targets the
-  sequencer hosts.
-- The load balancer cannot route by sender. So the ingress of any sequencer process takes any
-  transaction, and publishes it on `tx_data[lane]` of the owner lane. When the process owns the
-  lane, the publication is to its own twin partner and to itself.
-- The ingress of a process gets its acks from the twins of each lane on its `tx_verdicts` stream.
-  An ack is a few bytes.
-- `tx_data` stays as the forward from the process that took the request to the twins of the owner
-  lane. Both twins read the same image, so they give the same reference (lane, session,
+- The ingress runs on its own fleet: the `ingress` Nomad job, on hosts apart from the sequencers.
+  The JSON-RPC port and the Consul service `ingress-jsonrpc` stay in that job. The load balancer
+  targets the ingress hosts.
+- The ingress keeps no storage, so an ingress host needs no fast disk.
+- The load balancer cannot route by sender. So any ingress takes any transaction, and publishes it
+  on `tx_data[lane]` of the owner lane, to the twins of that lane.
+- The ingress gets its acks from the twins of each lane on its `tx_verdicts` stream. An ack is a
+  few bytes.
+- Both twins read the same `tx_data` image, so they give the same reference (lane, session,
   position). Nothing records `tx_data`.
-- The `ingress` Nomad job goes after every network runs the merged job.
 
 ## 5. The sealer: reference and bytes in one message (D4)
 
@@ -270,9 +268,9 @@ Each item is one pull request. Each passes `just style` and CI alone, and follow
 | P8 | egress: the client side of the notifier moves into the egress | P7 |
 | P9 | batcher and validator: read the egress | P7 |
 | P10 | sequencer: read `egress_rows`; ingress: read the receipts from the egress | P7, P1 |
-| P11 | sequencer: the ingress runs inside the sequencer process; deploy: one job (D3) | P1 |
+| P11 | sequencer: remove the in-process ingress of #725; the `ingress` job stays (D3) | P1 |
 | P12 | release: the upgrade transaction of feature 4 on staging, after P3 to P10 deploy | P3 to P10 |
-| P13 | cleanup: record types 0 and 4, the join, the void, the `tx_data` recorders, the ingress job (#599) | P12 on every network |
+| P13 | cleanup: record types 0 and 4, the join, the void, the `tx_data` recorders (#599) | P12 on every network |
 
 The open items of the carry spec that this plan does not need for staging: the member feed from
 the Raft log (#638), the stored cursor (#639), the recovery after a power loss (#644, #645), the
