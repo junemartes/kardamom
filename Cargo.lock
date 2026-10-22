@@ -4384,7 +4384,6 @@ dependencies = [
  "dhat",
  "kardamom-cache",
  "kardamom-cluster-adapter",
- "kardamom-ingress",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-sequencer",
