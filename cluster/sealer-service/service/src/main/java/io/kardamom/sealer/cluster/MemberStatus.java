@@ -55,6 +55,13 @@ final class MemberStatus {
      * file and its log, or empty when the disk cannot be read.
      */
     final OptionalLong diskFreeBytes;
+    /**
+     * The leadership term whose start the service applied last, or -1
+     * before any. The start hold of each peer compares it.
+     */
+    final long leadershipTermId;
+    /** Whether the member still holds its outputs after its start ({@link StartHold}). */
+    final boolean startHold;
 
     MemberStatus(
             final int memberId,
@@ -65,6 +72,20 @@ final class MemberStatus {
             final SnapshotVersions snapshot,
             final DecisionRules.View rules,
             final OptionalLong diskFreeBytes) {
+        this(memberId, role, election, commitPosition, servicePosition, snapshot, rules, diskFreeBytes, -1L, false);
+    }
+
+    private MemberStatus(
+            final int memberId,
+            final String role,
+            final String election,
+            final long commitPosition,
+            final long servicePosition,
+            final SnapshotVersions snapshot,
+            final DecisionRules.View rules,
+            final OptionalLong diskFreeBytes,
+            final long leadershipTermId,
+            final boolean startHold) {
         this.memberId = memberId;
         this.role = role;
         this.election = election;
@@ -73,6 +94,14 @@ final class MemberStatus {
         this.snapshot = snapshot;
         this.rules = rules;
         this.diskFreeBytes = diskFreeBytes;
+        this.leadershipTermId = leadershipTermId;
+        this.startHold = startHold;
+    }
+
+    /** This sample with the leadership term of the service and the state of the start hold. */
+    MemberStatus withStart(final long term, final boolean held) {
+        return new MemberStatus(memberId, role, election, commitPosition, servicePosition, snapshot, rules,
+            diskFreeBytes, term, held);
     }
 
     /**
@@ -102,6 +131,8 @@ final class MemberStatus {
             + ",\"decisionActivationOrigin\":" + Long.toUnsignedString(rules.activationOrigin())
             + ",\"decisionActivationMs\":" + Long.toUnsignedString(rules.activationMs())
             + ",\"diskFreeBytes\":" + diskFree("null")
+            + ",\"leadershipTermId\":" + leadershipTermId
+            + ",\"startHold\":" + startHold
             + ",\"ready\":" + isReady(lagBytes)
             + "}";
     }
