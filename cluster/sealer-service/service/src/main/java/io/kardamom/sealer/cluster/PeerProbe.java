@@ -142,18 +142,29 @@ final class PeerProbe {
         }
     }
 
-    /** The part of a peer's {@link MemberStatus} JSON that the watchdog reads. */
-    record PeerStatus(int memberId, String role, String election, long commitPosition) {
+    /**
+     * The part of a peer's {@link MemberStatus} JSON that the watchdog and
+     * the start hold read. A peer of an older release states no leadership
+     * term: its term reads {@link #TERM_NOT_STATED}. A peer of this release
+     * whose service applied no term yet states -1.
+     */
+    record PeerStatus(int memberId, String role, String election, long commitPosition, long leadershipTermId) {
+        /** The term of a peer of an older release, which states none. */
+        static final long TERM_NOT_STATED = Long.MIN_VALUE;
         private static final Pattern FIELDS = Pattern.compile(
             "\"memberId\":(\\d+),\"role\":\"([A-Z_]+)\",\"election\":\"([A-Z_]+)\",\"commitPosition\":(-?\\d+)");
+        private static final Pattern TERM = Pattern.compile("\"leadershipTermId\":(-?\\d+)");
 
         /** The fields of a status answer, or empty for any other body, such as an error object. */
         static Optional<PeerStatus> parse(final String json) {
             final Matcher m = FIELDS.matcher(json);
-            return m.find()
-                ? Optional.of(new PeerStatus(
-                    Integer.parseInt(m.group(1)), m.group(2), m.group(3), Long.parseLong(m.group(4))))
-                : Optional.empty();
+            if (!m.find()) {
+                return Optional.empty();
+            }
+            final Matcher term = TERM.matcher(json);
+            return Optional.of(new PeerStatus(
+                Integer.parseInt(m.group(1)), m.group(2), m.group(3), Long.parseLong(m.group(4)),
+                term.find() ? Long.parseLong(term.group(1)) : TERM_NOT_STATED));
         }
 
         /**

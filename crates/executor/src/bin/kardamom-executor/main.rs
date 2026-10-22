@@ -46,7 +46,7 @@ use kardamom_executor::ExecutorFileConfig;
 use kardamom_log::aeron_live::{AeronRuntime, ServiceEventsPublisherHandle};
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
-use kardamom_state::{StateWriter, seed_genesis};
+use kardamom_state::seed_genesis;
 
 use args::Args;
 use ledger::ReceiptLedger;
@@ -104,7 +104,7 @@ async fn spawn_writer_and_bal(
     // Spawn the writer, and build the three executor adapters from its
     // handle. The snapshot-swap channel feeds reads (the snapshot source
     // and commit signal). The delta channel feeds writes.
-    let writer = StateWriter::spawn(env).context("spawn state writer")?;
+    let writer = state::CheckpointLog::spawn_writer(args, env)?;
     let snapshots = MdbxSnapshotSource::new(writer.snapshot_rx.clone());
     let writer_signal = MdbxWriterSignal::new(writer.snapshot_rx.clone());
     let writer_queue = MdbxWriterQueue::new(writer.delta_tx.clone());

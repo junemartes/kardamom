@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.aeron.ChannelUri;
 import io.aeron.driver.NameResolver;
 import java.io.IOException;
 import java.net.InetAddress;
@@ -16,6 +17,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.agrona.SystemUtil;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -30,6 +32,20 @@ final class ClusterNodeTest {
         "0,192.168.56.51:40200,192.168.56.51:40201,192.168.56.51:40202,192.168.56.51:40203,192.168.56.51:40204"
             + "|1,192.168.56.52:40200,192.168.56.52:40201,192.168.56.52:40202,192.168.56.52:40203,192.168.56.52:40204"
             + "|2,192.168.56.53:40200,192.168.56.53:40201,192.168.56.53:40202,192.168.56.53:40203,192.168.56.53:40204";
+
+    /**
+     * The log channel gives each follower a receive window of half a term,
+     * the most that Aeron allows, and a socket buffer of the same size.
+     */
+    @Test
+    void theLogChannelGivesEachFollowerAWindowOfHalfATerm() {
+        final ChannelUri uri = ChannelUri.parse(ClusterNode.LOG_CHANNEL);
+        final long term = SystemUtil.parseSize("term-length", uri.get("term-length"));
+        final long window = SystemUtil.parseSize("rcv-wnd", uri.get("rcv-wnd"));
+        assertEquals(8L << 20, term);
+        assertEquals(term / 2, window);
+        assertEquals(window, SystemUtil.parseSize("so-rcvbuf", uri.get("so-rcvbuf")));
+    }
 
     @Test
     void theDriverThreadingModeIsSharedByDefaultAndRefusesAnUnknownMode() {

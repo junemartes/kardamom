@@ -132,6 +132,17 @@ public final class SealerClusteredService implements ClusteredService {
     private volatile long servicePosition;
 
     /**
+     * The leadership term whose start this service applied last, or -1
+     * before any. The leader commits the start of its term, so a term here
+     * is one that a quorum took. The start hold of each member compares it
+     * with its peers ({@link StartHoldRule}).
+     */
+    private volatile long leadershipTermId = -1L;
+
+    /** The hold of this member's outputs after its start; over at once when no member thread watches it. */
+    private StartHold startHold = StartHold.released();
+
+    /**
      * The snapshot marks and the posted head, for the log purge thread.
      * The service thread replaces the value after a snapshot and after the
      * posted head moves; the purge thread reads it.
@@ -362,6 +373,12 @@ public final class SealerClusteredService implements ClusteredService {
         return retainedFile.isPresent() ? VoidLedger.Config.DISABLED : voidConfig;
     }
 
+    /** Hold this member's outputs after its start, until {@code hold} ends ({@link StartHold}). */
+    SealerClusteredService holdAtStart(final StartHold hold) {
+        this.startHold = hold;
+        return this;
+    }
+
     /** Ask for a snapshot on each boundary tick that {@code schedule} makes due. */
     SealerClusteredService snapshotEvery(final SnapshotSchedule schedule) {
         this.snapshotSchedule = Optional.of(schedule);
@@ -540,7 +557,8 @@ public final class SealerClusteredService implements ClusteredService {
      * at the posted head.
      */
     private void openEgress(final Optional<ByteBuffer> retention) {
-        this.egress = new SealerEgress(cluster, memberId, retained, feed, state.canonicalCount(), state.blockNumber());
+        this.egress = new SealerEgress(
+            cluster, memberId, retained, feed, state.canonicalCount(), state.blockNumber(), startHold);
         retention.ifPresentOrElse(egress::restore, egress::openEmpty);
         egress.setPostedHead(state.postedHead());
     }
@@ -582,6 +600,7 @@ public final class SealerClusteredService implements ClusteredService {
         // relay, but blocks never seal.
         // Re-arming with the same correlation id is idempotent: Aeron replaces
         // the pending timer instead of scheduling a second one.
+        this.leadershipTermId = leadershipTermId;
         scheduleBoundaryTimer();
         offerRulesAgain();
         if (state.seedStatus() == CanonicalSealerState.SeedStatus.PENDING) {
@@ -1614,7 +1633,19 @@ public final class SealerClusteredService implements ClusteredService {
     /** Move the member feed on. It never waits, and it changes no replicated state. */
     @Override
     public int doBackgroundWork(final long nowNs) {
-        return feed.doWork(egress, state.canonicalCount(), state.blockNumber());
+        // While the start hold lasts, the member feed reads no request of
+        // its executor, so it sends no frame.
+        return startHold.held() ? 0 : feed.doWork(egress, state.canonicalCount(), state.blockNumber());
+    }
+
+    /** The leadership term whose start this service applied last, or -1 before any. */
+    long leadershipTermId() {
+        return leadershipTermId;
+    }
+
+    /** Whether this member still holds its outputs after its start. */
+    boolean holdingAtStart() {
+        return startHold.held();
     }
 
     /** The log position of the last applied entry; 0 before the first. */

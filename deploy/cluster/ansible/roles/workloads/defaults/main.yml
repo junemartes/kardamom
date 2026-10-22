@@ -157,6 +157,7 @@ workloads_cluster_file_sync_level: "{{ lookup('env', 'KARDAMOM_CLUSTER_FILE_SYNC
 # The threading mode of the media driver in each sealer member
 # (nomad/cluster.nomad.hcl). Empty keeps the job's SHARED default.
 workloads_cluster_driver_threading_mode: "{{ lookup('env', 'KARDAMOM_CLUSTER_DRIVER_THREADING_MODE') }}"
+workloads_cluster_heap_mb: "{{ lookup('env', 'KARDAMOM_CLUSTER_HEAP_MB') }}"
 workloads_archive_file_sync_level: "{{ lookup('env', 'KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL') }}"
 # The threading mode of the media driver of each node (nomad/aeron.system.nomad.hcl):
 # SHARED, SHARED_NETWORK or DEDICATED. Empty keeps the job's SHARED default.
@@ -166,6 +167,10 @@ workloads_priority_fees: "{{ lookup('env', 'PRIORITY_FEES') }}"
 # The recorded cursor of the executors (nomad/executor.nomad.hcl): "on" or
 # "off". Empty keeps the job's "off" default.
 workloads_exec_cursor: "{{ lookup('env', 'KARDAMOM_EXEC_CURSOR') }}"
+# The block log of the checkpoints of the executors
+# (nomad/executor.nomad.hcl): "on" or "off". Empty keeps the job's "off"
+# default.
+workloads_checkpoint_log: "{{ lookup('env', 'KARDAMOM_CHECKPOINT_LOG') }}"
 # The Aeron stall tolerance, in milliseconds (nomad/aeron.system.nomad.hcl).
 # 10000 is Aeron's default, and production keeps it: a longer value delays
 # the detection of a dead process. CI raises it, so a host stall does not
@@ -264,6 +269,7 @@ workloads_sealer_job:
     cluster_da_lag_budget_blocks: "{{ workloads_da_lag_budget_blocks }}"
     cluster_file_sync_level: "{{ workloads_cluster_file_sync_level }}"
     cluster_driver_threading_mode: "{{ workloads_cluster_driver_threading_mode }}"
+    cluster_heap_mb: "{{ workloads_cluster_heap_mb }}"
     cluster_remote_origins: "{{ workloads_remote_origins }}"
 # The sealer settings that every member must match (the Settings table of
 # cluster/sealer-service/README.md), as the deploy passes them in

@@ -72,6 +72,7 @@
       wait: false
       vars:
         exec_cursor: "{{ workloads_exec_cursor }}"
+        checkpoint_log: "{{ workloads_checkpoint_log }}"
     - {name: state-mirror, wait: false}
     # The notifier taps the sequencers' and the ingress's status stream
     # and the executors' receipts; it needs none of them up to start.

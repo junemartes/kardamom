@@ -122,6 +122,16 @@ variable "cluster_driver_threading_mode" {
   }
 }
 
+# The heap of each member in MB (KARDAMOM_CLUSTER_HEAP_MB of the image
+# entrypoint). The job memory is the heap plus 640 MB for the media
+# driver, the archive and the JVM itself. The retained frames of the
+# sealer are on the heap until the DA layer posts them, so the heap
+# bounds the DA lag that a member survives at a given rate.
+variable "cluster_heap_mb" {
+  type    = number
+  default = 384
+}
+
 # Remote-origin allowlist (-Dkardamom.cluster.remoteOrigins): the peer
 # chain ids whose cross-chain records (kind 5) this sealer seals. An
 # empty list disables interop, and the sealer rejects every kind-5
@@ -391,7 +401,7 @@ job "cluster" {
         }
 
         # These are JVM options for the image ENTRYPOINT
-        # (java -Xmx384m -cp ... ClusterNode). They must go through env,
+        # (java -Xmx<heap> -cp ... ClusterNode). They must go through env,
         # not docker `args`. docker `args` land after the main class, so
         # they would become program arguments instead of -D system
         # properties. ClusterNode reads System.getProperty(...), so the
@@ -408,7 +418,8 @@ job "cluster" {
         # entrypoint also sets the timer slack of the JVM when it is set.
         env {
           JAVA_TOOL_OPTIONS    = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.logPurgeKeepSnapshots=${var.cluster_log_purge_keep_snapshots} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.driverThreadingMode=${var.cluster_driver_threading_mode} -Dkardamom.cluster.remoteOrigins=${var.cluster_seed_snapshot != "" ? "" : var.cluster_remote_origins} -Dkardamom.cluster.seedSnapshot=${var.cluster_seed_snapshot} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}"
-          KARDAMOM_IDLE_CAP_US = var.idle_cap_us
+          KARDAMOM_IDLE_CAP_US     = var.idle_cap_us
+          KARDAMOM_CLUSTER_HEAP_MB = var.cluster_heap_mb
         }
 
         config {
@@ -442,7 +453,7 @@ job "cluster" {
 
         resources {
           cpu    = 1000
-          memory = 1024
+          memory = var.cluster_heap_mb + 640
         }
       }
     }

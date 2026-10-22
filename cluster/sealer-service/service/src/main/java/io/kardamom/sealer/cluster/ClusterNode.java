@@ -213,6 +213,9 @@ public final class ClusterNode {
         // leader's log fills the gap on rejoin, as on any intact-directory
         // restart. So the repair runs in-process, then the launch retries.
         final StopRequest stop = new StopRequest();
+        // One hold for the whole start: a launch retry gets a fresh service,
+        // and the hold thread watches the one that runs.
+        final StartHold startHold = new StartHold();
         ClusteredMediaDriver driver = null;
         ClusteredServiceContainer container = null;
         SealerClusteredService service = null;
@@ -230,6 +233,7 @@ public final class ClusterNode {
                     inclusionHorizonBlocks, orderingWindow,
                     new LagBudgets(daLagBudgetBlocks, recordLagBudget));
                 seed.ifPresent(service::seededFrom);
+                service.holdAtStart(startHold);
                 final SealerClusteredService built = service;
                 carryBytes.map(CarryBytes::file).ifPresent(file -> built.carryingBytes(file, feed));
                 snapshotSchedule.ifPresent(service::snapshotEvery);
@@ -269,11 +273,16 @@ public final class ClusterNode {
                  carryBytes.map(c -> c.endpoint(launched::retainedHead)))) {
             System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
             startLogPurger(purgePlanner, new LogPurger.Member(memberId, contexts, service), consensus);
+            final JoinWatchdogThread.Member watched = new JoinWatchdogThread.Member(memberId, consensus,
+                container.context(), stop, PeerProbe.forMembers(clusterMembers, memberId, adminPort()));
+            new StartHoldThread(new StartHoldThread.Member(memberId, consensus.clusterNodeRoleCounter(),
+                consensus.electionStateCounter(), launched::leadershipTermId,
+                PeerProbe.forMembers(clusterMembers, memberId, adminPort()), stop),
+                startHold, watched.timeouts().stallLimitMs()).start();
             // The watchdog starts last. A start-up step that throws before it
             // closes the components through this block, and the watchdog must
             // not read that close as a failed component.
-            startJoinWatchdog(new JoinWatchdogThread.Member(memberId, consensus, container.context(), stop,
-                PeerProbe.forMembers(clusterMembers, memberId, adminPort())), contexts.clusterState());
+            startJoinWatchdog(watched, contexts.clusterState());
             stop.await();
         }
     }
@@ -385,7 +394,8 @@ public final class ClusterNode {
             return new MemberStatus(memberId, roleName, electionName, commit, service.servicePosition(),
                 MemberStatus.SnapshotVersions.of(service.latestSnapshotVersion()),
                 service.decisionRules(),
-                diskFreeBytes());
+                diskFreeBytes())
+                .withStart(service.leadershipTermId(), service.holdingAtStart());
         }
 
         /**
@@ -447,6 +457,22 @@ public final class ClusterNode {
             p -> new LogPurger(member, p).start(consensus.electionStateCounter()),
             () -> System.out.println("cluster log purge DISABLED memberId=" + member.memberId()));
     }
+
+    /**
+     * The channel of the Raft log: 8 MiB terms, and a receive window of half
+     * a term on each follower.
+     *
+     * <p>The log publication runs at the speed of the slowest follower. A
+     * follower whose archive writes wait on a busy disk stops taking the
+     * log, and once the leader fills the receive window of that follower,
+     * the leader stops too, and no block seals. The default window is
+     * 128 KiB, a fraction of a second of traffic at 1,000 transactions a
+     * second. A window of 4 MiB, the most that an 8 MiB term allows, rides
+     * out a disk stall of about 16 s at that rate. {@code so-rcvbuf} gives
+     * the socket the same room; the hosts allow 16 MiB
+     * ({@code net.core.rmem_max}).</p>
+     */
+    static final String LOG_CHANNEL = "aeron:udp?term-length=8m|rcv-wnd=4m|so-rcvbuf=4m";
 
     /** Launch retries past the ~10s mark-file liveness window, with margin. */
     static final int MAX_LAUNCH_ATTEMPTS = 6;
@@ -555,7 +581,7 @@ public final class ClusterNode {
             // response publications, while Raft looks healthy from outside.
             // 8MB terms (24MB logs) leave an order of magnitude of headroom
             // without approaching flow-control limits.
-            .logChannel("aeron:udp?term-length=8m")
+            .logChannel(LOG_CHANNEL)
             .ingressStreamId(ingressStreamId)
             // The ordering window's hold timer is 5 ms. Aeron's timer wheel
             // fires a timer on the first tick at or after its deadline, and
