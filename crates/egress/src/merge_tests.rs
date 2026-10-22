@@ -179,3 +179,117 @@ fn an_epoch_moves_the_next_index_by_its_slots() {
     assert_eq!(out.len(), 2);
     assert_eq!(m.head().next_index, 4, "the epoch at 0 takes 0, 1 and 2");
 }
+
+/// A merge with `head`, as after a restart on a stored head.
+fn merge_at(head: Head) -> Merge {
+    Merge::new(
+        MergeConfig {
+            max_waiting: NonZeroUsize::new(64).unwrap(),
+            compared: NonZeroUsize::new(64).unwrap(),
+        },
+        head,
+    )
+}
+
+/// A copy of an executor that started before this merge.
+fn copy_from(session: i32, seq: u64) -> Copy {
+    Copy { session, seq }
+}
+
+/// After a restart no copy names a frame before its first one, so nothing
+/// goes out alone. The frames of a peer, in order, fill the place, and the
+/// frames of the copies that wait behind them follow.
+#[test]
+fn a_restart_joins_behind_the_frames_of_a_peer() {
+    let stored = Head {
+        next_index: 3,
+        next_block: 2,
+        last: Some(Key::Record(2)),
+    };
+    let mut m = merge_at(stored);
+    let (mut a, mut b) = (copy_from(1, 100), copy_from(2, 200));
+    let live = [record(3), record(4), boundary(2, 5), record(5)];
+    let out: Vec<Vec<u8>> = live
+        .iter()
+        .flat_map(|f| [a.send(&mut m, f), b.send(&mut m, f)].concat())
+        .collect();
+    assert_eq!(out, [] as [Vec<u8>; 0], "a record is never certain alone");
+    assert!(!m.joined());
+
+    let mut out = Vec::new();
+    m.take_ordered(&record(3), &mut out);
+    assert_eq!(out, live, "the copies chain behind the frame of the peer");
+    assert!(m.joined());
+}
+
+/// An empty store on a running chain does not start in the middle of a
+/// block: a frame of an executor that did not start at genesis waits.
+#[test]
+fn an_empty_store_on_a_running_chain_waits() {
+    let genesis = Head {
+        next_index: 0,
+        next_block: 1,
+        last: None,
+    };
+    let mut m = merge_at(genesis);
+    let mut a = copy_from(1, 100);
+    let out: Vec<Vec<u8>> = [record(200), record(201), boundary(30, 202), record(202)]
+        .iter()
+        .flat_map(|f| a.send(&mut m, f))
+        .collect();
+    assert_eq!(out, [] as [Vec<u8>; 0]);
+    assert_eq!(m.head(), genesis);
+}
+
+/// The boundary of the next block that closes at the next index has a
+/// certain place, so it goes out alone, and its copy chains after it.
+#[test]
+fn the_boundary_that_closes_at_the_head_goes_out_alone() {
+    let stored = Head {
+        next_index: 5,
+        next_block: 3,
+        last: Some(Key::Record(4)),
+    };
+    let mut m = merge_at(stored);
+    let mut a = copy_from(1, 50);
+    let mut out = a.send(&mut m, &boundary(3, 5));
+    out.extend(a.send(&mut m, &record(5)));
+    assert_eq!(out, [boundary(3, 5), record(5)]);
+    assert!(m.joined());
+    let mut b = copy_from(2, 60);
+    assert_eq!(
+        b.send(&mut m, &boundary(4, 7)),
+        [] as [Vec<u8>; 0],
+        "a boundary that does not close at the next index waits"
+    );
+}
+
+/// With no peer, the stream starts again after a boundary of a copy. The
+/// frames of that copy after the boundary chain.
+#[test]
+fn a_rebase_starts_after_a_boundary() {
+    let genesis = Head {
+        next_index: 0,
+        next_block: 1,
+        last: None,
+    };
+    let mut m = merge_at(genesis);
+    let mut a = copy_from(1, 100);
+    let mut out = a.send(&mut m, &record(200));
+    let join = boundary(30, 201);
+    out.extend(a.send(&mut m, &join));
+    assert_eq!(out, [] as [Vec<u8>; 0]);
+    let start = Head::after_boundary(&join).unwrap();
+    assert_eq!(
+        start,
+        Head {
+            next_index: 201,
+            next_block: 31,
+            last: Some(Key::Boundary(30)),
+        }
+    );
+    m.rebase(start);
+    assert_eq!(a.send(&mut m, &record(201)), [record(201)]);
+    assert!(m.joined());
+    assert_eq!(Head::after_boundary(&record(3)), None);
+}

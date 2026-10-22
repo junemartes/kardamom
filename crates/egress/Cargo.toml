@@ -34,12 +34,13 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 metrics = { workspace = true }
+# The range read of a peer egress after a start.
+reqwest = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "rt", "rt-multi-thread", "time", "macros", "signal"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
 kardamom-cache = { workspace = true }
-reqwest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
