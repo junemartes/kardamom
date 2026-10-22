@@ -40,7 +40,7 @@ mod manifest;
 pub mod replay;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 pub(crate) use manifest::manifest_path;

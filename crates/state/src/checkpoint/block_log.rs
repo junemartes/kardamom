@@ -112,6 +112,21 @@ impl Record {
         (RECORD_HEAD + self.bytes.len()) as u64
     }
 
+    /// Write the record as it is on disk: `[len][block][crc][batch]`.
+    pub(crate) fn write_to(&self, out: &mut impl Write) -> std::io::Result<()> {
+        Self::encode(out, self.block, &self.bytes)
+    }
+
+    /// Write the record of `block` with the archive `batch`.
+    fn encode(out: &mut impl Write, block: u64, batch: &[u8]) -> std::io::Result<()> {
+        let len =
+            u32::try_from(batch.len()).map_err(|_| std::io::Error::other("a batch above 4 GiB"))?;
+        out.write_all(&len.to_le_bytes())?;
+        out.write_all(&block.to_le_bytes())?;
+        out.write_all(&Self::crc(block, batch).to_le_bytes())?;
+        out.write_all(batch)
+    }
+
     fn crc(block: u64, batch: &[u8]) -> u32 {
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&block.to_le_bytes());
@@ -120,13 +135,18 @@ impl Record {
     }
 }
 
-/// The records of one segment, in order, up to the first torn or bad
-/// record.
-struct Records {
-    reader: BufReader<File>,
+/// The records of a stream, in order, up to the first torn or bad record.
+pub(crate) struct Records<R> {
+    reader: R,
 }
 
-impl Records {
+impl<R: Read> Records<R> {
+    /// The records in `reader`: a segment after its head, or the body of
+    /// a log transfer.
+    pub(crate) fn new(reader: R) -> Self {
+        Self { reader }
+    }
+
     /// Read the next record. `None` at the end of the file, and at a torn
     /// or bad record.
     fn read(&mut self) -> Option<Record> {
@@ -144,7 +164,7 @@ impl Records {
     }
 }
 
-impl Iterator for Records {
+impl<R: Read> Iterator for Records<R> {
     type Item = Record;
 
     fn next(&mut self) -> Option<Record> {
@@ -193,7 +213,7 @@ impl Segment {
     /// The records of the segment, when its head is of `identity`. A
     /// segment that does not open, or that has another head, holds none
     /// for this log.
-    fn records(&self, identity: LogIdentity) -> Option<Records> {
+    fn records(&self, identity: LogIdentity) -> Option<Records<BufReader<File>>> {
         let mut reader = File::open(&self.path).map(BufReader::new).ok()?;
         let mut head = [0u8; SEGMENT_HEAD];
         reader.read_exact(&mut head).ok()?;
@@ -303,13 +323,7 @@ struct OpenSegment {
 
 impl OpenSegment {
     fn append(&mut self, block: u64, batch: &[u8]) -> Result<(), StateError> {
-        let len =
-            u32::try_from(batch.len()).map_err(|_| std::io::Error::other("a batch above 4 GiB"))?;
-        self.writer.write_all(&len.to_le_bytes())?;
-        self.writer.write_all(&block.to_le_bytes())?;
-        self.writer
-            .write_all(&Record::crc(block, batch).to_le_bytes())?;
-        self.writer.write_all(batch)?;
+        Record::encode(&mut self.writer, block, batch)?;
         self.len = self
             .len
             .checked_add((RECORD_HEAD + batch.len()) as u64)

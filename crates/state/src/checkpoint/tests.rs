@@ -13,14 +13,14 @@ fn commit_blocks(env: &StateEnv, addr: Address, upto: u64) {
 
 /// Commit blocks `1..=upto` for `addr`. Each block also writes `slots`
 /// storage slots of `addr`, with keys that differ from block to block.
-pub(super) fn commit_blocks_with_slots(env: &StateEnv, addr: Address, upto: u64, slots: u64) {
+pub(crate) fn commit_blocks_with_slots(env: &StateEnv, addr: Address, upto: u64, slots: u64) {
     let handle = StateWriter::spawn(env.clone()).unwrap();
     commit_through(handle, (1..=upto).map(|b| block_batch(addr, b, slots)));
 }
 
 /// The batch of block `b` for `addr`. It also writes `slots` storage slots
 /// of `addr`, with keys that differ from block to block.
-pub(super) fn block_batch(addr: Address, b: u64, slots: u64) -> WriteBatch {
+pub(crate) fn block_batch(addr: Address, b: u64, slots: u64) -> WriteBatch {
     let boundary = BlockBoundary {
         block_number: b,
         end_tx_idx: BPosition::from_index(b),
@@ -52,7 +52,7 @@ pub(super) fn block_batch(addr: Address, b: u64, slots: u64) -> WriteBatch {
 
 /// Send `batches` to the writer of `handle`, wait until the last one
 /// commits, and shut the writer down.
-pub(super) fn commit_through(
+pub(crate) fn commit_through(
     mut handle: crate::writer::WriterHandle,
     batches: impl Iterator<Item = WriteBatch>,
 ) {
@@ -70,11 +70,11 @@ pub(super) fn commit_through(
 }
 
 /// The account of the batches of the block log tests.
-pub(super) const ADDR: Address = Address::repeat_byte(0x31);
+pub(crate) const ADDR: Address = Address::repeat_byte(0x31);
 
 /// Commit `blocks` of [`ADDR`] through a writer that feeds a log thread
 /// in `log_dir`, and wait for both threads to end.
-pub(super) fn commit_logged(
+pub(crate) fn commit_logged(
     env: &StateEnv,
     log_dir: &std::path::Path,
     blocks: std::ops::RangeInclusive<u64>,
@@ -113,7 +113,7 @@ fn seeded_env_with_blocks(dir: &std::path::Path, addr: Address, upto: u64) -> St
 }
 
 /// Open a fresh tempdir-backed env at `dir`, and seed genesis.
-pub(super) fn seeded_env(dir: &std::path::Path) -> StateEnv {
+pub(crate) fn seeded_env(dir: &std::path::Path) -> StateEnv {
     let env = StateEnvBuilder::new(dir)
         .durability(Durability::SafeNoSync)
         .open()
