@@ -21,6 +21,8 @@ alloy-rlp = { workspace = true, features = ["derive"] }
 alloy-trie = { version = "0.9", features = ["ethereum"] }
 bytes.workspace = true
 crossbeam-channel = "0.5"
+# The CRC of each record of the block log.
+crc32fast = "1.5"
 kardamom-log.workspace = true
 kardamom-types.workspace = true
 # Shadow-check counters surface in the host process's Prometheus exporter.

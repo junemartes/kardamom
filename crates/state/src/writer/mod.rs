@@ -39,7 +39,9 @@ use crate::swap::{SnapshotHandle, SnapshotReceiver, channel as swap_channel};
 /// - The block-level cursors.
 /// - The per-key state mutations.
 /// - The per-transaction receipts, each with where its bytes are.
-#[derive(Debug, Clone)]
+///
+/// The block log of the checkpoints stores the rkyv archive of a batch.
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct WriteBatch {
     pub boundary: BlockBoundary,
     pub delta: BlockDelta,
@@ -49,7 +51,7 @@ pub struct WriteBatch {
 
 /// Where the bytes of a block's transactions are, as the writer records
 /// them in the `tx_hash_index` rows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum TxRefs {
     /// The `TxRef` of every transaction of the block, as the canonical
     /// stream carried it: where the bytes are on a `tx_data` archive. A

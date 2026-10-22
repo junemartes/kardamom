@@ -30,6 +30,7 @@
 //! [`manifest`]. The peer-fetch path in [`crate::checkpoint_transfer`]
 //! also uses these helpers.
 
+pub mod block_log;
 mod image;
 mod manifest;
 
