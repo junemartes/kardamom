@@ -25,10 +25,17 @@
 //! x-checkpoint-keccak: <0x hash>
 //! x-checkpoint-genesis: <0x hash>
 //! x-checkpoint-schema: <u32>
+//! x-checkpoint-log-end: <u64>
 //! content-length: <bytes>
 //!
 //! <mdbx image>
 //! ```
+//!
+//! `x-checkpoint-log-end` is the last block that the block log of the
+//! server reaches after the image, so a client takes an image below its
+//! floor when the log reaches the floor. The client then fetches that log
+//! (see [`log_fetch`]). A server of an older release sends no such header,
+//! and the client takes the block of the image.
 //!
 //! The server serves its newest checkpoint, or with `max_block` its newest
 //! checkpoint at or below that block. A server of an older release ignores
@@ -51,11 +58,14 @@ use tracing::{info, warn};
 
 use alloy_primitives::B256;
 
+use crate::checkpoint::replay::LogReplay;
 use crate::checkpoint::{
     BlockRange, CheckpointInfo, ImageSchema, checkpoint_data_file, checkpoint_name,
     latest_checkpoint,
 };
 use crate::error::StateError;
+
+mod log_fetch;
 
 /// The read/write timeout for each socket. Transfers stream in bounded
 /// chunks, so this caps per-syscall stalls, such as a dead peer. It does
@@ -80,6 +90,11 @@ mod framing {
     /// The request path. The optional query caps the served block.
     pub(super) const PATH: &str = "GET /checkpoint/latest";
     pub(super) const MAX_BLOCK_QUERY: &str = "?max_block=";
+    /// The last block that the log of the server reaches after the base
+    /// that it serves. A server of an older release sends none.
+    pub(super) const HDR_LOG_END: &str = "x-checkpoint-log-end";
+    /// The request path of the block log.
+    pub(super) const LOG_PATH: &str = "GET /checkpoint/log";
 }
 
 /// The checkpoints that one fetch request asks for.
@@ -250,8 +265,12 @@ fn prepare_response(
         .stated()
         .map(|schema| format!("{}: {schema}\r\n", framing::HDR_SCHEMA))
         .unwrap_or_default();
+    let log_end = LogReplay::new(&ckpt.path, manifest.genesis_digest, request.range.max)
+        .reach(ckpt.block)
+        .unwrap_or(ckpt.block);
+    let log_end = format!("{}: {log_end}\r\n", framing::HDR_LOG_END);
     let head = format!(
-        "HTTP/1.0 200 OK\r\n{}: {}\r\n{}: {:#x}\r\n{}: {:#x}\r\n{schema}content-length: {len}\r\n\r\n",
+        "HTTP/1.0 200 OK\r\n{}: {}\r\n{}: {:#x}\r\n{}: {:#x}\r\n{schema}{log_end}content-length: {len}\r\n\r\n",
         framing::HDR_BLOCK,
         ckpt.block,
         framing::HDR_KECCAK,
@@ -267,6 +286,9 @@ async fn serve_one(stream: tokio::net::TcpStream, checkpoints_dir: &Path) -> std
     let mut reader = tokio::io::BufReader::new(rd).take(MAX_HEAD as u64);
     let mut request_line = String::new();
     timeout(IO_TIMEOUT, reader.read_line(&mut request_line)).await??;
+    if let Some(request) = log_fetch::LogRequest::parse(&request_line) {
+        return request.serve(checkpoints_dir, wr).await;
+    }
     let Some(request) = FetchRequest::parse(&request_line) else {
         timeout(IO_TIMEOUT, wr.write_all(b"HTTP/1.0 404 Not Found\r\n\r\n")).await??;
         return Ok(());
@@ -314,15 +336,16 @@ pub(crate) fn fetch_latest_checkpoint(
     range: BlockRange,
     expected_genesis: Option<B256>,
 ) -> Result<Option<CheckpointInfo>, StateError> {
-    let mut fetch = CheckpointFetch::connect(peer, FetchRequest { range }, expected_genesis)?;
+    let request = FetchRequest { range }.line();
+    let mut fetch = CheckpointFetch::connect(peer, &request, expected_genesis)?;
     let head = match fetch.response()? {
         PeerResponse::NotFound => return Ok(None),
         PeerResponse::Image(head) => head,
     };
-    if !range.contains(head.block) {
+    if !head.reaches(range) {
         // Too old to be useful, for example below the cluster's retention
-        // floor, or above the cap from a server that ignores it. Do not
-        // download the body.
+        // floor with a log that does not reach it, or above the cap from a
+        // server that ignores it. Do not download the body.
         return Ok(None);
     }
     // An image this release cannot open is refused before the download.
@@ -409,13 +432,17 @@ fn fetch_one_peer(
     range: BlockRange,
     expected_genesis: Option<B256>,
 ) -> Option<CheckpointInfo> {
-    match fetch_latest_checkpoint(peer, checkpoints_dir, range, expected_genesis) {
-        Ok(c) => c,
+    let base = match fetch_latest_checkpoint(peer, checkpoints_dir, range, expected_genesis) {
+        Ok(c) => c?,
         Err(e) => {
             warn!(peer, error = %e, "checkpoint fetch from peer failed");
-            None
+            return None;
         }
+    };
+    if let Err(e) = log_fetch::fetch_log(peer, checkpoints_dir, &base, range.max) {
+        warn!(peer, error = %e, "the block log fetch from peer failed; the base restores alone");
     }
+    Some(base)
 }
 
 /// One step of [`CheckpointFetch::read_head_line`].
@@ -441,13 +468,13 @@ impl<'a> CheckpointFetch<'a> {
     /// request.
     fn connect(
         peer: &'a str,
-        request: FetchRequest,
+        request_line: &str,
         expected_genesis: Option<B256>,
     ) -> Result<Self, StateError> {
         let mut stream = Self::open(peer)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
-        stream.write_all(request.line().as_bytes())?;
+        stream.write_all(request_line.as_bytes())?;
         Ok(Self {
             peer,
             reader: BufReader::new(stream),
@@ -579,6 +606,17 @@ struct CheckpointHead {
     /// The image's state schema; none stated from a peer of an older
     /// release.
     schema: ImageSchema,
+    /// The last block that the log of the peer reaches after the image.
+    /// The block of the image from a peer of an older release.
+    log_end: u64,
+}
+
+impl CheckpointHead {
+    /// Whether the image serves `range`: its block is in the range, or
+    /// the log of the peer after it reaches the lower end.
+    fn reaches(&self, range: BlockRange) -> bool {
+        range.contains(self.block) || (self.block <= range.max && self.log_end >= range.min)
+    }
 }
 
 impl PeerResponse {
@@ -626,6 +664,7 @@ impl PeerResponse {
             keccak,
             genesis,
             schema: headers.schema,
+            log_end: headers.log_end.unwrap_or(block),
         }))
     }
 
@@ -662,6 +701,7 @@ struct ParsedHeaders {
     keccak: Option<B256>,
     genesis: Option<B256>,
     schema: ImageSchema,
+    log_end: Option<u64>,
 }
 
 impl ParsedHeaders {
@@ -676,6 +716,7 @@ impl ParsedHeaders {
             framing::HDR_KECCAK => self.keccak = v.parse().ok(),
             framing::HDR_GENESIS => self.genesis = v.parse().ok(),
             framing::HDR_SCHEMA => self.schema = ImageSchema::parse(v),
+            framing::HDR_LOG_END => self.log_end = v.parse().ok(),
             _ => {}
         }
         self
