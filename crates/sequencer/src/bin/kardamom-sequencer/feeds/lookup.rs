@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
 use kardamom_cache::{CacheReader, ExecutorQuery, ExecutorQueryConfig, LiveAccounts, QueryError};
+use kardamom_obs::pipeline::Step;
 use kardamom_sequencer::lookup::{LookupConfig, LookupRequest};
 use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::resync::{Evidence, FloorEvent, FloorUpdate};
@@ -48,6 +49,8 @@ pub(crate) struct NonceLookupFeed {
     /// The last request per sender. It bounds the retry rate to one
     /// lookup per timeout per sender and rollback generation.
     recent: HashMap<Address, Asked>,
+    /// One query, from the start of its task to its result.
+    latency: Step,
 }
 
 /// The time and the rollback generation of the last request of a sender.
@@ -100,6 +103,7 @@ impl NonceLookupFeed {
             done_rx,
             in_flight: HashSet::new(),
             recent: HashMap::new(),
+            latency: Step::new("sequencer.account_lookup"),
         })
     }
 
@@ -212,7 +216,9 @@ impl NonceLookupFeed {
         let redis = self.redis.clone();
         let done_tx = self.done_tx.clone();
         let partition = self.partition;
+        let latency = self.latency.clone();
         tokio::spawn(async move {
+            let started = Instant::now();
             let result = match redis_nonce(redis.as_deref(), sender).await {
                 Some(nonce) => {
                     seq_metrics::record_nonce_lookup(partition, "redis");
@@ -223,6 +229,7 @@ impl NonceLookupFeed {
                         .map_err(|e| QueryError::new(format!("nonce out of range: {e}"), false))
                 }),
             };
+            latency.since(started);
             let _ = done_tx.send(LookupDone { request, result });
         });
     }

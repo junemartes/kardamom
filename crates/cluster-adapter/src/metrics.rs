@@ -14,6 +14,12 @@ pub const LEADER_CHANGES_TOTAL: &str = "kardamom_cluster_client_leader_changes_t
 /// Sessions opened. One per process life in steady state; more is a
 /// reconnect.
 pub const SESSIONS_TOTAL: &str = "kardamom_cluster_client_sessions_total";
+/// The age of the oldest app message of one egress drain: the clock of
+/// this host minus the cluster timestamp of the message header. The
+/// leader stamps the header from its own clock in milliseconds, so the
+/// value has millisecond resolution and holds the clock offset between
+/// the two hosts.
+pub const EGRESS_AGE_SECONDS: &str = "kardamom_cluster_client_egress_age_seconds";
 
 /// The session opened against `leader_member_id`.
 pub(crate) fn record_connected(leader_member_id: i32) {
@@ -47,6 +53,13 @@ pub fn describe() {
         "leader changes the session followed (a redirect or a new leader event)"
     );
     metrics::describe_counter!(SESSIONS_TOTAL, "cluster sessions opened");
+    metrics::describe_histogram!(
+        EGRESS_AGE_SECONDS,
+        metrics::Unit::Seconds,
+        "age of the oldest egress app message of one drain: this host's clock minus the \
+         leader's header timestamp; millisecond resolution, includes the clock offset \
+         between the two hosts"
+    );
 }
 
 #[cfg(test)]
@@ -68,6 +81,7 @@ mod tests {
             LEADER_MEMBER_ID,
             LEADER_CHANGES_TOTAL,
             SESSIONS_TOTAL,
+            EGRESS_AGE_SECONDS,
         ] {
             assert!(
                 name.starts_with("kardamom_cluster_client_"),
