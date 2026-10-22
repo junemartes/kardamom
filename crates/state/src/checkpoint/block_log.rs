@@ -306,7 +306,7 @@ impl BlockLogWriter {
         fs::create_dir_all(dir)?;
         let open = Segment::list(dir)?
             .last()
-            .map(|last| Self::resume(last, identity))
+            .map(|last| Self::resume(last, identity, u64::MAX))
             .transpose()?
             .flatten();
         Ok(Self {
@@ -335,6 +335,33 @@ impl BlockLogWriter {
         let block = batch.boundary.block_number;
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(batch).map_err(|e| self.refuse(e))?;
         self.segment_for(block)?.append(block, &bytes)
+    }
+
+    /// Cut the log after `block`: delete each segment that starts above
+    /// it, and cut the last segment after its record of `block`. The log
+    /// then continues with the batch of `block + 1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a segment does not sync, delete or cut.
+    pub fn cut_after(&mut self, block: u64) -> Result<(), StateError> {
+        self.open.take().map(|mut s| s.sync()).transpose()?;
+        let (kept, above): (Vec<Segment>, Vec<Segment>) = Segment::list(&self.dir)?
+            .into_iter()
+            .partition(|s| s.first_block <= block);
+        above.iter().try_for_each(|s| fs::remove_file(&s.path))?;
+        self.open = kept
+            .last()
+            .map(|last| Self::resume(last, self.identity, block))
+            .transpose()?
+            .flatten();
+        Ok(())
+    }
+
+    /// Give up the open segment after a failed write. The next batch
+    /// starts a new segment, and a reader stops at the torn record.
+    pub fn abandon(&mut self) {
+        self.open = None;
     }
 
     /// Force the appended records to disk.
@@ -379,13 +406,18 @@ impl BlockLogWriter {
         })
     }
 
-    /// The open segment after the last good record of `last`, cut there.
-    /// `None` when `last` is of another identity.
-    fn resume(last: &Segment, identity: LogIdentity) -> Result<Option<OpenSegment>, StateError> {
-        let Some(mut records) = last.records(identity) else {
+    /// The open segment after the last good record of `last` up to block
+    /// `upto`, cut there. `None` when `last` is of another identity.
+    fn resume(
+        last: &Segment,
+        identity: LogIdentity,
+        upto: u64,
+    ) -> Result<Option<OpenSegment>, StateError> {
+        let Some(records) = last.records(identity) else {
             return Ok(None);
         };
         let (len, next_block) = records
+            .take_while(|r| r.block <= upto)
             .try_fold((SEGMENT_HEAD as u64, last.first_block), |(len, _), r| {
                 Some((len.checked_add(r.len_on_disk())?, r.block.checked_add(1)?))
             })

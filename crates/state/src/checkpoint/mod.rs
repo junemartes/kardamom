@@ -32,6 +32,7 @@
 
 pub mod block_log;
 mod image;
+pub mod log_thread;
 mod manifest;
 
 #[cfg(test)]

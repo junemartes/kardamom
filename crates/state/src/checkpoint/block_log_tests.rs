@@ -192,3 +192,21 @@ fn the_format_matches_the_registry() {
     let head = alloy_primitives::hex::encode(head.encode());
     Registry::assert_layout("block-log", "SegmentHead", &head);
 }
+
+/// A cut inside a segment drops the records after the block. The log then
+/// continues with the next block, in the same segment.
+#[test]
+fn a_cut_drops_the_records_after_the_block() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), LARGE, 1..=5);
+    let mut log = BlockLogWriter::open(dir.path(), ID, LARGE).unwrap();
+    log.cut_after(3).unwrap();
+    assert_eq!(log.next_block(), Some(4));
+    let replaced = batch(4, 9);
+    log.append(&replaced).unwrap();
+    log.sync().unwrap();
+    assert_eq!(blocks_after(dir.path(), 0, u64::MAX), [1, 2, 3, 4]);
+    assert_eq!(Segment::list(dir.path()).unwrap().len(), 1);
+    let read = BlockLog::open(dir.path(), ID).unwrap();
+    assert_eq!(read.after(3, 4).next().unwrap().batch().unwrap(), replaced);
+}

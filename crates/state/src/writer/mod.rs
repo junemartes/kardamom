@@ -25,6 +25,7 @@ use crossbeam_channel::{Receiver, Sender};
 use kardamom_types::{BlockBoundary, BlockDelta, TxRef};
 use tracing::{debug, error, info, warn};
 
+use crate::checkpoint::log_thread::LogFeed;
 use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::snapshot::StateSnapshot;
@@ -175,6 +176,9 @@ pub struct StateWriter {
     /// the canonical Ethereum MPT world-state root (see [`crate::trie`])
     /// inside the same atomic transaction.
     trie_mode: TrieMode,
+    /// The block log of the checkpoints, when the executor keeps one. The
+    /// writer offers each committed batch to it, and never waits.
+    log: Option<LogFeed>,
 }
 
 impl StateWriter {
@@ -186,7 +190,18 @@ impl StateWriter {
     /// Returns [`StateError`] if the schema-version check fails, or if the
     /// writer thread or its initial snapshot cannot be created.
     pub fn spawn(env: StateEnv) -> Result<WriterHandle, StateError> {
-        Self::spawn_inner(env, TrieMode::Off)
+        Self::spawn_inner(env, TrieMode::Off, None)
+    }
+
+    /// Spawn the plain writer, and offer each committed batch to the block
+    /// log of the checkpoints on `log`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if the schema-version check fails, or if the
+    /// writer thread or its initial snapshot cannot be created.
+    pub fn spawn_with_log(env: StateEnv, log: LogFeed) -> Result<WriterHandle, StateError> {
+        Self::spawn_inner(env, TrieMode::Off, Some(log))
     }
 
     /// Spawn the trie-aware writer with the given [`TrieMode`]. Each block
@@ -213,10 +228,14 @@ impl StateWriter {
                     .into(),
             ));
         }
-        Self::spawn_inner(env, mode)
+        Self::spawn_inner(env, mode, None)
     }
 
-    fn spawn_inner(env: StateEnv, trie_mode: TrieMode) -> Result<WriterHandle, StateError> {
+    fn spawn_inner(
+        env: StateEnv,
+        trie_mode: TrieMode,
+        log: Option<LogFeed>,
+    ) -> Result<WriterHandle, StateError> {
         // This channel is bounded, HORIZON_BLOCKS deep. If the writer falls
         // behind by more than the version horizon, the executor blocks
         // here. At that point, the snapshot the executor holds is about
@@ -239,6 +258,7 @@ impl StateWriter {
             delta_rx,
             snapshot_handle: snapshot_handle.clone(),
             trie_mode,
+            log,
         };
 
         let join = thread::Builder::new()
@@ -266,8 +286,17 @@ impl StateWriter {
                 info!("delta channel closed; writer shutting down");
                 return Ok(());
             };
-            self.apply_and_publish(&batch)?;
+            self.take(batch)?;
         }
+    }
+
+    /// Apply and publish one batch, then offer it to the block log.
+    fn take(&self, batch: WriteBatch) -> Result<(), StateError> {
+        self.apply_and_publish(&batch)?;
+        if let Some(log) = &self.log {
+            log.offer(batch);
+        }
+        Ok(())
     }
 
     /// Apply one batch and publish the snapshot after it. Reports a

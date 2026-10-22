@@ -14,42 +14,55 @@ fn commit_blocks(env: &StateEnv, addr: Address, upto: u64) {
 /// Commit blocks `1..=upto` for `addr`. Each block also writes `slots`
 /// storage slots of `addr`, with keys that differ from block to block.
 fn commit_blocks_with_slots(env: &StateEnv, addr: Address, upto: u64, slots: u64) {
-    let mut handle = StateWriter::spawn(env.clone()).unwrap();
-    for b in 1..=upto {
-        let boundary = BlockBoundary {
-            block_number: b,
-            end_tx_idx: BPosition::from_index(b),
-            l2_timestamp: 1_700_000_000 + b,
-            l1_origin: 0,
-            base_fee: 0,
-            gas_used: 0,
-        };
-        let delta = BlockDelta {
-            block_number: b,
-            accounts: vec![AccountChange {
+    let handle = StateWriter::spawn(env.clone()).unwrap();
+    commit_through(handle, (1..=upto).map(|b| block_batch(addr, b, slots)));
+}
+
+/// The batch of block `b` for `addr`. It also writes `slots` storage slots
+/// of `addr`, with keys that differ from block to block.
+pub(super) fn block_batch(addr: Address, b: u64, slots: u64) -> WriteBatch {
+    let boundary = BlockBoundary {
+        block_number: b,
+        end_tx_idx: BPosition::from_index(b),
+        l2_timestamp: 1_700_000_000 + b,
+        l1_origin: 0,
+        base_fee: 0,
+        gas_used: 0,
+    };
+    let delta = BlockDelta {
+        block_number: b,
+        accounts: vec![AccountChange {
+            address: addr,
+            nonce: b,
+            balance: U256::from(b * 100),
+            code_hash: B256::ZERO,
+        }],
+        storage: (0..slots)
+            .map(|slot| StorageChange {
                 address: addr,
-                nonce: b,
-                balance: U256::from(b * 100),
-                code_hash: B256::ZERO,
-            }],
-            storage: (0..slots)
-                .map(|slot| StorageChange {
-                    address: addr,
-                    key: B256::from(U256::from(b * 1_000_000 + slot)),
-                    value: U256::from(slot + 1),
-                })
-                .collect(),
-            code: Vec::new(),
-            receipts: Vec::new(),
-        };
-        handle
-            .delta_tx
-            .send(WriteBatch::new(boundary, delta))
-            .unwrap();
-    }
-    // Wait for the last block to commit, then shut down.
+                key: B256::from(U256::from(b * 1_000_000 + slot)),
+                value: U256::from(slot + 1),
+            })
+            .collect(),
+        code: Vec::new(),
+        receipts: Vec::new(),
+    };
+    WriteBatch::new(boundary, delta)
+}
+
+/// Send `batches` to the writer of `handle`, wait until the last one
+/// commits, and shut the writer down.
+pub(super) fn commit_through(
+    mut handle: crate::writer::WriterHandle,
+    batches: impl Iterator<Item = WriteBatch>,
+) {
+    let last = batches.fold(0, |_, batch| {
+        let block = batch.boundary.block_number;
+        handle.delta_tx.send(batch).unwrap();
+        block
+    });
     while let Some(s) = handle.snapshot_rx.recv() {
-        if s.block_number() >= upto {
+        if s.block_number() >= last {
             break;
         }
     }
@@ -78,7 +91,7 @@ fn seeded_env_with_blocks(dir: &std::path::Path, addr: Address, upto: u64) -> St
 }
 
 /// Open a fresh tempdir-backed env at `dir`, and seed genesis.
-fn seeded_env(dir: &std::path::Path) -> StateEnv {
+pub(super) fn seeded_env(dir: &std::path::Path) -> StateEnv {
     let env = StateEnvBuilder::new(dir)
         .durability(Durability::SafeNoSync)
         .open()
