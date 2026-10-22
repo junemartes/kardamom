@@ -31,7 +31,7 @@ client ─TLS─▶ LB ─HTTP─▶ ingress ─▶ sequencer ─▶ sealer ─�
 
 | Id | Decision |
 |---|---|
-| D1 | `eth_sendRawTransaction` has the semantics of Ethereum. It returns the hash when the sequencer that owns the sender accepts the transaction into its mempool. It does not wait for the sealer or for the execution (section 3). |
+| D1 | `eth_sendRawTransaction` returns the hash when the ingress has validated the transaction and published it on `tx_data[lane]` (the user, 2026-10-22). The sequencer sends nothing back to the ingress. A later drop goes one way to the egress (section 3). This replaces the first form of D1, the ack of the sequencer on `tx_verdicts`. |
 | D2 | The ingress reads no receipts. Receipts go only to the egress. The strong confirmation goes through the egress: webhooks and the WebSocket status feed. `eth_sendRawTransactionSync` (EIP-7966) is not served. |
 | D3 | The ingress runs on its own fleet, apart from the sequencers (the user, 2026-10-22). It keeps no storage. This replaces the first form of D3, the ingress inside the sequencer process: the in-process mode of #725 goes. |
 | D4 | Each twin sequencer offers one cluster message for each transaction: the reference first, then the envelope. The sealer reads the reference, checks the window of decision version 4, and skips the bytes of a reference that it saw. Otherwise it orders the reference and its bytes (section 5). |
@@ -56,63 +56,80 @@ The carry spec decisions that change:
   not send it to the sequencer sessions.
 - **Open question 16.1-3 is answered by D5.** #543, #542, #554 and #570 close as superseded.
 
-## 3. The ack at admission (D1, D2)
+## 3. The ack after validation (D1, D2)
 
 ### 3.1 The call
 
-1. The ingress decodes the transaction, recovers the sender, and runs the static checks (size,
-   chain id, gas limit, intrinsic gas).
-2. It sends the envelope to the twins of the owner lane on `tx_data[lane]`, as today.
-3. Each twin runs the admission of the v2 loop (`crates/sequencer/src/v2/mod.rs`). Each twin sends
-   one ack for each transaction to the ingress that published it, on the `tx_verdicts` stream of
-   that ingress (#707): `accepted`, or `rejected` with a reason.
-4. The ingress answers the call on the first ack. It ignores the second ack of the other twin.
-   A `rejected` ack answers only when both twins rejected, or after the reject timer, as in the
-   #697 design. An `accepted` ack always wins.
-5. Without an ack in the ack timeout (default 2 s), the call answers with the error
-   `transaction not acknowledged`. The client can send the transaction again: a second copy of
-   an accepted transaction gets `already known`.
+1. The ingress computes the hash of the raw bytes. A hash in the duplicate cache (section 3.4)
+   answers with the same hash at once: no signature recovery, no second publication.
+2. It decodes the transaction, recovers the sender, and runs the static checks: size, chain id,
+   gas limit, intrinsic gas, and the fee cap against the fee floor.
+3. It checks the nonce against its account view: a nonce below the known nonce of the sender
+   answers `nonce too low`. The view comes from the account rows of the egress, and a row only
+   moves forward. So the view can lag the chain but never lead it: a rejection is always true,
+   and a stale view only misses some rejections. The ingress checks no balance: a balance can
+   grow, so a stale balance could reject a valid transaction.
+4. It publishes the envelope on `tx_data[lane]` of the owner lane. When the offer succeeds, the
+   call answers with the hash. When the offer fails within its deadline (back-pressure, no
+   connected twin), the call answers `txpool is full`, and the client can send again.
 
-### 3.2 What accepted means
+### 3.2 What the answer means
 
-- The sequencer took the transaction into its mempool: its pending list or its parked list.
-- The checks of an Ethereum node passed: the signature (at the ingress), the nonce is not below
-  the row nonce, the balance covers the worst-case cost with the pending entries, the fee cap
-  covers the base fee, and the transaction fits the size and the gas limit.
-- A transaction with a nonce gap is accepted and parked, as Ethereum queues it.
-- An accepted transaction can still drop later, as in Ethereum: a parked entry expires, a
-  forwarded entry is lost, or a lane loses both twins. The client sees it through the egress (no
-  receipt, or a `rejected` status event).
+- The ingress validated the transaction and handed it to the twins of its lane, as a public
+  Ethereum RPC hands a transaction to its node.
+- The sequencer can still drop it: a nonce below the floor of its mempool, a nonce gap that
+  expires, a full parked list, a replacement that is underpriced, or a balance that does not
+  cover the worst-case cost. An accepted transaction can also drop later, as in Ethereum: a
+  forwarded entry is lost, or a lane loses both twins.
 
-### 3.3 The errors
+### 3.3 Drops go to the egress
 
-The ack reasons map to the error texts of geth, so Ethereum tools understand them:
+- The sequencer records each drop on the egress as a status of the transaction hash, with a
+  reason. It sends nothing to the ingress. Each twin publishes its drops on the `tx_drops` stream
+  of its lane, a few bytes for each drop, and the egress subscribes to the stream of each lane. A
+  drop that both twins report is one status. A transaction that the sealer orders later wins over
+  a drop of one twin: the egress keeps the receipt.
+- A client sees a drop through the egress: `eth_getTransactionReceipt` answers null, and the
+  transaction status (`kardamom_getTransactionStatus`, the WebSocket status feed and the
+  webhooks) answers `dropped` with the reason.
+- The reasons use the error texts of geth, so Ethereum tools understand them:
 
-| Reason | Error text |
-|---|---|
-| The nonce is below the row nonce | `nonce too low` |
-| The balance does not cover the worst-case cost | `insufficient funds for gas * price + value` |
-| The same hash is in the pending list or the parked list | `already known` |
-| The same sender and nonce, a fee bump below 10% | `replacement transaction underpriced` |
-| The parked list of the sender, or of the lane, is full | `txpool is full` |
-| The fee cap is below the base fee | `max fee per gas less than block base fee` |
+| Reason | Error text | Where |
+|---|---|---|
+| The nonce is below the known nonce | `nonce too low` | the ingress (answer), or the sequencer (drop) |
+| The same hash was seen | `already known` | the ingress (answer, from the duplicate cache) |
+| The balance does not cover the worst-case cost | `insufficient funds for gas * price + value` | the sequencer (drop) |
+| The same sender and nonce, a fee bump below 10% | `replacement transaction underpriced` | the sequencer (drop) |
+| The parked list of the sender, or of the lane, is full | `txpool is full` | the sequencer (drop), or the ingress when the offer fails |
+| The fee cap is below the base fee | `max fee per gas less than block base fee` | the sequencer (drop) |
+| A parked entry expired | `transaction expired` | the sequencer (drop) |
 
 Replace by fee: a transaction with the same sender and nonce as a parked entry, and a tip and a
 fee cap that are each at least 10% higher, replaces that entry. A forwarded entry cannot be
 replaced: the sealer may have ordered it.
 
-### 3.4 What the ingress keeps and drops
+### 3.4 The duplicate cache
 
-- It keeps: the decode, the signature recovery, the static checks, the rate limits, the routing
-  to the lane, the publication on `tx_data`, and the waiters for the acks.
-- It drops: the receipt cache, the receipt watchers, the quorum watermark gate, the observer
-  session, the account layer and the `tx_receipts` subscription.
+- A fixed-size cache of the hashes of recent transactions, with the recovered sender of each.
+  The oldest entry goes when the cache is full. The size is a setting (default 65,536 entries,
+  about 4 MiB).
+- A client that sends the same transaction again gets the same hash, with no signature recovery
+  and no publication. The recovery is the expensive step of the call.
+- The cache is not a correctness mechanism. The decision window of the sealer stays the dedup
+  of the order.
+
+### 3.5 What the ingress keeps and drops
+
+- It keeps: the hash, the duplicate cache, the decode, the signature recovery, the static
+  checks, the account view (the nonce check and `eth_getTransactionCount`), the rate limits, the
+  routing to the lane, and the publication on `tx_data`.
+- It drops: the pending map and its waiters, the receipt cache and the receipt watchers, the
+  quorum watermark gate, the observer session, and the `tx_errors` and `tx_verdicts` streams. The
+  sequencer drops their publishers.
 - `eth_getTransactionReceipt` reads the egress. `eth_getBalance` and `eth_getTransactionCount`
-  read the account rows of the sequencer process for its own senders, and the egress for the
-  other senders.
-- `kardamom_sendRawTransactionAsync` stays. It acks after the publication on `tx_data`, without the
-  admission.
-- The ack mode is a configuration switch of the ingress (`--ack admission`). The old mode stays
+  read the account view, which the egress feeds.
+- `kardamom_sendRawTransactionAsync` becomes another name of `eth_sendRawTransaction`.
+- The ack mode is a configuration switch of the ingress (`--ack validated`). The old mode stays
   until every client moved. The load tools and the canary measure the executed latency through
   the egress after the switch.
 
@@ -124,8 +141,7 @@ replaced: the sealer may have ordered it.
 - The ingress keeps no storage, so an ingress host needs no fast disk.
 - The load balancer cannot route by sender. So any ingress takes any transaction, and publishes it
   on `tx_data[lane]` of the owner lane, to the twins of that lane.
-- The ingress gets its acks from the twins of each lane on its `tx_verdicts` stream. An ack is a
-  few bytes.
+- The ingress gets nothing back from the twins: the call answers after the publication (section 3).
 - Both twins read the same `tx_data` image, so they give the same reference (lane, session,
   position). Nothing records `tx_data`.
 
@@ -258,7 +274,7 @@ Each item is one pull request. Each passes `just style` and CI alone, and follow
 
 | PR | Title | Depends on |
 |---|---|---|
-| P1 | sequencer, ingress: the ack at admission, the error texts of geth, replace by fee (D1) | #707 |
+| P1 | ingress: the ack after validation, the duplicate cache, the nonce check; sequencer: the drops on `tx_drops` with the error texts of geth, replace by fee; egress: the `dropped` status (D1) | #707 |
 | P2 | wire: record type 7, the full reference, Java and Rust codecs on shared golden bytes | none |
 | P3 | sealer: decision version 5, the carry flag (feature 4), snapshot 16 (D4, D10) | P2 |
 | P4 | engine: the cluster reader yields `Ordered::Tx` for `RT_TX` (section 5.4) | P2 |
