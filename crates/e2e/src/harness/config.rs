@@ -95,6 +95,10 @@ pub struct StackConfig {
     /// transaction before the sealer, so the sequencers keep the v1 loop
     /// under `KARDAMOM_E2E_ADMISSION=1`.
     pub unpayable_spends: bool,
+    /// The scenario reads the local account layer of the ingress, which
+    /// only the full receipt stream fills. The ingress keeps `tx_receipts`
+    /// under `KARDAMOM_E2E_VERDICTS=1`.
+    pub ingress_rows: bool,
 }
 
 /// The L2 genesis a stack boots from.
@@ -156,6 +160,7 @@ impl Default for StackConfig {
             canary_genesis: false,
             notifier: false,
             unpayable_spends: false,
+            ingress_rows: false,
         }
     }
 }

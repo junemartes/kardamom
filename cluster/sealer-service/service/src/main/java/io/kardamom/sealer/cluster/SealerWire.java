@@ -262,6 +262,22 @@ public final class SealerWire {
     static final int TXREF_PAYLOAD_LEN = TXREF_RECORD_LEN - CANONICAL_ID_OFFSET;
 
     /**
+     * Record type of a full reference inside a kind-0 record, on ingress
+     * only: the {@link #TXREF_RECORD_LEN} bytes of a positioned
+     * {@link #RT_TXREF} frame with this record type, then the envelope.
+     * The relayed payload is
+     * {@code [canonical_id:32][record_type:7][lane:u8][term_id:i32][term_offset:i32][session_id:i32][envelope]}.
+     * See {@link TxRefOffer}. Matches Rust {@code RT_TXREF_OFFER}.
+     */
+    public static final byte RT_TXREF_OFFER = 7;
+
+    /**
+     * The length of the root of an archived {@code TxEnvelope}. No envelope
+     * is shorter. Matches Rust {@code ENVELOPE_ROOT_LEN}.
+     */
+    static final int ENVELOPE_ROOT_LEN = 80;
+
+    /**
      * The top byte of the deadline field, {@code 0x40}, when the field
      * carries the stream position of a transaction reference in its ingress
      * image. The position is below 2^56. Version 3 reads the value as a

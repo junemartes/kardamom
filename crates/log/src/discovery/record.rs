@@ -29,6 +29,10 @@ pub enum Topic {
     TxReceiptBoundaries,
     TxErrors,
     TxStatus,
+    /// The receipts of the transactions of one ingress, from the
+    /// sequencer that owns their senders. Each target ingress has its own
+    /// stream id.
+    TxVerdicts,
     TxDeposits,
     TxRemoteEpochs,
     TxBal,
@@ -49,6 +53,7 @@ impl Topic {
             Self::TxReceiptBoundaries => "tx_receipt_boundaries",
             Self::TxErrors => "tx_errors",
             Self::TxStatus => "tx_status",
+            Self::TxVerdicts => "tx_verdicts",
             Self::TxDeposits => "tx_deposits",
             Self::TxRemoteEpochs => "tx_remote_epochs",
             Self::TxBal => "tx_bal",
@@ -76,6 +81,7 @@ impl Topic {
             | Self::TxReceiptBoundaries
             | Self::TxErrors
             | Self::TxStatus
+            | Self::TxVerdicts
             | Self::TxDeposits
             | Self::TxRemoteEpochs
             | Self::TxBal
@@ -94,6 +100,7 @@ impl Topic {
             "tx_receipt_boundaries" => Some(Self::TxReceiptBoundaries),
             "tx_errors" => Some(Self::TxErrors),
             "tx_status" => Some(Self::TxStatus),
+            "tx_verdicts" => Some(Self::TxVerdicts),
             "tx_deposits" => Some(Self::TxDeposits),
             "tx_remote_epochs" => Some(Self::TxRemoteEpochs),
             "tx_bal" => Some(Self::TxBal),

@@ -27,8 +27,9 @@ use tokio::sync::{broadcast, watch};
 use kardamom_cache::{AccountView, CacheReader, ExecutorQuery, LiveAccounts};
 use kardamom_obs::halt::{HaltRef, Pause, PauseReason};
 use kardamom_obs::lifecycle::{Lifecycle, process};
-use kardamom_types::{ClusterStatus, Receipt, TxError};
+use kardamom_types::{ClusterStatus, Receipt, TxEnvelope, TxError};
 
+use crate::acks::AckWaiters;
 use crate::chain::SealerLifecycle;
 
 use crate::channels::{IngressPublication, IngressSubscription};
@@ -61,6 +62,8 @@ pub(crate) trait Watch<T> {
 pub(crate) struct BroadcastWatcher<T, W> {
     rx: broadcast::Receiver<T>,
     watcher: W,
+    /// The `bus` label of [`crate::metrics::BUS_LAGGED_TOTAL`].
+    bus: &'static str,
 }
 
 impl<T, W> BroadcastWatcher<T, W>
@@ -68,8 +71,8 @@ where
     T: Clone + Send + 'static,
     W: Watch<T> + Send + 'static,
 {
-    pub(crate) fn new(rx: broadcast::Receiver<T>, watcher: W) -> Self {
-        Self { rx, watcher }
+    pub(crate) fn new(bus: &'static str, rx: broadcast::Receiver<T>, watcher: W) -> Self {
+        Self { rx, watcher, bus }
     }
 
     /// Start the drain on the runtime. It ends when the sender side
@@ -83,28 +86,13 @@ where
             match self.rx.recv().await {
                 Ok(item) => self.watcher.on_item(item).await,
                 Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(_)) => {
+                Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                    crate::metrics::count_lagged(self.bus, dropped);
                     self.watcher.on_lagged(&mut self.rx).await;
                 }
             }
         }
     }
-}
-
-/// Packs a replica id and a per-replica sequence into a globally unique,
-/// opaque `correlation_id`: the top 16 bits are `ingress_id`, and the low
-/// 48 bits are `seq`. See [`IngressProxy::next_correlation_id`].
-#[inline]
-#[must_use]
-pub(crate) fn pack_correlation_id(ingress_id: u16, seq: u64) -> u64 {
-    (u64::from(ingress_id) << 48) | (seq & 0x0000_FFFF_FFFF_FFFF)
-}
-
-/// Extracts the originating `ingress_id` from a packed `correlation_id`.
-#[inline]
-#[must_use]
-pub fn ingress_id_of(correlation_id: u64) -> u16 {
-    (correlation_id >> 48) as u16
 }
 
 /// Output of the shared submit-path head: the identity of a decoded,
@@ -152,6 +140,9 @@ where
     pub(crate) rate_limiter: Arc<PerIpLimiter>,
     pub(crate) verifier: Arc<BatchVerifier>,
     pub(crate) pending: Arc<PendingReceipts>,
+    /// The waiters of the ack at admission. Empty unless
+    /// `cfg.admission_ack` is on. See [`crate::acks`].
+    pub(crate) acks: Arc<AckWaiters>,
     pub(crate) cache: Arc<ReceiptCache>,
     /// Consumer-side `tx_errors` dedup for P racing sequencer replicas.
     /// Drops the twin's duplicate copy of each per-tx rejection, and
@@ -234,6 +225,7 @@ where
             rate_limiter: self.rate_limiter.clone(),
             verifier: self.verifier.clone(),
             pending: self.pending.clone(),
+            acks: self.acks.clone(),
             cache: self.cache.clone(),
             tx_error_dedup: self.tx_error_dedup.clone(),
             publication: self.publication.clone(),
@@ -272,6 +264,7 @@ where
             cfg.sig_verify_flush_window,
         ));
         let pending = Arc::new(PendingReceipts::new(cfg.ack_policy));
+        let acks = AckWaiters::new(cfg.admission_ack.unwrap_or_default());
         let cache = Arc::new(ReceiptCache::new(cfg.receipt_cache_capacity));
         let tx_error_dedup = Arc::new(TxErrorDedup::default());
         let live = subscription.live_accounts();
@@ -298,6 +291,7 @@ where
             rate_limiter,
             verifier,
             pending,
+            acks,
             cache,
             tx_error_dedup,
             publication,
@@ -319,6 +313,9 @@ where
         };
         me.spawn_tx_receipts_watcher(applied_tx);
         me.spawn_tx_errors_watcher();
+        if me.cfg.admission_ack.is_some() {
+            me.spawn_verdicts_watcher();
+        }
         me.spawn_chain_watch();
         // Subscribe only to the watermark streams the configured policy needs.
         if me.cfg.ack_policy.requires_quorum() {
@@ -447,7 +444,7 @@ where
     #[inline]
     pub fn next_correlation_id(&self) -> u64 {
         let seq = self.correlation_seq.fetch_add(1, Ordering::Relaxed);
-        pack_correlation_id(self.cfg.ingress_id, seq)
+        TxEnvelope::pack_correlation_id(self.cfg.ingress_id, seq)
     }
 
     /// Looks up a receipt by `tx_hash` in the in-memory `tx_receipts`
@@ -607,38 +604,5 @@ where
             jsonrpc_addr,
             jsonrpc_handle,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ingress_id_of, pack_correlation_id};
-
-    #[test]
-    fn correlation_id_packs_ingress_id_in_high_bits() {
-        // The low 48 bits are the sequence, and the top 16 bits are the
-        // replica id.
-        assert_eq!(pack_correlation_id(0, 0), 0);
-        assert_eq!(pack_correlation_id(0, 41), 41);
-        assert_eq!(pack_correlation_id(7, 0), 7u64 << 48);
-        assert_eq!(pack_correlation_id(7, 5), (7u64 << 48) | 5);
-        // This round-trips the replica id back out.
-        let cases = [0u16, 1, 7, 256, u16::MAX]
-            .into_iter()
-            .flat_map(|id| [0u64, 1, 1_000_000, (1u64 << 48) - 1].map(move |seq| (id, seq)));
-        for (id, seq) in cases {
-            let c = pack_correlation_id(id, seq);
-            assert_eq!(ingress_id_of(c), id, "id={id} seq={seq}");
-            assert_eq!(c & 0x0000_FFFF_FFFF_FFFF, seq, "seq preserved");
-        }
-    }
-
-    #[test]
-    fn distinct_replicas_never_collide_for_any_sequence() {
-        // Two replicas that emit the same local sequence must produce
-        // distinct ids.
-        for seq in [0u64, 1, 99, 1u64 << 40] {
-            assert_ne!(pack_correlation_id(1, seq), pack_correlation_id(2, seq));
-        }
     }
 }

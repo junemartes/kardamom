@@ -273,8 +273,8 @@ where
 
     /// Submit one decoded frame and write its reply.
     async fn dispatch_frame(&mut self, raw: Bytes) -> std::io::Result<()> {
-        match self.proxy.submit_raw(self.client_ip, raw).await {
-            Ok(resp) => self.reply(STATUS_OK, resp.receipt.tx_hash.as_slice()).await,
+        match self.proxy.submit(self.client_ip, raw).await {
+            Ok(tx_hash) => self.reply(STATUS_OK, tx_hash.as_slice()).await,
             Err(e) => {
                 let (status, msg) = map_err(&e);
                 self.reply(status, msg.as_bytes()).await
@@ -308,7 +308,9 @@ fn map_err(e: &IngressError) -> (u8, String) {
         IngressError::Decode(_) | IngressError::TxTooLarge { .. } => (STATUS_DECODE, e.to_string()),
         IngressError::SignatureInvalid => (STATUS_SIG, e.to_string()),
         IngressError::Timeout => (STATUS_TIMEOUT, e.to_string()),
-        IngressError::Duplicate(_) => (STATUS_DUPLICATE, e.to_string()),
+        IngressError::Duplicate(_) | IngressError::AlreadyKnown => {
+            (STATUS_DUPLICATE, e.to_string())
+        }
         _ => (STATUS_INTERNAL, e.to_string()),
     }
 }

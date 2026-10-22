@@ -22,6 +22,27 @@ pub enum IngressError {
     Internal(String),
     #[error("duplicate (sender, nonce): {0:?}")]
     Duplicate((Address, u64)),
+    /// The nonce is below the next nonce of the sender. geth's message
+    /// shape, so a wallet handles it as on L1.
+    #[error("nonce too low: address {address}, tx: {tx_nonce} state: {state_nonce}")]
+    NonceTooLow {
+        address: Address,
+        tx_nonce: u64,
+        state_nonce: u64,
+    },
+    /// The sequencer holds a transaction of the sender at this nonce
+    /// already. geth's message.
+    #[error("already known")]
+    AlreadyKnown,
+    /// The sequencer holds as many transactions of the sender as it takes.
+    /// geth's message.
+    #[error("txpool is full")]
+    PoolFull,
+    /// No sequencer answered the submission in the ack timeout. The
+    /// transaction can still be in a mempool: a resubmit of it gets
+    /// `already known` then.
+    #[error("transaction not acknowledged: no sequencer answered in {0:?}; resubmit")]
+    NotAcknowledged(std::time::Duration),
     #[error(
         "evicted by sequencer overload shed (sender, nonce): {0:?} — resubmit \
          once the nonce is within the reorder window"
@@ -194,6 +215,24 @@ impl IngressError {
     pub(crate) fn internal(ctx: impl std::fmt::Display, e: impl std::fmt::Display) -> Self {
         Self::Internal(format!("{ctx}: {e}"))
     }
+
+    /// The client error of a rejection at admission, with the error texts
+    /// of geth where geth has one.
+    pub(crate) fn of_verdict(
+        sender: Address,
+        nonce: u64,
+        reason: &kardamom_types::TxErrorReason,
+    ) -> Self {
+        match reason {
+            kardamom_types::TxErrorReason::DuplicatedTx { expected_nonce } => Self::NonceTooLow {
+                address: sender,
+                tx_nonce: nonce,
+                state_nonce: *expected_nonce,
+            },
+            kardamom_types::TxErrorReason::Evicted { .. } => Self::PoolFull,
+            other => crate::pending::reason_to_error(sender, nonce, other),
+        }
+    }
 }
 
 impl From<IngressError> for ErrorObjectOwned {
@@ -224,6 +263,10 @@ impl From<IngressError> for ErrorObjectOwned {
             | IngressError::FeeTooLow { .. }
             | IngressError::SealerNonceAhead { .. }
             | IngressError::NonceInFlight { .. }
+            | IngressError::NonceTooLow { .. }
+            | IngressError::AlreadyKnown
+            | IngressError::PoolFull
+            | IngressError::NotAcknowledged(_)
             | IngressError::StateUnavailable(_) => -32000,
             // Internal error.
             IngressError::Internal(_) => -32603,

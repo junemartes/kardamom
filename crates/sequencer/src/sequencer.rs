@@ -503,6 +503,7 @@ impl Sequencer {
             .iter()
             .take(chunk)
             .map(|(s, n, m)| RefOffer {
+                envelope: None,
                 tx_ref: Self::make_txref(m),
                 guard: GuardHeader {
                     sender: *s,

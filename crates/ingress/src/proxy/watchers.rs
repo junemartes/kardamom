@@ -11,9 +11,10 @@ use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::{broadcast, watch};
 
 use kardamom_types::{
-    BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, ReceiptRollback, TxError,
+    BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, ReceiptRollback, TxError, TxStatus,
 };
 
+use crate::acks::AckWaiters;
 use crate::channels::{IngressPublication, IngressSubscription, ReceiptItem};
 use crate::cold_accounts::ColdAccounts;
 use crate::fee_history::FeeHistory;
@@ -25,6 +26,14 @@ use crate::tx_error_dedup::TxErrorDedup;
 
 use super::{BroadcastWatcher, IngressProxy, Watch};
 
+/// The `bus` labels of [`crate::metrics::BUS_LAGGED_TOTAL`].
+const BOUNDARIES_BUS: &str = "block_boundaries";
+const TX_ERRORS_BUS: &str = "tx_errors";
+const RECEIPTS_BUS: &str = "tx_receipts";
+const QUORUM_WATERMARK_BUS: &str = "quorum_watermark";
+const LOCAL_FSYNC_BUS: &str = "local_fsync_watermark";
+const VERDICTS_BUS: &str = "tx_verdicts";
+
 impl<P, S> IngressProxy<P, S>
 where
     P: IngressPublication + Clone + 'static,
@@ -32,6 +41,7 @@ where
 {
     pub(super) fn spawn_block_boundary_watcher(&self) {
         BroadcastWatcher::new(
+            BOUNDARIES_BUS,
             self.subscription.subscribe_block_boundaries(),
             BlockBoundaryWatcher::new(self.latest_block_number.clone(), self.fee_history.clone()),
         )
@@ -40,6 +50,7 @@ where
 
     pub(super) fn spawn_tx_errors_watcher(&self) {
         BroadcastWatcher::new(
+            TX_ERRORS_BUS,
             self.subscription.subscribe_tx_errors(),
             TxErrorsWatcher::new(
                 self.pending.clone(),
@@ -52,8 +63,18 @@ where
 
     /// Spawn the receipt watcher. It owns `applied`, the log of the
     /// rollbacks that it applied.
+    pub(super) fn spawn_verdicts_watcher(&self) {
+        BroadcastWatcher::new(
+            VERDICTS_BUS,
+            self.subscription.subscribe_verdicts(),
+            VerdictsWatcher(self.acks.clone()),
+        )
+        .spawn();
+    }
+
     pub(super) fn spawn_tx_receipts_watcher(&self, applied: watch::Sender<RollbackLog>) {
         BroadcastWatcher::new(
+            RECEIPTS_BUS,
             self.subscription.subscribe_receipts(),
             TxReceiptsWatcher {
                 pending: self.pending.clone(),
@@ -73,6 +94,7 @@ where
 
     pub(super) fn spawn_quorum_watermark_watcher(&self) {
         BroadcastWatcher::new(
+            QUORUM_WATERMARK_BUS,
             self.subscription.subscribe_watermark(),
             WatermarkWatcher::new(self.pending.clone()),
         )
@@ -81,6 +103,7 @@ where
 
     pub(super) fn spawn_local_fsync_watermark_watcher(&self) {
         BroadcastWatcher::new(
+            LOCAL_FSYNC_BUS,
             self.subscription.subscribe_local_fsync_watermark(),
             WatermarkWatcher::new(self.pending.clone()),
         )
@@ -94,6 +117,17 @@ where
             self.sealer.clone(),
         )
         .spawn();
+    }
+}
+
+/// Gives each verdict of the sequencer to the submission that waits for
+/// it. A verdict that the bus dropped leaves its submission to the ack
+/// timeout: the gap carries no state to recover.
+struct VerdictsWatcher(Arc<AckWaiters>);
+
+impl Watch<TxStatus> for VerdictsWatcher {
+    async fn on_item(&mut self, status: TxStatus) {
+        self.0.on_verdict(status);
     }
 }
 
@@ -347,7 +381,8 @@ impl LagQueue {
                 self.items.push(item);
                 ControlFlow::Continue(())
             }
-            Err(TryRecvError::Lagged(_)) => {
+            Err(TryRecvError::Lagged(dropped)) => {
+                crate::metrics::count_lagged(RECEIPTS_BUS, dropped);
                 self.complete = false;
                 ControlFlow::Break(())
             }

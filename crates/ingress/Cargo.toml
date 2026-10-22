@@ -77,7 +77,7 @@ kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-obs = { path = "../obs", features = ["test-support"] }
 metrics = { workspace = true }
 secp256k1 = { version = "0.31", features = ["recovery", "global-context"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [[bench]]
 name = "latency"

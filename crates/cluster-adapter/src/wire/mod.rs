@@ -8,6 +8,7 @@
 //!   [kind:u8 = 0][sender:20][nonce:u64 LE][deadline:u64 LE][tip:u128 LE][canonical_id:32][record_type:u8][fields…]
 //!     TxRef       fields = [shard_id:u8][tx_data_position.term_id:i32][.term_offset:i32][tx_data_session_id:i32]
 //!     DepositRef  fields = [deposit_position.term_id:i32][.term_offset:i32]
+//!     TxRefOffer  fields = [shard_id:u8][.term_id:i32][.term_offset:i32][.session_id:i32][envelope]
 //! ```
 //! The Java service parses `sender` and `nonce` for the per-sender
 //! contiguity guard, `deadline` for the inclusion check (see
@@ -56,6 +57,8 @@ mod ingress;
 mod relay;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod txref_offer_tests;
 
 pub use egress::{EgressItem, RemoteOriginReject};
 #[cfg(any(test, feature = "testing"))]
@@ -67,7 +70,7 @@ pub use egress_encode::{
     encode_egress_boundary, encode_egress_record, encode_replay_ahead, encode_replay_done,
     encode_replay_unavailable, encode_sealer_info, encode_session_start,
 };
-pub use entry::{CanonicalTx, RelayedRef, encode_feed_answer, encode_feed_request};
+pub use entry::{CanonicalTx, RelayedRef, TxRefOffer, encode_feed_answer, encode_feed_request};
 #[cfg(any(test, feature = "testing"))]
 pub use entry::{TxOffer, encode_feed_gap};
 #[cfg(any(test, feature = "testing"))]
@@ -203,6 +206,14 @@ pub const KIND_FEATURE_ACTIVATION: u8 = 11;
 /// The decision version of the sealer after the activation of
 /// [`kardamom_types::upgrades::FEATURE_SEALER_V4`].
 pub const SEALER_V4_DECISION_VERSION: u8 = 4;
+
+/// The decision version of the sealer after the activation of
+/// [`kardamom_types::upgrades::FEATURE_SEALER_V5`], the carry flag. The
+/// sealer orders a full reference ([`RT_TXREF_OFFER`]) and relays its
+/// envelope as a canonical entry ([`RT_TX`]). A sequencer sends record type
+/// [`RT_TXREF_OFFER`] only while the sealer reports this version in
+/// [`EGRESS_KIND_SEALER_INFO`].
+pub const SEALER_V5_DECISION_VERSION: u8 = 5;
 
 /// The top byte of the guard header's deadline field when the field
 /// carries the stream position of a transaction reference in its
@@ -492,6 +503,25 @@ pub const RT_TX_OFFER: u8 = 5;
 /// the envelope is the archived `TxEnvelope`. See [`CanonicalTx`]. Matches
 /// Java `RT_TX`.
 pub const RT_TX: u8 = 6;
+/// A full reference, on ingress only: the [`TXREF_RECORD_LEN`] bytes of a
+/// positioned [`RT_TXREF`] frame with this record type, then the envelope.
+/// The fields after the record type are
+/// `[lane:u8][term_id:i32][term_offset:i32][session_id:i32][envelope]`. A
+/// sealer on [`SEALER_V5_DECISION_VERSION`] orders it by the replay window
+/// of its image and relays it as [`RT_TX`]. No egress frame carries this
+/// type. See [`TxRefOffer`]. Matches Java `RT_TXREF_OFFER`.
+pub const RT_TXREF_OFFER: u8 = 7;
+
+/// The length of a kind-0 frame of a transaction reference: the guard
+/// header, the canonical id, the record type, the lane, the position and
+/// the session id. Matches Java `TXREF_RECORD_LEN`.
+pub const TXREF_RECORD_LEN: usize =
+    INGRESS_CANONICAL_ID_OFFSET + CANONICAL_ID_LEN + 1 + 1 + 4 + 4 + 4;
+
+/// The length of the root of an archived `TxEnvelope`. An archived envelope
+/// is the raw transaction padded to 8 bytes, then this root, so no envelope
+/// is shorter. Matches Java `ENVELOPE_ROOT_LEN`.
+pub const ENVELOPE_ROOT_LEN: usize = 80;
 
 /// How many canonical slots an epoch occupies. This is one slot for the
 /// epoch marker itself, plus one slot per deposit.
@@ -575,6 +605,8 @@ pub enum WireError {
     BadTx(String),
     #[error("record type {0} is an ingress type that the sealer never relays")]
     UnrelayedRecordType(u8),
+    #[error("ingress kind {0} is not a record")]
+    BadIngressKind(u8),
 }
 
 // ── shared helpers (both directions) ────────────────────────────────────────

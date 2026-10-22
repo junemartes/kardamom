@@ -33,3 +33,26 @@ pub struct TxEnvelope {
     /// See `docs/agents/offer-inclusion-deadline-spec.md`.
     pub max_inclusion_block: u64,
 }
+
+impl TxEnvelope {
+    /// The bits of `correlation_id` that carry the per-ingress sequence.
+    const SEQ_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+    /// A globally unique, opaque `correlation_id`: the top 16 bits are
+    /// `ingress_id`, and the low 48 bits are `seq`.
+    #[must_use]
+    pub const fn pack_correlation_id(ingress_id: u16, seq: u64) -> u64 {
+        ((ingress_id as u64) << 48) | (seq & Self::SEQ_MASK)
+    }
+
+    /// The id of the ingress that published an envelope with
+    /// `correlation_id`.
+    #[must_use]
+    pub const fn ingress_id_of(correlation_id: u64) -> u16 {
+        (correlation_id >> 48) as u16
+    }
+}
+
+#[cfg(test)]
+#[path = "envelope_tests.rs"]
+mod tests;

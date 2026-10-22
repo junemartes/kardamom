@@ -45,6 +45,15 @@ final class EgressFrames {
         return pos + length;
     }
 
+    /**
+     * The relayed canonical entry of a full reference: its payload is
+     * {@code [canonical_id:32][record_type:6][lane:u8][envelope]}, copied in
+     * two parts from the bytes that {@code offer} views.
+     */
+    int carried(final long index, final TxRefOffer offer) {
+        return offer.writeCanonical(buf, relayedHeader(index, offer.canonicalLength()));
+    }
+
     /** {@code [kind:1][index:u64][payload_len:u32]}; returns the offset of the payload. */
     private int relayedHeader(final long index, final int payloadLength) {
         buf.putByte(0, SealerWire.EGRESS_KIND_RELAYED);
