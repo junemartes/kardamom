@@ -69,6 +69,28 @@ pub(super) fn commit_through(
     handle.shutdown().unwrap();
 }
 
+/// The account of the batches of the block log tests.
+pub(super) const ADDR: Address = Address::repeat_byte(0x31);
+
+/// Commit `blocks` of [`ADDR`] through a writer that feeds a log thread
+/// in `log_dir`, and wait for both threads to end.
+pub(super) fn commit_logged(
+    env: &StateEnv,
+    log_dir: &std::path::Path,
+    blocks: std::ops::RangeInclusive<u64>,
+) {
+    let cfg = log_thread::LogConfig {
+        dir: log_dir.to_path_buf(),
+        segment_bytes: NonZeroU64::new(1 << 20).unwrap(),
+        queue: NonZeroUsize::new(64).unwrap(),
+        sync_every: std::time::Duration::from_millis(10),
+    };
+    let (feed, log_thread) = log_thread::BlockLogThread::spawn(env, &cfg).unwrap();
+    let writer = StateWriter::spawn_with_log(env.clone(), feed).unwrap();
+    commit_through(writer, blocks.map(|b| block_batch(ADDR, b, 2)));
+    log_thread.join().unwrap();
+}
+
 /// Every real env is genesis-seeded at startup. Checkpoints inherit
 /// that digest as their chain identity, so test envs must be seeded too.
 fn seed_test_genesis(env: &StateEnv) {
@@ -123,7 +145,8 @@ fn checkpoint_restore_roundtrips_state() {
     assert_eq!(latest.block, 5);
 
     // Restore into a fresh dir and confirm the state matches exactly.
-    let restored_block = restore_checkpoint(&latest.path, restore_dir.path(), None).unwrap();
+    let restored_block =
+        restore_checkpoint(&latest.path, restore_dir.path(), None, u64::MAX).unwrap();
     assert_eq!(restored_block, 5);
 
     let snap =
@@ -157,7 +180,7 @@ fn restore_refuses_a_tampered_image() {
     bytes[mid] ^= 0x01;
     std::fs::write(&data, &bytes).unwrap();
 
-    let err = restore_checkpoint(&c.path, dst.path(), None).unwrap_err();
+    let err = restore_checkpoint(&c.path, dst.path(), None, u64::MAX).unwrap_err();
     assert!(
         format!("{err}").contains("CORRUPT"),
         "expected a corruption refusal, got: {err}"
@@ -183,7 +206,7 @@ fn restore_refuses_a_foreign_chain() {
     // Same bytes, but this node belongs to a different chain.
     let theirs = B256::repeat_byte(0xAB);
     assert_ne!(ours, theirs);
-    let err = restore_checkpoint(&c.path, dst.path(), Some(theirs)).unwrap_err();
+    let err = restore_checkpoint(&c.path, dst.path(), Some(theirs), u64::MAX).unwrap_err();
     assert!(
         format!("{err}").contains("DIFFERENT CHAIN"),
         "expected a chain-identity refusal, got: {err}"
@@ -191,7 +214,7 @@ fn restore_refuses_a_foreign_chain() {
     assert!(!has_state_db(dst.path()).unwrap());
 
     // Our own chain still restores.
-    restore_checkpoint(&c.path, dst.path(), Some(ours)).expect("same chain must restore");
+    restore_checkpoint(&c.path, dst.path(), Some(ours), u64::MAX).expect("same chain must restore");
 }
 
 /// An image with no manifest at all is unverifiable and must be
@@ -207,7 +230,7 @@ fn restore_refuses_an_unmanifested_image() {
     drop(env);
 
     std::fs::remove_file(manifest_path(&c.path)).unwrap();
-    let err = restore_checkpoint(&c.path, dst.path(), None).unwrap_err();
+    let err = restore_checkpoint(&c.path, dst.path(), None, u64::MAX).unwrap_err();
     assert!(
         format!("{err}").contains("manifest"),
         "expected an unverifiable-image refusal, got: {err}"
@@ -485,7 +508,7 @@ fn restore_refuses_to_clobber_populated_dir() {
     let c = create_checkpoint(&env, ckpt_dir.path()).unwrap();
 
     // Restoring over the live, populated source directory must be refused.
-    let err = restore_checkpoint(&c.path, src_dir.path(), None).unwrap_err();
+    let err = restore_checkpoint(&c.path, src_dir.path(), None, u64::MAX).unwrap_err();
     assert!(matches!(err, StateError::Recovery(_)));
 }
 
@@ -551,7 +574,7 @@ fn restore_skips_a_checkpoint_of_another_schema() {
     manifest.schema_version = ImageSchema::of(crate::meta::SCHEMA_VERSION + 1);
     std::fs::write(manifest_path(&later.path), manifest.encode()).unwrap();
 
-    let err = restore_checkpoint(&later.path, dst.path(), None).unwrap_err();
+    let err = restore_checkpoint(&later.path, dst.path(), None, u64::MAX).unwrap_err();
     assert!(
         matches!(err, StateError::UnreadableCheckpointSchema { schema, .. } if schema == crate::meta::SCHEMA_VERSION + 1),
         "{err}"
@@ -668,7 +691,10 @@ fn create_cuts_the_image_to_its_used_pages() {
     );
     assert_eq!(len % (64 * 1024), 0, "the cut length is 64 KiB aligned");
     assert_eq!(table_rows(&in_place), table_rows(&env));
-    assert_eq!(restore_checkpoint(&c.path, dst.path(), None).unwrap(), 4);
+    assert_eq!(
+        restore_checkpoint(&c.path, dst.path(), None, u64::MAX).unwrap(),
+        4
+    );
 }
 
 /// An image that is longer than its used pages still verifies and
@@ -697,5 +723,8 @@ fn restore_reads_an_image_with_a_trailing_hole() {
     };
     std::fs::write(manifest_path(&c.path), manifest.encode()).unwrap();
 
-    assert_eq!(restore_checkpoint(&c.path, dst.path(), None).unwrap(), 2);
+    assert_eq!(
+        restore_checkpoint(&c.path, dst.path(), None, u64::MAX).unwrap(),
+        2
+    );
 }

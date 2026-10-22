@@ -1,27 +1,13 @@
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroU64;
 use std::path::Path;
-use std::time::Duration;
-
-use alloy_primitives::Address;
 
 use super::super::block_log::{BlockLog, BlockLogWriter, LogIdentity};
 use super::super::manifest::stored_genesis_digest;
-use super::super::tests::{block_batch, commit_through, seeded_env};
-use super::{BlockLogThread, LogConfig, LogFeed};
+use super::super::tests::{ADDR, block_batch, commit_logged, commit_through, seeded_env};
+use super::LogFeed;
 use crate::env::StateEnv;
 use crate::meta::SCHEMA_VERSION;
 use crate::writer::StateWriter;
-
-const ADDR: Address = Address::repeat_byte(0x31);
-
-fn config(dir: &Path) -> LogConfig {
-    LogConfig {
-        dir: dir.to_path_buf(),
-        segment_bytes: NonZeroU64::new(1 << 20).unwrap(),
-        queue: NonZeroUsize::new(64).unwrap(),
-        sync_every: Duration::from_millis(10),
-    }
-}
 
 fn identity(env: &StateEnv) -> LogIdentity {
     LogIdentity {
@@ -33,15 +19,6 @@ fn identity(env: &StateEnv) -> LogIdentity {
 fn logged_blocks(env: &StateEnv, dir: &Path) -> Vec<u64> {
     let log = BlockLog::open(dir, identity(env)).unwrap();
     log.after(0, u64::MAX).map(|r| r.block).collect()
-}
-
-/// Commit `blocks` through a writer that feeds a log thread in `dir`, and
-/// wait for both threads to end.
-fn commit_logged(env: &StateEnv, dir: &Path, blocks: std::ops::RangeInclusive<u64>) {
-    let (feed, log_thread) = BlockLogThread::spawn(env, &config(dir)).unwrap();
-    let writer = StateWriter::spawn_with_log(env.clone(), feed).unwrap();
-    commit_through(writer, blocks.map(|b| block_batch(ADDR, b, 2)));
-    log_thread.join().unwrap();
 }
 
 #[test]

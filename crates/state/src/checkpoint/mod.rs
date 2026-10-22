@@ -34,6 +34,7 @@ pub mod block_log;
 mod image;
 pub mod log_thread;
 mod manifest;
+pub mod replay;
 
 #[cfg(test)]
 mod tests;
@@ -45,6 +46,7 @@ pub(crate) use manifest::{CheckpointManifest, read_manifest, verify_checkpoint};
 use image::CompactedImage;
 use manifest::stored_genesis_digest;
 pub(crate) use manifest::{ImageSchema, check_image_identity, file_keccak, publish_checkpoint};
+use replay::LogReplay;
 
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
@@ -335,7 +337,7 @@ pub fn restore_newest_readable(
 ) -> Result<Option<(u64, PathBuf)>, StateError> {
     for ckpt in checkpoints_newest_first(checkpoints_dir)? {
         clear_dir(state_dir)?;
-        match restore_checkpoint(&ckpt.path, state_dir, expected_genesis) {
+        match restore_checkpoint(&ckpt.path, state_dir, expected_genesis, u64::MAX) {
             Ok(block) => return Ok(Some((block, ckpt.path))),
             Err(e) => warn!(
                 checkpoint = %ckpt.path.display(),
@@ -392,9 +394,10 @@ pub fn remove_checkpoints(checkpoints_dir: &Path, range: BlockRange) -> Result<u
 }
 
 /// Restore `checkpoint` into `state_dir`. `state_dir` must be empty or
-/// absent. This copies the compacted mdbx env files across, and returns
-/// the restored `last_committed_block`. The caller then opens
-/// `state_dir` normally, and the standard resume path replays the tail.
+/// absent. This copies the compacted mdbx env files across, applies the
+/// block log after the checkpoint up to block `to`, and returns the
+/// restored `last_committed_block`. The caller then opens `state_dir`
+/// normally, and the standard resume path replays the tail.
 ///
 /// # Errors
 ///
@@ -405,6 +408,7 @@ pub(crate) fn restore_checkpoint(
     checkpoint: &Path,
     state_dir: &Path,
     expected_genesis: Option<B256>,
+    to: u64,
 ) -> Result<u64, StateError> {
     // Verify before copying. An unverifiable or foreign image must never
     // become this node's state.
@@ -421,8 +425,7 @@ pub(crate) fn restore_checkpoint(
 
     let data_src = checkpoint_data_file(checkpoint)?;
     std::fs::copy(&data_src, state_dir.join("mdbx.dat"))?;
-    let env = crate::env::StateEnvBuilder::new(state_dir).open()?;
-    let block = read_recovery_point(&env)?.last_committed_block;
+    let block = LogReplay::new(checkpoint, manifest.genesis_digest, to).apply(state_dir)?;
     info!(
         block,
         manifest_block = manifest.block,
@@ -433,9 +436,11 @@ pub(crate) fn restore_checkpoint(
     Ok(block)
 }
 
-/// Restore the newest verifiable checkpoint under `checkpoints_dir` whose
-/// block is in `range`, into `state_dir`. Returns `(restored_block,
-/// checkpoint_path)`.
+/// Restore the newest verifiable checkpoint under `checkpoints_dir` that
+/// reaches `range`, into `state_dir`. Returns `(restored_block,
+/// checkpoint_path)`. A checkpoint reaches the range when its block is in
+/// it, or when the block log after it reaches the lower end. The restore
+/// applies the log up to the upper end.
 ///
 /// A checkpoint that fails verification is quarantined: renamed to a
 /// hidden `.rejected-<name>` that the scanners never pick up. The
@@ -461,9 +466,9 @@ pub fn restore_best_checkpoint(
 ) -> Result<Option<(u64, PathBuf)>, StateError> {
     checkpoints_newest_first(checkpoints_dir)?
         .into_iter()
-        .filter(|ckpt| range.contains(ckpt.block))
+        .filter(|ckpt| ckpt.reaches(range))
         .find_map(|ckpt| {
-            ckpt.restore_or_set_aside(state_dir, expected_genesis)
+            ckpt.restore_or_set_aside(state_dir, expected_genesis, range.max)
                 .map(|restored| restored.map(|block| (block, ckpt.path)))
                 .transpose()
         })
@@ -484,6 +489,21 @@ impl CheckpointInfo {
         remove_dir_or_file(&hidden)
     }
 
+    /// Whether a restore of this checkpoint reaches `range`: its block is
+    /// in the range, or the block log after it reaches the lower end. A
+    /// checkpoint whose manifest does not read reaches only by its block.
+    fn reaches(&self, range: BlockRange) -> bool {
+        if self.block > range.max {
+            return false;
+        }
+        range.contains(self.block)
+            || read_manifest(&self.path)
+                .and_then(|m| {
+                    LogReplay::new(&self.path, m.genesis_digest, range.max).reach(self.block)
+                })
+                .is_ok_and(|end| end >= range.min)
+    }
+
     /// Restore this checkpoint into `state_dir`, and return its block. When
     /// it does not restore, set it aside and return `None`, so the caller
     /// tries the next-newest. A checkpoint of a schema this release does
@@ -493,8 +513,9 @@ impl CheckpointInfo {
         &self,
         state_dir: &Path,
         expected_genesis: Option<B256>,
+        to: u64,
     ) -> Result<Option<u64>, StateError> {
-        match restore_checkpoint(&self.path, state_dir, expected_genesis) {
+        match restore_checkpoint(&self.path, state_dir, expected_genesis, to) {
             Ok(block) => Ok(Some(block)),
             Err(StateError::UnreadableCheckpointSchema { .. }) => Ok(None),
             Err(e) => quarantine_checkpoint(&self.path, state_dir, &e).map(|()| None),
