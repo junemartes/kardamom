@@ -88,19 +88,26 @@ The short period exists for two of these uses:
 
 ### 3.4 When a new base starts
 
-- A new base starts when the log after the newest base is larger than that base (the ratio is a
-  setting, default 1.0), or when the newest base is older than a limit (default 6 h), or after a
-  gap.
+- A new base starts when the log after the newest base is larger than a percent of that base (a
+  setting, default 100 %), or when the newest base is older than a limit (default 6 h), or after a
+  gap. A gap shows in the segment sizes: the log writer ends a segment only when it is full or at
+  a gap, so a segment that is not full and that another segment follows ended at a gap.
 - The checkpointer keeps the newest `--checkpoint-keep` bases (default 2) and the log segments
   that they need. It deletes a segment only when every block in it is at or below the oldest
   kept base.
 - **The copy of a base has a rate limit** (default 16 MiB/s). The copy uses
-  `mdbx_env_copy2fd` with `MDBX_CP_COMPACT` into a pipe. A thread reads the pipe and writes the
-  image file at the limit. The copy still reads from an online read-only snapshot, so it does
-  not block the writer. libmdbx refuses a copy into a pipe when the database has a page leak.
-  Then the copy writes the file directly with no limit, and counts
-  `kardamom_checkpoint_copy_unlimited_total`. A long read transaction keeps old pages alive in the database, so the
-  rate limit has a lower bound: the copy of a base must end before the next base starts.
+  `mdbx_env_copy2fd` into a pipe. A thread reads the pipe and writes the image file at the
+  limit. A chunk of zeros becomes a hole in the file, so only data counts for the limit. The copy
+  still reads from an online read-only snapshot, so it does not block the writer.
+- **The limited copy is not compacted.** A compacted copy into a pipe writes the meta pages first,
+  with a root page that libmdbx predicts before it walks the tree. In a test that prediction was
+  wrong, libmdbx returned success, and the image opened empty. A copy that keeps the pages needs no
+  prediction. Its image also holds the free pages of the database, so it is larger than a
+  compacted image (about 1.8 times in the test).
+- When libmdbx refuses the copy into a pipe, the copy writes a compacted file directly with no
+  limit, and counts `kardamom_checkpoint_copy_unlimited_total`.
+- A long read transaction keeps old pages alive in the database, so the rate limit has a lower
+  bound: the copy of a base must end before the next base starts.
 
 Estimate for staging at 1,000 tx/s:
 
@@ -111,7 +118,8 @@ Estimate for staging at 1,000 tx/s:
 | Restore points | one each 20 s, 3 kept | every block since the oldest kept base |
 
 The log size uses `WriteBatch::approx_size_bytes`: about 550 bytes for each transfer, most of it
-the receipt. At 1,000 tx/s a new base starts about every 17 minutes.
+the receipt. At 1,000 tx/s a new base starts about every 17 minutes. A base that is not compacted
+is larger than 550 MB, so the bases start less often, and each copy takes longer.
 
 ### 3.5 Restore
 
@@ -149,7 +157,7 @@ once and renames the directory into place. A crash during the restore leaves no 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--checkpoint-log` | `false` | Write the block log and make bases by the rule of section 3.4. `false` keeps the full copy each `--checkpoint-interval-secs`. |
-| `--checkpoint-base-ratio` | `1.0` | A new base when the log after the newest base is this many times the size of that base. |
+| `--checkpoint-base-log-percent` | `100` | A new base when the log after the newest base is larger than this percent of the size of that base. |
 | `--checkpoint-base-max-age-secs` | `21600` | A new base when the newest base is older than this. |
 | `--checkpoint-copy-mib-per-sec` | `16` | The rate limit of a base copy. |
 | `--checkpoint-log-segment-mib` | `64` | The size of one log segment. |
