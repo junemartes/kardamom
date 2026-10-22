@@ -13,7 +13,7 @@ fn commit_blocks(env: &StateEnv, addr: Address, upto: u64) {
 
 /// Commit blocks `1..=upto` for `addr`. Each block also writes `slots`
 /// storage slots of `addr`, with keys that differ from block to block.
-fn commit_blocks_with_slots(env: &StateEnv, addr: Address, upto: u64, slots: u64) {
+pub(super) fn commit_blocks_with_slots(env: &StateEnv, addr: Address, upto: u64, slots: u64) {
     let handle = StateWriter::spawn(env.clone()).unwrap();
     commit_through(handle, (1..=upto).map(|b| block_batch(addr, b, slots)));
 }

@@ -12,9 +12,10 @@
 //! This supports peer-to-peer restore, which mirrors the archive
 //! re-replication path.
 //!
-//! Creation reuses [`compact_to`] (`mdbx_env_copy` with
-//! `MDBX_CP_COMPACT`) against an online read-only snapshot, so the live
-//! env keeps serving reads and writes throughout. The copy lands under a
+//! Creation reuses [`crate::compaction::compact_to`] (`mdbx_env_copy`
+//! with `MDBX_CP_COMPACT`), or its rate-limited form in [`copy_rate`],
+//! against an online read-only snapshot, so the live env keeps serving
+//! reads and writes throughout. The copy lands under a
 //! hidden temp name and is renamed into place when complete. So anything
 //! visible as `checkpoint-*` is a full, consistent image that will never
 //! change again, and copying one concurrently is always safe.
@@ -30,7 +31,9 @@
 //! [`manifest`]. The peer-fetch path in [`crate::checkpoint_transfer`]
 //! also uses these helpers.
 
+pub mod bases;
 pub mod block_log;
+pub mod copy_rate;
 mod image;
 pub mod log_thread;
 mod manifest;
@@ -43,6 +46,7 @@ mod tests;
 pub(crate) use manifest::manifest_path;
 pub(crate) use manifest::{CheckpointManifest, read_manifest, verify_checkpoint};
 
+use copy_rate::CopyRate;
 use image::CompactedImage;
 use manifest::stored_genesis_digest;
 pub(crate) use manifest::{ImageSchema, check_image_identity, file_keccak, publish_checkpoint};
@@ -55,7 +59,6 @@ use alloy_primitives::B256;
 
 use tracing::{info, warn};
 
-use crate::compaction::compact_to;
 use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::recovery::read_recovery_point;
@@ -230,6 +233,20 @@ pub fn create_checkpoint(
     env: &StateEnv,
     checkpoints_dir: &Path,
 ) -> Result<CheckpointInfo, StateError> {
+    create_checkpoint_at(env, checkpoints_dir, CopyRate::Unlimited)
+}
+
+/// [`create_checkpoint`] with the copy at `rate`.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the checkpoints directory, the compaction,
+/// or the manifest write fails.
+pub fn create_checkpoint_at(
+    env: &StateEnv,
+    checkpoints_dir: &Path,
+    rate: CopyRate,
+) -> Result<CheckpointInfo, StateError> {
     let block = read_recovery_point(env)?.last_committed_block;
     std::fs::create_dir_all(checkpoints_dir)?;
     let dest = checkpoints_dir.join(checkpoint_name(block));
@@ -246,7 +263,7 @@ pub fn create_checkpoint(
     sweep_stale_tmp(checkpoints_dir)?;
     let tmp = checkpoints_dir.join(format!(".{}.tmp", checkpoint_name(block)));
     let tmp_data = tmp.join("mdbx.dat");
-    compact_to(env, &tmp_data)?;
+    rate.copy(env, &tmp_data)?;
     CompactedImage::new(&tmp_data).cut_to_used_pages()?;
     let manifest = CheckpointManifest {
         block,

@@ -203,6 +203,53 @@ impl Segment {
     }
 }
 
+/// The first block and the bytes of one segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentSize {
+    pub first_block: u64,
+    pub bytes: u64,
+}
+
+impl SegmentSize {
+    /// The segments in `dir` with their sizes, in block order. A segment
+    /// that is gone is not in the list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory does not read.
+    pub fn list(dir: &Path) -> Result<Vec<Self>, StateError> {
+        Ok(Segment::list(dir)?
+            .iter()
+            .filter_map(|s| {
+                let bytes = fs::metadata(&s.path).ok()?.len();
+                Some(Self {
+                    first_block: s.first_block,
+                    bytes,
+                })
+            })
+            .collect())
+    }
+
+    /// Delete each segment in `dir` whose blocks are all at or below
+    /// `base`: the next segment starts at or below `base + 1`. The last
+    /// segment always stays, because the writer appends to it. Returns
+    /// how many were deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory does not read or a segment
+    /// does not delete.
+    pub fn prune_below(dir: &Path, base: u64) -> Result<usize, StateError> {
+        Segment::list(dir)?
+            .windows(2)
+            .take_while(|pair| pair[1].first_block <= base.saturating_add(1))
+            .try_fold(0, |deleted, pair| {
+                fs::remove_file(&pair[0].path).map(|()| deleted + 1)
+            })
+            .map_err(StateError::from)
+    }
+}
+
 /// A reader of the block log in one directory.
 pub struct BlockLog {
     identity: LogIdentity,
