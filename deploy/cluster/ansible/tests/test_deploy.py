@@ -944,6 +944,8 @@ class DeployTest(Deploys):
         # Each Aeron agent of a sealer counts its work cycles above 5 ms.
         self.assertIn('-Daeron.driver.sender.cycle.threshold=5ms', cluster_options)
         self.assertIn('-Daeron.cluster.service.cycle.threshold=5ms', cluster_options)
+        # Each GC pause and safepoint goes to the log with a UTC time stamp.
+        self.assertIn('-Xlog:gc,safepoint:stdout:utctime', cluster_options)
         # A restarted driver waits out the active-driver window of its
         # dead predecessor: Nomad's 15 s default at the 10 s tolerance.
         delay_ns = plans['aeron']['TaskGroups'][0]['RestartPolicy']['Delay']

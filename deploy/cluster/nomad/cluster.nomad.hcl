@@ -243,6 +243,10 @@ locals {
       "aeron.cluster.service.cycle.threshold",
     ] : "-D${p}=5ms"
   ])
+  # Each GC pause and each safepoint of a sealer JVM goes to its log with a
+  # UTC time stamp, so a long cycle of an Aeron agent can be matched to a
+  # pause of the whole JVM. A sealer takes a safepoint about once a minute.
+  jvm_pause_log_opts = "-Xlog:gc,safepoint:stdout:utctime"
 }
 
 variable "sealer_count" {
@@ -410,7 +414,7 @@ job "cluster" {
         # archive, consensus module, service and feeder threads. The image
         # entrypoint also sets the timer slack of the JVM when it is set.
         env {
-          JAVA_TOOL_OPTIONS    = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} ${local.cycle_threshold_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.logPurgeKeepSnapshots=${var.cluster_log_purge_keep_snapshots} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_seed_snapshot != "" ? "" : var.cluster_remote_origins} -Dkardamom.cluster.seedSnapshot=${var.cluster_seed_snapshot} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}"
+          JAVA_TOOL_OPTIONS    = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} ${local.cycle_threshold_opts} ${local.jvm_pause_log_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.logPurgeKeepSnapshots=${var.cluster_log_purge_keep_snapshots} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_seed_snapshot != "" ? "" : var.cluster_remote_origins} -Dkardamom.cluster.seedSnapshot=${var.cluster_seed_snapshot} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}"
           KARDAMOM_IDLE_CAP_US = var.idle_cap_us
         }
 
