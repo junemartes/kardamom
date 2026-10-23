@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
-use crate::config::DEFAULT_MAX_TX_BYTES;
+use crate::config::{DEFAULT_DUPLICATE_CACHE_CAPACITY, DEFAULT_MAX_TX_BYTES};
 
 /// The settings of one ingress service. The process flags (the config
 /// files, the Aeron directory, the metrics address and the host id) stay
@@ -186,6 +186,23 @@ pub struct IngressSettings {
     /// A rejection of every one of them answers at once.
     #[arg(long, env = "KARDAMOM_INGRESS_TWINS", default_value_t = std::num::NonZeroU8::new(2).unwrap_or(std::num::NonZeroU8::MIN))]
     pub(crate) twins: std::num::NonZeroU8,
+    /// When `eth_sendRawTransaction` answers:
+    ///   - `receipt`: with the receipt, or with `--verdicts` on the verdict
+    ///     of the sequencer.
+    ///   - `validated`: when this ingress validated the transaction and
+    ///     published it on `tx_data`. It waits for no receipt and no
+    ///     verdict, so it takes no `--verdicts`.
+    #[arg(long, env = "KARDAMOM_INGRESS_ACK", default_value = "receipt")]
+    pub(crate) ack: AckArg,
+    /// With `--ack validated`, the hashes of recent transactions that the
+    /// duplicate cache holds. A copy of a held hash answers at once, with
+    /// no signature recovery and no second publication.
+    #[arg(
+        long = "duplicate-cache-entries",
+        env = "KARDAMOM_INGRESS_DUPLICATE_CACHE_ENTRIES",
+        default_value_t = DEFAULT_DUPLICATE_CACHE_CAPACITY
+    )]
+    pub(crate) duplicate_cache_entries: NonZeroUsize,
 }
 
 impl IngressSettings {
@@ -200,6 +217,13 @@ impl IngressSettings {
     pub fn ingress_id(&self) -> u16 {
         self.ingress_id
     }
+}
+
+/// The values of `--ack`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum AckArg {
+    Receipt,
+    Validated,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]

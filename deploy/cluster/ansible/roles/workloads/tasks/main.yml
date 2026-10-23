@@ -82,7 +82,9 @@
     # The cache before its readers and its writer: the ingress reads it,
     # the state mirror writes it.
     - {name: redis}
-    - {name: ingress}
+    - name: ingress
+      vars:
+        ack: "{{ workloads_ingress_ack | default('receipt', true) }}"
     - name: executor
       wait: false
       vars:
