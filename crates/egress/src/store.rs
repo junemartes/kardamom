@@ -172,6 +172,25 @@ impl Store {
         })
     }
 
+    /// Start the store again at `head`: delete every segment, and open a
+    /// new one that starts at `head`. The egress does this when it starts
+    /// the stream again after a boundary, with no peer to fill the frames
+    /// between its old head and that boundary. A reader of an older
+    /// cursor then gets [`Range::Unavailable`] with the new floor, and
+    /// reads another instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a file does not delete or write.
+    pub fn reset(&mut self, head: Head) -> Result<(), StoreError> {
+        self.writer.flush().map_err(io(&self.dir))?;
+        self.segments
+            .drain(..)
+            .try_for_each(|s| fs::remove_file(&s.path).map_err(io(&s.path)))?;
+        self.head = head;
+        self.start_segment()
+    }
+
     /// Delete the segments that end below `block`: every frame in them is of
     /// an older block.
     ///
@@ -213,6 +232,11 @@ impl Store {
             return Ok(());
         }
         self.writer.flush().map_err(io(&self.dir))?;
+        self.start_segment()
+    }
+
+    /// Open a new segment that starts at the head, and write to it.
+    fn start_segment(&mut self) -> Result<(), StoreError> {
         let segment = Self::create(&self.dir, self.head)?;
         let file = OpenOptions::new()
             .append(true)
