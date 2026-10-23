@@ -114,6 +114,8 @@ pub struct Merge {
     waiting: HashMap<Key, (Key, Vec<u8>)>,
     /// The digests of the newest delivered keys.
     digests: Digests,
+    /// The next index after the newest record that any copy sent.
+    seen: u64,
 }
 
 impl Merge {
@@ -125,6 +127,7 @@ impl Merge {
             copies: HashMap::new(),
             waiting: HashMap::new(),
             digests: Digests::new(cfg.compared),
+            seen: 0,
         }
     }
 
@@ -132,6 +135,15 @@ impl Merge {
     #[must_use]
     pub fn head(&self) -> Head {
         self.head
+    }
+
+    /// The next index after the newest record that any copy sent. The
+    /// executors read the sealed stream, so this is the nearest view of the
+    /// sealed head that the egress has. It is 0 until a copy sends a
+    /// record.
+    #[must_use]
+    pub fn seen(&self) -> u64 {
+        self.seen
     }
 
     /// Take one message `[seq:u64][frame]` of the copy `session`. The frames
@@ -145,6 +157,7 @@ impl Merge {
         let Some(key) = Key::of(frame) else {
             return;
         };
+        self.see(key, frame);
         let before = self
             .copies
             .insert(session, (seq, key))
@@ -162,6 +175,15 @@ impl Merge {
         if let Some(before) = before.filter(|b| !self.head.passed(*b)) {
             self.wait(before, key, frame);
         }
+    }
+
+    /// Move the newest index that a copy sent past the record `frame`.
+    fn see(&mut self, key: Key, frame: &[u8]) {
+        let Key::Record(index) = key else {
+            return;
+        };
+        let next = index.checked_add(slots(frame));
+        self.seen = next.map_or(self.seen, |next| next.max(self.seen));
     }
 
     /// Deliver `frame`, then every waiting frame that chains behind it.
