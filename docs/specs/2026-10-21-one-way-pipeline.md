@@ -41,6 +41,7 @@ client ─TLS─▶ LB ─HTTP─▶ ingress ─▶ sequencer ─▶ sealer ─�
 | D8 | The sequencers read the account rows from the egress. A delay of the rows is accepted: the client ack does not wait for them. |
 | D9 | The validator independence holds without a stream hash. Each executor runs on the host of a sealer member and reads the order of that member. The egress gets one copy of the order from each executor and compares the copies, the transaction bytes included. |
 | D10 | The feature id of the carry flag is 4, not 3. `FEATURE_SEALER_V4` took id 3 (#699). The carry flag needs decision version 4 active. |
+| D11 | The sealer keeps only a small replay window. It sends the order to its paired executor on the member feed. A reader that falls below the window, an executor too, recovers from the range read of the egress. The egress, not the sealer, holds the blocks above the posted head (the user, 2026-10-23; section 6.4). |
 
 The carry spec decisions that change:
 
@@ -55,6 +56,9 @@ The carry spec decisions that change:
   D1.** The ingress does not observe the order. The kind-15 frame has no reader. The sealer does
   not send it to the sequencer sessions.
 - **Open question 16.1-3 is answered by D5.** #543, #542, #554 and #570 close as superseded.
+- **The retained file of the carry spec is not needed with D11.** The sealer holds no frame past
+  its window, so its heap and its snapshot have a fixed bound at any DA lag (#751), and the
+  snapshot stays small.
 
 ## 3. The ack after validation (D1, D2)
 
@@ -249,6 +253,30 @@ kind 6) and the recorded cursors (kind 9) as unknown kinds.
   pending lists fill, and admission refuses new transactions of those senders. No forwarded entry
   is called lost, because the loss rule counts blocks of rows.
 
+### 6.4 The sealer window and the recovery from the egress (D11)
+
+- **What the sealer keeps.** The frames of its replay window: the last `retention` frames (a
+  setting, 65,536 today). It drops older frames at once. The rule that holds a frame until the DA
+  layer posts its block goes from the sealer. So the retained frames have a fixed bound on the heap
+  and in the snapshot, at any DA lag, and the snapshot stays small.
+- **The live path.** Each member sends its frames to its paired executor on the member feed, as
+  today. A request of a cursor inside the window gets the frames from the cursor. A cursor below
+  the window gets `REPLAY_UNAVAILABLE`.
+- **The recovery.** A reader below the window resumes in this order:
+  1. its own state, when its cursor is inside the window;
+  2. the range read of the egress, from its cursor to the head of the egress store, then the live
+     source;
+  3. a peer checkpoint, when its cursor is below the floor of the egress store.
+- **The DA lag.** The egress keeps every block above `min(posted_head, final_head)` (section 6.2).
+  The DA-lag guard of the sealer stays: it refuses new transactions when the sealed head is more
+  than the budget past the posted head. But the sealer holds no frame for it.
+- **The margin.** The egress sends nothing back to the sealer (section 1), so the sealer cannot
+  wait for it. The window must cover the delay from the seal to the store of the egress with a wide
+  margin: at 4,000 transactions a second, 65,536 frames are about 16 s. Each egress instance
+  exports the distance of its stored head from the sealed head, and an alert fires when it nears
+  the window. A reader that falls below both the window and the egress store recovers from a peer
+  checkpoint.
+
 ## 7. Upgrade and rollout
 
 - Every change is backwards compatible. A breaking change ships behind a chain feature flag that
@@ -287,6 +315,7 @@ Each item is one pull request. Each passes `just style` and CI alone, and follow
 | P11 | sequencer: remove the in-process ingress of #725; the `ingress` job stays (D3) | P1 |
 | P12 | release: the upgrade transaction of feature 4 on staging, after P3 to P10 deploy | P3 to P10 |
 | P13 | cleanup: record types 0 and 4, the join, the void, the `tx_data` recorders (#599) | P12 on every network |
+| P14 | sealer: the replay window only, no hold until the posted head; executor: the recovery from the range read of the egress; egress: the distance alert (D11, section 6.4) | P6, P7 |
 
 The open items of the carry spec that this plan does not need for staging: the member feed from
 the Raft log (#638), the stored cursor (#639), the recovery after a power loss (#644, #645), the
