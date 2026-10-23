@@ -12,6 +12,7 @@ use crossbeam_channel::{Receiver, TryRecvError, select};
 use kardamom_cluster_adapter::gateway::ClusterIngress;
 use kardamom_engine::ExecStreamItem;
 use kardamom_log::error::LogError;
+use kardamom_obs::pipeline::Queue;
 use kardamom_types::ExecTxRecord;
 use rkyv::util::AlignedVec;
 use tokio_util::sync::CancellationToken;
@@ -84,6 +85,8 @@ pub(crate) struct ExecStreamPublisher<P: StreamPublications> {
     cursor: RecordedCursor,
     /// The records that this session published.
     records: u64,
+    /// The items that wait in the channel from the reader.
+    queue: Queue,
 }
 
 impl<P: StreamPublications> ExecStreamPublisher<P> {
@@ -122,6 +125,7 @@ impl<P: StreamPublications> ExecStreamPublisher<P> {
             inputs,
             cursor: RecordedCursor::new(start),
             records: 0,
+            queue: Queue::new("executor.exec_stream"),
         })
     }
 
@@ -157,6 +161,7 @@ impl<P: StreamPublications> ExecStreamPublisher<P> {
             },
             default(IDLE_TICK) => Ok(Flow::Continue),
         }?;
+        self.queue.set(self.inputs.items.len());
         self.send_cursor();
         Ok(flow)
     }

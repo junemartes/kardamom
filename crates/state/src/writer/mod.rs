@@ -22,6 +22,7 @@ mod apply;
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender};
+use kardamom_obs::pipeline::{LoopMeter, LoopState};
 use kardamom_types::{BlockBoundary, BlockDelta, TxRef};
 use tracing::{debug, error, info, warn};
 
@@ -176,6 +177,10 @@ pub struct StateWriter {
     /// the canonical Ethereum MPT world-state root (see [`crate::trie`])
     /// inside the same atomic transaction.
     trie_mode: TrieMode,
+    /// The loop meter charges the wait for a batch to idle, and the apply
+    /// to busy. The writer has no output queue, so it is never blocked.
+    meter: LoopMeter,
+    steps: apply::CommitSteps,
     /// The block log of the checkpoints, when the executor keeps one. The
     /// writer offers each committed batch to it, and never waits.
     log: Option<LogFeed>,
@@ -258,6 +263,8 @@ impl StateWriter {
             delta_rx,
             snapshot_handle: snapshot_handle.clone(),
             trie_mode,
+            meter: LoopMeter::new("state.writer"),
+            steps: apply::CommitSteps::new(),
             log,
         };
 
@@ -272,7 +279,7 @@ impl StateWriter {
         })
     }
 
-    fn run(self) -> Result<(), StateError> {
+    fn run(mut self) -> Result<(), StateError> {
         info!(
             path = %self.env.path().display(),
             env_kind = ?self.env.raw().env_kind(),
@@ -281,13 +288,22 @@ impl StateWriter {
         // `StateEnvBuilder::open` already checked the env kind, so every
         // `StateEnv` this thread can see is one of the two kinds this
         // crate supports.
-        loop {
-            let Ok(batch) = self.delta_rx.recv() else {
-                info!("delta channel closed; writer shutting down");
-                return Ok(());
-            };
-            self.take(batch)?;
-        }
+        while self.step()? {}
+        Ok(())
+    }
+
+    /// Wait for one batch, then take it. Returns false when the delta
+    /// channel closed.
+    fn step(&mut self) -> Result<bool, StateError> {
+        let received = self.delta_rx.recv();
+        self.meter.mark(LoopState::Idle);
+        let Ok(batch) = received else {
+            info!("delta channel closed; writer shutting down");
+            return Ok(false);
+        };
+        self.take(batch)?;
+        self.meter.mark(LoopState::Busy);
+        Ok(true)
     }
 
     /// Apply and publish one batch, then offer it to the block log.

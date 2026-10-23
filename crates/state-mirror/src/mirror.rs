@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::head::HeadFile;
+use crate::metrics::MirrorSteps;
 use crate::rebuild::Rebuild;
 
 /// How long to wait after a failed batch write before the retry.
@@ -78,6 +79,7 @@ pub(crate) struct Mirror {
     progress: Progress,
     last_rebuild: Instant,
     head_persisted: Instant,
+    steps: MirrorSteps,
 }
 
 impl Mirror {
@@ -95,6 +97,7 @@ impl Mirror {
             progress: Progress::new(inputs.force_rebuild.then_some(RebuildReason::Forced)),
             last_rebuild: Instant::now(),
             head_persisted: Instant::now(),
+            steps: MirrorSteps::new(),
         }
     }
 
@@ -203,8 +206,15 @@ impl Mirror {
         if let Some(reason) = self.progress.pending_rebuild.take() {
             self.run_rebuild(reason, first).await?;
         }
+        let started = Instant::now();
         self.write_until_landed(&Write::Batches(group)).await?;
-        self.advance(end).await
+        self.advance(end).await?;
+        self.steps.group.since(started);
+        self.steps.group_batches.record(group.len());
+        self.steps
+            .group_receipts
+            .record(group.iter().map(|batch| batch.receipts.len()).sum());
+        Ok(())
     }
 
     /// Run the rebuild, with the first live position as its floor.
@@ -258,7 +268,9 @@ impl Mirror {
                         })
                     })
                     .collect();
+                let started = Instant::now();
                 let written = self.cache.write_batches(&writes).await?;
+                self.steps.write.since(started);
                 crate::metrics::record_batches(writes.len(), written.disagreed);
             }
             Write::Clear => {
@@ -273,10 +285,16 @@ impl Mirror {
     /// schedule the audit rebuild when it is due.
     async fn advance(&mut self, end: BPosition) -> Result<()> {
         let head = self.progress.advance(end);
-        if let Err(e) = self.cache.set_head(self.id, head).await {
+        let started = Instant::now();
+        let head_set = self.cache.set_head(self.id, head).await;
+        self.steps.head_set.since(started);
+        if let Err(e) = head_set {
             warn!(error = %e, "head publish failed; the next batch retries");
         }
-        match self.cache.wait_replica().await {
+        let started = Instant::now();
+        let replicas = self.cache.wait_replica().await;
+        self.steps.wait_replica.since(started);
+        match replicas {
             Ok(0) => crate::metrics::record_wait_replica_zero(),
             Ok(_) => {}
             Err(e) => warn!(error = %e, "WAIT failed"),

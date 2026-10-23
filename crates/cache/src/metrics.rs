@@ -15,6 +15,12 @@ pub const HEAD_LAG_TXS: &str = "kardamom_cache_head_lag_txs";
 /// Rows written to Redis, by `outcome` (`applied`, `discarded`,
 /// `disagreed`).
 pub const ROWS_WRITTEN_TOTAL: &str = "kardamom_cache_rows_written_total";
+/// Reconnects that a failed command started. One failure burst starts one
+/// reconnect. Each reconnect makes the readers skip the cache for a while.
+pub const RECONNECTS_TOTAL: &str = "kardamom_cache_reconnects_total";
+/// Entries that the local layer removed, for the TTL or for the capacity.
+/// A high rate means the local layer is too small for the active accounts.
+pub const LIVE_EVICTIONS_TOTAL: &str = "kardamom_cache_live_evictions_total";
 
 /// Register the descriptions. Call once at startup.
 pub fn describe() {
@@ -32,6 +38,14 @@ pub fn describe() {
         ROWS_WRITTEN_TOTAL,
         "account rows written to Redis, by outcome"
     );
+    metrics::describe_counter!(
+        RECONNECTS_TOTAL,
+        "reconnects that a failed Redis command started"
+    );
+    metrics::describe_counter!(
+        LIVE_EVICTIONS_TOTAL,
+        "entries that the local layer removed, for the TTL or the capacity"
+    );
 }
 
 pub fn record_lookup(layer: &'static str, outcome: &'static str) {
@@ -44,6 +58,10 @@ pub fn record_lookup_seconds(seconds: f64) {
 
 pub fn record_degraded(reason: &'static str) {
     metrics::counter!(DEGRADED_TOTAL, "reason" => reason).increment(1);
+}
+
+pub fn record_reconnect() {
+    metrics::counter!(RECONNECTS_TOTAL).increment(1);
 }
 
 pub fn set_head_lag(txs: u64) {

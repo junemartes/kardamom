@@ -486,6 +486,95 @@ With `--carry-bytes` (`KARDAMOM_CARRY_BYTES`, off by default), the executor read
 - Any increment of `kardamom_executor_source_mismatch_total` needs an operator: a member or a service sends bytes that do not match the ordered id. The log line is `the raw transaction does not hash to its canonical id; replaying from the other source`, with the source and the index.
 - A switch logs `switching the input source` with the old and the new source and the cursor.
 
+### Executor pipeline
+
+The executor records the [pipeline metrics](#pipeline-metrics) on the streaming path: the `tx_data` lanes and the
+`tx_ordering` join, then the exec thread, the commit thread and the state writer. A hot loop records a step or a batch
+once per block or per publish batch, never per transaction.
+
+| Name | Kind | Meaning |
+| --- | --- | --- |
+| `executor.tx_data_reader` | loop | The `tx_data` reader threads. Idle is the wait on a lane. Busy is the insert into the join buffer. All lanes add to one series. |
+| `executor.ordering_reader` | loop | The `tx_ordering` reader. A join wait is busy. Blocked is a send to a full exec channel or executor stream. |
+| `executor.exec` | loop | The exec thread. Blocked is a send to a full commit channel, and the wait for a free commit slot. |
+| `executor.commit` | loop | The commit thread. Busy is the publish on `tx_receipts`. Blocked is the pause between two must-deliver attempts. |
+| `state.writer` | loop | The state writer thread. Idle is the wait for a block delta. Busy is the commit. |
+| `executor.tx_data` | queue | The `tx_data` backlog of the lane that read last. `kardamom_executor_tx_data_queue_depth{shard}` has each lane. |
+| `executor.join_buffer` | queue | The envelopes in the join buffer. The `tx_ordering` reader sets it after each join. |
+| `executor.exec_stream` | queue | The items from the reader that wait for the executor stream publisher. It holds 4096 items at most. |
+| `executor.reader_to_exec` | queue | The messages from the reader that wait for the exec thread. The receipt queue depth bounds it. |
+| `executor.exec_to_commit` | queue | The messages from the exec thread that wait for the commit thread. The receipt queue depth bounds it. |
+| `executor.commits_inflight` | queue | The blocks that the state writer did not commit yet. At the full commit pipeline depth, the exec thread waits. |
+| `executor.join_wait` | step | A join that did not find its envelope at the first lookup: the time to the end of the join. A join that finds it at once records nothing. |
+| `executor.archive_refetch` | step | One archive refetch of a join miss. |
+| `executor.boundary` | step | The handling of one block boundary on the exec thread. |
+| `executor.receipt_publish` | step | One publish of a receipt batch on `tx_receipts`, with its retries. |
+| `state.commit` | step | One block commit of the state writer, from the open of the transaction to the end of the mdbx commit. |
+| `state.commit_open`, `state.commit_storage`, `state.commit_accounts`, `state.commit_receipts`, `state.commit_trie`, `state.commit_mdbx` | step | The sections of one block commit. `state.commit_trie` records only when the writer keeps a trie. `KARDAMOM_WRITER_TIMING` still prints the same sections. |
+| `executor.block_txs` | batch | The records in one sealed block. |
+| `executor.receipt_batch` | batch | The receipts in one publish on `tx_receipts`. |
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_executor_join_misses_total` | Joins whose first in-band wait ended without the envelope. The `tx_data` lane fell behind by a whole wait slice. |
+| `kardamom_executor_archive_refetch_total{outcome}` | Archive refetches of a join. The outcomes are `ok`, `absent` (the archive does not hold the range) and `error`. |
+| `kardamom_executor_archive_refetch_recovered_total` | Envelopes that archive refetches put into the join buffer. |
+| `kardamom_executor_void_votes_total` | Entries that every archive refused. For each one, the executor asks the sealer for a void. |
+| `kardamom_executor_gas_used_total` | The gas of each sealed block. Its rate is the gas per second. |
+| `kardamom_executor_receipt_publish_retries_total` | Failed must-deliver attempts on `tx_receipts`. Each one pauses the commit thread. |
+| `kardamom_executor_bal_handoff_dropped_total` | Blocks whose BAL the exec thread dropped, because the queue to the BAL publisher was full. |
+| `kardamom_executor_state_commit_duration_seconds` | The wait of the exec thread for a free commit slot when the commit pipeline is full. It is not the commit time: `state.commit` is the commit time. |
+
+### Executor pipeline
+
+The executor records the pipeline metrics on each thread from the `tx_data` lanes to the receipts.
+
+| Kind | Name | Meaning |
+| --- | --- | --- |
+| loop | `executor.tx_data_reader` | The `tx_data` reader threads. Idle while the lane is empty. Every lane adds to this one series. |
+| loop | `executor.ordering_reader` | The `tx_ordering` reader. A join wait is busy. A send to a full exec channel or a full executor stream is blocked. A void park is idle. |
+| loop | `executor.exec` | The exec thread. A send to a full commit channel, and the wait for a free commit slot, are blocked. |
+| loop | `executor.commit` | The commit thread. The pause between two must-deliver attempts on `tx_receipts` is blocked. |
+| queue | `executor.tx_data` | The backlog of the `tx_data` lane that read last. The per-lane backlog is `kardamom_executor_tx_data_queue_depth{shard}`. |
+| queue | `executor.join_buffer` | The envelopes in the join buffer. |
+| queue | `executor.reader_to_exec` | The messages from the reader that wait for the exec thread. |
+| queue | `executor.commits_inflight` | The blocks that the state writer did not commit yet. The exec thread waits at the pipeline depth. |
+| queue | `executor.exec_to_commit` | The messages that wait for the commit thread. |
+| queue | `executor.exec_stream` | The items that wait for the executor stream publisher. |
+| step | `executor.join_wait` | A join that did not find its envelope at the first lookup. A join that finds it at once records nothing. |
+| step | `executor.archive_refetch` | One archive refetch of a join miss. |
+| step | `executor.boundary` | One block boundary: the settle, the seal and the start of the next block. |
+| step | `executor.receipt_publish` | The publish of one receipt batch, with its retries. |
+| batch | `executor.block_txs` | The records in each sealed block. |
+| batch | `executor.receipt_batch` | The receipts in each published batch. |
+
+| Counter | Meaning |
+| --- | --- |
+| `kardamom_executor_join_misses_total` | Joins whose first in-band wait ended without the envelope. The `tx_data` lane is a whole wait slice behind. |
+| `kardamom_executor_archive_refetch_total{outcome}` | Archive refetches: `ok`, `absent` (the archive does not hold the range) or `error`. |
+| `kardamom_executor_archive_refetch_recovered_total` | Envelopes that refetches put into the join buffer. |
+| `kardamom_executor_void_votes_total` | Entries that every archive refused. The executor asked the sealer for a void. |
+| `kardamom_executor_gas_used_total` | The gas of every sealed block. Its rate is the gas per second. |
+| `kardamom_executor_receipt_publish_retries_total` | Failed must-deliver attempts on `tx_receipts`. |
+| `kardamom_executor_bal_handoff_dropped_total` | Blocks whose BAL the exec thread dropped, because the BAL publisher queue was full. |
+
+- `kardamom_executor_state_commit_duration_seconds` is the wait of the exec thread for a free commit slot. It is not the commit. The `state.commit` step is the commit.
+
+### State writer
+
+The state writer thread records the loop `state.writer`. The thread has no output queue, so it is never blocked.
+Each block commit records these steps:
+
+| Step | Section |
+| --- | --- |
+| `state.commit` | The whole commit, from the start of the MDBX transaction to the end of its commit. |
+| `state.commit_open` | The open of the tables. |
+| `state.commit_storage` | The storage slots. |
+| `state.commit_accounts` | The accounts. |
+| `state.commit_receipts` | The receipts. |
+| `state.commit_trie` | The trie update. Only a writer with a trie records it. |
+| `state.commit_mdbx` | The MDBX commit, with the sync of the durability mode. |
+
 ### L1 follower (inbox indexer)
 
 | Metric | Meaning |
@@ -613,6 +702,12 @@ Each process has one Aeron thread. It carries the publishes and the subscription
   and `state_error` when the query fails.
 - A client that is over its rate limit gets `shed`, and the ingress answers `null` without a query.
 - The receipt cache keeps the newest 131072 receipts and evicts the oldest first.
+- `kardamom_cache_reconnects_total` counts the Redis reconnects that a failed command started. One failure burst starts one reconnect.
+- `kardamom_cache_live_evictions_total` counts the entries that the local account layer removed, for the TTL or for the capacity. A high rate means that the layer is too small for the active accounts.
+- `kardamom_cache_reconnects_total` counts the reconnects that a failed Redis command starts. One failure burst starts one reconnect.
+  The readers skip the cache while the reconnect runs.
+- `kardamom_cache_live_evictions_total` counts the entries that the `live` layer removes, for the TTL or the capacity.
+  A high rate with many `live` misses means that the layer is too small for the active accounts.
 
 ### Transaction canary
 
@@ -661,6 +756,17 @@ See [tx-status-events.md](tx-status-events.md) for the feed and the webhooks.
 
 The state mirror exports `kardamom_state_mirror_serving`, `_batches_applied_total`, `_producer_disagreement_total`,
 `_head_tx_idx`, `_rebuilds_total`, `_rebuild_seconds`, `_write_retries_total`, and `_wait_replica_zero_total`.
+
+The mirror writes the waiting receipt batches as a group. It records these [pipeline metrics](#pipeline-metrics), once per group:
+
+| Name | Kind | Meaning |
+| --- | --- | --- |
+| `state_mirror.group` | step | One whole group: the write with its retries, the head and the replica wait. |
+| `state_mirror.write` | step | The write of one group: a `SCRIPT LOAD`, then one pipeline with the rows and the receipts of every batch. |
+| `state_mirror.head_set` | step | The publish of the head. |
+| `state_mirror.wait_replica` | step | The Redis `WAIT` for a replica. |
+| `state_mirror.group_batches` | batch | The receipt batches in one group. |
+| `state_mirror.group_receipts` | batch | The receipts in one group. |
 
 ### Validator replica checks
 
