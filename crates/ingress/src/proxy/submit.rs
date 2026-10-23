@@ -28,6 +28,7 @@ use kardamom_cache::metrics as cache_metrics;
 use kardamom_types::{Receipt, TxEnvelope};
 
 use crate::channels::{IngressPublication, IngressSubscription};
+use crate::config::AckMode;
 use crate::error::IngressError;
 use crate::metrics::count_reject;
 use crate::pending::ReceiptResponse;
@@ -117,10 +118,11 @@ where
     }
 
     /// The submit of `eth_sendRawTransaction` and of the binary protocol:
-    /// the transaction hash. With the ack at admission on, the answer comes
-    /// when the sequencer takes the transaction into its mempool, as on
-    /// Ethereum ([`crate::acks`]). Off, it comes with the receipt
-    /// ([`Self::submit_raw`]).
+    /// the transaction hash. The ack mode decides when it answers: with the
+    /// receipt ([`Self::submit_raw`]), when the sequencer takes the
+    /// transaction into its mempool, as on Ethereum ([`crate::acks`]), or
+    /// when this ingress validated and published it
+    /// ([`Self::submit_validated`]).
     ///
     /// # Errors
     ///
@@ -131,12 +133,23 @@ where
         client_ip: IpAddr,
         raw_tx: AlloyBytes,
     ) -> Result<B256, IngressError> {
-        if self.cfg.admission_ack.is_none() {
-            return self
+        match self.cfg.ack {
+            AckMode::Receipt => self
                 .submit_raw(client_ip, raw_tx)
                 .await
-                .map(|resp| resp.receipt.tx_hash);
+                .map(|resp| resp.receipt.tx_hash),
+            AckMode::Admission(_) => self.submit_admitted(client_ip, raw_tx).await,
+            AckMode::Validated => self.submit_validated(client_ip, raw_tx).await,
         }
+    }
+
+    /// The ack at admission: publish, then wait for the verdict of the
+    /// sequencer.
+    async fn submit_admitted(
+        &self,
+        client_ip: IpAddr,
+        raw_tx: AlloyBytes,
+    ) -> Result<B256, IngressError> {
         let _timing = Timing::start(&self.steps.submit);
         let v = self.validate_submission(client_ip, &raw_tx).await?;
         let wait = self
@@ -161,7 +174,9 @@ where
     /// separately, through `kardamom_subscribeReceipts` or by polling
     /// `eth_getTransactionReceipt`. On this path, "accepted" in the
     /// metrics means published, not receipted. The
-    /// `received == accepted + rejected` invariant still holds.
+    /// `received == accepted + rejected` invariant still holds. With the
+    /// validated ack, this call is [`Self::submit_validated`], the same as
+    /// `eth_sendRawTransaction`.
     ///
     /// # Errors
     ///
@@ -172,6 +187,9 @@ where
         client_ip: IpAddr,
         raw_tx: AlloyBytes,
     ) -> Result<B256, IngressError> {
+        if self.cfg.ack == AckMode::Validated {
+            return self.submit_validated(client_ip, raw_tx).await;
+        }
         let _timing = Timing::start(&self.steps.submit);
         let v = self.validate_submission(client_ip, &raw_tx).await?;
         if let Some(answer) = v.answer_from_cache() {
@@ -215,6 +233,17 @@ where
         raw_tx: &AlloyBytes,
     ) -> Result<ValidatedSubmission, IngressError> {
         let _timing = Timing::start(&self.steps.validate);
+        self.check_intake(client_ip, raw_tx)?;
+        self.recover_submission(raw_tx).await
+    }
+
+    /// The checks before the decode: the overload valve, the drain, the
+    /// pause, the rate limit, and the size cap. Each refusal is counted.
+    pub(super) fn check_intake(
+        &self,
+        client_ip: IpAddr,
+        raw_tx: &AlloyBytes,
+    ) -> Result<(), IngressError> {
         metrics::counter!(crate::metrics::TX_RECEIVED_TOTAL).increment(1);
 
         // Overload valve. When the pending registry reaches this depth,
@@ -252,8 +281,15 @@ where
 
         // The size cap runs before the decode: an oversized transaction
         // costs no decode and no recovery.
-        self.cfg.check_tx_size(raw_tx)?;
+        self.cfg.check_tx_size(raw_tx)
+    }
 
+    /// The decode, the protocol limits, the sender recovery, and the
+    /// receipt-cache lookup.
+    pub(super) async fn recover_submission(
+        &self,
+        raw_tx: &AlloyBytes,
+    ) -> Result<ValidatedSubmission, IngressError> {
         let env = ConsensusEnvelope::decode(&mut raw_tx.as_ref()).map_err(|e| {
             count_reject("decode-error");
             IngressError::Decode(e.to_string())
@@ -384,13 +420,25 @@ where
             .max(self.cluster_status().sealed_head)
     }
 
+    /// [`Self::offer`], with a failure counted as `partition-unavailable`.
+    async fn publish_validated(
+        &self,
+        v: &ValidatedSubmission,
+        raw_tx: AlloyBytes,
+    ) -> Result<(), IngressError> {
+        self.offer(v, raw_tx).await.inspect_err(|_| {
+            count_reject("partition-unavailable");
+        })
+    }
+
     /// Publishes a validated envelope onto `tx_data[shard]`. The shard comes
     /// from the sender-address hash, `partition_for(sender, K)`, so every
     /// tx from a given sender lands on the same shard's A stream. This
     /// lets the P sequencers per shard nonce-order them consistently. The
     /// envelope carries the canonical `tx_hash`, so downstream consumers
-    /// can dedup and re-emit it without recomputing it.
-    async fn publish_validated(
+    /// can dedup and re-emit it without recomputing it. A failure is not
+    /// counted here: each caller counts its own refusal.
+    pub(super) async fn offer(
         &self,
         v: &ValidatedSubmission,
         raw_tx: AlloyBytes,
@@ -412,9 +460,7 @@ where
             )
             .await;
         self.steps.publish_round_trip.since(started);
-        published.inspect_err(|_| {
-            count_reject("partition-unavailable");
-        })
+        published
     }
 }
 
@@ -487,7 +533,7 @@ impl ValidatedSubmission {
 
     /// Count a refusal of this submission by `reason`, log it at debug
     /// level with the sender and the nonce, and return `err`.
-    fn refuse(&self, reason: &'static str, err: IngressError) -> IngressError {
+    pub(super) fn refuse(&self, reason: &'static str, err: IngressError) -> IngressError {
         count_reject(reason);
         tracing::debug!(
             sender = %self.sender,

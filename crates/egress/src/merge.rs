@@ -10,10 +10,21 @@
 //! last delivered frame: that copy sent it right after the last delivered
 //! frame, with the next sequence. So a gap in one copy never reorders the
 //! stream: the frame of that copy after the gap names no frame before it,
-//! and the copy of another executor fills the gap. The first frame of a copy
-//! after its start names no frame before it either, so it chains only at
-//! the start of the stream. Later frames of that copy chain again once the
-//! copy reaches the delivered head.
+//! and the copy of another executor fills the gap. Later frames of that copy
+//! chain again once the copy reaches the delivered head.
+//!
+//! The first frame of a copy names no frame before it. It goes out alone
+//! only where its place is certain:
+//! - the boundary of the next block that closes at the next index: no
+//!   record of that block is missing;
+//! - at the start of the chain, the first frame of an executor that starts
+//!   there (its sequence is 0).
+//!
+//! A record is never certain alone: the boundary of an empty block can come
+//! before it. So after a restart of the egress the copies chain only from a
+//! frame that another source delivers: the frames of a peer egress, in
+//! order ([`Merge::take_ordered`]), or a new start after a boundary
+//! ([`Merge::rebase`]). [`Merge::joined`] says when a copy chained.
 //!
 //! A frame whose key the merge delivered is a copy. The merge compares its
 //! bytes with the first copy while it keeps the digest of that key, and
@@ -76,6 +87,32 @@ impl Head {
         }
     }
 
+    /// Whether `frame` takes the next place with no frame of its copy
+    /// before it: the boundary of the next block that closes at the next
+    /// index, or at the start of the chain the first frame (`seq` 0) of an
+    /// executor that starts there.
+    fn fits(&self, key: Key, frame: &[u8], seq: u64) -> bool {
+        let closes_here =
+            key == Key::Boundary(self.next_block) && boundary_end(frame) == Some(self.next_index);
+        let starts_here = self.last.is_none() && seq == 0 && key == Key::Record(self.next_index);
+        closes_here || starts_here
+    }
+
+    /// The head after the boundary `frame`: the next block, the next index
+    /// at its end, and the boundary as the last frame. `None` for a frame
+    /// that is no boundary.
+    #[must_use]
+    pub fn after_boundary(frame: &[u8]) -> Option<Self> {
+        let Some(Key::Boundary(block)) = Key::of(frame) else {
+            return None;
+        };
+        Some(Self {
+            next_index: boundary_end(frame)?,
+            next_block: block.checked_add(1)?,
+            last: Some(Key::Boundary(block)),
+        })
+    }
+
     /// Move the head past `frame`. A record moves the next index by its
     /// slots: an epoch takes its marker and one slot for each deposit, so
     /// the next record is that many indexes on.
@@ -114,6 +151,11 @@ pub struct Merge {
     waiting: HashMap<Key, (Key, Vec<u8>)>,
     /// The digests of the newest delivered keys.
     digests: Digests,
+    /// The next index after the newest record that any copy sent.
+    seen: u64,
+    /// Whether a frame of a copy went out since the start: the merge
+    /// follows the copies.
+    joined: bool,
 }
 
 impl Merge {
@@ -125,13 +167,54 @@ impl Merge {
             copies: HashMap::new(),
             waiting: HashMap::new(),
             digests: Digests::new(cfg.compared),
+            seen: 0,
+            joined: false,
         }
+    }
+
+    /// Whether a frame of a copy went out since the start or the last
+    /// rebase.
+    #[must_use]
+    pub fn joined(&self) -> bool {
+        self.joined
+    }
+
+    /// Start the stream again at `head`, after a boundary: the frames
+    /// that wait are of the old head, and go.
+    pub fn rebase(&mut self, head: Head) {
+        self.head = head;
+        self.waiting.clear();
+    }
+
+    /// Take one frame of a peer egress, which serves the stream in order
+    /// from this head. A frame that the stream passed is a copy. Each other
+    /// frame is the next one: it goes out, and then each frame of a copy
+    /// that waits behind it.
+    pub fn take_ordered(&mut self, frame: &[u8], out: &mut Vec<Vec<u8>>) {
+        let Some(key) = Key::of(frame) else {
+            return;
+        };
+        if self.head.passed(key) {
+            self.compare(0, key, frame);
+            return;
+        }
+        self.deliver(key, frame.to_vec(), out);
+        while self.release_next(out) {}
     }
 
     /// Where the merged stream stands.
     #[must_use]
     pub fn head(&self) -> Head {
         self.head
+    }
+
+    /// The next index after the newest record that any copy sent. The
+    /// executors read the sealed stream, so this is the nearest view of the
+    /// sealed head that the egress has. It is 0 until a copy sends a
+    /// record.
+    #[must_use]
+    pub fn seen(&self) -> u64 {
+        self.seen
     }
 
     /// Take one message `[seq:u64][frame]` of the copy `session`. The frames
@@ -145,6 +228,7 @@ impl Merge {
         let Some(key) = Key::of(frame) else {
             return;
         };
+        self.see(key, frame);
         let before = self
             .copies
             .insert(session, (seq, key))
@@ -154,18 +238,30 @@ impl Merge {
             self.compare(session, key, frame);
             return;
         }
-        let frame = frame.to_vec();
-        if before == self.head.last {
-            self.deliver_chain(key, frame, out);
+        let chains = before.is_some() && before == self.head.last;
+        if chains || self.head.fits(key, frame, seq) {
+            self.deliver_chain(key, frame.to_vec(), out);
             return;
         }
+        let frame = frame.to_vec();
         if let Some(before) = before.filter(|b| !self.head.passed(*b)) {
             self.wait(before, key, frame);
         }
     }
 
-    /// Deliver `frame`, then every waiting frame that chains behind it.
+    /// Move the newest index that a copy sent past the record `frame`.
+    fn see(&mut self, key: Key, frame: &[u8]) {
+        let Key::Record(index) = key else {
+            return;
+        };
+        let next = index.checked_add(slots(frame));
+        self.seen = next.map_or(self.seen, |next| next.max(self.seen));
+    }
+
+    /// Deliver `frame` of a copy, then every waiting frame that chains
+    /// behind it.
     fn deliver_chain(&mut self, key: Key, frame: Vec<u8>, out: &mut Vec<Vec<u8>>) {
+        self.joined = true;
         self.deliver(key, frame, out);
         while self.release_next(out) {}
     }
@@ -198,6 +294,7 @@ impl Merge {
         if self.head.passed(key) {
             return true;
         }
+        self.joined = true;
         self.deliver(key, frame, out);
         true
     }
@@ -283,6 +380,13 @@ fn slots(frame: &[u8]) -> u64 {
         }) => remote_epoch_slots(&r),
         _ => 1,
     }
+}
+
+/// The end index of a boundary frame:
+/// `[kind:u8][block:u64][end_tx_idx:u64]...`.
+fn boundary_end(frame: &[u8]) -> Option<u64> {
+    let end = frame.get(9..17)?.first_chunk::<8>()?;
+    Some(u64::from_le_bytes(*end))
 }
 
 fn digest(frame: &[u8]) -> u64 {

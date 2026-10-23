@@ -140,6 +140,12 @@ ports:
   # The transaction canary's Prometheus exporter, on the monitoring node
   # (nomad/canary.nomad.hcl).
   canary_metrics: 9012
+  # The egress (nomad/egress.nomad.hcl), on the executor nodes: the range
+  # read, /health and eth_getTransactionReceipt on egress_http, and its
+  # Prometheus exporter on egress_metrics. The readers reach egress_http
+  # through the Consul service kardamom-egress.
+  egress_http: 8548
+  egress_metrics: 9013
   anvil_l1: 8546              # in-cluster L1 (anvil) for the smoke test
   l1_fault_proxy: 8547        # the lying L1 proxy of the chaos-l1 shard, in front of anvil
   # Base UDP port for kardamom data/ordering channels; per-channel offsets
@@ -156,6 +162,7 @@ paths:
   mirror_dir: /opt/kardamom/mirror         # state mirror head file + rebuild scratch
   notifier_dir: /opt/kardamom/notifier     # webhook subscriptions, outboxes and cursors
   canary_dir: /opt/kardamom/canary         # the canary's nonce journal and contract addresses
+  egress_dir: /opt/kardamom/egress         # the egress store: the canonical frames and the receipts
   batcher_dir: /opt/kardamom/batcher       # live batcher cursor file + DA blob store
   da_watcher_dir: /opt/kardamom/da-watcher # the da-watcher's L1 cursor file
   l1_indexer_dir: /opt/kardamom/l1-indexer # inbox archive: batches, payloads, epochs, cursor

@@ -29,6 +29,17 @@ variable "ack_policy" {
   default     = "on-offer"
 }
 
+variable "ack" {
+  type        = string
+  description = "When eth_sendRawTransaction answers. receipt (the default) waits for the receipt. validated answers when the ingress validated the transaction and published it on tx_data. Override with: nomad job run -var ack=validated ingress.nomad.hcl."
+  default     = "receipt"
+
+  validation {
+    condition     = contains(["receipt", "validated"], var.ack)
+    error_message = "The ack value must be receipt or validated."
+  }
+}
+
 # Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests), so the task runs exactly the bytes
@@ -41,6 +52,17 @@ variable "executor_count" {
   type        = number
   description = "The executor node count (node_classes.executor.count). The account RPCs' executor queries go to executor-<i>.node.<datacenter>.consul."
   default     = 3
+}
+
+# The endpoints of eth_getTransactionReceipt on a cache miss
+# (--receipt-query-endpoints): the egress,
+# http://kardamom-egress.service.<datacenter>.consul:8548. Empty, the
+# ingress asks the executor query endpoints. Ansible deployment sets it
+# from KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS.
+variable "receipt_query_endpoints" {
+  type        = string
+  description = "The receipt query endpoints, comma separated (--receipt-query-endpoints). Empty asks the executors."
+  default     = ""
 }
 
 variable "image_ref" {
@@ -236,7 +258,7 @@ job "ingress" {
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
         ]
-        args = [
+        args = concat([
           "--config", "/local/ingress.toml",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
@@ -259,6 +281,7 @@ job "ingress" {
           # docs/agents/resilient-ingress-spec.md D3.
           "--ingress-id", "${NOMAD_ALLOC_INDEX}",
           "--ack-policy", "${var.ack_policy}",
+          "--ack", "${var.ack}",
           # The interim 100-connection failover shed is retired. That
           # earlier bug is now fixed twice over: the sequencer
           # republishes unconfirmed offers until a receipt proves
@@ -287,7 +310,9 @@ job "ingress" {
           # when the local account layer misses. Never on the submit
           # path. Same list as the sequencer's nonce lookup.
           "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:9024"]),
-        ]
+          ],
+          var.receipt_query_endpoints == "" ? [] : ["--receipt-query-endpoints", var.receipt_query_endpoints],
+        )
       }
 
       env {

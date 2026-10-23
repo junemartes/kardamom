@@ -406,6 +406,10 @@ The kill-based cases prove the restart logic. They do not prove durability again
 - At level 0, the kernel writes the log back on its own schedule. With the Linux defaults (`vm.dirty_expire_centisecs=3000`, `vm.dirty_writeback_centisecs=500`), a page reaches the disk within about 35 s.
 - So an entry that a quorum acknowledged can exist only in the page caches of its members for that time. A power loss or a kernel crash on a majority of members in that time drops it. Each member runs on its own machine, so one power loss takes at most one member. `pipeline-blackout-recover` stands for that event.
 - Only a test that cuts the power of a VM can prove this end to end.
+- On staging the three sealers are in different data centers (decision of the user, 2026-10-22). So one power event cannot take a majority, and the window above needs power losses in two data centers.
+- The backup sealer (`cluster-backup`, node `backup-0`) is the recovery path for that event. It is outside the quorum and copies each snapshot and the log after it from a follower. It syncs its own copy at level 1 (`kardamom.backup.fileSyncLevel`): its syncs do not delay a commit. See the sealer README, "Backup mode".
+- Level 0 is safe only while no two members share a power domain. A member that moves into the data center of another member needs level 1 again, or a backup in a third power domain.
+- An executor that applied an entry that such a loss drops stops with `ClusterBehindCursor`, and an operator repairs it. The automatic rollback (#655) runs only with the carry flag (`--carry-bytes`).
 
 ## Executor
 
@@ -463,6 +467,12 @@ The executors are deterministic state machines. One dead or lagging replica neve
 - **Replay-window overrun**
   - Trigger: the cluster keeps a bounded canonical window (`kardamom.cluster.retention`, default 65,536 frames, about 5 minutes at 200 tps). A `REPLAY_FROM` below the floor of the window is refused with `REPLAY_UNAVAILABLE`. The window is a minimum. A frame past it stays until L1 holds its block (see "DA-lag guard and posted-head retention floor"). The retained frames are in the cluster snapshot, so a member that restores from a snapshot keeps the floor at the posted head. A cursor that is older than the window is the trigger.
   - Effect: the refusal is terminal for the local state. A cursor below the floor can never catch up. A fresh or wiped node cannot re-sync from genesis either, because genesis aged out of the window.
+  - Recovery with `--carry-bytes` and `--egress`: the executor reads the egress first.
+    - The member refuses the cursor. The reader then reads the range read of the egress from the cursor to the head of the store, then the live `egress_order`. It goes back to the member feed when the feed serves the cursor again.
+    - The run does not end, and no checkpoint moves.
+    - A cursor below the floor of the egress store too (`410`) ends the run with the refusal. The executor then repairs itself with peer state, as below, at or above the lower floor.
+    - While the egress does not answer, the executor fetches no peer checkpoint. It tries the feed and the egress again.
+    - Proof: the unit tests `a_cursor_below_the_window_recovers_from_the_egress` and `a_cursor_below_the_floor_of_the_egress_goes_to_a_peer_checkpoint`.
   - Recovery: the executor repairs itself with peer state.
     - Each replica serves its newest checkpoint over `--checkpoint-serve-addr` (`:9014`).
     - A node that hits the refusal, or cold-starts with no checkpoint, fetches the newest qualifying peer checkpoint (`--checkpoint-peers`).
@@ -558,6 +568,14 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
   - The local account layer gets no rows, so `--verdicts` needs `--admission-checks false`. The v2 filter checks each sender.
   - Deploy order: the sequencers with `[admission] verdicts` first, then the ingress with `--verdicts`. An ingress with `--verdicts` before its sequencers send verdicts answers every call `transaction not acknowledged`.
   - Proof: `crates/log/tests/discovered_tx_verdicts.rs` (each ingress receives only its own verdicts), `v2::tests::each_transaction_gets_one_verdict_at_admission`, `crates/ingress/src/acks/tests.rs`, `end_to_end_test::the_ack_at_admission_answers_on_the_verdict_of_the_sequencer`, and the chain-semantics suite with `KARDAMOM_E2E_ADMISSION=1 KARDAMOM_E2E_VERDICTS=1`.
+- **The validated ack (`--ack validated`)**
+  - `eth_sendRawTransaction` answers when the ingress validated the transaction and published it on `tx_data`. The sequencer sends nothing back. No waiter stays after the answer: no pending receipt and no verdict. `kardamom_sendRawTransactionAsync` answers the same way.
+  - A failed offer (back pressure, no connected subscriber within the offer deadline) answers `txpool is full`. The client sends again. The counter is `kardamom_ingress_tx_rejected_total{reason="txpool-full"}`.
+  - The nonce check reads the local account layer, then Redis. A row only moves forward, so the view can lag the chain but never lead it: a `nonce too low` answer is always true. A stale view only misses some rejections, and the sequencer drops those. A sender with no row admits. The check asks no executor, so no call waits for a query. The counter is `kardamom_ingress_tx_rejected_total{reason="nonce-too-low"}`.
+  - The ingress checks no balance. The sequencer drops an unfunded transaction after the answer.
+  - The duplicate cache holds the newest `--duplicate-cache-entries` hashes (default 65,536), with the recovered sender. A copy of a held hash answers its hash with no recovery and no publication. Only a published hash enters the cache. A hash that the sequencer dropped stays in the cache until it is evicted, so a copy of it in that time does not publish again. A cache miss costs one more recovery and publication, and the window of the sealer drops the second copy.
+  - An accepted transaction can still drop later. The client reads the result through the egress: the receipt read or the status feed.
+  - Proof: `crates/ingress/src/proxy/validated_tests.rs`.
 - **The ingress inside a sequencer process (the job variable `ingress`)**
   - The ingress and the sequencer of a lane share one process, so they die together. Only the in-flight clients of that process pay. They retry against another process. The twin keeps the lane.
   - At a stop, the ingress drains first, while the sequencer loops still run, so a parked submit still gets its verdict. Then the loops stop. The kill timeout of the job (`tx_ttl_ms` plus 10 s) covers the drain.
