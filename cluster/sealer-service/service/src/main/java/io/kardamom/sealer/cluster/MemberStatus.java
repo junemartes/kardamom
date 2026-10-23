@@ -145,6 +145,11 @@ final class MemberStatus {
             + diskFree("NaN") + "\n";
     }
 
+    /** The admin endpoint's answer to this sample, ready within {@code lagBytes} of the commit position. */
+    AdminServer.Report report(final long lagBytes) {
+        return new AdminServer.Report(isReady(lagBytes), toJson(lagBytes), toMetrics());
+    }
+
     /** The free bytes as text, or {@code unknown} when the disk cannot be read. */
     private String diskFree(final String unknown) {
         return diskFreeBytes.isPresent() ? Long.toString(diskFreeBytes.getAsLong()) : unknown;

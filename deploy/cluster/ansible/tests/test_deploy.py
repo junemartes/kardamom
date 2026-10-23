@@ -393,7 +393,8 @@ class Deploys(unittest.TestCase):
         self.git('commit', '-q', '--allow-empty', '-m', message)
         return self.git('rev-parse', 'HEAD')
 
-    def run_deploy(self, extra=None, check=False, success=True, playbook="deploy.yml", environ=None):
+    def run_deploy(self, extra=None, check=False, success=True, playbook="deploy.yml", environ=None,
+                   inventory='localhost,'):
         variables = {
             'workloads_nomad_addr': f'http://127.0.0.1:{self.api.server_port}',
             'workloads_manifest': str(self.manifest),
@@ -423,7 +424,7 @@ class Deploys(unittest.TestCase):
         env.pop('AERON_STALL_TOLERANCE_MS', None)
         env.pop('KARDAMOM_IDLE_CAP_US', None)
         env.update(environ or {})
-        cmd = ['ansible-playbook', '-i', 'localhost,', str(ANSIBLE / playbook),
+        cmd = ['ansible-playbook', '-i', inventory, str(ANSIBLE / playbook),
                '-e', json.dumps(variables)] + (['--check'] if check else [])
         result = subprocess.run(cmd, cwd=ANSIBLE.parent, env=env, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
@@ -637,6 +638,24 @@ class DeployTest(Deploys):
         Path(str(self.manifest) + '.sigbundle').write_text('invalid bundle')
         self.run_deploy({'workloads_require_signed': True, 'workloads_cosign_binary': '/usr/bin/false'}, success=False)
         self.assertEqual(self.api.state['writes'], [])
+
+    def test_the_backup_sealer_runs_only_with_a_backup_node(self):
+        # Without a node of role backup, the deploy registers no backup job.
+        self.deploy()
+        self.assertNotIn('cluster-backup', self.api.state['plans'])
+        # With one, it registers the job on the sealer image, as a backup.
+        inventory = Path(self.tmp.name) / 'backup-hosts.ini'
+        inventory.write_text('localhost ansible_connection=local\n[backup]\nbackup-0 ansible_connection=local\n')
+        self.run_deploy({'workloads_backup_file_sync_level': '1'}, inventory=str(inventory))
+        plans = self.api.state['plans']
+        self.assertIn('cluster-backup', plans)
+        task = plans['cluster-backup']['TaskGroups'][0]['Tasks'][0]
+        self.assertEqual(task['Config']['image'], plans['cluster']['TaskGroups'][0]['Tasks'][0]['Config']['image'])
+        options = task['Env']['JAVA_TOOL_OPTIONS'].split()
+        self.assertIn('-Dkardamom.cluster.backup=true', options)
+        self.assertIn('-Dkardamom.backup.fileSyncLevel=1', options)
+        self.assertIn('-Dkardamom.backup.sourceType=FOLLOWER', options)
+        self.assertEqual(plans['cluster-backup']['Constraints'][0]['RTarget'], 'backup')
 
     def test_optional_light_client_and_cluster_overrides(self):
         self.run_deploy({
@@ -884,6 +903,18 @@ class DeployTest(Deploys):
             template = self.genesis_template(plans[name]).encode()
             self.assertEqual(hashlib.sha256(template).hexdigest(), STAGING_GENESIS_SHA256, name)
 
+    def test_the_driver_threading_modes_default_shared_and_reach_the_drivers(self):
+        for mode in ('', 'DEDICATED'):
+            with self.subTest(mode=mode):
+                self.run_deploy({'workloads_aeron_threading_mode': mode,
+                                 'workloads_cluster_driver_threading_mode': mode}, check=True)
+                plans = self.api.state['plans']
+                expected = mode or 'SHARED'
+                aeron = plans['aeron']['TaskGroups'][0]['Tasks'][0]['Env']
+                self.assertEqual(aeron['AERON_THREADING_MODE'], expected)
+                cluster = plans['cluster']['TaskGroups'][0]['Tasks'][0]['Env']['JAVA_TOOL_OPTIONS'].split()
+                self.assertIn(f'-Dkardamom.cluster.driverThreadingMode={expected}', cluster)
+
     def test_the_exec_cursor_switch_defaults_off_and_reaches_the_executor(self):
         for switch, expected in (('', 'false'), ('on', 'true')):
             with self.subTest(switch=switch):
@@ -955,6 +986,13 @@ class DeployTest(Deploys):
         cluster_options = dict(parties)['cluster']['Env']['JAVA_TOOL_OPTIONS'].split()
         self.assertIn(f'-Daeron.archive.message.timeout={tolerance}ms', cluster_options)
         self.assertIn(f'-Daeron.archive.connect.timeout={tolerance // 2}ms', cluster_options)
+        # Each Aeron agent of a sealer counts its work cycles above 5 ms.
+        self.assertIn('-Daeron.driver.sender.cycle.threshold=5ms', cluster_options)
+        self.assertIn('-Daeron.cluster.service.cycle.threshold=5ms', cluster_options)
+        # Each GC pause and safepoint goes to a rotated file with a UTC time
+        # stamp, written asynchronously.
+        self.assertIn('-Xlog:async', cluster_options)
+        self.assertIn('-Xlog:gc,safepoint:file=/opt/kardamom/cluster/jvm-pauses.log:utctime:filecount=5,filesize=20m', cluster_options)
         # A restarted driver waits out the active-driver window of its
         # dead predecessor: Nomad's 15 s default at the 10 s tolerance.
         delay_ns = plans['aeron']['TaskGroups'][0]['RestartPolicy']['Delay']
