@@ -1,20 +1,23 @@
-# Carry storage by an upgrade transaction
+# Carry activation: the exact window and the member feed on the heap
 
-- Status: revision 1, draft for review.
+- Status: revision 2, draft for review.
 - Issue: #771 (the carried path is not complete on staging). This spec closes gap 3 (the
-  cut-over of a live chain) and gap 1 (the executors read the member feed).
+  switch of a live chain) and gap 1 (the executors read the member feed).
 - The user decided on 2026-10-23:
-  - A live chain switches to carry storage by an upgrade transaction: a new feature activation.
-    There is no new chain and no stop-all cut-over.
+  - A live chain switches by an upgrade transaction: a new feature activation. There is no new
+    chain and no stop of all members.
   - Topology A: each executor runs on the node of its paired sealer member, and reads the feed
     of that member on `aeron:ipc`.
   - The upgrade policy holds (#661): a breaking change ships behind a feature flag, and every
     deploy is backward compatible.
-- Builds on (assumed merged first): #779 (snapshot version 17), #781 (the deploy switch
-  `KARDAMOM_CARRY_BYTES` and the pinned executor groups), the preflight of #780, and #765 (the
-  exact window under version 5).
-- Related specs: `docs/specs/2026-10-10-raft-carried-transactions.md` (the carry spec),
-  `docs/specs/2026-10-21-one-way-pipeline.md` (the one-way spec, decision D11).
+- The coordinator decided on 2026-10-24, after the design review of revision 1: the member feed
+  and the exact window run on the heap, not in the retained file. This follows D11 of
+  `docs/specs/2026-10-21-one-way-pipeline.md:44` and `:59-61`. Section 15 keeps the file as a
+  later spec, with a measured trigger.
+- Builds on (assumed merged first): #779 (snapshot version 17, the file layout), #781 (the shared
+  driver on the sealer nodes and the pinned executor groups), the preflight of #780, and #765
+  (the exact window under version 5).
+- Section 17 maps each finding of the review of revision 1 to its change.
 
 ## 1. The problem
 
@@ -24,663 +27,657 @@
   decision version 5 (`crates/types/src/upgrades.rs:87-93`, `VersionSwitch.java:72-86`).
 - Every member keeps its retained frames on the heap. The deploy does not set
   `kardamom.cluster.carryBytes`.
-- Under version 5, a sequencer offers each transaction as a full reference (record type 7), but
-  only after the sealer reports version 5 on its session (egress kind 17).
+- Under version 5, a sequencer offers each transaction as a full reference (record type 7). It
+  does this only after the sealer reports version 5 on its session (egress kind 17).
   `Sequencer::carried` sends the envelope only when `carries_bytes()` is true
   (`crates/sequencer/src/v2/mod.rs:426-433`).
-- The member orders a full reference and relays one canonical entry (`RT_TX`) with the envelope
+- The member orders a full reference. It relays one canonical entry (`RT_TX`) with the envelope
   (`SealerClusteredService.java:1170-1180`, `SealerEgress.java:646-647`,
   `EgressFrames.java:49-55`).
 - A heap member gives each egress session the frame as it is (`HeapFrames.java:252-259`). So
   each executor on its cluster session already gets the bytes of each `RT_TX` entry. It runs the
   entry with no join (`crates/engine/src/reader/cluster/mod.rs:259-264`).
-- A heap member keeps the posted rule under version 5: a frame past the window leaves only when
-  its block is posted (`SealerEgress.java:174-177`, `HeapFrames.java:138`). The heap grows with
-  the DA lag, as before #765.
+- A heap member keeps the posted rule under version 5. A frame past the window leaves only when
+  its block is posted (`SealerEgress.java:174-177`, `HeapFrames.java:138`). So the heap and the
+  snapshot grow with the DA lag. The snapshot holds every retained frame
+  (`HeapFrames.java:184-196`).
 
-### 1.2 Why `carryBytes` cannot change on a live chain
+### 1.2 Why the window and the feed are off on staging
 
-`kardamom.cluster.carryBytes=true` does five things at once. Each one depends on the setting, not
-on the replicated state:
+- The exact window needs `retained.carriesBytes()` (`SealerEgress.java:174-177`). Only the file
+  says true. #765 added that condition, because the executors and the batcher could still meet a
+  reference, and the egress cannot give a reference its bytes.
+- The member feed needs the file: `Feed.open` returns `Off` without it (`Feed.java:54-56`), and
+  `FeedConfig.parse` refuses a feed without `carryBytes` (`FeedConfig.java:38-46`).
+- `carryBytes` is a must-match setting
+  (`deploy/cluster/ansible/roles/workloads/defaults/main.yml:333-345`). A member stops on a
+  snapshot of the other layout (`SealerClusteredService.java:504-516`).
 
-| What | Where | Effect on a mixed fleet |
-|---|---|---|
-| The store of the retained frames: the file, not the heap | `SealerClusteredService.java:382-384` | The snapshot layout differs. |
-| The snapshot version: 12 (17 with #779), not 14 to 16 | `SealerClusteredService.java:466-475`, `:1595-1597` | A member stops on a snapshot of the other layout (`requireRetentionLayout`, `:504-516`). |
-| The void configuration `DISABLED` | `SealerClusteredService.java:352-354` | The void ledger and the snapshot differ. |
-| The vote kinds (6, 9) drop as unknown | `SealerClusteredService.java:747-749` | Under version 5 both sides drop them, so no difference today. |
-| The relay of a full entry (type 5) as a canonical entry, and no direct record path | `SealerClusteredService.java:964`, `:1008-1015` | A type-5 record relays differently. The direct path is off, so the record path allocates. |
+### 1.3 Findings
 
-So the release gate lists `carryBytes` in `workloads_sealer_must_match`
-(`deploy/cluster/ansible/roles/workloads/defaults/main.yml:333-345`), and the gate refuses a
-rolling change (`gate.yml:362-385`). The README says the switch changes "only with a new chain or
-a coordinated cut-over" (`SealerClusteredService.java:498-503`).
-
-### 1.3 Findings that change the rough design
-
-The rough design of the task was checked against the code. These findings change it.
-
-- **F1. The executors already get the bytes.** #771 gap 1 says the executors read references. On
-  a heap member under version 5, they get each `RT_TX` entry with its bytes (1.1). A reference
-  reaches them only when a sequencer offers a type-0 reference. That happens in two cases:
-  - A sequencer session that opened, before kind 17 of that session arrives. Until then the
-    version is 0 (`crates/sequencer/src/sealer_rules.rs:77-84`), and the sequencer sends type 0.
+- **F1. The executors already get the bytes.** #771 gap 1 says that the executors read
+  references. That is mostly not true. On a heap member under version 5, they get each `RT_TX`
+  entry with its bytes (1.1).
+- **F2. The references come from type-0 offers.** A reference reaches a reader only when a
+  sequencer offers a type-0 reference. There are two causes:
+  - A sequencer session opens. Until kind 17 of that session arrives, the version of the
+    sequencer is 0 (`crates/sequencer/src/sealer_rules.rs:77-84`). So the sequencer sends type 0.
   - The sealer still orders a type-0 reference under version 5 (README "Version 5", "Other
     records").
   The halt of the validator with `--egress` on 2026-10-23 (`TxRef ... not found`) fits these
-  references. This spec stops them (section 4.5 and section 5).
-- **F2. The file strips the bytes from the sessions.** A file member gives each session a
-  canonical entry as its relayed reference, kind 15 (`RetainedFile.java:491-499`,
-  `EgressFrames.java:88-101`). The cluster reader of an executor drops kind 15
-  (`crates/engine/src/reader/cluster/mod.rs:258`). So if a live chain turned on the file as it is,
-  every executor that still reads its cluster session would lose every transaction at that point.
-  This spec keeps the bytes on the sessions (section 4.6).
-- **F3. Every config-dependent rule must become state-dependent.** The table of 1.2 lists five
-  rules that read the setting. A "dormant" file only works when none of them reads the setting.
-  Section 4.2 moves each one to the state.
-- **F4. A peer seed fails with a dormant file.** With the file set, a blank member always runs
-  the copy of the retained file. The copy refuses a snapshot without a file section
-  (`PeerSeed.java:135-136`, `RetainedCopy.java:55-60`). So a member with the dormant
-  configuration could not be seeded before the activation. Section 4.10 runs the copy only for a
-  snapshot that holds an active file.
-- **F5. The feed floor is the egress floor.** The member feed checks a request against the floors
-  of the egress (`MemberFeed.java:152`), then walks the file from `scanStart`
-  (`MemberFeed.java:158`). In the transition, the egress floor is below the file. Without a
-  change, the feed would skip the heap frames silently. Section 4.7 adds the file floor.
-- **F6. A carry-mode executor cannot join a reference.** It opens no `tx_data` lane
+  references.
+- **F3. The heap already holds what the feed needs.** Under version 5, each heap frame of a
+  type-7 offer holds the envelope. So the feed can walk the heap frames. No file is needed.
+- **F4. The feed is local.** The feed sends frames on its own IPC publication, through a ring
+  on its own thread (`MemberFeed.java`). It reads `SealerEgress.replayVerdict` and writes
+  nothing that the state or a cluster session reads. A full ring gaps only the feed. So a deploy
+  setting can turn it on, member by member.
+- **F5. A carry-mode executor cannot join a reference.** It opens no `tx_data` lane
   (`crates/executor/src/bin/kardamom-executor/main.rs:311-313`). Its reader passes a reference on
-  as an ordinary record (`crates/engine/src/reader/carried/answer.rs:210`). Section 6 makes a
-  reference a fault of the source.
-- **F7. A copy at the activation is not bounded.** Under the posted rule the heap holds every
-  frame above the posted head. A copy of the heap into the file at the activation would stall
-  every member for a time that grows with the DA lag. The rough design keeps the old frames on the
-  heap until they leave. This spec keeps that part (section 4.3).
+  as an ordinary record (`crates/engine/src/reader/carried/answer.rs:210`). The switch between
+  its sources has no rule for a fault that every source gives: it switches again and again
+  (`crates/engine/src/reader/carried/switch.rs:95-139`, the last arm).
 
 ## 2. Goals and limits
 
-- Goal: a live chain moves its retained frames from the heap to the retained file at one log
-  entry, the same entry on every member and in every replay.
-- Goal: each executor moves to the member feed of its paired member, one at a time, with no
-  stop of the chain.
-- Goal: the window of #765 then holds: the frames of a member have a fixed bound at any DA lag.
-- Limit: every deploy is backward compatible. No deploy changes a rule of the replicated state.
-  Only the upgrade transaction of the new feature does.
+- Goal: the exact window of #765 runs on heap members. The heap and the snapshot of a member then
+  have a fixed bound at any DA lag.
+- Goal: each executor reads the member feed of its paired member. The executors move one at a
+  time, with no stop of the chain.
+- Goal: no reader of the order meets a reference after the activation.
+- Limit: every deploy is backward compatible. Only an upgrade transaction changes a rule of the
+  replicated state.
 - Limit: no stop of all members, no purge, no new chain.
-- Limit: no change to a wire format that a client reads, except new fields on admin `/status`.
+- Limit: no change to a wire format that an older client reads. The new egress kind goes only
+  to a session that offered a type-0 reference.
+- Non-goal: the retained file (section 15).
 - Non-goal: a network feed in place of `aeron:ipc` (topology B).
-- Non-goal: the removal of the heap store. A later release can remove it after the activation on
-  every network.
+- Non-goal: strip the bytes from the cluster sessions. A later change does that (Q4 of revision
+  1, accepted).
 
 ## 3. The design in short
 
-1. **A release with a ready file.** The deploy gives each member the file directory, the token,
-   the admin port and the feed settings. The member keeps the heap store, the heap snapshot and
-   every rule of today. The setting is local to the member: it decides nothing in the state. So a
-   rolling deploy is safe.
-2. **Feature 5, the carry storage.** An upgrade transaction schedules
-   `FEATURE_CARRY_STORAGE` (feature id 5). It follows the rules of features 3 and 4: the
-   sequencer sends kind 11 in front of the epoch, and the switch happens at a block boundary.
-   The switch is one-way.
-3. **The point B.** At the end of the log entry whose boundary turns feature 5 on, every member
-   opens an empty retained file. B is the record index and the block of the next frame.
-   - Each frame from B goes to the file.
-   - The frames before B stay on the heap until they leave by the eviction rule.
-   - From B, the member drops a type-0 transaction reference.
-   - The member asks for a snapshot, as at a version switch.
-4. **The snapshot in the transition.** Version 18: the state of version 16, then the schedule
-   and the latch of feature 5, then the heap section, then the file section.
-5. **The exact window after the posted head passes B.** Until then the posted rule stays, so a
-   batcher that reads the sealer keeps its frames.
-6. **The feed starts at B.** A request below B gets `REPLAY_UNAVAILABLE` with B as the floor.
-7. **The executors move one at a time**, after their committed block passes B and the compare
-   window. A carry-mode executor needs no hybrid code: a reference is a fault of the source.
-8. **The readers move to the egress** once their cursor passes B.
+1. **The sequencer keeps its version.** It keeps the highest version that any of its sessions
+   reported. It lowers it only on a kind 17 of the current session that says lower. A start
+   setting gives the first value. So a sequencer of this release sends no type 0 under version 5.
+2. **The member feed on the heap.** `MemberFeed` walks the heap frames by a frame number, not by a
+   file position. A deploy setting turns it on, member by member.
+3. **Feature 5 (`FEATURE_CARRY_WINDOW`).** An upgrade transaction schedules it. While version 5
+   and feature 5 are both on:
+   - the exact window holds on every member;
+   - the sealer refuses a type-0 transaction reference with a reject frame, and the sequencer
+     offers the transaction again as type 7.
+4. **Both ways.** Feature 5 follows the rules of features 3 and 4. It can turn off and on again.
+   Decision 23 of the carry spec holds.
+5. **Snapshot version 18.** Version 16, then the state and the schedule of feature 5. The heap
+   section does not change. A member writes 18 only when it holds an activation of feature 5.
+6. **The order.** The sequencers stop the type-0 offers first. The batcher and the validator move
+   to the egress. Then feature 5 turns on the window. Then the executors move to the feed.
 
 ## 4. The sealer
 
-### 4.1 Feature 5 and the latch
+### 4.1 Feature 5
 
-- **The feature.** `FEATURE_CARRY_STORAGE: u64 = 5` in `crates/types/src/upgrades.rs`, and the
-  same constant in `VersionSwitch.java`. Only the sealer follows it. The executor does not read
-  it. Feature 5 is free: the ids in use are 1 to 4 (`crates/exec-core/src/features.rs:50`,
-  `crates/types/src/upgrades.rs:77-93`).
-- **The schedule.** `VersionSwitch` gets a third `Schedule`, `storage`, next to `v4` and `carry`
-  (`VersionSwitch.java:91-95`). `onActivation` takes feature 5 with the same origin and epoch
-  rules (`VersionSwitch.java:140-166`).
-- **EARLY.** The state takes an activation of feature 5 only while version 5 runs, as it takes
-  feature 4 only while version 4 or 5 runs (`VersionSwitch.java:156-158`). A record that comes
-  under version 3 or 4 changes nothing (outcome `EARLY`).
-- **The latch.** At each boundary, the state evaluates `storage.onAt(...)` as it evaluates the
-  version (`VersionSwitch.java:175-201`). When it gives "on" for the first time, the state sets
-  the latch: `storageOn = true`. The latch never goes back.
-  - A held activation with a time ahead, or `2^64 - 1`, before B postpones or cancels the switch,
-    as today. After B, the state still stores the record, but the latch stays on. The member logs
-    `cluster FEATURE-ACTIVATION outcome=ONE_WAY` and counts it.
-  - Version 5 must stay on after B. If feature 4 or 3 turns off later, the latch stays. The
-    file stays, and the eviction falls back to the posted rule (4.4). The gate refuses such an
-    upgrade transaction (section 9).
-- **B.** The service reads the latch after each log entry, as `afterEntry` reads the version
-  (`SealerClusteredService.java:432-442`). When the latch turned on in the entry, the service
-  records B in the state: `storageFromIndex = canonicalCount`, `storageFromBlock = blockNumber`
-  (the open block). B is replicated state: the snapshot carries it (4.8).
-- **Why a latch, not decision version 6.** A version must be able to go back (decision 23 of the
-  carry spec). The store cannot go back in one entry: the frames in the file would need a copy to
-  the heap, and the executors that read the feed would lose it. A latch keeps the version
-  machinery as it is.
+- **The id.** `FEATURE_CARRY_WINDOW: u64 = 5` in `crates/types/src/upgrades.rs`, and the same
+  constant in `VersionSwitch.java`. The ids in use are 1 to 4
+  (`crates/exec-core/src/features.rs:50`, `crates/types/src/upgrades.rs:77-93`). Only the sealer
+  follows feature 5. The executor does not read it.
+- **The schedule.** `VersionSwitch` gets a third `Schedule`, `window`, next to `v4` and `carry`
+  (`VersionSwitch.java:91-95`). `onActivation` takes feature 5 with the same rules of origin and
+  epoch (`VersionSwitch.java:140-166`).
+- **EARLY.** The state stores an activation of feature 5 only while version 5 runs. This is the
+  rule of feature 4 under version 4 (`VersionSwitch.java:156-158`). A record that comes under
+  version 3 or 4 changes nothing (outcome `EARLY`).
+- **The flag.** At each boundary, the state evaluates `window.onAt(...)` as it evaluates the
+  version (`VersionSwitch.java:175-201`). The result is the flag `carryWindow` of the next block.
+  The rules of feature 5 apply while `carryWindow` is on and the version is 5:
+  - The flag can turn off: a later activation with a time ahead turns it off until that time,
+    and `2^64 - 1` keeps it off.
+  - When version 5 turns off (feature 3 or 4 off), the rules of feature 5 stop. The flag keeps its
+    value, so the rules come back with version 5. This is how version 5 keeps the schedule of
+    feature 4 today (README "Version 5", "The activation").
+- **The view.** `VersionSwitch.View` gets the flag and the newest held activation of feature 5.
 
-### 4.2 The ready configuration: the setting decides nothing
+### 4.2 The log position where the rules change
 
-The setting only says that the member can hold the file. The state decides whether it does.
+There are two rules. They change at two defined points of the same log entry.
 
-- **The property.** A new property `kardamom.cluster.carryStorage`, with the values `off`
-  (default) and `ready`. `ready` needs the admin port, the token and the snapshot interval, as
-  `CarryBytes.Inputs.require` checks today (`CarryBytes.java:49-62`). The feed settings need
-  `ready` (`FeedConfig.java:95-103`, with the new name).
-- **The old property.** This release refuses `kardamom.cluster.carryBytes=true` at the start,
-  with a message that names the activation. No live chain uses it (#779). The property leaves
-  `workloads_sealer_must_match`. The new property is not in that list.
-- **Each rule moves to the state:**
+- **The record rule (the type-0 refusal, 4.3).** It reads the flag of the state. The state sets
+  the flag at the boundary, inside the log entry. So the rule applies from the first record of
+  the block that the boundary opens.
+  - A timer tick: the boundary is the whole entry. The next record is in the next entry.
+  - A forced boundary: an origin record forces the boundary, and the boundary goes out before
+    the record (`SealerClusteredService.java:1554-1558`, `offerAdvance`). The forcing record is
+    an epoch, not a transaction reference. In a batch (kind 3), the entries after the forcing
+    record are in the new block, so the new rule applies to them in the same entry.
+- **The eviction rule (the exact window, 4.4).** The egress adopts it at the end of the log entry
+  that holds the boundary, in `afterEntry` (`SealerClusteredService.java:432-442`). This is the
+  point where the egress adopts a new version today. The frames of that entry go in under the
+  old rule, and the prune at the end of the entry applies the new rule.
+- **Every member and every replay.** Both points are functions of the log. A snapshot falls only
+  between entries. So a replay, and a restore from a snapshot on either side, switch at the same
+  points.
+- After a switch of the flag, the member asks for a snapshot, as after a version switch. So a
+  replay has a start point on each side.
 
-| Rule today | Reads | After this change |
+### 4.3 The type-0 refusal
+
+- While the rules of feature 5 apply, the member refuses a transaction reference of record type
+  0 (`RT_TXREF`). It does not order it, and it does not drop it silently.
+- **The reject frame.** It answers the offering session with a new egress kind,
+  `EGRESS_KIND_REF_REFUSED = 18`: `[kind:18][sender:20][nonce:u64 LE]`. This is the layout of
+  `WINDOW_FULL` (`SealerEgress.java:404-415`). Kind 18 is free (`SealerWire.java:331-472`).
+- **Why a frame.** With `--ack validated`, the client has the hash before the sealer sees the
+  offer. A silent drop would lose a transaction that the client was told is accepted.
+- **The sequencer side.** The sequencer takes kind 18 as it takes `WINDOW_FULL`: back pressure,
+  not a verdict. It republishes the transaction from its pending entry
+  (`crates/sequencer/src/resync/answers.rs:34-37`, `:129`). The republish follows the kept
+  version (section 5), so it goes out as type 7.
+  - Queue: the answers go through the existing rewind channel. Its drain is bounded per pass
+    (`drain_bounded`, `FLOOR_DRAIN_PER_ITER`, `answers.rs:9`). This spec adds no queue.
+- **The count.** The member counts each refusal in `kardamom_sealer_ref_refused_total`, and logs
+  `cluster REF-REFUSED` at most once a second.
+- **Other records.** An epoch, a deposit, a remote-origin record and a full reference keep their
+  rules. Under version 3 or 4, or with the flag off, a type-0 reference is ordered as today.
+- **Why the rule exists.** Section 5 stops the type-0 offers of this release. The rule protects
+  the carry-mode executors from a sequencer of an older release, or from a wrong start setting.
+
+### 4.4 The exact window
+
+- **The rule.** `windowOnly = version == 5 && (carryWindow || retained.carriesBytes())`.
+  - On a heap member, feature 5 turns the window on.
+  - On a member of a chain born with the file (version 17), `carriesBytes()` keeps the rule of
+    #765. No live chain has such a member.
+- **Where the egress computes it.** Today only `setDecisionVersion` computes `windowOnly`
+  (`SealerEgress.java:174-177`). `setPostedHead` only prunes with the current value
+  (`SealerEgress.java:162-165`). This spec replaces `setDecisionVersion(int)` with one method,
+  `setRules(int version, boolean carryWindow)`. It computes `windowOnly`, then prunes. The
+  service calls it at these points, in this order:
+  1. `openEgress` (`SealerClusteredService.java:542-548`), at a start from genesis, from a seed
+     or from a snapshot: first `restore` or `openEmpty`, then `setRules`, then `setPostedHead`.
+     So the restored frames are pruned by the rule of the snapshot.
+  2. `afterEntry`, at the end of each entry in which the version or the flag changed.
+  `setPostedHead` keeps its job: it stores the posted head and prunes with the current rule.
+- **The drain.** At the entry that turns the window on, the prune drops each frame past the
+  window. The retained frames fall within `retention` frames
+  (`kardamom.cluster.retention`, 65,536 by default) at the end of that entry.
+- **The bound.** With the window on, the heap holds at most `retention` frames, and the snapshot
+  holds the same frames. At about 300 bytes a frame, 65,536 frames are about 20 MB. Today the
+  snapshot holds every frame above the posted head.
+- **Off again.** When the flag turns off, the posted rule comes back at the end of that entry.
+  No frame comes back: the window keeps its frames, and new frames stay until they are posted.
+
+### 4.5 The member feed on the heap
+
+- **The walk.** `MemberFeed` walks the retained file today by its position: `scanStart`,
+  `frontPos`, `view` and `next` (`MemberFeed.java:152-158`, `:208`). This spec moves these four
+  calls to `RetainedFrames`, with a walk key of type `long`:
+  - `RetainedFile`: the key is the file position, as today.
+  - `HeapFrames`: the key is the frame number, the count of frames that the store appended
+    since its start. The front is the appended count minus the frame count. The frame at key `k`
+    is in the index slot `(first + k - front) % slots`.
+  - `walkStart(fromBlock)` on the heap: the key after the retained boundary of `fromBlock - 1`,
+    else the front. It scans the index once for each feed request. Requests are rare.
+  - `view(key, buffer)` wraps the bytes of the frame without a copy. `HeapFrames.grow` moves the
+    bytes (`HeapFrames.java:84-95`), so the walk wraps the view again at each step. The key does
+    not change when the ring grows.
+- **One thread.** The feed runs its walk on the service thread (`Feed.java:6-10`), as today. The
+  heap arrays have no reader on another thread.
+- **The settings.** `FeedConfig.parse` no longer needs `carryBytes` (`FeedConfig.java:38-46`).
+  `Feed.open` opens the feed on the store of the member, heap or file (`Feed.java:54-56`).
+  `kardamom.cluster.feedAeronDir` is not a must-match setting.
+- **The floor.** The feed answers a cursor below the egress floor with `REPLAY_UNAVAILABLE`, as
+  today. No other floor exists: the heap holds every frame from the egress floor.
+- **Before feature 5.** The feed can run, but the frames below the cursor of an executor can hold
+  references (F2). An executor moves to carry mode only after its cursor passes the last
+  reference (section 6).
+
+### 4.6 The snapshot: version 18
+
+- **A new version is needed.** The flag and the schedule of feature 5 are replicated state. The
+  state of version 16 holds neither. A member that restored version 16 would lose a held
+  activation, refuse no type-0 reference, and keep the posted rule, while its peers do not. That
+  forks the state.
+- **The layout.** Version 18 is the state of version 16, then the section of feature 5, then the
+  heap section of today:
+
+| Section | v16 (staging today) | v18 |
 |---|---|---|
-| The store (`:382-384`) | the setting | The heap store from the start. At B, the tiered store (4.3). A restore of an active snapshot opens the tiered store. |
-| The snapshot version (`:466-475`, `:1595-1597`) | the setting | The state: version 18 when the state holds a schedule or the latch of feature 5, else the version of today. A v17 restore keeps writing 17. |
-| The layout check (`:504-516`) | the setting | The member stops only when the snapshot holds an active file and the member is not `ready` (4.8). |
-| The void configuration (`:352-354`) | the setting | The configuration of the job, as on a heap member. A v12 or v17 restore keeps `DISABLED`, as today. |
-| The vote kinds (`:747-749`) | the setting and the version | The version only: `version < 5`. A v12 or v17 restore keeps them off. |
-| The type-5 relay (`:1008-1015`) | the setting | The latch. Before B, a type-5 record relays as is, as on a heap member. |
-| The direct record path (`:964`) | the setting | `window.capacity() == 0` only (4.5). |
+| State of v16 | yes | yes |
+| Feature 5 | no | `[carry_window:u8][held:u8]`, then `[origin:u64][time_ms:u64]` for each held activation, oldest first, at most three |
+| Heap section | `HeapFrames` layout (`HeapFrames.java:184-196`) | the same |
 
-- **The v17 chain.** A member that restores version 17 (a chain born with `carryBytes`) runs the
-  file from its start. The latch is on, and B is `(0, 0)`. No live chain has such a snapshot, so
-  this only keeps the reads of #779.
-- **A start at genesis or from a seed** runs the heap store, with the latch off. The setting does
-  not change that. So a member that replays the log from position 0 decides as its peers.
-
-### 4.3 The transition: the tiered store
-
-- **The store.** A new `TieredFrames implements RetainedFrames`: a heap tier (`HeapFrames`) and a
-  file tier (`RetainedFile`). `RetainedFrames` is sealed (`RetainedFrames.java:20`), so it gets a
-  third permitted type.
-  - `append`: to the file tier.
-  - `count`: the sum of the tiers.
-  - `frontIsBoundary`, `frontKey`, `evictFront`: the heap tier while it holds a frame, else the
-    file tier. The frames before B are older than the frames after B, so the front is always in
-    the heap tier first.
-  - `boundaryEnd`: the tier that holds the boundary.
-  - `wanted`: the heap frames, then the file frames.
-  - `writeSnapshot` and `restore`: the heap section, then the file section (4.8). The floors are
-    the lower of the two.
-  - `status`: the file form, with the retained bytes of the file above the posted head
-    (`RetainedFile.java:339-342`).
-  - `publishedHead`, `checkHealth`, `close`: the file tier.
-  - `forSession`: the frame as it is (4.6).
-  - `carriesBytes`: true.
-- **The swap.** `SealerEgress.retained` is a final field today (`SealerEgress.java:100`). The
-  egress gets one method, `openFileTier(RetainedFile)`: it wraps the heap store in a
-  `TieredFrames` and opens the file tier empty (`RetainedFile.clear()`). The service calls it in
-  `afterEntry` when the latch turned on, before the snapshot request.
-- **The file at B.** Every member opens the file at position 0 at B. A member that runs B again
-  in a replay clears the file of its earlier run first. So the positions are a function of the
-  log from B on every member.
-- **The cost of B.** No copy. The swap allocates the tier objects once and starts the segment
-  helper. The first segment is preallocated in the background, so the first append can wait for
-  it. The `ready` member asks for one spare segment at its start, so the wait does not happen at
-  B.
-- **The heap tier drains.** Each eviction from the front empties it further. Once it is empty, it
-  stays empty: no frame goes to it after B.
-
-### 4.4 The eviction rule
-
-Today: `windowOnly = version == 5 && retained.carriesBytes()` (`SealerEgress.java:174-177`).
-
-After this change: `windowOnly = version == 5 && retained.carriesBytes() && postedHead >=
-storageFromBlock`.
-
-- **Why the posted head.** Before B, the readers of the order can meet type-0 references
-  (finding F1). The egress cannot give them bytes, so the batcher and the validator read the
-  sealer until their cursor passes B. With the exact window at B, a batcher that restarts with a
-  cursor below the window gets `REPLAY_UNAVAILABLE` and has no source with bytes. So the exact
-  window waits until the batcher has posted past B. From then on, a batcher below the window reads
-  the egress, which holds bytes from B.
-- **Determinism.** The posted head and B are replicated state. `setPostedHead` and
-  `setDecisionVersion` both prune (`SealerEgress.java:157-177`). So every member evicts the same
-  frames at the same log position, from the log or from a snapshot.
-- **The v17 chain.** `storageFromBlock` is 0, so the rule is the rule of #765.
-- **The bound in the transition.** Until the posted head passes B, the frames grow with the DA
-  lag, as on staging today. The DA-lag guard bounds them (`daLagBudgetBlocks`). After that, the
-  file holds `retention` frames plus the segments of the last snapshot
-  (`RetainedFile.java:350-360`), and the heap tier is empty.
-
-### 4.5 The record path after B
-
-- **A type-0 transaction reference drops.** From the first block after B, and while version 5
-  runs, the member drops a reference of record type 0 (`RT_TXREF`) and counts it
-  (`cluster DROPPED txref-carry-storage`, a new reason of the existing drop counter).
-  - Why: no reader after B can join a reference. A carry-mode executor has no lane (F6), and the
-    egress cannot add the bytes.
-  - It is a rule of the state, so it changes at B on every member. The latch is in the state, so
-    the record path reads it in the same entry as the boundary.
-  - Its twin offers the same transaction as type 7, so the transaction is still ordered. A
-    sequencer of this release sends no type 0 under version 5 (section 5).
-  - Under version 3 or 4 (a later switch back), the member does not drop type 0: the rule
-    needs version 5.
-  - An epoch, a deposit and a remote-origin record keep their rules.
-- **The direct path.** Today a file member never takes the direct path
-  (`SealerClusteredService.java:964`). So every record of a file member goes through a
-  `HeldRecord`, which allocates. The type-7 path and the type-0 path never call `relayOf`, so the
-  setting is not needed there. After this change, `direct = window.capacity() == 0`. A type-6 or
-  type-5 record still falls to the held path, where `relayOf` refuses or converts it.
-- **The allocation of the file append.** `RetainedFile.append` calls `segments.lastEntry()`
-  (`RetainedFile.java:165`), which returns a new entry object, and wraps it in an `Optional`.
-  `FrameKey.of(staged)` (`:179`) makes a record. The append keeps the last segment in a field, and
-  reads the kind and the key from the staged buffer with no object. Only a boundary allocates its
-  index mark (one for each block). `CarriedPathAllocationTest` gets the cases `carried_fresh_file`
-  and `carried_copy_file`.
-
-### 4.6 The session form
-
-- A `TieredFrames` gives each session the frame as it is. A session that reads the cluster egress
-  keeps getting the bytes of each `RT_TX` entry after B (finding F2).
-- Why: until every executor reads the feed, some executors read their cluster session. The
-  batcher and the validator read the sealer until their cursor passes B (4.4).
-- The cost does not change: on staging, the leader sends the bytes to each consumer session
-  today.
-- A later change can strip the bytes from the sessions, when no reader of the order uses a
-  cluster session. That is out of scope.
-- The v17 chain keeps the kind-15 form of `RetainedFile.forSession`.
-
-### 4.7 The member feed
-
-- **Off before B.** `Feed.open` needs the file (`Feed.java:54-56`). Before B the member runs
-  `Feed.Off`. At B, the service starts the feeder thread on the file tier, after
-  `openFileTier`. A restore of an active snapshot starts it at the start, as today.
-- **The floor.** The feed refuses a request below B with `REPLAY_UNAVAILABLE` and the floor
-  `(storageFromIndex, storageFromBlock)`. The floor of the feed is the higher of the egress floor
-  and B (finding F5). After the heap tier drains, the two floors are the same.
-- **Member-local.** The feed settings decide nothing in the state. A `ready` member without the
-  feed settings runs no feed. So the feed settings are not must-match.
-
-### 4.8 The snapshot: version 18
-
-| Section | v16 (heap, staging today) | v17 (#779, a chain born with the file) | v18 (this spec) |
-|---|---|---|---|
-| State of v16 | yes | yes | yes |
-| Schedule of feature 5 | no | no | `[held:u8]`, then `[origin:u64][time_ms:u64]` for each held activation |
-| Latch and B | no | no (implied on, B = 0) | `[on:u8][from_index:u64][from_block:u64]` |
-| Heap section | `HeapFrames` layout | no | `HeapFrames` layout: the heap tier, count 0 when it is empty |
-| File section | no | `RetainedSection` with its length, at the end | when the latch is on: `RetainedSection` with its length, at the end |
-
-- **When a member writes 18.** When its state holds a schedule of feature 5 or the latch is on.
-  Before the first kind 11 of feature 5, a member writes 14, 15 or 16 as today. So the release
-  changes no snapshot byte until the upgrade transaction.
-- **The file section stays last.** `RetainedSection.ofSnapshot` reads it from the end
-  (`RetainedSection.java:75-80`). So the peer seed finds it with no parse of the state, as today.
-- **The restore rules:**
-
-| Snapshot | Member `ready` | Member `off` |
-|---|---|---|
-| 14, 15, 16 | heap store, latch off | heap store, latch off |
-| 18, latch off | heap store, schedule held | heap store, schedule held |
-| 18, latch on | tiered store: heap tier, then file tier checked by `RetainedWalk` | stop: `sealer CARRY-STORAGE FATAL` |
-| 17 | file store, latch on, B = 0 | stop, as today |
-| 12 | file store, version 3 rules (as #779) | stop, as today |
-
-- **Equality.** Every member writes the same bytes at the same log position, in each phase:
-  before the schedule, with the schedule held, in the transition, and after the heap tier drains.
-- **`formats.toml`.** `sealer-snapshot`: `reads_max = 18`, and the activation is feature 5 with
+- **When a member writes 18.** When the state holds an activation of feature 5. Before the first
+  kind 11 of feature 5, a member writes 14, 15 or 16 as today. So the release changes no
+  snapshot byte until the upgrade transaction.
+- **Restore.** This release reads 1 to 18. A v16 restore starts with the flag off and no
+  schedule. A v18 restore takes both.
+- **Rollback.** A member of a release that reads only up to 17 stops on 18. The preflight of #780
+  refuses such a rollback (`reads_max` below `snapshotLatest`).
+- **Equality.** Every member writes the same bytes at the same log position. This holds for the
+  retained frames too, because each member evicts the same frames at the same position (4.2).
+- **`formats.toml`.** `sealer-snapshot`: `reads_max = 18`. The activation is feature 5, with
   `writes = 18`. `docs/formats.md` gets a feature form of `activation`
   (`activation = { feature = 5, writes = 18 }`) next to the flag form.
+  `sealer-egress-kinds` gets kind 18.
 
-### 4.9 The admin status
+### 4.7 The admin status and the gauges
 
 `MemberStatus.toJson` (`MemberStatus.java:120-137`) gets these fields:
 
-- `carryStorage`: `off`, `ready` or `active`. `active` means the latch is on.
-- `carryStorageFromIndex` and `carryStorageFromBlock`: B, 0 before it.
-- `carryStorageActivationOrigin` and `carryStorageActivationMs`: the newest held activation of
+- `carryWindow`: `true` when the rules of feature 5 apply.
+- `carryWindowActivationOrigin` and `carryWindowActivationMs`: the newest held activation of
   feature 5, 0 when none.
-- `retainedHeapFrames` and `retainedFileFrames`: the frames of each tier.
+- `retainedFrames` and `retainedBytes`.
+- `feed`: `off`, `idle`, `walking`, `live` or `gapped`.
 
-The gate (section 9) and the rollout (section 12) read them.
+The metrics page gets the same values as Prometheus gauges, so the rollout and the alerts can
+read them:
 
-### 4.10 The peer seed
-
-- `PeerSeed.copiedRetained` runs the copy of the file only when the backed-up snapshot holds an
-  active file: version 17, or version 18 with the latch on. For any other snapshot it passes with
-  no copy (finding F4).
-- `RetainedCopy.run` accepts version 18 with the latch on (`RetainedCopy.java:55-60` checks one
-  version today).
-- A blank member seeded from a snapshot before B gets no file. If the backed-up log holds B, the
-  member opens its file at B in the replay, as its peers did.
+| Gauge | Value |
+|---|---|
+| `kardamom_sealer_retained_frames` | the retained frame count |
+| `kardamom_sealer_retained_bytes` | the bytes of the retained frames |
+| `kardamom_sealer_window_exact` | 1 when `windowOnly` is true, else 0 |
+| `kardamom_sealer_decision_version` | the version of the open block |
+| `kardamom_sealer_feature_state{feature="3"\|"4"\|"5"}` | 0 no activation held, 1 held and off, 2 on |
+| `kardamom_sealer_feature_activation_ms{feature}` | the time of the newest held activation |
+| `kardamom_sealer_snapshot_bytes` | the size of the newest snapshot |
+| `kardamom_sealer_snapshot_version` | the version of the newest snapshot |
+| `kardamom_sealer_ref_refused_total` | the type-0 refusals |
+| `kardamom_sealer_feed_state` | 0 off, 1 idle, 2 walking, 3 live, 4 gapped |
 
 ## 5. The sequencer
 
+- **The kept version.** `SealerVersion` keeps the highest version that any session of the
+  process reported. A kind 17 of the current session lowers it only when it says lower. A new
+  session does not reset it to 0 (today `SealerRules::on_session_start` does,
+  `crates/sequencer/src/sealer_rules.rs:77-84`). There is no hold and no deadline.
+- **The first value.** A new process has no report yet. It starts from the setting
+  `--sealer-version-floor` (env `KARDAMOM_SEALER_VERSION_FLOOR`, default 0).
+  - The deploy sets the floor to the lowest `decisionVersion` of the members at the time of the
+    deploy. On staging that is 5.
+  - A kind 17 that says lower lowers the version. So a wrong floor lasts until the first kind 17,
+    a few milliseconds after the session opens.
+  - Before a fleet rebuild from a seed, the runbook sets the floor to 0. A seeded member runs
+    version 3 (#667).
+- **The result.** A sequencer of this release sends no type-0 reference while every member runs
+  version 5. So the references of F2 stop with this release, before feature 5.
 - **Kind 11 of feature 5.** The list of followed features gets feature 5
-  (`crates/sequencer/src/outbound/cluster.rs:152`). The rule of the record does not change: the
-  last schedule of the feature in the epoch, in front of the epoch, on each offer of the epoch.
-- **No offer before kind 17.** On a new session, the sequencer holds its offers until the sealer
-  reports the version of that session (`SealerRules::on_session_start`,
-  `crates/sequencer/src/sealer_rules.rs:77-84`). Then it offers type 7 under version 5, and type 0
-  under version 3 or 4, as today.
-  - Every sealer of the releases since version 4 sends kind 17 when a session opens. So the hold
-    ends at once on a live chain.
-  - The hold has a deadline: 5 s. After it, the sequencer offers by the rules of version 0, and
-    counts `kardamom_sequencer_sealer_version_wait_expired_total`. A sealer of this release always
-    reports, so the deadline only protects an older sealer.
-  - This change is backward compatible: it changes no frame. It removes the type-0 offers of
-    finding F1.
-- **Job meta.** The sequencer job gets the meta `carry_storage = "true"` for the gate.
-- **Already true.** The sequencer sends type 7 under version 5 (`crates/sequencer/src/v2/mod.rs:426-433`).
+  (`crates/sequencer/src/outbound/cluster.rs:152`). The rule of the record does not change.
+- **Kind 18.** The sequencer decodes kind 18 and republishes, as for `WINDOW_FULL` (4.3).
+- **Job meta.** The sequencer job gets the meta `sealer_version_kept = "true"` for the gate.
 
 ## 6. The executors
 
-- **The move.** Each executor moves to the node of its paired member first, in reference mode.
-  Then it moves to carry mode (`--carry-bytes`). Both are separate deploy steps (section 10).
-- **When an executor can move to carry mode.** Its committed block must be at or above
-  `storageFromBlock + rollback_compare_blocks` (32 by default,
-  `crates/executor/src/bin/kardamom-executor/args.rs:17`). At its first carry start, the executor
-  compares the feed with the committed blocks of that window
-  (`crates/executor/src/bin/kardamom-executor/turns.rs:251-255`). Every frame of the window is then
-  in the file or in the egress with its bytes.
-- **No hybrid code.** A carry-mode executor reads three sources: the feed, then the egress
-  (`--egress`), then a peer checkpoint (`args.rs:115-123`). It needs one change:
-  - The carried reader treats a type-0 reference as a fault of the source,
-    `Fault::Unjoinable { index }` (`crates/engine/src/reader/carried/answer.rs:210`). The switch
-    then goes to the next source. A reference can only come from below B: from the egress range
-    of a cursor below B, or from a v12 chain.
-  - After B the stream holds no type-0 reference (4.5). So in normal operation the fault never
-    fires.
+- **The move.** Each executor moves to the node of its paired member first, in reference mode
+  (`KARDAMOM_EXEC_ON_SEALERS`, section 10). Later it moves to carry mode (`--carry-bytes`) on the
+  heap feed of its member.
+- **When an executor can move to carry mode.** All of these must be true:
+  - The rules of feature 5 apply on every member.
+  - Its member runs the feed (`kardamom_sealer_feed_state` above 0).
+  - Its committed block, minus the compare window (`rollback_compare_blocks`, 32 by default,
+    `crates/executor/src/bin/kardamom-executor/args.rs:17`), is above the block of the last
+    reference in the egress (`kardamom_egress_ref_frame_max_index`, 7.2). At its first carry
+    start, the executor compares the stream with the committed blocks of that window
+    (`turns.rs:251-255`). So every frame that it reads holds its bytes.
 - **The first carry run.** The executor has no running marker and no ledger yet. `start_run`
   takes a missing marker as a whole run (`marker.rs:172-186`), and the ledger opens empty. So the
   first run needs no migration.
-- **Back to reference mode.** An executor can move back at any time after B. Its cluster session
-  gets the bytes (4.6). So the move is reversible, one executor at a time.
+- **No hybrid code, one guard.** A carry-mode executor reads the feed, then the egress
+  (`--egress`), then a peer checkpoint (`args.rs:115-123`). It gets one change:
+  - The carried reader takes a type-0 reference as a fault of its source,
+    `Fault::Unjoinable { index }` (`answer.rs:210`). The switch goes to the other source.
+  - When both sources give `Unjoinable` at the same index, `Switch::verdict`
+    (`switch.rs:95-139`) gives a new verdict, `Verdict::Unjoinable { index }`. The reader stops
+    with `ExecutorError::UnjoinableReference { index }`. Without this verdict, the reader switches
+    between the sources with no end.
+  - In normal operation the fault never fires. It needs a reference above the cursor, which only
+    a sequencer of an older release or a wrong floor can make.
+- **Back to reference mode.** An executor can move back at any time. Its cluster session gets the
+  bytes, as today. So the move is reversible, one executor at a time.
 
 ## 7. The readers
 
 ### 7.1 The batcher and the validator
 
-- They keep reading the sealer until their cursor passes B. The heap and the file keep their
-  frames by the posted rule until then (4.4).
-- Then the operator switches each to `--egress` (`crates/batcher/src/bin/kardamom-batcher.rs:137`,
+- With the exact window, a batcher or a validator below the window gets `REPLAY_UNAVAILABLE` from
+  the sealer. So both must read the egress (`--egress`) before feature 5 turns on
+  (`crates/batcher/src/bin/kardamom-batcher.rs:137`,
   `crates/validator/src/bin/kardamom-validator/args.rs:64`).
-- The check before the switch: the cursor of the reader is above B, and the egress stores no
-  reference at or above that cursor (7.2).
+- A reader can move to the egress when its cursor is above `kardamom_egress_ref_frame_max_index`.
+  Below it, the egress range holds a reference that the reader cannot join.
+- New gauges, for the gate and the rollout: `kardamom_batcher_egress_cursor_index` and
+  `kardamom_validator_egress_cursor_index`, the canonical index of the newest frame that the
+  reader took from the egress.
 
 ### 7.2 The egress
 
-- The egress stores what the executors forward on `exec_frames`. Below B it holds references for
-  the type-0 offers of finding F1. From B it holds only frames with bytes.
+- The egress stores what the executors forward on `exec_frames`. It holds a reference for each
+  type-0 offer of F2.
 - New gauge: `kardamom_egress_ref_frame_max_index`, the highest canonical index of a stored
-  `RT_TXREF` frame. A reader can switch to the egress when its cursor is above it.
+  `RT_TXREF` frame, and `kardamom_egress_ref_frame_max_block`, its block. After the sequencer
+  release of section 5, the gauge stops moving.
 - No other change. The egress compares the copies of the executors as today.
+
+### 7.3 Why the order is not circular
+
+1. The sequencer release (section 5) stops the type-0 offers. It needs no feature.
+2. So the egress gauge stops at a last reference index R.
+3. The readers move to the egress once their cursor is above R. They need no feature either.
+4. Feature 5 turns on the window only after step 3. The gate checks step 3 (section 9).
+5. The executors move to the feed after feature 5. The refusal of 4.3 then guarantees that no
+   reference comes after R.
+
+No step waits for a later step.
 
 ## 8. The cases
 
 | Case | What happens |
 |---|---|
-| A member restarts before B | It restores a heap snapshot (14 to 16, or 18 with the schedule). It replays the log and opens its file at B in the replay. |
-| A member restores a snapshot from before B, after B | The same: the replay reaches B, clears the file of its earlier run, and appends the same frames. |
-| A member restores a snapshot from after B | It restores the tiered store. `RetainedWalk` checks the file. A file that does not match stops the member (`RetainedFile.java:405-425`); wipe it and let the peer seed copy the file. |
-| A blank member seeded before B | Aeron backup copies a heap snapshot and the log. No file copy. It opens its file at B in the replay. |
-| A blank member seeded after B | The backed-up snapshot is 18 with the latch on: `RetainedCopy` copies the segments from a peer with the token (4.10). |
-| A member without `ready` reaches B | It stops with `sealer CARRY-STORAGE FATAL` and does not fork: it never applies an entry with other rules. The gate prevents this (section 9). Fix: deploy `ready` to it; it replays to B again. |
-| A member of an older release at B | It ignores kind 11 of feature 5, keeps the heap, and orders type-0 references that its peers drop. That forks the state. The gate refuses the upgrade transaction while such a member runs (section 9). |
-| A rollback of the release after the first kind 11 of feature 5 | The members write version 18. A release that reads only up to 17 stops on it. The preflight of #780 refuses the rollback (`reads_max` below `snapshotLatest`). Before the kind 11, a rollback is safe. |
-| An upgrade transaction that turns feature 5 off after B | One-way: the latch stays on (4.1). The gate refuses it. |
-| An upgrade transaction that postpones feature 5 before B | Allowed, as for features 3 and 4. |
-| Feature 4 or 3 turns off after B | The latch stays. The posted rule comes back, and the members order type-0 references again. Carry-mode executors fault on them. The gate refuses such a transaction after B. |
-| A leader change just after B | The sessions reconnect and replay from their cursors. The heap tier and the file tier both serve, so no reader of a cluster session loses a frame. |
-| A fleet rebuild from a seed after B | A seeded member runs version 3 with the heap store (`SealerSeed` holds no rules). The operator sends the upgrade transactions of features 3, 4 and 5 again. Until then, the executors run in reference mode. This is the gap of #667 for features 3 and 4 too. |
+| A member stops before the switch and starts after it | It restores its snapshot from before the switch (14 to 16, or 18 with a held activation). It replays the log and switches at the same entry as its peers (4.2). Its frames and its snapshot bytes then equal those of its peers. |
+| A member restores a snapshot from after the switch | Version 18 with the flag on. `openEgress` restores the frames, then applies the exact window, then the posted head (4.4). |
+| A blank member seeded by a peer | Aeron backup copies a snapshot and the log. The snapshot holds the frames. No file copy, no token. |
+| A member of an older release at the switch | It ignores kind 11 of feature 5. It keeps the posted rule and orders the type-0 references that its peers refuse. That forks the state. The gate refuses feature 5 while such a member runs (section 9). |
+| A rollback of the release after the first kind 11 of feature 5 | The members write version 18. A release that reads only up to 17 stops on it. The preflight of #780 refuses the rollback. Before that kind 11, a rollback is safe. |
+| Feature 5 turns off, then on again | Off: the posted rule comes back, and type 0 is ordered again. On: the window drains to `retention` frames at the end of the entry, and type 0 is refused again. Every member switches at the same entries. |
+| Feature 3 or 4 turns off while feature 5 is on | Version 5 stops, so the rules of feature 5 stop. The sequencers send type 0 under version 4, and the carry-mode executors stop with `UnjoinableReference`. The gate refuses such a transaction while feature 5 is on (section 9). |
+| A leader change just after the switch | The sessions reconnect and replay from their cursors. A cursor inside the window gets its frames. A cursor below it gets `REPLAY_UNAVAILABLE`. |
+| A reference-mode executor below the window | `REPLAY_UNAVAILABLE`. It has no egress source, so it takes a peer checkpoint (`docs/failure-modes.md:472`). |
+| A carry-mode executor below the window | It reads the egress range, then a peer checkpoint. |
+| A sequencer of an older release, or a wrong floor, after the switch | Its type-0 offers get kind 18. A sequencer of this release republishes as type 7. An older sequencer drops kind 18 as an unknown kind, so its transaction stays unordered until its twin offers it. The gate requires the sequencer release. |
+| Every egress instance is down while the window is exact | A reader below the window cannot recover until an egress instance is back. The DA-lag guard does not change. The distance alert of the egress (one-way spec 6.4) fires first. |
+| A member without the feed setting | It runs no feed. Its executor stays in reference mode. Nothing else changes. |
+| The feed ring is full | The feed gaps (`GAPPED`). The executor asks again. The state and the sessions do not change. |
+| A fleet rebuild from a seed | A seeded member runs version 3 with no feature (`SealerSeed` holds no rules). The runbook sets the sequencer floor to 0, moves the executors to reference mode, and sends features 3, 4 and 5 again. #667 stays open for the seed with the rules. |
 | A power loss on a majority after the move | The carry-mode executors roll back by themselves (`docs/failure-modes.md:929-933`). This is a gain of the move. |
 
 ## 9. The gate
 
-`just sealer-upgrade-check <env> 5 <activation_ms>` (`upgrade_check.yml`) gets these checks:
+`just sealer-upgrade-check <env> 5 <activation_ms>` (`upgrade_check.yml`) gets these checks for
+feature 5:
 
 - Every configured member reports `snapshotReadsMax >= 18`.
-- Every configured member reports `carryStorage` `ready` or `active`.
-- Every configured member reports `decisionVersion == 5`. Feature 5 is `EARLY` below version 5.
-- The sequencer job has the meta `carry_storage = "true"`, and every live allocation runs that
-  job version (`upgrade_check_job.yml`).
-- The executor and validator jobs have a meta `carried_ref_fault = "true"` (section 6).
-- The activation time is not `2^64 - 1` when any member reports `carryStorage = active`.
-- New rule for features 3 and 4: when any member reports `carryStorage = active`, refuse any time
-  other than 0. A switch back of version 5 would break the carry-mode executors.
+- Every configured member reports `decisionVersion == 5`. Below version 5 the record is `EARLY`.
+- The sequencer job has the meta `sealer_version_kept = "true"`, and every live allocation runs
+  that job version (`upgrade_check_job.yml`).
+- The batcher and validator jobs have the meta `reads_egress = "true"`, and every live allocation
+  runs that job version.
+- On each egress instance, `kardamom_batcher_egress_cursor_index` and
+  `kardamom_validator_egress_cursor_index` are above `kardamom_egress_ref_frame_max_index`. The
+  check reads the metrics endpoint of each service, as it reads `/status` of each member.
 
-The gate tests go to `deploy/cluster/ansible/tests/test_deploy.py`, next to the feature-4 tests
-of #779.
+New rule for features 3 and 4: refuse any activation time other than 0 while any member reports
+`kardamom_sealer_feature_state{feature="5"}` at 1 or 2. A switch back of version 5 would stop
+the carry-mode executors. To turn feature 3 or 4 off, turn feature 5 off first, and move the
+executors to reference mode.
+
+Feature 5 itself can turn off: the check allows any activation time for feature 5.
+
+The gate tests go to `deploy/cluster/ansible/tests/test_deploy.py`, next to the feature-4 tests.
 
 ## 10. The deploy
 
-### 10.1 How the switch of #781 changes
+### 10.1 How #781 changes
 
-#781 makes `KARDAMOM_CARRY_BYTES=on` one switch for the sealer and the executors, and it relies on
-`KARDAMOM_ALLOW_MUST_MATCH=carryBytes`. This spec splits it into three switches:
+#781 makes `KARDAMOM_CARRY_BYTES=on` one switch for the sealer and the executors. It sets
+`carryBytes`, the token, the feed and the pinned groups, and it needs
+`KARDAMOM_ALLOW_MUST_MATCH=carryBytes`. With the heap feed, three switches replace it:
 
 | Switch | What it sets | When |
 |---|---|---|
-| `KARDAMOM_CARRY_BYTES=on` (meaning changes) | The sealer: `carryStorage=ready`, `feedAeronDir`, `feedRingBytes`, the token through the Nomad variables of each member group, the shared driver on the sealer nodes. No change to the executors. | Before the upgrade transaction. A rolling deploy, member by member. No allowance. |
-| `KARDAMOM_EXEC_ON_SEALERS=on` (new) | The executor groups `executor-<i>`, pinned to `sealer-<i>`, in reference mode. The readers that reach an executor by its node follow it. | Before or after the upgrade transaction. |
-| `KARDAMOM_CARRY_EXECUTORS=<list>` (new) | `--carry-bytes` (and `--egress` with `KARDAMOM_EGRESS=1`) on each listed group, such as `0`, then `0,1`, then `0,1,2`. | After B, one executor at a time. |
+| `KARDAMOM_MEMBER_FEED=on` (replaces `KARDAMOM_CARRY_BYTES`) | On each member: `feedAeronDir` and `feedRingBytes`. The shared driver on the sealer nodes. No `carryBytes`, no token. | Any time after the release. A rolling deploy, member by member. No allowance. |
+| `KARDAMOM_EXEC_ON_SEALERS=on` (new) | The executor groups `executor-<i>`, pinned to `sealer-<i>`, in reference mode. The readers that reach an executor by its node follow it. | Any time after the release. |
+| `KARDAMOM_CARRY_EXECUTORS=<list>` (new) | `--carry-bytes` and `--egress` on each listed group, such as `0`, then `0,1`, then `0,1,2`. | After feature 5, one executor at a time. |
 
-- **No must-match flip.** `carryBytes` leaves the must-match list (4.2). The test
-  `test_carry_mode_on_a_live_chain_needs_the_allowance` of #781 changes: a rolling deploy of `ready`
-  passes with no allowance.
-- **The executor roll.** The pinned groups roll together, because Nomad orders no groups (#781,
-  open question 1). This spec takes option (a): the executor job uses the staged roll of the
-  sealer (`sealer_step.yml`), one group at a time, with a health check between groups.
+- **The token goes.** The Nomad variables of each member group and the template of #781 are not
+  needed. The admin file endpoint and the file copy are not used.
+- **The executor roll.** The pinned groups would roll together, because Nomad orders no groups
+  (#781, open question 1). The executor job uses the staged roll of the sealer
+  (`sealer_step.yml`), one group at a time, with a health check between groups (option (a),
+  accepted).
+- **The sequencer floor.** The deploy reads `decisionVersion` on every member and passes the
+  lowest value as `KARDAMOM_SEALER_VERSION_FLOOR`.
 - **The preflight of `KARDAMOM_CARRY_EXECUTORS`.** It refuses the list unless:
-  - every member reports `carryStorage = active`;
-  - each listed executor reports `kardamom_executor_block_number` at or above
-    `carryStorageFromBlock + 32`;
+  - every member reports `carryWindow` true;
+  - the member of each listed executor reports `kardamom_sealer_feed_state` above 0;
+  - each listed executor reports `kardamom_executor_block_number`, minus 32, above
+    `kardamom_egress_ref_frame_max_block`;
+  - the executor job has the meta `carried_ref_fault = "true"`;
   - `KARDAMOM_EXEC_ON_SEALERS=on`.
-- **The preflight of #781 stays** for the token, the snapshot interval, the exec cursor, and the
-  executor count equal to the sealer count.
+- **The preflight of #781 stays** for the exec cursor and the executor count equal to the sealer
+  count. Its checks of the token and the snapshot interval go.
 
 ### 10.2 What staging needs (kardamom-infra)
 
-The list of #781 stays. In short:
+The list of #781, without the file:
 
 - On each sealer node: the directories of the executor and the state mirror, room in the
-  `aeron-mount` tmpfs for the shared driver, memory for the member, the shared driver, the
-  executor (1,536 MB), the state mirror (512 MB) and the page cache of the state DB.
-- Disk on each sealer node for the retained file. Until the posted head passes B, the file holds
-  the frames above the posted head (the DA lag). After it, `retention` frames plus two 64 MiB
-  segments. At 200 tx/s and about 300 bytes a frame, 30 minutes of DA lag is about 110 MB.
+  `aeron-mount` tmpfs for the shared driver and the 24 MiB feed log, and memory for the member,
+  the shared driver (768 MB), the executor (1,536 MB), the state mirror (512 MB) and the page
+  cache of the state DB.
 - The ports 9004, 9014, 9024 and 9007 open between the nodes.
-- The environment secret `KARDAMOM_RETAINED_TOKEN` in the deploy workflow.
-- The executor nodes stay: the egress runs there (#781, open question 2).
+- No disk for a retained file, and no secret for a token.
+- The executor nodes stay: the egress runs there (#781, open question 2, accepted).
 
 ## 11. Tests
 
-### 11.1 Unit tests (Java, `DriverlessLog`)
+### 11.1 Java unit tests (`DriverlessLog`)
 
-- **Activation at B.** Three `ready` members apply one stream with kind 11 of feature 5 and a
-  boundary that turns it on. All three log the same B, open the file at the same entry, and write
-  the same snapshot bytes after each entry.
-- **Restore at each point.** For each entry of the stream, one member takes a snapshot, stops and
-  restores (the pattern of `SealerVersionFiveTest.a_carrying_member_restored_at_any_entry_decides_as_its_peer`
-  in #779). The cuts cover: before the schedule, with the schedule held, the entry of B, the
-  transition with a non-empty heap tier, the drain of the heap tier, and after the posted head
-  passes B. The restored member gets the same egress outcomes, replay answers, status and final
-  snapshot bytes as its peer.
-- **Replay from before B.** A member restores a snapshot from before B while its file holds
-  frames of an earlier run. The replay clears the file at B and ends with the bytes of its peer.
-- **Eviction equality.** Under a DA lag, the members keep the posted rule until the posted head
-  passes `storageFromBlock`. Then all evict to `retention` at the same entry.
-- **The ref drop.** After B, a type-0 reference drops and is counted. Before B, and under version
-  4, it is ordered.
-- **The session form.** A session gets `RT_TX` with its bytes before and after B.
-- **The feed floor.** A feed request below B gets `REPLAY_UNAVAILABLE` with B. A request at B
-  gets every frame from B.
-- **The layout rules.** The restore table of 4.8, one case each: a member `off` stops on 18 with
-  the latch on, and starts on 18 with the latch off.
-- **One-way.** A kind 11 that turns feature 5 off after B leaves the latch on and counts
-  `ONE_WAY`.
-- **Peer seed.** `PeerSeedTest` and `RetainedFileSeedTest`: a heap snapshot passes with no copy; a
-  v18 snapshot with the latch on copies and walks the file.
-- **Allocation.** `CarriedPathAllocationTest`: the type-7 path of a file member allocates nothing.
-- **Formats.** `FormatRegistryTest`: the loader reads 1 to 18.
+- **Byte equality at every cut.** Three members apply one stream: type-7 offers, type-0 offers,
+  kind 11 of feature 5, the switch, and a DA lag. After each entry, the retained frames and the
+  snapshot bytes of the three members are equal, byte for byte.
+- **Restore at each point.** For each entry, one member takes a snapshot, stops and restores (the
+  pattern of `SealerVersionFiveTest` in #779). The cuts cover: before the schedule, with the
+  schedule held, the entry of the switch, the entry after it, and with the window on. The
+  restored member gets the same egress outcomes, replay answers, status, retained frames and
+  final snapshot bytes as its peer.
+- **A member stopped before the switch and started after it.** It replays the switch from the
+  log and ends with the bytes of its peers.
+- **The forced boundary.** The switch happens at a boundary that an epoch forces inside a kind-3
+  batch. A type-0 reference after the epoch in the same batch is refused. The prune happens at
+  the end of the entry.
+- **The drain.** Under a DA lag, the retained frames fall within `retention` frames at the end
+  of the entry that turns the window on.
+- **Off and on again.** Feature 5 turns off, then on. The posted rule comes back, then the
+  window. Each member switches at the same entries, and the bytes stay equal.
+- **The refusal.** With the rules of feature 5, a type-0 reference gets kind 18 on its session,
+  and is not ordered. With the flag off, or under version 4, it is ordered.
+- **The feed on the heap.** A feed request inside the window gets every frame from its cursor.
+  A request below the floor gets `REPLAY_UNAVAILABLE`. A walk across a growth of the byte ring
+  gives the same frames. A walk while the window evicts ends with `REPLAY_UNAVAILABLE` or with
+  the frames, never a gap.
+- **Allocation.** `CarriedPathAllocationTest`: the type-7 path allocates nothing with the feed on.
+- **Formats.** `FormatRegistryTest` reads 1 to 18. A new case checks a golden v18 snapshot: the
+  bytes that the PR of the layout writes. A later change to those bytes fails the test, unless it
+  takes a new version number.
 
 ### 11.2 Rust unit tests
 
-- The sequencer holds a new session until kind 17, and offers type 7 after a report of version 5.
+- The sequencer keeps version 5 across a new session, lowers it on a kind 17 of the current
+  session that says 4, and starts from the floor.
 - The sequencer sends kind 11 of feature 5 in front of its epoch.
-- The carried reader faults on a type-0 reference, and the switch goes to the next source.
-- The egress gauge of the highest stored reference.
+- The sequencer republishes a transaction after kind 18, as type 7.
+- Kind 18 decodes on the shared golden bytes (`WireGoldenTest` and the Rust wire tests).
+- The carried reader faults on a type-0 reference. The switch goes to the other source.
+- Two `Unjoinable` faults at the same index stop the reader with
+  `UnjoinableReference { index }`. Faults at two different indexes do not.
+- The egress gauges of the highest stored reference, and the reader cursor gauges.
 
 ### 11.3 Multi-process e2e (`crates/e2e`)
 
-A new scenario in `crates/e2e/src/scenarios/carry_storage.rs`, run from
+A new scenario in `crates/e2e/src/scenarios/carry_window.rs`, run from
 `crates/e2e/tests/chain_semantics/upgrades.rs` on the stack of `upgrade_stack_config`:
 
-1. Start three members with `carryStorage=ready`. Give each member its own feed driver directory:
-   the feed uses fixed stream ids on IPC, so two members cannot share one driver.
+1. Start three members. Give member 0 the feed, on its own driver directory: the feed uses fixed
+   stream ids on IPC.
 2. Send features 3 and 4 with `upgrade_and_await` (`crates/e2e/src/scenarios/upgrade.rs`). Wait
    for `kardamom_sequencer_sealer_version` 5.
-3. Send transfers. Then send feature 5. Wait for `carryStorage = active` on every member, and
-   check that B is the same on each.
-4. Restart executor 0 with `--carry-bytes` on the driver of member 0. Send transfers. Every
+3. Restart a sequencer. It sends no type 0 (`kardamom_egress_ref_frame_max_index` does not move).
+4. Send transfers. Send feature 5. Wait for `carryWindow` on every member.
+5. Restart executor 0 with `--carry-bytes` on the driver of member 0. Send transfers. Every
    receipt lands, and the validator agrees.
-5. Restart member 1 from its snapshot. Receipts keep landing.
+6. Restart member 1 from its snapshot. Receipts keep landing.
+7. Turn feature 5 off, then on again. Receipts keep landing.
 
 ### 11.4 The container shard `carry` (CI only)
 
 The plan of #781 ("E2E shard"), with these changes:
 
-- Deploy with `KARDAMOM_CARRY_BYTES=on` and `KARDAMOM_EXEC_ON_SEALERS=on`.
-- After `up`: deploy a lockbox (`kardamom-deploy`), and send the upgrade transactions of features
-  3, 4 and 5. Wait for `carryStorage = active`.
+- Deploy with `KARDAMOM_MEMBER_FEED=on` and `KARDAMOM_EXEC_ON_SEALERS=on`, and the batcher and
+  the validator on `--egress`.
+- After `up`: deploy a lockbox (`kardamom-deploy`). Send features 3, 4 and 5. Wait for
+  `carryWindow`.
 - Move the executors to carry mode one at a time with `KARDAMOM_CARRY_EXECUTORS`.
 - Run `smoke_gate`, 60 s at 100 tx/s, the converged-executors check, and `assert_persisted_state`.
-- Chaos cases in the shard: kill the leader within 2 s after B; wipe member 2 after B (the peer
-  seed copies the file); restart a member from a snapshot from before B.
+- Chaos cases: kill the leader within 2 s after the switch; stop a member before the switch and
+  start it after; turn feature 5 off and on under load.
 
 ### 11.5 Gate tests
 
 `test_deploy.py`: one case for each check of section 9 and each preflight of 10.1, with no job
-write on a refusal.
+write on a refusal. One case refuses feature 3 off, and one refuses feature 4 off, while feature
+5 is held or on.
 
 ## 12. The staging rollout
 
 Each step names its checks. Do not start a step until the checks of the step before pass.
 
-1. **Deploy the release** with `KARDAMOM_CARRY_BYTES` unset. It holds every PR of section 13.
-   - Each member: `snapshotReadsMax` 18, `carryStorage` `off`, `decisionVersion` 5,
-     `snapshotLatest` 16.
-   - `kardamom_sequencer_sealer_version` 5 on every partition.
+1. **Deploy the release.** It holds every PR of section 13. No switch of section 10 is on.
+   - Each member: `snapshotReadsMax` 18, `decisionVersion` 5, `snapshotLatest` 16,
+     `kardamom_sealer_window_exact` 0.
+   - Each sequencer: `kardamom_sequencer_sealer_version` 5, the floor 5.
    - No `FATAL` line in the sealer logs.
    - Rollback: allowed. Nothing wrote version 18.
-2. **Infra.** Apply the kardamom-infra change of 10.2. Check the directories, the tmpfs size, the
-   free memory and the free disk on each sealer node.
-3. **Ready the file.** Deploy with `KARDAMOM_CARRY_BYTES=on`. The deploy rolls member by member.
-   - Each member: `carryStorage` `ready`; the log line `cluster carry bytes` with the directory.
-   - `snapshotLatest` stays 16 on every member. The heap frame count does not change.
+2. **The references stop.** Restart one sequencer of each pair. Then watch
+   `kardamom_egress_ref_frame_max_index` for 30 minutes under the canary. It must not move.
+   Write down its value R and `kardamom_egress_ref_frame_max_block`.
+3. **The readers move to the egress.** Deploy the batcher and the validator with `--egress`.
+   - Each reader cursor gauge is above R.
+   - The validator agrees, and the batcher posts.
+4. **Infra and the feed.** Apply the kardamom-infra change of 10.2. Deploy with
+   `KARDAMOM_MEMBER_FEED=on`. The deploy rolls member by member.
+   - Each member: `kardamom_sealer_feed_state` 1 (idle).
    - The shared driver runs on each sealer node.
-4. **Move the executors to the sealer nodes.** Deploy with `KARDAMOM_EXEC_ON_SEALERS=on`. The
-   executor groups roll one at a time.
-   - Each executor runs on `sealer-<i>` and `kardamom_executor_block_number` follows the sealed
-     head.
-   - Receipts land (the canary).
-   - `kardamom_egress_copy_mismatch_total` does not move.
-5. **The upgrade check.** Pick the activation time: about 30 minutes ahead, at low load. Run
+5. **The executors move to the sealer nodes.** Deploy with `KARDAMOM_EXEC_ON_SEALERS=on`. The
+   groups roll one at a time.
+   - Each executor runs on `sealer-<i>`. `kardamom_executor_block_number` follows the sealed head.
+   - Receipts land (the canary). `kardamom_egress_copy_mismatch_total` does not move.
+6. **The upgrade check.** Pick the activation time: about 30 minutes ahead, at low load. Run
    `just sealer-upgrade-check staging 5 <activation_ms>`. It must pass.
-6. **The upgrade transaction on Sepolia. THE USER MUST APPROVE THIS STEP EXPLICITLY.** The Safe
+7. **The upgrade transaction on Sepolia. THE USER MUST APPROVE THIS STEP EXPLICITLY.** The Safe
    signs `ETHLockbox.initiateUpgrade(5, <activation_ms>)`. Nothing in this step happens without
    that approval.
-   - Each member logs `cluster FEATURE-ACTIVATION` for feature 5 with outcome `STORED`, and
-     reports `carryStorageActivationMs`.
-   - From here, `snapshotLatest` is 18, and a release rollback is refused (#780).
-7. **B.** At the activation time:
-   - Each member logs `cluster CARRY-STORAGE` with the same `fromIndex` and `fromBlock`, and
-     reports `carryStorage` `active`.
-   - `retainedFileFrames` grows. `retainedHeapFrames` does not grow.
-   - Receipts keep landing. The executors still read their cluster sessions.
-   - `cluster DROPPED txref-carry-storage` stays 0.
-8. **The posted head passes B.** Wait for `postedHead` above `carryStorageFromBlock`.
-   - `retainedHeapFrames` goes to 0, and the retained frames fall to `retention`.
-9. **Move the batcher and the validator to the egress.** For each, check that its cursor is above
-   `carryStorageFromBlock` and above `kardamom_egress_ref_frame_max_index`. Then deploy with
-   `--egress`.
-   - The validator agrees, and the batcher posts.
-10. **Move the executors to carry mode, one at a time.** `KARDAMOM_CARRY_EXECUTORS=0`, then `0,1`,
-    then `0,1,2`. Before each step, check `kardamom_executor_block_number` at or above
-    `carryStorageFromBlock + 32` for the executor.
-    - The log line `canonical entries via the member feed`.
-    - Receipts land. `kardamom_egress_copy_mismatch_total` does not move.
-    - The executor follows the sealed head. No `Unjoinable` fault.
-11. **Soak for 24 hours** under the canary. Then close #771.
+   - Each member logs `cluster FEATURE-ACTIVATION` for feature 5 with outcome `STORED`.
+   - `kardamom_sealer_feature_state{feature="5"}` is 1 on each member.
+   - From here, `snapshotLatest` is 18, and the preflight of #780 refuses a release rollback.
+8. **The switch.** At the activation time:
+   - Each member logs `cluster CARRY-WINDOW on` at the same block.
+     `kardamom_sealer_feature_state{feature="5"}` is 2, and `kardamom_sealer_window_exact` is 1.
+   - `kardamom_sealer_retained_frames` falls within `retention` frames on each member.
+   - `kardamom_sealer_snapshot_bytes` falls at the next snapshot.
+   - `kardamom_sealer_ref_refused_total` stays 0. Receipts keep landing.
+9. **The executors move to carry mode, one at a time.** `KARDAMOM_CARRY_EXECUTORS=0`, then
+   `0,1`, then `0,1,2`. The preflight checks the block of each executor against the reference
+   block.
+   - The log line `canonical entries via the member feed`.
+   - `kardamom_sealer_feed_state` 3 (live) on the member of the executor.
+   - Receipts land. `kardamom_egress_copy_mismatch_total` does not move. No `Unjoinable` fault.
+10. **Soak for 24 hours** under the canary. Record the snapshot gauges of section 15. Then close
+    #771.
 
-Drills on staging (a leader kill after B, a member wipe) need the approval of the user, and are
-not part of this plan. The chaos shard covers them in CI.
+Drills on staging (a leader kill after the switch, feature 5 off and on) need the approval of
+the user, and are not part of this plan. The chaos shard covers them in CI.
 
 ## 13. Pull requests
 
-Each PR passes `just style` and CI alone, and follows `docs/STYLE.md`.
+Each PR passes `just style` and CI alone, and follows `docs/STYLE.md`. One PR defines snapshot
+version 18 in full and writes it. No later PR changes those bytes under the same number.
 
 | PR | Title | Depends on | Size |
 |---|---|---|---|
-| C1 | types, sequencer: `FEATURE_CARRY_STORAGE`, kind 11 of feature 5, the hold until kind 17, job meta `carry_storage` | none | M |
-| C2 | sealer core: the schedule and the latch of feature 5, B in the state, the type-0 drop after B, snapshot 18 state section, `formats.toml` | #779 | M |
-| C3 | sealer service: `carryStorage=ready`, the config-to-state moves of 4.2, `TieredFrames`, the swap at B, the eviction rule of 4.4, the session form, snapshot 18 retention, the restore table | C2 | L |
-| C4 | sealer service: the feed at B with the B floor, the peer seed copy rule, the allocation of the file append, admin `/status` fields | C3 | M |
-| C5 | engine, executor, egress: the `Unjoinable` fault, the job meta `carried_ref_fault`, the egress gauge | none | S |
-| C6 | deploy: the three switches of 10.1, the staged executor roll, the preflights, the feature-5 checks of `upgrade_check.yml`, `carryBytes` out of must-match | #781, #780, C4, C1 | L |
-| C7 | e2e: the carry storage scenario | C1, C4, C5 | M |
+| C1 | wire: egress kind 18 `REF_REFUSED`, Java and Rust codecs on shared golden bytes | none | S |
+| C2 | sealer: feature 5, the flag and the schedule, snapshot 18 (the whole layout, with its golden test), the type-0 refusal, `setRules` and the exact window, admin and Prometheus gauges, `formats.toml` | #779, C1 | L |
+| C3 | sealer: the member feed on the heap (the walk on `RetainedFrames`, `FeedConfig` and `Feed` without the file), the feed gauge | C2 | M |
+| C4 | types, sequencer: `FEATURE_CARRY_WINDOW`, kind 11 of feature 5, the kept version and its floor, the republish on kind 18, job meta | C1 | M |
+| C5 | engine, executor, egress, batcher, validator: the `Unjoinable` fault and verdict, the reference gauges, the reader cursor gauges, job metas | none | M |
+| C6 | deploy: the three switches of 10.1, the staged executor roll, the sequencer floor, the preflights, the feature-5 and feature-3/4 checks of `upgrade_check.yml` | #781, #780, C2 to C5 | L |
+| C7 | e2e: the carry window scenario | C3, C4, C5 | M |
 | C8 | chaos: the `carry` shard with the activation step | C6, C7 | L |
-| C9 | docs: `cluster/sealer-service/README.md` (feature 5, the runbook), `docs/failure-modes.md`, `docs/formats.md`, `deploy/cluster/README.md` | C6 | S |
+| C9 | docs: `cluster/sealer-service/README.md` (feature 5, the runbook), `docs/failure-modes.md`, `docs/formats.md`, `deploy/cluster/README.md`, a note at D11 of the one-way spec | C6 | S |
 | infra | kardamom-infra: the sealer node resources of 10.2 | none | S |
 
-Sizes: S is up to about 200 lines, M up to about 600, L above that. C1 and C5 can start at once.
-C2 to C4 are one chain. The release of step 12.1 holds C1 to C6.
+Sizes: S is up to about 200 lines, M up to about 600, L above that. C1, C4 and C5 can start at
+once. The release of step 12.1 holds C1 to C6.
 
 ## 14. Considered and not chosen
 
-- **The member feed over the heap, with no file.** The one-way spec (D11) says that the file is
-  not needed: with the exact window, the heap has a fixed bound. A feed that walks `HeapFrames`
-  would remove the file, the token, the copy, the ready state and the tiered store. Only the
-  eviction rule would need an activation. It was not chosen because the heap snapshot carries
-  every frame of the window. At the 10,000 tx/s goal with a 60 s margin, the window is about
-  600,000 frames, about 150 MB on the heap and in each snapshot. Every member pauses for the
-  snapshot at the same log position. The file snapshot holds only the index. This trade needs the
-  user (question Q1).
-- **Copy the heap into the file at B.** No hybrid store. But the copy is as large as the heap,
-  which grows with the DA lag (F7). It would stall every member at once.
-- **Trim the heap to the window at B, then copy.** Bounded, but a batcher that reads the sealer
-  loses its frames above the posted head.
-- **Start the file empty at B and drop the heap.** No copy and no tiers. But a leader change just
-  after B would answer `REPLAY_UNAVAILABLE` to every session that replays, and a reference-mode
-  executor then needs a peer checkpoint.
-- **Decision version 6.** A version must be able to go back. The store cannot (4.1).
+- **The retained file at the activation (revision 1).** It kept the snapshot small at high
+  rates, but it needed a one-way latch, a store of two tiers, a ready state, the token, the
+  peer file copy, and a new snapshot layout with two sections. The heap design needs none of
+  them. Section 15 keeps the file for later.
+- **A hold of the offers on each new session until kind 17.** It needs a deadline and a queue.
+  The kept version needs neither.
+- **A silent drop of a type-0 reference.** With `--ack validated` it loses a transaction that the
+  client was told is accepted.
+- **Turn on the window with a condition on the posted head.** The gate check of section 9 is
+  simpler: the operator sends feature 5 only after the readers read the egress.
 - **Keep `carryBytes` must-match and stop all members.** The user ruled it out.
 
-## 15. Open questions for the user
+## 15. The retained file: a later spec, with a trigger
 
-- **Q1.** The file (this spec) or the heap feed of section 14? The file keeps the snapshot small
-  at high rates. The heap feed is much less code.
-- **Q2.** Feature 5 is one-way. Decision 23 of the carry spec says that an activation works both
-  ways. Accept the exception?
-- **Q3.** After B, the sealer drops a type-0 transaction reference (4.5). A sequencer of an older
-  release then loses its offers, unless its twin offers the same transaction. Accept?
-- **Q4.** After B, the sessions keep the bytes (4.6). Strip them later, in a separate change?
-- **Q5.** The executor groups roll one at a time with the staged roll (option (a) of #781, open
-  question 1)?
-- **Q6.** The egress stays on the executor nodes for now (#781, open question 2)?
-- **Q7.** A fleet rebuild from a seed starts on version 3 with the heap. Accept that the operator
-  sends features 3, 4 and 5 again, or extend the seed to carry the rules (#667)?
-- **Q8.** The activation time on staging: about 30 minutes ahead at low load, or 0 (at once)?
-- **Q9.** This release refuses `kardamom.cluster.carryBytes=true` at the start (4.2). No live
-  chain uses it. Accept?
+The file keeps only an index on the heap and in the snapshot. It is worth its cost only when the
+heap window costs too much. Measure these values on staging after step 12.10, and under each load
+test:
 
-## 16. Docs that change with the code
+- `kardamom_step_seconds{step="sealer.snapshot"}`, p99 and max: the pause of every member at the
+  snapshot.
+- `kardamom_sealer_snapshot_bytes` and `kardamom_sealer_retained_bytes`.
+- The GC pauses of the sealer JVM, and its heap after a GC, against `cluster_heap_mb` (384 MB by
+  default, `deploy/cluster/nomad/cluster.nomad.hcl:138-141`).
+- The window in time: `retention` divided by the transaction rate. It must cover the delay from
+  the seal to the store of the egress with a wide margin (one-way spec 6.4).
 
-- `cluster/sealer-service/README.md`: the feature 5 section, the replay window (the posted head
-  and B), the settings table (`carryStorage` in place of `carryBytes`), the snapshot table, and a
-  runbook "Activate carry storage".
-- `docs/failure-modes.md`: the replay window (`:167`), the retained file (`:171-184`), the new
-  fatal line, and the seed rebuild after B.
-- `docs/formats.md`: the feature form of `activation`, and the sealer snapshot row.
-- `deploy/cluster/README.md`: the three switches and the rollout of section 12.
-- `docs/specs/2026-10-21-one-way-pipeline.md`: a note at D11 that points to this spec.
+The proposed trigger for the file spec (Q2): the snapshot step p99 above 50 ms, or the retained
+bytes above a quarter of the heap, or a `retention` that must grow past the heap to keep a 60 s
+window.
+
+## 16. Open questions for the user
+
+- **Q1.** The sequencer starts from a floor that the deploy sets (section 5). A wrong floor lasts
+  until the first kind 17 of the session. The runbook sets it to 0 before a seed rebuild. Accept,
+  or prefer a hold of the offers only at the start of the process?
+- **Q2.** The trigger for the file spec (section 15): accept the proposed values?
+- **Q3.** The gate refuses feature 3 or 4 off while feature 5 is held or on (section 9). Accept?
+- **Q4.** `retention` stays at 65,536 frames on staging. At 200 tx/s that is about 5 minutes. At
+  the 10,000 tx/s goal it is about 6.5 s. Raise it when the load grows, with the gauges of
+  section 15?
+
+The answers to the questions of revision 1, from the review:
+
+- Strip the bytes from the sessions later: yes, in a separate change.
+- The staged roll of the executor groups (option (a) of #781): yes.
+- The egress stays on the executor nodes: yes.
+- A fleet rebuild from a seed: accepted. #667 stays open for the seed with the rules, and the
+  runbook of section 8 covers the rebuild.
+- The activation time on staging: about 30 minutes ahead, at low load.
+- `carryBytes`: moot. This design does not use it.
+
+## 17. Changes from revision 1
+
+| Finding of the review | Change |
+|---|---|
+| Decision: the heap feed, not the file | Sections 3 to 6 and 10 are new. The latch, B, `TieredFrames`, `carryStorage=ready`, the token, the file endpoint, the file copy, the file section of v18 and `openFileTier` are gone. Section 15 keeps the file for later. |
+| 1. The window before the readers | Section 7.3 gives the order and why it is not circular. Section 9 checks the readers before feature 5. |
+| 3. The sequencer hold | Section 5: the kept version with a floor, no hold. Section 4.3: kind 18, not a silent drop. |
+| 5. Two `Unjoinable` marks | Section 6: the verdict and the error. Section 11.2: the test. |
+| 6. The PR split and the snapshot number | Section 13: C2 defines v18 in full. Section 11.1: the golden v18 case. |
+| 7. The `FeedConfig` citation | `FeedConfig.java:38-46`. |
+| 8. Where `windowOnly` is computed | Section 4.4: `setRules`, its call points and their order. |
+| 9. The log position of the switch | Section 4.2, with the forced boundary. Section 11.1: the test. |
+| 10. The drain wording | "falls within `retention` frames" (4.4, 11.1, 12.8). |
+| 11. The failure modes of the heap design | Section 8: new rows. |
+| 12. Prometheus gauges | Section 4.7, and the readers and the egress in 7.1 and 7.2. |
+| 14. Tests that catch a fork | Section 11.1: byte equality at every cut, the forced boundary, the restore at each point, off and on again. Section 11.5: the feature-3/4 refusal. |
+| 15. Long sentences | Section 1.3, section 4.4 and section 8 now use short sentences. |
+| Questions | Section 16. |
