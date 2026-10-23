@@ -1,6 +1,6 @@
 # Carry activation: the exact window and the member feed on the heap
 
-- Status: revision 3, draft for review.
+- Status: revision 4, draft for review.
 - Issue: #771 (the carried path is not complete on staging). This spec closes gap 3 (the
   switch of a live chain) and gap 1 (the executors read the member feed).
 - The user decided on 2026-10-23:
@@ -18,7 +18,7 @@
   driver on the sealer nodes and the pinned executor groups), the preflight of #780, and #765
   (the exact window under version 5).
 - Section 17 maps each finding of the review of revision 1 to its change, and section 18 each
-  finding of the review of revision 2.
+  finding of the reviews of revisions 2 and 3.
 - Also builds on #768 (the `tx_drops` stream and `TxDrop`), for the drop record of section 5.
 
 ## 1. The problem
@@ -210,11 +210,25 @@ There are two rules. They change at two defined points of the same log entry.
   - The version tells the sequencer that the sealer runs version 5.
 - **Why a frame.** With `--ack validated`, the client has the hash before the sealer sees the
   offer. A silent drop would lose a transaction that the client was told is accepted.
-- **The sequencer side (section 5).** The sequencer raises its kept version to the version of the
-  frame. It publishes a `TxDrop` for the hash on `tx_drops` (#768), with the new reason
-  `SealerRefusedReference`. The egress then gives the hash the status `dropped`, and the client
-  sends the transaction again. The new submit goes out as type 7. The sequencer re-admits
-  nothing by itself (finding F7).
+- **The sequencer side (section 5).**
+  - The sequencer raises its kept version to the version of the frame.
+  - It publishes a `TxDrop` for the hash on `tx_drops` (#768), with the new reason
+    `SealerRefusedReference`.
+  - The egress then gives the hash the status `dropped`. The client sends the transaction again.
+    The new submit goes out as type 7.
+  - The sequencer re-admits nothing by itself (finding F7).
+- **The status `dropped` is provisional for this reason.** The twin sequencer can offer the same
+  transaction as type 7. Then the sealer orders the copy of the twin, and its receipt arrives
+  after the drop. A receipt of the hash always wins over a drop (#768,
+  `crates/types/src/tx_drop.rs`), so the status flips to `executed`.
+  - The window: from the drop to the receipt of the copy of the twin, about one receipt latency
+    (a few ms on staging, at most the 50 ms target).
+  - A resend in that window, or after it, is refused by the nonce guard, because the copy of the
+    twin used the nonce. The client then sees `executed` for the first hash.
+  - The drop text: `transaction dropped by the sealer, send it again`. Where a code is needed, it
+    is the geth code -32000.
+  - The client text in the docs of the status: "safe to send again; the status can still become
+    executed".
 - **When a type 0 comes after the switch.** Only from a sequencer of an older release, or from a
   sequencer with a wrong floor. The gate and the deploy prevent both (sections 9 and 10). If it
   still happens, the client sees the loss. It is not silent.
@@ -255,20 +269,33 @@ There are two rules. They change at two defined points of the same log entry.
   holds the same frames. At about 300 bytes a frame, 65,536 frames are about 20 MB. Today the
   snapshot holds every frame above the posted head.
 - **The size of `retention`.** `retention` must cover at least 60 s at the planned rate. A frame
-  is one record or one boundary, and the sealer seals one block every 2 s on staging
+  is one record or one boundary. The sealer seals one block every 2 s on staging
   (`kardamom.cluster.tickMs=2000`, `deploy/cluster/nomad/cluster.nomad.hcl:454`).
-  - Rule: `retention >= 60 x (planned tx/s + 0.5)`.
+  - The rule: `retention >= 60 x (planned tx/s + 0.5)`.
+  - **The cap: 131,072 frames.** A replay over a cluster session queues every wanted frame at
+    once (`handleReplayRequest`, `SealerEgress.java:269-275`). A session whose backlog passes
+    `SessionBacklogs.BYTE_LIMIT`, 64 MiB (`SessionBacklogs.java:74`), is closed
+    (`SealerEgress.java:238-244`). So a reader that replays from near the floor of a larger
+    window is closed, reconnects, and replays again, with no end. At about 300 bytes a frame,
+    131,072 frames are about 39 MB, well below 64 MiB. This design supports no larger value.
   - The spike of staging at 1,000 tx/s needs 60,030 frames. The default of 65,536
     (`SealerWire.java:501`, `cluster.nomad.hcl:31-34`) covers about 65 s. So the default holds.
-  - A load test at 2,000 tx/s needs 120,060 frames: set 131,072. The 10,000 tx/s goal needs
-    600,030 frames: set 655,360, and measure the heap first (section 15).
+  - A load test at 2,000 tx/s needs 120,060 frames: set 131,072, the cap.
+  - The cap covers 60 s up to about 2,180 tx/s (131,072 / 60 - 0.5). The 10,000 tx/s goal needs
+    600,030 frames, about 180 MB. That needs the file spec of section 15, or a change to the
+    replay path: a paced replay, or a larger backlog limit that a setting gives. Trigger 3 of
+    section 15 fires at about 2,180 tx/s, well before 10,000 tx/s.
   - The deploy sets it: `KARDAMOM_CLUSTER_RETENTION` gives the job variable `cluster_retention`
     (`deploy/cluster/ansible/roles/workloads/defaults/main.yml:154`, `:320`). The operator raises
     it before a load test, with a rolling deploy.
-  - `retention` is not a must-match setting. During a roll, two members can have two windows.
-    That changes no decision, and no state byte. It changes only the frames that each member can
-    replay, and the bytes of the heap section of its snapshot. The byte equality of section 11
-    holds for members with the same value. Q4 asks whether this is acceptable.
+  - `retention` is not a must-match setting, with two conditions:
+    1. A rolling change may only raise the value. The gate refuses a lower value unless
+       `KARDAMOM_ALLOW_MUST_MATCH` names `retention` (C6).
+    2. The value stays at or below the cap. The preflight refuses a value above 131,072.
+  - During a roll, two members can have two windows. That changes no decision and no state byte.
+    It changes only the frames that each member can replay, and the size of the heap section of
+    its snapshot. No protocol compares snapshot bytes across members. The byte equality of
+    section 11 holds for members with the same value. The sealer README says this (C9).
 - **Off again.** When the flag turns off, the posted rule comes back at the end of that entry.
   No frame comes back: the window keeps its frames, and new frames stay until they are posted.
 
@@ -398,9 +425,14 @@ All of this section is the v2 loop, which staging runs
      `DropReason::SealerRefusedReference`.
   3. It counts `kardamom_sequencer_ref_refused_total`.
   - The new reason goes at the end of `DropReason`: its layout is frozen. Its text is
-    `transaction dropped by the sealer, send it again`.
-  - The feed thread owns its own publication of `tx_drops`. An Aeron publication is not a queue.
-    A refused offer drops the record and counts it, as the stream is best effort (#768).
+    `transaction dropped by the sealer, send it again`, code -32000. The status is provisional
+    (4.3).
+  - The feed thread uses a clone of the `TxDropsPublisherHandle` of the publish loop, not a
+    second publication. The handle is `Clone`: the macro `declare_channel_handles!` makes a
+    `Clone` publisher struct around one `PubHandle` (`crates/log/src/aeron_live/handles/simple.rs`
+    on #768, the doc of the macro and `:273-286`).
+  - `publish_best_effort` does not wait. The Aeron thread retries a back-pressured offer for a
+    bounded time, then drops the frame and counts it. So the feed thread gets no new queue.
   - The v2 loop keeps no candidate after its offer (finding F7), so it re-admits nothing. The
     client sends the transaction again, and it goes out as type 7.
 - **Job meta.** The sequencer job gets the meta `sealer_version_kept = "true"` for the gate.
@@ -457,12 +489,17 @@ All of this section is the v2 loop, which staging runs
   its block. After the sequencer release of section 5, R stops moving.
 - **R is durable.** `Store::open` rebuilds the head from the last segment only (finding F8). So R
   goes in a side file of the store, `ref-mark`: `[index:u64 LE][block:u64 LE]`, 16 bytes.
-  - The store writes it after it appends a `RT_TXREF` frame whose index is above the mark. It
-    writes a temporary file, syncs it, and renames it over `ref-mark`. A crash leaves the old
+  - `append_one` (`crates/egress/src/store.rs:211-224`) notes the highest `RT_TXREF` frame of
+    the batch. `append` (`store.rs:118-119`) writes the mark once per batch, when that frame is
+    above the mark.
+  - It writes a temporary file, syncs it, and renames it over `ref-mark`. A crash leaves the old
     mark or the new mark, never a part.
-  - The store writes the mark after the frame and before its own sync of the segment. So after a
-    crash the mark is at or above every reference that the segment holds. A mark above the
-    segment only delays a switch. It never lets a reader meet a reference.
+  - The order: the frames of the batch, then the mark, then the sync of the segment
+    (`store.rs:128`). So after a crash the mark is at or above every reference that the segment
+    holds. A mark above the segment only delays a switch. It never lets a reader meet a
+    reference.
+  - The hook in `append_one` also covers the catch-up frames of `Input::Caught`. They reach the
+    store through the same `append` (`take_caught` and `flush`, `crates/egress/src/owner.rs:228-235`).
   - `Store::open` reads the mark. A missing mark is `(0, 0)`: no reference is stored.
   - A store copied from a peer at a scale-up (decision 27) copies the mark with the segments.
 - No other change. The egress compares the copies of the executors as today.
@@ -490,6 +527,10 @@ No step waits for a later step.
   canonical id. Then `TxRefOffer::canonical` (`entry.rs:237`) gives the `CanonicalTx`: the id,
   the lane and the envelope.
 - A relayed `RT_TX_OFFER` (type 5) stays refused. No sequencer sends type 5.
+- **The hazard that stays.** A relayed type 7 whose envelope does not hash to its id decodes to
+  `BadTx`, and the reader drops it. The reader then has a gap at that index. This is accepted:
+  the sequencer is trusted (decision 23 of the carry spec), and only a sequencer writes type 7.
+  The counter `kardamom_sealer_full_ref_below_v5_total` (4.3) shows each type 7 below version 5.
 - Every reader of the order then runs the entry with no join: the cluster reader of an executor
   (`crates/engine/src/reader/cluster/mod.rs:259-264`), the carried reader, the validator, the
   batcher and the egress.
@@ -720,8 +761,12 @@ Each step names its checks. Do not start a step until the checks of the step bef
 3. **The references stop.** Restart one sequencer of each pair. Then watch R on each egress
    instance for 30 minutes under the canary. It must not move. Write down the highest R and its
    block.
-4. **The readers move to the egress.** Deploy the batcher and the validator with `--egress`.
-   - Each reader cursor gauge is above the highest R.
+4. **The readers move to the egress.**
+   - Before the deploy: the posted cursor of the batcher (`kardamom_batcher_last_posted_block`)
+     and the block of the validator are above the highest `kardamom_egress_ref_frame_max_block`
+     of the egress instances.
+   - Deploy the batcher and the validator with `--egress`.
+   - After the deploy, the proof: each reader cursor gauge is above the highest R.
    - The validator agrees, and the batcher posts.
 5. **Infra and the feed.** Apply the kardamom-infra change of 10.2. Deploy with
    `KARDAMOM_MEMBER_FEED=on`. The deploy rolls member by member.
@@ -752,7 +797,9 @@ Each step names its checks. Do not start a step until the checks of the step bef
     - Receipts land. `kardamom_egress_copy_mismatch_total` does not move. No `Unjoinable` fault.
 11. **Soak for 24 hours** under the canary. Record the gauges of section 15. Then close #771.
 
-Before a load test above 1,000 tx/s, raise `retention` by the rule of 4.4, with a rolling deploy.
+Before a load test above 1,000 tx/s, raise `retention` by the rule of 4.4, with a rolling deploy:
+131,072 for 2,000 tx/s, the cap. A load test above about 2,180 tx/s needs the file spec of section
+15 or a change to the replay path (4.4).
 
 Drills on staging (a leader kill after the switch, feature 5 off and on) need the approval of
 the user, and are not part of this plan. The chaos shard covers them in CI.
@@ -770,10 +817,10 @@ version 18 in full and writes it. No later PR changes those bytes under the same
 | C3 | sealer: the member feed on the heap (the walk on `RetainedFrames`, `FeedConfig` and `Feed` without the file), the feed gauge | C2 | M |
 | C4 | types, sequencer: `FEATURE_CARRY_WINDOW`, kind 11 of feature 5, the kept version and its floor, kind 18 with the `TxDrop` and `DropReason::SealerRefusedReference`, job meta | #768, C0, C1 | M |
 | C5 | engine, executor, egress, batcher, validator: the `Unjoinable` fault and verdict, R with its durable mark, the reader cursor gauges, job metas | none | M |
-| C6 | deploy: the three switches of 10.1, the staged executor roll, the sequencer floor and its check, the preflights, the feature-5 and feature-3/4 checks of `upgrade_check.yml` | #781, #780, C0 to C5 | L |
+| C6 | deploy: the three switches of 10.1, the staged executor roll, the sequencer floor and its check, the preflights, the feature-5 and feature-3/4 checks of `upgrade_check.yml`, the raise-only and cap checks of `retention` | #781, #780, C0 to C5 | L |
 | C7 | e2e: the carry window scenario and the floor case | C3, C4, C5 | M |
 | C8 | chaos: the `carry` shard with the activation step | C6, C7 | L |
-| C9 | docs: `cluster/sealer-service/README.md` (feature 5, the runbook, `retention`), `docs/failure-modes.md`, `docs/formats.md`, `deploy/cluster/README.md`, a note at D11 of the one-way spec | C6 | S |
+| C9 | docs: `cluster/sealer-service/README.md` (feature 5, the runbook, `retention` with its cap, and the snapshot sizes that differ during a roll), `docs/failure-modes.md`, `docs/formats.md`, `deploy/cluster/README.md`, a note at D11 of the one-way spec | C6 | S |
 | infra | kardamom-infra: the sealer node resources of 10.2 | none | S |
 
 Sizes: S is up to about 200 lines, M up to about 600, L above that. C0, C1 and C5 can start at
@@ -812,17 +859,20 @@ The trigger for the file spec (accepted in review). Any one of these starts it:
 
 1. The snapshot step p99 is above 50 ms.
 2. The retained bytes are above a quarter of the heap.
-3. The `retention` of the rule of 4.4 does not fit in the heap.
+3. The `retention` of the rule of 4.4 is above the cap of 131,072 frames (4.4): a planned rate
+   above about 2,180 tx/s. It fires before the 10,000 tx/s goal.
 4. The GC pause p99 of the sealer is above 20 ms.
 
 ## 16. Open questions for the user
 
-- **Q1.** `retention` is not a must-match setting (4.4). During a rolling change, two members can
-  keep two windows. No decision changes, but the heap sections of their snapshots differ until
-  the roll ends. Accept, or make `retention` a must-match setting, which needs a coordinated
-  restart to raise it?
-- **Q2.** The text of the new drop reason: `transaction dropped by the sealer, send it again`.
-  Accept, or prefer a geth-like text such as `txpool is full`, which wallets already retry?
+None.
+
+The answers to the questions of revision 3, from the review:
+
+- `retention` stays a setting that does not have to match. A rolling change may only raise it,
+  and it stays at or below the cap (4.4).
+- The drop text: `transaction dropped by the sealer, send it again`, geth code -32000, with a
+  provisional status (4.3).
 
 The answers to the questions of revision 2, from the review:
 
@@ -862,7 +912,7 @@ The answers to the questions of revision 1, from the review:
 | 15. Long sentences | Section 1.3, section 4.4 and section 8 now use short sentences. |
 | Questions | Section 16. |
 
-## 18. Changes from revision 2
+## 18. Changes from revisions 2 and 3
 
 | Finding of the review of revision 2 | Change |
 |---|---|
@@ -876,3 +926,11 @@ The answers to the questions of revision 1, from the review:
 | 9. The egress kinds bump | Section 13: C1. |
 | 10. STE | Section 1.3 F1, section 4.2 and section 5 use short sentences. |
 | The questions | Section 16. `retention` gets its rule and the value for staging in 4.4. |
+| Review of revision 3, 1 (major). A full-window replay passes the backlog limit | Section 4.4: the cap of 131,072 frames, the 10,000 tx/s goal needs the file spec or a replay change, trigger 3 fires at about 2,180 tx/s. Section 12: the last line. Section 15: trigger 3. |
+| Review of revision 3, 2. The drop publisher | Section 5: a clone of `TxDropsPublisherHandle`, which is `Clone`. |
+| Review of revision 3, 3. The provisional status | Section 4.3: the window, the nonce guard, the drop text, the code and the client text. |
+| Review of revision 3, 4. The mark per batch | Section 7.2: once per `append` batch, before the segment sync, and the frames of `Input::Caught`. |
+| Review of revision 3, 5. The check before the readers move | Section 12, step 4: the posted cursor and the validator block against the reference block first. |
+| Review of revision 3, 6. The hazard of a bad type 7 | Section 7.4. |
+| Review of revision 3, 7. STE | Section 4.3, "The sequencer side", is a list of short sentences. |
+| Review of revision 3, Q1 and Q2 | Section 4.4: raise only, the cap, the README note. Section 13: C6 and C9. Section 16: none open. |
