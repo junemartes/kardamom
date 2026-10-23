@@ -135,6 +135,11 @@ final class HeapFrames implements RetainedFrames {
     }
 
     @Override
+    public boolean carriesBytes() {
+        return false;
+    }
+
+    @Override
     public boolean frontIsBoundary() {
         return boundaries[first];
     }

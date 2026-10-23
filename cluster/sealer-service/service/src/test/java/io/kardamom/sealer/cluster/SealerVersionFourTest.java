@@ -55,12 +55,7 @@ class SealerVersionFourTest {
 
     /** A kind-0 transaction reference of image {@code (lane 0, session 9)} at {@code position}. */
     private static byte[] ref(final int idTag, final long nonce, final long position) {
-        final ByteBuffer buf = ByteBuffer.allocate(SealerWire.TXREF_RECORD_LEN).order(ByteOrder.LITTLE_ENDIAN);
-        buf.put(SealerWire.KIND_INGRESS_RECORD).put(SENDER).putLong(nonce)
-            .putLong(SealerWire.POSITION_TAG | position).putLong(0L).putLong(0L)
-            .put(IngressFrames.recordId(idTag)).put(SealerWire.RT_TXREF)
-            .put((byte) 0).putInt(0).putInt((int) position).putInt(9);
-        return buf.array();
+        return IngressFrames.txRefFrame(idTag, SENDER, nonce, position);
     }
 
     /** {@link #ref} of another sender, with "no deadline" in place of the position. */

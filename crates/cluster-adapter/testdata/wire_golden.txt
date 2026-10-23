@@ -28,7 +28,14 @@
 #                   reference of tx_egress at stream position 0x0102030405
 #                   (tagged in the deadline field), lane 3, term 7, offset
 #                   9999, session 5, then the envelope of tx_offer_ingress;
-#                   the sealer relays it as tx_egress
+#                   a sealer on decision version 5 relays it as tx_egress
+# txref_offer_egress  egress kind 1, index 5: txref_offer_ingress as a
+#                   sealer below decision version 5 relays it, with record
+#                   type 7 and the reference fields; the reader decodes it
+#                   as the canonical entry of tx_egress
+# ref_refused       egress kind 18: the sealer on decision version 5 refuses
+#                   a reference of the transaction of tx_egress, sender
+#                   0x11..11, nonce 7
 tx_offer_ingress 0011111111111111111111111111111111111111110700000000000000921000000000000002010000000000000000000000000000abababababababababababababababababababababababababababababababab050302f86b01800000000807060504030201f0ffffff050000001111111111111111111111111111111111111111abababababababababababababababababababababababababababababababab000000009210000000000000
 tx_egress 0105000000000000007a000000abababababababababababababababababababababababababababababababab060302f86b01800000000807060504030201f0ffffff050000001111111111111111111111111111111111111111abababababababababababababababababababababababababababababababab000000009210000000000000
 relayed_ref 0f0500000000000000abababababababababababababababababababababababababababababababab06
@@ -44,3 +51,5 @@ txref_egress 0105000000000000002e000000cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc
 sealer_info 11030201000000000000
 feature_activation 0b05000000000000000200000000000000fa68e5cf8b010000
 txref_offer_ingress 0011111111111111111111111111111111111111110700000000000000050403020100004002010000000000000000000000000000abababababababababababababababababababababababababababababababab0703070000000f2700000500000002f86b01800000000807060504030201f0ffffff050000001111111111111111111111111111111111111111abababababababababababababababababababababababababababababababab000000009210000000000000
+txref_offer_egress 01050000000000000086000000abababababababababababababababababababababababababababababababab0703070000000f2700000500000002f86b01800000000807060504030201f0ffffff050000001111111111111111111111111111111111111111abababababababababababababababababababababababababababababababab000000009210000000000000
+ref_refused 12abababababababababababababababababababababababababababababababab1111111111111111111111111111111111111111070000000000000005
