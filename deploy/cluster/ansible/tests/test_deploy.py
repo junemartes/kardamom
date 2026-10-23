@@ -963,6 +963,9 @@ class DeployTest(Deploys):
         egress = plans['egress']
         self.assertTrue(egress['TaskGroups'][0]['Tasks'][0]['Config']['image'].endswith('@sha256:' + 'a' * 64))
         self.assertEqual(egress['TaskGroups'][0]['Count'], 2)
+        egress_args = self.job_args(egress)
+        self.assertEqual(egress_args[egress_args.index('--peers') + 1],
+                         ','.join(f'http://executor-{i}.node.dc1.consul:8548' for i in range(3)))
         services = {s['Name']: s for t in egress['TaskGroups'][0]['Tasks'] for s in t['Services']}
         self.assertEqual(services['kardamom-egress']['Checks'][0]['Path'], '/health')
         self.assertEqual(services['kardamom-egress-metrics']['Tags'], ['metrics'])
