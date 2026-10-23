@@ -143,6 +143,17 @@ variable "idle_flush_ms" {
 # The query endpoints that serve block references: every executor's
 # (group_vars/all.yml, ports.executor_nonce_query) and the validator's
 # (ports.validator_query), by the records the jobs register.
+# The canonical stream from the egress (--egress): the base URL of its
+# HTTP port, http://kardamom-egress.service.<datacenter>.consul:8548.
+# Empty, the batcher reads the cluster egress and joins the tx_data
+# lanes. Set it only on a chain where the carry flag is active. Ansible
+# deployment sets it from KARDAMOM_BATCHER_EGRESS.
+variable "egress_url" {
+  type        = string
+  description = "The base URL of the egress (--egress). Empty reads the cluster egress and the tx_data lanes."
+  default     = ""
+}
+
 variable "executor_query_port" {
   type    = number
   default = 9024
@@ -285,6 +296,7 @@ job "batcher" {
           var.idle_flush_ms != "" ? ["--idle-flush-ms", var.idle_flush_ms] : [],
           var.l1_silence_secs != "" ? ["--l1-silence-secs", var.l1_silence_secs] : [],
           var.da_lag_budget_blocks != "" ? ["--da-lag-budget-blocks", var.da_lag_budget_blocks] : [],
+          var.egress_url != "" ? ["--egress", var.egress_url] : [],
         )
       }
 
