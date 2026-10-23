@@ -576,11 +576,6 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
   - The duplicate cache holds the newest `--duplicate-cache-entries` hashes (default 65,536), with the recovered sender. A copy of a held hash answers its hash with no recovery and no publication. Only a published hash enters the cache. A hash that the sequencer dropped stays in the cache until it is evicted, so a copy of it in that time does not publish again. A cache miss costs one more recovery and publication, and the window of the sealer drops the second copy.
   - An accepted transaction can still drop later. The client reads the result through the egress: the receipt read or the status feed.
   - Proof: `crates/ingress/src/proxy/validated_tests.rs`.
-- **The ingress inside a sequencer process (the job variable `ingress`)**
-  - The ingress and the sequencer of a lane share one process, so they die together. Only the in-flight clients of that process pay. They retry against another process. The twin keeps the lane.
-  - At a stop, the ingress drains first, while the sequencer loops still run, so a parked submit still gets its verdict. Then the loops stop. The kill timeout of the job (`tx_ttl_ms` plus 10 s) covers the drain.
-  - The ingress runs on its own Tokio runtime, so a JSON-RPC burst takes no worker of the sequencer runtime. It shares the media driver and the CPU of the node with the sequencer.
-  - Proof: `args::tests` in the sequencer binary (the subcommand and its default off), and `test_sequencer.py` (the job with the variable on and off). No chaos case covers this mode yet.
 - The JSON-RPC surface is in [`json-rpc.md`](json-rpc.md).
 
 ## Sequencer (2 shards x 2 racing replicas)
