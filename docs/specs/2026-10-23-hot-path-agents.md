@@ -1,7 +1,7 @@
 # Hot-path agents: the transaction path off tokio
 
-- Status: revision 3, approved by the design review on 2026-10-23; waiting for the decision of the
-  user. Not implemented.
+- Status: revision 3, approved by the design review on 2026-10-23. Accepted by the user on
+  2026-10-23. Not implemented.
 - The user asked on 2026-10-23 to move the hot path off tokio.
 - Related: #774 (the timer tick of the batch verifier, and the split of a batch over the blocking
   pool) and #776 (the async publish ack), both open;
