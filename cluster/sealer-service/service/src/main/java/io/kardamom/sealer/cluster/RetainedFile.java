@@ -230,6 +230,11 @@ final class RetainedFile implements RetainedFrames {
     }
 
     @Override
+    public long bytes() {
+        return Math.subtractExact(headPos, frontPos);
+    }
+
+    @Override
     public boolean carriesBytes() {
         return true;
     }

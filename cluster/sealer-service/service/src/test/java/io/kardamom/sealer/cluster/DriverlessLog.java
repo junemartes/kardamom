@@ -58,6 +58,13 @@ final class DriverlessLog {
             return log.stream().map(this::apply).toList();
         }
 
+        /** The pipeline metrics of the member as Prometheus text, with the labels of member 1. */
+        String metrics() {
+            final MetricsText text = new MetricsText(1);
+            svc.metrics().renderTo(text);
+            return text.toString();
+        }
+
         /** Every egress frame that the session got, without the status frames. */
         List<byte[]> frames() {
             return sequencer.offered.stream().filter(f -> f[0] != SealerWire.EGRESS_KIND_STATUS).toList();

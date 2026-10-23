@@ -665,6 +665,16 @@ A ClusteredService cannot see its idle time, so the loop exports busy time only.
 | `kardamom_sealer_messages_total{kind}` | The session messages, by the kind byte. A kind shows after its first message. |
 | `kardamom_sealer_egress_backpressure_total{result}` | The egress offers that queued their frame. `result` is `back_pressured`, `admin_action` or `not_connected`. A frame behind an open backlog does not count. |
 | `kardamom_sealer_egress_stalls_total` | The sessions closed because their backlog made no progress for 1 s. |
+| `kardamom_sealer_retained_frames`, `kardamom_sealer_retained_bytes` | The retained frames and their bytes, at the end of the last log entry. |
+| `kardamom_sealer_retained_store` | The store of the retained frames: 0 heap, 1 file. |
+| `kardamom_sealer_window_exact` | 1 when the egress keeps only its replay window, at any posted head. |
+| `kardamom_sealer_decision_version` | The decision version of the open block. |
+| `kardamom_sealer_feature_state{feature}` | Features 3, 4 and 5: 0 no activation held, 1 held and off, 2 on. |
+| `kardamom_sealer_feature_activation_ms{feature}` | The time of the newest held activation of the feature, 0 when none. |
+| `kardamom_sealer_feature_unsupported_total` | The activations of feature 5 on a member with the retained file. The member never stores them. |
+| `kardamom_sealer_snapshot_bytes`, `kardamom_sealer_snapshot_version` | The size and the version of the newest snapshot that the member took or restored. |
+| `kardamom_sealer_ref_refused_total` | The references of record type 0 that the carry window refused with egress kind 18. |
+| `kardamom_sealer_full_ref_below_v5_total` | The full references (record type 7) that the member ordered below decision version 5. |
 
 The admin thread reads these series from the status of the member and from the Aeron counters in the CnC file of its media driver. A series of an Aeron counter that does not exist is absent.
 

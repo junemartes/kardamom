@@ -27,7 +27,9 @@ import org.junit.jupiter.api.Test;
  * retained ring, in steady state. Eight ingress images take turns, each one
  * a message further, and each reference comes twice, as from twin
  * sequencers. The gate measures only the delivery of each reference: the
- * ticks and the posted cursors between the blocks are not measured.
+ * ticks and the posted cursors between the blocks are not measured. A
+ * second case runs with the carry window on, so each new frame evicts the
+ * oldest one of the replay window at once.
  *
  * <p>The member is a follower with no client session, so no frame goes to
  * a stub session that copies it. The {@code allocationGate} task runs this
@@ -66,9 +68,22 @@ final class CarriedPathAllocationTest {
 
     @Test
     void a_full_reference_and_its_copy_allocate_at_most_their_baselines() {
+        measure(false, "carried_fresh", "carried_copy");
+    }
+
+    @Test
+    void with_the_carry_window_a_full_reference_and_its_copy_allocate_at_most_their_baselines() {
+        measure(true, "carried_window_fresh", "carried_window_copy");
+    }
+
+    /** Run the references on version 5, with the carry window when {@code window}, and check both baselines. */
+    private void measure(final boolean window, final String freshCase, final String copyCase) {
         cluster.role = io.aeron.cluster.service.Cluster.Role.FOLLOWER;
         svc.start(cluster, Optional.empty());
         switchToVersionFive();
+        if (window) {
+            switchOnTheCarryWindow();
+        }
         for (int i = 0; i < WARMUP; i++) {
             offerTwice(i);
         }
@@ -79,8 +94,8 @@ final class CarriedPathAllocationTest {
         }
         final double fresh = (double) freshBytes / MEASURED;
         final double copy = (double) copyBytes / MEASURED;
-        check("carried_fresh", fresh);
-        check("carried_copy", copy);
+        check(freshCase, fresh);
+        check(copyCase, copy);
     }
 
     /** Version 4 at the boundary of epoch 2, version 5 at the boundary of epoch 3. */
@@ -94,6 +109,14 @@ final class CarriedPathAllocationTest {
         deliver(IngressFrames.originRecordFrame(IngressFrames.canonicalId(1003), 3, 1, new byte[] {2}));
         tick();
         assertEquals(5, svc.decisionRules().version());
+    }
+
+    /** The carry window at the boundary of epoch 4. */
+    private void switchOnTheCarryWindow() {
+        deliver(IngressFrames.featureActivationFrame(4, VersionSwitch.FEATURE_CARRY_WINDOW, 1L));
+        deliver(IngressFrames.originRecordFrame(IngressFrames.canonicalId(1004), 4, 1, new byte[] {2}));
+        tick();
+        assertTrue(svc.metrics().carry().carryWindow());
     }
 
     /** Offer reference {@code i} and its copy, and close the block at each block end. */

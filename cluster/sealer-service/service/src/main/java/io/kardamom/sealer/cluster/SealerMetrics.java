@@ -1,6 +1,8 @@
 package io.kardamom.sealer.cluster;
 
+import io.kardamom.sealer.VersionSwitch;
 import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.stream.IntStream;
@@ -39,6 +41,36 @@ final class SealerMetrics {
     }
 
     /**
+     * The rules of the open block, for the admin thread: the store of the
+     * retained frames, whether the egress keeps only its replay window, the
+     * decision version, whether the rules of the carry window apply, and
+     * the state of each feature. The service sets a new value at the start
+     * and at each change.
+     */
+    record Rules(
+            boolean fileStore,
+            boolean windowExact,
+            int decisionVersion,
+            boolean carryWindow,
+            List<VersionSwitch.Feature> features) {
+        /** The rules before the start. */
+        static final Rules START = new Rules(false, false, VersionSwitch.OFF_VERSION, false, List.of());
+
+        /** The store of the retained frames: {@code heap} or {@code file}. */
+        String retainedStore() {
+            return fileStore ? "file" : "heap";
+        }
+
+        /** The state of the carry window. */
+        VersionSwitch.Feature window() {
+            return features.stream()
+                .filter(f -> f.id() == VersionSwitch.FEATURE_CARRY_WINDOW)
+                .findFirst()
+                .orElse(new VersionSwitch.Feature(VersionSwitch.FEATURE_CARRY_WINDOW, VersionSwitch.Feature.NONE, 0L, 0L));
+        }
+    }
+
+    /**
      * The labels of the retryable offer results, at index {@code -result - 1}:
      * NOT_CONNECTED is -1, BACK_PRESSURED is -2, and ADMIN_ACTION is -3.
      */
@@ -64,6 +96,14 @@ final class SealerMetrics {
     private final AtomicLongArray messages = new AtomicLongArray(256);
     private final AtomicLongArray refusals = new AtomicLongArray(REFUSALS.length);
     private final AtomicLong egressStalls = new AtomicLong();
+    private final AtomicLong retainedFrames = new AtomicLong();
+    private final AtomicLong retainedBytes = new AtomicLong();
+    private final AtomicLong snapshotBytes = new AtomicLong();
+    private final AtomicLong snapshotVersion = new AtomicLong();
+    private final AtomicLong refRefused = new AtomicLong();
+    private final AtomicLong fullRefBelowV5 = new AtomicLong();
+    private final AtomicLong featureUnsupported = new AtomicLong();
+    private volatile Rules rules = Rules.START;
     /** The offers since the last sampled one. Only the service thread reads it. */
     private int offersToSample;
 
@@ -174,6 +214,46 @@ final class SealerMetrics {
         egressBacklogBytes.lazySet(bytes);
     }
 
+    /** Set the retained frames and their bytes, at the end of a log entry. */
+    void retained(final long frames, final long bytes) {
+        retainedFrames.lazySet(frames);
+        retainedBytes.lazySet(bytes);
+    }
+
+    /** Set the version and the size of the newest snapshot that the member took or restored. */
+    void snapshot(final int version, final long bytes) {
+        snapshotVersion.lazySet(version);
+        snapshotBytes.lazySet(bytes);
+    }
+
+    /** Count one transaction reference of record type 0 that the carry window refused, and return the total. */
+    long refRefused() {
+        return increment(refRefused);
+    }
+
+    /** Count one full reference that the member ordered below decision version 5. */
+    void fullRefBelowV5() {
+        increment(fullRefBelowV5);
+    }
+
+    /** Count one activation of the carry window on a member with the retained file, and return the total. */
+    long featureUnsupported() {
+        return increment(featureUnsupported);
+    }
+
+    /** Set the rules of the open block. */
+    void rules(final Rules next) {
+        rules = next;
+    }
+
+    /** The carry part of the admin status: the store, the carry window, and the retained frames. */
+    MemberStatus.Carry carry() {
+        final Rules now = rules;
+        final VersionSwitch.Feature window = now.window();
+        return new MemberStatus.Carry(now.retainedStore(), now.carryWindow(), window.activationOrigin(),
+            window.activationMs(), retainedFrames.get(), retainedBytes.get());
+    }
+
     /** Write every series. Only the admin thread calls this. */
     void renderTo(final MetricsText text) {
         text.family("kardamom_loop_nanoseconds_total", "counter",
@@ -191,6 +271,46 @@ final class SealerMetrics {
             .sample("kardamom_queue_depth", "queue=\"sealer.egress_backlog\"", egressBacklogBytes.get())
             .sample("kardamom_queue_depth", "queue=\"sealer.ordering_window\"", orderingWindow.get());
         renderCounters(text);
+        renderCarry(text);
+    }
+
+    /** The retained frames, the snapshot, the rules of the open block, and the counters of the carry window. */
+    private void renderCarry(final MetricsText text) {
+        final Rules now = rules;
+        text.single("kardamom_sealer_retained_frames", "gauge", "The retained frame count.", retainedFrames.get())
+            .single("kardamom_sealer_retained_bytes", "gauge", "The bytes of the retained frames.", retainedBytes.get())
+            .single("kardamom_sealer_retained_store", "gauge",
+                "The store of the retained frames: 0 heap, 1 file.", now.fileStore() ? 1L : 0L)
+            .single("kardamom_sealer_window_exact", "gauge",
+                "1 when the egress keeps only its replay window, else 0.", now.windowExact() ? 1L : 0L)
+            .single("kardamom_sealer_decision_version", "gauge",
+                "The decision version of the open block.", now.decisionVersion())
+            .single("kardamom_sealer_snapshot_bytes", "gauge",
+                "The size of the newest snapshot that the member took or restored.", snapshotBytes.get())
+            .single("kardamom_sealer_snapshot_version", "gauge",
+                "The version of the newest snapshot that the member took or restored.", snapshotVersion.get())
+            .single("kardamom_sealer_ref_refused_total", "counter",
+                "The transaction references of record type 0 that the carry window refused.", refRefused.get())
+            .single("kardamom_sealer_full_ref_below_v5_total", "counter",
+                "The full references that the member ordered below decision version 5.", fullRefBelowV5.get())
+            .single("kardamom_sealer_feature_unsupported_total", "counter",
+                "The activations of the carry window on a member with the retained file.", featureUnsupported.get());
+        text.family("kardamom_sealer_feature_state", "gauge",
+            "The state of each feature: 0 no activation held, 1 held and off, 2 on.");
+        now.features().forEach(f -> text.sample("kardamom_sealer_feature_state", featureLabel(f), f.state()));
+        text.family("kardamom_sealer_feature_activation_ms", "gauge",
+            "The time of the newest held activation of each feature, 0 when none.");
+        now.features().forEach(f -> text.sample(
+            "kardamom_sealer_feature_activation_ms", featureLabel(f), unsigned(f.activationMs())));
+    }
+
+    /** A u64 value as a gauge value: a time of {@code 2^64 - 1} keeps a feature off. */
+    private static double unsigned(final long value) {
+        return value >= 0 ? value : 0x1p64 + value;
+    }
+
+    private static String featureLabel(final VersionSwitch.Feature feature) {
+        return "feature=\"" + feature.id() + "\"";
     }
 
     private void renderCounters(final MetricsText text) {

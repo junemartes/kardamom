@@ -7,6 +7,7 @@ import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -162,11 +163,12 @@ public final class CanonicalSealerState {
      * schedule of the carry flag after the replay windows: see
      * {@link VersionSwitch#writeCarryTo}. Version 17 has the state section
      * of version 16, and the retention section of the retained file after
-     * it.
+     * it. Version 18 is version 16 with the carry window section after the
+     * schedule of the carry flag: see {@link VersionSwitch#writeWindowTo}.
      *
      * <p>This is the newest version that {@link #load} reads.</p>
      */
-    private static final int SNAPSHOT_READ_VERSION = 17;
+    private static final int SNAPSHOT_READ_VERSION = 18;
 
     /**
      * The version that {@link #takeSnapshot()} writes when the version
@@ -183,6 +185,17 @@ public final class CanonicalSealerState {
      * carry flag comes only after every member reads version 16.
      */
     public static final int CARRY_SNAPSHOT_VERSION = 16;
+
+    /**
+     * The version that {@link #takeSnapshot()} writes when the version
+     * switch holds an activation of the carry window: version 16, then the
+     * flag and the schedule of the carry window. A member that reads only
+     * up to version 17 refuses it, so the upgrade transaction of the carry
+     * window comes only after every member reads version 18. A member with
+     * the retained file never holds such an activation, so it never writes
+     * version 18.
+     */
+    public static final int WINDOW_SNAPSHOT_VERSION = 18;
 
     /** The version with the decision rules of one activation; {@link #load} still reads it. */
     private static final int ONE_ACTIVATION_SNAPSHOT_VERSION = 13;
@@ -1015,6 +1028,30 @@ public final class CanonicalSealerState {
     }
 
     /**
+     * Whether the rules of the carry window apply in the open block: a
+     * transaction reference of record type 0 is refused, and the egress
+     * keeps only its replay window.
+     */
+    public boolean carryWindowRules() {
+        return versions.carryWindowRules();
+    }
+
+    /** The state of each feature of the version switch, for the admin endpoint. */
+    public List<VersionSwitch.Feature> features() {
+        return versions.features();
+    }
+
+    /**
+     * Mark the state of a member that keeps its retained frames in a file:
+     * it then takes no activation of the carry window
+     * ({@link VersionSwitch.Outcome#UNSUPPORTED}). The service calls it
+     * before the first entry, at each start.
+     */
+    public void fileStore(final boolean file) {
+        versions.fileStore(file);
+    }
+
+    /**
      * Take a feature activation record. It only stores the schedule: the
      * version changes at a block boundary ({@link #onTick}).
      */
@@ -1643,11 +1680,16 @@ public final class CanonicalSealerState {
 
     /**
      * The version that {@link #takeSnapshot()} writes:
-     * {@link #CARRY_SNAPSHOT_VERSION} when the version switch holds an
-     * activation of the carry flag, {@link #SWITCH_SNAPSHOT_VERSION} when
-     * it holds another activation, else {@link #SNAPSHOT_WRITE_VERSION}.
+     * {@link #WINDOW_SNAPSHOT_VERSION} when the version switch holds an
+     * activation of the carry window, {@link #CARRY_SNAPSHOT_VERSION} when
+     * it holds an activation of the carry flag,
+     * {@link #SWITCH_SNAPSHOT_VERSION} when it holds another activation,
+     * else {@link #SNAPSHOT_WRITE_VERSION}.
      */
     public int snapshotVersion() {
+        if (versions.holdsWindowActivation()) {
+            return WINDOW_SNAPSHOT_VERSION;
+        }
         if (versions.holdsCarryActivation()) {
             return CARRY_SNAPSHOT_VERSION;
         }
@@ -1667,16 +1709,18 @@ public final class CanonicalSealerState {
      * void ledger, 11 has the void ledger and the recorded cursors, 12 has
      * neither, 14 has the void ledger and the decision rules, 15 has
      * version 14 with the version switch and the replay windows, 16 has
-     * version 15 with the schedule of the carry flag, and 17 has the layout
-     * of version 16. A version-10 snapshot of a state is the same bytes in
-     * every release that writes version 10.
+     * version 15 with the schedule of the carry flag, 17 has the layout of
+     * version 16, and 18 has version 16 with the carry window section. A
+     * version-10 snapshot of a state is the same bytes in every release
+     * that writes version 10.
      *
-     * @param version 10, 11, 12, 14, 15, 16 or 17
+     * @param version 10, 11, 12, 14, 15, 16, 17 or 18
      */
     byte[] takeSnapshot(int version) {
         boolean withVoids = version != RETAINED_FILE_SNAPSHOT_VERSION;
         boolean withCursors = version == CURSORS_SNAPSHOT_VERSION;
-        boolean withCarry = version == CARRY_SNAPSHOT_VERSION || version == FILE_SNAPSHOT_VERSION;
+        boolean withWindow = version == WINDOW_SNAPSHOT_VERSION;
+        boolean withCarry = version == CARRY_SNAPSHOT_VERSION || version == FILE_SNAPSHOT_VERSION || withWindow;
         boolean withSwitch = version == SWITCH_SNAPSHOT_VERSION || withCarry;
         boolean withRules = version == SNAPSHOT_WRITE_VERSION || withSwitch;
         int idCount = dedup.size();
@@ -1693,7 +1737,8 @@ public final class CanonicalSealerState {
                 + (withCursors ? recorded.snapshotLen() : 0)
                 + (withRules ? rules.snapshotLen() : 0)
                 + (withSwitch ? versions.snapshotLen() + windows.snapshotLen() : 0)
-                + (withCarry ? versions.carrySnapshotLen() : 0);
+                + (withCarry ? versions.carrySnapshotLen() : 0)
+                + (withWindow ? versions.windowSnapshotLen() : 0);
         ByteBuffer buf = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN);
         buf.putInt(SNAPSHOT_MAGIC);
         buf.putInt(version);
@@ -1747,18 +1792,22 @@ public final class CanonicalSealerState {
         if (withCursors) {
             recorded.writeTo(buf);
         }
-        // v14 to v17: the decision rules.
+        // v14 to v18: the decision rules.
         if (withRules) {
             rules.writeTo(buf);
         }
-        // v15 to v17: the version switch and the replay windows.
+        // v15 to v18: the version switch and the replay windows.
         if (withSwitch) {
             versions.writeTo(buf);
             windows.writeTo(buf);
         }
-        // v16 and v17: the schedule of the carry flag.
+        // v16 to v18: the schedule of the carry flag.
         if (withCarry) {
             versions.writeCarryTo(buf);
+        }
+        // v18 only: the flag and the schedule of the carry window.
+        if (withWindow) {
+            versions.writeWindowTo(buf);
         }
         return buf.array();
     }
@@ -1990,6 +2039,9 @@ public final class CanonicalSealerState {
         if (version >= CARRY_SNAPSHOT_VERSION) {
             state.versions.readCarryFrom(buf);
         }
+        if (version == WINDOW_SNAPSHOT_VERSION) {
+            state.versions.readWindowFrom(buf);
+        }
         // A version-1 snapshot (before the guard existed) restores an empty
         // guard map, so every sender re-seeds on its next record. This is
         // trust-on-first-sight, and it causes no false rejects. A version-1
@@ -2002,7 +2054,8 @@ public final class CanonicalSealerState {
         // the peer's next record. A version-10 or older snapshot restores
         // no recorded cursor, so the record-lag guard refuses nothing until
         // the first cursor. A snapshot without the decision rules
-        // restores a state that holds no activation.
+        // restores a state that holds no activation. A snapshot before
+        // version 18 restores the carry window off, with no schedule.
         state.canonicalCount = canonicalCount;
         state.restoredSnapshotVersion = version;
         return state;

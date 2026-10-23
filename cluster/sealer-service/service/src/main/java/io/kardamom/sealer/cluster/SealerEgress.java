@@ -68,11 +68,11 @@ final class SealerEgress {
      * This is deterministic across members, since it is derived from the
      * replicated log.
      *
-     * <p>The eviction rule follows the decision version of the state
-     * ({@link #setDecisionVersion}):</p>
+     * <p>The eviction rule follows the decision version and the carry
+     * window of the state ({@link #setRules}):</p>
      * <ul>
-     *   <li>Below version 5, or on a member that keeps its frames on the
-     *       heap, the window of {@link #retentionCap} frames is a minimum,
+     *   <li>Below version 5, or on a heap member while the carry window is
+     *       off, the window of {@link #retentionCap} frames is a minimum,
      *       not a maximum: a frame past the window is evicted
      *       only when its block is posted to L1 ({@link #postedHead}).
      *       Nothing a batcher has not confirmed on L1 is dropped, so the
@@ -81,10 +81,10 @@ final class SealerEgress {
      *       {@code daLagBudgetBlocks} past the posted head, so the
      *       stretched window holds at most the budget's blocks plus one
      *       flush.</li>
-     *   <li>Under version 5 on a member that carries the bytes
-     *       ({@link RetainedFrames#carriesBytes}), the window is the whole
-     *       rule: a frame past the window is evicted at once, at any posted
-     *       head. So the
+     *   <li>Under version 5 with the carry window on, or on a member that
+     *       carries the bytes ({@link RetainedFrames#carriesBytes}), the
+     *       window is the whole rule: a frame past the window is evicted at
+     *       once, at any posted head. So the
      *       retained frames have a fixed bound at any DA lag. A reader
      *       below the window gets REPLAY_UNAVAILABLE and recovers from
      *       another source. The DA-lag guard still refuses user records,
@@ -110,10 +110,12 @@ final class SealerEgress {
     private long postedHead;
     /**
      * Whether a frame past the window leaves at once, at any posted head:
-     * decision version 5 on a member that carries the bytes. Without the
-     * bytes, no member feed runs: the executors and the batcher read
-     * references, which the egress cannot serve, so the posted rule stays. The state sets the version at a block boundary,
-     * and the service echoes it here at the end of that log entry.
+     * decision version 5 with the carry window on, or on a member that
+     * carries the bytes. Before the carry window, the executors and the
+     * batcher can read references, which the egress cannot serve, so a
+     * heap member keeps the posted rule. The state sets the version and the
+     * carry window at a block boundary, and the service echoes them here at
+     * the end of that log entry.
      */
     private boolean windowOnly;
 
@@ -154,10 +156,10 @@ final class SealerEgress {
     }
 
     /**
-     * Adopt the posted head, and evict what the window no longer needs:
-     * below version 5, the frames past the window whose block is now
-     * posted. Log-driven, so every member evicts the same frames at the
-     * same point of the log.
+     * Adopt the posted head, and evict with the current rule what the
+     * window no longer needs: under the posted rule, the frames past the
+     * window whose block is now posted. Log-driven, so every member evicts
+     * the same frames at the same point of the log.
      */
     void setPostedHead(final long postedHead) {
         this.postedHead = postedHead;
@@ -165,20 +167,32 @@ final class SealerEgress {
     }
 
     /**
-     * Adopt the eviction rule of decision version {@code version}, and
-     * evict what the rule no longer keeps. The service calls it at the
-     * start and at the end of each log entry that switched the version. So
-     * every member, from the log or from a snapshot, evicts the same frames
-     * at the same point of the log.
+     * Adopt the eviction rule of decision version {@code version} with the
+     * carry window {@code carryWindow}, and evict what the rule no longer
+     * keeps. The service calls it at the start, after the retention is
+     * restored and before the posted head, and at the end of each log entry
+     * that switched the version or the carry window. So every member, from
+     * the log or from a snapshot, evicts the same frames at the same point
+     * of the log.
      */
-    void setDecisionVersion(final int version) {
-        windowOnly = version == VersionSwitch.CARRY_VERSION && retained.carriesBytes();
+    void setRules(final int version, final boolean carryWindow) {
+        windowOnly = version == VersionSwitch.CARRY_VERSION && (carryWindow || retained.carriesBytes());
         prune();
+    }
+
+    /** Whether a frame past the window leaves at once, at any posted head. */
+    boolean windowOnly() {
+        return windowOnly;
     }
 
     /** The frames retained for replay. */
     long retainedCount() {
         return retained.count();
+    }
+
+    /** The bytes of the frames retained for replay. */
+    long retainedBytes() {
+        return retained.bytes();
     }
 
     /** The oldest record index still retained. */
@@ -399,6 +413,20 @@ final class SealerEgress {
         buf.putLong(pos, atBlock, ByteOrder.LITTLE_ENDIAN);
         pos += Long.BYTES;
         offerToSession(session, pos);
+    }
+
+    /**
+     * Frame and offer the refusal of a transaction reference of record
+     * type 0 to the offering session:
+     * {@code [kind:18][canonical_id:32][sender:20][nonce:u64 LE][decision_version:u8]}.
+     */
+    void offerRefRefused(
+            final ClientSession session,
+            final byte[] canonicalId,
+            final byte[] sender20,
+            final long nonce,
+            final int decisionVersion) {
+        offerToSession(session, frames.refRefused(canonicalId, sender20, nonce, decisionVersion));
     }
 
     /**
