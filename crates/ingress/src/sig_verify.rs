@@ -104,11 +104,14 @@ impl RequestCursor {
 /// caller rejects the tx at the RPC boundary.
 ///
 /// A batch smaller than this threshold is recovered on a single blocking
-/// thread. Splitting a 1-3 tx batch costs more in hops than the 42µs per
-/// tx it would save. At deployed rates, the ring almost always holds one
-/// transaction (a 50µs window at 3.8k tx/s sees 0.2 arrivals on
+/// thread. Each extra worker costs a wake of a pool thread, and on a
+/// shared 4-vCPU node a wake costs about as much as several recoveries
+/// (staging, 2026-10-23: a batch of about 5 split over 4 workers took
+/// 0.54 ms for 0.21 ms of work). 16 recoveries are about 0.7 ms of work,
+/// enough to pay for the wakes. At deployed rates, the ring almost always
+/// holds one transaction (a 50µs window at 3.8k tx/s sees 0.2 arrivals on
 /// average), so this is the common path.
-const PARALLEL_THRESHOLD: usize = 4;
+const PARALLEL_THRESHOLD: usize = 16;
 
 /// Intake capacity, as a multiple of the ring depth. A full intake
 /// makes `recover` wait, so overload turns into backpressure on the RPC
@@ -292,8 +295,13 @@ impl BatchVerifier {
     #[must_use]
     pub fn new(depth: NonZeroUsize, flush_window: Duration) -> Self {
         use nonzero_ext::nonzero;
-        let parallelism = std::thread::available_parallelism()
-            .map_or(NonZeroUsize::MIN, |n| n.min(nonzero!(8usize)));
+        // Half of the cores, at most 8: the other half stays for the tokio
+        // workers and the Aeron threads, which serve the same requests.
+        let parallelism = std::thread::available_parallelism().map_or(NonZeroUsize::MIN, |n| {
+            NonZeroUsize::new(n.get() / 2)
+                .unwrap_or(NonZeroUsize::MIN)
+                .min(nonzero!(8usize))
+        });
         Self::with_parallelism(depth, flush_window, parallelism)
     }
 
