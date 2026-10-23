@@ -20,6 +20,15 @@ final class MetricsPage {
         this.counters = counters;
     }
 
+    /**
+     * The report of one request: the verdict and the JSON of {@code status}
+     * for a member within {@code lagBytes} of the commit position, and the
+     * text of this page.
+     */
+    AdminServer.Report report(final MemberStatus status, final long lagBytes) {
+        return new AdminServer.Report(status.isReady(lagBytes), status.toJson(lagBytes), render(status));
+    }
+
     /** The text of one scrape, with {@code status} sampled for it. */
     String render(final MemberStatus status) {
         final MetricsText text = new MetricsText(memberId)

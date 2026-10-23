@@ -76,9 +76,13 @@ pub(super) struct PendingPublish {
 /// or sleeps, so the caller (`super::thread::run_aeron_thread`) goes
 /// straight back to polling subscriptions. That is what stops a
 /// back-pressured publish from starving a subscription image (see
-/// [`PendingPublish`]).
-pub(super) fn drain_pending(pubs: &[Option<PubEntry>], pending: &mut VecDeque<PendingPublish>) {
-    drain_pending_inner(pending, Instant::now(), |item| item.offer_on(pubs));
+/// [`PendingPublish`]). Returns the count of offers that Aeron refused
+/// with a transient status, which stay queued for the next pass.
+pub(super) fn drain_pending(
+    pubs: &[Option<PubEntry>],
+    pending: &mut VecDeque<PendingPublish>,
+) -> usize {
+    drain_pending_inner(pending, Instant::now(), |item| item.offer_on(pubs))
 }
 
 impl PendingPublish {
@@ -148,13 +152,14 @@ fn fail_item(item: &mut PendingPublish, msg: String) {
 /// Pure core of [`drain_pending`], with the Aeron offer injected so the
 /// FIFO, deadline, and back-pressure decisions are unit-testable without a
 /// media driver. `now` is threaded in for the same reason (deterministic
-/// deadline checks).
-fn drain_pending_inner<F>(pending: &mut VecDeque<PendingPublish>, now: Instant, offer: F)
+/// deadline checks). Returns the count of refused offers that stay
+/// queued.
+fn drain_pending_inner<F>(pending: &mut VecDeque<PendingPublish>, now: Instant, offer: F) -> usize
 where
     F: FnMut(&PendingPublish) -> OfferResult,
 {
     if pending.is_empty() {
-        return;
+        return 0;
     }
     let mut drainer = Drainer::new(now, offer);
     // `retain_mut` visits entries front-to-back exactly once, the same
@@ -163,6 +168,7 @@ where
     // the FIFO, deadline, and back-pressure decision this function makes,
     // with no second `VecDeque` to rebuild.
     pending.retain_mut(|item| drainer.process(item));
+    drainer.refused
 }
 
 /// One [`drain_pending_inner`] pass's state: the injected offer, and the
@@ -172,6 +178,8 @@ struct Drainer<F> {
     now: Instant,
     offer: F,
     blocked: HashSet<u32>,
+    /// The offers of this pass that Aeron refused with a transient status.
+    refused: usize,
 }
 
 impl<F> Drainer<F>
@@ -183,6 +191,7 @@ where
             now,
             offer,
             blocked: HashSet::new(),
+            refused: 0,
         }
     }
 
@@ -246,8 +255,10 @@ where
             OfferResult::Status(_) => {
                 // Transient NOT_CONNECTED or BACK_PRESSURED: hold this
                 // frame and every later frame on the same publication;
-                // retry next iteration.
+                // retry next iteration. One refused offer per publication
+                // and pass, so the count cannot pass the queue length.
                 self.blocked.insert(item.pub_id);
+                self.refused += 1;
                 true
             }
         }
@@ -336,6 +347,22 @@ mod drain_pending_tests {
         drain_pending_inner(&mut q, now, |_| delivered(0));
         assert!(q.is_empty());
         assert!(matches!(rx.try_recv(), Ok(Ok(_))));
+    }
+
+    #[test]
+    fn a_pass_counts_one_refused_offer_per_blocked_publication() {
+        // Two frames on pub 0 and one on pub 1 all back-pressure. Only the
+        // head of each publication is offered, so the pass counts two.
+        let now = Instant::now();
+        let (a, _ra) = pending(0, 0xA1, now, 5_000);
+        let (b, _rb) = pending(0, 0xB2, now, 5_000);
+        let (c, _rc) = pending(1, 0xC3, now, 5_000);
+        let mut q = VecDeque::from([a, b, c]);
+        let refused = drain_pending_inner(&mut q, now, |_| OfferResult::Status(-2));
+        assert_eq!(refused, 2);
+        assert_eq!(q.len(), 3);
+        assert_eq!(drain_pending_inner(&mut q, now, |_| delivered(0)), 0);
+        assert!(q.is_empty());
     }
 
     #[test]

@@ -58,6 +58,8 @@
 //!   dynamic MDC publication on port 0.
 //! - `pending`: the parked-publish retry scheduler (`drain_pending`) and
 //!   its unit tests.
+//! - `meter`: the pipeline metrics of the Aeron thread: its loop time,
+//!   its two queues, and the refused offers.
 //! - `idle`: the idle wait of a hot-path poll loop ([`IdleCap`],
 //!   [`IdleBackoff`]).
 //! - `handles`: the typed per-channel publisher/subscriber handle pairs.
@@ -71,6 +73,7 @@ mod destination;
 mod handles;
 mod idle;
 mod image_log;
+mod meter;
 mod pending;
 mod runtime;
 mod table_pub;

@@ -100,3 +100,19 @@ async fn a_second_submission_of_a_waiting_hash_is_already_known() {
         "the slot is free after the first wait"
     );
 }
+
+#[test]
+fn the_ack_waiters_gauge_follows_each_insert_and_each_remove() {
+    // The first wait lives past the render; the second ends in the scope.
+    let mut first = None;
+    let text = crate::rendered_metrics_tests::Rendered::of(|| {
+        let w = waiters();
+        first = Some(w.register(HASH).unwrap());
+        let _second = w.register(B256::repeat_byte(8)).unwrap();
+    });
+    assert!(first.is_some());
+    assert_eq!(
+        text.value(r#"kardamom_queue_depth{queue="ingress.ack_waiters"}"#),
+        1.0
+    );
+}

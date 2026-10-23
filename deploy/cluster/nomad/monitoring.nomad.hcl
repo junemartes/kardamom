@@ -184,6 +184,7 @@ locals {
     "kardamom-canary",
     "kardamom-performance",
     "kardamom-availability",
+    "kardamom-bottlenecks",
   ]
 }
 

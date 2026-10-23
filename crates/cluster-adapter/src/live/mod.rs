@@ -27,6 +27,7 @@
 mod endpoints;
 #[cfg(all(test, feature = "docker-e2e"))]
 mod fragmented_tests;
+mod meters;
 mod session_loop;
 mod term;
 

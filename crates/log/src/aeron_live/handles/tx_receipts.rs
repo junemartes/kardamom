@@ -535,6 +535,20 @@ impl TxReceiptsReceiver {
             return Some((raw.session, frame));
         }
     }
+
+    /// The next frame that is already here, without a wait: `None` when
+    /// no frame waits or the stream closed. A malformed frame is skipped.
+    /// A consumer drains the frames that queued behind a slow write with
+    /// it, and writes them together.
+    pub fn try_recv_frame(&mut self) -> Option<(i32, ReceiptFrame)> {
+        loop {
+            let raw = self.rx.try_recv().ok()?;
+            let Some(frame) = ReceiptFrame::decode(&raw) else {
+                continue;
+            };
+            return Some((raw.session, frame));
+        }
+    }
 }
 
 /// One frame of the `tx_receipts` receipt stream. A new kind goes last.

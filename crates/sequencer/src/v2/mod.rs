@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 use alloy_primitives::{Address, B256};
 use kardamom_cluster_adapter::wire::{GuardHeader, position_deadline};
 use kardamom_log::aeron_live::{IdleBackoff, IdleCap};
+use kardamom_obs::pipeline::Queue;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
 use kardamom_types::{TxDataLoc, TxEnvelope, TxError, TxErrorReason, TxStatus};
 
@@ -44,6 +45,7 @@ use crate::fees::FeeGate;
 use crate::inbound::{Inbound, TxDataSubscriber};
 use crate::metrics::HotMetrics;
 use crate::outbound::{RefOffer, SideChannelPublisher, TxOrderingRefPublisher};
+use crate::pipeline::PublishMeters;
 use crate::sealer_rules::SealerVersion;
 use crate::sender::sender_of;
 use crate::sequencer::SequencerPorts;
@@ -186,6 +188,11 @@ pub struct AdmissionLoop {
     hot: HotMetrics,
     depth: depth::ParkDepth,
     to_ingress: verdicts::Verdicts,
+    pipeline: PublishMeters,
+    /// The offers in the outbox.
+    outbox_depth: Queue,
+    /// The account events that wait in `accounts`.
+    accounts_depth: Queue,
 }
 
 impl AdmissionLoop {
@@ -210,6 +217,9 @@ impl AdmissionLoop {
             hot: HotMetrics::new(cfg.partition),
             depth: depth::ParkDepth::default(),
             to_ingress: verdicts::Verdicts::off(cfg.partition),
+            pipeline: PublishMeters::new(),
+            outbox_depth: Queue::new("sequencer.outbox"),
+            accounts_depth: Queue::new("sequencer.accounts"),
         }
     }
 
@@ -276,13 +286,29 @@ impl AdmissionLoop {
         Ok(())
     }
 
-    /// One turn of [`Self::run`]. Returns whether to go on.
+    /// One turn of [`Self::run`]. Returns whether to go on. The turn, its
+    /// wait included, counts in the state that its outcome names.
     fn run_tick<P: SequencerPorts>(
         &mut self,
         ports: &mut P,
         backoff: &mut IdleBackoff,
     ) -> Result<bool, SequencerError> {
-        match self.run_once(ports) {
+        let outcome = self.run_once(ports);
+        let state = PublishMeters::state_of(&outcome);
+        let next = Self::after_turn(outcome, backoff);
+        if self.pipeline.pass(state, ports.split().0) {
+            self.outbox_depth.set(self.outbox.len());
+            self.accounts_depth.set(self.accounts.len());
+        }
+        next
+    }
+
+    /// The dispatch of [`Self::run_tick`] on the outcome of one turn.
+    fn after_turn(
+        outcome: Result<bool, SequencerError>,
+        backoff: &mut IdleBackoff,
+    ) -> Result<bool, SequencerError> {
+        match outcome {
             Ok(true) => {
                 backoff.reset();
                 Ok(true)
@@ -387,7 +413,11 @@ impl AdmissionLoop {
             },
         };
         self.depth.took(vslot);
+        let started = Instant::now();
         self.admission.offer(candidate, &mut self.verdicts);
+        self.hot
+            .nonce_check_seconds
+            .record(started.elapsed().as_secs_f64());
         Ok(())
     }
 
@@ -464,7 +494,7 @@ impl AdmissionLoop {
         if self.outbox.is_empty() {
             return Ok(());
         }
-        let (published, err) = refs.try_publish_ref_batch(self.outbox.make_contiguous());
+        let (published, err) = self.pipeline.offer(refs, self.outbox.make_contiguous());
         self.hot.publish.increment(published as u64);
         if matches!(err, Some(SequencerError::Backpressure)) {
             self.hot.backpressure.increment(1);

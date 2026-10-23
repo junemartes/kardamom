@@ -7,14 +7,17 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
+use kardamom_obs::pipeline::LoopState;
 use tracing::{error, warn};
 
 use kardamom_types::{BlockBoundary, ReceiptRollback, ReceiptRows};
 
 use crate::error::ExecutorError;
 use crate::exec_types::CMessage;
+use crate::meter::OutputWait;
 
 use super::escalation::{Escalation, PUBLICATION_DEAD_EXIT_CODE, PublicationHealth, Step};
+use super::meters::CommitMeters;
 use super::ports::TxReceiptsPublication;
 use super::types::{ExecToCommit, ExecutorConfig};
 
@@ -60,6 +63,7 @@ struct MustDeliver {
     attempts: u32,
     escalation: Escalation,
     health: PublicationHealth,
+    retries: metrics::Counter,
 }
 
 impl MustDeliver {
@@ -68,6 +72,7 @@ impl MustDeliver {
             attempts: 0,
             escalation,
             health: PublicationHealth::new(TOPIC),
+            retries: metrics::counter!(crate::metrics::RECEIPT_PUBLISH_RETRIES_TOTAL),
         }
     }
 
@@ -86,6 +91,7 @@ impl MustDeliver {
         ) {
             return Err(e);
         }
+        self.retries.increment(1);
         // A wrap back toward 0 would only re-fire the "attempt 1" log line
         // on a long-running retry; saturate instead.
         self.attempts = self.attempts.saturating_add(1);
@@ -202,6 +208,7 @@ pub(crate) struct CommitLoop<C> {
     retry: MustDeliver,
     /// The rollback record to publish before the first receipt.
     rollback: Option<ReceiptRollback>,
+    meters: CommitMeters,
 }
 
 impl<C: TxReceiptsPublication + 'static> CommitLoop<C> {
@@ -213,6 +220,7 @@ impl<C: TxReceiptsPublication + 'static> CommitLoop<C> {
             rx,
             retry: MustDeliver::new(escalation),
             rollback: None,
+            meters: CommitMeters::new(),
         }
     }
 
@@ -246,9 +254,12 @@ impl<C: TxReceiptsPublication + 'static> CommitLoop<C> {
     /// load, with no added latency in either case. A boundary flushes the
     /// receipts gathered so far, and this keeps the stream order. Returns
     /// `None` when the channel is already closed with nothing queued.
-    fn collect_batch(&self) -> Option<Batch> {
+    fn collect_batch(&mut self) -> Option<Batch> {
         let mut batch = Batch::new();
-        match self.rx.recv() {
+        let received = self.rx.recv();
+        self.meters.meter.mark(LoopState::Idle);
+        self.meters.exec_to_commit.set(self.rx.len());
+        match received {
             Ok(ExecToCommit::Receipt(r)) => batch.receipts.push(*r),
             Ok(ExecToCommit::Boundary(b)) => batch.boundary = Some(b),
             Err(_) => return None,
@@ -365,7 +376,12 @@ impl<C: TxReceiptsPublication + 'static> CommitLoop<C> {
     /// of a branch.
     fn recover(&mut self, e: ExecutorError, msg: &'static str) -> Result<(), ExecutorError> {
         let listed = self.tx_receipts_pub.subscribers_listed();
-        if self.retry.failed(e, listed, msg)? == Step::Reopen {
+        let retry = &mut self.retry;
+        let step = self
+            .meters
+            .meter
+            .output_wait(true, || retry.failed(e, listed, msg))?;
+        if step == Step::Reopen {
             self.reopen()?;
         }
         Ok(())
@@ -400,10 +416,22 @@ impl<C: TxReceiptsPublication + 'static> CommitLoop<C> {
     /// whether the batch closes the stream. The loop in [`Self::run`]
     /// stays free of a branch.
     fn publish_one_batch(&mut self, batch: &Batch) -> Result<bool, ExecutorError> {
-        self.publish_batch(&batch.receipts)?;
+        self.publish_receipts(&batch.receipts)?;
         if let Some(b) = &batch.boundary {
             self.publish_boundary(b)?;
         }
+        self.meters.meter.mark(LoopState::Busy);
         Ok(batch.closed)
+    }
+
+    /// Publish a batch's receipts, and record the batch when it has any.
+    fn publish_receipts(&mut self, receipts: &[ReceiptRows]) -> Result<(), ExecutorError> {
+        if receipts.is_empty() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        self.publish_batch(receipts)?;
+        self.meters.published(receipts.len(), started);
+        Ok(())
     }
 }

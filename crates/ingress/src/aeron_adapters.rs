@@ -21,6 +21,7 @@ use kardamom_log::aeron_live::{
 };
 use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::events::BoardView;
+use kardamom_obs::pipeline::{Batch, LoopMeter, LoopState};
 use kardamom_types::{
     BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, Receipt,
     ReceiptBatch, ReceiptRollback, TxEnvelope, TxError, TxStatus,
@@ -184,6 +185,10 @@ struct ReceiptBatchPump {
     tx: broadcast::Sender<ReceiptItem>,
     log: watch::Sender<RollbackLog>,
     executed: StageClock,
+    /// Idle while the pump waits for a frame, busy while it handles one.
+    meter: LoopMeter,
+    /// The receipts in each batch frame that carries a receipt.
+    receipts: Batch,
 }
 
 impl ReceiptBatchPump {
@@ -198,6 +203,8 @@ impl ReceiptBatchPump {
             tx,
             log,
             executed,
+            meter: LoopMeter::new("ingress.receipt_pump"),
+            receipts: Batch::new("ingress.receipt_batch"),
         }
     }
 
@@ -209,8 +216,16 @@ impl ReceiptBatchPump {
 
     async fn run(mut self, mut rx: TxReceiptsReceiver) {
         while let Some((_, frame)) = rx.recv_frame().await {
-            self.on_frame(frame);
+            self.on_received(frame);
         }
+    }
+
+    /// Handle one frame that the wait received, and meter the wait and
+    /// the handling.
+    fn on_received(&mut self, frame: ReceiptFrame) {
+        self.meter.mark(LoopState::Idle);
+        self.on_frame(frame);
+        self.meter.mark(LoopState::Busy);
     }
 
     /// Put one frame onto the bus. A lagging or absent receiver is the
@@ -249,6 +264,7 @@ impl ReceiptBatchPump {
     /// channel's concern, so this ignores the send result.
     fn on_batch(&mut self, batch: ReceiptBatch) {
         if let Some(end) = batch.end_tx_idx() {
+            self.receipts.record(batch.receipts.len());
             self.writer.apply(end, &batch.accounts);
         }
         batch
@@ -590,6 +606,31 @@ mod tests {
             sub.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    // The receipt batch histogram takes one sample for each batch with a
+    // receipt. A boundary-only batch adds none.
+    #[tokio::test]
+    async fn receipt_pump_records_the_receipts_of_each_batch() {
+        let text = crate::rendered_metrics_tests::Rendered::of(|| {
+            let (_live, writer) = LiveAccounts::new(&LiveAccountsConfig::default());
+            let (bus, _sub) = broadcast::channel::<ReceiptItem>(16);
+            let log = watch::channel(RollbackLog::default()).0;
+            let mut pump = ReceiptBatchPump::new(writer, bus, log, StageClock::pair().1.executed);
+            pump.on_batch(ReceiptBatch {
+                receipts: vec![Receipt::default(), Receipt::default()],
+                accounts: Vec::new(),
+            });
+            pump.on_batch(ReceiptBatch::default());
+        });
+        assert_eq!(
+            text.value(r#"kardamom_batch_items_sum{batch="ingress.receipt_batch"}"#),
+            2.0
+        );
+        assert_eq!(
+            text.value(r#"kardamom_batch_items_count{batch="ingress.receipt_batch"}"#),
+            1.0
+        );
     }
 
     // A shard index past the publication vector must give an Internal

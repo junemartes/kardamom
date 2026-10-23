@@ -23,6 +23,7 @@ pub mod events;
 pub mod follower;
 pub mod halt;
 pub mod lifecycle;
+pub mod pipeline;
 pub mod ready;
 mod serve;
 #[cfg(feature = "test-support")]
@@ -128,6 +129,10 @@ const CANARY_BUCKETS: &[f64] = &[
 /// The name prefix of the canary's metrics.
 const CANARY_PREFIX: &str = "kardamom_canary_";
 
+/// Two histograms of counts, not durations. They need their own buckets.
+const VALIDATOR_PARALLEL_BATCHES: &str = "kardamom_validator_parallel_batches";
+const EXECUTOR_BAL_FRAME_BYTES: &str = "kardamom_executor_bal_frame_bytes";
+
 /// Build-info gauge name. The overview dashboard reads this exact name.
 const BUILD_INFO: &str = "kardamom_build_info";
 
@@ -188,17 +193,32 @@ impl Exporter {
     /// `/metrics`. The `init_port_in_use` integration test pins this
     /// eager bind.
     fn build(&self) -> Result<Built> {
-        let recorder = PrometheusBuilder::new()
+        let recorder = self.recorder()?;
+        let listener = std::net::TcpListener::bind(self.metrics_addr)
+            .with_context(|| format!("bind the metrics listener on {}", self.metrics_addr))?;
+        Ok((recorder, listener))
+    }
+
+    /// The recorder, with the bucket layout and the global labels. A full
+    /// name match wins over a prefix match.
+    fn recorder(&self) -> Result<PrometheusRecorder> {
+        let full = |name: &str| Matcher::Full(name.to_string());
+        Ok(PrometheusBuilder::new()
             .set_buckets(DURATION_BUCKETS)
             .context("set_buckets")?
             .set_buckets_for_metric(Matcher::Prefix(CANARY_PREFIX.to_string()), CANARY_BUCKETS)
             .context("set the canary buckets")?
+            .set_buckets_for_metric(full(pipeline::STEP_SECONDS), pipeline::STEP_BUCKETS)
+            .context("set the step buckets")?
+            .set_buckets_for_metric(full(pipeline::BATCH_ITEMS), pipeline::COUNT_BUCKETS)
+            .context("set the batch buckets")?
+            .set_buckets_for_metric(full(VALIDATOR_PARALLEL_BATCHES), pipeline::COUNT_BUCKETS)
+            .context("set the validator batch buckets")?
+            .set_buckets_for_metric(full(EXECUTOR_BAL_FRAME_BYTES), pipeline::BYTE_BUCKETS)
+            .context("set the BAL frame buckets")?
             .add_global_label("service", self.service)
             .add_global_label("host_id", self.host_id.as_str())
-            .build_recorder();
-        let listener = std::net::TcpListener::bind(self.metrics_addr)
-            .with_context(|| format!("bind the metrics listener on {}", self.metrics_addr))?;
-        Ok((recorder, listener))
+            .build_recorder())
     }
 
     /// Retry [`Exporter::build`] on `AddrInUse`, up to the env-configured
@@ -252,6 +272,19 @@ impl Exporter {
             halt::HALT,
             "1 while the service is halted; cause and recovery name the runbook."
         );
+        metrics::describe_counter!(
+            pipeline::LOOP_NANOSECONDS,
+            "The time of a thread loop in each state (busy, idle, blocked), in nanoseconds."
+        );
+        metrics::describe_gauge!(
+            pipeline::QUEUE_DEPTH,
+            "The items that wait in a queue between two loops."
+        );
+        metrics::describe_histogram!(
+            pipeline::STEP_SECONDS,
+            "The duration of one step of work, in seconds."
+        );
+        metrics::describe_histogram!(pipeline::BATCH_ITEMS, "The items in one batch.");
         metrics::describe_gauge!(
             halt::PAUSED,
             "1 while the service is paused; root_service and cause name the root it waits on."

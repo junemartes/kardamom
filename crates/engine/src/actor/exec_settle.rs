@@ -20,6 +20,8 @@ use tracing::debug;
 use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
 
+use crate::meter::OutputWait;
+
 use super::exec_thread::{ExecState, Flow};
 use super::ports::StateWriterSignal;
 use super::types::ExecToCommit;
@@ -79,6 +81,10 @@ impl<W: ExecPorts> ExecState<W> {
                 .iter()
                 .fold(None, |acc, (_, d)| Some(Self::merge_into_parent(acc, d)));
         }
+        self.metrics
+            .pipeline
+            .commits_inflight
+            .set(self.commits.inflight.len());
         Flow::Continue
     }
 
@@ -103,9 +109,7 @@ impl<W: ExecPorts> ExecState<W> {
         )]
         metrics::gauge!(crate::metrics::BLOCK_NUMBER).set(b.block_number as f64);
         let block_number = b.block_number;
-        self.io
-            .tx
-            .send(ExecToCommit::Boundary(b))
+        self.send_to_commit(ExecToCommit::Boundary(b))
             .map(|()| block_number)
             .map_err(|_| SendFailed)
     }
@@ -114,9 +118,10 @@ impl<W: ExecPorts> ExecState<W> {
     /// [`Self::settle_ready`] sweep, after the only wait the pipeline ever
     /// pays. The exec thread blocks for the oldest commit only when the
     /// pipeline is at full depth K. The recorded histogram measures
-    /// exactly this residual stall. A sustained non-zero residual means
-    /// the writer is K full block intervals behind, and this
-    /// back-pressure is correct.
+    /// exactly this wait for a free commit slot, not the commit itself.
+    /// The writer's `state.commit` step measures the commit. A sustained
+    /// non-zero wait means the writer is K full block intervals behind,
+    /// and this back-pressure is correct.
     pub(super) fn settle_at_boundary(&mut self) -> Result<Flow, ExecutorError> {
         let mut durable = self.io.sw_signal.committed()?;
         if self.commits.inflight.len() >= COMMIT_PIPELINE_DEPTH.get()
@@ -128,7 +133,12 @@ impl<W: ExecPorts> ExecState<W> {
                 .map(|(b, _)| b.block_number)
         {
             let commit_wait = Instant::now();
-            durable = self.io.sw_signal.wait_committed(oldest)?;
+            let signal = &mut self.io.sw_signal;
+            durable = self
+                .metrics
+                .pipeline
+                .meter
+                .output_wait(true, || signal.wait_committed(oldest))?;
             metrics::histogram!(crate::metrics::STATE_COMMIT_DURATION_SECONDS)
                 .record(commit_wait.elapsed().as_secs_f64());
         }

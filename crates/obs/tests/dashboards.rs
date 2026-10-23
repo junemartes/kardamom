@@ -20,6 +20,7 @@ const EXPECTED_DASHBOARDS: &[&str] = &[
     "kardamom-canary",
     "kardamom-performance",
     "kardamom-availability",
+    "kardamom-bottlenecks",
 ];
 
 fn dashboards_dir() -> PathBuf {
