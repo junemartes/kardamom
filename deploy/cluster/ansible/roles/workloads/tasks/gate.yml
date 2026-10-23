@@ -10,6 +10,7 @@
 #    rolling path.
 # 5a. The registered sealer job does not name decisionVersion=3.
 # 6. The shard map does not change in the rolling path.
+# 7. The target reads the newest snapshot of every sealer member.
 # The gate also reads the revision of the target tree, for the record.
 # The gate reads only, so it also runs in check mode.
 
@@ -426,3 +427,45 @@
          | selectattr('DestPath', 'equalto', 'local/shard-map.toml') | map(attribute='EmbeddedTmpl') | first
          | community.general.from_toml }}
   when: workloads_gate_ingress_job.status == 200
+
+# 7. The sealer snapshot. A member restores its newest snapshot at its
+# start. A member that holds a snapshot of a version above the reads_max
+# of the target cannot restore it after the roll, and stops. A cluster
+# that Nomad does not know has no member to read. A member that does not
+# run can hold the newest snapshot, and the gate cannot read its version,
+# so the gate refuses. The staged roll of the sealer also needs every
+# member.
+- name: Read the status of every sealer member
+  ansible.builtin.include_tasks: sealer_status.yml
+  vars:
+    workloads_sealer_groups: "{{ workloads_gate_cluster_job.json.TaskGroups | map(attribute='Name') | list }}"
+  when: workloads_gate_cluster_job.status == 200
+
+- name: Refuse a release while a sealer member does not run
+  ansible.builtin.assert:
+    that: workloads_sealer_down | length == 0
+    fail_msg: >-
+      Refused: the sealer members {{ workloads_sealer_down | join(', ') }} do not run, so the gate cannot read
+      the version of their newest snapshot. Start them and let them catch up, then deploy.
+  when: workloads_gate_cluster_job.status == 200
+
+# A member of a release without snapshotLatest reports no version. The
+# gate reads it as 0.
+- name: Refuse a release that cannot read the newest snapshot of a sealer member
+  ansible.builtin.assert:
+    that: workloads_gate_unreadable | length == 0
+    fail_msg: >-
+      Refused: the target release reads sealer snapshots only up to version {{ workloads_gate_reads_max }}
+      (formats.toml, sealer-snapshot reads_max), and these sealer members hold a newer snapshot:
+      {{ workloads_gate_unreadable | map('join', ' at version ') | join(', ') }}.
+      After the roll such a member cannot restore its own snapshot, and stops.
+      Deploy a release that reads snapshot version {{ (workloads_gate_unreadable | map('last') | list + [0]) | max }}.
+  vars:
+    workloads_gate_reads_max: >-
+      {{ (lookup('file', workloads_repo_root ~ '/formats.toml')
+          | community.general.from_toml)['format']['sealer-snapshot']['reads_max'] }}
+    workloads_gate_unreadable: >-
+      {{ workloads_sealer_status.results | map(attribute='item.item.TaskGroup')
+         | zip(workloads_sealer_status.results | map(attribute='json.snapshotLatest', default=0))
+         | rejectattr('1', 'le', workloads_gate_reads_max | int) | list }}
+  when: workloads_gate_cluster_job.status == 200

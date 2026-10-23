@@ -327,7 +327,7 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
 - **Snapshot of a newer release on disk**
   - Trigger: a release writes a snapshot version that the previous release does not read, and the deploy rolls back.
   - Effect: the rolled-back member cannot restore its newest snapshot and stops at start.
-  - Prevention: the writer stays one version behind the reader (`SNAPSHOT_WRITE_VERSION`, `SNAPSHOT_READ_VERSION`). `GET /status` reports `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax` and `snapshotLatest`, the version of the newest snapshot the member restored or took. A deploy preflight reads `snapshotLatest` on every member and refuses a target whose `reads_max` is below it.
+  - Prevention: the writer stays one version behind the reader (`SNAPSHOT_WRITE_VERSION`, `SNAPSHOT_READ_VERSION`). `GET /status` reports `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax` and `snapshotLatest`, the version of the newest snapshot the member restored or took. The release gate of a deploy reads `snapshotLatest` on every member and refuses a target whose `reads_max` is below it. `just rollback` does not run the gate.
   - Proof: the in-JVM tests `SealerSnapshotVersionTest`, `MemberStatusTest` and `FormatRegistryTest`.
 - **Torn archive fragment at launch**
   - Trigger: a hard kill leaves a torn last fragment in the archive. The launch then fails with `incomplete last fragment straddling page boundary`.

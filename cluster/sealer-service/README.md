@@ -667,7 +667,9 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
   - `diskFreeBytes` is the free space of the disk of the cluster directory: the Raft log and the retained file. `/metrics` exports the same value.
   - `snapshotWrites`, `snapshotReadsMin` and `snapshotReadsMax` are the snapshot versions of this release, as `formats.toml` lists them.
   - `snapshotLatest` is the version of the newest snapshot this member restored or took. It is 0 before either.
-  - A deploy reads `snapshotLatest` on every member before it rolls. It refuses a release whose `reads_max` is below that version, because that member could not restore its own snapshot after the roll.
+  - The release gate of a deploy (`deploy/cluster/ansible/roles/workloads/tasks/gate.yml`) reads `snapshotLatest` on every configured member before any job changes. It refuses a release whose `formats.toml` gives a sealer snapshot `reads_max` below that version, because that member could not restore its own snapshot after the roll.
+  - The gate skips the check when Nomad does not know the sealer job. It refuses while a configured member does not run, because it cannot read the version of that member.
+  - `just rollback` reverts job versions and does not run the gate.
 - A member is ready when all of these are true:
   - the role is `LEADER` or `FOLLOWER`
   - the election state is `CLOSED`

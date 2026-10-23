@@ -64,58 +64,26 @@
     that: workloads_registered_job.status == 200
     fail_msg: "Refused: Nomad does not know the sealer job. Deploy the release, then run the check."
 
-- name: Keep the configured sealer members
-  ansible.builtin.set_fact:
-    workloads_upgrade_groups: "{{ workloads_registered_job.json.TaskGroups | map(attribute='Name') | list }}"
-
-- name: Read the sealer allocations
-  ansible.builtin.uri:
-    url: "{{ workloads_nomad_addr }}/v1/job/cluster/allocations?namespace={{ workloads_namespace | urlencode }}"
-    headers:
-      X-Nomad-Token: "{{ workloads_nomad_token }}"
-  register: workloads_upgrade_allocs
-
 # A member that is down runs its release again at its next start, so the
 # check must read every configured member.
-- name: Keep the running node of each member
-  ansible.builtin.set_fact:
-    workloads_upgrade_nodes: >-
-      {{ workloads_upgrade_allocs.json | selectattr('ClientStatus', 'equalto', 'running')
-         | selectattr('TaskGroup', 'in', workloads_upgrade_groups) | map(attribute='NodeID') | unique | list }}
-    workloads_upgrade_down: >-
-      {{ workloads_upgrade_groups | difference(workloads_upgrade_allocs.json
-         | selectattr('ClientStatus', 'equalto', 'running') | map(attribute='TaskGroup') | list) }}
+- name: Read the status of every member
+  ansible.builtin.include_tasks: sealer_status.yml
+  vars:
+    workloads_sealer_groups: "{{ workloads_registered_job.json.TaskGroups | map(attribute='Name') | list }}"
 
 - name: Refuse a check while a configured member is down
   ansible.builtin.assert:
-    that: workloads_upgrade_down | length == 0
+    that: workloads_sealer_down | length == 0
     fail_msg: >-
-      Refused: the sealer members {{ workloads_upgrade_down | join(', ') }} do not run. The check must read every
+      Refused: the sealer members {{ workloads_sealer_down | join(', ') }} do not run. The check must read every
       configured member. Start it and let it catch up, then run the check again.
-
-- name: Read the node of each member
-  ansible.builtin.uri:
-    url: "{{ workloads_nomad_addr }}/v1/node/{{ item }}"
-    headers:
-      X-Nomad-Token: "{{ workloads_nomad_token }}"
-  loop: "{{ workloads_upgrade_nodes }}"
-  register: workloads_upgrade_node
-
-- name: Read the status of each member
-  ansible.builtin.uri:
-    url: "http://{{ item.json.HTTPAddr | regex_replace(':[0-9]+$', '') }}:{{ workloads_sealer_admin_port }}/status"
-    return_content: true
-  loop: "{{ workloads_upgrade_node.results }}"
-  loop_control:
-    label: "{{ item.item }}"
-  register: workloads_upgrade_status
 
 # A member of this release, or of the release before it, reads snapshot
 # version 14. An older member reports a lower snapshotReadsMax.
 - name: Keep the snapshot read maximum of each member
   ansible.builtin.set_fact:
     workloads_upgrade_reads_max: >-
-      {{ workloads_upgrade_status.results | map(attribute='json')
+      {{ workloads_sealer_status.results | map(attribute='json')
          | map(attribute='snapshotReadsMax', default=0) | list }}
 
 - name: Refuse a member of an older release
@@ -174,7 +142,7 @@
 - name: Report the passing check
   ansible.builtin.debug:
     msg: >-
-      The upgrade check passed: {{ workloads_upgrade_groups | length }} sealer members read snapshot version
+      The upgrade check passed: {{ workloads_sealer_running | length }} sealer members read snapshot version
       {{ {3: 15, 4: 16}.get(workloads_upgrade_feature | int, 14) }},
       and the live allocations of {{ workloads_upgrade_jobs | map(attribute='name') | join(', ') }}
       run this release. The upgrade transaction of feature {{ workloads_upgrade_feature }} may go to the Safe.
