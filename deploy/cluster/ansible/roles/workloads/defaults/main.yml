@@ -163,6 +163,10 @@ workloads_cluster_heap_mb: "{{ lookup('env', 'KARDAMOM_CLUSTER_HEAP_MB') }}"
 # The sync level of the backup sealer's archive (nomad/cluster-backup.nomad.hcl).
 # Empty keeps the job's 1.
 workloads_backup_file_sync_level: "{{ lookup('env', 'KARDAMOM_BACKUP_FILE_SYNC_LEVEL') }}"
+# How long and how much Prometheus keeps (nomad/monitoring.nomad.hcl).
+# Empty keeps the job's 24h and no size limit.
+workloads_prometheus_retention_time: "{{ lookup('env', 'KARDAMOM_PROMETHEUS_RETENTION_TIME') }}"
+workloads_prometheus_retention_size: "{{ lookup('env', 'KARDAMOM_PROMETHEUS_RETENTION_SIZE') }}"
 workloads_archive_file_sync_level: "{{ lookup('env', 'KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL') }}"
 # The threading mode of the media driver of each node (nomad/aeron.system.nomad.hcl):
 # SHARED, SHARED_NETWORK or DEDICATED. Empty keeps the job's SHARED default.

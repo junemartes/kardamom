@@ -669,6 +669,8 @@ class DeployTest(Deploys):
             'workloads_cluster_log_purge_keep': '5',
             'workloads_cluster_file_sync_level': '1',
             'workloads_cluster_heap_mb': '2560',
+            'workloads_prometheus_retention_time': '7d',
+            'workloads_prometheus_retention_size': '40GB',
             'workloads_archive_file_sync_level': '0',
             'workloads_remote_origins': '412399',
             'workloads_priority_fees': 'on',
@@ -700,6 +702,10 @@ class DeployTest(Deploys):
         cluster_task = plans['cluster']['TaskGroups'][0]['Tasks'][0]
         self.assertEqual(cluster_task['Env']['KARDAMOM_CLUSTER_HEAP_MB'], '2560')
         self.assertEqual(cluster_task['Resources']['MemoryMB'], 3200)
+        prometheus = next(t for t in plans['monitoring']['TaskGroups'][0]['Tasks'] if t['Name'] == 'prometheus')
+        self.assertIn('--storage.tsdb.retention.time=7d', prometheus['Config']['args'])
+        self.assertIn('--storage.tsdb.retention.size=40GB', prometheus['Config']['args'])
+        self.assertTrue(plans['monitoring']['TaskGroups'][0]['EphemeralDisk']['Sticky'])
         self.assertIn('-Dkardamom.cluster.logPurgeKeepSnapshots=5', json.dumps(plans['cluster']))
         self.assertIn('-Daeron.archive.file.sync.level=0', json.dumps(plans['aeron']))
         self.assertIn('-Daeron.archive.catalog.file.sync.level=0', json.dumps(plans['aeron']))
