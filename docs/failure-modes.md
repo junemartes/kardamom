@@ -516,6 +516,27 @@ Each executor publishes the transactions that it joins on the executor stream (`
 - **Shared media driver**: the recorded publication is exclusive. Each executor has its own session and its own recording, also when several executors share one media driver (the single-host e2e stack).
 - Proof: `graceful-executor` and `hard-executor` assert that the restarted executor shows a new session and that its recorded cursor advances. The check does not apply, and logs that, when no executor exports the gauges, or when no recorded cursor moves in the window. The `chaos-executor` shard runs no load, so the L1 epochs move the cursor. The shard deploys `KARDAMOM_EXEC_CURSOR=on`, and `hard-executor` also asserts that the sealer's best recorded cursor (`kardamom_ingress_cluster_recorded_head`) moves while the killed executor is down.
 
+### Carry mode: the executor next to its member
+
+In carry mode (`KARDAMOM_CARRY_BYTES=on`, see [the deploy README](../deploy/cluster/README.md#carry-mode)), executor `i` runs on `sealer-<i>`, the node of member `i`. It reads the canonical entries with their bytes from the member feed, an IPC stream on the shared media driver of that node.
+
+- **Whole sealer node loss**
+  - Trigger: `sealer-<i>` dies.
+  - Effect: one loss takes member `i` and executor `i` together. The cluster keeps its quorum with 2 of 3 members, and the executor fleet keeps 2 of 3 replicas. A second node loss takes the quorum, so no executor gets a new entry.
+  - Executor `i` is pinned to its node. Nomad does not move it to another node, so the fleet stays at 2 of 3 until the node returns.
+  - Recovery: the node returns. The member rejoins from its log or seeds from a peer. The executor resumes from its state directory, and asks its member for the entries from its cursor.
+- **Shared media driver loss on a sealer node**
+  - Effect: executor `i` loses its transport and stops. Member `i` keeps its quorum role: its Raft log runs on its own embedded driver. Its feeder logs `sealer FEED NO-DRIVER` and opens a new client every 1 s.
+  - Recovery: the system task restarts the driver. The executor restarts and asks for the entries from its cursor. The member answers from its retained file.
+- **Executor crash or restart**
+  - Recovery: the executor asks its member for the entries from its durable cursor. A cursor below the replay window of the member reads the range read of the egress (`--egress`, when the egress runs). A cursor below the floor of the egress too restores a peer checkpoint from another sealer node.
+- **Member crash or restart**
+  - Effect: executor `i` gets no entry while its member is down, and its block gauge stops. The other executors carry the chain.
+  - Recovery: the member starts again, and the executor asks again from its cursor.
+- **Deploy of the executor job**: the three executor groups roll at the same time, because Nomad orders no groups. The nonce queries of the sequencers and the ingresses fail until one executor is ready again.
+- **Wipe of a member**: keep `/opt/kardamom/archive/dir`. It is the archive of the shared driver, with the `exec_txs` recording of the executor, inside the archive directory of the member.
+- Proof: no chaos shard runs carry mode yet.
+
 ## Ingress (xN, active/active)
 
 The ingress replicas are shared-nothing. There is no leader and no sticky session. Any replica can accept the transaction of any sender.
@@ -1621,6 +1642,8 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - Proven: the resume of the batcher through the lies, the stale-post alert, the recovery after an outage past the retention window (the batcher exits on the Aeron client timeout and restores its spool), the contiguous record, and the rebuild parity.
   - Open: the followers of that shard read one source, the proxy. This is the wiring of the shard, not a limit of the code. The halt on a swallowed log, the disagreement counter and the self-resume after a wrong hash are therefore not cases yet.
   - Open: the proxy does not serve gas spikes of a real L1.
+- **Carry mode**
+  - Open: no chaos shard deploys carry mode. The node loss that takes a member and its executor together, the feed after a driver loss, and the egress fallback have no case yet. See "Carry mode: the executor next to its member".
 - **Bridge, injection and DA-parity cases are Target-L only**
   - The `semantics` shard runs nonce ordering, RPC liveness and validator and executor consistency against the real cluster.
   - Open on the deployed cluster: S1 and S2 (bridge) need a contract-deploy phase, the message-passer predeploy and the attester variables in the shared bring-up path.

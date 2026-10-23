@@ -464,7 +464,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
   - The snapshot carries the retained frames. A member that restores a snapshot keeps the floor at the posted head. It answers older ranges with `REPLAY_UNAVAILABLE`.
   - With no budget (`0`), nothing bounds the stretch.
   - Use the same value on every member, so the replay range does not change after a failover.
-- `carryBytes`: the deploy does not pass it yet, so the retained frames stay on the heap.
+- `carryBytes`: the deploy passes it, with `feedAeronDir` and `feedRingBytes`, only in carry mode (`KARDAMOM_CARRY_BYTES=on`). Then the job also passes `KARDAMOM_RETAINED_TOKEN` from the Nomad variable of the member group. Without carry mode the retained frames stay on the heap. See [Carry mode](../../deploy/cluster/README.md#carry-mode).
   - Switch it only with a new chain or a coordinated cut-over, never on a live chain. A member with the file stops on a snapshot before version 12, and a member without the file stops on a version-12 snapshot. Both print `sealer RETAINED-FILE FATAL`.
   - `snapshotIntervalS=0` with `carryBytes` stops the start: the purge of the file runs at each snapshot, so the file would never shrink.
 - `daLagBudgetBlocks`: the start-up line `cluster da-lag budget` shows the value. See [DA-lag guard](#da-lag-guard).
@@ -519,7 +519,7 @@ With `carryBytes=true`, the member keeps its retained frames in an append-only f
 
 ### Member feed
 
-With `feedAeronDir`, each member sends its retained frames to its paired executor over IPC, on the media driver of the executor node. The leader and the followers send the same frames. The wire layout, the answer rules and the states are in section 7.8 of `docs/specs/2026-10-10-raft-carried-transactions.md`.
+With `feedAeronDir`, each member sends its retained frames to its paired executor over IPC, on the media driver of the executor node. The deploy runs the executor on the node of its member, and points `feedAeronDir` at the shared media driver of that node. The leader and the followers send the same frames. The wire layout, the answer rules and the states are in section 7.8 of `docs/specs/2026-10-10-raft-carried-transactions.md`.
 
 - Stream 1006 carries the feed, member to executor. Stream 1007 carries the replay requests, executor to member.
 - The feed frames are kinds 1 and 2, the answers 3, 4 and 11, and kind 16 (`FEED_GAP`). Each answer carries the id of its request as an 8-byte tail. The feed carries no status.
@@ -537,7 +537,7 @@ A member stops with `sealer RETAINED-FILE FATAL` when its file does not match it
 
 1. Make sure that a quorum of the other members runs, and that they took a snapshot after the failure.
 2. Stop the member: `nomad alloc stop <alloc>`, or stop its job.
-3. Wipe its state on the host: the cluster directory (with `retained/` in it) and the archive directory. Keep the directories themselves.
+3. Wipe its state on the host: the cluster directory (with `retained/` in it) and the archive directory. Keep the directories themselves. Keep `/opt/kardamom/archive/dir` too: in carry mode it is the archive of the shared media driver of the node.
 4. Start the member. It finds no recording log, so it seeds from a peer and copies the retained file (`cluster START mode=SEED_FROM_PEER`).
 5. Check the log for `cluster SEED retained-copy` with no `FAILED`, then `sealer snapshot RESTORED`.
 

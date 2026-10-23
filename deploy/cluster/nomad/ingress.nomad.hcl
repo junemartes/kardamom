@@ -48,6 +48,18 @@ variable "ack" {
 # `nomad job run` during debugging, not a production path. A mutable
 # tag lets anyone with registry push access change what the next
 # restart runs.
+# Carry mode, "on" or "off" (executor.nomad.hcl). On, the executors run
+# on the sealer nodes, so the executor queries go to sealer-<i>, not to executor-<i>.
+# The deploy passes it from KARDAMOM_CARRY_BYTES.
+variable "carry_bytes" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.carry_bytes)
+    error_message = "The carry_bytes value must be on or off."
+  }
+}
+
 variable "executor_count" {
   type        = number
   description = "The executor node count (node_classes.executor.count). The account RPCs' executor queries go to executor-<i>.node.<datacenter>.consul."
@@ -309,7 +321,7 @@ job "ingress" {
           # eth_getBalance and eth_getTransactionCount ask one executor
           # when the local account layer misses. Never on the submit
           # path. Same list as the sequencer's nonce lookup.
-          "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:9024"]),
+          "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://${var.carry_bytes == "on" ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:9024"]),
           ],
           var.receipt_query_endpoints == "" ? [] : ["--receipt-query-endpoints", var.receipt_query_endpoints],
         )
