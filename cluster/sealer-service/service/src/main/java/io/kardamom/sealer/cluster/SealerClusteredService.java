@@ -458,7 +458,7 @@ public final class SealerClusteredService implements ClusteredService {
      * The snapshot: the state section, then the egress retention above the
      * posted head. Every member writes the same bytes at the same log
      * position. With the retained file, the snapshot is version
-     * {@link CanonicalSealerState#RETAINED_FILE_SNAPSHOT_VERSION}.
+     * {@link CanonicalSealerState#FILE_SNAPSHOT_VERSION}.
      */
     byte[] snapshot() {
         final byte[] stateBytes = retainedFile.isPresent()
@@ -493,13 +493,13 @@ public final class SealerClusteredService implements ClusteredService {
     /**
      * Stop the member when the snapshot does not hold the retention layout
      * of this member. A member with the retained file restores only a
-     * version-12 snapshot: a heap section would start its file at another
-     * position than the file of a peer that kept running. A member without
-     * the file cannot read a file section. The switch changes only with a
+     * snapshot with a file section, version 12 or 17: a heap section would
+     * start its file at another position than the file of a peer that kept
+     * running. A member without the file cannot read a file section. The switch changes only with a
      * new chain or a coordinated cut-over, never on a live chain.
      */
     private void requireRetentionLayout(final int version) {
-        final boolean fileSection = version == CanonicalSealerState.RETAINED_FILE_SNAPSHOT_VERSION;
+        final boolean fileSection = CanonicalSealerState.holdsRetainedFile(version);
         if (fileSection != retainedFile.isPresent()) {
             final String why = "snapshot version " + version + (fileSection
                 ? " holds a retained file, and this member keeps the frames on the heap: start it with "
@@ -1589,7 +1589,7 @@ public final class SealerClusteredService implements ClusteredService {
         flushWindow();
         SnapshotIo.writeSnapshot(snapshotPublication, snapshot(), cluster.idleStrategy());
         latestSnapshotVersion = retainedFile.isPresent()
-            ? CanonicalSealerState.RETAINED_FILE_SNAPSHOT_VERSION
+            ? CanonicalSealerState.FILE_SNAPSHOT_VERSION
             : state.snapshotVersion();
         purgeView = purgeView.withMark(new PurgeView.Mark(cluster.logPosition(), state.blockNumber()));
         // Log to stdout, like the role line below. The block= value is the

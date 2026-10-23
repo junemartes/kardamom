@@ -5,6 +5,7 @@ import io.kardamom.sealer.LagBudgets;
 import io.kardamom.sealer.VoidLedger;
 import io.kardamom.sealer.cluster.ClusterStubs.StubCluster;
 import io.kardamom.sealer.cluster.ClusterStubs.StubSession;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -21,6 +22,9 @@ final class DriverlessLog {
 
     /** The dedup window of every member. */
     static final int CAPACITY = 16;
+
+    /** The segment size of the retained file of a carrying member. */
+    private static final int SEGMENT_BYTES = 64 * 1024;
 
     /** One log entry: an ingress frame, or a boundary tick when {@code frame} is empty. */
     record Entry(String name, Optional<byte[]> frame, long timeMs) {
@@ -76,12 +80,31 @@ final class DriverlessLog {
 
     /** A heap member with an ordering window of {@code orderingWindow} records, from {@code snapshot} or at genesis. */
     Member member(final Optional<byte[]> snapshot, final int orderingWindow) {
+        return start(snapshot, orderingWindow, Optional.empty());
+    }
+
+    /** A member that keeps its retained frames in a file in {@code dir}, from {@code snapshot} or at genesis. */
+    Member carrying(final Path dir, final Optional<byte[]> snapshot) {
+        return start(snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW,
+            Optional.of(new RetainedFile.Config(dir, SEGMENT_BYTES)));
+    }
+
+    /** End {@code member}, then start a carrying member in its file in {@code dir} from {@code snapshot}. */
+    Member restart(final Member member, final Path dir, final byte[] snapshot) {
+        started.remove(member);
+        member.svc().onTerminate(member.cluster());
+        return carrying(dir, Optional.of(snapshot));
+    }
+
+    private Member start(
+            final Optional<byte[]> snapshot, final int orderingWindow, final Optional<RetainedFile.Config> file) {
         final StubCluster cluster = new StubCluster();
         cluster.role = io.aeron.cluster.service.Cluster.Role.FOLLOWER;
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService svc = new SealerClusteredService(
             CAPACITY, 250, 0, Set.of(), VoidLedger.Config.DISABLED,
             CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS, orderingWindow, LagBudgets.DEFAULT);
+        file.ifPresent(svc::carryingBytes);
         svc.start(cluster, snapshot);
         final Member member = new Member(svc, cluster, sequencer);
         started.add(member);

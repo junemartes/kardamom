@@ -8,9 +8,9 @@ import java.util.TreeMap;
 import java.util.stream.IntStream;
 
 /**
- * The retention section of a version-12 snapshot: the floors, the frame
- * count, the front and head positions of the retained file, and the index
- * of its retained boundaries. It is the last part of the snapshot:
+ * The retention section of a snapshot with a retained file, version 12 or
+ * 17: the floors, the frame count, the front and head positions of the
+ * retained file, and the index of its retained boundaries. It is the last part of the snapshot:
  * {@code floor_index(8) | floor_block(8) | count(8) | front(8) | head(8) |
  * n(4) | n * (block(8) | end_tx_idx(8) | end_pos(8)) | len(4)},
  * big-endian like the state. {@code len} is the length of the section
@@ -72,7 +72,7 @@ record RetainedSection(RetainedFrames.Floors floors, long count, long front, lon
         return new RetainedSection(floors, count, front, head, marks);
     }
 
-    /** The section at the end of a version-12 snapshot payload. */
+    /** The section at the end of a snapshot payload with a retained file. */
     static RetainedSection ofSnapshot(final byte[] snapshot) {
         final ByteBuffer buf = ByteBuffer.wrap(snapshot).order(ByteOrder.BIG_ENDIAN);
         final int length = buf.getInt(snapshot.length - Integer.BYTES);
