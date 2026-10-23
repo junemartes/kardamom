@@ -4,6 +4,7 @@ use std::time::Duration;
 use kardamom_cluster_adapter::wire::{
     EGRESS_KIND_REPLAY_DONE, encode_egress_boundary, encode_egress_record, encode_feed_answer,
 };
+use kardamom_egress::drops::Drops;
 use kardamom_egress::http::Http;
 use kardamom_egress::merge::{Head, Merge, MergeConfig};
 use kardamom_egress::owner::{FramePublisher, Input, Owner, OwnerConfig, Parts};
@@ -42,6 +43,7 @@ fn egress(rt: &tokio::runtime::Runtime, dir: &std::path::Path, frames: &[Vec<u8>
         merge,
         store,
         receipts: Receipts::new(NonZeroUsize::new(16).unwrap()),
+        drops: Drops::new(NonZeroUsize::new(16).unwrap()),
         live: NoLive,
         receipts_live: NoLive,
     };

@@ -536,6 +536,38 @@ fn remote_epoch_record_golden_bytes_are_pinned() {
     assert_eq!(back, v);
 }
 
+// The rkyv layout of `TxDrop` on the `tx_drops` stream. The sequencer
+// writes it and the egress reads it, so two releases must agree on these
+// bytes.
+const TX_DROP_GOLDEN: &str = "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1\
+a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a10000000077665544332211000200000000000000";
+
+fn golden_tx_drop() -> kardamom_types::TxDrop {
+    kardamom_types::TxDrop {
+        tx_hash: B256::repeat_byte(0xD1),
+        sender: Address::repeat_byte(0xA1),
+        nonce: 0x0011_2233_4455_6677,
+        reason: kardamom_types::DropReason::ReplacementUnderpriced,
+    }
+}
+
+#[test]
+fn tx_drop_golden_bytes_are_pinned() {
+    let v = golden_tx_drop();
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&v).unwrap();
+    assert_eq!(
+        alloy_primitives::hex::encode(&bytes[..]),
+        TX_DROP_GOLDEN,
+        "TxDrop rkyv layout changed"
+    );
+    let raw = alloy_primitives::hex::decode(TX_DROP_GOLDEN).unwrap();
+    let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(raw.len());
+    aligned.extend_from_slice(&raw);
+    let back: kardamom_types::TxDrop =
+        rkyv::from_bytes::<_, rkyv::rancor::Error>(&aligned).unwrap();
+    assert_eq!(back, v);
+}
+
 /// The frozen stream records against the format registry
 /// (`formats.toml` at the workspace root).
 #[test]
@@ -553,4 +585,5 @@ fn stream_record_layouts_match_the_registry() {
         "receipt-rollback",
         "ReceiptRollback",
     );
+    Registry::assert_rkyv_layout::<kardamom_types::TxDrop>("tx-drops", "TxDrop");
 }

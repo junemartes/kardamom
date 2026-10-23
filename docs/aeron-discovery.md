@@ -69,6 +69,7 @@ The streams and their publishers:
 | `exec_frames` | executor (with `--exec-frames`) | egress |
 | `egress_order` | egress | the readers after the executors (batcher, validator) |
 | `egress_receipts` | egress | sequencers (with `receipts_from_egress = true`) |
+| `tx_drops` (one record per sequencer, with its lane) | sequencer | egress |
 | `l1_blocks` | L1 follower (two instances) | da-watcher, batcher, follower archives |
 
 The `exec_txs` stream carries the transactions that an executor joins, in canonical order: one `ExecTxRecord` for each `TxRef`.
@@ -102,6 +103,14 @@ The `egress_receipts` stream carries the receipts that the egress merged from th
 - The executors cut their batches differently. The egress passes on only the receipts of a batch past the last receipt that it took, with the rows of the batch. The rows are absolute values, and a reader keeps the row of the higher position.
 - A sequencer reads it in place of `tx_receipts` with `receipts_from_egress = true` in its config.
 - The egress also answers `eth_getTransactionReceipt` as the state query of an executor does (`POST /`, the receipt as rkyv hex, the block in `x-state-block`). An ingress reads it with `--receipt-query-endpoints`.
+
+The `tx_drops` stream carries the transactions that the sequencers dropped: one `TxDrop` record for each drop, with the hash, the sender, the nonce and the reason. The reason has the error text of geth, for example `nonce too low` or `txpool is full`.
+
+- The stream id is 1012. The channel and the stream id are the keys `tx_drops_channel` and `tx_drops_stream_id` of `[channels]`.
+- Each sequencer opens one dynamic MDC publication with a `kardamom-mdc-publisher` record (topic `tx_drops`) that carries its lane id. The egress subscribes with no lane id, so it joins the sequencers of every lane.
+- The offer is best effort. A refused offer drops the record, and the client then sees the status `unknown` for that hash.
+- Both twins of a lane publish their drops. The egress keeps one status for each hash, and a receipt of the hash wins over a drop.
+- The egress serves the status with `kardamom_getTransactionStatus`.
 
 The `l1_blocks` stream carries the finalized L1 blocks: one `L1Block` for each block, in block order.
 
@@ -327,7 +336,7 @@ No job configures a publication control port.
 | executor | receipts, boundaries, BAL, the live `exec_txs` publication, `exec_frames` (with `--exec-frames`) |
 | da-watcher | deposits, remote epochs (subscribes to `l1_blocks` and `events`) |
 | l1-indexer | `l1_blocks`, `events` |
-| sequencer lane `n` | `tx_errors`, `tx_status`, one `tx_verdicts` for each ingress that it answers |
+| sequencer lane `n` | `tx_errors`, `tx_status`, `tx_drops`, one `tx_verdicts` for each ingress that it answers |
 | sequencer lane `n`, job variable `ingress` | the publications above, and the publications of the ingress inside the process: 8 `tx_data` lanes, `tx_status` |
 
 The ingress inside a sequencer process opens its own stream plane,

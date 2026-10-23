@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, U256};
 use kardamom_types::shard_map::vslot_for;
-use kardamom_types::{TxDataLoc, TxEnvelope, TxErrorReason, TxStageKind};
+use kardamom_types::{DropReason, TxDataLoc, TxEnvelope, TxErrorReason, TxStageKind};
 
 use super::{AccountEvent, AdmissionLoop, V2Config, VerdictOut};
 use crate::admission::{AccountState, AdmissionConfig};
@@ -120,6 +120,12 @@ fn a_sender_that_cannot_pay_gets_insufficient_funds() {
         errors[0].reason,
         TxErrorReason::InsufficientFunds { have: 1, .. }
     ));
+    let drops = rig.drops();
+    assert_eq!(drops.len(), 1, "one drop for the egress");
+    assert_eq!(
+        (drops[0].sender, drops[0].nonce, drops[0].reason),
+        (s.address(), 0, DropReason::InsufficientFunds)
+    );
 }
 
 #[test]

@@ -5,7 +5,11 @@
 //! ([`merge`]), compares the copies, and keeps the stream on disk
 //! ([`store`]). The readers after the executors (the batcher, the
 //! validator, the clients) read the egress, never an earlier stage.
+//!
+//! The egress also keeps the drops that the sequencers report ([`drops`]),
+//! so a client asks one place for the status of its transaction.
 
+pub mod drops;
 pub mod http;
 pub mod merge;
 pub mod metrics;

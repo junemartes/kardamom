@@ -4,6 +4,7 @@ use std::time::Duration;
 use kardamom_cluster_adapter::wire::{encode_egress_boundary, encode_egress_record};
 
 use super::Http;
+use crate::drops::Drops;
 use crate::merge::{Head, Merge, MergeConfig};
 use crate::owner::{FramePublisher, Input, Owner, OwnerConfig, Parts};
 use crate::receipts::Receipts;
@@ -17,15 +18,19 @@ impl FramePublisher for NoLive {
 
 /// An egress with `frames` stored, on a free port. Returns its address.
 async fn egress(dir: &std::path::Path, frames: &[Vec<u8>]) -> std::net::SocketAddr {
-    egress_with(dir, frames, Vec::new()).await
+    let inputs = frames
+        .iter()
+        .zip(0u64..)
+        .map(|(frame, seq)| Input::Frame {
+            session: 1,
+            message: [seq.to_le_bytes().as_slice(), frame].concat(),
+        })
+        .collect();
+    egress_inputs(dir, inputs).await
 }
 
-/// An egress with `frames` stored and `receipts` taken.
-async fn egress_with(
-    dir: &std::path::Path,
-    frames: &[Vec<u8>],
-    receipts: Vec<kardamom_log::aeron_live::ReceiptFrame>,
-) -> std::net::SocketAddr {
+/// An egress that took `taken` before its first read.
+async fn egress_inputs(dir: &std::path::Path, taken: Vec<Input>) -> std::net::SocketAddr {
     let genesis = Head {
         next_index: 0,
         next_block: 1,
@@ -48,22 +53,15 @@ async fn egress_with(
             merge,
             store,
             receipts: Receipts::new(NonZeroUsize::new(16).unwrap()),
+            drops: Drops::new(NonZeroUsize::new(16).unwrap()),
             live: NoLive,
             receipts_live: NoLive,
         },
     );
     let (inputs, rx) = crossbeam_channel::bounded(64);
-    frames.iter().zip(0u64..).for_each(|(frame, seq)| {
-        inputs
-            .send(Input::Frame {
-                session: 1,
-                message: [seq.to_le_bytes().as_slice(), frame].concat(),
-            })
-            .unwrap();
-    });
-    receipts
+    taken
         .into_iter()
-        .try_for_each(|frame| inputs.send(Input::Receipts(frame)))
+        .try_for_each(|input| inputs.send(input))
         .unwrap();
     std::thread::spawn(move || owner.run(&rx));
     let http = Http::bind("127.0.0.1:0".parse().unwrap(), inputs)
@@ -134,8 +132,8 @@ async fn the_receipt_call_answers_as_the_executor_query_does() {
         receipts: vec![receipt.clone()],
         accounts: Vec::new(),
     };
-    let frames = vec![kardamom_log::aeron_live::ReceiptFrame::Batch(batch)];
-    let addr = egress_with(dir.path(), &[], frames).await;
+    let frame = kardamom_log::aeron_live::ReceiptFrame::Batch(batch);
+    let addr = egress_inputs(dir.path(), vec![Input::Receipts(frame)]).await;
     let client = reqwest::Client::new();
     let ask = |hash| {
         client
@@ -159,5 +157,70 @@ async fn the_receipt_call_answers_as_the_executor_query_does() {
     assert_eq!(
         kardamom_cache::query::parse_receipt_answer(&missing).unwrap(),
         None
+    );
+}
+
+/// The status call answers each of the three states, and the receipt call
+/// answers `null` for a dropped hash.
+#[tokio::test]
+async fn the_status_call_answers_executed_dropped_and_unknown() {
+    use alloy_primitives::B256;
+    let dir = tempfile::tempdir().unwrap();
+    let executed = kardamom_types::Receipt {
+        tx_hash: B256::repeat_byte(4),
+        block_number: 7,
+        tx_idx: kardamom_types::BPosition::from_index(3),
+        ..kardamom_types::Receipt::default()
+    };
+    let batch = kardamom_types::ReceiptBatch {
+        receipts: vec![executed.clone()],
+        accounts: Vec::new(),
+    };
+    let dropped = kardamom_types::TxDrop {
+        tx_hash: B256::repeat_byte(5),
+        sender: alloy_primitives::Address::repeat_byte(0xA1),
+        nonce: 9,
+        reason: kardamom_types::DropReason::NonceTooLow,
+    };
+    let addr = egress_inputs(
+        dir.path(),
+        vec![
+            Input::Receipts(kardamom_log::aeron_live::ReceiptFrame::Batch(batch)),
+            Input::Drop(dropped.clone()),
+        ],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let call = |method: &'static str, hash: B256| {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": method, "params": [hash],
+        });
+        let request = client.post(format!("http://{addr}/")).json(&body).send();
+        async move {
+            let answer: serde_json::Value = request.await.unwrap().json().await.unwrap();
+            answer["result"].clone()
+        }
+    };
+    let status = "kardamom_getTransactionStatus";
+    assert_eq!(
+        call(status, executed.tx_hash).await,
+        serde_json::json!({"status": "executed"})
+    );
+    assert_eq!(
+        call(status, dropped.tx_hash).await,
+        serde_json::json!({
+            "status": "dropped",
+            "reason": "nonce too low",
+            "sender": dropped.sender,
+            "nonce": "0x9",
+        })
+    );
+    assert_eq!(
+        call(status, B256::ZERO).await,
+        serde_json::json!({"status": "unknown"})
+    );
+    assert_eq!(
+        call("eth_getTransactionReceipt", dropped.tx_hash).await,
+        serde_json::Value::Null
     );
 }
