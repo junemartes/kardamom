@@ -1209,6 +1209,10 @@ The da-watcher takes the records of the L1 follower's `l1_blocks` stream, and it
 - A record that does not descend from the head is the halt `l1_chain_break`. The watcher reads the block again from the archives every tick, and resumes by itself on a record that descends.
 - A record past the next block is a gap on the subscription. The watcher reads the missing records from the archives of the follower nodes, and the follower's archive (`indexer_l1_block`) serves what they do not hold.
 - The loop selects on the next record, the sealer's origin, the re-publish deadline, and a housekeeping tick (`--poll-interval-secs`, 1 s in the deploy).
+- **The epoch pace** (`--epoch-pace-ms`, default 100). L1 finalizes about 32 blocks at once, and each epoch seals its own L2 block. Published at once, the epochs make a burst of blocks. The executors can run only 4 blocks ahead of their commits (`COMMIT_PIPELINE_DEPTH`), so the transactions behind a burst wait for their receipts (about 150-300 ms on staging, every 6.4 min). The watcher publishes one epoch of a step at a time, one pace apart.
+  - A backlog of more than 64 records (`PACED_BACKLOG`, a catch-up after a restart) publishes at full speed.
+  - The pace must stay well below the 4 s gather window of the validator's epoch check, so one step stays one range of that check.
+  - A step of 32 epochs then takes about 3.2 s more. Deposits already wait 6 to 13 min for L1 finality.
 
 - With `--config` (the deploy), a boundary-only cluster session reads the L1 origin `C` of every boundary. `C` is the last epoch that the sealer committed.
 - The watcher keeps the epochs that it published after `C`. This is its window. The window holds up to 2048 epochs (6.8 hours of L1). The gauge is `kardamom_da_watcher_epochs_unconfirmed`.
