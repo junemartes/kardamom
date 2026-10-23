@@ -131,6 +131,18 @@ variable "receipts" {
   default     = 1000000
 }
 
+# The peers of each instance: the HTTP surface on each executor node. An
+# instance reads the frames between its head and the copies of the
+# executors from a peer after a start. A node with no instance refuses the
+# connection, and the instance itself costs one empty read, so the list
+# names every executor node.
+locals {
+  peers = join(",", [
+    for i in range(var.executor_count) :
+    "http://executor-${i}.node.${var.datacenter}.consul:${var.http_port}"
+  ])
+}
+
 job "egress" {
   datacenters = [var.datacenter]
   type        = "service"
@@ -217,6 +229,7 @@ job "egress" {
           "--compared", format("%d", var.compared),
           "--receipts", format("%d", var.receipts),
           "--executor-count", format("%d", var.executor_count),
+          "--peers", local.peers,
           # The service identity on the metrics and in the discovery
           # records. Each instance must have its own.
           "--host-id", "egress-${NOMAD_ALLOC_INDEX}",

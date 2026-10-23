@@ -520,7 +520,9 @@ async fn the_ack_at_admission_answers_on_the_verdict_of_the_sequencer() {
     let cfg = IngressConfig {
         partition_count_m: TWO_SHARDS,
         admission_checks: false,
-        admission_ack: Some(kardamom_ingress::config::AdmissionAck::default()),
+        ack: kardamom_ingress::config::AckMode::Admission(
+            kardamom_ingress::config::AdmissionAck::default(),
+        ),
         ..IngressConfig::default()
     };
     let (mock, mut partition_rx) = MockChannels::new(TWO_MOCK_SHARDS);

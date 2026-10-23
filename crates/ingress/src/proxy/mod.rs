@@ -3,7 +3,8 @@
 //! single process.
 //!
 //! Module layout: this file owns the struct, construction, and accessors.
-//! [`submit`] owns the client-facing submit path. [`accounts`] owns the
+//! [`submit`] owns the client-facing submit path. [`validated`] owns the
+//! submit of the validated ack. [`accounts`] owns the
 //! account reads behind the two account RPCs. [`watchers`] owns the
 //! background stream watchers that [`IngressProxy::new`] spawns.
 
@@ -11,6 +12,9 @@ mod accounts;
 #[cfg(test)]
 mod rollback_tests;
 mod submit;
+mod validated;
+#[cfg(test)]
+mod validated_tests;
 mod watchers;
 
 pub use accounts::AccountField;
@@ -39,6 +43,7 @@ use crate::error::IngressError;
 use crate::pending::PendingReceipts;
 use crate::rate_limit::PerIpLimiter;
 use crate::receipt_cache::ReceiptCache;
+use crate::recent::RecentMap;
 use crate::sig_verify::BatchVerifier;
 use crate::submit_steps::SubmitSteps;
 use crate::tx_error_dedup::TxErrorDedup;
@@ -141,9 +146,14 @@ where
     pub(crate) rate_limiter: Arc<PerIpLimiter>,
     pub(crate) verifier: Arc<BatchVerifier>,
     pub(crate) pending: Arc<PendingReceipts>,
-    /// The waiters of the ack at admission. Empty unless
-    /// `cfg.admission_ack` is on. See [`crate::acks`].
+    /// The waiters of the ack at admission. Empty unless `cfg.ack` is
+    /// [`crate::config::AckMode::Admission`]. See [`crate::acks`].
     pub(crate) acks: Arc<AckWaiters>,
+    /// The duplicate cache of the validated ack: the hashes of recent
+    /// published transactions, with the recovered sender of each. Empty
+    /// in the other ack modes. It saves a recovery and a publication. It
+    /// is no correctness rule: the window of the sealer dedups the order.
+    pub(crate) seen: Arc<RecentMap<B256, Address>>,
     pub(crate) cache: Arc<ReceiptCache>,
     /// Consumer-side `tx_errors` dedup for P racing sequencer replicas.
     /// Drops the twin's duplicate copy of each per-tx rejection, and
@@ -229,6 +239,7 @@ where
             verifier: self.verifier.clone(),
             pending: self.pending.clone(),
             acks: self.acks.clone(),
+            seen: self.seen.clone(),
             cache: self.cache.clone(),
             tx_error_dedup: self.tx_error_dedup.clone(),
             publication: self.publication.clone(),
@@ -268,7 +279,8 @@ where
             cfg.sig_verify_flush_window,
         ));
         let pending = Arc::new(PendingReceipts::new(cfg.ack_policy));
-        let acks = AckWaiters::new(cfg.admission_ack.unwrap_or_default());
+        let acks = AckWaiters::new(cfg.ack.admission().unwrap_or_default());
+        let seen = Arc::new(RecentMap::new(cfg.duplicate_cache_capacity));
         let cache = Arc::new(ReceiptCache::new(cfg.receipt_cache_capacity));
         let tx_error_dedup = Arc::new(TxErrorDedup::default());
         let live = subscription.live_accounts();
@@ -296,6 +308,7 @@ where
             verifier,
             pending,
             acks,
+            seen,
             cache,
             tx_error_dedup,
             publication,
@@ -318,7 +331,7 @@ where
         };
         me.spawn_tx_receipts_watcher(applied_tx);
         me.spawn_tx_errors_watcher();
-        if me.cfg.admission_ack.is_some() {
+        if me.cfg.ack.admission().is_some() {
             me.spawn_verdicts_watcher();
         }
         me.spawn_chain_watch();

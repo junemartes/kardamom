@@ -73,6 +73,19 @@ variable "nomad_tls_dir" {
   default     = ""
 }
 
+# How long and how much Prometheus keeps. At a 1 s scrape, staging
+# writes about 3 GB a day. A size of "0B" sets no size limit, and the
+# time limit alone applies.
+variable "prometheus_retention_time" {
+  type    = string
+  default = "24h"
+}
+
+variable "prometheus_retention_size" {
+  type    = string
+  default = "0B"
+}
+
 # The scrape of the egress (nomad/egress.nomad.hcl), "on" or "off". The
 # workloads role sets it on with the egress job (KARDAMOM_EGRESS=1).
 variable "egress" {
@@ -216,6 +229,14 @@ job "monitoring" {
   group "monitoring" {
     count = 1
 
+    # The metrics live in the allocation's data directory. A sticky disk
+    # keeps them when a job update replaces the allocation on the same
+    # node, so a deploy does not cut the history.
+    ephemeral_disk {
+      sticky  = true
+      migrate = true
+    }
+
     restart {
       attempts = 3
       interval = "1m"
@@ -291,7 +312,8 @@ job "monitoring" {
         args = [
           "--config.file=/local/prometheus.yml",
           "--storage.tsdb.path=/alloc/data/prometheus",
-          "--storage.tsdb.retention.time=24h",
+          "--storage.tsdb.retention.time=${var.prometheus_retention_time}",
+          "--storage.tsdb.retention.size=${var.prometheus_retention_size}",
           # The overview dashboard rates a multi-metric selector
           # ({__name__=~"kardamom_.+_total"}); without delayed name
           # removal, Prometheus rejects it once a service exports two
