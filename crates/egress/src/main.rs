@@ -14,10 +14,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use kardamom_egress::catchup::CatchUp;
 use kardamom_egress::drops::Drops;
 use kardamom_egress::http::Http;
 use kardamom_egress::merge::{Head, Merge, MergeConfig};
-use kardamom_egress::owner::{FramePublisher, Input, Owner, OwnerConfig, Parts};
+use kardamom_egress::owner::{FramePublisher, Input, Join, Owner, OwnerConfig, Parts};
 use kardamom_egress::receipts::Receipts;
 use kardamom_egress::store::Store;
 use kardamom_log::aeron_live::{AeronRuntime, PubHandle, TxDropsSubscriberHandle};
@@ -92,6 +93,17 @@ struct Args {
     /// Host identifier. Stamped on every metric.
     #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
     host_id: String,
+    /// The other egress instances (`http://host:port`, comma-separated).
+    /// After a start, the egress reads the frames between its head and
+    /// the copies of the executors from one of them. The list may hold
+    /// this instance too. Empty: the stream starts again after the next
+    /// boundary of a copy.
+    #[arg(long, env = "KARDAMOM_EGRESS_PEERS", value_delimiter = ',')]
+    peers: Vec<String>,
+    /// How long the peers may bring no frame before the stream starts
+    /// again after the next boundary of a copy, in seconds.
+    #[arg(long, env = "KARDAMOM_EGRESS_JOIN_TIMEOUT_S", default_value = "60")]
+    join_timeout_secs: NonZeroU64,
 }
 
 /// The live publication of the merged stream.
@@ -145,10 +157,22 @@ async fn main() -> Result<()> {
         },
         store.head(),
     );
+    let (inputs, rx) = crossbeam_channel::bounded(INPUTS);
+    let catch_up = CatchUp::new(
+        args.peers,
+        inputs.clone(),
+        Duration::from_secs(args.join_timeout_secs.get()),
+    );
+    let join = if catch_up.is_some() {
+        Join::FromPeer
+    } else {
+        Join::AtBoundary
+    };
     let owner = Owner::new(
         OwnerConfig {
             sync_every: Duration::from_millis(args.sync_ms),
             keep_blocks: args.keep_blocks,
+            join,
         },
         Parts {
             merge,
@@ -159,7 +183,6 @@ async fn main() -> Result<()> {
             receipts_live: Live(receipts_live),
         },
     );
-    let (inputs, rx) = crossbeam_channel::bounded(INPUTS);
     let owner_thread = std::thread::Builder::new()
         .name("egress-owner".into())
         .spawn(move || owner.run(&rx))
@@ -182,6 +205,9 @@ async fn main() -> Result<()> {
         .spawn(move || forward_drops(drops, &forward, &handle))
         .context("spawn the drops thread")?;
 
+    if let Some(task) = catch_up {
+        tokio::spawn(task.run());
+    }
     let http = Http::bind(args.bind, inputs)
         .await
         .context("bind the range read")?;

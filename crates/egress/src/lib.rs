@@ -9,6 +9,7 @@
 //! The egress also keeps the drops that the sequencers report ([`drops`]),
 //! so a client asks one place for the status of its transaction.
 
+pub mod catchup;
 pub mod drops;
 pub mod http;
 pub mod merge;
@@ -16,3 +17,5 @@ pub mod metrics;
 pub mod owner;
 pub mod receipts;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_support;

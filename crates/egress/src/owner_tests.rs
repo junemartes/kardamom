@@ -7,9 +7,9 @@ use kardamom_log::aeron_live::ReceiptFrame;
 use kardamom_types::{BPosition, DropReason, Receipt, ReceiptBatch, TxDrop};
 use tokio::sync::oneshot;
 
-use super::{FramePublisher, Input, Owner, OwnerConfig, Parts, ReadRequest};
+use super::{FramePublisher, Input, Join, JoinState, Owner, OwnerConfig, Parts, ReadRequest};
 use crate::drops::{Dropped, Drops, Status};
-use crate::merge::{Head, Merge, MergeConfig};
+use crate::merge::{Head, Key, Merge, MergeConfig};
 use crate::receipts::Receipts;
 use crate::store::{Range, Store};
 
@@ -35,6 +35,10 @@ const GENESIS: Head = Head {
 };
 
 fn owner(dir: &std::path::Path, live: Live) -> Owner<Live> {
+    owner_with(dir, live, Join::FromPeer)
+}
+
+fn owner_with(dir: &std::path::Path, live: Live, join: Join) -> Owner<Live> {
     let store = Store::open(dir, NonZeroU64::new(10).unwrap(), GENESIS).unwrap();
     let merge = Merge::new(
         MergeConfig {
@@ -47,6 +51,7 @@ fn owner(dir: &std::path::Path, live: Live) -> Owner<Live> {
         OwnerConfig {
             sync_every: Duration::from_millis(10),
             keep_blocks: NonZeroU64::new(1_000).unwrap(),
+            join,
         },
         Parts {
             merge,
@@ -187,4 +192,114 @@ fn a_drop_after_the_receipt_changes_nothing() {
     o.on(drop_input(1, DropReason::NonceTooLow)).unwrap();
     assert_eq!(status_of(&mut o, 1), Status::Executed);
     assert_eq!(o.parts.drops.dropped(&B256::with_last_byte(1)), None);
+}
+
+fn record(index: u64) -> Vec<u8> {
+    encode_egress_record(index, &[u8::try_from(index % 256).unwrap(); 40]).unwrap()
+}
+
+/// The message of `frame` from a copy that started before this egress.
+fn late(seq: u64, frame: &[u8]) -> Input {
+    message(100 + seq, frame)
+}
+
+fn state(o: &mut Owner<Live>) -> JoinState {
+    let (reply, answer) = oneshot::channel();
+    o.on(Input::State(reply)).unwrap();
+    answer.blocking_recv().unwrap()
+}
+
+/// What a read from genesis finds: the frames, or the floor.
+fn read_from_genesis(o: &mut Owner<Live>) -> Range {
+    let (reply, answer) = oneshot::channel();
+    o.on(Input::Read(ReadRequest {
+        from_index: 0,
+        from_block: 1,
+        limit: usize::MAX,
+        reply,
+    }))
+    .unwrap();
+    answer.blocking_recv().unwrap().unwrap()
+}
+
+/// With no peer, an empty store on a running chain starts after the first
+/// boundary of a copy. The frames after it chain, and a reader from
+/// genesis gets the new floor.
+#[test]
+fn with_no_peer_the_stream_starts_after_a_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, published) = live();
+    let mut o = owner_with(dir.path(), live, Join::AtBoundary);
+    o.on(late(0, &record(200))).unwrap();
+    o.on(late(1, &encode_egress_boundary(30, 201, 0, 0)))
+        .unwrap();
+    o.on(late(2, &record(201))).unwrap();
+    assert_eq!(published.try_iter().collect::<Vec<_>>(), [record(201)]);
+    assert!(state(&mut o).joined);
+    let start = Head {
+        next_index: 201,
+        next_block: 31,
+        last: Some(Key::Boundary(30)),
+    };
+    assert_eq!(
+        read_from_genesis(&mut o),
+        Range::Unavailable { floor: start }
+    );
+}
+
+/// The frames of a peer fill the place, and the frames of the copy that
+/// wait behind them follow.
+#[test]
+fn the_frames_of_a_peer_join_the_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, published) = live();
+    let mut o = owner(dir.path(), live);
+    let stream = [
+        record(0),
+        record(1),
+        encode_egress_boundary(1, 2, 0, 0),
+        record(2),
+        record(3),
+    ];
+    o.on(late(0, &stream[3])).unwrap();
+    o.on(late(1, &stream[4])).unwrap();
+    assert!(!state(&mut o).joined, "a record is never certain alone");
+    o.on(Input::Caught(stream[..4].to_vec())).unwrap();
+    assert_eq!(published.try_iter().collect::<Vec<_>>(), stream);
+    assert!(state(&mut o).joined);
+}
+
+/// A peer floor above the head starts the stream there. A floor at or
+/// below the head changes nothing.
+#[test]
+fn a_peer_floor_above_the_head_starts_the_stream_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, _published) = live();
+    let mut o = owner(dir.path(), live);
+    let floor = Head {
+        next_index: 40,
+        next_block: 21,
+        last: Some(Key::Boundary(20)),
+    };
+    o.on(Input::Floor(floor)).unwrap();
+    assert_eq!(state(&mut o).head, floor);
+    o.on(Input::Floor(GENESIS)).unwrap();
+    assert_eq!(state(&mut o).head, floor);
+}
+
+/// When the peers give up, the next boundary of a copy starts the stream.
+/// Before, a boundary changes nothing.
+#[test]
+fn after_the_peers_give_up_a_boundary_starts_the_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, _published) = live();
+    let mut o = owner(dir.path(), live);
+    o.on(late(0, &encode_egress_boundary(30, 201, 0, 0)))
+        .unwrap();
+    assert_eq!(state(&mut o).head, GENESIS);
+    o.on(Input::GiveUp).unwrap();
+    o.on(late(1, &encode_egress_boundary(31, 205, 0, 0)))
+        .unwrap();
+    assert_eq!(state(&mut o).head.next_block, 32);
+    assert!(state(&mut o).joined);
 }
