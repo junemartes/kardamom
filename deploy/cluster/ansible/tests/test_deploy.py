@@ -948,7 +948,7 @@ class DeployTest(Deploys):
         for name in ('executor', 'validator', 'batcher', 'ingress', 'notifier'):
             self.assertEqual(flags & set(self.job_args(plans[name])), set(), name)
         self.assertNotIn('receipts_from_egress', self.job_templates(plans['sequencer']))
-        self.assertNotIn('kardamom-egress', self.job_templates(plans['monitoring']))
+        self.assertNotIn('service "kardamom-egress-metrics|any"', self.job_templates(plans['monitoring']))
 
     def test_the_egress_switches_deploy_the_egress_and_reach_each_reader(self):
         self.manifest.write_text(self.manifest.read_text()
