@@ -6,12 +6,21 @@ use kardamom_cluster_adapter::wire::{
     RefRefused, SEALER_V5_DECISION_VERSION, encode_egress_boundary, encode_record_lag_reject,
     encode_status,
 };
+use kardamom_sequencer::outbound::fakes::InMemorySidePublisher;
 use kardamom_sequencer::resync::{SealerRefusal, SharedWatermark};
-use kardamom_sequencer::sealer_rules::SealerVersion;
+use kardamom_sequencer::sealer_rules::{SealerRules, SealerVersion};
 use kardamom_types::cluster_status::RecordLagStatus;
-use kardamom_types::{ClusterStatus, TxErrorReason};
+use kardamom_types::{ClusterStatus, DropReason, TxDrop, TxErrorReason};
 
 use super::EgressWatermarkFeed;
+
+/// Rules that keep `version` from 0, with drops that the test reads.
+fn rules(
+    version: &SealerVersion,
+    drops: &InMemorySidePublisher,
+) -> SealerRules<InMemorySidePublisher> {
+    SealerRules::new(0, version.clone(), drops.clone())
+}
 
 /// A record-lag reject reaches the terminal-refusal channel with its
 /// values, and never the rewind channel.
@@ -27,7 +36,7 @@ fn a_record_lag_reject_is_a_terminal_refusal() {
         answer_tx,
         deadline_tx,
         origins,
-        SealerVersion::default(),
+        rules(&SealerVersion::default(), &InMemorySidePublisher::default()),
     );
     let sender = Address::repeat_byte(0x13);
     let lag = RecordLagStatus {
@@ -69,7 +78,7 @@ fn a_snapshot_notice_holds_the_lag_flag_until_the_next_boundary() {
         reject_tx,
         deadline_tx,
         origins,
-        SealerVersion::default(),
+        rules(&SealerVersion::default(), &InMemorySidePublisher::default()),
     );
     let notice = encode_status(&ClusterStatus {
         snapshot_follows: true,
@@ -94,14 +103,16 @@ fn a_snapshot_notice_holds_the_lag_flag_until_the_next_boundary() {
     );
 }
 
-/// The refusal of a reference (egress kind 18) reaches no channel and does
-/// not change the version of the sealer.
+/// The refusal of a reference (egress kind 18) reaches no channel of the
+/// publish loop. It raises the kept version to the version of the frame,
+/// and publishes one drop for the hash, with the reason of the refusal.
 #[test]
-fn a_reference_refusal_changes_nothing() {
+fn a_reference_refusal_raises_the_version_and_drops_the_transaction() {
     let (deadline_tx, deadline_rx) = crossbeam_channel::bounded(4);
     let (answer_tx, answer_rx) = crossbeam_channel::bounded(4);
     let (origins, origins_rx) = crossbeam_channel::unbounded();
     let version = SealerVersion::default();
+    let drops = InMemorySidePublisher::default();
     let mut feed = EgressWatermarkFeed::new(
         1_000,
         0,
@@ -109,7 +120,7 @@ fn a_reference_refusal_changes_nothing() {
         answer_tx,
         deadline_tx,
         origins,
-        version.clone(),
+        rules(&version, &drops),
     );
 
     feed.on_frame(
@@ -125,5 +136,16 @@ fn a_reference_refusal_changes_nothing() {
     assert!(deadline_rx.try_recv().is_err());
     assert!(answer_rx.try_recv().is_err());
     assert!(origins_rx.try_recv().is_err());
-    assert!(!version.carries_bytes());
+    assert!(version.carries_bytes());
+    assert_eq!(
+        *drops.drops.lock().unwrap(),
+        [TxDrop {
+            tx_hash: B256::repeat_byte(0xAB),
+            sender: Address::repeat_byte(0x13),
+            nonce: 7,
+            reason: DropReason::SealerRefusedReference,
+        }]
+    );
+    assert_eq!(drops.statuses.lock().unwrap().len(), 0, "no status");
+    assert_eq!(drops.errors.lock().unwrap().len(), 0, "no error");
 }

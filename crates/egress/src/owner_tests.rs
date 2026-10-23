@@ -183,6 +183,24 @@ fn a_receipt_after_a_drop_wins() {
     assert_eq!(o.parts.drops.dropped(&B256::with_last_byte(1)), None);
 }
 
+/// A drop for a reference that the sealer refused is provisional: the
+/// twin can offer the same transaction with its bytes, and the receipt of
+/// that copy turns the status to executed.
+#[test]
+fn a_refused_reference_is_dropped_until_the_receipt_of_the_twin() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, _published) = live();
+    let mut o = owner(dir.path(), live);
+    o.on(drop_input(1, DropReason::SealerRefusedReference))
+        .unwrap();
+    assert_eq!(
+        status_of(&mut o, 1),
+        dropped(DropReason::SealerRefusedReference)
+    );
+    o.on(receipt_input(1)).unwrap();
+    assert_eq!(status_of(&mut o, 1), Status::Executed);
+}
+
 #[test]
 fn a_drop_after_the_receipt_changes_nothing() {
     let dir = tempfile::tempdir().unwrap();

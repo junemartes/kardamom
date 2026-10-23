@@ -120,6 +120,21 @@ pub(crate) struct Args {
     /// off): the deploy sets both from one value.
     #[arg(long, env = "KARDAMOM_PRIORITY_FEES")]
     priority_fees: Option<bool>,
+    /// The decision version of the sealer that a new process keeps until
+    /// the sealer reports its version (egress kind 17), from 0 to 5.
+    /// Default 0. The deploy sets the lowest decision version of the
+    /// members. With 5, a new process offers each transaction with its
+    /// bytes from the first offer. A report of the current session that
+    /// says a lower version lowers the kept version, so a wrong floor lasts
+    /// until the first report. Set 0 before a fleet rebuild from a seed.
+    #[arg(
+        long,
+        env = "KARDAMOM_SEALER_VERSION_FLOOR",
+        default_value_t = 0,
+        value_parser = clap::value_parser!(u8)
+            .range(0..=i64::from(kardamom_cluster_adapter::wire::SEALER_V5_DECISION_VERSION))
+    )]
+    pub(crate) sealer_version_floor: u8,
 }
 
 impl Args {

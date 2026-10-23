@@ -7,7 +7,7 @@ use kardamom_types::{DropReason, TxDataLoc, TxEnvelope, TxErrorReason, TxStageKi
 
 use super::{AccountEvent, AdmissionLoop, V2Config, VerdictOut};
 use crate::admission::{AccountState, AdmissionConfig};
-use crate::sealer_rules::{SealerRules, SealerVersion};
+use crate::sealer_rules::SealerVersion;
 use crate::testkit::{Rig, one_partition_cfg, pos, signed_envelope, signer};
 
 fn cfg() -> V2Config {
@@ -132,10 +132,7 @@ fn a_sender_that_cannot_pay_gets_insufficient_funds() {
 fn a_sealer_on_version_four_gets_the_tagged_position() {
     let s = signer(4);
     let (mut l, accounts, _) = new_loop();
-    let shared = SealerVersion::default();
-    let mut rules = SealerRules::new(0, shared.clone());
-    rules.on_session_start(1);
-    rules.on_sealer_info(1, 4);
+    let shared = SealerVersion::starting_at(4);
     l.enable_positioned_refs(shared);
     accounts
         .send(AccountEvent::Rows {
@@ -158,10 +155,7 @@ fn a_sealer_on_version_four_gets_the_tagged_position() {
 fn a_sealer_on_version_five_gets_the_bytes() {
     let s = signer(5);
     let (mut l, accounts, _) = new_loop();
-    let shared = SealerVersion::default();
-    let mut rules = SealerRules::new(0, shared.clone());
-    rules.on_session_start(1);
-    rules.on_sealer_info(1, 5);
+    let shared = SealerVersion::starting_at(5);
     l.enable_positioned_refs(shared);
     accounts
         .send(AccountEvent::Rows {

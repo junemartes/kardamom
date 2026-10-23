@@ -124,14 +124,32 @@ pub trait TxOrderingRefPublisher: Send {
     fn try_publish_remote_epoch(&mut self, r: &RemoteEpochRecord) -> Result<(), SequencerError>;
 }
 
+/// The `tx_drops` channel: one record for each transaction that the
+/// sequencer drops. Best effort: a failure is logged, and the egress then
+/// has no status for the hash.
+pub trait DropPublisher: Send {
+    fn publish_drop(&mut self, d: TxDrop);
+}
+
 /// The side channels: `tx_errors`, `tx_status` and `tx_drops`. All are
 /// best effort. The caller logs a failure and does not propagate it. The
 /// canonical state has already advanced, or the inbound transaction was
 /// rejected, so there is nothing to roll back.
-pub trait SideChannelPublisher: Send {
+pub trait SideChannelPublisher: DropPublisher {
     fn publish_error(&mut self, e: TxError);
     fn publish_status(&mut self, s: TxStatus);
-    fn publish_drop(&mut self, d: TxDrop);
+}
+
+/// The live `tx_drops` channel. A clone shares the publication, so the
+/// publish loop and the egress feed thread publish on one stream. Each
+/// drop counts in `kardamom_sequencer_tx_drops_total{reason}`.
+impl DropPublisher for TxDropsPublisherHandle {
+    fn publish_drop(&mut self, d: TxDrop) {
+        crate::metrics::record_tx_drop(d.reason);
+        if let Err(err) = self.publish_best_effort(&d) {
+            tracing::warn!(error = %err, "tx_drops publish failed (dropped)");
+        }
+    }
 }
 
 /// The live side channels. The sequencer publishes rejections on the
@@ -181,11 +199,11 @@ impl SideChannelPublisher for SideChannels {
             tracing::warn!(error = %err, "tx_status publish failed (dropped)");
         }
     }
+}
 
+impl DropPublisher for SideChannels {
     fn publish_drop(&mut self, d: TxDrop) {
-        if let Err(err) = self.drops.publish_best_effort(&d) {
-            tracing::warn!(error = %err, "tx_drops publish failed (dropped)");
-        }
+        self.drops.publish_drop(d);
     }
 }
 
@@ -201,7 +219,8 @@ pub mod fakes {
     use kardamom_types::{EpochRecord, TxRef, TxStatus};
 
     use super::{
-        RefOffer, SequencerError, SideChannelPublisher, TxDrop, TxError, TxOrderingRefPublisher,
+        DropPublisher, RefOffer, SequencerError, SideChannelPublisher, TxDrop, TxError,
+        TxOrderingRefPublisher,
     };
 
     /// In-memory `tx_ordering` publisher. Records every published offer,
@@ -281,7 +300,9 @@ pub mod fakes {
         fn publish_status(&mut self, s: TxStatus) {
             self.statuses.lock().unwrap().push(s);
         }
+    }
 
+    impl DropPublisher for InMemorySidePublisher {
         fn publish_drop(&mut self, d: TxDrop) {
             self.drops.lock().unwrap().push(d);
         }
