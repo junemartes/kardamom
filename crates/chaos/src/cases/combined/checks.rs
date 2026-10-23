@@ -20,6 +20,9 @@ use crate::rpc::Rpc;
 /// moves it when the da-watcher fills the gap. The sequencer's
 /// origin-gap counter is not a baseline: it resets with the sequencer.
 const EPOCHS_REPUBLISHED: &str = "kardamom_da_watcher_epochs_republished_total";
+/// The da-watcher's count of every epoch it published. It rises with
+/// each L1 block, so a drop shows a restart of the da-watcher.
+const EPOCHS_PUBLISHED: &str = "kardamom_da_watcher_epochs_published_total";
 /// The ingress reader counter, by layer and outcome. The receipt layer
 /// counts a `state_hit` when a receipt the memory cache does not hold
 /// comes from an executor's state DB.
@@ -38,44 +41,68 @@ const SEALER_MEMBERS: u64 = 3;
 /// How long a receipted transfer gets to execute before the fault.
 const TRANSFER_BUDGET: Duration = Duration::from_secs(60);
 
-/// The counter that rises when a lost epoch is filled again. `None` when
-/// the exporter did not answer.
+/// The counters that show the refill of a lost epoch. `None` when the
+/// exporter did not answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Refills {
     pub(super) republished: Option<i64>,
+    pub(super) published: Option<i64>,
+}
+
+/// How the da-watcher filled a lost epoch again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Refill {
+    /// The da-watcher published an unconfirmed epoch again.
+    Republished,
+    /// The da-watcher restarted, and its counters reset. A restarted
+    /// da-watcher resumes after the sealer's L1 origin, so its first
+    /// publish is the first epoch that the sealer does not hold.
+    Restarted,
 }
 
 impl Refills {
     pub(super) async fn read(h: &Harness) -> Self {
+        let read = |name: &'static str| h.probes.aux_metric_where(DA_WATCHER_PORT, name, "");
         Self {
-            republished: h
-                .probes
-                .aux_metric_where(DA_WATCHER_PORT, EPOCHS_REPUBLISHED, "")
-                .await,
+            republished: read(EPOCHS_REPUBLISHED).await,
+            published: read(EPOCHS_PUBLISHED).await,
         }
     }
 
-    /// Whether the counter rose from `self` to `now`.
-    pub(super) fn rose_to(self, now: Self) -> bool {
-        self.republished
-            .zip(now.republished)
-            .is_some_and(|(a, b)| b > a)
+    /// How the counters from `self` to `now` show a refill, or `None`
+    /// when they show none. A counter below its baseline shows a
+    /// restart: the da-watcher keeps its counters in memory.
+    pub(super) fn refill_to(self, now: Self) -> Option<Refill> {
+        let rose = |a: Option<i64>, b: Option<i64>| a.zip(b).is_some_and(|(a, b)| b > a);
+        let restarted =
+            rose(now.republished, self.republished) || rose(now.published, self.published);
+        let published = now.published.is_some_and(|v| v > 0);
+        if rose(self.republished, now.republished) {
+            Some(Refill::Republished)
+        } else {
+            (restarted && published).then_some(Refill::Restarted)
+        }
     }
 
     pub(super) fn describe(self) -> String {
-        self.republished
-            .map_or("republished ?".to_string(), |v| format!("republished {v}"))
+        let show = |v: Option<i64>| v.map_or("?".to_string(), |v| v.to_string());
+        format!(
+            "republished {}, published {}",
+            show(self.republished),
+            show(self.published)
+        )
     }
 
-    /// The counter rises past this baseline within the budget: the
-    /// da-watcher published a lost epoch again.
+    /// The counters show a refill within the budget: the da-watcher
+    /// published a lost epoch again, or it restarted and published after
+    /// the sealer's origin.
     async fn assert_rose(self, h: &Harness, ctx: &str) -> anyhow::Result<()> {
         let outcome = poll::until(Budget::secs(60, 3), |_| async move {
             let now = Self::read(h).await;
-            Ok::<_, anyhow::Error>(self.rose_to(now).then_some(now))
+            Ok::<_, anyhow::Error>(self.refill_to(now).map(|refill| (now, refill)))
         })
         .await?;
-        let now = match outcome {
+        let (now, refill) = match outcome {
             Outcome::Ready { value, .. } => value,
             Outcome::TimedOut { elapsed } => {
                 return Err(crate::chaos_fail!(
@@ -87,7 +114,7 @@ impl Refills {
             }
         };
         crate::log(format!(
-            "{ctx}: a lost epoch was filled again ({} -> {})",
+            "{ctx}: a lost epoch was filled again ({} -> {}, {refill:?})",
             self.describe(),
             now.describe()
         ));

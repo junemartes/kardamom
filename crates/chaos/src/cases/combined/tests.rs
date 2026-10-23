@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::checks::{Lookups, Refills, Terms};
+use super::checks::{Lookups, Refill, Refills, Terms};
 use super::*;
 use crate::Shard;
 
@@ -253,18 +253,47 @@ fn a_member_whose_log_reads_empty_fails_the_term_check() {
     );
 }
 
+/// The counters of the da-watcher.
+fn refills(republished: Option<i64>, published: Option<i64>) -> Refills {
+    Refills {
+        republished,
+        published,
+    }
+}
+
 #[test]
 fn a_refill_is_a_rise_of_the_republish_counter() {
-    let before = Refills {
-        republished: Some(3),
-    };
-    assert!(!before.rose_to(before));
-    assert!(before.rose_to(Refills {
-        republished: Some(4),
-    }));
+    let before = refills(Some(3), Some(200));
+    assert_eq!(before.refill_to(before), None);
+    assert_eq!(
+        before.refill_to(refills(Some(4), Some(201))),
+        Some(Refill::Republished)
+    );
     // A dark exporter is not a rise.
-    assert!(!before.rose_to(Refills { republished: None }));
-    assert_eq!(before.describe(), "republished 3");
+    assert_eq!(before.refill_to(refills(None, None)), None);
+    assert_eq!(before.describe(), "republished 3, published 200");
+    assert_eq!(refills(None, None).describe(), "republished ?, published ?");
+}
+
+#[test]
+fn a_restarted_da_watcher_refills_once_it_publishes() {
+    let before = refills(Some(5), Some(200));
+    // The restart resets both counters. The new process has published
+    // nothing yet.
+    assert_eq!(before.refill_to(refills(Some(0), Some(0))), None);
+    // Its first publish follows the sealer's origin.
+    assert_eq!(
+        before.refill_to(refills(Some(0), Some(3))),
+        Some(Refill::Restarted)
+    );
+    // The published counter shows the restart also when no epoch was
+    // published again before it.
+    assert_eq!(
+        refills(Some(0), Some(200)).refill_to(refills(Some(0), Some(3))),
+        Some(Refill::Restarted)
+    );
+    // Publishes with no republish and no reset show no refill.
+    assert_eq!(before.refill_to(refills(Some(5), Some(230))), None);
 }
 
 #[test]
