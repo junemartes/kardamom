@@ -1,6 +1,7 @@
 # Carry activation: the exact window and the member feed on the heap
 
-- Status: revision 4, draft for review.
+- Status: revision 4, approved by the design review on 2026-10-24; accepted by the user ("Let's do
+  it and implement e2e", 2026-10-23). Not implemented.
 - Issue: #771 (the carried path is not complete on staging). This spec closes gap 3 (the
   switch of a live chain) and gap 1 (the executors read the member feed).
 - The user decided on 2026-10-23:
@@ -276,13 +277,18 @@ There are two rules. They change at two defined points of the same log entry.
     once (`handleReplayRequest`, `SealerEgress.java:269-275`). A session whose backlog passes
     `SessionBacklogs.BYTE_LIMIT`, 64 MiB (`SessionBacklogs.java:74`), is closed
     (`SealerEgress.java:238-244`). So a reader that replays from near the floor of a larger
-    window is closed, reconnects, and replays again, with no end. At about 300 bytes a frame,
-    131,072 frames are about 39 MB, well below 64 MiB. This design supports no larger value.
+    window is closed, reconnects, and replays again, with no end.
+  - The cap in bytes: `retention x mean frame bytes <= 32 MiB`, half of the backlog limit. The
+    mean is `kardamom_sealer_retained_bytes / kardamom_sealer_retained_frames` at the time of the
+    deploy. The preflight of C6 checks it.
+  - The ceiling in frames: 131,072. It assumes transfers of about 300 bytes a frame: 131,072
+    frames are then about 39 MB, below 64 MiB. This design supports no larger value. With larger
+    frames, the cap in bytes gives a lower value.
   - The spike of staging at 1,000 tx/s needs 60,030 frames. The default of 65,536
     (`SealerWire.java:501`, `cluster.nomad.hcl:31-34`) covers about 65 s. So the default holds.
   - A load test at 2,000 tx/s needs 120,060 frames: set 131,072, the cap.
-  - The cap covers 60 s up to about 2,180 tx/s (131,072 / 60 - 0.5). The 10,000 tx/s goal needs
-    600,030 frames, about 180 MB. That needs the file spec of section 15, or a change to the
+  - The cap covers 60 s up to about 2,180 tx/s (131,072 / 60 - 0.5).
+  - The 10,000 tx/s goal needs 600,030 frames, about 180 MB. That needs the file spec of section 15, or a change to the
     replay path: a paced replay, or a larger backlog limit that a setting gives. Trigger 3 of
     section 15 fires at about 2,180 tx/s, well before 10,000 tx/s.
   - The deploy sets it: `KARDAMOM_CLUSTER_RETENTION` gives the job variable `cluster_retention`
@@ -502,6 +508,11 @@ All of this section is the v2 loop, which staging runs
     store through the same `append` (`take_caught` and `flush`, `crates/egress/src/owner.rs:228-235`).
   - `Store::open` reads the mark. A missing mark is `(0, 0)`: no reference is stored.
   - A store copied from a peer at a scale-up (decision 27) copies the mark with the segments.
+  - `Owner::start_at_floor` resets the store to the floor of a peer (`rebase`,
+    `crates/egress/src/owner.rs:298-302`, then `Store::reset`, `store.rs:185-192`). `reset` keeps
+    the higher of its own mark and the mark of the peer, when the start comes with one. It never
+    lowers the mark. A mark that stays high only delays a switch of a reader. It never lets a
+    reader meet a reference.
 - No other change. The egress compares the copies of the executors as today.
 
 ### 7.3 Why the order is not circular
@@ -699,6 +710,8 @@ The list of #781, without the file:
 - The egress store: a stored reference moves R. A restart of the store reads the same R from
   `ref-mark`, also when the reference is in an older segment than the last one. A store with no
   mark opens with `(0, 0)`.
+- The egress store: a `reset` after a stored reference keeps R. A `reset` with a higher mark of
+  the peer raises R. A `reset` with a lower mark of the peer keeps R.
 - The reader cursor gauges.
 
 ### 11.3 Multi-process e2e (`crates/e2e`)
@@ -816,8 +829,8 @@ version 18 in full and writes it. No later PR changes those bytes under the same
 | C2 | sealer: feature 5, the flag and the schedule, `UNSUPPORTED` on a file member, snapshot 18 (the whole layout, with its golden test), the type-0 refusal, the counter of a type 7 below version 5, `setRules` and the exact window, admin and Prometheus gauges, `sealer-snapshot` in `formats.toml` | #779, C1 | L |
 | C3 | sealer: the member feed on the heap (the walk on `RetainedFrames`, `FeedConfig` and `Feed` without the file), the feed gauge | C2 | M |
 | C4 | types, sequencer: `FEATURE_CARRY_WINDOW`, kind 11 of feature 5, the kept version and its floor, kind 18 with the `TxDrop` and `DropReason::SealerRefusedReference`, job meta | #768, C0, C1 | M |
-| C5 | engine, executor, egress, batcher, validator: the `Unjoinable` fault and verdict, R with its durable mark, the reader cursor gauges, job metas | none | M |
-| C6 | deploy: the three switches of 10.1, the staged executor roll, the sequencer floor and its check, the preflights, the feature-5 and feature-3/4 checks of `upgrade_check.yml`, the raise-only and cap checks of `retention` | #781, #780, C0 to C5 | L |
+| C5 | engine, executor, egress, batcher, validator: the `Unjoinable` fault and verdict, R with its durable mark and its `reset` rule, the reader cursor gauges, job metas | none | M |
+| C6 | deploy: the three switches of 10.1, the staged executor roll, the sequencer floor and its check, the preflights, the feature-5 and feature-3/4 checks of `upgrade_check.yml`, the raise-only check of `retention` and its cap in frames and in bytes | #781, #780, C0 to C5 | L |
 | C7 | e2e: the carry window scenario and the floor case | C3, C4, C5 | M |
 | C8 | chaos: the `carry` shard with the activation step | C6, C7 | L |
 | C9 | docs: `cluster/sealer-service/README.md` (feature 5, the runbook, `retention` with its cap, and the snapshot sizes that differ during a roll), `docs/failure-modes.md`, `docs/formats.md`, `deploy/cluster/README.md`, a note at D11 of the one-way spec | C6 | S |
@@ -912,7 +925,7 @@ The answers to the questions of revision 1, from the review:
 | 15. Long sentences | Section 1.3, section 4.4 and section 8 now use short sentences. |
 | Questions | Section 16. |
 
-## 18. Changes from revisions 2 and 3
+## 18. Changes from revisions 2 and 3, and the notes of the approval
 
 | Finding of the review of revision 2 | Change |
 |---|---|
@@ -934,3 +947,6 @@ The answers to the questions of revision 1, from the review:
 | Review of revision 3, 6. The hazard of a bad type 7 | Section 7.4. |
 | Review of revision 3, 7. STE | Section 4.3, "The sequencer side", is a list of short sentences. |
 | Review of revision 3, Q1 and Q2 | Section 4.4: raise only, the cap, the README note. Section 13: C6 and C9. Section 16: none open. |
+| Approval notes, 1. The cap in bytes | Section 4.4: `retention x mean frame bytes <= 32 MiB`, from the gauges, checked by C6. 131,072 frames stay the ceiling, for about 300 bytes a frame. |
+| Approval notes, 2. The mark at a reset | Section 7.2: `reset` keeps the higher mark. Section 11.2 and C5: the test. |
+| Approval notes, 3. STE | Section 4.4: the sentence is split at "The 10,000 tx/s goal". |
