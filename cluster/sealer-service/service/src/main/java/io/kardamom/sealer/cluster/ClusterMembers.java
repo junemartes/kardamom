@@ -20,4 +20,9 @@ record ClusterMembers(String spec) {
             .map(fields -> URI.create("http://" + fields[1].trim().split(":")[0] + ":" + adminPort))
             .toList();
     }
+
+    /** The consensus endpoints of every member, comma separated: the members that a backup node asks. */
+    String consensusEndpoints() {
+        return ClusterNode.consensusEndpoints(ClusterNode.entries(spec));
+    }
 }

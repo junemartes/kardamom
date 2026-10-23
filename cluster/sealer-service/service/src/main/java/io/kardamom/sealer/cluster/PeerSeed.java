@@ -1,15 +1,12 @@
 package io.kardamom.sealer.cluster;
 
 import io.aeron.ChannelUri;
-import io.aeron.CommonContext;
 import io.aeron.Image;
 import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.cluster.ClusterBackup;
-import io.aeron.cluster.ClusterBackup.Configuration.ReplayStart;
 import io.aeron.cluster.ClusterBackupMediaDriver;
 import java.util.Optional;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 import org.agrona.concurrent.YieldingIdleStrategy;
 import org.agrona.concurrent.status.AtomicCounter;
@@ -52,8 +49,6 @@ final class PeerSeed {
     static final int MAX_COPY_FAILURES = 5;
     private static final String REPLAY_CHANNEL = "aeron:ipc";
     private static final int REPLAY_STREAM_ID = 1_956;
-    /** The wait of the backup after a peer refuses it, before it asks the next peer. */
-    private static final long COOL_DOWN_NS = TimeUnit.SECONDS.toNanos(1);
 
     /** The peer timeout of a round, and the backoff between rounds. */
     record Timing(long peerTimeoutMs, long firstBackoffMs, long maxBackoffMs) {
@@ -266,22 +261,7 @@ final class PeerSeed {
     }
 
     private ClusterBackup.Context backupContext() {
-        final ClusterBackup.Context ctx = new ClusterBackup.Context();
-        final ChannelUri consensus = ChannelUri.parse(ctx.consensusChannel());
-        consensus.put(CommonContext.ENDPOINT_PARAM_NAME, contexts.consensusEndpoint());
-        final String ephemeral = contexts.host() + ":0";
-        return ctx
-            .clusterDir(clusterDir.root().toFile())
-            .clusterConsensusEndpoints(peers)
-            .consensusChannel(consensus.toString())
-            .catchupEndpoint(ephemeral)
-            // The backup replaces the request endpoint with the archive
-            // endpoint of the peer that answers.
-            .clusterArchiveContext(new AeronArchive.Context()
-                .controlRequestChannel(CommonContext.UDP_CHANNEL)
-                .controlResponseChannel("aeron:udp?endpoint=" + ephemeral))
-            .initialReplayStart(ReplayStart.LATEST_SNAPSHOT)
-            .clusterBackupCoolDownIntervalNs(COOL_DOWN_NS)
+        return contexts.backup(peers)
             .errorHandler(error -> System.out.println(
                 "cluster SEED backup error memberId=" + memberId + ": " + error));
     }

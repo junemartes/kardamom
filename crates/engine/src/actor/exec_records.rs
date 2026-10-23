@@ -14,6 +14,8 @@ use crate::executor::execute_xchain_tx;
 use kardamom_exec_core::exec_types::TxSlot;
 use kardamom_exec_core::executor::XChainDelivery;
 
+use crate::meter::OutputWait;
+
 use super::exec_block::{BlockRun, Streaming};
 use super::exec_thread::{ExecState, Flow};
 use super::tx_hook::{TxContext, TxHook, TxOutcome};
@@ -122,7 +124,7 @@ impl<W: ExecPorts> ExecState<W> {
         };
         self.block.receipts.push(receipt.clone());
         let item = kardamom_types::ReceiptRows { receipt, accounts };
-        match self.io.tx.send(ExecToCommit::Receipt(Box::new(item))) {
+        match self.send_to_commit(ExecToCommit::Receipt(Box::new(item))) {
             Ok(()) => Ok(Flow::Continue),
             Err(_) => Ok(Flow::Stop),
         }
@@ -161,6 +163,19 @@ impl<W: ExecPorts> ExecState<W> {
                 Ok(())
             }
         }
+    }
+
+    /// Send `msg` to the commit thread. The loop meter charges a send to
+    /// a full channel to blocked.
+    pub(super) fn send_to_commit(
+        &mut self,
+        msg: ExecToCommit,
+    ) -> Result<(), crossbeam_channel::SendError<ExecToCommit>> {
+        let tx = &self.io.tx;
+        self.metrics
+            .pipeline
+            .meter
+            .output_wait(tx.is_full(), || tx.send(msg))
     }
 
     pub(super) fn on_tx(

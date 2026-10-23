@@ -582,10 +582,10 @@ async fn main() -> anyhow::Result<()> {
         main_pub: cluster_pub.clone(),
         epoch_pub: cluster_pub.clone(),
         remote_epoch_pub: cluster_pub,
-        side: kardamom_sequencer::outbound::SideChannels {
-            errors: handles.errors_pub,
-            status: handles.status_pub,
-        },
+        side: kardamom_sequencer::outbound::SideChannels::new(
+            handles.errors_pub,
+            handles.status_pub,
+        ),
         epochs: handles.deposits_sub,
         epoch_lane: resync.epoch_lane,
         remote_epochs: handles.remote_epochs_sub,

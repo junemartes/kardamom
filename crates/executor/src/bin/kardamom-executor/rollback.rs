@@ -11,7 +11,9 @@
 //! - A divergence of the committed history also needs an older state. The
 //!   repair removes the local checkpoints at and above the divergence
 //!   block, chooses the newest checkpoint below it (a local one first, then
-//!   one of a peer), and parks the diverged state DB. The next run restores
+//!   one of a peer), cuts the block log after the block before the
+//!   divergence, and parks the diverged state DB. With the block log, the
+//!   restore then reaches the block just before the divergence. The next run restores
 //!   that checkpoint. With no checkpoint below the block, the executor
 //!   stops as before, and the operator restores it.
 //! - A divergence of the published receipts keeps the state: the committed
@@ -136,6 +138,8 @@ impl RollbackRepair<'_> {
         let Some(found) = self.find(dir, restore) else {
             return Ok(Self::unrecoverable(block));
         };
+        kardamom_state::checkpoint::bases::cut_log_after(dir, restore.max)
+            .context("cut the block log after the kept block")?;
         self.ledger.markers.raise(record)?;
         self.ledger.clear()?;
         kardamom_state::park_state_db(self.state_dir).context("park the diverged state DB")?;

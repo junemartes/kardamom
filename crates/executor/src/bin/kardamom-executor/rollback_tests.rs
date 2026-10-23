@@ -33,6 +33,12 @@ fn chain(state_dir: &Path, ckpt_dir: &Path, upto: u64, checkpoints: &[u64]) -> S
 /// Commit `block` and wait until it is durable.
 fn commit(env: &StateEnv, block: u64) {
     let mut writer = StateWriter::spawn(env.clone()).unwrap();
+    commit_on(&mut writer, block);
+    writer.shutdown().unwrap();
+}
+
+/// Commit `block` through `writer`, and wait until it is durable.
+fn commit_on(writer: &mut kardamom_state::WriterHandle, block: u64) {
     let boundary = BlockBoundary {
         block_number: block,
         end_tx_idx: BPosition::from_index(block),
@@ -49,7 +55,29 @@ fn commit(env: &StateEnv, block: u64) {
     std::iter::from_fn(|| writer.snapshot_rx.recv())
         .find(|s| s.block_number() >= block)
         .expect("the block commits");
+}
+
+/// [`chain`] with the block log of the checkpoints: a writer that feeds
+/// the log thread commits each block.
+fn chain_logged(state_dir: &Path, ckpt_dir: &Path, upto: u64, checkpoints: &[u64]) {
+    let env = chain(state_dir, ckpt_dir, 0, &[]);
+    let cfg = kardamom_state::checkpoint::log_thread::LogConfig {
+        dir: ckpt_dir.join(kardamom_state::checkpoint::replay::LOG_DIR),
+        segment_bytes: std::num::NonZeroU64::new(1 << 20).unwrap(),
+        queue: std::num::NonZeroUsize::new(64).unwrap(),
+        sync_every: std::time::Duration::from_millis(10),
+    };
+    let (feed, log_thread) =
+        kardamom_state::checkpoint::log_thread::BlockLogThread::spawn(&env, &cfg).unwrap();
+    let mut writer = StateWriter::spawn_with_log(env.clone(), feed).unwrap();
+    for block in 1..=upto {
+        commit_on(&mut writer, block);
+        if checkpoints.contains(&block) {
+            kardamom_state::create_checkpoint(&env, ckpt_dir).unwrap();
+        }
+    }
     writer.shutdown().unwrap();
+    log_thread.join().unwrap();
 }
 
 /// The blocks of the checkpoints in `dir`, oldest first.
@@ -186,6 +214,22 @@ fn a_local_checkpoint_below_the_divergence_is_staged() {
     .unwrap()
     .expect("a checkpoint below the block");
     assert_eq!(restored.0, 4, "the newest below the block");
+}
+
+/// With the block log, the rollback restores the block just before the
+/// divergence, not the newest checkpoint below it. The log of the diverged
+/// blocks is cut, so no later restore reaches them.
+#[test]
+fn a_rollback_with_the_block_log_restores_the_block_before_the_divergence() {
+    let dirs = Dirs::new();
+    chain_logged(&dirs.state, &dirs.ckpt, 8, &[2, 6]);
+    assert!(dirs.repair(&[]).stage(Some(&diverged(6))).unwrap());
+    assert_eq!(blocks(&dirs.ckpt), [2], "the diverged checkpoint goes");
+    let restored =
+        kardamom_state::restore_best_checkpoint(&dirs.ckpt, &dirs.state, BlockRange::ANY, None)
+            .unwrap()
+            .expect("the base below the block");
+    assert_eq!(restored.0, 5, "the base at 2 and the log to 5");
 }
 
 #[test]

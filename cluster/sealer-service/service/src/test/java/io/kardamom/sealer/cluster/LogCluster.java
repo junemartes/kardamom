@@ -5,6 +5,7 @@ import static io.kardamom.sealer.cluster.IngressFrames.offerIngress;
 import static io.kardamom.sealer.cluster.IngressFrames.offerPostedCursor;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 
+import io.aeron.cluster.ClusterBackup;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.driver.DefaultNameResolver;
 import io.aeron.driver.NameResolver;
@@ -20,6 +21,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
@@ -237,6 +239,24 @@ final class LogCluster implements AutoCloseable {
     private PeerSeed peerSeed(final int memberId) {
         return new PeerSeed(memberId, peerConsensusEndpoints(memberId),
                 seedContexts(memberId), PeerSeed.Timing.DEFAULT, retainedCopy(memberId));
+    }
+
+    /**
+     * The settings of a backup node of this cluster: its own directories,
+     * localhost endpoints on the ports that TestCluster keeps for a backup,
+     * and a query every second.
+     */
+    BackupSettings backupSettings() {
+        final Path dir = baseDir.resolve("backup");
+        final MemberContexts contexts = new MemberContexts(
+                dir.resolve("aeron").toString(),
+                dir.resolve("cluster").toString(),
+                dir.resolve("archive").toString(),
+                new MemberContexts.Endpoints("localhost", "localhost:20223", "localhost:8013"),
+                LOCAL_NODE_NAMES);
+        return new BackupSettings(
+                new ClusterMembers(TestCluster.clusterMembers(0, MEMBER_COUNT)).consensusEndpoints(),
+                contexts, 0, TimeUnit.SECONDS.toNanos(1), ClusterBackup.SourceType.FOLLOWER);
     }
 
     /** The contexts of a peer seed of a stopped member: its TestCluster directories and endpoints. */

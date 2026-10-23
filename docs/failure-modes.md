@@ -402,8 +402,9 @@ The kill-based cases prove the restart logic. They do not prove durability again
 
 - The sealer syncs the Raft log and the archive to disk with `kardamom.cluster.fileSyncLevel`.
 - Level 0 does not sync. Level 1 syncs the data of every write batch. Level 2 is also valid. Any other value refuses to start.
-- The code default is 0. The deploy sets 1 (Nomad variable `cluster_file_sync_level`, env `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL`).
-- At level 0, an entry that a quorum acknowledged can exist only in the page caches of its members. A rack-level power loss would drop it. `pipeline-blackout-recover` stands for that event.
+- The code default and the deploy default are 0 (Nomad variable `cluster_file_sync_level`, env `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL`). A commit waits for no disk sync.
+- At level 0, the kernel writes the log back on its own schedule. With the Linux defaults (`vm.dirty_expire_centisecs=3000`, `vm.dirty_writeback_centisecs=500`), a page reaches the disk within about 35 s.
+- So an entry that a quorum acknowledged can exist only in the page caches of its members for that time. A power loss or a kernel crash on a majority of members in that time drops it. Each member runs on its own machine, so one power loss takes at most one member. `pipeline-blackout-recover` stands for that event.
 - Only a test that cuts the power of a VM can prove this end to end.
 
 ## Executor
@@ -453,6 +454,12 @@ The executors are deterministic state machines. One dead or lagging replica neve
   - Effect: without a checkpoint, the executor must replay the whole canonical stream from genesis. That cost is unbounded as the chain ages.
   - Recovery: with `--checkpoint-dir`, the executor writes periodic consistent snapshots (`compact_to`, an online read-only copy that never blocks the writer). The writer cuts each image to its used pages, so the manifest hash and a peer transfer read about the size of the state, not the 256 MiB growth step. On a cold start with an empty state directory, it restores the newest checkpoint before it opens the env. The normal resume path then replays only the short tail. The replicas are deterministic at the same block, so the checkpoint of a **peer** is a valid restore source.
   - Proof: `state-checkpoint-restore`. The case wipes the state of executor-0 and re-replicates the checkpoint of executor-1. It asserts that executor-0 restores from that checkpoint, not from genesis, and rejoins.
+  - With `--checkpoint-log` (job variable `checkpoint_log`), a checkpoint is a base image and the block log after it: the write batch of each committed block.
+    - A restore copies the base and applies the log through the state writer. So each block of the log is a restore point.
+    - The executor copies the state only when the base rule asks for a new base: the log after the newest base is larger than that base, the base is old, or the log has a gap. The copy has a rate limit, so it does not take the disk from a sealer on the same host.
+    - A rollback restores the block just before the divergence, and cuts the log there.
+    - A peer serves its log after its base (`GET /checkpoint/log`), so a peer base below a retention floor serves when its log reaches the floor.
+    - The writer never waits for the log. A full queue drops the batch (`kardamom_checkpoint_log_dropped_total`), and the gap makes the next base start at once.
 - **Replay-window overrun**
   - Trigger: the cluster keeps a bounded canonical window (`kardamom.cluster.retention`, default 65,536 frames, about 5 minutes at 200 tps). A `REPLAY_FROM` below the floor of the window is refused with `REPLAY_UNAVAILABLE`. The window is a minimum. A frame past it stays until L1 holds its block (see "DA-lag guard and posted-head retention floor"). The retained frames are in the cluster snapshot, so a member that restores from a snapshot keeps the floor at the posted head. A cursor that is older than the window is the trigger.
   - Effect: the refusal is terminal for the local state. A cursor below the floor can never catch up. A fresh or wiped node cannot re-sync from genesis either, because genesis aged out of the window.
@@ -906,8 +913,8 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
 
 **A power loss on a majority of the sealers rolls the paired executors back.**
 
-- **Release gate.** The automatic rollback runs only in an executor that reads the member feed (`--carry-bytes`). The deployed executors read the cluster egress, and they do not compare. So the automatic rollback is live only after the cut-over to carried transactions (#598). An executor that reads the cluster egress keeps no rollback marker and no receipt ledger, and it publishes no rollback. The sealer change to sync level 0 with a 1 s scheduled sync (#645) must not reach a cluster before that cut-over: until then, a power loss on a majority stops the executors with `ClusterBehindCursor`, as described above.
-- The cause. A member forces its log on a schedule, not on each append. A power loss on the hosts of a majority loses, on each of them, the entries after its last forced position. Raft elects the most complete surviving log, and the cluster continues from it. The next entries take the lost indexes.
+- **Release gate.** The automatic rollback runs only in an executor that reads the member feed (`--carry-bytes`). The deployed executors read the cluster egress, and they do not compare. So the automatic rollback is live only after the cut-over to carried transactions (#598). An executor that reads the cluster egress keeps no rollback marker and no receipt ledger, and it publishes no rollback. The sealers run at sync level 0 before that cut-over. Until the cut-over, a power loss on a majority stops the executors with `ClusterBehindCursor`, as described above, and the recovery is a seeded start from a state rebuilt from L1.
+- The cause. A member does not force its log on each append: the kernel writes it back on its own schedule. A power loss on the hosts of a majority loses, on each of them, the entries after the last position that reached the disk. Raft elects the most complete surviving log, and the cluster continues from it. The next entries take the lost indexes.
 - A paired executor runs an entry in about 5 ms, before the entry is durable. So it can hold committed blocks that the new stream does not have, and it can have published receipts of lost entries.
 - **The comparison.** At each start, before it executes a frame, the executor that reads the member feed asks its member for a replay from a floor below its cursor. It compares each frame up to its last committed block with its state DB:
   - the transaction hash of each receipt, by canonical index;

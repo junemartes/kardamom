@@ -243,10 +243,13 @@ fn session_message_for_other_session_ignored() {
     d.on_egress(&ok_event(corr, 5, 9, 0));
     let other = wrap_session_message(9, 999, 0, b"not-ours");
     assert!(d.on_egress(&other).is_empty());
-    let ours = wrap_session_message(9, 5, 0, b"ours");
+    let ours = wrap_session_message(9, 5, 1_700_000_000_123, b"ours");
     assert_eq!(
         d.on_egress(&ours),
-        vec![DriverEvent::AppMessage(b"ours".to_vec())]
+        vec![DriverEvent::AppMessage {
+            payload: b"ours".to_vec(),
+            timestamp: 1_700_000_000_123,
+        }]
     );
 }
 
@@ -265,7 +268,13 @@ fn a_reassembled_session_message_at_the_bound_surfaces_whole() {
     ] {
         let payload: Vec<u8> = (0..len).map(|n| n.to_le_bytes()[0] ^ tag).collect();
         let framed = wrap_session_message(9, 5, 0, &payload);
-        assert_eq!(d.on_egress(&framed), vec![DriverEvent::AppMessage(payload)]);
+        assert_eq!(
+            d.on_egress(&framed),
+            vec![DriverEvent::AppMessage {
+                payload,
+                timestamp: 0
+            }]
+        );
     }
 }
 

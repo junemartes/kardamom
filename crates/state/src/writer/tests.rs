@@ -170,3 +170,51 @@ fn shadow_check_agrees_every_block() {
     // A shadow-check mismatch would surface here as the writer's Err result.
     handle.shutdown().expect("shadow-check agreed every block");
 }
+
+/// The count of the step `name` in `text`, or 0 when it has no record.
+fn step_count(text: &str, name: &str) -> f64 {
+    let series = format!(r#"kardamom_step_seconds_count{{step="{name}"}}"#);
+    text.lines()
+        .find(|line| line.starts_with(&series))
+        .and_then(|line| line.rsplit(' ').next())
+        .map_or(0.0, |v| v.parse().unwrap())
+}
+
+#[test]
+fn each_commit_records_its_sections_and_a_writer_without_a_trie_records_no_trie_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = StateEnvBuilder::new(dir.path())
+        .durability(Durability::SafeNoSync)
+        .open()
+        .unwrap();
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    metrics::with_local_recorder(&recorder, || {
+        let mut handle = StateWriter::spawn(env).unwrap();
+        (1..=2).for_each(|block| {
+            let delta = BlockDelta {
+                block_number: block,
+                accounts: vec![acct(0x11, block, 1000)],
+                storage: vec![slot(0x11, 1, block)],
+                code: vec![],
+                receipts: vec![],
+            };
+            handle
+                .delta_tx
+                .send(WriteBatch::new(boundary(block), delta))
+                .unwrap();
+        });
+        handle.shutdown().unwrap();
+    });
+    let text = recorder.handle().render();
+    let counts = [
+        "state.commit",
+        "state.commit_open",
+        "state.commit_storage",
+        "state.commit_accounts",
+        "state.commit_receipts",
+        "state.commit_mdbx",
+    ]
+    .map(|name| (name, step_count(&text, name)));
+    assert_eq!(counts.map(|(name, _)| (name, 2.0)), counts, "{text}");
+    assert_eq!(step_count(&text, "state.commit_trie"), 0.0, "{text}");
+}

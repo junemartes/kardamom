@@ -52,6 +52,9 @@ pub trait TxDataSubscriber: Send {
     /// Returns [`SequencerError::IngressDisconnected`] when the
     /// subscription is permanently closed.
     fn poll(&mut self) -> Result<Option<Inbound>, SequencerError>;
+
+    /// The envelopes that wait to be polled, for a queue-depth gauge.
+    fn queued(&self) -> usize;
 }
 
 // ===========================================================================
@@ -89,6 +92,10 @@ pub mod fakes {
                 stream_position: loc.position.as_index(),
                 envelope,
             }))
+        }
+
+        fn queued(&self) -> usize {
+            self.queue.len()
         }
     }
 }

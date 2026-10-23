@@ -17,9 +17,11 @@
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::time::Instant;
 
 use alloy_primitives::Address;
 use kardamom_cache::{AccountView, CacheReader, ExecutorQuery, LiveAccounts};
+use kardamom_obs::pipeline::Step;
 use kardamom_sequencer::admission::AccountState;
 use kardamom_sequencer::metrics;
 use kardamom_sequencer::sequencer::Shutdown;
@@ -44,6 +46,8 @@ struct Sources {
     live: Arc<LiveAccounts>,
     redis: Option<Arc<CacheReader>>,
     query: Option<ExecutorQuery>,
+    /// One lookup, from the first source to the answer.
+    latency: Step,
 }
 
 impl AccountLookupFeed {
@@ -64,6 +68,7 @@ impl AccountLookupFeed {
                 live,
                 redis,
                 query,
+                latency: Step::new("sequencer.account_lookup"),
             }),
             shutdown,
             limit: Arc::new(Semaphore::new(IN_FLIGHT)),
@@ -96,7 +101,9 @@ impl AccountLookupFeed {
         tokio::spawn(async move {
             // The permit ends with the task.
             let _permit = permit;
+            let started = Instant::now();
             let (outcome, state) = sources.state_of(address).await;
+            sources.latency.since(started);
             metrics::record_nonce_lookup(sources.partition, outcome);
             if let Some(state) = state {
                 let _ = answers.send(AccountEvent::Answer { address, state });

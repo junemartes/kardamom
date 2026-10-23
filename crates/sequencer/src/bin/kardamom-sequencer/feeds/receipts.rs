@@ -6,6 +6,7 @@ use std::ops::ControlFlow;
 
 use kardamom_cache::LiveAccountsWriter;
 use kardamom_log::aeron_live::{ReceiptFrame, TxReceiptsReceiver, TxReceiptsSubscriberHandle};
+use kardamom_obs::pipeline::{LoopMeter, LoopState};
 use kardamom_sequencer::admission::AccountState;
 use kardamom_sequencer::resync::{FloorEvent, FloorUpdate};
 use kardamom_sequencer::sequencer::Shutdown;
@@ -34,6 +35,10 @@ pub(crate) struct ReceiptFloorFeed {
     sink: ReceiptSink,
     /// The local account layer's one writer.
     writer: LiveAccountsWriter,
+    /// Idle while the task waits for a frame, busy while it applies one,
+    /// and blocked while the account events wait for room in the queue of
+    /// the v2 loop.
+    meter: LoopMeter,
 }
 
 /// Where the receipts of this replica's senders go: the floor channel of
@@ -49,6 +54,7 @@ impl ReceiptFloorFeed {
             vslots,
             sink,
             writer,
+            meter: LoopMeter::new("sequencer.receipt_feed"),
         }
     }
 
@@ -89,10 +95,13 @@ impl ReceiptFloorFeed {
                 None => return ControlFlow::Break(()),
             },
         };
-        match frame {
+        self.meter.mark(LoopState::Idle);
+        let flow = match frame {
             ReceiptFrame::Batch(batch) => self.forward_batch(batch),
             ReceiptFrame::Rollback(rollback) => self.forward_rollback(rollback),
-        }
+        };
+        self.meter.mark(LoopState::Busy);
+        flow
     }
 
     /// An executor rolled back. The local layer holds rows of the void
@@ -132,7 +141,15 @@ impl ReceiptFloorFeed {
                 .collect();
             self.writer.apply(end, &rows);
             if let (ReceiptSink::Accounts(accounts), Some(block)) = (&self.sink, block) {
-                return send_rows(accounts, block, end.as_index(), &rows);
+                let event = rows_event(block, end.as_index(), &rows);
+                self.meter.mark(LoopState::Busy);
+                let sent = accounts.send(event);
+                self.meter.mark(LoopState::Blocked);
+                return if sent.is_ok() {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(())
+                };
             }
         }
         for receipt in &batch.receipts {
@@ -177,13 +194,8 @@ impl ReceiptFloorFeed {
 }
 
 /// The rows of one batch as the state of each account at `tx_idx`, the
-/// end of the batch, for the v2 loop. `Break` means the loop is gone.
-fn send_rows(
-    accounts: &crossbeam_channel::Sender<AccountEvent>,
-    block: u64,
-    tx_idx: u64,
-    rows: &[AccountRow],
-) -> ControlFlow<()> {
+/// end of the batch, for the v2 loop.
+fn rows_event(block: u64, tx_idx: u64, rows: &[AccountRow]) -> AccountEvent {
     let rows = rows
         .iter()
         .map(|row| {
@@ -196,10 +208,7 @@ fn send_rows(
             (row.address, state)
         })
         .collect();
-    match accounts.send(AccountEvent::Rows { block, rows }) {
-        Ok(()) => ControlFlow::Continue(()),
-        Err(_) => ControlFlow::Break(()),
-    }
+    AccountEvent::Rows { block, rows }
 }
 
 #[cfg(test)]

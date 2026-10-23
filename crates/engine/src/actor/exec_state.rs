@@ -13,6 +13,7 @@ use crate::features::BlockFeatures;
 use crate::reader::ReaderToExec;
 
 use super::exec_block::{BalCapture, BlockRun, BlockState};
+use super::meters::ExecMeters;
 use super::types::{BalHandoff, ExecToCommit, ExecutorConfig, ResumePoint};
 use super::wiring::{ExecPorts, SnapshotDb};
 
@@ -153,6 +154,7 @@ pub(super) struct Cursor {
 pub(super) struct ExecMetrics {
     pub(super) applied_ok: metrics::Counter,
     pub(super) applied_error: metrics::Counter,
+    pub(super) pipeline: ExecMeters,
 }
 
 /// The exec thread's mutable loop state. Each [`ExecState::spawn`] thread has one
@@ -239,6 +241,7 @@ impl<W: ExecPorts> ExecState<W> {
             metrics: ExecMetrics {
                 applied_ok: metrics::counter!(crate::metrics::TX_APPLIED_TOTAL, "outcome" => "ok"),
                 applied_error: metrics::counter!(crate::metrics::TX_APPLIED_TOTAL, "outcome" => "error"),
+                pipeline: ExecMeters::new(),
             },
         })
     }

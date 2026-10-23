@@ -29,8 +29,11 @@
 
 pub mod cluster;
 
+use std::time::Instant;
+
 use kardamom_cluster_adapter::wire::GuardHeader;
 use kardamom_log::aeron_live::{TxErrorsPublisherHandle, TxStatusPublisherHandle};
+use kardamom_obs::pipeline::Step;
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{EpochRecord, TxError, TxRef, TxStatus};
 
@@ -132,13 +135,30 @@ pub trait SideChannelPublisher: Send {
 /// state has already advanced, or the transaction was rejected, so there
 /// is nothing to roll back.
 pub struct SideChannels {
-    pub errors: TxErrorsPublisherHandle,
-    pub status: TxStatusPublisherHandle,
+    errors: TxErrorsPublisherHandle,
+    status: TxStatusPublisherHandle,
+    /// One `tx_errors` publish. The publish waits for the offer, so the
+    /// publish loop pays it for each refused transaction.
+    errors_publish: Step,
+}
+
+impl SideChannels {
+    #[must_use]
+    pub fn new(errors: TxErrorsPublisherHandle, status: TxStatusPublisherHandle) -> Self {
+        Self {
+            errors,
+            status,
+            errors_publish: Step::new("sequencer.tx_errors_publish"),
+        }
+    }
 }
 
 impl SideChannelPublisher for SideChannels {
     fn publish_error(&mut self, e: TxError) {
-        if let Err(err) = self.errors.publish(&e) {
+        let started = Instant::now();
+        let published = self.errors.publish(&e);
+        self.errors_publish.since(started);
+        if let Err(err) = published {
             tracing::warn!(error = %err, "tx_errors publish failed (dropped)");
         }
     }

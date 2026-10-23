@@ -92,6 +92,8 @@ variable "grafana_admin_password" {
 
 locals {
   dc = var.datacenter
+  # The admin endpoint of a sealer member (admin_port in nomad/cluster.nomad.hcl).
+  sealer_admin_port = 40205
   # A sequencer node hosts one replica per active lane; the metrics port
   # forms the lane, 9001 + 10 * lane. Four lanes cover the resize cases;
   # an inactive lane's target reads as down.
@@ -135,7 +137,13 @@ locals {
           - targets: [{{ range $i, $s := service "kardamom-notifier-metrics|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
       - job_name: kardamom-canary
         static_configs:
-          - targets: [{{ range $i, $s := service "kardamom-canary|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]%{if var.egress == "on"}
+          - targets: [{{ range $i, $s := service "kardamom-canary|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
+      # The admin endpoint of each sealer member. The member service names
+      # the ingress port; the admin port is the admin_port of
+      # nomad/cluster.nomad.hcl.
+      - job_name: kardamom-sealer
+        static_configs:
+          - targets: [{{ range $i, $s := service "kardamom-cluster-member|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:${local.sealer_admin_port}"{{ end }}]%{if var.egress == "on"}
       - job_name: kardamom-egress
         static_configs:
           - targets: [{{ range $i, $s := service "kardamom-egress-metrics|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]%{endif}
@@ -190,6 +198,7 @@ locals {
     "kardamom-canary",
     "kardamom-performance",
     "kardamom-availability",
+    "kardamom-bottlenecks",
   ]
 }
 
