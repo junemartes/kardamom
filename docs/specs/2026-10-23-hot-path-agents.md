@@ -1,45 +1,67 @@
 # Hot-path agents: the transaction path off tokio
 
-- Status: draft for review, 2026-10-23. Not implemented.
+- Status: draft for review, revision 2 (2026-10-23). Not implemented.
 - The user asked on 2026-10-23 to move the hot path off tokio.
-- Related: #774 (the timer tick in the batch verifier), #773 (the egress retry queue), the
-  DEDICATED-thread experiment of the media driver, `docs/specs/2026-10-21-one-way-pipeline.md`.
+- Related: #774 (the timer tick of the batch verifier) and #776 (the async publish ack), both open;
+  #773 (the egress retry queue); #768 (the `dropped` status); the DEDICATED-thread experiment of
+  the media driver; `docs/specs/2026-10-21-one-way-pipeline.md`.
+- Revision 2 answers the review of revision 1 (findings F1 to F10). Section 10 maps each finding to
+  its change.
 
-## 1. The problem
+## 1. The problem, measured
 
-The path of one transaction crosses the tokio scheduler many times. Each crossing is a wake, a
-queue and a possible move to another core. Each one costs microseconds, and a timer costs a full
-millisecond.
+### 1.1 The spike of 2026-10-23
 
-The ingress path today (`eth_sendRawTransaction`, `--ack validated`):
+Staging, 2 x 500 tx/s for 10 minutes, `--ack validated`, receipts confirmed through the WebSocket
+feed. The client saw a receipt latency of p50 3–4 ms, p99 7–11 ms and a max of 171–175 ms.
 
-| Step | Mechanism | Cost on staging (2026-10-23 spike, 2 x 500 tx/s) |
+The step metrics over 13:35–13:43Z (means unless named):
+
+| Segment | Value | Source |
 |---|---|---|
-| 1. JSON-RPC handler | tokio task | — |
-| 2. To the batch verifier | `tokio::sync::mpsc` | — |
-| 3. The batch window | `tokio::time::sleep_until` (fixed in #774) | about 1 ms of the 1.4 ms `ingress.recover` |
-| 4. The recovery | `spawn_blocking`, 1 to 8 threads | 0.45–0.68 ms for a batch of about 5 |
-| 5. The nonce check | local layer, then Redis on a miss (`await`) | a network round trip on a miss |
-| 6. The publish | `spawn_blocking(pub_handle.publish)` | one more pool hop |
-| 7. The Aeron command | `crossbeam` channel to the shared Aeron thread | a wake of that thread |
-| 8. The answer | the handler task wakes | — |
+| The submit in the ingress | 1.84 ms | `kardamom_step_seconds{step="ingress.submit"}` |
+| — the recovery, with its wait | 1.47 ms | `step="ingress.recover"` |
+| — the recovery of one batch (about 5 signatures) | 0.54 ms | `step="ingress.recover_batch"` |
+| — the publish, to the ack of the Aeron thread | 0.35 ms | `step="ingress.publish_round_trip"` |
+| The publish to the sealed index, p50 / p99 | 1.88 / 6.82 ms | `kardamom_ingress_seal_latency_seconds` |
+| The publish to the first receipt, p50 / p99 | 1.90 / 6.42 ms | `kardamom_ingress_execute_latency_seconds` |
+| The sequencer offer, to its ack | 0.11 ms | `step="sequencer.offer_round_trip"` |
+| One snapshot of a sealer member | 32 ms | `step="sealer.snapshot"` |
 
-The receipt latency of the spike was p50 3–4 ms and p99 7–11 ms. The seal and the execution
-were each about 2 ms at p50. So a large share of the median is scheduling, not work.
+### 1.2 What the numbers say
 
-The same pattern is in the sequencer (admission and the offer to the sealer), the executor (the
-reader and the execution loop) and the egress (the merge and the receipt pump).
+- The ingress was about half of the median. About 1 ms of `ingress.recover` was the tokio timer:
+  the batch window of 50 µs waited on `tokio::time::sleep_until`, and the timer has a resolution
+  of 1 ms. #774 removes that wait.
+- The publish paid one hop to the blocking pool (`spawn_blocking` around a blocking publish,
+  `crates/ingress/src/aeron_adapters.rs`). #776 removes it with an async ack.
+- After #774 and #776 the ingress should cost about 0.3–0.5 ms. The rest of the median, about
+  1.9 ms, runs from the publish to the receipt: the sequencer, the Raft commit of the sealers
+  across three data centers, the executor, the egress and the receipt pump.
+- The p99 and the max do not come from the ingress. The sealer snapshot (32 ms each) is one known
+  source. The 171 ms max is not explained yet.
+
+### 1.3 Consequence for this spec
+
+The first stage must come from a measured breakdown of the 1.9 ms, not from a guess. So stage 0
+(section 4) measures each hop after #774 and #776 deploy. The agent model of section 3 stays the
+target shape. Section 5 describes the ingress agent, because the ingress is the stage with the
+most scheduler hops today. But it ships only if stage 0 shows a remaining scheduler cost there.
 
 ## 2. Goals and limits
 
-- Goal: remove the scheduler from the per-transaction path. A transaction crosses each stage
-  with no timer, no blocking-pool hop and no task wake, except one wake to answer the client.
-- Goal: a bounded, measured cost per stage, with the step metrics that exist now.
+- Goal: remove the scheduler from the per-transaction path. A transaction crosses each stage with
+  no timer, no blocking-pool hop and no task wake, except one wake to answer the client.
+- Goal: a bounded, measured cost per stage, with the step metrics.
 - Goal: 10k tx/s per ingress pair without a rise in p99.
-- Limit: tokio stays at the edges. HTTP, JSON-RPC parsing, WebSocket, the admin endpoints and
-  every call to Redis or to another HTTP service stay on tokio.
-- Limit: no change to a wire format, to a decision rule or to a replicated state. This spec
-  changes only threads and queues inside one process.
+- Limit: tokio stays at the edges: HTTP, the JSON-RPC parse, WebSocket, the admin endpoints and
+  every call to Redis or to another HTTP service.
+- Limit: no change to a wire format, to a decision rule, to a replicated state, or to the answer
+  semantics of the validated ack (one-way spec, section 3.1: `txpool is full` only when the offer
+  fails within its deadline).
+- Limit: the CPU work of the recovery does not run on a tokio worker. `recovery_does_not_block_the_reactor`
+  (`crates/ingress/tests/sig_verify_batch.rs`) enforces this. An agent keeps the rule and drops the
+  pool hop.
 - Non-goal: kernel bypass (DPDK, `ef_vi`, AF_XDP). The cloud nodes cannot use it.
 - Non-goal: the Java sealer. It already runs on Agrona agents.
 
@@ -47,194 +69,259 @@ reader and the execution loop) and the egress (the merge and the receipt pump).
 
 ### 3.1 Agents
 
-An agent is one thread that owns one stage:
+An agent is one thread that owns one stage. Its loop polls its inputs with no wait, does the work,
+and offers its outputs. With no work, it runs its idle strategy.
 
-```text
-loop {
-    work = poll(inputs)        // rings and Aeron subscriptions, no wait
-    if work > 0 { idle.reset() } else { idle.idle() }
-}
-```
+- The agent owns its state. Section 5.6 names each structure that it shares, and why.
+- The agent never calls `.await`, never sleeps on a timer, and makes no system call in a busy pass.
+  An Aeron offer and an Aeron poll are not system calls.
+- The idle strategy is short on a shared vCPU: a bounded spin, a few `std::thread::yield_now`,
+  then a park. A producer that pushes into the ring of a parked agent unparks it (3.2), so a quiet
+  agent costs no periodic wake. The park has a cap: `AeronRuntime::idle_cap()`, which the deploy
+  sets from `KARDAMOM_IDLE_CAP_US` (50 µs on staging). No new setting.
+- The agent records its loop with the `LoopMeter` names of `kardamom_obs::pipeline`, so the
+  Bottlenecks dashboard shows it.
 
-- The agent owns its state. It shares no lock with another thread.
-- The agent never calls `.await`, never sleeps on a timer and never makes a system call in a busy
-  pass. An Aeron offer and an Aeron poll are not system calls.
-- The idle strategy backs off in three steps: spin, then `std::thread::yield_now`, then park with
-  a cap (as `IdleBackoff` and `IdleCap` in `crates/log/src/aeron_live/idle.rs` do now). The cap
-  sets the worst wake delay of an idle agent. A busy agent never parks.
-- The agent counts its busy and idle time and its queue depths, with the names of
-  `kardamom_obs::pipeline`, so the Bottlenecks dashboard shows it like any other loop.
+### 3.2 Rings and the wake handshake
 
-### 3.2 Rings
-
-- Stages connect through bounded single-producer, single-consumer rings. The slots are allocated
-  once, at the start.
-- Many producers into one agent use one ring for each producer, not one shared ring. The agent
-  polls its rings in turn.
-- A full ring is back pressure. The producer does not wait: it answers the error of its stage
-  (for the ingress, `txpool is full`).
-- The ring crate is an open question (section 8, Q1).
+- The edge has many producers (the handler tasks), so the ring of an agent at the edge is a
+  `crossbeam_queue::ArrayQueue` (MPMC, lock-free, already a dependency). A ring between two agents
+  is SPSC; its crate is chosen when the first such pair exists (stage 2 or later).
+- The wake handshake follows Agrona: the agent sets an `AtomicBool` "parked" before it parks, and
+  checks the ring once more after it sets the flag. A producer pushes, then reads the flag, and
+  calls `Thread::unpark` only when it is set. So a busy agent sees no unpark, and no push is lost
+  between the last poll and the park. A `loom` test proves the handshake (section 8).
+- A full ring is back pressure. The handler answers at once, with a reason of its own:
+  `kardamom_ingress_tx_rejected_total{reason="ring-full"}`, apart from `txpool-full` (a refused
+  offer at its deadline), so the dashboard tells the two apart.
 
 ### 3.3 The edge
 
-- A tokio handler does the parse and hands the raw transaction to an agent ring with a reply
-  slot. Then it waits on the reply slot.
-- The agent fills the reply slot and wakes that one task. That is the only wake on the path.
-- The reply slot is a `tokio::sync::oneshot`. One send costs one atomic operation and one wake.
-  The agent does not block on it.
+- A handler task does the parse and the cheap checks, then pushes the work item and a
+  `tokio::sync::oneshot::Sender` into the ring, and awaits the receiver. The oneshot is used as
+  it is, with no wrapper type.
+- The agent sends the answer on the oneshot. One send is one atomic operation and one wake.
+- A dropped answer (`RecvError`, the agent is gone) maps to `IngressError::Internal`.
 
 ### 3.4 Threads and cores
 
-- Each agent has a name, a core list and an idle cap from the configuration. Pinning is optional.
-  Without a core list, the agent does not pin.
-- A busy-spin agent costs a full core while it is busy, and a fraction while it backs off.
-- The core budget is a design input (section 6). The ingress and sequencer nodes have 4 vCPUs on
-  shared cloud hosts. There, CPU steal can stop a pinned thread, so the idle cap must stay low
-  and no stage may assume a dedicated core.
+- Each agent has a name and an optional core list in its configuration. Without a core list, the
+  agent does not pin. No agent pins on the cloud nodes (Q5).
+- A busy agent costs a full core while it is busy. Section 7 gives the budget.
 
-### 3.5 The shared crate
+### 3.5 Where the code lives
 
-A new crate, `kardamom-agent`, holds the common shape, so each stage reuses one form:
+No new crate yet. The first agent lives in the ingress crate. The loop shape already exists twice
+(the Aeron thread with `IdleBackoff` and `ThreadMeter`, and the sequencer loops). When a second
+agent exists, a later PR extracts the shared shape. The agent is a struct with a `poll(&mut self)
+-> usize` method, so a test drives it with no thread (section 8).
 
-- `Agent`: a trait with `poll(&mut self) -> usize` and `name()`. It has no `dyn` use: each runner is
-  generic over its agent.
-- `Runner<A: Agent>`: the thread, the loop, the idle strategy, the pinning and the metrics.
-- `Inbox<T>`: the set of rings of one agent, with one producer handle for each producer.
-- `Reply<T>`: the reply slot of the edge.
+## 4. Stage 0: measure each hop
 
-## 4. Stage 1: the ingress submit path
+Before any agent ships, staging gets the breakdown of the 1.9 ms from the publish to the receipt.
 
-### 4.1 The target
+1. Deploy #774, #776 and #773 (the egress retry queue). Run the spike again (section 9).
+2. Read the existing hop metrics for each segment: `sequencer.offer_round_trip`, the sealer
+   `sealer.message` and `sealer.egress_offer`, the executor `executor.boundary` and
+   `executor.receipt_publish`, the egress loop metrics, and the seal and execute latency of the
+   ingress.
+3. Where a segment has no metric, add one step metric in a small PR. The candidates: the sequencer,
+   from the poll of `tx_data` to the offer; the executor, from the cluster frame to the receipt
+   publish; the egress, from a receipt frame to its `egress_receipts` offer; the ingress receipt
+   pump, from `egress_receipts` to the WebSocket send.
+4. Record the result in this spec (a table like 1.1), and choose the first agent stage from it:
+   the stage with the largest scheduler cost per transaction. A hop that waits on the network or on
+   Raft is not a scheduler cost and is out of scope.
+
+## 5. The ingress agent (a candidate stage)
+
+### 5.1 Scope
+
+- Only `--ack validated`. The receipt ack and the admission ack register a waiter before the
+  publish (`crates/ingress/src/proxy/submit.rs`) and stay on tokio. The flag is refused with
+  another ack mode.
+- The flag: `kardamom-ingress --verify-agent on|off`, default `off`, set by a job variable.
+
+### 5.2 The path
 
 ```text
 JSON-RPC handler (tokio)
-   │ raw bytes + reply slot
+   decode → hash → duplicate cache (a hit answers the hash) → push (envelope, raw, oneshot)
    ▼
-ring ──▶ verify agent k (k = 1..N, round robin over the agents)
-           decode → protocol limits → recovery → duplicate cache → nonce view
-           → offer on tx_data[lane] (its own publication)
-           → reply: hash, or the error
+ring (ArrayQueue) ──▶ verify agent (one thread)
+                        protocol limits → recovery → nonce view
+                        → offer on tx_data[lane] (its own clone of the publication)
+                        → answer: hash, or the error
 ```
 
-- N verify agents. One core recovers about 23k signatures/s (`tests/stage_costs.rs`), so N = 1 or
-  2 covers 10k tx/s on one ingress. N is a setting.
-- The handler picks the agent round robin. Each handler task has its own producer handle on each
-  ring (3.2), or the handlers of one tokio worker share one handle (Q2).
+- One verify agent. One core recovers about 23k signatures/s (`crates/ingress/tests/stage_costs.rs`),
+  so one agent covers 10k tx/s on one ingress. One agent keeps one publisher session on each lane
+  and the order of arrival, as today.
+- If one agent is ever too slow: split the recovery over workers, and keep one publisher that
+  offers in arrival order (a sequence barrier, the Disruptor shape). Never round robin over
+  publishers (5.4).
 
-### 4.2 The duplicate cache
+### 5.3 The duplicate cache
 
-- Today: `RecentMap`, a `DashMap` plus a lock-free order ring, shared by all handlers.
-- With agents: the cache stays shared and read-mostly. A hit answers the hash. Only a published
-  hash enters the cache, and only the agent that published it writes it. The `DashMap` shards keep
-  the write cost low at N = 2.
-- Option: give each agent its own cache, and route by the transaction hash. Then no cache is
-  shared, but a route by hash needs the hash before the recovery, and the hash costs one keccak in
-  the handler. Q3 decides.
+- The hash and the duplicate check stay in the handler, before the ring, as today
+  (`crates/ingress/src/proxy/validated.rs`). A duplicate never enters the ring and costs no
+  recovery.
+- The agent inserts a hash into the cache after its offer succeeds, as today: only a published hash
+  enters the cache.
 
-### 4.3 The nonce view
+### 5.4 The publish and its deadline
 
-- Today: the local account layer, then Redis on a miss, with an `await` on the path.
-- An agent cannot wait for Redis. The agent reads only the local layer. A sender with no row in
-  the local layer admits, as a sender with no row in Redis does today.
-- A miss sends the sender to a tokio task that reads Redis and fills the local layer, so the next
-  transaction of that sender finds a row. The answer of the first transaction does not wait for it.
-- Effect: a stale nonce of a new sender can pass the ingress once, and the sequencer drops it with
-  `nonce too low` (a `dropped` status on the egress). The rule "a `nonce too low` answer is always
-  true" stays true.
+- The agent offers on its own clone of the concurrent publication of each lane. rusteron marks
+  `AeronPublication` `Clone + Send + Sync`, and an Aeron concurrent publication takes offers from
+  many threads. No exclusive publication and no `try_claim`: rusteron does not mark
+  `AeronExclusivePublication` `Send`, and this spec adds no `unsafe`.
+- A refused offer does not answer at once. The agent keeps the item in a pending slot for its lane
+  with the deadline of today (`OFFER_TIMEOUT`, 5 s). Each pass retries the head of each lane once,
+  with no block, and keeps the order of the lane. At the deadline the answer is `txpool is full`.
+  This is the rule of `drain_pending` (`crates/log/src/aeron_live/pending.rs`), and the agent
+  reuses that function, not a copy of it.
+- Why not round robin over N publishers: the sequencer parks at most 16 transactions per sender
+  (`crates/sequencer/src/v2/mod.rs`, `max_parked`) and answers `TooManyPending` above it. Two
+  images of one ingress can deliver one sender's nonces in bursts of up to 64 fragments per poll,
+  so a hot sender would get drops. More sessions would also mean more replay windows in the sealer
+  and more recordings for the join. One publisher avoids all three.
+- The stamp for the seal clock (`stamps.stamp`) moves into the agent, before the offer.
 
-### 4.4 The publish
+### 5.5 The nonce view
 
-- Each verify agent opens its own exclusive publication on each `tx_data` lane. It offers with
-  `try_claim` or `offer` directly, not through the command channel of the shared Aeron thread.
-- A refused offer (back pressure, not connected) answers `txpool is full` at once. It does not
-  wait in a retry queue.
-- Effect on the sequencer: each lane gets N images from each ingress, not one. The order of one
-  sender stays FIFO, because one sender maps to one agent only if the route is by sender (Q4).
-  With a round robin, two transactions of one sender can reach the sequencer in another order on
-  two images. The sequencer already orders by nonce and parks a gap, so this costs a park, not a
-  drop. Q4 decides.
-- The stamp for the receipt pump (`stamps.stamp`) moves into the agent, before the offer.
+- Today the check reads the local account layer (`LiveAccounts`), then Redis on a miss, with an
+  `await` on the path.
+- The agent reads only the local layer. A sender with no row admits, as a sender with no row in
+  Redis does today.
+- On a miss, the agent pushes the sender into a bounded channel to the receipt pump, the one writer
+  of `LiveAccounts` (`crates/cache/src/live.rs`). The pump reads Redis on its own task and applies
+  the row with the monotone rule (`apply_one`). The next transaction of that sender then finds the
+  row. No second writer exists.
+- Effect: the first transaction of a sender with no local row skips the Redis check. This happens
+  after a restart (the layer is empty) and after an entry expires (the layer has a TTL and a
+  capacity). A stale nonce then passes the ingress, and the sequencer drops it with `nonce too low`.
+  The `dropped` status of #768 reports each one, so #768 is a dependency of this stage. The rule
+  "a `nonce too low` answer is always true" stays true.
 
-### 4.5 What stays on tokio
+### 5.6 Shared structures that the agent touches
 
-The HTTP server, the JSON-RPC parse, `eth_call` and every read method, WebSocket subscriptions,
-the Redis client, the receipt pump and the admin endpoints.
+| Structure | Access | Why it stays shared |
+|---|---|---|
+| The duplicate cache (`RecentMap`: `DashMap` + `ArrayQueue`) | insert after an offer | the handlers read it before the ring (5.3) |
+| `LiveAccounts` (`DashMap`) | read | the receipt pump is its one writer (5.5) |
+| The cluster status (`watch`) | read | the guards of the sealer come from the cluster session |
+| The pause slot | read | an operator pause reaches every path |
 
-## 5. Later stages
+Each is a read-mostly structure with sharded or lock-free access. None is a mutex on the path.
 
-Each later stage gets its own spec section and its own PR, after stage 1 shows its gain on
-staging.
+### 5.7 Shutdown
+
+1. The intake stops (`begin_drain`, `crates/ingress/src/proxy/mod.rs`): a new submit answers as it
+   does today in a drain.
+2. The agent empties its ring and its pending slots. Each item gets an answer: the hash, or the
+   error at its deadline.
+3. The agent stops, and its thread is joined.
+4. The publications close, then the Aeron runtime drops, in the drop order of today.
+
+### 5.8 Failure
+
+- A panic in the agent ends the process (the runner does not catch it), so Nomad restarts the
+  ingress, as for a panic of the Aeron thread today.
+- A dropped answer maps to `IngressError::Internal` (3.3).
+- A full ring answers `ring-full` (3.2).
+
+### 5.9 Metrics
+
+- The step `ingress.recover` keeps its name, recorded inside the agent.
+- New: the ring depth gauge (`kardamom_queue_depth{queue="ingress.verify_ring"}`), the loop meter
+  of the agent, and the counts of `ring-full` and of refused offers.
+
+## 6. Later stages
+
+Each later stage gets its own section and its own PR, in the order that stage 0 gives.
 
 | Stage | Agent | Input | Output |
 |---|---|---|---|
-| 2. Sequencer admission | one agent for each lane | `tx_data` images | the cluster offer |
-| 3. Executor reader | one agent | the cluster egress or the member feed | the execution ring |
-| 4. Executor execution | one agent | the execution ring | the commit ring, `exec_frames`, `tx_receipts` |
-| 5. Egress merge | one agent | `exec_frames`, `tx_receipts` | the store, `egress_order`, `egress_receipts` |
-| 6. Notifier and ingress receipt pump | one agent | `egress_receipts` | the WebSocket fan-out (tokio) |
+| Sequencer admission | one agent for each lane | `tx_data` images | the cluster offer |
+| Executor reader | one agent | the cluster egress or the member feed | the execution ring |
+| Executor execution | one agent | the execution ring | the commit ring, `exec_frames`, `tx_receipts` |
+| Egress merge | one agent | `exec_frames`, `tx_receipts` | the store, `egress_order`, `egress_receipts` |
+| Receipt pump (ingress, notifier) | one agent | `egress_receipts` | the WebSocket fan-out (tokio) |
 
-- The state commit stays on its own thread. It is not on the latency path: commits run at about
-  0.6/s and hold many blocks.
-- Stage 2 must keep the twin rule: both twins offer the same bytes in the same order.
+- The state commit stays on its own thread. Commits run at about 0.6/s and hold many blocks, so
+  they are not on the latency path.
+- The sequencer stage must keep the twin rule: both twins offer the same bytes in the same order.
 
-## 6. The core budget on staging
+## 7. The core budget on staging
 
-| Node | vCPUs | Today | With stage 1 |
+| Node | vCPUs | Today | With the ingress agent |
 |---|---|---|---|
-| ingress-0/1 | 4 (cloud, shared) | tokio workers, the blocking pool, the Aeron thread, the media driver (SHARED) | 1–2 verify agents, 2 tokio workers, the Aeron thread, the media driver |
-| sequencer-0/1 | 4 (cloud, shared) | 4 sequencer loops, tokio, the media driver | unchanged in stage 1 |
-| executor-0..2 | 4–6 (cpuset on a dedicated host) | reader, execution, commit, egress | unchanged in stage 1 |
-| sealer-0..2 | 4–6 (cpuset) | Java agents, the media driver | unchanged |
+| ingress-0/1 | 4 (cloud, shared) | 4 tokio workers (`main.rs` sets 4), the blocking pool, the Aeron thread, the Aeron client conductor, the `cluster-watermark` thread | the same, plus one verify agent; the blocking pool then runs no recovery |
+| sequencer-0/1 | 4 (cloud, shared) | 4 sequencer loops (`spawn_blocking`), 2 tokio workers, the Aeron thread | unchanged |
+| executor-0..2 | 4–6 (cpuset on a dedicated host) | reader, execution, commit, egress | unchanged |
+| sealer-0..2 | 4–6 (cpuset) | Java agents | unchanged |
 
-- On a 4-vCPU node, two spinning agents and a spinning media driver leave one core for tokio.
-  So the idle cap of each agent must keep its idle cost low, and the measure (section 7) must
-  show the CPU of each node at rest and under load.
-- The media driver in DEDICATED mode adds 3 threads. It fits the dedicated hosts. On the 4-vCPU
-  cloud nodes it competes with the agents. The DEDICATED experiment runs on the sealers and the
-  executors first.
+- The media driver is a separate Nomad job on the same node, in SHARED mode (one thread).
+- The ingress job reserves 500 CPU shares (`deploy/cluster/nomad/ingress.nomad.hcl`). That is a
+  weight, not a core: the agent competes with the other threads of the node.
+- One agent with a short spin and a park costs little at rest. The acceptance (section 9) bounds
+  the CPU at rest.
+- The DEDICATED mode of the media driver adds threads. It runs on the dedicated hosts first, not
+  on the 4-vCPU cloud nodes.
 
-## 7. Rollout and measure
+## 8. Tests
 
-1. The crate `kardamom-agent`, with unit tests of the loop, the rings, the back pressure and the
-   idle strategy. No service uses it yet.
-2. Stage 1 behind a flag: `kardamom-ingress --agents <N>`, default 0 (the tokio path). The deploy
-   variable of the ingress job sets it. One ingress can run the agents while the other does not,
-   so one spike compares both sides at the same time.
-3. Measure on staging with the spike of `scratchpad/bench/run-load.sh`: 2 x 500 tx/s for 10 min,
-   then the ramp. Compare per side: the receipt latency p50, p99 and max, `ingress.recover`, the
-   steps of the submit path, the CPU of the node at rest and under load, and the context switches.
-4. Keep the flag until the agents path wins on both latency and CPU at rest. Then the default
-   changes, and a later PR removes the tokio path (P13 style cleanup).
-5. Stages 2 to 6 follow the same steps, one PR each.
+- The agent runs with no thread in a test: a `poll` over scripted inputs, as the sequencer tests
+  drive their loops (`crates/sequencer/src/inbound.rs`). Deterministic cases:
+  - a full ring answers `ring-full`;
+  - a duplicate costs no recovery (it never enters the ring);
+  - the order of arrival holds on each lane;
+  - a refused offer is retried, keeps the order, and answers `txpool is full` at its deadline;
+  - a nonce below the local row answers `nonce too low`;
+  - a miss pushes the sender to the pump, and the next transaction of that sender is checked;
+  - a drain answers every queued item.
+- A `loom` test of the wake handshake (3.2): no push is lost between the last poll and the park.
+- `recovery_does_not_block_the_reactor` still passes: the recovery runs on the agent thread.
+- An end-to-end run of the docker e2e suite with `--verify-agent on`.
 
-Acceptance for stage 1: the p50 of the receipt latency falls by at least 0.5 ms against the tokio
-path with #774, the p99 does not rise, and the CPU of the ingress node at rest rises by less than
-half a core.
+## 9. Rollout and measure
 
-## 8. Open questions
+1. Stage 0 (section 4).
+2. If stage 0 picks the ingress: the agent behind `--verify-agent`, default `off`. Turn it on for
+   one ingress only. The load tool sends one side to each ingress, so one spike compares both at the
+   same time. The agent adds no publisher session (5.4), so the sequencers see the same images.
+3. The spike: 2 x 500 tx/s for 10 minutes, then the ramp to 2 x 2000 tx/s, with the receipt
+   latency confirmed through the WebSocket feed (`kardamom-load --feed-confirm`). Compare per side:
+   the receipt latency p50, p99 and max, `ingress.recover`, `ingress.submit`, the CPU of the node at
+   rest and under load, the context switches, and the latency of the read methods under load.
+4. Acceptance: the p50 of the agent side is lower by at least 0.2 ms, the p99 does not rise, the
+   read methods do not slow down, and the CPU at rest rises by less than 0.25 of a core.
+5. Rollback: turn the flag off and deploy. The flag changes no state and no wire format.
+6. When the agent wins, the default changes, and a later PR removes the tokio path.
+7. The later stages follow the same steps, one PR each.
 
-- Q1. The ring: `rtrb` (SPSC, wait-free), `crossbeam_queue::ArrayQueue` (MPMC, lock-free, already a
-  dependency), or a hand-written ring with pre-allocated slots. The proposal: `rtrb` for SPSC,
-  because each ring has one producer.
-- Q2. The producer handle of a tokio handler: one ring for each handler task needs a registration
-  per connection. One ring for each tokio worker needs the worker id. The proposal: one
-  `ArrayQueue` (MPMC) for each agent at the edge only, because the edge has many producers, and
-  SPSC rings between agents.
-- Q3. The duplicate cache: shared (`DashMap`) or one for each agent with a route by hash. The
-  proposal: shared, because N is 1 or 2.
-- Q4. The route to an agent: round robin (even load, two images can reorder one sender) or by
-  sender (FIFO per sender, but the sender is known only after the recovery). The proposal: round
-  robin, and the sequencer parks the gap.
-- Q5. Pinning on shared cloud vCPUs: pin, or let the kernel place the agents. The proposal: no pin
-  on cloud nodes, pin on the dedicated hosts.
-- Q6. The idle cap of an agent: the latency of the first transaction after a quiet period against
-  the CPU at rest. The proposal: 50 µs, the same order as the batch window of #774.
+## 10. Open questions, now answered
 
-## 9. Risks
+- Q1, the ring: `ArrayQueue` at the edge (many producers). An SPSC crate only when a pair of agents
+  exists.
+- Q2, the producer handle: one ring for each agent. No handle per connection or per worker.
+- Q3, the duplicate cache: shared, checked in the handler before the ring (5.3).
+- Q4, the route: one verify agent and one publisher; no round robin (5.4).
+- Q5, pinning: no pin on the cloud nodes. On the dedicated hosts, only after a core plan per host.
+- Q6, the idle cap: `AeronRuntime::idle_cap()`, with the producer unpark of 3.2, so a quiet agent
+  costs no periodic wake.
 
-- A busy agent on a shared vCPU can starve tokio. The measure in section 7 must include the read
-  methods (`eth_call`, receipt reads) under load, not only the submit path.
-- A panic in an agent stops its stage. The runner ends the process, so Nomad restarts it, as a
-  panic in the Aeron thread does today.
-- The local nonce view admits more stale nonces after a restart (4.3). The `dropped` status of #768
-  reports each one.
+## 11. Changes from revision 1
+
+| Finding | Change |
+|---|---|
+| F1, the gain is in the wrong place | Section 1 has the measured breakdown. Stage 0 measures each hop before an agent ships. The ingress agent is a candidate, not the first stage by default. |
+| F2, a cheaper first step | #774 (the timer) and #776 (the async publish) are that step. The inline recovery of F2 is not taken: it breaks the rule that the recovery does not run on a tokio worker (section 2). |
+| F3, drops and the ack semantics | One agent and one publisher, no round robin. A refused offer waits for its deadline. Only `--ack validated`. |
+| F4, the exclusive publication | A clone of the concurrent publication. No `try_claim`, no `unsafe`. |
+| F5, the duplicate cache | The hash and the check stay in the handler, before the ring. |
+| F6, the nonce view | The receipt pump stays the one writer; a miss goes to it on a channel. The TTL case is named. #768 is a dependency. |
+| F7, wrong facts | #774 is open. Section 7 lists every thread. The ingress reserves CPU shares, not cores. No file outside the repository. The idle cap reuses `KARDAMOM_IDLE_CAP_US`. |
+| F8, locks on the path | Section 5.6 lists each shared structure and why it stays. |
+| F9, style | No new crate yet; the oneshot is used as it is; the agent is a struct with `poll`. |
+| F10, missing sections | Sections 5.7 (shutdown), 5.8 (failure), 5.9 (metrics), 8 (tests) and 9.5 (rollback). |
