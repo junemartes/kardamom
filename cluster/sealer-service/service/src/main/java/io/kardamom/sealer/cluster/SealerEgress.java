@@ -71,8 +71,9 @@ final class SealerEgress {
      * <p>The eviction rule follows the decision version of the state
      * ({@link #setDecisionVersion}):</p>
      * <ul>
-     *   <li>Below version 5, the window of {@link #retentionCap} frames is
-     *       a minimum, not a maximum: a frame past the window is evicted
+     *   <li>Below version 5, or on a member that keeps its frames on the
+     *       heap, the window of {@link #retentionCap} frames is a minimum,
+     *       not a maximum: a frame past the window is evicted
      *       only when its block is posted to L1 ({@link #postedHead}).
      *       Nothing a batcher has not confirmed on L1 is dropped, so the
      *       batcher can always replay from its cursor. The DA-lag guard
@@ -80,8 +81,10 @@ final class SealerEgress {
      *       {@code daLagBudgetBlocks} past the posted head, so the
      *       stretched window holds at most the budget's blocks plus one
      *       flush.</li>
-     *   <li>Under version 5, the window is the whole rule: a frame past
-     *       the window is evicted at once, at any posted head. So the
+     *   <li>Under version 5 on a member that carries the bytes
+     *       ({@link RetainedFrames#carriesBytes}), the window is the whole
+     *       rule: a frame past the window is evicted at once, at any posted
+     *       head. So the
      *       retained frames have a fixed bound at any DA lag. A reader
      *       below the window gets REPLAY_UNAVAILABLE and recovers from
      *       another source. The DA-lag guard still refuses user records,
@@ -107,7 +110,9 @@ final class SealerEgress {
     private long postedHead;
     /**
      * Whether a frame past the window leaves at once, at any posted head:
-     * decision version 5. The state sets the version at a block boundary,
+     * decision version 5 on a member that carries the bytes. Without the
+     * bytes, no member feed runs: the executors and the batcher read
+     * references, which the egress cannot serve, so the posted rule stays. The state sets the version at a block boundary,
      * and the service echoes it here at the end of that log entry.
      */
     private boolean windowOnly;
@@ -167,7 +172,7 @@ final class SealerEgress {
      * at the same point of the log.
      */
     void setDecisionVersion(final int version) {
-        windowOnly = version == VersionSwitch.CARRY_VERSION;
+        windowOnly = version == VersionSwitch.CARRY_VERSION && retained.carriesBytes();
         prune();
     }
 
@@ -460,7 +465,7 @@ final class SealerEgress {
 
     /**
      * Evict from the front while the window is over its cap and the oldest
-     * frame may leave: at once under version 5, else when it is posted.
+     * frame may leave: at once with {@link #windowOnly}, else when it is posted.
      */
     private void prune() {
         while (retained.count() > retentionCap && (windowOnly || oldestIsPosted())) {

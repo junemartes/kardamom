@@ -463,7 +463,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
     - The batcher can always replay from its cursor, because the sealer keeps each frame that is not posted.
     - The stretch has a bound: the budget plus one flush of blocks, in heap.
     - With no budget (`0`), nothing bounds the stretch.
-  - Under version 5, `retention` is the whole rule. A frame past the window leaves at once, at any posted head. See [Version 5](#version-5).
+  - Under version 5 on a member that carries the bytes, `retention` is the whole rule. A frame past the window leaves at once, at any posted head. See [Version 5](#version-5).
   - The snapshot carries the retained frames. A member that restores a snapshot keeps the floors of the snapshot. It answers older ranges with `REPLAY_UNAVAILABLE`.
   - Use the same value on every member. The eviction is part of the replicated state: the replay answers and the snapshot bytes depend on it.
 - `carryBytes`: the deploy does not pass it yet, so the retained frames stay on the heap.
@@ -617,13 +617,16 @@ Version 5 is version 4 that relays the bytes of a transaction. The sequencer off
   4. Otherwise the member sets the bit and orders the reference. It relays one canonical entry: `[canonical_id:32][record_type=6][lane:u8][envelope]`.
 - **Other records.** A reference of type 0 keeps the rules of version 4, so a sequencer that sends type 0 still has its references ordered. An epoch and a remote-origin record keep the id window. With priority fees on, a held full reference takes the version-5 rules when the ordering window flushes it.
 - **No void and no record lag.** The member drops the void requests (kind 6) and the recorded cursors (kind 9) as unknown kinds. The record-lag guard is off. The void ledger keeps no full reference.
-- **The replay window.** The member keeps only the last `retention` frames. A frame past the window leaves at once, also when its block is above the posted head. So the retained frames have a fixed bound on the heap, in the retained file and in the snapshot, at any DA lag.
+- **The replay window.** A member that carries the bytes (`carryBytes`) keeps only the last `retention` frames. A frame past the window leaves at once, also when its block is above the posted head. So the retained frames have a fixed bound in the retained file and in the snapshot, at any DA lag.
+  - A member that keeps its frames on the heap keeps the rule of version 4: a frame past the window leaves only when its block is posted. Without the bytes, no member feed runs. The executors and the batcher then read references, and the egress cannot serve a reference, so no reader below the window could recover.
+  - Every member runs the same `carryBytes` value (the release gate refuses a rolling change of it), so every member evicts the same frames.
+  - A member with `carryBytes` writes snapshot version 12. That layout holds no decision rules and no version switch, so a restore of such a member does not run version 5 yet. Until a snapshot version for that case exists, do not run `carryBytes` with feature 3 or 4.
   - A cursor inside the window gets the frames from the cursor. A cursor below the window gets `REPLAY_UNAVAILABLE`. A reader below the window recovers from another source.
   - The DA-lag guard stays. It refuses new records when the sealed head is more than the budget past the posted head. It holds no frame.
   - The rule changes at the end of the log entry whose boundary switches the version: the member evicts the frames past the window before the snapshot notice of the switch. A restore takes the rule of the version in the snapshot. So every member evicts the same frames at the same log position, from the log or from a snapshot. The status of the tick that switches leaves before the eviction, with the count of the old rule.
   - A switch back to version 4 or 3 keeps the old rule again from the end of that entry.
   - A batcher that replays from the sealer gets `REPLAY_UNAVAILABLE` when its cursor falls below the window, and it does not recover by itself. The egress (`--egress`) serves the batcher and the validator below the window, but only frames with their bytes: a reference of version 4 or older has no bytes. So the order of the rollout is:
-    - On a chain where version 5 already runs: switch the batcher and the validator to the egress, then deploy this release.
+    - On a chain where version 5 already runs with `carryBytes`: switch the batcher and the validator to the egress, then deploy this release. Without `carryBytes`, this release changes no eviction.
     - On a chain where version 5 does not run yet: send the upgrade transaction of feature 4 at a low load, when the unposted frames fit in the window. Keep the load low until the batcher posts a block of version 5. Then switch the batcher and the validator to the egress.
   - See [the one-way pipeline spec, section 6.4](../../docs/specs/2026-10-21-one-way-pipeline.md).
 - **The cost.** The record path allocates nothing (`AllocationGateTest`, case `ref_v5`, and `CarriedPathAllocationTest` of the service, cases `carried_fresh` and `carried_copy`). With no ordering window, the relay copies the id, the lane and the envelope from the log buffer into the staging buffer in two parts. The frame goes from there to the retained ring and to each session.
@@ -795,7 +798,7 @@ The chaos suite and operators read these lines. The admin server also exports on
     - A restore drops the cursor of an executor that is not a configured voter.
   - from versions 13 and 14 only, the decision rules, after the seed digest
 - The retention section follows the state section. Its layout depends on the version. Both layouts are big-endian.
-  - Under decision version 5, the section holds at most `retention` frames. The layout does not change.
+  - Under decision version 5 on a member that carries the bytes, the section holds at most `retention` frames. The layout does not change.
   - Versions 8 to 11, 13 and 14, on the heap: `[count:i32]`, then `[boundary:u8][key:u64][len:u32][frame]` for each retained frame.
   - Version 12, the retained file: `[floor_index:u64][floor_block:u64][count:u64][front:u64][head:u64][n:i32]`, then `[block:u64][end_tx_idx:u64][end_pos:u64]` for each retained boundary, then `[len:i32]`, the length of the section before it. The section is the end of the snapshot, so a peer seed finds it with no parse of the state. See [Retained file](#retained-file).
   - A member with `carryBytes` stops on a snapshot that is not version 12. A member without it stops on version 12.

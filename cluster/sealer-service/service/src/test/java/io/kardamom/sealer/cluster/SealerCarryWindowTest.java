@@ -10,6 +10,7 @@ import io.kardamom.sealer.cluster.DriverlessLog.Member;
 import io.kardamom.sealer.cluster.DriverlessLog.Outcome;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
@@ -18,6 +19,7 @@ import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 /**
  * The replay window under decision version 5 on driverless members. Below
@@ -27,10 +29,17 @@ import org.junit.jupiter.api.Test;
  * have a fixed bound at any DA lag. The DA-lag guard still refuses, and a
  * replay below the window gets REPLAY_UNAVAILABLE. A replay of the log and
  * a restore from a snapshot at any entry evict the same frames.
+ *
+ * <p>The window-only rule needs a member that carries the bytes: only
+ * then does the member feed run, so every reader below the window can
+ * recover from the egress. A member that keeps its frames on the heap
+ * keeps the posted rule under version 5 too.</p>
  */
 class SealerCarryWindowTest {
 
     private static final byte RELAYED = SealerWire.EGRESS_KIND_RELAYED;
+    /** What a member that carries the bytes sends a session in place of a relayed full entry. */
+    private static final byte RELAYED_REF = SealerWire.EGRESS_KIND_RELAYED_REF;
     private static final byte BOUNDARY = SealerWire.EGRESS_KIND_BOUNDARY;
 
     /** The replay window of every member, in frames. */
@@ -45,6 +54,9 @@ class SealerCarryWindowTest {
     private static final int POSTED_HEAD_OFFSET = 1;
 
     private final DriverlessLog log = new DriverlessLog();
+
+    @TempDir
+    Path dir;
 
     @BeforeEach
     void window() {
@@ -138,6 +150,11 @@ class SealerCarryWindowTest {
         return retained(lastStatus(member));
     }
 
+    /** A member that carries the bytes, with its retained file under {@code name}, at genesis. */
+    private Member carrying(final String name) {
+        return log.carrying(Optional.empty(), dir.resolve(name), LagBudgets.DEFAULT);
+    }
+
     @Test
     void below_version_five_the_frames_above_the_posted_head_stay() {
         final Member member = log.member(Optional.empty());
@@ -153,7 +170,7 @@ class SealerCarryWindowTest {
 
     @Test
     void version_five_keeps_only_the_window_at_any_posted_head() {
-        final Member member = log.member(Optional.empty());
+        final Member member = carrying("window");
         final List<Entry> upgrade = upgrade(true).toList();
         // The last entry of the upgrade is the boundary that switches to version 5.
         final int switchAt = upgrade.size() - 1;
@@ -176,23 +193,45 @@ class SealerCarryWindowTest {
 
     @Test
     void version_five_refuses_a_replay_below_the_window_and_serves_one_inside_it() {
-        final List<Outcome> outcomes = log.member(Optional.empty()).applyAll(stream(true));
+        final List<Outcome> outcomes = carrying("replay").applyAll(stream(true));
         assertEquals(List.of(SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE), named(outcomes, "replay-genesis").kinds());
-        assertEquals(List.of(RELAYED, BOUNDARY, SealerWire.EGRESS_KIND_REPLAY_DONE),
+        assertEquals(List.of(RELAYED_REF, BOUNDARY, SealerWire.EGRESS_KIND_REPLAY_DONE),
             named(outcomes, "replay-inside").kinds());
     }
 
     /** The guard refuses once the sealed head runs more than 6 blocks past the posted head of 0: from {@code ref-4}. */
     @Test
     void version_five_keeps_the_da_lag_guard() {
-        final Member member = log.member(Optional.empty(), new LagBudgets(6L, 0L));
+        final Member member = log.carrying(Optional.empty(), dir.resolve("guard"), new LagBudgets(6L, 0L));
         final List<Outcome> outcomes = member.applyAll(Stream.concat(upgrade(true), lag(true)).toList());
-        assertEquals(List.of(RELAYED), named(outcomes, "ref-3").kinds());
+        assertEquals(List.of(RELAYED_REF), named(outcomes, "ref-3").kinds());
         assertEquals(List.of(SealerWire.EGRESS_KIND_DA_LAG_REJECT), named(outcomes, "ref-4").kinds());
         assertEquals(List.of(SealerWire.EGRESS_KIND_DA_LAG_REJECT), named(outcomes, "ref-" + (LAG_BLOCKS - 1)).kinds());
         assertEquals(WINDOW, retained(member), "the guard holds no frame");
     }
 
+    /**
+     * A member that keeps its frames on the heap runs no member feed, so no
+     * reader below the window can recover from the egress. Under version 5
+     * it keeps every frame above the posted head, as version 4 does.
+     */
+    @Test
+    void version_five_on_the_heap_keeps_the_frames_above_the_posted_head() {
+        final Member member = log.member(Optional.empty());
+        final List<Outcome> outcomes = member.applyAll(stream(true));
+        assertEquals(VersionSwitch.CARRY_VERSION, member.svc().decisionRules().version());
+        assertEquals(0L, lastStatus(member).getLong(POSTED_HEAD_OFFSET), "the batcher posted nothing");
+        assertEquals(2 * HEAD - 1, retained(member), "every record and every boundary stays");
+        final List<Byte> genesis = named(outcomes, "replay-genesis").kinds();
+        assertEquals(HEAD, Collections.frequency(genesis, RELAYED), "every record from genesis");
+        assertEquals(SealerWire.EGRESS_KIND_REPLAY_DONE, genesis.get(genesis.size() - 1));
+    }
+
+    /**
+     * The heap members only: a member that carries the bytes writes
+     * snapshot version 12, which holds no decision rules and no version
+     * switch, so a restore of it does not run version 5 yet.
+     */
     @Test
     void a_replay_from_a_snapshot_at_any_entry_evicts_alike() {
         final List<Entry> entries = stream(true);
