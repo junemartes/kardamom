@@ -1208,6 +1208,12 @@ The da-watcher takes the records of the L1 follower's `l1_blocks` stream, and it
 - A record that does not descend from the head is the halt `l1_chain_break`. The watcher reads the block again from the archives every tick, and resumes by itself on a record that descends.
 - A record past the next block is a gap on the subscription. The watcher reads the missing records from the archives of the follower nodes, and the follower's archive (`indexer_l1_block`) serves what they do not hold.
 - The loop selects on the next record, the sealer's origin, the re-publish deadline, and a housekeeping tick (`--poll-interval-secs`, 1 s in the deploy).
+- **The epoch pace** (`--epoch-pace-ms`, default 2000). L1 finalizes about 32 blocks at once, and each epoch seals its own L2 block. Published at once, the epochs make a burst of blocks. The executors can run only 4 blocks ahead of their commits (`COMMIT_PIPELINE_DEPTH`), so the transactions behind a burst wait for their receipts (about 150-300 ms on staging, every 6.4 min). The watcher publishes one epoch of a step at a time, one pace apart.
+  - A backlog of more than 64 records (`PACED_BACKLOG`, a catch-up after a restart) publishes at full speed.
+  - The default of 2 s is longer than a block commit (50-250 ms on staging), so each block commits before the next one comes.
+  - The pace must stay below the 4 s gather window of the validator's epoch check (`GATHER`), so one step stays one range of that check. Above 4 s, each epoch of a step is a check of its own. The upper limit is 12 s: 32 epochs in one 384 s step.
+  - The last epoch of a step of 32 then comes about 62 s later. Deposits already wait 6 to 13 min for L1 finality. A paced backlog of 64 takes up to about 128 s.
+  - An epoch that waits for the pace stays in the inbox, not in the publish window. So the pace causes no re-publish.
 
 - With `--config` (the deploy), a boundary-only cluster session reads the L1 origin `C` of every boundary. `C` is the last epoch that the sealer committed.
 - The watcher keeps the epochs that it published after `C`. This is its window. The window holds up to 2048 epochs (6.8 hours of L1). The gauge is `kardamom_da_watcher_epochs_unconfirmed`.
