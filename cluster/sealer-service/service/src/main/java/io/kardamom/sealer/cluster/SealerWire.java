@@ -473,6 +473,20 @@ public final class SealerWire {
     /** Length of an {@link #EGRESS_KIND_SEALER_INFO} frame. */
     static final int SEALER_INFO_LEN = Byte.BYTES + Byte.BYTES + Long.BYTES;
 
+    /**
+     * The refusal of a transaction reference of record type {@link #RT_TXREF}:
+     * {@code [kind:18][canonical_id:32][sender:20][nonce:u64 LE][decision_version:u8]}
+     * ({@link #REF_REFUSED_LEN} bytes). Offered only to the offering
+     * session. The reference is not ordered. The canonical id is the hash of
+     * the transaction, and the decision version is the version of the
+     * service. A reader that does not know the kind drops it.
+     * Matches Rust {@code EGRESS_KIND_REF_REFUSED}.
+     */
+    public static final byte EGRESS_KIND_REF_REFUSED = 18;
+    /** Length of an {@link #EGRESS_KIND_REF_REFUSED} frame. */
+    static final int REF_REFUSED_LEN = Byte.BYTES + CanonicalSealerState.CANONICAL_ID_LEN
+        + CanonicalSealerState.SENDER_LEN + Long.BYTES + Byte.BYTES;
+
     /** The egress header in front of a relayed payload: {@code [kind:1][index:u64][payload_len:u32]}. */
     static final int RELAYED_HEADER_LEN = Byte.BYTES + Long.BYTES + Integer.BYTES;
     /** Length of a status frame without its tails. */

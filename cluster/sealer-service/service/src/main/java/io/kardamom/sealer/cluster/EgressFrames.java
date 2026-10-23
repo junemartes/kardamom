@@ -141,6 +141,25 @@ final class EgressFrames {
     }
 
     /**
+     * The refusal of a transaction reference:
+     * {@code [kind:18][canonical_id:32][sender:20][nonce:u64][decision_version:u8]}.
+     */
+    int refRefused(final byte[] canonicalId, final byte[] sender20, final long nonce, final int decisionVersion) {
+        int pos = 0;
+        buf.putByte(pos, SealerWire.EGRESS_KIND_REF_REFUSED);
+        pos += Byte.BYTES;
+        buf.putBytes(pos, canonicalId, 0, CanonicalSealerState.CANONICAL_ID_LEN);
+        pos += CanonicalSealerState.CANONICAL_ID_LEN;
+        buf.putBytes(pos, sender20, 0, CanonicalSealerState.SENDER_LEN);
+        pos += CanonicalSealerState.SENDER_LEN;
+        buf.putLong(pos, nonce, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putByte(pos, (byte) decisionVersion);
+        pos += Byte.BYTES;
+        return pos;
+    }
+
+    /**
      * An answer on the member feed: {@code [kind][a:u64][b:u64][request_id:u64]}.
      * It is the control message of {@link #control} with the id of the
      * request that it answers as a tail.

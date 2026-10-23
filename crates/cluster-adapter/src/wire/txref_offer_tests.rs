@@ -78,12 +78,67 @@ fn the_shortest_envelope_is_the_root() {
     );
 }
 
+/// A sealer below decision version 5 relays a full reference as is. The
+/// reader decodes it as the same canonical entry as the frame of version 5.
 #[test]
-fn a_relayed_full_reference_is_refused() {
-    let payload = RelayShape::of(KIND_INGRESS_RECORD).relay(&golden_frame("txref_offer_ingress"));
-    let frame = encode_egress_record(1, &payload).unwrap();
+fn a_relayed_full_reference_decodes_as_its_canonical_entry() {
+    let frame = golden_frame("txref_offer_egress");
     assert_eq!(
-        EgressItem::decode(&frame),
-        Err(WireError::UnrelayedRecordType(RT_TXREF_OFFER))
+        frame,
+        encode_egress_record(
+            Fixture::INDEX,
+            &RelayShape::of(KIND_INGRESS_RECORD).relay(&golden_frame("txref_offer_ingress")),
+        )
+        .unwrap()
     );
+    let item = EgressItem::decode(&frame).unwrap();
+    assert_eq!(
+        item,
+        EgressItem::Tx {
+            index: Fixture::INDEX,
+            tx: Fixture::tx(),
+        }
+    );
+    assert_eq!(
+        item,
+        EgressItem::decode(&golden_frame("tx_egress")).unwrap()
+    );
+}
+
+#[test]
+fn the_full_reference_payload_of_an_entry_decodes_to_the_entry() {
+    let tx = Fixture::tx();
+    let frame = encode_egress_record(Fixture::INDEX, &tx.full_ref_payload().unwrap()).unwrap();
+    assert_eq!(
+        EgressItem::decode(&frame).unwrap(),
+        EgressItem::Tx {
+            index: Fixture::INDEX,
+            tx,
+        }
+    );
+}
+
+/// The sequencer is trusted to write an id that is the hash in the
+/// envelope. A relayed full reference with another id is refused, and the
+/// reader drops the frame.
+#[test]
+fn a_relayed_full_reference_whose_envelope_does_not_hash_to_its_id_is_refused() {
+    let mut payload = Fixture::tx().full_ref_payload().unwrap();
+    payload[0] ^= 1;
+    let frame = encode_egress_record(Fixture::INDEX, &payload).unwrap();
+    assert!(matches!(
+        EgressItem::decode(&frame),
+        Err(WireError::BadTx(_))
+    ));
+}
+
+#[test]
+fn a_relayed_full_reference_with_a_short_envelope_is_refused() {
+    let payload = Fixture::tx().full_ref_payload().unwrap();
+    let short = &payload[..TXREF_RECORD_LEN - INGRESS_CANONICAL_ID_OFFSET + ENVELOPE_ROOT_LEN - 1];
+    let frame = encode_egress_record(Fixture::INDEX, short).unwrap();
+    assert!(matches!(
+        EgressItem::decode(&frame),
+        Err(WireError::TooShort { .. })
+    ));
 }
