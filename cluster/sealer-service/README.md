@@ -638,7 +638,7 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
 |---|---|
 | `GET /status` | Always 200 with the status JSON. |
 | `GET /ready` | 200 when the member is ready. 503 when it is not. The body is the status JSON. |
-| `GET /metrics` | 200 with the gauge `kardamom_sealer_disk_free_bytes{member_id}` in the Prometheus text format. |
+| `GET /metrics` | 200 with the gauge `kardamom_sealer_disk_free_bytes{member_id}`, the pipeline metrics of the service thread, the log positions and the Aeron counters of the member, in the Prometheus text format. See "Sealer pipeline" in [docs/observability.md](../../docs/observability.md). |
 | `GET /retained` | With `carryBytes`: 200 with one `<name> <size>` line for each segment below the published head. `size` counts only the bytes below that head. 403 without the token. Else 404. |
 | `GET /retained/<name>` | With `carryBytes`: 200 with the bytes of one segment below the published head. 403 without the token. 404 for a name that is not a served segment, or a segment that the purge deleted. |
 | any other path | 404 |

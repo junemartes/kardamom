@@ -88,6 +88,10 @@
       vars:
         exec_cursor: "{{ workloads_exec_cursor }}"
         checkpoint_log: "{{ workloads_checkpoint_log }}"
+    # The egress after the executors that it reads, before the readers
+    # after it: the notifier here, the validator and the batcher below.
+    # A healthy egress answers /health. It needs no executor up to start.
+    - {name: egress, deploy: "{{ workloads_egress }}"}
     - {name: state-mirror, wait: false}
     # The notifier taps the sequencers' and the ingress's status stream
     # and the executors' receipts; it needs none of them up to start.
@@ -95,6 +99,7 @@
   loop_control:
     loop_var: workloads_job
     label: "{{ workloads_job.name }}"
+  when: workloads_job.deploy | default(true) | bool
 
 - name: Deploy optional L1 light client
   ansible.builtin.include_tasks: job.yml

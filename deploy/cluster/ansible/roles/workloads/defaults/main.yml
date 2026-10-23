@@ -20,7 +20,9 @@ workloads_cert_identity: >-
   {{ lookup('env', 'KARDAMOM_CERT_IDENTITY_RE') |
      default('^https://github\.com/junemartes/kardamom/\.github/workflows/[^@]+@refs/', true) }}
 workloads_cert_issuer: "{{ lookup('env', 'KARDAMOM_CERT_OIDC_ISSUER') | default('https://token.actions.githubusercontent.com', true) }}"
-workloads_image_services: [aeron, cluster, redis, sequencer, ingress, executor, validator, da-watcher, batcher, state-mirror, notifier, canary]
+workloads_image_services: >-
+  {{ ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher', 'batcher',
+      'state-mirror', 'notifier', 'canary'] + (['egress'] if workloads_egress | bool else []) }}
 # The variables every job derives its placement and its peer lists from.
 # A job receives the ones its file declares (tasks/job.yml).
 # The Nomad node pool of a job, by job name: the pool id of an elastic
@@ -174,6 +176,48 @@ workloads_priority_fees: "{{ lookup('env', 'PRIORITY_FEES') }}"
 # The recorded cursor of the executors (nomad/executor.nomad.hcl): "on" or
 # "off". Empty keeps the job's "off" default.
 workloads_exec_cursor: "{{ lookup('env', 'KARDAMOM_EXEC_CURSOR') }}"
+# The egress (nomad/egress.nomad.hcl) and its readers. Every switch is
+# off by default, and with every switch off no job changes. Switch them on
+# in this order, one deploy each: the executors' frames, the egress, then
+# each reader. A reader switch needs the egress, and the egress needs the
+# frames; the preflight refuses another order.
+# KARDAMOM_EGRESS=1 deploys the egress job, after the executors.
+workloads_egress: "{{ lookup('env', 'KARDAMOM_EGRESS') | default('0', true) | bool }}"
+# The reader switches: "on" or "off". Empty keeps the job's default, off.
+# The executors' frames (nomad/executor.nomad.hcl, exec_frames).
+workloads_exec_frames: "{{ lookup('env', 'KARDAMOM_EXEC_FRAMES') }}"
+# The canonical stream of the validator and the batcher from the egress
+# (--egress). Switch them on only on a chain where the carry flag is
+# active.
+workloads_validator_egress: "{{ lookup('env', 'KARDAMOM_VALIDATOR_EGRESS') }}"
+workloads_batcher_egress: "{{ lookup('env', 'KARDAMOM_BATCHER_EGRESS') }}"
+# The receipts and their rows of the sequencers from egress_receipts.
+workloads_sequencer_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_SEQUENCER_RECEIPTS_FROM_EGRESS') }}"
+# eth_getTransactionReceipt of the ingress from the egress on a cache miss.
+workloads_ingress_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS') }}"
+# The receipts of the notifier from egress_receipts.
+workloads_notifier_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS') }}"
+# The readers reach the egress through its Consul service.
+workloads_egress_url: "http://kardamom-egress.service.{{ datacenter }}.consul:{{ ports.egress_http }}"
+# The job variables of the switches, by job. Every compile of a job takes
+# them (tasks/compile.yml), so a resize keeps them too. An empty value
+# keeps the job's default, off.
+workloads_egress_job_vars:
+  executor:
+    exec_frames: "{{ workloads_exec_frames }}"
+  validator:
+    egress_url: "{{ workloads_egress_url if workloads_validator_egress == 'on' else '' }}"
+  batcher:
+    egress_url: "{{ workloads_egress_url if workloads_batcher_egress == 'on' else '' }}"
+  sequencer:
+    receipts_from_egress: "{{ workloads_sequencer_receipts_from_egress }}"
+  ingress:
+    receipt_query_endpoints: "{{ workloads_egress_url if workloads_ingress_receipts_from_egress == 'on' else '' }}"
+  notifier:
+    receipts_from_egress: "{{ workloads_notifier_receipts_from_egress }}"
+  # Prometheus scrapes the egress only where it runs.
+  monitoring:
+    egress: "{{ 'on' if workloads_egress | bool else '' }}"
 # The block log of the checkpoints of the executors
 # (nomad/executor.nomad.hcl): "on" or "off". Empty keeps the job's "off"
 # default.

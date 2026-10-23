@@ -152,3 +152,29 @@ fn a_torn_frame_at_the_end_is_cut_at_open() {
     };
     assert_eq!(frames, [record(2)], "the torn bytes are gone");
 }
+
+/// A reset drops every frame and starts the store at the new head. A
+/// reader of an older cursor gets the new floor.
+#[test]
+fn a_reset_starts_the_store_at_the_new_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
+    store.append(&blocks(3)).unwrap();
+    let start = Head {
+        next_index: 40,
+        next_block: 21,
+        last: Some(Key::Boundary(20)),
+    };
+    store.reset(start).unwrap();
+    assert_eq!(store.head(), start);
+    store
+        .append(&[record(40), encode_egress_boundary(21, 41, 0, 0)])
+        .unwrap();
+    assert!(matches!(
+        store.read_from(0, 1, 1 << 20).unwrap(),
+        Range::Unavailable { floor } if floor == start
+    ));
+    store.sync().unwrap();
+    let reopened = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
+    assert_eq!(reopened.head().next_block, 22, "the reset is on disk");
+}

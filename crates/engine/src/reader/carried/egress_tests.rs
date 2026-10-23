@@ -37,6 +37,7 @@ fn egress(rt: &tokio::runtime::Runtime, dir: &std::path::Path, frames: &[Vec<u8>
     let cfg = OwnerConfig {
         sync_every: Duration::from_millis(10),
         keep_blocks: NonZeroU64::new(1_000).unwrap(),
+        join: kardamom_egress::owner::Join::FromPeer,
     };
     let parts = Parts {
         merge,
