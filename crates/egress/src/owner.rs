@@ -9,6 +9,17 @@
 //! The thread appends each delivered frame to the store, then publishes it
 //! live. It forces the store to disk on a fixed period, and deletes the
 //! segments below the retention after each sync.
+//!
+//! After a start, the copies of the executors chain only behind a frame
+//! that another source delivers (see [`crate::merge`]). The thread joins
+//! them in one of two ways:
+//! - with peers, the frames of a peer egress fill the place between the
+//!   head and the copies, in order. A peer whose floor is above the head
+//!   gives its floor as the new start;
+//! - with no peer, or when the peers do not fill the place in time, the
+//!   stream starts again after the next boundary of a copy. The store then
+//!   holds no frame before that boundary, and a reader of an older cursor
+//!   reads another instance.
 
 use std::num::NonZeroU64;
 use std::ops::ControlFlow;
@@ -21,13 +32,32 @@ use alloy_primitives::B256;
 use kardamom_log::aeron_live::ReceiptFrame;
 use kardamom_types::Receipt;
 
-use crate::merge::Merge;
+use crate::merge::{Head, Merge};
+use crate::metrics;
 use crate::receipts::Receipts;
 use crate::store::{Range, Store, StoreError};
 
 /// Where the delivered frames go live.
 pub trait FramePublisher: Send + 'static {
     fn publish(&self, frame: &[u8]);
+}
+
+/// How the owner joins the copies of the executors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Join {
+    /// The merge follows the copies.
+    Joined,
+    /// A peer egress fills the frames between the head and the copies.
+    FromPeer,
+    /// The stream starts again after the next boundary of a copy.
+    AtBoundary,
+}
+
+/// Where the stream stands for the task that reads a peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JoinState {
+    pub head: Head,
+    pub joined: bool,
 }
 
 /// One input of the owner thread.
@@ -44,6 +74,15 @@ pub enum Input {
         tx_hash: B256,
         reply: oneshot::Sender<(Option<Receipt>, u64)>,
     },
+    /// Frames of a peer egress, in order, from the head of this one.
+    Caught(Vec<Vec<u8>>),
+    /// The floor of a peer egress, above the head of this one: no peer
+    /// holds the frames below it.
+    Floor(Head),
+    /// No peer filled the place in time: start again after a boundary.
+    GiveUp,
+    /// Where the stream stands, for the task that reads a peer.
+    State(oneshot::Sender<JoinState>),
 }
 
 /// A range read: the frames after the cursor, up to about `limit` bytes.
@@ -61,6 +100,9 @@ pub struct OwnerConfig {
     pub sync_every: Duration,
     /// The blocks the store keeps below its head.
     pub keep_blocks: NonZeroU64,
+    /// How the owner joins the copies at the start: [`Join::FromPeer`]
+    /// with peers, [`Join::AtBoundary`] with none.
+    pub join: Join,
 }
 
 /// What the owner thread owns.
@@ -80,12 +122,14 @@ pub struct Owner<P: FramePublisher> {
     parts: Parts<P>,
     delivered: Vec<Vec<u8>>,
     synced_at: Instant,
+    join: Join,
 }
 
 impl<P: FramePublisher> Owner<P> {
     #[must_use]
     pub fn new(cfg: OwnerConfig, parts: Parts<P>) -> Self {
         Self {
+            join: cfg.join,
             cfg,
             parts,
             delivered: Vec::new(),
@@ -149,15 +193,107 @@ impl<P: FramePublisher> Owner<P> {
                 let _ = reply.send((receipts.receipt(&tx_hash).cloned(), receipts.block()));
                 Ok(())
             }
+            Input::Caught(frames) => self.take_caught(&frames),
+            Input::Floor(floor) => self.start_at_floor(floor),
+            Input::GiveUp => {
+                self.give_up();
+                Ok(())
+            }
+            Input::State(reply) => {
+                let _ = reply.send(JoinState {
+                    head: self.parts.merge.head(),
+                    joined: self.join == Join::Joined,
+                });
+                Ok(())
+            }
         }
     }
 
+    /// Merge one message of a copy. Before the join with no peer, a
+    /// boundary of a copy at or after the head starts the stream again.
     fn take(&mut self, session: i32, message: &[u8]) -> Result<(), StoreError> {
         self.parts.merge.take(session, message, &mut self.delivered);
+        self.note_join();
+        if self.join == Join::AtBoundary {
+            self.start_after_boundary(message)?;
+        }
+        self.flush()
+    }
+
+    /// Merge the frames of a peer, in order.
+    fn take_caught(&mut self, frames: &[Vec<u8>]) -> Result<(), StoreError> {
+        metrics::count_caught(frames.len());
+        for frame in frames {
+            self.parts.merge.take_ordered(frame, &mut self.delivered);
+        }
+        self.note_join();
+        self.flush()
+    }
+
+    /// Append the delivered frames to the store, then publish them live.
+    fn flush(&mut self) -> Result<(), StoreError> {
         self.parts.store.append(&self.delivered)?;
         self.delivered
             .drain(..)
             .for_each(|frame| self.parts.live.publish(&frame));
+        Ok(())
+    }
+
+    fn note_join(&mut self) {
+        if self.join != Join::Joined && self.parts.merge.joined() {
+            tracing::info!(head = ?self.parts.merge.head(), "egress: joined the copies of the executors");
+            self.join = Join::Joined;
+        }
+    }
+
+    fn give_up(&mut self) {
+        if self.join == Join::FromPeer {
+            tracing::warn!(
+                head = ?self.parts.merge.head(),
+                "egress: no peer filled the place in time; the stream starts again after the next boundary"
+            );
+            self.join = Join::AtBoundary;
+        }
+    }
+
+    /// Start the stream again after the boundary in `message`, when it is
+    /// at or after the head.
+    fn start_after_boundary(&mut self, message: &[u8]) -> Result<(), StoreError> {
+        let next_block = self.parts.merge.head().next_block;
+        let Some(start) = message
+            .get(8..)
+            .and_then(Head::after_boundary)
+            .filter(|start| start.next_block > next_block)
+        else {
+            return Ok(());
+        };
+        tracing::warn!(
+            ?start,
+            "egress: the stream starts again after a boundary of a copy"
+        );
+        metrics::count_rebased("boundary");
+        self.rebase(start)?;
+        self.join = Join::Joined;
+        Ok(())
+    }
+
+    /// Start the stream again at the floor of a peer, when it is above the
+    /// head and the copies did not join yet.
+    fn start_at_floor(&mut self, floor: Head) -> Result<(), StoreError> {
+        if self.join == Join::Joined || floor.next_block <= self.parts.merge.head().next_block {
+            return Ok(());
+        }
+        tracing::warn!(
+            ?floor,
+            "egress: the floor of a peer is above the head; the stream starts there"
+        );
+        metrics::count_rebased("peer-floor");
+        self.rebase(floor)
+    }
+
+    fn rebase(&mut self, start: Head) -> Result<(), StoreError> {
+        self.parts.store.reset(start)?;
+        self.parts.merge.rebase(start);
         Ok(())
     }
 
