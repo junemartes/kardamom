@@ -67,7 +67,13 @@ pub enum DriverEvent {
     },
     /// An application payload arrived on egress (the inner bytes of a
     /// `SessionMessageHeader`).
-    AppMessage(Vec<u8>),
+    AppMessage {
+        payload: Vec<u8>,
+        /// The `timestamp` of the header: the cluster time at which the
+        /// leader sent the message. The unit is the cluster time unit of
+        /// the service, milliseconds by default.
+        timestamp: i64,
+    },
     /// The session failed: authentication was rejected, an error occurred,
     /// or it was closed.
     Failed(String),
@@ -296,7 +302,10 @@ impl SessionDriver {
             SessionState::Connected {
                 cluster_session_id, ..
             } if cluster_session_id == m.cluster_session_id => {
-                vec![DriverEvent::AppMessage(m.payload.to_vec())]
+                vec![DriverEvent::AppMessage {
+                    payload: m.payload.to_vec(),
+                    timestamp: m.timestamp,
+                }]
             }
             _ => Vec::new(),
         }

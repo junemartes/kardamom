@@ -12,6 +12,7 @@ use kardamom_log::aeron_live::{AeronRuntime, IdleBackoff, PubHandle, RawFrame};
 use kardamom_types::cluster_status::SilenceDeadline;
 
 use super::endpoints::{now_ms, now_ms_i64, open_leader_pub, open_next_member_pub, to_aligned};
+use super::meters::{Depths, SessionMeters};
 use super::{LiveClusterConfig, OfferReq, ReplayOnConnect};
 use crate::gateway::OfferOutcome;
 use crate::wire::{
@@ -311,6 +312,7 @@ struct SessionLoop {
     // on 100ms-plus scales. Profiling showed the fixed 1ms wake cost
     // about 8% of the sequencer's CPU while quiet.
     backoff: IdleBackoff,
+    meters: SessionMeters,
 }
 
 /// Run the session duty cycle until `stop`. This is the thin entry
@@ -335,16 +337,7 @@ pub(super) fn run_session(
         seams,
     );
     while !s.stop.load(Ordering::SeqCst) {
-        // Whether this iteration moved anything (egress frames, offers, or
-        // driver outbound frames). This drives the idle backoff.
-        let mut worked = s.drain_egress();
-        s.watchdog();
-        s.send_subscribe();
-        s.send_replay();
-        let now = now_ms();
-        worked |= s.pump_outbound(now);
-        worked |= s.handle_offers(now);
-        s.idle_wait(worked);
+        s.cycle();
     }
     s.close_on_shutdown();
 }
@@ -388,6 +381,31 @@ impl SessionLoop {
             subscribe_confirmed: false,
             egress_alive: true,
             backoff: IdleBackoff::new(Duration::from_millis(1), Duration::from_millis(5), 5),
+            meters: SessionMeters::new(subscribe),
+        }
+    }
+
+    /// One duty cycle: the duties, then the idle wait.
+    fn cycle(&mut self) {
+        // Whether this iteration moved anything (egress frames, offers, or
+        // driver outbound frames). This drives the idle backoff.
+        let mut worked = self.drain_egress();
+        self.watchdog();
+        self.send_subscribe();
+        self.send_replay();
+        let now = now_ms();
+        worked |= self.pump_outbound(now);
+        worked |= self.handle_offers(now);
+        self.meters.duties_done(worked, &self.depths());
+        self.idle_wait(worked);
+        self.meters.waited();
+    }
+
+    /// The depths of the seams whose other end is still there.
+    fn depths(&self) -> Depths {
+        Depths {
+            requests: (!self.req_rx_dead).then(|| self.req_rx.len()),
+            egress_out: self.egress_alive.then(|| self.out_tx.len()),
         }
     }
 
@@ -399,6 +417,7 @@ impl SessionLoop {
             worked = true;
             self.on_egress_frame(&frame);
         }
+        self.meters.drain_done();
         worked
     }
 
@@ -422,7 +441,10 @@ impl SessionLoop {
 
     fn on_driver_event(&mut self, ev: DriverEvent) {
         match ev {
-            DriverEvent::AppMessage(payload) => self.on_app_message(payload),
+            DriverEvent::AppMessage { payload, timestamp } => {
+                self.meters.note_egress(timestamp);
+                self.on_app_message(payload);
+            }
             DriverEvent::Reconnect {
                 leader_member_id,
                 ingress_endpoints,
@@ -678,6 +700,7 @@ impl SessionLoop {
     /// publish the payload, then reply with the outcome.
     fn handle_one_offer(&mut self, req: OfferReq, now: u64) {
         let OfferReq { payload, reply } = req;
+        let started = Instant::now();
         let outcome = match self.driver.wrap_app(payload.as_bytes(), now_ms_i64(now)) {
             Some(framed) => match self.ingress.publish_bytes(to_aligned(&framed)) {
                 Ok(_) => OfferOutcome::Accepted,
@@ -685,6 +708,7 @@ impl SessionLoop {
             },
             None => OfferOutcome::NotConnected,
         };
+        self.meters.offered(started);
         let _ = reply.send(outcome);
     }
 

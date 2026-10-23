@@ -75,10 +75,22 @@ Every service that drives a cluster session exports the state of that session un
 | `kardamom_cluster_client_leader_member_id` | The leader that the ingress publication points at. |
 | `kardamom_cluster_client_leader_changes_total` | Redirects and new-leader events. |
 | `kardamom_cluster_client_sessions_total` | Sessions opened. |
+| `kardamom_cluster_client_egress_age_seconds` | A histogram. For each drain of egress frames, the age of the oldest app message: the clock of this host minus the timestamp that the leader wrote in the message header. |
 
 - A leader change rate above zero in steady state is an election.
 - A client that stays disconnected finds no member that answers.
 - These series observe the Raft set from its clients, not from inside the JVM.
+- The egress age has a resolution of 1 ms. It includes the clock offset between the two hosts. A leader clock ahead of this host gives zero age.
+
+The session thread records these pipeline names (see "Pipeline metrics"):
+
+| Kind | Name | Meaning |
+| --- | --- | --- |
+| loop | `cluster_client.session` | The duty cycle of a session that publishes. A cycle that moves frames or offers is busy. A cycle that finds nothing, and the wait after it, are idle. |
+| loop | `cluster_client.stream_session` | The same loop for a session that subscribes to the canonical stream. A process can drive one session of each kind. |
+| step | `cluster_client.offer` | One offer request: the wrap and the publish of its payload. |
+| queue | `cluster_client.requests` | The offer requests that wait. Only a session with an ingress seam sets it. |
+| queue | `cluster_client.egress_out` | The egress payloads that wait for the consumer. The stream session uses `cluster_client.stream_egress_out`. |
 
 ### Host and agent metrics
 
@@ -506,6 +518,25 @@ The epoch lane exports these metrics. See "Sequencer" in [failure-modes.md](fail
 | `kardamom_sequencer_l1_origin` | The highest L1 origin that a boundary carried: the last L1 block whose epoch the sealer ordered. The sealer accepts the epoch of the next block only. An operator resumes the da-watcher after this block. |
 | `kardamom_sequencer_epochs_unconfirmed` | The epochs that the lane relayed, or took to relay, and that no boundary confirmed yet. The lane holds at most 4096. |
 | `kardamom_sequencer_origin_gap_total` | The `ORIGIN_GAP` rejects that the sealer sent to this replica. Each one makes the lane offer its unconfirmed epochs again from the expected block. |
+
+The sequencer records these pipeline names (see "Pipeline metrics"). The v1 and the v2 loop record the same names.
+Each lane is its own process on its own metrics port, so the scrape target tells the lanes apart.
+
+| Kind | Name | Meaning |
+| --- | --- | --- |
+| loop | `sequencer.main` | The publish loop. A pass that did work is busy. A pass that found no input is idle. A pass that the sealer back-pressured is blocked. The wait after a pass counts in the state of the pass. |
+| loop | `sequencer.egress_feed` | The egress-watermark feed. It is idle while it waits for an egress frame. |
+| loop | `sequencer.receipt_feed` | The `tx_receipts` floor feed. It is blocked while the account rows wait for room in the queue of the v2 loop. |
+| step | `sequencer.offer_round_trip` | One offer to the sealer: the request to the session thread, the Aeron publish there, and the reply. The publish loop waits for all of it. |
+| step | `sequencer.tx_errors_publish` | One `tx_errors` publish. The publish loop waits for it for each refused transaction. |
+| step | `sequencer.account_lookup` | One lookup of a sender's state. The v2 loop times each lookup. The v1 loop times each query to Redis or the executors, and not the answers from the local account layer. |
+| batch | `sequencer.offer_refs` | The refs that one offer took. The v1 loop offers at most 13. The v2 loop offers its outbox up to 64 KiB of entries. |
+| queue | `sequencer.tx_data` | The envelopes that wait in the `tx_data` lanes. |
+| queue | `sequencer.outbox` | The v2 offers that wait for the sealer. The loop stops its intake at `outbox_cap`. |
+| queue | `sequencer.accounts` | The v2 account events that wait: rows, lookup answers and rollbacks. The queue holds 65,536. |
+
+- The loop sets its queue gauges once in 64 passes.
+- `kardamom_sequencer_nonce_check_duration_seconds` is the nonce state machine in the v1 loop, and the admission filter in the v2 loop.
 
 ### Ingress cluster status
 
