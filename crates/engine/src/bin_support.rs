@@ -364,11 +364,13 @@ pub type LiveTxOrderingSub = crate::reader::cluster::ClusterTxOrderingSubscripti
     kardamom_cluster_adapter::LiveIngress,
 >;
 
-/// The live canonical stream with its bytes: the member feed, and no
-/// second source.
+/// The live canonical stream with its bytes: the member feed, then the
+/// egress when a setting names one. A cursor below the replay window of
+/// the member reads the egress from the cursor, and the reader goes back
+/// to the feed once the feed serves the cursor again.
 pub type LiveCarriedSub = crate::reader::carried::CarriedSubscription<
     crate::reader::carried::AeronFeed,
-    crate::reader::carried::NoSource,
+    Option<crate::reader::carried::EgressTransport>,
 >;
 
 /// The guard of a cluster session: the session lives while the guard does.
@@ -413,9 +415,8 @@ impl crate::TxOrderingSubscription for LiveOrdering {
     }
 }
 
-/// Open the egress at `base` (`http://host:port`) from `cursor`: its range
-/// reads on the current Tokio runtime, and its live `egress_order` frames
-/// through `plane`. A thread moves the live frames to the reader.
+/// Open the egress at `base` (`http://host:port`) from `cursor`. See
+/// [`open_egress_transport`].
 ///
 /// # Errors
 ///
@@ -426,7 +427,24 @@ pub fn open_egress(
     base: String,
     cursor: crate::reader::cluster::ReplayCursor,
 ) -> Result<LiveEgressSub> {
-    use crate::reader::carried::{CarriedSubscription, EgressTransport, NoSource};
+    use crate::reader::carried::{CarriedSubscription, NoSource};
+    let transport = open_egress_transport(rt, plane, base)?;
+    Ok(CarriedSubscription::new(transport, NoSource, cursor))
+}
+
+/// Open one source of the egress at `base` (`http://host:port`): its range
+/// reads on the current Tokio runtime, and its live `egress_order` frames
+/// through `plane`. A thread moves the live frames to the reader. The
+/// thread ends when `rt` ends or the transport goes.
+///
+/// # Errors
+///
+/// Returns `Err` when the live subscription does not open.
+pub fn open_egress_transport(
+    rt: &AeronRuntime,
+    plane: &mut kardamom_log::discovery::StreamPlane,
+    base: String,
+) -> Result<crate::reader::carried::EgressTransport> {
     let mut frames = plane
         .egress_order_subscription(rt)
         .context("open egress_order")?;
@@ -438,32 +456,44 @@ pub fn open_egress(
                 .try_for_each(|frame| live_tx.send(frame.bytes));
         })
         .context("spawn the egress-live thread")?;
-    let transport = EgressTransport::new(base, live, tokio::runtime::Handle::current());
-    Ok(CarriedSubscription::new(transport, NoSource, cursor))
+    Ok(crate::reader::carried::EgressTransport::new(
+        base,
+        live,
+        tokio::runtime::Handle::current(),
+    ))
 }
 
-/// Open the member feed on a dedicated Aeron runtime on `aeron_dir`, the
-/// media driver that the executor shares with its member, and read it from
-/// `cursor`. With a committed `history`, the reader first compares the
-/// stream with it, from the floor of the history to `cursor`. The feed
-/// reads as closed once `stop` is cancelled.
+/// What [`open_member_feed`] opens the reader of the member feed with.
+pub struct MemberFeed<'a> {
+    /// The media driver that the executor shares with its member.
+    pub aeron_dir: Option<&'a Path>,
+    pub cursor: crate::reader::cluster::ReplayCursor,
+    /// The committed history that the reader compares the stream with
+    /// first, from the floor of the history to `cursor`.
+    pub history: Option<crate::reader::carried::LocalHistory>,
+    /// The second source: the egress, for a cursor below the replay window
+    /// of the member.
+    pub egress: Option<crate::reader::carried::EgressTransport>,
+    /// The feed reads as closed once this token is cancelled.
+    pub stop: tokio_util::sync::CancellationToken,
+}
+
+/// Open the member feed on a dedicated Aeron runtime on the media driver
+/// at `aeron_dir`, and read it from `cursor`, with `egress` as the second
+/// source. With a committed `history`, the reader first compares the
+/// stream with it.
 ///
 /// # Errors
 ///
 /// Returns `Err` when the runtime fails to spawn, or the feed streams fail
 /// to open.
-pub fn open_member_feed(
-    aeron_dir: Option<&Path>,
-    cursor: crate::reader::cluster::ReplayCursor,
-    history: Option<crate::reader::carried::LocalHistory>,
-    stop: tokio_util::sync::CancellationToken,
-) -> Result<LiveCarriedSub> {
-    use crate::reader::carried::{AeronFeed, CarriedSubscription, NoSource};
-    let rt = AeronRuntime::spawn(aeron_dir).context("spawn the member feed AeronRuntime")?;
-    let feed = AeronFeed::open(rt, stop).context("open the member feed")?;
-    Ok(match history {
-        Some(history) => CarriedSubscription::compared(feed, NoSource, history),
-        None => CarriedSubscription::new(feed, NoSource, cursor),
+pub fn open_member_feed(cfg: MemberFeed<'_>) -> Result<LiveCarriedSub> {
+    use crate::reader::carried::{AeronFeed, CarriedSubscription};
+    let rt = AeronRuntime::spawn(cfg.aeron_dir).context("spawn the member feed AeronRuntime")?;
+    let feed = AeronFeed::open(rt, cfg.stop).context("open the member feed")?;
+    Ok(match cfg.history {
+        Some(history) => CarriedSubscription::compared(feed, cfg.egress, history),
+        None => CarriedSubscription::new(feed, cfg.egress, cfg.cursor),
     })
 }
 

@@ -8,7 +8,11 @@
 //!
 //! The thread appends each delivered frame to the store, then publishes it
 //! live. It forces the store to disk on a fixed period, and deletes the
-//! segments below the retention after each sync.
+//! segments below the retention after each sync. After each sync it also
+//! sets the distance of the stored head from the newest record that any
+//! executor copy sent. The sealer keeps only its replay window, so a
+//! reader below the window recovers from this store, and the distance
+//! must stay well inside the window.
 //!
 //! After a start, the copies of the executors chain only behind a frame
 //! that another source delivers (see [`crate::merge`]). The thread joins
@@ -318,6 +322,7 @@ impl<P: FramePublisher> Owner<P> {
         }
         self.parts.store.sync()?;
         self.synced_at = Instant::now();
+        self.show_distance();
         let floor = self
             .parts
             .store
@@ -325,6 +330,21 @@ impl<P: FramePublisher> Owner<P> {
             .next_block
             .saturating_sub(self.cfg.keep_blocks.get());
         self.parts.store.prune_below(floor)
+    }
+
+    /// The canonical indexes between the stored head and the newest record
+    /// that any copy sent. A copy behind the stored head counts 0, so the
+    /// subtraction saturates.
+    #[must_use]
+    pub fn distance(&self) -> u64 {
+        self.parts
+            .merge
+            .seen()
+            .saturating_sub(self.parts.store.head().next_index)
+    }
+
+    fn show_distance(&self) {
+        crate::metrics::set_head_distance(self.distance());
     }
 }
 

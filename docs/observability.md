@@ -366,6 +366,12 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
 - `kardamom_egress_caught_frames_total` counts the frames that a peer egress gave after a start, to fill the place between the head and the executor copies.
 - `kardamom_egress_rebased_total{reason}` counts the times that the egress started its stream again: after a boundary of a copy with no peer (`boundary`), or at the floor of a peer above its head (`peer-floor`). After a `boundary` start, the store holds no frame before that boundary, and a reader of an older cursor reads another instance.
 - `kardamom_executor_egress_frames_dropped_total` counts the canonical frames that the reader did not forward on `exec_frames`, because the queue to the publication was full.
+
+`kardamom_egress_head_distance_frames` is a gauge of each egress instance. It gives the canonical indexes between the stored head and the newest record that any executor copy sent. The egress sets it after each sync of its store.
+
+- The sealer keeps only its replay window. A reader below the window recovers from the store of the egress, so the distance must stay well inside the window.
+- The egress does not see the sealed head. The distance does not include the lag of every executor behind the sealer.
+- `KardamomEgressHeadNearWindow` in `deploy/alerts.yml` fires when the distance stays above 32,768 for 1 minute: half the default window of 65,536 frames.
   - `peer-checkpoint`: the node fell behind the retention window and repaired itself from a peer checkpoint.
   - `unrecoverable`: the node could not repair itself and waits for an operator.
   - See "Replay-window overrun" in [failure-modes.md](failure-modes.md).
@@ -481,9 +487,16 @@ With `--carry-bytes` (`KARDAMOM_CARRY_BYTES`, off by default), the executor read
 - Switch it on only with sealer members that carry the bytes and run the member feed.
 - Off: the executor joins the references of the cluster egress with `tx_data`.
 
+With `--carry-bytes`, `--egress <url>` (`KARDAMOM_EGRESS_URL`, off by default) makes the egress the second source of the executor.
+
+- A cursor below the replay window of the member reads the range read of the egress from the cursor to the head of the store. Then the executor reads the live `egress_order`.
+- The executor goes back to the feed by the same rule as from the serving service.
+- A cursor below the floor of the egress store too stages a peer checkpoint (`kardamom_executor_resync_total`).
+- Off: a cursor below the window stages a peer checkpoint at once.
+
 | Metric | Meaning |
 | --- | --- |
-| `kardamom_executor_input_source{source}` | 1 for the source that the executor reads, 0 for the other. `source` is `feed` (the member feed) or `service` (the serving service). |
+| `kardamom_executor_input_source{source}` | 1 for the source that the executor reads, 0 for the other. `source` is `feed` (the member feed) or `service` (the serving service, or the egress with `--egress`). |
 | `kardamom_executor_source_mismatch_total{source}` | Canonical entries whose `keccak256(raw_tx)` is not the canonical id, by the source that sent them. The executor does not execute such an entry and does not stop: it leaves the source and reads the same index from the other source. |
 
 - The executor leaves the feed when no frame comes for 6 s, when the feed loses its image, or on a mismatch. It goes back to the feed after the feed has one image for 30 s and a replay of the feed from its cursor reaches `REPLAY_DONE`.
@@ -691,6 +704,8 @@ the replay retention of the sealer, and the record-lag guard. See [l1-data-path.
 | `kardamom_ingress_cluster_record_lag` | The canonical records past the best recorded cursor when the status frame arrived. The record-lag guard compares this value with its budget. `0` while no executor sent a cursor, because the guard then refuses nothing. |
 | `kardamom_ingress_tx_rejected_total{reason="paused"}` | Submits that a paused ingress refused. |
 | `kardamom_ingress_tx_rejected_total{reason="too-large"}` | Submits above the size cap, `--max-tx-bytes`. |
+| `kardamom_ingress_tx_rejected_total{reason="nonce-too-low"}` | With `--ack validated`, submits with a nonce below the account view of the sender. |
+| `kardamom_ingress_tx_rejected_total{reason="txpool-full"}` | With `--ack validated`, submits whose `tx_data` offer failed. |
 | `kardamom_ingress_seal_latency_seconds` | A histogram: the time from the `tx_data` publish of a transaction to the egress frame that gives it a canonical index. Only the ingress that published the transaction records it. A seal later than 180 s gives no sample. The buckets are the shared service buckets of 100 µs to 5 s. Above 10 ms their bounds are 25, 50, 100, 250 and 500 ms, then 1, 2.5 and 5 s. |
 | `kardamom_ingress_seal_stamps_expired_total` | The publish stamps that no seal matched within 180 s. Most are of refused transactions. A non-zero rate under load means that the seal latency histogram undercounts the tail. |
 | `kardamom_ingress_seal_stamps_dropped_total` | The publish stamps that the submit path dropped because the channel to the seal clock (65,536 stamps) was full. Each one is a seal with no latency sample. |
