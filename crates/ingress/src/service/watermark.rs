@@ -10,6 +10,7 @@ use crate::cluster::{ClusterWatermarkObserver, EgressProgress, Observed};
 use crate::stage_latency::StageClock;
 use kardamom_cluster_adapter::{LiveCluster, LiveEgress};
 use kardamom_log::aeron_live::TxStatusPublisherHandle;
+use kardamom_obs::pipeline::{LoopMeter, LoopState};
 use kardamom_types::{ClusterStatus, QuorumWatermark, TxStatus};
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -27,6 +28,9 @@ pub(crate) struct ClusterWatermarkPump {
     cluster_status: watch::Sender<ClusterStatus>,
     status: TxStatusPublisherHandle,
     stop: CancellationToken,
+    /// Idle while the thread waits for an egress event (the receive and
+    /// the decode), busy while it handles one.
+    meter: LoopMeter,
 }
 
 /// A running watermark thread: the guard that cancels its stop token,
@@ -62,6 +66,7 @@ impl ClusterWatermarkPump {
             cluster_status,
             status,
             stop: CancellationToken::new(),
+            meter: LoopMeter::new("ingress.watermark"),
         }
     }
 
@@ -96,13 +101,16 @@ impl ClusterWatermarkPump {
         if self.stop.is_cancelled() {
             return ControlFlow::Break(());
         }
-        match self.observer.next_event() {
+        let event = self.observer.next_event();
+        self.meter.mark(LoopState::Idle);
+        match event {
             None => return ControlFlow::Break(()),
             Some(Observed::Progress(progress)) => self.forward_progress(progress),
             Some(Observed::Status(status)) => {
                 self.cluster_status.send_replace(status);
             }
         }
+        self.meter.mark(LoopState::Busy);
         ControlFlow::Continue(())
     }
 

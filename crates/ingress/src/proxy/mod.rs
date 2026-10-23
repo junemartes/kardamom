@@ -40,6 +40,7 @@ use crate::pending::PendingReceipts;
 use crate::rate_limit::PerIpLimiter;
 use crate::receipt_cache::ReceiptCache;
 use crate::sig_verify::BatchVerifier;
+use crate::submit_steps::SubmitSteps;
 use crate::tx_error_dedup::TxErrorDedup;
 
 /// One stream watcher's per-item step. Each watcher in `watchers` holds
@@ -201,6 +202,8 @@ where
     /// The sealer's lifecycle as this ingress observes it. The binary
     /// publishes it on the `events` stream.
     pub(crate) sealer: SealerLifecycle,
+    /// The step times of the submit path.
+    pub(crate) steps: SubmitSteps,
 }
 
 /// Capacity of the deduped receipt and error re-broadcast feeds. A
@@ -244,6 +247,7 @@ where
             draining: self.draining.clone(),
             cluster_status: self.cluster_status.clone(),
             sealer: self.sealer.clone(),
+            steps: self.steps.clone(),
         }
     }
 }
@@ -310,6 +314,7 @@ where
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cluster_status,
             sealer: Arc::new(Lifecycle::new(Some(crate::chain::SEALER))),
+            steps: SubmitSteps::new(),
         };
         me.spawn_tx_receipts_watcher(applied_tx);
         me.spawn_tx_errors_watcher();

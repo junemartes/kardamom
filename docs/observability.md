@@ -533,6 +533,40 @@ the replay retention of the sealer, and the record-lag guard. See [l1-data-path.
 - The sealed head minus the posted head is the DA lag. The sealer refuses new transactions when it passes the DA-lag budget.
 - The record lag is the canonical count minus the best recorded cursor plus one. The ingress takes the count from the records and boundaries that it observed before the status frame. The sealer refuses user transactions when the record lag passes `recordLagBudget`. A flat recorded head while the lag grows means that no executor records.
 
+### Ingress pipeline
+
+The ingress records these names of the pipeline metrics (see "Pipeline metrics"). A submit records its steps once for each request.
+
+| Name | Metric | Meaning |
+| --- | --- | --- |
+| `ingress.submit` | step | The whole submit on the server, from the call to the answer, on each return path. With the receipt wait (no ack at admission), it includes the wait for the receipt. |
+| `ingress.validate` | step | The shared head of the submit: the shed, drain, pause and rate checks, the decode, and the sender recovery. It includes `ingress.recover`. |
+| `ingress.recover` | step | The sender recovery of one submit: the wait for a slot in the verifier intake, the batch window, and the recovery. |
+| `ingress.publish_round_trip` | step | The `tx_data` publish: the hop to the blocking pool and the round trip to the Aeron thread up to its ack. |
+| `ingress.recover_batch` | step | The recovery of one verifier batch on the blocking pool, up to the end of its last worker. |
+| `ingress.recover_batch` | batch | The requests in each verifier batch. |
+| `ingress.recover_intake` | queue | The requests that wait in the verifier intake after the flush task takes a batch. The intake holds four times the batch depth; a full intake makes a submit wait. |
+| `ingress.ack_waiters` | queue | The submissions that wait for the verdict of the sequencer (ack at admission). The shed check counts them with `kardamom_ingress_queue_depth`. |
+| `ingress.watermark` | loop | The cluster egress thread. Idle while it waits for an egress event (the receive and the decode), busy while it handles the event. |
+| `ingress.receipt_pump` | loop | The `tx_receipts` pump task. Idle while it waits for a frame, busy while it applies the rows and fans out the receipts. |
+| `ingress.receipt_batch` | batch | The receipts in each `tx_receipts` batch frame. A boundary-only frame adds no sample. |
+
+- A high `ingress.recover` with a low `ingress.recover_batch` step means that submits wait for the intake or the batch window, not for the recovery.
+- A busy share of `ingress.watermark` near 1 means that the egress frames queue in the cluster client before the thread reads them.
+
+### Aeron thread
+
+Each process has one Aeron thread. It carries the publishes and the subscriptions of every service in the process. The `service` label tells the processes apart.
+
+| Name | Metric | Meaning |
+| --- | --- | --- |
+| `log.aeron` | loop | One pass: the drain of the command queue, one retry of each queued publish, and one poll of each subscription. Busy when the pass handled a command or polled a fragment. Blocked when the pass did no work and a refused offer waits in the retry queue. Idle otherwise. The wait for the next command is blocked while a refused offer waits, idle otherwise. |
+| `log.aeron_commands` | queue | The commands that wait for the thread at the start of a pass: publishes, opens and closes from all callers. |
+| `log.aeron_pending` | queue | The publishes in the retry queue after a pass: offers that Aeron refused, and the frames behind them on the same publication. |
+
+- `kardamom_log_offer_retries_total` counts the offers that Aeron refused with a transient status (`BACK_PRESSURED`, `NOT_CONNECTED`, `ADMIN_ACTION`) and that stay queued for the next pass. A pass counts at most one refusal for each publication.
+- A frame that stays refused until its deadline fails. A best-effort frame then counts in `kardamom_log_best_effort_dropped_total`.
+
 ### Receipt cache and lookups
 
 `kardamom_cache_lookups_total{layer,outcome}` counts the cache lookups.
