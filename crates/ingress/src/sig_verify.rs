@@ -105,10 +105,8 @@ impl RequestCursor {
 ///
 /// A batch smaller than this threshold is recovered on a single blocking
 /// thread. Each extra worker costs a wake of a pool thread, and on a
-/// shared 4-vCPU node a wake costs about as much as several recoveries
-/// (staging, 2026-10-23: a batch of about 5 split over 4 workers took
-/// 0.54 ms for 0.21 ms of work). 16 recoveries are about 0.7 ms of work,
-/// enough to pay for the wakes. At deployed rates, the ring almost always
+/// shared 4-vCPU node a wake costs about as much as several recoveries.
+/// 16 recoveries are about 0.7 ms of work, enough to pay for the wakes. At deployed rates, the ring almost always
 /// holds one transaction (a 50µs window at 3.8k tx/s sees 0.2 arrivals on
 /// average), so this is the common path.
 const PARALLEL_THRESHOLD: usize = 16;
