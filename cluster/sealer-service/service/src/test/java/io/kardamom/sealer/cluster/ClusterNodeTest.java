@@ -61,6 +61,21 @@ final class ClusterNodeTest {
     }
 
     @Test
+    void theDriverThreadingModeIsSharedByDefaultAndRefusesAnUnknownMode() {
+        final String key = "kardamom.cluster.driverThreadingMode";
+        try {
+            System.clearProperty(key);
+            assertEquals(io.aeron.driver.ThreadingMode.SHARED, ClusterNode.driverThreadingMode());
+            System.setProperty(key, "DEDICATED");
+            assertEquals(io.aeron.driver.ThreadingMode.DEDICATED, ClusterNode.driverThreadingMode());
+            System.setProperty(key, "INVOKER");
+            assertThrows(IllegalArgumentException.class, ClusterNode::driverThreadingMode);
+        } finally {
+            System.clearProperty(key);
+        }
+    }
+
+    @Test
     void memberEndpointsReturnsTheFiveEndpointsForEachId() {
         assertArrayEquals(
             new String[] {

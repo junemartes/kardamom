@@ -901,6 +901,18 @@ class DeployTest(Deploys):
             template = self.genesis_template(plans[name]).encode()
             self.assertEqual(hashlib.sha256(template).hexdigest(), STAGING_GENESIS_SHA256, name)
 
+    def test_the_driver_threading_modes_default_shared_and_reach_the_drivers(self):
+        for mode in ('', 'DEDICATED'):
+            with self.subTest(mode=mode):
+                self.run_deploy({'workloads_aeron_threading_mode': mode,
+                                 'workloads_cluster_driver_threading_mode': mode}, check=True)
+                plans = self.api.state['plans']
+                expected = mode or 'SHARED'
+                aeron = plans['aeron']['TaskGroups'][0]['Tasks'][0]['Env']
+                self.assertEqual(aeron['AERON_THREADING_MODE'], expected)
+                cluster = plans['cluster']['TaskGroups'][0]['Tasks'][0]['Env']['JAVA_TOOL_OPTIONS'].split()
+                self.assertIn(f'-Dkardamom.cluster.driverThreadingMode={expected}', cluster)
+
     def test_the_exec_cursor_switch_defaults_off_and_reaches_the_executor(self):
         for switch, expected in (('', 'false'), ('on', 'true')):
             with self.subTest(switch=switch):

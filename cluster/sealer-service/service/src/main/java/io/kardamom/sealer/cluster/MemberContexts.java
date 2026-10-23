@@ -9,7 +9,6 @@ import io.aeron.cluster.ClusterBackup;
 import io.aeron.cluster.ClusterBackup.Configuration.ReplayStart;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.NameResolver;
-import io.aeron.driver.ThreadingMode;
 import java.io.File;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
@@ -160,8 +159,14 @@ final class MemberContexts {
     MediaDriver.Context driver() {
         return new MediaDriver.Context()
             .aeronDirectoryName(aeronDir)
-            .threadingMode(ThreadingMode.SHARED)
+            .threadingMode(ClusterNode.driverThreadingMode())
+            // Each mode reads the strategies of its own threads; the
+            // others stay unused.
             .sharedIdleStrategy(idleCap.strategy())
+            .sharedNetworkIdleStrategy(idleCap.strategy())
+            .conductorIdleStrategy(idleCap.strategy())
+            .senderIdleStrategy(idleCap.strategy())
+            .receiverIdleStrategy(idleCap.strategy())
             .nameResolver(nameResolver)
             .dirDeleteOnStart(true)
             .dirDeleteOnShutdown(false);
