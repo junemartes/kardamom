@@ -43,6 +43,17 @@ variable "executor_count" {
   default     = 3
 }
 
+# The endpoints of eth_getTransactionReceipt on a cache miss
+# (--receipt-query-endpoints): the egress,
+# http://kardamom-egress.service.<datacenter>.consul:8548. Empty, the
+# ingress asks the executor query endpoints. Ansible deployment sets it
+# from KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS.
+variable "receipt_query_endpoints" {
+  type        = string
+  description = "The receipt query endpoints, comma separated (--receipt-query-endpoints). Empty asks the executors."
+  default     = ""
+}
+
 variable "image_ref" {
   type        = string
   description = "Digest-pinned image reference (repo:tag@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
@@ -236,7 +247,7 @@ job "ingress" {
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
         ]
-        args = [
+        args = concat([
           "--config", "/local/ingress.toml",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
@@ -287,7 +298,9 @@ job "ingress" {
           # when the local account layer misses. Never on the submit
           # path. Same list as the sequencer's nonce lookup.
           "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:9024"]),
-        ]
+          ],
+          var.receipt_query_endpoints == "" ? [] : ["--receipt-query-endpoints", var.receipt_query_endpoints],
+        )
       }
 
       env {

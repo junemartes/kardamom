@@ -25,6 +25,7 @@ Set the address with `--metrics-addr` or `KARDAMOM_METRICS_ADDR`.
 | `kardamom-state-mirror` | `127.0.0.1:9007` | `0.0.0.0:9007` | `kardamom-state-mirror` |
 | `kardamom-notifier` | `127.0.0.1:9008` | `0.0.0.0:9008` | `kardamom-notifier` |
 | `kardamom-canary` | `127.0.0.1:9012` | `0.0.0.0:9012` | `kardamom-canary` |
+| `kardamom-egress` | `127.0.0.1:9013` | `0.0.0.0:9013` | none |
 | `kardamom-l1-indexer` | `127.0.0.1:9549` | `0.0.0.0:9009` | none |
 
 Notes on the table:
@@ -45,7 +46,8 @@ Notes on the table:
 - The monitoring job scrapes each exporter by its Consul node name: `<class>-<i>.node.<datacenter>.consul:<port>`.
   The job renders the targets from the node-class counts (`executor_count`, `sequencer_count`, `ingress_count`).
   A larger class gets its targets at the next deploy.
-- The services that Consul lists (the validator, the da-watcher, the batcher, the L1 follower, the notifier and the canary) are targets in every health state.
+- The services that Consul lists (the validator, the da-watcher, the batcher, the L1 follower, the notifier, the canary and the egress) are targets in every health state.
+  The monitoring job scrapes the egress only when the deploy runs it (`KARDAMOM_EGRESS=1`, the job variable `egress`).
   A halt or a pause fails `/ready` by design, so Consul marks the service critical. A healthy-only list would drop the target exactly when the halt and pause alerts need its metrics.
   A dead process stays a registered target and reads as `up == 0`.
 
@@ -54,16 +56,15 @@ Notes on the table:
 - Each binary takes `--host-id <STRING>` (env `KARDAMOM_HOST_ID`, default `local`).
   It sets the `host_id` label of each metric. `kardamom_obs::init` adds a `service` label.
 - The `Kardamom Overview` dashboard has a `host` template variable. The service dashboards inherit it.
-- The sealer is a Java service in an Aeron Cluster. It has no Prometheus endpoint.
-  Each executor re-exports the output of the sealer as it decodes the cluster egress:
+- The sealer is a Java service in an Aeron Cluster. Its Prometheus endpoint is `GET /metrics` on the admin port of each member (40205).
+  The monitoring job scrapes it as the job `kardamom-sealer`.
+  - `kardamom_sealer_disk_free_bytes{member_id}` is the free space of the disk that holds the Raft log and the retained file of the member.
+  - The other series carry the labels `service="sealer"` and `member_id`. They do not carry `host_id`. See "Sealer pipeline" below.
+- Each executor also re-exports the output of the sealer as it decodes the cluster egress:
   - `kardamom_sealer_boundaries_emitted_total` counts the boundary frames.
   - `kardamom_sealer_block_number` is the block that the sealer declared.
   - The series are on the executor port with the `host_id` of the executor.
     They show the boundary stream as one executor sees it.
-  - For the sealer itself, use the admin port and the log lines (see below).
-- The admin port of each sealer member answers `GET /metrics` with one gauge in the Prometheus text format:
-  - `kardamom_sealer_disk_free_bytes{member_id}` is the free space of the disk that holds the Raft log and the retained file of the member.
-  - The deploy does not scrape it yet.
 
 ### Cluster client metrics
 
@@ -630,6 +631,51 @@ Each lane is its own process on its own metrics port, so the scrape target tells
 - The loop sets its queue gauges once in 64 passes.
 - `kardamom_sequencer_nonce_check_duration_seconds` is the nonce state machine in the v1 loop, and the admission filter in the v2 loop.
 
+### Sealer pipeline
+
+The admin endpoint of each sealer member exports these series. Each one carries `service="sealer"` and `member_id`.
+They use the names of the shared pipeline metrics, so one dashboard shows whether the sealer is the bottleneck.
+
+The service thread writes the pipeline series. It allocates nothing for them and uses no map.
+A ClusteredService cannot see its idle time, so the loop exports busy time only. The Aeron cycle-time series below show the duty cycle.
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_loop_nanoseconds_total{loop="sealer.service",state="busy"}` | The time of the service thread in the session messages, the timers, the snapshots, and the member feed passes that did work. |
+| `kardamom_step_seconds{step="sealer.message"}` | One session message. A batch message is one step. |
+| `kardamom_step_seconds{step="sealer.flush_window"}` | One flush of the ordering window that admitted records. A member with no ordering window records none. |
+| `kardamom_step_seconds{step="sealer.boundary"}` | The work of one boundary timer: the flush, the boundary, the status, and the timer re-arm. |
+| `kardamom_step_seconds{step="sealer.snapshot"}` | One snapshot: the window flush and the snapshot write. |
+| `kardamom_step_seconds{step="sealer.egress_offer"}` | One offer of a relayed frame to the consumer sessions. It samples one offer in 64. |
+| `kardamom_batch_items{batch="sealer.ingress_batch"}` | The entries of one batch message (kind 3). |
+| `kardamom_queue_depth{queue="sealer.egress_backlog"}` | The bytes that the egress backlogs hold, after the last drain. |
+| `kardamom_queue_depth{queue="sealer.ordering_window"}` | The records that the ordering window holds. |
+| `kardamom_sealer_frames_total{outcome}` | The frames that the service did not relay. `outcome` is `malformed`, `unknown_kind`, `contiguity_reject`, `past_deadline`, `window_full`, `da_lag_reject`, `record_lag_reject`, `expired_ref`, `origin_gap` or `remote_origin_reject`. |
+| `kardamom_sealer_messages_total{kind}` | The session messages, by the kind byte. A kind shows after its first message. |
+| `kardamom_sealer_egress_backpressure_total{result}` | The egress offers that queued their frame. `result` is `back_pressured`, `admin_action` or `not_connected`. A frame behind an open backlog does not count. |
+| `kardamom_sealer_egress_stalls_total` | The sessions closed because their backlog made no progress for 1 s. |
+
+The admin thread reads these series from the status of the member and from the Aeron counters in the CnC file of its media driver. A series of an Aeron counter that does not exist is absent.
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_sealer_append_position` | The position that the archive recorded of the cluster log on this member. |
+| `kardamom_sealer_commit_position` | The log position that a quorum appended. Append minus commit is the wait for the quorum. |
+| `kardamom_sealer_service_position` | The log position that the service thread applied. Commit minus service is the wait for the service thread. |
+| `kardamom_sealer_consensus_max_cycle_seconds` | The longest duty cycle of the consensus module. |
+| `kardamom_sealer_consensus_cycle_threshold_exceeded_total` | The duty cycles of the consensus module above the cycle threshold. |
+| `kardamom_sealer_service_max_cycle_seconds` | The longest duty cycle of the clustered service. |
+| `kardamom_sealer_service_cycle_threshold_exceeded_total` | The duty cycles of the clustered service above the cycle threshold. |
+| `kardamom_sealer_archive_recorder_max_write_seconds` | The longest write of the archive recorder. |
+| `kardamom_sealer_archive_recorder_write_seconds_total` | The time of the archive recorder in writes. |
+| `kardamom_sealer_archive_recorder_write_bytes_total` | The bytes that the archive recorder wrote. |
+| `kardamom_sealer_driver_errors_total` | The errors that the media driver logged. |
+| `kardamom_sealer_driver_naks_sent_total` | The NAK messages that the media driver sent. |
+| `kardamom_sealer_driver_naks_received_total` | The NAK messages that the media driver received. |
+| `kardamom_sealer_driver_retransmits_total` | The retransmits that the media driver sent. |
+| `kardamom_sealer_driver_short_sends_total` | The sends that the socket took only in part. |
+| `kardamom_sealer_driver_sender_backpressure_total` | The back-pressure events of all network publications of the driver. |
+
 ### Ingress cluster status
 
 The ingress reads the status frame of the sealer and exports it on port 9006. The frame carries the posted head, the sealed head,
@@ -754,6 +800,18 @@ See [tx-status-events.md](tx-status-events.md) for the feed and the webhooks.
 | `outbox_backlog_bytes{subscription}` | Bytes of an outbox that are not delivered. |
 | `webhook_attempts_total{outcome}` | Webhook POST attempts. The outcomes are `ok`, `status`, and `error`. |
 | `webhook_delivery_seconds` | Histogram of the time from event arrival to delivery. |
+
+### Egress
+
+The egress (`kardamom-egress`) exports these metrics on `--metrics-addr` (`KARDAMOM_METRICS_ADDR`, default `127.0.0.1:9013`). The cluster job binds `0.0.0.0:9013` and registers it as the Consul service `kardamom-egress-metrics`. Every metric carries `host_id` (`egress-<alloc index>` in the cluster job).
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_egress_copy_mismatch_total` | Copies of a canonical frame whose bytes differ from the first copy. The egress does not stop. A difference means that one executor executed other bytes than the others: the validator decides which copy is wrong. |
+| `kardamom_egress_waiting_dropped_total` | Times that every copy missed a frame and the merge dropped the frames that waited behind it. |
+
+- Any increment of `kardamom_egress_copy_mismatch_total` needs an operator.
+- The egress answers `GET /health` on its HTTP port (`:8548` in the cluster job). The Consul check of the service `kardamom-egress` reads it.
 
 ### State mirror
 

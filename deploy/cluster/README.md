@@ -32,7 +32,7 @@ The local profile defines these classes:
 | `control` | 1 | Nomad and Consul server, Docker registry, anvil (the in-cluster L1) |
 | `sequencer` | 2 | 2 lanes with 2 racing replicas each. One job group per lane (`seq-<lane>`, expanded by the Nomad HCL). The metrics port is `9001 + 10 * lane`. With the job variable `ingress`, each replica also serves the ingress JSON-RPC on `8550 + lane`. See [The ingress inside the sequencer](#the-ingress-inside-the-sequencer). |
 | `ingress` | 2 | The active/active JSON-RPC front door (`:8545`) and the notifier status feed (`:8547`). Role `redis`. Instance 1 also has role `redis-replica`. |
-| `executor` | 3 | State-machine replica appliers (libmdbx state). The state mirror runs here too. |
+| `executor` | 3 | State-machine replica appliers (libmdbx state). The state mirror runs here too. With `KARDAMOM_EGRESS=1`, the egress runs on two of them (`:8548`, metrics `:9013`). See [The egress](#the-egress). |
 | `sealer` | 3 | A 3-member Aeron Cluster (Raft). The Java `cluster` job orders the transactions. The Raft log and its archive hold the canonical log. |
 | `aux` | 1 | The service roles `redis`, `redis-primary`, `batcher`, `monitoring`, `validator`, `da-watcher` and `indexer`. |
 
@@ -190,7 +190,7 @@ The `update` stanza of each job:
 | `cluster` (sealer) | 1 | `checks` | 60s | `false` | One task group for each member |
 | `cluster-backup` | 1 | `task_states` | 30s | `false` | Only with a node in the group `backup`. The deploy does not wait for it. |
 | `executor`, `validator`, `batcher`, `state-mirror` | 1 | `checks` | 15s | `false` | |
-| `notifier`, `canary` | 1 | `checks` | 10s | `false` | |
+| `notifier`, `canary`, `egress` | 1 | `checks` | 10s | `false` | |
 | `da-watcher`, `l1-indexer`, `l1-light-client`, `da-proxy`, `da-store` | 1 | `task_states` | 10s | `false` | |
 | `aeron` (system job) | 1 | `task_states` | 15s | not set | `stagger = "30s"` |
 
@@ -306,6 +306,35 @@ Signed mode needs a complete digest manifest.
 - Local unsigned mode keeps an explicit dev-tag fallback.
 - Upstream Anvil keeps the image policy of its jobspec. The light-client image is built by the image playbook, pinned by digest and signed like the service images.
 
+### The egress
+
+The egress (`kardamom-egress`, `nomad/egress.nomad.hcl`) is the stage after the executors. It merges the `exec_frames` copies of every executor into one canonical stream and keeps the stream and the receipts on disk. It serves the readers after the executors:
+
+- `egress_order` (Aeron stream 1009): the merged frames, live.
+- `egress_receipts` (Aeron stream 1011): the receipts of every executor, each once, with their account rows.
+- HTTP on `:8548` (`ports.egress_http`), as the Consul service `kardamom-egress`:
+  - `GET /v1/frames?from_index=<i>&from_block=<b>`: the range read of a reader that resumes.
+  - `GET /health`: the Consul check.
+  - `POST /`: `eth_getTransactionReceipt`, as the state query of an executor.
+- Metrics on `:9013` (`ports.egress_metrics`), as the Consul service `kardamom-egress-metrics`.
+
+Placement:
+
+- Two instances, on two different executor nodes (`distinct_hosts`). The job variable `egress_count` sets the count, at least 2.
+- The egress reads every executor, and the executor nodes keep state on their own disks.
+- The readers of the canonical stream (the validator and the batcher) stay on the aux node. So the loss of one node never stops the egress and those readers together.
+- Each instance keeps its store in `/opt/kardamom/egress` (`paths.egress_dir`) on its node.
+
+Every switch is off by default. With every switch off, the deploy renders every job as before. Switch them on in this order, one deploy for each step:
+
+1. `KARDAMOM_EXEC_FRAMES=on`: the executors publish their frames. Nothing reads them yet.
+2. `KARDAMOM_EGRESS=1`: the deploy adds the egress after the executors and before the notifier, the validator and the batcher. Prometheus scrapes it.
+3. The reader switches, one reader at a time: `KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS`, `KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS`, `KARDAMOM_SEQUENCER_RECEIPTS_FROM_EGRESS`. `KARDAMOM_VALIDATOR_EGRESS` and `KARDAMOM_BATCHER_EGRESS` only after the carry flag is active on the chain.
+
+The preflight refuses a reader switch without the egress, the egress without the frames, and a value other than `on`, `off` or empty. To go back, switch off in the reverse order.
+
+The merge chains the copy of an executor only from the start of the stream. An instance with an empty store on a running chain finds no frame to chain to. So start the egress with a new chain, or give a new instance a store. A new node of a rescheduled instance has an empty store too.
+
 ### Configuration switches
 
 The workloads role reads these environment variables. The defaults are in `ansible/roles/workloads/defaults/main.yml`. An Ansible extra variable can set the matching `workloads_*` variable directly. An empty value means "use the default of the job".
@@ -373,6 +402,12 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Backup sealer | `KARDAMOM_BACKUP_FILE_SYNC_LEVEL` | empty (`1` in the job) | The sync level of the archive of the backup sealer (job `cluster-backup`, variable `backup_file_sync_level`). The deploy registers the job only when the inventory has a node in the group `backup`. The backup is outside the quorum, so its syncs never delay a commit. Its copy is the recovery source after a power loss on a majority of the members. |
 | Sealer | `KARDAMOM_REMOTE_ORIGINS` | empty (`412347,412399` in the job) | The peer chain ids whose cross-chain records the sealer seals. All members use the same list. |
 | Executor | `KARDAMOM_EXEC_CURSOR` (job variable `exec_cursor`) | empty (`off` in the job) | `on` or `off`. On, each executor sends its recorded cursor to the sealer, the floor of the record-lag guard. Switch it on only after every sealer member reads ingress kind 9. A sealer member that does not read it drops the frame. |
+| Egress | `KARDAMOM_EGRESS` | `0` | `1` deploys the egress job (`nomad/egress.nomad.hcl`) and its scrape (job variable `egress` of the monitoring job). It needs `KARDAMOM_EXEC_FRAMES=on`. See [The egress](#the-egress). |
+| Egress | `KARDAMOM_EXEC_FRAMES` (job variable `exec_frames` of the executor) | empty (`off` in the job) | `on` or `off`. On, each executor publishes the frames that it executes on `exec_frames` (`--exec-frames`). |
+| Egress | `KARDAMOM_VALIDATOR_EGRESS`, `KARDAMOM_BATCHER_EGRESS` (job variable `egress_url`) | empty (the job reads the cluster egress) | `on` or `off`. On, the validator or the batcher reads the canonical stream from the egress (`--egress`). Switch it on only on a chain where the carry flag is active. It needs `KARDAMOM_EGRESS=1`. |
+| Egress | `KARDAMOM_SEQUENCER_RECEIPTS_FROM_EGRESS` (job variable `receipts_from_egress` of the sequencer) | empty (`off` in the job) | `on` or `off`. On, the sequencers read the receipts and their account rows from `egress_receipts` (`receipts_from_egress = true` in the config). It needs `KARDAMOM_EGRESS=1`. |
+| Egress | `KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS` (job variable `receipt_query_endpoints` of the ingress) | empty (the executors) | `on` or `off`. On, `eth_getTransactionReceipt` asks the egress on a cache miss (`--receipt-query-endpoints`). It needs `KARDAMOM_EGRESS=1`. |
+| Egress | `KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS` (job variable `receipts_from_egress` of the notifier) | empty (`off` in the job) | `on` or `off`. On, the notifier reads the receipts from `egress_receipts` (`--receipts-from-egress`). It needs `KARDAMOM_EGRESS=1`. |
 | Executor | `KARDAMOM_CHECKPOINT_LOG` (job variable `checkpoint_log`) | empty (`off` in the job) | `on` or `off`. On, each executor keeps the block log of its checkpoints and copies the state only when the base rule asks for a new base, at 16 MiB/s. Off, it copies the whole state each 20 s. Each release reads the bases of both modes. See [`../../docs/specs/2026-10-22-incremental-checkpoints.md`](../../docs/specs/2026-10-22-incremental-checkpoints.md). |
 | Fees | `PRIORITY_FEES` | empty (`off`) | `on` or `off`. One value sets the sequencer tip, the sealer ordering window and the executor and validator fee schedule. Turning it on for an existing chain is a chain upgrade. See [`../../docs/priority-fees.md`](../../docs/priority-fees.md). |
 | Aeron | `KARDAMOM_AERON_THREADING_MODE` | empty (`SHARED` in the job) | The threading mode of the media driver of each node: `SHARED` (one thread), `SHARED_NETWORK` (the sender and the receiver on one thread, the conductor on its own) or `DEDICATED` (three threads). `SHARED` costs the least CPU, but at a high message rate its one thread saturates and every stream of the node waits. |
@@ -488,7 +523,7 @@ ansible-playbook -i localhost, deploy/cluster/ansible/images.yml
 
 - `aeron`, `redis` and `cluster` (the Java sealer).
 - `l1-light-client`, built from the pinned helios release binary (`docker/helios/Dockerfile`). The build checks the SHA-256 of the release asset.
-- The 12 Rust service images of `roles/images/defaults/main.yml`: `ingress`, `sequencer`, `executor`, `validator`, `da-watcher`, `batcher`, `state-mirror`, `l1-indexer`, `da-store`, `l1-fault-proxy`, `notifier` and `canary`.
+- The 13 Rust service images of `roles/images/defaults/main.yml`: `ingress`, `sequencer`, `executor`, `validator`, `da-watcher`, `batcher`, `state-mirror`, `l1-indexer`, `da-store`, `l1-fault-proxy`, `notifier`, `canary` and `egress`.
 
 The build:
 

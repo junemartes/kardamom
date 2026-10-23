@@ -56,7 +56,7 @@ The streams and their publishers:
 | Topic | Publisher | Consumers |
 | --- | --- | --- |
 | `tx_data` (one record per lane) | ingress | sequencer, executor, validator, batcher, ingress archives |
-| `tx_receipts` | executor | ingress, sequencer, validator |
+| `tx_receipts` | executor | ingress, sequencer, validator, egress |
 | `tx_receipt_boundaries` | executor | ingress |
 | `tx_errors` | sequencer | ingress, notifier |
 | `tx_status` | sequencer, ingress | notifier |
@@ -68,7 +68,7 @@ The streams and their publishers:
 | `exec_txs` | executor | validator, batcher (none subscribes yet), the archive on the node of each executor |
 | `exec_frames` | executor (with `--exec-frames`) | egress |
 | `egress_order` | egress | the readers after the executors (batcher, validator) |
-| `egress_receipts` | egress | sequencers (with `receipts_from_egress = true`) |
+| `egress_receipts` | egress | sequencers (with `receipts_from_egress = true`), notifier (with `--receipts-from-egress`) |
 | `tx_drops` (one record per sequencer, with its lane) | sequencer | egress |
 | `l1_blocks` | L1 follower (two instances) | da-watcher, batcher, follower archives |
 
@@ -338,6 +338,7 @@ No job configures a publication control port.
 | l1-indexer | `l1_blocks`, `events` |
 | sequencer lane `n` | `tx_errors`, `tx_status`, `tx_drops`, one `tx_verdicts` for each ingress that it answers |
 | sequencer lane `n`, job variable `ingress` | the publications above, and the publications of the ingress inside the process: 8 `tx_data` lanes, `tx_status` |
+| egress | `egress_order`, `egress_receipts` (subscribes to `exec_frames`, `tx_receipts` and `tx_drops`) |
 
 The ingress inside a sequencer process opens its own stream plane,
 `ingress-<id>`, beside the plane of the sequencer. It records its `tx_data`
