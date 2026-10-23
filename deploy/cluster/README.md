@@ -384,6 +384,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Batcher L1 | `BATCHER_L1_RPC` | `L1_RPC` | Comma-separated endpoints, best first. The batcher falls back on errors and ranks failing endpoints last. The DA proxy and settlement bootstrap keep the single `L1_RPC` endpoint. |
 | Followers | `L1_FOLLOWERS_RPC` | the fault proxy if deployed, else the light client if deployed, else `L1_RPC` | The L1 that the indexer (the L1 follower) reads. A comma-separated list. With two or more entries, a block counts only when two agree. The da-watcher reads the follower's stream, not L1. |
 | da-watcher, batcher | `L1_SILENCE_S` | empty (`1152` in the binaries) | Seconds with no `l1_blocks` record before the da-watcher and the batcher pause with the follower as their root. |
+| da-watcher | `EPOCH_PACE_MS` | empty (`2000` in the binary) | The pause between two epochs of one L1 finality step, in ms. The container recipes and CI use `100`: the tests mine bursts of L1 blocks. Keep it below the 4 s gather window of the validator. |
 | Indexer | `L1_INDEXER_START_BLOCK` | empty (`1` with the fault proxy) | The first L1 block to index on an empty archive. Empty: the finalized block at the first start. |
 | Indexer | `L1_INDEXER_POLL_S` | empty (`12` in the binary) | One slot, in seconds: the read cadence while the finalized tip does not move, and the whole cadence without a beacon API. |
 | Indexer | `L1_BEACON_API` | `L1_LIGHT_CLIENT_CONSENSUS_RPC` | The beacon API of the finality schedule. Empty: the follower reads every slot. |

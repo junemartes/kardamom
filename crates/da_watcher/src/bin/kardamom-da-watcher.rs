@@ -129,8 +129,15 @@ struct Args {
     /// The pause between two epochs of one L1 finality step, in
     /// milliseconds. A finality step brings up to 32 epochs at once, and
     /// each one seals its own L2 block; the pace spreads that burst of
-    /// blocks. 0 publishes at once. A catch-up backlog is not paced.
-    #[arg(long, env = "KARDAMOM_DA_WATCHER_EPOCH_PACE_MS", default_value = "100")]
+    /// blocks. 0 publishes at once. A catch-up backlog is not paced. The
+    /// default of 2 s is longer than a block commit (50-250 ms on staging),
+    /// so each block commits before the next one comes. Keep the pace below
+    /// the 4 s gather window of the validator's epoch check.
+    #[arg(
+        long,
+        env = "KARDAMOM_DA_WATCHER_EPOCH_PACE_MS",
+        default_value = "2000"
+    )]
     epoch_pace_ms: u64,
     /// Peer Kardamom chain to source cross-chain messages from. Enables the
     /// interop path. It requires `--interop-feed-url` and `--self-chain-id`.

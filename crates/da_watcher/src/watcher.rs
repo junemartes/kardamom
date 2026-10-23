@@ -66,6 +66,10 @@ pub struct DaWatcherConfig {
     /// the transactions behind the burst wait for their receipts. A pace
     /// spreads the burst. A backlog larger than [`PACED_BACKLOG`] (a
     /// catch-up after a restart) is not paced. Zero publishes at once.
+    /// The pace must stay below the 4 s gather window of the validator's
+    /// epoch check, or each epoch of a step becomes its own range there.
+    /// An epoch that waits for the pace stays in the inbox, not in the
+    /// publish window, so the pace causes no re-publish.
     pub epoch_pace: Duration,
 }
 

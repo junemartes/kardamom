@@ -295,6 +295,11 @@ workloads_indexer_count: "{{ lookup('env', 'L1_INDEXER_COUNT') }}"
 # How long l1_blocks may carry no record before the da-watcher and the batcher pause
 # with the follower as its root. Empty: three finality steps (1152 s).
 workloads_l1_silence_s: "{{ lookup('env', 'L1_SILENCE_S') }}"
+# The pause between two epochs of one L1 finality step, in ms. Empty: the
+# da-watcher's default, 2000. The container recipes set 100: the tests
+# mine bursts of L1 blocks, and a 2 s pace makes their deposits wait too
+# long.
+workloads_epoch_pace_ms: "{{ lookup('env', 'EPOCH_PACE_MS') }}"
 workloads_indexer_host: "{{ lookup('env', 'L1_INDEXER_HOST') | default('kardamom-l1-indexer.service.' ~ datacenter ~ '.consul', true) }}"
 workloads_indexer_port: "{{ lookup('env', 'L1_INDEXER_PORT') | default('8549', true) }}"
 workloads_poll_delay: 3
