@@ -46,7 +46,7 @@
       "type": "text",
       "options": {
         "mode": "markdown",
-        "content": "Each service records the same pipeline metrics. Read them in path order: ingress, sequencer, cluster client, sealer, executor, state writer, state mirror.\n\n- **Busy share near 1:** the loop is saturated. It is the bottleneck, or it sits behind one.\n- **Blocked share above 0:** the loop has work but its output is full. The bottleneck is after it.\n- **A queue that grows:** the loop that reads it is too slow.\n- **A step p99 that jumps:** that step holds the latency tail.\n\nThe loop metrics flush every 100 ms, so a share below 1 s of window is noisy."
+        "content": "Each service records the same pipeline metrics. Read them in path order: ingress, sequencer, cluster client, sealer, executor, state writer, state mirror.\n\n- **Busy share near 1:** the loop is saturated. It is the bottleneck, or it sits behind one.\n- **Blocked share above 0:** the loop has work but its output is full. The bottleneck is after it.\n- **A queue that grows:** the loop that reads it is too slow.\n- **A step p99 that jumps:** that step holds the latency tail.\n\nThe loop metrics flush every 100 ms, so a share below 1 s of window is noisy.\nA share divides by the time that the loop reported, but by at least one second per second. The sealer service reports its busy time only, so its share is the busy time of each second."
       }
     },
     {
@@ -123,7 +123,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (service, host_id, loop) (rate(kardamom_loop_nanoseconds_total{state=\"busy\"}[1m])) / sum by (service, host_id, loop) (rate(kardamom_loop_nanoseconds_total[1m]))",
+          "expr": "sum by (service, host_id, loop) (rate(kardamom_loop_nanoseconds_total{state=\"busy\"}[1m])) / clamp_min(sum by (service, host_id, loop) (rate(kardamom_loop_nanoseconds_total[1m])), 1e9)",
           "legendFormat": "{{service}} {{host_id}} {{loop}}",
           "refId": "A",
           "range": true
@@ -186,7 +186,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (service, host_id, loop) (rate(kardamom_loop_nanoseconds_total{state=\"blocked\"}[1m])) / sum by (service, host_id, loop) (rate(kardamom_loop_nanoseconds_total[1m]))",
+          "expr": "sum by (service, host_id, loop) (rate(kardamom_loop_nanoseconds_total{state=\"blocked\"}[1m])) / clamp_min(sum by (service, host_id, loop) (rate(kardamom_loop_nanoseconds_total[1m])), 1e9)",
           "legendFormat": "{{service}} {{host_id}} {{loop}}",
           "refId": "A",
           "range": true
@@ -256,7 +256,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "topk(15, max by (service, loop) (sum by (service, host_id, loop) (rate(kardamom_loop_nanoseconds_total{state=\"busy\"}[1m])) / sum by (service, host_id, loop) (rate(kardamom_loop_nanoseconds_total[1m]))))",
+          "expr": "topk(15, max by (service, loop) (sum by (service, host_id, loop) (rate(kardamom_loop_nanoseconds_total{state=\"busy\"}[1m])) / clamp_min(sum by (service, host_id, loop) (rate(kardamom_loop_nanoseconds_total[1m])), 1e9)))",
           "legendFormat": "",
           "refId": "A",
           "range": false,
