@@ -1440,6 +1440,19 @@ class RecordTest(Deploys):
         self.run_deploy()
         self.assertEqual(sorted(set(self.api.state['writes'])), sorted(self.REPINNED))
 
+    def test_a_release_that_does_not_change_the_sealer_skips_the_snapshot_check(self):
+        """A running member reads no snapshot, and the release can be the fix of the outage of a member."""
+        self.deploy()
+        self.api.state['writes'] = []
+        self.target_snapshot_reads_max(16)
+        self.api.state['snapshot_latest'] = {'node-cluster-0': 17}
+        self.api.state['down_groups'] = ['cluster-2']
+        self.manifest.write_text(re.sub(r'^(executor .*@sha256:)[0-9a-f]{64}$', r'\g<1>' + 'b' * 64,
+                                        self.manifest.read_text(), flags=re.M))
+        output = self.run_deploy()
+        self.assertIn('The sealer job does not change, so no sealer member restarts on the target release.', output)
+        self.assertEqual(self.api.state['writes'], ['executor'])
+
     def test_a_new_sealer_cluster_skips_the_snapshot_check(self):
         self.target_snapshot_reads_max(16)
         self.api.state['snapshot_latest'] = {'node-cluster-0': 17}
