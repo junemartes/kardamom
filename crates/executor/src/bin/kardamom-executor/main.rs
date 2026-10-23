@@ -212,46 +212,88 @@ fn open_transport(args: &Args) -> Result<Transport> {
     })
 }
 
-/// The one `tx_ordering` subscription, always the Aeron Cluster (Raft)
-/// egress. The cluster has already deduped and totally ordered the
-/// stream, and exposes a blocking `next()`, so no async-to-sync bridge is
-/// needed. Leader failover and reconnect, including crash-recovery replay
-/// of the canonical stream, are handled inside the cluster client, so the
-/// reader never sees an image rotation. The subscription's canonical-index
-/// cursor drops any reconnect overlap. The cluster-session guard (`LiveCluster`) must outlive the executor loop,
-/// so [`bin_support::LiveStreams`] holds it. It drops only after the
-/// shutdown wait ends. With `--carry-bytes` the executor reads the member
-/// feed and opens no cluster session.
-///
-/// The member ingress endpoints come from the catalog when discovery
-/// lists them, else from the static `[cluster]` section. The executor is
-/// the chosen emitter of the `kardamom_sealer_*` re-export, on by default
-/// in the shared subscription.
-async fn connect_cluster(
-    args: &Args,
-    file_cfg: &ExecutorFileConfig,
-    plane: &StreamPlane,
-    state: &state::PreparedState,
+/// What the reader of one run starts from.
+struct ReaderStart<'a> {
+    /// The runtime of the live `egress_order` frames, with `--egress`.
+    rt: &'a AeronRuntime,
+    state: &'a state::PreparedState,
     history: Option<kardamom_engine::reader::carried::LocalHistory>,
-    stop: &tokio_util::sync::CancellationToken,
-) -> Result<(
-    Option<kardamom_cluster_adapter::LiveCluster>,
-    ExecutorOrdering,
-)> {
-    let cursor = bin_support::cluster_replay_cursor(&state.start);
-    let aeron_dir = args.aeron_dir.as_deref();
-    if args.carry_bytes {
-        let sub = bin_support::open_member_feed(aeron_dir, cursor, history, stop.clone())?;
-        tracing::info!("kardamom-executor: canonical entries via the member feed");
-        return Ok((None, ExecutorOrdering::Carried(Box::new(sub))));
+    stop: &'a tokio_util::sync::CancellationToken,
+}
+
+impl<'a> ReaderStart<'a> {
+    fn new(
+        rt: &'a AeronRuntime,
+        state: &'a state::PreparedState,
+        history: Option<kardamom_engine::reader::carried::LocalHistory>,
+        stop: &'a tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            rt,
+            state,
+            history,
+            stop,
+        }
     }
-    let mut cluster_cfg = file_cfg.cluster.to_live();
-    if let Some(endpoints) = plane.cluster_ingress_endpoints().await? {
-        cluster_cfg.ingress_endpoints = endpoints;
+
+    /// The one `tx_ordering` subscription, always the Aeron Cluster (Raft)
+    /// egress. The cluster has already deduped and totally ordered the
+    /// stream, and exposes a blocking `next()`, so no async-to-sync bridge is
+    /// needed. Leader failover and reconnect, including crash-recovery replay
+    /// of the canonical stream, are handled inside the cluster client, so the
+    /// reader never sees an image rotation. The subscription's canonical-index
+    /// cursor drops any reconnect overlap. The cluster-session guard (`LiveCluster`) must outlive the executor loop,
+    /// so [`bin_support::LiveStreams`] holds it. It drops only after the
+    /// shutdown wait ends. With `--carry-bytes` the executor reads the member
+    /// feed and opens no cluster session.
+    ///
+    /// The member ingress endpoints come from the catalog when discovery
+    /// lists them, else from the static `[cluster]` section. The executor is
+    /// the chosen emitter of the `kardamom_sealer_*` re-export, on by default
+    /// in the shared subscription.
+    ///
+    /// With `--egress`, the reader of the member feed has the egress as its
+    /// second source. A cursor below the replay window of the member then
+    /// reads the egress, and only a cursor below the floor of the egress too
+    /// ends the run with the refused replay that stages a peer checkpoint.
+    async fn connect(
+        self,
+        boot: &Boot,
+        plane: &mut StreamPlane,
+    ) -> Result<(
+        Option<kardamom_cluster_adapter::LiveCluster>,
+        ExecutorOrdering,
+    )> {
+        let (args, file_cfg) = (&boot.args, &boot.file_cfg);
+        let cursor = bin_support::cluster_replay_cursor(&self.state.start);
+        let aeron_dir = args.aeron_dir.as_deref();
+        if args.carry_bytes {
+            let egress = args
+                .egress
+                .clone()
+                .map(|base| bin_support::open_egress_transport(self.rt, plane, base))
+                .transpose()?;
+            let sub = bin_support::open_member_feed(bin_support::MemberFeed {
+                aeron_dir,
+                cursor,
+                history: self.history,
+                egress,
+                stop: self.stop.clone(),
+            })?;
+            tracing::info!(
+                egress = args.egress.as_deref(),
+                "kardamom-executor: canonical entries via the member feed"
+            );
+            return Ok((None, ExecutorOrdering::Carried(Box::new(sub))));
+        }
+        let mut cluster_cfg = file_cfg.cluster.to_live();
+        if let Some(endpoints) = plane.cluster_ingress_endpoints().await? {
+            cluster_cfg.ingress_endpoints = endpoints;
+        }
+        let (guard, sub) = bin_support::connect_cluster_ordering(aeron_dir, cluster_cfg, cursor)?;
+        tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");
+        Ok((Some(guard), ExecutorOrdering::Refs(sub)))
     }
-    let (guard, sub) = bin_support::connect_cluster_ordering(aeron_dir, cluster_cfg, cursor)?;
-    tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");
-    Ok((Some(guard), ExecutorOrdering::Refs(sub)))
 }
 
 /// The `tx_data` lanes and their join-miss refetch. The member feed carries
@@ -505,7 +547,6 @@ async fn run() -> Result<()> {
 /// gone before the repair parks the state.
 async fn run_once(boot: &Boot, window: std::num::NonZeroU64) -> Result<Verdict> {
     let args = &boot.args;
-    let file_cfg = &boot.file_cfg;
     let Transport {
         aeron_cfg,
         plane,
@@ -549,8 +590,8 @@ async fn run_once(boot: &Boot, window: std::num::NonZeroU64) -> Result<Verdict> 
     .await?;
     let exec_stream_threads = outputs.exec_stream.threads;
 
-    let (cluster_guard, tx_ordering_sub) =
-        connect_cluster(args, file_cfg, &plane, &prepared, history, &shutdown).await?;
+    let reader = ReaderStart::new(&rt, &prepared, history, &shutdown);
+    let (cluster_guard, tx_ordering_sub) = reader.connect(boot, &mut plane).await?;
     let tx_ordering_sub = tx_ordering_sub.with_tee(outputs.frames);
     let state::PreparedState {
         env,

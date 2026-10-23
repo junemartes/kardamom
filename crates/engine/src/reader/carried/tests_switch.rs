@@ -160,18 +160,47 @@ fn both_sources_below_their_floor_go_to_a_peer_checkpoint() {
     }
 }
 
+/// Run a reader of a feed below its floor, with `service` as the second
+/// source that never connects, until it fails.
+fn refused_with_no_service<S: Transport>(service: S) -> ExecutorError {
+    let (feed, remote) = MemoryTransport::pair();
+    let mut sub = CarriedSubscription::with_timing(feed, service, ReplayCursor::new(3, 2), TIMING);
+    fail_answering(&mut sub, &remote, |id| unavailable(id, 10, 5))
+}
+
 #[test]
 fn a_feed_below_its_floor_with_no_service_goes_to_a_peer_checkpoint() {
-    let (feed, remote) = MemoryTransport::pair();
-    let mut sub = CarriedSubscription::with_timing(feed, NoSource, ReplayCursor::new(3, 2), TIMING);
-    let error = fail_answering(&mut sub, &remote, |id| unavailable(id, 10, 5));
-    assert!(matches!(
-        error,
-        ExecutorError::ClusterReplayUnavailable {
-            oldest_block: 5,
-            ..
-        }
-    ));
+    let no_egress: Option<super::EgressTransport> = None;
+    for error in [
+        refused_with_no_service(NoSource),
+        refused_with_no_service(no_egress),
+    ] {
+        assert!(
+            matches!(
+                error,
+                ExecutorError::ClusterReplayUnavailable {
+                    oldest_block: 5,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+}
+
+#[test]
+fn the_service_drops_its_frames_while_the_reader_reads_the_feed() {
+    let mut rig = Rig::new(0, 1);
+    serve_block(&mut rig, Source::Feed, 0, 1);
+    assert_eq!(rig.deliver(5), ["t0", "b1"]);
+    (0..8).for_each(|index| rig.service.send(tx_at(index)));
+    rig.run_for(TIMING.poll * 4);
+    assert_eq!(rig.sub.source(), Source::Feed);
+    assert_eq!(
+        rig.service.pending(),
+        0,
+        "a live service that the reader does not read keeps no backlog"
+    );
 }
 
 #[test]

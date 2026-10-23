@@ -76,7 +76,7 @@ where
     }
 
     /// The two cache layers, each counted: the local layer, then Redis.
-    async fn cached_view(&self, address: Address) -> Option<AccountView> {
+    pub(super) async fn cached_view(&self, address: Address) -> Option<AccountView> {
         if let Some(view) = self.live.get(address) {
             cache_metrics::record_lookup("live", "hit");
             return Some(view);

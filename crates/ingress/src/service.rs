@@ -32,13 +32,14 @@ use kardamom_types::shard_map::{LANE_COUNT, ShardMap, validate_shard_count};
 
 use crate::aeron_adapters::{LiveIngressPublication, LiveIngressSubscription};
 use crate::cluster::cluster_watermark_observer;
-use crate::config::{AdmissionAck, IngressConfig, IngressFileConfig};
+use crate::config::{AckMode, AdmissionAck, IngressConfig, IngressFileConfig};
 use crate::proxy::{IngressHandle, IngressProxy};
 use crate::stage_latency::{StageClock, StageClocks, StageStamps};
 use recorders::{
     spawn_discovered_tx_data_recorder, spawn_tx_data_recorders, wait_for_discovered_recorder,
     wait_for_recorders,
 };
+use settings::AckArg;
 pub use settings::IngressSettings;
 
 /// What [`IngressService::spawn_recorders`] returns: the threads, the
@@ -94,6 +95,9 @@ impl IngressService {
                 "--verdicts needs --admission-checks false: the v2 sequencers check each sender"
             );
         }
+        if args.verdicts && args.ack == AckArg::Validated {
+            anyhow::bail!("--ack validated takes no --verdicts: it waits for no verdict");
+        }
         let mut cfg = IngressConfig {
             jsonrpc_bind: args.jsonrpc_bind,
             partition_count_m: NonZeroU32::from(args.shards),
@@ -119,16 +123,28 @@ impl IngressService {
             mirror_count: self.executor_count().unwrap_or(NonZeroU32::MIN),
             inclusion_horizon_blocks: args.inclusion_horizon_blocks,
             max_tx_bytes: args.max_tx_bytes,
-            admission_ack: args.verdicts.then(|| AdmissionAck {
-                timeout: Duration::from_millis(args.ack_timeout_ms),
-                twins: args.twins,
-                ..AdmissionAck::default()
-            }),
+            ack: self.ack_mode(),
+            duplicate_cache_capacity: args.duplicate_cache_entries,
             ..IngressConfig::default()
         };
         cfg.binary_tcp_bind = None;
         cfg.binary_uds_path = None;
         Ok(cfg)
+    }
+
+    /// The ack mode of `--ack` and `--verdicts`. The caller refuses the
+    /// two together.
+    fn ack_mode(&self) -> AckMode {
+        let args = &self.settings;
+        match (args.ack, args.verdicts) {
+            (AckArg::Validated, _) => AckMode::Validated,
+            (AckArg::Receipt, true) => AckMode::Admission(AdmissionAck {
+                timeout: Duration::from_millis(args.ack_timeout_ms),
+                twins: args.twins,
+                ..AdmissionAck::default()
+            }),
+            (AckArg::Receipt, false) => AckMode::Receipt,
+        }
     }
 
     /// The executor count: the CLI or env `--executor-count`, else the
@@ -384,6 +400,7 @@ impl IngressService {
             active_lanes = cfg.shard_map.as_ref().map(ShardMap::active_lanes),
             ingress_id = cfg.ingress_id,
             ack_policy = ?cfg.ack_policy,
+            ack = ?cfg.ack,
             "kardamom-ingress starting"
         );
 

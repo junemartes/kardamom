@@ -343,9 +343,12 @@ impl<F: Transport, S: Transport> Switch<F, S> {
     ///
     /// Before the probe, the reader discards the frames of the feed at each
     /// check. A member that stays live writes on, and a backlog would delay
-    /// the answer of the probe past its silence window.
+    /// the answer of the probe past its silence window. While the reader
+    /// reads the feed, it discards the frames of the service at each check
+    /// in the same way: a service with a live stream writes on too.
     pub(crate) fn check_return(&mut self, cursor: (u64, u64), now: Instant) -> bool {
         if self.active != Source::Service {
+            self.service.close();
             self.back = Return::default();
             return false;
         }

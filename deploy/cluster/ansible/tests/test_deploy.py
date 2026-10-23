@@ -963,6 +963,9 @@ class DeployTest(Deploys):
         egress = plans['egress']
         self.assertTrue(egress['TaskGroups'][0]['Tasks'][0]['Config']['image'].endswith('@sha256:' + 'a' * 64))
         self.assertEqual(egress['TaskGroups'][0]['Count'], 2)
+        egress_args = self.job_args(egress)
+        self.assertEqual(egress_args[egress_args.index('--peers') + 1],
+                         ','.join(f'http://executor-{i}.node.dc1.consul:8548' for i in range(3)))
         services = {s['Name']: s for t in egress['TaskGroups'][0]['Tasks'] for s in t['Services']}
         self.assertEqual(services['kardamom-egress']['Checks'][0]['Path'], '/health')
         self.assertEqual(services['kardamom-egress-metrics']['Tags'], ['metrics'])
@@ -993,6 +996,13 @@ class DeployTest(Deploys):
                 self.run_deploy({'workloads_checkpoint_log': switch}, check=True)
                 env = self.api.state['plans']['executor']['TaskGroups'][0]['Tasks'][0]['Env']
                 self.assertEqual(env['KARDAMOM_CHECKPOINT_LOG'], expected)
+
+    def test_the_ingress_ack_defaults_to_the_receipt_and_reaches_the_ingress(self):
+        for switch, expected in (('', 'receipt'), ('validated', 'validated')):
+            with self.subTest(switch=switch):
+                self.run_deploy({'workloads_ingress_ack': switch}, check=True)
+                args = self.api.state['plans']['ingress']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+                self.assertEqual(args[args.index('--ack') + 1], expected)
 
     def test_every_aeron_party_takes_the_deploy_values(self):
         """Each Aeron deploy value: its environment variable, its default,
