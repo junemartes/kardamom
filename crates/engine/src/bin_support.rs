@@ -21,6 +21,7 @@ use anyhow::{Context, Result};
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::AeronConfig;
 use kardamom_log::refetch::{EndpointSource, RefetchConfig};
+use kardamom_obs::pipeline::Queue;
 use kardamom_state::Durability;
 use kardamom_types::{AccountChange, CodeEntry, TxDataLoc, TxEnvelope};
 
@@ -145,9 +146,14 @@ pub fn bounded_join_timeout(resuming: bool) -> Duration {
 /// tokio channel. The engine's reader thread blocks on the channel, with
 /// `blocking_recv`. No pump task sits between them. This is public so a
 /// binary's `EngineWiring` can name it as its `TxData` type.
+///
+/// Every lane sets the one `executor.tx_data` queue before each receive.
+/// The queue thus shows the backlog of the lane that read last. The
+/// per-lane backlog is the `shard` series of the `tx_data` queue depth.
 pub struct LiveTxDataSub {
     sequencer_id: u8,
     rx: kardamom_log::aeron_live::TxDataSubscription,
+    queue: Queue,
 }
 
 impl TxDataSubscription for LiveTxDataSub {
@@ -165,6 +171,7 @@ impl TxDataSubscription for LiveTxDataSub {
             "shard" => self.sequencer_id.to_string()
         )
         .set(self.rx.len() as f64);
+        self.queue.set(self.rx.len());
         self.rx.blocking_recv().ok_or(ExecutorError::TxDataClosed {
             sequencer_id: self.sequencer_id,
         })
@@ -202,6 +209,7 @@ pub fn open_tx_data_subs(
             Ok(LiveTxDataSub {
                 sequencer_id: shard_id,
                 rx,
+                queue: Queue::new("executor.tx_data"),
             })
         })
         .collect()

@@ -17,6 +17,7 @@
 
 pub mod actor;
 pub mod bin_support;
+mod meter;
 pub mod metrics;
 pub mod persist;
 pub mod reader;

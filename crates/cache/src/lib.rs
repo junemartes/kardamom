@@ -28,7 +28,7 @@ pub mod testing;
 
 mod client;
 
-pub use client::{AccountCache, AccountView, RowsWritten};
+pub use client::{AccountCache, AccountView, BatchWrite, RowsWritten};
 pub use config::{CacheConfig, LiveAccountsConfig};
 pub use error::CacheError;
 pub use live::{LiveAccounts, LiveAccountsWriter};

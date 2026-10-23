@@ -39,12 +39,15 @@ pub mod proxy;
 pub(crate) mod rate_limit;
 pub(crate) mod receipt_cache;
 pub(crate) mod receipt_subscription;
+#[cfg(test)]
+mod rendered_metrics_tests;
 pub mod rollback_log;
 pub mod routing;
 pub(crate) mod seen_receipts;
 pub mod service;
 pub mod sig_verify;
 pub mod stage_latency;
+pub(crate) mod submit_steps;
 pub(crate) mod sync_util;
 /// Shared test and bench helpers. See the module doc for what it covers.
 #[cfg(any(test, feature = "test-support"))]

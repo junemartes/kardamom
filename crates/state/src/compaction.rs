@@ -34,19 +34,7 @@ use crate::error::StateError;
 /// [`StateError`] if the underlying `mdbx_env_copy` call fails.
 pub fn compact_to(env: &StateEnv, dest: &Path) -> Result<(), StateError> {
     info!(src = %env.path().display(), dst = %dest.display(), "starting compaction");
-    if dest.exists() {
-        warn!("destination already exists; refusing to overwrite");
-        return Err(StateError::Recovery(format!(
-            "compaction destination {} already exists",
-            dest.display()
-        )));
-    }
-    // Make sure the parent directory exists. mdbx_env_copy creates the
-    // destination subdirectory itself.
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
+    prepare_dest(dest)?;
     let c_path = MdbxPath::new(dest, "compaction dest")?;
 
     let rc = env.raw().with_raw_env_ptr(|env_ptr| unsafe {
@@ -59,6 +47,29 @@ pub fn compact_to(env: &StateEnv, dest: &Path) -> Result<(), StateError> {
     }
 
     info!("compaction complete");
+    Ok(())
+}
+
+/// Refuse a `dest` that exists, and create its parent directory. A copy
+/// never overwrites an image.
+///
+/// # Errors
+///
+/// Returns [`StateError::Recovery`] if `dest` already exists, and
+/// [`StateError::Io`] if the parent directory cannot be created.
+pub(crate) fn prepare_dest(dest: &Path) -> Result<(), StateError> {
+    if dest.exists() {
+        warn!("destination already exists; refusing to overwrite");
+        return Err(StateError::Recovery(format!(
+            "compaction destination {} already exists",
+            dest.display()
+        )));
+    }
+    // Make sure the parent directory exists. mdbx_env_copy creates the
+    // destination subdirectory itself.
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     Ok(())
 }
 

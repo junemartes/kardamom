@@ -66,6 +66,7 @@ use crate::lookup::LookupRequester;
 use crate::metrics;
 use crate::nonce_ahead::NonceAheadWatch;
 use crate::outbound::{RefOffer, SideChannelPublisher, TxOrderingRefPublisher};
+use crate::pipeline::PublishMeters;
 use crate::sealer_rules::SealerVersion;
 use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction, ProcessResult};
@@ -252,6 +253,7 @@ pub struct Sequencer {
     /// The decision version of the sealer. Under version 4 the deadline
     /// field of each offer carries the stream position of the envelope.
     sealer_version: SealerVersion,
+    pipeline: PublishMeters,
 }
 
 impl Sequencer {
@@ -293,6 +295,7 @@ impl Sequencer {
             pause: crate::pause_gate::PauseGate::default(),
             fees: FeeGate::off(),
             sealer_version: SealerVersion::default(),
+            pipeline: PublishMeters::new(),
         })
     }
 
@@ -514,7 +517,7 @@ impl Sequencer {
             })
             .collect();
         let (_, b, rc) = ports.split();
-        let (published, err) = b.try_publish_ref_batch(&refs);
+        let (published, err) = self.pipeline.offer(b, &refs);
         self.record_published_prefix(rc, rest, published, ctx);
         match err {
             None => ControlFlow::Continue(()),
@@ -1088,13 +1091,27 @@ impl Sequencer {
     /// One [`Self::run`] iteration: dispatch on `run_once`'s outcome,
     /// updating the resync controller and idle backoff. Returns whether
     /// the loop should keep going; `false` only on a clean
-    /// `IngressDisconnected` exit.
+    /// `IngressDisconnected` exit. The pass, its wait included, counts in
+    /// the state that its outcome names.
     fn run_tick<P: SequencerPorts>(
         &mut self,
         ports: &mut P,
         backoff: &mut IdleBackoff,
     ) -> Result<bool, SequencerError> {
-        match self.run_once(ports) {
+        let outcome = self.run_once(ports);
+        let state = PublishMeters::state_of(&outcome);
+        let next = self.after_pass(outcome, backoff);
+        self.pipeline.pass(state, ports.split().0);
+        next
+    }
+
+    /// The dispatch of [`Self::run_tick`] on the outcome of one pass.
+    fn after_pass(
+        &mut self,
+        outcome: Result<bool, SequencerError>,
+        backoff: &mut IdleBackoff,
+    ) -> Result<bool, SequencerError> {
+        match outcome {
             Ok(true) => {
                 backoff.reset();
                 self.resync_note_publish_ok();

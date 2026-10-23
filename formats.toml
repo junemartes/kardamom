@@ -228,6 +228,23 @@ reads_max = 1
 shared = true
 code = ["crates/state/src/checkpoint/manifest.rs#MANIFEST_VERSION"]
 
+# The block log of the checkpoints: segment files of the write batch of
+# each committed block after a base checkpoint. A segment starts with a
+# 56-byte head (magic, version, state schema, genesis digest, first block),
+# then records `[len:u32][block:u64][crc32:u32][rkyv WriteBatch]`. A peer
+# serves the log with its checkpoints, so the format is shared. A reader
+# skips a segment whose head has another version, so a restore of an older
+# release uses the base checkpoint alone.
+[format.block-log]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = true
+code = ["crates/state/src/checkpoint/block_log.rs#BLOCK_LOG_VERSION"]
+[format.block-log.layout]
+WriteBatch = "rkyv size 128 align 16"
+SegmentHead = "4b4152424c4f4700010000000300000011111111111111111111111111111111111111111111111111111111111111112a00000000000000"
+
 # The KAR1 batch on DA and L1. The batch stays there for all time. The
 # batcher decodes its own last post at start, and the indexer and
 # kardamom-reconstruct decode every post.

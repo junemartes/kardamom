@@ -24,6 +24,7 @@ use std::time::Duration;
 use alloy_consensus::TxEnvelope;
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_primitives::{Address, B256, Bytes, keccak256};
+use kardamom_obs::pipeline::{Batch, Queue, Step};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -133,6 +134,28 @@ struct FlushLoop {
     depth: NonZeroUsize,
     flush_window: Duration,
     parallelism: NonZeroUsize,
+    meters: FlushMeters,
+}
+
+/// The pipeline metrics of the flush task, recorded once per batch.
+struct FlushMeters {
+    /// The requests in each flushed batch.
+    batch: Batch,
+    /// The recovery of one batch on the blocking pool, from the hop to the
+    /// end of its last worker.
+    recover: Step,
+    /// The requests that wait in the intake after a batch is taken.
+    intake: Queue,
+}
+
+impl FlushMeters {
+    fn new() -> Self {
+        Self {
+            batch: Batch::new("ingress.recover_batch"),
+            recover: Step::new("ingress.recover_batch"),
+            intake: Queue::new("ingress.recover_intake"),
+        }
+    }
 }
 
 impl FlushLoop {
@@ -147,6 +170,7 @@ impl FlushLoop {
             depth,
             flush_window,
             parallelism,
+            meters: FlushMeters::new(),
         }
     }
 
@@ -175,7 +199,11 @@ impl FlushLoop {
         if buf.len() < depth {
             self.fill_until_deadline(&mut buf).await;
         }
+        self.meters.intake.set(self.rx.len());
+        self.meters.batch.record(buf.len());
+        let started = std::time::Instant::now();
         self.process_batch(buf).await;
+        self.meters.recover.since(started);
         ControlFlow::Continue(())
     }
 

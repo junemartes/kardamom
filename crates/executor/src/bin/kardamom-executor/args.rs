@@ -188,6 +188,29 @@ pub(crate) struct Args {
     /// 0 checkpoints, no restore is possible.
     #[arg(long, default_value_t = DEFAULT_CHECKPOINT_KEEP)]
     pub(crate) checkpoint_keep: NonZeroUsize,
+    /// Keep the block log of the committed blocks next to the checkpoints,
+    /// and make a new base only when the base rule asks for one. Each
+    /// block of the log is then a restore point, and a checkpoint round
+    /// copies the state only now and then. Off: a compacted copy each
+    /// `--checkpoint-interval-secs`. Ignored unless `checkpoint_dir` is
+    /// set.
+    #[arg(long, env = "KARDAMOM_CHECKPOINT_LOG", default_value_t = false)]
+    pub(crate) checkpoint_log: bool,
+    /// With `--checkpoint-log`: a new base when the log after the newest
+    /// base is larger than this percent of the size of that base.
+    #[arg(long, default_value = "100")]
+    pub(crate) checkpoint_base_log_percent: NonZeroU64,
+    /// With `--checkpoint-log`: a new base when the newest base is older
+    /// than this, in seconds.
+    #[arg(long, default_value = "21600")]
+    pub(crate) checkpoint_base_max_age_secs: NonZeroU64,
+    /// With `--checkpoint-log`: the rate limit of the copy of a base, in
+    /// MiB a second.
+    #[arg(long, default_value = "16")]
+    pub(crate) checkpoint_copy_mib_per_sec: NonZeroU64,
+    /// With `--checkpoint-log`: the size of one segment of the log, in MiB.
+    #[arg(long, default_value = "64")]
+    pub(crate) checkpoint_log_segment_mib: NonZeroU64,
     /// TCP address that serves this node's newest checkpoint to peer
     /// executors (`GET /checkpoint/latest`). Replicas are deterministic
     /// state machines, so any replica's checkpoint is a valid restore
@@ -278,6 +301,35 @@ mod tests {
         assert!(error.to_string().contains("--carry-bytes"), "{error}");
         let feed = parse(&["--void-voter-id", "2", "--carry-bytes"]);
         assert_eq!(feed.recorded_cursor_id().expect("valid"), None);
+    }
+
+    #[test]
+    fn the_block_log_is_off_by_default_and_needs_a_checkpoint_dir() {
+        use crate::state::CheckpointLog;
+        use kardamom_state::checkpoint::copy_rate::CopyRate;
+        let off = parse(&["--checkpoint-dir", "/c"]);
+        assert!(CheckpointLog::of(&off).unwrap().is_none(), "off by default");
+        let no_dir = parse(&["--checkpoint-log"]);
+        assert!(
+            CheckpointLog::of(&no_dir).unwrap().is_none(),
+            "no directory"
+        );
+        let on = parse(&[
+            "--checkpoint-dir",
+            "/c",
+            "--checkpoint-log",
+            "--checkpoint-copy-mib-per-sec",
+            "8",
+        ]);
+        let log = CheckpointLog::of(&on).unwrap().expect("on");
+        assert_eq!(log.log.dir, std::path::Path::new("/c/log"));
+        assert_eq!(log.log.segment_bytes.get(), 64 << 20);
+        assert_eq!(
+            log.round.rate,
+            CopyRate::Limited(std::num::NonZeroU64::new(8 << 20).unwrap())
+        );
+        assert_eq!(log.round.rule.log_percent.get(), 100);
+        assert_eq!(log.round.rule.max_age.as_secs(), 21_600);
     }
 
     /// `CheckpointInterval` gives clap one concrete type for this

@@ -58,6 +58,8 @@ docker-e2e = ["kardamom-log/docker-e2e"]
 
 [dev-dependencies]
 kardamom-egress = { path = "../egress" }
+# The tests of the pipeline metrics render a local recorder.
+metrics-exporter-prometheus = { workspace = true }
 kardamom-test-support = { workspace = true }
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }

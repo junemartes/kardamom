@@ -36,6 +36,8 @@ tokio = { workspace = true, features = ["rt", "time", "sync"] }
 testcontainers = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The eviction counter test renders a local recorder.
+metrics-exporter-prometheus = { workspace = true }
 # The format registry: a test checks this crate's format layout against it.
 kardamom-formats.workspace = true
 # A fake executor query endpoint for the failover test of `query`.

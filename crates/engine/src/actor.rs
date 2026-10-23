@@ -78,6 +78,7 @@ mod exec_records;
 mod exec_settle;
 mod exec_state;
 mod exec_thread;
+mod meters;
 mod ports;
 mod tx_hook;
 mod types;
@@ -106,6 +107,8 @@ pub mod fixtures;
 /// block drivers of other crates. Behind `test-support`, as [`fixtures`].
 #[cfg(feature = "test-support")]
 pub mod flag_switches;
+#[cfg(test)]
+mod meters_tests;
 #[cfg(test)]
 mod test_hooks;
 #[cfg(test)]

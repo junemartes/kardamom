@@ -24,6 +24,7 @@ mod receipts;
 mod steps;
 mod verdicts;
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,7 @@ use kardamom_log::aeron_live::{
 };
 use kardamom_obs::halt::{HaltCause, HaltRef};
 use kardamom_obs::lifecycle::process;
+use kardamom_obs::pipeline::{LoopMeter, LoopState};
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::epoch::{EpochPump, OriginSignalTx};
 use kardamom_sequencer::error::SequencerError;
@@ -107,6 +109,10 @@ impl TxDataSubscriber for LaneSubscriptions {
             inbound
         }))
     }
+
+    fn queued(&self) -> usize {
+        self.lanes.iter().map(|sub| sub.handle.len()).sum()
+    }
 }
 
 /// The egress-watermark feed: the silence authority. It measures
@@ -148,6 +154,8 @@ pub(crate) struct EgressWatermarkFeed {
     silence: SilenceDeadline,
     /// The sealer's decision version for the current session.
     rules: SealerRules,
+    /// Idle while the receive waits, busy while a frame is handled.
+    meter: LoopMeter,
 }
 
 impl EgressWatermarkFeed {
@@ -172,6 +180,7 @@ impl EgressWatermarkFeed {
             last_origin: 0,
             last_boundary_at: Some(Instant::now()),
             silence: SilenceDeadline::new(Instant::now()),
+            meter: LoopMeter::new("sequencer.egress_feed"),
         }
     }
 
@@ -189,13 +198,21 @@ impl EgressWatermarkFeed {
 
     /// Run until `shutdown` fires or the egress source closes.
     fn run(mut self, mut egress: LiveEgress, shutdown: &Shutdown) {
-        while !shutdown.is_signaled() {
-            match egress.recv_timeout(Duration::from_millis(500)) {
-                EgressPoll::Frame(frame) => self.on_frame(&frame),
-                EgressPoll::Idle => self.on_idle(),
-                EgressPoll::Closed => return,
-            }
+        while !shutdown.is_signaled() && self.step(&mut egress).is_continue() {}
+    }
+
+    /// One wait on `egress` and the work on what it gave. `Break` means
+    /// that the egress source closed.
+    fn step(&mut self, egress: &mut LiveEgress) -> ControlFlow<()> {
+        let poll = egress.recv_timeout(Duration::from_millis(500));
+        self.meter.mark(LoopState::Idle);
+        match poll {
+            EgressPoll::Frame(frame) => self.on_frame(&frame),
+            EgressPoll::Idle => self.on_idle(),
+            EgressPoll::Closed => return ControlFlow::Break(()),
         }
+        self.meter.mark(LoopState::Busy);
+        ControlFlow::Continue(())
     }
 
     /// Egress is silent while this thread is demonstrably alive. This

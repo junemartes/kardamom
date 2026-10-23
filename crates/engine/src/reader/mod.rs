@@ -46,6 +46,7 @@
 pub mod carried;
 pub mod cluster;
 mod join;
+mod meters;
 mod ordered;
 mod ports;
 mod tee;
@@ -62,6 +63,8 @@ pub use ports::{
 pub use tee::FrameTee;
 pub use threads::{ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader};
 
+#[cfg(test)]
+mod meters_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
