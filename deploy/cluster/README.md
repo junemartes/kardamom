@@ -335,6 +335,46 @@ The preflight refuses a reader switch without the egress, the egress without the
 
 The merge chains the copy of an executor only from the start of the stream. An instance with an empty store on a running chain finds no frame to chain to. So start the egress with a new chain, or give a new instance a store. A new node of a rescheduled instance has an empty store too.
 
+### Carry mode
+
+Carry mode moves the transaction bytes into the sealer. One switch turns it on: `KARDAMOM_CARRY_BYTES=on`. It is off by default. With it off, the deploy renders every job as before.
+
+With it on:
+
+- Each sealer member keeps its retained frames in a file (`-Dkardamom.cluster.carryBytes=true`) and relays a full entry as a canonical entry. See [Retained file](../../cluster/sealer-service/README.md#retained-file).
+- Each member sends its retained frames to one executor on its own node: the member feed (`-Dkardamom.cluster.feedAeronDir`, `-Dkardamom.cluster.feedRingBytes`). See [Member feed](../../cluster/sealer-service/README.md#member-feed).
+- The executor job has one group for each member. Group `executor-<i>` runs on `sealer-<i>`, with `--carry-bytes`. Its recorder id, void voter id and host id are `i`.
+- The executor reads the feed on `aeron:ipc` of the shared media driver of its node. The member publishes the feed into that driver. The node is the pair: no setting names the member.
+- The shared media driver (`aeron` job) runs on the sealer nodes too. It records the `exec_txs` stream of the executor in `/opt/kardamom/archive/dir`, beside the archive of the member in `/opt/kardamom/archive`.
+- The state mirrors run on the sealer nodes, next to their executors.
+- The jobs that reach an executor by its node use `sealer-<i>`: the nonce queries of the sequencers, the ingresses and the batcher, the checkpoint peers of the executors and the validator, and the Prometheus targets.
+- With `KARDAMOM_EGRESS=1`, each executor also takes the egress as its second source (`--egress`). The egress stays on the executor nodes.
+
+The member needs the token of its retained file. The deploy reads it from `KARDAMOM_RETAINED_TOKEN` and writes it to the Nomad variable of each member group, `nomad/jobs/cluster/cluster-<i>`, before the sealer registers. See [Secrets](#secrets).
+
+The preflight refuses carry mode:
+
+- without `KARDAMOM_RETAINED_TOKEN`,
+- when `node_classes.executor.count` differs from `node_classes.sealer.count`,
+- with `KARDAMOM_EXEC_CURSOR=on`: an executor that reads the feed sends no recorded cursor,
+- with `KARDAMOM_CLUSTER_SNAPSHOT_S=0`: the purge of the retained file runs at each snapshot.
+
+Every member must match `carryBytes`, and it sets the snapshot layout. So the release gate refuses a change of the switch on a live chain. Turn it on only for a new chain, or in a coordinated cut-over with `KARDAMOM_ALLOW_MUST_MATCH=carryBytes`. The executors of a carry chain read only canonical entries. So activate decision versions 4 and 5 (features 3 and 4, see [The upgrade check](#the-upgrade-check)) before the chain takes user transactions.
+
+The groups of the executor job roll at the same time: Nomad orders no groups. A change of the executor job restarts the three executors together, and the nonce queries fail until the first one is ready again.
+
+#### What a node needs for carry mode
+
+The infrastructure of an environment sets these. The deploy does not change them.
+
+- Each sealer node has `/opt/kardamom/state`, `/opt/kardamom/checkpoints` and `/opt/kardamom/mirror`, writable by the executor and the state mirror. They hold the state database, the checkpoints and the mirror store.
+- Each sealer node has the Aeron tmpfs `/opt/kardamom/aeron-mount` with room for the shared driver as well as the member: the term buffers of the executor streams and the 24 MiB log of the feed.
+- Each sealer node has the memory of the member (heap plus 640 MB), the shared driver (768 MB), the executor (1536 MB) and the state mirror, plus the page cache of the state database.
+- Each sealer node has the disk of the Raft log, the retained file (two snapshot intervals of transaction bytes and two segments of 64 MiB), the state database, the checkpoints and the `exec_txs` recording.
+- The node meta of a sealer node keeps `role = sealer` and `node_index = <i>`. To advertise its `exec_txs` recording, the role set of the node also names `executor`, so the Nomad agent stamps `archive_topics = exec_txs`. No consumer reads that stream yet.
+- The fixed ports of the executor (9004, 9014, 9024) and of the state mirror (9007) are free on a sealer node.
+- The executor nodes stay: they run the egress.
+
 ### Configuration switches
 
 The workloads role reads these environment variables. The defaults are in `ansible/roles/workloads/defaults/main.yml`. An Ansible extra variable can set the matching `workloads_*` variable directly. An empty value means "use the default of the job".
@@ -403,6 +443,8 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Monitoring | `KARDAMOM_PROMETHEUS_RETENTION_TIME`, `KARDAMOM_PROMETHEUS_RETENTION_SIZE` | empty (`24h` and `0B` in the job) | How long and how much Prometheus keeps (job variables `prometheus_retention_time`, `prometheus_retention_size`). `0B` sets no size limit. At a 1 s scrape, staging writes about 3 GB a day. |
 | Sealer | `KARDAMOM_REMOTE_ORIGINS` | empty (`412347,412399` in the job) | The peer chain ids whose cross-chain records the sealer seals. All members use the same list. |
 | Ingress | `KARDAMOM_INGRESS_ACK` (job variable `ack`) | empty (`receipt`) | When `eth_sendRawTransaction` answers. `receipt` waits for the receipt. `validated` answers when the ingress validated the transaction and published it on `tx_data`. See [`../../docs/json-rpc.md`](../../docs/json-rpc.md). |
+| Sealer, executor | `KARDAMOM_CARRY_BYTES` (job variable `carry_bytes` of every job that it changes) | empty (`off` in the jobs) | `on` or `off`. On, the sealer carries the transaction bytes, and each executor runs on the node of its member and reads the member feed. Every member must match it. See [Carry mode](#carry-mode). |
+| Sealer | `KARDAMOM_RETAINED_TOKEN` | empty | The token of the retained file of the members. Carry mode needs it. It reaches the members only through a Nomad variable. See [Secrets](#secrets). |
 | Executor | `KARDAMOM_EXEC_CURSOR` (job variable `exec_cursor`) | empty (`off` in the job) | `on` or `off`. On, each executor sends its recorded cursor to the sealer, the floor of the record-lag guard. Switch it on only after every sealer member reads ingress kind 9. A sealer member that does not read it drops the frame. |
 | Egress | `KARDAMOM_EGRESS` | `0` | `1` deploys the egress job (`nomad/egress.nomad.hcl`) and its scrape (job variable `egress` of the monitoring job). It needs `KARDAMOM_EXEC_FRAMES=on`. See [The egress](#the-egress). |
 | Egress | `KARDAMOM_EXEC_FRAMES` (job variable `exec_frames` of the executor) | empty (`off` in the job) | `on` or `off`. On, each executor publishes the frames that it executes on `exec_frames` (`--exec-frames`). |
@@ -453,6 +495,7 @@ A secret is a keyed L1 URL, a private key, or a receiver token. No job definitio
   - A task reads `nomad/jobs/<job>` with its workload identity. That needs no ACL policy.
   - The `secrets/` directory does not show in `nomad alloc fs`.
   - A `nomad job inspect` shows the template, not the values.
+- A group variable `nomad/jobs/<job>/<group>` holds the secrets of one group. The tasks of that group read it with their workload identity.
 - The deploy token needs `write`, `read` and `list` on `nomad/jobs/*` and on `kardamom/deploys/*` in its namespace.
 - A job that renders its variable waits for it. Without the role, write it first: `nomad var put nomad/jobs/<job> KEY=value`.
 
@@ -466,6 +509,7 @@ A secret is a keyed L1 URL, a private key, or a receiver token. No job definitio
 | `l1-indexer` | `KARDAMOM_BEACON_API` | The beacon API for its finality schedule. |
 | `l1-light-client` | `HELIOS_EXECUTION_RPC`, `HELIOS_CONSENSUS_RPC` | The upstream execution and beacon URLs. |
 | `monitoring` | `alertmanager`, `rules` | Files: `secrets/alertmanager.yml` and `local/operator-rules.yml`. |
+| `cluster`, group `cluster-<i>` (variable `nomad/jobs/cluster/cluster-<i>`) | `KARDAMOM_RETAINED_TOKEN` | `KARDAMOM_RETAINED_TOKEN`, in carry mode only. Every member gets the same token. The template change mode is `noop`, so a new token reaches a member at its next start. The variable `nomad/jobs/cluster` stays the bootstrap flag. |
 
 The followers name an L1 source in their logs by its scheme and host only. A provider key is in the path or the query of the URL, so the logs do not show it.
 

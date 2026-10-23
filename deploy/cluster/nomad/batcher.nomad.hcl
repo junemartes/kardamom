@@ -76,6 +76,18 @@ variable "datacenter" {
   default     = "dc1"
 }
 
+# Carry mode, "on" or "off" (executor.nomad.hcl). On, the executors run
+# on the sealer nodes, so the block reference queries go to sealer-<i>, not to executor-<i>.
+# The deploy passes it from KARDAMOM_CARRY_BYTES.
+variable "carry_bytes" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.carry_bytes)
+    error_message = "The carry_bytes value must be on or off."
+  }
+}
+
 variable "executor_count" {
   type        = number
   description = "The executor node count (node_classes.executor.count). The void voter ids come from it."
@@ -277,7 +289,7 @@ job "batcher" {
             # The block references: the executors' query endpoints by
             # node name, then the validator's by its service record.
             "--block-refs-source", join(",", concat(
-              [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:${var.executor_query_port}"],
+              [for i in range(var.executor_count) : "http://${var.carry_bytes == "on" ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:${var.executor_query_port}"],
               ["http://kardamom-validator-query.service.${var.datacenter}.consul:${var.validator_query_port}"],
             )),
             # Group a few blocks per batch. The sealer emits about 1

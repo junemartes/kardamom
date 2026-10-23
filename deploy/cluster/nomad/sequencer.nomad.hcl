@@ -47,6 +47,18 @@ variable "datacenter" {
   type    = string
   default = "dc1"
 }
+# Carry mode, "on" or "off" (executor.nomad.hcl). On, the executors run
+# on the sealer nodes, so the executor queries go to sealer-<i>, not to executor-<i>.
+# The deploy passes it from KARDAMOM_CARRY_BYTES.
+variable "carry_bytes" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.carry_bytes)
+    error_message = "The carry_bytes value must be on or off."
+  }
+}
+
 variable "executor_count" {
   type    = number
   default = 3
@@ -240,7 +252,7 @@ job "sequencer" {
               "--lane", group.key,
               "--vslots", join(",", group.value.slots),
               "--tx-ttl-ms", format("%d", var.tx_ttl_ms),
-              "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:${var.executor_query_port}"]),
+              "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://${var.carry_bytes == "on" ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:${var.executor_query_port}"]),
               "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
               ], length(group.value.incoming) == 0 ? [] : [
               "--extra-lanes", join(",", sort(distinct([for slot in group.value.incoming : var.previous_shard_table[slot]]))),
