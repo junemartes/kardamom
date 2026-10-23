@@ -119,6 +119,8 @@ final class SealerEgress {
     private final EgressFrames frames = new EgressFrames(egressBuffer);
     /** The member feed: it carries each retained frame to the paired executor. */
     private final Feed feed;
+    /** The pipeline metrics of the service thread. */
+    private final SealerMetrics metrics;
 
     SealerEgress(
             final Cluster cluster,
@@ -127,13 +129,15 @@ final class SealerEgress {
             final Feed feed,
             final long firstRetainedIndex,
             final long firstRetainedBlock,
-            final StartHold hold) {
+            final StartHold hold,
+            final SealerMetrics metrics) {
         this.cluster = cluster;
         this.memberId = memberId;
         this.retained = retained;
         this.feed = feed;
+        this.metrics = metrics;
         this.backlogs = new SessionBacklogs(
-            memberId, SessionBacklogs.STALL_DEADLINE_NS, SessionBacklogs.BYTE_LIMIT, hold);
+            memberId, SessionBacklogs.STALL_DEADLINE_NS, SessionBacklogs.BYTE_LIMIT, hold, metrics);
         this.firstRetainedIndex = firstRetainedIndex;
         this.firstRetainedBlock = firstRetainedBlock;
     }
@@ -653,9 +657,11 @@ final class SealerEgress {
      * their own sessions.</p>
      */
     private void offerToConsumers(final int length) {
+        final long startedNs = metrics.egressOfferStart();
         for (final ClientSession session : targets()) {
             backlogs.offer(session, egressBuffer, length);
         }
+        metrics.egressOfferDone(startedNs);
     }
 
     /** The sessions of {@link #offerToConsumers}, built again after a session change. */

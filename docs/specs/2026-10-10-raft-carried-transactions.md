@@ -3068,7 +3068,7 @@ each replaced part says so.
 34. to 43. **The one-way pipeline (2026-10-21).** Decisions D1 to D10 of
     `docs/specs/2026-10-21-one-way-pipeline.md`, in that order: the ack at admission (D1), no
     receipts at the ingress and the strong confirmation through the egress (D2), the ingress
-    inside the sequencer (D3), the full reference with record type 7 and decision version 5 (D4),
+    on its own fleet (D3, amended 2026-10-22), the full reference with record type 7 and decision version 5 (D4),
     no join and no void (D5), the egress fed by the executors (D6), the batcher and the validator
     on the egress (D7), the sequencers on the egress rows (D8), the validator independence by the
     comparison of the copies (D9), and the carry flag on feature id 4 (D10). D2 replaces decision

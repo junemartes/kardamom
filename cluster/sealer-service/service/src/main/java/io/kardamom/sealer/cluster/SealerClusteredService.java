@@ -149,14 +149,12 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private volatile PurgeView purgeView = PurgeView.EMPTY;
 
-    /** Malformed ingress frames dropped (logged at power-of-two counts). */
-    private long droppedFrameCount = 0;
-
     /**
-     * Ingress frames of a kind this release does not know, dropped (logged
-     * at power-of-two counts). The admin thread and the tests read it.
+     * The pipeline metrics of this thread, for the admin endpoint. It also
+     * holds the counts of the frames that the service did not relay; the
+     * log lines print them at power-of-two counts.
      */
-    private volatile long unknownKindCount = 0;
+    private final SealerMetrics metrics = new SealerMetrics();
 
     /**
      * The version of the newest snapshot this member restored or took, or
@@ -188,11 +186,6 @@ public final class SealerClusteredService implements ClusteredService {
     /** One heartbeat line per this many boundary ticks (a minute at a 2 s tick). */
     private static final long BOUNDARY_TICK_LOG_EVERY = 30L;
 
-    /** Contiguity rejects emitted (logged at power-of-two counts). */
-    private long rejectedFrameCount = 0;
-    private long pastDeadlineCount = 0;
-    private long windowFullCount = 0;
-
     /**
      * The decision rules of the member, for the admin thread. The service
      * thread sets them after the start, at each activation record that
@@ -206,9 +199,6 @@ public final class SealerClusteredService implements ClusteredService {
     /** The activation records of the carry flag that came while version 4 was off: the switch does not follow them. */
     private long earlyActivations;
 
-    /** Version-4 references that came a window behind their image (logged at power-of-two counts). */
-    private long expiredRefCount;
-
     /** The transaction hash of the reference on the version-4 path: one array for every record. */
     private final byte[] refId = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
 
@@ -217,12 +207,6 @@ public final class SealerClusteredService implements ClusteredService {
 
     /** {@link #orderCarried}: the frame holds no whole envelope, or its deadline field holds no position. */
     private static final long CARRIED_MALFORMED = Long.MIN_VALUE;
-
-    /** Remote-origin rejects emitted (logged at power-of-two counts). */
-    private long remoteRejectedFrameCount = 0;
-
-    /** Origin-gap rejects emitted (logged at power-of-two counts). */
-    private long originGapCount = 0;
 
     private final VoidLedger.Config voidConfig;
     /**
@@ -237,10 +221,6 @@ public final class SealerClusteredService implements ClusteredService {
      * Zero turns a guard off.
      */
     private final LagBudgets budgets;
-    /** DA-lag rejects emitted (logged at power-of-two counts). */
-    private long daLagRejectCount = 0;
-    /** Record-lag rejects emitted (logged at power-of-two counts). */
-    private long recordLagRejectCount = 0;
     /** Moves up of the best recorded cursor (logged at power-of-two counts). */
     private long recordedAdvanceCount = 0;
     /**
@@ -561,7 +541,7 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void openEgress(final Optional<ByteBuffer> retention) {
         this.egress = new SealerEgress(
-            cluster, memberId, retained, feed, state.canonicalCount(), state.blockNumber(), startHold);
+            cluster, memberId, retained, feed, state.canonicalCount(), state.blockNumber(), startHold, metrics);
         retention.ifPresentOrElse(egress::restore, egress::openEmpty);
         egress.setDecisionVersion(state.decisionVersion());
         egress.setPostedHead(state.postedHead());
@@ -656,6 +636,7 @@ public final class SealerClusteredService implements ClusteredService {
             final int offset,
             final int length,
             final Header header) {
+        final long startedNs = System.nanoTime();
         // Every log-driven callback first sends what the egress backlogs
         // hold, so a back-pressured session catches up between frames, and
         // the stall deadline is checked at least once per tick.
@@ -664,6 +645,7 @@ public final class SealerClusteredService implements ClusteredService {
         dispatchSessionMessage(session, timestamp, buffer, offset, length);
         afterEntry(versionBefore, timestamp);
         recordServicePosition();
+        metrics.messageDone(startedNs, window.size());
     }
 
     /** Decode the kind tag and dispatch one ingress frame. */
@@ -679,6 +661,7 @@ public final class SealerClusteredService implements ClusteredService {
             return;
         }
         final byte kind = buffer.getByte(offset + SealerWire.KIND_OFFSET);
+        metrics.message(kind);
         switch (kind) {
             case SealerWire.KIND_SUBSCRIBE:
                 egress.addConsumer(session.id());
@@ -799,6 +782,7 @@ public final class SealerClusteredService implements ClusteredService {
             return;
         }
         final int count = buffer.getShort(offset + 1, ByteOrder.LITTLE_ENDIAN) & 0xFFFF;
+        metrics.ingressBatch(count);
         int pos = offset + 3;
         final int limit = offset + length;
         for (int i = 0; i < count; i++) {
@@ -876,15 +860,15 @@ public final class SealerClusteredService implements ClusteredService {
      * moved no replicated state, and every member computed it the same way.
      */
     private void onOriginGap(final ClientSession session, final long offeredOrigin, final long expectedOrigin) {
-        originGapCount++;
-        if (Long.bitCount(originGapCount) == 1) {
+        final long total = metrics.frame(SealerMetrics.Frame.ORIGIN_GAP);
+        if (Long.bitCount(total) == 1) {
             // Log to stdout like the other operational signals, so the e2e
             // and chaos suites can grep it. Count at powers of two so a
             // storm cannot flood the log.
             System.out.println("cluster ORIGIN-GAP memberId=" + memberId
                 + " offered=" + offeredOrigin
                 + " expected=" + expectedOrigin
-                + " totalOriginGaps=" + originGapCount);
+                + " totalOriginGaps=" + total);
         }
         egress.offerOriginGap(session, offeredOrigin, expectedOrigin);
     }
@@ -952,8 +936,8 @@ public final class SealerClusteredService implements ClusteredService {
             final long firstSeq,
             final long expectedNextSeq,
             final byte reason) {
-        remoteRejectedFrameCount++;
-        if (Long.bitCount(remoteRejectedFrameCount) == 1) {
+        final long total = metrics.frame(SealerMetrics.Frame.REMOTE_ORIGIN_REJECT);
+        if (Long.bitCount(total) == 1) {
             // Log to stdout like the other operational signals, so the e2e
             // and chaos suites can grep it. Count at powers of two so a
             // storm cannot flood the log.
@@ -962,7 +946,7 @@ public final class SealerClusteredService implements ClusteredService {
                 + " firstSeq=" + Long.toUnsignedString(firstSeq)
                 + " expectedNextSeq=" + Long.toUnsignedString(expectedNextSeq)
                 + " reason=" + reason
-                + " totalRejected=" + remoteRejectedFrameCount);
+                + " totalRejected=" + total);
         }
         egress.offerRemoteOriginReject(session, originChainId, firstSeq, expectedNextSeq, reason);
     }
@@ -1039,10 +1023,23 @@ public final class SealerClusteredService implements ClusteredService {
      * in the flush order, so the egress relays in that order.
      */
     private void flushWindow() {
+        // Without a window, each record flushes a window of one, and the
+        // message step already times it: the record path reads no clock here.
+        if (window.capacity() == 0) {
+            admitHeld();
+            return;
+        }
+        final long startedNs = System.nanoTime();
+        metrics.windowFlushed(startedNs, admitHeld());
+    }
+
+    /** Run the record path on every held record in flush order, and return how many it took. */
+    private int admitHeld() {
         final List<HeldRecord> held = window.flush();
         for (HeldRecord record : held) {
             admitRecord(record);
         }
+        return held.size();
     }
 
     /**
@@ -1208,9 +1205,9 @@ public final class SealerClusteredService implements ClusteredService {
 
     /** Count a reference that came a window behind its image: a late copy, or a reference held too long. */
     private void onRefExpired() {
-        expiredRefCount++;
-        if (Long.bitCount(expiredRefCount) == 1) {
-            System.out.println("cluster REF-EXPIRED memberId=" + memberId + " total=" + expiredRefCount);
+        final long total = metrics.frame(SealerMetrics.Frame.EXPIRED_REF);
+        if (Long.bitCount(total) == 1) {
+            System.out.println("cluster REF-EXPIRED memberId=" + memberId + " total=" + total);
         }
     }
 
@@ -1393,13 +1390,13 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void onDaLagReject(final HeldRecord r) {
         final long nonce = r.nonce;
-        daLagRejectCount++;
-        if (Long.bitCount(daLagRejectCount) == 1) {
+        final long total = metrics.frame(SealerMetrics.Frame.DA_LAG_REJECT);
+        if (Long.bitCount(total) == 1) {
             System.out.println("cluster DA-LAG-REJECT memberId=" + memberId
                 + " nonce=" + nonce + " sealedHead=" + state.sealedHead()
                 + " postedHead=" + state.postedHead()
                 + " budget=" + state.daLagBudgetBlocks()
-                + " totalDaLagRejected=" + daLagRejectCount);
+                + " totalDaLagRejected=" + total);
         }
         egress.offerDaLagReject(r.session, r.sender, nonce, status());
     }
@@ -1410,13 +1407,13 @@ public final class SealerClusteredService implements ClusteredService {
      * to the client instead of republishing.
      */
     private void onRecordLagReject(final HeldRecord r) {
-        recordLagRejectCount++;
-        if (Long.bitCount(recordLagRejectCount) == 1) {
+        final long total = metrics.frame(SealerMetrics.Frame.RECORD_LAG_REJECT);
+        if (Long.bitCount(total) == 1) {
             System.out.println("cluster RECORD-LAG-REJECT memberId=" + memberId
                 + " nonce=" + r.nonce + " sealedIndex=" + state.sealedIndex()
                 + " bestRecorded=" + state.bestRecorded()
                 + " budget=" + state.recordLagBudget()
-                + " totalRecordLagRejected=" + recordLagRejectCount);
+                + " totalRecordLagRejected=" + total);
         }
         egress.offerRecordLagReject(r.session, r.sender, r.nonce, state.sealedIndex(), status());
     }
@@ -1456,14 +1453,14 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void onContiguityReject(final HeldRecord r, final long expected) {
         final long nonce = r.nonce;
-        rejectedFrameCount++;
-        if (Long.bitCount(rejectedFrameCount) == 1) {
+        final long total = metrics.frame(SealerMetrics.Frame.CONTIGUITY_REJECT);
+        if (Long.bitCount(total) == 1) {
             // Log to stdout like the other operational signals, so the chaos
             // suite can grep it. Count at powers of two so a gap storm cannot
             // flood the log.
             System.out.println("cluster CONTIGUITY-REJECT memberId=" + memberId
                 + " nonce=" + nonce + " expected=" + expected
-                + " totalRejected=" + rejectedFrameCount);
+                + " totalRejected=" + total);
         }
         egress.offerContiguityReject(r.session, r.sender, nonce, expected);
     }
@@ -1475,12 +1472,12 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void onPastDeadline(final HeldRecord r, final long maxInclusionBlock) {
         final long nonce = r.nonce;
-        pastDeadlineCount++;
-        if (Long.bitCount(pastDeadlineCount) == 1) {
+        final long total = metrics.frame(SealerMetrics.Frame.PAST_DEADLINE);
+        if (Long.bitCount(total) == 1) {
             System.out.println("cluster PAST-DEADLINE memberId=" + memberId
                 + " nonce=" + nonce + " maxInclusionBlock=" + maxInclusionBlock
                 + " atBlock=" + state.blockNumber()
-                + " totalPastDeadline=" + pastDeadlineCount);
+                + " totalPastDeadline=" + total);
         }
         egress.offerPastDeadline(
             r.session, r.sender, nonce, maxInclusionBlock, state.blockNumber());
@@ -1493,21 +1490,23 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void onWindowFull(final HeldRecord r) {
         final long nonce = r.nonce;
-        windowFullCount++;
-        if (Long.bitCount(windowFullCount) == 1) {
+        final long total = metrics.frame(SealerMetrics.Frame.WINDOW_FULL);
+        if (Long.bitCount(total) == 1) {
             System.out.println("cluster WINDOW-FULL memberId=" + memberId
                 + " nonce=" + nonce + " windowSize=" + state.dedupSize()
                 + " capacity=" + state.dedupCapacity()
-                + " totalWindowFull=" + windowFullCount);
+                + " totalWindowFull=" + total);
         }
         egress.offerWindowFull(r.session, r.sender, nonce);
     }
 
     @Override
     public void onTimerEvent(long correlationId, long timestamp) {
+        final long startedNs = System.nanoTime();
         final int versionBefore = state.decisionVersion();
         onTimer(correlationId);
         afterEntry(versionBefore, timestamp);
+        metrics.timerDone(startedNs, window.size());
     }
 
     /** One timer entry: the ordering window, or the boundary tick. */
@@ -1522,6 +1521,7 @@ public final class SealerClusteredService implements ClusteredService {
         if (correlationId != BOUNDARY_TIMER_CORRELATION_ID) {
             return;
         }
+        final long boundaryStartedNs = System.nanoTime();
         // The window closes at a boundary: a reorder never crosses a block.
         flushWindow();
         final Boundary boundary = state.onTick(cluster.time());
@@ -1542,6 +1542,7 @@ public final class SealerClusteredService implements ClusteredService {
         }
         // Cluster timers are one-shot, so re-arm for the next tick.
         scheduleBoundaryTimer();
+        metrics.boundaryDone(boundaryStartedNs);
     }
 
     /**
@@ -1610,6 +1611,7 @@ public final class SealerClusteredService implements ClusteredService {
         System.out.println("sealer snapshot TAKEN memberId=" + memberId
             + " block=" + state.blockNumber() + " canonicalCount=" + state.canonicalCount()
             + " ms=" + ms);
+        metrics.snapshotDone(startNs);
     }
 
     @Override
@@ -1639,7 +1641,16 @@ public final class SealerClusteredService implements ClusteredService {
     public int doBackgroundWork(final long nowNs) {
         // While the start hold lasts, the member feed reads no request of
         // its executor, so it sends no frame.
-        return startHold.held() ? 0 : feed.doWork(egress, state.canonicalCount(), state.blockNumber());
+        if (startHold.held()) {
+            return 0;
+        }
+        final long startedNs = System.nanoTime();
+        final int work = feed.doWork(egress, state.canonicalCount(), state.blockNumber());
+        // A pass with no work is idle time of the duty cycle, not busy time.
+        if (work > 0) {
+            metrics.busySince(startedNs);
+        }
+        return work;
     }
 
     /** The leadership term whose start this service applied last, or -1 before any. */
@@ -1669,7 +1680,12 @@ public final class SealerClusteredService implements ClusteredService {
 
     /** Ingress frames of an unknown kind this member dropped. */
     long droppedUnknownKindCount() {
-        return unknownKindCount;
+        return metrics.frames(SealerMetrics.Frame.UNKNOWN_KIND);
+    }
+
+    /** The pipeline metrics of the service thread. */
+    SealerMetrics metrics() {
+        return metrics;
     }
 
     /** The store of the retained frames. */
@@ -1760,8 +1776,7 @@ public final class SealerClusteredService implements ClusteredService {
      * greps.
      */
     private void onMalformedFrame(final String what, final int length) {
-        droppedFrameCount++;
-        logDrop(droppedFrameCount, "malformed " + what, length);
+        logDrop(metrics.frame(SealerMetrics.Frame.MALFORMED), "malformed " + what, length);
     }
 
     /**
@@ -1770,8 +1785,7 @@ public final class SealerClusteredService implements ClusteredService {
      * so the counters of the members agree.
      */
     private void onUnknownKind(final byte kind, final int length) {
-        unknownKindCount++;
-        logDrop(unknownKindCount, "unknown-kind kind=" + kind, length);
+        logDrop(metrics.frame(SealerMetrics.Frame.UNKNOWN_KIND), "unknown-kind kind=" + kind, length);
     }
 
     /** One log line per power of two of {@code total}, so a flood cannot drown stdout. */

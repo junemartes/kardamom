@@ -42,7 +42,7 @@ class SessionBacklogsTest {
     @Test
     void theStartHoldQueuesEveryFrameAndClosesNothing() throws InterruptedException {
         final StartHold hold = new StartHold();
-        final SessionBacklogs held = new SessionBacklogs(0, STALL_NS, BYTE_LIMIT, hold);
+        final SessionBacklogs held = new SessionBacklogs(0, STALL_NS, BYTE_LIMIT, hold, new SealerMetrics());
         final StubSession session = new StubSession(1);
         final UnsafeBuffer buffer = new UnsafeBuffer(new byte[8]);
 

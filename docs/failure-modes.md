@@ -410,6 +410,10 @@ The kill-based cases prove the restart logic. They do not prove durability again
 - At level 0, the kernel writes the log back on its own schedule. With the Linux defaults (`vm.dirty_expire_centisecs=3000`, `vm.dirty_writeback_centisecs=500`), a page reaches the disk within about 35 s.
 - So an entry that a quorum acknowledged can exist only in the page caches of its members for that time. A power loss or a kernel crash on a majority of members in that time drops it. Each member runs on its own machine, so one power loss takes at most one member. `pipeline-blackout-recover` stands for that event.
 - Only a test that cuts the power of a VM can prove this end to end.
+- On staging the three sealers are in different data centers (decision of the user, 2026-10-22). So one power event cannot take a majority, and the window above needs power losses in two data centers.
+- The backup sealer (`cluster-backup`, node `backup-0`) is the recovery path for that event. It is outside the quorum and copies each snapshot and the log after it from a follower. It syncs its own copy at level 1 (`kardamom.backup.fileSyncLevel`): its syncs do not delay a commit. See the sealer README, "Backup mode".
+- Level 0 is safe only while no two members share a power domain. A member that moves into the data center of another member needs level 1 again, or a backup in a third power domain.
+- An executor that applied an entry that such a loss drops stops with `ClusterBehindCursor`, and an operator repairs it. The automatic rollback (#655) runs only with the carry flag (`--carry-bytes`).
 
 ## Executor
 
