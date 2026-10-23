@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.LagBudgets;
 import io.kardamom.sealer.VersionSwitch;
 import io.kardamom.sealer.cluster.DriverlessLog.Entry;
 import io.kardamom.sealer.cluster.DriverlessLog.Member;
@@ -58,12 +59,7 @@ class SealerVersionFiveTest {
 
     /** A kind-0 reference of record type 0 of image {@code (lane 0, session 9)} at {@code position}. */
     private static byte[] ref(final int idTag, final long position) {
-        final ByteBuffer buf = ByteBuffer.allocate(SealerWire.TXREF_RECORD_LEN).order(ByteOrder.LITTLE_ENDIAN);
-        buf.put(SealerWire.KIND_INGRESS_RECORD).put(FullRef.filled(CanonicalSealerState.SENDER_LEN, 0xAA))
-            .putLong(0L).putLong(SealerWire.POSITION_TAG | position).putLong(0L).putLong(0L)
-            .put(IngressFrames.recordId(idTag)).put(SealerWire.RT_TXREF)
-            .put((byte) 0).putInt(0).putInt((int) position).putInt(9);
-        return buf.array();
+        return IngressFrames.txRefFrame(idTag, FullRef.filled(CanonicalSealerState.SENDER_LEN, 0xAA), 0L, position);
     }
 
     /**
@@ -186,8 +182,8 @@ class SealerVersionFiveTest {
     }
 
     private void restartAt(final List<Entry> entries, final int cut, final Path dir) {
-        final Member peer = log.carrying(dir.resolve("peer"), Optional.empty());
-        final Member member = log.carrying(dir.resolve("member"), Optional.empty());
+        final Member peer = log.carrying(Optional.empty(), dir.resolve("peer"), LagBudgets.DEFAULT);
+        final Member member = log.carrying(Optional.empty(), dir.resolve("member"), LagBudgets.DEFAULT);
         final List<Entry> head = entries.subList(0, cut);
         assertEquals(peer.applyAll(head), member.applyAll(head));
         final byte[] snapshot = member.svc().snapshot();

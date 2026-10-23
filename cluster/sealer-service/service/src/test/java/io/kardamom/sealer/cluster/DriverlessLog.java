@@ -22,8 +22,7 @@ final class DriverlessLog {
 
     /** The dedup window of every member. */
     static final int CAPACITY = 16;
-
-    /** The segment size of the retained file of a carrying member. */
+    /** The segment size of the retained file of a member that carries the bytes. */
     private static final int SEGMENT_BYTES = 64 * 1024;
 
     /** One log entry: an ingress frame, or a boundary tick when {@code frame} is empty. */
@@ -80,12 +79,25 @@ final class DriverlessLog {
 
     /** A heap member with an ordering window of {@code orderingWindow} records, from {@code snapshot} or at genesis. */
     Member member(final Optional<byte[]> snapshot, final int orderingWindow) {
-        return start(snapshot, orderingWindow, Optional.empty());
+        return member(snapshot, orderingWindow, LagBudgets.DEFAULT);
     }
 
-    /** A member that keeps its retained frames in a file in {@code dir}, from {@code snapshot} or at genesis. */
-    Member carrying(final Path dir, final Optional<byte[]> snapshot) {
-        return start(snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW,
+    /** A heap member with no ordering window and the lag guards of {@code budgets}, from {@code snapshot} or at genesis. */
+    Member member(final Optional<byte[]> snapshot, final LagBudgets budgets) {
+        return member(snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW, budgets);
+    }
+
+    private Member member(final Optional<byte[]> snapshot, final int orderingWindow, final LagBudgets budgets) {
+        return member(snapshot, orderingWindow, budgets, Optional.empty());
+    }
+
+    /**
+     * A member that carries the bytes and keeps its retained frames in a
+     * file under {@code dir}, with the lag guards of {@code budgets}, from
+     * {@code snapshot} or at genesis.
+     */
+    Member carrying(final Optional<byte[]> snapshot, final Path dir, final LagBudgets budgets) {
+        return member(snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW, budgets,
             Optional.of(new RetainedFile.Config(dir, SEGMENT_BYTES)));
     }
 
@@ -93,17 +105,20 @@ final class DriverlessLog {
     Member restart(final Member member, final Path dir, final byte[] snapshot) {
         started.remove(member);
         member.svc().onTerminate(member.cluster());
-        return carrying(dir, Optional.of(snapshot));
+        return carrying(Optional.of(snapshot), dir, LagBudgets.DEFAULT);
     }
 
-    private Member start(
-            final Optional<byte[]> snapshot, final int orderingWindow, final Optional<RetainedFile.Config> file) {
+    private Member member(
+            final Optional<byte[]> snapshot,
+            final int orderingWindow,
+            final LagBudgets budgets,
+            final Optional<RetainedFile.Config> file) {
         final StubCluster cluster = new StubCluster();
         cluster.role = io.aeron.cluster.service.Cluster.Role.FOLLOWER;
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService svc = new SealerClusteredService(
             CAPACITY, 250, 0, Set.of(), VoidLedger.Config.DISABLED,
-            CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS, orderingWindow, LagBudgets.DEFAULT);
+            CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS, orderingWindow, budgets);
         file.ifPresent(svc::carryingBytes);
         svc.start(cluster, snapshot);
         final Member member = new Member(svc, cluster, sequencer);
