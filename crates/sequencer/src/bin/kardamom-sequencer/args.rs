@@ -9,8 +9,6 @@ use clap::Parser;
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_types::shard_map::VslotSet;
 
-use crate::ingress::Embedded;
-
 #[derive(Debug, Parser)]
 #[command(
     name = "kardamom-sequencer",
@@ -122,9 +120,6 @@ pub(crate) struct Args {
     /// off): the deploy sets both from one value.
     #[arg(long, env = "KARDAMOM_PRIORITY_FEES")]
     priority_fees: Option<bool>,
-    /// A service that runs inside this process. None runs when absent.
-    #[command(subcommand)]
-    pub(crate) embedded: Option<Embedded>,
 }
 
 impl Args {
@@ -200,7 +195,3 @@ impl Args {
         cfg.fees.priority = self.priority_fees.unwrap_or(cfg.fees.priority);
     }
 }
-
-#[cfg(test)]
-#[path = "args_tests.rs"]
-mod tests;

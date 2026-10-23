@@ -48,8 +48,6 @@ kardamom-cluster-adapter = { path = "../cluster-adapter" }
 # The local account layer: the rows on the tx_receipts batch frame answer
 # a cold sender's floor before any executor query.
 kardamom-cache = { workspace = true }
-# The ingress service, which the binary can run inside the process.
-kardamom-ingress = { path = "../ingress" }
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-obs = { path = "../obs" }
 kardamom-types.workspace = true

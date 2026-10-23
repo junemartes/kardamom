@@ -99,14 +99,44 @@ struct Args {
     join_timeout_secs: NonZeroU64,
 }
 
-/// The live publication of the merged stream.
-struct Live(PubHandle);
+/// A live publication of the egress.
+struct Live {
+    handle: PubHandle,
+    /// Whether every reader repairs a gap with the range read of the
+    /// egress. Then a refused offer drops the frame at once: with no
+    /// reader, the retry queue of the Aeron thread would hold each frame
+    /// until its deadline, and each loop pass would check them all.
+    repaired: bool,
+}
+
+impl Live {
+    /// `egress_order`: a carried reader repairs a gap with the range read.
+    fn order(handle: PubHandle) -> Self {
+        Self {
+            handle,
+            repaired: true,
+        }
+    }
+
+    /// `egress_receipts`: a receipt reader repairs no gap, so a frame
+    /// waits for its subscriber until the offer deadline.
+    fn receipts(handle: PubHandle) -> Self {
+        Self {
+            handle,
+            repaired: false,
+        }
+    }
+}
 
 impl FramePublisher for Live {
     fn publish(&self, frame: &[u8]) {
         let mut bytes = rkyv::util::AlignedVec::with_capacity(frame.len());
         bytes.extend_from_slice(frame);
-        self.0.publish_best_effort(bytes);
+        if self.repaired {
+            self.handle.publish_lossy(bytes);
+        } else {
+            self.handle.publish_best_effort(bytes);
+        }
     }
 }
 
@@ -170,8 +200,8 @@ async fn main() -> Result<()> {
             merge,
             store,
             receipts: Receipts::new(args.receipts),
-            live: Live(live),
-            receipts_live: Live(receipts_live),
+            live: Live::order(live),
+            receipts_live: Live::receipts(receipts_live),
         },
     );
     let owner_thread = std::thread::Builder::new()

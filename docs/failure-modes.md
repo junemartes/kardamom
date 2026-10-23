@@ -144,7 +144,7 @@ Each service publishes its lifecycle state on the `events` stream. The stream gi
 
 ### DA-lag guard and posted-head retention floor
 
-The sealer refuses user records when the batcher falls too far behind on L1. The sealer also keeps every frame that L1 does not hold yet.
+The sealer refuses user records when the batcher falls too far behind on L1. Below decision version 5, the sealer also keeps every frame that L1 does not hold yet.
 
 - **Posted head.** The batcher sends its confirmed cursor to the sealer at start and on every change. The sealer keeps it in the replicated state.
 - **Guard.** The sealer refuses a user record when the budget is above 0 and the sealed head is more than the budget past the posted head.
@@ -159,11 +159,15 @@ The sealer refuses user records when the batcher falls too far behind on L1. The
   - The ingress raises `da_lag` while the frame says halted, and clears it when the frame says not halted.
   - Any status frame ends a `sealer_no_quorum` halt.
   - The status before a Raft snapshot carries the snapshot notice. The consensus module sends nothing until the snapshot is complete, and on a loaded disk that takes many seconds. After the notice, the ingress waits 60 s for the next status, not 10 s.
-- **Retention floor.** `kardamom.cluster.retention` is a minimum, not a maximum.
+- **Retention floor.** Below decision version 5, `kardamom.cluster.retention` is a minimum, not a maximum.
   - A frame past the window leaves only when its block is at or below the posted head.
   - The batcher can always replay from its cursor.
   - The guard bounds the growth. The stretch is at most the budget plus one flush, in heap.
-  - The retained frames are in the snapshot. A restored member keeps the floor at the posted head.
+  - The retained frames are in the snapshot. A restored member keeps the floor of the snapshot.
+- **Replay window.** Under decision version 5 (the carry flag) on members with `kardamom.cluster.carryBytes=true`, `kardamom.cluster.retention` is the exact window. Members that keep the frames on the heap keep the posted rule, because no member feed runs and the egress cannot serve a reference.
+  - A frame past the window leaves at once, at any posted head. The retained frames have a fixed bound at any DA lag.
+  - A cursor below the window gets `REPLAY_UNAVAILABLE`, the batcher too. The reader recovers from another source.
+  - The guard still refuses user records. It holds no frame.
 - **Retained file.** With `kardamom.cluster.carryBytes=true`, the retained frames are in an append-only file on the disk of each member, not on the heap. The default is off.
   - The heap keeps only an index: the end index and the file position of each retained boundary. The heap does not grow with the retained bytes.
   - The member orders a full entry (record type 5) and retains it as a canonical entry with its envelope (record type 6). Each egress session gets the relayed reference (egress kind 15), live and in a replay, never the envelope. The twin copy drops at the dedup, and each refusal is the same as without the file.
@@ -465,7 +469,7 @@ The executors are deterministic state machines. One dead or lagging replica neve
     - A peer serves its log after its base (`GET /checkpoint/log`), so a peer base below a retention floor serves when its log reaches the floor.
     - The writer never waits for the log. A full queue drops the batch (`kardamom_checkpoint_log_dropped_total`), and the gap makes the next base start at once.
 - **Replay-window overrun**
-  - Trigger: the cluster keeps a bounded canonical window (`kardamom.cluster.retention`, default 65,536 frames, about 5 minutes at 200 tps). A `REPLAY_FROM` below the floor of the window is refused with `REPLAY_UNAVAILABLE`. The window is a minimum. A frame past it stays until L1 holds its block (see "DA-lag guard and posted-head retention floor"). The retained frames are in the cluster snapshot, so a member that restores from a snapshot keeps the floor at the posted head. A cursor that is older than the window is the trigger.
+  - Trigger: the cluster keeps a bounded canonical window (`kardamom.cluster.retention`, default 65,536 frames, about 5 minutes at 200 tps). A `REPLAY_FROM` below the floor of the window is refused with `REPLAY_UNAVAILABLE`. Below decision version 5, the window is a minimum: a frame past it stays until L1 holds its block. Under version 5 with `carryBytes`, the window is exact (see "DA-lag guard and posted-head retention floor"). The retained frames are in the cluster snapshot, so a member that restores from a snapshot keeps the floor of the snapshot. A cursor that is older than the window is the trigger.
   - Effect: the refusal is terminal for the local state. A cursor below the floor can never catch up. A fresh or wiped node cannot re-sync from genesis either, because genesis aged out of the window.
   - Recovery with `--carry-bytes` and `--egress`: the executor reads the egress first.
     - The member refuses the cursor. The reader then reads the range read of the egress from the cursor to the head of the store, then the live `egress_order`. It goes back to the member feed when the feed serves the cursor again.
@@ -576,11 +580,6 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
   - The duplicate cache holds the newest `--duplicate-cache-entries` hashes (default 65,536), with the recovered sender. A copy of a held hash answers its hash with no recovery and no publication. Only a published hash enters the cache. A hash that the sequencer dropped stays in the cache until it is evicted, so a copy of it in that time does not publish again. A cache miss costs one more recovery and publication, and the window of the sealer drops the second copy.
   - An accepted transaction can still drop later. The client reads the result through the egress: the receipt read or the status feed.
   - Proof: `crates/ingress/src/proxy/validated_tests.rs`.
-- **The ingress inside a sequencer process (the job variable `ingress`)**
-  - The ingress and the sequencer of a lane share one process, so they die together. Only the in-flight clients of that process pay. They retry against another process. The twin keeps the lane.
-  - At a stop, the ingress drains first, while the sequencer loops still run, so a parked submit still gets its verdict. Then the loops stop. The kill timeout of the job (`tx_ttl_ms` plus 10 s) covers the drain.
-  - The ingress runs on its own Tokio runtime, so a JSON-RPC burst takes no worker of the sequencer runtime. It shares the media driver and the CPU of the node with the sequencer.
-  - Proof: `args::tests` in the sequencer binary (the subcommand and its default off), and `test_sequencer.py` (the job with the variable on and off). No chaos case covers this mode yet.
 - The JSON-RPC surface is in [`json-rpc.md`](json-rpc.md).
 
 ## Sequencer (2 shards x 2 racing replicas)
