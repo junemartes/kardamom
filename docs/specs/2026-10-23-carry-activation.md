@@ -1,6 +1,6 @@
 # Carry activation: the exact window and the member feed on the heap
 
-- Status: revision 2, draft for review.
+- Status: revision 3, draft for review.
 - Issue: #771 (the carried path is not complete on staging). This spec closes gap 3 (the
   switch of a live chain) and gap 1 (the executors read the member feed).
 - The user decided on 2026-10-23:
@@ -17,7 +17,9 @@
 - Builds on (assumed merged first): #779 (snapshot version 17, the file layout), #781 (the shared
   driver on the sealer nodes and the pinned executor groups), the preflight of #780, and #765
   (the exact window under version 5).
-- Section 17 maps each finding of the review of revision 1 to its change.
+- Section 17 maps each finding of the review of revision 1 to its change, and section 18 each
+  finding of the review of revision 2.
+- Also builds on #768 (the `tx_drops` stream and `TxDrop`), for the drop record of section 5.
 
 ## 1. The problem
 
@@ -55,9 +57,10 @@
 
 ### 1.3 Findings
 
-- **F1. The executors already get the bytes.** #771 gap 1 says that the executors read
-  references. That is mostly not true. On a heap member under version 5, they get each `RT_TX`
-  entry with its bytes (1.1).
+- **F1. The executors already get the bytes of a type-7 offer.** #771 gap 1 says that the
+  executors read references. That is true only for the entries of a type-0 offer. On a heap
+  member under version 5, each entry of a type-7 offer reaches the executors as `RT_TX`, with its
+  bytes (1.1).
 - **F2. The references come from type-0 offers.** A reference reaches a reader only when a
   sequencer offers a type-0 reference. There are two causes:
   - A sequencer session opens. Until kind 17 of that session arrives, the version of the
@@ -69,7 +72,7 @@
 - **F3. The heap already holds what the feed needs.** Under version 5, each heap frame of a
   type-7 offer holds the envelope. So the feed can walk the heap frames. No file is needed.
 - **F4. The feed is local.** The feed sends frames on its own IPC publication, through a ring
-  on its own thread (`MemberFeed.java`). It reads `SealerEgress.replayVerdict` and writes
+  on its own thread (`MemberFeed.java`). It reads `SealerEgress.replayVerdict`. It writes
   nothing that the state or a cluster session reads. A full ring gaps only the feed. So a deploy
   setting can turn it on, member by member.
 - **F5. A carry-mode executor cannot join a reference.** It opens no `tx_data` lane
@@ -77,6 +80,21 @@
   as an ordinary record (`crates/engine/src/reader/carried/answer.rs:210`). The switch between
   its sources has no rule for a fault that every source gives: it switches again and again
   (`crates/engine/src/reader/carried/switch.rs:95-139`, the last arm).
+- **F6. A type 7 below version 5 halts the reference-mode executors.** Below version 5, the
+  sealer relays a full reference with its record type 7. The Rust decoder refuses that type
+  (`crates/cluster-adapter/src/wire/egress.rs:375`, `UnrelayedRecordType`). The cluster reader
+  then drops the frame (`crates/engine/src/reader/cluster/mod.rs:285-290`). So the executor has a
+  gap at that index and stops. A sequencer with a high version on a chain below version 5 makes
+  such a frame. Section 7.4 fixes the decoder.
+- **F7. The v2 sequencer has no answer path.** Staging runs the v2 loop of the sequencer
+  (`crates/sequencer/src/bin/kardamom-sequencer/main.rs:239-275`, `admission.enabled`). The v2
+  loop keeps no candidate after its offer and handles no sealer answer
+  (`crates/sequencer/src/v2/mod.rs:417`, `:426-433`). So a refusal of the sealer cannot make it
+  offer the transaction again. Section 4.3 and section 5 use a drop record instead.
+- **F8. The egress store rebuilds its head from the last segment only.** `Store::open` scans only
+  the last segment (`crates/egress/src/store.rs:81-105`, `:290-300`). So a value that the egress
+  computes from the frames, such as the highest stored reference, would go back at a restart.
+  Section 7.2 keeps it in a side file.
 
 ## 2. Goals and limits
 
@@ -97,22 +115,27 @@
 
 ## 3. The design in short
 
-1. **The sequencer keeps its version.** It keeps the highest version that any of its sessions
+1. **The readers decode a relayed type 7.** A reader that gets a full reference below version 5
+   runs it as a canonical entry. This change ships first, to every reader.
+2. **The sequencer keeps its version.** It keeps the highest version that any of its sessions
    reported. It lowers it only on a kind 17 of the current session that says lower. A start
-   setting gives the first value. So a sequencer of this release sends no type 0 under version 5.
-2. **The member feed on the heap.** `MemberFeed` walks the heap frames by a frame number, not by a
+   floor gives the first value. So a sequencer of this release sends no type-0 reference under
+   version 5.
+3. **The member feed on the heap.** `MemberFeed` walks the heap frames by a frame number, not by a
    file position. A deploy setting turns it on, member by member.
-3. **Feature 5 (`FEATURE_CARRY_WINDOW`).** An upgrade transaction schedules it. While version 5
+4. **Feature 5 (`FEATURE_CARRY_WINDOW`).** An upgrade transaction schedules it. While version 5
    and feature 5 are both on:
    - the exact window holds on every member;
-   - the sealer refuses a type-0 transaction reference with a reject frame, and the sequencer
-     offers the transaction again as type 7.
-4. **Both ways.** Feature 5 follows the rules of features 3 and 4. It can turn off and on again.
+   - the sealer refuses a type-0 transaction reference. It answers the session with a reject
+     frame. The sequencer publishes a drop record for the hash, so the client sees the status
+     `dropped` and sends again.
+5. **Both ways.** Feature 5 follows the rules of features 3 and 4. It can turn off and on again.
    Decision 23 of the carry spec holds.
-5. **Snapshot version 18.** Version 16, then the state and the schedule of feature 5. The heap
+6. **Snapshot version 18.** Version 16, then the state and the schedule of feature 5. The heap
    section does not change. A member writes 18 only when it holds an activation of feature 5.
-6. **The order.** The sequencers stop the type-0 offers first. The batcher and the validator move
-   to the egress. Then feature 5 turns on the window. Then the executors move to the feed.
+7. **The order.** The readers get the decoder. The sequencers stop the type-0 offers. The batcher
+   and the validator move to the egress. Then feature 5 turns on the window. Then the executors
+   move to the feed.
 
 ## 4. The sealer
 
@@ -128,6 +151,16 @@
 - **EARLY.** The state stores an activation of feature 5 only while version 5 runs. This is the
   rule of feature 4 under version 4 (`VersionSwitch.java:156-158`). A record that comes under
   version 3 or 4 changes nothing (outcome `EARLY`).
+- **UNSUPPORTED.** A member with the retained file (a chain born with `carryBytes`, snapshot 12
+  or 17) never stores an activation of feature 5. The record gets the new outcome `UNSUPPORTED`.
+  The member counts it in `kardamom_sealer_feature_unsupported_total` and logs
+  `cluster FEATURE-ACTIVATION-UNSUPPORTED`.
+  - Why: the snapshot of a file member (12 or 17) has no place for the schedule. A file member
+    that stored it would lose it at its next restore, and fork from its peers.
+  - The choice is deterministic: `carryBytes` is a must-match setting, so every member of such a
+    chain gives the same outcome. The service tells the state at the start
+    (`state.fileStore(true)`), before the first entry.
+  - The gate refuses feature 5 while any member reports a file store (section 9).
 - **The flag.** At each boundary, the state evaluates `window.onAt(...)` as it evaluates the
   version (`VersionSwitch.java:175-201`). The result is the flag `carryWindow` of the next block.
   The rules of feature 5 apply while `carryWindow` is on and the version is 5:
@@ -142,18 +175,23 @@
 
 There are two rules. They change at two defined points of the same log entry.
 
-- **The record rule (the type-0 refusal, 4.3).** It reads the flag of the state. The state sets
-  the flag at the boundary, inside the log entry. So the rule applies from the first record of
-  the block that the boundary opens.
-  - A timer tick: the boundary is the whole entry. The next record is in the next entry.
-  - A forced boundary: an origin record forces the boundary, and the boundary goes out before
-    the record (`SealerClusteredService.java:1554-1558`, `offerAdvance`). The forcing record is
-    an epoch, not a transaction reference. In a batch (kind 3), the entries after the forcing
-    record are in the new block, so the new rule applies to them in the same entry.
+- **The record rule (the type-0 refusal, 4.3).** It reads the flag of the state.
+  - The state sets the flag at the boundary, inside the log entry.
+  - So the rule applies from the first record of the block that the boundary opens.
+- **The two kinds of boundary:**
+  - A timer tick. The boundary is the whole entry. The next record is in the next entry.
+  - A forced boundary. Only an origin record (`KIND_ORIGIN_RECORD`, kind 4) forces a boundary.
+    The boundary goes out before the record (`SealerClusteredService.java:1554-1558`,
+    `offerAdvance`). The forcing record is an epoch, not a transaction reference. The entry holds
+    no other record.
+  - A kind-3 batch holds only records of kind 0 (`onBatch`,
+    `SealerClusteredService.java:778-800`). So a batch never holds a boundary. The record rule
+    is the same for every record of one batch.
 - **The eviction rule (the exact window, 4.4).** The egress adopts it at the end of the log entry
   that holds the boundary, in `afterEntry` (`SealerClusteredService.java:432-442`). This is the
   point where the egress adopts a new version today. The frames of that entry go in under the
-  old rule, and the prune at the end of the entry applies the new rule.
+  old rule. The prune at the end of the entry applies the new rule. For a forced boundary, that
+  entry holds the boundary frame and the epoch frame.
 - **Every member and every replay.** Both points are functions of the log. A snapshot falls only
   between entries. So a replay, and a restore from a snapshot on either side, switch at the same
   points.
@@ -165,22 +203,34 @@ There are two rules. They change at two defined points of the same log entry.
 - While the rules of feature 5 apply, the member refuses a transaction reference of record type
   0 (`RT_TXREF`). It does not order it, and it does not drop it silently.
 - **The reject frame.** It answers the offering session with a new egress kind,
-  `EGRESS_KIND_REF_REFUSED = 18`: `[kind:18][sender:20][nonce:u64 LE]`. This is the layout of
-  `WINDOW_FULL` (`SealerEgress.java:404-415`). Kind 18 is free (`SealerWire.java:331-472`).
+  `EGRESS_KIND_REF_REFUSED = 18`:
+  `[kind:18][canonical_id:32][sender:20][nonce:u64 LE][decision_version:u8]`. Kind 18 is free
+  (`SealerWire.java:331-472`). The frame is 62 bytes.
+  - The canonical id is the hash of the transaction. The sequencer needs it for the drop record.
+  - The version tells the sequencer that the sealer runs version 5.
 - **Why a frame.** With `--ack validated`, the client has the hash before the sealer sees the
   offer. A silent drop would lose a transaction that the client was told is accepted.
-- **The sequencer side.** The sequencer takes kind 18 as it takes `WINDOW_FULL`: back pressure,
-  not a verdict. It republishes the transaction from its pending entry
-  (`crates/sequencer/src/resync/answers.rs:34-37`, `:129`). The republish follows the kept
-  version (section 5), so it goes out as type 7.
-  - Queue: the answers go through the existing rewind channel. Its drain is bounded per pass
-    (`drain_bounded`, `FLOOR_DRAIN_PER_ITER`, `answers.rs:9`). This spec adds no queue.
-- **The count.** The member counts each refusal in `kardamom_sealer_ref_refused_total`, and logs
-  `cluster REF-REFUSED` at most once a second.
+- **The sequencer side (section 5).** The sequencer raises its kept version to the version of the
+  frame. It publishes a `TxDrop` for the hash on `tx_drops` (#768), with the new reason
+  `SealerRefusedReference`. The egress then gives the hash the status `dropped`, and the client
+  sends the transaction again. The new submit goes out as type 7. The sequencer re-admits
+  nothing by itself (finding F7).
+- **When a type 0 comes after the switch.** Only from a sequencer of an older release, or from a
+  sequencer with a wrong floor. The gate and the deploy prevent both (sections 9 and 10). If it
+  still happens, the client sees the loss. It is not silent.
+- **Queues and metrics.** This rule adds no queue. The metrics:
+  - `kardamom_sealer_ref_refused_total`: the refusals on each member. The member logs
+    `cluster REF-REFUSED` at most once a second.
+  - `kardamom_sequencer_ref_refused_total{partition}`: the kind-18 frames that a sequencer got.
+  - `kardamom_sequencer_tx_drops_total{reason="sealer_refused_reference"}`: the drop records of
+    #768 with the new reason.
 - **Other records.** An epoch, a deposit, a remote-origin record and a full reference keep their
   rules. Under version 3 or 4, or with the flag off, a type-0 reference is ordered as today.
 - **Why the rule exists.** Section 5 stops the type-0 offers of this release. The rule protects
-  the carry-mode executors from a sequencer of an older release, or from a wrong start setting.
+  the carry-mode executors from a sequencer of an older release, or from a wrong floor.
+- **A type 7 below version 5.** The member counts each full reference that it orders below
+  version 5 in `kardamom_sealer_full_ref_below_v5_total`. Such a frame comes from a wrong floor
+  (section 5). The readers run it (section 7.4).
 
 ### 4.4 The exact window
 
@@ -204,6 +254,21 @@ There are two rules. They change at two defined points of the same log entry.
 - **The bound.** With the window on, the heap holds at most `retention` frames, and the snapshot
   holds the same frames. At about 300 bytes a frame, 65,536 frames are about 20 MB. Today the
   snapshot holds every frame above the posted head.
+- **The size of `retention`.** `retention` must cover at least 60 s at the planned rate. A frame
+  is one record or one boundary, and the sealer seals one block every 2 s on staging
+  (`kardamom.cluster.tickMs=2000`, `deploy/cluster/nomad/cluster.nomad.hcl:454`).
+  - Rule: `retention >= 60 x (planned tx/s + 0.5)`.
+  - The spike of staging at 1,000 tx/s needs 60,030 frames. The default of 65,536
+    (`SealerWire.java:501`, `cluster.nomad.hcl:31-34`) covers about 65 s. So the default holds.
+  - A load test at 2,000 tx/s needs 120,060 frames: set 131,072. The 10,000 tx/s goal needs
+    600,030 frames: set 655,360, and measure the heap first (section 15).
+  - The deploy sets it: `KARDAMOM_CLUSTER_RETENTION` gives the job variable `cluster_retention`
+    (`deploy/cluster/ansible/roles/workloads/defaults/main.yml:154`, `:320`). The operator raises
+    it before a load test, with a rolling deploy.
+  - `retention` is not a must-match setting. During a roll, two members can have two windows.
+    That changes no decision, and no state byte. It changes only the frames that each member can
+    replay, and the bytes of the heap section of its snapshot. The byte equality of section 11
+    holds for members with the same value. Q4 asks whether this is acceptable.
 - **Off again.** When the flag turns off, the posted rule comes back at the end of that entry.
   No frame comes back: the window keeps its frames, and new frames stay until they are posted.
 
@@ -250,8 +315,16 @@ There are two rules. They change at two defined points of the same log entry.
 - **When a member writes 18.** When the state holds an activation of feature 5. Before the first
   kind 11 of feature 5, a member writes 14, 15 or 16 as today. So the release changes no
   snapshot byte until the upgrade transaction.
-- **Restore.** This release reads 1 to 18. A v16 restore starts with the flag off and no
-  schedule. A v18 restore takes both.
+- **Restore.** This release reads 1 to 18:
+
+| Snapshot | Who writes it | Restore on a heap member | Restore on a file member |
+|---|---|---|---|
+| 1 to 11, 13 | older releases | heap store, flag off, no schedule | stop: `sealer RETAINED-FILE FATAL` (today) |
+| 12 | a file member of an older release | stop (today) | file store, the rules of version 3 (#779). Feature 5: `UNSUPPORTED` |
+| 14, 15, 16 | heap members, today | heap store, flag off, no schedule | stop (today) |
+| 17 | a file member (#779) | stop (today) | file store, the rules of v16. Feature 5: `UNSUPPORTED` |
+| 18 | a heap member that holds an activation of feature 5 | heap store, the flag and the schedule | stop: a file member never writes 18 |
+
 - **Rollback.** A member of a release that reads only up to 17 stops on 18. The preflight of #780
   refuses such a rollback (`reads_max` below `snapshotLatest`).
 - **Equality.** Every member writes the same bytes at the same log position. This holds for the
@@ -265,6 +338,7 @@ There are two rules. They change at two defined points of the same log entry.
 
 `MemberStatus.toJson` (`MemberStatus.java:120-137`) gets these fields:
 
+- `retainedStore`: `heap` or `file`.
 - `carryWindow`: `true` when the rules of feature 5 apply.
 - `carryWindowActivationOrigin` and `carryWindowActivationMs`: the newest held activation of
   feature 5, 0 when none.
@@ -278,25 +352,35 @@ read them:
 |---|---|
 | `kardamom_sealer_retained_frames` | the retained frame count |
 | `kardamom_sealer_retained_bytes` | the bytes of the retained frames |
+| `kardamom_sealer_retained_store` | 0 heap, 1 file |
 | `kardamom_sealer_window_exact` | 1 when `windowOnly` is true, else 0 |
 | `kardamom_sealer_decision_version` | the version of the open block |
 | `kardamom_sealer_feature_state{feature="3"\|"4"\|"5"}` | 0 no activation held, 1 held and off, 2 on |
 | `kardamom_sealer_feature_activation_ms{feature}` | the time of the newest held activation |
+| `kardamom_sealer_feature_unsupported_total` | the records of feature 5 on a file member |
 | `kardamom_sealer_snapshot_bytes` | the size of the newest snapshot |
 | `kardamom_sealer_snapshot_version` | the version of the newest snapshot |
 | `kardamom_sealer_ref_refused_total` | the type-0 refusals |
+| `kardamom_sealer_full_ref_below_v5_total` | the full references ordered below version 5 |
 | `kardamom_sealer_feed_state` | 0 off, 1 idle, 2 walking, 3 live, 4 gapped |
 
 ## 5. The sequencer
 
+All of this section is the v2 loop, which staging runs
+(`crates/sequencer/src/bin/kardamom-sequencer/main.rs:239-275`). The v1 loop does not change.
+
 - **The kept version.** `SealerVersion` keeps the highest version that any session of the
-  process reported. A kind 17 of the current session lowers it only when it says lower. A new
-  session does not reset it to 0 (today `SealerRules::on_session_start` does,
-  `crates/sequencer/src/sealer_rules.rs:77-84`). There is no hold and no deadline.
+  process reported.
+  - A kind 17 of the current session lowers it only when it says lower.
+  - A new session does not reset it to 0. Today `SealerRules::on_session_start` does
+    (`crates/sequencer/src/sealer_rules.rs:77-84`).
+  - There is no hold, no deadline and no queue.
 - **The first value.** A new process has no report yet. It starts from the setting
   `--sealer-version-floor` (env `KARDAMOM_SEALER_VERSION_FLOOR`, default 0).
   - The deploy sets the floor to the lowest `decisionVersion` of the members at the time of the
     deploy. On staging that is 5.
+  - The deploy sets a floor above 0 only when every reader runs the decoder of section 7.4
+    (section 10.1). A wrong floor then costs no halt.
   - A kind 17 that says lower lowers the version. So a wrong floor lasts until the first kind 17,
     a few milliseconds after the session opens.
   - Before a fleet rebuild from a seed, the runbook sets the floor to 0. A seeded member runs
@@ -305,7 +389,20 @@ read them:
   version 5. So the references of F2 stop with this release, before feature 5.
 - **Kind 11 of feature 5.** The list of followed features gets feature 5
   (`crates/sequencer/src/outbound/cluster.rs:152`). The rule of the record does not change.
-- **Kind 18.** The sequencer decodes kind 18 and republishes, as for `WINDOW_FULL` (4.3).
+- **Kind 18.** The egress feed thread of the sequencer (`EgressWatermarkFeed`,
+  `crates/sequencer/src/bin/kardamom-sequencer/feeds.rs:128`) reads kind 18 next to kind 17
+  (`on_rules_frame`, `feeds.rs:275`). For each frame it does three things:
+  1. It raises the kept version to the version of the frame.
+  2. It publishes a `TxDrop` (#768, `crates/types/src/tx_drop.rs`) for the canonical id of the
+     frame on `tx_drops` of its lane, with the sender, the nonce and the reason
+     `DropReason::SealerRefusedReference`.
+  3. It counts `kardamom_sequencer_ref_refused_total`.
+  - The new reason goes at the end of `DropReason`: its layout is frozen. Its text is
+    `transaction dropped by the sealer, send it again`.
+  - The feed thread owns its own publication of `tx_drops`. An Aeron publication is not a queue.
+    A refused offer drops the record and counts it, as the stream is best effort (#768).
+  - The v2 loop keeps no candidate after its offer (finding F7), so it re-admits nothing. The
+    client sends the transaction again, and it goes out as type 7.
 - **Job meta.** The sequencer job gets the meta `sealer_version_kept = "true"` for the gate.
 
 ## 6. The executors
@@ -355,21 +452,51 @@ read them:
 
 - The egress stores what the executors forward on `exec_frames`. It holds a reference for each
   type-0 offer of F2.
-- New gauge: `kardamom_egress_ref_frame_max_index`, the highest canonical index of a stored
-  `RT_TXREF` frame, and `kardamom_egress_ref_frame_max_block`, its block. After the sequencer
-  release of section 5, the gauge stops moving.
+- **R, the highest stored reference.** Two gauges: `kardamom_egress_ref_frame_max_index`, the
+  highest canonical index of a stored `RT_TXREF` frame, and `kardamom_egress_ref_frame_max_block`,
+  its block. After the sequencer release of section 5, R stops moving.
+- **R is durable.** `Store::open` rebuilds the head from the last segment only (finding F8). So R
+  goes in a side file of the store, `ref-mark`: `[index:u64 LE][block:u64 LE]`, 16 bytes.
+  - The store writes it after it appends a `RT_TXREF` frame whose index is above the mark. It
+    writes a temporary file, syncs it, and renames it over `ref-mark`. A crash leaves the old
+    mark or the new mark, never a part.
+  - The store writes the mark after the frame and before its own sync of the segment. So after a
+    crash the mark is at or above every reference that the segment holds. A mark above the
+    segment only delays a switch. It never lets a reader meet a reference.
+  - `Store::open` reads the mark. A missing mark is `(0, 0)`: no reference is stored.
+  - A store copied from a peer at a scale-up (decision 27) copies the mark with the segments.
 - No other change. The egress compares the copies of the executors as today.
 
 ### 7.3 Why the order is not circular
 
-1. The sequencer release (section 5) stops the type-0 offers. It needs no feature.
-2. So the egress gauge stops at a last reference index R.
-3. The readers move to the egress once their cursor is above R. They need no feature either.
-4. Feature 5 turns on the window only after step 3. The gate checks step 3 (section 9).
-5. The executors move to the feed after feature 5. The refusal of 4.3 then guarantees that no
+1. The readers get the decoder of 7.4. It needs no feature.
+2. The sequencer release (section 5) stops the type-0 offers. It needs no feature either.
+3. So R stops moving on each egress instance. R is durable (7.2), so a restart of the egress does
+   not lower it.
+4. The readers move to the egress once their cursor is above R. They need no feature either.
+5. Feature 5 turns on the window only after step 4. The gate checks step 4 (section 9).
+6. The executors move to the feed after feature 5. The refusal of 4.3 then guarantees that no
    reference comes after R.
 
 No step waits for a later step.
+
+### 7.4 The decoder of a relayed type 7
+
+- Below version 5, the sealer relays a full reference with record type 7 (finding F6). The
+  payload holds the canonical id, the reference fields, and the envelope.
+- `RelayedPayload::into_item` (`crates/cluster-adapter/src/wire/egress.rs:368-381`) decodes a
+  relayed `RT_TXREF_OFFER` as `EgressItem::Tx`. It reads the payload with a payload form of
+  `TxRefOffer::parse` (`crates/cluster-adapter/src/wire/entry.rs:171-211`), which starts at the
+  canonical id. Then `TxRefOffer::canonical` (`entry.rs:237`) gives the `CanonicalTx`: the id,
+  the lane and the envelope.
+- A relayed `RT_TX_OFFER` (type 5) stays refused. No sequencer sends type 5.
+- Every reader of the order then runs the entry with no join: the cluster reader of an executor
+  (`crates/engine/src/reader/cluster/mod.rs:259-264`), the carried reader, the validator, the
+  batcher and the egress.
+- This change is backward compatible: it only accepts a frame that is refused today.
+- It must reach every reader before the deploy sets a sequencer floor above 0 (section 10.1).
+  So it ships in the first PR (C0), and each reader job gets the meta
+  `relayed_full_ref = "true"`.
 
 ## 8. The cases
 
@@ -378,14 +505,17 @@ No step waits for a later step.
 | A member stops before the switch and starts after it | It restores its snapshot from before the switch (14 to 16, or 18 with a held activation). It replays the log and switches at the same entry as its peers (4.2). Its frames and its snapshot bytes then equal those of its peers. |
 | A member restores a snapshot from after the switch | Version 18 with the flag on. `openEgress` restores the frames, then applies the exact window, then the posted head (4.4). |
 | A blank member seeded by a peer | Aeron backup copies a snapshot and the log. The snapshot holds the frames. No file copy, no token. |
-| A member of an older release at the switch | It ignores kind 11 of feature 5. It keeps the posted rule and orders the type-0 references that its peers refuse. That forks the state. The gate refuses feature 5 while such a member runs (section 9). |
+| A member of an older release at the switch | It ignores kind 11 of feature 5. It keeps the posted rule. It orders the type-0 references that its peers refuse. That forks the state. The gate refuses feature 5 while such a member runs (section 9). |
 | A rollback of the release after the first kind 11 of feature 5 | The members write version 18. A release that reads only up to 17 stops on it. The preflight of #780 refuses the rollback. Before that kind 11, a rollback is safe. |
 | Feature 5 turns off, then on again | Off: the posted rule comes back, and type 0 is ordered again. On: the window drains to `retention` frames at the end of the entry, and type 0 is refused again. Every member switches at the same entries. |
 | Feature 3 or 4 turns off while feature 5 is on | Version 5 stops, so the rules of feature 5 stop. The sequencers send type 0 under version 4, and the carry-mode executors stop with `UnjoinableReference`. The gate refuses such a transaction while feature 5 is on (section 9). |
 | A leader change just after the switch | The sessions reconnect and replay from their cursors. A cursor inside the window gets its frames. A cursor below it gets `REPLAY_UNAVAILABLE`. |
 | A reference-mode executor below the window | `REPLAY_UNAVAILABLE`. It has no egress source, so it takes a peer checkpoint (`docs/failure-modes.md:472`). |
 | A carry-mode executor below the window | It reads the egress range, then a peer checkpoint. |
-| A sequencer of an older release, or a wrong floor, after the switch | Its type-0 offers get kind 18. A sequencer of this release republishes as type 7. An older sequencer drops kind 18 as an unknown kind, so its transaction stays unordered until its twin offers it. The gate requires the sequencer release. |
+| A sequencer of an older release, or a wrong floor, after the switch | Its type-0 offers get kind 18. A sequencer of this release publishes a `TxDrop`, and the client sees `dropped` and sends again. An older sequencer drops kind 18 as an unknown kind, and the transaction stays unordered unless its twin offers it as type 7. The client then sees no receipt. The gate requires the sequencer release. |
+| A sequencer floor above the version of the chain | The sequencer offers type 7 until the first kind 17 lowers its version. The sealer orders each such offer below version 5 as type 7, and counts it. Every reader with the decoder of 7.4 runs it. |
+| A member with the retained file (snapshot 12 or 17) gets kind 11 of feature 5 | Outcome `UNSUPPORTED`, counted, never stored (4.1). Every member of such a chain gives the same outcome. The gate refuses feature 5 on such a chain. |
+| An egress instance restarts | It reads R from `ref-mark` (7.2). R does not go back, so the gate and the preflight do not see a false low value. |
 | Every egress instance is down while the window is exact | A reader below the window cannot recover until an egress instance is back. The DA-lag guard does not change. The distance alert of the egress (one-way spec 6.4) fires first. |
 | A member without the feed setting | It runs no feed. Its executor stays in reference mode. Nothing else changes. |
 | The feed ring is full | The feed gaps (`GAPPED`). The executor asks again. The state and the sessions do not change. |
@@ -399,13 +529,20 @@ feature 5:
 
 - Every configured member reports `snapshotReadsMax >= 18`.
 - Every configured member reports `decisionVersion == 5`. Below version 5 the record is `EARLY`.
+- Every configured member reports `retainedStore = heap`. A file member answers `UNSUPPORTED`
+  (4.1).
 - The sequencer job has the meta `sealer_version_kept = "true"`, and every live allocation runs
   that job version (`upgrade_check_job.yml`).
 - The batcher and validator jobs have the meta `reads_egress = "true"`, and every live allocation
   runs that job version.
-- On each egress instance, `kardamom_batcher_egress_cursor_index` and
-  `kardamom_validator_egress_cursor_index` are above `kardamom_egress_ref_frame_max_index`. The
-  check reads the metrics endpoint of each service, as it reads `/status` of each member.
+- **The readers are past R.** The check reads two kinds of value:
+  - R from each egress instance: `kardamom_egress_ref_frame_max_index` on the metrics endpoint
+    of each instance. It takes the highest R of all instances.
+  - The cursor of each reader: `kardamom_batcher_egress_cursor_index` on each batcher, and
+    `kardamom_validator_egress_cursor_index` on each validator, from the metrics endpoint of
+    each reader.
+  - It refuses unless every reader cursor is above the highest R. It refuses while an egress
+    instance or a reader does not answer.
 
 New rule for features 3 and 4: refuse any activation time other than 0 while any member reports
 `kardamom_sealer_feature_state{feature="5"}` at 1 or 2. A switch back of version 5 would stop
@@ -437,7 +574,9 @@ The gate tests go to `deploy/cluster/ansible/tests/test_deploy.py`, next to the 
   (`sealer_step.yml`), one group at a time, with a health check between groups (option (a),
   accepted).
 - **The sequencer floor.** The deploy reads `decisionVersion` on every member and passes the
-  lowest value as `KARDAMOM_SEALER_VERSION_FLOOR`.
+  lowest value as `KARDAMOM_SEALER_VERSION_FLOOR`. It refuses a floor above 0 unless every reader
+  job (executor, validator, batcher, egress) has the meta `relayed_full_ref = "true"`, and every
+  live allocation runs that job version (section 7.4).
 - **The preflight of `KARDAMOM_CARRY_EXECUTORS`.** It refuses the list unless:
   - every member reports `carryWindow` true;
   - the member of each listed executor reports `kardamom_sealer_feed_state` above 0;
@@ -474,19 +613,28 @@ The list of #781, without the file:
   final snapshot bytes as its peer.
 - **A member stopped before the switch and started after it.** It replays the switch from the
   log and ends with the bytes of its peers.
-- **The forced boundary.** The switch happens at a boundary that an epoch forces inside a kind-3
-  batch. A type-0 reference after the epoch in the same batch is refused. The prune happens at
-  the end of the entry.
+- **The forced boundary.** An origin record (kind 4) forces the boundary that turns feature 5
+  on. The boundary frame and the epoch frame go in under the old eviction rule. The prune at
+  the end of that entry applies the window. The first type-0 reference in the next entry gets
+  kind 18. The bytes of the three members stay equal.
+- **A batch after the switch.** A kind-3 batch of type-0 and type-7 records, after the switch:
+  each type-0 record gets kind 18, and each type-7 record is ordered.
 - **The drain.** Under a DA lag, the retained frames fall within `retention` frames at the end
   of the entry that turns the window on.
 - **Off and on again.** Feature 5 turns off, then on. The posted rule comes back, then the
   window. Each member switches at the same entries, and the bytes stay equal.
 - **The refusal.** With the rules of feature 5, a type-0 reference gets kind 18 on its session,
-  and is not ordered. With the flag off, or under version 4, it is ordered.
+  with its canonical id and version 5, and is not ordered. With the flag off, or under version
+  4, it is ordered.
+- **A type 7 below version 5.** It is ordered, relayed with type 7, and counted in
+  `kardamom_sealer_full_ref_below_v5_total`.
+- **UNSUPPORTED.** A file member (snapshot 17) gets kind 11 of feature 5: outcome
+  `UNSUPPORTED`, the counter moves, and the snapshot bytes do not change.
+- **The restore table.** One case for each row of 4.6, versions 12 and 17 included.
 - **The feed on the heap.** A feed request inside the window gets every frame from its cursor.
   A request below the floor gets `REPLAY_UNAVAILABLE`. A walk across a growth of the byte ring
-  gives the same frames. A walk while the window evicts ends with `REPLAY_UNAVAILABLE` or with
-  the frames, never a gap.
+  gives the same frames. A walk while the window evicts ends with the frames, or gaps
+  (`MemberFeed.java:208-211`), and the next request serves.
 - **Allocation.** `CarriedPathAllocationTest`: the type-7 path allocates nothing with the feed on.
 - **Formats.** `FormatRegistryTest` reads 1 to 18. A new case checks a golden v18 snapshot: the
   bytes that the PR of the layout writes. A later change to those bytes fails the test, unless it
@@ -494,15 +642,23 @@ The list of #781, without the file:
 
 ### 11.2 Rust unit tests
 
+- The decoder of 7.4: a relayed type-7 frame on shared golden bytes decodes as `EgressItem::Tx`
+  with the id, the lane and the envelope. A relayed type 5 stays refused. The cluster reader of
+  an executor runs the entry with no join, and the validator and the batcher read it.
 - The sequencer keeps version 5 across a new session, lowers it on a kind 17 of the current
   session that says 4, and starts from the floor.
 - The sequencer sends kind 11 of feature 5 in front of its epoch.
-- The sequencer republishes a transaction after kind 18, as type 7.
+- On kind 18, the sequencer raises its version and publishes one `TxDrop` with the reason
+  `SealerRefusedReference` and the hash of the frame. It re-admits nothing.
+- The egress gives the hash of that drop the status `dropped`.
 - Kind 18 decodes on the shared golden bytes (`WireGoldenTest` and the Rust wire tests).
 - The carried reader faults on a type-0 reference. The switch goes to the other source.
 - Two `Unjoinable` faults at the same index stop the reader with
   `UnjoinableReference { index }`. Faults at two different indexes do not.
-- The egress gauges of the highest stored reference, and the reader cursor gauges.
+- The egress store: a stored reference moves R. A restart of the store reads the same R from
+  `ref-mark`, also when the reference is in an older segment than the last one. A store with no
+  mark opens with `(0, 0)`.
+- The reader cursor gauges.
 
 ### 11.3 Multi-process e2e (`crates/e2e`)
 
@@ -513,12 +669,15 @@ A new scenario in `crates/e2e/src/scenarios/carry_window.rs`, run from
    stream ids on IPC.
 2. Send features 3 and 4 with `upgrade_and_await` (`crates/e2e/src/scenarios/upgrade.rs`). Wait
    for `kardamom_sequencer_sealer_version` 5.
-3. Restart a sequencer. It sends no type 0 (`kardamom_egress_ref_frame_max_index` does not move).
+3. Restart a sequencer. It sends no type 0: R does not move. Restart the egress: R stays the same.
 4. Send transfers. Send feature 5. Wait for `carryWindow` on every member.
 5. Restart executor 0 with `--carry-bytes` on the driver of member 0. Send transfers. Every
    receipt lands, and the validator agrees.
 6. Restart member 1 from its snapshot. Receipts keep landing.
 7. Turn feature 5 off, then on again. Receipts keep landing.
+
+A second case starts a sequencer with floor 5 on a chain on version 4. Its first offers go out as
+type 7. Every executor and the validator run them, and every receipt lands.
 
 ### 11.4 The container shard `carry` (CI only)
 
@@ -531,60 +690,69 @@ The plan of #781 ("E2E shard"), with these changes:
 - Move the executors to carry mode one at a time with `KARDAMOM_CARRY_EXECUTORS`.
 - Run `smoke_gate`, 60 s at 100 tx/s, the converged-executors check, and `assert_persisted_state`.
 - Chaos cases: kill the leader within 2 s after the switch; stop a member before the switch and
-  start it after; turn feature 5 off and on under load.
+  start it after; turn feature 5 off and on under load; restart an egress instance.
 
 ### 11.5 Gate tests
 
 `test_deploy.py`: one case for each check of section 9 and each preflight of 10.1, with no job
-write on a refusal. One case refuses feature 3 off, and one refuses feature 4 off, while feature
-5 is held or on.
+write on a refusal. These cases are in the list:
+
+- refuse feature 3 off, and feature 4 off, while feature 5 is held or on;
+- refuse feature 5 while a member reports `retainedStore = file`;
+- refuse feature 5 when one reader cursor is at or below the highest R of the egress instances;
+- refuse a sequencer floor above 0 while a reader job lacks the meta `relayed_full_ref`.
 
 ## 12. The staging rollout
 
 Each step names its checks. Do not start a step until the checks of the step before pass.
 
-1. **Deploy the release.** It holds every PR of section 13. No switch of section 10 is on.
+1. **Deploy the release.** It holds every PR of section 13. No switch of section 10 is on, and
+   the sequencer floor is 0.
    - Each member: `snapshotReadsMax` 18, `decisionVersion` 5, `snapshotLatest` 16,
-     `kardamom_sealer_window_exact` 0.
-   - Each sequencer: `kardamom_sequencer_sealer_version` 5, the floor 5.
+     `retainedStore` heap, `kardamom_sealer_window_exact` 0.
+   - Every reader job (executor, validator, batcher, egress) has the meta
+     `relayed_full_ref = "true"`, and every live allocation runs it.
    - No `FATAL` line in the sealer logs.
    - Rollback: allowed. Nothing wrote version 18.
-2. **The references stop.** Restart one sequencer of each pair. Then watch
-   `kardamom_egress_ref_frame_max_index` for 30 minutes under the canary. It must not move.
-   Write down its value R and `kardamom_egress_ref_frame_max_block`.
-3. **The readers move to the egress.** Deploy the batcher and the validator with `--egress`.
-   - Each reader cursor gauge is above R.
+2. **The sequencer floor.** Deploy the sequencers with the floor from the members (5).
+   - Each sequencer: `kardamom_sequencer_sealer_version` 5.
+   - `kardamom_sealer_full_ref_below_v5_total` stays 0.
+3. **The references stop.** Restart one sequencer of each pair. Then watch R on each egress
+   instance for 30 minutes under the canary. It must not move. Write down the highest R and its
+   block.
+4. **The readers move to the egress.** Deploy the batcher and the validator with `--egress`.
+   - Each reader cursor gauge is above the highest R.
    - The validator agrees, and the batcher posts.
-4. **Infra and the feed.** Apply the kardamom-infra change of 10.2. Deploy with
+5. **Infra and the feed.** Apply the kardamom-infra change of 10.2. Deploy with
    `KARDAMOM_MEMBER_FEED=on`. The deploy rolls member by member.
    - Each member: `kardamom_sealer_feed_state` 1 (idle).
    - The shared driver runs on each sealer node.
-5. **The executors move to the sealer nodes.** Deploy with `KARDAMOM_EXEC_ON_SEALERS=on`. The
+6. **The executors move to the sealer nodes.** Deploy with `KARDAMOM_EXEC_ON_SEALERS=on`. The
    groups roll one at a time.
    - Each executor runs on `sealer-<i>`. `kardamom_executor_block_number` follows the sealed head.
    - Receipts land (the canary). `kardamom_egress_copy_mismatch_total` does not move.
-6. **The upgrade check.** Pick the activation time: about 30 minutes ahead, at low load. Run
+7. **The upgrade check.** Pick the activation time: about 30 minutes ahead, at low load. Run
    `just sealer-upgrade-check staging 5 <activation_ms>`. It must pass.
-7. **The upgrade transaction on Sepolia. THE USER MUST APPROVE THIS STEP EXPLICITLY.** The Safe
+8. **The upgrade transaction on Sepolia. THE USER MUST APPROVE THIS STEP EXPLICITLY.** The Safe
    signs `ETHLockbox.initiateUpgrade(5, <activation_ms>)`. Nothing in this step happens without
    that approval.
    - Each member logs `cluster FEATURE-ACTIVATION` for feature 5 with outcome `STORED`.
    - `kardamom_sealer_feature_state{feature="5"}` is 1 on each member.
    - From here, `snapshotLatest` is 18, and the preflight of #780 refuses a release rollback.
-8. **The switch.** At the activation time:
+9. **The switch.** At the activation time:
    - Each member logs `cluster CARRY-WINDOW on` at the same block.
      `kardamom_sealer_feature_state{feature="5"}` is 2, and `kardamom_sealer_window_exact` is 1.
    - `kardamom_sealer_retained_frames` falls within `retention` frames on each member.
    - `kardamom_sealer_snapshot_bytes` falls at the next snapshot.
    - `kardamom_sealer_ref_refused_total` stays 0. Receipts keep landing.
-9. **The executors move to carry mode, one at a time.** `KARDAMOM_CARRY_EXECUTORS=0`, then
-   `0,1`, then `0,1,2`. The preflight checks the block of each executor against the reference
-   block.
-   - The log line `canonical entries via the member feed`.
-   - `kardamom_sealer_feed_state` 3 (live) on the member of the executor.
-   - Receipts land. `kardamom_egress_copy_mismatch_total` does not move. No `Unjoinable` fault.
-10. **Soak for 24 hours** under the canary. Record the snapshot gauges of section 15. Then close
-    #771.
+10. **The executors move to carry mode, one at a time.** `KARDAMOM_CARRY_EXECUTORS=0`, then
+    `0,1`, then `0,1,2`. The preflight checks the block of each executor against the block of R.
+    - The log line `canonical entries via the member feed`.
+    - `kardamom_sealer_feed_state` 3 (live) on the member of the executor.
+    - Receipts land. `kardamom_egress_copy_mismatch_total` does not move. No `Unjoinable` fault.
+11. **Soak for 24 hours** under the canary. Record the gauges of section 15. Then close #771.
+
+Before a load test above 1,000 tx/s, raise `retention` by the rule of 4.4, with a rolling deploy.
 
 Drills on staging (a leader kill after the switch, feature 5 off and on) need the approval of
 the user, and are not part of this plan. The chaos shard covers them in CI.
@@ -596,19 +764,20 @@ version 18 in full and writes it. No later PR changes those bytes under the same
 
 | PR | Title | Depends on | Size |
 |---|---|---|---|
-| C1 | wire: egress kind 18 `REF_REFUSED`, Java and Rust codecs on shared golden bytes | none | S |
-| C2 | sealer: feature 5, the flag and the schedule, snapshot 18 (the whole layout, with its golden test), the type-0 refusal, `setRules` and the exact window, admin and Prometheus gauges, `formats.toml` | #779, C1 | L |
+| C0 | cluster-adapter: decode a relayed type 7 as `EgressItem::Tx`; reader job meta `relayed_full_ref` | none | S |
+| C1 | wire: egress kind 18 `REF_REFUSED`, Java and Rust codecs on shared golden bytes, `sealer-egress-kinds` to 18 in `formats.toml` | none | S |
+| C2 | sealer: feature 5, the flag and the schedule, `UNSUPPORTED` on a file member, snapshot 18 (the whole layout, with its golden test), the type-0 refusal, the counter of a type 7 below version 5, `setRules` and the exact window, admin and Prometheus gauges, `sealer-snapshot` in `formats.toml` | #779, C1 | L |
 | C3 | sealer: the member feed on the heap (the walk on `RetainedFrames`, `FeedConfig` and `Feed` without the file), the feed gauge | C2 | M |
-| C4 | types, sequencer: `FEATURE_CARRY_WINDOW`, kind 11 of feature 5, the kept version and its floor, the republish on kind 18, job meta | C1 | M |
-| C5 | engine, executor, egress, batcher, validator: the `Unjoinable` fault and verdict, the reference gauges, the reader cursor gauges, job metas | none | M |
-| C6 | deploy: the three switches of 10.1, the staged executor roll, the sequencer floor, the preflights, the feature-5 and feature-3/4 checks of `upgrade_check.yml` | #781, #780, C2 to C5 | L |
-| C7 | e2e: the carry window scenario | C3, C4, C5 | M |
+| C4 | types, sequencer: `FEATURE_CARRY_WINDOW`, kind 11 of feature 5, the kept version and its floor, kind 18 with the `TxDrop` and `DropReason::SealerRefusedReference`, job meta | #768, C0, C1 | M |
+| C5 | engine, executor, egress, batcher, validator: the `Unjoinable` fault and verdict, R with its durable mark, the reader cursor gauges, job metas | none | M |
+| C6 | deploy: the three switches of 10.1, the staged executor roll, the sequencer floor and its check, the preflights, the feature-5 and feature-3/4 checks of `upgrade_check.yml` | #781, #780, C0 to C5 | L |
+| C7 | e2e: the carry window scenario and the floor case | C3, C4, C5 | M |
 | C8 | chaos: the `carry` shard with the activation step | C6, C7 | L |
-| C9 | docs: `cluster/sealer-service/README.md` (feature 5, the runbook), `docs/failure-modes.md`, `docs/formats.md`, `deploy/cluster/README.md`, a note at D11 of the one-way spec | C6 | S |
+| C9 | docs: `cluster/sealer-service/README.md` (feature 5, the runbook, `retention`), `docs/failure-modes.md`, `docs/formats.md`, `deploy/cluster/README.md`, a note at D11 of the one-way spec | C6 | S |
 | infra | kardamom-infra: the sealer node resources of 10.2 | none | S |
 
-Sizes: S is up to about 200 lines, M up to about 600, L above that. C1, C4 and C5 can start at
-once. The release of step 12.1 holds C1 to C6.
+Sizes: S is up to about 200 lines, M up to about 600, L above that. C0, C1 and C5 can start at
+once. C0 must deploy to every reader before step 12.2. The release of step 12.1 holds C0 to C6.
 
 ## 14. Considered and not chosen
 
@@ -627,31 +796,42 @@ once. The release of step 12.1 holds C1 to C6.
 ## 15. The retained file: a later spec, with a trigger
 
 The file keeps only an index on the heap and in the snapshot. It is worth its cost only when the
-heap window costs too much. Measure these values on staging after step 12.10, and under each load
+heap window costs too much. Measure these values on staging after step 12.11, and under each load
 test:
 
 - `kardamom_step_seconds{step="sealer.snapshot"}`, p99 and max: the pause of every member at the
   snapshot.
 - `kardamom_sealer_snapshot_bytes` and `kardamom_sealer_retained_bytes`.
-- The GC pauses of the sealer JVM, and its heap after a GC, against `cluster_heap_mb` (384 MB by
-  default, `deploy/cluster/nomad/cluster.nomad.hcl:138-141`).
+- The GC pauses of the sealer JVM, p99 and max, from its pause log (`jvm_pause_log_opts`,
+  `deploy/cluster/nomad/cluster.nomad.hcl:454`), and its heap after a GC, against
+  `cluster_heap_mb` (384 MB by default, `cluster.nomad.hcl:138-141`).
 - The window in time: `retention` divided by the transaction rate. It must cover the delay from
   the seal to the store of the egress with a wide margin (one-way spec 6.4).
 
-The proposed trigger for the file spec (Q2): the snapshot step p99 above 50 ms, or the retained
-bytes above a quarter of the heap, or a `retention` that must grow past the heap to keep a 60 s
-window.
+The trigger for the file spec (accepted in review). Any one of these starts it:
+
+1. The snapshot step p99 is above 50 ms.
+2. The retained bytes are above a quarter of the heap.
+3. The `retention` of the rule of 4.4 does not fit in the heap.
+4. The GC pause p99 of the sealer is above 20 ms.
 
 ## 16. Open questions for the user
 
-- **Q1.** The sequencer starts from a floor that the deploy sets (section 5). A wrong floor lasts
-  until the first kind 17 of the session. The runbook sets it to 0 before a seed rebuild. Accept,
-  or prefer a hold of the offers only at the start of the process?
-- **Q2.** The trigger for the file spec (section 15): accept the proposed values?
-- **Q3.** The gate refuses feature 3 or 4 off while feature 5 is held or on (section 9). Accept?
-- **Q4.** `retention` stays at 65,536 frames on staging. At 200 tx/s that is about 5 minutes. At
-  the 10,000 tx/s goal it is about 6.5 s. Raise it when the load grows, with the gauges of
-  section 15?
+- **Q1.** `retention` is not a must-match setting (4.4). During a rolling change, two members can
+  keep two windows. No decision changes, but the heap sections of their snapshots differ until
+  the roll ends. Accept, or make `retention` a must-match setting, which needs a coordinated
+  restart to raise it?
+- **Q2.** The text of the new drop reason: `transaction dropped by the sealer, send it again`.
+  Accept, or prefer a geth-like text such as `txpool is full`, which wallets already retry?
+
+The answers to the questions of revision 2, from the review:
+
+- The sequencer floor: accepted, with the decoder of 7.4.
+- The trigger for the file spec: accepted, with the GC pause p99 as a fourth signal.
+- The gate refuses feature 3 or 4 off while feature 5 is held or on: accepted. The gate also
+  refuses feature 5 while a member reports a file store.
+- `retention`: it covers at least 60 s at the planned rate (4.4). The operator raises it before a
+  load test.
 
 The answers to the questions of revision 1, from the review:
 
@@ -681,3 +861,18 @@ The answers to the questions of revision 1, from the review:
 | 14. Tests that catch a fork | Section 11.1: byte equality at every cut, the forced boundary, the restore at each point, off and on again. Section 11.5: the feature-3/4 refusal. |
 | 15. Long sentences | Section 1.3, section 4.4 and section 8 now use short sentences. |
 | Questions | Section 16. |
+
+## 18. Changes from revision 2
+
+| Finding of the review of revision 2 | Change |
+|---|---|
+| 1 (blocker). Kind 18 has no republish path in the v2 loop | Sections 4.3 and 5: kind 18 carries the hash and the version. The v2 sequencer raises its version and publishes a `TxDrop` with the new reason. It re-admits nothing. The text names the only sources of a type 0 after the switch. No citation of the v1 loop is left. Section 1.3, F7. |
+| 2 (major). R is not durable | Section 7.2: the `ref-mark` side file, its write order and its read at `open`. Section 7.3: R is durable. Section 11.2 and 11.3: a restart of the egress. Section 1.3, F8. |
+| 3 (major). A type 7 below version 5 halts the readers | Section 7.4: the decoder. Section 4.3: the sealer counter. Section 13: C0 ships first. Section 12.1 and 12.2: the floor follows the decoder. Section 1.3, F6. |
+| 4 (major). A file member loses a feature-5 schedule | Section 4.1: `UNSUPPORTED`. Section 4.6: the restore table with versions 12 and 17. Section 4.7: `retainedStore`. Section 9: the gate refuses feature 5 on a file chain. |
+| 5. No epoch in a kind-3 batch | Section 4.2 and section 11.1: only kind 4 forces a boundary, and a batch holds no boundary. |
+| 6. The walk gap | Section 11.1: "ends with the frames, or gaps, and the next request serves". |
+| 7. Where R and the cursors come from | Section 9: R from each egress instance, the cursors from the readers. |
+| 9. The egress kinds bump | Section 13: C1. |
+| 10. STE | Section 1.3 F1, section 4.2 and section 5 use short sentences. |
+| The questions | Section 16. `retention` gets its rule and the value for staging in 4.4. |
