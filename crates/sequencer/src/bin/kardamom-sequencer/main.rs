@@ -10,12 +10,10 @@
 //! subscriber/publisher traits directly (`kardamom_sequencer::{epoch,
 //! remote_epoch, outbound}`); the lane set is [`feeds::LaneSubscriptions`].
 //!
-//! The flags live in [`args`]. With the `ingress` subcommand, the process
-//! also runs the ingress service ([`ingress`]).
+//! The flags live in [`args`].
 
 mod args;
 mod feeds;
-mod ingress;
 
 use std::num::NonZeroU32;
 
@@ -605,15 +603,9 @@ async fn main() -> anyhow::Result<()> {
         deposits: join_deposits,
         remote_epochs: join_remote_epochs,
     };
-    let ingress = ingress::EmbeddedIngress::start(&args, &cfg, &log_cfg).await?;
 
     wait_for_shutdown().await;
     tracing::info!("kardamom-sequencer: shutdown signal received");
-    // The ingress drains first: its parked submits wait for the verdicts
-    // of the loops.
-    if let Some(ingress) = ingress {
-        ingress.stop().await;
-    }
     // `join_all` signals the loops, then joins them. The cluster session
     // (`cluster_guard`) stays alive until every publish loop has
     // stopped; `join_all` drops it as soon as it returns.

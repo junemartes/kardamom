@@ -33,8 +33,6 @@ Notes on the table:
 - A sequencer node runs one replica for each lane it serves. Lane `L` uses port `9001 + 10 * L`.
   Each lane has two racing replicas on different nodes.
   Scraping one lane port on every sequencer node gives one replica of that lane for each node.
-- The ingress inside a sequencer process (the `ingress` subcommand, the job variable `ingress`) has no exporter of its own.
-  Its `kardamom_ingress_*` metrics go to the exporter of the sequencer, with `service="sequencer"`.
 - The validator and the state mirror have the same default port. The cluster deploy binds the validator to `9006`.
   The ingress also binds `9006`. Run the two on different nodes.
 - The cluster jobs bind each exporter to `0.0.0.0`. Prometheus then scrapes the exporters from another node.
@@ -200,7 +198,7 @@ It answers 503 with the failed conditions when the rule does not hold.
 
 | Service | Rule |
 | --- | --- |
-| `kardamom-ingress` | `kardamom_ingress_draining == 0`. The RPC port `GET /health` answers 503 while the ingress drains. The ingress inside a sequencer process has only the `/health` route: the rule of the sequencer does not read the drain. |
+| `kardamom-ingress` | `kardamom_ingress_draining == 0`. The RPC port `GET /health` answers 503 while the ingress drains. |
 | `kardamom-sequencer` | `kardamom_sequencer_last_boundary_unix_seconds` is fresher than `boundary_silence_ms` (default 10000). The session is open and the egress is attached. |
 | `kardamom-executor` | `kardamom_executor_block_number` is within `--ready-lag-blocks` of `kardamom_sealer_block_number`. |
 | `kardamom-validator` | `validator_verdict_standing == 0`, and `validator_committed_block` is within `--ready-lag-blocks` of `validator_sealer_block_number`. |

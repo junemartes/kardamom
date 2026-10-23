@@ -114,20 +114,3 @@
       ingress inclusion_horizon_blocks ({{ contract_ingress_horizon }})
       and cluster_inclusion_horizon_blocks ({{ contract_sealer_horizon }})
       must be equal.
-
-# The ingress inside the sequencer process stamps with the horizon of the
-# sequencer job.
-- name: Read the inclusion horizon of the ingress inside the sequencer
-  ansible.builtin.set_fact:
-    contract_sequencer_horizon: >-
-      {{ lookup('file', contract_cluster_dir ~ '/nomad/sequencer.nomad.hcl')
-         | regex_search('variable "inclusion_horizon_blocks"[^}]*default\s*=\s*"([0-9]+)"', '\1')
-         | first }}
-
-- name: The ingress inside the sequencer and the sealer must agree on the inclusion horizon
-  ansible.builtin.assert:
-    that: contract_sequencer_horizon | int == contract_sealer_horizon | int
-    fail_msg: >-
-      sequencer inclusion_horizon_blocks ({{ contract_sequencer_horizon }})
-      and cluster_inclusion_horizon_blocks ({{ contract_sealer_horizon }})
-      must be equal.

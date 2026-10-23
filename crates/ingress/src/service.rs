@@ -8,8 +8,8 @@
 //! proxy itself. It returns a [`RunningIngress`] that owns everything the
 //! stop needs.
 //!
-//! The `kardamom-ingress` binary runs one service. A sequencer process can
-//! run one inside itself.
+//! The `kardamom-ingress` binary runs one service. The ingress runs on its
+//! own fleet, never inside a sequencer process.
 
 mod recorders;
 mod settings;
