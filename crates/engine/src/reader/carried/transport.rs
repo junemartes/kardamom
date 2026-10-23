@@ -77,3 +77,29 @@ impl Transport for NoSource {
 
     fn close(&mut self) {}
 }
+
+/// A source that a setting turns on. `None` is [`NoSource`].
+impl<T: Transport> Transport for Option<T> {
+    fn connection(&mut self) -> Option<u64> {
+        self.as_mut().and_then(Transport::connection)
+    }
+
+    fn request(&mut self, request: Request) {
+        if let Some(source) = self {
+            source.request(request);
+        }
+    }
+
+    fn poll(&mut self, wait: Duration) -> Poll {
+        match self {
+            Some(source) => source.poll(wait),
+            None => NoSource.poll(wait),
+        }
+    }
+
+    fn close(&mut self) {
+        if let Some(source) = self {
+            source.close();
+        }
+    }
+}

@@ -366,6 +366,12 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
 - `kardamom_egress_caught_frames_total` counts the frames that a peer egress gave after a start, to fill the place between the head and the executor copies.
 - `kardamom_egress_rebased_total{reason}` counts the times that the egress started its stream again: after a boundary of a copy with no peer (`boundary`), or at the floor of a peer above its head (`peer-floor`). After a `boundary` start, the store holds no frame before that boundary, and a reader of an older cursor reads another instance.
 - `kardamom_executor_egress_frames_dropped_total` counts the canonical frames that the reader did not forward on `exec_frames`, because the queue to the publication was full.
+
+`kardamom_egress_head_distance_frames` is a gauge of each egress instance. It gives the canonical indexes between the stored head and the newest record that any executor copy sent. The egress sets it after each sync of its store.
+
+- The sealer keeps only its replay window. A reader below the window recovers from the store of the egress, so the distance must stay well inside the window.
+- The egress does not see the sealed head. The distance does not include the lag of every executor behind the sealer.
+- `KardamomEgressHeadNearWindow` in `deploy/alerts.yml` fires when the distance stays above 32,768 for 1 minute: half the default window of 65,536 frames.
   - `peer-checkpoint`: the node fell behind the retention window and repaired itself from a peer checkpoint.
   - `unrecoverable`: the node could not repair itself and waits for an operator.
   - See "Replay-window overrun" in [failure-modes.md](failure-modes.md).
@@ -481,9 +487,16 @@ With `--carry-bytes` (`KARDAMOM_CARRY_BYTES`, off by default), the executor read
 - Switch it on only with sealer members that carry the bytes and run the member feed.
 - Off: the executor joins the references of the cluster egress with `tx_data`.
 
+With `--carry-bytes`, `--egress <url>` (`KARDAMOM_EGRESS_URL`, off by default) makes the egress the second source of the executor.
+
+- A cursor below the replay window of the member reads the range read of the egress from the cursor to the head of the store. Then the executor reads the live `egress_order`.
+- The executor goes back to the feed by the same rule as from the serving service.
+- A cursor below the floor of the egress store too stages a peer checkpoint (`kardamom_executor_resync_total`).
+- Off: a cursor below the window stages a peer checkpoint at once.
+
 | Metric | Meaning |
 | --- | --- |
-| `kardamom_executor_input_source{source}` | 1 for the source that the executor reads, 0 for the other. `source` is `feed` (the member feed) or `service` (the serving service). |
+| `kardamom_executor_input_source{source}` | 1 for the source that the executor reads, 0 for the other. `source` is `feed` (the member feed) or `service` (the serving service, or the egress with `--egress`). |
 | `kardamom_executor_source_mismatch_total{source}` | Canonical entries whose `keccak256(raw_tx)` is not the canonical id, by the source that sent them. The executor does not execute such an entry and does not stop: it leaves the source and reads the same index from the other source. |
 
 - The executor leaves the feed when no frame comes for 6 s, when the feed loses its image, or on a mismatch. It goes back to the feed after the feed has one image for 30 s and a replay of the feed from its cursor reaches `REPLAY_DONE`.

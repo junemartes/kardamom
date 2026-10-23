@@ -112,6 +112,15 @@ pub(crate) struct Args {
     /// the egress. Off: the executor publishes no frame.
     #[arg(long, env = "KARDAMOM_EXEC_FRAMES", default_value_t = false)]
     pub(crate) exec_frames: bool,
+    /// With `--carry-bytes`: the egress at this base URL
+    /// (`http://host:port`). A cursor below the replay window of the member
+    /// reads the range read of the egress up to its head, then the live
+    /// `egress_order`, and goes back to the member feed once the feed
+    /// serves the cursor again. A cursor below the floor of the egress too
+    /// goes to a peer checkpoint. Off: a cursor below the window goes to a
+    /// peer checkpoint at once.
+    #[arg(long, env = "KARDAMOM_EGRESS_URL", requires = "carry_bytes")]
+    pub(crate) egress: Option<String>,
     /// With `--carry-bytes`: how many committed blocks below its cursor the
     /// executor compares with the member feed at each start, before it
     /// executes a frame. A difference rolls the state back to a checkpoint
@@ -301,6 +310,21 @@ mod tests {
         assert!(error.to_string().contains("--carry-bytes"), "{error}");
         let feed = parse(&["--void-voter-id", "2", "--carry-bytes"]);
         assert_eq!(feed.recorded_cursor_id().expect("valid"), None);
+    }
+
+    #[test]
+    fn the_egress_needs_carry_bytes() {
+        let refused = Args::try_parse_from([
+            "kardamom-executor",
+            "--config",
+            "executor.toml",
+            "--egress",
+            "http://127.0.0.1:8548",
+        ]);
+        assert!(refused.is_err(), "the egress serves only the carried bytes");
+        let on = parse(&["--carry-bytes", "--egress", "http://127.0.0.1:8548"]);
+        assert_eq!(on.egress.as_deref(), Some("http://127.0.0.1:8548"));
+        assert_eq!(parse(&["--carry-bytes"]).egress, None, "off by default");
     }
 
     #[test]
