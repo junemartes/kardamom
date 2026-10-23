@@ -170,6 +170,15 @@ contract_mirrors:
       - static = {{ ports.notifier_metrics }}
       - --log-config
     forbidden: []
+  - path: deploy/cluster/nomad/egress.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-egress:{{ image_tag }}'
+      - '"{{ paths.egress_dir }}:{{ paths.egress_dir }}"'
+      - '"--dir", "{{ paths.egress_dir }}"'
+      - default = {{ ports.egress_http }}
+      - default = {{ ports.egress_metrics }}
+      - --log-config
+    forbidden: []
   - path: deploy/cluster/nomad/canary.nomad.hcl
     required:
       - '{{ registry_host }}:{{ registry_port }}/kardamom-canary:{{ image_tag }}'

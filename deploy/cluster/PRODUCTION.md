@@ -20,7 +20,7 @@ A node has one class and a set of roles. A job selects its nodes by class or by 
 
 How jobs place themselves:
 
-- The pipeline jobs constrain on `meta.role`. These are the sealer (`cluster`), `executor`, `state-mirror`, `ingress`, `sequencer`, `notifier` and `anvil`.
+- The pipeline jobs constrain on `meta.role`. These are the sealer (`cluster`), `executor`, `state-mirror`, `egress`, `ingress`, `sequencer`, `notifier` and `anvil`.
 - The service jobs constrain on `meta.roles` with `set_contains`.
 - No job names a node or a node index.
 

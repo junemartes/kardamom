@@ -56,7 +56,7 @@ The streams and their publishers:
 | Topic | Publisher | Consumers |
 | --- | --- | --- |
 | `tx_data` (one record per lane) | ingress | sequencer, executor, validator, batcher, ingress archives |
-| `tx_receipts` | executor | ingress, sequencer, validator |
+| `tx_receipts` | executor | ingress, sequencer, validator, egress |
 | `tx_receipt_boundaries` | executor | ingress |
 | `tx_errors` | sequencer | ingress, notifier |
 | `tx_status` | sequencer, ingress | notifier |
@@ -68,7 +68,7 @@ The streams and their publishers:
 | `exec_txs` | executor | validator, batcher (none subscribes yet), the archive on the node of each executor |
 | `exec_frames` | executor (with `--exec-frames`) | egress |
 | `egress_order` | egress | the readers after the executors (batcher, validator) |
-| `egress_receipts` | egress | sequencers (with `receipts_from_egress = true`) |
+| `egress_receipts` | egress | sequencers (with `receipts_from_egress = true`), notifier (with `--receipts-from-egress`) |
 | `l1_blocks` | L1 follower (two instances) | da-watcher, batcher, follower archives |
 
 The `exec_txs` stream carries the transactions that an executor joins, in canonical order: one `ExecTxRecord` for each `TxRef`.
@@ -328,6 +328,7 @@ No job configures a publication control port.
 | da-watcher | deposits, remote epochs (subscribes to `l1_blocks` and `events`) |
 | l1-indexer | `l1_blocks`, `events` |
 | sequencer lane `n` | `tx_errors`, `tx_status`, one `tx_verdicts` for each ingress that it answers |
+| egress | `egress_order`, `egress_receipts` (subscribes to `exec_frames` and `tx_receipts`) |
 
 The aeron system job registers the archive record with the `archive_topics`
 meta of the node:

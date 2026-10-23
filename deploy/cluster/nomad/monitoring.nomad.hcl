@@ -73,6 +73,17 @@ variable "nomad_tls_dir" {
   default     = ""
 }
 
+# The scrape of the egress (nomad/egress.nomad.hcl), "on" or "off". The
+# workloads role sets it on with the egress job (KARDAMOM_EGRESS=1).
+variable "egress" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.egress)
+    error_message = "The egress value must be on or off."
+  }
+}
+
 variable "grafana_admin_password" {
   type        = string
   description = "The Grafana admin password. The local profile keeps the development default."
@@ -132,7 +143,10 @@ locals {
       # nomad/cluster.nomad.hcl.
       - job_name: kardamom-sealer
         static_configs:
-          - targets: [{{ range $i, $s := service "kardamom-cluster-member|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:${local.sealer_admin_port}"{{ end }}]
+          - targets: [{{ range $i, $s := service "kardamom-cluster-member|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:${local.sealer_admin_port}"{{ end }}]%{if var.egress == "on"}
+      - job_name: kardamom-egress
+        static_configs:
+          - targets: [{{ range $i, $s := service "kardamom-egress-metrics|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]%{endif}
       # The host metrics of every node (nomad/node-exporter.system.nomad.hcl)
       # and the metrics of every Nomad agent, discovered through the local
       # Consul agent. The node label is the Consul node name.
@@ -144,7 +158,7 @@ locals {
         relabel_configs:
           - source_labels: [__meta_consul_node]
             target_label: node
-      %{ for role in ["server", "client"] }
+      %{for role in ["server", "client"]}
       - job_name: nomad-${role}
         metrics_path: /v1/metrics
         params:
@@ -165,14 +179,14 @@ locals {
             target_label: node
           - target_label: job
             replacement: nomad
-      %{ if role == "client" }
+      %{if role == "client"}
           # A server can also register as a client. Its certificate has
           # the server name, and the server scrape already covers it.
           - source_labels: [__meta_consul_node]
             regex: '{{ range $i, $s := service "${var.cluster_id}-nomad" }}{{ if $i }}|{{ end }}{{ $s.Node }}{{ end }}'
             action: drop
-      %{ endif }
-      %{ endfor }
+      %{endif}
+      %{endfor}
   EOT
   dashboards = [
     "kardamom-overview", "kardamom-ingress", "kardamom-sequencer",
