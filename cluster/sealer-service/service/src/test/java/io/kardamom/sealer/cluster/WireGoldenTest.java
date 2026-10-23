@@ -5,14 +5,17 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.ClusterStatus;
 import io.kardamom.sealer.RecordedCursors;
 import io.kardamom.sealer.Relayed;
 import io.kardamom.sealer.TxOffer;
+import io.kardamom.sealer.VersionSwitch;
 import java.io.IOException;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.Optional;
@@ -163,6 +166,33 @@ final class WireGoldenTest {
         final TxRefOffer shortOffer = new TxRefOffer().wrap(new UnsafeBuffer(ingress),
             SealerWire.CANONICAL_ID_OFFSET, TxRefOffer.MIN_PAYLOAD_LEN - 1);
         assertFalse(shortOffer.isWhole());
+    }
+
+    @Test
+    void aFullReferenceBelowVersionFiveRelaysAsIs() {
+        final byte[] payload = relayedPayload("txref_offer_ingress");
+        assertEquals(SealerWire.RT_TXREF_OFFER, payload[TxRefOffer.RECORD_TYPE_OFFSET]);
+        assertArrayEquals(golden.get("txref_offer_egress"),
+            frames.copy(frames.relayed(new Relayed(INDEX, payload))));
+    }
+
+    @Test
+    void theReferenceRefusalHasItsFieldsAtTheWireOffsets() {
+        final byte[] canonicalId = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
+        Arrays.fill(canonicalId, (byte) 0xAB);
+        final byte[] sender = new byte[CanonicalSealerState.SENDER_LEN];
+        Arrays.fill(sender, (byte) 0x11);
+        final byte[] frame = golden.get("ref_refused");
+
+        assertEquals(62, SealerWire.REF_REFUSED_LEN);
+        assertEquals(SealerWire.REF_REFUSED_LEN, frame.length);
+        assertArrayEquals(frame, frames.copy(frames.refRefused(canonicalId, sender, 7, VersionSwitch.CARRY_VERSION)));
+        final UnsafeBuffer read = new UnsafeBuffer(frame);
+        assertEquals(SealerWire.EGRESS_KIND_REF_REFUSED, read.getByte(SealerWire.KIND_OFFSET));
+        assertEquals(7, read.getLong(
+            Byte.BYTES + CanonicalSealerState.CANONICAL_ID_LEN + CanonicalSealerState.SENDER_LEN,
+            ByteOrder.LITTLE_ENDIAN));
+        assertEquals(VersionSwitch.CARRY_VERSION, read.getByte(SealerWire.REF_REFUSED_LEN - 1));
     }
 
     @Test

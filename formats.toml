@@ -102,7 +102,10 @@ code = [
 # thread puts it on the consumer channel when a session opens. It is never
 # on the wire. The sealer sends kind 17 (its rules: the decision version)
 # to each session when it opens, and to each open session at each new
-# term. An older reader drops kind 17 as an unknown kind.
+# term. An older reader drops kind 17 as an unknown kind. This release
+# reads kind 18 (the refusal of a type 0 reference), but the sealer does not
+# send it yet. It goes only to the offering session, and an older reader
+# drops it as an unknown kind.
 #
 # On the member feed, the answers (kinds 3, 4, 11 and 16) are 25 bytes:
 # the 17 bytes of the egress layout, then the request id. A reader reads
@@ -117,9 +120,12 @@ code = [
 [format.sealer-egress-kinds]
 writes = 17
 reads_min = 1
-reads_max = 17
+reads_max = 18
 shared = true
 code = [
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#EGRESS_KIND_REF_REFUSED",
+    "crates/cluster-adapter/src/wire/mod.rs#EGRESS_KIND_REF_REFUSED",
+    "crates/cluster-adapter/testdata/wire_golden.txt#ref_refused",
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#EGRESS_KIND_SEALER_INFO",
     "crates/cluster-adapter/src/wire/mod.rs#EGRESS_KIND_SEALER_INFO",
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#EGRESS_KIND_RECORD_LAG_REJECT",
@@ -140,8 +146,8 @@ code = [
 # This release also has the codecs of type 7 (the full reference, on
 # ingress only): the 99 bytes of a positioned type 0 reference with type 7,
 # then the envelope. A sealer on decision version 5 relays it as a type 6,
-# and a sealer below version 5 relays it as is. No writer sends type 7
-# yet. The Rust reader refuses a relayed type 7.
+# and a sealer below version 5 relays it as is. The Rust reader decodes a
+# relayed type 7 as its type 6 entry. An older Rust reader refuses it.
 [format.sealer-record-types]
 writes = 4
 reads_min = 0
@@ -154,6 +160,7 @@ code = [
     "crates/cluster-adapter/src/wire/mod.rs#RT_TXREF_OFFER",
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#RT_TXREF_OFFER",
     "crates/cluster-adapter/testdata/wire_golden.txt#txref_offer_ingress",
+    "crates/cluster-adapter/testdata/wire_golden.txt#txref_offer_egress",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/VoidLedger.java#RT_VOID",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/TxOffer.java#RT_TX",
 ]
