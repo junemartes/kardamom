@@ -156,7 +156,12 @@
       wait: false
       vars:
         host_hardware: "{{ 'off' if deployment_profile == 'local' else 'on' }}"
-    - {name: monitoring, wait: false, secrets: "{{ workloads_monitoring_secrets }}"}
+    - name: monitoring
+      wait: false
+      secrets: "{{ workloads_monitoring_secrets }}"
+      vars:
+        prometheus_retention_time: "{{ workloads_prometheus_retention_time }}"
+        prometheus_retention_size: "{{ workloads_prometheus_retention_size }}"
   loop_control:
     loop_var: workloads_job
     label: "{{ workloads_job.name }}"
