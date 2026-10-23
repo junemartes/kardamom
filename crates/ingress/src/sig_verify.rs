@@ -19,7 +19,7 @@
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy_consensus::TxEnvelope;
 use alloy_consensus::transaction::SignerRecoverable;
@@ -27,7 +27,6 @@ use alloy_primitives::{Address, B256, Bytes, keccak256};
 use kardamom_obs::pipeline::{Batch, Queue, Step};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
 
 use crate::error::IngressError;
 use crate::sync_util::LockIgnorePoison;
@@ -201,7 +200,7 @@ impl FlushLoop {
         }
         self.meters.intake.set(self.rx.len());
         self.meters.batch.record(buf.len());
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         self.process_batch(buf).await;
         self.meters.recover.since(started);
         ControlFlow::Continue(())
@@ -264,8 +263,14 @@ impl FlushLoop {
         }
     }
 
-    /// Races the flush window's deadline against further arrivals until
-    /// `buf` reaches `self.depth`, or the deadline passes.
+    /// Takes further arrivals until `buf` reaches `self.depth`, or the
+    /// flush window passes.
+    ///
+    /// The window is shorter than one tick of the tokio timer (1 ms), so a
+    /// timer would hold each batch for a full millisecond, not for the
+    /// window. Each pass yields once instead, so a handler that runs on
+    /// the same runtime can queue its request, then takes what is queued
+    /// without a wait. A partial batch costs at most the window in passes.
     async fn fill_until_deadline(&mut self, buf: &mut Vec<VerifyRequest>) {
         let depth = self.depth.get();
         // `Instant + Duration` panics on overflow (R12). `checked_add`
@@ -276,16 +281,9 @@ impl FlushLoop {
         let Some(deadline) = Instant::now().checked_add(self.flush_window) else {
             return;
         };
-        loop {
-            let remaining = depth - buf.len();
-            let filled = tokio::select! {
-                biased;
-                () = tokio::time::sleep_until(deadline) => return,
-                n = self.rx.recv_many(buf, remaining) => n,
-            };
-            if filled == 0 || buf.len() >= depth {
-                return;
-            }
+        while buf.len() < depth && Instant::now() < deadline {
+            tokio::task::yield_now().await;
+            buf.extend(std::iter::from_fn(|| self.rx.try_recv().ok()).take(depth - buf.len()));
         }
     }
 }
