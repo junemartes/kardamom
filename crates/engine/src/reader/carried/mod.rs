@@ -70,6 +70,9 @@ pub struct CarriedSubscription<F, S> {
     woke_at: Instant,
     /// The frames for the egress, when this reader forwards them.
     tee: Forward,
+    /// The gauge of the canonical index of the newest record that the
+    /// reader delivered, when the binary names one.
+    cursor_gauge: Option<metrics::Gauge>,
 }
 
 impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
@@ -126,7 +129,16 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
             timing,
             woke_at: Instant::now(),
             tee: Forward::default(),
+            cursor_gauge: None,
         }
+    }
+
+    /// Set the gauge `name` to the canonical index of each record that the
+    /// reader delivers. A boundary does not move it.
+    #[must_use]
+    pub fn with_cursor_gauge(mut self, name: &'static str) -> Self {
+        self.cursor_gauge = Some(metrics::gauge!(name));
+        self
     }
 
     /// Forward each delivered frame to the egress through `tee`.
@@ -329,6 +341,13 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
                 oldest_block,
             } => Err(self.reorder.unavailable(oldest_index, oldest_block)),
             Verdict::Behind { .. } => Err(self.restarted()),
+            Verdict::Unjoinable { index } => {
+                tracing::error!(
+                    index,
+                    "no source holds the bytes of the transaction reference; stopping"
+                );
+                Err(ExecutorError::UnjoinableReference { index })
+            }
         }
     }
 }
@@ -341,6 +360,21 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
         }
         self.reorder.try_deliver()
     }
+
+    /// Set the cursor gauge to the index of a delivered record.
+    fn show_cursor(&self, (position, item): &(BPosition, Ordered)) {
+        let boundary = matches!(
+            item,
+            Ordered::Message(kardamom_types::TxOrderingMessage::BoundaryStart(_))
+        );
+        if let (Some(gauge), false) = (&self.cursor_gauge, boundary) {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "canonical indexes stay far below 2^52; f64 represents them exactly"
+            )]
+            gauge.set(position.as_index() as f64);
+        }
+    }
 }
 
 impl<F: Transport, S: Transport> TxOrderingSubscription for CarriedSubscription<F, S> {
@@ -350,7 +384,9 @@ impl<F: Transport, S: Transport> TxOrderingSubscription for CarriedSubscription<
                 self.step()?;
                 continue;
             };
-            return Ok(self.tee.release(out));
+            let out = self.tee.release(out);
+            self.show_cursor(&out);
+            return Ok(out);
         }
     }
 }

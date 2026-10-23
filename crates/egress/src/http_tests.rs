@@ -110,3 +110,32 @@ async fn the_receipt_call_answers_as_the_executor_query_does() {
         None
     );
 }
+
+/// A store that starts after a boundary answers a cursor below it with
+/// `410`, its floor, and its reference mark.
+#[tokio::test]
+async fn a_read_below_the_floor_names_the_floor_and_the_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let egress = TestEgress::spawn(dir.path(), Join::AtBoundary).await;
+    egress.send_copy(
+        1,
+        0,
+        &[
+            encode_egress_boundary(10, 20, 0, 0),
+            crate::test_support::ref_record(20),
+            encode_egress_boundary(11, 21, 0, 0),
+        ],
+    );
+    let response = reqwest::get(format!(
+        "http://{}/v1/frames?from_index=0&from_block=1",
+        egress.addr
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 410);
+    let header = |name: &str| response.headers()[name].to_str().unwrap().to_owned();
+    assert_eq!(header("x-egress-floor-index"), "20");
+    assert_eq!(header("x-egress-floor-block"), "11");
+    assert_eq!(header("x-egress-ref-mark-index"), "20");
+    assert_eq!(header("x-egress-ref-mark-block"), "11");
+}

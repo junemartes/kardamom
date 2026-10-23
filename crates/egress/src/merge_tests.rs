@@ -3,10 +3,7 @@ use std::num::NonZeroUsize;
 use kardamom_cluster_adapter::wire::{encode_egress_boundary, encode_egress_record};
 
 use super::{Head, Key, Merge, MergeConfig};
-
-fn record(index: u64) -> Vec<u8> {
-    encode_egress_record(index, &[u8::try_from(index).unwrap(); 40]).unwrap()
-}
+use crate::test_support::record;
 
 fn boundary(block: u64, end: u64) -> Vec<u8> {
     encode_egress_boundary(block, end, 0, 0)

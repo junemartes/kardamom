@@ -160,6 +160,23 @@ pub(super) fn forged_at(index: u64) -> Vec<u8> {
     tx_frame(index, &CanonicalTx { envelope, ..good })
 }
 
+/// The relayed frame of a transaction reference at `index`: an entry with
+/// no bytes.
+pub(super) fn ref_at(index: u64) -> Vec<u8> {
+    let tx_ref = kardamom_types::TxRef::new(
+        alloy_primitives::B256::repeat_byte(0x33),
+        0,
+        kardamom_types::BPosition::from_index(index),
+        0,
+    );
+    let ingress = kardamom_cluster_adapter::wire::encode_ingress_txref(
+        &tx_ref,
+        kardamom_cluster_adapter::wire::GuardHeader::EXEMPT,
+    );
+    let (_, relayed) = kardamom_cluster_adapter::wire::split_ingress(&ingress).unwrap();
+    encode_egress_record(index, relayed).unwrap()
+}
+
 pub(super) fn boundary(block: u64, end: u64) -> Vec<u8> {
     encode_egress_boundary(block, end, 0, 0)
 }
@@ -407,4 +424,30 @@ fn a_hole_and_the_frames_after_it_send_one_request() {
         "the test ran past a resend"
     );
     assert_eq!(rig.feed.requests().len(), 1, "one request for the hole");
+}
+
+#[test]
+fn the_cursor_gauge_names_the_newest_delivered_record() {
+    let text = crate::meter::tests::render(|| {
+        let Rig { sub, feed, service } = Rig::new(0, 1);
+        let mut rig = Rig {
+            sub: sub.with_cursor_gauge("test_egress_cursor_index"),
+            feed,
+            service,
+        };
+        let request = rig.request(Source::Feed);
+        rig.feed.send(tx_at(0));
+        rig.feed.send(tx_at(1));
+        rig.feed.send(boundary(1, 2));
+        rig.feed.send(done(request.request_id, 2, 2));
+        let labels: Vec<String> = (0..3)
+            .map(|_| label(TxOrderingSubscription::next(&mut rig.sub).unwrap()))
+            .collect();
+        assert_eq!(labels, ["t0", "t1", "b1"]);
+    });
+    assert_eq!(
+        crate::meter::tests::value(&text, "test_egress_cursor_index"),
+        1.0,
+        "a boundary does not move the gauge"
+    );
 }

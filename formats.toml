@@ -372,6 +372,20 @@ code = ["crates/executor/src/bin/kardamom-executor/ledger.rs#struct Slot"]
 [format.receipt-ledger.layout]
 Slot = "slots 65536 01000000000000000200000000000000030303030303030303030303030303030303030303030303030303030303030300000000000000000000000000000000"
 
+# Frozen layout. The reference mark of an egress store (ref-mark in the
+# store directory): the canonical index and the block of the highest stored
+# transaction reference, as little-endian u64, 16 bytes. A missing file is
+# index 0 and block 0. A release that does not know the file ignores it. A
+# file of another size stops the egress at start.
+[format.egress-ref-mark]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = false
+code = ["crates/egress/src/ref_mark.rs#pub struct RefMark"]
+[format.egress-ref-mark.layout]
+RefMark = "09000000000000000300000000000000"
+
 # Frozen layout. The notifier outbox: rkyv OutboxRecord frames. An unknown
 # stage code reads as no stage.
 [format.notifier-outbox]

@@ -8,7 +8,8 @@
 //!   store in `x-egress-next-index` and `x-egress-next-block`. A reader
 //!   whose cursor after is below the head asks again from it;
 //! - `410` when the store holds nothing that old, with its floor in
-//!   `x-egress-floor-index` and `x-egress-floor-block`;
+//!   `x-egress-floor-index` and `x-egress-floor-block`, and its reference
+//!   mark in `x-egress-ref-mark-index` and `x-egress-ref-mark-block`;
 //! - `400` for a bad query, `503` when the owner thread is gone.
 //!
 //! `POST /` with the JSON-RPC call `eth_getTransactionReceipt` answers as
@@ -39,6 +40,7 @@ use tokio::sync::oneshot;
 
 use crate::merge::Head;
 use crate::owner::{Input, ReadRequest};
+use crate::ref_mark::RefMark;
 use crate::store::Range;
 
 /// The largest read that one request takes, in bytes.
@@ -177,10 +179,13 @@ impl Cursor {
                 after,
                 head,
             } => frames_reply(&frames, after, head),
-            Range::Unavailable { floor } => with_head(
-                reply(StatusCode::GONE, Bytes::from_static(b"below the floor\n")),
-                "floor",
-                floor,
+            Range::Unavailable { floor, mark } => with_mark(
+                with_head(
+                    reply(StatusCode::GONE, Bytes::from_static(b"below the floor\n")),
+                    "floor",
+                    floor,
+                ),
+                mark,
             ),
         }
     }
@@ -266,10 +271,23 @@ fn frames_reply(frames: &[Vec<u8>], after: Head, head: Head) -> Response<Full<By
 }
 
 /// Put `head` in the headers `x-egress-<name>-index` and `-block`.
-fn with_head(mut response: Response<Full<Bytes>>, name: &str, head: Head) -> Response<Full<Bytes>> {
+fn with_head(response: Response<Full<Bytes>>, name: &str, head: Head) -> Response<Full<Bytes>> {
+    with_pair(response, name, (head.next_index, head.next_block))
+}
+
+fn with_mark(response: Response<Full<Bytes>>, mark: RefMark) -> Response<Full<Bytes>> {
+    with_pair(response, "ref-mark", (mark.index, mark.block))
+}
+
+/// Add the headers `x-egress-<name>-index` and `x-egress-<name>-block`.
+fn with_pair(
+    mut response: Response<Full<Bytes>>,
+    name: &str,
+    (index, block): (u64, u64),
+) -> Response<Full<Bytes>> {
     [
-        (format!("x-egress-{name}-index"), head.next_index),
-        (format!("x-egress-{name}-block"), head.next_block),
+        (format!("x-egress-{name}-index"), index),
+        (format!("x-egress-{name}-block"), block),
     ]
     .into_iter()
     .filter_map(|(key, value)| {

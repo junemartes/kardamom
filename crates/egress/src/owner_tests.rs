@@ -7,7 +7,9 @@ use tokio::sync::oneshot;
 use super::{FramePublisher, Input, Join, JoinState, Owner, OwnerConfig, Parts, ReadRequest};
 use crate::merge::{Head, Key, Merge, MergeConfig};
 use crate::receipts::Receipts;
+use crate::ref_mark::RefMark;
 use crate::store::{Range, Store};
+use crate::test_support::record;
 
 /// The frames that went out live, on a channel the test reads.
 #[derive(Clone)]
@@ -141,10 +143,6 @@ fn the_distance_counts_the_records_above_the_stored_head() {
     );
 }
 
-fn record(index: u64) -> Vec<u8> {
-    encode_egress_record(index, &[u8::try_from(index % 256).unwrap(); 40]).unwrap()
-}
-
 /// The message of `frame` from a copy that started before this egress.
 fn late(seq: u64, frame: &[u8]) -> Input {
     message(100 + seq, frame)
@@ -190,7 +188,10 @@ fn with_no_peer_the_stream_starts_after_a_boundary() {
     };
     assert_eq!(
         read_from_genesis(&mut o),
-        Range::Unavailable { floor: start }
+        Range::Unavailable {
+            floor: start,
+            mark: RefMark::default()
+        }
     );
 }
 
@@ -228,10 +229,41 @@ fn a_peer_floor_above_the_head_starts_the_stream_there() {
         next_block: 21,
         last: Some(Key::Boundary(20)),
     };
-    o.on(Input::Floor(floor)).unwrap();
+    o.on(Input::Floor {
+        floor,
+        mark: RefMark::default(),
+    })
+    .unwrap();
     assert_eq!(state(&mut o).head, floor);
-    o.on(Input::Floor(GENESIS)).unwrap();
+    o.on(Input::Floor {
+        floor: GENESIS,
+        mark: RefMark::default(),
+    })
+    .unwrap();
     assert_eq!(state(&mut o).head, floor);
+}
+
+/// A start at the floor of a peer raises the reference mark to the mark
+/// of the peer.
+#[test]
+fn a_peer_floor_raises_the_mark_to_the_mark_of_the_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, _published) = live();
+    let mut o = owner(dir.path(), live);
+    let floor = Head {
+        next_index: 40,
+        next_block: 21,
+        last: Some(Key::Boundary(20)),
+    };
+    let mark = RefMark {
+        index: 30,
+        block: 16,
+    };
+    o.on(Input::Floor { floor, mark }).unwrap();
+    assert_eq!(
+        read_from_genesis(&mut o),
+        Range::Unavailable { floor, mark }
+    );
 }
 
 /// When the peers give up, the next boundary of a copy starts the stream.

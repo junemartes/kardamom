@@ -39,6 +39,7 @@ use kardamom_types::Receipt;
 use crate::merge::{Head, Merge};
 use crate::metrics;
 use crate::receipts::Receipts;
+use crate::ref_mark::RefMark;
 use crate::store::{Range, Store, StoreError};
 
 /// Where the delivered frames go live.
@@ -81,8 +82,8 @@ pub enum Input {
     /// Frames of a peer egress, in order, from the head of this one.
     Caught(Vec<Vec<u8>>),
     /// The floor of a peer egress, above the head of this one: no peer
-    /// holds the frames below it.
-    Floor(Head),
+    /// holds the frames below it. `mark` is the reference mark of the peer.
+    Floor { floor: Head, mark: RefMark },
     /// No peer filled the place in time: start again after a boundary.
     GiveUp,
     /// Where the stream stands, for the task that reads a peer.
@@ -198,7 +199,7 @@ impl<P: FramePublisher> Owner<P> {
                 Ok(())
             }
             Input::Caught(frames) => self.take_caught(&frames),
-            Input::Floor(floor) => self.start_at_floor(floor),
+            Input::Floor { floor, mark } => self.start_at_floor(floor, mark),
             Input::GiveUp => {
                 self.give_up();
                 Ok(())
@@ -276,14 +277,15 @@ impl<P: FramePublisher> Owner<P> {
             "egress: the stream starts again after a boundary of a copy"
         );
         metrics::count_rebased("boundary");
-        self.rebase(start)?;
+        self.rebase(start, RefMark::default())?;
         self.join = Join::Joined;
         Ok(())
     }
 
     /// Start the stream again at the floor of a peer, when it is above the
-    /// head and the copies did not join yet.
-    fn start_at_floor(&mut self, floor: Head) -> Result<(), StoreError> {
+    /// head and the copies did not join yet. The reference mark of the
+    /// store becomes the higher of its own and `mark`, the mark of the peer.
+    fn start_at_floor(&mut self, floor: Head, mark: RefMark) -> Result<(), StoreError> {
         if self.join == Join::Joined || floor.next_block <= self.parts.merge.head().next_block {
             return Ok(());
         }
@@ -292,11 +294,11 @@ impl<P: FramePublisher> Owner<P> {
             "egress: the floor of a peer is above the head; the stream starts there"
         );
         metrics::count_rebased("peer-floor");
-        self.rebase(floor)
+        self.rebase(floor, mark)
     }
 
-    fn rebase(&mut self, start: Head) -> Result<(), StoreError> {
-        self.parts.store.reset(start)?;
+    fn rebase(&mut self, start: Head, peer: RefMark) -> Result<(), StoreError> {
+        self.parts.store.reset(start, peer)?;
         self.parts.merge.rebase(start);
         Ok(())
     }
