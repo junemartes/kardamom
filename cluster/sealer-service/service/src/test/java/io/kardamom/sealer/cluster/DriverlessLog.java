@@ -76,12 +76,21 @@ final class DriverlessLog {
 
     /** A heap member with an ordering window of {@code orderingWindow} records, from {@code snapshot} or at genesis. */
     Member member(final Optional<byte[]> snapshot, final int orderingWindow) {
+        return member(snapshot, orderingWindow, LagBudgets.DEFAULT);
+    }
+
+    /** A heap member with no ordering window and the lag guards of {@code budgets}, from {@code snapshot} or at genesis. */
+    Member member(final Optional<byte[]> snapshot, final LagBudgets budgets) {
+        return member(snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW, budgets);
+    }
+
+    private Member member(final Optional<byte[]> snapshot, final int orderingWindow, final LagBudgets budgets) {
         final StubCluster cluster = new StubCluster();
         cluster.role = io.aeron.cluster.service.Cluster.Role.FOLLOWER;
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService svc = new SealerClusteredService(
             CAPACITY, 250, 0, Set.of(), VoidLedger.Config.DISABLED,
-            CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS, orderingWindow, LagBudgets.DEFAULT);
+            CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS, orderingWindow, budgets);
         svc.start(cluster, snapshot);
         final Member member = new Member(svc, cluster, sequencer);
         started.add(member);

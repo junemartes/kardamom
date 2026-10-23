@@ -444,13 +444,16 @@ public final class SealerClusteredService implements ClusteredService {
 
     /**
      * After a log entry: when a block boundary of the entry switched the
-     * version from {@code versionBefore}, report the switch and ask for a
-     * snapshot, so a replay has a start point on each side of it.
+     * version from {@code versionBefore}, give the egress the eviction rule
+     * of the new version, report the switch, and ask for a snapshot, so a
+     * replay has a start point on each side of it. The egress evicts before
+     * the snapshot notice, so the notice and the snapshot show the new rule.
      */
     private void afterEntry(final int versionBefore, final long timestamp) {
         if (state.decisionVersion() == versionBefore) {
             return;
         }
+        egress.setDecisionVersion(state.decisionVersion());
         publishedRules = rulesView();
         System.out.println("cluster DECISION-VERSION memberId=" + memberId
             + " version=" + state.decisionVersion() + " at=" + timestamp + " block=" + state.blockNumber());
@@ -475,9 +478,9 @@ public final class SealerClusteredService implements ClusteredService {
     }
 
     /**
-     * The snapshot: the state section, then the egress retention above the
-     * posted head. Every member writes the same bytes at the same log
-     * position. With the retained file, the snapshot is version
+     * The snapshot: the state section, then the egress retention. Every
+     * member writes the same bytes at the same log position. With the
+     * retained file, the snapshot is version
      * {@link CanonicalSealerState#RETAINED_FILE_SNAPSHOT_VERSION}.
      */
     byte[] snapshot() {
@@ -496,9 +499,9 @@ public final class SealerClusteredService implements ClusteredService {
      * start at the restore point (record index canonicalCount and boundary
      * block blockNumber, the next ones to emit) and move down to the oldest
      * retained frame, so a member restored from a snapshot still serves a
-     * replay from the posted head. Floors left at genesis would answer a
-     * pre-retention replay request with a false REPLAY_DONE (a silent
-     * canonical gap) instead of the correct REPLAY_UNAVAILABLE.
+     * replay from the floors of the snapshot. Floors left at genesis would
+     * answer a pre-retention replay request with a false REPLAY_DONE (a
+     * silent canonical gap) instead of the correct REPLAY_UNAVAILABLE.
      */
     void restore(final byte[] snapshot) {
         final ByteBuffer buf = ByteBuffer.wrap(snapshot).order(ByteOrder.BIG_ENDIAN);
@@ -553,13 +556,14 @@ public final class SealerClusteredService implements ClusteredService {
 
     /**
      * Open the egress at the state's head, restore the retention section
-     * of a snapshot or open an empty retention, and set the retention floor
-     * at the posted head.
+     * of a snapshot or open an empty retention, and give the egress the
+     * eviction rule of the state's decision version and the posted head.
      */
     private void openEgress(final Optional<ByteBuffer> retention) {
         this.egress = new SealerEgress(
             cluster, memberId, retained, feed, state.canonicalCount(), state.blockNumber(), startHold);
         retention.ifPresentOrElse(egress::restore, egress::openEmpty);
+        egress.setDecisionVersion(state.decisionVersion());
         egress.setPostedHead(state.postedHead());
     }
 

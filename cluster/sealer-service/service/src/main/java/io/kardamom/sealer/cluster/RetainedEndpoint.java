@@ -25,7 +25,7 @@ import java.util.stream.Collectors;
  * byte below it is a whole record. A segment that starts at or above the
  * published head is not listed.</p>
  *
- * <p>The file holds the bytes of every transaction above the posted head,
+ * <p>The file holds the bytes of the transactions of the retained frames,
  * and the admin server listens on all addresses. So every request must
  * carry the shared token of the job in {@code Authorization: Bearer
  * <token>}; any other request answers 403. The token and the bytes travel
