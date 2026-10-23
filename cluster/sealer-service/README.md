@@ -430,7 +430,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.voidWindow` | `65536` | yes | The number of newest canonical indices that a void can name. |
 | `kardamom.cluster.daLagBudgetBlocks` | `10000` (env `DA_LAG_BUDGET_BLOCKS`) | yes | The DA-lag budget in blocks. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. |
 | `kardamom.cluster.recordLagBudget` | `0` (env `KARDAMOM_RECORD_LAG_BUDGET`) | yes | The record-lag budget in canonical records. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. In this release a value above `0` also stops the start, because the snapshot writer writes version 10. |
-| `kardamom.cluster.retention` | `65536` | recommended | The minimum number of egress frames kept for replay. |
+| `kardamom.cluster.retention` | `65536` | recommended | The egress frames kept for replay: the minimum below decision version 5, and the exact window under version 5. |
 | `kardamom.cluster.carryBytes` | `false` | yes | `true` keeps the retained frames in an append-only file, not on the heap, and writes snapshot version 12. It also relays a full entry as a canonical entry, and drops the void request and the recorded cursor. The release gate refuses a rolling change of it. It needs `adminPort`, the env var `KARDAMOM_RETAINED_TOKEN` and a `snapshotIntervalS` above `0`. Any value other than `true`, `false` or empty stops the start. See [Retained file](#retained-file). |
 | `kardamom.cluster.feedAeronDir` | empty (off) | no | The directory of the media driver that the member shares with its paired executor. A value turns the member feed on. It needs `carryBytes=true`; without it the start stops. See [Member feed](#member-feed). |
 | `kardamom.cluster.feedRingBytes` | `16777216` (16 MiB) | no | The frame ring of the member feed, off the heap. A power of two of at least 8 MiB; another value stops the start. |
@@ -458,12 +458,14 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 - `fileSyncLevel`: `0` leaves a write in the page cache. `1` syncs the data of each write batch. `2` syncs the data and the file metadata.
   - At level 0 an entry that a quorum acknowledged can exist only in page caches. A power loss that takes the members together drops it.
   - The deploy passes `1` (variable `cluster_file_sync_level`, env `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL`).
-- `retention` is a minimum window. A frame past the window leaves only when its block is at or below the posted head.
-  - The batcher can always replay from its cursor, because the sealer keeps each frame that is not posted.
-  - The stretch has a bound: the budget plus one flush of blocks, in heap.
-  - The snapshot carries the retained frames. A member that restores a snapshot keeps the floor at the posted head. It answers older ranges with `REPLAY_UNAVAILABLE`.
-  - With no budget (`0`), nothing bounds the stretch.
-  - Use the same value on every member, so the replay range does not change after a failover.
+- `retention`: the eviction rule follows the decision version of the state.
+  - Below version 5, `retention` is a minimum window. A frame past the window leaves only when its block is at or below the posted head.
+    - The batcher can always replay from its cursor, because the sealer keeps each frame that is not posted.
+    - The stretch has a bound: the budget plus one flush of blocks, in heap.
+    - With no budget (`0`), nothing bounds the stretch.
+  - Under version 5 on a member that carries the bytes, `retention` is the whole rule. A frame past the window leaves at once, at any posted head. See [Version 5](#version-5).
+  - The snapshot carries the retained frames. A member that restores a snapshot keeps the floors of the snapshot. It answers older ranges with `REPLAY_UNAVAILABLE`.
+  - Use the same value on every member. The eviction is part of the replicated state: the replay answers and the snapshot bytes depend on it.
 - `carryBytes`: the deploy passes it, with `feedAeronDir` and `feedRingBytes`, only in carry mode (`KARDAMOM_CARRY_BYTES=on`). Then the job also passes `KARDAMOM_RETAINED_TOKEN` from the Nomad variable of the member group. Without carry mode the retained frames stay on the heap. See [Carry mode](../../deploy/cluster/README.md#carry-mode).
   - Switch it only with a new chain or a coordinated cut-over, never on a live chain. A member with the file stops on a snapshot before version 12, and a member without the file stops on a version-12 snapshot. Both print `sealer RETAINED-FILE FATAL`.
   - `snapshotIntervalS=0` with `carryBytes` stops the start: the purge of the file runs at each snapshot, so the file would never shrink.
@@ -615,6 +617,18 @@ Version 5 is version 4 that relays the bytes of a transaction. The sequencer off
   4. Otherwise the member sets the bit and orders the reference. It relays one canonical entry: `[canonical_id:32][record_type=6][lane:u8][envelope]`.
 - **Other records.** A reference of type 0 keeps the rules of version 4, so a sequencer that sends type 0 still has its references ordered. An epoch and a remote-origin record keep the id window. With priority fees on, a held full reference takes the version-5 rules when the ordering window flushes it.
 - **No void and no record lag.** The member drops the void requests (kind 6) and the recorded cursors (kind 9) as unknown kinds. The record-lag guard is off. The void ledger keeps no full reference.
+- **The replay window.** A member that carries the bytes (`carryBytes`) keeps only the last `retention` frames. A frame past the window leaves at once, also when its block is above the posted head. So the retained frames have a fixed bound in the retained file and in the snapshot, at any DA lag.
+  - A member that keeps its frames on the heap keeps the rule of version 4: a frame past the window leaves only when its block is posted. Without the bytes, no member feed runs. The executors and the batcher then read references, and the egress cannot serve a reference, so no reader below the window could recover.
+  - Every member runs the same `carryBytes` value (the release gate refuses a rolling change of it), so every member evicts the same frames.
+  - A member with `carryBytes` writes snapshot version 12. That layout holds no decision rules and no version switch, so a restore of such a member does not run version 5 yet. Until a snapshot version for that case exists, do not run `carryBytes` with feature 3 or 4.
+  - A cursor inside the window gets the frames from the cursor. A cursor below the window gets `REPLAY_UNAVAILABLE`. A reader below the window recovers from another source.
+  - The DA-lag guard stays. It refuses new records when the sealed head is more than the budget past the posted head. It holds no frame.
+  - The rule changes at the end of the log entry whose boundary switches the version: the member evicts the frames past the window before the snapshot notice of the switch. A restore takes the rule of the version in the snapshot. So every member evicts the same frames at the same log position, from the log or from a snapshot. The status of the tick that switches leaves before the eviction, with the count of the old rule.
+  - A switch back to version 4 or 3 keeps the old rule again from the end of that entry.
+  - A batcher that replays from the sealer gets `REPLAY_UNAVAILABLE` when its cursor falls below the window, and it does not recover by itself. The egress (`--egress`) serves the batcher and the validator below the window, but only frames with their bytes: a reference of version 4 or older has no bytes. So the order of the rollout is:
+    - On a chain where version 5 already runs with `carryBytes`: switch the batcher and the validator to the egress, then deploy this release. Without `carryBytes`, this release changes no eviction.
+    - On a chain where version 5 does not run yet: send the upgrade transaction of feature 4 at a low load, when the unposted frames fit in the window. Keep the load low until the batcher posts a block of version 5. Then switch the batcher and the validator to the egress.
+  - See [the one-way pipeline spec, section 6.4](../../docs/specs/2026-10-21-one-way-pipeline.md).
 - **The cost.** The record path allocates nothing (`AllocationGateTest`, case `ref_v5`, and `CarriedPathAllocationTest` of the service, cases `carried_fresh` and `carried_copy`). With no ordering window, the relay copies the id, the lane and the envelope from the log buffer into the staging buffer in two parts. The frame goes from there to the retained ring and to each session.
 - **The activation.** `FEATURE_SEALER_V5` follows the rules of `FEATURE_SEALER_V4`, with its own schedule: the activation becomes visible at the boundary that seals the first block of its epoch, and the version changes at the first boundary at or after its time. A later activation with a time ahead turns version 5 off until that time, and a time of `2^64 - 1` keeps it off.
   - The member stores the activation only while version 4 or 5 runs. A record that comes while version 3 runs changes nothing (outcome `EARLY`, `cluster FEATURE-ACTIVATION-EARLY`). Send the upgrade transaction of feature 4 only after version 4 is on.
@@ -645,7 +659,7 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
 
 - The server listens on `0.0.0.0`. Two members on one host cannot share the port, so the port is off by default.
 - The server answers `/status`, `/ready` and `/metrics` on one thread. The paths under `/retained` run on two threads of their own, so a segment copy does not hold up `/ready`.
-- The retained file holds the bytes of every transaction above the posted head, and the server listens on all addresses. So each request under `/retained` must carry `Authorization: Bearer <KARDAMOM_RETAINED_TOKEN>`. The job passes the same token to every member.
+- The retained file holds the bytes of the transactions of the retained frames, and the server listens on all addresses. So each request under `/retained` must carry `Authorization: Bearer <KARDAMOM_RETAINED_TOKEN>`. The job passes the same token to every member.
   - The token and the segment bytes travel in cleartext HTTP on the node network. The token keeps out a client that does not have it. It does not hide the bytes from a host that reads the network.
 - `diskFreeBytes` is `null`, and the gauge is `NaN`, when the disk cannot be read. The member stays ready.
 - The status JSON has `memberId`, `role`, `election`, `commitPosition`, `servicePosition`, `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, `snapshotLatest`, `decisionVersion`, `decisionActivationOrigin`, `decisionActivationMs`, `diskFreeBytes` and `ready`.
@@ -784,6 +798,7 @@ The chaos suite and operators read these lines. The admin server also exports on
     - A restore drops the cursor of an executor that is not a configured voter.
   - from versions 13 and 14 only, the decision rules, after the seed digest
 - The retention section follows the state section. Its layout depends on the version. Both layouts are big-endian.
+  - Under decision version 5 on a member that carries the bytes, the section holds at most `retention` frames. The layout does not change.
   - Versions 8 to 11, 13 and 14, on the heap: `[count:i32]`, then `[boundary:u8][key:u64][len:u32][frame]` for each retained frame.
   - Version 12, the retained file: `[floor_index:u64][floor_block:u64][count:u64][front:u64][head:u64][n:i32]`, then `[block:u64][end_tx_idx:u64][end_pos:u64]` for each retained boundary, then `[len:i32]`, the length of the section before it. The section is the end of the snapshot, so a peer seed finds it with no parse of the state. See [Retained file](#retained-file).
   - A member with `carryBytes` stops on a snapshot that is not version 12. A member without it stops on version 12.

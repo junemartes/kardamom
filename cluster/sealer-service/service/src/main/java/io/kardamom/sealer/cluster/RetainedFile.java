@@ -230,6 +230,11 @@ final class RetainedFile implements RetainedFrames {
     }
 
     @Override
+    public boolean carriesBytes() {
+        return true;
+    }
+
+    @Override
     public boolean frontIsBoundary() {
         return keyAt(frontPos).boundary();
     }
