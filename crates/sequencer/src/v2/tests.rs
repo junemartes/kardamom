@@ -321,3 +321,29 @@ fn each_transaction_gets_one_verdict_at_admission() {
     );
     assert_eq!(rig.offers().len(), 4, "2, the cold 0, 3 and 4");
 }
+
+/// The v2 loop times the filter decision of each envelope under the name
+/// of the nonce check of the v1 loop.
+#[test]
+fn the_filter_decision_records_the_nonce_check() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    metrics::with_local_recorder(&recorder, || {
+        let s = signer(1);
+        let (mut l, accounts, _) = new_loop();
+        accounts
+            .send(AccountEvent::Rows {
+                block: 1,
+                rows: vec![(s.address(), rich(0, 1))],
+            })
+            .unwrap();
+        let mut rig = Rig::default();
+        rig.push(TxDataLoc::new(7, pos(64)), signed_envelope(&s, 0, 1));
+        assert!(l.run_once(&mut rig.ports()).unwrap());
+    });
+    let text = recorder.handle().render();
+    assert!(
+        text.lines().any(|line| line
+            == r#"kardamom_sequencer_nonce_check_duration_seconds_count{partition="0"} 1"#),
+        "{text}"
+    );
+}

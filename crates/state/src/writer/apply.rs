@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use kardamom_obs::pipeline::Step;
 use signet_libmdbx::tx::aliases::RwTxSync;
 use signet_libmdbx::{Database, WriteFlags};
 use tracing::error;
@@ -45,6 +46,40 @@ impl IndexEntry {
             std::mem::swap(later, kept);
         }
         true
+    }
+}
+
+/// The steps of one block commit, one for each timed section. The writer
+/// owns them, and records every section of every commit. The trie step
+/// records only when the writer keeps a trie.
+pub(super) struct CommitSteps {
+    open: Step,
+    storage: Step,
+    accounts: Step,
+    receipts: Step,
+    trie: Step,
+    mdbx: Step,
+    total: Step,
+}
+
+impl CommitSteps {
+    pub(super) fn new() -> Self {
+        Self {
+            open: Step::new("state.commit_open"),
+            storage: Step::new("state.commit_storage"),
+            accounts: Step::new("state.commit_accounts"),
+            receipts: Step::new("state.commit_receipts"),
+            trie: Step::new("state.commit_trie"),
+            mdbx: Step::new("state.commit_mdbx"),
+            total: Step::new("state.commit"),
+        }
+    }
+
+    /// Record the section that began at `started` on `step`, and return
+    /// its time for [`ApplyTimings`].
+    fn lap(step: &Step, started: Instant) -> Duration {
+        step.since(started);
+        started.elapsed()
     }
 }
 
@@ -90,12 +125,17 @@ struct BatchWriter<'a> {
     meta: Database,
     trie_mode: TrieMode,
     timing: ApplyTimings,
+    steps: &'a CommitSteps,
 }
 
 impl<'a> BatchWriter<'a> {
     /// Open every table this batch touches, timed as the batch's `open`
     /// section.
-    fn open(txn: &'a RwTxSync, trie_mode: TrieMode) -> Result<Self, StateError> {
+    fn open(
+        txn: &'a RwTxSync,
+        trie_mode: TrieMode,
+        steps: &'a CommitSteps,
+    ) -> Result<Self, StateError> {
         let t0 = Instant::now();
         let accounts = txn.open_db(Some(TABLE_ACCOUNTS))?;
         let storage = txn.open_db(Some(TABLE_STORAGE))?;
@@ -115,12 +155,13 @@ impl<'a> BatchWriter<'a> {
             meta,
             trie_mode,
             timing: ApplyTimings {
-                open: t0.elapsed(),
+                open: CommitSteps::lap(&steps.open, t0),
                 storage: Duration::ZERO,
                 accounts: Duration::ZERO,
                 receipts: Duration::ZERO,
                 commit: Duration::ZERO,
             },
+            steps,
         })
     }
 
@@ -150,7 +191,7 @@ impl<'a> BatchWriter<'a> {
                 WriteFlags::UPSERT,
             )?;
         }
-        self.timing.storage = t.elapsed();
+        self.timing.storage = CommitSteps::lap(&self.steps.storage, t);
         Ok(self)
     }
 
@@ -164,7 +205,7 @@ impl<'a> BatchWriter<'a> {
     fn accounts(mut self, delta: &BlockDelta) -> Result<Self, StateError> {
         let t = Instant::now();
         crate::schema::write_accounts(self.txn, self.accounts, &delta.accounts)?;
-        self.timing.accounts = t.elapsed();
+        self.timing.accounts = CommitSteps::lap(&self.steps.accounts, t);
         Ok(self)
     }
 
@@ -255,7 +296,7 @@ impl<'a> BatchWriter<'a> {
         for e in writes {
             cur.put(&e.key, &e.value, WriteFlags::UPSERT)?;
         }
-        self.timing.receipts = t.elapsed();
+        self.timing.receipts = CommitSteps::lap(&self.steps.receipts, t);
         Ok(self)
     }
 
@@ -319,6 +360,7 @@ impl<'a> BatchWriter<'a> {
         if self.trie_mode == TrieMode::Off {
             return Ok(self);
         }
+        let t = Instant::now();
         let tables = trie::TrieTables::open(self.txn)?;
         let root = tables.update_for_block(self.txn, delta)?;
         // `every_n` is never 0 here: `StateWriter::spawn_with_trie` refuses to
@@ -347,6 +389,7 @@ impl<'a> BatchWriter<'a> {
             encode_b256(root),
             WriteFlags::UPSERT,
         )?;
+        self.steps.trie.since(t);
         Ok(self)
     }
 
@@ -360,9 +403,10 @@ impl<'a> BatchWriter<'a> {
 impl StateWriter {
     pub(super) fn apply(&self, batch: &WriteBatch) -> Result<(), StateError> {
         let want_timing = std::env::var_os("KARDAMOM_WRITER_TIMING").is_some();
+        let started = Instant::now();
         let txn = self.env.raw().begin_rw_sync()?;
 
-        let mut timing = BatchWriter::open(&txn, self.trie_mode)?
+        let mut timing = BatchWriter::open(&txn, self.trie_mode, &self.steps)?
             .storage(&batch.delta)?
             .accounts(&batch.delta)?
             .code(&batch.delta)?
@@ -374,7 +418,8 @@ impl StateWriter {
 
         let t_commit = Instant::now();
         txn.commit()?;
-        timing.commit = t_commit.elapsed();
+        timing.commit = CommitSteps::lap(&self.steps.mdbx, t_commit);
+        self.steps.total.since(started);
 
         if want_timing {
             timing.report(batch);

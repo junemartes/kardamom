@@ -21,6 +21,7 @@
       retries: 200
       vars:
         archive_file_sync_level: "{{ workloads_archive_file_sync_level }}"
+        aeron_threading_mode: "{{ workloads_aeron_threading_mode }}"
 
 # The development L1: anvil runs only when no real L1 is given (L1_RPC).
 # Behind the fault proxy, the followers walk finalized blocks, so anvil
@@ -56,6 +57,21 @@
 - name: Deploy the sealer
   ansible.builtin.include_tasks: sealer.yml
 
+# The backup sealer (#746) follows the cluster from a node of role
+# "backup". The deploy registers it only when the inventory has such a
+# node, and does not wait for it: its first copy of the snapshots can take
+# minutes, and no other job needs it.
+- name: Deploy the backup sealer
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job:
+      name: cluster-backup
+      wait: false
+      vars:
+        image_ref: "{{ workloads_image_refs.cluster | default('') }}"
+        backup_file_sync_level: "{{ workloads_backup_file_sync_level }}"
+  when: groups['backup'] | default([]) | length > 0
+
 - name: Deploy pipeline dependencies
   ansible.builtin.include_tasks: job.yml
   loop:
@@ -71,6 +87,7 @@
       wait: false
       vars:
         exec_cursor: "{{ workloads_exec_cursor }}"
+        checkpoint_log: "{{ workloads_checkpoint_log }}"
     - {name: state-mirror, wait: false}
     # The notifier taps the sequencers' and the ingress's status stream
     # and the executors' receipts; it needs none of them up to start.

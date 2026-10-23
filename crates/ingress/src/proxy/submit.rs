@@ -17,6 +17,7 @@
 //! logged at debug level with the sender and the nonce.
 
 use std::net::IpAddr;
+use std::time::Instant;
 
 use alloy_consensus::TxEnvelope as ConsensusEnvelope;
 use alloy_consensus::transaction::Transaction;
@@ -30,6 +31,7 @@ use crate::channels::{IngressPublication, IngressSubscription};
 use crate::error::IngressError;
 use crate::metrics::count_reject;
 use crate::pending::ReceiptResponse;
+use crate::submit_steps::Timing;
 
 use super::{AccountState, IngressProxy, ValidatedSubmission};
 
@@ -52,6 +54,7 @@ where
         client_ip: IpAddr,
         raw_tx: AlloyBytes,
     ) -> Result<ReceiptResponse, IngressError> {
+        let _timing = Timing::start(&self.steps.submit);
         let v = self.validate_submission(client_ip, &raw_tx).await?;
         if let Some(answer) = v.answer_from_cache() {
             return answer.map(|receipt| ReceiptResponse { receipt });
@@ -134,6 +137,7 @@ where
                 .await
                 .map(|resp| resp.receipt.tx_hash);
         }
+        let _timing = Timing::start(&self.steps.submit);
         let v = self.validate_submission(client_ip, &raw_tx).await?;
         let wait = self
             .acks
@@ -168,6 +172,7 @@ where
         client_ip: IpAddr,
         raw_tx: AlloyBytes,
     ) -> Result<B256, IngressError> {
+        let _timing = Timing::start(&self.steps.submit);
         let v = self.validate_submission(client_ip, &raw_tx).await?;
         if let Some(answer) = v.answer_from_cache() {
             return answer.map(|receipt| receipt.tx_hash);
@@ -209,6 +214,7 @@ where
         client_ip: IpAddr,
         raw_tx: &AlloyBytes,
     ) -> Result<ValidatedSubmission, IngressError> {
+        let _timing = Timing::start(&self.steps.validate);
         metrics::counter!(crate::metrics::TX_RECEIVED_TOTAL).increment(1);
 
         // Overload valve. When the pending registry reaches this depth,
@@ -266,18 +272,17 @@ where
         // `sender` and `tx_hash`. This code stamps both fields into the
         // envelope before any other consumer sees the tx. The sig-verify
         // failure path returns before this code publishes to Aeron.
-        let (sender, tx_hash) = self
-            .verifier
-            .recover(env, raw_tx.clone())
-            .await
-            .map_err(|e| {
-                if matches!(e, IngressError::SignatureInvalid) {
-                    count_reject("signature-invalid");
-                } else {
-                    count_reject("internal");
-                }
-                e
-            })?;
+        let started = Instant::now();
+        let recovered = self.verifier.recover(env, raw_tx.clone()).await;
+        self.steps.recover.since(started);
+        let (sender, tx_hash) = recovered.map_err(|e| {
+            if matches!(e, IngressError::SignatureInvalid) {
+                count_reject("signature-invalid");
+            } else {
+                count_reject("internal");
+            }
+            e
+        })?;
 
         let cached = self.cache.lookup(sender, nonce);
         Ok(ValidatedSubmission {
@@ -392,7 +397,9 @@ where
     ) -> Result<(), IngressError> {
         let shard = kardamom_types::num::u32_to_usize(self.cfg.lane_for(v.sender));
         let correlation_id = self.next_correlation_id();
-        self.publication
+        let started = Instant::now();
+        let published = self
+            .publication
             .publish_tx_data(
                 shard,
                 TxEnvelope {
@@ -403,10 +410,11 @@ where
                     max_inclusion_block: self.cfg.inclusion_deadline(self.deadline_clock()),
                 },
             )
-            .await
-            .inspect_err(|_| {
-                count_reject("partition-unavailable");
-            })
+            .await;
+        self.steps.publish_round_trip.since(started);
+        published.inspect_err(|_| {
+            count_reject("partition-unavailable");
+        })
     }
 }
 

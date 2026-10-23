@@ -97,13 +97,47 @@ variable "priority_fees" {
 
 # File sync level of the Raft log and the archive
 # (-Dkardamom.cluster.fileSyncLevel): 0 leaves a write in the page cache,
-# 1 syncs the data of every write batch, 2 syncs data and metadata. At 0
-# an entry that a quorum acknowledged can exist only in page caches, and a
-# power loss that takes the members together drops it. Ansible deployment
-# passes -var from KARDAMOM_CLUSTER_FILE_SYNC_LEVEL.
+# 1 syncs the data of every write batch, 2 syncs data and metadata. At 0 a
+# commit waits for no disk sync, and the kernel writes the log back on its
+# own schedule (about 30 s with the Linux defaults). An entry that a quorum
+# acknowledged is lost only when a majority of members lose power or their
+# kernels before the write-back. So each member runs on its own machine.
+# The level is local to a member and can differ during a rolling deploy.
+# Ansible deployment passes -var from KARDAMOM_CLUSTER_FILE_SYNC_LEVEL.
 variable "cluster_file_sync_level" {
   type    = string
-  default = "1"
+  default = "0"
+
+  validation {
+    condition     = contains(["0", "1", "2"], var.cluster_file_sync_level)
+    error_message = "The cluster_file_sync_level value must be 0, 1 or 2."
+  }
+}
+
+# The threading mode of the media driver inside each sealer member
+# (-Dkardamom.cluster.driverThreadingMode): SHARED, SHARED_NETWORK or
+# DEDICATED, as for the node driver (aeron.system.nomad.hcl). The Raft log
+# of the member passes through this driver. Each member reads its own value,
+# so a rolling deploy can change it. Ansible deployment passes -var from
+# KARDAMOM_CLUSTER_DRIVER_THREADING_MODE.
+variable "cluster_driver_threading_mode" {
+  type    = string
+  default = "SHARED"
+
+  validation {
+    condition     = contains(["SHARED", "SHARED_NETWORK", "DEDICATED"], var.cluster_driver_threading_mode)
+    error_message = "The cluster_driver_threading_mode value must be SHARED, SHARED_NETWORK or DEDICATED."
+  }
+}
+
+# The heap of each member in MB (KARDAMOM_CLUSTER_HEAP_MB of the image
+# entrypoint). The job memory is the heap plus 640 MB for the media
+# driver, the archive and the JVM itself. The retained frames of the
+# sealer are on the heap until the DA layer posts them, so the heap
+# bounds the DA lag that a member survives at a given rate.
+variable "cluster_heap_mb" {
+  type    = number
+  default = 384
 }
 
 # Remote-origin allowlist (-Dkardamom.cluster.remoteOrigins): the peer
@@ -224,6 +258,32 @@ locals {
     "-Daeron.archive.message.timeout=${var.aeron_stall_tolerance_ms}ms",
     "-Daeron.archive.connect.timeout=${floor(var.aeron_stall_tolerance_ms / 2)}ms",
   ])
+  # Each Aeron agent of a sealer counts its work cycles above 5 ms, in the
+  # "cycle exceeded threshold" counters of its CnC file. A long cycle of
+  # the shared driver thread holds every log packet in and out, so these
+  # counters show the stalls that make the seal p99. Aeron's default
+  # threshold is 1 s, which counts nearly nothing. The counters change no
+  # behavior.
+  cycle_threshold_opts = join(" ", [
+    for p in [
+      "aeron.driver.sender.cycle.threshold",
+      "aeron.driver.receiver.cycle.threshold",
+      "aeron.driver.conductor.cycle.threshold",
+      "aeron.name.resolver.threshold",
+      "aeron.archive.conductor.cycle.threshold",
+      "aeron.archive.recorder.cycle.threshold",
+      "aeron.archive.replayer.cycle.threshold",
+      "aeron.cluster.cycle.threshold",
+      "aeron.cluster.service.cycle.threshold",
+    ] : "-D${p}=5ms"
+  ])
+  # Each GC pause and each safepoint of a sealer JVM goes to a file in the
+  # member directory with a UTC time stamp, so a long cycle of an Aeron
+  # agent can be matched to a pause of the whole JVM. The JVM writes a
+  # safepoint line inside the pause, so the writes are asynchronous
+  # (-Xlog:async) and go to a rotated file, not to stdout: a slow log pipe
+  # must never lengthen a pause.
+  jvm_pause_log_opts = "-Xlog:async -Xlog:gc,safepoint:file=/opt/kardamom/cluster/jvm-pauses.log:utctime:filecount=5,filesize=20m"
 }
 
 variable "sealer_count" {
@@ -375,7 +435,7 @@ job "cluster" {
         }
 
         # These are JVM options for the image ENTRYPOINT
-        # (java -Xmx384m -cp ... ClusterNode). They must go through env,
+        # (java -Xmx<heap> -cp ... ClusterNode). They must go through env,
         # not docker `args`. docker `args` land after the main class, so
         # they would become program arguments instead of -D system
         # properties. ClusterNode reads System.getProperty(...), so the
@@ -391,8 +451,9 @@ job "cluster" {
         # archive, consensus module, service and feeder threads. The image
         # entrypoint also sets the timer slack of the JVM when it is set.
         env {
-          JAVA_TOOL_OPTIONS    = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.logPurgeKeepSnapshots=${var.cluster_log_purge_keep_snapshots} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_seed_snapshot != "" ? "" : var.cluster_remote_origins} -Dkardamom.cluster.seedSnapshot=${var.cluster_seed_snapshot} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}"
-          KARDAMOM_IDLE_CAP_US = var.idle_cap_us
+          JAVA_TOOL_OPTIONS    = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} ${local.cycle_threshold_opts} ${local.jvm_pause_log_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.logPurgeKeepSnapshots=${var.cluster_log_purge_keep_snapshots} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.driverThreadingMode=${var.cluster_driver_threading_mode} -Dkardamom.cluster.remoteOrigins=${var.cluster_seed_snapshot != "" ? "" : var.cluster_remote_origins} -Dkardamom.cluster.seedSnapshot=${var.cluster_seed_snapshot} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}"
+          KARDAMOM_IDLE_CAP_US     = var.idle_cap_us
+          KARDAMOM_CLUSTER_HEAP_MB = var.cluster_heap_mb
         }
 
         config {
@@ -426,7 +487,7 @@ job "cluster" {
 
         resources {
           cpu    = 1000
-          memory = 1024
+          memory = var.cluster_heap_mb + 640
         }
       }
     }

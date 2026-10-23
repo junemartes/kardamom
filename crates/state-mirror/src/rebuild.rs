@@ -14,8 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use kardamom_cache::AccountCache;
-use kardamom_state::BlockRange;
-use kardamom_state::checkpoint::latest_checkpoint;
+use kardamom_state::checkpoint::RestorePoint;
 use kardamom_state::{StateEnvBuilder, StateSnapshot, restore_newest_readable};
 use kardamom_types::{AccountRow, BPosition};
 use tokio::sync::mpsc;
@@ -37,26 +36,27 @@ pub(crate) struct Rebuild {
     scratch: PathBuf,
 }
 
-/// The checkpoint block a rebuild already restored. A restore copies
-/// and hashes the whole state image, which costs seconds to minutes
-/// with three mirrors on one disk. Restoring the same block again on
-/// every poll gains nothing, and the work starves the restores that
-/// would make progress.
+/// The restore point a rebuild already restored. A restore copies and
+/// hashes the whole state image, which costs seconds to minutes with
+/// three mirrors on one disk. Restoring the same point again on every
+/// poll gains nothing, and the work starves the restores that would make
+/// progress. With the block log of the checkpoints, the same base reaches
+/// further as its log grows, so a grown log is a new point.
 struct TriedCheckpoint {
-    block: Option<u64>,
+    point: Option<RestorePoint>,
 }
 
 impl TriedCheckpoint {
     fn new() -> Self {
-        Self { block: None }
+        Self { point: None }
     }
 
-    fn is_new(&self, block: u64) -> bool {
-        self.block.is_none_or(|tried| block > tried)
+    fn is_new(&self, point: RestorePoint) -> bool {
+        self.point.is_none_or(|tried| point.is_after(&tried))
     }
 
-    fn mark(&mut self, block: u64) {
-        self.block = Some(block);
+    fn mark(&mut self, point: RestorePoint) {
+        self.point = Some(point);
     }
 }
 
@@ -137,23 +137,24 @@ impl Rebuild {
 
     /// One attempt at the newest checkpoint, on a blocking thread. The
     /// restore copies and hashes the whole image, so it must not run on
-    /// an async worker. A block this rebuild already restored is
-    /// skipped: only a newer one can carry the first live batch.
+    /// an async worker. A restore point this rebuild already restored is
+    /// skipped: only a newer base, or more log after the same base, can
+    /// carry the first live batch.
     async fn try_newest(
         &self,
         first_live: BPosition,
         tried: &mut TriedCheckpoint,
     ) -> Result<Option<RebuildSnapshot>> {
-        let Some(newest) = latest_checkpoint(&self.checkpoints_dir, BlockRange::ANY)? else {
+        let Some(newest) = RestorePoint::newest(&self.checkpoints_dir)? else {
             warn!(dir = %self.checkpoints_dir.display(), "rebuild: no checkpoint yet");
             return Ok(None);
         };
-        if !tried.is_new(newest.block) {
+        if !tried.is_new(newest) {
             return Ok(None);
         }
-        tried.mark(newest.block);
+        tried.mark(newest);
         let this = self.clone();
-        tokio::task::spawn_blocking(move || this.open_newest(newest.block, first_live))
+        tokio::task::spawn_blocking(move || this.open_newest(newest.base, first_live))
             .await
             .context("join the checkpoint restore")?
     }
@@ -262,21 +263,46 @@ mod regression_tests;
 
 #[cfg(test)]
 mod tests {
+    use kardamom_state::checkpoint::RestorePoint;
+
     use super::TriedCheckpoint;
 
     /// A restore copies and hashes the whole state image. The wait loop
-    /// polls every five seconds, so it must restore one block once and
+    /// polls every five seconds, so it must restore one point once and
     /// then wait for a newer one.
     #[test]
-    fn a_checkpoint_is_tried_once_until_a_newer_one_appears() {
+    fn a_restore_point_is_tried_once_until_a_newer_one_appears() {
+        let point = |base, log_bytes| RestorePoint { base, log_bytes };
         let mut tried = TriedCheckpoint::new();
-        assert!(tried.is_new(683), "the first checkpoint is always new");
-        tried.mark(683);
-        assert!(!tried.is_new(683), "the same block must not restore twice");
-        assert!(!tried.is_new(680), "an older block carries less, not more");
+        assert!(tried.is_new(point(683, 0)), "the first point is always new");
+        tried.mark(point(683, 0));
         assert!(
-            tried.is_new(696),
-            "a newer block may carry the first live batch"
+            !tried.is_new(point(683, 0)),
+            "the same point must not restore twice"
         );
+        assert!(
+            !tried.is_new(point(680, 9)),
+            "an older base carries less, not more"
+        );
+        assert!(
+            tried.is_new(point(696, 0)),
+            "a newer base may carry the first live batch"
+        );
+    }
+
+    /// With the block log, the base stays while the log after it grows. A
+    /// rebuild that waited for a newer base would wait for the next base
+    /// round, which the log makes rare.
+    #[test]
+    fn more_log_after_the_same_base_is_a_new_point() {
+        let mut tried = TriedCheckpoint::new();
+        tried.mark(RestorePoint {
+            base: 85,
+            log_bytes: 4096,
+        });
+        assert!(tried.is_new(RestorePoint {
+            base: 85,
+            log_bytes: 8192
+        }));
     }
 }

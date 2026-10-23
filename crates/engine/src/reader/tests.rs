@@ -519,7 +519,14 @@ fn a_join_with_no_recovery_times_out_and_is_not_unjoinable() {
     };
     let mut recovery = None;
     let tx_ref = kardamom_types::TxRef::default();
-    let wait = super::join::JoinWait::new(&buffer, &mut recovery, &tx_ref, &cfg).unwrap();
+    let meters = super::meters::JoinMeters::new();
+    let ctx = super::join::JoinContext {
+        buffer: &buffer,
+        recovery: &mut recovery,
+        cfg: &cfg,
+        meters: &meters,
+    };
+    let wait = super::join::JoinWait::new(ctx, &tx_ref).unwrap();
 
     assert!(matches!(wait.run(), super::join::JoinOutcome::TimedOut));
 }

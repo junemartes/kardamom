@@ -81,6 +81,10 @@ pub enum StateError {
     /// The query endpoint answers this as a JSON-RPC error with the cause.
     #[error("block {block} cannot be rebuilt from references: {cause}")]
     NoBlockRefs { block: u64, cause: NoRefsCause },
+    /// The block log refuses a write: a block that does not come after
+    /// the last block of the log, or a size that does not fit its field.
+    #[error("block log {dir}: {detail}")]
+    BlockLog { dir: String, detail: String },
 }
 
 /// Why a committed block has no full list of references.

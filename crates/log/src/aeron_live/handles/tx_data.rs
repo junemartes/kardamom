@@ -39,4 +39,16 @@ impl TxDataSubscriberHandle {
     pub fn try_recv_positioned(&mut self) -> Option<PositionedTxData> {
         self.rx.try_recv_positioned()
     }
+
+    /// The frames that wait in the receive queue, for a queue-depth gauge.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rx.len()
+    }
+
+    /// Whether [`Self::len`] is 0.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rx.is_empty()
+    }
 }

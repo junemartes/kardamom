@@ -41,10 +41,12 @@ record StateDir(Path root) {
 
     /** The log position of the latest consensus module snapshot, or -1 when there is none. */
     long latestSnapshotPosition() {
-        return withRecordingLog(log -> Optional
-                .ofNullable(log.getLatestSnapshot(ConsensusModule.Configuration.SERVICE_ID))
-                .map(entry -> entry.logPosition)
-                .orElse(AeronArchive.NULL_POSITION));
+        return latestSnapshot().map(entry -> entry.logPosition).orElse(AeronArchive.NULL_POSITION);
+    }
+
+    /** The recording log entry of the latest consensus module snapshot, or empty when there is none. */
+    Optional<RecordingLog.Entry> latestSnapshot() {
+        return withRecordingLog(log -> Optional.ofNullable(log.getLatestSnapshot(ConsensusModule.Configuration.SERVICE_ID)));
     }
 
     /** The archive recording of the latest snapshot of the sealer service, or empty when there is none. */
