@@ -1,12 +1,13 @@
 # Hot-path agents: the transaction path off tokio
 
-- Status: draft for review, revision 2 (2026-10-23). Not implemented.
+- Status: draft for review, revision 3 (2026-10-23). Not implemented.
 - The user asked on 2026-10-23 to move the hot path off tokio.
-- Related: #774 (the timer tick of the batch verifier) and #776 (the async publish ack), both open;
+- Related: #774 (the timer tick of the batch verifier, and the split of a batch over the blocking
+  pool) and #776 (the async publish ack), both open;
   #773 (the egress retry queue); #768 (the `dropped` status); the DEDICATED-thread experiment of
   the media driver; `docs/specs/2026-10-21-one-way-pipeline.md`.
-- Revision 2 answers the review of revision 1 (findings F1 to F10). Section 10 maps each finding to
-  its change.
+- Revision 2 answers the review of revision 1 (findings F1 to F10), and revision 3 the review of
+  revision 2 (F11 to F14). Section 11 maps each finding to its change.
 
 ## 1. The problem, measured
 
@@ -33,9 +34,13 @@ The step metrics over 13:35–13:43Z (means unless named):
 - The ingress was about half of the median. About 1 ms of `ingress.recover` was the tokio timer:
   the batch window of 50 µs waited on `tokio::time::sleep_until`, and the timer has a resolution
   of 1 ms. #774 removes that wait.
+- The recovery of one batch (0.54 ms) is mostly wakes, not work: a batch of about 5 was split over
+  4 blocking workers on a 4-vCPU node, for about 0.21 ms of recovery. #774 also splits a batch only
+  from 16 transactions, and uses half of the cores at most. The shorter window of #774 makes most
+  batches hold one transaction, so the split is rare at these rates anyway.
 - The publish paid one hop to the blocking pool (`spawn_blocking` around a blocking publish,
   `crates/ingress/src/aeron_adapters.rs`). #776 removes it with an async ack.
-- After #774 and #776 the ingress should cost about 0.3–0.5 ms. The rest of the median, about
+- After #774 and #776 the ingress should cost about 0.3 ms. The rest of the median, about
   1.9 ms, runs from the publish to the receipt: the sequencer, the Raft commit of the sealers
   across three data centers, the executor, the egress and the receipt pump.
 - The p99 and the max do not come from the ingress. The sealer snapshot (32 ms each) is one known
@@ -120,7 +125,8 @@ agent exists, a later PR extracts the shared shape. The agent is a struct with a
 
 Before any agent ships, staging gets the breakdown of the 1.9 ms from the publish to the receipt.
 
-1. Deploy #774, #776 and #773 (the egress retry queue). Run the spike again (section 9).
+1. Deploy #774 (the timer and the split of a batch), #776 (the async publish) and #773 (the egress
+   retry queue). Run the spike again (section 9). This is the fair baseline for any agent.
 2. Read the existing hop metrics for each segment: `sequencer.offer_round_trip`, the sealer
    `sealer.message` and `sealer.egress_offer`, the executor `executor.boundary` and
    `executor.receipt_publish`, the egress loop metrics, and the seal and execute latency of the
@@ -146,7 +152,7 @@ Before any agent ships, staging gets the breakdown of the 1.9 ms from the publis
 
 ```text
 JSON-RPC handler (tokio)
-   decode → hash → duplicate cache (a hit answers the hash) → push (envelope, raw, oneshot)
+   hash → duplicate cache (a hit answers the hash) → decode → push (envelope, raw, oneshot)
    ▼
 ring (ArrayQueue) ──▶ verify agent (one thread)
                         protocol limits → recovery → nonce view
@@ -163,9 +169,9 @@ ring (ArrayQueue) ──▶ verify agent (one thread)
 
 ### 5.3 The duplicate cache
 
-- The hash and the duplicate check stay in the handler, before the ring, as today
-  (`crates/ingress/src/proxy/validated.rs`). A duplicate never enters the ring and costs no
-  recovery.
+- The hash and the duplicate check stay in the handler, before the decode and the ring, as today
+  (`crates/ingress/src/proxy/validated.rs`). A duplicate never enters the ring and costs no decode
+  and no recovery.
 - The agent inserts a hash into the cache after its offer succeeds, as today: only a published hash
   enters the cache.
 
@@ -178,8 +184,10 @@ ring (ArrayQueue) ──▶ verify agent (one thread)
 - A refused offer does not answer at once. The agent keeps the item in a pending slot for its lane
   with the deadline of today (`OFFER_TIMEOUT`, 5 s). Each pass retries the head of each lane once,
   with no block, and keeps the order of the lane. At the deadline the answer is `txpool is full`.
-  This is the rule of `drain_pending` (`crates/log/src/aeron_live/pending.rs`), and the agent
-  reuses that function, not a copy of it.
+  This is the rule of `drain_pending` (`crates/log/src/aeron_live/pending.rs`). The agent reuses
+  that rule, not a copy of it: a log-crate PR first lifts the pure core (`drain_pending_inner`: the
+  queue, the deadline rule and the block per publication) into a `pub` type that is generic over
+  the offer and the ack. The Aeron thread and the agent then both use it.
 - Why not round robin over N publishers: the sequencer parks at most 16 transactions per sender
   (`crates/sequencer/src/v2/mod.rs`, `max_parked`) and answers `TooManyPending` above it. Two
   images of one ingress can deliver one sender's nonces in bursts of up to 64 fragments per poll,
@@ -194,9 +202,11 @@ ring (ArrayQueue) ──▶ verify agent (one thread)
 - The agent reads only the local layer. A sender with no row admits, as a sender with no row in
   Redis does today.
 - On a miss, the agent pushes the sender into a bounded channel to the receipt pump, the one writer
-  of `LiveAccounts` (`crates/cache/src/live.rs`). The pump reads Redis on its own task and applies
-  the row with the monotone rule (`apply_one`). The next transaction of that sender then finds the
-  row. No second writer exists.
+  of `LiveAccounts` (`crates/cache/src/live.rs`). The pump never awaits Redis: for each miss it
+  spawns a task that reads Redis, and that task sends the row back on the channel of the pump. The
+  pump applies the row with the monotone rule (`apply_one`), between two frames. The next
+  transaction of that sender then finds the row. No second writer exists, and no receipt waits
+  for Redis.
 - Effect: the first transaction of a sender with no local row skips the Redis check. This happens
   after a restart (the layer is empty) and after an entry expires (the layer has a TTL and a
   capacity). A stale nonce then passes the ingress, and the sequencer drops it with `nonce too low`.
@@ -311,7 +321,7 @@ Each later stage gets its own section and its own PR, in the order that stage 0 
 - Q6, the idle cap: `AeronRuntime::idle_cap()`, with the producer unpark of 3.2, so a quiet agent
   costs no periodic wake.
 
-## 11. Changes from revision 1
+## 11. Changes from the reviews
 
 | Finding | Change |
 |---|---|
@@ -325,3 +335,7 @@ Each later stage gets its own section and its own PR, in the order that stage 0 
 | F8, locks on the path | Section 5.6 lists each shared structure and why it stays. |
 | F9, style | No new crate yet; the oneshot is used as it is; the agent is a struct with `poll`. |
 | F10, missing sections | Sections 5.7 (shutdown), 5.8 (failure), 5.9 (metrics), 8 (tests) and 9.5 (rollback). |
+| F11, the split of a batch | Section 1.2 names it, and #774 now includes the fix: no split below 16 transactions, half of the cores at most. The estimate is about 0.3 ms. Stage 0 measures after it. |
+| F12, `drain_pending` is not callable | Section 5.4 names the log-crate PR that lifts its pure core into a `pub` generic type. |
+| F13, Redis in the pump | Section 5.5: a spawned task reads Redis and sends the row back; the pump never awaits Redis. |
+| F14, the order in the handler | Section 5.2: hash, duplicate cache, then decode, as today. |
