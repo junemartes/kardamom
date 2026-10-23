@@ -39,6 +39,7 @@ pub mod proxy;
 pub(crate) mod rate_limit;
 pub(crate) mod receipt_cache;
 pub(crate) mod receipt_subscription;
+pub(crate) mod recent;
 #[cfg(test)]
 mod rendered_metrics_tests;
 pub mod rollback_log;

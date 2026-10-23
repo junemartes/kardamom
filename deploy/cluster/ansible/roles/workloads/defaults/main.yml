@@ -174,6 +174,9 @@ workloads_exec_cursor: "{{ lookup('env', 'KARDAMOM_EXEC_CURSOR') }}"
 # (nomad/executor.nomad.hcl): "on" or "off". Empty keeps the job's "off"
 # default.
 workloads_checkpoint_log: "{{ lookup('env', 'KARDAMOM_CHECKPOINT_LOG') }}"
+# When eth_sendRawTransaction answers (nomad/ingress.nomad.hcl): "receipt"
+# or "validated". Empty keeps "receipt".
+workloads_ingress_ack: "{{ lookup('env', 'KARDAMOM_INGRESS_ACK') }}"
 # The Aeron stall tolerance, in milliseconds (nomad/aeron.system.nomad.hcl).
 # 10000 is Aeron's default, and production keeps it: a longer value delays
 # the detection of a dead process. CI raises it, so a host stall does not
