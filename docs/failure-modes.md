@@ -467,6 +467,12 @@ The executors are deterministic state machines. One dead or lagging replica neve
 - **Replay-window overrun**
   - Trigger: the cluster keeps a bounded canonical window (`kardamom.cluster.retention`, default 65,536 frames, about 5 minutes at 200 tps). A `REPLAY_FROM` below the floor of the window is refused with `REPLAY_UNAVAILABLE`. The window is a minimum. A frame past it stays until L1 holds its block (see "DA-lag guard and posted-head retention floor"). The retained frames are in the cluster snapshot, so a member that restores from a snapshot keeps the floor at the posted head. A cursor that is older than the window is the trigger.
   - Effect: the refusal is terminal for the local state. A cursor below the floor can never catch up. A fresh or wiped node cannot re-sync from genesis either, because genesis aged out of the window.
+  - Recovery with `--carry-bytes` and `--egress`: the executor reads the egress first.
+    - The member refuses the cursor. The reader then reads the range read of the egress from the cursor to the head of the store, then the live `egress_order`. It goes back to the member feed when the feed serves the cursor again.
+    - The run does not end, and no checkpoint moves.
+    - A cursor below the floor of the egress store too (`410`) ends the run with the refusal. The executor then repairs itself with peer state, as below, at or above the lower floor.
+    - While the egress does not answer, the executor fetches no peer checkpoint. It tries the feed and the egress again.
+    - Proof: the unit tests `a_cursor_below_the_window_recovers_from_the_egress` and `a_cursor_below_the_floor_of_the_egress_goes_to_a_peer_checkpoint`.
   - Recovery: the executor repairs itself with peer state.
     - Each replica serves its newest checkpoint over `--checkpoint-serve-addr` (`:9014`).
     - A node that hits the refusal, or cold-starts with no checkpoint, fetches the newest qualifying peer checkpoint (`--checkpoint-peers`).

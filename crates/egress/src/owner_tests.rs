@@ -194,6 +194,33 @@ fn a_drop_after_the_receipt_changes_nothing() {
     assert_eq!(o.parts.drops.dropped(&B256::with_last_byte(1)), None);
 }
 
+/// The distance counts the records that a copy sent above the stored head.
+/// A copy that misses a frame stalls the head, and the distance grows.
+#[test]
+fn the_distance_counts_the_records_above_the_stored_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, _published) = live();
+    let mut o = owner(dir.path(), live);
+    assert_eq!(o.distance(), 0, "no copy sent a record yet");
+    o.on(message(0, &encode_egress_record(0, &[1; 40]).unwrap()))
+        .unwrap();
+    assert_eq!(o.distance(), 0, "the store holds every record a copy sent");
+    [2u64, 3]
+        .iter()
+        .try_for_each(|&index| {
+            o.on(message(
+                index,
+                &encode_egress_record(index, &[1; 40]).unwrap(),
+            ))
+        })
+        .unwrap();
+    assert_eq!(
+        o.distance(),
+        3,
+        "the copy missed record 1: records 1 to 3 are above the stored head"
+    );
+}
+
 fn record(index: u64) -> Vec<u8> {
     encode_egress_record(index, &[u8::try_from(index % 256).unwrap(); 40]).unwrap()
 }
