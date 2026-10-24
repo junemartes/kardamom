@@ -755,13 +755,16 @@ Each process has one Aeron thread. It carries the publishes and the subscription
 
 | Layer | Outcomes |
 | --- | --- |
-| `receipt` | `hit`, `state_hit`, `miss`, `shed`, `state_error` |
+| `receipt` | `hit`, `state_hit`, `miss`, `shed`, `state_error`, `fallback_hit`, `fallback_miss`, `fallback_error` |
 | `live` | `hit`, `miss` |
 | `redis` | `hit`, `miss`, `error`, `timeout` |
 
 - On the `receipt` layer, a lookup first reads the receipt cache of the ingress. That read is a `hit`.
-- A miss asks an executor for the receipt. The outcome is `state_hit` when the executor has it, `miss` when it has not,
-  and `state_error` when the query fails.
+- A miss asks the receipt query for the receipt: the egress with `--receipt-query-endpoints`, else an executor. The
+  outcome is `state_hit` when it has the receipt, `miss` when it has not, and `state_error` when the query fails.
+- When the egress gives no receipt, the ingress asks an executor. The outcome of that second query is `fallback_hit`,
+  `fallback_miss` or `fallback_error`. A high `fallback_hit` rate means that clients ask for receipts older than the
+  egress index.
 - A client that is over its rate limit gets `shed`, and the ingress answers `null` without a query.
 - The receipt cache keeps the newest 131072 receipts and evicts the oldest first.
 - `kardamom_cache_reconnects_total` counts the Redis reconnects that a failed command started. One failure burst starts one reconnect.

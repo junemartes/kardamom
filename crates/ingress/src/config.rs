@@ -84,8 +84,9 @@ pub struct IngressConfig {
     /// address then gets an error, not an answer.
     pub executor_query: ExecutorQueryConfig,
     /// The query of `eth_getTransactionReceipt` on a cache miss: the
-    /// egress, which answers it as an executor does. An empty list uses
-    /// [`Self::executor_query`].
+    /// egress, which answers it as an executor does. An answer that is no
+    /// receipt then asks [`Self::executor_query`]. An empty list asks
+    /// [`Self::executor_query`] only.
     pub receipt_query: ExecutorQueryConfig,
     /// The Redis layer, between the local layer and the executor query.
     /// Off when no address is configured: no Redis call exists on any
