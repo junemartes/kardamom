@@ -12,9 +12,12 @@ use crate::poll::Budget;
 
 mod job;
 mod log;
+mod node;
 mod saved_job;
+mod task;
 pub(crate) use job::{Job, Nodes};
 pub(crate) use saved_job::SavedJob;
+pub(crate) use task::TaskEvent;
 
 /// The log streams to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +45,10 @@ pub struct Alloc {
     pub job_version: u64,
     #[serde(rename = "DesiredStatus")]
     pub desired_status: String,
+    /// Why Nomad wants the allocation in its desired status, such as a
+    /// lost node.
+    #[serde(rename = "DesiredDescription", default)]
+    pub desired_description: Option<String>,
     #[serde(rename = "ID")]
     pub id: String,
     #[serde(rename = "TaskGroup")]

@@ -10,9 +10,9 @@ use std::time::Duration;
 use crate::cases::cache::{mirror_rebuilds, wait_every_mirror_rebuilt, wait_readers_recovered};
 use crate::cases::coordinated::assert_no_ref_below_floor;
 use crate::cases::da_watcher::assert_no_origin_gap;
-use crate::evidence::number_after;
+use crate::evidence::{SEALER_MEMBERS, number_after};
 use crate::harness::Harness;
-use crate::poll::{self, Budget};
+use crate::poll::{self, Budget, Outcome};
 use crate::probes::Probed;
 use crate::rpc::Rpc;
 
@@ -30,9 +30,12 @@ const LOOKUP_REQUESTS: &str = "kardamom_sequencer_nonce_lookup_requests_total";
 const LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
 const FROM_EXECUTOR: &str = "outcome=\"ok\"";
 const FROM_REDIS: &str = "outcome=\"redis\"";
-/// The Raft members. Every one is live after the return, and every one
-/// must log a leadership term.
-const SEALER_MEMBERS: u64 = 3;
+/// How long the state-hit count of a restarted ingress may take to
+/// answer: a few scrapes past one that fails.
+const HITS_BUDGET: Budget = Budget {
+    timeout: Duration::from_secs(15),
+    interval: Duration::from_secs(3),
+};
 /// How long a receipted transfer gets to execute before the fault.
 const TRANSFER_BUDGET: Duration = Duration::from_secs(60);
 
@@ -120,13 +123,29 @@ struct ReceiptProbe<'a> {
 impl ReceiptProbe<'_> {
     /// The receipts the ingress on `node` served from an executor's state
     /// DB. The counter lives in the ingress process, so it starts at zero
-    /// with a restarted ingress. An ingress that does not answer counts as
-    /// zero.
-    async fn state_hits(&self, node: &Probed) -> i64 {
+    /// with a restarted ingress. `None` when the ingress does not answer.
+    async fn state_hits(&self, node: &Probed) -> Option<i64> {
         let probes = &self.h.probes;
         let body = probes.scrape().fetch(&probes.ingress_target(node)).await;
         body.and_then(|b| crate::metrics::sum_where(&b, CACHE_LOOKUPS, STATE_HIT))
-            .unwrap_or(0)
+    }
+
+    /// The state hits of the ingress on `node`, from the first scrape
+    /// that answers. A failed scrape is no answer, so the probe scrapes
+    /// again, for at most `HITS_BUDGET`. `None` when no scrape answered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the wait fails.
+    async fn await_state_hits(&self, node: &Probed) -> anyhow::Result<Option<i64>> {
+        let outcome = poll::until(HITS_BUDGET, |_| async move {
+            Ok::<_, anyhow::Error>(self.state_hits(node).await)
+        })
+        .await?;
+        Ok(match outcome {
+            Outcome::Ready { value, .. } => Some(value),
+            Outcome::TimedOut { .. } => None,
+        })
     }
 
     /// The restarted ingress on `node` serves a receipt with status `0x1`
@@ -153,7 +172,13 @@ impl ReceiptProbe<'_> {
             crate::FAIL_PREFIX,
             node.container
         );
-        let hits = self.state_hits(node).await;
+        let hits = self.await_state_hits(node).await?.ok_or_else(|| {
+            crate::chaos_fail!(
+                "{ctx}: {} serves {hash}, and its exporter did not answer within {}s",
+                node.container,
+                HITS_BUDGET.timeout.as_secs()
+            )
+        })?;
         anyhow::ensure!(
             hits > 0,
             "{}: {ctx}: {} serves {hash} with no state query since its restart: its empty memory cache cannot hold that receipt",

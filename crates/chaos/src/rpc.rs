@@ -211,29 +211,44 @@ impl Rpc {
     }
 
     /// The next nonce of `address`, from the latest block the ingress
-    /// serves. The read repeats on `account state unavailable` for at most
-    /// [`NONCE_READ`]; any other failure ends it at once.
+    /// serves. The read repeats on `account state unavailable`, and on a
+    /// connection to the ingress that fails or times out, for at most
+    /// [`NONCE_READ`]: an ingress that Nomad replaces after a node loss
+    /// refuses connections until its replacement binds. Any other failure
+    /// ends the read at once.
     async fn nonce_at(&self, address: Address) -> anyhow::Result<u64> {
         let (nonce, _) = poll::until(NONCE_READ, |_| self.try_nonce_at(address))
             .await?
             .or_fail(|elapsed| {
                 anyhow::anyhow!(
-                    "eth_getTransactionCount of {address:#x}: {STATE_UNAVAILABLE} for {elapsed:?}; \
-                     no executor answered the ingress in that time"
+                    "eth_getTransactionCount of {address:#x} through {}: no nonce for {elapsed:?}; \
+                     the ingress did not connect, or no executor answered it (see the lines above)",
+                    self.url
                 )
             })?;
         Ok(nonce)
     }
 
-    /// One nonce read. `None` is `account state unavailable`, which the
-    /// caller repeats; the refusal is logged with its reason.
+    /// One nonce read. `None` is `account state unavailable` or a failed
+    /// connection, which the caller repeats; each is logged with its
+    /// reason.
     async fn try_nonce_at(&self, address: Address) -> anyhow::Result<Option<u64>> {
-        let answer = self
+        let call = self
             .call_typed(
                 "eth_getTransactionCount",
                 serde_json::json!([format!("{address:#x}"), "latest"]),
             )
-            .await?;
+            .await;
+        let answer = match call {
+            Ok(answer) => answer,
+            Err(e) if Self::is_unreachable(&e) => {
+                crate::log(format!(
+                    "eth_getTransactionCount of {address:#x}: {e:#}; the read repeats"
+                ));
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
         match answer {
             Ok(nonce) => Self::quantity(&nonce).map(Some),
             Err(err) if err.is_state_unavailable() => {
@@ -245,6 +260,13 @@ impl Rpc {
             }
             Err(err) => Err(err.into_error("eth_getTransactionCount")),
         }
+    }
+
+    /// True when a call got no answer: the connection failed, or the
+    /// request timed out.
+    fn is_unreachable(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<reqwest::Error>()
+            .is_some_and(|e| e.is_connect() || e.is_timeout())
     }
 
     /// A `0x` quantity of a nonce answer as a `u64`.

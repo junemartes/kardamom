@@ -229,25 +229,28 @@ impl Class {
         })
     }
 
-    /// No allocation of the job restarted since its return: the class
-    /// waited for what it needs. A crash loop shows as a restart count,
-    /// also when the class got what it needs since, so the proof holds
-    /// after the pause and again at the end.
+    /// No task of the job failed since its return, other than by a
+    /// designed recovery exit: the class waited for what it needs. A
+    /// crash loop shows as a failed exit in the task events, also when
+    /// the class got what it needs since, so the proof holds after the
+    /// pause and again at the end.
     async fn assert_no_restart(self, h: &Harness, ctx: &str) -> anyhow::Result<()> {
         let allocs = h.nomad.running(self.job()).await?;
-        let restarted: Vec<String> = allocs.iter().filter_map(Alloc::restart_note).collect();
+        let failed = h.nomad.unexplained_exits(&allocs).await?;
         anyhow::ensure!(
-            allocs.len() == self.count() && restarted.is_empty(),
+            allocs.len() == self.count() && failed.is_empty(),
             "{}: {ctx}: the {} job did not wait for the classes it needs: {} of {} running, {}",
             crate::FAIL_PREFIX,
             self.job(),
             allocs.len(),
             self.count(),
-            restarted.join(", ")
+            failed.join("; ")
         );
+        let restarts: Vec<String> = allocs.iter().filter_map(Alloc::restart_note).collect();
         crate::log(format!(
-            "{ctx}: every {} allocation runs with no restart",
-            self.job()
+            "{ctx}: every {} allocation runs with no failed exit outside a designed recovery; restarts: [{}]",
+            self.job(),
+            restarts.join(", ")
         ));
         Ok(())
     }
@@ -624,8 +627,11 @@ impl Combined {
             class.assert_no_restart(h, ctx).await?;
         }
         if placed.sealers_down() {
-            let leader = h.evidence.cluster_leader(FULL_RESTART_ELECTION).await?;
-            crate::log(format!("{ctx}: members elected memberId={leader}"));
+            let elected = h.evidence.cluster_elected(FULL_RESTART_ELECTION).await?;
+            crate::log(format!(
+                "{ctx}: members elected memberId={} (term {} closed on a majority)",
+                elected.leader, elected.term
+            ));
         }
         h.assert_ingress_pair_live(ctx).await?;
         if placed.executors_down() {

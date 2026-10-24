@@ -411,6 +411,40 @@ fn a_restart_is_judged_by_its_driver_loss() {
     assert!(moved.judge(&base).unwrap().is_some());
 }
 
+/// The starts that find no live driver after a driver loss are part of
+/// that loss. With no driver loss, they explain nothing.
+#[test]
+fn a_start_with_no_live_driver_after_a_loss_is_part_of_the_loss() {
+    let alloc = || "c683773a-aac6-9a63-af79-0d4889810fca".to_string();
+    let base = WatcherRuns::new([(alloc(), 0)], "start\n");
+    let loss = exit_line(
+        "08:24:33",
+        "MediaDriver keepalive: age=30009ms > timeout=30000ms",
+    );
+    let no_cnc = "Error: spawn AeronRuntime\n    [aeron_client_connect_to_driver, aeronc.c:59] CnC file not created: /opt/kardamom/aeron-mount/dir/cnc.dat\n";
+    let no_beat = "Error: spawn events runtime\n    [aeron_client_connect_to_driver, aeronc.c:119] no driver heartbeat detected after: 30000ms\n";
+    let after_loss = format!("start\n{loss}\n{no_cnc}{no_cnc}{no_beat}");
+    let note = WatcherRuns::new([(alloc(), 4)], &after_loss)
+        .judge(&base)
+        .unwrap()
+        .unwrap();
+    assert!(note.contains("starts with no live driver: 3"), "{note}");
+    let one_more = WatcherRuns::new([(alloc(), 5)], &after_loss)
+        .judge(&base)
+        .unwrap_err();
+    assert!(
+        one_more.contains("a driver loss explains 4 of the 5 restarts"),
+        "{one_more}"
+    );
+    let no_loss = WatcherRuns::new([(alloc(), 1)], &format!("start\n{no_cnc}"))
+        .judge(&base)
+        .unwrap_err();
+    assert!(
+        no_loss.contains("a driver loss explains 0 of the 1 restarts"),
+        "{no_loss}"
+    );
+}
+
 #[test]
 fn a_floor_is_looked_up_when_a_park_asked_and_a_source_answered() {
     let asked_and_answered = Lookups {

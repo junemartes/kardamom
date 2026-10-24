@@ -15,6 +15,7 @@ use crate::nomad::{Alloc, Nomad, Streams};
 use crate::stages::{head_lines, matching_lines, tail_lines};
 
 mod exits;
+mod nodes;
 
 const JOBS: [&str; 18] = [
     "aeron",
@@ -173,6 +174,7 @@ impl Diagnostics {
         self.multicast_groups().await;
         self.multicast_probe().await;
         self.capture().await;
+        self.nomad_nodes().await;
         for job in JOBS {
             self.job_section(job).await;
         }
@@ -316,8 +318,11 @@ impl Diagnostics {
     async fn alloc_section(&self, job: &str, alloc: &Alloc) {
         println!("----- {job} alloc {}: status -----", alloc.short_id());
         println!(
-            "  client_status={} node={}",
-            alloc.client_status, alloc.node_name
+            "  client_status={} desired={} ({}) node={}",
+            alloc.client_status,
+            alloc.desired_status,
+            alloc.desired_description.as_deref().unwrap_or(""),
+            alloc.node_name
         );
         for (task, state) in &alloc.task_states {
             println!("  task {task}: {}", task_summary(state));

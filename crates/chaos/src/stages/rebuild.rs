@@ -37,6 +37,17 @@ const GENESIS: &str = "deploy/cluster/config/genesis/dev.toml";
 /// failure is final for the L1 record it read.
 const NOT_POSTED_YET: &[&str] = &["posted batches end at block", "no BatchPosted events found"];
 
+/// What the tool's error chain holds when a request to L1 or to the DA
+/// proxy did not reach an answer: the connection failed, was reset, or
+/// timed out. The record is unread, so a later attempt can pass.
+const TRANSPORT_ERRORS: &[&str] = &[
+    "error sending request",
+    "tcp connect error",
+    "onnection refused",
+    "onnection reset",
+    "timed out",
+];
+
 /// How one run of the tool ended.
 #[derive(Debug)]
 enum Attempt {
@@ -44,6 +55,9 @@ enum Attempt {
     /// L1 does not cover the target block yet. The batcher posts it
     /// within a few seconds of its seal, so a later attempt can pass.
     NotPosted(String),
+    /// A request to L1 or to the DA proxy got no answer. The tool read
+    /// no record, so a later attempt can pass.
+    Unreachable(String),
     /// The tool refused the posted record: a block that needs more slots
     /// than its canonical range holds, a root mismatch, a payload that
     /// does not decode. L1 and the DA layer hold the same record on the
@@ -62,8 +76,11 @@ impl Attempt {
             .collect::<Vec<_>>()
             .join(" / ");
         let why = format!("{report} {chain}").trim().to_string();
-        if NOT_POSTED_YET.iter().any(|marker| stderr.contains(marker)) {
+        let marks = |markers: &[&str]| markers.iter().any(|marker| stderr.contains(marker));
+        if marks(NOT_POSTED_YET) {
             Self::NotPosted(why)
+        } else if marks(TRANSPORT_ERRORS) {
+            Self::Unreachable(why)
         } else {
             Self::Refused(why)
         }
@@ -71,10 +88,18 @@ impl Attempt {
 
     /// The rebuilt state, or `None` to retry with the reason kept in
     /// `last`. A refusal ends the wait at once with the tool's reason.
+    /// A transport error is logged with its whole chain, and retried.
     fn settle(self, last: &RefCell<String>, block: u64) -> anyhow::Result<Option<Rebuilt>> {
         match self {
             Self::Rebuilt(rebuilt) => Ok(Some(rebuilt)),
             Self::NotPosted(why) => {
+                *last.borrow_mut() = why;
+                Ok(None)
+            }
+            Self::Unreachable(why) => {
+                crate::log(format!(
+                    "rebuild-from-l1: a request for block {block} got no answer; retrying: {why}"
+                ));
                 *last.borrow_mut() = why;
                 Ok(None)
             }
@@ -210,8 +235,9 @@ impl Rebuild<'_> {
 
     /// Rebuild through the target block, within the budget. The batcher
     /// posts a block within a few seconds of its seal, so the run retries
-    /// while the posted batches end before the target. It does not retry
-    /// any other failure.
+    /// while the posted batches end before the target. It also retries a
+    /// request to L1 or the DA proxy that got no answer. It does not
+    /// retry any other failure.
     ///
     /// # Errors
     ///

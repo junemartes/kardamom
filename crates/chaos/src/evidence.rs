@@ -149,6 +149,15 @@ impl Evidence {
     }
 
     async fn leader_once(&self) -> anyhow::Result<Option<u32>> {
+        Ok(self
+            .member_logs()
+            .await?
+            .iter()
+            .find_map(|logs| leader_from_last_role_line(logs)))
+    }
+
+    /// The stdout of every cluster allocation that Nomad wants running.
+    async fn member_logs(&self) -> anyhow::Result<Vec<String>> {
         let allocs: Vec<Alloc> = self
             .nomad
             .allocations_with_logs(CLUSTER_TASK)
@@ -156,16 +165,36 @@ impl Evidence {
             .into_iter()
             .filter(Alloc::is_desired_running)
             .collect();
-        let mut leader = None;
+        let mut logs = Vec::with_capacity(allocs.len());
         for alloc in &allocs {
-            leader = leader.or(self.leader_of(alloc).await?);
+            logs.push(self.nomad.alloc_logs(alloc, Streams::StdoutOnly).await?);
         }
-        Ok(leader)
+        Ok(logs)
     }
 
-    async fn leader_of(&self, alloc: &Alloc) -> anyhow::Result<Option<u32>> {
-        let logs = self.nomad.alloc_logs(alloc, Streams::StdoutOnly).await?;
-        Ok(leader_from_last_role_line(&logs))
+    /// The leader and the term of a closed election, within `max`. A
+    /// member logs `role=LEADER` when it wins the vote. Its followers can
+    /// still fail to join its log, and the election then runs again. So
+    /// the election counts only when a majority of the members closed it
+    /// in the term of the leader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no election closes within `max`.
+    pub async fn cluster_elected(&self, max: Duration) -> anyhow::Result<Elected> {
+        let budget = Budget::new(max, Duration::from_secs(3));
+        let outcome = poll::until(budget, |_| async move {
+            Ok(Elected::from_member_logs(&self.member_logs().await?))
+        })
+        .await?;
+        outcome
+            .or_fail(|t| {
+                crate::chaos_fail!(
+                    "no election closed on a majority within {}s (checked the alloc logs for 'role=LEADER' and 'cluster ELECTION ... state=CLOSED' after the last '{START_LINE}')",
+                    t.as_secs()
+                )
+            })
+            .map(|(elected, _)| elected)
     }
 
     /// Whether any validator allocation logged `halted on divergence`.
@@ -187,6 +216,76 @@ impl Evidence {
             }
         }
         Ok(None)
+    }
+}
+
+/// The members of the sealer cluster.
+pub(crate) const SEALER_MEMBERS: u64 = 3;
+/// The line that each start of a sealer process prints first.
+const START_LINE: &str = "cluster START mode=";
+/// The line of an election state change. The join watchdog of each
+/// member samples the state once a second.
+const ELECTION_LINE: &str = "cluster ELECTION ";
+/// The line of a term start. Every member prints it, also on replay.
+const TERM_LINE: &str = "cluster TERM ";
+
+/// A closed election: the leader, and the term that a majority of the
+/// members closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Elected {
+    pub leader: u32,
+    pub term: u64,
+}
+
+impl Elected {
+    /// The closed election in the logs of the members, one log for each.
+    /// The leader is the member whose last role line says LEADER. The
+    /// election is closed when a majority of the members, the leader
+    /// with them, closed their elections in one term.
+    fn from_member_logs(logs: &[String]) -> Option<Self> {
+        let views: Vec<MemberView> = logs.iter().map(|l| MemberView::parse(l)).collect();
+        let (leader, term) = views.iter().find_map(|v| v.leader.zip(v.closed_term))?;
+        let closed = views.iter().filter(|v| v.closed_term == Some(term)).count();
+        let majority = usize::try_from(SEALER_MEMBERS / 2 + 1).ok()?;
+        (closed >= majority).then_some(Self { leader, term })
+    }
+}
+
+/// What the current process of one member logged about its election.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemberView {
+    /// The memberId when the last role line says LEADER.
+    leader: Option<u32>,
+    /// The term of the election when the last election line says
+    /// CLOSED.
+    closed_term: Option<u64>,
+}
+
+impl MemberView {
+    /// Read the log of one member from its last start line on. The lines
+    /// of an earlier process in the same allocation are stale: a killed
+    /// member's last line can say LEADER or CLOSED. The closed line names
+    /// the term of the last term entry of the recording log. When that
+    /// read fails, it says `unknown`, and the last term line of the
+    /// process names the term.
+    fn parse(logs: &str) -> Self {
+        let current = logs.rfind(START_LINE).map_or(logs, |at| &logs[at..]);
+        let closed = current
+            .lines()
+            .rfind(|l| l.contains(ELECTION_LINE))
+            .filter(|l| l.contains(" state=CLOSED "));
+        let closed_term = closed.and_then(|l| {
+            number_after(l, "logLeadershipTermId=").or_else(|| {
+                current
+                    .lines()
+                    .rfind(|l| l.contains(TERM_LINE))
+                    .and_then(|t| number_after(t, "leadershipTermId="))
+            })
+        });
+        Self {
+            leader: leader_from_last_role_line(current),
+            closed_term,
+        }
     }
 }
 
@@ -273,6 +372,81 @@ mod tests {
         assert_eq!(
             member_id_of("sealer snapshot TAKEN memberId=12 block=30"),
             Some(12)
+        );
+    }
+
+    /// The logs of three members after a full restart: each member logs
+    /// its last process from `cluster START` on.
+    fn member(id: u32, current: &str) -> String {
+        format!(
+            "2026-10-24T04:49:03Z cluster role=LEADER memberId={id}\n\
+             2026-10-24T04:49:03Z cluster ELECTION memberId={id} state=CLOSED commitPosition=1 candidateTermId=1 logLeadershipTermId=1\n\
+             2026-10-24T04:56:19Z cluster START mode=RESUME memberId={id}\n{current}"
+        )
+    }
+
+    /// A won vote is not a closed election: the followers can fail to
+    /// join the log of the leader. The lines of the killed process do
+    /// not count.
+    #[test]
+    fn an_election_counts_only_when_a_majority_closed_it_in_one_term() {
+        let leader = "2026-10-24T05:00:27Z cluster role=LEADER memberId=1\n";
+        let awaiting = |id: u32| {
+            format!(
+                "2026-10-24T05:00:20Z cluster ELECTION memberId={id} state=FOLLOWER_LOG_AWAIT commitPosition=9 candidateTermId=4 logLeadershipTermId=2\n"
+            )
+        };
+        let closed = |id: u32, term: &str| {
+            format!(
+                "2026-10-24T05:00:28Z cluster ELECTION memberId={id} state=CLOSED commitPosition=9 candidateTermId=0 logLeadershipTermId={term}\n"
+            )
+        };
+        let won = [
+            member(0, &awaiting(0)),
+            member(1, leader),
+            member(2, &awaiting(2)),
+        ];
+        assert_eq!(Elected::from_member_logs(&won), None);
+        let stale = [member(0, ""), member(1, ""), member(2, "")];
+        assert_eq!(Elected::from_member_logs(&stale), None);
+        let lone = [
+            member(0, &awaiting(0)),
+            member(1, &format!("{leader}{}", closed(1, "4"))),
+            member(2, &awaiting(2)),
+        ];
+        assert_eq!(Elected::from_member_logs(&lone), None);
+        let split = [
+            member(0, &closed(0, "3")),
+            member(1, &format!("{leader}{}", closed(1, "4"))),
+            member(2, &awaiting(2)),
+        ];
+        assert_eq!(Elected::from_member_logs(&split), None);
+        let majority = [
+            member(0, &closed(0, "4")),
+            member(1, &format!("{leader}{}", closed(1, "4"))),
+            member(2, &awaiting(2)),
+        ];
+        assert_eq!(
+            Elected::from_member_logs(&majority),
+            Some(Elected { leader: 1, term: 4 })
+        );
+    }
+
+    /// A closed line whose log term reads `unknown` takes the term of the
+    /// last term line of the process.
+    #[test]
+    fn an_unknown_log_term_falls_back_to_the_last_term_line() {
+        let logs = member(
+            0,
+            "2026-10-24T05:00:30Z cluster TERM memberId=0 leadershipTermId=4 leaderMemberId=1 logPosition=9 role=FOLLOWER block=1601\n\
+             2026-10-24T05:00:31Z cluster ELECTION memberId=0 state=CLOSED commitPosition=9 candidateTermId=4 logLeadershipTermId=unknown\n",
+        );
+        assert_eq!(
+            MemberView::parse(&logs),
+            MemberView {
+                leader: None,
+                closed_term: Some(4)
+            }
         );
     }
 

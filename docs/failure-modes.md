@@ -1073,9 +1073,10 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
   - A refusal needs a cursor below the floor of the sealer. The batcher then rebuilds the range from references (above).
 - The batcher posts the pending group of the spool first. It does this even when a refusal stops the reader before the group is due. The spool is the only copy of those blocks.
 - Proof: `batcher-outage-past-retention`.
-  - The case freezes the batcher with a non-empty spool. It holds the freeze until the load passes twice the retention and a Raft snapshot lands. It then thaws the batcher.
+  - The case freezes the batcher with a group in its spool that L1 does not hold. Each freeze attempt holds the batcher for 5 s, so a post in flight lands, and then reads the block L1 covers. A spool that ends at or below that block holds only the posted batch, and a restart drops it. The attempt then thaws the batcher and tries again.
+  - It holds the freeze until the load passes twice the retention and a Raft snapshot lands. It then thaws the batcher.
   - It asserts that the frozen group lands right after the covered block.
-  - It asserts that the batcher exits after the thaw and restores the group from its spool. The freeze lasts at least the stall tolerance plus 20 s, so a client times out and ends the process (see "Aeron stall tolerance").
+  - It asserts that the batcher exits after the thaw and restores the group from its spool. The old process can also post the group between the thaw and its exit: its confirmed post of the next block comes before the last start line. The case accepts that end too. The freeze lasts at least the stall tolerance plus 20 s, so a client times out and ends the process (see "Aeron stall tolerance").
   - A batcher that keeps running fails the case. The failure says whether the handler logged `aeron client error; exiting` (the exit hung) or no timeout fired.
   - It then accepts one of two ends. The sealers serve the replay, and L1 covers the head at the thaw with no refusal. This is the expected end. Or the sealers refuse, and the batcher rebuilds the gap and posts past the floor.
   - It asserts that the record on L1 is contiguous.
@@ -1535,7 +1536,8 @@ A deploy replaces service instances one at a time under readiness checks. The ch
 - Proof: `deploy-broken-image` (`chaos-executor` shard).
   - The case deploys a manifest whose executor image is a real image that is not an executor.
   - The new replica never passes its readiness check. Nomad fails the deployment at its healthy deadline.
-  - The deploy must fail, and at least two old executors must keep running. The chain must keep advancing.
+  - Each deploy waits until the release gate shows no root and no pause, so the gate does not refuse it.
+  - The deploy must fail at the executor rollout: the executor job has a new version. At least two old executors must keep running. The chain must keep advancing.
   - The deploy of the real manifest then heals the job.
 - The deploy flow is in [../deploy/cluster/README.md](../deploy/cluster/README.md).
 

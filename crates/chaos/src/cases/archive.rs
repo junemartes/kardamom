@@ -3,11 +3,12 @@
 
 use std::cell::RefCell;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 
 use crate::harness::Harness;
+use crate::nodes::Pipe;
 use crate::poll::{self, Budget};
 
 const DRIVER_TASK: &str = "archiving-media-driver";
@@ -72,25 +73,57 @@ pub(crate) async fn tx_data_wipe(h: &mut Harness) -> anyhow::Result<()> {
         "archive-tx-data-wipe: re-replicating archive from {mirror} mirror"
     ));
     copy_stable_catalog(h, &mirror, &victim).await?;
-    let segments = h
-        .nodes
-        .exec_bytes(
-            &mirror,
-            "tar -C /opt/kardamom/archive --warning=no-file-changed --exclude='dir/archive-mark.dat' --exclude='dir/archive.catalog' -cf - dir",
-            1,
-        )
-        .await
-        .map_err(|e| crate::chaos_fail!("archive-tx-data-wipe: re-replication copy failed: {e}"))?;
-    h.nodes
-        .exec_with_stdin(&victim, "tar -C /opt/kardamom/archive -xf -", segments)
-        .await
-        .map_err(|e| crate::chaos_fail!("archive-tx-data-wipe: re-replication copy failed: {e}"))?;
+    copy_segments(h, &mirror, &victim).await?;
     h.assert_progress().await?;
     h.assert_count("aeron", base, h.knobs.driver_restart_slo())
         .await?;
     verify_restored(h, &victim).await?;
     h.assert_count("ingress", 2, h.knobs.reschedule_slo).await?;
     h.assert_ingress_pair_live("archive-tx-data-wipe").await
+}
+
+/// Stream the mirror's segments into the victim's archive directory,
+/// with no copy in memory. The victim's daemon must not start before
+/// the copy ends: it would adopt a partial archive.
+async fn copy_segments(h: &Harness, mirror: &str, victim: &str) -> anyhow::Result<()> {
+    let pipe = Pipe {
+        from: mirror,
+        read: "tar -C /opt/kardamom/archive --sparse --warning=no-file-changed --exclude='dir/archive-mark.dat' --exclude='dir/archive.catalog' -cf - dir",
+        to: victim,
+        write: "tar -C /opt/kardamom/archive -xf -",
+        max_read_status: 1,
+    };
+    let streamed = h.nodes.stream(&pipe).await.map_err(|e| {
+        crate::chaos_fail!("archive-tx-data-wipe: re-replication copy failed: {e:#}")
+    })?;
+    let ended = SystemTime::now();
+    crate::log(format!(
+        "archive-tx-data-wipe: re-replicated {} bytes from {mirror} in {:.1}s",
+        streamed.bytes,
+        streamed.elapsed.as_secs_f64()
+    ));
+    let Some(daemon) = h.nodes.inner_container(victim, DRIVER_TASK).await else {
+        return Ok(());
+    };
+    let started = h
+        .nodes
+        .started_at(victim, &daemon)
+        .await
+        .unwrap_or_default();
+    match humantime::parse_rfc3339_weak(started.trim()) {
+        Ok(at) if at < ended => Err(crate::chaos_fail!(
+            "archive-tx-data-wipe: the {DRIVER_TASK} on {victim} restarted at {started}, before the re-replication copy ended ({} bytes in {:.1}s): its daemon read a partial archive",
+            streamed.bytes,
+            streamed.elapsed.as_secs_f64()
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => {
+            crate::log(format!(
+                "archive-tx-data-wipe: the start time {started:?} of {daemon} does not parse ({e}); the verify judges the archive"
+            ));
+            Ok(())
+        }
+    }
 }
 
 /// Copy the mirror's catalog with a stable read: the mirror's daemon

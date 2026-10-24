@@ -60,8 +60,11 @@ pub(crate) async fn cluster_total_loss_recover(h: &mut Harness) -> anyhow::Resul
     h.start_nodes(&nodes).await?;
     h.assert_count(CLUSTER_TASK, 3, h.knobs.reschedule_slo)
         .await?;
-    let leader = h.evidence.cluster_leader(FULL_RESTART_ELECTION).await?;
-    crate::log(format!("{ctx}: members elected memberId={leader}"));
+    let elected = h.evidence.cluster_elected(FULL_RESTART_ELECTION).await?;
+    crate::log(format!(
+        "{ctx}: members elected memberId={} (term {} closed on a majority)",
+        elected.leader, elected.term
+    ));
     await_exporter_back(h, ctx).await?;
     h.assert_executor_progress(Duration::from_mins(3)).await
 }

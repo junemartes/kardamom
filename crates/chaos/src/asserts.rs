@@ -14,6 +14,17 @@ use crate::nomad::Alloc;
 use crate::poll::{self, Budget};
 use crate::probes::EXECUTOR_BLOCK_METRIC;
 
+/// How long the sealer boundary counter may stay flat after a recovery.
+/// An executor that misses a join waits 10 s (`join_refetch_after`)
+/// before it refetches from the archive, and the refetch took up to 9 s
+/// in CI, with one failed archive connect. The boundaries can stall over
+/// one such miss and refetch, so the budget holds two of them with a
+/// margin.
+const PROGRESS_BUDGET: Budget = Budget {
+    timeout: Duration::from_secs(45),
+    interval: Duration::from_secs(2),
+};
+
 /// Where an executor stands against the fleet head.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Standing {
@@ -210,8 +221,9 @@ impl Harness {
     }
 
     /// The pipeline-progress probe of the component cases: the sealer
-    /// boundary counter must tick over a ten-second window. When no
-    /// executor exporter answers, the executor block gauge stands in.
+    /// boundary counter must tick within `PROGRESS_BUDGET`. The probe
+    /// passes on the first tick. When no executor exporter answers, the
+    /// executor block gauge stands in.
     ///
     /// # Errors
     ///
@@ -220,15 +232,19 @@ impl Harness {
         let Some(b0) = self.probes.sealer_boundaries().await else {
             return self.assert_executor_progress(Duration::from_mins(1)).await;
         };
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        let b1 = self.probes.sealer_boundaries().await.unwrap_or(0);
-        anyhow::ensure!(
-            b1 > b0,
-            "{}: pipeline NOT progressing after recovery (sealer boundaries {b0} -> {b1})",
-            crate::FAIL_PREFIX
-        );
+        let outcome = poll::after_sleep(PROGRESS_BUDGET, |_| async move {
+            Ok(self.probes.sealer_boundaries().await.filter(|b1| *b1 > b0))
+        })
+        .await?;
+        let (b1, elapsed) = outcome.or_fail(|t| {
+            crate::chaos_fail!(
+                "pipeline NOT progressing after recovery (sealer boundaries {b0} -> ? over {}s)",
+                t.as_secs()
+            )
+        })?;
         crate::log(format!(
-            "pipeline progressing (sealer boundaries {b0} -> {b1})"
+            "pipeline progressing (sealer boundaries {b0} -> {b1} after {}s)",
+            elapsed.as_secs()
         ));
         Ok(())
     }

@@ -5,13 +5,11 @@
 //! Nomad keeps only the last events of a task, and the restart count
 //! covers the rest.
 
-use std::collections::BTreeMap;
-use std::time::{Duration, SystemTime};
-
 use serde::Deserialize;
 
 use super::{Diagnostics, section};
 use crate::contract::Node;
+use crate::nomad::TaskEvent;
 
 /// A task whose deaths the dump records: the node role that runs it, and
 /// its name, which is also its Nomad job and the prefix of its inner
@@ -64,30 +62,15 @@ struct TaskRecord {
     restarts: u64,
     #[serde(rename = "Failed", default)]
     failed: bool,
+    /// A task that has not started lists an explicit `null`.
     #[serde(rename = "StartedAt", default)]
-    started_at: String,
+    started_at: Option<String>,
+    /// A running task lists an explicit `null`.
     #[serde(rename = "FinishedAt", default)]
-    finished_at: String,
+    finished_at: Option<String>,
     /// A task with no event yet lists an explicit `null`.
     #[serde(rename = "Events", default)]
     events: Option<Vec<TaskEvent>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TaskEvent {
-    #[serde(rename = "Type")]
-    kind: String,
-    /// Unix nanoseconds.
-    #[serde(rename = "Time")]
-    time: i64,
-    #[serde(rename = "DisplayMessage", default)]
-    message: String,
-    #[serde(rename = "ExitCode", default)]
-    exit_code: i64,
-    #[serde(rename = "Signal", default)]
-    signal: i64,
-    #[serde(rename = "Details", default)]
-    details: Option<BTreeMap<String, String>>,
 }
 
 impl TaskRecord {
@@ -102,7 +85,10 @@ impl TaskRecord {
     fn lines(&self, task: &str) -> String {
         let header = format!(
             "  task {task}: restarts={} failed={} started={} finished={}",
-            self.restarts, self.failed, self.started_at, self.finished_at
+            self.restarts,
+            self.failed,
+            self.started_at.as_deref().unwrap_or("-"),
+            self.finished_at.as_deref().unwrap_or("-")
         );
         std::iter::once(header)
             .chain(self.events.iter().flatten().map(TaskEvent::line))
@@ -111,41 +97,10 @@ impl TaskRecord {
     }
 }
 
-impl TaskEvent {
-    fn line(&self) -> String {
-        let oom = self
-            .details
-            .as_ref()
-            .and_then(|d| d.get("oom_killed"))
-            .map_or("-", String::as_str);
-        format!(
-            "    {} {} exit={} signal={} oom={oom} {}",
-            self.utc(),
-            self.kind,
-            self.exit_code,
-            self.signal,
-            self.message
-        )
-    }
-
-    /// The event time in RFC 3339, comparable with `docker logs -t`.
-    fn utc(&self) -> String {
-        u64::try_from(self.time)
-            .ok()
-            .and_then(|nanos| SystemTime::UNIX_EPOCH.checked_add(Duration::from_nanos(nanos)))
-            .map_or_else(
-                || format!("time={}", self.time),
-                |t| humantime::format_rfc3339_millis(t).to_string(),
-            )
-    }
-}
-
 impl Diagnostics {
-    /// The task state and events of every allocation of a watched job.
+    /// The task state and events of every allocation: the restarts, and
+    /// how each task ended.
     pub(super) fn task_records(job: &str, alloc: &crate::nomad::Alloc) {
-        if !WATCHED.iter().any(|w| w.task == job) {
-            return;
-        }
         println!("----- {job} alloc {}: task events -----", alloc.short_id());
         let records: Vec<String> = alloc
             .task_states
@@ -222,7 +177,27 @@ mod tests {
         let state = serde_json::json!({"State": "pending", "Events": null});
         assert_eq!(
             TaskRecord::render("executor", &state),
-            "  task executor: restarts=0 failed=false started= finished="
+            "  task executor: restarts=0 failed=false started=- finished=-"
+        );
+    }
+
+    /// Nomad lists `null` for the finish time of a running task, and for
+    /// the start time of a task that has not started.
+    #[test]
+    fn a_running_task_with_a_null_finish_time_decodes() {
+        let state = serde_json::json!({
+            "State": "running", "Restarts": 1, "Failed": false,
+            "StartedAt": "2026-10-24T10:30:45Z", "FinishedAt": null, "Events": []});
+        assert_eq!(
+            TaskRecord::render("executor", &state),
+            "  task executor: restarts=1 failed=false started=2026-10-24T10:30:45Z finished=-"
+        );
+        let pending =
+            serde_json::json!({"State": "pending", "StartedAt": null, "FinishedAt": null});
+        assert!(
+            !TaskRecord::render("executor", &pending).contains("undecodable"),
+            "{}",
+            TaskRecord::render("executor", &pending)
         );
     }
 

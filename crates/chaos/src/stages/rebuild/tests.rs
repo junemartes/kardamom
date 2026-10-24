@@ -39,6 +39,40 @@ fn only_a_short_l1_record_is_retried() {
     );
 }
 
+/// A request that got no answer is retried. A record that does not
+/// decode is final.
+#[test]
+fn a_transport_error_is_retried_and_a_decode_error_is_final() {
+    let unsent = Attempt::failed(
+        "",
+        "Error: recover blocks from the DA layer\n\nCaused by:\n    data availability: get: error sending request for url (http://192.168.56.10:3100/get/0x03)\n",
+    );
+    assert!(
+        matches!(&unsent, Attempt::Unreachable(why) if why.contains("error sending request")),
+        "{unsent:?}"
+    );
+    let refused = Attempt::failed(
+        "",
+        "Error: eth_getLogs\n\nCaused by:\n    tcp connect error: Connection refused (os error 111)\n",
+    );
+    assert!(matches!(refused, Attempt::Unreachable(_)), "{refused:?}");
+    let undecodable = Attempt::failed(
+        "",
+        "Error: recover blocks from the DA layer\n\nCaused by:\n    payload 3: unknown frame version 9\n",
+    );
+    assert!(
+        matches!(undecodable, Attempt::Refused(_)),
+        "{undecodable:?}"
+    );
+    let last = RefCell::new(String::new());
+    assert!(matches!(unsent.settle(&last, 7), Ok(None)));
+    assert!(
+        last.borrow().contains("error sending request"),
+        "{}",
+        last.borrow()
+    );
+}
+
 #[test]
 fn a_refusal_ends_the_wait_and_a_short_record_waits() {
     let last = RefCell::new(String::new());

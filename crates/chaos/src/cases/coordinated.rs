@@ -133,11 +133,14 @@ pub(crate) async fn pipeline_blackout_recover(h: &mut Harness) -> anyhow::Result
     for (job, count) in PIPELINE_JOBS.into_iter().chain(egress) {
         h.assert_count(job, count, h.knobs.reschedule_slo).await?;
     }
-    let leader = h
+    let elected = h
         .evidence
-        .cluster_leader(crate::cases::fleet::FULL_RESTART_ELECTION)
+        .cluster_elected(crate::cases::fleet::FULL_RESTART_ELECTION)
         .await?;
-    crate::log(format!("{ctx}: members elected memberId={leader}"));
+    crate::log(format!(
+        "{ctx}: members elected memberId={} (term {} closed on a majority)",
+        elected.leader, elected.term
+    ));
     await_exporter_back(h, ctx).await?;
     h.assert_ingress_pair_live(ctx).await?;
     h.assert_executor_progress(Duration::from_mins(3)).await?;
