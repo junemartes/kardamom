@@ -5,7 +5,10 @@
 # Nomad reverted it itself (auto_revert), or an earlier run of this
 # rollback did. The sealer, when it has one group per member, rolls back
 # member by member through the roll of the deploy: a revert of the whole
-# job would replace the members at once and lose the quorum. Each job
+# job would replace the members at once and lose the quorum. The executor
+# job, when both versions have the pinned groups on the sealer nodes, rolls
+# back one group at a time the same way, so one executor stops at a time.
+# Each job
 # joins `rolled_back` in the record when it is done, so a rollback that
 # stops resumes after it.
 - name: Keep the versions of {{ workloads_revert_job }}
@@ -38,8 +41,12 @@
     workloads_revert_enforce: >-
       {{ workloads_revert_after if workloads_revert_after is not none else workloads_registered_job.json.Version }}
     workloads_revert_staged: >-
-      {{ workloads_revert_job == 'cluster'
-         and (workloads_registered_job.json.TaskGroups | map(attribute='Name') | select('match', '^cluster-') | list | length > 0) }}
+      {{ (workloads_revert_job == 'cluster'
+          and (workloads_registered_job.json.TaskGroups | map(attribute='Name') | select('match', '^cluster-') | list | length > 0))
+         or (workloads_revert_job == 'executor'
+             and (workloads_registered_job.json.TaskGroups | map(attribute='Name') | select('match', '^executor-') | list | length > 0)
+             and (workloads_revert_version_definition.TaskGroups | map(attribute='Name') | select('match', '^executor-') | list
+                  | length == workloads_revert_version_definition.TaskGroups | length)) }}
   vars:
     workloads_revert_version_definition: >-
       {{ (workloads_rollback_versions.results | selectattr('item', 'equalto', workloads_revert_job) | first).json.Versions
@@ -99,7 +106,7 @@
     - not workloads_revert_done | bool
     - not workloads_revert_staged | bool
 
-- name: Roll the sealer back one member at a time
+- name: Roll back one group at a time, {{ workloads_revert_job }}
   when:
     - workloads_revert_before is not none
     - not workloads_revert_done | bool
@@ -109,16 +116,29 @@
       ansible.builtin.set_fact:
         workloads_sealer_new: "{{ workloads_revert_definition }}"
         workloads_sealer_current: "{{ workloads_revert_current }}"
+      when: workloads_revert_job == 'cluster'
 
     - name: Order the members for the reverse roll
       ansible.builtin.include_tasks: sealer_order.yml
+      when: workloads_revert_job == 'cluster'
 
-    - name: Roll the sealer back one member at a time
-      ansible.builtin.include_tasks: sealer_step.yml
-      loop: "{{ workloads_sealer_order }}"
+    - name: Roll back each group, {{ workloads_revert_job }}
+      ansible.builtin.include_tasks: roll_step.yml
+      loop: >-
+        {{ workloads_sealer_order if workloads_revert_job == 'cluster'
+           else workloads_revert_definition.TaskGroups | map(attribute='Name') | list }}
       loop_control:
-        loop_var: workloads_sealer_group
-        index_var: workloads_sealer_index
+        loop_var: workloads_roll_group
+        index_var: workloads_roll_index
+      vars:
+        workloads_roll_job: "{{ workloads_revert_job }}"
+        workloads_roll_new: "{{ workloads_revert_definition }}"
+        workloads_roll_current: "{{ workloads_revert_current }}"
+        workloads_roll_order: >-
+          {{ workloads_sealer_order if workloads_revert_job == 'cluster'
+             else workloads_revert_definition.TaskGroups | map(attribute='Name') | list }}
+        workloads_roll_spec: >-
+          {{ workloads_sealer_job if workloads_revert_job == 'cluster' else {'name': workloads_revert_job} }}
 
 - name: Record the rollback of {{ workloads_revert_job }}
   ansible.builtin.set_fact:

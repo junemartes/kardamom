@@ -143,30 +143,37 @@ variable "checkpoint_log" {
   }
 }
 
-# Carry mode, "on" or "off" (--carry-bytes). On, each executor runs on
-# the node of its paired sealer member and reads the canonical entries
-# with their bytes from the feed of that member. Off, the executors run on
-# the executor nodes and join the references of the cluster egress with
-# tx_data. The sealer job takes the same value (cluster.nomad.hcl), and
-# the deploy passes both from KARDAMOM_CARRY_BYTES.
-variable "carry_bytes" {
+# The executors on the sealer nodes, "on" or "off". On, executor <i>
+# runs on sealer-<i>, the node of member i, in its own group. Off, the
+# executors run on the executor nodes. The deploy passes it from
+# KARDAMOM_EXEC_ON_SEALERS.
+variable "exec_on_sealers" {
   type    = string
   default = "off"
   validation {
-    condition     = contains(["on", "off"], var.carry_bytes)
-    error_message = "The carry_bytes value must be on or off."
+    condition     = contains(["on", "off"], var.exec_on_sealers)
+    error_message = "The exec_on_sealers value must be on or off."
   }
 }
 
 variable "sealer_count" {
   type        = number
-  description = "The sealer node count (node_classes.sealer.count). In carry mode, executor <i> runs on sealer-<i>."
+  description = "The sealer node count (node_classes.sealer.count). With exec_on_sealers, executor <i> runs on sealer-<i>."
   default     = 3
 }
 
-# The egress base URL (--egress), in carry mode only. The executor reads a
-# cursor below the replay window of its member from the egress. Empty: a
-# cursor below the window goes to a peer checkpoint at once.
+# The executors that run in carry mode (--carry-bytes): a comma-separated
+# list of member indexes, such as "0,1". Empty: none. Each listed executor
+# reads the canonical entries with their bytes from the member feed of its
+# node, then the egress (--egress). It needs exec_on_sealers. The deploy
+# passes it from KARDAMOM_CARRY_EXECUTORS.
+variable "carry_executors" {
+  type    = string
+  default = ""
+}
+
+# The egress base URL (--egress) of the carry executors. A carry executor
+# reads a cursor below the replay window of its member from the egress.
 variable "egress_url" {
   type    = string
   default = ""
@@ -185,33 +192,35 @@ variable "executor_query_port" {
 # the shared media driver of that node (stream 1006). Only that member
 # publishes on that driver, so the node names the pair: the executor takes
 # no member id. Its id is the member index i.
+#
+# The role constraint of a pinned group is in the group, not in the job.
+# So during the staged move (tasks/executor.yml) a step can hold the
+# group of the executor nodes and the pinned groups in one job.
 locals {
-  carry = var.carry_bytes == "on"
-  executor_groups = local.carry ? [
+  on_sealers = var.exec_on_sealers == "on"
+  carry_ids  = split(",", var.carry_executors)
+  executor_groups = local.on_sealers ? [
     for i in range(var.sealer_count) : {
       label = "executor-${i}"
       count = 1
       id    = format("%d", i)
-      constraint = {
-        attribute = "${meta.node_index}"
-        operator  = "="
-        value     = format("%d", i)
-      }
+      carry = contains(local.carry_ids, format("%d", i))
+      constraints = [
+        { attribute = "${meta.node_index}", operator = "=", value = format("%d", i) },
+        { attribute = "${meta.role}", operator = "=", value = "sealer" },
+      ]
     }
     ] : [{
-      label = "executor"
-      count = 3
-      id    = "${NOMAD_ALLOC_INDEX}"
-      constraint = {
-        attribute = ""
-        operator  = "distinct_hosts"
-        value     = "true"
-      }
+      label       = "executor"
+      count       = 3
+      id          = "${NOMAD_ALLOC_INDEX}"
+      carry       = false
+      constraints = [{ attribute = "", operator = "distinct_hosts", value = "true" }]
   }]
   # The nodes of the checkpoint peers: the nodes that run the executors.
   checkpoint_peers = join(",", [
-    for i in range(local.carry ? var.sealer_count : var.executor_count) :
-    "${local.carry ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:9014"
+    for i in range(local.on_sealers ? var.sealer_count : var.executor_count) :
+    "${local.on_sealers ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:9014"
   ])
 }
 
@@ -228,20 +237,27 @@ job "executor" {
   # (`just sealer-upgrade-check <env>`) reads these metas. The executor of
   # this release runs a full reference that a sealer below decision
   # version 5 relays as is (relayed_full_ref). An older executor drops that
-  # frame and stops at the gap.
+  # frame and stops at the gap. A carry executor of this release stops
+  # with an error when every source gives a reference that it cannot
+  # join (carried_ref_fault). The deploy reads this meta before it lists
+  # an executor in KARDAMOM_CARRY_EXECUTORS.
   meta {
     nonce_burn          = "true"
     chain_state_install = "true"
     first_receipt       = "true"
     relayed_full_ref    = "true"
+    carried_ref_fault   = "true"
   }
 
   datacenters = [var.datacenter]
   type        = "service"
 
-  constraint {
-    attribute = "${meta.role}"
-    value     = local.carry ? "sealer" : "executor"
+  dynamic "constraint" {
+    for_each = local.on_sealers ? [] : ["executor"]
+    content {
+      attribute = "${meta.role}"
+      value     = constraint.value
+    }
   }
 
   dynamic "group" {
@@ -251,10 +267,13 @@ job "executor" {
       # 3-way redundant state machines, each with a co-located recorder.
       # See local.executor_groups for the placement.
       count = group.value.count
-      constraint {
-        attribute = group.value.constraint.attribute
-        operator  = group.value.constraint.operator
-        value     = group.value.constraint.value
+      dynamic "constraint" {
+        for_each = group.value.constraints
+        content {
+          attribute = constraint.value.attribute
+          operator  = constraint.value.operator
+          value     = constraint.value.value
+        }
       }
 
       # Resilience (chaos tests): restart a crashed task on the same
@@ -263,7 +282,7 @@ job "executor" {
       # canonical order from genesis, which is fine for a redundant
       # state machine. With 3 executor-role nodes and distinct_hosts, a
       # lost replica reschedules to a spare node if one exists, or
-      # degrades to 2. In carry mode a group has one node, so a lost
+      # degrades to 2. On the sealer nodes a group has one node, so a lost
       # replica waits for that node.
       restart {
         attempts = 3
@@ -378,7 +397,7 @@ job "executor" {
             # This replica's id selects its per-replica tx_receipts
             # MDS endpoint (channels.toml tx_receipts_endpoint_base_port
             # plus id). The id is stable: the allocation index of the
-            # count-based group, or the member index in carry mode. It
+            # count-based group, or the member index on the sealer nodes. It
             # matches the co-located recorder's id.
             "--recorder-id", group.value.id,
             # The void voter id: the same stable id. The sealer's voter
@@ -437,8 +456,7 @@ job "executor" {
             var.exec_frames == "on" ? ["--exec-frames"] : [],
             # Carry mode: the member feed on the shared driver of this node
             # (--aeron-dir above), and the egress as the second source.
-            local.carry ? ["--carry-bytes"] : [],
-            local.carry && var.egress_url != "" ? ["--egress", var.egress_url] : [],
+            group.value.carry ? ["--carry-bytes", "--egress", var.egress_url] : [],
           )
         }
 

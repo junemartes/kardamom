@@ -27,7 +27,7 @@ SERVICES = ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'va
 # real L1 or the chaos-l1 shard adds.
 MANIFEST = SERVICES + ['l1-indexer', 'l1-fault-proxy']
 # The Nomad Variable a job's template renders into the task environment.
-SECRET_PATH = re.compile(r'nomadVar "(nomad/jobs/[\w/-]+)"')
+SECRET_PATH = re.compile(r'nomadVar "(nomad/jobs/[\w-]+)"')
 # A secret no rendered job, job variable or play output may hold.
 SENTINEL = 'SECRET-SENTINEL'
 # The SHA-256 of the genesis that staging started from. A live chain
@@ -44,6 +44,10 @@ NO_QUORUM_ROOT = {'service': 'sealer', 'instance': 'cluster', 'cause': 'sealer_n
                   'runbook': 'docs/runbooks/sealer_no_quorum.md'}
 NO_QUORUM_CHAIN = HEALTHY_CHAIN | {'roots': [NO_QUORUM_ROOT],
                                    'ingress': {'pause': {'reason': 'upstream', 'root': NO_QUORUM_ROOT}}}
+# The carry fields of the status of a member of this release, before the
+# carry window: decision version 5, the heap store, no feed.
+MEMBER_CARRY = {'decisionVersion': 5, 'retainedStore': 'heap', 'carryWindow': False, 'feed': 'off',
+                'retainedFrames': 0, 'retainedBytes': 0}
 # The format registry of the repository: the formats of every target.
 FORMATS = (ANSIBLE.parents[2] / 'formats.toml').read_text()
 # The formats text that an accepted release holds in the record. The deploy
@@ -87,11 +91,12 @@ class NomadAPI(BaseHTTPRequestHandler):
                 assert path in state['variables'], f'{body["Job"]["ID"]} registers before {path}'
             self.register(body['Job'])
             state['writes'].append(body['Job']['ID'])
+            state.setdefault('registrations', []).append(body['Job'])
             # The sealer groups that carry the roll's marker (the new
             # retention, or the digest a rollback restores), per
             # registration: the staged roll adds one group per step.
             if body['Job']['ID'] == 'cluster':
-                marker = state.get('roll_marker', 'retention=4096')
+                marker = state.get('roll_marker', 'retention=131072')
                 state.setdefault('rolled', []).append(sorted(
                     g['Name'] for g in body['Job']['TaskGroups'] if marker in json.dumps(g)))
             self.respond({'JobModifyIndex': 1})
@@ -246,12 +251,25 @@ class NomadAPI(BaseHTTPRequestHandler):
         elif parts[1] == 'status':
             # The sealer member status of the node the Host header names;
             # member 0 leads unless the test says otherwise.
-            octet = int(self.headers['Host'].split(':')[0].rsplit('.', 1)[1])
-            node = f'node-cluster-{octet - 1}'
+            node = self.host_node()
+            octet = int(node.rsplit('-', 1)[1]) + 1
             default = 'LEADER' if node.endswith('-0') else 'FOLLOWER'
             self.respond({'memberId': octet - 1, 'role': state['roles'].get(node, default), 'election': 'CLOSED',
                           'snapshotReadsMax': state.get('reads_max', {}).get(node, 15),
-                          'snapshotLatest': state.get('snapshot_latest', {}).get(node, 0)})
+                          'snapshotLatest': state.get('snapshot_latest', {}).get(node, 0)}
+                         | MEMBER_CARRY | state.get('status', {}).get(node, {}))
+        elif parts[1] == 'metrics':
+            # The Prometheus page of the node the Host header names. A node
+            # without a page does not answer.
+            page = state.get('metrics', {}).get(self.host_node())
+            if page is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(page.encode())
         elif parts[2] == 'job' and parts[4] == 'deployment':
             # A job with a scripted deployment gets one; every other job
             # has none, like a system job.
@@ -272,11 +290,25 @@ class NomadAPI(BaseHTTPRequestHandler):
         else:
             raise AssertionError(self.path)
 
-    @staticmethod
-    def node_ip(node):
+    def metric_nodes(self):
+        """The nodes with a metrics page that are not sealer nodes, each on
+        its own loopback address 127.0.2.<n>."""
+        return sorted(n for n in self.server.state.get('metrics', {}) if not n.startswith('node-cluster-'))
+
+    def node_ip(self, node):
         if node.startswith('node-cluster-'):
             return f'127.0.0.{int(node.rsplit("-", 1)[1]) + 1}'
+        if node in self.metric_nodes():
+            return f'127.0.2.{self.metric_nodes().index(node) + 1}'
         return '127.0.0.1'
+
+    def host_node(self):
+        """The node that the Host header of the request names."""
+        address = self.headers['Host'].split(':')[0]
+        prefix, last = address.rsplit('.', 1)
+        if prefix == '127.0.2':
+            return self.metric_nodes()[int(last) - 1]
+        return f'node-cluster-{int(last) - 1}'
 
     def allocations(self, name):
         state = self.server.state
@@ -292,9 +324,10 @@ class NomadAPI(BaseHTTPRequestHandler):
                 # A job the test names has no running allocation: a crash loop.
                 running = name not in state.get('not_running', ()) \
                     and group['Name'] not in state.get('down_groups', ())
+                # Each instance of a group has its own node.
                 allocs.append({'TaskGroup': group['Name'], 'JobVersion': self.version(name) - int(stale),
                                'DesiredStatus': 'run', 'ClientStatus': 'running' if running else 'pending',
-                               'NodeID': f'node-{group["Name"]}',
+                               'NodeID': f'node-{group["Name"]}' + (f'.{i}' if i else ''),
                                'DeploymentStatus': {'Canary': False}})
         return allocs
 
@@ -411,6 +444,8 @@ class Deploys(unittest.TestCase):
             'workloads_cluster_binary': str(self.smoke),
             'workloads_deploy_binary': str(self.deploy_bin),
             'workloads_sealer_admin_port': self.api.server_port,
+            'workloads_metrics_ports': dict.fromkeys(('executor', 'batcher', 'validator', 'egress'),
+                                                     self.api.server_port),
             'workloads_cluster_bootstrap': False,
             'workloads_ingress_rpc_port': self.api.server_port,
             'workloads_registry_url': f'http://127.0.0.1:{self.api.server_port}',
@@ -445,6 +480,17 @@ class Deploys(unittest.TestCase):
         self.manifest.write_text(self.manifest.read_text().replace(
             re.search(r'@sha256:([0-9a-f]{64})', self.manifest.read_text()).group(1), digest * 64))
 
+    def upgrade_check(self, success=True, feature='9', activation_ms=''):
+        """Run the upgrade check for an upgrade transaction of `feature` at `activation_ms`."""
+        return self.run_deploy(playbook='upgrade-check.yml', success=success,
+                               environ={'KARDAMOM_UPGRADE_FEATURE': feature,
+                                        'KARDAMOM_UPGRADE_ACTIVATION_MS': activation_ms})
+
+    def add_egress_image(self):
+        """Pin the image of the egress in the manifest."""
+        self.manifest.write_text(self.manifest.read_text()
+                                 + f'egress registry.example:5000/kardamom-egress:test@sha256:{"a" * 64}\n')
+
     def run_rollback(self, success=True, environ=None):
         return self.run_deploy(playbook='rollback.yml', success=success, environ=environ)
 
@@ -452,6 +498,8 @@ class Deploys(unittest.TestCase):
     # the state of the fake API, and a directory with a copy of the record
     # directory.
     deployed = None
+    # The environment of that deploy.
+    DEPLOY_ENVIRON = {}
 
     def deploy(self):
         """Run a default deploy on the fresh fixture of this test.
@@ -464,7 +512,7 @@ class Deploys(unittest.TestCase):
         """
         cls = type(self)
         if cls.deployed is None:
-            self.run_deploy()
+            self.run_deploy(environ=self.DEPLOY_ENVIRON)
             files = tempfile.TemporaryDirectory(prefix='kardamom-deploy-snapshot-')
             cls.addClassCleanup(files.cleanup)
             shutil.copytree(self.record_dir, Path(files.name) / 'deployed')
@@ -472,7 +520,7 @@ class Deploys(unittest.TestCase):
             return
         state, files = cls.deployed
         self.api.state = copy.deepcopy(state)
-        shutil.copytree(Path(files.name) / 'deployed', self.record_dir)
+        shutil.copytree(Path(files.name) / 'deployed', self.record_dir, dirs_exist_ok=True)
 
     def gate_formats(self, findings):
         """Deploy once, give the accepted release the formats text that the
@@ -958,8 +1006,7 @@ class DeployTest(Deploys):
         self.assertNotIn('service "kardamom-egress-metrics|any"', self.job_templates(plans['monitoring']))
 
     def test_the_egress_switches_deploy_the_egress_and_reach_each_reader(self):
-        self.manifest.write_text(self.manifest.read_text()
-                                 + f'egress registry.example:5000/kardamom-egress:test@sha256:{"a" * 64}\n')
+        self.add_egress_image()
         self.run_deploy(self.EGRESS_ON, check=True)
         plans = self.api.state['plans']
         # After the executors that it reads, before the readers after it.
@@ -1011,99 +1058,118 @@ class DeployTest(Deploys):
                 args = self.api.state['plans']['ingress']['TaskGroups'][0]['Tasks'][0]['Config']['args']
                 self.assertEqual(args[args.index('--ack') + 1], expected)
 
-    # The jobs that carry mode changes, and the switch in the environment
-    # of the deploy.
+    # The jobs that the switches of the carry window change.
     CARRY_JOBS = ('aeron', 'cluster', 'executor', 'state-mirror', 'sequencer', 'ingress', 'batcher',
                   'validator', 'monitoring')
-    CARRY_ON = {'KARDAMOM_CARRY_BYTES': 'on', 'KARDAMOM_RETAINED_TOKEN': f'{SENTINEL}-RETAINED'}
+    # Every switch of the carry window, off.
+    CARRY_OFF = {'KARDAMOM_MEMBER_FEED': 'off', 'KARDAMOM_EXEC_ON_SEALERS': 'off', 'KARDAMOM_CARRY_EXECUTORS': '',
+                 'KARDAMOM_SEALER_VERSION_FLOOR': '0'}
+    MEMBER_FEED = {'KARDAMOM_MEMBER_FEED': 'on'}
+    ON_SEALERS = MEMBER_FEED | {'KARDAMOM_EXEC_ON_SEALERS': 'on'}
 
-    def test_carry_mode_off_renders_every_job_as_before(self):
-        """An explicit off and an unset switch render the same jobs, with
-        no carry setting and the executors on the executor nodes."""
+    def test_the_carry_switches_off_render_every_job_as_before(self):
+        """An explicit off and unset switches render the same jobs: no feed,
+        the executors on the executor nodes, no floor and no new meta."""
         self.run_deploy(check=True)
         unset = self.api.state['plans']
-        self.run_deploy(check=True, environ={'KARDAMOM_CARRY_BYTES': 'off'})
+        self.run_deploy(check=True, environ=self.CARRY_OFF)
         self.assertEqual(self.api.state['plans'], unset)
         executor = unset['executor']
         self.assertEqual([(g['Name'], g['Count']) for g in executor['TaskGroups']], [('executor', 3)])
-        self.assertEqual(executor['Constraints'][0]['RTarget'], 'executor')
-        self.assertNotIn('--carry-bytes', self.job_args(executor))
+        self.assertEqual(executor['Constraints'], [{'LTarget': '${meta.role}', 'RTarget': 'executor', 'Operand': '='}])
+        self.assertEqual(executor['TaskGroups'][0]['Constraints'],
+                         [{'LTarget': '', 'RTarget': 'true', 'Operand': 'distinct_hosts'}])
+        self.assertEqual({'--carry-bytes', '--egress'} & set(self.job_args(executor)), set())
         self.assertNotIn('carryBytes', json.dumps(unset['cluster']))
         self.assertNotIn('feedAeronDir', json.dumps(unset['cluster']))
         self.assertIn({'LTarget': '${meta.role}', 'RTarget': 'sealer', 'Operand': '!='},
                       unset['aeron']['Constraints'])
+        self.assertNotIn('--sealer-version-floor', self.job_args(unset['sequencer']))
+        for name in ('batcher', 'validator'):
+            self.assertNotIn('reads_egress', unset[name]['Meta'], name)
         for name in self.CARRY_JOBS:
             self.assertNotIn('sealer-0.node.dc1.consul:90', json.dumps(unset[name]), name)
 
-    def test_carry_mode_pins_one_executor_to_each_sealer_member(self):
-        output = self.run_deploy(environ=self.CARRY_ON)
-        state = self.api.state
-        # The token reaches the members only through the variable of each
-        # group, written before the sealer registers.
-        self.assertNotIn(SENTINEL, output)
-        for name, job in [*state['plans'].items(), *state['jobs'].items()]:
-            self.assertNotIn(SENTINEL, json.dumps(job), name)
-        for i in range(3):
-            self.assertEqual(state['variables'][f'nomad/jobs/cluster/cluster-{i}'],
-                             {'KARDAMOM_RETAINED_TOKEN': f'{SENTINEL}-RETAINED'})
-        plans = state['plans']
+    def test_the_member_feed_reaches_the_members_and_the_shared_driver(self):
+        self.run_deploy(check=True, environ=self.MEMBER_FEED)
+        plans = self.api.state['plans']
         for group in plans['cluster']['TaskGroups']:
             task = group['Tasks'][0]
             options = task['Env']['JAVA_TOOL_OPTIONS'].split()
-            for setting in ('carryBytes=true', 'feedAeronDir=/opt/kardamom/aeron-mount/dir',
-                            'feedRingBytes=16777216'):
-                self.assertIn(f'-Dkardamom.cluster.{setting}', options)
-            token = [t for t in task['Templates'] if t['Envvars']]
-            self.assertEqual(token[0]['DestPath'], 'secrets/retained.env')
-            self.assertIn(f'nomadVar "nomad/jobs/cluster/{group["Name"]}"', token[0]['EmbeddedTmpl'])
+            self.assertIn('-Dkardamom.cluster.feedAeronDir=/opt/kardamom/aeron-mount/dir', options)
+            self.assertIn('-Dkardamom.cluster.feedRingBytes=16777216', options)
+            # No retained file and no token: the feed walks the heap.
+            self.assertNotIn('carryBytes', task['Env']['JAVA_TOOL_OPTIONS'])
+            self.assertEqual([t['DestPath'] for t in task['Templates'] if t['Envvars']], [])
+        self.assertNotIn('sealer', json.dumps(plans['aeron']['Constraints']))
+        self.assertEqual([g['Name'] for g in plans['executor']['TaskGroups']], ['executor'])
+
+    def test_the_executors_on_the_sealer_nodes_pin_one_group_to_each_member(self):
+        self.run_deploy(check=True, environ=self.ON_SEALERS)
+        plans = self.api.state['plans']
         # Executor <i> runs on the node of member <i>, with the member index
-        # as its id, and reads the member feed of that node.
+        # as its id, in reference mode. The role constraint is in each group,
+        # so a step of the move holds the group of the executor nodes too.
         executor = plans['executor']
-        self.assertEqual(executor['Constraints'][0]['RTarget'], 'sealer')
+        self.assertIsNone(executor['Constraints'])
         peers = ','.join(f'sealer-{i}.node.dc1.consul:9014' for i in range(3))
         for i, group in enumerate(executor['TaskGroups']):
             self.assertEqual((group['Name'], group['Count']), (f'executor-{i}', 1))
             self.assertEqual(group['Constraints'],
-                             [{'LTarget': '${meta.node_index}', 'RTarget': str(i), 'Operand': '='}])
+                             [{'LTarget': '${meta.node_index}', 'RTarget': str(i), 'Operand': '='},
+                              {'LTarget': '${meta.role}', 'RTarget': 'sealer', 'Operand': '='}])
             task = group['Tasks'][0]
             args = task['Config']['args']
-            self.assertIn('--carry-bytes', args)
-            self.assertNotIn('--egress', args)
+            self.assertEqual({'--carry-bytes', '--egress'} & set(args), set())
             self.assertEqual(args[args.index('--aeron-dir') + 1], '/opt/kardamom/aeron-mount/dir')
             self.assertEqual(args[args.index('--recorder-id') + 1], str(i))
             self.assertEqual(args[args.index('--void-voter-id') + 1], str(i))
             self.assertEqual(args[args.index('--checkpoint-peers') + 1], peers)
             self.assertEqual(task['Env']['KARDAMOM_HOST_ID'], f'executor-{i}')
-        # The shared driver runs on the sealer nodes, and the state mirror
-        # and every reader of an executor follow the executors there.
-        self.assertNotIn('sealer', json.dumps(plans['aeron']['Constraints']))
+        # The state mirror and every reader of an executor follow the
+        # executors to the sealer nodes.
         self.assertEqual(plans['state-mirror']['Constraints'][0]['RTarget'], 'sealer')
         for name in ('sequencer', 'ingress', 'batcher', 'validator', 'monitoring'):
             text = json.dumps(plans[name])
             self.assertIn('sealer-2.node.dc1.consul:90', text, name)
             self.assertNotIn('executor-0.node.dc1.consul:90', text, name)
+        self.assertEqual(self.api.state['variables'], {}, 'no Nomad variable for a member group')
 
-    def test_carry_mode_takes_the_egress_as_the_second_source(self):
-        self.manifest.write_text(self.manifest.read_text()
-                                 + f'egress registry.example:5000/kardamom-egress:test@sha256:{"a" * 64}\n')
-        self.run_deploy({'workloads_egress': True, 'workloads_exec_frames': 'on'}, check=True,
-                        environ=self.CARRY_ON)
-        args = self.job_args(self.api.state['plans']['executor'])
-        self.assertEqual(args.count('--egress'), 3)
-        self.assertEqual(args[args.index('--egress') + 1], self.EGRESS_URL)
-
-    def test_carry_mode_refuses_an_incomplete_setting(self):
+    def test_the_carry_switches_refuse_an_incomplete_setting(self):
+        egress = {'KARDAMOM_EGRESS': '1', 'KARDAMOM_EXEC_FRAMES': 'on'}
         cases = (
-            ('a value that is not on or off', {'KARDAMOM_CARRY_BYTES': 'yes'}),
-            ('no retained token', {'KARDAMOM_CARRY_BYTES': 'on'}),
-            ('the recorded cursor', self.CARRY_ON | {'KARDAMOM_EXEC_CURSOR': 'on'}),
-            ('no snapshot', self.CARRY_ON | {'KARDAMOM_CLUSTER_SNAPSHOT_S': '0'}),
+            ('a feed value that is not on or off', {'KARDAMOM_MEMBER_FEED': 'yes'},
+             'KARDAMOM_MEMBER_FEED and KARDAMOM_EXEC_ON_SEALERS are on, off or empty'),
+            ('the executors on the sealer nodes without the feed', {'KARDAMOM_EXEC_ON_SEALERS': 'on'},
+             'KARDAMOM_EXEC_ON_SEALERS=on needs'),
+            ('a carry executor on the executor nodes', egress | {'KARDAMOM_CARRY_EXECUTORS': '0'},
+             'is empty or a list of distinct member indexes'),
+            ('a carry executor without the egress', self.ON_SEALERS | {'KARDAMOM_CARRY_EXECUTORS': '0'},
+             'is empty or a list of distinct member indexes'),
+            ('a carry executor with the recorded cursor',
+             self.ON_SEALERS | egress | {'KARDAMOM_CARRY_EXECUTORS': '0', 'KARDAMOM_EXEC_CURSOR': 'on'},
+             'is empty or a list of distinct member indexes'),
+            ('a repeated carry executor', self.ON_SEALERS | egress | {'KARDAMOM_CARRY_EXECUTORS': '0,0'},
+             'is empty or a list of distinct member indexes'),
+            ('a carry executor without a member', self.ON_SEALERS | egress | {'KARDAMOM_CARRY_EXECUTORS': '3'},
+             'is empty or a list of distinct member indexes'),
+            ('a floor above decision version 5', {'KARDAMOM_SEALER_VERSION_FLOOR': '6'},
+             'KARDAMOM_SEALER_VERSION_FLOOR ("6") is empty or a decision version from 0 to 5'),
+            ('a retention above the cap', {'KARDAMOM_CLUSTER_RETENTION': '131073'},
+             'KARDAMOM_CLUSTER_RETENTION ("131073") is empty or a frame count from 1 to 131072'),
+            ('a retention of 0', {'KARDAMOM_CLUSTER_RETENTION': '0'}, 'is empty or a frame count from 1 to 131072'),
         )
-        for name, environ in cases:
+        self.add_egress_image()
+        for name, environ, message in cases:
             with self.subTest(name):
                 output = self.run_deploy(check=True, success=False, environ=environ)
-                self.assertIn('KARDAMOM_CARRY_BYTES is on, off or empty', output)
+                self.assertIn(message, output)
                 self.assertNotIn('plans', self.api.state)
+
+    def test_a_floor_on_a_new_chain_is_refused(self):
+        output = self.run_deploy(check=True, success=False, environ={'KARDAMOM_SEALER_VERSION_FLOOR': '5'})
+        self.assertIn('Nomad does not know the sealer job. A new chain starts on decision version 3', output)
+        self.assertNotIn('sequencer', self.api.state.get('plans', {}))
 
     def test_every_aeron_party_takes_the_deploy_values(self):
         """Each Aeron deploy value: its environment variable, its default,
@@ -1493,18 +1559,6 @@ class RecordTest(Deploys):
         self.assertIn('every member must match: carryBytes.', output)
         self.assertEqual(self.api.state['writes'], [])
 
-    def test_carry_mode_on_a_live_chain_needs_the_allowance(self):
-        self.deploy()
-        self.api.state['writes'] = []
-        carry = DeployTest.CARRY_ON
-        output = self.run_deploy(success=False, environ=carry)
-        self.assertIn('every member must match: carryBytes.', output)
-        self.assertEqual(self.api.state['writes'], [])
-        self.run_deploy(environ=carry | {'KARDAMOM_ALLOW_MUST_MATCH': 'carryBytes'})
-        self.assertEqual(self.api.state['writes'].count('cluster'), 3, 'the sealer rolls member by member')
-        self.assertEqual([g['Name'] for g in self.api.state['jobs']['executor']['TaskGroups']],
-                         ['executor-0', 'executor-1', 'executor-2'])
-
     def test_a_sealer_job_that_started_on_decision_version_three_is_refused(self):
         """A cluster that ran a build with decisionVersion=3 must not roll onto version 2."""
         self.deploy()
@@ -1566,18 +1620,12 @@ class RecordTest(Deploys):
         self.assertRegex(output, r'cannot read the newest snapshot of a sealer member\] \*+\nskipping')
         self.assertIn('cluster', self.api.state['plans'])
 
-    def upgrade_check(self, success=True, feature='5', activation_ms=''):
-        """Run the upgrade check for an upgrade transaction of `feature` at `activation_ms`."""
-        return self.run_deploy(playbook='upgrade-check.yml', success=success,
-                               environ={'KARDAMOM_UPGRADE_FEATURE': feature,
-                                        'KARDAMOM_UPGRADE_ACTIVATION_MS': activation_ms})
-
     def test_the_upgrade_check_passes_on_a_release_that_takes_the_upgrade(self):
         self.deploy()
         output = self.upgrade_check()
         self.assertIn('The upgrade check passed: 3 sealer members read snapshot version 14', output)
         self.assertIn('the live allocations of sequencer, executor, validator, ingress', output)
-        self.assertIn('The upgrade transaction of feature 5 may go to the Safe', output)
+        self.assertIn('The upgrade transaction of feature 9 may go to the Safe', output)
 
     def test_the_upgrade_check_allows_the_sealer_feature_only_on_at_once(self):
         """A new network turns FEATURE_SEALER_V3 on at once. Off, or on at a later time, is refused."""
@@ -1606,8 +1654,8 @@ class RecordTest(Deploys):
         self.api.state['reads_max'] = {'node-cluster-2': 14}
         output = self.upgrade_check(success=False, feature='3', activation_ms='0')
         self.assertIn('needs every sealer member to read snapshot version 15', output)
-        output = self.upgrade_check(feature='5')
-        self.assertIn('The upgrade transaction of feature 5 may go to the Safe', output)
+        output = self.upgrade_check()
+        self.assertIn('The upgrade transaction of feature 9 may go to the Safe', output)
 
     def test_the_upgrade_check_refuses_feature_four_on_a_member_that_reads_no_version_sixteen(self):
         self.deploy()
@@ -1899,7 +1947,7 @@ class SealerTest(Deploys):
         self.api.state['roles'] = {f'node-cluster-{i}': 'LEADER' if i == leader else 'FOLLOWER' for i in range(3)}
         self.api.state['deployments']['cluster'] = Deployment('cluster', ['successful'])
         self.api.state['writes'] = []
-        self.run_deploy({'workloads_cluster_retention': '4096'})
+        self.run_deploy({'workloads_cluster_retention': '131072'})
         return [g['Name'] for g in self.api.state['jobs']['cluster']['TaskGroups']]
 
     def test_the_sealer_rolls_followers_first_and_the_leader_last(self):
@@ -1908,7 +1956,7 @@ class SealerTest(Deploys):
         self.assertEqual(sorted(groups), ['cluster-0', 'cluster-1', 'cluster-2'])
         # Every step holds the current definition of the members not rolled
         # yet, so the retention reaches the groups in the roll order.
-        retention = [('-Dkardamom.cluster.retention=4096' in json.dumps(g)) for g in
+        retention = [('-Dkardamom.cluster.retention=131072' in json.dumps(g)) for g in
                      self.api.state['jobs']['cluster']['TaskGroups']]
         self.assertTrue(all(retention), retention)
         self.assertEqual(self.api.state['deployments']['cluster'].polls, 3)
@@ -1930,7 +1978,7 @@ class SealerTest(Deploys):
         # opens no bootstrap.
         self.api.state['deployments']['cluster'] = Deployment('cluster', ['successful'])
         self.api.state['writes'] = []
-        self.run_deploy({'workloads_cluster_bootstrap': True, 'workloads_cluster_retention': '4096'})
+        self.run_deploy({'workloads_cluster_bootstrap': True, 'workloads_cluster_retention': '131072'})
         self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster'])
 
     def test_a_failed_bootstrap_closes_the_bootstrap(self):
@@ -1938,6 +1986,249 @@ class SealerTest(Deploys):
         self.run_deploy({'workloads_cluster_bootstrap': True}, success=False)
         self.assertEqual(self.api.state['writes'][-3:], ['bootstrap-open', 'cluster', 'bootstrap-close'])
 
+
+
+class CarryTest(Deploys):
+    """The carry window: the staged move and roll of the executors, the
+    sequencer version floor, the move of the readers to the egress, the
+    carry executors, the retention, and the upgrade check of feature 5."""
+
+    # A chain with the egress and the frames of the executors.
+    DEPLOY_ENVIRON = {'KARDAMOM_EGRESS': '1', 'KARDAMOM_EXEC_FRAMES': 'on'}
+    ON_SEALERS = DEPLOY_ENVIRON | DeployTest.ON_SEALERS
+    # R of each egress instance, as (index, block): the highest is index
+    # 100 at block 50.
+    MARKS = {'node-egress': (100, 50), 'node-egress.1': (90, 45)}
+
+    def setUp(self):
+        super().setUp()
+        self.add_egress_image()
+
+    def metric(self, node, gauges):
+        """Give the node a metrics page with `gauges`, by name."""
+        self.api.state.setdefault('metrics', {})[node] = ''.join(f'{k} {v}\n' for k, v in gauges.items())
+
+    def set_marks(self):
+        for node, (index, block) in self.MARKS.items():
+            self.metric(node, {'kardamom_egress_ref_frame_max_index': index,
+                               'kardamom_egress_ref_frame_max_block': block})
+
+    def refused(self, environ, message):
+        """A check deploy that the gate refuses with `message`, and that plans
+        no job after the sealer."""
+        self.api.state.pop('plans', None)
+        output = self.run_deploy(check=True, success=False, environ=environ)
+        self.assertIn(message, output)
+        self.assertEqual(set(self.api.state.get('plans', {})) - {'cluster'}, set())
+
+    def executor_steps(self):
+        """The groups of each registration of the executor job."""
+        return [[(g['Name'], g['Count']) for g in job['TaskGroups']]
+                for job in self.api.state.get('registrations', []) if job['ID'] == 'executor']
+
+    def test_the_executors_move_to_the_sealer_nodes_one_at_a_time(self):
+        self.deploy()
+        self.api.state['writes'] = []
+        self.api.state['registrations'] = []
+        self.run_deploy(environ=self.ON_SEALERS)
+        # Each step stops the instance of the highest index on the executor
+        # nodes and starts the pinned group of that id.
+        self.assertEqual(self.executor_steps(), [
+            [('executor-2', 1), ('executor', 2)],
+            [('executor-1', 1), ('executor-2', 1), ('executor', 1)],
+            [('executor-0', 1), ('executor-1', 1), ('executor-2', 1)]])
+        moving = [job for job in self.api.state['registrations'] if job['ID'] == 'executor'][0]
+        self.assertIn({'LTarget': '${meta.role}', 'RTarget': 'executor', 'Operand': '='},
+                      moving['TaskGroups'][1]['Constraints'], 'the group of the executor nodes stays there')
+        self.assertEqual(self.api.state['writes'].count('cluster'), 3, 'the feed rolls member by member')
+        # A new image of the executor rolls the pinned groups one at a time.
+        self.api.state['registrations'] = []
+        self.manifest.write_text(re.sub(r'^(executor .*@sha256:)[0-9a-f]{64}$', r'\g<1>' + 'c' * 64,
+                                        self.manifest.read_text(), flags=re.M))
+        self.run_deploy(environ=self.ON_SEALERS)
+        rolled = [sorted(g['Name'] for g in job['TaskGroups'] if 'c' * 64 in json.dumps(g))
+                  for job in self.api.state['registrations'] if job['ID'] == 'executor']
+        self.assertEqual(rolled, [['executor-0'], ['executor-0', 'executor-1'],
+                                  ['executor-0', 'executor-1', 'executor-2']])
+
+    def test_a_rollback_rolls_the_pinned_executor_groups_back_one_at_a_time(self):
+        self.deploy()
+        self.run_deploy(environ=self.ON_SEALERS)
+        self.repin('b')
+        self.run_deploy(environ=self.ON_SEALERS)
+        self.api.state['writes'] = []
+        self.api.state['registrations'] = []
+        self.run_rollback()
+        self.assertNotIn('revert:executor:', ' '.join(self.api.state['writes']))
+        rolled = [sorted(g['Name'] for g in job['TaskGroups'] if 'a' * 64 in json.dumps(g))
+                  for job in self.api.state['registrations'] if job['ID'] == 'executor']
+        self.assertEqual(rolled, [['executor-0'], ['executor-0', 'executor-1'],
+                                  ['executor-0', 'executor-1', 'executor-2']])
+
+    def test_the_version_floor_needs_every_reader_of_a_relayed_full_reference(self):
+        self.deploy()
+        floor = self.DEPLOY_ENVIRON | {'KARDAMOM_SEALER_VERSION_FLOOR': '5'}
+        self.run_deploy(check=True, environ=floor)
+        for group in self.api.state['plans']['sequencer']['TaskGroups']:
+            args = group['Tasks'][0]['Config']['args']
+            self.assertEqual(args[args.index('--sealer-version-floor') + 1], '5')
+        self.api.state['status'] = {'node-cluster-1': {'decisionVersion': 4}}
+        self.refused(floor, 'a sealer member runs decision version 4 ([5, 4, 5])')
+        del self.api.state['status']
+        self.api.state['down_groups'] = ['cluster-2']
+        self.refused(floor, 'the sealer members cluster-2 do not run, so the gate cannot read their decision version')
+        del self.api.state['down_groups']
+        for job in ('batcher', 'egress'):
+            meta = self.api.state['jobs'][job]['Meta']
+            del meta['relayed_full_ref']
+            self.refused(floor, f'the {job} job does not run a relayed full reference (job meta relayed_full_ref)')
+            meta['relayed_full_ref'] = 'true'
+
+    def test_the_readers_move_to_the_egress_past_the_last_stored_reference(self):
+        self.deploy()
+        readers = self.DEPLOY_ENVIRON | {'KARDAMOM_BATCHER_EGRESS': 'on', 'KARDAMOM_VALIDATOR_EGRESS': 'on'}
+        self.set_marks()
+        self.metric('node-batcher', {'kardamom_batcher_last_posted_block': 50})
+        self.metric('node-validator', {'validator_committed_block': 60})
+        self.refused(readers, 'the batcher moves to the egress, and its block [50.0]')
+        self.metric('node-batcher', {'kardamom_batcher_last_posted_block': 51})
+        self.run_deploy(check=True, environ=readers)
+        for name in ('batcher', 'validator'):
+            job = self.api.state['plans'][name]
+            self.assertEqual(job['Meta']['reads_egress'], 'true', name)
+            args = DeployTest.job_args(job)
+            self.assertEqual(args[args.index('--egress') + 1], DeployTest.EGRESS_URL, name)
+        # An egress of a release without the mark, or an instance that does
+        # not answer: the gate cannot trust R.
+        meta = self.api.state['jobs']['egress']['Meta']
+        del meta['ref_mark']
+        self.refused(readers, 'the egress job does not keep the mark of the highest stored reference')
+        meta['ref_mark'] = 'true'
+        del self.api.state['metrics']['node-egress.1']
+        self.refused(readers, 'Refused: an egress instance does not report its reference mark')
+
+    def test_the_carry_executors_move_one_at_a_time_after_the_switch(self):
+        self.deploy()
+        self.run_deploy(environ=self.ON_SEALERS)
+        carry = self.ON_SEALERS | {'KARDAMOM_CARRY_EXECUTORS': '0'}
+        ready = {'carryWindow': True, 'feed': 'idle'}
+        status = {f'node-cluster-{i}': dict(ready) for i in range(3)}
+        self.api.state['status'] = status
+        self.set_marks()
+        # The committed block minus the compare window of 32 is above the
+        # block 50 of R.
+        self.metric('node-executor-0', {'kardamom_executor_block_number': 83})
+        cases = (
+            ('node-cluster-1', 'carryWindow', False, 'needs the rules of the carry window (feature 5) on every member'),
+            ('node-cluster-0', 'feed', 'off', 'its member cluster-0 reports the feed off'),
+        )
+        for node, field, value, message in cases:
+            with self.subTest(field):
+                status[node][field] = value
+                self.refused(carry, message)
+                status[node][field] = ready[field]
+        self.metric('node-executor-0', {'kardamom_executor_block_number': 82})
+        self.refused(carry, 'minus 32 is not above the block 50 of the last stored reference')
+        self.metric('node-executor-0', {'kardamom_executor_block_number': 83})
+        meta = self.api.state['jobs']['executor']['Meta']
+        del meta['carried_ref_fault']
+        self.refused(carry, 'the executor job does not stop on a reference that no source can join')
+        meta['carried_ref_fault'] = 'true'
+        # The move: only executor-0 changes, so the roll registers one step.
+        self.api.state['registrations'] = []
+        self.run_deploy(environ=carry)
+        self.assertEqual(len(self.executor_steps()), 1)
+        for group in self.api.state['jobs']['executor']['TaskGroups']:
+            args = group['Tasks'][0]['Config']['args']
+            carried = group['Name'] == 'executor-0'
+            self.assertEqual('--carry-bytes' in args, carried, group['Name'])
+            self.assertEqual(args[args.index('--egress') + 1] if carried else None,
+                             DeployTest.EGRESS_URL if carried else None, group['Name'])
+        # The next executor: the gate checks only the executor that moves.
+        del self.api.state['metrics']['node-executor-0']
+        self.metric('node-executor-1', {'kardamom_executor_block_number': 100})
+        self.api.state['registrations'] = []
+        self.run_deploy(environ=carry | {'KARDAMOM_CARRY_EXECUTORS': '0,1'})
+        self.assertEqual(len(self.executor_steps()), 1)
+
+    def test_the_retention_only_rises_and_stays_within_the_cap_in_bytes(self):
+        self.deploy()
+        lower = self.DEPLOY_ENVIRON | {'KARDAMOM_CLUSTER_RETENTION': '4096'}
+        self.refused(lower, 'the target lowers the sealer retention from 65536 to 4096 frames')
+        self.run_deploy(check=True, environ=lower | {'KARDAMOM_ALLOW_MUST_MATCH': 'retention'})
+        higher = self.DEPLOY_ENVIRON | {'KARDAMOM_CLUSTER_RETENTION': '131072'}
+        self.refused(higher | {'KARDAMOM_ALLOW_MUST_MATCH': 'retention'},
+                     'KARDAMOM_ALLOW_MUST_MATCH names retention, and the release does not change it')
+        # 131072 frames of 300 bytes are above 32 MiB.
+        self.api.state['status'] = {f'node-cluster-{i}': {'retainedFrames': 1000, 'retainedBytes': 300000}
+                                    for i in range(3)}
+        self.refused(higher, 'above the cap of 33554432 bytes')
+        self.refused(higher, 'Set at most 111848 frames')
+        self.api.state['status'] = {f'node-cluster-{i}': {'retainedFrames': 1000, 'retainedBytes': 256000}
+                                    for i in range(3)}
+        self.run_deploy(check=True, environ=higher)
+        self.assertIn('-Dkardamom.cluster.retention=131072', json.dumps(self.api.state['plans']['cluster']))
+
+    def window_ready(self):
+        """A chain that takes feature 5: every member reads version 18, and
+        every reader of the egress is past R."""
+        self.deploy()
+        for name in ('batcher', 'validator'):
+            self.api.state['jobs'][name]['Meta']['reads_egress'] = 'true'
+        self.api.state['reads_max'] = {f'node-cluster-{i}': 18 for i in range(3)}
+        self.set_marks()
+        self.metric('node-batcher', {'kardamom_batcher_egress_cursor_index': 101})
+        self.metric('node-validator', {'kardamom_validator_egress_cursor_index': 150})
+
+    def test_the_upgrade_check_of_feature_five(self):
+        self.window_ready()
+        for activation_ms in ('1700000000000', '18446744073709551615'):
+            output = self.upgrade_check(feature='5', activation_ms=activation_ms)
+            self.assertIn('3 sealer members read snapshot version 18', output)
+            self.assertIn('The upgrade transaction of feature 5 may go to the Safe', output)
+        cases = (
+            ('reads_max', lambda state: state['reads_max'].update({'node-cluster-2': 17}),
+             'needs every sealer member to read snapshot version 18'),
+            ('decision version', lambda state: state.update(status={'node-cluster-1': {'decisionVersion': 4}}),
+             'feature 5 needs decision version 5 on every member, and the members run [5, 4, 5]'),
+            ('retained file', lambda state: state.update(status={'node-cluster-0': {'retainedStore': 'file'}}),
+             "the stores ['file', 'heap', 'heap']"),
+            ('sequencer', lambda state: state['jobs']['sequencer']['Meta'].pop('sealer_version_kept'),
+             'the sequencer job does not keep the highest sealer version across its sessions'),
+            ('batcher', lambda state: state['jobs']['batcher']['Meta'].pop('reads_egress'),
+             'the batcher job does not read the canonical stream from the egress'),
+            ('egress', lambda state: state['jobs']['egress']['Meta'].pop('ref_mark'),
+             'the egress job does not keep the mark of the highest stored reference'),
+            ('older egress', lambda state: state.update(missing_replica='egress'),
+             'an allocation of an older job version still runs'),
+            ('egress down', lambda state: state['metrics'].pop('node-egress'),
+             'Refused: an egress instance does not report its reference mark'),
+            ('reader at R', lambda state: self.metric('node-validator', {'kardamom_validator_egress_cursor_index': 100}),
+             'the validator cursors [100.0] (kardamom_validator_egress_cursor_index; -1 is no answer) are not all above'
+             ' the index 100'),
+            ('reader down', lambda state: state['metrics'].pop('node-batcher'), 'the batcher cursors [-1.0]'),
+        )
+        for name, change, message in cases:
+            with self.subTest(name):
+                self.window_ready()
+                change(self.api.state)
+                output = self.upgrade_check(success=False, feature='5', activation_ms='1700000000000')
+                self.assertIn(message, output)
+
+    def test_feature_three_or_four_off_is_refused_while_a_member_holds_feature_five(self):
+        self.deploy()
+        self.api.state['reads_max'] = {f'node-cluster-{i}': 16 for i in range(3)}
+        self.metric('node-cluster-1', {'kardamom_sealer_feature_state{feature="5"}': 1})
+        for feature in ('3', '4'):
+            for activation_ms in ('18446744073709551615', '1700000000000'):
+                with self.subTest(feature=feature, activation_ms=activation_ms):
+                    output = self.upgrade_check(success=False, feature=feature, activation_ms=activation_ms)
+                    self.assertIn('can turn decision version 5 off, and a member holds feature 5', output)
+        output = self.upgrade_check(feature='4', activation_ms='0')
+        self.assertIn('The upgrade transaction of feature 4 may go to the Safe', output)
+        self.metric('node-cluster-1', {'kardamom_sealer_feature_state{feature="5"}': 0})
+        output = self.upgrade_check(feature='4', activation_ms='18446744073709551615')
+        self.assertIn('The upgrade transaction of feature 4 may go to the Safe', output)
 
 if __name__ == '__main__':
     unittest.main()

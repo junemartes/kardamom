@@ -57,25 +57,59 @@
       Each egress switch is on, off or empty: {{ workloads_switches }}.
       A reader switch ({{ workloads_readers_on }}) needs KARDAMOM_EGRESS=1, and the egress needs KARDAMOM_EXEC_FRAMES=on.
 
-# Carry mode moves each executor onto the node of one sealer member, and
-# the member needs the token of its retained file and a snapshot interval
-# above 0: the purge of the file runs at each snapshot. An executor that
-# reads the member feed sends no recorded cursor, so it refuses
-# --exec-cursor.
-- name: Validate carry mode
+# The switches of the carry window. The executor on a sealer node uses
+# the shared media driver of that node, which runs there only with the
+# member feed. One executor for each member keeps the void voters and the
+# peers of the egress the same.
+- name: Validate the executors on the sealer nodes
   ansible.builtin.assert:
     that:
-      - workloads_carry_bytes in ['', 'on', 'off']
+      - workloads_member_feed in ['', 'on', 'off']
+      - workloads_exec_on_sealers in ['', 'on', 'off']
       - >-
-        workloads_carry_bytes != 'on'
-        or (workloads_retained_token | length > 0
-            and node_classes.sealer.count | int == node_classes.executor.count | int
-            and workloads_exec_cursor != 'on'
-            and workloads_cluster_snapshot_s | default('300', true) | int > 0)
+        workloads_exec_on_sealers != 'on'
+        or (workloads_member_feed == 'on' and node_classes.sealer.count | int == node_classes.executor.count | int)
     fail_msg: >-
-      KARDAMOM_CARRY_BYTES is on, off or empty. On, it needs KARDAMOM_RETAINED_TOKEN, one executor for each
-      sealer member (node_classes.executor.count equal to node_classes.sealer.count), KARDAMOM_EXEC_CURSOR
-      not on, and KARDAMOM_CLUSTER_SNAPSHOT_S above 0.
+      KARDAMOM_MEMBER_FEED and KARDAMOM_EXEC_ON_SEALERS are on, off or empty. KARDAMOM_EXEC_ON_SEALERS=on needs
+      KARDAMOM_MEMBER_FEED=on and one executor for each sealer member (node_classes.executor.count equal to
+      node_classes.sealer.count).
+
+# A carry executor reads the member feed of its node, then the egress. It
+# sends no recorded cursor: the executor refuses --exec-cursor with
+# --carry-bytes.
+- name: Validate the carry executors
+  ansible.builtin.assert:
+    that:
+      - workloads_carry_executors | string is match('^([0-9]+(,[0-9]+)*)?$')
+      - workloads_carry_executor_ids | unique | length == workloads_carry_executor_ids | length
+      - workloads_carry_executor_ids | select('ge', node_classes.sealer.count | int) | list | length == 0
+      - >-
+        workloads_carry_executor_ids | length == 0
+        or (workloads_exec_on_sealers == 'on' and workloads_egress | bool and workloads_exec_cursor != 'on')
+    fail_msg: >-
+      KARDAMOM_CARRY_EXECUTORS ("{{ workloads_carry_executors }}") is empty or a list of distinct member indexes
+      below {{ node_classes.sealer.count }}, such as 0,1. A list needs KARDAMOM_EXEC_ON_SEALERS=on, KARDAMOM_EGRESS=1
+      and KARDAMOM_EXEC_CURSOR not on.
+
+- name: Validate the sequencer version floor
+  ansible.builtin.assert:
+    that: workloads_sealer_version_floor | string is match('^[0-5]?$')
+    fail_msg: >-
+      KARDAMOM_SEALER_VERSION_FLOOR ("{{ workloads_sealer_version_floor }}") is empty or a decision version from 0 to 5.
+
+# The release gate compares the value with the registered sealer, so it
+# only rises on a live chain.
+- name: Validate the sealer retention
+  ansible.builtin.assert:
+    that: >-
+      workloads_cluster_retention | string | length == 0
+      or (workloads_cluster_retention | string is match('^[0-9]+$')
+          and workloads_cluster_retention | int > 0
+          and workloads_cluster_retention | int <= workloads_retention_cap_frames | int)
+    fail_msg: >-
+      KARDAMOM_CLUSTER_RETENTION ("{{ workloads_cluster_retention }}") is empty or a frame count from 1 to
+      {{ workloads_retention_cap_frames }}. A replay over a cluster session queues every wanted frame at once, and a
+      larger window passes the backlog limit of the session.
 
 - name: Validate image provenance
   ansible.builtin.import_tasks: provenance.yml

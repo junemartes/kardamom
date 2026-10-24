@@ -9,7 +9,8 @@
 - name: Write the secrets of {{ workloads_job.name }}
   ansible.builtin.include_tasks: secrets.yml
   vars:
-    workloads_secrets_path: "nomad/jobs/{{ workloads_job.name }}"
+    workloads_secrets_url: >-
+      {{ workloads_nomad_addr }}/v1/var/nomad/jobs/{{ workloads_job.name }}?namespace={{ workloads_namespace | urlencode }}
     workloads_secrets_items: >-
       {{ workloads_job.secrets | dict2items | rejectattr('value', 'equalto', '') | items2dict }}
   when:

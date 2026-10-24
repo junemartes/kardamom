@@ -120,15 +120,16 @@ variable "egress_url" {
   default     = ""
 }
 
-# Carry mode, "on" or "off" (executor.nomad.hcl). On, the executors run
-# on the sealer nodes, so the checkpoint peers go to sealer-<i>, not to executor-<i>.
-# The deploy passes it from KARDAMOM_CARRY_BYTES.
-variable "carry_bytes" {
+# The executors on the sealer nodes, "on" or "off" (executor.nomad.hcl).
+# On, the executors run on the sealer nodes, so the checkpoint peers go
+# to sealer-<i>, not to executor-<i>. The deploy passes it from
+# KARDAMOM_EXEC_ON_SEALERS.
+variable "exec_on_sealers" {
   type    = string
   default = "off"
   validation {
-    condition     = contains(["on", "off"], var.carry_bytes)
-    error_message = "The carry_bytes value must be on or off."
+    condition     = contains(["on", "off"], var.exec_on_sealers)
+    error_message = "The exec_on_sealers value must be on or off."
   }
 }
 
@@ -150,13 +151,18 @@ job "validator" {
   # (`just sealer-upgrade-check <env>`) reads these metas. The validator of
   # this release runs a full reference that a sealer below decision
   # version 5 relays as is (relayed_full_ref). An older validator drops that
-  # frame and stops at the gap.
-  meta {
-    nonce_burn          = "true"
-    chain_state_install = "true"
-    first_receipt       = "true"
-    relayed_full_ref    = "true"
-  }
+  # frame and stops at the gap. A validator that reads the canonical
+  # stream from the egress carries reads_egress. The upgrade check of the
+  # carry window (feature 5) reads it.
+  meta = merge(
+    {
+      nonce_burn          = "true"
+      chain_state_install = "true"
+      first_receipt       = "true"
+      relayed_full_ref    = "true"
+    },
+    var.egress_url == "" ? {} : { reads_egress = "true" },
+  )
 
   datacenters = [var.datacenter]
   type        = "service"
@@ -323,7 +329,7 @@ job "validator" {
           # the executors' serve endpoints, and adopt it on restart,
           # the same as the executors' recovery-D loop.
           "--checkpoint-dir", "/opt/kardamom/checkpoints",
-          "--checkpoint-peers", join(",", [for i in range(var.executor_count) : "${var.carry_bytes == "on" ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:9014"]),
+          "--checkpoint-peers", join(",", [for i in range(var.executor_count) : "${var.exec_on_sealers == "on" ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:9014"]),
           # Shadow-check the node-incremental state trie against a
           # full rebuild every 8th block. A walker bug fail-stops the
           # validator (a dead alloc is a verdict failure), and bumps

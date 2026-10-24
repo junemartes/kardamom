@@ -16,24 +16,6 @@
     workloads_sealer_new: "{{ workloads_job_definition }}"
     workloads_sealer_diff: "{{ workloads_plan.json.Diff.Type }}"
 
-# Carry mode: the token of the retained file goes to the Nomad variable
-# of each member group before any member starts, so a new task finds it.
-# A group variable keeps the token apart from the bootstrap variable
-# nomad/jobs/cluster, whose presence opens the bootstrap.
-- name: Write the retained token of each sealer member
-  ansible.builtin.include_tasks: secrets.yml
-  loop: "{{ range(node_classes.sealer.count | int) | list }}"
-  loop_control:
-    loop_var: workloads_sealer_member
-    label: cluster-{{ workloads_sealer_member }}
-  vars:
-    workloads_secrets_path: nomad/jobs/cluster/cluster-{{ workloads_sealer_member }}
-    workloads_secrets_items:
-      KARDAMOM_RETAINED_TOKEN: "{{ workloads_retained_token }}"
-  when:
-    - workloads_carry_bytes == 'on'
-    - not ansible_check_mode
-
 # The bootstrap opens only for a job that Nomad does not know: the blank
 # members of a registered cluster seed from their peers. Nomad does not
 # know a purged job either, so a purged cluster is re-registered without
@@ -107,11 +89,17 @@
     - not ansible_check_mode
 
 - name: Roll the sealer one member at a time
-  ansible.builtin.include_tasks: sealer_step.yml
+  ansible.builtin.include_tasks: roll_step.yml
   loop: "{{ workloads_sealer_order | default([]) }}"
   loop_control:
-    loop_var: workloads_sealer_group
-    index_var: workloads_sealer_index
+    loop_var: workloads_roll_group
+    index_var: workloads_roll_index
+  vars:
+    workloads_roll_job: cluster
+    workloads_roll_new: "{{ workloads_sealer_new }}"
+    workloads_roll_current: "{{ workloads_sealer_current }}"
+    workloads_roll_order: "{{ workloads_sealer_order }}"
+    workloads_roll_spec: "{{ workloads_sealer_job }}"
   when:
     - workloads_sealer_staged | bool
     - not ansible_check_mode

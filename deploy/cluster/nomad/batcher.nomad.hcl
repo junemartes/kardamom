@@ -76,15 +76,16 @@ variable "datacenter" {
   default     = "dc1"
 }
 
-# Carry mode, "on" or "off" (executor.nomad.hcl). On, the executors run
-# on the sealer nodes, so the block reference queries go to sealer-<i>, not to executor-<i>.
-# The deploy passes it from KARDAMOM_CARRY_BYTES.
-variable "carry_bytes" {
+# The executors on the sealer nodes, "on" or "off" (executor.nomad.hcl).
+# On, the executors run on the sealer nodes, so the block reference
+# queries go to sealer-<i>, not to executor-<i>. The deploy passes it
+# from KARDAMOM_EXEC_ON_SEALERS.
+variable "exec_on_sealers" {
   type    = string
   default = "off"
   validation {
-    condition     = contains(["on", "off"], var.carry_bytes)
-    error_message = "The carry_bytes value must be on or off."
+    condition     = contains(["on", "off"], var.exec_on_sealers)
+    error_message = "The exec_on_sealers value must be on or off."
   }
 }
 
@@ -179,10 +180,13 @@ variable "validator_query_port" {
 job "batcher" {
   # The batcher of this release reads a full reference that a sealer below
   # decision version 5 relays as is (relayed_full_ref). The deploy reads
-  # this meta before it sets a sequencer version floor above 0.
-  meta {
-    relayed_full_ref = "true"
-  }
+  # this meta before it sets a sequencer version floor above 0. A batcher
+  # that reads the canonical stream from the egress carries reads_egress.
+  # The upgrade check of the carry window (feature 5) reads it.
+  meta = merge(
+    { relayed_full_ref = "true" },
+    var.egress_url == "" ? {} : { reads_egress = "true" },
+  )
 
   datacenters = [var.datacenter]
   type        = "service"
@@ -296,7 +300,7 @@ job "batcher" {
             # The block references: the executors' query endpoints by
             # node name, then the validator's by its service record.
             "--block-refs-source", join(",", concat(
-              [for i in range(var.executor_count) : "http://${var.carry_bytes == "on" ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:${var.executor_query_port}"],
+              [for i in range(var.executor_count) : "http://${var.exec_on_sealers == "on" ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:${var.executor_query_port}"],
               ["http://kardamom-validator-query.service.${var.datacenter}.consul:${var.validator_query_port}"],
             )),
             # Group a few blocks per batch. The sealer emits about 1

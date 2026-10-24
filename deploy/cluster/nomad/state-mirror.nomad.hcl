@@ -38,15 +38,16 @@ variable "datacenter" {
   default     = "dc1"
 }
 
-# Carry mode, "on" or "off" (executor.nomad.hcl). On, the executors run
-# on the sealer nodes, so each mirror runs there too, next to its
-# executor. The deploy passes it from KARDAMOM_CARRY_BYTES.
-variable "carry_bytes" {
+# The executors on the sealer nodes, "on" or "off" (executor.nomad.hcl).
+# On, the executors run on the sealer nodes, so each mirror runs there
+# too, next to its executor. The deploy passes it from
+# KARDAMOM_EXEC_ON_SEALERS.
+variable "exec_on_sealers" {
   type    = string
   default = "off"
   validation {
-    condition     = contains(["on", "off"], var.carry_bytes)
-    error_message = "The carry_bytes value must be on or off."
+    condition     = contains(["on", "off"], var.exec_on_sealers)
+    error_message = "The exec_on_sealers value must be on or off."
   }
 }
 
@@ -62,7 +63,7 @@ job "state-mirror" {
 
   constraint {
     attribute = "${meta.role}"
-    value     = var.carry_bytes == "on" ? "sealer" : "executor"
+    value     = var.exec_on_sealers == "on" ? "sealer" : "executor"
   }
 
   group "mirror" {

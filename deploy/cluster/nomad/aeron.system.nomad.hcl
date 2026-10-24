@@ -140,16 +140,17 @@ variable "aeron_threading_mode" {
   }
 }
 
-# Carry mode, "on" or "off". On, the executors run on the sealer nodes
-# (executor.nomad.hcl), so the shared media driver runs there too: the
-# executor and the member feed of the sealer meet on it. The deploy passes
-# it from KARDAMOM_CARRY_BYTES.
-variable "carry_bytes" {
+# The member feed, "on" or "off". On, each sealer member publishes its
+# feed into the shared media driver of its node (cluster.nomad.hcl), so
+# the driver runs on the sealer nodes too. The executor of the member
+# reads the feed there when it runs on that node (executor.nomad.hcl).
+# The deploy passes it from KARDAMOM_MEMBER_FEED.
+variable "member_feed" {
   type    = string
   default = "off"
   validation {
-    condition     = contains(["on", "off"], var.carry_bytes)
-    error_message = "The carry_bytes value must be on or off."
+    condition     = contains(["on", "off"], var.member_feed)
+    error_message = "The member_feed value must be on or off."
   }
 }
 
@@ -168,8 +169,8 @@ job "aeron" {
     value     = "control"
   }
 
-  # Keep the shared media driver off the sealer nodes too, unless carry
-  # mode is on. Without carry mode, they run only the Aeron Cluster
+  # Keep the shared media driver off the sealer nodes too, unless the
+  # member feed is on. Without the feed, they run only the Aeron Cluster
   # (cluster.nomad.hcl), which boots its own embedded
   # ClusteredMediaDriver on a private aeron.dir
   # (.../aeron-mount/cluster-dir), and never touches the shared
@@ -180,13 +181,13 @@ job "aeron" {
   # Ansible mounts the on-node tmpfs independently, so the cluster's
   # cluster-dir is unaffected.
   #
-  # In carry mode, a sealer node also runs the executor of its member.
-  # The executor uses this driver for all its streams, and the member
-  # publishes its feed into it. The archive of this driver records the
-  # exec_txs stream of that executor in /opt/kardamom/archive/dir, beside
-  # the archive of the member in /opt/kardamom/archive.
+  # With the member feed, the member publishes its feed into this
+  # driver. An executor on the sealer node uses this driver for all its
+  # streams. The archive of this driver records the exec_txs stream of
+  # that executor in /opt/kardamom/archive/dir, beside the archive of the
+  # member in /opt/kardamom/archive.
   dynamic "constraint" {
-    for_each = var.carry_bytes == "on" ? [] : ["sealer"]
+    for_each = var.member_feed == "on" ? [] : ["sealer"]
     content {
       attribute = "${meta.role}"
       operator  = "!="
