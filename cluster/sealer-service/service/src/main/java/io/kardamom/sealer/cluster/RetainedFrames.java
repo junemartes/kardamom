@@ -29,6 +29,9 @@ sealed interface RetainedFrames permits HeapFrames, RetainedFile {
     /** The number of retained frames. */
     long count();
 
+    /** The bytes of the retained frames. */
+    long bytes();
+
     /**
      * Whether this store belongs to a member that carries the bytes: only
      * then does the member feed run, so a paired executor reads the bytes

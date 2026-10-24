@@ -194,6 +194,31 @@ fn an_activation_past_the_base_reader_is_a_note() {
 }
 
 #[test]
+fn a_feature_activation_and_a_list_of_activations_parse() {
+    let base = registry([1, 1, 1], "");
+    let both = "activation = [{ flag = \"f\", writes = 2 }, { feature = 5, writes = 3 }]\n";
+    let report = report(&base, &registry([1, 1, 3], both));
+    assert!(report.passed());
+    assert_eq!(report.notes.len(), 2);
+    assert!(
+        report.notes[1].contains("feature 5 writes version 3"),
+        "{:?}",
+        report.notes
+    );
+    assert!(matches!(
+        refusal(&text([1, 1, 2], both)),
+        RegistryError::Activation { writes: 3, .. }
+    ));
+    assert!(matches!(
+        refusal(&text(
+            [1, 1, 2],
+            "activation = { feature = 5, flag = \"f\", writes = 2 }\n"
+        )),
+        RegistryError::Toml(_)
+    ));
+}
+
+#[test]
 fn parse_refuses_bad_versions() {
     assert!(matches!(
         refusal(&text([11, 1, 10], "")),

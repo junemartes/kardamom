@@ -21,7 +21,7 @@ Each `[format.<id>]` entry has these keys:
 | `shared` | `true` when two releases of a mixed fleet read each other's output: wire messages, files that pass between services, and snapshots that a member can get from another member. `false` for a file that one process writes and reads, such as the state database, the spool, and the cursors. |
 | `permanent` | Optional, default `false`. `true` when the data stays for all time, as a KAR1 batch on L1 does. |
 | `code` | One or more `path#symbol` strings: a file that defines the format, and a name in that file. |
-| `activation` | Optional. `{ flag = "...", writes = N }`: the version that the writer writes when an operator switches the flag on. |
+| `activation` | Optional. `{ flag = "...", writes = N }`: the version that the writer writes when an operator switches the flag on. `{ feature = N, writes = M }`: the version that the writer writes after the activation of feature `N` is in the log. A list of both forms is also valid. |
 | `layout` | Optional table `[format.<id>.layout]`: a fingerprint of each part of a frozen layout. |
 
 For a set of message kinds, the version is the highest kind number. A
@@ -65,6 +65,7 @@ The layout tests of the frozen formats:
 | `block-log` | `kardamom-state` | rkyv archived size and alignment of `WriteBatch`, and the bytes of a fixed segment head |
 | `executor-markers` | `kardamom-executor` | the text of a fixed rollback marker, and its parse |
 | `receipt-ledger` | `kardamom-executor` | the slot count and the bytes of a fixed slot, and its decode |
+| `egress-ref-mark` | `kardamom-egress` | the bytes of a fixed mark, and its read |
 | `notifier-outbox` | `kardamom-notifier` | rkyv archived size and alignment of `OutboxRecord` |
 | `redis-cache` | `kardamom-cache` | the keys of fixed samples |
 | `canary-journal`, `canary-store`, `canary-market` | `kardamom-canary` | the JSON of fixed samples |
@@ -108,7 +109,7 @@ These rules apply too:
 - A format that the base does not list is new. It passes.
 - When the base has no `formats.toml`, only the head file is checked.
 - When `activation.writes` falls outside the base read range, the check prints a note:
-  switch the flag on only after no node runs the base.
+  switch the flag on, or send the activation of the feature, only after no node runs the base.
 
 ## The pull request check is incremental
 
@@ -208,8 +209,9 @@ proves each one.
 
 | Reader | Rule | What it makes safe |
 |---|---|---|
-| Sealer ingress dispatch | Every member drops a frame of a kind it does not know, counts it (`cluster DROPPED unknown-kind`), and never orders it. Kind 0 carries one user record, and kind 3 carries a batch of them; every other known kind is a control message. Kind 11, the feature activation, is a control message: a record of feature 3 stores the schedule of decision version 4, a record of feature 4 stores the schedule of decision version 5 while version 4 or 5 runs, and a record of another feature changes no state. No client sends kind 10 or kind 11. The release before this one orders an unknown kind of 85 bytes or more as a user record, so during the first roll to this release no client may send an unknown kind. | A mixed fleet does not fork on a new kind: a member of the old release drops the frame, and a member of the new release sends a state-changing kind only after every member reads it. |
+| Sealer ingress dispatch | Every member drops a frame of a kind it does not know, counts it (`cluster DROPPED unknown-kind`), and never orders it. Kind 0 carries one user record, and kind 3 carries a batch of them; every other known kind is a control message. Kind 11, the feature activation, is a control message: a record of feature 3 stores the schedule of decision version 4, a record of feature 4 stores the schedule of decision version 5 while version 4 or 5 runs, a record of feature 5 stores the schedule of the carry window while version 5 runs on a member without the retained file, and a record of another feature changes no state. No client sends kind 10 or kind 11. The release before this one orders an unknown kind of 85 bytes or more as a user record, so during the first roll to this release no client may send an unknown kind. | A mixed fleet does not fork on a new kind: a member of the old release drops the frame, and a member of the new release sends a state-changing kind only after every member reads it. |
 | Sealer snapshot with a retained file | A member with `kardamom.cluster.carryBytes=true` writes version 17: the state of version 16, then the file section. It restores version 17 and version 12, and stops on any other version. A member without the flag stops on both. `SealerVersionFiveTest` restarts a carrying member from version 17 at each entry, and the member decides as its peer. | A restored member runs the decision version, the switch and the schedule of feature 4 of its peers. A member without the flag never writes version 17, so a rolling deploy of a chain without the flag is safe. |
+| Sealer snapshot with the carry window | A heap member that holds an activation of feature 5 writes version 18: the state of version 16, then the carry window section, then the heap section. Before that record, it writes 14, 15 or 16. A member with the retained file answers feature 5 with `UNSUPPORTED` and stops on version 18. `FormatRegistryTest` checks golden version-18 bytes, and `SealerCarryActivationTest` restores a member at each entry of the switch. | A release changes no snapshot byte until the upgrade transaction of feature 5. A release that reads only up to version 17 stops on version 18, so the preflight refuses a rollback after it. |
 | Sealer `/status` | The admin endpoint reports `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, and `snapshotLatest`, the version of the newest snapshot the member restored or took. | The release gate of a deploy and `just rollback` refuse a sealer release whose `reads_max` is below `snapshotLatest` of any member. That member could not restore its own snapshot after the restart. The check reads `formats.toml` at the revision of the sealer release. The gate checks only a release that changes the sealer job. The check skips a sealer job that Nomad does not know, and refuses while a member does not run. |
 | Rust egress reader | A frame of a kind the reader does not know drops with a warning. Kind 17 (the sealer's rules): an older reader drops it, and only the sequencer reads it. | A sealer can send a new egress kind to the clients of the release before. |
 | Batcher spool | The spool of a layout version lives in `spool/v<N>`. A release opens only its own directory. Every other entry of the root, and a spool whose block does not decode, is dropped with a warning and `kardamom_batcher_spool_dropped_total{reason}`. The range is read again from the sealer. | A spool of either release never stops the batcher. A rollback and a roll forward both start, and the sealer, which keeps every frame above the posted head, serves the dropped range. |

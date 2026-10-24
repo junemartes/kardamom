@@ -14,7 +14,7 @@ use crate::outcome::Outcome;
 use crate::ring::Call;
 use crate::rpc::Rpc;
 
-const NAME: &str = "transfer";
+pub(crate) const NAME: &str = "transfer";
 /// The gas of a plain transfer.
 const TRANSFER_GAS: u64 = 21_000;
 

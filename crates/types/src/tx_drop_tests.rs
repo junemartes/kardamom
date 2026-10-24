@@ -92,10 +92,23 @@ fn the_reason_bytes_keep_their_order() {
         DropReason::FeeCapBelowBaseFee,
         DropReason::Expired,
         DropReason::TipAboveFeeCap,
+        DropReason::SealerRefusedReference,
     ];
     let bytes: Vec<u8> = reasons
         .iter()
         .map(|r| rkyv::to_bytes::<rkyv::rancor::Error>(r).unwrap()[0])
         .collect();
-    assert_eq!(bytes, [0, 1, 2, 3, 4, 5, 6]);
+    assert_eq!(bytes, [0, 1, 2, 3, 4, 5, 6, 7]);
+}
+
+/// The refusal of a reference by the sealer tells the client to send the
+/// transaction again, and has its own metric label.
+#[test]
+fn a_refused_reference_says_send_it_again() {
+    let reason = DropReason::SealerRefusedReference;
+    assert_eq!(
+        reason.text(),
+        "transaction dropped by the sealer, send it again"
+    );
+    assert_eq!(reason.label(), "sealer_refused_reference");
 }

@@ -22,6 +22,8 @@ final class DriverlessLog {
 
     /** The dedup window of every member. */
     static final int CAPACITY = 16;
+    /** The peer chain that every member takes remote-origin records from. */
+    static final long REMOTE_CHAIN = 10L;
     /** The segment size of the retained file of a member that carries the bytes. */
     private static final int SEGMENT_BYTES = 64 * 1024;
 
@@ -56,6 +58,13 @@ final class DriverlessLog {
 
         List<Outcome> applyAll(final List<Entry> log) {
             return log.stream().map(this::apply).toList();
+        }
+
+        /** The pipeline metrics of the member as Prometheus text, with the labels of member 1. */
+        String metrics() {
+            final MetricsText text = new MetricsText(1);
+            svc.metrics().renderTo(text);
+            return text.toString();
         }
 
         /** Every egress frame that the session got, without the status frames. */
@@ -117,7 +126,7 @@ final class DriverlessLog {
         cluster.role = io.aeron.cluster.service.Cluster.Role.FOLLOWER;
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService svc = new SealerClusteredService(
-            CAPACITY, 250, 0, Set.of(), VoidLedger.Config.DISABLED,
+            CAPACITY, 250, 0, Set.of(REMOTE_CHAIN), VoidLedger.Config.DISABLED,
             CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS, orderingWindow, budgets);
         file.ifPresent(svc::carryingBytes);
         svc.start(cluster, snapshot);

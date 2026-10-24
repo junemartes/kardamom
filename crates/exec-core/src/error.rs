@@ -132,6 +132,15 @@ pub enum ExecutorError {
     )]
     SourceRestarted { next_index: u64, next_block: u64 },
 
+    /// Every source of the carried reader holds a transaction reference at
+    /// `index`, and the reader has no `tx_data` lane to join it. Another
+    /// source or a restart gets the same reference, so the consumer stops.
+    /// Only a sequencer that offers a reference makes such an entry.
+    #[error(
+        "no source holds the bytes of the transaction reference at index {index}: the carried reader cannot join it"
+    )]
+    UnjoinableReference { index: u64 },
+
     /// `sequencer_id` is the `tx_data` lane index, `TxRef::shard_id`. It
     /// names the archive that holds the envelope, not the process that
     /// published the ref.
