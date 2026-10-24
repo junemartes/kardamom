@@ -776,6 +776,7 @@ KARDAMOM_CHAOS_CASES="graceful-executor" just shard chaos-executor   # narrow to
 - The operator commands are `kardamom-cluster smoke | diagnostics | scale-sequencers` (`cargo run -p kardamom-chaos --bin kardamom-cluster -- ...`).
 - `kardamom-deploy formats --base <registry> --root <tree>` prints the format findings of the tree against the registry as JSON. The release gate reads them.
 - `kardamom-deploy smoke --rpc-url <ingress> --chain-id <id>` sends one signed transfer from a genesis account (`--account`, default `0`) and waits one minute for its receipt. The canary gate of the deploy runs it.
+  - While the ingress answers the nonce read with `account state unavailable`, the read repeats each second, for at most 60 s. Any other error fails the smoke at once.
 
 The shards, their cases, the gates, the load verdict, the L1 fault proxy and the knobs are in [`../../docs/chaos-suite.md`](../../docs/chaos-suite.md).
 
