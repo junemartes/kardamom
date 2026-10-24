@@ -58,7 +58,10 @@ public final class SealerClusteredService implements ClusteredService {
 
     /**
      * One record held in the ordering window: the parsed guard header, the
-     * relayed payload, and the session to answer a reject to.
+     * relayed payload, the session to answer a reject to, and whether the
+     * session offered a full reference. A member with the retained file
+     * relays a full reference as a canonical entry, so the payload alone
+     * does not tell.
      */
     private static final class HeldRecord {
         final ClientSession session;
@@ -67,16 +70,18 @@ public final class SealerClusteredService implements ClusteredService {
         final long nonce;
         final long deadline;
         final byte[] payload;
+        final boolean fullRef;
 
         HeldRecord(
                 final ClientSession session, final byte[] canonicalId, final byte[] sender,
-                final long nonce, final long deadline, final byte[] payload) {
+                final long nonce, final long deadline, final byte[] payload, final boolean fullRef) {
             this.session = session;
             this.canonicalId = canonicalId;
             this.sender = sender;
             this.nonce = nonce;
             this.deadline = deadline;
             this.payload = payload;
+            this.fullRef = fullRef;
         }
     }
 
@@ -440,7 +445,7 @@ public final class SealerClusteredService implements ClusteredService {
     private void publishRules() {
         publishedRules = rulesView();
         metrics.rules(new SealerMetrics.Rules(retainedFile.isPresent(), egress.windowOnly(),
-            state.decisionVersion(), state.carryWindowRules(), state.features()));
+            state.decisionVersion(), state.carryWindowRules(), state.features(), state.carryWindowFeature()));
     }
 
     /**
@@ -1023,6 +1028,7 @@ public final class SealerClusteredService implements ClusteredService {
         final long tipLo = buffer.getLong(offset + SealerWire.TIP_OFFSET, ByteOrder.LITTLE_ENDIAN);
         final long tipHi =
             buffer.getLong(offset + SealerWire.TIP_OFFSET + Long.BYTES, ByteOrder.LITTLE_ENDIAN);
+        final boolean fullRef = buffer.getByte(offset + SealerWire.RECORD_TYPE_OFFSET) == SealerWire.RT_TXREF_OFFER;
         final Optional<byte[]> relay = relayOf(RelayShape.INGRESS_RECORD.payload(buffer, offset, length));
         if (relay.isEmpty()) {
             onMalformedFrame("canonical-entry-on-ingress", length);
@@ -1031,7 +1037,7 @@ public final class SealerClusteredService implements ClusteredService {
         final byte[] payload = relay.get();
         final boolean opened = window.isEmpty();
         final boolean full = window.add(
-            sender, tipHi, tipLo, new HeldRecord(session, canonicalId, sender, nonce, deadline, payload));
+            sender, tipHi, tipLo, new HeldRecord(session, canonicalId, sender, nonce, deadline, payload, fullRef));
         if (full) {
             flushWindow();
             return;
@@ -1136,12 +1142,13 @@ public final class SealerClusteredService implements ClusteredService {
     }
 
     /**
-     * Relay a record that the record path took. A full reference on this
-     * path is one that the member orders below decision version 5: it
-     * relays as is, with its record type, and is counted.
+     * Relay a record that the record path took, and count a full reference
+     * that the member orders below decision version 5. A heap member relays
+     * it as is, with its record type. A member with the retained file
+     * relays it as a canonical entry.
      */
     private void onRelayed(final HeldRecord r, final Optional<Relayed> relayed) {
-        if (r.payload[CanonicalSealerState.CANONICAL_ID_LEN] == SealerWire.RT_TXREF_OFFER) {
+        if (r.fullRef && state.decisionVersion() < VersionSwitch.CARRY_VERSION) {
             metrics.fullRefBelowV5();
         }
         relayed.ifPresent(egress::offerRelayed);
@@ -1299,7 +1306,7 @@ public final class SealerClusteredService implements ClusteredService {
         buffer.getBytes(offset + SealerWire.CANONICAL_ID_OFFSET, payload);
         return new HeldRecord(session, id, sender,
             buffer.getLong(offset + SealerWire.NONCE_OFFSET, ByteOrder.LITTLE_ENDIAN),
-            buffer.getLong(offset + SealerWire.DEADLINE_OFFSET, ByteOrder.LITTLE_ENDIAN), payload);
+            buffer.getLong(offset + SealerWire.DEADLINE_OFFSET, ByteOrder.LITTLE_ENDIAN), payload, false);
     }
 
     /**

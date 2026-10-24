@@ -670,7 +670,7 @@ A ClusteredService cannot see its idle time, so the loop exports busy time only.
 | `kardamom_sealer_window_exact` | 1 when the egress keeps only its replay window, at any posted head. |
 | `kardamom_sealer_decision_version` | The decision version of the open block. |
 | `kardamom_sealer_feature_state{feature}` | Features 3, 4 and 5: 0 no activation held, 1 held and off, 2 on. |
-| `kardamom_sealer_feature_activation_ms{feature}` | The time of the newest held activation of the feature, 0 when none. |
+| `kardamom_sealer_feature_activation_ms{feature}` | The time of the newest held activation of the feature, 0 when none. A held activation with time 0 whose epoch is not sealed yet also reports 0: the time resolves when the activation becomes visible. Use `kardamom_sealer_feature_state` to tell it from no activation. |
 | `kardamom_sealer_feature_unsupported_total` | The activations of feature 5 on a member with the retained file. The member never stores them. |
 | `kardamom_sealer_snapshot_bytes`, `kardamom_sealer_snapshot_version` | The size and the version of the newest snapshot that the member took or restored. |
 | `kardamom_sealer_ref_refused_total` | The references of record type 0 that the carry window refused with egress kind 18. |

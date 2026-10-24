@@ -432,7 +432,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.voidWindow` | `65536` | yes | The number of newest canonical indices that a void can name. |
 | `kardamom.cluster.daLagBudgetBlocks` | `10000` (env `DA_LAG_BUDGET_BLOCKS`) | yes | The DA-lag budget in blocks. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. |
 | `kardamom.cluster.recordLagBudget` | `0` (env `KARDAMOM_RECORD_LAG_BUDGET`) | yes | The record-lag budget in canonical records. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. In this release a value above `0` also stops the start, because the snapshot writer writes version 10. |
-| `kardamom.cluster.retention` | `65536` | no, raise only | The egress frames kept for replay: the minimum under the posted rule, and the exact window under decision version 5 with the carry window or with `carryBytes`. The largest supported value is 131072. |
+| `kardamom.cluster.retention` | `65536` | no, raise only (the deploy gate enforces it) | The egress frames kept for replay: the minimum under the posted rule, and the exact window under decision version 5 with the carry window or with `carryBytes`. The largest supported value is 131072. The service does not check the cap: the deploy gate enforces it. |
 | `kardamom.cluster.carryBytes` | `false` | yes | `true` keeps the retained frames in an append-only file, not on the heap, and writes snapshot version 17. It also relays a full entry as a canonical entry, and drops the void request and the recorded cursor. The release gate refuses a rolling change of it. It needs `adminPort`, the env var `KARDAMOM_RETAINED_TOKEN` and a `snapshotIntervalS` above `0`. Any value other than `true`, `false` or empty stops the start. See [Retained file](#retained-file). |
 | `kardamom.cluster.feedAeronDir` | empty (off) | no | The directory of the media driver that the member shares with its paired executor. A value turns the member feed on. It needs `carryBytes=true`; without it the start stops. See [Member feed](#member-feed). |
 | `kardamom.cluster.feedRingBytes` | `16777216` (16 MiB) | no | The frame ring of the member feed, off the heap. A power of two of at least 8 MiB; another value stops the start. |
@@ -472,7 +472,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
   - The cap: 131072 frames, and `retention x mean frame bytes <= 32 MiB`. The mean is `kardamom_sealer_retained_bytes / kardamom_sealer_retained_frames` at the time of the deploy.
     - Why: a replay over a cluster session queues every wanted frame at once. A session whose backlog passes 64 MiB (`SessionBacklogs.BYTE_LIMIT`) is closed. A reader that replays from near the floor of a larger window is closed, reconnects, and replays again, with no end.
     - 131072 frames of about 300 bytes are about 39 MB. A larger mean frame gives a lower cap. This design supports no larger value: the cap covers 60 s up to about 2180 tx/s.
-  - A rolling change may only raise `retention`, and it stays at or below the cap.
+  - A rolling change may only raise `retention`, and it stays at or below the cap. The deploy gate enforces both rules. The service checks neither.
     - During a roll, two members can keep two windows. That changes no decision and no byte of the state section. It changes only the frames that each member can replay, and the size of the heap section of its snapshot.
     - So the snapshot sizes of the members differ during a roll of `retention`. No protocol compares snapshot bytes across members. Members with the same value write the same bytes.
 - `carryBytes`: the deploy does not pass it yet, so the retained frames stay on the heap.
@@ -656,8 +656,8 @@ Version 5 is version 4 that relays the bytes of a transaction. The sequencer off
 
 The rules change at two points of one log entry:
 
-1. The flag changes at the boundary inside the entry: a timer tick, or the boundary that an epoch (ingress kind 4) forces in front of it. Only an epoch forces a boundary, and a kind-3 batch never holds one. So the refusal applies from the first record of the block that the boundary opens.
-2. The eviction rule changes at the end of that entry. The frames of the entry go in under the old rule, and the prune at the end applies the new rule. For a forced boundary, that entry holds the boundary frame and the epoch frame. The member then asks for a snapshot, so a replay has a start point on each side.
+1. The flag changes at the boundary inside the entry: a timer tick, or the boundary that an origin record or a remote-origin record (ingress kinds 4 and 5) forces in front of it. Only these two kinds force a boundary, and a kind-3 batch never holds one. So the refusal applies from the first record of the block that the boundary opens.
+2. The eviction rule changes at the end of that entry. The frames of the entry go in under the old rule, and the prune at the end applies the new rule. For a forced boundary, that entry holds the boundary frame and the frame of the record that forced it. The member then asks for a snapshot, so a replay has a start point on each side.
 
 A restore runs `restore`, then the rules of the snapshot, then the posted head. So the restored frames are pruned by the rule of the snapshot. Both points are functions of the log, and a snapshot falls only between entries. So every member, from the log or from a snapshot, switches at the same points and keeps the same bytes.
 
@@ -700,7 +700,7 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
   | `kardamom_sealer_window_exact` | 1 when the egress keeps only its replay window, else 0 |
   | `kardamom_sealer_decision_version` | the version of the open block |
   | `kardamom_sealer_feature_state{feature="3"\|"4"\|"5"}` | 0 no activation held, 1 held and off, 2 on |
-  | `kardamom_sealer_feature_activation_ms{feature}` | the time of the newest held activation, 0 when none |
+  | `kardamom_sealer_feature_activation_ms{feature}` | the time of the newest held activation, 0 when none. A held activation with time 0 that is not visible yet also shows 0: `feature_state` tells the two apart |
   | `kardamom_sealer_feature_unsupported_total` | the records of feature 5 on a member with the retained file |
   | `kardamom_sealer_snapshot_bytes` | the size of the newest snapshot that the member took or restored |
   | `kardamom_sealer_snapshot_version` | the version of that snapshot |
