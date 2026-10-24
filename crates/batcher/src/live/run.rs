@@ -407,7 +407,11 @@ impl RunConfig {
         base: &str,
         cursor: kardamom_engine::reader::cluster::ReplayCursor,
     ) -> Result<Ordering> {
-        let sub = bin_support::open_egress(rt, &mut self.plane, base.to_owned(), cursor)?;
+        let source = bin_support::EgressSource {
+            base: base.to_owned(),
+            cursor_gauge: super::live_metric_names::EGRESS_CURSOR_INDEX,
+        };
+        let sub = bin_support::open_egress(rt, &mut self.plane, source, cursor)?;
         let (cluster_guard, ingress) = bin_support::connect_cluster_publisher(
             args.aeron_dir.as_deref(),
             self.file_cfg.cluster.to_live(),

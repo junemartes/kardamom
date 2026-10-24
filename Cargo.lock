@@ -4030,6 +4030,7 @@ dependencies = [
  "hyper-util",
  "kardamom-cache",
  "kardamom-cluster-adapter",
+ "kardamom-formats",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-types",
