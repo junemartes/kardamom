@@ -1,8 +1,8 @@
 # Stateless ingress on cpx32, and the egress as the transaction source
 
-- Status: revision 2, draft for review. Not implemented.
-- Revision 2 answers the design review of revision 1 (findings R1 to R10). Section 14 maps each
-  finding to its change.
+- Status: revision 3, draft for review. Not implemented.
+- Revision 2 answers the design review of revision 1 (findings R1 to R10). Revision 3 answers the
+  review of revision 2 (findings S1 to S8). Section 14 maps each finding to its change.
 - The user decided on 2026-10-24:
   - All services get their transaction data from the egress.
   - No Aeron archive records `tx_data` or `tx_deposits`. Only the sealer commits and keeps the
@@ -214,7 +214,7 @@ Sources:
   - An instance that does not answer is not a refusal. When no instance answers, the transport
     reports a failed connection, as today, and the reader asks again.
 - This change is in the engine, so the validator and the carry-mode executors get it too.
-- A metric: `kardamom_reader_egress_floor_retries_total{reader}`, the 410 answers that another
+- A metric: `kardamom_reader_egress_floor_retries_total`, the 410 answers that another
   instance served.
 
 **The cluster session as the second source of the batcher (F13).**
@@ -222,20 +222,38 @@ Sources:
 - A new transport, `ClusterTransport`, reads the cluster session of the sealer: `REPLAY_FROM` at
   the cursor, then the live frames, as the executor in reference mode reads today. It implements
   `Transport` (`carried/transport.rs`).
-- The batcher in egress mode opens `CarriedSubscription::new(egress, cluster, cursor)`: the egress
+- **A switch, off by default.** The job variable `batcher_second_source = cluster|none`, default
+  `none`. With `none`, the batcher opens `NoSource` as today. With `cluster`, it opens
+  `CarriedSubscription::new(egress, cluster, cursor)`: the egress first, the sealer second. The job
+  meta `egress_two_sources = "true"` is set only with `cluster`.
+  - Why off by default: before feature 5, the sealer window still holds type-0 references (carry
+    spec 1.3, F2). A 410 from every egress instance would then send the batcher to the sealer, which
+    answers with a reference. With the `Unjoinable` verdict of carry C5 (#785), the batcher would
+    stop with `UnjoinableReference`, not with the halt of today.
+  - The deploy turns it on at step 4 of 5.4, after every executor is in carry mode and every
+    reader cursor is past R. The preflight of the switch refuses `cluster` unless every member
+    reports `carryWindow` true.
+- With `cluster`, the batcher opens the two sources: the egress
   first, the sealer second. Today it opens `NoSource` as the second source
   (`bin_support.rs:424-433`), and keeps a cluster session only to publish the posted cursor
   (`run.rs:403-422`). The same session serves both.
 - After feature 5, each `RT_TX` frame of a heap member holds its bytes (carry spec 1.1), and no
   type-0 reference comes (carry spec 4.3). So the sealer window is a source that needs no join.
-- The sealer window covers the batcher only when the posted cursor is inside it. The carry spec
-  sizes `retention` for 60 s at the planned rate (carry spec 4.4). This spec adds one rule to the
-  preflight of carry C6: `retention` must also cover the frames between two posts of the batcher
-  at the planned rate, with a margin of 2.
+- **The window is short.** Under the carry window, a member keeps exactly `retention` frames, and
+  it no longer keeps the frames above the posted head (carry spec 4.4). At 65,536 frames that is
+  about 30 to 60 s at the planned rates. The DA-lag guard allows 10,000 unposted blocks, about
+  5.5 hours at one block each 2 s. So the second source covers a double egress loss only when the
+  posted cursor of the batcher is within one window of the sealed head. In normal operation the
+  batcher posts often enough for that. In a DA outage it does not.
+- **The retention rule.** This spec adds one rule to the preflight of carry C6: `retention` must
+  also cover the frames between two posts of the batcher at the planned rate, with a margin of 2.
+  The rule makes the second source cover the normal case. It does not cover a DA outage.
 - **The hazard.** The carry spec keeps the bytes on the cluster sessions for now, and plans a later
   change that strips them (carry spec 2, non-goal 3). That change must keep the bytes on the
-  session of the batcher, or give the batcher another second source. Section 13 (Q5) asks the
-  user.
+  session of the batcher, or give the batcher another second source.
+- **The residual risk.** A DA outage longer than the window, plus a loss of both egress stores,
+  leaves no copy of the unposted blocks except the `exec_txs` recordings, which no reader reads.
+  Section 13 (Q5) asks the user.
 - The validator keeps `NoSource` as its second source. Below the egress floor it takes a peer
   checkpoint, as today.
 
@@ -340,8 +358,21 @@ local map of three kinds. Each group constrains on `${meta.aeron_driver}`:
 
 - **The wait for the old driver.** Before it starts the JVM, the entrypoint checks `cnc.dat` in
   `AERON_DIR`. While the heartbeat of that file is younger than the driver timeout, it waits, up
-  to the driver timeout plus 5 s. The check uses `CommonContext.isDriverActive` of the same jar.
-  This applies to every kind. Today only Nomad's restart delay protects a restart of the same
+  to the driver timeout plus 5 s. This applies to every kind.
+  - **The mechanism.** The entrypoint is a shell script, so the check needs a main class. E3 adds
+    a small class, `io.kardamom.aeron.DriverStale`, to the jar that the image already builds for
+    its idle strategy (`crates/log/docker/aeron/Dockerfile:35-37`,
+    `CappedBackoffIdleStrategy.java`). Its `main` calls `CommonContext.isDriverActive` on
+    `AERON_DIR` with the driver timeout, and exits 0 when no driver is active. The entrypoint
+    runs it in a loop. A read of the heartbeat offset of `cnc.dat` from the shell is not chosen:
+    the offset is bound to the Aeron version.
+  - **The test.** A shell test of the image, next to `idle-cap-cases.txt`: with a fresh `cnc.dat`
+    of a running driver, the start waits. When that driver stops, the start follows within the
+    driver timeout plus 5 s. With no `cnc.dat`, the start is at once.
+  - **The common case is the full timeout.** The job sets no `aeron.dir.delete.on.shutdown`
+    (`aeron.system.nomad.hcl:246-272`, `crates/log/docker/aeron/entrypoint.sh:64-81`), so a stopped driver leaves `cnc.dat` in place. Its last
+    heartbeat is at the stop, so the new driver waits about the driver timeout: 10 s at the
+    default. Today only Nomad's restart delay protects a restart of the same
   task (F10). It does not protect the start of a task of another group on the same `aeron.dir`.
 - **The start wait.** It looks for `archive.catalog` and `cnc.dat` for 30 s
   (`entrypoint.sh:84-100`). With the plain class, it waits only for a new `cnc.dat`.
@@ -406,8 +437,9 @@ The order of the findings holds. This spec adds two steps (marked new):
 1. The batcher and the validator read `--egress` (carry spec 12, step 4).
 2. Feature 5 is on, with the window (carry spec 12, steps 8 and 9).
 3. Every executor is in carry mode, and every reader cursor is past R (carry spec 12, step 10).
-4. (new) The readers of 4.3 are deployed: the egress reader asks every instance, and the batcher
-   has the cluster session as its second source.
+4. (new) The readers of 4.3 are deployed: the egress reader asks every instance. Then the deploy
+   sets `batcher_second_source = cluster`, so the batcher has the cluster session as its second
+   source. This is safe only now: every executor is in carry mode, and feature 5 refuses type 0.
 5. The deploy removes the ingress recorder, `--archive-durability` of the ingress and of the
    da-watcher, and the `tx_data` and `tx_deposits` topics. The preflight of this step refuses
    unless:
@@ -446,9 +478,18 @@ The order of the findings holds. This spec adds two steps (marked new):
     `2^64 - 1` (off), and a time ahead, which turns it off until that time (carry spec 4.1);
   - the deploy refuses `KARDAMOM_SEALER_VERSION_FLOOR` below 5;
   - the deploy refuses an empty `KARDAMOM_CARRY_EXECUTORS`, and a list that leaves out an executor.
+- **The floor must be set on each deploy.** An empty `KARDAMOM_SEALER_VERSION_FLOOR` is 0 (carry
+  spec 5). So after Part B every staging deploy must set the floor. The infra workflow passes it
+  from a repository variable, `KARDAMOM_SEALER_VERSION_FLOOR=5` (infra follow-up I5). The gate
+  then refuses a deploy with no value.
 - **A fleet rebuild from a seed** needs floor 0 (carry spec 5). After Part B it also needs the
-  `tx_data` archive back first: deploy the ingress with `--archive-durability`, then follow the
-  runbook. The gates then fall away by the job meta.
+  `tx_data` archive back first, in this order:
+  1. Set `aeron_driver = archive` on ingress-0, then on ingress-1, one at a time (5.2). The
+     ingress nodes run the plain driver after Part B (section 10, step 9).
+  2. Restore `archive_topics = tx_data` on the ingress nodes.
+  3. Deploy the ingress with `--archive-durability`. Without step 1, its start waits on recorders
+     that no archive serves (F9).
+  4. Follow the runbook. The gates then fall away by the job meta.
 - **The runbook.** "To go back" of `docs/runbooks/carry-window-rollout.md` gets the same rule.
   C9 (#794) can take the line.
 
@@ -512,7 +553,10 @@ notifier-1 ansible_host=10.20.0.59 kardamom_node=notifier-1 role=notifier node_r
   adds up to about 1 ms to a notifier event. The notifier is off the transaction path. On the
   ingress nodes the driver sits at its 768 MB limit at 77 to 82 % CPU at rest, mostly a spin at the
   50 µs cap. On a notifier node the driver carries only the streams of the notifier, so about
-  512 MB is expected. The rollout measures it, then lowers `driver_quiet_memory_mb`.
+  512 MB is expected.
+- **The order of the memory.** Until it is measured, the driver reservation stays 768 MB. On a 2 GB
+  node that leaves little room (the fit below). So: measure the driver on notifier-0 in the ramp,
+  then lower `driver_quiet_memory_mb`, then add notifier-1 (section 10, step 5).
 - **The fit on cpx12.** 2 GB of RAM holds:
   - the notifier, 512 MB;
   - the driver, 768 MB at first, about 512 MB after the measure;
@@ -668,7 +712,7 @@ node, if the numbers show that the verifier still competes for the CPU (Q1).
 | One egress instance down | The other serves the range read and `egress_order`. The restarted instance fills from its peer (`crates/egress/src/main.rs:96-106`). | 2 instances, `distinct_hosts`. |
 | One egress instance with a high floor (a fresh or rebased instance, F12) | A reader that reaches it gets a 410. The transport asks the other instance, which serves the range (4.3). | E1a. The counter `kardamom_reader_egress_floor_retries_total`. |
 | Every egress instance down | The batcher reads the sealer window (4.3), then waits. The validator stops moving. The carry executors run on the member feed, but cannot recover below the sealer window. The sequencers get no account rows, so admission refuses the senders with pending transactions (one-way spec 6.3). The notifier gets no receipts (`--receipts-from-egress`). The DA-lag guard stops user records after 10,000 unposted blocks. | The alerts of the egress. Restart an instance with its store. |
-| Both egress stores lost | The new instances start after the next boundary of a copy (F12). The blocks between the posted head and that boundary have no egress copy. The batcher reads them from the sealer window, when its posted cursor is inside it (4.3). Else it halts. The validator takes a peer checkpoint. | E1b, and the `retention` rule of 4.3. |
+| Both egress stores lost | The new instances start after the next boundary of a copy (F12). The blocks between the posted head and that boundary have no egress copy. With `batcher_second_source = cluster`, the batcher reads them from the sealer window, but only when its posted cursor is within one window of the sealed head: `retention` frames, about 30 to 60 s at the planned rates (4.3). Else it halts. In a DA outage longer than the window, no copy is left except the `exec_txs` recordings (Q5). The validator takes a peer checkpoint. | E1b, the `retention` rule of 4.3, Q5. |
 | An egress behind | The readers lag. The distance gauge `kardamom_egress_head_distance_frames` and its alert show it. No loss. | One-way spec 6.4. |
 | The batcher below every egress floor and the sealer window | It halts with `ReplayUnavailable` and both floors (4.3). | The floor alert of 4.3. `--keep-blocks` is far above the DA-lag budget. |
 | A driver switch on one node | Its clients restart, an estimated 30 to 60 s (5.2). | The stale wait of E3. One node at a time, at low load. The measure in the container shard first. |
@@ -722,11 +766,12 @@ The user's last pool shape was min 2 and max 3 cpx32. These blockers stay open:
 Each step names its checks. Do not start a step until the checks of the step before pass.
 **A step marked "needs the user's explicit approval" does not start without it.**
 
-0. **The container shard first.** Run the no-archive profile of the `carry` shard (10.1). It
-   measures the downtime of a driver switch for each kind. No staging node switches its driver
-   before this measure passes.
+0. **The switch case first.** Run the switch case of E4 on the existing container profile: the
+   archive driver on every node, then one node of each kind switched to plain and back. It
+   measures the downtime of a driver switch. No staging node switches its driver before this
+   measure passes. The no-archive profile belongs to E8.
 1. **Release 1.** It holds E1, E1a, E1b, E2, E3, E4 and E5 (section 11), with every switch at
-   today's value. Before the aeron job, apply `aeron_driver = archive` to every live node (5.2),
+   today's value. `batcher_second_source` is `none`. Before the aeron job, apply `aeron_driver = archive` to every live node (5.2),
    so every node keeps the archive group.
    - Every `aeron` allocation keeps its id: no driver restarted.
    - The notifier still runs on the ingress nodes. The canary passes.
@@ -762,9 +807,13 @@ Each step names its checks. Do not start a step until the checks of the step bef
    - Each node: the `aeron-plain` allocation runs, the services on it are healthy, and the node
      has no `kardamom-aeron-archive` record. The downtime is within the measure of step 0.
    - Each sequencer: `kardamom_sequencer_sealer_version` 5, receipts land.
-8. **The readers of 4.3**, after step 4 of the carry rollout. Deploy the validator and the
-   batcher with `--egress-instances`. Restart one egress instance with an empty store.
-   - The counter `kardamom_reader_egress_floor_retries_total` moves, and no reader halts.
+8. **The readers of 4.3.**
+   1. After step 4 of the carry rollout: deploy the validator and the batcher with
+      `--egress-instances`. Restart one egress instance with an empty store. The counter
+      `kardamom_reader_egress_floor_retries_total` moves, and no reader halts.
+   2. After step 10 of the carry rollout (every executor in carry mode, every reader cursor past
+      R): deploy the batcher with `batcher_second_source = cluster` (5.4, step 4). Its preflight
+      must pass. The job meta `egress_two_sources` is `"true"`.
 9. **Part B** (5.4), after step 10 of the carry rollout:
    - Deploy E6. Its preflight must pass. The gates of 5.5 are on from this deploy.
    - Set `aeron_driver = plain` on ingress-0, then on ingress-1.
@@ -843,15 +892,16 @@ Each PR passes `just style` and CI alone, and follows `docs/STYLE.md`.
 |---|---|---|---|---|
 | E1 | kardamom | batcher: the halt names both floors, and egress mode fetches no block references; egress: floor and head gauges; deploy: the `--keep-blocks` check and the floor alert | none | S |
 | E1a | kardamom | engine: the egress transport asks every instance before `Unavailable`, the lowest floor, the retry counter; deploy: `--egress-instances` for the validator, the batcher and the carry executors | none | M |
-| E1b | kardamom | engine, batcher: `ClusterTransport`, the cluster session as the second source of the batcher in egress mode, batcher job meta `egress_two_sources`; deploy: the `retention` rule against the post interval | E1a | M |
+| E1b | kardamom | engine, batcher: `ClusterTransport`, the cluster session as the second source of the batcher in egress mode behind `batcher_second_source` (default `none`), its preflight, the job meta `egress_two_sources` only with `cluster`; deploy: the `retention` rule against the post interval | E1a | M |
 | E2 | kardamom | ingress: `--verify-workers`; deploy: `ingress_verify_workers` | #792 | S |
-| E3 | kardamom | aeron image: the wait for a stale `cnc.dat` before the start, and the start wait of the plain class; job meta `driver_waits_stale` | none | S |
+| E3 | kardamom | aeron image: the class `DriverStale` and the wait for a stale `cnc.dat` before the start, the start wait of the plain class, the shell test; job meta `driver_waits_stale` | none | S |
 | E4 | kardamom | deploy: the aeron job by `aeron_driver` (three groups), the node meta, the meta apply of release 1, `idle_cap_quiet_us`, `driver_quiet_memory_mb`, tests; chaos: the container case that switches the driver of one node of each kind and measures the downtime | E3 | M |
 | E5 | kardamom | deploy: the notifier on the `notifier` role: constraint, `notifier_count` with its preflight, peers, instance count, 512 MB, README | none | S |
 | I1 | infra | #67, load-0 | none | merged |
 | I2 | infra | #79: ingress-0 and ingress-1 on cpx32, `keep_disk`, notifier-0 on cpx12, the role, `server_budget = 20` | I1 | approved |
 | I3 | infra | `aeron_tmpfs_size: 384m` on the notifier nodes | I2 | S |
-| I4 | infra | notifier-1 on cpx12, the inventory line, the tests | I2, step 4 of section 10 | S |
+| I4 | infra | notifier-1 on cpx12, the inventory line, the tests | I2, step 5 of section 10 | S |
+| I5 | infra | the workflow: `KARDAMOM_SEALER_VERSION_FLOOR` from a repository variable, set to 5 | before step 9 of section 10 | S |
 | E6 | kardamom | deploy: no `tx_data` and no `tx_deposits` recording: the ingress and da-watcher flags, `archive_topics`, the job meta `tx_data_recorded`, the preflight of 5.4, the gates of 5.5, tests | carry C6 (#791), E1, E1a, E1b, E4 | M |
 | C9 | kardamom | #794 (open): the line of 5.5 in "To go back" of `docs/runbooks/carry-window-rollout.md` | none | S |
 | E7 | kardamom | deploy: remove the two archive lists, the contract checks and the refetch flags and ports of the readers | E6 on staging | S |
@@ -894,10 +944,14 @@ of section 10.
   that network, and a fleet rebuild from a seed needs the `tx_data` archive back first.
   Recommendation: accept it. The alternative is to keep the `tx_data` archive, which the user ruled
   out.
-- **Q5. The bytes on the session of the batcher.** The carry spec plans a later change that
-  strips the bytes from the cluster sessions. The batcher then loses its second source (4.3).
-  Recommendation: that change keeps the bytes on the sessions that ask for them, and the batcher
-  asks.
+- **Q5. The second source of the batcher, and the risk that stays.**
+  - The residual risk: a DA outage longer than the sealer window, plus a loss of both egress
+    stores, leaves no copy of the unposted blocks except the `exec_txs` recordings, which no
+    reader reads (4.3). Recommendation: accept it on staging. Open an issue for a recovery from the
+    `exec_txs` recordings, or a third egress instance, before a production network.
+  - The strip of the bytes: the carry spec plans a later change that strips the bytes from the
+    cluster sessions. The batcher then loses its second source. Recommendation: that change keeps
+    the bytes on the sessions that ask for them, and the batcher asks.
 - **Q6. When to delete the old recordings** (section 10, step 11). Recommendation: after a soak of
   7 days, not 24 hours.
 
@@ -907,7 +961,9 @@ The answers of revision 1 that changed:
 - The loss of both egress stores (Q5 of revision 1): no longer "accept". The batcher reads the
   sealer window as its second source (4.3).
 
-## 14. Changes from revision 1
+## 14. Changes from the reviews
+
+### 14.1 Revision 2: the review of revision 1
 
 | Finding of the review of revision 1 | Change |
 |---|---|
@@ -921,3 +977,16 @@ The answers of revision 1 that changed:
 | R8. `max_kill_timeout`; the rule of #792 | Section 7.1: the default is 30 s. Section 7.2: the minimum per worker. Section 10.1: the test. |
 | R9. The tmpfs on cpx12 | Section 6.2: the tmpfs in the fit, its size on the notifier nodes. Section 10: the measure. Section 11: I3. |
 | R10. The `tx_data` chaos cases and the contract test | Section 5.1: two rows. Section 10.1 and E8: aimed at `exec_txs`, or retired. |
+
+### 14.2 Revision 3: the review of revision 2
+
+| Finding of the review of revision 2 | Change |
+|---|---|
+| S1 (major). The second source of the batcher has no switch, and meets type-0 references before feature 5 | Section 4.3: `batcher_second_source = cluster|none`, default `none`, its preflight, the meta only with `cluster`. Section 10: step 1 (`none`) and step 8.2 (on after carry step 10). Section 11: E1b. |
+| S2 (major). The sealer window is short under the carry window | Section 4.3: the window against the DA-lag budget, the retention rule kept, the residual risk. Section 8: the row of both stores lost. Section 13: Q5. |
+| S3. The stale check needs a main class | Section 5.2: the class `DriverStale` in the jar of the image, why not the heartbeat offset, the shell test, and the full timeout because `cnc.dat` stays. Section 11: E3. |
+| S4. The seed rebuild needs the archive driver back | Section 5.5: the order, with `aeron_driver = archive` on the ingress nodes before the recorders. |
+| S5. Step 0 ran the profile of E8 before release 1 | Section 10: step 0 is the switch case of E4 on the existing container profile. |
+| S6. An empty floor is 0 | Section 5.5: every deploy sets the floor. Section 11: I5. |
+| S7. The driver memory before notifier-1 | Section 6.2: measure, then lower `driver_quiet_memory_mb`, then notifier-1. |
+| S8. The `reader` label repeats `service` | Section 4.3 and section 10: the label goes (`crates/obs/src/lib.rs:219-220`). |
