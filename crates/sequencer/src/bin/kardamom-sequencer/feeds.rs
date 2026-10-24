@@ -46,7 +46,7 @@ use kardamom_sequencer::fees::{FeeGate, LatestBaseFee};
 use kardamom_sequencer::inbound::{Inbound, TxDataSubscriber};
 use kardamom_sequencer::lookup::LookupRequester;
 use kardamom_sequencer::metrics as seq_metrics;
-use kardamom_sequencer::outbound::{SideChannels, TxOrderingRefPublisher};
+use kardamom_sequencer::outbound::{DropPublisher, SideChannels, TxOrderingRefPublisher};
 use kardamom_sequencer::pump::Pump;
 use kardamom_sequencer::resync::{
     ResyncController, SealerAnswer, SealerRefusal, SharedWatermark, elapsed_ms_saturating,
@@ -125,7 +125,7 @@ impl TxDataSubscriber for LaneSubscriptions {
 /// thread, which may be mid-reconnect after a process freeze. A detector
 /// that only runs when the publish loop runs would miss the freeze
 /// entirely.
-pub(crate) struct EgressWatermarkFeed {
+pub(crate) struct EgressWatermarkFeed<D> {
     silence_ms: u64,
     partition: u32,
     watermark: SharedWatermark,
@@ -152,13 +152,14 @@ pub(crate) struct EgressWatermarkFeed {
     /// snapshot budget: the leader sends no boundary until the snapshot
     /// is complete, so that gap is neither a lag nor a lost quorum.
     silence: SilenceDeadline,
-    /// The sealer's decision version for the current session.
-    rules: SealerRules,
+    /// The kept decision version of the sealer, and the drops of the
+    /// references that it refused.
+    rules: SealerRules<D>,
     /// Idle while the receive waits, busy while a frame is handled.
     meter: LoopMeter,
 }
 
-impl EgressWatermarkFeed {
+impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
     pub(crate) fn new(
         silence_ms: u64,
         partition: u32,
@@ -166,9 +167,8 @@ impl EgressWatermarkFeed {
         answer_tx: crossbeam_channel::Sender<SealerAnswer>,
         deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
         origins: OriginSignalTx,
-        sealer_version: SealerVersion,
+        rules: SealerRules<D>,
     ) -> Self {
-        let rules = SealerRules::new(partition, sealer_version);
         Self {
             rules,
             silence_ms,
@@ -240,6 +240,9 @@ impl EgressWatermarkFeed {
         if self.on_rules_frame(frame) {
             return;
         }
+        if self.on_ref_refused_frame(frame) {
+            return;
+        }
         if self.on_reject_frame(frame) {
             return;
         }
@@ -290,6 +293,26 @@ impl EgressWatermarkFeed {
                 self.rules.on_sealer_info(session_id, decision_version);
             }
             _ => {}
+        }
+        true
+    }
+
+    /// Handle one reference refusal (egress kind 18). Returns `true` when
+    /// `frame` was one. The sealer takes only a reference with the bytes of
+    /// its transaction: the rules raise the version and drop the
+    /// transaction.
+    fn on_ref_refused_frame(&mut self, frame: &[u8]) -> bool {
+        if frame.first() != Some(&wire::EGRESS_KIND_REF_REFUSED) {
+            return false;
+        }
+        match EgressItem::decode(frame) {
+            Ok(EgressItem::RefRefused(refused)) => self.rules.on_ref_refused(&refused),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                partition = self.partition,
+                error = %e,
+                "a reference refusal of the sealer does not decode"
+            ),
         }
         true
     }

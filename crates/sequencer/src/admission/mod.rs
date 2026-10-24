@@ -28,6 +28,8 @@
 //!   [`AdmissionConfig::loss_blocks`] blocks is lost: the sealer dropped
 //!   it, or the executor skipped it with no nonce. The filter forgets the
 //!   run, and the sender can send from its chain nonce again.
+//! - A forwarded transaction that the sealer refused is lost at once, by
+//!   the same rule.
 //! - A parked transaction expires when its ingress image moves
 //!   [`AdmissionConfig::park_width`] position units past it, so the
 //!   sealer window still holds it when it goes out, or when it waited
@@ -388,15 +390,30 @@ impl<T> Admission<T> {
     }
 
     fn expire_forward(&mut self, out: &mut Vec<Verdict<T>>) {
-        let from = out.len();
         let lost = self.forwards.pop_front();
         // The sweep calls this only while a stamped mark is at the front.
         self.stamped -= 1;
-        let freed = lost.is_some_and(|mark| {
-            self.senders
-                .get_mut(&mark.sender)
-                .is_some_and(|s| s.on_lost(mark.nonce, &self.cfg, out))
-        });
+        if let Some(mark) = lost {
+            self.lose(mark.sender, mark.nonce, out);
+        }
+    }
+
+    /// The sealer refused the forwarded transaction of `sender` at `nonce`:
+    /// forget the run, as for a lost transaction, so a resend at the nonce
+    /// goes out again.
+    pub fn on_refused(&mut self, sender: Address, nonce: u64, out: &mut Vec<Verdict<T>>) {
+        self.lose(sender, nonce, out);
+    }
+
+    /// The forwarded transaction of `sender` at `nonce` is gone. When the
+    /// run still holds it, the run ends, and the parked transactions that
+    /// go out from the chain nonce get their marks.
+    fn lose(&mut self, sender: Address, nonce: u64, out: &mut Vec<Verdict<T>>) {
+        let from = out.len();
+        let freed = self
+            .senders
+            .get_mut(&sender)
+            .is_some_and(|s| s.on_lost(nonce, &self.cfg, out));
         if freed {
             self.record_forwards(&out[from..]);
         }

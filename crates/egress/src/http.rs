@@ -23,7 +23,11 @@
 //! the status of one hash:
 //! - `{"status":"executed"}` when the egress holds its receipt;
 //! - `{"status":"dropped","reason":<geth error text>,"sender":<address>,
-//!   "nonce":<quantity>}` when a sequencer dropped it and no receipt came;
+//!   "nonce":<quantity>}` when a sequencer dropped it and no receipt came.
+//!   The status is provisional: a receipt of the hash that comes later
+//!   turns it to `executed`. For the reason `transaction dropped by the
+//!   sealer, send it again`, it is safe to send again; the status can still
+//!   become executed;
 //! - `{"status":"unknown"}` otherwise.
 //!
 //! `GET /health` answers `200 ok`.
