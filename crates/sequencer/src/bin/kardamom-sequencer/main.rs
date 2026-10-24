@@ -32,6 +32,7 @@ use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::fees::FeeGate;
 use kardamom_sequencer::lookup::LookupRequester;
+use kardamom_sequencer::sealer_rules::{SealerRules, SealerVersion};
 use kardamom_sequencer::sequencer::Shutdown;
 
 /// The Aeron subscriptions and publisher this sequencer needs, all opened
@@ -119,9 +120,6 @@ struct ResyncWiring {
     fees: FeeGate,
     /// The epoch lane, whose signal sender the egress-watermark feed holds.
     epoch_lane: kardamom_sequencer::epoch::EpochPump,
-    /// The decision version that the egress-watermark feed reads off the
-    /// sealer, for the publish loop.
-    sealer_version: kardamom_sequencer::sealer_rules::SealerVersion,
     /// The inputs of the v2 loop, when `[admission]` turns it on.
     v2: Option<feeds::V2Wiring>,
     feeds: ResyncFeeds,
@@ -167,11 +165,19 @@ impl ResyncFeeds {
     }
 }
 
+/// The sealer side of the egress-watermark feed: the egress of the cluster
+/// session, and the rules that keep the decision version of the sealer and
+/// publish the drops of the references that it refuses.
+struct SealerFeed {
+    egress: kardamom_cluster_adapter::LiveEgress,
+    rules: SealerRules<TxDropsPublisherHandle>,
+}
+
 impl ResyncWiring {
     fn spawn(
         cfg: &SequencerConfig,
         main_rt: AeronRuntime,
-        cluster_egress: kardamom_cluster_adapter::LiveEgress,
+        sealer: SealerFeed,
         receipts_rt: &AeronRuntime,
         plane: &mut StreamPlane,
         executor_count: Option<NonZeroU32>,
@@ -201,7 +207,15 @@ impl ResyncWiring {
         // The epoch lane reads the same egress: the boundaries confirm its
         // epochs, and an origin-gap reject makes it offer them again.
         let (origins, epoch_lane) = kardamom_sequencer::epoch::EpochPump::new();
-        let sealer_version = kardamom_sequencer::sealer_rules::SealerVersion::default();
+        // The v2 loop takes the rows of each batch, the lookup answers and
+        // the refusals of the sealer as account events. The v1 loop takes
+        // the receipts as floors.
+        let (accounts_tx, accounts_rx) = crossbeam_channel::bounded(V2_ACCOUNT_EVENTS);
+        let rules = if cfg.admission.enabled {
+            sealer.rules.telling(accounts_tx.clone())
+        } else {
+            sealer.rules
+        };
         let watermark_task = feeds::EgressWatermarkFeed::new(
             cfg.resync.boundary_silence_ms,
             cfg.partition_index,
@@ -209,9 +223,9 @@ impl ResyncWiring {
             answer_tx,
             deadline_tx,
             origins,
-            sealer_version.clone(),
+            rules,
         )
-        .spawn(cluster_egress, shutdown.clone());
+        .spawn(sealer.egress, shutdown.clone());
 
         // The receipts subscription follows the plane's transport. A
         // discovered subscription receives on OS-chosen ports, so
@@ -241,9 +255,6 @@ impl ResyncWiring {
                 live.clone(),
             ))
         });
-        // The v2 loop takes the rows of each batch and the lookup answers
-        // as account events. The v1 loop takes the receipts as floors.
-        let (accounts_tx, accounts_rx) = crossbeam_channel::bounded(V2_ACCOUNT_EVENTS);
         let sink = if cfg.admission.enabled {
             feeds::ReceiptSink::Accounts(accounts_tx.clone())
         } else {
@@ -287,7 +298,6 @@ impl ResyncWiring {
             lookup,
             fees,
             epoch_lane,
-            sealer_version,
             v2,
             feeds: ResyncFeeds {
                 watermark_task,
@@ -565,10 +575,22 @@ async fn main() -> anyhow::Result<()> {
     // sustainable ingest rate.
     let receipts_rt =
         AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
+    // The egress feed and the publish loop share the kept version of the
+    // sealer. The feed publishes its drops on a clone of the drop handle
+    // of the publish loop: one publication, best effort, with no queue.
+    let sealer_version = SealerVersion::starting_at(args.sealer_version_floor);
+    let sealer = SealerFeed {
+        egress: cluster_egress,
+        rules: SealerRules::new(
+            cfg.partition_index,
+            sealer_version.clone(),
+            handles.drops_pub.clone(),
+        ),
+    };
     let mut resync = ResyncWiring::spawn(
         &cfg,
         rt,
-        cluster_egress,
+        sealer,
         &receipts_rt,
         &mut plane,
         args.executor_count,
@@ -597,7 +619,7 @@ async fn main() -> anyhow::Result<()> {
         resync: Some(resync.controller),
         lookup: resync.lookup,
         fees: resync.fees,
-        sealer_version: resync.sealer_version,
+        sealer_version,
         v2: resync.v2,
         shutdown: shutdown.clone(),
         idle_cap,

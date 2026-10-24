@@ -93,4 +93,7 @@ pub(crate) mod live_metric_names {
     /// 1 once the feed loop runs over the spool it restored. The
     /// readiness rule of the live batcher requires it.
     pub const FEED_RUNNING: &str = "kardamom_batcher_feed_running";
+    /// The canonical index of the newest record that the batcher took from
+    /// the egress (`--egress`). It stays absent on the cluster egress.
+    pub(crate) const EGRESS_CURSOR_INDEX: &str = "kardamom_batcher_egress_cursor_index";
 }

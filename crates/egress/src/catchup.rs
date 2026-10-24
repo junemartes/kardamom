@@ -10,7 +10,8 @@
 //!
 //! A peer whose floor is above the head holds no frame before its floor,
 //! and neither does any other peer that keeps the same blocks. So the
-//! task gives the owner that floor as the new start.
+//! task gives the owner that floor as the new start, with the reference
+//! mark of the peer. A peer that sends no mark gives `(0, 0)`.
 //!
 //! When no read brings a frame for the join timeout, the task tells the
 //! owner to start the stream again after the next boundary of a copy.
@@ -23,6 +24,7 @@ use tokio::sync::oneshot;
 
 use crate::merge::{Head, Key};
 use crate::owner::{Input, JoinState};
+use crate::ref_mark::RefMark;
 
 /// The bytes that one range read asks for.
 const PAGE: u64 = 4 * 1024 * 1024;
@@ -34,8 +36,8 @@ enum Read {
     /// The frames after the head, in order. Empty when the peer has no
     /// frame after it.
     Frames(Vec<Vec<u8>>),
-    /// The peer holds nothing that old: its floor.
-    Floor(Head),
+    /// The peer holds nothing that old: its floor and its reference mark.
+    Floor(Head, RefMark),
 }
 
 /// The task that reads the peers until the copies join.
@@ -91,8 +93,8 @@ impl CatchUp {
                 self.send(Input::Caught(frames))?;
                 ControlFlow::Continue(peer)
             }
-            Ok(Read::Floor(floor)) => {
-                self.send(Input::Floor(floor))?;
+            Ok(Read::Floor(floor, mark)) => {
+                self.send(Input::Floor { floor, mark })?;
                 ControlFlow::Continue(peer)
             }
             Ok(Read::Frames(_)) => self.next_peer(peer).await,
@@ -140,7 +142,8 @@ impl CatchUp {
             .await
             .map_err(|e| e.to_string())?;
         if response.status() == reqwest::StatusCode::GONE {
-            return Ok(Read::Floor(Self::floor(response.headers())?));
+            let headers = response.headers();
+            return Ok(Read::Floor(Self::floor(headers)?, Self::mark(headers)));
         }
         let response = response.error_for_status().map_err(|e| e.to_string())?;
         let body = response.bytes().await.map_err(|e| e.to_string())?;
@@ -152,11 +155,7 @@ impl CatchUp {
     /// boundary of the block before it.
     fn floor(headers: &reqwest::header::HeaderMap) -> Result<Head, String> {
         let part = |name: &str| {
-            headers
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .ok_or_else(|| format!("the peer sent no {name}"))
+            Self::header(headers, name).ok_or_else(|| format!("the peer sent no {name}"))
         };
         let next_block = part("x-egress-floor-block")?;
         Ok(Head {
@@ -167,6 +166,26 @@ impl CatchUp {
                 .filter(|block| *block > 0)
                 .map(Key::Boundary),
         })
+    }
+
+    /// The reference mark of a peer from its headers. A peer of an older
+    /// release sends none: its mark counts as `(0, 0)`.
+    fn mark(headers: &reqwest::header::HeaderMap) -> RefMark {
+        match (
+            Self::header(headers, "x-egress-ref-mark-index"),
+            Self::header(headers, "x-egress-ref-mark-block"),
+        ) {
+            (Some(index), Some(block)) => RefMark { index, block },
+            _ => RefMark::default(),
+        }
+    }
+
+    /// The value of the header `name` as a `u64`.
+    fn header(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
     }
 }
 

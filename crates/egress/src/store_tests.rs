@@ -1,13 +1,11 @@
 use std::num::NonZeroU64;
 
-use kardamom_cluster_adapter::wire::{encode_egress_boundary, encode_egress_record};
+use kardamom_cluster_adapter::wire::encode_egress_boundary;
 
 use super::{Range, Store};
 use crate::merge::{Head, Key};
-
-fn record(index: u64) -> Vec<u8> {
-    encode_egress_record(index, &[u8::try_from(index).unwrap(); 40]).unwrap()
-}
+use crate::ref_mark::RefMark;
+use crate::test_support::{record, ref_record};
 
 fn boundary(block: u64, end: u64) -> Vec<u8> {
     encode_egress_boundary(block, end, 0, 0)
@@ -99,7 +97,10 @@ fn a_cursor_below_the_oldest_segment_is_unavailable() {
     };
     assert_eq!(
         store.read_from(0, 1, usize::MAX).unwrap(),
-        Range::Unavailable { floor }
+        Range::Unavailable {
+            floor,
+            mark: RefMark::default()
+        }
     );
     let Range::Frames { frames, .. } = store.read_from(4, 3, usize::MAX).unwrap() else {
         panic!("the store keeps blocks 3 on");
@@ -137,10 +138,9 @@ fn a_torn_frame_at_the_end_is_cut_at_open() {
     drop(store);
     let segment = std::fs::read_dir(dir.path())
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|e| e == "frames"))
+        .unwrap();
     let mut torn = std::fs::read(&segment).unwrap();
     torn.extend_from_slice(&[9, 0, 0, 0, 1, 2]);
     std::fs::write(&segment, torn).unwrap();
@@ -165,16 +165,114 @@ fn a_reset_starts_the_store_at_the_new_head() {
         next_block: 21,
         last: Some(Key::Boundary(20)),
     };
-    store.reset(start).unwrap();
+    store.reset(start, RefMark::default()).unwrap();
     assert_eq!(store.head(), start);
     store
         .append(&[record(40), encode_egress_boundary(21, 41, 0, 0)])
         .unwrap();
     assert!(matches!(
         store.read_from(0, 1, 1 << 20).unwrap(),
-        Range::Unavailable { floor } if floor == start
+        Range::Unavailable { floor, .. } if floor == start
     ));
     store.sync().unwrap();
     let reopened = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
     assert_eq!(reopened.head().next_block, 22, "the reset is on disk");
+}
+
+/// Block 1 with record 0, a reference at index 1 and its boundary, then
+/// blocks 2 to 5 with one record each.
+fn with_a_reference() -> Vec<Vec<u8>> {
+    let mut frames = vec![record(0), ref_record(1), boundary(1, 2)];
+    frames.extend((2..=5).flat_map(|b| [record(b), boundary(b, b + 1)]));
+    frames
+}
+
+const REFERENCE: RefMark = RefMark { index: 1, block: 1 };
+
+#[test]
+fn a_store_with_no_mark_opens_with_no_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
+    assert_eq!(store.mark(), RefMark { index: 0, block: 0 });
+    store.append(&blocks(3)).unwrap();
+    assert_eq!(store.mark(), RefMark::default(), "no frame is a reference");
+}
+
+/// The reference is in the first segment, and the head comes from the
+/// last one. The mark still names the reference after a restart.
+#[test]
+fn a_restart_reads_the_mark_of_a_reference_in_an_older_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
+    store.append(&with_a_reference()).unwrap();
+    assert_eq!(store.mark(), REFERENCE);
+    store.append(&[record(6), boundary(6, 7)]).unwrap();
+    assert_eq!(store.mark(), REFERENCE, "a batch with no reference keeps R");
+    store.sync().unwrap();
+    drop(store);
+    let again = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
+    assert_eq!(again.head().next_block, 7);
+    assert_eq!(again.mark(), REFERENCE);
+}
+
+/// A reset keeps the mark, a higher mark of the peer raises it, and a
+/// lower mark of the peer does not lower it.
+#[test]
+fn a_reset_keeps_or_raises_the_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
+    store.append(&with_a_reference()).unwrap();
+    let start = |block: u64| Head {
+        next_index: block * 10,
+        next_block: block,
+        last: Some(Key::Boundary(block - 1)),
+    };
+    store.reset(start(21), RefMark::default()).unwrap();
+    assert_eq!(store.mark(), REFERENCE, "a reset with no peer keeps R");
+    let higher = RefMark {
+        index: 150,
+        block: 20,
+    };
+    store.reset(start(31), higher).unwrap();
+    assert_eq!(store.mark(), higher, "a higher mark of the peer raises R");
+    store.reset(start(41), REFERENCE).unwrap();
+    assert_eq!(store.mark(), higher, "a lower mark of the peer keeps R");
+    drop(store);
+    let again = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
+    assert_eq!(again.mark(), higher, "the raised mark is on disk");
+}
+
+/// A crash after the mark and before the sync of the segment can lose the
+/// frames of the batch. The mark then stays at or above every reference
+/// that the segment still holds.
+#[test]
+fn a_crash_before_the_segment_sync_leaves_the_mark_at_or_above_the_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path(), NonZeroU64::new(100).unwrap(), GENESIS).unwrap();
+    store.append(&with_a_reference()).unwrap();
+    drop(store);
+    let segment = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|e| e == "frames"))
+        .unwrap();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&segment)
+        .unwrap();
+    file.set_len(25).unwrap();
+    let again = Store::open(dir.path(), NonZeroU64::new(100).unwrap(), GENESIS).unwrap();
+    assert_eq!(again.head(), GENESIS, "the frames of the batch are lost");
+    assert_eq!(
+        again.mark(),
+        REFERENCE,
+        "the mark is above the surviving frames"
+    );
+}
+
+#[test]
+fn a_mark_of_another_size_stops_the_open() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("ref-mark"), [1, 2, 3]).unwrap();
+    assert!(Store::open(dir.path(), two_block_segments(), GENESIS).is_err());
 }

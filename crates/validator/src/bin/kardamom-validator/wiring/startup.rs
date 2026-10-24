@@ -282,7 +282,10 @@ impl Opened {
                 cursor: bin_support::cluster_replay_cursor(&self.state.start),
                 bin_name: "kardamom-validator",
                 suppress_sealer_metrics: true,
-                egress: args.egress.clone(),
+                egress: args.egress.clone().map(|base| bin_support::EgressSource {
+                    base,
+                    cursor_gauge: kardamom_validator::metrics::EGRESS_CURSOR_INDEX,
+                }),
             })?;
 
         // --- Verification streams: tx_bal (BAL) and tx_receipts. ---

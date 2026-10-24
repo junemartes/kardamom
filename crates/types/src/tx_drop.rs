@@ -48,6 +48,11 @@ pub enum DropReason {
     Expired,
     /// The tip is above the fee cap.
     TipAboveFeeCap,
+    /// The sealer refused the transaction reference that the sequencer
+    /// offered without the bytes of its transaction. The status is
+    /// provisional: the twin can offer the same transaction with its bytes,
+    /// and then its receipt wins over the drop.
+    SealerRefusedReference,
 }
 
 impl DropReason {
@@ -62,6 +67,22 @@ impl DropReason {
             Self::FeeCapBelowBaseFee => "max fee per gas less than block base fee",
             Self::Expired => "transaction expired",
             Self::TipAboveFeeCap => "max priority fee per gas higher than max fee per gas",
+            Self::SealerRefusedReference => "transaction dropped by the sealer, send it again",
+        }
+    }
+
+    /// The name of the reason as a metric label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NonceTooLow => "nonce_too_low",
+            Self::InsufficientFunds => "insufficient_funds",
+            Self::ReplacementUnderpriced => "replacement_underpriced",
+            Self::TxpoolFull => "txpool_full",
+            Self::FeeCapBelowBaseFee => "fee_cap_below_base_fee",
+            Self::Expired => "expired",
+            Self::TipAboveFeeCap => "tip_above_fee_cap",
+            Self::SealerRefusedReference => "sealer_refused_reference",
         }
     }
 }

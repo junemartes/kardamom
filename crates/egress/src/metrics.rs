@@ -24,6 +24,22 @@ pub const CAUGHT_FRAMES_TOTAL: &str = "kardamom_egress_caught_frames_total";
 /// above its head (`reason="peer-floor"`).
 pub const REBASED_TOTAL: &str = "kardamom_egress_rebased_total";
 
+/// The highest canonical index of a stored transaction reference
+/// (`RT_TXREF`), and its block. Both are 0 when the store holds none.
+pub const REF_FRAME_MAX_INDEX: &str = "kardamom_egress_ref_frame_max_index";
+pub const REF_FRAME_MAX_BLOCK: &str = "kardamom_egress_ref_frame_max_block";
+
+pub(crate) fn set_ref_mark(mark: crate::ref_mark::RefMark) {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "indexes and blocks stay far below 2^52; f64 represents them exactly"
+    )]
+    {
+        metrics::gauge!(REF_FRAME_MAX_INDEX).set(mark.index as f64);
+        metrics::gauge!(REF_FRAME_MAX_BLOCK).set(mark.block as f64);
+    }
+}
+
 pub(crate) fn count_copy_mismatch() {
     metrics::counter!(COPY_MISMATCH_TOTAL).increment(1);
 }
@@ -57,6 +73,14 @@ pub fn describe() {
     metrics::describe_counter!(
         CAUGHT_FRAMES_TOTAL,
         "Frames of a peer egress that filled the place between the head and the copies."
+    );
+    metrics::describe_gauge!(
+        REF_FRAME_MAX_INDEX,
+        "Highest canonical index of a stored transaction reference (RT_TXREF); 0 with none."
+    );
+    metrics::describe_gauge!(
+        REF_FRAME_MAX_BLOCK,
+        "Block of the highest stored transaction reference (RT_TXREF); 0 with none."
     );
     metrics::describe_counter!(
         REBASED_TOTAL,

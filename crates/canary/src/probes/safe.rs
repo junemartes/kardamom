@@ -12,7 +12,7 @@ use crate::outcome::{Outcome, Stage};
 use crate::rpc::Rpc;
 use crate::wait::Poll;
 
-const NAME: &str = "safe";
+pub(crate) const NAME: &str = "safe";
 
 /// One sampled transaction: its block, the endpoint that served it, and
 /// the time its receipt arrived.

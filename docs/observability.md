@@ -270,7 +270,7 @@ Each dashboard is a JSON file in `deploy/grafana/provisioning/dashboards-json/`.
 | `kardamom-notifier` | The status feed and the webhooks. |
 | `kardamom-canary` | The transaction canary: the success ratio per probe and per endpoint, the failures by outcome, the stage latencies, the last success, the balances, the feed gaps and the stalled accounts. |
 | `kardamom-performance` | Throughput and latency against the two load goals: 10,000 tx/s sustained, and 1,000,000 tx/s with a p99 of 1 ms from submit to the executed receipt. It shows the share of each goal, the rate at each pipeline step, the submit-to-sealed and submit-to-executed percentiles, the canary stages, the step times inside the services, the queues and the back pressure. |
-| `kardamom-availability` | The service levels against a 99.9 % target over the selected range: the canary success and its error budget, the submit success, the chain liveness, the ingress reachability and the validator verdict. Over time: the failures, the head lag of each replica, the scrape targets, the settlement and the sealer leader changes. |
+| `kardamom-availability` | The service levels against a 99.9999 % target over the selected range: the canary success and its error budget, the submit success, the chain liveness, the ingress reachability and the validator verdict. Over time: the failures, the head lag of each replica, the scrape targets, the settlement and the sealer leader changes. |
 | `kardamom-bottlenecks` | The pipeline metrics of every service in path order: the busy and blocked share of each loop, the queue depths, the step p50 and p99, the batch sizes, the latency of each stage, and the misses and retries. |
 
 - A dashboard queries `kardamom`-scoped metrics of its service.
@@ -421,6 +421,7 @@ The live batcher exports a settlement-health group on port 9002. See [l1-data-pa
 | `kardamom_batcher_rebuilt_blocks_total` | Blocks rebuilt from references after the sealer refused a replay. |
 | `kardamom_batcher_spool_dropped_total{reason}` | Spools dropped at start. `other-version`: a spool of another release. `unreadable`: a block file does not decode. `discontinuous`: the spool does not continue the confirmed cursor. The sealer serves the range again. One after a deploy is expected. Growth means the spool disk is bad. |
 | `kardamom_batcher_feed_running` | 1 when the feed loop runs over the restored spool. The readiness rule needs it. |
+| `kardamom_batcher_egress_cursor_index` | With `--egress`: the canonical index of the newest record that the batcher took from the egress. A boundary does not move it. Absent on the cluster egress. See [Egress](#egress). |
 
 ### L1 sources
 
@@ -500,6 +501,8 @@ With `--carry-bytes`, `--egress <url>` (`KARDAMOM_EGRESS_URL`, off by default) m
 - The executor leaves the feed when no frame comes for 6 s, when the feed loses its image, or on a mismatch. It goes back to the feed after the feed has one image for 30 s and a replay of the feed from its cursor reaches `REPLAY_DONE`.
 - Any increment of `kardamom_executor_source_mismatch_total` needs an operator: a member or a service sends bytes that do not match the ordered id. The log line is `the raw transaction does not hash to its canonical id; replaying from the other source`, with the source and the index.
 - A switch logs `switching the input source` with the old and the new source and the cursor.
+- A transaction reference at the cursor is a fault of the source: the reader has no `tx_data` lane to join it. The reader leaves the source and reads the same index from the other source.
+- When every source gives a reference at the same index, the reader stops with `UnjoinableReference { index }`. The log line is `no source holds the bytes of the transaction reference; stopping`, with the index. A source that never connected counts as one that gives the reference. Only a sequencer that offers a type-0 reference makes such an entry.
 
 ### Executor pipeline
 
@@ -738,13 +741,14 @@ The ingress records these names of the pipeline metrics (see "Pipeline metrics")
 | `ingress.publish_round_trip` | step | The `tx_data` publish: the hop to the blocking pool and the round trip to the Aeron thread up to its ack. |
 | `ingress.recover_batch` | step | The recovery of one verifier batch on the blocking pool, up to the end of its last worker. |
 | `ingress.recover_batch` | batch | The requests in each verifier batch. |
-| `ingress.recover_intake` | queue | The requests that wait in the verifier intake after the flush task takes a batch. The intake holds four times the batch depth; a full intake makes a submit wait. |
+| `ingress.recover_intake` | queue | The requests that queued in the verifier intake while the batch before ran, read when the flush task comes back for the next batch. While the verifier is idle, the gauge holds the last backlog that it read (sample and hold), not a live depth. The intake holds four times the batch depth; a full intake makes a submit wait. |
+| `ingress.recover_wait` | step | The wait of each request from its submit to the take of its batch: the flush window plus the time behind the batch before it. |
 | `ingress.ack_waiters` | queue | The submissions that wait for the verdict of the sequencer (ack at admission). The shed check counts them with `kardamom_ingress_queue_depth`. |
 | `ingress.watermark` | loop | The cluster egress thread. Idle while it waits for an egress event (the receive and the decode), busy while it handles the event. |
 | `ingress.receipt_pump` | loop | The `tx_receipts` pump task. Idle while it waits for a frame, busy while it applies the rows and fans out the receipts. |
 | `ingress.receipt_batch` | batch | The receipts in each `tx_receipts` batch frame. A boundary-only frame adds no sample. |
 
-- A high `ingress.recover` with a low `ingress.recover_batch` step means that submits wait for the intake or the batch window, not for the recovery.
+- A high `ingress.recover` with a low `ingress.recover_batch` step means that submits wait for the intake or the batch window, not for the recovery. `ingress.recover_wait` shows that wait directly.
 - A busy share of `ingress.watermark` near 1 means that the egress frames queue in the cluster client before the thread reads them.
 
 ### Aeron thread
@@ -833,8 +837,16 @@ The egress (`kardamom-egress`) exports these metrics on `--metrics-addr` (`KARDA
 | --- | --- |
 | `kardamom_egress_copy_mismatch_total` | Copies of a canonical frame whose bytes differ from the first copy. The egress does not stop. A difference means that one executor executed other bytes than the others: the validator decides which copy is wrong. |
 | `kardamom_egress_waiting_dropped_total` | Times that every copy missed a frame and the merge dropped the frames that waited behind it. |
+| `kardamom_egress_ref_frame_max_index` | R: the highest canonical index of a stored transaction reference (`RT_TXREF`). 0 when the store holds none. |
+| `kardamom_egress_ref_frame_max_block` | The block of R. 0 when the store holds none. |
 
 - Any increment of `kardamom_egress_copy_mismatch_total` needs an operator.
+- R is durable. The store keeps it in the side file `ref-mark` of its directory (16 bytes: the index, then the block, little endian), and reads it at start. A restart does not lower R.
+  - The store writes the mark of a batch before the frames of the batch. After a crash, R is at or above every reference that the segments hold.
+  - A start at the floor of a peer keeps the higher of the two marks. The peer sends its mark in the headers `x-egress-ref-mark-index` and `x-egress-ref-mark-block` of its `410` answer.
+  - R can stay above the stored references. That only delays the move of a reader to the egress.
+  - A corrupt or hostile mark of a peer, for example `u64::MAX`, raises R for good: R never goes down. To recover, stop the egress, then copy `ref-mark` from the store directory of a healthy peer, then start the egress. Delete `ref-mark` only when the store holds no `RT_TXREF` frame.
+- A reader below R can meet a reference in the egress range that it cannot join. The readers after the executors export their cursor on the egress: `kardamom_batcher_egress_cursor_index` and `kardamom_validator_egress_cursor_index`, the canonical index of the newest record that the reader took. A reader is past every reference when its cursor is above the highest R of all egress instances.
 - The egress answers `GET /health` on its HTTP port (`:8548` in the cluster job). The Consul check of the service `kardamom-egress` reads it.
 
 ### State mirror

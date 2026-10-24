@@ -568,6 +568,21 @@ fn tx_drop_golden_bytes_are_pinned() {
     assert_eq!(back, v);
 }
 
+/// The last reason, `SealerRefusedReference`, keeps the layout: only the
+/// reason byte differs from the golden bytes, and it is 7.
+#[test]
+fn tx_drop_of_a_refused_reference_keeps_the_layout() {
+    let v = kardamom_types::TxDrop {
+        reason: kardamom_types::DropReason::SealerRefusedReference,
+        ..golden_tx_drop()
+    };
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&v).unwrap();
+    let mut want = alloy_primitives::hex::decode(TX_DROP_GOLDEN).unwrap();
+    let reason_at = 32 + 20 + 4 + 8;
+    want[reason_at] = 7;
+    assert_eq!(&bytes[..], &want[..], "TxDrop rkyv layout changed");
+}
+
 /// The frozen stream records against the format registry
 /// (`formats.toml` at the workspace root).
 #[test]

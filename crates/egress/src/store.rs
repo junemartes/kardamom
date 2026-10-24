@@ -14,6 +14,10 @@
 //! cuts a torn frame at the end of the last segment. A reader that resumes
 //! from a cursor reads the frames after it from the segment that holds the
 //! cursor.
+//!
+//! The side file `ref-mark` holds the highest stored transaction reference
+//! (see [`crate::ref_mark`]). The head comes from the last segment only, so
+//! the mark needs its own file: a reference in an older segment counts too.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -22,6 +26,7 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use crate::merge::{Head, Key};
+use crate::ref_mark::RefMark;
 
 /// The bytes of the head at the start of each segment.
 const SEGMENT_HEAD: usize = 25;
@@ -49,8 +54,8 @@ pub enum Range {
         head: Head,
     },
     /// The store holds nothing that old: its oldest segment starts at
-    /// `floor`.
-    Unavailable { floor: Head },
+    /// `floor`. `mark` is the reference mark of the store.
+    Unavailable { floor: Head, mark: RefMark },
 }
 
 /// One segment: the head at its start and its file.
@@ -69,11 +74,13 @@ pub struct Store {
     /// The boundaries in the open segment.
     blocks_in_segment: u64,
     head: Head,
+    /// The highest stored transaction reference, as the side file holds it.
+    mark: RefMark,
 }
 
 impl Store {
-    /// Open the store in `dir`, and rebuild its head from the segments. An
-    /// empty directory starts at `genesis`.
+    /// Open the store in `dir`, rebuild its head from the segments, and
+    /// read its reference mark. An empty directory starts at `genesis`.
     ///
     /// # Errors
     ///
@@ -94,6 +101,8 @@ impl Store {
         file.set_len(end).map_err(io(&last.path))?;
         let mut writer = BufWriter::new(file);
         writer.seek(SeekFrom::Start(end)).map_err(io(&last.path))?;
+        let mark = RefMark::read(dir)?;
+        mark.show();
         Ok(Self {
             dir: dir.to_path_buf(),
             segment_blocks,
@@ -101,7 +110,14 @@ impl Store {
             writer,
             blocks_in_segment: blocks,
             head,
+            mark,
         })
+    }
+
+    /// The highest stored transaction reference.
+    #[must_use]
+    pub fn mark(&self) -> RefMark {
+        self.mark
     }
 
     /// The head of the stream on disk.
@@ -110,12 +126,17 @@ impl Store {
         self.head
     }
 
-    /// Append the frames that the merge delivered, in order.
+    /// Append the frames that the merge delivered, in order. The reference
+    /// mark of the batch goes to disk first, so no frame on disk is above
+    /// the mark.
     ///
     /// # Errors
     ///
     /// Returns an error when a write fails.
     pub fn append(&mut self, frames: &[Vec<u8>]) -> Result<(), StoreError> {
+        if let Some(top) = RefMark::top(frames, self.head.next_block) {
+            self.raise_mark(top)?;
+        }
         frames.iter().try_for_each(|frame| self.append_one(frame))?;
         self.writer.flush().map_err(io(&self.dir))
     }
@@ -149,6 +170,7 @@ impl Store {
         else {
             return Ok(Range::Unavailable {
                 floor: self.segments.first().map_or(self.head, |s| s.start),
+                mark: self.mark,
             });
         };
         let cursor = Head {
@@ -179,10 +201,15 @@ impl Store {
     /// cursor then gets [`Range::Unavailable`] with the new floor, and
     /// reads another instance.
     ///
+    /// The reference mark becomes the higher of the mark of the store and
+    /// `peer`, the mark of the peer that gave the start. It never goes
+    /// down.
+    ///
     /// # Errors
     ///
     /// Returns an error when a file does not delete or write.
-    pub fn reset(&mut self, head: Head) -> Result<(), StoreError> {
+    pub fn reset(&mut self, head: Head, peer: RefMark) -> Result<(), StoreError> {
+        self.raise_mark(peer)?;
         self.writer.flush().map_err(io(&self.dir))?;
         self.segments
             .drain(..)
@@ -206,6 +233,17 @@ impl Store {
         self.segments
             .drain(..keep_from)
             .try_for_each(|s| fs::remove_file(&s.path).map_err(io(&s.path)))
+    }
+
+    /// Write `mark` to the side file when it is above the mark.
+    fn raise_mark(&mut self, mark: RefMark) -> Result<(), StoreError> {
+        if mark <= self.mark {
+            return Ok(());
+        }
+        mark.write(&self.dir)?;
+        self.mark = mark;
+        mark.show();
+        Ok(())
     }
 
     fn append_one(&mut self, frame: &[u8]) -> Result<(), StoreError> {
@@ -376,7 +414,7 @@ fn name(next_block: u64) -> String {
     format!("{next_block:020}.{SUFFIX}")
 }
 
-fn io(path: &Path) -> impl Fn(std::io::Error) -> StoreError + '_ {
+pub(crate) fn io(path: &Path) -> impl Fn(std::io::Error) -> StoreError + '_ {
     move |source| StoreError::Io {
         path: path.to_path_buf(),
         source,

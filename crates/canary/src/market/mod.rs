@@ -61,6 +61,8 @@ enum Job {
 }
 
 impl Job {
+    const ALL: [Self; 3] = [Self::Rwa, Self::Swap, Self::Liquidity];
+
     fn name(self) -> &'static str {
         match self {
             Self::Rwa => "rwa",
@@ -109,8 +111,8 @@ pub struct MarketTask {
     state: Market,
     /// The pool's reserves and sequence after the last canary call.
     last: Option<(Reserves, U256)>,
-    /// The direction of the next swap.
-    eth_in_next: bool,
+    /// The tokens that the last swap bought: the next swap sells them.
+    bought: pool::Bought,
     turn: usize,
 }
 
@@ -126,9 +128,14 @@ impl MarketTask {
             ctx,
             state,
             last: None,
-            eth_in_next: true,
+            bought: pool::Bought::default(),
             turn: 0,
         })
+    }
+
+    /// The names of the task's probes.
+    pub(crate) fn probes() -> impl Iterator<Item = &'static str> + Clone {
+        Job::ALL.into_iter().map(Job::name)
     }
 
     /// Run the probes on their timers, for ever.
