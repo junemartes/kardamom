@@ -57,11 +57,13 @@ jobs:
   # one 2-core runner the classes starved each other: three took about 40
   # minutes each and the job hit its 45-minute limit. Each class now runs
   # on its own runner. The job named `nomad job validate` is the required
-  # check; it waits for every part and passes only when all passed.
+  # check; it waits for every part and passes only when all passed. The
+  # longest class, RollbackTest, takes about 45 minutes on one runner, so
+  # the limit is 60 minutes.
   deploy-tests:
     name: deploy tests (${{ matrix.part }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
