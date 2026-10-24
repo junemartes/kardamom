@@ -285,7 +285,7 @@ Run `just sealer-upgrade-check <env> <feature> <activation_ms>` before the Safe 
 - feature 3 or 4 with an activation time other than 0 while a member reports `kardamom_sealer_feature_state{feature="5"}` at 1 (held) or 2 (on). Without decision version 5 the rules of feature 5 stop, and a carry executor stops on the first reference. Turn feature 5 off first, and empty `KARDAMOM_CARRY_EXECUTORS`;
 - feature 5 (`FEATURE_CARRY_WINDOW`, the carry window), at any activation time, unless:
   - every member reports `snapshotReadsMax` 18 or more, `decisionVersion` 5 and `retainedStore` `heap`;
-  - the sequencer job has the meta `sealer_version_kept`, the batcher and the validator jobs have `reads_egress`, and the egress job has `ref_mark`, each with every live allocation on that job version (`workloads_upgrade_window_jobs`);
+  - the sequencer job has the metas `sealer_version_kept` and `v2_loop` (the v2 loop, `KARDAMOM_SEQUENCER_ADMISSION=on`), the batcher and the validator jobs have `reads_egress`, and the egress job has `ref_mark`, each with every live allocation on that job version (`workloads_upgrade_window_jobs`);
   - every egress instance reports its reference mark, and every `kardamom_batcher_egress_cursor_index` and `kardamom_validator_egress_cursor_index` is above the highest `kardamom_egress_ref_frame_max_index`. An instance that does not answer is a refusal;
 - a job without its metas (`workloads_upgrade_jobs` in `ansible/roles/workloads/defaults/main.yml`), or a live allocation of an older job version:
   - the sequencer: `nonce_burn`;
@@ -393,7 +393,8 @@ The gates of the carry window refuse a move before any job changes. Each gate ru
   - a sealer job that Nomad does not know: a new chain starts on decision version 3;
   - a member that does not run, or a floor above the lowest `decisionVersion` of the members;
   - an executor, validator, batcher or egress job without the meta `relayed_full_ref`, or a live allocation of an older job version. Without the egress job, the egress passes.
-- A batcher or validator job that Nomad does not know, switched to the egress on a live chain (a registered sealer). It has no block to read. Deploy it on the cluster egress first.
+  - the v1 loop of the sequencers: a target without `KARDAMOM_SEQUENCER_ADMISSION=on`, or a registered sequencer job without the meta `v2_loop`. The v1 loop offers record type 0 at every floor.
+- A batcher or validator job that Nomad does not know, switched to the egress, while an egress instance reports a stored reference (`kardamom_egress_ref_frame_max_index` above 0). It has no block to read against it. Under decision versions 3 and 4 both loops of the sequencer offer record type 0, so a new chain stores references too. Deploy the reader on the cluster egress first.
 - The move of the batcher or the validator to the egress (`KARDAMOM_BATCHER_EGRESS`, `KARDAMOM_VALIDATOR_EGRESS`), when the registered job does not carry the meta `reads_egress`:
   - an egress job without the meta `ref_mark`, or a live egress allocation of an older job version;
   - an egress instance that does not report `kardamom_egress_ref_frame_max_index` and `kardamom_egress_ref_frame_max_block`;
@@ -415,6 +416,7 @@ The gates read the metrics of each instance by the node address that the Nomad A
 The order on a live chain:
 
 1. Deploy the release with every switch off and the floor 0.
+   The sequencers run the v2 loop (`KARDAMOM_SEQUENCER_ADMISSION=on`). The v1 loop offers each transaction without its bytes, and the sealer refuses such an offer after the switch.
 2. Set `KARDAMOM_SEALER_VERSION_FLOOR` to the lowest `decisionVersion` of the members.
 3. Move the batcher and the validator to the egress.
 4. Deploy with `KARDAMOM_MEMBER_FEED=on`.
@@ -509,6 +511,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Executor | `KARDAMOM_EXEC_ON_SEALERS` (job variable `exec_on_sealers` of every job that it changes) | empty (`off` in the jobs) | `on` or `off`. On, executor `<i>` runs on `sealer-<i>`, and the executor job rolls one group at a time. It needs `KARDAMOM_MEMBER_FEED=on`. |
 | Executor | `KARDAMOM_CARRY_EXECUTORS` (job variable `carry_executors`) | empty | The member indexes of the carry executors, such as `0,1`. Each one runs with `--carry-bytes` and `--egress`. It needs `KARDAMOM_EXEC_ON_SEALERS=on` and `KARDAMOM_EGRESS=1`. |
 | Sequencer | `KARDAMOM_SEALER_VERSION_FLOOR` (job variable `sealer_version_floor`) | empty (`0` in the job) | The decision version that a sequencer assumes before the first report of a sealer session, from 0 to 5. The release gate refuses a value above the lowest `decisionVersion` of the members, and a value above 0 before every reader runs this release. |
+| Sequencer | `KARDAMOM_SEQUENCER_ADMISSION` (job variable `admission`) | empty (`off` in the job) | `on` or `off`. On, the sequencers run the v2 loop (the `[admission]` section of the config), with 512 forwarded and 512 parked transactions for each sender. The carry window needs it: only the v2 loop takes the bytes of a transaction under decision version 5, and the sealer refuses a reference without bytes while the window is on. |
 | Executor | `KARDAMOM_EXEC_CURSOR` (job variable `exec_cursor`) | empty (`off` in the job) | `on` or `off`. On, each executor sends its recorded cursor to the sealer, the floor of the record-lag guard. Switch it on only after every sealer member reads ingress kind 9. A sealer member that does not read it drops the frame. |
 | Egress | `KARDAMOM_EGRESS` | `0` | `1` deploys the egress job (`nomad/egress.nomad.hcl`) and its scrape (job variable `egress` of the monitoring job). It needs `KARDAMOM_EXEC_FRAMES=on`. See [The egress](#the-egress). |
 | Egress | `KARDAMOM_EXEC_FRAMES` (job variable `exec_frames` of the executor) | empty (`off` in the job) | `on` or `off`. On, each executor publishes the frames that it executes on `exec_frames` (`--exec-frames`). |

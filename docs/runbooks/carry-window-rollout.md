@@ -10,7 +10,7 @@ executors to the bytes that the sealer carries. The chain does not stop, and no 
 - After the switch, no reader of the order meets a transaction reference that it cannot join.
 
 The order is not circular. Each step needs only the steps before it. Do not start a step until every check of the
-step before it passes. Step 8 is an upgrade transaction on L1: it needs the explicit approval of the operator.
+step before it passes. Step 9 is an upgrade transaction on L1: it needs the explicit approval of the operator.
 
 The switches and the gates of the deploy are in
 [The carry window](../../deploy/cluster/README.md#the-carry-window).
@@ -68,7 +68,32 @@ Checks:
 
 Rollback: allowed. No member wrote snapshot version 18.
 
-### 2. Set the sequencer version floor
+### 2. Turn on the v2 loop of the sequencers
+
+Deploy with `KARDAMOM_SEQUENCER_ADMISSION=on`. The sequencers roll one replica at a time. Each one gets the
+`[admission]` table in its `sequencer.toml`, with 512 forwarded and 512 parked transactions for each sender, and the
+job gets the meta `v2_loop = "true"`.
+
+Why: the v1 loop of the sequencer offers each transaction as a reference of record type 0, at every decision version
+and every floor. Only the v2 loop offers the bytes of a transaction (record type 7). So the floor of step 3, the stop
+of the references in step 4, and the carry window need the v2 loop. Without it, the sealer refuses every transaction
+after the switch. The floor gate and the upgrade check of feature 5 refuse while the sequencer job lacks `v2_loop`.
+
+Checks:
+
+- Each sequencer replica holds the table in its config:
+
+  ```sh
+  for alloc in $(nomad job allocs -json sequencer | jq -r '.[] | select(.ClientStatus == "running") | .ID'); do
+    nomad alloc fs "$alloc" sequencer/local/sequencer.toml | grep -A1 '^\[admission\]'
+  done
+  ```
+
+  Each one shows `enabled = true`.
+- Receipts keep landing (the canary).
+- `kardamom_sequencer_pending_depth` exists on each sequencer (metrics port 9001 + 10 × lane).
+
+### 3. Set the sequencer version floor
 
 Deploy with `KARDAMOM_SEALER_VERSION_FLOOR=5`, the lowest `decisionVersion` of the members. The release gate refuses
 a floor above that value, and a floor above 0 while a reader job lacks `relayed_full_ref`.
@@ -78,7 +103,7 @@ Checks:
 - Each sequencer: `kardamom_sequencer_sealer_version` 5 (metrics port 9001 + 10 × lane).
 - `kardamom_sealer_full_ref_below_v5_total` stays 0 on every member.
 
-### 3. Watch the references stop
+### 4. Watch the references stop
 
 Restart one sequencer of each pair: `nomad alloc restart <alloc>`. Then watch R on each egress instance for 30
 minutes under the canary:
@@ -92,7 +117,7 @@ Checks:
 - R does not move on any instance.
 - Write down the highest `kardamom_egress_ref_frame_max_index` and its block.
 
-### 4. Move the batcher and the validator to the egress
+### 5. Move the batcher and the validator to the egress
 
 Before the deploy:
 
@@ -108,7 +133,7 @@ Checks:
 - The batcher and the validator jobs carry the meta `reads_egress = "true"`.
 - The validator agrees, and the batcher posts.
 
-### 5. Apply the infrastructure change, then turn on the member feed
+### 6. Apply the infrastructure change, then turn on the member feed
 
 Apply the change of kardamom-infra (see "What staging needs" below). Then deploy with `KARDAMOM_MEMBER_FEED=on`.
 The sealer rolls member by member, and the shared media driver starts on each sealer node.
@@ -118,7 +143,7 @@ Checks:
 - Each member: `kardamom_sealer_feed_state` 1 (idle), and `feed` `idle` in its status.
 - The `aeron` job runs on each sealer node: `nomad job status aeron`.
 
-### 6. Move the executors to the sealer nodes
+### 7. Move the executors to the sealer nodes
 
 Deploy with `KARDAMOM_MEMBER_FEED=on` and `KARDAMOM_EXEC_ON_SEALERS=on`. The executor job moves one executor at a
 time: `executor-2`, then `executor-1`, then `executor-0`. Each step waits for the health check of the moved
@@ -134,7 +159,7 @@ Checks:
 - `kardamom_executor_block_number` (port 9004 on each sealer node) follows the sealed head.
 - Receipts land (the canary). `kardamom_egress_copy_mismatch_total` does not move.
 
-### 7. Run the upgrade check
+### 8. Run the upgrade check
 
 Pick the activation time: about 30 minutes ahead, at low load. Then run:
 
@@ -143,23 +168,23 @@ just sealer-upgrade-check staging 5 <activation_ms>
 ```
 
 It must pass. It refuses unless every member reads snapshot version 18, runs decision version 5 and keeps its frames
-on the heap; the sequencer job has `sealer_version_kept`, the batcher and the validator jobs have `reads_egress`, and
+on the heap; the sequencer job has `sealer_version_kept` and `v2_loop`, the batcher and the validator jobs have `reads_egress`, and
 the egress job has `ref_mark`; and every reader cursor is above the highest R of the egress instances.
 
-### 8. Send the upgrade transaction on Sepolia
+### 9. Send the upgrade transaction on Sepolia
 
 **This step needs the explicit approval of the operator. Do nothing in this step without that approval.**
 
-The Safe signs `ETHLockbox.initiateUpgrade(5, <activation_ms>)`, with the time of step 7.
+The Safe signs `ETHLockbox.initiateUpgrade(5, <activation_ms>)`, with the time of step 8.
 
 Checks:
 
 - Each member logs `cluster FEATURE-ACTIVATION` with `feature=5` and `outcome=STORED`.
 - `kardamom_sealer_feature_state{feature="5"}` is 1 on each member.
 - From here, the members write snapshot version 18. A release that reads only up to version 17 stops on it. Do not
-  roll the sealer back to such a release. See "A rollback after step 8" below.
+  roll the sealer back to such a release. See "A rollback after step 9" below.
 
-### 9. Watch the switch
+### 10. Watch the switch
 
 At the activation time:
 
@@ -171,7 +196,7 @@ Checks:
 - `kardamom_sealer_snapshot_bytes` falls at the next snapshot.
 - `kardamom_sealer_ref_refused_total` stays 0. Receipts keep landing.
 
-### 10. Move the executors to carry mode, one at a time
+### 11. Move the executors to carry mode, one at a time
 
 Deploy with `KARDAMOM_CARRY_EXECUTORS=0`. After its checks pass, deploy with `0,1`, then with `0,1,2`. The release
 gate refuses an executor unless every member reports `carryWindow` true, its member runs the feed, the executor job
@@ -184,7 +209,7 @@ Checks, for each executor that moved:
 - `kardamom_sealer_feed_state` is 3 (live) on the member of the executor.
 - Receipts land. `kardamom_egress_copy_mismatch_total` does not move. No `UnjoinableReference` error.
 
-### 11. Soak for 24 hours
+### 12. Soak for 24 hours
 
 Run the canary for 24 hours. Record these values, for the trigger of the retained file:
 
@@ -203,7 +228,7 @@ Raise `KARDAMOM_CLUSTER_RETENTION` with a rolling deploy. The rule is `retention
 - The gate refuses a lower value unless `KARDAMOM_ALLOW_MUST_MATCH=retention`.
 - A rate above about 2,180 tx/s needs the retained file or a change to the replay path.
 
-### A rollback after step 8
+### A rollback after step 9
 
 After the first snapshot of version 18, a sealer member of a release that reads only up to version 17 stops at its
 next start. Nothing in the deploy refuses that rollback yet:
@@ -230,16 +255,16 @@ sealer:
 An egress of an older release stores references but does not raise its reference mark. So after a rollback of the
 egress, the mark can be too low, and R is not true.
 
-1. The release gate refuses the move of a reader to the egress (step 4), and the upgrade check refuses feature 5
-   (step 7), while any egress allocation runs a job version without the meta `ref_mark`.
+1. The release gate refuses the move of a reader to the egress (step 5), and the upgrade check refuses feature 5
+   (step 8), while any egress allocation runs a job version without the meta `ref_mark`.
 2. Deploy the release of the egress again.
 3. Write down B, the highest `kardamom_executor_block_number` at the time of that deploy. Every frame that the older
    egress stored is at or below B.
-4. Do not do step 4, 7 or 10 until each reader and each executor is past B:
+4. Do not do step 5, 8 or 11 until each reader and each executor is past B:
    - `kardamom_batcher_last_posted_block` and `validator_committed_block` above B;
-   - for step 10, `kardamom_executor_block_number` minus 32 above B.
+   - for step 11, `kardamom_executor_block_number` minus 32 above B.
 
-After the switch of step 9, the sealer refuses each new reference, so a rollback of the egress then adds none.
+After the switch of step 10, the sealer refuses each new reference, so a rollback of the egress then adds none.
 
 This rule is manual. A follow-up can remove it: `Store::open` of the egress can rebuild the mark from the segments, as
 the highest reference of every segment (`RefMark::top` over each one), and not only read the side file. Then a
@@ -247,7 +272,7 @@ deploy of the new release after a rollback gives a true R again.
 
 ### What staging needs (kardamom-infra)
 
-The deploy does not change these. Apply them before step 5.
+The deploy does not change these. Apply them before step 6.
 
 - On each sealer node, the directories `/opt/kardamom/state`, `/opt/kardamom/checkpoints` and `/opt/kardamom/mirror`,
   writable by the executor and the state mirror.

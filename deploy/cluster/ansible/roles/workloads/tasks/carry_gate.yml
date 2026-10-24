@@ -14,7 +14,10 @@
 # below version 5, and the sealer relays them as is. A reader of an older
 # release drops such a frame and stops at the gap. So a floor above 0
 # needs every reader of this release, and a floor above the lowest
-# decisionVersion of the members is wrong.
+# decisionVersion of the members is wrong. The floor acts only in the v2
+# loop of the sequencer: the v1 loop offers record type 0 at every version
+# and every floor. So a floor above 0 also needs the sequencers on the v2
+# loop (the job meta v2_loop), in the registered job and in the target.
 - name: Read the registered sequencer for the version floor
   ansible.builtin.include_tasks: read_job.yml
   vars:
@@ -67,6 +70,19 @@
           {{ workloads_sealer_status.results | map(attribute='json') | map(attribute='decisionVersion', default=0)
              | map('int') | list }}
 
+    - name: Refuse a version floor with the v1 loop in the target
+      ansible.builtin.assert:
+        that: workloads_sequencer_admission == 'on'
+        fail_msg: >-
+          Refused: KARDAMOM_SEALER_VERSION_FLOOR is {{ workloads_gate_floor }}, and the target runs the v1 loop of the
+          sequencers (KARDAMOM_SEQUENCER_ADMISSION is not on). The v1 loop offers record type 0 at every floor. Deploy
+          with KARDAMOM_SEQUENCER_ADMISSION=on first, then set the floor.
+
+    - name: Check that the registered sequencers run the v2 loop
+      ansible.builtin.include_tasks: upgrade_check_job.yml
+      vars:
+        workloads_upgrade_job: "{{ workloads_upgrade_window_jobs | selectattr('metas', 'contains', 'v2_loop') | first }}"
+
     - name: Check the readers of a relayed full reference
       ansible.builtin.include_tasks: upgrade_check_job.yml
       loop: "{{ workloads_floor_jobs }}"
@@ -78,9 +94,11 @@
 # range holds a reference that the reader cannot join. So the posted block
 # of the batcher and the committed block of the validator must be above
 # the block of R before the move. A reader job that Nomad does not know
-# has no block to read. On a live chain, it starts on the cluster egress
-# first. On a new chain (no registered sealer) the egress stores no
-# reference, so a new reader may start on the egress at once.
+# has no block to read. Under decision versions 3 and 4 both loops of the
+# sequencer offer record type 0, so a new chain stores references too. So
+# a new reader starts on the egress only while every egress instance
+# reports no stored reference (R index 0). Else it starts on the cluster
+# egress first.
 - name: Read the registered readers of the egress
   ansible.builtin.uri:
     url: "{{ workloads_nomad_addr }}/v1/job/{{ item }}?namespace={{ workloads_namespace | urlencode }}"
@@ -102,21 +120,30 @@
       {{ (['batcher'] if workloads_batcher_egress == 'on' else [])
          + (['validator'] if workloads_validator_egress == 'on' else []) }}
 
-- name: Refuse a new reader on the egress on a live chain
-  ansible.builtin.assert:
-    that: workloads_gate_new_readers | length == 0
-    fail_msg: >-
-      Refused: Nomad does not know the {{ workloads_gate_new_readers | join(' and ') }} job, and the deploy starts it
-      on the egress (--egress) on a live chain. The gate cannot read its block against the last stored reference.
-      Deploy it on the cluster egress first, then switch it.
-  vars:
+- name: Keep the new readers on the egress
+  ansible.builtin.set_fact:
     workloads_gate_new_readers: >-
       {{ workloads_gate_readers.results | selectattr('status', 'equalto', 404)
-         | selectattr('item', 'in', workloads_gate_switched_readers) | map(attribute='item') | list
-         if workloads_gate_cluster_job.status == 200 else [] }}
+         | selectattr('item', 'in', workloads_gate_switched_readers) | map(attribute='item') | list }}
+  vars:
     workloads_gate_switched_readers: >-
       {{ (['batcher'] if workloads_batcher_egress == 'on' else [])
          + (['validator'] if workloads_validator_egress == 'on' else []) }}
+
+- name: Check the new readers on the egress
+  when: workloads_gate_new_readers | length > 0
+  block:
+    - name: Read the reference mark for the new readers
+      ansible.builtin.include_tasks: egress_mark.yml
+
+    - name: Refuse a new reader on the egress while the egress holds a reference
+      ansible.builtin.assert:
+        that: workloads_ref_index | int == 0
+        fail_msg: >-
+          Refused: Nomad does not know the {{ workloads_gate_new_readers | join(' and ') }} job, the deploy starts it
+          on the egress (--egress), and the egress holds a reference (kardamom_egress_ref_frame_max_index
+          {{ workloads_ref_index }}). A new reader has no block to read against it. Deploy it on the cluster egress
+          first, then switch it.
 
 - name: Check the readers that move to the egress
   when: workloads_gate_moving_readers | length > 0

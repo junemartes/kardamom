@@ -1004,6 +1004,15 @@ class DeployTest(Deploys):
         return '\n'.join(t['EmbeddedTmpl'] for g in job['TaskGroups'] for task in g['Tasks']
                          for t in task.get('Templates') or [])
 
+    def test_the_sequencer_admission_switch_adds_the_v2_section(self):
+        """Empty keeps the v1 loop; on appends the [admission] table."""
+        for switch, present in (('', False), ('on', True)):
+            with self.subTest(switch=switch):
+                self.run_deploy({'workloads_sequencer_admission': switch}, check=True)
+                templates = self.job_templates(self.api.state['plans']['sequencer'])
+                self.assertEqual('[admission]\nenabled = true\nmax_parked = 512\nmax_forwarded = 512' in templates,
+                                 present)
+
     def test_the_egress_switches_default_off(self):
         """With every switch off, no egress job and no reader flag."""
         self.run_deploy(check=True)
@@ -2005,8 +2014,9 @@ class CarryTest(Deploys):
     sequencer version floor, the move of the readers to the egress, the
     carry executors, the retention, and the upgrade check of feature 5."""
 
-    # A chain with the egress and the frames of the executors.
-    DEPLOY_ENVIRON = {'KARDAMOM_EGRESS': '1', 'KARDAMOM_EXEC_FRAMES': 'on'}
+    # A chain with the egress, the frames of the executors, and the v2 loop
+    # of the sequencers.
+    DEPLOY_ENVIRON = {'KARDAMOM_EGRESS': '1', 'KARDAMOM_EXEC_FRAMES': 'on', 'KARDAMOM_SEQUENCER_ADMISSION': 'on'}
     ON_SEALERS = DEPLOY_ENVIRON | DeployTest.ON_SEALERS
     # R of each egress instance, as (index, block): the highest is index
     # 100 at block 50.
@@ -2047,6 +2057,17 @@ class CarryTest(Deploys):
         """The groups of each registration of the executor job."""
         return [[(g['Name'], g['Count']) for g in job['TaskGroups']]
                 for job in self.api.state.get('registrations', []) if job['ID'] == 'executor']
+
+    def test_the_bring_up_of_the_carry_shard_deploys_a_new_chain(self):
+        """The bring-up of the chaos-carry shard: the member feed, the
+        executors on the sealer nodes, the egress and the v2 loop of the
+        sequencers, all on a new chain."""
+        self.run_deploy(environ=self.ON_SEALERS | {'KARDAMOM_SEQUENCER_ADMISSION': 'on'})
+        jobs = {job['ID']: job for job in self.api.state['registrations']}
+        self.assertEqual(sorted(g['Name'] for g in jobs['executor']['TaskGroups']),
+                         ['executor-0', 'executor-1', 'executor-2'])
+        self.assertIn('[admission]\nenabled = true', DeployTest.job_templates(jobs['sequencer']))
+        self.assertIn('egress', jobs)
 
     def test_the_executors_move_to_the_sealer_nodes_one_at_a_time(self):
         self.deploy()
@@ -2104,6 +2125,13 @@ class CarryTest(Deploys):
         self.api.state['down_groups'] = ['cluster-2']
         self.refused(floor, 'the sealer members cluster-2 do not run, so the gate cannot read their decision version')
         del self.api.state['down_groups']
+        # The v1 loop offers record type 0 at every floor.
+        self.refused(floor | {'KARDAMOM_SEQUENCER_ADMISSION': ''},
+                     'and the target runs the v1 loop of the sequencers')
+        meta = self.api.state['jobs']['sequencer']['Meta']
+        del meta['v2_loop']
+        self.refused(floor, 'the sequencer job does not run the v2 loop, the only loop that offers the bytes')
+        meta['v2_loop'] = 'true'
         for job in ('batcher', 'egress'):
             meta = self.api.state['jobs'][job]['Meta']
             del meta['relayed_full_ref']
@@ -2133,9 +2161,15 @@ class CarryTest(Deploys):
         del self.api.state['metrics']['node-egress.1']
         self.refused(readers, 'Refused: an egress instance does not report its reference mark')
         self.set_marks()
-        # A batcher that Nomad does not know has no block to read.
+        # A batcher that Nomad does not know has no block to read. It may
+        # start on the egress only while the egress holds no reference.
         del self.api.state['jobs']['batcher']
-        self.refused(readers, 'Nomad does not know the batcher job, and the deploy starts it on the egress')
+        self.refused(readers, 'Nomad does not know the batcher job, the deploy starts it on the egress (--egress), and'
+                              ' the egress holds a reference (kardamom_egress_ref_frame_max_index 100)')
+        for node in self.MARKS:
+            self.metric(node, {'kardamom_egress_ref_frame_max_index': 0, 'kardamom_egress_ref_frame_max_block': 0})
+        self.run_deploy(check=True, environ=readers)
+        self.assertEqual(self.api.state['plans']['batcher']['Meta']['reads_egress'], 'true')
 
     def test_the_carry_executors_move_one_at_a_time_after_the_switch(self):
         self.deploy()
@@ -2231,6 +2265,8 @@ class CarryTest(Deploys):
              "the stores ['file', 'heap', 'heap']"),
             ('sequencer', lambda state: state['jobs']['sequencer']['Meta'].pop('sealer_version_kept'),
              'the sequencer job does not keep the highest sealer version across its sessions'),
+            ('v1 loop', lambda state: state['jobs']['sequencer']['Meta'].pop('v2_loop'),
+             'the sequencer job does not run the v2 loop, the only loop that offers the bytes of a transaction'),
             ('batcher', lambda state: state['jobs']['batcher']['Meta'].pop('reads_egress'),
              'the batcher job does not read the canonical stream from the egress'),
             ('egress', lambda state: state['jobs']['egress']['Meta'].pop('ref_mark'),

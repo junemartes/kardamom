@@ -207,6 +207,11 @@ workloads_carry_executor_ids: "{{ workloads_carry_executors | split(',') | rejec
 # gate refuses a floor above the lowest decisionVersion of the members,
 # and a floor above 0 until every reader reads a relayed full reference.
 workloads_sealer_version_floor: "{{ lookup('env', 'KARDAMOM_SEALER_VERSION_FLOOR') }}"
+# The v2 loop of the sequencers (KARDAMOM_SEQUENCER_ADMISSION): "on" or
+# "off". Empty keeps the job's "off" default. The carry window needs it:
+# only the v2 loop carries the bytes of a transaction under decision
+# version 5.
+workloads_sequencer_admission: "{{ lookup('env', 'KARDAMOM_SEQUENCER_ADMISSION') }}"
 # The ceiling of the sealer retention in frames, and in bytes: the
 # retained frames times their mean size. A replay over a cluster session
 # queues every wanted frame at once, and the sealer closes a session whose
@@ -277,6 +282,7 @@ workloads_egress_job_vars:
   sequencer:
     receipts_from_egress: "{{ workloads_sequencer_receipts_from_egress }}"
     sealer_version_floor: "{{ workloads_sealer_version_floor }}"
+    admission: "{{ workloads_sequencer_admission }}"
   ingress:
     receipt_query_endpoints: "{{ workloads_egress_url if workloads_ingress_receipts_from_egress == 'on' else '' }}"
   notifier:
@@ -525,11 +531,17 @@ workloads_upgrade_v4_jobs:
 # the batcher and the validator read the canonical stream from the egress,
 # because the exact window answers a cursor below it with
 # REPLAY_UNAVAILABLE. ref_mark: the egress keeps the highest stored
-# reference in a side file, so the check can trust its mark.
+# reference in a side file, so the check can trust its mark. v2_loop: the
+# sequencer runs the v2 loop (KARDAMOM_SEQUENCER_ADMISSION=on). The v1 loop
+# offers each transaction as a reference of record type 0 at every
+# version and every floor, and the carry window refuses such a reference.
 workloads_upgrade_window_jobs:
   - name: sequencer
     metas: [sealer_version_kept]
     does: keep the highest sealer version across its sessions
+  - name: sequencer
+    metas: [v2_loop]
+    does: run the v2 loop, the only loop that offers the bytes of a transaction
   - name: batcher
     metas: [reads_egress]
     does: read the canonical stream from the egress
