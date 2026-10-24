@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::checks::{Lookups, Refill, Refills, Terms};
+use super::checks::{Lookups, Terms};
+use super::refill::{Refill, RefillWatch, Refills, WatcherRuns};
 use super::*;
 use crate::Shard;
 
@@ -261,39 +262,95 @@ fn refills(republished: Option<i64>, published: Option<i64>) -> Refills {
     }
 }
 
+/// The refills that a watch from `base` shows for each reading.
+fn watched(base: Refills, readings: &[Refills]) -> Vec<Option<Refill>> {
+    let mut watch = RefillWatch::new(base);
+    readings.iter().map(|now| watch.step(*now)).collect()
+}
+
 #[test]
 fn a_refill_is_a_rise_of_the_republish_counter() {
     let before = refills(Some(3), Some(200));
-    assert_eq!(before.refill_to(before), None);
     assert_eq!(
-        before.refill_to(refills(Some(4), Some(201))),
-        Some(Refill::Republished)
+        watched(before, &[before, refills(Some(4), Some(201))]),
+        [None, Some(Refill::Republished)]
     );
-    // A dark exporter is not a rise.
-    assert_eq!(before.refill_to(refills(None, None)), None);
+    // A dark exporter is not a rise, and not a drop.
+    assert_eq!(
+        watched(before, &[refills(None, None), refills(None, Some(230))]),
+        [None, None]
+    );
+    // Publishes with no republish and no drop show no refill.
+    assert_eq!(watched(before, &[refills(Some(3), Some(230))]), [None]);
     assert_eq!(before.describe(), "republished 3, published 200");
     assert_eq!(refills(None, None).describe(), "republished ?, published ?");
 }
 
 #[test]
-fn a_restarted_da_watcher_refills_once_it_publishes() {
+fn a_restarted_da_watcher_needs_a_rise_after_the_drop() {
     let before = refills(Some(5), Some(200));
-    // The restart resets both counters. The new process has published
-    // nothing yet.
-    assert_eq!(before.refill_to(refills(Some(0), Some(0))), None);
-    // Its first publish follows the sealer's origin.
+    // The new process published 3 epochs before the first reading,
+    // perhaps into no queue. The drop moves the baseline, so they count
+    // for nothing.
+    let drop = refills(Some(0), Some(3));
+    assert_eq!(watched(before, &[drop, drop, drop]), [None, None, None]);
+    // A publish after the drop is the refill.
     assert_eq!(
-        before.refill_to(refills(Some(0), Some(3))),
-        Some(Refill::Restarted)
+        watched(before, &[drop, refills(Some(0), Some(4))]),
+        [None, Some(Refill::Restarted)]
     );
-    // The published counter shows the restart also when no epoch was
-    // published again before it.
+    // A republish after the drop is a republish.
     assert_eq!(
-        refills(Some(0), Some(200)).refill_to(refills(Some(0), Some(3))),
-        Some(Refill::Restarted)
+        watched(before, &[drop, refills(Some(1), Some(3))]),
+        [None, Some(Refill::Republished)]
     );
-    // Publishes with no republish and no reset show no refill.
-    assert_eq!(before.refill_to(refills(Some(5), Some(230))), None);
+    // The published counter shows the drop also with no republish before
+    // it.
+    assert_eq!(
+        watched(
+            refills(Some(0), Some(200)),
+            &[drop, refills(Some(0), Some(4))]
+        ),
+        [None, Some(Refill::Restarted)]
+    );
+}
+
+/// A fail-fast exit line of the da-watcher at `at`, with `msg`.
+fn exit_line(at: &str, msg: &str) -> String {
+    format!(
+        "{at} ERROR kardamom_log::fail_fast: aeron client error; exiting (fail-fast) code=1000 msg=\"{msg}\""
+    )
+}
+
+#[test]
+fn a_restart_is_judged_by_its_driver_loss() {
+    let alloc = || "c683773a-aac6-9a63-af79-0d4889810fca".to_string();
+    let base = WatcherRuns::new([(alloc(), 0)], "start\n");
+    assert_eq!(base.judge(&base), Ok(None));
+    let loss = exit_line("22:24:10", "MediaDriver has been shutdown");
+    let after_loss = WatcherRuns::new([(alloc(), 1)], &format!("start\n{loss}\n"));
+    let note = after_loss.judge(&base).unwrap().unwrap();
+    assert!(note.contains("restarted 1 times"), "{note}");
+    assert!(note.contains("c683773a restarted 1 times"), "{note}");
+    assert!(note.contains("MediaDriver has been shutdown"), "{note}");
+    // A restart with no driver loss fails.
+    let stall = exit_line("22:24:10", "service interval exceeded");
+    let stalled = WatcherRuns::new([(alloc(), 1)], &format!("start\n{stall}\n"));
+    let err = stalled.judge(&base).unwrap_err();
+    assert!(
+        err.contains("a driver loss explains 0 of the 1 restarts"),
+        "{err}"
+    );
+    // An exit before the baseline explains no restart after it.
+    let old = WatcherRuns::new([(alloc(), 1)], &format!("{loss}\n"));
+    assert!(
+        WatcherRuns::new([(alloc(), 2)], &format!("{loss}\n"))
+            .judge(&old)
+            .is_err()
+    );
+    // A new allocation is a restart.
+    let moved = WatcherRuns::new([("6479b28f-0000".to_string(), 0)], &format!("{loss}\n"));
+    assert!(moved.judge(&base).unwrap().is_some());
 }
 
 #[test]
