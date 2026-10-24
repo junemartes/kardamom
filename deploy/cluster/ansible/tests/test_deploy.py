@@ -2148,6 +2148,10 @@ class CarryTest(Deploys):
         del self.api.state['status']
         self.metric('node-cluster-2', {'kardamom_sealer_feature_state{feature="5"}': 1})
         self.refused(v1, 'kardamom_sealer_feature_state{feature="5"} [-1.0, -1.0, 1.0]')
+        # A member whose /metrics does not answer can hold feature 5.
+        self.metric('node-cluster-0', {})
+        self.metric('node-cluster-2', {'kardamom_sealer_feature_state{feature="5"}': 0})
+        self.refused(v1, "members whose /metrics does not answer ['cluster-1']")
         self.assertEqual(self.api.state['writes'], [])
         # The documented way out.
         self.run_deploy(check=True, environ=v1 | {'KARDAMOM_ALLOW_MUST_MATCH': 'admission'})
@@ -2305,6 +2309,9 @@ class CarryTest(Deploys):
     def test_feature_three_or_four_off_is_refused_while_a_member_holds_feature_five(self):
         self.deploy()
         self.api.state['reads_max'] = {f'node-cluster-{i}': 16 for i in range(3)}
+        # A member of an older release reports no gauge of feature 5.
+        self.metric('node-cluster-0', {})
+        self.metric('node-cluster-2', {})
         self.metric('node-cluster-1', {'kardamom_sealer_feature_state{feature="4"}': 2,
                                         'kardamom_sealer_feature_state{feature="5"}': 1})
         held = self.api.state['metrics']['node-cluster-1']
@@ -2319,6 +2326,10 @@ class CarryTest(Deploys):
         self.metric('node-cluster-1', {'kardamom_sealer_feature_state{feature="5"}': 0})
         output = self.upgrade_check(feature='4', activation_ms='18446744073709551615')
         self.assertIn('The upgrade transaction of feature 4 may go to the Safe', output)
+        # A member whose /metrics does not answer can hold feature 5.
+        del self.api.state['metrics']['node-cluster-2']
+        output = self.upgrade_check(success=False, feature='4', activation_ms='18446744073709551615')
+        self.assertIn("members whose /metrics does not answer: ['cluster-2']", output)
 
 if __name__ == '__main__':
     unittest.main()
