@@ -23,6 +23,7 @@
       name: data-dirs
       file: data-dirs.sysbatch.nomad.hcl
       vars:
+        image_ref: "{{ workloads_image_refs.aeron | default('') }}"
         base: "{{ paths.base }}"
         dirs: "{{ node_data_dirs.paths | join(' ') }}"
         mode: "{{ node_data_dirs.mode }}"

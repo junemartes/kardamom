@@ -8,6 +8,16 @@
 #
 # The workloads role passes the list and the mode from node_data_dirs in
 # group_vars/all.yml, the one list of the data directories.
+#
+# The task runs the Aeron image of the release manifest, as root, with a
+# shell as its entrypoint. The release signs that image, and most nodes
+# already hold it, so the job needs no other image.
+
+variable "image_ref" {
+  type        = string
+  default     = ""
+  description = "The Aeron image of the release manifest (repo:tag@sha256:...). Empty = mutable :dev tag fallback (dev-only)."
+}
 
 variable "datacenter" {
   type    = string
@@ -41,18 +51,23 @@ job "data-dirs" {
   group "data-dirs" {
     task "data-dirs" {
       driver = "docker"
+      # Root makes a directory under a root-owned base and sets its mode.
+      user = "root"
 
       config {
-        image = "busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-aeron:dev"
         volumes = [
           "${var.base}:${var.base}",
         ]
-        command = "/bin/sh"
-        args = concat([
+        # The shell replaces the entrypoint of the media driver. The
+        # directories are the positional arguments of the script.
+        entrypoint = [
+          "/bin/sh",
           "-c",
           "mkdir -p \"$@\" && chmod ${var.mode} \"$@\"",
           "data-dirs",
-        ], split(" ", var.dirs))
+        ]
+        args = split(" ", var.dirs)
       }
 
       resources {

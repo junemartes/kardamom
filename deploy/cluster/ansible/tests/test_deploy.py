@@ -327,8 +327,13 @@ class NomadAPI(BaseHTTPRequestHandler):
                 # A job the test names has no running allocation: a crash loop.
                 running = name not in state.get('not_running', ()) \
                     and group['Name'] not in state.get('down_groups', ())
+                # A node that the test takes down holds the first allocation
+                # of the job. Nomad stops the allocation of a down node and
+                # marks it lost.
+                lost = name in state.get('down_node_jobs', ()) and i == 0
                 allocs.append({'TaskGroup': group['Name'], 'JobVersion': self.version(name) - int(stale),
-                               'DesiredStatus': 'run', 'ClientStatus': done if running else 'pending',
+                               'DesiredStatus': 'stop' if lost else 'run',
+                               'ClientStatus': 'lost' if lost else done if running else 'pending',
                                'NodeID': f'node-{group["Name"]}',
                                'DeploymentStatus': {'Canary': False}})
         return allocs
@@ -1297,10 +1302,14 @@ class DeployTest(Deploys):
         self.assertEqual(self.api.state['writes'][0], 'data-dirs')
         job = self.api.state['jobs']['data-dirs']
         self.assertEqual((job['Type'], job['NodePool']), ('sysbatch', 'all'))
-        config = job['TaskGroups'][0]['Tasks'][0]['Config']
+        task = job['TaskGroups'][0]['Tasks'][0]
+        config = task['Config']
+        # The signed Aeron image of the manifest, as root: no other image.
+        self.assertEqual(config['image'], f'registry.example:5000/kardamom-aeron:test@sha256:{"a" * 64}')
+        self.assertEqual(task['User'], 'root')
         self.assertEqual(config['volumes'], ['/opt/kardamom:/opt/kardamom'])
-        self.assertEqual(config['args'][:3], ['-c', 'mkdir -p "$@" && chmod 0777 "$@"', 'data-dirs'])
-        dirs = config['args'][3:]
+        self.assertEqual(config['entrypoint'], ['/bin/sh', '-c', 'mkdir -p "$@" && chmod 0777 "$@"', 'data-dirs'])
+        dirs = config['args']
         self.assertIn('/opt/kardamom/canary', dirs)
         # One list: the common role makes the same directories.
         group_vars = yaml.safe_load((ANSIBLE / 'group_vars/all.yml').read_text())
@@ -1319,6 +1328,11 @@ class DeployTest(Deploys):
                    for group in job['TaskGroups'] for task in group['Tasks']
                    for volume in (task['Config'].get('volumes') or [])}
         self.assertEqual({d for d in mounted if d.startswith('/opt/kardamom/')} - exempt - set(dirs), set())
+
+    def test_a_down_node_does_not_hold_the_data_directory_job(self):
+        self.api.state['down_node_jobs'] = ['data-dirs']
+        self.run_deploy()
+        self.assertEqual(self.api.state['writes'][:2], ['data-dirs', 'aeron'])
 
     def test_an_incomplete_data_directory_job_stops_the_deploy_before_any_service(self):
         self.api.state['not_running'] = ['data-dirs']
