@@ -1,7 +1,6 @@
 # Carry activation: the exact window and the member feed on the heap
 
-- Status: revision 4, approved by the design review on 2026-10-24; accepted by the user ("Let's do
-  it and implement e2e", 2026-10-23). Not implemented.
+- Status: revision 4, approved by the design review on 2026-10-24; accepted by the user. Implemented in #784-#791 and C7-C9.
 - Issue: #771 (the carried path is not complete on staging). This spec closes gap 3 (the
   switch of a live chain) and gap 1 (the executors read the member feed).
 - The user decided on 2026-10-23:
@@ -19,7 +18,7 @@
   driver on the sealer nodes and the pinned executor groups), the preflight of #780, and #765
   (the exact window under version 5).
 - Section 17 maps each finding of the review of revision 1 to its change, and section 18 each
-  finding of the reviews of revisions 2 and 3.
+  finding of the reviews of revisions 2 and 3, and each difference that the implementation found.
 - Also builds on #768 (the `tx_drops` stream and `TxDrop`), for the drop record of section 5.
 
 ## 1. The problem
@@ -278,9 +277,10 @@ There are two rules. They change at two defined points of the same log entry.
     `SessionBacklogs.BYTE_LIMIT`, 64 MiB (`SessionBacklogs.java:74`), is closed
     (`SealerEgress.java:238-244`). So a reader that replays from near the floor of a larger
     window is closed, reconnects, and replays again, with no end.
-  - The cap in bytes: `retention x mean frame bytes <= 32 MiB`, half of the backlog limit. The
-    mean is `kardamom_sealer_retained_bytes / kardamom_sealer_retained_frames` at the time of the
-    deploy. The preflight of C6 checks it.
+  - The cap in bytes: `retention x mean frame bytes <= 48 MiB`, three quarters of the backlog
+    limit. So 131,072 frames at 300 bytes (39.3 MB) fit, and a mean above 384 bytes gives a lower
+    value. The mean is `kardamom_sealer_retained_bytes / kardamom_sealer_retained_frames` at the
+    time of the deploy. The release gate of C6 checks it when the sealer job and the value change.
   - The ceiling in frames: 131,072. It assumes transfers of about 300 bytes a frame: 131,072
     frames are then about 39 MB, below 64 MiB. This design supports no larger value. With larger
     frames, the cap in bytes gives a lower value.
@@ -399,8 +399,9 @@ read them:
 
 ## 5. The sequencer
 
-All of this section is the v2 loop, which staging runs
-(`crates/sequencer/src/bin/kardamom-sequencer/main.rs:239-275`). The v1 loop does not change.
+Staging runs the v2 loop (`crates/sequencer/src/bin/kardamom-sequencer/main.rs`,
+`admission.enabled`). The kept version, its floor and the drop record of kind 18 run on the egress
+feed thread, so the v1 loop gets them too. Only the v2 loop gets the refusal event for its filter.
 
 - **The kept version.** `SealerVersion` keeps the highest version that any session of the
   process reported.
@@ -410,9 +411,10 @@ All of this section is the v2 loop, which staging runs
   - There is no hold, no deadline and no queue.
 - **The first value.** A new process has no report yet. It starts from the setting
   `--sealer-version-floor` (env `KARDAMOM_SEALER_VERSION_FLOOR`, default 0).
-  - The deploy sets the floor to the lowest `decisionVersion` of the members at the time of the
-    deploy. On staging that is 5.
-  - The deploy sets a floor above 0 only when every reader runs the decoder of section 7.4
+  - The operator sets the floor to the lowest `decisionVersion` of the members. On staging that
+    is 5. The release gate reads `decisionVersion` on every member, and refuses a floor above the
+    lowest value.
+  - The release gate refuses a floor above 0 until every reader runs the decoder of section 7.4
     (section 10.1). A wrong floor then costs no halt.
   - A kind 17 that says lower lowers the version. So a wrong floor lasts until the first kind 17,
     a few milliseconds after the session opens.
@@ -430,6 +432,10 @@ All of this section is the v2 loop, which staging runs
      frame on `tx_drops` of its lane, with the sender, the nonce and the reason
      `DropReason::SealerRefusedReference`.
   3. It counts `kardamom_sequencer_ref_refused_total`.
+  4. In the v2 loop, it puts `AccountEvent::Refused { sender, nonce }` on the account queue. The
+     filter forgets the forwarded run of the sender, as for a lost transaction, so the resend at
+     the same nonce goes out at once. A full queue loses the event, and the loss window frees the
+     nonce later.
   - The new reason goes at the end of `DropReason`: its layout is frozen. Its text is
     `transaction dropped by the sealer, send it again`, code -32000. The status is provisional
     (4.3).
@@ -495,17 +501,16 @@ All of this section is the v2 loop, which staging runs
   its block. After the sequencer release of section 5, R stops moving.
 - **R is durable.** `Store::open` rebuilds the head from the last segment only (finding F8). So R
   goes in a side file of the store, `ref-mark`: `[index:u64 LE][block:u64 LE]`, 16 bytes.
-  - `append_one` (`crates/egress/src/store.rs:211-224`) notes the highest `RT_TXREF` frame of
-    the batch. `append` (`store.rs:118-119`) writes the mark once per batch, when that frame is
-    above the mark.
-  - It writes a temporary file, syncs it, and renames it over `ref-mark`. A crash leaves the old
-    mark or the new mark, never a part.
-  - The order: the frames of the batch, then the mark, then the sync of the segment
-    (`store.rs:128`). So after a crash the mark is at or above every reference that the segment
-    holds. A mark above the segment only delays a switch. It never lets a reader meet a
-    reference.
-  - The hook in `append_one` also covers the catch-up frames of `Input::Caught`. They reach the
-    store through the same `append` (`take_caught` and `flush`, `crates/egress/src/owner.rs:228-235`).
+  - `append` finds the highest `RT_TXREF` frame of the batch (`RefMark::top`), and writes the
+    mark once per batch, when that frame is above the mark.
+  - It writes a temporary file, syncs it, renames it over `ref-mark`, and syncs the directory. A
+    crash leaves the old mark or the new mark, never a part.
+  - The order: the mark, then the frames of the batch, then the sync of the segment. So no frame
+    on disk is above the mark, also before the sync. This is stronger than the order of revision
+    4 (the frames before the mark). A mark above the segment only delays a switch. It never lets
+    a reader meet a reference.
+  - The rule in `append` also covers the catch-up frames of `Input::Caught`. They reach the
+    store through the same `append` (`take_caught` and `flush`, `crates/egress/src/owner.rs`).
   - `Store::open` reads the mark. A missing mark is `(0, 0)`: no reference is stored.
   - A store copied from a peer at a scale-up (decision 27) copies the mark with the segments.
   - `Owner::start_at_floor` resets the store to the floor of a peer (`rebase`,
@@ -585,6 +590,9 @@ feature 5:
   (4.1).
 - The sequencer job has the meta `sealer_version_kept = "true"`, and every live allocation runs
   that job version (`upgrade_check_job.yml`).
+- The egress job has the meta `ref_mark = "true"`, and every live allocation runs that job
+  version. An egress of an older release stores references but does not raise the mark, so after
+  a rollback of the egress the mark can be too low.
 - The batcher and validator jobs have the meta `reads_egress = "true"`, and every live allocation
   runs that job version.
 - **The readers are past R.** The check reads two kinds of value:
@@ -594,7 +602,7 @@ feature 5:
     `kardamom_validator_egress_cursor_index` on each validator, from the metrics endpoint of
     each reader.
   - It refuses unless every reader cursor is above the highest R. It refuses while an egress
-    instance or a reader does not answer.
+    instance or a reader does not answer, or while no batcher or no validator runs.
 
 New rule for features 3 and 4: refuse any activation time other than 0 while any member reports
 `kardamom_sealer_feature_state{feature="5"}` at 1 or 2. A switch back of version 5 would stop
@@ -623,10 +631,11 @@ The gate tests go to `deploy/cluster/ansible/tests/test_deploy.py`, next to the 
   needed. The admin file endpoint and the file copy are not used.
 - **The executor roll.** The pinned groups would roll together, because Nomad orders no groups
   (#781, open question 1). The executor job uses the staged roll of the sealer
-  (`sealer_step.yml`), one group at a time, with a health check between groups (option (a),
-  accepted).
-- **The sequencer floor.** The deploy reads `decisionVersion` on every member and passes the
-  lowest value as `KARDAMOM_SEALER_VERSION_FLOOR`. It refuses a floor above 0 unless every reader
+  (`roll_step.yml`, shared by the sealer and the executor), one group at a time, with a health
+  check between groups (option (a), accepted).
+- **The sequencer floor.** The operator sets `KARDAMOM_SEALER_VERSION_FLOOR`. When the floor
+  changes to a value above 0, the release gate reads `decisionVersion` on every member, and
+  refuses a floor above the lowest value. It also refuses a floor above 0 unless every reader
   job (executor, validator, batcher, egress) has the meta `relayed_full_ref = "true"`, and every
   live allocation runs that job version (section 7.4).
 - **The preflight of `KARDAMOM_CARRY_EXECUTORS`.** It refuses the list unless:
@@ -635,7 +644,10 @@ The gate tests go to `deploy/cluster/ansible/tests/test_deploy.py`, next to the 
   - each listed executor reports `kardamom_executor_block_number`, minus 32, above
     `kardamom_egress_ref_frame_max_block`;
   - the executor job has the meta `carried_ref_fault = "true"`;
-  - `KARDAMOM_EXEC_ON_SEALERS=on`.
+  - `KARDAMOM_EXEC_ON_SEALERS=on`, and the group of each listed executor runs on the sealer
+    nodes;
+  - `KARDAMOM_EGRESS=1`, and `KARDAMOM_EXEC_CURSOR` is not on;
+  - the egress job has the meta `ref_mark`, and every egress instance reports R.
 - **The preflight of #781 stays** for the exec cursor and the executor count equal to the sealer
   count. Its checks of the token and the snapshot interval go.
 
@@ -686,7 +698,9 @@ The list of #781, without the file:
 - **The feed on the heap.** A feed request inside the window gets every frame from its cursor.
   A request below the floor gets `REPLAY_UNAVAILABLE`. A walk across a growth of the byte ring
   gives the same frames. A walk while the window evicts ends with the frames, or gaps
-  (`MemberFeed.java:208-211`), and the next request serves.
+  (`MemberFeed.java`, `walkStep`). The cursor of the gap is below the floor, so a request from
+  it gets `REPLAY_UNAVAILABLE`. A request from a cursor inside the window serves
+  (`SealerHeapFeedTest`).
 - **Allocation.** `CarriedPathAllocationTest`: the type-7 path allocates nothing with the feed on.
 - **Formats.** `FormatRegistryTest` reads 1 to 18. A new case checks a golden v18 snapshot: the
   bytes that the PR of the layout writes. A later change to those bytes fails the test, unless it
@@ -798,7 +812,8 @@ Each step names its checks. Do not start a step until the checks of the step bef
    - `kardamom_sealer_feature_state{feature="5"}` is 1 on each member.
    - From here, `snapshotLatest` is 18, and the preflight of #780 refuses a release rollback.
 9. **The switch.** At the activation time:
-   - Each member logs `cluster CARRY-WINDOW on` at the same block.
+   - Each member logs `cluster CARRY-WINDOW` with `carryWindow=true windowOnly=true`, at the
+     same block.
      `kardamom_sealer_feature_state{feature="5"}` is 2, and `kardamom_sealer_window_exact` is 1.
    - `kardamom_sealer_retained_frames` falls within `retention` frames on each member.
    - `kardamom_sealer_snapshot_bytes` falls at the next snapshot.
@@ -925,7 +940,7 @@ The answers to the questions of revision 1, from the review:
 | 15. Long sentences | Section 1.3, section 4.4 and section 8 now use short sentences. |
 | Questions | Section 16. |
 
-## 18. Changes from revisions 2 and 3, and the notes of the approval
+## 18. Changes from revisions 2 and 3, the notes of the approval, and the implementation
 
 | Finding of the review of revision 2 | Change |
 |---|---|
@@ -934,7 +949,7 @@ The answers to the questions of revision 1, from the review:
 | 3 (major). A type 7 below version 5 halts the readers | Section 7.4: the decoder. Section 4.3: the sealer counter. Section 13: C0 ships first. Section 12.1 and 12.2: the floor follows the decoder. Section 1.3, F6. |
 | 4 (major). A file member loses a feature-5 schedule | Section 4.1: `UNSUPPORTED`. Section 4.6: the restore table with versions 12 and 17. Section 4.7: `retainedStore`. Section 9: the gate refuses feature 5 on a file chain. |
 | 5. No epoch in a kind-3 batch | Section 4.2 and section 11.1: only kind 4 forces a boundary, and a batch holds no boundary. |
-| 6. The walk gap | Section 11.1: "ends with the frames, or gaps, and the next request serves". |
+| 6. The walk gap | Section 11.1: "ends with the frames, or gaps". The implementation note below corrects the rest of the sentence. |
 | 7. Where R and the cursors come from | Section 9: R from each egress instance, the cursors from the readers. |
 | 9. The egress kinds bump | Section 13: C1. |
 | 10. STE | Section 1.3 F1, section 4.2 and section 5 use short sentences. |
@@ -947,6 +962,22 @@ The answers to the questions of revision 1, from the review:
 | Review of revision 3, 6. The hazard of a bad type 7 | Section 7.4. |
 | Review of revision 3, 7. STE | Section 4.3, "The sequencer side", is a list of short sentences. |
 | Review of revision 3, Q1 and Q2 | Section 4.4: raise only, the cap, the README note. Section 13: C6 and C9. Section 16: none open. |
-| Approval notes, 1. The cap in bytes | Section 4.4: `retention x mean frame bytes <= 32 MiB`, from the gauges, checked by C6. 131,072 frames stay the ceiling, for about 300 bytes a frame. |
+| Approval notes, 1. The cap in bytes | Section 4.4: `retention x mean frame bytes <= 48 MiB`, from the gauges, checked by C6. 131,072 frames stay the ceiling, for about 300 bytes a frame. The review of C6 (2026-10-24) raised the cap from 32 MiB to 48 MiB, so 131,072 frames at 300 bytes (39.3 MB) fit. |
 | Approval notes, 2. The mark at a reset | Section 7.2: `reset` keeps the higher mark. Section 11.2 and C5: the test. |
 | Approval notes, 3. STE | Section 4.4: the sentence is split at "The 10,000 tx/s goal". |
+
+The implementation (#784 to #791) found these differences. The code is right in each case, and
+the sections above now say what the code does.
+
+| Difference | Change |
+|---|---|
+| C3. The walk gap | Section 11.1. A gap of an eviction names a cursor below the floor. A request from that cursor gets `REPLAY_UNAVAILABLE`, not the frames. Only a request from inside the window serves. Revision 4 said "the next request serves". |
+| C4. The kept version in the v1 loop | Section 5. The v1 loop reads the kept version and the floor too, and the feed thread publishes the drop of kind 18 for it. Revision 4 said that the v1 loop does not change. |
+| C4. The refusal event | Section 5, kind 18, step 4: the v2 filter frees the refused nonce at once. |
+| C4. An old loss mark after a refusal | A refusal frees the run of the sender at once, but the forward mark of the refused nonce stays in the loss queue. When that mark expires, it can end a new run at the same nonce early. The sender then sends from its chain nonce again. This is the same as the loss expiry of a run that is still in flight (`docs/failure-modes.md`, the kept sealer version). |
+| C5. The order of the mark | Section 7.2. The mark of a batch goes to disk before the frames of the batch. Revision 4 had the frames first. |
+| C6. The job metas | Sections 9 and 10.1. The deploy sets `sealer_version_kept` (sequencer), `carried_ref_fault` (executor) and `ref_mark` (egress). `ref_mark` is new: the release gate and the upgrade check refuse while an egress of an older release runs. |
+| C6. The floor | Sections 5 and 10.1. The operator sets the floor. The release gate reads `decisionVersion` on every member and refuses a floor above the lowest value. Revision 4 said that the deploy reads and passes the value. |
+| C6. The cap in bytes | Section 4.4: 48 MiB, not 32 MiB. |
+| C6. The staged roll | Section 10.1: `roll_step.yml` replaces `sealer_step.yml`, and the sealer and the executor share it. |
+| C2. The switch log line | Section 12, step 9: `cluster CARRY-WINDOW` with `carryWindow=true windowOnly=true`. |

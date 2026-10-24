@@ -286,7 +286,7 @@ Run `just sealer-upgrade-check <env> <feature> <activation_ms>` before the Safe 
 - feature 5 (`FEATURE_CARRY_WINDOW`, the carry window), at any activation time, unless:
   - every member reports `snapshotReadsMax` 18 or more, `decisionVersion` 5 and `retainedStore` `heap`;
   - the sequencer job has the meta `sealer_version_kept`, the batcher and the validator jobs have `reads_egress`, and the egress job has `ref_mark`, each with every live allocation on that job version (`workloads_upgrade_window_jobs`);
-  - every egress instance reports its reference mark, and every `kardamom_batcher_egress_cursor_index` and `kardamom_validator_egress_cursor_index` is above the highest `kardamom_egress_ref_frame_max_index`. An instance that does not answer is a refusal;
+  - every egress instance reports its reference mark, and every `kardamom_batcher_egress_cursor_index` and `kardamom_validator_egress_cursor_index` is above the highest `kardamom_egress_ref_frame_max_index`. An instance that does not answer is a refusal, and so is a chain with no batcher or no validator;
 - a job without its metas (`workloads_upgrade_jobs` in `ansible/roles/workloads/defaults/main.yml`), or a live allocation of an older job version:
   - the sequencer: `nonce_burn`;
   - the executor and the validator: `nonce_burn` and `chain_state_install`;

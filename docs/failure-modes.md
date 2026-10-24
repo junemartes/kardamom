@@ -159,15 +159,23 @@ The sealer refuses user records when the batcher falls too far behind on L1. Bel
   - The ingress raises `da_lag` while the frame says halted, and clears it when the frame says not halted.
   - Any status frame ends a `sealer_no_quorum` halt.
   - The status before a Raft snapshot carries the snapshot notice. The consensus module sends nothing until the snapshot is complete, and on a loaded disk that takes many seconds. After the notice, the ingress waits 60 s for the next status, not 10 s.
-- **Retention floor.** Below decision version 5, `kardamom.cluster.retention` is a minimum, not a maximum.
+- **Retention floor.** Below decision version 5, and under version 5 on a heap member before the carry window turns on, `kardamom.cluster.retention` is a minimum, not a maximum.
   - A frame past the window leaves only when its block is at or below the posted head.
   - The batcher can always replay from its cursor.
   - The guard bounds the growth. The stretch is at most the budget plus one flush, in heap.
   - The retained frames are in the snapshot. A restored member keeps the floor of the snapshot.
-- **Replay window.** Under decision version 5 (the carry flag) on members with `kardamom.cluster.carryBytes=true`, `kardamom.cluster.retention` is the exact window. Members that keep the frames on the heap keep the posted rule, because no member feed runs and the egress cannot serve a reference.
+- **Replay window.** Under decision version 5 (the carry flag), `kardamom.cluster.retention` is the exact window on members with `kardamom.cluster.carryBytes=true`, and on heap members while the carry window (`FEATURE_CARRY_WINDOW`, feature 5) is on. A heap member without the carry window keeps the posted rule: a reader can still meet a reference that the egress cannot serve.
   - A frame past the window leaves at once, at any posted head. The retained frames have a fixed bound at any DA lag.
-  - A cursor below the window gets `REPLAY_UNAVAILABLE`, the batcher too. The reader recovers from another source.
+  - A cursor below the window gets `REPLAY_UNAVAILABLE`, the batcher too. The reader recovers from another source: the batcher and the validator from the egress (`--egress`).
   - The guard still refuses user records. It holds no frame.
+  - A heap member runs the member feed on its heap frames when `kardamom.cluster.feedAeronDir` is set (`KARDAMOM_MEMBER_FEED=on`). The feed needs no retained file. The feed and its gap rule are in "Member feed" in [`../cluster/sealer-service/README.md`](../cluster/sealer-service/README.md).
+- **Carry window (feature 5).** An upgrade transaction turns it on, and it can turn off again. While it and version 5 are on:
+  - The member refuses a transaction reference of record type 0. It answers the offering session with egress kind 18, and counts `kardamom_sealer_ref_refused_total`. The sequencer publishes a drop, and the client sees the provisional status `dropped` (see "The kept sealer version and the refused reference").
+  - A member with the retained file never stores the activation (outcome `UNSUPPORTED`). The upgrade check refuses feature 5 on such a chain.
+  - A member of a release that reads only up to snapshot version 17 stops on version 18. The members write version 18 from the first activation of feature 5, so a rollback of the sealer after it is refused.
+  - Feature 3 or 4 off stops version 5, and with it the rules of feature 5. The sequencers then send type 0 again, and a carry executor stops on the first reference. The upgrade check refuses feature 3 or 4 off while a member holds feature 5.
+  - The rollout and the way back are in [`runbooks/carry-window-rollout.md`](runbooks/carry-window-rollout.md).
+  - Proof: `SealerCarryWindowTest`, `SealerCarryActivationTest`, `SealerCarryClusterTest`, `CarryWindowSwitchTest` and `SealerHeapFeedTest`.
 - **Retained file.** With `kardamom.cluster.carryBytes=true`, the retained frames are in an append-only file on the disk of each member, not on the heap. The default is off.
   - The heap keeps only an index: the end index and the file position of each retained boundary. The heap does not grow with the retained bytes.
   - The member orders a full entry (record type 5) and retains it as a canonical entry with its envelope (record type 6). Each egress session gets the relayed reference (egress kind 15), live and in a replay, never the envelope. The twin copy drops at the dedup, and each refusal is the same as without the file.
@@ -472,7 +480,7 @@ The executors are deterministic state machines. One dead or lagging replica neve
     - A peer serves its log after its base (`GET /checkpoint/log`), so a peer base below a retention floor serves when its log reaches the floor.
     - The writer never waits for the log. A full queue drops the batch (`kardamom_checkpoint_log_dropped_total`), and the gap makes the next base start at once.
 - **Replay-window overrun**
-  - Trigger: the cluster keeps a bounded canonical window (`kardamom.cluster.retention`, default 65,536 frames, about 5 minutes at 200 tps). A `REPLAY_FROM` below the floor of the window is refused with `REPLAY_UNAVAILABLE`. Below decision version 5, the window is a minimum: a frame past it stays until L1 holds its block. Under version 5 with `carryBytes`, the window is exact (see "DA-lag guard and posted-head retention floor"). The retained frames are in the cluster snapshot, so a member that restores from a snapshot keeps the floor of the snapshot. A cursor that is older than the window is the trigger.
+  - Trigger: the cluster keeps a bounded canonical window (`kardamom.cluster.retention`, default 65,536 frames, about 5 minutes at 200 tps). A `REPLAY_FROM` below the floor of the window is refused with `REPLAY_UNAVAILABLE`. Below decision version 5, the window is a minimum: a frame past it stays until L1 holds its block. Under version 5 with `carryBytes`, or with the carry window (feature 5), the window is exact (see "DA-lag guard and posted-head retention floor"). The retained frames are in the cluster snapshot, so a member that restores from a snapshot keeps the floor of the snapshot. A cursor that is older than the window is the trigger.
   - Effect: the refusal is terminal for the local state. A cursor below the floor can never catch up. A fresh or wiped node cannot re-sync from genesis either, because genesis aged out of the window.
   - Recovery with `--carry-bytes` and `--egress`: the executor reads the egress first.
     - The member refuses the cursor. The reader then reads the range read of the egress from the cursor to the head of the store, then the live `egress_order`. It goes back to the member feed when the feed serves the cursor again.
@@ -541,6 +549,14 @@ With `KARDAMOM_EXEC_ON_SEALERS=on` (see [the deploy README](../deploy/cluster/RE
   - Effect: executor `i` gets no entry while its member is down, and its block gauge stops. The other executors carry the chain.
   - Recovery: the member starts again, and the executor asks again from its cursor.
 - **Deploy of the executor job**: Nomad orders no groups, so the role rolls the three executor groups one at a time, and waits for the health check of each group. In a roll of the pinned groups, the other two executors serve the nonce queries during each step. The move from the executor nodes also goes one executor at a time, but the readers already ask the sealer nodes: until the second executor moved, one executor serves the nonce queries.
+- **A reference that no source can join**
+  - Trigger: a transaction reference (record type 0) above the cursor of a carry executor. Only a sequencer of an older release, or a wrong version floor, makes one. The carry window refuses each new one, and the release gate moves an executor only when its committed block, minus 32, is above the block of the last stored reference (R).
+  - Effect: the reader takes the reference as a fault of its source, and reads the same index from the other source. When every source gives a reference at the same index, the executor stops with `UnjoinableReference { index }`.
+  - Recovery: move the executor back to reference mode (leave it out of `KARDAMOM_CARRY_EXECUTORS`). Its cluster session gets the bytes.
+  - Proof: `crates/engine/src/reader/carried/tests_switch.rs` (`references_at_the_same_index_on_both_sources_stop_the_reader`, `a_reference_with_no_second_source_stops_the_reader`).
+- **Rollback of the egress**
+  - Effect: an egress of an older release stores references and does not raise its mark (`ref-mark`). R can then be too low, and a reader past R can still meet a reference.
+  - Prevention: the release gate and the upgrade check refuse while any egress allocation runs a job version without the meta `ref_mark`. The steps after such a rollback are in "After a rollback of the egress" in [`runbooks/carry-window-rollout.md`](runbooks/carry-window-rollout.md).
 - **Wipe of a member**: keep `/opt/kardamom/archive/dir`. It is the archive of the shared driver, with the `exec_txs` recording of the executor, inside the archive directory of the member.
 - Proof: no chaos shard runs carry mode yet.
 
@@ -718,6 +734,7 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
     - publishes one `TxDrop` for the hash on `tx_drops`, with the reason `SealerRefusedReference`. It uses a clone of the drop handle of the publish loop: best effort, with no new queue. The drop counts in `kardamom_sequencer_tx_drops_total{reason="sealer_refused_reference"}`.
   - The sequencer offers nothing again by itself: the v2 loop keeps no transaction after its offer. The client sends the transaction again, and the new offer goes out with its bytes.
   - The feed thread also puts `AccountEvent::Refused { sender, nonce }` on the account queue of the v2 loop. The filter then forgets the forwarded run of the sender, as for a lost transaction. So the resend at the same nonce goes out at once, with no `already known` refusal and no wait for the loss window (`loss_blocks`, 16 blocks). A full queue loses the event, and the loss window frees the nonce later.
+  - The refusal does not remove the loss mark of the refused forward. When that mark expires, `loss_blocks` after the forward, it can end a new run of the sender that holds the same nonce, before a state confirms it. The sender then sends from its chain nonce again. This is the same as the loss expiry today, which can also end a run whose transaction is still in flight.
   - A kind 18 that does not decode logs `a reference refusal of the sealer does not decode` with the error.
   - The egress then answers `dropped` with the text `transaction dropped by the sealer, send it again` (code -32000). The status is provisional. The twin can offer the same transaction with its bytes, and the sealer orders that copy. Its receipt wins over the drop, and the status becomes `executed`. Client text: safe to send again; the status can still become executed. A copy sent after the twin's copy is ordered gets the nonce guard, and the first hash stays `executed`.
   - A sequencer of an older release drops kind 18 as an unknown kind. Its transaction stays unordered unless its twin offers it with its bytes, and the client sees no receipt.

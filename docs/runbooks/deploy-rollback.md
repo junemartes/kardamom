@@ -99,7 +99,7 @@ deploy succeeded and the release degrades the chain after it.
    the pre-release definition, and the resume refuses it with `Another
    change moved the job`. Finish the roll by hand: register the pre-release
    definition (`nomad job history -p -version <before> cluster`) one group
-   at a time, as `sealer_step.yml` does, followers first and the leader
+   at a time, as `roll_step.yml` does, followers first and the leader
    last, and wait for each member's `/ready`. Never revert the whole job:
    the members would restart at once. Then run `just rollback <env>` again
    for the jobs that remain.
@@ -179,6 +179,10 @@ with `Refused:`.
 | `<executor> moves to carry mode, and its committed block ... minus 32 is not above the block <b>` | At its first carry start the executor compares the stream with its committed blocks of that window, and the window still holds a reference. | Wait until the executor passes the block, then deploy. |
 | `KARDAMOM_MEMBER_FEED and KARDAMOM_EXEC_ON_SEALERS are on, off or empty` | A bad value, the executors on the sealer nodes without the feed, or an executor count other than the sealer count. | Fix the switches. Turn on the feed first. |
 | `KARDAMOM_CARRY_EXECUTORS (...) is empty or a list of distinct member indexes` | A bad list, or a list without `KARDAMOM_EXEC_ON_SEALERS=on` and `KARDAMOM_EGRESS=1`, or with `KARDAMOM_EXEC_CURSOR=on`. | Fix the list or the switches. |
+| `KARDAMOM_SEALER_VERSION_FLOOR (...) is empty or a decision version from 0 to 5` | A bad value. | Set empty, or a value from 0 to 5. |
+| `KARDAMOM_CLUSTER_RETENTION (...) is empty or a frame count from 1 to 131072` | A value above the cap in frames. A replay of the whole window would pass the backlog limit of a cluster session. | Set at most 131072. A higher rate needs the retained file or a change to the replay path. |
+
+The last four rows come from the preflight, before the release gate. Their messages do not start with `Refused:`.
 
 The upgrade check (`just sealer-upgrade-check`) refuses with these messages too:
 
@@ -188,4 +192,8 @@ The upgrade check (`just sealer-upgrade-check`) refuses with these messages too:
 | `the upgrade transaction of FEATURE_CARRY_WINDOW (feature id 5) needs every sealer member to read snapshot version 18` | A member of an older release. | Deploy the release to every member. |
 | `feature 5 needs decision version 5 on every member` | Features 3 and 4 are not on. A member below version 5 ignores the record (`EARLY`). | Activate features 3 and 4 first. |
 | `feature 5 needs the retained frames on the heap of every member` | A member with the retained file never stores the record (`UNSUPPORTED`). | The chain cannot take feature 5. |
+| `the sequencer job does not keep the highest sealer version across its sessions (job meta sealer_version_kept)` | A sequencer of an older release runs. It can send a reference without bytes after a new session. | Deploy the release to every sequencer. |
+| `the <reader> job does not read the canonical stream from the egress (job meta reads_egress)` | The batcher or the validator still reads the cluster egress. Under the carry window it gets `REPLAY_UNAVAILABLE` below the window. | Do step 4 of `carry-window-rollout.md` first. |
+| `the egress job does not keep the mark of the highest stored reference (job meta ref_mark)` | An egress of an older release runs. | Deploy the release of the egress. Then follow "After a rollback of the egress" in `carry-window-rollout.md`. |
+| `an egress instance does not report its reference mark` | An egress instance does not answer on its metrics port. | Bring the instance back, then run the check again. |
 | `the <reader> cursors <cursors> ... are not all above the index <r> of the last stored reference` | A reader cursor at or below R can still meet a reference in the egress range. | Wait until every reader passes R. |
