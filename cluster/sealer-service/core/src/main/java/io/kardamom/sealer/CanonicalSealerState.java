@@ -1036,6 +1036,11 @@ public final class CanonicalSealerState {
         return versions.carryWindowRules();
     }
 
+    /** The state of the carry window, for the admin endpoint. */
+    public VersionSwitch.Feature carryWindowFeature() {
+        return versions.windowFeature();
+    }
+
     /** The state of each feature of the version switch, for the admin endpoint. */
     public List<VersionSwitch.Feature> features() {
         return versions.features();

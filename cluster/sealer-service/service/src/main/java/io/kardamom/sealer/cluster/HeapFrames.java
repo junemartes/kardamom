@@ -3,6 +3,7 @@ package io.kardamom.sealer.cluster;
 import io.kardamom.sealer.ClusterStatus;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.OptionalInt;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.agrona.DirectBuffer;
@@ -178,23 +179,26 @@ final class HeapFrames implements RetainedFrames {
 
     @Override
     public long boundaryEnd(final long block) {
-        return IntStream.range(0, count)
-            .map(this::slot)
-            .filter(s -> boundaries[s] && keys[s] == block)
-            .mapToLong(s -> view.getLong(offsets[s] + FrameKey.BOUNDARY_END_OFFSET, ByteOrder.LITTLE_ENDIAN))
-            .findFirst()
-            .orElse(-1L);
+        final OptionalInt place = boundaryPlace(block);
+        return place.isPresent()
+            ? view.getLong(offsets[slot(place.getAsInt())] + FrameKey.BOUNDARY_END_OFFSET, ByteOrder.LITTLE_ENDIAN)
+            : -1L;
     }
 
-    /** The scan of the index runs once for each feed request, and requests are rare. */
     @Override
     public long walkStart(final long fromBlock) {
         final long front = walkFront();
-        return IntStream.range(0, count)
-            .filter(i -> boundaries[slot(i)] && keys[slot(i)] == fromBlock - 1)
-            .mapToLong(i -> front + i + 1)
-            .findFirst()
-            .orElse(front);
+        final OptionalInt place = boundaryPlace(fromBlock - 1);
+        return place.isPresent() ? front + place.getAsInt() + 1 : front;
+    }
+
+    /**
+     * The place of the retained boundary of {@code block} among the frames,
+     * oldest first, or empty when the store does not hold it. It scans the
+     * index, so only the start of a replay or a feed answer calls it.
+     */
+    private OptionalInt boundaryPlace(final long block) {
+        return IntStream.range(0, count).filter(i -> boundaries[slot(i)] && keys[slot(i)] == block).findFirst();
     }
 
     @Override

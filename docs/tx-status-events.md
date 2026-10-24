@@ -36,7 +36,7 @@ Connect to the notifier address with a WebSocket client. The default address is 
 
 - On subscribe, the notifier first replays the events in its ring that match the filter, oldest first. Then it streams live events.
   - The replay and the live stream do not lose or repeat an event.
-  - A new subscriber gets the history of the ring: by default the last 10 minutes, and at most 1000000 events.
+  - A new subscriber gets the history of the ring: by default the last 10 minutes, and at most 1000000 events. On the notifier nodes (`KARDAMOM_NOTIFIER_NODES=on`), the ring keeps at most 250000 events.
 - The `filter` is one of these:
 
 | Filter | Selects |
@@ -197,7 +197,7 @@ def verify(secret: bytes, body: bytes, header: str) -> bool:
   - A peer that gets a forwarded registration stores it. It does not forward it again.
   - The peer list can include the instance itself. That forward is a repeat of the same subscription, and it changes nothing.
 - Set `KARDAMOM_NOTIFIER_INSTANCE_INDEX` (from 0) and `KARDAMOM_NOTIFIER_INSTANCE_COUNT` on each instance. The index must be below the count.
-- The deploy job `notifier` runs 2 instances, one on each ingress node. See `deploy/cluster/nomad/notifier.nomad.hcl`.
+- The deploy job `notifier` runs 2 instances, one on each ingress node. With `KARDAMOM_NOTIFIER_NODES=on`, it runs `KARDAMOM_NOTIFIER_COUNT` instances, one on each node of role `notifier`. See `deploy/cluster/nomad/notifier.nomad.hcl`, and "The notifier nodes" in `deploy/cluster/README.md` for the move of the webhook state.
 
 ## Configuration
 
@@ -224,7 +224,7 @@ Each setting is a flag or an environment variable. The flag overrides the variab
 | `--executor-count` | `KARDAMOM_EXECUTOR_COUNT` | from `channels.tx_receipts_executor_count` | The number of executors whose receipts the notifier reads. |
 
 - The deploy sets `ring_minutes`, `ring_max_events` and `outbox_retain_bytes` as Nomad variables. The defaults are the same as in the table.
-- The deploy runs the notifier with a 1024 MB memory limit.
+- The deploy runs the notifier with a 1024 MB memory limit, or 512 MB on the notifier nodes. A full ring at the default count bound takes about 300 MB of it.
 
 ## Metrics
 

@@ -40,6 +40,8 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 kardamom-formats.workspace = true
+# The outcome tests render a local recorder.
+metrics-exporter-prometheus = { workspace = true }
 # The fake ingress of the ring tests.
 jsonrpsee = { workspace = true, features = ["server"] }
 tempfile = { workspace = true }

@@ -20,8 +20,8 @@ import org.agrona.concurrent.ringbuffer.RingBufferDescriptor;
  * {@link Feeder} thread offers it to the publication. The feeder passes the
  * replay requests of the executor back through the control ring. Each ring
  * has one writer thread and one reader thread, so the rings are
- * {@link OneToOneRingBuffer}s. No write waits: a full ring gaps a live
- * feed, and pauses a replay to the next duty cycle.</p>
+ * {@link OneToOneRingBuffer}s. No write waits: a full ring ends a live
+ * feed with a gap, and pauses a replay to the next duty cycle.</p>
  *
  * <p>Each ring message carries a generation as its type. The feeder starts
  * a new generation for each request and for each loss of the subscriber,
@@ -38,11 +38,14 @@ import org.agrona.concurrent.ringbuffer.RingBufferDescriptor;
  * <p>The walk holds a walk key of the store ({@link RetainedFrames}): a
  * file position, or a frame number on the heap. The key stays valid while
  * the store grows and evicts. When the front of the store passes the key,
- * the frames from the key are gone, and the answer gaps. The executor then
- * asks again, and a request from a cursor inside the window serves.</p>
+ * the frames from the key are gone, and the answer ends with a gap. The
+ * executor then asks again, and a request from a cursor inside the window
+ * serves.</p>
  *
- * <p>The walk allocates nothing: it wraps one view on each frame and reads
- * the key in place.</p>
+ * <p>A duty cycle that reads no control message allocates nothing: the
+ * walk wraps one view on each frame and reads the key in place, and the
+ * live path copies each frame into the ring. The start of an answer and
+ * each change of the state log a line, and that allocates.</p>
  */
 final class MemberFeed implements Feed {
 
@@ -68,7 +71,10 @@ final class MemberFeed implements Feed {
         WALKING(FeedState.WALKING),
         /** Carry each new retained frame. */
         LIVE(FeedState.LIVE),
-        /** A frame did not fit, or the front passed the walk: write nothing until the next request. */
+        /**
+         * The answer ended with a gap: a frame did not fit, or the front
+         * passed the walk. Write nothing until the next request.
+         */
         GAPPED(FeedState.GAPPED);
 
         private final FeedState shown;
@@ -152,7 +158,10 @@ final class MemberFeed implements Feed {
     public int doWork(final SealerEgress egress, final long upToIndex, final long upToBlock) {
         asked = Optional.empty();
         final int read = control.read(controlHandler, CONTROL_BATCH);
-        asked.ifPresent(r -> answer(r, egress, upToIndex, upToBlock));
+        // A lambda here would capture the head, and allocate in each duty cycle.
+        if (asked.isPresent()) {
+            answer(asked.get(), egress, upToIndex, upToBlock);
+        }
         return read + step(upToIndex, upToBlock);
     }
 
