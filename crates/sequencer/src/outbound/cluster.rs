@@ -144,11 +144,11 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
 
     fn try_publish_epoch(&mut self, e: &EpochRecord) -> Result<(), SequencerError> {
         // The activations of decision versions 4 and 5, and of the exact
-        // window, go in front of their epoch, on this session. The pump offers the same epoch again after back
-        // pressure, a gap or a restart, so the activation goes out again
-        // with it, and the sealer ignores a copy. An epoch that the sealer
-        // ordered is never offered again, so the activation must not come
-        // after it.
+        // window, go in front of their epoch, on this session. The pump
+        // offers the same epoch again after back pressure, a gap or a
+        // restart, so the activation goes out again with it, and the sealer
+        // ignores a copy. An epoch that the sealer ordered is never offered
+        // again, so the activation must not come after it.
         [FEATURE_SEALER_V4, FEATURE_SEALER_V5, FEATURE_CARRY_WINDOW]
             .into_iter()
             .filter_map(|feature| wire::FeatureActivation::of(e, feature))

@@ -149,3 +149,36 @@ fn a_reference_refusal_raises_the_version_and_drops_the_transaction() {
     assert_eq!(drops.statuses.lock().unwrap().len(), 0, "no status");
     assert_eq!(drops.errors.lock().unwrap().len(), 0, "no error");
 }
+
+/// A reference refusal that names a version below the kept version does
+/// not lower it.
+#[test]
+fn a_reference_refusal_below_the_kept_version_does_not_lower_it() {
+    let (deadline_tx, _deadline_rx) = crossbeam_channel::bounded(4);
+    let (answer_tx, _answer_rx) = crossbeam_channel::bounded(4);
+    let (origins, _origins_rx) = crossbeam_channel::unbounded();
+    let version = SealerVersion::starting_at(SEALER_V5_DECISION_VERSION);
+    let drops = InMemorySidePublisher::default();
+    let mut feed = EgressWatermarkFeed::new(
+        1_000,
+        0,
+        SharedWatermark::new(),
+        answer_tx,
+        deadline_tx,
+        origins,
+        rules(&version, &drops),
+    );
+
+    feed.on_frame(
+        &RefRefused {
+            canonical_id: B256::repeat_byte(0xAB),
+            sender: Address::repeat_byte(0x13),
+            nonce: 7,
+            decision_version: 4,
+        }
+        .encode(),
+    );
+
+    assert!(version.carries_bytes(), "the version stays 5");
+    assert_eq!(drops.drops.lock().unwrap().len(), 1);
+}

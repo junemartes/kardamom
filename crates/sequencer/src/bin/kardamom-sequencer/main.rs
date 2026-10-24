@@ -207,6 +207,15 @@ impl ResyncWiring {
         // The epoch lane reads the same egress: the boundaries confirm its
         // epochs, and an origin-gap reject makes it offer them again.
         let (origins, epoch_lane) = kardamom_sequencer::epoch::EpochPump::new();
+        // The v2 loop takes the rows of each batch, the lookup answers and
+        // the refusals of the sealer as account events. The v1 loop takes
+        // the receipts as floors.
+        let (accounts_tx, accounts_rx) = crossbeam_channel::bounded(V2_ACCOUNT_EVENTS);
+        let rules = if cfg.admission.enabled {
+            sealer.rules.telling(accounts_tx.clone())
+        } else {
+            sealer.rules
+        };
         let watermark_task = feeds::EgressWatermarkFeed::new(
             cfg.resync.boundary_silence_ms,
             cfg.partition_index,
@@ -214,7 +223,7 @@ impl ResyncWiring {
             answer_tx,
             deadline_tx,
             origins,
-            sealer.rules,
+            rules,
         )
         .spawn(sealer.egress, shutdown.clone());
 
@@ -246,9 +255,6 @@ impl ResyncWiring {
                 live.clone(),
             ))
         });
-        // The v2 loop takes the rows of each batch and the lookup answers
-        // as account events. The v1 loop takes the receipts as floors.
-        let (accounts_tx, accounts_rx) = crossbeam_channel::bounded(V2_ACCOUNT_EVENTS);
         let sink = if cfg.admission.enabled {
             feeds::ReceiptSink::Accounts(accounts_tx.clone())
         } else {

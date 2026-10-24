@@ -346,3 +346,26 @@ fn a_gap_over_rows_does_not_ask_again() {
     a.sweep(start + Duration::from_secs(2), &mut out);
     assert!(out.is_empty(), "no lookup for a gap over rows");
 }
+
+/// A run that the sealer refused ends at once: a resend at the refused
+/// nonce goes out, with no wait for the loss window.
+#[test]
+fn a_refused_transaction_can_be_sent_again_at_once() {
+    let mut a = known(state(5, 2 * COST, 1));
+    offer(&mut a, tx(1, 5, 1));
+    assert!(offer(&mut a, tx(1, 5, 2))[0].starts_with("R5:InFlight"));
+    let mut out = Vec::new();
+    a.on_refused(sender(1), 5, &mut out);
+    assert_eq!(names(&out), [] as [&str; 0]);
+    assert_eq!(offer(&mut a, tx(1, 5, 3)), ["F5"]);
+}
+
+/// A refusal of a nonce that the run does not hold changes nothing.
+#[test]
+fn a_refusal_of_another_nonce_keeps_the_run() {
+    let mut a = known(state(5, 2 * COST, 1));
+    offer(&mut a, tx(1, 5, 1));
+    a.on_refused(sender(1), 9, &mut Vec::new());
+    a.on_refused(sender(2), 5, &mut Vec::new());
+    assert!(offer(&mut a, tx(1, 5, 2))[0].starts_with("R5:InFlight"));
+}

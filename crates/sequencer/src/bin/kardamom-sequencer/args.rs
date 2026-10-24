@@ -210,3 +210,7 @@ impl Args {
         cfg.fees.priority = self.priority_fees.unwrap_or(cfg.fees.priority);
     }
 }
+
+#[cfg(test)]
+#[path = "args_tests.rs"]
+mod tests;

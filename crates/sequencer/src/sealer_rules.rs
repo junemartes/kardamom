@@ -22,8 +22,11 @@ use kardamom_cluster_adapter::wire::{
 };
 use kardamom_types::{DropReason, TxDrop};
 
+use crossbeam_channel::TrySendError;
+
 use crate::metrics;
 use crate::outbound::DropPublisher;
+use crate::v2::AccountEvent;
 
 /// The kept decision version of the sealer, shared between the egress feed
 /// thread, which writes it, and the publish loop, which reads it to choose
@@ -64,34 +67,42 @@ impl SealerVersion {
 /// The sealer's rules as this process keeps them. One owner: the egress
 /// feed thread. It exports the kept version as a metric, and shares it
 /// through [`SealerVersion`]. It publishes a drop record for each
-/// reference that the sealer refused.
+/// reference that the sealer refused, and tells the v2 loop.
 pub struct SealerRules<D> {
     partition: u32,
     shared: SealerVersion,
-    /// The kept version: the value of `shared`.
-    kept: u8,
     /// The cluster session that the last session-start marker named.
     session: Option<i64>,
     /// A report for a session whose marker has not arrived yet.
     early: Option<(i64, u8)>,
     /// The `tx_drops` channel of the lane.
     drops: D,
+    /// The account events of the v2 loop, when it runs: each refusal goes
+    /// there, so the filter forgets the refused run.
+    refusals: Option<crossbeam_channel::Sender<AccountEvent>>,
 }
 
 impl<D: DropPublisher> SealerRules<D> {
     /// Rules that keep the version of `shared`, from its start value.
     #[must_use]
     pub fn new(partition: u32, shared: SealerVersion, drops: D) -> Self {
-        let kept = shared.get();
-        metrics::record_sealer_version(partition, kept);
+        metrics::record_sealer_version(partition, shared.get());
         Self {
             partition,
             shared,
-            kept,
             session: None,
             early: None,
             drops,
+            refusals: None,
         }
+    }
+
+    /// Send each refusal to the v2 loop on `accounts`, its queue of account
+    /// events.
+    #[must_use]
+    pub fn telling(mut self, accounts: crossbeam_channel::Sender<AccountEvent>) -> Self {
+        self.refusals = Some(accounts);
+        self
     }
 
     /// The session `session_id` starts. A report that came first for it
@@ -103,7 +114,7 @@ impl<D: DropPublisher> SealerRules<D> {
             .take()
             .filter(|(id, _)| *id == session_id)
             .map(|(_, version)| version);
-        self.publish(report.unwrap_or(self.kept));
+        self.publish(report.unwrap_or(self.shared.get()));
     }
 
     /// The sealer reports `version` for the session `session_id`. A report
@@ -115,13 +126,14 @@ impl<D: DropPublisher> SealerRules<D> {
             return;
         }
         self.early = Some((session_id, version));
-        self.publish(self.kept.max(version));
+        self.publish(self.shared.get().max(version));
     }
 
     /// The sealer refused a reference without bytes: it runs `refused`'s
     /// version. Raise the version to it, count the refusal, and publish a
-    /// drop for the hash, so the client sends the transaction again. The
-    /// sequencer offers nothing again by itself.
+    /// drop for the hash, so the client sends the transaction again. Tell
+    /// the v2 loop, so it takes the resend. The sequencer offers nothing
+    /// again by itself.
     pub fn on_ref_refused(&mut self, refused: &RefRefused) {
         metrics::record_ref_refused(self.partition);
         tracing::warn!(
@@ -132,7 +144,8 @@ impl<D: DropPublisher> SealerRules<D> {
             decision_version = refused.decision_version,
             "sealer refused a reference without bytes; dropping the transaction"
         );
-        self.publish(self.kept.max(refused.decision_version));
+        self.publish(self.shared.get().max(refused.decision_version));
+        self.tell_loop(refused);
         self.drops.publish_drop(TxDrop {
             tx_hash: refused.canonical_id,
             sender: refused.sender,
@@ -141,8 +154,26 @@ impl<D: DropPublisher> SealerRules<D> {
         });
     }
 
-    fn publish(&mut self, version: u8) {
-        self.kept = version;
+    /// Put the refusal on the queue of the v2 loop. A full queue loses it:
+    /// the loss window of the filter then frees the nonce, later.
+    fn tell_loop(&self, refused: &RefRefused) {
+        let event = AccountEvent::Refused {
+            sender: refused.sender,
+            nonce: refused.nonce,
+        };
+        let full = self
+            .refusals
+            .as_ref()
+            .is_some_and(|tx| matches!(tx.try_send(event), Err(TrySendError::Full(_))));
+        if full {
+            tracing::warn!(
+                partition = self.partition,
+                "account event queue full; the refusal waits for the loss window"
+            );
+        }
+    }
+
+    fn publish(&self, version: u8) {
         self.shared.set(version);
         metrics::record_sealer_version(self.partition, version);
         tracing::info!(

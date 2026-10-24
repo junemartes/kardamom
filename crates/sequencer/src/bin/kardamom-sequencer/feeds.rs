@@ -305,8 +305,14 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
         if frame.first() != Some(&wire::EGRESS_KIND_REF_REFUSED) {
             return false;
         }
-        if let Ok(EgressItem::RefRefused(refused)) = EgressItem::decode(frame) {
-            self.rules.on_ref_refused(&refused);
+        match EgressItem::decode(frame) {
+            Ok(EgressItem::RefRefused(refused)) => self.rules.on_ref_refused(&refused),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                partition = self.partition,
+                error = %e,
+                "a reference refusal of the sealer does not decode"
+            ),
         }
         true
     }

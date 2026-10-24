@@ -4,6 +4,7 @@ use kardamom_types::{DropReason, TxDrop};
 
 use super::{SealerRules, SealerVersion};
 use crate::outbound::fakes::InMemorySidePublisher;
+use crate::v2::AccountEvent;
 
 struct Rig {
     rules: SealerRules<InMemorySidePublisher>,
@@ -157,4 +158,21 @@ fn a_refused_reference_never_lowers_the_version() {
     r.rules.on_ref_refused(&refused(4));
     assert_eq!(r.version.get(), 5);
     assert_eq!(r.drops().len(), 1);
+}
+
+#[test]
+fn a_refused_reference_tells_the_loop_once() {
+    let (accounts_tx, accounts_rx) = crossbeam_channel::unbounded();
+    let mut rules = SealerRules::new(
+        0,
+        SealerVersion::default(),
+        InMemorySidePublisher::default(),
+    )
+    .telling(accounts_tx);
+    rules.on_ref_refused(&refused(5));
+    let events: Vec<_> = accounts_rx.try_iter().collect();
+    assert!(matches!(
+        events[..],
+        [AccountEvent::Refused { sender, nonce: 7 }] if sender == Address::repeat_byte(0x13)
+    ));
 }
