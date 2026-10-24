@@ -1,13 +1,16 @@
 # Stateless ingress on cpx32, and the egress as the transaction source
 
-- Status: revision 1, draft for review. Not implemented.
+- Status: revision 2, draft for review. Not implemented.
+- Revision 2 answers the design review of revision 1 (findings R1 to R10). Section 14 maps each
+  finding to its change.
 - The user decided on 2026-10-24:
   - All services get their transaction data from the egress.
   - No Aeron archive records `tx_data` or `tx_deposits`. Only the sealer commits and keeps the
     data streams. The `l1_blocks` archive (the L1 follower nodes) and the `exec_txs` archive (the
     executor nodes) stay.
   - The notifier is a separate service. It does not run on the ingress nodes. It runs on two new
-    cpx12 nodes (1 shared AMD vCPU, 2 GB each), one instance on each node. The fallback is cpx22.
+    cpx12 nodes (1 shared AMD vCPU, 2 GB each), one instance on each node. notifier-0 comes first,
+    and notifier-1 follows after a load test of notifier-0. The fallback is cpx22.
   - Staging keeps two fixed ingress nodes, ingress-0 and ingress-1. Both change to cpx32
     (4 shared AMD vCPU, 8 GB, 160 GB) in place, one at a time. There is no autoscaling for now.
   - The L1 indexer (on da-watcher-0) and the Redis replica (on redis-1) stay where they are.
@@ -19,8 +22,11 @@
   - `docs/specs/2026-10-21-one-way-pipeline.md` (the one-way spec): D5, D7, D11, P8 and P13.
   - `docs/specs/2026-10-23-hot-path-agents.md` (the hot-path spec): the verify agent (section 5)
     and Q5.
-  - #792 (the split of a verify batch from 4 requests, and `ingress.recover_wait`), open.
-  - kardamom-infra #67 (load-0), open, and kardamom-infra #78 (the on-node directories), open.
+  - #792 (the split of a verify batch by a minimum per worker, and `ingress.recover_wait`), open.
+  - #794 (carry C9, the carry runbook `docs/runbooks/carry-window-rollout.md`), open.
+  - kardamom-infra #67 (load-0), merged. kardamom-infra #79 (ingress-0 and ingress-1 on cpx32 with
+    `keep_disk`, and notifier-0 on cpx12), approved. kardamom-infra #78 (the on-node
+    directories), open.
 - Section 9 keeps the elastic ingress pool as later work, with its blockers.
 
 ## 1. The problem
@@ -35,10 +41,12 @@
 | executor-0..2 (node containers) | dedicated | executor, egress (2 of 3), state mirror | archiving | `exec_txs` |
 | redis-0/1, batcher-0, monitoring-0, validator-0 | cx23, cx33 | Redis, batcher, monitoring, validator | archiving | nothing |
 | sealer-0..2 (node containers) | dedicated | sealer member | the cluster's own driver | none |
+| load-0 | ccx33 (8 dedicated vCPU) | the load tool; no Nomad node | none | none |
 
 Sources:
 
-- The server types: kardamom-infra `terraform/hetzner/staging.tfvars:83-97`. The role sets:
+- The server types: kardamom-infra `terraform/hetzner/staging.tfvars:83-97`, and load-0 from #67
+  (merged). The role sets:
   kardamom-infra `ansible/inventories/staging/hosts.ini:113-144`.
 - The driver: the `aeron` system job runs one `ArchivingMediaDriver` on each node that is not a
   control node or a sealer node (`deploy/cluster/nomad/aeron.system.nomad.hcl:147-172`, `:247`).
@@ -50,9 +58,9 @@ Sources:
 - The egress: 2 instances on the executor nodes, `distinct_hosts`
   (`deploy/cluster/nomad/egress.nomad.hcl:73-83`, `:158-169`). Staging runs it
   (`KARDAMOM_EGRESS=1` in the variables of the infra workflow).
-- On staging, the readers still read the sealer: `KARDAMOM_VALIDATOR_EGRESS=off`, and
-  `KARDAMOM_BATCHER_EGRESS` is not set (the infra workflow `.github/workflows/deploy-staging.yml:104-121`
-  and its repository variables). `--ack validated` is on (`KARDAMOM_INGRESS_ACK=validated`).
+- On staging, the readers still read the sealer. The infra workflow passes
+  `KARDAMOM_VALIDATOR_EGRESS` and `KARDAMOM_BATCHER_EGRESS` from repository variables
+  (`.github/workflows/deploy-staging.yml:114-115`). The first is `off`, and the second is not set. `--ack validated` is on (`KARDAMOM_INGRESS_ACK=validated`).
 
 ### 1.2 Findings
 
@@ -75,11 +83,29 @@ Sources:
   epoch is repaired by the da-watcher, which publishes again what the sealer did not confirm
   (`crates/da_watcher/src/watcher/follow.rs:1-17`). So "the executor restart replay of deposits"
   does not exist. Several comments still say it does (section 4.4).
-- **F4. The batcher still needs the `tx_data` archives in egress mode.** In egress mode it opens
-  no lane and no refetch (`run.rs:403-422`). But a refused replay goes to the rebuild from
-  references (`run.rs:682-684`, `:825-866`). The rebuild needs the `tx_data` archives, and fails
-  without them (`run.rs:848-852`, `crates/batcher/src/live/rebuild.rs:128-145`). This is the one
-  reader change that this spec adds.
+- **F4. The batcher rebuild in egress mode runs only on the refetch flags.** In egress mode the
+  batcher opens no lane and no refetch (`run.rs:403-422`). A refused replay goes to the rebuild
+  from references (`run.rs:682-684`, `:825-866`). The rebuild needs the `tx_data` archives
+  (`crates/batcher/src/live/rebuild.rs:128-145`). It runs only because the batcher job still
+  passes the refetch flags (`deploy/cluster/nomad/batcher.nomad.hcl:278-279`). When 5.1 removes
+  them, `join_recovery` is `None`, and the rebuild already ends in `ReplayUnavailable`
+  (`run.rs:845-852`, `:825-838`). So no new halt rule is needed.
+- **F11. A reader of the egress reads one instance at a time.** The reader holds one base URL,
+  `http://kardamom-egress.service.<dc>.consul:8548`
+  (`deploy/cluster/ansible/roles/workloads/defaults/main.yml:201`), and Consul resolves it for each
+  connection (`crates/engine/src/reader/carried/egress.rs:28-50`). A 410 from the instance that it
+  reaches becomes `ClusterReplayUnavailable` (`crates/engine/src/reader/carried/mod.rs:322-331`),
+  with no try of the other instance.
+- **F12. A new egress instance has a high floor.** An instance with no peer that fills its place in
+  time starts again after the next boundary of a copy (`crates/egress/src/owner.rs:289-317`,
+  `:18-26`; `crates/egress/src/main.rs:96-106`). Its floor is then far above a cursor that the
+  other instance still serves. The comment of the job says that such an instance cannot join
+  (`egress.nomad.hcl:27-29`). That comment is stale.
+- **F13. The egress reader has no second source.** `open_egress` pairs the egress transport with
+  `NoSource` (`crates/engine/src/bin_support.rs:424-433`). `CarriedSubscription` takes two
+  transports (`carried/mod.rs:59-80`). The transports today are the member feed, the egress, a
+  memory transport and `NoSource` (`carried/transport.rs:64`, `carried/feed.rs:51`,
+  `carried/egress.rs:60`, `carried/memory.rs:105`). No transport reads a cluster session.
 - **F5. The void vote and the record-lag guard are already off on staging.** A member on decision
   version 5 drops the void request (kind 6) and the recorded cursor (kind 9) as unknown kinds
   (`cluster/sealer-service/README.md:619`). The record-lag guard has a default budget of 0, which
@@ -121,19 +147,26 @@ Sources:
 ## 3. The design in short
 
 1. **Part A, the egress as the source.** The carry rollout moves the executors, the validator and
-   the batcher to the egress. This spec adds one change: a batcher in egress mode does not
-   rebuild from the archives. A refused egress replay is a halt.
+   the batcher to the egress. This spec adds three changes:
+   - the egress reader asks every egress instance before it reports a range as unavailable, and
+     takes the lowest floor (4.3);
+   - the batcher in egress mode gets the cluster session of the sealer as its second source
+     (4.3);
+   - the halt of the batcher names the egress floor, and skips the fetch of block references.
 2. **Part B, no `tx_data` and no `tx_deposits` archive.** The ingress and the da-watcher stop
    their recordings. The archive lists and the refetch go from the deploy. The aeron job runs the
    archiving driver only on a node that records a topic.
 3. **Part C, the notifier on its own nodes.** Two cpx12 nodes, `notifier-0` and `notifier-1`, of
    the new role `notifier`. The job constrains on the role, takes its count from
    `notifier_count`, and names its peers by the notifier nodes. It reserves 512 MB. Its driver
-   runs with an idle cap of 1,000 µs.
+   runs with an idle cap of 1,000 µs. notifier-0 comes first, with a count of 1. notifier-1
+   follows, with a re-shard to a count of 2 (6.3).
 4. **Part D, the ingress nodes on cpx32.** An in-place resize, one node at a time. The verifier
    gets a setting for its worker count: 3 on cpx32.
-5. **The order.** Release, infra (load-0 first), the notifier nodes, the notifier move, the plain
-   driver where nothing records, the resize, then Part B after step 10 of the carry rollout.
+5. **The order.** The measure of a driver switch in CI, the release, notifier-0, the notifier
+   move, the resize, notifier-1, the plain driver where nothing records, then Part B after step 10
+   of the carry rollout.
+6. **After Part B, feature 5 is one way** on that network, and the sequencer floor stays 5 (5.5).
 
 ## 4. Part A: the egress as the only source of transaction data
 
@@ -159,26 +192,71 @@ Sources:
 |---|---|---|---|---|
 | Executor | Reference mode: the cluster session, 8 `tx_data` lanes and the refetch (`crates/executor/src/bin/kardamom-executor/main.rs:289-324`) | `REPLAY_FROM` from the cursor of its state DB (`main.rs:268`). A refused replay stages a peer checkpoint (`crates/engine/src/bin_support.rs:727-760`). | A join miss refetches from the `tx_data` archives after 10 s (`crates/engine/src/reader/join.rs:126`), then votes a void or stops (`threads.rs:374-411`). | Carry mode: the member feed, then the egress range read, then a peer checkpoint (carry spec 6). No lane, no refetch (`main.rs:311-313`). A gap asks the source again from the cursor (`crates/engine/src/reader/carried/answer.rs:297-303`). |
 | Validator | The cluster session, the lanes and the refetch (`crates/validator/src/bin/kardamom-validator/wiring/startup.rs:272-286`) | It resumes from its state DB (`startup.rs:184-191`). | Join miss: refetch, as the executor. A refused replay: a peer checkpoint in the process (`wiring/revolve.rs:44-59`, `:104-118`). | `--egress` only (`crates/validator/src/bin/kardamom-validator/args.rs:60-65`). A gap re-reads the range. Below the egress floor: a peer checkpoint. No change in this spec. |
-| Batcher | The cluster session, the lanes and the refetch (`run.rs:372-398`) | The spool, then the sealer replay, then a rebuild (`run.rs:569-575`). | A refused replay rebuilds from block references and the `tx_data` archives (`run.rs:825-866`). | `--egress` (`run.rs:403-422`). A refused egress replay halts with `ReplayUnavailable`, with no rebuild (4.3). |
+| Batcher | The cluster session, the lanes and the refetch (`run.rs:372-398`) | The spool, then the sealer replay, then a rebuild (`run.rs:569-575`). | A refused replay rebuilds from block references and the `tx_data` archives (`run.rs:825-866`). | `--egress` (`run.rs:403-422`): every egress instance, then the cluster session of the sealer (4.3). Below both: the halt `ReplayUnavailable`. |
 | State mirror | `tx_receipts` of the executors (`crates/state-mirror/src/main.rs:1-12`) | It resumes, or rebuilds from the checkpoint of its executor (`crates/state-mirror/src/mirror.rs:176-196`). | A write outage above 10 s, the audit or an executor rollback starts a rebuild (`mirror.rs:20-22`, `:150-174`). | No change. It reads receipts and account rows, not transaction bytes. A move to `egress_receipts` is a separate change. |
 | Sequencer | `tx_data` live, `tx_deposits` live | — | It has no refetch. A lost `tx_data` frame is not ordered. A lost epoch comes again from the da-watcher (F3). | No change. These are its inputs, not the order. |
 
-### 4.3 The batcher in egress mode
+### 4.3 The egress reader: every instance, then the sealer
 
-- **The rule.** In egress mode the batcher does not rebuild. A refused replay from the egress is
-  the halt `ReplayUnavailable`, with the floor of the egress in the halt text.
-  - `recover_and_serve` (`run.rs:825-838`) gets the source of the refusal. With `--egress`, it
-    returns the halt at once. It does not call `join_recovery` (`run.rs:286-294`).
-  - The cluster mode keeps the rebuild, until P13.
-- **Why a halt is enough.** The batcher cursor is the posted cursor. The DA-lag guard refuses user
-  records when the sealed head is more than 10,000 blocks past the posted head
-  (`cluster/sealer-service/README.md:246-251`). The egress keeps 1,000,000 blocks. So the posted
-  cursor is inside the egress store, except in a DA outage of about 23 days. In such an outage
-  the boundary ticks still seal empty blocks (`README.md:255-258`).
-- **The gauges.** The egress exports `kardamom_egress_floor_block` and
-  `kardamom_egress_head_block`. An alert fires when
-  `kardamom_batcher_last_posted_block - min(kardamom_egress_floor_block) < 100000`.
-- **The preflight.** The deploy refuses `--keep-blocks` below `20 x daLagBudgetBlocks`.
+**Every instance before a refusal (F11, F12).**
+
+- The egress transport gets the list of the egress instances: `--egress-instances` (env
+  `KARDAMOM_EGRESS_INSTANCES`), comma-separated base URLs. The deploy names every executor node,
+  `http://executor-<i>.node.<dc>.consul:8548`, as the egress job does for its own peers
+  (`egress.nomad.hcl:134-144`). A node with no instance refuses the connection, which costs one
+  failed connect.
+- The live stream and the first range read stay on the service URL of today.
+- On a 410, the transport asks each other instance of the list for the same range, one after the
+  other.
+  - The first instance that serves the range becomes the source of this replay.
+  - Only when every instance that answers gives a 410 does the transport report `Unavailable`,
+    with the lowest floor of those answers.
+  - An instance that does not answer is not a refusal. When no instance answers, the transport
+    reports a failed connection, as today, and the reader asks again.
+- This change is in the engine, so the validator and the carry-mode executors get it too.
+- A metric: `kardamom_reader_egress_floor_retries_total{reader}`, the 410 answers that another
+  instance served.
+
+**The cluster session as the second source of the batcher (F13).**
+
+- A new transport, `ClusterTransport`, reads the cluster session of the sealer: `REPLAY_FROM` at
+  the cursor, then the live frames, as the executor in reference mode reads today. It implements
+  `Transport` (`carried/transport.rs`).
+- The batcher in egress mode opens `CarriedSubscription::new(egress, cluster, cursor)`: the egress
+  first, the sealer second. Today it opens `NoSource` as the second source
+  (`bin_support.rs:424-433`), and keeps a cluster session only to publish the posted cursor
+  (`run.rs:403-422`). The same session serves both.
+- After feature 5, each `RT_TX` frame of a heap member holds its bytes (carry spec 1.1), and no
+  type-0 reference comes (carry spec 4.3). So the sealer window is a source that needs no join.
+- The sealer window covers the batcher only when the posted cursor is inside it. The carry spec
+  sizes `retention` for 60 s at the planned rate (carry spec 4.4). This spec adds one rule to the
+  preflight of carry C6: `retention` must also cover the frames between two posts of the batcher
+  at the planned rate, with a margin of 2.
+- **The hazard.** The carry spec keeps the bytes on the cluster sessions for now, and plans a later
+  change that strips them (carry spec 2, non-goal 3). That change must keep the bytes on the
+  session of the batcher, or give the batcher another second source. Section 13 (Q5) asks the
+  user.
+- The validator keeps `NoSource` as its second source. Below the egress floor it takes a peer
+  checkpoint, as today.
+
+**The halt.** When both sources refuse, the batcher halts with `ReplayUnavailable`. With the
+refetch flags gone (5.1), the rebuild already ends there (F4). The change (E1, size S):
+
+- the halt text names the lowest egress floor and the sealer floor;
+- in egress mode the batcher does not fetch the block references, because no archive can fill
+  them.
+
+**Why the halt is rare.** The DA-lag guard refuses user records when the sealed head is more than
+10,000 blocks past the posted head (`cluster/sealer-service/README.md:246-251`). The egress keeps
+1,000,000 blocks (`crates/egress/src/main.rs:66-67`). So the posted cursor is inside the store of
+an instance with a full history, except in a DA outage of about 23 days.
+
+**The gauges and the checks.**
+
+- The egress exports `kardamom_egress_floor_block` and `kardamom_egress_head_block`.
+- An alert fires when `kardamom_batcher_last_posted_block` is below the floor of one instance: that
+  instance cannot serve the batcher, so one more loss halts it.
+- The deploy refuses `--keep-blocks` below `20 x daLagBudgetBlocks`.
 
 ### 4.4 Stale comments
 
@@ -202,11 +280,13 @@ corrects them:
 |---|---|---|
 | `--archive-durability` of the ingress | `ingress.nomad.hcl:304-307` | removed from the job. The flag stays in the binary until P13. |
 | The `tx_data` recorders | `crates/ingress/src/service/recorders.rs` | not started. Code removal in P13. |
-| `--archive-durability` of the da-watcher | `deploy/cluster/nomad/da-watcher.nomad.hcl:173-176` | removed from the job. The da-watcher then publishes with no wait for a recording (`kardamom-da-watcher.rs:575-631`). |
+| `--archive-durability` of the da-watcher | `deploy/cluster/nomad/da-watcher.nomad.hcl:174-177` | removed from the job. The da-watcher then publishes with no wait for a recording (`kardamom-da-watcher.rs:575-631`). |
 | The topics `tx_data` and `tx_deposits` | `nomad.hcl.j2:85` | `archive_topics` becomes `exec_txs` on an executor node, else empty. |
 | `tx_data_archive_endpoints`, `tx_deposits_archive_endpoints` | `deploy/cluster/config/channels.toml.tpl:66-79`, `deploy/cluster/ansible/roles/contract/vars/main.yml:159-160`, `deploy/cluster/ansible/tests/test_channels.py:65` | removed. The `l1_blocks` list (`channels.toml.tpl:82`) stays. |
 | The join-miss refetch | `--replay-destination-endpoint` and `--archive-control-response-endpoint` of the executor (`executor.nomad.hcl:324-334`), the validator (`validator.nomad.hcl:308`) and the batcher (`batcher.nomad.hcl:275-279`), with their ports | removed from these jobs. The da-watcher keeps them: it reads the history of `l1_blocks` (`da-watcher.nomad.hcl:162`). |
 | The archiving driver on the ingress and sequencer nodes | `aeron.system.nomad.hcl` | a plain driver (5.2). |
+| The chaos cases of the `tx_data` archive | `driver_loss`, `tx_data_wipe` and `corruption` (`crates/chaos/src/cases/archive.rs:34-54`, `:231`) | E8 aims `driver_loss` and `corruption` at an `exec_txs` archive of an executor node, and retires `tx_data_wipe`. |
+| The contract check of the `tx_data` list | `deploy/cluster/ansible/roles/contract/vars/main.yml:159-160` | removed with the lists (E7). |
 
 The `l1_blocks` archive on the follower nodes and the `exec_txs` archive on the executor nodes
 stay. On staging, da-watcher-0 has the role `indexer`, so it keeps the archiving driver for
@@ -256,9 +336,16 @@ local map of three kinds. Each group constrains on `${meta.aeron_driver}`:
 
 **The image holds both classes.** The image starts `${AERON_ARCHIVE_CLASS}` from `aeron-all.jar`
 (`crates/log/docker/aeron/entrypoint.sh:64-81`, `crates/log/docker/aeron/Dockerfile:50`).
-`aeron-all.jar` holds `io.aeron.driver.MediaDriver` too. One change: the start wait looks for
-`archive.catalog` and `cnc.dat` for 30 s (`entrypoint.sh:84-100`). With the plain class, it waits
-only for `cnc.dat`. The archive system properties are harmless to a plain driver.
+`aeron-all.jar` holds `io.aeron.driver.MediaDriver` too. Two changes to the entrypoint (E3):
+
+- **The wait for the old driver.** Before it starts the JVM, the entrypoint checks `cnc.dat` in
+  `AERON_DIR`. While the heartbeat of that file is younger than the driver timeout, it waits, up
+  to the driver timeout plus 5 s. The check uses `CommonContext.isDriverActive` of the same jar.
+  This applies to every kind. Today only Nomad's restart delay protects a restart of the same
+  task (F10). It does not protect the start of a task of another group on the same `aeron.dir`.
+- **The start wait.** It looks for `archive.catalog` and `cnc.dat` for 30 s
+  (`entrypoint.sh:84-100`). With the plain class, it waits only for a new `cnc.dat`.
+- The archive system properties are harmless to a plain driver.
 
 **No consumer lists an archive on a plain node.**
 
@@ -272,19 +359,31 @@ only for `cnc.dat`. The archive system properties are harmless to a plain driver
 **A switch on a running node restarts the driver.** Every Aeron client on that node loses its
 driver.
 
-- The order on one node: Nomad stops the old driver, waits for the restart delay (F10), and
-  starts the new one. The clients stop on the driver timeout (10 s,
-  `AERON_DRIVER_TIMEOUT`), and Nomad restarts them after their restart delay (5 s, for example
-  `ingress.nomad.hcl:182-187`).
-- The rollout switches one node at a time, by a change of its node meta (section 10). The
-  downtime per node is an estimate, to be measured in the container shard (section 10.1):
+- **What Nomad does.** `nomad node meta apply` starts a node-update evaluation. Nomad stops the
+  allocation of the old group and places the allocation of the new group at once, on the same
+  `aeron.dir`. The new driver then finds the fresh heartbeat of the old one. Without the wait of
+  E3, its first start fails, and the 30 s start wait adds to the downtime.
+- **Why not `nomad alloc stop` first.** Nomad places a stopped allocation of a system job again on
+  the same node, from the same group. So a stop before the meta change only adds one more restart.
+- **The order on one node.**
+  1. Check that the node runs the E3 image (the job meta `driver_waits_stale = "true"`).
+  2. `nomad node meta apply -node-id <id> aeron_driver=<kind>`.
+  3. The new driver waits for the old heartbeat to go stale (up to 15 s at the default timeout),
+     then starts.
+  4. The clients on the node stop on the driver timeout (10 s, `AERON_DRIVER_TIMEOUT`). Nomad
+     restarts them after their restart delay (5 s, for example `ingress.nomad.hcl:182-187`). A
+     client that starts before the new driver fails its start and restarts again.
+  5. Check the services of the node before the next node.
+- **Measure first.** The container shard measures the downtime of each kind (section 10.1). No
+  staging node switches before that measure. The values below are estimates: the driver timeout,
+  the stale wait, the driver start and one or two client restarts.
 
 | Node class | Clients | Estimated downtime | Effect |
 |---|---|---|---|
-| ingress (one of two) | ingress | 20 to 40 s | The other ingress serves. The LB TCP check takes up to 30 s to drop the target (kardamom-infra `terraform/hetzner/main.tf:338-344`), so some connections fail. Do it at low load. |
-| sequencer (one of a twin pair) | sequencer | 20 to 40 s | The twin offers each transaction too. |
+| ingress (one of two) | ingress | 30 to 60 s | The other ingress serves. The LB TCP check takes up to 30 s to drop the target (kardamom-infra `terraform/hetzner/main.tf:338-344`), so some connections fail. Do it at low load. |
+| sequencer (one of a twin pair) | sequencer | 30 to 60 s | The twin offers each transaction too. |
 | notifier | notifier | none | The notifier nodes start with the quiet driver. |
-| validator, batcher | validator, batcher | 20 to 40 s | They pause and catch up from the egress. |
+| validator, batcher | validator, batcher | 30 to 60 s | They pause and catch up from the egress. |
 | redis, monitoring | none on Aeron | none for a service | The driver restarts alone. |
 
 ### 5.3 The void vote and the record-lag guard
@@ -307,7 +406,8 @@ The order of the findings holds. This spec adds two steps (marked new):
 1. The batcher and the validator read `--egress` (carry spec 12, step 4).
 2. Feature 5 is on, with the window (carry spec 12, steps 8 and 9).
 3. Every executor is in carry mode, and every reader cursor is past R (carry spec 12, step 10).
-4. (new) The batcher of 4.3 is deployed: in egress mode it never asks for an archive.
+4. (new) The readers of 4.3 are deployed: the egress reader asks every instance, and the batcher
+   has the cluster session as its second source.
 5. The deploy removes the ingress recorder, `--archive-durability` of the ingress and of the
    da-watcher, and the `tx_data` and `tx_deposits` topics. The preflight of this step refuses
    unless:
@@ -315,45 +415,68 @@ The order of the findings holds. This spec adds two steps (marked new):
      every live allocation runs that version;
    - every member reports `carryWindow` true;
    - `KARDAMOM_CARRY_EXECUTORS` lists every executor;
-   - the batcher job has the meta `egress_halt_no_rebuild = "true"` (step 4).
+   - the batcher job has the meta `egress_two_sources = "true"` (step 4);
+   - the gates of 5.5 are in the release.
 6. (new) The ingress nodes switch to the plain driver, one at a time (5.2).
 7. The deploy removes `tx_data_archive_endpoints`, `tx_deposits_archive_endpoints` and the
    refetch flags and ports of the readers.
 8. P13 removes the code, after step 7 on every network.
 
 - **Why it is not circular.** Steps 1 to 3 need no archive change. Step 5 needs only steps 1 to 4.
-- **Rollback.** Until step 5, a deploy turns each part back. After step 5, a reader in
-  reference mode still runs on a heap member, because each `RT_TX` frame holds its bytes (carry
-  spec 1.1) and feature 5 refuses type 0. But it has no archive for a join miss.
+- **Rollback.** Until step 5, a deploy turns each part back. After step 5, the way back of the
+  carry runbook is closed (5.5).
 - **The old recordings.** The recordings of `tx_data` on the ingress nodes and of `tx_deposits`
   on da-watcher-0 stay on disk under `/opt/kardamom/archive` after the switch. Delete them after
-  the soak (section 10, step 12).
+  the soak (section 10, step 11).
+
+### 5.5 After Part B, feature 5 is one way
+
+- **Why.** The carry runbook allows feature 5 off, and an executor back in reference mode, at any
+  time (#794, `docs/runbooks/carry-window-rollout.md`, "To go back"). After Part B, both break the
+  chain:
+  - A reader in reference mode has no archive for a join miss.
+  - With feature 5 off, the sealer orders type-0 references again (carry spec 4.4, "Off again").
+    One sequencer restart with a floor below 5 then sends a type 0, and every carry-mode executor
+    stops with `UnjoinableReference` (carry spec 6).
+- **The rule.** After Part B, feature 5 stays on for the life of that network, and the sequencer
+  floor stays 5.
+- **The gates.** They apply while the ingress job has no `--archive-durability` (the job meta
+  `tx_data_recorded = "false"`, set by E6):
+  - the upgrade check refuses any new activation of feature 5 while it is on. That covers
+    `2^64 - 1` (off), and a time ahead, which turns it off until that time (carry spec 4.1);
+  - the deploy refuses `KARDAMOM_SEALER_VERSION_FLOOR` below 5;
+  - the deploy refuses an empty `KARDAMOM_CARRY_EXECUTORS`, and a list that leaves out an executor.
+- **A fleet rebuild from a seed** needs floor 0 (carry spec 5). After Part B it also needs the
+  `tx_data` archive back first: deploy the ingress with `--archive-durability`, then follow the
+  runbook. The gates then fall away by the job meta.
+- **The runbook.** "To go back" of `docs/runbooks/carry-window-rollout.md` gets the same rule.
+  C9 (#794) can take the line.
 
 ## 6. Part C: the notifier on its own nodes
 
 ### 6.1 The infra change (kardamom-infra)
 
-- **Two static servers** in `terraform/hetzner/staging.tfvars`:
+- **Two phases.** kardamom-infra #79 (approved) adds notifier-0 now. notifier-1 follows after a
+  load test of notifier-0. Each phase is one static server in `terraform/hetzner/staging.tfvars`:
 
 ```hcl
-notifier-0 = { role = "notifier", tier = "worker", server_type = "cpx12", private_ip = "10.20.0.58", placement_group = "services" }
-notifier-1 = { role = "notifier", tier = "worker", server_type = "cpx12", private_ip = "10.20.0.59", placement_group = "services" }
+notifier-0 = { role = "notifier", tier = "worker", server_type = "cpx12", private_ip = "10.20.0.58", placement_group = "services", keep_disk = true }
+notifier-1 = { role = "notifier", tier = "worker", server_type = "cpx12", private_ip = "10.20.0.59", placement_group = "services", keep_disk = true }
 ```
 
-- **The addresses.** 10.20.0.58 and 10.20.0.59 are free. The plan uses .50-.52, .55-.57 and
-  .60 in the services range, and #67 adds .70 (kardamom-infra `docs/staging-launch.md:35`).
+- **The addresses.** #79 takes .58 and reserves .59 for notifier-1 in the address plan of
+  `docs/staging-launch.md`. The plan uses .50-.52, .55-.57, .60 and .70 (load-0, from #67).
 - **The placement group.** `services` holds 6 servers today (`staging.tfvars:92-97`). With the two
   notifier nodes it holds 8, below the limit of 10 (`main.tf:205-210`). A spread group puts
   the two notifier nodes on different hosts.
-- **The role.** `notifier` goes into the list of roles of `variables.tf:170`.
+- **The role.** #79 adds `notifier` to the list of roles of `variables.tf:170`.
 - **No public address.** The default of `public` is false. The notifier nodes route through gw-0.
-- **The server budget.** Today 13 static servers plus the pool maxima 2 + 2 give 17, which is
-  the budget (`staging.tfvars:16`). #67 makes it 18 with load-0. The two notifier nodes need 20.
-  `server_budget = 20`.
-- **The cores.** Today the static servers use 38 shared cores against a project limit of 40
-  (`staging.tfvars:14-15`). The notifier nodes add 2: 40. The resize of the ingress nodes adds
-  none (4 to 4). load-0 has 8 dedicated cores. The limit in the console must cover the total
-  before the apply (section 10, step 3).
+- **The server budget.** #67 made it 18 with load-0. #79 sets 20: 14 static servers, notifier-1,
+  and the pool maxima 2 + 2 (`main.tf:36`, `:68-73`). So notifier-1 needs no budget change.
+- **The cores.** Before #79 the static servers use 38 shared cores against a project limit of 40
+  (`staging.tfvars:14-15`). The resize of the ingress nodes adds none (4 to 4). notifier-0 makes
+  39 and notifier-1 makes 40. load-0 (ccx33) counts against the dedicated quota, 8 vCPU. The API
+  does not show the limits. Check them in the console before each apply (section 10).
 - **The inventory.** `ansible/inventories/staging/hosts.ini`:
 
 ```ini
@@ -361,6 +484,8 @@ notifier-1 = { role = "notifier", tier = "worker", server_type = "cpx12", privat
 notifier-0 ansible_host=10.20.0.58 kardamom_node=notifier-0 role=notifier node_roles=notifier tier=worker node_index=0
 notifier-1 ansible_host=10.20.0.59 kardamom_node=notifier-1 role=notifier node_roles=notifier tier=worker node_index=1
 ```
+
+  #79 adds the line of notifier-0. The phase of notifier-1 adds its line.
 
   The group `notifier` goes into `[cloud:children]` (`hosts.ini:146-155`).
 - **The directories.** The node build runs the `common` role, which makes
@@ -372,9 +497,10 @@ notifier-1 ansible_host=10.20.0.59 kardamom_node=notifier-1 role=notifier node_r
 
 - **The constraint.** `meta.roles` `set_contains` `notifier`, as the batcher does
   (`batcher.nomad.hcl:178-182`). It replaces `meta.role = ingress` (`notifier.nomad.hcl:108-111`).
-- **The count.** A job variable `notifier_count`, default 2, with `distinct_hosts`. The workloads
-  role passes it from the node class count. `--instance-count` takes the same value
-  (`notifier.nomad.hcl:185`).
+- **The count.** A job variable `notifier_count`, default 2, with `distinct_hosts`. The deploy
+  takes it from `KARDAMOM_NOTIFIER_COUNT`. `--instance-count` takes the same value
+  (`notifier.nomad.hcl:185`). A preflight refuses a count above the number of Nomad nodes with
+  the role `notifier`: with more allocations than nodes, the deployment never turns healthy.
 - **The peers.** The Consul node records of the notifier nodes:
   `http://notifier-${i}.node.<dc>.consul:8547` for `i` in `range(var.notifier_count)`. They
   replace the ingress records (`notifier.nomad.hcl:100`). A node record exists before the
@@ -387,9 +513,21 @@ notifier-1 ansible_host=10.20.0.59 kardamom_node=notifier-1 role=notifier node_r
   ingress nodes the driver sits at its 768 MB limit at 77 to 82 % CPU at rest, mostly a spin at the
   50 µs cap. On a notifier node the driver carries only the streams of the notifier, so about
   512 MB is expected. The rollout measures it, then lowers `driver_quiet_memory_mb`.
-- **The fit on cpx12.** 2 GB: the notifier 512 MB, the driver 768 MB (512 MB after the measure),
-  the node exporter 64 MB (`deploy/cluster/nomad/node-exporter.system.nomad.hcl:90-93`), and
-  the Consul, Nomad and Docker agents. The fallback is cpx22, by an in-place resize.
+- **The fit on cpx12.** 2 GB of RAM holds:
+  - the notifier, 512 MB;
+  - the driver, 768 MB at first, about 512 MB after the measure;
+  - the node exporter, 64 MB (`deploy/cluster/nomad/node-exporter.system.nomad.hcl:90-93`);
+  - the Consul, Nomad and Docker agents;
+  - the Aeron tmpfs `/opt/kardamom/aeron-mount`. It is RAM too. Its limit is 2 GB on every node
+    (`aeron_tmpfs_size`, `deploy/cluster/ansible/group_vars/all.yml:173`; the mount at
+    `roles/common/tasks/main.yml:106-112`). The term buffers in it are charged to the cgroup of
+    the process that creates them (`aeron.system.nomad.hcl:309-317`).
+- **The tmpfs on the notifier nodes.** It holds only the images of the notifier streams:
+  `tx_status`, `tx_errors` and `egress_receipts`, from their publishers. Each image is 3 terms of
+  4 MiB (`aeron.system.nomad.hcl:252-255`). An estimate of 10 to 15 images gives 120 to 180 MiB.
+  The notifier nodes set `aeron_tmpfs_size: 384m` as a host variable (#79 or the phase of
+  notifier-1). The measure of section 10 checks the use.
+- **The fallback** is cpx22, by an in-place resize.
 - **The notifier poll loops** keep their own waits: the job sets no `KARDAMOM_IDLE_CAP_US`, so each
   loop keeps its default (`crates/log/src/aeron_live/idle.rs:19-23`).
 - **The README.** The node class table of `deploy/cluster/README.md:34` loses the notifier from
@@ -404,11 +542,33 @@ notifier-1 ansible_host=10.20.0.59 kardamom_node=notifier-1 role=notifier node_r
   job scrapes `kardamom-notifier-metrics` through Consul (`monitoring.nomad.hcl:148-150`).
 - **The state.** `/opt/kardamom/notifier` holds the webhook subscriptions, the outboxes and the
   cursors (`crates/notifier/src/main.rs:79-85`). A registration is stored on both instances
-  (`notifier.nomad.hcl:11-14`). The move copies the directory of `ingress-<i>` to `notifier-<i>`,
-  so the shard of each instance keeps its outbox.
-- **The move.** Stop the notifier job. Copy the two directories. Deploy the job with the new
-  constraint. The WebSocket feed is down for a few minutes. The canary feed check fails in that
-  window: silence it first.
+  (`notifier.nomad.hcl:11-14`).
+- **The shards follow the instance index, not the node.** The owner of a subscription is a
+  rendezvous hash over `--instance-index ${NOMAD_ALLOC_INDEX}` and `--instance-count`
+  (`notifier.nomad.hcl:184-185`, `crates/notifier/src/shard.rs:1-5`). The allocation on
+  ingress-1 can have index 0. The move gives the indexes again.
+- **The choice: merge, not a copy by index.** The move merges both directories onto the new node:
+  - The subscriptions are the same on both (the peers list).
+  - For each subscription, it takes the outbox and the cursor of the old owner, by the index of
+    the old allocation (`nomad alloc status` gives `NOMAD_ALLOC_INDEX`).
+  - Delivery is at least once, so a cursor that is behind sends an event again, and loses none.
+  - A merge does not depend on which index lands on which node.
+- **Phase 1, one node (notifier-0).** `notifier_count = 1`, so `--instance-count 1`, and every
+  shard is on instance 0. The peers list names notifier-0 only.
+  1. Silence the canary feed check.
+  2. Stop the notifier job. Read the index of each old allocation first.
+  3. Merge both old directories into `/opt/kardamom/notifier` on notifier-0.
+  4. Deploy the job with the role constraint and `KARDAMOM_NOTIFIER_COUNT=1`.
+  5. The WebSocket feed is down for a few minutes. Check the canary feed, then turn its check on.
+- **Phase 2, the re-shard (notifier-1).** After the load test of notifier-0 and the apply of
+  notifier-1:
+  1. Stop the notifier job.
+  2. Copy the directory of notifier-0 to notifier-1. The registrations of phase 1 are only on
+     notifier-0, because its peers list named only itself.
+  3. Deploy with `KARDAMOM_NOTIFIER_COUNT=2`. The rendezvous hash moves only the subscriptions
+     whose owner changes (`shard.rs:1-5`). Each moved subscription resumes from its copied outbox
+     and cursor on notifier-1.
+  4. A registration reaches both instances again through the peers list.
 - **Before the resize.** A resize powers off an ingress node. Today that also stops one notifier,
   which cannot move to the other ingress node (`distinct_hosts`). So the notifier moves first.
 
@@ -439,13 +599,12 @@ executor nodes.
 - **What the provider does (findings, provider 1.69.0).** A type change is an in-place update, not
   a replacement. The server powers off, the type changes, and the server starts again. The IPs
   and the LB target stay.
-- **The disk.** `hcloud_server.static` sets no `keep_disk` (`main.tf:243-293`). The disk then
-  grows from 80 to 160 GB, and a later move back to cx33 is not possible. With `keep_disk = true`
-  the disk stays 80 GB, and cx33 stays possible. After Part B the ingress keeps no recording, so
-  80 GB is enough. Recommendation: `keep_disk = true` (Q2).
-- **The hazard of load-0.** load-0 is in the local state (it was applied on 2026-10-17), but only
-  in the open #67. An apply from infra main destroys it. Merge #67, or rebase on it, first. The
-  plan of each apply must show 0 to destroy.
+- **The disk.** On infra main, `hcloud_server.static` sets no `keep_disk` (`main.tf:243-293`), so
+  the disk would grow from 80 to 160 GB, with no way back to cx33. #79 adds `keep_disk` to the
+  server variable and sets it to true on ingress-0, ingress-1 and notifier-0. The disk then stays
+  80 GB, and cx33 stays possible. After Part B the ingress keeps no recording, so 80 GB is enough.
+- **load-0.** #67 has merged, so an apply from infra main keeps load-0. The plan of each apply must
+  still show 0 to destroy.
 - **One server at a time.** Each step on one node:
   1. Check that the other ingress is healthy, and that the load is low.
   2. Drain the Nomad node. The ingress stops with its drain: `/health` answers 503, new submits
@@ -460,9 +619,8 @@ executor nodes.
   within about 30 s. An HTTP check on `/health` is in the later list (section 9). For two fixed
   nodes and a planned resize at low load, the TCP check is accepted.
 - **The kill timeout.** The ingress asks for 40 s (`ingress.nomad.hcl:229`). Nomad caps a kill
-  timeout at the client `max_kill_timeout`, which the deploy does not set. Nomad's default, as far
-  as we know, is 30 s (not checked against the Nomad source). With `--ack validated` nothing
-  parks, so 30 s is enough.
+  timeout at the client `max_kill_timeout`, which the deploy does not set. The Nomad default is
+  30 s. With `--ack validated` nothing parks, so 30 s is enough.
 
 ### 7.2 The verifier
 
@@ -481,7 +639,13 @@ executor nodes.
   the CLI. Without it, the rule of today: half of `available_parallelism`, at most 8
   (`crates/ingress/src/sig_verify.rs:293-303`). On a 4-vCPU node that is 2.
 - The deploy sets 3 on cpx32: a job variable `ingress_verify_workers`.
-- The split threshold of #792 stays: 4 requests (today 16, `sig_verify.rs:112`).
+- The split rule of #792 stays. #792 replaces the fixed threshold (16 today, `sig_verify.rs:112`)
+  with a minimum per worker: a batch gets one more worker only for about 5 more recoveries. So a
+  batch of `n` requests uses `min(workers, n / 5)` workers, and at least one.
+  - With 3 workers, a batch splits in 3 only from about 15 requests. At 1,700 tx/s per node a
+    batch holds about 10 requests (#792), so most batches use 2 workers, and the third serves the
+    peaks.
+  - The setting is the ceiling of the rule, not a fixed split.
 - Then the verify agent of the hot-path spec (section 5) can follow, if its stage 0 picks the
   ingress.
 - Measure in the ramp, before and after:
@@ -502,18 +666,20 @@ node, if the numbers show that the verifier still competes for the CPU (Q1).
 | Case | What happens | Mitigation |
 |---|---|---|
 | One egress instance down | The other serves the range read and `egress_order`. The restarted instance fills from its peer (`crates/egress/src/main.rs:96-106`). | 2 instances, `distinct_hosts`. |
-| Every egress instance down | The batcher and the validator stop moving. The carry executors run on the member feed, but cannot recover below the sealer window. The sequencers get no account rows, so admission refuses the senders with pending transactions (one-way spec 6.3). The notifier gets no receipts (`--receipts-from-egress`). The DA-lag guard stops user records after 10,000 unposted blocks. | The alerts of the egress. Restart an instance with its store. |
-| Both egress stores lost | An empty instance cannot join a running chain (`egress.nomad.hcl:27-29`). The blocks above the sealer window and the posted head have no copy that a reader can read. Their bytes exist in the `exec_txs` recording of each executor (`exec_stream/mod.rs:1-23`), but no reader recovers from it. | Q5. Today the `tx_data` archives are a second copy for the batcher rebuild. Part B removes it. |
+| One egress instance with a high floor (a fresh or rebased instance, F12) | A reader that reaches it gets a 410. The transport asks the other instance, which serves the range (4.3). | E1a. The counter `kardamom_reader_egress_floor_retries_total`. |
+| Every egress instance down | The batcher reads the sealer window (4.3), then waits. The validator stops moving. The carry executors run on the member feed, but cannot recover below the sealer window. The sequencers get no account rows, so admission refuses the senders with pending transactions (one-way spec 6.3). The notifier gets no receipts (`--receipts-from-egress`). The DA-lag guard stops user records after 10,000 unposted blocks. | The alerts of the egress. Restart an instance with its store. |
+| Both egress stores lost | The new instances start after the next boundary of a copy (F12). The blocks between the posted head and that boundary have no egress copy. The batcher reads them from the sealer window, when its posted cursor is inside it (4.3). Else it halts. The validator takes a peer checkpoint. | E1b, and the `retention` rule of 4.3. |
 | An egress behind | The readers lag. The distance gauge `kardamom_egress_head_distance_frames` and its alert show it. No loss. | One-way spec 6.4. |
-| The batcher below the egress floor | It halts with `ReplayUnavailable` and the floor (4.3). | The floor alert of 4.3. `--keep-blocks` is far above the DA-lag budget. |
-| A driver switch on one node | Its clients restart, 20 to 40 s (5.2). | One node at a time, at low load. The twin or the other ingress serves. |
+| The batcher below every egress floor and the sealer window | It halts with `ReplayUnavailable` and both floors (4.3). | The floor alert of 4.3. `--keep-blocks` is far above the DA-lag budget. |
+| A driver switch on one node | Its clients restart, an estimated 30 to 60 s (5.2). | The stale wait of E3. One node at a time, at low load. The measure in the container shard first. |
+| Feature 5 off after Part B | Type-0 references come back, and a reference reader has no archive. The carry executors stop. | The gates of 5.5 refuse it. |
 | The second ingress fails during a resize | No ingress serves RPC until one is back. | Low load. Check the other ingress first. Stop the step if it is not healthy. |
 | A resize fails or hangs | The node stays off. One ingress serves. | Hetzner console. The other ingress carries the load. |
-| An apply from infra main | It destroys load-0. | #67 first. The plan shows 0 to destroy. |
-| One notifier node lost | The other instance serves the WebSocket feed. The webhook shard of the lost instance waits: a shard moves only when the instance count changes (`notifier.nomad.hcl:11-14`). | The node comes back. Staging accepts the wait. |
-| cpx12 too small | The notifier or the driver is killed for memory, or the events lag. | The ramp check (section 10, step 5). The fallback is cpx22. |
+| One notifier node lost (phase 2) | The other instance serves the WebSocket feed. The webhook shard of the lost instance waits: a shard moves only when the instance count changes (`notifier.nomad.hcl:11-14`). | The node comes back. Staging accepts the wait. |
+| The notifier node lost (phase 1) | No notifier runs. No events, no webhooks. Receipts still land. | The node comes back. Phase 2 restores the HA. |
+| A notifier count above the notifier nodes | The deployment never turns healthy. | The preflight of 6.2. |
+| cpx12 too small | The notifier or the driver is killed for memory, or the events lag. | The ramp check (section 10). The fallback is cpx22. |
 | A lost `tx_data` frame after Part B | The sequencer does not order it, as today: the sequencer has no refetch (F3). The client sees no receipt. | No change. One-way D1. |
-| A reader in reference mode after Part B | It opens its lanes, but no archive serves a join miss. With feature 5 on, no type-0 reference comes, so it never joins. | The preflight of 5.4 keeps the carry gates. |
 
 ## 9. Later: the elastic ingress pool
 
@@ -526,8 +692,8 @@ The user's last pool shape was min 2 and max 3 cpx32. These blockers stay open:
   (`main.tf:350-363`). A pool needs a `label_selector` target (`group-id=kardamom-staging-ingress`,
   `use_private_ip`) and an HTTP check on `/health`, so that a drain (503) takes the node out.
 - **The drain.** The ingress job has no `shutdown_delay`. It needs one above the LB detection
-  (about 30 to 40 s). `kill_timeout` 40 s is above the Nomad default `max_kill_timeout`, which no
-  config sets.
+  (about 30 to 40 s). `kill_timeout` 40 s is above the Nomad default `max_kill_timeout` of 30 s,
+  which no config changes.
 - **The system jobs.** The aeron job sets no `node_pool`, so a node in a pool gets no driver. The
   node exporter sets `node_pool = "all"` (`node-exporter.system.nomad.hcl:51`).
 - **The plugin.** The autoscaler role builds the hcloud-server plugin itself, and its URL and
@@ -538,8 +704,9 @@ The user's last pool shape was min 2 and max 3 cpx32. These blockers stay open:
 - **#78.** A new on-node directory reaches only a node that is built after it.
 - **The ingress id.** `--ingress-id ${NOMAD_ALLOC_INDEX}` (`ingress.nomad.hcl:282`). A canary
   could reuse an index (not confirmed).
-- **Fixed counts.** `ingress.nomad.hcl:170` (`count = 2`), `monitoring.nomad.hcl:119`,
-  `canary.nomad.hcl:78`, and the chaos suite (`crates/chaos/src/harness.rs:112`, `:137`,
+- **Fixed counts.** `ingress.nomad.hcl:170` (`count = 2`, a literal). `monitoring.nomad.hcl:119`
+  and `canary.nomad.hcl:78` iterate `var.ingress_count`, so a pool must keep that value current.
+  The chaos suite (`crates/chaos/src/harness.rs:112`, `:137`,
   `:257-258`; `crates/chaos/src/cases/archive.rs`). Part C removes the notifier from this list.
 - **The pool floor.** `variables.tf:109` needs `min >= 2`, and `autoscaler_ingress_min` is 2. Min 2
   fits.
@@ -555,61 +722,79 @@ The user's last pool shape was min 2 and max 3 cpx32. These blockers stay open:
 Each step names its checks. Do not start a step until the checks of the step before pass.
 **A step marked "needs the user's explicit approval" does not start without it.**
 
-1. **Release 1.** It holds E1 to E5 (section 11) with every switch at today's value. Before the
-   aeron job, apply `aeron_driver = archive` to every live node (5.2), so every node keeps the
-   archive group.
+0. **The container shard first.** Run the no-archive profile of the `carry` shard (10.1). It
+   measures the downtime of a driver switch for each kind. No staging node switches its driver
+   before this measure passes.
+1. **Release 1.** It holds E1, E1a, E1b, E2, E3, E4 and E5 (section 11), with every switch at
+   today's value. Before the aeron job, apply `aeron_driver = archive` to every live node (5.2),
+   so every node keeps the archive group.
    - Every `aeron` allocation keeps its id: no driver restarted.
    - The notifier still runs on the ingress nodes. The canary passes.
-2. **Merge infra #67, or rebase the infra PRs on it.** **Needs the user's explicit approval** (a
-   change to the live infra state).
-3. **The notifier nodes.** Apply I2. **Needs the user's explicit approval: it creates two paid
-   servers and runs a Terraform apply.**
-   - Before: the core limit in the console covers the total. The plan adds 2 servers and destroys
-     0.
-   - After: notifier-0 and notifier-1 join Consul and Nomad with `meta.roles = notifier` and
-     `meta.aeron_driver = quiet`. The `aeron-quiet` group runs on both.
-4. **The notifier move** (6.3). Silence the canary feed check. Stop the job. Copy the directories.
-   Deploy.
-   - Two notifier allocations, on notifier-0 and notifier-1. The canary feed check passes.
+2. **Infra #79, notifier-0.** #67 (load-0) has merged. Apply notifier-0 only (`-target`).
+   **Needs the user's explicit approval: a Terraform apply that creates a paid server.**
+   - Before: the core limit in the console covers 39 shared cores. The plan adds 1 server and
+     destroys 0.
+   - After: notifier-0 joins Consul and Nomad with `meta.roles = notifier` and
+     `meta.aeron_driver = quiet`. The `aeron-quiet` group runs on it.
+3. **The notifier move, phase 1** (6.3): `KARDAMOM_NOTIFIER_COUNT=1`, the merge of both old
+   directories on notifier-0. It runs before any resize.
+   - One notifier allocation, on notifier-0. The canary feed check passes.
      `kardamom-notifier-metrics` is scraped.
-5. **The notifier check in the next ramp.**
+4. **Infra #79, the resize** (7.1): ingress-0, then ingress-1, one apply each, at low load, each
+   with a plan that changes one server type and destroys 0. **Needs the user's explicit approval:
+   a Terraform apply and a paid server type, once for each server.**
+5. **The notifier check in the next ramp** (the load test of notifier-0).
    - Read the notifier event latency (the canary feed lag, and the time from a receipt to its
-     event) and the node CPU of both notifier nodes.
-   - Read the driver memory on those nodes. Set `driver_quiet_memory_mb` to the measured peak plus
-     a margin, about 512.
-   - If a notifier node runs out of CPU or memory: resize it to cpx22. **Needs the user's explicit
+     event) and the node CPU of notifier-0.
+   - Read the driver memory and the tmpfs use on notifier-0. Set `driver_quiet_memory_mb` to the
+     measured peak plus a margin, about 512.
+   - If notifier-0 runs out of CPU or memory: resize it to cpx22. **Needs the user's explicit
      approval.**
-6. **The plain driver where nothing records.** Set `aeron_driver = plain` on sequencer-0, then
-   sequencer-1, then validator-0, batcher-0, monitoring-0, redis-0 and redis-1, one at a time.
-   - Each node: the `aeron-plain` allocation runs, the services on it are healthy, and the node
-     has no `kardamom-aeron-archive` record.
-   - Each sequencer: `kardamom_sequencer_sealer_version` 5, receipts land.
-7. **Resize ingress-0 to cpx32** (7.1). **Needs the user's explicit approval: a Terraform apply
-   and a paid server type.**
-8. **Resize ingress-1 to cpx32** (7.1). **Needs the user's explicit approval.**
-9. **The verifier.** After #792: deploy `ingress_verify_workers = 3`. Run the ramp. Compare the
+   - Then notifier-1 (I4). **Needs the user's explicit approval: a Terraform apply that creates a
+     paid server.** Check the core limit first (40 shared). Then the re-shard of phase 2 (6.3)
+     with `KARDAMOM_NOTIFIER_COUNT=2`. Check: two notifier allocations, one on each node, and a
+     webhook registration on one instance reaches the other.
+6. **The verifier.** After #792: deploy `ingress_verify_workers = 3`. Run the ramp. Compare the
    values of 7.2 with the ramp of 2026-10-24.
-10. **Part B** (5.4), after step 10 of the carry rollout and the deploy of E1:
-    - Deploy E6. Its preflight must pass.
-    - Set `aeron_driver = plain` on ingress-0, then on ingress-1.
-    - Consul has no record with the tag `tx_data` or `tx_deposits`. The rendered
-      `channels.toml` of a reader lists no `tx_data` and no `tx_deposits` archive.
-    - The ingress starts with no recorder. The da-watcher publishes epochs with no recording.
-    - Receipts land. The validator agrees. The batcher posts.
-11. **The cleanup deploy.** Deploy E7.
-12. **Soak for 24 hours** under the canary. Then delete the old `tx_data` recordings on the
-    ingress nodes and the `tx_deposits` recordings on da-watcher-0. **Needs the user's explicit
-    approval: it deletes data on staging nodes.**
+7. **The plain driver where nothing records.** Set `aeron_driver = plain` on sequencer-0, then
+   sequencer-1, then validator-0, batcher-0, monitoring-0, redis-0 and redis-1, one at a time, at
+   low load.
+   - Each node: the `aeron-plain` allocation runs, the services on it are healthy, and the node
+     has no `kardamom-aeron-archive` record. The downtime is within the measure of step 0.
+   - Each sequencer: `kardamom_sequencer_sealer_version` 5, receipts land.
+8. **The readers of 4.3**, after step 4 of the carry rollout. Deploy the validator and the
+   batcher with `--egress-instances`. Restart one egress instance with an empty store.
+   - The counter `kardamom_reader_egress_floor_retries_total` moves, and no reader halts.
+9. **Part B** (5.4), after step 10 of the carry rollout:
+   - Deploy E6. Its preflight must pass. The gates of 5.5 are on from this deploy.
+   - Set `aeron_driver = plain` on ingress-0, then on ingress-1.
+   - Consul has no record with the tag `tx_data` or `tx_deposits`. The rendered
+     `channels.toml` of a reader lists no `tx_data` and no `tx_deposits` archive.
+   - The ingress starts with no recorder. The da-watcher publishes epochs with no recording.
+   - Receipts land. The validator agrees. The batcher posts.
+   - The gates: an upgrade check of feature 5 off is refused, and a deploy with floor 4 is
+     refused.
+10. **The cleanup deploy.** Deploy E7.
+11. **Soak** under the canary (Q6). Then delete the old `tx_data` recordings on the ingress nodes
+    and the `tx_deposits` recordings on da-watcher-0. **Needs the user's explicit approval: it
+    deletes data on staging nodes.**
 
 ### 10.1 Tests
 
 - **Rust unit tests.**
-  - The batcher in egress mode: an egress 410 gives the halt `ReplayUnavailable` with the floor,
-    and calls no archive.
+  - The egress transport: a 410 from one instance and frames from the other serve the range. A 410
+    from every instance reports `Unavailable` with the lowest floor. A refused connect is not a
+    refusal. One instance that does not answer and one 410 is not `Unavailable`.
+  - `ClusterTransport`: a replay from the cursor, then the live frames, on a scripted session.
+  - The batcher in egress mode: the egress below the floor, the sealer window serves. Both below
+    the floor: the halt `ReplayUnavailable` names both floors, and no block references are
+    fetched.
   - The batcher in cluster mode keeps the rebuild.
   - The egress floor and head gauges move with a prune and with an append.
-  - `--verify-workers`: 0 is refused at the parse. With no value, the rule of today. With 3, the
-    flush loop runs 3 workers.
+  - `--verify-workers`: 0 is refused at the parse. With no value, the rule of today. With 3, a
+    batch of 10 uses 2 workers and a batch of 15 uses 3, under the rule of #792.
+- **Java and shell tests of the image** (E3): a start next to a fresh `cnc.dat` waits, and starts
+  when the heartbeat is stale. A plain start waits for `cnc.dat` only.
 - **Deploy tests** (`deploy/cluster/ansible/tests/test_deploy.py`, `test_channels.py`):
   - `aeron_driver` for each role set: `archive` with `indexer` or `executor`, `quiet` with
     `notifier`, `plain` otherwise.
@@ -619,26 +804,35 @@ Each step names its checks. Do not start a step until the checks of the step bef
   - `archive_topics` is empty on an ingress node and on a da-watcher node (E6).
   - `channels.toml` renders no `tx_data` or `tx_deposits` list (E7).
   - The notifier job: the role constraint, `count = notifier_count`, `--instance-count` equal to
-    the count, the peers `notifier-<i>`, 512 MB.
+    the count, the peers `notifier-<i>`, 512 MB. A count above the notifier nodes is refused.
   - The ingress job has no `--archive-durability`. The da-watcher job has none.
   - The preflight of 5.4 refuses with one reader off the egress, with one executor not in carry
     mode, and with the batcher meta missing. A refusal writes no job.
+  - The gates of 5.5: with `tx_data_recorded = "false"`, refuse feature 5 off, a new activation of
+    feature 5 with a time ahead, a floor below 5, and an empty or partial
+    `KARDAMOM_CARRY_EXECUTORS`. With the archive back, the gates do not apply.
+  - The `retention` rule of 4.3 against the post interval of the batcher.
   - `--keep-blocks` below `20 x daLagBudgetBlocks` is refused.
-- **Infra tests** (kardamom-infra `terraform/hetzner/tests`): the role `notifier` is accepted, the
-  budget precondition holds at 20, the services group holds 8.
+- **Infra tests** (kardamom-infra `terraform/hetzner/tests`): #79 has them for notifier-0 and
+  `keep_disk`. I4 adds notifier-1 and the services group of 8.
 - **Multi-process e2e** (`crates/e2e`): a new scenario on the stack of the carry scenario
   (carry spec 11.3), with no archive except `exec_txs`:
   1. Send transfers and a deposit.
   2. Restart the validator and the batcher with cursors below the sealer window. Both recover
      from the egress range read. The deposit executes once.
   3. Restart a carry executor. It reads the epoch with its deposits from the egress.
-  4. Stop both egress instances for 30 s. The batcher and the validator wait, then resume.
+  4. Wipe the store of one egress instance and restart it. The readers read the other instance.
+  5. Stop both egress instances for 30 s. The batcher reads the sealer window, then the egress
+     again. The validator waits, then resumes.
 - **The container shard.** The `carry` shard of carry spec C8 gets a no-archive profile: every
   node except the executor and follower nodes runs `aeron-plain`, and the notifier runs on its own
-  node class. Chaos cases under load:
-  - switch the driver of one ingress node, and measure the downtime of 5.2;
-  - restart one egress instance;
-  - stop one notifier node, and check the WebSocket feed of the other.
+  node class. Cases under load:
+  - switch the driver of one node of each kind, and measure the downtime (5.2, step 0 of section
+    10; this case ships in E4);
+  - restart one egress instance with an empty store;
+  - stop one notifier node, and check the WebSocket feed of the other;
+  - `driver_loss` and `corruption` on an `exec_txs` archive (5.1).
+  - `tx_data_wipe` retires (5.1).
 - **The elastic shard** (scale-out and scale-in under load) belongs to section 9.
 
 ## 11. Pull requests
@@ -647,22 +841,27 @@ Each PR passes `just style` and CI alone, and follows `docs/STYLE.md`.
 
 | PR | Repo | Title | Depends on | Size |
 |---|---|---|---|---|
-| E1 | kardamom | batcher: in egress mode a refused replay halts, no archive rebuild; egress: floor and head gauges; deploy: the `--keep-blocks` check and the floor alert; batcher job meta `egress_halt_no_rebuild` | none | M |
+| E1 | kardamom | batcher: the halt names both floors, and egress mode fetches no block references; egress: floor and head gauges; deploy: the `--keep-blocks` check and the floor alert | none | S |
+| E1a | kardamom | engine: the egress transport asks every instance before `Unavailable`, the lowest floor, the retry counter; deploy: `--egress-instances` for the validator, the batcher and the carry executors | none | M |
+| E1b | kardamom | engine, batcher: `ClusterTransport`, the cluster session as the second source of the batcher in egress mode, batcher job meta `egress_two_sources`; deploy: the `retention` rule against the post interval | E1a | M |
 | E2 | kardamom | ingress: `--verify-workers`; deploy: `ingress_verify_workers` | #792 | S |
-| E3 | kardamom | aeron image: wait only for `cnc.dat` with the plain class | none | S |
-| E4 | kardamom | deploy: the aeron job by `aeron_driver` (three groups), the node meta, `idle_cap_quiet_us`, `driver_quiet_memory_mb`, tests | E3 | M |
-| E5 | kardamom | deploy: the notifier on the `notifier` role: constraint, `notifier_count`, peers, instance count, 512 MB, README | none | S |
-| I1 | infra | #67, load-0 (exists) | none | S |
-| I2 | infra | terraform and inventory: notifier-0 and notifier-1 on cpx12, the role, `server_budget = 20`, the address plan in `docs/staging-launch.md` | I1 | S |
-| I3 | infra | terraform: ingress-0, then ingress-1, on cpx32, with `keep_disk` (Q2); one commit for each server | I1 | S |
-| E6 | kardamom | deploy: no `tx_data` and no `tx_deposits` recording: the ingress and da-watcher flags, `archive_topics`, the preflight of 5.4, tests | carry C6 (#791), E1, E4 | M |
+| E3 | kardamom | aeron image: the wait for a stale `cnc.dat` before the start, and the start wait of the plain class; job meta `driver_waits_stale` | none | S |
+| E4 | kardamom | deploy: the aeron job by `aeron_driver` (three groups), the node meta, the meta apply of release 1, `idle_cap_quiet_us`, `driver_quiet_memory_mb`, tests; chaos: the container case that switches the driver of one node of each kind and measures the downtime | E3 | M |
+| E5 | kardamom | deploy: the notifier on the `notifier` role: constraint, `notifier_count` with its preflight, peers, instance count, 512 MB, README | none | S |
+| I1 | infra | #67, load-0 | none | merged |
+| I2 | infra | #79: ingress-0 and ingress-1 on cpx32, `keep_disk`, notifier-0 on cpx12, the role, `server_budget = 20` | I1 | approved |
+| I3 | infra | `aeron_tmpfs_size: 384m` on the notifier nodes | I2 | S |
+| I4 | infra | notifier-1 on cpx12, the inventory line, the tests | I2, step 4 of section 10 | S |
+| E6 | kardamom | deploy: no `tx_data` and no `tx_deposits` recording: the ingress and da-watcher flags, `archive_topics`, the job meta `tx_data_recorded`, the preflight of 5.4, the gates of 5.5, tests | carry C6 (#791), E1, E1a, E1b, E4 | M |
+| C9 | kardamom | #794 (open): the line of 5.5 in "To go back" of `docs/runbooks/carry-window-rollout.md` | none | S |
 | E7 | kardamom | deploy: remove the two archive lists, the contract checks and the refetch flags and ports of the readers | E6 on staging | S |
-| E8 | kardamom | e2e and chaos: the no-archive scenario, the no-archive profile of the `carry` shard, the cases of 10.1 | E4 to E7, carry C7, C8 | L |
-| E9 | kardamom | docs: `docs/failure-modes.md`, `deploy/cluster/README.md`, `crates/log/README.md`, the stale comments of 4.4, a note at P8 and P13 of the one-way spec | E6 | S |
+| E8 | kardamom | e2e and chaos: the no-archive scenario, the no-archive profile of the `carry` shard, the cases of 10.1, `driver_loss` and `corruption` on `exec_txs`, `tx_data_wipe` retired | E1a, E1b, E4 to E7, carry C7, C8 | L |
+| E9 | kardamom | docs: `docs/failure-modes.md`, `deploy/cluster/README.md`, `crates/log/README.md`, the stale comments of 4.4, the stale comment of `egress.nomad.hcl:27-29` (F12), a note at P8 and P13 of the one-way spec | E6 | S |
 | E10 | kardamom | cleanup (part of one-way P13): `refetch.rs`, the recorders of `tx_data` and `tx_deposits`, `archive_join_recovery`, the batcher rebuild, `RangeAbsent`, the void vote | E7 on every network | L |
 
-Sizes: S is up to about 200 lines, M up to about 600, L above that. E1 to E5 can start at once.
-The release of step 1 holds E1 to E5.
+Sizes: S is up to about 200 lines, M up to about 600, L above that. E1, E1a, E2, E3 and E5 can
+start at once. The release of step 1 holds E1 to E5. The switch case of E4 is the measure of step 0
+of section 10.
 
 ## 12. Considered and not chosen
 
@@ -673,7 +872,13 @@ The release of step 1 holds E1 to E5.
 - **The notifier in the egress now (P8).** Section 6.4.
 - **One cpx22 with two notifiers.** It loses the HA of two hosts. Two cpx12 keep it.
 - **Keep the `tx_data` archive as a copy for the batcher.** It is the only reason for the
-  ingress recorders and the archive on the ingress nodes. Q5 names the gap that it closes.
+  ingress recorders and the archive on the ingress nodes. The sealer window (4.3) is a second
+  source that needs no join.
+- **`nomad alloc stop` before the meta change.** Nomad places the system allocation again (5.2).
+- **A copy of the notifier directory by node name.** The shards follow the allocation index, not
+  the node (6.3).
+- **A fixed halt in egress mode with no second source (revision 1).** One fresh egress instance
+  could halt the batcher while the other held the range (F11, F12).
 - **Min 1 ingress.** The user set min 2 (section 9).
 
 ## 13. Open questions for the user
@@ -681,17 +886,38 @@ The release of step 1 holds E1 to E5.
 - **Q1. Pin 3 cores, or 3 workers with no pin?** Recommendation: 3 workers, no pin, and measure
   first (7.2). Pin only as an experiment on one node, if `ingress.recover_wait` and
   `node_schedstat_waiting_seconds_total` show that the verifier still waits for the CPU.
-- **Q2. `keep_disk` at the resize.** With it, the disk stays 80 GB and a move back to cx33 stays
-  possible. Without it, the disk grows to 160 GB, with no way back. Recommendation:
-  `keep_disk = true`.
-- **Q3. The notifier state at the move.** Copy `/opt/kardamom/notifier` from each ingress node
-  (a stop of a few minutes), or start empty (the webhook clients register again).
-  Recommendation: copy.
-- **Q4. The notifier as its own class, or in the egress (P8).** Recommendation: its own class now.
+- **Q2. The notifier state at the move.** Merge the old directories (6.3, a stop of a few
+  minutes), or start empty (the webhook clients register again). Recommendation: merge.
+- **Q3. The notifier as its own class, or in the egress (P8).** Recommendation: its own class now.
   Revisit P8 when the egress has its own fleet (6.4).
-- **Q5. The loss of both egress stores after Part B.** The `tx_data` archives are then gone, and
-  no reader recovers from the `exec_txs` recordings. Recommendation: accept it on staging, with 2
-  egress instances. Open an issue for a recovery from the `exec_txs` recordings, or a third egress
-  instance, before a production network.
-- **Q6. When to delete the old recordings** (section 10, step 12). Recommendation: after a soak of
+- **Q4. Feature 5 one way after Part B (5.5).** After Part B the carry window cannot turn off on
+  that network, and a fleet rebuild from a seed needs the `tx_data` archive back first.
+  Recommendation: accept it. The alternative is to keep the `tx_data` archive, which the user ruled
+  out.
+- **Q5. The bytes on the session of the batcher.** The carry spec plans a later change that
+  strips the bytes from the cluster sessions. The batcher then loses its second source (4.3).
+  Recommendation: that change keeps the bytes on the sessions that ask for them, and the batcher
+  asks.
+- **Q6. When to delete the old recordings** (section 10, step 11). Recommendation: after a soak of
   7 days, not 24 hours.
+
+The answers of revision 1 that changed:
+
+- `keep_disk` at the resize (Q2 of revision 1): #79 sets it to true. No longer open.
+- The loss of both egress stores (Q5 of revision 1): no longer "accept". The batcher reads the
+  sealer window as its second source (4.3).
+
+## 14. Changes from revision 1
+
+| Finding of the review of revision 1 | Change |
+|---|---|
+| R1 (major). One 410 from a fresh egress instance halts the batcher | F11, F12. Section 4.3: the transport asks every instance before `Unavailable`, and takes the lowest floor. Section 8: a new row. Section 11: E1a. |
+| R2 (major). Both egress stores lost; the stale job comment | F12, F13. Section 4.3: the cluster session as the second source of the batcher, the `retention` rule, the hazard of the strip. Section 8: the row. Section 13: Q5 of revision 1 moves to this design; the new Q5. Section 11: E1b, and the comment in E9. |
+| R3 (major). A meta switch places the new driver on a fresh heartbeat | Section 5.2: the stale wait in the entrypoint (E3), why not `nomad alloc stop`, the order on one node, the estimates of 30 to 60 s. Section 10: step 0 measures before any staging switch. Section 11: E3 and the case in E4. |
+| R4 (major). Part B closes the way back of the carry window | Section 5.5: feature 5 one way, the floor stays 5, the gates, the seed rebuild. Section 5.4: step 5 and the rollback. Section 13: Q4. Section 11: E6 and C9 (#794). |
+| R5 (major). The notifier shards follow the index; one node first | Section 6.3: the merge by the old index, phase 1 with count 1, phase 2 and the re-shard. Section 6.2: the count preflight. Section 8: the phase rows. Section 10: steps 2, 3 and 5. |
+| R6. Stale facts | Header: #67 merged, #79 approved. Section 1.1: load-0. `KARDAMOM_BATCHER_EGRESS` from a repository variable (`deploy-staging.yml:114-115`). `da-watcher.nomad.hcl:174-177`. Section 9: `var.ingress_count`. Sections 6.1, 7.1, 8 and 10 for #67 and #79. |
+| R7. E1 is not a new rule | F4. Section 4.3, "The halt". Section 11: E1 is S. |
+| R8. `max_kill_timeout`; the rule of #792 | Section 7.1: the default is 30 s. Section 7.2: the minimum per worker. Section 10.1: the test. |
+| R9. The tmpfs on cpx12 | Section 6.2: the tmpfs in the fit, its size on the notifier nodes. Section 10: the measure. Section 11: I3. |
+| R10. The `tx_data` chaos cases and the contract test | Section 5.1: two rows. Section 10.1 and E8: aimed at `exec_txs`, or retired. |
