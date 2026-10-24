@@ -8,7 +8,8 @@
 //!   store in `x-egress-next-index` and `x-egress-next-block`. A reader
 //!   whose cursor after is below the head asks again from it;
 //! - `410` when the store holds nothing that old, with its floor in
-//!   `x-egress-floor-index` and `x-egress-floor-block`;
+//!   `x-egress-floor-index` and `x-egress-floor-block`, and its reference
+//!   mark in `x-egress-ref-mark-index` and `x-egress-ref-mark-block`;
 //! - `400` for a bad query, `503` when the owner thread is gone.
 //!
 //! `POST /` with the JSON-RPC call `eth_getTransactionReceipt` answers as
@@ -22,7 +23,11 @@
 //! the status of one hash:
 //! - `{"status":"executed"}` when the egress holds its receipt;
 //! - `{"status":"dropped","reason":<geth error text>,"sender":<address>,
-//!   "nonce":<quantity>}` when a sequencer dropped it and no receipt came;
+//!   "nonce":<quantity>}` when a sequencer dropped it and no receipt came.
+//!   The status is provisional: a receipt of the hash that comes later
+//!   turns it to `executed`. For the reason `transaction dropped by the
+//!   sealer, send it again`, it is safe to send again; the status can still
+//!   become executed;
 //! - `{"status":"unknown"}` otherwise.
 //!
 //! `GET /health` answers `200 ok`.
@@ -48,6 +53,7 @@ use tokio::sync::oneshot;
 use crate::drops::Status;
 use crate::merge::Head;
 use crate::owner::{Input, ReadRequest};
+use crate::ref_mark::RefMark;
 use crate::store::Range;
 
 /// The largest read that one request takes, in bytes.
@@ -182,11 +188,12 @@ impl Cursor {
                 after,
                 head,
             } => frames_reply(&frames, after, head),
-            Range::Unavailable { floor } => with_head(
-                reply(StatusCode::GONE, Bytes::from_static(b"below the floor\n")),
-                "floor",
-                floor,
-            ),
+            Range::Unavailable { floor, mark } => {
+                HeaderPair::mark(mark).put(HeaderPair::head("floor", floor).put(reply(
+                    StatusCode::GONE,
+                    Bytes::from_static(b"below the floor\n"),
+                )))
+            }
         }
     }
 }
@@ -308,11 +315,8 @@ fn frames_reply(frames: &[Vec<u8>], after: Head, head: Head) -> Response<Full<By
         Some(body)
     });
     match body {
-        Some(body) => with_head(
-            with_head(reply(StatusCode::OK, Bytes::from(body)), "next", head),
-            "after",
-            after,
-        ),
+        Some(body) => HeaderPair::head("after", after)
+            .put(HeaderPair::head("next", head).put(reply(StatusCode::OK, Bytes::from(body)))),
         None => reply(
             StatusCode::INTERNAL_SERVER_ERROR,
             Bytes::from_static(b"a frame above 4 GiB\n"),
@@ -320,23 +324,51 @@ fn frames_reply(frames: &[Vec<u8>], after: Head, head: Head) -> Response<Full<By
     }
 }
 
-/// Put `head` in the headers `x-egress-<name>-index` and `-block`.
-fn with_head(mut response: Response<Full<Bytes>>, name: &str, head: Head) -> Response<Full<Bytes>> {
-    [
-        (format!("x-egress-{name}-index"), head.next_index),
-        (format!("x-egress-{name}-block"), head.next_block),
-    ]
-    .into_iter()
-    .filter_map(|(key, value)| {
-        Some((
-            hyper::header::HeaderName::try_from(key).ok()?,
-            hyper::header::HeaderValue::from(value),
-        ))
-    })
-    .for_each(|(key, value)| {
-        response.headers_mut().insert(key, value);
-    });
-    response
+/// The headers `x-egress-<name>-index` and `x-egress-<name>-block` of one
+/// answer.
+struct HeaderPair<'a> {
+    name: &'a str,
+    index: u64,
+    block: u64,
+}
+
+impl<'a> HeaderPair<'a> {
+    /// The headers of `head` under `name`.
+    fn head(name: &'a str, head: Head) -> Self {
+        Self {
+            name,
+            index: head.next_index,
+            block: head.next_block,
+        }
+    }
+
+    /// The headers of the reference mark of the store.
+    fn mark(mark: RefMark) -> Self {
+        Self {
+            name: "ref-mark",
+            index: mark.index,
+            block: mark.block,
+        }
+    }
+
+    /// Add the two headers to `response`.
+    fn put(self, mut response: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
+        [
+            (format!("x-egress-{}-index", self.name), self.index),
+            (format!("x-egress-{}-block", self.name), self.block),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| {
+            Some((
+                hyper::header::HeaderName::try_from(key).ok()?,
+                hyper::header::HeaderValue::from(value),
+            ))
+        })
+        .for_each(|(key, value)| {
+            response.headers_mut().insert(key, value);
+        });
+        response
+    }
 }
 
 fn reply(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {

@@ -1,16 +1,13 @@
 use std::time::Duration;
 
-use kardamom_cluster_adapter::wire::{encode_egress_boundary, encode_egress_record};
+use kardamom_cluster_adapter::wire::encode_egress_boundary;
 use tokio::sync::oneshot;
 
 use super::CatchUp;
 use crate::merge::Head;
 use crate::owner::{Input, Join, JoinState};
-use crate::test_support::TestEgress;
-
-fn record(index: u64) -> Vec<u8> {
-    encode_egress_record(index, &[u8::try_from(index).unwrap(); 40]).unwrap()
-}
+use crate::ref_mark::RefMark;
+use crate::test_support::{TestEgress, record};
 
 /// The canonical stream of the tests: two blocks of two records.
 fn stream() -> Vec<Vec<u8>> {
@@ -100,4 +97,13 @@ async fn with_no_answer_the_task_gives_up_and_a_boundary_starts_the_stream() {
 fn no_peer_makes_no_task() {
     let (inputs, _rx) = crossbeam_channel::bounded(1);
     assert!(CatchUp::new(Vec::new(), inputs, Duration::from_secs(1)).is_none());
+}
+
+#[test]
+fn the_mark_of_a_peer_reads_from_its_headers_and_defaults_to_none() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    assert_eq!(CatchUp::mark(&headers), RefMark::default(), "an older peer");
+    headers.insert("x-egress-ref-mark-index", 7.into());
+    headers.insert("x-egress-ref-mark-block", 3.into());
+    assert_eq!(CatchUp::mark(&headers), RefMark { index: 7, block: 3 });
 }

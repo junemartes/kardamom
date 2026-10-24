@@ -111,6 +111,7 @@ The `tx_drops` stream carries the transactions that the sequencers dropped: one 
 - The offer is best effort. A refused offer drops the record, and the client then sees the status `unknown` for that hash.
 - Both twins of a lane publish their drops. The egress keeps one status for each hash, and a receipt of the hash wins over a drop.
 - The egress serves the status with `kardamom_getTransactionStatus`.
+- A drop with the reason `transaction dropped by the sealer, send it again` (code -32000) is provisional. The sealer refused the reference of one twin, and the other twin can still offer the transaction with its bytes. Client text: safe to send again; the status can still become executed.
 
 The `l1_blocks` stream carries the finalized L1 blocks: one `L1Block` for each block, in block order.
 
@@ -346,6 +347,19 @@ meta of the node:
 - `tx_deposits` on a node with the `da-watcher` role.
 - `exec_txs` on a node with the `executor` role. The archive keeps the stream of the executor on that node.
 - Empty on every other node.
+
+The switches of the carry window change the placement (see [the deploy README](../deploy/cluster/README.md#the-carry-window)):
+
+| Process | With every switch off | With the switch on |
+| --- | --- | --- |
+| Shared media driver and archive (`aeron` job) | every node except the control and sealer nodes | every node except the control node (`KARDAMOM_MEMBER_FEED=on`) |
+| Executor `i` | an executor node | `sealer-<i>`, the node of member `i` (`KARDAMOM_EXEC_ON_SEALERS=on`) |
+| State mirror | the executor nodes | the sealer nodes (`KARDAMOM_EXEC_ON_SEALERS=on`) |
+| Egress | the executor nodes | the executor nodes |
+
+- The executor records its `exec_txs` stream on the archive of the shared driver of its sealer node. The recorder reaches that archive over IPC, so it needs no archive record.
+- The `archive_topics` meta follows the role set of the node. A sealer node advertises `exec_txs` only when its role set also names `executor`.
+- The member feed (streams 1006 and 1007) is an IPC stream on the shared driver of the sealer node. The member publishes into that driver through `feedAeronDir`, not through its own embedded driver. The feed has no record in the catalog: the node is the pair.
 
 An archive record with an unknown topic fails to parse, and a refetch
 client then skips the whole record. So a runtime that knows `exec_txs`

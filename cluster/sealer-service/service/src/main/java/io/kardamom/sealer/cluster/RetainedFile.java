@@ -230,6 +230,11 @@ final class RetainedFile implements RetainedFrames {
     }
 
     @Override
+    public long bytes() {
+        return Math.subtractExact(headPos, frontPos);
+    }
+
+    @Override
     public boolean carriesBytes() {
         return true;
     }
@@ -250,7 +255,7 @@ final class RetainedFile implements RetainedFrames {
         if (key.boundary()) {
             boundaries.remove(key.key());
         }
-        frontPos = next(frontPos);
+        frontPos = walkNext(frontPos);
         count = Math.subtractExact(count, 1);
     }
 
@@ -267,37 +272,34 @@ final class RetainedFile implements RetainedFrames {
      */
     @Override
     public Stream<byte[]> wanted(final long fromIndex, final long fromBlock) {
-        return Stream.iterate(scanStart(fromBlock), pos -> pos < headPos, this::next)
-            .filter(pos -> keyAt(pos).wanted(fromIndex, fromBlock))
+        return Stream.iterate(walkStart(fromBlock), pos -> pos < headPos, this::walkNext)
+            .filter(pos -> FrameKey.wanted(keyView(pos), fromIndex, fromBlock))
             .map(this::frameAt);
     }
 
-    /**
-     * The position where a replay from {@code fromBlock} starts its scan:
-     * after the retained boundary of the block before it, else the front.
-     */
-    long scanStart(final long fromBlock) {
+    /** The walk key is the file position of the record. */
+    @Override
+    public long walkStart(final long fromBlock) {
         return Optional.ofNullable(boundaries.get(fromBlock - 1))
             .map(RetainedSection.Mark::endPos)
             .orElse(frontPos);
     }
 
-    /** The position of the oldest retained frame. Every record from it to {@link #headPos()} is readable. */
-    long frontPos() {
+    /** The position of the oldest retained frame. Every record from it to {@link #walkHead()} is readable. */
+    @Override
+    public long walkFront() {
         return frontPos;
     }
 
     /** The position after the newest frame. */
-    long headPos() {
+    @Override
+    public long walkHead() {
         return headPos;
     }
 
-    /**
-     * Point {@code view} at the frame of the record at {@code pos}, without
-     * a copy. The position is at or above {@link #frontPos()} and below
-     * {@link #headPos()}. The view stays valid until the next purge.
-     */
-    void view(final long pos, final UnsafeBuffer view) {
+    /** The file keeps the bytes of a record until the next purge, so the view stays valid until then. */
+    @Override
+    public void view(final long pos, final UnsafeBuffer view) {
         final Segment segment = segmentAt(pos);
         final int offset = segment.offset(pos);
         view.wrap(segment.buffer(), offset + LENGTH_PREFIX, segment.buffer().getInt(offset));
@@ -308,13 +310,18 @@ final class RetainedFile implements RetainedFrames {
     }
 
     private FrameKey keyAt(final long pos) {
+        return FrameKey.of(keyView(pos));
+    }
+
+    /** The kind and the key of the frame of the record at {@code pos}. */
+    private UnsafeBuffer keyView(final long pos) {
         final Segment segment = segmentAt(pos);
-        return FrameKey.of(new UnsafeBuffer(segment.buffer(), segment.offset(pos) + LENGTH_PREFIX,
-            Byte.BYTES + Long.BYTES));
+        return new UnsafeBuffer(segment.buffer(), segment.offset(pos) + LENGTH_PREFIX, Byte.BYTES + Long.BYTES);
     }
 
     /** The position of the record after the record at {@code pos}. */
-    long next(final long pos) {
+    @Override
+    public long walkNext(final long pos) {
         final Segment segment = segmentAt(pos);
         return Math.addExact(pos, LENGTH_PREFIX + segment.buffer().getInt(segment.offset(pos)));
     }

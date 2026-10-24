@@ -109,6 +109,24 @@ final class AllocationGateTest {
             state, (s, i, id) -> s.onCarriedRef(0, i & 7, (long) (i >>> 3) * 128)));
     }
 
+    /** A full reference of decision version 5 with the carry window on: the same images and ticks. */
+    @Test
+    void a_full_reference_with_the_carry_window_allocates_at_most_its_baseline() {
+        CanonicalSealerState state = new CanonicalSealerState(DEDUP_CAPACITY);
+        state.onFeatureActivation(new VersionSwitch.FeatureActivation(1, VersionSwitch.FEATURE_SEALER_V4, 1L));
+        state.onOriginRecord(Workload.id(0), 1, 1, PAYLOAD, 0L);
+        state.onTick(CanonicalSealerState.TICK_INTERVAL_MS);
+        state.onFeatureActivation(new VersionSwitch.FeatureActivation(2, VersionSwitch.FEATURE_SEALER_V5, 1L));
+        state.onOriginRecord(Workload.id(1), 2, 1, PAYLOAD, 0L);
+        state.onTick(2 * CanonicalSealerState.TICK_INTERVAL_MS);
+        state.onFeatureActivation(new VersionSwitch.FeatureActivation(3, VersionSwitch.FEATURE_CARRY_WINDOW, 1L));
+        state.onOriginRecord(Workload.id(3), 3, 1, PAYLOAD, 0L);
+        state.onTick(3 * CanonicalSealerState.TICK_INTERVAL_MS);
+        assertTrue(state.carryWindowRules());
+        check("ref_v5_window", new RefClock(4).bytesPerRecord(
+            state, (s, i, id) -> s.onCarriedRef(0, i & 7, (long) (i >>> 3) * 128)));
+    }
+
     /** One reference of a reference case, at position {@code i} of the case. Returns its index or code. */
     @FunctionalInterface
     private interface RefStep {

@@ -1,0 +1,16 @@
+---
+# Plan workloads_job_definition as workloads_register_job. The plan reads
+# only. The result is workloads_plan: its Diff.Type is None when the
+# registered job does not change.
+- name: Plan {{ workloads_register_job }}
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/{{ workloads_register_job }}/plan?namespace={{ workloads_namespace | urlencode }}"
+    method: POST
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+    body_format: json
+    body:
+      Job: "{{ workloads_job_definition }}"
+      Diff: true
+  register: workloads_plan
+  check_mode: false

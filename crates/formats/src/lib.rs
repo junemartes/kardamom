@@ -101,9 +101,76 @@ impl Location {
 /// A writer version that an operator switches on with a flag.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Activation {
+struct FlagActivation {
     flag: String,
     writes: u32,
+}
+
+/// A writer version that a feature activation on the chain switches on.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeatureActivation {
+    feature: u64,
+    writes: u32,
+}
+
+/// A writer version that a switch turns on: an operator flag, or a
+/// feature activation of an upgrade transaction.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Activation {
+    Flag(FlagActivation),
+    Feature(FeatureActivation),
+}
+
+impl Activation {
+    fn writes(&self) -> u32 {
+        match self {
+            Self::Flag(flag) => flag.writes,
+            Self::Feature(feature) => feature.writes,
+        }
+    }
+
+    /// The switch, as the registry text names it.
+    fn switch(&self) -> String {
+        match self {
+            Self::Flag(flag) => format!("flag {}", flag.flag),
+            Self::Feature(feature) => format!("feature {}", feature.feature),
+        }
+    }
+
+    /// When the switch may turn on, against a base that cannot read the version.
+    fn advice(&self) -> &'static str {
+        match self {
+            Self::Flag(_) => "Switch the flag on only after no node runs the base.",
+            Self::Feature(_) => {
+                "Send the activation of the feature only after no node runs the base."
+            }
+        }
+    }
+}
+
+/// The `activation` key: one activation, or a list of them.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Activations {
+    One(Activation),
+    Many(Vec<Activation>),
+}
+
+impl Default for Activations {
+    fn default() -> Self {
+        Self::Many(Vec::new())
+    }
+}
+
+impl Activations {
+    fn iter(&self) -> std::slice::Iter<'_, Activation> {
+        match self {
+            Self::One(one) => std::slice::from_ref(one).iter(),
+            Self::Many(many) => many.iter(),
+        }
+    }
 }
 
 /// One `[format.<id>]` entry.
@@ -121,7 +188,8 @@ struct Format {
     #[serde(default)]
     permanent: bool,
     code: Vec<Location>,
-    activation: Option<Activation>,
+    #[serde(default)]
+    activation: Activations,
     /// The fingerprint of each part of a frozen layout, by part name. A
     /// test in the owning crate computes each one from the code.
     #[serde(default)]
@@ -151,14 +219,16 @@ impl Format {
         if self.code.is_empty() {
             return Err(RegistryError::NoCode(id.to_owned()));
         }
-        match &self.activation {
-            Some(activation) if !self.reads(activation.writes) => Err(RegistryError::Activation {
-                id: id.to_owned(),
-                flag: activation.flag.clone(),
-                writes: activation.writes,
-            }),
-            _ => Ok(()),
-        }
+        self.activation
+            .iter()
+            .find(|activation| !self.reads(activation.writes()))
+            .map_or(Ok(()), |activation| {
+                Err(RegistryError::Activation {
+                    id: id.to_owned(),
+                    switch: activation.switch(),
+                    writes: activation.writes(),
+                })
+            })
     }
 }
 
@@ -336,10 +406,10 @@ pub enum RegistryError {
     Order { id: String, versions: Versions },
     #[error("format {0}: the entry has no code location")]
     NoCode(String),
-    #[error("format {id}: flag {flag} writes version {writes}, outside the read range")]
+    #[error("format {id}: {switch} writes version {writes}, outside the read range")]
     Activation {
         id: String,
-        flag: String,
+        switch: String,
         writes: u32,
     },
     #[error(

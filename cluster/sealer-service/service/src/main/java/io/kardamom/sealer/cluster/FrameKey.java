@@ -25,8 +25,13 @@ record FrameKey(boolean boundary, long key) {
             frame.getLong(KEY_OFFSET, ByteOrder.LITTLE_ENDIAN));
     }
 
-    /** Whether a replay from {@code (fromIndex, fromBlock)} includes this frame. */
-    boolean wanted(final long fromIndex, final long fromBlock) {
-        return boundary ? key >= fromBlock : key >= fromIndex;
+    /**
+     * Whether a replay from {@code (fromIndex, fromBlock)} includes the frame
+     * at the start of {@code frame}. It reads the kind and the key in place,
+     * so the walk of the member feed allocates nothing.
+     */
+    static boolean wanted(final DirectBuffer frame, final long fromIndex, final long fromBlock) {
+        final long key = frame.getLong(KEY_OFFSET, ByteOrder.LITTLE_ENDIAN);
+        return frame.getByte(0) == SealerWire.EGRESS_KIND_BOUNDARY ? key >= fromBlock : key >= fromIndex;
     }
 }

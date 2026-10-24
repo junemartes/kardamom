@@ -124,14 +124,38 @@ pub trait TxOrderingRefPublisher: Send {
     fn try_publish_remote_epoch(&mut self, r: &RemoteEpochRecord) -> Result<(), SequencerError>;
 }
 
+/// The `tx_drops` channel: one record for each transaction that the
+/// sequencer drops. Best effort: a failure is logged, and the egress then
+/// has no status for the hash.
+pub trait DropPublisher: Send {
+    /// Send one drop record.
+    fn send_drop(&mut self, d: TxDrop);
+
+    /// Count the drop in `kardamom_sequencer_tx_drops_total{reason}`, and
+    /// send it.
+    fn publish_drop(&mut self, d: TxDrop) {
+        crate::metrics::record_tx_drop(d.reason);
+        self.send_drop(d);
+    }
+}
+
 /// The side channels: `tx_errors`, `tx_status` and `tx_drops`. All are
 /// best effort. The caller logs a failure and does not propagate it. The
 /// canonical state has already advanced, or the inbound transaction was
 /// rejected, so there is nothing to roll back.
-pub trait SideChannelPublisher: Send {
+pub trait SideChannelPublisher: DropPublisher {
     fn publish_error(&mut self, e: TxError);
     fn publish_status(&mut self, s: TxStatus);
-    fn publish_drop(&mut self, d: TxDrop);
+}
+
+/// The live `tx_drops` channel. A clone shares the publication, so the
+/// publish loop and the egress feed thread publish on one stream.
+impl DropPublisher for TxDropsPublisherHandle {
+    fn send_drop(&mut self, d: TxDrop) {
+        if let Err(err) = self.publish_best_effort(&d) {
+            tracing::warn!(error = %err, "tx_drops publish failed (dropped)");
+        }
+    }
 }
 
 /// The live side channels. The sequencer publishes rejections on the
@@ -181,11 +205,11 @@ impl SideChannelPublisher for SideChannels {
             tracing::warn!(error = %err, "tx_status publish failed (dropped)");
         }
     }
+}
 
-    fn publish_drop(&mut self, d: TxDrop) {
-        if let Err(err) = self.drops.publish_best_effort(&d) {
-            tracing::warn!(error = %err, "tx_drops publish failed (dropped)");
-        }
+impl DropPublisher for SideChannels {
+    fn send_drop(&mut self, d: TxDrop) {
+        self.drops.send_drop(d);
     }
 }
 
@@ -201,7 +225,8 @@ pub mod fakes {
     use kardamom_types::{EpochRecord, TxRef, TxStatus};
 
     use super::{
-        RefOffer, SequencerError, SideChannelPublisher, TxDrop, TxError, TxOrderingRefPublisher,
+        DropPublisher, RefOffer, SequencerError, SideChannelPublisher, TxDrop, TxError,
+        TxOrderingRefPublisher,
     };
 
     /// In-memory `tx_ordering` publisher. Records every published offer,
@@ -281,8 +306,10 @@ pub mod fakes {
         fn publish_status(&mut self, s: TxStatus) {
             self.statuses.lock().unwrap().push(s);
         }
+    }
 
-        fn publish_drop(&mut self, d: TxDrop) {
+    impl DropPublisher for InMemorySidePublisher {
+        fn send_drop(&mut self, d: TxDrop) {
             self.drops.lock().unwrap().push(d);
         }
     }
@@ -342,6 +369,29 @@ mod tests {
         p.publish_error(error);
         assert_eq!(p.errors.lock().unwrap().len(), 1);
         assert_eq!(p.statuses.lock().unwrap().len(), 1);
+    }
+
+    /// Each drop counts once in `kardamom_sequencer_tx_drops_total`, with
+    /// the label of its reason.
+    #[test]
+    fn publish_drop_counts_the_drop_by_reason() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let mut p = InMemorySidePublisher::default();
+        metrics::with_local_recorder(&recorder, || {
+            p.publish_drop(TxDrop {
+                tx_hash: B256::repeat_byte(0x01),
+                sender: Address::repeat_byte(0xAB),
+                nonce: 7,
+                reason: kardamom_types::DropReason::SealerRefusedReference,
+            });
+        });
+        let text = recorder.handle().render();
+        assert!(
+            text.lines().any(|line| line
+                == r#"kardamom_sequencer_tx_drops_total{reason="sealer_refused_reference"} 1"#),
+            "{text}"
+        );
+        assert_eq!(p.drops.lock().unwrap().len(), 1);
     }
 
     fn test_epoch(n: u64) -> EpochRecord {

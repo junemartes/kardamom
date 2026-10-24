@@ -1,6 +1,8 @@
 package io.kardamom.sealer;
 
 import java.nio.ByteBuffer;
+import java.util.List;
+import java.util.Optional;
 
 /**
  * The switch between decision versions 3, 4 and 5. Two members
@@ -60,6 +62,14 @@ import java.nio.ByteBuffer;
  * <p>The state holds the visible activation of each feature and the ones
  * whose epoch is not sealed yet: at most {@link #MAX_HELD} of each feature. A record that comes when the
  * state holds that many changes nothing ({@link Outcome#FULL}).</p>
+ *
+ * <p>{@link #FEATURE_CARRY_WINDOW} sets the carry window flag, not a
+ * version. The state takes its activation only while version 5 runs
+ * ({@link Outcome#EARLY}), and never on a member that keeps its retained
+ * frames in a file ({@link Outcome#UNSUPPORTED}). The flag changes at a
+ * boundary by the same rules as a version. Its rules apply only while the
+ * flag is on and version 5 runs. When version 5 stops, the flag keeps its
+ * value, so its rules come back with version 5.</p>
  */
 public final class VersionSwitch {
 
@@ -82,6 +92,14 @@ public final class VersionSwitch {
      */
     public static final long FEATURE_SEALER_V5 = 4L;
 
+    /**
+     * The feature id of the carry window in {@code KardamomChainState}.
+     * Matches Rust {@code kardamom_types::upgrades::FEATURE_CARRY_WINDOW}.
+     * Under version 5, the carry window keeps only the replay window of
+     * retained frames, and refuses a transaction reference of record type 0.
+     */
+    public static final long FEATURE_CARRY_WINDOW = 5L;
+
     /** The version of an active carry flag: version 4 that relays the bytes of a full reference. */
     public static final int CARRY_VERSION = 5;
 
@@ -93,6 +111,20 @@ public final class VersionSwitch {
 
     /** The activations of {@link #FEATURE_SEALER_V5}. */
     private final Schedule carry = new Schedule();
+
+    /** The activations of {@link #FEATURE_CARRY_WINDOW}. */
+    private final Schedule window = new Schedule();
+
+    /** The carry window flag of the open block. Its rules apply only under version 5. */
+    private boolean carryWindow;
+
+    /**
+     * Whether the member keeps its retained frames in a file. Such a
+     * member takes no activation of {@link #FEATURE_CARRY_WINDOW}: its
+     * snapshot has no place for the schedule. The setting must match on
+     * every member, so every member gives the same outcome.
+     */
+    private boolean fileStore;
 
     /** The L1 origin of the last block that a boundary sealed. An activation at or below it is visible. */
     private long sealedOrigin;
@@ -123,6 +155,32 @@ public final class VersionSwitch {
         return carry.held > 0;
     }
 
+    /** Whether the state holds an activation of the carry window: the snapshot must then carry its section. */
+    public boolean holdsWindowActivation() {
+        return window.held > 0;
+    }
+
+    /** Whether the rules of the carry window apply in the open block: the flag is on, and version 5 runs. */
+    public boolean carryWindowRules() {
+        return carryWindow && version == CARRY_VERSION;
+    }
+
+    /** Mark the state of a member that keeps its retained frames in a file. Call it before the first entry. */
+    void fileStore(final boolean file) {
+        fileStore = file;
+    }
+
+    /**
+     * The state of each feature, for the admin endpoint: version 4, the
+     * carry flag and the carry window, in feature id order.
+     */
+    public List<Feature> features() {
+        return List.of(
+            v4.feature(FEATURE_SEALER_V4, version >= ON_VERSION),
+            carry.feature(FEATURE_SEALER_V5, version == CARRY_VERSION),
+            window.feature(FEATURE_CARRY_WINDOW, carryWindow));
+    }
+
     /** The newest held activation of either feature, as a value, for the admin endpoint. */
     public View view() {
         final Schedule newest = carry.held > 0 && Long.compareUnsigned(carry.newest(), v4.newest()) > 0 ? carry : v4;
@@ -135,14 +193,16 @@ public final class VersionSwitch {
      * Take a feature activation record, with {@code stateOrigin} the L1
      * origin of the state and {@code openBlockMs} the time that the open
      * block executes with. The record only stores the schedule. The state
-     * takes a record of the carry flag only while version 4 or 5 runs.
+     * takes a record of the carry flag only while version 4 or 5 runs, and
+     * a record of the carry window only while version 5 runs and only on a
+     * member without the retained file.
      */
     Outcome onActivation(final FeatureActivation activation, final long stateOrigin, final long openBlockMs) {
-        final long featureId = activation.featureId();
-        if (featureId != FEATURE_SEALER_V4 && featureId != FEATURE_SEALER_V5) {
+        final Optional<Schedule> known = scheduleOf(activation.featureId());
+        if (known.isEmpty()) {
             return Outcome.IGNORED;
         }
-        final Schedule schedule = featureId == FEATURE_SEALER_V4 ? v4 : carry;
+        final Schedule schedule = known.get();
         final long origin = activation.l1Origin();
         if (Long.compareUnsigned(origin, schedule.newest()) <= 0) {
             return Outcome.IGNORED;
@@ -153,7 +213,10 @@ public final class VersionSwitch {
         if (stateOrigin != 0L && origin != stateOrigin && origin != stateOrigin + 1) {
             return Outcome.IGNORED;
         }
-        if (schedule == carry && version < ON_VERSION) {
+        if (schedule == window && fileStore) {
+            return Outcome.UNSUPPORTED;
+        }
+        if (schedule == carry && version < ON_VERSION || schedule == window && version != CARRY_VERSION) {
             return Outcome.EARLY;
         }
         if (schedule.held == MAX_HELD) {
@@ -163,6 +226,17 @@ public final class VersionSwitch {
         final long time = activation.activationMs();
         schedule.hold(origin, late && time == 0L ? openBlockMs : time);
         return late ? Outcome.STORED_LATE : Outcome.STORED;
+    }
+
+    /** The schedule of {@code featureId}, or empty for a feature that the switch does not follow. */
+    private Optional<Schedule> scheduleOf(final long featureId) {
+        if (featureId == FEATURE_SEALER_V4) {
+            return Optional.of(v4);
+        }
+        if (featureId == FEATURE_SEALER_V5) {
+            return Optional.of(carry);
+        }
+        return featureId == FEATURE_CARRY_WINDOW ? Optional.of(window) : Optional.empty();
     }
 
     /**
@@ -186,14 +260,17 @@ public final class VersionSwitch {
      * origin {@code l1Origin}. {@code l2Timestamp} is the time that the next
      * block executes with, and {@code sealedBlockMs} the time that the
      * sealed block executed with. The newest visible activation of each
-     * feature decides, and the older ones go.
+     * feature decides, and the older ones go. The carry window flag
+     * follows its own schedule at every boundary, whatever the version.
      *
      * @return whether the version switched at this boundary
      */
     boolean atBoundary(final long l1Origin, final long sealedBlockMs, final long l2Timestamp) {
         final int due = versionAtBoundary(l1Origin, sealedBlockMs, l2Timestamp);
+        carryWindow = window.onAt(l1Origin, sealedBlockMs, l2Timestamp, carryWindow);
         v4.settle(l1Origin, sealedBlockMs);
         carry.settle(l1Origin, sealedBlockMs);
+        window.settle(l1Origin, sealedBlockMs);
         sealedOrigin = l1Origin;
         final boolean switched = due != version;
         version = due;
@@ -208,6 +285,11 @@ public final class VersionSwitch {
     /** The length of the snapshot section that {@link #writeCarryTo} writes. */
     int carrySnapshotLen() {
         return carry.snapshotLen();
+    }
+
+    /** The length of the snapshot section that {@link #writeWindowTo} writes. */
+    int windowSnapshotLen() {
+        return Byte.BYTES + window.snapshotLen();
     }
 
     /**
@@ -229,6 +311,16 @@ public final class VersionSwitch {
         carry.writeTo(buf);
     }
 
+    /**
+     * Write {@code [carry_window:u8][held:u8]}, then
+     * {@code [origin:u64][time_ms:u64]} for each held activation of
+     * {@link #FEATURE_CARRY_WINDOW}, oldest first.
+     */
+    void writeWindowTo(final ByteBuffer buf) {
+        buf.put(carryWindow ? (byte) 1 : (byte) 0);
+        window.writeTo(buf);
+    }
+
     /** Read the section that {@link #writeTo} wrote. */
     static VersionSwitch readFrom(final ByteBuffer buf) {
         final VersionSwitch rules = new VersionSwitch(versionOf(buf.get()));
@@ -240,6 +332,19 @@ public final class VersionSwitch {
     /** Read the section that {@link #writeCarryTo} wrote. */
     void readCarryFrom(final ByteBuffer buf) {
         carry.readFrom(buf);
+    }
+
+    /** Read the section that {@link #writeWindowTo} wrote. */
+    void readWindowFrom(final ByteBuffer buf) {
+        carryWindow = flagOf(buf.get());
+        window.readFrom(buf);
+    }
+
+    private static boolean flagOf(final byte flag) {
+        if (flag != 0 && flag != 1) {
+            throw new IllegalArgumentException("bad snapshot carry window flag: " + flag);
+        }
+        return flag == 1;
     }
 
     private static int versionOf(final byte version) {
@@ -316,6 +421,14 @@ public final class VersionSwitch {
             held -= count;
         }
 
+        /** The state of this feature, which is on when {@code on}, with its newest held activation. */
+        Feature feature(final long id, final boolean on) {
+            if (held == 0) {
+                return new Feature(id, Feature.NONE, 0L, 0L);
+            }
+            return new Feature(id, on ? Feature.ON : Feature.HELD_OFF, origins[held - 1], times[held - 1]);
+        }
+
         void hold(final long origin, final long time) {
             origins[held] = origin;
             times[held] = time;
@@ -356,8 +469,13 @@ public final class VersionSwitch {
         MISSED,
         /** The state holds {@link #MAX_HELD} activations: the record changed nothing. */
         FULL,
-        /** The record schedules the carry flag while version 4 is off: the record changed nothing. */
-        EARLY
+        /**
+         * The record schedules the carry flag while version 4 is off, or the
+         * carry window while version 5 is off: the record changed nothing.
+         */
+        EARLY,
+        /** The record schedules the carry window on a member with the retained file: the record changed nothing. */
+        UNSUPPORTED
     }
 
     /** A feature activation record: the upgrade transaction of the epoch at {@code l1Origin} schedules {@code featureId}. */
@@ -366,5 +484,19 @@ public final class VersionSwitch {
 
     /** The version, and the origin and the time of the newest held activation, both 0 when none. */
     public record View(int version, long activationOrigin, long activationMs) {
+    }
+
+    /**
+     * The state of feature {@code id}: {@link #NONE}, {@link #HELD_OFF} or
+     * {@link #ON}, and the origin and the time of its newest held
+     * activation, both 0 when none.
+     */
+    public record Feature(long id, int state, long activationOrigin, long activationMs) {
+        /** The state holds no activation of the feature. */
+        public static final int NONE = 0;
+        /** The state holds an activation, and the feature is off. */
+        public static final int HELD_OFF = 1;
+        /** The feature is on. */
+        public static final int ON = 2;
     }
 }

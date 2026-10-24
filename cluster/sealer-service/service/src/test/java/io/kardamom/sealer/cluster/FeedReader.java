@@ -4,6 +4,7 @@ import io.aeron.Aeron;
 import io.aeron.ExclusivePublication;
 import io.aeron.FragmentAssembler;
 import io.aeron.Subscription;
+import io.aeron.logbuffer.FragmentHandler;
 import io.aeron.logbuffer.Header;
 import io.aeron.test.Tests;
 import java.nio.ByteOrder;
@@ -49,6 +50,7 @@ final class FeedReader implements AutoCloseable {
     private final Subscription feed;
     private final ExclusivePublication control;
     private final FragmentAssembler assembler = new FragmentAssembler(this::onFragment);
+    private final FragmentHandler dropper = (buffer, offset, length, header) -> { };
     private final List<Frame> frames = new ArrayList<>();
 
     FeedReader(final String aeronDir) {
@@ -71,10 +73,21 @@ final class FeedReader implements AutoCloseable {
 
     /** Poll until {@code done} holds for the frames so far. */
     void pollUntil(final Predicate<List<Frame>> done) {
+        pollUntil(done, () -> { });
+    }
+
+    /** Run {@code step} and poll, until {@code done} holds for the frames so far. */
+    void pollUntil(final Predicate<List<Frame>> done, final Runnable step) {
         while (!done.test(frames)) {
+            step.run();
             feed.poll(assembler, 64);
             Tests.yield();
         }
+    }
+
+    /** Poll once, and drop the frames: a reader that only keeps the feed moving. */
+    void drain() {
+        feed.poll(dropper, 64);
     }
 
     /** The frames so far. */

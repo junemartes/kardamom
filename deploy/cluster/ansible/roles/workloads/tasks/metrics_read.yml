@@ -1,0 +1,76 @@
+---
+# Read the gauges workloads_metrics_gauges of every running allocation of
+# the job workloads_metrics_job, from /metrics on the port
+# workloads_metrics_port. The controller reaches each allocation by the
+# node address that the Nomad API advertises, as sealer_status.yml does.
+# Every exporter adds its own labels to each sample: a Rust service
+# service and host_id, a sealer member service and member_id. So a bare
+# gauge name matches a sample with any labels. A gauge name with labels,
+# such as kardamom_sealer_feature_state{feature="5"}, matches the first
+# sample that carries each of those labels.
+# The result is workloads_metrics_of[<job>]:
+# - groups: the task group of each running allocation;
+# - one list for each gauge, in the order of groups. The value is -1 when
+#   the allocation does not answer or does not report the gauge.
+# A job that Nomad does not know has no allocation. The tasks read only,
+# so they also run in check mode.
+- name: Read the allocations of {{ workloads_metrics_job }}
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/{{ workloads_metrics_job }}/allocations?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+    status_code: [200, 404]
+  register: workloads_metrics_allocations
+  check_mode: false
+
+- name: Read the node of every running {{ workloads_metrics_job }}
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/node/{{ item.NodeID }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  loop: >-
+    {{ (workloads_metrics_allocations.json if workloads_metrics_allocations.status == 200 else [])
+       | selectattr('ClientStatus', 'equalto', 'running')
+       | selectattr('DesiredStatus', 'equalto', 'run') | list }}
+  loop_control:
+    label: "{{ item.TaskGroup }}"
+  register: workloads_metrics_nodes
+  check_mode: false
+
+# A page that does not answer stays in the result with no content.
+- name: Read the metrics of every running {{ workloads_metrics_job }}
+  ansible.builtin.uri:
+    url: "http://{{ item.json.HTTPAddr | regex_replace(':[0-9]+$', '') }}:{{ workloads_metrics_port }}/metrics"
+    return_content: true
+    timeout: 10
+  loop: "{{ workloads_metrics_nodes.results }}"
+  loop_control:
+    label: "{{ item.item.TaskGroup }}"
+  register: workloads_metrics_pages
+  failed_when: false
+  check_mode: false
+
+- name: Keep the allocations of {{ workloads_metrics_job }}
+  ansible.builtin.set_fact:
+    workloads_metrics_of: >-
+      {{ workloads_metrics_of | default({}) | combine({workloads_metrics_job:
+           {'groups': workloads_metrics_pages.results | map(attribute='item.item.TaskGroup') | list}}) }}
+
+- name: Keep each gauge of {{ workloads_metrics_job }}
+  ansible.builtin.set_fact:
+    workloads_metrics_of: >-
+      {{ workloads_metrics_of | combine({workloads_metrics_job: {item: workloads_metrics_pages.results
+           | map(attribute='content', default='') | map('default', '', true)
+           | map('regex_search', workloads_metrics_pattern)
+           | map('default', 'none -1', true) | map('split', ' ') | map('last') | map('float') | list}}, recursive=true) }}
+  loop: "{{ workloads_metrics_gauges }}"
+  vars:
+    workloads_metrics_labels: >-
+      {{ item | regex_replace('^[^{]*', '') | regex_replace('^[{]|[}]$', '') | split(',') | reject('equalto', '') | list }}
+    # Each given label is a lookahead over the braces: it stands after the
+    # brace or a comma, and before a comma or the closing brace.
+    workloads_metrics_pattern: >-
+      {{ '(?m)^' ~ (item | regex_replace('[{].*$', '') | regex_escape)
+         ~ (workloads_metrics_labels | map('regex_escape') | map('regex_replace', '^', '(?=[{](?:[^}]*,)?')
+            | map('regex_replace', '$', '[,}])') | join)
+         ~ '([{][^}]*[}])? [-+0-9.eE]+$' }}

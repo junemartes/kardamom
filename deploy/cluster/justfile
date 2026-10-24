@@ -60,7 +60,10 @@ rollback env:
 # service runs a release that takes the upgrade transaction of `feature`
 # (its feature id) at `activation_ms`. Run it before the Safe signs the
 # upgrade transaction. It allows FEATURE_SEALER_V3 (feature id 2) only
-# with the activation time 0. It records nothing.
+# with the activation time 0. For FEATURE_CARRY_WINDOW (feature id 5) it
+# also reads the reference mark of the egress and the cursors of its
+# readers. It refuses feature 3 or 4 off while a member holds feature 5.
+# It records nothing.
 # cluster/sealer-service/README.md ("Decision version") is the procedure.
 sealer-upgrade-check env feature activation_ms="":
     KARDAMOM_ENV="{{ env }}" KARDAMOM_UPGRADE_FEATURE="{{ feature }}" KARDAMOM_UPGRADE_ACTIVATION_MS="{{ activation_ms }}" ansible-playbook -i localhost, ansible/upgrade-check.yml
