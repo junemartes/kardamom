@@ -525,7 +525,7 @@ Each executor publishes the transactions that it joins on the executor stream (`
 
 ### Carry mode: the executor next to its member
 
-In carry mode (`KARDAMOM_CARRY_BYTES=on`, see [the deploy README](../deploy/cluster/README.md#carry-mode)), executor `i` runs on `sealer-<i>`, the node of member `i`. It reads the canonical entries with their bytes from the member feed, an IPC stream on the shared media driver of that node.
+With `KARDAMOM_EXEC_ON_SEALERS=on` (see [the deploy README](../deploy/cluster/README.md#the-carry-window)), executor `i` runs on `sealer-<i>`, the node of member `i`. With `KARDAMOM_CARRY_EXECUTORS` naming `i`, it reads the canonical entries with their bytes from the member feed, an IPC stream on the shared media driver of that node (`KARDAMOM_MEMBER_FEED=on`).
 
 - **Whole sealer node loss**
   - Trigger: `sealer-<i>` dies.
@@ -534,13 +534,13 @@ In carry mode (`KARDAMOM_CARRY_BYTES=on`, see [the deploy README](../deploy/clus
   - Recovery: the node returns. The member rejoins from its log or seeds from a peer. The executor resumes from its state directory, and asks its member for the entries from its cursor.
 - **Shared media driver loss on a sealer node**
   - Effect: executor `i` loses its transport and stops. Member `i` keeps its quorum role: its Raft log runs on its own embedded driver. Its feeder logs `sealer FEED NO-DRIVER` and opens a new client every 1 s.
-  - Recovery: the system task restarts the driver. The executor restarts and asks for the entries from its cursor. The member answers from its retained file.
+  - Recovery: the system task restarts the driver. The executor restarts and asks for the entries from its cursor. The member answers from its retained frames.
 - **Executor crash or restart**
   - Recovery: the executor asks its member for the entries from its durable cursor. A cursor below the replay window of the member reads the range read of the egress (`--egress`, when the egress runs). A cursor below the floor of the egress too restores a peer checkpoint from another sealer node.
 - **Member crash or restart**
   - Effect: executor `i` gets no entry while its member is down, and its block gauge stops. The other executors carry the chain.
   - Recovery: the member starts again, and the executor asks again from its cursor.
-- **Deploy of the executor job**: the three executor groups roll at the same time, because Nomad orders no groups. The nonce queries of the sequencers and the ingresses fail until one executor is ready again.
+- **Deploy of the executor job**: Nomad orders no groups, so the role rolls the three executor groups one at a time, and waits for the health check of each group. In a roll of the pinned groups, the other two executors serve the nonce queries during each step. The move from the executor nodes also goes one executor at a time, but the readers already ask the sealer nodes: until the second executor moved, one executor serves the nonce queries.
 - **Wipe of a member**: keep `/opt/kardamom/archive/dir`. It is the archive of the shared driver, with the `exec_txs` recording of the executor, inside the archive directory of the member.
 - Proof: no chaos shard runs carry mode yet.
 

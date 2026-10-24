@@ -475,7 +475,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
   - A rolling change may only raise `retention`, and it stays at or below the cap.
     - During a roll, two members can keep two windows. That changes no decision and no byte of the state section. It changes only the frames that each member can replay, and the size of the heap section of its snapshot.
     - So the snapshot sizes of the members differ during a roll of `retention`. No protocol compares snapshot bytes across members. Members with the same value write the same bytes.
-- `carryBytes`: the deploy passes it, with `feedAeronDir` and `feedRingBytes`, only in carry mode (`KARDAMOM_CARRY_BYTES=on`). Then the job also passes `KARDAMOM_RETAINED_TOKEN` from the Nomad variable of the member group. Without carry mode the retained frames stay on the heap. See [Carry mode](../../deploy/cluster/README.md#carry-mode).
+- `carryBytes`: the deploy does not pass it, so the retained frames stay on the heap. The member feed walks the heap frames. `KARDAMOM_MEMBER_FEED=on` passes `feedAeronDir` and `feedRingBytes`. See [The carry window](../../deploy/cluster/README.md#the-carry-window).
   - Switch it only with a new chain or a coordinated cut-over, never on a live chain. A member with the file stops on a snapshot that is not version 12 or 17, and a member without the file stops on version 12 or 17. Both print `sealer RETAINED-FILE FATAL`.
   - `snapshotIntervalS=0` with `carryBytes` stops the start: the purge of the file runs at each snapshot, so the file would never shrink.
 - `daLagBudgetBlocks`: the start-up line `cluster da-lag budget` shows the value. See [DA-lag guard](#da-lag-guard).
@@ -530,7 +530,7 @@ With `carryBytes=true`, the member keeps its retained frames in an append-only f
 
 ### Member feed
 
-With `feedAeronDir`, each member sends its retained frames to its paired executor over IPC, on the media driver of the executor node. The deploy runs the executor on the node of its member, and points `feedAeronDir` at the shared media driver of that node. The leader and the followers send the same frames. The wire layout, the answer rules and the states are in section 7.8 of `docs/specs/2026-10-10-raft-carried-transactions.md`.
+With `feedAeronDir`, each member sends its retained frames to its paired executor over IPC, on the media driver of the executor node. With `KARDAMOM_MEMBER_FEED=on`, the deploy points `feedAeronDir` at the shared media driver of the sealer node. With `KARDAMOM_EXEC_ON_SEALERS=on`, it runs the executor of the member on that node. The leader and the followers send the same frames. The wire layout, the answer rules and the states are in section 7.8 of `docs/specs/2026-10-10-raft-carried-transactions.md`.
 
 The feed runs on a heap member and on a member with `carryBytes`. It is local to the member: it writes nothing that the replicated state or a cluster session reads. So it is not a must-match setting, and a rolling deploy can turn it on member by member.
 
@@ -560,7 +560,7 @@ A member stops with `sealer RETAINED-FILE FATAL` when its file does not match it
 
 1. Make sure that a quorum of the other members runs, and that they took a snapshot after the failure.
 2. Stop the member: `nomad alloc stop <alloc>`, or stop its job.
-3. Wipe its state on the host: the cluster directory (with `retained/` in it) and the archive directory. Keep the directories themselves. Keep `/opt/kardamom/archive/dir` too: in carry mode it is the archive of the shared media driver of the node.
+3. Wipe its state on the host: the cluster directory (with `retained/` in it) and the archive directory. Keep the directories themselves. Keep `/opt/kardamom/archive/dir` too: with the member feed it is the archive of the shared media driver of the node.
 4. Start the member. It finds no recording log, so it seeds from a peer and copies the retained file (`cluster START mode=SEED_FROM_PEER`).
 5. Check the log for `cluster SEED retained-copy` with no `FAILED`, then `sealer snapshot RESTORED`.
 

@@ -348,13 +348,13 @@ meta of the node:
 - `exec_txs` on a node with the `executor` role. The archive keeps the stream of the executor on that node.
 - Empty on every other node.
 
-In carry mode (`KARDAMOM_CARRY_BYTES=on`) the placement changes:
+The switches of the carry window change the placement (see [the deploy README](../deploy/cluster/README.md#the-carry-window)):
 
-| Process | Without carry mode | In carry mode |
+| Process | With every switch off | With the switch on |
 | --- | --- | --- |
-| Shared media driver and archive (`aeron` job) | every node except the control and sealer nodes | every node except the control node |
-| Executor `i` | an executor node | `sealer-<i>`, the node of member `i` |
-| State mirror | the executor nodes | the sealer nodes |
+| Shared media driver and archive (`aeron` job) | every node except the control and sealer nodes | every node except the control node (`KARDAMOM_MEMBER_FEED=on`) |
+| Executor `i` | an executor node | `sealer-<i>`, the node of member `i` (`KARDAMOM_EXEC_ON_SEALERS=on`) |
+| State mirror | the executor nodes | the sealer nodes (`KARDAMOM_EXEC_ON_SEALERS=on`) |
 | Egress | the executor nodes | the executor nodes |
 
 - The executor records its `exec_txs` stream on the archive of the shared driver of its sealer node. The recorder reaches that archive over IPC, so it needs no archive record.
