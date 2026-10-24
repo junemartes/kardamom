@@ -17,7 +17,7 @@ use crate::ring::Call;
 use crate::rpc::{Receipt, Rpc};
 use crate::wait::Poll;
 
-const NAME: &str = "fees";
+pub(crate) const NAME: &str = "fees";
 /// The tip rate the probe bids, in wei per gas.
 const TIP: u128 = 1;
 /// A gas limit above the 21,000 a transfer uses, so the tip on unused gas

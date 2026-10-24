@@ -61,6 +61,8 @@ enum Job {
 }
 
 impl Job {
+    const ALL: [Self; 3] = [Self::Rwa, Self::Swap, Self::Liquidity];
+
     fn name(self) -> &'static str {
         match self {
             Self::Rwa => "rwa",
@@ -129,6 +131,11 @@ impl MarketTask {
             eth_in_next: true,
             turn: 0,
         })
+    }
+
+    /// The names of the task's probes.
+    pub(crate) fn probes() -> impl Iterator<Item = &'static str> + Clone {
+        Job::ALL.into_iter().map(Job::name)
     }
 
     /// Run the probes on their timers, for ever.
