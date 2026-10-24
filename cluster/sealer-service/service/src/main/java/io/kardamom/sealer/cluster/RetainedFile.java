@@ -229,6 +229,16 @@ final class RetainedFile implements RetainedFrames {
         return count;
     }
 
+    /**
+     * The bytes of the retained frames. The records from the front to the
+     * head lie end to end, so the positions between them less one length
+     * prefix per record are the frame bytes, as on the heap.
+     */
+    @Override
+    public long bytes() {
+        return Math.subtractExact(Math.subtractExact(headPos, frontPos), Math.multiplyExact(count, LENGTH_PREFIX));
+    }
+
     @Override
     public boolean carriesBytes() {
         return true;

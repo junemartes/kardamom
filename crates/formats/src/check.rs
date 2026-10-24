@@ -310,14 +310,17 @@ impl<'a> Comparison<'a> {
     }
 
     fn activation_notes(&self) -> impl Iterator<Item = String> + '_ {
-        self.pairs().filter_map(|(id, head, base)| {
+        self.pairs().flat_map(|(id, head, base)| {
             head.activation
-                .as_ref()
-                .filter(|activation| !base.reads(activation.writes))
-                .map(|activation| {
+                .iter()
+                .filter(move |activation| !base.reads(activation.writes()))
+                .map(move |activation| {
                     format!(
-                        "{id}: flag {} writes version {}, and the base reads only up to version {}. Switch the flag on only after no node runs the base.",
-                        activation.flag, activation.writes, base.read_boundary(activation.writes)
+                        "{id}: {} writes version {}, and the base reads only up to version {}. {}",
+                        activation.switch(),
+                        activation.writes(),
+                        base.read_boundary(activation.writes()),
+                        activation.advice()
                     )
                 })
         })

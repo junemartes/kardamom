@@ -132,6 +132,7 @@ class RetainedFileTest {
         assertTrue(segmentFiles().size() > 2, "the frames span several segments: " + segmentFiles());
 
         assertEquals(heap.count(), file.count());
+        assertEquals(heap.bytes(), file.bytes(), "both stores count the frame bytes");
         assertSameFrames(replay(heap, 0, 1), replay(file, 0, 1));
         assertSameFrames(replay(heap, 18, 5), replay(file, 18, 5));
         IntStream.rangeClosed(0, BLOCKS + 1).forEach(block ->
@@ -144,6 +145,7 @@ class RetainedFileTest {
             file.evictFront();
         });
         assertEquals(heap.count(), file.count());
+        assertEquals(heap.bytes(), file.bytes());
         assertSameFrames(replay(heap, 10, 3), replay(file, 10, 3));
         assertEquals(-1L, file.boundaryEnd(2), "an evicted boundary leaves the index");
     }
