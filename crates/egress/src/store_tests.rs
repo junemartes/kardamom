@@ -212,7 +212,43 @@ fn a_restart_reads_the_mark_of_a_reference_in_an_older_segment() {
     drop(store);
     let again = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
     assert_eq!(again.head().next_block, 7);
-    assert_eq!(again.mark(), REFERENCE);
+    assert_eq!(
+        again.mark(),
+        REFERENCE.ahead(),
+        "the file holds R plus the lead"
+    );
+}
+
+/// The side file changes only when the mark passes it: a run of
+/// references inside the lead writes it once.
+#[test]
+fn a_mark_inside_the_lead_does_not_write_the_side_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path(), NonZeroU64::new(1000).unwrap(), GENESIS).unwrap();
+    let file = || RefMark::read(dir.path()).unwrap();
+    store.append(&with_a_reference()).unwrap();
+    assert_eq!(file(), REFERENCE.ahead());
+    // Block b holds the reference at index b, from block 6 on.
+    let refs = |blocks: std::ops::RangeInclusive<u64>| {
+        blocks
+            .flat_map(|b| [ref_record(b), boundary(b, b + 1)])
+            .collect::<Vec<_>>()
+    };
+    let lead_end = REFERENCE.ahead().block;
+    store.append(&refs(6..=lead_end)).unwrap();
+    let inside = RefMark {
+        index: lead_end,
+        block: lead_end,
+    };
+    assert_eq!(store.mark(), inside, "R in memory is exact");
+    assert_eq!(file(), REFERENCE.ahead(), "R stays inside the lead");
+    store.append(&refs(lead_end + 1..=lead_end + 1)).unwrap();
+    let past = RefMark {
+        index: lead_end + 1,
+        block: lead_end + 1,
+    };
+    assert_eq!(store.mark(), past);
+    assert_eq!(file(), past.ahead(), "R passed the file, so the file moves");
 }
 
 /// A reset keeps the mark, a higher mark of the peer raises it, and a
@@ -239,7 +275,7 @@ fn a_reset_keeps_or_raises_the_mark() {
     assert_eq!(store.mark(), higher, "a lower mark of the peer keeps R");
     drop(store);
     let again = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
-    assert_eq!(again.mark(), higher, "the raised mark is on disk");
+    assert!(higher.within(again.mark()), "the raised mark is on disk");
 }
 
 /// A crash after the mark and before the sync of the segment can lose the
@@ -265,7 +301,7 @@ fn a_crash_before_the_segment_sync_leaves_the_mark_at_or_above_the_frames() {
     assert_eq!(again.head(), GENESIS, "the frames of the batch are lost");
     assert_eq!(
         again.mark(),
-        REFERENCE,
+        REFERENCE.ahead(),
         "the mark is above the surviving frames"
     );
 }

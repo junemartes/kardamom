@@ -15,8 +15,8 @@
 //! from a cursor reads the frames after it from the segment that holds the
 //! cursor.
 //!
-//! The side file `ref-mark` holds the highest stored transaction reference
-//! (see [`crate::ref_mark`]). The head comes from the last segment only, so
+//! The side file `ref-mark` holds a mark at or above the highest stored
+//! transaction reference (see [`crate::ref_mark`]). The head comes from the last segment only, so
 //! the mark needs its own file: a reference in an older segment counts too.
 
 use std::fs::{self, File, OpenOptions};
@@ -74,8 +74,10 @@ pub struct Store {
     /// The boundaries in the open segment.
     blocks_in_segment: u64,
     head: Head,
-    /// The highest stored transaction reference, as the side file holds it.
+    /// The highest stored transaction reference.
     mark: RefMark,
+    /// The mark that the side file holds: at or above `mark`.
+    written: RefMark,
 }
 
 impl Store {
@@ -111,6 +113,7 @@ impl Store {
             blocks_in_segment: blocks,
             head,
             mark,
+            written: mark,
         })
     }
 
@@ -235,12 +238,17 @@ impl Store {
             .try_for_each(|s| fs::remove_file(&s.path).map_err(io(&s.path)))
     }
 
-    /// Write `mark` to the side file when it is above the mark.
+    /// Raise the mark to `mark` when it is above the mark. Write the side
+    /// file first when `mark` passes it.
     fn raise_mark(&mut self, mark: RefMark) -> Result<(), StoreError> {
         if mark <= self.mark {
             return Ok(());
         }
-        mark.write(&self.dir)?;
+        if !mark.within(self.written) {
+            let ahead = mark.ahead();
+            ahead.write(&self.dir)?;
+            self.written = ahead;
+        }
         self.mark = mark;
         mark.show();
         Ok(())
