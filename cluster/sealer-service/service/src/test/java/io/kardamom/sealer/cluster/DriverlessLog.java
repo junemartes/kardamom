@@ -20,8 +20,10 @@ import org.agrona.ExpandableArrayBuffer;
  */
 final class DriverlessLog {
 
-    /** The dedup window of every member. */
+    /** The dedup window of every member but a member with a feed. */
     static final int CAPACITY = 16;
+    /** The dedup window of a member with a feed: its tests fill the replay window with records. */
+    private static final int FEED_CAPACITY = 1 << 14;
     /** The segment size of the retained file of a member that carries the bytes. */
     private static final int SEGMENT_BYTES = 64 * 1024;
 
@@ -95,7 +97,13 @@ final class DriverlessLog {
     }
 
     private Member member(final Optional<byte[]> snapshot, final int orderingWindow, final LagBudgets budgets) {
-        return member(snapshot, orderingWindow, budgets, Optional.empty());
+        return member(CAPACITY, snapshot, orderingWindow, budgets, Optional.empty(), Optional.empty());
+    }
+
+    /** A heap member with no ordering window and the member feed of {@code feed}, from {@code snapshot} or at genesis. */
+    Member feeding(final Optional<byte[]> snapshot, final FeedConfig feed) {
+        return member(FEED_CAPACITY, snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW, LagBudgets.DEFAULT,
+            Optional.empty(), Optional.of(feed));
     }
 
     /**
@@ -104,29 +112,37 @@ final class DriverlessLog {
      * {@code snapshot} or at genesis.
      */
     Member carrying(final Optional<byte[]> snapshot, final Path dir, final LagBudgets budgets) {
-        return member(snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW, budgets,
-            Optional.of(new RetainedFile.Config(dir, SEGMENT_BYTES)));
+        return member(CAPACITY, snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW, budgets,
+            Optional.of(new RetainedFile.Config(dir, SEGMENT_BYTES)), Optional.empty());
     }
 
     /** End {@code member}, then start a carrying member in its file in {@code dir} from {@code snapshot}. */
     Member restart(final Member member, final Path dir, final byte[] snapshot) {
-        started.remove(member);
-        member.svc().onTerminate(member.cluster());
+        end(member);
         return carrying(Optional.of(snapshot), dir, LagBudgets.DEFAULT);
     }
 
+    /** End {@code member}: its feed and its store close. */
+    void end(final Member member) {
+        started.remove(member);
+        member.svc().onTerminate(member.cluster());
+    }
+
     private Member member(
+            final int capacity,
             final Optional<byte[]> snapshot,
             final int orderingWindow,
             final LagBudgets budgets,
-            final Optional<RetainedFile.Config> file) {
+            final Optional<RetainedFile.Config> file,
+            final Optional<FeedConfig> feed) {
         final StubCluster cluster = new StubCluster();
         cluster.role = io.aeron.cluster.service.Cluster.Role.FOLLOWER;
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService svc = new SealerClusteredService(
-            CAPACITY, 250, 0, Set.of(), VoidLedger.Config.DISABLED,
+            capacity, 250, 0, Set.of(), VoidLedger.Config.DISABLED,
             CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS, orderingWindow, budgets);
         file.ifPresent(svc::carryingBytes);
+        feed.ifPresent(svc::feeding);
         svc.start(cluster, snapshot);
         final Member member = new Member(svc, cluster, sequencer);
         started.add(member);

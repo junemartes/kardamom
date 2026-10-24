@@ -45,8 +45,9 @@ final class MemberStatus {
     /**
      * The store of the retained frames ({@code heap} or {@code file}),
      * whether the rules of the carry window apply, the newest held
-     * activation of the carry window (both 0 when none), and the retained
-     * frames and their bytes.
+     * activation of the carry window (both 0 when none), the retained
+     * frames and their bytes, and the state of the member feed
+     * ({@link FeedState#label()}).
      */
     record Carry(
             String retainedStore,
@@ -54,9 +55,10 @@ final class MemberStatus {
             long activationOrigin,
             long activationMs,
             long retainedFrames,
-            long retainedBytes) {
+            long retainedBytes,
+            String feed) {
         /** The value of a sample that has no service. */
-        static final Carry NONE = new Carry("heap", false, 0L, 0L, 0L, 0L);
+        static final Carry NONE = new Carry("heap", false, 0L, 0L, 0L, 0L, FeedState.OFF.label());
     }
 
     final int memberId;
@@ -164,6 +166,7 @@ final class MemberStatus {
             + ",\"carryWindowActivationMs\":" + Long.toUnsignedString(carry.activationMs())
             + ",\"retainedFrames\":" + carry.retainedFrames()
             + ",\"retainedBytes\":" + carry.retainedBytes()
+            + ",\"feed\":\"" + carry.feed() + "\""
             + ",\"diskFreeBytes\":" + diskFree("null")
             + ",\"leadershipTermId\":" + leadershipTermId
             + ",\"startHold\":" + startHold

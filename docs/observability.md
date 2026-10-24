@@ -675,6 +675,7 @@ A ClusteredService cannot see its idle time, so the loop exports busy time only.
 | `kardamom_sealer_snapshot_bytes`, `kardamom_sealer_snapshot_version` | The size and the version of the newest snapshot that the member took or restored. |
 | `kardamom_sealer_ref_refused_total` | The references of record type 0 that the carry window refused with egress kind 18. |
 | `kardamom_sealer_full_ref_below_v5_total` | The full references (record type 7) that the member ordered below decision version 5. |
+| `kardamom_sealer_feed_state` | The member feed: 0 off, 1 idle, 2 walking, 3 live, 4 gapped. |
 
 The admin thread reads these series from the status of the member and from the Aeron counters in the CnC file of its media driver. A series of an Aeron counter that does not exist is absent.
 

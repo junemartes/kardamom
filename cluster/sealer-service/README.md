@@ -434,7 +434,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.recordLagBudget` | `0` (env `KARDAMOM_RECORD_LAG_BUDGET`) | yes | The record-lag budget in canonical records. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. In this release a value above `0` also stops the start, because the snapshot writer writes version 10. |
 | `kardamom.cluster.retention` | `65536` | no, raise only | The egress frames kept for replay: the minimum under the posted rule, and the exact window under decision version 5 with the carry window or with `carryBytes`. The largest supported value is 131072. |
 | `kardamom.cluster.carryBytes` | `false` | yes | `true` keeps the retained frames in an append-only file, not on the heap, and writes snapshot version 17. It also relays a full entry as a canonical entry, and drops the void request and the recorded cursor. The release gate refuses a rolling change of it. It needs `adminPort`, the env var `KARDAMOM_RETAINED_TOKEN` and a `snapshotIntervalS` above `0`. Any value other than `true`, `false` or empty stops the start. See [Retained file](#retained-file). |
-| `kardamom.cluster.feedAeronDir` | empty (off) | no | The directory of the media driver that the member shares with its paired executor. A value turns the member feed on. It needs `carryBytes=true`; without it the start stops. See [Member feed](#member-feed). |
+| `kardamom.cluster.feedAeronDir` | empty (off) | no | The directory of the media driver that the member shares with its paired executor. A value turns the member feed on. The feed runs on the heap store and on the retained file, and needs no other setting. See [Member feed](#member-feed). |
 | `kardamom.cluster.feedRingBytes` | `16777216` (16 MiB) | no | The frame ring of the member feed, off the heap. A power of two of at least 8 MiB; another value stops the start. |
 | env `KARDAMOM_RETAINED_TOKEN` | none | yes, with `carryBytes` | The shared token that a request for the retained file must carry. The member reads it only from the env var, because `ps` shows the system properties. A log line never prints it. |
 | `kardamom.cluster.retainedSegmentBytes` | `67108864` (64 MiB) | recommended | The size of a new segment of the retained file. The smallest value is 1 MiB, one session message. A smaller value stops the start. |
@@ -532,15 +532,27 @@ With `carryBytes=true`, the member keeps its retained frames in an append-only f
 
 With `feedAeronDir`, each member sends its retained frames to its paired executor over IPC, on the media driver of the executor node. The leader and the followers send the same frames. The wire layout, the answer rules and the states are in section 7.8 of `docs/specs/2026-10-10-raft-carried-transactions.md`.
 
+The feed runs on a heap member and on a member with `carryBytes`. It is local to the member: it writes nothing that the replicated state or a cluster session reads. So it is not a must-match setting, and a rolling deploy can turn it on member by member.
+
+- The settings: `feedAeronDir` turns the feed on. `feedRingBytes` sets its frame ring. A member without `feedAeronDir` runs no feed, and its status shows `feed` `off`.
+- On a heap member, each frame of a type-7 offer holds the envelope, so the feed carries the bytes of each transaction.
+
 - Stream 1006 carries the feed, member to executor. Stream 1007 carries the replay requests, executor to member.
 - The feed frames are kinds 1 and 2, the answers 3, 4 and 11, and kind 16 (`FEED_GAP`). Each answer carries the id of its request as an 8-byte tail. The feed carries no status.
 - The service thread writes each retained frame into a ring off the heap. It never waits for the feed. The feeder thread (`sealer-feeder-<id>`) offers the frames to the publication. Only the feeder waits on a back-pressured offer.
-- A replay request goes from the feeder to the service through a second ring. The service checks the cursor as for egress kind 1, walks the retained file from it (at most 256 KiB in each duty cycle), sends `REPLAY_DONE`, and then sends each new frame. The walk does not depend on log traffic: the service runs it in `doBackgroundWork`.
-- A live frame that does not fit the ring ends the answer with `FEED_GAP`. The member then writes nothing until the next request. A full ring during a walk only pauses the walk.
+- A replay request goes from the feeder to the service through a second ring. The service checks the cursor as for egress kind 1, walks the retained frames from it (at most 256 KiB in each duty cycle), sends `REPLAY_DONE`, and then sends each new frame. The walk does not depend on log traffic: the service runs it in `doBackgroundWork`.
+- The walk holds a walk key: the file position on the retained file, and the frame number on the heap. The frame number counts the frames that the store appended since the member started. The front is the appended count minus the frame count. An eviction and a growth of the heap rings keep the number of each frame, and the walk wraps its view again at each step. The walk allocates nothing.
+- The answer below the egress floor is `REPLAY_UNAVAILABLE` with the floors. On the heap, the window holds every frame from the floor.
+- The gap rule:
+  - A live frame that does not fit the ring ends the answer with `FEED_GAP`. A full ring during a walk only pauses the walk.
+  - When the window evicts past the walk key, the frames from the key are gone, and the answer ends with `FEED_GAP`.
+  - `FEED_GAP` names the cursor after the last frame that the answer carried. The member then writes nothing until the next request.
+  - The executor asks again from its cursor. A cursor below the floor gets `REPLAY_UNAVAILABLE`, and the executor reads the missing frames from another source. A cursor inside the window gets the frames from it.
 - A lost subscriber ends the answer. The feeder drops the unsent frames.
 - The feeder has its own Aeron client. When the driver goes, the client closes, and the feeder opens a new one every 1 s. A feed error never stops the member and never changes the replicated state.
 - The feed log is not sparse, so the driver of the executor node pays for its 24 MiB. The member pays for its 16 MiB ring.
 - Log lines: `sealer FEED START`, `OPEN`, `NO-DRIVER`, `CONNECTED`, `DISCONNECTED`, `CLOSED`, `DROPPED`, and for each request `REPLAY`, `LIVE`, `GAPPED` and `IDLE`.
+- The state: the status field `feed` and the gauge `kardamom_sealer_feed_state` (see [Admin server](#admin-server)).
 
 ### Recover a member that stops on its retained file
 
@@ -706,13 +718,15 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
   | `kardamom_sealer_snapshot_version` | the version of that snapshot |
   | `kardamom_sealer_ref_refused_total` | the type-0 references that the carry window refused |
   | `kardamom_sealer_full_ref_below_v5_total` | the full references ordered below version 5 |
+  | `kardamom_sealer_feed_state` | the member feed: 0 off, 1 idle, 2 walking, 3 live, 4 gapped |
 - The server listens on `0.0.0.0`. Two members on one host cannot share the port, so the port is off by default.
 - The server answers `/status`, `/ready` and `/metrics` on one thread. The paths under `/retained` run on two threads of their own, so a segment copy does not hold up `/ready`.
 - The retained file holds the bytes of the transactions of the retained frames, and the server listens on all addresses. So each request under `/retained` must carry `Authorization: Bearer <KARDAMOM_RETAINED_TOKEN>`. The job passes the same token to every member.
   - The token and the segment bytes travel in cleartext HTTP on the node network. The token keeps out a client that does not have it. It does not hide the bytes from a host that reads the network.
 - `diskFreeBytes` is `null`, and the gauge is `NaN`, when the disk cannot be read. The member stays ready.
-- The status JSON has `memberId`, `role`, `election`, `commitPosition`, `servicePosition`, `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, `snapshotLatest`, `decisionVersion`, `decisionActivationOrigin`, `decisionActivationMs`, `retainedStore`, `carryWindow`, `carryWindowActivationOrigin`, `carryWindowActivationMs`, `retainedFrames`, `retainedBytes`, `diskFreeBytes`, `leadershipTermId`, `startHold` and `ready`.
+- The status JSON has `memberId`, `role`, `election`, `commitPosition`, `servicePosition`, `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, `snapshotLatest`, `decisionVersion`, `decisionActivationOrigin`, `decisionActivationMs`, `retainedStore`, `carryWindow`, `carryWindowActivationOrigin`, `carryWindowActivationMs`, `retainedFrames`, `retainedBytes`, `feed`, `diskFreeBytes`, `leadershipTermId`, `startHold` and `ready`.
   - `retainedStore` is `heap` or `file` (`carryBytes`). `carryWindow` is `true` while the rules of the carry window apply. `carryWindowActivationOrigin` and `carryWindowActivationMs` are the newest held activation of feature 5, both 0 when none. `retainedFrames` and `retainedBytes` are the retained frames and their bytes at the end of the last entry.
+  - `feed` is the state of the member feed: `off` without `feedAeronDir`, `idle` with no answer, `walking` while an answer walks the retained frames, `live` while it sends each new frame, and `gapped` after `FEED_GAP` until the next request.
   - `decisionVersion` is the version of the rules of the member: 3, 4 or 5. `decisionActivationOrigin` and `decisionActivationMs` are the L1 origin and the time of the newest feature activation that the snapshot tail holds, both 0 when it holds none. See [Decision version](#decision-version).
   - `diskFreeBytes` is the free space of the disk of the cluster directory: the Raft log and the retained file. `/metrics` exports the same value.
   - `snapshotWrites`, `snapshotReadsMin` and `snapshotReadsMax` are the snapshot versions of this release, as `formats.toml` lists them.
