@@ -1478,6 +1478,15 @@ An **upgrade transaction** turns on a feature flag.
 - An older executor or validator runs the deposit as a call to an empty account. Its state forks at that deposit. The job meta `chain_state_install = "true"` marks the executor and validator jobs of this release, and `just sealer-upgrade-check <env> <feature> <activation_ms>` requires it. The zk guest links the install, so roll the prover's guest and its verifying key before the first upgrade transaction.
 - Proof: `crates/exec-core/src/executor/install_tests.rs`, `crates/engine/src/actor/exec_tests/flag_freeze.rs` (`every_driver_switches_at_the_same_block`), `crates/executor/tests/flag_freeze.rs`, `crates/validator/src/parallel/engine_tests/flag_freeze.rs`, `crates/validator/tests/witness_anchoring.rs` (`the_guest_installs_the_chain_state_code_with_the_first_upgrade`), `crates/deployer/tests/chainstate_genesis_predeploy.rs`, and the S13d cases of the chain-semantics suite on both geneses.
 
+**Features at genesis.** A new chain can start with the sealer features 3, 4 and 5 on, with no upgrade transaction: the genesis TOML key `genesis_features = [3, 4, 5]`.
+
+- Only the prefixes of the activation order are valid: `[]`, `[3]`, `[3, 4]` and `[3, 4, 5]`. The parse refuses any other list.
+- The genesis state holds what the upgrade transactions write on a live chain: the `KardamomChainState` code at `CHAIN_STATE`, and for each feature the activation word `GENESIS_ACTIVATION_MS` (1 ms). An allocation entry at `CHAIN_STATE` keeps its nonce and balance. Other code at `CHAIN_STATE` fails the validation.
+- The key changes the genesis root and the genesis digest. A chain without the key keeps the exact root and digest of its genesis: the storage words add no bytes to the digest, and `crates/engine/src/replay_genesis_tests.rs` pins the roots and digests of the genesis files.
+- Every state consumer seeds from `Genesis::to_alloc`: the executor, the validator, replay and `kardamom-reconstruct`. So all of them must read the same genesis file. A consumer with another file refuses its state (`GenesisMismatch`) or a checkpoint of the chain.
+- The key must match the sealer setting `kardamom.cluster.genesisFeatures` of the same chain. A later upgrade transaction of a feature rewrites its word, as on any chain.
+- Proof: `crates/types/src/genesis_tests.rs`, `crates/state/src/genesis.rs` (the storage tests), `crates/engine/src/replay_genesis_tests.rs` (`a_carry_genesis_holds_the_words_of_the_upgrade_transactions`), and S13g of the chain-semantics suite.
+
 **Mixed-version fleets fail-stop rather than fork.** This happens in two places.
 
 - An **old validator** halts at the epoch that contains the upgrade.

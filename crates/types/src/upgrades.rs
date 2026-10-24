@@ -228,6 +228,24 @@ pub fn encode_set_feature(feature_id: U256, activation_timestamp: u64) -> Bytes 
     Bytes::from(out)
 }
 
+/// The activation word of a feature that a genesis turns on: the time, in
+/// epoch milliseconds, that `KardamomChainState` holds for it. It is the
+/// word of `setFeature(feature, 1)`, an activation at L1 origin 0 and time
+/// 1 ms, as the sealer holds it for its genesis activation of the feature.
+/// The word is not 0 and is at most the time of every block, so the feature
+/// is active from the first block on.
+pub const GENESIS_ACTIVATION_MS: u64 = 1;
+
+/// The storage slot of `KardamomChainState` that holds the activation word
+/// of `feature_id`. The slot follows the Solidity mapping rule
+/// `keccak256(pad32(key) ++ pad32(slot))`, with the mapping at slot 0.
+#[must_use]
+pub fn activation_slot(feature_id: u64) -> B256 {
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(&U256::from(feature_id).to_be_bytes::<32>());
+    alloy_primitives::keccak256(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -37,7 +37,11 @@ mkdir -p rebuild && cd rebuild
 
 The genesis is `deploy/cluster/config/genesis/dev.toml`. With
 `PRIORITY_FEES=on`, append `fees.toml` to it, as the validator job does:
-`cat dev.toml fees.toml > genesis.toml`.
+`cat dev.toml fees.toml > genesis.toml`. On a chain that started in
+carry mode (`KARDAMOM_GENESIS_CARRY=on`), the first line of the file is
+`genesis_features = [3, 4, 5]`, as the executor and validator jobs render
+it. The key must come before the first table of the file. Without it, the
+rebuilt root differs from the live root at genesis.
 
 ### 1. Stop the pipeline and find the posted head H
 

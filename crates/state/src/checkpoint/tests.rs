@@ -100,7 +100,11 @@ fn seed_test_genesis(env: &StateEnv) {
         balance: alloy_primitives::U256::from(1u64),
         code_hash: B256::ZERO,
     }];
-    crate::genesis::seed_genesis(env, &accounts, &[]).unwrap();
+    crate::genesis::seed_genesis(
+        env,
+        &kardamom_types::GenesisAlloc::of_accounts(accounts.to_vec()),
+    )
+    .unwrap();
 }
 
 /// Open a fresh tempdir-backed env at `dir`, seed genesis, and commit

@@ -271,8 +271,7 @@ async fn main() -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(&cli.chain).context("read genesis TOML")?;
     let genesis: kardamom_types::Genesis = toml::from_str(&raw).context("parse genesis TOML")?;
     genesis.validate().context("validate genesis")?;
-    let (accounts, code) = genesis.to_alloc();
-    let replay_genesis = kardamom_engine::ReplayGenesis::of(&genesis, &accounts, &code);
+    let replay_genesis = kardamom_engine::ReplayGenesis::of(&genesis);
 
     let provider = ProviderBuilder::new()
         .connect(&cli.l1_rpc)

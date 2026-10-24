@@ -10,9 +10,7 @@ use alloy_primitives::{Address, B256, U256, address};
 use alloy_signer_local::PrivateKeySigner;
 use kardamom_state::{StateEnv, StateSnapshot, StateWriter, TrieMode, seed_genesis};
 use kardamom_types::upgrades::{CHAIN_STATE, FEATURE_SEALER_V3};
-use kardamom_types::{
-    AccountChange, EpochRecord, StateDatabase, TxEnvelope, TxRef, delta::CodeEntry,
-};
+use kardamom_types::{AccountChange, EpochRecord, GenesisAlloc, StateDatabase, TxEnvelope, TxRef};
 
 use crate::actor::StateWriterSignal;
 use crate::actor::fixtures::{ChainStateGenesis, ChainStatePredeploy};
@@ -132,8 +130,7 @@ struct Numbered<'a> {
 
 pub(super) struct FlagChain {
     poor: PrivateKeySigner,
-    accounts: Vec<AccountChange>,
-    code: Vec<CodeEntry>,
+    genesis: GenesisAlloc,
     /// Each block's header time and resolved records.
     blocks: Vec<(u64, Vec<Record>)>,
 }
@@ -175,8 +172,11 @@ impl FlagChain {
             .collect();
         Self {
             poor,
-            accounts,
-            code: predeploy.into_iter().map(|p| p.code).collect(),
+            genesis: GenesisAlloc {
+                accounts,
+                code: predeploy.into_iter().map(|p| p.code).collect(),
+                storage: Vec::new(),
+            },
             blocks,
         }
     }
@@ -286,7 +286,7 @@ impl FlagChain {
     /// Run the chain through the live exec thread.
     pub(super) fn live(&self, mode: Mode) -> Rebuilt {
         let (_dir, env) = fresh_env();
-        seed_genesis(&env, &self.accounts, &self.code).unwrap();
+        seed_genesis(&env, &self.genesis).unwrap();
         let handle = StateWriter::spawn_with_trie(env.clone(), TrieMode::Incremental).unwrap();
         let rig = ExecRig::new(
             MdbxSnapshotSource::new(handle.snapshot_rx.clone()),
@@ -310,8 +310,7 @@ impl FlagChain {
         let (_dir, env) = fresh_env();
         let genesis = ReplayGenesis {
             chain_id: 1,
-            accounts: &self.accounts,
-            code: &self.code,
+            alloc: self.genesis.clone(),
             fees: None,
         };
         replay_blocks(env.clone(), &genesis, self.replay_blocks()).unwrap();

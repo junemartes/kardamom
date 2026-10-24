@@ -36,7 +36,7 @@
 //! consensus divergence. [`BlockFeatures::read`] and [`BlockClose::apply`]
 //! are the single implementation for all drivers.
 
-use alloy_primitives::{B256, U256, keccak256};
+use alloy_primitives::{B256, U256};
 use kardamom_types::StateDatabase;
 use kardamom_types::upgrades::{CHAIN_STATE, FEATURE_SEALER_V3};
 
@@ -56,16 +56,7 @@ pub const HEALTH_BEACON_SLOT: B256 = B256::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
 ]);
 
-/// Storage slot that holds `featureId`'s activation timestamp. This follows
-/// the Solidity mapping rule `keccak256(pad32(key) ++ pad32(slot))`, with the
-/// mapping at slot 0.
-#[must_use]
-pub fn activation_slot(feature_id: u64) -> B256 {
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(&U256::from(feature_id).to_be_bytes::<32>());
-    // buf[32..64] stays zero. This is the mapping's declaration slot.
-    keccak256(buf)
-}
+pub use kardamom_types::upgrades::activation_slot;
 
 /// The feature flags of one block, frozen before its first record. See the
 /// module doc for the rule.

@@ -121,7 +121,30 @@ pub struct StackConfig {
 pub struct CarryOptions {
     /// `-Dkardamom.cluster.retention` on every member.
     pub retention: NonZeroU32,
+    /// The carry mode from genesis. Without it, the chain starts on the
+    /// reference rules, and the carry window comes with upgrade
+    /// transactions, as on a live chain. With it:
+    ///
+    /// - Every member starts with the features 3, 4 and 5 at genesis
+    ///   (`-Dkardamom.cluster.genesisFeatures=3,4,5`), and takes a periodic
+    ///   snapshot every [`GENESIS_SNAPSHOT_INTERVAL_S`] seconds.
+    /// - The L2 genesis holds the activation words of the same features
+    ///   (`genesis_features = [3, 4, 5]`).
+    /// - Each sequencer starts at the floor 5.
+    /// - The executor reads the member feed and the egress from its first
+    ///   block, and the validator and the batcher read the egress.
+    pub genesis: bool,
 }
+
+/// The periodic snapshot interval of a member on a chain in carry mode
+/// from genesis, in seconds. A restart before the first snapshot needs
+/// the bring-up to end well before it, and a restart from a snapshot
+/// needs it to come during the scenario.
+pub const GENESIS_SNAPSHOT_INTERVAL_S: u64 = 90;
+
+/// The genesis features of a chain in carry mode from genesis, as the
+/// sealer setting and the L2 genesis TOML spell them.
+pub(crate) const GENESIS_FEATURES: &str = "3,4,5";
 
 /// The L2 genesis a stack boots from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +181,15 @@ impl Genesis {
     /// same file the executor and validator jobs append for it.
     pub(super) fn canary_fragment(repo: &std::path::Path) -> PathBuf {
         repo.join("deploy/cluster/config/genesis/canary.toml")
+    }
+}
+
+impl StackConfig {
+    /// Whether the stack runs the carry mode from genesis
+    /// ([`CarryOptions::genesis`]).
+    #[must_use]
+    pub fn carry_genesis(&self) -> bool {
+        self.carry.is_some_and(|c| c.genesis)
     }
 }
 

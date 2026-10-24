@@ -38,7 +38,7 @@ use std::time::Duration;
 use anyhow::Result;
 
 pub use carry::CarrySeams;
-pub use config::{CarryOptions, DEV_CHAIN_ID, Genesis, StackConfig};
+pub use config::{CarryOptions, DEV_CHAIN_ID, GENESIS_SNAPSHOT_INTERVAL_S, Genesis, StackConfig};
 use load_sampler::LoadSampler;
 use sealer::SealerCluster;
 use services::{ServiceSpec, Spawned, SpawnedIngress, SpawnedNotifier};

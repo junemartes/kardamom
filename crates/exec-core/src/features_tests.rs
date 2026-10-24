@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::state::MockStateDatabase;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, keccak256};
 
 /// A snapshot that errors on every storage read, to exercise the error
 /// paths. `basic`, `code_by_hash`, and the receipt lookups are never
