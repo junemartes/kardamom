@@ -183,6 +183,7 @@ A deploy rolls each service job one instance at a time, under a health check.
 - A system job (the Aeron drivers) has no deployment. The role waits for its allocations instead.
 - The first job of each deploy is `data-dirs`, a sysbatch job on every node of every pool. It makes each data directory of `node_data_dirs` in `ansible/group_vars/all.yml` and sets its mode (`0777`). The role waits until each allocation is complete, and registers no other job before.
   - The job runs the Aeron image of the release manifest, as root, with a shell as its entrypoint. It needs no image outside the manifest.
+  - A release changes the Aeron image, so each release registers the job again, and it runs again on every node. A rollback reverts it with the other jobs.
   - Nomad stops the allocation of a node that goes down, and the wait no longer counts it. An allocation that does not complete fails the deploy when the poll budget runs out (`workloads_poll_retries` polls, `workloads_poll_delay` seconds apart).
   - The common role makes the same directories when it provisions a node. The job gives a node that existed before a service the directory of that service.
   - Without the directory, Docker makes the bind-mount source as `root` with mode `0755`, and a service that runs as uid 10001 cannot write to it.
