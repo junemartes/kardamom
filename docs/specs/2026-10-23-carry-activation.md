@@ -503,7 +503,8 @@ All of this section is the v2 loop, which staging runs
   - Implementation note (2026-10-24): the file holds the mark plus a lead of 65,536 indexes and
     32 blocks, and the store writes it only when the mark passes it. Two syncs for each batch
     stalled the owner thread of the egress under the v1 loop, and with it `egress_receipts`. The
-    mark in memory stays exact. After a restart R is at most the lead above the stored references.
+    mark in memory stays exact. A clean stop writes the exact mark. After a crash R is at most the
+    lead above the stored references.
   - The order: the frames of the batch, then the mark, then the sync of the segment
     (`store.rs:128`). So after a crash the mark is at or above every reference that the segment
     holds. A mark above the segment only delays a switch. It never lets a reader meet a

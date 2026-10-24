@@ -144,6 +144,22 @@ impl Store {
         self.writer.flush().map_err(io(&self.dir))
     }
 
+    /// Close the store at a clean stop: force the frames to disk, then
+    /// write the exact mark over the lead. Every stored reference is then
+    /// at or below the mark, so only a crash leaves the lead in the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sync or the write fails.
+    pub fn close(&mut self) -> Result<(), StoreError> {
+        self.sync()?;
+        if self.written != self.mark {
+            self.mark.write(&self.dir)?;
+            self.written = self.mark;
+        }
+        Ok(())
+    }
+
     /// Force the appended frames to disk.
     ///
     /// # Errors

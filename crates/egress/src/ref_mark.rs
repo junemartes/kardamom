@@ -15,8 +15,9 @@
 //! writes the file again only when its mark passes the file. So most
 //! batches cost no sync: under the v1 loop every transaction is a
 //! reference, and two syncs for each batch stalled the owner thread of
-//! the egress, and with it the receipts. After a restart the mark is at
-//! most [`LEAD`] above the highest stored reference.
+//! the egress, and with it the receipts. A clean stop writes the exact
+//! mark. After a crash the mark is at most [`LEAD`] above the highest
+//! stored reference.
 
 use std::fs::{self, File};
 use std::io::Write;

@@ -251,6 +251,45 @@ fn a_mark_inside_the_lead_does_not_write_the_side_file() {
     assert_eq!(file(), past.ahead(), "R passed the file, so the file moves");
 }
 
+/// Empty blocks move the block of the next reference past the lead while
+/// its index stays inside it. The file then moves too.
+#[test]
+fn a_reference_past_the_lead_in_blocks_only_writes_the_side_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path(), NonZeroU64::new(1000).unwrap(), GENESIS).unwrap();
+    store.append(&with_a_reference()).unwrap();
+    let lead_end = REFERENCE.ahead().block;
+    // Block b holds only its boundary, at index b, from block 6 on.
+    let empty: Vec<_> = (6..=lead_end).map(|b| boundary(b, b + 1)).collect();
+    store.append(&empty).unwrap();
+    let block = lead_end + 1;
+    store
+        .append(&[ref_record(block), boundary(block, block + 1)])
+        .unwrap();
+    let top = RefMark {
+        index: block,
+        block,
+    };
+    assert!(
+        top.index < REFERENCE.ahead().index,
+        "the index is inside the lead"
+    );
+    assert_eq!(RefMark::read(dir.path()).unwrap(), top.ahead());
+}
+
+/// A clean stop writes the exact mark, so a restart after it reads no
+/// lead.
+#[test]
+fn a_close_writes_the_exact_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
+    store.append(&with_a_reference()).unwrap();
+    store.close().unwrap();
+    drop(store);
+    let again = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
+    assert_eq!(again.mark(), REFERENCE);
+}
+
 /// A reset keeps the mark, a higher mark of the peer raises it, and a
 /// lower mark of the peer does not lower it.
 #[test]
