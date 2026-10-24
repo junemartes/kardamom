@@ -10,6 +10,7 @@ import io.aeron.cluster.service.Cluster;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.LagBudgets;
+import io.kardamom.sealer.GenesisFeatures;
 import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.VoidLedger;
 import java.io.File;
@@ -152,6 +153,13 @@ public final class ClusterNode {
         System.out.println("cluster carry bytes memberId=" + memberId + carryBytes
             .map(c -> " dir=" + c.file().dir() + " segmentBytes=" + c.file().segmentBytes())
             .orElse(" <off: retained frames on the heap>"));
+        // The features that the chain runs from its genesis. Replicated
+        // configuration: a member that starts at genesis takes them, so
+        // every member must run the same set for the life of the chain.
+        final GenesisFeatures genesisFeatures = genesisFeatures(
+            System.getProperty(GenesisFeatures.SETTING), carryBytes.isPresent(), seed);
+        System.out.println("cluster genesis features memberId=" + memberId
+            + " features=\"" + genesisFeatures.value() + "\"");
         // The longest idle park of every hot-path thread of the member.
         // -Dkardamom.cluster.idleCapUs wins over the KARDAMOM_IDLE_CAP_US
         // env var. Unset, the cap is 1 ms, the cap of Aeron's own backoff.
@@ -241,6 +249,7 @@ public final class ClusterNode {
                     inclusionHorizonBlocks, orderingWindow,
                     new LagBudgets(daLagBudgetBlocks, recordLagBudget));
                 seed.ifPresent(service::seededFrom);
+                service.genesisFeatures(genesisFeatures);
                 service.holdAtStart(startHold);
                 final SealerClusteredService built = service;
                 carryBytes.map(CarryBytes::file).ifPresent(built::carryingBytes);
@@ -409,7 +418,8 @@ public final class ClusterNode {
                 service.decisionRules(),
                 diskFreeBytes())
                 .withStart(service.leadershipTermId(), service.holdingAtStart())
-                .withCarry(service.metrics().carry());
+                .withCarry(service.metrics().carry())
+                .withGenesis(service.genesisFeatures());
         }
 
         /**
@@ -801,6 +811,38 @@ public final class ClusterNode {
                 + " writes snapshot version 11 lifts this check.");
         }
         return budget;
+    }
+
+    /**
+     * The features that the chain runs from its genesis, from the setting
+     * {@code value}. A start refuses three cases:
+     * <ul>
+     *   <li>a value that is not {@code ""}, {@code "3"}, {@code "3,4"} or
+     *       {@code "3,4,5"};</li>
+     *   <li>feature 5 with {@code carryBytes}: a member with the retained
+     *       file holds no activation of the carry window, and its snapshot
+     *       has no place for it;</li>
+     *   <li>a seed whose rules do not hold an activation of each feature: a
+     *       chain that ran the features from its genesis holds one of each
+     *       for all time, so the seed came from another genesis.</li>
+     * </ul>
+     *
+     * @throws IllegalArgumentException if the value names no set
+     * @throws IllegalStateException    for the other two cases
+     */
+    static GenesisFeatures genesisFeatures(
+            final String value, final boolean carryBytes, final Optional<SealerSeed> seed) {
+        final GenesisFeatures features = GenesisFeatures.parse(value);
+        if (carryBytes && features.carryWindow()) {
+            throw new IllegalStateException(GenesisFeatures.SETTING + "=" + features.value() + " needs the retained"
+                + " frames on the heap: a member with " + RetainedFile.Config.SETTING + "=true holds no activation"
+                + " of feature 5, and its snapshot has no place for it");
+        }
+        if (seed.filter(s -> !s.rules().holdsEach(features)).isPresent()) {
+            throw new IllegalStateException(GenesisFeatures.SETTING + "=" + features.value() + ", but the seed holds"
+                + " no activation of each of these features: write the seed with the genesis of this chain");
+        }
+        return features;
     }
 
     private static ClusteredServiceContainer.Context serviceContext(

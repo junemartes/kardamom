@@ -293,8 +293,10 @@ The deploy does not change these. Apply them before step 6.
   activation time for feature 5.
 - Feature 3 or 4 off stops decision version 5, and with it the rules of feature 5. The upgrade check refuses it
   while a member holds feature 5. Turn feature 5 off first, and empty `KARDAMOM_CARRY_EXECUTORS`.
-- Before a fleet rebuild from a seed, set `KARDAMOM_SEALER_VERSION_FLOOR=0`, and empty `KARDAMOM_CARRY_EXECUTORS`. A
-  seeded member runs decision version 3 with no feature. Send features 3, 4 and 5 again.
+- A fleet rebuild from a seed keeps the rules: the seed carries the decision rules at its head, and a seeded member
+  runs them. Check that `kardamom-reconstruct` logs `sealer seed written` with `decision_version=5` and
+  `carry_window=true`. A seed of version 1 holds no rules: before a rebuild from such a seed, set
+  `KARDAMOM_SEALER_VERSION_FLOOR=0`, empty `KARDAMOM_CARRY_EXECUTORS`, and send features 3, 4 and 5 again.
 
 ## Clear
 

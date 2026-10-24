@@ -20,12 +20,16 @@
 //! artifacts. The end-to-end test scenarios enforce it too, through the
 //! live chain.
 
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use alloy_primitives::{Address, B256, U256, address, b256, hex};
 use bytes::Bytes;
+use serde::Deserialize;
 
 use crate::deposit::Deposit;
+use crate::epoch::EpochRecord;
 
 /// Canonical L2 address of the `KardamomChainState` predeploy. This is the
 /// feature-flag store. A genesis can hold its code
@@ -99,6 +103,63 @@ pub const FEATURE_SEALER_V5: u64 = 4;
 /// executor does not read it.
 pub const FEATURE_CARRY_WINDOW: u64 = 5;
 
+/// The features that only the sealer follows, in feature id order.
+pub const SEALER_FEATURES: [u64; 3] = [FEATURE_SEALER_V4, FEATURE_SEALER_V5, FEATURE_CARRY_WINDOW];
+
+/// The sealer features that a chain runs from its genesis: the key
+/// `genesis_features` of the genesis config, and the sealer setting
+/// `kardamom.cluster.genesisFeatures`. Each set is a prefix of
+/// [`SEALER_FEATURES`], because feature 4 needs decision version 4 and
+/// feature 5 needs version 5. The set is fixed for the life of the chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(try_from = "Vec<u64>")]
+pub enum GenesisFeatures {
+    /// No feature: the chain starts on decision version 3.
+    #[default]
+    None,
+    /// Feature 3: the chain starts on decision version 4.
+    SealerV4,
+    /// Features 3 and 4: the chain starts on decision version 5.
+    SealerV5,
+    /// Features 3, 4 and 5: decision version 5 with the carry window.
+    CarryWindow,
+}
+
+impl GenesisFeatures {
+    /// Every set.
+    const ALL: [Self; 4] = [
+        Self::None,
+        Self::SealerV4,
+        Self::SealerV5,
+        Self::CarryWindow,
+    ];
+
+    /// The feature ids of the set, in feature id order.
+    #[must_use]
+    pub const fn ids(self) -> &'static [u64] {
+        match self {
+            Self::None => &[],
+            Self::SealerV4 => &[FEATURE_SEALER_V4],
+            Self::SealerV5 => &[FEATURE_SEALER_V4, FEATURE_SEALER_V5],
+            Self::CarryWindow => &SEALER_FEATURES,
+        }
+    }
+}
+
+impl TryFrom<Vec<u64>> for GenesisFeatures {
+    type Error = String;
+
+    /// The set of `ids`: `[]`, `[3]`, `[3, 4]` or `[3, 4, 5]`.
+    fn try_from(ids: Vec<u64>) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|set| set.ids() == ids.as_slice())
+            .ok_or_else(|| {
+                format!("genesis_features must be [], [3], [3, 4] or [3, 4, 5], got {ids:?}")
+            })
+    }
+}
+
 /// The length of `setFeature` calldata: the selector and two words.
 const SET_FEATURE_LEN: usize = 4 + 32 + 32;
 
@@ -119,6 +180,19 @@ impl FeatureSchedule {
         (deposit.is_system_transaction && deposit.to == Some(CHAIN_STATE))
             .then(|| Self::decode(&deposit.input))
             .flatten()
+    }
+
+    /// The schedule of `feature_id` that `epoch` carries: the last one,
+    /// because the last `setFeature` call wins on L2. `None` when the
+    /// epoch schedules no such feature.
+    #[must_use]
+    pub fn last_in(epoch: &EpochRecord, feature_id: u64) -> Option<Self> {
+        epoch
+            .deposits
+            .iter()
+            .rev()
+            .filter_map(Self::of_deposit)
+            .find(|schedule| schedule.feature_id == U256::from(feature_id))
     }
 
     /// Decode the calldata that [`encode_set_feature`] writes. A word of
@@ -241,6 +315,46 @@ mod tests {
             ..system
         };
         assert_eq!(FeatureSchedule::of_deposit(&elsewhere), None);
+    }
+
+    #[test]
+    fn genesis_features_take_only_a_prefix_of_the_sealer_features() {
+        let parse = |ids: &[u64]| GenesisFeatures::try_from(ids.to_vec());
+        assert_eq!(parse(&[]), Ok(GenesisFeatures::None));
+        assert_eq!(parse(&[3]), Ok(GenesisFeatures::SealerV4));
+        assert_eq!(parse(&[3, 4]), Ok(GenesisFeatures::SealerV5));
+        assert_eq!(parse(&[3, 4, 5]), Ok(GenesisFeatures::CarryWindow));
+        let bad: [&[u64]; 6] = [&[4], &[3, 5], &[5, 4, 3], &[3, 3], &[3, 4, 5, 6], &[2]];
+        assert!(
+            bad.iter()
+                .all(|ids| parse(ids).is_err_and(|err| err.contains("genesis_features")))
+        );
+        assert_eq!(GenesisFeatures::CarryWindow.ids(), SEALER_FEATURES);
+        assert_eq!(GenesisFeatures::default().ids(), [] as [u64; 0]);
+    }
+
+    #[test]
+    fn the_last_schedule_of_a_feature_in_an_epoch_wins() {
+        let schedule = |feature: u64, at: u64| Deposit {
+            source_hash: alloy_primitives::B256::ZERO,
+            from: SYSTEM_UPGRADER,
+            to: Some(CHAIN_STATE),
+            mint: 0,
+            value: U256::ZERO,
+            gas_limit: UPGRADE_TX_GAS_LIMIT,
+            is_system_transaction: true,
+            input: encode_set_feature(U256::from(feature), at),
+        };
+        let epoch = EpochRecord {
+            l1_number: 9,
+            l1_hash: B256::ZERO,
+            deposits: vec![schedule(4, 1), schedule(3, 2), schedule(4, 3)],
+        };
+        let last =
+            |feature| FeatureSchedule::last_in(&epoch, feature).map(|s| s.activation_timestamp);
+        assert_eq!(last(4), Some(3));
+        assert_eq!(last(3), Some(2));
+        assert_eq!(last(5), None);
     }
 
     #[test]

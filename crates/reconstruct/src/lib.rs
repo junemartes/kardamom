@@ -139,7 +139,9 @@ impl Reconstruction<'_> {
     }
 }
 
+mod rules;
 mod seed;
+pub use rules::SealerRules;
 pub use seed::{SealerSeed, SeedInput, SeedSender, SenderOrder};
 
 /// Shared test fixtures: signed transfers, a funded-EOA genesis, closed-

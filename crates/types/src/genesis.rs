@@ -24,6 +24,11 @@ pub struct Genesis {
     /// fees and computes the same roots.
     #[serde(default)]
     pub fees: Option<crate::fees::FeeSchedule>,
+    /// The sealer features that the chain runs from its genesis, as
+    /// `genesis_features = [3, 4, 5]`. Absent means none. The sealer
+    /// setting `kardamom.cluster.genesisFeatures` names the same set.
+    #[serde(default)]
+    pub genesis_features: crate::upgrades::GenesisFeatures,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

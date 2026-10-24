@@ -714,7 +714,7 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - A new process starts from `--sealer-version-floor` (env `KARDAMOM_SEALER_VERSION_FLOOR`, from 0 to 5, default 0). The deploy sets the lowest `decisionVersion` of the members. With a floor of 5, the first offers of a new process go out with their bytes (record type 7), so no reference without bytes (record type 0) goes out after a restart.
   - A wrong floor lasts until the first kind 17 of the session, a few milliseconds.
   - A floor above the version of the chain makes type-7 offers below version 5. The sealer orders them. A reader with the decoder of a relayed type 7 runs them.
-  - Set the floor to 0 before a fleet rebuild from a seed. A seeded member runs version 3.
+  - A seeded member runs the decision rules that the seed carries, so the floor can stay at a fleet rebuild from a seed. A seed of version 1, from an older `kardamom-reconstruct`, holds no rules: set the floor to 0 before a rebuild from such a seed, because the member runs version 3.
   - Both loops (v1 and v2) read the kept version.
   - The sequencer sends the activation record (ingress kind 11) of `FEATURE_CARRY_WINDOW` (feature 5) in front of its epoch, as for features 3 and 4. A sealer that does not follow feature 5 ignores it.
   - The sealer can refuse a reference without bytes, and answer the offering session with egress kind 18 (`REF_REFUSED`: the hash, the sender, the nonce and the decision version). The egress feed thread of the sequencer then:

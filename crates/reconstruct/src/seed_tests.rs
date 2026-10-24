@@ -6,7 +6,9 @@ use kardamom_engine::ReplayOutcome;
 
 use super::{SealerSeed, SeedInput, SeedSender, SenderOrder};
 use crate::reconstruct_state;
+use crate::rules::{Activation, Boundary, SealerRules};
 use crate::test_support::{CHAIN_ID, genesis, test_genesis, two_transfer_blocks};
+use kardamom_types::upgrades::{FEATURE_CARRY_WINDOW, GenesisFeatures};
 
 /// The seed file of [`golden_seed`]. `SealerSeedTest.java` parses the same
 /// bytes, so the two sides of the layout cannot drift apart.
@@ -26,6 +28,54 @@ const GOLDEN: &str = concat!(
     "0000000000000001",
 );
 
+/// The rules section of [`golden_rules_seed`], after the bytes of
+/// [`GOLDEN`] with version 2: version 5, sealed origin 42, the genesis
+/// activations of features 3 and 4, the carry window flag off, and the
+/// activation of feature 5 at origin 40 with a time ahead.
+/// `SealerSeedTest.java` parses the same bytes.
+const GOLDEN_RULES: &str = concat!(
+    "05",
+    "000000000000002a",
+    "01",
+    "0000000000000000",
+    "0000000000000001",
+    "01",
+    "0000000000000000",
+    "0000000000000001",
+    "00",
+    "01",
+    "0000000000000028",
+    "0000018bcfe57b88",
+);
+
+/// The rules of a carry-born chain at origin 42 that sent feature 5 with a
+/// time ahead at origin 40.
+fn golden_rules() -> SealerRules {
+    let mut rules = SealerRules::genesis(GenesisFeatures::CarryWindow);
+    rules.on_activation(
+        Activation {
+            l1_origin: 40,
+            feature_id: FEATURE_CARRY_WINDOW,
+            time_ms: 1_700_000_005_000,
+        },
+        39,
+        1_700_000_000_000,
+    );
+    rules.at_boundary(&Boundary {
+        l1_origin: 42,
+        sealed_ms: 1_700_000_000_000,
+        l2_timestamp: 1_700_000_000_250,
+    });
+    rules
+}
+
+fn golden_rules_seed() -> SealerSeed {
+    SealerSeed {
+        rules: golden_rules(),
+        ..golden_seed()
+    }
+}
+
 fn golden_seed() -> SealerSeed {
     SealerSeed {
         chain_id: CHAIN_ID,
@@ -44,12 +94,24 @@ fn golden_seed() -> SealerSeed {
                 next_nonce: 1,
             },
         ],
+        rules: SealerRules::genesis(GenesisFeatures::None),
     }
 }
 
+/// A seed whose rules hold no activation keeps the bytes of version 1.
 #[test]
 fn the_seed_layout_matches_the_golden_bytes() {
     assert_eq!(hex::encode(golden_seed().encode().unwrap()), GOLDEN);
+}
+
+/// A seed whose rules hold an activation is version 2: the bytes of
+/// version 1, then the rules.
+#[test]
+fn a_seed_with_rules_matches_the_golden_bytes() {
+    let rules = golden_rules();
+    assert_eq!((rules.version(), rules.carry_window()), (5, false));
+    let expected = format!("{}00000002{}{GOLDEN_RULES}", &GOLDEN[..8], &GOLDEN[16..]);
+    assert_eq!(hex::encode(golden_rules_seed().encode().unwrap()), expected);
 }
 
 #[test]
@@ -101,6 +163,7 @@ impl Rebuilt {
             chain_id: CHAIN_ID,
             outcome: &self.outcome,
             senders: &SenderOrder::of([self.user]),
+            rules: &SealerRules::genesis(GenesisFeatures::None),
         }
         .seed()
     }
@@ -126,6 +189,7 @@ fn a_seed_carries_the_rebuilt_head_and_the_next_nonce() {
                 address: rebuilt.user,
                 next_nonce: 3,
             }],
+            rules: SealerRules::genesis(GenesisFeatures::None),
         }
     );
     let path = rebuilt.dir.path().join("sealer.seed");
@@ -141,5 +205,12 @@ fn a_seed_refuses_a_head_without_a_canonical_end() {
 
 #[test]
 fn seed_version_matches_the_registry() {
-    kardamom_formats::Registry::assert_exact("sealer-seed", super::VERSION);
+    kardamom_formats::Registry::assert_versions(
+        "sealer-seed",
+        kardamom_formats::Versions {
+            writes: super::VERSION,
+            reads_min: super::VERSION,
+            reads_max: super::RULES_VERSION,
+        },
+    );
 }

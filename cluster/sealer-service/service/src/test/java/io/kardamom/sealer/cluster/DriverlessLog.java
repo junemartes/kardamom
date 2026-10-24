@@ -1,7 +1,9 @@
 package io.kardamom.sealer.cluster;
 
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.GenesisFeatures;
 import io.kardamom.sealer.LagBudgets;
+import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.VoidLedger;
 import io.kardamom.sealer.cluster.ClusterStubs.StubCluster;
 import io.kardamom.sealer.cluster.ClusterStubs.StubSession;
@@ -10,6 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Consumer;
 import org.agrona.ExpandableArrayBuffer;
 
 /**
@@ -99,13 +102,13 @@ final class DriverlessLog {
     }
 
     private Member member(final Optional<byte[]> snapshot, final int orderingWindow, final LagBudgets budgets) {
-        return member(CAPACITY, snapshot, orderingWindow, budgets, Optional.empty(), Optional.empty());
+        return member(CAPACITY, snapshot, orderingWindow, budgets, svc -> { });
     }
 
     /** A heap member with no ordering window and the member feed of {@code feed}, from {@code snapshot} or at genesis. */
     Member feeding(final Optional<byte[]> snapshot, final FeedConfig feed) {
         return member(FEED_CAPACITY, snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW, LagBudgets.DEFAULT,
-            Optional.empty(), Optional.of(feed));
+            svc -> svc.feeding(feed));
     }
 
     /**
@@ -114,8 +117,40 @@ final class DriverlessLog {
      * {@code snapshot} or at genesis.
      */
     Member carrying(final Optional<byte[]> snapshot, final Path dir, final LagBudgets budgets) {
+        return carrying(snapshot, dir, budgets, svc -> { });
+    }
+
+    /** A heap member from {@code snapshot}, or at genesis with the rules of {@code features}. */
+    Member genesis(final Optional<byte[]> snapshot, final GenesisFeatures features) {
+        return heap(snapshot, svc -> svc.genesisFeatures(features));
+    }
+
+    /** A member with the retained file under {@code dir}, from {@code snapshot}, or at genesis with {@code features}. */
+    Member carryingGenesis(final Optional<byte[]> snapshot, final Path dir, final GenesisFeatures features) {
+        return carrying(snapshot, dir, LagBudgets.DEFAULT, svc -> svc.genesisFeatures(features));
+    }
+
+    /** A heap member from {@code snapshot}, or from {@code seed}. */
+    Member seeded(final Optional<byte[]> snapshot, final SealerSeed seed) {
+        return heap(snapshot, svc -> svc.seededFrom(seed));
+    }
+
+    /** A member with the retained file under {@code dir}, from {@code snapshot}, or from {@code seed}. */
+    Member carryingSeeded(final Optional<byte[]> snapshot, final Path dir, final SealerSeed seed) {
+        return carrying(snapshot, dir, LagBudgets.DEFAULT, svc -> svc.seededFrom(seed));
+    }
+
+    private Member heap(final Optional<byte[]> snapshot, final Consumer<SealerClusteredService> setup) {
+        return member(CAPACITY, snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW, LagBudgets.DEFAULT, setup);
+    }
+
+    private Member carrying(
+            final Optional<byte[]> snapshot,
+            final Path dir,
+            final LagBudgets budgets,
+            final Consumer<SealerClusteredService> setup) {
         return member(CAPACITY, snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW, budgets,
-            Optional.of(new RetainedFile.Config(dir, SEGMENT_BYTES)), Optional.empty());
+            setup.andThen(svc -> svc.carryingBytes(new RetainedFile.Config(dir, SEGMENT_BYTES))));
     }
 
     /** End {@code member}, then start a carrying member in its file in {@code dir} from {@code snapshot}. */
@@ -135,16 +170,14 @@ final class DriverlessLog {
             final Optional<byte[]> snapshot,
             final int orderingWindow,
             final LagBudgets budgets,
-            final Optional<RetainedFile.Config> file,
-            final Optional<FeedConfig> feed) {
+            final Consumer<SealerClusteredService> setup) {
         final StubCluster cluster = new StubCluster();
         cluster.role = io.aeron.cluster.service.Cluster.Role.FOLLOWER;
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService svc = new SealerClusteredService(
             capacity, 250, 0, Set.of(REMOTE_CHAIN), VoidLedger.Config.DISABLED,
             CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS, orderingWindow, budgets);
-        file.ifPresent(svc::carryingBytes);
-        feed.ifPresent(svc::feeding);
+        setup.accept(svc);
         svc.start(cluster, snapshot);
         final Member member = new Member(svc, cluster, sequencer);
         started.add(member);

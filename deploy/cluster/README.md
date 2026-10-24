@@ -425,7 +425,7 @@ The order on a live chain:
 6. Run the upgrade check of feature 5, then send the upgrade transaction (see [The upgrade check](#the-upgrade-check)).
 7. After the switch, list the executors in `KARDAMOM_CARRY_EXECUTORS`, one at a time.
 
-To go back, reverse the order: empty the list first, then the executors, then the feed. Before a fleet rebuild from a seed, set the floor to 0: a seeded member runs decision version 3.
+To go back, reverse the order: empty the list first, then the executors, then the feed. A seeded member runs the decision rules that the seed carries. Only before a fleet rebuild from a seed of version 1, which holds no rules, set the floor to 0: such a member runs decision version 3.
 
 #### What a node needs for the carry window
 

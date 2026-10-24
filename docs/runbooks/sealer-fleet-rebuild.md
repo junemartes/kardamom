@@ -112,6 +112,15 @@ L1 origin of H. Bytes 40 to 47 of the seed hold the same value:
 M=$(od -An -t u8 --endian=big -j 40 -N 8 seed.bin | tr -d ' ')
 ```
 
+The same line shows the decision rules that the seed carries: `decision_version`,
+`carry_window` and `rules`. The members run these rules from the start, so no
+upgrade transaction is sent again. Compare them with `decisionVersion` and
+`carryWindow` of the old members, as admin `/status` reported them before the
+wipe. The rules come from the `genesis_features` of `genesis.toml` and from the
+upgrade transactions in the lockbox logs, so use the genesis of the chain and
+`--lockbox`. A seeded member with `kardamom.cluster.genesisFeatures` stops when
+the seed does not hold each of these features.
+
 ### 3. Wipe the old state
 
 The old state belongs to the reverted chain. A consumer that resumes on it, or
