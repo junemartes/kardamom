@@ -24,6 +24,8 @@ kardamom-cluster-client = { path = "../cluster-client" }
 # Live transport reuses kardamom-log's AeronRuntime (already in the tree via the
 # executor → log dependency, so this adds no new native build cost).
 kardamom-log.workspace = true
+# The shared pipeline metrics of the session thread.
+kardamom-obs = { path = "../obs" }
 alloy-primitives.workspace = true
 crossbeam-channel.workspace = true
 metrics.workspace = true
@@ -42,3 +44,5 @@ toml.workspace = true
 kardamom-sequencer = { path = "../sequencer" }
 kardamom-engine = { path = "../engine" }
 tokio.workspace = true
+# A local recorder for the tests that read the session metrics.
+metrics-exporter-prometheus.workspace = true

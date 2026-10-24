@@ -68,6 +68,51 @@ tasks.named('test') {
     systemProperty 'kardamom.aeronEntrypoint', aeronEntrypoint.canonicalPath
     // TestCluster spins up many threads; give the forked worker a single test fork.
     maxParallelForks = 1
+    useJUnitPlatform {
+        excludeTags 'allocation'
+    }
+}
+
+// The allocation gate of the service record path (CarriedPathAllocationTest,
+// tag "allocation") runs in its own JVM with escape analysis off, as the gate
+// of :core does. The normal test task leaves it out.
+def allocationGate = tasks.register('allocationGate', Test) {
+    description = 'Checks the heap bytes per record of the service record path against its baselines.'
+    group = 'verification'
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform {
+        includeTags 'allocation'
+    }
+    forkEvery = 1
+    jvmArgs '-XX:-DoEscapeAnalysis'
+}
+
+tasks.named('check') {
+    dependsOn allocationGate
+}
+
+// The load bench (`just sealer-bench`): real sealer members from the jar,
+// racing twin publishers and a consumer in this JVM. It never runs in CI.
+sourceSets {
+    bench {
+        compileClasspath += sourceSets.main.output + configurations.runtimeClasspath
+        runtimeClasspath += sourceSets.main.output + configurations.runtimeClasspath
+    }
+}
+
+tasks.register('sealerBench', JavaExec) {
+    dependsOn 'shadowJar'
+    classpath = sourceSets.bench.runtimeClasspath
+    mainClass = 'io.kardamom.sealer.bench.SealerLoadBench'
+    jvmArgs(
+        '--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED',
+        '--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED',
+        '-Xmx1g'
+    )
+    systemProperty 'bench.jar', layout.buildDirectory.file('libs/kardamom-cluster-node.jar').get().asFile.path
+    systemProperty 'bench.dir', layout.buildDirectory.dir('sealer-bench').get().asFile.path
+    project.properties.findAll { k, v -> k.startsWith('bench.') }.each { k, v -> systemProperty k, v }
 }
 
 tasks.named('shadowJar') {

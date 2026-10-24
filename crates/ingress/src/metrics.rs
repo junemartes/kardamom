@@ -64,12 +64,27 @@ pub const SEAL_STAMPS_EXPIRED_TOTAL: &str = "kardamom_ingress_seal_stamps_expire
 /// The publish stamps that the submit path dropped because the channel to
 /// the seal clock was full. Each one is a seal with no latency sample.
 pub const SEAL_STAMPS_DROPPED_TOTAL: &str = "kardamom_ingress_seal_stamps_dropped_total";
+/// The time from the publish of a transaction on `tx_data` to the first
+/// executor receipt for it, in seconds. Only the ingress that published
+/// the transaction records it.
+pub const EXECUTE_LATENCY_SECONDS: &str = "kardamom_ingress_execute_latency_seconds";
+/// The publish stamps that no receipt matched within the age bound of the
+/// executed clock. A non-zero rate under load means that the histogram
+/// undercounts the tail.
+pub const EXECUTE_STAMPS_EXPIRED_TOTAL: &str = "kardamom_ingress_execute_stamps_expired_total";
+/// The publish stamps that the submit path dropped because the channel to
+/// the executed clock was full.
+pub const EXECUTE_STAMPS_DROPPED_TOTAL: &str = "kardamom_ingress_execute_stamps_dropped_total";
 /// 0 while the proxy serves, 1 from the first moment of the shutdown
 /// drain. The readiness rule requires 0: a draining replica refuses new
 /// submits, so a health check must take it out of rotation at once. The
 /// gauge is unset before the listeners are up, which also reads as not
 /// ready.
 pub const DRAINING: &str = "kardamom_ingress_draining";
+/// The items that a stream bus dropped because its watcher fell behind,
+/// by `bus`. A dropped receipt or error does not release its waiter, so
+/// that client waits until the pending timeout.
+pub const BUS_LAGGED_TOTAL: &str = "kardamom_ingress_bus_lagged_total";
 
 /// Increments [`TX_REJECTED_TOTAL`] with the given `reason` label. This is
 /// the one place for the submit-path rejection counter, so every rejection
@@ -77,6 +92,13 @@ pub const DRAINING: &str = "kardamom_ingress_draining";
 #[inline]
 pub(crate) fn count_reject(reason: &'static str) {
     metrics::counter!(TX_REJECTED_TOTAL, "reason" => reason).increment(1);
+}
+
+/// Adds `dropped` to [`BUS_LAGGED_TOTAL`] for `bus`. Each read that meets
+/// a gap counts it here.
+#[inline]
+pub(crate) fn count_lagged(bus: &'static str, dropped: u64) {
+    metrics::counter!(BUS_LAGGED_TOTAL, "bus" => bus).increment(dropped);
 }
 
 pub fn describe() {
@@ -115,7 +137,24 @@ pub fn describe() {
         SEAL_STAMPS_EXPIRED_TOTAL,
         "publish stamps that no seal matched within the age bound of the seal clock; the seal latency histogram has no sample for them"
     );
+    metrics::describe_histogram!(
+        EXECUTE_LATENCY_SECONDS,
+        metrics::Unit::Seconds,
+        "time from the tx_data publish to the first executor receipt for the transaction"
+    );
+    metrics::describe_counter!(
+        EXECUTE_STAMPS_DROPPED_TOTAL,
+        "publish stamps dropped because the channel to the executed clock was full; the execute latency histogram has no sample for them"
+    );
+    metrics::describe_counter!(
+        EXECUTE_STAMPS_EXPIRED_TOTAL,
+        "publish stamps that no receipt matched within the age bound of the executed clock; the execute latency histogram has no sample for them"
+    );
     metrics::describe_gauge!(DRAINING, "1 while the shutdown drain refuses new submits");
+    metrics::describe_counter!(
+        BUS_LAGGED_TOTAL,
+        "items that a stream bus dropped because its watcher fell behind, by bus"
+    );
     metrics::describe_gauge!(
         CLUSTER_POSTED_HEAD,
         "the last L2 block posted to L1, from the cluster's status frame"
@@ -230,6 +269,9 @@ mod tests {
             SEAL_LATENCY_SECONDS,
             SEAL_STAMPS_EXPIRED_TOTAL,
             SEAL_STAMPS_DROPPED_TOTAL,
+            EXECUTE_LATENCY_SECONDS,
+            EXECUTE_STAMPS_EXPIRED_TOTAL,
+            EXECUTE_STAMPS_DROPPED_TOTAL,
         ] {
             assert!(
                 name.starts_with("kardamom_ingress_"),

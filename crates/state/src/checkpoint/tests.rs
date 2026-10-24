@@ -13,47 +13,82 @@ fn commit_blocks(env: &StateEnv, addr: Address, upto: u64) {
 
 /// Commit blocks `1..=upto` for `addr`. Each block also writes `slots`
 /// storage slots of `addr`, with keys that differ from block to block.
-fn commit_blocks_with_slots(env: &StateEnv, addr: Address, upto: u64, slots: u64) {
-    let mut handle = StateWriter::spawn(env.clone()).unwrap();
-    for b in 1..=upto {
-        let boundary = BlockBoundary {
-            block_number: b,
-            end_tx_idx: BPosition::from_index(b),
-            l2_timestamp: 1_700_000_000 + b,
-            l1_origin: 0,
-            base_fee: 0,
-            gas_used: 0,
-        };
-        let delta = BlockDelta {
-            block_number: b,
-            accounts: vec![AccountChange {
+pub(crate) fn commit_blocks_with_slots(env: &StateEnv, addr: Address, upto: u64, slots: u64) {
+    let handle = StateWriter::spawn(env.clone()).unwrap();
+    commit_through(handle, (1..=upto).map(|b| block_batch(addr, b, slots)));
+}
+
+/// The batch of block `b` for `addr`. It also writes `slots` storage slots
+/// of `addr`, with keys that differ from block to block.
+pub(crate) fn block_batch(addr: Address, b: u64, slots: u64) -> WriteBatch {
+    let boundary = BlockBoundary {
+        block_number: b,
+        end_tx_idx: BPosition::from_index(b),
+        l2_timestamp: 1_700_000_000 + b,
+        l1_origin: 0,
+        base_fee: 0,
+        gas_used: 0,
+    };
+    let delta = BlockDelta {
+        block_number: b,
+        accounts: vec![AccountChange {
+            address: addr,
+            nonce: b,
+            balance: U256::from(b * 100),
+            code_hash: B256::ZERO,
+        }],
+        storage: (0..slots)
+            .map(|slot| StorageChange {
                 address: addr,
-                nonce: b,
-                balance: U256::from(b * 100),
-                code_hash: B256::ZERO,
-            }],
-            storage: (0..slots)
-                .map(|slot| StorageChange {
-                    address: addr,
-                    key: B256::from(U256::from(b * 1_000_000 + slot)),
-                    value: U256::from(slot + 1),
-                })
-                .collect(),
-            code: Vec::new(),
-            receipts: Vec::new(),
-        };
-        handle
-            .delta_tx
-            .send(WriteBatch::new(boundary, delta))
-            .unwrap();
-    }
-    // Wait for the last block to commit, then shut down.
+                key: B256::from(U256::from(b * 1_000_000 + slot)),
+                value: U256::from(slot + 1),
+            })
+            .collect(),
+        code: Vec::new(),
+        receipts: Vec::new(),
+    };
+    WriteBatch::new(boundary, delta)
+}
+
+/// Send `batches` to the writer of `handle`, wait until the last one
+/// commits, and shut the writer down.
+pub(crate) fn commit_through(
+    mut handle: crate::writer::WriterHandle,
+    batches: impl Iterator<Item = WriteBatch>,
+) {
+    let last = batches.fold(0, |_, batch| {
+        let block = batch.boundary.block_number;
+        handle.delta_tx.send(batch).unwrap();
+        block
+    });
     while let Some(s) = handle.snapshot_rx.recv() {
-        if s.block_number() >= upto {
+        if s.block_number() >= last {
             break;
         }
     }
     handle.shutdown().unwrap();
+}
+
+/// The account of the batches of the block log tests.
+pub(crate) const ADDR: Address = Address::repeat_byte(0x31);
+
+/// Commit `blocks` of [`ADDR`] through a writer that feeds a log thread
+/// in `log_dir`, and wait for both threads to end.
+pub(crate) fn commit_logged(
+    env: &StateEnv,
+    log_dir: &std::path::Path,
+    blocks: std::ops::RangeInclusive<u64>,
+) {
+    let cfg = log_thread::LogConfig {
+        dir: log_dir.to_path_buf(),
+        segment_bytes: NonZeroU64::new(1 << 20).unwrap(),
+        queue: NonZeroUsize::new(64).unwrap(),
+        sync_every: std::time::Duration::from_millis(10),
+    };
+    let (feed, log_thread) = log_thread::BlockLogThread::spawn(env, &cfg).unwrap();
+    let writer = StateWriter::spawn_with_log(env.clone(), feed).unwrap();
+    commit_through(writer, blocks.map(|b| block_batch(ADDR, b, 2)));
+    log_thread.join().unwrap();
 }
 
 /// Every real env is genesis-seeded at startup. Checkpoints inherit
@@ -78,7 +113,7 @@ fn seeded_env_with_blocks(dir: &std::path::Path, addr: Address, upto: u64) -> St
 }
 
 /// Open a fresh tempdir-backed env at `dir`, and seed genesis.
-fn seeded_env(dir: &std::path::Path) -> StateEnv {
+pub(crate) fn seeded_env(dir: &std::path::Path) -> StateEnv {
     let env = StateEnvBuilder::new(dir)
         .durability(Durability::SafeNoSync)
         .open()
@@ -110,7 +145,8 @@ fn checkpoint_restore_roundtrips_state() {
     assert_eq!(latest.block, 5);
 
     // Restore into a fresh dir and confirm the state matches exactly.
-    let restored_block = restore_checkpoint(&latest.path, restore_dir.path(), None).unwrap();
+    let restored_block =
+        restore_checkpoint(&latest.path, restore_dir.path(), None, u64::MAX).unwrap();
     assert_eq!(restored_block, 5);
 
     let snap =
@@ -144,7 +180,7 @@ fn restore_refuses_a_tampered_image() {
     bytes[mid] ^= 0x01;
     std::fs::write(&data, &bytes).unwrap();
 
-    let err = restore_checkpoint(&c.path, dst.path(), None).unwrap_err();
+    let err = restore_checkpoint(&c.path, dst.path(), None, u64::MAX).unwrap_err();
     assert!(
         format!("{err}").contains("CORRUPT"),
         "expected a corruption refusal, got: {err}"
@@ -170,7 +206,7 @@ fn restore_refuses_a_foreign_chain() {
     // Same bytes, but this node belongs to a different chain.
     let theirs = B256::repeat_byte(0xAB);
     assert_ne!(ours, theirs);
-    let err = restore_checkpoint(&c.path, dst.path(), Some(theirs)).unwrap_err();
+    let err = restore_checkpoint(&c.path, dst.path(), Some(theirs), u64::MAX).unwrap_err();
     assert!(
         format!("{err}").contains("DIFFERENT CHAIN"),
         "expected a chain-identity refusal, got: {err}"
@@ -178,7 +214,7 @@ fn restore_refuses_a_foreign_chain() {
     assert!(!has_state_db(dst.path()).unwrap());
 
     // Our own chain still restores.
-    restore_checkpoint(&c.path, dst.path(), Some(ours)).expect("same chain must restore");
+    restore_checkpoint(&c.path, dst.path(), Some(ours), u64::MAX).expect("same chain must restore");
 }
 
 /// An image with no manifest at all is unverifiable and must be
@@ -194,7 +230,7 @@ fn restore_refuses_an_unmanifested_image() {
     drop(env);
 
     std::fs::remove_file(manifest_path(&c.path)).unwrap();
-    let err = restore_checkpoint(&c.path, dst.path(), None).unwrap_err();
+    let err = restore_checkpoint(&c.path, dst.path(), None, u64::MAX).unwrap_err();
     assert!(
         format!("{err}").contains("manifest"),
         "expected an unverifiable-image refusal, got: {err}"
@@ -472,7 +508,7 @@ fn restore_refuses_to_clobber_populated_dir() {
     let c = create_checkpoint(&env, ckpt_dir.path()).unwrap();
 
     // Restoring over the live, populated source directory must be refused.
-    let err = restore_checkpoint(&c.path, src_dir.path(), None).unwrap_err();
+    let err = restore_checkpoint(&c.path, src_dir.path(), None, u64::MAX).unwrap_err();
     assert!(matches!(err, StateError::Recovery(_)));
 }
 
@@ -538,7 +574,7 @@ fn restore_skips_a_checkpoint_of_another_schema() {
     manifest.schema_version = ImageSchema::of(crate::meta::SCHEMA_VERSION + 1);
     std::fs::write(manifest_path(&later.path), manifest.encode()).unwrap();
 
-    let err = restore_checkpoint(&later.path, dst.path(), None).unwrap_err();
+    let err = restore_checkpoint(&later.path, dst.path(), None, u64::MAX).unwrap_err();
     assert!(
         matches!(err, StateError::UnreadableCheckpointSchema { schema, .. } if schema == crate::meta::SCHEMA_VERSION + 1),
         "{err}"
@@ -655,7 +691,10 @@ fn create_cuts_the_image_to_its_used_pages() {
     );
     assert_eq!(len % (64 * 1024), 0, "the cut length is 64 KiB aligned");
     assert_eq!(table_rows(&in_place), table_rows(&env));
-    assert_eq!(restore_checkpoint(&c.path, dst.path(), None).unwrap(), 4);
+    assert_eq!(
+        restore_checkpoint(&c.path, dst.path(), None, u64::MAX).unwrap(),
+        4
+    );
 }
 
 /// An image that is longer than its used pages still verifies and
@@ -684,5 +723,8 @@ fn restore_reads_an_image_with_a_trailing_hole() {
     };
     std::fs::write(manifest_path(&c.path), manifest.encode()).unwrap();
 
-    assert_eq!(restore_checkpoint(&c.path, dst.path(), None).unwrap(), 2);
+    assert_eq!(
+        restore_checkpoint(&c.path, dst.path(), None, u64::MAX).unwrap(),
+        2
+    );
 }

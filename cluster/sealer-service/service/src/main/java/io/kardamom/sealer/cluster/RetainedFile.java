@@ -18,6 +18,7 @@ import java.util.TreeMap;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.agrona.DirectBuffer;
+import org.agrona.MutableDirectBuffer;
 import org.agrona.IoUtil;
 import org.agrona.concurrent.AgentTerminationException;
 import org.agrona.concurrent.UnsafeBuffer;
@@ -159,7 +160,7 @@ final class RetainedFile implements RetainedFrames {
     }
 
     @Override
-    public byte[] append(final DirectBuffer staged, final int length) {
+    public void append(final DirectBuffer staged, final int length) {
         final int recordBytes = LENGTH_PREFIX + length;
         final Segment segment = Optional.ofNullable(segments.lastEntry())
             .map(Map.Entry::getValue)
@@ -171,9 +172,6 @@ final class RetainedFile implements RetainedFrames {
         headPos = Math.addExact(headPos, recordBytes);
         count = Math.addExact(count, 1);
         markBoundary(staged);
-        final byte[] frame = new byte[length];
-        staged.getBytes(0, frame);
-        return frame;
     }
 
     /** Index the frame in {@code staged} when it is a boundary. */
@@ -232,13 +230,23 @@ final class RetainedFile implements RetainedFrames {
     }
 
     @Override
-    public FrameKey front() {
-        return keyAt(frontPos);
+    public boolean carriesBytes() {
+        return true;
+    }
+
+    @Override
+    public boolean frontIsBoundary() {
+        return keyAt(frontPos).boundary();
+    }
+
+    @Override
+    public long frontKey() {
+        return keyAt(frontPos).key();
     }
 
     @Override
     public void evictFront() {
-        final FrameKey key = front();
+        final FrameKey key = keyAt(frontPos);
         if (key.boundary()) {
             boundaries.remove(key.key());
         }
@@ -482,6 +490,11 @@ final class RetainedFile implements RetainedFrames {
     @Override
     public byte[] forSession(final byte[] frame) {
         return EgressFrames.forSession(frame);
+    }
+
+    @Override
+    public int forSession(final MutableDirectBuffer staged, final int length) {
+        return EgressFrames.forSession(staged, length);
     }
 
     /** Stop the helper and wait for it. The mappings stay until the collector frees them, so no late read can fault. */

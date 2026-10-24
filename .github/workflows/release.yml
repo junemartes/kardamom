@@ -119,6 +119,7 @@ jobs:
             -p kardamom-state-mirror -p kardamom-l1-indexer -p kardamom-notifier \
             -p kardamom-canary \
             -p kardamom-l1-fault-proxy \
+            -p kardamom-egress \
             --bins
           # The settlement-contract deployer. A first deployment to an L1
           # with no settlement contract runs it on the deploy host.

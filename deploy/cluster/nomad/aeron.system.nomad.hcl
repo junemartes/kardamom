@@ -121,6 +121,25 @@ variable "archive_file_sync_level" {
   }
 }
 
+# The threading mode of the media driver of each node (-Daeron.threading.mode,
+# which the image entrypoint reads from AERON_THREADING_MODE). SHARED runs
+# the conductor, the sender and the receiver on one thread. SHARED_NETWORK
+# runs the sender and the receiver on one thread and the conductor on its
+# own. DEDICATED runs each on its own thread. SHARED costs the least CPU,
+# but at a high message rate its one thread saturates, and every stream of
+# the node waits behind it. Ansible deployment passes -var from
+# KARDAMOM_AERON_THREADING_MODE.
+variable "aeron_threading_mode" {
+  type        = string
+  description = "The threading mode of the media driver: SHARED, SHARED_NETWORK or DEDICATED."
+  default     = "SHARED"
+
+  validation {
+    condition     = contains(["SHARED", "SHARED_NETWORK", "DEDICATED"], var.aeron_threading_mode)
+    error_message = "The aeron_threading_mode value must be SHARED, SHARED_NETWORK or DEDICATED."
+  }
+}
+
 job "aeron" {
   datacenters = [var.datacenter]
   type        = "system"
@@ -231,6 +250,7 @@ job "aeron" {
         AERON_ARCHIVE_CONTROL_RESPONSE_PORT = "${NOMAD_HOST_PORT_archive_control_response}"
         AERON_ARCHIVE_REPLICATION_PORT      = "${NOMAD_HOST_PORT_archive_replication}"
         AERON_TERM_BUFFER_LENGTH            = "4194304"
+        AERON_THREADING_MODE                = var.aeron_threading_mode
         AERON_IPC_TERM_BUFFER_LENGTH        = "4194304"
         # The longest park of the driver and archive agents
         # (CappedBackoffIdleStrategy in the image).

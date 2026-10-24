@@ -14,7 +14,7 @@ use crate::addresses::{
 };
 use crate::embedded;
 use crate::ids::ContractId;
-use crate::spec::{DeploymentSpec, Op, build_spec};
+use crate::spec::{DeploymentSpec, Op};
 
 // ---------------------------------------------------------------------------
 // Sol! bindings for the kardamom factory
@@ -30,6 +30,14 @@ sol!(
     )
 );
 
+sol! {
+    /// The upgrade authority view of `KardamomUUPSBase`.
+    #[sol(rpc)]
+    interface IKardamomUUPS {
+        function factory() external view returns (address);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -44,6 +52,12 @@ pub enum DeployError {
     FactoryNotDeployed(Address),
     #[error("transaction reverted")]
     Reverted,
+    #[error("proxy {proxy} names factory {actual}, not the deployer factory {expected}")]
+    FactoryMismatch {
+        proxy: Address,
+        expected: Address,
+        actual: Address,
+    },
     #[error("provider error: {0}")]
     Provider(String),
 }
@@ -149,7 +163,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         init_args: &Bytes,
     ) -> Address {
         let factory = self.factory_address();
-        let impl_initcode = id.creation_bytecode();
+        let impl_initcode = id.initcode(factory);
         let impl_addr = app_impl_address(factory, id.impl_salt(1), &impl_initcode);
         let init_data = crate::spec::encode_init_calldata(id, init_args);
         app_proxy_address(
@@ -228,9 +242,13 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     /// computed offline, through `target_impl`. So an upgrade of the same
     /// new impl across N L2s deploys the impl once, not N times.
     ///
+    /// After the transaction, it reads `factory()` from the proxy of each
+    /// op. Each proxy must name the factory of this deployer.
+    ///
     /// # Errors
-    /// Returns an error when the factory is not deployed, or the
-    /// `applyDeployments` transaction fails.
+    /// Returns an error when the factory is not deployed, the
+    /// `applyDeployments` transaction fails, or a proxy names a different
+    /// factory.
     pub async fn apply(&self, ops: &[Op], operator: Address) -> Result<TxHash, DeployError> {
         let factory_proxy = self.factory_address();
 
@@ -240,7 +258,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         }
 
         // Build raw specs, each with target_impl = zero. Then run the dedup pass.
-        let mut specs: Vec<DeploymentSpec> = ops.iter().map(build_spec).collect();
+        let mut specs: Vec<DeploymentSpec> = ops.iter().map(|op| op.spec(factory_proxy)).collect();
         dedup_impl_specs(factory_proxy, &mut specs);
 
         // Encode and send.
@@ -255,7 +273,32 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
             .with_input(Bytes::from(calldata));
 
         let receipt = self.send_and_confirm(tx).await?;
+        for op in ops {
+            self.check_proxy_factory(op, factory_proxy).await?;
+        }
         Ok(receipt.transaction_hash())
+    }
+
+    /// Read `factory()` from the registered proxy of `op`. Fail with
+    /// [`DeployError::FactoryMismatch`] when it is not `expected`.
+    async fn check_proxy_factory(&self, op: &Op, expected: Address) -> Result<(), DeployError> {
+        let entry = self
+            .factory()
+            .entry(U256::from(op.l2_chain_id()), op.id().id())
+            .call()
+            .await?;
+        let actual = IKardamomUUPS::new(entry.proxy, &self.provider)
+            .factory()
+            .call()
+            .await?;
+        if actual != expected {
+            return Err(DeployError::FactoryMismatch {
+                proxy: entry.proxy,
+                expected,
+                actual,
+            });
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -398,13 +441,19 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
 
     /// Send `tx` and wait for its receipt. Fail with [`DeployError::Reverted`]
     /// if the transaction does not succeed.
+    ///
+    /// The gas limit comes from `eth_estimateGas`. A provider without a gas
+    /// filler otherwise lets the node pick the limit, and anvil picks a
+    /// limit that is too low for an upgrade batch. A transaction that
+    /// reverts fails at the estimate with [`DeployError::Provider`].
     async fn send_and_confirm(
         &self,
         tx: TransactionRequest,
     ) -> Result<TransactionReceipt, DeployError> {
+        let gas = self.provider.estimate_gas(tx.clone()).await?;
         let receipt = self
             .provider
-            .send_transaction(tx)
+            .send_transaction(tx.with_gas_limit(gas))
             .await?
             .get_receipt()
             .await?;

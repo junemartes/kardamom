@@ -1,0 +1,46 @@
+[package]
+name = "kardamom-egress"
+version = { workspace = true }
+edition = { workspace = true }
+license = "MIT"
+publish = false
+
+# The egress: one canonical stream from the frames of every executor,
+# kept on disk and served to the readers after the executors. See
+# docs/specs/2026-10-21-one-way-pipeline.md.
+
+[lib]
+name = "kardamom_egress"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kardamom-egress"
+path = "src/main.rs"
+
+[dependencies]
+kardamom-cluster-adapter = { path = "../cluster-adapter" }
+alloy-primitives = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+kardamom-log = { workspace = true }
+kardamom-obs = { path = "../obs" }
+kardamom-types = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+rkyv = { workspace = true }
+bytes = { workspace = true }
+crossbeam-channel = "0.5"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+metrics = { workspace = true }
+# The range read of a peer egress after a start.
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "net", "rt", "rt-multi-thread", "time", "macros", "signal"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+kardamom-cache = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }

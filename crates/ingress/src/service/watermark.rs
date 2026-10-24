@@ -6,10 +6,11 @@
 
 use std::ops::ControlFlow;
 
+use crate::cluster::{ClusterWatermarkObserver, EgressProgress, Observed};
+use crate::stage_latency::StageClock;
 use kardamom_cluster_adapter::{LiveCluster, LiveEgress};
-use kardamom_ingress::cluster::{ClusterWatermarkObserver, EgressProgress, Observed};
-use kardamom_ingress::seal_latency::SealClock;
 use kardamom_log::aeron_live::TxStatusPublisherHandle;
+use kardamom_obs::pipeline::{LoopMeter, LoopState};
 use kardamom_types::{ClusterStatus, QuorumWatermark, TxStatus};
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -22,11 +23,14 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 /// here. The status publish is fire-and-forget on the Aeron thread.
 pub(crate) struct ClusterWatermarkPump {
     observer: ClusterWatermarkObserver<LiveEgress>,
-    seal_clock: SealClock,
+    seal_clock: StageClock,
     tx: broadcast::Sender<QuorumWatermark>,
     cluster_status: watch::Sender<ClusterStatus>,
     status: TxStatusPublisherHandle,
     stop: CancellationToken,
+    /// Idle while the thread waits for an egress event (the receive and
+    /// the decode), busy while it handles one.
+    meter: LoopMeter,
 }
 
 /// A running watermark thread: the guard that cancels its stop token,
@@ -50,7 +54,7 @@ pub(crate) struct ClusterWatermark {
 impl ClusterWatermarkPump {
     pub(crate) fn new(
         observer: ClusterWatermarkObserver<LiveEgress>,
-        seal_clock: SealClock,
+        seal_clock: StageClock,
         tx: broadcast::Sender<QuorumWatermark>,
         cluster_status: watch::Sender<ClusterStatus>,
         status: TxStatusPublisherHandle,
@@ -62,6 +66,7 @@ impl ClusterWatermarkPump {
             cluster_status,
             status,
             stop: CancellationToken::new(),
+            meter: LoopMeter::new("ingress.watermark"),
         }
     }
 
@@ -96,13 +101,16 @@ impl ClusterWatermarkPump {
         if self.stop.is_cancelled() {
             return ControlFlow::Break(());
         }
-        match self.observer.next_event() {
+        let event = self.observer.next_event();
+        self.meter.mark(LoopState::Idle);
+        match event {
             None => return ControlFlow::Break(()),
             Some(Observed::Progress(progress)) => self.forward_progress(progress),
             Some(Observed::Status(status)) => {
                 self.cluster_status.send_replace(status);
             }
         }
+        self.meter.mark(LoopState::Busy);
         ControlFlow::Continue(())
     }
 
@@ -113,7 +121,7 @@ impl ClusterWatermarkPump {
             let _ = self.tx.send(QuorumWatermark { position });
         }
         if let Some(tx_hash) = progress.sealed {
-            self.seal_clock.sealed(tx_hash);
+            self.seal_clock.observe(tx_hash);
             self.publish_sealed(tx_hash);
         }
     }

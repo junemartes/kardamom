@@ -7,10 +7,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::B256;
+use futures::StreamExt;
 use jsonrpsee::http_client::HttpClient;
 
 use super::{Tracker, receipt_status};
 use crate::load::tracker::ReceiptStatus;
+
+/// The receipt reads of one sweep that run at the same time. A sweep
+/// after a halt can hold hundreds of thousands of entries. The drain
+/// reads the deadline only between sweeps, so one read at a time
+/// overruns the deadline by the whole sweep.
+const SWEEP_CONCURRENCY: usize = 64;
 
 /// Join one queued task, or time out at `deadline`. Returns
 /// [`ControlFlow::Break`] once the deadline hits with tasks still
@@ -79,16 +86,18 @@ impl Drainer {
 
     /// Sweep once over outstanding, un-confirmed transactions at least
     /// `min_age` old. Re-fetch each receipt, and settle the entry if
-    /// found. Returns how many entries stayed pending after the sweep.
-    /// This confirms an entry only if it removed the entry itself: the
-    /// live feed keeps confirming entries at the same time, and a
+    /// found. Up to [`SWEEP_CONCURRENCY`] reads run at a time. Returns
+    /// how many entries stayed pending after the sweep. This confirms
+    /// an entry only if it removed the entry itself: the live feed
+    /// keeps confirming entries at the same time, and a
     /// transaction it settled between this poll and this removal must
     /// not count twice.
     async fn sweep_pending_once(&self, min_age: Duration) -> usize {
-        let pending = self.tracker.pending_older_than(min_age);
-        for (hash, submit_ts) in pending {
-            self.settle_if_still_pending(hash, submit_ts).await;
-        }
+        futures::stream::iter(self.tracker.pending_older_than(min_age))
+            .for_each_concurrent(SWEEP_CONCURRENCY, |(hash, submit_ts)| {
+                self.settle_if_still_pending(hash, submit_ts)
+            })
+            .await;
         self.tracker.pending_len()
     }
 

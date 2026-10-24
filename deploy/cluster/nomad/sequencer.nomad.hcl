@@ -71,6 +71,19 @@ variable "priority_fees" {
     error_message = "The priority_fees value must be on or off."
   }
 }
+# The receipts from the egress, "on" or "off" (receipts_from_egress in
+# the config). On, the sequencer reads the receipts and their account rows
+# from egress_receipts, each once, in place of the tx_receipts stream of
+# every executor. Ansible deployment passes -var from
+# KARDAMOM_SEQUENCER_RECEIPTS_FROM_EGRESS.
+variable "receipts_from_egress" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.receipts_from_egress)
+    error_message = "The receipts_from_egress value must be on or off."
+  }
+}
 variable "metrics_base" {
   type    = number
   default = 9001
@@ -125,13 +138,14 @@ locals {
 }
 
 job "sequencer" {
-  # The sequencer of this release sends the feature activation (ingress
-  # kind 11) in front of the epoch of an upgrade transaction, and moves the
-  # nonce floor past a skip that used its nonce. The upgrade check
-  # (`just sealer-upgrade-check <env>`) reads these metas.
+  # The sequencer of this release moves the nonce floor past a skip that
+  # used its nonce (nonce_burn). It sends the activation record of
+  # FEATURE_SEALER_V4 in front of its epoch, and the stream position of
+  # each reference to a sealer on decision version 4 (sealer_v4). The
+  # upgrade check (`just sealer-upgrade-check`) reads these metas.
   meta {
-    sealer_feature_activation = "true"
-    nonce_burn                = "true"
+    nonce_burn = "true"
+    sealer_v4  = "true"
   }
 
   datacenters = [var.datacenter]
@@ -251,9 +265,14 @@ job "sequencer" {
             change_mode = "noop"
           }
 
+          # The switch goes in front of the file: a top-level key after
+          # the first table of the file would belong to that table.
           template {
             destination = "local/sequencer.toml"
-            data        = file("config/sequencer.toml.tpl")
+            data = join("\n", concat(
+              var.receipts_from_egress == "on" ? ["receipts_from_egress = true"] : [],
+              [file("config/sequencer.toml.tpl")],
+            ))
           }
 
           resources {

@@ -21,6 +21,10 @@ use crate::error::SequencerError;
 pub struct Inbound {
     pub lane: u8,
     pub loc: TxDataLoc,
+    /// The stream position of the envelope in its `tx_data` image. Racing
+    /// sequencers read the same image, so a sealer on decision version 4
+    /// names one message by its lane, session and this position.
+    pub stream_position: u64,
     pub envelope: TxEnvelope,
 }
 
@@ -48,6 +52,9 @@ pub trait TxDataSubscriber: Send {
     /// Returns [`SequencerError::IngressDisconnected`] when the
     /// subscription is permanently closed.
     fn poll(&mut self) -> Result<Option<Inbound>, SequencerError>;
+
+    /// The envelopes that wait to be polled, for a queue-depth gauge.
+    fn queued(&self) -> usize;
 }
 
 // ===========================================================================
@@ -77,11 +84,18 @@ pub mod fakes {
             if self.disconnected {
                 return Err(SequencerError::IngressDisconnected);
             }
+            // The fake's stream position: the locator's position as one
+            // index, which grows with the script like a real position.
             Ok(self.queue.pop_front().map(|(loc, envelope)| Inbound {
                 lane: self.lane,
                 loc,
+                stream_position: loc.position.as_index(),
                 envelope,
             }))
+        }
+
+        fn queued(&self) -> usize {
+            self.queue.len()
         }
     }
 }

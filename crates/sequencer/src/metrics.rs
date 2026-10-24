@@ -25,6 +25,11 @@ pub(crate) const FEE_REJECTED: &str = "kardamom_sequencer_fee_rejected_total";
 pub(crate) const NONCE_LOOKUP_REQUESTS: &str = "kardamom_sequencer_nonce_lookup_requests_total";
 pub(crate) const NONCE_LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
 pub(crate) const NONCE_LOOKUPS_IN_FLIGHT: &str = "kardamom_sequencer_nonce_lookups_in_flight";
+/// The receipts that the v2 loop matched to the ingress that published
+/// their transactions, by `outcome`: `sent` to the verdict task, `full`
+/// when its queue had no room, `closed` when the task is gone, and `wide`
+/// when the ingress id does not fit a verdict stream id (above 255).
+pub(crate) const VERDICTS: &str = "kardamom_sequencer_verdicts_total";
 /// Envelopes dropped by the wrong-shard guard: their vslot is not in this
 /// replica's set. During a resize, a new shard reads the old lanes whole,
 /// so this counts the other shards' traffic. It is not an error.
@@ -64,11 +69,6 @@ pub(crate) const RECEIPT_FLOORS_FORGOTTEN: &str =
 /// The decision version that the sealer reported for the current session,
 /// 0 before its report.
 pub(crate) const SEALER_VERSION: &str = "kardamom_sequencer_sealer_version";
-/// The feature activations that this replica sent and for which the
-/// sealer reported no decision version 3 within 60 s of the activation
-/// time: a member of the sealer did not switch its rules. Alert on any
-/// increase.
-pub(crate) const SEALER_RULES_MISSING: &str = "kardamom_sequencer_sealer_rules_missing_total";
 /// Contiguity rejects whose expected nonce stays above the chain nonce
 /// plus the refs in flight for the settle time: the sealer's nonce guard
 /// is ahead of the chain after a skip that used no nonce. While
@@ -200,6 +200,11 @@ pub fn record_nonce_lookup(partition: u32, outcome: &'static str) {
         .increment(1);
 }
 
+pub(crate) fn record_verdicts(partition: u32, outcome: &'static str, n: usize) {
+    counter!(VERDICTS, "partition" => partition.to_string(), "outcome" => outcome)
+        .increment(u64::try_from(n).unwrap_or(u64::MAX));
+}
+
 pub fn record_nonce_lookups_in_flight(partition: u32, n: usize) {
     set(NONCE_LOOKUPS_IN_FLIGHT, partition, gauge_value(n));
 }
@@ -254,10 +259,6 @@ pub(crate) fn record_floor_forgotten(partition: u32) {
 
 pub(crate) fn record_sealer_version(partition: u32, version: u8) {
     set(SEALER_VERSION, partition, f64::from(version));
-}
-
-pub(crate) fn record_sealer_rules_missing(partition: u32) {
-    bump(SEALER_RULES_MISSING, partition, 1);
 }
 
 pub(crate) fn record_sealer_nonce_ahead(partition: u32) {

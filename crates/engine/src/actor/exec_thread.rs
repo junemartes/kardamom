@@ -12,6 +12,8 @@
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use kardamom_obs::pipeline::LoopState;
+
 use crate::error::ExecutorError;
 use crate::reader::ReaderToExec;
 
@@ -80,15 +82,20 @@ impl<W: ExecPorts> ExecState<W> {
     /// the idle probe or the matching `on_*` handler. [`Self::run`] stays
     /// a plain loop over this.
     fn recv_and_dispatch(&mut self) -> Result<Flow, ExecutorError> {
-        let msg = match self.recv_next() {
-            Recv::Msg(m) => m,
+        let received = self.recv_next();
+        let pipeline = &mut self.metrics.pipeline;
+        pipeline.meter.mark(LoopState::Idle);
+        pipeline.reader_to_exec.set(self.io.rx.len());
+        let flow = match received {
+            Recv::Msg(m) => self.dispatch(m),
             Recv::Closed => {
                 self.on_closed();
                 return Ok(Flow::Stop);
             }
-            Recv::IdleProbe => return self.on_idle_probe(),
+            Recv::IdleProbe => self.on_idle_probe(),
         };
-        self.dispatch(msg)
+        self.metrics.pipeline.meter.mark(LoopState::Busy);
+        flow
     }
 
     /// Dispatch one canonical-stream message to its handler.

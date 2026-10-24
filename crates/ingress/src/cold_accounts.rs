@@ -26,12 +26,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
-use crossbeam_queue::ArrayQueue;
-use dashmap::DashMap;
 use kardamom_cache::{
     AccountView, ExecutorQuery, ExecutorQueryConfig, LiveAccounts, QueryAnswer,
     metrics as cache_metrics,
 };
+
+use crate::recent::RecentMap;
 
 /// The bound on cold senders the map holds.
 const CAPACITY: NonZeroUsize = NonZeroUsize::new(64 * 1024).unwrap();
@@ -74,8 +74,7 @@ pub(crate) struct ColdAccounts {
     query: Option<ExecutorQuery>,
     live: Arc<LiveAccounts>,
     max_stale: u64,
-    map: DashMap<Address, (Slot, Instant)>,
-    order: ArrayQueue<Address>,
+    map: RecentMap<Address, (Slot, Instant)>,
 }
 
 impl ColdAccounts {
@@ -94,8 +93,7 @@ impl ColdAccounts {
             query,
             live,
             max_stale: max_stale.get(),
-            map: DashMap::new(),
-            order: ArrayQueue::new(CAPACITY.get()),
+            map: RecentMap::new(CAPACITY),
         }
     }
 
@@ -159,9 +157,8 @@ impl ColdAccounts {
 
     /// The slot of `address`, when it is within its TTL.
     fn get(&self, address: Address) -> Option<Slot> {
-        let entry = self.map.get(&address)?;
-        let (slot, at) = entry.value();
-        (at.elapsed() <= slot.ttl()).then(|| slot.clone())
+        let (slot, at) = self.map.get(&address)?;
+        (at.elapsed() <= slot.ttl()).then_some(slot)
     }
 
     /// Forget every answer. After a rollback, an answer can hold the state
@@ -169,7 +166,6 @@ impl ColdAccounts {
     /// asks again.
     pub(crate) fn clear(&self) {
         self.map.clear();
-        std::iter::from_fn(|| self.order.pop()).for_each(drop);
     }
 
     /// Keep the slot of `address`. A full ring retires the oldest
@@ -177,9 +173,6 @@ impl ColdAccounts {
     /// newer slot too, which costs one more query and nothing else.
     fn insert(&self, address: Address, slot: Slot) {
         self.map.insert(address, (slot, Instant::now()));
-        if let Some(oldest) = self.order.force_push(address) {
-            self.map.remove(&oldest);
-        }
     }
 }
 
@@ -242,7 +235,7 @@ mod tests {
         cold.insert(address, Slot::Known(view(5)));
         cold.clear();
         assert!(cold.get(address).is_none());
-        assert!(cold.order.is_empty());
+        assert_eq!(cold.map.ring_len(), 0);
     }
 
     /// An answer with no position header, an answer before the first

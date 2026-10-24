@@ -18,6 +18,7 @@
 //! outside the cluster. (This closes the `docs/failure-modes.md`
 //! "divergence injection" gap.)
 
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use alloy_primitives::Address;
@@ -123,37 +124,33 @@ pub async fn corrupt_bal_halts_validator(stack: &mut LocalStack, t: &Target) -> 
 pub async fn forged_epoch_halts_validator(stack: &mut LocalStack, t: &Target) -> Result<()> {
     super::assert_validator_warm(t, "injection").await?;
     let l1 = stack.l1().context("S11 needs an L1 (l1: true)")?;
+    let state_dir = stack
+        .executor_state_dir()
+        .context("S11 reads the chain's origin from the executor's state")?;
+    // The origin must not be read before the first epoch lands. Otherwise
+    // origin 0 holds still while the first honest epoch is still on its way
+    // to the sealer, the forgery names L1 block 1, and the sealer refuses
+    // it behind the honest epoch.
+    first_epoch_landed(&state_dir).await?;
 
-    // Freeze the honest producer, so its epoch for this L1 block cannot race
-    // the forgery. Then forge the next origin after the one the chain holds:
-    // the sealer accepts only the epoch of `l1_origin + 1`, and refuses any
-    // other as an origin gap.
+    // Freeze the honest producer, so no new honest epoch can race the
+    // forgery. An epoch that the producer published before the freeze can
+    // still be on its way to the sealer, and take the slot of the forgery:
+    // the sealer accepts only the epoch of `l1_origin + 1`. The drill then
+    // forges the next slot. The frozen producer sends no more, so the
+    // forgery wins within a few attempts.
     anyhow::ensure!(
         stack.suspend_da_watcher(),
         "S11 needs a DA watcher (l1: true)"
     );
-    let state_dir = stack
-        .executor_state_dir()
-        .context("S11 reads the chain's origin from the executor's state")?;
-    let forged_at = settled_origin(&state_dir)
-        .await?
-        .checked_add(1)
-        .context("the chain's L1 origin is implausibly close to u64::MAX")?;
-    crate::harness::inject::publish_forged_epoch(&stack.aeron_dir(), forged_at).await?;
-
-    // The verdict is deferred by one epoch on purpose, because the L1 read
-    // runs off the exec thread. Keep honest epochs coming to carry it
-    // through.
-    l1.mine(12).await?;
-
-    // The halt record names the divergence cause. The validator stays up
-    // and serves it, so a scrape never races an exit.
-    t.wait_validator_halted(
-        Duration::from_mins(1),
-        "validator halted on the forged epoch",
-    )
-    .await
-    .context("validator must reject an epoch L1 never produced")?;
+    let drill = ForgeDrill {
+        aeron_dir: stack.aeron_dir(),
+        state_dir,
+    };
+    anyhow::ensure!(
+        drill.run(t, l1).await?,
+        "validator must reject an epoch L1 never produced"
+    );
 
     // It must also have halted on an epoch fault specifically. A
     // divergence from some unrelated check would pass the line above,
@@ -166,6 +163,76 @@ pub async fn forged_epoch_halts_validator(stack: &mut LocalStack, t: &Target) ->
         "validator halted but not on an epoch fault — halted for another reason"
     );
     Ok(())
+}
+
+/// The forgeries that S11 tries before it fails.
+const FORGE_ATTEMPTS: usize = 4;
+
+/// The forged-epoch drill of S11 over one stack.
+struct ForgeDrill {
+    aeron_dir: std::path::PathBuf,
+    state_dir: std::path::PathBuf,
+}
+
+impl ForgeDrill {
+    /// Forge until the validator halts. Returns false after
+    /// [`FORGE_ATTEMPTS`] forgeries with no halt.
+    async fn run(&self, t: &Target, l1: &crate::harness::l1::L1) -> Result<bool> {
+        for _ in 0..FORGE_ATTEMPTS {
+            if self.attempt(t, l1).await?.is_break() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Forge the epoch of the next L1 origin, and wait for the halt.
+    /// `Break` when the validator halted; `Continue` when an honest epoch
+    /// took the slot first.
+    async fn attempt(&self, t: &Target, l1: &crate::harness::l1::L1) -> Result<ControlFlow<()>> {
+        let forged_at = settled_origin(&self.state_dir)
+            .await?
+            .checked_add(1)
+            .context("the chain's L1 origin is implausibly close to u64::MAX")?;
+        crate::harness::inject::publish_forged_epoch(&self.aeron_dir, forged_at).await?;
+        // The verdict is deferred by one epoch on purpose, because the L1
+        // read runs off the exec thread. Mined blocks finalize the forged
+        // block for that read.
+        l1.mine(12).await?;
+        // The halt record names the divergence cause. The validator stays
+        // up and serves it, so a scrape never races an exit.
+        let halted = t
+            .wait_validator_halted(
+                Duration::from_secs(30),
+                "validator halted on the forged epoch",
+            )
+            .await;
+        Ok(if halted.is_ok() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        })
+    }
+}
+
+/// Wait until a block of the chain has an L1 origin: the first epoch landed.
+///
+/// # Errors
+/// Returns an error when the headers cannot be read, or when no epoch lands
+/// within 60 seconds.
+async fn first_epoch_landed(state_dir: &std::path::Path) -> Result<()> {
+    poll_until(
+        "the chain holds its first epoch",
+        Duration::from_mins(1),
+        Duration::from_millis(500),
+        async || {
+            let landed = super::derivation::read_block_origins(state_dir)?
+                .last()
+                .is_some_and(|b| b.l1_origin > 0);
+            Ok(landed.then_some(()))
+        },
+    )
+    .await
 }
 
 /// The chain's L1 origin once it holds still for two reads, two seconds

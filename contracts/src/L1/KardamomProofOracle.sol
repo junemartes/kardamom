@@ -129,7 +129,7 @@ contract KardamomProofOracle is KardamomUUPSBase {
     error NothingToWithdraw();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() {
+    constructor(address factory_) KardamomUUPSBase(factory_) {
         _disableInitializers();
     }
 

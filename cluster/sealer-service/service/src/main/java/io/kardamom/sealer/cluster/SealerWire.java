@@ -190,15 +190,13 @@ public final class SealerWire {
     static final int RECORDED_CURSOR_LEN = RECORDED_THROUGH_OFFSET + Long.BYTES;
 
     /**
-     * Feature activation, a sequencer's system record:
+     * Feature activation, a system record:
      * {@code [kind:11][l1_origin:u64 LE][feature_id:u64 LE][activation_ms:u64 LE]}
      * ({@link #FEATURE_ACTIVATION_LEN} bytes). The upgrade transaction of the
      * epoch at {@code l1_origin} schedules {@code feature_id} at
-     * {@code activation_ms}. The sequencer sends it in front of that epoch,
-     * on the same session, and again each time it offers the epoch again.
-     * See {@link io.kardamom.sealer.DecisionRules}. A member that does not
-     * know the kind drops the frame. Matches Rust
-     * {@code KIND_FEATURE_ACTIVATION}.
+     * {@code activation_ms}. A member follows no feature: it takes the
+     * record and changes no state. A member that does not know the kind
+     * drops the frame. Matches Rust {@code KIND_FEATURE_ACTIVATION}.
      */
     public static final byte KIND_FEATURE_ACTIVATION = 11;
     /** Offset of the u64 LE L1 origin within a {@link #KIND_FEATURE_ACTIVATION} frame. */
@@ -239,6 +237,62 @@ public final class SealerWire {
      * Rust {@code RT_TX}.
      */
     public static final byte RT_TX = io.kardamom.sealer.TxOffer.RT_TX;
+
+    /**
+     * Record type of a transaction reference:
+     * {@code [lane:u8][term_id:i32][term_offset:i32][session_id:i32]}, the
+     * place of the transaction in an ingress image of {@code tx_data}.
+     * Matches Rust {@code RT_TXREF}.
+     */
+    public static final byte RT_TXREF = 0;
+
+    /** The offset of the record type in a kind-0 frame. */
+    static final int RECORD_TYPE_OFFSET = CANONICAL_ID_OFFSET + CanonicalSealerState.CANONICAL_ID_LEN;
+
+    /** The offset of the lane in a kind-0 frame of a transaction reference. */
+    static final int REF_LANE_OFFSET = RECORD_TYPE_OFFSET + Byte.BYTES;
+
+    /** The offset of the session id in a kind-0 frame of a transaction reference. */
+    static final int REF_SESSION_OFFSET = REF_LANE_OFFSET + Byte.BYTES + Integer.BYTES + Integer.BYTES;
+
+    /** The length of a kind-0 frame of a transaction reference. */
+    static final int TXREF_RECORD_LEN = REF_SESSION_OFFSET + Integer.BYTES;
+
+    /** The length of the relayed payload of a transaction reference: the id, the record type and the fields. */
+    static final int TXREF_PAYLOAD_LEN = TXREF_RECORD_LEN - CANONICAL_ID_OFFSET;
+
+    /**
+     * Record type of a full reference inside a kind-0 record, on ingress
+     * only: the {@link #TXREF_RECORD_LEN} bytes of a positioned
+     * {@link #RT_TXREF} frame with this record type, then the envelope.
+     * The relayed payload is
+     * {@code [canonical_id:32][record_type:7][lane:u8][term_id:i32][term_offset:i32][session_id:i32][envelope]}.
+     * See {@link TxRefOffer}. Matches Rust {@code RT_TXREF_OFFER}.
+     */
+    public static final byte RT_TXREF_OFFER = 7;
+
+    /**
+     * The length of the root of an archived {@code TxEnvelope}. No envelope
+     * is shorter. Matches Rust {@code ENVELOPE_ROOT_LEN}.
+     */
+    static final int ENVELOPE_ROOT_LEN = 80;
+
+    /**
+     * The top byte of the deadline field, {@code 0x40}, when the field
+     * carries the stream position of a transaction reference in its ingress
+     * image. The position is below 2^56. Version 3 reads the value as a
+     * deadline far ahead. No deadline has this top byte: a block number is
+     * far below it, and "no deadline" is {@code 2^63 - 1} or {@code 2^64 - 1}.
+     */
+    static final long POSITION_TAG = 0x40L << 56;
+
+    /** The bits of the position below the tag. */
+    static final long POSITION_MASK = (1L << 56) - 1;
+
+    /** Whether a deadline field carries a position. */
+    static boolean carriesPosition(final long deadline) {
+        return (deadline & ~POSITION_MASK) == POSITION_TAG;
+    }
 
     /** Offset of the 32-byte canonical id in a {@link #KIND_ORIGIN_RECORD} frame. */
     static final int ORIGIN_ID_OFFSET = KIND_OFFSET + Byte.BYTES;
@@ -407,18 +461,31 @@ public final class SealerWire {
     /**
      * The sealer's rules:
      * {@code [kind:17][decision_version:u8][cluster_session_id:i64 LE]}
-     * ({@link #SEALER_INFO_LEN} bytes). The service sends it only under
-     * decision version 3: to every open session at the switch, and then to
-     * each session when the session opens. It carries the id of that
-     * session, so a client ties it to its session whatever the order of its
-     * own session events. Under version 2 the service sends no frame of this
-     * kind. A sequencer reports the version it got for its current
-     * session. A reader that does not know the kind drops it. Matches Rust
-     * {@code EGRESS_KIND_SEALER_INFO}.
+     * ({@link #SEALER_INFO_LEN} bytes). The service sends it to each session
+     * when the session opens, and to every open session at each new term.
+     * It carries the id of that session, so a client ties it to its session
+     * whatever the order of its own session events. A sequencer reports the
+     * version that it got last for its current session. A reader that does
+     * not know the kind drops it.
+     * Matches Rust {@code EGRESS_KIND_SEALER_INFO}.
      */
     public static final byte EGRESS_KIND_SEALER_INFO = 17;
     /** Length of an {@link #EGRESS_KIND_SEALER_INFO} frame. */
     static final int SEALER_INFO_LEN = Byte.BYTES + Byte.BYTES + Long.BYTES;
+
+    /**
+     * The refusal of a transaction reference of record type {@link #RT_TXREF}:
+     * {@code [kind:18][canonical_id:32][sender:20][nonce:u64 LE][decision_version:u8]}
+     * ({@link #REF_REFUSED_LEN} bytes). Offered only to the offering
+     * session. The reference is not ordered. The canonical id is the hash of
+     * the transaction, and the decision version is the version of the
+     * service. A reader that does not know the kind drops it.
+     * Matches Rust {@code EGRESS_KIND_REF_REFUSED}.
+     */
+    public static final byte EGRESS_KIND_REF_REFUSED = 18;
+    /** Length of an {@link #EGRESS_KIND_REF_REFUSED} frame. */
+    static final int REF_REFUSED_LEN = Byte.BYTES + CanonicalSealerState.CANONICAL_ID_LEN
+        + CanonicalSealerState.SENDER_LEN + Long.BYTES + Byte.BYTES;
 
     /** The egress header in front of a relayed payload: {@code [kind:1][index:u64][payload_len:u32]}. */
     static final int RELAYED_HEADER_LEN = Byte.BYTES + Long.BYTES + Integer.BYTES;

@@ -102,6 +102,6 @@ pub use rpc_source::RpcL1Source;
 pub use source::{L1Header, L1Source, L1SourceError};
 pub use sources::{L1Endpoints, L1Sources, SourceHalt};
 pub use watcher::{
-    DaWatcherConfig, L1ResumeAfter, L1Watcher, MonitorError, ResumeAfterError, START_WAIT,
-    WatcherHandle,
+    DaWatcherConfig, L1ResumeAfter, L1Watcher, MonitorError, PACED_BACKLOG, ResumeAfterError,
+    START_WAIT, WatcherHandle,
 };

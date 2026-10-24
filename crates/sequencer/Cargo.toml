@@ -75,9 +75,19 @@ kardamom-sequencer = { path = ".", features = ["testing"] }
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
 kardamom-obs = { path = "../obs", features = ["test-support"] }
+# A local recorder for the tests that read the pipeline metrics.
+metrics-exporter-prometheus.workspace = true
 proptest = "1"
 rand = "0.9"
 
 [[bench]]
 name = "throughput"
+harness = false
+
+[[bench]]
+name = "admission"
+harness = false
+
+[[bench]]
+name = "v2_loop"
 harness = false

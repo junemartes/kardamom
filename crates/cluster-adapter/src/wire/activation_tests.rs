@@ -1,4 +1,4 @@
-//! The feature activation that the sequencer derives from an epoch.
+//! The feature activation that a sequencer derives from an epoch.
 
 use alloy_primitives::{Address, B256, Bytes as AlloyBytes, U256};
 use kardamom_types::epoch::{DepositLog, LockboxLog, UpgradeLog, derive_epoch};
@@ -32,11 +32,11 @@ fn deposit(index: u64) -> LockboxLog {
 }
 
 fn activation_of(logs: &[LockboxLog]) -> Option<FeatureActivation> {
-    FeatureActivation::sealer_rules_of(&derive_epoch(9, BLOCK, logs).unwrap())
+    FeatureActivation::of(&derive_epoch(9, BLOCK, logs).unwrap(), FEATURE_SEALER_V3)
 }
 
 #[test]
-fn an_epoch_with_the_upgrade_of_the_sealer_rules_carries_its_activation() {
+fn an_epoch_with_the_upgrade_of_the_feature_carries_its_activation() {
     assert_eq!(
         activation_of(&[deposit(0), upgrade(1, FEATURE_SEALER_V3, 5_000)]),
         Some(FeatureActivation {

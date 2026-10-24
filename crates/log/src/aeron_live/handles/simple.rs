@@ -1,5 +1,5 @@
 //! The structurally identical single-stream handle pairs: `TxErrors`,
-//! `TxStatus`, `TxDeposits`, `TxRemoteEpochs`, `ServiceEvents`, `ExecTxs`,
+//! `TxStatus`, `TxDrops`, `TxDeposits`, `TxRemoteEpochs`, `ServiceEvents`, `ExecTxs`,
 //! `L1Blocks`, `FsyncWatermark`. Each is a publisher
 //! wrapping one [`PubHandle`] plus a subscriber wrapping one typed receiver, differing
 //! only in message type, channel/stream selection, and the publisher's
@@ -16,7 +16,7 @@ use crate::error::LogError;
 use kardamom_types::service::ServiceEvent;
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{
-    BPosition, EpochRecord, ExecTxRecord, FsyncWatermark, L1Block, TxError, TxStatus,
+    BPosition, EpochRecord, ExecTxRecord, FsyncWatermark, L1Block, TxDrop, TxError, TxStatus,
 };
 
 /// Name the discovery topic and stream of one single-stream handle pair,
@@ -267,6 +267,26 @@ declare_channel_handles! {
     /// `TxStatus` subscriber (sequencer and ingress → notifier).
     subscriber TxStatusSubscriberHandle(TxStatus);
     open(ch) = (ch.tx_status_channel, ch.tx_status_stream_id);
+}
+
+declare_channel_handles! {
+    /// `tx_drops` publisher (sequencer → egress).
+    publisher TxDropsPublisherHandle {
+        /// Fire-and-forget publish: the Aeron thread retries a
+        /// back-pressured offer for a bounded time, then drops the frame
+        /// and counts it. The publish loop never waits for the egress.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if `d` fails to encode.
+        pub fn publish_best_effort(&self, d: &TxDrop) -> Result<(), LogError> {
+            self.inner.publish_best_effort(crate::codec::encode(d)?);
+            Ok(())
+        }
+    }
+    /// `tx_drops` subscriber (sequencer → egress).
+    subscriber TxDropsSubscriberHandle(TxDrop);
+    open(ch) = (ch.tx_drops_channel, ch.tx_drops_stream_id);
 }
 
 declare_channel_handles! {

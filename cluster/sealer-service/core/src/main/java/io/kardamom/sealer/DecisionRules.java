@@ -3,175 +3,134 @@ package io.kardamom.sealer;
 import java.nio.ByteBuffer;
 
 /**
- * The version of the rules that decide the replicated state, and the
- * switch from version 2 to version 3. Two members on two versions can
- * decide one log entry differently, and the state forks. So the version is
- * replicated state: it changes only at a record in the log, at the same log
- * index on every member, and the snapshot carries it.
+ * The rules that decide the replicated state: decision version 3 on every
+ * member, from its start. Version 3 relays a frame of kinds 0, 3, 4 and 5
+ * only when it carries the record-type byte, and the member sends the rules
+ * frame (egress kind 17) to each session.
  *
- * <p>Version 2 is the rules of a state that holds no activation. Version 3
- * sends the rules frame to each session, and relays a frame of kinds 0, 3,
- * 4 and 5 only when it carries the record-type byte. A state that holds an
- * activation writes snapshot version 13. An upgrade transaction on L1 schedules
- * {@link #FEATURE_SEALER_V3} at an activation time. The sequencer sends the
- * schedule as a feature activation record in front of the epoch that holds
- * the upgrade. The rules switch to version 3 at the first log entry whose
- * cluster time is at or above the activation time. An activation time at or
- * below the time of the activation record switches the rules at that
- * record. The switch is one way.</p>
- *
- * <p>An activation applies only when its L1 origin names the epoch that the
- * record fronts: the next origin of the state, or the origin of the state
- * when the epoch got in first. A state with no epoch yet (origin 0) takes
- * any origin, because its first epoch can start at any L1 block. The
- * activation must also be above the origin of the pending activation. So a copy of the record from a twin sequencer, or a
- * record that a sequencer sends again with its epoch, changes nothing, and a
- * record for an older or a later epoch changes nothing. The copy of the twin
- * still applies after the epoch, so one lost record does not lose the
- * activation. A later upgrade before the switch replaces the activation
- * time, as {@code KardamomChainState.setFeature} does. The origins and the
- * time are u64 values from the wire, so every comparison is unsigned.</p>
+ * <p>The snapshot of version 14 carries the rules after the seed digest. A
+ * member of an older release reads that tail and switches its rules by the
+ * feature activations that it holds. This class keeps the held activations
+ * as it loads them, and writes them back with version 3 and the L1 origin of
+ * the last sealed block. While {@code FEATURE_SEALER_V3} stays on, a member
+ * of the older release then holds the same tail, decides every entry as this
+ * member does, and writes the same snapshot bytes. The held activations
+ * change no decision of this member.</p>
  */
 public final class DecisionRules {
-    /** The rules of a state that holds no activation. Every member starts on it. */
-    public static final int START_VERSION = 2;
+    /** The version of the rules of every member. */
+    public static final int VERSION = 3;
 
-    /**
-     * The newest rules: the rules frame goes to each session, and a relayed
-     * frame needs its record type.
-     */
-    public static final int NEWEST_VERSION = 3;
-
-    /**
-     * The feature id of version 3 in {@code KardamomChainState}. Matches
-     * Rust {@code kardamom_types::upgrades::FEATURE_SEALER_V3}.
-     */
-    public static final long FEATURE_SEALER_V3 = 2L;
+    /** The version of the rules of a member that ran with the feature off. A snapshot can still hold it. */
+    private static final int OFF_VERSION = 2;
 
     /** The rules of a state that holds no activation, as a value. */
-    public static final View START_VIEW = new View(START_VERSION, 0L, 0L);
+    public static final View START_VIEW = new View(VERSION, 0L, 0L);
 
-    /** The snapshot tail: {@code [version:u8][activation_origin:u64][activation_ms:u64]}. */
-    static final int SNAPSHOT_LEN = Byte.BYTES + Long.BYTES + Long.BYTES;
+    /** The most activations that the snapshot tail holds. */
+    static final int MAX_HELD = 3;
 
-    /** The origin of the pending activation, or 0 when the state holds none. */
-    private long activationOrigin;
+    /** The L1 origins of the held activations, oldest first. */
+    private final long[] origins = new long[MAX_HELD];
 
-    /** The activation time in ms, compared unsigned: the wire carries a u64. */
-    private long activationMs;
+    /** The times in ms of the held activations, as the snapshot carries them. */
+    private final long[] times = new long[MAX_HELD];
 
-    private int version;
+    /** How many activations the tail holds. */
+    private int held;
 
-    private DecisionRules(final int version, final long activationOrigin, final long activationMs) {
-        this.version = version;
-        this.activationOrigin = activationOrigin;
-        this.activationMs = activationMs;
-    }
+    /** The L1 origin of the last block that a boundary sealed. */
+    private long sealedOrigin;
 
-    /** The rules of a state that holds no activation. */
+    /** The rules of a state that starts at genesis or from a seed: no held activation. */
     static DecisionRules start() {
-        return new DecisionRules(START_VERSION, 0L, 0L);
+        return new DecisionRules();
     }
 
-    /**
-     * Version 3 with no activation: the rules of a member that keeps its
-     * retained frames in a file. That setting comes with version 3, and every
-     * member must match it.
-     */
-    static DecisionRules newest() {
-        return new DecisionRules(NEWEST_VERSION, 0L, 0L);
-    }
-
-    /** The version of the rules. */
-    int version() {
-        return version;
-    }
-
-    /** Whether the state holds an activation: the snapshot must then carry the rules. */
-    boolean holdsActivation() {
-        return activationOrigin != 0L;
-    }
-
-    /** The rules as a value, for the admin endpoint. */
+    /** The rules as a value, for the admin endpoint: the version and the newest held activation. */
     public View view() {
-        return new View(version, activationOrigin, activationMs);
+        return held == 0 ? START_VIEW : new View(VERSION, origins[held - 1], times[held - 1]);
+    }
+
+    /** The boundary of a block with L1 origin {@code l1Origin} seals that block. */
+    void atBoundary(final long l1Origin) {
+        sealedOrigin = l1Origin;
+    }
+
+    /** The length of the snapshot tail that {@link #writeTo} writes. */
+    int snapshotLen() {
+        return Byte.BYTES + Long.BYTES + Byte.BYTES + held * (Long.BYTES + Long.BYTES);
     }
 
     /**
-     * Take a feature activation record at cluster time {@code nowMs}, with
-     * {@code stateOrigin} the L1 origin of the state.
-     *
-     * @return what the record did
+     * Write the snapshot tail of version 14:
+     * {@code [version:u8][sealed_origin:u64][held:u8]}, then
+     * {@code [origin:u64][time_ms:u64]} for each held activation, oldest
+     * first.
      */
-    Outcome onActivation(final FeatureActivation activation, final long stateOrigin, final long nowMs) {
-        final long origin = activation.l1Origin();
-        final boolean frontsTheEpoch = stateOrigin == 0L || origin == stateOrigin || origin == stateOrigin + 1;
-        final boolean applies = activation.featureId() == FEATURE_SEALER_V3
-            && version == START_VERSION
-            && frontsTheEpoch
-            && Long.compareUnsigned(origin, activationOrigin) > 0;
-        if (!applies) {
-            return Outcome.IGNORED;
-        }
-        activationOrigin = origin;
-        activationMs = activation.activationMs();
-        return switchAt(nowMs) ? Outcome.SWITCHED : Outcome.PENDING;
-    }
-
-    /**
-     * Switch to version 3 when an activation is pending and {@code nowMs},
-     * the cluster time of the log entry, is at or above its time.
-     *
-     * @return whether the rules switched at this entry
-     */
-    boolean switchAt(final long nowMs) {
-        final boolean due = version == START_VERSION
-            && holdsActivation()
-            && Long.compareUnsigned(nowMs, activationMs) >= 0;
-        if (due) {
-            version = NEWEST_VERSION;
-        }
-        return due;
-    }
-
-    /** Write the snapshot tail. */
     void writeTo(final ByteBuffer buf) {
-        buf.put((byte) version);
-        buf.putLong(activationOrigin);
-        buf.putLong(activationMs);
+        buf.put((byte) VERSION);
+        buf.putLong(sealedOrigin);
+        buf.put((byte) held);
+        for (int i = 0; i < held; i++) {
+            buf.putLong(origins[i]).putLong(times[i]);
+        }
     }
 
-    /** Read the snapshot tail that {@link #writeTo} wrote. */
+    /**
+     * Read the snapshot tail of version 14 that {@link #writeTo} wrote. A
+     * tail of version 2 loads as version 3: the two versions decide alike
+     * every frame that a client of the cluster writes.
+     */
     static DecisionRules readFrom(final ByteBuffer buf) {
-        final int version = buf.get();
-        if (version != START_VERSION && version != NEWEST_VERSION) {
+        checkVersion(buf.get());
+        final DecisionRules rules = new DecisionRules();
+        rules.sealedOrigin = buf.getLong();
+        final int count = buf.get();
+        if (count < 0 || count > MAX_HELD) {
+            throw new IllegalArgumentException("bad snapshot activation count: " + count);
+        }
+        for (int i = 0; i < count; i++) {
+            rules.hold(buf.getLong(), buf.getLong());
+        }
+        return rules;
+    }
+
+    /**
+     * Read the snapshot tail of version 13:
+     * {@code [version:u8][activation_origin:u64][activation_ms:u64]}. A
+     * version-13 state holds at most one activation, and the activation is
+     * the visible one. Its time of 0 reads as 1 ms, the time that a member
+     * of an older release gives it.
+     */
+    static DecisionRules readVersionThirteen(final ByteBuffer buf) {
+        checkVersion(buf.get());
+        final DecisionRules rules = new DecisionRules();
+        final long origin = buf.getLong();
+        final long time = buf.getLong();
+        if (origin != 0L) {
+            rules.hold(origin, time == 0L ? 1L : time);
+            rules.sealedOrigin = origin;
+        }
+        return rules;
+    }
+
+    private static void checkVersion(final byte version) {
+        if (version != OFF_VERSION && version != VERSION) {
             throw new IllegalArgumentException("bad snapshot decision version: " + version);
         }
-        return new DecisionRules(version, buf.getLong(), buf.getLong());
     }
 
-    /** What a feature activation record did. */
-    public enum Outcome {
-        /** The record changed nothing. */
-        IGNORED,
-        /** The state holds the activation, and its time is not due yet. */
-        PENDING,
-        /** The rules switched to version 3 at this record. */
-        SWITCHED
-    }
-
-    /**
-     * A feature activation record: the upgrade transaction of the epoch at
-     * {@code l1Origin} schedules {@code featureId} at {@code activationMs}.
-     */
-    public record FeatureActivation(long l1Origin, long featureId, long activationMs) {
+    /** Hold one more activation, after the ones held. */
+    private void hold(final long origin, final long time) {
+        origins[held] = origin;
+        times[held] = time;
+        held++;
     }
 
     /**
      * The rules as a value: the version, and the origin and the time of the
-     * activation, both 0 when the state holds none. A check outside the
-     * cluster compares the origin with the {@code setFeature} deposit of
-     * that epoch on L1.
+     * newest held activation, both 0 when the state holds none.
      */
     public record View(int version, long activationOrigin, long activationMs) {
     }

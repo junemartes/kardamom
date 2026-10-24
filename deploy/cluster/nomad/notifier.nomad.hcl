@@ -83,6 +83,19 @@ variable "outbox_retain_bytes" {
   default     = 268435456
 }
 
+# The receipts from the egress, "on" or "off" (--receipts-from-egress).
+# On, the notifier reads egress_receipts, each receipt once, in place of
+# the tx_receipts stream of every executor. Ansible deployment passes
+# -var from KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS.
+variable "receipts_from_egress" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.receipts_from_egress)
+    error_message = "The receipts_from_egress value must be on or off."
+  }
+}
+
 locals {
   peers = join(",", [for i in range(var.ingress_count) : "http://ingress-${i}.node.${var.datacenter}.consul:8547"])
 }
@@ -159,7 +172,7 @@ job "notifier" {
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
           "/opt/kardamom/notifier:/opt/kardamom/notifier",
         ]
-        args = [
+        args = concat([
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
           "--executor-count", "${var.executor_count}",
@@ -175,7 +188,9 @@ job "notifier" {
           "--peers", local.peers,
           "--host-id", "notifier-${NOMAD_ALLOC_INDEX}",
           "--metrics-addr", "0.0.0.0:9008",
-        ]
+          ],
+          var.receipts_from_egress == "on" ? ["--receipts-from-egress"] : [],
+        )
       }
 
       # Cluster LogConfig (Aeron streams and discovery), read through

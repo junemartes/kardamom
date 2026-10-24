@@ -31,9 +31,7 @@ import org.junit.jupiter.api.Test;
  * and three void voters. Each kind of input occurs often: relays,
  * duplicates, nonce gaps, passed deadlines, the zero sender, void votes,
  * origin records with and without a gap, posted and recorded cursors, and
- * ticks. A feature activation in the middle of the stream switches the
- * decision rules to version 3, and after it the snapshot is version 13.
- * The window fills, so it also refuses records,
+ * ticks. The snapshot is version 14. The window fills, so it also refuses records,
  * and the least recently used sender is evicted. The test checks that every
  * record outcome occurs, so the stream keeps its coverage.
  *
@@ -61,8 +59,6 @@ final class DecisionGoldenTest {
     /** The relayed records that a void vote can name. */
     private static final int RECENT = 64;
     private static final int SNAPSHOT_EVERY = 5_000;
-    /** The step of the feature activation: the middle of the stream. */
-    private static final int ACTIVATION_STEP = STEPS / 2;
     private static final String GOLDEN = "decision-golden.sha256";
 
     @Test
@@ -118,7 +114,6 @@ final class DecisionGoldenTest {
 
         byte[] run() {
             for (int step = 1; step <= STEPS; step++) {
-                activateAt(step);
                 step(random.nextInt(1000));
                 if (step % SNAPSHOT_EVERY == 0) {
                     digest.update(state.takeSnapshot());
@@ -136,8 +131,7 @@ final class DecisionGoldenTest {
                 assertTrue(kinds.getOrDefault(kind, 0) > 0, "the stream has no " + kind + " outcome: " + kinds);
             }
             assertTrue(voids > 0 && originGaps > 0, "decided voids " + voids + ", origin gaps " + originGaps);
-            assertEquals(3, state.decisionVersion());
-            assertEquals(CanonicalSealerState.RULES_SNAPSHOT_VERSION, state.snapshotVersion());
+            assertEquals(14, state.snapshotVersion());
         }
 
         /** One step of the stream; {@code roll} in [0, 1000) picks its kind. */
@@ -163,20 +157,6 @@ final class DecisionGoldenTest {
             } else {
                 tick();
             }
-        }
-
-        /**
-         * At {@link #ACTIVATION_STEP}, the activation of version 3 for the
-         * next epoch, due at once.
-         */
-        private void activateAt(int step) {
-            if (step != ACTIVATION_STEP) {
-                return;
-            }
-            DecisionRules.Outcome outcome = state.onFeatureActivation(new DecisionRules.FeatureActivation(
-                    l1Origin + 1, DecisionRules.FEATURE_SEALER_V3, 0L), clock);
-            assertEquals(DecisionRules.Outcome.SWITCHED, outcome);
-            hashLong(outcome.ordinal());
         }
 
         /** Offer a fresh id at a sender's next nonce; a relay moves the nonce and joins the recent entries. */

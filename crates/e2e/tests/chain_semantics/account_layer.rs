@@ -1,6 +1,15 @@
 // The account layer scenarios (`s17`). Included by `main.rs`; see the
 // note there on `include!`.
 
+/// A stack whose ingress fills its local account layer from the full
+/// receipt stream, for the scenarios that read that layer.
+fn ingress_rows_config() -> StackConfig {
+    StackConfig {
+        ingress_rows: true,
+        ..StackConfig::default()
+    }
+}
+
 /// The ingress serves an established sender's count from its local
 /// layer, the executor agrees once the block commits, a retry answers
 /// its hash, and a different transaction at a landed nonce is invalid
@@ -21,7 +30,7 @@ async fn s17a_ingress_count_matches_the_executor_and_a_retry_answers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn s17c_cold_ingress_admits_on_a_local_miss() {
-    let mut stack = LocalStack::launch(StackConfig::default())
+    let mut stack = LocalStack::launch(ingress_rows_config())
         .await
         .expect("stack");
     let params = account_layer::Params::default();
@@ -56,7 +65,7 @@ async fn s17e_validator_verifies_the_batch_rows() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn s17g_recipient_spends_within_one_batch() {
-    let stack = LocalStack::launch(StackConfig::default())
+    let stack = LocalStack::launch(ingress_rows_config())
         .await
         .expect("stack");
     account_layer::recipient_spends_within_batch(

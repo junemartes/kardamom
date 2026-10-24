@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "forge-std/Test.sol";
+import {FACTORY} from "../TestFactory.sol";
 import {ETHLockbox} from "../../src/L1/ETHLockbox.sol";
 import {WithdrawalOutputOracle} from "../../src/L1/WithdrawalOutputOracle.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
@@ -17,8 +18,6 @@ contract WithdrawalFlowTest is Test {
     address constant ATTESTER = address(0xA77E);
     address constant CHALLENGER = address(0xC4A1);
     address constant RECOVERY = address(0x4EC0);
-    /// Must match KardamomUUPSBase.FACTORY.
-    address constant FACTORY = 0x2e4925D28F5F52086ff20aAd4981D68B1C87676E;
     address constant L2_MINTER = address(0xBEEF);
     uint64 constant WINDOW = 1 days;
 
@@ -30,7 +29,7 @@ contract WithdrawalFlowTest is Test {
 
     function setUp() public {
         // Oracle proxy.
-        WithdrawalOutputOracle oImpl = new WithdrawalOutputOracle();
+        WithdrawalOutputOracle oImpl = new WithdrawalOutputOracle(FACTORY);
         oracle = WithdrawalOutputOracle(
             address(
                 new ERC1967Proxy(
@@ -42,7 +41,7 @@ contract WithdrawalFlowTest is Test {
             )
         );
         // Lockbox proxy, pointed at the oracle.
-        ETHLockbox lImpl = new ETHLockbox();
+        ETHLockbox lImpl = new ETHLockbox(FACTORY);
         lockbox = ETHLockbox(
             payable(address(
                     new ERC1967Proxy(

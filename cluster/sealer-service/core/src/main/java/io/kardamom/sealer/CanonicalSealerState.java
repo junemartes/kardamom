@@ -152,45 +152,86 @@ public final class CanonicalSealerState {
      * keeps its retained frames in a file, and such a member takes no void
      * request and no recorded cursor. A member that cannot read the file
      * section must not load the snapshot. Version 13 is version 10 with the
-     * decision rules after the seed digest: see {@link DecisionRules}.
+     * decision rules of one activation after the seed digest. Version 14 is
+     * version 10 with the decision rules of up to three activations after
+     * the seed digest: see {@link DecisionRules#writeTo}.
      *
-     * <p>This is the newest version that {@link #load} reads. The writer
-     * can be one version behind: see {@link #SNAPSHOT_WRITE_VERSION}.</p>
+     * Version 15 is version 14 with the version switch and the replay
+     * windows after the decision rules: see {@link VersionSwitch#writeTo}
+     * and {@link SessionWindows#writeTo}. Version 16 is version 15 with the
+     * schedule of the carry flag after the replay windows: see
+     * {@link VersionSwitch#writeCarryTo}. Version 17 has the state section
+     * of version 16, and the retention section of the retained file after
+     * it.
+     *
+     * <p>This is the newest version that {@link #load} reads.</p>
      */
-    private static final int SNAPSHOT_READ_VERSION = 13;
+    private static final int SNAPSHOT_READ_VERSION = 17;
 
     /**
-     * The version that {@link #takeSnapshot()} writes when the state holds
-     * a feature activation: version 10, then the decision rules. A state
-     * with no activation writes {@link #SNAPSHOT_WRITE_VERSION}. A loader
-     * that reads only up to version 12 refuses version 13, so the upgrade
-     * transaction comes only after every member reads version 13.
+     * The version that {@link #takeSnapshot()} writes when the version
+     * switch holds a feature activation. A member of the release before
+     * reads only up to version 14, so the upgrade transaction comes only
+     * after every member reads version 15.
      */
-    public static final int RULES_SNAPSHOT_VERSION = 13;
+    public static final int SWITCH_SNAPSHOT_VERSION = 15;
+
+    /**
+     * The version that {@link #takeSnapshot()} writes when the version
+     * switch holds an activation of the carry flag. A member that reads
+     * only up to version 15 refuses it, so the upgrade transaction of the
+     * carry flag comes only after every member reads version 16.
+     */
+    public static final int CARRY_SNAPSHOT_VERSION = 16;
+
+    /** The version with the decision rules of one activation; {@link #load} still reads it. */
+    private static final int ONE_ACTIVATION_SNAPSHOT_VERSION = 13;
 
     /**
      * The version that {@link #takeSnapshotWithRetainedFile()} writes: the
-     * state section of version 10 without the void ledger, then the
-     * retention section of the retained file.
+     * state section of version 16, then the retention section of the
+     * retained file. The state section holds the decision rules, the
+     * version switch and the schedule of the carry flag, so a member that
+     * restores it decides as its peers that kept running. A member that
+     * reads only up to version 16 refuses it.
+     */
+    public static final int FILE_SNAPSHOT_VERSION = 17;
+
+    /**
+     * The older version with a retained file: the state section of version
+     * 10 without the void ledger, then the retention section of the
+     * retained file. {@link #load} still reads it. It holds no decision
+     * rules, so a member that restores it runs decision version 3.
      */
     public static final int RETAINED_FILE_SNAPSHOT_VERSION = 12;
 
     /**
-     * The version that {@link #takeSnapshot()} writes. It stays one step
-     * behind {@link #SNAPSHOT_READ_VERSION}, so a member of the previous
-     * release, which reads up to version 10, can still restore every
-     * snapshot that this release writes. A rollback then does not stop the
-     * old members on the first new snapshot.
-     *
-     * <p>A version-10 snapshot holds no recorded cursor, so a member that
-     * restores one has no cursor until the next cursor record. With the
-     * record-lag guard off (budget 0) that changes no decision: the guard
-     * refuses nothing, and the cursors reach only the status frame. With a
-     * budget above 0, a restored member could refuse less than its peers.
-     * So the release that turns the cursor publisher and the guard on also
-     * sets this value to 11, after every member reads version 11.</p>
+     * Whether a snapshot of {@code version} ends with the retention section
+     * of a retained file: version {@link #RETAINED_FILE_SNAPSHOT_VERSION}
+     * or {@link #FILE_SNAPSHOT_VERSION}.
      */
-    private static final int SNAPSHOT_WRITE_VERSION = 10;
+    public static boolean holdsRetainedFile(int version) {
+        return version == RETAINED_FILE_SNAPSHOT_VERSION || version == FILE_SNAPSHOT_VERSION;
+    }
+
+    /** The only version that holds the recorded cursors. */
+    private static final int CURSORS_SNAPSHOT_VERSION = 11;
+
+    /**
+     * The version that {@link #takeSnapshot()} writes: version 10, then the
+     * decision rules ({@link DecisionRules#writeTo}). A member of an older
+     * release that reads version 14 restores it with decision version 3.
+     * A member that restores version 10 would run decision version 2 there,
+     * so this release never writes version 10.
+     *
+     * <p>Version 14 holds no recorded cursor, so a member that restores one
+     * has no cursor until the next cursor record. With the record-lag guard
+     * off (budget 0) that changes no decision: the guard refuses nothing,
+     * and the cursors reach only the status frame. With a budget above 0, a
+     * restored member could refuse less than its peers. So the guard needs a
+     * release that writes the cursors.</p>
+     */
+    private static final int SNAPSHOT_WRITE_VERSION = 14;
 
     /**
      * Whether {@link #takeSnapshot()} writes the recorded cursors. Only
@@ -198,7 +239,7 @@ public final class CanonicalSealerState {
      * snapshot without cursors refuses less than its peers that kept them.
      */
     public static boolean snapshotKeepsRecordedCursors() {
-        return SNAPSHOT_WRITE_VERSION >= 11;
+        return SNAPSHOT_WRITE_VERSION == CURSORS_SNAPSHOT_VERSION;
     }
 
     /** The oldest snapshot version that {@link #load} reads. */
@@ -372,6 +413,12 @@ public final class CanonicalSealerState {
 
     /** The decision rules. Replicated state: see {@link DecisionRules}. */
     private DecisionRules rules = DecisionRules.start();
+
+    /** The switch to decision version 4. Replicated state: see {@link VersionSwitch}. */
+    private VersionSwitch versions = VersionSwitch.start();
+
+    /** The replay windows of decision version 4. Replicated state: see {@link SessionWindows}. */
+    private SessionWindows windows = new SessionWindows(SessionWindows.DEFAULT_SLOTS, SessionWindows.DEFAULT_WIDTH);
 
     /** Cumulative count of canonical (first-seen) records relayed. */
     private long canonicalCount;
@@ -952,44 +999,102 @@ public final class CanonicalSealerState {
         return voids;
     }
 
-    /** The version of the decision rules: see {@link DecisionRules}. */
-    public int decisionVersion() {
-        return rules.version();
-    }
-
     /** The decision rules as a value, for the admin endpoint. */
     public DecisionRules.View decisionRules() {
         return rules.view();
     }
 
-    /**
-     * Run version 3 from the start: the rules of a member that keeps its
-     * retained frames in a file. Call it only on a state that started at
-     * genesis or from a seed, before the first log entry.
-     */
-    public void startOnNewestRules() {
-        rules = DecisionRules.newest();
+    /** The decision version of the open block: 3, 4 after its activation, or 5 with the carry flag. */
+    public int decisionVersion() {
+        return versions.version();
+    }
+
+    /** The version switch as a value, for the admin endpoint. */
+    public VersionSwitch.View versionSwitch() {
+        return versions.view();
     }
 
     /**
-     * Take a feature activation record at cluster time {@code nowMs}.
-     *
-     * @return what the record did
+     * Take a feature activation record. It only stores the schedule: the
+     * version changes at a block boundary ({@link #onTick}).
      */
-    public DecisionRules.Outcome onFeatureActivation(
-            final DecisionRules.FeatureActivation activation, final long nowMs) {
-        return rules.onActivation(activation, l1Origin, nowMs);
+    public VersionSwitch.Outcome onFeatureActivation(final VersionSwitch.FeatureActivation activation) {
+        return versions.onActivation(activation, l1Origin, lastL2Timestamp);
     }
 
     /**
-     * Switch the rules when a pending activation is due at {@code nowMs},
-     * the cluster time of a log entry. Call it before each log entry.
-     *
-     * @return whether the rules switched at this entry
+     * The decision version of an origin-advancing record offered at
+     * {@code leaderClockMillis}. The record opens a new block: when the open
+     * block holds a record, the record forces a boundary first, and runs
+     * under the version that the boundary sets. It changes nothing.
      */
-    public boolean switchRulesAt(final long nowMs) {
-        return rules.switchAt(nowMs);
+    int decisionVersionOfOriginRecord(final long leaderClockMillis) {
+        return canonicalCount > lastBoundaryCount
+            ? versions.versionAtBoundary(l1Origin, lastL2Timestamp, nextL2Timestamp(leaderClockMillis))
+            : versions.version();
     }
+
+    /** {@link #onRef}: the replay window holds the reference already. */
+    public static final long REF_DUPLICATE = -1L;
+    /** {@link #onRef}: the reference is too far below the highest one of its image. */
+    public static final long REF_EXPIRED = -2L;
+    /** {@link #onRef}: the DA-lag guard refuses user records. */
+    public static final long REF_DA_LAG = -3L;
+    /** {@link #onRef}: the record-lag guard refuses user records. */
+    public static final long REF_RECORD_LAG = -4L;
+
+    /**
+     * Decision version 5: order one full reference by the replay window of
+     * its ingress image, as {@link #onRef} does. The entry carries its
+     * bytes, so the void ledger keeps nothing of it. The record-lag guard is
+     * off under version 5. The record path allocates nothing.
+     *
+     * @param lane     the lane of the ingress image
+     * @param session  the Aeron session id of the ingress image
+     * @param position the stream position of the transaction in the image
+     * @return the canonical index of the reference, or a {@code REF_*} code
+     */
+    public long onCarriedRef(final int lane, final int session, final long position) {
+        final int seen = windows.check(lane, session, position, canonicalCount);
+        if (seen != SessionWindows.FRESH) {
+            return seen == SessionWindows.DUPLICATE ? REF_DUPLICATE : REF_EXPIRED;
+        }
+        if (recordLagHalted()) {
+            return REF_RECORD_LAG;
+        }
+        if (daLagHalted()) {
+            return REF_DA_LAG;
+        }
+        windows.mark();
+        return canonicalCount++;
+    }
+
+    /**
+     * Decision version 4: order one transaction reference by the replay
+     * window of its ingress image ({@link SessionWindows}). The record path
+     * allocates nothing.
+     *
+     * <p>The window decides first, so a copy of an ordered reference stays
+     * a silent duplicate while a lag guard refuses. A refused reference does
+     * not enter the window, so the copy that comes after the halt is
+     * fresh.</p>
+     *
+     * @param lane     the lane of the ingress image
+     * @param session  the Aeron session id of the ingress image
+     * @param position the stream position of the transaction in the image
+     * @param id32     the transaction hash, for the void ledger
+     * @return the canonical index of the reference, or a {@code REF_*} code
+     */
+    public long onRef(final int lane, final int session, final long position, final byte[] id32) {
+        final long index = onCarriedRef(lane, session, position);
+        if (index >= 0) {
+            voids.onReference(index, id32, ZERO_SENDER, 0L);
+        }
+        return index;
+    }
+
+    /** The sender of a reference that decision version 4 orders: the void ledger keeps no sender for it. */
+    private static final byte[] ZERO_SENDER = new byte[SENDER_LEN];
 
     /**
      * Process a record without the contiguity guard (no sender identity)
@@ -1024,20 +1129,32 @@ public final class CanonicalSealerState {
      * <p>The block number advances after the stamp, so successive ticks
      * produce block numbers that increase by one each time, with no
      * gaps.</p>
+     *
+     * <p>The boundary seals its block, and sets the decision version of the
+     * next block: see {@link VersionSwitch#atBoundary}. Every entry of a
+     * block runs under one version.</p>
      */
     public Boundary onTick(long leaderClockMillis) {
+        long l2Timestamp = nextL2Timestamp(leaderClockMillis);
+        Boundary boundary = new Boundary(blockNumber, canonicalCount, l2Timestamp, l1Origin);
+        blockNumber++;
+        pruneExpired();
+        rules.atBoundary(l1Origin);
+        // The sealed block executed with the time of the boundary before it.
+        versions.atBoundary(l1Origin, lastL2Timestamp, l2Timestamp);
+        lastL2Timestamp = l2Timestamp;
+        lastBoundaryCount = canonicalCount;
+        return boundary;
+    }
+
+    /** The time of a boundary stamped at {@code leaderClockMillis}. */
+    private long nextL2Timestamp(final long leaderClockMillis) {
         long floored = (leaderClockMillis / TICK_INTERVAL_MS) * TICK_INTERVAL_MS;
         // Under a normal tick cadence, `floored` always exceeds the previous
         // stamp by a full interval, so this max() call has no effect. It
         // matters only after onOriginRecord forces an extra boundary in the
         // same window.
-        long l2Timestamp = Math.max(floored, lastL2Timestamp + 1);
-        Boundary boundary = new Boundary(blockNumber, canonicalCount, l2Timestamp, l1Origin);
-        blockNumber++;
-        pruneExpired();
-        lastL2Timestamp = l2Timestamp;
-        lastBoundaryCount = canonicalCount;
-        return boundary;
+        return Math.max(floored, lastL2Timestamp + 1);
     }
 
     /**
@@ -1390,12 +1507,14 @@ public final class CanonicalSealerState {
     }
 
     /**
-     * Whether the record-lag guard refuses user records: the budget is on,
-     * an executor sent a cursor, and the last ordered index is more than
-     * the budget past the best cursor.
+     * Whether the record-lag guard refuses user records: the open block
+     * runs a version below 5, the budget is on, an executor sent a cursor,
+     * and the last ordered index is more than the budget past the best
+     * cursor. Under version 5 the member takes no recorded cursor, so the
+     * guard is off.
      */
     public boolean recordLagHalted() {
-        return recorded.halted(sealedIndex());
+        return versions.version() < VersionSwitch.CARRY_VERSION && recorded.halted(sealedIndex());
     }
 
     /** L1 origin currently stamped into boundaries. */
@@ -1511,8 +1630,10 @@ public final class CanonicalSealerState {
      * {@link SeedStatus} ordinal) and the seed digest (32) after it.
      * Version 11 adds the recorded cursors after the seed digest: see
      * {@link RecordedCursors#writeTo}. Version 12 is version 10 without the
-     * void ledger. Version 13 is version 10 with the decision rules after
-     * the seed digest: see {@link DecisionRules#writeTo}.</p>
+     * void ledger. Version 13 is version 10 with the decision rules of one
+     * activation after the seed digest. Version 14 is version 10 with the
+     * decision rules of up to three activations after the seed digest: see
+     * {@link DecisionRules#writeTo}.</p>
      *
      * <p>The writer writes {@link #snapshotVersion()}.</p>
      */
@@ -1521,35 +1642,43 @@ public final class CanonicalSealerState {
     }
 
     /**
-     * The version that {@link #takeSnapshot()} writes now:
-     * {@link #RULES_SNAPSHOT_VERSION} when the state holds a feature
-     * activation, else {@link #SNAPSHOT_WRITE_VERSION}.
+     * The version that {@link #takeSnapshot()} writes:
+     * {@link #CARRY_SNAPSHOT_VERSION} when the version switch holds an
+     * activation of the carry flag, {@link #SWITCH_SNAPSHOT_VERSION} when
+     * it holds another activation, else {@link #SNAPSHOT_WRITE_VERSION}.
      */
     public int snapshotVersion() {
-        return rules.holdsActivation() ? RULES_SNAPSHOT_VERSION : SNAPSHOT_WRITE_VERSION;
+        if (versions.holdsCarryActivation()) {
+            return CARRY_SNAPSHOT_VERSION;
+        }
+        return versions.holdsActivation() ? SWITCH_SNAPSHOT_VERSION : SNAPSHOT_WRITE_VERSION;
     }
 
     /**
      * The state section of a snapshot whose retention section is a
-     * retained file: version {@link #RETAINED_FILE_SNAPSHOT_VERSION}.
+     * retained file: version {@link #FILE_SNAPSHOT_VERSION}.
      */
     public byte[] takeSnapshotWithRetainedFile() {
-        return takeSnapshot(RETAINED_FILE_SNAPSHOT_VERSION);
+        return takeSnapshot(FILE_SNAPSHOT_VERSION);
     }
 
     /**
      * {@link #takeSnapshot()} in the layout of {@code version}: 10 has the
      * void ledger, 11 has the void ledger and the recorded cursors, 12 has
-     * neither, and 13 has the void ledger and the decision rules. A
-     * version-10 snapshot of a state is the same bytes in every release
-     * that writes version 10.
+     * neither, 14 has the void ledger and the decision rules, 15 has
+     * version 14 with the version switch and the replay windows, 16 has
+     * version 15 with the schedule of the carry flag, and 17 has the layout
+     * of version 16. A version-10 snapshot of a state is the same bytes in
+     * every release that writes version 10.
      *
-     * @param version 10, 11, 12 or 13
+     * @param version 10, 11, 12, 14, 15, 16 or 17
      */
     byte[] takeSnapshot(int version) {
         boolean withVoids = version != RETAINED_FILE_SNAPSHOT_VERSION;
-        boolean withCursors = version == 11;
-        boolean withRules = version == RULES_SNAPSHOT_VERSION;
+        boolean withCursors = version == CURSORS_SNAPSHOT_VERSION;
+        boolean withCarry = version == CARRY_SNAPSHOT_VERSION || version == FILE_SNAPSHOT_VERSION;
+        boolean withSwitch = version == SWITCH_SNAPSHOT_VERSION || withCarry;
+        boolean withRules = version == SNAPSHOT_WRITE_VERSION || withSwitch;
         int idCount = dedup.size();
         int senderCount = expectedNonce.size();
         int remoteCount = remoteOrigins.size();
@@ -1562,7 +1691,9 @@ public final class CanonicalSealerState {
                 + 8
                 + 1 + SealerSeed.HASH_LEN
                 + (withCursors ? recorded.snapshotLen() : 0)
-                + (withRules ? DecisionRules.SNAPSHOT_LEN : 0);
+                + (withRules ? rules.snapshotLen() : 0)
+                + (withSwitch ? versions.snapshotLen() + windows.snapshotLen() : 0)
+                + (withCarry ? versions.carrySnapshotLen() : 0);
         ByteBuffer buf = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN);
         buf.putInt(SNAPSHOT_MAGIC);
         buf.putInt(version);
@@ -1601,7 +1732,7 @@ public final class CanonicalSealerState {
             buf.put(e.getValue().nextSeqKnown ? (byte) 1 : (byte) 0);
             buf.putLong(e.getValue().nextSeq);
         }
-        // v6 to v11 and v13: the void window, then the open votes.
+        // Every version from v6 except v12: the void window, then the open votes.
         if (withVoids) {
             voids.writeTo(buf, canonicalCount);
         }
@@ -1616,9 +1747,18 @@ public final class CanonicalSealerState {
         if (withCursors) {
             recorded.writeTo(buf);
         }
-        // v13 only: the decision rules.
+        // v14 to v17: the decision rules.
         if (withRules) {
             rules.writeTo(buf);
+        }
+        // v15 to v17: the version switch and the replay windows.
+        if (withSwitch) {
+            versions.writeTo(buf);
+            windows.writeTo(buf);
+        }
+        // v16 and v17: the schedule of the carry flag.
+        if (withCarry) {
+            versions.writeCarryTo(buf);
         }
         return buf.array();
     }
@@ -1833,17 +1973,22 @@ public final class CanonicalSealerState {
             state.seedStatus = seedStatusOf(buf.get());
             buf.get(state.seedDigest);
         }
-        if (version == 11) {
+        if (version == CURSORS_SNAPSHOT_VERSION) {
             state.recorded = RecordedCursors.readFrom(
                 buf, budgets.recordLagRecords(), state.voids::isVoter);
         }
-        if (version == RULES_SNAPSHOT_VERSION) {
+        if (version == ONE_ACTIVATION_SNAPSHOT_VERSION) {
+            state.rules = DecisionRules.readVersionThirteen(buf);
+        }
+        if (version >= SNAPSHOT_WRITE_VERSION) {
             state.rules = DecisionRules.readFrom(buf);
         }
-        if (version == RETAINED_FILE_SNAPSHOT_VERSION) {
-            // Only a member with the retained file writes version 12, and
-            // such a member runs version 3 from its start.
-            state.rules = DecisionRules.newest();
+        if (version >= SWITCH_SNAPSHOT_VERSION) {
+            state.versions = VersionSwitch.readFrom(buf);
+            state.windows = SessionWindows.readFrom(buf, SessionWindows.DEFAULT_SLOTS, SessionWindows.DEFAULT_WIDTH);
+        }
+        if (version >= CARRY_SNAPSHOT_VERSION) {
+            state.versions.readCarryFrom(buf);
         }
         // A version-1 snapshot (before the guard existed) restores an empty
         // guard map, so every sender re-seeds on its next record. This is
@@ -1856,8 +2001,8 @@ public final class CanonicalSealerState {
         // peer's anchor with an unknown lane cursor. The cursor seeds from
         // the peer's next record. A version-10 or older snapshot restores
         // no recorded cursor, so the record-lag guard refuses nothing until
-        // the first cursor. A snapshot before version 12 restores the
-        // rules of a state with no activation.
+        // the first cursor. A snapshot without the decision rules
+        // restores a state that holds no activation.
         state.canonicalCount = canonicalCount;
         state.restoredSnapshotVersion = version;
         return state;

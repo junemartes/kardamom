@@ -71,12 +71,21 @@ kardamom-deploy addresses --owner 0xSAFE --l2-chain-id 42 --rpc-url https://...
 | ERC-7955 factory | `0xC0DEb853af168215879d284cc8B4d0A645fA9b0E` (canonical on every EIP-7702 chain) |
 | Kardamom factory impl | `CREATE2(ERC7955, keccak256("kardamom.factory.impl.v1"), keccak256(impl_initcode))` |
 | **Kardamom factory proxy** | `CREATE2(ERC7955, keccak256("kardamom.factory.proxy.v1"), keccak256(ERC1967Proxy_init ‖ abi.encode(impl_addr, initialize_calldata(owner))))` |
-| App impl (shared across L2s) | `CREATE2(kardamomFactory, keccak256(abi.encode(id, "impl", version)), keccak256(impl_initcode))` |
+| App impl (shared across L2s) | `CREATE2(kardamomFactory, keccak256(abi.encode(id, "impl", version)), keccak256(app_creation_code ‖ abi.encode(kardamomFactory)))` |
 | App proxy (per L2) | `CREATE2(kardamomFactory, keccak256(abi.encode(l2ChainId, id, "proxy")), keccak256(ERC1967Proxy_init ‖ abi.encode(impl_addr, init_data)))` |
 
 Different `--owner` values give different factory proxy addresses. This is intended.
 
 - Each environment (mainnet, testnet, dev) has its own canonical owner. It therefore has its own canonical factory address.
+
+## Upgrade authority
+
+Each app implementation extends `KardamomUUPSBase`. Its constructor takes the factory proxy address and stores it as an immutable.
+
+- Only that factory can upgrade the proxy or call its factory-only setters.
+- `ETHLockbox.initiateUpgrade` reads the owner of that factory.
+- The deployer appends `abi.encode(factory)` to the creation code of each app implementation. `ContractId::initcode` builds this initcode.
+- The view `factory()` returns the stored address. After each `apply`, the deployer reads `factory()` from each proxy of the batch. It fails with `FactoryMismatch` when the value is not its own factory.
 - An owner with the same address on several L1s (for example a deterministic Safe) gives the same factory address on those L1s.
 
 ## Bytecode pinning
@@ -92,11 +101,9 @@ The canonical address of the factory depends on the exact bytecode of `KardamomF
 | OpenZeppelin upgradeable | `openzeppelin-contracts-upgradeable@v5.0.2` (CI installs this version explicitly) |
 
 - `contracts/expected_bytecode_hash.txt` holds the SHA-256 of the runtime bytecode of `KardamomFactoryV1`.
-- The test `factory_address_sync` (`crates/deployer/tests/factory_address_sync.rs`) checks that the `FACTORY` constant in `KardamomUUPSBase.sol` equals the computed factory address for the dev owner.
 - A deliberate change that shifts the bytecode needs these steps:
   1. Bump the salt suffix in `crates/deployer/src/addresses.rs` (`v1` to `v2`).
   2. Regenerate `contracts/expected_bytecode_hash.txt`.
-  3. Run `cargo test -p kardamom-deployer --test factory_address_sync`. Update `KardamomUUPSBase.FACTORY` with the new address.
 - The v1 factory stays at its old address. The v2 factory has a new canonical address.
 
 ## What if ERC-7955 is not on my chain?

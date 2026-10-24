@@ -83,6 +83,10 @@ pub struct IngressConfig {
     /// two account RPCs. Off when the endpoint list is empty: a cold
     /// address then gets an error, not an answer.
     pub executor_query: ExecutorQueryConfig,
+    /// The query of `eth_getTransactionReceipt` on a cache miss: the
+    /// egress, which answers it as an executor does. An empty list uses
+    /// [`Self::executor_query`].
+    pub receipt_query: ExecutorQueryConfig,
     /// The Redis layer, between the local layer and the executor query.
     /// Off when no address is configured: no Redis call exists on any
     /// path. On, the submit path reads the account projection on a
@@ -104,11 +108,71 @@ pub struct IngressConfig {
     /// refuses a larger transaction before it decodes it. The cap bounds
     /// the bytes of each transaction on every path after the ingress.
     pub max_tx_bytes: NonZeroUsize,
+    /// When `eth_sendRawTransaction` answers. See [`AckMode`].
+    pub ack: AckMode,
+    /// The hashes that the duplicate cache of the validated ack holds. The
+    /// oldest hash goes when the cache is full.
+    pub duplicate_cache_capacity: NonZeroUsize,
+}
+
+/// When `eth_sendRawTransaction` answers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AckMode {
+    /// It waits for the receipt.
+    #[default]
+    Receipt,
+    /// The ack at admission: it answers on the verdict of the sequencer, as
+    /// an Ethereum node answers when its mempool takes a transaction. See
+    /// [`crate::acks`].
+    Admission(AdmissionAck),
+    /// The validated ack: it answers when this ingress validated the
+    /// transaction and published it on `tx_data`. It waits for nothing
+    /// after the publication. `kardamom_sendRawTransactionAsync` answers
+    /// the same way.
+    Validated,
+}
+
+impl AckMode {
+    /// The settings of the ack at admission, in that mode.
+    #[must_use]
+    pub fn admission(self) -> Option<AdmissionAck> {
+        match self {
+            Self::Admission(ack) => Some(ack),
+            Self::Receipt | Self::Validated => None,
+        }
+    }
+}
+
+/// The settings of the ack at admission. See [`crate::acks`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionAck {
+    /// The time a submission waits for a verdict, then fails with
+    /// `transaction not acknowledged`.
+    pub timeout: Duration,
+    /// The time a rejection waits for an accept of another twin.
+    pub reject_grace: Duration,
+    /// The sequencers of each lane that send a verdict. A rejection of
+    /// every one of them answers at once.
+    pub twins: std::num::NonZeroU8,
+}
+
+impl Default for AdmissionAck {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(2),
+            reject_grace: Duration::from_millis(250),
+            twins: std::num::NonZeroU8::new(2).unwrap_or(std::num::NonZeroU8::MIN),
+        }
+    }
 }
 
 /// The default of [`IngressConfig::max_tx_bytes`]: 128 KiB, equal to the
 /// geth default (`txMaxSize` = 131072).
 pub const DEFAULT_MAX_TX_BYTES: NonZeroUsize = NonZeroUsize::new(128 * 1024).unwrap();
+
+/// The default of [`IngressConfig::duplicate_cache_capacity`]: 65,536
+/// hashes, a few MiB.
+pub const DEFAULT_DUPLICATE_CACHE_CAPACITY: NonZeroUsize = NonZeroUsize::new(64 * 1024).unwrap();
 
 /// The deadline that never passes. The sealer reads the guard header's
 /// deadline as a signed 64-bit integer and refuses a record once its block
@@ -199,6 +263,7 @@ impl Default for IngressConfig {
             live_accounts: LiveAccountsConfig::default(),
             admission_checks: true,
             executor_query: ExecutorQueryConfig::default(),
+            receipt_query: ExecutorQueryConfig::default(),
             cache: CacheConfig::default(),
             mirror_count: nonzero!(1u32),
             // 64 blocks is 16 s at the 250 ms production tick, and 128 s
@@ -207,6 +272,8 @@ impl Default for IngressConfig {
             // below the stall that makes a re-offer a hazard.
             inclusion_horizon_blocks: nonzero!(64u64),
             max_tx_bytes: DEFAULT_MAX_TX_BYTES,
+            ack: AckMode::Receipt,
+            duplicate_cache_capacity: DEFAULT_DUPLICATE_CACHE_CAPACITY,
         }
     }
 }

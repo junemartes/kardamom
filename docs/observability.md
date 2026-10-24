@@ -25,6 +25,7 @@ Set the address with `--metrics-addr` or `KARDAMOM_METRICS_ADDR`.
 | `kardamom-state-mirror` | `127.0.0.1:9007` | `0.0.0.0:9007` | `kardamom-state-mirror` |
 | `kardamom-notifier` | `127.0.0.1:9008` | `0.0.0.0:9008` | `kardamom-notifier` |
 | `kardamom-canary` | `127.0.0.1:9012` | `0.0.0.0:9012` | `kardamom-canary` |
+| `kardamom-egress` | `127.0.0.1:9013` | `0.0.0.0:9013` | none |
 | `kardamom-l1-indexer` | `127.0.0.1:9549` | `0.0.0.0:9009` | none |
 
 Notes on the table:
@@ -43,7 +44,8 @@ Notes on the table:
 - The monitoring job scrapes each exporter by its Consul node name: `<class>-<i>.node.<datacenter>.consul:<port>`.
   The job renders the targets from the node-class counts (`executor_count`, `sequencer_count`, `ingress_count`).
   A larger class gets its targets at the next deploy.
-- The services that Consul lists (the validator, the da-watcher, the batcher, the L1 follower, the notifier and the canary) are targets in every health state.
+- The services that Consul lists (the validator, the da-watcher, the batcher, the L1 follower, the notifier, the canary and the egress) are targets in every health state.
+  The monitoring job scrapes the egress only when the deploy runs it (`KARDAMOM_EGRESS=1`, the job variable `egress`).
   A halt or a pause fails `/ready` by design, so Consul marks the service critical. A healthy-only list would drop the target exactly when the halt and pause alerts need its metrics.
   A dead process stays a registered target and reads as `up == 0`.
 
@@ -52,16 +54,15 @@ Notes on the table:
 - Each binary takes `--host-id <STRING>` (env `KARDAMOM_HOST_ID`, default `local`).
   It sets the `host_id` label of each metric. `kardamom_obs::init` adds a `service` label.
 - The `Kardamom Overview` dashboard has a `host` template variable. The service dashboards inherit it.
-- The sealer is a Java service in an Aeron Cluster. It has no Prometheus endpoint.
-  Each executor re-exports the output of the sealer as it decodes the cluster egress:
+- The sealer is a Java service in an Aeron Cluster. Its Prometheus endpoint is `GET /metrics` on the admin port of each member (40205).
+  The monitoring job scrapes it as the job `kardamom-sealer`.
+  - `kardamom_sealer_disk_free_bytes{member_id}` is the free space of the disk that holds the Raft log and the retained file of the member.
+  - The other series carry the labels `service="sealer"` and `member_id`. They do not carry `host_id`. See "Sealer pipeline" below.
+- Each executor also re-exports the output of the sealer as it decodes the cluster egress:
   - `kardamom_sealer_boundaries_emitted_total` counts the boundary frames.
   - `kardamom_sealer_block_number` is the block that the sealer declared.
   - The series are on the executor port with the `host_id` of the executor.
     They show the boundary stream as one executor sees it.
-  - For the sealer itself, use the admin port and the log lines (see below).
-- The admin port of each sealer member answers `GET /metrics` with one gauge in the Prometheus text format:
-  - `kardamom_sealer_disk_free_bytes{member_id}` is the free space of the disk that holds the Raft log and the retained file of the member.
-  - The deploy does not scrape it yet.
 
 ### Cluster client metrics
 
@@ -73,10 +74,22 @@ Every service that drives a cluster session exports the state of that session un
 | `kardamom_cluster_client_leader_member_id` | The leader that the ingress publication points at. |
 | `kardamom_cluster_client_leader_changes_total` | Redirects and new-leader events. |
 | `kardamom_cluster_client_sessions_total` | Sessions opened. |
+| `kardamom_cluster_client_egress_age_seconds` | A histogram. For each drain of egress frames, the age of the oldest app message: the clock of this host minus the timestamp that the leader wrote in the message header. |
 
 - A leader change rate above zero in steady state is an election.
 - A client that stays disconnected finds no member that answers.
 - These series observe the Raft set from its clients, not from inside the JVM.
+- The egress age has a resolution of 1 ms. It includes the clock offset between the two hosts. A leader clock ahead of this host gives zero age.
+
+The session thread records these pipeline names (see "Pipeline metrics"):
+
+| Kind | Name | Meaning |
+| --- | --- | --- |
+| loop | `cluster_client.session` | The duty cycle of a session that publishes. A cycle that moves frames or offers is busy. A cycle that finds nothing, and the wait after it, are idle. |
+| loop | `cluster_client.stream_session` | The same loop for a session that subscribes to the canonical stream. A process can drive one session of each kind. |
+| step | `cluster_client.offer` | One offer request: the wrap and the publish of its payload. |
+| queue | `cluster_client.requests` | The offer requests that wait. Only a session with an ingress seam sets it. |
+| queue | `cluster_client.egress_out` | The egress payloads that wait for the consumer. The stream session uses `cluster_client.stream_egress_out`. |
 
 ### Host and agent metrics
 
@@ -137,6 +150,32 @@ Each cause has a runbook in [runbooks/README.md](runbooks/README.md).
 ```
 
 The range is 100 µs to 5 s.
+
+Some histograms have their own buckets:
+
+| Histogram | Buckets |
+| --- | --- |
+| `kardamom_step_seconds` | 1 µs to 10 s |
+| `kardamom_batch_items`, `kardamom_validator_parallel_batches` | The powers of 2 from 1 to 65,536 |
+| `kardamom_executor_bal_frame_bytes` | The powers of 4 from 64 B to 64 MiB |
+| `kardamom_canary_*` | 5 ms to 1 h |
+
+### Pipeline metrics
+
+Four names locate a bottleneck on the transaction path. Every service records them through
+`kardamom_obs::pipeline`. The `service` label tells the services apart.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `kardamom_loop_nanoseconds_total` | counter | `loop`, `state` | The time of a thread loop in each state: `busy`, `idle` or `blocked`. |
+| `kardamom_queue_depth` | gauge | `queue` | The items that wait in a queue between two loops. |
+| `kardamom_step_seconds` | histogram | `step` | The duration of one step of work. A hot loop records it per batch. |
+| `kardamom_batch_items` | histogram | `batch` | The items in one batch. |
+
+- The busy share of a loop is `busy / (busy + idle + blocked)`. A share near 1 means that the loop is saturated.
+- `blocked` is time with work but no room on the output: a full queue or a back-pressured publication.
+- A queue that grows sits in front of the bottleneck.
+- A loop adds its time to the counter at most every 100 ms.
 
 ## Readiness
 
@@ -230,6 +269,9 @@ Each dashboard is a JSON file in `deploy/grafana/provisioning/dashboards-json/`.
 | `kardamom-state-mirror` | The account-state mirror. |
 | `kardamom-notifier` | The status feed and the webhooks. |
 | `kardamom-canary` | The transaction canary: the success ratio per probe and per endpoint, the failures by outcome, the stage latencies, the last success, the balances, the feed gaps and the stalled accounts. |
+| `kardamom-performance` | Throughput and latency against the two load goals: 10,000 tx/s sustained, and 1,000,000 tx/s with a p99 of 1 ms from submit to the executed receipt. It shows the share of each goal, the rate at each pipeline step, the submit-to-sealed and submit-to-executed percentiles, the canary stages, the step times inside the services, the queues and the back pressure. |
+| `kardamom-availability` | The service levels against a 99.9 % target over the selected range: the canary success and its error budget, the submit success, the chain liveness, the ingress reachability and the validator verdict. Over time: the failures, the head lag of each replica, the scrape targets, the settlement and the sealer leader changes. |
+| `kardamom-bottlenecks` | The pipeline metrics of every service in path order: the busy and blocked share of each loop, the queue depths, the step p50 and p99, the batch sizes, the latency of each stage, and the misses and retries. |
 
 - A dashboard queries `kardamom`-scoped metrics of its service.
 - The test `crates/obs/tests/dashboards.rs` checks that each dashboard in `EXPECTED_DASHBOARDS` parses, uses schema 38,
@@ -317,6 +359,17 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 These counters need an alert of your own. No rule in `deploy/alerts.yml` watches them:
 
 - `kardamom_executor_resync_total{outcome}` counts the full resyncs after a replay-window overrun.
+- `kardamom_egress_copy_mismatch_total` counts the copies of a canonical frame, from another executor, whose bytes differ from the first copy. Any increase means that one executor read another stream: alert on it.
+- `kardamom_egress_waiting_dropped_total` counts the times that every executor copy missed a frame, and the egress dropped the frames that waited behind it. The merged stream then stalls until a copy sends the frame.
+- `kardamom_egress_caught_frames_total` counts the frames that a peer egress gave after a start, to fill the place between the head and the executor copies.
+- `kardamom_egress_rebased_total{reason}` counts the times that the egress started its stream again: after a boundary of a copy with no peer (`boundary`), or at the floor of a peer above its head (`peer-floor`). After a `boundary` start, the store holds no frame before that boundary, and a reader of an older cursor reads another instance.
+- `kardamom_executor_egress_frames_dropped_total` counts the canonical frames that the reader did not forward on `exec_frames`, because the queue to the publication was full.
+
+`kardamom_egress_head_distance_frames` is a gauge of each egress instance. It gives the canonical indexes between the stored head and the newest record that any executor copy sent. The egress sets it after each sync of its store.
+
+- The sealer keeps only its replay window. A reader below the window recovers from the store of the egress, so the distance must stay well inside the window.
+- The egress does not see the sealed head. The distance does not include the lag of every executor behind the sealer.
+- `KardamomEgressHeadNearWindow` in `deploy/alerts.yml` fires when the distance stays above 32,768 for 1 minute: half the default window of 65,536 frames.
   - `peer-checkpoint`: the node fell behind the retention window and repaired itself from a peer checkpoint.
   - `unrecoverable`: the node could not repair itself and waits for an operator.
   - See "Replay-window overrun" in [failure-modes.md](failure-modes.md).
@@ -327,6 +380,9 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
   - See "A power loss on a majority of the sealers rolls the paired executors back" in [failure-modes.md](failure-modes.md).
 - `kardamom_sequencer_receipt_floors_forgotten_total` counts the nonce floors that a rollback of an executor reset to unknown.
 - `validator_replica_results_unchecked_total{reason="withdrawn"}` counts the buffered receipts, rows and BALs that a rollback of an executor withdrew.
+- `kardamom_checkpoint_log_dropped_total` counts the committed blocks that the state writer did not give to the block log of the checkpoints, because the queue to the log thread was full. Each one is a gap in the log.
+- `kardamom_checkpoint_log_failed_total{step}` counts the appends and syncs of the block log that failed (`step` is `append` or `sync`). The next block then starts a new segment.
+- `kardamom_checkpoint_copy_unlimited_total` counts the base copies that libmdbx refused into the pipe of the rate limit. Such a copy then ran with no limit.
 - `kardamom_checkpoint_unreadable_schema_skips_total` counts the checkpoints an executor, a validator or a state mirror skipped because the image holds a state schema the release does not read.
   - An increment after a rollback is expected: the newest checkpoint comes from the newer release.
   - Growth on a steady fleet means a node runs a release of another schema.
@@ -429,14 +485,110 @@ With `--carry-bytes` (`KARDAMOM_CARRY_BYTES`, off by default), the executor read
 - Switch it on only with sealer members that carry the bytes and run the member feed.
 - Off: the executor joins the references of the cluster egress with `tx_data`.
 
+With `--carry-bytes`, `--egress <url>` (`KARDAMOM_EGRESS_URL`, off by default) makes the egress the second source of the executor.
+
+- A cursor below the replay window of the member reads the range read of the egress from the cursor to the head of the store. Then the executor reads the live `egress_order`.
+- The executor goes back to the feed by the same rule as from the serving service.
+- A cursor below the floor of the egress store too stages a peer checkpoint (`kardamom_executor_resync_total`).
+- Off: a cursor below the window stages a peer checkpoint at once.
+
 | Metric | Meaning |
 | --- | --- |
-| `kardamom_executor_input_source{source}` | 1 for the source that the executor reads, 0 for the other. `source` is `feed` (the member feed) or `service` (the serving service). |
+| `kardamom_executor_input_source{source}` | 1 for the source that the executor reads, 0 for the other. `source` is `feed` (the member feed) or `service` (the serving service, or the egress with `--egress`). |
 | `kardamom_executor_source_mismatch_total{source}` | Canonical entries whose `keccak256(raw_tx)` is not the canonical id, by the source that sent them. The executor does not execute such an entry and does not stop: it leaves the source and reads the same index from the other source. |
 
 - The executor leaves the feed when no frame comes for 6 s, when the feed loses its image, or on a mismatch. It goes back to the feed after the feed has one image for 30 s and a replay of the feed from its cursor reaches `REPLAY_DONE`.
 - Any increment of `kardamom_executor_source_mismatch_total` needs an operator: a member or a service sends bytes that do not match the ordered id. The log line is `the raw transaction does not hash to its canonical id; replaying from the other source`, with the source and the index.
 - A switch logs `switching the input source` with the old and the new source and the cursor.
+
+### Executor pipeline
+
+The executor records the [pipeline metrics](#pipeline-metrics) on the streaming path: the `tx_data` lanes and the
+`tx_ordering` join, then the exec thread, the commit thread and the state writer. A hot loop records a step or a batch
+once per block or per publish batch, never per transaction.
+
+| Name | Kind | Meaning |
+| --- | --- | --- |
+| `executor.tx_data_reader` | loop | The `tx_data` reader threads. Idle is the wait on a lane. Busy is the insert into the join buffer. All lanes add to one series. |
+| `executor.ordering_reader` | loop | The `tx_ordering` reader. A join wait is busy. Blocked is a send to a full exec channel or executor stream. |
+| `executor.exec` | loop | The exec thread. Blocked is a send to a full commit channel, and the wait for a free commit slot. |
+| `executor.commit` | loop | The commit thread. Busy is the publish on `tx_receipts`. Blocked is the pause between two must-deliver attempts. |
+| `state.writer` | loop | The state writer thread. Idle is the wait for a block delta. Busy is the commit. |
+| `executor.tx_data` | queue | The `tx_data` backlog of the lane that read last. `kardamom_executor_tx_data_queue_depth{shard}` has each lane. |
+| `executor.join_buffer` | queue | The envelopes in the join buffer. The `tx_ordering` reader sets it after each join. |
+| `executor.exec_stream` | queue | The items from the reader that wait for the executor stream publisher. It holds 4096 items at most. |
+| `executor.reader_to_exec` | queue | The messages from the reader that wait for the exec thread. The receipt queue depth bounds it. |
+| `executor.exec_to_commit` | queue | The messages from the exec thread that wait for the commit thread. The receipt queue depth bounds it. |
+| `executor.commits_inflight` | queue | The blocks that the state writer did not commit yet. At the full commit pipeline depth, the exec thread waits. |
+| `executor.join_wait` | step | A join that did not find its envelope at the first lookup: the time to the end of the join. A join that finds it at once records nothing. |
+| `executor.archive_refetch` | step | One archive refetch of a join miss. |
+| `executor.boundary` | step | The handling of one block boundary on the exec thread. |
+| `executor.receipt_publish` | step | One publish of a receipt batch on `tx_receipts`, with its retries. |
+| `state.commit` | step | One block commit of the state writer, from the open of the transaction to the end of the mdbx commit. |
+| `state.commit_open`, `state.commit_storage`, `state.commit_accounts`, `state.commit_receipts`, `state.commit_trie`, `state.commit_mdbx` | step | The sections of one block commit. `state.commit_trie` records only when the writer keeps a trie. `KARDAMOM_WRITER_TIMING` still prints the same sections. |
+| `executor.block_txs` | batch | The records in one sealed block. |
+| `executor.receipt_batch` | batch | The receipts in one publish on `tx_receipts`. |
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_executor_join_misses_total` | Joins whose first in-band wait ended without the envelope. The `tx_data` lane fell behind by a whole wait slice. |
+| `kardamom_executor_archive_refetch_total{outcome}` | Archive refetches of a join. The outcomes are `ok`, `absent` (the archive does not hold the range) and `error`. |
+| `kardamom_executor_archive_refetch_recovered_total` | Envelopes that archive refetches put into the join buffer. |
+| `kardamom_executor_void_votes_total` | Entries that every archive refused. For each one, the executor asks the sealer for a void. |
+| `kardamom_executor_gas_used_total` | The gas of each sealed block. Its rate is the gas per second. |
+| `kardamom_executor_receipt_publish_retries_total` | Failed must-deliver attempts on `tx_receipts`. Each one pauses the commit thread. |
+| `kardamom_executor_bal_handoff_dropped_total` | Blocks whose BAL the exec thread dropped, because the queue to the BAL publisher was full. |
+| `kardamom_executor_state_commit_duration_seconds` | The wait of the exec thread for a free commit slot when the commit pipeline is full. It is not the commit time: `state.commit` is the commit time. |
+
+### Executor pipeline
+
+The executor records the pipeline metrics on each thread from the `tx_data` lanes to the receipts.
+
+| Kind | Name | Meaning |
+| --- | --- | --- |
+| loop | `executor.tx_data_reader` | The `tx_data` reader threads. Idle while the lane is empty. Every lane adds to this one series. |
+| loop | `executor.ordering_reader` | The `tx_ordering` reader. A join wait is busy. A send to a full exec channel or a full executor stream is blocked. A void park is idle. |
+| loop | `executor.exec` | The exec thread. A send to a full commit channel, and the wait for a free commit slot, are blocked. |
+| loop | `executor.commit` | The commit thread. The pause between two must-deliver attempts on `tx_receipts` is blocked. |
+| queue | `executor.tx_data` | The backlog of the `tx_data` lane that read last. The per-lane backlog is `kardamom_executor_tx_data_queue_depth{shard}`. |
+| queue | `executor.join_buffer` | The envelopes in the join buffer. |
+| queue | `executor.reader_to_exec` | The messages from the reader that wait for the exec thread. |
+| queue | `executor.commits_inflight` | The blocks that the state writer did not commit yet. The exec thread waits at the pipeline depth. |
+| queue | `executor.exec_to_commit` | The messages that wait for the commit thread. |
+| queue | `executor.exec_stream` | The items that wait for the executor stream publisher. |
+| step | `executor.join_wait` | A join that did not find its envelope at the first lookup. A join that finds it at once records nothing. |
+| step | `executor.archive_refetch` | One archive refetch of a join miss. |
+| step | `executor.boundary` | One block boundary: the settle, the seal and the start of the next block. |
+| step | `executor.receipt_publish` | The publish of one receipt batch, with its retries. |
+| batch | `executor.block_txs` | The records in each sealed block. |
+| batch | `executor.receipt_batch` | The receipts in each published batch. |
+
+| Counter | Meaning |
+| --- | --- |
+| `kardamom_executor_join_misses_total` | Joins whose first in-band wait ended without the envelope. The `tx_data` lane is a whole wait slice behind. |
+| `kardamom_executor_archive_refetch_total{outcome}` | Archive refetches: `ok`, `absent` (the archive does not hold the range) or `error`. |
+| `kardamom_executor_archive_refetch_recovered_total` | Envelopes that refetches put into the join buffer. |
+| `kardamom_executor_void_votes_total` | Entries that every archive refused. The executor asked the sealer for a void. |
+| `kardamom_executor_gas_used_total` | The gas of every sealed block. Its rate is the gas per second. |
+| `kardamom_executor_receipt_publish_retries_total` | Failed must-deliver attempts on `tx_receipts`. |
+| `kardamom_executor_bal_handoff_dropped_total` | Blocks whose BAL the exec thread dropped, because the BAL publisher queue was full. |
+
+- `kardamom_executor_state_commit_duration_seconds` is the wait of the exec thread for a free commit slot. It is not the commit. The `state.commit` step is the commit.
+
+### State writer
+
+The state writer thread records the loop `state.writer`. The thread has no output queue, so it is never blocked.
+Each block commit records these steps:
+
+| Step | Section |
+| --- | --- |
+| `state.commit` | The whole commit, from the start of the MDBX transaction to the end of its commit. |
+| `state.commit_open` | The open of the tables. |
+| `state.commit_storage` | The storage slots. |
+| `state.commit_accounts` | The accounts. |
+| `state.commit_receipts` | The receipts. |
+| `state.commit_trie` | The trie update. Only a writer with a trie records it. |
+| `state.commit_mdbx` | The MDBX commit, with the sync of the durability mode. |
 
 ### L1 follower (inbox indexer)
 
@@ -471,6 +623,70 @@ The epoch lane exports these metrics. See "Sequencer" in [failure-modes.md](fail
 | `kardamom_sequencer_epochs_unconfirmed` | The epochs that the lane relayed, or took to relay, and that no boundary confirmed yet. The lane holds at most 4096. |
 | `kardamom_sequencer_origin_gap_total` | The `ORIGIN_GAP` rejects that the sealer sent to this replica. Each one makes the lane offer its unconfirmed epochs again from the expected block. |
 
+The sequencer records these pipeline names (see "Pipeline metrics"). The v1 and the v2 loop record the same names.
+Each lane is its own process on its own metrics port, so the scrape target tells the lanes apart.
+
+| Kind | Name | Meaning |
+| --- | --- | --- |
+| loop | `sequencer.main` | The publish loop. A pass that did work is busy. A pass that found no input is idle. A pass that the sealer back-pressured is blocked. The wait after a pass counts in the state of the pass. |
+| loop | `sequencer.egress_feed` | The egress-watermark feed. It is idle while it waits for an egress frame. |
+| loop | `sequencer.receipt_feed` | The `tx_receipts` floor feed. It is blocked while the account rows wait for room in the queue of the v2 loop. |
+| step | `sequencer.offer_round_trip` | One offer to the sealer: the request to the session thread, the Aeron publish there, and the reply. The publish loop waits for all of it. |
+| step | `sequencer.tx_errors_publish` | One `tx_errors` publish. The publish loop waits for it for each refused transaction. |
+| step | `sequencer.account_lookup` | One lookup of a sender's state. The v2 loop times each lookup. The v1 loop times each query to Redis or the executors, and not the answers from the local account layer. |
+| batch | `sequencer.offer_refs` | The refs that one offer took. The v1 loop offers at most 13. The v2 loop offers its outbox up to 64 KiB of entries. |
+| queue | `sequencer.tx_data` | The envelopes that wait in the `tx_data` lanes. |
+| queue | `sequencer.outbox` | The v2 offers that wait for the sealer. The loop stops its intake at `outbox_cap`. |
+| queue | `sequencer.accounts` | The v2 account events that wait: rows, lookup answers and rollbacks. The queue holds 65,536. |
+
+- The loop sets its queue gauges once in 64 passes.
+- `kardamom_sequencer_nonce_check_duration_seconds` is the nonce state machine in the v1 loop, and the admission filter in the v2 loop.
+
+### Sealer pipeline
+
+The admin endpoint of each sealer member exports these series. Each one carries `service="sealer"` and `member_id`.
+They use the names of the shared pipeline metrics, so one dashboard shows whether the sealer is the bottleneck.
+
+The service thread writes the pipeline series. It allocates nothing for them and uses no map.
+A ClusteredService cannot see its idle time, so the loop exports busy time only. The Aeron cycle-time series below show the duty cycle.
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_loop_nanoseconds_total{loop="sealer.service",state="busy"}` | The time of the service thread in the session messages, the timers, the snapshots, and the member feed passes that did work. |
+| `kardamom_step_seconds{step="sealer.message"}` | One session message. A batch message is one step. |
+| `kardamom_step_seconds{step="sealer.flush_window"}` | One flush of the ordering window that admitted records. A member with no ordering window records none. |
+| `kardamom_step_seconds{step="sealer.boundary"}` | The work of one boundary timer: the flush, the boundary, the status, and the timer re-arm. |
+| `kardamom_step_seconds{step="sealer.snapshot"}` | One snapshot: the window flush and the snapshot write. |
+| `kardamom_step_seconds{step="sealer.egress_offer"}` | One offer of a relayed frame to the consumer sessions. It samples one offer in 64. |
+| `kardamom_batch_items{batch="sealer.ingress_batch"}` | The entries of one batch message (kind 3). |
+| `kardamom_queue_depth{queue="sealer.egress_backlog"}` | The bytes that the egress backlogs hold, after the last drain. |
+| `kardamom_queue_depth{queue="sealer.ordering_window"}` | The records that the ordering window holds. |
+| `kardamom_sealer_frames_total{outcome}` | The frames that the service did not relay. `outcome` is `malformed`, `unknown_kind`, `contiguity_reject`, `past_deadline`, `window_full`, `da_lag_reject`, `record_lag_reject`, `expired_ref`, `origin_gap` or `remote_origin_reject`. |
+| `kardamom_sealer_messages_total{kind}` | The session messages, by the kind byte. A kind shows after its first message. |
+| `kardamom_sealer_egress_backpressure_total{result}` | The egress offers that queued their frame. `result` is `back_pressured`, `admin_action` or `not_connected`. A frame behind an open backlog does not count. |
+| `kardamom_sealer_egress_stalls_total` | The sessions closed because their backlog made no progress for 1 s. |
+
+The admin thread reads these series from the status of the member and from the Aeron counters in the CnC file of its media driver. A series of an Aeron counter that does not exist is absent.
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_sealer_append_position` | The position that the archive recorded of the cluster log on this member. |
+| `kardamom_sealer_commit_position` | The log position that a quorum appended. Append minus commit is the wait for the quorum. |
+| `kardamom_sealer_service_position` | The log position that the service thread applied. Commit minus service is the wait for the service thread. |
+| `kardamom_sealer_consensus_max_cycle_seconds` | The longest duty cycle of the consensus module. |
+| `kardamom_sealer_consensus_cycle_threshold_exceeded_total` | The duty cycles of the consensus module above the cycle threshold. |
+| `kardamom_sealer_service_max_cycle_seconds` | The longest duty cycle of the clustered service. |
+| `kardamom_sealer_service_cycle_threshold_exceeded_total` | The duty cycles of the clustered service above the cycle threshold. |
+| `kardamom_sealer_archive_recorder_max_write_seconds` | The longest write of the archive recorder. |
+| `kardamom_sealer_archive_recorder_write_seconds_total` | The time of the archive recorder in writes. |
+| `kardamom_sealer_archive_recorder_write_bytes_total` | The bytes that the archive recorder wrote. |
+| `kardamom_sealer_driver_errors_total` | The errors that the media driver logged. |
+| `kardamom_sealer_driver_naks_sent_total` | The NAK messages that the media driver sent. |
+| `kardamom_sealer_driver_naks_received_total` | The NAK messages that the media driver received. |
+| `kardamom_sealer_driver_retransmits_total` | The retransmits that the media driver sent. |
+| `kardamom_sealer_driver_short_sends_total` | The sends that the socket took only in part. |
+| `kardamom_sealer_driver_sender_backpressure_total` | The back-pressure events of all network publications of the driver. |
+
 ### Ingress cluster status
 
 The ingress reads the status frame of the sealer and exports it on port 9006. The frame carries the posted head, the sealed head,
@@ -486,12 +702,52 @@ the replay retention of the sealer, and the record-lag guard. See [l1-data-path.
 | `kardamom_ingress_cluster_record_lag` | The canonical records past the best recorded cursor when the status frame arrived. The record-lag guard compares this value with its budget. `0` while no executor sent a cursor, because the guard then refuses nothing. |
 | `kardamom_ingress_tx_rejected_total{reason="paused"}` | Submits that a paused ingress refused. |
 | `kardamom_ingress_tx_rejected_total{reason="too-large"}` | Submits above the size cap, `--max-tx-bytes`. |
+| `kardamom_ingress_tx_rejected_total{reason="nonce-too-low"}` | With `--ack validated`, submits with a nonce below the account view of the sender. |
+| `kardamom_ingress_tx_rejected_total{reason="txpool-full"}` | With `--ack validated`, submits whose `tx_data` offer failed. |
 | `kardamom_ingress_seal_latency_seconds` | A histogram: the time from the `tx_data` publish of a transaction to the egress frame that gives it a canonical index. Only the ingress that published the transaction records it. A seal later than 180 s gives no sample. The buckets are the shared service buckets of 100 µs to 5 s. Above 10 ms their bounds are 25, 50, 100, 250 and 500 ms, then 1, 2.5 and 5 s. |
 | `kardamom_ingress_seal_stamps_expired_total` | The publish stamps that no seal matched within 180 s. Most are of refused transactions. A non-zero rate under load means that the seal latency histogram undercounts the tail. |
 | `kardamom_ingress_seal_stamps_dropped_total` | The publish stamps that the submit path dropped because the channel to the seal clock (65,536 stamps) was full. Each one is a seal with no latency sample. |
+| `kardamom_ingress_execute_latency_seconds` | A histogram: the time from the `tx_data` publish of a transaction to the first executor receipt for it. Only the ingress that published the transaction records it. A receipt later than 180 s gives no sample. The buckets are the shared service buckets. |
+| `kardamom_ingress_execute_stamps_expired_total` | The publish stamps that no receipt matched within 180 s. A non-zero rate under load means that the execute latency histogram undercounts the tail. |
+| `kardamom_ingress_execute_stamps_dropped_total` | The publish stamps that the submit path dropped because the channel to the executed clock (65,536 stamps) was full. |
+| `kardamom_ingress_bus_lagged_total{bus}` | The items that a stream bus of the ingress (32,768 items) dropped because its watcher fell behind. `bus` is `tx_receipts`, `tx_verdicts`, `tx_errors`, `block_boundaries`, `quorum_watermark` or `local_fsync_watermark`. A dropped verdict leaves its submission to the ack timeout. A dropped receipt or error does not release its waiter, so that client waits until the pending timeout (30 s). A non-zero `tx_receipts` rate explains a 30 s tail in the submit latency. |
 
 - The sealed head minus the posted head is the DA lag. The sealer refuses new transactions when it passes the DA-lag budget.
 - The record lag is the canonical count minus the best recorded cursor plus one. The ingress takes the count from the records and boundaries that it observed before the status frame. The sealer refuses user transactions when the record lag passes `recordLagBudget`. A flat recorded head while the lag grows means that no executor records.
+
+### Ingress pipeline
+
+The ingress records these names of the pipeline metrics (see "Pipeline metrics"). A submit records its steps once for each request.
+
+| Name | Metric | Meaning |
+| --- | --- | --- |
+| `ingress.submit` | step | The whole submit on the server, from the call to the answer, on each return path. With the receipt wait (no ack at admission), it includes the wait for the receipt. |
+| `ingress.validate` | step | The shared head of the submit: the shed, drain, pause and rate checks, the decode, and the sender recovery. It includes `ingress.recover`. |
+| `ingress.recover` | step | The sender recovery of one submit: the wait for a slot in the verifier intake, the batch window, and the recovery. |
+| `ingress.publish_round_trip` | step | The `tx_data` publish: the hop to the blocking pool and the round trip to the Aeron thread up to its ack. |
+| `ingress.recover_batch` | step | The recovery of one verifier batch on the blocking pool, up to the end of its last worker. |
+| `ingress.recover_batch` | batch | The requests in each verifier batch. |
+| `ingress.recover_intake` | queue | The requests that wait in the verifier intake after the flush task takes a batch. The intake holds four times the batch depth; a full intake makes a submit wait. |
+| `ingress.ack_waiters` | queue | The submissions that wait for the verdict of the sequencer (ack at admission). The shed check counts them with `kardamom_ingress_queue_depth`. |
+| `ingress.watermark` | loop | The cluster egress thread. Idle while it waits for an egress event (the receive and the decode), busy while it handles the event. |
+| `ingress.receipt_pump` | loop | The `tx_receipts` pump task. Idle while it waits for a frame, busy while it applies the rows and fans out the receipts. |
+| `ingress.receipt_batch` | batch | The receipts in each `tx_receipts` batch frame. A boundary-only frame adds no sample. |
+
+- A high `ingress.recover` with a low `ingress.recover_batch` step means that submits wait for the intake or the batch window, not for the recovery.
+- A busy share of `ingress.watermark` near 1 means that the egress frames queue in the cluster client before the thread reads them.
+
+### Aeron thread
+
+Each process has one Aeron thread. It carries the publishes and the subscriptions of every service in the process. The `service` label tells the processes apart.
+
+| Name | Metric | Meaning |
+| --- | --- | --- |
+| `log.aeron` | loop | One pass: the drain of the command queue, one retry of each queued publish, and one poll of each subscription. Busy when the pass handled a command or polled a fragment. Blocked when the pass did no work and a refused offer waits in the retry queue. Idle otherwise. The wait for the next command is blocked while a refused offer waits, idle otherwise. |
+| `log.aeron_commands` | queue | The commands that wait for the thread at the start of a pass: publishes, opens and closes from all callers. |
+| `log.aeron_pending` | queue | The publishes in the retry queue after a pass: offers that Aeron refused, and the frames behind them on the same publication. |
+
+- `kardamom_log_offer_retries_total` counts the offers that Aeron refused with a transient status (`BACK_PRESSURED`, `NOT_CONNECTED`, `ADMIN_ACTION`) and that stay queued for the next pass. A pass counts at most one refusal for each publication.
+- A frame that stays refused until its deadline fails. A best-effort frame then counts in `kardamom_log_best_effort_dropped_total`.
 
 ### Receipt cache and lookups
 
@@ -508,6 +764,12 @@ the replay retention of the sealer, and the record-lag guard. See [l1-data-path.
   and `state_error` when the query fails.
 - A client that is over its rate limit gets `shed`, and the ingress answers `null` without a query.
 - The receipt cache keeps the newest 131072 receipts and evicts the oldest first.
+- `kardamom_cache_reconnects_total` counts the Redis reconnects that a failed command started. One failure burst starts one reconnect.
+- `kardamom_cache_live_evictions_total` counts the entries that the local account layer removed, for the TTL or for the capacity. A high rate means that the layer is too small for the active accounts.
+- `kardamom_cache_reconnects_total` counts the reconnects that a failed Redis command starts. One failure burst starts one reconnect.
+  The readers skip the cache while the reconnect runs.
+- `kardamom_cache_live_evictions_total` counts the entries that the `live` layer removes, for the TTL or the capacity.
+  A high rate with many `live` misses means that the layer is too small for the active accounts.
 
 ### Transaction canary
 
@@ -552,10 +814,33 @@ See [tx-status-events.md](tx-status-events.md) for the feed and the webhooks.
 | `webhook_attempts_total{outcome}` | Webhook POST attempts. The outcomes are `ok`, `status`, and `error`. |
 | `webhook_delivery_seconds` | Histogram of the time from event arrival to delivery. |
 
+### Egress
+
+The egress (`kardamom-egress`) exports these metrics on `--metrics-addr` (`KARDAMOM_METRICS_ADDR`, default `127.0.0.1:9013`). The cluster job binds `0.0.0.0:9013` and registers it as the Consul service `kardamom-egress-metrics`. Every metric carries `host_id` (`egress-<alloc index>` in the cluster job).
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_egress_copy_mismatch_total` | Copies of a canonical frame whose bytes differ from the first copy. The egress does not stop. A difference means that one executor executed other bytes than the others: the validator decides which copy is wrong. |
+| `kardamom_egress_waiting_dropped_total` | Times that every copy missed a frame and the merge dropped the frames that waited behind it. |
+
+- Any increment of `kardamom_egress_copy_mismatch_total` needs an operator.
+- The egress answers `GET /health` on its HTTP port (`:8548` in the cluster job). The Consul check of the service `kardamom-egress` reads it.
+
 ### State mirror
 
 The state mirror exports `kardamom_state_mirror_serving`, `_batches_applied_total`, `_producer_disagreement_total`,
 `_head_tx_idx`, `_rebuilds_total`, `_rebuild_seconds`, `_write_retries_total`, and `_wait_replica_zero_total`.
+
+The mirror writes the waiting receipt batches as a group. It records these [pipeline metrics](#pipeline-metrics), once per group:
+
+| Name | Kind | Meaning |
+| --- | --- | --- |
+| `state_mirror.group` | step | One whole group: the write with its retries, the head and the replica wait. |
+| `state_mirror.write` | step | The write of one group: a `SCRIPT LOAD`, then one pipeline with the rows and the receipts of every batch. |
+| `state_mirror.head_set` | step | The publish of the head. |
+| `state_mirror.wait_replica` | step | The Redis `WAIT` for a replica. |
+| `state_mirror.group_batches` | batch | The receipt batches in one group. |
+| `state_mirror.group_receipts` | batch | The receipts in one group. |
 
 ### Validator replica checks
 

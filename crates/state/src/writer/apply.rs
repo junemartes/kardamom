@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use kardamom_obs::pipeline::Step;
 use signet_libmdbx::tx::aliases::RwTxSync;
 use signet_libmdbx::{Database, WriteFlags};
 use tracing::error;
@@ -24,6 +25,63 @@ use crate::schema::{
 use crate::trie;
 
 use super::{StateWriter, TrieMode, TxRefs, WriteBatch};
+
+/// One `tx_hash_index` entry of a block: the key, the value, and whether
+/// the receipt used its nonce.
+struct IndexEntry {
+    key: [u8; 32],
+    value: Vec<u8>,
+    used_nonce: bool,
+}
+
+impl IndexEntry {
+    /// `Vec::dedup_by` over entries sorted by key: `later` drops when it
+    /// names the hash of `kept`. A later receipt that used its nonce takes
+    /// the place of a kept one that used none.
+    fn merge_copy(later: &mut Self, kept: &mut Self) -> bool {
+        if later.key != kept.key {
+            return false;
+        }
+        if later.used_nonce && !kept.used_nonce {
+            std::mem::swap(later, kept);
+        }
+        true
+    }
+}
+
+/// The steps of one block commit, one for each timed section. The writer
+/// owns them, and records every section of every commit. The trie step
+/// records only when the writer keeps a trie.
+pub(super) struct CommitSteps {
+    open: Step,
+    storage: Step,
+    accounts: Step,
+    receipts: Step,
+    trie: Step,
+    mdbx: Step,
+    total: Step,
+}
+
+impl CommitSteps {
+    pub(super) fn new() -> Self {
+        Self {
+            open: Step::new("state.commit_open"),
+            storage: Step::new("state.commit_storage"),
+            accounts: Step::new("state.commit_accounts"),
+            receipts: Step::new("state.commit_receipts"),
+            trie: Step::new("state.commit_trie"),
+            mdbx: Step::new("state.commit_mdbx"),
+            total: Step::new("state.commit"),
+        }
+    }
+
+    /// Record the section that began at `started` on `step`, and return
+    /// its time for [`ApplyTimings`].
+    fn lap(step: &Step, started: Instant) -> Duration {
+        step.since(started);
+        started.elapsed()
+    }
+}
 
 /// Per-section stopwatches for one `apply` call, reported when
 /// `KARDAMOM_WRITER_TIMING` is set.
@@ -67,12 +125,17 @@ struct BatchWriter<'a> {
     meta: Database,
     trie_mode: TrieMode,
     timing: ApplyTimings,
+    steps: &'a CommitSteps,
 }
 
 impl<'a> BatchWriter<'a> {
     /// Open every table this batch touches, timed as the batch's `open`
     /// section.
-    fn open(txn: &'a RwTxSync, trie_mode: TrieMode) -> Result<Self, StateError> {
+    fn open(
+        txn: &'a RwTxSync,
+        trie_mode: TrieMode,
+        steps: &'a CommitSteps,
+    ) -> Result<Self, StateError> {
         let t0 = Instant::now();
         let accounts = txn.open_db(Some(TABLE_ACCOUNTS))?;
         let storage = txn.open_db(Some(TABLE_STORAGE))?;
@@ -92,12 +155,13 @@ impl<'a> BatchWriter<'a> {
             meta,
             trie_mode,
             timing: ApplyTimings {
-                open: t0.elapsed(),
+                open: CommitSteps::lap(&steps.open, t0),
                 storage: Duration::ZERO,
                 accounts: Duration::ZERO,
                 receipts: Duration::ZERO,
                 commit: Duration::ZERO,
             },
+            steps,
         })
     }
 
@@ -127,7 +191,7 @@ impl<'a> BatchWriter<'a> {
                 WriteFlags::UPSERT,
             )?;
         }
-        self.timing.storage = t.elapsed();
+        self.timing.storage = CommitSteps::lap(&self.steps.storage, t);
         Ok(self)
     }
 
@@ -141,7 +205,7 @@ impl<'a> BatchWriter<'a> {
     fn accounts(mut self, delta: &BlockDelta) -> Result<Self, StateError> {
         let t = Instant::now();
         crate::schema::write_accounts(self.txn, self.accounts, &delta.accounts)?;
-        self.timing.accounts = t.elapsed();
+        self.timing.accounts = CommitSteps::lap(&self.steps.accounts, t);
         Ok(self)
     }
 
@@ -178,6 +242,15 @@ impl<'a> BatchWriter<'a> {
     /// reads: `StateDatabase::get_tx_position(hash)`, then
     /// `StateDatabase::get_receipt(pos)`, and the batcher read where a
     /// block's bytes are once the sealer no longer retains the block.
+    ///
+    /// The sealer can order one transaction more than once: a client sends
+    /// the same signed bytes again, and the copies take different places in
+    /// the ingress stream. Only one copy can use the nonce; the others skip
+    /// and use none. So the index of a hash names the receipt that used the
+    /// nonce ([`Receipt::uses_nonce`]), and a receipt that used none takes
+    /// the index only while the hash has no entry. Every copy carries the
+    /// same bytes, so the first reference of a hash in the block serves
+    /// each copy.
     fn receipts_and_index(mut self, batch: &WriteBatch) -> Result<Self, StateError> {
         let t = Instant::now();
         let delta = &batch.delta;
@@ -187,12 +260,15 @@ impl<'a> BatchWriter<'a> {
             TxRefs::Archive(refs) => refs,
             TxRefs::RebuiltFromL1 => &[],
         };
-        let data: HashMap<_, _> = refs.iter().map(|r| (r.tx_hash, TxDataRef::of(r))).collect();
+        let mut data: HashMap<_, _> = HashMap::with_capacity(refs.len());
+        for r in refs {
+            data.entry(r.tx_hash).or_insert_with(|| TxDataRef::of(r));
+        }
         // Receipts arrive in ascending BPosition order, so use a cursor.
         // One pass writes each receipt and collects its hash-index entry,
         // instead of a second walk over `delta.receipts` just to build `hk`.
         let mut cur = self.txn.cursor(self.receipts)?;
-        let mut hk: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(delta.receipts.len());
+        let mut hk: Vec<IndexEntry> = Vec::with_capacity(delta.receipts.len());
         for r in &delta.receipts {
             let pos_key = encode_b_position(r.tx_idx);
             cur.put(&pos_key, &encode_receipt_value(r), WriteFlags::UPSERT)?;
@@ -200,17 +276,41 @@ impl<'a> BatchWriter<'a> {
                 tx_idx: r.tx_idx,
                 data: data.get(&r.tx_hash).copied(),
             };
-            hk.push((encode_tx_hash_key(r.tx_hash), encode_tx_hash_value(&value)));
+            hk.push(IndexEntry {
+                key: encode_tx_hash_key(r.tx_hash),
+                value: encode_tx_hash_value(&value),
+                used_nonce: r.uses_nonce(),
+            });
         }
         // The hash index's keys are random. Sort them first, so the cursor
-        // gets the same locality benefit.
-        hk.sort_unstable_by_key(|e| e.0);
+        // gets the same locality benefit. The sort is stable: the copies of
+        // one hash keep the order of their receipts. Then one entry stays
+        // for each hash: the receipt that used the nonce, else the first.
+        hk.sort_by_key(|e| e.key);
+        hk.dedup_by(IndexEntry::merge_copy);
+        let writes = hk
+            .iter()
+            .filter_map(|e| self.index_write(e).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
         let mut cur = self.txn.cursor(self.tx_hash_index)?;
-        for (k, v) in &hk {
-            cur.put(k, v, WriteFlags::UPSERT)?;
+        for e in writes {
+            cur.put(&e.key, &e.value, WriteFlags::UPSERT)?;
         }
-        self.timing.receipts = t.elapsed();
+        self.timing.receipts = CommitSteps::lap(&self.steps.receipts, t);
         Ok(self)
+    }
+
+    /// The entry to write: a receipt that used its nonce always writes, and
+    /// any other receipt writes only when the hash has no entry.
+    fn index_write<'e>(&self, e: &'e IndexEntry) -> Result<Option<&'e IndexEntry>, StateError> {
+        if e.used_nonce {
+            return Ok(Some(e));
+        }
+        let held = self
+            .txn
+            .get::<Vec<u8>>(self.tx_hash_index.dbi(), &e.key)?
+            .is_some();
+        Ok((!held).then_some(e))
     }
 
     /// Write the block-level durable cursors, last so a reader never sees a
@@ -260,6 +360,7 @@ impl<'a> BatchWriter<'a> {
         if self.trie_mode == TrieMode::Off {
             return Ok(self);
         }
+        let t = Instant::now();
         let tables = trie::TrieTables::open(self.txn)?;
         let root = tables.update_for_block(self.txn, delta)?;
         // `every_n` is never 0 here: `StateWriter::spawn_with_trie` refuses to
@@ -288,6 +389,7 @@ impl<'a> BatchWriter<'a> {
             encode_b256(root),
             WriteFlags::UPSERT,
         )?;
+        self.steps.trie.since(t);
         Ok(self)
     }
 
@@ -301,9 +403,10 @@ impl<'a> BatchWriter<'a> {
 impl StateWriter {
     pub(super) fn apply(&self, batch: &WriteBatch) -> Result<(), StateError> {
         let want_timing = std::env::var_os("KARDAMOM_WRITER_TIMING").is_some();
+        let started = Instant::now();
         let txn = self.env.raw().begin_rw_sync()?;
 
-        let mut timing = BatchWriter::open(&txn, self.trie_mode)?
+        let mut timing = BatchWriter::open(&txn, self.trie_mode, &self.steps)?
             .storage(&batch.delta)?
             .accounts(&batch.delta)?
             .code(&batch.delta)?
@@ -315,7 +418,8 @@ impl StateWriter {
 
         let t_commit = Instant::now();
         txn.commit()?;
-        timing.commit = t_commit.elapsed();
+        timing.commit = CommitSteps::lap(&self.steps.mdbx, t_commit);
+        self.steps.total.since(started);
 
         if want_timing {
             timing.report(batch);

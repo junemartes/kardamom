@@ -97,6 +97,8 @@ final class ClusterStubs {
         final IdleStrategy idleStrategy = new YieldingIdleStrategy();
         /** Every timer the service armed, as {@code (correlationId, deadline)} pairs. */
         final List<long[]> scheduledTimers = new ArrayList<>();
+        /** The cluster time of the current log entry: a test sets it before the entry. */
+        long time;
         /** Every message the service offered to the log, verbatim. */
         final List<byte[]> logOffers = new ArrayList<>();
         /** The role {@link #role()} reports. */
@@ -145,7 +147,7 @@ final class ClusterStubs {
         }
 
         public long time() {
-            return 0;
+            return time;
         }
 
         public TimeUnit timeUnit() {

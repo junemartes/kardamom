@@ -4,6 +4,7 @@ import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.ClusterStatus;
 import io.kardamom.sealer.Relayed;
 import java.nio.ByteOrder;
+import org.agrona.DirectBuffer;
 import org.agrona.MutableDirectBuffer;
 
 /**
@@ -32,16 +33,33 @@ final class EgressFrames {
      * copied through as is.
      */
     int relayed(final Relayed relayed) {
-        int pos = 0;
-        buf.putByte(pos, SealerWire.EGRESS_KIND_RELAYED);
-        pos += Byte.BYTES;
-        buf.putLong(pos, relayed.index, ByteOrder.LITTLE_ENDIAN);
-        pos += Long.BYTES;
-        buf.putInt(pos, relayed.payload.length, ByteOrder.LITTLE_ENDIAN);
-        pos += Integer.BYTES;
+        final int pos = relayedHeader(relayed.index, relayed.payload.length);
         buf.putBytes(pos, relayed.payload);
-        pos += relayed.payload.length;
-        return pos;
+        return pos + relayed.payload.length;
+    }
+
+    /** A relayed record whose payload is {@code length} bytes of {@code src} at {@code offset}. */
+    int relayed(final long index, final DirectBuffer src, final int offset, final int length) {
+        final int pos = relayedHeader(index, length);
+        buf.putBytes(pos, src, offset, length);
+        return pos + length;
+    }
+
+    /**
+     * The relayed canonical entry of a full reference: its payload is
+     * {@code [canonical_id:32][record_type:6][lane:u8][envelope]}, copied in
+     * two parts from the bytes that {@code offer} views.
+     */
+    int carried(final long index, final TxRefOffer offer) {
+        return offer.writeCanonical(buf, relayedHeader(index, offer.canonicalLength()));
+    }
+
+    /** {@code [kind:1][index:u64][payload_len:u32]}; returns the offset of the payload. */
+    private int relayedHeader(final long index, final int payloadLength) {
+        buf.putByte(0, SealerWire.EGRESS_KIND_RELAYED);
+        buf.putLong(Byte.BYTES, index, ByteOrder.LITTLE_ENDIAN);
+        buf.putInt(Byte.BYTES + Long.BYTES, payloadLength, ByteOrder.LITTLE_ENDIAN);
+        return SealerWire.RELAYED_HEADER_LEN;
     }
 
     /**
@@ -65,9 +83,8 @@ final class EgressFrames {
      * A retained frame as an egress session gets it: a relayed canonical
      * entry becomes its relayed reference, and every other frame stays as
      * is. A retained frame is one that this member framed: a relayed frame
-     * always holds the record type, because a member with the retained file
-     * runs version 3, and version 3 takes no ingress record without one
-     * ({@link RelayShape#minLength(int)}).
+     * always holds the record type, because the service takes no ingress
+     * record without one ({@link RelayShape#minLength()}).
      */
     static byte[] forSession(final byte[] retained) {
         final boolean entry = retained[0] == SealerWire.EGRESS_KIND_RELAYED
@@ -82,6 +99,25 @@ final class EgressFrames {
             CanonicalSealerState.CANONICAL_ID_LEN);
         ref[SealerWire.RELAYED_REF_LEN - 1] = SealerWire.RT_TX;
         return ref;
+    }
+
+    /**
+     * {@link #forSession(byte[])} in place, on the first {@code length} bytes
+     * of {@code staged}: a canonical entry becomes its relayed reference.
+     * Returns the new length.
+     */
+    static int forSession(final MutableDirectBuffer staged, final int length) {
+        final boolean entry = staged.getByte(0) == SealerWire.EGRESS_KIND_RELAYED
+            && staged.getByte(ENTRY_RECORD_TYPE_OFFSET) == SealerWire.RT_TX;
+        if (!entry) {
+            return length;
+        }
+        final byte[] id = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
+        staged.getBytes(SealerWire.RELAYED_HEADER_LEN, id);
+        staged.putByte(0, SealerWire.EGRESS_KIND_RELAYED_REF);
+        staged.putBytes(Byte.BYTES + Long.BYTES, id);
+        staged.putByte(SealerWire.RELAYED_REF_LEN - 1, SealerWire.RT_TX);
+        return SealerWire.RELAYED_REF_LEN;
     }
 
     /** A control message {@code [kind][a:u64][b:u64]}: the replay answers and the origin gap. */
@@ -102,6 +138,25 @@ final class EgressFrames {
         buf.putByte(Byte.BYTES, (byte) decisionVersion);
         buf.putLong(Byte.BYTES + Byte.BYTES, sessionId, ByteOrder.LITTLE_ENDIAN);
         return SealerWire.SEALER_INFO_LEN;
+    }
+
+    /**
+     * The refusal of a transaction reference:
+     * {@code [kind:18][canonical_id:32][sender:20][nonce:u64][decision_version:u8]}.
+     */
+    int refRefused(final byte[] canonicalId, final byte[] sender20, final long nonce, final int decisionVersion) {
+        int pos = 0;
+        buf.putByte(pos, SealerWire.EGRESS_KIND_REF_REFUSED);
+        pos += Byte.BYTES;
+        buf.putBytes(pos, canonicalId, 0, CanonicalSealerState.CANONICAL_ID_LEN);
+        pos += CanonicalSealerState.CANONICAL_ID_LEN;
+        buf.putBytes(pos, sender20, 0, CanonicalSealerState.SENDER_LEN);
+        pos += CanonicalSealerState.SENDER_LEN;
+        buf.putLong(pos, nonce, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putByte(pos, (byte) decisionVersion);
+        pos += Byte.BYTES;
+        return pos;
     }
 
     /**

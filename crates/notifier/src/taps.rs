@@ -45,6 +45,17 @@ impl TapSource for TxReceiptsReceiver {
     }
 }
 
+/// Where the receipts come from.
+#[derive(Clone, Copy, Debug)]
+pub enum ReceiptSource {
+    /// The `tx_receipts` stream of every executor. The count sizes the
+    /// fan-in under MDS; discovery ignores it.
+    Executors(Option<NonZeroU32>),
+    /// The `egress_receipts` stream: each receipt once, merged by the
+    /// egress.
+    Egress,
+}
+
 /// The three open subscriptions.
 pub struct Taps {
     status: TxStatusSubscriberHandle,
@@ -53,8 +64,8 @@ pub struct Taps {
 }
 
 impl Taps {
-    /// Open the three subscriptions through the plane. `executor_count`
-    /// sizes the receipts fan-in under MDS; discovery ignores it.
+    /// Open the three subscriptions through the plane. The receipts come
+    /// from `source`.
     ///
     /// # Errors
     ///
@@ -62,15 +73,19 @@ impl Taps {
     pub fn open(
         rt: &AeronRuntime,
         plane: &mut StreamPlane,
-        executor_count: Option<NonZeroU32>,
+        source: ReceiptSource,
     ) -> Result<Self, LogError> {
+        let receipts = match source {
+            ReceiptSource::Executors(executor_count) => {
+                plane.tx_receipts_subscriber(rt, executor_count)?
+            }
+            ReceiptSource::Egress => plane.egress_receipts_subscriber(rt)?,
+        };
         Ok(Self {
             status: plane.subscriber::<TxStatusSubscriberHandle>(rt)?,
             // The receiver alone moves into the task. A runtime clone in
             // the task would hold the Aeron thread open past shutdown.
-            receipts: plane
-                .tx_receipts_subscriber(rt, executor_count)?
-                .into_receiver(),
+            receipts: receipts.into_receiver(),
             errors: plane.subscriber::<TxErrorsSubscriberHandle>(rt)?,
         })
     }

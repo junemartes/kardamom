@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.aeron.ChannelUri;
 import io.aeron.driver.NameResolver;
 import java.io.IOException;
 import java.net.InetAddress;
@@ -16,6 +17,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.agrona.SystemUtil;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -30,6 +32,48 @@ final class ClusterNodeTest {
         "0,192.168.56.51:40200,192.168.56.51:40201,192.168.56.51:40202,192.168.56.51:40203,192.168.56.51:40204"
             + "|1,192.168.56.52:40200,192.168.56.52:40201,192.168.56.52:40202,192.168.56.52:40203,192.168.56.52:40204"
             + "|2,192.168.56.53:40200,192.168.56.53:40201,192.168.56.53:40202,192.168.56.53:40203,192.168.56.53:40204";
+
+    /**
+     * The log channel gives each follower a receive window of half a term,
+     * the most that Aeron allows, and a socket buffer of the same size.
+     */
+    @Test
+    void theLogChannelGivesEachFollowerAWindowOfHalfATerm() {
+        final ChannelUri uri = ChannelUri.parse(ClusterNode.LOG_CHANNEL);
+        final long term = SystemUtil.parseSize("term-length", uri.get("term-length"));
+        final long window = SystemUtil.parseSize("rcv-wnd", uri.get("rcv-wnd"));
+        assertEquals(8L << 20, term);
+        assertEquals(term / 2, window);
+        assertEquals(window, SystemUtil.parseSize("so-rcvbuf", uri.get("so-rcvbuf")));
+    }
+
+    /**
+     * A snapshot opens a publication on the snapshot channel. A small sparse
+     * log buffer opens at once, and its max message length still fits the
+     * chunks of the snapshot writer.
+     */
+    @Test
+    void theSnapshotChannelOpensASmallSparseLogBuffer() {
+        final ChannelUri uri = ChannelUri.parse(ClusterNode.SNAPSHOT_CHANNEL);
+        assertEquals("ipc", uri.media());
+        assertEquals(4L << 20, SystemUtil.parseSize("term-length", uri.get("term-length")));
+        assertEquals("true", uri.get("sparse"));
+    }
+
+    @Test
+    void theDriverThreadingModeIsSharedByDefaultAndRefusesAnUnknownMode() {
+        final String key = "kardamom.cluster.driverThreadingMode";
+        try {
+            System.clearProperty(key);
+            assertEquals(io.aeron.driver.ThreadingMode.SHARED, ClusterNode.driverThreadingMode());
+            System.setProperty(key, "DEDICATED");
+            assertEquals(io.aeron.driver.ThreadingMode.DEDICATED, ClusterNode.driverThreadingMode());
+            System.setProperty(key, "INVOKER");
+            assertThrows(IllegalArgumentException.class, ClusterNode::driverThreadingMode);
+        } finally {
+            System.clearProperty(key);
+        }
+    }
 
     @Test
     void memberEndpointsReturnsTheFiveEndpointsForEachId() {
@@ -177,8 +221,7 @@ final class ClusterNodeTest {
     }
 
     /**
-     * The job names no decision version: every member starts on version 2,
-     * and only an upgrade transaction in the log switches it to version 3
+     * The job names no decision version: every member runs version 3
      * ({@link SealerDecisionRulesTest}). A job spec that names a version is
      * replaced by a rolling deploy.
      */
@@ -186,7 +229,7 @@ final class ClusterNodeTest {
     void theSealerJobNamesNoDecisionVersion() throws IOException {
         final String job = Files.readString(Path.of(System.getProperty("kardamom.sealerJob")));
         assertFalse(job.contains("decisionVersion"), "the job names no decision version");
-        assertEquals(2, io.kardamom.sealer.DecisionRules.START_VERSION);
+        assertEquals(3, io.kardamom.sealer.DecisionRules.VERSION);
     }
 
     /** Member names under the reserved .invalid domain: no lookup can resolve them. */

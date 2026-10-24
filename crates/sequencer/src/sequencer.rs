@@ -51,11 +51,11 @@ use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, B256};
-use kardamom_cluster_adapter::wire::GuardHeader;
+use kardamom_cluster_adapter::wire::{GuardHeader, position_deadline};
 use kardamom_log::aeron_live::{IdleBackoff, IdleCap};
 use kardamom_types::num::usize_to_u64;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
-use kardamom_types::{BPosition, TxError, TxErrorReason, TxStatus};
+use kardamom_types::{BPosition, DropReason, TxDrop, TxError, TxErrorReason, TxStatus};
 use tracing::{trace, warn};
 
 use crate::config::{ConfigError, SequencerConfig};
@@ -66,6 +66,8 @@ use crate::lookup::LookupRequester;
 use crate::metrics;
 use crate::nonce_ahead::NonceAheadWatch;
 use crate::outbound::{RefOffer, SideChannelPublisher, TxOrderingRefPublisher};
+use crate::pipeline::PublishMeters;
+use crate::sealer_rules::SealerVersion;
 use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction, ProcessResult};
 use crate::tx_decode::decode_fields;
@@ -248,6 +250,10 @@ pub struct Sequencer {
     /// The fee admission gate. Off unless the binary wired the base fee
     /// view and the setting is on.
     fees: FeeGate,
+    /// The decision version of the sealer. Under version 4 the deadline
+    /// field of each offer carries the stream position of the envelope.
+    sealer_version: SealerVersion,
+    pipeline: PublishMeters,
 }
 
 impl Sequencer {
@@ -288,6 +294,8 @@ impl Sequencer {
             depth,
             pause: crate::pause_gate::PauseGate::default(),
             fees: FeeGate::off(),
+            sealer_version: SealerVersion::default(),
+            pipeline: PublishMeters::new(),
         })
     }
 
@@ -295,6 +303,26 @@ impl Sequencer {
     /// envelope, and the admitted bid rides the offer.
     pub fn enable_fees(&mut self, gate: FeeGate) {
         self.fees = gate;
+    }
+
+    /// Follow the decision version that the sealer reports: under version 4,
+    /// the deadline field of an offer carries the stream position of its
+    /// envelope, so the sealer orders it by the replay window of its image.
+    pub fn enable_positioned_refs(&mut self, version: SealerVersion) {
+        self.sealer_version = version;
+    }
+
+    /// The deadline field of an offer. Under decision version 4 it carries
+    /// the stream position. Racing replicas read the same image, so they
+    /// offer the same field for one envelope. A replica that learns the
+    /// version a moment later than its twin offers the envelope's deadline:
+    /// the sealer orders that copy by the rules of version 3, and the copy
+    /// with the position by its window.
+    fn guard_deadline(&self, max_inclusion_block: u64, stream_position: u64) -> u64 {
+        if !self.sealer_version.orders_by_position() {
+            return max_inclusion_block;
+        }
+        position_deadline(stream_position).unwrap_or(max_inclusion_block)
     }
 
     /// Offer nothing while `slots` holds a pause: the process lifecycle
@@ -338,9 +366,10 @@ impl Sequencer {
         rc.publish_error(err);
     }
 
-    /// Publish a rejection on both side channels: the `tx_errors` event
-    /// for the receipt feed, and the `Rejected` status for the status
-    /// feed. Silent for a sender in shadow mode, like `publish_error`.
+    /// Publish a rejection on every side channel: the `tx_errors` event
+    /// for the receipt feed, the `Rejected` status for the status feed, and
+    /// the drop for the egress. Silent for a sender in shadow mode, like
+    /// `publish_error`.
     fn publish_rejection<R>(&self, rc: &mut R, tx_hash: B256, err: TxError)
     where
         R: SideChannelPublisher,
@@ -349,7 +378,32 @@ impl Sequencer {
             return;
         }
         rc.publish_status(TxStatus::rejected(tx_hash, &err));
+        rc.publish_drop(TxDrop {
+            tx_hash,
+            sender: err.sender,
+            nonce: err.nonce,
+            reason: err.reason.drop_reason(),
+        });
         rc.publish_error(err);
+    }
+
+    /// Publish only the drop of a transaction whose nonce a receipt already
+    /// proves executed. The client gets no error: a transaction at the nonce
+    /// succeeded, and its receipt wins over the drop at the egress. Silent
+    /// for a sender in shadow mode, like `publish_error`.
+    fn publish_proven_drop<R>(&self, rc: &mut R, observed: Observed)
+    where
+        R: SideChannelPublisher,
+    {
+        if self.in_shadow(observed.sender) {
+            return;
+        }
+        rc.publish_drop(TxDrop {
+            tx_hash: observed.tx_hash,
+            sender: observed.sender,
+            nonce: observed.nonce,
+            reason: DropReason::NonceTooLow,
+        });
     }
 
     /// End shadow mode when the warm-up has passed. After the warm-up,
@@ -478,6 +532,7 @@ impl Sequencer {
             .iter()
             .take(chunk)
             .map(|(s, n, m)| RefOffer {
+                envelope: None,
                 tx_ref: Self::make_txref(m),
                 guard: GuardHeader {
                     sender: *s,
@@ -488,7 +543,7 @@ impl Sequencer {
             })
             .collect();
         let (_, b, rc) = ports.split();
-        let (published, err) = b.try_publish_ref_batch(&refs);
+        let (published, err) = self.pipeline.offer(b, &refs);
         self.record_published_prefix(rc, rest, published, ctx);
         match err {
             None => ControlFlow::Continue(()),
@@ -588,7 +643,8 @@ impl Sequencer {
         let Some(mut r) = self.resync.take() else {
             return;
         };
-        let lookups = self.apply_receipt_drain(&mut r);
+        let (_, _, rc) = ports.split();
+        let lookups = self.apply_receipt_drain(&mut r, rc);
         // The refusals go before the contiguity rejects, so a refused ref
         // and the rejects of the later refs settle in one iteration. The
         // two arrive on different channels, so the order is not certain,
@@ -805,6 +861,7 @@ impl Sequencer {
         let Some(Inbound {
             lane,
             loc: tx_data_loc,
+            stream_position,
             envelope,
         }) = channel_a.poll()?
         else {
@@ -866,7 +923,7 @@ impl Sequencer {
             lane,
             tx_data_position: tx_data_loc.position,
             tx_data_session_id: tx_data_loc.session_id,
-            max_inclusion_block: envelope.max_inclusion_block,
+            max_inclusion_block: self.guard_deadline(envelope.max_inclusion_block, stream_position),
             tip,
         };
 
@@ -976,9 +1033,7 @@ impl Sequencer {
     }
 
     /// One process action, for [`Self::collect_publishes`]'s loop: a
-    /// publish appends to `publishes`; a non-proven duplicate reports on
-    /// `rc`. A receipt-proven skip is suppressed: the client's
-    /// transaction already executed, so there is nothing to report.
+    /// publish appends to `publishes`; a duplicate reports on `rc`.
     fn collect_one_action<R>(
         &self,
         rc: &mut R,
@@ -995,25 +1050,22 @@ impl Sequencer {
             ProcessAction::ReportDuplicate {
                 nonce: n,
                 expected_nonce,
-            } => self.report_duplicate_if_unproven(rc, observed, n, expected_nonce),
+            } => self.report_duplicate(rc, observed, n, expected_nonce),
         }
     }
 
-    /// Report a duplicate submission on `rc`, unless a receipt already
-    /// proves this sender and nonce executed. A proven duplicate is
-    /// routine and stays silent. `nonce` is the duplicate's nonce, which
-    /// the state machine reports; `observed` names the transaction.
-    fn report_duplicate_if_unproven<R>(
-        &self,
-        rc: &mut R,
-        observed: Observed,
-        nonce: u64,
-        expected_nonce: u64,
-    ) where
+    /// Report a duplicate submission on `rc`. When a receipt already proves
+    /// this sender and nonce executed, the duplicate is routine: only the
+    /// drop goes out, and the client gets no error. `nonce` is the
+    /// duplicate's nonce, which the state machine reports; `observed`
+    /// names the transaction.
+    fn report_duplicate<R>(&self, rc: &mut R, observed: Observed, nonce: u64, expected_nonce: u64)
+    where
         R: SideChannelPublisher,
     {
         let sender = observed.sender;
         if self.proven_executed(sender, nonce) {
+            self.publish_proven_drop(rc, Observed { nonce, ..observed });
             return;
         }
         self.publish_rejection(
@@ -1061,13 +1113,27 @@ impl Sequencer {
     /// One [`Self::run`] iteration: dispatch on `run_once`'s outcome,
     /// updating the resync controller and idle backoff. Returns whether
     /// the loop should keep going; `false` only on a clean
-    /// `IngressDisconnected` exit.
+    /// `IngressDisconnected` exit. The pass, its wait included, counts in
+    /// the state that its outcome names.
     fn run_tick<P: SequencerPorts>(
         &mut self,
         ports: &mut P,
         backoff: &mut IdleBackoff,
     ) -> Result<bool, SequencerError> {
-        match self.run_once(ports) {
+        let outcome = self.run_once(ports);
+        let state = PublishMeters::state_of(&outcome);
+        let next = self.after_pass(outcome, backoff);
+        self.pipeline.pass(state, ports.split().0);
+        next
+    }
+
+    /// The dispatch of [`Self::run_tick`] on the outcome of one pass.
+    fn after_pass(
+        &mut self,
+        outcome: Result<bool, SequencerError>,
+        backoff: &mut IdleBackoff,
+    ) -> Result<bool, SequencerError> {
+        match outcome {
             Ok(true) => {
                 backoff.reset();
                 self.resync_note_publish_ok();

@@ -140,6 +140,10 @@ pub struct Knobs {
     /// sealer (`KARDAMOM_EXEC_CURSOR=on`). `hard-executor` checks the
     /// sealer's best cursor only then.
     pub exec_cursor: bool,
+    /// Whether the deployed executors keep the block log of their
+    /// checkpoints (`KARDAMOM_CHECKPOINT_LOG=on`). The peer resync then
+    /// also checks that the victim fetched and applied the log.
+    pub checkpoint_log: bool,
     /// The hard cap of the adaptive retention freeze.
     pub retention_freeze_cap: Duration,
     /// How long one L1 fault of the chaos-l1 cases stays active.
@@ -290,6 +294,7 @@ impl Knobs {
             cluster_retention: retention,
             da_lag_budget_blocks: da_lag_budget,
             exec_cursor: env.or("KARDAMOM_EXEC_CURSOR", "off") == "on",
+            checkpoint_log: env.or("KARDAMOM_CHECKPOINT_LOG", "off") == "on",
             retention_freeze_cap: env.secs("RETENTION_FREEZE_CAP_S", 600)?,
             l1_fault: env.secs("L1_FAULT_S", 60)?,
             l1_tps: env.nonzero_u32("L1_CASE_TPS", 50)?,

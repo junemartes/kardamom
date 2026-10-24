@@ -5,6 +5,8 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
+use tracing::warn;
+
 use crate::error::LogError;
 
 /// The metadata schema this runtime writes and accepts. A record from
@@ -27,12 +29,22 @@ pub enum Topic {
     TxReceiptBoundaries,
     TxErrors,
     TxStatus,
+    /// The receipts of the transactions of one ingress, from the
+    /// sequencer that owns their senders. Each target ingress has its own
+    /// stream id.
+    TxVerdicts,
     TxDeposits,
     TxRemoteEpochs,
     TxBal,
     ServiceEvents,
     ExecTxs,
     L1Blocks,
+    ExecFrames,
+    EgressOrder,
+    EgressReceipts,
+    /// The drops of the sequencers. Each sequencer registers its
+    /// publication with its lane id.
+    TxDrops,
 }
 
 impl Topic {
@@ -44,12 +56,17 @@ impl Topic {
             Self::TxReceiptBoundaries => "tx_receipt_boundaries",
             Self::TxErrors => "tx_errors",
             Self::TxStatus => "tx_status",
+            Self::TxVerdicts => "tx_verdicts",
             Self::TxDeposits => "tx_deposits",
             Self::TxRemoteEpochs => "tx_remote_epochs",
             Self::TxBal => "tx_bal",
             Self::ServiceEvents => "events",
             Self::ExecTxs => "exec_txs",
             Self::L1Blocks => "l1_blocks",
+            Self::ExecFrames => "exec_frames",
+            Self::EgressOrder => "egress_order",
+            Self::EgressReceipts => "egress_receipts",
+            Self::TxDrops => "tx_drops",
         }
     }
 
@@ -68,11 +85,16 @@ impl Topic {
             | Self::TxReceiptBoundaries
             | Self::TxErrors
             | Self::TxStatus
+            | Self::TxVerdicts
             | Self::TxDeposits
             | Self::TxRemoteEpochs
             | Self::TxBal
             | Self::ExecTxs
-            | Self::L1Blocks => None,
+            | Self::L1Blocks
+            | Self::ExecFrames
+            | Self::EgressOrder
+            | Self::EgressReceipts
+            | Self::TxDrops => None,
         }
     }
 
@@ -83,12 +105,17 @@ impl Topic {
             "tx_receipt_boundaries" => Some(Self::TxReceiptBoundaries),
             "tx_errors" => Some(Self::TxErrors),
             "tx_status" => Some(Self::TxStatus),
+            "tx_verdicts" => Some(Self::TxVerdicts),
             "tx_deposits" => Some(Self::TxDeposits),
             "tx_remote_epochs" => Some(Self::TxRemoteEpochs),
             "tx_bal" => Some(Self::TxBal),
             "events" => Some(Self::ServiceEvents),
             "exec_txs" => Some(Self::ExecTxs),
             "l1_blocks" => Some(Self::L1Blocks),
+            "exec_frames" => Some(Self::ExecFrames),
+            "egress_order" => Some(Self::EgressOrder),
+            "egress_receipts" => Some(Self::EgressReceipts),
+            "tx_drops" => Some(Self::TxDrops),
             _ => None,
         }
     }
@@ -179,6 +206,41 @@ impl ServiceEntry {
         raw.parse().map_err(|e| {
             LogError::Discovery(format!("record {}: bad meta {key}={raw}: {e}", self.id))
         })
+    }
+
+    /// The comma-separated topic list under `key`. An empty piece is
+    /// skipped. A piece that names no known topic is skipped with a
+    /// warning: an unfilled Nomad interpolation such as
+    /// `${meta.archive_topics_follower}` is one. A list with only such
+    /// pieces is an error, so the caller drops the record.
+    fn meta_topics(&self, key: &str) -> Result<Vec<Topic>, LogError> {
+        let raw = self.meta_str(key)?;
+        let pieces: Vec<&str> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        let topics: Vec<Topic> = pieces.iter().copied().filter_map(Topic::parse).collect();
+        let skipped: Vec<&str> = pieces
+            .iter()
+            .copied()
+            .filter(|t| Topic::parse(t).is_none())
+            .collect();
+        match (skipped.is_empty(), topics.is_empty()) {
+            (true, _) => Ok(topics),
+            (false, true) => Err(LogError::Discovery(format!(
+                "record {}: no known topic in {key}={raw}",
+                self.id
+            ))),
+            (false, false) => {
+                warn!(
+                    record = %self.id,
+                    ?skipped,
+                    "discovery: skipping unknown topics of an archive record"
+                );
+                Ok(topics)
+            }
+        }
     }
 
     fn meta_optional<T: std::str::FromStr>(&self, key: &str) -> Result<Option<T>, LogError>
@@ -324,26 +386,19 @@ pub struct ArchiveRecord {
 }
 
 impl ArchiveRecord {
+    /// Parse a catalog entry. An empty or unknown topic is skipped, and
+    /// the known topics stay.
+    ///
     /// # Errors
     ///
-    /// Returns an error if a required field is missing or malformed.
+    /// Returns an error if a required field is missing or malformed, or
+    /// if the topic list names no known topic.
     pub fn from_entry(entry: &ServiceEntry) -> Result<Self, LogError> {
-        let topics = entry
-            .meta_str("topics")?
-            .split(',')
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(|t| {
-                Topic::parse(t).ok_or_else(|| {
-                    LogError::Discovery(format!("record {}: unknown topic {t}", entry.id))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             id: entry.id.clone(),
             control: entry.socket_addr(),
             archive_id: entry.meta_str("archive_id")?.to_string(),
-            topics,
+            topics: entry.meta_topics("topics")?,
         })
     }
 

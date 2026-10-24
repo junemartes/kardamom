@@ -363,7 +363,7 @@ stage-dist dist:
     # The services the images wrap (the state mirror included), the settlement
     # deployer and the semantics runner the stages spawn, the operator binary,
     # and the archive tool the archive-corruption case runs on the host.
-    for bin in ingress sequencer executor validator da-watcher batcher state-mirror l1-indexer da-store l1-fault-proxy notifier canary reconstruct deploy semantics cluster archive-rereplicate; do
+    for bin in ingress sequencer executor validator da-watcher batcher state-mirror l1-indexer da-store l1-fault-proxy notifier canary egress reconstruct deploy semantics cluster archive-rereplicate; do
         cp "$rel/kardamom-$bin" "$dist/$rel/"
     done
     # The shard test executable carries a build hash; the newest one is this build's.
@@ -490,6 +490,17 @@ cluster-jar:
     cd cluster/sealer-service
     JAVA_HOME="$JH" ./gradlew :service:shadowJar -q
     echo "cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar"
+
+# Run the sealer load bench: real sealer members on this host, racing twin
+# publishers and one consumer. Pass more settings as `-Pbench.<name>=<value>`
+# (see BenchConfig.java in cluster/sealer-service/service/src/bench). Set
+# BENCH_MEMBER_PROPS and BENCH_MEMBER_JVM for the member JVMs.
+sealer-bench members="3" rate="100000" seconds="10" *args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    JH="$(just java-home)"
+    cd cluster/sealer-service
+    JAVA_HOME="$JH" ./gradlew -q :service:sealerBench -Pbench.members={{ members }} -Pbench.rate={{ rate }} -Pbench.seconds={{ seconds }} {{ args }}
 
 # Run the chain-semantics e2e suite (Target L) locally: real service
 # binaries + a 1-member Java Aeron Cluster sealer + per-test media drivers,
@@ -678,9 +689,9 @@ deploy:
 rollback env:
     @just --justfile deploy/cluster/justfile rollback {{ env }}
 
-# Check the sealer and the sequencers before the upgrade transaction of the sealer rules (cluster/sealer-service/README.md).
-sealer-upgrade-check env:
-    @just --justfile deploy/cluster/justfile sealer-upgrade-check {{ env }}
+# Check the sealer and the services before an upgrade transaction of feature id <feature> at <activation_ms> (cluster/sealer-service/README.md).
+sealer-upgrade-check env feature activation_ms="":
+    @just --justfile deploy/cluster/justfile sealer-upgrade-check {{ env }} {{ feature }} "{{ activation_ms }}"
 
 # Re-render the release before the last one when Nomad dropped its job versions.
 rollback-rerender env:

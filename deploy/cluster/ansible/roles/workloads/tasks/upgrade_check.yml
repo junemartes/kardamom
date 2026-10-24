@@ -1,17 +1,59 @@
 ---
-# The check before the upgrade transaction of FEATURE_SEALER_V3: the
-# decision rules version 3 of the sealer. A sealer member of an older
-# release drops the feature activation (ingress kind 11) and keeps
-# version 2, so the replicated state forks at the first frame that the two
-# versions decide differently: a frame that ends at its record type.
-# So every configured member must run a release that reads snapshot
-# version 13, the layout that carries the rules. Every sequencer must
-# run a release that sends the activation, or no member gets it. Every
-# executor, validator, ingress and sequencer must run a release that uses
-# the nonce of a skipped transaction (job meta nonce_burn). Every executor
-# and validator must run a release that installs the KardamomChainState code
-# with the first setFeature system deposit (job meta chain_state_install).
-# cluster/sealer-service/README.md ("Decision version") is the procedure.
+# The check before each upgrade transaction (ETHLockbox.initiateUpgrade).
+# KARDAMOM_UPGRADE_FEATURE names the feature id of the transaction, and
+# KARDAMOM_UPGRADE_ACTIVATION_MS its activation time in ms.
+#
+# The sealer runs decision version 3 on every member and does not follow
+# FEATURE_SEALER_V3 (feature id 2). The executor and the validator use the
+# nonce of a skip at the chain nonce of its sender only while the feature
+# is on. So a new network sends initiateUpgrade(2, 0) once after its first
+# deploy, and the check allows feature 2 only with the activation time 0
+# (on at once). It refuses feature 2 with any other time (off, or on later
+# with the feature off until then). An off switch leaves a sender stuck
+# after a skip at its chain nonce. A sealer member of an older release
+# still switches its rules on the feature activation (ingress kind 11) that
+# a sequencer of an older release sends, so an off switch also forks the
+# state in a mixed fleet.
+#
+# Every configured sealer member must run a release that reads snapshot
+# version 14. Every executor, validator, ingress and sequencer must run a
+# release that uses the nonce of a skipped transaction (job meta
+# nonce_burn). Every executor and validator must run a release that
+# installs the KardamomChainState code with the first setFeature system
+# deposit, and reads the flags once per block, frozen at its start (job
+# meta chain_state_install). cluster/sealer-service/README.md ("Decision
+# version") is the procedure.
+#
+# FEATURE_SEALER_V4 (feature id 3) switches the sealer to decision version
+# 4. It also needs every sealer member to read snapshot version 15, and the
+# services of workloads_upgrade_v4_jobs: a sequencer that sends the
+# activation record of feature 3 and the stream positions, and an executor
+# and a validator that keep the receipt that used the nonce of a
+# transaction that the sealer ordered more than once.
+#
+# FEATURE_SEALER_V5 (feature id 4, the carry flag) switches the sealer
+# from decision version 4 to 5. It needs every sealer member to read
+# snapshot version 16.
+- name: Keep the feature and the activation time of the upgrade transaction
+  ansible.builtin.set_fact:
+    workloads_upgrade_feature: "{{ lookup('env', 'KARDAMOM_UPGRADE_FEATURE') | trim }}"
+    workloads_upgrade_activation_ms: "{{ lookup('env', 'KARDAMOM_UPGRADE_ACTIVATION_MS') | trim }}"
+
+- name: Refuse an upgrade transaction of no named feature
+  ansible.builtin.assert:
+    that: workloads_upgrade_feature is match('^[0-9]+$')
+    fail_msg: >-
+      Refused: the upgrade transaction names feature "{{ workloads_upgrade_feature }}". Name the feature id of the
+      transaction (KARDAMOM_UPGRADE_FEATURE, a decimal number).
+
+- name: Refuse an upgrade transaction that turns FEATURE_SEALER_V3 off
+  ansible.builtin.assert:
+    that: workloads_upgrade_feature | int != 2 or workloads_upgrade_activation_ms == '0'
+    fail_msg: >-
+      Refused: the upgrade transaction of FEATURE_SEALER_V3 (feature id 2) has the activation time
+      "{{ workloads_upgrade_activation_ms }}". Only the time 0 (on at once) is allowed. This release does not
+      support an off switch of feature 2, or an on switch at a later time.
+
 - name: Read the registered sealer
   ansible.builtin.include_tasks: read_job.yml
   vars:
@@ -68,8 +110,8 @@
     label: "{{ item.item }}"
   register: workloads_upgrade_status
 
-# The release that takes the activation reads snapshot version 13. An older
-# member reports a lower snapshotReadsMax.
+# A member of this release, or of the release before it, reads snapshot
+# version 14. An older member reports a lower snapshotReadsMax.
 - name: Keep the snapshot read maximum of each member
   ansible.builtin.set_fact:
     workloads_upgrade_reads_max: >-
@@ -78,11 +120,35 @@
 
 - name: Refuse a member of an older release
   ansible.builtin.assert:
-    that: workloads_upgrade_reads_max | min >= 13
+    that: workloads_upgrade_reads_max | min >= 14
     fail_msg: >-
       Refused: a sealer member reads only up to snapshot version {{ workloads_upgrade_reads_max | min }}
-      ({{ workloads_upgrade_reads_max }}). A member of an older release drops the feature activation and forks
-      the state. Deploy the release that reads version 13 to every member, then run the check again.
+      ({{ workloads_upgrade_reads_max }}). Deploy the release that reads version 14 to every member, then run the
+      check again.
+
+# A member writes snapshot version 15 once it holds the activation of
+# feature 3, and a member that reads only up to version 14 stops on it.
+- name: Refuse feature 3 on a member that reads no snapshot version 15
+  ansible.builtin.assert:
+    that: workloads_upgrade_feature | int != 3 or workloads_upgrade_reads_max | min >= 15
+    fail_msg: >-
+      Refused: the upgrade transaction of FEATURE_SEALER_V4 (feature id 3) needs every sealer member to read
+      snapshot version 15, and a member reads only up to {{ workloads_upgrade_reads_max | min }}
+      ({{ workloads_upgrade_reads_max }}). Deploy the release that reads version 15 to every member, then run the
+      check again.
+
+# A member writes snapshot version 16 once it holds the activation of
+# feature 4, and a member that reads only up to version 15 stops on it. A
+# member of such a release also ignores the activation, and stays on
+# decision version 4 while the other members switch to 5.
+- name: Refuse feature 4 on a member that reads no snapshot version 16
+  ansible.builtin.assert:
+    that: workloads_upgrade_feature | int != 4 or workloads_upgrade_reads_max | min >= 16
+    fail_msg: >-
+      Refused: the upgrade transaction of FEATURE_SEALER_V5 (feature id 4, the carry flag) needs every sealer
+      member to read snapshot version 16, and a member reads only up to {{ workloads_upgrade_reads_max | min }}
+      ({{ workloads_upgrade_reads_max }}). Deploy the release that reads version 16 to every member, then run the
+      check again.
 
 # Each service that executes or reads a skip must run this release: an
 # older executor or validator does not use the nonce of a skipped
@@ -98,9 +164,17 @@
     loop_var: workloads_upgrade_job
     label: "{{ workloads_upgrade_job.name }}"
 
+- name: Check the services of decision version 4
+  ansible.builtin.include_tasks: upgrade_check_job.yml
+  loop: "{{ workloads_upgrade_v4_jobs if workloads_upgrade_feature | int == 3 else [] }}"
+  loop_control:
+    loop_var: workloads_upgrade_job
+    label: "{{ workloads_upgrade_job.name }}"
+
 - name: Report the passing check
   ansible.builtin.debug:
     msg: >-
-      The upgrade check passed: {{ workloads_upgrade_groups | length }} sealer members read snapshot version 13,
-      and the live allocations of {{ workloads_upgrade_jobs | map(attribute='name') | join(', ') }} run this
-      release. The upgrade transaction of FEATURE_SEALER_V3 may go to the Safe.
+      The upgrade check passed: {{ workloads_upgrade_groups | length }} sealer members read snapshot version
+      {{ {3: 15, 4: 16}.get(workloads_upgrade_feature | int, 14) }},
+      and the live allocations of {{ workloads_upgrade_jobs | map(attribute='name') | join(', ') }}
+      run this release. The upgrade transaction of feature {{ workloads_upgrade_feature }} may go to the Safe.

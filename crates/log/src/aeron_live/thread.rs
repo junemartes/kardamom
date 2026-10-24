@@ -10,7 +10,7 @@ use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, TryRecvError};
+use crossbeam_channel::{Receiver as CbReceiver, TryRecvError};
 use tracing::warn;
 
 use super::add_wait::{AddWait, PubAdd, SubAdd};
@@ -18,7 +18,8 @@ use super::bound::BoundControl;
 use super::destination::Destination;
 use super::idle::{IdleBackoff, IdleCap};
 use super::image_log::ImageHandlers;
-use super::pending::{PendingPublish, PubEntry, drain_pending};
+use super::meter::{Backlog, ThreadMeter};
+use super::pending::{PendingPublish, PubEntry, PublishAck, drain_pending};
 use super::runtime::{OpenedPub, RuntimeCmd};
 use super::table_pub::TablePub;
 use super::{ADD_PUB_TIMEOUT, ADD_SUB_TIMEOUT, AeronClient, FrameSink, Header, RawFrame, Sub};
@@ -44,11 +45,12 @@ struct AssembledDeliver {
 
 impl rusteron_client::AeronFragmentHandlerCallback for AssembledDeliver {
     fn handle_aeron_fragment_handler(&mut self, buffer: &[u8], header: Header) {
-        if let Some((pos, session)) = header_loc(&header) {
+        if let Some((pos, session, stream_pos)) = header_loc(&header) {
             self.sink.send(RawFrame {
                 bytes: buffer.to_vec(),
                 pos,
                 session,
+                stream_pos,
             });
         }
     }
@@ -193,6 +195,8 @@ struct AeronThread {
     /// consecutive emptiness before the first escalation). With a cap:
     /// base [`Self::CAPPED_BASE`], up to the cap.
     backoff: IdleBackoff,
+    /// The loop time, the queue depths and the refused offers.
+    meter: ThreadMeter,
 }
 
 impl AeronThread {
@@ -219,6 +223,7 @@ impl AeronThread {
             image_log: ImageHandlers::leak(),
             backoff: IdleBackoff::new(Duration::from_micros(100), Duration::from_millis(1), 10)
                 .under(idle_cap, Self::CAPPED_BASE),
+            meter: ThreadMeter::new(),
         }
     }
 
@@ -238,6 +243,7 @@ impl AeronThread {
     /// `Break(())` means the thread must stop (`Shutdown`, or the command
     /// channel disconnected).
     fn step(&mut self) -> ControlFlow<()> {
+        self.meter.start_pass(self.cmd_rx.len());
         // Whether this pass did anything: handled a command, or polled at
         // least one fragment. Drives the idle backoff. An empty streak
         // escalates the wait; any work snaps it back to base.
@@ -249,13 +255,15 @@ impl AeronThread {
         // 2. Attempt one offer per pending publish, preserving
         //    per-publication FIFO order. Successful or expired entries
         //    are removed.
-        drain_pending(&self.pubs, &mut self.pending);
+        let refused = drain_pending(&self.pubs, &mut self.pending);
 
         // 3. Poll every subscription. This runs on every pass, even while
         //    a publish is back-pressured in `pending`, so a slow or
         //    stalled publish can never starve a subscription's image.
         worked |= self.poll_subscriptions();
         self.close_departed();
+        self.meter
+            .end_pass(worked, Backlog(self.pending.len()), refused);
 
         // 4. Idle. Block only when there is genuinely nothing to do:
         //    nothing to poll and nothing pending. Otherwise wait at the
@@ -349,12 +357,15 @@ impl AeronThread {
     /// nothing to do. The caller uses that distinction to decide whether
     /// to reset the idle backoff.
     fn wait_for_cmd(&mut self, wait: Duration) -> ControlFlow<(), bool> {
-        match self.cmd_rx.recv_timeout(wait) {
+        let received = self.cmd_rx.recv_timeout(wait);
+        self.meter.end_wait(Backlog(self.pending.len()));
+        match received {
             Ok(RuntimeCmd::Shutdown) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 ControlFlow::Break(())
             }
             Ok(cmd) => {
                 self.handle_cmd(cmd);
+                self.meter.end_command();
                 ControlFlow::Continue(true)
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => ControlFlow::Continue(false),
@@ -369,7 +380,7 @@ impl AeronThread {
         &mut self,
         pub_id: u32,
         bytes: rkyv::util::AlignedVec,
-        ack: Option<CbSender<Result<BPosition, LogError>>>,
+        ack: Option<PublishAck>,
     ) {
         self.pending.push_back(PendingPublish {
             stream_id: self.pub_entry(pub_id).map(|e| e.stream_id),
@@ -681,19 +692,28 @@ impl AeronThread {
     }
 }
 
-/// Read the fragment-start [`BPosition`] and the Aeron publisher
-/// `session_id` from a single `get_values()` FFI call, the hottest
-/// per-fragment path. They must come from the same header read: returning
-/// them together guarantees the session belongs to the position's
-/// fragment, and avoids a divergent second-read error path where a
-/// transient failure could mint a spurious session 0 that collides with a
-/// genuine session-0 publisher's join key.
-fn header_loc(h: &Header) -> Option<(BPosition, i32)> {
+/// Read the fragment-start [`BPosition`], the Aeron publisher
+/// `session_id` and the stream position from a single `get_values()` FFI
+/// call, the hottest per-fragment path. They must come from the same
+/// header read: returning them together guarantees the session belongs to
+/// the position's fragment, and avoids a divergent second-read error path
+/// where a transient failure could mint a spurious session 0 that collides
+/// with a genuine session-0 publisher's join key.
+///
+/// The stream position is Aeron's `computePosition`: the terms since the
+/// initial term, shifted by the term length bits, plus the term offset.
+/// Term ids wrap, so the term count is a wrapping difference. The count is
+/// below 2^31 and the shift is at most 30 (a term holds at most 1 GiB), so
+/// the position stays below 2^61.
+fn header_loc(h: &Header) -> Option<(BPosition, i32, i64)> {
     let v = h.get_values().ok()?;
     let frame = v.frame();
     let pos = BPosition {
         term_id: frame.term_id(),
         term_offset: frame.term_offset(),
     };
-    Some((pos, frame.session_id()))
+    let terms = i64::from(frame.term_id().wrapping_sub(v.initial_term_id()));
+    let shift = u32::try_from(v.position_bits_to_shift()).ok()?;
+    let stream_pos = (terms << shift) + i64::from(frame.term_offset());
+    Some((pos, frame.session_id(), stream_pos))
 }

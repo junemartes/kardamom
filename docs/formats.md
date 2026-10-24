@@ -42,7 +42,7 @@ The version tests:
 
 | Crate | Formats | What the test checks |
 |---|---|---|
-| `kardamom-state` | `state-db`, `checkpoint-manifest` | the constants |
+| `kardamom-state` | `state-db`, `checkpoint-manifest`, `block-log` | the constants |
 | `kardamom-batcher` | `kar1-batch` | `decode` accepts exactly `reads_min..=reads_max`, and `VERSION` is `writes` |
 | `kardamom-cluster-adapter` | sealer ingress kinds, egress kinds, record types | the egress decoder and the record type decoder accept exactly the read range; the Rust ingress kinds stay at or below `reads_max` |
 | `kardamom-cluster-client` | `cluster-app-version` | the major of the app version |
@@ -62,6 +62,7 @@ The layout tests of the frozen formats:
 | `l1-cursor` | `kardamom-da-watcher` | the line of a fixed sample, and its parse |
 | `aeron-stream-records` | `kardamom-types` | rkyv archived size and alignment of the seven record types |
 | `receipt-rollback` | `kardamom-types` | rkyv archived size and alignment of `ReceiptRollback` |
+| `block-log` | `kardamom-state` | rkyv archived size and alignment of `WriteBatch`, and the bytes of a fixed segment head |
 | `executor-markers` | `kardamom-executor` | the text of a fixed rollback marker, and its parse |
 | `receipt-ledger` | `kardamom-executor` | the slot count and the bytes of a fixed slot, and its decode |
 | `notifier-outbox` | `kardamom-notifier` | rkyv archived size and alignment of `OutboxRecord` |
@@ -207,9 +208,10 @@ proves each one.
 
 | Reader | Rule | What it makes safe |
 |---|---|---|
-| Sealer ingress dispatch | Every member drops a frame of a kind it does not know, counts it (`cluster DROPPED unknown-kind`), and never orders it. Kind 0 carries one user record, and kind 3 carries a batch of them; every other known kind is a control message. Kind 11, the feature activation, is a control message of the sequencer. No client sends kind 10. The release before this one orders an unknown kind of 85 bytes or more as a user record, so during the first roll to this release no client may send an unknown kind. | A mixed fleet does not fork on a new kind: a member of the old release drops the frame, and a member of the new release sends a state-changing kind only after every member reads it. |
+| Sealer ingress dispatch | Every member drops a frame of a kind it does not know, counts it (`cluster DROPPED unknown-kind`), and never orders it. Kind 0 carries one user record, and kind 3 carries a batch of them; every other known kind is a control message. Kind 11, the feature activation, is a control message: a record of feature 3 stores the schedule of decision version 4, a record of feature 4 stores the schedule of decision version 5 while version 4 or 5 runs, and a record of another feature changes no state. No client sends kind 10 or kind 11. The release before this one orders an unknown kind of 85 bytes or more as a user record, so during the first roll to this release no client may send an unknown kind. | A mixed fleet does not fork on a new kind: a member of the old release drops the frame, and a member of the new release sends a state-changing kind only after every member reads it. |
+| Sealer snapshot with a retained file | A member with `kardamom.cluster.carryBytes=true` writes version 17: the state of version 16, then the file section. It restores version 17 and version 12, and stops on any other version. A member without the flag stops on both. `SealerVersionFiveTest` restarts a carrying member from version 17 at each entry, and the member decides as its peer. | A restored member runs the decision version, the switch and the schedule of feature 4 of its peers. A member without the flag never writes version 17, so a rolling deploy of a chain without the flag is safe. |
 | Sealer `/status` | The admin endpoint reports `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, and `snapshotLatest`, the version of the newest snapshot the member restored or took. | A deploy preflight refuses a target whose `reads_max` is below `snapshotLatest` of any member. That member could not restore its own snapshot after the roll. |
-| Rust egress reader | A frame of a kind the reader does not know drops with a warning. Kind 17 (the sealer's rules) is new: an older reader drops it, and only the sequencer reads it. | A sealer can send a new egress kind to the clients of the release before. |
+| Rust egress reader | A frame of a kind the reader does not know drops with a warning. Kind 17 (the sealer's rules): an older reader drops it, and only the sequencer reads it. | A sealer can send a new egress kind to the clients of the release before. |
 | Batcher spool | The spool of a layout version lives in `spool/v<N>`. A release opens only its own directory. Every other entry of the root, and a spool whose block does not decode, is dropped with a warning and `kardamom_batcher_spool_dropped_total{reason}`. The range is read again from the sealer. | A spool of either release never stops the batcher. A rollback and a roll forward both start, and the sealer, which keeps every frame above the posted head, serves the dropped range. |
 | Checkpoint manifest and peer fetch | The manifest states `schema_version`, and the peer header `x-checkpoint-schema` carries it. An adopter skips an image of a schema it does not read, before the copy, with a log line and `kardamom_checkpoint_unreadable_schema_skips_total`. An image without a stated schema passes, and says its schema when it opens. | After a schema bump, an executor or a validator of the old release does not adopt a checkpoint of the new release, from its own disk or from a peer. It takes the next checkpoint that it reads. |
 | da-watcher L1 cursor | The reader takes the block number and the hash, and ignores any field after the hash. A line with fewer fields, or a field that does not parse, is still the `l1_cursor_unreadable` halt. | A later release can add a field at the tail, and this release still reads the file after a rollback. |
@@ -226,8 +228,8 @@ gate refuses to roll them:
 
 - The sealer settings that every member must match. See `cluster/sealer-service/README.md`.
 - The rules that decide the sealer's replicated state. A new rule ships
-  behind a feature flag, and an upgrade transaction turns it on at one
-  record in the log of the sealer. See "Decision version" in
+  behind a feature flag, and the flag switches every member at one record
+  in the log of the sealer. See "Decision version" in
   `cluster/sealer-service/README.md`.
 - The shard map. Use the resize playbook.
 - The L1 contracts. Their upgrades go forward only.

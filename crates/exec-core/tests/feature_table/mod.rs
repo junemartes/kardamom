@@ -1,5 +1,5 @@
 //! The rows of `testdata/feature_switch_blocks.txt`, the table of blocks
-//! that the executor tests and the sealer tests share. The exec-core test
+//! that the executor tests share. The exec-core test
 //! `feature_switch_blocks` and the engine test
 //! `the_table_switches_where_the_chain_switches` both parse it here.
 

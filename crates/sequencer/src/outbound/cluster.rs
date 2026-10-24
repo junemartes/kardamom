@@ -8,6 +8,7 @@
 //! rewind-and-retry path applies.
 
 use kardamom_types::EpochRecord;
+use kardamom_types::upgrades::{FEATURE_SEALER_V4, FEATURE_SEALER_V5};
 use kardamom_types::xchain::RemoteEpochRecord;
 
 use crate::SequencerError;
@@ -46,6 +47,21 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
         self.offer(&bytes)
     }
 
+    /// Offer the feature activation that goes in front of its epoch.
+    fn offer_activation(
+        &mut self,
+        activation: &wire::FeatureActivation,
+    ) -> Result<(), SequencerError> {
+        self.offer(&activation.encode())?;
+        tracing::info!(
+            l1_origin = activation.l1_origin,
+            feature_id = activation.feature_id,
+            activation_ms = activation.activation_ms,
+            "sealer feature activation offered"
+        );
+        Ok(())
+    }
+
     fn offer(&mut self, bytes: &[u8]) -> Result<(), SequencerError> {
         match self.ingress.offer(bytes) {
             OfferOutcome::Accepted => Ok(()),
@@ -61,13 +77,20 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
         }
     }
 
-    /// Encode many refs as one batch frame and offer it. Returns the
+    /// Encode the refs at the head of `many` as one batch frame of at most
+    /// [`BATCH_BYTES`] of entries, at least one, and offer it. Returns the
     /// accepted count and, on failure, the error for the whole batch.
     fn offer_batch(&mut self, many: &[RefOffer]) -> (usize, Option<SequencerError>) {
+        let mut bytes = 0usize;
         let entries: Vec<Vec<u8>> = many
             .iter()
-            .map(|o| wire::encode_ingress_txref(&o.tx_ref, o.guard))
+            .map(entry_of)
+            .take_while(|entry| {
+                bytes += entry.len();
+                bytes <= BATCH_BYTES || bytes == entry.len()
+            })
             .collect();
+        let taken = entries.len();
         let frame = match wire::encode_ingress_batch(&entries) {
             Ok(frame) => frame,
             Err(err) => {
@@ -78,16 +101,34 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
             }
         };
         match self.offer(&frame) {
-            Ok(()) => (many.len(), None),
+            Ok(()) => (taken, None),
             Err(e) => (0, Some(e)),
         }
     }
 }
 
+/// The most entry bytes in one batch frame. A transaction with its bytes
+/// can be large, and the batch goes out as one session message, so the
+/// limit is in bytes, not in entries. A larger entry goes alone.
+const BATCH_BYTES: usize = 64 * 1024;
+
+/// The ingress frame of one offer: a full reference with the bytes of its
+/// transaction, or a reference.
+fn entry_of(offer: &RefOffer) -> Vec<u8> {
+    match &offer.envelope {
+        Some(envelope) => wire::TxRefOffer {
+            guard: offer.guard,
+            reference: offer.tx_ref,
+            envelope,
+        }
+        .encode(),
+        None => wire::encode_ingress_txref(&offer.tx_ref, offer.guard),
+    }
+}
+
 impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I> {
     fn try_publish_ref(&mut self, offer: &RefOffer) -> Result<(), SequencerError> {
-        let bytes = wire::encode_ingress_txref(&offer.tx_ref, offer.guard);
-        self.offer(&bytes)
+        self.offer(&entry_of(offer))
     }
 
     fn try_publish_ref_batch(&mut self, refs: &[RefOffer]) -> (usize, Option<SequencerError>) {
@@ -102,21 +143,16 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
     }
 
     fn try_publish_epoch(&mut self, e: &EpochRecord) -> Result<(), SequencerError> {
-        // The feature activation of the sealer rules goes in front of its
-        // epoch, on this session. The pump offers the same epoch again
-        // after back pressure, a gap or a restart, so the activation goes
-        // out again with it, and the sealer ignores a copy. An epoch that
-        // the sealer ordered is never offered again, so the activation
-        // must not come after it.
-        if let Some(activation) = wire::FeatureActivation::sealer_rules_of(e) {
-            self.offer(&activation.encode())?;
-            tracing::info!(
-                l1_origin = activation.l1_origin,
-                feature_id = activation.feature_id,
-                activation_ms = activation.activation_ms,
-                "sealer feature activation offered"
-            );
-        }
+        // The activations of decision versions 4 and 5 go in front of their
+        // epoch, on this session. The pump offers the same epoch again after back
+        // pressure, a gap or a restart, so the activation goes out again
+        // with it, and the sealer ignores a copy. An epoch that the sealer
+        // ordered is never offered again, so the activation must not come
+        // after it.
+        [FEATURE_SEALER_V4, FEATURE_SEALER_V5]
+            .into_iter()
+            .filter_map(|feature| wire::FeatureActivation::of(e, feature))
+            .try_for_each(|activation| self.offer_activation(&activation))?;
         // This uses KIND_ORIGIN_RECORD, not a plain record. The sealer
         // must close the open block and adopt this epoch's L1 number
         // before it relays the record. Epochs are never batched: there is
@@ -238,6 +274,7 @@ mod tests {
                 nonce,
                 ..GuardHeader::EXEMPT
             },
+            envelope: None,
         }
     }
 
@@ -294,33 +331,31 @@ mod tests {
         assert_eq!(u32::from_le_bytes(sent[0][41..45].try_into().unwrap()), 2);
     }
 
-    /// The upgrade of the sealer rules goes out in front of its epoch, and
-    /// again with each new offer of the epoch.
-    #[test]
-    fn publishes_the_feature_activation_in_front_of_its_epoch() {
+    /// An epoch with the upgrade transaction of `feature` at time 9 000.
+    fn epoch_with_upgrade(feature: u64) -> EpochRecord {
         use kardamom_types::epoch::{LockboxLog, UpgradeLog, derive_epoch};
-        use kardamom_types::upgrades::FEATURE_SEALER_V3;
 
         let block = B256::repeat_byte(0x22);
         let upgrade = LockboxLog::Upgrade(UpgradeLog {
             block_number: 4_242,
             block_hash: block,
             log_index: 0,
-            feature_id: alloy_primitives::U256::from(FEATURE_SEALER_V3),
+            feature_id: alloy_primitives::U256::from(feature),
             activation_timestamp: 9_000,
         });
-        let e = derive_epoch(4_242, block, &[upgrade]).unwrap();
+        derive_epoch(4_242, block, &[upgrade]).unwrap()
+    }
+
+    /// The upgrade of decision version 4 goes out in front of its epoch,
+    /// and again with each new offer of the epoch.
+    #[test]
+    fn publishes_the_activation_of_version_four_in_front_of_its_epoch() {
+        let e = epoch_with_upgrade(FEATURE_SEALER_V4);
         let ingress = FakeIngress::new();
         let mut pubr = ClusterRefPublisher::new(ingress.clone());
         pubr.try_publish_epoch(&e).unwrap();
         pubr.try_publish_epoch(&e).unwrap();
 
-        let activation = wire::FeatureActivation {
-            l1_origin: 4_242,
-            feature_id: FEATURE_SEALER_V3,
-            activation_ms: 9_000,
-        }
-        .encode();
         let kinds: Vec<u8> = ingress.accepted().iter().map(|frame| frame[0]).collect();
         assert_eq!(
             kinds,
@@ -331,7 +366,67 @@ mod tests {
                 wire::KIND_ORIGIN_RECORD
             ]
         );
-        assert_eq!(ingress.accepted()[0], activation);
+        let activation = wire::FeatureActivation {
+            l1_origin: 4_242,
+            feature_id: FEATURE_SEALER_V4,
+            activation_ms: 9_000,
+        };
+        assert_eq!(ingress.accepted()[0], activation.encode());
+    }
+
+    /// The carry flag (feature 4) goes out in front of its epoch too: the
+    /// sealer switches to decision version 5 on it.
+    #[test]
+    fn publishes_the_activation_of_the_carry_flag_in_front_of_its_epoch() {
+        let e = epoch_with_upgrade(FEATURE_SEALER_V5);
+        let ingress = FakeIngress::new();
+        let mut pubr = ClusterRefPublisher::new(ingress.clone());
+        pubr.try_publish_epoch(&e).unwrap();
+        let activation = wire::FeatureActivation {
+            l1_origin: 4_242,
+            feature_id: FEATURE_SEALER_V5,
+            activation_ms: 9_000,
+        };
+        assert_eq!(ingress.accepted()[0], activation.encode());
+        assert_eq!(ingress.accepted()[1][0], wire::KIND_ORIGIN_RECORD);
+    }
+
+    /// An offer with the bytes of its transaction goes out as a full
+    /// reference, and a batch of them stays within the byte limit of one
+    /// batch frame.
+    #[test]
+    fn offers_with_bytes_go_out_as_full_references_in_batches_of_bounded_bytes() {
+        let ingress = FakeIngress::new();
+        let mut pubr = ClusterRefPublisher::new(ingress.clone());
+        let sender = alloy_primitives::Address::repeat_byte(0x55);
+        let envelope = bytes::Bytes::from(vec![7u8; 20_000]);
+        let offers: Vec<RefOffer> = (0..5u8)
+            .map(|n| RefOffer {
+                envelope: Some(envelope.clone()),
+                ..offer(txref(n), sender, u64::from(n))
+            })
+            .collect();
+        let (taken, err) = pubr.try_publish_ref_batch(&offers);
+        assert!(err.is_none());
+        assert_eq!(taken, 3, "three entries of about 20 KB fit in 64 KiB");
+        pubr.try_publish_ref(&offers[3]).unwrap();
+        let single = &ingress.accepted()[1];
+        let parsed = wire::TxRefOffer::parse(single).unwrap();
+        assert_eq!(parsed.reference, txref(3));
+        assert_eq!(parsed.envelope, envelope.as_ref());
+    }
+
+    /// An epoch with the upgrade of another feature goes out alone: the
+    /// sealer follows only the features of decision versions 4 and 5.
+    #[test]
+    fn an_epoch_with_another_upgrade_goes_out_without_a_feature_activation() {
+        let e = epoch_with_upgrade(kardamom_types::upgrades::FEATURE_SEALER_V3);
+        let ingress = FakeIngress::new();
+        let mut pubr = ClusterRefPublisher::new(ingress.clone());
+        pubr.try_publish_epoch(&e).unwrap();
+
+        let kinds: Vec<u8> = ingress.accepted().iter().map(|frame| frame[0]).collect();
+        assert_eq!(kinds, [wire::KIND_ORIGIN_RECORD]);
     }
 
     /// A remote epoch must go out as `KIND_REMOTE_ORIGIN_RECORD`, carrying the

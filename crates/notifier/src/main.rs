@@ -19,7 +19,7 @@ use kardamom_notifier::metrics;
 use kardamom_notifier::ring::RingConfig;
 use kardamom_notifier::server::{Hooks, ListenConfig, serve};
 use kardamom_notifier::shard::InstanceSet;
-use kardamom_notifier::taps::Taps;
+use kardamom_notifier::taps::{ReceiptSource, Taps};
 use kardamom_notifier::webhooks::{Webhooks, WebhooksConfig};
 use kardamom_obs::bin::wait_for_shutdown;
 
@@ -41,6 +41,14 @@ struct Args {
     /// `channels.tx_receipts_executor_count`.
     #[arg(long, env = "KARDAMOM_EXECUTOR_COUNT")]
     executor_count: Option<u32>,
+    /// Take the receipts from the egress (`egress_receipts`), each once, in
+    /// place of the `tx_receipts` stream of every executor.
+    #[arg(
+        long,
+        env = "KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS",
+        default_value_t = false
+    )]
+    receipts_from_egress: bool,
     /// The address of the WebSocket feed and the webhook endpoint.
     #[arg(long, env = "KARDAMOM_NOTIFIER_BIND", default_value = "127.0.0.1:8547")]
     bind: SocketAddr,
@@ -123,7 +131,12 @@ async fn main() -> Result<()> {
         .executor_count
         .and_then(NonZeroU32::new)
         .or(plane.channels().tx_receipts_executor_count);
-    let taps = Taps::open(&rt, &mut plane, executor_count).context("open the taps")?;
+    let source = if args.receipts_from_egress {
+        ReceiptSource::Egress
+    } else {
+        ReceiptSource::Executors(executor_count)
+    };
+    let taps = Taps::open(&rt, &mut plane, source).context("open the taps")?;
     let shutdown = plane.cancellation().child_token();
 
     let (hub, handle) = Hub::new(

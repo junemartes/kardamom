@@ -2,24 +2,28 @@
 //!
 //! Parses a TOML [`SequencerConfig`], opens one `tx_data` subscriber per
 //! lane it reads, the Aeron Cluster (Raft) ref publisher (`tx_ordering`),
-//! and the `tx_errors` and `tx_status` publishers. Runs the sequencer
+//! and the `tx_errors`, `tx_status` and `tx_drops` publishers. Runs the sequencer
 //! main loop on a dedicated blocking thread until SIGTERM or Ctrl-C.
 //!
 //! The lag-detection, receipt-floor, and nonce-lookup feed tasks live in
 //! [`feeds`]. The `aeron_live` handles implement the sequencer's
 //! subscriber/publisher traits directly (`kardamom_sequencer::{epoch,
 //! remote_epoch, outbound}`); the lane set is [`feeds::LaneSubscriptions`].
+//!
+//! The flags live in [`args`].
 
+mod args;
 mod feeds;
 
-use std::num::{NonZeroU32, NonZeroU64};
-use std::path::PathBuf;
+use std::num::NonZeroU32;
 
 use anyhow::{Context, Result};
+use args::Args;
 use clap::Parser;
+use feeds::{LaneSub, LaneSubscriptions, PublishLoops};
 use kardamom_cluster_adapter::LiveCluster;
 use kardamom_log::aeron_live::{
-    AeronRuntime, ServiceEventsPublisherHandle, TxDepositsSubscriberHandle,
+    AeronRuntime, ServiceEventsPublisherHandle, TxDepositsSubscriberHandle, TxDropsPublisherHandle,
     TxErrorsPublisherHandle, TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle,
 };
 use kardamom_log::config::LogConfig;
@@ -29,194 +33,6 @@ use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::fees::FeeGate;
 use kardamom_sequencer::lookup::LookupRequester;
 use kardamom_sequencer::sequencer::Shutdown;
-use kardamom_types::shard_map::VslotSet;
-
-use feeds::{LaneSub, LaneSubscriptions, PublishLoops};
-
-#[derive(Debug, Parser)]
-#[command(
-    name = "kardamom-sequencer",
-    version,
-    about = "kardamom sequencer process"
-)]
-struct Args {
-    /// Path to a TOML config file (schema: `SequencerConfig`).
-    #[arg(long)]
-    config: PathBuf,
-    /// Optional `LogConfig` TOML that supplies the Aeron `[channels]`
-    /// config. If unset, it uses built-in single-host IPC defaults (this
-    /// keeps local and e2e behavior). Multi-host deployments point this at
-    /// the rendered UDP channels config.
-    #[arg(long, env = "KARDAMOM_LOG_CONFIG")]
-    log_config: Option<PathBuf>,
-    /// Aeron Media Driver directory (`aeron.dir`).
-    #[arg(long)]
-    aeron_dir: Option<PathBuf>,
-    /// Override the partition index from the config.
-    #[arg(long)]
-    partition_index: Option<u32>,
-    /// Override the partition count (M).
-    #[arg(long)]
-    partition_count: Option<NonZeroU32>,
-    /// Replica-group shard rotation. The effective partition becomes
-    /// `(partition_index + partition_offset) % partition_count`, and
-    /// `sequencer_id` follows it, unless explicitly overridden. This lets
-    /// a second Nomad group of racing replicas reuse the same
-    /// node-derived `--partition-index` while it serves a rotated shard.
-    /// So the two replicas of any shard land on different nodes,
-    /// deterministically. This is incompatible with an explicit
-    /// `--sequencer-id`: the `tx_data` subscription and `TxRef.shard_id`
-    /// must both follow the rotated shard.
-    ///
-    /// Racing replicas are safe by construction. Refs encode
-    /// deterministically from the shared per-shard `tx_data` stream, and
-    /// the Aeron Cluster dedups records by `canonical_id` first-seen. This
-    /// is the same mechanism that already absorbs the M duplicate
-    /// `DepositRefs`.
-    #[arg(long, default_value_t = 0)]
-    partition_offset: u32,
-    /// Override the sequencer id embedded in every `tx_ordering` `TxRef`.
-    /// If omitted and the TOML did not set it, falls back to
-    /// `partition_index as u8`.
-    #[arg(long)]
-    sequencer_id: Option<u8>,
-    /// The own `tx_data` lane (`lane`). Defaults to the sequencer id.
-    #[arg(long, env = "KARDAMOM_LANE")]
-    lane: Option<u8>,
-    /// The vslots this replica serves (`vslots`), as ranges: `0-7,16`.
-    /// Defaults to the identity map over the partition count.
-    #[arg(long, env = "KARDAMOM_VSLOTS")]
-    vslots: Option<VslotSet>,
-    /// The old lanes to read during a resize (`extra_lanes`).
-    #[arg(long, env = "KARDAMOM_EXTRA_LANES", value_delimiter = ',')]
-    extra_lanes: Vec<u8>,
-    /// The incoming vslots that start in shadow mode (`shadow_vslots`).
-    #[arg(long, env = "KARDAMOM_SHADOW_VSLOTS")]
-    shadow_vslots: Option<VslotSet>,
-    /// The shadow warm-up in ms (`shadow_warm_ms`). Defaults to
-    /// `tx_ttl_ms + 5000`.
-    #[arg(long, env = "KARDAMOM_SHADOW_WARM_MS")]
-    shadow_warm_ms: Option<u64>,
-    /// The lifetime of a transaction that waits on a nonce gap, in ms
-    /// (`tx_ttl_ms`). The deploy passes the same value to the ingress as
-    /// `--pending-receipt-timeout-ms`. Zero is rejected.
-    #[arg(long, env = "KARDAMOM_TX_TTL_MS")]
-    tx_ttl_ms: Option<NonZeroU64>,
-    /// Override the CPU core to pin to.
-    #[arg(long)]
-    core_id: Option<usize>,
-    /// This node's cluster-egress endpoint `ip:port` (cluster mode). Sets
-    /// or overrides the `[cluster] egress_channel` as
-    /// `aeron:udp?endpoint=<ip:port>`. The Nomad job injects this per node
-    /// as `${meta.node_ip}:${NOMAD_HOST_PORT_egress}`.
-    #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
-    cluster_egress_endpoint: Option<String>,
-    /// Address for the Prometheus /metrics HTTP listener.
-    #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9001")]
-    metrics_addr: std::net::SocketAddr,
-    /// Host identifier; stamped on every metric.
-    #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
-    host_id: kardamom_obs::HostId,
-    /// The cluster's first-seen dedup window (`[resync] dedup_capacity`).
-    /// Must equal the JVM's `-Dkardamom.cluster.dedupCapacity`: the lag
-    /// horizon the resync mechanism protects.
-    #[arg(long, env = "KARDAMOM_CLUSTER_DEDUP_CAPACITY")]
-    cluster_dedup_capacity: Option<NonZeroU64>,
-    /// Watermark-jump enter threshold as a percent of the dedup capacity
-    /// (`[resync] enter_percent`).
-    #[arg(long, env = "KARDAMOM_RESYNC_ENTER_PERCENT")]
-    resync_enter_percent: Option<NonZeroU64>,
-    /// Boundary-silence resync trigger, ms (`[resync] boundary_silence_ms`).
-    #[arg(long, env = "KARDAMOM_RESYNC_BOUNDARY_SILENCE_MS")]
-    resync_boundary_silence_ms: Option<u64>,
-    /// The executor nonce query endpoints, as a comma-separated list of
-    /// `http://host:port` (`[lookup] executor_endpoints`). Empty means no
-    /// lookup. See `docs/specs/dynamic-sequencer-sizing.md`, section 3.4.
-    #[arg(long, env = "KARDAMOM_EXECUTOR_QUERY_ENDPOINTS", value_delimiter = ',')]
-    executor_query_endpoints: Vec<String>,
-    /// Executor replica count for the `tx_receipts` MDS fan-in (parity with
-    /// the validator). Falls back to `channels.tx_receipts_executor_count`.
-    /// Not relevant when receipts ride multicast (the cluster deploy).
-    #[arg(long)]
-    executor_count: Option<NonZeroU32>,
-    /// Priority fees on or off (`[fees] priority`). Must match the
-    /// sealer's `-Dkardamom.cluster.orderingWindow` (20 for on, 0 for
-    /// off): the deploy sets both from one value.
-    #[arg(long, env = "KARDAMOM_PRIORITY_FEES")]
-    priority_fees: Option<bool>,
-}
-
-/// Fold the CLI and env overrides into the TOML-loaded config: the
-/// plain overrides first, then the replica-group shard rotation and the
-/// sequencer id fallback, which read the overridden partition index.
-fn apply_cli_overrides(args: &Args, cfg: &mut SequencerConfig) -> Result<()> {
-    apply_plain_overrides(args, cfg);
-    if args.partition_offset != 0 {
-        // An explicit --sequencer-id combined with rotation would
-        // subscribe to tx_data stream `sequencer_id`, while the
-        // wrong-shard guard filters on the rotated `partition_index`. The
-        // replica would silently drop every envelope, and its TxRefs
-        // would stamp a shard_id its twin does not, breaking
-        // byte-identical dedup.
-        anyhow::ensure!(
-            args.sequencer_id.is_none(),
-            "--sequencer-id cannot be combined with --partition-offset: \
-             the sequencer id must follow the rotated shard \
-             (sequencer_id == partition_index)"
-        );
-        let raw_index = cfg.partition_index;
-        cfg.rotate_partition(args.partition_offset)
-            .context("rotate partition")?;
-        tracing::info!(
-            raw_index,
-            offset = args.partition_offset,
-            rotated = cfg.partition_index,
-            "partition-offset: rotated shard assignment (racing replica group)"
-        );
-    }
-    if let Some(id) = args.sequencer_id {
-        cfg.sequencer_id = id;
-    } else if cfg.sequencer_id == 0 && cfg.partition_index != 0 {
-        // A count above 256 would otherwise truncate silently:
-        // sequencer_id is a u8 on the wire (TxRef.shard_id).
-        cfg.sequencer_id = u8::try_from(cfg.partition_index)
-            .context("partition_index does not fit in sequencer_id (u8)")?;
-    }
-    Ok(())
-}
-
-/// The overrides that copy a set flag over the TOML value. A flag left
-/// unset, or an empty list, keeps the TOML value.
-fn apply_plain_overrides(args: &Args, cfg: &mut SequencerConfig) {
-    cfg.partition_index = args.partition_index.unwrap_or(cfg.partition_index);
-    cfg.partition_count = args.partition_count.map_or(
-        cfg.partition_count,
-        kardamom_sequencer::partition::PartitionCount::new,
-    );
-    cfg.tx_ttl_ms = args.tx_ttl_ms.unwrap_or(cfg.tx_ttl_ms);
-    if !args.executor_query_endpoints.is_empty() {
-        cfg.lookup
-            .executor_endpoints
-            .clone_from(&args.executor_query_endpoints);
-    }
-    cfg.lane = args.lane.or(cfg.lane);
-    cfg.vslots = args.vslots.or(cfg.vslots);
-    if !args.extra_lanes.is_empty() {
-        cfg.extra_lanes.clone_from(&args.extra_lanes);
-    }
-    cfg.shadow_vslots = args.shadow_vslots.unwrap_or(cfg.shadow_vslots);
-    cfg.shadow_warm_ms = args.shadow_warm_ms.or(cfg.shadow_warm_ms);
-    cfg.core_id = args.core_id.or(cfg.core_id);
-    cfg.cluster
-        .set_egress_endpoint(args.cluster_egress_endpoint.as_deref());
-    let resync = &mut cfg.resync;
-    resync.dedup_capacity = args.cluster_dedup_capacity.unwrap_or(resync.dedup_capacity);
-    resync.enter_percent = args.resync_enter_percent.unwrap_or(resync.enter_percent);
-    resync.boundary_silence_ms = args
-        .resync_boundary_silence_ms
-        .unwrap_or(resync.boundary_silence_ms);
-    cfg.fees.priority = args.priority_fees.unwrap_or(cfg.fees.priority);
-}
 
 /// The Aeron subscriptions and publisher this sequencer needs, all opened
 /// on the same runtime `rt`.
@@ -230,12 +46,14 @@ struct Handles {
     remote_epochs_sub: TxRemoteEpochsSubscriberHandle,
     errors_pub: TxErrorsPublisherHandle,
     status_pub: TxStatusPublisherHandle,
+    /// The drops of the own lane, for the status that the egress serves.
+    drops_pub: TxDropsPublisherHandle,
 }
 
 impl Handles {
     /// Open every handle this sequencer needs, for the lanes of `cfg`.
-    /// `tx_errors` and `tx_status` follow the plane's transport; the rest
-    /// still open on their static channels.
+    /// `tx_errors`, `tx_status` and `tx_drops` follow the plane's
+    /// transport; the rest still open on their static channels.
     async fn open(
         rt: &AeronRuntime,
         plane: &mut StreamPlane,
@@ -263,6 +81,10 @@ impl Handles {
                 .publisher::<TxStatusPublisherHandle>(rt)
                 .await
                 .context("open TxStatusPublisherHandle")?,
+            drops_pub: plane
+                .tx_drops_publisher(rt, cfg.lane())
+                .await
+                .context("open TxDropsPublisherHandle")?,
         })
     }
 
@@ -274,6 +96,14 @@ impl Handles {
         Ok(LaneSub { lane, handle })
     }
 }
+
+/// The account events that may wait for the v2 loop: about one for each
+/// receipt batch. A full queue holds the receipts feed back.
+const V2_ACCOUNT_EVENTS: usize = 65_536;
+
+/// The senders that may wait for a lookup of the v2 loop. A full queue
+/// drops a request; the sender's transactions then wait for its rows.
+const V2_LOOKUP_QUEUE: usize = 4_096;
 
 /// Lag detection, receipt-floor resync, and the nonce lookup: the
 /// egress-watermark task, the receipts-floor task, the lookup task, the
@@ -289,6 +119,11 @@ struct ResyncWiring {
     fees: FeeGate,
     /// The epoch lane, whose signal sender the egress-watermark feed holds.
     epoch_lane: kardamom_sequencer::epoch::EpochPump,
+    /// The decision version that the egress-watermark feed reads off the
+    /// sealer, for the publish loop.
+    sealer_version: kardamom_sequencer::sealer_rules::SealerVersion,
+    /// The inputs of the v2 loop, when `[admission]` turns it on.
+    v2: Option<feeds::V2Wiring>,
     feeds: ResyncFeeds,
 }
 
@@ -366,12 +201,7 @@ impl ResyncWiring {
         // The epoch lane reads the same egress: the boundaries confirm its
         // epochs, and an origin-gap reject makes it offer them again.
         let (origins, epoch_lane) = kardamom_sequencer::epoch::EpochPump::new();
-        let epoch_lane = epoch_lane.with_activation_watch(
-            kardamom_sequencer::sealer_rules::ActivationWatch::new(
-                cfg.partition_index,
-                watermark.clone(),
-            ),
-        );
+        let sealer_version = kardamom_sequencer::sealer_rules::SealerVersion::default();
         let watermark_task = feeds::EgressWatermarkFeed::new(
             cfg.resync.boundary_silence_ms,
             cfg.partition_index,
@@ -379,6 +209,7 @@ impl ResyncWiring {
             answer_tx,
             deadline_tx,
             origins,
+            sealer_version.clone(),
         )
         .spawn(cluster_egress, shutdown.clone());
 
@@ -386,9 +217,16 @@ impl ResyncWiring {
         // discovered subscription receives on OS-chosen ports, so
         // co-located replicas never collide.
         let executor_count = executor_count.or(plane.channels().tx_receipts_executor_count);
-        let receipts_sub = plane
-            .tx_receipts_subscriber(receipts_rt, executor_count)
-            .context("open tx_receipts")?;
+        let receipts_sub = if cfg.receipts_from_egress {
+            tracing::info!("sequencer: the receipts and their rows come from the egress");
+            plane
+                .egress_receipts_subscriber(receipts_rt)
+                .context("open egress_receipts")?
+        } else {
+            plane
+                .tx_receipts_subscriber(receipts_rt, executor_count)
+                .context("open tx_receipts")?
+        };
         let vslots = cfg.vslot_set().context("vslots")?;
         // The local account layer: the receipts feed writes the rows of
         // this replica's vslots, the lookup task reads them.
@@ -403,7 +241,15 @@ impl ResyncWiring {
                 live.clone(),
             ))
         });
-        let receipts_task = feeds::ReceiptFloorFeed::new(vslots, floor_tx.clone(), live_writer)
+        // The v2 loop takes the rows of each batch and the lookup answers
+        // as account events. The v1 loop takes the receipts as floors.
+        let (accounts_tx, accounts_rx) = crossbeam_channel::bounded(V2_ACCOUNT_EVENTS);
+        let sink = if cfg.admission.enabled {
+            feeds::ReceiptSink::Accounts(accounts_tx.clone())
+        } else {
+            feeds::ReceiptSink::Floors(floor_tx.clone())
+        };
+        let receipts_task = feeds::ReceiptFloorFeed::new(vslots, sink, live_writer)
             .spawn(receipts_sub, shutdown.clone());
 
         // The fee gate: the base fee view follows the executors' boundary
@@ -415,21 +261,34 @@ impl ResyncWiring {
                 .tx_receipt_boundaries_subscriber(receipts_rt, executor_count)
                 .context("open tx_receipts boundaries")?;
             let task = feeds::BaseFeeFeed::new(view.clone()).spawn(boundaries, shutdown.clone());
-            (FeeGate::on(view, Some(live.clone())), Some(task))
+            // The v2 filter checks the balance itself, with the forwarded
+            // run counted, so its gate holds no account layer.
+            let balances = (!cfg.admission.enabled).then(|| live.clone());
+            (FeeGate::on(view, balances), Some(task))
         } else {
             (FeeGate::off(), None)
         };
 
-        // The nonce lookup task. It shares the floor channel with the
-        // receipts feed: an executor's committed nonce is floor evidence
-        // of the same kind as a receipt.
-        let (lookup, lookup_task) = Self::spawn_lookup(cfg, floor_tx, shutdown, live, redis);
+        // The lookup task: the account lookup of the v2 loop, or the nonce
+        // lookup of the v1 loop. The nonce lookup shares the floor channel
+        // with the receipts feed: an executor's committed nonce is floor
+        // evidence of the same kind as a receipt.
+        let (lookup, lookup_task, v2) = if cfg.admission.enabled {
+            let (v2, task) =
+                Self::spawn_account_lookup(cfg, accounts_tx, accounts_rx, shutdown, live, redis);
+            (None, Some(task), Some(v2))
+        } else {
+            let (lookup, task) = Self::spawn_lookup(cfg, floor_tx, shutdown, live, redis);
+            (lookup, task, None)
+        };
 
         Ok(Self {
             controller,
             lookup,
             fees,
             epoch_lane,
+            sealer_version,
+            v2,
             feeds: ResyncFeeds {
                 watermark_task,
                 receipts_task,
@@ -438,6 +297,42 @@ impl ResyncWiring {
                 main_rt,
             },
         })
+    }
+
+    /// Spawn the account lookup task of the v2 loop. Returns the inputs of
+    /// the loop and the task handle.
+    fn spawn_account_lookup(
+        cfg: &SequencerConfig,
+        accounts_tx: crossbeam_channel::Sender<kardamom_sequencer::v2::AccountEvent>,
+        accounts_rx: crossbeam_channel::Receiver<kardamom_sequencer::v2::AccountEvent>,
+        shutdown: &Shutdown,
+        live: std::sync::Arc<kardamom_cache::LiveAccounts>,
+        redis: Option<std::sync::Arc<kardamom_cache::CacheReader>>,
+    ) -> (feeds::V2Wiring, tokio::task::JoinHandle<()>) {
+        let (lookups, rx) = tokio::sync::mpsc::channel(V2_LOOKUP_QUEUE);
+        let query = kardamom_cache::ExecutorQuery::new(&kardamom_cache::ExecutorQueryConfig {
+            endpoints: cfg.lookup.executor_endpoints.clone(),
+            timeout_ms: cfg.lookup.timeout_ms,
+            max_in_flight: cfg.lookup.max_in_flight,
+        });
+        let task = feeds::AccountLookupFeed::new(
+            rx,
+            accounts_tx,
+            live,
+            redis,
+            query,
+            shutdown.clone(),
+            cfg.partition_index,
+        )
+        .spawn();
+        (
+            feeds::V2Wiring {
+                accounts: accounts_rx,
+                lookups,
+                verdicts: None,
+            },
+            task,
+        )
     }
 
     /// Spawn the nonce lookup task when the config names executor
@@ -547,13 +442,70 @@ async fn spawn_events_beacon(plane: &mut StreamPlane, rt: &AeronRuntime) -> Resu
     Ok(())
 }
 
+/// The start lines: the contract line for the CI drift check, which must
+/// match the cluster JVM's -Dkardamom.cluster.dedupCapacity (see
+/// cluster.nomad.hcl), and the settings of this replica.
+fn log_start(cfg: &SequencerConfig) -> anyhow::Result<()> {
+    kardamom_sequencer::metrics::record_start_time();
+    tracing::info!(
+        dedup_capacity = cfg.resync.dedup_capacity.get(),
+        enter_percent = cfg.resync.enter_percent.get(),
+        boundary_silence_ms = cfg.resync.boundary_silence_ms,
+        "resync contract: dedup_capacity must equal the cluster's -Dkardamom.cluster.dedupCapacity"
+    );
+    tracing::info!(
+        partition_index = cfg.partition_index,
+        sequencer_id = cfg.sequencer_id,
+        tx_ttl_ms = cfg.tx_ttl_ms.get(),
+        lane = cfg.lane(),
+        extra_lanes = ?cfg.extra_lanes,
+        vslots = %cfg.vslot_set().context("vslots")?,
+        shadow_vslots = %cfg.shadow_vslots,
+        shadow_warm_ms = kardamom_types::time::duration_to_ms_saturating(cfg.shadow_warm()),
+        "kardamom-sequencer starting"
+    );
+    Ok(())
+}
+
+/// Start the verdict task when the v2 loop runs with `[admission]
+/// verdicts`, and give its queue to the loop.
+fn start_verdicts(
+    resync: &mut ResyncWiring,
+    cfg: &SequencerConfig,
+    log_cfg: &LogConfig,
+    args: &Args,
+    shutdown: &Shutdown,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    let Some(v2) = resync.v2.as_mut().filter(|_| cfg.admission.verdicts) else {
+        return Ok(None);
+    };
+    let (frames, task) = feeds::VerdictFeed::start(
+        log_cfg,
+        &format!("sequencer-{}-verdicts", cfg.lane()),
+        args.aeron_dir.as_deref(),
+        shutdown,
+    )?;
+    v2.verdicts = Some(frames);
+    Ok(Some(task))
+}
+
+/// Join the verdict task. The loop dropped its end of the verdict queue,
+/// so the task ends its plane and drops its runtime.
+async fn join_verdicts(task: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = task
+        && let Err(e) = task.await
+    {
+        tracing::warn!(?e, "verdict task panicked");
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
     let args = Args::parse();
     let raw = std::fs::read_to_string(&args.config).context("read config")?;
     let mut cfg: SequencerConfig = toml::from_str(&raw).context("parse config")?;
-    apply_cli_overrides(&args, &mut cfg)?;
+    args.apply_overrides(&mut cfg)?;
     cfg.validate().context("validate config")?;
     // Ready while the cluster egress delivered a boundary within the
     // boundary-silence window: the session is open and the twin's dedup
@@ -569,27 +521,7 @@ async fn main() -> anyhow::Result<()> {
         )
     )
     .await?;
-    // Contract line for the CI drift check: this must match the cluster
-    // JVM's -Dkardamom.cluster.dedupCapacity (see cluster.nomad.hcl).
-    kardamom_sequencer::metrics::record_start_time();
-    tracing::info!(
-        dedup_capacity = cfg.resync.dedup_capacity.get(),
-        enter_percent = cfg.resync.enter_percent.get(),
-        boundary_silence_ms = cfg.resync.boundary_silence_ms,
-        "resync contract: dedup_capacity must equal the cluster's -Dkardamom.cluster.dedupCapacity"
-    );
-
-    tracing::info!(
-        partition_index = cfg.partition_index,
-        sequencer_id = cfg.sequencer_id,
-        tx_ttl_ms = cfg.tx_ttl_ms.get(),
-        lane = cfg.lane(),
-        extra_lanes = ?cfg.extra_lanes,
-        vslots = %cfg.vslot_set().context("vslots")?,
-        shadow_vslots = %cfg.shadow_vslots,
-        shadow_warm_ms = kardamom_types::time::duration_to_ms_saturating(cfg.shadow_warm()),
-        "kardamom-sequencer starting"
-    );
+    log_start(&cfg)?;
 
     let log_cfg = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
     let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
@@ -633,7 +565,7 @@ async fn main() -> anyhow::Result<()> {
     // sustainable ingest rate.
     let receipts_rt =
         AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
-    let resync = ResyncWiring::spawn(
+    let mut resync = ResyncWiring::spawn(
         &cfg,
         rt,
         cluster_egress,
@@ -642,6 +574,7 @@ async fn main() -> anyhow::Result<()> {
         args.executor_count,
         &shutdown,
     )?;
+    let verdict_task = start_verdicts(&mut resync, &cfg, &log_cfg, &args, &shutdown)?;
 
     // Cloning shares the single session thread, and offers serialize
     // through it. All three loops use `cluster_pub` (it implements
@@ -653,16 +586,19 @@ async fn main() -> anyhow::Result<()> {
         main_pub: cluster_pub.clone(),
         epoch_pub: cluster_pub.clone(),
         remote_epoch_pub: cluster_pub,
-        side: kardamom_sequencer::outbound::SideChannels {
-            errors: handles.errors_pub,
-            status: handles.status_pub,
-        },
+        side: kardamom_sequencer::outbound::SideChannels::new(
+            handles.errors_pub,
+            handles.status_pub,
+            handles.drops_pub,
+        ),
         epochs: handles.deposits_sub,
         epoch_lane: resync.epoch_lane,
         remote_epochs: handles.remote_epochs_sub,
         resync: Some(resync.controller),
         lookup: resync.lookup,
         fees: resync.fees,
+        sealer_version: resync.sealer_version,
+        v2: resync.v2,
         shutdown: shutdown.clone(),
         idle_cap,
     }
@@ -684,6 +620,7 @@ async fn main() -> anyhow::Result<()> {
     // when it returns, drops `rt` — before `receipts_rt`, still a local
     // here, drops at the end of `main`.
     loops.join_all().await;
+    join_verdicts(verdict_task).await;
     // The plane's registrations and discovery tasks end before the
     // runtime drops inside `resync.feeds.join()`.
     plane.shutdown().await;

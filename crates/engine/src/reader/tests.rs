@@ -117,12 +117,29 @@ pub(super) fn run_ordering(
     buf: JoinBuffer,
     cfg: ReaderConfig,
 ) -> Result<Vec<ReaderToExec>, ExecutorError> {
-    let b = VecTxOrderingSub {
-        queue: VecDeque::from(queue),
-    };
+    run_reader(
+        VecTxOrderingSub {
+            queue: VecDeque::from(queue),
+        },
+        buf,
+        cfg,
+    )
+}
+
+/// Spawn the `tx_ordering` reader over `sub`, join it, and drain the exec
+/// sink into a `Vec`, in arrival order.
+///
+/// # Errors
+///
+/// Returns the reader thread's error, if any.
+pub(super) fn run_reader(
+    sub: impl TxOrderingSubscription + 'static,
+    buf: JoinBuffer,
+    cfg: ReaderConfig,
+) -> Result<Vec<ReaderToExec>, ExecutorError> {
     let (tx, rx) = bounded::<ReaderToExec>(8);
     let h = TxOrderingReader::spawn(TxOrderingInputs {
-        sub: b,
+        sub,
         buffer: buf,
         cfg,
         exec_out: tx,
@@ -519,7 +536,14 @@ fn a_join_with_no_recovery_times_out_and_is_not_unjoinable() {
     };
     let mut recovery = None;
     let tx_ref = kardamom_types::TxRef::default();
-    let wait = super::join::JoinWait::new(&buffer, &mut recovery, &tx_ref, &cfg).unwrap();
+    let meters = super::meters::JoinMeters::new();
+    let ctx = super::join::JoinContext {
+        buffer: &buffer,
+        recovery: &mut recovery,
+        cfg: &cfg,
+        meters: &meters,
+    };
+    let wait = super::join::JoinWait::new(ctx, &tx_ref).unwrap();
 
     assert!(matches!(wait.run(), super::join::JoinOutcome::TimedOut));
 }

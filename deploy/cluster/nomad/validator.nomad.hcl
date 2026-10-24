@@ -108,6 +108,18 @@ variable "canary_genesis" {
     error_message = "The canary_genesis value must be on or off."
   }
 }
+# The canonical stream from the egress (--egress): the base URL of its
+# HTTP port, http://kardamom-egress.service.<datacenter>.consul:8548.
+# Empty, the validator reads the cluster egress and joins the tx_data
+# lanes. Set it only on a chain where the carry flag is active: a
+# reference without bytes then has nothing to join. Ansible deployment
+# sets it from KARDAMOM_VALIDATOR_EGRESS.
+variable "egress_url" {
+  type        = string
+  description = "The base URL of the egress (--egress). Empty reads the cluster egress and the tx_data lanes."
+  default     = ""
+}
+
 variable "executor_count" {
   type        = number
   description = "The executor node count (node_classes.executor.count). The checkpoint peers are executor-<i>.node.<datacenter>.consul."
@@ -120,11 +132,18 @@ job "validator" {
   # older validator finds a divergence at the first such skip. The
   # validator of this release also installs the KardamomChainState code
   # with the first setFeature system deposit on a genesis without it. An
-  # older validator finds a divergence at that deposit. The upgrade check
-  # (`just sealer-upgrade-check <env>`) reads these metas.
+  # older validator finds a divergence at that deposit. The validator of
+  # this release keeps the receipt that used the nonce as the index of its
+  # hash, as the executor does (first_receipt). The upgrade check
+  # (`just sealer-upgrade-check <env>`) reads these metas. The validator of
+  # this release runs a full reference that a sealer below decision
+  # version 5 relays as is (relayed_full_ref). An older validator drops that
+  # frame and stops at the gap.
   meta {
     nonce_burn          = "true"
     chain_state_install = "true"
+    first_receipt       = "true"
+    relayed_full_ref    = "true"
   }
 
   datacenters = [var.datacenter]
@@ -315,7 +334,9 @@ job "validator" {
           var.l1_rpc_url == "" || var.lockbox_address == "" ? [] : [
             "--l1-rpc-url", var.l1_rpc_url,
             "--lockbox", var.lockbox_address,
-        ])
+          ],
+          var.egress_url == "" ? [] : ["--egress", var.egress_url],
+        )
       }
 
       env {

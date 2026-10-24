@@ -32,6 +32,7 @@
 //! fallback path, no `recover_signer()` call, and no paranoid-check mode.
 //! The sequencer does zero secp256k1 work on the hot path.
 
+pub mod admission;
 pub mod config;
 pub mod epoch;
 pub mod error;
@@ -46,6 +47,7 @@ pub mod outbound;
 pub mod partition;
 mod pause_gate;
 pub(crate) mod pending;
+mod pipeline;
 pub mod pump;
 pub mod remote_epoch;
 pub mod resync;
@@ -58,6 +60,7 @@ pub(crate) mod state;
 pub mod testkit;
 mod tx_decode;
 mod unconfirmed;
+pub mod v2;
 
 pub use config::{BackpressurePolicy, SequencerConfig};
 pub use epoch::EpochSubscriber;

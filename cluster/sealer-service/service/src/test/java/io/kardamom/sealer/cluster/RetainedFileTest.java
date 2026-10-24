@@ -138,7 +138,8 @@ class RetainedFileTest {
             assertEquals(heap.boundaryEnd(block), file.boundaryEnd(block), "block " + block));
 
         IntStream.range(0, 2 * RECORDS_PER_BLOCK + 3).forEach(i -> {
-            assertEquals(heap.front(), file.front());
+            assertEquals(heap.frontIsBoundary(), file.frontIsBoundary());
+            assertEquals(heap.frontKey(), file.frontKey());
             heap.evictFront();
             file.evictFront();
         });
@@ -220,7 +221,7 @@ class RetainedFileTest {
         final List<Path> all = segmentFiles();
         // Evict the first half of the frames: the front moves into a later segment.
         IntStream.range(0, Math.toIntExact(file.count() / 2)).forEach(i -> file.evictFront());
-        final List<byte[]> served = replay(file, file.front().key(), BLOCKS / 2 + 1);
+        final List<byte[]> served = replay(file, file.frontKey(), BLOCKS / 2 + 1);
 
         file.writeSnapshot(0, 1);
         assertEquals(all, segmentFiles(), "the first snapshot keeps the segments below its own front");
@@ -228,7 +229,7 @@ class RetainedFileTest {
         final List<Path> kept = segmentFiles();
         assertTrue(kept.size() < all.size(), "the next snapshot deletes them: " + kept);
         assertEquals(all.get(all.size() - 1), kept.get(kept.size() - 1));
-        assertSameFrames(served, replay(file, file.front().key(), BLOCKS / 2 + 1));
+        assertSameFrames(served, replay(file, file.frontKey(), BLOCKS / 2 + 1));
     }
 
     @Test
@@ -308,12 +309,15 @@ class RetainedFileTest {
         final RetainedFile peer = open(source, SEGMENT_BYTES);
         peer.clear();
         blocks(peer, 1, BLOCKS + 1);
-        final byte[] snapshot = snapshotOf(CanonicalSealerState.RETAINED_FILE_SNAPSHOT_VERSION,
-            peer.writeSnapshot(0, 1));
+        final byte[] section = peer.writeSnapshot(0, 1);
+        final byte[] snapshot = snapshotOf(CanonicalSealerState.FILE_SNAPSHOT_VERSION, section);
         final long head = peer.publishedHead();
         final RetainedCopy copy = new RetainedCopy(List.of(), new SegmentDir(dir.resolve("into")), TOKEN, 1);
 
         assertTrue(copyFrom(source, head, copy, snapshot), "a peer at the snapshot head serves a whole copy");
+        assertTrue(copyFrom(source, head, copy,
+            snapshotOf(CanonicalSealerState.RETAINED_FILE_SNAPSHOT_VERSION, section)),
+            "a version-12 snapshot also holds a retained file");
         assertFalse(copyFrom(source, head - 1, copy, snapshot), "a peer behind the snapshot fails the walk");
         assertFalse(copyFrom(source, head, copy, snapshotOf(10, new byte[Integer.BYTES])),
             "a snapshot without a retained file fails");

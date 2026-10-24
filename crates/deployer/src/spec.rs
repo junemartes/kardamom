@@ -17,7 +17,7 @@ pub struct DeploymentSpec {
     pub init_data: Bytes,
     pub impl_salt: B256,
     /// If this is non-zero, the factory skips CREATE2 and reuses this impl.
-    /// The deployer sets it when it groups multi-L2 ops. `build_spec` always
+    /// The deployer sets it when it groups multi-L2 ops. `Op::spec` always
     /// returns zero here.
     pub target_impl: Address,
 }
@@ -67,40 +67,27 @@ impl Op {
             Op::Upgrade { new_version, .. } => *new_version,
         }
     }
-}
 
-/// Build a `DeploymentSpec` for a single `Op`. `target_impl` is always zero
-/// here. The deployer's dedup pass fills it in after grouping by
-/// `(id, version)`.
-pub fn build_spec(op: &Op) -> DeploymentSpec {
-    match op {
-        Op::Deploy {
-            l2_chain_id,
-            id,
-            init_args,
-        } => DeploymentSpec {
-            l2_chain_id: *l2_chain_id,
+    /// Build the `DeploymentSpec` of this op for the factory at `factory`.
+    /// The implementation initcode carries `factory` as its constructor
+    /// argument. `target_impl` is always zero here. The dedup pass of the
+    /// deployer fills it in after it groups the specs by `(id, version)`.
+    #[must_use]
+    pub fn spec(&self, factory: Address) -> DeploymentSpec {
+        let id = self.id();
+        let (action, init_data) = match self {
+            Op::Deploy { init_args, .. } => (Action::Deploy, encode_init_calldata(id, init_args)),
+            Op::Upgrade { init_args, .. } => (Action::Upgrade, init_args.clone()),
+        };
+        DeploymentSpec {
+            l2_chain_id: self.l2_chain_id(),
             id: id.id(),
-            action: Action::Deploy,
-            impl_initcode: id.creation_bytecode(),
-            init_data: encode_init_calldata(*id, init_args),
-            impl_salt: id.impl_salt(1),
+            action,
+            impl_initcode: id.initcode(factory),
+            init_data,
+            impl_salt: id.impl_salt(self.version()),
             target_impl: Address::ZERO,
-        },
-        Op::Upgrade {
-            l2_chain_id,
-            id,
-            new_version,
-            init_args,
-        } => DeploymentSpec {
-            l2_chain_id: *l2_chain_id,
-            id: id.id(),
-            action: Action::Upgrade,
-            impl_initcode: id.creation_bytecode(),
-            init_data: init_args.clone(),
-            impl_salt: id.impl_salt(*new_version),
-            target_impl: Address::ZERO,
-        },
+        }
     }
 }
 

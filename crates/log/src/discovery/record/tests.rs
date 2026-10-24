@@ -2,12 +2,13 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use super::*;
 
-const EVERY_TOPIC: [Topic; 11] = [
+const EVERY_TOPIC: [Topic; 12] = [
     Topic::TxData,
     Topic::TxReceipts,
     Topic::TxReceiptBoundaries,
     Topic::TxErrors,
     Topic::TxStatus,
+    Topic::TxVerdicts,
     Topic::TxDeposits,
     Topic::TxRemoteEpochs,
     Topic::TxBal,
@@ -78,4 +79,50 @@ fn an_archive_record_lists_the_follower_stream_beside_another_topic() {
     only.meta.insert("topics".into(), ",l1_blocks".into());
     let record = ArchiveRecord::from_entry(&only).expect("an empty piece is skipped");
     assert_eq!(record.topics, [Topic::L1Blocks]);
+}
+
+/// An archive entry of one node, with `topics` as its topic list.
+fn archive_entry(topics: &str) -> ServiceEntry {
+    let scope = Scope {
+        cluster_id: "test".into(),
+        chain_id: 7,
+    };
+    let mut meta = scope.meta();
+    meta.insert("archive_id".into(), "ingress-0".into());
+    meta.insert("topics".into(), topics.into());
+    ServiceEntry {
+        id: ServiceId::new("archive-ingress-0".into()),
+        name: ARCHIVE_SERVICE.into(),
+        address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
+        port: 8010,
+        meta,
+    }
+}
+
+/// A node without the follower meta leaves the Nomad interpolation
+/// unfilled. The record keeps its known topic.
+#[test]
+fn an_unfilled_interpolation_is_skipped_and_the_known_topic_stays() {
+    let entry = archive_entry("tx_data,${meta.archive_topics_follower}");
+    let record = ArchiveRecord::from_entry(&entry).expect("the known topic parses");
+    assert_eq!(record.topics, [Topic::TxData]);
+}
+
+#[test]
+fn an_empty_trailing_piece_is_skipped() {
+    let record = ArchiveRecord::from_entry(&archive_entry("tx_data,")).expect("tx_data parses");
+    assert_eq!(record.topics, [Topic::TxData]);
+}
+
+#[test]
+fn a_record_with_only_unknown_topics_is_dropped() {
+    let entry = archive_entry(",${meta.archive_topics_follower}");
+    assert!(ArchiveRecord::from_entry(&entry).is_err());
+    assert!(ArchiveRecord::from_entry(&archive_entry("nope,also_nope")).is_err());
+}
+
+#[test]
+fn a_record_with_an_empty_topic_list_records_nothing() {
+    let record = ArchiveRecord::from_entry(&archive_entry("")).expect("an empty list parses");
+    assert_eq!(record.topics, [] as [Topic; 0]);
 }

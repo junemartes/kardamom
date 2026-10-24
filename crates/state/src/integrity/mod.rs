@@ -46,6 +46,9 @@ pub struct IntegrityReport {
     pub last_committed_block: u64,
     pub headers: u64,
     pub receipts: u64,
+    /// Receipts of a transaction that the sealer ordered again: they used
+    /// no nonce, and the index of their hash names another copy.
+    pub repeated_receipts: u64,
     pub accounts: u64,
     pub storage_slots: u64,
     /// `meta[state_root]`, when present. Only trie-aware writers set this.

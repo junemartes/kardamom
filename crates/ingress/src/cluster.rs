@@ -129,6 +129,7 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
                 | EgressItem::WindowFull { .. }
                 | EgressItem::DaLagReject { .. }
                 | EgressItem::RecordLagReject { .. }
+                | EgressItem::RefRefused(_)
                 | EgressItem::OriginGap { .. },
             ) => return ControlFlow::Continue(()),
             // The watermark moves on relayed records and boundaries. A
