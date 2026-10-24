@@ -727,7 +727,7 @@ The ingress records these names of the pipeline metrics (see "Pipeline metrics")
 | `ingress.publish_round_trip` | step | The `tx_data` publish: the hop to the blocking pool and the round trip to the Aeron thread up to its ack. |
 | `ingress.recover_batch` | step | The recovery of one verifier batch on the blocking pool, up to the end of its last worker. |
 | `ingress.recover_batch` | batch | The requests in each verifier batch. |
-| `ingress.recover_intake` | queue | The requests that queued in the verifier intake while the batch before ran, read when the flush task comes back for the next batch. The intake holds four times the batch depth; a full intake makes a submit wait. |
+| `ingress.recover_intake` | queue | The requests that queued in the verifier intake while the batch before ran, read when the flush task comes back for the next batch. While the verifier is idle, the gauge holds the last backlog that it read (sample and hold), not a live depth. The intake holds four times the batch depth; a full intake makes a submit wait. |
 | `ingress.recover_wait` | step | The wait of each request from its submit to the take of its batch: the flush window plus the time behind the batch before it. |
 | `ingress.ack_waiters` | queue | The submissions that wait for the verdict of the sequencer (ack at admission). The shed check counts them with `kardamom_ingress_queue_depth`. |
 | `ingress.watermark` | loop | The cluster egress thread. Idle while it waits for an egress event (the receive and the decode), busy while it handles the event. |
