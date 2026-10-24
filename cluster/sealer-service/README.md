@@ -143,8 +143,10 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 | 13 | Record-lag reject | `[kind=13][sender:20][nonce:u64][sealed_index:u64][recorded_index:u64][budget:u64]` | the offering session |
 | 15 | Relayed reference | `[kind=15][index:u64][canonical_id:32][record_type:u8]` (42 bytes) | consumers, with `carryBytes` |
 | 17 | Sealer info | `[kind=17][decision_version:u8][cluster_session_id:i64]` (10 bytes) | each session when it opens, and every session at each new term |
+| 18 | Reference refused | `[kind=18][canonical_id:32][sender:20][nonce:u64][decision_version:u8]` (62 bytes) | the offering session |
 
 - Kind 17: a sequencer reports the version that it got last for its current session (`kardamom_sequencer_sealer_version`). A reader that does not know kind 17 drops it.
+- Kind 18: the carry window refused a transaction reference of record type 0. The sealer did not order it. `canonical_id` is the hash of the transaction, and `decision_version` is 5. See [The carry window](#the-carry-window-feature-5). A reader that does not know kind 18 drops it.
 
 - `index` is the 0-based canonical record index.
 - Consumers are the sessions that sent a kind 2 or a kind 1. While no consumer is known, the service sends relayed records to all sessions.
@@ -430,8 +432,8 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.voidWindow` | `65536` | yes | The number of newest canonical indices that a void can name. |
 | `kardamom.cluster.daLagBudgetBlocks` | `10000` (env `DA_LAG_BUDGET_BLOCKS`) | yes | The DA-lag budget in blocks. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. |
 | `kardamom.cluster.recordLagBudget` | `0` (env `KARDAMOM_RECORD_LAG_BUDGET`) | yes | The record-lag budget in canonical records. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. In this release a value above `0` also stops the start, because the snapshot writer writes version 10. |
-| `kardamom.cluster.retention` | `65536` | recommended | The minimum number of egress frames kept for replay. |
-| `kardamom.cluster.carryBytes` | `false` | yes | `true` keeps the retained frames in an append-only file, not on the heap, and writes snapshot version 12. It also relays a full entry as a canonical entry, and drops the void request and the recorded cursor. The release gate refuses a rolling change of it. It needs `adminPort`, the env var `KARDAMOM_RETAINED_TOKEN` and a `snapshotIntervalS` above `0`. Any value other than `true`, `false` or empty stops the start. See [Retained file](#retained-file). |
+| `kardamom.cluster.retention` | `65536` | no, raise only (the deploy gate enforces it) | The egress frames kept for replay: the minimum under the posted rule, and the exact window under decision version 5 with the carry window or with `carryBytes`. The largest supported value is 131072. The service does not check the cap: the deploy gate enforces it. |
+| `kardamom.cluster.carryBytes` | `false` | yes | `true` keeps the retained frames in an append-only file, not on the heap, and writes snapshot version 17. It also relays a full entry as a canonical entry, and drops the void request and the recorded cursor. The release gate refuses a rolling change of it. It needs `adminPort`, the env var `KARDAMOM_RETAINED_TOKEN` and a `snapshotIntervalS` above `0`. Any value other than `true`, `false` or empty stops the start. See [Retained file](#retained-file). |
 | `kardamom.cluster.feedAeronDir` | empty (off) | no | The directory of the media driver that the member shares with its paired executor. A value turns the member feed on. It needs `carryBytes=true`; without it the start stops. See [Member feed](#member-feed). |
 | `kardamom.cluster.feedRingBytes` | `16777216` (16 MiB) | no | The frame ring of the member feed, off the heap. A power of two of at least 8 MiB; another value stops the start. |
 | env `KARDAMOM_RETAINED_TOKEN` | none | yes, with `carryBytes` | The shared token that a request for the retained file must carry. The member reads it only from the env var, because `ps` shows the system properties. A log line never prints it. |
@@ -458,14 +460,23 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 - `fileSyncLevel`: `0` leaves a write in the page cache. `1` syncs the data of each write batch. `2` syncs the data and the file metadata.
   - At level 0 an entry that a quorum acknowledged can exist only in page caches. A power loss that takes the members together drops it.
   - The deploy passes `1` (variable `cluster_file_sync_level`, env `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL`).
-- `retention` is a minimum window. A frame past the window leaves only when its block is at or below the posted head.
-  - The batcher can always replay from its cursor, because the sealer keeps each frame that is not posted.
-  - The stretch has a bound: the budget plus one flush of blocks, in heap.
-  - The snapshot carries the retained frames. A member that restores a snapshot keeps the floor at the posted head. It answers older ranges with `REPLAY_UNAVAILABLE`.
-  - With no budget (`0`), nothing bounds the stretch.
-  - Use the same value on every member, so the replay range does not change after a failover.
+- `retention`: the eviction rule follows the decision version of the state.
+  - Below version 5, `retention` is a minimum window. A frame past the window leaves only when its block is at or below the posted head.
+    - The batcher can always replay from its cursor, because the sealer keeps each frame that is not posted.
+    - The stretch has a bound: the budget plus one flush of blocks, in heap.
+    - With no budget (`0`), nothing bounds the stretch.
+  - Under version 5 with the carry window on, or on a member that carries the bytes, `retention` is the whole rule. A frame past the window leaves at once, at any posted head. See [The carry window](#the-carry-window-feature-5).
+  - The snapshot carries the retained frames. A member that restores a snapshot keeps the floors of the snapshot. It answers older ranges with `REPLAY_UNAVAILABLE`.
+  - The size: `retention` must cover at least 60 s at the planned rate. A frame is one record or one boundary. The rule is `retention >= 60 x (planned tx/s + 0.5)`.
+    - The default of 65536 covers about 65 s at 1000 tx/s. A load test at 2000 tx/s needs 120060 frames: set 131072.
+  - The cap: 131072 frames, and `retention x mean frame bytes <= 32 MiB`. The mean is `kardamom_sealer_retained_bytes / kardamom_sealer_retained_frames` at the time of the deploy.
+    - Why: a replay over a cluster session queues every wanted frame at once. A session whose backlog passes 64 MiB (`SessionBacklogs.BYTE_LIMIT`) is closed. A reader that replays from near the floor of a larger window is closed, reconnects, and replays again, with no end.
+    - 131072 frames of about 300 bytes are about 39 MB. A larger mean frame gives a lower cap. This design supports no larger value: the cap covers 60 s up to about 2180 tx/s.
+  - A rolling change may only raise `retention`, and it stays at or below the cap. The deploy gate enforces both rules. The service checks neither.
+    - During a roll, two members can keep two windows. That changes no decision and no byte of the state section. It changes only the frames that each member can replay, and the size of the heap section of its snapshot.
+    - So the snapshot sizes of the members differ during a roll of `retention`. No protocol compares snapshot bytes across members. Members with the same value write the same bytes.
 - `carryBytes`: the deploy does not pass it yet, so the retained frames stay on the heap.
-  - Switch it only with a new chain or a coordinated cut-over, never on a live chain. A member with the file stops on a snapshot before version 12, and a member without the file stops on a version-12 snapshot. Both print `sealer RETAINED-FILE FATAL`.
+  - Switch it only with a new chain or a coordinated cut-over, never on a live chain. A member with the file stops on a snapshot that is not version 12 or 17, and a member without the file stops on version 12 or 17. Both print `sealer RETAINED-FILE FATAL`.
   - `snapshotIntervalS=0` with `carryBytes` stops the start: the purge of the file runs at each snapshot, so the file would never shrink.
 - `daLagBudgetBlocks`: the start-up line `cluster da-lag budget` shows the value. See [DA-lag guard](#da-lag-guard).
 - `recordLagBudget`: the start-up line `cluster record-lag budget` shows the value. See [Record-lag guard](#record-lag-guard).
@@ -558,10 +569,11 @@ Every member applies the same log. Two members on two rule versions can decide o
 
 - Every member runs version 3 from its start. `FEATURE_SEALER_V4` (feature id 3) switches it to version 4. See [Version 4](#version-4).
 - `FEATURE_SEALER_V5` (feature id 4), the carry flag, switches version 4 to version 5. See [Version 5](#version-5).
+- `FEATURE_CARRY_WINDOW` (feature id 5), the carry window, turns on the rules of the carry window under version 5. See [The carry window](#the-carry-window-feature-5).
 - A relayed frame of kinds 0, 3, 4 and 5 needs its record-type byte. A frame that ends at the record type drops as malformed.
 - The member reports its version in the sealer info (egress kind 17): to each session when it opens, to every open session at each new leadership term (a leader change can lose a frame of the old leader), and to every open session at a switch.
-- A feature activation record (ingress kind 11) of feature 3 or 4 stores the schedule of the switch. A record of another feature changes no state. The member prints `cluster FEATURE-ACTIVATION` with the outcome.
-- The snapshot is version 14: version 10, then the rules. A member that holds an activation of feature 3 writes version 15, and a member that holds an activation of feature 4 writes version 16. See [Snapshot](#snapshot).
+- A feature activation record (ingress kind 11) of feature 3, 4 or 5 stores the schedule of the switch. A record of another feature changes no state. The member prints `cluster FEATURE-ACTIVATION` with the outcome.
+- The snapshot is version 14: version 10, then the rules. A member that holds an activation of feature 3 writes version 15, a member that holds an activation of feature 4 writes version 16, and a member that holds an activation of feature 5 writes version 18. See [Snapshot](#snapshot).
 - Admin `/status` reports `decisionVersion` (3, 4 or 5), and `decisionActivationOrigin` and `decisionActivationMs`: the newest activation of feature 3 or 4, else the newest one that the snapshot tail holds, both 0 when there is none.
 
 `FEATURE_SEALER_V3` (feature id 2) turns on the nonce burn of a skipped transaction. The executor, the validator, the replay and the zk guest read the flag at each block, so a replay of a block from before the activation, or from a time that the feature was off, uses no nonce on a skip. The sealer does not read the flag.
@@ -613,8 +625,20 @@ Version 5 is version 4 that relays the bytes of a transaction. The sequencer off
   2. The replay window of the image, as in version 4. A copy or an expired reference drops. The member reads no byte of its envelope. This is the copy of the twin sequencer.
   3. The DA-lag guard. A refused reference does not enter the window.
   4. Otherwise the member sets the bit and orders the reference. It relays one canonical entry: `[canonical_id:32][record_type=6][lane:u8][envelope]`.
-- **Other records.** A reference of type 0 keeps the rules of version 4, so a sequencer that sends type 0 still has its references ordered. An epoch and a remote-origin record keep the id window. With priority fees on, a held full reference takes the version-5 rules when the ordering window flushes it.
+- **Other records.** A reference of type 0 keeps the rules of version 4, so a sequencer that sends type 0 still has its references ordered. With the carry window on, the member refuses it (see below). An epoch and a remote-origin record keep the id window. With priority fees on, a held full reference takes the version-5 rules when the ordering window flushes it.
 - **No void and no record lag.** The member drops the void requests (kind 6) and the recorded cursors (kind 9) as unknown kinds. The record-lag guard is off. The void ledger keeps no full reference.
+- **The replay window.** A member that carries the bytes (`carryBytes`) keeps only the last `retention` frames. A frame past the window leaves at once, also when its block is above the posted head. So the retained frames have a fixed bound in the retained file and in the snapshot, at any DA lag.
+  - A member that keeps its frames on the heap keeps the rule of version 4 until the carry window turns on: a frame past the window leaves only when its block is posted. Before the carry window, the executors and the batcher can read references, and the egress cannot serve a reference, so no reader below the window could recover.
+  - Every member runs the same `carryBytes` value (the release gate refuses a rolling change of it), so every member evicts the same frames.
+  - A member with `carryBytes` writes snapshot version 17. It holds the decision rules and the version switch, so a restored member runs version 5 as its peers do. A member that restores a version-12 snapshot of an older release runs version 3, so a chain with the file writes version 17 before it turns on feature 3 or 4.
+  - A cursor inside the window gets the frames from the cursor. A cursor below the window gets `REPLAY_UNAVAILABLE`. A reader below the window recovers from another source.
+  - The DA-lag guard stays. It refuses new records when the sealed head is more than the budget past the posted head. It holds no frame.
+  - The rule changes at the end of the log entry whose boundary switches the version or the carry window: the member evicts the frames past the window before the snapshot notice of the switch. A restore takes the rule of the version in the snapshot. So every member evicts the same frames at the same log position, from the log or from a snapshot. The status of the tick that switches leaves before the eviction, with the count of the old rule.
+  - A switch back to version 4 or 3 keeps the old rule again from the end of that entry.
+  - A batcher that replays from the sealer gets `REPLAY_UNAVAILABLE` when its cursor falls below the window, and it does not recover by itself. The egress (`--egress`) serves the batcher and the validator below the window, but only frames with their bytes: a reference of version 4 or older has no bytes. So the order of the rollout is:
+    - On a chain where version 5 already runs with `carryBytes`: switch the batcher and the validator to the egress, then deploy this release. Without `carryBytes`, this release changes no eviction.
+    - On a chain where version 5 does not run yet: send the upgrade transaction of feature 4 at a low load, when the unposted frames fit in the window. Keep the load low until the batcher posts a block of version 5. Then switch the batcher and the validator to the egress.
+  - See [the one-way pipeline spec, section 6.4](../../docs/specs/2026-10-21-one-way-pipeline.md).
 - **The cost.** The record path allocates nothing (`AllocationGateTest`, case `ref_v5`, and `CarriedPathAllocationTest` of the service, cases `carried_fresh` and `carried_copy`). With no ordering window, the relay copies the id, the lane and the envelope from the log buffer into the staging buffer in two parts. The frame goes from there to the retained ring and to each session.
 - **The activation.** `FEATURE_SEALER_V5` follows the rules of `FEATURE_SEALER_V4`, with its own schedule: the activation becomes visible at the boundary that seals the first block of its epoch, and the version changes at the first boundary at or after its time. A later activation with a time ahead turns version 5 off until that time, and a time of `2^64 - 1` keeps it off.
   - The member stores the activation only while version 4 or 5 runs. A record that comes while version 3 runs changes nothing (outcome `EARLY`, `cluster FEATURE-ACTIVATION-EARLY`). Send the upgrade transaction of feature 4 only after version 4 is on.
@@ -622,13 +646,36 @@ Version 5 is version 4 that relays the bytes of a transaction. The sequencer off
 - **The report.** The member reports version 5 in the sealer info (egress kind 17). A sequencer sends record type 7 only after it reads version 5 there.
 - **The gate.** `just sealer-upgrade-check <env> 4 <activation_ms>` refuses feature 4 unless every member reads snapshot version 16. A member of the release before reads only up to version 15, and it also ignores the activation of feature 4: it would stay on version 4 while the other members switch to 5.
 
+#### The carry window (feature 5)
+
+`FEATURE_CARRY_WINDOW` (feature id 5) sets the carry window flag. The rules of the carry window apply while the flag is on and version 5 runs:
+
+- **The window.** The egress keeps only the last `retention` frames, as with `carryBytes`. The rule is `windowOnly = version == 5 && (carryWindow || carryBytes)`. So the heap and the snapshot have a fixed bound at any DA lag. About 300 bytes a frame give about 20 MB for 65536 frames.
+- **The refusal.** The member does not order a transaction reference of record type 0, alone or in a kind-3 batch. It answers the offering session with egress kind 18, counts it in `kardamom_sealer_ref_refused_total`, and logs `cluster REF-REFUSED` at most once a second. It never drops one silently: with `--ack validated` the client has the hash before the sealer sees the offer. A full reference (type 7), an epoch, a deposit and a remote-origin record keep their rules.
+- **A type 7 below version 5.** The member orders a full reference below version 5 by the rules of version 3 or 4, and relays it as is, with record type 7. It counts each one in `kardamom_sealer_full_ref_below_v5_total`. Such a frame comes from a sequencer with a wrong start floor.
+
+The rules change at two points of one log entry:
+
+1. The flag changes at the boundary inside the entry: a timer tick, or the boundary that an origin record or a remote-origin record (ingress kinds 4 and 5) forces in front of it. Only these two kinds force a boundary, and a kind-3 batch never holds one. So the refusal applies from the first record of the block that the boundary opens.
+2. The eviction rule changes at the end of that entry. The frames of the entry go in under the old rule, and the prune at the end applies the new rule. For a forced boundary, that entry holds the boundary frame and the frame of the record that forced it. The member then asks for a snapshot, so a replay has a start point on each side.
+
+A restore runs `restore`, then the rules of the snapshot, then the posted head. So the restored frames are pruned by the rule of the snapshot. Both points are functions of the log, and a snapshot falls only between entries. So every member, from the log or from a snapshot, switches at the same points and keeps the same bytes.
+
+- **The activation.** Feature 5 follows the rules of feature 4, with its own schedule. A later activation with a time ahead turns the flag off until that time, and `2^64 - 1` keeps it off. Off, the posted rule comes back at the end of that entry, no frame comes back, and type 0 is ordered again. On again, the window drains to `retention` frames at the end of the entry.
+  - The member stores the activation only while version 5 runs. A record that comes under version 3 or 4 changes nothing (outcome `EARLY`).
+  - When version 5 stops (feature 3 or 4 off), the rules stop. The flag keeps its value, so the rules come back with version 5.
+- **A member with the retained file.** A member with `carryBytes` never stores an activation of feature 5: its snapshot (version 12 or 17) has no place for the schedule. The record gets the outcome `UNSUPPORTED`. The member counts it in `kardamom_sealer_feature_unsupported_total` and logs `cluster FEATURE-ACTIVATION-UNSUPPORTED`. `carryBytes` must match on every member, so every member gives the same outcome. The record changes no snapshot byte.
+- **The snapshot.** A member that holds an activation of feature 5 writes version 18. Before the first kind 11 of feature 5, a member writes 14, 15 or 16 as before. See [Snapshot](#snapshot).
+- **The cost.** The record path allocates nothing with the carry window on (`AllocationGateTest`, case `ref_v5_window`, and `CarriedPathAllocationTest`, cases `carried_window_fresh` and `carried_window_copy`).
+
 | Version | Rule change |
 |---|---|
 | 1 | The first rules. |
 | 2 | A void sets the expected nonce of the sender to the lower of the expected nonce and the voided nonce. |
 | 3 | A relayed frame of kinds 0, 3, 4 and 5 needs its record-type byte. With `carryBytes`, a member orders full entries, relays them as canonical entries, and takes no void request. The contiguity guard does not change. |
 
-- `carryBytes` is a setting that every member must match, and the release gate refuses a rolling change of it. The snapshot layout carries it: a member with `carryBytes` stops on a snapshot that is not version 12, and a member without it stops on version 12.
+- `carryBytes` is a setting that every member must match, and the release gate refuses a rolling change of it. The snapshot layout carries it: a member with `carryBytes` stops on a snapshot that is not version 12 or 17, and a member without it stops on version 12 or 17.
+- A member with `carryBytes` writes snapshot version 17. Version 17 holds the decision rules, the switch and the schedule of feature 4, so a restored member runs the same decision version as its peers. A version-12 snapshot holds no decision rules: a member that restores one runs version 3.
 
 ## Admin server
 
@@ -638,17 +685,34 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
 |---|---|
 | `GET /status` | Always 200 with the status JSON. |
 | `GET /ready` | 200 when the member is ready. 503 when it is not. The body is the status JSON. |
-| `GET /metrics` | 200 with the gauge `kardamom_sealer_disk_free_bytes{member_id}`, the pipeline metrics of the service thread, the log positions and the Aeron counters of the member, in the Prometheus text format. See "Sealer pipeline" in [docs/observability.md](../../docs/observability.md). |
+| `GET /metrics` | 200 with the gauge `kardamom_sealer_disk_free_bytes{member_id}`, the pipeline metrics of the service thread, the rules and the retained frames (below), the log positions and the Aeron counters of the member, in the Prometheus text format. See "Sealer pipeline" in [docs/observability.md](../../docs/observability.md). |
 | `GET /retained` | With `carryBytes`: 200 with one `<name> <size>` line for each segment below the published head. `size` counts only the bytes below that head. 403 without the token. Else 404. |
 | `GET /retained/<name>` | With `carryBytes`: 200 with the bytes of one segment below the published head. 403 without the token. 404 for a name that is not a served segment, or a segment that the purge deleted. |
 | any other path | 404 |
 
+- The rules and the retained frames on `/metrics`:
+
+  | Series | Value |
+  |---|---|
+  | `kardamom_sealer_retained_frames` | the retained frame count |
+  | `kardamom_sealer_retained_bytes` | the bytes of the retained frames |
+  | `kardamom_sealer_retained_store` | 0 heap, 1 file |
+  | `kardamom_sealer_window_exact` | 1 when the egress keeps only its replay window, else 0 |
+  | `kardamom_sealer_decision_version` | the version of the open block |
+  | `kardamom_sealer_feature_state{feature="3"\|"4"\|"5"}` | 0 no activation held, 1 held and off, 2 on |
+  | `kardamom_sealer_feature_activation_ms{feature}` | the time of the newest held activation, 0 when none. A held activation with time 0 that is not visible yet also shows 0: `feature_state` tells the two apart |
+  | `kardamom_sealer_feature_unsupported_total` | the records of feature 5 on a member with the retained file |
+  | `kardamom_sealer_snapshot_bytes` | the size of the newest snapshot that the member took or restored |
+  | `kardamom_sealer_snapshot_version` | the version of that snapshot |
+  | `kardamom_sealer_ref_refused_total` | the type-0 references that the carry window refused |
+  | `kardamom_sealer_full_ref_below_v5_total` | the full references ordered below version 5 |
 - The server listens on `0.0.0.0`. Two members on one host cannot share the port, so the port is off by default.
 - The server answers `/status`, `/ready` and `/metrics` on one thread. The paths under `/retained` run on two threads of their own, so a segment copy does not hold up `/ready`.
-- The retained file holds the bytes of every transaction above the posted head, and the server listens on all addresses. So each request under `/retained` must carry `Authorization: Bearer <KARDAMOM_RETAINED_TOKEN>`. The job passes the same token to every member.
+- The retained file holds the bytes of the transactions of the retained frames, and the server listens on all addresses. So each request under `/retained` must carry `Authorization: Bearer <KARDAMOM_RETAINED_TOKEN>`. The job passes the same token to every member.
   - The token and the segment bytes travel in cleartext HTTP on the node network. The token keeps out a client that does not have it. It does not hide the bytes from a host that reads the network.
 - `diskFreeBytes` is `null`, and the gauge is `NaN`, when the disk cannot be read. The member stays ready.
-- The status JSON has `memberId`, `role`, `election`, `commitPosition`, `servicePosition`, `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, `snapshotLatest`, `decisionVersion`, `decisionActivationOrigin`, `decisionActivationMs`, `diskFreeBytes` and `ready`.
+- The status JSON has `memberId`, `role`, `election`, `commitPosition`, `servicePosition`, `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, `snapshotLatest`, `decisionVersion`, `decisionActivationOrigin`, `decisionActivationMs`, `retainedStore`, `carryWindow`, `carryWindowActivationOrigin`, `carryWindowActivationMs`, `retainedFrames`, `retainedBytes`, `diskFreeBytes`, `leadershipTermId`, `startHold` and `ready`.
+  - `retainedStore` is `heap` or `file` (`carryBytes`). `carryWindow` is `true` while the rules of the carry window apply. `carryWindowActivationOrigin` and `carryWindowActivationMs` are the newest held activation of feature 5, both 0 when none. `retainedFrames` and `retainedBytes` are the retained frames and their bytes at the end of the last entry.
   - `decisionVersion` is the version of the rules of the member: 3, 4 or 5. `decisionActivationOrigin` and `decisionActivationMs` are the L1 origin and the time of the newest feature activation that the snapshot tail holds, both 0 when it holds none. See [Decision version](#decision-version).
   - `diskFreeBytes` is the free space of the disk of the cluster directory: the Raft log and the retained file. `/metrics` exports the same value.
   - `snapshotWrites`, `snapshotReadsMin` and `snapshotReadsMax` are the snapshot versions of this release, as `formats.toml` lists them.
@@ -717,7 +781,9 @@ The chaos suite and operators read these lines. The admin server also exports on
 | `cluster WINDOW-FULL` | The dedup window is at capacity. The line shows the size and the capacity. |
 | `cluster REMOTE-ORIGIN-REJECT` | The sealer refused a remote-origin record. The line shows the reason code. |
 | `cluster VOID-VOTE` | A void vote changed the count (`voter`, `index`, `result`, `votes` as `n/total`). A repeated vote prints nothing. |
-| `cluster FEATURE-ACTIVATION` | A feature activation record (`l1Origin`, `feature`, `activationMs`, `outcome`, `version`). `cluster FEATURE-ACTIVATION-LATE` follows for a record that the switch follows late or not at all, and `cluster FEATURE-ACTIVATION-EARLY` for a record of feature 4 that came while version 4 was off. |
+| `cluster FEATURE-ACTIVATION` | A feature activation record (`l1Origin`, `feature`, `activationMs`, `outcome`, `version`). `cluster FEATURE-ACTIVATION-LATE` follows for a record that the switch follows late or not at all, `cluster FEATURE-ACTIVATION-EARLY` for a record of feature 4 that came while version 4 was off, and `cluster FEATURE-ACTIVATION-UNSUPPORTED` for a record of feature 5 on a member with the retained file. |
+| `cluster DECISION-VERSION` / `cluster CARRY-WINDOW` | A boundary of the entry switched the version, or only the rules of the carry window (`version`, `carryWindow`, `windowOnly`, `at`, `block`). |
+| `cluster REF-REFUSED` | The carry window refused a reference of record type 0 (`version`, `nonce`, `block`, `total`). It prints at most once a second of cluster time. |
 | `cluster DROPPED malformed` | The service dropped a malformed frame. The line names the frame type. A non-zero count means that the Java and Rust layouts differ. |
 | `cluster REPLAY` | A replay request. A served replay ends with `served=`, `queued=` and `dropped=`. A refusal ends with `AHEAD head=(index,block)`, `SKEWED` or `UNAVAILABLE`. `AHEAD` means that the cursor is past the head. `SKEWED` means that `from_index` is outside the block that `from_block` names. |
 | `cluster EGRESS-CLOSE` | The service closed a client session because it could not take its frames. The line has the reason. See [Egress back-pressure](#egress-back-pressure). |
@@ -757,16 +823,20 @@ The chaos suite and operators read these lines. The admin server also exports on
 | `cluster node up`, `cluster admin endpoint`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster da-lag budget`, `cluster record-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster carry bytes`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |
 
 - The lines `CONTIGUITY-REJECT`, `PAST-DEADLINE`, `DA-LAG-REJECT`, `RECORD-LAG-REJECT`, `WINDOW-FULL`, `REMOTE-ORIGIN-REJECT` and `DROPPED` print when their count is a power of two (1, 2, 4, 8, and so on).
-- There is no Prometheus counter for these events.
+- There is no Prometheus counter for these events. `REF-REFUSED` and `FEATURE-ACTIVATION-UNSUPPORTED` have their counters on `/metrics`.
 
 ## Snapshot
 
-- The member reads snapshot versions 1 to 16. It writes version 14, or version 12 with `carryBytes`. It writes version 15 or 16 when it holds a feature activation (see below).
+- The member reads snapshot versions 1 to 18. It writes version 14, or version 17 with `carryBytes`. Without `carryBytes`, it writes version 15, 16 or 18 when it holds a feature activation (see below).
+  - Version 18 is version 16, then the carry window: `[carry_window:u8][held:u8]`, then `[origin:u64][time_ms:u64]` for each held activation of feature 5, oldest first (at most three). The heap section follows, with no change. A member writes version 18 once it holds an activation of feature 5, and then for good. A member with `carryBytes` never writes it. A member of the release before reads only up to version 17 and stops on it, so the upgrade transaction of feature 5 comes only after every member reads version 18, and a rollback after it is refused.
   - Version 14 is version 10, then the decision rules after the seed digest: `[decision_version:u8][sealed_origin:u64][held:u8]`, then `[origin:u64][time_ms:u64]` for each held activation, oldest first (at most three). The member writes version 3 and `sealed_origin`, the L1 origin of the last sealed block. It keeps the held activations of the snapshot that it restored, and adds none. A member of the release before this one restores the same rules, and runs version 3 while `FEATURE_SEALER_V3` stays on. A tail of version 2 restores as version 3. See [Decision version](#decision-version).
   - Version 15 is version 14, then the switch to version 4: `[decision_version:u8][sealed_origin:u64][held:u8]` and `[origin:u64][time_ms:u64]` for each held activation of feature 3, then the replay windows: `[slots:i32][width:i32][used:i32]` and, for each used slot, `[key:u64][highest:u64][last_seen:u64][bits]` (the bitmap is 32 KiB). A member writes version 15 once it holds an activation of feature 3. A member of the release before reads only up to version 14, so the upgrade transaction comes only after every member runs this release. A member checks that the snapshot was written with its own slot count and width.
   - Version 16 is version 15, then the schedule of feature 4: `[held:u8]` and `[origin:u64][time_ms:u64]` for each held activation, oldest first (at most three). The version byte of the switch can be 5. A member writes version 16 once it holds an activation of feature 4. A member of the release before reads only up to version 15, so the upgrade transaction of feature 4 comes only after every member runs this release.
   - Version 13 is version 10, then `[decision_version:u8][activation_origin:u64][activation_ms:u64]`: one held activation.
-  - Version 12 is the state section of version 10 without the void ledger, then the retention section of the retained file. A member with `carryBytes` takes no void request and no recorded cursor, so it holds neither.
+  - Version 17 is the state section of version 16, then the retention section of the retained file. A member with `carryBytes` writes it with or without a held activation. Its void ledger is empty: a member with `carryBytes` takes no void request.
+    - A member of the release before reads only up to version 16, and stops on version 17. A member without `carryBytes` never writes version 17, so a rolling deploy of a chain without `carryBytes` is safe.
+    - On a chain with `carryBytes`, a member of the release before stops on version 17. So a rollback after the first version-17 snapshot fails, and so does a seed of such a member from a peer that wrote version 17.
+  - Version 12 is the state section of version 10 without the void ledger, then the retention section of the retained file. A member with `carryBytes` of an older release writes it. This release still restores it. It holds no decision rules, so a member that restores it runs decision version 3.
   - This release does not write version 10. A member of the release before it restores version 10 with decision version 2.
   - A version-14 snapshot, as a version-10 one, holds no recorded cursor. A member that restores one has no cursor until the next cursor record. With the record-lag budget at `0` this changes no decision.
   - The release that turns on the cursor publisher and the record-lag guard writes version 11. Before that release, a `recordLagBudget` above `0` stops the start.
@@ -776,17 +846,30 @@ The chaos suite and operators read these lines. The admin server also exports on
   - the dedup window with the deadline of each id
   - the per-sender nonces
   - the remote-origin state
-  - the void ledger, in versions 6 to 11, 13 and 14
+  - the void ledger, in versions 6 to 11 and 13 to 18
   - the ordering window size
   - the posted head, after the ordering window size
   - the seed status (1 byte) and the seed digest (32 bytes), after the posted head
   - from version 11 only, the recorded cursors, after the seed digest: `[count:u8]`, then `[executor_id:u8][recorded_through:u64]` for each executor, in executor-id order
     - A restore drops the cursor of an executor that is not a configured voter.
-  - from versions 13 and 14 only, the decision rules, after the seed digest
+  - from versions 13 to 18, the decision rules, after the seed digest
+  - from versions 15 to 18, the version switch and the replay windows, after the decision rules
+  - from versions 16 to 18, the schedule of feature 4, after the replay windows
+  - from version 18 only, the flag and the schedule of feature 5, after the schedule of feature 4
 - The retention section follows the state section. Its layout depends on the version. Both layouts are big-endian.
-  - Versions 8 to 11, 13 and 14, on the heap: `[count:i32]`, then `[boundary:u8][key:u64][len:u32][frame]` for each retained frame.
-  - Version 12, the retained file: `[floor_index:u64][floor_block:u64][count:u64][front:u64][head:u64][n:i32]`, then `[block:u64][end_tx_idx:u64][end_pos:u64]` for each retained boundary, then `[len:i32]`, the length of the section before it. The section is the end of the snapshot, so a peer seed finds it with no parse of the state. See [Retained file](#retained-file).
-  - A member with `carryBytes` stops on a snapshot that is not version 12. A member without it stops on version 12.
+  - Under decision version 5 with the carry window on, or on a member that carries the bytes, the section holds at most `retention` frames. The layout does not change.
+  - Versions 8 to 11, 13 to 16 and 18, on the heap: `[count:i32]`, then `[boundary:u8][key:u64][len:u32][frame]` for each retained frame.
+  - Versions 12 and 17, the retained file: `[floor_index:u64][floor_block:u64][count:u64][front:u64][head:u64][n:i32]`, then `[block:u64][end_tx_idx:u64][end_pos:u64]` for each retained boundary, then `[len:i32]`, the length of the section before it. The section is the end of the snapshot, so a peer seed finds it with no parse of the state. See [Retained file](#retained-file).
+  - A member with `carryBytes` stops on a snapshot that is not version 12 or 17. A member without it stops on version 12 or 17.
+- The restore table:
+
+  | Snapshot | Who writes it | Restore on a heap member | Restore on a file member |
+  |---|---|---|---|
+  | 1 to 11, 13 | older releases | heap store, carry window off, no schedule | stop: `sealer RETAINED-FILE FATAL` |
+  | 12 | a file member of an older release | stop | file store, the rules of version 3. Feature 5: `UNSUPPORTED` |
+  | 14, 15, 16 | heap members | heap store, carry window off, no schedule | stop |
+  | 17 | a file member | stop | file store, the rules of version 16. Feature 5: `UNSUPPORTED` |
+  | 18 | a heap member that holds an activation of feature 5 | heap store, the flag and the schedule | stop: a file member never writes 18 |
 - A snapshot that was taken with another `orderingWindow` does not load. The member halts.
 - The Raft snapshot interval is `snapshotIntervalS`. The service asks for the snapshot on a boundary tick whose block number is a multiple of the interval in blocks. Only the leader's control toggle takes the request. The action is a log entry, so all members snapshot at the same position.
 - A snapshot stops the cluster. The consensus module appends no timer and no ingress until the service and the module record their snapshots in the archive. With `fileSyncLevel` above `0`, each recording is a chain of disk syncs (the catalog, the directory, each write, the recording log). On a loaded disk this took 11 s.

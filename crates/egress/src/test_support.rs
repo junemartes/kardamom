@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crossbeam_channel::Sender;
 
+use crate::drops::Drops;
 use crate::http::Http;
 use crate::merge::{Head, Merge, MergeConfig};
 use crate::owner::{FramePublisher, Input, Join, Owner, OwnerConfig, Parts};
@@ -24,6 +25,31 @@ struct NoLive;
 
 impl FramePublisher for NoLive {
     fn publish(&self, _frame: &[u8]) {}
+}
+
+/// The relayed frame of a record at `index` with a filler payload. Its
+/// record type is `RT_TX`, so it is no reference.
+pub(crate) fn record(index: u64) -> Vec<u8> {
+    let fill = u8::try_from(index % 256).unwrap();
+    let mut payload = [fill; 40];
+    payload[32] = kardamom_cluster_adapter::wire::RT_TX;
+    kardamom_cluster_adapter::wire::encode_egress_record(index, &payload).unwrap()
+}
+
+/// The relayed frame of a transaction reference (`RT_TXREF`) at `index`.
+pub(crate) fn ref_record(index: u64) -> Vec<u8> {
+    use kardamom_cluster_adapter::wire::{
+        GuardHeader, encode_egress_record, encode_ingress_txref, split_ingress,
+    };
+    let tx_ref = kardamom_types::TxRef::new(
+        alloy_primitives::B256::repeat_byte(0x44),
+        0,
+        kardamom_types::BPosition::from_index(index),
+        0,
+    );
+    let ingress = encode_ingress_txref(&tx_ref, GuardHeader::EXEMPT);
+    let (_, relayed) = split_ingress(&ingress).unwrap();
+    encode_egress_record(index, relayed).unwrap()
 }
 
 /// A running egress of a test: its address and its input queue.
@@ -53,6 +79,7 @@ impl TestEgress {
                 merge,
                 store,
                 receipts: Receipts::new(NonZeroUsize::new(16).unwrap()),
+                drops: Drops::new(NonZeroUsize::new(16).unwrap()),
                 live: NoLive,
                 receipts_live: NoLive,
             },

@@ -32,6 +32,9 @@ pub const COMMITTED_BLOCK: &str = "validator_committed_block";
 /// 1 while a divergence verdict stands in the verdict file beside the
 /// state, 0 otherwise. The readiness rule and the alert read it.
 pub const VERDICT_STANDING: &str = "validator_verdict_standing";
+/// The canonical index of the newest record that the validator took from
+/// the egress (`--egress`). It stays absent on the cluster egress.
+pub const EGRESS_CURSOR_INDEX: &str = "kardamom_validator_egress_cursor_index";
 const STATE_ROOT_BLOCK: &str = "validator_state_root_block";
 /// Epochs whose deposits were re-derived from L1 and matched.
 const EPOCHS_VERIFIED_TOTAL: &str = "validator_epochs_verified_total";
@@ -105,6 +108,10 @@ pub fn describe() {
          a peer-checkpoint increment is one in-process revolution of the pipeline"
     );
     metrics::describe_gauge!(COMMITTED_BLOCK, "Highest block the validator has committed");
+    metrics::describe_gauge!(
+        EGRESS_CURSOR_INDEX,
+        "Canonical index of the newest record that the validator took from the egress"
+    );
     metrics::describe_gauge!(
         VERDICT_STANDING,
         "1 while a divergence verdict stands beside the state, 0 otherwise"

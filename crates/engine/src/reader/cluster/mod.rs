@@ -253,14 +253,16 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
             | EgressItem::WindowFull { .. }
             | EgressItem::DaLagReject { .. }
             | EgressItem::RecordLagReject { .. }
+            | EgressItem::RefRefused(_)
             | EgressItem::OriginGap { .. }
             | EgressItem::Status(_)
             | EgressItem::RelayedRef(_)
             | EgressItem::FeedGap { .. } => Ok(()),
             // A canonical entry carries its bytes: under decision version 5
-            // the sealer relays each full reference as one. It takes its
-            // place in the order like a reference, and the reader runs it
-            // with no join.
+            // the sealer relays each full reference as one. Below version 5
+            // it relays a full reference as is, and the decoder gives the
+            // same entry. It takes its place in the order like a reference,
+            // and the reader runs it with no join.
             EgressItem::Tx { index, tx } => self.reorder.ingest_record(index, Ordered::Tx(tx)),
             EgressItem::ReplayUnavailable {
                 oldest_index,

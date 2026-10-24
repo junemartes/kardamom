@@ -4,17 +4,20 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.LagBudgets;
 import io.kardamom.sealer.VersionSwitch;
 import io.kardamom.sealer.cluster.DriverlessLog.Entry;
 import io.kardamom.sealer.cluster.DriverlessLog.Member;
 import io.kardamom.sealer.cluster.DriverlessLog.Outcome;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 /**
  * Decision version 5 on driverless members: the carry flag switches
@@ -56,12 +59,7 @@ class SealerVersionFiveTest {
 
     /** A kind-0 reference of record type 0 of image {@code (lane 0, session 9)} at {@code position}. */
     private static byte[] ref(final int idTag, final long position) {
-        final ByteBuffer buf = ByteBuffer.allocate(SealerWire.TXREF_RECORD_LEN).order(ByteOrder.LITTLE_ENDIAN);
-        buf.put(SealerWire.KIND_INGRESS_RECORD).put(FullRef.filled(CanonicalSealerState.SENDER_LEN, 0xAA))
-            .putLong(0L).putLong(SealerWire.POSITION_TAG | position).putLong(0L).putLong(0L)
-            .put(IngressFrames.recordId(idTag)).put(SealerWire.RT_TXREF)
-            .put((byte) 0).putInt(0).putInt((int) position).putInt(9);
-        return buf.array();
+        return IngressFrames.txRefFrame(idTag, FullRef.filled(CanonicalSealerState.SENDER_LEN, 0xAA), 0L, position);
     }
 
     /**
@@ -169,6 +167,34 @@ class SealerVersionFiveTest {
         assertFramesEqual(one.frames(), two.frames());
         assertArrayEquals(one.svc().snapshot(), two.svc().snapshot());
         assertFramesEqual(relayedFrames(one.frames()), relayedFrames(windowed.frames()));
+    }
+
+    /**
+     * A carrying member writes snapshot version 17. A member that restarts
+     * from it at any entry keeps the decision version, the switch and the
+     * schedule of the carry flag of a peer that kept running, and decides
+     * alike from there.
+     */
+    @Test
+    void a_carrying_member_restored_at_any_entry_decides_as_its_peer(@TempDir final Path dir) {
+        final List<Entry> entries = stream();
+        IntStream.range(1, entries.size()).forEach(cut -> restartAt(entries, cut, dir.resolve("cut-" + cut)));
+    }
+
+    private void restartAt(final List<Entry> entries, final int cut, final Path dir) {
+        final Member peer = log.carrying(Optional.empty(), dir.resolve("peer"), LagBudgets.DEFAULT);
+        final Member member = log.carrying(Optional.empty(), dir.resolve("member"), LagBudgets.DEFAULT);
+        final List<Entry> head = entries.subList(0, cut);
+        assertEquals(peer.applyAll(head), member.applyAll(head));
+        final byte[] snapshot = member.svc().snapshot();
+        assertEquals(CanonicalSealerState.FILE_SNAPSHOT_VERSION, ByteBuffer.wrap(snapshot).getInt(Integer.BYTES));
+        final Member restored = log.restart(member, dir.resolve("member"), snapshot);
+        assertEquals(CanonicalSealerState.FILE_SNAPSHOT_VERSION, restored.svc().latestSnapshotVersion());
+        assertEquals(peer.svc().decisionRules(), restored.svc().decisionRules(), "cut at " + cut);
+        final List<Entry> rest = entries.subList(cut, entries.size());
+        assertEquals(peer.applyAll(rest), restored.applyAll(rest), "cut at " + cut);
+        assertEquals(5, restored.svc().decisionRules().version());
+        assertArrayEquals(peer.svc().snapshot(), restored.svc().snapshot(), "cut at " + cut);
     }
 
     @Test

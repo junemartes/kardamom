@@ -69,6 +69,7 @@ The streams and their publishers:
 | `exec_frames` | executor (with `--exec-frames`) | egress |
 | `egress_order` | egress | the readers after the executors (batcher, validator) |
 | `egress_receipts` | egress | sequencers (with `receipts_from_egress = true`), notifier (with `--receipts-from-egress`) |
+| `tx_drops` (one record per sequencer, with its lane) | sequencer | egress |
 | `l1_blocks` | L1 follower (two instances) | da-watcher, batcher, follower archives |
 
 The `exec_txs` stream carries the transactions that an executor joins, in canonical order: one `ExecTxRecord` for each `TxRef`.
@@ -102,6 +103,15 @@ The `egress_receipts` stream carries the receipts that the egress merged from th
 - The executors cut their batches differently. The egress passes on only the receipts of a batch past the last receipt that it took, with the rows of the batch. The rows are absolute values, and a reader keeps the row of the higher position.
 - A sequencer reads it in place of `tx_receipts` with `receipts_from_egress = true` in its config.
 - The egress also answers `eth_getTransactionReceipt` as the state query of an executor does (`POST /`, the receipt as rkyv hex, the block in `x-state-block`). An ingress reads it with `--receipt-query-endpoints`.
+
+The `tx_drops` stream carries the transactions that the sequencers dropped: one `TxDrop` record for each drop, with the hash, the sender, the nonce and the reason. The reason has the error text of geth, for example `nonce too low` or `txpool is full`.
+
+- The stream id is 1012. The channel and the stream id are the keys `tx_drops_channel` and `tx_drops_stream_id` of `[channels]`.
+- Each sequencer opens one dynamic MDC publication with a `kardamom-mdc-publisher` record (topic `tx_drops`) that carries its lane id. The egress subscribes with no lane id, so it joins the sequencers of every lane.
+- The offer is best effort. A refused offer drops the record, and the client then sees the status `unknown` for that hash.
+- Both twins of a lane publish their drops. The egress keeps one status for each hash, and a receipt of the hash wins over a drop.
+- The egress serves the status with `kardamom_getTransactionStatus`.
+- A drop with the reason `transaction dropped by the sealer, send it again` (code -32000) is provisional. The sealer refused the reference of one twin, and the other twin can still offer the transaction with its bytes. Client text: safe to send again; the status can still become executed.
 
 The `l1_blocks` stream carries the finalized L1 blocks: one `L1Block` for each block, in block order.
 
@@ -233,7 +243,7 @@ procedure.
 
 ## Archives and readiness
 
-An ingress with `--archive-durability` runs one discovery-driven recorder thread. It records every
+An ingress runs one discovery-driven recorder thread. It records every
 `tx_data` publisher the catalog lists, its own lanes and every other
 ingress's, through the same dynamic MDC join a subscriber uses. Each
 publisher is its own recording, keyed in the catalog by its control
@@ -327,14 +337,8 @@ No job configures a publication control port.
 | executor | receipts, boundaries, BAL, the live `exec_txs` publication, `exec_frames` (with `--exec-frames`) |
 | da-watcher | deposits, remote epochs (subscribes to `l1_blocks` and `events`) |
 | l1-indexer | `l1_blocks`, `events` |
-| sequencer lane `n` | `tx_errors`, `tx_status`, one `tx_verdicts` for each ingress that it answers |
-| sequencer lane `n`, job variable `ingress` | the publications above, and the publications of the ingress inside the process: 8 `tx_data` lanes, `tx_status` |
-| egress | `egress_order`, `egress_receipts` (subscribes to `exec_frames` and `tx_receipts`) |
-
-The ingress inside a sequencer process opens its own stream plane,
-`ingress-<id>`, beside the plane of the sequencer. It records its `tx_data`
-lanes only with `--archive-durability`, and the sequencer job turns that
-off by default.
+| sequencer lane `n` | `tx_errors`, `tx_status`, `tx_drops`, one `tx_verdicts` for each ingress that it answers |
+| egress | `egress_order`, `egress_receipts` (subscribes to `exec_frames`, `tx_receipts` and `tx_drops`) |
 
 The aeron system job registers the archive record with the `archive_topics`
 meta of the node:

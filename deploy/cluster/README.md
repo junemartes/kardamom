@@ -30,7 +30,7 @@ The local profile defines these classes:
 | Class | Count | Runs |
 |-------|-------|------|
 | `control` | 1 | Nomad and Consul server, Docker registry, anvil (the in-cluster L1) |
-| `sequencer` | 2 | 2 lanes with 2 racing replicas each. One job group per lane (`seq-<lane>`, expanded by the Nomad HCL). The metrics port is `9001 + 10 * lane`. With the job variable `ingress`, each replica also serves the ingress JSON-RPC on `8550 + lane`. See [The ingress inside the sequencer](#the-ingress-inside-the-sequencer). |
+| `sequencer` | 2 | 2 lanes with 2 racing replicas each. One job group per lane (`seq-<lane>`, expanded by the Nomad HCL). The metrics port is `9001 + 10 * lane`. |
 | `ingress` | 2 | The active/active JSON-RPC front door (`:8545`) and the notifier status feed (`:8547`). Role `redis`. Instance 1 also has role `redis-replica`. |
 | `executor` | 3 | State-machine replica appliers (libmdbx state). The state mirror runs here too. With `KARDAMOM_EGRESS=1`, the egress runs on two of them (`:8548`, metrics `:9013`). See [The egress](#the-egress). |
 | `sealer` | 3 | A 3-member Aeron Cluster (Raft). The Java `cluster` job orders the transactions. The Raft log and its archive hold the canonical log. |
@@ -384,6 +384,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Batcher L1 | `BATCHER_L1_RPC` | `L1_RPC` | Comma-separated endpoints, best first. The batcher falls back on errors and ranks failing endpoints last. The DA proxy and settlement bootstrap keep the single `L1_RPC` endpoint. |
 | Followers | `L1_FOLLOWERS_RPC` | the fault proxy if deployed, else the light client if deployed, else `L1_RPC` | The L1 that the indexer (the L1 follower) reads. A comma-separated list. With two or more entries, a block counts only when two agree. The da-watcher reads the follower's stream, not L1. |
 | da-watcher, batcher | `L1_SILENCE_S` | empty (`1152` in the binaries) | Seconds with no `l1_blocks` record before the da-watcher and the batcher pause with the follower as their root. |
+| da-watcher | `EPOCH_PACE_MS` | empty (`2000` in the binary) | The pause between two epochs of one L1 finality step, in ms. The container recipes and CI use `100`: the tests mine bursts of L1 blocks. Keep it below the 4 s gather window of the validator. |
 | Indexer | `L1_INDEXER_START_BLOCK` | empty (`1` with the fault proxy) | The first L1 block to index on an empty archive. Empty: the finalized block at the first start. |
 | Indexer | `L1_INDEXER_POLL_S` | empty (`12` in the binary) | One slot, in seconds: the read cadence while the finalized tip does not move, and the whole cadence without a beacon API. |
 | Indexer | `L1_BEACON_API` | `L1_LIGHT_CLIENT_CONSENSUS_RPC` | The beacon API of the finality schedule. Empty: the follower reads every slot. |
@@ -439,24 +440,6 @@ The release gate (`roles/workloads/tasks/gate.yml`) refuses a release before it 
 | A shard map change | `config/shard-map.toml` against the map of the registered ingress. | Use the resize controller (`kardamom-cluster scale-sequencers`). |
 
 The gate reads only, so it also runs in check mode. A cluster without an accepted release has no formats to compare with.
-
-### The ingress inside the sequencer
-
-The sequencer process can run the ingress service. The `ingress` subcommand of `kardamom-sequencer` takes the flags of `kardamom-ingress`. The job variable `ingress` of `nomad/sequencer.nomad.hcl` turns it on. It is `false` by default, and the `ingress` job stays the front door.
-
-With `-var ingress=true`, each sequencer allocation also does these things:
-
-- It serves JSON-RPC on port `ingress_rpc_port_base + lane` (default `8550 + lane`). Two lanes can share a node, so each lane has its own port.
-- It registers the Consul service `ingress-jsonrpc` with the tags `sequencer` and `lane-<lane>`, and the `/health` check. A client of this service reads the port from the SRV record: the port is not `8545`.
-- It opens a second cluster session for the egress tap of the ingress, on the dynamic port `ingress_egress`.
-- It drains its parked submits before the sequencer loops stop. The kill timeout is `tx_ttl_ms` plus 10 seconds.
-- It renders `config/shard-map.toml` for the routing of the ingress.
-
-The ingress id of an allocation is the decimal `lane + 1` followed by the allocation index. Lane 0 has the ids 10 and 11, and lane 7 has the ids 80 and 81. Each id is unique and at most 255, so the ingress can take the verdicts of the sequencers. No id is an id of the `ingress` job, which uses the allocation index (0 or 1).
-
-The job variable `ingress_archive_durability` records the `tx_data` lanes of the ingress on the archive of the node. It is `false` by default. The sequencer nodes do not advertise a `tx_data` archive, and the ingress nodes record every `tx_data` publisher that the catalog lists, the publishers inside the sequencers too.
-
-The load balancer must target each sequencer node on each port of its lanes. Use a load balancer that reads the `ingress-jsonrpc` service from Consul, or one target for each (node, port) pair.
 
 ### Secrets
 

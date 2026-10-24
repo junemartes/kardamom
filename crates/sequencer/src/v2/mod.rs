@@ -8,7 +8,8 @@
 //!   rollbacks) update the filter;
 //! - a timer runs the filter's sweep.
 //! - A forwarded transaction goes to the sealer as a reference.
-//! - A refused one goes to the client on `tx_errors` and `tx_status`.
+//! - A refused one goes to the client on `tx_errors` and `tx_status`, and
+//!   to the egress on `tx_drops`.
 //! - A sender with no state goes to the lookup task.
 //! - With verdicts on, the answer to each transaction goes to the ingress
 //!   that published it ([`verdicts`]).
@@ -35,7 +36,7 @@ use kardamom_cluster_adapter::wire::{GuardHeader, position_deadline};
 use kardamom_log::aeron_live::{IdleBackoff, IdleCap};
 use kardamom_obs::pipeline::Queue;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
-use kardamom_types::{TxDataLoc, TxEnvelope, TxError, TxErrorReason, TxStatus};
+use kardamom_types::{TxDataLoc, TxDrop, TxEnvelope, TxError, TxErrorReason, TxStatus};
 
 use crate::admission::{
     AccountState, Ack, Admission, AdmissionConfig, Candidate, ImagePos, Refusal, Verdict,
@@ -154,6 +155,9 @@ pub enum AccountEvent {
     },
     /// The executor rolled back.
     Rollback,
+    /// The sealer refused the forwarded transaction of `sender` at `nonce`
+    /// (egress kind 18). The filter forgets the run, so a resend goes out.
+    Refused { sender: Address, nonce: u64 },
 }
 
 /// What the loop needs to offer one forwarded transaction.
@@ -345,6 +349,9 @@ impl AdmissionLoop {
                 self.admission.on_lookup(address, state, &mut self.verdicts);
             }
             AccountEvent::Rollback => self.admission.on_rollback(),
+            AccountEvent::Refused { sender, nonce } => {
+                self.admission.on_refused(sender, nonce, &mut self.verdicts);
+            }
         }
     }
 
@@ -556,7 +563,8 @@ fn reason_of(refusal: Refusal) -> TxErrorReason {
     }
 }
 
-/// Tell the client on both side channels that its transaction is refused.
+/// Tell the client on both side channels that its transaction is refused,
+/// and the egress that it dropped.
 fn reject<R: SideChannelPublisher>(
     side: &mut R,
     tx_hash: B256,
@@ -570,6 +578,12 @@ fn reject<R: SideChannelPublisher>(
         reason,
     };
     side.publish_status(TxStatus::rejected(tx_hash, &err));
+    side.publish_drop(TxDrop {
+        tx_hash,
+        sender,
+        nonce,
+        reason: err.reason.drop_reason(),
+    });
     side.publish_error(err);
 }
 

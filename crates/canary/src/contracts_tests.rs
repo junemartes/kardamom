@@ -59,11 +59,11 @@ fn the_rust_formula_matches_the_pools_test_vector() {
     let out = Pool::amount_out(amount_in, eth, tok).unwrap();
     let kept = amount_in * u(997);
     assert_eq!(out, kept * tok / (eth * u(1000) + kept));
-    // The token amount that buys the same ETH back from the new reserves.
+    // The swap back sells the same tokens: the token balance is level,
+    // and the round trip pays the fee twice in ETH.
     let (eth_after, tok_after) = (eth + amount_in, tok - out);
-    let back = Pool::amount_in_for(amount_in, tok_after, eth_after).unwrap();
-    assert!(Pool::amount_out(back, tok_after, eth_after).unwrap() >= amount_in);
-    assert!(back > out, "a round trip pays the fee twice");
+    let back = Pool::amount_out(out, tok_after, eth_after).unwrap();
+    assert!(back < amount_in, "a round trip pays the fee twice");
 }
 
 fn swap(amount_out: U256) -> SwapEvent {

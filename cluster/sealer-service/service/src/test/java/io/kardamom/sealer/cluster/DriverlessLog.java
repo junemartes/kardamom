@@ -5,6 +5,7 @@ import io.kardamom.sealer.LagBudgets;
 import io.kardamom.sealer.VoidLedger;
 import io.kardamom.sealer.cluster.ClusterStubs.StubCluster;
 import io.kardamom.sealer.cluster.ClusterStubs.StubSession;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -21,6 +22,10 @@ final class DriverlessLog {
 
     /** The dedup window of every member. */
     static final int CAPACITY = 16;
+    /** The peer chain that every member takes remote-origin records from. */
+    static final long REMOTE_CHAIN = 10L;
+    /** The segment size of the retained file of a member that carries the bytes. */
+    private static final int SEGMENT_BYTES = 64 * 1024;
 
     /** One log entry: an ingress frame, or a boundary tick when {@code frame} is empty. */
     record Entry(String name, Optional<byte[]> frame, long timeMs) {
@@ -55,6 +60,13 @@ final class DriverlessLog {
             return log.stream().map(this::apply).toList();
         }
 
+        /** The pipeline metrics of the member as Prometheus text, with the labels of member 1. */
+        String metrics() {
+            final MetricsText text = new MetricsText(1);
+            svc.metrics().renderTo(text);
+            return text.toString();
+        }
+
         /** Every egress frame that the session got, without the status frames. */
         List<byte[]> frames() {
             return sequencer.offered.stream().filter(f -> f[0] != SealerWire.EGRESS_KIND_STATUS).toList();
@@ -76,12 +88,47 @@ final class DriverlessLog {
 
     /** A heap member with an ordering window of {@code orderingWindow} records, from {@code snapshot} or at genesis. */
     Member member(final Optional<byte[]> snapshot, final int orderingWindow) {
+        return member(snapshot, orderingWindow, LagBudgets.DEFAULT);
+    }
+
+    /** A heap member with no ordering window and the lag guards of {@code budgets}, from {@code snapshot} or at genesis. */
+    Member member(final Optional<byte[]> snapshot, final LagBudgets budgets) {
+        return member(snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW, budgets);
+    }
+
+    private Member member(final Optional<byte[]> snapshot, final int orderingWindow, final LagBudgets budgets) {
+        return member(snapshot, orderingWindow, budgets, Optional.empty());
+    }
+
+    /**
+     * A member that carries the bytes and keeps its retained frames in a
+     * file under {@code dir}, with the lag guards of {@code budgets}, from
+     * {@code snapshot} or at genesis.
+     */
+    Member carrying(final Optional<byte[]> snapshot, final Path dir, final LagBudgets budgets) {
+        return member(snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW, budgets,
+            Optional.of(new RetainedFile.Config(dir, SEGMENT_BYTES)));
+    }
+
+    /** End {@code member}, then start a carrying member in its file in {@code dir} from {@code snapshot}. */
+    Member restart(final Member member, final Path dir, final byte[] snapshot) {
+        started.remove(member);
+        member.svc().onTerminate(member.cluster());
+        return carrying(Optional.of(snapshot), dir, LagBudgets.DEFAULT);
+    }
+
+    private Member member(
+            final Optional<byte[]> snapshot,
+            final int orderingWindow,
+            final LagBudgets budgets,
+            final Optional<RetainedFile.Config> file) {
         final StubCluster cluster = new StubCluster();
         cluster.role = io.aeron.cluster.service.Cluster.Role.FOLLOWER;
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService svc = new SealerClusteredService(
-            CAPACITY, 250, 0, Set.of(), VoidLedger.Config.DISABLED,
-            CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS, orderingWindow, LagBudgets.DEFAULT);
+            CAPACITY, 250, 0, Set.of(REMOTE_CHAIN), VoidLedger.Config.DISABLED,
+            CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS, orderingWindow, budgets);
+        file.ifPresent(svc::carryingBytes);
         svc.start(cluster, snapshot);
         final Member member = new Member(svc, cluster, sequencer);
         started.add(member);

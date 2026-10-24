@@ -294,14 +294,11 @@ fn a_paused_sequencer_offers_nothing_until_it_resumes() {
     assert_eq!(rig.refs().len(), 1, "the envelope waited in the stream");
 }
 
-/// A sequencer whose sealer reported `version` on its session.
+/// A sequencer that keeps the sealer version `version`.
 fn sequencer_on_sealer_version(version: u8) -> Sequencer {
-    use kardamom_sequencer::sealer_rules::{SealerRules, SealerVersion};
+    use kardamom_sequencer::sealer_rules::SealerVersion;
 
-    let shared = SealerVersion::default();
-    let mut rules = SealerRules::new(0, shared.clone());
-    rules.on_session_start(1);
-    rules.on_sealer_info(1, version);
+    let shared = SealerVersion::starting_at(version);
     let mut seq = Sequencer::new(one_partition_cfg()).unwrap();
     seq.enable_positioned_refs(shared);
     seq

@@ -92,6 +92,13 @@ pub const FEATURE_SEALER_V4: u64 = 3;
 /// [`FEATURE_SEALER_V4`]. The executor does not read it.
 pub const FEATURE_SEALER_V5: u64 = 4;
 
+/// The exact replay window of the sealer: while decision version 5 runs,
+/// each member keeps only its replay window of frames, and refuses a
+/// transaction reference without the bytes of its transaction. Only the
+/// sealer follows it, at a block boundary, as [`FEATURE_SEALER_V4`]. The
+/// executor does not read it.
+pub const FEATURE_CARRY_WINDOW: u64 = 5;
+
 /// The length of `setFeature` calldata: the selector and two words.
 const SET_FEATURE_LEN: usize = 4 + 32 + 32;
 

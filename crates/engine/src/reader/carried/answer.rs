@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use alloy_primitives::keccak256;
 use kardamom_cluster_adapter::wire::{EgressItem, WireError};
-use kardamom_types::BlockBoundaryStart;
+use kardamom_types::{BlockBoundaryStart, TxOrderingMessage};
 
 use super::transport::Request;
 use crate::reader::Ordered;
@@ -50,6 +50,9 @@ pub(crate) enum Fault {
     /// The raw transaction of the entry at `index` does not hash to its
     /// canonical id.
     Mismatch { index: u64 },
+    /// The entry at `index` is a transaction reference with no bytes. The
+    /// reader has no `tx_data` lane to join it.
+    Unjoinable { index: u64 },
     /// A frame of a known kind does not decode.
     Undecodable,
     /// No frame came within the silence window.
@@ -207,6 +210,10 @@ impl Answer {
 
     fn item(&mut self, item: EgressItem) -> Step {
         match item {
+            EgressItem::Record {
+                index,
+                msg: TxOrderingMessage::TxRef(_),
+            } if index == self.expect_index => Step::Fault(Fault::Unjoinable { index }),
             EgressItem::Record { index, msg } => self.record(index, msg.into()),
             EgressItem::Tx { index, tx } => {
                 if index == self.expect_index && keccak256(&tx.envelope.raw_tx) != tx.canonical_id {
@@ -256,7 +263,8 @@ impl Answer {
             | EgressItem::RemoteOriginReject { .. }
             | EgressItem::OriginGap { .. }
             | EgressItem::DaLagReject { .. }
-            | EgressItem::RecordLagReject { .. } => Step::Drop,
+            | EgressItem::RecordLagReject { .. }
+            | EgressItem::RefRefused(_) => Step::Drop,
         }
     }
 

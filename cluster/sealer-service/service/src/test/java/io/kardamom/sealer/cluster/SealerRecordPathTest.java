@@ -217,7 +217,7 @@ class SealerRecordPathTest {
             sameLog(svc, sequencer);
             return svc.snapshot();
         }).toList();
-        assertEquals(CanonicalSealerState.RETAINED_FILE_SNAPSHOT_VERSION,
+        assertEquals(CanonicalSealerState.FILE_SNAPSHOT_VERSION,
             ByteBuffer.wrap(snapshots.get(0)).getInt(Integer.BYTES));
         snapshots.forEach(s -> assertArrayEquals(snapshots.get(0), s));
     }

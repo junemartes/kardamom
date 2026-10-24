@@ -17,6 +17,7 @@ use tracing::error;
 
 use super::add_wait::AddWait;
 use super::idle::IdleCap;
+use super::pending::PublishAck;
 use super::thread::run_aeron_thread;
 use super::{ACK_TIMEOUT, AeronClient, FrameSink, RawFrame};
 use crate::codec;
@@ -77,7 +78,7 @@ pub(super) enum RuntimeCmd {
     Publish {
         pub_id: u32,
         bytes: AlignedVec,
-        ack: CbSender<Result<BPosition, LogError>>,
+        ack: PublishAck,
     },
     /// Best-effort publish — no ack, errors logged.
     PublishBestEffort { pub_id: u32, bytes: AlignedVec },

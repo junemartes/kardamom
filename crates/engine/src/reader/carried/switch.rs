@@ -64,6 +64,9 @@ pub(crate) enum Verdict {
     },
     /// Both sources have a head below the cursor.
     Behind { head_index: u64, head_block: u64 },
+    /// Both sources hold a transaction reference with no bytes at the
+    /// cursor `index`. No source of this reader can serve the entry.
+    Unjoinable { index: u64 },
 }
 
 /// The fault of the latest answer of each source. A new request to a
@@ -89,15 +92,14 @@ impl Marks {
     ///   above the lowest floor.
     /// - A stop when every source has a head below the cursor, or never
     ///   connected. The stop names the highest head.
+    /// - A stop when every source has a reference with no bytes at the same
+    ///   index, refused the cursor below its floor, or never connected. A
+    ///   floor only rises, so another try gets the same faults.
     /// - Else the reader tries the other source again: a silent, lost or
     ///   bad source can serve again later, for example a member that
     ///   restarts.
     fn verdict(&self) -> Verdict {
         let pair = [self.feed, self.service];
-        let every = |accept: fn(&Fault) -> bool| {
-            pair.iter()
-                .all(|mark| mark.is_some_and(|f| f == Fault::Absent || accept(&f)))
-        };
         let floor = pair
             .iter()
             .flatten()
@@ -120,23 +122,48 @@ impl Marks {
                 _ => None,
             })
             .max();
-        match (floor, head) {
-            (Some((oldest_block, oldest_index)), _)
-                if every(|f| matches!(f, Fault::Unavailable { .. })) =>
+        let unjoinable = pair
+            .iter()
+            .flatten()
+            .filter_map(|fault| match fault {
+                Fault::Unjoinable { index } => Some(*index),
+                _ => None,
+            })
+            .min();
+        match (floor, head, unjoinable) {
+            (Some((oldest_block, oldest_index)), _, _)
+                if self.every(|f| matches!(f, Fault::Unavailable { .. })) =>
             {
                 Verdict::Unavailable {
                     oldest_index,
                     oldest_block,
                 }
             }
-            (_, Some((head_index, head_block))) if every(|f| matches!(f, Fault::Ahead { .. })) => {
+            (_, Some((head_index, head_block)), _)
+                if self.every(|f| matches!(f, Fault::Ahead { .. })) =>
+            {
                 Verdict::Behind {
                     head_index,
                     head_block,
                 }
             }
+            (_, _, Some(index))
+                if self.every(|f| {
+                    *f == Fault::Unjoinable { index } || matches!(f, Fault::Unavailable { .. })
+                }) =>
+            {
+                Verdict::Unjoinable { index }
+            }
             _ => Verdict::Switched,
         }
+    }
+
+    /// Whether each source has a mark that `accept` takes, or never
+    /// connected.
+    fn every(&self, accept: impl Fn(&Fault) -> bool) -> bool {
+        [self.feed, self.service]
+            .iter()
+            .all(|mark| mark.is_some_and(|f| f == Fault::Absent || accept(&f)))
     }
 }
 

@@ -129,7 +129,7 @@ pub(super) fn label((pos, item): (kardamom_types::BPosition, Ordered)) -> String
 }
 
 /// A signed transfer with nonce `nonce`, as a canonical entry.
-pub(super) fn entry(nonce: u64) -> CanonicalTx {
+pub(in crate::reader) fn entry(nonce: u64) -> CanonicalTx {
     let signer = PrivateKeySigner::from_bytes(&[0x11; 32].into()).expect("a test key");
     let envelope = crate::actor::test_support::legacy(&signer, Address::from([0x22; 20]), nonce, 1);
     CanonicalTx {
@@ -149,6 +149,12 @@ pub(in crate::reader) fn tx_at(index: u64) -> Vec<u8> {
     tx_frame(index, &entry(index))
 }
 
+/// The relayed frame of a valid entry at `index` as a full reference, as a
+/// sealer below decision version 5 relays it.
+pub(in crate::reader) fn full_ref_at(index: u64) -> Vec<u8> {
+    encode_egress_record(index, &entry(index).full_ref_payload().unwrap()).unwrap()
+}
+
 /// An entry whose id is the hash in its envelope, but whose raw
 /// transaction hashes to another id: bytes changed on the way.
 pub(super) fn forged_at(index: u64) -> Vec<u8> {
@@ -158,6 +164,23 @@ pub(super) fn forged_at(index: u64) -> Vec<u8> {
         ..good.envelope.clone()
     };
     tx_frame(index, &CanonicalTx { envelope, ..good })
+}
+
+/// The relayed frame of a transaction reference at `index`: an entry with
+/// no bytes.
+pub(super) fn ref_at(index: u64) -> Vec<u8> {
+    let tx_ref = kardamom_types::TxRef::new(
+        alloy_primitives::B256::repeat_byte(0x33),
+        0,
+        kardamom_types::BPosition::from_index(index),
+        0,
+    );
+    let ingress = kardamom_cluster_adapter::wire::encode_ingress_txref(
+        &tx_ref,
+        kardamom_cluster_adapter::wire::GuardHeader::EXEMPT,
+    );
+    let (_, relayed) = kardamom_cluster_adapter::wire::split_ingress(&ingress).unwrap();
+    encode_egress_record(index, relayed).unwrap()
 }
 
 pub(super) fn boundary(block: u64, end: u64) -> Vec<u8> {
@@ -209,6 +232,16 @@ fn no_frame_is_delivered_before_the_replay_done_of_the_newest_request() {
     assert_eq!(rig.deliver(5), ["t0", "t1"]);
     rig.feed.send(tx_at(2));
     assert_eq!(rig.deliver(5), ["t2"], "live after the replay done");
+}
+
+#[test]
+fn a_relayed_full_reference_is_delivered_as_its_entry() {
+    let mut rig = Rig::new(0, 1);
+    let id = rig.request(Source::Feed).request_id;
+    rig.feed.send(tx_at(0));
+    rig.feed.send(full_ref_at(1));
+    rig.feed.send(done(id, 2, 1));
+    assert_eq!(rig.deliver(5), ["t0", "t1"]);
 }
 
 #[test]
@@ -407,4 +440,30 @@ fn a_hole_and_the_frames_after_it_send_one_request() {
         "the test ran past a resend"
     );
     assert_eq!(rig.feed.requests().len(), 1, "one request for the hole");
+}
+
+#[test]
+fn the_cursor_gauge_names_the_newest_delivered_record() {
+    let text = crate::meter::tests::render(|| {
+        let Rig { sub, feed, service } = Rig::new(0, 1);
+        let mut rig = Rig {
+            sub: sub.with_cursor_gauge("test_egress_cursor_index"),
+            feed,
+            service,
+        };
+        let request = rig.request(Source::Feed);
+        rig.feed.send(tx_at(0));
+        rig.feed.send(tx_at(1));
+        rig.feed.send(boundary(1, 2));
+        rig.feed.send(done(request.request_id, 2, 2));
+        let labels: Vec<String> = (0..3)
+            .map(|_| label(TxOrderingSubscription::next(&mut rig.sub).unwrap()))
+            .collect();
+        assert_eq!(labels, ["t0", "t1", "b1"]);
+    });
+    assert_eq!(
+        crate::meter::tests::value(&text, "test_egress_cursor_index"),
+        1.0,
+        "a boundary does not move the gauge"
+    );
 }

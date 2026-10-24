@@ -5,7 +5,7 @@ package io.kardamom.sealer;
  * session: the last L2 block posted to L1 (the batcher's published cursor),
  * the last sealed block, the DA-lag budget, and whether the guard refuses
  * new transactions. The egress retention floors ride along, so an observer
- * can show how far the retention stretched above the posted head. The
+ * can show how far back a replay reaches. The
  * record-lag guard follows: the best recorded cursor of the executors, its
  * budget, and whether it refuses new transactions.
  *

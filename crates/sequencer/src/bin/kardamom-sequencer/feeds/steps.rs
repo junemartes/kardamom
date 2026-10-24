@@ -6,11 +6,12 @@
 use kardamom_cluster_adapter::wire::{self, EgressItem};
 use kardamom_sequencer::epoch::OriginSignal;
 use kardamom_sequencer::metrics as seq_metrics;
+use kardamom_sequencer::outbound::DropPublisher;
 use kardamom_sequencer::resync::{SealerAnswer, SealerRefusal};
 
 use super::EgressWatermarkFeed;
 
-impl EgressWatermarkFeed {
+impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
     /// Handle one origin-gap frame. Returns `true` when `frame` was one,
     /// so the caller does not also check it for a boundary.
     ///

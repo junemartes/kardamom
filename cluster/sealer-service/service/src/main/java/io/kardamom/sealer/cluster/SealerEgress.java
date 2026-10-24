@@ -7,6 +7,7 @@ import io.kardamom.sealer.Boundary;
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.ClusterStatus;
 import io.kardamom.sealer.Relayed;
+import io.kardamom.sealer.VersionSwitch;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.EnumMap;
@@ -67,20 +68,34 @@ final class SealerEgress {
      * This is deterministic across members, since it is derived from the
      * replicated log.
      *
-     * <p>The window of {@link #retentionCap} frames is a minimum, not a
-     * maximum: a frame past the window is evicted only when its block is
-     * posted to L1 ({@link #postedHead}). Nothing a batcher has not
-     * confirmed on L1 is dropped, so the batcher can always replay from
-     * its cursor. The DA-lag guard bounds the growth: the sealer refuses
-     * user records at {@code daLagBudgetBlocks} past the posted head, so
-     * the stretched window holds at most the budget's blocks plus one
-     * flush, in heap.</p>
+     * <p>The eviction rule follows the decision version and the carry
+     * window of the state ({@link #setRules}):</p>
+     * <ul>
+     *   <li>Below version 5, or on a heap member while the carry window is
+     *       off, the window of {@link #retentionCap} frames is a minimum,
+     *       not a maximum: a frame past the window is evicted
+     *       only when its block is posted to L1 ({@link #postedHead}).
+     *       Nothing a batcher has not confirmed on L1 is dropped, so the
+     *       batcher can always replay from its cursor. The DA-lag guard
+     *       bounds the growth: the sealer refuses user records at
+     *       {@code daLagBudgetBlocks} past the posted head, so the
+     *       stretched window holds at most the budget's blocks plus one
+     *       flush.</li>
+     *   <li>Under version 5 with the carry window on, or on a member that
+     *       carries the bytes ({@link RetainedFrames#carriesBytes}), the
+     *       window is the whole rule: a frame past the window is evicted at
+     *       once, at any posted head. So the
+     *       retained frames have a fixed bound at any DA lag. A reader
+     *       below the window gets REPLAY_UNAVAILABLE and recovers from
+     *       another source. The DA-lag guard still refuses user records,
+     *       but it holds no frame.</li>
+     * </ul>
      *
-     * <p>The frames above the posted head ride the snapshot
-     * ({@link #writeSnapshot}), so a member restored from a snapshot keeps
-     * the floor at the posted head instead of raising it to the restore
-     * point. In a {@link RetainedFile}, the snapshot carries the index, and
-     * the frames stay in the file.</p>
+     * <p>The retained frames ride the snapshot ({@link #writeSnapshot}), so
+     * a member restored from a snapshot keeps the floor of the snapshot
+     * instead of raising it to the restore point. In a
+     * {@link RetainedFile}, the snapshot carries the index, and the frames
+     * stay in the file.</p>
      */
     private final RetainedFrames retained;
     private final int retentionCap =
@@ -93,6 +108,16 @@ final class SealerEgress {
      * machine. A frame of a block at or below it may leave the window.
      */
     private long postedHead;
+    /**
+     * Whether a frame past the window leaves at once, at any posted head:
+     * decision version 5 with the carry window on, or on a member that
+     * carries the bytes. Before the carry window, the executors and the
+     * batcher can read references, which the egress cannot serve, so a
+     * heap member keeps the posted rule. The state sets the version and the
+     * carry window at a block boundary, and the service echoes them here at
+     * the end of that log entry.
+     */
+    private boolean windowOnly;
 
     // Staging buffer for egress framing. Reuse it to avoid a per-message
     // allocation on the single cluster service thread.
@@ -131,19 +156,43 @@ final class SealerEgress {
     }
 
     /**
-     * Adopt the posted head as the retention floor, and evict what the
-     * window no longer needs: frames past the window whose block is now
-     * posted. Log-driven, so every member evicts the same frames at the
-     * same point of the log.
+     * Adopt the posted head, and evict with the current rule what the
+     * window no longer needs: under the posted rule, the frames past the
+     * window whose block is now posted. Log-driven, so every member evicts
+     * the same frames at the same point of the log.
      */
     void setPostedHead(final long postedHead) {
         this.postedHead = postedHead;
         prune();
     }
 
+    /**
+     * Adopt the eviction rule of decision version {@code version} with the
+     * carry window {@code carryWindow}, and evict what the rule no longer
+     * keeps. The service calls it at the start, after the retention is
+     * restored and before the posted head, and at the end of each log entry
+     * that switched the version or the carry window. So every member, from
+     * the log or from a snapshot, evicts the same frames at the same point
+     * of the log.
+     */
+    void setRules(final int version, final boolean carryWindow) {
+        windowOnly = version == VersionSwitch.CARRY_VERSION && (carryWindow || retained.carriesBytes());
+        prune();
+    }
+
+    /** Whether a frame past the window leaves at once, at any posted head. */
+    boolean windowOnly() {
+        return windowOnly;
+    }
+
     /** The frames retained for replay. */
     long retainedCount() {
         return retained.count();
+    }
+
+    /** The bytes of the frames retained for replay. */
+    long retainedBytes() {
+        return retained.bytes();
     }
 
     /** The oldest record index still retained. */
@@ -367,6 +416,20 @@ final class SealerEgress {
     }
 
     /**
+     * Frame and offer the refusal of a transaction reference of record
+     * type 0 to the offering session:
+     * {@code [kind:18][canonical_id:32][sender:20][nonce:u64 LE][decision_version:u8]}.
+     */
+    void offerRefRefused(
+            final ClientSession session,
+            final byte[] canonicalId,
+            final byte[] sender20,
+            final long nonce,
+            final int decisionVersion) {
+        offerToSession(session, frames.refRefused(canonicalId, sender20, nonce, decisionVersion));
+    }
+
+    /**
      * Frame and offer a window-full reject to the offering session:
      * {@code [kind:8][sender:20][nonce:u64 LE]}. Back-pressure, not a
      * verdict: the sequencer republishes.
@@ -419,8 +482,7 @@ final class SealerEgress {
     /**
      * Retain the frame staged in {@link #egressBuffer} for future replays,
      * hand it to the member feed, and return its length. The window is
-     * pruned after the add: a frame leaves only when it is past the window
-     * and its block is posted.
+     * pruned after the add ({@link #prune}).
      */
     private int retain(final int length) {
         retained.append(egressBuffer, length);
@@ -429,9 +491,12 @@ final class SealerEgress {
         return length;
     }
 
-    /** Evict from the front while the window is over its cap and the oldest frame is posted. */
+    /**
+     * Evict from the front while the window is over its cap and the oldest
+     * frame may leave: at once with {@link #windowOnly}, else when it is posted.
+     */
     private void prune() {
-        while (retained.count() > retentionCap && oldestIsPosted()) {
+        while (retained.count() > retentionCap && (windowOnly || oldestIsPosted())) {
             evictFront();
         }
     }

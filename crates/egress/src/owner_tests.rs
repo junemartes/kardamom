@@ -1,13 +1,19 @@
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
+use alloy_primitives::{Address, B256};
 use kardamom_cluster_adapter::wire::{encode_egress_boundary, encode_egress_record};
+use kardamom_log::aeron_live::ReceiptFrame;
+use kardamom_types::{BPosition, DropReason, Receipt, ReceiptBatch, TxDrop};
 use tokio::sync::oneshot;
 
 use super::{FramePublisher, Input, Join, JoinState, Owner, OwnerConfig, Parts, ReadRequest};
+use crate::drops::{Dropped, Drops, Status};
 use crate::merge::{Head, Key, Merge, MergeConfig};
 use crate::receipts::Receipts;
+use crate::ref_mark::RefMark;
 use crate::store::{Range, Store};
+use crate::test_support::record;
 
 /// The frames that went out live, on a channel the test reads.
 #[derive(Clone)]
@@ -53,6 +59,7 @@ fn owner_with(dir: &std::path::Path, live: Live, join: Join) -> Owner<Live> {
             merge,
             store,
             receipts: Receipts::new(NonZeroUsize::new(16).unwrap()),
+            drops: Drops::new(NonZeroUsize::new(16).unwrap()),
             live: live.clone(),
             receipts_live: live,
         },
@@ -114,6 +121,99 @@ fn the_run_ends_when_every_sender_is_gone() {
     assert_eq!(again.head().next_index, 1, "the frame is on disk");
 }
 
+/// The drop of the hash `hash`, as a sequencer reports it.
+fn drop_input(hash: u8, reason: DropReason) -> Input {
+    Input::Drop(TxDrop {
+        tx_hash: B256::with_last_byte(hash),
+        sender: Address::repeat_byte(0xA1),
+        nonce: 3,
+        reason,
+    })
+}
+
+/// The receipt batch with one receipt of the hash `hash`.
+fn receipt_input(hash: u8) -> Input {
+    Input::Receipts(ReceiptFrame::Batch(ReceiptBatch {
+        receipts: vec![Receipt {
+            tx_hash: B256::with_last_byte(hash),
+            block_number: 1,
+            tx_idx: BPosition::from_index(u64::from(hash)),
+            ..Receipt::default()
+        }],
+        accounts: Vec::new(),
+    }))
+}
+
+fn status_of(o: &mut Owner<Live>, hash: u8) -> Status {
+    let (reply, answer) = oneshot::channel();
+    o.on(Input::Status {
+        tx_hash: B256::with_last_byte(hash),
+        reply,
+    })
+    .unwrap();
+    answer.blocking_recv().unwrap()
+}
+
+fn dropped(reason: DropReason) -> Status {
+    Status::Dropped(Dropped {
+        sender: Address::repeat_byte(0xA1),
+        nonce: 3,
+        reason,
+    })
+}
+
+#[test]
+fn a_drop_that_both_twins_report_is_one_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, _published) = live();
+    let mut o = owner(dir.path(), live);
+    o.on(drop_input(1, DropReason::NonceTooLow)).unwrap();
+    o.on(drop_input(1, DropReason::ReplacementUnderpriced))
+        .unwrap();
+    assert_eq!(status_of(&mut o, 1), dropped(DropReason::NonceTooLow));
+    assert_eq!(status_of(&mut o, 2), Status::Unknown);
+}
+
+#[test]
+fn a_receipt_after_a_drop_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, _published) = live();
+    let mut o = owner(dir.path(), live);
+    o.on(drop_input(1, DropReason::TxpoolFull)).unwrap();
+    o.on(receipt_input(1)).unwrap();
+    assert_eq!(status_of(&mut o, 1), Status::Executed);
+    assert_eq!(o.parts.drops.dropped(&B256::with_last_byte(1)), None);
+}
+
+/// A drop for a reference that the sealer refused is provisional: the
+/// twin can offer the same transaction with its bytes, and the receipt of
+/// that copy turns the status to executed.
+#[test]
+fn a_refused_reference_is_dropped_until_the_receipt_of_the_twin() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, _published) = live();
+    let mut o = owner(dir.path(), live);
+    o.on(drop_input(1, DropReason::SealerRefusedReference))
+        .unwrap();
+    assert_eq!(
+        status_of(&mut o, 1),
+        dropped(DropReason::SealerRefusedReference)
+    );
+    o.on(receipt_input(1)).unwrap();
+    assert_eq!(status_of(&mut o, 1), Status::Executed);
+}
+
+#[test]
+fn a_drop_after_the_receipt_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, _published) = live();
+    let mut o = owner(dir.path(), live);
+    o.on(receipt_input(1)).unwrap();
+    o.on(drop_input(1, DropReason::NonceTooLow)).unwrap();
+    assert_eq!(status_of(&mut o, 1), Status::Executed);
+    assert_eq!(o.parts.drops.dropped(&B256::with_last_byte(1)), None);
+}
+
 /// The distance counts the records that a copy sent above the stored head.
 /// A copy that misses a frame stalls the head, and the distance grows.
 #[test]
@@ -139,10 +239,6 @@ fn the_distance_counts_the_records_above_the_stored_head() {
         3,
         "the copy missed record 1: records 1 to 3 are above the stored head"
     );
-}
-
-fn record(index: u64) -> Vec<u8> {
-    encode_egress_record(index, &[u8::try_from(index % 256).unwrap(); 40]).unwrap()
 }
 
 /// The message of `frame` from a copy that started before this egress.
@@ -190,7 +286,10 @@ fn with_no_peer_the_stream_starts_after_a_boundary() {
     };
     assert_eq!(
         read_from_genesis(&mut o),
-        Range::Unavailable { floor: start }
+        Range::Unavailable {
+            floor: start,
+            mark: RefMark::default()
+        }
     );
 }
 
@@ -228,10 +327,57 @@ fn a_peer_floor_above_the_head_starts_the_stream_there() {
         next_block: 21,
         last: Some(Key::Boundary(20)),
     };
-    o.on(Input::Floor(floor)).unwrap();
+    o.on(Input::Floor {
+        floor,
+        mark: RefMark::default(),
+    })
+    .unwrap();
     assert_eq!(state(&mut o).head, floor);
-    o.on(Input::Floor(GENESIS)).unwrap();
+    o.on(Input::Floor {
+        floor: GENESIS,
+        mark: RefMark::default(),
+    })
+    .unwrap();
     assert_eq!(state(&mut o).head, floor);
+}
+
+/// A start at the floor of a peer raises the reference mark to the mark
+/// of the peer.
+#[test]
+fn a_peer_floor_raises_the_mark_to_the_mark_of_the_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, _published) = live();
+    let mut o = owner(dir.path(), live);
+    let floor = Head {
+        next_index: 40,
+        next_block: 21,
+        last: Some(Key::Boundary(20)),
+    };
+    let mark = RefMark {
+        index: 30,
+        block: 16,
+    };
+    o.on(Input::Floor { floor, mark }).unwrap();
+    assert_eq!(
+        read_from_genesis(&mut o),
+        Range::Unavailable { floor, mark }
+    );
+}
+
+/// The frames of a peer reach the store through the same append as the
+/// copies, so a reference among them raises the mark.
+#[test]
+fn a_reference_in_the_frames_of_a_peer_raises_the_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, _published) = live();
+    let mut o = owner(dir.path(), live);
+    let caught = vec![
+        record(0),
+        crate::test_support::ref_record(1),
+        encode_egress_boundary(1, 2, 0, 0),
+    ];
+    o.on(Input::Caught(caught)).unwrap();
+    assert_eq!(o.parts.store.mark(), RefMark { index: 1, block: 1 });
 }
 
 /// When the peers give up, the next boundary of a copy starts the stream.
