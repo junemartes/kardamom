@@ -265,6 +265,7 @@ A new sealer cluster needs one bootstrap. The bootstrap decides which blank memb
 - Do not set the flag when you register a purged job again for a cluster that holds state.
   Nomad does not know a purged job, so the role would open the bootstrap.
 - A cluster that lost all its state can start from a seed that `kardamom-reconstruct --sealer-seed` writes. The deploy has no switch for the seed. See the [sealer README](../../cluster/sealer-service/README.md#seeded-start).
+- A bootstrap with `KARDAMOM_GENESIS_CARRY=on` starts the new chain with the carry window. See [The carry from genesis](#the-carry-from-genesis).
 
 ### Sealer log purge
 
@@ -390,7 +391,7 @@ The gates of the carry window refuse a move before any job changes. Each gate ru
   - `KARDAMOM_SEALER_VERSION_FLOOR` other than empty or 0 to 5.
   - `KARDAMOM_CLUSTER_RETENTION` above 131,072 frames.
 - The version floor, when it changes to a value above 0:
-  - a sealer job that Nomad does not know: a new chain starts on decision version 3;
+  - a sealer job that Nomad does not know: a new chain starts on decision version 3. A genesis bootstrap passes (see [The carry from genesis](#the-carry-from-genesis));
   - a member that does not run, or a floor above the lowest `decisionVersion` of the members;
   - an executor, validator, batcher or egress job without the meta `relayed_full_ref`, or a live allocation of an older job version. Without the egress job, the egress passes.
   - the v1 loop of the sequencers: a target without `KARDAMOM_SEQUENCER_ADMISSION=on`, or a registered sequencer job without the meta `v2_loop`. The v1 loop offers record type 0 at every floor.
@@ -400,13 +401,13 @@ The gates of the carry window refuse a move before any job changes. Each gate ru
   - an egress instance that does not report `kardamom_egress_ref_frame_max_index` and `kardamom_egress_ref_frame_max_block`;
   - a batcher whose `kardamom_batcher_last_posted_block`, or a validator whose `validator_committed_block`, is not above the highest `kardamom_egress_ref_frame_max_block`.
 - The move of an executor to carry mode, for each listed executor that does not carry yet:
-  - a sealer job that Nomad does not know;
+  - a sealer job that Nomad does not know, except on a genesis bootstrap;
   - a group `executor-<i>` that does not run on the sealer nodes;
   - an executor job without the meta `carried_ref_fault`;
   - a member that does not run, or that reports `carryWindow` false;
   - the member `cluster-<i>` that reports the feed `off`;
   - the egress checks above;
-  - `kardamom_executor_block_number` of the executor minus 32 not above the highest `kardamom_egress_ref_frame_max_block`. At its first carry start, the executor compares the stream with its committed blocks of that window.
+  - `kardamom_executor_block_number` of the executor minus 32 not above the highest `kardamom_egress_ref_frame_max_block`. At its first carry start, the executor compares the stream with its committed blocks of that window. An egress that stored no reference (`kardamom_egress_ref_frame_max_index` 0) holds none to join, so the check passes.
 - The move back to the v1 loop: a target without `KARDAMOM_SEQUENCER_ADMISSION=on` while the registered sequencer job carries `v2_loop`, and a member reports `carryWindow` true, holds feature 5 (`kardamom_sealer_feature_state{feature="5"}` at 1 or 2), or does not run. `KARDAMOM_ALLOW_MUST_MATCH=admission` allows it.
 - The sealer retention, when the sealer job changes:
   - a lower value than the registered sealer, unless `KARDAMOM_ALLOW_MUST_MATCH` names `retention`;
@@ -510,6 +511,50 @@ An event that the old owner appends between the copy and the deploy, and does no
 
 To go back, deploy with `KARDAMOM_NOTIFIER_NODES=off`.
 
+### The carry from genesis
+
+`KARDAMOM_GENESIS_CARRY=on` starts a new chain with features 3, 4 and 5 active at genesis: decision version 5 and the carry window from the first block. The chain needs no upgrade transaction and no staged move of the executors. A live chain keeps the rollout above and the runbook [`docs/runbooks/carry-window-rollout.md`](../../docs/runbooks/carry-window-rollout.md). Staging and production leave the variable unset, and then every job renders as before.
+
+The variable sets:
+
+- `-Dkardamom.cluster.genesisFeatures=3,4,5` on every sealer member (job variable `genesis_carry` of the sealer). Every member must match it. A member takes it only when it starts at genesis.
+- `genesis_features = [3, 4, 5]` in the genesis of the executors and the validator (job variable `genesis_carry`, the fragment `config/genesis/carry.toml` in front of `config/genesis/dev.toml`).
+- The default of every carry switch (`workloads_genesis_carry_switches`):
+  - `KARDAMOM_MEMBER_FEED=on` and `KARDAMOM_EXEC_ON_SEALERS=on`;
+  - `KARDAMOM_EXEC_FRAMES=on` and `KARDAMOM_EGRESS=1`;
+  - `KARDAMOM_BATCHER_EGRESS=on` and `KARDAMOM_VALIDATOR_EGRESS=on`;
+  - `KARDAMOM_SEQUENCER_ADMISSION=on`: only the v2 loop offers the bytes of a transaction;
+  - `KARDAMOM_SEALER_VERSION_FLOOR=5`;
+  - `KARDAMOM_CARRY_EXECUTORS` with every member index, such as `0,1,2`.
+
+The preflight refuses:
+
+- a value other than `on`, `off` or empty;
+- a carry switch with another value than the one above, such as a floor below 5 or a partial list of carry executors;
+- `KARDAMOM_EXEC_CURSOR=on`.
+
+The release gate accepts the variable only in two cases:
+
+- A genesis bootstrap: `KARDAMOM_CLUSTER_BOOTSTRAP=1`, a sealer job that Nomad does not know (the plan says `Added`), and no job of `workloads_genesis_pipeline_jobs` (the sequencer, the executor, the batcher, the validator and the egress) in Nomad.
+- A registered sealer job whose every member carries `genesisFeatures=3,4,5`. So the chaos lifecycle and `just container-test` deploy again without the bootstrap.
+
+The gate also refuses:
+
+- any other case, with a pointer to the runbook of the rollout;
+- a target or registered sealer job that names a seed (`seedSnapshot`) or the retained file (`carryBytes=true`): a seeded member does not start at genesis;
+- a change of `genesisFeatures` on a registered sealer job, also with `KARDAMOM_ALLOW_MUST_MATCH`. A member with no snapshot replays its log from genesis, and with other genesis features it forks. So a chain keeps the variable for its life.
+
+On a genesis bootstrap no member and no other job of the pipeline runs yet. The gates of the carry window read the genesis facts:
+
+- The rules of each member come from the rendered sealer job: decision version 5, the carry window, and the feed (`tasks/sealer_rules.yml`). The floor 5 and the carry executors pass on these rules.
+- The reference mark of the egress is index 0 at block 0: the carry window refuses every reference from the first block (`tasks/egress_mark.yml`). So the new readers start on the egress, and the executors start in carry mode.
+- A job that Nomad does not know runs no instance of an older release, so the meta checks of the registered jobs pass it. The deploy registers it from this release.
+- After the new members start, and before any other job registers, every member must report `decisionVersion` 5, `carryWindow` true and `genesisFeatures` `"3,4,5"` on its status. Else the deploy stops: the sealer image does not take the setting.
+
+On a registered chain the gates read the live state as above. The upgrade check reads the live members too: every member holds feature 5 from genesis, so the check refuses feature 3 or 4 off.
+
+`KARDAMOM_GENESIS_CARRY=on just container-up` starts a container cluster with the carry from genesis. The chaos lifecycle sets the variable for each shard (`DeployVars`).
+
 ### Configuration switches
 
 The workloads role reads these environment variables. The defaults are in `ansible/roles/workloads/defaults/main.yml`. An Ansible extra variable can set the matching `workloads_*` variable directly. An empty value means "use the default of the job".
@@ -570,6 +615,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Fault proxy | `KARDAMOM_L1_FAULT_PROXY` | `0` | `1` deploys the lying L1 of the `chaos-l1` shard in front of the in-cluster anvil. All followers read L1 through it. |
 | Sealer | `KARDAMOM_CLUSTER_RETENTION` | empty (`65536` frames in the job) | The egress replay retention, in frames, at most 131,072. It is a minimum. The sealer keeps a frame above the posted head even past this window, unless the carry window applies. On a live chain the release gate refuses a lower value unless `KARDAMOM_ALLOW_MUST_MATCH` names `retention`, and a value whose frames pass 48 MiB. See [The carry window](#the-carry-window) and the [sealer README](../../cluster/sealer-service/README.md). |
 | Sealer, batcher | `KARDAMOM_DA_LAG_BUDGET_BLOCKS` (job variables `cluster_da_lag_budget_blocks`, `da_lag_budget_blocks`) | empty (`10000` in the jobs) | The DA-lag budget, in blocks. The sealer refuses user transactions when the sealed head is more than this far past the posted head. `0` turns the guard off. Every member must use the same value. The batcher posts at half of it. The deploy refuses `BATCHER_IDLE_FLUSH_MS / 1000` at or above it. |
+| Sealer, executor, validator | `KARDAMOM_GENESIS_CARRY` (job variable `genesis_carry`) | empty | `on`, `off` or empty. On, a new chain starts with features 3, 4 and 5 active at genesis, and every carry switch is on. Only a new cluster, or a chain that started with it, takes it. See [The carry from genesis](#the-carry-from-genesis). |
 | Sealer | `KARDAMOM_CLUSTER_BOOTSTRAP` | `0` (`1` in `just container-up`) | `1` opens the sealer bootstrap while the role registers a cluster job that Nomad does not know. See [Sealer bootstrap](#sealer-bootstrap). |
 | Sealer | `KARDAMOM_CLUSTER_SNAPSHOT_S` | empty (`300` in the job) | The interval of the Raft snapshot, in seconds. `0` disables it. |
 | Sealer | `KARDAMOM_CLUSTER_LOG_PURGE_KEEP` | empty (`3` in the job) | How many of the newest Raft snapshots keep their log. `0` turns the log purge off. See [Sealer log purge](#sealer-log-purge). |

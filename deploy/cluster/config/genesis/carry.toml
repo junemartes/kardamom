@@ -1,0 +1,11 @@
+# The genesis fragment of the carry from genesis: features 3, 4 and 5
+# active at genesis (kardamom_types::genesis::Genesis, genesis_features).
+# Genesis writes the KardamomChainState word of each feature, so every
+# reader of the words sees what an upgrade transaction would have written.
+#
+# The executor and validator jobs put this file in front of dev.toml
+# when the deploy runs with KARDAMOM_GENESIS_CARRY=on. The key is a
+# top-level key, so it must come before the first table of the genesis.
+# Only a new chain takes it: an executor refuses a genesis that differs
+# from the one in its state.
+genesis_features = [3, 4, 5]

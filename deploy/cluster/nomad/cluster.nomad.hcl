@@ -198,6 +198,23 @@ variable "member_feed" {
   }
 }
 
+# The carry from genesis, "on" or "off". On, every member starts a new
+# chain with features 3, 4 and 5 active at genesis
+# (-Dkardamom.cluster.genesisFeatures=3,4,5): decision version 5 and the
+# carry window from the first block. The setting applies only to a member
+# that starts at genesis, but every member must match it for the life of
+# the chain: a member with no snapshot replays the log from genesis with
+# it. Off renders no setting. The deploy passes it from
+# KARDAMOM_GENESIS_CARRY, and accepts it only for a new chain.
+variable "genesis_carry" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.genesis_carry)
+    error_message = "The genesis_carry value must be on or off."
+  }
+}
+
 # The frame ring of the member feed in bytes (-Dkardamom.cluster.feedRingBytes),
 # off the heap, with the member feed only. A power of two of at least 8 MiB.
 variable "cluster_feed_ring_bytes" {
@@ -338,6 +355,8 @@ locals {
     " -Dkardamom.cluster.feedAeronDir=/opt/kardamom/aeron-mount/dir",
     " -Dkardamom.cluster.feedRingBytes=${var.cluster_feed_ring_bytes}",
   ]) : ""
+  # The genesis features of the carry from genesis, empty when it is off.
+  genesis_opts = var.genesis_carry == "on" ? " -Dkardamom.cluster.genesisFeatures=3,4,5" : ""
 }
 
 job "cluster" {
@@ -437,12 +456,12 @@ job "cluster" {
           # ingress endpoint is an Aeron UDP channel, so it has no
           # connect check of its own.
           check {
-            name      = "member-ready"
-            type      = "http"
-            port      = "admin"
-            path      = "/ready"
-            interval  = "10s"
-            timeout   = "2s"
+            name     = "member-ready"
+            type     = "http"
+            port     = "admin"
+            path     = "/ready"
+            interval = "10s"
+            timeout  = "2s"
           }
         }
 
@@ -483,7 +502,7 @@ job "cluster" {
         # archive, consensus module, service and feeder threads. The image
         # entrypoint also sets the timer slack of the JVM when it is set.
         env {
-          JAVA_TOOL_OPTIONS    = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} ${local.cycle_threshold_opts} ${local.jvm_pause_log_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.logPurgeKeepSnapshots=${var.cluster_log_purge_keep_snapshots} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.driverThreadingMode=${var.cluster_driver_threading_mode} -Dkardamom.cluster.remoteOrigins=${var.cluster_seed_snapshot != "" ? "" : var.cluster_remote_origins} -Dkardamom.cluster.seedSnapshot=${var.cluster_seed_snapshot} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}${local.feed_opts}"
+          JAVA_TOOL_OPTIONS        = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} ${local.cycle_threshold_opts} ${local.jvm_pause_log_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.logPurgeKeepSnapshots=${var.cluster_log_purge_keep_snapshots} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.driverThreadingMode=${var.cluster_driver_threading_mode} -Dkardamom.cluster.remoteOrigins=${var.cluster_seed_snapshot != "" ? "" : var.cluster_remote_origins} -Dkardamom.cluster.seedSnapshot=${var.cluster_seed_snapshot} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}${local.feed_opts}${local.genesis_opts}"
           KARDAMOM_IDLE_CAP_US     = var.idle_cap_us
           KARDAMOM_CLUSTER_HEAP_MB = var.cluster_heap_mb
         }
