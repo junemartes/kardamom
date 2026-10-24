@@ -459,9 +459,10 @@
 # One sealer image holds one set of snapshot versions. The revision of
 # the target sealer image comes from the first source that names it:
 # - A deploy record that names the image.
-# - The checkout, when the image is the registered one, or the manifest
-#   pins no sealer image. The members run that image, or the image builds
-#   from this tree.
+# - The checkout, when every registered member runs the image, or the
+#   manifest pins no sealer image. The members run that image, or the
+#   image builds from this tree. A registered job whose groups run more
+#   than one image (a roll that stopped half way) does not name the image.
 # - The tag of the image. A release tags it main-<12 hex of the commit>,
 #   or vX.Y.Z.
 # - KARDAMOM_REVISION.
@@ -475,7 +476,7 @@
            | selectattr('manifest.cluster', 'defined')
            | selectattr('manifest.cluster', 'equalto', workloads_gate_sealer_image)
            | rejectattr('revision', 'in', ['', 'unknown']) | map(attribute='revision') | list)
-          + ([workloads_target_revision] if workloads_gate_sealer_image == '' or workloads_gate_sealer_image in workloads_gate_sealer_registered else [])
+          + ([workloads_target_revision] if workloads_gate_sealer_image == '' or workloads_gate_sealer_registered | unique | list == [workloads_gate_sealer_image] else [])
           + (workloads_gate_sealer_tag | regex_findall('^main-([0-9a-f]{12})$'))
           + (workloads_gate_sealer_tag | regex_findall('^v[0-9]+\.[0-9]+\.[0-9]+$'))
           + ([workloads_revision] if workloads_revision | length > 0 else [])
@@ -492,8 +493,8 @@
   ansible.builtin.assert:
     that: workloads_gate_sealer_revision | length > 0
     fail_msg: >-
-      Refused: no deploy record names the sealer image {{ workloads_image_refs.cluster }}, it is not the registered
-      sealer, and its tag names no release revision (main-<12 hex> or vX.Y.Z). So the gate cannot read the snapshot
+      Refused: no deploy record names the sealer image {{ workloads_image_refs.cluster }}, not every registered
+      sealer member runs it, and its tag names no release revision (main-<12 hex> or vX.Y.Z). So the gate cannot read the snapshot
       versions that this sealer reads. Set KARDAMOM_REVISION to the revision of that image, then deploy.
   when: workloads_gate_sealer_rolls | bool
 

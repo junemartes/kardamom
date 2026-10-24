@@ -1836,6 +1836,17 @@ class RollbackTest(Deploys):
                       output)
         self.assertEqual(self.api.state['writes'], [])
 
+    def test_a_sealer_image_that_only_some_members_run_needs_its_revision(self):
+        """A roll that stopped half way: one member runs the target image, so the checkout does not name it."""
+        self.two_sealer_releases()
+        self.repin('c', tag='test')
+        image = re.search(r'\S*kardamom-cluster:test@sha256:[0-9a-f]{64}', self.manifest.read_text()).group(0)
+        groups = self.api.state['jobs']['cluster']['TaskGroups']
+        groups[0]['Tasks'][0]['Config']['image'] = image
+        output = self.run_deploy(success=False)
+        self.assertIn('not every registered sealer member runs it', output)
+        self.assertEqual(self.api.state['writes'], [])
+
     def test_a_rollback_rolls_a_down_sealer_member_that_the_operator_names_first(self):
         """A member crash-loops on the release: the main reason to roll back."""
         self.deploy()
