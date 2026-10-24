@@ -40,22 +40,37 @@
 # and up to three held activations), then the replay windows of version 4.
 # A release that reads only up to v14 refuses v15 and stops, so send the
 # upgrade transaction only after every member runs this release.
-# With kardamom.cluster.carryBytes=true, the members write v12: the state
-# of v10 without the void ledger, then the index of the retained file in
-# place of the retained frames. A release that reads only up to v11
-# refuses v12 and stops, so switch the flag on only on a new chain or at a
-# coordinated cut-over. No release wrote v12 before this layout.
+# After the feature activation of FEATURE_SEALER_V5 (feature 4, the carry
+# flag) is in the log, the members write v16: v15, then the schedule of the
+# carry flag (up to three held activations). A release that reads only up
+# to v15 refuses v16 and stops. A release before this one also ignores the
+# activation of feature 4, and stays on decision version 4 while this
+# release switches to 5. So send the upgrade transaction of feature 4 only
+# after every member runs this release.
+# With kardamom.cluster.carryBytes=true, the members write v17: the state
+# of v16, then the index of the retained file in place of the retained
+# frames. A member with the flag restores v17 or v12, and a member without
+# it stops on both. v12 is the older layout with a retained file: the
+# state of v10 without the void ledger, then the index. It holds no
+# decision rules, so a member that restores v12 runs decision version 3.
+# A release that reads only up to v16 refuses v17 and stops. A member
+# without the flag never writes v17, so a rolling deploy of a chain
+# without the flag is safe. On a chain with the flag, a member of an older
+# release stops on v17: a rollback after the first v17 snapshot, or a seed
+# from a peer that wrote v17.
 [format.sealer-snapshot]
 writes = 14
 reads_min = 1
-reads_max = 15
+reads_max = 17
 shared = true
-activation = { flag = "kardamom.cluster.carryBytes", writes = 12 }
+activation = { flag = "kardamom.cluster.carryBytes", writes = 17 }
 code = [
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_WRITE_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_READ_VERSION",
+    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#FILE_SNAPSHOT_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#RETAINED_FILE_SNAPSHOT_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SWITCH_SNAPSHOT_VERSION",
+    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#CARRY_SNAPSHOT_VERSION",
 ]
 
 # The ingress message kinds of the sealer. The Rust writers send kinds 0
@@ -65,7 +80,9 @@ code = [
 # sequencer sends kind 11 (the feature activation) only in front of an
 # epoch that holds an upgrade transaction of feature 3. A member reads
 # kind 11: a record of feature 3 stores the schedule of decision version
-# 4, and a record of another feature changes no state.
+# 4, a record of feature 4 stores the schedule of decision version 5 while
+# version 4 or 5 runs, and a record of another feature changes no state.
+# A member on decision version 5 drops kinds 6 and 9 as unknown kinds.
 # Every member drops a frame of a kind it does not know, counts it, and
 # never orders it.
 [format.sealer-ingress-kinds]
@@ -92,7 +109,10 @@ code = [
 # thread puts it on the consumer channel when a session opens. It is never
 # on the wire. The sealer sends kind 17 (its rules: the decision version)
 # to each session when it opens, and to each open session at each new
-# term. An older reader drops kind 17 as an unknown kind.
+# term. An older reader drops kind 17 as an unknown kind. This release
+# reads kind 18 (the refusal of a type 0 reference), but the sealer does not
+# send it yet. It goes only to the offering session, and an older reader
+# drops it as an unknown kind.
 #
 # On the member feed, the answers (kinds 3, 4, 11 and 16) are 25 bytes:
 # the 17 bytes of the egress layout, then the request id. A reader reads
@@ -107,9 +127,12 @@ code = [
 [format.sealer-egress-kinds]
 writes = 17
 reads_min = 1
-reads_max = 17
+reads_max = 18
 shared = true
 code = [
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#EGRESS_KIND_REF_REFUSED",
+    "crates/cluster-adapter/src/wire/mod.rs#EGRESS_KIND_REF_REFUSED",
+    "crates/cluster-adapter/testdata/wire_golden.txt#ref_refused",
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#EGRESS_KIND_SEALER_INFO",
     "crates/cluster-adapter/src/wire/mod.rs#EGRESS_KIND_SEALER_INFO",
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#EGRESS_KIND_RECORD_LAG_REJECT",
@@ -127,15 +150,24 @@ code = [
 # into its retained file, and takes no void request. The Rust reader
 # refuses a relayed type 5, and drops a frame with an unknown type, so an
 # old executor misses a canonical record.
+# This release also has the codecs of type 7 (the full reference, on
+# ingress only): the 99 bytes of a positioned type 0 reference with type 7,
+# then the envelope. A sealer on decision version 5 relays it as a type 6,
+# and a sealer below version 5 relays it as is. The Rust reader decodes a
+# relayed type 7 as its type 6 entry. An older Rust reader refuses it.
 [format.sealer-record-types]
 writes = 4
 reads_min = 0
-reads_max = 6
+reads_max = 7
 shared = true
 activation = { flag = "kardamom.cluster.carryBytes", writes = 6 }
 code = [
     "crates/cluster-adapter/src/wire/mod.rs#RT_VOID",
     "crates/cluster-adapter/src/wire/mod.rs#RT_TX",
+    "crates/cluster-adapter/src/wire/mod.rs#RT_TXREF_OFFER",
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#RT_TXREF_OFFER",
+    "crates/cluster-adapter/testdata/wire_golden.txt#txref_offer_ingress",
+    "crates/cluster-adapter/testdata/wire_golden.txt#txref_offer_egress",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/VoidLedger.java#RT_VOID",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/TxOffer.java#RT_TX",
 ]
@@ -209,6 +241,23 @@ reads_min = 1
 reads_max = 1
 shared = true
 code = ["crates/state/src/checkpoint/manifest.rs#MANIFEST_VERSION"]
+
+# The block log of the checkpoints: segment files of the write batch of
+# each committed block after a base checkpoint. A segment starts with a
+# 56-byte head (magic, version, state schema, genesis digest, first block),
+# then records `[len:u32][block:u64][crc32:u32][rkyv WriteBatch]`. A peer
+# serves the log with its checkpoints, so the format is shared. A reader
+# skips a segment whose head has another version, so a restore of an older
+# release uses the base checkpoint alone.
+[format.block-log]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = true
+code = ["crates/state/src/checkpoint/block_log.rs#BLOCK_LOG_VERSION"]
+[format.block-log.layout]
+WriteBatch = "rkyv size 128 align 16"
+SegmentHead = "4b4152424c4f4700010000000300000011111111111111111111111111111111111111111111111111111111111111112a00000000000000"
 
 # The KAR1 batch on DA and L1. The batch stays there for all time. The
 # batcher decodes its own last post at start, and the indexer and
@@ -292,6 +341,21 @@ ServiceEvent = "rkyv size 64 align 8"
 TxStatus = "rkyv size 112 align 16"
 TxError = "rkyv size 80 align 16"
 TxEnvelope = "rkyv size 80 align 8"
+
+# Frozen layout. The drop record on the tx_drops stream: the hash, the
+# sender, the nonce and the reason of one transaction that the sequencer
+# dropped. The sequencer writes it, and the egress reads it. A reader of
+# an older build has no subscription to the stream. A reason goes only at
+# the end; a reader logs and skips a frame with a reason that it does not
+# know.
+[format.tx-drops]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = true
+code = ["crates/types/src/tx_drop.rs#pub struct TxDrop"]
+[format.tx-drops.layout]
+TxDrop = "rkyv size 72 align 8"
 
 # Frozen layout. The rollback record on the tx_receipts receipt stream: a
 # 40-byte rkyv ReceiptRollback frame (the last valid block and the identity

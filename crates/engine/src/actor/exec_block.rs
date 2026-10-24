@@ -68,6 +68,7 @@ impl<W: ExecPorts> BlockState<W> {
 pub(super) struct BalCapture {
     tx: Sender<BalHandoff>,
     pub(super) bal: Bal,
+    dropped: metrics::Counter,
 }
 
 impl BalCapture {
@@ -75,6 +76,7 @@ impl BalCapture {
         Self {
             tx,
             bal: Bal::new(),
+            dropped: metrics::counter!(crate::metrics::BAL_HANDOFF_DROPPED_TOTAL),
         }
     }
 
@@ -114,7 +116,7 @@ impl BalCapture {
             },
             block_number,
             BAL_HANDOFF,
-            || {},
+            || self.dropped.increment(1),
         );
     }
 }

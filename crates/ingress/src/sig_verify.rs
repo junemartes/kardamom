@@ -19,14 +19,14 @@
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy_consensus::TxEnvelope;
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_primitives::{Address, B256, Bytes, keccak256};
+use kardamom_obs::pipeline::{Batch, Queue, Step};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
 
 use crate::error::IngressError;
 use crate::sync_util::LockIgnorePoison;
@@ -104,11 +104,12 @@ impl RequestCursor {
 /// caller rejects the tx at the RPC boundary.
 ///
 /// A batch smaller than this threshold is recovered on a single blocking
-/// thread. Splitting a 1-3 tx batch costs more in hops than the 42µs per
-/// tx it would save. At deployed rates, the ring almost always holds one
-/// transaction (a 50µs window at 3.8k tx/s sees 0.2 arrivals on
+/// thread. Each extra worker costs a wake of a pool thread, and on a
+/// shared 4-vCPU node a wake costs about as much as several recoveries.
+/// 16 recoveries are about 0.7 ms of work, enough to pay for the wakes. At deployed rates, the ring almost always
+/// holds one transaction (a 50µs window at 3.8k tx/s sees 0.2 arrivals on
 /// average), so this is the common path.
-const PARALLEL_THRESHOLD: usize = 4;
+const PARALLEL_THRESHOLD: usize = 16;
 
 /// Intake capacity, as a multiple of the ring depth. A full intake
 /// makes `recover` wait, so overload turns into backpressure on the RPC
@@ -133,6 +134,28 @@ struct FlushLoop {
     depth: NonZeroUsize,
     flush_window: Duration,
     parallelism: NonZeroUsize,
+    meters: FlushMeters,
+}
+
+/// The pipeline metrics of the flush task, recorded once per batch.
+struct FlushMeters {
+    /// The requests in each flushed batch.
+    batch: Batch,
+    /// The recovery of one batch on the blocking pool, from the hop to the
+    /// end of its last worker.
+    recover: Step,
+    /// The requests that wait in the intake after a batch is taken.
+    intake: Queue,
+}
+
+impl FlushMeters {
+    fn new() -> Self {
+        Self {
+            batch: Batch::new("ingress.recover_batch"),
+            recover: Step::new("ingress.recover_batch"),
+            intake: Queue::new("ingress.recover_intake"),
+        }
+    }
 }
 
 impl FlushLoop {
@@ -147,6 +170,7 @@ impl FlushLoop {
             depth,
             flush_window,
             parallelism,
+            meters: FlushMeters::new(),
         }
     }
 
@@ -175,7 +199,11 @@ impl FlushLoop {
         if buf.len() < depth {
             self.fill_until_deadline(&mut buf).await;
         }
+        self.meters.intake.set(self.rx.len());
+        self.meters.batch.record(buf.len());
+        let started = Instant::now();
         self.process_batch(buf).await;
+        self.meters.recover.since(started);
         ControlFlow::Continue(())
     }
 
@@ -236,8 +264,14 @@ impl FlushLoop {
         }
     }
 
-    /// Races the flush window's deadline against further arrivals until
-    /// `buf` reaches `self.depth`, or the deadline passes.
+    /// Takes further arrivals until `buf` reaches `self.depth`, or the
+    /// flush window passes.
+    ///
+    /// The window is shorter than one tick of the tokio timer (1 ms), so a
+    /// timer would hold each batch for a full millisecond, not for the
+    /// window. Each pass yields once instead, so a handler that runs on
+    /// the same runtime can queue its request, then takes what is queued
+    /// without a wait. A partial batch costs at most the window in passes.
     async fn fill_until_deadline(&mut self, buf: &mut Vec<VerifyRequest>) {
         let depth = self.depth.get();
         // `Instant + Duration` panics on overflow (R12). `checked_add`
@@ -248,16 +282,9 @@ impl FlushLoop {
         let Some(deadline) = Instant::now().checked_add(self.flush_window) else {
             return;
         };
-        loop {
-            let remaining = depth - buf.len();
-            let filled = tokio::select! {
-                biased;
-                () = tokio::time::sleep_until(deadline) => return,
-                n = self.rx.recv_many(buf, remaining) => n,
-            };
-            if filled == 0 || buf.len() >= depth {
-                return;
-            }
+        while buf.len() < depth && Instant::now() < deadline {
+            tokio::task::yield_now().await;
+            buf.extend(std::iter::from_fn(|| self.rx.try_recv().ok()).take(depth - buf.len()));
         }
     }
 }
@@ -266,8 +293,13 @@ impl BatchVerifier {
     #[must_use]
     pub fn new(depth: NonZeroUsize, flush_window: Duration) -> Self {
         use nonzero_ext::nonzero;
-        let parallelism = std::thread::available_parallelism()
-            .map_or(NonZeroUsize::MIN, |n| n.min(nonzero!(8usize)));
+        // Half of the cores, at most 8: the other half stays for the tokio
+        // workers and the Aeron threads, which serve the same requests.
+        let parallelism = std::thread::available_parallelism().map_or(NonZeroUsize::MIN, |n| {
+            NonZeroUsize::new(n.get() / 2)
+                .unwrap_or(NonZeroUsize::MIN)
+                .min(nonzero!(8usize))
+        });
         Self::with_parallelism(depth, flush_window, parallelism)
     }
 

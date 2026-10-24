@@ -29,6 +29,13 @@ sealed interface RetainedFrames permits HeapFrames, RetainedFile {
     /** The number of retained frames. */
     long count();
 
+    /**
+     * Whether this store belongs to a member that carries the bytes: only
+     * then does the member feed run, so a paired executor reads the bytes
+     * and every reader below the window recovers from the egress.
+     */
+    boolean carriesBytes();
+
     /** Whether the oldest retained frame is a boundary. Call it only when {@link #count()} is above 0. */
     boolean frontIsBoundary();
 

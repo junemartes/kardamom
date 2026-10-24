@@ -34,6 +34,32 @@ class SessionBacklogsTest {
         return session;
     }
 
+    /**
+     * While the member holds its outputs after its start, every frame waits,
+     * and no session closes for the wait. After the hold the frames go out
+     * in order.
+     */
+    @Test
+    void theStartHoldQueuesEveryFrameAndClosesNothing() throws InterruptedException {
+        final StartHold hold = new StartHold();
+        final SessionBacklogs held = new SessionBacklogs(0, STALL_NS, BYTE_LIMIT, hold, new SealerMetrics());
+        final StubSession session = new StubSession(1);
+        final UnsafeBuffer buffer = new UnsafeBuffer(new byte[8]);
+
+        assertEquals(Outcome.QUEUED, held.offer(session, new byte[] {1}));
+        assertEquals(Outcome.QUEUED, held.offer(session, buffer, 8));
+        pastTheStallDeadline();
+        held.drain();
+        assertTrue(session.offered.isEmpty(), "nothing goes out during the hold");
+        assertEquals(0, session.closes);
+
+        hold.release();
+        held.drain();
+        assertEquals(2, session.offered.size());
+        assertEquals(1, session.offered.get(0).length);
+        assertEquals(0, session.closes, "the wait of the hold is no stall");
+    }
+
     @Test
     void aBacklogOverTheByteLimitClosesItsSessionOnce() {
         final StubSession session = wedged(1);

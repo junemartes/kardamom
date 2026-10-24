@@ -73,6 +73,30 @@ variable "nomad_tls_dir" {
   default     = ""
 }
 
+# How long and how much Prometheus keeps. At a 1 s scrape, staging
+# writes about 3 GB a day. A size of "0B" sets no size limit, and the
+# time limit alone applies.
+variable "prometheus_retention_time" {
+  type    = string
+  default = "24h"
+}
+
+variable "prometheus_retention_size" {
+  type    = string
+  default = "0B"
+}
+
+# The scrape of the egress (nomad/egress.nomad.hcl), "on" or "off". The
+# workloads role sets it on with the egress job (KARDAMOM_EGRESS=1).
+variable "egress" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.egress)
+    error_message = "The egress value must be on or off."
+  }
+}
+
 variable "grafana_admin_password" {
   type        = string
   description = "The Grafana admin password. The local profile keeps the development default."
@@ -81,6 +105,8 @@ variable "grafana_admin_password" {
 
 locals {
   dc = var.datacenter
+  # The admin endpoint of a sealer member (admin_port in nomad/cluster.nomad.hcl).
+  sealer_admin_port = 40205
   # A sequencer node hosts one replica per active lane; the metrics port
   # forms the lane, 9001 + 10 * lane. Four lanes cover the resize cases;
   # an inactive lane's target reads as down.
@@ -125,6 +151,15 @@ locals {
       - job_name: kardamom-canary
         static_configs:
           - targets: [{{ range $i, $s := service "kardamom-canary|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
+      # The admin endpoint of each sealer member. The member service names
+      # the ingress port; the admin port is the admin_port of
+      # nomad/cluster.nomad.hcl.
+      - job_name: kardamom-sealer
+        static_configs:
+          - targets: [{{ range $i, $s := service "kardamom-cluster-member|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:${local.sealer_admin_port}"{{ end }}]%{if var.egress == "on"}
+      - job_name: kardamom-egress
+        static_configs:
+          - targets: [{{ range $i, $s := service "kardamom-egress-metrics|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]%{endif}
       # The host metrics of every node (nomad/node-exporter.system.nomad.hcl)
       # and the metrics of every Nomad agent, discovered through the local
       # Consul agent. The node label is the Consul node name.
@@ -136,7 +171,7 @@ locals {
         relabel_configs:
           - source_labels: [__meta_consul_node]
             target_label: node
-      %{ for role in ["server", "client"] }
+      %{for role in ["server", "client"]}
       - job_name: nomad-${role}
         metrics_path: /v1/metrics
         params:
@@ -157,14 +192,14 @@ locals {
             target_label: node
           - target_label: job
             replacement: nomad
-      %{ if role == "client" }
+      %{if role == "client"}
           # A server can also register as a client. Its certificate has
           # the server name, and the server scrape already covers it.
           - source_labels: [__meta_consul_node]
             regex: '{{ range $i, $s := service "${var.cluster_id}-nomad" }}{{ if $i }}|{{ end }}{{ $s.Node }}{{ end }}'
             action: drop
-      %{ endif }
-      %{ endfor }
+      %{endif}
+      %{endfor}
   EOT
   dashboards = [
     "kardamom-overview", "kardamom-ingress", "kardamom-sequencer",
@@ -176,6 +211,7 @@ locals {
     "kardamom-canary",
     "kardamom-performance",
     "kardamom-availability",
+    "kardamom-bottlenecks",
   ]
 }
 
@@ -192,6 +228,14 @@ job "monitoring" {
 
   group "monitoring" {
     count = 1
+
+    # The metrics live in the allocation's data directory. A sticky disk
+    # keeps them when a job update replaces the allocation on the same
+    # node, so a deploy does not cut the history.
+    ephemeral_disk {
+      sticky  = true
+      migrate = true
+    }
 
     restart {
       attempts = 3
@@ -268,7 +312,8 @@ job "monitoring" {
         args = [
           "--config.file=/local/prometheus.yml",
           "--storage.tsdb.path=/alloc/data/prometheus",
-          "--storage.tsdb.retention.time=24h",
+          "--storage.tsdb.retention.time=${var.prometheus_retention_time}",
+          "--storage.tsdb.retention.size=${var.prometheus_retention_size}",
           # The overview dashboard rates a multi-metric selector
           # ({__name__=~"kardamom_.+_total"}); without delayed name
           # removal, Prometheus rejects it once a service exports two

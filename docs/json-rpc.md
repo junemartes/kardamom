@@ -17,12 +17,12 @@ receipt fields, the errors and the limits.
 | `eth_blockNumber` | none | The newest closed block number, as a hex quantity. It comes from the block boundaries on the receipt stream. It is `0x0` before the first boundary. |
 | `eth_getBalance` | `address`, `block` | The balance in wei, as a hex quantity. |
 | `eth_getTransactionCount` | `address`, `block` | The committed nonce of the account, as a hex quantity. |
-| `eth_sendRawTransaction` | `bytes` | The transaction hash. The call waits until the receipt arrives. |
+| `eth_sendRawTransaction` | `bytes` | The transaction hash. The call waits until the receipt arrives, or with `--verdicts` until the sequencer takes the transaction into its mempool. With `--ack validated`, it returns when the ingress validated and published the transaction. |
 | `eth_getTransactionReceipt` | `hash` | The receipt, or `null` if the transaction is not committed. |
 | `eth_feeHistory` | `blockCount`, `newestBlock`, `rewardPercentiles` (optional) | An Ethereum `FeeHistory` object. |
 | `eth_maxPriorityFeePerGas` | none | A tip rate that a wallet can bid, in wei per gas. |
 | `eth_gasPrice` | none | The next block base fee plus the suggested tip rate, in wei per gas. |
-| `kardamom_sendRawTransactionAsync` | `bytes` | The transaction hash. The call returns when the transaction is published. |
+| `kardamom_sendRawTransactionAsync` | `bytes` | The transaction hash. The call returns when the transaction is published. With `--ack validated`, it is another name of `eth_sendRawTransaction`. |
 | `kardamom_subscribeReceipts` | `senders` (optional) | A subscription. WebSocket only. See [Receipt subscription](#receipt-subscription). |
 | `kardamom_blockNumberByTag` | `tag` | The block number that the tag names, as a hex quantity. See [Block tags](#block-tags). |
 | `kardamom_chainStatus` | none | The chain status: the heads, the DA-lag budget, the live halts and the state of each service. See [Chain status](#chain-status). |
@@ -36,6 +36,18 @@ receipt fields, the errors and the limits.
   - A DA-lag reject from the sealer also ends the wait. The error is `-32010`, with the cause `da_lag` at the service `sealer`.
   - A record-lag reject from the sealer also ends the wait. The error is `-32010`, with the cause `record_lag` at the service `sealer`. The record-lag guard is off by default until a later release.
   - The timeout is 30 seconds. The `--pending-receipt-timeout-ms` flag (env `KARDAMOM_PENDING_RECEIPT_TIMEOUT_MS`) sets it.
+- With `--verdicts` (the ack at admission), `eth_sendRawTransaction` has the semantics of Ethereum. It returns the hash when the sequencer that owns the sender takes the transaction into its mempool: it forwards it to the sealer, or it holds it for a nonce gap. It does not wait for the sealer or the receipt.
+  - The errors use the text of geth: `nonce too low: address <a>, tx: <n> state: <m>`, `already known`, `txpool is full`, `insufficient funds for gas * price + value: ...`, `max fee per gas less than block base fee: ...`.
+  - With no answer of a sequencer in 2 seconds, the error is `transaction not acknowledged`. The `--ack-timeout-ms` flag (env `KARDAMOM_INGRESS_ACK_TIMEOUT_MS`) sets the time. A resubmit of the same transaction can answer `already known`: the first copy is in a mempool.
+  - An accepted transaction can still drop later, as on Ethereum. Read the result with `eth_getTransactionReceipt`, or follow the status feed.
+- With `--ack validated` (env `KARDAMOM_INGRESS_ACK`), `eth_sendRawTransaction` returns the hash when the ingress validated the transaction and published it on `tx_data`. It waits for no receipt and no verdict of the sequencer. The default is `--ack receipt`.
+  - A copy of a recent transaction returns its hash at once, from the duplicate cache. It costs no signature recovery and no second publication. The cache holds the newest 65,536 hashes. The `--duplicate-cache-entries` flag sets the size. The cache is not a correctness rule: the sealer dedups the order.
+  - A nonce below the known nonce of the sender returns `nonce too low: address <a>, tx: <n> state: <m>`. The ingress reads its local account layer, then Redis when `[cache]` is on. These layers only lag the chain, so this error is always true. A sender with no row goes on. `--admission-checks false` turns the check off.
+  - The ingress checks no balance: a balance can grow.
+  - A failed publication returns `txpool is full`. Send the transaction again.
+  - An accepted transaction can still drop later in the sequencer. Read the result with `eth_getTransactionReceipt`, or follow the status feed.
+  - `kardamom_sendRawTransactionAsync` is another name of `eth_sendRawTransaction` in this mode.
+  - `--ack validated` takes no `--verdicts`.
 - `kardamom_sendRawTransactionAsync` validates the transaction and publishes it. It returns the hash at once.
   - Use it to keep many transactions in flight on one connection.
   - A rejection by the sequencer does not reach this call. It reaches the client through the receipt subscription or the status feed.
@@ -50,6 +62,7 @@ receipt fields, the errors and the limits.
   8. Signature: recover the sender.
   9. Known receipt: a resubmission of a transaction with a receipt answers with its hash. A different transaction at a nonce with a receipt is a `Duplicate` error. A skip receipt (`status=false`, `gas_used=0`) uses no nonce, so a different transaction at its nonce goes on. After the activation of `FEATURE_SEALER_V3`, a skip at the chain nonce uses its nonce, and a different transaction at it is a `Duplicate` error.
   10. Balance: if the ingress knows a fresh balance below `gas_limit * max_fee_per_gas + value`, it refuses with `insufficient funds`. For a sender that no cache layer holds, the ingress asks an executor once and keeps the answer for 30 s. Only an answer within `max_stale_txs` of the newest position can refuse. A stale, failed or shed query lets the transaction go on.
+- With `--ack validated`, the duplicate cache runs after step 5, and the nonce check replaces steps 9 and 10.
 - The ingress publishes the transaction with an inclusion deadline: the newest block it has seen plus `--inclusion-horizon-blocks` (default 64).
   - The sealer refuses the transaction after that block. See `past deadline` in [Errors](#errors).
 - Blob (EIP-4844) transactions are not supported.

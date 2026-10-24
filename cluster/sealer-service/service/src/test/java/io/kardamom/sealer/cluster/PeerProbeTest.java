@@ -112,7 +112,18 @@ final class PeerProbeTest {
     void parsesTheStatusJsonOfThisRelease() {
         final MemberStatus sample = status(2, "LEADER", "LEADER_READY", 15_027_008L);
         final Optional<PeerProbe.PeerStatus> parsed = PeerProbe.PeerStatus.parse(sample.toJson(LAG));
-        assertEquals(Optional.of(new PeerProbe.PeerStatus(2, "LEADER", "LEADER_READY", 15_027_008L)), parsed);
+        assertEquals(Optional.of(new PeerProbe.PeerStatus(2, "LEADER", "LEADER_READY", 15_027_008L, -1L)), parsed);
         assertTrue(PeerProbe.PeerStatus.parse("{\"error\":\"x\"}").isEmpty());
+    }
+
+    /** The start hold of a peer reads the leadership term of the member's service. */
+    @Test
+    void parsesTheLeadershipTermOfTheService() {
+        final MemberStatus sample = status(1, "FOLLOWER", "CLOSED", 9L).withStart(7L, true);
+        assertEquals(7L, PeerProbe.PeerStatus.parse(sample.toJson(LAG)).orElseThrow().leadershipTermId());
+        final String older = "{\"memberId\":1,\"role\":\"FOLLOWER\",\"election\":\"CLOSED\",\"commitPosition\":9}";
+        assertEquals(PeerProbe.PeerStatus.TERM_NOT_STATED,
+            PeerProbe.PeerStatus.parse(older).orElseThrow().leadershipTermId(),
+            "a peer of an older release states no term");
     }
 }

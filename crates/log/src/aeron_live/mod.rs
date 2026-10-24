@@ -58,6 +58,8 @@
 //!   dynamic MDC publication on port 0.
 //! - `pending`: the parked-publish retry scheduler (`drain_pending`) and
 //!   its unit tests.
+//! - `meter`: the pipeline metrics of the Aeron thread: its loop time,
+//!   its two queues, and the refused offers.
 //! - `idle`: the idle wait of a hot-path poll loop ([`IdleCap`],
 //!   [`IdleBackoff`]).
 //! - `handles`: the typed per-channel publisher/subscriber handle pairs.
@@ -71,6 +73,7 @@ mod destination;
 mod handles;
 mod idle;
 mod image_log;
+mod meter;
 mod pending;
 mod runtime;
 mod table_pub;
@@ -81,15 +84,16 @@ pub use handles::simple::{
     ExecTxsPublisherHandle, ExecTxsSubscriberHandle, FsyncWatermarkPublisherHandle,
     FsyncWatermarkSubscriberHandle, L1BlocksPublisherHandle, L1BlocksSubscriberHandle,
     ServiceEventsPublisherHandle, ServiceEventsSubscriberHandle, TxDepositsPublisherHandle,
-    TxDepositsSubscriberHandle, TxErrorsPublisherHandle, TxErrorsSubscriberHandle,
-    TxRemoteEpochsPublisherHandle, TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle,
-    TxStatusSubscriberHandle,
+    TxDepositsSubscriberHandle, TxDropsPublisherHandle, TxDropsSubscriberHandle,
+    TxErrorsPublisherHandle, TxErrorsSubscriberHandle, TxRemoteEpochsPublisherHandle,
+    TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle, TxStatusSubscriberHandle,
 };
 pub use handles::tx_data::{TxDataPublisherHandle, TxDataSubscriberHandle};
 pub use handles::tx_receipts::{
     ReceiptFrame, TxReceiptsBoundarySubscriberHandle, TxReceiptsPublisherHandle,
     TxReceiptsReceiver, TxReceiptsSubscriberHandle,
 };
+pub use handles::tx_verdicts::TxVerdictsPublisherHandle;
 pub use idle::{IdleBackoff, IdleCap};
 pub use pending::BEST_EFFORT_DROPPED_TOTAL;
 pub use runtime::{

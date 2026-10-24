@@ -11,11 +11,12 @@ import java.util.concurrent.Executors;
 import java.util.function.Supplier;
 
 /**
- * The member's admin endpoint: a small HTTP server that reports the
- * {@link MemberStatus}.
+ * The admin endpoint of a node: a small HTTP server that reports the
+ * {@link MemberStatus} of a member, or the {@link BackupStatus} of a
+ * backup node.
  *
  * <p>{@code GET /status} answers 200 with the status JSON. {@code GET /ready}
- * answers 200 when the member is ready and 503 when it is not, with the same
+ * answers 200 when the node is ready and 503 when it is not, with the same
  * JSON, so a service check reads the verdict from the status code and an
  * operator reads the reason from the body. {@code GET /metrics} answers the
  * gauges in the Prometheus text format.</p>
@@ -30,26 +31,34 @@ final class AdminServer implements AutoCloseable {
     private static final int NOT_FOUND = 404;
     private static final int UNAVAILABLE = 503;
 
+    /**
+     * One sample of a node, as the endpoint answers it.
+     *
+     * @param ready   the verdict of {@code /ready}
+     * @param json    the body of {@code /status} and {@code /ready}
+     * @param metrics the body of {@code /metrics}, in the Prometheus text format
+     */
+    record Report(boolean ready, String json, String metrics) {
+    }
+
     private final HttpServer server;
-    private final Supplier<MemberStatus> status;
-    private final long lagBytes;
+    private final Supplier<Report> reports;
     /** The segments of the retained file, or empty when the member keeps the frames on the heap. */
     private final Optional<RetainedEndpoint> retained;
 
     private AdminServer(
             final HttpServer server,
-            final Supplier<MemberStatus> status,
-            final long lagBytes,
+            final Supplier<Report> reports,
             final Optional<RetainedEndpoint> retained) {
         this.server = server;
-        this.status = status;
-        this.lagBytes = lagBytes;
+        this.reports = reports;
         this.retained = retained;
     }
 
     /**
-     * Bind {@code 0.0.0.0:port} (0 picks a free port) and start serving,
-     * with the segments of {@code retained} when it is present.
+     * Bind {@code 0.0.0.0:port} (0 picks a free port) and serve the member
+     * status, with the segments of {@code retained} when it is present. A
+     * member is ready within {@code lagBytes} of the commit position.
      *
      * @throws IOException when the bind fails
      */
@@ -59,8 +68,23 @@ final class AdminServer implements AutoCloseable {
             final long lagBytes,
             final Optional<RetainedEndpoint> retained)
             throws IOException {
+        return serve(port, () -> status.get().report(lagBytes), retained);
+    }
+
+    /**
+     * Bind {@code 0.0.0.0:port} (0 picks a free port) and serve the reports
+     * of {@code reports}, with the segments of {@code retained} when it is
+     * present.
+     *
+     * @throws IOException when the bind fails
+     */
+    static AdminServer serve(
+            final int port,
+            final Supplier<Report> reports,
+            final Optional<RetainedEndpoint> retained)
+            throws IOException {
         final HttpServer http = HttpServer.create(new InetSocketAddress("0.0.0.0", port), 0);
-        final AdminServer admin = new AdminServer(http, status, lagBytes, retained);
+        final AdminServer admin = new AdminServer(http, reports, retained);
         http.createContext("/", admin::handle);
         http.setExecutor(Executors.newSingleThreadExecutor(admin::daemonThread));
         http.start();
@@ -86,12 +110,8 @@ final class AdminServer implements AutoCloseable {
 
     private void handle(final HttpExchange exchange) throws IOException {
         final String path = exchange.getRequestURI().getPath();
-        if ("/status".equals(path)) {
-            respondWithStatus(exchange, false);
-        } else if ("/ready".equals(path)) {
-            respondWithStatus(exchange, true);
-        } else if ("/metrics".equals(path)) {
-            respondWithMetrics(exchange);
+        if ("/status".equals(path) || "/ready".equals(path) || "/metrics".equals(path)) {
+            respondWithReport(exchange, path);
         } else if (retained.isPresent()
                 && (RetainedEndpoint.PATH.equals(path) || path.startsWith(RetainedEndpoint.PATH + "/"))) {
             retained.get().handle(exchange, path);
@@ -100,32 +120,25 @@ final class AdminServer implements AutoCloseable {
         }
     }
 
-    private void respondWithMetrics(final HttpExchange exchange) throws IOException {
-        final MemberStatus sample;
-        try {
-            sample = status.get();
-        } catch (final RuntimeException e) {
-            respond(exchange, UNAVAILABLE, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
-            return;
-        }
-        respond(exchange, OK, "text/plain; version=0.0.4", sample.toMetrics());
-    }
-
     /**
-     * Answer with the status JSON. On {@code /ready} the status code carries
-     * the verdict; on {@code /status} it is always 200.
+     * Answer one sample. {@code /metrics} answers the Prometheus text. The
+     * other paths answer the status JSON: on {@code /ready} the status code
+     * carries the verdict; on {@code /status} it is always 200.
      */
-    private void respondWithStatus(final HttpExchange exchange, final boolean verdictInCode)
-            throws IOException {
-        final MemberStatus sample;
+    private void respondWithReport(final HttpExchange exchange, final String path) throws IOException {
+        final Report report;
         try {
-            sample = status.get();
+            report = reports.get();
         } catch (final RuntimeException e) {
             respond(exchange, UNAVAILABLE, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
             return;
         }
-        final boolean ready = !verdictInCode || sample.isReady(lagBytes);
-        respond(exchange, ready ? OK : UNAVAILABLE, sample.toJson(lagBytes));
+        if ("/metrics".equals(path)) {
+            respond(exchange, OK, "text/plain; version=0.0.4", report.metrics());
+            return;
+        }
+        final boolean ready = "/status".equals(path) || report.ready();
+        respond(exchange, ready ? OK : UNAVAILABLE, report.json());
     }
 
     private static void respond(final HttpExchange exchange, final int code, final String body)

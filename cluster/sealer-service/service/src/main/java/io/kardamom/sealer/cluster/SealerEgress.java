@@ -7,6 +7,7 @@ import io.kardamom.sealer.Boundary;
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.ClusterStatus;
 import io.kardamom.sealer.Relayed;
+import io.kardamom.sealer.VersionSwitch;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.EnumMap;
@@ -67,20 +68,34 @@ final class SealerEgress {
      * This is deterministic across members, since it is derived from the
      * replicated log.
      *
-     * <p>The window of {@link #retentionCap} frames is a minimum, not a
-     * maximum: a frame past the window is evicted only when its block is
-     * posted to L1 ({@link #postedHead}). Nothing a batcher has not
-     * confirmed on L1 is dropped, so the batcher can always replay from
-     * its cursor. The DA-lag guard bounds the growth: the sealer refuses
-     * user records at {@code daLagBudgetBlocks} past the posted head, so
-     * the stretched window holds at most the budget's blocks plus one
-     * flush, in heap.</p>
+     * <p>The eviction rule follows the decision version of the state
+     * ({@link #setDecisionVersion}):</p>
+     * <ul>
+     *   <li>Below version 5, or on a member that keeps its frames on the
+     *       heap, the window of {@link #retentionCap} frames is a minimum,
+     *       not a maximum: a frame past the window is evicted
+     *       only when its block is posted to L1 ({@link #postedHead}).
+     *       Nothing a batcher has not confirmed on L1 is dropped, so the
+     *       batcher can always replay from its cursor. The DA-lag guard
+     *       bounds the growth: the sealer refuses user records at
+     *       {@code daLagBudgetBlocks} past the posted head, so the
+     *       stretched window holds at most the budget's blocks plus one
+     *       flush.</li>
+     *   <li>Under version 5 on a member that carries the bytes
+     *       ({@link RetainedFrames#carriesBytes}), the window is the whole
+     *       rule: a frame past the window is evicted at once, at any posted
+     *       head. So the
+     *       retained frames have a fixed bound at any DA lag. A reader
+     *       below the window gets REPLAY_UNAVAILABLE and recovers from
+     *       another source. The DA-lag guard still refuses user records,
+     *       but it holds no frame.</li>
+     * </ul>
      *
-     * <p>The frames above the posted head ride the snapshot
-     * ({@link #writeSnapshot}), so a member restored from a snapshot keeps
-     * the floor at the posted head instead of raising it to the restore
-     * point. In a {@link RetainedFile}, the snapshot carries the index, and
-     * the frames stay in the file.</p>
+     * <p>The retained frames ride the snapshot ({@link #writeSnapshot}), so
+     * a member restored from a snapshot keeps the floor of the snapshot
+     * instead of raising it to the restore point. In a
+     * {@link RetainedFile}, the snapshot carries the index, and the frames
+     * stay in the file.</p>
      */
     private final RetainedFrames retained;
     private final int retentionCap =
@@ -93,6 +108,14 @@ final class SealerEgress {
      * machine. A frame of a block at or below it may leave the window.
      */
     private long postedHead;
+    /**
+     * Whether a frame past the window leaves at once, at any posted head:
+     * decision version 5 on a member that carries the bytes. Without the
+     * bytes, no member feed runs: the executors and the batcher read
+     * references, which the egress cannot serve, so the posted rule stays. The state sets the version at a block boundary,
+     * and the service echoes it here at the end of that log entry.
+     */
+    private boolean windowOnly;
 
     // Staging buffer for egress framing. Reuse it to avoid a per-message
     // allocation on the single cluster service thread.
@@ -101,6 +124,8 @@ final class SealerEgress {
     private final EgressFrames frames = new EgressFrames(egressBuffer);
     /** The member feed: it carries each retained frame to the paired executor. */
     private final Feed feed;
+    /** The pipeline metrics of the service thread. */
+    private final SealerMetrics metrics;
 
     SealerEgress(
             final Cluster cluster,
@@ -108,13 +133,16 @@ final class SealerEgress {
             final RetainedFrames retained,
             final Feed feed,
             final long firstRetainedIndex,
-            final long firstRetainedBlock) {
+            final long firstRetainedBlock,
+            final StartHold hold,
+            final SealerMetrics metrics) {
         this.cluster = cluster;
         this.memberId = memberId;
         this.retained = retained;
         this.feed = feed;
+        this.metrics = metrics;
         this.backlogs = new SessionBacklogs(
-            memberId, SessionBacklogs.STALL_DEADLINE_NS, SessionBacklogs.BYTE_LIMIT);
+            memberId, SessionBacklogs.STALL_DEADLINE_NS, SessionBacklogs.BYTE_LIMIT, hold, metrics);
         this.firstRetainedIndex = firstRetainedIndex;
         this.firstRetainedBlock = firstRetainedBlock;
     }
@@ -126,13 +154,25 @@ final class SealerEgress {
     }
 
     /**
-     * Adopt the posted head as the retention floor, and evict what the
-     * window no longer needs: frames past the window whose block is now
+     * Adopt the posted head, and evict what the window no longer needs:
+     * below version 5, the frames past the window whose block is now
      * posted. Log-driven, so every member evicts the same frames at the
      * same point of the log.
      */
     void setPostedHead(final long postedHead) {
         this.postedHead = postedHead;
+        prune();
+    }
+
+    /**
+     * Adopt the eviction rule of decision version {@code version}, and
+     * evict what the rule no longer keeps. The service calls it at the
+     * start and at the end of each log entry that switched the version. So
+     * every member, from the log or from a snapshot, evicts the same frames
+     * at the same point of the log.
+     */
+    void setDecisionVersion(final int version) {
+        windowOnly = version == VersionSwitch.CARRY_VERSION && retained.carriesBytes();
         prune();
     }
 
@@ -414,8 +454,7 @@ final class SealerEgress {
     /**
      * Retain the frame staged in {@link #egressBuffer} for future replays,
      * hand it to the member feed, and return its length. The window is
-     * pruned after the add: a frame leaves only when it is past the window
-     * and its block is posted.
+     * pruned after the add ({@link #prune}).
      */
     private int retain(final int length) {
         retained.append(egressBuffer, length);
@@ -424,9 +463,12 @@ final class SealerEgress {
         return length;
     }
 
-    /** Evict from the front while the window is over its cap and the oldest frame is posted. */
+    /**
+     * Evict from the front while the window is over its cap and the oldest
+     * frame may leave: at once with {@link #windowOnly}, else when it is posted.
+     */
     private void prune() {
-        while (retained.count() > retentionCap && oldestIsPosted()) {
+        while (retained.count() > retentionCap && (windowOnly || oldestIsPosted())) {
             evictFront();
         }
     }
@@ -594,6 +636,17 @@ final class SealerEgress {
     }
 
     /**
+     * Relay the full reference that {@code offer} views as the canonical
+     * entry of record {@code index}. The record path of decision version 5
+     * allocates nothing here: the id and the envelope go from the log
+     * buffer to the staging buffer, then to the retained ring and to each
+     * session.
+     */
+    void offerCarried(final long index, final TxRefOffer offer) {
+        offerToConsumers(retained.forSession(egressBuffer, retain(frames.carried(index, offer))));
+    }
+
+    /**
      * Offer {@code frame} to every session that announced itself as a
      * canonical-stream consumer: the executors, the validator, and ingress
      * observers. This excludes the publisher-only sequencer sessions, which
@@ -609,9 +662,11 @@ final class SealerEgress {
      * their own sessions.</p>
      */
     private void offerToConsumers(final int length) {
+        final long startedNs = metrics.egressOfferStart();
         for (final ClientSession session : targets()) {
             backlogs.offer(session, egressBuffer, length);
         }
+        metrics.egressOfferDone(startedNs);
     }
 
     /** The sessions of {@link #offerToConsumers}, built again after a session change. */

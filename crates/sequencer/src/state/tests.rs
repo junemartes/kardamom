@@ -185,7 +185,11 @@ fn advance_floor_drops_proven_and_advances() {
     }
     let (from, dropped) = st.advance_floor(s(1), 5).expect("floor must advance");
     assert_eq!(from, 0);
-    assert_eq!(dropped, 2, "3 and 4 are receipt-proven duplicates");
+    assert_eq!(
+        dropped,
+        vec![(3, 3), (4, 4)],
+        "3 and 4 are receipt-proven duplicates"
+    );
     assert_eq!(st.next_nonce(s(1)), 5);
     // The stuck run unsticks. 5,6 drain as a contiguous run from the floor.
     let drained: Vec<u64> = st.drain_pending().iter().map(|(_, n, _)| *n).collect();
@@ -346,7 +350,7 @@ fn an_entry_at_the_expected_nonce_never_expires() {
     let mut st: PartitionState<u32> = PartitionState::new(4, TTL);
     let t0 = Instant::now();
     st.process_at(t0, s(1), 5, 55);
-    assert_eq!(st.advance_floor(s(1), 5), Some((0, 0)));
+    assert_eq!(st.advance_floor(s(1), 5), Some((0, vec![])));
     assert!(st.sweep_expired(t0 + TTL, 256).is_empty());
     assert_eq!(st.drain_pending(), vec![(s(1), 5, 55)]);
 }
@@ -372,7 +376,7 @@ fn a_floor_dropped_entry_leaves_only_a_stale_deadline() {
     let mut st: PartitionState<u32> = PartitionState::new(4, TTL);
     let t0 = Instant::now();
     st.process_at(t0, s(1), 5, 55);
-    assert_eq!(st.advance_floor(s(1), 8), Some((0, 1)));
+    assert_eq!(st.advance_floor(s(1), 8), Some((0, vec![(5, 55)])));
     assert!(st.sweep_expired(t0 + TTL, 256).is_empty());
 }
 

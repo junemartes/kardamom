@@ -393,7 +393,8 @@ class Deploys(unittest.TestCase):
         self.git('commit', '-q', '--allow-empty', '-m', message)
         return self.git('rev-parse', 'HEAD')
 
-    def run_deploy(self, extra=None, check=False, success=True, playbook="deploy.yml", environ=None):
+    def run_deploy(self, extra=None, check=False, success=True, playbook="deploy.yml", environ=None,
+                   inventory='localhost,'):
         variables = {
             'workloads_nomad_addr': f'http://127.0.0.1:{self.api.server_port}',
             'workloads_manifest': str(self.manifest),
@@ -423,7 +424,7 @@ class Deploys(unittest.TestCase):
         env.pop('AERON_STALL_TOLERANCE_MS', None)
         env.pop('KARDAMOM_IDLE_CAP_US', None)
         env.update(environ or {})
-        cmd = ['ansible-playbook', '-i', 'localhost,', str(ANSIBLE / playbook),
+        cmd = ['ansible-playbook', '-i', inventory, str(ANSIBLE / playbook),
                '-e', json.dumps(variables)] + (['--check'] if check else [])
         result = subprocess.run(cmd, cwd=ANSIBLE.parent, env=env, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
@@ -638,6 +639,24 @@ class DeployTest(Deploys):
         self.run_deploy({'workloads_require_signed': True, 'workloads_cosign_binary': '/usr/bin/false'}, success=False)
         self.assertEqual(self.api.state['writes'], [])
 
+    def test_the_backup_sealer_runs_only_with_a_backup_node(self):
+        # Without a node of role backup, the deploy registers no backup job.
+        self.deploy()
+        self.assertNotIn('cluster-backup', self.api.state['plans'])
+        # With one, it registers the job on the sealer image, as a backup.
+        inventory = Path(self.tmp.name) / 'backup-hosts.ini'
+        inventory.write_text('localhost ansible_connection=local\n[backup]\nbackup-0 ansible_connection=local\n')
+        self.run_deploy({'workloads_backup_file_sync_level': '1'}, inventory=str(inventory))
+        plans = self.api.state['plans']
+        self.assertIn('cluster-backup', plans)
+        task = plans['cluster-backup']['TaskGroups'][0]['Tasks'][0]
+        self.assertEqual(task['Config']['image'], plans['cluster']['TaskGroups'][0]['Tasks'][0]['Config']['image'])
+        options = task['Env']['JAVA_TOOL_OPTIONS'].split()
+        self.assertIn('-Dkardamom.cluster.backup=true', options)
+        self.assertIn('-Dkardamom.backup.fileSyncLevel=1', options)
+        self.assertIn('-Dkardamom.backup.sourceType=FOLLOWER', options)
+        self.assertEqual(plans['cluster-backup']['Constraints'][0]['RTarget'], 'backup')
+
     def test_optional_light_client_and_cluster_overrides(self):
         self.run_deploy({
             'workloads_light_execution_rpc': f'https://execution.example/{SENTINEL}',
@@ -648,7 +667,10 @@ class DeployTest(Deploys):
             'workloads_cluster_retention': '8192',
             'workloads_cluster_snapshot_s': '60',
             'workloads_cluster_log_purge_keep': '5',
-            'workloads_cluster_file_sync_level': '2',
+            'workloads_cluster_file_sync_level': '1',
+            'workloads_cluster_heap_mb': '2560',
+            'workloads_prometheus_retention_time': '7d',
+            'workloads_prometheus_retention_size': '40GB',
             'workloads_archive_file_sync_level': '0',
             'workloads_remote_origins': '412399',
             'workloads_priority_fees': 'on',
@@ -675,7 +697,15 @@ class DeployTest(Deploys):
         self.assertNotIn('--beacon-api', follower)
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertIn('8192', json.dumps(plans['cluster']))
-        self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))
+        self.assertIn('-Dkardamom.cluster.fileSyncLevel=1', json.dumps(plans['cluster']))
+        # The heap reaches the image entrypoint, and the job memory follows it.
+        cluster_task = plans['cluster']['TaskGroups'][0]['Tasks'][0]
+        self.assertEqual(cluster_task['Env']['KARDAMOM_CLUSTER_HEAP_MB'], '2560')
+        self.assertEqual(cluster_task['Resources']['MemoryMB'], 3200)
+        prometheus = next(t for t in plans['monitoring']['TaskGroups'][0]['Tasks'] if t['Name'] == 'prometheus')
+        self.assertIn('--storage.tsdb.retention.time=7d', prometheus['Config']['args'])
+        self.assertIn('--storage.tsdb.retention.size=40GB', prometheus['Config']['args'])
+        self.assertTrue(plans['monitoring']['TaskGroups'][0]['EphemeralDisk']['Sticky'])
         self.assertIn('-Dkardamom.cluster.logPurgeKeepSnapshots=5', json.dumps(plans['cluster']))
         self.assertIn('-Daeron.archive.file.sync.level=0', json.dumps(plans['aeron']))
         self.assertIn('-Daeron.archive.catalog.file.sync.level=0', json.dumps(plans['aeron']))
@@ -865,10 +895,12 @@ class DeployTest(Deploys):
                 else:
                     self.assertEqual(result.stdout, f'started {root}/local/sentinel.conf\n')
 
-    def test_priority_fees_default_off_on_every_role(self):
+    def test_the_default_plans_turn_priority_fees_off_and_skip_the_append_sync(self):
         self.run_deploy(check=True)
         plans = self.api.state['plans']
         self.assertIn('-Dkardamom.cluster.orderingWindow=0', json.dumps(plans['cluster']))
+        # A sealer commit waits for no disk sync; the kernel writes the log back.
+        self.assertIn('-Dkardamom.cluster.fileSyncLevel=0', json.dumps(plans['cluster']))
         self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'false')
         for name in ('executor', 'validator'):
             self.assertNotIn('base_fee_initial', self.genesis_template(plans[name]), name)
@@ -877,12 +909,106 @@ class DeployTest(Deploys):
             template = self.genesis_template(plans[name]).encode()
             self.assertEqual(hashlib.sha256(template).hexdigest(), STAGING_GENESIS_SHA256, name)
 
+    def test_the_driver_threading_modes_default_shared_and_reach_the_drivers(self):
+        for mode in ('', 'DEDICATED'):
+            with self.subTest(mode=mode):
+                self.run_deploy({'workloads_aeron_threading_mode': mode,
+                                 'workloads_cluster_driver_threading_mode': mode}, check=True)
+                plans = self.api.state['plans']
+                expected = mode or 'SHARED'
+                aeron = plans['aeron']['TaskGroups'][0]['Tasks'][0]['Env']
+                self.assertEqual(aeron['AERON_THREADING_MODE'], expected)
+                cluster = plans['cluster']['TaskGroups'][0]['Tasks'][0]['Env']['JAVA_TOOL_OPTIONS'].split()
+                self.assertIn(f'-Dkardamom.cluster.driverThreadingMode={expected}', cluster)
+
     def test_the_exec_cursor_switch_defaults_off_and_reaches_the_executor(self):
         for switch, expected in (('', 'false'), ('on', 'true')):
             with self.subTest(switch=switch):
                 self.run_deploy({'workloads_exec_cursor': switch}, check=True)
                 env = self.api.state['plans']['executor']['TaskGroups'][0]['Tasks'][0]['Env']
                 self.assertEqual(env['KARDAMOM_EXEC_CURSOR'], expected)
+
+    # Every egress switch on: the egress job and each reader's flag.
+    EGRESS_ON = {'workloads_egress': True, 'workloads_exec_frames': 'on', 'workloads_validator_egress': 'on',
+                 'workloads_batcher_egress': 'on', 'workloads_sequencer_receipts_from_egress': 'on',
+                 'workloads_ingress_receipts_from_egress': 'on', 'workloads_notifier_receipts_from_egress': 'on'}
+    EGRESS_URL = 'http://kardamom-egress.service.dc1.consul:8548'
+
+    @staticmethod
+    def job_args(job):
+        """The arguments of every task of `job`, in one list."""
+        return [a for g in job['TaskGroups'] for t in g['Tasks'] for a in t['Config'].get('args') or []]
+
+    @staticmethod
+    def job_templates(job):
+        """The embedded templates of every task of `job`, in one text."""
+        return '\n'.join(t['EmbeddedTmpl'] for g in job['TaskGroups'] for task in g['Tasks']
+                         for t in task.get('Templates') or [])
+
+    def test_the_egress_switches_default_off(self):
+        """With every switch off, no egress job and no reader flag."""
+        self.run_deploy(check=True)
+        plans = self.api.state['plans']
+        self.assertNotIn('egress', plans)
+        flags = {'--exec-frames', '--egress', '--receipt-query-endpoints', '--receipts-from-egress'}
+        for name in ('executor', 'validator', 'batcher', 'ingress', 'notifier'):
+            self.assertEqual(flags & set(self.job_args(plans[name])), set(), name)
+        self.assertNotIn('receipts_from_egress', self.job_templates(plans['sequencer']))
+        self.assertNotIn('service "kardamom-egress-metrics|any"', self.job_templates(plans['monitoring']))
+
+    def test_the_egress_switches_deploy_the_egress_and_reach_each_reader(self):
+        self.manifest.write_text(self.manifest.read_text()
+                                 + f'egress registry.example:5000/kardamom-egress:test@sha256:{"a" * 64}\n')
+        self.run_deploy(self.EGRESS_ON, check=True)
+        plans = self.api.state['plans']
+        # After the executors that it reads, before the readers after it.
+        order = list(plans)
+        self.assertLess(order.index('executor'), order.index('egress'))
+        for reader in ('notifier', 'validator', 'batcher'):
+            self.assertLess(order.index('egress'), order.index(reader), reader)
+        egress = plans['egress']
+        self.assertTrue(egress['TaskGroups'][0]['Tasks'][0]['Config']['image'].endswith('@sha256:' + 'a' * 64))
+        self.assertEqual(egress['TaskGroups'][0]['Count'], 2)
+        egress_args = self.job_args(egress)
+        self.assertEqual(egress_args[egress_args.index('--peers') + 1],
+                         ','.join(f'http://executor-{i}.node.dc1.consul:8548' for i in range(3)))
+        services = {s['Name']: s for t in egress['TaskGroups'][0]['Tasks'] for s in t['Services']}
+        self.assertEqual(services['kardamom-egress']['Checks'][0]['Path'], '/health')
+        self.assertEqual(services['kardamom-egress-metrics']['Tags'], ['metrics'])
+        self.assertIn('--exec-frames', self.job_args(plans['executor']))
+        for name, flag in (('validator', '--egress'), ('batcher', '--egress'),
+                           ('ingress', '--receipt-query-endpoints')):
+            args = self.job_args(plans[name])
+            self.assertEqual(args[args.index(flag) + 1], self.EGRESS_URL, name)
+        self.assertIn('--receipts-from-egress', self.job_args(plans['notifier']))
+        self.assertIn('receipts_from_egress = true', self.job_templates(plans['sequencer']))
+        self.assertIn('service "kardamom-egress-metrics|any"', self.job_templates(plans['monitoring']))
+
+    def test_the_egress_switches_refuse_a_reader_before_its_source(self):
+        cases = (
+            ('a reader without the egress', {'workloads_validator_egress': 'on'}),
+            ('the egress without the frames', {'workloads_egress': True}),
+            ('a value that is not on or off', {'workloads_exec_frames': 'yes'}),
+        )
+        for name, switches in cases:
+            with self.subTest(name):
+                output = self.run_deploy(switches, check=True, success=False)
+                self.assertIn('Each egress switch is on, off or empty', output)
+                self.assertNotIn('plans', self.api.state)
+
+    def test_the_checkpoint_log_switch_defaults_off_and_reaches_the_executor(self):
+        for switch, expected in (('', 'false'), ('on', 'true')):
+            with self.subTest(switch=switch):
+                self.run_deploy({'workloads_checkpoint_log': switch}, check=True)
+                env = self.api.state['plans']['executor']['TaskGroups'][0]['Tasks'][0]['Env']
+                self.assertEqual(env['KARDAMOM_CHECKPOINT_LOG'], expected)
+
+    def test_the_ingress_ack_defaults_to_the_receipt_and_reaches_the_ingress(self):
+        for switch, expected in (('', 'receipt'), ('validated', 'validated')):
+            with self.subTest(switch=switch):
+                self.run_deploy({'workloads_ingress_ack': switch}, check=True)
+                args = self.api.state['plans']['ingress']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+                self.assertEqual(args[args.index('--ack') + 1], expected)
 
     def test_every_aeron_party_takes_the_deploy_values(self):
         """Each Aeron deploy value: its environment variable, its default,
@@ -941,6 +1067,13 @@ class DeployTest(Deploys):
         cluster_options = dict(parties)['cluster']['Env']['JAVA_TOOL_OPTIONS'].split()
         self.assertIn(f'-Daeron.archive.message.timeout={tolerance}ms', cluster_options)
         self.assertIn(f'-Daeron.archive.connect.timeout={tolerance // 2}ms', cluster_options)
+        # Each Aeron agent of a sealer counts its work cycles above 5 ms.
+        self.assertIn('-Daeron.driver.sender.cycle.threshold=5ms', cluster_options)
+        self.assertIn('-Daeron.cluster.service.cycle.threshold=5ms', cluster_options)
+        # Each GC pause and safepoint goes to a rotated file with a UTC time
+        # stamp, written asynchronously.
+        self.assertIn('-Xlog:async', cluster_options)
+        self.assertIn('-Xlog:gc,safepoint:file=/opt/kardamom/cluster/jvm-pauses.log:utctime:filecount=5,filesize=20m', cluster_options)
         # A restarted driver waits out the active-driver window of its
         # dead predecessor: Nomad's 15 s default at the 10 s tolerance.
         delay_ns = plans['aeron']['TaskGroups'][0]['RestartPolicy']['Delay']
@@ -1318,6 +1451,16 @@ class RecordTest(Deploys):
         self.assertIn('needs every sealer member to read snapshot version 15', output)
         output = self.upgrade_check(feature='5')
         self.assertIn('The upgrade transaction of feature 5 may go to the Safe', output)
+
+    def test_the_upgrade_check_refuses_feature_four_on_a_member_that_reads_no_version_sixteen(self):
+        self.deploy()
+        output = self.upgrade_check(success=False, feature='4', activation_ms='0')
+        self.assertIn('needs every sealer member to read snapshot version 16', output)
+        for reads_max in (16, 17):
+            self.api.state['reads_max'] = {f'node-cluster-{member}': reads_max for member in range(3)}
+            output = self.upgrade_check(feature='4', activation_ms='0')
+            self.assertIn('3 sealer members read snapshot version 16', output)
+            self.assertIn('The upgrade transaction of feature 4 may go to the Safe', output)
 
     def test_the_upgrade_check_refuses_feature_three_on_a_sequencer_that_sends_no_position(self):
         self.deploy()

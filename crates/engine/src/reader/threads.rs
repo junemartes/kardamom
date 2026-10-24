@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 use std::thread::{self, JoinHandle};
 
+use kardamom_obs::pipeline::{LoopMeter, LoopState};
 use tracing::{debug, info, warn};
 
 use kardamom_cluster_adapter::wire::CanonicalTx;
@@ -14,9 +15,11 @@ use kardamom_types::{
 };
 
 use crate::error::ExecutorError;
+use crate::meter::OutputWait;
 
 use super::Ordered;
-use super::join::{JoinBuffer, JoinOutcome, JoinWait, ReaderConfig, TxDataKey};
+use super::join::{JoinBuffer, JoinContext, JoinOutcome, JoinWait, ReaderConfig, TxDataKey};
+use super::meters::OrderingMeters;
 use super::ports::{
     ExecSink, ExecStreamSink, JoinRecovery, JoinRecoveryFactory, TxDataSubscription,
     TxOrderingSubscription,
@@ -75,10 +78,15 @@ pub enum ReaderToExec {
 
 /// One `tx_data` reader thread's state: its subscription, the shared join
 /// buffer it inserts into, and the sequencer id that keys each insert.
+///
+/// The loop meter charges the wait on the subscription to idle, and the
+/// insert to busy. An insert never waits, so the loop is never blocked.
+/// Every lane adds to the one `executor.tx_data_reader` series.
 pub struct TxDataReader<D> {
     sub: D,
     buffer: JoinBuffer,
     sid: u8,
+    meter: LoopMeter,
 }
 
 impl<D: TxDataSubscription + 'static> TxDataReader<D> {
@@ -86,7 +94,12 @@ impl<D: TxDataSubscription + 'static> TxDataReader<D> {
     /// subscription, so every insert carries the lane it arrived on.
     pub fn new(sub: D, buffer: JoinBuffer) -> Self {
         let sid = sub.sequencer_id();
-        Self { sub, buffer, sid }
+        Self {
+            sub,
+            buffer,
+            sid,
+            meter: LoopMeter::new("executor.tx_data_reader"),
+        }
     }
 
     /// Spawn the reader on its own OS thread. It inserts every
@@ -119,10 +132,13 @@ impl<D: TxDataSubscription + 'static> TxDataReader<D> {
     /// One `tx_data` receive step: insert the envelope into the join
     /// buffer, or report a clean subscription close.
     fn step(&mut self) -> Result<TxDataStep, ExecutorError> {
-        match self.sub.next() {
+        let next = self.sub.next();
+        self.meter.mark(LoopState::Idle);
+        match next {
             Ok((loc, env)) => {
                 self.buffer
                     .insert(TxDataKey::new(self.sid, loc.session_id, loc.position), env);
+                self.meter.mark(LoopState::Busy);
                 Ok(TxDataStep::Inserted)
             }
             Err(ExecutorError::TxDataClosed { .. }) => Ok(TxDataStep::Closed),
@@ -171,6 +187,7 @@ pub struct TxOrderingReader<O, S, E> {
     /// in the backlog. The record's own slot counts when its turn comes.
     dropped: BTreeSet<u64>,
     last_warn_len: usize,
+    meters: OrderingMeters,
 }
 
 /// Everything [`TxOrderingReader::spawn`] needs.
@@ -239,23 +256,41 @@ where
             backlog: ReadAhead::new(),
             dropped: BTreeSet::new(),
             last_warn_len: 0,
+            meters: OrderingMeters::new(),
         }
     }
 
     /// Send one message to the exec sink. `Stop` means the exec thread is
     /// shutting down, not an error.
-    fn send(&self, msg: ReaderToExec) -> Flow {
-        match self.exec_out.send(msg) {
+    fn send(&mut self, msg: ReaderToExec) -> Flow {
+        let full = self.exec_out.is_full();
+        let exec_out = &self.exec_out;
+        match self.meters.meter.output_wait(full, || exec_out.send(msg)) {
             Ok(()) => Flow::Continue,
             Err(_) => Flow::Stop,
         }
+    }
+
+    /// Send the record of one joined entry to the executor stream.
+    fn record(
+        &mut self,
+        position: BPosition,
+        tx_ref: &kardamom_types::TxRef,
+        env: &TxEnvelope,
+    ) -> Result<(), ExecutorError> {
+        let full = self.exec_stream.is_full();
+        let stream = &self.exec_stream;
+        self.meters
+            .meter
+            .output_wait(full, || stream.record(position.as_index(), tx_ref, env))
+            .map_err(|_| Self::stream_closed())
     }
 
     /// Dispatch a marker's expanded items: an epoch's deposits, or a
     /// remote epoch's messages. The record claimed a contiguous slot
     /// range, one slot per item, and the exec thread numbers the items in
     /// this order.
-    fn send_expanded<T>(&self, items: Vec<T>, make: impl Fn(T) -> ReaderToExec) -> Flow {
+    fn send_expanded<T>(&mut self, items: Vec<T>, make: impl Fn(T) -> ReaderToExec) -> Flow {
         let outcome = items
             .into_iter()
             .try_for_each(|item| match self.send(make(item)) {
@@ -310,16 +345,19 @@ where
         tx_ref: kardamom_types::TxRef,
         position: BPosition,
     ) -> Result<Flow, ExecutorError> {
-        let wait = JoinWait::new(&self.buffer, &mut self.recovery, &tx_ref, &self.cfg)?;
-        let env = match wait.run() {
+        let ctx = JoinContext {
+            buffer: &self.buffer,
+            recovery: &mut self.recovery,
+            cfg: &self.cfg,
+            meters: &self.meters.join,
+        };
+        let env = match JoinWait::new(ctx, &tx_ref)?.run() {
             JoinOutcome::Joined(env) => env,
             JoinOutcome::Unjoinable => return self.on_unjoinable(&tx_ref, position),
             JoinOutcome::TimedOut => return Err(self.join_timeout(&tx_ref, false)),
         };
         self.warn_on_buffer_growth();
-        self.exec_stream
-            .record(position.as_index(), &tx_ref, &env)
-            .map_err(|_| Self::stream_closed())?;
+        self.record(position, &tx_ref, &env)?;
         Ok(self.send(ReaderToExec::Tx {
             envelope: env,
             position,
@@ -345,6 +383,7 @@ where
             index: position.as_index(),
             tx_hash: tx_ref.tx_hash,
         };
+        self.meters.void_votes.increment(1);
         let park = VoidPark::new(
             &mut self.sub,
             &mut self.backlog,
@@ -352,7 +391,10 @@ where
             void,
             self.cfg.void_wait,
         );
-        match park.run() {
+        let parked = park.run();
+        // The park waits for the void record: an input wait.
+        self.meters.meter.mark(LoopState::Idle);
+        match parked {
             Ok(ParkOutcome::Voided) => (),
             Ok(ParkOutcome::GaveUp) => return Err(self.join_timeout(tx_ref, true)),
             Err(ExecutorError::TxOrderingClosed) => return Ok(Flow::Stop),
@@ -388,6 +430,7 @@ where
     /// back-pressure issue, or there is a leak.
     fn warn_on_buffer_growth(&mut self) {
         let cur = self.buffer.len();
+        self.meters.buffer.set(cur);
         if cur >= self.cfg.buffer_warn_threshold && cur > self.last_warn_len * 2 {
             warn!(
                 target: "kardamom_executor::reader",
@@ -407,7 +450,7 @@ where
     /// transaction. The deposits travel inside the epoch record. Unlike a
     /// `DepositRef`, there is no side-stream join to wait on; nothing here
     /// can time out or go missing.
-    fn expand_epoch(&self, epoch: EpochRecord) -> Flow {
+    fn expand_epoch(&mut self, epoch: EpochRecord) -> Flow {
         let deposits = epoch.deposits.clone();
         if let Flow::Stop = self.send(ReaderToExec::Epoch(epoch)) {
             return Flow::Stop;
@@ -420,7 +463,7 @@ where
     /// a contiguous slot range, the marker, then one slot per message
     /// (`wire::remote_epoch_slots`). Messages travel inside the record, so
     /// as with epoch deposits there is no side-stream join to wait on.
-    fn expand_remote_epoch(&self, rec: RemoteEpochRecord) -> Flow {
+    fn expand_remote_epoch(&mut self, rec: RemoteEpochRecord) -> Flow {
         let origin_chain_id = rec.origin_chain_id;
         let messages: Vec<XChainMessage> = rec.messages.iter().cloned().collect();
         if let Flow::Stop = self.send(ReaderToExec::RemoteEpoch(Box::new(rec))) {
@@ -449,6 +492,7 @@ where
             Some(read) => Ok(read),
             None => self.sub.next(),
         };
+        self.meters.meter.mark(LoopState::Idle);
         let (position, msg) = match read {
             Ok(p) => p,
             Err(ExecutorError::TxOrderingClosed) => return Ok(Flow::Stop),
@@ -456,10 +500,12 @@ where
         };
         self.first_index.get_or_insert(position.as_index());
         let through = Self::last_slot(position, &msg);
-        match self.dispatch(position, msg)? {
+        let flow = match self.dispatch(position, msg)? {
             Flow::Continue => self.mark(through),
             Flow::Stop => Ok(Flow::Stop),
-        }
+        };
+        self.meters.meter.mark(LoopState::Busy);
+        flow
     }
 
     /// The last canonical slot that `item` at `position` takes. A boundary
@@ -475,9 +521,12 @@ where
 
     /// Send the progress mark of a dispatched message, when it takes a
     /// slot.
-    fn mark(&self, through: Option<u64>) -> Result<Flow, ExecutorError> {
-        through
-            .map_or(Ok(()), |t| self.exec_stream.passed(t))
+    fn mark(&mut self, through: Option<u64>) -> Result<Flow, ExecutorError> {
+        let full = self.exec_stream.is_full();
+        let stream = &self.exec_stream;
+        self.meters
+            .meter
+            .output_wait(full, || through.map_or(Ok(()), |t| stream.passed(t)))
             .map_err(|_| Self::stream_closed())?;
         Ok(Flow::Continue)
     }
@@ -495,9 +544,7 @@ where
     /// the envelope.
     fn on_carried(&mut self, tx: CanonicalTx, position: BPosition) -> Result<Flow, ExecutorError> {
         let tx_ref = tx.tx_ref();
-        self.exec_stream
-            .record(position.as_index(), &tx_ref, &tx.envelope)
-            .map_err(|_| Self::stream_closed())?;
+        self.record(position, &tx_ref, &tx.envelope)?;
         Ok(self.send(ReaderToExec::Tx {
             envelope: tx.envelope,
             position,

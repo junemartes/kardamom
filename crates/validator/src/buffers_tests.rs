@@ -125,6 +125,66 @@ fn receipt_take_skips_aged_out_backlog_immediately() {
     );
 }
 
+// A restart on an idle chain has no live head, so the catch-up skip
+// never fires. After one take waits its whole timeout with no insert,
+// the buffer is quiet, and a take for a missing key returns at once.
+#[test]
+fn a_quiet_buffer_does_not_wait_for_a_missing_key() {
+    let buf = ReceiptBuffer::new();
+    let got = buf
+        .receipts
+        .take(BPosition::from_index(0), Duration::from_millis(20));
+    assert!(got.current.is_empty());
+    let start = std::time::Instant::now();
+    let got = buf
+        .receipts
+        .take(BPosition::from_index(1), Duration::from_secs(5));
+    assert!(got.current.is_empty());
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "a quiet take must not wait: {:?}",
+        start.elapsed()
+    );
+}
+
+// An insert ends the quiet: the next take waits again for its key.
+#[test]
+fn an_insert_ends_the_quiet() {
+    let bals = BalBuffer::new();
+    assert!(bals.take(1, Duration::from_millis(20)).current.is_empty());
+    insert(&bals, R1, 2, 100);
+    let bals2 = bals.clone();
+    let h = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        insert(&bals2, R1, 3, 100);
+    });
+    let got = bals.take(3, Duration::from_secs(2));
+    assert_eq!(got.current.len(), 1, "the take must wait after an insert");
+    h.join().unwrap();
+}
+
+// A take that times out while inserts of other keys come does not turn
+// the buffer quiet: the producer is live, and the next key can come.
+#[test]
+fn a_timeout_with_inserts_keeps_the_wait() {
+    let bals = BalBuffer::new();
+    let bals2 = bals.clone();
+    let h = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(5));
+        insert(&bals2, R1, 2, 100);
+        std::thread::sleep(Duration::from_millis(40));
+        insert(&bals2, R1, 3, 100);
+    });
+    assert!(bals.take(1, Duration::from_millis(20)).current.is_empty());
+    let got = bals.take(3, Duration::from_secs(2));
+    assert_eq!(
+        got.current.len(),
+        1,
+        "the take must wait while inserts come"
+    );
+    h.join().unwrap();
+}
+
 // One wrong key far ahead is not a live head. It does not turn the
 // catch-up skip on, so the consumer still waits for its own key.
 #[test]

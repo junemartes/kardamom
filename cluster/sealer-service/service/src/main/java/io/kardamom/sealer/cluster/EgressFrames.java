@@ -45,6 +45,15 @@ final class EgressFrames {
         return pos + length;
     }
 
+    /**
+     * The relayed canonical entry of a full reference: its payload is
+     * {@code [canonical_id:32][record_type:6][lane:u8][envelope]}, copied in
+     * two parts from the bytes that {@code offer} views.
+     */
+    int carried(final long index, final TxRefOffer offer) {
+        return offer.writeCanonical(buf, relayedHeader(index, offer.canonicalLength()));
+    }
+
     /** {@code [kind:1][index:u64][payload_len:u32]}; returns the offset of the payload. */
     private int relayedHeader(final long index, final int payloadLength) {
         buf.putByte(0, SealerWire.EGRESS_KIND_RELAYED);
@@ -129,6 +138,25 @@ final class EgressFrames {
         buf.putByte(Byte.BYTES, (byte) decisionVersion);
         buf.putLong(Byte.BYTES + Byte.BYTES, sessionId, ByteOrder.LITTLE_ENDIAN);
         return SealerWire.SEALER_INFO_LEN;
+    }
+
+    /**
+     * The refusal of a transaction reference:
+     * {@code [kind:18][canonical_id:32][sender:20][nonce:u64][decision_version:u8]}.
+     */
+    int refRefused(final byte[] canonicalId, final byte[] sender20, final long nonce, final int decisionVersion) {
+        int pos = 0;
+        buf.putByte(pos, SealerWire.EGRESS_KIND_REF_REFUSED);
+        pos += Byte.BYTES;
+        buf.putBytes(pos, canonicalId, 0, CanonicalSealerState.CANONICAL_ID_LEN);
+        pos += CanonicalSealerState.CANONICAL_ID_LEN;
+        buf.putBytes(pos, sender20, 0, CanonicalSealerState.SENDER_LEN);
+        pos += CanonicalSealerState.SENDER_LEN;
+        buf.putLong(pos, nonce, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putByte(pos, (byte) decisionVersion);
+        pos += Byte.BYTES;
+        return pos;
     }
 
     /**

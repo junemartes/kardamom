@@ -126,6 +126,19 @@ struct Args {
     /// check of the follower, and the readiness mark.
     #[arg(long, default_value = "12")]
     poll_interval_secs: NonZeroU64,
+    /// The pause between two epochs of one L1 finality step, in
+    /// milliseconds. A finality step brings up to 32 epochs at once, and
+    /// each one seals its own L2 block; the pace spreads that burst of
+    /// blocks. 0 publishes at once. A catch-up backlog is not paced. The
+    /// default of 2 s is longer than a block commit (50-250 ms on staging),
+    /// so each block commits before the next one comes. Keep the pace below
+    /// the 4 s gather window of the validator's epoch check.
+    #[arg(
+        long,
+        env = "KARDAMOM_DA_WATCHER_EPOCH_PACE_MS",
+        default_value = "2000"
+    )]
+    epoch_pace_ms: u64,
     /// Peer Kardamom chain to source cross-chain messages from. Enables the
     /// interop path. It requires `--interop-feed-url` and `--self-chain-id`.
     /// Chain id 0 is not valid.
@@ -294,6 +307,7 @@ impl Args {
                 tick: Duration::from_secs(self.poll_interval_secs.get()),
                 silence: Duration::from_secs(self.l1_silence_secs.get()),
                 resume_after: self.l1_resume_after,
+                epoch_pace: Duration::from_millis(self.epoch_pace_ms),
             },
             cursor_file,
             sealer,

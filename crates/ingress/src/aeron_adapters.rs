@@ -17,13 +17,14 @@ use kardamom_cache::{LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
 use kardamom_log::aeron_live::{
     AeronRuntime, FsyncWatermarkSubscriberHandle, ReceiptFrame, ServiceEventsSubscriberHandle,
     TxDataPublisherHandle, TxErrorsSubscriberHandle, TxReceiptsBoundarySubscriberHandle,
-    TxReceiptsReceiver,
+    TxReceiptsReceiver, TxStatusSubscriberHandle,
 };
 use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::events::BoardView;
+use kardamom_obs::pipeline::{Batch, LoopMeter, LoopState};
 use kardamom_types::{
     BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, Receipt,
-    ReceiptBatch, ReceiptRollback, TxEnvelope, TxError,
+    ReceiptBatch, ReceiptRollback, TxEnvelope, TxError, TxStatus,
 };
 
 use crate::channels::{BUS_CAPACITY, IngressPublication, IngressSubscription, ReceiptItem};
@@ -79,17 +80,15 @@ impl IngressPublication for LiveIngressPublication {
         let pub_handle = self
             .tx_data
             .get(shard)
-            .ok_or_else(|| IngressError::Internal(format!("shard {shard} out of range")))?
-            .clone();
+            .ok_or_else(|| IngressError::Internal(format!("shard {shard} out of range")))?;
         // The stamp comes before the publish, so the egress tap and the
         // receipt pump always have it when the seal and the receipt arrive.
         self.stamps.stamp(envelope.tx_hash);
-        // The Aeron publish blocks through the runtime's command channel.
-        // This runs it off the reactor thread, so it does not stall the
-        // JSON-RPC server.
-        tokio::task::spawn_blocking(move || pub_handle.publish(&envelope))
+        // The task awaits the ack of the Aeron thread, so no thread blocks
+        // and the publish costs no hop to the blocking pool.
+        pub_handle
+            .publish_async(&envelope)
             .await
-            .map_err(|e| IngressError::internal("publish_tx_data join", e))?
             .map(|_| ())
             .map_err(|e| IngressError::internal("publish_tx_data", e))
     }
@@ -151,7 +150,7 @@ impl<T: Clone + Send + 'static> PumpSource
 }
 
 /// Implements [`PumpSource`] for a subscriber handle whose `recv` returns
-/// `(BPosition, Item)`, dropping the position. The three concrete
+/// `(BPosition, Item)`, dropping the position. The four concrete
 /// subscriber handles below share exactly this shape. The receipts
 /// stream does not: its frame is a batch with account rows, so
 /// [`ReceiptBatchPump`] drains it.
@@ -169,6 +168,7 @@ macro_rules! impl_pump_source {
 impl_pump_source!(FsyncWatermarkSubscriberHandle, FsyncWatermark);
 impl_pump_source!(TxReceiptsBoundarySubscriberHandle, BlockBoundary);
 impl_pump_source!(TxErrorsSubscriberHandle, TxError);
+impl_pump_source!(TxStatusSubscriberHandle, TxStatus);
 
 /// The `tx_receipts` pump: one batch frame in, its account rows into the
 /// local layer, then its receipts onto the bus, one by one, each timed by
@@ -183,6 +183,10 @@ struct ReceiptBatchPump {
     tx: broadcast::Sender<ReceiptItem>,
     log: watch::Sender<RollbackLog>,
     executed: StageClock,
+    /// Idle while the pump waits for a frame, busy while it handles one.
+    meter: LoopMeter,
+    /// The receipts in each batch frame that carries a receipt.
+    receipts: Batch,
 }
 
 impl ReceiptBatchPump {
@@ -197,6 +201,8 @@ impl ReceiptBatchPump {
             tx,
             log,
             executed,
+            meter: LoopMeter::new("ingress.receipt_pump"),
+            receipts: Batch::new("ingress.receipt_batch"),
         }
     }
 
@@ -208,8 +214,16 @@ impl ReceiptBatchPump {
 
     async fn run(mut self, mut rx: TxReceiptsReceiver) {
         while let Some((_, frame)) = rx.recv_frame().await {
-            self.on_frame(frame);
+            self.on_received(frame);
         }
+    }
+
+    /// Handle one frame that the wait received, and meter the wait and
+    /// the handling.
+    fn on_received(&mut self, frame: ReceiptFrame) {
+        self.meter.mark(LoopState::Idle);
+        self.on_frame(frame);
+        self.meter.mark(LoopState::Busy);
     }
 
     /// Put one frame onto the bus. A lagging or absent receiver is the
@@ -248,6 +262,7 @@ impl ReceiptBatchPump {
     /// channel's concern, so this ignores the send result.
     fn on_batch(&mut self, batch: ReceiptBatch) {
         if let Some(end) = batch.end_tx_idx() {
+            self.receipts.record(batch.receipts.len());
             self.writer.apply(end, &batch.accounts);
         }
         batch
@@ -274,6 +289,7 @@ pub struct LiveIngressSubscription {
     local_fsync: broadcast::Sender<FsyncWatermark>,
     block_boundaries: broadcast::Sender<BlockBoundary>,
     tx_errors: broadcast::Sender<TxError>,
+    verdicts: broadcast::Sender<TxStatus>,
     /// The latest cluster status, fed by the binary's egress observer
     /// like the watermark bus.
     cluster_status: watch::Sender<ClusterStatus>,
@@ -285,8 +301,11 @@ pub struct LiveIngressSubscription {
 impl LiveIngressSubscription {
     /// Open the five subscriber handles through `plane`: `tx_errors`,
     /// receipts, boundaries, and `events` follow the plane's transport;
-    /// the fsync watermark still opens on its static channel. The
-    /// receipt pump owns `executed`, the clock of the executed stage.
+    /// the fsync watermark still opens on its static channel. With
+    /// `verdicts`, the ingress reads no receipts: it reads the
+    /// `tx_verdicts` stream of that ingress id, the answer of the
+    /// sequencer to each of its transactions. The receipt pump owns
+    /// `executed`, the clock of the executed stage.
     ///
     /// # Errors
     ///
@@ -298,6 +317,7 @@ impl LiveIngressSubscription {
         recorder_id: u8,
         executor_count: Option<NonZeroU32>,
         live_cfg: &LiveAccountsConfig,
+        verdicts: Option<u8>,
         executed: StageClock,
     ) -> Result<Self, IngressError> {
         let channels = plane.channels().clone();
@@ -308,6 +328,7 @@ impl LiveIngressSubscription {
         let (local_fsync_tx, _) = broadcast::channel::<FsyncWatermark>(BUS_CAPACITY);
         let (block_boundaries_tx, _) = broadcast::channel::<BlockBoundary>(BUS_CAPACITY);
         let (tx_errors_tx, _) = broadcast::channel::<TxError>(BUS_CAPACITY);
+        let (verdicts_tx, _) = broadcast::channel::<TxStatus>(BUS_CAPACITY);
         let (cluster_status_tx, _) = watch::channel(ClusterStatus::default());
 
         let mds = channels.tx_receipts_mds_enabled();
@@ -325,15 +346,33 @@ impl LiveIngressSubscription {
         // aggregates the streams: every executor publisher the plane
         // discovers, or the static channel's members. The batch frame's
         // account rows feed the local layer on the way through.
-        let receipts_sub = plane
-            .tx_receipts_subscriber(rt, executor_count)
-            .map_err(|e| IngressError::internal("open tx_receipts", e))?;
-        // `into_receiver()`: the pump task must not hold an
-        // `AeronRuntime` clone. Holding one would keep the runtime alive
-        // forever; see `TxReceiptsSubscriberHandle::into_receiver`.
+        //
+        // With `verdicts`, the ingress reads no receipts: the receipts go
+        // to the egress, and the verdicts of its own transactions come on
+        // its `tx_verdicts` stream.
         let (rollback_log, rollbacks) = watch::channel(RollbackLog::default());
-        ReceiptBatchPump::new(live_writer, receipts_tx.clone(), rollback_log, executed)
-            .spawn(receipts_sub.into_receiver());
+        match verdicts {
+            None => {
+                let receipts_sub = plane
+                    .tx_receipts_subscriber(rt, executor_count)
+                    .map_err(|e| IngressError::internal("open tx_receipts", e))?;
+                // `into_receiver()`: the pump task must not hold an
+                // `AeronRuntime` clone. Holding one would keep the runtime
+                // alive forever; see `TxReceiptsSubscriberHandle::into_receiver`.
+                ReceiptBatchPump::new(live_writer, receipts_tx.clone(), rollback_log, executed)
+                    .spawn(receipts_sub.into_receiver());
+            }
+            Some(own) => {
+                tracing::info!(
+                    ingress_id = own,
+                    "the ingress reads its verdicts, no receipts"
+                );
+                let verdicts_sub = plane
+                    .tx_verdicts_subscriber(rt, own)
+                    .map_err(|e| IngressError::internal("open tx_verdicts", e))?;
+                Pump::new(verdicts_sub, verdicts_tx.clone()).spawn();
+            }
+        }
 
         // Quorum and durable watermark: in the cluster-only topology,
         // there is no Aeron `quorum_watermark` subscription here. The
@@ -373,6 +412,7 @@ impl LiveIngressSubscription {
             local_fsync: local_fsync_tx,
             block_boundaries: block_boundaries_tx,
             tx_errors: tx_errors_tx,
+            verdicts: verdicts_tx,
             cluster_status: cluster_status_tx,
             service_board,
         })
@@ -414,6 +454,9 @@ impl IngressSubscription for LiveIngressSubscription {
     }
     fn subscribe_tx_errors(&self) -> broadcast::Receiver<TxError> {
         self.tx_errors.subscribe()
+    }
+    fn subscribe_verdicts(&self) -> broadcast::Receiver<TxStatus> {
+        self.verdicts.subscribe()
     }
     fn live_accounts(&self) -> Arc<LiveAccounts> {
         self.live.clone()
@@ -561,6 +604,31 @@ mod tests {
             sub.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    // The receipt batch histogram takes one sample for each batch with a
+    // receipt. A boundary-only batch adds none.
+    #[tokio::test]
+    async fn receipt_pump_records_the_receipts_of_each_batch() {
+        let text = crate::rendered_metrics_tests::Rendered::of(|| {
+            let (_live, writer) = LiveAccounts::new(&LiveAccountsConfig::default());
+            let (bus, _sub) = broadcast::channel::<ReceiptItem>(16);
+            let log = watch::channel(RollbackLog::default()).0;
+            let mut pump = ReceiptBatchPump::new(writer, bus, log, StageClock::pair().1.executed);
+            pump.on_batch(ReceiptBatch {
+                receipts: vec![Receipt::default(), Receipt::default()],
+                accounts: Vec::new(),
+            });
+            pump.on_batch(ReceiptBatch::default());
+        });
+        assert_eq!(
+            text.value(r#"kardamom_batch_items_sum{batch="ingress.receipt_batch"}"#),
+            2.0
+        );
+        assert_eq!(
+            text.value(r#"kardamom_batch_items_count{batch="ingress.receipt_batch"}"#),
+            1.0
+        );
     }
 
     // A shard index past the publication vector must give an Internal

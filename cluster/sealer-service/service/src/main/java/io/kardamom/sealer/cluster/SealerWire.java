@@ -262,6 +262,22 @@ public final class SealerWire {
     static final int TXREF_PAYLOAD_LEN = TXREF_RECORD_LEN - CANONICAL_ID_OFFSET;
 
     /**
+     * Record type of a full reference inside a kind-0 record, on ingress
+     * only: the {@link #TXREF_RECORD_LEN} bytes of a positioned
+     * {@link #RT_TXREF} frame with this record type, then the envelope.
+     * The relayed payload is
+     * {@code [canonical_id:32][record_type:7][lane:u8][term_id:i32][term_offset:i32][session_id:i32][envelope]}.
+     * See {@link TxRefOffer}. Matches Rust {@code RT_TXREF_OFFER}.
+     */
+    public static final byte RT_TXREF_OFFER = 7;
+
+    /**
+     * The length of the root of an archived {@code TxEnvelope}. No envelope
+     * is shorter. Matches Rust {@code ENVELOPE_ROOT_LEN}.
+     */
+    static final int ENVELOPE_ROOT_LEN = 80;
+
+    /**
      * The top byte of the deadline field, {@code 0x40}, when the field
      * carries the stream position of a transaction reference in its ingress
      * image. The position is below 2^56. Version 3 reads the value as a
@@ -456,6 +472,20 @@ public final class SealerWire {
     public static final byte EGRESS_KIND_SEALER_INFO = 17;
     /** Length of an {@link #EGRESS_KIND_SEALER_INFO} frame. */
     static final int SEALER_INFO_LEN = Byte.BYTES + Byte.BYTES + Long.BYTES;
+
+    /**
+     * The refusal of a transaction reference of record type {@link #RT_TXREF}:
+     * {@code [kind:18][canonical_id:32][sender:20][nonce:u64 LE][decision_version:u8]}
+     * ({@link #REF_REFUSED_LEN} bytes). Offered only to the offering
+     * session. The reference is not ordered. The canonical id is the hash of
+     * the transaction, and the decision version is the version of the
+     * service. A reader that does not know the kind drops it.
+     * Matches Rust {@code EGRESS_KIND_REF_REFUSED}.
+     */
+    public static final byte EGRESS_KIND_REF_REFUSED = 18;
+    /** Length of an {@link #EGRESS_KIND_REF_REFUSED} frame. */
+    static final int REF_REFUSED_LEN = Byte.BYTES + CanonicalSealerState.CANONICAL_ID_LEN
+        + CanonicalSealerState.SENDER_LEN + Long.BYTES + Byte.BYTES;
 
     /** The egress header in front of a relayed payload: {@code [kind:1][index:u64][payload_len:u32]}. */
     static final int RELAYED_HEADER_LEN = Byte.BYTES + Long.BYTES + Integer.BYTES;

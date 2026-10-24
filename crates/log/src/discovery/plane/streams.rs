@@ -6,12 +6,14 @@ use std::num::NonZeroU32;
 use super::{StreamKey, StreamPlane};
 use crate::aeron_live::{
     AeronRuntime, TxDataPublisherHandle, TxDataSubscriberHandle, TxDataSubscription,
-    TxReceiptsBoundarySubscriberHandle, TxReceiptsPublisherHandle, TxReceiptsSubscriberHandle,
+    TxDropsPublisherHandle, TxDropsSubscriberHandle, TxReceiptsBoundarySubscriberHandle,
+    TxReceiptsPublisherHandle, TxReceiptsSubscriberHandle, TxStatusSubscriberHandle,
+    TxVerdictsPublisherHandle,
 };
 use crate::aeron_live::{PubHandle, TypedSubscription};
 use crate::discovery::record::Topic;
 use crate::error::LogError;
-use kardamom_types::BalFrame;
+use kardamom_types::{BalFrame, TxDrop, TxStatus};
 
 impl StreamPlane {
     /// The `tx_bal` publisher, as the raw handle the executor's BAL
@@ -47,6 +49,159 @@ impl StreamPlane {
                 self.channels.tx_bal_stream_id,
             ),
             Some(d) => d.open_subscription(rt, key),
+        }
+    }
+
+    /// The `exec_frames` publisher of this executor, as the raw handle that
+    /// its forwarder drives. Discovered: a dynamic MDC publication that
+    /// every egress instance joins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publication fails to open or register.
+    pub async fn exec_frames_publisher(
+        &mut self,
+        rt: &AeronRuntime,
+    ) -> Result<PubHandle, LogError> {
+        let key = self.exec_frames_key();
+        match &mut self.discovered {
+            None => rt.open_publication(
+                &self.channels.exec_frames_channel,
+                self.channels.exec_frames_stream_id,
+            ),
+            Some(d) => d.open_publication(rt, key).await,
+        }
+    }
+
+    /// The `exec_frames` subscription of the egress: the raw frames of
+    /// every executor. Each executor is one image, so a reader tells the
+    /// copies apart by the session id of the frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription fails to open.
+    pub fn exec_frames_subscription(
+        &mut self,
+        rt: &AeronRuntime,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<crate::aeron_live::RawFrame>, LogError> {
+        let key = self.exec_frames_key();
+        match &mut self.discovered {
+            None => Ok(rt
+                .open_subscription_raw(
+                    &self.channels.exec_frames_channel,
+                    self.channels.exec_frames_stream_id,
+                )?
+                .1),
+            Some(d) => d.open_raw_subscription(rt, key),
+        }
+    }
+
+    /// The `egress_order` publisher of this egress instance. Discovered: a
+    /// dynamic MDC publication that every reader of the egress joins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publication fails to open or register.
+    pub async fn egress_order_publisher(
+        &mut self,
+        rt: &AeronRuntime,
+    ) -> Result<PubHandle, LogError> {
+        let key = self.egress_order_key();
+        match &mut self.discovered {
+            None => rt.open_publication(
+                &self.channels.egress_order_channel,
+                self.channels.egress_order_stream_id,
+            ),
+            Some(d) => d.open_publication(rt, key).await,
+        }
+    }
+
+    /// The `egress_order` subscription of a reader of the egress: the
+    /// frames of every egress instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription fails to open.
+    pub fn egress_order_subscription(
+        &mut self,
+        rt: &AeronRuntime,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<crate::aeron_live::RawFrame>, LogError> {
+        let key = self.egress_order_key();
+        match &mut self.discovered {
+            None => Ok(rt
+                .open_subscription_raw(
+                    &self.channels.egress_order_channel,
+                    self.channels.egress_order_stream_id,
+                )?
+                .1),
+            Some(d) => d.open_raw_subscription(rt, key),
+        }
+    }
+
+    /// The `egress_receipts` publisher of this egress instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publication fails to open or register.
+    pub async fn egress_receipts_publisher(
+        &mut self,
+        rt: &AeronRuntime,
+    ) -> Result<PubHandle, LogError> {
+        let key = self.egress_receipts_key();
+        match &mut self.discovered {
+            None => rt.open_publication(
+                &self.channels.egress_receipts_channel,
+                self.channels.egress_receipts_stream_id,
+            ),
+            Some(d) => d.open_publication(rt, key).await,
+        }
+    }
+
+    /// The `egress_receipts` subscription of a reader of the egress, in the
+    /// frame format of `tx_receipts`: the frames of every egress instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription fails to open.
+    pub fn egress_receipts_subscriber(
+        &mut self,
+        rt: &AeronRuntime,
+    ) -> Result<TxReceiptsSubscriberHandle, LogError> {
+        let key = self.egress_receipts_key();
+        let rx = match &mut self.discovered {
+            None => {
+                rt.open_subscription_raw(
+                    &self.channels.egress_receipts_channel,
+                    self.channels.egress_receipts_stream_id,
+                )?
+                .1
+            }
+            Some(d) => d.open_raw_subscription(rt, key)?,
+        };
+        Ok(TxReceiptsSubscriberHandle::from_raw(rx, rt))
+    }
+
+    fn egress_receipts_key(&self) -> StreamKey {
+        StreamKey {
+            topic: Topic::EgressReceipts,
+            stream_id: self.channels.egress_receipts_stream_id,
+            lane: None,
+        }
+    }
+
+    fn egress_order_key(&self) -> StreamKey {
+        StreamKey {
+            topic: Topic::EgressOrder,
+            stream_id: self.channels.egress_order_stream_id,
+            lane: None,
+        }
+    }
+
+    fn exec_frames_key(&self) -> StreamKey {
+        StreamKey {
+            topic: Topic::ExecFrames,
+            stream_id: self.channels.exec_frames_stream_id,
+            lane: None,
         }
     }
 
@@ -126,6 +281,107 @@ impl StreamPlane {
             Some(d) => d
                 .open_subscription(rt, key)
                 .map(|rx| TxReceiptsBoundarySubscriberHandle::from_subscription(rx, rt)),
+        }
+    }
+
+    /// The `tx_verdicts` publisher of the ingress `target`. Discovered: a
+    /// dynamic MDC publication on the stream id of `target`, so only that
+    /// ingress joins it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publication fails to open or register.
+    pub async fn tx_verdicts_publisher(
+        &mut self,
+        rt: &AeronRuntime,
+        target: u8,
+    ) -> Result<TxVerdictsPublisherHandle, LogError> {
+        let key = self.tx_verdicts_key(target);
+        let inner = match &mut self.discovered {
+            None => rt.open_publication(&self.channels.tx_verdicts_channel, key.stream_id)?,
+            Some(d) => d.open_publication(rt, key).await?,
+        };
+        Ok(TxVerdictsPublisherHandle::from_publication(inner))
+    }
+
+    /// The `tx_verdicts` subscriber of the ingress `own`: one status
+    /// record for each of its transactions, accepted or rejected.
+    /// Discovered: one subscription that the reconcile task fills with
+    /// every sequencer that publishes to `own`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription fails to open.
+    pub fn tx_verdicts_subscriber(
+        &mut self,
+        rt: &AeronRuntime,
+        own: u8,
+    ) -> Result<TxStatusSubscriberHandle, LogError> {
+        let key = self.tx_verdicts_key(own);
+        let rx = match &mut self.discovered {
+            None => {
+                rt.open_subscription::<TxStatus>(&self.channels.tx_verdicts_channel, key.stream_id)?
+            }
+            Some(d) => d.open_subscription(rt, key)?,
+        };
+        Ok(TxStatusSubscriberHandle::from_subscription(rx))
+    }
+
+    /// The `tx_drops` publisher of a sequencer of `lane`. Discovered: a
+    /// dynamic MDC publication registered with its lane id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publication fails to open or register.
+    pub async fn tx_drops_publisher(
+        &mut self,
+        rt: &AeronRuntime,
+        lane: u8,
+    ) -> Result<TxDropsPublisherHandle, LogError> {
+        let key = self.tx_drops_key(Some(lane));
+        let inner = match &mut self.discovered {
+            None => rt.open_publication(&self.channels.tx_drops_channel, key.stream_id)?,
+            Some(d) => d.open_publication(rt, key).await?,
+        };
+        Ok(TxDropsPublisherHandle::from_publication(inner))
+    }
+
+    /// The `tx_drops` subscriber of the egress: the drops of every lane.
+    /// Discovered: one subscription that the reconcile task fills with the
+    /// sequencers of every lane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription fails to open.
+    pub fn tx_drops_subscriber(
+        &mut self,
+        rt: &AeronRuntime,
+    ) -> Result<TxDropsSubscriberHandle, LogError> {
+        let key = self.tx_drops_key(None);
+        let rx = match &mut self.discovered {
+            None => {
+                rt.open_subscription::<TxDrop>(&self.channels.tx_drops_channel, key.stream_id)?
+            }
+            Some(d) => d.open_subscription(rt, key)?,
+        };
+        Ok(TxDropsSubscriberHandle::from_subscription(rx))
+    }
+
+    /// The `tx_drops` key. A publisher names its lane; the subscriber names
+    /// none, so its filter matches the publishers of every lane.
+    fn tx_drops_key(&self, lane: Option<u8>) -> StreamKey {
+        StreamKey {
+            topic: Topic::TxDrops,
+            stream_id: self.channels.tx_drops_stream_id,
+            lane,
+        }
+    }
+
+    fn tx_verdicts_key(&self, ingress_id: u8) -> StreamKey {
+        StreamKey {
+            topic: Topic::TxVerdicts,
+            stream_id: self.channels.tx_verdicts_stream_id(ingress_id),
+            lane: None,
         }
     }
 

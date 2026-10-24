@@ -293,7 +293,8 @@ final class JoinWatchdogTest {
         // election: no relaunch yet. The check repeats; when the silent peer
         // answers with an open election, the member relaunches and keeps
         // its log. If it never answers, the member seeds at the window.
-        final PeerProbe.PeerStatus electing = new PeerProbe.PeerStatus(1, "FOLLOWER", "CANVASS", COMMIT);
+        final PeerProbe.PeerStatus electing = new PeerProbe.PeerStatus(1, "FOLLOWER", "CANVASS", COMMIT,
+            PeerProbe.PeerStatus.TERM_NOT_STATED);
         final PeerElections silent = new PeerProbe.Round(2, List.of(electing)).elections();
         final PeerElections answered = new PeerProbe.Round(2, List.of(electing, electing)).elections();
         assertEquals(PeerElections.UNKNOWN, silent);

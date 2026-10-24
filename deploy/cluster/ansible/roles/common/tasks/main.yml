@@ -91,6 +91,7 @@
     - "{{ paths.mirror_dir }}"
     - "{{ paths.notifier_dir }}"
     - "{{ paths.canary_dir }}"
+    - "{{ paths.egress_dir }}"
     - "{{ paths.batcher_dir }}"
     - "{{ paths.da_watcher_dir }}"
     - "{{ paths.l1_indexer_dir }}"

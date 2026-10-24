@@ -44,6 +44,13 @@ import org.agrona.concurrent.UnsafeBuffer;
  * clients reconnect to the new leader and replay from there. A session close
  * drops the backlog of that session.</p>
  *
+ * <p>While the member holds its outputs after its start ({@link StartHold}),
+ * every offered frame goes to the backlog of its session, and a drain sends
+ * nothing and closes nothing. The first drain after the hold restarts the
+ * clock of each backlog, so a session that waited through the hold is not
+ * closed for it. A role change still drops every backlog: the frames of a
+ * term that the next election cuts back reach no client.</p>
+ *
  * <p>This class is single-threaded, like {@link SealerEgress}.</p>
  */
 final class SessionBacklogs {
@@ -117,6 +124,7 @@ final class SessionBacklogs {
                 return true;
             }
             if (nowNs - progressNs > stallDeadlineNs) {
+                metrics.egressStall();
                 closeLoudly(session, "offer deadline exhausted (back-pressure)");
                 return true;
             }
@@ -185,11 +193,32 @@ final class SessionBacklogs {
     private final Long2ObjectHashMap<Backlog> bySession = new Long2ObjectHashMap<>();
     /** A view that wraps each frame for the offer, with no allocation. */
     private final UnsafeBuffer view = new UnsafeBuffer(0, 0);
+    private final StartHold hold;
+    /** The pipeline metrics of the service thread: the refused offers, the stalls and the queued bytes. */
+    private final SealerMetrics metrics;
+    /** Whether a drain saw the hold over; after that, the hold is not read again. */
+    private boolean released;
 
     SessionBacklogs(final int memberId, final long stallDeadlineNs, final long byteLimit) {
+        this(memberId, stallDeadlineNs, byteLimit, StartHold.released(), new SealerMetrics());
+    }
+
+    SessionBacklogs(
+            final int memberId,
+            final long stallDeadlineNs,
+            final long byteLimit,
+            final StartHold hold,
+            final SealerMetrics metrics) {
         this.memberId = memberId;
         this.stallDeadlineNs = stallDeadlineNs;
         this.byteLimit = byteLimit;
+        this.hold = hold;
+        this.metrics = metrics;
+    }
+
+    /** Whether the member still holds its outputs. Once a drain sees the hold over, this is false for good. */
+    private boolean holding() {
+        return !released && hold.held();
     }
 
     /**
@@ -205,11 +234,15 @@ final class SessionBacklogs {
         if (session.isClosing()) {
             return Outcome.DROPPED;
         }
+        if (holding()) {
+            return append(open(session), copy(frame, length));
+        }
         final long result = attemptInPlace(session, frame, length);
         if (result >= 0) {
             return Outcome.SENT;
         }
         if (retryable(result)) {
+            metrics.egressRefused(result);
             return append(open(session), copy(frame, length));
         }
         closeOnTerminal(session, result, copy(frame, length));
@@ -248,11 +281,15 @@ final class SessionBacklogs {
         if (session.isClosing()) {
             return Outcome.DROPPED;
         }
+        if (holding()) {
+            return append(open(session), frame);
+        }
         final long result = attempt(session, frame);
         if (result >= 0) {
             return Outcome.SENT;
         }
         if (retryable(result)) {
+            metrics.egressRefused(result);
             return append(open(session), frame);
         }
         closeOnTerminal(session, result, frame);
@@ -261,8 +298,28 @@ final class SessionBacklogs {
 
     /** Send what each backlog's session takes now, and close each session past a limit. */
     void drain() {
+        if (holding()) {
+            return;
+        }
+        if (!released) {
+            released = true;
+            restartClocks();
+        }
+        if (bySession.isEmpty()) {
+            // The common case on the record path: no session is back-pressured,
+            // and the drain allocates no iterator and no lambda.
+            metrics.egressBacklog(0L);
+            return;
+        }
         final long nowNs = System.nanoTime();
         bySession.values().removeIf(backlog -> backlog.drain(nowNs));
+        metrics.egressBacklog(bySession.values().stream().mapToLong(backlog -> backlog.bytes).sum());
+    }
+
+    /** Restart the stall clock of each backlog: no backlog made progress while the member held its outputs. */
+    private void restartClocks() {
+        final long nowNs = System.nanoTime();
+        bySession.values().forEach(backlog -> backlog.progressNs = nowNs);
     }
 
     /** Drop the backlog of a closed session. */

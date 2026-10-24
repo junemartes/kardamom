@@ -366,6 +366,14 @@ pub struct ChannelsConfig {
     pub tx_status_channel: ChannelUri,
     pub tx_status_stream_id: i32,
 
+    /// `TxVerdicts`: the receipts of the transactions of one ingress, from
+    /// the sequencer that owns their senders. The stream of ingress `i` has
+    /// the id `tx_verdicts_stream_id_base + i`, so an ingress takes only
+    /// the receipts of its own transactions. RAM only, not recorded: a
+    /// client signal, not canonical state.
+    pub tx_verdicts_channel: ChannelUri,
+    pub tx_verdicts_stream_id_base: i32,
+
     /// `TxDeposits`: the DA watcher publishes full `Deposit` envelopes here.
     /// The M sequencers subscribe and republish a `DepositRef` onto
     /// `tx_ordering`, so the canonical order interleaves L1 deposits with
@@ -409,6 +417,34 @@ pub struct ChannelsConfig {
     /// `TxRef`.
     pub exec_txs_channel: ChannelUri,
     pub exec_txs_stream_id: i32,
+
+    /// `exec_frames`: the canonical frames that an executor reads, byte for
+    /// byte, in the order that it executes them. The egress reads every
+    /// executor, keeps the first copy of each frame, and compares the
+    /// other copies with it.
+    pub exec_frames_channel: ChannelUri,
+    pub exec_frames_stream_id: i32,
+
+    /// `egress_order`: the canonical stream that the egress merged from the
+    /// executors, live, in canonical order: the frames of the member feed,
+    /// byte for byte. The readers after the executors subscribe to it, and
+    /// read the frames before it from the range read of the egress.
+    pub egress_order_channel: ChannelUri,
+    pub egress_order_stream_id: i32,
+
+    /// `egress_receipts`: the receipts that the egress merged from the
+    /// executors, each once, in the frame format of `tx_receipts`: the
+    /// batches with their account rows, and the rollbacks. The sequencers
+    /// read their account rows from it.
+    pub egress_receipts_channel: ChannelUri,
+    pub egress_receipts_stream_id: i32,
+
+    /// `tx_drops`: the transactions that the sequencers dropped, one small
+    /// `TxDrop` record each. Each sequencer publishes the drops of its
+    /// lane, and the egress reads every lane. RAM only, not recorded: a
+    /// client signal, not canonical state.
+    pub tx_drops_channel: ChannelUri,
+    pub tx_drops_stream_id: i32,
 
     /// `l1_blocks`: the L1 follower publishes one `L1Block` for each
     /// finalized L1 block, in block order. Every follower instance
@@ -489,6 +525,15 @@ impl ChannelsConfig {
                 self.tx_data_stream_id_base
             ));
         }
+        // `tx_verdicts_stream_id` adds a `u8` ingress id to the base, as
+        // the lanes of `tx_data` do.
+        if self.tx_verdicts_stream_id_base > i32::MAX - 255 {
+            return Err(format!(
+                "tx_verdicts_stream_id_base ({}) too close to i32::MAX: \
+                 tx_verdicts_stream_id(ingress_id) would overflow",
+                self.tx_verdicts_stream_id_base
+            ));
+        }
         // `tx_receipts_boundary_stream_id` adds 1 to `tx_receipts_stream_id`.
         if self.tx_receipts_stream_id == i32::MAX {
             return Err("tx_receipts_stream_id must not be i32::MAX: \
@@ -500,7 +545,7 @@ impl ChannelsConfig {
 
     /// The id of every stream except the `tx_data` lanes, with the key
     /// that sets it.
-    fn single_stream_ids(&self) -> [(&'static str, i32); 11] {
+    fn single_stream_ids(&self) -> [(&'static str, i32); 15] {
         [
             ("tx_receipts_stream_id", self.tx_receipts_stream_id),
             (
@@ -517,6 +562,10 @@ impl ChannelsConfig {
             ("events_stream_id", self.events_stream_id),
             ("tx_bal_stream_id", self.tx_bal_stream_id),
             ("exec_txs_stream_id", self.exec_txs_stream_id),
+            ("exec_frames_stream_id", self.exec_frames_stream_id),
+            ("egress_order_stream_id", self.egress_order_stream_id),
+            ("egress_receipts_stream_id", self.egress_receipts_stream_id),
+            ("tx_drops_stream_id", self.tx_drops_stream_id),
             ("l1_blocks_stream_id", self.l1_blocks_stream_id),
             ("fsync_watermark_stream_id", self.fsync_watermark_stream_id),
         ]
@@ -525,23 +574,34 @@ impl ChannelsConfig {
     /// Two streams on one id deliver the frames of one stream to the
     /// subscribers of the other, which then decode them as the wrong type.
     /// Every single stream therefore has its own id, outside the `tx_data`
-    /// lane ids `base..=base + 255`.
+    /// lane ids `base..=base + 255` and the `tx_verdicts` ids
+    /// `base..=base + 255`. The two ranges do not overlap either.
     fn check_stream_ids(&self) -> Result<(), String> {
         let mut ids = self.single_stream_ids();
         ids.sort_unstable_by_key(|&(_, id)| id);
         if let Some([(a, id), (b, _)]) = ids.array_windows().find(|[(_, x), (_, y)]| x == y) {
             return Err(format!("{a} and {b} share the stream id {id}"));
         }
-        let lanes = self.tx_data_stream_id(0)..=self.tx_data_stream_id(u8::MAX);
-        ids.iter()
-            .find(|(_, id)| lanes.contains(id))
-            .map_or(Ok(()), |(key, id)| {
-                Err(format!(
-                    "{key} ({id}) is a tx_data lane id: tx_data_stream_id_base \
-                     ({}) + 0..=255",
-                    self.tx_data_stream_id_base
-                ))
-            })
+        let lanes = IdRange {
+            name: "tx_data lane",
+            base_key: "tx_data_stream_id_base",
+            base: self.tx_data_stream_id_base,
+            ids: self.tx_data_stream_id(0)..=self.tx_data_stream_id(u8::MAX),
+        };
+        let verdicts = IdRange {
+            name: "tx_verdicts",
+            base_key: "tx_verdicts_stream_id_base",
+            base: self.tx_verdicts_stream_id_base,
+            ids: self.tx_verdicts_stream_id(0)..=self.tx_verdicts_stream_id(u8::MAX),
+        };
+        if lanes.ids.contains(verdicts.ids.start()) || verdicts.ids.contains(lanes.ids.start()) {
+            return Err(format!(
+                "the tx_data lane ids {:?} and the tx_verdicts ids {:?} overlap",
+                lanes.ids, verdicts.ids
+            ));
+        }
+        lanes.check(&ids)?;
+        verdicts.check(&ids)
     }
 
     /// The UDP endpoint executor replica `replica_idx` publishes its
@@ -625,6 +685,16 @@ impl ChannelsConfig {
             .saturating_add(i32::from(sequencer_id))
     }
 
+    /// The `tx_verdicts` stream id of the ingress `ingress_id`. `validate`
+    /// proves `tx_verdicts_stream_id_base <= i32::MAX - 255` for a loaded
+    /// config; `saturating_add` keeps a directly built config from
+    /// wrapping into a negative id.
+    #[must_use]
+    pub fn tx_verdicts_stream_id(&self, ingress_id: u8) -> i32 {
+        self.tx_verdicts_stream_id_base
+            .saturating_add(i32::from(ingress_id))
+    }
+
     /// `TxReceipts` block-boundary side-stream id
     /// (`tx_receipts_stream_id + 1`). `validate` proves
     /// `tx_receipts_stream_id != i32::MAX` for a loaded config, so this
@@ -700,6 +770,10 @@ impl Default for ChannelsConfig {
             // (1010), tx_errors (1015), tx_deposits (1016).
             tx_status_channel: "aeron:ipc?alias=tx-status".into(),
             tx_status_stream_id: 1018,
+            // 3000..=3255 sits above the tx_data lanes (2000..=2255) and
+            // clear of every single stream.
+            tx_verdicts_channel: "aeron:ipc?alias=tx-verdicts".into(),
+            tx_verdicts_stream_id_base: 3000,
             tx_deposits_channel: "aeron:ipc?alias=tx-deposits".into(),
             tx_deposits_stream_id: 1016,
             // 1017 sits next to tx_deposits (1016), the stream it mirrors. It
@@ -722,6 +796,22 @@ impl Default for ChannelsConfig {
             // below the fsync-watermark block (1010).
             exec_txs_channel: "aeron:ipc?alias=exec-txs".into(),
             exec_txs_stream_id: 1005,
+            // 1008 follows the member feed (1006, 1007), another stream of
+            // canonical frames, and stays below the fsync-watermark block
+            // (1010).
+            exec_frames_channel: "aeron:ipc?alias=exec-frames".into(),
+            exec_frames_stream_id: 1008,
+            // 1009 follows exec_frames (1008), the input of the egress.
+            egress_order_channel: "aeron:ipc?alias=egress-order".into(),
+            egress_order_stream_id: 1009,
+            // 1011 follows the fsync-watermark block (1010), and the egress
+            // order (1009): the other output of the egress.
+            egress_receipts_channel: "aeron:ipc?alias=egress-receipts".into(),
+            egress_receipts_stream_id: 1011,
+            // 1012 follows egress_receipts (1011): the drops are the other
+            // transaction status that the egress serves.
+            tx_drops_channel: "aeron:ipc?alias=tx-drops".into(),
+            tx_drops_stream_id: 1012,
             // 1020 follows the events stream (1019), the last of the
             // 1015..=1019 side-stream block.
             l1_blocks_channel: "aeron:ipc?alias=l1-blocks".into(),
@@ -729,6 +819,29 @@ impl Default for ChannelsConfig {
             fsync_watermark_channel_template: "aeron:ipc?alias=fsync-wm-{rid}".into(),
             fsync_watermark_stream_id: 1010,
         }
+    }
+}
+
+/// A block of 256 stream ids that one base sets: the `tx_data` lanes or
+/// the `tx_verdicts` streams. No single stream may take an id of it.
+struct IdRange {
+    name: &'static str,
+    base_key: &'static str,
+    base: i32,
+    ids: std::ops::RangeInclusive<i32>,
+}
+
+impl IdRange {
+    fn check(&self, single: &[(&'static str, i32)]) -> Result<(), String> {
+        single
+            .iter()
+            .find(|(_, id)| self.ids.contains(id))
+            .map_or(Ok(()), |(key, id)| {
+                Err(format!(
+                    "{key} ({id}) is a {} id: {} ({}) + 0..=255",
+                    self.name, self.base_key, self.base
+                ))
+            })
     }
 }
 

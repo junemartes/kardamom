@@ -20,7 +20,9 @@ workloads_cert_identity: >-
   {{ lookup('env', 'KARDAMOM_CERT_IDENTITY_RE') |
      default('^https://github\.com/junemartes/kardamom/\.github/workflows/[^@]+@refs/', true) }}
 workloads_cert_issuer: "{{ lookup('env', 'KARDAMOM_CERT_OIDC_ISSUER') | default('https://token.actions.githubusercontent.com', true) }}"
-workloads_image_services: [aeron, cluster, redis, sequencer, ingress, executor, validator, da-watcher, batcher, state-mirror, notifier, canary]
+workloads_image_services: >-
+  {{ ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher', 'batcher',
+      'state-mirror', 'notifier', 'canary'] + (['egress'] if workloads_egress | bool else []) }}
 # The variables every job derives its placement and its peer lists from.
 # A job receives the ones its file declares (tasks/job.yml).
 # The Nomad node pool of a job, by job name: the pool id of an elastic
@@ -154,12 +156,75 @@ workloads_cluster_snapshot_s: "{{ lookup('env', 'KARDAMOM_CLUSTER_SNAPSHOT_S') }
 workloads_cluster_log_purge_keep: "{{ lookup('env', 'KARDAMOM_CLUSTER_LOG_PURGE_KEEP') }}"
 workloads_da_lag_budget_blocks: "{{ lookup('env', 'KARDAMOM_DA_LAG_BUDGET_BLOCKS') }}"
 workloads_cluster_file_sync_level: "{{ lookup('env', 'KARDAMOM_CLUSTER_FILE_SYNC_LEVEL') }}"
+# The threading mode of the media driver in each sealer member
+# (nomad/cluster.nomad.hcl). Empty keeps the job's SHARED default.
+workloads_cluster_driver_threading_mode: "{{ lookup('env', 'KARDAMOM_CLUSTER_DRIVER_THREADING_MODE') }}"
+workloads_cluster_heap_mb: "{{ lookup('env', 'KARDAMOM_CLUSTER_HEAP_MB') }}"
+# The sync level of the backup sealer's archive (nomad/cluster-backup.nomad.hcl).
+# Empty keeps the job's 1.
+workloads_backup_file_sync_level: "{{ lookup('env', 'KARDAMOM_BACKUP_FILE_SYNC_LEVEL') }}"
+# How long and how much Prometheus keeps (nomad/monitoring.nomad.hcl).
+# Empty keeps the job's 24h and no size limit.
+workloads_prometheus_retention_time: "{{ lookup('env', 'KARDAMOM_PROMETHEUS_RETENTION_TIME') }}"
+workloads_prometheus_retention_size: "{{ lookup('env', 'KARDAMOM_PROMETHEUS_RETENTION_SIZE') }}"
 workloads_archive_file_sync_level: "{{ lookup('env', 'KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL') }}"
+# The threading mode of the media driver of each node (nomad/aeron.system.nomad.hcl):
+# SHARED, SHARED_NETWORK or DEDICATED. Empty keeps the job's SHARED default.
+workloads_aeron_threading_mode: "{{ lookup('env', 'KARDAMOM_AERON_THREADING_MODE') }}"
 workloads_remote_origins: "{{ lookup('env', 'KARDAMOM_REMOTE_ORIGINS') }}"
 workloads_priority_fees: "{{ lookup('env', 'PRIORITY_FEES') }}"
 # The recorded cursor of the executors (nomad/executor.nomad.hcl): "on" or
 # "off". Empty keeps the job's "off" default.
 workloads_exec_cursor: "{{ lookup('env', 'KARDAMOM_EXEC_CURSOR') }}"
+# The egress (nomad/egress.nomad.hcl) and its readers. Every switch is
+# off by default, and with every switch off no job changes. Switch them on
+# in this order, one deploy each: the executors' frames, the egress, then
+# each reader. A reader switch needs the egress, and the egress needs the
+# frames; the preflight refuses another order.
+# KARDAMOM_EGRESS=1 deploys the egress job, after the executors.
+workloads_egress: "{{ lookup('env', 'KARDAMOM_EGRESS') | default('0', true) | bool }}"
+# The reader switches: "on" or "off". Empty keeps the job's default, off.
+# The executors' frames (nomad/executor.nomad.hcl, exec_frames).
+workloads_exec_frames: "{{ lookup('env', 'KARDAMOM_EXEC_FRAMES') }}"
+# The canonical stream of the validator and the batcher from the egress
+# (--egress). Switch them on only on a chain where the carry flag is
+# active.
+workloads_validator_egress: "{{ lookup('env', 'KARDAMOM_VALIDATOR_EGRESS') }}"
+workloads_batcher_egress: "{{ lookup('env', 'KARDAMOM_BATCHER_EGRESS') }}"
+# The receipts and their rows of the sequencers from egress_receipts.
+workloads_sequencer_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_SEQUENCER_RECEIPTS_FROM_EGRESS') }}"
+# eth_getTransactionReceipt of the ingress from the egress on a cache miss.
+workloads_ingress_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS') }}"
+# The receipts of the notifier from egress_receipts.
+workloads_notifier_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS') }}"
+# The readers reach the egress through its Consul service.
+workloads_egress_url: "http://kardamom-egress.service.{{ datacenter }}.consul:{{ ports.egress_http }}"
+# The job variables of the switches, by job. Every compile of a job takes
+# them (tasks/compile.yml), so a resize keeps them too. An empty value
+# keeps the job's default, off.
+workloads_egress_job_vars:
+  executor:
+    exec_frames: "{{ workloads_exec_frames }}"
+  validator:
+    egress_url: "{{ workloads_egress_url if workloads_validator_egress == 'on' else '' }}"
+  batcher:
+    egress_url: "{{ workloads_egress_url if workloads_batcher_egress == 'on' else '' }}"
+  sequencer:
+    receipts_from_egress: "{{ workloads_sequencer_receipts_from_egress }}"
+  ingress:
+    receipt_query_endpoints: "{{ workloads_egress_url if workloads_ingress_receipts_from_egress == 'on' else '' }}"
+  notifier:
+    receipts_from_egress: "{{ workloads_notifier_receipts_from_egress }}"
+  # Prometheus scrapes the egress only where it runs.
+  monitoring:
+    egress: "{{ 'on' if workloads_egress | bool else '' }}"
+# The block log of the checkpoints of the executors
+# (nomad/executor.nomad.hcl): "on" or "off". Empty keeps the job's "off"
+# default.
+workloads_checkpoint_log: "{{ lookup('env', 'KARDAMOM_CHECKPOINT_LOG') }}"
+# When eth_sendRawTransaction answers (nomad/ingress.nomad.hcl): "receipt"
+# or "validated". Empty keeps "receipt".
+workloads_ingress_ack: "{{ lookup('env', 'KARDAMOM_INGRESS_ACK') }}"
 # The Aeron stall tolerance, in milliseconds (nomad/aeron.system.nomad.hcl).
 # 10000 is Aeron's default, and production keeps it: a longer value delays
 # the detection of a dead process. CI raises it, so a host stall does not
@@ -230,6 +295,11 @@ workloads_indexer_count: "{{ lookup('env', 'L1_INDEXER_COUNT') }}"
 # How long l1_blocks may carry no record before the da-watcher and the batcher pause
 # with the follower as its root. Empty: three finality steps (1152 s).
 workloads_l1_silence_s: "{{ lookup('env', 'L1_SILENCE_S') }}"
+# The pause between two epochs of one L1 finality step, in ms. Empty: the
+# da-watcher's default, 2000. The container recipes set 100: the tests
+# mine bursts of L1 blocks, and a 2 s pace makes their deposits wait too
+# long.
+workloads_epoch_pace_ms: "{{ lookup('env', 'EPOCH_PACE_MS') }}"
 workloads_indexer_host: "{{ lookup('env', 'L1_INDEXER_HOST') | default('kardamom-l1-indexer.service.' ~ datacenter ~ '.consul', true) }}"
 workloads_indexer_port: "{{ lookup('env', 'L1_INDEXER_PORT') | default('8549', true) }}"
 workloads_poll_delay: 3
@@ -257,6 +327,8 @@ workloads_sealer_job:
     cluster_log_purge_keep_snapshots: "{{ workloads_cluster_log_purge_keep }}"
     cluster_da_lag_budget_blocks: "{{ workloads_da_lag_budget_blocks }}"
     cluster_file_sync_level: "{{ workloads_cluster_file_sync_level }}"
+    cluster_driver_threading_mode: "{{ workloads_cluster_driver_threading_mode }}"
+    cluster_heap_mb: "{{ workloads_cluster_heap_mb }}"
     cluster_remote_origins: "{{ workloads_remote_origins }}"
 # The sealer settings that every member must match (the Settings table of
 # cluster/sealer-service/README.md), as the deploy passes them in

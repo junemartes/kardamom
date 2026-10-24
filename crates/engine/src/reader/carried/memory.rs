@@ -89,6 +89,12 @@ impl MemoryRemote {
         self.requests.recv_timeout(wait).ok()
     }
 
+    /// The frames that the reader did not poll or discard yet.
+    #[must_use]
+    pub(crate) fn pending(&self) -> usize {
+        self.frames.len()
+    }
+
     /// The requests that the reader sent and the test did not read yet.
     #[must_use]
     pub(crate) fn requests(&self) -> Vec<Request> {

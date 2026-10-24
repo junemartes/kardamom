@@ -6,8 +6,15 @@ use std::ops::ControlFlow;
 use anyhow::{Context, Result};
 use kardamom_engine::ResumePoint;
 use kardamom_engine::reader::carried::LocalHistory;
+use kardamom_state::checkpoint::bases::{BaseRound, BaseRule};
+use kardamom_state::checkpoint::copy_rate::CopyRate;
+use kardamom_state::checkpoint::log_thread::{BlockLogThread, LogConfig};
+use kardamom_state::checkpoint::replay::LOG_DIR;
 use kardamom_state::checkpoint::{create_checkpoint, prune_checkpoints};
-use kardamom_state::{BlockRange, StateEnv, StateEnvBuilder, StateSnapshot, read_recovery_point};
+use kardamom_state::{
+    BlockRange, StateEnv, StateEnvBuilder, StateSnapshot, StateWriter, WriterHandle,
+    read_recovery_point,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::args::Args;
@@ -67,7 +74,7 @@ pub(crate) fn prepare_state(
         .with_context(|| format!("open state env at {}", args.state_dir.display()))?;
     let recovery = read_recovery_point(&env).context("read state recovery point")?;
 
-    let checkpointer = spawn_checkpointer(args, &env, shutdown);
+    let checkpointer = spawn_checkpointer(args, &env, shutdown)?;
 
     // Crash-recovery cursor. A non-genesis cursor means the node restarted
     // mid-chain. A fresh start is just a resume from the genesis cursor.
@@ -140,19 +147,102 @@ fn spawn_checkpointer(
     args: &Args,
     env: &StateEnv,
     shutdown: CancellationToken,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Result<Option<tokio::task::JoinHandle<()>>> {
     let (Some(ckpt_dir), Some(interval_secs)) =
         (args.checkpoint_dir.clone(), args.checkpoint_interval_secs.0)
     else {
-        return None;
+        return Ok(None);
     };
+    let mode = CheckpointLog::of(args)?.map_or(RoundMode::Full, |log| RoundMode::Log(log.round));
     let round = CheckpointRound {
         env: env.clone(),
         dir: ckpt_dir,
         keep: args.checkpoint_keep,
+        mode,
     };
     let interval = std::time::Duration::from_secs(interval_secs.get());
-    Some(Checkpointer::new(round, interval, shutdown).spawn())
+    Ok(Some(Checkpointer::new(round, interval, shutdown).spawn()))
+}
+
+/// The block log of the checkpoints, with `--checkpoint-log` and
+/// `--checkpoint-dir`: the settings of the log thread, and the round that
+/// makes a base when the rule asks for one.
+pub(crate) struct CheckpointLog {
+    pub(crate) log: LogConfig,
+    pub(crate) round: BaseRound,
+}
+
+impl CheckpointLog {
+    /// The batches that may wait for the log thread: about two hours of
+    /// 2 s blocks.
+    const QUEUE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(4096).unwrap();
+    /// The period of the sync of the log.
+    const SYNC_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+    const MIB: std::num::NonZeroU64 = std::num::NonZeroU64::new(1 << 20).unwrap();
+
+    /// The block log settings of `args`. `None` without `--checkpoint-log`
+    /// or `--checkpoint-dir`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a size in MiB does not fit in bytes.
+    pub(crate) fn of(args: &Args) -> Result<Option<Self>> {
+        let Some(dir) = args.checkpoint_dir.as_ref().filter(|_| args.checkpoint_log) else {
+            return Ok(None);
+        };
+        let segment_bytes = Self::bytes(args.checkpoint_log_segment_mib)?;
+        let rate = Self::bytes(args.checkpoint_copy_mib_per_sec)?;
+        Ok(Some(Self {
+            log: LogConfig {
+                dir: dir.join(LOG_DIR),
+                segment_bytes,
+                queue: Self::QUEUE,
+                sync_every: Self::SYNC_EVERY,
+            },
+            round: BaseRound {
+                rule: BaseRule {
+                    log_percent: args.checkpoint_base_log_percent,
+                    max_age: std::time::Duration::from_secs(
+                        args.checkpoint_base_max_age_secs.get(),
+                    ),
+                    segment_bytes,
+                },
+                rate: CopyRate::Limited(rate),
+                keep: args.checkpoint_keep,
+            },
+        }))
+    }
+
+    /// Spawn the state writer of `env`, with the block log thread behind
+    /// it when `args` asks for the log. The log thread ends after the
+    /// writer, when the writer's feed is gone, so nothing joins it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the settings do not parse, or the log or the
+    /// writer does not start.
+    pub(crate) fn spawn_writer(args: &Args, env: StateEnv) -> Result<WriterHandle> {
+        let Some(log) = Self::of(args)? else {
+            return StateWriter::spawn(env).context("spawn state writer");
+        };
+        let (feed, _detached) =
+            BlockLogThread::spawn(&env, &log.log).context("start the block log thread")?;
+        StateWriter::spawn_with_log(env, feed).context("spawn state writer")
+    }
+
+    fn bytes(mib: std::num::NonZeroU64) -> Result<std::num::NonZeroU64> {
+        mib.checked_mul(Self::MIB)
+            .with_context(|| format!("{mib} MiB does not fit in bytes"))
+    }
+}
+
+/// What one checkpoint round does.
+#[derive(Clone, Copy)]
+enum RoundMode {
+    /// A compacted copy each round.
+    Full,
+    /// A base when the rule of the block log asks for one.
+    Log(BaseRound),
 }
 
 /// One checkpoint round's fixed inputs: the state env, the checkpoint
@@ -164,11 +254,24 @@ struct CheckpointRound {
     env: StateEnv,
     dir: std::path::PathBuf,
     keep: std::num::NonZeroUsize,
+    mode: RoundMode,
 }
 
 impl CheckpointRound {
-    /// One checkpoint + prune round; failures are logged, never fatal.
+    /// One round of the mode; failures are logged, never fatal.
     fn once(&self) {
+        match self.mode {
+            RoundMode::Full => self.full(),
+            RoundMode::Log(round) => {
+                if let Err(e) = round.run(&self.env, &self.dir) {
+                    tracing::warn!(error = %e, "checkpoint base round failed");
+                }
+            }
+        }
+    }
+
+    /// One checkpoint + prune round; failures are logged, never fatal.
+    fn full(&self) {
         match create_checkpoint(&self.env, &self.dir) {
             Ok(_) => self.prune_stale(),
             Err(e) => tracing::warn!(error = %e, "checkpoint creation failed"),

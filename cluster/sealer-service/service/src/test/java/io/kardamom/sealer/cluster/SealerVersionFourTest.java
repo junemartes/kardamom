@@ -5,20 +5,16 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.kardamom.sealer.CanonicalSealerState;
-import io.kardamom.sealer.LagBudgets;
 import io.kardamom.sealer.VersionSwitch;
-import io.kardamom.sealer.VoidLedger;
-import io.kardamom.sealer.cluster.ClusterStubs.StubCluster;
-import io.kardamom.sealer.cluster.ClusterStubs.StubSession;
+import io.kardamom.sealer.cluster.DriverlessLog.Entry;
+import io.kardamom.sealer.cluster.DriverlessLog.Member;
+import io.kardamom.sealer.cluster.DriverlessLog.Outcome;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
-import java.util.Set;
 import java.util.stream.IntStream;
-import org.agrona.ExpandableArrayBuffer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -32,7 +28,6 @@ import org.junit.jupiter.api.Test;
  */
 class SealerVersionFourTest {
 
-    private static final int CAPACITY = 16;
     private static final byte[] SENDER = filled(CanonicalSealerState.SENDER_LEN, 0xAA);
     /** The sender of the references without a position: version 4 references move no expected nonce. */
     private static final byte[] PLAIN_SENDER = filled(CanonicalSealerState.SENDER_LEN, 0xBB);
@@ -40,27 +35,11 @@ class SealerVersionFourTest {
     private static final byte BOUNDARY = SealerWire.EGRESS_KIND_BOUNDARY;
     private static final byte RULES = SealerWire.EGRESS_KIND_SEALER_INFO;
 
-    /** One log entry: an ingress frame, or a boundary tick when {@code frame} is empty. */
-    private record Entry(String name, Optional<byte[]> frame, long timeMs) {
-        static Entry frame(final String name, final byte[] frame, final long timeMs) {
-            return new Entry(name, Optional.of(frame), timeMs);
-        }
-
-        static Entry tick(final String name, final long timeMs) {
-            return new Entry(name, Optional.empty(), timeMs);
-        }
-    }
-
-    /** The egress kinds that the session got for one entry, without the status frames, and the version after it. */
-    private record Outcome(String name, List<Byte> kinds, int decisionVersion) {
-    }
-
-    private final List<SealerClusteredService> started = new ArrayList<>();
-    private final List<StubCluster> clusters = new ArrayList<>();
+    private final DriverlessLog log = new DriverlessLog();
 
     @AfterEach
     void stop() {
-        IntStream.range(0, started.size()).forEach(i -> started.get(i).onTerminate(clusters.get(i)));
+        log.stop();
     }
 
     private static byte[] filled(final int length, final int value) {
@@ -76,12 +55,7 @@ class SealerVersionFourTest {
 
     /** A kind-0 transaction reference of image {@code (lane 0, session 9)} at {@code position}. */
     private static byte[] ref(final int idTag, final long nonce, final long position) {
-        final ByteBuffer buf = ByteBuffer.allocate(SealerWire.TXREF_RECORD_LEN).order(ByteOrder.LITTLE_ENDIAN);
-        buf.put(SealerWire.KIND_INGRESS_RECORD).put(SENDER).putLong(nonce)
-            .putLong(SealerWire.POSITION_TAG | position).putLong(0L).putLong(0L)
-            .put(IngressFrames.recordId(idTag)).put(SealerWire.RT_TXREF)
-            .put((byte) 0).putInt(0).putInt((int) position).putInt(9);
-        return buf.array();
+        return IngressFrames.txRefFrame(idTag, SENDER, nonce, position);
     }
 
     /** {@link #ref} of another sender, with "no deadline" in place of the position. */
@@ -116,44 +90,8 @@ class SealerVersionFourTest {
             Entry.tick("tick-3", 2_500L));
     }
 
-    /** A heap member on its own stub cluster, from {@code snapshot} or at genesis. */
     private Member member(final Optional<byte[]> snapshot) {
-        final StubCluster cluster = new StubCluster();
-        cluster.role = io.aeron.cluster.service.Cluster.Role.FOLLOWER;
-        final StubSession sequencer = cluster.addSession(1);
-        final SealerClusteredService svc = new SealerClusteredService(
-            CAPACITY, 250, 0, Set.of(), VoidLedger.Config.DISABLED,
-            CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS,
-            CanonicalSealerState.DEFAULT_ORDERING_WINDOW, LagBudgets.DEFAULT);
-        svc.start(cluster, snapshot);
-        started.add(svc);
-        clusters.add(cluster);
-        return new Member(svc, cluster, sequencer);
-    }
-
-    /** A member, its cluster, and the session of its sequencer. */
-    private record Member(SealerClusteredService svc, StubCluster cluster, StubSession sequencer) {
-        Outcome apply(final Entry entry) {
-            final int before = sequencer.offered.size();
-            cluster.time = entry.timeMs();
-            entry.frame().ifPresentOrElse(frame -> deliver(frame, entry.timeMs()), () -> svc.onTimerEvent(
-                SealerClusteredService.BOUNDARY_TIMER_CORRELATION_ID, entry.timeMs()));
-            final List<Byte> kinds = sequencer.offered.subList(before, sequencer.offered.size()).stream()
-                .map(f -> f[0])
-                .filter(kind -> kind != SealerWire.EGRESS_KIND_STATUS)
-                .toList();
-            return new Outcome(entry.name(), kinds, svc.decisionRules().version());
-        }
-
-        List<Outcome> applyAll(final List<Entry> log) {
-            return log.stream().map(this::apply).toList();
-        }
-
-        private void deliver(final byte[] frame, final long timeMs) {
-            final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
-            buf.putBytes(0, frame);
-            svc.onSessionMessage(sequencer, timeMs, buf, 0, frame.length, null);
-        }
+        return log.member(snapshot);
     }
 
     @Test

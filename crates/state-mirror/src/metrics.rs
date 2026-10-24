@@ -1,5 +1,7 @@
 //! Mirror metric names and helpers, in one place.
 
+use kardamom_obs::pipeline::{Batch, Step};
+
 const BATCHES_APPLIED_TOTAL: &str = "kardamom_state_mirror_batches_applied_total";
 const PRODUCER_DISAGREEMENT_TOTAL: &str = "kardamom_state_mirror_producer_disagreement_total";
 const HEAD_TX_IDX: &str = "kardamom_state_mirror_head_tx_idx";
@@ -41,8 +43,8 @@ pub(crate) fn describe() {
     );
 }
 
-pub(crate) fn record_batch(disagreed: u64) {
-    metrics::counter!(BATCHES_APPLIED_TOTAL).increment(1);
+pub(crate) fn record_batches(count: usize, disagreed: u64) {
+    metrics::counter!(BATCHES_APPLIED_TOTAL).increment(u64::try_from(count).unwrap_or(u64::MAX));
     metrics::counter!(PRODUCER_DISAGREEMENT_TOTAL).increment(disagreed);
 }
 
@@ -67,4 +69,32 @@ pub(crate) fn record_write_retry() {
 
 pub(crate) fn record_wait_replica_zero() {
     metrics::counter!(WAIT_REPLICA_ZERO_TOTAL).increment(1);
+}
+
+/// The pipeline metrics of the mirror, once per group of batches. The
+/// mirror owns them.
+pub(crate) struct MirrorSteps {
+    /// The write of one group: one `SCRIPT LOAD`, then one pipeline with
+    /// the rows and the receipts of every batch.
+    pub(crate) write: Step,
+    pub(crate) head_set: Step,
+    pub(crate) wait_replica: Step,
+    /// A whole group: the write with its retries, the head, and the
+    /// replica wait.
+    pub(crate) group: Step,
+    pub(crate) group_batches: Batch,
+    pub(crate) group_receipts: Batch,
+}
+
+impl MirrorSteps {
+    pub(crate) fn new() -> Self {
+        Self {
+            write: Step::new("state_mirror.write"),
+            head_set: Step::new("state_mirror.head_set"),
+            wait_replica: Step::new("state_mirror.wait_replica"),
+            group: Step::new("state_mirror.group"),
+            group_batches: Batch::new("state_mirror.group_batches"),
+            group_receipts: Batch::new("state_mirror.group_receipts"),
+        }
+    }
 }

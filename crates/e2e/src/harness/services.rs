@@ -131,6 +131,13 @@ pub struct ServiceSpec<'a> {
     /// settings. The `[channels]` defaults are inherited, so the topology
     /// does not change.
     pub log_config: Option<&'a Path>,
+    /// Run every sequencer on the v2 loop (the `[admission]` section).
+    pub admission: bool,
+    /// With `admission`: the sequencers send the verdict of each
+    /// transaction to its ingress, and `eth_sendRawTransaction` answers on
+    /// it, at admission. The ingress reads its `tx_verdicts` stream and no
+    /// receipts.
+    pub verdicts: bool,
 }
 
 /// The parts of a stateful service's (executor, validator) bring-up that
@@ -273,9 +280,12 @@ pub fn spawn_da_watcher(spec: &ServiceSpec<'_>, indexer_url: &str) -> Result<Spa
     let egress_port = free_udp_port().port();
     let cfg_path = spec.write_cluster_config("da-watcher", "")?;
     let mut cmd = Command::new(bin("kardamom-da-watcher")?);
+    // The tests mine bursts of L1 blocks. At the 2 s default pace, the
+    // deposits of a burst wait too long, so the harness uses 100 ms.
     cmd.arg("--l1-blocks")
         .args(["--indexer-url", indexer_url])
         .args(["--poll-interval-secs", "1"])
+        .args(["--epoch-pace-ms", "100"])
         .arg("--config")
         .arg(&cfg_path)
         .args([
@@ -566,10 +576,17 @@ pub fn spawn_sequencer_with(
     // flags below (`--partition-index`, `--sequencer-id`) are what the
     // binary actually uses. max_pending_per_sender and
     // backpressure_policy have no CLI flag, so they must live in the file.
-    let prefix = format!(
+    let mut prefix = format!(
         "partition_count = {partition_count}\npartition_index = 0\nsequencer_id = 0\n\
          max_pending_per_sender = 512\nbackpressure_policy = \"return_immediately\"\n\n",
     );
+    if spec.admission {
+        prefix.push_str("[admission]\nenabled = true\nmax_parked = 512\n");
+        if spec.verdicts {
+            prefix.push_str("verdicts = true\n");
+        }
+        prefix.push('\n');
+    }
     let name = format!("sequencer-{index}{}", opts.log_tag);
     let cfg_path = spec.write_cluster_config(&name, &prefix)?;
     let metrics_port = free_port().port();
@@ -873,6 +890,11 @@ pub fn spawn_ingress_at(
             "--executor-query-endpoints",
             &format!("http://{}", spec.executor_query),
         ]);
+    // The v2 sequencers check each sender, and the ingress reads no
+    // receipts: its local account layer gets no rows.
+    if spec.verdicts {
+        cmd.args(["--verdicts", "true", "--admission-checks", "false"]);
+    }
     with_log_config(&mut cmd, spec);
     // The ingress is the tx_data recorder. With this flag, the shared
     // archive records every shard's publication. This is what makes a

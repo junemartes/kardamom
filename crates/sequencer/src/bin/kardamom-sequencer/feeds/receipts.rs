@@ -6,8 +6,11 @@ use std::ops::ControlFlow;
 
 use kardamom_cache::LiveAccountsWriter;
 use kardamom_log::aeron_live::{ReceiptFrame, TxReceiptsReceiver, TxReceiptsSubscriberHandle};
+use kardamom_obs::pipeline::{LoopMeter, LoopState};
+use kardamom_sequencer::admission::AccountState;
 use kardamom_sequencer::resync::{FloorEvent, FloorUpdate};
 use kardamom_sequencer::sequencer::Shutdown;
+use kardamom_sequencer::v2::AccountEvent;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
 use kardamom_types::{AccountRow, ReceiptBatch, ReceiptRollback};
 
@@ -29,21 +32,29 @@ use kardamom_types::{AccountRow, ReceiptBatch, ReceiptRollback};
 /// sync `ResyncController` in the publish loop.
 pub(crate) struct ReceiptFloorFeed {
     vslots: VslotSet,
-    floor_tx: crossbeam_channel::Sender<FloorEvent>,
+    sink: ReceiptSink,
     /// The local account layer's one writer.
     writer: LiveAccountsWriter,
+    /// Idle while the task waits for a frame, busy while it applies one,
+    /// and blocked while the account events wait for room in the queue of
+    /// the v2 loop.
+    meter: LoopMeter,
+}
+
+/// Where the receipts of this replica's senders go: the floor channel of
+/// the v1 loop, or the account events of the v2 loop.
+pub(crate) enum ReceiptSink {
+    Floors(crossbeam_channel::Sender<FloorEvent>),
+    Accounts(crossbeam_channel::Sender<AccountEvent>),
 }
 
 impl ReceiptFloorFeed {
-    pub(crate) fn new(
-        vslots: VslotSet,
-        floor_tx: crossbeam_channel::Sender<FloorEvent>,
-        writer: LiveAccountsWriter,
-    ) -> Self {
+    pub(crate) fn new(vslots: VslotSet, sink: ReceiptSink, writer: LiveAccountsWriter) -> Self {
         Self {
             vslots,
-            floor_tx,
+            sink,
             writer,
+            meter: LoopMeter::new("sequencer.receipt_feed"),
         }
     }
 
@@ -84,10 +95,13 @@ impl ReceiptFloorFeed {
                 None => return ControlFlow::Break(()),
             },
         };
-        match frame {
+        self.meter.mark(LoopState::Idle);
+        let flow = match frame {
             ReceiptFrame::Batch(batch) => self.forward_batch(batch),
             ReceiptFrame::Rollback(rollback) => self.forward_rollback(rollback),
-        }
+        };
+        self.meter.mark(LoopState::Busy);
+        flow
     }
 
     /// An executor rolled back. The local layer holds rows of the void
@@ -102,9 +116,14 @@ impl ReceiptFloorFeed {
             to_block = rollback.to_block,
             "an executor rolled back; the floors above the block are void"
         );
-        match self.floor_tx.send(FloorEvent::Rollback(rollback)) {
-            Ok(()) => ControlFlow::Continue(()),
-            Err(_) => ControlFlow::Break(()),
+        let sent = match &self.sink {
+            ReceiptSink::Floors(floor_tx) => floor_tx.send(FloorEvent::Rollback(rollback)).is_ok(),
+            ReceiptSink::Accounts(accounts) => accounts.send(AccountEvent::Rollback).is_ok(),
+        };
+        if sent {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
         }
     }
 
@@ -113,6 +132,7 @@ impl ReceiptFloorFeed {
     /// filter. The rows go first, so a lookup request the receipt's
     /// park raises finds the entry.
     fn forward_batch(&mut self, batch: ReceiptBatch) -> ControlFlow<()> {
+        let block = batch.receipts.last().map(|r| r.block_number);
         if let Some(end) = batch.end_tx_idx() {
             let rows: Vec<AccountRow> = batch
                 .accounts
@@ -120,6 +140,17 @@ impl ReceiptFloorFeed {
                 .filter(|row| self.vslots.contains(vslot_for(row.address)))
                 .collect();
             self.writer.apply(end, &rows);
+            if let (ReceiptSink::Accounts(accounts), Some(block)) = (&self.sink, block) {
+                let event = rows_event(block, end.as_index(), &rows);
+                self.meter.mark(LoopState::Busy);
+                let sent = accounts.send(event);
+                self.meter.mark(LoopState::Blocked);
+                return if sent.is_ok() {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(())
+                };
+            }
         }
         for receipt in &batch.receipts {
             self.forward_one_receipt(receipt)?;
@@ -143,10 +174,10 @@ impl ReceiptFloorFeed {
         if !self.vslots.contains(vslot_for(receipt.from)) {
             return ControlFlow::Continue(());
         }
-        match self
-            .floor_tx
-            .try_send(FloorUpdate::of_receipt(receipt).into())
-        {
+        let ReceiptSink::Floors(floor_tx) = &self.sink else {
+            return ControlFlow::Continue(());
+        };
+        match floor_tx.try_send(FloorUpdate::of_receipt(receipt).into()) {
             Ok(()) => ControlFlow::Continue(()),
             // The publish loop is stalled past the resync window already.
             // Dropping is safe: an unproven skip just falls through to
@@ -160,6 +191,24 @@ impl ReceiptFloorFeed {
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => ControlFlow::Break(()),
         }
     }
+}
+
+/// The rows of one batch as the state of each account at `tx_idx`, the
+/// end of the batch, for the v2 loop.
+fn rows_event(block: u64, tx_idx: u64, rows: &[AccountRow]) -> AccountEvent {
+    let rows = rows
+        .iter()
+        .map(|row| {
+            let state = AccountState {
+                nonce: row.nonce,
+                balance: row.balance,
+                delegated: false,
+                tx_idx,
+            };
+            (row.address, state)
+        })
+        .collect();
+    AccountEvent::Rows { block, rows }
 }
 
 #[cfg(test)]
@@ -178,7 +227,8 @@ mod tests {
     fn a_rollback_follows_the_receipts_and_empties_the_local_layer() {
         let (floor_tx, floor_rx) = crossbeam_channel::unbounded();
         let (live, writer) = LiveAccounts::new(&LiveAccountsConfig::default());
-        let mut feed = ReceiptFloorFeed::new(VslotSet::full(), floor_tx, writer);
+        let mut feed =
+            ReceiptFloorFeed::new(VslotSet::full(), ReceiptSink::Floors(floor_tx), writer);
         let sender = Address::repeat_byte(0x31);
         let receipt = Receipt {
             from: sender,

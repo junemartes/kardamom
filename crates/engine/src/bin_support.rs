@@ -21,6 +21,7 @@ use anyhow::{Context, Result};
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::AeronConfig;
 use kardamom_log::refetch::{EndpointSource, RefetchConfig};
+use kardamom_obs::pipeline::Queue;
 use kardamom_state::Durability;
 use kardamom_types::{AccountChange, CodeEntry, TxDataLoc, TxEnvelope};
 
@@ -145,9 +146,14 @@ pub fn bounded_join_timeout(resuming: bool) -> Duration {
 /// tokio channel. The engine's reader thread blocks on the channel, with
 /// `blocking_recv`. No pump task sits between them. This is public so a
 /// binary's `EngineWiring` can name it as its `TxData` type.
+///
+/// Every lane sets the one `executor.tx_data` queue before each receive.
+/// The queue thus shows the backlog of the lane that read last. The
+/// per-lane backlog is the `shard` series of the `tx_data` queue depth.
 pub struct LiveTxDataSub {
     sequencer_id: u8,
     rx: kardamom_log::aeron_live::TxDataSubscription,
+    queue: Queue,
 }
 
 impl TxDataSubscription for LiveTxDataSub {
@@ -165,6 +171,7 @@ impl TxDataSubscription for LiveTxDataSub {
             "shard" => self.sequencer_id.to_string()
         )
         .set(self.rx.len() as f64);
+        self.queue.set(self.rx.len());
         self.rx.blocking_recv().ok_or(ExecutorError::TxDataClosed {
             sequencer_id: self.sequencer_id,
         })
@@ -202,6 +209,7 @@ pub fn open_tx_data_subs(
             Ok(LiveTxDataSub {
                 sequencer_id: shard_id,
                 rx,
+                queue: Queue::new("executor.tx_data"),
             })
         })
         .collect()
@@ -356,35 +364,136 @@ pub type LiveTxOrderingSub = crate::reader::cluster::ClusterTxOrderingSubscripti
     kardamom_cluster_adapter::LiveIngress,
 >;
 
-/// The live canonical stream with its bytes: the member feed, and no
-/// second source.
+/// The live canonical stream with its bytes: the member feed, then the
+/// egress when a setting names one. A cursor below the replay window of
+/// the member reads the egress from the cursor, and the reader goes back
+/// to the feed once the feed serves the cursor again.
 pub type LiveCarriedSub = crate::reader::carried::CarriedSubscription<
     crate::reader::carried::AeronFeed,
+    Option<crate::reader::carried::EgressTransport>,
+>;
+
+/// The guard of a cluster session: the session lives while the guard does.
+pub type LiveClusterGuard = kardamom_cluster_adapter::LiveCluster;
+
+/// The canonical stream with its bytes, read from the egress.
+pub type LiveEgressSub = crate::reader::carried::CarriedSubscription<
+    crate::reader::carried::EgressTransport,
     crate::reader::carried::NoSource,
 >;
 
-/// Open the member feed on a dedicated Aeron runtime on `aeron_dir`, the
-/// media driver that the executor shares with its member, and read it from
-/// `cursor`. With a committed `history`, the reader first compares the
-/// stream with it, from the floor of the history to `cursor`. The feed
-/// reads as closed once `stop` is cancelled.
+/// The canonical stream of a reader after the executors: the cluster
+/// egress, or the egress of the executors.
+pub enum LiveOrdering {
+    /// The references of the cluster egress. The reader joins each one with
+    /// its envelope from `tx_data`.
+    Cluster(LiveTxOrderingSub),
+    /// The entries with their bytes, from the egress. It is boxed: it is
+    /// far larger than the reference subscription.
+    Egress(Box<LiveEgressSub>),
+}
+
+impl crate::TxOrderingSubscription for LiveOrdering {
+    fn next(&mut self) -> Result<(crate::BPosition, crate::reader::Ordered), crate::ExecutorError> {
+        match self {
+            Self::Cluster(sub) => sub.next(),
+            Self::Egress(sub) => sub.next(),
+        }
+    }
+
+    /// Only the reference stream has entries to void. The egress stream
+    /// carries the bytes, so it never votes.
+    fn vote(
+        &mut self,
+        voter_id: u8,
+        void: &kardamom_types::VoidRecord,
+    ) -> kardamom_cluster_adapter::OfferOutcome {
+        match self {
+            Self::Cluster(sub) => sub.vote(voter_id, void),
+            Self::Egress(_) => kardamom_cluster_adapter::OfferOutcome::NotConnected,
+        }
+    }
+}
+
+/// Open the egress at `base` (`http://host:port`) from `cursor`. See
+/// [`open_egress_transport`].
+///
+/// # Errors
+///
+/// Returns `Err` when the live subscription does not open.
+pub fn open_egress(
+    rt: &AeronRuntime,
+    plane: &mut kardamom_log::discovery::StreamPlane,
+    base: String,
+    cursor: crate::reader::cluster::ReplayCursor,
+) -> Result<LiveEgressSub> {
+    use crate::reader::carried::{CarriedSubscription, NoSource};
+    let transport = open_egress_transport(rt, plane, base)?;
+    Ok(CarriedSubscription::new(transport, NoSource, cursor))
+}
+
+/// Open one source of the egress at `base` (`http://host:port`): its range
+/// reads on the current Tokio runtime, and its live `egress_order` frames
+/// through `plane`. A thread moves the live frames to the reader. The
+/// thread ends when `rt` ends or the transport goes.
+///
+/// # Errors
+///
+/// Returns `Err` when the live subscription does not open.
+pub fn open_egress_transport(
+    rt: &AeronRuntime,
+    plane: &mut kardamom_log::discovery::StreamPlane,
+    base: String,
+) -> Result<crate::reader::carried::EgressTransport> {
+    let mut frames = plane
+        .egress_order_subscription(rt)
+        .context("open egress_order")?;
+    let (live_tx, live) = crossbeam_channel::unbounded();
+    std::thread::Builder::new()
+        .name("egress-live".into())
+        .spawn(move || {
+            let _ = std::iter::from_fn(|| frames.blocking_recv())
+                .try_for_each(|frame| live_tx.send(frame.bytes));
+        })
+        .context("spawn the egress-live thread")?;
+    Ok(crate::reader::carried::EgressTransport::new(
+        base,
+        live,
+        tokio::runtime::Handle::current(),
+    ))
+}
+
+/// What [`open_member_feed`] opens the reader of the member feed with.
+pub struct MemberFeed<'a> {
+    /// The media driver that the executor shares with its member.
+    pub aeron_dir: Option<&'a Path>,
+    pub cursor: crate::reader::cluster::ReplayCursor,
+    /// The committed history that the reader compares the stream with
+    /// first, from the floor of the history to `cursor`.
+    pub history: Option<crate::reader::carried::LocalHistory>,
+    /// The second source: the egress, for a cursor below the replay window
+    /// of the member.
+    pub egress: Option<crate::reader::carried::EgressTransport>,
+    /// The feed reads as closed once this token is cancelled.
+    pub stop: tokio_util::sync::CancellationToken,
+}
+
+/// Open the member feed on a dedicated Aeron runtime on the media driver
+/// at `aeron_dir`, and read it from `cursor`, with `egress` as the second
+/// source. With a committed `history`, the reader first compares the
+/// stream with it.
 ///
 /// # Errors
 ///
 /// Returns `Err` when the runtime fails to spawn, or the feed streams fail
 /// to open.
-pub fn open_member_feed(
-    aeron_dir: Option<&Path>,
-    cursor: crate::reader::cluster::ReplayCursor,
-    history: Option<crate::reader::carried::LocalHistory>,
-    stop: tokio_util::sync::CancellationToken,
-) -> Result<LiveCarriedSub> {
-    use crate::reader::carried::{AeronFeed, CarriedSubscription, NoSource};
-    let rt = AeronRuntime::spawn(aeron_dir).context("spawn the member feed AeronRuntime")?;
-    let feed = AeronFeed::open(rt, stop).context("open the member feed")?;
-    Ok(match history {
-        Some(history) => CarriedSubscription::compared(feed, NoSource, history),
-        None => CarriedSubscription::new(feed, NoSource, cursor),
+pub fn open_member_feed(cfg: MemberFeed<'_>) -> Result<LiveCarriedSub> {
+    use crate::reader::carried::{AeronFeed, CarriedSubscription};
+    let rt = AeronRuntime::spawn(cfg.aeron_dir).context("spawn the member feed AeronRuntime")?;
+    let feed = AeronFeed::open(rt, cfg.stop).context("open the member feed")?;
+    Ok(match cfg.history {
+        Some(history) => CarriedSubscription::compared(feed, cfg.egress, history),
+        None => CarriedSubscription::new(feed, cfg.egress, cfg.cursor),
     })
 }
 
@@ -413,6 +522,34 @@ pub fn connect_cluster_ordering(
         .context("connect cluster tx_ordering subscription")
 }
 
+/// Connect a cluster session that only publishes: it reads no canonical
+/// stream and drops every egress frame at the session thread. The batcher
+/// that reads the egress sends its posted cursor over it.
+///
+/// # Errors
+///
+/// Returns `Err` when the runtime fails to spawn or the session fails to
+/// connect.
+pub fn connect_cluster_publisher(
+    aeron_dir: Option<&Path>,
+    cfg: kardamom_cluster_adapter::LiveClusterConfig,
+) -> Result<(
+    kardamom_cluster_adapter::LiveCluster,
+    kardamom_cluster_adapter::LiveIngress,
+)> {
+    let cluster_rt = AeronRuntime::spawn(aeron_dir).context("spawn cluster AeronRuntime")?;
+    let (cluster, ingress, _egress) = kardamom_cluster_adapter::live::connect_with(
+        cluster_rt,
+        cfg,
+        kardamom_cluster_adapter::live::ConnectOptions {
+            egress_kind_filter: Some(Vec::new()),
+            ..Default::default()
+        },
+    )
+    .context("connect the cluster publisher session")?;
+    Ok((cluster, ingress))
+}
+
 /// Everything [`open_inbound`] needs, gathered so the function reads no
 /// eight-argument list.
 pub struct InboundConfig<'a> {
@@ -432,6 +569,10 @@ pub struct InboundConfig<'a> {
     /// re-export; the validator suppresses its own copy to avoid a
     /// second, lagging series.
     pub suppress_sealer_metrics: bool,
+    /// Read the canonical stream from the egress at this base URL, not
+    /// from the cluster egress. The stream then carries the bytes: no
+    /// `tx_data` lane opens, and nothing joins.
+    pub egress: Option<String>,
 }
 
 /// Open the shared inbound side of the engine, both role binaries run
@@ -448,14 +589,30 @@ pub struct InboundConfig<'a> {
 /// ordering connection fails.
 pub fn open_inbound<W>(
     cfg: InboundConfig<'_>,
-) -> Result<(crate::Inbound<W>, kardamom_cluster_adapter::LiveCluster)>
+) -> Result<(
+    crate::Inbound<W>,
+    Option<kardamom_cluster_adapter::LiveCluster>,
+)>
 where
     W: crate::EngineWiring<
             TxData = LiveTxDataSub,
-            TxOrdering = LiveTxOrderingSub,
+            TxOrdering = LiveOrdering,
             ExecStream = crate::reader::NoExecStream,
         >,
 {
+    if let Some(base) = cfg.egress {
+        tracing::info!(%base, "{}: the canonical stream via the egress", cfg.bin_name);
+        let sub = open_egress(cfg.rt, cfg.plane, base, cfg.cursor)?;
+        return Ok((
+            crate::Inbound {
+                tx_data: Vec::new(),
+                tx_ordering: LiveOrdering::Egress(Box::new(sub)),
+                join_recovery: None,
+                exec_stream: crate::reader::NoExecStream,
+            },
+            None,
+        ));
+    }
     let tx_data = open_tx_data_subs(cfg.rt, cfg.plane)?;
     let join_recovery = archive_join_recovery(
         cfg.plane,
@@ -475,11 +632,11 @@ where
     Ok((
         crate::Inbound {
             tx_data,
-            tx_ordering,
+            tx_ordering: LiveOrdering::Cluster(tx_ordering),
             join_recovery,
             exec_stream: crate::reader::NoExecStream,
         },
-        cluster_guard,
+        Some(cluster_guard),
     ))
 }
 

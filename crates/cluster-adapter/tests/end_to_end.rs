@@ -92,6 +92,7 @@ fn dedup_order_and_boundary_alignment_end_to_end() {
                 nonce: 0,
                 ..GuardHeader::EXEMPT
             },
+            envelope: None,
         })
         .unwrap();
     publisher
@@ -102,6 +103,7 @@ fn dedup_order_and_boundary_alignment_end_to_end() {
                 nonce: 1,
                 ..GuardHeader::EXEMPT
             },
+            envelope: None,
         })
         .unwrap();
     publisher
@@ -112,6 +114,7 @@ fn dedup_order_and_boundary_alignment_end_to_end() {
                 nonce: 0,
                 ..GuardHeader::EXEMPT
             },
+            envelope: None,
         })
         .unwrap(); // duplicate (republish)
     publisher
@@ -122,6 +125,7 @@ fn dedup_order_and_boundary_alignment_end_to_end() {
                 nonce: 2,
                 ..GuardHeader::EXEMPT
             },
+            envelope: None,
         })
         .unwrap();
 

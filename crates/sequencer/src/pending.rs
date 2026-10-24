@@ -192,17 +192,19 @@ impl<T> PendingBuffer<T> {
         parked.then(|| self.remove(nonce)).flatten()
     }
 
-    /// Drop every buffered entry with a nonce below `floor`. Returns how
-    /// many were dropped. The receipt-floor advance
+    /// Drop every buffered entry with a nonce below `floor`. Returns the
+    /// dropped entries with their nonces, in nonce order. The
+    /// receipt-floor advance
     /// ([`crate::state::PartitionState::advance_floor`]) uses this. Entries
     /// below an executed-truth floor are proven duplicates of already
     /// executed transactions, so dropping them can never create a
     /// canonical gap.
-    pub(crate) fn drop_below(&mut self, floor: u64) -> usize {
+    pub(crate) fn drop_below(&mut self, floor: u64) -> Vec<(u64, T)> {
         let keep = self.inner.split_off(&floor);
-        let dropped = self.inner.len();
-        self.inner = keep;
-        dropped
+        std::mem::replace(&mut self.inner, keep)
+            .into_iter()
+            .map(|(nonce, slot)| (nonce, slot.value))
+            .collect()
     }
 
     /// Drain the contiguous run of nonces starting at `start`. Stops at the

@@ -56,18 +56,25 @@ The streams and their publishers:
 | Topic | Publisher | Consumers |
 | --- | --- | --- |
 | `tx_data` (one record per lane) | ingress | sequencer, executor, validator, batcher, ingress archives |
-| `tx_receipts` | executor | ingress, sequencer, validator |
+| `tx_receipts` | executor | ingress, sequencer, validator, egress |
 | `tx_receipt_boundaries` | executor | ingress |
 | `tx_errors` | sequencer | ingress, notifier |
 | `tx_status` | sequencer, ingress | notifier |
+| `tx_verdicts` (one record per target ingress) | sequencer (v2 loop, `[admission] verdicts`) | the target ingress (`--verdicts`) |
 | `tx_deposits` | DA watcher | sequencer, DA watcher archive |
 | `tx_remote_epochs` | DA watcher | sequencer |
 | `tx_bal` | executor | validator |
 | `events` | ingress, sequencer, executor, validator, batcher, DA watcher, L1 follower, state mirror | ingress, validator, DA watcher, batcher |
 | `exec_txs` | executor | validator, batcher (none subscribes yet), the archive on the node of each executor |
+| `exec_frames` | executor (with `--exec-frames`) | egress |
+| `egress_order` | egress | the readers after the executors (batcher, validator) |
+| `egress_receipts` | egress | sequencers (with `receipts_from_egress = true`), notifier (with `--receipts-from-egress`) |
+| `tx_drops` (one record per sequencer, with its lane) | sequencer | egress |
 | `l1_blocks` | L1 follower (two instances) | da-watcher, batcher, follower archives |
 
 The `exec_txs` stream carries the transactions that an executor joins, in canonical order: one `ExecTxRecord` for each `TxRef`.
+
+The `tx_verdicts` stream carries the verdict of the sequencer for each transaction of one ingress: one `TxStatus` record, `Accepted` or `Rejected` with the reason. The ingress answers `eth_sendRawTransaction` on it. The stream of ingress `i` has the id `tx_verdicts_stream_id_base + i` (3000 + i by default), so `i` is at most 255 and each ingress joins only its own stream. A sequencer opens the publication of an ingress on its first verdict for it. Each offer is best effort: the Aeron thread holds a refused frame until the offer deadline, so the first verdicts wait for the image of the ingress to connect. A frame past the deadline drops, and the client gets the ack timeout of its ingress.
 
 - The stream id is 1005. The channel and the stream id are the keys `exec_txs_channel` and `exec_txs_stream_id` of `[channels]`.
 - Each executor opens two publications on stream 1005. One publisher thread writes both, in the same order:
@@ -76,6 +83,34 @@ The `exec_txs` stream carries the transactions that an executor joins, in canoni
 - A static plane whose `exec_txs_channel` is IPC opens only the recorded publication. Its consumers read that one.
 - A slow or absent archive refuses the recorded offer. The publisher offers the record again until the archive takes it. The reader then blocks, and this executor stalls. It never executes a record that its archive did not take.
 - The validator and the batcher name the topic as their future source. No service subscribes to it yet.
+
+The `exec_frames` stream carries the canonical frames that an executor reads, byte for byte, in the order that it executes them: each relayed record (egress kind 1) and each block boundary (kind 2), once. Each message is `[seq:u64][frame]`. The sequence counts every frame that the reader delivers, also one that the executor drops, so the egress sees a gap in one copy as a jump of the sequence.
+
+- The stream id is 1008. The channel and the stream id are the keys `exec_frames_channel` and `exec_frames_stream_id` of `[channels]`.
+- The reader holds the bytes of each frame until it delivers the item of the frame, then sends them. So a frame of a replay, a copy, or a live frame ahead of a gap goes out once, in canonical order.
+- Each executor opens one dynamic MDC publication with a `kardamom-mdc-publisher` record (topic `exec_frames`). The offer is best effort. A full queue in the executor drops the frame and counts `kardamom_executor_egress_frames_dropped_total`. The egress reads every executor, so it takes a lost frame from the copy of another executor.
+- The executor publishes it only with `--exec-frames` (env `KARDAMOM_EXEC_FRAMES`).
+
+The `egress_order` stream carries the canonical stream that the egress merged from the `exec_frames` copies, live, in canonical order: the record and boundary frames of the member feed, byte for byte, with no sequence.
+
+- The stream id is 1009. The channel and the stream id are the keys `egress_order_channel` and `egress_order_stream_id` of `[channels]`.
+- Each egress instance opens one dynamic MDC publication (topic `egress_order`). A reader gets the copies of every instance and keeps the first of each frame.
+- A reader that resumes reads the frames before the live stream from the range read of one instance: `GET /v1/frames?from_index=<i>&from_block=<b>`.
+
+The `egress_receipts` stream carries the receipts that the egress merged from the `tx_receipts` stream of every executor, each once, in the frame format of `tx_receipts`: the batches with their account rows, and each rollback once.
+
+- The stream id is 1011. The channel and the stream id are the keys `egress_receipts_channel` and `egress_receipts_stream_id` of `[channels]`.
+- The executors cut their batches differently. The egress passes on only the receipts of a batch past the last receipt that it took, with the rows of the batch. The rows are absolute values, and a reader keeps the row of the higher position.
+- A sequencer reads it in place of `tx_receipts` with `receipts_from_egress = true` in its config.
+- The egress also answers `eth_getTransactionReceipt` as the state query of an executor does (`POST /`, the receipt as rkyv hex, the block in `x-state-block`). An ingress reads it with `--receipt-query-endpoints`.
+
+The `tx_drops` stream carries the transactions that the sequencers dropped: one `TxDrop` record for each drop, with the hash, the sender, the nonce and the reason. The reason has the error text of geth, for example `nonce too low` or `txpool is full`.
+
+- The stream id is 1012. The channel and the stream id are the keys `tx_drops_channel` and `tx_drops_stream_id` of `[channels]`.
+- Each sequencer opens one dynamic MDC publication with a `kardamom-mdc-publisher` record (topic `tx_drops`) that carries its lane id. The egress subscribes with no lane id, so it joins the sequencers of every lane.
+- The offer is best effort. A refused offer drops the record, and the client then sees the status `unknown` for that hash.
+- Both twins of a lane publish their drops. The egress keeps one status for each hash, and a receipt of the hash wins over a drop.
+- The egress serves the status with `kardamom_getTransactionStatus`.
 
 The `l1_blocks` stream carries the finalized L1 blocks: one `L1Block` for each block, in block order.
 
@@ -298,10 +333,11 @@ No job configures a publication control port.
 | Job | Publications |
 | --- | --- |
 | ingress | 8 `tx_data` lanes, `tx_status` |
-| executor | receipts, boundaries, BAL, the live `exec_txs` publication |
+| executor | receipts, boundaries, BAL, the live `exec_txs` publication, `exec_frames` (with `--exec-frames`) |
 | da-watcher | deposits, remote epochs (subscribes to `l1_blocks` and `events`) |
 | l1-indexer | `l1_blocks`, `events` |
-| sequencer lane `n` | `tx_errors`, `tx_status` |
+| sequencer lane `n` | `tx_errors`, `tx_status`, `tx_drops`, one `tx_verdicts` for each ingress that it answers |
+| egress | `egress_order`, `egress_receipts` (subscribes to `exec_frames`, `tx_receipts` and `tx_drops`) |
 
 The aeron system job registers the archive record with the `archive_topics`
 meta of the node:

@@ -116,6 +116,33 @@ variable "exec_cursor" {
   }
 }
 
+# The canonical frames to the egress, "on" or "off" (--exec-frames). On,
+# each executor publishes the frames that it executes on exec_frames for
+# the egress (egress.nomad.hcl). Off, the executor publishes no frame.
+# Ansible deployment passes -var from KARDAMOM_EXEC_FRAMES.
+variable "exec_frames" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.exec_frames)
+    error_message = "The exec_frames value must be on or off."
+  }
+}
+
+# The block log of the checkpoints, "on" or "off" (--checkpoint-log). On,
+# each executor logs the write batch of each committed block next to its
+# checkpoints, and copies the state only when the base rule asks for a new
+# base, at a rate limit. Off, it copies the whole state each 20 s. Ansible
+# deployment passes -var from KARDAMOM_CHECKPOINT_LOG.
+variable "checkpoint_log" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.checkpoint_log)
+    error_message = "The checkpoint_log value must be on or off."
+  }
+}
+
 variable "executor_query_port" {
   type    = number
   default = 9024
@@ -131,11 +158,15 @@ job "executor" {
   # release keeps the receipt that used the nonce as the index of its hash
   # and of its (sender, nonce), when the sealer orders a transaction more
   # than once (first_receipt). The upgrade check
-  # (`just sealer-upgrade-check <env>`) reads these metas.
+  # (`just sealer-upgrade-check <env>`) reads these metas. The executor of
+  # this release runs a full reference that a sealer below decision
+  # version 5 relays as is (relayed_full_ref). An older executor drops that
+  # frame and stops at the gap.
   meta {
     nonce_burn          = "true"
     chain_state_install = "true"
     first_receipt       = "true"
+    relayed_full_ref    = "true"
   }
 
   datacenters = [var.datacenter]
@@ -237,6 +268,8 @@ job "executor" {
         KARDAMOM_BAL_GRANULARITY = "20"
         # The recorded cursor to the sealer, under the void voter id.
         KARDAMOM_EXEC_CURSOR = var.exec_cursor == "on" ? "true" : "false"
+        # The block log of the checkpoints.
+        KARDAMOM_CHECKPOINT_LOG = var.checkpoint_log == "on" ? "true" : "false"
         # KARDAMOM_BAL_MEASURE stays unset in deployed profiles. The
         # K-ladder measure mode re-encodes every frame 4 times, on the
         # publisher thread. Under DeFi loads, that saturated the
@@ -267,7 +300,7 @@ job "executor" {
           # executor's, re-replicated in.
           "/opt/kardamom/checkpoints:/opt/kardamom/checkpoints",
         ]
-        args = [
+        args = concat([
           "--config", "/local/executor.toml",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
@@ -329,7 +362,9 @@ job "executor" {
           # cluster network; loopback scrapes (docker exec
           # curl 127.0.0.1:9004) keep working too.
           "--metrics-addr", "0.0.0.0:9004",
-        ]
+          ],
+          var.exec_frames == "on" ? ["--exec-frames"] : [],
+        )
       }
 
       # Cluster LogConfig (UDP multicast channels), read through

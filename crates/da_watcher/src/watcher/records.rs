@@ -10,7 +10,7 @@ use kardamom_types::{EpochRecord, L1Block};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use super::{L1Watcher, MonitorError, Position};
+use super::{L1Watcher, MonitorError, PACED_BACKLOG, Position};
 use crate::feed::BlockFeed;
 use crate::l1_cursor::L1Cursor;
 use crate::metrics;
@@ -42,8 +42,18 @@ impl<F: BlockFeed, P: EpochPublisher> L1Watcher<F, P> {
         let mut published = 0usize;
         while let ControlFlow::Continue(one) = self.process_one()? {
             published = published.saturating_add(usize::from(one));
+            if one && self.paces() {
+                self.retry_at = Instant::now().checked_add(self.pace);
+                break;
+            }
         }
         Ok(published)
+    }
+
+    /// Whether the next record waits for the pace: a pace is set, and a
+    /// backlog of at most [`PACED_BACKLOG`] records waits.
+    fn paces(&self) -> bool {
+        !self.pace.is_zero() && (1..=PACED_BACKLOG).contains(&self.inbox.len())
     }
 
     /// Take the first record of the inbox. `Continue` with whether an

@@ -73,6 +73,15 @@ pub struct AccountView {
     pub tx_idx: u64,
 }
 
+/// One batch of a [`AccountCache::write_batches`] pipeline: its account
+/// rows at its end position, and its receipts.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchWrite<'a> {
+    pub end: BPosition,
+    pub rows: &'a [AccountRow],
+    pub receipts: &'a [Receipt],
+}
+
 /// The outcome of one `write_rows` pipeline, by row.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RowsWritten {
@@ -309,6 +318,7 @@ impl AccountCache {
         if !claimed {
             return;
         }
+        crate::metrics::record_reconnect();
         let this = self.clone();
         tokio::spawn(async move {
             match connect_within(&this.source, this.connect_timeout).await {
@@ -351,27 +361,12 @@ impl AccountCache {
         end: BPosition,
         rows: &[AccountRow],
     ) -> Result<RowsWritten, CacheError> {
-        if rows.is_empty() {
-            return Ok(RowsWritten::default());
-        }
-        let tag = keys::position_tag(end);
-        // A pipeline calls EVALSHA and does not load a missing script, and
-        // a fresh primary after a failover has none. One SCRIPT LOAD per
-        // batch is one round trip; a batch lands every few milliseconds.
-        self.load_script().await?;
-        let mut pipe = redis::pipe();
-        for row in rows {
-            let mut invocation = self.apply_row.key(keys::account(row.address));
-            invocation
-                .arg(&tag)
-                .arg(row.nonce)
-                .arg(row.balance.to_string());
-            pipe.invoke_script(&invocation);
-        }
-        let codes: Vec<i64> = self.run_pipe(&pipe).await?;
-        let written = RowsWritten::from_codes(&codes);
-        metrics::record_rows_written(&written);
-        Ok(written)
+        self.write_batches(&[BatchWrite {
+            end,
+            rows,
+            receipts: &[],
+        }])
+        .await
     }
 
     /// Index a batch's receipts by `(sender, nonce)`, with the receipt
@@ -383,7 +378,76 @@ impl AccountCache {
     /// Returns the Redis error or [`CacheError::Timeout`], or
     /// [`CacheError::Codec`] when a receipt does not encode.
     pub async fn write_receipts(&self, receipts: &[Receipt]) -> Result<(), CacheError> {
+        self.write_batches(&[BatchWrite {
+            end: BPosition::from_index(0),
+            rows: &[],
+            receipts,
+        }])
+        .await
+        .map(|_| ())
+    }
+
+    /// Write the rows and the receipts of several batches in one pipeline.
+    /// Each row goes through the monotone rule with the end position of its
+    /// own batch, so the batches may come in any order and more than once.
+    /// One pipeline is one round trip, where a write per batch costs one
+    /// for each batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Redis error or [`CacheError::Timeout`], or
+    /// [`CacheError::Codec`] when a receipt does not encode. Nothing of the
+    /// batches is then known to be written; the mirror retries them all.
+    pub async fn write_batches(
+        &self,
+        batches: &[BatchWrite<'_>],
+    ) -> Result<RowsWritten, CacheError> {
         let mut pipe = redis::pipe();
+        let with_rows = batches.iter().any(|b| !b.rows.is_empty());
+        for batch in batches {
+            self.push_rows(&mut pipe, batch.end, batch.rows);
+            self.push_receipts(&mut pipe, batch.receipts)?;
+        }
+        if pipe.cmd_iter().next().is_none() {
+            return Ok(RowsWritten::default());
+        }
+        // A pipeline calls EVALSHA and does not load a missing script, and
+        // a fresh primary after a failover has none. One SCRIPT LOAD per
+        // pipeline is one round trip.
+        if with_rows {
+            self.load_script().await?;
+        }
+        let codes: Vec<i64> = self.run_pipe(&pipe).await?;
+        let written = RowsWritten::from_codes(&codes);
+        metrics::record_rows_written(&written);
+        Ok(written)
+    }
+
+    /// Add the row script of each row to `pipe`, tagged with `end`. Each
+    /// invocation answers one code.
+    fn push_rows(&self, pipe: &mut redis::Pipeline, end: BPosition, rows: &[AccountRow]) {
+        if rows.is_empty() {
+            return;
+        }
+        let tag = keys::position_tag(end);
+        for row in rows {
+            let mut invocation = self.apply_row.key(keys::account(row.address));
+            invocation
+                .arg(&tag)
+                .arg(row.nonce)
+                .arg(row.balance.to_string());
+            pipe.invoke_script(&invocation);
+        }
+    }
+
+    /// Add a `SET` with the receipt TTL for each indexed receipt to
+    /// `pipe`. The replies are ignored, so the codes of the pipeline stay
+    /// the codes of the rows.
+    fn push_receipts(
+        &self,
+        pipe: &mut redis::Pipeline,
+        receipts: &[Receipt],
+    ) -> Result<(), CacheError> {
         let indexed = receipts
             .iter()
             .filter(|r| !r.is_deposit() && r.tx_type != TX_TYPE_XCHAIN);
@@ -404,10 +468,7 @@ impl AccountCache {
             }
             set.ignore();
         }
-        if pipe.cmd_iter().next().is_none() {
-            return Ok(());
-        }
-        self.run_pipe::<()>(&pipe).await
+        Ok(())
     }
 
     /// The indexed receipt of `(sender, nonce)`, when one is stored.

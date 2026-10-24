@@ -4,6 +4,7 @@ import io.aeron.Publication;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.test.Tests;
 import io.kardamom.sealer.CanonicalSealerState;
+import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import org.agrona.ExpandableArrayBuffer;
 
@@ -192,6 +193,21 @@ final class IngressFrames {
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
         buf.putBytes(0, postedCursorFrame(postedHead));
         offerFully(client, buf, SealerWire.MIN_POSTED_CURSOR_LEN);
+    }
+
+    /**
+     * A kind-0 transaction reference (record type 0) of {@code sender20}
+     * at {@code nonce}, of image {@code (lane 0, session 9)} at
+     * {@code position}: the position goes in the deadline field with its
+     * tag.
+     */
+    static byte[] txRefFrame(final int idTag, final byte[] sender20, final long nonce, final long position) {
+        final ByteBuffer buf = ByteBuffer.allocate(SealerWire.TXREF_RECORD_LEN).order(ByteOrder.LITTLE_ENDIAN);
+        buf.put(SealerWire.KIND_INGRESS_RECORD).put(sender20).putLong(nonce)
+            .putLong(SealerWire.POSITION_TAG | position).putLong(0L).putLong(0L)
+            .put(recordId(idTag)).put(SealerWire.RT_TXREF)
+            .put((byte) 0).putInt(0).putInt((int) position).putInt(9);
+        return buf.array();
     }
 
     /**

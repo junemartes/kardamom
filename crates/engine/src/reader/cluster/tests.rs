@@ -1,4 +1,6 @@
 use super::*;
+use crate::reader::carried::tests::{entry, full_ref_at};
+use crate::reader::{JoinBuffer, ReaderConfig, ReaderToExec};
 use alloy_primitives::B256;
 use kardamom_cluster_adapter::gateway::fakes::FakeEgress;
 use kardamom_cluster_adapter::wire::{
@@ -414,4 +416,65 @@ fn status_and_lag_reject_frames_are_skipped() {
     let mut sub = ClusterTxOrderingSubscription::new(egress);
     assert_eq!(label(next(&mut sub).unwrap()), "r0");
     assert_eq!(label(next(&mut sub).unwrap()), "b1");
+}
+
+#[test]
+fn a_canonical_entry_takes_its_place_among_the_references() {
+    // Decision version 5 relays a full reference as a canonical entry with
+    // its bytes. A reference of a sequencer that has not switched yet can
+    // come next to it. Canonical order: r0 t1 b1(end2) r2.
+    let egress = FakeEgress::new();
+    egress.push(encode_egress_record(0, &relayed_txref(1, 0)).unwrap());
+    egress.push(crate::reader::carried::tests::tx_at(1));
+    egress.push(encode_egress_boundary(1, 2, 1_000, 0));
+    egress.push(encode_egress_record(2, &relayed_txref(1, 2)).unwrap());
+    egress.close();
+
+    let mut sub = ClusterTxOrderingSubscription::new(egress);
+    let got: Vec<String> = std::iter::from_fn(|| sub.next().ok())
+        .map(|(pos, item)| match item {
+            Ordered::Tx(_) => format!("t{}", pos.as_index()),
+            Ordered::Message(msg) => label((pos, msg)),
+        })
+        .collect();
+    assert_eq!(got, vec!["r0", "t1", "b1", "r2"]);
+}
+
+/// Below decision version 5 the sealer relays a full reference as is. The
+/// reader runs it as its canonical entry. The join buffer is empty, so a
+/// join would time out.
+#[test]
+fn a_relayed_full_reference_runs_with_no_join() {
+    let egress = FakeEgress::new();
+    egress.push(full_ref_at(0));
+    egress.push(encode_egress_boundary(1, 1, 1_000, 0));
+    egress.close();
+    let cfg = ReaderConfig {
+        join_timeout: std::time::Duration::from_millis(50),
+        join_poll_interval: std::time::Duration::from_millis(5),
+        ..ReaderConfig::default()
+    };
+    let out = crate::reader::tests::run_reader(
+        ClusterTxOrderingSubscription::new(egress),
+        JoinBuffer::new(),
+        cfg,
+    )
+    .expect("no join waits");
+    let tx = entry(0);
+    match &out[..] {
+        [
+            ReaderToExec::Tx {
+                envelope,
+                position,
+                tx_ref,
+            },
+            ReaderToExec::Boundary(b),
+        ] => {
+            assert_eq!(*envelope, tx.envelope);
+            assert_eq!(position.as_index(), 0);
+            assert_eq!(*tx_ref, tx.tx_ref());
+            assert_eq!(b.block_number, 1);
+        }
+        other => panic!("expected the entry and the boundary, got {other:?}"),
+    }
 }

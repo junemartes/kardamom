@@ -50,6 +50,7 @@ impl LiveAccounts {
             shared: shared.clone(),
             order: VecDeque::new(),
             capacity: cfg.capacity,
+            evictions: metrics::counter!(crate::metrics::LIVE_EVICTIONS_TOTAL),
         };
         (shared, writer)
     }
@@ -87,6 +88,8 @@ pub struct LiveAccountsWriter {
     /// Write order, for eviction. An address repeats once per write.
     order: VecDeque<(Instant, Address)>,
     capacity: NonZeroUsize,
+    /// Counts each entry that [`Self::evict`] removes from the map.
+    evictions: metrics::Counter,
 }
 
 impl LiveAccountsWriter {
@@ -152,11 +155,19 @@ impl LiveAccountsWriter {
                 || self.shared.map.len() > capacity
                 || self.order.len() > capacity.saturating_mul(4))
         {
-            self.order.pop_front();
-            self.shared
-                .map
-                .remove_if(&address, |_, entry| entry.seen_at == at);
+            self.evict_front(at, address);
         }
+    }
+
+    /// Drop the front queue entry, written at `at` for `address`. Remove
+    /// the map entry too, unless a later write replaced it.
+    fn evict_front(&mut self, at: Instant, address: Address) {
+        self.order.pop_front();
+        let removed = self
+            .shared
+            .map
+            .remove_if(&address, |_, entry| entry.seen_at == at);
+        self.evictions.increment(u64::from(removed.is_some()));
     }
 }
 
@@ -209,6 +220,26 @@ mod tests {
         assert!(live.get(Address::repeat_byte(0x02)).is_none(), "oldest out");
         assert_eq!(live.get(Address::repeat_byte(0x01)).unwrap().nonce, 2);
         assert!(live.len() <= 2);
+    }
+
+    #[test]
+    fn an_eviction_counts_only_an_entry_that_leaves_the_map() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            let (_live, mut writer) = LiveAccounts::new(&cfg(2, 60_000));
+            writer.apply(BPosition::from_index(1), &[row(0x01, 1)]);
+            writer.apply(BPosition::from_index(2), &[row(0x02, 1)]);
+            writer.apply(BPosition::from_index(3), &[row(0x01, 2)]);
+            // The stale queue entry of 0x01 leaves the queue, not the map.
+            // Then 0x02 leaves the map.
+            writer.apply(BPosition::from_index(4), &[row(0x03, 1)]);
+        });
+        let text = recorder.handle().render();
+        assert!(
+            text.lines()
+                .any(|line| line == "kardamom_cache_live_evictions_total 1"),
+            "{text}"
+        );
     }
 
     #[test]

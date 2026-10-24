@@ -3,6 +3,7 @@ package io.kardamom.sealer.cluster;
 import io.aeron.archive.ArchiveTool;
 import io.aeron.archive.ArchiveTool.VerifyOption;
 import io.aeron.cluster.ElectionState;
+import io.aeron.driver.ThreadingMode;
 import io.aeron.cluster.ClusteredMediaDriver;
 import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.Cluster;
@@ -24,7 +25,9 @@ import org.agrona.concurrent.status.AtomicCounter;
 /**
  * Boots an all-in-one Aeron Cluster member: a media driver, an archive, and
  * a consensus module, running {@link SealerClusteredService}.
- * Configure it with -D system properties.
+ * Configure it with -D system properties. With
+ * {@code -Dkardamom.cluster.backup=true} the process runs a
+ * {@link BackupNode} instead: no member, and no vote.
  */
 public final class ClusterNode {
     // App version shared with the Rust cluster-client (kardamom-cluster-client's
@@ -43,10 +46,17 @@ public final class ClusterNode {
     static final String DA_LAG_BUDGET_SETTING = "kardamom.cluster.daLagBudgetBlocks";
     /** The property of the record-lag budget, in canonical records. */
     static final String RECORD_LAG_BUDGET_SETTING = "kardamom.cluster.recordLagBudget";
+    /** The property of the file sync level of the Raft log and the archive of a member. */
+    static final String FILE_SYNC_LEVEL_SETTING = "kardamom.cluster.fileSyncLevel";
 
     public static void main(final String[] args) {
         // Every stdout line carries its time from here on (see the class).
         System.setOut(new TimestampedOut(System.out));
+        // A backup node is no member: it has no member id and never votes.
+        if (Boolean.getBoolean(BackupNode.SETTING)) {
+            new BackupNode(BackupSettings.parse(System.getProperties(), IdleCap.fromSettings())).run();
+            return;
+        }
         // "0,ingressHost:port,consensusHost:port,logHost:port,catchupHost:port,archiveHost:port|1,...|2,..."
         final String clusterMembers = System.getProperty("kardamom.cluster.members");
         if (clusterMembers == null) throw new IllegalStateException("kardamom.cluster.members not set");
@@ -212,6 +222,9 @@ public final class ClusterNode {
         // leader's log fills the gap on rejoin, as on any intact-directory
         // restart. So the repair runs in-process, then the launch retries.
         final StopRequest stop = new StopRequest();
+        // One hold for the whole start: a launch retry gets a fresh service,
+        // and the hold thread watches the one that runs.
+        final StartHold startHold = new StartHold();
         ClusteredMediaDriver driver = null;
         ClusteredServiceContainer container = null;
         SealerClusteredService service = null;
@@ -229,6 +242,7 @@ public final class ClusterNode {
                     inclusionHorizonBlocks, orderingWindow,
                     new LagBudgets(daLagBudgetBlocks, recordLagBudget));
                 seed.ifPresent(service::seededFrom);
+                service.holdAtStart(startHold);
                 final SealerClusteredService built = service;
                 carryBytes.map(CarryBytes::file).ifPresent(file -> built.carryingBytes(file, feed));
                 snapshotSchedule.ifPresent(service::snapshotEvery);
@@ -268,11 +282,16 @@ public final class ClusterNode {
                  carryBytes.map(c -> c.endpoint(launched::retainedHead)))) {
             System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
             startLogPurger(purgePlanner, new LogPurger.Member(memberId, contexts, service), consensus);
+            final JoinWatchdogThread.Member watched = new JoinWatchdogThread.Member(memberId, consensus,
+                container.context(), stop, PeerProbe.forMembers(clusterMembers, memberId, adminPort()));
+            new StartHoldThread(new StartHoldThread.Member(memberId, consensus.clusterNodeRoleCounter(),
+                consensus.electionStateCounter(), launched::leadershipTermId,
+                PeerProbe.forMembers(clusterMembers, memberId, adminPort()), stop),
+                startHold, watched.timeouts().stallLimitMs()).start();
             // The watchdog starts last. A start-up step that throws before it
             // closes the components through this block, and the watchdog must
             // not read that close as a failed component.
-            startJoinWatchdog(new JoinWatchdogThread.Member(memberId, consensus, container.context(), stop,
-                PeerProbe.forMembers(clusterMembers, memberId, adminPort())), contexts.clusterState());
+            startJoinWatchdog(watched, contexts.clusterState());
             stop.await();
         }
     }
@@ -311,7 +330,8 @@ public final class ClusterNode {
      *
      * <p>{@code stateDir} is the directory whose disk the free-space gauge
      * reads. {@code retained} serves the retained file to a member that a
-     * peer seeds.</p>
+     * peer seeds. {@code /metrics} also renders the pipeline metrics of the
+     * service and the Aeron counters of the member ({@link MetricsPage}).</p>
      */
     private static AdminServer startAdminServer(
             final ConsensusModule.Context consensus,
@@ -332,9 +352,12 @@ public final class ClusterNode {
             consensus.commitPositionCounter(),
             service,
             stateDir);
+        // The driver created the CnC file before the launch returned.
+        final MetricsPage page = new MetricsPage(memberId, service.metrics(),
+            CncCounters.map(consensus.aeronDirectoryName(), consensus.logStreamId()));
         final AdminServer admin;
         try {
-            admin = AdminServer.start(port, source::sample, lagBytes, retained);
+            admin = AdminServer.serve(port, () -> page.report(source.sample(), lagBytes), retained);
         } catch (final java.io.IOException e) {
             throw new IllegalStateException("cluster admin endpoint bind failed on port " + port, e);
         }
@@ -384,7 +407,8 @@ public final class ClusterNode {
             return new MemberStatus(memberId, roleName, electionName, commit, service.servicePosition(),
                 MemberStatus.SnapshotVersions.of(service.latestSnapshotVersion()),
                 service.decisionRules(),
-                diskFreeBytes());
+                diskFreeBytes())
+                .withStart(service.leadershipTermId(), service.holdingAtStart());
         }
 
         /**
@@ -447,6 +471,41 @@ public final class ClusterNode {
             () -> System.out.println("cluster log purge DISABLED memberId=" + member.memberId()));
     }
 
+    /**
+     * The channel of the Raft log: 8 MiB terms, and a receive window of half
+     * a term on each follower.
+     *
+     * <p>The log publication runs at the speed of the slowest follower. A
+     * follower whose archive writes wait on a busy disk stops taking the
+     * log, and once the leader fills the receive window of that follower,
+     * the leader stops too, and no block seals. The default window is
+     * 128 KiB, a fraction of a second of traffic at 1,000 transactions a
+     * second. A window of 4 MiB, the most that an 8 MiB term allows, rides
+     * out a disk stall of about 16 s at that rate. {@code so-rcvbuf} gives
+     * the socket the same room; the hosts allow 16 MiB
+     * ({@code net.core.rmem_max}).</p>
+     */
+    static final String LOG_CHANNEL = "aeron:udp?term-length=8m|rcv-wnd=4m|so-rcvbuf=4m";
+
+    /**
+     * The channel of the snapshots of the consensus module and the service:
+     * 4 MiB terms, on a sparse log buffer.
+     *
+     * <p>Each snapshot opens a new publication on this channel, once in the
+     * service and once in the consensus module. Aeron's default IPC term is
+     * 64 MiB, so each opening made a 192 MiB log buffer, and the media
+     * driver touched each of its pages before it answered. The driver runs
+     * in SHARED mode, so its sender and receiver waited too: staging
+     * measured about 150 ms before the service snapshot and 120 ms before
+     * the snapshot of the consensus module, while the log stood still. A
+     * sparse 12 MiB buffer takes no time to open. A larger snapshot only
+     * waits on back-pressure: the writer chunks at the max message length
+     * (512 KiB here) and retries. The restore reads the recording through
+     * the replay channel, so an older snapshot with larger chunks still
+     * restores.</p>
+     */
+    static final String SNAPSHOT_CHANNEL = "aeron:ipc?alias=snapshot|term-length=4m|sparse=true";
+
     /** Launch retries past the ~10s mark-file liveness window, with margin. */
     static final int MAX_LAUNCH_ATTEMPTS = 6;
     static final long LAUNCH_RETRY_DELAY_MS = 5_000;
@@ -502,11 +561,38 @@ public final class ClusterNode {
      * a container kill, never shows this: the host kernel keeps the page
      * cache.
      */
+    /**
+     * The threading mode of the member's media driver
+     * ({@code -Dkardamom.cluster.driverThreadingMode}, default SHARED).
+     * SHARED runs the conductor, the sender and the receiver on one thread,
+     * which costs the least CPU and saturates first under load.
+     * SHARED_NETWORK and DEDICATED split that work over two or three
+     * threads. Any other value stops the start.
+     */
+    static ThreadingMode driverThreadingMode() {
+        final String mode = System.getProperty("kardamom.cluster.driverThreadingMode", "SHARED");
+        return switch (mode) {
+            case "SHARED" -> ThreadingMode.SHARED;
+            case "SHARED_NETWORK" -> ThreadingMode.SHARED_NETWORK;
+            case "DEDICATED" -> ThreadingMode.DEDICATED;
+            default -> throw new IllegalArgumentException(
+                "kardamom.cluster.driverThreadingMode must be SHARED, SHARED_NETWORK or DEDICATED, not " + mode);
+        };
+    }
+
     static int fileSyncLevel() {
-        final int level = Integer.getInteger("kardamom.cluster.fileSyncLevel", 0);
+        return checkedSyncLevel(FILE_SYNC_LEVEL_SETTING, Integer.getInteger(FILE_SYNC_LEVEL_SETTING, 0));
+    }
+
+    /**
+     * Return {@code level} when it is a file sync level of Aeron: 0, 1 or 2.
+     *
+     * @param setting the property name, for the error text
+     * @throws IllegalArgumentException for any other value
+     */
+    static int checkedSyncLevel(final String setting, final int level) {
         if (level < 0 || level > 2) {
-            throw new IllegalArgumentException(
-                "kardamom.cluster.fileSyncLevel must be 0, 1 or 2, not " + level);
+            throw new IllegalArgumentException(setting + " must be 0, 1 or 2, not " + level);
         }
         return level;
     }
@@ -535,7 +621,8 @@ public final class ClusterNode {
             // response publications, while Raft looks healthy from outside.
             // 8MB terms (24MB logs) leave an order of magnitude of headroom
             // without approaching flow-control limits.
-            .logChannel("aeron:udp?term-length=8m")
+            .logChannel(LOG_CHANNEL)
+            .snapshotChannel(SNAPSHOT_CHANNEL)
             .ingressStreamId(ingressStreamId)
             // The ordering window's hold timer is 5 ms. Aeron's timer wheel
             // fires a timer on the first tick at or after its deadline, and
@@ -725,6 +812,7 @@ public final class ClusterNode {
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
             .appVersion(APP_VERSION)
+            .snapshotChannel(SNAPSHOT_CHANNEL)
             .clusteredService(service);
         // The clustered-service container has its own termination hook.
         // Instrumenting only the consensus module would still exit silently
@@ -774,7 +862,12 @@ public final class ClusterNode {
      * comma separated: the peers that a blank member seeds from.
      */
     static String peerConsensusEndpoints(final String clusterMembers, final int memberId) {
-        return peerEntries(clusterMembers, memberId)
+        return consensusEndpoints(peerEntries(clusterMembers, memberId));
+    }
+
+    /** The consensus endpoints of {@code entries}, comma separated. */
+    static String consensusEndpoints(final java.util.stream.Stream<String[]> entries) {
+        return entries
             .map(f -> f[2].trim())
             .collect(java.util.stream.Collectors.joining(","));
     }
@@ -784,9 +877,14 @@ public final class ClusterNode {
      * its fields {@code id,ingress,consensus,log,catchup,archive}.
      */
     static java.util.stream.Stream<String[]> peerEntries(final String clusterMembers, final int memberId) {
-        return java.util.Arrays.stream(clusterMembers.split("\\|"))
-            .map(member -> member.split(","))
+        return entries(clusterMembers)
             .filter(f -> Integer.parseInt(f[0].trim()) != memberId);
+    }
+
+    /** The entries of every member, each split into its fields {@code id,ingress,consensus,log,catchup,archive}. */
+    static java.util.stream.Stream<String[]> entries(final String clusterMembers) {
+        return java.util.Arrays.stream(clusterMembers.split("\\|"))
+            .map(member -> member.split(","));
     }
 
     /**

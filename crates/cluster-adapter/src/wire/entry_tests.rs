@@ -17,11 +17,13 @@ const GOLDEN: &str = include_str!("../../testdata/wire_golden.txt");
 const MAX_APP_PAYLOAD_LEN: usize = MAX_SESSION_MESSAGE_LEN - SESSION_HEADER_LEN;
 
 /// The values that the golden frames encode.
-struct Fixture;
+pub(super) struct Fixture;
 
 impl Fixture {
-    const INDEX: u64 = 5;
-    const LANE: u8 = 3;
+    pub(super) const INDEX: u64 = 5;
+    pub(super) const LANE: u8 = 3;
+    /// The stream position of the full reference in its image.
+    pub(super) const POSITION: u64 = 0x0001_0203_0405;
 
     fn guard() -> GuardHeader {
         GuardHeader {
@@ -32,11 +34,11 @@ impl Fixture {
         }
     }
 
-    fn envelope() -> TxEnvelope {
+    pub(super) fn envelope() -> TxEnvelope {
         Self::envelope_with(vec![0x02, 0xf8, 0x6b, 0x01, 0x80])
     }
 
-    fn envelope_with(raw_tx: Vec<u8>) -> TxEnvelope {
+    pub(super) fn envelope_with(raw_tx: Vec<u8>) -> TxEnvelope {
         TxEnvelope {
             correlation_id: 0x0102_0304_0506_0708,
             raw_tx: raw_tx.into(),
@@ -46,7 +48,7 @@ impl Fixture {
         }
     }
 
-    fn tx() -> CanonicalTx {
+    pub(super) fn tx() -> CanonicalTx {
         CanonicalTx {
             canonical_id: B256::repeat_byte(0xAB),
             lane: Self::LANE,
@@ -54,7 +56,7 @@ impl Fixture {
         }
     }
 
-    fn archived(envelope: &TxEnvelope) -> Vec<u8> {
+    pub(super) fn archived(envelope: &TxEnvelope) -> Vec<u8> {
         rkyv::to_bytes::<rkyv::rancor::Error>(envelope)
             .unwrap()
             .to_vec()
@@ -93,6 +95,43 @@ impl Fixture {
         }
     }
 
+    /// The guard of a full reference: its deadline field carries the
+    /// position of the reference in its image.
+    fn positioned_guard() -> GuardHeader {
+        GuardHeader {
+            max_inclusion_block: position_deadline(Self::POSITION).unwrap(),
+            ..Self::guard()
+        }
+    }
+
+    /// The full reference of the canonical entry [`Self::tx`].
+    pub(super) fn txref_offer(envelope: &[u8]) -> TxRefOffer<'_> {
+        TxRefOffer {
+            guard: Self::positioned_guard(),
+            reference: TxRef::new(
+                B256::repeat_byte(0xAB),
+                Self::LANE,
+                BPosition {
+                    term_id: 7,
+                    term_offset: 9_999,
+                },
+                5,
+            ),
+            envelope,
+        }
+    }
+
+    /// The refusal of a reference of the canonical entry [`Self::tx`] by a
+    /// sealer on decision version 5.
+    pub(super) fn ref_refused() -> RefRefused {
+        RefRefused {
+            canonical_id: B256::repeat_byte(0xAB),
+            sender: Address::repeat_byte(0x11),
+            nonce: 7,
+            decision_version: SEALER_V5_DECISION_VERSION,
+        }
+    }
+
     fn txref() -> TxRef {
         TxRef::new(
             B256::repeat_byte(0xCD),
@@ -108,6 +147,7 @@ impl Fixture {
     /// Each golden frame, by name, from the Rust encoders.
     fn frames() -> Vec<(&'static str, Vec<u8>)> {
         let txref_ingress = encode_ingress_txref(&Self::txref(), Self::guard());
+        let envelope = Self::archived(&Self::envelope());
         let txref_egress = encode_egress_record(
             Self::INDEX,
             &RelayShape::of(KIND_INGRESS_RECORD).relay(&txref_ingress),
@@ -154,6 +194,17 @@ impl Fixture {
                 }
                 .encode(),
             ),
+            ("txref_offer_ingress", Self::txref_offer(&envelope).encode()),
+            (
+                "txref_offer_egress",
+                encode_egress_record(
+                    Self::INDEX,
+                    &RelayShape::of(KIND_INGRESS_RECORD)
+                        .relay(&Self::txref_offer(&envelope).encode()),
+                )
+                .unwrap(),
+            ),
+            ("ref_refused", Self::ref_refused().encode()),
         ]
     }
 }
@@ -168,7 +219,7 @@ fn golden() -> Vec<(&'static str, Vec<u8>)> {
         .collect()
 }
 
-fn golden_frame(name: &str) -> Vec<u8> {
+pub(super) fn golden_frame(name: &str) -> Vec<u8> {
     golden()
         .into_iter()
         .find_map(|(n, frame)| (n == name).then_some(frame))
@@ -425,6 +476,7 @@ fn a_frame_at_the_cap_of_each_record_type_fits_one_egress_message() {
         (KIND_INGRESS_RECORD, RT_TXREF),
         (KIND_INGRESS_RECORD, RT_DEPOSITREF),
         (KIND_INGRESS_RECORD, RT_TX_OFFER),
+        (KIND_INGRESS_RECORD, RT_TXREF_OFFER),
         (KIND_ORIGIN_RECORD, RT_EPOCH),
         (KIND_REMOTE_ORIGIN_RECORD, RT_REMOTE_EPOCH),
     ]

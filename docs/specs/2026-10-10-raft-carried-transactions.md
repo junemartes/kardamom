@@ -6,7 +6,8 @@
   2026-10-18 (decisions 19 and 20, #661): every deploy is backwards compatible, and an upgrade
   transaction turns on each breaking change. The cut-over and decision version 3 activate by an
   upgrade transaction, not by a chain reset or a coordinated restart (sections 5.4 and 12).
-  Partly implemented (section 13).
+  Partly implemented (section 13). Amended for the user decisions of 2026-10-21 (decisions 34 to
+  43): `docs/specs/2026-10-21-one-way-pipeline.md` wins where the two differ.
 - Issue: refs #582.
 - Reviewed by dev-32 (the batcher resume and DA side) and kardamom-3-00 (the executor side). Their points are in this version.
 - Decided by the user:
@@ -3063,6 +3064,17 @@ each replaced part says so.
     restart, the attester sees every withdrawal again (section 8.3).
 33. **No mixed-version chaos shard (2026-10-18, #663 and the comment on #661).** #663 keeps only
     the compatibility fixtures (section 12.1).
+
+34. to 43. **The one-way pipeline (2026-10-21).** Decisions D1 to D10 of
+    `docs/specs/2026-10-21-one-way-pipeline.md`, in that order: the ack at admission (D1), no
+    receipts at the ingress and the strong confirmation through the egress (D2), the ingress
+    on its own fleet (D3, amended 2026-10-22), the full reference with record type 7 and decision version 5 (D4),
+    no join and no void (D5), the egress fed by the executors (D6), the batcher and the validator
+    on the egress (D7), the sequencers on the egress rows (D8), the validator independence by the
+    comparison of the copies (D9), and the carry flag on feature id 4 (D10). D2 replaces decision
+    12. D6 replaces the transport of decisions 16 and 27 (the egress reads the executors, not a
+    sealer member). D10 replaces the feature id of decision 21. D1 answers 16.1-2, and D5 answers
+    16.1-3.
 
 ### 16.1 Still open
 

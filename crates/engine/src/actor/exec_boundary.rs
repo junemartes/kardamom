@@ -185,6 +185,7 @@ impl<W: ExecPorts> ExecState<W> {
             l2_timestamp,
             l1_origin,
         } = start.clone();
+        let started = Instant::now();
         if let Flow::Stop = self.settle_at_boundary()? {
             return Ok(Flow::Stop);
         }
@@ -281,6 +282,9 @@ impl<W: ExecPorts> ExecState<W> {
         // corrupt value near `u64::MAX` must not wrap the next block back
         // to 0 and re-execute the chain.
         self.cursor.block = block_number.saturating_add(1);
+        let pipeline = &self.metrics.pipeline;
+        pipeline.sealed(self.block.tx_index, gas_used);
+        pipeline.commits_inflight.set(self.commits.inflight.len());
         self.block.tx_index = 0;
         self.block.cumulative_gas_used = 0;
         // The next block's wall-clock timestamp arrives in its own
@@ -298,6 +302,7 @@ impl<W: ExecPorts> ExecState<W> {
             self.commits.parent.as_ref(),
             l2_timestamp,
         )?;
+        self.metrics.pipeline.boundary_done(started);
         Ok(Flow::Continue)
     }
 }

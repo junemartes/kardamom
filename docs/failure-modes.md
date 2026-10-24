@@ -144,7 +144,7 @@ Each service publishes its lifecycle state on the `events` stream. The stream gi
 
 ### DA-lag guard and posted-head retention floor
 
-The sealer refuses user records when the batcher falls too far behind on L1. The sealer also keeps every frame that L1 does not hold yet.
+The sealer refuses user records when the batcher falls too far behind on L1. Below decision version 5, the sealer also keeps every frame that L1 does not hold yet.
 
 - **Posted head.** The batcher sends its confirmed cursor to the sealer at start and on every change. The sealer keeps it in the replicated state.
 - **Guard.** The sealer refuses a user record when the budget is above 0 and the sealed head is more than the budget past the posted head.
@@ -159,18 +159,25 @@ The sealer refuses user records when the batcher falls too far behind on L1. The
   - The ingress raises `da_lag` while the frame says halted, and clears it when the frame says not halted.
   - Any status frame ends a `sealer_no_quorum` halt.
   - The status before a Raft snapshot carries the snapshot notice. The consensus module sends nothing until the snapshot is complete, and on a loaded disk that takes many seconds. After the notice, the ingress waits 60 s for the next status, not 10 s.
-- **Retention floor.** `kardamom.cluster.retention` is a minimum, not a maximum.
+- **Retention floor.** Below decision version 5, `kardamom.cluster.retention` is a minimum, not a maximum.
   - A frame past the window leaves only when its block is at or below the posted head.
   - The batcher can always replay from its cursor.
   - The guard bounds the growth. The stretch is at most the budget plus one flush, in heap.
-  - The retained frames are in the snapshot. A restored member keeps the floor at the posted head.
+  - The retained frames are in the snapshot. A restored member keeps the floor of the snapshot.
+- **Replay window.** Under decision version 5 (the carry flag) on members with `kardamom.cluster.carryBytes=true`, `kardamom.cluster.retention` is the exact window. Members that keep the frames on the heap keep the posted rule, because no member feed runs and the egress cannot serve a reference.
+  - A frame past the window leaves at once, at any posted head. The retained frames have a fixed bound at any DA lag.
+  - A cursor below the window gets `REPLAY_UNAVAILABLE`, the batcher too. The reader recovers from another source.
+  - The guard still refuses user records. It holds no frame.
 - **Retained file.** With `kardamom.cluster.carryBytes=true`, the retained frames are in an append-only file on the disk of each member, not on the heap. The default is off.
   - The heap keeps only an index: the end index and the file position of each retained boundary. The heap does not grow with the retained bytes.
   - The member orders a full entry (record type 5) and retains it as a canonical entry with its envelope (record type 6). Each egress session gets the relayed reference (egress kind 15), live and in a replay, never the envelope. The twin copy drops at the dedup, and each refusal is the same as without the file.
-  - The member takes no void request and no recorded cursor: it drops kinds 6 and 9 as unknown kinds. Its snapshot (version 12) holds no void ledger. Every member must run the same value; the release gate refuses a rolling change.
+  - The member takes no void request and no recorded cursor: it drops kinds 6 and 9 as unknown kinds. Its snapshot (version 17) holds an empty void ledger. Every member must run the same value; the release gate refuses a rolling change.
   - The file is a function of the log. Every member holds the same bytes at the same position.
   - The snapshot holds the floors, the front and head positions, and the index. It does not hold the frames. The member syncs the file to disk up to the head before it writes the snapshot.
-  - The snapshot is version 12. The switch turns on only with a new chain or a coordinated cut-over: a member with the file stops on an older snapshot, and a member without it stops on version 12.
+  - The snapshot is version 17: the state of version 16, with the decision rules, the switch and the schedule of feature 4, then the file section. A restored member runs the same decision version as its peers.
+  - The member still restores version 12, the file snapshot of an older release. Version 12 holds no decision rules, so a member that restores it runs decision version 3. On a chain past decision version 3, that member forks. A chain with the file must write version 17 before it switches to decision version 4.
+  - The switch turns on only with a new chain or a coordinated cut-over: a member with the file stops on a snapshot that is not version 12 or 17, and a member without it stops on version 12 or 17.
+  - A member of a release that reads only up to version 16 stops on version 17. A member without the file never writes version 17, so a rolling deploy of a chain without the file is safe.
   - A restore truncates the file at the head position of the snapshot. The log replay appends the rest.
   - A restore walks the records from the front to the head. It stops the member when a record is not a whole frame, a boundary is not in the index, or the walk does not end at the head with the counts of the snapshot. The member never serves a partial file. The next start stops again, because the member keeps its recording log. Wipe the cluster and archive directories of the member, and start it: the peer seed copies the file. The steps are in "Recover a member that stops on its retained file" in [`../cluster/sealer-service/README.md`](../cluster/sealer-service/README.md).
   - A member that a peer seeds copies the segment files from the admin endpoint of a peer, and walks the copy against the backed-up snapshot. A peer serves only below its published head. After 5 rounds with no copy that passes, the seed stops the start with `GAVE-UP`; wipe the member and start it again, as above. So the file needs `kardamom.cluster.adminPort` and the env var `KARDAMOM_RETAINED_TOKEN`. The token and the bytes travel in cleartext HTTP on the node network.
@@ -402,9 +409,14 @@ The kill-based cases prove the restart logic. They do not prove durability again
 
 - The sealer syncs the Raft log and the archive to disk with `kardamom.cluster.fileSyncLevel`.
 - Level 0 does not sync. Level 1 syncs the data of every write batch. Level 2 is also valid. Any other value refuses to start.
-- The code default is 0. The deploy sets 1 (Nomad variable `cluster_file_sync_level`, env `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL`).
-- At level 0, an entry that a quorum acknowledged can exist only in the page caches of its members. A rack-level power loss would drop it. `pipeline-blackout-recover` stands for that event.
+- The code default and the deploy default are 0 (Nomad variable `cluster_file_sync_level`, env `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL`). A commit waits for no disk sync.
+- At level 0, the kernel writes the log back on its own schedule. With the Linux defaults (`vm.dirty_expire_centisecs=3000`, `vm.dirty_writeback_centisecs=500`), a page reaches the disk within about 35 s.
+- So an entry that a quorum acknowledged can exist only in the page caches of its members for that time. A power loss or a kernel crash on a majority of members in that time drops it. Each member runs on its own machine, so one power loss takes at most one member. `pipeline-blackout-recover` stands for that event.
 - Only a test that cuts the power of a VM can prove this end to end.
+- On staging the three sealers are in different data centers (decision of the user, 2026-10-22). So one power event cannot take a majority, and the window above needs power losses in two data centers.
+- The backup sealer (`cluster-backup`, node `backup-0`) is the recovery path for that event. It is outside the quorum and copies each snapshot and the log after it from a follower. It syncs its own copy at level 1 (`kardamom.backup.fileSyncLevel`): its syncs do not delay a commit. See the sealer README, "Backup mode".
+- Level 0 is safe only while no two members share a power domain. A member that moves into the data center of another member needs level 1 again, or a backup in a third power domain.
+- An executor that applied an entry that such a loss drops stops with `ClusterBehindCursor`, and an operator repairs it. The automatic rollback (#655) runs only with the carry flag (`--carry-bytes`).
 
 ## Executor
 
@@ -453,9 +465,21 @@ The executors are deterministic state machines. One dead or lagging replica neve
   - Effect: without a checkpoint, the executor must replay the whole canonical stream from genesis. That cost is unbounded as the chain ages.
   - Recovery: with `--checkpoint-dir`, the executor writes periodic consistent snapshots (`compact_to`, an online read-only copy that never blocks the writer). The writer cuts each image to its used pages, so the manifest hash and a peer transfer read about the size of the state, not the 256 MiB growth step. On a cold start with an empty state directory, it restores the newest checkpoint before it opens the env. The normal resume path then replays only the short tail. The replicas are deterministic at the same block, so the checkpoint of a **peer** is a valid restore source.
   - Proof: `state-checkpoint-restore`. The case wipes the state of executor-0 and re-replicates the checkpoint of executor-1. It asserts that executor-0 restores from that checkpoint, not from genesis, and rejoins.
+  - With `--checkpoint-log` (job variable `checkpoint_log`), a checkpoint is a base image and the block log after it: the write batch of each committed block.
+    - A restore copies the base and applies the log through the state writer. So each block of the log is a restore point.
+    - The executor copies the state only when the base rule asks for a new base: the log after the newest base is larger than that base, the base is old, or the log has a gap. The copy has a rate limit, so it does not take the disk from a sealer on the same host.
+    - A rollback restores the block just before the divergence, and cuts the log there.
+    - A peer serves its log after its base (`GET /checkpoint/log`), so a peer base below a retention floor serves when its log reaches the floor.
+    - The writer never waits for the log. A full queue drops the batch (`kardamom_checkpoint_log_dropped_total`), and the gap makes the next base start at once.
 - **Replay-window overrun**
-  - Trigger: the cluster keeps a bounded canonical window (`kardamom.cluster.retention`, default 65,536 frames, about 5 minutes at 200 tps). A `REPLAY_FROM` below the floor of the window is refused with `REPLAY_UNAVAILABLE`. The window is a minimum. A frame past it stays until L1 holds its block (see "DA-lag guard and posted-head retention floor"). The retained frames are in the cluster snapshot, so a member that restores from a snapshot keeps the floor at the posted head. A cursor that is older than the window is the trigger.
+  - Trigger: the cluster keeps a bounded canonical window (`kardamom.cluster.retention`, default 65,536 frames, about 5 minutes at 200 tps). A `REPLAY_FROM` below the floor of the window is refused with `REPLAY_UNAVAILABLE`. Below decision version 5, the window is a minimum: a frame past it stays until L1 holds its block. Under version 5 with `carryBytes`, the window is exact (see "DA-lag guard and posted-head retention floor"). The retained frames are in the cluster snapshot, so a member that restores from a snapshot keeps the floor of the snapshot. A cursor that is older than the window is the trigger.
   - Effect: the refusal is terminal for the local state. A cursor below the floor can never catch up. A fresh or wiped node cannot re-sync from genesis either, because genesis aged out of the window.
+  - Recovery with `--carry-bytes` and `--egress`: the executor reads the egress first.
+    - The member refuses the cursor. The reader then reads the range read of the egress from the cursor to the head of the store, then the live `egress_order`. It goes back to the member feed when the feed serves the cursor again.
+    - The run does not end, and no checkpoint moves.
+    - A cursor below the floor of the egress store too (`410`) ends the run with the refusal. The executor then repairs itself with peer state, as below, at or above the lower floor.
+    - While the egress does not answer, the executor fetches no peer checkpoint. It tries the feed and the egress again.
+    - Proof: the unit tests `a_cursor_below_the_window_recovers_from_the_egress` and `a_cursor_below_the_floor_of_the_egress_goes_to_a_peer_checkpoint`.
   - Recovery: the executor repairs itself with peer state.
     - Each replica serves its newest checkpoint over `--checkpoint-serve-addr` (`:9014`).
     - A node that hits the refusal, or cold-starts with no checkpoint, fetches the newest qualifying peer checkpoint (`--checkpoint-peers`).
@@ -524,6 +548,12 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
   - The lookup is bounded by the token bucket of the client, the in-flight bound of the query client and its timeout. A shed or failed query answers `null`. This is the same answer as "not committed yet".
   - The counter is `kardamom_cache_lookups_total{layer="receipt", outcome}`. The outcomes are `hit`, `state_hit`, `miss`, `shed` and `state_error`.
   - Proof: `ingress-pair-loss-recover` kills both ingresses under load. It requires the receipt of every accepted transaction afterwards.
+- **A watcher falls behind its stream bus**
+  - Each stream (receipts, errors, block boundaries, watermarks) reaches its watcher through a broadcast bus of 32,768 items. One receipt is one item, and the ingress reads the receipts of every executor.
+  - Trigger: the watcher task stalls longer than the bus can hold, for example on a loaded host.
+  - Effect: the bus drops its oldest items. A rollback that the bus drops still applies from its log. A dropped receipt or error does not release its waiter, so that client waits until the pending timeout (30 s). Its retry gets the receipt by hash.
+  - The counter is `kardamom_ingress_bus_lagged_total{bus}`.
+  - Proof: `a_gap_counts_the_receipts_that_the_bus_dropped`. On one local stack under load, a bus of 1,024 items dropped 4,684 receipts and gave a soak p99 of 30 s. The bus of 32,768 items dropped none.
 - **Admission of a cold sender**
   - The admission checks read the local account layer, then Redis. A sender that never sent and never received value has no row in either layer.
   - For such a cold sender, the ingress asks an executor for the nonce and the balance (two queries). It keeps the answer for 30 s in a map of at most 65,536 senders. So a cold sender costs one pair of queries for each 30 s, not one pair for each submit. A row in the local layer always wins.
@@ -535,6 +565,24 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
   - The counter is `kardamom_cache_lookups_total{layer="cold", outcome}`. The outcomes are `hit` (a kept answer or outcome), `miss` (a fresh answer), `stale` and `error` (a shed or failed query).
   - Each admission refusal counts `kardamom_ingress_tx_rejected_total{reason}` and logs `submit refused` at debug level, with the sender, the nonce and the reason.
   - Proof: `crates/ingress/tests/account_cache_test.rs` (`a_cold_unfunded_sender_is_refused_with_one_query`, `a_lagging_executor_answer_admits`, `an_answer_before_the_first_head_admits`, `a_cold_funded_sender_or_a_failed_query_admits`).
+- **The ack at admission (`--verdicts`)**
+  - With `--verdicts`, `eth_sendRawTransaction` answers when the v2 sequencer that owns the sender takes the transaction into its mempool, as on Ethereum. The answer comes on the `tx_verdicts` stream of the ingress. The v2 sequencers fill it (`[admission] verdicts`). The ingress reads no receipts: a client reads the result with `eth_getTransactionReceipt`, which asks Redis or an executor.
+  - A sequencer sends one verdict for each transaction: `Accepted` when its filter forwards the transaction or holds it for a nonce gap, `Rejected` with the reason otherwise. A sender with no state gets its verdict when the lookup answers. Both twins of a lane send one.
+  - The ingress answers on the first `Accepted`. A `Rejected` answers when every twin rejected (`--twins`, default 2), or 250 ms after the first rejection with no accept: a twin with stale rows can reject a transaction that the other twin took. The errors use the text of geth: `nonce too low`, `already known`, `txpool is full`, `insufficient funds for gas * price + value`.
+  - A lost verdict: the offer of a verdict is best effort. The Aeron thread holds a refused frame until the offer deadline, then drops it and logs `best-effort publish failed`. A full queue of the verdict task also drops verdicts. With no verdict in `--ack-timeout-ms` (default 2 s), the call answers `transaction not acknowledged`. The transaction can still be in a mempool: a resubmit of it answers `already known`. The counters are `kardamom_sequencer_verdicts_total{outcome}` (`sent`, `full`, `closed`, `wide`) and `kardamom_ingress_tx_rejected_total{reason="not-acknowledged"}`.
+  - An accepted transaction can still drop later, as in the mempool of an Ethereum node: a parked one expires, a forwarded one is lost, or a lane loses both twins. The call does not tell the client. The status feed and the receipt read do.
+  - A second submission of a hash that waits on the same ingress answers `already known` at once.
+  - The local account layer gets no rows, so `--verdicts` needs `--admission-checks false`. The v2 filter checks each sender.
+  - Deploy order: the sequencers with `[admission] verdicts` first, then the ingress with `--verdicts`. An ingress with `--verdicts` before its sequencers send verdicts answers every call `transaction not acknowledged`.
+  - Proof: `crates/log/tests/discovered_tx_verdicts.rs` (each ingress receives only its own verdicts), `v2::tests::each_transaction_gets_one_verdict_at_admission`, `crates/ingress/src/acks/tests.rs`, `end_to_end_test::the_ack_at_admission_answers_on_the_verdict_of_the_sequencer`, and the chain-semantics suite with `KARDAMOM_E2E_ADMISSION=1 KARDAMOM_E2E_VERDICTS=1`.
+- **The validated ack (`--ack validated`)**
+  - `eth_sendRawTransaction` answers when the ingress validated the transaction and published it on `tx_data`. The sequencer sends nothing back. No waiter stays after the answer: no pending receipt and no verdict. `kardamom_sendRawTransactionAsync` answers the same way.
+  - A failed offer (back pressure, no connected subscriber within the offer deadline) answers `txpool is full`. The client sends again. The counter is `kardamom_ingress_tx_rejected_total{reason="txpool-full"}`.
+  - The nonce check reads the local account layer, then Redis. A row only moves forward, so the view can lag the chain but never lead it: a `nonce too low` answer is always true. A stale view only misses some rejections, and the sequencer drops those. A sender with no row admits. The check asks no executor, so no call waits for a query. The counter is `kardamom_ingress_tx_rejected_total{reason="nonce-too-low"}`.
+  - The ingress checks no balance. The sequencer drops an unfunded transaction after the answer.
+  - The duplicate cache holds the newest `--duplicate-cache-entries` hashes (default 65,536), with the recovered sender. A copy of a held hash answers its hash with no recovery and no publication. Only a published hash enters the cache. A hash that the sequencer dropped stays in the cache until it is evicted, so a copy of it in that time does not publish again. A cache miss costs one more recovery and publication, and the window of the sealer drops the second copy.
+  - An accepted transaction can still drop later. The client reads the result through the egress: the receipt read or the status feed.
+  - Proof: `crates/ingress/src/proxy/validated_tests.rs`.
 - The JSON-RPC surface is in [`json-rpc.md`](json-rpc.md).
 
 ## Sequencer (2 shards x 2 racing replicas)
@@ -885,8 +933,8 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
 
 **A power loss on a majority of the sealers rolls the paired executors back.**
 
-- **Release gate.** The automatic rollback runs only in an executor that reads the member feed (`--carry-bytes`). The deployed executors read the cluster egress, and they do not compare. So the automatic rollback is live only after the cut-over to carried transactions (#598). An executor that reads the cluster egress keeps no rollback marker and no receipt ledger, and it publishes no rollback. The sealer change to sync level 0 with a 1 s scheduled sync (#645) must not reach a cluster before that cut-over: until then, a power loss on a majority stops the executors with `ClusterBehindCursor`, as described above.
-- The cause. A member forces its log on a schedule, not on each append. A power loss on the hosts of a majority loses, on each of them, the entries after its last forced position. Raft elects the most complete surviving log, and the cluster continues from it. The next entries take the lost indexes.
+- **Release gate.** The automatic rollback runs only in an executor that reads the member feed (`--carry-bytes`). The deployed executors read the cluster egress, and they do not compare. So the automatic rollback is live only after the cut-over to carried transactions (#598). An executor that reads the cluster egress keeps no rollback marker and no receipt ledger, and it publishes no rollback. The sealers run at sync level 0 before that cut-over. Until the cut-over, a power loss on a majority stops the executors with `ClusterBehindCursor`, as described above, and the recovery is a seeded start from a state rebuilt from L1.
+- The cause. A member does not force its log on each append: the kernel writes it back on its own schedule. A power loss on the hosts of a majority loses, on each of them, the entries after the last position that reached the disk. Raft elects the most complete surviving log, and the cluster continues from it. The next entries take the lost indexes.
 - A paired executor runs an entry in about 5 ms, before the entry is durable. So it can hold committed blocks that the new stream does not have, and it can have published receipts of lost entries.
 - **The comparison.** At each start, before it executes a frame, the executor that reads the member feed asks its member for a replay from a floor below its cursor. It compares each frame up to its last committed block with its state DB:
   - the transaction hash of each receipt, by canonical index;
@@ -1163,6 +1211,12 @@ The da-watcher takes the records of the L1 follower's `l1_blocks` stream, and it
 - A record that does not descend from the head is the halt `l1_chain_break`. The watcher reads the block again from the archives every tick, and resumes by itself on a record that descends.
 - A record past the next block is a gap on the subscription. The watcher reads the missing records from the archives of the follower nodes, and the follower's archive (`indexer_l1_block`) serves what they do not hold.
 - The loop selects on the next record, the sealer's origin, the re-publish deadline, and a housekeeping tick (`--poll-interval-secs`, 1 s in the deploy).
+- **The epoch pace** (`--epoch-pace-ms`, default 2000). L1 finalizes about 32 blocks at once, and each epoch seals its own L2 block. Published at once, the epochs make a burst of blocks. The executors can run only 4 blocks ahead of their commits (`COMMIT_PIPELINE_DEPTH`), so the transactions behind a burst wait for their receipts (about 150-300 ms on staging, every 6.4 min). The watcher publishes one epoch of a step at a time, one pace apart.
+  - A backlog of more than 64 records (`PACED_BACKLOG`, a catch-up after a restart) publishes at full speed.
+  - The default of 2 s is longer than a block commit (50-250 ms on staging), so each block commits before the next one comes.
+  - The pace must stay below the 4 s gather window of the validator's epoch check (`GATHER`), so one step stays one range of that check. Above 4 s, each epoch of a step is a check of its own. The upper limit is 12 s: 32 epochs in one 384 s step.
+  - The last epoch of a step of 32 then comes about 62 s later. Deposits already wait 6 to 13 min for L1 finality. A paced backlog of 64 takes up to about 128 s.
+  - An epoch that waits for the pace stays in the inbox, not in the publish window. So the pace causes no re-publish.
 
 - With `--config` (the deploy), a boundary-only cluster session reads the L1 origin `C` of every boundary. `C` is the last epoch that the sealer committed.
 - The watcher keeps the epochs that it published after `C`. This is its window. The window holds up to 2048 epochs (6.8 hours of L1). The gauge is `kardamom_da_watcher_epochs_unconfirmed`.

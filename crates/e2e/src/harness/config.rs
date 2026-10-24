@@ -90,6 +90,15 @@ pub struct StackConfig {
     /// Also run `kardamom-notifier`, the transaction status feed. The
     /// feed's WebSocket URL is [`crate::harness::LocalStack::notifier_ws_url`].
     pub notifier: bool,
+    /// The scenario sends transactions that cannot pay, so that the
+    /// executor writes skip receipts. The v2 loop refuses such a
+    /// transaction before the sealer, so the sequencers keep the v1 loop
+    /// under `KARDAMOM_E2E_ADMISSION=1`.
+    pub unpayable_spends: bool,
+    /// The scenario reads the local account layer of the ingress, which
+    /// only the full receipt stream fills. The ingress keeps `tx_receipts`
+    /// under `KARDAMOM_E2E_VERDICTS=1`.
+    pub ingress_rows: bool,
 }
 
 /// The L2 genesis a stack boots from.
@@ -150,6 +159,8 @@ impl Default for StackConfig {
             priority_fees: false,
             canary_genesis: false,
             notifier: false,
+            unpayable_spends: false,
+            ingress_rows: false,
         }
     }
 }

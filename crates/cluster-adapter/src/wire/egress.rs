@@ -15,14 +15,14 @@ use rkyv::Archive;
 use rkyv::api::high::{HighDeserializer, HighValidator};
 use rkyv::rancor;
 
-use super::entry::{CanonicalTx, RelayedRef};
+use super::entry::{CanonicalTx, RefRefused, RelayedRef};
 use super::{
     CANONICAL_ID_LEN, EGRESS_KIND_BOUNDARY, EGRESS_KIND_CONTIGUITY_REJECT,
     EGRESS_KIND_DA_LAG_REJECT, EGRESS_KIND_PAST_DEADLINE, EGRESS_KIND_RELAYED,
     EGRESS_KIND_REMOTE_ORIGIN_REJECT, EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE,
     EGRESS_KIND_STATUS, EGRESS_KIND_WINDOW_FULL, FEED_ANSWER_LEN, FEED_REQUEST_ID_OFFSET,
-    RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH, RT_TX, RT_TX_OFFER, RT_TXREF, RT_VOID,
-    RemoteOriginRejectReason, SENDER_LEN, STATUS_LEN, STATUS_RETAINED_BYTES_OFFSET,
+    RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH, RT_TX, RT_TX_OFFER, RT_TXREF, RT_TXREF_OFFER,
+    RT_VOID, RemoteOriginRejectReason, SENDER_LEN, STATUS_LEN, STATUS_RETAINED_BYTES_OFFSET,
     STATUS_WITH_RETAINED_BYTES_LEN, WireError, rd_i32, rd_i64, rd_len, rd_slice, rd_u8, rd_u64,
     too_short,
 };
@@ -34,7 +34,8 @@ use super::{
 pub enum EgressItem {
     /// A relayed canonical record with its assigned 0-based index.
     Record { index: u64, msg: TxOrderingMessage },
-    /// A relayed canonical entry with its bytes: record type 6.
+    /// A relayed canonical entry with its bytes: record type 6, or a
+    /// relayed full reference (record type 7).
     Tx { index: u64, tx: CanonicalTx },
     /// The index and the id of a canonical entry, without its bytes.
     RelayedRef(RelayedRef),
@@ -145,6 +146,9 @@ pub enum EgressItem {
         recorded_index: u64,
         budget: u64,
     },
+    /// The sealer refused a transaction reference of record type 0. The
+    /// reference is not ordered.
+    RefRefused(RefRefused),
 }
 
 impl EgressItem {
@@ -184,6 +188,7 @@ impl EgressItem {
             }),
             super::EGRESS_KIND_RECORD_LAG_REJECT => Self::decode_record_lag_reject(buf),
             super::EGRESS_KIND_RELAYED_REF => RelayedRef::parse(buf).map(Self::RelayedRef),
+            super::EGRESS_KIND_REF_REFUSED => RefRefused::parse(buf).map(Self::RefRefused),
             super::EGRESS_KIND_SESSION_START => Ok(Self::SessionStart {
                 session_id: rd_i64(buf, 1)?,
             }),
@@ -364,15 +369,20 @@ impl<'a> RelayedPayload<'a> {
     }
 
     /// The egress item of this payload at canonical `index`. A canonical
-    /// entry has its own item. A full entry is an ingress type, so a
-    /// relayed one is refused.
+    /// entry has its own item. A sealer below decision version 5 relays a
+    /// full reference as is, so it decodes to the same item as its
+    /// canonical entry. No sealer relays a full entry, so it is refused.
     fn into_item(self, index: u64) -> Result<EgressItem, WireError> {
         match self.record_type {
             RT_TX => Ok(EgressItem::Tx {
                 index,
                 tx: CanonicalTx::parse(self.id, self.fields)?,
             }),
-            RT_TX_OFFER => Err(WireError::UnrelayedRecordType(RT_TX_OFFER)),
+            RT_TXREF_OFFER => Ok(EgressItem::Tx {
+                index,
+                tx: CanonicalTx::parse_full_ref(self.id, self.fields)?,
+            }),
+            RT_TX_OFFER => Err(WireError::UnrelayedRecordType(self.record_type)),
             _ => Ok(EgressItem::Record {
                 index,
                 msg: self.decode()?,
