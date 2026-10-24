@@ -661,6 +661,26 @@ class DeployTest(Deploys):
         self.run_deploy(check=True)
         self.assertNotIn('canary', self.api.state['plans'])
 
+    def upstream_images(self):
+        """The image of each task of the jobs that run an upstream image, by task name."""
+        return {t['Name']: t['Config']['image'] for name in ('anvil', 'node-exporter', 'monitoring')
+                for g in self.api.state['jobs'][name]['TaskGroups'] for t in g['Tasks']}
+
+    def test_upstream_images_run_the_pins_or_the_copies_of_the_manifest(self):
+        pins = re.findall(r'^  (\w+_image): "(\S+)"$', (ANSIBLE / 'group_vars/all.yml').read_text(), re.M)
+        tasks = {'anvil_image': 'anvil', 'node_exporter_image': 'node-exporter', 'prometheus_image': 'prometheus',
+                 'alertmanager_image': 'alertmanager', 'grafana_image': 'grafana'}
+        # A manifest without copies (a release for a real registry): the pins.
+        self.deploy()
+        self.assertEqual(self.upstream_images(), {tasks[var]: ref for var, ref in pins})
+        # The container path records a copy of each one: the jobs run the copies.
+        copies = {var: f'registry.example:5000/kardamom-upstream-{var.replace("_", "-")}:test@sha256:{"c" * 64}'
+                  for var, _ in pins}
+        with self.manifest.open('a') as manifest:
+            manifest.writelines(f'upstream-{var.replace("_", "-")} {ref}\n' for var, ref in copies.items())
+        self.run_deploy()
+        self.assertEqual(self.upstream_images(), {tasks[var]: ref for var, ref in copies.items()})
+
     def test_secrets_reach_tasks_only_through_nomad_variables(self):
         # Every keyed URL and key the deploy gets, by the environment the
         # deploy workflow sets.
@@ -1461,8 +1481,8 @@ class DeployTest(Deploys):
     def assert_aeron_parties(self, plans, tolerance):
         """Every task that maps the Aeron directory carries the tolerance:
         a Rust client as its driver timeout, a JVM with a media driver as
-        its driver timeout, client liveness, and a publication unblock
-        timeout above the liveness."""
+        its driver timeout, client liveness, image liveness, and a
+        publication unblock timeout above the client liveness."""
         jvm_options = {'aeron': '_JAVA_OPTIONS', 'cluster': 'JAVA_TOOL_OPTIONS'}
         parties = self.aeron_tasks(plans)
         self.assertEqual({name for name, _ in parties}, {
@@ -1476,6 +1496,9 @@ class DeployTest(Deploys):
             options = task['Env'][jvm_options[name]].split()
             self.assertIn(f'-Daeron.driver.timeout={tolerance}', options, name)
             self.assertIn(f'-Daeron.client.liveness.timeout={liveness_ns}', options, name)
+            # A receiving driver keeps the image of a stalled publisher as
+            # long: an archive keeps its recording whole through a stall.
+            self.assertIn(f'-Daeron.image.liveness.timeout={liveness_ns}', options, name)
             unblock = [o for o in options if o.startswith('-Daeron.publication.unblock.timeout=')]
             self.assertEqual(len(unblock), 1, name)
             self.assertGreater(int(unblock[0].split('=')[1]), liveness_ns, name)

@@ -17,6 +17,20 @@ addresses {
 ports {
   dns = 53
 }
+
+# The HTTP connections that one client address may hold at a time. Every
+# local process reaches the agent from 127.0.0.1, so for them this is a
+# limit for the whole node. A kardamom process holds one blocking query
+# for each service that it watches, and it passes a TTL check for each
+# publication and subscription that it registers. The Nomad agent and the
+# job templates add their own blocking queries. At the default of 200,
+# the agents answer "429 Too Many Requests" under the chaos load, and the
+# service registrations and check passes fail. 1024 is five times the
+# default and far below the agent's LimitNOFILE of 65536.
+limits {
+  http_max_conns_per_client = {{ consul_http_max_conns_per_client }}
+}
+
 # The join list is infrastructure DNS or the control node address, never
 # a Consul service record: Consul must not bootstrap through itself.
 retry_join   = {{ consul_retry_join | to_json }}

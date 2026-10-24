@@ -83,7 +83,7 @@ jobs:
       - name: Install Nomad (version from the cluster contract)
         run: |
           ver="$(sed -n 's/^nomad_version: "\([^"]*\)".*/\1/p' deploy/cluster/ansible/group_vars/all.yml)"
-          curl -fsSL "https://releases.hashicorp.com/nomad/${ver}/nomad_${ver}_linux_amd64.zip" -o /tmp/nomad.zip
+          curl -fsSL --retry 5 --retry-all-errors "https://releases.hashicorp.com/nomad/${ver}/nomad_${ver}_linux_amd64.zip" -o /tmp/nomad.zip
           sudo unzip -o /tmp/nomad.zip -d /usr/local/bin
           nomad version
       - name: Start a dev agent (job validation needs the API)

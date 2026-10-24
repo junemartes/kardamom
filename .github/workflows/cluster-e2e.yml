@@ -99,9 +99,7 @@ jobs:
           echo "shards=$shards" >> "$GITHUB_OUTPUT"
           echo "shards: $shards"
 
-      - uses: extractions/setup-just@v4
-        with:
-          just-version: 1.49.0
+      - uses: ./.github/actions/just
 
       - name: Install system build deps (Aeron C client)
         run: |
@@ -321,7 +319,7 @@ jobs:
       - name: Install Nomad CLI
         run: |
           ver="$(sed -n 's/^nomad_version: "\([^"]*\)".*/\1/p' deploy/cluster/ansible/group_vars/all.yml)"
-          curl -fsSL "https://releases.hashicorp.com/nomad/${ver}/nomad_${ver}_linux_amd64.zip" -o /tmp/nomad.zip
+          curl -fsSL --retry 5 --retry-all-errors "https://releases.hashicorp.com/nomad/${ver}/nomad_${ver}_linux_amd64.zip" -o /tmp/nomad.zip
           sudo unzip -o /tmp/nomad.zip -d /usr/local/bin
 
       # Runner identity for the correlation stamps in the load logs.
@@ -337,9 +335,7 @@ jobs:
       # runner is ephemeral, so nothing destroys it after.
       # The shard runner carries no toolchain; just is the one tool the
       # recipes need.
-      - uses: extractions/setup-just@v4
-        with:
-          just-version: 1.49.0
+      - uses: ./.github/actions/just
 
       # The runner stalls for more than 10 s at times (archive copies,
       # cluster restarts). At Aeron's 10 s default, a stall kills a

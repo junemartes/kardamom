@@ -311,7 +311,7 @@ Signed mode needs a complete digest manifest.
 - It verifies the bundle and each image with cosign before it changes a workload.
 - It never falls back to a mutable tag.
 - Local unsigned mode keeps an explicit dev-tag fallback.
-- Upstream Anvil keeps the image policy of its jobspec. The light-client image is built by the image playbook, pinned by digest and signed like the service images.
+- The upstream images (anvil, the node exporter, Prometheus, Alertmanager, Grafana) are pinned by tag and digest in `upstream_images` (`ansible/group_vars/all.yml`). They are not signed. The light-client image is built by the image playbook, pinned by digest and signed like the service images.
 
 ### The egress
 
@@ -644,7 +644,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Fees | `PRIORITY_FEES` | empty (`off`) | `on` or `off`. One value sets the sequencer tip, the sealer ordering window and the executor and validator fee schedule. Turning it on for an existing chain is a chain upgrade. See [`../../docs/priority-fees.md`](../../docs/priority-fees.md). |
 | Aeron | `KARDAMOM_AERON_THREADING_MODE` | empty (`SHARED` in the job) | The threading mode of the media driver of each node: `SHARED` (one thread), `SHARED_NETWORK` (the sender and the receiver on one thread, the conductor on its own) or `DEDICATED` (three threads). `SHARED` costs the least CPU, but at a high message rate its one thread saturates and every stream of the node waits. |
 | Aeron | `KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL` | empty (`1` in the job) | The sync level of the `tx_data`, `tx_deposits` and `exec_txs` recordings and of the archive catalog (job variable `archive_file_sync_level`). `0` leaves a write in the page cache. `1` syncs the data of each write batch. `2` also syncs the metadata. Level 1 costs throughput on the recording path. |
-| Aeron | `AERON_STALL_TOLERANCE_MS` | `10000` | How long every Aeron party waits through a stalled peer, in ms. The container recipes and CI use `30000`. See "Aeron stall tolerance" in [`../../docs/failure-modes.md`](../../docs/failure-modes.md#substrate-the-shared-failure-domain). |
+| Aeron | `AERON_STALL_TOLERANCE_MS` | `10000` | How long every Aeron party waits through a stalled peer, in ms. It also sets how long a media driver keeps the image of a silent publisher. The container recipes and CI use `30000`. See "Aeron stall tolerance" in [`../../docs/failure-modes.md`](../../docs/failure-modes.md#substrate-the-shared-failure-domain). |
 | Aeron | `KARDAMOM_IDLE_CAP_US` | `50` | The longest idle wait of every hot-path thread, in µs from 1 to 1000000 (job variable `idle_cap_us`). Only the `aeron`, `cluster`, `ingress`, `sequencer` and `executor` jobs take it. A lower value gives a lower latency after a quiet spell and costs more idle CPU. The container recipes and CI use `1000`. See "Hot-path idle cap" in [`../../docs/failure-modes.md`](../../docs/failure-modes.md#substrate-the-shared-failure-domain). |
 | Deploy | `KARDAMOM_CANARY` | `0` | `1` deploys one canary of the ingress and of the sequencer. |
 | Chaos | `KARDAMOM_CHAOS_CASES`, `CHAOS_TPS`, `LOAD_DURATION_S` and others | | The knobs of the chaos suite. See [`../../docs/chaos-suite.md`](../../docs/chaos-suite.md). |
@@ -754,6 +754,11 @@ Settings are in `roles/images/defaults/main.yml`.
 - `REGISTRY_PUSH_NODE=control-0` (the default) keeps the host daemon out of the push. Ansible exports an image archive, copies it into `kardamom-control-0`, loads it into the Docker engine of that node, and pushes from there. It removes the temporary archive even when the load fails. It needs temporary disk space for one image archive on each side.
 - Pushes use the Docker CLI through Ansible `command.argv`, without a shell. This keeps the digest of the exact push: the Docker push module returns a pre-push inspection and does not expose that digest.
 - Each manifest entry has the form `repo:tag@sha256:...` that the Nomad jobs need.
+- Upstream copies: with `REGISTRY_PUSH_NODE` set (the container path), the playbook also copies each image of `upstream_images` into the in-cluster registry.
+  - The copy is a build `FROM` the pinned reference (`docker/upstream/Dockerfile`). The host pulls each image one time, with the retries of the build, and the copy takes the transfer and the push of the kardamom images.
+  - The manifest records each copy as `upstream-<variable>`, for example `upstream-anvil-image`. The deploy passes the copy to the job variable (`anvil_image`, `node_exporter_image`, `prometheus_image`, `alertmanager_image`, `grafana_image`). A node then pulls nothing from an external registry, and one stuck pull cannot fail the bring-up.
+  - A release for a real registry (no `REGISTRY_PUSH_NODE`) copies nothing. Its jobs pull the upstream references.
+  - A job file repeats each reference as its variable default. `just check-contract` checks the copy.
 
 Signing:
 
@@ -853,6 +858,8 @@ deploy/cluster/
 | `production` | A dedicated core and elastic cloud pools | One or three voting servers on the dedicated core | `roles/netinfo` resolves the address from the vSwitch VLAN or the private interface | Gossip encryption, ACLs, agent TLS, `roles/firewall` |
 
 - In both profiles the Nomad agents find their servers through the local Consul agent (`server_auto_join`, `client_auto_join`). There is no static server list.
+- `nomad_heartbeat_grace` is the time after a missed client heartbeat before a Nomad server marks the node down and replaces its allocations. The local profile uses `60s`: its node containers share one host and stall under CPU load. Production keeps the Nomad default of `10s`.
+- `consul_http_max_conns_per_client` (`1024`, Consul's default is 200) limits the HTTP connections of one client address on a Consul agent. All local processes share the loopback address, so the limit applies to the whole node. Each process holds a blocking query for each watched service.
 - The Consul agents join `consul_retry_join`: the control node in the local profile, infrastructure DNS names in production.
 - The Nomad service names carry `cluster_id`. Two clusters in one Consul datacenter cannot join each other.
 - `roles/profile` refuses a production run that lacks a security input.
@@ -867,6 +874,7 @@ The inventory, the bootstrap steps, the elastic first boot and the host settings
 - **Durability:** the Aeron Cluster members of the sealer archive the canonical log. Executors keep state in libmdbx under `/opt/kardamom/state` and recover from a crash by archive replay-merge.
 - **MTU 1344:** the media driver and the cluster JVM set `-Daeron.mtu.length=1344`. The value fits a path MTU of 1400 bytes.
 - **Reserved port block:** `fixed_port_block` (`40000-40299`) takes the fixed Aeron ports out of the Linux ephemeral range.
+- **Stall tolerance:** `AERON_STALL_TOLERANCE_MS` sets the driver timeout, the client liveness timeout, the image liveness timeout and the publication unblock timeout of each media driver: the `aeron` job and the embedded driver of each sealer member.
 - The derivation of the MTU and the port rules are in [Host settings](./PRODUCTION.md#host-settings).
 
 ## Performance pipeline (`kardamom-perf`)

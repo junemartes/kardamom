@@ -116,6 +116,24 @@ variable "grafana_admin_password" {
   default     = "kardamom"
 }
 
+variable "prometheus_image" {
+  type        = string
+  description = "The image reference. The default is the pinned upstream image (upstream_images in ansible/group_vars/all.yml). The container path passes the in-cluster copy."
+  default     = "prom/prometheus:v3.5.1@sha256:38c3b05c3bc744ff1b0b7b4eb82196026442845e62a1e2073795565da506d7a2"
+}
+
+variable "alertmanager_image" {
+  type        = string
+  description = "The image reference. The default is the pinned upstream image (upstream_images in ansible/group_vars/all.yml). The container path passes the in-cluster copy."
+  default     = "prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a"
+}
+
+variable "grafana_image" {
+  type        = string
+  description = "The image reference. The default is the pinned upstream image (upstream_images in ansible/group_vars/all.yml). The container path passes the in-cluster copy."
+  default     = "grafana/grafana:12.1.1@sha256:a1701c2180249361737a99a01bc770db39381640e4d631825d38ff4535efa47d"
+}
+
 locals {
   dc = var.datacenter
   # The admin endpoint of a sealer member (admin_port in nomad/cluster.nomad.hcl).
@@ -317,7 +335,7 @@ job "monitoring" {
       driver = "docker"
 
       config {
-        image        = "prom/prometheus:v3.5.1@sha256:38c3b05c3bc744ff1b0b7b4eb82196026442845e62a1e2073795565da506d7a2"
+        image        = var.prometheus_image
         network_mode = "host"
         # The CA of the Nomad agents, when the API speaks TLS: the scrape
         # of the Nomad metrics verifies the agent certificate against it.
@@ -395,7 +413,7 @@ job "monitoring" {
       driver = "docker"
 
       config {
-        image        = "prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a"
+        image        = var.alertmanager_image
         network_mode = "host"
         args = [
           "--config.file=/secrets/alertmanager.yml",
@@ -437,7 +455,7 @@ job "monitoring" {
       driver = "docker"
 
       config {
-        image        = "grafana/grafana:12.1.1@sha256:a1701c2180249361737a99a01bc770db39381640e4d631825d38ff4535efa47d"
+        image        = var.grafana_image
         network_mode = "host"
         volumes = [
           "local/provisioning:/etc/grafana/provisioning:ro",

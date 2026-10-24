@@ -23,6 +23,13 @@ workloads_cert_issuer: "{{ lookup('env', 'KARDAMOM_CERT_OIDC_ISSUER') | default(
 workloads_image_services: >-
   {{ ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher', 'batcher',
       'state-mirror', 'notifier', 'canary'] + (['egress'] if workloads_egress | bool else []) }}
+# The upstream image of each job variable in upstream_images: the
+# in-cluster copy that the image manifest records as upstream-<variable>
+# (the container path), else the pinned upstream reference.
+workloads_upstream_images: >-
+  {{ upstream_images | combine(dict(workloads_image_refs.keys() | select('match', '^upstream-')
+     | map('regex_replace', '^upstream-', '') | map('replace', '-', '_')
+     | zip(workloads_image_refs | dict2items | selectattr('key', 'match', '^upstream-') | map(attribute='value')))) }}
 # The variables every job derives its placement and its peer lists from.
 # A job receives the ones its file declares (tasks/job.yml).
 # The Nomad node pool of a job, by job name: the pool id of an elastic
@@ -433,9 +440,10 @@ workloads_indexer_port: "{{ lookup('env', 'L1_INDEXER_PORT') | default('8549', t
 workloads_poll_delay: 3
 workloads_poll_retries: 80
 # The poll budget of one Nomad deployment, in polls of workloads_poll_delay
-# seconds. It covers a job's progress_deadline (10 minutes), so a
-# deployment that Nomad has not decided yet is never read as a failure.
-workloads_deployment_retries: 220
+# seconds. It covers the longest progress_deadline of a job (12 minutes,
+# the sealer), so a deployment that Nomad has not decided yet is never
+# read as a failure. 260 polls of 3 s are 13 minutes.
+workloads_deployment_retries: 260
 # Canary allocations for the ingress and the sequencer: 0 or 1. A canary
 # is one allocation more than the count, so it needs a spare node of its
 # class; the container profile has none.

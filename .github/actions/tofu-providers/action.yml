@@ -12,9 +12,16 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: opentofu/setup-opentofu@v1
+    # The download needs no version lookup: opentofu/setup-opentofu reads
+    # get.opentofu.org/tofu/api.json, and a timeout there fails the job.
+    # The SHA-256 is the line for tofu_1.12.6_linux_amd64.tar.gz in the
+    # tofu_1.12.6_SHA256SUMS asset of the release. mise.toml pins the same
+    # version for local hosts.
+    - uses: ./.github/actions/release-tarball
       with:
-        tofu_version: 1.12.6
+        name: tofu
+        url: https://github.com/opentofu/opentofu/releases/download/v1.12.6/tofu_1.12.6_linux_amd64.tar.gz
+        sha256: 50a6106fa4de523d09c87af85f3db1dd47535fc005727fdca6852146476b88ec
     # Every later tofu init in the job reads this variable, the shard
     # test's init included.
     - name: Point OpenTofu at the plugin cache

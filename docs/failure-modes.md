@@ -1584,11 +1584,13 @@ A deploy replaces service instances one at a time under readiness checks. The ch
     - the driver timeout of every Rust client (`AERON_DRIVER_TIMEOUT`, which the C client reads);
     - the driver timeout of every Java client (`aeron.driver.timeout`), in the `aeron` job and in each sealer member;
     - the client liveness timeout of every media driver (`aeron.client.liveness.timeout`), in the `aeron` job and in the embedded driver of each sealer member. The service interval check of a client uses the same value.
+    - the image liveness timeout of the same media drivers (`aeron.image.liveness.timeout`). A receiving driver keeps the image of a silent publisher this long. A receiver thread that stalls for longer loses the image, and an archive that loses an image leaves a hole in its recording.
   - The publication unblock timeout is 3/2 of the tolerance. Aeron refuses to start a driver whose unblock timeout is not above its client liveness timeout.
   - A client sends its keepalive every 500 ms, far below the tolerance.
   - A Rust service waits for its Aeron client to start for the driver timeout plus 5 s, and at least 10 s. A client that starts while a restarted driver is still in its restart delay therefore waits for the driver, and does not crash-loop.
   - A new driver refuses to start (`active driver detected`) while the heartbeat of a dead predecessor is younger than its driver timeout. So the `aeron` job restarts a failed driver after the tolerance plus 5 s.
   - The default is **10000** ms, the Aeron default. Staging and production keep it. A longer value delays the detection of a dead client or driver by the same time.
+    - A publisher that closes sends an end of stream, and its images go at once. Only the image of a killed publisher or of a dead driver waits for the image liveness timeout. At the CI tolerance, such an image goes after 30 s, not 10 s. The subscribers and the recordings of that image close later by the same time. No chaos budget waits for that close: the Raft election and the cluster sessions use their own heartbeats, and a detached destination of a Rust subscriber lingers for a stall budget, which is longer than the image liveness timeout.
   - The Raft election and leader heartbeat timeouts are separate and do not change.
   - CI sets **30000** ms (the `cluster-e2e` workflow and the container recipes of `deploy/cluster/justfile`). A shared CI runner can stall for more than 10 s. At 10 s, such a stall kills a healthy party: a client exits on `MediaDriver keepalive: age=... > timeout=10000ms` or on `service interval exceeded`.
   - Every Aeron client error ends the process, in every Aeron context of a Rust service. A timeout is the common case.

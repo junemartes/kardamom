@@ -243,7 +243,7 @@ variable "image_ref" {
 # detection of a dead process. CI raises it to ride out host stalls.
 variable "aeron_stall_tolerance_ms" {
   type        = number
-  description = "The client liveness timeout of the media driver and the driver timeout of its Java clients, in milliseconds. Aeron's default is 10000."
+  description = "The client liveness and image liveness timeouts of the media driver and the driver timeout of its Java clients, in milliseconds. Aeron's default is 10000."
   default     = 10000
 
   validation {
@@ -282,6 +282,14 @@ variable "datacenter" {
 #   keepalive every 500 ms, far below it.
 # - aeron.publication.unblock.timeout (ns): Aeron requires it above the
 #   client liveness timeout. It keeps Aeron's default ratio, 3/2.
+# - aeron.image.liveness.timeout (ns): a receiving driver keeps the image
+#   of a silent publisher this long, and a stalled receiver thread loses
+#   the image when its stall is longer. An archive that loses an image
+#   leaves a hole in its recording. A publisher sends a heartbeat every
+#   100 ms, far below it. Aeron checks no order against the other
+#   timeouts. A publisher that closes sends an end of stream, and its
+#   images go at once. Only the image of a dead publisher or a dead
+#   driver waits for the full timeout.
 # - aeron.archive.message.timeout: the archive clients of the consensus
 #   module and the service wait this long for an archive response.
 #   Aeron's default is 10 s, the same as the stall tolerance default.
@@ -296,6 +304,7 @@ locals {
     "-Daeron.driver.timeout=${var.aeron_stall_tolerance_ms}",
     "-Daeron.client.liveness.timeout=${var.aeron_stall_tolerance_ms * 1000000}",
     "-Daeron.publication.unblock.timeout=${floor(var.aeron_stall_tolerance_ms * 3 / 2) * 1000000}",
+    "-Daeron.image.liveness.timeout=${var.aeron_stall_tolerance_ms * 1000000}",
     "-Daeron.archive.message.timeout=${var.aeron_stall_tolerance_ms}ms",
     "-Daeron.archive.connect.timeout=${floor(var.aeron_stall_tolerance_ms / 2)}ms",
   ])
@@ -406,12 +415,27 @@ job "cluster" {
       # so it has rejoined and caught up before the next member stops.
       # Two members never restart together. No revert: a member carries
       # the Raft log, and the role's rollback is the path.
+      #
+      # The healthy deadline covers the self-heal of a member that waits
+      # for a log tail that the leader does not have. Its join watchdog
+      # exits it after a 160 s stall, and the relaunch rejoins. The steps,
+      # as measured on a CI bring-up:
+      #   allocation to task start (image, JVM)           72 s
+      #   task start to the stall verdict (leader + 160)  200 s
+      #   verdict to the relaunch (restart delay, JVM)     34 s
+      #   relaunch to the closed election                 53 s
+      #   min_healthy_time                                60 s
+      # That is 419 s, 7 minutes. 9 minutes leaves 2 minutes for the check
+      # interval and a slower host. A deadline below the total marks the
+      # healing member unhealthy, and the deployment fails. The progress
+      # deadline stays above the healthy deadline, and the poll budget of
+      # the deploy (workloads_deployment_retries) covers it.
       update {
         max_parallel      = 1
         health_check      = "checks"
         min_healthy_time  = "60s"
-        healthy_deadline  = "5m"
-        progress_deadline = "10m"
+        healthy_deadline  = "9m"
+        progress_deadline = "12m"
         auto_revert       = false
       }
 

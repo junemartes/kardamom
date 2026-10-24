@@ -114,3 +114,18 @@
       ingress inclusion_horizon_blocks ({{ contract_ingress_horizon }})
       and cluster_inclusion_horizon_blocks ({{ contract_sealer_horizon }})
       must be equal.
+
+# The job files repeat each upstream image reference as the default of
+# its variable, so a job that the deploy does not compile (nomad job
+# validate, an operator run) pulls the same pinned image.
+- name: The job defaults must match the upstream image pins
+  vars:
+    contract_job_text: "{{ query('file', *query('fileglob', contract_cluster_dir ~ '/nomad/*.hcl')) | join('\n') }}"
+  ansible.builtin.assert:
+    that: >-
+      contract_job_text | regex_search('variable "' ~ item.key ~ '" \{[^}]*default\s*=\s*"' ~ (item.value | regex_escape) ~ '"')
+      is not none
+    fail_msg: "No job file declares variable {{ item.key }} with the default {{ item.value }} (upstream_images)."
+  loop: "{{ upstream_images | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
