@@ -137,7 +137,9 @@ pub struct IngressSettings {
     )]
     pub(crate) executor_query_endpoints: Vec<String>,
     /// The endpoints of `eth_getTransactionReceipt` on a cache miss: the
-    /// egress (`http://host:port`). Empty: the executor query endpoints.
+    /// egress (`http://host:port`). An answer that is no receipt then asks
+    /// the executor query endpoints. Empty: the executor query endpoints
+    /// only.
     #[arg(
         long = "receipt-query-endpoints",
         env = "KARDAMOM_RECEIPT_QUERY_ENDPOINTS",

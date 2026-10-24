@@ -43,6 +43,7 @@ use crate::error::IngressError;
 use crate::pending::PendingReceipts;
 use crate::rate_limit::PerIpLimiter;
 use crate::receipt_cache::ReceiptCache;
+use crate::receipt_query::ReceiptQuery;
 use crate::recent::RecentMap;
 use crate::sig_verify::BatchVerifier;
 use crate::submit_steps::SubmitSteps;
@@ -172,9 +173,9 @@ where
     /// stall. The admission path never calls it: it has its own client
     /// in `cold`.
     pub(crate) query: Option<ExecutorQuery>,
-    /// The query of a receipt on a cache miss: the egress, or `query` when
-    /// the config names no receipt endpoint.
-    pub(crate) receipt_query: Option<ExecutorQuery>,
+    /// The query of a receipt on a cache miss: the egress first, then
+    /// `query`. See [`crate::receipt_query`].
+    pub(crate) receipt_query: ReceiptQuery,
     /// The Redis layer. `None` with `[cache]` off: no Redis call exists
     /// on any path. See `kardamom_cache::reader`.
     pub(crate) redis: Option<Arc<CacheReader>>,
@@ -285,7 +286,7 @@ where
         let tx_error_dedup = Arc::new(TxErrorDedup::default());
         let live = subscription.live_accounts();
         let query = ExecutorQuery::new(&cfg.executor_query);
-        let receipt_query = ExecutorQuery::new(&cfg.receipt_query).or_else(|| query.clone());
+        let receipt_query = ReceiptQuery::new(&cfg.receipt_query, query.as_ref());
         let redis = cfg.cache.enabled().then(|| {
             Arc::new(CacheReader::spawn(
                 &cfg.cache,
@@ -475,21 +476,25 @@ where
         self.cache.lookup_by_tx_hash(tx_hash)
     }
 
-    /// The receipt of `tx_hash`: the in-memory cache first, then one
-    /// query to an executor's state DB on a miss.
+    /// The receipt of `tx_hash`: the in-memory cache first, then the
+    /// receipt query on a miss: the egress, then an executor's state DB.
     ///
     /// The cache lives in this process, so a restarted ingress holds no
     /// receipt from before its start, and an old receipt leaves the
-    /// bounded cache. The state DB is the durable copy: a client that
-    /// got a hash from an accepted submit must find its receipt after any
-    /// ingress restart. A receipt found there enters the cache, so the
-    /// next poll is a local hit.
+    /// bounded cache. The egress holds only its newest receipts. The state
+    /// DB is the durable copy: a client that got a hash from an accepted
+    /// submit must find its receipt after any ingress or egress restart. A
+    /// receipt found behind the cache enters the cache, so the next poll
+    /// is a local hit.
     ///
     /// A poll for a transaction that has not executed yet also misses,
-    /// so the executor query is bounded three ways: the client's token
-    /// bucket, the query client's in-flight bound, which sheds at once,
-    /// and its timeout. A shed or failed query answers `None`, the same
-    /// as "not committed yet", and the client polls again.
+    /// so the receipt query is bounded three ways: the client's token
+    /// bucket, the in-flight bound of each query client, which sheds at
+    /// once, and its timeout. One token pays for the whole read. A poll
+    /// over the token bucket answers `None` and asks no layer: a fallback
+    /// would give an over-rate client more queries, not fewer. A shed or
+    /// failed query answers `None`, the same as "not committed yet", and
+    /// the client polls again.
     pub async fn receipt_by_hash(
         &self,
         client_ip: std::net::IpAddr,
@@ -499,19 +504,14 @@ where
             kardamom_cache::metrics::record_lookup("receipt", "hit");
             return Some(receipt);
         }
-        let query = self.receipt_query.as_ref()?;
+        if self.receipt_query.is_off() {
+            return None;
+        }
         if self.rate_limiter.check(client_ip).is_err() {
             kardamom_cache::metrics::record_lookup("receipt", "shed");
             return None;
         }
-        let found = query.receipt(tx_hash).await;
-        let outcome = match &found {
-            Ok(Some(_)) => "state_hit",
-            Ok(None) => "miss",
-            Err(_) => "state_error",
-        };
-        kardamom_cache::metrics::record_lookup("receipt", outcome);
-        let receipt = found.ok().flatten()?;
+        let receipt = self.receipt_query.receipt(tx_hash).await?;
         self.cache.insert(receipt.clone());
         Some(receipt)
     }

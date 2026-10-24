@@ -103,6 +103,8 @@ The `egress_receipts` stream carries the receipts that the egress merged from th
 - The executors cut their batches differently. The egress passes on only the receipts of a batch past the last receipt that it took, with the rows of the batch. The rows are absolute values, and a reader keeps the row of the higher position.
 - A sequencer reads it in place of `tx_receipts` with `receipts_from_egress = true` in its config.
 - The egress also answers `eth_getTransactionReceipt` as the state query of an executor does (`POST /`, the receipt as rkyv hex, the block in `x-state-block`). An ingress reads it with `--receipt-query-endpoints`.
+- The egress keeps only its newest receipts (`KARDAMOM_EGRESS_RECEIPTS`, default 1,000,000), in memory. It holds no receipt from before its start, and it is empty after a restart. It answers `null` for every hash that it does not hold.
+- So an ingress asks the egress first, and asks the executor query (`--executor-query-endpoints`) when the egress gives no receipt: a `null`, an error, a timeout or a `503`. The state DB of an executor keeps every committed receipt. A receipt from the egress ends the read, with no second query.
 
 The `tx_drops` stream carries the transactions that the sequencers dropped: one `TxDrop` record for each drop, with the hash, the sender, the nonce and the reason. The reason has the error text of geth, for example `nonce too low` or `txpool is full`.
 
