@@ -10,6 +10,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.kardamom.sealer.VersionSwitch.FeatureActivation;
 import io.kardamom.sealer.VersionSwitch.Outcome;
 import java.nio.ByteBuffer;
+import java.util.List;
+import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -156,6 +158,40 @@ class CarryFlagSwitchTest {
         final CanonicalSealerState again = CanonicalSealerState.load(restored.takeSnapshot(), 8);
         assertEquals(5, again.decisionVersion());
         assertEquals(restored.versionSwitch(), again.versionSwitch());
+    }
+
+    /**
+     * The state section of a snapshot with a retained file is version 17:
+     * the bytes of version 16 with another version. A restored state keeps
+     * decision version 5 and a held activation of the carry flag. A
+     * version-12 section holds no decision rules, so its state runs
+     * version 3.
+     */
+    @Test
+    void a_state_with_a_retained_file_writes_snapshot_version_seventeen_and_restores_it() {
+        final CanonicalSealerState state = onVersionFive();
+        assertEquals(Outcome.STORED, activate(state, VersionSwitch.FEATURE_SEALER_V5, 6, 5_000L));
+        final byte[] v17 = state.takeSnapshotWithRetainedFile();
+        assertEquals(CanonicalSealerState.FILE_SNAPSHOT_VERSION, snapshotVersion(v17));
+        final byte[] v16 = state.takeSnapshot();
+        assertEquals(CanonicalSealerState.CARRY_SNAPSHOT_VERSION, snapshotVersion(v16));
+        ByteBuffer.wrap(v16).putInt(Integer.BYTES, CanonicalSealerState.FILE_SNAPSHOT_VERSION);
+        assertArrayEquals(v16, v17, "version 17 has the state section of version 16");
+        final CanonicalSealerState restored = CanonicalSealerState.load(v17, 8);
+        assertEquals(CanonicalSealerState.FILE_SNAPSHOT_VERSION, restored.restoredSnapshotVersion());
+        assertEquals(5, restored.decisionVersion());
+        assertEquals(state.versionSwitch(), restored.versionSwitch());
+        assertArrayEquals(v17, restored.takeSnapshotWithRetainedFile());
+        final CanonicalSealerState legacy = CanonicalSealerState.load(
+            state.takeSnapshot(CanonicalSealerState.RETAINED_FILE_SNAPSHOT_VERSION), 8);
+        assertEquals(3, legacy.decisionVersion(), "version 12 holds no decision rules");
+    }
+
+    @Test
+    void only_versions_twelve_and_seventeen_hold_a_retained_file() {
+        assertEquals(List.of(12, 17), IntStream
+            .rangeClosed(CanonicalSealerState.SNAPSHOT_READ_MIN_VERSION, CanonicalSealerState.snapshotReadMaxVersion())
+            .filter(CanonicalSealerState::holdsRetainedFile).boxed().toList());
     }
 
     /** A version-15 snapshot loads, and its state then takes the carry flag. */

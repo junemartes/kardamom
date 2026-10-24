@@ -431,7 +431,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.daLagBudgetBlocks` | `10000` (env `DA_LAG_BUDGET_BLOCKS`) | yes | The DA-lag budget in blocks. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. |
 | `kardamom.cluster.recordLagBudget` | `0` (env `KARDAMOM_RECORD_LAG_BUDGET`) | yes | The record-lag budget in canonical records. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. In this release a value above `0` also stops the start, because the snapshot writer writes version 10. |
 | `kardamom.cluster.retention` | `65536` | recommended | The egress frames kept for replay: the minimum below decision version 5, and the exact window under version 5. |
-| `kardamom.cluster.carryBytes` | `false` | yes | `true` keeps the retained frames in an append-only file, not on the heap, and writes snapshot version 12. It also relays a full entry as a canonical entry, and drops the void request and the recorded cursor. The release gate refuses a rolling change of it. It needs `adminPort`, the env var `KARDAMOM_RETAINED_TOKEN` and a `snapshotIntervalS` above `0`. Any value other than `true`, `false` or empty stops the start. See [Retained file](#retained-file). |
+| `kardamom.cluster.carryBytes` | `false` | yes | `true` keeps the retained frames in an append-only file, not on the heap, and writes snapshot version 17. It also relays a full entry as a canonical entry, and drops the void request and the recorded cursor. The release gate refuses a rolling change of it. It needs `adminPort`, the env var `KARDAMOM_RETAINED_TOKEN` and a `snapshotIntervalS` above `0`. Any value other than `true`, `false` or empty stops the start. See [Retained file](#retained-file). |
 | `kardamom.cluster.feedAeronDir` | empty (off) | no | The directory of the media driver that the member shares with its paired executor. A value turns the member feed on. It needs `carryBytes=true`; without it the start stops. See [Member feed](#member-feed). |
 | `kardamom.cluster.feedRingBytes` | `16777216` (16 MiB) | no | The frame ring of the member feed, off the heap. A power of two of at least 8 MiB; another value stops the start. |
 | env `KARDAMOM_RETAINED_TOKEN` | none | yes, with `carryBytes` | The shared token that a request for the retained file must carry. The member reads it only from the env var, because `ps` shows the system properties. A log line never prints it. |
@@ -467,7 +467,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
   - The snapshot carries the retained frames. A member that restores a snapshot keeps the floors of the snapshot. It answers older ranges with `REPLAY_UNAVAILABLE`.
   - Use the same value on every member. The eviction is part of the replicated state: the replay answers and the snapshot bytes depend on it.
 - `carryBytes`: the deploy does not pass it yet, so the retained frames stay on the heap.
-  - Switch it only with a new chain or a coordinated cut-over, never on a live chain. A member with the file stops on a snapshot before version 12, and a member without the file stops on a version-12 snapshot. Both print `sealer RETAINED-FILE FATAL`.
+  - Switch it only with a new chain or a coordinated cut-over, never on a live chain. A member with the file stops on a snapshot that is not version 12 or 17, and a member without the file stops on version 12 or 17. Both print `sealer RETAINED-FILE FATAL`.
   - `snapshotIntervalS=0` with `carryBytes` stops the start: the purge of the file runs at each snapshot, so the file would never shrink.
 - `daLagBudgetBlocks`: the start-up line `cluster da-lag budget` shows the value. See [DA-lag guard](#da-lag-guard).
 - `recordLagBudget`: the start-up line `cluster record-lag budget` shows the value. See [Record-lag guard](#record-lag-guard).
@@ -620,7 +620,7 @@ Version 5 is version 4 that relays the bytes of a transaction. The sequencer off
 - **The replay window.** A member that carries the bytes (`carryBytes`) keeps only the last `retention` frames. A frame past the window leaves at once, also when its block is above the posted head. So the retained frames have a fixed bound in the retained file and in the snapshot, at any DA lag.
   - A member that keeps its frames on the heap keeps the rule of version 4: a frame past the window leaves only when its block is posted. Without the bytes, no member feed runs. The executors and the batcher then read references, and the egress cannot serve a reference, so no reader below the window could recover.
   - Every member runs the same `carryBytes` value (the release gate refuses a rolling change of it), so every member evicts the same frames.
-  - A member with `carryBytes` writes snapshot version 12. That layout holds no decision rules and no version switch, so a restore of such a member does not run version 5 yet. Until a snapshot version for that case exists, do not run `carryBytes` with feature 3 or 4.
+  - A member with `carryBytes` writes snapshot version 17. It holds the decision rules and the version switch, so a restored member runs version 5 as its peers do. A member that restores a version-12 snapshot of an older release runs version 3, so a chain with the file writes version 17 before it turns on feature 3 or 4.
   - A cursor inside the window gets the frames from the cursor. A cursor below the window gets `REPLAY_UNAVAILABLE`. A reader below the window recovers from another source.
   - The DA-lag guard stays. It refuses new records when the sealed head is more than the budget past the posted head. It holds no frame.
   - The rule changes at the end of the log entry whose boundary switches the version: the member evicts the frames past the window before the snapshot notice of the switch. A restore takes the rule of the version in the snapshot. So every member evicts the same frames at the same log position, from the log or from a snapshot. The status of the tick that switches leaves before the eviction, with the count of the old rule.
@@ -642,7 +642,8 @@ Version 5 is version 4 that relays the bytes of a transaction. The sequencer off
 | 2 | A void sets the expected nonce of the sender to the lower of the expected nonce and the voided nonce. |
 | 3 | A relayed frame of kinds 0, 3, 4 and 5 needs its record-type byte. With `carryBytes`, a member orders full entries, relays them as canonical entries, and takes no void request. The contiguity guard does not change. |
 
-- `carryBytes` is a setting that every member must match, and the release gate refuses a rolling change of it. The snapshot layout carries it: a member with `carryBytes` stops on a snapshot that is not version 12, and a member without it stops on version 12.
+- `carryBytes` is a setting that every member must match, and the release gate refuses a rolling change of it. The snapshot layout carries it: a member with `carryBytes` stops on a snapshot that is not version 12 or 17, and a member without it stops on version 12 or 17.
+- A member with `carryBytes` writes snapshot version 17. Version 17 holds the decision rules, the switch and the schedule of feature 4, so a restored member runs the same decision version as its peers. A version-12 snapshot holds no decision rules: a member that restores one runs version 3.
 
 ## Admin server
 
@@ -775,12 +776,15 @@ The chaos suite and operators read these lines. The admin server also exports on
 
 ## Snapshot
 
-- The member reads snapshot versions 1 to 16. It writes version 14, or version 12 with `carryBytes`. It writes version 15 or 16 when it holds a feature activation (see below).
+- The member reads snapshot versions 1 to 17. It writes version 14, or version 17 with `carryBytes`. Without `carryBytes`, it writes version 15 or 16 when it holds a feature activation (see below).
   - Version 14 is version 10, then the decision rules after the seed digest: `[decision_version:u8][sealed_origin:u64][held:u8]`, then `[origin:u64][time_ms:u64]` for each held activation, oldest first (at most three). The member writes version 3 and `sealed_origin`, the L1 origin of the last sealed block. It keeps the held activations of the snapshot that it restored, and adds none. A member of the release before this one restores the same rules, and runs version 3 while `FEATURE_SEALER_V3` stays on. A tail of version 2 restores as version 3. See [Decision version](#decision-version).
   - Version 15 is version 14, then the switch to version 4: `[decision_version:u8][sealed_origin:u64][held:u8]` and `[origin:u64][time_ms:u64]` for each held activation of feature 3, then the replay windows: `[slots:i32][width:i32][used:i32]` and, for each used slot, `[key:u64][highest:u64][last_seen:u64][bits]` (the bitmap is 32 KiB). A member writes version 15 once it holds an activation of feature 3. A member of the release before reads only up to version 14, so the upgrade transaction comes only after every member runs this release. A member checks that the snapshot was written with its own slot count and width.
   - Version 16 is version 15, then the schedule of feature 4: `[held:u8]` and `[origin:u64][time_ms:u64]` for each held activation, oldest first (at most three). The version byte of the switch can be 5. A member writes version 16 once it holds an activation of feature 4. A member of the release before reads only up to version 15, so the upgrade transaction of feature 4 comes only after every member runs this release.
   - Version 13 is version 10, then `[decision_version:u8][activation_origin:u64][activation_ms:u64]`: one held activation.
-  - Version 12 is the state section of version 10 without the void ledger, then the retention section of the retained file. A member with `carryBytes` takes no void request and no recorded cursor, so it holds neither.
+  - Version 17 is the state section of version 16, then the retention section of the retained file. A member with `carryBytes` writes it with or without a held activation. Its void ledger is empty: a member with `carryBytes` takes no void request.
+    - A member of the release before reads only up to version 16, and stops on version 17. A member without `carryBytes` never writes version 17, so a rolling deploy of a chain without `carryBytes` is safe.
+    - On a chain with `carryBytes`, a member of the release before stops on version 17. So a rollback after the first version-17 snapshot fails, and so does a seed of such a member from a peer that wrote version 17.
+  - Version 12 is the state section of version 10 without the void ledger, then the retention section of the retained file. A member with `carryBytes` of an older release writes it. This release still restores it. It holds no decision rules, so a member that restores it runs decision version 3.
   - This release does not write version 10. A member of the release before it restores version 10 with decision version 2.
   - A version-14 snapshot, as a version-10 one, holds no recorded cursor. A member that restores one has no cursor until the next cursor record. With the record-lag budget at `0` this changes no decision.
   - The release that turns on the cursor publisher and the record-lag guard writes version 11. Before that release, a `recordLagBudget` above `0` stops the start.
@@ -790,18 +794,20 @@ The chaos suite and operators read these lines. The admin server also exports on
   - the dedup window with the deadline of each id
   - the per-sender nonces
   - the remote-origin state
-  - the void ledger, in versions 6 to 11, 13 and 14
+  - the void ledger, in versions 6 to 11 and 13 to 17
   - the ordering window size
   - the posted head, after the ordering window size
   - the seed status (1 byte) and the seed digest (32 bytes), after the posted head
   - from version 11 only, the recorded cursors, after the seed digest: `[count:u8]`, then `[executor_id:u8][recorded_through:u64]` for each executor, in executor-id order
     - A restore drops the cursor of an executor that is not a configured voter.
-  - from versions 13 and 14 only, the decision rules, after the seed digest
+  - from versions 13 to 17, the decision rules, after the seed digest
+  - from versions 15 to 17, the version switch and the replay windows, after the decision rules
+  - from versions 16 and 17, the schedule of feature 4, after the replay windows
 - The retention section follows the state section. Its layout depends on the version. Both layouts are big-endian.
   - Under decision version 5 on a member that carries the bytes, the section holds at most `retention` frames. The layout does not change.
-  - Versions 8 to 11, 13 and 14, on the heap: `[count:i32]`, then `[boundary:u8][key:u64][len:u32][frame]` for each retained frame.
-  - Version 12, the retained file: `[floor_index:u64][floor_block:u64][count:u64][front:u64][head:u64][n:i32]`, then `[block:u64][end_tx_idx:u64][end_pos:u64]` for each retained boundary, then `[len:i32]`, the length of the section before it. The section is the end of the snapshot, so a peer seed finds it with no parse of the state. See [Retained file](#retained-file).
-  - A member with `carryBytes` stops on a snapshot that is not version 12. A member without it stops on version 12.
+  - Versions 8 to 11 and 13 to 16, on the heap: `[count:i32]`, then `[boundary:u8][key:u64][len:u32][frame]` for each retained frame.
+  - Versions 12 and 17, the retained file: `[floor_index:u64][floor_block:u64][count:u64][front:u64][head:u64][n:i32]`, then `[block:u64][end_tx_idx:u64][end_pos:u64]` for each retained boundary, then `[len:i32]`, the length of the section before it. The section is the end of the snapshot, so a peer seed finds it with no parse of the state. See [Retained file](#retained-file).
+  - A member with `carryBytes` stops on a snapshot that is not version 12 or 17. A member without it stops on version 12 or 17.
 - A snapshot that was taken with another `orderingWindow` does not load. The member halts.
 - The Raft snapshot interval is `snapshotIntervalS`. The service asks for the snapshot on a boundary tick whose block number is a multiple of the interval in blocks. Only the leader's control toggle takes the request. The action is a log entry, so all members snapshot at the same position.
 - A snapshot stops the cluster. The consensus module appends no timer and no ingress until the service and the module record their snapshots in the archive. With `fileSyncLevel` above `0`, each recording is a chain of disk syncs (the catalog, the directory, each write, the recording log). On a loaded disk this took 11 s.
