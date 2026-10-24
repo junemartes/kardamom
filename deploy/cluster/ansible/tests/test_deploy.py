@@ -117,8 +117,13 @@ class NomadAPI(BaseHTTPRequestHandler):
             raise AssertionError(self.path)
 
     def register(self, job):
-        """Store `job` as the current definition and as a new version."""
+        """Store `job` as the current definition and as a new version. A down group starts when its
+        definition changes: a member that crash-loops on its release starts on another one."""
         state = self.server.state
+        old = {g['Name']: g for g in state['jobs'].get(job['ID'], {}).get('TaskGroups', [])}
+        new = {g['Name']: g for g in job['TaskGroups']}
+        if 'down_groups' in state:
+            state['down_groups'] = [name for name in state['down_groups'] if old.get(name) == new.get(name)]
         state['jobs'][job['ID']] = job
         state.setdefault('versions', {}).setdefault(job['ID'], []).append(job)
         if job['ID'] in state['deployments']:
@@ -443,10 +448,13 @@ class Deploys(unittest.TestCase):
     def record(self):
         return self.api.state['records']['kardamom/deploys/local']
 
-    def repin(self, digest):
-        """Point every manifest line at `digest`: a new release."""
-        self.manifest.write_text(self.manifest.read_text().replace(
-            re.search(r'@sha256:([0-9a-f]{64})', self.manifest.read_text()).group(1), digest * 64))
+    def repin(self, digest, tag=None):
+        """Point every manifest line at `digest`: a new release. A release tags its images
+        main-<12 hex of its commit>, and `tag` defaults to that tag of HEAD."""
+        text = self.manifest.read_text()
+        old = re.search(r'@sha256:([0-9a-f]{64})', text).group(1)
+        tag = tag or 'main-' + self.git('rev-parse', 'HEAD')[:12]
+        self.manifest.write_text(re.sub(rf':[^:@\s]+@sha256:{old}', f':{tag}@sha256:{digest * 64}', text))
 
     def run_rollback(self, success=True, environ=None):
         return self.run_deploy(playbook='rollback.yml', success=success, environ=environ)
@@ -1188,7 +1196,7 @@ class DeployTest(Deploys):
         first = self.manifest.read_text()
         self.assertEqual((self.record_dir / 'images.digests').read_text(), first)
         self.assertFalse((self.record_dir / 'images.digests.previous').exists())
-        self.manifest.write_text(first.replace('a' * 64, 'b' * 64))
+        self.repin('b')
         self.run_deploy()
         self.assertEqual((self.record_dir / 'images.digests').read_text(), self.manifest.read_text())
         self.assertEqual((self.record_dir / 'images.digests.previous').read_text(), first)
@@ -1435,8 +1443,8 @@ class RecordTest(Deploys):
         self.deploy()
         self.api.state['writes'] = []
         self.api.state['record_writes'] = []
-        self.repin('b')
         self.target_snapshot_reads_max(16)
+        self.repin('b')
         self.api.state['snapshot_latest'] = {'node-cluster-0': 16, 'node-cluster-1': 17}
         output = self.run_deploy(success=False)
         self.assertIn('reads sealer snapshots only up to version 16', output)
@@ -1805,9 +1813,60 @@ class RollbackTest(Deploys):
         """The manifest of release a, deployed from the checkout of release b: the record names the revision of
         the sealer image."""
         revision = self.two_sealer_releases()
-        self.repin('a')
+        self.repin('a', tag='test')
         output = self.run_deploy(success=False)
         self.assertIn(f'the sealer release of revision {revision} reads sealer snapshots only up to version 16', output)
+        self.assertEqual(self.api.state['writes'], [])
+
+    def test_a_sealer_image_that_no_record_names_needs_its_revision(self):
+        """The manifest of a release two back, deployed from the checkout of a newer release: no record names
+        the sealer image."""
+        revision = self.two_sealer_releases()
+        self.repin('c', tag='test')
+        output = self.run_deploy(success=False)
+        self.assertIn('no deploy record names the sealer image registry.example:5000/kardamom-cluster:test@sha256:', output)
+        self.assertIn('Set KARDAMOM_REVISION to the revision of that image', output)
+        self.assertEqual(self.api.state['writes'], [])
+        output = self.run_deploy({'workloads_revision': revision}, success=False)
+        self.assertIn(f'the sealer release of revision {revision} reads sealer snapshots only up to version 16', output)
+        # The tag of a release names its commit.
+        self.repin('c', tag=f'main-{revision[:12]}')
+        output = self.run_deploy(success=False)
+        self.assertIn(f'the sealer release of revision {revision[:12]} reads sealer snapshots only up to version 16',
+                      output)
+        self.assertEqual(self.api.state['writes'], [])
+
+    def test_a_rollback_rolls_a_down_sealer_member_that_the_operator_names_first(self):
+        """A member crash-loops on the release: the main reason to roll back."""
+        self.deploy()
+        self.repin('b')
+        self.run_deploy()
+        self.api.state['writes'] = []
+        self.api.state['roll_marker'] = 'a' * 64
+        self.api.state['down_groups'] = ['cluster-2']
+        output = self.run_rollback(success=False)
+        self.assertIn('the sealer members cluster-2 do not run', output)
+        self.assertIn('set KARDAMOM_ALLOW_SEALER_DOWN=cluster-2', output)
+        self.assertEqual(self.api.state['writes'], [], 'the check runs before the first revert')
+        output = self.run_rollback(success=False, environ={'KARDAMOM_ALLOW_SEALER_DOWN': 'cluster-1'})
+        self.assertIn('the sealer members cluster-2 do not run', output)
+        self.assertEqual(self.api.state['writes'], [])
+        output = self.run_rollback(environ={'KARDAMOM_ALLOW_SEALER_DOWN': 'cluster-2'})
+        self.assertIn('KARDAMOM_ALLOW_SEALER_DOWN accepts the down sealer members cluster-2.', output)
+        self.assertEqual(self.api.state['down_groups'], [], 'the member starts on the release before')
+        self.assertEqual(self.record()['attempt']['status'], 'rolled_back')
+        self.assertEqual(self.api.state['rolled'][-3:],
+                         [['cluster-2'], ['cluster-1', 'cluster-2'], ['cluster-0', 'cluster-1', 'cluster-2']])
+
+    def test_a_rollback_without_the_revision_of_the_release_before_is_refused(self):
+        """An empty revision makes git read the index of the checkout."""
+        self.deploy()
+        self.repin('b')
+        self.run_deploy()
+        self.api.state['writes'] = []
+        self.record()['attempt']['before']['revision'] = ''
+        output = self.run_rollback(success=False)
+        self.assertIn('the sealer release has no revision ("")', output)
         self.assertEqual(self.api.state['writes'], [])
 
     def test_a_rollback_without_a_record_refuses(self):

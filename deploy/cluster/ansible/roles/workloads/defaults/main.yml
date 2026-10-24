@@ -394,6 +394,13 @@ workloads_allow_retired: "{{ lookup('env', 'KARDAMOM_ALLOW_RETIRED') | split(','
 # and remoteOrigins. A change that the list does not name is refused.
 workloads_allow_must_match: >-
   {{ lookup('env', 'KARDAMOM_ALLOW_MUST_MATCH') | split(',') | map('trim') | reject('equalto', '') | list }}
+# The sealer groups that do not run, and that a roll of the sealer accepts
+# (KARDAMOM_ALLOW_SEALER_DOWN, comma-separated): a member that crash-loops
+# on a bad release. The snapshot check cannot read the newest snapshot of
+# such a member. The staged roll rolls it first. A down group that the
+# list does not name is refused, and so is a named group that runs.
+workloads_allow_sealer_down: >-
+  {{ lookup('env', 'KARDAMOM_ALLOW_SEALER_DOWN') | split(',') | map('trim') | reject('equalto', '') | list }}
 # A deploy over an attempt that is still `started` (KARDAMOM_REPLACE_ATTEMPT=1):
 # the operator says that the attempt died. The gate refuses it otherwise.
 workloads_replace_attempt: "{{ lookup('env', 'KARDAMOM_REPLACE_ATTEMPT') | default('0', true) | bool }}"
