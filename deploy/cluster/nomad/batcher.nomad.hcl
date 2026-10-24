@@ -165,6 +165,13 @@ variable "validator_query_port" {
 }
 
 job "batcher" {
+  # The batcher of this release reads a full reference that a sealer below
+  # decision version 5 relays as is (relayed_full_ref). The deploy reads
+  # this meta before it sets a sequencer version floor above 0.
+  meta {
+    relayed_full_ref = "true"
+  }
+
   datacenters = [var.datacenter]
   type        = "service"
 

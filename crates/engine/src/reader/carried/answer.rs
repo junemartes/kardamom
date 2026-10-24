@@ -263,7 +263,8 @@ impl Answer {
             | EgressItem::RemoteOriginReject { .. }
             | EgressItem::OriginGap { .. }
             | EgressItem::DaLagReject { .. }
-            | EgressItem::RecordLagReject { .. } => Step::Drop,
+            | EgressItem::RecordLagReject { .. }
+            | EgressItem::RefRefused(_) => Step::Drop,
         }
     }
 

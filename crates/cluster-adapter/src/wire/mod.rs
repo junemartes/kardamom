@@ -54,6 +54,8 @@ mod entry_tests;
 #[cfg(test)]
 mod format_tests;
 mod ingress;
+#[cfg(test)]
+mod ref_refused_tests;
 mod relay;
 #[cfg(test)]
 mod tests;
@@ -70,7 +72,9 @@ pub use egress_encode::{
     encode_egress_boundary, encode_egress_record, encode_replay_ahead, encode_replay_done,
     encode_replay_unavailable, encode_sealer_info, encode_session_start,
 };
-pub use entry::{CanonicalTx, RelayedRef, TxRefOffer, encode_feed_answer, encode_feed_request};
+pub use entry::{
+    CanonicalTx, RefRefused, RelayedRef, TxRefOffer, encode_feed_answer, encode_feed_request,
+};
 #[cfg(any(test, feature = "testing"))]
 pub use entry::{TxOffer, encode_feed_gap};
 #[cfg(any(test, feature = "testing"))]
@@ -391,6 +395,18 @@ pub const EGRESS_KIND_SEALER_INFO: u8 = 17;
 /// Length of an [`EGRESS_KIND_SEALER_INFO`] frame.
 pub const SEALER_INFO_LEN: usize = 1 + 1 + 8;
 
+/// Egress kind: the sealer refused a transaction reference of record type
+/// [`RT_TXREF`]:
+/// `[kind:u8 = 18][canonical_id:32][sender:20][nonce:u64][decision_version:u8]`
+/// ([`REF_REFUSED_LEN`] bytes). The sealer sends it only to the offering
+/// session. The reference is not ordered. The canonical id is the hash of
+/// the transaction, and the decision version is the version of the sealer.
+/// A reader that does not know the kind drops it. See [`RefRefused`].
+/// Matches Java `EGRESS_KIND_REF_REFUSED`.
+pub const EGRESS_KIND_REF_REFUSED: u8 = 18;
+/// Length of an [`EGRESS_KIND_REF_REFUSED`] frame.
+pub const REF_REFUSED_LEN: usize = 1 + CANONICAL_ID_LEN + SENDER_LEN + 8 + 1;
+
 /// Client-local kind: a new session starts:
 /// `[kind:u8 = 255][cluster_session_id:i64]`. The
 /// session thread puts this frame on the consumer channel when a session
@@ -508,8 +524,10 @@ pub const RT_TX: u8 = 6;
 /// The fields after the record type are
 /// `[lane:u8][term_id:i32][term_offset:i32][session_id:i32][envelope]`. A
 /// sealer on [`SEALER_V5_DECISION_VERSION`] orders it by the replay window
-/// of its image and relays it as [`RT_TX`]. No egress frame carries this
-/// type. See [`TxRefOffer`]. Matches Java `RT_TXREF_OFFER`.
+/// of its image and relays it as [`RT_TX`]. A sealer below that version
+/// relays it as is, from the canonical id on. The reader decodes such a
+/// frame as the canonical entry of its transaction. See [`TxRefOffer`].
+/// Matches Java `RT_TXREF_OFFER`.
 pub const RT_TXREF_OFFER: u8 = 7;
 
 /// The length of a kind-0 frame of a transaction reference: the guard

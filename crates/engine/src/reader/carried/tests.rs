@@ -129,7 +129,7 @@ pub(super) fn label((pos, item): (kardamom_types::BPosition, Ordered)) -> String
 }
 
 /// A signed transfer with nonce `nonce`, as a canonical entry.
-pub(super) fn entry(nonce: u64) -> CanonicalTx {
+pub(in crate::reader) fn entry(nonce: u64) -> CanonicalTx {
     let signer = PrivateKeySigner::from_bytes(&[0x11; 32].into()).expect("a test key");
     let envelope = crate::actor::test_support::legacy(&signer, Address::from([0x22; 20]), nonce, 1);
     CanonicalTx {
@@ -147,6 +147,12 @@ pub(super) fn tx_frame(index: u64, tx: &CanonicalTx) -> Vec<u8> {
 /// The relayed frame of a valid entry at `index`.
 pub(in crate::reader) fn tx_at(index: u64) -> Vec<u8> {
     tx_frame(index, &entry(index))
+}
+
+/// The relayed frame of a valid entry at `index` as a full reference, as a
+/// sealer below decision version 5 relays it.
+pub(in crate::reader) fn full_ref_at(index: u64) -> Vec<u8> {
+    encode_egress_record(index, &entry(index).full_ref_payload().unwrap()).unwrap()
 }
 
 /// An entry whose id is the hash in its envelope, but whose raw
@@ -226,6 +232,16 @@ fn no_frame_is_delivered_before_the_replay_done_of_the_newest_request() {
     assert_eq!(rig.deliver(5), ["t0", "t1"]);
     rig.feed.send(tx_at(2));
     assert_eq!(rig.deliver(5), ["t2"], "live after the replay done");
+}
+
+#[test]
+fn a_relayed_full_reference_is_delivered_as_its_entry() {
+    let mut rig = Rig::new(0, 1);
+    let id = rig.request(Source::Feed).request_id;
+    rig.feed.send(tx_at(0));
+    rig.feed.send(full_ref_at(1));
+    rig.feed.send(done(id, 2, 1));
+    assert_eq!(rig.deliver(5), ["t0", "t1"]);
 }
 
 #[test]

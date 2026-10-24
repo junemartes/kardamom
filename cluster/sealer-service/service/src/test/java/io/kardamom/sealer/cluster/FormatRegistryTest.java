@@ -94,9 +94,10 @@ final class FormatRegistryTest {
     void egressKindsMatchTheRegistry() {
         // The record-lag reject waits for recordLagBudget. The relayed
         // reference waits for carryBytes, and the feed gap for the member
-        // feed.
+        // feed. The service does not send the reference refusal yet.
         assertKinds("sealer-egress-kinds", "EGRESS_KIND_", Set.of(
-            "EGRESS_KIND_RECORD_LAG_REJECT", "EGRESS_KIND_RELAYED_REF", "EGRESS_KIND_FEED_GAP"));
+            "EGRESS_KIND_RECORD_LAG_REJECT", "EGRESS_KIND_RELAYED_REF", "EGRESS_KIND_FEED_GAP",
+            "EGRESS_KIND_REF_REFUSED"));
     }
 
     @Test

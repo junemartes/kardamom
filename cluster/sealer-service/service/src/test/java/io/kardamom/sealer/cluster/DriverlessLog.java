@@ -101,6 +101,13 @@ final class DriverlessLog {
             Optional.of(new RetainedFile.Config(dir, SEGMENT_BYTES)));
     }
 
+    /** End {@code member}, then start a carrying member in its file in {@code dir} from {@code snapshot}. */
+    Member restart(final Member member, final Path dir, final byte[] snapshot) {
+        started.remove(member);
+        member.svc().onTerminate(member.cluster());
+        return carrying(Optional.of(snapshot), dir, LagBudgets.DEFAULT);
+    }
+
     private Member member(
             final Optional<byte[]> snapshot,
             final int orderingWindow,

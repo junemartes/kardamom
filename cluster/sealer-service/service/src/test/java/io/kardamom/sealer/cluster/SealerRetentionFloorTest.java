@@ -307,8 +307,8 @@ class SealerRetentionFloorTest {
             "the switch never turns on with a heap section");
         assertThrows(AgentTerminationException.class, () -> startService(Store.HEAP, "f", Optional.of(fileSnapshot)),
             "a heap member cannot read a retained file");
-        assertEquals(CanonicalSealerState.RETAINED_FILE_SNAPSHOT_VERSION,
-            ByteBuffer.wrap(fileSnapshot).getInt(Integer.BYTES), "the file writes snapshot version 12");
+        assertEquals(CanonicalSealerState.FILE_SNAPSHOT_VERSION,
+            ByteBuffer.wrap(fileSnapshot).getInt(Integer.BYTES), "the file writes snapshot version 17");
         assertEquals(CanonicalSealerState.snapshotWriteVersion(), ByteBuffer.wrap(heapSnapshot).getInt(Integer.BYTES));
     }
 }

@@ -121,6 +121,17 @@ impl Fixture {
         }
     }
 
+    /// The refusal of a reference of the canonical entry [`Self::tx`] by a
+    /// sealer on decision version 5.
+    pub(super) fn ref_refused() -> RefRefused {
+        RefRefused {
+            canonical_id: B256::repeat_byte(0xAB),
+            sender: Address::repeat_byte(0x11),
+            nonce: 7,
+            decision_version: SEALER_V5_DECISION_VERSION,
+        }
+    }
+
     fn txref() -> TxRef {
         TxRef::new(
             B256::repeat_byte(0xCD),
@@ -184,6 +195,16 @@ impl Fixture {
                 .encode(),
             ),
             ("txref_offer_ingress", Self::txref_offer(&envelope).encode()),
+            (
+                "txref_offer_egress",
+                encode_egress_record(
+                    Self::INDEX,
+                    &RelayShape::of(KIND_INGRESS_RECORD)
+                        .relay(&Self::txref_offer(&envelope).encode()),
+                )
+                .unwrap(),
+            ),
+            ("ref_refused", Self::ref_refused().encode()),
         ]
     }
 }
