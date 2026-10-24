@@ -12,11 +12,12 @@
 //!    transaction. Every member runs decision version 5, and every
 //!    sequencer keeps it.
 //! 2. `carry-full-ref-below-v5`: a full reference that the sealer orders
-//!    below version 5, on purpose. The v2 loop takes nonce `n + 1` with
-//!    its bytes under version 5 and holds it for nonce `n`. Feature 4 turns
-//!    off. Then nonce `n` releases the held nonce, which goes out with its
-//!    bytes under version 4. Every member counts it. Feature 4 turns on
-//!    again.
+//!    below version 5, on purpose. The upgrade transaction that turns
+//!    feature 4 off is final on L1. Then the v2 loop takes nonce `n + 1`
+//!    with its bytes, while its lane still keeps version 5, and holds it
+//!    for nonce `n`. When every member runs version 4, nonce `n` releases
+//!    the held nonce, which goes out with its bytes under version 4. Every
+//!    member counts it. Feature 4 turns on again.
 //! 3. `carry-readers-on-egress`: the batcher and the validator move to
 //!    the egress once they are past R, the highest stored reference, and
 //!    the sequencers get the version floor 5. R does not move.

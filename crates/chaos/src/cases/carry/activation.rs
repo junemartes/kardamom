@@ -27,6 +27,9 @@ use crate::rpc::Rpc;
 /// chaos shard runs no load stage, so no other sender spends it.
 const PROBE_ACCOUNT: u32 = 1;
 
+/// The lane of [`PROBE_ACCOUNT`] at shard map version 0.
+const PROBE_LANE: u8 = ACCT_SHARD[PROBE_ACCOUNT as usize];
+
 /// How long the probe transfers may take to get their receipts.
 const RECEIPT_WAIT: Duration = Duration::from_mins(1);
 
@@ -50,6 +53,12 @@ impl Run<'_> {
     }
 
     /// Step 2: a full reference that the sealer orders below version 5.
+    /// The v2 loop holds the transfer for its nonce gap for at most the
+    /// transaction lifetime (30 s), and less under load: the hold expires
+    /// when the image of the lane moves past its width. So the upgrade
+    /// transaction that turns feature 4 off is final on L1 first. The
+    /// hold starts after it, while the lane still keeps version 5, and
+    /// lasts only until every member runs version 4.
     pub(super) async fn full_ref_below_v5(&mut self) -> anyhow::Result<()> {
         let rpc = Rpc::new(&self.h.rpc_url, self.h.knobs.chain_id)?;
         let nonce = rpc.nonce_of(PROBE_ACCOUNT).await?;
@@ -60,16 +69,21 @@ impl Run<'_> {
         let before = Members::new(self.h)?.counts(FULL_REF_BELOW_V5).await?;
         let off = Upgrade::off(FEATURE_SEALER_V5);
         off.check(self.h, self.ctx).await?;
+        off.send(self.h, self.ctx).await?;
         let parked = {
             let (rpc, raw) = (rpc.clone(), held.raw.clone());
             tokio::spawn(async move { rpc.send_raw(&raw).await })
         };
-        let lane = ACCT_SHARD[PROBE_ACCOUNT as usize];
-        Lanes::new(self.h).await_held(lane).await?;
-        off.send(self.h, self.ctx).await?;
+        self.hold_under_version_five().await?;
         Members::new(self.h)?
             .await_all(&ALL, DECISION_VERSION, |v| v == 4)
             .await?;
+        anyhow::ensure!(
+            Lanes::new(self.h).holds(PROBE_LANE).await,
+            "{}: {}: the park expired: lane {PROBE_LANE} holds no transfer when every member runs version 4",
+            crate::FAIL_PREFIX,
+            self.ctx
+        );
         rpc.transfer_hash(PROBE_ACCOUNT, nonce, RECEIPT_WAIT)
             .await?;
         rpc.await_receipt(&held.hash, RECEIPT_WAIT).await?;
@@ -87,6 +101,21 @@ impl Run<'_> {
         ));
         self.version(Upgrade::on(FEATURE_SEALER_V5), 5).await?;
         Lanes::new(self.h).await_version(5).await
+    }
+
+    /// Wait until the lane of the probe holds its transfer, and require
+    /// that the lane still keeps version 5: the v2 loop then took the
+    /// bytes of the transfer.
+    async fn hold_under_version_five(&self) -> anyhow::Result<()> {
+        let lanes = Lanes::new(self.h);
+        lanes.await_held(PROBE_LANE).await?;
+        anyhow::ensure!(
+            lanes.keeps(PROBE_LANE, 5).await,
+            "{}: {}: lane {PROBE_LANE} left version 5 before it held the transfer, so the transfer carries no bytes",
+            crate::FAIL_PREFIX,
+            self.ctx
+        );
+        Ok(())
     }
 
     /// Step 3: the batcher and the validator move to the egress past R,

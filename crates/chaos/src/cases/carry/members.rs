@@ -3,7 +3,7 @@
 //! admin port. A read that fails is `None`, never a value: the member may
 //! start again.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -32,6 +32,14 @@ const WAIT: Budget = Budget {
 /// 2 s after it switches, so the read must come well inside that.
 const SWITCH_POLL: Budget = Budget {
     timeout: Duration::from_mins(3),
+    interval: Duration::from_millis(100),
+};
+
+/// How often the hold of the probe transfer is read. The hold must come
+/// before the lane leaves version 5, about one second after the upgrade
+/// transaction is final.
+const HOLD_POLL: Budget = Budget {
+    timeout: Duration::from_secs(30),
     interval: Duration::from_millis(100),
 };
 
@@ -262,24 +270,35 @@ impl<'a> Members<'a> {
     }
 
     /// Wait until member `id` reports `carryWindow` true, and return the
-    /// moment of that read.
+    /// moment of that read. The first read must report false: then the
+    /// switch came less than one poll interval before the returned moment.
     ///
     /// # Errors
     ///
-    /// Returns an error when the wait ends first.
+    /// Returns an error when the first read does not report false, or
+    /// when the wait ends first.
     pub(super) async fn await_switch(&self, id: u32) -> anyhow::Result<Instant> {
+        let first = Cell::new(None);
+        let first_ref = &first;
         let outcome = poll::until(SWITCH_POLL, |_| async move {
-            Ok((self.carry_window(id).await == Some(true)).then(Instant::now))
+            let on = self.carry_window(id).await;
+            first_ref.set(first_ref.get().or(Some(on)));
+            Ok((on == Some(true)).then(Instant::now))
         })
         .await?;
-        outcome
-            .or_fail(|t| {
-                crate::chaos_fail!(
-                    "member {id} did not switch the carry window on within {}s",
-                    t.as_secs()
-                )
-            })
-            .map(|(at, _)| at)
+        let (at, _) = outcome.or_fail(|t| {
+            crate::chaos_fail!(
+                "member {id} did not switch the carry window on within {}s",
+                t.as_secs()
+            )
+        })?;
+        anyhow::ensure!(
+            first.get() == Some(Some(false)),
+            "{}: the first read of member {id} reported carryWindow {:?}, not false, so the time of its switch is unknown",
+            crate::FAIL_PREFIX,
+            first.get().flatten()
+        );
+        Ok(at)
     }
 }
 
@@ -343,18 +362,26 @@ impl<'a> Lanes<'a> {
             .map(|_| ())
     }
 
+    /// Whether a replica of `lane` holds a transaction for a nonce gap.
+    pub(super) async fn holds(&self, lane: u8) -> bool {
+        let values = self.lane(lane, SEQ_PENDING_DEPTH).await;
+        values.iter().any(|v| v.is_some_and(|d| d > 0))
+    }
+
+    /// Whether every replica of `lane` keeps `version`.
+    pub(super) async fn keeps(&self, lane: u8, version: i64) -> bool {
+        let values = self.lane(lane, SEQ_SEALER_VERSION).await;
+        values.iter().all(|v| *v == Some(version))
+    }
+
     /// Wait until a replica of `lane` holds a transaction for a nonce gap.
     ///
     /// # Errors
     ///
     /// Returns an error when the wait ends first.
     pub(super) async fn await_held(&self, lane: u8) -> anyhow::Result<()> {
-        let outcome = poll::until(WAIT, |_| async move {
-            let values = self.lane(lane, SEQ_PENDING_DEPTH).await;
-            Ok(values
-                .iter()
-                .any(|v| v.is_some_and(|d| d > 0))
-                .then_some(()))
+        let outcome = poll::until(HOLD_POLL, |_| async move {
+            Ok(self.holds(lane).await.then_some(()))
         })
         .await?;
         outcome
