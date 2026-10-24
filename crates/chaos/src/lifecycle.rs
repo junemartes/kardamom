@@ -142,6 +142,14 @@ impl DeployVars {
         on.then(|| (name, value.to_string()))
     }
 
+    /// The carry from genesis, always set: `on`, or empty for the
+    /// reference path. A value in the caller's environment then cannot
+    /// make a reference-born shard carry-born.
+    fn genesis_carry_env(&self) -> (&'static str, String) {
+        let value = if self.genesis_carry { "on" } else { "" };
+        ("KARDAMOM_GENESIS_CARRY", value.to_string())
+    }
+
     /// The deploy variables, as Ansible reads them. The knobs of a shard
     /// read the same pairs (see [`crate::Knobs::deployed`]).
     pub(crate) fn env(&self) -> Vec<(&'static str, String)> {
@@ -159,7 +167,7 @@ impl DeployVars {
                 .map(|v| ("L1_SILENCE_S", v.to_string())),
             Self::switch(self.exec_cursor, "KARDAMOM_EXEC_CURSOR", "on"),
             Self::switch(self.checkpoint_log, "KARDAMOM_CHECKPOINT_LOG", "on"),
-            Self::switch(self.genesis_carry, "KARDAMOM_GENESIS_CARRY", "on"),
+            Some(self.genesis_carry_env()),
         ]
         .into_iter()
         .chain(self.carry.env())
@@ -493,8 +501,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_default_vars_set_no_variable() {
-        assert_eq!(DeployVars::default().env(), Vec::new());
+    fn the_default_vars_set_only_an_empty_genesis_carry() {
+        assert_eq!(
+            DeployVars::default().env(),
+            vec![("KARDAMOM_GENESIS_CARRY", String::new())]
+        );
     }
 
     #[test]

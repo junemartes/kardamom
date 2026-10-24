@@ -334,6 +334,37 @@ pub(crate) fn without_ansi(line: &str) -> String {
         .collect()
 }
 
+/// A log read by the time stamp of each line. A Nomad log read returns
+/// the stdout of each task and then its stderr, so the text order is
+/// not the time order. The services stamp each line with an RFC 3339
+/// time of fixed width, so the stamps compare as strings.
+pub(crate) struct StampedLog<'a>(pub(crate) &'a str);
+
+impl StampedLog<'_> {
+    /// Each line that starts with a time stamp, without its ANSI escape
+    /// sequences, as the stamp and the line.
+    pub(crate) fn lines(&self) -> impl Iterator<Item = (String, String)> + '_ {
+        self.0.lines().map(without_ansi).filter_map(|line| {
+            let stamp = line.split_whitespace().next()?;
+            humantime::parse_rfc3339(stamp).ok()?;
+            Some((stamp.to_owned(), line))
+        })
+    }
+
+    /// The time stamps of the lines that hold `needle` and the word
+    /// `word`. An empty `word` matches every line.
+    pub(crate) fn stamps<'s>(
+        &'s self,
+        needle: &'s str,
+        word: &'s str,
+    ) -> impl Iterator<Item = String> + 's {
+        self.lines()
+            .filter(move |(_, l)| l.contains(needle))
+            .filter(move |(_, l)| word.is_empty() || l.split_whitespace().any(|w| w == word))
+            .map(|(stamp, _)| stamp)
+    }
+}
+
 /// Print the divergence context to stderr: the lines around the hit.
 pub fn dump_divergence(hit: &Divergence) {
     eprintln!("----- divergence context (alloc {}) -----", hit.alloc);

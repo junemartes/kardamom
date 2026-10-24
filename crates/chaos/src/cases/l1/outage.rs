@@ -17,7 +17,7 @@ use super::batcher::{
     AERON_EXIT_LINE, REBUILDING_LINE, REBUILT_LINE, SPOOL_RESTORED_LINE, START_LINE, count,
     field_in_last, require_posting,
 };
-use crate::evidence::without_ansi;
+use crate::evidence::StampedLog;
 use crate::harness::Harness;
 use crate::l1::{L1, Posted};
 use crate::nomad::Streams;
@@ -404,13 +404,11 @@ impl AtFreeze {
     /// True when `logs` hold a confirmed post of the block after the
     /// covered block, stamped before the last start line: the old
     /// process posted the frozen group between the thaw and its exit.
-    /// The services stamp each line with an RFC 3339 time of fixed
-    /// width, so the stamps compare as strings.
     fn old_process_posted(&self, logs: &str) -> bool {
         let Some(next) = self.covered.checked_add(1) else {
             return false;
         };
-        let log = BatcherLog(logs);
+        let log = StampedLog(logs);
         let start_word = format!("l2_block_start={next}");
         let last_start = log.stamps(START_LINE, "").max();
         let confirmed = log.stamps(CONFIRMED_LINE, &start_word).min();
@@ -476,22 +474,6 @@ impl AtFreeze {
 struct AfterThaw {
     lines: Lines,
     old_posted: bool,
-}
-
-/// The concatenated log of every batcher allocation.
-struct BatcherLog<'a>(&'a str);
-
-impl BatcherLog<'_> {
-    /// The time stamps of the lines that hold `needle` and the word
-    /// `word`. An empty `word` matches every line.
-    fn stamps<'s>(&'s self, needle: &'s str, word: &'s str) -> impl Iterator<Item = String> + 's {
-        self.0
-            .lines()
-            .map(without_ansi)
-            .filter(move |l| l.contains(needle))
-            .filter(move |l| word.is_empty() || l.split_whitespace().any(|w| w == word))
-            .filter_map(|l| l.split_whitespace().next().map(str::to_owned))
-    }
 }
 
 /// The frozen group lands on L1 right after the covered block: from the

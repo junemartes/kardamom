@@ -100,3 +100,24 @@ fn a_refusal_ends_the_wait_and_a_short_record_waits() {
         Some("reconstructed head=7")
     );
 }
+
+/// The rebuild renders the genesis as the executor and validator jobs
+/// do: a carry-born cluster's genesis starts with the carry fragment and
+/// holds features 3, 4 and 5, and a reference-born one holds none.
+#[test]
+fn the_rebuild_genesis_matches_the_jobs() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let carry = Genesis { carry: true }.render(&repo).unwrap();
+    let dev = Genesis { carry: false }.render(&repo).unwrap();
+    let fragment = std::fs::read_to_string(repo.join(CARRY_GENESIS)).unwrap();
+    assert_eq!(carry, format!("{fragment}\n{dev}"));
+    let parse = |text: &str| toml::from_str::<kardamom_types::Genesis>(text).unwrap();
+    assert_eq!(
+        parse(&carry).genesis_features,
+        kardamom_types::upgrades::GenesisFeatures::CarryWindow
+    );
+    assert_eq!(
+        parse(&dev).genesis_features,
+        kardamom_types::upgrades::GenesisFeatures::None
+    );
+}

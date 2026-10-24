@@ -32,6 +32,11 @@ const BATCHER_FAILURE_MARKERS: &[&str] = &["WARN", "ERROR", "Error:", "panicked"
 /// The genesis the cluster's services start from, in the checkout.
 const GENESIS: &str = "deploy/cluster/config/genesis/dev.toml";
 
+/// The genesis fragment of a carry-born cluster, in the checkout. It
+/// holds a top-level key, so it comes before the first table of
+/// [`GENESIS`].
+const CARRY_GENESIS: &str = "deploy/cluster/config/genesis/carry.toml";
+
 /// What the tool prints when L1 does not cover the target block yet: the
 /// posted batches end before it, or no batch is posted. Every other
 /// failure is final for the L1 record it read.
@@ -114,6 +119,40 @@ impl Attempt {
     }
 }
 
+/// The genesis of the cluster's chain, as the executor and validator
+/// jobs render it (nomad/executor.nomad.hcl): the carry fragment first on
+/// a carry-born cluster, then the dev genesis, joined by a newline. The
+/// rebuild must start from the same genesis, or its root differs from
+/// the live root at every block.
+#[derive(Debug, Clone, Copy)]
+struct Genesis {
+    carry: bool,
+}
+
+impl Genesis {
+    /// The fragments, in the order the jobs join them.
+    fn fragments(self) -> &'static [&'static str] {
+        if self.carry {
+            &[CARRY_GENESIS, GENESIS]
+        } else {
+            &[GENESIS]
+        }
+    }
+
+    /// The joined genesis text, from the checkout at `repo`.
+    fn render(self, repo: &Path) -> anyhow::Result<String> {
+        let fragments = self
+            .fragments()
+            .iter()
+            .map(|fragment| {
+                let path = repo.join(fragment);
+                std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(fragments.join("\n"))
+    }
+}
+
 /// What a rebuild must reach: the block, and what the state there must
 /// carry when the caller knows it.
 #[derive(Debug, Clone, Copy)]
@@ -180,6 +219,14 @@ impl Output {
             Self::ValidatorState => None,
         }
     }
+}
+
+/// What each attempt of a rebuild runs with: the tool, the settlement
+/// contract it reads, and the genesis file it starts from.
+struct Tool {
+    bin: PathBuf,
+    settlement: String,
+    genesis: PathBuf,
 }
 
 /// One rebuild-from-L1 run against `target`: read the payloads from the
@@ -252,13 +299,16 @@ impl Rebuild<'_> {
                 .root
                 .map_or("unknown".to_string(), |root| format!("{root:#x}"))
         ));
-        let bin = self.harness.release_binary("kardamom-reconstruct")?;
-        let settlement = self.harness.settlement_address().await?;
+        let tool = Tool {
+            bin: self.harness.release_binary("kardamom-reconstruct")?,
+            settlement: self.harness.settlement_address().await?,
+            genesis: self.write_genesis()?,
+        };
         let last = RefCell::new(String::new());
-        let (bin, settlement, last_ref) = (&bin, &settlement, &last);
+        let (tool, last_ref) = (&tool, &last);
         let block = self.target.block;
         let outcome = poll::until(Budget::secs(180, 5), |_| async move {
-            self.attempt(bin, settlement).await?.settle(last_ref, block)
+            self.attempt(tool).await?.settle(last_ref, block)
         })
         .await?;
         if matches!(outcome, Outcome::TimedOut { .. }) {
@@ -296,19 +346,36 @@ impl Rebuild<'_> {
         ));
     }
 
+    /// Write the cluster's genesis into the evidence directory, and
+    /// return its path.
+    fn write_genesis(&self) -> anyhow::Result<PathBuf> {
+        let genesis = Genesis {
+            carry: self.harness.knobs.genesis_carry,
+        }
+        .render(&self.harness.lifecycle.repo_root())?;
+        let path = self.evidence.join("genesis.toml");
+        std::fs::write(&path, genesis).with_context(|| format!("write {}", path.display()))?;
+        Ok(path)
+    }
+
     /// One attempt: a fresh state directory, the payloads read from the
     /// DA proxy. The `Err` is a harness failure.
-    async fn attempt(&self, bin: &Path, settlement: &str) -> anyhow::Result<Attempt> {
+    async fn attempt(&self, tool: &Tool) -> anyhow::Result<Attempt> {
+        let Tool {
+            bin,
+            settlement,
+            genesis,
+        } = tool;
         let state = tempfile::Builder::new()
             .prefix("rebuild-")
             .tempdir_in(&self.evidence)?
             .keep();
         let out = Command::new(bin)
             .args(["--l1-rpc", &self.harness.l1_rpc()?])
-            .args(["--settlement", settlement])
+            .args(["--settlement", settlement.as_str()])
             .args(["--da-proxy", &self.da_proxy()])
             .arg("--chain")
-            .arg(self.harness.lifecycle.repo_root().join(GENESIS))
+            .arg(genesis)
             .arg("--state-dir")
             .arg(&state)
             .args(["--through-block", &self.target.block.to_string()])

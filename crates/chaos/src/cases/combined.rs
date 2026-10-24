@@ -18,8 +18,8 @@ use crate::nomad::{Alloc, Job, SavedJob};
 use crate::probes::CLUSTER_TASK;
 
 mod checks;
-mod refill;
 mod expect;
+mod refill;
 #[cfg(test)]
 mod tests;
 

@@ -12,10 +12,24 @@ use serde::Deserialize;
 use super::{Alloc, Nomad, Streams};
 
 /// The log lines of a designed recovery exit: the process fails, and
-/// its restart is the recovery. An executor or a validator stops on a
-/// join timeout: no archive serves the envelope of a `TxRef`. The
-/// restart resumes from the persisted cursor and replays the gap.
-const RECOVERY_EXIT_LINES: [&str; 1] = ["join timeout: TxRef has no envelope on tx_data"];
+/// its restart is the recovery.
+/// - An executor or a validator stops on a join timeout: no archive
+///   serves the envelope of a `TxRef`. The restart resumes from the
+///   persisted cursor and replays the gap.
+/// - A sealer member ends a wedged or stalled election, or a log that a
+///   new leader truncated, with an exit of its join watchdog. The
+///   relaunch elects again or joins the leader. Members that return
+///   together after a stop of their job can take this path. The deferred
+///   follower stall line ends no process, so the follower stall counts
+///   by the text of its exit.
+const RECOVERY_EXIT_LINES: [&str; 6] = [
+    "join timeout: TxRef has no envelope on tx_data",
+    "cluster JOIN WEDGE",
+    "cluster LEADER WEDGE",
+    "cluster LEADER STALL",
+    "cluster CATCHUP STALL",
+    "exiting for a relaunch that keeps the recording log",
+];
 
 /// One event of a Nomad task.
 #[derive(Debug, Clone, Deserialize)]

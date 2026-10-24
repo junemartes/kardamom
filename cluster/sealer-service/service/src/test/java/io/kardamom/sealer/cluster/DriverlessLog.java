@@ -27,8 +27,15 @@ final class DriverlessLog {
     static final int CAPACITY = 16;
     /** The dedup window of a member with a feed: its tests fill the replay window with records. */
     private static final int FEED_CAPACITY = 1 << 14;
-    /** The peer chain that every member takes remote-origin records from. */
+    /** The peer chain that every member but a seeded one takes remote-origin records from. */
     static final long REMOTE_CHAIN = 10L;
+    /** The remote-origin allowlist of every member but a seeded one. */
+    private static final Set<Long> INTEROP = Set.of(REMOTE_CHAIN);
+    /**
+     * The remote-origin allowlist of a seeded member. A seed carries no
+     * remote-origin anchor, so a member with interop on refuses it.
+     */
+    private static final Set<Long> NO_INTEROP = Set.of();
     /** The segment size of the retained file of a member that carries the bytes. */
     private static final int SEGMENT_BYTES = 64 * 1024;
 
@@ -102,13 +109,13 @@ final class DriverlessLog {
     }
 
     private Member member(final Optional<byte[]> snapshot, final int orderingWindow, final LagBudgets budgets) {
-        return member(CAPACITY, snapshot, orderingWindow, budgets, svc -> { });
+        return member(CAPACITY, snapshot, orderingWindow, budgets, INTEROP, svc -> { });
     }
 
     /** A heap member with no ordering window and the member feed of {@code feed}, from {@code snapshot} or at genesis. */
     Member feeding(final Optional<byte[]> snapshot, final FeedConfig feed) {
         return member(FEED_CAPACITY, snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW, LagBudgets.DEFAULT,
-            svc -> svc.feeding(feed));
+            INTEROP, svc -> svc.feeding(feed));
     }
 
     /**
@@ -117,39 +124,44 @@ final class DriverlessLog {
      * {@code snapshot} or at genesis.
      */
     Member carrying(final Optional<byte[]> snapshot, final Path dir, final LagBudgets budgets) {
-        return carrying(snapshot, dir, budgets, svc -> { });
+        return carrying(snapshot, dir, budgets, INTEROP, svc -> { });
     }
 
     /** A heap member from {@code snapshot}, or at genesis with the rules of {@code features}. */
     Member genesis(final Optional<byte[]> snapshot, final GenesisFeatures features) {
-        return heap(snapshot, svc -> svc.genesisFeatures(features));
+        return heap(snapshot, INTEROP, svc -> svc.genesisFeatures(features));
     }
 
     /** A member with the retained file under {@code dir}, from {@code snapshot}, or at genesis with {@code features}. */
     Member carryingGenesis(final Optional<byte[]> snapshot, final Path dir, final GenesisFeatures features) {
-        return carrying(snapshot, dir, LagBudgets.DEFAULT, svc -> svc.genesisFeatures(features));
+        return carrying(snapshot, dir, LagBudgets.DEFAULT, INTEROP, svc -> svc.genesisFeatures(features));
     }
 
     /** A heap member from {@code snapshot}, or from {@code seed}. */
     Member seeded(final Optional<byte[]> snapshot, final SealerSeed seed) {
-        return heap(snapshot, svc -> svc.seededFrom(seed));
+        return heap(snapshot, NO_INTEROP, svc -> svc.seededFrom(seed));
     }
 
     /** A member with the retained file under {@code dir}, from {@code snapshot}, or from {@code seed}. */
     Member carryingSeeded(final Optional<byte[]> snapshot, final Path dir, final SealerSeed seed) {
-        return carrying(snapshot, dir, LagBudgets.DEFAULT, svc -> svc.seededFrom(seed));
+        return carrying(snapshot, dir, LagBudgets.DEFAULT, NO_INTEROP, svc -> svc.seededFrom(seed));
     }
 
-    private Member heap(final Optional<byte[]> snapshot, final Consumer<SealerClusteredService> setup) {
-        return member(CAPACITY, snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW, LagBudgets.DEFAULT, setup);
+    private Member heap(
+            final Optional<byte[]> snapshot,
+            final Set<Long> remoteOrigins,
+            final Consumer<SealerClusteredService> setup) {
+        return member(CAPACITY, snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW, LagBudgets.DEFAULT,
+            remoteOrigins, setup);
     }
 
     private Member carrying(
             final Optional<byte[]> snapshot,
             final Path dir,
             final LagBudgets budgets,
+            final Set<Long> remoteOrigins,
             final Consumer<SealerClusteredService> setup) {
-        return member(CAPACITY, snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW, budgets,
+        return member(CAPACITY, snapshot, CanonicalSealerState.DEFAULT_ORDERING_WINDOW, budgets, remoteOrigins,
             setup.andThen(svc -> svc.carryingBytes(new RetainedFile.Config(dir, SEGMENT_BYTES))));
     }
 
@@ -170,12 +182,13 @@ final class DriverlessLog {
             final Optional<byte[]> snapshot,
             final int orderingWindow,
             final LagBudgets budgets,
+            final Set<Long> remoteOrigins,
             final Consumer<SealerClusteredService> setup) {
         final StubCluster cluster = new StubCluster();
         cluster.role = io.aeron.cluster.service.Cluster.Role.FOLLOWER;
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService svc = new SealerClusteredService(
-            capacity, 250, 0, Set.of(REMOTE_CHAIN), VoidLedger.Config.DISABLED,
+            capacity, 250, 0, remoteOrigins, VoidLedger.Config.DISABLED,
             CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS, orderingWindow, budgets);
         setup.accept(svc);
         svc.start(cluster, snapshot);
