@@ -1027,6 +1027,73 @@ class DeployTest(Deploys):
             with self.subTest(value=value):
                 self.run_deploy(check=True, success=False, environ={'KARDAMOM_IDLE_CAP_US': value})
 
+    # The plan of the notifier and of the media drivers for each value of
+    # the notifier switch: the job constraint, the count, the peers, the
+    # memory, and each driver group with its node class constraint and its
+    # idle cap.
+    NOTIFIER_PLACEMENTS = (
+        ({}, {
+            'constraint': ('${meta.role}', '=', 'ingress'), 'count': 2, 'memory': 1024,
+            'peers': [f'http://ingress-{i}.node.dc1.consul:8547' for i in range(2)],
+            'drivers': {'aeron': (None, '50')}}),
+        ({'KARDAMOM_NOTIFIER_NODES': 'off'}, {
+            'constraint': ('${meta.role}', '=', 'ingress'), 'count': 2, 'memory': 1024,
+            'peers': [f'http://ingress-{i}.node.dc1.consul:8547' for i in range(2)],
+            'drivers': {'aeron': (None, '50')}}),
+        ({'KARDAMOM_NOTIFIER_NODES': 'on', 'KARDAMOM_NOTIFIER_COUNT': '1'}, {
+            'constraint': ('${meta.roles}', 'set_contains', 'notifier'), 'count': 1, 'memory': 512,
+            'peers': ['http://notifier-0.node.dc1.consul:8547'],
+            'drivers': {'aeron': ('!=', '50'), 'aeron-notifier': ('=', '1000')}}),
+        ({'KARDAMOM_NOTIFIER_NODES': 'on'}, {
+            'constraint': ('${meta.roles}', 'set_contains', 'notifier'), 'count': 2, 'memory': 512,
+            'peers': [f'http://notifier-{i}.node.dc1.consul:8547' for i in range(2)],
+            'drivers': {'aeron': ('!=', '50'), 'aeron-notifier': ('=', '1000')}}),
+    )
+
+    def test_the_notifier_nodes_switch_defaults_off_and_moves_the_notifier(self):
+        """Off, every plan is the default plan. On, only the notifier and
+        the media drivers change: the monitoring and the canary find the
+        notifier through its Consul service records. The local canary
+        runs, so its plan is in the comparison."""
+        plans = {}
+        for environ, expected in self.NOTIFIER_PLACEMENTS:
+            with self.subTest(environ=environ):
+                self.run_deploy(check=True, environ=environ | {'CANARY_LOCAL': '1'})
+                plans[json.dumps(environ)] = self.api.state['plans']
+                self.assert_notifier_placement(self.api.state['plans'], expected)
+        default = plans['{}']
+        for environ, current in plans.items():
+            moved = {'notifier', 'aeron'} if '"on"' in environ else set()
+            self.assertEqual({n: j for n, j in current.items() if n not in moved},
+                             {n: j for n, j in default.items() if n not in moved}, environ)
+        self.assertIn('service "kardamom-notifier-metrics|any"', self.job_templates(default['monitoring']))
+        self.assertIn('ws://kardamom-notifier.service.consul:8547', self.job_args(default['canary']))
+
+    def test_a_bad_notifier_switch_fails_the_deploy(self):
+        for environ in ({'KARDAMOM_NOTIFIER_NODES': 'yes'}, {'KARDAMOM_NOTIFIER_COUNT': '0'}):
+            with self.subTest(environ=environ):
+                self.run_deploy(check=True, success=False, environ=environ)
+
+    def assert_notifier_placement(self, plans, expected):
+        notifier = plans['notifier']
+        group = notifier['TaskGroups'][0]
+        task = group['Tasks'][0]
+        args = task['Config']['args']
+        [constraint] = notifier['Constraints']
+        self.assertEqual((constraint['LTarget'], constraint['Operand'], constraint['RTarget']),
+                         expected['constraint'])
+        self.assertEqual(group['Count'], expected['count'])
+        self.assertEqual(args[args.index('--instance-count') + 1], str(expected['count']))
+        self.assertIn({'LTarget': '', 'RTarget': 'true', 'Operand': 'distinct_hosts'}, group['Constraints'])
+        self.assertEqual(args[args.index('--peers') + 1].split(','), expected['peers'])
+        self.assertEqual(task['Resources']['MemoryMB'], expected['memory'])
+        drivers = {g['Name']: (g['Constraints'], g['Tasks'][0]['Env']['KARDAMOM_IDLE_CAP_US'])
+                   for g in plans['aeron']['TaskGroups']}
+        self.assertEqual(drivers, {
+            name: (None if operator is None else [{'LTarget': '${meta.role}', 'RTarget': 'notifier',
+                                                    'Operand': operator}], cap)
+            for name, (operator, cap) in expected['drivers'].items()})
+
     @staticmethod
     def aeron_tasks(plans):
         """Every task that maps the Aeron directory, by job name."""
