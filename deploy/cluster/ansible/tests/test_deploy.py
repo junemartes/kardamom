@@ -1038,6 +1038,29 @@ class DeployTest(Deploys):
         self.assertIn('receipts_from_egress = true', self.job_templates(plans['sequencer']))
         self.assertIn('service "kardamom-egress-metrics|any"', self.job_templates(plans['monitoring']))
 
+    def test_the_egress_reads_the_output_oracle_only_when_one_is_given(self):
+        self.manifest.write_text(self.manifest.read_text()
+                                 + f'egress registry.example:5000/kardamom-egress:test@sha256:{"a" * 64}\n')
+        self.run_deploy(self.EGRESS_ON, check=True)
+        args = self.job_args(self.api.state['plans']['egress'])
+        self.assertEqual({'--l1-rpc-url', '--withdrawal-oracle'} & set(args), set())
+        oracle = '0x' + '3' * 40
+        cases = (
+            ('the in-cluster anvil', {}, 'http://anvil.service.consul:8546'),
+            ('the light client', {'workloads_light_execution_rpc': 'https://execution.example',
+                                  'workloads_light_consensus_rpc': 'https://consensus.example',
+                                  'workloads_light_checkpoint': '0x' + 'a' * 64,
+                                  'workloads_lockbox_address': '0x' + '2' * 40},
+             'http://kardamom-l1-light-client.service.dc1.consul:8548'),
+        )
+        for name, extra, l1 in cases:
+            with self.subTest(name):
+                self.run_deploy({**self.EGRESS_ON, **extra, 'workloads_withdrawal_oracle_address': oracle},
+                                check=True)
+                args = self.job_args(self.api.state['plans']['egress'])
+                self.assertEqual(args[args.index('--withdrawal-oracle') + 1], oracle)
+                self.assertEqual(args[args.index('--l1-rpc-url') + 1], l1)
+
     def test_the_egress_switches_refuse_a_reader_before_its_source(self):
         cases = (
             ('a reader without the egress', {'workloads_validator_egress': 'on'}),

@@ -8,10 +8,12 @@
 //! it after its last input.
 //!
 //! The thread appends each delivered frame to the store, then publishes it
-//! live. It forces the store to disk on a fixed period, and deletes the
-//! segments below the retention after each sync. After each sync it also
-//! sets the distance of the stored head from the newest record that any
-//! executor copy sent. The sealer keeps only its replay window, so a
+//! live. It forces the store to disk on a fixed period. After each sync it
+//! deletes the segments below the floor of the store: it keeps every block
+//! above the heads that L1 holds for good (see [`crate::l1_heads`]), and
+//! the window of `keep_blocks` blocks below its head. It also sets the
+//! distance of the stored head from the newest record that any executor
+//! copy sent. The sealer keeps only its replay window, so a
 //! reader below the window recovers from this store, and the distance
 //! must stay well inside the window.
 //!
@@ -38,6 +40,7 @@ use kardamom_log::aeron_live::ReceiptFrame;
 use kardamom_types::{Receipt, TxDrop};
 
 use crate::drops::{Drops, Status};
+use crate::l1_heads::L1Heads;
 use crate::merge::{Head, Merge};
 use crate::metrics;
 use crate::receipts::Receipts;
@@ -97,6 +100,10 @@ pub enum Input {
     GiveUp,
     /// Where the stream stands, for the task that reads a peer.
     State(oneshot::Sender<JoinState>),
+    /// A finalized post on L1 covers the blocks through this block.
+    Posted(u64),
+    /// An output on L1 that covers the blocks through this block is final.
+    Final(u64),
 }
 
 /// A range read: the frames after the cursor, up to about `limit` bytes.
@@ -112,7 +119,8 @@ pub struct ReadRequest {
 pub struct OwnerConfig {
     /// The period of the sync of the store.
     pub sync_every: Duration,
-    /// The blocks the store keeps below its head.
+    /// The blocks the store keeps below its head, whatever the L1 heads
+    /// say: the window of the readers that resume.
     pub keep_blocks: NonZeroU64,
     /// How the owner joins the copies at the start: [`Join::FromPeer`]
     /// with peers, [`Join::AtBoundary`] with none.
@@ -138,6 +146,7 @@ pub struct Owner<P: FramePublisher> {
     delivered: Vec<Vec<u8>>,
     synced_at: Instant,
     join: Join,
+    heads: L1Heads,
 }
 
 impl<P: FramePublisher> Owner<P> {
@@ -145,11 +154,21 @@ impl<P: FramePublisher> Owner<P> {
     pub fn new(cfg: OwnerConfig, parts: Parts<P>) -> Self {
         Self {
             join: cfg.join,
+            heads: L1Heads::posted_only(),
             cfg,
             parts,
             delivered: Vec::new(),
             synced_at: Instant::now(),
         }
+    }
+
+    /// The L1 heads at the start: [`L1Heads::with_oracle`] with an output
+    /// oracle. Without this call, the owner has no oracle
+    /// ([`L1Heads::posted_only`]).
+    #[must_use]
+    pub fn with_heads(mut self, heads: L1Heads) -> Self {
+        self.heads = heads;
+        self
     }
 
     /// Run until every sender of `inputs` is gone.
@@ -227,6 +246,14 @@ impl<P: FramePublisher> Owner<P> {
                     head: self.parts.merge.head(),
                     joined: self.join == Join::Joined,
                 });
+                Ok(())
+            }
+            Input::Posted(block) => {
+                self.heads.post(block);
+                Ok(())
+            }
+            Input::Final(block) => {
+                self.heads.finalize(block);
                 Ok(())
             }
         }
@@ -365,13 +392,21 @@ impl<P: FramePublisher> Owner<P> {
         self.parts.store.sync()?;
         self.synced_at = Instant::now();
         self.show_distance();
-        let floor = self
-            .parts
+        self.show_disk();
+        let next_block = self.parts.store.head().next_block;
+        self.heads.show(next_block);
+        self.parts
             .store
-            .head()
-            .next_block
-            .saturating_sub(self.cfg.keep_blocks.get());
-        self.parts.store.prune_below(floor)
+            .prune_below(self.heads.keep_from(next_block, self.cfg.keep_blocks))
+    }
+
+    /// Export the free disk of the store. A failed read keeps the last
+    /// value: the store itself reports a disk that fails.
+    fn show_disk(&self) {
+        match self.parts.store.free_bytes() {
+            Ok(bytes) => metrics::set_disk_free(bytes),
+            Err(error) => tracing::warn!(%error, "egress: the free disk of the store did not read"),
+        }
     }
 
     /// The canonical indexes between the stored head and the newest record

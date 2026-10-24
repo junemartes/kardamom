@@ -4,24 +4,31 @@
 //! reads of the readers that resume. It merges the receipts of every
 //! executor too, publishes them on `egress_receipts`, and answers
 //! `eth_getTransactionReceipt`. It keeps the drops that the sequencers
-//! report on `tx_drops`, and answers `kardamom_getTransactionStatus`. See
-//! the library docs.
+//! report on `tx_drops`, and answers `kardamom_getTransactionStatus`. It
+//! reads the posted head from the `l1_blocks` stream of the L1 follower,
+//! and, with an oracle, the final head from L1, and keeps every block above
+//! the lower of the two. See the library docs.
 
 use std::net::SocketAddr;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use alloy_primitives::Address;
 use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_egress::catchup::CatchUp;
 use kardamom_egress::drops::Drops;
+use kardamom_egress::final_head::FinalHead;
 use kardamom_egress::http::Http;
+use kardamom_egress::l1_heads::L1Heads;
 use kardamom_egress::merge::{Head, Merge, MergeConfig};
 use kardamom_egress::owner::{FramePublisher, Input, Join, Owner, OwnerConfig, Parts};
 use kardamom_egress::receipts::Receipts;
 use kardamom_egress::store::Store;
-use kardamom_log::aeron_live::{AeronRuntime, PubHandle, TxDropsSubscriberHandle};
+use kardamom_log::aeron_live::{
+    AeronRuntime, L1BlocksSubscriberHandle, PubHandle, TxDropsSubscriberHandle,
+};
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::bin::wait_for_shutdown;
@@ -62,9 +69,21 @@ struct Args {
     /// The blocks in one segment file.
     #[arg(long, env = "KARDAMOM_EGRESS_SEGMENT_BLOCKS", default_value = "1000")]
     segment_blocks: NonZeroU64,
-    /// The blocks the store keeps below its head.
+    /// The blocks the store keeps below its head, whatever the L1 heads
+    /// say: the window of the readers that resume. The store also keeps
+    /// every block above the lower of the posted head and the final head.
     #[arg(long, env = "KARDAMOM_EGRESS_KEEP_BLOCKS", default_value = "1000000")]
     keep_blocks: NonZeroU64,
+    /// The L1 JSON-RPC endpoint of the output oracle. Point it at the
+    /// light client. It needs `--withdrawal-oracle`.
+    #[arg(long, env = "KARDAMOM_L1_RPC_URL", requires = "withdrawal_oracle")]
+    l1_rpc_url: Option<reqwest::Url>,
+    /// The L1 address of `WithdrawalOutputOracle`. With it, the store keeps
+    /// every block above the lower of the posted head and the final head.
+    /// Without it, the store keeps every block above the posted head. It
+    /// needs `--l1-rpc-url`.
+    #[arg(long, env = "KARDAMOM_WITHDRAWAL_ORACLE", requires = "l1_rpc_url")]
+    withdrawal_oracle: Option<Address>,
     /// The period of the disk sync, in milliseconds.
     #[arg(long, env = "KARDAMOM_EGRESS_SYNC_MS", default_value_t = 1_000)]
     sync_ms: u64,
@@ -104,6 +123,23 @@ struct Args {
     /// again after the next boundary of a copy, in seconds.
     #[arg(long, env = "KARDAMOM_EGRESS_JOIN_TIMEOUT_S", default_value = "60")]
     join_timeout_secs: NonZeroU64,
+}
+
+impl Args {
+    /// The watch of the final head, with an oracle, and the L1 heads that
+    /// the owner starts from.
+    fn final_head(
+        &self,
+        inputs: &crossbeam_channel::Sender<Input>,
+    ) -> (Option<FinalHead>, L1Heads) {
+        match (&self.l1_rpc_url, self.withdrawal_oracle) {
+            (Some(url), Some(oracle)) => (
+                Some(FinalHead::new(url.clone(), oracle, inputs.clone())),
+                L1Heads::with_oracle(),
+            ),
+            _ => (None, L1Heads::posted_only()),
+        }
+    }
 }
 
 /// A live publication of the egress.
@@ -177,6 +213,9 @@ async fn main() -> Result<()> {
         .await
         .context("open egress_receipts")?;
     let drops = plane.tx_drops_subscriber(&rt).context("open tx_drops")?;
+    let l1_blocks = plane
+        .subscriber::<L1BlocksSubscriberHandle>(&rt)
+        .context("open l1_blocks")?;
 
     let store = Store::open(&args.dir, args.segment_blocks, GENESIS).context("open the store")?;
     tracing::info!(head = ?store.head(), mark = ?store.mark(), dir = %args.dir.display(), "egress: store open");
@@ -188,6 +227,7 @@ async fn main() -> Result<()> {
         store.head(),
     );
     let (inputs, rx) = crossbeam_channel::bounded(INPUTS);
+    let (final_head, heads) = args.final_head(&inputs);
     let catch_up = CatchUp::new(
         args.peers,
         inputs.clone(),
@@ -212,30 +252,24 @@ async fn main() -> Result<()> {
             live: Live::order(live),
             receipts_live: Live::receipts(receipts_live),
         },
-    );
+    )
+    .with_heads(heads);
     let owner_thread = std::thread::Builder::new()
         .name("egress-owner".into())
         .spawn(move || owner.run(&rx))
         .context("spawn the owner thread")?;
-    let forward = inputs.clone();
-    std::thread::Builder::new()
-        .name("egress-frames".into())
-        .spawn(move || forward_frames(frames, &forward))
-        .context("spawn the frames thread")?;
-    let forward = inputs.clone();
-    let handle = tokio::runtime::Handle::current();
-    std::thread::Builder::new()
-        .name("egress-receipts".into())
-        .spawn(move || forward_receipts(receipt_frames, &forward, &handle))
-        .context("spawn the receipts thread")?;
-    let forward = inputs.clone();
-    let handle = tokio::runtime::Handle::current();
-    std::thread::Builder::new()
-        .name("egress-drops".into())
-        .spawn(move || forward_drops(drops, &forward, &handle))
-        .context("spawn the drops thread")?;
+    Feeds {
+        frames,
+        receipt_frames,
+        drops,
+        l1_blocks,
+    }
+    .forward(&inputs)?;
 
     if let Some(task) = catch_up {
+        tokio::spawn(task.run());
+    }
+    if let Some(task) = final_head {
         tokio::spawn(task.run());
     }
     let http = Http::bind(args.bind, inputs)
@@ -252,6 +286,48 @@ async fn main() -> Result<()> {
     match owner_thread.join() {
         Ok(result) => result.context("the owner thread"),
         Err(_) => anyhow::bail!("the owner thread panicked"),
+    }
+}
+
+/// The streams that feed the owner thread.
+struct Feeds {
+    frames: tokio::sync::mpsc::UnboundedReceiver<kardamom_log::aeron_live::RawFrame>,
+    receipt_frames: kardamom_log::aeron_live::TxReceiptsReceiver,
+    drops: TxDropsSubscriberHandle,
+    l1_blocks: L1BlocksSubscriberHandle,
+}
+
+impl Feeds {
+    /// Start one thread for each stream. Each thread puts the inputs of
+    /// its stream on `inputs`.
+    fn forward(self, inputs: &crossbeam_channel::Sender<Input>) -> Result<()> {
+        let Self {
+            frames,
+            receipt_frames,
+            drops,
+            l1_blocks,
+        } = self;
+        let handle = tokio::runtime::Handle::current();
+        let to = inputs.clone();
+        Self::spawn("egress-frames", move || forward_frames(frames, &to))?;
+        let (to, rt) = (inputs.clone(), handle.clone());
+        Self::spawn("egress-receipts", move || {
+            forward_receipts(receipt_frames, &to, &rt);
+        })?;
+        let (to, rt) = (inputs.clone(), handle.clone());
+        Self::spawn("egress-drops", move || forward_drops(drops, &to, &rt))?;
+        let to = inputs.clone();
+        Self::spawn("egress-posted", move || {
+            forward_posted(l1_blocks, &to, &handle);
+        })
+    }
+
+    fn spawn(name: &str, body: impl FnOnce() + Send + 'static) -> Result<()> {
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(body)
+            .with_context(|| format!("spawn the thread {name}"))?;
+        Ok(())
     }
 }
 
@@ -290,6 +366,19 @@ fn forward_drops(
 ) {
     let _ = std::iter::from_fn(|| handle.block_on(drops.recv()))
         .try_for_each(|(_, drop)| inputs.send(Input::Drop(drop)));
+}
+
+/// Put the posted head of each `l1_blocks` record that carries a post on
+/// the owner's queue, until the subscription closes or the owner is gone.
+/// The follower publishes only finalized L1 blocks.
+fn forward_posted(
+    mut blocks: L1BlocksSubscriberHandle,
+    inputs: &crossbeam_channel::Sender<Input>,
+    handle: &tokio::runtime::Handle,
+) {
+    let _ = std::iter::from_fn(|| handle.block_on(blocks.recv()))
+        .filter_map(|(_, record)| record.batches.iter().map(|b| b.l2_block_end).max())
+        .try_for_each(|block| inputs.send(Input::Posted(block)));
 }
 
 /// End the Aeron runtime: the subscription closes, so the frames thread

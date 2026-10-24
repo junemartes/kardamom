@@ -1,0 +1,95 @@
+//! The prune of the store follows the L1 heads, past the window of the
+//! readers that resume.
+
+use std::num::NonZeroU64;
+use std::time::Duration;
+
+use kardamom_cluster_adapter::wire::encode_egress_boundary;
+
+use super::{Live, live, message, owner_with, read_from_genesis};
+use crate::l1_heads::L1Heads;
+use crate::owner::{Input, Join, Owner};
+use crate::store::Range;
+
+/// An owner that keeps 10 blocks below its head and syncs at each call,
+/// with the receiver of its live frames.
+fn pruning(
+    dir: &std::path::Path,
+    heads: L1Heads,
+) -> (Owner<Live>, crossbeam_channel::Receiver<Vec<u8>>) {
+    let (live, published) = live();
+    let mut o = owner_with(dir, live, Join::FromPeer).with_heads(heads);
+    o.cfg.sync_every = Duration::ZERO;
+    o.cfg.keep_blocks = NonZeroU64::new(10).unwrap();
+    (o, published)
+}
+
+/// Deliver the empty blocks `from..=to` from one copy, then sync.
+fn blocks(o: &mut Owner<Live>, from: u64, to: u64) {
+    (from..=to)
+        .try_for_each(|block| o.on(message(block - 1, &encode_egress_boundary(block, 0, 0, 0))))
+        .unwrap();
+    o.sync_if_due().unwrap();
+}
+
+/// Take the heads, then sync.
+fn heads(o: &mut Owner<Live>, inputs: impl IntoIterator<Item = Input>) {
+    inputs
+        .into_iter()
+        .try_for_each(|input| o.on(input))
+        .unwrap();
+    o.sync_if_due().unwrap();
+}
+
+/// The first block that the store holds. A segment holds 10 blocks.
+fn first_block(o: &mut Owner<Live>) -> u64 {
+    match read_from_genesis(o) {
+        Range::Frames { .. } => 1,
+        Range::Unavailable { floor, .. } => floor.next_block,
+    }
+}
+
+#[test]
+fn a_frozen_posted_head_keeps_every_block_above_it_past_the_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut o, _published) = pruning(dir.path(), L1Heads::posted_only());
+    blocks(&mut o, 1, 100);
+    assert_eq!(
+        first_block(&mut o),
+        1,
+        "no posted head: the store keeps every block"
+    );
+    heads(&mut o, [Input::Posted(25)]);
+    assert_eq!(first_block(&mut o), 21, "the segment of block 26 stays");
+    blocks(&mut o, 101, 300);
+    assert_eq!(
+        first_block(&mut o),
+        21,
+        "the posted head does not move: every block above it stays, 270 blocks past the window"
+    );
+}
+
+#[test]
+fn the_prune_follows_the_lower_of_the_posted_head_and_the_final_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut o, _published) = pruning(dir.path(), L1Heads::with_oracle());
+    heads(&mut o, [Input::Posted(55)]);
+    blocks(&mut o, 1, 101);
+    assert_eq!(first_block(&mut o), 1, "no output is final yet");
+    heads(&mut o, [Input::Final(35)]);
+    assert_eq!(first_block(&mut o), 31, "the final head is the lower head");
+    heads(&mut o, [Input::Final(75)]);
+    assert_eq!(first_block(&mut o), 51, "the posted head is the lower head");
+    heads(&mut o, [Input::Posted(95)]);
+    assert_eq!(
+        first_block(&mut o),
+        71,
+        "the final head is the lower head again"
+    );
+    heads(&mut o, [Input::Posted(500), Input::Final(500)]);
+    assert_eq!(
+        first_block(&mut o),
+        91,
+        "both heads are above the window: the store keeps the window"
+    );
+}

@@ -325,6 +325,13 @@ Placement:
 - The readers of the canonical stream (the validator and the batcher) stay on the aux node. So the loss of one node never stops the egress and those readers together.
 - Each instance keeps its store in `/opt/kardamom/egress` (`paths.egress_dir`) on its node.
 
+The floor of the store:
+
+- Each instance keeps every block above the posted head. It reads the posted head from the `l1_blocks` stream of the L1 follower, so the follower must run.
+- With `WITHDRAWAL_ORACLE_ADDRESS`, each instance keeps every block above the lower of the posted head and the final head. It reads the final head from the oracle on L1: through the light client when one runs, else through the in-cluster anvil. With a real L1 and no light client, the deploy gives the egress no L1 endpoint, and the egress refuses to start with the oracle alone.
+- Each instance also keeps `keep_blocks` blocks below its head (job variable, default 1,000,000).
+- Size the disk of the executor nodes for the DA-lag budget, and for the challenge window with an oracle. `KardamomEgressDiskFillsSoon` fires before the disk is full.
+
 Every switch is off by default. With every switch off, the deploy renders every job as before. Switch them on in this order, one deploy for each step:
 
 1. `KARDAMOM_EXEC_FRAMES=on`: the executors publish their frames. Nothing reads them yet.
@@ -478,6 +485,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Ingress | `KARDAMOM_INGRESS_ACK` (job variable `ack`) | empty (`receipt`) | When `eth_sendRawTransaction` answers. `receipt` waits for the receipt. `validated` answers when the ingress validated the transaction and published it on `tx_data`. See [`../../docs/json-rpc.md`](../../docs/json-rpc.md). |
 | Executor | `KARDAMOM_EXEC_CURSOR` (job variable `exec_cursor`) | empty (`off` in the job) | `on` or `off`. On, each executor sends its recorded cursor to the sealer, the floor of the record-lag guard. Switch it on only after every sealer member reads ingress kind 9. A sealer member that does not read it drops the frame. |
 | Egress | `KARDAMOM_EGRESS` | `0` | `1` deploys the egress job (`nomad/egress.nomad.hcl`) and its scrape (job variable `egress` of the monitoring job). It needs `KARDAMOM_EXEC_FRAMES=on`. See [The egress](#the-egress). |
+| Egress | `WITHDRAWAL_ORACLE_ADDRESS` (job variables `withdrawal_oracle` and `l1_rpc_url` of the egress) | empty (no oracle) | The L1 address of `WithdrawalOutputOracle`. Set, the egress keeps every block above the lower of the posted head and the final head (`--withdrawal-oracle`, `--l1-rpc-url`). Empty, it keeps every block above the posted head. The deploy does not create the oracle. See [The egress](#the-egress). |
 | Egress | `KARDAMOM_EXEC_FRAMES` (job variable `exec_frames` of the executor) | empty (`off` in the job) | `on` or `off`. On, each executor publishes the frames that it executes on `exec_frames` (`--exec-frames`). |
 | Egress | `KARDAMOM_VALIDATOR_EGRESS`, `KARDAMOM_BATCHER_EGRESS` (job variable `egress_url`) | empty (the job reads the cluster egress) | `on` or `off`. On, the validator or the batcher reads the canonical stream from the egress (`--egress`). Switch it on only on a chain where the carry flag is active. It needs `KARDAMOM_EGRESS=1`. |
 | Egress | `KARDAMOM_SEQUENCER_RECEIPTS_FROM_EGRESS` (job variable `receipts_from_egress` of the sequencer) | empty (`off` in the job) | `on` or `off`. On, the sequencers read the receipts and their account rows from `egress_receipts` (`receipts_from_egress = true` in the config). It needs `KARDAMOM_EGRESS=1`. |

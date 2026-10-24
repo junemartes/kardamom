@@ -201,6 +201,19 @@ workloads_sequencer_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_SEQUENCER_
 workloads_ingress_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS') }}"
 # The receipts of the notifier from egress_receipts.
 workloads_notifier_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS') }}"
+# The output oracle of the egress (nomad/egress.nomad.hcl): the L1
+# address of WithdrawalOutputOracle. With it, the egress keeps every block
+# above the lower of the posted head and the final head. Without it, the
+# egress keeps every block above the posted head. The deploy does not
+# create the oracle.
+workloads_withdrawal_oracle_address: "{{ lookup('env', 'WITHDRAWAL_ORACLE_ADDRESS') }}"
+# The L1 that the egress reads the oracle through: the light client when
+# one runs, else the in-cluster anvil when no real L1 is given. A real L1
+# without a light client gives none, because a keyed URL never goes into a
+# job. The egress then refuses to start with the oracle alone.
+workloads_egress_l1_rpc_url: >-
+  {{ 'http://' ~ workloads_light_host ~ ':' ~ workloads_light_port if workloads_light_execution_rpc | length > 0
+     else workloads_anvil_service_rpc if workloads_l1_rpc_given | length == 0 else '' }}
 # The readers reach the egress through its Consul service.
 workloads_egress_url: "http://kardamom-egress.service.{{ datacenter }}.consul:{{ ports.egress_http }}"
 # The job variables of the switches, by job. Every compile of a job takes
@@ -209,6 +222,9 @@ workloads_egress_url: "http://kardamom-egress.service.{{ datacenter }}.consul:{{
 workloads_egress_job_vars:
   executor:
     exec_frames: "{{ workloads_exec_frames }}"
+  egress:
+    withdrawal_oracle: "{{ workloads_withdrawal_oracle_address }}"
+    l1_rpc_url: "{{ workloads_egress_l1_rpc_url if workloads_withdrawal_oracle_address | length > 0 else '' }}"
   validator:
     egress_url: "{{ workloads_egress_url if workloads_validator_egress == 'on' else '' }}"
   batcher:

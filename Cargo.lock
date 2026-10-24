@@ -4021,7 +4021,11 @@ dependencies = [
 name = "kardamom-egress"
 version = "0.1.0"
 dependencies = [
+ "alloy-contract",
  "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types-eth",
+ "alloy-sol-types",
  "anyhow",
  "bytes",
  "clap",
@@ -4038,6 +4042,7 @@ dependencies = [
  "metrics",
  "reqwest 0.13.4",
  "rkyv",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

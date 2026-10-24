@@ -367,8 +367,19 @@ is the current state, and the difference is a follow-up.
   `[len:u32][frame]`, little endian.
 - At open the store reads every segment once. It rebuilds the head and cuts a torn frame at the
   end of the last segment.
-- The store keeps `--keep-blocks` blocks below its head. The prune does not follow
-  `min(posted_head, final_head)` yet (follow-up).
+- The store keeps every block above `min(posted_head, final_head)`, as section 6.2 says. It
+  deletes a segment after a sync, only when the segment is below that floor and below the window
+  of `--keep-blocks` blocks under its head. The window serves the readers that resume.
+  - The posted head is the highest `l2_block_end` of a post on the `l1_blocks` stream of the L1
+    follower. The follower publishes only finalized L1 blocks.
+  - The final head comes from `WithdrawalOutputOracle` on L1 (`--withdrawal-oracle`,
+    `--l1-rpc-url`), read at the finalized L1 block every 30 s. Without an oracle, the floor is
+    the posted head.
+  - A head that the egress did not read yet is 0, so the store keeps every block.
+  - The prune is local to each instance and changes no replicated state.
+  - The egress exports `kardamom_egress_posted_distance_blocks`,
+    `kardamom_egress_floor_distance_blocks` and `kardamom_egress_disk_free_bytes`.
+    `KardamomEgressDiskFillsSoon` fires before the disk is full.
 - The store syncs to disk each `--sync-ms` milliseconds.
 
 ### 10.4 The HTTP side
@@ -410,7 +421,6 @@ Each switch is off by default. Without it, the reader keeps its old source.
 - **The notifier stays a separate service.** It reads `egress_receipts` in place of the
   `tx_receipts` of the executors. The webhooks and `kardamom_subscribeTxStatus` stay in
   `crates/notifier`. The move into the egress process is a follow-up.
-- **The prune** keeps a fixed number of blocks (section 10.3).
 - **No drops on `egress_receipts`.** Its frames are receipt batches and rollbacks, told apart by
   length, so a drop has no clean place there. The WebSocket status feed and the webhooks do not
   show a drop yet. The ingress does not forward `kardamom_getTransactionStatus` yet.
