@@ -5,20 +5,17 @@ use crate::test_support::TestEgress;
 
 /// An egress with `frames` stored, on a free port. Returns its address.
 async fn egress(dir: &std::path::Path, frames: &[Vec<u8>]) -> std::net::SocketAddr {
-    egress_with(dir, frames, Vec::new()).await
-}
-
-/// An egress with `frames` stored and `receipts` taken.
-async fn egress_with(
-    dir: &std::path::Path,
-    frames: &[Vec<u8>],
-    receipts: Vec<kardamom_log::aeron_live::ReceiptFrame>,
-) -> std::net::SocketAddr {
     let egress = TestEgress::spawn(dir, Join::FromPeer).await;
     egress.send_copy(1, 0, frames);
-    receipts
+    egress.addr
+}
+
+/// An egress that took `taken` before its first read.
+async fn egress_inputs(dir: &std::path::Path, taken: Vec<Input>) -> std::net::SocketAddr {
+    let egress = TestEgress::spawn(dir, Join::FromPeer).await;
+    taken
         .into_iter()
-        .try_for_each(|frame| egress.inputs.send(Input::Receipts(frame)))
+        .try_for_each(|input| egress.inputs.send(input))
         .unwrap();
     egress.addr
 }
@@ -83,8 +80,8 @@ async fn the_receipt_call_answers_as_the_executor_query_does() {
         receipts: vec![receipt.clone()],
         accounts: Vec::new(),
     };
-    let frames = vec![kardamom_log::aeron_live::ReceiptFrame::Batch(batch)];
-    let addr = egress_with(dir.path(), &[], frames).await;
+    let frame = kardamom_log::aeron_live::ReceiptFrame::Batch(batch);
+    let addr = egress_inputs(dir.path(), vec![Input::Receipts(frame)]).await;
     let client = reqwest::Client::new();
     let ask = |hash| {
         client
@@ -108,5 +105,70 @@ async fn the_receipt_call_answers_as_the_executor_query_does() {
     assert_eq!(
         kardamom_cache::query::parse_receipt_answer(&missing).unwrap(),
         None
+    );
+}
+
+/// The status call answers each of the three states, and the receipt call
+/// answers `null` for a dropped hash.
+#[tokio::test]
+async fn the_status_call_answers_executed_dropped_and_unknown() {
+    use alloy_primitives::B256;
+    let dir = tempfile::tempdir().unwrap();
+    let executed = kardamom_types::Receipt {
+        tx_hash: B256::repeat_byte(4),
+        block_number: 7,
+        tx_idx: kardamom_types::BPosition::from_index(3),
+        ..kardamom_types::Receipt::default()
+    };
+    let batch = kardamom_types::ReceiptBatch {
+        receipts: vec![executed.clone()],
+        accounts: Vec::new(),
+    };
+    let dropped = kardamom_types::TxDrop {
+        tx_hash: B256::repeat_byte(5),
+        sender: alloy_primitives::Address::repeat_byte(0xA1),
+        nonce: 9,
+        reason: kardamom_types::DropReason::NonceTooLow,
+    };
+    let addr = egress_inputs(
+        dir.path(),
+        vec![
+            Input::Receipts(kardamom_log::aeron_live::ReceiptFrame::Batch(batch)),
+            Input::Drop(dropped.clone()),
+        ],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let call = |method: &'static str, hash: B256| {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": method, "params": [hash],
+        });
+        let request = client.post(format!("http://{addr}/")).json(&body).send();
+        async move {
+            let answer: serde_json::Value = request.await.unwrap().json().await.unwrap();
+            answer["result"].clone()
+        }
+    };
+    let status = "kardamom_getTransactionStatus";
+    assert_eq!(
+        call(status, executed.tx_hash).await,
+        serde_json::json!({"status": "executed"})
+    );
+    assert_eq!(
+        call(status, dropped.tx_hash).await,
+        serde_json::json!({
+            "status": "dropped",
+            "reason": "nonce too low",
+            "sender": dropped.sender,
+            "nonce": "0x9",
+        })
+    );
+    assert_eq!(
+        call(status, B256::ZERO).await,
+        serde_json::json!({"status": "unknown"})
+    );
+    assert_eq!(
+        call("eth_getTransactionReceipt", dropped.tx_hash).await,
+        serde_json::Value::Null
     );
 }

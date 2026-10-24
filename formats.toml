@@ -328,6 +328,21 @@ TxStatus = "rkyv size 112 align 16"
 TxError = "rkyv size 80 align 16"
 TxEnvelope = "rkyv size 80 align 8"
 
+# Frozen layout. The drop record on the tx_drops stream: the hash, the
+# sender, the nonce and the reason of one transaction that the sequencer
+# dropped. The sequencer writes it, and the egress reads it. A reader of
+# an older build has no subscription to the stream. A reason goes only at
+# the end; a reader logs and skips a frame with a reason that it does not
+# know.
+[format.tx-drops]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = true
+code = ["crates/types/src/tx_drop.rs#pub struct TxDrop"]
+[format.tx-drops.layout]
+TxDrop = "rkyv size 72 align 8"
+
 # Frozen layout. The rollback record on the tx_receipts receipt stream: a
 # 40-byte rkyv ReceiptRollback frame (the last valid block and the identity
 # of the event). A receipt batch frame is 16 bytes with no receipt and more
