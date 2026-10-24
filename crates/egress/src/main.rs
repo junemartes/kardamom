@@ -179,7 +179,7 @@ async fn main() -> Result<()> {
     let drops = plane.tx_drops_subscriber(&rt).context("open tx_drops")?;
 
     let store = Store::open(&args.dir, args.segment_blocks, GENESIS).context("open the store")?;
-    tracing::info!(head = ?store.head(), dir = %args.dir.display(), "egress: store open");
+    tracing::info!(head = ?store.head(), mark = ?store.mark(), dir = %args.dir.display(), "egress: store open");
     let merge = Merge::new(
         MergeConfig {
             max_waiting: args.max_waiting,

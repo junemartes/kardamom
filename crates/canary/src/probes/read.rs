@@ -12,7 +12,7 @@ use super::{Context, Probe};
 use crate::outcome::Outcome;
 use crate::rpc::Rpc;
 
-const NAME: &str = "read";
+pub(crate) const NAME: &str = "read";
 
 #[derive(Debug)]
 pub struct Read {

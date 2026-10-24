@@ -15,6 +15,17 @@ pub enum Stage {
 }
 
 impl Stage {
+    /// Every stage, for the counters that start at zero.
+    const ALL: [Self; 7] = [
+        Self::Submit,
+        Self::Receipt,
+        Self::Read,
+        Self::Safe,
+        Self::L1Inclusion,
+        Self::L1Finality,
+        Self::L2Credit,
+    ];
+
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
@@ -28,6 +39,64 @@ impl Stage {
         }
     }
 }
+
+/// The `code` labels that start at zero: a transport failure, and each
+/// code the ingress answers with.
+const RPC_CODES: [&str; 6] = [
+    "transport",
+    "-32000",
+    "-32005",
+    "-32010",
+    "-32602",
+    "-32603",
+];
+
+/// The `reason` labels that start at zero: each reason word of the status
+/// feed, and `unknown` for a rejection without a reason.
+const REJECT_REASONS: [&str; 13] = [
+    "duplicated-tx",
+    "evicted",
+    "expired",
+    "past-deadline",
+    "fee-invalid",
+    "fee-too-low",
+    "insufficient-funds",
+    "da-lag",
+    "record-lag",
+    "sealer-nonce-ahead",
+    "nonce-in-flight",
+    "already-known",
+    "unknown",
+];
+
+/// The `field` labels that start at zero: each check of the `fees` probe.
+const FEE_FIELDS: [&str; 5] = [
+    "max_priority_fee",
+    "fee_history",
+    "priority_fee_paid",
+    "base_fee",
+    "priority_fee_per_gas",
+];
+
+/// The outcomes without a detail label.
+const PLAIN: [Outcome; 16] = [
+    Outcome::Success,
+    Outcome::ReceiptStatus0,
+    Outcome::Skipped,
+    Outcome::NonceGap,
+    Outcome::Unfunded,
+    Outcome::AccountStalled,
+    Outcome::StateMismatch,
+    Outcome::HeadStalled,
+    Outcome::ReceiptLost,
+    Outcome::L1Error,
+    Outcome::SupplyMismatch,
+    Outcome::AllowlistBreach,
+    Outcome::SwapMismatch,
+    Outcome::InvariantBroken,
+    Outcome::ReserveMismatch,
+    Outcome::LiquidityMismatch,
+];
 
 /// One probe run's result. Each failure names what a user would see.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,15 +198,45 @@ impl Outcome {
         }
     }
 
-    /// Count the run, and mark the time of a success.
-    pub fn record(&self, probe: &'static str, endpoint: &str) {
+    /// Every outcome that has a known label set: the plain outcomes, a
+    /// timeout in each stage, a fee mismatch of each field, and the known
+    /// RPC codes and rejection reasons.
+    fn known() -> impl Iterator<Item = Self> {
+        PLAIN
+            .into_iter()
+            .chain(Stage::ALL.into_iter().map(Self::Timeout))
+            .chain(FEE_FIELDS.into_iter().map(Self::FeeMismatch))
+            .chain(RPC_CODES.into_iter().map(|c| Self::RpcError(c.to_string())))
+            .chain(
+                REJECT_REASONS
+                    .into_iter()
+                    .map(|r| Self::Rejected(r.to_string())),
+            )
+    }
+
+    /// The run counter of this outcome of `probe` on `endpoint`.
+    fn counter(&self, probe: &'static str, endpoint: &str) -> metrics::Counter {
         let mut labels = vec![
             ("probe", probe.to_string()),
             ("endpoint", endpoint.to_string()),
             ("outcome", self.label().to_string()),
         ];
         labels.extend(self.detail());
-        metrics::counter!(crate::metrics::PROBE_TOTAL, &labels).increment(1);
+        metrics::counter!(crate::metrics::PROBE_TOTAL, &labels)
+    }
+
+    /// Start the run counter of each known outcome of `probe` on
+    /// `endpoint` at zero. Prometheus `increase()` takes the first sample
+    /// of a series as its base, so a series that starts at 1 loses its
+    /// first count. An RPC code or a rejection reason outside the known
+    /// lists still starts at 1, and its first count is lost.
+    pub fn start_at_zero(probe: &'static str, endpoint: &str) {
+        Self::known().for_each(|outcome| outcome.counter(probe, endpoint).increment(0));
+    }
+
+    /// Count the run, and mark the time of a success.
+    pub fn record(&self, probe: &'static str, endpoint: &str) {
+        self.counter(probe, endpoint).increment(1);
         if *self == Self::Success {
             crate::metrics::success_now(probe);
         } else {
@@ -160,5 +259,43 @@ mod tests {
         let unknown = Outcome::from(RpcError::Unknown("reset".into()));
         assert_eq!(unknown.detail(), Some(("code", "transport".to_string())));
         assert_eq!(Outcome::Success.detail(), None);
+    }
+
+    /// The run counter series that `record` gives on a fresh local
+    /// recorder, as their rendered lines.
+    fn series(record: impl FnOnce()) -> Vec<String> {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        metrics::with_local_recorder(&recorder, record);
+        recorder
+            .handle()
+            .render()
+            .lines()
+            .filter(|line| line.starts_with(crate::metrics::PROBE_TOTAL))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn every_known_outcome_starts_at_zero_and_its_first_run_counts_on_that_series() {
+        let started = series(|| Outcome::start_at_zero("transfer", "a"));
+        assert_eq!(started.len(), Outcome::known().count());
+        assert!(started.iter().all(|line| line.ends_with(" 0")));
+        assert!(
+            started
+                .iter()
+                .any(|line| line.contains(r#"outcome="timeout",stage="receipt""#))
+        );
+        let ran = series(|| {
+            Outcome::start_at_zero("transfer", "a");
+            Outcome::known().for_each(|outcome| outcome.record("transfer", "a"));
+        });
+        let names = |lines: &[String]| -> std::collections::BTreeSet<String> {
+            lines
+                .iter()
+                .map(|line| line.rsplit_once(' ').unwrap().0.to_string())
+                .collect()
+        };
+        assert_eq!(names(&ran), names(&started));
+        assert!(ran.iter().all(|line| line.ends_with(" 1")));
     }
 }

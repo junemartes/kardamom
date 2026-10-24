@@ -19,7 +19,7 @@ use crate::rpc::Rpc;
 use crate::store::Contracts;
 use crate::wait::Poll;
 
-const NAME: &str = "contract";
+pub(crate) const NAME: &str = "contract";
 
 #[derive(Debug)]
 pub struct Contract {
