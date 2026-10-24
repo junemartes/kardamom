@@ -43,6 +43,14 @@ variable "l1_silence_secs" {
 # mutable :dev tag in the task config. That fallback is a dev
 # affordance for manual `nomad job run` during debugging, not a
 # production path.
+# The pause between two epochs of one L1 finality step, in ms
+# (--epoch-pace-ms). Empty: the binary's default, 2000.
+variable "epoch_pace_ms" {
+  type        = string
+  description = "The pause between two epochs of one finality step, in ms. Empty: 2000."
+  default     = ""
+}
+
 variable "image_ref" {
   type        = string
   description = "Digest-pinned image reference (repo:tag@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
@@ -168,6 +176,7 @@ job "da-watcher" {
             "--archive-durability",
           ],
           var.l1_silence_secs != "" ? ["--l1-silence-secs", var.l1_silence_secs] : [],
+          var.epoch_pace_ms != "" ? ["--epoch-pace-ms", var.epoch_pace_ms] : [],
         )
       }
 

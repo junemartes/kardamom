@@ -514,13 +514,18 @@ impl<T> PartitionState<T> {
     /// floor become drainable by [`Self::drain_pending`] on the next loop
     /// iteration.
     ///
-    /// Returns `Some((previous_next_nonce, dropped_count))` when the floor
-    /// advanced, or `None` when it was already at or behind `next`.
+    /// Returns `Some((previous_next_nonce, dropped))` when the floor
+    /// advanced, with the dropped entries and their nonces, or `None` when
+    /// it was already at or behind `next`.
     ///
     /// This advances only on execution evidence from the receipts stream,
     /// never on locally inferred stream gaps. A client-abandoned nonce
     /// hole produces no receipt, so it never advances the floor.
-    pub(crate) fn advance_floor(&mut self, sender: Address, floor: u64) -> Option<(u64, usize)> {
+    pub(crate) fn advance_floor(
+        &mut self,
+        sender: Address,
+        floor: u64,
+    ) -> Option<(u64, Vec<(u64, T)>)> {
         let cur = self.next_nonce(sender);
         if floor <= cur {
             return None;
@@ -528,7 +533,7 @@ impl<T> PartitionState<T> {
         let dropped = self
             .pending
             .get_mut(&sender)
-            .map_or(0, |b| b.drop_below(floor));
+            .map_or_else(Vec::new, |b| b.drop_below(floor));
         self.next.insert(sender, floor);
         self.trim_refused(sender, |n| n >= floor);
         Some((cur, dropped))

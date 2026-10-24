@@ -20,6 +20,10 @@ export RUN_SHARDS := env('RUN_SHARDS', if KARDAMOM_STAGED != '' { '../../target/
 # CI or developer host stalls past Aeron's 10 s default at times. Only the
 # container recipes set it; `deploy` keeps the 10 s production default.
 container_stall_ms := env('AERON_STALL_TOLERANCE_MS', '30000')
+# The epoch pace of a container cluster, in milliseconds: not the 2 s
+# default of the da-watcher. The tests mine bursts of L1 blocks, and at
+# 2 s a burst of 64 epochs takes about 128 s.
+container_epoch_pace_ms := env('EPOCH_PACE_MS', '100')
 # The idle cap of a container cluster, in microseconds: Aeron's own 1 ms
 # park, not the 50 µs default of `deploy`. A cap at or above the own cap of
 # a thread leaves the thread as it is, so at 1000 µs every thread keeps its
@@ -119,6 +123,7 @@ container-up:
     set -euo pipefail
     export REGISTRY_PUSH_NODE="${REGISTRY_PUSH_NODE:-control-0}"
     export AERON_STALL_TOLERANCE_MS="{{container_stall_ms}}"
+    export EPOCH_PACE_MS="{{container_epoch_pace_ms}}"
     export KARDAMOM_IDLE_CAP_US="{{container_idle_cap_us}}"
     # New nodes get a new sealer cluster. The deploy opens the bootstrap
     # only for a cluster job that Nomad does not know.
@@ -138,11 +143,11 @@ container-up:
 # chaos-combined-exec, chaos-retention, chaos-cache, chaos-l1, chaos-follower,
 # chaos-integrity (nightly).
 container-test $shard=env('SHARD', 'load'):
-    KARDAMOM_CHAOS_REUSE=1 AERON_STALL_TOLERANCE_MS="{{container_stall_ms}}" KARDAMOM_IDLE_CAP_US="{{container_idle_cap_us}}" $RUN_SHARDS --ignored --exact "${shard//-/_}" --nocapture
+    KARDAMOM_CHAOS_REUSE=1 AERON_STALL_TOLERANCE_MS="{{container_stall_ms}}" EPOCH_PACE_MS="{{container_epoch_pace_ms}}" KARDAMOM_IDLE_CAP_US="{{container_idle_cap_us}}" $RUN_SHARDS --ignored --exact "${shard//-/_}" --nocapture
 
 # Run a shard end to end, including its cluster lifecycle, as CI does.
 shard $shard=env('SHARD', 'load'):
-    AERON_STALL_TOLERANCE_MS="{{container_stall_ms}}" KARDAMOM_IDLE_CAP_US="{{container_idle_cap_us}}" $RUN_SHARDS --ignored --exact "${shard//-/_}" --nocapture
+    AERON_STALL_TOLERANCE_MS="{{container_stall_ms}}" EPOCH_PACE_MS="{{container_epoch_pace_ms}}" KARDAMOM_IDLE_CAP_US="{{container_idle_cap_us}}" $RUN_SHARDS --ignored --exact "${shard//-/_}" --nocapture
 
 # Collect node and job state after a failure.
 container-diagnostics:
