@@ -557,7 +557,10 @@ async fn main() -> anyhow::Result<()> {
     let cluster_rt =
         AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn cluster AeronRuntime")?;
     let mut cluster_cfg = cfg.cluster.to_live();
-    if let Some(endpoints) = plane.cluster_ingress_endpoints().await? {
+    if let Some(endpoints) = plane
+        .cluster_ingress_endpoints(rt.start_open_limit())
+        .await?
+    {
         cluster_cfg.ingress_endpoints = endpoints;
     }
     let (cluster_guard, cluster_pub, cluster_egress) =

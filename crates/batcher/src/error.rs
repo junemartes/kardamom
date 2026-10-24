@@ -43,6 +43,13 @@ pub enum BatcherError {
 }
 
 impl BatcherError {
+    /// The error of the DA proxy request `op` that failed in transport.
+    /// The text carries every cause of `e`, for example the refused
+    /// connection under a failed send.
+    pub(crate) fn da_transport(op: &str, e: reqwest::Error) -> Self {
+        Self::Da(format!("{op}: {:#}", anyhow::Error::new(e)))
+    }
+
     /// True for the payload-ceiling overflow of a group that a shorter
     /// prefix can still fit.
     #[must_use]

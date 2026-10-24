@@ -149,7 +149,7 @@ voting set.
 | `advertise_interface` | none | Interface name or IPv4 network in CIDR form. Required when enabled. Exactly one address must match. |
 | `request_timeout_ms` | `5000` | One HTTP request's connect plus response budget. |
 | `blocking_wait_ms` | `30000` | How long one blocking catalog query waits for a change. |
-| `backoff_min_ms`, `backoff_max_ms` | `500`, `10000` | Retry backoff after a failed catalog read, and between the tries of a start-up registration. |
+| `backoff_min_ms`, `backoff_max_ms` | `500`, `10000` | Retry backoff after a failed catalog read, and between the tries of a start-up registration or a start-up read. |
 | `removal_grace_ms` | `5000` | A missing publisher is detached only after this long. |
 | `check_ttl_ms` | `10000` | The TTL of a publication's health check. |
 | `deregister_after_ms` | `60000` | Consul deletes a registration critical for this long. |
@@ -330,6 +330,7 @@ No job configures a publication control port.
 - A start-up open waits for the start-up limit: two Aeron stall budgets (30 s at the default tolerance, 70 s in CI).
   - The Aeron add of a publication or a subscription is one add that waits the whole limit, with no retry. An add that times out stays registered in the driver, so a retry would leak one publication or subscription for each try. A wait that ends with no answer cancels the add.
   - The Consul registration of a record retries an unavailable agent (no answer, or a 5xx status) with the pauses of `backoff_min_ms` to `backoff_max_ms`. Each try logs a WARN line that names the record.
+  - The read of the cluster members (`StreamPlane::cluster_ingress_endpoints`) retries an unavailable agent the same way.
   - After the limit, a failed publication open, subscription open or publisher record registration ends the start-up, and the service exits with the open error. A failed subscriber record registration only logs a WARN line, and the service runs without that record.
   - A stop token (`StreamPlane::stopping_opens_on`) ends the wait and the retries at once.
   - See "Start-up open of a stream" in [failure-modes.md](failure-modes.md#substrate-the-shared-failure-domain).

@@ -287,7 +287,10 @@ impl<'a> ReaderStart<'a> {
             return Ok((None, ExecutorOrdering::Carried(Box::new(sub))));
         }
         let mut cluster_cfg = file_cfg.cluster.to_live();
-        if let Some(endpoints) = plane.cluster_ingress_endpoints().await? {
+        if let Some(endpoints) = plane
+            .cluster_ingress_endpoints(self.rt.start_open_limit())
+            .await?
+        {
             cluster_cfg.ingress_endpoints = endpoints;
         }
         let (guard, sub) = bin_support::connect_cluster_ordering(aeron_dir, cluster_cfg, cursor)?;

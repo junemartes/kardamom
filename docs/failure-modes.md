@@ -370,7 +370,7 @@ The sealer orders a transaction reference before the archives make its data dura
 
 - A consumer votes (`KIND_VOID_REQUEST`) only after the join budget ends and every archive refuses the range.
   - An archive refuses when it has no recording of the session, when each recording starts after the range, or when the range is in a gap or after an ended recording.
-  - An archive that is down or slow does not refuse. A live recording that does not reach the range yet does not refuse.
+  - An archive that is down or slow does not refuse. A live recording that does not reach the range yet does not refuse. A recording with no stop position (`NULL_POSITION`, -1) is live, so it does not refuse either.
 - A consumer that has the data never votes.
 - The sealer appends the void record only when **every** configured voter has voted for the same `(index, tx_hash)`.
 - One voter that is down blocks the void, and the chain waits for it. This is the safe side, because that voter can be the one that executed the entry.
@@ -953,6 +953,8 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
 - A request goes to the best endpoint first. On an error or an HTTP 429, it falls back to the next endpoint. A failing endpoint ranks last for the requests after it.
 - The batcher reads only what the contract commits to, so it does not cross-check hashes. The followers do (see "DA-watcher").
 - A post that fails on every attempt of `--l1-retries` is the `l1_unreachable` halt. The halt clears by itself when L1 answers.
+- The nonce of each send is the pending transaction count of the batcher key on L1. A send that fails before it reaches L1 (for example, a failed gas estimate during an L1 outage) takes no nonce, so it leaves no nonce gap.
+- A post waits up to 120 s (ten Ethereum blocks) for its receipt. After that, the sender reads `lastBatchIndex`. A transaction that landed counts as the post. The sender sends a transaction that did not land again. When the first one lands later, the contract refuses the second (`StaleBatchIndex`). The read after that refusal confirms the post. So a batch never lands twice.
 
 **Data path.**
 
@@ -1633,8 +1635,10 @@ A deploy replaces service instances one at a time under readiness checks. The ch
     - Only an unavailable agent starts a retry: a connect error, a timeout, a broken transfer, or a 5xx status. A refused permission (a 4xx status, an ACL denial) or a malformed request fails at once.
     - The pauses follow the catalog backoff of `[discovery]` (`backoff_min_ms` to `backoff_max_ms`, doubling).
     - Each failed try logs a WARN line `discovery: start-up open failed; trying again`. The line names the record (`open`) and gives the error.
+  - Consul read of the cluster members (`StreamPlane::cluster_ingress_endpoints`): the same retry, for the same limit. A Consul agent that rejoins its servers after a node restart answers `500 No known Consul servers` for a short time. The WARN line names the read (`open = read kardamom-cluster-member`). Every service that connects to the cluster reads the members once at start-up: the sequencer, the executor, the validator, the batcher, the ingress and the da-watcher.
+  - Archive connect of a discovered recorder (the `tx_data` recorder of the ingress, the `tx_deposits` recorder of the da-watcher, the `l1_blocks` recorder of the L1 follower): a node that restarts can start the archive after the recorder. The connect then ends with `archive connect poll: TimedOut` after 30 s. The recorder tries the connect again, with a pause of 1 s, until the start-up limit passes. Each failed try logs the WARN line `discovered recorder: archive connect failed; trying again`. The readiness wait of the service is the limit, plus one connect of 30 s, plus 60 s for the recordings to go live (`DiscoveredRecorder::ready_budget`). A stop ends the tries.
   - At the end of the limit, the open returns its last error. What happens next depends on the open:
-    - A publication open, a subscription open, or a publisher record registration: the error ends the start-up, and the service exits with the same error as with no wait. Nomad restarts it. A service that cannot open its streams has no state to serve, so the exit does not go through the halt contract.
+    - A publication open, a subscription open, a publisher record registration, a cluster member read, or an archive connect of a recorder: the error ends the start-up, and the service exits with the same error as with no wait. Nomad restarts it. A service that cannot open its streams has no state to serve, so the exit does not go through the halt contract.
     - A subscriber record registration: it runs in a background task, so its last error only logs the WARN line `discovery: subscriber registration failed`, and the service keeps running. The subscription itself is open and attaches its publishers. Without the record, the publishers of the stream treat the stream as one without a subscriber: a must-deliver publisher does not escalate for it.
   - A stop ends the wait of an add and the retries of a registration at once, with the error `stopped during start-up open`.
     - The executor and the validator handle SIGTERM before they open their streams, so they pass the token of that signal to the plane (`StreamPlane::stopping_opens_on`). Without the token, a SIGTERM during a stall waits for the end of the limit, and Nomad sends SIGKILL first.
@@ -1644,7 +1648,8 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - Proof:
     - The `add_wait` unit tests of `kardamom-log`: the start-up wait equals the limit; a wait with no answer times out once and cancels the add; a stop ends the wait at once and cancels the add.
     - The `start_retry` unit tests: the retry succeeds after transient failures, gives up at the limit, fails at once on a refusal, and ends at once on a stop (during a pause, and before a pause).
-    - `consul_register_retry`: a fake Consul agent drops one request and answers 503 once, then accepts.
+    - `consul_register_retry`: a fake Consul agent drops one request and answers 503 once, then accepts. The cluster member read tries again after two 500 answers, and fails with the last error after the limit.
+    - The connect tests of the discovered recorder in `discovery/recording/tests.rs`: the connect tries again within the limit, fails after the limit, and ends on a stop.
     - `a_publication_open_outlasts_a_driver_stall` in `discovered_exec_txs` (docker-e2e): the test freezes the driver for 7 s during a publication open. The open succeeds with one add, and the driver holds one publication.
 - **Catalog flap of a live publisher**
   - Trigger: the Consul catalog misses a live publisher for longer than `removal_grace_ms` (5 s by default) and lists it again. For example, a read that returns a malformed body, or a record whose check is late. The publisher does not restart.

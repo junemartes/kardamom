@@ -86,10 +86,16 @@ const SEQUENTIAL_METHODS: &[&str] = &[
 /// endpoint first and falls back to the next on an error or an HTTP 429;
 /// the scores rank a failing endpoint last for the requests after it.
 ///
+/// The nonce of each send comes from the pending transaction count of
+/// L1. A local nonce count would advance on a send that failed before it
+/// reached L1, for example on a failed gas estimate. Every later send
+/// then leaves a nonce gap, and L1 never mines it. The sends are serial
+/// ([`LiveSender`]), so two sends never read the same count.
+///
 /// # Errors
 /// Returns an error when the key does not parse, when `rpcs` is empty,
 /// or when an endpoint is not a URL.
-pub fn connect_l1(rpcs: &[String], key: &str) -> Result<impl Provider + Clone + 'static> {
+pub fn connect_l1(rpcs: &[String], key: &str) -> Result<impl Provider + Clone + use<>> {
     let signer: PrivateKeySigner = key.parse().context("parse --l1-key")?;
     let transports = rpcs
         .iter()
@@ -105,6 +111,10 @@ pub fn connect_l1(rpcs: &[String], key: &str) -> Result<impl Provider + Clone + 
         .with_sequential_methods(SEQUENTIAL_METHODS.iter().map(ToString::to_string).collect())
         .layer(transports);
     Ok(ProviderBuilder::new()
+        .disable_recommended_fillers()
+        .with_gas_estimation()
+        .with_simple_nonce_management()
+        .fetch_chain_id()
         .wallet(EthereumWallet::from(signer))
         .connect_client(RpcClient::new(service, false)))
 }
@@ -269,12 +279,12 @@ impl RunConfig {
         })
     }
 
-    /// Open the `tx_data` and cluster `tx_ordering` subscriptions, and
-    /// spawn their reader threads.
     /// Replace the static `[cluster]` ingress endpoints with the members
-    /// the catalog lists, when discovery is on and lists any.
-    async fn resolve_cluster_ingress(&mut self) -> Result<()> {
-        if let Some(endpoints) = self.plane.cluster_ingress_endpoints().await? {
+    /// the catalog lists, when discovery is on and lists any. A
+    /// transient catalog error makes the read try again for up to
+    /// `limit`.
+    async fn resolve_cluster_ingress(&mut self, limit: Duration) -> Result<()> {
+        if let Some(endpoints) = self.plane.cluster_ingress_endpoints(limit).await? {
             self.file_cfg.cluster.ingress_endpoints = endpoints;
         }
         Ok(())
@@ -293,12 +303,16 @@ impl RunConfig {
         )
     }
 
-    fn spawn_reader_stack(
+    /// Open the `tx_data` and cluster `tx_ordering` subscriptions, and
+    /// spawn their reader threads. The cluster members come from the
+    /// catalog first, within the start-up limit of the runtime.
+    async fn spawn_reader_stack(
         &mut self,
         args: &LiveArgs,
         cursor: BatchCursor,
     ) -> Result<ReaderStack<impl Send + use<>>> {
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
+        self.resolve_cluster_ingress(rt.start_open_limit()).await?;
         let replay_cursor = kardamom_engine::reader::cluster::ReplayCursor::new(
             cursor.next_index,
             cursor.next_block,
@@ -649,8 +663,7 @@ async fn run_once(args: &LiveArgs) -> Result<RunEnd> {
     };
     let spool = Spool::open(&args.spool_dir)?;
     let (restored, resume) = continue_from_spool(&spool, l1.cursor, l1.skip_through_block)?;
-    let mut run_cfg = RunConfig::resolve(args)?;
-    run_cfg.resolve_cluster_ingress().await?;
+    let run_cfg = RunConfig::resolve(args)?;
 
     gauge!(live_metric_names::IDLE_FLUSH_SECONDS)
         .set(Duration::from_millis(args.idle_flush_ms.get()).as_secs_f64());
@@ -794,7 +807,7 @@ impl Service<'_> {
             handles,
             feed_rx,
             posted_cursor,
-        } = self.run_cfg.spawn_reader_stack(self.args, resume)?;
+        } = self.run_cfg.spawn_reader_stack(self.args, resume).await?;
         // The start reached the stream: a held halt is over.
         halt::clear();
         let follower = posted_cursor.follow(feed.posted());
