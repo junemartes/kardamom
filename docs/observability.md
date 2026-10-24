@@ -172,7 +172,9 @@ Four names locate a bottleneck on the transaction path. Every service records th
 | `kardamom_step_seconds` | histogram | `step` | The duration of one step of work. A hot loop records it per batch. |
 | `kardamom_batch_items` | histogram | `batch` | The items in one batch. |
 
-- The busy share of a loop is `busy / (busy + idle + blocked)`. A share near 1 means that the loop is saturated.
+- The busy share of a loop is `busy / max(busy + idle + blocked, 1 s)` for each second. A share near 1 means that the loop is saturated.
+- The sealer service reports only its busy time. The floor of 1 s makes its share the busy time in each second.
+- A loop that reports nothing in a window shows a share of 0, not a gap.
 - `blocked` is time with work but no room on the output: a full queue or a back-pressured publication.
 - A queue that grows sits in front of the bottleneck.
 - A loop adds its time to the counter at most every 100 ms.
