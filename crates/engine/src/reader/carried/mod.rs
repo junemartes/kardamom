@@ -348,6 +348,13 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
                 );
                 Err(ExecutorError::UnjoinableReference { index })
             }
+            Verdict::Mismatch { index } => {
+                tracing::error!(
+                    index,
+                    "no source holds the right bytes of the entry; stopping"
+                );
+                Err(ExecutorError::HashMismatch { index })
+            }
         }
     }
 }

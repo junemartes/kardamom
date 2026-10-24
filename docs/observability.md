@@ -498,13 +498,18 @@ With `--carry-bytes`, `--egress <url>` (`KARDAMOM_EGRESS_URL`, off by default) m
 | Metric | Meaning |
 | --- | --- |
 | `kardamom_executor_input_source{source}` | 1 for the source that the executor reads, 0 for the other. `source` is `feed` (the member feed) or `service` (the serving service, or the egress with `--egress`). |
-| `kardamom_executor_source_mismatch_total{source}` | Canonical entries whose `keccak256(raw_tx)` is not the canonical id, by the source that sent them. The executor does not execute such an entry and does not stop: it leaves the source and reads the same index from the other source. |
+| `kardamom_executor_source_mismatch_total{source}` | Canonical entries whose `keccak256(raw_tx)` is not the canonical id, by the source that sent them. The executor does not execute such an entry. It leaves the source and reads the same index from the other source. It stops only when no source can serve the right bytes (see below). |
 
 - The executor leaves the feed when no frame comes for 6 s, when the feed loses its image, or on a mismatch. It goes back to the feed after the feed has one image for 30 s and a replay of the feed from its cursor reaches `REPLAY_DONE`.
 - Any increment of `kardamom_executor_source_mismatch_total` needs an operator: a member or a service sends bytes that do not match the ordered id. The log line is `the raw transaction does not hash to its canonical id; replaying from the other source`, with the source and the index.
 - A switch logs `switching the input source` with the old and the new source and the cursor.
 - A transaction reference at the cursor is a fault of the source: the reader has no `tx_data` lane to join it. The reader leaves the source and reads the same index from the other source.
 - When every source gives a reference at the same index, the reader stops with `UnjoinableReference { index }`. The log line is `no source holds the bytes of the transaction reference; stopping`, with the index. A source that never connected counts as one that gives the reference. Only a sequencer that offers a type-0 reference makes such an entry.
+- When every source gives a mismatch at the same index, the reader stops with `HashMismatch { index }`. The log line is `no source holds the right bytes of the entry; stopping`, with the index.
+  - A source that never connected counts as one that gives the mismatch. So a reader with one source stops on its first mismatch, after the silence window of the absent second source. This is an executor with no `--egress`, and a validator or a batcher with `--egress`.
+  - A source that refused the cursor below its floor also counts, as for a reference.
+  - A reader with two sources that connect keeps the switch for a mismatch on one source: the other source can serve the right bytes.
+  - The executor exits with status 1. The batcher run ends with the error `tx_ordering reader failed`. The validator holds the `validator_divergence` halt: see [`validator_divergence`](runbooks/validator_divergence.md).
 
 ### Executor pipeline
 
