@@ -20,8 +20,8 @@ import org.agrona.concurrent.ringbuffer.RingBufferDescriptor;
  * {@link Feeder} thread offers it to the publication. The feeder passes the
  * replay requests of the executor back through the control ring. Each ring
  * has one writer thread and one reader thread, so the rings are
- * {@link OneToOneRingBuffer}s. No write waits: a full ring gaps a live
- * feed, and pauses a replay to the next duty cycle.</p>
+ * {@link OneToOneRingBuffer}s. No write waits: a full ring ends a live
+ * feed with a gap, and pauses a replay to the next duty cycle.</p>
  *
  * <p>Each ring message carries a generation as its type. The feeder starts
  * a new generation for each request and for each loss of the subscriber,
@@ -29,11 +29,23 @@ import org.agrona.concurrent.ringbuffer.RingBufferDescriptor;
  * clean: no frame of an earlier answer that is still in the ring reaches
  * the executor after the new answer starts.</p>
  *
- * <p>The answer to a request walks the retained file from the cursor to
+ * <p>The answer to a request walks the retained frames from the cursor to
  * the head, at most {@link #WALK_BYTES} in each duty cycle, then sends
  * {@code REPLAY_DONE} and turns live. The walk reads the frames that the
  * service appends during the walk too, so no live frame is lost and none
  * comes before {@code REPLAY_DONE}.</p>
+ *
+ * <p>The walk holds a walk key of the store ({@link RetainedFrames}): a
+ * file position, or a frame number on the heap. The key stays valid while
+ * the store grows and evicts. When the front of the store passes the key,
+ * the frames from the key are gone, and the answer ends with a gap. The
+ * executor then asks again, and a request from a cursor inside the window
+ * serves.</p>
+ *
+ * <p>A duty cycle that reads no control message allocates nothing: the
+ * walk wraps one view on each frame and reads the key in place, and the
+ * live path copies each frame into the ring. The start of an answer and
+ * each change of the state log a line, and that allocates.</p>
  */
 final class MemberFeed implements Feed {
 
@@ -49,21 +61,32 @@ final class MemberFeed implements Feed {
     /** The most control messages that one duty cycle reads. */
     private static final int CONTROL_BATCH = 16;
 
+    /** The state of the answer, with the state that the admin status shows for it. */
     private enum State {
         /** No request, or the subscriber left: write nothing. */
-        IDLE,
+        IDLE(FeedState.IDLE),
         /** Send the refusal in the staging buffer, then turn idle. */
-        REFUSING,
-        /** Walk the retained file from the cursor of the request. */
-        WALKING,
+        REFUSING(FeedState.IDLE),
+        /** Walk the retained frames from the cursor of the request. */
+        WALKING(FeedState.WALKING),
         /** Carry each new retained frame. */
-        LIVE,
-        /** A frame did not fit: write nothing until the next request. */
-        GAPPED
+        LIVE(FeedState.LIVE),
+        /**
+         * The answer ended with a gap: a frame did not fit, or the front
+         * passed the walk. Write nothing until the next request.
+         */
+        GAPPED(FeedState.GAPPED);
+
+        private final FeedState shown;
+
+        State(final FeedState shown) {
+            this.shown = shown;
+        }
     }
 
     private final int memberId;
-    private final RetainedFile file;
+    private final RetainedFrames retained;
+    private final SealerMetrics metrics;
     /** Written by this thread, read by the feeder. */
     private final FrameRing frames;
     /** Written by the feeder, read by this thread. */
@@ -71,7 +94,7 @@ final class MemberFeed implements Feed {
     private final AgentRunner feeder;
     private final UnsafeBuffer staging = new UnsafeBuffer(new byte[SealerWire.FEED_ANSWER_LEN]);
     private final EgressFrames codec = new EgressFrames(staging);
-    /** A view of one frame of the retained file, during the walk. */
+    /** A view of one retained frame, during the walk. */
     private final UnsafeBuffer view = new UnsafeBuffer(0, 0);
     private final MessageHandler controlHandler = this::onControl;
 
@@ -83,30 +106,39 @@ final class MemberFeed implements Feed {
     private FeedRequest request = new FeedRequest(0, 0, 0);
     /** The point after the frames that the answer carried. */
     private final FeedCursor cursor = new FeedCursor();
-    private long walkPos;
+    /** The walk key of the next frame of the walk. */
+    private long walkKey;
     /** The frame bytes that the walk can still move in this duty cycle. */
     private long walkLeft;
     /** The length of the refusal in {@link #staging}. */
     private int refusalLength;
 
-    private MemberFeed(
-            final int memberId, final RetainedFile file, final FrameRing frames, final RingBuffer control,
-            final AgentRunner feeder) {
-        this.memberId = memberId;
-        this.file = file;
+    private MemberFeed(final Member member, final FrameRing frames, final RingBuffer control, final AgentRunner feeder) {
+        this.memberId = member.memberId();
+        this.retained = member.retained();
+        this.metrics = member.metrics();
         this.frames = frames;
         this.control = control;
         this.feeder = feeder;
+        metrics.feed(state.shown);
+    }
+
+    /**
+     * The parts of the member that the feed reads: its id, its retained
+     * frames on the heap or in the file, and its metrics.
+     */
+    record Member(int memberId, RetainedFrames retained, SealerMetrics metrics) {
     }
 
     /** Make the rings and start the feeder thread on them. */
-    static MemberFeed start(final FeedConfig config, final RetainedFile file, final int memberId) {
+    static MemberFeed start(final FeedConfig config, final Member member) {
+        final int memberId = member.memberId();
         final RingBuffer frames = ring(config.ringBytes());
         final RingBuffer control = ring(CONTROL_RING_BYTES);
         final AgentRunner feeder = new Feeder(config, memberId, frames, control).start();
         System.out.println("sealer FEED START memberId=" + memberId + " aeronDir=" + config.aeronDir()
             + " ringBytes=" + config.ringBytes() + " termBytes=" + config.termBytes());
-        return new MemberFeed(memberId, file, new FrameRing(frames), control, feeder);
+        return new MemberFeed(member, new FrameRing(frames), control, feeder);
     }
 
     /** A ring off the heap of {@code capacity} bytes, a power of two. */
@@ -126,7 +158,10 @@ final class MemberFeed implements Feed {
     public int doWork(final SealerEgress egress, final long upToIndex, final long upToBlock) {
         asked = Optional.empty();
         final int read = control.read(controlHandler, CONTROL_BATCH);
-        asked.ifPresent(r -> answer(r, egress, upToIndex, upToBlock));
+        // A lambda here would capture the head, and allocate in each duty cycle.
+        if (asked.isPresent()) {
+            answer(asked.get(), egress, upToIndex, upToBlock);
+        }
         return read + step(upToIndex, upToBlock);
     }
 
@@ -140,7 +175,7 @@ final class MemberFeed implements Feed {
         generation = msgTypeId;
         asked = FeedRequest.parse(buffer, index, length);
         if (asked.isEmpty() && state != State.IDLE) {
-            state = State.IDLE;
+            enter(State.IDLE);
             log("IDLE the subscriber left");
         }
     }
@@ -155,8 +190,8 @@ final class MemberFeed implements Feed {
             case REFUSED -> refuse(SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE,
                 egress.firstRetainedIndex(), egress.firstRetainedBlock(), verdict);
             case SERVE -> {
-                walkPos = file.scanStart(next.fromBlock());
-                state = State.WALKING;
+                walkKey = retained.walkStart(next.fromBlock());
+                enter(State.WALKING);
                 log("REPLAY from=" + cursor);
             }
         }
@@ -164,7 +199,7 @@ final class MemberFeed implements Feed {
 
     private void refuse(final byte kind, final long a, final long b, final ReplayVerdict verdict) {
         refusalLength = codec.feedAnswer(kind, a, b, request.requestId());
-        state = State.REFUSING;
+        enter(State.REFUSING);
         log("REPLAY from=" + cursor + " " + verdict.reason());
     }
 
@@ -180,7 +215,7 @@ final class MemberFeed implements Feed {
         if (!frames.put(generation, staging, refusalLength)) {
             return 0;
         }
-        state = State.IDLE;
+        enter(State.IDLE);
         return 1;
     }
 
@@ -195,27 +230,27 @@ final class MemberFeed implements Feed {
     }
 
     /**
-     * Carry the record at the walk position when the request wants it, and
-     * move past it. False when the walk stops in this duty cycle: at the
-     * head, at a full ring, behind the front of the file, or at the end of
-     * the budget.
+     * Carry the frame at the walk key when the request wants it, and move
+     * past it. False when the walk stops in this duty cycle: at the head, at
+     * a full ring, behind the front of the store, or at the end of the
+     * budget.
      */
     private boolean walkStep(final long upToIndex, final long upToBlock) {
-        if (walkPos >= file.headPos()) {
+        if (walkKey >= retained.walkHead()) {
             finishWalk(upToIndex, upToBlock);
             return false;
         }
-        if (walkPos < file.frontPos()) {
+        if (walkKey < retained.walkFront()) {
             // The floor passed the walk: the frames from here are gone.
             gap();
             return false;
         }
-        file.view(walkPos, view);
+        retained.view(walkKey, view);
         final int length = view.capacity();
-        if (FrameKey.of(view).wanted(request.fromIndex(), request.fromBlock()) && !carry(view, length)) {
+        if (FrameKey.wanted(view, request.fromIndex(), request.fromBlock()) && !carry(view, length)) {
             return false;
         }
-        walkPos = file.next(walkPos);
+        walkKey = retained.walkNext(walkKey);
         walkLeft -= length;
         return walkLeft > 0;
     }
@@ -224,7 +259,7 @@ final class MemberFeed implements Feed {
         final int length = codec.feedAnswer(
             SealerWire.EGRESS_KIND_REPLAY_DONE, upToIndex, upToBlock, request.requestId());
         if (frames.put(generation, staging, length)) {
-            state = State.LIVE;
+            enter(State.LIVE);
             log("LIVE at=" + cursor);
         }
     }
@@ -242,8 +277,14 @@ final class MemberFeed implements Feed {
     private void gap() {
         final int length = codec.feedGap(cursor.index(), cursor.block(), request.requestId());
         final String lost = frames.putMarker(generation, staging, length) ? "" : " marker=LOST";
-        state = State.GAPPED;
+        enter(State.GAPPED);
         log("GAPPED next=" + cursor + lost);
+    }
+
+    /** Take the state {@code next}, and show it on the admin status. */
+    private void enter(final State next) {
+        state = next;
+        metrics.feed(next.shown);
     }
 
     private void log(final String what) {

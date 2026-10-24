@@ -349,13 +349,17 @@ public final class SealerClusteredService implements ClusteredService {
      * Every member must run the same choice.
      */
     SealerClusteredService carryingBytes(final RetainedFile.Config config) {
-        return carryingBytes(config, Optional.empty());
+        this.retainedFile = Optional.of(config);
+        return this;
     }
 
-    /** Keep the retained frames in a file, and send them to the paired executor through {@code feed}. */
-    SealerClusteredService carryingBytes(final RetainedFile.Config config, final Optional<FeedConfig> feed) {
-        this.retainedFile = Optional.of(config);
-        this.feedConfig = feed;
+    /**
+     * Send the retained frames to the paired executor through the member
+     * feed of {@code feed}, from the heap or from the file. The feed is
+     * local to this member: the members of one cluster can differ.
+     */
+    SealerClusteredService feeding(final FeedConfig feed) {
+        this.feedConfig = Optional.of(feed);
         return this;
     }
 
@@ -395,7 +399,7 @@ public final class SealerClusteredService implements ClusteredService {
         this.snapshots = new SnapshotRequests(cluster, memberId);
         final Optional<RetainedFile> file = retainedFile.map(config -> new RetainedFile(config, memberId));
         this.retained = file.<RetainedFrames>map(f -> f).orElseGet(HeapFrames::new);
-        this.feed = Feed.open(feedConfig, file, memberId);
+        this.feed = Feed.open(feedConfig, new MemberFeed.Member(memberId, retained, metrics));
         if (snapshot.isPresent()) {
             restore(snapshot.get());
             // The log position of a start from a snapshot is the snapshot's position.
