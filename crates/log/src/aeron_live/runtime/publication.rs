@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use crossbeam_channel::Sender as CbSender;
 use rkyv::util::AlignedVec;
 
-use super::{AeronRuntime, RuntimeCmd, request, request_within};
+use super::{ACK_TIMEOUT, AeronRuntime, PublishAck, RuntimeCmd, request, request_within};
 use crate::aeron_live::ADD_PUB_TIMEOUT;
 use crate::aeron_live::add_wait::AddWait;
 use crate::codec;
@@ -177,9 +177,36 @@ impl PubHandle {
         let pub_id = self.pub_id;
         request(
             &self.cmd_tx,
-            |ack| RuntimeCmd::Publish { pub_id, bytes, ack },
+            |ack| RuntimeCmd::Publish {
+                pub_id,
+                bytes,
+                ack: PublishAck::Blocking(ack),
+            },
             "publish_bytes",
         )
+    }
+
+    /// [`publish_bytes`](Self::publish_bytes) for an async caller: the
+    /// task awaits the ack of the Aeron thread, with the same
+    /// [`ACK_TIMEOUT`](super::super::ACK_TIMEOUT), and blocks no thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron offer fails or times out, or if the
+    /// Aeron thread is gone.
+    pub async fn publish_bytes_async(&self, bytes: AlignedVec) -> Result<BPosition, LogError> {
+        let (ack, outcome) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(RuntimeCmd::Publish {
+                pub_id: self.pub_id,
+                bytes,
+                ack: PublishAck::Async(ack),
+            })
+            .map_err(|_| LogError::Aeron("aeron thread dropped".into()))?;
+        tokio::time::timeout(ACK_TIMEOUT, outcome)
+            .await
+            .map_err(|_| LogError::Aeron("publish_bytes timed out".into()))?
+            .map_err(|_| LogError::Aeron("aeron thread dropped".into()))?
     }
 
     /// Fire-and-forget publish. Errors are logged on the Aeron thread.
@@ -235,5 +262,26 @@ impl PubHandle {
     {
         let bytes = codec::encode(msg)?;
         self.publish_bytes(bytes)
+    }
+
+    /// [`publish`](Self::publish) for an async caller. See
+    /// [`publish_bytes_async`](Self::publish_bytes_async).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `msg` fails to encode, or if the publish
+    /// itself fails.
+    pub async fn publish_async<T>(&self, msg: &T) -> Result<BPosition, LogError>
+    where
+        T: for<'a> rkyv::Serialize<
+                rkyv::api::high::HighSerializer<
+                    AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'a>,
+                    rkyv::rancor::Error,
+                >,
+            >,
+    {
+        let bytes = codec::encode(msg)?;
+        self.publish_bytes_async(bytes).await
     }
 }

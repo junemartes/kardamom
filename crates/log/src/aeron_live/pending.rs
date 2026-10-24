@@ -32,6 +32,29 @@ pub(super) struct PubEntry {
 /// only trace of one, so a dashboard reads it per stream.
 pub const BEST_EFFORT_DROPPED_TOTAL: &str = "kardamom_log_best_effort_dropped_total";
 
+/// Where the Aeron thread sends the outcome of an acknowledged publish:
+/// to a thread that blocks on it, or to a task that awaits it. The task
+/// form costs no blocking-pool hop on the caller side.
+pub(super) enum PublishAck {
+    Blocking(CbSender<Result<BPosition, LogError>>),
+    Async(tokio::sync::oneshot::Sender<Result<BPosition, LogError>>),
+}
+
+impl PublishAck {
+    /// Send the outcome. A caller that gave up has dropped its receiver,
+    /// and the outcome then has no reader.
+    pub(super) fn send(self, outcome: Result<BPosition, LogError>) {
+        match self {
+            Self::Blocking(ack) => {
+                let _ = ack.send(outcome);
+            }
+            Self::Async(ack) => {
+                let _ = ack.send(outcome);
+            }
+        }
+    }
+}
+
 /// A publish awaiting delivery on the Aeron thread.
 ///
 /// Why this queue exists: the Aeron thread is single-threaded and shared
@@ -55,9 +78,9 @@ pub const BEST_EFFORT_DROPPED_TOTAL: &str = "kardamom_log_best_effort_dropped_to
 pub(super) struct PendingPublish {
     pub(super) pub_id: u32,
     pub(super) bytes: AlignedVec,
-    /// `Some` for an acknowledged publish (`publish_bytes`); `None` for
-    /// best effort.
-    pub(super) ack: Option<CbSender<Result<BPosition, LogError>>>,
+    /// `Some` for an acknowledged publish (`publish_bytes` or
+    /// `publish_bytes_async`); `None` for best effort.
+    pub(super) ack: Option<PublishAck>,
     /// Give up (ack an error, or log) once this instant passes. Bounds a
     /// publish to a never-connecting subscriber.
     pub(super) deadline: Instant,
@@ -111,7 +134,7 @@ impl PendingPublish {
         let Some(ack) = self.ack.take() else {
             return;
         };
-        let _ = ack.send(decoded);
+        ack.send(decoded);
     }
 }
 
@@ -139,7 +162,7 @@ enum OfferResult {
 /// the ack-or-warn split cannot drift between them.
 fn fail_item(item: &mut PendingPublish, msg: String) {
     if let Some(ack) = item.ack.take() {
-        let _ = ack.send(Err(LogError::Aeron(msg)));
+        ack.send(Err(LogError::Aeron(msg)));
         return;
     }
     warn!(pub_id = item.pub_id, "best-effort publish failed: {msg}");
@@ -308,7 +331,7 @@ mod drain_pending_tests {
                 stream_id: Some(1),
                 pub_id,
                 bytes,
-                ack: Some(tx),
+                ack: Some(PublishAck::Blocking(tx)),
                 deadline: base + Duration::from_millis(dl_ms),
             },
             rx,
@@ -327,6 +350,53 @@ mod drain_pending_tests {
             Ok(Ok(_pos)) => {}
             other => panic!("expected an Ok position ack, got {other:?}"),
         }
+    }
+
+    /// The publish of `marker` with an async ack, and the receiver of
+    /// the ack.
+    fn pending_async(
+        marker: u8,
+        deadline: Instant,
+    ) -> (
+        PendingPublish,
+        tokio::sync::oneshot::Receiver<Result<BPosition, LogError>>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut bytes = AlignedVec::new();
+        bytes.extend_from_slice(&[marker]);
+        (
+            PendingPublish {
+                stream_id: Some(1),
+                pub_id: 0,
+                bytes,
+                ack: Some(PublishAck::Async(tx)),
+                deadline,
+            },
+            rx,
+        )
+    }
+
+    /// An async ack gets the position of a delivered offer, and the error
+    /// of an offer that passed its deadline, as a blocking ack does.
+    #[test]
+    fn an_async_ack_gets_the_outcome_of_the_offer() {
+        let now = Instant::now();
+        let (delivered_frame, mut delivered_ack) =
+            pending_async(0xAA, now + Duration::from_secs(5));
+        let mut q = VecDeque::from([delivered_frame]);
+        drain_pending_inner(&mut q, now, |_| delivered(64));
+        assert!(matches!(delivered_ack.try_recv(), Ok(Ok(_))));
+
+        let (expired_frame, mut expired_ack) = pending_async(0xBB, now);
+        let mut q = VecDeque::from([expired_frame]);
+        drain_pending_inner(&mut q, now, |_| {
+            OfferResult::Status(-1 /* NOT_CONNECTED */)
+        });
+        assert!(q.is_empty(), "the expired frame leaves the queue");
+        assert!(matches!(
+            expired_ack.try_recv(),
+            Ok(Err(LogError::Aeron(_)))
+        ));
     }
 
     #[test]

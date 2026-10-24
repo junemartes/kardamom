@@ -56,6 +56,7 @@ impl Rig {
             silence: Duration::from_secs(3600),
             resume_after: resume_after
                 .map(|b| L1ResumeAfter::from(NonZeroU64::new(b).expect("a test block is not 0"))),
+            epoch_pace: Duration::ZERO,
         }
     }
 
