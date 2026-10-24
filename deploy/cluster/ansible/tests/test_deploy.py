@@ -20,6 +20,8 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import yaml
+
 ANSIBLE = Path(__file__).resolve().parents[1]
 SERVICES = ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher',
             'batcher', 'state-mirror', 'notifier', 'da-store', 'canary']
@@ -313,9 +315,12 @@ class NomadAPI(BaseHTTPRequestHandler):
         allocs = []
         job = state['jobs'][name]
         for group in job['TaskGroups']:
-            # The scheduler places a system group on the nodes its
-            # constraints admit; the playbook must not assume a node count.
-            count = 8 if job['Type'] == 'system' else group['Count']
+            # The scheduler places a system or sysbatch group on the nodes
+            # its constraints admit; the playbook must not assume a node count.
+            per_node = job['Type'] in ('system', 'sysbatch')
+            count = 8 if per_node else group['Count']
+            # A sysbatch allocation that ends well is complete; the others run.
+            done = 'complete' if job['Type'] == 'sysbatch' else 'running'
             for i in range(count):
                 # Historical/stopping allocations must not satisfy readiness.
                 stale = state.get('missing_replica') == name and i > 0
@@ -323,7 +328,7 @@ class NomadAPI(BaseHTTPRequestHandler):
                 running = name not in state.get('not_running', ()) \
                     and group['Name'] not in state.get('down_groups', ())
                 allocs.append({'TaskGroup': group['Name'], 'JobVersion': self.version(name) - int(stale),
-                               'DesiredStatus': 'run', 'ClientStatus': 'running' if running else 'pending',
+                               'DesiredStatus': 'run', 'ClientStatus': done if running else 'pending',
                                'NodeID': f'node-{group["Name"]}',
                                'DeploymentStatus': {'Canary': False}})
         return allocs
@@ -548,7 +553,7 @@ class DeployTest(Deploys):
         local_canary = {'CANARY_LOCAL': '1'}
         self.run_deploy(environ=local_canary)
         self.assertIn('-Daeron.archive.file.sync.level=1', json.dumps(self.api.state['jobs']['aeron']))
-        expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
+        expected = ['data-dirs', 'aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
                     'da-store', 'l1-indexer', 'batcher', 'canary']
         self.assertEqual(self.api.state['writes'], expected)
@@ -1286,6 +1291,46 @@ class DeployTest(Deploys):
         self.api.state['deployments']['executor'] = Deployment('executor', ['running'])
         self.run_deploy(success=False)
         self.assertNotIn('batcher', self.api.state['writes'])
+
+    def test_the_deploy_makes_every_data_directory_on_every_node_first(self):
+        self.run_deploy(environ={'CANARY_LOCAL': '1'})
+        self.assertEqual(self.api.state['writes'][0], 'data-dirs')
+        job = self.api.state['jobs']['data-dirs']
+        self.assertEqual((job['Type'], job['NodePool']), ('sysbatch', 'all'))
+        config = job['TaskGroups'][0]['Tasks'][0]['Config']
+        self.assertEqual(config['volumes'], ['/opt/kardamom:/opt/kardamom'])
+        self.assertEqual(config['args'][:3], ['-c', 'mkdir -p "$@" && chmod 0777 "$@"', 'data-dirs'])
+        dirs = config['args'][3:]
+        self.assertIn('/opt/kardamom/canary', dirs)
+        # One list: the common role makes the same directories.
+        group_vars = yaml.safe_load((ANSIBLE / 'group_vars/all.yml').read_text())
+        listed = [group_vars['paths'][re.fullmatch(r'\{\{ paths\.(\w+) \}\}', d).group(1)]
+                  for d in group_vars['node_data_dirs']['paths']]
+        self.assertEqual(dirs, listed)
+        common = yaml.safe_load((ANSIBLE / 'roles/common/tasks/main.yml').read_text())
+        task = next(t for t in common if t['name'] == 'Create on-node kardamom directories')
+        self.assertEqual((task['loop'], task['ansible.builtin.file']['mode']),
+                         ('{{ node_data_dirs.paths }}', '{{ node_data_dirs.mode }}'))
+        # Every host directory that a job mounts is in the list. The
+        # exceptions: the Aeron tmpfs, which the common role mounts, and the
+        # directories of the sealer, whose image runs as root.
+        exempt = {'/opt/kardamom/aeron-mount', '/opt/kardamom/cluster', '/opt/kardamom/seed'}
+        mounted = {volume.split(':')[0] for job in self.api.state['jobs'].values()
+                   for group in job['TaskGroups'] for task in group['Tasks']
+                   for volume in (task['Config'].get('volumes') or [])}
+        self.assertEqual({d for d in mounted if d.startswith('/opt/kardamom/')} - exempt - set(dirs), set())
+
+    def test_an_incomplete_data_directory_job_stops_the_deploy_before_any_service(self):
+        self.api.state['not_running'] = ['data-dirs']
+        self.run_deploy(success=False)
+        self.assertEqual(self.api.state['writes'], ['data-dirs'])
+
+    def test_an_unhealthy_canary_job_fails_the_deploy(self):
+        self.api.state['deployments']['canary'] = Deployment('canary', ['running', 'failed'])
+        output = self.run_deploy(environ={'CANARY_LOCAL': '1'}, success=False)
+        self.assertIn('scripted failed', output)
+        self.assertEqual(self.api.state['writes'][-1], 'canary')
+        self.assertFalse((self.record_dir / 'images.digests').exists(), 'a failed deploy records nothing')
 
     def test_a_canary_is_smoked_by_its_node_then_promoted(self):
         self.api.state['deployments']['ingress'] = Deployment('ingress', [], canary=True)

@@ -12,6 +12,21 @@
   ansible.builtin.import_tasks: record_start.yml
   when: not ansible_check_mode
 
+# The data directories of the services, on every node, before any job
+# that mounts one. The list and the mode are node_data_dirs, the list
+# that the common role also makes. The job runs to completion on each
+# node, and the deploy waits for it.
+- name: Make the data directories on every node
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job:
+      name: data-dirs
+      file: data-dirs.sysbatch.nomad.hcl
+      vars:
+        base: "{{ paths.base }}"
+        dirs: "{{ node_data_dirs.paths | join(' ') }}"
+        mode: "{{ node_data_dirs.mode }}"
+
 - name: Deploy Aeron
   ansible.builtin.include_tasks: job.yml
   vars:
@@ -261,15 +276,14 @@
         KARDAMOM_L1_KEY: "{{ workloads_batcher_key | default(workloads_batcher_dev_key, true) }}"
 
 # The transaction canary uses the chain through the ingresses and the
-# notifier, and nothing waits for it. It comes up last, so its first
-# transactions find every reader of the chain, the batcher included,
-# already subscribed.
+# notifier. It comes up last, so its first transactions find every
+# reader of the chain, the batcher included, already subscribed. The
+# deploy waits for its deployment: an unhealthy canary fails the deploy.
 - name: Deploy the transaction canary
   ansible.builtin.include_tasks: job.yml
   vars:
     workloads_job:
       name: canary
-      wait: false
       vars:
         ring_offset: >-
           {{ workloads_canary_ring_offset if workloads_canary_mnemonic | length > 0

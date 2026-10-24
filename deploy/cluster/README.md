@@ -181,6 +181,11 @@ A deploy rolls each service job one instance at a time, under a health check.
   - The rules of each service are in [Readiness](../../docs/observability.md#readiness).
 - The role waits for the Nomad deployment of each job and requires `successful`. A deployment that Nomad marks `failed` fails the play at that job. The next job is not touched.
 - A system job (the Aeron drivers) has no deployment. The role waits for its allocations instead.
+- The first job of each deploy is `data-dirs`, a sysbatch job on every node of every pool. It makes each data directory of `node_data_dirs` in `ansible/group_vars/all.yml` and sets its mode (`0777`). The role waits until each allocation is complete, and registers no other job before.
+  - The common role makes the same directories when it provisions a node. The job gives a node that existed before a service the directory of that service.
+  - Without the directory, Docker makes the bind-mount source as `root` with mode `0755`, and a service that runs as uid 10001 cannot write to it.
+  - A new data directory goes into `node_data_dirs` only.
+- The role waits for every job except `cluster-backup`. The transaction canary is the last job: an unhealthy canary fails the deploy.
 
 The `update` stanza of each job:
 
@@ -667,6 +672,7 @@ deploy/cluster/
     node.Dockerfile         systemd + Docker-in-Docker node container (local profile)
     helios/Dockerfile       the L1 light client, from the pinned helios release
   nomad/
+    data-dirs.sysbatch.nomad.hcl  the data directories of the services, on every node
     aeron.system.nomad.hcl  ArchivingMediaDriver (driver + archive)
     cluster.nomad.hcl       3-member Aeron Cluster (Raft) sealer
     anvil.nomad.hcl         in-cluster L1 for the smoke test, the follower and the batcher
