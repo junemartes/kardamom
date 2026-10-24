@@ -16,6 +16,16 @@ declare_channel_handles! {
         pub fn publish(&self, env: &TxEnvelope) -> Result<BPosition, LogError> {
             self.inner.publish(env)
         }
+
+        /// [`Self::publish`] for an async caller: the task awaits the ack
+        /// and blocks no thread (see `PubHandle::publish_async`).
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the underlying Aeron offer fails or times out.
+        pub async fn publish_async(&self, env: &TxEnvelope) -> Result<BPosition, LogError> {
+            self.inner.publish_async(env).await
+        }
     }
     /// Per-shard `TxData` subscriber. Yields `(TxDataLoc, TxEnvelope)`: the
     /// envelope paired with its publisher `session_id` and `BPosition`, so

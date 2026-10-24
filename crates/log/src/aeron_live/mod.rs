@@ -84,9 +84,9 @@ pub use handles::simple::{
     ExecTxsPublisherHandle, ExecTxsSubscriberHandle, FsyncWatermarkPublisherHandle,
     FsyncWatermarkSubscriberHandle, L1BlocksPublisherHandle, L1BlocksSubscriberHandle,
     ServiceEventsPublisherHandle, ServiceEventsSubscriberHandle, TxDepositsPublisherHandle,
-    TxDepositsSubscriberHandle, TxErrorsPublisherHandle, TxErrorsSubscriberHandle,
-    TxRemoteEpochsPublisherHandle, TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle,
-    TxStatusSubscriberHandle,
+    TxDepositsSubscriberHandle, TxDropsPublisherHandle, TxDropsSubscriberHandle,
+    TxErrorsPublisherHandle, TxErrorsSubscriberHandle, TxRemoteEpochsPublisherHandle,
+    TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle, TxStatusSubscriberHandle,
 };
 pub use handles::tx_data::{TxDataPublisherHandle, TxDataSubscriberHandle};
 pub use handles::tx_receipts::{

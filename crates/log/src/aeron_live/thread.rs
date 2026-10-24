@@ -10,7 +10,7 @@ use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, TryRecvError};
+use crossbeam_channel::{Receiver as CbReceiver, TryRecvError};
 use tracing::warn;
 
 use super::add_wait::{AddWait, PubAdd, SubAdd};
@@ -19,7 +19,7 @@ use super::destination::Destination;
 use super::idle::{IdleBackoff, IdleCap};
 use super::image_log::ImageHandlers;
 use super::meter::{Backlog, ThreadMeter};
-use super::pending::{PendingPublish, PubEntry, drain_pending};
+use super::pending::{PendingPublish, PubEntry, PublishAck, drain_pending};
 use super::runtime::{OpenedPub, RuntimeCmd};
 use super::table_pub::TablePub;
 use super::{ADD_PUB_TIMEOUT, ADD_SUB_TIMEOUT, AeronClient, FrameSink, Header, RawFrame, Sub};
@@ -380,7 +380,7 @@ impl AeronThread {
         &mut self,
         pub_id: u32,
         bytes: rkyv::util::AlignedVec,
-        ack: Option<CbSender<Result<BPosition, LogError>>>,
+        ack: Option<PublishAck>,
     ) {
         self.pending.push_back(PendingPublish {
             stream_id: self.pub_entry(pub_id).map(|e| e.stream_id),

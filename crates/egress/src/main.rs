@@ -3,7 +3,9 @@
 //! it on disk, publishes it live on `egress_order`, and answers the range
 //! reads of the readers that resume. It merges the receipts of every
 //! executor too, publishes them on `egress_receipts`, and answers
-//! `eth_getTransactionReceipt`. See the library docs.
+//! `eth_getTransactionReceipt`. It keeps the drops that the sequencers
+//! report on `tx_drops`, and answers `kardamom_getTransactionStatus`. See
+//! the library docs.
 
 use std::net::SocketAddr;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -13,12 +15,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_egress::catchup::CatchUp;
+use kardamom_egress::drops::Drops;
 use kardamom_egress::http::Http;
 use kardamom_egress::merge::{Head, Merge, MergeConfig};
 use kardamom_egress::owner::{FramePublisher, Input, Join, Owner, OwnerConfig, Parts};
 use kardamom_egress::receipts::Receipts;
 use kardamom_egress::store::Store;
-use kardamom_log::aeron_live::{AeronRuntime, PubHandle};
+use kardamom_log::aeron_live::{AeronRuntime, PubHandle, TxDropsSubscriberHandle};
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::bin::wait_for_shutdown;
@@ -76,6 +79,10 @@ struct Args {
     /// `eth_getTransactionReceipt`.
     #[arg(long, env = "KARDAMOM_EGRESS_RECEIPTS", default_value = "1000000")]
     receipts: NonZeroUsize,
+    /// The newest drops of the sequencers that the egress keeps for
+    /// `kardamom_getTransactionStatus`.
+    #[arg(long, env = "KARDAMOM_EGRESS_DROPS", default_value = "1000000")]
+    drops: NonZeroUsize,
     /// The executor replicas whose `tx_receipts` endpoints to attach under
     /// MDS. Falls back to `channels.tx_receipts_executor_count`.
     #[arg(long, env = "KARDAMOM_EXECUTOR_COUNT")]
@@ -169,6 +176,7 @@ async fn main() -> Result<()> {
         .egress_receipts_publisher(&rt)
         .await
         .context("open egress_receipts")?;
+    let drops = plane.tx_drops_subscriber(&rt).context("open tx_drops")?;
 
     let store = Store::open(&args.dir, args.segment_blocks, GENESIS).context("open the store")?;
     tracing::info!(head = ?store.head(), dir = %args.dir.display(), "egress: store open");
@@ -200,6 +208,7 @@ async fn main() -> Result<()> {
             merge,
             store,
             receipts: Receipts::new(args.receipts),
+            drops: Drops::new(args.drops),
             live: Live::order(live),
             receipts_live: Live::receipts(receipts_live),
         },
@@ -219,6 +228,12 @@ async fn main() -> Result<()> {
         .name("egress-receipts".into())
         .spawn(move || forward_receipts(receipt_frames, &forward, &handle))
         .context("spawn the receipts thread")?;
+    let forward = inputs.clone();
+    let handle = tokio::runtime::Handle::current();
+    std::thread::Builder::new()
+        .name("egress-drops".into())
+        .spawn(move || forward_drops(drops, &forward, &handle))
+        .context("spawn the drops thread")?;
 
     if let Some(task) = catch_up {
         tokio::spawn(task.run());
@@ -264,6 +279,17 @@ fn forward_receipts(
 ) {
     let _ = std::iter::from_fn(|| handle.block_on(frames.recv_frame()))
         .try_for_each(|(_, frame)| inputs.send(Input::Receipts(frame)));
+}
+
+/// Put each drop of the sequencers on the owner's queue, until the
+/// subscription closes or the owner is gone.
+fn forward_drops(
+    mut drops: TxDropsSubscriberHandle,
+    inputs: &crossbeam_channel::Sender<Input>,
+    handle: &tokio::runtime::Handle,
+) {
+    let _ = std::iter::from_fn(|| handle.block_on(drops.recv()))
+        .try_for_each(|(_, drop)| inputs.send(Input::Drop(drop)));
 }
 
 /// End the Aeron runtime: the subscription closes, so the frames thread

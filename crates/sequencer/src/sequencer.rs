@@ -55,7 +55,7 @@ use kardamom_cluster_adapter::wire::{GuardHeader, position_deadline};
 use kardamom_log::aeron_live::{IdleBackoff, IdleCap};
 use kardamom_types::num::usize_to_u64;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
-use kardamom_types::{BPosition, TxError, TxErrorReason, TxStatus};
+use kardamom_types::{BPosition, DropReason, TxDrop, TxError, TxErrorReason, TxStatus};
 use tracing::{trace, warn};
 
 use crate::config::{ConfigError, SequencerConfig};
@@ -366,9 +366,10 @@ impl Sequencer {
         rc.publish_error(err);
     }
 
-    /// Publish a rejection on both side channels: the `tx_errors` event
-    /// for the receipt feed, and the `Rejected` status for the status
-    /// feed. Silent for a sender in shadow mode, like `publish_error`.
+    /// Publish a rejection on every side channel: the `tx_errors` event
+    /// for the receipt feed, the `Rejected` status for the status feed, and
+    /// the drop for the egress. Silent for a sender in shadow mode, like
+    /// `publish_error`.
     fn publish_rejection<R>(&self, rc: &mut R, tx_hash: B256, err: TxError)
     where
         R: SideChannelPublisher,
@@ -377,7 +378,32 @@ impl Sequencer {
             return;
         }
         rc.publish_status(TxStatus::rejected(tx_hash, &err));
+        rc.publish_drop(TxDrop {
+            tx_hash,
+            sender: err.sender,
+            nonce: err.nonce,
+            reason: err.reason.drop_reason(),
+        });
         rc.publish_error(err);
+    }
+
+    /// Publish only the drop of a transaction whose nonce a receipt already
+    /// proves executed. The client gets no error: a transaction at the nonce
+    /// succeeded, and its receipt wins over the drop at the egress. Silent
+    /// for a sender in shadow mode, like `publish_error`.
+    fn publish_proven_drop<R>(&self, rc: &mut R, observed: Observed)
+    where
+        R: SideChannelPublisher,
+    {
+        if self.in_shadow(observed.sender) {
+            return;
+        }
+        rc.publish_drop(TxDrop {
+            tx_hash: observed.tx_hash,
+            sender: observed.sender,
+            nonce: observed.nonce,
+            reason: DropReason::NonceTooLow,
+        });
     }
 
     /// End shadow mode when the warm-up has passed. After the warm-up,
@@ -617,7 +643,8 @@ impl Sequencer {
         let Some(mut r) = self.resync.take() else {
             return;
         };
-        let lookups = self.apply_receipt_drain(&mut r);
+        let (_, _, rc) = ports.split();
+        let lookups = self.apply_receipt_drain(&mut r, rc);
         // The refusals go before the contiguity rejects, so a refused ref
         // and the rejects of the later refs settle in one iteration. The
         // two arrive on different channels, so the order is not certain,
@@ -1006,9 +1033,7 @@ impl Sequencer {
     }
 
     /// One process action, for [`Self::collect_publishes`]'s loop: a
-    /// publish appends to `publishes`; a non-proven duplicate reports on
-    /// `rc`. A receipt-proven skip is suppressed: the client's
-    /// transaction already executed, so there is nothing to report.
+    /// publish appends to `publishes`; a duplicate reports on `rc`.
     fn collect_one_action<R>(
         &self,
         rc: &mut R,
@@ -1025,25 +1050,22 @@ impl Sequencer {
             ProcessAction::ReportDuplicate {
                 nonce: n,
                 expected_nonce,
-            } => self.report_duplicate_if_unproven(rc, observed, n, expected_nonce),
+            } => self.report_duplicate(rc, observed, n, expected_nonce),
         }
     }
 
-    /// Report a duplicate submission on `rc`, unless a receipt already
-    /// proves this sender and nonce executed. A proven duplicate is
-    /// routine and stays silent. `nonce` is the duplicate's nonce, which
-    /// the state machine reports; `observed` names the transaction.
-    fn report_duplicate_if_unproven<R>(
-        &self,
-        rc: &mut R,
-        observed: Observed,
-        nonce: u64,
-        expected_nonce: u64,
-    ) where
+    /// Report a duplicate submission on `rc`. When a receipt already proves
+    /// this sender and nonce executed, the duplicate is routine: only the
+    /// drop goes out, and the client gets no error. `nonce` is the
+    /// duplicate's nonce, which the state machine reports; `observed`
+    /// names the transaction.
+    fn report_duplicate<R>(&self, rc: &mut R, observed: Observed, nonce: u64, expected_nonce: u64)
+    where
         R: SideChannelPublisher,
     {
         let sender = observed.sender;
         if self.proven_executed(sender, nonce) {
+            self.publish_proven_drop(rc, Observed { nonce, ..observed });
             return;
         }
         self.publish_rejection(

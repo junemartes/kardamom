@@ -53,7 +53,7 @@ record RetainedCopy(List<URI> peers, SegmentDir into, RetainedToken token, int m
      * whether a peer did.
      */
     boolean run(final byte[] snapshot) {
-        if (ByteBuffer.wrap(snapshot).getInt(VERSION_OFFSET) != CanonicalSealerState.RETAINED_FILE_SNAPSHOT_VERSION) {
+        if (!CanonicalSealerState.holdsRetainedFile(ByteBuffer.wrap(snapshot).getInt(VERSION_OFFSET))) {
             System.out.println("cluster SEED retained-copy FAILED memberId=" + memberId
                 + " — the backed-up snapshot holds no retained file");
             return false;

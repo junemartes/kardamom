@@ -6,13 +6,14 @@ use std::num::NonZeroU32;
 use super::{StreamKey, StreamPlane};
 use crate::aeron_live::{
     AeronRuntime, TxDataPublisherHandle, TxDataSubscriberHandle, TxDataSubscription,
-    TxReceiptsBoundarySubscriberHandle, TxReceiptsPublisherHandle, TxReceiptsSubscriberHandle,
-    TxStatusSubscriberHandle, TxVerdictsPublisherHandle,
+    TxDropsPublisherHandle, TxDropsSubscriberHandle, TxReceiptsBoundarySubscriberHandle,
+    TxReceiptsPublisherHandle, TxReceiptsSubscriberHandle, TxStatusSubscriberHandle,
+    TxVerdictsPublisherHandle,
 };
 use crate::aeron_live::{PubHandle, TypedSubscription};
 use crate::discovery::record::Topic;
 use crate::error::LogError;
-use kardamom_types::{BalFrame, TxStatus};
+use kardamom_types::{BalFrame, TxDrop, TxStatus};
 
 impl StreamPlane {
     /// The `tx_bal` publisher, as the raw handle the executor's BAL
@@ -324,6 +325,56 @@ impl StreamPlane {
             Some(d) => d.open_subscription(rt, key)?,
         };
         Ok(TxStatusSubscriberHandle::from_subscription(rx))
+    }
+
+    /// The `tx_drops` publisher of a sequencer of `lane`. Discovered: a
+    /// dynamic MDC publication registered with its lane id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publication fails to open or register.
+    pub async fn tx_drops_publisher(
+        &mut self,
+        rt: &AeronRuntime,
+        lane: u8,
+    ) -> Result<TxDropsPublisherHandle, LogError> {
+        let key = self.tx_drops_key(Some(lane));
+        let inner = match &mut self.discovered {
+            None => rt.open_publication(&self.channels.tx_drops_channel, key.stream_id)?,
+            Some(d) => d.open_publication(rt, key).await?,
+        };
+        Ok(TxDropsPublisherHandle::from_publication(inner))
+    }
+
+    /// The `tx_drops` subscriber of the egress: the drops of every lane.
+    /// Discovered: one subscription that the reconcile task fills with the
+    /// sequencers of every lane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription fails to open.
+    pub fn tx_drops_subscriber(
+        &mut self,
+        rt: &AeronRuntime,
+    ) -> Result<TxDropsSubscriberHandle, LogError> {
+        let key = self.tx_drops_key(None);
+        let rx = match &mut self.discovered {
+            None => {
+                rt.open_subscription::<TxDrop>(&self.channels.tx_drops_channel, key.stream_id)?
+            }
+            Some(d) => d.open_subscription(rt, key)?,
+        };
+        Ok(TxDropsSubscriberHandle::from_subscription(rx))
+    }
+
+    /// The `tx_drops` key. A publisher names its lane; the subscriber names
+    /// none, so its filter matches the publishers of every lane.
+    fn tx_drops_key(&self, lane: Option<u8>) -> StreamKey {
+        StreamKey {
+            topic: Topic::TxDrops,
+            stream_id: self.channels.tx_drops_stream_id,
+            lane,
+        }
     }
 
     fn tx_verdicts_key(&self, ingress_id: u8) -> StreamKey {

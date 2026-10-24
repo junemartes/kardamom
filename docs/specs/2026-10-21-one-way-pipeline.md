@@ -333,10 +333,20 @@ is the current state, and the difference is a follow-up.
 | `exec_frames` | 1008 | each executor with `--exec-frames` | `[seq:u64][frame]` for each canonical frame |
 | `egress_order` | 1009 | each egress | the merged canonical frames |
 | `egress_receipts` | 1011 | each egress | the merged receipts, their account rows and the rollbacks |
+| `tx_drops` | 1012 | each sequencer, with the lane id in its discovery record | one 72-byte rkyv `TxDrop` for each drop: the hash, the sender, the nonce and the reason |
 
 - An executor sends best effort. It does not wait for the egress. A full publication drops the
   frame and counts `kardamom_executor_egress_frames_dropped_total`.
 - The sequence counts the dropped frames too. So the egress sees a gap in a copy.
+- A sequencer sends each drop best effort. Every rejection on `tx_errors` that names a hash also
+  goes on `tx_drops`. A buffered entry below a receipt floor, and a duplicate that a receipt
+  proves, go only on `tx_drops`, as `nonce too low`: the client gets no error for them.
+- The reason of a drop maps from the rejection: `DuplicatedTx` and `SealerNonceAhead` are
+  `nonce too low`; `AlreadyKnown` and `NonceInFlight` are `replacement transaction underpriced`;
+  `Evicted`, `DaLag` and `RecordLag` are `txpool is full`; `Expired` and `PastDeadline` are
+  `transaction expired`; `FeeTooLow` is `max fee per gas less than block base fee`;
+  `InsufficientFunds` is `insufficient funds for gas * price + value`; `FeeInvalid` is
+  `max priority fee per gas higher than max fee per gas`, the seventh text of geth.
 
 ### 10.2 The merge and the compare
 
@@ -371,7 +381,13 @@ The listener binds `--bind` (default `127.0.0.1:8548`).
   with the floor in the headers `x-egress-floor-*`.
 - `POST /` with `eth_getTransactionReceipt` answers in the format of the state query of an
   executor: the rkyv bytes of the receipt as `0x` hex, and the header `x-state-block`. The egress
-  keeps the newest `--receipts` receipts for this call.
+  keeps the newest `--receipts` receipts for this call. A dropped hash answers `null`.
+- `POST /` with `kardamom_getTransactionStatus` answers the status of one hash:
+  `{"status":"executed"}` when the egress holds the receipt, `{"status":"dropped","reason":...,
+  "sender":...,"nonce":...}` when a sequencer dropped it, and `{"status":"unknown"}` otherwise.
+  The egress keeps the newest `--drops` drops. It keeps the first report of a hash, so the drops
+  of the two twins are one status. A receipt wins: a receipt forgets the drop of its hash, and a
+  drop of a hash with a receipt changes nothing.
 - `GET /health` answers `200 ok`.
 - The metrics listener binds `--metrics-addr` (default `127.0.0.1:9013`).
 
@@ -395,4 +411,7 @@ Each switch is off by default. Without it, the reader keeps its old source.
   `tx_receipts` of the executors. The webhooks and `kardamom_subscribeTxStatus` stay in
   `crates/notifier`. The move into the egress process is a follow-up.
 - **The prune** keeps a fixed number of blocks (section 10.3).
+- **No drops on `egress_receipts`.** Its frames are receipt batches and rollbacks, told apart by
+  length, so a drop has no clean place there. The WebSocket status feed and the webhooks do not
+  show a drop yet. The ingress does not forward `kardamom_getTransactionStatus` yet.
 - **The deploy** of the egress and the switches of the readers come with P7c.

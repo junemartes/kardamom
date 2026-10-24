@@ -439,6 +439,13 @@ pub struct ChannelsConfig {
     pub egress_receipts_channel: ChannelUri,
     pub egress_receipts_stream_id: i32,
 
+    /// `tx_drops`: the transactions that the sequencers dropped, one small
+    /// `TxDrop` record each. Each sequencer publishes the drops of its
+    /// lane, and the egress reads every lane. RAM only, not recorded: a
+    /// client signal, not canonical state.
+    pub tx_drops_channel: ChannelUri,
+    pub tx_drops_stream_id: i32,
+
     /// `l1_blocks`: the L1 follower publishes one `L1Block` for each
     /// finalized L1 block, in block order. Every follower instance
     /// publishes every block; a consumer keeps the first record of each
@@ -538,7 +545,7 @@ impl ChannelsConfig {
 
     /// The id of every stream except the `tx_data` lanes, with the key
     /// that sets it.
-    fn single_stream_ids(&self) -> [(&'static str, i32); 14] {
+    fn single_stream_ids(&self) -> [(&'static str, i32); 15] {
         [
             ("tx_receipts_stream_id", self.tx_receipts_stream_id),
             (
@@ -558,6 +565,7 @@ impl ChannelsConfig {
             ("exec_frames_stream_id", self.exec_frames_stream_id),
             ("egress_order_stream_id", self.egress_order_stream_id),
             ("egress_receipts_stream_id", self.egress_receipts_stream_id),
+            ("tx_drops_stream_id", self.tx_drops_stream_id),
             ("l1_blocks_stream_id", self.l1_blocks_stream_id),
             ("fsync_watermark_stream_id", self.fsync_watermark_stream_id),
         ]
@@ -800,6 +808,10 @@ impl Default for ChannelsConfig {
             // order (1009): the other output of the egress.
             egress_receipts_channel: "aeron:ipc?alias=egress-receipts".into(),
             egress_receipts_stream_id: 1011,
+            // 1012 follows egress_receipts (1011): the drops are the other
+            // transaction status that the egress serves.
+            tx_drops_channel: "aeron:ipc?alias=tx-drops".into(),
+            tx_drops_stream_id: 1012,
             // 1020 follows the events stream (1019), the last of the
             // 1015..=1019 side-stream block.
             l1_blocks_channel: "aeron:ipc?alias=l1-blocks".into(),

@@ -47,20 +47,27 @@
 # activation of feature 4, and stays on decision version 4 while this
 # release switches to 5. So send the upgrade transaction of feature 4 only
 # after every member runs this release.
-# With kardamom.cluster.carryBytes=true, the members write v12: the state
-# of v10 without the void ledger, then the index of the retained file in
-# place of the retained frames. A release that reads only up to v11
-# refuses v12 and stops, so switch the flag on only on a new chain or at a
-# coordinated cut-over. No release wrote v12 before this layout.
+# With kardamom.cluster.carryBytes=true, the members write v17: the state
+# of v16, then the index of the retained file in place of the retained
+# frames. A member with the flag restores v17 or v12, and a member without
+# it stops on both. v12 is the older layout with a retained file: the
+# state of v10 without the void ledger, then the index. It holds no
+# decision rules, so a member that restores v12 runs decision version 3.
+# A release that reads only up to v16 refuses v17 and stops. A member
+# without the flag never writes v17, so a rolling deploy of a chain
+# without the flag is safe. On a chain with the flag, a member of an older
+# release stops on v17: a rollback after the first v17 snapshot, or a seed
+# from a peer that wrote v17.
 [format.sealer-snapshot]
 writes = 14
 reads_min = 1
-reads_max = 16
+reads_max = 17
 shared = true
-activation = { flag = "kardamom.cluster.carryBytes", writes = 12 }
+activation = { flag = "kardamom.cluster.carryBytes", writes = 17 }
 code = [
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_WRITE_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_READ_VERSION",
+    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#FILE_SNAPSHOT_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#RETAINED_FILE_SNAPSHOT_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SWITCH_SNAPSHOT_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#CARRY_SNAPSHOT_VERSION",
@@ -327,6 +334,21 @@ ServiceEvent = "rkyv size 64 align 8"
 TxStatus = "rkyv size 112 align 16"
 TxError = "rkyv size 80 align 16"
 TxEnvelope = "rkyv size 80 align 8"
+
+# Frozen layout. The drop record on the tx_drops stream: the hash, the
+# sender, the nonce and the reason of one transaction that the sequencer
+# dropped. The sequencer writes it, and the egress reads it. A reader of
+# an older build has no subscription to the stream. A reason goes only at
+# the end; a reader logs and skips a frame with a reason that it does not
+# know.
+[format.tx-drops]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = true
+code = ["crates/types/src/tx_drop.rs#pub struct TxDrop"]
+[format.tx-drops.layout]
+TxDrop = "rkyv size 72 align 8"
 
 # Frozen layout. The rollback record on the tx_receipts receipt stream: a
 # 40-byte rkyv ReceiptRollback frame (the last valid block and the identity
