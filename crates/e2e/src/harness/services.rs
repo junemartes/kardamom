@@ -280,9 +280,12 @@ pub fn spawn_da_watcher(spec: &ServiceSpec<'_>, indexer_url: &str) -> Result<Spa
     let egress_port = free_udp_port().port();
     let cfg_path = spec.write_cluster_config("da-watcher", "")?;
     let mut cmd = Command::new(bin("kardamom-da-watcher")?);
+    // The tests mine bursts of L1 blocks. At the 2 s default pace, the
+    // deposits of a burst wait too long, so the harness uses 100 ms.
     cmd.arg("--l1-blocks")
         .args(["--indexer-url", indexer_url])
         .args(["--poll-interval-secs", "1"])
+        .args(["--epoch-pace-ms", "100"])
         .arg("--config")
         .arg(&cfg_path)
         .args([

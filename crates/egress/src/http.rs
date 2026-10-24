@@ -16,7 +16,15 @@
 //! the state query of an executor does: the receipt as the `0x` hex of its
 //! rkyv bytes, or `null`, with the block of the newest receipt in the
 //! header `x-state-block`. So a client of the executor query reads the
-//! egress with no change.
+//! egress with no change. A dropped hash has no receipt, so the answer is
+//! `null`.
+//!
+//! `POST /` with the JSON-RPC call `kardamom_getTransactionStatus` answers
+//! the status of one hash:
+//! - `{"status":"executed"}` when the egress holds its receipt;
+//! - `{"status":"dropped","reason":<geth error text>,"sender":<address>,
+//!   "nonce":<quantity>}` when a sequencer dropped it and no receipt came;
+//! - `{"status":"unknown"}` otherwise.
 //!
 //! `GET /health` answers `200 ok`.
 
@@ -38,6 +46,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+use crate::drops::Status;
 use crate::merge::Head;
 use crate::owner::{Input, ReadRequest};
 use crate::ref_mark::RefMark;
@@ -110,7 +119,7 @@ impl Http {
 
 async fn respond(req: Request<Incoming>, inputs: &Sender<Input>) -> Response<Full<Bytes>> {
     if req.method() == hyper::Method::POST && req.uri().path() == "/" {
-        return receipt_call(req, inputs).await;
+        return rpc_call(req, inputs).await;
     }
     match req.uri().path() {
         "/health" => reply(StatusCode::OK, Bytes::from_static(b"ok\n")),
@@ -150,28 +159,24 @@ impl Cursor {
     }
 
     async fn read(self, inputs: &Sender<Input>) -> Response<Full<Bytes>> {
-        let (reply_tx, answer) = oneshot::channel();
-        let sent = inputs.try_send(Input::Read(ReadRequest {
-            from_index: self.from_index,
-            from_block: self.from_block,
-            limit: self.limit,
-            reply: reply_tx,
-        }));
-        let range = match (sent, answer.await) {
-            (Ok(()), Ok(Ok(range))) => range,
-            (Ok(()), Ok(Err(e))) => {
+        let read = ask_owner(inputs, |reply| {
+            Input::Read(ReadRequest {
+                from_index: self.from_index,
+                from_block: self.from_block,
+                limit: self.limit,
+                reply,
+            })
+        });
+        let range = match read.await {
+            Some(Ok(range)) => range,
+            Some(Err(e)) => {
                 tracing::error!(error = %e, "egress: a range read failed");
                 return reply(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Bytes::from(format!("{e}\n")),
                 );
             }
-            _ => {
-                return reply(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Bytes::from_static(b"the store is busy or gone\n"),
-                );
-            }
+            None => return busy(),
         };
         match range {
             Range::Frames {
@@ -192,7 +197,8 @@ impl Cursor {
 /// The largest JSON-RPC body taken.
 const MAX_CALL: usize = 64 * 1024;
 
-/// One JSON-RPC call: `eth_getTransactionReceipt` with one hash.
+/// One JSON-RPC call: `eth_getTransactionReceipt` or
+/// `kardamom_getTransactionStatus` with one hash.
 #[derive(serde::Deserialize)]
 struct Call {
     #[serde(default)]
@@ -202,7 +208,7 @@ struct Call {
     params: Vec<B256>,
 }
 
-async fn receipt_call(req: Request<Incoming>, inputs: &Sender<Input>) -> Response<Full<Bytes>> {
+async fn rpc_call(req: Request<Incoming>, inputs: &Sender<Input>) -> Response<Full<Bytes>> {
     let Ok(body) = http_body_util::Limited::new(req.into_body(), MAX_CALL)
         .collect()
         .await
@@ -214,30 +220,79 @@ async fn receipt_call(req: Request<Incoming>, inputs: &Sender<Input>) -> Respons
         Ok(call) => call,
         Err(e) => return json_error(&serde_json::Value::Null, -32700, &e.to_string()),
     };
-    let (Some(tx_hash), "eth_getTransactionReceipt") = (call.params.first(), call.method.as_str())
-    else {
-        return json_error(&call.id, -32601, "only eth_getTransactionReceipt");
-    };
+    match (call.params.first(), call.method.as_str()) {
+        (Some(tx_hash), "eth_getTransactionReceipt") => {
+            receipt_answer(&call.id, *tx_hash, inputs).await
+        }
+        (Some(tx_hash), "kardamom_getTransactionStatus") => {
+            status_answer(&call.id, *tx_hash, inputs).await
+        }
+        _ => json_error(
+            &call.id,
+            -32601,
+            "only eth_getTransactionReceipt and kardamom_getTransactionStatus",
+        ),
+    }
+}
+
+/// Ask the owner thread with `ask`, and wait for its answer. `None` when
+/// the queue is full or the owner is gone.
+async fn ask_owner<T>(
+    inputs: &Sender<Input>,
+    ask: impl FnOnce(oneshot::Sender<T>) -> Input,
+) -> Option<T> {
     let (reply_tx, answer) = oneshot::channel();
-    let asked = inputs.try_send(Input::Receipt {
-        tx_hash: *tx_hash,
-        reply: reply_tx,
-    });
-    let (Ok(()), Ok((receipt, block))) = (asked, answer.await) else {
-        return reply(
-            StatusCode::SERVICE_UNAVAILABLE,
-            Bytes::from_static(b"the store is busy or gone\n"),
-        );
+    inputs.try_send(ask(reply_tx)).ok()?;
+    answer.await.ok()
+}
+
+fn busy() -> Response<Full<Bytes>> {
+    reply(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Bytes::from_static(b"the store is busy or gone\n"),
+    )
+}
+
+async fn receipt_answer(
+    id: &serde_json::Value,
+    tx_hash: B256,
+    inputs: &Sender<Input>,
+) -> Response<Full<Bytes>> {
+    let Some((receipt, block)) = ask_owner(inputs, |reply| Input::Receipt { tx_hash, reply }).await
+    else {
+        return busy();
     };
     let result = receipt
         .and_then(|r| rkyv::to_bytes::<rkyv::rancor::Error>(&r).ok())
         .map(|bytes| format!("0x{}", alloy_primitives::hex::encode(bytes.as_slice())));
-    let body = serde_json::json!({"jsonrpc": "2.0", "id": call.id, "result": result});
+    let body = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
     let mut response = reply(StatusCode::OK, Bytes::from(body.to_string()));
     response
         .headers_mut()
         .insert("x-state-block", hyper::header::HeaderValue::from(block));
     response
+}
+
+async fn status_answer(
+    id: &serde_json::Value,
+    tx_hash: B256,
+    inputs: &Sender<Input>,
+) -> Response<Full<Bytes>> {
+    let Some(status) = ask_owner(inputs, |reply| Input::Status { tx_hash, reply }).await else {
+        return busy();
+    };
+    let result = match status {
+        Status::Executed => serde_json::json!({"status": "executed"}),
+        Status::Dropped(dropped) => serde_json::json!({
+            "status": "dropped",
+            "reason": dropped.reason.text(),
+            "sender": dropped.sender,
+            "nonce": format!("{:#x}", dropped.nonce),
+        }),
+        Status::Unknown => serde_json::json!({"status": "unknown"}),
+    };
+    let body = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
+    reply(StatusCode::OK, Bytes::from(body.to_string()))
 }
 
 fn json_error(id: &serde_json::Value, code: i32, message: &str) -> Response<Full<Bytes>> {

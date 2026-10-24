@@ -1,10 +1,14 @@
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
+use alloy_primitives::{Address, B256};
 use kardamom_cluster_adapter::wire::{encode_egress_boundary, encode_egress_record};
+use kardamom_log::aeron_live::ReceiptFrame;
+use kardamom_types::{BPosition, DropReason, Receipt, ReceiptBatch, TxDrop};
 use tokio::sync::oneshot;
 
 use super::{FramePublisher, Input, Join, JoinState, Owner, OwnerConfig, Parts, ReadRequest};
+use crate::drops::{Dropped, Drops, Status};
 use crate::merge::{Head, Key, Merge, MergeConfig};
 use crate::receipts::Receipts;
 use crate::ref_mark::RefMark;
@@ -55,6 +59,7 @@ fn owner_with(dir: &std::path::Path, live: Live, join: Join) -> Owner<Live> {
             merge,
             store,
             receipts: Receipts::new(NonZeroUsize::new(16).unwrap()),
+            drops: Drops::new(NonZeroUsize::new(16).unwrap()),
             live: live.clone(),
             receipts_live: live,
         },
@@ -114,6 +119,81 @@ fn the_run_ends_when_every_sender_is_gone() {
     o.run(&rx).unwrap();
     let again = Store::open(dir.path(), NonZeroU64::new(10).unwrap(), GENESIS).unwrap();
     assert_eq!(again.head().next_index, 1, "the frame is on disk");
+}
+
+/// The drop of the hash `hash`, as a sequencer reports it.
+fn drop_input(hash: u8, reason: DropReason) -> Input {
+    Input::Drop(TxDrop {
+        tx_hash: B256::with_last_byte(hash),
+        sender: Address::repeat_byte(0xA1),
+        nonce: 3,
+        reason,
+    })
+}
+
+/// The receipt batch with one receipt of the hash `hash`.
+fn receipt_input(hash: u8) -> Input {
+    Input::Receipts(ReceiptFrame::Batch(ReceiptBatch {
+        receipts: vec![Receipt {
+            tx_hash: B256::with_last_byte(hash),
+            block_number: 1,
+            tx_idx: BPosition::from_index(u64::from(hash)),
+            ..Receipt::default()
+        }],
+        accounts: Vec::new(),
+    }))
+}
+
+fn status_of(o: &mut Owner<Live>, hash: u8) -> Status {
+    let (reply, answer) = oneshot::channel();
+    o.on(Input::Status {
+        tx_hash: B256::with_last_byte(hash),
+        reply,
+    })
+    .unwrap();
+    answer.blocking_recv().unwrap()
+}
+
+fn dropped(reason: DropReason) -> Status {
+    Status::Dropped(Dropped {
+        sender: Address::repeat_byte(0xA1),
+        nonce: 3,
+        reason,
+    })
+}
+
+#[test]
+fn a_drop_that_both_twins_report_is_one_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, _published) = live();
+    let mut o = owner(dir.path(), live);
+    o.on(drop_input(1, DropReason::NonceTooLow)).unwrap();
+    o.on(drop_input(1, DropReason::ReplacementUnderpriced))
+        .unwrap();
+    assert_eq!(status_of(&mut o, 1), dropped(DropReason::NonceTooLow));
+    assert_eq!(status_of(&mut o, 2), Status::Unknown);
+}
+
+#[test]
+fn a_receipt_after_a_drop_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, _published) = live();
+    let mut o = owner(dir.path(), live);
+    o.on(drop_input(1, DropReason::TxpoolFull)).unwrap();
+    o.on(receipt_input(1)).unwrap();
+    assert_eq!(status_of(&mut o, 1), Status::Executed);
+    assert_eq!(o.parts.drops.dropped(&B256::with_last_byte(1)), None);
+}
+
+#[test]
+fn a_drop_after_the_receipt_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, _published) = live();
+    let mut o = owner(dir.path(), live);
+    o.on(receipt_input(1)).unwrap();
+    o.on(drop_input(1, DropReason::NonceTooLow)).unwrap();
+    assert_eq!(status_of(&mut o, 1), Status::Executed);
+    assert_eq!(o.parts.drops.dropped(&B256::with_last_byte(1)), None);
 }
 
 /// The distance counts the records that a copy sent above the stored head.

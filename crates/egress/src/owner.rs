@@ -1,10 +1,11 @@
 //! [`Owner`]: the one thread that owns the merge and the store.
 //!
 //! Everything that touches the stream comes to this thread on one channel:
-//! the messages and the receipts of the executors, the range reads of the
-//! readers that resume, and the receipt reads. So the merges, the store and
-//! the live publications need no lock, and a read sees the state as the
-//! thread left it after its last input.
+//! the messages and the receipts of the executors, the drops of the
+//! sequencers, the range reads of the readers that resume, and the receipt
+//! and status reads. So the merges, the store, the drops and the live
+//! publications need no lock, and a read sees the state as the thread left
+//! it after its last input.
 //!
 //! The thread appends each delivered frame to the store, then publishes it
 //! live. It forces the store to disk on a fixed period, and deletes the
@@ -34,8 +35,9 @@ use tokio::sync::oneshot;
 
 use alloy_primitives::B256;
 use kardamom_log::aeron_live::ReceiptFrame;
-use kardamom_types::Receipt;
+use kardamom_types::{Receipt, TxDrop};
 
+use crate::drops::{Drops, Status};
 use crate::merge::{Head, Merge};
 use crate::metrics;
 use crate::receipts::Receipts;
@@ -79,6 +81,13 @@ pub enum Input {
         tx_hash: B256,
         reply: oneshot::Sender<(Option<Receipt>, u64)>,
     },
+    /// One drop of a sequencer.
+    Drop(TxDrop),
+    /// A status read: the status of a hash.
+    Status {
+        tx_hash: B256,
+        reply: oneshot::Sender<Status>,
+    },
     /// Frames of a peer egress, in order, from the head of this one.
     Caught(Vec<Vec<u8>>),
     /// The floor of a peer egress, above the head of this one: no peer
@@ -115,6 +124,7 @@ pub struct Parts<P: FramePublisher> {
     pub merge: Merge,
     pub store: Store,
     pub receipts: Receipts,
+    pub drops: Drops,
     /// The live publication of the merged stream.
     pub live: P,
     /// The live publication of the merged receipts.
@@ -198,6 +208,14 @@ impl<P: FramePublisher> Owner<P> {
                 let _ = reply.send((receipts.receipt(&tx_hash).cloned(), receipts.block()));
                 Ok(())
             }
+            Input::Drop(drop) => {
+                self.take_drop(&drop);
+                Ok(())
+            }
+            Input::Status { tx_hash, reply } => {
+                let _ = reply.send(self.status(&tx_hash));
+                Ok(())
+            }
             Input::Caught(frames) => self.take_caught(&frames),
             Input::Floor { floor, mark } => self.start_at_floor(floor, mark),
             Input::GiveUp => {
@@ -212,6 +230,23 @@ impl<P: FramePublisher> Owner<P> {
                 Ok(())
             }
         }
+    }
+
+    /// Keep a drop, unless the receipt of its hash is here: a receipt wins.
+    fn take_drop(&mut self, drop: &TxDrop) {
+        if self.parts.receipts.receipt(&drop.tx_hash).is_none() {
+            self.parts.drops.take(drop);
+        }
+    }
+
+    fn status(&self, tx_hash: &B256) -> Status {
+        if self.parts.receipts.receipt(tx_hash).is_some() {
+            return Status::Executed;
+        }
+        self.parts
+            .drops
+            .dropped(tx_hash)
+            .map_or(Status::Unknown, Status::Dropped)
     }
 
     /// Merge one message of a copy. Before the join with no peer, a
@@ -303,11 +338,16 @@ impl<P: FramePublisher> Owner<P> {
         Ok(())
     }
 
-    /// Merge one receipt frame, and publish what is new in it.
+    /// Merge one receipt frame, forget the drops of its new receipts, and
+    /// publish what is new in it.
     fn take_receipts(&mut self, frame: ReceiptFrame) {
         let Some(frame) = self.parts.receipts.take(frame) else {
             return;
         };
+        if let ReceiptFrame::Batch(batch) = &frame {
+            let drops = &mut self.parts.drops;
+            batch.receipts.iter().for_each(|r| drops.forget(&r.tx_hash));
+        }
         let encoded = match &frame {
             ReceiptFrame::Batch(batch) => kardamom_log::codec::encode(batch),
             ReceiptFrame::Rollback(rollback) => kardamom_log::codec::encode(rollback),

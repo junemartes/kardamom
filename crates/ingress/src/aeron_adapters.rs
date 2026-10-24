@@ -80,17 +80,15 @@ impl IngressPublication for LiveIngressPublication {
         let pub_handle = self
             .tx_data
             .get(shard)
-            .ok_or_else(|| IngressError::Internal(format!("shard {shard} out of range")))?
-            .clone();
+            .ok_or_else(|| IngressError::Internal(format!("shard {shard} out of range")))?;
         // The stamp comes before the publish, so the egress tap and the
         // receipt pump always have it when the seal and the receipt arrive.
         self.stamps.stamp(envelope.tx_hash);
-        // The Aeron publish blocks through the runtime's command channel.
-        // This runs it off the reactor thread, so it does not stall the
-        // JSON-RPC server.
-        tokio::task::spawn_blocking(move || pub_handle.publish(&envelope))
+        // The task awaits the ack of the Aeron thread, so no thread blocks
+        // and the publish costs no hop to the blocking pool.
+        pub_handle
+            .publish_async(&envelope)
             .await
-            .map_err(|e| IngressError::internal("publish_tx_data join", e))?
             .map(|_| ())
             .map_err(|e| IngressError::internal("publish_tx_data", e))
     }

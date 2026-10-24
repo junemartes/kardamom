@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crossbeam_channel::Sender;
 
+use crate::drops::Drops;
 use crate::http::Http;
 use crate::merge::{Head, Merge, MergeConfig};
 use crate::owner::{FramePublisher, Input, Join, Owner, OwnerConfig, Parts};
@@ -78,6 +79,7 @@ impl TestEgress {
                 merge,
                 store,
                 receipts: Receipts::new(NonZeroUsize::new(16).unwrap()),
+                drops: Drops::new(NonZeroUsize::new(16).unwrap()),
                 live: NoLive,
                 receipts_live: NoLive,
             },

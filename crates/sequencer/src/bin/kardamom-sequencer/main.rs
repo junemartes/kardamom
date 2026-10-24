@@ -2,7 +2,7 @@
 //!
 //! Parses a TOML [`SequencerConfig`], opens one `tx_data` subscriber per
 //! lane it reads, the Aeron Cluster (Raft) ref publisher (`tx_ordering`),
-//! and the `tx_errors` and `tx_status` publishers. Runs the sequencer
+//! and the `tx_errors`, `tx_status` and `tx_drops` publishers. Runs the sequencer
 //! main loop on a dedicated blocking thread until SIGTERM or Ctrl-C.
 //!
 //! The lag-detection, receipt-floor, and nonce-lookup feed tasks live in
@@ -23,7 +23,7 @@ use clap::Parser;
 use feeds::{LaneSub, LaneSubscriptions, PublishLoops};
 use kardamom_cluster_adapter::LiveCluster;
 use kardamom_log::aeron_live::{
-    AeronRuntime, ServiceEventsPublisherHandle, TxDepositsSubscriberHandle,
+    AeronRuntime, ServiceEventsPublisherHandle, TxDepositsSubscriberHandle, TxDropsPublisherHandle,
     TxErrorsPublisherHandle, TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle,
 };
 use kardamom_log::config::LogConfig;
@@ -46,12 +46,14 @@ struct Handles {
     remote_epochs_sub: TxRemoteEpochsSubscriberHandle,
     errors_pub: TxErrorsPublisherHandle,
     status_pub: TxStatusPublisherHandle,
+    /// The drops of the own lane, for the status that the egress serves.
+    drops_pub: TxDropsPublisherHandle,
 }
 
 impl Handles {
     /// Open every handle this sequencer needs, for the lanes of `cfg`.
-    /// `tx_errors` and `tx_status` follow the plane's transport; the rest
-    /// still open on their static channels.
+    /// `tx_errors`, `tx_status` and `tx_drops` follow the plane's
+    /// transport; the rest still open on their static channels.
     async fn open(
         rt: &AeronRuntime,
         plane: &mut StreamPlane,
@@ -79,6 +81,10 @@ impl Handles {
                 .publisher::<TxStatusPublisherHandle>(rt)
                 .await
                 .context("open TxStatusPublisherHandle")?,
+            drops_pub: plane
+                .tx_drops_publisher(rt, cfg.lane())
+                .await
+                .context("open TxDropsPublisherHandle")?,
         })
     }
 
@@ -583,6 +589,7 @@ async fn main() -> anyhow::Result<()> {
         side: kardamom_sequencer::outbound::SideChannels::new(
             handles.errors_pub,
             handles.status_pub,
+            handles.drops_pub,
         ),
         epochs: handles.deposits_sub,
         epoch_lane: resync.epoch_lane,
