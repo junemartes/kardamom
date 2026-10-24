@@ -1,7 +1,8 @@
 //! The receipts of this shard's senders, as the publish loop drains them:
 //! the publish confirmations, the skip releases, and the executed-truth
 //! floors, and the floors that a rollback voids. Each one moves the
-//! publish ledger or the nonce floor of one sender.
+//! publish ledger or the nonce floor of one sender. A buffered entry that
+//! a floor proves executed drops, and the egress learns the drop.
 
 use std::time::Instant;
 
@@ -9,8 +10,9 @@ use alloy_primitives::Address;
 use kardamom_types::num::usize_to_u64;
 use tracing::{info, trace};
 
-use super::Sequencer;
+use super::{Observed, Sequencer};
 use crate::metrics;
+use crate::outbound::SideChannelPublisher;
 use crate::resync::ReceiptDrain;
 
 impl Sequencer {
@@ -19,16 +21,17 @@ impl Sequencer {
     /// above the receipt floor at its skip, so a raise that comes later in
     /// the stream wins. The forgotten floors go last: the drain ends at the
     /// rollback that voids them. Proven-duplicate buffered entries drop,
-    /// and newly contiguous runs surface through `drain_pending` in
-    /// `run_once`.
+    /// each with a drop on `rc`, and newly contiguous runs surface through
+    /// `drain_pending` in `run_once`.
     ///
     /// Returns the senders whose floor a new lookup must learn: each
     /// forgotten floor, and each sender whose lookup answer a rollback
     /// voided. A request carries the rollback generation of `r`, so the
     /// caller sends the requests after `r` is back in `self.resync`.
-    pub(super) fn apply_receipt_drain(
+    pub(super) fn apply_receipt_drain<R: SideChannelPublisher>(
         &mut self,
         r: &mut crate::resync::ResyncController,
+        rc: &mut R,
     ) -> Vec<Address> {
         let ReceiptDrain {
             raised,
@@ -47,7 +50,7 @@ impl Sequencer {
             self.apply_one_release(sender, chain);
         }
         for (sender, floor) in raised {
-            self.apply_one_floor_update(sender, floor);
+            self.apply_one_floor_update(rc, sender, floor);
         }
         for &sender in &forgotten {
             self.forget_one_floor(sender);
@@ -89,9 +92,15 @@ impl Sequencer {
     }
 
     /// One receipt-proven floor update, for [`Self::apply_receipt_drain`]'s
-    /// loop: advance the state machine's floor, and record the drops it
-    /// proves, if the floor actually moved.
-    fn apply_one_floor_update(&mut self, sender: Address, floor: u64) {
+    /// loop: advance the state machine's floor, and record and publish the
+    /// drops it proves, if the floor actually moved. Each dropped entry is
+    /// `nonce too low` for the egress.
+    fn apply_one_floor_update<R: SideChannelPublisher>(
+        &mut self,
+        rc: &mut R,
+        sender: Address,
+        floor: u64,
+    ) {
         self.nonce_ahead.forget(sender);
         let Some((from, dropped)) = self.state.advance_floor(sender, floor) else {
             return;
@@ -104,13 +113,21 @@ impl Sequencer {
         // computed, so the state machine's floor is always current when
         // `process` runs. A proven-stale incoming envelope takes the
         // ordinary `Past`/DuplicatedTx path below, and is counted there.
-        metrics::record_resync_skip(self.cfg.partition_index, usize_to_u64(dropped));
+        metrics::record_resync_skip(self.cfg.partition_index, usize_to_u64(dropped.len()));
         trace!(
             sender = ?sender,
             from,
             floor,
-            dropped,
+            dropped = dropped.len(),
             "resync: receipt floor advanced nonce state"
         );
+        dropped
+            .into_iter()
+            .map(|(nonce, meta)| Observed {
+                sender,
+                nonce,
+                tx_hash: meta.tx_hash,
+            })
+            .for_each(|observed| self.publish_proven_drop(rc, observed));
     }
 }
