@@ -727,13 +727,14 @@ The ingress records these names of the pipeline metrics (see "Pipeline metrics")
 | `ingress.publish_round_trip` | step | The `tx_data` publish: the hop to the blocking pool and the round trip to the Aeron thread up to its ack. |
 | `ingress.recover_batch` | step | The recovery of one verifier batch on the blocking pool, up to the end of its last worker. |
 | `ingress.recover_batch` | batch | The requests in each verifier batch. |
-| `ingress.recover_intake` | queue | The requests that wait in the verifier intake after the flush task takes a batch. The intake holds four times the batch depth; a full intake makes a submit wait. |
+| `ingress.recover_intake` | queue | The requests that queued in the verifier intake while the batch before ran, read when the flush task comes back for the next batch. The intake holds four times the batch depth; a full intake makes a submit wait. |
+| `ingress.recover_wait` | step | The wait of each request from its submit to the take of its batch: the flush window plus the time behind the batch before it. |
 | `ingress.ack_waiters` | queue | The submissions that wait for the verdict of the sequencer (ack at admission). The shed check counts them with `kardamom_ingress_queue_depth`. |
 | `ingress.watermark` | loop | The cluster egress thread. Idle while it waits for an egress event (the receive and the decode), busy while it handles the event. |
 | `ingress.receipt_pump` | loop | The `tx_receipts` pump task. Idle while it waits for a frame, busy while it applies the rows and fans out the receipts. |
 | `ingress.receipt_batch` | batch | The receipts in each `tx_receipts` batch frame. A boundary-only frame adds no sample. |
 
-- A high `ingress.recover` with a low `ingress.recover_batch` step means that submits wait for the intake or the batch window, not for the recovery.
+- A high `ingress.recover` with a low `ingress.recover_batch` step means that submits wait for the intake or the batch window, not for the recovery. `ingress.recover_wait` shows that wait directly.
 - A busy share of `ingress.watermark` near 1 means that the egress frames queue in the cluster client before the thread reads them.
 
 ### Aeron thread

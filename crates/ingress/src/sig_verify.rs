@@ -53,6 +53,8 @@ struct VerifyRequest {
     env: TxEnvelope,
     raw_tx: Bytes,
     respond: oneshot::Sender<Result<(Address, B256), IngressError>>,
+    /// When the caller submitted it, for the wait before its batch.
+    queued: Instant,
 }
 
 impl VerifyRequest {
@@ -104,12 +106,13 @@ impl RequestCursor {
 /// caller rejects the tx at the RPC boundary.
 ///
 /// A batch smaller than this threshold is recovered on a single blocking
-/// thread. Each extra worker costs a wake of a pool thread, and on a
-/// shared 4-vCPU node a wake costs about as much as several recoveries.
-/// 16 recoveries are about 0.7 ms of work, enough to pay for the wakes. At deployed rates, the ring almost always
-/// holds one transaction (a 50µs window at 3.8k tx/s sees 0.2 arrivals on
-/// average), so this is the common path.
-const PARALLEL_THRESHOLD: usize = 16;
+/// thread. Each extra worker costs a wake of a pool thread. On a shared
+/// 4-vCPU node under load, one recovery costs 76-120 µs and the fixed cost
+/// of a batch is 0.17-0.30 ms, so 4 recoveries (0.3-0.5 ms of work) pay
+/// for the second wake. A load that sends in bursts makes batches of about
+/// 10 at 1700 tx/s; below this threshold each of them would run one
+/// recovery after the other.
+const PARALLEL_THRESHOLD: usize = 4;
 
 /// Intake capacity, as a multiple of the ring depth. A full intake
 /// makes `recover` wait, so overload turns into backpressure on the RPC
@@ -144,8 +147,10 @@ struct FlushMeters {
     /// The recovery of one batch on the blocking pool, from the hop to the
     /// end of its last worker.
     recover: Step,
-    /// The requests that wait in the intake after a batch is taken.
+    /// The requests that queued in the intake while the batch before ran.
     intake: Queue,
+    /// The wait of each request from its submit to the take of its batch.
+    wait: Step,
 }
 
 impl FlushMeters {
@@ -154,6 +159,7 @@ impl FlushMeters {
             batch: Batch::new("ingress.recover_batch"),
             recover: Step::new("ingress.recover_batch"),
             intake: Queue::new("ingress.recover_intake"),
+            wait: Step::new("ingress.recover_wait"),
         }
     }
 }
@@ -193,13 +199,16 @@ impl FlushLoop {
     async fn run_one_batch(&mut self) -> ControlFlow<()> {
         let depth = self.depth.get();
         let mut buf = Vec::with_capacity(depth);
+        self.meters.intake.set(self.rx.len());
         if self.rx.recv_many(&mut buf, depth).await == 0 {
             return ControlFlow::Break(());
         }
         if buf.len() < depth {
             self.fill_until_deadline(&mut buf).await;
         }
-        self.meters.intake.set(self.rx.len());
+        for req in &buf {
+            self.meters.wait.since(req.queued);
+        }
         self.meters.batch.record(buf.len());
         let started = Instant::now();
         self.process_batch(buf).await;
@@ -337,6 +346,7 @@ impl BatchVerifier {
                 env,
                 raw_tx,
                 respond: tx,
+                queued: Instant::now(),
             })
             .await
             .map_err(|_| IngressError::Internal("verifier dropped".into()))?;
