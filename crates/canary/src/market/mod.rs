@@ -109,9 +109,8 @@ pub struct MarketTask {
     state: Market,
     /// The pool's reserves and sequence after the last canary call.
     last: Option<(Reserves, U256)>,
-    /// The tokens that the last swap bought with ETH: the next swap sells
-    /// them back. `None`: the next swap buys tokens with ETH.
-    bought: Option<U256>,
+    /// The tokens that the last swap bought: the next swap sells them.
+    bought: pool::Bought,
     turn: usize,
 }
 
@@ -127,7 +126,7 @@ impl MarketTask {
             ctx,
             state,
             last: None,
-            bought: None,
+            bought: pool::Bought::default(),
             turn: 0,
         })
     }

@@ -1,6 +1,10 @@
 //! `swap` and `liquidity`. A swap alternates direction: 0.00001 ETH in,
 //! then the tokens that swap bought back for ETH. The swapper's token
 //! balance stays level, and the fee of each swap comes out of its ETH.
+//! A sell spends the bought amount before it sends. A sell that fails,
+//! or a receipt that times out, gives a buy next, so the stash never
+//! shrinks. The bought amount is in memory only: a restart between a
+//! buy and its sell leaves the tokens of that buy in the stash.
 //! Each result is checked against the formula from the reserves the
 //! pool's event reports before the call; the product of the reserves
 //! must not fall; the pool's ETH balance must hold its ETH reserve. A
@@ -22,11 +26,42 @@ const SWAP_WEI: u64 = 10_000_000_000_000;
 /// The ETH a `liquidity` run adds: 0.0001 ETH.
 const LIQUIDITY_WEI: u64 = 100_000_000_000_000;
 
+/// The direction of a swap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    /// Buy tokens with `SWAP_WEI` of ETH.
+    Buy,
+    /// Sell this non-zero token amount for ETH.
+    Sell(U256),
+}
+
+/// The tokens that the last swap bought with ETH, and not sold yet.
+/// The amount is never zero.
+#[derive(Debug, Default)]
+pub(super) struct Bought(Option<U256>);
+
+impl Bought {
+    /// The side of the next swap: a sell of the bought tokens, else a
+    /// buy. A sell spends the amount, so a sell that fails gives a buy
+    /// next.
+    fn next_swap(&mut self) -> Side {
+        self.0.take().map_or(Side::Buy, Side::Sell)
+    }
+
+    /// Note a landed swap: a buy of a non-zero amount gives a sell next.
+    fn note_swap(&mut self, event: &SwapEvent) {
+        self.0 = event
+            .eth_in
+            .then_some(event.amount_out)
+            .filter(|tokens| !tokens.is_zero());
+    }
+}
+
 impl MarketTask {
     pub(super) async fn swap(&mut self, rpc: &Rpc, pool: Pool) -> Result<(), Outcome> {
-        let (value, input) = match self.bought {
-            None => (U256::from(SWAP_WEI), Pool::swap_eth_for_token()),
-            Some(tokens) => (U256::ZERO, Pool::swap_token_for_eth(tokens)),
+        let (value, input) = match self.bought.next_swap() {
+            Side::Buy => (U256::from(SWAP_WEI), Pool::swap_eth_for_token()),
+            Side::Sell(tokens) => (U256::ZERO, Pool::swap_token_for_eth(tokens)),
         };
         let call = Call::new(TxKind::Call(pool.0), value, input, CALL_GAS);
         let done = self.send(rpc, SWAPPER, call).await?;
@@ -34,7 +69,7 @@ impl MarketTask {
             .swap_in(&done.landed.receipt)
             .ok_or(Outcome::SwapMismatch)?;
         self.observe(event.before, event.after, event.seq);
-        self.bought = event.eth_in.then_some(event.amount_out);
+        self.bought.note_swap(&event);
         event.check()?;
         self.balance_holds(rpc, pool, event.after).await
     }
@@ -163,3 +198,7 @@ impl MarketTask {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "pool_tests.rs"]
+mod tests;
