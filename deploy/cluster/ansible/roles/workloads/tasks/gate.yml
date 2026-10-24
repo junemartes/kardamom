@@ -476,7 +476,10 @@
            | selectattr('manifest.cluster', 'defined')
            | selectattr('manifest.cluster', 'equalto', workloads_gate_sealer_image)
            | rejectattr('revision', 'in', ['', 'unknown']) | map(attribute='revision') | list)
-          + ([workloads_target_revision] if workloads_gate_sealer_image == '' or workloads_gate_sealer_registered | unique | list == [workloads_gate_sealer_image] else [])
+          + ([workloads_target_revision]
+             if workloads_gate_sealer_image == ''
+                or workloads_gate_sealer_registered | unique | list == [workloads_gate_sealer_image]
+             else [])
           + (workloads_gate_sealer_tag | regex_findall('^main-([0-9a-f]{12})$'))
           + (workloads_gate_sealer_tag | regex_findall('^v[0-9]+\.[0-9]+\.[0-9]+$'))
           + ([workloads_revision] if workloads_revision | length > 0 else [])
