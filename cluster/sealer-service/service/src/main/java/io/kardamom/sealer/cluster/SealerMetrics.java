@@ -307,7 +307,7 @@ final class SealerMetrics {
             .single("kardamom_sealer_feature_unsupported_total", "counter",
                 "The activations of the carry window on a member with the retained file.", featureUnsupported.get())
             .single("kardamom_sealer_feed_state", "gauge",
-                "The state of the member feed: 0 off, 1 idle, 2 walking, 3 live, 4 gapped.", feed.ordinal());
+                "The state of the member feed: 0 off, 1 idle, 2 walking, 3 live, 4 gapped.", feed.value());
         text.family("kardamom_sealer_feature_state", "gauge",
             "The state of each feature: 0 no activation held, 1 held and off, 2 on.");
         now.features().forEach(f -> text.sample("kardamom_sealer_feature_state", featureLabel(f), f.state()));

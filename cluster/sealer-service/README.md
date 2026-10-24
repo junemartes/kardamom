@@ -544,8 +544,8 @@ The feed runs on a heap member and on a member with `carryBytes`. It is local to
 - The walk holds a walk key: the file position on the retained file, and the frame number on the heap. The frame number counts the frames that the store appended since the member started. The front is the appended count minus the frame count. An eviction and a growth of the heap rings keep the number of each frame, and the walk wraps its view again at each step. The walk allocates nothing.
 - The answer below the egress floor is `REPLAY_UNAVAILABLE` with the floors. On the heap, the window holds every frame from the floor.
 - The gap rule:
-  - A live frame that does not fit the ring ends the answer with `FEED_GAP`. A full ring during a walk only pauses the walk.
-  - When the window evicts past the walk key, the frames from the key are gone, and the answer ends with `FEED_GAP`.
+  - A live frame that does not fit the ring ends the answer with a gap (`FEED_GAP`). A full ring during a walk only pauses the walk.
+  - When the window evicts past the walk key, the frames from the key are gone, and the answer ends with a gap (`FEED_GAP`).
   - `FEED_GAP` names the cursor after the last frame that the answer carried. The member then writes nothing until the next request.
   - The executor asks again from its cursor. A cursor below the floor gets `REPLAY_UNAVAILABLE`, and the executor reads the missing frames from another source. A cursor inside the window gets the frames from it.
 - A lost subscriber ends the answer. The feeder drops the unsent frames.

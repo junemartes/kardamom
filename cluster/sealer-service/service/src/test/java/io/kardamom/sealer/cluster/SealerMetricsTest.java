@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.aeron.Publication;
 import io.kardamom.sealer.cluster.ClusterStubs.StubSession;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
@@ -14,6 +15,16 @@ import org.junit.jupiter.api.Test;
 class SealerMetricsTest {
 
     private final SealerMetrics metrics = new SealerMetrics();
+
+    @Test
+    void each_feed_state_has_its_fixed_gauge_value() {
+        final List<FeedState> states =
+            List.of(FeedState.OFF, FeedState.IDLE, FeedState.WALKING, FeedState.LIVE, FeedState.GAPPED);
+        IntStream.range(0, states.size()).forEach(i -> {
+            metrics.feed(states.get(i));
+            assertEquals(i, value(render(), "kardamom_sealer_feed_state", ""), states.get(i).label());
+        });
+    }
 
     private String render() {
         final MetricsText text = new MetricsText(1);
