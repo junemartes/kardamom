@@ -57,6 +57,35 @@
       Each egress switch is on, off or empty: {{ workloads_switches }}.
       A reader switch ({{ workloads_readers_on }}) needs KARDAMOM_EGRESS=1, and the egress needs KARDAMOM_EXEC_FRAMES=on.
 
+# With the switch on, the notifier places one instance on each notifier
+# node (distinct_hosts). An instance without a node is never placed, and
+# the deployment never turns healthy. The filter matches the exact role
+# in the comma-separated role set, as set_contains does. An empty count
+# is the job's default, 1.
+- name: Read the ready notifier nodes
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/nodes?filter={{ workloads_notifier_node_filter | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  vars:
+    workloads_notifier_node_filter: >-
+      Meta.roles matches "(^|,) *notifier *(,|$)" and Status == "ready" and SchedulingEligibility == "eligible"
+  register: workloads_notifier_node_list
+  check_mode: false
+  when: workloads_notifier_nodes == 'on'
+
+- name: Require a notifier node for each notifier instance
+  vars:
+    workloads_notifier_instances: "{{ workloads_notifier_count | default('1', true) | int }}"
+    workloads_notifier_ready: "{{ workloads_notifier_node_list.json | map(attribute='Name') | sort }}"
+  ansible.builtin.assert:
+    that:
+      - workloads_notifier_instances | int <= workloads_notifier_ready | length
+    fail_msg: >-
+      KARDAMOM_NOTIFIER_COUNT ({{ workloads_notifier_instances }}) is above the count of the ready, eligible
+      Nomad nodes with notifier in meta.roles ({{ workloads_notifier_ready }}). Add the notifier nodes or lower the count.
+  when: workloads_notifier_nodes == 'on'
+
 - name: Validate image provenance
   ansible.builtin.import_tasks: provenance.yml
 

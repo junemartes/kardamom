@@ -243,7 +243,8 @@ workloads_idle_cap_us: "{{ lookup('env', 'KARDAMOM_IDLE_CAP_US') | default('50',
 # the ingress nodes. Switch it on only when the notifier nodes exist.
 workloads_notifier_nodes: "{{ lookup('env', 'KARDAMOM_NOTIFIER_NODES') }}"
 # The notifier instance count with the switch on: the count of the
-# notifier nodes. Empty keeps the job's default, 2.
+# notifier nodes. Empty keeps the job's default, 1. The preflight refuses
+# a count above the count of the ready notifier nodes.
 workloads_notifier_count: "{{ lookup('env', 'KARDAMOM_NOTIFIER_COUNT') }}"
 workloads_light_execution_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_EXECUTION_RPC') }}"
 workloads_light_consensus_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_CONSENSUS_RPC') }}"

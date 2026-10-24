@@ -46,6 +46,22 @@ NO_QUORUM_CHAIN = HEALTHY_CHAIN | {'roots': [NO_QUORUM_ROOT],
                                    'ingress': {'pause': {'reason': 'upstream', 'root': NO_QUORUM_ROOT}}}
 # The format registry of the repository: the formats of every target.
 FORMATS = (ANSIBLE.parents[2] / 'formats.toml').read_text()
+# The filter of the notifier node preflight, and its meaning on a node.
+# A Nomad 1.9 agent evaluates the filter on the whole node.
+NOTIFIER_NODE_FILTER = ('Meta.roles matches "(^|,) *notifier *(,|$)" and Status == "ready" '
+                        'and SchedulingEligibility == "eligible"')
+
+
+def notifier_node(node):
+    """Whether NOTIFIER_NODE_FILTER admits the node."""
+    return (re.search(r'(^|,) *notifier *(,|$)', node['Meta'].get('roles', '')) is not None
+            and node['Status'] == 'ready' and node['SchedulingEligibility'] == 'eligible')
+
+
+def nomad_node(name, roles, status='ready', eligibility='eligible'):
+    return {'Name': name, 'Meta': {'roles': roles}, 'Status': status, 'SchedulingEligibility': eligibility}
+
+
 # The formats text that an accepted release holds in the record. The deploy
 # binary of the tests scripts its findings, so the text is a small fixed
 # registry: a record holds it up to four times within Nomad's 64 KiB limit.
@@ -237,6 +253,12 @@ class NomadAPI(BaseHTTPRequestHandler):
                 self.register(state['versions'][parts[3]][-2])
                 state['writes'].append(f'auto-revert:{parts[3]}')
             self.respond(verdict)
+        elif parts[2] == 'nodes':
+            # The node list of the notifier preflight: the stubs of the
+            # nodes that the filter admits.
+            [query] = urllib.parse.parse_qs(self.path.split('?')[1])['filter']
+            assert query == NOTIFIER_NODE_FILTER, query
+            self.respond([{'Name': n['Name']} for n in state['nodes'] if notifier_node(n)])
         elif parts[2] == 'node':
             # Every node advertises an address of this fake API, so the
             # member status and the smoke target resolve back here. A
@@ -354,7 +376,9 @@ class Deploys(unittest.TestCase):
         self.api = ThreadingHTTPServer(('0.0.0.0', 0), NomadAPI)
         self.api.state = {'jobs': {}, 'writes': [], 'deployments': {}, 'roles': {},
                           'variables': {}, 'variable_writes': [], 'records': {}, 'record_index': {},
-                          'record_writes': []}
+                          'record_writes': [],
+                          'nodes': [nomad_node('ingress-0', 'ingress,redis'), nomad_node('notifier-0', 'notifier'),
+                                    nomad_node('notifier-1', 'notifier')]}
         self.record_dir = Path(self.tmp.name) / 'deployed'
         # The target tree: a git checkout with the formats.toml of this
         # repository. A deploy records its HEAD as the revision, which must
@@ -1029,23 +1053,23 @@ class DeployTest(Deploys):
 
     # The plan of the notifier and of the media drivers for each value of
     # the notifier switch: the job constraint, the count, the peers, the
-    # memory, and each driver group with its node class constraint and its
-    # idle cap.
+    # memory, the ring cap, and each driver group with its node class
+    # constraint and its idle cap. The fake cluster has two notifier nodes.
     NOTIFIER_PLACEMENTS = (
         ({}, {
-            'constraint': ('${meta.role}', '=', 'ingress'), 'count': 2, 'memory': 1024,
+            'constraint': ('${meta.role}', '=', 'ingress'), 'count': 2, 'memory': 1024, 'ring': 1000000,
             'peers': [f'http://ingress-{i}.node.dc1.consul:8547' for i in range(2)],
             'drivers': {'aeron': (None, '50')}}),
         ({'KARDAMOM_NOTIFIER_NODES': 'off'}, {
-            'constraint': ('${meta.role}', '=', 'ingress'), 'count': 2, 'memory': 1024,
+            'constraint': ('${meta.role}', '=', 'ingress'), 'count': 2, 'memory': 1024, 'ring': 1000000,
             'peers': [f'http://ingress-{i}.node.dc1.consul:8547' for i in range(2)],
             'drivers': {'aeron': (None, '50')}}),
-        ({'KARDAMOM_NOTIFIER_NODES': 'on', 'KARDAMOM_NOTIFIER_COUNT': '1'}, {
-            'constraint': ('${meta.roles}', 'set_contains', 'notifier'), 'count': 1, 'memory': 512,
+        ({'KARDAMOM_NOTIFIER_NODES': 'on'}, {
+            'constraint': ('${meta.roles}', 'set_contains', 'notifier'), 'count': 1, 'memory': 512, 'ring': 250000,
             'peers': ['http://notifier-0.node.dc1.consul:8547'],
             'drivers': {'aeron': ('!=', '50'), 'aeron-notifier': ('=', '1000')}}),
-        ({'KARDAMOM_NOTIFIER_NODES': 'on'}, {
-            'constraint': ('${meta.roles}', 'set_contains', 'notifier'), 'count': 2, 'memory': 512,
+        ({'KARDAMOM_NOTIFIER_NODES': 'on', 'KARDAMOM_NOTIFIER_COUNT': '2'}, {
+            'constraint': ('${meta.roles}', 'set_contains', 'notifier'), 'count': 2, 'memory': 512, 'ring': 250000,
             'peers': [f'http://notifier-{i}.node.dc1.consul:8547' for i in range(2)],
             'drivers': {'aeron': ('!=', '50'), 'aeron-notifier': ('=', '1000')}}),
     )
@@ -1074,6 +1098,23 @@ class DeployTest(Deploys):
             with self.subTest(environ=environ):
                 self.run_deploy(check=True, success=False, environ=environ)
 
+    def test_the_preflight_refuses_more_notifiers_than_notifier_nodes(self):
+        """The preflight counts the ready, eligible nodes whose role set
+        holds notifier, before any job changes. A down node, a drained node
+        and a role that only starts with notifier do not count."""
+        self.api.state['nodes'] = [
+            nomad_node('notifier-0', 'redis, notifier'), nomad_node('notifier-1', 'notifier', status='down'),
+            nomad_node('notifier-2', 'notifier', eligibility='ineligible'), nomad_node('aux-0', 'notifiers')]
+        output = self.run_deploy(check=True, success=False,
+                                 environ={'KARDAMOM_NOTIFIER_NODES': 'on', 'KARDAMOM_NOTIFIER_COUNT': '2'})
+        self.assertIn("KARDAMOM_NOTIFIER_COUNT (2) is above the count of the ready, eligible Nomad nodes "
+                      "with notifier in meta.roles (['notifier-0'])", output)
+        self.assertNotIn('plans', self.api.state)
+        self.api.state['nodes'] = []
+        output = self.run_deploy(check=True, success=False, environ={'KARDAMOM_NOTIFIER_NODES': 'on'})
+        self.assertIn('KARDAMOM_NOTIFIER_COUNT (1) is above the count', output)
+        self.run_deploy(check=True, environ={'KARDAMOM_NOTIFIER_NODES': 'off'})
+
     def assert_notifier_placement(self, plans, expected):
         notifier = plans['notifier']
         group = notifier['TaskGroups'][0]
@@ -1087,6 +1128,7 @@ class DeployTest(Deploys):
         self.assertIn({'LTarget': '', 'RTarget': 'true', 'Operand': 'distinct_hosts'}, group['Constraints'])
         self.assertEqual(args[args.index('--peers') + 1].split(','), expected['peers'])
         self.assertEqual(task['Resources']['MemoryMB'], expected['memory'])
+        self.assertEqual(args[args.index('--ring-max-events') + 1], expected['ring'])
         drivers = {g['Name']: (g['Constraints'], g['Tasks'][0]['Env']['KARDAMOM_IDLE_CAP_US'])
                    for g in plans['aeron']['TaskGroups']}
         self.assertEqual(drivers, {

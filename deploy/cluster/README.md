@@ -341,21 +341,24 @@ The notifier (`nomad/notifier.nomad.hcl`) runs on the ingress nodes by default. 
 
 - A notifier node has the class `notifier` (`role=notifier`, `tier=worker`). Its name is `notifier-<i>`.
 - The notifier job constrains on `meta.roles` with `set_contains "notifier"`, with `distinct_hosts`.
-- `KARDAMOM_NOTIFIER_COUNT` sets the instance count and `--instance-count`. The default is 2. Set it to the count of the notifier nodes.
+- `KARDAMOM_NOTIFIER_COUNT` sets the instance count and `--instance-count`. The default is 1. Set it to the count of the notifier nodes.
 - The peers are the node records `notifier-<i>.node.<datacenter>.consul:8547`, for `i` from 0 to the count minus 1. The list is complete before an instance starts, so a registration reaches every instance.
 - The memory reservation is 512 MB, not 1024 MB. On staging the notifier uses at most about 300 MiB.
+- The ring keeps at most 250,000 events, not `ring_max_events` (1,000,000 by default). 250,000 events use about 75 MB. At the staging load-test peak of 5,100 events a second (1,700 tx/s, three stages), the ring holds about 50 seconds. So a client that reconnects replays at most 250,000 events, and on a load peak only the last 50 seconds. We measure the memory in the first load test on the notifier nodes and adjust the cap.
 - The media driver of a notifier node idles at 1000 µs. The aeron job runs a second group, `aeron-notifier`, on the nodes of class `notifier`. The group `aeron` keeps `KARDAMOM_IDLE_CAP_US` on every other node. The notifier is not on the transaction hot path.
 
-Off, the deploy renders every job as before. On, only the notifier and aeron jobs change. The canary and Prometheus find the notifier through its Consul services `kardamom-notifier` and `kardamom-notifier-metrics`. The edge load balancer must reach the notifier nodes on `:8547` before the switch goes on.
+Off, the deploy renders every job as before. On, only the notifier and aeron jobs change. The canary and Prometheus find the notifier through its Consul services `kardamom-notifier` and `kardamom-notifier-metrics`.
+
+The edge load balancer needs a change only in an environment that exposes the feed on `:8547`. There, add the notifier nodes to its targets before the switch goes on. The staging load balancer (kardamom-infra) serves only the JSON-RPC, so staging needs no change.
 
 Do the move in this order:
 
 1. Create `notifier-0`. Bootstrap it like the other nodes, with `role=notifier`.
-2. Deploy with `KARDAMOM_NOTIFIER_NODES=on` and `KARDAMOM_NOTIFIER_COUNT=1`.
+2. Merge the webhook state onto `notifier-0` (see [The webhook state](#the-webhook-state)). Deploy with `KARDAMOM_NOTIFIER_NODES=on` and `KARDAMOM_NOTIFIER_COUNT=1`. The `aeron-notifier` driver on `notifier-0` fails its first start: the old `aeron` driver stops in the same evaluation and leaves a fresh `cnc.dat`. The new driver starts after the restart delay of 15 s.
 3. Measure the memory and the CPU of the notifier and of its media driver on `notifier-0`.
-4. Create `notifier-1`. Deploy with `KARDAMOM_NOTIFIER_NODES=on` and `KARDAMOM_NOTIFIER_COUNT=2`.
+4. Create `notifier-1`. Copy the webhook state of `notifier-0` to it. Deploy with `KARDAMOM_NOTIFIER_NODES=on` and `KARDAMOM_NOTIFIER_COUNT=2`.
 
-Each deploy with the switch on needs a node of class `notifier`. Without one, the deploy waits for the `aeron-notifier` group and fails. `KARDAMOM_NOTIFIER_COUNT` must not be above the count of the notifier nodes: with `distinct_hosts`, an instance without a node is never placed, and the deployment never turns healthy. So step 2 needs `KARDAMOM_NOTIFIER_COUNT=1` while only `notifier-0` exists.
+`KARDAMOM_NOTIFIER_COUNT` must not be above the count of the notifier nodes. With `distinct_hosts`, an instance without a node is never placed, and the deployment never turns healthy. So with the switch on, the preflight of the deploy counts the Nomad nodes that are `ready` and `eligible` and have `notifier` in `meta.roles`. The deploy stops before it changes a job when the count is above that number.
 
 The WebSocket clients reconnect when the notifier moves: Nomad stops the instances on the ingress nodes and starts new ones on the notifier nodes. The ring of a new instance starts empty, so a client that reconnects cannot replay the events from before the move.
 
@@ -368,17 +371,36 @@ The webhook shards follow the rendezvous hash of the subscription id over `--ins
 - With `KARDAMOM_NOTIFIER_COUNT=1`, the one instance owns every subscription.
 - From 1 to 2, the new instance 1 takes about half of the subscriptions. Instance 0 keeps the rest. Instance 0 stops the deliveries of the subscriptions that move.
 
-The state does not move with the notifier. Merge the directories of all the old nodes onto each new node before the deploy, and rely on at-least-once delivery. Do not copy by allocation index:
+The state does not move with the notifier. Before the deploy, merge the state of all the old nodes onto each new node, and rely on at-least-once delivery. Do not copy by allocation index:
 
 - The file names carry the subscription id, not the instance index. So one merged directory serves any index.
 - Nomad does not keep an allocation index on a node. The index-to-node map of the old nodes and of the new nodes is not fixed, so a copy by index can put a shard on the wrong node.
-- A stale outbox and cursor of a past owner can be on another node. `rsync --update` keeps the newer file. The current owner opened its pair after the past owner stopped, so its pair is newer.
 - A cursor that is behind its outbox only delivers some events again. The subscriber deduplicates by the idempotency key (`tx_hash` plus stage).
+
+Merge by subscription, not file by file:
+
+- The cursor is a byte position in one outbox. So take `<id>.outbox` and `<id>.cursor` together, from the same node. Do not use `rsync --update`, because it selects each file alone.
+- A past owner can leave a stale pair on another node. The current owner opens the outbox when it takes the subscription, and the open sets the modification time. So take the pair from the node with the newer `<id>.outbox`.
+- The modification times come from the clocks of different nodes. So the merge relies on NTP on every node.
+- The `<id>.json` files are the same on every node. Copy each one from any node.
 
 The merges of the move:
 
-- Step 2 (ingress to `notifier-0`): on `notifier-0`, `rsync -a --update` the directory from `ingress-0`, then from `ingress-1`. The one new instance owns every subscription, so it needs the outboxes of both old instances.
-- Step 4 (count 1 to 2): `rsync -a` the directory of `notifier-0` to `notifier-1`, then deploy at once. The new instance 1 then has every subscription and the outboxes of the shards that it takes.
+- Step 2 (ingress to `notifier-0`): the one new instance owns every subscription, so it needs the outboxes of both old instances. On `notifier-0`, run:
+
+  ```sh
+  dir=/opt/kardamom/notifier
+  for host in ingress-0 ingress-1; do
+    rsync -a --ignore-existing --include='*.json' --exclude='*' "$host:$dir/" "$dir/"
+    ssh "$host" "cd $dir && stat -c '%Y %n' -- *.outbox" | sed "s/\$/ $host/"
+  done | sort -k2,2 -k1,1nr | awk '!seen[$2]++ { print $3, $2 }' |
+  while read -r host outbox; do
+    id=${outbox%.outbox}
+    rsync -a --ignore-missing-args "$host:$dir/$id.outbox" "$host:$dir/$id.cursor" "$dir/"
+  done
+  ```
+
+- Step 4 (count 1 to 2): `rsync -a` the directory of `notifier-0` to `notifier-1`, then deploy at once. One node is the source, so each pair stays together. The new instance 1 then has every subscription and the outboxes of the shards that it takes.
 
 An event that the old owner appends between the copy and the deploy, and does not deliver before it stops, is not delivered. Keep that interval short. The receipt stays the truth for a client that misses a status.
 
@@ -461,7 +483,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Egress | `KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS` (job variable `receipt_query_endpoints` of the ingress) | empty (the executors) | `on` or `off`. On, `eth_getTransactionReceipt` asks the egress on a cache miss (`--receipt-query-endpoints`). It needs `KARDAMOM_EGRESS=1`. |
 | Egress | `KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS` (job variable `receipts_from_egress` of the notifier) | empty (`off` in the job) | `on` or `off`. On, the notifier reads the receipts from `egress_receipts` (`--receipts-from-egress`). It needs `KARDAMOM_EGRESS=1`. |
 | Notifier | `KARDAMOM_NOTIFIER_NODES` (job variable `notifier_nodes` of the notifier and the aeron jobs) | empty (`off` in the jobs) | `on` or `off`. On, the notifier runs on the nodes of role `notifier`, and their media drivers idle at 1000 µs. Off, it runs on the ingress nodes. See [The notifier nodes](#the-notifier-nodes). |
-| Notifier | `KARDAMOM_NOTIFIER_COUNT` (job variable `notifier_count` of the notifier) | empty (`2` in the job) | The notifier instance count with `KARDAMOM_NOTIFIER_NODES=on`: the count of the notifier nodes. |
+| Notifier | `KARDAMOM_NOTIFIER_COUNT` (job variable `notifier_count` of the notifier) | empty (`1` in the job) | The notifier instance count with `KARDAMOM_NOTIFIER_NODES=on`: the count of the notifier nodes. The preflight refuses a count above the count of the ready notifier nodes. |
 | Executor | `KARDAMOM_CHECKPOINT_LOG` (job variable `checkpoint_log`) | empty (`off` in the job) | `on` or `off`. On, each executor keeps the block log of its checkpoints and copies the state only when the base rule asks for a new base, at 16 MiB/s. Off, it copies the whole state each 20 s. Each release reads the bases of both modes. See [`../../docs/specs/2026-10-22-incremental-checkpoints.md`](../../docs/specs/2026-10-22-incremental-checkpoints.md). |
 | Fees | `PRIORITY_FEES` | empty (`off`) | `on` or `off`. One value sets the sequencer tip, the sealer ordering window and the executor and validator fee schedule. Turning it on for an existing chain is a chain upgrade. See [`../../docs/priority-fees.md`](../../docs/priority-fees.md). |
 | Aeron | `KARDAMOM_AERON_THREADING_MODE` | empty (`SHARED` in the job) | The threading mode of the media driver of each node: `SHARED` (one thread), `SHARED_NETWORK` (the sender and the receiver on one thread, the conductor on its own) or `DEDICATED` (three threads). `SHARED` costs the least CPU, but at a high message rate its one thread saturates and every stream of the node waits. |

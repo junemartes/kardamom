@@ -36,7 +36,7 @@ Connect to the notifier address with a WebSocket client. The default address is 
 
 - On subscribe, the notifier first replays the events in its ring that match the filter, oldest first. Then it streams live events.
   - The replay and the live stream do not lose or repeat an event.
-  - A new subscriber gets the history of the ring: by default the last 10 minutes, and at most 1000000 events.
+  - A new subscriber gets the history of the ring: by default the last 10 minutes, and at most 1000000 events. On the notifier nodes (`KARDAMOM_NOTIFIER_NODES=on`), the ring keeps at most 250000 events.
 - The `filter` is one of these:
 
 | Filter | Selects |
