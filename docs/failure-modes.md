@@ -172,7 +172,8 @@ The sealer refuses user records when the batcher falls too far behind on L1. Bel
   - The posted head is the highest `l2_block_end` of a post on the `l1_blocks` stream of the L1 follower. The follower publishes only finalized L1 blocks.
   - The final head is the newest L2 block of an output whose challenge window ended (`WithdrawalOutputOracle.isFinalizable`). The egress reads it from L1 with `--withdrawal-oracle` and `--l1-rpc-url`, at the finalized L1 block. Without an oracle, the floor is the posted head.
   - A head that the egress did not read yet is 0: the store keeps every block. After a start, the egress learns the posted head from the next finalized post.
-  - The store also keeps `--keep-blocks` blocks below its head (default 1,000,000), for the readers that resume. It deletes a segment only when the segment is below both the floor and this window.
+  - The store also keeps `--keep-blocks` blocks below its head (default 43,200: 1 day at 2 s a block), for the readers that resume. It deletes a segment only when the segment is below both the floor and this window.
+  - A reader further behind than the window and the floor gets `410` with the floor of the store. The executor and the validator then recover from a peer checkpoint (see "Replay-window overrun"). The batcher never reads below the floor: the floor is at or below its posted head.
   - The prune is local to each instance. It changes no replicated state.
   - The disk of the store grows with the DA lag and, with an oracle, with the challenge window. `KardamomEgressDiskFillsSoon` fires when the free disk runs out within 6 hours at the rate of the last hour. A full disk stops the instance.
   - Proof: the unit tests `a_frozen_posted_head_keeps_every_block_above_it_past_the_window` and `the_prune_follows_the_lower_of_the_posted_head_and_the_final_head` in `crates/egress/src/owner_prune_tests.rs`.

@@ -375,7 +375,7 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
 
 `kardamom_egress_disk_free_bytes` is a gauge of each egress instance: the free bytes of the file system of its store. The egress sets it after each sync of its store.
 
-- The store keeps every block above the lower of the posted head and the final head. Its disk grows with the DA lag.
+- The store keeps every block above the lower of the posted head and the final head, and the window of `--keep-blocks` blocks below its head (default 43,200). Its disk grows with the DA lag.
 - `KardamomEgressDiskFillsSoon` in `deploy/alerts.yml` fires when `predict_linear` over the last hour gives a full disk within 6 hours, for 15 minutes.
 - `kardamom_egress_posted_distance_blocks` and `kardamom_egress_floor_distance_blocks` show why the store grows: the batcher does not post, or the final head does not move.
   - `peer-checkpoint`: the node fell behind the retention window and repaired itself from a peer checkpoint.

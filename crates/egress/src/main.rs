@@ -70,9 +70,10 @@ struct Args {
     #[arg(long, env = "KARDAMOM_EGRESS_SEGMENT_BLOCKS", default_value = "1000")]
     segment_blocks: NonZeroU64,
     /// The blocks the store keeps below its head, whatever the L1 heads
-    /// say: the window of the readers that resume. The store also keeps
-    /// every block above the lower of the posted head and the final head.
-    #[arg(long, env = "KARDAMOM_EGRESS_KEEP_BLOCKS", default_value = "1000000")]
+    /// say: the window of the readers that resume. The default is one
+    /// challenge window: 1 day at 2 s a block. The store also keeps every
+    /// block above the lower of the posted head and the final head.
+    #[arg(long, env = "KARDAMOM_EGRESS_KEEP_BLOCKS", default_value = "43200")]
     keep_blocks: NonZeroU64,
     /// The L1 JSON-RPC endpoint of the output oracle. Point it at the
     /// light client. It needs `--withdrawal-oracle`.

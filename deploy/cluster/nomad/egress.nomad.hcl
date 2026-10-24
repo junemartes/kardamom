@@ -103,8 +103,8 @@ variable "segment_blocks" {
 
 variable "keep_blocks" {
   type        = number
-  description = "The blocks that the store keeps below its head, whatever the L1 heads say (--keep-blocks)."
-  default     = 1000000
+  description = "The blocks that the store keeps below its head, whatever the L1 heads say (--keep-blocks). The default is 1 day at 2 s a block."
+  default     = 43200
 }
 
 # The floor of the store. The egress keeps every block above the posted

@@ -369,7 +369,9 @@ is the current state, and the difference is a follow-up.
   end of the last segment.
 - The store keeps every block above `min(posted_head, final_head)`, as section 6.2 says. It
   deletes a segment after a sync, only when the segment is below that floor and below the window
-  of `--keep-blocks` blocks under its head. The window serves the readers that resume.
+  of `--keep-blocks` blocks under its head. The window serves the readers that resume. Its default
+  is one challenge window, 43,200 blocks (1 day at 2 s a block). A reader further behind than the
+  window and the floor gets `410` with the floor of the store, and recovers from a peer checkpoint.
   - The posted head is the highest `l2_block_end` of a post on the `l1_blocks` stream of the L1
     follower. The follower publishes only finalized L1 blocks.
   - The final head comes from `WithdrawalOutputOracle` on L1 (`--withdrawal-oracle`,

@@ -329,8 +329,8 @@ The floor of the store:
 
 - Each instance keeps every block above the posted head. It reads the posted head from the `l1_blocks` stream of the L1 follower, so the follower must run.
 - With `WITHDRAWAL_ORACLE_ADDRESS`, each instance keeps every block above the lower of the posted head and the final head. It reads the final head from the oracle on L1: through the light client when one runs, else through the in-cluster anvil. With a real L1 and no light client, the deploy gives the egress no L1 endpoint, and the egress refuses to start with the oracle alone.
-- Each instance also keeps `keep_blocks` blocks below its head (job variable, default 1,000,000).
-- Size the disk of the executor nodes for the DA-lag budget, and for the challenge window with an oracle. `KardamomEgressDiskFillsSoon` fires before the disk is full.
+- Each instance also keeps `keep_blocks` blocks below its head (job variable, default 43,200: 1 day at 2 s a block), for the readers that resume. A reader further behind than this window and the floor gets `410` with the floor of the store. The executor and the validator then recover from a peer checkpoint.
+- Size the disk of the executor nodes for the larger of the window and the stretch above the floor: the DA-lag budget, and the challenge window with an oracle. `KardamomEgressDiskFillsSoon` fires before the disk is full.
 
 Every switch is off by default. With every switch off, the deploy renders every job as before. Switch them on in this order, one deploy for each step:
 

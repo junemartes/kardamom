@@ -1044,6 +1044,8 @@ class DeployTest(Deploys):
         self.run_deploy(self.EGRESS_ON, check=True)
         args = self.job_args(self.api.state['plans']['egress'])
         self.assertEqual({'--l1-rpc-url', '--withdrawal-oracle'} & set(args), set())
+        # The window of the readers that resume: one challenge window.
+        self.assertEqual(args[args.index('--keep-blocks') + 1], '43200')
         oracle = '0x' + '3' * 40
         cases = (
             ('the in-cluster anvil', {}, 'http://anvil.service.consul:8546'),
