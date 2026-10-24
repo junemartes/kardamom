@@ -785,6 +785,10 @@ Raft.
     `leadershipTermId` field, and the peer probe of the join watchdog (`PeerProbe`) reads it.
   - After a full restart, when a peer does not answer, a majority that agrees is enough after the
     stall limit of today (80 s to 160 s). So one dead member does not block the chain.
+  - After a partial restart, a majority that agrees is enough at once when a peer in it reports
+    `startHold` false (it did not restart) and every peer that answered since the start agrees
+    now. A peer that never answered was down for the whole hold. A leader of a higher term is
+    live and answers with an open election, so it holds the member.
   - Until then the member feed sends no frame, the serving service exposes nothing from that
     member, and the leader sends no kind 17. The sequencers wait for kind 17 before they send.
   - The hold changes no decision rule and no Raft log, so it needs no flag (#661).

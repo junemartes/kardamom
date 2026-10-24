@@ -146,14 +146,18 @@ final class PeerProbe {
      * The part of a peer's {@link MemberStatus} JSON that the watchdog and
      * the start hold read. A peer of an older release states no leadership
      * term: its term reads {@link #TERM_NOT_STATED}. A peer of this release
-     * whose service applied no term yet states -1.
+     * whose service applied no term yet states -1. A peer of an older
+     * release states no start hold either: it reads as held, so it never
+     * shows that it did not restart.
      */
-    record PeerStatus(int memberId, String role, String election, long commitPosition, long leadershipTermId) {
+    record PeerStatus(
+            int memberId, String role, String election, long commitPosition, long leadershipTermId, boolean startHold) {
         /** The term of a peer of an older release, which states none. */
         static final long TERM_NOT_STATED = Long.MIN_VALUE;
         private static final Pattern FIELDS = Pattern.compile(
             "\"memberId\":(\\d+),\"role\":\"([A-Z_]+)\",\"election\":\"([A-Z_]+)\",\"commitPosition\":(-?\\d+)");
         private static final Pattern TERM = Pattern.compile("\"leadershipTermId\":(-?\\d+)");
+        private static final Pattern HOLD = Pattern.compile("\"startHold\":(true|false)");
 
         /** The fields of a status answer, or empty for any other body, such as an error object. */
         static Optional<PeerStatus> parse(final String json) {
@@ -162,9 +166,11 @@ final class PeerProbe {
                 return Optional.empty();
             }
             final Matcher term = TERM.matcher(json);
+            final Matcher hold = HOLD.matcher(json);
             return Optional.of(new PeerStatus(
                 Integer.parseInt(m.group(1)), m.group(2), m.group(3), Long.parseLong(m.group(4)),
-                term.find() ? Long.parseLong(term.group(1)) : TERM_NOT_STATED));
+                term.find() ? Long.parseLong(term.group(1)) : TERM_NOT_STATED,
+                !hold.find() || Boolean.parseBoolean(hold.group(1))));
         }
 
         /**

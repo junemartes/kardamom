@@ -2,6 +2,8 @@ package io.kardamom.sealer.cluster;
 
 import io.aeron.cluster.ElectionState;
 import io.aeron.cluster.service.Cluster;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.function.LongSupplier;
 import org.agrona.concurrent.status.AtomicCounter;
 
@@ -43,6 +45,8 @@ final class StartHoldThread {
     private final StartHold hold;
     private final long stallLimitMs;
     private final long startMs = System.currentTimeMillis();
+    /** The ids of the peers that answered in any round; only the hold thread uses it. */
+    private final Set<Integer> heard = new HashSet<>();
 
     StartHoldThread(final Member member, final StartHold hold, final long stallLimitMs) {
         this.member = member;
@@ -69,14 +73,15 @@ final class StartHoldThread {
         final StartHoldRule.Own own = new StartHoldRule.Own(member.settled(), member.term().getAsLong());
         final PeerProbe.Round round = member.peers().ask();
         final long heldMs = System.currentTimeMillis() - startMs;
-        final StartHoldRule.Verdict verdict =
-            new StartHoldRule(round.peers(), stallLimitMs).judge(own, round.answers(), heldMs);
+        round.answers().forEach(peer -> heard.add(peer.memberId()));
+        final StartHoldRule.Verdict verdict = new StartHoldRule(round.peers(), stallLimitMs)
+            .judge(own, new StartHoldRule.Round(round.answers(), heard.size(), heldMs));
         if (verdict == StartHoldRule.Verdict.HOLD) {
             return;
         }
         hold.release();
         System.out.println("cluster START-HOLD released memberId=" + member.memberId()
             + " term=" + own.term() + " verdict=" + verdict + " heldMs=" + heldMs
-            + " answers=" + round.answers().size() + "/" + round.peers());
+            + " answers=" + round.answers().size() + "/" + round.peers() + " heard=" + heard.size());
     }
 }
