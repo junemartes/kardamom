@@ -85,11 +85,12 @@
       - workloads_carry_executor_ids | select('ge', node_classes.sealer.count | int) | list | length == 0
       - >-
         workloads_carry_executor_ids | length == 0
-        or (workloads_exec_on_sealers == 'on' and workloads_egress | bool and workloads_exec_cursor != 'on')
+        or (workloads_exec_on_sealers == 'on' and workloads_egress | bool and workloads_exec_cursor != 'on'
+            and workloads_egress_job_vars.executor.egress_url | length > 0)
     fail_msg: >-
       KARDAMOM_CARRY_EXECUTORS ("{{ workloads_carry_executors }}") is empty or a list of distinct member indexes
       below {{ node_classes.sealer.count }}, such as 0,1. A list needs KARDAMOM_EXEC_ON_SEALERS=on, KARDAMOM_EGRESS=1
-      and KARDAMOM_EXEC_CURSOR not on.
+      with the egress URL of the executors, and KARDAMOM_EXEC_CURSOR not on.
 
 - name: Validate the sequencer version floor
   ansible.builtin.assert:

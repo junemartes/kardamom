@@ -3,8 +3,11 @@
 # the job workloads_metrics_job, from /metrics on the port
 # workloads_metrics_port. The controller reaches each allocation by the
 # node address that the Nomad API advertises, as sealer_status.yml does.
-# A gauge name can carry its labels, such as
-# kardamom_sealer_feature_state{feature="5"}.
+# Every exporter adds its own labels to each sample: a Rust service
+# service and host_id, a sealer member service and member_id. So a bare
+# gauge name matches a sample with any labels. A gauge name with labels,
+# such as kardamom_sealer_feature_state{feature="5"}, matches the first
+# sample that carries each of those labels.
 # The result is workloads_metrics_of[<job>]:
 # - groups: the task group of each running allocation;
 # - one list for each gauge, in the order of groups. The value is -1 when
@@ -58,6 +61,16 @@
     workloads_metrics_of: >-
       {{ workloads_metrics_of | combine({workloads_metrics_job: {item: workloads_metrics_pages.results
            | map(attribute='content', default='') | map('default', '', true)
-           | map('regex_search', '(?m)^' ~ (item | regex_escape) ~ ' [-+0-9.eE]+$')
+           | map('regex_search', workloads_metrics_pattern)
            | map('default', 'none -1', true) | map('split', ' ') | map('last') | map('float') | list}}, recursive=true) }}
   loop: "{{ workloads_metrics_gauges }}"
+  vars:
+    workloads_metrics_labels: >-
+      {{ item | regex_replace('^[^{]*', '') | regex_replace('^[{]|[}]$', '') | split(',') | reject('equalto', '') | list }}
+    # Each given label is a lookahead over the braces: it stands after the
+    # brace or a comma, and before a comma or the closing brace.
+    workloads_metrics_pattern: >-
+      {{ '(?m)^' ~ (item | regex_replace('[{].*$', '') | regex_escape)
+         ~ (workloads_metrics_labels | map('regex_escape') | map('regex_replace', '^', '(?=[{](?:[^}]*,)?')
+            | map('regex_replace', '$', '[,}])') | join)
+         ~ '([{][^}]*[}])? [-+0-9.eE]+$' }}

@@ -77,7 +77,10 @@
 # 8b. The readers that move to the egress (--egress). Below R, the egress
 # range holds a reference that the reader cannot join. So the posted block
 # of the batcher and the committed block of the validator must be above
-# the block of R before the move.
+# the block of R before the move. A reader job that Nomad does not know
+# has no block to read. On a live chain, it starts on the cluster egress
+# first. On a new chain (no registered sealer) the egress stores no
+# reference, so a new reader may start on the egress at once.
 - name: Read the registered readers of the egress
   ansible.builtin.uri:
     url: "{{ workloads_nomad_addr }}/v1/job/{{ item }}?namespace={{ workloads_namespace | urlencode }}"
@@ -95,6 +98,22 @@
          | selectattr('item', 'in', workloads_gate_switched_readers)
          | rejectattr('json.Meta.reads_egress', 'defined') | map(attribute='item') | list }}
   vars:
+    workloads_gate_switched_readers: >-
+      {{ (['batcher'] if workloads_batcher_egress == 'on' else [])
+         + (['validator'] if workloads_validator_egress == 'on' else []) }}
+
+- name: Refuse a new reader on the egress on a live chain
+  ansible.builtin.assert:
+    that: workloads_gate_new_readers | length == 0
+    fail_msg: >-
+      Refused: Nomad does not know the {{ workloads_gate_new_readers | join(' and ') }} job, and the deploy starts it
+      on the egress (--egress) on a live chain. The gate cannot read its block against the last stored reference.
+      Deploy it on the cluster egress first, then switch it.
+  vars:
+    workloads_gate_new_readers: >-
+      {{ workloads_gate_readers.results | selectattr('status', 'equalto', 404)
+         | selectattr('item', 'in', workloads_gate_switched_readers) | map(attribute='item') | list
+         if workloads_gate_cluster_job.status == 200 else [] }}
     workloads_gate_switched_readers: >-
       {{ (['batcher'] if workloads_batcher_egress == 'on' else [])
          + (['validator'] if workloads_validator_egress == 'on' else []) }}
@@ -175,6 +194,13 @@
           name: executor
           metas: [carried_ref_fault]
           does: stop on a reference that no source can join
+
+    - name: Refuse a carry executor without a registered sealer
+      ansible.builtin.assert:
+        that: workloads_gate_cluster_job.status == 200
+        fail_msg: >-
+          Refused: KARDAMOM_CARRY_EXECUTORS lists {{ workloads_gate_moving_executors | join(', ') }}, and Nomad does
+          not know the sealer job. A carry executor needs the carry window on every member.
 
     - name: Read the status of every sealer member for the carry executors
       ansible.builtin.include_tasks: sealer_status.yml

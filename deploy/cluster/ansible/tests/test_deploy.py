@@ -99,7 +99,7 @@ class NomadAPI(BaseHTTPRequestHandler):
                 marker = state.get('roll_marker', 'retention=131072')
                 state.setdefault('rolled', []).append(sorted(
                     g['Name'] for g in body['Job']['TaskGroups'] if marker in json.dumps(g)))
-            self.respond({'JobModifyIndex': 1})
+            self.respond({'JobModifyIndex': 1, 'EvalID': self.eval_id(body['Job']['ID'])})
         elif self.path.startswith('/v1/deployment/promote/'):
             name = self.path.split('/')[4].split('?')[0]
             assert body['All'] is True
@@ -117,9 +117,13 @@ class NomadAPI(BaseHTTPRequestHandler):
                 return
             self.register(versions[body['JobVersion']])
             state['writes'].append(f'revert:{name}:{body["JobVersion"]}')
-            self.respond({'EvalID': 'reverted', 'JobModifyIndex': len(versions)})
+            self.respond({'EvalID': self.eval_id(name), 'JobModifyIndex': len(versions)})
         else:
             raise AssertionError(self.path)
+
+    def eval_id(self, name):
+        """The id of the evaluation of a new version of the job `name`."""
+        return f'eval:{name}:{len(self.server.state.get("versions", {}).get(name, []))}'
 
     def register(self, job):
         """Store `job` as the current definition and as a new version."""
@@ -242,6 +246,12 @@ class NomadAPI(BaseHTTPRequestHandler):
                 self.register(state['versions'][parts[3]][-2])
                 state['writes'].append(f'auto-revert:{parts[3]}')
             self.respond(verdict)
+        elif parts[2] == 'evaluation':
+            # The evaluation of a registration: complete, with the
+            # deployment of the job when the test scripts one.
+            job = parts[3].split(':')[1]
+            self.respond({'ID': parts[3], 'Status': 'complete',
+                          'DeploymentID': job if job in state['deployments'] else ''})
         elif parts[2] == 'node':
             # Every node advertises an address of this fake API, so the
             # member status and the smoke target resolve back here. A
@@ -1153,6 +1163,8 @@ class DeployTest(Deploys):
              'is empty or a list of distinct member indexes'),
             ('a carry executor without a member', self.ON_SEALERS | egress | {'KARDAMOM_CARRY_EXECUTORS': '3'},
              'is empty or a list of distinct member indexes'),
+            ('a carry executor without the egress URL', self.ON_SEALERS | egress | {'KARDAMOM_CARRY_EXECUTORS': '0'},
+             'with the egress URL of the executors', {'workloads_egress_url': ''}),
             ('a floor above decision version 5', {'KARDAMOM_SEALER_VERSION_FLOOR': '6'},
              'KARDAMOM_SEALER_VERSION_FLOOR ("6") is empty or a decision version from 0 to 5'),
             ('a retention above the cap', {'KARDAMOM_CLUSTER_RETENTION': '131073'},
@@ -1160,9 +1172,9 @@ class DeployTest(Deploys):
             ('a retention of 0', {'KARDAMOM_CLUSTER_RETENTION': '0'}, 'is empty or a frame count from 1 to 131072'),
         )
         self.add_egress_image()
-        for name, environ, message in cases:
+        for name, environ, message, *extra in cases:
             with self.subTest(name):
-                output = self.run_deploy(check=True, success=False, environ=environ)
+                output = self.run_deploy(*extra, check=True, success=False, environ=environ)
                 self.assertIn(message, output)
                 self.assertNotIn('plans', self.api.state)
 
@@ -2005,8 +2017,18 @@ class CarryTest(Deploys):
         self.add_egress_image()
 
     def metric(self, node, gauges):
-        """Give the node a metrics page with `gauges`, by name."""
-        self.api.state.setdefault('metrics', {})[node] = ''.join(f'{k} {v}\n' for k, v in gauges.items())
+        """Give the node a metrics page with `gauges`, by name, in the format
+        of the exporters: a sealer member labels each sample with service and
+        member_id, a Rust service with service and host_id. The labels of a
+        gauge name follow them."""
+        own = (f'service="sealer",member_id="{node.rsplit("-", 1)[1]}"' if node.startswith('node-cluster-')
+               else f'service="{node.removeprefix("node-").split(".")[0]}",host_id="{node}"')
+
+        def line(name, value):
+            bare, _, labels = name.partition('{')
+            return f'{bare}{{{own}{"," + labels.rstrip("}") if labels else ""}}} {value}\n'
+        self.api.state.setdefault('metrics', {})[node] = '# TYPE x gauge\n' + ''.join(
+            line(k, v) for k, v in gauges.items())
 
     def set_marks(self):
         for node, (index, block) in self.MARKS.items():
@@ -2031,15 +2053,19 @@ class CarryTest(Deploys):
         self.api.state['writes'] = []
         self.api.state['registrations'] = []
         self.run_deploy(environ=self.ON_SEALERS)
-        # Each step stops the instance of the highest index on the executor
-        # nodes and starts the pinned group of that id.
+        # Each step first stops the instance of the highest index on the
+        # executor nodes, then starts the pinned group of that id. The last
+        # step removes the group of the executor nodes.
         self.assertEqual(self.executor_steps(), [
+            [('executor', 2)],
             [('executor-2', 1), ('executor', 2)],
+            [('executor-2', 1), ('executor', 1)],
             [('executor-1', 1), ('executor-2', 1), ('executor', 1)],
+            [('executor-1', 1), ('executor-2', 1)],
             [('executor-0', 1), ('executor-1', 1), ('executor-2', 1)]])
         moving = [job for job in self.api.state['registrations'] if job['ID'] == 'executor'][0]
         self.assertIn({'LTarget': '${meta.role}', 'RTarget': 'executor', 'Operand': '='},
-                      moving['TaskGroups'][1]['Constraints'], 'the group of the executor nodes stays there')
+                      moving['TaskGroups'][0]['Constraints'], 'the group of the executor nodes stays there')
         self.assertEqual(self.api.state['writes'].count('cluster'), 3, 'the feed rolls member by member')
         # A new image of the executor rolls the pinned groups one at a time.
         self.api.state['registrations'] = []
@@ -2106,6 +2132,10 @@ class CarryTest(Deploys):
         meta['ref_mark'] = 'true'
         del self.api.state['metrics']['node-egress.1']
         self.refused(readers, 'Refused: an egress instance does not report its reference mark')
+        self.set_marks()
+        # A batcher that Nomad does not know has no block to read.
+        del self.api.state['jobs']['batcher']
+        self.refused(readers, 'Nomad does not know the batcher job, and the deploy starts it on the egress')
 
     def test_the_carry_executors_move_one_at_a_time_after_the_switch(self):
         self.deploy()
@@ -2134,6 +2164,11 @@ class CarryTest(Deploys):
         del meta['carried_ref_fault']
         self.refused(carry, 'the executor job does not stop on a reference that no source can join')
         meta['carried_ref_fault'] = 'true'
+        cluster = self.api.state['jobs'].pop('cluster')
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN
+        self.refused(carry, 'KARDAMOM_CARRY_EXECUTORS lists executor-0, and Nomad does not know the sealer job')
+        self.api.state['jobs']['cluster'] = cluster
+        del self.api.state['chain_status']
         # The move: only executor-0 changes, so the roll registers one step.
         self.api.state['registrations'] = []
         self.run_deploy(environ=carry)
@@ -2219,7 +2254,10 @@ class CarryTest(Deploys):
     def test_feature_three_or_four_off_is_refused_while_a_member_holds_feature_five(self):
         self.deploy()
         self.api.state['reads_max'] = {f'node-cluster-{i}': 16 for i in range(3)}
-        self.metric('node-cluster-1', {'kardamom_sealer_feature_state{feature="5"}': 1})
+        self.metric('node-cluster-1', {'kardamom_sealer_feature_state{feature="4"}': 2,
+                                        'kardamom_sealer_feature_state{feature="5"}': 1})
+        held = self.api.state['metrics']['node-cluster-1']
+        self.assertIn('kardamom_sealer_feature_state{service="sealer",member_id="1",feature="5"} 1', held)
         for feature in ('3', '4'):
             for activation_ms in ('18446744073709551615', '1700000000000'):
                 with self.subTest(feature=feature, activation_ms=activation_ms):

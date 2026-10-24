@@ -32,6 +32,9 @@ The switches and the gates of the deploy are in
 3. The egress runs (`KARDAMOM_EGRESS=1`, `KARDAMOM_EXEC_FRAMES=on`), on two executor nodes.
 
 The commands below run on an operator host with `nomad`, `curl`, `jq`, and the Consul DNS names of the nodes.
+Each metrics line carries the labels of its exporter, such as
+`kardamom_executor_block_number{service="executor",host_id="executor-0"} 42`. So match a gauge name with `[{ ]` after
+it.
 `<egress-node>` is a node that runs an egress instance (`nomad job status egress`). Set every switch in the
 environment of the staging deploy, then deploy.
 
@@ -48,7 +51,7 @@ Checks:
 
   ```sh
   curl -s "http://sealer-$i.node.dc1.consul:40205/metrics" \
-    | grep -E '^kardamom_sealer_(window_exact|feature_state|feed_state|full_ref_below_v5_total|ref_refused_total) '
+    | grep -E '^kardamom_sealer_(window_exact|feature_state|feed_state|full_ref_below_v5_total|ref_refused_total)[{ ]'
   ```
 
 - Every reader job (executor, validator, batcher, egress) has the meta `relayed_full_ref = "true"`, and every live
@@ -81,7 +84,7 @@ Restart one sequencer of each pair: `nomad alloc restart <alloc>`. Then watch R 
 minutes under the canary:
 
 ```sh
-curl -s "http://<egress-node>.node.dc1.consul:9013/metrics" | grep -E '^kardamom_egress_ref_frame_max_(index|block) '
+curl -s "http://<egress-node>.node.dc1.consul:9013/metrics" | grep -E '^kardamom_egress_ref_frame_max_(index|block)[{ ]'
 ```
 
 Checks:
@@ -153,7 +156,8 @@ Checks:
 
 - Each member logs `cluster FEATURE-ACTIVATION` with `feature=5` and `outcome=STORED`.
 - `kardamom_sealer_feature_state{feature="5"}` is 1 on each member.
-- From here, the members write snapshot version 18, and the release gate refuses a rollback of the release.
+- From here, the members write snapshot version 18. A release that reads only up to version 17 stops on it. Do not
+  roll the sealer back to such a release. See "A rollback after step 8" below.
 
 ### 9. Watch the switch
 
@@ -199,6 +203,28 @@ Raise `KARDAMOM_CLUSTER_RETENTION` with a rolling deploy. The rule is `retention
 - The gate refuses a lower value unless `KARDAMOM_ALLOW_MUST_MATCH=retention`.
 - A rate above about 2,180 tx/s needs the retained file or a change to the replay path.
 
+### A rollback after step 8
+
+After the first snapshot of version 18, a sealer member of a release that reads only up to version 17 stops at its
+next start. Nothing in the deploy refuses that rollback yet:
+
+- `just rollback` (`tasks/revert.yml`) runs no release gate.
+- A deploy of an older manifest from this checkout reads `reads_max` from the `formats.toml` of this checkout, not of
+  the older release.
+
+The snapshot check of the rollback is in work in #783. Until it ships, check by hand before any rollback of the
+sealer:
+
+1. Read `snapshotLatest` of each member:
+
+   ```sh
+   for i in 0 1 2; do curl -s "http://sealer-$i.node.dc1.consul:40205/status" | jq '{memberId, snapshotLatest}'; done
+   ```
+
+2. Read `reads_max` of `[format.sealer-snapshot]` in the `formats.toml` of the release to roll back to:
+   `git show <revision>:formats.toml`.
+3. If a member reports `snapshotLatest` above that `reads_max`, do not roll the sealer back. Fix forward.
+
 ### After a rollback of the egress
 
 An egress of an older release stores references but does not raise its reference mark. So after a rollback of the
@@ -214,6 +240,10 @@ egress, the mark can be too low, and R is not true.
    - for step 10, `kardamom_executor_block_number` minus 32 above B.
 
 After the switch of step 9, the sealer refuses each new reference, so a rollback of the egress then adds none.
+
+This rule is manual. A follow-up can remove it: `Store::open` of the egress can rebuild the mark from the segments, as
+the highest reference of every segment (`RefMark::top` over each one), and not only read the side file. Then a
+deploy of the new release after a rollback gives a true R again.
 
 ### What staging needs (kardamom-infra)
 

@@ -369,7 +369,9 @@ The executors on the sealer nodes:
 The staged roll of the executors:
 
 - Nomad orders no groups, so one registration of the pinned groups would replace every executor at once. So the role rolls them one group at a time (`tasks/executor.yml`, `tasks/roll_step.yml`), the same way as the sealer members. It waits for the health check of each group before the next step.
-- The move from the executor nodes goes one executor at a time too. Each step lowers the count of the group on the executor nodes by one and starts the pinned group of the same id, from the highest id down. Nomad stops the allocation with the highest index first, and that index is the id of the executor.
+- The move from the executor nodes goes one executor at a time too, from the highest id down. Each step has two registrations. The first lowers the count of the group on the executor nodes by one, and the role waits until that allocation stops. Nomad stops the allocation with the highest index first, and that index is the id of the executor. The second starts the pinned group of that id. So two executors never run with one id. The last step removes the group on the executor nodes.
+- The group on the executor nodes keeps the job constraint of the registered job during the move. That is an in-place update for Nomad: it restarts no executor.
+- After each registration, the role waits for the deployment that the evaluation of that registration names, not for the latest deployment of the job.
 - During the move, the jobs that follow the executors already ask `sealer-<i>`. An executor that did not move yet does not answer there, so they ask the others.
 - A new job, or a move back to the executor nodes, registers in one step.
 - `just rollback` rolls the pinned groups back one group at a time when both versions have them.
@@ -384,18 +386,20 @@ The gates of the carry window refuse a move before any job changes. Each gate ru
 
 - The preflight:
   - `KARDAMOM_EXEC_ON_SEALERS=on` without `KARDAMOM_MEMBER_FEED=on`, or with an executor count other than the sealer count.
-  - `KARDAMOM_CARRY_EXECUTORS` with an index that repeats or has no member, or without `KARDAMOM_EXEC_ON_SEALERS=on` and `KARDAMOM_EGRESS=1`, or with `KARDAMOM_EXEC_CURSOR=on`.
+  - `KARDAMOM_CARRY_EXECUTORS` with an index that repeats or has no member, or without `KARDAMOM_EXEC_ON_SEALERS=on`, `KARDAMOM_EGRESS=1` and the egress URL of the executors, or with `KARDAMOM_EXEC_CURSOR=on`.
   - `KARDAMOM_SEALER_VERSION_FLOOR` other than empty or 0 to 5.
   - `KARDAMOM_CLUSTER_RETENTION` above 131,072 frames.
 - The version floor, when it changes to a value above 0:
   - a sealer job that Nomad does not know: a new chain starts on decision version 3;
   - a member that does not run, or a floor above the lowest `decisionVersion` of the members;
   - an executor, validator, batcher or egress job without the meta `relayed_full_ref`, or a live allocation of an older job version. Without the egress job, the egress passes.
+- A batcher or validator job that Nomad does not know, switched to the egress on a live chain (a registered sealer). It has no block to read. Deploy it on the cluster egress first.
 - The move of the batcher or the validator to the egress (`KARDAMOM_BATCHER_EGRESS`, `KARDAMOM_VALIDATOR_EGRESS`), when the registered job does not carry the meta `reads_egress`:
   - an egress job without the meta `ref_mark`, or a live egress allocation of an older job version;
   - an egress instance that does not report `kardamom_egress_ref_frame_max_index` and `kardamom_egress_ref_frame_max_block`;
   - a batcher whose `kardamom_batcher_last_posted_block`, or a validator whose `validator_committed_block`, is not above the highest `kardamom_egress_ref_frame_max_block`.
 - The move of an executor to carry mode, for each listed executor that does not carry yet:
+  - a sealer job that Nomad does not know;
   - a group `executor-<i>` that does not run on the sealer nodes;
   - an executor job without the meta `carried_ref_fault`;
   - a member that does not run, or that reports `carryWindow` false;
@@ -406,7 +410,7 @@ The gates of the carry window refuse a move before any job changes. Each gate ru
   - a lower value than the registered sealer, unless `KARDAMOM_ALLOW_MUST_MATCH` names `retention`;
   - a value whose frames, at the mean frame size of the members, pass 48 MiB, well below the 64 MiB backlog limit of a cluster session. At a mean of 300 bytes, 131,072 frames (about 39.3 MB) fit. The mean is the sum of `retainedBytes` over the sum of `retainedFrames` of the member status (the gauges `kardamom_sealer_retained_bytes` and `kardamom_sealer_retained_frames`).
 
-The gates read the metrics of each instance by the node address that the Nomad API advertises: the egress on `ports.egress_metrics`, the batcher on 9002, the validator on 9006, the executor on 9004, and the sealer on its admin port (`workloads_metrics_ports`). An instance that does not answer counts as `-1`, so the gate refuses.
+The gates read the metrics of each instance by the node address that the Nomad API advertises. A gauge matches a sample with the labels of its exporter (`service` and `host_id`, or `service` and `member_id` on a sealer), and a gauge with labels, such as `kardamom_sealer_feature_state{feature="5"}`, matches the sample that carries each of them. The ports: the egress on `ports.egress_metrics`, the batcher on 9002, the validator on 9006, the executor on 9004, and the sealer on its admin port (`workloads_metrics_ports`). An instance that does not answer counts as `-1`, so the gate refuses.
 
 The order on a live chain:
 
