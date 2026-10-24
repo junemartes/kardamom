@@ -36,6 +36,9 @@
   ansible.builtin.set_fact:
     workloads_rollback_jobs: >-
       {{ workloads_last_attempt.changed | reverse | reject('in', workloads_last_attempt.rolled_back | default([])) | list }}
+    workloads_rollback_sealer: >-
+      {{ 'cluster' in workloads_last_attempt.changed | reject('in', workloads_last_attempt.rolled_back | default([]))
+         and (workloads_last_attempt.before.jobs.cluster | default({})).before | default(none) is not none }}
 
 - name: Report the rollback
   ansible.builtin.debug:
@@ -79,6 +82,25 @@
       Nomad no longer holds the pre-release version of {{ workloads_rollback_dropped | default([]) | join(', ') }}.
       Re-render the release before from its manifest: `just rollback-rerender {{ workloads_env }}` deploys
       deployed/{{ workloads_env }}/rollback.digests with the job files of this checkout.
+
+# The sealer members restart on the release before, so that release must
+# read the newest snapshot of every member (snapshot_check.yml). The check
+# runs before the first revert: the sealer reverts late in the reverse
+# order, and a refusal there would leave the other jobs rolled back.
+- name: Read the registered sealer for the snapshot check
+  ansible.builtin.include_tasks: read_job.yml
+  vars:
+    workloads_read_job: cluster
+  when: workloads_rollback_sealer | bool
+
+- name: Check the sealer snapshot against the release before
+  ansible.builtin.include_tasks: snapshot_check.yml
+  vars:
+    workloads_sealer_groups: "{{ workloads_registered_job.json.TaskGroups | map(attribute='Name') | list }}"
+    workloads_snapshot_revision: "{{ workloads_last_attempt.before.revision }}"
+  when:
+    - workloads_rollback_sealer | bool
+    - workloads_registered_job.status == 200
 
 - name: Initialize the readiness state
   ansible.builtin.set_fact:

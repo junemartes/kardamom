@@ -668,10 +668,10 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
   - `diskFreeBytes` is the free space of the disk of the cluster directory: the Raft log and the retained file. `/metrics` exports the same value.
   - `snapshotWrites`, `snapshotReadsMin` and `snapshotReadsMax` are the snapshot versions of this release, as `formats.toml` lists them.
   - `snapshotLatest` is the version of the newest snapshot this member restored or took. It is 0 before either.
-  - The release gate of a deploy (`deploy/cluster/ansible/roles/workloads/tasks/gate.yml`) reads `snapshotLatest` on every configured member before any job changes. It refuses a release whose `formats.toml` gives a sealer snapshot `reads_max` below that version, because that member could not restore its own snapshot after the roll.
-  - The gate runs the check only when the plan of the sealer job shows a change, such as a new image digest. A running member reads no snapshot. The gate logs the skip.
-  - The gate skips the check when Nomad does not know the sealer job. When the sealer job changes, the gate refuses while a configured member does not run, because it cannot read the version of that member. A release that does not change the sealer job passes while a member is down.
-  - `just rollback` reverts job versions and does not run the gate.
+  - The snapshot check (`deploy/cluster/ansible/roles/workloads/tasks/snapshot_check.yml`) reads `snapshotLatest` on every configured member before any job changes. It refuses a sealer release whose `formats.toml` gives a sealer snapshot `reads_max` below that version, because that member could not restore its own snapshot after the restart.
+  - The check reads `formats.toml` at the revision of the sealer release, not in the checkout. For a deploy, that is the revision that the deploy record names for the target sealer image, else the target revision. For `just rollback`, it is the revision of the release before.
+  - The release gate of a deploy runs the check only when the plan of the sealer job shows a change, such as a new image digest. A running member reads no snapshot. The gate logs the skip. `just rollback` runs the check before its first revert when it reverts the sealer.
+  - The check is skipped when Nomad does not know the sealer job. It refuses while a configured member does not run, because it cannot read the version of that member. A release that does not change the sealer job passes while a member is down.
 - A member is ready when all of these are true:
   - the role is `LEADER` or `FOLLOWER`
   - the election state is `CLOSED`

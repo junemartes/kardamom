@@ -249,9 +249,12 @@ class NomadAPI(BaseHTTPRequestHandler):
             octet = int(self.headers['Host'].split(':')[0].rsplit('.', 1)[1])
             node = f'node-cluster-{octet - 1}'
             default = 'LEADER' if node.endswith('-0') else 'FOLLOWER'
+            # A snapshotLatest of None stands for a member of a release
+            # without the field.
+            latest = state.get('snapshot_latest', {}).get(node, 0)
             self.respond({'memberId': octet - 1, 'role': state['roles'].get(node, default), 'election': 'CLOSED',
-                          'snapshotReadsMax': state.get('reads_max', {}).get(node, 15),
-                          'snapshotLatest': state.get('snapshot_latest', {}).get(node, 0)})
+                          'snapshotReadsMax': state.get('reads_max', {}).get(node, 15)}
+                         | ({} if latest is None else {'snapshotLatest': latest}))
         elif parts[2] == 'job' and parts[4] == 'deployment':
             # A job with a scripted deployment gets one; every other job
             # has none, like a system job.
@@ -485,6 +488,24 @@ class Deploys(unittest.TestCase):
         Path(str(self.deploy_bin) + '.findings').write_text(json.dumps(findings))
         self.repin('b')
 
+    def target_snapshot_reads_max(self, version):
+        """Commit a target release with a sealer snapshot reads_max of `version`, and return its revision."""
+        formats = self.repo / 'formats.toml'
+        formats.write_text(re.sub(r'(\[format\.sealer-snapshot\][^\[]*?reads_max = )\d+', rf'\g<1>{version}',
+                                  formats.read_text()))
+        return self.commit(f'the release that reads snapshot version {version}')
+
+    def two_sealer_releases(self):
+        """Deploy release a, which reads snapshot version 16, then release b, which reads 17. A member then
+        holds a snapshot of version 17. Return the revision of release a."""
+        revision = self.target_snapshot_reads_max(16)
+        self.run_deploy()
+        self.target_snapshot_reads_max(17)
+        self.repin('b')
+        self.run_deploy()
+        self.api.state['snapshot_latest'] = {'node-cluster-1': 17}
+        self.api.state['writes'] = []
+        return revision
 
 class DeployTest(Deploys):
     """The deploy: order, pins, secrets, waits, canary, sealer roll."""
@@ -1410,12 +1431,6 @@ class RecordTest(Deploys):
         self.assertIn('the registered sealer job names decisionVersion=3', output)
         self.assertEqual(self.api.state['writes'], [])
 
-    def target_snapshot_reads_max(self, version):
-        """Give the target release a sealer snapshot reads_max of `version`."""
-        formats = self.repo / 'formats.toml'
-        formats.write_text(re.sub(r'(\[format\.sealer-snapshot\][^\[]*?reads_max = )\d+', rf'\g<1>{version}',
-                                  formats.read_text()))
-
     def test_a_release_that_cannot_read_the_newest_sealer_snapshot_is_refused(self):
         self.deploy()
         self.api.state['writes'] = []
@@ -1436,7 +1451,8 @@ class RecordTest(Deploys):
         self.assertIn('the sealer members cluster-2 do not run', output)
         self.assertEqual(self.api.state['writes'], [])
         del self.api.state['down_groups']
-        self.api.state['snapshot_latest'] = {f'node-cluster-{member}': 16 for member in range(3)}
+        # A member of a release without snapshotLatest reads as 0.
+        self.api.state['snapshot_latest'] = {'node-cluster-0': None, 'node-cluster-1': 16, 'node-cluster-2': 16}
         self.run_deploy()
         self.assertEqual(sorted(set(self.api.state['writes'])), sorted(self.REPINNED))
 
@@ -1457,7 +1473,7 @@ class RecordTest(Deploys):
         self.target_snapshot_reads_max(16)
         self.api.state['snapshot_latest'] = {'node-cluster-0': 17}
         output = self.run_deploy(check=True)
-        self.assertRegex(output, r'cannot read the newest snapshot of a sealer member\] \*+\nskipping')
+        self.assertRegex(output, r'Check the sealer snapshot against the target\] \*+\nskipping')
         self.assertIn('cluster', self.api.state['plans'])
 
     def upgrade_check(self, success=True, feature='5', activation_ms=''):
@@ -1777,6 +1793,22 @@ class RollbackTest(Deploys):
         rerender = (self.record_dir / 'rollback.digests').read_text()
         self.assertIn(f'ingress registry.example:5000/kardamom-ingress:test@sha256:{"a" * 64}\n', rerender)
         self.assertEqual(len(rerender.splitlines()), len(MANIFEST))
+
+    def test_a_rollback_below_the_newest_sealer_snapshot_is_refused(self):
+        revision = self.two_sealer_releases()
+        output = self.run_rollback(success=False)
+        self.assertIn(f'the sealer release of revision {revision} reads sealer snapshots only up to version 16', output)
+        self.assertIn('cluster-1 at version 17.', output)
+        self.assertEqual(self.api.state['writes'], [], 'the check runs before the first revert')
+
+    def test_a_deploy_of_an_older_sealer_image_reads_the_formats_of_its_revision(self):
+        """The manifest of release a, deployed from the checkout of release b: the record names the revision of
+        the sealer image."""
+        revision = self.two_sealer_releases()
+        self.repin('a')
+        output = self.run_deploy(success=False)
+        self.assertIn(f'the sealer release of revision {revision} reads sealer snapshots only up to version 16', output)
+        self.assertEqual(self.api.state['writes'], [])
 
     def test_a_rollback_without_a_record_refuses(self):
         output = self.run_rollback(success=False)

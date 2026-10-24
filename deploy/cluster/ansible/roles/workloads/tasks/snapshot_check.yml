@@ -1,0 +1,67 @@
+---
+# The sealer snapshot check. A member restores its newest snapshot at its
+# start. A member that holds a snapshot of a version above the sealer
+# snapshot reads_max of the release that it restarts on cannot restore
+# it, and stops. workloads_snapshot_revision names that release, and
+# workloads_sealer_groups names the configured members. A member that
+# does not run can hold the newest snapshot, and the check cannot read
+# its version, so the check refuses. The check reads only, so it also
+# runs in check mode.
+- name: Read formats.toml of the sealer release with git
+  ansible.builtin.command:
+    argv: [git, -C, "{{ workloads_repo_root }}", show, "{{ workloads_snapshot_revision }}:formats.toml"]
+  register: workloads_snapshot_git
+  failed_when: false
+  changed_when: false
+  check_mode: false
+
+- name: Read formats.toml of the sealer release with jj
+  ansible.builtin.command:
+    argv: [jj, -R, "{{ workloads_repo_root }}", file, show, -r, "{{ workloads_snapshot_revision }}", formats.toml]
+  register: workloads_snapshot_jj
+  failed_when: false
+  changed_when: false
+  check_mode: false
+  when: workloads_snapshot_git.rc != 0
+
+- name: Refuse a sealer release whose formats the checkout does not hold
+  ansible.builtin.assert:
+    that: workloads_snapshot_git.rc == 0 or workloads_snapshot_jj.rc | default(1) == 0
+    fail_msg: >-
+      Refused: the checkout {{ workloads_repo_root }} holds no formats.toml at the revision
+      "{{ workloads_snapshot_revision }}" of the sealer release, so the check cannot read the snapshot versions
+      that the sealer of that release reads. Fetch that revision into the checkout, then run again.
+
+- name: Keep the snapshot read maximum of the sealer release
+  ansible.builtin.set_fact:
+    workloads_snapshot_reads_max: >-
+      {{ ((workloads_snapshot_git.stdout if workloads_snapshot_git.rc == 0 else workloads_snapshot_jj.stdout)
+          | community.general.from_toml)['format']['sealer-snapshot']['reads_max'] | int }}
+
+- name: Read the status of every sealer member
+  ansible.builtin.include_tasks: sealer_status.yml
+
+- name: Refuse while a sealer member does not run
+  ansible.builtin.assert:
+    that: workloads_sealer_down | length == 0
+    fail_msg: >-
+      Refused: the sealer members {{ workloads_sealer_down | join(', ') }} do not run, so the check cannot read
+      the version of their newest snapshot. Start them and let them catch up, then run again.
+
+# A member of a release without snapshotLatest reports no version. The
+# check reads it as 0.
+- name: Refuse a sealer release that cannot read the newest snapshot of a member
+  ansible.builtin.assert:
+    that: workloads_snapshot_unreadable | length == 0
+    fail_msg: >-
+      Refused: the sealer release of revision {{ workloads_snapshot_revision }} reads sealer snapshots only up to
+      version {{ workloads_snapshot_reads_max }} (formats.toml, sealer-snapshot reads_max), and these sealer members
+      hold a newer snapshot: {{ workloads_snapshot_unreadable | map('join', ' at version ') | join(', ') }}.
+      After the restart such a member cannot restore its own snapshot, and stops.
+      Deploy a release that reads snapshot version {{ (workloads_snapshot_unreadable | map('last') | list + [0]) | max }}.
+      Do not roll the sealer back below it.
+  vars:
+    workloads_snapshot_unreadable: >-
+      {{ workloads_sealer_status.results | map(attribute='item.item.TaskGroup')
+         | zip(workloads_sealer_status.results | map(attribute='json.snapshotLatest', default=0))
+         | rejectattr('1', 'le', workloads_snapshot_reads_max | int) | list }}
