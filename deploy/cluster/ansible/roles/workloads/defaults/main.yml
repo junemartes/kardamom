@@ -56,6 +56,10 @@ workloads_common_vars:
   # One value for the longest idle wait of every hot-path thread: the
   # media drivers, the sealer and the Rust poll loops.
   idle_cap_us: "{{ workloads_idle_cap_us }}"
+  # The notifier on its own nodes: the notifier job places on them, and the
+  # aeron job gives their media drivers the notifier idle cap.
+  notifier_nodes: "{{ workloads_notifier_nodes }}"
+  notifier_count: "{{ workloads_notifier_count }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
 # workloads_l1_rpc_given keeps the given value: anvil.yml overwrites
@@ -234,6 +238,14 @@ workloads_aeron_stall_tolerance_ms: "{{ lookup('env', 'AERON_STALL_TOLERANCE_MS'
 # to 1000000. A message that reaches an idle thread waits up to this long.
 # A lower value costs more idle CPU. The container recipes set 1000.
 workloads_idle_cap_us: "{{ lookup('env', 'KARDAMOM_IDLE_CAP_US') | default('50', true) }}"
+# The notifier on the nodes of role notifier (nomad/notifier.nomad.hcl):
+# "on" or "off". Empty keeps the job's "off" default: the notifier stays on
+# the ingress nodes. Switch it on only when the notifier nodes exist.
+workloads_notifier_nodes: "{{ lookup('env', 'KARDAMOM_NOTIFIER_NODES') }}"
+# The notifier instance count with the switch on: the count of the
+# notifier nodes. Empty keeps the job's default, 1. The preflight refuses
+# a count above the count of the ready notifier nodes.
+workloads_notifier_count: "{{ lookup('env', 'KARDAMOM_NOTIFIER_COUNT') }}"
 workloads_light_execution_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_EXECUTION_RPC') }}"
 workloads_light_consensus_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_CONSENSUS_RPC') }}"
 workloads_light_checkpoint: "{{ lookup('env', 'L1_LIGHT_CLIENT_CHECKPOINT') }}"
