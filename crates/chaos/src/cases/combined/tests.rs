@@ -137,22 +137,80 @@ fn started_nodes_count_as_back_when_their_job_reaches_its_count() {
 #[test]
 fn every_job_that_returned_is_checked_for_a_restart_at_the_end() {
     assert_eq!(
-        ALL_THREE.restart_proofs(),
+        ALL_THREE.placed(ExecutorNodes::Executor).restart_proofs(),
         [Class::Ingress, Class::Sequencer]
     );
-    assert_eq!(INGRESS_SEALER.restart_proofs(), [Class::Ingress]);
     assert_eq!(
-        INGRESS_SEQUENCER.restart_proofs(),
+        INGRESS_SEALER
+            .placed(ExecutorNodes::Executor)
+            .restart_proofs(),
+        [Class::Ingress]
+    );
+    assert_eq!(
+        INGRESS_SEQUENCER
+            .placed(ExecutorNodes::Executor)
+            .restart_proofs(),
         [Class::Ingress, Class::Sequencer]
     );
     // A stopped job is a restored job, so it is checked too; killed
     // nodes are judged by their count.
     assert_eq!(
-        READ_PATH.restart_proofs(),
+        READ_PATH.placed(ExecutorNodes::Executor).restart_proofs(),
         [Class::Executor, Class::Redis, Class::StateMirror]
     );
-    assert_eq!(EXECUTOR_SEALER.restart_proofs(), Vec::<Class>::new());
-    assert_eq!(INGRESS_EXECUTOR.restart_proofs(), [Class::Ingress]);
+    assert_eq!(
+        EXECUTOR_SEALER
+            .placed(ExecutorNodes::Executor)
+            .restart_proofs(),
+        Vec::<Class>::new()
+    );
+    assert_eq!(
+        INGRESS_EXECUTOR
+            .placed(ExecutorNodes::Executor)
+            .restart_proofs(),
+        [Class::Ingress]
+    );
+}
+
+#[test]
+fn on_the_sealer_nodes_the_executors_and_the_members_go_down_by_task() {
+    let carry = |c: Combined| c.placed(ExecutorNodes::Sealer);
+    // The executors return a minute before the members, and wait.
+    let placed = carry(EXECUTOR_SEALER);
+    assert_eq!(placed.down, [Class::Executor, Class::SealerTasks]);
+    assert_eq!(
+        Recovery::Reverse(Duration::from_secs(60))
+            .plan(&placed.down)
+            .into_iter()
+            .flat_map(|w| w.classes)
+            .collect::<Vec<_>>(),
+        [Class::Executor, Class::SealerTasks]
+    );
+    assert_eq!(
+        placed.restart_proofs(),
+        [Class::Executor, Class::SealerTasks]
+    );
+    assert!(placed.executors_down() && placed.sealers_down());
+    assert_eq!(
+        carry(EXECUTOR_SEALER_VALIDATOR).down,
+        [Class::Executor, Class::SealerTasks, Class::Validator]
+    );
+    assert_eq!(
+        carry(INGRESS_EXECUTOR).down,
+        [Class::Executor, Class::Ingress]
+    );
+    // A node kill of the members alone also takes the executors on the
+    // nodes, so the case waits for their exporters.
+    let sealers = carry(INGRESS_SEALER);
+    assert_eq!(sealers.down, [Class::Ingress, Class::Sealer]);
+    assert!(sealers.executors_down());
+    assert!(
+        !INGRESS_SEALER
+            .placed(ExecutorNodes::Executor)
+            .executors_down()
+    );
+    assert_eq!(Class::SealerTasks.job(), "cluster");
+    assert_eq!(Class::SealerTasks.fault_kind(), FaultKind::KillTasks);
 }
 
 #[test]

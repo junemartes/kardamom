@@ -32,13 +32,20 @@ impl Watched {
     }
 }
 
-const WATCHED: [Watched; 2] = [
+/// The executors run on the executor nodes, or on the sealer nodes of a
+/// cluster with the executors there. A node with no such task prints a
+/// line that says so.
+const WATCHED: [Watched; 3] = [
     Watched {
         role: "sealer",
         task: "cluster",
     },
     Watched {
         role: "executor",
+        task: "executor",
+    },
+    Watched {
+        role: "sealer",
         task: "executor",
     },
 ];

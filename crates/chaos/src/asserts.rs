@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::harness::Harness;
 use crate::inject::Killed;
+use crate::knobs::ExecutorNodes;
 use crate::metrics;
 use crate::nomad::Alloc;
 use crate::poll::{self, Budget};
@@ -77,6 +78,45 @@ impl Standing {
             Some(floor) if block <= floor => Self::Stalled(node.to_string(), block),
             _ => Self::Converged,
         }
+    }
+}
+
+/// The head that a stall check reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallHead {
+    /// The highest executor block.
+    Executor,
+    /// The highest sealed head that an ingress read from the sealer.
+    Ingress,
+}
+
+impl StallHead {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Executor => "executor block",
+            Self::Ingress => "ingress sealed head",
+        }
+    }
+
+    async fn read(self, h: &Harness) -> Option<i64> {
+        match self {
+            Self::Executor => h.probes.executor_progress().await,
+            Self::Ingress => h.probes.ingress_sealed_head().await,
+        }
+    }
+
+    /// One reading, retried for twelve seconds.
+    async fn sample(self, h: &Harness) -> Option<i64> {
+        let outcome = poll::until(
+            Budget::secs(12, 3),
+            |_| async move { Ok(self.read(h).await) },
+        )
+        .await
+        .ok()?;
+        outcome
+            .or_fail(|_| anyhow::anyhow!("no sample"))
+            .ok()
+            .map(|(v, _)| v)
     }
 }
 
@@ -353,44 +393,49 @@ impl Harness {
     }
 
     /// The must-not-progress check: the executor block gauge stays flat
-    /// over `window`. Both samples must be real scrapes; an unreachable
-    /// gauge is a harness failure, because the executors survive a
-    /// sealer quorum loss.
+    /// over `window`. Both samples must be real scrapes of one head. The
+    /// executors survive a sealer quorum loss, so they give the head. When
+    /// no executor answers and the executors run on the sealer nodes, they
+    /// died with the nodes, and the sealed head of the ingresses gives it.
     ///
     /// # Errors
     ///
-    /// Returns an error if a sample is missing or the gauge advanced.
+    /// Returns an error if a sample is missing or the head advanced.
     pub async fn assert_executor_stalled(&self, window: Duration) -> anyhow::Result<()> {
-        let e0 = self.progress_sample().await.ok_or_else(|| {
-            crate::chaos_fail!("stall assert: no executor gauge scrapeable BEFORE the window — cannot observe the stall")
+        let head = match (self.progress_sample().await, self.knobs.executor_nodes) {
+            (None, ExecutorNodes::Sealer) => StallHead::Ingress,
+            _ => StallHead::Executor,
+        };
+        let e0 = head.sample(self).await.ok_or_else(|| {
+            crate::chaos_fail!(
+                "stall assert: no {} scrapeable BEFORE the window — cannot observe the stall",
+                head.name()
+            )
         })?;
         tokio::time::sleep(window).await;
-        let e1 = self.progress_sample().await.ok_or_else(|| {
-            crate::chaos_fail!("stall assert: no executor gauge scrapeable AFTER the window — cannot observe the stall")
+        let e1 = head.sample(self).await.ok_or_else(|| {
+            crate::chaos_fail!(
+                "stall assert: no {} scrapeable AFTER the window — cannot observe the stall",
+                head.name()
+            )
         })?;
         anyhow::ensure!(
             e1 == e0,
-            "{}: pipeline UNEXPECTEDLY progressed while quorum lost (executor block {e0} -> {e1})",
-            crate::FAIL_PREFIX
+            "{}: pipeline UNEXPECTEDLY progressed while quorum lost ({} {e0} -> {e1})",
+            crate::FAIL_PREFIX,
+            head.name()
         );
         crate::log(format!(
-            "pipeline correctly STALLED (executor block {e0} -> {e1} over {}s, no false progress)",
+            "pipeline correctly STALLED ({} {e0} -> {e1} over {}s, no false progress)",
+            head.name(),
             window.as_secs()
         ));
         Ok(())
     }
 
-    /// One executor-progress reading, retried five times.
+    /// One executor-progress reading, retried for twelve seconds.
     async fn progress_sample(&self) -> Option<i64> {
-        let outcome = poll::until(Budget::secs(12, 3), |_| async move {
-            Ok(self.probes.executor_progress().await)
-        })
-        .await
-        .ok()?;
-        outcome
-            .or_fail(|_| anyhow::anyhow!("no sample"))
-            .ok()
-            .map(|(v, _)| v)
+        StallHead::Executor.sample(self).await
     }
 
     /// The restarted-replica health probe: the sequencer exporter at

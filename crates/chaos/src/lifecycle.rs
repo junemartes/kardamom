@@ -37,6 +37,10 @@ const APPLY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(15
 /// reads them from the environment, and a case reads the same values
 /// from its knobs, so one setting drives both sides.
 #[derive(Debug, Clone, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one independent deploy variable that Ansible reads on its own"
+)]
 pub struct DeployVars {
     /// `-Dkardamom.cluster.snapshotIntervalS` of the sealer.
     pub cluster_snapshot_interval_s: Option<u64>,
@@ -59,6 +63,14 @@ pub struct DeployVars {
     /// `--checkpoint-log` of the executors: each one keeps the block log
     /// of its checkpoints.
     pub checkpoint_log: bool,
+    /// A carry-born cluster (`KARDAMOM_GENESIS_CARRY=on`). The chain starts
+    /// with features 3, 4 and 5 active at genesis, and the deploy turns on
+    /// every switch of the carry window: the member feed, the executors on
+    /// the sealer nodes in carry mode, the egress, the batcher and the
+    /// validator on the egress, the v2 loop of the sequencers, and the
+    /// version floor 5. The deploy accepts it only for a new cluster, or
+    /// for a registered sealer job that has the genesis features.
+    pub genesis_carry: bool,
     /// The switches of the carry window. See [`CarrySwitches`].
     pub carry: CarrySwitches,
 }
@@ -130,7 +142,9 @@ impl DeployVars {
         on.then(|| (name, value.to_string()))
     }
 
-    fn env(&self) -> Vec<(&'static str, String)> {
+    /// The deploy variables, as Ansible reads them. The knobs of a shard
+    /// read the same pairs (see [`crate::Knobs::deployed`]).
+    pub(crate) fn env(&self) -> Vec<(&'static str, String)> {
         [
             self.cluster_snapshot_interval_s
                 .map(|v| ("KARDAMOM_CLUSTER_SNAPSHOT_S", v.to_string())),
@@ -145,6 +159,7 @@ impl DeployVars {
                 .map(|v| ("L1_SILENCE_S", v.to_string())),
             Self::switch(self.exec_cursor, "KARDAMOM_EXEC_CURSOR", "on"),
             Self::switch(self.checkpoint_log, "KARDAMOM_CHECKPOINT_LOG", "on"),
+            Self::switch(self.genesis_carry, "KARDAMOM_GENESIS_CARRY", "on"),
         ]
         .into_iter()
         .chain(self.carry.env())
@@ -486,6 +501,7 @@ mod tests {
     fn the_carry_switches_reach_the_deploy_variables() {
         let vars = DeployVars {
             exec_cursor: true,
+            genesis_carry: true,
             carry: CarrySwitches {
                 exec_on_sealers: true,
                 egress: EgressStage::Readers,
@@ -499,6 +515,7 @@ mod tests {
         let env = vars.env();
         let want = [
             ("KARDAMOM_EXEC_CURSOR", "on"),
+            ("KARDAMOM_GENESIS_CARRY", "on"),
             ("KARDAMOM_MEMBER_FEED", "on"),
             ("KARDAMOM_EXEC_ON_SEALERS", "on"),
             ("KARDAMOM_EXEC_FRAMES", "on"),

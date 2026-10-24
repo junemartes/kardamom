@@ -93,7 +93,7 @@ async fn run_audited(harness: &mut Harness, case: &str, audit: bool) -> anyhow::
 }
 
 async fn run_shard(shard: Shard) -> anyhow::Result<()> {
-    let knobs = Knobs::read(shard.env())?;
+    let knobs = shard.knobs()?;
     let lifecycle = Lifecycle::in_workspace().with_vars(shard.deploy_vars());
     let contract = if reuse() {
         lifecycle.contract()?

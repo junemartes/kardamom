@@ -1,7 +1,9 @@
 //! The sequencer lapse and the retention-overrun cases: a running
 //! consumer is frozen with SIGSTOP and must repair itself on thaw.
 
+mod heal;
 mod repair;
+use heal::{Heal, assert_no_repair, await_egress_read};
 use repair::Repair;
 
 use std::cell::Cell;
@@ -252,7 +254,7 @@ async fn engaged(
 /// Which consumer the retention overrun freezes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Victim {
-    /// executor-2; nodes 0 and 1 stay untouched as checkpoint donors.
+    /// Executor 2; executors 0 and 1 stay untouched as checkpoint donors.
     Executor,
     Validator,
 }
@@ -277,17 +279,21 @@ impl Victim {
 /// retention rolls past its cursor, so on thaw its replay is refused
 /// and it must repair itself: fetch a peer checkpoint, park the stale
 /// state, restore or adopt it in-process, and rejoin. The repair burns
-/// no orchestrator restart (issue #298): the process that logged the
-/// refusal is the one that logs the restore. The freeze itself does
-/// cost one restart, before the refusal: a SIGSTOP longer than the Aeron
-/// client's service interval makes the client exit on resume, and Nomad
-/// restarts the task. The freeze lasts at least the evicting freeze of
-/// the deployed Aeron stall tolerance, so the restart happens at any
-/// tolerance. The freeze also crosses the cluster session
-/// timeout, so the resume goes through a fresh session.
+/// no orchestrator restart: the process that logged the refusal is the
+/// one that logs the restore. The freeze itself does cost one restart,
+/// before the refusal: a SIGSTOP longer than the Aeron client's service
+/// interval makes the client exit on resume, and Nomad restarts the task.
+/// The freeze lasts at least the evicting freeze of the deployed Aeron
+/// stall tolerance, so the restart happens at any tolerance. The freeze
+/// also crosses the cluster session timeout, so the resume goes through a
+/// fresh session.
+///
+/// On a carry-born cluster the sealer keeps the exact window, and the
+/// consumer heals from the egress instead (see [`Heal::Egress`]).
 pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow::Result<()> {
     let kind = victim.kind();
     let ctx = format!("retention-overrun({kind})");
+    let heal = Heal::of(h.knobs.genesis_carry);
     let retention = h.knobs.cluster_retention.ok_or_else(|| {
         crate::chaos_fail!("{ctx}: KARDAMOM_CLUSTER_RETENTION is not set — this case only means something on a cluster deployed with a small -Dkardamom.cluster.retention")
     })?;
@@ -306,10 +312,10 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
         .inner_container(&node, kind)
         .await
         .ok_or_else(|| crate::chaos_fail!("{ctx}: no inner {kind} container on {node}"))?;
-    let donor = h.container("executor-0")?;
+    let donor = h.probes.executors[0].container.clone();
     super::component::wait_peer_checkpoint(h, &donor, &ctx).await?;
     require_live_victim(h, victim, &ctx).await?;
-    let repair = Repair::capture(h, victim, &node).await?;
+    let repair = Repair::capture(h, victim, &node, heal.needles(victim)).await?;
     let need = i64::try_from(retention.get().saturating_mul(2)).unwrap_or(i64::MAX);
     let rx_freeze =
         h.probes.ingress_counts().await.complete().ok_or_else(|| {
@@ -333,10 +339,17 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
             "{ctx}: SIGCONT failed (container may have been replaced mid-freeze); the log asserts below own the verdict"
         ));
     }
-    await_repair_chain(h, victim, &ctx, delta, elapsed, &repair).await?;
+    match heal {
+        Heal::Repair => await_repair_chain(h, victim, &ctx, delta, elapsed, &repair).await?,
+        Heal::Egress => await_egress_read(h, victim, &ctx, &repair).await?,
+    }
     match victim {
-        Victim::Executor => h.assert_executor_progress(Duration::from_mins(3)).await,
-        Victim::Validator => await_verifying_resumed(h).await,
+        Victim::Executor => h.assert_executor_progress(Duration::from_mins(3)).await?,
+        Victim::Validator => await_verifying_resumed(h).await?,
+    }
+    match heal {
+        Heal::Repair => Ok(()),
+        Heal::Egress => assert_no_repair(h, &ctx, &repair).await,
     }
 }
 

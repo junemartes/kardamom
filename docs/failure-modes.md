@@ -488,7 +488,7 @@ The executors are deterministic state machines. One dead or lagging replica neve
     - `kardamom_executor_resync_total` counts these repairs by outcome.
   - If no peer offers a checkpoint at or above the floor, the node stays down and says so. The remaining paths are an operator-restored checkpoint or the rebuild from L1 (`kardamom-reconstruct`).
   - A checkpoint of another state schema is skipped. The manifest states `schema_version`, and the peer sends it as `x-checkpoint-schema`. The adopter refuses the image before the copy, logs `checkpoint holds a state schema this release does not read; skipping it`, counts `kardamom_checkpoint_unreadable_schema_skips_total`, and takes the next checkpoint or the next peer. So an executor or a validator of the previous release does not adopt a checkpoint of a release with a newer schema. A manifest without the key passes, and the image says its schema when it opens.
-  - Proof: `replay-window-resync`; the unit tests `restore_skips_a_checkpoint_of_another_schema` and `a_peer_image_of_another_schema_is_skipped`. The `retention-overrun` case (`chaos-retention` shard) freezes one executor past a small retention. The shard deploys that retention. The executor must adopt a peer checkpoint.
+  - Proof: `replay-window-resync`; the unit tests `restore_skips_a_checkpoint_of_another_schema` and `a_peer_image_of_another_schema_is_skipped`. The `retention-overrun` case (`chaos-retention` shard) freezes one executor past a small retention. The shard deploys that retention. In reference mode, the executor must adopt a peer checkpoint. The shard is carry-born, so there the executor must read the range from the egress, with no refused replay and no checkpoint.
 - **Dead `tx_receipts` publication**
   - Trigger: the must-deliver `tx_receipts` publication of an executor has no connected subscriber. Every publish fails with `NOT_CONNECTED`. The causes seen: a restored executor job whose new control port every ingress attached, and a media driver that crashed and restarted under the executor.
   - Effect: the commit thread holds the receipt and retries, so the exec thread blocks and the executor stops at one block. Without a bound, one dead publication held an executor for minutes. `kardamom_publication_connected{topic="tx_receipts"}` reads 0, and `kardamom_publication_not_connected_seconds` grows.
@@ -887,7 +887,7 @@ A divergence is a state, not a dead process.
 - The validator then resumes verified execution.
 - Blocks through the adopted checkpoint are **unverified by this validator**. `validator_resync_total{outcome="peer-checkpoint"}` counts the adoptions. The divergence latch covers only blocks that the validator re-executed.
 - The trustless alternative is the rebuild from L1 (`kardamom-reconstruct`) into the state directory.
-- Proof: `retention-overrun-validator` (`chaos-retention` shard). The case asserts that the adopted validator resumes verifying (`blocks_verified` rises).
+- Proof: `retention-overrun-validator` (`chaos-retention` shard). In reference mode, the case asserts that the adopted validator resumes verifying (`blocks_verified` rises). The shard is carry-born, and its validator reads the egress. There the case asserts that the validator resumes verifying with no refused replay and no adoption.
 
 **Catch-up semantics.** These rules set the coverage cost.
 
@@ -1191,7 +1191,7 @@ Remove every copy of the reverted chain. Each copy that stays resumes or publish
 
 ### Proof: `sealer-fleet-total-wipe-recover`
 
-The chaos case `sealer-fleet-total-wipe-recover` proves the procedure end to end. It runs last in the `chaos-fleet` shard. See [`chaos-suite.md`](chaos-suite.md#shards).
+The chaos case `sealer-fleet-total-wipe-recover` proves the procedure end to end. It runs last in the nightly `chaos-integrity` shard, on a reference-born cluster. See [`chaos-suite.md`](chaos-suite.md#shards).
 
 The case does these steps:
 

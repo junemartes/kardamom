@@ -6,7 +6,9 @@
 //! posts the group it restores from its spool. The group lands right
 //! after the covered block. The batcher then gets the rest of the gap
 //! replayed, or rebuilds it from the state databases' block references
-//! and the `tx_data` archives, and posts on past the sealers' floor.
+//! and the `tx_data` archives, and posts on past the sealers' floor. On a
+//! carry-born cluster the batcher reads the egress, which keeps the gap,
+//! so the replay of the egress serves it and no rebuild runs.
 
 use std::cell::Cell;
 use std::time::Duration;
@@ -434,6 +436,11 @@ pub(crate) async fn batcher_outage_past_retention(h: &mut Harness) -> anyhow::Re
     if !await_rebuilt_or_served(h, &l1, lines, sealed, budget + REBUILD_BUDGET, ctx).await? {
         return l1.assert_contiguous(ctx).await;
     }
+    anyhow::ensure!(
+        !h.knobs.genesis_carry,
+        "{}: {ctx}: the batcher reads the egress, which keeps the gap, but it rebuilt the gap from references",
+        crate::FAIL_PREFIX
+    );
     let logs = h.nomad.job_logs("batcher", Streams::Both).await?;
     let floor = field_in_last(&logs, REBUILDING_LINE, "oldest_block").ok_or_else(|| {
         crate::chaos_fail!("{ctx}: the rebuild line names no oldest_block (the sealers' floor)")
@@ -451,11 +458,14 @@ struct Baselines {
 
 /// Wait for one of the two ends of the outage. The sealers refused the
 /// replay and the batcher rebuilt the gap from references (`true`). Or
-/// the sealers kept every frame above the posted head, served the
-/// replay, and L1 covers through `sealed`, the head at the thaw, with no
-/// refusal on the way (`false`). The retention never prunes below the
-/// posted head, so the second is the expected end; the first stays valid
-/// for a sealer that prunes by the window alone.
+/// the sealers, or the egress, kept every frame above the posted head,
+/// served the replay, and L1 covers through `sealed`, the head at the
+/// thaw, with no refusal on the way (`false`). In reference mode the
+/// retention never prunes below the posted head, so the second is the
+/// expected end; the first stays valid for a sealer that prunes by the
+/// window alone. The exact window of a carry-born sealer prunes by the
+/// window alone, but its batcher reads the egress, so the second is the
+/// only valid end there.
 async fn await_rebuilt_or_served(
     h: &Harness,
     l1: &L1,
