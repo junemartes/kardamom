@@ -1,8 +1,10 @@
 use std::time::Duration;
 
 use alloy_primitives::Address;
+use alloy_primitives::B256;
 use kardamom_cluster_adapter::wire::{
-    encode_egress_boundary, encode_record_lag_reject, encode_status,
+    RefRefused, SEALER_V5_DECISION_VERSION, encode_egress_boundary, encode_record_lag_reject,
+    encode_status,
 };
 use kardamom_sequencer::resync::{SealerRefusal, SharedWatermark};
 use kardamom_sequencer::sealer_rules::SealerVersion;
@@ -90,4 +92,38 @@ fn a_snapshot_notice_holds_the_lag_flag_until_the_next_boundary() {
         watermark.take_lag().is_some(),
         "the boundary after the snapshot ends the stall"
     );
+}
+
+/// The refusal of a reference (egress kind 18) reaches no channel and does
+/// not change the version of the sealer.
+#[test]
+fn a_reference_refusal_changes_nothing() {
+    let (deadline_tx, deadline_rx) = crossbeam_channel::bounded(4);
+    let (answer_tx, answer_rx) = crossbeam_channel::bounded(4);
+    let (origins, origins_rx) = crossbeam_channel::unbounded();
+    let version = SealerVersion::default();
+    let mut feed = EgressWatermarkFeed::new(
+        1_000,
+        0,
+        SharedWatermark::new(),
+        answer_tx,
+        deadline_tx,
+        origins,
+        version.clone(),
+    );
+
+    feed.on_frame(
+        &RefRefused {
+            canonical_id: B256::repeat_byte(0xAB),
+            sender: Address::repeat_byte(0x13),
+            nonce: 7,
+            decision_version: SEALER_V5_DECISION_VERSION,
+        }
+        .encode(),
+    );
+
+    assert!(deadline_rx.try_recv().is_err());
+    assert!(answer_rx.try_recv().is_err());
+    assert!(origins_rx.try_recv().is_err());
+    assert!(!version.carries_bytes());
 }
