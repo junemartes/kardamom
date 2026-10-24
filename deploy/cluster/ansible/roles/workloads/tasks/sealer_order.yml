@@ -1,7 +1,8 @@
 ---
 # The roll order from the members' own status: every follower's group
 # first, the leader's last. A member reports its role on its admin
-# endpoint.
+# endpoint. A down member that KARDAMOM_ALLOW_SEALER_DOWN names rolls
+# before the followers: it holds no vote, so its roll keeps the quorum.
 - name: Read the status of every member
   ansible.builtin.include_tasks: sealer_status.yml
   vars:
@@ -10,7 +11,8 @@
 - name: Order the followers first and the leader last
   ansible.builtin.set_fact:
     workloads_sealer_order: >-
-      {{ (workloads_sealer_members | rejectattr('role', 'equalto', 'LEADER') | map(attribute='group') | list)
+      {{ (workloads_sealer_down | intersect(workloads_allow_sealer_down))
+         + (workloads_sealer_members | rejectattr('role', 'equalto', 'LEADER') | map(attribute='group') | list)
          + (workloads_sealer_members | selectattr('role', 'equalto', 'LEADER') | map(attribute='group') | list) }}
   vars:
     workloads_sealer_members: >-
@@ -25,4 +27,6 @@
       - workloads_sealer_order | length == workloads_sealer_new.TaskGroups | length
     fail_msg: >-
       The sealer has no settled leader or a member is down
-      ({{ workloads_sealer_status.results | map(attribute='json') | list }}); the roll waits for a whole quorum.
+      ({{ workloads_sealer_status.results | map(attribute='json') | list }}, down:
+      {{ workloads_sealer_down | join(', ') }}); the roll waits for a whole quorum. When a down member crash-loops
+      on the release that it runs, KARDAMOM_ALLOW_SEALER_DOWN=<groups> rolls it first.

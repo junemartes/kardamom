@@ -72,15 +72,15 @@
               },
               {
                 "color": "yellow",
-                "value": 0.99
+                "value": 0.9999
               },
               {
                 "color": "green",
-                "value": 0.999
+                "value": 0.999999
               }
             ]
           },
-          "decimals": 3
+          "decimals": 4
         },
         "overrides": []
       },
@@ -119,7 +119,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "The share of the 0.1 % failure budget of a 99.9 % target that the canary has not used in the range. Below 0 the range missed the target.",
+      "description": "The share of the 0.0001 % failure budget of a 99.9999 % target that the canary has not used in the range. Below 0 the range missed the target. For a range shorter than about 37 days, one failure takes it below 0.",
       "id": 3,
       "gridPos": {
         "h": 5,
@@ -171,14 +171,14 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "1 - (1 - (sum(increase(kardamom_canary_probe_total{outcome=\"success\"}[$__range])) / sum(increase(kardamom_canary_probe_total{outcome!=\"unfunded\"}[$__range])))) / 0.001",
+          "expr": "1 - (1 - (sum(increase(kardamom_canary_probe_total{outcome=\"success\"}[$__range])) / sum(increase(kardamom_canary_probe_total{outcome!=\"unfunded\"}[$__range])))) / 0.000001",
           "legendFormat": "",
           "refId": "A",
           "range": false,
           "instant": true
         }
       ],
-      "title": "Error budget left (99.9 %)",
+      "title": "Error budget left (99.9999 %)",
       "type": "stat"
     },
     {
@@ -206,15 +206,15 @@
               },
               {
                 "color": "yellow",
-                "value": 0.99
+                "value": 0.9999
               },
               {
                 "color": "green",
-                "value": 0.999
+                "value": 0.999999
               }
             ]
           },
-          "decimals": 3
+          "decimals": 4
         },
         "overrides": []
       },
@@ -273,15 +273,15 @@
               },
               {
                 "color": "yellow",
-                "value": 0.99
+                "value": 0.9999
               },
               {
                 "color": "green",
-                "value": 0.999
+                "value": 0.999999
               }
             ]
           },
-          "decimals": 3
+          "decimals": 4
         },
         "overrides": []
       },
@@ -340,15 +340,15 @@
               },
               {
                 "color": "yellow",
-                "value": 0.99
+                "value": 0.9999
               },
               {
                 "color": "green",
-                "value": 0.999
+                "value": 0.999999
               }
             ]
           },
-          "decimals": 3
+          "decimals": 4
         },
         "overrides": []
       },
@@ -477,7 +477,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "The share of passed probes in each 10-minute window. The red line is the 99.9 % target.",
+      "description": "The share of passed probes in each 10-minute window. A probe runs far fewer than 1,000,000 times in 10 minutes, so one failure takes its line below the red line. The red line marks any failure in the window, not the 99.9999 % target.",
       "id": 9,
       "gridPos": {
         "h": 8,
@@ -504,7 +504,7 @@
               },
               {
                 "color": "red",
-                "value": 0.999
+                "value": 0.999999
               }
             ]
           }
@@ -927,7 +927,7 @@
               },
               {
                 "color": "green",
-                "value": 0.999
+                "value": 0.999999
               }
             ]
           },
@@ -1102,7 +1102,7 @@
     {
       "id": 18,
       "gridPos": {
-        "h": 7,
+        "h": 10,
         "w": 24,
         "x": 0,
         "y": 47
@@ -1111,7 +1111,7 @@
       "type": "text",
       "options": {
         "mode": "markdown",
-        "content": "The target is **99.9 %** for each service level. The error budget is the 0.1 % of failures that the target allows.\n\n- **Canary success:** the end-to-end view. A probe passes when its transaction lands with the expected receipt, or its read returns the expected value.\n- **Submit success:** the front-door view. It counts the refusals for `internal`, `timeout`, `overloaded`, `paused` and `draining`.\n- **Chain liveness:** the minutes in which the executed head moved. An idle chain still moves: the sealer closes empty blocks.\n- **Ingress reachable:** the minutes in which at least one ingress answered the scrape."
+        "content": "The target is **99.9999 %** for each service level. The error budget is the 0.0001 % of failures that the target allows.\n\n- **Colors:** in the stat panels, green is at or above the target. Yellow is at or above 99.99 % and below the target. Red is below 99.99 %.\n- **Probe and submit counts:** the budget is 1 failure in 1,000,000. The canary runs fewer than 1,000,000 probes in 30 days. One failure in 30 days gives 99.99988 %, and an error budget left of -24 %. For a range shorter than about 37 days, read canary success as: 100 %, or a miss. Submit success shows the target only when the range holds 1,000,000 submits or more.\n- **Minute levels** (chain liveness, ingress reachable): the budget is about 2.6 s of downtime in 30 days. These levels count whole minutes at a 1-minute resolution, so they cannot show 2.6 s. One bad minute in 30 days gives 99.998 %. Read them as: 100 %, or a miss.\n\n- **Canary success:** the end-to-end view. A probe passes when its transaction lands with the expected receipt, or its read returns the expected value.\n- **Submit success:** the front-door view. It counts the refusals for `internal`, `timeout`, `overloaded`, `paused` and `draining`.\n- **Chain liveness:** the minutes in which the executed head moved. An idle chain still moves: the sealer closes empty blocks.\n- **Ingress reachable:** the minutes in which at least one ingress answered the scrape."
       }
     }
   ],

@@ -14,12 +14,13 @@ use crate::config::{Endpoint, Timing};
 use crate::feed::{Board, Feed};
 use crate::funds::Funds;
 use crate::market::MarketTask;
+use crate::outcome::Outcome;
 use crate::probes::contract::Contract;
 use crate::probes::deposit::{Deposit, DepositSettings};
 use crate::probes::fees::Fees;
 use crate::probes::read::Read;
 use crate::probes::transfer::Transfer;
-use crate::probes::{Context, drive};
+use crate::probes::{Context, contract, deposit, drive, fees, read, safe, transfer};
 use crate::ring::Ring;
 use crate::rpc::Rpc;
 use crate::store::Store;
@@ -102,6 +103,7 @@ impl Canary {
             topup: settings.topup,
         };
         let market = MarketTask::new(Arc::clone(&ctx)).await?;
+        Self::start_outcomes_at_zero(&ctx.endpoints, settings.deposit.is_some());
         tracing::info!(chain_id, accounts = ?ctx.ring.addresses(), "kardamom-canary starting");
         let mut tasks = vec![
             tokio::spawn(board.run()),
@@ -119,6 +121,29 @@ impl Canary {
             tasks.push(tokio::spawn(drive(probe)));
         }
         Ok(Self { tasks })
+    }
+
+    /// Start the outcome counters of every probe on each of its endpoints
+    /// at zero: each L2 probe on every ingress endpoint, and the deposit
+    /// probe on L1 when it runs.
+    fn start_outcomes_at_zero(endpoints: &[Rpc], with_deposit: bool) {
+        let l2 = [
+            transfer::NAME,
+            read::NAME,
+            safe::NAME,
+            fees::NAME,
+            contract::NAME,
+        ]
+        .into_iter()
+        .chain(MarketTask::probes());
+        endpoints
+            .iter()
+            .flat_map(|rpc| {
+                l2.clone()
+                    .map(move |probe| (probe, rpc.endpoint.name.as_str()))
+            })
+            .chain(with_deposit.then_some((deposit::NAME, deposit::ENDPOINT)))
+            .for_each(|(probe, endpoint)| Outcome::start_at_zero(probe, endpoint));
     }
 
     /// The chain id of the first endpoint that answers, asked in turn

@@ -108,6 +108,16 @@ mod tests {
         assert_eq!(moved_elsewhere, 0);
     }
 
+    /// From one instance to two, the second instance takes about half
+    /// of the ids, and the first instance keeps the rest.
+    #[test]
+    fn a_second_instance_takes_about_half_of_the_ids() {
+        let two = set(0, 2);
+        let ids: Vec<B256> = (0..200u8).map(B256::repeat_byte).collect();
+        let moved = ids.iter().filter(|id| two.owner(**id) == 1).count();
+        assert!(moved > 50 && moved < 150, "{moved}");
+    }
+
     #[test]
     fn an_index_past_the_count_is_refused() {
         assert!(InstanceSet::new(2, NonZeroU32::new(2).unwrap()).is_err());

@@ -21,6 +21,7 @@ use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
 
 mod checks;
+mod refill;
 #[cfg(test)]
 mod tests;
 

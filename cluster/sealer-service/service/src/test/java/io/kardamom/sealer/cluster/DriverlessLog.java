@@ -24,6 +24,8 @@ final class DriverlessLog {
     static final int CAPACITY = 16;
     /** The dedup window of a member with a feed: its tests fill the replay window with records. */
     private static final int FEED_CAPACITY = 1 << 14;
+    /** The peer chain that every member takes remote-origin records from. */
+    static final long REMOTE_CHAIN = 10L;
     /** The segment size of the retained file of a member that carries the bytes. */
     private static final int SEGMENT_BYTES = 64 * 1024;
 
@@ -139,7 +141,7 @@ final class DriverlessLog {
         cluster.role = io.aeron.cluster.service.Cluster.Role.FOLLOWER;
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService svc = new SealerClusteredService(
-            capacity, 250, 0, Set.of(), VoidLedger.Config.DISABLED,
+            capacity, 250, 0, Set.of(REMOTE_CHAIN), VoidLedger.Config.DISABLED,
             CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS, orderingWindow, budgets);
         file.ifPresent(svc::carryingBytes);
         feed.ifPresent(svc::feeding);

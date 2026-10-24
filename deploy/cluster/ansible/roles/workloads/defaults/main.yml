@@ -64,6 +64,10 @@ workloads_common_vars:
   # executors, the state mirrors and every job that reaches an executor by
   # its node. Empty leaves every job at its "off" default.
   exec_on_sealers: "{{ workloads_exec_on_sealers }}"
+  # The notifier on its own nodes: the notifier job places on them, and the
+  # aeron job gives their media drivers the notifier idle cap.
+  notifier_nodes: "{{ workloads_notifier_nodes }}"
+  notifier_count: "{{ workloads_notifier_count }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
 # workloads_l1_rpc_given keeps the given value: anvil.yml overwrites
@@ -306,6 +310,14 @@ workloads_aeron_stall_tolerance_ms: "{{ lookup('env', 'AERON_STALL_TOLERANCE_MS'
 # to 1000000. A message that reaches an idle thread waits up to this long.
 # A lower value costs more idle CPU. The container recipes set 1000.
 workloads_idle_cap_us: "{{ lookup('env', 'KARDAMOM_IDLE_CAP_US') | default('50', true) }}"
+# The notifier on the nodes of role notifier (nomad/notifier.nomad.hcl):
+# "on" or "off". Empty keeps the job's "off" default: the notifier stays on
+# the ingress nodes. Switch it on only when the notifier nodes exist.
+workloads_notifier_nodes: "{{ lookup('env', 'KARDAMOM_NOTIFIER_NODES') }}"
+# The notifier instance count with the switch on: the count of the
+# notifier nodes. Empty keeps the job's default, 1. The preflight refuses
+# a count above the count of the ready notifier nodes.
+workloads_notifier_count: "{{ lookup('env', 'KARDAMOM_NOTIFIER_COUNT') }}"
 workloads_light_execution_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_EXECUTION_RPC') }}"
 workloads_light_consensus_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_CONSENSUS_RPC') }}"
 workloads_light_checkpoint: "{{ lookup('env', 'L1_LIGHT_CLIENT_CHECKPOINT') }}"
@@ -466,6 +478,13 @@ workloads_allow_retired: "{{ lookup('env', 'KARDAMOM_ALLOW_RETIRED') | split(','
 # and remoteOrigins. A change that the list does not name is refused.
 workloads_allow_must_match: >-
   {{ lookup('env', 'KARDAMOM_ALLOW_MUST_MATCH') | split(',') | map('trim') | reject('equalto', '') | list }}
+# The sealer groups that do not run, and that a roll of the sealer accepts
+# (KARDAMOM_ALLOW_SEALER_DOWN, comma-separated): a member that crash-loops
+# on a bad release. The snapshot check cannot read the newest snapshot of
+# such a member. The staged roll rolls it first. A down group that the
+# list does not name is refused, and so is a named group that runs.
+workloads_allow_sealer_down: >-
+  {{ lookup('env', 'KARDAMOM_ALLOW_SEALER_DOWN') | split(',') | map('trim') | reject('equalto', '') | list }}
 # A deploy over an attempt that is still `started` (KARDAMOM_REPLACE_ATTEMPT=1):
 # the operator says that the attempt died. The gate refuses it otherwise.
 workloads_replace_attempt: "{{ lookup('env', 'KARDAMOM_REPLACE_ATTEMPT') | default('0', true) | bool }}"

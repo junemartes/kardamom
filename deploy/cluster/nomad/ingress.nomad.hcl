@@ -70,12 +70,13 @@ variable "executor_count" {
 
 # The endpoints of eth_getTransactionReceipt on a cache miss
 # (--receipt-query-endpoints): the egress,
-# http://kardamom-egress.service.<datacenter>.consul:8548. Empty, the
-# ingress asks the executor query endpoints. Ansible deployment sets it
+# http://kardamom-egress.service.<datacenter>.consul:8548. When the egress
+# gives no receipt, the ingress asks the executor query endpoints. Empty,
+# the ingress asks the executor query endpoints only. Ansible sets it
 # from KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS.
 variable "receipt_query_endpoints" {
   type        = string
-  description = "The receipt query endpoints, comma separated (--receipt-query-endpoints). Empty asks the executors."
+  description = "The receipt query endpoints, comma separated (--receipt-query-endpoints). The executors answer what they do not hold. Empty asks the executors only."
   default     = ""
 }
 

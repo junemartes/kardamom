@@ -492,16 +492,11 @@
          | community.general.from_toml }}
   when: workloads_gate_ingress_job.status == 200
 
-# 7. The sealer snapshot. A member restores its newest snapshot at its
-# start. A member that holds a snapshot of a version above the reads_max
-# of the target cannot restore it after the roll, and stops. A cluster
-# that Nomad does not know has no member to read. A running member reads
-# no snapshot, so the check runs only when the sealer job changes. A
-# member that does not run can hold the newest snapshot, and the gate
-# cannot read its version, so the gate refuses. The staged roll of the
-# sealer also needs every member. A release that does not change the
-# sealer passes while a member is down, so it can be the fix of that
-# outage.
+# 7. The sealer snapshot (snapshot_check.yml). A cluster that Nomad does
+# not know has no member to read. A running member reads no snapshot, so
+# the check runs only when the sealer job changes. A release that does
+# not change the sealer passes while a member is down, so it can be the
+# fix of that outage.
 - name: Report the skip of the snapshot check
   ansible.builtin.debug:
     msg: >-
@@ -510,39 +505,55 @@
   when:
     - workloads_gate_cluster_job.status == 200
     - not workloads_gate_sealer_rolls | bool
-- name: Read the status of every sealer member
-  ansible.builtin.include_tasks: sealer_status.yml
+
+# The formats of the sealer release come from its revision, not from the
+# checkout. A deploy of an older manifest can run from a newer checkout.
+# One sealer image holds one set of snapshot versions. The revision of
+# the target sealer image comes from the first source that names it:
+# - A deploy record that names the image.
+# - The checkout, when the image is the registered one, or the manifest
+#   pins no sealer image. The members run that image, or the image builds
+#   from this tree.
+# - The tag of the image. A release tags it main-<12 hex of the commit>,
+#   or vX.Y.Z.
+# - KARDAMOM_REVISION.
+# A sealer image that no source names is refused.
+- name: Name the revision of the target sealer release
+  ansible.builtin.set_fact:
+    workloads_gate_sealer_revision: >-
+      {{ (([workloads_last_attempt.before | default({}), workloads_accepted.target | default({}),
+            workloads_last_attempt.target | default({})]
+           | selectattr('manifest', 'defined') | selectattr('revision', 'defined')
+           | selectattr('manifest.cluster', 'defined')
+           | selectattr('manifest.cluster', 'equalto', workloads_gate_sealer_image)
+           | rejectattr('revision', 'in', ['', 'unknown']) | map(attribute='revision') | list)
+          + ([workloads_target_revision] if workloads_gate_sealer_image == '' or workloads_gate_sealer_image in workloads_gate_sealer_registered else [])
+          + (workloads_gate_sealer_tag | regex_findall('^main-([0-9a-f]{12})$'))
+          + (workloads_gate_sealer_tag | regex_findall('^v[0-9]+\.[0-9]+\.[0-9]+$'))
+          + ([workloads_revision] if workloads_revision | length > 0 else [])
+          + ['']) | first }}
+  vars:
+    workloads_gate_sealer_image: "{{ workloads_image_refs.cluster | default('') }}"
+    workloads_gate_sealer_registered: >-
+      {{ workloads_gate_cluster_job.json.TaskGroups | map(attribute='Tasks') | map('first')
+         | map(attribute='Config.image', default='') | list }}
+    workloads_gate_sealer_tag: "{{ workloads_gate_sealer_image | regex_replace('@.*$', '') | regex_replace('^.*:', '') }}"
+  when: workloads_gate_sealer_rolls | bool
+
+- name: Refuse a sealer image whose revision the gate cannot name
+  ansible.builtin.assert:
+    that: workloads_gate_sealer_revision | length > 0
+    fail_msg: >-
+      Refused: no deploy record names the sealer image {{ workloads_image_refs.cluster }}, it is not the registered
+      sealer, and its tag names no release revision (main-<12 hex> or vX.Y.Z). So the gate cannot read the snapshot
+      versions that this sealer reads. Set KARDAMOM_REVISION to the revision of that image, then deploy.
+  when: workloads_gate_sealer_rolls | bool
+
+- name: Check the sealer snapshot against the target
+  ansible.builtin.include_tasks: snapshot_check.yml
   vars:
     workloads_sealer_groups: "{{ workloads_gate_cluster_job.json.TaskGroups | map(attribute='Name') | list }}"
-  when: workloads_gate_sealer_rolls | bool
-
-- name: Refuse a release while a sealer member does not run
-  ansible.builtin.assert:
-    that: workloads_sealer_down | length == 0
-    fail_msg: >-
-      Refused: the sealer members {{ workloads_sealer_down | join(', ') }} do not run, so the gate cannot read
-      the version of their newest snapshot. Start them and let them catch up, then deploy.
-  when: workloads_gate_sealer_rolls | bool
-
-# A member of a release without snapshotLatest reports no version. The
-# gate reads it as 0.
-- name: Refuse a release that cannot read the newest snapshot of a sealer member
-  ansible.builtin.assert:
-    that: workloads_gate_unreadable | length == 0
-    fail_msg: >-
-      Refused: the target release reads sealer snapshots only up to version {{ workloads_gate_reads_max }}
-      (formats.toml, sealer-snapshot reads_max), and these sealer members hold a newer snapshot:
-      {{ workloads_gate_unreadable | map('join', ' at version ') | join(', ') }}.
-      After the roll such a member cannot restore its own snapshot, and stops.
-      Deploy a release that reads snapshot version {{ (workloads_gate_unreadable | map('last') | list + [0]) | max }}.
-  vars:
-    workloads_gate_reads_max: >-
-      {{ (lookup('file', workloads_repo_root ~ '/formats.toml')
-          | community.general.from_toml)['format']['sealer-snapshot']['reads_max'] }}
-    workloads_gate_unreadable: >-
-      {{ workloads_sealer_status.results | map(attribute='item.item.TaskGroup')
-         | zip(workloads_sealer_status.results | map(attribute='json.snapshotLatest', default=0))
-         | rejectattr('1', 'le', workloads_gate_reads_max | int) | list }}
+    workloads_snapshot_revision: "{{ workloads_gate_sealer_revision }}"
   when: workloads_gate_sealer_rolls | bool
 
 # 7a. The sealer retention in bytes. A replay over a cluster session

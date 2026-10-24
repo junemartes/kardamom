@@ -313,20 +313,6 @@ impl Pool {
         kept.checked_mul(reserve_out)?.checked_div(denominator)
     }
 
-    /// The input that buys at least `amount_out` against the reserves.
-    #[must_use]
-    pub fn amount_in_for(amount_out: U256, reserve_in: U256, reserve_out: U256) -> Option<U256> {
-        let numerator = reserve_in
-            .checked_mul(amount_out)?
-            .checked_mul(U256::from(Self::BASE))?;
-        let denominator = reserve_out
-            .checked_sub(amount_out)?
-            .checked_mul(U256::from(Self::KEPT))?;
-        numerator
-            .checked_div(denominator)?
-            .checked_add(U256::from(1))
-    }
-
     /// The `Swap` event of this pool in `receipt`.
     #[must_use]
     pub fn swap_in(self, receipt: &Receipt) -> Option<SwapEvent> {
