@@ -532,8 +532,8 @@
 # 7a. The sealer retention in bytes. A replay over a cluster session
 # queues every wanted frame at once, and the sealer closes a session whose
 # backlog passes 64 MiB. So the frames of a full window, at the mean size
-# of the frames that the members hold now, stay within half of that
-# limit. The members hold the same frames, so the mean is the retained
+# of the frames that the members hold now, stay within 48 MiB
+# (workloads_retention_cap_bytes), well below that limit. The members hold the same frames, so the mean is the retained
 # bytes over the retained frames of all members, from the member status:
 # the values of the gauges kardamom_sealer_retained_bytes and
 # kardamom_sealer_retained_frames. Members that hold no frame give no mean.

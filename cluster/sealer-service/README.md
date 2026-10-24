@@ -469,7 +469,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
   - The snapshot carries the retained frames. A member that restores a snapshot keeps the floors of the snapshot. It answers older ranges with `REPLAY_UNAVAILABLE`.
   - The size: `retention` must cover at least 60 s at the planned rate. A frame is one record or one boundary. The rule is `retention >= 60 x (planned tx/s + 0.5)`.
     - The default of 65536 covers about 65 s at 1000 tx/s. A load test at 2000 tx/s needs 120060 frames: set 131072.
-  - The cap: 131072 frames, and `retention x mean frame bytes <= 32 MiB`. The mean is `kardamom_sealer_retained_bytes / kardamom_sealer_retained_frames` at the time of the deploy.
+  - The cap: 131072 frames, and `retention x mean frame bytes <= 48 MiB`. The mean is `kardamom_sealer_retained_bytes / kardamom_sealer_retained_frames` at the time of the deploy.
     - Why: a replay over a cluster session queues every wanted frame at once. A session whose backlog passes 64 MiB (`SessionBacklogs.BYTE_LIMIT`) is closed. A reader that replays from near the floor of a larger window is closed, reconnects, and replays again, with no end.
     - 131072 frames of about 300 bytes are about 39 MB. A larger mean frame gives a lower cap. This design supports no larger value: the cap covers 60 s up to about 2180 tx/s.
   - A rolling change may only raise `retention`, and it stays at or below the cap.

@@ -210,9 +210,9 @@ workloads_sealer_version_floor: "{{ lookup('env', 'KARDAMOM_SEALER_VERSION_FLOOR
 # The ceiling of the sealer retention in frames, and in bytes: the
 # retained frames times their mean size. A replay over a cluster session
 # queues every wanted frame at once, and the sealer closes a session whose
-# backlog passes 64 MiB. The cap in bytes is half of that.
+# backlog passes 64 MiB. The cap in bytes, 48 MiB, stays well below that.
 workloads_retention_cap_frames: 131072
-workloads_retention_cap_bytes: 33554432
+workloads_retention_cap_bytes: 50331648
 # A carry executor compares its first stream with its committed blocks of
 # this window (the executor's rollback_compare_blocks). So its committed
 # block minus this window must be above the block of the last stored

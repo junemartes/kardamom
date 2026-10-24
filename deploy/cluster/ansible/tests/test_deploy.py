@@ -2159,12 +2159,13 @@ class CarryTest(Deploys):
         higher = self.DEPLOY_ENVIRON | {'KARDAMOM_CLUSTER_RETENTION': '131072'}
         self.refused(higher | {'KARDAMOM_ALLOW_MUST_MATCH': 'retention'},
                      'KARDAMOM_ALLOW_MUST_MATCH names retention, and the release does not change it')
-        # 131072 frames of 300 bytes are above 32 MiB.
-        self.api.state['status'] = {f'node-cluster-{i}': {'retainedFrames': 1000, 'retainedBytes': 300000}
+        # 131072 frames of 400 bytes are above 48 MiB.
+        self.api.state['status'] = {f'node-cluster-{i}': {'retainedFrames': 1000, 'retainedBytes': 400000}
                                     for i in range(3)}
-        self.refused(higher, 'above the cap of 33554432 bytes')
-        self.refused(higher, 'Set at most 111848 frames')
-        self.api.state['status'] = {f'node-cluster-{i}': {'retainedFrames': 1000, 'retainedBytes': 256000}
+        self.refused(higher, 'above the cap of 50331648 bytes')
+        self.refused(higher, 'Set at most 125829 frames')
+        # 131072 frames of 300 bytes, about 39.3 MB, fit.
+        self.api.state['status'] = {f'node-cluster-{i}': {'retainedFrames': 1000, 'retainedBytes': 300000}
                                     for i in range(3)}
         self.run_deploy(check=True, environ=higher)
         self.assertIn('-Dkardamom.cluster.retention=131072', json.dumps(self.api.state['plans']['cluster']))

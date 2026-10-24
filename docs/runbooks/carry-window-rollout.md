@@ -121,6 +121,10 @@ Deploy with `KARDAMOM_MEMBER_FEED=on` and `KARDAMOM_EXEC_ON_SEALERS=on`. The exe
 time: `executor-2`, then `executor-1`, then `executor-0`. Each step waits for the health check of the moved
 executor.
 
+A known short window: the sequencers, the ingresses and the batcher already ask `sealer-<i>` for the nonce queries
+and the block references. Until `executor-1` has moved, only `executor-2` answers them. The window lasts one step of
+the move, a few minutes. This is acceptable on staging. Do the move at low load.
+
 Checks:
 
 - Each group `executor-<i>` runs on `sealer-<i>`: `nomad job status executor`.
@@ -190,8 +194,8 @@ Run the canary for 24 hours. Record these values, for the trigger of the retaine
 Raise `KARDAMOM_CLUSTER_RETENTION` with a rolling deploy. The rule is `retention >= 60 × (planned tx/s + 0.5)`.
 
 - 131,072 frames covers 2,000 tx/s. That is the cap in frames.
-- The release gate also refuses a value whose frames, at the mean frame size of the members, pass 32 MiB. At a mean
-  of 300 bytes, the highest value is 111,848 frames.
+- The release gate also refuses a value whose frames, at the mean frame size of the members, pass 48 MiB. At a mean
+  of 300 bytes, 131,072 frames (about 39.3 MB) fit. A mean above 384 bytes gives a lower value: the refusal names it.
 - The gate refuses a lower value unless `KARDAMOM_ALLOW_MUST_MATCH=retention`.
 - A rate above about 2,180 tx/s needs the retained file or a change to the replay path.
 
