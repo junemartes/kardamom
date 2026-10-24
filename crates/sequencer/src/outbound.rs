@@ -21,7 +21,10 @@
 //! variants may come later). Ingress reads that channel and releases the
 //! parked client right away with a JSON-RPC error. The same port carries
 //! the `tx_status` stream: an `Offered` status for every ref the
-//! sequencer offers, and a `Rejected` status next to every error.
+//! sequencer offers, and a `Rejected` status next to every error. It also
+//! carries the `tx_drops` stream: one [`types::TxDrop`] for every
+//! transaction that the sequencer drops, for the status that the egress
+//! serves.
 //!
 //! All surfaces are traits, so unit tests can use the in-memory fakes (no
 //! Aeron media driver needed). Production wiring binds them to the real
@@ -32,10 +35,12 @@ pub mod cluster;
 use std::time::Instant;
 
 use kardamom_cluster_adapter::wire::GuardHeader;
-use kardamom_log::aeron_live::{TxErrorsPublisherHandle, TxStatusPublisherHandle};
+use kardamom_log::aeron_live::{
+    TxDropsPublisherHandle, TxErrorsPublisherHandle, TxStatusPublisherHandle,
+};
 use kardamom_obs::pipeline::Step;
 use kardamom_types::xchain::RemoteEpochRecord;
-use kardamom_types::{EpochRecord, TxError, TxRef, TxStatus};
+use kardamom_types::{EpochRecord, TxDrop, TxError, TxRef, TxStatus};
 
 use crate::error::SequencerError;
 
@@ -119,24 +124,51 @@ pub trait TxOrderingRefPublisher: Send {
     fn try_publish_remote_epoch(&mut self, r: &RemoteEpochRecord) -> Result<(), SequencerError>;
 }
 
-/// The side channels: `tx_errors` and `tx_status`. Both are best effort.
-/// The caller logs a failure and does not propagate it. The canonical
-/// state has already advanced, or the inbound transaction was rejected,
-/// so there is nothing to roll back.
-pub trait SideChannelPublisher: Send {
+/// The `tx_drops` channel: one record for each transaction that the
+/// sequencer drops. Best effort: a failure is logged, and the egress then
+/// has no status for the hash.
+pub trait DropPublisher: Send {
+    /// Send one drop record.
+    fn send_drop(&mut self, d: TxDrop);
+
+    /// Count the drop in `kardamom_sequencer_tx_drops_total{reason}`, and
+    /// send it.
+    fn publish_drop(&mut self, d: TxDrop) {
+        crate::metrics::record_tx_drop(d.reason);
+        self.send_drop(d);
+    }
+}
+
+/// The side channels: `tx_errors`, `tx_status` and `tx_drops`. All are
+/// best effort. The caller logs a failure and does not propagate it. The
+/// canonical state has already advanced, or the inbound transaction was
+/// rejected, so there is nothing to roll back.
+pub trait SideChannelPublisher: DropPublisher {
     fn publish_error(&mut self, e: TxError);
     fn publish_status(&mut self, s: TxStatus);
 }
 
+/// The live `tx_drops` channel. A clone shares the publication, so the
+/// publish loop and the egress feed thread publish on one stream.
+impl DropPublisher for TxDropsPublisherHandle {
+    fn send_drop(&mut self, d: TxDrop) {
+        if let Err(err) = self.publish_best_effort(&d) {
+            tracing::warn!(error = %err, "tx_drops publish failed (dropped)");
+        }
+    }
+}
+
 /// The live side channels. The sequencer publishes rejections on the
 /// `tx_errors` Aeron channel, which the ingress reads to release parked
-/// clients early, and statuses on the `tx_status` channel, which the
-/// notifier reads. A publish failure is logged and dropped: the canonical
-/// state has already advanced, or the transaction was rejected, so there
-/// is nothing to roll back.
+/// clients early, statuses on the `tx_status` channel, which the
+/// notifier reads, and drops on the `tx_drops` channel, which the egress
+/// reads. A publish failure is logged and dropped: the canonical state has
+/// already advanced, or the transaction was rejected, so there is nothing
+/// to roll back.
 pub struct SideChannels {
     errors: TxErrorsPublisherHandle,
     status: TxStatusPublisherHandle,
+    drops: TxDropsPublisherHandle,
     /// One `tx_errors` publish. The publish waits for the offer, so the
     /// publish loop pays it for each refused transaction.
     errors_publish: Step,
@@ -144,10 +176,15 @@ pub struct SideChannels {
 
 impl SideChannels {
     #[must_use]
-    pub fn new(errors: TxErrorsPublisherHandle, status: TxStatusPublisherHandle) -> Self {
+    pub fn new(
+        errors: TxErrorsPublisherHandle,
+        status: TxStatusPublisherHandle,
+        drops: TxDropsPublisherHandle,
+    ) -> Self {
         Self {
             errors,
             status,
+            drops,
             errors_publish: Step::new("sequencer.tx_errors_publish"),
         }
     }
@@ -170,6 +207,12 @@ impl SideChannelPublisher for SideChannels {
     }
 }
 
+impl DropPublisher for SideChannels {
+    fn send_drop(&mut self, d: TxDrop) {
+        self.drops.send_drop(d);
+    }
+}
+
 // ===========================================================================
 // In-memory fakes for unit / integration tests.
 // ===========================================================================
@@ -181,7 +224,10 @@ pub mod fakes {
     use kardamom_types::xchain::RemoteEpochRecord;
     use kardamom_types::{EpochRecord, TxRef, TxStatus};
 
-    use super::{RefOffer, SequencerError, SideChannelPublisher, TxError, TxOrderingRefPublisher};
+    use super::{
+        DropPublisher, RefOffer, SequencerError, SideChannelPublisher, TxDrop, TxError,
+        TxOrderingRefPublisher,
+    };
 
     /// In-memory `tx_ordering` publisher. Records every published offer,
     /// `EpochRecord`, and `RemoteEpochRecord` in arrival order, so tests
@@ -243,12 +289,13 @@ pub mod fakes {
         }
     }
 
-    /// In-memory side channels. Records every error and every status in
-    /// arrival order.
+    /// In-memory side channels. Records every error, every status and
+    /// every drop in arrival order.
     #[derive(Default, Clone)]
     pub struct InMemorySidePublisher {
         pub errors: Arc<Mutex<Vec<TxError>>>,
         pub statuses: Arc<Mutex<Vec<TxStatus>>>,
+        pub drops: Arc<Mutex<Vec<TxDrop>>>,
     }
 
     impl SideChannelPublisher for InMemorySidePublisher {
@@ -258,6 +305,12 @@ pub mod fakes {
 
         fn publish_status(&mut self, s: TxStatus) {
             self.statuses.lock().unwrap().push(s);
+        }
+    }
+
+    impl DropPublisher for InMemorySidePublisher {
+        fn send_drop(&mut self, d: TxDrop) {
+            self.drops.lock().unwrap().push(d);
         }
     }
 }
@@ -316,6 +369,29 @@ mod tests {
         p.publish_error(error);
         assert_eq!(p.errors.lock().unwrap().len(), 1);
         assert_eq!(p.statuses.lock().unwrap().len(), 1);
+    }
+
+    /// Each drop counts once in `kardamom_sequencer_tx_drops_total`, with
+    /// the label of its reason.
+    #[test]
+    fn publish_drop_counts_the_drop_by_reason() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let mut p = InMemorySidePublisher::default();
+        metrics::with_local_recorder(&recorder, || {
+            p.publish_drop(TxDrop {
+                tx_hash: B256::repeat_byte(0x01),
+                sender: Address::repeat_byte(0xAB),
+                nonce: 7,
+                reason: kardamom_types::DropReason::SealerRefusedReference,
+            });
+        });
+        let text = recorder.handle().render();
+        assert!(
+            text.lines().any(|line| line
+                == r#"kardamom_sequencer_tx_drops_total{reason="sealer_refused_reference"} 1"#),
+            "{text}"
+        );
+        assert_eq!(p.drops.lock().unwrap().len(), 1);
     }
 
     fn test_epoch(n: u64) -> EpochRecord {

@@ -45,6 +45,7 @@ pub mod service;
 pub mod shard_map;
 pub mod state;
 pub mod time;
+pub mod tx_drop;
 pub mod tx_error;
 pub mod tx_ordering;
 pub mod tx_status;
@@ -80,6 +81,7 @@ pub use receipt::{
 };
 pub use shard_map::{ShardMap, ShardMapError, vslot_for};
 pub use state::{SnapshotSource, StateDatabase, StateError};
+pub use tx_drop::{DropReason, TxDrop};
 pub use tx_error::{TxError, TxErrorReason};
 pub use tx_ordering::TxOrderingMessage;
 pub use tx_status::{TxStage, TxStageKind, TxStatus};

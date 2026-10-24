@@ -42,6 +42,9 @@ pub enum Topic {
     ExecFrames,
     EgressOrder,
     EgressReceipts,
+    /// The drops of the sequencers. Each sequencer registers its
+    /// publication with its lane id.
+    TxDrops,
 }
 
 impl Topic {
@@ -63,6 +66,7 @@ impl Topic {
             Self::ExecFrames => "exec_frames",
             Self::EgressOrder => "egress_order",
             Self::EgressReceipts => "egress_receipts",
+            Self::TxDrops => "tx_drops",
         }
     }
 
@@ -89,7 +93,8 @@ impl Topic {
             | Self::L1Blocks
             | Self::ExecFrames
             | Self::EgressOrder
-            | Self::EgressReceipts => None,
+            | Self::EgressReceipts
+            | Self::TxDrops => None,
         }
     }
 
@@ -110,6 +115,7 @@ impl Topic {
             "exec_frames" => Some(Self::ExecFrames),
             "egress_order" => Some(Self::EgressOrder),
             "egress_receipts" => Some(Self::EgressReceipts),
+            "tx_drops" => Some(Self::TxDrops),
             _ => None,
         }
     }
