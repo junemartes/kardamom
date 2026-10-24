@@ -27,7 +27,7 @@ SERVICES = ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'va
 # real L1 or the chaos-l1 shard adds.
 MANIFEST = SERVICES + ['l1-indexer', 'l1-fault-proxy']
 # The Nomad Variable a job's template renders into the task environment.
-SECRET_PATH = re.compile(r'nomadVar "(nomad/jobs/[\w-]+)"')
+SECRET_PATH = re.compile(r'nomadVar "(nomad/jobs/[\w/-]+)"')
 # A secret no rendered job, job variable or play output may hold.
 SENTINEL = 'SECRET-SENTINEL'
 # The SHA-256 of the genesis that staging started from. A live chain
@@ -1011,6 +1011,100 @@ class DeployTest(Deploys):
                 args = self.api.state['plans']['ingress']['TaskGroups'][0]['Tasks'][0]['Config']['args']
                 self.assertEqual(args[args.index('--ack') + 1], expected)
 
+    # The jobs that carry mode changes, and the switch in the environment
+    # of the deploy.
+    CARRY_JOBS = ('aeron', 'cluster', 'executor', 'state-mirror', 'sequencer', 'ingress', 'batcher',
+                  'validator', 'monitoring')
+    CARRY_ON = {'KARDAMOM_CARRY_BYTES': 'on', 'KARDAMOM_RETAINED_TOKEN': f'{SENTINEL}-RETAINED'}
+
+    def test_carry_mode_off_renders_every_job_as_before(self):
+        """An explicit off and an unset switch render the same jobs, with
+        no carry setting and the executors on the executor nodes."""
+        self.run_deploy(check=True)
+        unset = self.api.state['plans']
+        self.run_deploy(check=True, environ={'KARDAMOM_CARRY_BYTES': 'off'})
+        self.assertEqual(self.api.state['plans'], unset)
+        executor = unset['executor']
+        self.assertEqual([(g['Name'], g['Count']) for g in executor['TaskGroups']], [('executor', 3)])
+        self.assertEqual(executor['Constraints'][0]['RTarget'], 'executor')
+        self.assertNotIn('--carry-bytes', self.job_args(executor))
+        self.assertNotIn('carryBytes', json.dumps(unset['cluster']))
+        self.assertNotIn('feedAeronDir', json.dumps(unset['cluster']))
+        self.assertIn({'LTarget': '${meta.role}', 'RTarget': 'sealer', 'Operand': '!='},
+                      unset['aeron']['Constraints'])
+        for name in self.CARRY_JOBS:
+            self.assertNotIn('sealer-0.node.dc1.consul:90', json.dumps(unset[name]), name)
+
+    def test_carry_mode_pins_one_executor_to_each_sealer_member(self):
+        output = self.run_deploy(environ=self.CARRY_ON)
+        state = self.api.state
+        # The token reaches the members only through the variable of each
+        # group, written before the sealer registers.
+        self.assertNotIn(SENTINEL, output)
+        for name, job in [*state['plans'].items(), *state['jobs'].items()]:
+            self.assertNotIn(SENTINEL, json.dumps(job), name)
+        for i in range(3):
+            self.assertEqual(state['variables'][f'nomad/jobs/cluster/cluster-{i}'],
+                             {'KARDAMOM_RETAINED_TOKEN': f'{SENTINEL}-RETAINED'})
+        plans = state['plans']
+        for group in plans['cluster']['TaskGroups']:
+            task = group['Tasks'][0]
+            options = task['Env']['JAVA_TOOL_OPTIONS'].split()
+            for setting in ('carryBytes=true', 'feedAeronDir=/opt/kardamom/aeron-mount/dir',
+                            'feedRingBytes=16777216'):
+                self.assertIn(f'-Dkardamom.cluster.{setting}', options)
+            token = [t for t in task['Templates'] if t['Envvars']]
+            self.assertEqual(token[0]['DestPath'], 'secrets/retained.env')
+            self.assertIn(f'nomadVar "nomad/jobs/cluster/{group["Name"]}"', token[0]['EmbeddedTmpl'])
+        # Executor <i> runs on the node of member <i>, with the member index
+        # as its id, and reads the member feed of that node.
+        executor = plans['executor']
+        self.assertEqual(executor['Constraints'][0]['RTarget'], 'sealer')
+        peers = ','.join(f'sealer-{i}.node.dc1.consul:9014' for i in range(3))
+        for i, group in enumerate(executor['TaskGroups']):
+            self.assertEqual((group['Name'], group['Count']), (f'executor-{i}', 1))
+            self.assertEqual(group['Constraints'],
+                             [{'LTarget': '${meta.node_index}', 'RTarget': str(i), 'Operand': '='}])
+            task = group['Tasks'][0]
+            args = task['Config']['args']
+            self.assertIn('--carry-bytes', args)
+            self.assertNotIn('--egress', args)
+            self.assertEqual(args[args.index('--aeron-dir') + 1], '/opt/kardamom/aeron-mount/dir')
+            self.assertEqual(args[args.index('--recorder-id') + 1], str(i))
+            self.assertEqual(args[args.index('--void-voter-id') + 1], str(i))
+            self.assertEqual(args[args.index('--checkpoint-peers') + 1], peers)
+            self.assertEqual(task['Env']['KARDAMOM_HOST_ID'], f'executor-{i}')
+        # The shared driver runs on the sealer nodes, and the state mirror
+        # and every reader of an executor follow the executors there.
+        self.assertNotIn('sealer', json.dumps(plans['aeron']['Constraints']))
+        self.assertEqual(plans['state-mirror']['Constraints'][0]['RTarget'], 'sealer')
+        for name in ('sequencer', 'ingress', 'batcher', 'validator', 'monitoring'):
+            text = json.dumps(plans[name])
+            self.assertIn('sealer-2.node.dc1.consul:90', text, name)
+            self.assertNotIn('executor-0.node.dc1.consul:90', text, name)
+
+    def test_carry_mode_takes_the_egress_as_the_second_source(self):
+        self.manifest.write_text(self.manifest.read_text()
+                                 + f'egress registry.example:5000/kardamom-egress:test@sha256:{"a" * 64}\n')
+        self.run_deploy({'workloads_egress': True, 'workloads_exec_frames': 'on'}, check=True,
+                        environ=self.CARRY_ON)
+        args = self.job_args(self.api.state['plans']['executor'])
+        self.assertEqual(args.count('--egress'), 3)
+        self.assertEqual(args[args.index('--egress') + 1], self.EGRESS_URL)
+
+    def test_carry_mode_refuses_an_incomplete_setting(self):
+        cases = (
+            ('a value that is not on or off', {'KARDAMOM_CARRY_BYTES': 'yes'}),
+            ('no retained token', {'KARDAMOM_CARRY_BYTES': 'on'}),
+            ('the recorded cursor', self.CARRY_ON | {'KARDAMOM_EXEC_CURSOR': 'on'}),
+            ('no snapshot', self.CARRY_ON | {'KARDAMOM_CLUSTER_SNAPSHOT_S': '0'}),
+        )
+        for name, environ in cases:
+            with self.subTest(name):
+                output = self.run_deploy(check=True, success=False, environ=environ)
+                self.assertIn('KARDAMOM_CARRY_BYTES is on, off or empty', output)
+                self.assertNotIn('plans', self.api.state)
+
     def test_every_aeron_party_takes_the_deploy_values(self):
         """Each Aeron deploy value: its environment variable, its default,
         a second value, and the check of the plans."""
@@ -1398,6 +1492,18 @@ class RecordTest(Deploys):
         output = self.run_deploy(success=False)
         self.assertIn('every member must match: carryBytes.', output)
         self.assertEqual(self.api.state['writes'], [])
+
+    def test_carry_mode_on_a_live_chain_needs_the_allowance(self):
+        self.deploy()
+        self.api.state['writes'] = []
+        carry = DeployTest.CARRY_ON
+        output = self.run_deploy(success=False, environ=carry)
+        self.assertIn('every member must match: carryBytes.', output)
+        self.assertEqual(self.api.state['writes'], [])
+        self.run_deploy(environ=carry | {'KARDAMOM_ALLOW_MUST_MATCH': 'carryBytes'})
+        self.assertEqual(self.api.state['writes'].count('cluster'), 3, 'the sealer rolls member by member')
+        self.assertEqual([g['Name'] for g in self.api.state['jobs']['executor']['TaskGroups']],
+                         ['executor-0', 'executor-1', 'executor-2'])
 
     def test_a_sealer_job_that_started_on_decision_version_three_is_refused(self):
         """A cluster that ran a build with decisionVersion=3 must not roll onto version 2."""

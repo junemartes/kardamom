@@ -56,6 +56,10 @@ workloads_common_vars:
   # One value for the longest idle wait of every hot-path thread: the
   # media drivers, the sealer and the Rust poll loops.
   idle_cap_us: "{{ workloads_idle_cap_us }}"
+  # Carry mode: "on" or "off". One value for the sealer, the executors,
+  # the media drivers and every job that reaches an executor by its node.
+  # Empty leaves every job at its "off" default.
+  carry_bytes: "{{ workloads_carry_bytes }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
 # workloads_l1_rpc_given keeps the given value: anvil.yml overwrites
@@ -176,6 +180,18 @@ workloads_priority_fees: "{{ lookup('env', 'PRIORITY_FEES') }}"
 # The recorded cursor of the executors (nomad/executor.nomad.hcl): "on" or
 # "off". Empty keeps the job's "off" default.
 workloads_exec_cursor: "{{ lookup('env', 'KARDAMOM_EXEC_CURSOR') }}"
+# Carry mode (KARDAMOM_CARRY_BYTES): "on" or "off". Empty keeps every job
+# at its "off" default. On, each sealer member keeps its retained frames in
+# a file and feeds them to an executor on its own node, and the executors
+# move from the executor nodes to the sealer nodes, one for each member.
+# Every member must match the setting, so a change on a live chain needs
+# KARDAMOM_ALLOW_MUST_MATCH=carryBytes and a coordinated cut-over. See
+# README.md, "Carry mode".
+workloads_carry_bytes: "{{ lookup('env', 'KARDAMOM_CARRY_BYTES') }}"
+# The token of the retained file of the sealer members
+# (KARDAMOM_RETAINED_TOKEN), in carry mode only. It reaches the members
+# only through the Nomad variable of each sealer group (tasks/sealer.yml).
+workloads_retained_token: "{{ lookup('env', 'KARDAMOM_RETAINED_TOKEN') }}"
 # The egress (nomad/egress.nomad.hcl) and its readers. Every switch is
 # off by default, and with every switch off no job changes. Switch them on
 # in this order, one deploy each: the executors' frames, the egress, then
@@ -205,6 +221,8 @@ workloads_egress_url: "http://kardamom-egress.service.{{ datacenter }}.consul:{{
 workloads_egress_job_vars:
   executor:
     exec_frames: "{{ workloads_exec_frames }}"
+    # In carry mode, the egress is the second source of the member feed.
+    egress_url: "{{ workloads_egress_url if workloads_carry_bytes == 'on' and workloads_egress | bool else '' }}"
   validator:
     egress_url: "{{ workloads_egress_url if workloads_validator_egress == 'on' else '' }}"
   batcher:

@@ -120,6 +120,18 @@ variable "egress_url" {
   default     = ""
 }
 
+# Carry mode, "on" or "off" (executor.nomad.hcl). On, the executors run
+# on the sealer nodes, so the checkpoint peers go to sealer-<i>, not to executor-<i>.
+# The deploy passes it from KARDAMOM_CARRY_BYTES.
+variable "carry_bytes" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.carry_bytes)
+    error_message = "The carry_bytes value must be on or off."
+  }
+}
+
 variable "executor_count" {
   type        = number
   description = "The executor node count (node_classes.executor.count). The checkpoint peers are executor-<i>.node.<datacenter>.consul."
@@ -311,7 +323,7 @@ job "validator" {
           # the executors' serve endpoints, and adopt it on restart,
           # the same as the executors' recovery-D loop.
           "--checkpoint-dir", "/opt/kardamom/checkpoints",
-          "--checkpoint-peers", join(",", [for i in range(var.executor_count) : "executor-${i}.node.${var.datacenter}.consul:9014"]),
+          "--checkpoint-peers", join(",", [for i in range(var.executor_count) : "${var.carry_bytes == "on" ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:9014"]),
           # Shadow-check the node-incremental state trie against a
           # full rebuild every 8th block. A walker bug fail-stops the
           # validator (a dead alloc is a verdict failure), and bumps
