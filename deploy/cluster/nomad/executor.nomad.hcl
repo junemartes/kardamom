@@ -158,11 +158,15 @@ job "executor" {
   # release keeps the receipt that used the nonce as the index of its hash
   # and of its (sender, nonce), when the sealer orders a transaction more
   # than once (first_receipt). The upgrade check
-  # (`just sealer-upgrade-check <env>`) reads these metas.
+  # (`just sealer-upgrade-check <env>`) reads these metas. The executor of
+  # this release runs a full reference that a sealer below decision
+  # version 5 relays as is (relayed_full_ref). An older executor drops that
+  # frame and stops at the gap.
   meta {
     nonce_burn          = "true"
     chain_state_install = "true"
     first_receipt       = "true"
+    relayed_full_ref    = "true"
   }
 
   datacenters = [var.datacenter]
