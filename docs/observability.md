@@ -833,6 +833,7 @@ The egress (`kardamom-egress`) exports these metrics on `--metrics-addr` (`KARDA
   - The store writes the mark of a batch before the frames of the batch. After a crash, R is at or above every reference that the segments hold.
   - A start at the floor of a peer keeps the higher of the two marks. The peer sends its mark in the headers `x-egress-ref-mark-index` and `x-egress-ref-mark-block` of its `410` answer.
   - R can stay above the stored references. That only delays the move of a reader to the egress.
+  - A corrupt or hostile mark of a peer, for example `u64::MAX`, raises R for good: R never goes down. To recover, stop the egress, then copy `ref-mark` from the store directory of a healthy peer, then start the egress. Delete `ref-mark` only when the store holds no `RT_TXREF` frame.
 - A reader below R can meet a reference in the egress range that it cannot join. The readers after the executors export their cursor on the egress: `kardamom_batcher_egress_cursor_index` and `kardamom_validator_egress_cursor_index`, the canonical index of the newest record that the reader took. A reader is past every reference when its cursor is above the highest R of all egress instances.
 - The egress answers `GET /health` on its HTTP port (`:8548` in the cluster job). The Consul check of the service `kardamom-egress` reads it.
 

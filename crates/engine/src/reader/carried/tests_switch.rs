@@ -401,3 +401,29 @@ fn a_reference_with_no_second_source_stops_the_reader() {
         other => panic!("expected the unjoinable reference error, got {other:?}"),
     }
 }
+
+/// A floor only rises and a reference stays, so a feed below its floor
+/// and a service with a reference at the cursor stop the reader too.
+#[test]
+fn a_floor_and_a_reference_at_the_cursor_stop_the_reader() {
+    let mut rig = Rig::new(3, 2);
+    let request = rig.request(Source::Feed);
+    rig.feed.send(unavailable(request.request_id, 10, 5));
+    rig.request(Source::Service);
+    rig.service.send(ref_at(3));
+    match rig.error() {
+        ExecutorError::UnjoinableReference { index } => assert_eq!(index, 3),
+        other => panic!("expected the unjoinable reference error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_reference_at_the_cursor_after_a_hole_is_a_fault() {
+    let mut rig = Rig::new(0, 1);
+    let first = rig.request(Source::Feed);
+    rig.feed.send(ref_at(2));
+    let again = rig.request(Source::Feed);
+    assert_ne!(again.request_id, first.request_id, "the hole asks again");
+    rig.feed.send(ref_at(0));
+    rig.run_until(|rig| rig.sub.source() == Source::Service);
+}

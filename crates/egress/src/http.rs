@@ -179,14 +179,12 @@ impl Cursor {
                 after,
                 head,
             } => frames_reply(&frames, after, head),
-            Range::Unavailable { floor, mark } => with_mark(
-                with_head(
-                    reply(StatusCode::GONE, Bytes::from_static(b"below the floor\n")),
-                    "floor",
-                    floor,
-                ),
-                mark,
-            ),
+            Range::Unavailable { floor, mark } => {
+                HeaderPair::mark(mark).put(HeaderPair::head("floor", floor).put(reply(
+                    StatusCode::GONE,
+                    Bytes::from_static(b"below the floor\n"),
+                )))
+            }
         }
     }
 }
@@ -258,11 +256,8 @@ fn frames_reply(frames: &[Vec<u8>], after: Head, head: Head) -> Response<Full<By
         Some(body)
     });
     match body {
-        Some(body) => with_head(
-            with_head(reply(StatusCode::OK, Bytes::from(body)), "next", head),
-            "after",
-            after,
-        ),
+        Some(body) => HeaderPair::head("after", after)
+            .put(HeaderPair::head("next", head).put(reply(StatusCode::OK, Bytes::from(body)))),
         None => reply(
             StatusCode::INTERNAL_SERVER_ERROR,
             Bytes::from_static(b"a frame above 4 GiB\n"),
@@ -270,36 +265,51 @@ fn frames_reply(frames: &[Vec<u8>], after: Head, head: Head) -> Response<Full<By
     }
 }
 
-/// Put `head` in the headers `x-egress-<name>-index` and `-block`.
-fn with_head(response: Response<Full<Bytes>>, name: &str, head: Head) -> Response<Full<Bytes>> {
-    with_pair(response, name, (head.next_index, head.next_block))
+/// The headers `x-egress-<name>-index` and `x-egress-<name>-block` of one
+/// answer.
+struct HeaderPair<'a> {
+    name: &'a str,
+    index: u64,
+    block: u64,
 }
 
-fn with_mark(response: Response<Full<Bytes>>, mark: RefMark) -> Response<Full<Bytes>> {
-    with_pair(response, "ref-mark", (mark.index, mark.block))
-}
+impl<'a> HeaderPair<'a> {
+    /// The headers of `head` under `name`.
+    fn head(name: &'a str, head: Head) -> Self {
+        Self {
+            name,
+            index: head.next_index,
+            block: head.next_block,
+        }
+    }
 
-/// Add the headers `x-egress-<name>-index` and `x-egress-<name>-block`.
-fn with_pair(
-    mut response: Response<Full<Bytes>>,
-    name: &str,
-    (index, block): (u64, u64),
-) -> Response<Full<Bytes>> {
-    [
-        (format!("x-egress-{name}-index"), index),
-        (format!("x-egress-{name}-block"), block),
-    ]
-    .into_iter()
-    .filter_map(|(key, value)| {
-        Some((
-            hyper::header::HeaderName::try_from(key).ok()?,
-            hyper::header::HeaderValue::from(value),
-        ))
-    })
-    .for_each(|(key, value)| {
-        response.headers_mut().insert(key, value);
-    });
-    response
+    /// The headers of the reference mark of the store.
+    fn mark(mark: RefMark) -> Self {
+        Self {
+            name: "ref-mark",
+            index: mark.index,
+            block: mark.block,
+        }
+    }
+
+    /// Add the two headers to `response`.
+    fn put(self, mut response: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
+        [
+            (format!("x-egress-{}-index", self.name), self.index),
+            (format!("x-egress-{}-block", self.name), self.block),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| {
+            Some((
+                hyper::header::HeaderName::try_from(key).ok()?,
+                hyper::header::HeaderValue::from(value),
+            ))
+        })
+        .for_each(|(key, value)| {
+            response.headers_mut().insert(key, value);
+        });
+        response
+    }
 }
 
 fn reply(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {

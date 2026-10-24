@@ -363,17 +363,20 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
 
     /// Set the cursor gauge to the index of a delivered record.
     fn show_cursor(&self, (position, item): &(BPosition, Ordered)) {
-        let boundary = matches!(
+        if matches!(
             item,
             Ordered::Message(kardamom_types::TxOrderingMessage::BoundaryStart(_))
-        );
-        if let (Some(gauge), false) = (&self.cursor_gauge, boundary) {
-            #[allow(
-                clippy::cast_precision_loss,
-                reason = "canonical indexes stay far below 2^52; f64 represents them exactly"
-            )]
-            gauge.set(position.as_index() as f64);
+        ) {
+            return;
         }
+        let Some(gauge) = &self.cursor_gauge else {
+            return;
+        };
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "canonical indexes stay far below 2^52; f64 represents them exactly"
+        )]
+        gauge.set(position.as_index() as f64);
     }
 }
 

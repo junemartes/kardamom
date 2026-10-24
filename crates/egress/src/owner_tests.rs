@@ -266,6 +266,22 @@ fn a_peer_floor_raises_the_mark_to_the_mark_of_the_peer() {
     );
 }
 
+/// The frames of a peer reach the store through the same append as the
+/// copies, so a reference among them raises the mark.
+#[test]
+fn a_reference_in_the_frames_of_a_peer_raises_the_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, _published) = live();
+    let mut o = owner(dir.path(), live);
+    let caught = vec![
+        record(0),
+        crate::test_support::ref_record(1),
+        encode_egress_boundary(1, 2, 0, 0),
+    ];
+    o.on(Input::Caught(caught)).unwrap();
+    assert_eq!(o.parts.store.mark(), RefMark { index: 1, block: 1 });
+}
+
 /// When the peers give up, the next boundary of a copy starts the stream.
 /// Before, a boundary changes nothing.
 #[test]

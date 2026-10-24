@@ -48,20 +48,20 @@ impl RefMark {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(io(&path)(e)),
         };
-        let (index, block) = bytes
-            .as_slice()
-            .split_first_chunk::<8>()
-            .and_then(|(index, rest)| Some((*index, *rest.first_chunk::<8>()?)))
-            .filter(|_| bytes.len() == 16)
-            .ok_or_else(|| {
-                io(&path)(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "the reference mark is not 16 bytes",
-                ))
-            })?;
+        let whole = <[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| {
+            io(&path)(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the reference mark is not 16 bytes",
+            ))
+        })?;
+        let (index, block) = whole.split_at(8);
+        let word = |half: &[u8]| {
+            half.first_chunk::<8>()
+                .map_or(0, |bytes| u64::from_le_bytes(*bytes))
+        };
         Ok(Self {
-            index: u64::from_le_bytes(index),
-            block: u64::from_le_bytes(block),
+            index: word(index),
+            block: word(block),
         })
     }
 

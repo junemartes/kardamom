@@ -93,7 +93,8 @@ impl Marks {
     /// - A stop when every source has a head below the cursor, or never
     ///   connected. The stop names the highest head.
     /// - A stop when every source has a reference with no bytes at the same
-    ///   index, or never connected. Another try gets the same reference.
+    ///   index, refused the cursor below its floor, or never connected. A
+    ///   floor only rises, so another try gets the same faults.
     /// - Else the reader tries the other source again: a silent, lost or
     ///   bad source can serve again later, for example a member that
     ///   restarts.
@@ -146,7 +147,11 @@ impl Marks {
                     head_block,
                 }
             }
-            (_, _, Some(index)) if self.every(|f| *f == Fault::Unjoinable { index }) => {
+            (_, _, Some(index))
+                if self.every(|f| {
+                    *f == Fault::Unjoinable { index } || matches!(f, Fault::Unavailable { .. })
+                }) =>
+            {
                 Verdict::Unjoinable { index }
             }
             _ => Verdict::Switched,

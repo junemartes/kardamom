@@ -269,3 +269,10 @@ fn a_crash_before_the_segment_sync_leaves_the_mark_at_or_above_the_frames() {
         "the mark is above the surviving frames"
     );
 }
+
+#[test]
+fn a_mark_of_another_size_stops_the_open() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("ref-mark"), [1, 2, 3]).unwrap();
+    assert!(Store::open(dir.path(), two_block_segments(), GENESIS).is_err());
+}
