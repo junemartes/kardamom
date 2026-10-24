@@ -205,6 +205,7 @@ The canary:
 
 - The ingress and the sequencer can deploy a canary. Set `KARDAMOM_CANARY=1`. The canary is one allocation more than the count, so it needs one spare node of the class. The container profile has none.
 - The role smokes the ingress canary by its node address, and promotes it. Then it replaces the old instances.
+- `kardamom-deploy smoke` sends the smoke transfer, from genesis account #0. Every release ships this binary, signed.
 - For the sequencer, the canary is healthy by its own check. The smoke then goes through a running ingress and proves that the chain still accepts a transaction.
 - A failed smoke fails the play. The deployment stays unpromoted, and the old instances keep serving. `nomad deployment fail` removes the canary.
 - `auto_revert` is on for these two stateless classes only.
@@ -418,7 +419,6 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Controller | `NOMAD_TOKEN` | empty | The Nomad ACL token. |
 | Controller | `NOMAD_NAMESPACE` | `default` | The Nomad namespace. |
 | Controller | `KARDAMOM_ENV` | `local` | The environment name. It selects `deployed/<env>/`. |
-| Controller | `KARDAMOM_CLUSTER_BIN` | `target/release/kardamom-cluster` | The operator binary that smokes a canary. |
 | Controller | `KARDAMOM_OPERATOR`, `KARDAMOM_REVISION` | `GITHUB_ACTOR` or `USER`; `GITHUB_SHA` or the git or jj revision | The operator and the revision of the deploy record. The snapshot check also takes `KARDAMOM_REVISION` as the revision of a sealer image that no record, registration or tag names. |
 | Controller | `KARDAMOM_REGISTRY_URL` | the Nomad API host on the registry port | The registry API that holds the images of the manifest, as the controller reaches it. `off` skips the image check, in the local profile only. A registry that answers 401, such as `https://ghcr.io`, gets an anonymous pull token from the realm of its challenge. |
 | Controller | `KARDAMOM_ALLOW_ONE_WAY` | empty | The format ids whose one-way change the operator accepts, comma-separated. The record then carries a rollback floor. |
@@ -433,7 +433,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Signing | `KARDAMOM_CERT_OIDC_ISSUER` | `https://token.actions.githubusercontent.com` | The OIDC issuer of the signer. |
 | Signing | `KARDAMOM_COSIGN_CACHE`, `KARDAMOM_COSIGN_VERSION` | the user cache, the pinned version | Where the controller finds a cosign that is not on `PATH`. |
 | Settlement | `SETTLEMENT_ADDRESS` | empty | An existing settlement address. Empty: deploy one with `kardamom-deploy`. |
-| Settlement | `DEPLOY_BIN` | `target/release/kardamom-deploy` | The settlement deployer. The release gate also runs its `formats` command. |
+| Settlement | `DEPLOY_BIN` | `target/release/kardamom-deploy` | The settlement deployer. The release gate also runs its `formats` command, and the canary gate its `smoke` command. |
 | Settlement | `L1_OWNER`, `L1_OWNER_KEY` | the Anvil dev account 0 | The owner address and key that the deployer uses. |
 | Settlement | `BATCHER_EOA` | the Anvil dev account 2 | The batcher address that the deployer registers. |
 | Settlement | `L2_CHAIN_ID` | `chain_id` of `all.yml` (412346) | The L2 chain id. |
@@ -775,6 +775,7 @@ KARDAMOM_CHAOS_CASES="graceful-executor" just shard chaos-executor   # narrow to
 - The knobs (`CHAOS_TPS`, `LOAD_DURATION_S` and others) are the environment variables that `crates/chaos/src/knobs.rs` reads.
 - The operator commands are `kardamom-cluster smoke | diagnostics | scale-sequencers` (`cargo run -p kardamom-chaos --bin kardamom-cluster -- ...`).
 - `kardamom-deploy formats --base <registry> --root <tree>` prints the format findings of the tree against the registry as JSON. The release gate reads them.
+- `kardamom-deploy smoke --rpc-url <ingress> --chain-id <id>` sends one signed transfer from a genesis account (`--account`, default `0`) and waits one minute for its receipt. The canary gate of the deploy runs it.
 
 The shards, their cases, the gates, the load verdict, the L1 fault proxy and the knobs are in [`../../docs/chaos-suite.md`](../../docs/chaos-suite.md).
 

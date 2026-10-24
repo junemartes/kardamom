@@ -41,16 +41,17 @@
       X-Nomad-Token: "{{ workloads_nomad_token }}"
   register: workloads_smoke_node_info
 
-# The node's advertised HTTP address is its node_ip, as in anvil.yml.
+# The node's advertised HTTP address is its node_ip, as in anvil.yml. The
+# deploy binary sends the transfer: every release ships it, signed.
 - name: Smoke the canary of {{ workloads_wait_job }}
   ansible.builtin.command:
     argv:
-      - "{{ workloads_cluster_binary }}"
+      - "{{ workloads_deploy_binary }}"
       - smoke
-      - --rpc
+      - --rpc-url
       - "http://{{ workloads_smoke_node_info.json.HTTPAddr | regex_replace(':[0-9]+$', '') }}:{{ ports.ingress_rpc }}"
-  environment:
-    CHAIN_ID: "{{ workloads_chain_id }}"
+      - --chain-id
+      - "{{ workloads_chain_id }}"
   changed_when: false
 
 - name: Promote the canary of {{ workloads_wait_job }}
