@@ -8,7 +8,7 @@ use crate::harness::Harness;
 use crate::lifecycle::{LastAttempt, NOMAD_HTTP_PORT};
 
 /// The manifest of the running cluster, written by the image push.
-const MANIFEST: &str = "images.digests";
+pub(crate) const MANIFEST: &str = "images.digests";
 /// The broken copy the case deploys, beside the real one.
 const BROKEN_MANIFEST: &str = "images.digests.broken";
 

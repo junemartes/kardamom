@@ -26,7 +26,6 @@
 
 #![cfg(feature = "cluster-e2e")]
 
-use kardamom_chaos::lifecycle::DeployVars;
 use kardamom_chaos::{Harness, Knobs, Lifecycle, Shard};
 
 /// The two shards without chaos: the sustained load, and the
@@ -95,11 +94,11 @@ async fn run_audited(harness: &mut Harness, case: &str, audit: bool) -> anyhow::
 
 async fn run_shard(shard: Shard) -> anyhow::Result<()> {
     let knobs = Knobs::read(shard.env())?;
-    let lifecycle = Lifecycle::in_workspace();
+    let lifecycle = Lifecycle::in_workspace().with_vars(shard.deploy_vars());
     let contract = if reuse() {
         lifecycle.contract()?
     } else {
-        lifecycle.up(&shard.deploy_vars()).await?
+        lifecycle.up().await?
     };
     let mut harness = Harness::new(contract, knobs, lifecycle.clone())?;
     harness.smoke_gate(harness.knobs.gate_account).await?;
@@ -132,7 +131,7 @@ async fn run_stage(stage: Stage) -> anyhow::Result<()> {
     let contract = if reuse() {
         lifecycle.contract()?
     } else {
-        lifecycle.up(&DeployVars::default()).await?
+        lifecycle.up().await?
     };
     let harness = Harness::new(contract, knobs, lifecycle.clone())?;
     harness.smoke_gate(harness.knobs.gate_account).await?;
@@ -264,6 +263,12 @@ async fn chaos_l1() {
 #[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
 async fn chaos_follower() {
     shard_test(Shard::Follower).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
+async fn chaos_carry() {
+    shard_test(Shard::Carry).await;
 }
 
 /// The nightly shard. CI runs it on the schedule and on a pull request

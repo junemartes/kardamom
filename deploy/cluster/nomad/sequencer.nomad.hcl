@@ -112,6 +112,22 @@ variable "receipts_from_egress" {
     error_message = "The receipts_from_egress value must be on or off."
   }
 }
+# The v2 loop, "on" or "off" (the [admission] section of the config). On,
+# the sequencer takes the bytes of each transaction under decision version
+# 5, and the sealer carries them. The carry window needs it: the v1 loop
+# offers each transaction as a reference without its bytes, and the sealer
+# refuses such a reference while the window is on. Each sender may keep
+# 512 transactions forwarded and 512 parked, the same bound as
+# max_pending_per_sender of the v1 loop. Ansible deployment passes -var
+# from KARDAMOM_SEQUENCER_ADMISSION.
+variable "admission" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.admission)
+    error_message = "The admission value must be on or off."
+  }
+}
 variable "metrics_base" {
   type    = number
   default = 9001
@@ -299,13 +315,15 @@ job "sequencer" {
             change_mode = "noop"
           }
 
-          # The switch goes in front of the file: a top-level key after
-          # the first table of the file would belong to that table.
+          # The receipts switch goes in front of the file: a top-level key
+          # after the first table of the file would belong to that table.
+          # The [admission] table goes after the file.
           template {
             destination = "local/sequencer.toml"
             data = join("\n", concat(
               var.receipts_from_egress == "on" ? ["receipts_from_egress = true"] : [],
               [file("config/sequencer.toml.tpl")],
+              var.admission == "on" ? ["[admission]\nenabled = true\nmax_parked = 512\nmax_forwarded = 512\n"] : [],
             ))
           }
 

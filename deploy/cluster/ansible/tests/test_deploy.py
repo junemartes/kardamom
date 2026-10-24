@@ -1004,6 +1004,15 @@ class DeployTest(Deploys):
         return '\n'.join(t['EmbeddedTmpl'] for g in job['TaskGroups'] for task in g['Tasks']
                          for t in task.get('Templates') or [])
 
+    def test_the_sequencer_admission_switch_adds_the_v2_section(self):
+        """Empty keeps the v1 loop; on appends the [admission] table."""
+        for switch, present in (('', False), ('on', True)):
+            with self.subTest(switch=switch):
+                self.run_deploy({'workloads_sequencer_admission': switch}, check=True)
+                templates = self.job_templates(self.api.state['plans']['sequencer'])
+                self.assertEqual('[admission]\nenabled = true\nmax_parked = 512\nmax_forwarded = 512' in templates,
+                                 present)
+
     def test_the_egress_switches_default_off(self):
         """With every switch off, no egress job and no reader flag."""
         self.run_deploy(check=True)
@@ -2047,6 +2056,17 @@ class CarryTest(Deploys):
         """The groups of each registration of the executor job."""
         return [[(g['Name'], g['Count']) for g in job['TaskGroups']]
                 for job in self.api.state.get('registrations', []) if job['ID'] == 'executor']
+
+    def test_the_bring_up_of_the_carry_shard_deploys_a_new_chain(self):
+        """The bring-up of the chaos-carry shard: the member feed, the
+        executors on the sealer nodes, the egress and the v2 loop of the
+        sequencers, all on a new chain."""
+        self.run_deploy(environ=self.ON_SEALERS | {'KARDAMOM_SEQUENCER_ADMISSION': 'on'})
+        jobs = {job['ID']: job for job in self.api.state['registrations']}
+        self.assertEqual(sorted(g['Name'] for g in jobs['executor']['TaskGroups']),
+                         ['executor-0', 'executor-1', 'executor-2'])
+        self.assertIn('[admission]\nenabled = true', DeployTest.job_templates(jobs['sequencer']))
+        self.assertIn('egress', jobs)
 
     def test_the_executors_move_to_the_sealer_nodes_one_at_a_time(self):
         self.deploy()

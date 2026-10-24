@@ -50,6 +50,27 @@ impl StallTolerance {
     }
 }
 
+/// The nodes of the executors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutorNodes {
+    /// The executor nodes.
+    Executor,
+    /// The sealer nodes (`KARDAMOM_EXEC_ON_SEALERS=on`): executor `i` runs
+    /// on node `sealer-<i>`.
+    Sealer,
+}
+
+impl ExecutorNodes {
+    /// The node role of the executors in the node contract.
+    #[must_use]
+    pub fn role(self) -> &'static str {
+        match self {
+            Self::Executor => "executor",
+            Self::Sealer => "sealer",
+        }
+    }
+}
+
 /// The suite settings. See the module doc for the defaults.
 /// One fixed-rate run of the sustained-load stage.
 #[derive(Debug, Clone)]
@@ -144,6 +165,8 @@ pub struct Knobs {
     /// checkpoints (`KARDAMOM_CHECKPOINT_LOG=on`). The peer resync then
     /// also checks that the victim fetched and applied the log.
     pub checkpoint_log: bool,
+    /// Where the executors run (`KARDAMOM_EXEC_ON_SEALERS`).
+    pub executor_nodes: ExecutorNodes,
     /// The hard cap of the adaptive retention freeze.
     pub retention_freeze_cap: Duration,
     /// How long one L1 fault of the chaos-l1 cases stays active.
@@ -295,6 +318,11 @@ impl Knobs {
             da_lag_budget_blocks: da_lag_budget,
             exec_cursor: env.or("KARDAMOM_EXEC_CURSOR", "off") == "on",
             checkpoint_log: env.or("KARDAMOM_CHECKPOINT_LOG", "off") == "on",
+            executor_nodes: if env.or("KARDAMOM_EXEC_ON_SEALERS", "off") == "on" {
+                ExecutorNodes::Sealer
+            } else {
+                ExecutorNodes::Executor
+            },
             retention_freeze_cap: env.secs("RETENTION_FREEZE_CAP_S", 600)?,
             l1_fault: env.secs("L1_FAULT_S", 60)?,
             l1_tps: env.nonzero_u32("L1_CASE_TPS", 50)?,

@@ -207,6 +207,11 @@ workloads_carry_executor_ids: "{{ workloads_carry_executors | split(',') | rejec
 # gate refuses a floor above the lowest decisionVersion of the members,
 # and a floor above 0 until every reader reads a relayed full reference.
 workloads_sealer_version_floor: "{{ lookup('env', 'KARDAMOM_SEALER_VERSION_FLOOR') }}"
+# The v2 loop of the sequencers (KARDAMOM_SEQUENCER_ADMISSION): "on" or
+# "off". Empty keeps the job's "off" default. The carry window needs it:
+# only the v2 loop carries the bytes of a transaction under decision
+# version 5.
+workloads_sequencer_admission: "{{ lookup('env', 'KARDAMOM_SEQUENCER_ADMISSION') }}"
 # The ceiling of the sealer retention in frames, and in bytes: the
 # retained frames times their mean size. A replay over a cluster session
 # queues every wanted frame at once, and the sealer closes a session whose
@@ -277,6 +282,7 @@ workloads_egress_job_vars:
   sequencer:
     receipts_from_egress: "{{ workloads_sequencer_receipts_from_egress }}"
     sealer_version_floor: "{{ workloads_sealer_version_floor }}"
+    admission: "{{ workloads_sequencer_admission }}"
   ingress:
     receipt_query_endpoints: "{{ workloads_egress_url if workloads_ingress_receipts_from_egress == 'on' else '' }}"
   notifier:

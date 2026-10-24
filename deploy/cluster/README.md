@@ -415,6 +415,7 @@ The gates read the metrics of each instance by the node address that the Nomad A
 The order on a live chain:
 
 1. Deploy the release with every switch off and the floor 0.
+   The sequencers run the v2 loop (`KARDAMOM_SEQUENCER_ADMISSION=on`). The v1 loop offers each transaction without its bytes, and the sealer refuses such an offer after the switch.
 2. Set `KARDAMOM_SEALER_VERSION_FLOOR` to the lowest `decisionVersion` of the members.
 3. Move the batcher and the validator to the egress.
 4. Deploy with `KARDAMOM_MEMBER_FEED=on`.
@@ -509,6 +510,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Executor | `KARDAMOM_EXEC_ON_SEALERS` (job variable `exec_on_sealers` of every job that it changes) | empty (`off` in the jobs) | `on` or `off`. On, executor `<i>` runs on `sealer-<i>`, and the executor job rolls one group at a time. It needs `KARDAMOM_MEMBER_FEED=on`. |
 | Executor | `KARDAMOM_CARRY_EXECUTORS` (job variable `carry_executors`) | empty | The member indexes of the carry executors, such as `0,1`. Each one runs with `--carry-bytes` and `--egress`. It needs `KARDAMOM_EXEC_ON_SEALERS=on` and `KARDAMOM_EGRESS=1`. |
 | Sequencer | `KARDAMOM_SEALER_VERSION_FLOOR` (job variable `sealer_version_floor`) | empty (`0` in the job) | The decision version that a sequencer assumes before the first report of a sealer session, from 0 to 5. The release gate refuses a value above the lowest `decisionVersion` of the members, and a value above 0 before every reader runs this release. |
+| Sequencer | `KARDAMOM_SEQUENCER_ADMISSION` (job variable `admission`) | empty (`off` in the job) | `on` or `off`. On, the sequencers run the v2 loop (the `[admission]` section of the config), with 512 forwarded and 512 parked transactions for each sender. The carry window needs it: only the v2 loop takes the bytes of a transaction under decision version 5, and the sealer refuses a reference without bytes while the window is on. |
 | Executor | `KARDAMOM_EXEC_CURSOR` (job variable `exec_cursor`) | empty (`off` in the job) | `on` or `off`. On, each executor sends its recorded cursor to the sealer, the floor of the record-lag guard. Switch it on only after every sealer member reads ingress kind 9. A sealer member that does not read it drops the frame. |
 | Egress | `KARDAMOM_EGRESS` | `0` | `1` deploys the egress job (`nomad/egress.nomad.hcl`) and its scrape (job variable `egress` of the monitoring job). It needs `KARDAMOM_EXEC_FRAMES=on`. See [The egress](#the-egress). |
 | Egress | `KARDAMOM_EXEC_FRAMES` (job variable `exec_frames` of the executor) | empty (`off` in the job) | `on` or `off`. On, each executor publishes the frames that it executes on `exec_frames` (`--exec-frames`). |

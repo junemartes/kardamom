@@ -29,7 +29,8 @@ FIXTURE = Path(__file__).resolve().parent / 'fixtures' / 'carry-off-jobs.json'
 JOBS = ('aeron.system', 'batcher', 'cluster', 'egress', 'executor', 'ingress', 'monitoring', 'sequencer',
         'state-mirror', 'validator')
 # The value of each switch when it is off, for the jobs that declare it.
-OFF = {'member_feed': 'off', 'exec_on_sealers': 'off', 'carry_executors': '', 'sealer_version_floor': '0'}
+OFF = {'member_feed': 'off', 'exec_on_sealers': 'off', 'carry_executors': '', 'sealer_version_floor': '0',
+       'admission': 'off'}
 # The metas that state what the release does. They are on with every
 # switch off.
 RELEASE_METAS = {'sealer_version_kept', 'carried_ref_fault', 'ref_mark'}
