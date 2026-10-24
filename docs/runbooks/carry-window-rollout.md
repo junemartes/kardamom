@@ -287,6 +287,8 @@ The deploy does not change these. Apply them before step 6.
 ### To go back
 
 - An executor goes back to reference mode at any time: leave it out of `KARDAMOM_CARRY_EXECUTORS`.
+- Keep `KARDAMOM_SEQUENCER_ADMISSION=on` while a member holds feature 5. The release gate refuses the v1 loop then, unless
+  `KARDAMOM_ALLOW_MUST_MATCH=admission`: the v1 loop offers record type 0, and the sealer refuses every such transaction.
 - Feature 5 can turn off with an upgrade transaction (activation time `18446744073709551615`). The check allows any
   activation time for feature 5.
 - Feature 3 or 4 off stops decision version 5, and with it the rules of feature 5. The upgrade check refuses it

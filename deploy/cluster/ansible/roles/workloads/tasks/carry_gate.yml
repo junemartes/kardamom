@@ -6,6 +6,7 @@
 #    not run yet.
 # b. The batcher or the validator moves to the egress.
 # c. An executor moves to carry mode.
+# d. The sequencers go back to the v1 loop.
 # The tasks read only, so they also run in check mode.
 
 # 8a. The sequencer version floor. A sequencer starts from the floor until
@@ -284,3 +285,46 @@
       vars:
         workloads_gate_executor_blocks: >-
           {{ dict(workloads_metrics_of.executor.groups | zip(workloads_metrics_of.executor.kardamom_executor_block_number)) }}
+
+# 8d. The v1 loop of the sequencers offers each transaction as a reference
+# of record type 0, and the rules of feature 5 refuse such a reference.
+# So with the carry window held or on, a deploy that turns the v2 loop off
+# makes the sealer refuse every transaction. The gate refuses it while any
+# member reports carryWindow true or holds feature 5
+# (kardamom_sealer_feature_state{feature="5"} at 1 or 2), and while a
+# member does not run. KARDAMOM_ALLOW_MUST_MATCH=admission is the way out,
+# for example after feature 5 went off.
+- name: Check the move back to the v1 loop
+  when:
+    - workloads_gate_admission_off | bool
+    - "'admission' not in workloads_allow_must_match"
+    - workloads_gate_cluster_job.status == 200
+  block:
+    - name: Read the status of every sealer member for the v1 loop
+      ansible.builtin.include_tasks: sealer_status.yml
+      vars:
+        workloads_sealer_groups: "{{ workloads_gate_cluster_job.json.TaskGroups | map(attribute='Name') | list }}"
+
+    - name: Read the state of feature 5 for the v1 loop
+      ansible.builtin.include_tasks: metrics_read.yml
+      vars:
+        workloads_metrics_job: cluster
+        workloads_metrics_port: "{{ workloads_sealer_admin_port }}"
+        workloads_metrics_gauges: ['kardamom_sealer_feature_state{feature="5"}']
+
+    - name: Refuse the v1 loop while a member holds the carry window
+      ansible.builtin.assert:
+        that:
+          - workloads_sealer_down | length == 0
+          - workloads_gate_windows | select('equalto', true) | list | length == 0
+          - workloads_metrics_of.cluster['kardamom_sealer_feature_state{feature="5"}'] | select('ge', 1) | list | length == 0
+        fail_msg: >-
+          Refused: the target turns the v2 loop of the sequencers off (KARDAMOM_SEQUENCER_ADMISSION is not on, and the
+          registered sequencer job carries v2_loop), and a member holds the carry window: carryWindow
+          {{ workloads_gate_windows }}, kardamom_sealer_feature_state{feature="5"}
+          {{ workloads_metrics_of.cluster['kardamom_sealer_feature_state{feature="5"}'] }}, members down
+          {{ workloads_sealer_down }}. The v1 loop offers record type 0, and the sealer refuses every such transaction.
+          Keep KARDAMOM_SEQUENCER_ADMISSION=on. To turn it off on purpose, set KARDAMOM_ALLOW_MUST_MATCH=admission.
+      vars:
+        workloads_gate_windows: >-
+          {{ workloads_sealer_status.results | map(attribute='json') | map(attribute='carryWindow', default=false) | list }}

@@ -407,6 +407,7 @@ The gates of the carry window refuse a move before any job changes. Each gate ru
   - the member `cluster-<i>` that reports the feed `off`;
   - the egress checks above;
   - `kardamom_executor_block_number` of the executor minus 32 not above the highest `kardamom_egress_ref_frame_max_block`. At its first carry start, the executor compares the stream with its committed blocks of that window.
+- The move back to the v1 loop: a target without `KARDAMOM_SEQUENCER_ADMISSION=on` while the registered sequencer job carries `v2_loop`, and a member reports `carryWindow` true, holds feature 5 (`kardamom_sealer_feature_state{feature="5"}` at 1 or 2), or does not run. `KARDAMOM_ALLOW_MUST_MATCH=admission` allows it.
 - The sealer retention, when the sealer job changes:
   - a lower value than the registered sealer, unless `KARDAMOM_ALLOW_MUST_MATCH` names `retention`;
   - a value whose frames, at the mean frame size of the members, pass 48 MiB, well below the 64 MiB backlog limit of a cluster session. At a mean of 300 bytes, 131,072 frames (about 39.3 MB) fit. The mean is the sum of `retainedBytes` over the sum of `retainedFrames` of the member status (the gauges `kardamom_sealer_retained_bytes` and `kardamom_sealer_retained_frames`).

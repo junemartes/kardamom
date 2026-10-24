@@ -2138,6 +2138,21 @@ class CarryTest(Deploys):
             self.refused(floor, f'the {job} job does not run a relayed full reference (job meta relayed_full_ref)')
             meta['relayed_full_ref'] = 'true'
 
+    def test_the_v2_loop_stays_on_while_a_member_holds_the_carry_window(self):
+        """The v1 loop offers record type 0, which the carry window refuses."""
+        self.deploy()
+        self.api.state['writes'] = []
+        v1 = self.DEPLOY_ENVIRON | {'KARDAMOM_SEQUENCER_ADMISSION': ''}
+        self.api.state['status'] = {'node-cluster-1': {'carryWindow': True}}
+        self.refused(v1, 'the target turns the v2 loop of the sequencers off')
+        del self.api.state['status']
+        self.metric('node-cluster-2', {'kardamom_sealer_feature_state{feature="5"}': 1})
+        self.refused(v1, 'kardamom_sealer_feature_state{feature="5"} [-1.0, -1.0, 1.0]')
+        self.assertEqual(self.api.state['writes'], [])
+        # The documented way out.
+        self.run_deploy(check=True, environ=v1 | {'KARDAMOM_ALLOW_MUST_MATCH': 'admission'})
+        self.assertNotIn('[admission]', DeployTest.job_templates(self.api.state['plans']['sequencer']))
+
     def test_the_readers_move_to_the_egress_past_the_last_stored_reference(self):
         self.deploy()
         readers = self.DEPLOY_ENVIRON | {'KARDAMOM_BATCHER_EGRESS': 'on', 'KARDAMOM_VALIDATOR_EGRESS': 'on'}

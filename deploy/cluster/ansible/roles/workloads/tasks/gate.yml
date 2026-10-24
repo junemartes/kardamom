@@ -430,6 +430,21 @@
       {{ workloads_gate_retention_new }} frames. A rolling deploy only raises it: a member with the lower window
       answers more cursors with REPLAY_UNAVAILABLE. Lower it only on purpose, with KARDAMOM_ALLOW_MUST_MATCH=retention.
 
+# The v2 loop of the sequencers goes off when the registered sequencer
+# job carries v2_loop and the target does not turn it on (8d of
+# carry_gate.yml). KARDAMOM_ALLOW_MUST_MATCH=admission allows that move.
+- name: Read the registered sequencer for the v2 loop
+  ansible.builtin.include_tasks: read_job.yml
+  vars:
+    workloads_read_job: sequencer
+
+- name: Keep whether the target turns the v2 loop off
+  ansible.builtin.set_fact:
+    workloads_gate_admission_off: >-
+      {{ workloads_registered_job.status == 200
+         and ((workloads_registered_job.json.Meta | default({}, true)).v2_loop | default('')) == 'true'
+         and workloads_sequencer_admission != 'on' }}
+
 - name: Refuse an allowance that covers no sealer setting change
   ansible.builtin.assert:
     that: workloads_allow_must_match | difference(workloads_gate_allowable) | length == 0
@@ -438,7 +453,8 @@
       and the release does not change it. Unset it.
   vars:
     workloads_gate_allowable: >-
-      {{ workloads_gate_sealer_changed + (['retention'] if workloads_gate_retention_lowered | bool else []) }}
+      {{ workloads_gate_sealer_changed + (['retention'] if workloads_gate_retention_lowered | bool else [])
+         + (['admission'] if workloads_gate_admission_off | bool else []) }}
 
 # 5a. A registered sealer job that names decisionVersion=3 ran a build
 # that applied nonce releases (ingress kind 10) from its start. This
