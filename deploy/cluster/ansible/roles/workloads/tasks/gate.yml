@@ -10,6 +10,8 @@
 #    rolling path.
 # 5a. The registered sealer job does not name decisionVersion=3.
 # 6. The shard map does not change in the rolling path.
+# 7. When the sealer job changes, the target reads the newest snapshot
+#    of every sealer member.
 # The gate also reads the revision of the target tree, for the record.
 # The gate reads only, so it also runs in check mode.
 
@@ -360,6 +362,17 @@
   vars:
     workloads_job: "{{ workloads_sealer_job }}"
 
+# The plan of the sealer roll. A new image digest or any other change of
+# the sealer job shows as a diff, and only then do the members restart.
+- name: Plan the sealer for the snapshot check
+  ansible.builtin.include_tasks: plan.yml
+  vars:
+    workloads_register_job: cluster
+
+- name: Keep whether the sealer members restart on the target
+  ansible.builtin.set_fact:
+    workloads_gate_sealer_rolls: "{{ workloads_gate_cluster_job.status == 200 and workloads_plan.json.Diff.Type != 'None' }}"
+
 - name: Keep the sealer settings that change
   ansible.builtin.set_fact:
     workloads_gate_sealer_changed: >-
@@ -426,3 +439,67 @@
          | selectattr('DestPath', 'equalto', 'local/shard-map.toml') | map(attribute='EmbeddedTmpl') | first
          | community.general.from_toml }}
   when: workloads_gate_ingress_job.status == 200
+
+# 7. The sealer snapshot (snapshot_check.yml). A cluster that Nomad does
+# not know has no member to read. A running member reads no snapshot, so
+# the check runs only when the sealer job changes. A release that does
+# not change the sealer passes while a member is down, so it can be the
+# fix of that outage.
+- name: Report the skip of the snapshot check
+  ansible.builtin.debug:
+    msg: >-
+      The sealer job does not change, so no sealer member restarts on the target release. The gate skips the
+      snapshot check.
+  when:
+    - workloads_gate_cluster_job.status == 200
+    - not workloads_gate_sealer_rolls | bool
+
+# The formats of the sealer release come from its revision, not from the
+# checkout. A deploy of an older manifest can run from a newer checkout.
+# One sealer image holds one set of snapshot versions. The revision of
+# the target sealer image comes from the first source that names it:
+# - A deploy record that names the image.
+# - The checkout, when the image is the registered one, or the manifest
+#   pins no sealer image. The members run that image, or the image builds
+#   from this tree.
+# - The tag of the image. A release tags it main-<12 hex of the commit>,
+#   or vX.Y.Z.
+# - KARDAMOM_REVISION.
+# A sealer image that no source names is refused.
+- name: Name the revision of the target sealer release
+  ansible.builtin.set_fact:
+    workloads_gate_sealer_revision: >-
+      {{ (([workloads_last_attempt.before | default({}), workloads_accepted.target | default({}),
+            workloads_last_attempt.target | default({})]
+           | selectattr('manifest', 'defined') | selectattr('revision', 'defined')
+           | selectattr('manifest.cluster', 'defined')
+           | selectattr('manifest.cluster', 'equalto', workloads_gate_sealer_image)
+           | rejectattr('revision', 'in', ['', 'unknown']) | map(attribute='revision') | list)
+          + ([workloads_target_revision] if workloads_gate_sealer_image == '' or workloads_gate_sealer_image in workloads_gate_sealer_registered else [])
+          + (workloads_gate_sealer_tag | regex_findall('^main-([0-9a-f]{12})$'))
+          + (workloads_gate_sealer_tag | regex_findall('^v[0-9]+\.[0-9]+\.[0-9]+$'))
+          + ([workloads_revision] if workloads_revision | length > 0 else [])
+          + ['']) | first }}
+  vars:
+    workloads_gate_sealer_image: "{{ workloads_image_refs.cluster | default('') }}"
+    workloads_gate_sealer_registered: >-
+      {{ workloads_gate_cluster_job.json.TaskGroups | map(attribute='Tasks') | map('first')
+         | map(attribute='Config.image', default='') | list }}
+    workloads_gate_sealer_tag: "{{ workloads_gate_sealer_image | regex_replace('@.*$', '') | regex_replace('^.*:', '') }}"
+  when: workloads_gate_sealer_rolls | bool
+
+- name: Refuse a sealer image whose revision the gate cannot name
+  ansible.builtin.assert:
+    that: workloads_gate_sealer_revision | length > 0
+    fail_msg: >-
+      Refused: no deploy record names the sealer image {{ workloads_image_refs.cluster }}, it is not the registered
+      sealer, and its tag names no release revision (main-<12 hex> or vX.Y.Z). So the gate cannot read the snapshot
+      versions that this sealer reads. Set KARDAMOM_REVISION to the revision of that image, then deploy.
+  when: workloads_gate_sealer_rolls | bool
+
+- name: Check the sealer snapshot against the target
+  ansible.builtin.include_tasks: snapshot_check.yml
+  vars:
+    workloads_sealer_groups: "{{ workloads_gate_cluster_job.json.TaskGroups | map(attribute='Name') | list }}"
+    workloads_snapshot_revision: "{{ workloads_gate_sealer_revision }}"
+  when: workloads_gate_sealer_rolls | bool
