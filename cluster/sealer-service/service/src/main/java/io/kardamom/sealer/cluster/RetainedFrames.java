@@ -5,6 +5,7 @@ import java.nio.ByteBuffer;
 import java.util.stream.Stream;
 import org.agrona.DirectBuffer;
 import org.agrona.MutableDirectBuffer;
+import org.agrona.concurrent.UnsafeBuffer;
 
 /**
  * The egress frames that a member retains for replay, in emission order.
@@ -16,6 +17,12 @@ import org.agrona.MutableDirectBuffer;
  * only an index on the heap. {@code kardamom.cluster.carryBytes} selects
  * one. Every call runs on the clustered-service thread, and every result
  * is a pure function of the log.</p>
+ *
+ * <p>The member feed walks the frames by a walk key of type {@code long}.
+ * The key of a frame does not change while the frame stays: an append, an
+ * eviction and a growth of a ring keep it. The key after a frame is above
+ * the key of the frame. The keys are local to the member: they are not in
+ * a snapshot, and no other member reads them.</p>
  */
 sealed interface RetainedFrames permits HeapFrames, RetainedFile {
 
@@ -29,10 +36,13 @@ sealed interface RetainedFrames permits HeapFrames, RetainedFile {
     /** The number of retained frames. */
     long count();
 
+    /** The bytes of the retained frames. */
+    long bytes();
+
     /**
-     * Whether this store belongs to a member that carries the bytes: only
-     * then does the member feed run, so a paired executor reads the bytes
-     * and every reader below the window recovers from the egress.
+     * Whether this store keeps the retained file. Then the egress keeps only
+     * its replay window under decision version 5, also without the carry
+     * window.
      */
     boolean carriesBytes();
 
@@ -58,6 +68,31 @@ sealed interface RetainedFrames permits HeapFrames, RetainedFile {
      * inside its block and at or above the floors.
      */
     Stream<byte[]> wanted(long fromIndex, long fromBlock);
+
+    /**
+     * The walk key where a feed answer from {@code fromBlock} starts: the
+     * key after the retained boundary of the block before it, else
+     * {@link #walkFront()}. A frame before that key is a boundary below
+     * {@code fromBlock}, or a record of an earlier block.
+     */
+    long walkStart(long fromBlock);
+
+    /** The walk key of the oldest retained frame. Every key from it to {@link #walkHead()} names a retained frame. */
+    long walkFront();
+
+    /** The walk key after the newest retained frame. */
+    long walkHead();
+
+    /**
+     * Point {@code view} at the bytes of the frame at {@code key}, without a
+     * copy. The key is at or above {@link #walkFront()} and below
+     * {@link #walkHead()}. The view stays valid until the next append or
+     * eviction.
+     */
+    void view(long key, UnsafeBuffer view);
+
+    /** The walk key of the frame after the frame at {@code key}. */
+    long walkNext(long key);
 
     /** The retention section of a snapshot. Every member writes the same bytes at the same log position. */
     byte[] writeSnapshot(long floorIndex, long floorBlock);

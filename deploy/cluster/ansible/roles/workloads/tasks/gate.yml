@@ -10,6 +10,11 @@
 #    rolling path.
 # 5a. The registered sealer job does not name decisionVersion=3.
 # 6. The shard map does not change in the rolling path.
+# 7. When the sealer job changes, the target reads the newest snapshot
+#    of every sealer member.
+# 7a. The sealer retention only rises on a live chain, and stays within
+#     the cap in bytes.
+# 8. The gates of the carry window (carry_gate.yml).
 # The gate also reads the revision of the target tree, for the record.
 # The gate reads only, so it also runs in check mode.
 
@@ -360,6 +365,17 @@
   vars:
     workloads_job: "{{ workloads_sealer_job }}"
 
+# The plan of the sealer roll. A new image digest or any other change of
+# the sealer job shows as a diff, and only then do the members restart.
+- name: Plan the sealer for the snapshot check
+  ansible.builtin.include_tasks: plan.yml
+  vars:
+    workloads_register_job: cluster
+
+- name: Keep whether the sealer members restart on the target
+  ansible.builtin.set_fact:
+    workloads_gate_sealer_rolls: "{{ workloads_gate_cluster_job.status == 200 and workloads_plan.json.Diff.Type != 'None' }}"
+
 - name: Keep the sealer settings that change
   ansible.builtin.set_fact:
     workloads_gate_sealer_changed: >-
@@ -384,12 +400,45 @@
       Change it through a coordinated restart of the sealer. A documented procedure names the settings in
       KARDAMOM_ALLOW_MUST_MATCH={{ workloads_gate_sealer_changed | join(',') }}.
 
+# 5b. The sealer retention. It is not a setting that every member must
+# match: two members with two windows decide the same. A member with a
+# lower window answers more cursors with REPLAY_UNAVAILABLE, and a reader
+# whose cursor sits between the two windows loses its source. So a rolling
+# deploy only raises it. KARDAMOM_ALLOW_MUST_MATCH=retention allows a lower
+# value. A member that is mid-roll keeps its own value, so the gate
+# compares with the highest value of the registered groups.
+- name: Keep the sealer retention of the target and of the registered sealer
+  ansible.builtin.set_fact:
+    workloads_gate_retention_new: >-
+      {{ workloads_job_definition.TaskGroups[0].Tasks[0].Env.JAVA_TOOL_OPTIONS
+         | regex_search('-Dkardamom[.]cluster[.]retention=[0-9]+') | regex_replace('^.*=', '') | int }}
+    workloads_gate_retention_now: >-
+      {{ ([] if workloads_gate_cluster_job.status != 200 else
+          workloads_gate_cluster_job.json.TaskGroups | map(attribute='Tasks') | map('first')
+          | map(attribute='Env.JAVA_TOOL_OPTIONS') | map('regex_search', '-Dkardamom[.]cluster[.]retention=[0-9]+')
+          | select | map('regex_replace', '^.*=', '') | map('int') | list) | max | default(0, true) }}
+
+- name: Keep whether the target lowers the sealer retention
+  ansible.builtin.set_fact:
+    workloads_gate_retention_lowered: "{{ workloads_gate_retention_new | int < workloads_gate_retention_now | int }}"
+
+- name: Refuse a lower sealer retention in the rolling path
+  ansible.builtin.assert:
+    that: not workloads_gate_retention_lowered | bool or 'retention' in workloads_allow_must_match
+    fail_msg: >-
+      Refused: the target lowers the sealer retention from {{ workloads_gate_retention_now }} to
+      {{ workloads_gate_retention_new }} frames. A rolling deploy only raises it: a member with the lower window
+      answers more cursors with REPLAY_UNAVAILABLE. Lower it only on purpose, with KARDAMOM_ALLOW_MUST_MATCH=retention.
+
 - name: Refuse an allowance that covers no sealer setting change
   ansible.builtin.assert:
-    that: workloads_allow_must_match | difference(workloads_gate_sealer_changed) | length == 0
+    that: workloads_allow_must_match | difference(workloads_gate_allowable) | length == 0
     fail_msg: >-
-      Refused: KARDAMOM_ALLOW_MUST_MATCH names {{ workloads_allow_must_match | difference(workloads_gate_sealer_changed) | join(', ') }},
+      Refused: KARDAMOM_ALLOW_MUST_MATCH names {{ workloads_allow_must_match | difference(workloads_gate_allowable) | join(', ') }},
       and the release does not change it. Unset it.
+  vars:
+    workloads_gate_allowable: >-
+      {{ workloads_gate_sealer_changed + (['retention'] if workloads_gate_retention_lowered | bool else []) }}
 
 # 5a. A registered sealer job that names decisionVersion=3 ran a build
 # that applied nonce releases (ingress kind 10) from its start. This
@@ -426,3 +475,90 @@
          | selectattr('DestPath', 'equalto', 'local/shard-map.toml') | map(attribute='EmbeddedTmpl') | first
          | community.general.from_toml }}
   when: workloads_gate_ingress_job.status == 200
+
+# 7. The sealer snapshot. A member restores its newest snapshot at its
+# start. A member that holds a snapshot of a version above the reads_max
+# of the target cannot restore it after the roll, and stops. A cluster
+# that Nomad does not know has no member to read. A running member reads
+# no snapshot, so the check runs only when the sealer job changes. A
+# member that does not run can hold the newest snapshot, and the gate
+# cannot read its version, so the gate refuses. The staged roll of the
+# sealer also needs every member. A release that does not change the
+# sealer passes while a member is down, so it can be the fix of that
+# outage.
+- name: Report the skip of the snapshot check
+  ansible.builtin.debug:
+    msg: >-
+      The sealer job does not change, so no sealer member restarts on the target release. The gate skips the
+      snapshot check.
+  when:
+    - workloads_gate_cluster_job.status == 200
+    - not workloads_gate_sealer_rolls | bool
+- name: Read the status of every sealer member
+  ansible.builtin.include_tasks: sealer_status.yml
+  vars:
+    workloads_sealer_groups: "{{ workloads_gate_cluster_job.json.TaskGroups | map(attribute='Name') | list }}"
+  when: workloads_gate_sealer_rolls | bool
+
+- name: Refuse a release while a sealer member does not run
+  ansible.builtin.assert:
+    that: workloads_sealer_down | length == 0
+    fail_msg: >-
+      Refused: the sealer members {{ workloads_sealer_down | join(', ') }} do not run, so the gate cannot read
+      the version of their newest snapshot. Start them and let them catch up, then deploy.
+  when: workloads_gate_sealer_rolls | bool
+
+# A member of a release without snapshotLatest reports no version. The
+# gate reads it as 0.
+- name: Refuse a release that cannot read the newest snapshot of a sealer member
+  ansible.builtin.assert:
+    that: workloads_gate_unreadable | length == 0
+    fail_msg: >-
+      Refused: the target release reads sealer snapshots only up to version {{ workloads_gate_reads_max }}
+      (formats.toml, sealer-snapshot reads_max), and these sealer members hold a newer snapshot:
+      {{ workloads_gate_unreadable | map('join', ' at version ') | join(', ') }}.
+      After the roll such a member cannot restore its own snapshot, and stops.
+      Deploy a release that reads snapshot version {{ (workloads_gate_unreadable | map('last') | list + [0]) | max }}.
+  vars:
+    workloads_gate_reads_max: >-
+      {{ (lookup('file', workloads_repo_root ~ '/formats.toml')
+          | community.general.from_toml)['format']['sealer-snapshot']['reads_max'] }}
+    workloads_gate_unreadable: >-
+      {{ workloads_sealer_status.results | map(attribute='item.item.TaskGroup')
+         | zip(workloads_sealer_status.results | map(attribute='json.snapshotLatest', default=0))
+         | rejectattr('1', 'le', workloads_gate_reads_max | int) | list }}
+  when: workloads_gate_sealer_rolls | bool
+
+# 7a. The sealer retention in bytes. A replay over a cluster session
+# queues every wanted frame at once, and the sealer closes a session whose
+# backlog passes 64 MiB. So the frames of a full window, at the mean size
+# of the frames that the members hold now, stay within 48 MiB
+# (workloads_retention_cap_bytes), well below that limit. The members hold the same frames, so the mean is the retained
+# bytes over the retained frames of all members, from the member status:
+# the values of the gauges kardamom_sealer_retained_bytes and
+# kardamom_sealer_retained_frames. Members that hold no frame give no mean.
+- name: Refuse a sealer retention whose window passes the cap in bytes
+  ansible.builtin.assert:
+    that: workloads_gate_retention_new | int * workloads_gate_mean_bytes | float <= workloads_retention_cap_bytes | int
+    fail_msg: >-
+      Refused: the sealer retention {{ workloads_gate_retention_new }} frames at the mean frame size of the members,
+      {{ workloads_gate_mean_bytes | float | round(1) }} bytes, is
+      {{ (workloads_gate_retention_new | int * workloads_gate_mean_bytes | float) | int }} bytes, above the cap of
+      {{ workloads_retention_cap_bytes }} bytes. A replay of the whole window would pass the backlog limit of a
+      cluster session. Set at most {{ (workloads_retention_cap_bytes | int / [workloads_gate_mean_bytes | float, 1] | max) | int }}
+      frames.
+  vars:
+    workloads_gate_frames: >-
+      {{ workloads_sealer_status.results | map(attribute='json') | map(attribute='retainedFrames', default=0)
+         | map('int') | sum }}
+    workloads_gate_mean_bytes: >-
+      {{ 0 if workloads_gate_frames | int == 0 else
+         (workloads_sealer_status.results | map(attribute='json') | map(attribute='retainedBytes', default=0)
+          | map('int') | sum) / workloads_gate_frames | int }}
+  when:
+    - workloads_gate_sealer_rolls | bool
+    - workloads_gate_retention_new | int != workloads_gate_retention_now | int
+
+# 8. The carry window.
+- name: Gate the moves of the carry window
+  ansible.builtin.import_tasks: carry_gate.yml

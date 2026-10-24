@@ -42,6 +42,25 @@ final class MemberStatus {
         }
     }
 
+    /**
+     * The store of the retained frames ({@code heap} or {@code file}),
+     * whether the rules of the carry window apply, the newest held
+     * activation of the carry window (both 0 when none), the retained
+     * frames and their bytes, and the state of the member feed
+     * ({@link FeedState#label()}).
+     */
+    record Carry(
+            String retainedStore,
+            boolean carryWindow,
+            long activationOrigin,
+            long activationMs,
+            long retainedFrames,
+            long retainedBytes,
+            String feed) {
+        /** The value of a sample that has no service. */
+        static final Carry NONE = new Carry("heap", false, 0L, 0L, 0L, 0L, FeedState.OFF.label());
+    }
+
     final int memberId;
     final String role;
     final String election;
@@ -62,6 +81,8 @@ final class MemberStatus {
     final long leadershipTermId;
     /** Whether the member still holds its outputs after its start ({@link StartHold}). */
     final boolean startHold;
+    /** The retained store and the carry window of the member. */
+    final Carry carry;
 
     MemberStatus(
             final int memberId,
@@ -72,7 +93,8 @@ final class MemberStatus {
             final SnapshotVersions snapshot,
             final DecisionRules.View rules,
             final OptionalLong diskFreeBytes) {
-        this(memberId, role, election, commitPosition, servicePosition, snapshot, rules, diskFreeBytes, -1L, false);
+        this(memberId, role, election, commitPosition, servicePosition, snapshot, rules, diskFreeBytes, -1L, false,
+            Carry.NONE);
     }
 
     private MemberStatus(
@@ -85,7 +107,8 @@ final class MemberStatus {
             final DecisionRules.View rules,
             final OptionalLong diskFreeBytes,
             final long leadershipTermId,
-            final boolean startHold) {
+            final boolean startHold,
+            final Carry carry) {
         this.memberId = memberId;
         this.role = role;
         this.election = election;
@@ -96,12 +119,19 @@ final class MemberStatus {
         this.diskFreeBytes = diskFreeBytes;
         this.leadershipTermId = leadershipTermId;
         this.startHold = startHold;
+        this.carry = carry;
     }
 
     /** This sample with the leadership term of the service and the state of the start hold. */
     MemberStatus withStart(final long term, final boolean held) {
         return new MemberStatus(memberId, role, election, commitPosition, servicePosition, snapshot, rules,
-            diskFreeBytes, term, held);
+            diskFreeBytes, term, held, carry);
+    }
+
+    /** This sample with the retained store and the carry window of the service. */
+    MemberStatus withCarry(final Carry next) {
+        return new MemberStatus(memberId, role, election, commitPosition, servicePosition, snapshot, rules,
+            diskFreeBytes, leadershipTermId, startHold, next);
     }
 
     /**
@@ -130,6 +160,13 @@ final class MemberStatus {
             + ",\"decisionVersion\":" + rules.version()
             + ",\"decisionActivationOrigin\":" + Long.toUnsignedString(rules.activationOrigin())
             + ",\"decisionActivationMs\":" + Long.toUnsignedString(rules.activationMs())
+            + ",\"retainedStore\":\"" + carry.retainedStore() + "\""
+            + ",\"carryWindow\":" + carry.carryWindow()
+            + ",\"carryWindowActivationOrigin\":" + Long.toUnsignedString(carry.activationOrigin())
+            + ",\"carryWindowActivationMs\":" + Long.toUnsignedString(carry.activationMs())
+            + ",\"retainedFrames\":" + carry.retainedFrames()
+            + ",\"retainedBytes\":" + carry.retainedBytes()
+            + ",\"feed\":\"" + carry.feed() + "\""
             + ",\"diskFreeBytes\":" + diskFree("null")
             + ",\"leadershipTermId\":" + leadershipTermId
             + ",\"startHold\":" + startHold

@@ -14,7 +14,10 @@
 #              that file. A test checks that each file holds the symbol as a
 #              whole word. It is a pointer, not a proof.
 #   activation optional { flag = "...", writes = N }: the version the writer
-#              writes when an operator switches the flag on
+#              writes when an operator switches the flag on, or
+#              { feature = N, writes = M }: the version the writer writes
+#              after the activation of feature N is in the log. A list of
+#              both forms is also valid.
 #   layout     optional table [format.<id>.layout]: a fingerprint of each
 #              part of a frozen layout. A test computes each one from code.
 #
@@ -58,16 +61,31 @@
 # without the flag is safe. On a chain with the flag, a member of an older
 # release stops on v17: a rollback after the first v17 snapshot, or a seed
 # from a peer that wrote v17.
+# After the feature activation of FEATURE_CARRY_WINDOW (feature 5) is in
+# the log, a heap member writes v18: v16, then the carry window flag and
+# its schedule (up to three held activations), then the heap section. A
+# member with the flag above never takes feature 5, so it never writes
+# v18, and it stops on v18. A release that reads only up to v17 refuses
+# v18 and stops, so send the upgrade transaction of feature 5 only after
+# every member reads v18. The members' snapshot sizes can differ during a
+# roll of kardamom.cluster.retention. No protocol compares snapshot bytes
+# across members.
 [format.sealer-snapshot]
 writes = 14
 reads_min = 1
-reads_max = 17
+reads_max = 18
 shared = true
-activation = { flag = "kardamom.cluster.carryBytes", writes = 17 }
+activation = [
+    { flag = "kardamom.cluster.carryBytes", writes = 17 },
+    { feature = 5, writes = 18 },
+]
 code = [
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_WRITE_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_READ_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#FILE_SNAPSHOT_VERSION",
+    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#WINDOW_SNAPSHOT_VERSION",
+    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/VersionSwitch.java#FEATURE_CARRY_WINDOW",
+    "cluster/sealer-service/service/src/test/resources/sealer-snapshot-v18.hex#v18",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#RETAINED_FILE_SNAPSHOT_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SWITCH_SNAPSHOT_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#CARRY_SNAPSHOT_VERSION",
@@ -109,10 +127,10 @@ code = [
 # thread puts it on the consumer channel when a session opens. It is never
 # on the wire. The sealer sends kind 17 (its rules: the decision version)
 # to each session when it opens, and to each open session at each new
-# term. An older reader drops kind 17 as an unknown kind. This release
-# reads kind 18 (the refusal of a type 0 reference), but the sealer does not
-# send it yet. It goes only to the offering session, and an older reader
-# drops it as an unknown kind.
+# term. An older reader drops kind 17 as an unknown kind. The sealer sends
+# kind 18 (the refusal of a type 0 reference) while the carry window
+# (feature 5) applies. It goes only to the session that offered the
+# reference, and an older reader drops it as an unknown kind.
 #
 # On the member feed, the answers (kinds 3, 4, 11 and 16) are 25 bytes:
 # the 17 bytes of the egress layout, then the request id. A reader reads
@@ -125,7 +143,7 @@ code = [
 # ignores a tail it does not know, and a new reader reads a frame with no
 # tail as the guard off, no snapshot and no retained bytes.
 [format.sealer-egress-kinds]
-writes = 17
+writes = 18
 reads_min = 1
 reads_max = 18
 shared = true
@@ -400,6 +418,20 @@ shared = false
 code = ["crates/executor/src/bin/kardamom-executor/ledger.rs#struct Slot"]
 [format.receipt-ledger.layout]
 Slot = "slots 65536 01000000000000000200000000000000030303030303030303030303030303030303030303030303030303030303030300000000000000000000000000000000"
+
+# Frozen layout. The reference mark of an egress store (ref-mark in the
+# store directory): the canonical index and the block of the highest stored
+# transaction reference, as little-endian u64, 16 bytes. A missing file is
+# index 0 and block 0. A release that does not know the file ignores it. A
+# file of another size stops the egress at start.
+[format.egress-ref-mark]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = false
+code = ["crates/egress/src/ref_mark.rs#pub struct RefMark"]
+[format.egress-ref-mark.layout]
+RefMark = "09000000000000000300000000000000"
 
 # Frozen layout. The notifier outbox: rkyv OutboxRecord frames. An unknown
 # stage code reads as no stage.

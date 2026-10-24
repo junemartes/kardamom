@@ -330,7 +330,7 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
 - **Snapshot of a newer release on disk**
   - Trigger: a release writes a snapshot version that the previous release does not read, and the deploy rolls back.
   - Effect: the rolled-back member cannot restore its newest snapshot and stops at start.
-  - Prevention: the writer stays one version behind the reader (`SNAPSHOT_WRITE_VERSION`, `SNAPSHOT_READ_VERSION`). `GET /status` reports `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax` and `snapshotLatest`, the version of the newest snapshot the member restored or took. A deploy preflight reads `snapshotLatest` on every member and refuses a target whose `reads_max` is below it.
+  - Prevention: the writer stays one version behind the reader (`SNAPSHOT_WRITE_VERSION`, `SNAPSHOT_READ_VERSION`). `GET /status` reports `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax` and `snapshotLatest`, the version of the newest snapshot the member restored or took. When the sealer job changes, the release gate of a deploy reads `snapshotLatest` on every member and refuses a target whose `reads_max` is below it. `just rollback` does not run the gate.
   - Proof: the in-JVM tests `SealerSnapshotVersionTest`, `MemberStatusTest` and `FormatRegistryTest`.
 - **Torn archive fragment at launch**
   - Trigger: a hard kill leaves a torn last fragment in the archive. The launch then fails with `incomplete last fragment straddling page boundary`.
@@ -523,6 +523,27 @@ Each executor publishes the transactions that it joins on the executor stream (`
 - **Shared media driver**: the recorded publication is exclusive. Each executor has its own session and its own recording, also when several executors share one media driver (the single-host e2e stack).
 - Proof: `graceful-executor` and `hard-executor` assert that the restarted executor shows a new session and that its recorded cursor advances. The check does not apply, and logs that, when no executor exports the gauges, or when no recorded cursor moves in the window. The `chaos-executor` shard runs no load, so the L1 epochs move the cursor. The shard deploys `KARDAMOM_EXEC_CURSOR=on`, and `hard-executor` also asserts that the sealer's best recorded cursor (`kardamom_ingress_cluster_recorded_head`) moves while the killed executor is down.
 
+### Carry mode: the executor next to its member
+
+With `KARDAMOM_EXEC_ON_SEALERS=on` (see [the deploy README](../deploy/cluster/README.md#the-carry-window)), executor `i` runs on `sealer-<i>`, the node of member `i`. With `KARDAMOM_CARRY_EXECUTORS` naming `i`, it reads the canonical entries with their bytes from the member feed, an IPC stream on the shared media driver of that node (`KARDAMOM_MEMBER_FEED=on`).
+
+- **Whole sealer node loss**
+  - Trigger: `sealer-<i>` dies.
+  - Effect: one loss takes member `i` and executor `i` together. The cluster keeps its quorum with 2 of 3 members, and the executor fleet keeps 2 of 3 replicas. A second node loss takes the quorum, so no executor gets a new entry.
+  - Executor `i` is pinned to its node. Nomad does not move it to another node, so the fleet stays at 2 of 3 until the node returns.
+  - Recovery: the node returns. The member rejoins from its log or seeds from a peer. The executor resumes from its state directory, and asks its member for the entries from its cursor.
+- **Shared media driver loss on a sealer node**
+  - Effect: executor `i` loses its transport and stops. Member `i` keeps its quorum role: its Raft log runs on its own embedded driver. Its feeder logs `sealer FEED NO-DRIVER` and opens a new client every 1 s.
+  - Recovery: the system task restarts the driver. The executor restarts and asks for the entries from its cursor. The member answers from its retained frames.
+- **Executor crash or restart**
+  - Recovery: the executor asks its member for the entries from its durable cursor. A cursor below the replay window of the member reads the range read of the egress (`--egress`, when the egress runs). A cursor below the floor of the egress too restores a peer checkpoint from another sealer node.
+- **Member crash or restart**
+  - Effect: executor `i` gets no entry while its member is down, and its block gauge stops. The other executors carry the chain.
+  - Recovery: the member starts again, and the executor asks again from its cursor.
+- **Deploy of the executor job**: Nomad orders no groups, so the role rolls the three executor groups one at a time, and waits for the health check of each group. In a roll of the pinned groups, the other two executors serve the nonce queries during each step. The move from the executor nodes also goes one executor at a time, but the readers already ask the sealer nodes: until the second executor moved, one executor serves the nonce queries.
+- **Wipe of a member**: keep `/opt/kardamom/archive/dir`. It is the archive of the shared driver, with the `exec_txs` recording of the executor, inside the archive directory of the member.
+- Proof: no chaos shard runs carry mode yet.
+
 ## Ingress (xN, active/active)
 
 The ingress replicas are shared-nothing. There is no leader and no sticky session. Any replica can accept the transaction of any sender.
@@ -683,6 +704,24 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
     - Version 3 and version 2 decide every frame that a client writes alike: they differ only for a frame that ends at its record type, which no writer sends. So a member of this release that restores a snapshot of version 2 rules decides the log after it as the cluster did.
     - The cluster network is the trust boundary. The session sends no identity, so any cluster client can send kind 0 with any guard header, kind 7, and kind 11. The cluster network must admit only the services of the chain.
   - Proof: `crates/exec-core/src/executor/burn_tests.rs`, `crates/stm/tests/equivalence_burn.rs`, `crates/validator/src/parallel/engine_tests/burn.rs`, `crates/types/src/receipt.rs` (`a_skip_with_a_write_set_burns_its_nonce`), `crates/engine/src/actor/exec_tests/replay_burn_parity.rs`, `crates/sequencer/tests/refusal_rewind.rs` (`a_burning_skip_receipt_raises_the_floor`, `a_skip_receipt_reopens_the_skipped_nonce`, `a_guard_ahead_of_the_chain_answers_the_client`, `another_tx_at_a_nonce_in_flight_hears_of_it`, `a_stale_reject_of_a_settled_copy_is_silent`, `an_ordered_ref_that_did_not_execute_is_not_stuck`), `crates/ingress/tests/account_cache_test.rs` (`a_skip_receipt_leaves_its_nonce_open`, `a_burning_skip_receipt_uses_its_nonce`), `SealerRecordPathTest.the_guard_expects_the_nonce_after_the_last_ordered_entry`, the e2e case S13d (`s13d_a_skip_uses_its_nonce_only_after_the_upgrade`), and the block fixture `crates/exec-core/testdata/feature_switch_blocks.txt` (`crates/exec-core/tests/feature_switch_blocks.rs`).
+- **The kept sealer version and the refused reference**
+  - The sequencer keeps the highest decision version that any session of the process reported (egress kind 17). A new session does not reset it. Only a report of the current session lowers it. The gauge is `kardamom_sequencer_sealer_version{partition}`.
+  - A new process starts from `--sealer-version-floor` (env `KARDAMOM_SEALER_VERSION_FLOOR`, from 0 to 5, default 0). The deploy sets the lowest `decisionVersion` of the members. With a floor of 5, the first offers of a new process go out with their bytes (record type 7), so no reference without bytes (record type 0) goes out after a restart.
+  - A wrong floor lasts until the first kind 17 of the session, a few milliseconds.
+  - A floor above the version of the chain makes type-7 offers below version 5. The sealer orders them. A reader with the decoder of a relayed type 7 runs them.
+  - Set the floor to 0 before a fleet rebuild from a seed. A seeded member runs version 3.
+  - Both loops (v1 and v2) read the kept version.
+  - The sequencer sends the activation record (ingress kind 11) of `FEATURE_CARRY_WINDOW` (feature 5) in front of its epoch, as for features 3 and 4. A sealer that does not follow feature 5 ignores it.
+  - The sealer can refuse a reference without bytes, and answer the offering session with egress kind 18 (`REF_REFUSED`: the hash, the sender, the nonce and the decision version). The egress feed thread of the sequencer then:
+    - raises the kept version to the version of the frame;
+    - counts `kardamom_sequencer_ref_refused_total{partition}` and logs `sealer refused a reference without bytes; dropping the transaction`;
+    - publishes one `TxDrop` for the hash on `tx_drops`, with the reason `SealerRefusedReference`. It uses a clone of the drop handle of the publish loop: best effort, with no new queue. The drop counts in `kardamom_sequencer_tx_drops_total{reason="sealer_refused_reference"}`.
+  - The sequencer offers nothing again by itself: the v2 loop keeps no transaction after its offer. The client sends the transaction again, and the new offer goes out with its bytes.
+  - The feed thread also puts `AccountEvent::Refused { sender, nonce }` on the account queue of the v2 loop. The filter then forgets the forwarded run of the sender, as for a lost transaction. So the resend at the same nonce goes out at once, with no `already known` refusal and no wait for the loss window (`loss_blocks`, 16 blocks). A full queue loses the event, and the loss window frees the nonce later.
+  - A kind 18 that does not decode logs `a reference refusal of the sealer does not decode` with the error.
+  - The egress then answers `dropped` with the text `transaction dropped by the sealer, send it again` (code -32000). The status is provisional. The twin can offer the same transaction with its bytes, and the sealer orders that copy. Its receipt wins over the drop, and the status becomes `executed`. Client text: safe to send again; the status can still become executed. A copy sent after the twin's copy is ordered gets the nonce guard, and the first hash stays `executed`.
+  - A sequencer of an older release drops kind 18 as an unknown kind. Its transaction stays unordered unless its twin offers it with its bytes, and the client sees no receipt.
+  - Proof: `crates/sequencer/src/sealer_rules_tests.rs` (`a_new_session_keeps_the_version`, `a_lower_report_of_the_current_session_lowers_the_version`, `a_lower_report_of_an_old_session_does_not_lower_the_version`, `a_new_process_starts_from_the_floor`, `a_refused_reference_raises_the_version_and_drops_the_transaction`, `a_refused_reference_tells_the_loop_once`), `feeds::steps::tests::a_reference_refusal_raises_the_version_and_drops_the_transaction`, `a_reference_refusal_below_the_kept_version_does_not_lower_it`, `crates/sequencer/src/v2/tests.rs` (`a_resend_after_a_sealer_refusal_goes_out`), `crates/sequencer/src/admission/tests.rs` (`a_refused_transaction_can_be_sent_again_at_once`), `publish_drop_counts_the_drop_by_reason`, `a_floor_above_five_is_refused`, `publishes_the_activation_of_the_exact_window_in_front_of_its_epoch`, `crates/egress/src/owner_tests.rs` (`a_refused_reference_is_dropped_until_the_receipt_of_the_twin`), and `tx_drop_of_a_refused_reference_keeps_the_layout`.
 - **Nonce lookup path**
   - A parked sender needs its committed nonce. The sequencer asks the local layer first (outcome `local`). Then it asks Redis (outcome `redis`). Then it asks the executors.
   - A lookup that misses Redis, or finds Redis degraded, goes to the executors.
@@ -1634,6 +1673,8 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - Proven: the resume of the batcher through the lies, the stale-post alert, the recovery after an outage past the retention window (the batcher exits on the Aeron client timeout and restores its spool), the contiguous record, and the rebuild parity.
   - Open: the followers of that shard read one source, the proxy. This is the wiring of the shard, not a limit of the code. The halt on a swallowed log, the disagreement counter and the self-resume after a wrong hash are therefore not cases yet.
   - Open: the proxy does not serve gas spikes of a real L1.
+- **Carry mode**
+  - Open: no chaos shard deploys carry mode. The node loss that takes a member and its executor together, the feed after a driver loss, and the egress fallback have no case yet. See "Carry mode: the executor next to its member".
 - **Bridge, injection and DA-parity cases are Target-L only**
   - The `semantics` shard runs nonce ordering, RPC liveness and validator and executor consistency against the real cluster.
   - Open on the deployed cluster: S1 and S2 (bridge) need a contract-deploy phase, the message-passer predeploy and the attester variables in the shared bring-up path.

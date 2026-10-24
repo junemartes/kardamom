@@ -4,6 +4,24 @@
 # instance under its Consul checks, and marks the deployment successful
 # only when the job is whole again. A system job, or a job without an
 # update stanza, has no deployment; its allocations are the gate.
+#
+# After a registration in this play, the wait reads the evaluation of that
+# registration. Nomad writes the plan, with its deployment, before it
+# completes the evaluation, so a complete evaluation names the deployment
+# of the new version, or none. The latest deployment of the job can still
+# be the one of the version before, which is already successful. A job
+# that this play did not register waits for its latest deployment.
+- name: Wait for the evaluation of the registration of {{ workloads_wait_job }}
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/evaluation/{{ workloads_register_evals[workloads_wait_job] }}?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  register: workloads_wait_eval
+  until: workloads_wait_eval.json.Status != 'pending'
+  retries: "{{ workloads_poll_retries }}"
+  delay: "{{ workloads_poll_delay }}"
+  when: workloads_wait_job in workloads_register_evals | default({})
+
 - name: Read the latest deployment of {{ workloads_wait_job }}
   ansible.builtin.uri:
     url: "{{ workloads_nomad_addr }}/v1/job/{{ workloads_wait_job }}/deployment?namespace={{ workloads_namespace | urlencode }}"
@@ -11,13 +29,21 @@
       X-Nomad-Token: "{{ workloads_nomad_token }}"
     return_content: true
   register: workloads_latest_deployment
+  when: workloads_wait_job not in workloads_register_evals | default({})
+
+- name: Keep the deployment to wait for, {{ workloads_wait_job }}
+  ansible.builtin.set_fact:
+    workloads_wait_deployment: >-
+      {{ (workloads_wait_eval.json.DeploymentID | default('', true))
+         if workloads_wait_job in workloads_register_evals | default({})
+         else ((workloads_latest_deployment.json | default({}, true)).ID | default('', true)) }}
 
 - name: Wait for the deployment of {{ workloads_wait_job }}
   ansible.builtin.include_tasks: deployment.yml
   vars:
-    workloads_deployment_id: "{{ workloads_latest_deployment.json.ID }}"
-  when: workloads_latest_deployment.json is not none
+    workloads_deployment_id: "{{ workloads_wait_deployment }}"
+  when: workloads_wait_deployment | length > 0
 
 - name: Wait for the allocations of {{ workloads_wait_job }}
   ansible.builtin.include_tasks: wait_allocations.yml
-  when: workloads_latest_deployment.json is none
+  when: workloads_wait_deployment | length == 0

@@ -421,6 +421,7 @@ The live batcher exports a settlement-health group on port 9002. See [l1-data-pa
 | `kardamom_batcher_rebuilt_blocks_total` | Blocks rebuilt from references after the sealer refused a replay. |
 | `kardamom_batcher_spool_dropped_total{reason}` | Spools dropped at start. `other-version`: a spool of another release. `unreadable`: a block file does not decode. `discontinuous`: the spool does not continue the confirmed cursor. The sealer serves the range again. One after a deploy is expected. Growth means the spool disk is bad. |
 | `kardamom_batcher_feed_running` | 1 when the feed loop runs over the restored spool. The readiness rule needs it. |
+| `kardamom_batcher_egress_cursor_index` | With `--egress`: the canonical index of the newest record that the batcher took from the egress. A boundary does not move it. Absent on the cluster egress. See [Egress](#egress). |
 
 ### L1 sources
 
@@ -500,6 +501,8 @@ With `--carry-bytes`, `--egress <url>` (`KARDAMOM_EGRESS_URL`, off by default) m
 - The executor leaves the feed when no frame comes for 6 s, when the feed loses its image, or on a mismatch. It goes back to the feed after the feed has one image for 30 s and a replay of the feed from its cursor reaches `REPLAY_DONE`.
 - Any increment of `kardamom_executor_source_mismatch_total` needs an operator: a member or a service sends bytes that do not match the ordered id. The log line is `the raw transaction does not hash to its canonical id; replaying from the other source`, with the source and the index.
 - A switch logs `switching the input source` with the old and the new source and the cursor.
+- A transaction reference at the cursor is a fault of the source: the reader has no `tx_data` lane to join it. The reader leaves the source and reads the same index from the other source.
+- When every source gives a reference at the same index, the reader stops with `UnjoinableReference { index }`. The log line is `no source holds the bytes of the transaction reference; stopping`, with the index. A source that never connected counts as one that gives the reference. Only a sequencer that offers a type-0 reference makes such an entry.
 
 ### Executor pipeline
 
@@ -665,6 +668,17 @@ A ClusteredService cannot see its idle time, so the loop exports busy time only.
 | `kardamom_sealer_messages_total{kind}` | The session messages, by the kind byte. A kind shows after its first message. |
 | `kardamom_sealer_egress_backpressure_total{result}` | The egress offers that queued their frame. `result` is `back_pressured`, `admin_action` or `not_connected`. A frame behind an open backlog does not count. |
 | `kardamom_sealer_egress_stalls_total` | The sessions closed because their backlog made no progress for 1 s. |
+| `kardamom_sealer_retained_frames`, `kardamom_sealer_retained_bytes` | The retained frames and their bytes, at the end of the last log entry. |
+| `kardamom_sealer_retained_store` | The store of the retained frames: 0 heap, 1 file. |
+| `kardamom_sealer_window_exact` | 1 when the egress keeps only its replay window, at any posted head. |
+| `kardamom_sealer_decision_version` | The decision version of the open block. |
+| `kardamom_sealer_feature_state{feature}` | Features 3, 4 and 5: 0 no activation held, 1 held and off, 2 on. |
+| `kardamom_sealer_feature_activation_ms{feature}` | The time of the newest held activation of the feature, 0 when none. |
+| `kardamom_sealer_feature_unsupported_total` | The activations of feature 5 on a member with the retained file. The member never stores them. |
+| `kardamom_sealer_snapshot_bytes`, `kardamom_sealer_snapshot_version` | The size and the version of the newest snapshot that the member took or restored. |
+| `kardamom_sealer_ref_refused_total` | The references of record type 0 that the carry window refused with egress kind 18. |
+| `kardamom_sealer_full_ref_below_v5_total` | The full references (record type 7) that the member ordered below decision version 5. |
+| `kardamom_sealer_feed_state` | The member feed: 0 off, 1 idle, 2 walking, 3 live, 4 gapped. |
 
 The admin thread reads these series from the status of the member and from the Aeron counters in the CnC file of its media driver. A series of an Aeron counter that does not exist is absent.
 
@@ -822,8 +836,16 @@ The egress (`kardamom-egress`) exports these metrics on `--metrics-addr` (`KARDA
 | --- | --- |
 | `kardamom_egress_copy_mismatch_total` | Copies of a canonical frame whose bytes differ from the first copy. The egress does not stop. A difference means that one executor executed other bytes than the others: the validator decides which copy is wrong. |
 | `kardamom_egress_waiting_dropped_total` | Times that every copy missed a frame and the merge dropped the frames that waited behind it. |
+| `kardamom_egress_ref_frame_max_index` | R: the highest canonical index of a stored transaction reference (`RT_TXREF`). 0 when the store holds none. |
+| `kardamom_egress_ref_frame_max_block` | The block of R. 0 when the store holds none. |
 
 - Any increment of `kardamom_egress_copy_mismatch_total` needs an operator.
+- R is durable. The store keeps it in the side file `ref-mark` of its directory (16 bytes: the index, then the block, little endian), and reads it at start. A restart does not lower R.
+  - The store writes the mark of a batch before the frames of the batch. After a crash, R is at or above every reference that the segments hold.
+  - A start at the floor of a peer keeps the higher of the two marks. The peer sends its mark in the headers `x-egress-ref-mark-index` and `x-egress-ref-mark-block` of its `410` answer.
+  - R can stay above the stored references. That only delays the move of a reader to the egress.
+  - A corrupt or hostile mark of a peer, for example `u64::MAX`, raises R for good: R never goes down. To recover, stop the egress, then copy `ref-mark` from the store directory of a healthy peer, then start the egress. Delete `ref-mark` only when the store holds no `RT_TXREF` frame.
+- A reader below R can meet a reference in the egress range that it cannot join. The readers after the executors export their cursor on the egress: `kardamom_batcher_egress_cursor_index` and `kardamom_validator_egress_cursor_index`, the canonical index of the newest record that the reader took. A reader is past every reference when its cursor is above the highest R of all egress instances.
 - The egress answers `GET /health` on its HTTP port (`:8548` in the cluster job). The Consul check of the service `kardamom-egress` reads it.
 
 ### State mirror

@@ -7,6 +7,7 @@ use kardamom_types::{DropReason, TxDataLoc, TxEnvelope, TxErrorReason, TxStageKi
 
 use super::{AccountEvent, AdmissionLoop, V2Config, VerdictOut};
 use crate::admission::{AccountState, AdmissionConfig};
+use crate::outbound::fakes::InMemorySidePublisher;
 use crate::sealer_rules::{SealerRules, SealerVersion};
 use crate::testkit::{Rig, one_partition_cfg, pos, signed_envelope, signer};
 
@@ -132,10 +133,7 @@ fn a_sender_that_cannot_pay_gets_insufficient_funds() {
 fn a_sealer_on_version_four_gets_the_tagged_position() {
     let s = signer(4);
     let (mut l, accounts, _) = new_loop();
-    let shared = SealerVersion::default();
-    let mut rules = SealerRules::new(0, shared.clone());
-    rules.on_session_start(1);
-    rules.on_sealer_info(1, 4);
+    let shared = SealerVersion::starting_at(4);
     l.enable_positioned_refs(shared);
     accounts
         .send(AccountEvent::Rows {
@@ -153,13 +151,14 @@ fn a_sealer_on_version_four_gets_the_tagged_position() {
 }
 
 /// A sealer on decision version 5 takes each offer with the bytes of its
-/// transaction: the archived envelope that the ingress published.
+/// transaction: the archived envelope that the ingress published. The
+/// version comes from the report of the session, through the rules.
 #[test]
 fn a_sealer_on_version_five_gets_the_bytes() {
     let s = signer(5);
     let (mut l, accounts, _) = new_loop();
     let shared = SealerVersion::default();
-    let mut rules = SealerRules::new(0, shared.clone());
+    let mut rules = SealerRules::new(0, shared.clone(), InMemorySidePublisher::default());
     rules.on_session_start(1);
     rules.on_sealer_info(1, 5);
     l.enable_positioned_refs(shared);
@@ -352,4 +351,42 @@ fn the_filter_decision_records_the_nonce_check() {
             == r#"kardamom_sequencer_nonce_check_duration_seconds_count{partition="0"} 1"#),
         "{text}"
     );
+}
+
+/// The sealer refuses a forwarded reference (egress kind 18). The rules
+/// tell the loop, so the resend of the client at the same nonce goes out
+/// again, and does not wait for the loss window.
+#[test]
+fn a_resend_after_a_sealer_refusal_goes_out() {
+    let s = signer(6);
+    let (mut l, accounts, _) = new_loop();
+    let mut rules = SealerRules::new(
+        0,
+        SealerVersion::default(),
+        InMemorySidePublisher::default(),
+    )
+    .telling(accounts.clone());
+    accounts
+        .send(AccountEvent::Rows {
+            block: 1,
+            rows: vec![(s.address(), rich(0, 1))],
+        })
+        .unwrap();
+    let mut rig = Rig::default();
+    let envelope = signed_envelope(&s, 0, 1);
+    rig.push(TxDataLoc::new(7, pos(64)), envelope.clone());
+    l.run_once(&mut rig.ports()).unwrap();
+    assert_eq!(rig.offers().len(), 1);
+
+    rules.on_ref_refused(&kardamom_cluster_adapter::wire::RefRefused {
+        canonical_id: rig.offers()[0].tx_ref.tx_hash,
+        sender: s.address(),
+        nonce: 0,
+        decision_version: kardamom_cluster_adapter::wire::SEALER_V5_DECISION_VERSION,
+    });
+    rig.push(TxDataLoc::new(7, pos(128)), envelope);
+    l.run_once(&mut rig.ports()).unwrap();
+    l.run_once(&mut rig.ports()).unwrap();
+    assert_eq!(rig.offers().len(), 2, "the resend goes out");
+    assert!(rig.errors().is_empty(), "no refusal of the resend");
 }

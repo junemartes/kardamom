@@ -66,9 +66,15 @@ pub(crate) const SKIP_RELEASES: &str = "kardamom_sequencer_skip_releases_total";
 /// unknown again until a lookup or a new receipt sets it.
 pub(crate) const RECEIPT_FLOORS_FORGOTTEN: &str =
     "kardamom_sequencer_receipt_floors_forgotten_total";
-/// The decision version that the sealer reported for the current session,
-/// 0 before its report.
+/// The kept decision version of the sealer: the highest version that a
+/// session reported, or the start floor before the first report. Only a
+/// report of the current session lowers it.
 pub(crate) const SEALER_VERSION: &str = "kardamom_sequencer_sealer_version";
+/// The references that the sealer refused (egress kind 18), because it
+/// takes only a transaction with its bytes.
+pub(crate) const REF_REFUSED: &str = "kardamom_sequencer_ref_refused_total";
+/// The drop records on `tx_drops`, by reason.
+pub(crate) const TX_DROPS: &str = "kardamom_sequencer_tx_drops_total";
 /// Contiguity rejects whose expected nonce stays above the chain nonce
 /// plus the refs in flight for the settle time: the sealer's nonce guard
 /// is ahead of the chain after a skip that used no nonce. While
@@ -259,6 +265,14 @@ pub(crate) fn record_floor_forgotten(partition: u32) {
 
 pub(crate) fn record_sealer_version(partition: u32, version: u8) {
     set(SEALER_VERSION, partition, f64::from(version));
+}
+
+pub(crate) fn record_ref_refused(partition: u32) {
+    bump(REF_REFUSED, partition, 1);
+}
+
+pub(crate) fn record_tx_drop(reason: kardamom_types::DropReason) {
+    counter!(TX_DROPS, "reason" => reason.label()).increment(1);
 }
 
 pub(crate) fn record_sealer_nonce_ahead(partition: u32) {

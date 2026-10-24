@@ -515,7 +515,8 @@ test-e2e-local: aeron-jar cluster-jar
     cargo build --bins --locked \
         -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
         -p kardamom-validator -p kardamom-state -p kardamom-da-watcher -p kardamom-l1-indexer \
-        -p kardamom-reconstruct -p kardamom-notifier -p kardamom-canary
+        -p kardamom-reconstruct -p kardamom-notifier -p kardamom-canary \
+        -p kardamom-batcher -p kardamom-egress
     cargo test -p e2e --features full-pipeline-e2e --test chain_semantics \
         --locked -- --ignored --nocapture --test-threads=2 --skip s14_
     # S14 runs TWO full stacks (4 JVMs + 10 service processes) — the

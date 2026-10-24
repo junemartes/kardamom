@@ -42,5 +42,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 kardamom-cache = { workspace = true }
+# The format registry: a test checks the layout of the reference mark.
+kardamom-formats = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }

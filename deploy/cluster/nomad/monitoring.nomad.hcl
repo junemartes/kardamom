@@ -37,6 +37,19 @@ variable "datacenter" {
   default     = "dc1"
 }
 
+# The executors on the sealer nodes, "on" or "off" (executor.nomad.hcl).
+# On, the executors run on the sealer nodes, so the executor and state
+# mirror scrapes go to sealer-<i>, not to executor-<i>. The deploy
+# passes it from KARDAMOM_EXEC_ON_SEALERS.
+variable "exec_on_sealers" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.exec_on_sealers)
+    error_message = "The exec_on_sealers value must be on or off."
+  }
+}
+
 variable "executor_count" {
   type        = number
   description = "Executor nodes (node_classes.executor.count in group_vars/all.yml)."
@@ -115,10 +128,10 @@ locals {
       for lane in range(4) : "sequencer-${i}.node.${local.dc}.consul:${9001 + 10 * lane}"
     ]
   ])
-  executor_targets = [for i in range(var.executor_count) : "executor-${i}.node.${local.dc}.consul:9004"]
+  executor_targets = [for i in range(var.executor_count) : "${var.exec_on_sealers == "on" ? "sealer" : "executor"}-${i}.node.${local.dc}.consul:9004"]
   ingress_targets  = [for i in range(var.ingress_count) : "ingress-${i}.node.${local.dc}.consul:9006"]
   # One state mirror per executor node (nomad/state-mirror.nomad.hcl).
-  state_mirror_targets = [for i in range(var.executor_count) : "executor-${i}.node.${local.dc}.consul:9007"]
+  state_mirror_targets = [for i in range(var.executor_count) : "${var.exec_on_sealers == "on" ? "sealer" : "executor"}-${i}.node.${local.dc}.consul:9007"]
   targets_yaml         = <<-EOT
     scrape_configs:
       - job_name: kardamom-sequencer

@@ -1,0 +1,61 @@
+{
+ "aeron.system": {
+  "meta": {},
+  "sha256": "2f4e56226feeb94b3ffea992a7caa3dd1e12995c7f054184d1e2a31fd9003edc"
+ },
+ "batcher": {
+  "meta": {
+   "relayed_full_ref": "true"
+  },
+  "sha256": "64920f42913eeb558a67e9359b3d4140cae45b46a5c3e04fa19198abfd6e8fac"
+ },
+ "cluster": {
+  "meta": {},
+  "sha256": "abe3d203db867b2791b76ad2abed8d4b5872c5e97a4d2e8c34b4bed942300394"
+ },
+ "egress": {
+  "meta": {
+   "relayed_full_ref": "true"
+  },
+  "sha256": "e5500211a90e4778ae83108a42e27f2b2d2abb70585a761c9956881dc609392f"
+ },
+ "executor": {
+  "meta": {
+   "chain_state_install": "true",
+   "first_receipt": "true",
+   "nonce_burn": "true",
+   "relayed_full_ref": "true"
+  },
+  "sha256": "0c33276d81f0c6312d8fddd2eb0e86d7e598ad41c09845a02fe824378b904730"
+ },
+ "ingress": {
+  "meta": {
+   "nonce_burn": "true"
+  },
+  "sha256": "05649163019c39e23c31721f11c4b5ff2bbeb2889c43eab422c6d2355eead0d8"
+ },
+ "monitoring": {
+  "meta": {},
+  "sha256": "f7a5e68d2f2fdd893c91e4afd6787cbbb7531f8eecc0b7869053e8be7543da82"
+ },
+ "sequencer": {
+  "meta": {
+   "nonce_burn": "true",
+   "sealer_v4": "true"
+  },
+  "sha256": "44058a7e65e3df4cfe4a012165fcc6a3e377f5ebc3565e7542715e59e4baf339"
+ },
+ "state-mirror": {
+  "meta": {},
+  "sha256": "6157e8b36cf695ad8edd56c3ec7201b6c29300714859fea4937acd1ec352bf56"
+ },
+ "validator": {
+  "meta": {
+   "chain_state_install": "true",
+   "first_receipt": "true",
+   "nonce_burn": "true",
+   "relayed_full_ref": "true"
+  },
+  "sha256": "aa2d779f50624bb8265f3c6239cdd331a3176e3582deb8de7847c879d88f4263"
+ }
+}

@@ -3,17 +3,7 @@
 # when the plan shows a change. Both the deploy of a job and one step of
 # the sealer roll come through here.
 - name: Plan {{ workloads_register_job }}
-  ansible.builtin.uri:
-    url: "{{ workloads_nomad_addr }}/v1/job/{{ workloads_register_job }}/plan?namespace={{ workloads_namespace | urlencode }}"
-    method: POST
-    headers:
-      X-Nomad-Token: "{{ workloads_nomad_token }}"
-    body_format: json
-    body:
-      Job: "{{ workloads_job_definition }}"
-      Diff: true
-  register: workloads_plan
-  check_mode: false
+  ansible.builtin.include_tasks: plan.yml
 
 # The registration and its record. The job joins the attempt record
 # before the registration, so a controller that dies after the
@@ -44,7 +34,17 @@
           {{ {'Job': workloads_job_definition,
               'EnforceIndex': true,
               'JobModifyIndex': workloads_plan.json.JobModifyIndex} }}
+      register: workloads_registration
       changed_when: true
+
+    # The wait reads the deployment of this registration through its
+    # evaluation (wait.yml), not the latest deployment of the job: right
+    # after the registration, the latest one can still be the deployment of
+    # the version before.
+    - name: Keep the evaluation of the registration of {{ workloads_register_job }}
+      ansible.builtin.set_fact:
+        workloads_register_evals: >-
+          {{ workloads_register_evals | default({}) | combine({workloads_register_job: workloads_registration.json.EvalID}) }}
 
     - name: Record the registration of {{ workloads_register_job }}
       when: workloads_recording | default(false)

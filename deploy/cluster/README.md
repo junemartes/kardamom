@@ -200,6 +200,7 @@ The sealer roll:
 - The role rolls the followers first and the leader last. It finds the leader through the admin port (`GET /status`).
 - Each step replaces one member. The `update` stanza holds the next step until that member rejoins and catches up.
 - A fresh job, or a job that still has one shared group, registers in one step.
+- The executor job on the sealer nodes rolls its pinned groups the same way, one group at a time. See [The carry window](#the-carry-window).
 
 The canary:
 
@@ -281,6 +282,11 @@ Run `just sealer-upgrade-check <env> <feature> <activation_ms>` before the Safe 
 - feature 2 (`FEATURE_SEALER_V3`) with an activation time other than 0: off is no longer supported;
 - a configured sealer member that is down, or that reads a snapshot version below 14;
 - feature 4 (`FEATURE_SEALER_V5`, the carry flag) when a sealer member reads a snapshot version below 16;
+- feature 3 or 4 with an activation time other than 0 while a member reports `kardamom_sealer_feature_state{feature="5"}` at 1 (held) or 2 (on). Without decision version 5 the rules of feature 5 stop, and a carry executor stops on the first reference. Turn feature 5 off first, and empty `KARDAMOM_CARRY_EXECUTORS`;
+- feature 5 (`FEATURE_CARRY_WINDOW`, the carry window), at any activation time, unless:
+  - every member reports `snapshotReadsMax` 18 or more, `decisionVersion` 5 and `retainedStore` `heap`;
+  - the sequencer job has the meta `sealer_version_kept`, the batcher and the validator jobs have `reads_egress`, and the egress job has `ref_mark`, each with every live allocation on that job version (`workloads_upgrade_window_jobs`);
+  - every egress instance reports its reference mark, and every `kardamom_batcher_egress_cursor_index` and `kardamom_validator_egress_cursor_index` is above the highest `kardamom_egress_ref_frame_max_index`. An instance that does not answer is a refusal;
 - a job without its metas (`workloads_upgrade_jobs` in `ansible/roles/workloads/defaults/main.yml`), or a live allocation of an older job version:
   - the sequencer: `nonce_burn`;
   - the executor and the validator: `nonce_burn` and `chain_state_install`;
@@ -329,11 +335,106 @@ Every switch is off by default. With every switch off, the deploy renders every 
 
 1. `KARDAMOM_EXEC_FRAMES=on`: the executors publish their frames. Nothing reads them yet.
 2. `KARDAMOM_EGRESS=1`: the deploy adds the egress after the executors and before the notifier, the validator and the batcher. Prometheus scrapes it.
-3. The reader switches, one reader at a time: `KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS`, `KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS`, `KARDAMOM_SEQUENCER_RECEIPTS_FROM_EGRESS`. `KARDAMOM_VALIDATOR_EGRESS` and `KARDAMOM_BATCHER_EGRESS` only after the carry flag is active on the chain.
+3. The reader switches, one reader at a time: `KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS`, `KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS`, `KARDAMOM_SEQUENCER_RECEIPTS_FROM_EGRESS`. `KARDAMOM_VALIDATOR_EGRESS` and `KARDAMOM_BATCHER_EGRESS` only after the carry flag is active on the chain, and only when the reader is past the last stored reference (see [The carry window](#the-carry-window)).
 
 The preflight refuses a reader switch without the egress, the egress without the frames, and a value other than `on`, `off` or empty. To go back, switch off in the reverse order.
 
 The merge chains the copy of an executor only from the start of the stream. An instance with an empty store on a running chain finds no frame to chain to. So start the egress with a new chain, or give a new instance a store. A new node of a rescheduled instance has an empty store too.
+
+### The carry window
+
+The carry window moves the executors to the bytes that the sealer carries, with no stop of the chain. Three switches and one deploy value do it. Each is off by default. With each one off, the deploy renders every job as before. The runbook of the rollout on a live chain is [`docs/runbooks/carry-window-rollout.md`](../../docs/runbooks/carry-window-rollout.md).
+
+| Switch | What it sets | When |
+|---|---|---|
+| `KARDAMOM_MEMBER_FEED=on` | On each sealer member: `-Dkardamom.cluster.feedAeronDir=/opt/kardamom/aeron-mount/dir` and `-Dkardamom.cluster.feedRingBytes` (job variable `cluster_feed_ring_bytes`, 16 MiB). The shared media driver (`aeron` job) also runs on the sealer nodes. | Any time after the release. The sealer rolls member by member. It needs no allowance: the feed is not a setting that every member must match. |
+| `KARDAMOM_EXEC_ON_SEALERS=on` | The executor groups `executor-<i>`, each pinned to `sealer-<i>`, in reference mode. The state mirrors and every job that reaches an executor by its node follow them. | After the feed. |
+| `KARDAMOM_CARRY_EXECUTORS=<list>` | `--carry-bytes` and `--egress` on each listed group: `0`, then `0,1`, then `0,1,2`. | After feature 5, one executor at a time. |
+| `KARDAMOM_SEALER_VERSION_FLOOR=<n>` | `--sealer-version-floor <n>` on each sequencer. Empty or `0` sends no flag. | After every reader runs this release. Set the lowest `decisionVersion` of the members: `5` on staging. |
+
+The member feed:
+
+- Each member sends its retained frames to the executor on its own node over `aeron:ipc`. It publishes into the shared media driver of the node, not into its own embedded driver. The node is the pair: no setting names the member.
+- The member walks its frames on the heap. The deploy sets no `carryBytes` and no token, and writes no Nomad variable for a member group.
+- The archive of the shared driver records the `exec_txs` stream of an executor on the node in `/opt/kardamom/archive/dir`, beside the archive of the member in `/opt/kardamom/archive`.
+- See [Member feed](../../cluster/sealer-service/README.md#member-feed).
+
+The executors on the sealer nodes:
+
+- Group `executor-<i>` runs on `sealer-<i>`. Its recorder id, void voter id and host id are `i`. Each group has its own role constraint, and the job has none.
+- The executor reads the cluster egress, as on the executor nodes. Only `KARDAMOM_CARRY_EXECUTORS` turns on `--carry-bytes`.
+- The jobs that reach an executor by its node use `sealer-<i>`: the nonce queries of the sequencers and the ingresses, the block references of the batcher, the checkpoint peers of the executors and the validator, and the Prometheus targets.
+- The egress stays on the executor nodes.
+
+The staged roll of the executors:
+
+- Nomad orders no groups, so one registration of the pinned groups would replace every executor at once. So the role rolls them one group at a time (`tasks/executor.yml`, `tasks/roll_step.yml`), the same way as the sealer members. It waits for the health check of each group before the next step.
+- The move from the executor nodes goes one executor at a time too, from the highest id down. Each step has two registrations. The first lowers the count of the group on the executor nodes by one, and the role waits until that allocation stops. Nomad stops the allocation with the highest index first, and that index is the id of the executor. The second starts the pinned group of that id. So two executors never run with one id. The last step removes the group on the executor nodes.
+- The group on the executor nodes keeps the job constraint of the registered job during the move. That is an in-place update for Nomad: it restarts no executor.
+- After each registration, the role waits for the deployment that the evaluation of that registration names, not for the latest deployment of the job.
+- During the move, the jobs that follow the executors already ask `sealer-<i>`. An executor that did not move yet does not answer there, so they ask the others.
+- A new job, or a move back to the executor nodes, registers in one step.
+- `just rollback` rolls the pinned groups back one group at a time when both versions have them.
+
+The carry executors:
+
+- A listed executor reads the member feed of its node, then the egress (`--egress`, the Consul service `kardamom-egress`), then a peer checkpoint.
+- A carry executor sends no recorded cursor, so the list refuses `KARDAMOM_EXEC_CURSOR=on`.
+- To move an executor back to reference mode, leave it out of the list.
+
+The gates of the carry window refuse a move before any job changes. Each gate runs only when the deploy makes its move, so a later deploy with the same values reads nothing:
+
+- The preflight:
+  - `KARDAMOM_EXEC_ON_SEALERS=on` without `KARDAMOM_MEMBER_FEED=on`, or with an executor count other than the sealer count.
+  - `KARDAMOM_CARRY_EXECUTORS` with an index that repeats or has no member, or without `KARDAMOM_EXEC_ON_SEALERS=on`, `KARDAMOM_EGRESS=1` and the egress URL of the executors, or with `KARDAMOM_EXEC_CURSOR=on`.
+  - `KARDAMOM_SEALER_VERSION_FLOOR` other than empty or 0 to 5.
+  - `KARDAMOM_CLUSTER_RETENTION` above 131,072 frames.
+- The version floor, when it changes to a value above 0:
+  - a sealer job that Nomad does not know: a new chain starts on decision version 3;
+  - a member that does not run, or a floor above the lowest `decisionVersion` of the members;
+  - an executor, validator, batcher or egress job without the meta `relayed_full_ref`, or a live allocation of an older job version. Without the egress job, the egress passes.
+- A batcher or validator job that Nomad does not know, switched to the egress on a live chain (a registered sealer). It has no block to read. Deploy it on the cluster egress first.
+- The move of the batcher or the validator to the egress (`KARDAMOM_BATCHER_EGRESS`, `KARDAMOM_VALIDATOR_EGRESS`), when the registered job does not carry the meta `reads_egress`:
+  - an egress job without the meta `ref_mark`, or a live egress allocation of an older job version;
+  - an egress instance that does not report `kardamom_egress_ref_frame_max_index` and `kardamom_egress_ref_frame_max_block`;
+  - a batcher whose `kardamom_batcher_last_posted_block`, or a validator whose `validator_committed_block`, is not above the highest `kardamom_egress_ref_frame_max_block`.
+- The move of an executor to carry mode, for each listed executor that does not carry yet:
+  - a sealer job that Nomad does not know;
+  - a group `executor-<i>` that does not run on the sealer nodes;
+  - an executor job without the meta `carried_ref_fault`;
+  - a member that does not run, or that reports `carryWindow` false;
+  - the member `cluster-<i>` that reports the feed `off`;
+  - the egress checks above;
+  - `kardamom_executor_block_number` of the executor minus 32 not above the highest `kardamom_egress_ref_frame_max_block`. At its first carry start, the executor compares the stream with its committed blocks of that window.
+- The sealer retention, when the sealer job changes:
+  - a lower value than the registered sealer, unless `KARDAMOM_ALLOW_MUST_MATCH` names `retention`;
+  - a value whose frames, at the mean frame size of the members, pass 48 MiB, well below the 64 MiB backlog limit of a cluster session. At a mean of 300 bytes, 131,072 frames (about 39.3 MB) fit. The mean is the sum of `retainedBytes` over the sum of `retainedFrames` of the member status (the gauges `kardamom_sealer_retained_bytes` and `kardamom_sealer_retained_frames`).
+
+The gates read the metrics of each instance by the node address that the Nomad API advertises. A gauge matches a sample with the labels of its exporter (`service` and `host_id`, or `service` and `member_id` on a sealer), and a gauge with labels, such as `kardamom_sealer_feature_state{feature="5"}`, matches the sample that carries each of them. The ports: the egress on `ports.egress_metrics`, the batcher on 9002, the validator on 9006, the executor on 9004, and the sealer on its admin port (`workloads_metrics_ports`). An instance that does not answer counts as `-1`, so the gate refuses.
+
+The order on a live chain:
+
+1. Deploy the release with every switch off and the floor 0.
+2. Set `KARDAMOM_SEALER_VERSION_FLOOR` to the lowest `decisionVersion` of the members.
+3. Move the batcher and the validator to the egress.
+4. Deploy with `KARDAMOM_MEMBER_FEED=on`.
+5. Deploy with `KARDAMOM_EXEC_ON_SEALERS=on`.
+6. Run the upgrade check of feature 5, then send the upgrade transaction (see [The upgrade check](#the-upgrade-check)).
+7. After the switch, list the executors in `KARDAMOM_CARRY_EXECUTORS`, one at a time.
+
+To go back, reverse the order: empty the list first, then the executors, then the feed. Before a fleet rebuild from a seed, set the floor to 0: a seeded member runs decision version 3.
+
+#### What a node needs for the carry window
+
+The infrastructure of an environment sets these. The deploy does not change them.
+
+- Each sealer node has `/opt/kardamom/state`, `/opt/kardamom/checkpoints` and `/opt/kardamom/mirror`, writable by the executor and the state mirror. They hold the state database, the checkpoints and the mirror store.
+- Each sealer node has the Aeron tmpfs `/opt/kardamom/aeron-mount` with room for the shared driver as well as the member: the term buffers of the executor streams and the 24 MiB log of the feed.
+- Each sealer node has the memory of the member (heap plus 640 MB), the shared driver (768 MB), the executor (1536 MB) and the state mirror (512 MB), plus the page cache of the state database.
+- Each sealer node has the disk of the Raft log, the state database, the checkpoints and the `exec_txs` recording. The heap design needs no disk for a retained file and no secret for a token.
+- The node meta of a sealer node keeps `role = sealer` and `node_index = <i>`. To advertise its `exec_txs` recording, the role set of the node also names `executor`, so the Nomad agent stamps `archive_topics = exec_txs`. No consumer reads that stream yet.
+- The fixed ports of the executor (9004, 9014, 9024) and of the state mirror (9007) are free on a sealer node and open between the nodes.
+- The executor nodes stay: they run the egress.
 
 ### Configuration switches
 
@@ -392,7 +493,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Indexer | `L1_INDEXER_COUNT` | empty (`2` in the job) | Follower instances, each on its own node with the `indexer` role. |
 | Indexer | `L1_INDEXER_HOST`, `L1_INDEXER_PORT` | `kardamom-l1-indexer.service.<datacenter>.consul`, `8549` | Where the batcher reaches the indexer. |
 | Fault proxy | `KARDAMOM_L1_FAULT_PROXY` | `0` | `1` deploys the lying L1 of the `chaos-l1` shard in front of the in-cluster anvil. All followers read L1 through it. |
-| Sealer | `KARDAMOM_CLUSTER_RETENTION` | empty (`65536` frames in the job) | The egress replay retention, in frames. It is a minimum. The sealer keeps a frame above the posted head even past this window. See the [sealer README](../../cluster/sealer-service/README.md). |
+| Sealer | `KARDAMOM_CLUSTER_RETENTION` | empty (`65536` frames in the job) | The egress replay retention, in frames, at most 131,072. It is a minimum. The sealer keeps a frame above the posted head even past this window, unless the carry window applies. On a live chain the release gate refuses a lower value unless `KARDAMOM_ALLOW_MUST_MATCH` names `retention`, and a value whose frames pass 48 MiB. See [The carry window](#the-carry-window) and the [sealer README](../../cluster/sealer-service/README.md). |
 | Sealer, batcher | `KARDAMOM_DA_LAG_BUDGET_BLOCKS` (job variables `cluster_da_lag_budget_blocks`, `da_lag_budget_blocks`) | empty (`10000` in the jobs) | The DA-lag budget, in blocks. The sealer refuses user transactions when the sealed head is more than this far past the posted head. `0` turns the guard off. Every member must use the same value. The batcher posts at half of it. The deploy refuses `BATCHER_IDLE_FLUSH_MS / 1000` at or above it. |
 | Sealer | `KARDAMOM_CLUSTER_BOOTSTRAP` | `0` (`1` in `just container-up`) | `1` opens the sealer bootstrap while the role registers a cluster job that Nomad does not know. See [Sealer bootstrap](#sealer-bootstrap). |
 | Sealer | `KARDAMOM_CLUSTER_SNAPSHOT_S` | empty (`300` in the job) | The interval of the Raft snapshot, in seconds. `0` disables it. |
@@ -404,10 +505,14 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Monitoring | `KARDAMOM_PROMETHEUS_RETENTION_TIME`, `KARDAMOM_PROMETHEUS_RETENTION_SIZE` | empty (`24h` and `0B` in the job) | How long and how much Prometheus keeps (job variables `prometheus_retention_time`, `prometheus_retention_size`). `0B` sets no size limit. At a 1 s scrape, staging writes about 3 GB a day. |
 | Sealer | `KARDAMOM_REMOTE_ORIGINS` | empty (`412347,412399` in the job) | The peer chain ids whose cross-chain records the sealer seals. All members use the same list. |
 | Ingress | `KARDAMOM_INGRESS_ACK` (job variable `ack`) | empty (`receipt`) | When `eth_sendRawTransaction` answers. `receipt` waits for the receipt. `validated` answers when the ingress validated the transaction and published it on `tx_data`. See [`../../docs/json-rpc.md`](../../docs/json-rpc.md). |
+| Sealer | `KARDAMOM_MEMBER_FEED` (job variable `member_feed` of the sealer and the `aeron` job) | empty (`off` in the jobs) | `on` or `off`. On, each member feeds its retained frames to the executor on its own node, and the shared media driver runs on the sealer nodes. See [The carry window](#the-carry-window). |
+| Executor | `KARDAMOM_EXEC_ON_SEALERS` (job variable `exec_on_sealers` of every job that it changes) | empty (`off` in the jobs) | `on` or `off`. On, executor `<i>` runs on `sealer-<i>`, and the executor job rolls one group at a time. It needs `KARDAMOM_MEMBER_FEED=on`. |
+| Executor | `KARDAMOM_CARRY_EXECUTORS` (job variable `carry_executors`) | empty | The member indexes of the carry executors, such as `0,1`. Each one runs with `--carry-bytes` and `--egress`. It needs `KARDAMOM_EXEC_ON_SEALERS=on` and `KARDAMOM_EGRESS=1`. |
+| Sequencer | `KARDAMOM_SEALER_VERSION_FLOOR` (job variable `sealer_version_floor`) | empty (`0` in the job) | The decision version that a sequencer assumes before the first report of a sealer session, from 0 to 5. The release gate refuses a value above the lowest `decisionVersion` of the members, and a value above 0 before every reader runs this release. |
 | Executor | `KARDAMOM_EXEC_CURSOR` (job variable `exec_cursor`) | empty (`off` in the job) | `on` or `off`. On, each executor sends its recorded cursor to the sealer, the floor of the record-lag guard. Switch it on only after every sealer member reads ingress kind 9. A sealer member that does not read it drops the frame. |
 | Egress | `KARDAMOM_EGRESS` | `0` | `1` deploys the egress job (`nomad/egress.nomad.hcl`) and its scrape (job variable `egress` of the monitoring job). It needs `KARDAMOM_EXEC_FRAMES=on`. See [The egress](#the-egress). |
 | Egress | `KARDAMOM_EXEC_FRAMES` (job variable `exec_frames` of the executor) | empty (`off` in the job) | `on` or `off`. On, each executor publishes the frames that it executes on `exec_frames` (`--exec-frames`). |
-| Egress | `KARDAMOM_VALIDATOR_EGRESS`, `KARDAMOM_BATCHER_EGRESS` (job variable `egress_url`) | empty (the job reads the cluster egress) | `on` or `off`. On, the validator or the batcher reads the canonical stream from the egress (`--egress`). Switch it on only on a chain where the carry flag is active. It needs `KARDAMOM_EGRESS=1`. |
+| Egress | `KARDAMOM_VALIDATOR_EGRESS`, `KARDAMOM_BATCHER_EGRESS` (job variable `egress_url`) | empty (the job reads the cluster egress) | `on` or `off`. On, the validator or the batcher reads the canonical stream from the egress (`--egress`), and its job carries the meta `reads_egress`. Switch it on only on a chain where the carry flag is active. It needs `KARDAMOM_EGRESS=1`. The release gate refuses the move while the reader is not past the last stored reference. See [The carry window](#the-carry-window). |
 | Egress | `KARDAMOM_SEQUENCER_RECEIPTS_FROM_EGRESS` (job variable `receipts_from_egress` of the sequencer) | empty (`off` in the job) | `on` or `off`. On, the sequencers read the receipts and their account rows from `egress_receipts` (`receipts_from_egress = true` in the config). It needs `KARDAMOM_EGRESS=1`. |
 | Egress | `KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS` (job variable `receipt_query_endpoints` of the ingress) | empty (the executors) | `on` or `off`. On, `eth_getTransactionReceipt` asks the egress on a cache miss (`--receipt-query-endpoints`). It needs `KARDAMOM_EGRESS=1`. |
 | Egress | `KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS` (job variable `receipts_from_egress` of the notifier) | empty (`off` in the job) | `on` or `off`. On, the notifier reads the receipts from `egress_receipts` (`--receipts-from-egress`). It needs `KARDAMOM_EGRESS=1`. |
@@ -438,6 +543,7 @@ The release gate (`roles/workloads/tasks/gate.yml`) refuses a release before it 
 | A one-way format change | A `rollback` finding that `KARDAMOM_ALLOW_ONE_WAY` does not name. An allowance that covers no finding is refused too. | Set `KARDAMOM_ALLOW_ONE_WAY=<ids>`. The record then carries a rollback floor. |
 | A sealer setting that every member must match | The settings of `workloads_sealer_must_match` in the compiled sealer job against the registered cluster. | Change it through a coordinated restart of the sealer. A documented procedure names the settings in `KARDAMOM_ALLOW_MUST_MATCH`. |
 | A shard map change | `config/shard-map.toml` against the map of the registered ingress. | Use the resize controller (`kardamom-cluster scale-sequencers`). |
+| A sealer member holds a snapshot that the target cannot read | `snapshotLatest` of `GET /status` on the admin port of every configured member, against `reads_max` of `sealer-snapshot` in the target's `formats.toml`. The check runs only when the plan of the sealer job shows a change, such as a new image digest: a running member reads no snapshot. A sealer job that Nomad does not know skips the check. When the sealer job changes, a configured member that does not run is refused: the gate cannot read its version. | Deploy a release that reads that snapshot version. Start a member that does not run, and let it catch up. |
 
 The gate reads only, so it also runs in check mode. A cluster without an accepted release has no formats to compare with.
 

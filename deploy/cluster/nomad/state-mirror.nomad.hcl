@@ -38,6 +38,19 @@ variable "datacenter" {
   default     = "dc1"
 }
 
+# The executors on the sealer nodes, "on" or "off" (executor.nomad.hcl).
+# On, the executors run on the sealer nodes, so each mirror runs there
+# too, next to its executor. The deploy passes it from
+# KARDAMOM_EXEC_ON_SEALERS.
+variable "exec_on_sealers" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.exec_on_sealers)
+    error_message = "The exec_on_sealers value must be on or off."
+  }
+}
+
 variable "executor_count" {
   type        = number
   description = "The executor node count (node_classes.executor.count): the number of mirrors and of tx_receipts publishers."
@@ -50,7 +63,7 @@ job "state-mirror" {
 
   constraint {
     attribute = "${meta.role}"
-    value     = "executor"
+    value     = var.exec_on_sealers == "on" ? "sealer" : "executor"
   }
 
   group "mirror" {

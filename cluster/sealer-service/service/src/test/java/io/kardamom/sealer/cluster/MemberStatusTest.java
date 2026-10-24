@@ -57,9 +57,12 @@ final class MemberStatusTest {
                 + "\"commitPosition\":5000,\"servicePosition\":4000,"
                 + "\"snapshotWrites\":10,\"snapshotReadsMin\":1,\"snapshotReadsMax\":11,"
                 + "\"snapshotLatest\":9,\"decisionVersion\":3,\"decisionActivationOrigin\":36,"
-                + "\"decisionActivationMs\":0,\"diskFreeBytes\":0,"
+                + "\"decisionActivationMs\":0,\"retainedStore\":\"heap\",\"carryWindow\":true,"
+                + "\"carryWindowActivationOrigin\":7,\"carryWindowActivationMs\":18446744073709551615,"
+                + "\"retainedFrames\":12,\"retainedBytes\":3456,\"feed\":\"walking\",\"diskFreeBytes\":0,"
                 + "\"leadershipTermId\":4,\"startHold\":true,\"ready\":true}",
-            sample("LEADER", "CLOSED", 5000, 4000).withStart(4L, true).toJson(LAG));
+            sample("LEADER", "CLOSED", 5000, 4000).withStart(4L, true)
+                .withCarry(new MemberStatus.Carry("heap", true, 7L, -1L, 12L, 3456L, "walking")).toJson(LAG));
     }
 
     @Test

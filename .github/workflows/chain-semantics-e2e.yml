@@ -72,13 +72,15 @@ jobs:
 
       # Every binary a scenario spawns or shells out to: the pipeline three,
       # the validator (S6/S7), statecheck (S6's CLI check), the da-watcher
-      # (S1/S2 bridge) and reconstruct (S8's DA-parity gate).
+      # (S1/S2 bridge), reconstruct (S8's DA-parity gate), and the batcher
+      # and the egress (S13e/S13f, the carry window).
       - name: Build service binaries
         run: |
           cargo build --locked --bins \
             -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
             -p kardamom-validator -p kardamom-state -p kardamom-da-watcher -p kardamom-l1-indexer \
-            -p kardamom-batcher -p kardamom-reconstruct -p kardamom-notifier -p kardamom-canary
+            -p kardamom-batcher -p kardamom-reconstruct -p kardamom-notifier -p kardamom-canary \
+            -p kardamom-egress
 
       # Each test brings up its own stack (2 JVMs + 4 service processes), and
       # the L1-backed ones add an anvil on top. Two of those at once on a
