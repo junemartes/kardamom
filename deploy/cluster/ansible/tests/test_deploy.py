@@ -1079,6 +1079,16 @@ class DeployTest(Deploys):
 
     def test_the_egress_switches_deploy_the_egress_and_reach_each_reader(self):
         self.add_egress_image()
+        # A new reader starts on the egress only while every egress
+        # instance holds no reference (gate 8b). So the egress runs first,
+        # and the readers are new jobs.
+        readers = ('workloads_validator_egress', 'workloads_batcher_egress')
+        self.run_deploy({k: v for k, v in self.EGRESS_ON.items() if k not in readers})
+        for job in ('batcher', 'validator'):
+            del self.api.state['jobs'][job]
+        for node in ('node-egress', 'node-egress.1'):
+            self.api.state.setdefault('metrics', {})[node] = (
+                'kardamom_egress_ref_frame_max_index 0\nkardamom_egress_ref_frame_max_block 0\n')
         self.run_deploy(self.EGRESS_ON, check=True)
         plans = self.api.state['plans']
         # After the executors that it reads, before the readers after it.

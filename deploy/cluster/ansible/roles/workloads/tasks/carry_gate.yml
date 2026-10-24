@@ -324,7 +324,8 @@
           registered sequencer job carries v2_loop), and a member holds the carry window: carryWindow
           {{ workloads_gate_windows }}, kardamom_sealer_feature_state{feature="5"}
           {{ workloads_metrics_of.cluster['kardamom_sealer_feature_state{feature="5"}'] }}, members down
-          {{ workloads_sealer_down }}, members whose /metrics does not answer {{ workloads_metrics_of.cluster.silent }}. The v1 loop offers record type 0, and the sealer refuses every such transaction.
+          {{ workloads_sealer_down }}, members whose /metrics does not answer {{ workloads_metrics_of.cluster.silent }}.
+          The v1 loop offers record type 0, and the sealer refuses every such transaction.
           Keep KARDAMOM_SEQUENCER_ADMISSION=on. To turn it off on purpose, set KARDAMOM_ALLOW_MUST_MATCH=admission.
       vars:
         workloads_gate_windows: >-

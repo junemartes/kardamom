@@ -36,7 +36,7 @@
  },
  "monitoring": {
   "meta": {},
-  "sha256": "f7a5e68d2f2fdd893c91e4afd6787cbbb7531f8eecc0b7869053e8be7543da82"
+  "sha256": "de61e8805a81162afbee39f1a0fdd2aaaa1ffc8cfd86231872908d12440553d6"
  },
  "sequencer": {
   "meta": {
@@ -47,7 +47,7 @@
  },
  "state-mirror": {
   "meta": {},
-  "sha256": "6157e8b36cf695ad8edd56c3ec7201b6c29300714859fea4937acd1ec352bf56"
+  "sha256": "2359073f124f5ffe7e7ac2a6ab2e9c705c23436865b79930426030d32a48950d"
  },
  "validator": {
   "meta": {
