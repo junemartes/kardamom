@@ -437,6 +437,7 @@ The release gate (`roles/workloads/tasks/gate.yml`) refuses a release before it 
 | A one-way format change | A `rollback` finding that `KARDAMOM_ALLOW_ONE_WAY` does not name. An allowance that covers no finding is refused too. | Set `KARDAMOM_ALLOW_ONE_WAY=<ids>`. The record then carries a rollback floor. |
 | A sealer setting that every member must match | The settings of `workloads_sealer_must_match` in the compiled sealer job against the registered cluster. | Change it through a coordinated restart of the sealer. A documented procedure names the settings in `KARDAMOM_ALLOW_MUST_MATCH`. |
 | A shard map change | `config/shard-map.toml` against the map of the registered ingress. | Use the resize controller (`kardamom-cluster scale-sequencers`). |
+| A sealer member holds a snapshot that the target cannot read | `snapshotLatest` of `GET /status` on the admin port of every configured member, against `reads_max` of `sealer-snapshot` in the target's `formats.toml`. The check runs only when the plan of the sealer job shows a change, such as a new image digest: a running member reads no snapshot. A sealer job that Nomad does not know skips the check. When the sealer job changes, a configured member that does not run is refused: the gate cannot read its version. | Deploy a release that reads that snapshot version. Start a member that does not run, and let it catch up. |
 
 The gate reads only, so it also runs in check mode. A cluster without an accepted release has no formats to compare with.
 

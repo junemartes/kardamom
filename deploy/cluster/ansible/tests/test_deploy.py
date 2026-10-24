@@ -250,7 +250,8 @@ class NomadAPI(BaseHTTPRequestHandler):
             node = f'node-cluster-{octet - 1}'
             default = 'LEADER' if node.endswith('-0') else 'FOLLOWER'
             self.respond({'memberId': octet - 1, 'role': state['roles'].get(node, default), 'election': 'CLOSED',
-                          'snapshotReadsMax': state.get('reads_max', {}).get(node, 15)})
+                          'snapshotReadsMax': state.get('reads_max', {}).get(node, 15),
+                          'snapshotLatest': state.get('snapshot_latest', {}).get(node, 0)})
         elif parts[2] == 'job' and parts[4] == 'deployment':
             # A job with a scripted deployment gets one; every other job
             # has none, like a system job.
@@ -1408,6 +1409,56 @@ class RecordTest(Deploys):
         output = self.run_deploy(success=False)
         self.assertIn('the registered sealer job names decisionVersion=3', output)
         self.assertEqual(self.api.state['writes'], [])
+
+    def target_snapshot_reads_max(self, version):
+        """Give the target release a sealer snapshot reads_max of `version`."""
+        formats = self.repo / 'formats.toml'
+        formats.write_text(re.sub(r'(\[format\.sealer-snapshot\][^\[]*?reads_max = )\d+', rf'\g<1>{version}',
+                                  formats.read_text()))
+
+    def test_a_release_that_cannot_read_the_newest_sealer_snapshot_is_refused(self):
+        self.deploy()
+        self.api.state['writes'] = []
+        self.api.state['record_writes'] = []
+        self.repin('b')
+        self.target_snapshot_reads_max(16)
+        self.api.state['snapshot_latest'] = {'node-cluster-0': 16, 'node-cluster-1': 17}
+        output = self.run_deploy(success=False)
+        self.assertIn('reads sealer snapshots only up to version 16', output)
+        self.assertIn('cluster-1 at version 17.', output)
+        self.assertIn('Deploy a release that reads snapshot version 17.', output)
+        self.assertEqual(self.api.state['writes'], [])
+        self.assertEqual(self.api.state['record_writes'], [], 'a refused release starts no attempt')
+        # The gate cannot read the snapshot of a member that does not run.
+        self.api.state['snapshot_latest'] = {}
+        self.api.state['down_groups'] = ['cluster-2']
+        output = self.run_deploy(success=False)
+        self.assertIn('the sealer members cluster-2 do not run', output)
+        self.assertEqual(self.api.state['writes'], [])
+        del self.api.state['down_groups']
+        self.api.state['snapshot_latest'] = {f'node-cluster-{member}': 16 for member in range(3)}
+        self.run_deploy()
+        self.assertEqual(sorted(set(self.api.state['writes'])), sorted(self.REPINNED))
+
+    def test_a_release_that_does_not_change_the_sealer_skips_the_snapshot_check(self):
+        """A running member reads no snapshot, and the release can be the fix of the outage of a member."""
+        self.deploy()
+        self.api.state['writes'] = []
+        self.target_snapshot_reads_max(16)
+        self.api.state['snapshot_latest'] = {'node-cluster-0': 17}
+        self.api.state['down_groups'] = ['cluster-2']
+        self.manifest.write_text(re.sub(r'^(executor .*@sha256:)[0-9a-f]{64}$', r'\g<1>' + 'b' * 64,
+                                        self.manifest.read_text(), flags=re.M))
+        output = self.run_deploy()
+        self.assertIn('The sealer job does not change, so no sealer member restarts on the target release.', output)
+        self.assertEqual(self.api.state['writes'], ['executor'])
+
+    def test_a_new_sealer_cluster_skips_the_snapshot_check(self):
+        self.target_snapshot_reads_max(16)
+        self.api.state['snapshot_latest'] = {'node-cluster-0': 17}
+        output = self.run_deploy(check=True)
+        self.assertRegex(output, r'cannot read the newest snapshot of a sealer member\] \*+\nskipping')
+        self.assertIn('cluster', self.api.state['plans'])
 
     def upgrade_check(self, success=True, feature='5', activation_ms=''):
         """Run the upgrade check for an upgrade transaction of `feature` at `activation_ms`."""
