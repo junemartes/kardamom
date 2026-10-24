@@ -8,7 +8,7 @@
 //! rewind-and-retry path applies.
 
 use kardamom_types::EpochRecord;
-use kardamom_types::upgrades::{FEATURE_SEALER_V4, FEATURE_SEALER_V5};
+use kardamom_types::upgrades::{FEATURE_CARRY_WINDOW, FEATURE_SEALER_V4, FEATURE_SEALER_V5};
 use kardamom_types::xchain::RemoteEpochRecord;
 
 use crate::SequencerError;
@@ -143,13 +143,13 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
     }
 
     fn try_publish_epoch(&mut self, e: &EpochRecord) -> Result<(), SequencerError> {
-        // The activations of decision versions 4 and 5 go in front of their
-        // epoch, on this session. The pump offers the same epoch again after back
-        // pressure, a gap or a restart, so the activation goes out again
-        // with it, and the sealer ignores a copy. An epoch that the sealer
-        // ordered is never offered again, so the activation must not come
-        // after it.
-        [FEATURE_SEALER_V4, FEATURE_SEALER_V5]
+        // The activations of decision versions 4 and 5, and of the exact
+        // window, go in front of their epoch, on this session. The pump
+        // offers the same epoch again after back pressure, a gap or a
+        // restart, so the activation goes out again with it, and the sealer
+        // ignores a copy. An epoch that the sealer ordered is never offered
+        // again, so the activation must not come after it.
+        [FEATURE_SEALER_V4, FEATURE_SEALER_V5, FEATURE_CARRY_WINDOW]
             .into_iter()
             .filter_map(|feature| wire::FeatureActivation::of(e, feature))
             .try_for_each(|activation| self.offer_activation(&activation))?;
@@ -173,8 +173,8 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
 /// The egress kinds a publisher session reads: the boundaries, the
 /// status (for its snapshot notice), every reject the sealer answers an
 /// offer with, and the sealer's rules (for the decision version that the
-/// sequencer reports).
-pub const PUBLISHER_EGRESS_KINDS: [u8; 10] = [
+/// sequencer keeps).
+pub const PUBLISHER_EGRESS_KINDS: [u8; 11] = [
     wire::EGRESS_KIND_SEALER_INFO,
     wire::EGRESS_KIND_BOUNDARY,
     wire::EGRESS_KIND_STATUS,
@@ -185,6 +185,7 @@ pub const PUBLISHER_EGRESS_KINDS: [u8; 10] = [
     wire::EGRESS_KIND_DA_LAG_REJECT,
     wire::EGRESS_KIND_ORIGIN_GAP,
     wire::EGRESS_KIND_RECORD_LAG_REJECT,
+    wire::EGRESS_KIND_REF_REFUSED,
 ];
 
 /// Connect to the cluster, wrap ingress as a `TxOrderingRefPublisher`, and
@@ -248,6 +249,7 @@ mod tests {
             wire::EGRESS_KIND_DA_LAG_REJECT,
             wire::EGRESS_KIND_ORIGIN_GAP,
             wire::EGRESS_KIND_RECORD_LAG_REJECT,
+            wire::EGRESS_KIND_REF_REFUSED,
         ] {
             assert!(PUBLISHER_EGRESS_KINDS.contains(&kind), "kind {kind}");
         }
@@ -416,8 +418,25 @@ mod tests {
         assert_eq!(parsed.envelope, envelope.as_ref());
     }
 
+    /// The exact window (feature 5) goes out in front of its epoch too.
+    #[test]
+    fn publishes_the_activation_of_the_exact_window_in_front_of_its_epoch() {
+        let e = epoch_with_upgrade(FEATURE_CARRY_WINDOW);
+        let ingress = FakeIngress::new();
+        let mut pubr = ClusterRefPublisher::new(ingress.clone());
+        pubr.try_publish_epoch(&e).unwrap();
+        let activation = wire::FeatureActivation {
+            l1_origin: 4_242,
+            feature_id: FEATURE_CARRY_WINDOW,
+            activation_ms: 9_000,
+        };
+        assert_eq!(ingress.accepted()[0], activation.encode());
+        assert_eq!(ingress.accepted()[1][0], wire::KIND_ORIGIN_RECORD);
+    }
+
     /// An epoch with the upgrade of another feature goes out alone: the
-    /// sealer follows only the features of decision versions 4 and 5.
+    /// sealer follows only the features of decision versions 4 and 5, and
+    /// of the exact window.
     #[test]
     fn an_epoch_with_another_upgrade_goes_out_without_a_feature_activation() {
         let e = epoch_with_upgrade(kardamom_types::upgrades::FEATURE_SEALER_V3);

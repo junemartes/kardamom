@@ -25,7 +25,9 @@ use crate::ring::journal::{InFlight, Journal};
 use crate::rpc::{Receipt, Rpc, RpcError};
 use crate::wait::Poll;
 
-const NAME: &str = "deposit";
+pub(crate) const NAME: &str = "deposit";
+/// The `endpoint` label of the probe's outcomes and stages.
+pub(crate) const ENDPOINT: &str = "l1";
 /// The L2 gas limit of the deposit: a plain credit.
 const L2_GAS: u64 = 21_000;
 /// The L1 gas limit of `depositETH` with empty data.
@@ -61,7 +63,7 @@ impl DepositSettings {
             .parse()
             .map_err(|e| anyhow::anyhow!("the canary's L1 key does not parse: {e}"))?;
         let endpoint = crate::config::Endpoint {
-            name: "l1".to_string(),
+            name: ENDPOINT.to_string(),
             url: url.clone(),
         };
         Ok(Some(Self {
@@ -135,7 +137,7 @@ impl Deposit {
         let included = Instant::now();
         metrics::stage(
             NAME,
-            "l1",
+            ENDPOINT,
             "l1_inclusion",
             included.saturating_duration_since(started),
         );
@@ -143,12 +145,12 @@ impl Deposit {
         let finalized = Instant::now();
         metrics::stage(
             NAME,
-            "l1",
+            ENDPOINT,
             "l1_finality",
             finalized.saturating_duration_since(included),
         );
         self.credited(on_l1.source).await?;
-        metrics::stage(NAME, "l1", "l2_credit", finalized.elapsed());
+        metrics::stage(NAME, ENDPOINT, "l2_credit", finalized.elapsed());
         Ok(())
     }
 
@@ -309,6 +311,6 @@ impl Probe for Deposit {
         ::metrics::gauge!(metrics::BALANCE_FLOOR_WEI, "layer" => "l1")
             .set(metrics::wei(self.settings.floor));
         let outcome = self.attempt().await.err().unwrap_or(Outcome::Success);
-        outcome.record(NAME, "l1");
+        outcome.record(NAME, ENDPOINT);
     }
 }

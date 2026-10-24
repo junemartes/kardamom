@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.SealerSeed;
+import io.kardamom.sealer.VersionSwitch;
 import io.kardamom.sealer.VoidLedger;
 import java.io.IOException;
 import java.lang.reflect.Field;
@@ -13,6 +14,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.IntSummaryStatistics;
 import java.util.List;
 import java.util.Map;
@@ -21,6 +23,7 @@ import java.util.Set;
 import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import org.agrona.SemanticVersion;
 import org.junit.jupiter.api.BeforeAll;
@@ -70,6 +73,68 @@ final class FormatRegistryTest {
         assertEquals(IntStream.rangeClosed(readsMin, readsMax).boxed().toList(), read);
     }
 
+    /**
+     * The bytes of a version-18 snapshot of a heap member are frozen: the
+     * state of version 16, the carry window section, then the heap section.
+     * A change of these bytes takes a new snapshot version. To write the
+     * file again on purpose, run
+     * {@code SEALER_GOLDEN_UPDATE=1 ./gradlew :service:test --tests '*FormatRegistryTest' --rerun-tasks}.
+     */
+    @Test
+    void aVersionEighteenSnapshotHasTheGoldenBytes() throws IOException {
+        final DriverlessLog log = new DriverlessLog();
+        final DriverlessLog.Member member = log.member(Optional.empty());
+        member.applyAll(versionEighteenLog());
+        final byte[] snapshot = member.svc().snapshot();
+        log.stop();
+        assertEquals(CanonicalSealerState.WINDOW_SNAPSHOT_VERSION, ByteBuffer.wrap(snapshot).getInt(Integer.BYTES));
+        final String hex = HexFormat.of().formatHex(snapshot);
+        if ("1".equals(System.getenv("SEALER_GOLDEN_UPDATE"))) {
+            Files.writeString(Path.of("src/test/resources", V18_GOLDEN), V18_HEADER + "\n"
+                + String.join("\n", hex.split("(?<=\\G.{64})")) + "\n");
+            return;
+        }
+        final String golden = Files.readAllLines(Path.of("src/test/resources", V18_GOLDEN)).stream()
+            .filter(line -> !line.startsWith("#"))
+            .collect(Collectors.joining());
+        assertEquals(golden, hex, "the bytes of snapshot version 18 changed; a new layout takes a new version");
+    }
+
+    private static final String V18_GOLDEN = "sealer-snapshot-v18.hex";
+    private static final String V18_HEADER =
+        "# v18: the snapshot of a heap member that holds the carry window (FormatRegistryTest).";
+
+    /**
+     * Version 4 at epoch 2, version 5 at epoch 3, the carry window on at
+     * epoch 4, then one full reference and one boundary under its rules.
+     */
+    private static List<DriverlessLog.Entry> versionEighteenLog() {
+        return List.of(
+            epochEntry(1, 1_000L),
+            DriverlessLog.Entry.tick("tick-1", 1_250L),
+            activationEntry(2, VersionSwitch.FEATURE_SEALER_V4, 1_300L),
+            epochEntry(2, 1_400L),
+            DriverlessLog.Entry.tick("tick-2", 1_500L),
+            activationEntry(3, VersionSwitch.FEATURE_SEALER_V5, 1_550L),
+            epochEntry(3, 1_600L),
+            DriverlessLog.Entry.tick("tick-3", 1_750L),
+            activationEntry(4, VersionSwitch.FEATURE_CARRY_WINDOW, 1_800L),
+            epochEntry(4, 1_850L),
+            DriverlessLog.Entry.tick("tick-4", 2_000L),
+            DriverlessLog.Entry.frame("full", FullRef.of(30, 64).frame(), 2_100L),
+            DriverlessLog.Entry.tick("tick-5", 2_250L));
+    }
+
+    private static DriverlessLog.Entry epochEntry(final long origin, final long ms) {
+        return DriverlessLog.Entry.frame("epoch-" + origin, IngressFrames.originRecordFrame(
+            IngressFrames.canonicalId(1000 + (int) origin), origin, 1, new byte[] {0x02}), ms);
+    }
+
+    private static DriverlessLog.Entry activationEntry(final long origin, final long feature, final long ms) {
+        return DriverlessLog.Entry.frame("activation-" + feature,
+            IngressFrames.featureActivationFrame(origin, feature, 0L), ms);
+    }
+
     @Test
     void voidRecordTypeMatchesTheRegistry() {
         assertEquals(VoidLedger.RT_VOID, version("sealer-record-types", "writes"));
@@ -94,10 +159,9 @@ final class FormatRegistryTest {
     void egressKindsMatchTheRegistry() {
         // The record-lag reject waits for recordLagBudget. The relayed
         // reference waits for carryBytes, and the feed gap for the member
-        // feed. The service does not send the reference refusal yet.
+        // feed.
         assertKinds("sealer-egress-kinds", "EGRESS_KIND_", Set.of(
-            "EGRESS_KIND_RECORD_LAG_REJECT", "EGRESS_KIND_RELAYED_REF", "EGRESS_KIND_FEED_GAP",
-            "EGRESS_KIND_REF_REFUSED"));
+            "EGRESS_KIND_RECORD_LAG_REJECT", "EGRESS_KIND_RELAYED_REF", "EGRESS_KIND_FEED_GAP"));
     }
 
     @Test

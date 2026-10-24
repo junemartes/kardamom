@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use kardamom_cluster_adapter::wire::{EGRESS_KIND_REPLAY_AHEAD, encode_feed_answer};
 
-use super::tests::{Rig, TIMING, boundary, done, entry, forged_at, tx_at, unavailable};
+use super::tests::{Rig, TIMING, boundary, done, entry, forged_at, ref_at, tx_at, unavailable};
 use super::*;
 
 /// Serve one block on `source` from its newest request: the entry at
@@ -343,4 +343,87 @@ fn a_return_to_a_new_image_of_the_feed_restarts_the_run() {
         } => assert_eq!((next_index, next_block), (1, 2)),
         other => panic!("expected the restart from the state DB, got {other:?}"),
     }
+}
+
+#[test]
+fn a_reference_at_the_cursor_switches_to_the_other_source() {
+    let mut rig = Rig::new(0, 1);
+    rig.request(Source::Feed);
+    rig.feed.send(ref_at(0));
+    let request = serve_block(&mut rig, Source::Service, 0, 1);
+    assert_eq!((request.from_index, request.from_block), (0, 1));
+    assert_eq!(
+        rig.next_item(),
+        (
+            kardamom_types::BPosition::from_index(0),
+            Ordered::Tx(entry(0))
+        ),
+        "the reader executes the entry of the other source, not the reference"
+    );
+}
+
+#[test]
+fn references_at_the_same_index_on_both_sources_stop_the_reader() {
+    let mut rig = Rig::new(4, 2);
+    rig.request(Source::Feed);
+    rig.feed.send(ref_at(4));
+    rig.request(Source::Service);
+    rig.service.send(ref_at(4));
+    match rig.error() {
+        ExecutorError::UnjoinableReference { index } => assert_eq!(index, 4),
+        other => panic!("expected the unjoinable reference error, got {other:?}"),
+    }
+}
+
+#[test]
+fn references_at_two_indexes_do_not_stop_the_reader() {
+    let mut rig = Rig::new(0, 1);
+    rig.request(Source::Feed);
+    rig.feed.send(ref_at(0));
+    serve_block(&mut rig, Source::Service, 0, 1);
+    assert_eq!(rig.deliver(5), ["t0", "b1"]);
+    rig.service.send(ref_at(1));
+    let request = rig.request(Source::Feed);
+    assert_eq!(
+        rig.sub.source(),
+        Source::Feed,
+        "the reader tries the feed again"
+    );
+    assert_eq!((request.from_index, request.from_block), (1, 2));
+}
+
+#[test]
+fn a_reference_with_no_second_source_stops_the_reader() {
+    let (feed, remote) = MemoryTransport::pair();
+    let mut sub = CarriedSubscription::with_timing(feed, NoSource, ReplayCursor::new(3, 2), TIMING);
+    match fail_answering(&mut sub, &remote, |_| ref_at(3)) {
+        ExecutorError::UnjoinableReference { index } => assert_eq!(index, 3),
+        other => panic!("expected the unjoinable reference error, got {other:?}"),
+    }
+}
+
+/// A floor only rises and a reference stays, so a feed below its floor
+/// and a service with a reference at the cursor stop the reader too.
+#[test]
+fn a_floor_and_a_reference_at_the_cursor_stop_the_reader() {
+    let mut rig = Rig::new(3, 2);
+    let request = rig.request(Source::Feed);
+    rig.feed.send(unavailable(request.request_id, 10, 5));
+    rig.request(Source::Service);
+    rig.service.send(ref_at(3));
+    match rig.error() {
+        ExecutorError::UnjoinableReference { index } => assert_eq!(index, 3),
+        other => panic!("expected the unjoinable reference error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_reference_at_the_cursor_after_a_hole_is_a_fault() {
+    let mut rig = Rig::new(0, 1);
+    let first = rig.request(Source::Feed);
+    rig.feed.send(ref_at(2));
+    let again = rig.request(Source::Feed);
+    assert_ne!(again.request_id, first.request_id, "the hole asks again");
+    rig.feed.send(ref_at(0));
+    rig.run_until(|rig| rig.sub.source() == Source::Service);
 }

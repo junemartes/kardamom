@@ -155,6 +155,9 @@ pub enum AccountEvent {
     },
     /// The executor rolled back.
     Rollback,
+    /// The sealer refused the forwarded transaction of `sender` at `nonce`
+    /// (egress kind 18). The filter forgets the run, so a resend goes out.
+    Refused { sender: Address, nonce: u64 },
 }
 
 /// What the loop needs to offer one forwarded transaction.
@@ -346,6 +349,9 @@ impl AdmissionLoop {
                 self.admission.on_lookup(address, state, &mut self.verdicts);
             }
             AccountEvent::Rollback => self.admission.on_rollback(),
+            AccountEvent::Refused { sender, nonce } => {
+                self.admission.on_refused(sender, nonce, &mut self.verdicts);
+            }
         }
     }
 

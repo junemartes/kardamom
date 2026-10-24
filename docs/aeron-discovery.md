@@ -113,6 +113,7 @@ The `tx_drops` stream carries the transactions that the sequencers dropped: one 
 - The offer is best effort. A refused offer drops the record, and the client then sees the status `unknown` for that hash.
 - Both twins of a lane publish their drops. The egress keeps one status for each hash, and a receipt of the hash wins over a drop.
 - The egress serves the status with `kardamom_getTransactionStatus`.
+- A drop with the reason `transaction dropped by the sealer, send it again` (code -32000) is provisional. The sealer refused the reference of one twin, and the other twin can still offer the transaction with its bytes. Client text: safe to send again; the status can still become executed.
 
 The `l1_blocks` stream carries the finalized L1 blocks: one `L1Block` for each block, in block order.
 

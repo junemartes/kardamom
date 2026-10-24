@@ -33,7 +33,8 @@ import org.junit.jupiter.api.io.TempDir;
  * <p>The window-only rule needs a member that carries the bytes: only
  * then does the member feed run, so every reader below the window can
  * recover from the egress. A member that keeps its frames on the heap
- * keeps the posted rule under version 5 too.</p>
+ * keeps the posted rule under version 5 too, while the carry window is
+ * off: see {@link SealerCarryActivationTest}.</p>
  */
 class SealerCarryWindowTest {
 

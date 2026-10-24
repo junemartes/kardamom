@@ -38,6 +38,8 @@ final class HeapFrames implements RetainedFrames {
     /** The index slot of the oldest frame, and the number of frames. */
     private int first;
     private int count;
+    /** The bytes of the retained frames. */
+    private long bytes;
 
     @Override
     public void append(final DirectBuffer staged, final int length) {
@@ -50,6 +52,7 @@ final class HeapFrames implements RetainedFrames {
         boundaries[slot] = staged.getByte(0) == SealerWire.EGRESS_KIND_BOUNDARY;
         tail = at + length;
         count++;
+        bytes += length;
     }
 
     /** The offset where a frame of {@code length} bytes goes. The byte ring grows when no free run holds it. */
@@ -135,6 +138,11 @@ final class HeapFrames implements RetainedFrames {
     }
 
     @Override
+    public long bytes() {
+        return bytes;
+    }
+
+    @Override
     public boolean carriesBytes() {
         return false;
     }
@@ -151,6 +159,7 @@ final class HeapFrames implements RetainedFrames {
 
     @Override
     public void evictFront() {
+        bytes -= lengths[first];
         first = (first + 1) % offsets.length;
         count--;
         head = count == 0 ? tail : offsets[first];
@@ -233,6 +242,7 @@ final class HeapFrames implements RetainedFrames {
     public void clear() {
         first = 0;
         count = 0;
+        bytes = 0;
         head = 0;
         tail = 0;
     }

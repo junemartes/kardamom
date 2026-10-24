@@ -408,7 +408,8 @@ public final class ClusterNode {
                 MemberStatus.SnapshotVersions.of(service.latestSnapshotVersion()),
                 service.decisionRules(),
                 diskFreeBytes())
-                .withStart(service.leadershipTermId(), service.holdingAtStart());
+                .withStart(service.leadershipTermId(), service.holdingAtStart())
+                .withCarry(service.metrics().carry());
         }
 
         /**
