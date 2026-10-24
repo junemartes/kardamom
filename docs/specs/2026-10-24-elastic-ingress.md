@@ -1,6 +1,8 @@
 # Stateless ingress on cpx32, and the egress as the transaction source
 
-- Status: revision 3, draft for review. Not implemented.
+- Status: revision 3, approved by the design review on 2026-10-24; accepted. The open questions take
+  the recommended answers (the user's instruction of 2026-10-24: drive to completion without
+  questions). Not implemented.
 - Revision 2 answers the design review of revision 1 (findings R1 to R10). Revision 3 answers the
   review of revision 2 (findings S1 to S8). Section 14 maps each finding to its change.
 - The user decided on 2026-10-24:
@@ -933,27 +935,31 @@ of section 10.
 
 ## 13. Open questions for the user
 
+Each question takes its recommended answer (the user's instruction of 2026-10-24).
+
 - **Q1. Pin 3 cores, or 3 workers with no pin?** Recommendation: 3 workers, no pin, and measure
-  first (7.2). Pin only as an experiment on one node, if `ingress.recover_wait` and
+  first (7.2). Decided: 3 workers, no pin, and measure first. Pin only as an experiment on one node, if `ingress.recover_wait` and
   `node_schedstat_waiting_seconds_total` show that the verifier still waits for the CPU.
 - **Q2. The notifier state at the move.** Merge the old directories (6.3, a stop of a few
-  minutes), or start empty (the webhook clients register again). Recommendation: merge.
+  minutes), or start empty (the webhook clients register again). Recommendation: merge. Decided: merge.
 - **Q3. The notifier as its own class, or in the egress (P8).** Recommendation: its own class now.
-  Revisit P8 when the egress has its own fleet (6.4).
+  Revisit P8 when the egress has its own fleet (6.4). Decided: its own class now.
 - **Q4. Feature 5 one way after Part B (5.5).** After Part B the carry window cannot turn off on
   that network, and a fleet rebuild from a seed needs the `tx_data` archive back first.
   Recommendation: accept it. The alternative is to keep the `tx_data` archive, which the user ruled
-  out.
+  out. Decided: accept it.
 - **Q5. The second source of the batcher, and the risk that stays.**
   - The residual risk: a DA outage longer than the sealer window, plus a loss of both egress
     stores, leaves no copy of the unposted blocks except the `exec_txs` recordings, which no
     reader reads (4.3). Recommendation: accept it on staging. Open an issue for a recovery from the
     `exec_txs` recordings, or a third egress instance, before a production network.
+    Decided: accept it on staging, with the issue before a production network.
   - The strip of the bytes: the carry spec plans a later change that strips the bytes from the
     cluster sessions. The batcher then loses its second source. Recommendation: that change keeps
     the bytes on the sessions that ask for them, and the batcher asks.
+    Decided: the strip change keeps the bytes on the sessions that ask for them.
 - **Q6. When to delete the old recordings** (section 10, step 11). Recommendation: after a soak of
-  7 days, not 24 hours.
+  7 days, not 24 hours. Decided: after a soak of 7 days.
 
 The answers of revision 1 that changed:
 
