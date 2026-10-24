@@ -160,11 +160,13 @@ public final class CanonicalSealerState {
      * windows after the decision rules: see {@link VersionSwitch#writeTo}
      * and {@link SessionWindows#writeTo}. Version 16 is version 15 with the
      * schedule of the carry flag after the replay windows: see
-     * {@link VersionSwitch#writeCarryTo}.
+     * {@link VersionSwitch#writeCarryTo}. Version 17 has the state section
+     * of version 16, and the retention section of the retained file after
+     * it.
      *
      * <p>This is the newest version that {@link #load} reads.</p>
      */
-    private static final int SNAPSHOT_READ_VERSION = 16;
+    private static final int SNAPSHOT_READ_VERSION = 17;
 
     /**
      * The version that {@link #takeSnapshot()} writes when the version
@@ -187,10 +189,30 @@ public final class CanonicalSealerState {
 
     /**
      * The version that {@link #takeSnapshotWithRetainedFile()} writes: the
-     * state section of version 10 without the void ledger, then the
-     * retention section of the retained file.
+     * state section of version 16, then the retention section of the
+     * retained file. The state section holds the decision rules, the
+     * version switch and the schedule of the carry flag, so a member that
+     * restores it decides as its peers that kept running. A member that
+     * reads only up to version 16 refuses it.
+     */
+    public static final int FILE_SNAPSHOT_VERSION = 17;
+
+    /**
+     * The older version with a retained file: the state section of version
+     * 10 without the void ledger, then the retention section of the
+     * retained file. {@link #load} still reads it. It holds no decision
+     * rules, so a member that restores it runs decision version 3.
      */
     public static final int RETAINED_FILE_SNAPSHOT_VERSION = 12;
+
+    /**
+     * Whether a snapshot of {@code version} ends with the retention section
+     * of a retained file: version {@link #RETAINED_FILE_SNAPSHOT_VERSION}
+     * or {@link #FILE_SNAPSHOT_VERSION}.
+     */
+    public static boolean holdsRetainedFile(int version) {
+        return version == RETAINED_FILE_SNAPSHOT_VERSION || version == FILE_SNAPSHOT_VERSION;
+    }
 
     /** The only version that holds the recorded cursors. */
     private static final int CURSORS_SNAPSHOT_VERSION = 11;
@@ -1634,26 +1656,27 @@ public final class CanonicalSealerState {
 
     /**
      * The state section of a snapshot whose retention section is a
-     * retained file: version {@link #RETAINED_FILE_SNAPSHOT_VERSION}.
+     * retained file: version {@link #FILE_SNAPSHOT_VERSION}.
      */
     public byte[] takeSnapshotWithRetainedFile() {
-        return takeSnapshot(RETAINED_FILE_SNAPSHOT_VERSION);
+        return takeSnapshot(FILE_SNAPSHOT_VERSION);
     }
 
     /**
      * {@link #takeSnapshot()} in the layout of {@code version}: 10 has the
      * void ledger, 11 has the void ledger and the recorded cursors, 12 has
      * neither, 14 has the void ledger and the decision rules, 15 has
-     * version 14 with the version switch and the replay windows, and 16 has
-     * version 15 with the schedule of the carry flag. A version-10 snapshot
-     * of a state is the same bytes in every release that writes version 10.
+     * version 14 with the version switch and the replay windows, 16 has
+     * version 15 with the schedule of the carry flag, and 17 has the layout
+     * of version 16. A version-10 snapshot of a state is the same bytes in
+     * every release that writes version 10.
      *
-     * @param version 10, 11, 12, 14, 15 or 16
+     * @param version 10, 11, 12, 14, 15, 16 or 17
      */
     byte[] takeSnapshot(int version) {
         boolean withVoids = version != RETAINED_FILE_SNAPSHOT_VERSION;
         boolean withCursors = version == CURSORS_SNAPSHOT_VERSION;
-        boolean withCarry = version == CARRY_SNAPSHOT_VERSION;
+        boolean withCarry = version == CARRY_SNAPSHOT_VERSION || version == FILE_SNAPSHOT_VERSION;
         boolean withSwitch = version == SWITCH_SNAPSHOT_VERSION || withCarry;
         boolean withRules = version == SNAPSHOT_WRITE_VERSION || withSwitch;
         int idCount = dedup.size();
@@ -1709,7 +1732,7 @@ public final class CanonicalSealerState {
             buf.put(e.getValue().nextSeqKnown ? (byte) 1 : (byte) 0);
             buf.putLong(e.getValue().nextSeq);
         }
-        // v6 to v11 and v13: the void window, then the open votes.
+        // Every version from v6 except v12: the void window, then the open votes.
         if (withVoids) {
             voids.writeTo(buf, canonicalCount);
         }
@@ -1724,16 +1747,16 @@ public final class CanonicalSealerState {
         if (withCursors) {
             recorded.writeTo(buf);
         }
-        // v14 to v16: the decision rules.
+        // v14 to v17: the decision rules.
         if (withRules) {
             rules.writeTo(buf);
         }
-        // v15 and v16: the version switch and the replay windows.
+        // v15 to v17: the version switch and the replay windows.
         if (withSwitch) {
             versions.writeTo(buf);
             windows.writeTo(buf);
         }
-        // v16 only: the schedule of the carry flag.
+        // v16 and v17: the schedule of the carry flag.
         if (withCarry) {
             versions.writeCarryTo(buf);
         }
@@ -1964,7 +1987,7 @@ public final class CanonicalSealerState {
             state.versions = VersionSwitch.readFrom(buf);
             state.windows = SessionWindows.readFrom(buf, SessionWindows.DEFAULT_SLOTS, SessionWindows.DEFAULT_WIDTH);
         }
-        if (version == CARRY_SNAPSHOT_VERSION) {
+        if (version >= CARRY_SNAPSHOT_VERSION) {
             state.versions.readCarryFrom(buf);
         }
         // A version-1 snapshot (before the guard existed) restores an empty
