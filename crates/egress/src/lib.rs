@@ -16,6 +16,7 @@ pub mod merge;
 pub mod metrics;
 pub mod owner;
 pub mod receipts;
+pub mod ref_mark;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod test_support;

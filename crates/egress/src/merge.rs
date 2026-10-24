@@ -357,7 +357,7 @@ impl Digests {
 
 /// The offset of the record type in a record frame:
 /// `[kind:u8][index:u64][len:u32]`, then `[canonical_id:32][record_type:u8]`.
-const RECORD_TYPE_AT: usize = 1 + 8 + 4 + 32;
+pub(crate) const RECORD_TYPE_AT: usize = 1 + 8 + 4 + 32;
 
 /// The canonical slots of a record frame. Only an epoch and a remote epoch
 /// take more than one, so only they decode.

@@ -415,7 +415,16 @@ impl crate::TxOrderingSubscription for LiveOrdering {
     }
 }
 
-/// Open the egress at `base` (`http://host:port`) from `cursor`. See
+/// The egress that a reader after the executors reads.
+pub struct EgressSource {
+    /// The base URL of the egress (`http://host:port`).
+    pub base: String,
+    /// The gauge of the canonical index of the newest record that the
+    /// reader took from the egress.
+    pub cursor_gauge: &'static str,
+}
+
+/// Open the egress of `source` from `cursor`. See
 /// [`open_egress_transport`].
 ///
 /// # Errors
@@ -424,12 +433,15 @@ impl crate::TxOrderingSubscription for LiveOrdering {
 pub fn open_egress(
     rt: &AeronRuntime,
     plane: &mut kardamom_log::discovery::StreamPlane,
-    base: String,
+    source: EgressSource,
     cursor: crate::reader::cluster::ReplayCursor,
 ) -> Result<LiveEgressSub> {
     use crate::reader::carried::{CarriedSubscription, NoSource};
-    let transport = open_egress_transport(rt, plane, base)?;
-    Ok(CarriedSubscription::new(transport, NoSource, cursor))
+    let transport = open_egress_transport(rt, plane, source.base)?;
+    Ok(
+        CarriedSubscription::new(transport, NoSource, cursor)
+            .with_cursor_gauge(source.cursor_gauge),
+    )
 }
 
 /// Open one source of the egress at `base` (`http://host:port`): its range
@@ -569,10 +581,10 @@ pub struct InboundConfig<'a> {
     /// re-export; the validator suppresses its own copy to avoid a
     /// second, lagging series.
     pub suppress_sealer_metrics: bool,
-    /// Read the canonical stream from the egress at this base URL, not
-    /// from the cluster egress. The stream then carries the bytes: no
-    /// `tx_data` lane opens, and nothing joins.
-    pub egress: Option<String>,
+    /// Read the canonical stream from this egress, not from the cluster
+    /// egress. The stream then carries the bytes: no `tx_data` lane opens,
+    /// and nothing joins.
+    pub egress: Option<EgressSource>,
 }
 
 /// Open the shared inbound side of the engine, both role binaries run
@@ -600,9 +612,9 @@ where
             ExecStream = crate::reader::NoExecStream,
         >,
 {
-    if let Some(base) = cfg.egress {
-        tracing::info!(%base, "{}: the canonical stream via the egress", cfg.bin_name);
-        let sub = open_egress(cfg.rt, cfg.plane, base, cfg.cursor)?;
+    if let Some(source) = cfg.egress {
+        tracing::info!(base = %source.base, "{}: the canonical stream via the egress", cfg.bin_name);
+        let sub = open_egress(cfg.rt, cfg.plane, source, cfg.cursor)?;
         return Ok((
             crate::Inbound {
                 tx_data: Vec::new(),
