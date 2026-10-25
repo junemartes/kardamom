@@ -8,6 +8,7 @@ use kardamom_egress::merge::Head;
 use super::EgressTransport;
 use crate::ExecutorError;
 use crate::actor::fixtures::TestEgress;
+use crate::reader::carried::answer::Timing;
 use crate::reader::carried::memory::{MemoryRemote, MemoryTransport};
 use crate::reader::carried::tests::{TIMING, boundary, label, tx_at, unavailable};
 use crate::reader::carried::transport::{Poll, Request, Transport};
@@ -172,9 +173,18 @@ struct Alone {
 
 impl Alone {
     fn new(rt: &tokio::runtime::Runtime, egress: &TestEgress, cursor: ReplayCursor) -> Self {
+        Self::with_timing(rt, egress, cursor, TIMING)
+    }
+
+    fn with_timing(
+        rt: &tokio::runtime::Runtime,
+        egress: &TestEgress,
+        cursor: ReplayCursor,
+        timing: Timing,
+    ) -> Self {
         let (transport, live) = egress.transport(rt);
         Self {
-            sub: CarriedSubscription::with_timing(transport, NoSource, cursor, TIMING),
+            sub: CarriedSubscription::with_timing(transport, NoSource, cursor, timing),
             live,
         }
     }
@@ -219,10 +229,10 @@ fn a_live_record_of_the_egress_waits_for_its_boundary() {
 /// The reader delivered the records of block 2 before the boundary of
 /// block 1. Each range read from that cursor starts with the boundary of
 /// block 1, so the run starts again from the state DB at the first range
-/// read, before the stall window.
+/// read. The stall window of this reader is one hour, so the restart
+/// cannot come from the stall watchdog.
 #[test]
 fn a_cursor_past_an_undelivered_boundary_restarts_the_run() {
-    let started = std::time::Instant::now();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let stored = [
@@ -234,7 +244,11 @@ fn a_cursor_past_an_undelivered_boundary_restarts_the_run() {
         boundary(3, 3),
     ];
     let egress = TestEgress::serve(&rt, dir.path(), TestEgress::GENESIS, &stored);
-    let mut reader = Alone::new(&rt, &egress, ReplayCursor::new(2, 1));
+    let timing = Timing {
+        stall: Duration::from_secs(3600),
+        ..TIMING
+    };
+    let mut reader = Alone::with_timing(&rt, &egress, ReplayCursor::new(2, 1), timing);
     match reader.sub.error() {
         ExecutorError::SourceRestarted {
             next_index,
@@ -242,5 +256,4 @@ fn a_cursor_past_an_undelivered_boundary_restarts_the_run() {
         } => assert_eq!((next_index, next_block), (2, 1)),
         other => panic!("expected a restart from the state DB, got {other:?}"),
     }
-    assert!(started.elapsed() < TIMING.stall, "{:?}", started.elapsed());
 }

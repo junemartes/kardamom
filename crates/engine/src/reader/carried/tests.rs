@@ -19,7 +19,9 @@ pub(super) const TIMING: Timing = Timing {
     silence: Duration::from_millis(300),
     ready: Duration::from_millis(150),
     poll: Duration::from_millis(5),
-    stall: Duration::from_secs(1),
+    // Long, so a slow test host never trips the stall watchdog: the tests
+    // of the watchdog set their own short window.
+    stall: Duration::from_secs(60),
 };
 
 /// A reader of two in-memory sources, and the test's side of each.
