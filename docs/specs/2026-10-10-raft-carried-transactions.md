@@ -88,6 +88,22 @@
   side of the handoff (sections 8.1 and 8.3).
 - Every claim about the current code cites `path:line` on `main` at `0e0c34f25`. The amendment of
   2026-10-17 cites `main` at `1d2529033`.
+- Later changes (2026-10-25). The body of this spec does not show these changes. Where the body
+  differs, this list and `docs/specs/2026-10-21-one-way-pipeline.md` win:
+  - The flusher (section 5.5, section 10): the sealer runs at file sync level 0, with no scheduled
+    sync (owner decision of 2026-10-22, #641). The durable position of #645 is on hold.
+  - The ordered signal, egress kind 15 (decision 31, sections 6 and 13): kind 15 has no reader.
+    The v2 loop of the sequencer keeps no re-offer ledger (one-way pipeline D1, #680 closed).
+  - The serving service that tails a sealer member (the header and section 1): the egress gets the
+    order, the receipts and the account rows from the executors (one-way pipeline D6).
+  - The two stored heads (R7, decision 27, section 8.3): the egress gets the frames and the
+    receipts from one source, so the split of #679 is not needed (#679 closed). The sealer purge
+    still follows the stored head of the egress (#639, owner decision of 2026-10-24).
+  - The retained file (decision 10): it stays as a store for a member that carries the bytes
+    (`docs/specs/2026-10-23-carry-activation.md` section 15, #637 closed).
+  - The cut-over of section 12 (#598): features 4 and 5 turn on the carried path by upgrade
+    transactions (`docs/specs/2026-10-23-carry-activation.md`, #771).
+  - The `tx_heads` stream: dropped, because no component reads it (#596 closed).
 
 ## 1. Summary
 

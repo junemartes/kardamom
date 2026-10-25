@@ -68,6 +68,8 @@ Two alerts of the L1 follower have a runbook and no halt:
 A procedure runbook has no `RecoveryId`: no halt names it, and an operator
 starts it. It has the same four sections.
 
+- [`carry-window-rollout.md`](carry-window-rollout.md): turn on the carry window (feature 5) on a live
+  chain, and move the executors to the bytes that the sealer carries, one step at a time.
 - [`sealer-fleet-rebuild.md`](sealer-fleet-rebuild.md): every sealer member lost its state. The chain
   restarts after the posted head from a state rebuilt from L1, and the blocks
   after the posted head are reverted.
