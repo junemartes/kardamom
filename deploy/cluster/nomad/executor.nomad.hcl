@@ -218,10 +218,16 @@ locals {
       constraints = [{ attribute = "", operator = "distinct_hosts", value = "true" }]
   }]
   # The nodes of the checkpoint peers: the nodes that run the executors.
-  checkpoint_peers = join(",", [
-    for i in range(local.on_sealers ? var.sealer_count : var.executor_count) :
-    "${local.on_sealers ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:9014"
-  ])
+  # On the sealer nodes, the list also names the executor nodes. The first
+  # executor of the staged move starts with no state, and only the
+  # executors on the executor nodes hold a checkpoint then. A fetch skips
+  # a peer that does not answer.
+  checkpoint_peers = join(",", concat(
+    local.on_sealers ? [
+      for i in range(var.sealer_count) : "sealer-${i}.node.${var.datacenter}.consul:9014"
+    ] : [],
+    [for i in range(var.executor_count) : "executor-${i}.node.${var.datacenter}.consul:9014"],
+  ))
 }
 
 job "executor" {

@@ -135,9 +135,33 @@ pub(crate) struct Args {
             .range(0..=i64::from(kardamom_cluster_adapter::wire::SEALER_V5_DECISION_VERSION))
     )]
     pub(crate) sealer_version_floor: u8,
+    /// Publish the `sent` records of `tx_events`
+    /// (`docs/specs/2026-10-25-client-events.md`). Best effort: a refused
+    /// offer drops the frame, and the loop never waits for it.
+    #[arg(long, env = "KARDAMOM_TX_EVENTS", value_enum, default_value_t = TxEventsArg::Off)]
+    pub(crate) tx_events: TxEventsArg,
+    /// The replica of this sequencer in its lane: the Nomad allocation
+    /// index of its group (0 or 1 for the two twins). It goes in the high
+    /// byte of the `tx_events` origin, so the twins of a lane publish
+    /// under two origins and their frame counters do not mix.
+    #[arg(long, env = "KARDAMOM_TX_EVENTS_ORIGIN", default_value_t = 0)]
+    tx_events_origin: u8,
+}
+
+/// The values of `--tx-events`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum TxEventsArg {
+    On,
+    Off,
 }
 
 impl Args {
+    /// The origin of the `tx_events` frames of this replica: its replica
+    /// index in the high byte and its `lane` in the low byte.
+    pub(crate) fn tx_events_origin(&self, lane: u8) -> u16 {
+        (u16::from(self.tx_events_origin) << 8) | u16::from(lane)
+    }
+
     /// Fold the CLI and env overrides into the TOML-loaded config: the
     /// plain overrides first, then the replica-group shard rotation and the
     /// sequencer id fallback, which read the overridden partition index.

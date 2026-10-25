@@ -15,17 +15,21 @@
   # A service group is ready when Count allocations of the current version
   # run. A system group is ready when every allocation the scheduler placed
   # for the current version runs; the job's own constraints decide how many
-  # nodes that is, so no node count is derived here.
+  # nodes that is, so no node count is derived here. A sysbatch group is
+  # done when every allocation that the scheduler placed for the current
+  # version is complete.
   vars:
     workloads_placed: >-
       {{ workloads_allocations.json | default([])
          | selectattr('TaskGroup', 'equalto', item.Name)
          | selectattr('JobVersion', 'equalto', workloads_current_job.json.Version)
          | selectattr('DesiredStatus', 'equalto', 'run') | list }}
-    workloads_system: "{{ workloads_jobs[workloads_wait_job].Type == 'system' }}"
+    workloads_type: "{{ workloads_jobs[workloads_wait_job].Type }}"
+    workloads_system: "{{ workloads_type in ['system', 'sysbatch'] }}"
     workloads_desired: "{{ workloads_placed | length if workloads_system else item.Count }}"
+    workloads_done: "{{ 'complete' if workloads_type == 'sysbatch' else 'running' }}"
   until: >-
-    (workloads_placed | selectattr('ClientStatus', 'equalto', 'running') | list | length) >= (workloads_desired | int)
+    (workloads_placed | selectattr('ClientStatus', 'equalto', workloads_done) | list | length) >= (workloads_desired | int)
     and (workloads_desired | int > 0 or not workloads_system)
   retries: "{{ workloads_job.retries | default(workloads_poll_retries) }}"
   delay: "{{ workloads_poll_delay }}"

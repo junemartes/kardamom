@@ -16,8 +16,10 @@
 //! batches cost no sync: under the v1 loop every transaction is a
 //! reference, and two syncs for each batch stalled the owner thread of
 //! the egress, and with it the receipts. A clean stop writes the exact
-//! mark. After a crash the mark is at most [`LEAD`] above the highest
-//! stored reference.
+//! mark. The open takes the exact mark from the segments, and keeps at
+//! least the file value minus [`LEAD`]: the side file holds the mark or
+//! the mark plus the lead. So the lead never stays in the mark after a
+//! restart.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -103,6 +105,23 @@ impl RefMark {
         }
     }
 
+    /// The lowest mark that the side file value `self` can stand for: the
+    /// file holds the mark, or the mark plus [`LEAD`] (`ahead`).
+    pub(crate) fn behind(self) -> Self {
+        Self {
+            index: self.index.saturating_sub(LEAD.index),
+            block: self.block.saturating_sub(LEAD.block),
+        }
+    }
+
+    /// The higher of `self` and `other` in each field.
+    pub(crate) fn joined(self, other: Self) -> Self {
+        Self {
+            index: self.index.max(other.index),
+            block: self.block.max(other.block),
+        }
+    }
+
     /// True when `bound` is at or above `self` in the index and in the
     /// block. The order of `RefMark` compares the index first, so it does
     /// not tell this.
@@ -113,10 +132,14 @@ impl RefMark {
     /// The highest reference of `frames`, in stream order from the block
     /// `next_block`. A record belongs to the block of the next boundary.
     /// `None` when no frame is a reference.
-    pub(crate) fn top(frames: &[Vec<u8>], next_block: u64) -> Option<Self> {
+    pub(crate) fn top<F: AsRef<[u8]>>(
+        frames: impl IntoIterator<Item = F>,
+        next_block: u64,
+    ) -> Option<Self> {
         frames
-            .iter()
+            .into_iter()
             .scan(next_block, |block, frame| {
+                let frame = frame.as_ref();
                 let mark = match Key::of(frame) {
                     Some(Key::Boundary(closed)) => {
                         // No chain reaches block `u64::MAX`, so the cap

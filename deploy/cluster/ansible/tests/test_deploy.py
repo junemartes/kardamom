@@ -20,6 +20,8 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import yaml
+
 ANSIBLE = Path(__file__).resolve().parents[1]
 SERVICES = ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher',
             'batcher', 'state-mirror', 'notifier', 'da-store', 'canary']
@@ -52,13 +54,13 @@ MEMBER_CARRY = {'decisionVersion': 5, 'retainedStore': 'heap', 'carryWindow': Fa
 FORMATS = (ANSIBLE.parents[2] / 'formats.toml').read_text()
 # The filter of the notifier node preflight, and its meaning on a node.
 # A Nomad 1.9 agent evaluates the filter on the whole node.
-NOTIFIER_NODE_FILTER = ('Meta.roles matches "(^|,) *notifier *(,|$)" and Status == "ready" '
-                        'and SchedulingEligibility == "eligible"')
+ROLE_NODE_FILTER = ('Meta.roles matches "(^|,) *{role} *(,|$)" and Status == "ready" '
+                    'and SchedulingEligibility == "eligible"')
 
 
-def notifier_node(node):
-    """Whether NOTIFIER_NODE_FILTER admits the node."""
-    return (re.search(r'(^|,) *notifier *(,|$)', node['Meta'].get('roles', '')) is not None
+def role_node(node, role):
+    """Whether ROLE_NODE_FILTER of `role` admits the node."""
+    return (re.search(rf'(^|,) *{role} *(,|$)', node['Meta'].get('roles', '')) is not None
             and node['Status'] == 'ready' and node['SchedulingEligibility'] == 'eligible')
 
 
@@ -274,11 +276,12 @@ class NomadAPI(BaseHTTPRequestHandler):
             self.respond({'ID': parts[3], 'Status': 'complete',
                           'DeploymentID': job if job in state['deployments'] else ''})
         elif parts[2] == 'nodes':
-            # The node list of the notifier preflight: the stubs of the
-            # nodes that the filter admits.
+            # The node list of the preflight of a moved role (the notifier,
+            # the egress): the stubs of the nodes that the filter admits.
             [query] = urllib.parse.parse_qs(self.path.split('?')[1])['filter']
-            assert query == NOTIFIER_NODE_FILTER, query
-            self.respond([{'Name': n['Name']} for n in state['nodes'] if notifier_node(n)])
+            role = re.search(r'\* *([a-z-]+) \*', query).group(1)
+            assert query == ROLE_NODE_FILTER.format(role=role), query
+            self.respond([{'Name': n['Name']} for n in state['nodes'] if role_node(n, role)])
         elif parts[2] == 'node':
             # Every node advertises an address of this fake API, so the
             # member status and the smoke target resolve back here. A
@@ -355,18 +358,26 @@ class NomadAPI(BaseHTTPRequestHandler):
         allocs = []
         job = state['jobs'][name]
         for group in job['TaskGroups']:
-            # The scheduler places a system group on the nodes its
-            # constraints admit; the playbook must not assume a node count.
-            count = 8 if job['Type'] == 'system' else group['Count']
+            # The scheduler places a system or sysbatch group on the nodes
+            # its constraints admit; the playbook must not assume a node count.
+            per_node = job['Type'] in ('system', 'sysbatch')
+            count = 8 if per_node else group['Count']
+            # A sysbatch allocation that ends well is complete; the others run.
+            done = 'complete' if job['Type'] == 'sysbatch' else 'running'
             for i in range(count):
                 # Historical/stopping allocations must not satisfy readiness.
                 stale = state.get('missing_replica') == name and i > 0
                 # A job the test names has no running allocation: a crash loop.
                 running = name not in state.get('not_running', ()) \
                     and group['Name'] not in state.get('down_groups', ())
+                # A node that the test takes down holds the first allocation
+                # of the job. Nomad stops the allocation of a down node and
+                # marks it lost.
+                lost = name in state.get('down_node_jobs', ()) and i == 0
                 # Each instance of a group has its own node.
                 allocs.append({'TaskGroup': group['Name'], 'JobVersion': self.version(name) - int(stale),
-                               'DesiredStatus': 'run', 'ClientStatus': 'running' if running else 'pending',
+                               'DesiredStatus': 'stop' if lost else 'run',
+                               'ClientStatus': 'lost' if lost else done if running else 'pending',
                                'NodeID': f'node-{group["Name"]}' + (f'.{i}' if i else ''),
                                'DeploymentStatus': {'Canary': False}})
         return allocs
@@ -429,7 +440,8 @@ class Deploys(unittest.TestCase):
         self.api.state = {'jobs': {}, 'writes': [], 'deployments': {}, 'roles': {},
                           'variables': {}, 'variable_writes': [], 'records': {}, 'record_index': {},
                           'record_writes': [],
-                          'nodes': [nomad_node('ingress-0', 'ingress,redis'), nomad_node('notifier-0', 'notifier'),
+                          'nodes': [nomad_node('ingress-0', 'ingress,redis'), nomad_node('egress-0', 'egress'),
+                                    nomad_node('egress-1', 'egress'), nomad_node('notifier-0', 'notifier'),
                                     nomad_node('notifier-1', 'notifier')]}
         self.record_dir = Path(self.tmp.name) / 'deployed'
         # The target tree: a git checkout with the formats.toml of this
@@ -440,17 +452,23 @@ class Deploys(unittest.TestCase):
         self.git('init', '-q')
         (self.repo / 'formats.toml').write_text(FORMATS)
         self.revision = self.commit('the release')
-        # One stub for each operator binary. The cluster binary smokes a
-        # canary and fails a `formats` call. The deploy binary prints the
-        # format findings of the release gate, which a test scripts in
-        # `deploy.sh.findings`. Each stub logs its calls in `<stub>.calls`.
-        self.smoke = Path(self.tmp.name) / 'smoke.sh'
-        self.smoke.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\n'
-                              'if [ "$1" = formats ]; then exit 1; fi\n')
-        self.smoke.chmod(0o755)
+        # One stub for each operator binary, so that a call to the wrong
+        # binary fails the deploy. A release ships only the deploy binary,
+        # so the cluster binary fails every call. The deploy binary prints
+        # the format findings of the release gate, which a test scripts in
+        # `deploy.sh.findings`, and smokes a canary; the smoke fails when
+        # `deploy.sh.smoke-fails` exists. It fails every other command.
+        # Each stub logs its calls in `<stub>.calls`.
+        self.cluster_bin = Path(self.tmp.name) / 'cluster.sh'
+        self.cluster_bin.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\nexit 1\n')
+        self.cluster_bin.chmod(0o755)
         self.deploy_bin = Path(self.tmp.name) / 'deploy.sh'
         self.deploy_bin.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\n'
-                                   'if [ "$1" = formats ]; then cat "$0.findings" 2>/dev/null || echo "[]"; fi\n')
+                                   'case "$1" in\n'
+                                   'formats) cat "$0.findings" 2>/dev/null || echo "[]" ;;\n'
+                                   'smoke) [ ! -e "$0.smoke-fails" ] ;;\n'
+                                   '*) exit 1 ;;\n'
+                                   'esac\n')
         self.deploy_bin.chmod(0o755)
         self.thread = threading.Thread(target=self.api.serve_forever, daemon=True)
         self.thread.start()
@@ -483,7 +501,7 @@ class Deploys(unittest.TestCase):
             'workloads_da_proxy_probe': False,
             'workloads_deployment_retries': 3,
             'workloads_record_dir': str(self.record_dir),
-            'workloads_cluster_binary': str(self.smoke),
+            'workloads_cluster_binary': str(self.cluster_bin),
             'workloads_deploy_binary': str(self.deploy_bin),
             'workloads_sealer_admin_port': self.api.server_port,
             'workloads_metrics_ports': dict.fromkeys(('executor', 'batcher', 'validator', 'egress'),
@@ -510,8 +528,9 @@ class Deploys(unittest.TestCase):
         return result.stdout
 
     # The jobs a manifest with new digests changes, in deploy order: every
-    # pinned image, and not anvil or the monitoring.
-    REPINNED = ['aeron', 'cluster', 'sequencer', 'redis', 'ingress', 'executor', 'state-mirror', 'notifier',
+    # pinned image, and not anvil or the monitoring. The data directory job
+    # runs the Aeron image of the manifest.
+    REPINNED = ['data-dirs', 'aeron', 'cluster', 'sequencer', 'redis', 'ingress', 'executor', 'state-mirror', 'notifier',
                 'validator', 'da-watcher', 'da-store', 'l1-indexer', 'batcher']
 
     def record(self):
@@ -606,7 +625,7 @@ class DeployTest(Deploys):
         local_canary = {'CANARY_LOCAL': '1'}
         self.run_deploy(environ=local_canary)
         self.assertIn('-Daeron.archive.file.sync.level=1', json.dumps(self.api.state['jobs']['aeron']))
-        expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
+        expected = ['data-dirs', 'aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
                     'da-store', 'l1-indexer', 'batcher', 'canary']
         self.assertEqual(self.api.state['writes'], expected)
@@ -647,7 +666,10 @@ class DeployTest(Deploys):
         self.assertEqual(sorted(self.api.state['variable_writes']),
                          ['nomad/jobs/batcher', 'nomad/jobs/canary', 'nomad/jobs/l1-indexer'])
         self.run_deploy(environ=local_canary)
-        self.assertEqual(self.api.state['writes'], expected, 'unchanged redeploy must not register jobs')
+        # An unchanged redeploy registers only the data directory job: each
+        # deploy gives it a new version, so it runs again on every node.
+        self.assertEqual(self.api.state['writes'], expected + ['data-dirs'],
+                         'unchanged redeploy must register no job but the data directories')
         self.assertEqual(len(self.api.state['variable_writes']), 3, 'unchanged redeploy must not write secrets')
 
     def test_the_local_profile_runs_no_canary_by_default(self):
@@ -1114,6 +1136,54 @@ class DeployTest(Deploys):
         self.assertIn('receipts_from_egress = true', self.job_templates(plans['sequencer']))
         self.assertIn('service "kardamom-egress-metrics|any"', self.job_templates(plans['monitoring']))
 
+    def test_the_egress_nodes_switch_moves_only_the_egress(self):
+        """Off, the egress places on the executor nodes. On, it places on
+        the nodes with egress in meta.roles, and its peers name the egress
+        nodes and the executor nodes, so a moved instance fills its store
+        from the one that did not move. No other job changes."""
+        self.add_egress_image()
+        # A new reader starts on the egress only while every egress
+        # instance holds no reference (gate 8b). So the egress runs first,
+        # and the readers are new jobs, as in the egress switch test.
+        readers = ('workloads_validator_egress', 'workloads_batcher_egress')
+        self.run_deploy({k: v for k, v in self.EGRESS_ON.items() if k not in readers})
+        for job in ('batcher', 'validator'):
+            del self.api.state['jobs'][job]
+        for node in ('node-egress', 'node-egress.1'):
+            self.api.state.setdefault('metrics', {})[node] = (
+                'kardamom_egress_ref_frame_max_index 0\nkardamom_egress_ref_frame_max_block 0\n')
+        plans = {}
+        cases = (
+            ({}, ('${meta.role}', '=', 'executor'), [f'executor-{i}' for i in range(3)]),
+            ({'KARDAMOM_EGRESS_NODES': 'on'}, ('${meta.roles}', 'set_contains', 'egress'),
+             ['egress-0', 'egress-1'] + [f'executor-{i}' for i in range(3)]),
+        )
+        for environ, constraint, peers in cases:
+            with self.subTest(environ=environ):
+                self.run_deploy(self.EGRESS_ON, check=True, environ=environ)
+                plans[bool(environ)] = self.api.state['plans']
+                egress = plans[bool(environ)]['egress']
+                [placed] = egress['Constraints']
+                self.assertEqual((placed['LTarget'], placed['Operand'], placed['RTarget']), constraint)
+                self.assertIn({'LTarget': '', 'RTarget': 'true', 'Operand': 'distinct_hosts'},
+                              egress['TaskGroups'][0]['Constraints'])
+                args = self.job_args(egress)
+                self.assertEqual(args[args.index('--peers') + 1],
+                                 ','.join(f'http://{n}.node.dc1.consul:8548' for n in peers))
+        self.assertEqual({n: j for n, j in plans[True].items() if n != 'egress'},
+                         {n: j for n, j in plans[False].items() if n != 'egress'})
+
+    def test_the_preflight_refuses_the_egress_nodes_switch_without_two_egress_nodes(self):
+        """With the switch on, each egress instance needs a ready, eligible
+        node with egress in meta.roles, before any job changes. Without the
+        egress (KARDAMOM_EGRESS empty) the switch counts no node."""
+        self.api.state['nodes'] = [nomad_node('egress-0', 'egress'), nomad_node('egress-1', 'egress', status='down')]
+        output = self.run_deploy(self.EGRESS_ON, check=True, success=False, environ={'KARDAMOM_EGRESS_NODES': 'on'})
+        self.assertIn("The egress count (2) is above the count of the ready, eligible Nomad nodes "
+                      "with egress in meta.roles (['egress-0'])", output)
+        self.assertNotIn('plans', self.api.state)
+        self.run_deploy(check=True, environ={'KARDAMOM_EGRESS_NODES': 'on'})
+
     def test_the_egress_switches_refuse_a_reader_before_its_source(self):
         cases = (
             ('a reader without the egress', {'workloads_validator_egress': 'on'}),
@@ -1194,7 +1264,10 @@ class DeployTest(Deploys):
         # so a step of the move holds the group of the executor nodes too.
         executor = plans['executor']
         self.assertIsNone(executor['Constraints'])
-        peers = ','.join(f'sealer-{i}.node.dc1.consul:9014' for i in range(3))
+        # The executor nodes stay peers: the first executor that moves has
+        # no state, and only the executors there hold a checkpoint.
+        peers = ','.join([f'sealer-{i}.node.dc1.consul:9014' for i in range(3)]
+                         + [f'executor-{i}.node.dc1.consul:9014' for i in range(3)])
         for i, group in enumerate(executor['TaskGroups']):
             self.assertEqual((group['Name'], group['Count']), (f'executor-{i}', 1))
             self.assertEqual(group['Constraints'],
@@ -1478,16 +1551,82 @@ class DeployTest(Deploys):
         self.run_deploy(success=False)
         self.assertNotIn('batcher', self.api.state['writes'])
 
+    def test_the_deploy_makes_every_data_directory_on_every_node_first(self):
+        self.run_deploy(environ={'CANARY_LOCAL': '1'})
+        self.assertEqual(self.api.state['writes'][0], 'data-dirs')
+        job = self.api.state['jobs']['data-dirs']
+        self.assertEqual((job['Type'], job['NodePool']), ('sysbatch', 'all'))
+        task = job['TaskGroups'][0]['Tasks'][0]
+        config = task['Config']
+        # The signed Aeron image of the manifest, as root: no other image.
+        self.assertEqual(config['image'], f'registry.example:5000/kardamom-aeron:test@sha256:{"a" * 64}')
+        self.assertEqual(task['User'], 'root')
+        self.assertEqual(config['volumes'], ['/opt/kardamom:/opt/kardamom'])
+        self.assertEqual(config['entrypoint'], ['/bin/sh', '-c', 'mkdir -p "$@" && chmod 0777 "$@"', 'data-dirs'])
+        dirs = config['args']
+        self.assertIn('/opt/kardamom/canary', dirs)
+        # One list: the common role makes the same directories.
+        group_vars = yaml.safe_load((ANSIBLE / 'group_vars/all.yml').read_text())
+        listed = [group_vars['paths'][re.fullmatch(r'\{\{ paths\.(\w+) \}\}', d).group(1)]
+                  for d in group_vars['node_data_dirs']['paths']]
+        self.assertEqual(dirs, listed)
+        common = yaml.safe_load((ANSIBLE / 'roles/common/tasks/main.yml').read_text())
+        task = next(t for t in common if t['name'] == 'Create on-node kardamom directories')
+        self.assertEqual((task['loop'], task['ansible.builtin.file']['mode']),
+                         ('{{ node_data_dirs.paths }}', '{{ node_data_dirs.mode }}'))
+        # Every host directory that a job mounts is in the list. The
+        # exceptions: the Aeron tmpfs, which the common role mounts, and the
+        # directories of the sealer, whose image runs as root.
+        exempt = {'/opt/kardamom/aeron-mount', '/opt/kardamom/cluster', '/opt/kardamom/seed'}
+        mounted = {volume.split(':')[0] for job in self.api.state['jobs'].values()
+                   for group in job['TaskGroups'] for task in group['Tasks']
+                   for volume in (task['Config'].get('volumes') or [])}
+        self.assertEqual({d for d in mounted if d.startswith('/opt/kardamom/')} - exempt - set(dirs), set())
+
+    def test_a_second_deploy_of_the_same_release_runs_the_data_directory_job_again(self):
+        # A sysbatch job runs once for each version, and Nomad can remove the
+        # allocations of the last run. So each deploy gives the job a new
+        # version, and the wait finds allocations of that version.
+        self.run_deploy()
+        first = self.api.state['jobs']['data-dirs']['Meta']['run']
+        self.api.state['writes'] = []
+        self.run_deploy()
+        self.assertEqual(self.api.state['writes'][0], 'data-dirs')
+        self.assertNotEqual(self.api.state['jobs']['data-dirs']['Meta']['run'], first)
+
+    def test_a_down_node_does_not_hold_the_data_directory_job(self):
+        self.api.state['down_node_jobs'] = ['data-dirs']
+        self.run_deploy()
+        self.assertEqual(self.api.state['writes'][:2], ['data-dirs', 'aeron'])
+
+    def test_an_incomplete_data_directory_job_stops_the_deploy_before_any_service(self):
+        self.api.state['not_running'] = ['data-dirs']
+        self.run_deploy(success=False)
+        self.assertEqual(self.api.state['writes'], ['data-dirs'])
+
+    def test_an_unhealthy_canary_job_fails_the_deploy(self):
+        self.api.state['deployments']['canary'] = Deployment('canary', ['running', 'failed'])
+        output = self.run_deploy(environ={'CANARY_LOCAL': '1'}, success=False)
+        self.assertIn('scripted failed', output)
+        self.assertEqual(self.api.state['writes'][-1], 'canary')
+        self.assertFalse((self.record_dir / 'images.digests').exists(), 'a failed deploy records nothing')
+
     def test_a_canary_is_smoked_by_its_node_then_promoted(self):
         self.api.state['deployments']['ingress'] = Deployment('ingress', [], canary=True)
         self.run_deploy()
         self.assertTrue(self.api.state['deployments']['ingress'].promoted)
-        calls = Path(str(self.smoke) + '.calls').read_text().splitlines()
-        self.assertEqual(calls, ['smoke --rpc http://127.0.0.1:8545'])
+        # The deploy binary of the release smokes the canary. The cluster
+        # binary, which no release ships, does not run.
+        calls = Path(str(self.deploy_bin) + '.calls').read_text().splitlines()
+        self.assertEqual(calls, ['smoke --rpc-url http://127.0.0.1:8545 --chain-id 412346'])
+        self.assertFalse(Path(str(self.cluster_bin) + '.calls').exists())
 
     def test_a_failed_smoke_leaves_the_canary_unpromoted(self):
         self.api.state['deployments']['sequencer'] = Deployment('sequencer', [], canary=True)
-        self.run_deploy({'workloads_cluster_binary': '/usr/bin/false'}, success=False)
+        Path(str(self.deploy_bin) + '.smoke-fails').touch()
+        self.run_deploy(success=False)
+        calls = Path(str(self.deploy_bin) + '.calls').read_text().splitlines()
+        self.assertEqual(calls, ['smoke --rpc-url http://127.0.0.1:8545 --chain-id 412346'])
         self.assertFalse(self.api.state['deployments']['sequencer'].promoted)
         self.assertNotIn('batcher', self.api.state['writes'])
 
@@ -1544,7 +1683,7 @@ class RecordTest(Deploys):
         self.run_deploy(success=False)
         attempt = self.record()['attempt']
         self.assertEqual(attempt['status'], 'started')
-        self.assertEqual(attempt['changed'], ['aeron', 'cluster', 'sequencer', 'redis', 'ingress'])
+        self.assertEqual(attempt['changed'], ['data-dirs', 'aeron', 'cluster', 'sequencer', 'redis', 'ingress'])
         self.assertEqual(self.record()['accepted'], accepted, 'a failed attempt is never the accepted release')
         self.assertEqual(json.loads((self.record_dir / 'accepted.json').read_text()), accepted)
         # The attempt is still started: it runs, or it died. Only the
@@ -1615,7 +1754,7 @@ class RecordTest(Deploys):
         self.assertEqual(self.api.state['writes'], [])
         self.api.state['chain_status'] = NO_QUORUM_CHAIN
         self.run_deploy()
-        self.assertEqual(self.api.state['writes'], ['cluster'], 'the sealer registers in one step')
+        self.assertEqual(self.api.state['writes'], ['data-dirs', 'cluster'], 'the sealer registers in one step')
 
     def test_a_missing_image_refuses_the_release(self):
         self.api.state['missing_images'] = {'kardamom-executor'}
@@ -1649,7 +1788,7 @@ class RecordTest(Deploys):
         # and this tree. The cluster binary did not run.
         calls = Path(str(self.deploy_bin) + '.calls').read_text().splitlines()
         self.assertEqual(calls, [f'formats --base {self.record_dir}/accepted.formats.toml --root {self.repo}'])
-        self.assertFalse(Path(str(self.smoke) + '.calls').exists())
+        self.assertFalse(Path(str(self.cluster_bin) + '.calls').exists())
 
     def test_a_retired_format_needs_the_allowance(self):
         self.gate_formats([{'rule': 'retired', 'id': 'notifier-outbox', 'head': 1, 'base': 1,
@@ -1706,7 +1845,7 @@ class RecordTest(Deploys):
         # A documented procedure names the settings it changes.
         # The batcher takes the same budget, so it rolls after the sealer.
         self.run_deploy({'workloads_da_lag_budget_blocks': '5000'}, environ={'KARDAMOM_ALLOW_MUST_MATCH': 'daLagBudgetBlocks'})
-        self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster', 'batcher'])
+        self.assertEqual(self.api.state['writes'], ['data-dirs', 'cluster', 'cluster', 'cluster', 'batcher'])
 
     def test_a_sealer_job_that_names_a_decision_version_rolls(self):
         """The job of the release before names decisionVersion; this release names none."""
@@ -1775,7 +1914,7 @@ class RecordTest(Deploys):
                                         self.manifest.read_text(), flags=re.M))
         output = self.run_deploy()
         self.assertIn('The sealer job does not change, so no sealer member restarts on the target release.', output)
-        self.assertEqual(self.api.state['writes'], ['executor'])
+        self.assertEqual(self.api.state['writes'], ['data-dirs', 'executor'])
 
     def test_a_new_sealer_cluster_skips_the_snapshot_check(self):
         self.target_snapshot_reads_max(16)
@@ -2021,7 +2160,7 @@ class RollbackTest(Deploys):
         reverted = [w for w in self.api.state['writes'] if w.startswith('revert:')]
         self.assertEqual(reverted, ['revert:da-watcher:0', 'revert:validator:0', 'revert:notifier:0', 'revert:state-mirror:0',
                                     'revert:executor:0', 'revert:ingress:0', 'revert:redis:0', 'revert:sequencer:0',
-                                    'revert:aeron:0'])
+                                    'revert:aeron:0', 'revert:data-dirs:0'])
         self.assertEqual(self.api.state['writes'].count('cluster'), 3)
         self.assertNotIn('revert:batcher:0', self.api.state['writes'], 'the failed attempt never reached the batcher')
         self.assertEqual(self.record()['accepted']['target']['manifest']['executor'],
@@ -2044,7 +2183,7 @@ class RollbackTest(Deploys):
         self.assertIn('ingress is at version 2, the pre-release definition', output)
         self.assertNotIn('revert:ingress:0', self.api.state['writes'])
         self.assertIn('revert:redis:0', self.api.state['writes'])
-        self.assertEqual(self.record()['attempt']['rolled_back'], ['ingress', 'redis', 'sequencer', 'cluster', 'aeron'])
+        self.assertEqual(self.record()['attempt']['rolled_back'], ['ingress', 'redis', 'sequencer', 'cluster', 'aeron', 'data-dirs'])
         self.assertEqual(self.record()['attempt']['status'], 'rolled_back')
 
     def test_a_rollback_that_stops_resumes_after_the_jobs_it_reverted(self):
@@ -2067,9 +2206,11 @@ class RollbackTest(Deploys):
         output = self.run_rollback()
         self.assertIn('executor is at version 2, the pre-release definition', output)
         self.assertEqual(self.api.state['writes'],
-                         ['revert:ingress:0', 'revert:redis:0', 'revert:sequencer:0', 'cluster', 'cluster', 'cluster', 'revert:aeron:0'])
+                         ['revert:ingress:0', 'revert:redis:0', 'revert:sequencer:0', 'cluster', 'cluster', 'cluster', 'revert:aeron:0',
+                          'revert:data-dirs:0'])
         self.assertEqual(self.record()['attempt']['status'], 'rolled_back')
-        self.assertEqual(self.record()['attempt']['rolled_back'], done + ['executor', 'ingress', 'redis', 'sequencer', 'cluster', 'aeron'])
+        self.assertEqual(self.record()['attempt']['rolled_back'],
+                         done + ['executor', 'ingress', 'redis', 'sequencer', 'cluster', 'aeron', 'data-dirs'])
 
     def test_a_rollback_does_not_cross_the_floor(self):
         self.gate_formats([{'rule': 'rollback', 'id': 'state-db', 'head': 4, 'base': 3}])
@@ -2194,7 +2335,7 @@ class SealerTest(Deploys):
 
     def test_the_sealer_rolls_followers_first_and_the_leader_last(self):
         groups = self.sealer_roll(leader=1)
-        self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster'])
+        self.assertEqual(self.api.state['writes'], ['data-dirs', 'cluster', 'cluster', 'cluster'])
         self.assertEqual(sorted(groups), ['cluster-0', 'cluster-1', 'cluster-2'])
         # Every step holds the current definition of the members not rolled
         # yet, so the retention reaches the groups in the roll order.
@@ -2221,7 +2362,7 @@ class SealerTest(Deploys):
         self.api.state['deployments']['cluster'] = Deployment('cluster', ['successful'])
         self.api.state['writes'] = []
         self.run_deploy({'workloads_cluster_bootstrap': True, 'workloads_cluster_retention': '131072'})
-        self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster'])
+        self.assertEqual(self.api.state['writes'], ['data-dirs', 'cluster', 'cluster', 'cluster'])
 
     def test_a_failed_bootstrap_closes_the_bootstrap(self):
         self.api.state['deployments']['cluster'] = Deployment('cluster', ['failed'])
