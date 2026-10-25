@@ -87,16 +87,14 @@ impl FrameOffer for TxEventsPublisherHandle {
     }
 }
 
-/// The frames of one publisher of `tx_events`: one frame for each kind
-/// that it publishes. An append copies the record into the frame. A frame
+/// The frames of one publisher of `tx_events`: one frame for each kind. An append copies the record into the frame. A frame
 /// goes out when it is full, or at the first [`Self::flush_due`] after it
 /// is [`FRAME_MAX_AGE`] old. The sink never waits: a refused offer drops
 /// the frame (see [`TxEventsPublisherHandle::publish_lossy`]).
 pub struct TxEventsSink<P = TxEventsPublisherHandle> {
     publisher: P,
-    /// Indexed by the code of the kind. A kind that this publisher does not
-    /// publish has no frame.
-    frames: [Option<PendingFrame>; 3],
+    /// One frame for each kind, in the order of [`TxEventKind::ALL`].
+    frames: [PendingFrame; TxEventKind::ALL.len()],
 }
 
 /// One frame of a sink, and the time of its first record.
@@ -106,18 +104,17 @@ struct PendingFrame {
 }
 
 impl<P: FrameOffer> TxEventsSink<P> {
-    /// A sink for `origin` with one frame for each of `kinds`. The frames
-    /// are allocated here, once.
+    /// A sink for `origin` with one frame for each kind. The frames are
+    /// allocated here, once: about 66 KB.
     #[must_use]
-    pub fn new(publisher: P, origin: u16, kinds: &[TxEventKind]) -> Self {
-        let mut frames: [Option<PendingFrame>; 3] = Default::default();
-        for &kind in kinds {
-            frames[kind as usize] = Some(PendingFrame {
+    pub fn new(publisher: P, origin: u16) -> Self {
+        Self {
+            publisher,
+            frames: TxEventKind::ALL.map(|kind| PendingFrame {
                 frame: TxEventsFrame::new(kind, origin),
                 since: None,
-            });
+            }),
         }
-        Self { publisher, frames }
     }
 
     /// Append an `accepted` record.
@@ -133,14 +130,13 @@ impl<P: FrameOffer> TxEventsSink<P> {
     /// Send each frame that is [`FRAME_MAX_AGE`] old. A sink with no
     /// record reads no clock.
     pub fn flush_due(&mut self) {
-        if self.frames.iter().flatten().all(|p| p.since.is_none()) {
+        if self.frames.iter().all(|p| p.since.is_none()) {
             return;
         }
         let now = Instant::now();
         let publisher = &self.publisher;
         self.frames
             .iter_mut()
-            .flatten()
             .filter(|p| {
                 p.since
                     .is_some_and(|since| now.duration_since(since) >= FRAME_MAX_AGE)
@@ -153,17 +149,13 @@ impl<P: FrameOffer> TxEventsSink<P> {
         let publisher = &self.publisher;
         self.frames
             .iter_mut()
-            .flatten()
             .filter(|p| !p.frame.is_empty())
             .for_each(|p| p.send(publisher));
     }
 
-    /// Append one record with `push`. The frame of `kind` exists: each
-    /// publisher appends only the kinds that it named at `new`.
+    /// Append one record to the frame of `kind` with `push`.
     fn append(&mut self, kind: TxEventKind, push: impl FnOnce(&mut TxEventsFrame) -> bool) {
-        let Some(pending) = self.frames[kind as usize].as_mut() else {
-            return;
-        };
+        let pending = &mut self.frames[kind.index()];
         pending.since.get_or_insert_with(Instant::now);
         if push(&mut pending.frame) {
             pending.send(&self.publisher);
