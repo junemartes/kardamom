@@ -16,6 +16,7 @@ pub(crate) struct MemoryTransport {
     /// The id of the connection, 0 while disconnected. Shared with the
     /// remote side. The transport must be `Send`, so the id is atomic.
     connection: Arc<AtomicU64>,
+    lossy: bool,
 }
 
 /// The test's side of an in-memory source: it sends frames, reads the
@@ -41,6 +42,7 @@ impl MemoryTransport {
                 frames: frames_rx,
                 requests: requests_tx,
                 connection: Arc::clone(&connection),
+                lossy: false,
             },
             MemoryRemote {
                 frames: frames_tx,
@@ -49,6 +51,12 @@ impl MemoryTransport {
                 last: Arc::new(AtomicU64::new(1)),
             },
         )
+    }
+
+    /// The same source, lossy as the egress when `lossy` holds.
+    #[must_use]
+    pub(crate) fn with_lossy(self, lossy: bool) -> Self {
+        Self { lossy, ..self }
     }
 }
 
@@ -121,5 +129,9 @@ impl Transport for MemoryTransport {
 
     fn close(&mut self) {
         self.frames.try_iter().for_each(|_| ());
+    }
+
+    fn lossy(&self) -> bool {
+        self.lossy
     }
 }

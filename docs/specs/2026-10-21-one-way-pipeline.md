@@ -1,15 +1,21 @@
 # The one-way pipeline
 
 - Status: decided by the user on 2026-10-21. Not implemented yet (section 9).
-- Amended by the user on 2026-10-25: decisions 45 to 52 (D12 to D19), in the section "Amendment
+- Amended by the user on 2026-10-25: decisions 45 to 54 (D12 to D21), in the section "Amendment
   of 2026-10-25". Where the amendment and the older text differ, the amendment wins. The older
   text stays, marked "superseded by decision N (2026-10-25)".
 - Issues: refs #582, #585, #706, #709, #712.
 - Amends `docs/specs/2026-10-10-raft-carried-transactions.md` (the carry spec). Section 16 of the
-  carry spec lists these decisions as decisions 34 to 43. D11 is decision 44, and D12 to D19 are
-  decisions 45 to 52. Where this spec and the carry spec differ, this spec wins.
+  carry spec lists these decisions as decisions 34 to 43. D11 is decision 44, and D12 to D21 are
+  decisions 45 to 54. Where this spec and the carry spec differ, this spec wins.
 - Amends the design comments of #585 (the serving service, called the egress here) and #706 (the
   sequencer gateway).
+- Status update (2026-10-25). The body of this spec does not show these changes:
+  - P1 to P12 and P14 are done. Feature 4 is active on staging since 2026-10-21. P13 (the
+    cleanup, #599) waits until feature 4 and feature 5 are active on every network.
+  - Sections 1 and 6.4: the egress will send its stored head to the sealer (ingress kind 12), and
+    the Raft-log purge floor will follow it (owner decision of 2026-10-24, #639). The egress keeps
+    its order from the executors (D6).
 
 ## Amendment of 2026-10-25
 
@@ -371,6 +377,8 @@ client ─TLS─▶ LB ─HTTP (sends)─▶ ingress ─▶ sequencer ─▶ sea
 | D10 | The feature id of the carry flag is 4, not 3. `FEATURE_SEALER_V4` took id 3 (#699). The carry flag needs decision version 4 active. |
 | D11 | The sealer keeps only a small replay window. It sends the order to its paired executor on the member feed. A reader that falls below the window, an executor too, recovers from the range read of the egress. The egress, not the sealer, holds the blocks above the posted head (the user, 2026-10-23; section 6.4). This is decision 44 of the carry spec. |
 | D12 to D19 | Decisions 45 to 52 of 2026-10-25: the receipts only from the egress (D12), every read on the egress (D13), `ack=validated` only (D14), no refusal kinds (D15), the DA-lag bound by back-pressure (D16), no `tx_errors` and `tx_verdicts` (D17), carry as the only mode after the staging activation (D18), and a carry-born chain in the target mode from block 1 (D19). See the section "Amendment of 2026-10-25". |
+| D20 | Decision 53: the sequencer reads only the egress, including account lookups and state. |
+| D21 | Decision 54: separate sealer and sequencer feature flags allow each service to switch independently. |
 
 The carry spec decisions that change:
 

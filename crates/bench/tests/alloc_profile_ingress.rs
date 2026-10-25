@@ -284,3 +284,43 @@ fn ingress_submission_allocation_profile() {
     }
     let _ = std::fs::rename("dhat-heap.json", "dhat-heap-ingress.json");
 }
+
+/// An offer that only reads the frame.
+struct NoOffer;
+
+impl kardamom_log::aeron_live::FrameOffer for NoOffer {
+    fn offer_frame(&self, frame: &[u8]) {
+        std::hint::black_box(frame);
+    }
+}
+
+/// `KARDAMOM_TX_EVENTS=on` adds no allocation for each transaction on the
+/// ingress: the request task queues 32 bytes into a queue allocated at
+/// the start, and the drain copies them into a frame allocated at the
+/// start (docs/specs/2026-10-25-client-events.md, 4.8). The live offer
+/// then copies each frame once, at most 1,000 frames a second.
+#[test]
+fn accepted_records_allocate_nothing_for_each_transaction() {
+    use kardamom_ingress::tx_events::AcceptedQueue;
+    use kardamom_log::aeron_live::TxEventsSink;
+    const TXS: u64 = 50_000;
+    let queue = AcceptedQueue::new(0);
+    let mut sink = TxEventsSink::new(NoOffer, 0);
+    let hashes: Vec<B256> = (0..TXS).map(|i| keccak256(i.to_le_bytes())).collect();
+    let profiler = dhat::Profiler::builder().testing().build();
+    let before = dhat::HeapStats::get().total_blocks;
+    // The drain task takes the queue each 1 ms: here, after each 1,000
+    // submits.
+    for (i, hash) in hashes.iter().enumerate() {
+        queue.note(*hash);
+        if i % 1_000 == 999 {
+            queue.drain_into(&mut sink);
+        }
+    }
+    let blocks = dhat::HeapStats::get().total_blocks - before;
+    drop(profiler);
+    assert_eq!(
+        blocks, 0,
+        "{TXS} accepted records allocated {blocks} blocks"
+    );
+}

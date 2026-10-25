@@ -29,6 +29,17 @@ variable "ack_policy" {
   default     = "on-offer"
 }
 
+# The tx_events stream (docs/specs/2026-10-25-client-events.md), "on" or
+# "off". On, the job publishes its client stage records on tx_events, best
+# effort. Ansible deployment passes -var from KARDAMOM_TX_EVENTS.
+variable "tx_events" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.tx_events)
+    error_message = "The tx_events value must be on or off."
+  }
+}
 variable "ack" {
   type        = string
   description = "When eth_sendRawTransaction answers. receipt (the default) waits for the receipt. validated answers when the ingress validated the transaction and published it on tx_data. Override with: nomad job run -var ack=validated ingress.nomad.hcl."
@@ -48,6 +59,20 @@ variable "ack" {
 # `nomad job run` during debugging, not a production path. A mutable
 # tag lets anyone with registry push access change what the next
 # restart runs.
+
+# The executors on the sealer nodes, "on" or "off" (executor.nomad.hcl).
+# On, the executors run on the sealer nodes, so the executor queries go
+# to sealer-<i>, not to executor-<i>. The deploy passes it from
+# KARDAMOM_EXEC_ON_SEALERS.
+variable "exec_on_sealers" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.exec_on_sealers)
+    error_message = "The exec_on_sealers value must be on or off."
+  }
+}
+
 variable "executor_count" {
   type        = number
   description = "The executor node count (node_classes.executor.count). The account RPCs' executor queries go to executor-<i>.node.<datacenter>.consul."
@@ -310,9 +335,10 @@ job "ingress" {
           # eth_getBalance and eth_getTransactionCount ask one executor
           # when the local account layer misses. Never on the submit
           # path. Same list as the sequencer's nonce lookup.
-          "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:9024"]),
+          "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://${var.exec_on_sealers == "on" ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:9024"]),
           ],
           var.receipt_query_endpoints == "" ? [] : ["--receipt-query-endpoints", var.receipt_query_endpoints],
+          var.tx_events == "off" ? [] : ["--tx-events", var.tx_events],
         )
       }
 

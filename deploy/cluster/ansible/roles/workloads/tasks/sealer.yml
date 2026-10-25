@@ -89,11 +89,17 @@
     - not ansible_check_mode
 
 - name: Roll the sealer one member at a time
-  ansible.builtin.include_tasks: sealer_step.yml
+  ansible.builtin.include_tasks: roll_step.yml
   loop: "{{ workloads_sealer_order | default([]) }}"
   loop_control:
-    loop_var: workloads_sealer_group
-    index_var: workloads_sealer_index
+    loop_var: workloads_roll_group
+    index_var: workloads_roll_index
+  vars:
+    workloads_roll_job: cluster
+    workloads_roll_new: "{{ workloads_sealer_new }}"
+    workloads_roll_current: "{{ workloads_sealer_current }}"
+    workloads_roll_order: "{{ workloads_sealer_order }}"
+    workloads_roll_spec: "{{ workloads_sealer_job }}"
   when:
     - workloads_sealer_staged | bool
     - not ansible_check_mode

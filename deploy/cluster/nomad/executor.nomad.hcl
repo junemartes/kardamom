@@ -143,9 +143,91 @@ variable "checkpoint_log" {
   }
 }
 
+# The executors on the sealer nodes, "on" or "off". On, executor <i>
+# runs on sealer-<i>, the node of member i, in its own group. Off, the
+# executors run on the executor nodes. The deploy passes it from
+# KARDAMOM_EXEC_ON_SEALERS.
+variable "exec_on_sealers" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.exec_on_sealers)
+    error_message = "The exec_on_sealers value must be on or off."
+  }
+}
+
+variable "sealer_count" {
+  type        = number
+  description = "The sealer node count (node_classes.sealer.count). With exec_on_sealers, executor <i> runs on sealer-<i>."
+  default     = 3
+}
+
+# The executors that run in carry mode (--carry-bytes): a comma-separated
+# list of member indexes, such as "0,1". Empty: none. Each listed executor
+# reads the canonical entries with their bytes from the member feed of its
+# node, then the egress (--egress). It needs exec_on_sealers. The deploy
+# passes it from KARDAMOM_CARRY_EXECUTORS.
+variable "carry_executors" {
+  type    = string
+  default = ""
+}
+
+# The egress base URL (--egress) of the carry executors. A carry executor
+# reads a cursor below the replay window of its member from the egress.
+variable "egress_url" {
+  type    = string
+  default = ""
+}
+
 variable "executor_query_port" {
   type    = number
   default = 9024
+}
+
+# The executor groups. Off: one group of three replicas on the executor
+# nodes, spread by distinct_hosts. Each replica takes its allocation index
+# as its id. On: one group for each sealer member. Group executor-<i>
+# runs on sealer-<i>, the node of member i, with the same placement as
+# group cluster-<i> of the sealer job. The member feed is an IPC stream on
+# the shared media driver of that node (stream 1006). Only that member
+# publishes on that driver, so the node names the pair: the executor takes
+# no member id. Its id is the member index i.
+#
+# The role constraint of a pinned group is in the group, not in the job.
+# So during the staged move (tasks/executor.yml) a step can hold the
+# group of the executor nodes and the pinned groups in one job.
+locals {
+  on_sealers = var.exec_on_sealers == "on"
+  carry_ids  = split(",", var.carry_executors)
+  executor_groups = local.on_sealers ? [
+    for i in range(var.sealer_count) : {
+      label = "executor-${i}"
+      count = 1
+      id    = format("%d", i)
+      carry = contains(local.carry_ids, format("%d", i))
+      constraints = [
+        { attribute = "${meta.node_index}", operator = "=", value = format("%d", i) },
+        { attribute = "${meta.role}", operator = "=", value = "sealer" },
+      ]
+    }
+    ] : [{
+      label       = "executor"
+      count       = 3
+      id          = "${NOMAD_ALLOC_INDEX}"
+      carry       = false
+      constraints = [{ attribute = "", operator = "distinct_hosts", value = "true" }]
+  }]
+  # The nodes of the checkpoint peers: the nodes that run the executors.
+  # On the sealer nodes, the list also names the executor nodes. The first
+  # executor of the staged move starts with no state, and only the
+  # executors on the executor nodes hold a checkpoint then. A fetch skips
+  # a peer that does not answer.
+  checkpoint_peers = join(",", concat(
+    local.on_sealers ? [
+      for i in range(var.sealer_count) : "sealer-${i}.node.${var.datacenter}.consul:9014"
+    ] : [],
+    [for i in range(var.executor_count) : "executor-${i}.node.${var.datacenter}.consul:9014"],
+  ))
 }
 
 job "executor" {
@@ -161,259 +243,281 @@ job "executor" {
   # (`just sealer-upgrade-check <env>`) reads these metas. The executor of
   # this release runs a full reference that a sealer below decision
   # version 5 relays as is (relayed_full_ref). An older executor drops that
-  # frame and stops at the gap.
+  # frame and stops at the gap. A carry executor of this release stops
+  # with an error when every source gives a reference that it cannot
+  # join (carried_ref_fault). The deploy reads this meta before it lists
+  # an executor in KARDAMOM_CARRY_EXECUTORS.
   meta {
     nonce_burn          = "true"
     chain_state_install = "true"
     first_receipt       = "true"
     relayed_full_ref    = "true"
+    carried_ref_fault   = "true"
   }
 
   datacenters = [var.datacenter]
   type        = "service"
 
-  constraint {
-    attribute = "${meta.role}"
-    value     = "executor"
+  dynamic "constraint" {
+    for_each = local.on_sealers ? [] : ["executor"]
+    content {
+      attribute = "${meta.role}"
+      value     = constraint.value
+    }
   }
 
-  group "executor" {
-    # Run one executor per executor-class node: 3-way redundant state
-    # machines, each with a co-located recorder. distinct_hosts spreads
-    # them across the nodes.
-    count = 3
-    constraint {
-      operator = "distinct_hosts"
-      value    = "true"
-    }
-
-    # Resilience (chaos tests): restart a crashed task on the same
-    # node, which resumes from persistent /opt/kardamom/state. On node
-    # loss, reschedule onto a healthy node; a fresh node replays the
-    # canonical order from genesis, which is fine for a redundant
-    # state machine. With 3 executor-role nodes and distinct_hosts, a
-    # lost replica reschedules to a spare node if one exists, or
-    # degrades to 2.
-    restart {
-      attempts = 3
-      interval = "1m"
-      delay    = "5s"
-      mode     = "delay"
-    }
-
-    reschedule {
-      delay          = "10s"
-      delay_function = "exponential"
-      max_delay      = "1m"
-      unlimited      = true
-    }
-
-    # One replica at a time, healthy by its /ready check: the applied
-    # block is within the lag budget of the sealer's head, so a restarted
-    # replica has caught up before the next one stops. No revert: a
-    # replica carries its state, and the role's rollback is the path.
-    update {
-      max_parallel      = 1
-      health_check      = "checks"
-      min_healthy_time  = "15s"
-      healthy_deadline  = "5m"
-      progress_deadline = "10m"
-      auto_revert       = false
-    }
-
-    network {
-      mode = "host"
-      # The exporter, as a Consul service: the /ready check reads it.
-      port "metrics" {
-        static = 9004
-      }
-      # The cluster egress (response) port, unique per allocation. A
-      # fixed port sat in the node's ephemeral range, where the shared
-      # media driver's port-0 discovery sockets could take it first.
-      port "egress" {}
-      # The join-miss refetch ports: replayed fragments and archive
-      # control responses. Nomad picks them per allocation, below the
-      # ephemeral range, so no other process on the node holds them.
-      port "replay" {}
-      port "archive_response" {}
-    }
-
-    task "executor" {
-      driver = "docker"
-
-      # The graceful stop. The run first syncs the receipt ledger and
-      # removes the running marker, then it waits for the checkpoint task.
-      # So a kill after the first step costs no rollback. This gives the
-      # checkpoint round in progress time to end.
-      kill_timeout = "30s"
-
-      # BAL granularity measurement (spec phase 1). This logs
-      # per-block encoded sizes at each K, so the batch size can be
-      # chosen from data. This stays unset in normal operation, and is
-      # harmless (log-only) when set.
-      env {
-        # The service identity on the metrics (host_id) and on the events
-        # stream (instance). Each instance must have its own, or the
-        # events of two instances merge into one state.
-        KARDAMOM_HOST_ID = "executor-${NOMAD_ALLOC_INDEX}"
-        # The Aeron C client reads its driver timeout from this variable,
-        # and the service code never overrides it.
-        AERON_DRIVER_TIMEOUT = var.aeron_stall_tolerance_ms
-        # The idle cap of the hot-path poll loops (kardamom_log IdleCap).
-        KARDAMOM_IDLE_CAP_US = var.idle_cap_us
-        # BAL attribution granularity. K=20 measured a 31% reduction
-        # in frame bytes on contract workloads
-        # (docs/agents/2026-08-01-bal-phase1-measurement and the DeFi
-        # run), at zero parallelism cost under seeded execution.
-        KARDAMOM_BAL_GRANULARITY = "20"
-        # The recorded cursor to the sealer, under the void voter id.
-        KARDAMOM_EXEC_CURSOR = var.exec_cursor == "on" ? "true" : "false"
-        # The block log of the checkpoints.
-        KARDAMOM_CHECKPOINT_LOG = var.checkpoint_log == "on" ? "true" : "false"
-        # KARDAMOM_BAL_MEASURE stays unset in deployed profiles. The
-        # K-ladder measure mode re-encodes every frame 4 times, on the
-        # publisher thread. Under DeFi loads, that saturated the
-        # publisher, filled the bounded exec-to-publisher handoff, and
-        # back-pressured the exec thread into 10-15s stalls.
-      }
-
-      config {
-        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-executor:dev"
-        # force_pull stays on for both paths; see the ingress job's
-        # comment. The :dev fallback needs it. On the pinned path, the
-        # 1.9.5 driver pulls the tag but resolves the image by digest,
-        # so the pin holds.
-        force_pull = true
-        # Read-only rootfs. The executor's
-        # writable surfaces are state, checkpoints, and the aeron
-        # directory. All are explicit bind mounts below, plus Nomad's
-        # alloc, local, and secrets mounts. cluster-e2e validates
-        # this.
-        readonly_rootfs = true
-        network_mode    = "host"
-        volumes = [
-          "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
-          "/opt/kardamom/state:/opt/kardamom/state",
-          # Periodic state checkpoints, for fast cold-start recovery.
-          # This path stays distinct from state_dir, so a state-DB
-          # wipe can recover from a checkpoint here, or from a peer
-          # executor's, re-replicated in.
-          "/opt/kardamom/checkpoints:/opt/kardamom/checkpoints",
-        ]
-        args = concat([
-          "--config", "/local/executor.toml",
-          "--log-config", "/local/channels.toml",
-          "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
-          # This replica's index selects its per-replica tx_receipts
-          # MDS endpoint (channels.toml tx_receipts_endpoint_base_port
-          # plus index). The job is count-based with distinct_hosts,
-          # so ${NOMAD_ALLOC_INDEX} stays stable at 0 through N, and
-          # matches the co-located recorder's id.
-          "--recorder-id", "${NOMAD_ALLOC_INDEX}",
-          # The void voter id: the same stable index. The sealer's voter
-          # list (cluster.nomad.hcl) names every executor index.
-          "--void-voter-id", "${NOMAD_ALLOC_INDEX}",
-          # Cluster mode only: this allocation's cluster-egress
-          # (response) endpoint. The cluster client's egress_channel is
-          # per allocation (the node IP and the dynamic port are known
-          # only at placement), so it is injected here instead of baked
-          # into config/executor.toml.
-          "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
-          "--chain-id", "412346",
-          "--chain", "/local/genesis.toml",
-          # Join-miss archive refetch (tx_data and tx_deposits). When
-          # the live multicast misses a canonical ref's envelope
-          # (down-window, image lapse, blackout), it replays in-band
-          # from the durability archives listed in channels.toml
-          # (ingress .31/.32; aux .61). Replayed fragments and
-          # archive-control responses land on this node's cluster NIC
-          # (${meta.node_ip}), on the allocation's dynamic ports.
-          # tx_ordering recovery goes through the Aeron Cluster
-          # client's REPLAY_FROM.
-          "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
-          "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
-          # Fast cold-start recovery: restore the newest checkpoint
-          # into a wiped or empty state_dir before startup, replaying
-          # only the tail, not from genesis. Write a checkpoint every
-          # 20s as the chain advances.
-          "--checkpoint-dir", "/opt/kardamom/checkpoints",
-          "--checkpoint-interval-secs", "20",
-          # Peer checkpoint exchange, a full-resync fallback. Each
-          # replica serves its newest checkpoint on 9014, and can
-          # fetch one from the others. A node whose replay cursor, or
-          # genesis join, fell below the cluster's bounded retention
-          # floor gets REPLAY_UNAVAILABLE, and can only be repaired
-          # with peer state. Deterministic replicas make any peer's
-          # checkpoint a valid restore source. Including self in the
-          # peer list is harmless; its own checkpoint never satisfies
-          # the floor.
-          "--checkpoint-serve-addr", "${meta.node_ip}:9014",
-          # The account nonce query for the sequencers
-          # (ports.executor_nonce_query in group_vars/all.yml).
-          "--nonce-query-addr", "${meta.node_ip}:${var.executor_query_port}",
-          "--checkpoint-peers", join(",", [for i in range(var.executor_count) : "executor-${i}.node.${var.datacenter}.consul:9014"]),
-          # Bind the Prometheus exporter on all interfaces; the
-          # default is loopback. The chaos suite probes it directly
-          # over the cluster bridge (http://<node_ip>:9004/metrics),
-          # which keeps dockerd out of the observation path. A docker
-          # kill of a privileged sibling node can stall docker exec
-          # runner-wide for minutes, which reads as "block 0 -> 0"
-          # while executors were healthy. The bridge is the isolated
-          # cluster network; loopback scrapes (docker exec
-          # curl 127.0.0.1:9004) keep working too.
-          "--metrics-addr", "0.0.0.0:9004",
-          ],
-          var.exec_frames == "on" ? ["--exec-frames"] : [],
-        )
-      }
-
-      # Cluster LogConfig (UDP multicast channels), read through
-      # --log-config.
-      template {
-        destination = "local/channels.toml"
-        data        = file("config/channels.toml.tpl")
-        # The template reads the archive records from Consul. A change
-        # there re-renders the file; the process reads it once at start
-        # and follows the catalog through discovery, so never restart.
-        change_mode = "noop"
-      }
-
-      # Presence-checked config. Content lives in config/executor.toml.
-      template {
-        destination = "local/executor.toml"
-        data        = file("config/executor.toml")
-      }
-
-      # The chain genesis comes from one source, config/genesis/dev.toml.
-      # It prefunds Anvil accounts #0 through #15 with 1000 ETH each,
-      # plus the ERC-7955 factory predeploy. The local canary's accounts
-      # and, with priority fees on, the fee schedule fragment follow it;
-      # the validator renders the same.
-      template {
-        destination = "local/genesis.toml"
-        data = join("\n", concat(
-          [file("config/genesis/dev.toml")],
-          var.canary_genesis == "on" ? [file("config/genesis/canary.toml")] : [],
-          var.priority_fees == "on" ? [file("config/genesis/fees.toml")] : [],
-        ))
-      }
-
-      service {
-        name     = "kardamom-executor"
-        port     = "metrics"
-        provider = "consul"
-        tags     = ["metrics"]
-        check {
-          type     = "http"
-          path     = "/ready"
-          interval = "10s"
-          timeout  = "2s"
+  dynamic "group" {
+    for_each = local.executor_groups
+    labels   = [group.value.label]
+    content {
+      # 3-way redundant state machines, each with a co-located recorder.
+      # See local.executor_groups for the placement.
+      count = group.value.count
+      dynamic "constraint" {
+        for_each = group.value.constraints
+        content {
+          attribute = constraint.value.attribute
+          operator  = constraint.value.operator
+          value     = constraint.value.value
         }
       }
 
-      resources {
-        cpu    = 1000
-        memory = 1536
+      # Resilience (chaos tests): restart a crashed task on the same
+      # node, which resumes from persistent /opt/kardamom/state. On node
+      # loss, reschedule onto a healthy node; a fresh node replays the
+      # canonical order from genesis, which is fine for a redundant
+      # state machine. With 3 executor-role nodes and distinct_hosts, a
+      # lost replica reschedules to a spare node if one exists, or
+      # degrades to 2. On the sealer nodes a group has one node, so a lost
+      # replica waits for that node.
+      restart {
+        attempts = 3
+        interval = "1m"
+        delay    = "5s"
+        mode     = "delay"
+      }
+
+      reschedule {
+        delay          = "10s"
+        delay_function = "exponential"
+        max_delay      = "1m"
+        unlimited      = true
+      }
+
+      # One replica at a time, healthy by its /ready check: the applied
+      # block is within the lag budget of the sealer's head, so a restarted
+      # replica has caught up before the next one stops. No revert: a
+      # replica carries its state, and the role's rollback is the path.
+      update {
+        max_parallel      = 1
+        health_check      = "checks"
+        min_healthy_time  = "15s"
+        healthy_deadline  = "5m"
+        progress_deadline = "10m"
+        auto_revert       = false
+      }
+
+      network {
+        mode = "host"
+        # The exporter, as a Consul service: the /ready check reads it.
+        port "metrics" {
+          static = 9004
+        }
+        # The cluster egress (response) port, unique per allocation. A
+        # fixed port sat in the node's ephemeral range, where the shared
+        # media driver's port-0 discovery sockets could take it first.
+        port "egress" {}
+        # The join-miss refetch ports: replayed fragments and archive
+        # control responses. Nomad picks them per allocation, below the
+        # ephemeral range, so no other process on the node holds them.
+        port "replay" {}
+        port "archive_response" {}
+      }
+
+      task "executor" {
+        driver = "docker"
+
+        # The graceful stop. The run first syncs the receipt ledger and
+        # removes the running marker, then it waits for the checkpoint task.
+        # So a kill after the first step costs no rollback. This gives the
+        # checkpoint round in progress time to end.
+        kill_timeout = "30s"
+
+        # BAL granularity measurement (spec phase 1). This logs
+        # per-block encoded sizes at each K, so the batch size can be
+        # chosen from data. This stays unset in normal operation, and is
+        # harmless (log-only) when set.
+        env {
+          # The service identity on the metrics (host_id) and on the events
+          # stream (instance). Each instance must have its own, or the
+          # events of two instances merge into one state.
+          KARDAMOM_HOST_ID = "executor-${group.value.id}"
+          # The Aeron C client reads its driver timeout from this variable,
+          # and the service code never overrides it.
+          AERON_DRIVER_TIMEOUT = var.aeron_stall_tolerance_ms
+          # The idle cap of the hot-path poll loops (kardamom_log IdleCap).
+          KARDAMOM_IDLE_CAP_US = var.idle_cap_us
+          # BAL attribution granularity. K=20 measured a 31% reduction
+          # in frame bytes on contract workloads
+          # (docs/agents/2026-08-01-bal-phase1-measurement and the DeFi
+          # run), at zero parallelism cost under seeded execution.
+          KARDAMOM_BAL_GRANULARITY = "20"
+          # The recorded cursor to the sealer, under the void voter id.
+          KARDAMOM_EXEC_CURSOR = var.exec_cursor == "on" ? "true" : "false"
+          # The block log of the checkpoints.
+          KARDAMOM_CHECKPOINT_LOG = var.checkpoint_log == "on" ? "true" : "false"
+          # KARDAMOM_BAL_MEASURE stays unset in deployed profiles. The
+          # K-ladder measure mode re-encodes every frame 4 times, on the
+          # publisher thread. Under DeFi loads, that saturated the
+          # publisher, filled the bounded exec-to-publisher handoff, and
+          # back-pressured the exec thread into 10-15s stalls.
+        }
+
+        config {
+          image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-executor:dev"
+          # force_pull stays on for both paths; see the ingress job's
+          # comment. The :dev fallback needs it. On the pinned path, the
+          # 1.9.5 driver pulls the tag but resolves the image by digest,
+          # so the pin holds.
+          force_pull = true
+          # Read-only rootfs. The executor's
+          # writable surfaces are state, checkpoints, and the aeron
+          # directory. All are explicit bind mounts below, plus Nomad's
+          # alloc, local, and secrets mounts. cluster-e2e validates
+          # this.
+          readonly_rootfs = true
+          network_mode    = "host"
+          volumes = [
+            "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
+            "/opt/kardamom/state:/opt/kardamom/state",
+            # Periodic state checkpoints, for fast cold-start recovery.
+            # This path stays distinct from state_dir, so a state-DB
+            # wipe can recover from a checkpoint here, or from a peer
+            # executor's, re-replicated in.
+            "/opt/kardamom/checkpoints:/opt/kardamom/checkpoints",
+          ]
+          args = concat([
+            "--config", "/local/executor.toml",
+            "--log-config", "/local/channels.toml",
+            "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
+            # This replica's id selects its per-replica tx_receipts
+            # MDS endpoint (channels.toml tx_receipts_endpoint_base_port
+            # plus id). The id is stable: the allocation index of the
+            # count-based group, or the member index on the sealer nodes. It
+            # matches the co-located recorder's id.
+            "--recorder-id", group.value.id,
+            # The void voter id: the same stable id. The sealer's voter
+            # list (cluster.nomad.hcl) names every executor id.
+            "--void-voter-id", group.value.id,
+            # Cluster mode only: this allocation's cluster-egress
+            # (response) endpoint. The cluster client's egress_channel is
+            # per allocation (the node IP and the dynamic port are known
+            # only at placement), so it is injected here instead of baked
+            # into config/executor.toml.
+            "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
+            "--chain-id", "412346",
+            "--chain", "/local/genesis.toml",
+            # Join-miss archive refetch (tx_data and tx_deposits). When
+            # the live multicast misses a canonical ref's envelope
+            # (down-window, image lapse, blackout), it replays in-band
+            # from the durability archives listed in channels.toml
+            # (ingress .31/.32; aux .61). Replayed fragments and
+            # archive-control responses land on this node's cluster NIC
+            # (${meta.node_ip}), on the allocation's dynamic ports.
+            # tx_ordering recovery goes through the Aeron Cluster
+            # client's REPLAY_FROM.
+            "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
+            "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
+            # Fast cold-start recovery: restore the newest checkpoint
+            # into a wiped or empty state_dir before startup, replaying
+            # only the tail, not from genesis. Write a checkpoint every
+            # 20s as the chain advances.
+            "--checkpoint-dir", "/opt/kardamom/checkpoints",
+            "--checkpoint-interval-secs", "20",
+            # Peer checkpoint exchange, a full-resync fallback. Each
+            # replica serves its newest checkpoint on 9014, and can
+            # fetch one from the others. A node whose replay cursor, or
+            # genesis join, fell below the cluster's bounded retention
+            # floor gets REPLAY_UNAVAILABLE, and can only be repaired
+            # with peer state. Deterministic replicas make any peer's
+            # checkpoint a valid restore source. Including self in the
+            # peer list is harmless; its own checkpoint never satisfies
+            # the floor.
+            "--checkpoint-serve-addr", "${meta.node_ip}:9014",
+            # The account nonce query for the sequencers
+            # (ports.executor_nonce_query in group_vars/all.yml).
+            "--nonce-query-addr", "${meta.node_ip}:${var.executor_query_port}",
+            "--checkpoint-peers", local.checkpoint_peers,
+            # Bind the Prometheus exporter on all interfaces; the
+            # default is loopback. The chaos suite probes it directly
+            # over the cluster bridge (http://<node_ip>:9004/metrics),
+            # which keeps dockerd out of the observation path. A docker
+            # kill of a privileged sibling node can stall docker exec
+            # runner-wide for minutes, which reads as "block 0 -> 0"
+            # while executors were healthy. The bridge is the isolated
+            # cluster network; loopback scrapes (docker exec
+            # curl 127.0.0.1:9004) keep working too.
+            "--metrics-addr", "0.0.0.0:9004",
+            ],
+            var.exec_frames == "on" ? ["--exec-frames"] : [],
+            # Carry mode: the member feed on the shared driver of this node
+            # (--aeron-dir above), and the egress as the second source.
+            # Without a URL a carry executor has no egress source: a cursor
+            # below the window of its member goes to a peer checkpoint. The
+            # deploy refuses a carry executor without the URL.
+            group.value.carry ? ["--carry-bytes"] : [],
+            group.value.carry && var.egress_url != "" ? ["--egress", var.egress_url] : [],
+          )
+        }
+
+        # Cluster LogConfig (UDP multicast channels), read through
+        # --log-config.
+        template {
+          destination = "local/channels.toml"
+          data        = file("config/channels.toml.tpl")
+          # The template reads the archive records from Consul. A change
+          # there re-renders the file; the process reads it once at start
+          # and follows the catalog through discovery, so never restart.
+          change_mode = "noop"
+        }
+
+        # Presence-checked config. Content lives in config/executor.toml.
+        template {
+          destination = "local/executor.toml"
+          data        = file("config/executor.toml")
+        }
+
+        # The chain genesis comes from one source, config/genesis/dev.toml.
+        # It prefunds Anvil accounts #0 through #15 with 1000 ETH each,
+        # plus the ERC-7955 factory predeploy. The local canary's accounts
+        # and, with priority fees on, the fee schedule fragment follow it;
+        # the validator renders the same.
+        template {
+          destination = "local/genesis.toml"
+          data = join("\n", concat(
+            [file("config/genesis/dev.toml")],
+            var.canary_genesis == "on" ? [file("config/genesis/canary.toml")] : [],
+            var.priority_fees == "on" ? [file("config/genesis/fees.toml")] : [],
+          ))
+        }
+
+        service {
+          name     = "kardamom-executor"
+          port     = "metrics"
+          provider = "consul"
+          tags     = ["metrics"]
+          check {
+            type     = "http"
+            path     = "/ready"
+            interval = "10s"
+            timeout  = "2s"
+          }
+        }
+
+        resources {
+          cpu    = 1000
+          memory = 1536
+        }
       }
     }
   }

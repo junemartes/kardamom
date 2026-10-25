@@ -8,7 +8,7 @@
   upgrade transaction, not by a chain reset or a coordinated restart (sections 5.4 and 12).
   Partly implemented (section 13). Amended for the user decisions of 2026-10-21 (decisions 34 to
   43): `docs/specs/2026-10-21-one-way-pipeline.md` wins where the two differ. The amendment of
-  that spec of 2026-10-25 (decisions 45 to 52) also wins: receipts and reads only from the egress,
+  that spec of 2026-10-25 (decisions 45 to 54) also wins: receipts and reads only from the egress,
   `ack=validated` only, no refusal kinds, and no DA-lag guard.
 - Issue: refs #582.
 - Reviewed by dev-32 (the batcher resume and DA side) and kardamom-3-00 (the executor side). Their points are in this version.
@@ -90,6 +90,22 @@
   side of the handoff (sections 8.1 and 8.3).
 - Every claim about the current code cites `path:line` on `main` at `0e0c34f25`. The amendment of
   2026-10-17 cites `main` at `1d2529033`.
+- Later changes (2026-10-25). The body of this spec does not show these changes. Where the body
+  differs, this list and `docs/specs/2026-10-21-one-way-pipeline.md` win:
+  - The flusher (section 5.5, section 10): the sealer runs at file sync level 0, with no scheduled
+    sync (owner decision of 2026-10-22, #641). The durable position of #645 is on hold.
+  - The ordered signal, egress kind 15 (decision 31, sections 6 and 13): kind 15 has no reader.
+    The v2 loop of the sequencer keeps no re-offer ledger (one-way pipeline D1, #680 closed).
+  - The serving service that tails a sealer member (the header and section 1): the egress gets the
+    order, the receipts and the account rows from the executors (one-way pipeline D6).
+  - The two stored heads (R7, decision 27, section 8.3): the egress gets the frames and the
+    receipts from one source, so the split of #679 is not needed (#679 closed). The sealer purge
+    still follows the stored head of the egress (#639, owner decision of 2026-10-24).
+  - The retained file (decision 10): it stays as a store for a member that carries the bytes
+    (`docs/specs/2026-10-23-carry-activation.md` section 15, #637 closed).
+  - The cut-over of section 12 (#598): features 4 and 5 turn on the carried path by upgrade
+    transactions (`docs/specs/2026-10-23-carry-activation.md`, #771).
+  - The `tx_heads` stream: dropped, because no component reads it (#596 closed).
 
 ## 1. Summary
 
@@ -3100,6 +3116,12 @@ each replaced part says so.
     the only mode after the staging activation (51), and a carry-born chain in the target mode
     from block 1 (52). Decision 45 replaces decision 11. Decision 47 replaces section 6.4.
     Decision 49 replaces the DA-lag guard of sections 5.5 and 8.2.
+53. **The sequencer reads only the egress.** D20 of the one-way amendment: account rows,
+    lookups and other state reads come from the egress. The sequencer does not query an executor.
+54. **Feature flags for each service.** D21 of the one-way amendment: the sealer and sequencer
+    use separate flag namespaces. The sealer first accepts a new format; a later sequencer
+    activation starts sending it. The sealer keeps accepting the old format until a later code
+    removal, so no switch depends on the lag of the egress.
 
 ### 16.1 Still open
 

@@ -433,6 +433,7 @@ impl Runbook<'_> {
             shadow_vslots: Some(moved_text.clone()),
             shadow_warm: Some(warm),
             log_tag: "-shadow".into(),
+            ..SequencerOptions::default()
         })?;
         anyhow::ensure!(new_index == 2, "new shard index {new_index} != 2");
 

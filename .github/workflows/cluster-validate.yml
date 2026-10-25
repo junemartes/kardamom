@@ -80,6 +80,8 @@ jobs:
           - part: RecordFormatsTest
           - {part: RollbackTest, shard: 0/2}
           - {part: RollbackTest, shard: 1/2}
+          - {part: CarryTest, shard: 0/2}
+          - {part: CarryTest, shard: 1/2}
           - part: others
     steps:
       - uses: actions/checkout@v4

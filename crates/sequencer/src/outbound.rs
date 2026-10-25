@@ -34,9 +34,10 @@ pub mod cluster;
 
 use std::time::Instant;
 
+use alloy_primitives::B256;
 use kardamom_cluster_adapter::wire::GuardHeader;
 use kardamom_log::aeron_live::{
-    TxDropsPublisherHandle, TxErrorsPublisherHandle, TxStatusPublisherHandle,
+    TxDropsPublisherHandle, TxErrorsPublisherHandle, TxEventsSink, TxStatusPublisherHandle,
 };
 use kardamom_obs::pipeline::Step;
 use kardamom_types::xchain::RemoteEpochRecord;
@@ -146,6 +147,14 @@ pub trait DropPublisher: Send {
 pub trait SideChannelPublisher: DropPublisher {
     fn publish_error(&mut self, e: TxError);
     fn publish_status(&mut self, s: TxStatus);
+
+    /// Append a `sent` record of `tx_events` for an offered reference. A
+    /// port with no `tx_events` stream does nothing.
+    fn note_sent(&mut self, _tx_hash: &B256) {}
+
+    /// Send the `tx_events` frames that are due. The loop calls it once for
+    /// each iteration. A port with no `tx_events` stream does nothing.
+    fn flush_events(&mut self) {}
 }
 
 /// The live `tx_drops` channel. A clone shares the publication, so the
@@ -172,6 +181,11 @@ pub struct SideChannels {
     /// One `tx_errors` publish. The publish waits for the offer, so the
     /// publish loop pays it for each refused transaction.
     errors_publish: Step,
+    /// The `tx_events` frames of this replica, with
+    /// `KARDAMOM_TX_EVENTS=on`: `sent`, best effort.
+    events: Option<TxEventsSink>,
+    /// The lane of the `sent` records.
+    lane: u8,
 }
 
 impl SideChannels {
@@ -186,7 +200,18 @@ impl SideChannels {
             status,
             drops,
             errors_publish: Step::new("sequencer.tx_errors_publish"),
+            events: None,
+            lane: 0,
         }
+    }
+
+    /// Publish the `sent` records of `lane` on `tx_events` through `sink`
+    /// (`KARDAMOM_TX_EVENTS=on`).
+    #[must_use]
+    pub fn with_tx_events(mut self, sink: TxEventsSink, lane: u8) -> Self {
+        self.events = Some(sink);
+        self.lane = lane;
+        self
     }
 }
 
@@ -205,6 +230,18 @@ impl SideChannelPublisher for SideChannels {
             tracing::warn!(error = %err, "tx_status publish failed (dropped)");
         }
     }
+
+    fn note_sent(&mut self, tx_hash: &B256) {
+        if let Some(events) = self.events.as_mut() {
+            events.sent(tx_hash, self.lane);
+        }
+    }
+
+    fn flush_events(&mut self) {
+        if let Some(events) = self.events.as_mut() {
+            events.flush_due();
+        }
+    }
 }
 
 impl DropPublisher for SideChannels {
@@ -219,8 +256,12 @@ impl DropPublisher for SideChannels {
 
 #[cfg(any(test, feature = "testing"))]
 pub mod fakes {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use alloy_primitives::B256;
+    use kardamom_log::aeron_live::{FrameOffer, TxEventsSink};
+    use kardamom_types::tx_events::TxEventsView;
     use kardamom_types::xchain::RemoteEpochRecord;
     use kardamom_types::{EpochRecord, TxRef, TxStatus};
 
@@ -296,6 +337,36 @@ pub mod fakes {
         pub errors: Arc<Mutex<Vec<TxError>>>,
         pub statuses: Arc<Mutex<Vec<TxStatus>>>,
         pub drops: Arc<Mutex<Vec<TxDrop>>>,
+        /// The `tx_events` sink, when a test turns the stream on. It writes
+        /// the real frames and counts the offers.
+        pub events: Option<Arc<Mutex<TxEventsSink<CountedOffers>>>>,
+    }
+
+    impl InMemorySidePublisher {
+        /// Turn the `tx_events` stream on, with `offers` counting the
+        /// frames that the sink sends.
+        #[must_use]
+        pub fn with_tx_events(mut self, offers: CountedOffers) -> Self {
+            let sink = TxEventsSink::new(offers, 0);
+            self.events = Some(Arc::new(Mutex::new(sink)));
+            self
+        }
+    }
+
+    /// Counts the frames and the records that a sink offers. Allocates
+    /// nothing on an offer.
+    #[derive(Default, Clone)]
+    pub struct CountedOffers {
+        pub frames: Arc<AtomicUsize>,
+        pub sent: Arc<AtomicUsize>,
+    }
+
+    impl FrameOffer for CountedOffers {
+        fn offer_frame(&self, frame: &[u8]) {
+            let view = TxEventsView::parse(frame).expect("the sink writes valid frames");
+            self.frames.fetch_add(1, Ordering::Relaxed);
+            self.sent.fetch_add(view.len(), Ordering::Relaxed);
+        }
     }
 
     impl SideChannelPublisher for InMemorySidePublisher {
@@ -305,6 +376,18 @@ pub mod fakes {
 
         fn publish_status(&mut self, s: TxStatus) {
             self.statuses.lock().unwrap().push(s);
+        }
+
+        fn note_sent(&mut self, tx_hash: &B256) {
+            if let Some(events) = &self.events {
+                events.lock().unwrap().sent(tx_hash, 0);
+            }
+        }
+
+        fn flush_events(&mut self) {
+            if let Some(events) = &self.events {
+                events.lock().unwrap().flush_due();
+            }
         }
     }
 

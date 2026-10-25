@@ -187,6 +187,7 @@ The `common` role sets these on every host. Some also apply inside a node contai
 | `net.ipv4.ip_local_reserved_ports` | the `fixed_port_block` value | It takes the block out of the ephemeral range. The file is `/etc/sysctl.d/99-kardamom-ports.conf`. |
 | `net.core.rmem_max`, `wmem_max`, `rmem_default`, `wmem_default` | `16777216` (16 MiB) | Large socket buffers for Aeron. The file is `/etc/sysctl.d/99-kardamom-aeron.conf`. |
 | `aeron.mtu.length` | `1344` | The Aeron MTU of the media driver and of the sealer JVM. |
+| `node_data_dirs` | the data directories under `/opt/kardamom`, mode `0777` | The services write to them as uid 10001. The `data-dirs` job of each deploy makes them again, so a node keeps up with a new service. |
 
 The fixed port block:
 
