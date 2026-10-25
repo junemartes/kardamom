@@ -1,6 +1,6 @@
 # Client events from one-way stage publications, and the egress on its own nodes
 
-Status: draft, revision 5, 2026-10-25. The decisions in section 1 are the user's (2026-10-25).
+Status: draft, revision 6, 2026-10-25. The decisions in section 1 are the user's (2026-10-25).
 Section 10 lists the changes from revision 1 and from revision 3.
 
 ## 1. Decisions
@@ -26,6 +26,11 @@ Section 10 lists the changes from revision 1 and from revision 3.
    execution (4.8).
 6. The events have a negligible cost on the hot path: no allocation and no encode for each
    event, one offer for each poll cycle, and no wait (4.8).
+7. An explicit halt of the ingress (record lag or DA lag, from `chain_status`) ends when its
+   newest status is older than 30 s, and the ingress then admits again. A silence of
+   `chain_status` never starts a halt, and never keeps one. The reason is decision 5: a
+   best-effort stream never stops admission. The guards of the sealer stay the real stop
+   (4.6).
 
 For now the notifier reads both the executors and the egress, so that the stages can be measured
 apart: the time of each executor, and the time from the executors to the merged receipt. A switch
@@ -215,11 +220,13 @@ removal of `tx_status` leaves no kind unmapped:
     `accepted` then `receipt`, with no `sent` and no `executed`.
   - A late event still sets its bit in `observed`, and a late `executed` sets its bit in
     `executors`. So the latencies of section 6 keep every stage that came, also a slow executor.
-  - `dropped` is sent only while the state is below `executed`. A drop on `tx_drops` is
-    provisional, as `kardamom_getTransactionStatus` says today. So a `receipt` after a `dropped`
-    is sent.
-  - A `rejected` record is final. The sequencer does not order the transaction. Nothing after it
-    is sent.
+  - `dropped` is not a stage of the order, and it does not change `state`. It sets its bit in
+    `observed`, and the bit decides a copy: the notifier sends `dropped` once, and only while
+    `state` is below `executed`. A drop on `tx_drops` is provisional, as
+    `kardamom_getTransactionStatus` says today. So a `receipt` after a `dropped` is sent.
+  - A `rejected` record is final. The sequencer does not order the transaction. It sets `state`
+    to the terminal value, above `included`, so no later event is sent: a late `sent` after a
+    `rejected` is dropped.
 - **Loss.** Every stage is best effort (decision 5). MDC offers can fail, for example with
   `NOT_CONNECTED` during a restart, and a publisher drops a batch that it cannot offer (4.8).
   - A lost `accepted`, `sent`, `dropped`, `executed`, `posted` or `included` is not sent again.
@@ -245,9 +252,35 @@ removal of `tx_status` leaves no kind unmapped:
   - An entry is `{ hash: [u8; 32], state: u8, observed: u8, executors: u8, block: u64,
     accepted_ms: u32 }`, about 56 bytes. So the table uses about 14 MB.
   - `state` is the highest stage that the notifier sent (4.3). One comparison decides a copy and
-    a late event.
-  - `observed` is a bitmap, one bit for each stage that really came, for the latencies. It
-    extends the bits of `TxStageKind::bit`.
+    a late event. Its values:
+
+    | `state` | Meaning |
+    |---|---|
+    | 0 | no event sent yet |
+    | 1 | `accepted` |
+    | 2 | `sent` |
+    | 3 | `executed` |
+    | 4 | `receipt` |
+    | 5 | `posted` |
+    | 6 | `included` |
+    | 7 | `rejected`, terminal |
+
+  - `observed` is a bitmap, one bit for each stage that really came, for the latencies and for
+    the copy of `dropped`. It keeps the bits of `TxStageKind::bit`
+    (`crates/types/src/tx_status.rs:112-120`), and uses the free bits for the new stages:
+
+    | Bit | Stage |
+    |---|---|
+    | 1 | `sent` (the bit of `Offered`) |
+    | 2 | `receipt` (the bit of `Sealed`, which goes) |
+    | 4 | `executed` |
+    | 8 | `rejected` |
+    | 16 | `accepted` |
+    | 32 | `posted` |
+    | 64 | `included` |
+    | 128 | `dropped` |
+
+    `rolled_back` is an event, not a stage, so it has no bit.
   - `executors` has one bit for each executor index. So the notifier sees which executors
     reported.
   - `block` comes from the first `executed` or `receipt`. It maps a `Posted` range to its
@@ -259,9 +292,13 @@ removal of `tx_status` leaves no kind unmapped:
   - A hash older than the table gets `posted` only through a status query (4.5).
   - The decode reads the hot frames and the archived rkyv receipts in place. It does not copy
     each event.
-  - A rollback sets `state` back to `sent` (or to `accepted` if `sent` is not in `observed`),
-    clears the `executed` and `receipt` bits and `executors`, and sets `block` to 0, for each
-    entry at or above `from_block`. Then the new receipt after the rollback is sent again.
+  - A rollback changes only an entry at or above `from_block` whose `state` is `executed` or
+    `receipt`. It sets `state` back to `sent` (or to `accepted` if `sent` is not in `observed`),
+    clears the `executed` and `receipt` bits and `executors`, and sets `block` to 0. Then the new
+    receipt after the rollback is sent again.
+  - An entry at `posted` or above does not change. The notifier counts it
+    (`kardamom_notifier_rollback_past_posted_total`): a rollback past a posted block needs an
+    operator.
   - One thread owns the table: the ingest thread of the notifier. No lock is necessary.
 - **The receipt feed.** `kardamom_subscribeReceipts` moves from the ingress to the notifier,
   next to its status feed, with the same frames. Its users (3.1) point to the notifier.
@@ -356,6 +393,12 @@ removal of `tx_status` leaves no kind unmapped:
   - **The ingress halts only on an explicit halt in a status.** `record_lag` while a status says
     that the record-lag guard refuses, `da_lag` while a status says that the DA-lag guard
     refuses (3.2).
+  - **An explicit halt has a lifetime of 30 s** (decision 7). Each status of the same halt
+    renews it. The sealer repeats its state about every 2 s, so one lost status changes
+    nothing. When no status comes for 30 s (both sequencers down, or the `chain_status`
+    publication stalls), the halt ends and the ingress admits again. The bound is the bound of
+    the age alert of section 6, so the operator sees the same moment. While the chain still
+    refuses, the sealer guards refuse the references, and the client gets `dropped`.
   - **A silence of `chain_status` does not halt.** This replaces the silence rule of `chain.rs`
     (`check_silence`, with `SEALER_SILENCE` of 10 s and `SNAPSHOT_SILENCE` of 60 s, raising
     `sealer_no_quorum`). `chain_status` is best effort (decision 5), so its silence is not proof
@@ -409,7 +452,12 @@ Decisions 5 and 6 bind every publisher of `tx_events` and `chain_status`.
 - For each event it copies the 32-byte hash (and the lane for `sent`) into the next record. No
   allocation, no encode, no hash computation: the hash is already there.
 - It offers the frame once for each poll cycle, or at once when the buffer is full. The offer is
-  non-blocking (`try_claim` or `offer` on the publication).
+  non-blocking: `offer` on the publication, not `try_claim`. A full frame (1,024 records) is
+    about 34 KB, above one MTU payload (`-Daeron.mtu.length=1344` in the deploy,
+    `crates/chaos/src/cases/fleet/seeding/tests.rs:62`), and `try_claim` takes at most one MTU
+    payload. `offer` fragments the frame, and the notifier reads it through a fragment
+    assembler. The frame stays below the maximum message of the term (a term of 4 MiB gives
+    512 KiB).
 - On back-pressure or `NOT_CONNECTED`, it drops the frame and counts it
   (`kardamom_tx_events_dropped_total{origin}`). It never waits, and never retries.
 - It then clears the count and moves `seq` on, so a drop shows as a gap to the notifier.
@@ -472,6 +520,19 @@ switch (Q7), and the A/B ramp measures it.
   - their tests and flags.
 - **The ingress halt on silence:** the silence rule of `chain.rs` (`check_silence`, the use of
   `SEALER_SILENCE` and `SNAPSHOT_SILENCE` by the ingress) and its `sealer_no_quorum` halt (4.6).
+  `chain.rs:172` is the only place that raises `HaltCause::SealerNoQuorum`. So these users of
+  the halt change in P6, with the switch `KARDAMOM_INGRESS_CHAIN_STATUS=events`, not later:
+
+  | User of the halt | Path in main | The replacement |
+  |---|---|---|
+  | The chaos recovery stage, which waits for the chain view to leave `sealer_no_quorum` | `crates/chaos/src/stages/recovery.rs:1-8` | It waits until `kardamom_ingress_chain_status_age_seconds` is below 10 s on each ingress, or for the first `accepted` after the restore. |
+  | The chaos cases that assert the refusal "the sealer is halted on sealer_no_quorum" | `crates/chaos/src/cases/combined.rs` (2 places), `crates/chaos/src/cases/chain_status.rs` (3 places) | They assert the new effect: the ingress admits, the sequencer back-pressures, the transaction drops (`dropped` on `tx_drops`), or its receipt comes after the restore. |
+  | The proofs `ingress-sealer-loss-recover` and the two combined losses | `docs/failure-modes.md:68`, `:115`, `:160`, `:755`, `:773` | The effect lines become "the ingress admits, the sequencer back-pressures, the transaction drops". Line 115 keeps the sequencer's own pause of 10 s with no boundary, which does not change. |
+  | The alert `KardamomHaltSealerNoQuorum` | `deploy/alerts.yml:237` | It goes. The age alert on `kardamom_ingress_chain_status_age_seconds` above 30 s (section 6) takes its place. |
+  | The gate excuse for a `sealer_no_quorum` halt | `deploy/cluster/ansible/roles/workloads/tasks/gate.yml` (3 places, about `:145-158`) | It goes: the halt no longer comes. |
+  | The runbooks | `docs/runbooks/sealer_no_quorum.md`, `sealer-fleet-rebuild.md`, `deploy-rollback.md` | `sealer_no_quorum.md` becomes the runbook of the age alert. The two others name the age alert. |
+  | The chaos suite doc | `docs/chaos-suite.md` (3 places) | It names the new effect and the new wait of the recovery stage. |
+  | The chain status dashboard | `deploy/grafana/provisioning/dashboards-json/kardamom-chain-status.json` | The `sealer_no_quorum` panel shows the status age instead. |
 - **The notifier:** its receipt source switch (`--receipts-from-egress`). It reads
   `egress_receipts` always, and `tx_receipts` only behind `KARDAMOM_NOTIFIER_EXECUTED`.
 - **The streams:**
@@ -510,8 +571,11 @@ switch (Q7), and the A/B ramp measures it.
   counts here too.
 - `kardamom_notifier_event_gaps_total{origin}` and
   `kardamom_notifier_catchup_receipts_total{source}`.
+- `kardamom_notifier_rollback_past_posted_total`: a rollback that reached an entry at `posted` or
+  above (4.4). An alert fires on any increase.
 - `kardamom_ingress_chain_status_age_seconds`: the time since the last `ChainStatus` that the
-  ingress took. An alert fires above 30 s. It does not halt (4.6).
+  ingress took. An alert fires above 30 s. It does not start a halt, and at 30 s an explicit
+  halt ends (4.6, decision 7).
 - The canary reads its stages from the notifier feed. The performance dashboard takes the
   notifier stage latencies in place of the ingress seal latency.
 
@@ -579,7 +643,7 @@ Each PR merges alone. Each new path is behind a switch that is off by default, u
 | P3 | kardamom | the `tx_events` hot frame and the batcher frame, with their formats and golden tests; the publishers of the ingress, the sequencer and the batcher; the `chain_status` stream; `KARDAMOM_TX_EVENTS`; the allocation cases and the micro-benchmark of 4.8; the e2e failure case with the notifier down | none |
 | P4 | kardamom | the notifier on `tx_events` and its taps (`egress_receipts` with the rollback frames, `tx_drops`, and `tx_receipts` behind `KARDAMOM_NOTIFIER_EXECUTED`): the stage table with its state and bitmaps, the copies, the latest-state rule, the rollback, the gaps, the stage metrics, `KARDAMOM_NOTIFIER_EVENTS` | P3 |
 | P5 | kardamom | the shards of the notifier (4.4) | P4 |
-| P6 | kardamom | the ingress halt from the explicit halts of `ChainStatus`, with no silence rule (`KARDAMOM_INGRESS_CHAIN_STATUS`), the age gauge and its alert, the e2e scenario on `tx_events`, the dashboard panels | P3 |
+| P6 | kardamom | the ingress halt from the explicit halts of `ChainStatus`, with no silence rule and a lifetime of 30 s for an explicit halt (`KARDAMOM_INGRESS_CHAIN_STATUS`), the age gauge and its alert, the users of the `sealer_no_quorum` halt of section 5 (the chaos recovery stage and cases, the proofs, the alert, the gate excuse, the runbooks, `docs/chaos-suite.md`, the chain status dashboard), the e2e scenario on `tx_events`, the dashboard panels | P3 |
 | P7 | kardamom | the receipt feed on the notifier; the egress short wait, the fallback and `/v1/receipts`; the capped notifier catch-up; the receipt endpoint flag of the canary, the chaos suite, the e2e harness and the load tool | P4 |
 | P8 | kardamom-infra | the second endpoint for the egress reads, and the infra variables of the new switches | P7 |
 | P9 | kardamom | the removals of section 5, the ack default `validated`, `docs/specs/egress-node-spec.md` marked superseded, the docs | P6, P7, P8 on staging for a week |
@@ -617,3 +681,15 @@ the chain", and "we should ensure this has a negligible impact on the hot path".
 | The sequencer `sent` record replaces its `TxStatus` `Offered` publish of each transaction, so the sequencer hot path does less work than today. | 4.2, 4.8, 5 |
 | A fix of revision 3: the `TxStatus` kind `Accepted` comes from the v2 sequencer verdict on `tx_verdicts`, not from the ingress, and `Executed` is derived by the notifier from the receipts. | 4.2 |
 | Revision 5. The user: send the latest state, not the missed stages | 4.3, 4.4, P4: the latest-state rule replaces the implied stages, and `state: u8` replaces the `emitted` bitmap. |
+
+### 10.2 Changes from revisions 4 and 5
+
+| Change | Where |
+|---|---|
+| Revision 5, the user: the notifier sends only the latest state of a hash, and drops an earlier event that comes too late. `state: u8` replaces the `emitted` bitmap. | 4.3, 4.4, P4 |
+| Review of revision 4, finding 1 (major): the users of the `sealer_no_quorum` halt break at step 6, not at P9. Section 5 lists each one with its path and its replacement, and P6 carries them. | 5, P6 |
+| Review of revision 4, finding 2 (major): a stale explicit halt had no end. It now ends when its newest status is older than 30 s, and the ingress admits again. | 1 (decision 7), 4.6, P6 |
+| Review of revision 5, finding 3: `dropped` sets its bit in `observed`, is sent once, and leaves `state` unchanged. `rejected` sets `state` to a terminal value above `included`. The `state` values are listed. | 4.3, 4.4 |
+| Review of revision 5, finding 4: a rollback resets only an entry at `executed` or `receipt`. An entry at `posted` or above is counted (`kardamom_notifier_rollback_past_posted_total`) and kept. | 4.4 |
+| Review of revision 5, finding 5: the `observed` bits keep `TxStageKind::bit` and take the free bits for `receipt`, `posted`, `included` and `dropped`. `rolled_back` has no bit. | 4.4 |
+| Review of revision 4, finding 3 (minor): a frame of about 34 KB does not fit `try_claim`. The publishers use `offer` with fragmentation, and the notifier uses a fragment assembler. | 4.8 |
