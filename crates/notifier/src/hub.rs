@@ -198,7 +198,7 @@ impl Hub {
             }
         };
         // With the path on, only a rejection reaches here, from `tx_status`
-        // or `tx_errors`. It goes through the table, so it is terminal.
+        // or `tx_errors`. The table compares it with any execution result.
         if let Some(path) = self.events.as_mut() {
             path.on_rejected(&status, now, fanout(&mut self.ring, &self.live, now));
             return;

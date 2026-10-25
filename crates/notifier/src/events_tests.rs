@@ -154,7 +154,7 @@ fn a_frame_that_does_not_read_sends_nothing() {
 }
 
 #[test]
-fn a_rejection_is_terminal_so_a_late_twin_sent_is_not_sent() {
+fn a_rejection_suppresses_a_late_twin_sent() {
     use kardamom_types::{TxError, TxErrorReason, TxStatus};
 
     let now = Instant::now();
@@ -177,4 +177,32 @@ fn a_rejection_is_terminal_so_a_late_twin_sent_is_not_sent() {
         p.on_rejected(&rejected, now, |s| out.push(s));
     });
     assert!(got.is_empty(), "the copy of the other sequencer");
+}
+
+#[test]
+fn an_executed_transaction_is_not_rejected_by_a_late_twin() {
+    use kardamom_types::{TxError, TxErrorReason, TxStatus};
+
+    let now = Instant::now();
+    let hash = B256::repeat_byte(7);
+    let error = TxError {
+        sender: Address::repeat_byte(9),
+        nonce: 4,
+        reason: TxErrorReason::DuplicatedTx { expected_nonce: 5 },
+    };
+    let rejection = TxStatus::rejected(hash, &error);
+    for rejection_first in [false, true] {
+        let mut path = EventsPath::new(64, now);
+        if rejection_first {
+            path.on_rejected(&rejection, now, |_| {});
+        }
+        let got = sends(&mut path, |p, out| {
+            p.on_merged(&batch(vec![receipt(hash, 9)]), now, |s| out.push(s));
+        });
+        assert_eq!(got, [(hash, Stage::Receipt)], "a canonical receipt wins");
+        let got = sends(&mut path, |p, out| {
+            p.on_rejected(&rejection, now, |s| out.push(s));
+        });
+        assert!(got.is_empty(), "the twin cannot revoke the receipt");
+    }
 }

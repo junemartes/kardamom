@@ -161,8 +161,8 @@ impl EventsPath {
         }
     }
 
-    /// Take a `tx_status` rejection at `now`. The rejection is terminal in
-    /// the table, so a late `sent` of the twin is not sent after it. The
+    /// Take a `tx_status` rejection at `now`. The rejection suppresses a late `sent` of the twin. Execution
+    /// takes precedence over a rejection, in either arrival order. The
     /// record of `tx_errors` and `tx_status` stays the input of `rejected`
     /// until the decisions on #819.
     pub fn on_rejected(&mut self, status: &TxStatus, now: Instant, mut send: impl FnMut(Send)) {
