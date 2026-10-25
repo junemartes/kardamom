@@ -440,17 +440,23 @@ class Deploys(unittest.TestCase):
         self.git('init', '-q')
         (self.repo / 'formats.toml').write_text(FORMATS)
         self.revision = self.commit('the release')
-        # One stub for each operator binary. The cluster binary smokes a
-        # canary and fails a `formats` call. The deploy binary prints the
-        # format findings of the release gate, which a test scripts in
-        # `deploy.sh.findings`. Each stub logs its calls in `<stub>.calls`.
-        self.smoke = Path(self.tmp.name) / 'smoke.sh'
-        self.smoke.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\n'
-                              'if [ "$1" = formats ]; then exit 1; fi\n')
-        self.smoke.chmod(0o755)
+        # One stub for each operator binary, so that a call to the wrong
+        # binary fails the deploy. A release ships only the deploy binary,
+        # so the cluster binary fails every call. The deploy binary prints
+        # the format findings of the release gate, which a test scripts in
+        # `deploy.sh.findings`, and smokes a canary; the smoke fails when
+        # `deploy.sh.smoke-fails` exists. It fails every other command.
+        # Each stub logs its calls in `<stub>.calls`.
+        self.cluster_bin = Path(self.tmp.name) / 'cluster.sh'
+        self.cluster_bin.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\nexit 1\n')
+        self.cluster_bin.chmod(0o755)
         self.deploy_bin = Path(self.tmp.name) / 'deploy.sh'
         self.deploy_bin.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\n'
-                                   'if [ "$1" = formats ]; then cat "$0.findings" 2>/dev/null || echo "[]"; fi\n')
+                                   'case "$1" in\n'
+                                   'formats) cat "$0.findings" 2>/dev/null || echo "[]" ;;\n'
+                                   'smoke) [ ! -e "$0.smoke-fails" ] ;;\n'
+                                   '*) exit 1 ;;\n'
+                                   'esac\n')
         self.deploy_bin.chmod(0o755)
         self.thread = threading.Thread(target=self.api.serve_forever, daemon=True)
         self.thread.start()
@@ -483,7 +489,7 @@ class Deploys(unittest.TestCase):
             'workloads_da_proxy_probe': False,
             'workloads_deployment_retries': 3,
             'workloads_record_dir': str(self.record_dir),
-            'workloads_cluster_binary': str(self.smoke),
+            'workloads_cluster_binary': str(self.cluster_bin),
             'workloads_deploy_binary': str(self.deploy_bin),
             'workloads_sealer_admin_port': self.api.server_port,
             'workloads_metrics_ports': dict.fromkeys(('executor', 'batcher', 'validator', 'egress'),
@@ -1482,12 +1488,18 @@ class DeployTest(Deploys):
         self.api.state['deployments']['ingress'] = Deployment('ingress', [], canary=True)
         self.run_deploy()
         self.assertTrue(self.api.state['deployments']['ingress'].promoted)
-        calls = Path(str(self.smoke) + '.calls').read_text().splitlines()
-        self.assertEqual(calls, ['smoke --rpc http://127.0.0.1:8545'])
+        # The deploy binary of the release smokes the canary. The cluster
+        # binary, which no release ships, does not run.
+        calls = Path(str(self.deploy_bin) + '.calls').read_text().splitlines()
+        self.assertEqual(calls, ['smoke --rpc-url http://127.0.0.1:8545 --chain-id 412346'])
+        self.assertFalse(Path(str(self.cluster_bin) + '.calls').exists())
 
     def test_a_failed_smoke_leaves_the_canary_unpromoted(self):
         self.api.state['deployments']['sequencer'] = Deployment('sequencer', [], canary=True)
-        self.run_deploy({'workloads_cluster_binary': '/usr/bin/false'}, success=False)
+        Path(str(self.deploy_bin) + '.smoke-fails').touch()
+        self.run_deploy(success=False)
+        calls = Path(str(self.deploy_bin) + '.calls').read_text().splitlines()
+        self.assertEqual(calls, ['smoke --rpc-url http://127.0.0.1:8545 --chain-id 412346'])
         self.assertFalse(self.api.state['deployments']['sequencer'].promoted)
         self.assertNotIn('batcher', self.api.state['writes'])
 
@@ -1649,7 +1661,7 @@ class RecordTest(Deploys):
         # and this tree. The cluster binary did not run.
         calls = Path(str(self.deploy_bin) + '.calls').read_text().splitlines()
         self.assertEqual(calls, [f'formats --base {self.record_dir}/accepted.formats.toml --root {self.repo}'])
-        self.assertFalse(Path(str(self.smoke) + '.calls').exists())
+        self.assertFalse(Path(str(self.cluster_bin) + '.calls').exists())
 
     def test_a_retired_format_needs_the_allowance(self):
         self.gate_formats([{'rule': 'retired', 'id': 'notifier-outbox', 'head': 1, 'base': 1,
