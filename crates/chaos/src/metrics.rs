@@ -76,6 +76,16 @@ pub fn first(body: &str, metric: &str) -> Option<i64> {
         .and_then(sample_value)
 }
 
+/// The integer value of the first sample of `metric` whose label set
+/// contains `label_fragment`, such as `step="sealer.boundary"`. `None`
+/// when no sample matches: a metric that is not registered is not zero.
+#[must_use]
+pub fn first_where(body: &str, metric: &str, label_fragment: &str) -> Option<i64> {
+    body.lines()
+        .find(|l| is_sample_of(l, metric) && l.contains(label_fragment))
+        .and_then(sample_value)
+}
+
 /// The integer sum of every sample of `metric`, for per-label counters.
 /// `None` when no sample matches: a scrape failure, or a metric not yet
 /// registered, is not zero.

@@ -4,6 +4,7 @@ use super::checks::{Lookups, Terms};
 use super::refill::{Refill, RefillWatch, Refills, WatcherRuns};
 use super::*;
 use crate::Shard;
+use crate::probes::Boundaries;
 
 /// Every ordering case, in the shard's run order.
 const ALL: [Combined; 5] = [
@@ -213,42 +214,36 @@ fn on_the_sealer_nodes_the_executors_and_the_members_go_down_by_task() {
     assert_eq!(Class::SealerTasks.fault_kind(), FaultKind::KillTasks);
 }
 
+/// A reading with no member answer.
+fn progress(block: i64, applied: Option<i64>) -> Progress {
+    Progress {
+        block,
+        boundaries: None,
+        applied,
+    }
+}
+
 #[test]
 fn the_expectations_judge_two_readings() {
-    let flat = Progress {
-        block: 100,
-        applied: Some(5000),
-    };
-    let sealed = Progress {
-        block: 103,
-        applied: Some(5000),
-    };
-    let applied = Progress {
-        block: 103,
-        applied: Some(5010),
-    };
+    let flat = progress(100, Some(5000));
+    let sealed = progress(103, Some(5000));
+    let applied = progress(103, Some(5010));
     // No executor answers: nothing is applied, and the head still tells
     // a stall from a seal.
-    let dark = Progress {
-        block: 103,
-        applied: None,
-    };
+    let dark = progress(103, None);
     assert!(Expect::Stall.judge(flat, flat).is_ok());
     assert!(Expect::SealOnly.judge(flat, dark).is_ok());
     assert!(Expect::Stall.judge(dark, dark).is_ok());
     assert!(Expect::Stall.judge(flat, dark).is_err());
     // A head that reads lower is not a seal: a source of it went dark.
-    let lower = Progress {
-        block: 99,
-        applied: None,
-    };
+    let lower = progress(99, None);
     assert!(
         Expect::SealOnly
             .judge(flat, lower)
             .unwrap_err()
             .contains("no block was sealed")
     );
-    assert_eq!(dark.describe(), "head 103, applied ?");
+    assert_eq!(dark.describe(), "head 103, sealer boundaries ?, applied ?");
     assert!(
         Expect::Stall
             .judge(flat, sealed)
@@ -269,6 +264,43 @@ fn the_expectations_judge_two_readings() {
             .contains("a user transaction was applied")
     );
     assert!(Expect::Stall.observed(flat, flat).contains("STALLED"));
+}
+
+#[test]
+fn a_seal_only_outage_with_no_client_is_judged_by_the_members() {
+    // The executors and the ingresses are down, and the validator reads a
+    // feed that only the executors fill: the head stays flat.
+    let at = |count: Option<i64>| Progress {
+        block: 931,
+        boundaries: count.map(Boundaries::Members),
+        applied: None,
+    };
+    assert!(
+        Expect::SealOnly
+            .judge(at(Some(4810)), at(Some(4870)))
+            .is_ok()
+    );
+    let why = Expect::SealOnly
+        .judge(at(Some(4810)), at(Some(4810)))
+        .unwrap_err();
+    assert_eq!(
+        why,
+        "no block was sealed while the sealers were up (head 931, sealer boundaries 4810, applied ? -> head 931, sealer boundaries 4810, applied ?)"
+    );
+    // One reading with no member answer proves no seal.
+    assert!(Expect::SealOnly.judge(at(None), at(Some(4870))).is_err());
+    assert!(Expect::SealOnly.judge(at(Some(4810)), at(None)).is_err());
+    // A user transaction still fails the case while the members tick.
+    let applied = |boundaries, n| Progress {
+        applied: Some(n),
+        ..at(Some(boundaries))
+    };
+    assert!(
+        Expect::SealOnly
+            .judge(applied(4810, 5000), applied(4870, 5010))
+            .unwrap_err()
+            .contains("a user transaction was applied")
+    );
 }
 
 #[test]

@@ -220,10 +220,10 @@ impl Harness {
         })
     }
 
-    /// The pipeline-progress probe of the component cases: the sealer
-    /// boundary counter must tick within `PROGRESS_BUDGET`. The probe
-    /// passes on the first tick. When no executor exporter answers, the
-    /// executor block gauge stands in.
+    /// The pipeline-progress probe of the component cases: the count of
+    /// the boundaries that reach an executor must tick within
+    /// `PROGRESS_BUDGET`. The probe passes on the first tick. When no
+    /// executor exporter answers, the executor block gauge stands in.
     ///
     /// # Errors
     ///
@@ -233,7 +233,11 @@ impl Harness {
             return self.assert_executor_progress(Duration::from_mins(1)).await;
         };
         let outcome = poll::after_sleep(PROGRESS_BUDGET, |_| async move {
-            Ok(self.probes.sealer_boundaries().await.filter(|b1| *b1 > b0))
+            Ok(self
+                .probes
+                .sealer_boundaries()
+                .await
+                .filter(|b1| b1.rose_over(b0)))
         })
         .await?;
         let (b1, elapsed) = outcome.or_fail(|t| {

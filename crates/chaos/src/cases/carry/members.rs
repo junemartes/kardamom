@@ -11,10 +11,7 @@ use anyhow::Context;
 use crate::harness::Harness;
 use crate::metrics::{self, Target};
 use crate::poll::{self, Budget};
-
-/// The admin endpoint of a member (`cluster_ports.admin` in
-/// `group_vars/all.yml`).
-const ADMIN_PORT: u16 = 40205;
+use crate::probes::SEALER_ADMIN_PORT as ADMIN_PORT;
 
 /// The member ids.
 pub(super) const ALL: [u32; 3] = [0, 1, 2];

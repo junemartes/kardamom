@@ -9,6 +9,7 @@ use crate::cases::chain_status::ChainView;
 use crate::cases::validator::COMMITTED;
 use crate::harness::Harness;
 use crate::poll::{self, Budget};
+use crate::probes::Boundaries;
 
 /// The window between the two head readings that judge the expectation.
 const WINDOW: Duration = Duration::from_secs(15);
@@ -18,24 +19,30 @@ const REFUSAL_BUDGET: Duration = Duration::from_secs(60);
 /// The cause an ingress names while no sealer answers.
 const NO_QUORUM: &str = "sealer_no_quorum";
 
-/// The highest head any live client reports, and the highest count of
-/// applied transactions any executor reports.
+/// The highest head any live client reports, the highest count of
+/// boundaries any sealer member sealed, and the highest count of applied
+/// transactions any executor reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Progress {
     /// The highest of the executor block, the sealed head an ingress
     /// reads from the sealer's status frames, and the validator's
-    /// committed block. Each one follows the sealer, so the highest one
-    /// is the head of the chain as the live clients see it.
+    /// committed block. The highest one is the head of the chain as the
+    /// live clients see it. The validator follows the sealer only
+    /// through a feed that the executors fill in carry mode, so with the
+    /// executors and the ingresses down, this head stays flat.
     pub(super) block: i64,
+    /// `None` while no sealer member answers on its admin port. A member
+    /// counts each boundary it seals, also while no client follows it.
+    pub(super) boundaries: Option<Boundaries>,
     /// `None` while no executor exporter answers: no executor runs, so
     /// no transaction is applied.
     pub(super) applied: Option<i64>,
 }
 
 impl Progress {
-    /// One reading, retried for twelve seconds. Some client of the
-    /// sealer is up through every combined case, so no head at all is a
-    /// harness failure.
+    /// One reading, retried for twelve seconds. An ingress, an executor
+    /// or the validator is up through every combined case, so no head at
+    /// all is a harness failure.
     async fn read(h: &Harness, ctx: &str) -> anyhow::Result<Self> {
         let outcome = poll::until(Budget::secs(12, 3), |_| async move {
             let block = h
@@ -44,8 +51,13 @@ impl Progress {
                 .await
                 .max(h.probes.ingress_sealed_head().await)
                 .max(h.probes.val_metric(COMMITTED).await);
+            let boundaries = h.probes.sealer_member_boundaries().await;
             let applied = h.probes.executor_tx_applied().await;
-            Ok(block.map(|block| Self { block, applied }))
+            Ok(block.map(|block| Self {
+                block,
+                boundaries,
+                applied,
+            }))
         })
         .await?;
         outcome
@@ -57,9 +69,21 @@ impl Progress {
             .map(|(progress, _)| progress)
     }
 
+    /// Whether the sealers sealed a block since `before`: the head rose,
+    /// or a member counts more boundaries. A head that reads lower is
+    /// not a rise: a source of the head stopped answering.
+    fn sealed_since(self, before: Self) -> bool {
+        let boundaries = before.boundaries.zip(self.boundaries);
+        self.block > before.block || boundaries.is_some_and(|(b, a)| a.rose_over(b))
+    }
+
     pub(super) fn describe(self) -> String {
+        let boundaries = self.boundaries.map_or("?".to_string(), |b| b.to_string());
         let applied = self.applied.map_or("?".to_string(), |a| a.to_string());
-        format!("head {}, applied {applied}", self.block)
+        format!(
+            "head {}, sealer boundaries {boundaries}, applied {applied}",
+            self.block
+        )
     }
 }
 
@@ -67,12 +91,13 @@ impl Progress {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Expect {
     /// No block is committed: the head stays flat, and every live
-    /// ingress refuses a submit with `sealer_no_quorum`.
+    /// ingress refuses a submit with `sealer_no_quorum`. No member
+    /// answers, so the head is the only signal.
     Stall,
     /// Blocks are still sealed, but no user transaction is applied: the
-    /// head rises and the applied-transaction counter of a live executor
-    /// stays flat. A head that reads lower is not a rise: a source of the
-    /// head stopped answering.
+    /// head rises or the boundary count of a member rises, and the
+    /// applied-transaction counter of a live executor stays flat. The
+    /// member count is the signal when no client of the sealer is up.
     SealOnly,
 }
 
@@ -85,9 +110,10 @@ impl Expect {
                 "the pipeline UNEXPECTEDLY progressed while the sealers were down (head {} -> {})",
                 before.block, after.block
             )),
-            Self::SealOnly if after.block <= before.block => Err(format!(
-                "no block was sealed while the sealers were up (head {} -> {})",
-                before.block, after.block
+            Self::SealOnly if !after.sealed_since(before) => Err(format!(
+                "no block was sealed while the sealers were up ({} -> {})",
+                before.describe(),
+                after.describe()
             )),
             Self::SealOnly if applied.is_some_and(|(b, a)| a != b) => Err(format!(
                 "a user transaction was applied while the classes were down ({} -> {})",
