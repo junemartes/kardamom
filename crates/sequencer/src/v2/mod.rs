@@ -256,6 +256,7 @@ impl AdmissionLoop {
         let applied = self.apply_accounts();
         self.sweep_if_due(Instant::now());
         let (input, refs, side) = ports.split();
+        side.flush_events();
         self.dispatch(side);
         self.flush(refs, side)?;
         if self.outbox.len() >= self.cfg.outbox_cap.get() {
@@ -512,6 +513,7 @@ impl AdmissionLoop {
                 offer.guard.sender,
                 offer.guard.nonce,
             ));
+            side.note_sent(&offer.tx_ref.tx_hash);
         }
         err.map_or(Ok(()), Err)
     }

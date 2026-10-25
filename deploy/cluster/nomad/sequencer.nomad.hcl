@@ -84,6 +84,17 @@ variable "receipts_from_egress" {
     error_message = "The receipts_from_egress value must be on or off."
   }
 }
+# The tx_events stream (docs/specs/2026-10-25-client-events.md), "on" or
+# "off". On, the job publishes its client stage records on tx_events, best
+# effort. Ansible deployment passes -var from KARDAMOM_TX_EVENTS.
+variable "tx_events" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.tx_events)
+    error_message = "The tx_events value must be on or off."
+  }
+}
 variable "metrics_base" {
   type    = number
   default = 9001
@@ -257,6 +268,7 @@ job "sequencer" {
             KARDAMOM_METRICS_ADDR  = "0.0.0.0:${var.metrics_base + 10 * parseint(group.key, 10)}"
             KARDAMOM_HOST_ID       = "node${meta.node_index}-seq-${group.key}"
             KARDAMOM_PRIORITY_FEES = var.priority_fees == "on" ? "true" : "false"
+            KARDAMOM_TX_EVENTS     = var.tx_events == "on" ? "true" : "false"
           }
 
           template {

@@ -199,6 +199,10 @@ workloads_batcher_egress: "{{ lookup('env', 'KARDAMOM_BATCHER_EGRESS') }}"
 workloads_sequencer_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_SEQUENCER_RECEIPTS_FROM_EGRESS') }}"
 # eth_getTransactionReceipt of the ingress from the egress on a cache miss.
 workloads_ingress_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS') }}"
+# The tx_events stream of the ingress and the sequencers
+# (docs/specs/2026-10-25-client-events.md): "on" or "off". Empty keeps the
+# jobs' "off" default.
+workloads_tx_events: "{{ lookup('env', 'KARDAMOM_TX_EVENTS') }}"
 # The receipts of the notifier from egress_receipts.
 workloads_notifier_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS') }}"
 # The readers reach the egress through its Consul service.
@@ -215,8 +219,10 @@ workloads_egress_job_vars:
     egress_url: "{{ workloads_egress_url if workloads_batcher_egress == 'on' else '' }}"
   sequencer:
     receipts_from_egress: "{{ workloads_sequencer_receipts_from_egress }}"
+    tx_events: "{{ workloads_tx_events }}"
   ingress:
     receipt_query_endpoints: "{{ workloads_egress_url if workloads_ingress_receipts_from_egress == 'on' else '' }}"
+    tx_events: "{{ workloads_tx_events }}"
   notifier:
     receipts_from_egress: "{{ workloads_notifier_receipts_from_egress }}"
   # Prometheus scrapes the egress only where it runs.
