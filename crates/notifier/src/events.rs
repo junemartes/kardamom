@@ -15,8 +15,8 @@ use std::time::Instant;
 
 use alloy_primitives::B256;
 use kardamom_log::aeron_live::ReceiptFrame;
-use kardamom_types::Receipt;
 use kardamom_types::tx_events::{TxEvent, TxEventKind, TxEventsView};
+use kardamom_types::{Receipt, TxStatus};
 use metrics::{Counter, Histogram};
 
 use crate::dto::{Stage as Word, TxStatusEvent};
@@ -158,6 +158,26 @@ impl EventsPath {
             if self.take(receipt_event(receipt, Stage::Executed, Some(slot)), now) {
                 send(with_receipt(receipt, Word::Executed));
             }
+        }
+    }
+
+    /// Take a `tx_status` rejection at `now`. The rejection is terminal in
+    /// the table, so a late `sent` of the twin is not sent after it. The
+    /// record of `tx_errors` and `tx_status` stays the input of `rejected`
+    /// until the decisions on #819.
+    pub fn on_rejected(&mut self, status: &TxStatus, now: Instant, mut send: impl FnMut(Send)) {
+        let event = Event {
+            hash: status.tx_hash,
+            stage: Stage::Rejected,
+            block: None,
+            executor: None,
+        };
+        if self.take(event, now) {
+            let identity = status.identity();
+            send(Send {
+                event: TxStatusEvent::from_status(status, identity),
+                identity,
+            });
         }
     }
 

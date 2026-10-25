@@ -41,10 +41,10 @@ pub const WEBHOOK_ATTEMPTS_TOTAL: &str = "kardamom_notifier_webhook_attempts_tot
 pub const WEBHOOK_DELIVERY_SECONDS: &str = "kardamom_notifier_webhook_delivery_seconds";
 
 /// The events path (`KARDAMOM_NOTIFIER_EVENTS`): seconds from the first
-/// observed `accepted` of a hash to the first observed event of each later
-/// stage, by `stage`.
+/// observed event of a hash to the first observed event of each later
+/// stage, by `stage`. A stage counts when an `accepted` came by then.
 pub const STAGE_LATENCY_SECONDS: &str = "kardamom_notifier_stage_latency_seconds";
-/// Seconds from the first observed `accepted` to the receipt of each
+/// Seconds from the first observed event of a hash to the receipt of each
 /// executor on `tx_receipts`, by `executor` (the slot of its session).
 pub const EXECUTED_LATENCY_SECONDS: &str = "kardamom_notifier_executed_latency_seconds";
 /// Seconds from the first `executed` of a hash to its first `receipt`.
@@ -111,11 +111,11 @@ pub fn describe() {
     metrics::describe_counter!(WEBHOOK_ATTEMPTS_TOTAL, "webhook POST attempts, by outcome");
     metrics::describe_histogram!(
         STAGE_LATENCY_SECONDS,
-        "seconds from the first accepted of a hash to each later stage, by stage"
+        "seconds from the first observed event of a hash to each later stage, by stage"
     );
     metrics::describe_histogram!(
         EXECUTED_LATENCY_SECONDS,
-        "seconds from the first accepted of a hash to the receipt of each executor"
+        "seconds from the first observed event of a hash to the receipt of each executor"
     );
     metrics::describe_histogram!(
         MERGE_LATENCY_SECONDS,

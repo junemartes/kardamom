@@ -197,8 +197,14 @@ impl Hub {
                 TxStatus::rejected(hash, &e)
             }
         };
+        // With the path on, only a rejection reaches here, from `tx_status`
+        // or `tx_errors`. It goes through the table, so it is terminal.
+        if let Some(path) = self.events.as_mut() {
+            path.on_rejected(&status, now, fanout(&mut self.ring, &self.live, now));
+            return;
+        }
         let kind = status.kind();
-        match self.ring.insert(&status, Instant::now()) {
+        match self.ring.insert(&status, now) {
             Insert::Stored(stamped) => {
                 metrics::counter!(m::EVENTS_TOTAL, "stage" => kind.as_str()).increment(1);
                 // No receiver is not an error: the ring still serves

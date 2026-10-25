@@ -152,3 +152,29 @@ fn a_frame_that_does_not_read_sends_nothing() {
     path.on_frame(&[0x45, 0x4B, 9], now, |s| out.push(s));
     assert!(out.is_empty());
 }
+
+#[test]
+fn a_rejection_is_terminal_so_a_late_twin_sent_is_not_sent() {
+    use kardamom_types::{TxError, TxErrorReason, TxStatus};
+
+    let now = Instant::now();
+    let mut path = EventsPath::new(64, now);
+    let hash = B256::repeat_byte(6);
+    let error = TxError {
+        sender: Address::repeat_byte(7),
+        nonce: 2,
+        reason: TxErrorReason::DuplicatedTx { expected_nonce: 3 },
+    };
+    let rejected = TxStatus::rejected(hash, &error);
+    let got = sends(&mut path, |p, out| {
+        p.on_rejected(&rejected, now, |s| out.push(s));
+    });
+    assert_eq!(got, [(hash, Stage::Rejected)]);
+    let sent = frame(TxEventKind::Sent, 0x0103, &[hash]);
+    let got = sends(&mut path, |p, out| p.on_frame(&sent, now, |s| out.push(s)));
+    assert!(got.is_empty(), "nothing after a rejection");
+    let got = sends(&mut path, |p, out| {
+        p.on_rejected(&rejected, now, |s| out.push(s));
+    });
+    assert!(got.is_empty(), "the copy of the other sequencer");
+}
