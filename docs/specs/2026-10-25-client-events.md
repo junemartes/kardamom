@@ -295,6 +295,13 @@ Every deploy stays backward compatible: a breaking change goes only through an u
   the executor events off and keep `receipt` only. If a client needs the earliest signal, keep
   them, and only for the first executor copy to the clients.
 
+- **Q8. io_uring in the notifier.** It does not replace the stage table: the table is memory
+  state, and io_uring is a way to submit I/O. It can serve the output side: the WebSocket sends,
+  the webhook posts, and the outbox and cursor writes with their syncs. The `tx_events` ingest
+  gains nothing, because Aeron uses shared memory. Recommended: not in this change. Profile the
+  notifier at the peak of the ramp after P4. If the system calls of the output side are the cost,
+  write a separate spec for an io_uring runtime (tokio-uring, monoio or glommio) on those paths.
+
 ## 9. The PRs
 
 | PR | Repo | Content |
