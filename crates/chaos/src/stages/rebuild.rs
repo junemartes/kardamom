@@ -320,7 +320,18 @@ impl Rebuild<'_> {
             .sealer_seed
             .as_ref()
             .map(|path| vec!["--sealer-seed".to_string(), path.display().to_string()]);
-        [root, output, seed]
+        // The deposits are not in the DA payload: the tool reads them from
+        // the logs of the lockbox. A chain with upgrade deposits rebuilds
+        // to a different root without them.
+        let lockbox = self
+            .harness
+            .lifecycle
+            .vars()
+            .carry
+            .lockbox
+            .clone()
+            .map(|lockbox| vec!["--lockbox".to_string(), lockbox]);
+        [root, output, seed, lockbox]
             .into_iter()
             .flatten()
             .flatten()
