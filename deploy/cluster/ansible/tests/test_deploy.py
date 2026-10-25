@@ -1093,7 +1093,8 @@ class DeployTest(Deploys):
         self.run_deploy(check=True)
         plans = self.api.state['plans']
         self.assertNotIn('egress', plans)
-        flags = {'--exec-frames', '--egress', '--receipt-query-endpoints', '--receipts-from-egress'}
+        flags = {'--exec-frames', '--egress', '--receipt-query-endpoints', '--receipts-from-egress', '--events',
+                 '--executed'}
         for name in ('executor', 'validator', 'batcher', 'ingress', 'notifier'):
             self.assertEqual(flags & set(self.job_args(plans[name])), set(), name)
         self.assertNotIn('receipts_from_egress', self.job_templates(plans['sequencer']))
@@ -1135,6 +1136,18 @@ class DeployTest(Deploys):
         self.assertIn('--receipts-from-egress', self.job_args(plans['notifier']))
         self.assertIn('receipts_from_egress = true', self.job_templates(plans['sequencer']))
         self.assertIn('service "kardamom-egress-metrics|any"', self.job_templates(plans['monitoring']))
+
+    def test_the_notifier_events_path_takes_its_two_switches(self):
+        """KARDAMOM_NOTIFIER_EVENTS and KARDAMOM_NOTIFIER_EXECUTED reach the notifier, and only the notifier."""
+        self.run_deploy({'workloads_notifier_events': 'on'}, check=True)
+        args = self.job_args(self.api.state['plans']['notifier'])
+        self.assertEqual(args[args.index('--events') + 1], 'on')
+        self.assertEqual(args[args.index('--executed') + 1], 'off')
+        self.run_deploy({'workloads_notifier_events': 'on', 'workloads_notifier_executed': 'on'}, check=True)
+        args = self.job_args(self.api.state['plans']['notifier'])
+        self.assertEqual(args[args.index('--executed') + 1], 'on')
+        for name in ('ingress', 'sequencer', 'executor'):
+            self.assertNotIn('--events', self.job_args(self.api.state['plans'][name]), name)
 
     def test_the_egress_nodes_switch_moves_only_the_egress(self):
         """Off, the egress places on the executor nodes. On, it places on

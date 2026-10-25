@@ -224,9 +224,10 @@ removal of `tx_status` leaves no kind unmapped:
     `observed`, and the bit decides a copy: the notifier sends `dropped` once, and only while
     `state` is below `executed`. A drop on `tx_drops` is provisional, as
     `kardamom_getTransactionStatus` says today. So a `receipt` after a `dropped` is sent.
-  - A `rejected` record is final. The sequencer does not order the transaction. It sets `state`
-    to the terminal value, above `included`, so no later event is sent: a late `sent` after a
-    `rejected` is dropped.
+  - A `rejected` record suppresses later `accepted` and `sent` events. A twin can reject a
+    duplicate after the other twin ordered it, so an `executed` or `receipt` overrides a
+    rejection in either arrival order. A rejection never replaces execution or settlement
+    evidence. The terminal value above `included` applies only to admission events.
 - **Loss.** Every stage is best effort (decision 5). MDC offers can fail, for example with
   `NOT_CONNECTED` during a restart, and a publisher drops a batch that it cannot offer (4.8).
   - A lost `accepted`, `sent`, `dropped`, `executed`, `posted` or `included` is not sent again.
@@ -263,7 +264,7 @@ removal of `tx_status` leaves no kind unmapped:
     | 4 | `receipt` |
     | 5 | `posted` |
     | 6 | `included` |
-    | 7 | `rejected`, terminal |
+    | 7 | `rejected`, terminal for admission events; execution takes precedence |
 
   - `observed` is a bitmap, one bit for each stage that really came, for the latencies and for
     the copy of `dropped`. It keeps the bits of `TxStageKind::bit`

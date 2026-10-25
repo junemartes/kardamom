@@ -49,3 +49,8 @@ kardamom-formats.workspace = true
 jsonrpsee = { workspace = true, features = ["ws-client"] }
 kardamom-obs = { path = "../obs", features = ["test-support"] }
 tempfile = { workspace = true }
+dhat = "0.3"
+
+[[test]]
+name = "alloc_stage_table"
+harness = false

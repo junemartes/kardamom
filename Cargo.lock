@@ -4302,6 +4302,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "dhat",
  "hmac",
  "http-body-util",
  "hyper",

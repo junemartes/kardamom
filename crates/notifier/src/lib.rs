@@ -34,6 +34,7 @@
 
 pub mod delivery;
 pub mod dto;
+pub mod events;
 pub mod feed;
 pub mod hub;
 pub mod metrics;

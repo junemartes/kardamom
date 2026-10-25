@@ -38,6 +38,12 @@ struct Stack {
 
 impl Stack {
     async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// A stack with the events path on, with a stage table of `entries`,
+    /// or off with `None`.
+    async fn start_with(stage_table: Option<NonZeroUsize>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let shutdown = CancellationToken::new();
         let (hub, handle) = Hub::new(
@@ -48,6 +54,7 @@ impl Stack {
                 },
                 feed_buffer: NonZeroUsize::new(1024).unwrap(),
                 ingest_buffer: NonZeroUsize::new(1024).unwrap(),
+                stage_table,
             },
             shutdown.clone(),
         );
@@ -89,11 +96,11 @@ impl Stack {
     }
 
     async fn push(&self, status: TxStatus) {
-        self.hub
-            .ingest()
-            .send(Observed::Status(status))
-            .await
-            .unwrap();
+        self.observe(Observed::Status(status)).await;
+    }
+
+    async fn observe(&self, observed: Observed) {
+        self.hub.ingest().send(observed).await.unwrap();
     }
 
     /// Wait until the ring holds `n` events.
@@ -326,6 +333,61 @@ async fn a_webhook_subscriber_down_at_the_event_gets_it_once_when_up() {
         tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .is_err()
+    );
+    stack.stop().await;
+}
+
+/// The events path: the stages come from `tx_events` and the merged
+/// receipts, through the stage table. A `tx_status` record that the path
+/// replaces is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_events_path_sends_the_latest_state_of_each_hash() {
+    use kardamom_log::aeron_live::ReceiptFrame;
+    use kardamom_types::ReceiptBatch;
+    use kardamom_types::tx_events::{TxEventKind, TxEventsFrame};
+
+    let stack = Stack::start_with(NonZeroUsize::new(1024)).await;
+    let client = WsClientBuilder::default()
+        .build(stack.url("ws"))
+        .await
+        .unwrap();
+    let mut sub: Subscription<FeedItem> = client
+        .subscribe(
+            SUBSCRIBE_METHOD,
+            rpc_params![StatusFilter::all()],
+            UNSUBSCRIBE_METHOD,
+        )
+        .await
+        .unwrap();
+    let hash = B256::repeat_byte(0x31);
+    let sender = Address::repeat_byte(0x32);
+    // A `tx_status` stage that the path replaces is not stored.
+    stack.push(TxStatus::offered(hash, sender, 1)).await;
+    let mut accepted = TxEventsFrame::new(TxEventKind::Accepted, 1);
+    accepted.push_accepted(&hash);
+    stack
+        .observe(Observed::Events(accepted.bytes().to_vec()))
+        .await;
+    let mut merged = receipt(hash, sender, 1);
+    merged.block_number = 3;
+    let frame = ReceiptFrame::Batch(ReceiptBatch {
+        receipts: vec![merged],
+        accounts: Vec::new(),
+    });
+    stack.observe(Observed::Merged(frame.clone())).await;
+    // A copy from the other egress is not sent.
+    stack.observe(Observed::Merged(frame)).await;
+    let first = next_status(&mut sub).await;
+    assert_eq!((first.tx_hash, first.stage), (hash, Stage::Accepted));
+    let second = next_status(&mut sub).await;
+    assert_eq!((second.tx_hash, second.stage), (hash, Stage::Receipt));
+    assert_eq!(second.sender, Some(sender));
+    stack.settle(2).await;
+    let ring = stack.hub.replay(StatusFilter::all(), 0, 100).await;
+    assert_eq!(
+        ring.len(),
+        2,
+        "the offered record and the copy are not stored"
     );
     stack.stop().await;
 }
