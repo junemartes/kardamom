@@ -48,7 +48,11 @@ paths of today. This amendment removes them.
       that the clients see;
     - the JSON-RPC reads (decision 46).
 
-    After this change, the egress is the only reader of `tx_receipts` (1002), its boundaries
+    One exception (user decision of 2026-10-25): the notifier may read `tx_receipts` of the
+    executors for its `executed` stage, behind `KARDAMOM_NOTIFIER_EXECUTED` (off by default).
+
+    After this change, the egress is the only reader of `tx_receipts` (1002) apart from that
+    notifier switch, its boundaries
     (1003) and the receipt and account reads of the executor state query. The peer checkpoint
     fetch is not a receipt read, and it stays.
     Reason: one source gives every reader the same view, and each executor has one output.
@@ -274,10 +278,10 @@ The load balancer must read the method of each request (open question 9).
       serves them too (decision 50, updated);
     - no webhooks for the new stage events for now.
 
-    Still open: the executor `executed` tap of #817 (a read of the executors against decision
-    45). The proposal of #817 keeps it behind `KARDAMOM_NOTIFIER_EXECUTED`, off by default, for the
-    evaluation only. Also open: the ingress halt on an explicit `da_lag` status of #817 against
-    decision 49.
+    - the notifier may read `tx_receipts` of the executors for its `executed` stage, behind
+      `KARDAMOM_NOTIFIER_EXECUTED` (an exception to decision 45).
+
+    Still open: the ingress halt on an explicit `da_lag` status of #817 against decision 49.
 
 ## 1. The principle
 
