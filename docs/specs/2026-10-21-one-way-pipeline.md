@@ -108,7 +108,7 @@ paths of today. This amendment removes them.
     on staging (`docs/runbooks/carry-window-rollout.md`), the carried path is the only mode. The
     reference mode (the `TxRef` and the `tx_data` join, the void, the recorded cursor, the
     refetch, `exec_txs`) and the other legacy modes stay only until then. A later PR removes them
-    (A9 in section 9.2 lists what it removes). If another network still runs a reference-born
+    (A9 in section 9.2 points at issue #837, which lists what it removes). If another network still runs a reference-born
     chain then, the removal waits for its activation too (decision 19).
     Reason: two modes double the code of each reader and keep the back arrows of the reference
     mode alive.
@@ -143,14 +143,17 @@ paths of today. This amendment removes them.
     only its own flags.
     - The sealer takes its flags through the generic activation (ingress kind 11), as today.
     - The sequencer reads its flags from the state changes on the egress (decision 53).
-    - A change of the format between the sequencer and the sealer goes in three upgrade
+    - A change of the format between the sequencer and the sealer goes in two upgrade
       transactions:
       1. a sealer flag "accept the new format": the sealer accepts both formats from a block
          boundary;
       2. a sequencer flag "send the new format": the sequencer switches when it sees a block at or
-         after the activation time, whatever the delay of the egress;
-      3. a sealer flag "require the new format", sent only after the sequencer has switched.
-    - No step depends on the delay of the egress.
+         after the activation time, whatever the delay of the egress.
+    - The sealer keeps accepting the old format: the sequencer can turn its flag off on its own.
+      The old format goes later, as code in a release, not by a flag.
+    - No step depends on the delay of the egress. Issue
+      [#836](https://github.com/junemartes/kardamom/issues/836) holds the flags of each service
+      and the next upgrades.
 
     Reason: a service never depends on the schedule of another service, and the order of the
     transactions makes each step safe.
@@ -697,23 +700,11 @@ In this order:
 | A6 | back-pressure in place of the refusal kinds (decisions 48 and 49): `exec_frames` reliable with `fc=min`; the egress publication to the batcher reliable and flow-controlled; the spool budget of the batcher, and no cluster session in the batcher. Sealer, behind a new feature: no DA-lag guard, no posted cursor, no kind 10, no kind-18 frame. Sequencer: remove the handlers of kinds 10 and 18 and their `TxDrop`. Ingress: remove the pause on `da_lag`. The docs, the runbooks and the chaos cases change with it | A4; feature 5 active on every network |
 | A7 | deploy: the load balancer sends the read methods to the egress and the send methods to the ingress. The ingress removes its read methods, its executor query and its sealer session | A3, A5 |
 | A8 | release: the upgrade transaction of the feature of A6 on staging | A6 deployed |
-| A9 | cleanup: the legacy removal (decision 51), listed below | the carry window rollout on staging |
+| A9 | cleanup: the legacy removal (decision 51), planned in issue [#837](https://github.com/junemartes/kardamom/issues/837) | the carry window rollout on staging |
 
-A9 removes:
-
-- record types 0 (`RT_TXREF`) and 4, and the `TxRef` decoders of every reader;
-- the `tx_data` join in the executors, the validator and the batcher, and the rebuild of the
-  batcher from `kardamom_getBlockRefs` and the archives;
-- the void: ingress kind 6, `VoidLedger`, the void votes and the voter ids;
-- the recorded cursor: ingress kind 9, `RecordedCursors`, the record-lag guard and egress kind 13;
-- the archive refetch and the peer fetch;
-- the `exec_txs` stream and its archive;
-- the `tx_data` recorders (#599);
-- the record path of the sealer below decision version 4, with egress kinds 5, 7 and 8 and the
-  contiguity guard;
-- the type-0 refusal of feature 5 and egress kind 18;
-- the posted rule of the heap members below feature 5;
-- the v1 sequencer loop and its republish from `tx_receipts`.
+A9 is the removal of every sealer decision version before 5 and of the legacy paths. Issue
+[#837](https://github.com/junemartes/kardamom/issues/837) holds the one list: its PRs R0 to R10,
+the conditions for the sealer change, and its decisions. This spec does not repeat the list.
 
 After A9, a node of a reference-born chain starts from a checkpoint at or above the activation
 block. It cannot replay the blocks of the reference mode from the order. A9 supersedes P13.
