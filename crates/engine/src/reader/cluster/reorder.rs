@@ -52,7 +52,7 @@ pub(crate) struct Reorder {
     /// in the open block, and the executor would execute it, and stream its
     /// receipt, with the wrong block number.
     catching_up: bool,
-    /// The gauge that each delivered boundary sets.
+    /// The gauge that each delivered boundary and each replay end set.
     pub(crate) metrics: BoundaryMetrics,
     /// The block that the head gauge shows. The gauge does not move down:
     /// a `REPLAY_DONE` can show a head above a boundary that the reorder
