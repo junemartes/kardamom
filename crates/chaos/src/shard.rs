@@ -202,7 +202,7 @@ impl Shard {
             // step needs the steps before it.
             Self::Carry => &[
                 "carry-versions-on",
-                "carry-full-ref-below-v5",
+                "carry-held-offer-after-downgrade",
                 "carry-readers-on-egress",
                 "carry-window-on",
                 "carry-executor-first",

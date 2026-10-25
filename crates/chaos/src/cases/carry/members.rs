@@ -48,7 +48,6 @@ pub(super) struct Gauge {
 }
 
 pub(super) const DECISION_VERSION: Gauge = Gauge::of("kardamom_sealer_decision_version");
-pub(super) const FULL_REF_BELOW_V5: Gauge = Gauge::of("kardamom_sealer_full_ref_below_v5_total");
 pub(super) const REF_REFUSED: Gauge = Gauge::of("kardamom_sealer_ref_refused_total");
 pub(super) const FEED_STATE: Gauge = Gauge::of("kardamom_sealer_feed_state");
 const WINDOW_EXACT: Gauge = Gauge::of("kardamom_sealer_window_exact");

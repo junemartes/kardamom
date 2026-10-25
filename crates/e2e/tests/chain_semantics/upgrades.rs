@@ -183,8 +183,8 @@ async fn s13e_carry_window_rollout() {
 }
 
 /// S13f: a sequencer floor above the version of the chain. The floor 5
-/// on a chain at version 4 costs no stall, and a full reference that the
-/// sealer orders below version 5 runs on every reader.
+/// on a chain at version 4 costs no stall. A transaction parked at version
+/// 5 leaves in version-4 format after a downgrade, and every reader agrees.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s13f_a_wrong_floor_costs_no_stall() {
@@ -196,6 +196,10 @@ async fn s13f_a_wrong_floor_costs_no_stall() {
     )
     .await
     .expect("S13f");
+    let exec_dir = stack.executor_state_dir().expect("executor state dir");
+    let val_dir = stack.validator_state_dir().expect("validator state dir");
+    stack.shutdown_graceful().await.expect("graceful shutdown");
+    consistency::verify_state_dirs(&exec_dir, &val_dir).expect("S13f persisted state");
 }
 
 /// S13g: the carry mode from genesis on a new chain. Every member starts at
