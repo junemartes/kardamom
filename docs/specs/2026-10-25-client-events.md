@@ -1,22 +1,33 @@
 # Client events from one-way stage publications, and the egress on its own nodes
 
-Status: draft, revision 6, 2026-10-25. The decisions in section 1 are the user's (2026-10-25).
-Section 10 lists the changes from revision 1 and from revision 3.
+Status: draft, revision 7, 2026-10-25. The decisions in section 1 are the user's (2026-10-25).
+Section 10 lists the changes of each revision.
 
 ## 1. Decisions
 
 1. The ingress never looks up receipts. It has no receipt cache, no receipt query and no receipt
    feed.
-2. Receipts reach clients by push: WebSocket subscriptions and webhooks. The notifier serves both.
-   The notifier and the egress stay two processes.
+2. Receipts reach clients by push. The notifier serves the WebSocket subscriptions. The notifier
+   and the egress stay two processes.
+   - The egress serves every other RPC read endpoint: `eth_getTransactionReceipt`,
+     `kardamom_getTransactionStatus` and the other read methods. The spec of #819 (decision 46)
+     owns "the egress serves every read". This spec covers only the receipt and status reads
+     (4.5).
+   - The webhooks of the notifier are removed (the user, 2026-10-25: "Let's remove the webhooks
+     for now then. Later on we should add support via a task queue like sqs"). The removal takes
+     the registry, the outbox, the cursors, the delivery loop, the forwarding of registrations to
+     the peers, the sharding by subscription, the state directory `/opt/kardamom/notifier` and
+     the move procedure of that state. So the notifier becomes stateless.
+   - Offline delivery comes later, through a task queue such as SQS, in its own spec.
 3. There is no "sealed" status. The client events come from one-way stage publications:
 
    | Stage | Publisher | Stream that the notifier reads |
    |---|---|---|
    | `accepted` | ingress | `tx_events` (new) |
    | `sent` | sequencer | `tx_events` (new, in place of the `Offered` status of each transaction) |
-   | `dropped` | sequencer | `tx_drops` (exists, #768), and `tx_events` for a final rejection |
-   | `executed` | executor, each of them | `tx_receipts` (exists), for the evaluation only (Q7) |
+   | `dropped` | sequencer | `tx_drops` (exists, #768) |
+   | `rejected` | sequencer | `tx_events` (new, kind 3) |
+   | `executed` | executor, each of them | `tx_receipts` (exists), behind `KARDAMOM_NOTIFIER_EXECUTED` (decision 9) |
    | `receipt` | egress | `egress_receipts` (exists), with its rollback frames |
    | `posted` | batcher | `tx_events` (new, once for each batch) |
 
@@ -31,10 +42,18 @@ Section 10 lists the changes from revision 1 and from revision 3.
    `chain_status` never starts a halt, and never keeps one. The reason is decision 5: a
    best-effort stream never stops admission. The guards of the sealer stay the real stop
    (4.6).
+8. Drops and refusals are pushed as events too (the user, 2026-10-25): `dropped` from `tx_drops`,
+   and `rejected` from the sequencer (`tx_events` kind 3). The egress status API
+   (`kardamom_getTransactionStatus`) also serves them.
+9. The notifier may read receipts from the executors (the user, 2026-10-25: "It is fine for the
+   notifier to read from the executor"). The `executed` tap from `tx_receipts`, behind
+   `KARDAMOM_NOTIFIER_EXECUTED`, is an exception to #819 decision 45 (the services read receipts
+   from the egress).
 
 For now the notifier reads both the executors and the egress, so that the stages can be measured
-apart: the time of each executor, and the time from the executors to the merged receipt. A switch
-of the notifier turns the executor tap off after the evaluation (Q7). The executors and the egress
+apart: the time of each executor, and the time from the executors to the merged receipt. The
+executor tap stays behind `KARDAMOM_NOTIFIER_EXECUTED`, off by default, for the evaluation only.
+The user decided that it may stay (decision 9). The executors and the egress
 publish nothing new: their streams already carry these stages.
 
 The `dropped` stage is not in the user's list. It is here because without it a client sees `sent`
@@ -312,11 +331,15 @@ removal of `tx_status` leaves no kind unmapped:
   - The shards of P5 (section 9) split that work. Q4 holds the step after them.
 - **The shards (P5).**
   - Each instance reads every batch.
-  - Each instance keeps only the hashes of its shard in its table. The shard is the rendezvous
-    hash of the webhooks.
+  - Each instance keeps only the hashes of its shard in its table. The shard is a rendezvous hash
+    of the transaction hash over the instance count.
   - A WebSocket client subscribes on the instance of its shard.
   - An instance that gets a subscription of another shard forwards it to that instance.
   - The decode of each batch stays on every instance.
+- **No state to move.** With the webhooks removed (decision 2), the notifier holds no state on
+  disk. Its ring and its stage table are memory only. So more instances are a change of
+  `KARDAMOM_NOTIFIER_COUNT` and of the notifier nodes only, with no copy of a state directory. A
+  client reconnects when an instance moves.
 
 ### 4.5 The egress reads
 
@@ -440,6 +463,17 @@ removal of `tx_status` leaves no kind unmapped:
   5. Stop the other instance, and check it.
 
   With two instances, one always serves.
+- **On staging (2026-10-25).** P1 (kardamom-infra #81) and P2 (#820) are merged and deployed. The
+  egress runs on `egress-0` and `egress-1`.
+- **The lesson of #831.** The deploy that turned the switch on was also a new release. A change of
+  the image together with the constraint makes Nomad place both instances again in one rolling
+  update, so step 3 never happens. The second new instance filled from the first, and both
+  stores started at the sealer window. The batcher then lacked blocks 298870 to 298903, and the
+  user accepted a DA gap on staging. So:
+  - Turn the switch on in a deploy that changes nothing else of the egress job. Then the change is
+    an in-place update, and the move of step 3 runs one instance at a time.
+  - #831 holds the fixes: a new instance fills from the posted head of the batcher, and the deploy
+    refuses an image change and a constraint change of the egress in one update.
 
 ### 4.8 The hot path budget
 
@@ -566,9 +600,13 @@ switch (Q7), and the A/B ramp measures it.
   of each executor on `tx_receipts`. So a slow executor shows. Only with the executor tap on.
 - `kardamom_notifier_merge_latency_seconds`: the time from the first `executed` to the first
   `receipt`: the cost of the hop to the egress and its merge. Only with the executor tap on.
-- `kardamom_tx_events_published_total{origin,kind}` and
-  `kardamom_tx_events_dropped_total{origin,kind}` on each publisher. A drop of the ingress queue
-  counts here too.
+- The drops of the publishers (as built in P3, #821 and #822): a frame that an offer refuses counts
+  in `kardamom_log_best_effort_dropped_total{stream_id="1013"}`. The offer runs on the Aeron
+  thread, so the publisher does not see each result, and the counter has no origin or kind. A
+  full queue of the ingress counts in `kardamom_tx_events_queue_full_total{origin}`. The gap count
+  of the notifier (`kardamom_notifier_event_gaps_total{origin}`) gives the view for each origin.
+- A publisher sends a frame when it is full or 1 ms old, not once for each poll cycle. That caps
+  the copy of a frame at 1,000 a second for each kind.
 - `kardamom_notifier_event_gaps_total{origin}` and
   `kardamom_notifier_catchup_receipts_total{source}`.
 - `kardamom_notifier_rollback_past_posted_total`: a rollback that reached an entry at `posted` or
@@ -619,15 +657,16 @@ transaction and a feature flag. Each step has a switch, off by default.
   tests use `--ack validated`, and the push of `receipt` gives a client the same certainty sooner.
 - **Q6. `tx_errors`.** Recommended: the `dropped` and `rejected` events cover the client side. The ingress reads
   `tx_errors` only for the receipt ack, so it goes with Q5.
-- **Q7. The executor tap after the evaluation.** Recommended: keep the switch
-  `KARDAMOM_NOTIFIER_EXECUTED`, off by default. Turn it on for the evaluation. Decide from the two
-  latencies of section 6 and from the driver bandwidth that the A/B ramp measures on the executor
-  nodes. If the merge latency stays below 1 ms at the peak, turn the tap off, and keep `receipt`
-  only. If a client needs the earliest signal, keep it, and send only the first executor copy to
-  the clients.
+- **Q7. The executor tap after the evaluation.** The user decided that the notifier may read the
+  executors (decision 9). So the tap stays, behind `KARDAMOM_NOTIFIER_EXECUTED`, off by default.
+  The open part is the default only. Recommended: turn it on for the evaluation, and decide from
+  the two latencies of section 6 and from the driver bandwidth that the A/B ramp measures on the
+  executor nodes. If the merge latency stays below 1 ms at the peak, keep it off by default. If a
+  client needs the earliest signal, turn it on, and send only the first executor copy to the
+  clients.
 - **Q8. io_uring in the notifier.** It does not replace the stage table: the table is memory
-  state, and io_uring is a way to submit I/O. It can serve the output side: the WebSocket sends,
-  the webhook posts, and the outbox and cursor writes with their syncs. The `tx_events` ingest
+  state, and io_uring is a way to submit I/O. It can serve the output side: the WebSocket sends.
+  The webhook posts and the outbox writes go with the webhooks (decision 2). The `tx_events` ingest
   gains nothing, because Aeron uses shared memory. Recommended: not in this change. Profile the
   notifier at the peak of the ramp after P4. If the system calls of the output side are the cost,
   write a separate spec for an io_uring runtime (tokio-uring, monoio or glommio) on those paths.
@@ -638,13 +677,14 @@ Each PR merges alone. Each new path is behind a switch that is off by default, u
 
 | PR | Repo | Content | Depends on |
 |---|---|---|---|
-| P1 | kardamom-infra | the egress nodes | none |
-| P2 | kardamom | `KARDAMOM_EGRESS_NODES` and the constraint `role=egress`, the README move steps | none (off by default); the move needs P1 |
-| P3 | kardamom | the `tx_events` hot frame and the batcher frame, with their formats and golden tests; the publishers of the ingress, the sequencer and the batcher; the `chain_status` stream; `KARDAMOM_TX_EVENTS`; the allocation cases and the micro-benchmark of 4.8; the e2e failure case with the notifier down | none |
-| P4 | kardamom | the notifier on `tx_events` and its taps (`egress_receipts` with the rollback frames, `tx_drops`, and `tx_receipts` behind `KARDAMOM_NOTIFIER_EXECUTED`): the stage table with its state and bitmaps, the copies, the latest-state rule, the rollback, the gaps, the stage metrics, `KARDAMOM_NOTIFIER_EVENTS` | P3 |
+| P1 | kardamom-infra | the egress nodes. **Done:** kardamom-infra #81, applied on staging | none |
+| P2 | kardamom | `KARDAMOM_EGRESS_NODES` and the constraint `role=egress`, the README move steps. **Done:** #820, deployed on staging (see the lesson of #831 in 4.7) | none (off by default); the move needs P1 |
+| P3 | kardamom | **Done:** #821 (the `tx_events` frame, its format and stream) and #822 (the `accepted` and `sent` publishers of the ingress and the sequencer, `KARDAMOM_TX_EVENTS`, the allocation cases and the micro-benchmark). Left: the `rejected` record of the sequencer (kind 3), the batcher frame and its `posted`/`included` publisher, the `chain_status` stream, and the e2e case with the notifier down | none |
+| P4 | kardamom | **Done (core):** #823 (the stage table: the state and the bitmaps, the latest-state rule, the rollback) and #824 (the events path: `tx_events`, the `egress_receipts` tap with the rollbacks, the `tx_receipts` tap behind `KARDAMOM_NOTIFIER_EXECUTED`, the gaps, the stage metrics, `KARDAMOM_NOTIFIER_EVENTS`). Left: the `dropped` events from the `tx_drops` tap and the `rejected` events of `tx_events` kind 3 (decision 8) | P3 |
+| P4a | kardamom | the removal of the notifier webhooks (decision 2): the registry, the outbox, the cursors, the delivery loop, the forwarding of registrations to the peers, the sharding by subscription, `--peers`, the state directory `/opt/kardamom/notifier` and its volume, the move procedure of the webhook state in `deploy/cluster/README.md`, their tests and docs. No switch: no client uses webhooks, and staging had no webhook state. The rollout checks first that notifier-0 holds no registration (`/opt/kardamom/notifier` is empty). It comes before P7, the client feed work | none |
 | P5 | kardamom | the shards of the notifier (4.4) | P4 |
-| P6 | kardamom | the ingress halt from the explicit halts of `ChainStatus`, with no silence rule and a lifetime of 30 s for an explicit halt (`KARDAMOM_INGRESS_CHAIN_STATUS`), the age gauge and its alert, the users of the `sealer_no_quorum` halt of section 5 (the chaos recovery stage and cases, the proofs, the alert, the gate excuse, the runbooks, `docs/chaos-suite.md`, the chain status dashboard), the e2e scenario on `tx_events`, the dashboard panels | P3 |
-| P7 | kardamom | the receipt feed on the notifier; the egress short wait, the fallback and `/v1/receipts`; the capped notifier catch-up; the receipt endpoint flag of the canary, the chaos suite, the e2e harness and the load tool | P4 |
+| P6 | kardamom | the ingress halt from the explicit halts of `ChainStatus`, with no silence rule and a lifetime of 30 s for an explicit halt (`KARDAMOM_INGRESS_CHAIN_STATUS`), the age gauge and its alert, the users of the `sealer_no_quorum` halt of section 5 (the chaos recovery stage and cases, the proofs, the alert, the gate excuse, the runbooks, `docs/chaos-suite.md`, the chain status dashboard), the e2e scenario on `tx_events`, the dashboard panels | P3. Waits for #819 decisions 48-49 (no custom refusal kinds, no DA-lag guard) |
+| P7 | kardamom | after P4a. The receipt feed (`kardamom_subscribeReceipts`) on the notifier; the egress short wait, the executor fallback and `/v1/receipts`; the capped catch-up of the notifier; the receipt endpoints of the clients: the canary, the chaos suite, the e2e harness and the load tool | P4, P4a |
 | P8 | kardamom-infra | the second endpoint for the egress reads, and the infra variables of the new switches | P7 |
 | P9 | kardamom | the removals of section 5, the ack default `validated`, `docs/specs/egress-node-spec.md` marked superseded, the docs | P6, P7, P8 on staging for a week |
 
@@ -693,3 +733,15 @@ the chain", and "we should ensure this has a negligible impact on the hot path".
 | Review of revision 5, finding 4: a rollback resets only an entry at `executed` or `receipt`. An entry at `posted` or above is counted (`kardamom_notifier_rollback_past_posted_total`) and kept. | 4.4 |
 | Review of revision 5, finding 5: the `observed` bits keep `TxStageKind::bit` and take the free bits for `receipt`, `posted`, `included` and `dropped`. `rolled_back` has no bit. | 4.4 |
 | Review of revision 4, finding 3 (minor): a frame of about 34 KB does not fit `try_claim`. The publishers use `offer` with fragmentation, and the notifier uses a fragment assembler. | 4.8 |
+
+### 10.3 Changes for revision 7
+
+| Change | Sections |
+|---|---|
+| The user, 2026-10-25: the subscriptions are the notifier, and the egress serves every other read endpoint (#819 decision 46 owns the rest of the reads). | 1 (decision 2) |
+| The user: the webhooks are removed for now, and offline delivery comes later through a task queue such as SQS. The notifier becomes stateless. A new PR P4a removes them, and more notifier instances are then a count change only. | 1 (decision 2), 4.4, Q8, 9 (P4a, P7) |
+| The user: drops and refusals are pushed as events too, and the egress status API serves them. `rejected` gets its own row. | 1 (decisions 3 and 8), P3, P4 |
+| The user: the notifier may read the executors. The `executed` tap is decision 9, an exception to #819 decision 45. Q7 keeps only its default open. | 1 (decision 9), Q7 |
+| The egress runs on its own nodes on staging, and the lesson of #831: an image change and a constraint change in one deploy place both instances again. | 4.7 |
+| The metric deviation of P3: the drop counters as built, and a frame flush when full or 1 ms old. | 6 |
+| P1, P2, P3 (#821, #822) and the core of P4 (#823, #824) are done. The rest of P3 and P4 and the scope of P7 are listed. P6 waits for #819 decisions 48-49. | 9 |
