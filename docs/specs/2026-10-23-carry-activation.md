@@ -21,6 +21,10 @@
 - Section 17 maps each finding of the review of revision 1 to its change, and section 18 each
   finding of the reviews of revisions 2 and 3.
 - Also builds on #768 (the `tx_drops` stream and `TxDrop`), for the drop record of section 5.
+- Note of 2026-10-25: the amendment of `docs/specs/2026-10-21-one-way-pipeline.md` (decisions 45
+  to 52) changes this spec in two places. Decision 48 removes the kind-18 frame and its `TxDrop`
+  (section 4.3). Decision 49 removes the DA-lag guard (section 8). Where they differ, the
+  amendment wins.
 
 ## 1. The problem
 
@@ -200,6 +204,11 @@ There are two rules. They change at two defined points of the same log entry.
   replay has a start point on each side.
 
 ### 4.3 The type-0 refusal
+
+> Note of 2026-10-25: decision 48 of the one-way spec amendment replaces the kind-18 frame and the
+> `TxDrop` with the reason `SealerRefusedReference`. The sealer still does not order a type-0
+> reference under feature 5, but it sends no frame. See amendment A.3 of
+> `docs/specs/2026-10-21-one-way-pipeline.md`.
 
 - While the rules of feature 5 apply, the member refuses a transaction reference of record type
   0 (`RT_TXREF`). It does not order it, and it does not drop it silently.
@@ -573,7 +582,7 @@ No step waits for a later step.
 | A sequencer floor above the version of the chain | The sequencer offers type 7 until the first kind 17 lowers its version. The sealer orders each such offer below version 5 as type 7, and counts it. Every reader with the decoder of 7.4 runs it. |
 | A member with the retained file (snapshot 12 or 17) gets kind 11 of feature 5 | Outcome `UNSUPPORTED`, counted, never stored (4.1). Every member of such a chain gives the same outcome. The gate refuses feature 5 on such a chain. |
 | An egress instance restarts | It reads R from `ref-mark` (7.2). R does not go back, so the gate and the preflight do not see a false low value. |
-| Every egress instance is down while the window is exact | A reader below the window cannot recover until an egress instance is back. The DA-lag guard does not change. The distance alert of the egress (one-way spec 6.4) fires first. |
+| Every egress instance is down while the window is exact | A reader below the window cannot recover until an egress instance is back. The DA-lag guard does not change (superseded by decision 49 of the one-way spec, 2026-10-25: the guard goes, and back-pressure bounds the DA lag). The distance alert of the egress (one-way spec 6.4) fires first. |
 | A member without the feed setting | It runs no feed. Its executor stays in reference mode. Nothing else changes. |
 | The feed ring is full | The feed gaps (`GAPPED`). The executor asks again. The state and the sessions do not change. |
 | A fleet rebuild from a seed | A seeded member runs version 3 with no feature (`SealerSeed` holds no rules). The runbook sets the sequencer floor to 0, moves the executors to reference mode, and sends features 3, 4 and 5 again. #667 stays open for the seed with the rules. |
