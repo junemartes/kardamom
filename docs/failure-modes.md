@@ -758,7 +758,7 @@ The single-replica cases prove that a twin covers a loss. These cases prove the 
 - **A whole sequencer lane**
   - Trigger: both replicas of lane 0 die, one on each sequencer node.
   - Effect: the senders of the lane are unordered until a replica returns with empty state. That replica learns the floor of each sender from the executors.
-  - Recovery: both replicas come back healthy. `kardamom_sequencer_ref_below_floor` reads zero on both.
+  - Recovery: both replicas come back healthy. On the v1 loop, `kardamom_sequencer_ref_below_floor` reads zero on both. The v2 loop cannot strand a reference and does not export the gauge.
   - Proof: `sequencer-lane-loss-recover`.
 - **Pipeline blackout**
   - Trigger: every ingress, sequencer, sealer, executor and aux node dies at once. Only the control node stays, with the orchestrator and the L1. All nodes start in one call, in no set order.
@@ -773,7 +773,7 @@ The coordinated cases take one class down, or every node. These cases take two o
 - **The ingresses and the sequencers**
   - Trigger: both ingress tasks and all four sequencer tasks die, and both jobs stop. The sealers run on.
   - Effect: the sealers seal empty blocks. The executor block gauge advances. The applied-transaction counter stays flat.
-  - Recovery: the sequencers return, then the ingresses. The da-watcher publishes again the epochs that reached no sequencer. The sealer's L1 origin reaches the last published epoch. No lane-0 replica holds a ref below a floor.
+  - Recovery: the sequencers return, then the ingresses. The da-watcher publishes again the epochs that reached no sequencer. The sealer's L1 origin reaches the last published epoch. On the v1 loop, no lane-0 replica holds a ref below a floor.
   - Proof: `ingress-sequencer-loss-recover`.
 - **The ingresses and the sealers**
   - Trigger: both ingress tasks die and the job stops. All three sealer nodes die.
@@ -822,7 +822,7 @@ The ordering shard keeps the executors up. These cases take the executors down w
   - Trigger: the sequencer tasks, the executor tasks and the redis job die, and all three jobs stop. No source of a sender floor is left.
   - Effect: the head advances. A submit parks at the ingress and times out: no sequencer orders it.
   - Recovery: the sequencers return first with no floor. Each established sender parks, and the replica asks for its floor. The lookup misses Redis (down) and fails at the executors (down), so the sender stays parked and the replica asks again on its next park. It never seeds a floor. Redis returns empty 30 s later. The executors return 30 s after that and answer the lookups. The floors rise, the parked transactions drain in nonce order.
-  - Proof: `sequencer-executor-redis-loss`, by name only (see "Known gaps"). Every lane-0 replica shows a lookup request and an answer from an executor or from Redis, `kardamom_sequencer_ref_below_floor` reads zero, and the load verdict proves that no nonce gap remains.
+  - Proof: `sequencer-executor-redis-loss`, by name only (see "Known gaps"). Every lane-0 replica shows a lookup request and an answer from an executor or from Redis, `kardamom_sequencer_ref_below_floor` reads zero on the v1 loop, and the load verdict proves that no nonce gap remains.
 - Every case ends with the common tail. The load verdict proves that no accepted transaction was lost and that the receipts are in nonce order.
 
 ## Validator (off the hot path, halts on divergence)

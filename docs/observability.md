@@ -621,6 +621,7 @@ Each block commit records these steps:
   - It counts the buffered references that are below the floor of their sender.
   - It is 0 unless a rewind or a floor update stranded a reference. Nothing drains such a reference.
   - The sender is then stuck, and the client sees no error. Any value above 0 is a defect.
+  - Only the v1 loop exports it. The v2 loop cannot strand a reference: each parked transaction expires, and a forwarded run that no row confirms is lost after the loss window.
 - `kardamom_sequencer_fee_rejected_total{partition}` counts the envelopes that the fee gate refused.
   Each one gets a `FeeInvalid`, `FeeTooLow`, or `InsufficientFunds` error on `tx_errors`.
   See [priority-fees.md](priority-fees.md).

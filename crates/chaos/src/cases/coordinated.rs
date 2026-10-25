@@ -14,7 +14,8 @@ use crate::harness::Harness;
 use crate::probes::CLUSTER_TASK;
 
 /// The gauge of buffered refs below their sender's floor. It is zero
-/// unless a restart or a rewind stranded a ref.
+/// unless a restart or a rewind stranded a ref. Only the v1 loop exports
+/// it. See [`crate::knobs::SequencerLoop::can_strand_refs`].
 const REF_BELOW_FLOOR: &str = "kardamom_sequencer_ref_below_floor";
 
 /// The jobs a blackout takes down, with their allocation counts.
@@ -58,7 +59,7 @@ pub(crate) async fn ingress_pair_loss_recover(h: &mut Harness) -> anyhow::Result
 /// node. No twin keeps the lane: its senders are unordered until a
 /// replica returns with empty state and learns each sender's floor
 /// from the executors. Both replicas must come back healthy, no ref may
-/// sit below a floor, and the pipeline must progress. The load is
+/// sit below a floor (v1 loop), and the pipeline must progress. The load is
 /// pinned to shard 0, so the case's sender rides the killed lane.
 pub(crate) async fn sequencer_lane_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "sequencer-lane-loss-recover";
@@ -86,7 +87,16 @@ pub(crate) async fn sequencer_lane_loss_recover(h: &mut Harness) -> anyhow::Resu
 }
 
 /// No replica of lane 0 holds a buffered ref below its sender's floor.
+/// The v2 loop cannot strand a ref and exports no such gauge, so the
+/// check passes on it. The recovery probe then proves that the senders
+/// send again.
 pub(crate) async fn assert_no_ref_below_floor(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+    if !h.knobs.sequencer_loop.can_strand_refs() {
+        crate::log(format!(
+            "{ctx}: the v2 loop expires every transaction it holds, so no ref can sit below a floor"
+        ));
+        return Ok(());
+    }
     for i in 0..h.probes.sequencers.len() {
         let stranded = h.probes.seq_lane0_metric(i, REF_BELOW_FLOOR).await;
         anyhow::ensure!(

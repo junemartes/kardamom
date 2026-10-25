@@ -79,6 +79,37 @@ impl ExecutorNodes {
     }
 }
 
+/// The publish loop of the sequencers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequencerLoop {
+    /// The v1 loop: a ledger of offers and a resync from receipt floors.
+    V1,
+    /// The v2 loop (`KARDAMOM_SEQUENCER_ADMISSION=on`): the admission
+    /// filter. A carry-born cluster always runs it.
+    V2,
+}
+
+impl SequencerLoop {
+    /// Whether the loop can strand a ref below the floor of its sender,
+    /// and so exports `kardamom_sequencer_ref_below_floor`.
+    ///
+    /// The v1 loop buffers refs with no deadline. A rewind or a floor
+    /// update can leave one below the floor, where no drain reaches it.
+    /// The sender is then stuck for good.
+    ///
+    /// The v2 loop cannot strand a ref. Each parked transaction has a mark
+    /// that expires it after the park width or the transaction TTL. Each
+    /// forwarded run has a mark that loses it after the loss window, and
+    /// the sender then sends from its chain nonce again. A new state
+    /// refuses each parked transaction below its nonce. So no transaction
+    /// waits for good, and the recovery probe of the case proves that the
+    /// senders send again.
+    #[must_use]
+    pub fn can_strand_refs(self) -> bool {
+        self == Self::V1
+    }
+}
+
 /// The suite settings. See the module doc for the defaults.
 /// One fixed-rate run of the sustained-load stage.
 #[derive(Debug, Clone)]
@@ -187,6 +218,9 @@ pub struct Knobs {
     /// batcher and the validator read the egress, so no consumer replays
     /// from the sealer.
     pub genesis_carry: bool,
+    /// The publish loop of the sequencers: the v2 loop on a carry-born
+    /// cluster or with `KARDAMOM_SEQUENCER_ADMISSION=on`.
+    pub sequencer_loop: SequencerLoop,
     /// The hard cap of the adaptive retention freeze.
     pub retention_freeze_cap: Duration,
     /// How long one L1 fault of the chaos-l1 cases stays active.
@@ -373,6 +407,11 @@ impl Knobs {
                 ExecutorNodes::Executor
             },
             genesis_carry,
+            sequencer_loop: if genesis_carry || env.on("KARDAMOM_SEQUENCER_ADMISSION") {
+                SequencerLoop::V2
+            } else {
+                SequencerLoop::V1
+            },
             retention_freeze_cap: env.secs("RETENTION_FREEZE_CAP_S", 600)?,
             l1_fault: env.secs("L1_FAULT_S", 60)?,
             l1_tps: env.nonzero_u32("L1_CASE_TPS", 50)?,
@@ -446,6 +485,7 @@ mod tests {
         let reference = Knobs::read(&[]).unwrap();
         assert_eq!(reference.executor_nodes, ExecutorNodes::Executor);
         assert!(!reference.genesis_carry);
+        assert_eq!(reference.sequencer_loop, SequencerLoop::V1);
         let vars = DeployVars {
             genesis_carry: true,
             cluster_retention: Some(6144),
@@ -458,6 +498,7 @@ mod tests {
         assert_eq!(carry.executor_nodes.node(2), "sealer-2");
         assert_eq!(carry.cluster_retention.map(NonZeroU64::get), Some(6144));
         assert!(carry.checkpoint_log && !carry.exec_cursor);
+        assert_eq!(carry.sequencer_loop, SequencerLoop::V2);
         let moved = DeployVars {
             carry: crate::lifecycle::CarrySwitches {
                 exec_on_sealers: true,
@@ -468,6 +509,27 @@ mod tests {
         let moved = Knobs::deployed(&[], &moved).unwrap();
         assert_eq!(moved.executor_nodes, ExecutorNodes::Sealer);
         assert!(!moved.genesis_carry);
+        assert_eq!(moved.sequencer_loop, SequencerLoop::V1);
+    }
+
+    #[test]
+    fn the_admission_switch_selects_the_v2_loop() {
+        let vars = DeployVars {
+            carry: crate::lifecycle::CarrySwitches {
+                admission: true,
+                ..crate::lifecycle::CarrySwitches::default()
+            },
+            ..DeployVars::default()
+        };
+        let knobs = Knobs::deployed(&[], &vars).unwrap();
+        assert!(!knobs.genesis_carry);
+        assert_eq!(knobs.sequencer_loop, SequencerLoop::V2);
+    }
+
+    #[test]
+    fn only_the_v1_loop_can_strand_a_ref() {
+        assert!(SequencerLoop::V1.can_strand_refs());
+        assert!(!SequencerLoop::V2.can_strand_refs());
     }
 
     #[test]
