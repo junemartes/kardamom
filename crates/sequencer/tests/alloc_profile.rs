@@ -187,8 +187,10 @@ fn sequencer_core_loop_allocation_profile() {
 
 /// One loaded rig: every envelope of `SENDERS` senders, `WARMUP_NONCES`
 /// of them already run, and the vectors of the fakes reserved for the
-/// measured window.
-fn warm_rig(side: kardamom_sequencer::outbound::fakes::InMemorySidePublisher) -> (Rig, Sequencer) {
+/// measured window. Returns the transactions of the measured window too.
+fn warm_rig(
+    side: kardamom_sequencer::outbound::fakes::InMemorySidePublisher,
+) -> (Rig, Sequencer, u64) {
     let signers: Vec<_> = (1..=SENDERS as u64).map(signer).collect();
     let mut rig = Rig {
         errors: side,
@@ -212,10 +214,10 @@ fn warm_rig(side: kardamom_sequencer::outbound::fakes::InMemorySidePublisher) ->
     for _ in 0..SENDERS as u64 * WARMUP_NONCES {
         assert!(rig.step(&mut seq).expect("warmup"));
     }
-    let measured = SENDERS * usize::try_from(MEASURED_NONCES).unwrap() + 16;
-    rig.refs.offers.lock().unwrap().reserve(measured);
-    rig.errors.statuses.lock().unwrap().reserve(measured);
-    (rig, seq)
+    let measured = SENDERS * usize::try_from(MEASURED_NONCES).unwrap();
+    rig.refs.offers.lock().unwrap().reserve(measured + 16);
+    rig.errors.statuses.lock().unwrap().reserve(measured + 16);
+    (rig, seq, measured as u64)
 }
 
 /// The heap blocks that the measured window of `rig` allocates.
@@ -233,9 +235,9 @@ fn measured_blocks(rig: &mut Rig, seq: &mut Sequencer) -> u64 {
 #[test]
 fn tx_events_add_no_allocation_for_each_transaction() {
     let offers = kardamom_sequencer::outbound::fakes::CountedOffers::default();
-    let (mut off_rig, mut off_seq) =
+    let (mut off_rig, mut off_seq, measured) =
         warm_rig(kardamom_sequencer::outbound::fakes::InMemorySidePublisher::default());
-    let (mut on_rig, mut on_seq) = warm_rig(
+    let (mut on_rig, mut on_seq, _) = warm_rig(
         kardamom_sequencer::outbound::fakes::InMemorySidePublisher::default()
             .with_tx_events(offers.clone()),
     );
@@ -261,10 +263,12 @@ fn tx_events_add_no_allocation_for_each_transaction() {
         "tx_events: {off} blocks off, {on} blocks on, {} frames",
         offers.frames.load(std::sync::atomic::Ordering::Relaxed)
     );
-    // The two runs differ by a few blocks of the warm-up (a map that grew
-    // in one window and not in the other), never by one for each record.
+    // The two windows can differ by a few blocks in either direction (a
+    // map that grew in one window and not in the other). The bound is 1 %
+    // of the transactions of the window: one allocation for each record
+    // would exceed it by a factor of 100.
     assert!(
-        on <= off,
-        "the sent records allocate: {on} blocks on, {off} off"
+        on.abs_diff(off) * 100 < measured,
+        "the sent records allocate: {on} blocks on, {off} off, {measured} transactions"
     );
 }

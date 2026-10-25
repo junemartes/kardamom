@@ -87,9 +87,10 @@ impl FrameOffer for TxEventsPublisherHandle {
     }
 }
 
-/// The frames of one publisher of `tx_events`: one frame for each kind. An append copies the record into the frame. A frame
-/// goes out when it is full, or at the first [`Self::flush_due`] after it
-/// is [`FRAME_MAX_AGE`] old. The sink never waits: a refused offer drops
+/// The frames of one publisher of `tx_events`: one frame for each kind.
+/// An append copies the record into the frame. A frame goes out when it
+/// is full, or at the first [`Self::flush_due`] after it is
+/// [`FRAME_MAX_AGE`] old. The sink never waits: a refused offer drops
 /// the frame (see [`TxEventsPublisherHandle::publish_lossy`]).
 pub struct TxEventsSink<P = TxEventsPublisherHandle> {
     publisher: P,
