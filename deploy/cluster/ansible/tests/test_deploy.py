@@ -20,6 +20,8 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import yaml
+
 ANSIBLE = Path(__file__).resolve().parents[1]
 SERVICES = ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher',
             'batcher', 'state-mirror', 'notifier', 'da-store', 'canary']
@@ -52,13 +54,13 @@ MEMBER_CARRY = {'decisionVersion': 5, 'retainedStore': 'heap', 'carryWindow': Fa
 FORMATS = (ANSIBLE.parents[2] / 'formats.toml').read_text()
 # The filter of the notifier node preflight, and its meaning on a node.
 # A Nomad 1.9 agent evaluates the filter on the whole node.
-NOTIFIER_NODE_FILTER = ('Meta.roles matches "(^|,) *notifier *(,|$)" and Status == "ready" '
-                        'and SchedulingEligibility == "eligible"')
+ROLE_NODE_FILTER = ('Meta.roles matches "(^|,) *{role} *(,|$)" and Status == "ready" '
+                    'and SchedulingEligibility == "eligible"')
 
 
-def notifier_node(node):
-    """Whether NOTIFIER_NODE_FILTER admits the node."""
-    return (re.search(r'(^|,) *notifier *(,|$)', node['Meta'].get('roles', '')) is not None
+def role_node(node, role):
+    """Whether ROLE_NODE_FILTER of `role` admits the node."""
+    return (re.search(rf'(^|,) *{role} *(,|$)', node['Meta'].get('roles', '')) is not None
             and node['Status'] == 'ready' and node['SchedulingEligibility'] == 'eligible')
 
 
@@ -274,11 +276,12 @@ class NomadAPI(BaseHTTPRequestHandler):
             self.respond({'ID': parts[3], 'Status': 'complete',
                           'DeploymentID': job if job in state['deployments'] else ''})
         elif parts[2] == 'nodes':
-            # The node list of the notifier preflight: the stubs of the
-            # nodes that the filter admits.
+            # The node list of the preflight of a moved role (the notifier,
+            # the egress): the stubs of the nodes that the filter admits.
             [query] = urllib.parse.parse_qs(self.path.split('?')[1])['filter']
-            assert query == NOTIFIER_NODE_FILTER, query
-            self.respond([{'Name': n['Name']} for n in state['nodes'] if notifier_node(n)])
+            role = re.search(r'\* *([a-z-]+) \*', query).group(1)
+            assert query == ROLE_NODE_FILTER.format(role=role), query
+            self.respond([{'Name': n['Name']} for n in state['nodes'] if role_node(n, role)])
         elif parts[2] == 'node':
             # Every node advertises an address of this fake API, so the
             # member status and the smoke target resolve back here. A
@@ -355,18 +358,26 @@ class NomadAPI(BaseHTTPRequestHandler):
         allocs = []
         job = state['jobs'][name]
         for group in job['TaskGroups']:
-            # The scheduler places a system group on the nodes its
-            # constraints admit; the playbook must not assume a node count.
-            count = 8 if job['Type'] == 'system' else group['Count']
+            # The scheduler places a system or sysbatch group on the nodes
+            # its constraints admit; the playbook must not assume a node count.
+            per_node = job['Type'] in ('system', 'sysbatch')
+            count = 8 if per_node else group['Count']
+            # A sysbatch allocation that ends well is complete; the others run.
+            done = 'complete' if job['Type'] == 'sysbatch' else 'running'
             for i in range(count):
                 # Historical/stopping allocations must not satisfy readiness.
                 stale = state.get('missing_replica') == name and i > 0
                 # A job the test names has no running allocation: a crash loop.
                 running = name not in state.get('not_running', ()) \
                     and group['Name'] not in state.get('down_groups', ())
+                # A node that the test takes down holds the first allocation
+                # of the job. Nomad stops the allocation of a down node and
+                # marks it lost.
+                lost = name in state.get('down_node_jobs', ()) and i == 0
                 # Each instance of a group has its own node.
                 allocs.append({'TaskGroup': group['Name'], 'JobVersion': self.version(name) - int(stale),
-                               'DesiredStatus': 'run', 'ClientStatus': 'running' if running else 'pending',
+                               'DesiredStatus': 'stop' if lost else 'run',
+                               'ClientStatus': 'lost' if lost else done if running else 'pending',
                                'NodeID': f'node-{group["Name"]}' + (f'.{i}' if i else ''),
                                'DeploymentStatus': {'Canary': False}})
         return allocs
@@ -429,7 +440,8 @@ class Deploys(unittest.TestCase):
         self.api.state = {'jobs': {}, 'writes': [], 'deployments': {}, 'roles': {},
                           'variables': {}, 'variable_writes': [], 'records': {}, 'record_index': {},
                           'record_writes': [],
-                          'nodes': [nomad_node('ingress-0', 'ingress,redis'), nomad_node('notifier-0', 'notifier'),
+                          'nodes': [nomad_node('ingress-0', 'ingress,redis'), nomad_node('egress-0', 'egress'),
+                                    nomad_node('egress-1', 'egress'), nomad_node('notifier-0', 'notifier'),
                                     nomad_node('notifier-1', 'notifier')]}
         self.record_dir = Path(self.tmp.name) / 'deployed'
         # The target tree: a git checkout with the formats.toml of this
@@ -516,8 +528,9 @@ class Deploys(unittest.TestCase):
         return result.stdout
 
     # The jobs a manifest with new digests changes, in deploy order: every
-    # pinned image, and not anvil or the monitoring.
-    REPINNED = ['aeron', 'cluster', 'sequencer', 'redis', 'ingress', 'executor', 'state-mirror', 'notifier',
+    # pinned image, and not anvil or the monitoring. The data directory job
+    # runs the Aeron image of the manifest.
+    REPINNED = ['data-dirs', 'aeron', 'cluster', 'sequencer', 'redis', 'ingress', 'executor', 'state-mirror', 'notifier',
                 'validator', 'da-watcher', 'da-store', 'l1-indexer', 'batcher']
 
     def record(self):
@@ -612,7 +625,7 @@ class DeployTest(Deploys):
         local_canary = {'CANARY_LOCAL': '1'}
         self.run_deploy(environ=local_canary)
         self.assertIn('-Daeron.archive.file.sync.level=1', json.dumps(self.api.state['jobs']['aeron']))
-        expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
+        expected = ['data-dirs', 'aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
                     'da-store', 'l1-indexer', 'batcher', 'canary']
         self.assertEqual(self.api.state['writes'], expected)
@@ -1133,6 +1146,54 @@ class DeployTest(Deploys):
         for name in ('ingress', 'sequencer', 'executor'):
             self.assertNotIn('--events', self.job_args(self.api.state['plans'][name]), name)
 
+    def test_the_egress_nodes_switch_moves_only_the_egress(self):
+        """Off, the egress places on the executor nodes. On, it places on
+        the nodes with egress in meta.roles, and its peers name the egress
+        nodes and the executor nodes, so a moved instance fills its store
+        from the one that did not move. No other job changes."""
+        self.add_egress_image()
+        # A new reader starts on the egress only while every egress
+        # instance holds no reference (gate 8b). So the egress runs first,
+        # and the readers are new jobs, as in the egress switch test.
+        readers = ('workloads_validator_egress', 'workloads_batcher_egress')
+        self.run_deploy({k: v for k, v in self.EGRESS_ON.items() if k not in readers})
+        for job in ('batcher', 'validator'):
+            del self.api.state['jobs'][job]
+        for node in ('node-egress', 'node-egress.1'):
+            self.api.state.setdefault('metrics', {})[node] = (
+                'kardamom_egress_ref_frame_max_index 0\nkardamom_egress_ref_frame_max_block 0\n')
+        plans = {}
+        cases = (
+            ({}, ('${meta.role}', '=', 'executor'), [f'executor-{i}' for i in range(3)]),
+            ({'KARDAMOM_EGRESS_NODES': 'on'}, ('${meta.roles}', 'set_contains', 'egress'),
+             ['egress-0', 'egress-1'] + [f'executor-{i}' for i in range(3)]),
+        )
+        for environ, constraint, peers in cases:
+            with self.subTest(environ=environ):
+                self.run_deploy(self.EGRESS_ON, check=True, environ=environ)
+                plans[bool(environ)] = self.api.state['plans']
+                egress = plans[bool(environ)]['egress']
+                [placed] = egress['Constraints']
+                self.assertEqual((placed['LTarget'], placed['Operand'], placed['RTarget']), constraint)
+                self.assertIn({'LTarget': '', 'RTarget': 'true', 'Operand': 'distinct_hosts'},
+                              egress['TaskGroups'][0]['Constraints'])
+                args = self.job_args(egress)
+                self.assertEqual(args[args.index('--peers') + 1],
+                                 ','.join(f'http://{n}.node.dc1.consul:8548' for n in peers))
+        self.assertEqual({n: j for n, j in plans[True].items() if n != 'egress'},
+                         {n: j for n, j in plans[False].items() if n != 'egress'})
+
+    def test_the_preflight_refuses_the_egress_nodes_switch_without_two_egress_nodes(self):
+        """With the switch on, each egress instance needs a ready, eligible
+        node with egress in meta.roles, before any job changes. Without the
+        egress (KARDAMOM_EGRESS empty) the switch counts no node."""
+        self.api.state['nodes'] = [nomad_node('egress-0', 'egress'), nomad_node('egress-1', 'egress', status='down')]
+        output = self.run_deploy(self.EGRESS_ON, check=True, success=False, environ={'KARDAMOM_EGRESS_NODES': 'on'})
+        self.assertIn("The egress count (2) is above the count of the ready, eligible Nomad nodes "
+                      "with egress in meta.roles (['egress-0'])", output)
+        self.assertNotIn('plans', self.api.state)
+        self.run_deploy(check=True, environ={'KARDAMOM_EGRESS_NODES': 'on'})
+
     def test_the_egress_switches_refuse_a_reader_before_its_source(self):
         cases = (
             ('a reader without the egress', {'workloads_validator_egress': 'on'}),
@@ -1213,7 +1274,10 @@ class DeployTest(Deploys):
         # so a step of the move holds the group of the executor nodes too.
         executor = plans['executor']
         self.assertIsNone(executor['Constraints'])
-        peers = ','.join(f'sealer-{i}.node.dc1.consul:9014' for i in range(3))
+        # The executor nodes stay peers: the first executor that moves has
+        # no state, and only the executors there hold a checkpoint.
+        peers = ','.join([f'sealer-{i}.node.dc1.consul:9014' for i in range(3)]
+                         + [f'executor-{i}.node.dc1.consul:9014' for i in range(3)])
         for i, group in enumerate(executor['TaskGroups']):
             self.assertEqual((group['Name'], group['Count']), (f'executor-{i}', 1))
             self.assertEqual(group['Constraints'],
@@ -1497,6 +1561,55 @@ class DeployTest(Deploys):
         self.run_deploy(success=False)
         self.assertNotIn('batcher', self.api.state['writes'])
 
+    def test_the_deploy_makes_every_data_directory_on_every_node_first(self):
+        self.run_deploy(environ={'CANARY_LOCAL': '1'})
+        self.assertEqual(self.api.state['writes'][0], 'data-dirs')
+        job = self.api.state['jobs']['data-dirs']
+        self.assertEqual((job['Type'], job['NodePool']), ('sysbatch', 'all'))
+        task = job['TaskGroups'][0]['Tasks'][0]
+        config = task['Config']
+        # The signed Aeron image of the manifest, as root: no other image.
+        self.assertEqual(config['image'], f'registry.example:5000/kardamom-aeron:test@sha256:{"a" * 64}')
+        self.assertEqual(task['User'], 'root')
+        self.assertEqual(config['volumes'], ['/opt/kardamom:/opt/kardamom'])
+        self.assertEqual(config['entrypoint'], ['/bin/sh', '-c', 'mkdir -p "$@" && chmod 0777 "$@"', 'data-dirs'])
+        dirs = config['args']
+        self.assertIn('/opt/kardamom/canary', dirs)
+        # One list: the common role makes the same directories.
+        group_vars = yaml.safe_load((ANSIBLE / 'group_vars/all.yml').read_text())
+        listed = [group_vars['paths'][re.fullmatch(r'\{\{ paths\.(\w+) \}\}', d).group(1)]
+                  for d in group_vars['node_data_dirs']['paths']]
+        self.assertEqual(dirs, listed)
+        common = yaml.safe_load((ANSIBLE / 'roles/common/tasks/main.yml').read_text())
+        task = next(t for t in common if t['name'] == 'Create on-node kardamom directories')
+        self.assertEqual((task['loop'], task['ansible.builtin.file']['mode']),
+                         ('{{ node_data_dirs.paths }}', '{{ node_data_dirs.mode }}'))
+        # Every host directory that a job mounts is in the list. The
+        # exceptions: the Aeron tmpfs, which the common role mounts, and the
+        # directories of the sealer, whose image runs as root.
+        exempt = {'/opt/kardamom/aeron-mount', '/opt/kardamom/cluster', '/opt/kardamom/seed'}
+        mounted = {volume.split(':')[0] for job in self.api.state['jobs'].values()
+                   for group in job['TaskGroups'] for task in group['Tasks']
+                   for volume in (task['Config'].get('volumes') or [])}
+        self.assertEqual({d for d in mounted if d.startswith('/opt/kardamom/')} - exempt - set(dirs), set())
+
+    def test_a_down_node_does_not_hold_the_data_directory_job(self):
+        self.api.state['down_node_jobs'] = ['data-dirs']
+        self.run_deploy()
+        self.assertEqual(self.api.state['writes'][:2], ['data-dirs', 'aeron'])
+
+    def test_an_incomplete_data_directory_job_stops_the_deploy_before_any_service(self):
+        self.api.state['not_running'] = ['data-dirs']
+        self.run_deploy(success=False)
+        self.assertEqual(self.api.state['writes'], ['data-dirs'])
+
+    def test_an_unhealthy_canary_job_fails_the_deploy(self):
+        self.api.state['deployments']['canary'] = Deployment('canary', ['running', 'failed'])
+        output = self.run_deploy(environ={'CANARY_LOCAL': '1'}, success=False)
+        self.assertIn('scripted failed', output)
+        self.assertEqual(self.api.state['writes'][-1], 'canary')
+        self.assertFalse((self.record_dir / 'images.digests').exists(), 'a failed deploy records nothing')
+
     def test_a_canary_is_smoked_by_its_node_then_promoted(self):
         self.api.state['deployments']['ingress'] = Deployment('ingress', [], canary=True)
         self.run_deploy()
@@ -1569,7 +1682,7 @@ class RecordTest(Deploys):
         self.run_deploy(success=False)
         attempt = self.record()['attempt']
         self.assertEqual(attempt['status'], 'started')
-        self.assertEqual(attempt['changed'], ['aeron', 'cluster', 'sequencer', 'redis', 'ingress'])
+        self.assertEqual(attempt['changed'], ['data-dirs', 'aeron', 'cluster', 'sequencer', 'redis', 'ingress'])
         self.assertEqual(self.record()['accepted'], accepted, 'a failed attempt is never the accepted release')
         self.assertEqual(json.loads((self.record_dir / 'accepted.json').read_text()), accepted)
         # The attempt is still started: it runs, or it died. Only the
@@ -2046,7 +2159,7 @@ class RollbackTest(Deploys):
         reverted = [w for w in self.api.state['writes'] if w.startswith('revert:')]
         self.assertEqual(reverted, ['revert:da-watcher:0', 'revert:validator:0', 'revert:notifier:0', 'revert:state-mirror:0',
                                     'revert:executor:0', 'revert:ingress:0', 'revert:redis:0', 'revert:sequencer:0',
-                                    'revert:aeron:0'])
+                                    'revert:aeron:0', 'revert:data-dirs:0'])
         self.assertEqual(self.api.state['writes'].count('cluster'), 3)
         self.assertNotIn('revert:batcher:0', self.api.state['writes'], 'the failed attempt never reached the batcher')
         self.assertEqual(self.record()['accepted']['target']['manifest']['executor'],
@@ -2069,7 +2182,7 @@ class RollbackTest(Deploys):
         self.assertIn('ingress is at version 2, the pre-release definition', output)
         self.assertNotIn('revert:ingress:0', self.api.state['writes'])
         self.assertIn('revert:redis:0', self.api.state['writes'])
-        self.assertEqual(self.record()['attempt']['rolled_back'], ['ingress', 'redis', 'sequencer', 'cluster', 'aeron'])
+        self.assertEqual(self.record()['attempt']['rolled_back'], ['ingress', 'redis', 'sequencer', 'cluster', 'aeron', 'data-dirs'])
         self.assertEqual(self.record()['attempt']['status'], 'rolled_back')
 
     def test_a_rollback_that_stops_resumes_after_the_jobs_it_reverted(self):
@@ -2092,9 +2205,11 @@ class RollbackTest(Deploys):
         output = self.run_rollback()
         self.assertIn('executor is at version 2, the pre-release definition', output)
         self.assertEqual(self.api.state['writes'],
-                         ['revert:ingress:0', 'revert:redis:0', 'revert:sequencer:0', 'cluster', 'cluster', 'cluster', 'revert:aeron:0'])
+                         ['revert:ingress:0', 'revert:redis:0', 'revert:sequencer:0', 'cluster', 'cluster', 'cluster', 'revert:aeron:0',
+                          'revert:data-dirs:0'])
         self.assertEqual(self.record()['attempt']['status'], 'rolled_back')
-        self.assertEqual(self.record()['attempt']['rolled_back'], done + ['executor', 'ingress', 'redis', 'sequencer', 'cluster', 'aeron'])
+        self.assertEqual(self.record()['attempt']['rolled_back'],
+                         done + ['executor', 'ingress', 'redis', 'sequencer', 'cluster', 'aeron', 'data-dirs'])
 
     def test_a_rollback_does_not_cross_the_floor(self):
         self.gate_formats([{'rule': 'rollback', 'id': 'state-db', 'head': 4, 'base': 3}])

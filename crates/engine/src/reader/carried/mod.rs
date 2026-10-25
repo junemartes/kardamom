@@ -5,7 +5,8 @@
 //! ([`answer`]), then through the pending set that the cluster egress
 //! reader uses too ([`Reorder`]). So a record waits for the boundary of its
 //! block until the replay of the newest request reaches the head, also
-//! across a reconnect or a switch of the source.
+//! across a reconnect or a switch of the source. A record of a lossy
+//! source, such as the egress, always waits for its boundary.
 //!
 //! Before it delivers a frame, a reader with a committed history compares
 //! the stream with that history ([`compare`]). A difference ends the run
@@ -14,6 +15,11 @@
 //! entries in flight, so the run starts again from the state DB, and the
 //! comparison at its start also checks the receipts that the run published
 //! above the committed block.
+//!
+//! A reader that asks again, and still does not move its cursor for the
+//! stall window, starts the run again from the state DB too. A source can
+//! answer each request and keep the reader busy, so no fault of the source
+//! fires.
 
 mod answer;
 mod compare;
@@ -29,12 +35,14 @@ pub(super) mod tests;
 #[cfg(test)]
 mod tests_compare;
 #[cfg(test)]
+mod tests_late;
+#[cfg(test)]
 mod tests_switch;
 mod transport;
 
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
-use kardamom_types::BPosition;
+use kardamom_types::{BPosition, BlockBoundaryStart};
 
 pub use compare::{LocalHistory, PublishedTail};
 pub use egress::EgressTransport;
@@ -73,6 +81,48 @@ pub struct CarriedSubscription<F, S> {
     /// The gauge of the canonical index of the newest record that the
     /// reader delivered, when the binary names one.
     cursor_gauge: Option<metrics::Gauge>,
+    watch: Watch,
+}
+
+/// The progress of the cursor, for the stall window.
+struct Watch {
+    /// The cursor at the start of the window.
+    cursor: (u64, u64),
+    since: Instant,
+    /// The requests since the start of the window.
+    asks: u32,
+    /// The source sent a frame since the start of the window.
+    heard: bool,
+}
+
+impl Watch {
+    fn new(cursor: (u64, u64), now: Instant) -> Self {
+        Self {
+            cursor,
+            since: now,
+            asks: 0,
+            heard: false,
+        }
+    }
+
+    /// Start the window again when the cursor moved.
+    fn see(&mut self, cursor: (u64, u64), now: Instant) {
+        if cursor != self.cursor {
+            *self = Self::new(cursor, now);
+        }
+    }
+
+    fn asked(&mut self) {
+        self.asks = self.asks.saturating_add(1);
+    }
+
+    /// Whether the window is over, the source sent frames in it, and the
+    /// reader asked again. A source that sends nothing has the silence
+    /// window instead. The first request of a window can find a source
+    /// with nothing new, such as a chain at rest after a new connection.
+    fn stuck(&self, now: Instant, stall: Duration) -> bool {
+        self.heard && self.asks >= 2 && now.duration_since(self.since) >= stall
+    }
 }
 
 impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
@@ -121,13 +171,15 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
             });
         let mut reorder = Reorder::new(cursor);
         reorder.restart();
+        let now = Instant::now();
         Self {
+            watch: Watch::new(reorder.next(), now),
             idle_start: Some(reorder.next()),
             reorder,
             compare: None,
             switch: Switch::new(feed, service, timing, first_id),
             timing,
-            woke_at: Instant::now(),
+            woke_at: now,
             tee: Forward::default(),
             cursor_gauge: None,
         }
@@ -166,6 +218,7 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
     fn step(&mut self) -> Result<(), ExecutorError> {
         match self.switch.poll(self.timing.poll) {
             Poll::Frame(bytes) => {
+                self.watch.heard = true;
                 self.tee.hold(&bytes);
                 let step = self.switch.frame(&bytes, Instant::now());
                 self.apply(step)?;
@@ -175,14 +228,15 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
         }
         self.wake(Instant::now())?;
         self.renewal(Instant::now())?;
-        self.settle()
+        self.settle()?;
+        self.watchdog(Instant::now())
     }
 
     /// Apply the step of one frame.
     fn apply(&mut self, step: Step) -> Result<(), ExecutorError> {
         match step {
             Step::Record(index, item) => self.active().ingest_record(index, item),
-            Step::Boundary(b) => self.active().ingest_boundary(b),
+            Step::Boundary(b) => self.boundary(b),
             Step::Live {
                 up_to_index,
                 up_to_block,
@@ -197,6 +251,24 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
                 Ok(())
             }
             Step::Fault(fault) => self.fault(fault, Instant::now()),
+        }
+    }
+
+    /// Buffer a boundary. A boundary that seals below the cursor came late:
+    /// the reader delivered records past its end. No answer from the cursor
+    /// can put it back in order, so the run starts again from the state DB.
+    fn boundary(&mut self, b: BlockBoundaryStart) -> Result<(), ExecutorError> {
+        let restarted = self.restarted();
+        let block = b.block_number;
+        match self.active().ingest_boundary(b) {
+            Err(ExecutorError::BoundaryMisaligned { .. }) => {
+                tracing::warn!(
+                    block,
+                    "a late boundary seals below the cursor; restarting from the state DB"
+                );
+                Err(restarted)
+            }
+            other => other,
         }
     }
 
@@ -230,6 +302,10 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
     /// this reader delivered: the run starts again from the state DB, and
     /// the comparison finds the divergence. The comparison reads on past
     /// the head, as the source closes new blocks.
+    ///
+    /// The live frames of a lossy source can lose a boundary with no hole
+    /// in the indexes. So for such a source, the pending set stays in the
+    /// catch-up: a record waits for the boundary of its block.
     fn end_replay(&mut self, up_to_index: u64, up_to_block: u64) -> Result<(), ExecutorError> {
         let restarted = self.restarted();
         match self.compare.as_mut() {
@@ -238,7 +314,11 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
                 .reorder
                 .end_replay(up_to_index, up_to_block)
                 .map_err(|_| restarted),
+        }?;
+        if self.switch.lossy() {
+            self.active().catch_up();
         }
+        Ok(())
     }
 
     /// A request went out on a new connection. The comparison starts again
@@ -306,6 +386,25 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
     fn ask(&mut self, now: Instant) {
         self.active().restart();
         self.switch.ask(self.cursor(), now);
+        self.watch.asked();
+    }
+
+    /// Start the run again from the state DB when the reader asked again
+    /// and the cursor stayed for the stall window. Such a source answers,
+    /// so no fault of it fires, but the run from the state DB is the only
+    /// way past it. The comparison has its own waits for the head.
+    fn watchdog(&mut self, now: Instant) -> Result<(), ExecutorError> {
+        self.watch.see(self.cursor(), now);
+        if self.compare.is_some() || !self.watch.stuck(now, self.timing.stall) {
+            return Ok(());
+        }
+        let (next_index, next_block) = self.reorder.next();
+        tracing::warn!(
+            next_index,
+            next_block,
+            "the stream does not move past the cursor; restarting from the state DB"
+        );
+        Err(self.restarted())
     }
 
     /// Leave the active source. While the comparison runs, a head below
@@ -396,7 +495,10 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
 }
 
 impl<F: Transport, S: Transport> TxOrderingSubscription for CarriedSubscription<F, S> {
+    /// The stall window starts at each call: the wait of the caller
+    /// between two calls is no stall of the stream.
     fn next(&mut self) -> Result<(BPosition, Ordered), ExecutorError> {
+        self.watch = Watch::new(self.cursor(), Instant::now());
         loop {
             let Some(out) = self.deliver()? else {
                 self.step()?;

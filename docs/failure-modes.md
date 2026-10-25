@@ -824,6 +824,12 @@ The failure philosophy is inverted here: **halting is the feature**. A divergenc
 - A forged record on the canonical stream is a divergence too. The halt reason starts with `record identity forged:`.
   - The validator checks each transaction record before it executes it: `keccak256(raw_tx)` must be the transaction hash, and the signature must recover the sender.
   - With `--egress`, the reader also checks that `keccak256(raw_tx)` is the canonical id. The egress is the only source of the reader. So a wrong hash stops the reader with `HashMismatch` after one silence window (6 s), and the validator halts. It does not read the egress again without end.
+- With `--egress`, the live `egress_order` is lossy, and the reader gets the copy of each egress instance. A boundary takes no slot, so a lost boundary leaves no hole in the indexes.
+  - The reader delivers a record only after the boundary of its block, also after the replay end. A boundary that comes late from the other copy takes its place.
+  - A late boundary that seals below the delivery cursor ends the run (`a late boundary seals below the cursor`). No range read from that cursor can put it back in order.
+  - A reader that asks again, gets frames, and does not move its cursor for 30 s ends the run too (`the stream does not move past the cursor`).
+  - In both cases the validator exits with code 1. Nomad starts it again, and it reads the egress from its committed block.
+  - Proof: the tests in `crates/engine/src/reader/carried/tests_late.rs`, and `a_cursor_past_an_undelivered_boundary_restarts_the_run` in `egress_tests.rs`.
   - Proof: the tests `forged_sender_from_the_egress_halts_and_latches` and `forged_hash_from_the_egress_halts_and_latches` in `crates/validator/tests/forged_envelope_chaos.rs`.
 - Every executor replica publishes its own BAL and receipts. The validator compares the BAL and the receipts of **every** replica with its own re-execution. The arrival order does not matter.
   - The re-execution of the validator is the reference. A replica whose result differs is a divergence, also when the other replicas agree with the validator.

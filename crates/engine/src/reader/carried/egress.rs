@@ -9,6 +9,10 @@
 //! first and the live frames after it. The reader drops a live frame that
 //! the replay sent already.
 //!
+//! The live stream is lossy, and the reader gets the copy of each egress
+//! instance. So the transport is [`Transport::lossy`]: a record waits for
+//! the boundary of its block.
+//!
 //! The egress is one source with no image to follow: the connection id
 //! changes only when a range read fails, so the reader asks again.
 
@@ -99,6 +103,10 @@ impl Transport for EgressTransport {
     fn close(&mut self) {
         self.replay = None;
         self.live.try_iter().for_each(drop);
+    }
+
+    fn lossy(&self) -> bool {
+        true
     }
 }
 

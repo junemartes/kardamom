@@ -81,6 +81,7 @@ kardamom-validator.workspace = true
 alloy-eip7928.workspace = true
 dhat = "0.3"
 kardamom-engine.workspace = true
+kardamom-log.workspace = true
 kardamom-types.workspace = true
 
 [features]
