@@ -37,8 +37,7 @@ use crate::proxy::{IngressHandle, IngressProxy};
 use crate::stage_latency::{StageClock, StageClocks, StageStamps};
 use crate::tx_events::AcceptedQueue;
 use recorders::{
-    spawn_discovered_tx_data_recorder, spawn_tx_data_recorders, wait_for_discovered_recorder,
-    wait_for_recorders,
+    DiscoveredReady, spawn_discovered_tx_data_recorder, spawn_tx_data_recorders, wait_for_recorders,
 };
 pub use settings::IngressSettings;
 use settings::{AckArg, TxEventsArg};
@@ -49,7 +48,7 @@ use settings::{AckArg, TxEventsArg};
 type SpawnedRecorders = (
     RecorderThreads,
     Vec<recorders::RecorderReady>,
-    Option<tokio::sync::oneshot::Receiver<kardamom_log::discovery::RecorderProgress>>,
+    Option<DiscoveredReady>,
 );
 
 /// The lane plane as the non-zero count the publisher and recorder
@@ -188,8 +187,13 @@ impl IngressService {
     /// catalog lists. Without it, one static thread per lane records the
     /// shared channel. Returns the threads and the readiness receivers of
     /// the path taken: per lane for the static recorders, or one for the
-    /// discovered recorder.
-    fn spawn_recorders(&self, plane: &mut StreamPlane) -> Result<SpawnedRecorders> {
+    /// discovered recorder. The discovered recorder tries its archive
+    /// connect again for up to `connect_limit`.
+    fn spawn_recorders(
+        &self,
+        plane: &mut StreamPlane,
+        connect_limit: Duration,
+    ) -> Result<SpawnedRecorders> {
         if !self.settings.archive_durability {
             return Ok((RecorderThreads::new(), Vec::new(), None));
         }
@@ -198,6 +202,7 @@ impl IngressService {
             &self.log_cfg.aeron,
             plane,
             LANE_PLANE,
+            connect_limit,
         )?;
         if let Some((recorders, ready)) = discovered {
             return Ok((recorders, Vec::new(), Some(ready)));
@@ -240,7 +245,8 @@ impl IngressService {
             StreamPlane::from_config(&self.log_cfg, &format!("ingress-{}", args.ingress_id))
                 .context("build the stream plane")?;
 
-        let (recorders, recorder_ready, discovered_ready) = self.spawn_recorders(&mut plane)?;
+        let (recorders, recorder_ready, discovered_ready) =
+            self.spawn_recorders(&mut plane, rt.start_open_limit())?;
 
         // tx_receipts MDS membership: the CLI or env `--executor-count`,
         // else the log-config field, else `None` (no known executor
@@ -261,7 +267,8 @@ impl IngressService {
         // This is the recorder barrier: with the tx_data publications now
         // open, every lane's recording can start.
         if let Some(ready) = discovered_ready {
-            wait_for_discovered_recorder(ready)
+            ready
+                .wait()
                 .await
                 .context("archive durability requested but the tx_data recorder failed to start")?;
         } else if args.archive_durability {
@@ -369,7 +376,10 @@ impl IngressService {
         opened: &mut OpenedAeron,
         seal_clock: StageClock,
     ) -> Result<watermark::ClusterWatermark> {
-        let members = opened.plane.cluster_ingress_endpoints().await?;
+        let members = opened
+            .plane
+            .cluster_ingress_endpoints(opened.rt.start_open_limit())
+            .await?;
         let status = opened
             .plane
             .publisher::<TxStatusPublisherHandle>(&opened.rt)

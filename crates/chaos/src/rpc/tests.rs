@@ -140,3 +140,24 @@ async fn a_nonce_read_fails_at_once_on_another_refusal() {
     assert_eq!(ingress.calls(), 1);
     ingress.handle.stop().unwrap();
 }
+
+/// A connection that the ingress refuses is no answer: the read repeats
+/// within its budget, and the error names the ingress.
+#[tokio::test(start_paused = true)]
+async fn a_nonce_read_repeats_through_a_refused_connection() {
+    // The listener closes at the end of the block, so the port refuses.
+    let url = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let err = Rpc::new(&url, 1)
+        .unwrap()
+        .nonce_of(ACCOUNT)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("the ingress did not connect"),
+        "{err:#}"
+    );
+    assert!(err.to_string().contains(&url), "{err:#}");
+}

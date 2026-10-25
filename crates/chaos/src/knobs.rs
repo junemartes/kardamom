@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 
+use crate::lifecycle::DeployVars;
+
 /// The CPU-squeeze drill settings.
 #[derive(Debug, Clone)]
 pub struct Squeeze {
@@ -50,6 +52,64 @@ impl StallTolerance {
     }
 }
 
+/// The nodes of the executors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutorNodes {
+    /// The executor nodes.
+    Executor,
+    /// The sealer nodes (`KARDAMOM_EXEC_ON_SEALERS=on`): executor `i` runs
+    /// on node `sealer-<i>`.
+    Sealer,
+}
+
+impl ExecutorNodes {
+    /// The node role of the executors in the node contract.
+    #[must_use]
+    pub fn role(self) -> &'static str {
+        match self {
+            Self::Executor => "executor",
+            Self::Sealer => "sealer",
+        }
+    }
+
+    /// The contract name of the node of executor `i`, `<role>-<i>`.
+    #[must_use]
+    pub fn node(self, i: usize) -> String {
+        format!("{}-{i}", self.role())
+    }
+}
+
+/// The publish loop of the sequencers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequencerLoop {
+    /// The v1 loop: a ledger of offers and a resync from receipt floors.
+    V1,
+    /// The v2 loop (`KARDAMOM_SEQUENCER_ADMISSION=on`): the admission
+    /// filter. A carry-born cluster always runs it.
+    V2,
+}
+
+impl SequencerLoop {
+    /// Whether the loop can strand a ref below the floor of its sender,
+    /// and so exports `kardamom_sequencer_ref_below_floor`.
+    ///
+    /// The v1 loop buffers refs with no deadline. A rewind or a floor
+    /// update can leave one below the floor, where no drain reaches it.
+    /// The sender is then stuck for good.
+    ///
+    /// The v2 loop cannot strand a ref. Each parked transaction has a mark
+    /// that expires it after the park width or the transaction TTL. Each
+    /// forwarded run has a mark that loses it after the loss window, and
+    /// the sender then sends from its chain nonce again. A new state
+    /// refuses each parked transaction below its nonce. So no transaction
+    /// waits for good, and the recovery probe of the case proves that the
+    /// senders send again.
+    #[must_use]
+    pub fn can_strand_refs(self) -> bool {
+        self == Self::V1
+    }
+}
+
 /// The suite settings. See the module doc for the defaults.
 /// One fixed-rate run of the sustained-load stage.
 #[derive(Debug, Clone)]
@@ -81,6 +141,10 @@ pub struct Stages {
 }
 
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors one independent setting of the deploy or of the workflow"
+)]
 pub struct Knobs {
     /// The L2 chain id. The ingress `eth_chainId` returns a default that
     /// differs from the cluster chain, so the load never probes it.
@@ -144,6 +208,19 @@ pub struct Knobs {
     /// checkpoints (`KARDAMOM_CHECKPOINT_LOG=on`). The peer resync then
     /// also checks that the victim fetched and applied the log.
     pub checkpoint_log: bool,
+    /// Where the executors run: on the sealer nodes with
+    /// `KARDAMOM_EXEC_ON_SEALERS=on` or `KARDAMOM_GENESIS_CARRY=on`.
+    pub executor_nodes: ExecutorNodes,
+    /// Whether the cluster is carry-born (`KARDAMOM_GENESIS_CARRY=on`).
+    /// Every member then runs decision version 5 with the exact window,
+    /// so the sealer takes no recorded cursor and no void request. The
+    /// executors read the member feed and then the egress, and the
+    /// batcher and the validator read the egress, so no consumer replays
+    /// from the sealer.
+    pub genesis_carry: bool,
+    /// The publish loop of the sequencers: the v2 loop on a carry-born
+    /// cluster or with `KARDAMOM_SEQUENCER_ADMISSION=on`.
+    pub sequencer_loop: SequencerLoop,
     /// The hard cap of the adaptive retention freeze.
     pub retention_freeze_cap: Duration,
     /// How long one L1 fault of the chaos-l1 cases stays active.
@@ -160,20 +237,33 @@ pub struct Knobs {
     pub stages: Stages,
 }
 
-/// The setting source: the process environment first, then the shard's
-/// workflow values, then the built-in CI default.
+/// The setting source: the deploy variables of the shard first, then the
+/// process environment, then the shard's workflow values, then the
+/// built-in CI default. The deploy variables come first because the
+/// lifecycle sets them over the process environment of Ansible, so a knob
+/// reads what the deploy read.
 struct Source<'a> {
+    deploy: Vec<(&'static str, String)>,
     shard: &'a [(&'a str, &'a str)],
 }
 
 impl Source<'_> {
     fn get(&self, name: &str) -> Option<String> {
-        std::env::var(name).ok().or_else(|| {
-            self.shard
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, v)| (*v).to_string())
-        })
+        self.deploy
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var(name).ok())
+            .or_else(|| {
+                self.shard
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| (*v).to_string())
+            })
+    }
+
+    fn on(&self, name: &str) -> bool {
+        self.get(name).is_some_and(|v| v == "on")
     }
 
     fn or(&self, name: &str, default: &str) -> String {
@@ -263,7 +353,23 @@ impl Knobs {
     ///
     /// Returns an error if a set variable does not parse.
     pub fn read(shard: &[(&str, &str)]) -> anyhow::Result<Self> {
-        let env = Source { shard };
+        Self::deployed(shard, &DeployVars::default())
+    }
+
+    /// Read every knob as [`Self::read`] does, with the deploy variables
+    /// `vars` of the shard's cluster above the environment. A knob that
+    /// follows the deployed topology, such as where the executors run,
+    /// then reads the value the deploy used.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a set variable does not parse.
+    pub fn deployed(shard: &[(&str, &str)], vars: &DeployVars) -> anyhow::Result<Self> {
+        let env = Source {
+            deploy: vars.env(),
+            shard,
+        };
+        let genesis_carry = env.on("KARDAMOM_GENESIS_CARRY");
         let retention = env.optional_nonzero_u64("KARDAMOM_CLUSTER_RETENTION")?;
         let da_lag_budget = env.optional_nonzero_u64("KARDAMOM_DA_LAG_BUDGET_BLOCKS")?;
         let aeron_stall = StallTolerance(Duration::from_millis(
@@ -293,8 +399,19 @@ impl Knobs {
             validator_lapse: env.secs("LAPSE_S", lapse_s)?,
             cluster_retention: retention,
             da_lag_budget_blocks: da_lag_budget,
-            exec_cursor: env.or("KARDAMOM_EXEC_CURSOR", "off") == "on",
-            checkpoint_log: env.or("KARDAMOM_CHECKPOINT_LOG", "off") == "on",
+            exec_cursor: env.on("KARDAMOM_EXEC_CURSOR"),
+            checkpoint_log: env.on("KARDAMOM_CHECKPOINT_LOG"),
+            executor_nodes: if genesis_carry || env.on("KARDAMOM_EXEC_ON_SEALERS") {
+                ExecutorNodes::Sealer
+            } else {
+                ExecutorNodes::Executor
+            },
+            genesis_carry,
+            sequencer_loop: if genesis_carry || env.on("KARDAMOM_SEQUENCER_ADMISSION") {
+                SequencerLoop::V2
+            } else {
+                SequencerLoop::V1
+            },
             retention_freeze_cap: env.secs("RETENTION_FREEZE_CAP_S", 600)?,
             l1_fault: env.secs("L1_FAULT_S", 60)?,
             l1_tps: env.nonzero_u32("L1_CASE_TPS", 50)?,
@@ -361,6 +478,58 @@ mod tests {
             Knobs::read(&[("AERON_STALL_TOLERANCE_MS", "10000"), ("LAPSE_S", "12")]).unwrap();
         assert_eq!(explicit.validator_lapse, Duration::from_secs(12));
         assert_eq!(explicit.seq_lapse, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn the_deploy_variables_decide_the_topology_knobs() {
+        let reference = Knobs::read(&[]).unwrap();
+        assert_eq!(reference.executor_nodes, ExecutorNodes::Executor);
+        assert!(!reference.genesis_carry);
+        assert_eq!(reference.sequencer_loop, SequencerLoop::V1);
+        let vars = DeployVars {
+            genesis_carry: true,
+            cluster_retention: Some(6144),
+            checkpoint_log: true,
+            ..DeployVars::default()
+        };
+        let carry = Knobs::deployed(&[("KARDAMOM_CLUSTER_RETENTION", "99")], &vars).unwrap();
+        assert!(carry.genesis_carry);
+        assert_eq!(carry.executor_nodes, ExecutorNodes::Sealer);
+        assert_eq!(carry.executor_nodes.node(2), "sealer-2");
+        assert_eq!(carry.cluster_retention.map(NonZeroU64::get), Some(6144));
+        assert!(carry.checkpoint_log && !carry.exec_cursor);
+        assert_eq!(carry.sequencer_loop, SequencerLoop::V2);
+        let moved = DeployVars {
+            carry: crate::lifecycle::CarrySwitches {
+                exec_on_sealers: true,
+                ..crate::lifecycle::CarrySwitches::default()
+            },
+            ..DeployVars::default()
+        };
+        let moved = Knobs::deployed(&[], &moved).unwrap();
+        assert_eq!(moved.executor_nodes, ExecutorNodes::Sealer);
+        assert!(!moved.genesis_carry);
+        assert_eq!(moved.sequencer_loop, SequencerLoop::V1);
+    }
+
+    #[test]
+    fn the_admission_switch_selects_the_v2_loop() {
+        let vars = DeployVars {
+            carry: crate::lifecycle::CarrySwitches {
+                admission: true,
+                ..crate::lifecycle::CarrySwitches::default()
+            },
+            ..DeployVars::default()
+        };
+        let knobs = Knobs::deployed(&[], &vars).unwrap();
+        assert!(!knobs.genesis_carry);
+        assert_eq!(knobs.sequencer_loop, SequencerLoop::V2);
+    }
+
+    #[test]
+    fn only_the_v1_loop_can_strand_a_ref() {
+        assert!(SequencerLoop::V1.can_strand_refs());
+        assert!(!SequencerLoop::V2.can_strand_refs());
     }
 
     #[test]

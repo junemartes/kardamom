@@ -210,15 +210,22 @@ code = [
 ]
 
 # The seed file that kardamom-reconstruct writes and an empty sealer
-# cluster starts from. The sealer refuses any other version.
+# cluster starts from. Version 2 adds the decision rules of the sealer
+# after the senders. The writer writes version 2 only when the rules hold
+# an activation of feature 3, 4 or 5: at genesis or by an upgrade
+# transaction. A sealer that reads only version 1 refuses version 2 and
+# does not start, so it never runs a seeded chain with the wrong rules.
 [format.sealer-seed]
 writes = 1
 reads_min = 1
-reads_max = 1
+reads_max = 2
 shared = true
+activation = { feature = 3, writes = 2 }
 code = [
     "crates/reconstruct/src/seed.rs#const VERSION",
+    "crates/reconstruct/src/seed.rs#const RULES_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/SealerSeed.java#int VERSION",
+    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/SealerSeed.java#int RULES_VERSION",
 ]
 
 # The major part of the Aeron Cluster app version. Aeron refuses a session

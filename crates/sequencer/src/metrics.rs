@@ -19,9 +19,16 @@ pub(crate) const PENDING_BUFFER_EXPIRED: &str = "kardamom_sequencer_pending_expi
 /// `FeeTooLow`, or `InsufficientFunds` error on `tx_errors`.
 pub(crate) const FEE_REJECTED: &str = "kardamom_sequencer_fee_rejected_total";
 /// Nonce lookups. `NONCE_LOOKUP_REQUESTS` counts the parks that asked for
-/// one. `NONCE_LOOKUPS` counts the queries the task ran, by `outcome`
-/// (`ok`, `error`, `timeout`, `shed`). `NONCE_LOOKUPS_IN_FLIGHT` is the
-/// concurrent query gauge.
+/// one. `NONCE_LOOKUPS` counts the lookups by `outcome`:
+/// - `ok`: the v1 loop got an answer from Redis or an executor. The v2
+///   loop got an answer from an executor.
+/// - `redis`: Redis answered. The v1 loop then also records `ok`.
+/// - `live`: the v2 loop got the answer from the local live layer.
+/// - `local`: the v1 loop got the answer from the local live layer.
+/// - `error`, `timeout`: no source answered.
+/// - `shed`: the task dropped the request at its bound.
+///
+/// `NONCE_LOOKUPS_IN_FLIGHT` is the concurrent query gauge.
 pub(crate) const NONCE_LOOKUP_REQUESTS: &str = "kardamom_sequencer_nonce_lookup_requests_total";
 pub(crate) const NONCE_LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
 pub(crate) const NONCE_LOOKUPS_IN_FLIGHT: &str = "kardamom_sequencer_nonce_lookups_in_flight";

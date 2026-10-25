@@ -385,14 +385,18 @@ A sealer cluster that lost all its state can start after a block `H` that `karda
 3. Start the members as a new cluster, with empty cluster and archive directories and the bootstrap on.
 
 - The seed file is versioned and big-endian. It holds:
-  - the magic `KSED` and the version (1)
+  - the magic `KSED` and the version (1 or 2)
   - the chain id, `H`, the canonical end `E_H` of `H`, the timestamp of `H` and its L1 origin
   - the state root
   - the senders and the next nonce of each
+  - in version 2 only, the decision rules at `H`, after the senders. The layout is the switch sections of the snapshot: `[decision_version:u8][sealed_origin:u64]`, the schedule of feature 3, the schedule of feature 4, `[carry_window:u8]`, then the schedule of feature 5. A schedule is `[held:u8]`, then `[origin:u64][time_ms:u64]` for each held activation, oldest first (at most three).
+- `kardamom-reconstruct` writes version 2 only when the rules hold an activation of feature 3, 4 or 5. The seed of a chain with no such feature keeps the bytes of version 1. A member of an older release reads only version 1, and stops on version 2.
+- The rules come from the `genesis_features` of the genesis config and from every upgrade transaction of feature 3, 4 or 5 in the epochs of the rebuilt blocks, by the rules of the version switch. The tool takes each activation record in front of its epoch. When the rules depend on whether a timer tick or the epoch closed the block before that epoch, the tool cannot know the rules, and it refuses to write the seed.
 - The digest is the SHA-256 of the file. `sha256sum` of the file equals the `digest=` in the log.
 - A member that restores a snapshot ignores the seed.
 - An unreadable or invalid seed stops the start.
 - A member with a non-empty `remoteOrigins` refuses a seed and does not start. The seed holds no peer anchor, so a seeded cluster runs with interop off.
+- A member with `genesisFeatures` refuses a seed whose rules do not hold an activation of each of these features, and does not start. A chain that ran the features from its genesis holds one of each for all time.
 
 The seeded state:
 
@@ -401,6 +405,7 @@ The seeded state:
 - The posted head is `H`, so the DA-lag guard does not halt the chain at once.
 - The dedup window and the void ledger are empty.
 - The nonce guard holds the seeded senders, the eldest first. A guard with a smaller capacity keeps the most recent senders.
+- The version switch is the rules of the seed: the decision version, the carry window flag and the held activations. A seed of version 1 gives version 3 with no activation. A member with `carryBytes` drops the carry window of the seed, because it answers each activation of feature 5 with `UNSUPPORTED`. The first snapshot holds the rules, so a member that restores it keeps them.
 - The egress opens at `(E_H, H + 1)`. A consumer at the rebuilt head resumes there.
 
 The seed record (ingress kind 8) proves that every member started from the same seed:
@@ -441,7 +446,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.adminPort` | `0` (off) | no | The admin server port. |
 | `kardamom.cluster.readyLagBytes` | `4194304` (4 MiB) | no | The most that the service can lag the commit position and still be ready. |
 | `kardamom.cluster.snapshotIntervalS` | `300` | no | The interval of the automatic snapshot, in seconds. The leader asks for a snapshot on every boundary tick whose block number is a multiple of `snapshotIntervalS * 1000 / tickMs`. `0` turns it off. An interval shorter than one tick stops the start. |
-| `kardamom.cluster.joinWatchdogS` | `60` | no | The member exits with code 3 if its election stays in `INIT` for this long. It exits with code 6 when the completion of its leader election failed: the control toggle is active, but the election state is not `CLOSED`, for longer than the archive message timeout plus the driver timeout. It exits with code 7 or 8 when an election stalls for the stall limit (see [Election stalls](#election-stalls)). `0` turns the join watchdog off, and with it the exit on a closed component and the stall rules. |
+| `kardamom.cluster.joinWatchdogS` | `60` | no | The member exits with code 3 if its election stays in `INIT` for this long. It exits with code 6 when the completion of its leader election failed: the control toggle is active, but the election state is not `CLOSED`, for longer than the archive message timeout plus the driver timeout. It exits with code 7 or 8 when an election stalls for the stall limit, and with code 8 when its service applied the log past its truncated log (see [Election stalls](#election-stalls)). `0` turns the join watchdog off, and with it the exit on a closed component and the stall rules. |
 | `kardamom.cluster.catchupStallS` | `300` | no | A member that tried a catch-up, and makes no progress for this long, drops its recording log and exits with code 4, unless every peer answers with an open election. The relaunch seeds the member from a peer. `0` turns the seed off: the member then never drops its log. |
 | `kardamom.cluster.fileSyncLevel` | `0` | no | The sync level of the Raft log and the archive. Values: `0`, `1`, `2`. Any other value stops the start. |
 | `kardamom.cluster.driverThreadingMode` | `SHARED` | no | The threading mode of the member's media driver: `SHARED`, `SHARED_NETWORK` or `DEDICATED`. Any other value stops the start. |
@@ -451,6 +456,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.backup.sourceType` | `FOLLOWER` | no | The members that a backup node copies from: `ANY`, `LEADER` or `FOLLOWER`. Any other value stops the start. |
 | `kardamom.cluster.bootstrap` | off | no | `true` starts a blank member at log position 0. The file `bootstrap` in `$NOMAD_TASK_DIR` has the same effect. See [Start modes](#start-modes). |
 | `kardamom.cluster.seedSnapshot` | none | yes, on a new seeded cluster | The path of the seed file. A cluster with no snapshot starts after the head of the seed, not at genesis. See [Seeded start](#seeded-start). |
+| `kardamom.cluster.genesisFeatures` | empty | yes, for the life of the chain | The features of the version switch that the chain runs from its genesis: empty, `3`, `3,4` or `3,4,5`. Any other value stops the start. `3,4,5` together with `carryBytes=true` stops the start. Only a member that starts at genesis (no snapshot and no seed) takes the value. See [Decision version](#decision-version). |
 
 - Block interval: the code default `tickMs` is 2000 ms. The deploy also passes `2000`.
   - The state machine floors the `l2_timestamp` of each boundary to a multiple of 250 ms.
@@ -579,14 +585,24 @@ The member list names each member by its Consul node name, for example `sealer-0
 
 Every member applies the same log. Two members on two rule versions can decide one entry differently, and the replicated state forks.
 
-- Every member runs version 3 from its start. `FEATURE_SEALER_V4` (feature id 3) switches it to version 4. See [Version 4](#version-4).
+- A member runs version 3 from its start, unless the chain runs features from its genesis (below). `FEATURE_SEALER_V4` (feature id 3) switches it to version 4. See [Version 4](#version-4).
 - `FEATURE_SEALER_V5` (feature id 4), the carry flag, switches version 4 to version 5. See [Version 5](#version-5).
 - `FEATURE_CARRY_WINDOW` (feature id 5), the carry window, turns on the rules of the carry window under version 5. See [The carry window](#the-carry-window-feature-5).
 - A relayed frame of kinds 0, 3, 4 and 5 needs its record-type byte. A frame that ends at the record type drops as malformed.
 - The member reports its version in the sealer info (egress kind 17): to each session when it opens, to every open session at each new leadership term (a leader change can lose a frame of the old leader), and to every open session at a switch.
 - A feature activation record (ingress kind 11) of feature 3, 4 or 5 stores the schedule of the switch. A record of another feature changes no state. The member prints `cluster FEATURE-ACTIVATION` with the outcome.
 - The snapshot is version 14: version 10, then the rules. A member that holds an activation of feature 3 writes version 15, a member that holds an activation of feature 4 writes version 16, and a member that holds an activation of feature 5 writes version 18. See [Snapshot](#snapshot).
-- Admin `/status` reports `decisionVersion` (3, 4 or 5), and `decisionActivationOrigin` and `decisionActivationMs`: the newest activation of feature 3 or 4, else the newest one that the snapshot tail holds, both 0 when there is none.
+- Admin `/status` reports `decisionVersion` (3, 4 or 5), and `decisionActivationOrigin` and `decisionActivationMs`: the newest activation of feature 3 or 4 at an L1 origin above 0, else the newest one that the snapshot tail holds, both 0 when there is none. It also reports `genesisFeatures`, the setting of the member.
+
+A new chain can run features 3, 4 and 5 from its genesis, with no upgrade transaction. The setting `kardamom.cluster.genesisFeatures` names the features: `3`, `3,4` or `3,4,5`.
+
+- A member that starts at genesis (no snapshot and no seed) holds one activation of each feature at L1 origin 0 with the time 1 ms. Such an activation is visible at every boundary, and its time is at or below the time of every block. So `3,4,5` runs version 5 with the carry window from the first entry, and the first kind 17 says version 5.
+- The held activations work through the schedule as any other activation. The snapshot is version 15 for `3`, 16 for `3,4`, and 18 for `3,4,5`, so a member that restores it keeps the rules without the setting.
+- A real activation of a feature replaces its genesis activation when the real one becomes visible: feature 5 with a time ahead turns the carry window off until that time, and feature 4 off runs version 4. A record at L1 origin 0 changes nothing.
+- Every member must run the same value, for the life of the chain. A member that replays the log from position 0, such as a blank member that copies the log of a young chain, starts at genesis again with its own value.
+- A member with `carryBytes` refuses `3,4,5`: it holds no activation of feature 5. It can run `3` or `3,4`.
+- A seed carries the rules, so a seeded member ignores the value. The member refuses a seed whose rules do not hold an activation of each feature of the value.
+- The L2 genesis config names the same set as `genesis_features`. `kardamom-reconstruct` reads it to write the rules of a seed.
 
 `FEATURE_SEALER_V3` (feature id 2) turns on the nonce burn of a skipped transaction. The executor, the validator, the replay and the zk guest read the flag at each block, so a replay of a block from before the activation, or from a time that the feature was off, uses no nonce on a skip. The sealer does not read the flag.
 
@@ -606,7 +622,7 @@ The procedure of an upgrade transaction:
 3. The Safe signs `ETHLockbox.initiateUpgrade(feature, activation_ms)`.
 
 - A rollback of the sealer to the release before this one is safe while `FEATURE_SEALER_V3` stays on: that release reads snapshot version 14 with version 3 and the held activation, and decides every entry as this release does.
-- A sealer that starts from a seed file, or at genesis, runs version 3.
+- A sealer that starts at genesis runs version 3, or the rules of `genesisFeatures`. A sealer that starts from a seed file runs the rules of the seed: version 3 for a seed of version 1.
 - The trust: any client of the cluster can send kind 11, as it can send kind 0 and kind 7. The cluster network must admit only the services of the chain.
 
 ### Version 4
@@ -724,10 +740,11 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
 - The retained file holds the bytes of the transactions of the retained frames, and the server listens on all addresses. So each request under `/retained` must carry `Authorization: Bearer <KARDAMOM_RETAINED_TOKEN>`. The job passes the same token to every member.
   - The token and the segment bytes travel in cleartext HTTP on the node network. The token keeps out a client that does not have it. It does not hide the bytes from a host that reads the network.
 - `diskFreeBytes` is `null`, and the gauge is `NaN`, when the disk cannot be read. The member stays ready.
-- The status JSON has `memberId`, `role`, `election`, `commitPosition`, `servicePosition`, `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, `snapshotLatest`, `decisionVersion`, `decisionActivationOrigin`, `decisionActivationMs`, `retainedStore`, `carryWindow`, `carryWindowActivationOrigin`, `carryWindowActivationMs`, `retainedFrames`, `retainedBytes`, `feed`, `diskFreeBytes`, `leadershipTermId`, `startHold` and `ready`.
+- The status JSON has `memberId`, `role`, `election`, `commitPosition`, `servicePosition`, `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, `snapshotLatest`, `decisionVersion`, `decisionActivationOrigin`, `decisionActivationMs`, `genesisFeatures`, `retainedStore`, `carryWindow`, `carryWindowActivationOrigin`, `carryWindowActivationMs`, `retainedFrames`, `retainedBytes`, `feed`, `diskFreeBytes`, `leadershipTermId`, `startHold` and `ready`.
   - `retainedStore` is `heap` or `file` (`carryBytes`). `carryWindow` is `true` while the rules of the carry window apply. `carryWindowActivationOrigin` and `carryWindowActivationMs` are the newest held activation of feature 5, both 0 when none. `retainedFrames` and `retainedBytes` are the retained frames and their bytes at the end of the last entry.
   - `feed` is the state of the member feed: `off` without `feedAeronDir`, `idle` with no answer, `walking` while an answer walks the retained frames, `live` while it sends each new frame, and `gapped` after `FEED_GAP` until the next request.
   - `decisionVersion` is the version of the rules of the member: 3, 4 or 5. `decisionActivationOrigin` and `decisionActivationMs` are the L1 origin and the time of the newest feature activation that the snapshot tail holds, both 0 when it holds none. See [Decision version](#decision-version).
+  - `genesisFeatures` is the setting `kardamom.cluster.genesisFeatures`: `""`, `"3"`, `"3,4"` or `"3,4,5"`.
   - `diskFreeBytes` is the free space of the disk of the cluster directory: the Raft log and the retained file. `/metrics` exports the same value.
   - `snapshotWrites`, `snapshotReadsMin` and `snapshotReadsMax` are the snapshot versions of this release, as `formats.toml` lists them.
   - `snapshotLatest` is the version of the newest snapshot this member restored or took. It is 0 before either.
@@ -748,13 +765,17 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
 Aeron 1.44 has three election waits with no bound. The join watchdog turns each into an exit. The relaunch then starts from the member's own state.
 
 - `LEADER_READY` has no timeout. The leader waits until each member that voted, or after the leader heartbeat timeout a quorum, appends at its position in its term. A member that voted, but can never join the term, keeps the leader there.
-- A follower whose service applied a log tail that the new leader does not hold fails each join at once. The join check finds the leader's join position below the member's log position, and each new election takes the position from the commit counter again. Only a relaunch replays the log again, up to the leader's log.
+- A follower whose service applied a log tail that the new leader does not hold fails each join at once. Aeron replays the whole local log at a start, an uncommitted tail included. The new leader's first message makes Aeron truncate the follower's log to the leader's term base (`Truncating Cluster Log` in the error log), but the service keeps the tail. The join check then finds the leader's join position below the member's log position, and each new election takes the position from the commit counter again. Only a relaunch replays the log again, up to the leader's log.
 - `FOLLOWER_LOG_REPLICATION` checks its deadline only after the archive signals both the end of the replication and the stop of the recording. A replication that fails before its recording starts sends no stop, and the election waits for ever.
 
 The rules:
 
 - **Progress.** A new highest commit position of the member, a new highest position of its log recording in `FOLLOWER_LOG_REPLICATION`, a new highest commit position of a peer while the member waits in `LEADER_READY`, or a closed election. A leader reads the commit positions of its peers from their admin servers each 5 s. A replay of the member's own log from a lower position is no progress.
-- **Leader stall.** The member waits in `LEADER_READY` with no progress for longer than the stall limit. It logs `cluster LEADER STALL` and exits with code 7.
+- **Truncated log.** The election is open, and the commit position stays above the position that a relaunch reaches for 5 s. A relaunch reaches the end of the last term of the recording log when that term is closed, or the latest snapshot when that is higher. An open last term fixes no position, so the rule does not act on it. The member logs `cluster FOLLOWER STALL ... truncated log` and exits with code 8. The relaunch keeps the recording log, replays it up to the leader's position, and joins the waiting leader in the same term.
+  - The follower relaunches, not the leader. Aeron already truncated the follower's log, so no member's log holds the tail any more. A new election cannot bring it back. A leader exit only costs one more election, and the follower still fails each join until it relaunches.
+  - The 5 s confirm window covers a read of the recording log that meets a half-written entry. A relaunch takes 29 s to 58 s in CI, so the window adds little.
+  - The rule needs no peer and no admin port.
+- **Leader stall.** The member waits in `LEADER_READY` with no progress for longer than the stall limit. It logs `cluster LEADER STALL` and exits with code 7. A leader whose followers have a truncated log waits for their relaunch: the stall limit is far above the relaunch time.
 - **Follower stall.** The member reached a follower state, so it found a leader, and it then makes no progress for the stall limit. It logs `cluster FOLLOWER STALL` and exits with code 8. The relaunch keeps the recording log.
 - **Catch-up stall.** A member in the follower stall that tried a catch-up (`FOLLOWER_LOG_REPLICATION` or a `FOLLOWER_CATCHUP` state) first asks its peers for their admin status. Each round asks all peers at once and ends after 2 s, name lookups included.
   - Every peer answers with an open election: the leader that the member found is not live, so its log tail is not the cause, and no peer can seed the member. The member exits with code 8 and keeps its log.
@@ -776,6 +797,20 @@ With `adminPort` 0 (the code default, and the e2e harness) the members serve no 
 - A follower that tried a catch-up never gets the answer "no closed election". It seeds at `catchupStallS`, as before the probe existed.
 
 Not covered: `LEADER_LOG_REPLICATION` also has no timeout in Aeron 1.44. A leader waits there until a quorum has replicated its log. No rule of the join watchdog acts on that state.
+
+### Start hold
+
+After its start, a member holds its outputs until the members are stable: its session egress queues every frame, and its member feed answers no request. When all members restart with different log tails, Aeron 1.44 can let one member vote in two terms. The leader of the higher term then cuts back entries that the leader of the lower term committed. The hold keeps those entries from the clients.
+
+The hold ends once per process start, at the first of these:
+
+- **All.** The member holds a settled role with a closed election, its service applied the start of a term, and every peer reports the same term with a closed election.
+- **Partial restart.** A majority agrees as above, and both of these are true:
+  - A peer in the majority reports `startHold` `false`. That peer did not restart, or it already found the members stable.
+  - Every peer that answered in any round since the start agrees now. A leader of a higher term is a live member with an open election, and it answers its status, so it holds the member. A peer that never answered was down for the whole hold.
+- **Majority.** A majority agrees after the stall limit (see above).
+
+A running member alone is not enough. Two members that restart together while the third runs can still give the running member two votes. A peer of an older release states no `startHold`, so it never opens the partial release. The member logs `cluster START-HOLD released memberId=.. term=.. verdict=ALL|PARTIAL_RESTART|MAJORITY heldMs=.. answers=../.. heard=..`.
 
 ## Log lines
 
@@ -807,7 +842,7 @@ The chaos suite and operators read these lines. The admin server also exports on
 | `sealer snapshot START` | The service starts its snapshot (`block`). The archive recording of the snapshot is open. |
 | `sealer snapshot TAKEN` | A snapshot was taken (`block`, `canonicalCount`, and `ms`, the wall time of the snapshot in milliseconds). A member that replays old log entries also prints it. |
 | `sealer snapshot RESTORED` | The member started from a snapshot. The line shows `block`, `canonicalCount`, `retained` and `postedHead`. |
-| `sealer state FRESH at genesis` | The member started with no snapshot and no seed. |
+| `sealer state FRESH at genesis` | The member started with no snapshot and no seed (`genesisFeatures`). |
 | `sealer state SEEDED` | The member started from a seed (`block`, `endTx`, `senders`, `stateRoot`, `digest`). |
 | `sealer seed CONFIRMED` | The first seed record is in the log (`block`, `canonicalCount`). |
 | `sealer seed SNAPSHOT` | The seeded leader asked for a snapshot (`requested=true` or `false`). A refused request leaves the periodic snapshot to take one. |
@@ -830,14 +865,14 @@ The chaos suite and operators read these lines. The admin server also exports on
 | `cluster ELECTION` | The election state changed between two samples of the join watchdog, one second apart (`state`, `commitPosition`, `candidateTermId`, `logLeadershipTermId`). A short state can pass with no line. `candidateTermId` is the highest term that the member voted in or stood for (from the node state file). `logLeadershipTermId` is the term of the last term entry of the recording log: a leader writes it when it starts its term, and a follower when it joins the leader's log. It reads `unknown` when the member has no term entry, or when the read meets an entry that the consensus module writes at that moment. |
 | `cluster REPLICATION` | The member is in `FOLLOWER_LOG_REPLICATION`, and the position of its active log recording changed (`recordingId`, `position`, `commitPosition`). `(no active recording)` means that the replication ended, or never started, with no recording. |
 | `cluster LEADER STALL` | The member waited in `LEADER_READY` with no progress on itself or its peers for the stall limit. The process halts with exit code 7, and the members elect again. See [Election stalls](#election-stalls). |
-| `cluster FOLLOWER STALL` | The member found a leader and then made no progress for the stall limit. The process halts with exit code 8, and the relaunch keeps the recording log. After a catch-up, the member exits only when every peer answers with an open election. A line with `deferred` shows that a peer has a closed election: the `CATCHUP STALL` rule then decides at `catchupStallS`. |
+| `cluster FOLLOWER STALL` | The member found a leader and then made no progress for the stall limit. The process halts with exit code 8, and the relaunch keeps the recording log. After a catch-up, the member exits only when every peer answers with an open election. A line with `deferred` shows that a peer has a closed election: the `CATCHUP STALL` rule then decides at `catchupStallS`. A line with `truncated log` shows that the service applied the log past the position that a relaunch reaches: the member exits after 5 s, with the same code. |
 | `cluster CATCHUP STALL` | The member tried a catch-up and made no progress for `catchupStallS`, and not every peer answered with an open election. The member drops its recording log, and the process halts with exit code 4. The relaunch seeds from a peer. |
 | `cluster ERROR LOG` | Before each exit of the join watchdog, the member prints the error logs of its consensus module, its media driver and its service container, one line each. |
 | `cluster DNS FAILED` / `cluster DNS RESOLVED` | A lookup of a member name failed, and the media driver uses the last address of the name. The second line shows the first good lookup after the outage. A name with no last address stays unresolved, and the Aeron add fails. See [Member names](#member-names). |
 | `cluster COMPONENT CLOSED` | The consensus module or the service container closed with no stop request, for example after an error in its start. The error log in the cluster directory holds the cause. The process halts with exit code 5. |
 | `cluster BACKUP` | A backup node: `up` shows its settings, `state=` a change of its state or of its latest snapshot, `error` an error of its ClusterBackup, and `closed` its stop. See [Backup mode](#backup-mode). |
 | `cluster TERMINATION` | The consensus module or the service container asked for a shutdown, or the ClusterBackup of a backup node terminated. |
-| `cluster node up`, `cluster admin endpoint`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster da-lag budget`, `cluster record-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster carry bytes`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |
+| `cluster node up`, `cluster admin endpoint`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster da-lag budget`, `cluster record-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster carry bytes`, `cluster genesis features`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |
 
 - The lines `CONTIGUITY-REJECT`, `PAST-DEADLINE`, `DA-LAG-REJECT`, `RECORD-LAG-REJECT`, `WINDOW-FULL`, `REMOTE-ORIGIN-REJECT` and `DROPPED` print when their count is a power of two (1, 2, 4, 8, and so on).
 - There is no Prometheus counter for these events. `REF-REFUSED` and `FEATURE-ACTIVATION-UNSUPPORTED` have their counters on `/metrics`.

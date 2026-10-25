@@ -50,7 +50,7 @@ variable "image_ref" {
 # detection of a dead process. CI raises it to ride out host stalls.
 variable "aeron_stall_tolerance_ms" {
   type        = number
-  description = "The client liveness timeout of the media driver and the driver timeout of its Java clients, in milliseconds. Aeron's default is 10000."
+  description = "The client liveness and image liveness timeouts of the media driver and the driver timeout of its Java clients, in milliseconds. Aeron's default is 10000."
   default     = 10000
 
   validation {
@@ -116,11 +116,20 @@ locals {
 #   keepalive every 500 ms, far below it.
 # - aeron.publication.unblock.timeout (ns): Aeron requires it above the
 #   client liveness timeout. It keeps Aeron's default ratio, 3/2.
+# - aeron.image.liveness.timeout (ns): a receiving driver keeps the image
+#   of a silent publisher this long, and a stalled receiver thread loses
+#   the image when its stall is longer. An archive that loses an image
+#   leaves a hole in its recording. A publisher sends a heartbeat every
+#   100 ms, far below it. Aeron checks no order against the other
+#   timeouts. A publisher that closes sends an end of stream, and its
+#   images go at once. Only the image of a dead publisher or a dead
+#   driver waits for the full timeout.
 locals {
   aeron_stall_opts = join(" ", [
     "-Daeron.driver.timeout=${var.aeron_stall_tolerance_ms}",
     "-Daeron.client.liveness.timeout=${var.aeron_stall_tolerance_ms * 1000000}",
     "-Daeron.publication.unblock.timeout=${floor(var.aeron_stall_tolerance_ms * 3 / 2) * 1000000}",
+    "-Daeron.image.liveness.timeout=${var.aeron_stall_tolerance_ms * 1000000}",
   ])
   # A new driver refuses to start ("active driver detected") while the
   # CnC heartbeat of a dead predecessor is younger than the driver

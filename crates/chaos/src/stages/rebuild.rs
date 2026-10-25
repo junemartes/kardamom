@@ -32,10 +32,26 @@ const BATCHER_FAILURE_MARKERS: &[&str] = &["WARN", "ERROR", "Error:", "panicked"
 /// The genesis the cluster's services start from, in the checkout.
 const GENESIS: &str = "deploy/cluster/config/genesis/dev.toml";
 
+/// The genesis fragment of a carry-born cluster, in the checkout. It
+/// holds a top-level key, so it comes before the first table of
+/// [`GENESIS`].
+const CARRY_GENESIS: &str = "deploy/cluster/config/genesis/carry.toml";
+
 /// What the tool prints when L1 does not cover the target block yet: the
 /// posted batches end before it, or no batch is posted. Every other
 /// failure is final for the L1 record it read.
 const NOT_POSTED_YET: &[&str] = &["posted batches end at block", "no BatchPosted events found"];
+
+/// What the tool's error chain holds when a request to L1 or to the DA
+/// proxy did not reach an answer: the connection failed, was reset, or
+/// timed out. The record is unread, so a later attempt can pass.
+const TRANSPORT_ERRORS: &[&str] = &[
+    "error sending request",
+    "tcp connect error",
+    "onnection refused",
+    "onnection reset",
+    "timed out",
+];
 
 /// How one run of the tool ended.
 #[derive(Debug)]
@@ -44,6 +60,9 @@ enum Attempt {
     /// L1 does not cover the target block yet. The batcher posts it
     /// within a few seconds of its seal, so a later attempt can pass.
     NotPosted(String),
+    /// A request to L1 or to the DA proxy got no answer. The tool read
+    /// no record, so a later attempt can pass.
+    Unreachable(String),
     /// The tool refused the posted record: a block that needs more slots
     /// than its canonical range holds, a root mismatch, a payload that
     /// does not decode. L1 and the DA layer hold the same record on the
@@ -62,8 +81,11 @@ impl Attempt {
             .collect::<Vec<_>>()
             .join(" / ");
         let why = format!("{report} {chain}").trim().to_string();
-        if NOT_POSTED_YET.iter().any(|marker| stderr.contains(marker)) {
+        let marks = |markers: &[&str]| markers.iter().any(|marker| stderr.contains(marker));
+        if marks(NOT_POSTED_YET) {
             Self::NotPosted(why)
+        } else if marks(TRANSPORT_ERRORS) {
+            Self::Unreachable(why)
         } else {
             Self::Refused(why)
         }
@@ -71,10 +93,18 @@ impl Attempt {
 
     /// The rebuilt state, or `None` to retry with the reason kept in
     /// `last`. A refusal ends the wait at once with the tool's reason.
+    /// A transport error is logged with its whole chain, and retried.
     fn settle(self, last: &RefCell<String>, block: u64) -> anyhow::Result<Option<Rebuilt>> {
         match self {
             Self::Rebuilt(rebuilt) => Ok(Some(rebuilt)),
             Self::NotPosted(why) => {
+                *last.borrow_mut() = why;
+                Ok(None)
+            }
+            Self::Unreachable(why) => {
+                crate::log(format!(
+                    "rebuild-from-l1: a request for block {block} got no answer; retrying: {why}"
+                ));
                 *last.borrow_mut() = why;
                 Ok(None)
             }
@@ -86,6 +116,40 @@ impl Attempt {
                 Err(crate::chaos_fail!("{message}"))
             }
         }
+    }
+}
+
+/// The genesis of the cluster's chain, as the executor and validator
+/// jobs render it (nomad/executor.nomad.hcl): the carry fragment first on
+/// a carry-born cluster, then the dev genesis, joined by a newline. The
+/// rebuild must start from the same genesis, or its root differs from
+/// the live root at every block.
+#[derive(Debug, Clone, Copy)]
+struct Genesis {
+    carry: bool,
+}
+
+impl Genesis {
+    /// The fragments, in the order the jobs join them.
+    fn fragments(self) -> &'static [&'static str] {
+        if self.carry {
+            &[CARRY_GENESIS, GENESIS]
+        } else {
+            &[GENESIS]
+        }
+    }
+
+    /// The joined genesis text, from the checkout at `repo`.
+    fn render(self, repo: &Path) -> anyhow::Result<String> {
+        let fragments = self
+            .fragments()
+            .iter()
+            .map(|fragment| {
+                let path = repo.join(fragment);
+                std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(fragments.join("\n"))
     }
 }
 
@@ -157,6 +221,14 @@ impl Output {
     }
 }
 
+/// What each attempt of a rebuild runs with: the tool, the settlement
+/// contract it reads, and the genesis file it starts from.
+struct Tool {
+    bin: PathBuf,
+    settlement: String,
+    genesis: PathBuf,
+}
+
 /// One rebuild-from-L1 run against `target`: read the payloads from the
 /// DA proxy, run
 /// `kardamom-reconstruct` through the target block, and require its
@@ -210,8 +282,9 @@ impl Rebuild<'_> {
 
     /// Rebuild through the target block, within the budget. The batcher
     /// posts a block within a few seconds of its seal, so the run retries
-    /// while the posted batches end before the target. It does not retry
-    /// any other failure.
+    /// while the posted batches end before the target. It also retries a
+    /// request to L1 or the DA proxy that got no answer. It does not
+    /// retry any other failure.
     ///
     /// # Errors
     ///
@@ -226,13 +299,16 @@ impl Rebuild<'_> {
                 .root
                 .map_or("unknown".to_string(), |root| format!("{root:#x}"))
         ));
-        let bin = self.harness.release_binary("kardamom-reconstruct")?;
-        let settlement = self.harness.settlement_address().await?;
+        let tool = Tool {
+            bin: self.harness.release_binary("kardamom-reconstruct")?,
+            settlement: self.harness.settlement_address().await?,
+            genesis: self.write_genesis()?,
+        };
         let last = RefCell::new(String::new());
-        let (bin, settlement, last_ref) = (&bin, &settlement, &last);
+        let (tool, last_ref) = (&tool, &last);
         let block = self.target.block;
         let outcome = poll::until(Budget::secs(180, 5), |_| async move {
-            self.attempt(bin, settlement).await?.settle(last_ref, block)
+            self.attempt(tool).await?.settle(last_ref, block)
         })
         .await?;
         if matches!(outcome, Outcome::TimedOut { .. }) {
@@ -270,19 +346,36 @@ impl Rebuild<'_> {
         ));
     }
 
+    /// Write the cluster's genesis into the evidence directory, and
+    /// return its path.
+    fn write_genesis(&self) -> anyhow::Result<PathBuf> {
+        let genesis = Genesis {
+            carry: self.harness.knobs.genesis_carry,
+        }
+        .render(&self.harness.lifecycle.repo_root())?;
+        let path = self.evidence.join("genesis.toml");
+        std::fs::write(&path, genesis).with_context(|| format!("write {}", path.display()))?;
+        Ok(path)
+    }
+
     /// One attempt: a fresh state directory, the payloads read from the
     /// DA proxy. The `Err` is a harness failure.
-    async fn attempt(&self, bin: &Path, settlement: &str) -> anyhow::Result<Attempt> {
+    async fn attempt(&self, tool: &Tool) -> anyhow::Result<Attempt> {
+        let Tool {
+            bin,
+            settlement,
+            genesis,
+        } = tool;
         let state = tempfile::Builder::new()
             .prefix("rebuild-")
             .tempdir_in(&self.evidence)?
             .keep();
         let out = Command::new(bin)
             .args(["--l1-rpc", &self.harness.l1_rpc()?])
-            .args(["--settlement", settlement])
+            .args(["--settlement", settlement.as_str()])
             .args(["--da-proxy", &self.da_proxy()])
             .arg("--chain")
-            .arg(self.harness.lifecycle.repo_root().join(GENESIS))
+            .arg(genesis)
             .arg("--state-dir")
             .arg(&state)
             .args(["--through-block", &self.target.block.to_string()])
@@ -320,7 +413,18 @@ impl Rebuild<'_> {
             .sealer_seed
             .as_ref()
             .map(|path| vec!["--sealer-seed".to_string(), path.display().to_string()]);
-        [root, output, seed]
+        // The deposits are not in the DA payload: the tool reads them from
+        // the logs of the lockbox. A chain with upgrade deposits rebuilds
+        // to a different root without them.
+        let lockbox = self
+            .harness
+            .lifecycle
+            .vars()
+            .carry
+            .lockbox
+            .clone()
+            .map(|lockbox| vec!["--lockbox".to_string(), lockbox]);
+        [root, output, seed, lockbox]
             .into_iter()
             .flatten()
             .flatten()

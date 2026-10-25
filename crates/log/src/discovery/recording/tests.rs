@@ -83,23 +83,79 @@ fn membership_of(instance: &str, present: bool) -> Membership {
     }
 }
 
-fn recording() -> Recording<StubArchive> {
+/// A recorder of the own publication of `alloc-test`, with an archive
+/// connect limit of `connect_limit`.
+fn spec(connect_limit: Duration) -> DiscoveredRecorder {
     let (_, membership) = watch::channel(Membership::unknown());
+    DiscoveredRecorder {
+        aeron_dir: None,
+        aeron_cfg: AeronConfig::default(),
+        local_ip: Ipv4Addr::LOCALHOST,
+        own_instance: "alloc-test".into(),
+        expected_own: 1,
+        removal_grace: GRACE,
+        connect_limit,
+        membership,
+        stop: CancellationToken::new(),
+        runtime: tokio::runtime::Handle::current(),
+    }
+}
+
+fn recording() -> Recording<StubArchive> {
     Recording {
-        spec: DiscoveredRecorder {
-            aeron_dir: None,
-            aeron_cfg: AeronConfig::default(),
-            local_ip: Ipv4Addr::LOCALHOST,
-            own_instance: "alloc-test".into(),
-            expected_own: 1,
-            removal_grace: GRACE,
-            membership,
-            stop: CancellationToken::new(),
-            runtime: tokio::runtime::Handle::current(),
-        },
+        spec: spec(Duration::ZERO),
         archive: StubArchive::default(),
         started: BTreeMap::new(),
     }
+}
+
+/// A connect that times out on its first `failures` tries, then connects.
+/// Returns the number of the try.
+fn flaky_connect(tries: &Cell<u32>, failures: u32) -> Result<u32, LogError> {
+    tries.set(tries.get() + 1);
+    if tries.get() > failures {
+        return Ok(tries.get());
+    }
+    Err(LogError::Aeron("archive connect poll: TimedOut".into()))
+}
+
+/// Run [`DiscoveredRecorder::connect_with`] over [`flaky_connect`] on a
+/// thread outside the runtime, as the recorder thread runs.
+async fn connect_after(recorder: DiscoveredRecorder, failures: u32) -> Result<u32, LogError> {
+    tokio::task::spawn_blocking(move || {
+        let tries = Cell::new(0);
+        recorder.connect_with(|| flaky_connect(&tries, failures))
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_archive_connect_tries_again_within_the_limit() {
+    let tries = connect_after(spec(Duration::from_secs(30)), 2).await;
+    assert_eq!(tries.unwrap(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_archive_connect_fails_after_the_limit() {
+    let error = connect_after(spec(Duration::ZERO), 1).await.unwrap_err();
+    assert!(error.to_string().contains("TimedOut"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_ends_the_archive_connect_tries() {
+    let recorder = spec(Duration::from_secs(30));
+    recorder.stop.cancel();
+    let error = connect_after(recorder, u32::MAX).await.unwrap_err();
+    assert!(error.to_string().contains("TimedOut"), "{error}");
+}
+
+#[tokio::test]
+async fn the_ready_budget_covers_the_connect_tries() {
+    assert_eq!(
+        spec(Duration::from_secs(70)).ready_budget(),
+        Duration::from_secs(70 + 30 + 60)
+    );
 }
 
 #[tokio::test]

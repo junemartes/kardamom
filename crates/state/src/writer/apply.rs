@@ -19,8 +19,7 @@ use crate::meta::{
 use crate::schema::{
     HeaderValue, TABLE_ACCOUNTS, TABLE_CODE, TABLE_HEADERS, TABLE_META, TABLE_RECEIPTS,
     TABLE_STORAGE, TABLE_TX_HASH_INDEX, TxDataRef, TxIndexValue, encode_block_key,
-    encode_header_value, encode_receipt_value, encode_storage_key, encode_storage_value,
-    encode_tx_hash_key, encode_tx_hash_value,
+    encode_header_value, encode_receipt_value, encode_tx_hash_key, encode_tx_hash_value,
 };
 use crate::trie;
 
@@ -182,15 +181,7 @@ impl<'a> BatchWriter<'a> {
     /// current slots when it recomputes that account's `storage_root`.
     fn storage(mut self, delta: &BlockDelta) -> Result<Self, StateError> {
         let t = Instant::now();
-        let mut cur = self.txn.cursor(self.storage)?;
-        for change in &delta.storage {
-            let key = encode_storage_key(change.address, change.key);
-            cur.put(
-                &key,
-                &encode_storage_value(change.value),
-                WriteFlags::UPSERT,
-            )?;
-        }
+        crate::schema::write_storage(self.txn, self.storage, &delta.storage)?;
         self.timing.storage = CommitSteps::lap(&self.steps.storage, t);
         Ok(self)
     }

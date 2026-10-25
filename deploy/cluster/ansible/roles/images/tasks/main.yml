@@ -13,7 +13,8 @@
   ansible.builtin.debug:
     msg: >-
       Would build and push {{ images_services + ['aeron', 'redis', 'cluster', 'l1-light-client'] }}
-      from prebuilt binaries, then publish {{ images_manifest }}.
+      from prebuilt binaries, copy {{ images_upstream.keys() | list }} into the registry,
+      then publish {{ images_manifest }}.
   when: ansible_check_mode
 
 - name: Build a complete image release
@@ -119,6 +120,24 @@
               name: l1-light-client
               path: "{{ images_cluster_dir }}/docker/helios"
               dockerfile: Dockerfile
+
+        # One pull of each upstream image on this host, with the retries
+        # of the build, in place of one pull on every node. The copy is a
+        # build FROM the pinned reference, so it takes the transfer and the
+        # push of the kardamom images.
+        - name: Copy the upstream images into the registry
+          ansible.builtin.include_tasks: image.yml
+          loop: "{{ images_upstream | dict2items }}"
+          loop_control:
+            loop_var: images_upstream_item
+            label: "{{ images_upstream_item.key }}"
+          vars:
+            images_item:
+              name: "upstream-{{ images_upstream_item.key | replace('_', '-') }}"
+              path: "{{ images_cluster_dir }}/docker/upstream"
+              dockerfile: Dockerfile
+              args:
+                BASE: "{{ images_upstream_item.value }}"
 
         - name: Publish the completed digest manifest
           ansible.builtin.include_tasks: manifest.yml

@@ -33,6 +33,12 @@ container_epoch_pace_ms := env('EPOCH_PACE_MS', '100')
 # A container cluster runs about 20 of them on one shared CI or developer
 # host, far above their Nomad cpu reservations.
 container_idle_cap_us := env('KARDAMOM_IDLE_CAP_US', '1000')
+# The carry from genesis of a container cluster: `on` starts the new chain
+# with features 3, 4 and 5 active at genesis and every carry switch on
+# (KARDAMOM_GENESIS_CARRY). Empty keeps the reference path. The chaos
+# lifecycle sets it per shard (DeployVars), so the shard recipes leave it
+# alone. `deploy` never sets it.
+container_genesis_carry := env('KARDAMOM_GENESIS_CARRY', '')
 
 _default:
     @just --list
@@ -128,6 +134,7 @@ container-up:
     export AERON_STALL_TOLERANCE_MS="{{container_stall_ms}}"
     export EPOCH_PACE_MS="{{container_epoch_pace_ms}}"
     export KARDAMOM_IDLE_CAP_US="{{container_idle_cap_us}}"
+    export KARDAMOM_GENESIS_CARRY="{{container_genesis_carry}}"
     # New nodes get a new sealer cluster. The deploy opens the bootstrap
     # only for a cluster job that Nomad does not know.
     export KARDAMOM_CLUSTER_BOOTSTRAP="${KARDAMOM_CLUSTER_BOOTSTRAP:-1}"

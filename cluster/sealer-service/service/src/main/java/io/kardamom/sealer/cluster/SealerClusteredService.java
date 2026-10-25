@@ -17,6 +17,7 @@ import io.kardamom.sealer.OriginOutcome;
 import io.kardamom.sealer.Relayed;
 import io.kardamom.sealer.VersionSwitch;
 import io.kardamom.sealer.RemoteOriginAdvance;
+import io.kardamom.sealer.GenesisFeatures;
 import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.TxOffer;
 import io.kardamom.sealer.VoidLedger;
@@ -102,6 +103,13 @@ public final class SealerClusteredService implements ClusteredService {
      * Empty starts it at genesis. A snapshot, when one exists, wins.
      */
     private Optional<SealerSeed> seed = Optional.empty();
+
+    /**
+     * The features that the chain runs from its genesis. Replicated
+     * configuration: a member that starts at genesis takes them, so every
+     * member runs the same set. A restore and a seed bring their own rules.
+     */
+    private GenesisFeatures genesisFeatures = GenesisFeatures.NONE;
 
     /**
      * The retained-file settings, or empty to keep the retained frames on
@@ -344,6 +352,17 @@ public final class SealerClusteredService implements ClusteredService {
         return this;
     }
 
+    /** Start a member at genesis with the rules of {@code features}. Every member must run the same set. */
+    SealerClusteredService genesisFeatures(final GenesisFeatures features) {
+        this.genesisFeatures = features;
+        return this;
+    }
+
+    /** The features that the chain runs from its genesis, for the admin endpoint. */
+    GenesisFeatures genesisFeatures() {
+        return genesisFeatures;
+    }
+
     /**
      * Keep the retained frames in an append-only file, not on the heap.
      * Every member must run the same choice.
@@ -418,8 +437,10 @@ public final class SealerClusteredService implements ClusteredService {
             this.state = new CanonicalSealerState(
                 dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER, remoteOrigins, voids(),
                 inclusionHorizonBlocks, window.capacity(), budgets);
+            state.genesisRules(genesisFeatures);
             openEgress(Optional.empty());
-            System.out.println("sealer state FRESH at genesis memberId=" + memberId);
+            System.out.println("sealer state FRESH at genesis memberId=" + memberId
+                + " genesisFeatures=\"" + genesisFeatures.value() + "\"");
         }
         publishRules();
         System.out.println("sealer decision rules memberId=" + memberId + " version=" + state.decisionVersion()

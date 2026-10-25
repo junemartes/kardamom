@@ -385,13 +385,14 @@ impl<'a> FleetWipe<'a> {
             "{}: {CTX}: a member started from the seed after the seed property was cleared",
             crate::FAIL_PREFIX
         );
-        let leader = self
+        let elected = self
             .h
             .evidence
-            .cluster_leader(FULL_RESTART_ELECTION)
+            .cluster_elected(FULL_RESTART_ELECTION)
             .await?;
         crate::log(format!(
-            "{CTX}: members without the seed elected memberId={leader}"
+            "{CTX}: members without the seed elected memberId={} (term {})",
+            elected.leader, elected.term
         ));
         Ok(())
     }
@@ -399,12 +400,15 @@ impl<'a> FleetWipe<'a> {
     /// Register the seeded cluster job and wait for a leader.
     async fn start_seeded(&self, job: &serde_json::Value) -> anyhow::Result<()> {
         self.jobs.cluster.register(job).await?;
-        let leader = self
+        let elected = self
             .h
             .evidence
-            .cluster_leader(FULL_RESTART_ELECTION)
+            .cluster_elected(FULL_RESTART_ELECTION)
             .await?;
-        crate::log(format!("{CTX}: seeded members elected memberId={leader}"));
+        crate::log(format!(
+            "{CTX}: seeded members elected memberId={} (term {})",
+            elected.leader, elected.term
+        ));
         Ok(())
     }
 

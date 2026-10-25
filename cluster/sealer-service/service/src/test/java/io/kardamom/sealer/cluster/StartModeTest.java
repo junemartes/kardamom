@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -57,6 +58,29 @@ final class StartModeTest {
             log.appendSnapshot(1, 0, 0, 4_096, 0, ConsensusModule.Configuration.SERVICE_ID);
         }
         assertEquals(4_096L, state.latestSnapshotPosition());
+    }
+
+    /**
+     * A relaunch reaches the end of a closed last term, or the latest
+     * snapshot when that is higher. An open term grows with its recording,
+     * so it fixes no position.
+     */
+    @Test
+    void theRelaunchPositionComesFromAClosedLastTerm() {
+        final StateDir state = new StateDir(dir);
+        final int cm = ConsensusModule.Configuration.SERVICE_ID;
+        assertEquals(OptionalLong.empty(), state.relaunchPosition(), "no recording log");
+        try (RecordingLog log = new RecordingLog(dir.toFile(), true)) {
+            log.appendTerm(0, 2, 0, 0);
+            log.appendSnapshot(1, 2, 0, 4_096, 0, cm);
+            assertEquals(OptionalLong.empty(), state.relaunchPosition(), "an open term");
+            log.commitLogPosition(2, 18_338_816L);
+            assertEquals(OptionalLong.of(18_338_816L), state.relaunchPosition(), "a term that a new leader truncated");
+            log.appendSnapshot(2, 2, 0, 20_000_000L, 0, cm);
+            assertEquals(OptionalLong.of(20_000_000L), state.relaunchPosition(), "a snapshot above the log end");
+            log.appendTerm(0, 3, 20_000_000L, 0);
+        }
+        assertEquals(OptionalLong.empty(), state.relaunchPosition(), "the member joined a new term");
     }
 
     @Test

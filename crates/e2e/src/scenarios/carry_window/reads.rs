@@ -18,6 +18,7 @@ pub(super) const REF_REFUSED: &str = "kardamom_sealer_ref_refused_total";
 pub(super) const FULL_REF_BELOW_V5: &str = "kardamom_sealer_full_ref_below_v5_total";
 pub(super) const FEED_STATE: &str = "kardamom_sealer_feed_state";
 pub(super) const FEATURE_STATE: &str = "kardamom_sealer_feature_state";
+pub(super) const SNAPSHOT_VERSION: &str = "kardamom_sealer_snapshot_version";
 pub(super) const VALIDATOR_CURSOR: &str = "kardamom_validator_egress_cursor_index";
 pub(super) const BATCHER_CURSOR: &str = "kardamom_batcher_egress_cursor_index";
 pub(super) const BATCHER_POSTED: &str = "kardamom_batcher_last_posted_block";

@@ -261,7 +261,12 @@ impl Opened {
     pub(crate) async fn open_streams(mut self) -> Result<Streamed> {
         let args = &self.base.args;
         let mut cluster_cfg = self.base.file_cfg.cluster.to_live();
-        if let Some(endpoints) = self.base.plane.cluster_ingress_endpoints().await? {
+        if let Some(endpoints) = self
+            .base
+            .plane
+            .cluster_ingress_endpoints(self.base.rt.start_open_limit())
+            .await?
+        {
             cluster_cfg.ingress_endpoints = endpoints;
         }
         // The kardamom_sealer_* re-export is the executor's job. A

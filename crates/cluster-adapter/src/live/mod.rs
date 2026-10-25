@@ -31,6 +31,7 @@ mod meters;
 mod session_loop;
 mod term;
 
+use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -83,9 +84,80 @@ impl LiveClusterConfig {
     }
 }
 
+/// The mark of one session of the session thread: the count of the
+/// sessions that it opened, from 1, and back to 1 after `u16::MAX`. A fenced
+/// ingress compares two marks for equality only, so the wrap matters only
+/// when exactly 65,536 sessions open between two offers. The mark is two
+/// bytes, so a fenced [`LiveIngress`] is no larger than a plain one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionMark(NonZeroU16);
+
+impl SessionMark {
+    /// The mark of the session that opens after the session `prev`.
+    fn after(prev: Option<Self>) -> Self {
+        let next = prev.map_or(0, |mark| mark.0.get()).wrapping_add(1);
+        Self(NonZeroU16::new(next).unwrap_or(NonZeroU16::MIN))
+    }
+}
+
+/// One offer request to the session thread.
 struct OfferReq {
     payload: AppPayload,
-    reply: Sender<OfferOutcome>,
+    /// The session of the last offer of a fenced ingress: the session
+    /// thread refuses the offer on any other session. `None` takes any
+    /// session.
+    expect: Option<SessionMark>,
+    reply: Sender<OfferReply>,
+}
+
+impl OfferReq {
+    /// Whether the offer must not go out on `session`, the open session:
+    /// the ingress is fenced to another one.
+    fn fenced_off(&self, session: Option<SessionMark>) -> bool {
+        self.expect
+            .is_some_and(|expect| session.is_some_and(|open| open != expect))
+    }
+}
+
+/// The answer of the session thread to one offer.
+#[derive(Clone, Copy)]
+struct OfferReply {
+    outcome: OfferOutcome,
+    /// The mark of the session that opened last, `None` before the first
+    /// one.
+    session: Option<SessionMark>,
+}
+
+/// Whether an ingress offers only on the session of its last offer.
+#[derive(Clone, Copy)]
+enum Fence {
+    Off,
+    /// The session of the last offer that reached a session, `None` before
+    /// the first one.
+    On(Option<SessionMark>),
+}
+
+impl Fence {
+    /// The session that the next offer must go to.
+    fn expect(self) -> Option<SessionMark> {
+        match self {
+            Self::Off => None,
+            Self::On(session) => session,
+        }
+    }
+
+    /// Follow the session of `reply`: an accepted offer and a refused one
+    /// both name the open session.
+    fn follow(&mut self, reply: OfferReply) {
+        if let Self::On(held) = self
+            && matches!(
+                reply.outcome,
+                OfferOutcome::Accepted | OfferOutcome::SessionChanged
+            )
+        {
+            *held = reply.session;
+        }
+    }
 }
 
 /// Owns the session thread. Dropping it stops the session cleanly.
@@ -114,6 +186,22 @@ impl Drop for LiveCluster {
 pub struct LiveIngress {
     req_tx: Sender<OfferReq>,
     term: SessionTerm,
+    fence: Fence,
+}
+
+impl LiveIngress {
+    /// A clone that offers only on the session of its last offer. The first
+    /// offer after the session changes offers nothing and returns
+    /// [`OfferOutcome::SessionChanged`]: the old session can have lost the
+    /// payloads that it took, and the caller offers them again before any
+    /// new payload. The offers after it go to the new session.
+    #[must_use]
+    pub fn fenced(&self) -> Self {
+        Self {
+            fence: Fence::On(None),
+            ..self.clone()
+        }
+    }
 }
 
 impl ClusterIngress for LiveIngress {
@@ -130,6 +218,7 @@ impl ClusterIngress for LiveIngress {
             .req_tx
             .send(OfferReq {
                 payload,
+                expect: self.fence.expect(),
                 reply: reply_tx,
             })
             .is_err()
@@ -139,7 +228,12 @@ impl ClusterIngress for LiveIngress {
         // `RecvError` means the session thread dropped `reply_tx` without
         // answering, which only happens when it is gone: the same
         // condition `OfferOutcome::NotConnected` reports above.
-        reply_rx.recv().unwrap_or(OfferOutcome::NotConnected)
+        let reply = reply_rx.recv().unwrap_or(OfferReply {
+            outcome: OfferOutcome::NotConnected,
+            session: None,
+        });
+        self.fence.follow(reply);
+        reply.outcome
     }
 }
 
@@ -407,6 +501,7 @@ impl IngressOpened {
             LiveIngress {
                 req_tx,
                 term: ingress_term,
+                fence: Fence::Off,
             },
             LiveEgress { out_rx },
         ))
@@ -436,10 +531,74 @@ mod tests {
         let mut ingress = LiveIngress {
             req_tx,
             term: SessionTerm::Control,
+            fence: Fence::Off,
         };
         let len = SessionTerm::Control.max_payload_len() + 1;
         assert_eq!(ingress.offer(&vec![0; len]), OfferOutcome::TooLarge { len });
         assert!(req_rx.is_empty(), "no request reaches the session thread");
+    }
+
+    /// Answer one request as the session thread does while the session
+    /// `open` is open, with the fence rule of the real session thread.
+    fn answer(req_rx: &crossbeam_channel::Receiver<OfferReq>, open: SessionMark) {
+        let req = req_rx.recv().unwrap();
+        let session = Some(open);
+        let outcome = if req.fenced_off(session) {
+            OfferOutcome::SessionChanged
+        } else {
+            OfferOutcome::Accepted
+        };
+        req.reply.send(OfferReply { outcome, session }).unwrap();
+    }
+
+    /// A fenced ingress offers nothing on a new session at first: it
+    /// reports the change once, and its next offer goes to the new session.
+    /// An ingress that is not fenced offers on any session.
+    #[test]
+    fn a_fenced_ingress_reports_a_new_session_once() {
+        let (req_tx, req_rx) = unbounded();
+        let plain = LiveIngress {
+            req_tx,
+            term: SessionTerm::Control,
+            fence: Fence::Off,
+        };
+        let mut fenced = plain.fenced();
+        let mut plain = plain;
+        let session_thread = std::thread::spawn(move || {
+            let first = SessionMark::after(None);
+            let second = SessionMark::after(Some(first));
+            for open in [first, first, second, second, second] {
+                answer(&req_rx, open);
+            }
+        });
+        let outcomes = [
+            fenced.offer(b"a"),
+            fenced.offer(b"b"),
+            plain.offer(b"c"),
+            fenced.offer(b"d"),
+            fenced.offer(b"e"),
+        ];
+        session_thread.join().unwrap();
+        assert_eq!(
+            outcomes,
+            [
+                OfferOutcome::Accepted,
+                OfferOutcome::Accepted,
+                OfferOutcome::Accepted,
+                OfferOutcome::SessionChanged,
+                OfferOutcome::Accepted,
+            ]
+        );
+    }
+
+    /// The mark counts from 1, and wraps back to 1, never to 0.
+    #[test]
+    fn a_session_mark_counts_from_one_and_wraps_to_one() {
+        let first = SessionMark::after(None);
+        assert_eq!(first.0.get(), 1);
+        assert_eq!(SessionMark::after(Some(first)).0.get(), 2);
+        let last = SessionMark(NonZeroU16::MAX);
+        assert_eq!(SessionMark::after(Some(last)), first);
     }
 
     #[test]

@@ -135,20 +135,24 @@ async fn wait_reader_moves(
 }
 
 /// The readers use Redis again: a probe read raises the Redis lookups
-/// and leaves the degraded count where it was.
+/// and leaves the degraded count where it was. A failed probe read or
+/// scrape is one reading that shows no recovery: a recovering ingress
+/// can refuse a read or drop a scrape, and the next reading tries again.
 pub(crate) async fn wait_readers_recovered(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+    let last = std::cell::RefCell::new(String::from("no reading"));
+    let last_ref = &last;
     let outcome = poll::until(Budget::secs(120, 3), |_| async move {
-        let before = readers(h).await?;
-        probe_cold_read(h, 1).await?;
-        let after = readers(h).await?;
-        let recovered = after.redis > before.redis && after.degraded == before.degraded;
-        Ok::<_, anyhow::Error>(recovered.then_some(after))
+        Ok::<_, anyhow::Error>(recovery_reading(h).await.unwrap_or_else(|e| {
+            *last_ref.borrow_mut() = format!("{e:#}");
+            None
+        }))
     })
     .await?;
     let (sample, elapsed) = outcome.or_fail(|t| {
         crate::chaos_fail!(
-            "{ctx}: the readers did not use Redis again without a degraded read within {}s",
-            t.as_secs()
+            "{ctx}: the readers did not use Redis again without a degraded read within {}s (last failed reading: {})",
+            t.as_secs(),
+            last.borrow()
         )
     })?;
     crate::log(format!(
@@ -158,6 +162,17 @@ pub(crate) async fn wait_readers_recovered(h: &Harness, ctx: &str) -> anyhow::Re
         sample.degraded
     ));
     Ok(())
+}
+
+/// One reading of the recovery: the counters, a probe read, and the
+/// counters again. The readings after the probe when it used Redis with
+/// no degraded read, else `None`.
+async fn recovery_reading(h: &Harness) -> anyhow::Result<Option<Readers>> {
+    let before = readers(h).await?;
+    probe_cold_read(h, 1).await?;
+    let after = readers(h).await?;
+    let recovered = after.redis > before.redis && after.degraded == before.degraded;
+    Ok(recovered.then_some(after))
 }
 
 /// The readers degrade instead of stalling: a probe read raises the

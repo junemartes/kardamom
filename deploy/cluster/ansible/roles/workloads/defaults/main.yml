@@ -23,6 +23,13 @@ workloads_cert_issuer: "{{ lookup('env', 'KARDAMOM_CERT_OIDC_ISSUER') | default(
 workloads_image_services: >-
   {{ ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher', 'batcher',
       'state-mirror', 'notifier', 'canary'] + (['egress'] if workloads_egress | bool else []) }}
+# The upstream image of each job variable in upstream_images: the
+# in-cluster copy that the image manifest records as upstream-<variable>
+# (the container path), else the pinned upstream reference.
+workloads_upstream_images: >-
+  {{ upstream_images | combine(dict(workloads_image_refs.keys() | select('match', '^upstream-')
+     | map('regex_replace', '^upstream-', '') | map('replace', '-', '_')
+     | zip(workloads_image_refs | dict2items | selectattr('key', 'match', '^upstream-') | map(attribute='value')))) }}
 # The variables every job derives its placement and its peer lists from.
 # A job receives the ones its file declares (tasks/job.yml).
 # The Nomad node pool of a job, by job name: the pool id of an elastic
@@ -68,6 +75,10 @@ workloads_common_vars:
   # aeron job gives their media drivers the notifier idle cap.
   notifier_nodes: "{{ workloads_notifier_nodes }}"
   notifier_count: "{{ workloads_notifier_count }}"
+  # The carry from genesis: "on" or empty. One value for the sealer
+  # members (genesisFeatures) and the genesis of the executors and the
+  # validator. Empty leaves every job at its "off" default.
+  genesis_carry: "{{ 'on' if workloads_genesis_carry == 'on' else '' }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
 # workloads_l1_rpc_given keeps the given value: anvil.yml overwrites
@@ -188,6 +199,36 @@ workloads_priority_fees: "{{ lookup('env', 'PRIORITY_FEES') }}"
 # The recorded cursor of the executors (nomad/executor.nomad.hcl): "on" or
 # "off". Empty keeps the job's "off" default.
 workloads_exec_cursor: "{{ lookup('env', 'KARDAMOM_EXEC_CURSOR') }}"
+# The carry from genesis (KARDAMOM_GENESIS_CARRY): "on", "off" or empty.
+# On, a new chain starts with features 3, 4 and 5 active at genesis: the
+# sealer members take genesisFeatures=3,4,5, and the genesis of the
+# executors and the validator takes genesis_features = [3, 4, 5]. It also
+# sets the default of every switch in workloads_genesis_carry_switches.
+# The preflight refuses an explicit other value of such a switch, and the
+# release gate accepts it only for a new chain. README.md, "The carry from
+# genesis", gives the rules.
+workloads_genesis_carry: "{{ lookup('env', 'KARDAMOM_GENESIS_CARRY') }}"
+# The value of each carry switch on a chain that starts with the carry
+# window, by its environment variable: the member feed, the executors on
+# the sealer nodes in carry mode, the egress with every reader of the
+# canonical stream on it, the v2 loop of the sequencers and the floor 5.
+workloads_genesis_carry_switches:
+  KARDAMOM_MEMBER_FEED: "on"
+  KARDAMOM_EXEC_ON_SEALERS: "on"
+  KARDAMOM_EXEC_FRAMES: "on"
+  KARDAMOM_EGRESS: "1"
+  KARDAMOM_BATCHER_EGRESS: "on"
+  KARDAMOM_VALIDATOR_EGRESS: "on"
+  KARDAMOM_SEQUENCER_ADMISSION: "on"
+  KARDAMOM_SEALER_VERSION_FLOOR: "5"
+  KARDAMOM_CARRY_EXECUTORS: "{{ range(node_classes.sealer.count | int) | join(',') }}"
+# The defaults of the carry switches: workloads_genesis_carry_switches
+# with the carry from genesis, else none.
+workloads_genesis_carry_defaults: "{{ workloads_genesis_carry_switches if workloads_genesis_carry == 'on' else {} }}"
+# The jobs that the carry gates read. A genesis bootstrap needs a cluster
+# where Nomad knows none of them: the deploy then registers each one from
+# this release (tasks/genesis_gate.yml).
+workloads_genesis_pipeline_jobs: [sequencer, executor, batcher, validator, egress]
 # The switches of the carry window. Every switch is off by default, and
 # with every switch off no job changes. README.md, "The carry window",
 # gives the order.
@@ -195,27 +236,33 @@ workloads_exec_cursor: "{{ lookup('env', 'KARDAMOM_EXEC_CURSOR') }}"
 # member feeds its retained frames to the executor on its own node, on the
 # shared media driver of that node. It is not a setting that every member
 # must match, so a rolling deploy turns it on member by member.
-workloads_member_feed: "{{ lookup('env', 'KARDAMOM_MEMBER_FEED') }}"
+workloads_member_feed: >-
+  {{ lookup('env', 'KARDAMOM_MEMBER_FEED') | default(workloads_genesis_carry_defaults.KARDAMOM_MEMBER_FEED | default(''), true) }}
 # The executors on the sealer nodes (KARDAMOM_EXEC_ON_SEALERS): "on" or
 # "off". On, executor <i> runs on sealer-<i> in its own group
 # executor-<i>, and the executor job rolls one group at a time
 # (tasks/executor.yml). It needs the member feed.
-workloads_exec_on_sealers: "{{ lookup('env', 'KARDAMOM_EXEC_ON_SEALERS') }}"
+workloads_exec_on_sealers: >-
+  {{ lookup('env', 'KARDAMOM_EXEC_ON_SEALERS') | default(workloads_genesis_carry_defaults.KARDAMOM_EXEC_ON_SEALERS | default(''), true) }}
 # The executors in carry mode (KARDAMOM_CARRY_EXECUTORS): a
 # comma-separated list of member indexes, such as "0", then "0,1". Each
 # listed executor runs with --carry-bytes and --egress. Empty: none.
-workloads_carry_executors: "{{ lookup('env', 'KARDAMOM_CARRY_EXECUTORS') | replace(' ', '') }}"
+workloads_carry_executors: >-
+  {{ lookup('env', 'KARDAMOM_CARRY_EXECUTORS') | replace(' ', '')
+     | default(workloads_genesis_carry_defaults.KARDAMOM_CARRY_EXECUTORS | default(''), true) }}
 workloads_carry_executor_ids: "{{ workloads_carry_executors | split(',') | reject('equalto', '') | map('int') | list }}"
 # The first sealer decision version of the sequencers
 # (KARDAMOM_SEALER_VERSION_FLOOR), from 0 to 5. Empty is 0. The release
 # gate refuses a floor above the lowest decisionVersion of the members,
 # and a floor above 0 until every reader reads a relayed full reference.
-workloads_sealer_version_floor: "{{ lookup('env', 'KARDAMOM_SEALER_VERSION_FLOOR') }}"
+workloads_sealer_version_floor: >-
+  {{ lookup('env', 'KARDAMOM_SEALER_VERSION_FLOOR') | default(workloads_genesis_carry_defaults.KARDAMOM_SEALER_VERSION_FLOOR | default(''), true) }}
 # The v2 loop of the sequencers (KARDAMOM_SEQUENCER_ADMISSION): "on" or
 # "off". Empty keeps the job's "off" default. The carry window needs it:
 # only the v2 loop carries the bytes of a transaction under decision
 # version 5.
-workloads_sequencer_admission: "{{ lookup('env', 'KARDAMOM_SEQUENCER_ADMISSION') }}"
+workloads_sequencer_admission: >-
+  {{ lookup('env', 'KARDAMOM_SEQUENCER_ADMISSION') | default(workloads_genesis_carry_defaults.KARDAMOM_SEQUENCER_ADMISSION | default(''), true) }}
 # The ceiling of the sealer retention in frames, and in bytes: the
 # retained frames times their mean size. A replay over a cluster session
 # queues every wanted frame at once, and the sealer closes a session whose
@@ -252,15 +299,19 @@ workloads_reader_cursor_gauges:
 # each reader. A reader switch needs the egress, and the egress needs the
 # frames; the preflight refuses another order.
 # KARDAMOM_EGRESS=1 deploys the egress job, after the executors.
-workloads_egress: "{{ lookup('env', 'KARDAMOM_EGRESS') | default('0', true) | bool }}"
+workloads_egress: >-
+  {{ lookup('env', 'KARDAMOM_EGRESS') | default(workloads_genesis_carry_defaults.KARDAMOM_EGRESS | default('0'), true) | bool }}
 # The reader switches: "on" or "off". Empty keeps the job's default, off.
 # The executors' frames (nomad/executor.nomad.hcl, exec_frames).
-workloads_exec_frames: "{{ lookup('env', 'KARDAMOM_EXEC_FRAMES') }}"
+workloads_exec_frames: >-
+  {{ lookup('env', 'KARDAMOM_EXEC_FRAMES') | default(workloads_genesis_carry_defaults.KARDAMOM_EXEC_FRAMES | default(''), true) }}
 # The canonical stream of the validator and the batcher from the egress
 # (--egress). Switch them on only on a chain where the carry flag is
 # active.
-workloads_validator_egress: "{{ lookup('env', 'KARDAMOM_VALIDATOR_EGRESS') }}"
-workloads_batcher_egress: "{{ lookup('env', 'KARDAMOM_BATCHER_EGRESS') }}"
+workloads_validator_egress: >-
+  {{ lookup('env', 'KARDAMOM_VALIDATOR_EGRESS') | default(workloads_genesis_carry_defaults.KARDAMOM_VALIDATOR_EGRESS | default(''), true) }}
+workloads_batcher_egress: >-
+  {{ lookup('env', 'KARDAMOM_BATCHER_EGRESS') | default(workloads_genesis_carry_defaults.KARDAMOM_BATCHER_EGRESS | default(''), true) }}
 # The receipts and their rows of the sequencers from egress_receipts.
 workloads_sequencer_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_SEQUENCER_RECEIPTS_FROM_EGRESS') }}"
 # eth_getTransactionReceipt of the ingress from the egress on a cache miss.
@@ -416,9 +467,10 @@ workloads_indexer_port: "{{ lookup('env', 'L1_INDEXER_PORT') | default('8549', t
 workloads_poll_delay: 3
 workloads_poll_retries: 80
 # The poll budget of one Nomad deployment, in polls of workloads_poll_delay
-# seconds. It covers a job's progress_deadline (10 minutes), so a
-# deployment that Nomad has not decided yet is never read as a failure.
-workloads_deployment_retries: 220
+# seconds. It covers the longest progress_deadline of a job (12 minutes,
+# the sealer), so a deployment that Nomad has not decided yet is never
+# read as a failure. 260 polls of 3 s are 13 minutes.
+workloads_deployment_retries: 260
 # Canary allocations for the ingress and the sequencer: 0 or 1. A canary
 # is one allocation more than the count, so it needs a spare node of its
 # class; the container profile has none.
@@ -459,6 +511,7 @@ workloads_sealer_must_match:
   - recordLagBudget
   - carryBytes
   - seedSnapshot
+  - genesisFeatures
 # The bootstrap of a new sealer cluster (KARDAMOM_CLUSTER_BOOTSTRAP=1).
 # Only a blank member that starts while the bootstrap is open starts at
 # log position 0; every other blank member copies a peer's snapshot. The

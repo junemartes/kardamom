@@ -10,34 +10,28 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::cases::Case;
-use crate::cases::cache::wait_readers_degraded;
-use crate::cases::chain_status::ChainView;
 use crate::cases::component::executor_containers;
 use crate::cases::fleet::{FULL_RESTART_ELECTION, await_exporter_back, sealers};
-use crate::cases::validator::COMMITTED;
 use crate::harness::Harness;
+use crate::knobs::ExecutorNodes;
 use crate::nomad::{Alloc, Job, SavedJob};
-use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
 
 mod checks;
+mod expect;
 mod refill;
 #[cfg(test)]
 mod tests;
 
 use checks::Baseline;
 pub(crate) use checks::Check;
+pub(crate) use expect::Expect;
+#[cfg(test)]
+use expect::Progress;
 
 /// How long every class stays down before the first one returns. The
 /// expectation while down is checked inside it.
 const HOLD: Duration = Duration::from_secs(60);
-/// The window between the two head readings that judge the expectation.
-const WINDOW: Duration = Duration::from_secs(15);
-/// How long a live ingress gets to refuse a submit on the lost quorum:
-/// the sealer silence an ingress tolerates, then its next status poll.
-const REFUSAL_BUDGET: Duration = Duration::from_secs(60);
-/// The cause an ingress names while no sealer answers.
-const NO_QUORUM: &str = "sealer_no_quorum";
 /// The task of each sequencer lane on a sequencer node.
 const LANES: [&str; 2] = ["sequencer-0", "sequencer-1"];
 
@@ -48,10 +42,17 @@ const LANES: [&str; 2] = ["sequencer-0", "sequencer-1"];
 /// write; the sequencers learn their floors from the executors and from
 /// Redis; the ingresses need a sealer for their session and the
 /// executors for their receipts.
+///
+/// The executors and the state mirrors run on the executor nodes, or on
+/// the sealer nodes (see [`Class::placed`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Class {
     /// The three Raft members, on their own nodes.
     Sealer,
+    /// The three Raft member tasks, with their job stopped. The sealer
+    /// nodes stay up, so the executors on them can return before the
+    /// members.
+    SealerTasks,
     /// The three executor tasks, with their job stopped. The nodes stay
     /// up, so the mirrors on them can return before the executors.
     Executor,
@@ -93,7 +94,7 @@ enum Fault {
 }
 
 /// What holds a class down, and brings it back.
-enum Held {
+pub(crate) enum Held {
     /// The stopped job, as Nomad held it before the case.
     Job(SavedJob),
     /// The killed nodes.
@@ -101,7 +102,7 @@ enum Held {
 }
 
 /// A class whose return has started, and what proves that it runs.
-enum Pending<'a> {
+pub(crate) enum Pending<'a> {
     /// The allocations of the posted job version run.
     Job { job: &'a SavedJob, desired: Job },
     /// The job on the started nodes reaches its count.
@@ -111,7 +112,7 @@ enum Pending<'a> {
 impl Class {
     fn job(self) -> &'static str {
         match self {
-            Self::Sealer => CLUSTER_TASK,
+            Self::Sealer | Self::SealerTasks => CLUSTER_TASK,
             Self::Executor | Self::ExecutorNodes => "executor",
             Self::Validator => "validator",
             Self::StateMirror => "state-mirror",
@@ -124,7 +125,11 @@ impl Class {
     /// The allocation count of the class when every replica runs.
     fn count(self) -> usize {
         match self {
-            Self::Sealer | Self::Executor | Self::ExecutorNodes | Self::StateMirror => 3,
+            Self::Sealer
+            | Self::SealerTasks
+            | Self::Executor
+            | Self::ExecutorNodes
+            | Self::StateMirror => 3,
             Self::Validator => 1,
             Self::Redis => 5,
             Self::Sequencer => 4,
@@ -139,12 +144,35 @@ impl Class {
         match self {
             Self::Sealer | Self::ExecutorNodes => FaultKind::KillNodes,
             Self::Redis => FaultKind::StopJob,
-            Self::Executor
+            Self::SealerTasks
+            | Self::Executor
             | Self::Validator
             | Self::StateMirror
             | Self::Sequencer
             | Self::Ingress => FaultKind::KillTasks,
         }
+    }
+
+    /// The class that takes the same services down where the executors
+    /// run. On the sealer nodes, a node kill of the executors also kills
+    /// the members, so the executors go down by task. A case that takes
+    /// the executors and the members down then takes the members down by
+    /// task too, so that each class can return on its own.
+    pub(crate) fn placed(self, executors: ExecutorNodes, executors_down: bool) -> Self {
+        match (self, executors) {
+            (Self::ExecutorNodes, ExecutorNodes::Sealer) => Self::Executor,
+            (Self::Sealer, ExecutorNodes::Sealer) if executors_down => Self::SealerTasks,
+            _ => self,
+        }
+    }
+
+    /// Whether the class takes an executor down: an executor class, or a
+    /// node kill of the sealers while the executors run on them.
+    fn takes_executors(self, executors: ExecutorNodes) -> bool {
+        matches!(
+            (self, executors),
+            (Self::Executor | Self::ExecutorNodes, _) | (Self::Sealer, ExecutorNodes::Sealer)
+        )
     }
 
     fn fault(self, h: &Harness) -> anyhow::Result<Fault> {
@@ -153,6 +181,7 @@ impl Class {
         };
         Ok(match self {
             Self::Sealer => Fault::KillNodes(sealers(h)?),
+            Self::SealerTasks => one_task(&sealers(h)?, CLUSTER_TASK),
             Self::Executor => one_task(&executor_containers(h), "executor"),
             Self::ExecutorNodes => Fault::KillNodes(executor_containers(h)),
             Self::Validator => one_task(
@@ -172,7 +201,8 @@ impl Class {
         })
     }
 
-    async fn take_down(self, h: &mut Harness, ctx: &str) -> anyhow::Result<Held> {
+    /// Take the class down, and return what holds it down.
+    pub(crate) async fn take_down(self, h: &mut Harness, ctx: &str) -> anyhow::Result<Held> {
         Ok(match self.fault(h)? {
             Fault::KillTasks(tasks) => {
                 let listed: Vec<String> = tasks
@@ -199,25 +229,28 @@ impl Class {
         })
     }
 
-    /// No allocation of the job restarted since its return: the class
-    /// waited for what it needs. A crash loop shows as a restart count,
-    /// also when the class got what it needs since, so the proof holds
-    /// after the pause and again at the end.
+    /// No task of the job failed since its return, other than by a
+    /// designed recovery exit: the class waited for what it needs. A
+    /// crash loop shows as a failed exit in the task events, also when
+    /// the class got what it needs since, so the proof holds after the
+    /// pause and again at the end.
     async fn assert_no_restart(self, h: &Harness, ctx: &str) -> anyhow::Result<()> {
         let allocs = h.nomad.running(self.job()).await?;
-        let restarted: Vec<String> = allocs.iter().filter_map(Alloc::restart_note).collect();
+        let failed = h.nomad.unexplained_exits(&allocs).await?;
         anyhow::ensure!(
-            allocs.len() == self.count() && restarted.is_empty(),
+            allocs.len() == self.count() && failed.is_empty(),
             "{}: {ctx}: the {} job did not wait for the classes it needs: {} of {} running, {}",
             crate::FAIL_PREFIX,
             self.job(),
             allocs.len(),
             self.count(),
-            restarted.join(", ")
+            failed.join("; ")
         );
+        let restarts: Vec<String> = allocs.iter().filter_map(Alloc::restart_note).collect();
         crate::log(format!(
-            "{ctx}: every {} allocation runs with no restart",
-            self.job()
+            "{ctx}: every {} allocation runs with no failed exit outside a designed recovery; restarts: [{}]",
+            self.job(),
+            restarts.join(", ")
         ));
         Ok(())
     }
@@ -226,7 +259,12 @@ impl Class {
 impl Held {
     /// Start the return and come back at once: post the job again, or
     /// `docker start` the nodes.
-    async fn start(&self, h: &Harness, ctx: &str, class: Class) -> anyhow::Result<Pending<'_>> {
+    pub(crate) async fn start(
+        &self,
+        h: &Harness,
+        ctx: &str,
+        class: Class,
+    ) -> anyhow::Result<Pending<'_>> {
         crate::log(format!("{ctx}: bring the {} back", class.job()));
         Ok(match self {
             Self::Job(job) => Pending::Job {
@@ -260,7 +298,7 @@ impl Pending<'_> {
     }
 
     /// Wait until the class runs.
-    async fn await_running(self, h: &mut Harness) -> anyhow::Result<()> {
+    pub(crate) async fn await_running(self, h: &mut Harness) -> anyhow::Result<()> {
         match self {
             Self::Job { job, desired } => job.await_running(&desired).await,
             Self::Count { job, count } => h.assert_count(job, count, h.knobs.reschedule_slo).await,
@@ -357,163 +395,6 @@ impl Wave {
     }
 }
 
-/// The highest head any live client reports, and the highest count of
-/// applied transactions any executor reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Progress {
-    /// The highest of the executor block, the sealed head an ingress
-    /// reads from the sealer's status frames, and the validator's
-    /// committed block. Each one follows the sealer, so the highest one
-    /// is the head of the chain as the live clients see it.
-    block: i64,
-    /// `None` while no executor exporter answers: no executor runs, so
-    /// no transaction is applied.
-    applied: Option<i64>,
-}
-
-impl Progress {
-    /// One reading, retried for twelve seconds. Some client of the
-    /// sealer is up through every combined case, so no head at all is a
-    /// harness failure.
-    async fn read(h: &Harness, ctx: &str) -> anyhow::Result<Self> {
-        let outcome = poll::until(Budget::secs(12, 3), |_| async move {
-            let block = h
-                .probes
-                .executor_progress()
-                .await
-                .max(h.probes.ingress_sealed_head().await)
-                .max(h.probes.val_metric(COMMITTED).await);
-            let applied = h.probes.executor_tx_applied().await;
-            Ok(block.map(|block| Self { block, applied }))
-        })
-        .await?;
-        outcome
-            .or_fail(|_| {
-                crate::chaos_fail!(
-                    "{ctx}: no client reports a head, so the outage cannot be observed"
-                )
-            })
-            .map(|(progress, _)| progress)
-    }
-
-    fn describe(self) -> String {
-        let applied = self.applied.map_or("?".to_string(), |a| a.to_string());
-        format!("head {}, applied {applied}", self.block)
-    }
-}
-
-/// What the pipeline must do while the classes are down.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Expect {
-    /// No block is committed: the head stays flat, and every live
-    /// ingress refuses a submit with `sealer_no_quorum`.
-    Stall,
-    /// Blocks are still sealed, but no user transaction is applied: the
-    /// head rises and the applied-transaction counter of a live executor
-    /// stays flat. A head that reads lower is not a rise: a source of the
-    /// head stopped answering.
-    SealOnly,
-}
-
-impl Expect {
-    /// Whether two readings, one window apart, show the expectation.
-    fn judge(self, before: Progress, after: Progress) -> Result<(), String> {
-        let applied = before.applied.zip(after.applied);
-        match self {
-            Self::Stall if after.block != before.block => Err(format!(
-                "the pipeline UNEXPECTEDLY progressed while the sealers were down (head {} -> {})",
-                before.block, after.block
-            )),
-            Self::SealOnly if after.block <= before.block => Err(format!(
-                "no block was sealed while the sealers were up (head {} -> {})",
-                before.block, after.block
-            )),
-            Self::SealOnly if applied.is_some_and(|(b, a)| a != b) => Err(format!(
-                "a user transaction was applied while the classes were down ({} -> {})",
-                before.describe(),
-                after.describe()
-            )),
-            Self::Stall | Self::SealOnly => Ok(()),
-        }
-    }
-
-    fn observed(self, before: Progress, after: Progress) -> String {
-        match self {
-            Self::Stall => format!(
-                "the pipeline correctly STALLED (head {} -> {} over {}s)",
-                before.block,
-                after.block,
-                WINDOW.as_secs()
-            ),
-            Self::SealOnly => format!(
-                "the sealers tick with no user transaction ({} -> {} over {}s)",
-                before.describe(),
-                after.describe(),
-                WINDOW.as_secs()
-            ),
-        }
-    }
-
-    /// Judge two readings one window apart. A stall with the ingresses
-    /// up also needs every ingress to refuse on the lost quorum. With
-    /// Redis down, a cold read must count as degraded, not stall.
-    async fn assert(self, h: &Harness, ctx: &str, down: &[Class]) -> anyhow::Result<()> {
-        let before = Progress::read(h, ctx).await?;
-        tokio::time::sleep(WINDOW).await;
-        let after = Progress::read(h, ctx).await?;
-        self.judge(before, after)
-            .map_err(|why| crate::chaos_fail!("{ctx}: {why}"))?;
-        crate::log(format!("{ctx}: {}", self.observed(before, after)));
-        if self == Self::Stall && !down.contains(&Class::Ingress) {
-            h.assert_ingresses_refuse(ctx).await?;
-        }
-        if down.contains(&Class::Redis) {
-            wait_readers_degraded(h, ctx).await?;
-        }
-        Ok(())
-    }
-}
-
-impl Harness {
-    /// Every ingress refuses a submit on the lost quorum within the
-    /// budget.
-    async fn assert_ingresses_refuse(&self, ctx: &str) -> anyhow::Result<()> {
-        let budget = Budget::new(REFUSAL_BUDGET, Duration::from_secs(2));
-        let outcome = poll::until(budget, |_| async move {
-            let answers = self.refusals().await;
-            let all = answers.iter().all(|a| a.contains(NO_QUORUM));
-            Ok::<_, anyhow::Error>(all.then_some(answers))
-        })
-        .await?;
-        let (answers, elapsed) = outcome.or_fail(|t| {
-            crate::chaos_fail!(
-                "{ctx}: an ingress does not refuse on {NO_QUORUM} after {}s without a sealer",
-                t.as_secs()
-            )
-        })?;
-        crate::log(format!(
-            "{ctx}: every ingress refuses on {NO_QUORUM} after {}s ({})",
-            elapsed.as_secs(),
-            answers.join("; ")
-        ));
-        Ok(())
-    }
-
-    /// One line per ingress: its refusal, or that it takes submits.
-    async fn refusals(&self) -> Vec<String> {
-        let mut lines = Vec::with_capacity(self.probes.ingresses.len());
-        for node in &self.probes.ingresses {
-            let why = ChainView::refusal_at(&node.rpc_url(), self.knobs.chain_id).await;
-            lines.push(format!(
-                "{}: {}",
-                node.container,
-                why.unwrap_or_else(|| "takes submits".to_string())
-            ));
-        }
-        lines
-    }
-}
-
 /// One combined case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Combined {
@@ -580,7 +461,9 @@ pub(crate) const ALL_THREE_REVERSE: Combined = Combined {
 };
 
 /// The executor nodes and the sealer nodes die. The executors return a
-/// minute before the sealers, and must wait for them.
+/// minute before the sealers, and must wait for them. With the executors
+/// on the sealer nodes, the executor tasks and the member tasks die
+/// instead, and return in the same order.
 pub(crate) const EXECUTOR_SEALER: Combined = Combined {
     case: Case::ExecutorSealerLossRecover,
     down: &[Class::ExecutorNodes, Class::Sealer],
@@ -604,7 +487,8 @@ pub(crate) const EXECUTOR_SEALER_VALIDATOR: Combined = Combined {
 /// transactions in flight. The executors return first and publish the
 /// receipts of their replay while no ingress listens; the ingresses
 /// return a minute later and must serve those receipts from the state
-/// of an executor.
+/// of an executor. With the executors on the sealer nodes, the executor
+/// tasks die instead of the nodes.
 pub(crate) const INGRESS_EXECUTOR: Combined = Combined {
     case: Case::IngressExecutorLossRecover,
     down: &[Class::ExecutorNodes, Class::Ingress],
@@ -637,25 +521,74 @@ pub(crate) const SEQUENCER_EXECUTOR_REDIS: Combined = Combined {
     checks: &[Check::FloorsLookedUp, Check::NoRefBelowFloor],
 };
 
+/// The classes of one case as they go down on the deployed cluster, in
+/// the order of the case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Placed {
+    pub(crate) down: Vec<Class>,
+    executors: ExecutorNodes,
+}
+
+impl Placed {
+    /// Whether the case takes an executor down.
+    fn executors_down(&self) -> bool {
+        self.down.iter().any(|c| c.takes_executors(self.executors))
+    }
+
+    /// Whether the case takes the members down.
+    fn sealers_down(&self) -> bool {
+        self.down
+            .iter()
+            .any(|c| matches!(c, Class::Sealer | Class::SealerTasks))
+    }
+
+    /// The classes whose job must show no restart at the end: the ones
+    /// a job restore brought back.
+    pub(crate) fn restart_proofs(&self) -> Vec<Class> {
+        self.down
+            .iter()
+            .copied()
+            .filter(|c| c.fault_kind() != FaultKind::KillNodes)
+            .collect()
+    }
+}
+
 impl Combined {
+    /// The classes of the case where the executors run on `executors`.
+    pub(crate) fn placed(&self, executors: ExecutorNodes) -> Placed {
+        let executors_down = self
+            .down
+            .iter()
+            .any(|c| matches!(c, Class::Executor | Class::ExecutorNodes));
+        Placed {
+            down: self
+                .down
+                .iter()
+                .map(|c| c.placed(executors, executors_down))
+                .collect(),
+            executors,
+        }
+    }
+
     /// Take the classes down, hold them, judge the pipeline while they
     /// are down, bring them back as the recovery says, and check that
     /// everything is back.
     pub(crate) async fn run(&self, h: &mut Harness) -> anyhow::Result<()> {
         let ctx = self.case.name();
+        let placed = self.placed(h.knobs.executor_nodes);
         let baseline = Baseline::read(h, ctx, self.checks).await?;
         let mut taken = BTreeMap::new();
-        for class in self.down {
+        for class in &placed.down {
             taken.insert(*class, class.take_down(h, ctx).await?);
         }
         // The return is proven by the posted job versions and the counts
         // below, not by the replacement of the last killed container.
         h.killed = None;
         let held = Instant::now();
-        self.expect.assert(h, ctx, self.down).await?;
+        self.expect.assert(h, ctx, &placed.down).await?;
         tokio::time::sleep(HOLD.saturating_sub(held.elapsed())).await;
-        self.bring_back(h, ctx, &taken).await?;
-        self.assert_back(h, ctx).await?;
+        self.bring_back(h, ctx, &placed, &taken).await?;
+        Self::assert_back(h, ctx, &placed).await?;
         for check in self.checks {
             check.assert(h, ctx, &baseline).await?;
         }
@@ -667,9 +600,10 @@ impl Combined {
         &self,
         h: &mut Harness,
         ctx: &str,
+        placed: &Placed,
         taken: &BTreeMap<Class, Held>,
     ) -> anyhow::Result<()> {
-        let plan = self.recovery.plan(self.down);
+        let plan = self.recovery.plan(&placed.down);
         crate::log(format!(
             "{ctx}: return plan: {}",
             plan.iter()
@@ -684,37 +618,23 @@ impl Combined {
         Ok(())
     }
 
-    /// Whether the case takes an executor class down.
-    fn executors_down(&self) -> bool {
-        self.down
-            .iter()
-            .any(|c| matches!(c, Class::Executor | Class::ExecutorNodes))
-    }
-
-    /// The classes whose job must show no restart at the end: the ones
-    /// a job restore brought back.
-    fn restart_proofs(&self) -> Vec<Class> {
-        self.down
-            .iter()
-            .copied()
-            .filter(|c| c.fault_kind() != FaultKind::KillNodes)
-            .collect()
-    }
-
     /// No returned job restarted, the members elected a leader when
     /// they were down, both ingresses are live, and the executors
     /// advance. A returned executor runs before its exporter binds, so
     /// the progress reading waits for an exporter first.
-    async fn assert_back(&self, h: &Harness, ctx: &str) -> anyhow::Result<()> {
-        for class in self.restart_proofs() {
+    async fn assert_back(h: &Harness, ctx: &str, placed: &Placed) -> anyhow::Result<()> {
+        for class in placed.restart_proofs() {
             class.assert_no_restart(h, ctx).await?;
         }
-        if self.down.contains(&Class::Sealer) {
-            let leader = h.evidence.cluster_leader(FULL_RESTART_ELECTION).await?;
-            crate::log(format!("{ctx}: members elected memberId={leader}"));
+        if placed.sealers_down() {
+            let elected = h.evidence.cluster_elected(FULL_RESTART_ELECTION).await?;
+            crate::log(format!(
+                "{ctx}: members elected memberId={} (term {} closed on a majority)",
+                elected.leader, elected.term
+            ));
         }
         h.assert_ingress_pair_live(ctx).await?;
-        if self.executors_down() {
+        if placed.executors_down() {
             await_exporter_back(h, ctx).await?;
         }
         h.assert_executor_progress(Duration::from_mins(3)).await

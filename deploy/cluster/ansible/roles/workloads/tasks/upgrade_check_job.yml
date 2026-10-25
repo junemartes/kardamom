@@ -41,4 +41,4 @@
       {{ workloads_upgrade_missing | join(', ') }}), no {{ workloads_upgrade_job.name }} runs, or an allocation of
       an older job version still runs ({{ workloads_upgrade_live | map(attribute='JobVersion') | unique | list }}).
       Deploy the release to every {{ workloads_upgrade_job.name }}, then run the check again.
-  when: not (workloads_upgrade_job.optional | default(false) and workloads_registered_job.status == 404)
+  when: not (workloads_upgrade_job.optional | default(false) | bool and workloads_registered_job.status == 404)

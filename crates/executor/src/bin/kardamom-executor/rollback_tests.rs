@@ -20,7 +20,11 @@ fn chain(state_dir: &Path, ckpt_dir: &Path, upto: u64, checkpoints: &[u64]) -> S
         balance: U256::from(1u64),
         code_hash: B256::ZERO,
     }];
-    kardamom_state::seed_genesis(&env, &genesis, &[]).unwrap();
+    kardamom_state::seed_genesis(
+        &env,
+        &kardamom_types::GenesisAlloc::of_accounts(genesis.to_vec()),
+    )
+    .unwrap();
     (1..=upto).for_each(|block| {
         commit(&env, block);
         if checkpoints.contains(&block) {

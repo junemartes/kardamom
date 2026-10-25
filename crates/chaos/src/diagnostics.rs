@@ -15,6 +15,7 @@ use crate::nomad::{Alloc, Nomad, Streams};
 use crate::stages::{head_lines, matching_lines, tail_lines};
 
 mod exits;
+mod nodes;
 
 const JOBS: [&str; 18] = [
     "aeron",
@@ -140,6 +141,19 @@ const CLUSTER_TOOL: &str = r#"inner="$(docker ps --format "{{.Names}}" | grep -m
 timeout 12 docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar io.aeron.cluster.ClusterTool /opt/kardamom/cluster errors 2>&1 | tail -60
 echo "--- list-members ---"
 timeout 5 docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar io.aeron.cluster.ClusterTool /opt/kardamom/cluster list-members 2>&1 | tail -3"#;
+/// The sockets of a sealer node. The members run in the host network of
+/// the node, so a member that cannot bind a port of the cluster range
+/// (nomad/cluster.nomad.hcl: the member ports 40200 to 40204 and the
+/// admin port 40205) finds the holder here. The listeners show every
+/// bound TCP port, and the range filter shows the TCP connections and
+/// the UDP sockets that use a port of the range at either end.
+const SEALER_SOCKETS: &str = r#"range='( sport >= :40200 and sport <= :40205 ) or ( dport >= :40200 and dport <= :40205 )'
+echo "--- TCP listeners ---"
+ss -tlnp
+echo "--- TCP sockets on the cluster ports ---"
+ss -tanp "$range"
+echo "--- UDP sockets on the cluster ports ---"
+ss -uanp "$range""#;
 
 /// The dump of one cluster.
 pub struct Diagnostics {
@@ -173,6 +187,7 @@ impl Diagnostics {
         self.multicast_groups().await;
         self.multicast_probe().await;
         self.capture().await;
+        self.nomad_nodes().await;
         for job in JOBS {
             self.job_section(job).await;
         }
@@ -316,8 +331,11 @@ impl Diagnostics {
     async fn alloc_section(&self, job: &str, alloc: &Alloc) {
         println!("----- {job} alloc {}: status -----", alloc.short_id());
         println!(
-            "  client_status={} node={}",
-            alloc.client_status, alloc.node_name
+            "  client_status={} desired={} ({}) node={}",
+            alloc.client_status,
+            alloc.desired_status,
+            alloc.desired_description.as_deref().unwrap_or(""),
+            alloc.node_name
         );
         for (task, state) in &alloc.task_states {
             println!("  task {task}: {}", task_summary(state));
@@ -381,6 +399,8 @@ impl Diagnostics {
         println!("{}", self.node_script(node, AERON_ERRORS).await);
         section(format!("{}: ClusterTool errors + members", node.name));
         println!("{}", self.node_script(node, CLUSTER_TOOL).await);
+        section(format!("{}: sockets on the cluster ports", node.name));
+        println!("{}", self.node_script(node, SEALER_SOCKETS).await);
     }
 
     /// The output of a script in a node container. A failed or a timed

@@ -74,13 +74,26 @@ impl<'a> StackLaunch<'a> {
     /// stack root (the `chain_id` line rewritten, the canary's accounts
     /// and the fee schedule fragment appended when on — alloc + predeploy
     /// bytecode ride along byte-identical, so the deployer's drift guard
-    /// keeps watching the ONE canonical copy).
+    /// keeps watching the ONE canonical copy). In carry mode from genesis,
+    /// the copy starts with the `genesis_features` line: a top-level key
+    /// must come before the first table of the TOML.
     fn materialise_genesis(&self, canonical: &Path) -> Result<PathBuf> {
         let chain_id = self.cfg.chain_id;
-        if chain_id == DEV_CHAIN_ID && !self.cfg.priority_fees && !self.cfg.canary_genesis {
+        let carry_genesis = self.cfg.carry_genesis();
+        if chain_id == DEV_CHAIN_ID
+            && !self.cfg.priority_fees
+            && !self.cfg.canary_genesis
+            && !carry_genesis
+        {
             return Ok(canonical.to_path_buf());
         }
+        let features = if carry_genesis {
+            format!("genesis_features = [{}]\n", super::config::GENESIS_FEATURES)
+        } else {
+            String::new()
+        };
         let src = std::fs::read_to_string(canonical)
+            .map(|body| format!("{features}{body}"))
             .with_context(|| format!("read genesis {}", canonical.display()))?;
         // The order of the deploy: the canary's accounts, then the fees.
         let repo = services::repo_root();
@@ -215,6 +228,49 @@ impl<'a> StackLaunch<'a> {
         }
     }
 
+    /// Spawn one sequencer per shard. In carry mode from genesis each one
+    /// starts at the floor 5, so that no reference without bytes goes out
+    /// before the first report of the sealer.
+    fn spawn_sequencers(&self, spec: &ServiceSpec<'_>) -> Result<Vec<services::Spawned>> {
+        let opts = services::SequencerOptions {
+            sealer_version_floor: if self.cfg.carry_genesis() { 5 } else { 0 },
+            ..services::SequencerOptions::default()
+        };
+        (0..self.cfg.shards.get())
+            .map(|i| services::spawn_sequencer_with(spec, i, &opts))
+            .collect()
+    }
+
+    /// Spawn the validator when the stack runs one: on the egress at
+    /// `egress` when present, otherwise on the cluster egress.
+    fn spawn_validator(
+        &self,
+        spec: &ServiceSpec<'_>,
+        attester: Option<&services::L1Wiring>,
+        egress: Option<&str>,
+    ) -> Result<Option<services::Spawned>> {
+        let feed_addr_file = self.root.join("validator-feed.addr");
+        self.cfg
+            .validator
+            .then(|| {
+                services::spawn_validator(
+                    spec,
+                    &services::ValidatorOptions {
+                        trie_shadow_check: self.cfg.trie_shadow_check,
+                        attester,
+                        parallel: self.cfg.validator_parallel,
+                        serve_feed_addr_file: self
+                            .cfg
+                            .validator_serve_feed
+                            .then_some(feed_addr_file.as_path()),
+                        egress,
+                        metrics_port: None,
+                    },
+                )
+            })
+            .transpose()
+    }
+
     /// `KARDAMOM_E2E_ADMISSION=1` runs the sequencers on the v2 loop, so the
     /// suite covers both loops. A scenario that needs transactions that
     /// cannot pay keeps the v1 loop: the v2 filter refuses them. The carry
@@ -347,30 +403,25 @@ impl LocalStack {
         let log_config = stack_launch.write_archive_log_config()?;
         let spec = stack_launch.assemble_spec(&genesis, log_config.as_deref());
 
-        let sequencers = (0..cfg.shards.get())
-            .map(|i| services::spawn_sequencer(&spec, i))
-            .collect::<Result<Vec<_>>>()?;
-        let executor = services::spawn_executor(&spec)?;
+        let sequencers = stack_launch.spawn_sequencers(&spec)?;
         let egress = cfg.carry.map(|_| spec.spawn_egress(None)).transpose()?;
+        let genesis_egress = egress
+            .as_ref()
+            .filter(|_| cfg.carry_genesis())
+            .map(super::carry::SpawnedEgress::url);
+        let executor = services::spawn_executor_at(
+            &spec,
+            &services::ExecutorRun {
+                metrics_port: None,
+                carry_egress: genesis_egress.as_deref(),
+            },
+        )?;
         let wirings = stack_launch.build_l1_wiring(l1.as_ref()).await?;
-        let feed_addr_file = root.path().join("validator-feed.addr");
-        let validator = if cfg.validator {
-            Some(services::spawn_validator(
-                &spec,
-                &services::ValidatorOptions {
-                    trie_shadow_check: cfg.trie_shadow_check,
-                    attester: wirings.validator.as_ref(),
-                    parallel: cfg.validator_parallel,
-                    serve_feed_addr_file: cfg
-                        .validator_serve_feed
-                        .then_some(feed_addr_file.as_path()),
-                    egress: None,
-                    metrics_port: None,
-                },
-            )?)
-        } else {
-            None
-        };
+        let validator = stack_launch.spawn_validator(
+            &spec,
+            wirings.validator.as_ref(),
+            genesis_egress.as_deref(),
+        )?;
         let l1_follower = wirings
             .da_watcher
             .as_ref()
@@ -383,7 +434,7 @@ impl LocalStack {
         let batcher = cfg
             .carry
             .and(l1.as_ref())
-            .map(|l| super::carry::BatcherSide::launch(&spec, l))
+            .map(|l| super::carry::BatcherSide::launch(&spec, l, genesis_egress.as_deref()))
             .transpose()?;
         let ingress = services::spawn_ingress(&spec, &cfg.ingress)?;
         let notifier = cfg

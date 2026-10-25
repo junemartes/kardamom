@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.function.Function;
 import java.util.stream.Stream;
 
@@ -46,7 +47,7 @@ record StateDir(Path root) {
 
     /** The recording log entry of the latest consensus module snapshot, or empty when there is none. */
     Optional<RecordingLog.Entry> latestSnapshot() {
-        return withRecordingLog(log -> Optional.ofNullable(log.getLatestSnapshot(ConsensusModule.Configuration.SERVICE_ID)));
+        return withRecordingLog(StateDir::latestSnapshotIn);
     }
 
     /** The archive recording of the latest snapshot of the sealer service, or empty when there is none. */
@@ -78,6 +79,27 @@ record StateDir(Path root) {
             return withRecordingLog(log -> Optional.ofNullable(log.findLastTerm()).map(entry -> entry.leadershipTermId));
         } catch (final ClusterException e) {
             return Optional.empty();
+        }
+    }
+
+    /**
+     * The commit position that a relaunch of the member reaches, or empty
+     * when the recording log does not fix it. A relaunch loads the latest
+     * snapshot and replays the member's own log to its end. The log has a
+     * fixed end only when its last term is closed: Aeron closes the term
+     * when it truncates the log to the term base of a new leader, and when
+     * the member stops. An open term grows with its recording. A read that
+     * the recording log refuses gives empty, as in {@link #lastTermId()}.
+     */
+    OptionalLong relaunchPosition() {
+        try {
+            return withRecordingLog(log -> Optional.ofNullable(log.findLastTerm())
+                    .filter(term -> term.logPosition != AeronArchive.NULL_POSITION)
+                    .map(term -> OptionalLong.of(Math.max(term.logPosition,
+                            latestSnapshotIn(log).map(entry -> entry.logPosition).orElse(AeronArchive.NULL_POSITION))))
+                    .orElse(OptionalLong.empty()));
+        } catch (final ClusterException e) {
+            return OptionalLong.empty();
         }
     }
 
@@ -118,6 +140,10 @@ record StateDir(Path root) {
         } catch (final IOException ex) {
             throw new UncheckedIOException(ex);
         }
+    }
+
+    private static Optional<RecordingLog.Entry> latestSnapshotIn(final RecordingLog log) {
+        return Optional.ofNullable(log.getLatestSnapshot(ConsensusModule.Configuration.SERVICE_ID));
     }
 
     private <T> T withRecordingLog(final Function<RecordingLog, T> read) {

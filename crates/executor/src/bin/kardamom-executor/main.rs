@@ -82,13 +82,13 @@ async fn spawn_writer_and_bal(
     // Seed genesis once into a fresh env (a no-op if already seeded, for
     // example on recovery). This must run before `StateWriter::spawn`, so
     // the writer's initial published snapshot already reflects genesis.
-    let (genesis_accounts, genesis_code) = bin_support::build_genesis_alloc(genesis);
-    let seeded = seed_genesis(&env, &genesis_accounts, &genesis_code)
-        .context("seed genesis into state env")?;
+    let genesis_alloc = bin_support::build_genesis_alloc(genesis);
+    let seeded = seed_genesis(&env, &genesis_alloc).context("seed genesis into state env")?;
     tracing::info!(
         state_dir = %args.state_dir.display(),
         durability = ?args.state_durability,
-        genesis_accounts = genesis_accounts.len(),
+        genesis_accounts = genesis_alloc.accounts.len(),
+        genesis_words = genesis_alloc.storage.len(),
         seeded,
         "state env opened"
     );
@@ -287,7 +287,10 @@ impl<'a> ReaderStart<'a> {
             return Ok((None, ExecutorOrdering::Carried(Box::new(sub))));
         }
         let mut cluster_cfg = file_cfg.cluster.to_live();
-        if let Some(endpoints) = plane.cluster_ingress_endpoints().await? {
+        if let Some(endpoints) = plane
+            .cluster_ingress_endpoints(self.rt.start_open_limit())
+            .await?
+        {
             cluster_cfg.ingress_endpoints = endpoints;
         }
         let (guard, sub) = bin_support::connect_cluster_ordering(aeron_dir, cluster_cfg, cursor)?;

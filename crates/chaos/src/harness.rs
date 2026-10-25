@@ -108,7 +108,7 @@ impl Harness {
     /// the HTTP clients fail to build.
     pub fn new(contract: NodeContract, knobs: Knobs, lifecycle: Lifecycle) -> anyhow::Result<Self> {
         let nomad = Nomad::new(&contract.nomad_addr(NOMAD_HTTP_PORT)?)?;
-        let probes = Probes::new(&contract)?;
+        let probes = Probes::new(&contract, knobs.executor_nodes.role())?;
         let ingress0 = contract.node("ingress-0")?;
         let rpc_url = format!("http://{}:{INGRESS_RPC_PORT}", ingress0.ip);
         Ok(Self {
@@ -133,7 +133,7 @@ impl Harness {
     ///
     /// Returns an error if the contract lacks a node the probes need.
     pub fn follow(&mut self, contract: NodeContract) -> anyhow::Result<()> {
-        self.probes = Probes::new(&contract)?;
+        self.probes = Probes::new(&contract, self.knobs.executor_nodes.role())?;
         let ingress0 = contract.node("ingress-0")?;
         self.rpc_url = format!("http://{}:{INGRESS_RPC_PORT}", ingress0.ip);
         self.contract = contract;

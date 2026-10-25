@@ -52,6 +52,8 @@ struct MemberCarry {
     feed_dir: PathBuf,
     /// The admin port of each member, in member order.
     admin_ports: Vec<u16>,
+    /// The carry mode from genesis ([`crate::harness::CarryOptions::genesis`]).
+    genesis: bool,
 }
 
 impl SealerCluster {
@@ -126,6 +128,7 @@ impl SealerLaunch {
             admin_ports: (0..cfg.sealer_members.get())
                 .map(|_| free_port().port())
                 .collect(),
+            genesis: c.genesis,
         });
         Ok(Self {
             root: root.to_path_buf(),
@@ -310,7 +313,9 @@ impl SealerLaunch {
 }
 
 impl MemberCarry {
-    /// The carry window settings of member `id`.
+    /// The carry window settings of member `id`. In carry mode from
+    /// genesis, every member takes the same genesis features: the sealer
+    /// requires the setting to match on every member.
     ///
     /// Each member serves its admin endpoint on its own port, because the
     /// members share one host and the endpoint binds every address. The
@@ -325,6 +330,16 @@ impl MemberCarry {
             self.admin_ports[id]
         ))
         .arg(format!("-Dkardamom.cluster.retention={}", self.retention));
+        if self.genesis {
+            cmd.arg(format!(
+                "-Dkardamom.cluster.genesisFeatures={}",
+                super::config::GENESIS_FEATURES
+            ))
+            .arg(format!(
+                "-Dkardamom.cluster.snapshotIntervalS={}",
+                super::config::GENESIS_SNAPSHOT_INTERVAL_S
+            ));
+        }
         if id == 0 {
             cmd.arg(format!(
                 "-Dkardamom.cluster.feedAeronDir={}",

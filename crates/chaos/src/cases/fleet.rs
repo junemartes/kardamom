@@ -3,12 +3,15 @@
 //! own logs and snapshots, and the executors from their own disks or
 //! their own checkpoints. The load keeps submitting through the
 //! outage and after it, so the verdict proves the chain accepts new
-//! transactions again and receipts them correctly.
+//! transactions again and receipts them correctly. With the executors on
+//! the sealer nodes, a loss of the sealer nodes also takes the executors,
+//! and the cases wait for them too.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::cases::cluster::sealer;
+use crate::cases::combined::Class;
 use crate::cases::component::{
     FETCHED, RESTORED, executor_containers, wait_peer_checkpoint, wipe_dirs,
 };
@@ -45,7 +48,9 @@ pub(crate) fn sealers(h: &Harness) -> anyhow::Result<Vec<String>> {
 /// must stall. Then every node returns with its own log and snapshots,
 /// the members elect a leader among themselves, and the backlog
 /// drains. The load window outlasts the return, so the verdict covers
-/// transactions submitted to the recovered cluster.
+/// transactions submitted to the recovered cluster. An executor on a
+/// sealer node returns with its node, so the case waits for an executor
+/// block before it reads the progress.
 pub(crate) async fn cluster_total_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "cluster-total-loss-recover";
     let nodes = sealers(h)?;
@@ -55,24 +60,30 @@ pub(crate) async fn cluster_total_loss_recover(h: &mut Harness) -> anyhow::Resul
     h.start_nodes(&nodes).await?;
     h.assert_count(CLUSTER_TASK, 3, h.knobs.reschedule_slo)
         .await?;
-    let leader = h.evidence.cluster_leader(FULL_RESTART_ELECTION).await?;
-    crate::log(format!("{ctx}: members elected memberId={leader}"));
+    let elected = h.evidence.cluster_elected(FULL_RESTART_ELECTION).await?;
+    crate::log(format!(
+        "{ctx}: members elected memberId={} (term {} closed on a majority)",
+        elected.leader, elected.term
+    ));
+    await_exporter_back(h, ctx).await?;
     h.assert_executor_progress(Duration::from_mins(3)).await
 }
 
-/// Kill all three executor nodes. Every exporter goes dark, so the
-/// outage is real and not a survivor answering for the fleet. Then the
-/// nodes return, each executor resumes from its own state directory,
-/// and the fleet catches up on the backlog the sealers kept ordering.
+/// Take all three executors down at once with no warning: their nodes
+/// die, or on the sealer nodes their tasks die and their job stops, so
+/// that the members stay up. Every exporter goes dark, so the outage is
+/// real and not a survivor answering for the fleet. Then the executors
+/// return, each one resumes from its own state directory, and the fleet
+/// catches up on the backlog the sealers kept ordering.
 pub(crate) async fn executor_fleet_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "executor-fleet-loss-recover";
-    let nodes = executor_containers(h);
-    h.kill_all_nodes(ctx, "executor", &nodes).await?;
+    let class = Class::ExecutorNodes.placed(h.knobs.executor_nodes, false);
+    let held = class.take_down(h, ctx).await?;
+    // The return is proven by the count below, not by the replacement of
+    // the last killed container.
+    h.killed = None;
     await_exporters_dark(h, ctx).await?;
-    crate::log(format!("{ctx}: docker start all three executor nodes"));
-    h.start_nodes(&nodes).await?;
-    h.assert_count("executor", 3, h.knobs.reschedule_slo)
-        .await?;
+    held.start(h, ctx, class).await?.await_running(h).await?;
     await_exporter_back(h, ctx).await?;
     h.assert_executor_progress(Duration::from_mins(3)).await
 }
@@ -153,10 +164,12 @@ const EXECUTOR_STATE: &str = "/opt/kardamom/state";
 /// Stop the executor job and wipe every state database and every
 /// checkpoint: no executor holds any state, and no peer can serve a
 /// checkpoint. The state is then rebuilt on the host from L1 and the DA
-/// store alone, as an executor image, installed on every executor node,
-/// and the job starts again. Every executor must resume from the image's
-/// cursor with a replay request the sealer accepts, with no checkpoint
-/// restore and no fetch from a peer, and the fleet must catch up. The
+/// store alone, as an executor image, installed on the node of every
+/// executor, and the job starts again. Every executor must resume from
+/// the image's cursor, with no checkpoint restore and no fetch from a
+/// peer, and the fleet must catch up. An executor in reference mode
+/// replays from the sealer; a carry executor reads the member feed, or
+/// the egress when the cursor is below the window of the member. The
 /// end-of-shard audit then compares the resumed executors with the
 /// validator table by table.
 ///

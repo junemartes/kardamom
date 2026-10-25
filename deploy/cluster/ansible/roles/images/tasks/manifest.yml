@@ -1,8 +1,9 @@
 ---
-# The services, plus the three third-party bases: Aeron, Redis, cluster.
+# The services, plus Aeron, Redis, cluster and the light client, plus
+# the upstream copies.
 - name: Check that all expected images were pushed
   ansible.builtin.assert:
-    that: images_records | length == images_services | length + 4
+    that: images_records | length == images_services | length + 4 + images_upstream | length
 
 - name: Write the completed manifest in staging
   ansible.builtin.template:

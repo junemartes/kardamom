@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.kardamom.sealer.GenesisFeatures;
 import org.junit.jupiter.api.Test;
 
 /** The readiness rule and the JSON shape of one member-status sample. */
@@ -57,12 +58,14 @@ final class MemberStatusTest {
                 + "\"commitPosition\":5000,\"servicePosition\":4000,"
                 + "\"snapshotWrites\":10,\"snapshotReadsMin\":1,\"snapshotReadsMax\":11,"
                 + "\"snapshotLatest\":9,\"decisionVersion\":3,\"decisionActivationOrigin\":36,"
-                + "\"decisionActivationMs\":0,\"retainedStore\":\"heap\",\"carryWindow\":true,"
+                + "\"decisionActivationMs\":0,\"genesisFeatures\":\"3,4,5\","
+                + "\"retainedStore\":\"heap\",\"carryWindow\":true,"
                 + "\"carryWindowActivationOrigin\":7,\"carryWindowActivationMs\":18446744073709551615,"
                 + "\"retainedFrames\":12,\"retainedBytes\":3456,\"feed\":\"walking\",\"diskFreeBytes\":0,"
                 + "\"leadershipTermId\":4,\"startHold\":true,\"ready\":true}",
             sample("LEADER", "CLOSED", 5000, 4000).withStart(4L, true)
-                .withCarry(new MemberStatus.Carry("heap", true, 7L, -1L, 12L, 3456L, "walking")).toJson(LAG));
+                .withCarry(new MemberStatus.Carry("heap", true, 7L, -1L, 12L, 3456L, "walking"))
+                .withGenesis(GenesisFeatures.CARRY_WINDOW).toJson(LAG));
     }
 
     @Test

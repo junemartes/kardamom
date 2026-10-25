@@ -17,6 +17,7 @@ import urllib.request
 import subprocess
 import tempfile
 import threading
+import tomllib
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -519,6 +520,7 @@ class Deploys(unittest.TestCase):
                    OBJC_DISABLE_INITIALIZE_FORK_SAFETY='YES')
         env.pop('AERON_STALL_TOLERANCE_MS', None)
         env.pop('KARDAMOM_IDLE_CAP_US', None)
+        env.pop('KARDAMOM_GENESIS_CARRY', None)
         env.update(environ or {})
         cmd = ['ansible-playbook', '-i', inventory, str(ANSIBLE / playbook),
                '-e', json.dumps(variables)] + (['--check'] if check else [])
@@ -558,15 +560,16 @@ class Deploys(unittest.TestCase):
     def run_rollback(self, success=True, environ=None):
         return self.run_deploy(playbook='rollback.yml', success=success, environ=environ)
 
-    # The result of a default deploy on a fresh fixture, kept per test class:
-    # the state of the fake API, and a directory with a copy of the record
-    # directory.
+    # The results of the deploys on a fresh fixture, kept per test class and
+    # per deploy setting: the state of the fake API, and a directory with a
+    # copy of the record directory.
     deployed = None
-    # The environment of that deploy.
+    # The environment of the default deploy.
     DEPLOY_ENVIRON = {}
 
-    def deploy(self):
-        """Run a default deploy on the fresh fixture of this test.
+    def deploy(self, extra=None, environ=None):
+        """Run a deploy on the fresh fixture of this test: the default deploy,
+        or the one of the extra vars `extra` and the environment `environ`.
 
         A deploy of the whole pipeline takes minutes on a loaded runner. The
         first test of a class runs it. Every later test restores the state
@@ -576,13 +579,17 @@ class Deploys(unittest.TestCase):
         """
         cls = type(self)
         if cls.deployed is None:
-            self.run_deploy(environ=self.DEPLOY_ENVIRON)
+            cls.deployed = {}
+        environ = self.DEPLOY_ENVIRON if environ is None else environ
+        key = json.dumps([extra, environ], sort_keys=True)
+        if key not in cls.deployed:
+            self.run_deploy(extra, environ=environ)
             files = tempfile.TemporaryDirectory(prefix='kardamom-deploy-snapshot-')
             cls.addClassCleanup(files.cleanup)
             shutil.copytree(self.record_dir, Path(files.name) / 'deployed')
-            cls.deployed = (copy.deepcopy(self.api.state), files)
+            cls.deployed[key] = (copy.deepcopy(self.api.state), files)
             return
-        state, files = cls.deployed
+        state, files = cls.deployed[key]
         self.api.state = copy.deepcopy(state)
         shutil.copytree(Path(files.name) / 'deployed', self.record_dir, dirs_exist_ok=True)
 
@@ -675,6 +682,26 @@ class DeployTest(Deploys):
     def test_the_local_profile_runs_no_canary_by_default(self):
         self.run_deploy(check=True)
         self.assertNotIn('canary', self.api.state['plans'])
+
+    def upstream_images(self):
+        """The image of each task of the jobs that run an upstream image, by task name."""
+        return {t['Name']: t['Config']['image'] for name in ('anvil', 'node-exporter', 'monitoring')
+                for g in self.api.state['jobs'][name]['TaskGroups'] for t in g['Tasks']}
+
+    def test_upstream_images_run_the_pins_or_the_copies_of_the_manifest(self):
+        pins = re.findall(r'^  (\w+_image): "(\S+)"$', (ANSIBLE / 'group_vars/all.yml').read_text(), re.M)
+        tasks = {'anvil_image': 'anvil', 'node_exporter_image': 'node-exporter', 'prometheus_image': 'prometheus',
+                 'alertmanager_image': 'alertmanager', 'grafana_image': 'grafana'}
+        # A manifest without copies (a release for a real registry): the pins.
+        self.deploy()
+        self.assertEqual(self.upstream_images(), {tasks[var]: ref for var, ref in pins})
+        # The container path records a copy of each one: the jobs run the copies.
+        copies = {var: f'registry.example:5000/kardamom-upstream-{var.replace("_", "-")}:test@sha256:{"c" * 64}'
+                  for var, _ in pins}
+        with self.manifest.open('a') as manifest:
+            manifest.writelines(f'upstream-{var.replace("_", "-")} {ref}\n' for var, ref in copies.items())
+        self.run_deploy()
+        self.assertEqual(self.upstream_images(), {tasks[var]: ref for var, ref in copies.items()})
 
     def test_secrets_reach_tasks_only_through_nomad_variables(self):
         # Every keyed URL and key the deploy gets, by the environment the
@@ -1323,6 +1350,86 @@ class DeployTest(Deploys):
                 self.assertIn(message, output)
                 self.assertNotIn('plans', self.api.state)
 
+    # The carry from genesis.
+    GENESIS = {'KARDAMOM_GENESIS_CARRY': 'on'}
+
+    def test_the_genesis_carry_unset_renders_every_job_as_before(self):
+        """Unset, empty and off render the same jobs as before: no genesis
+        features in the sealer job or in the genesis of the executors and
+        the validator, and every carry switch at its default."""
+        self.run_deploy(check=True)
+        unset = self.api.state['plans']
+        for value in ('', 'off'):
+            with self.subTest(value=value):
+                self.run_deploy(check=True, environ={'KARDAMOM_GENESIS_CARRY': value})
+                self.assertEqual(self.api.state['plans'], unset)
+        text = json.dumps(unset)
+        self.assertNotIn('genesisFeatures', text)
+        self.assertNotIn('genesis_features', text)
+        for group in unset['cluster']['TaskGroups']:
+            options = group['Tasks'][0]['Env']['JAVA_TOOL_OPTIONS']
+            self.assertTrue(options.endswith(' -Dkardamom.cluster.orderingWindow=0'), options)
+        for name in ('executor', 'validator'):
+            template = self.genesis_template(unset[name]).encode()
+            self.assertEqual(hashlib.sha256(template).hexdigest(), STAGING_GENESIS_SHA256, name)
+        self.assertNotIn('egress', unset)
+        self.assertNotIn('--sealer-version-floor', self.job_args(unset['sequencer']))
+
+    def test_the_genesis_carry_sets_every_carry_switch(self):
+        """On a new cluster: the genesis features in every member and in the
+        genesis, and every carry switch on."""
+        self.add_egress_image()
+        self.run_deploy({'workloads_cluster_bootstrap': True}, check=True, environ=self.GENESIS)
+        plans = self.api.state['plans']
+        for group in plans['cluster']['TaskGroups']:
+            options = group['Tasks'][0]['Env']['JAVA_TOOL_OPTIONS'].split()
+            self.assertIn('-Dkardamom.cluster.genesisFeatures=3,4,5', options)
+            self.assertIn('-Dkardamom.cluster.feedAeronDir=/opt/kardamom/aeron-mount/dir', options)
+        executor = plans['executor']
+        self.assertEqual([g['Name'] for g in executor['TaskGroups']], ['executor-0', 'executor-1', 'executor-2'])
+        for group in executor['TaskGroups']:
+            args = group['Tasks'][0]['Config']['args']
+            self.assertIn('--carry-bytes', args)
+            self.assertIn('--exec-frames', args)
+            self.assertEqual(args[args.index('--egress') + 1], self.EGRESS_URL)
+        self.assertIn('egress', plans)
+        for name in ('batcher', 'validator'):
+            args = self.job_args(plans[name])
+            self.assertEqual(args[args.index('--egress') + 1], self.EGRESS_URL, name)
+        args = self.job_args(plans['sequencer'])
+        self.assertEqual(args[args.index('--sealer-version-floor') + 1], '5')
+        self.assertIn('[admission]\nenabled = true', self.job_templates(plans['sequencer']))
+        genesis = ANSIBLE.parent / 'config/genesis'
+        dev = tomllib.loads((genesis / 'dev.toml').read_text())
+        for name in ('executor', 'validator'):
+            template = self.genesis_template(plans[name])
+            self.assertTrue(template.startswith((genesis / 'carry.toml').read_text()), name)
+            self.assertEqual(tomllib.loads(template), dev | {'genesis_features': [3, 4, 5]}, name)
+
+    def test_the_genesis_carry_refuses_another_carry_switch(self):
+        cases = (
+            ('a value that is not on or off', {'KARDAMOM_GENESIS_CARRY': 'yes'},
+             'KARDAMOM_GENESIS_CARRY ("yes") is on, off or empty'),
+            ('the recorded cursor', self.GENESIS | {'KARDAMOM_EXEC_CURSOR': 'on'},
+             'KARDAMOM_EXEC_CURSOR ("on") must not be on'),
+            ('a floor below 5', self.GENESIS | {'KARDAMOM_SEALER_VERSION_FLOOR': '4'},
+             "['KARDAMOM_SEALER_VERSION_FLOOR'] are ['4'], and the carry from genesis needs ['5']"),
+            ('a partial carry executor list', self.GENESIS | {'KARDAMOM_CARRY_EXECUTORS': '0,1'},
+             "['KARDAMOM_CARRY_EXECUTORS'] are ['0,1'], and the carry from genesis needs ['0,1,2']"),
+            ('the member feed off', self.GENESIS | {'KARDAMOM_MEMBER_FEED': 'off'},
+             "['KARDAMOM_MEMBER_FEED'] are ['off']"),
+            ('the v1 loop', self.GENESIS | {'KARDAMOM_SEQUENCER_ADMISSION': 'off'},
+             "['KARDAMOM_SEQUENCER_ADMISSION'] are ['off']"),
+            ('no egress', self.GENESIS | {'KARDAMOM_EGRESS': '0'}, "['KARDAMOM_EGRESS'] are ['0']"),
+        )
+        self.add_egress_image()
+        for name, environ, message in cases:
+            with self.subTest(name):
+                output = self.run_deploy({'workloads_cluster_bootstrap': True}, check=True, success=False,
+                                         environ=environ)
+                self.assertIn(message, output)
+                self.assertNotIn('plans', self.api.state)
+
     def test_a_floor_on_a_new_chain_is_refused(self):
         output = self.run_deploy(check=True, success=False, environ={'KARDAMOM_SEALER_VERSION_FLOOR': '5'})
         self.assertIn('Nomad does not know the sealer job. A new chain starts on decision version 3', output)
@@ -1447,8 +1554,8 @@ class DeployTest(Deploys):
     def assert_aeron_parties(self, plans, tolerance):
         """Every task that maps the Aeron directory carries the tolerance:
         a Rust client as its driver timeout, a JVM with a media driver as
-        its driver timeout, client liveness, and a publication unblock
-        timeout above the liveness."""
+        its driver timeout, client liveness, image liveness, and a
+        publication unblock timeout above the client liveness."""
         jvm_options = {'aeron': '_JAVA_OPTIONS', 'cluster': 'JAVA_TOOL_OPTIONS'}
         parties = self.aeron_tasks(plans)
         self.assertEqual({name for name, _ in parties}, {
@@ -1462,6 +1569,9 @@ class DeployTest(Deploys):
             options = task['Env'][jvm_options[name]].split()
             self.assertIn(f'-Daeron.driver.timeout={tolerance}', options, name)
             self.assertIn(f'-Daeron.client.liveness.timeout={liveness_ns}', options, name)
+            # A receiving driver keeps the image of a stalled publisher as
+            # long: an archive keeps its recording whole through a stall.
+            self.assertIn(f'-Daeron.image.liveness.timeout={liveness_ns}', options, name)
             unblock = [o for o in options if o.startswith('-Daeron.publication.unblock.timeout=')]
             self.assertEqual(len(unblock), 1, name)
             self.assertGreater(int(unblock[0].split('=')[1]), liveness_ns, name)
@@ -2619,6 +2729,114 @@ class CarryTest(Deploys):
                                     for i in range(3)}
         self.run_deploy(check=True, environ=higher)
         self.assertIn('-Dkardamom.cluster.retention=131072', json.dumps(self.api.state['plans']['cluster']))
+
+    # The carry from genesis, and the status of a member that started with
+    # it.
+    GENESIS = DeployTest.GENESIS
+    GENESIS_MEMBER = {'carryWindow': True, 'genesisFeatures': '3,4,5', 'feed': 'idle'}
+    BOOTSTRAP = {'workloads_cluster_bootstrap': True}
+
+    def genesis_members(self):
+        """Every member reports the rules of the carry from genesis."""
+        self.api.state['status'] = {f'node-cluster-{i}': dict(self.GENESIS_MEMBER) for i in range(3)}
+
+    def genesis_start(self):
+        """Start a chain with the carry from genesis, on a fresh fixture."""
+        self.genesis_members()
+        self.deploy(self.BOOTSTRAP, self.GENESIS)
+        self.api.state['writes'] = []
+        self.api.state['registrations'] = []
+
+    def refused_unwritten(self, message, extra=None, environ=None):
+        """A deploy that the gate refuses with `message` before any write."""
+        self.api.state['writes'] = []
+        self.api.state['record_writes'] = []
+        output = self.run_deploy(extra, success=False, environ=environ)
+        self.assertIn(message, output)
+        self.assertEqual(self.api.state['writes'], [])
+        self.assertEqual(self.api.state['record_writes'], [])
+
+    def test_a_genesis_bootstrap_starts_a_chain_with_the_carry_window(self):
+        """The gates of the carry window read the genesis facts of the
+        rendered sealer job: the floor 5, the readers on the egress, and
+        every executor in carry mode, all on a new chain."""
+        self.genesis_members()
+        output = self.run_deploy(self.BOOTSTRAP, environ=self.GENESIS)
+        writes = self.api.state['writes']
+        cluster = writes.index('cluster')
+        self.assertEqual(writes[cluster - 1:cluster + 2], ['bootstrap-open', 'cluster', 'bootstrap-close'])
+        self.assertLess(cluster, writes.index('sequencer'))
+        for task in ('Read the rules of every sealer member for the version floor',
+                     'Keep the reference mark of a chain that starts with the carry window',
+                     'Read the rules of every sealer member for the carry executors',
+                     'Refuse a new sealer member without the genesis rules'):
+            self.assertIn(task, output)
+        jobs = {job['ID']: job for job in self.api.state['registrations']}
+        for group in jobs['executor']['TaskGroups']:
+            self.assertIn('--carry-bytes', group['Tasks'][0]['Config']['args'], group['Name'])
+        for name in ('batcher', 'validator'):
+            self.assertEqual(jobs[name]['Meta']['reads_egress'], 'true', name)
+        self.assertEqual(jobs['sequencer']['Meta']['v2_loop'], 'true')
+        # A redeploy without the bootstrap: the registered sealer job carries
+        # the genesis features, so the gate accepts it, and nothing changes.
+        self.api.state['writes'] = []
+        self.run_deploy(environ=self.GENESIS)
+        self.assertEqual(self.api.state['writes'], [])
+
+    def test_a_genesis_bootstrap_stops_at_a_member_without_the_genesis_rules(self):
+        """A sealer image that does not take the genesis features starts on
+        decision version 3, and no other job registers."""
+        self.genesis_members()
+        self.api.state['status']['node-cluster-1'] = {'carryWindow': False}
+        output = self.run_deploy(self.BOOTSTRAP, success=False, environ=self.GENESIS)
+        self.assertIn('the new sealer members do not all report the genesis rules', output)
+        self.assertIn("genesisFeatures ['3,4,5', 'missing', '3,4,5']", output)
+        self.assertEqual(self.api.state['writes'][-3:], ['bootstrap-open', 'cluster', 'bootstrap-close'])
+
+    def test_the_genesis_carry_is_refused_on_a_chain_that_did_not_start_with_it(self):
+        self.deploy()
+        no_new_chain = 'and the deploy starts no new chain'
+        self.refused_unwritten(no_new_chain, environ=self.GENESIS)
+        self.refused_unwritten(no_new_chain, self.BOOTSTRAP, environ=self.GENESIS)
+        # A purged sealer job: Nomad knows the other jobs of the chain.
+        self.api.state['jobs'].pop('cluster')
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN
+        self.refused_unwritten("Nomad knows ['sequencer', 'executor', 'batcher', 'validator', 'egress']",
+                               self.BOOTSTRAP, environ=self.GENESIS)
+        self.refused_unwritten(no_new_chain, environ=self.GENESIS)
+
+    def test_a_chain_that_started_with_the_carry_window_keeps_it(self):
+        """No deploy removes the genesis features, and none adds a seed or the
+        retained file to them."""
+        self.genesis_start()
+        removed = 'the target changes genesisFeatures of the registered sealer job'
+        self.refused_unwritten(removed, environ=self.DEPLOY_ENVIRON)
+        self.refused_unwritten(removed, environ=self.DEPLOY_ENVIRON | {'KARDAMOM_ALLOW_MUST_MATCH': 'genesisFeatures'})
+        for option in ('-Dkardamom.cluster.seedSnapshot=/opt/kardamom/seed/seed.bin',
+                       '-Dkardamom.cluster.carryBytes=true'):
+            with self.subTest(option):
+                self.genesis_start()
+                for group in self.api.state['jobs']['cluster']['TaskGroups']:
+                    group['Tasks'][0]['Env']['JAVA_TOOL_OPTIONS'] += ' ' + option
+                self.refused_unwritten(f'the target or the registered sealer job names {option}', environ=self.GENESIS)
+
+    def test_the_upgrade_check_reads_a_chain_that_started_with_the_carry_window(self):
+        """The upgrade check reads the live members of a chain with the carry
+        from genesis, with no allowance: feature 5 off and on passes, and
+        feature 3 or 4 off is refused, since every member holds feature 5."""
+        self.genesis_start()
+        self.api.state['reads_max'] = {f'node-cluster-{i}': 18 for i in range(3)}
+        for node in self.MARKS:
+            self.metric(node, {'kardamom_egress_ref_frame_max_index': 0, 'kardamom_egress_ref_frame_max_block': 0})
+        self.metric('node-batcher', {'kardamom_batcher_egress_cursor_index': 1})
+        self.metric('node-validator', {'kardamom_validator_egress_cursor_index': 1})
+        for activation_ms in ('18446744073709551615', '1700000000000'):
+            output = self.upgrade_check(feature='5', activation_ms=activation_ms)
+            self.assertIn('The upgrade transaction of feature 5 may go to the Safe', output)
+        for i in range(3):
+            self.metric(f'node-cluster-{i}', {'kardamom_sealer_feature_state{feature="5"}': 2})
+        output = self.upgrade_check(success=False, feature='4', activation_ms='18446744073709551615')
+        self.assertIn('can turn decision version 5 off, and a member holds feature 5', output)
 
     def window_ready(self):
         """A chain that takes feature 5: every member reads version 18, and
