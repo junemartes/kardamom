@@ -1,39 +1,25 @@
-//! The notifier's client surfaces without Aeron: events pushed straight
-//! into the hub, a WebSocket subscriber that replays then follows, and a
-//! webhook subscriber that is down when its events arrive and gets every
-//! one of them once when it comes up.
+//! The notifier's client surface without Aeron: events pushed straight
+//! into the hub, and a WebSocket subscriber that replays then follows.
 
-use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, B256};
-use hmac::{Hmac, Mac};
-use http_body_util::BodyExt;
 use jsonrpsee::core::client::{Subscription, SubscriptionClientT};
 use jsonrpsee::rpc_params;
-use jsonrpsee::server::{HttpBody, HttpRequest, HttpResponse};
 use jsonrpsee::ws_client::WsClientBuilder;
-use kardamom_notifier::dto::{
-    FeedItem, Stage, StatusFilter, TxStatusEvent, WebhookAck, WebhookRequest,
-};
+use kardamom_notifier::dto::{FeedItem, Stage, StatusFilter, TxStatusEvent};
 use kardamom_notifier::feed::{Feed, SUBSCRIBE_METHOD, UNSUBSCRIBE_METHOD};
 use kardamom_notifier::hub::{Hub, HubConfig, HubHandle, Observed};
 use kardamom_notifier::ring::RingConfig;
-use kardamom_notifier::server::{Hooks, ListenConfig, Running, serve};
-use kardamom_notifier::shard::InstanceSet;
-use kardamom_notifier::webhooks::{IDEMPOTENCY_HEADER, SIGNATURE_HEADER, Webhooks, WebhooksConfig};
+use kardamom_notifier::server::{ListenConfig, Running, serve};
 use kardamom_types::{Receipt, TxStatus};
-use sha2::Sha256;
-use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 struct Stack {
     hub: HubHandle,
     running: Running,
     shutdown: CancellationToken,
-    _dir: tempfile::TempDir,
 }
 
 impl Stack {
@@ -44,7 +30,6 @@ impl Stack {
     /// A stack with the events path on, with a stage table of `entries`,
     /// or off with `None`.
     async fn start_with(stage_table: Option<NonZeroUsize>) -> Self {
-        let dir = tempfile::tempdir().unwrap();
         let shutdown = CancellationToken::new();
         let (hub, handle) = Hub::new(
             HubConfig {
@@ -58,27 +43,13 @@ impl Stack {
             },
             shutdown.clone(),
         );
-        let (webhooks, registrar) = Webhooks::start(
-            WebhooksConfig {
-                dir: dir.path().join("webhooks"),
-                instances: InstanceSet::new(0, std::num::NonZeroU32::MIN).unwrap(),
-                retain_bytes: 1 << 30,
-                request_timeout: Duration::from_secs(2),
-                queue: NonZeroUsize::new(1024).unwrap(),
-            },
-            &handle,
-            shutdown.clone(),
-        )
-        .unwrap();
         tokio::spawn(hub.run());
-        tokio::spawn(webhooks.run());
         let running = serve(
             ListenConfig {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 max_connections: 100,
             },
             Feed::new(handle.clone(), NonZeroUsize::new(2).unwrap()),
-            Hooks::new(registrar, Vec::new()).unwrap(),
             shutdown.clone(),
         )
         .await
@@ -87,7 +58,6 @@ impl Stack {
             hub: handle,
             running,
             shutdown,
-            _dir: dir,
         }
     }
 
@@ -209,137 +179,6 @@ async fn a_subscriber_replays_the_ring_then_follows_live() {
     stack.stop().await;
 }
 
-/// One delivery the receiver saw.
-struct Delivery {
-    key: String,
-    signature: String,
-    body: Vec<u8>,
-}
-
-async fn record(
-    req: HttpRequest<hyper::body::Incoming>,
-    tx: mpsc::UnboundedSender<Delivery>,
-) -> Result<HttpResponse<HttpBody>, tower::BoxError> {
-    let header = |name: &str| {
-        req.headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string()
-    };
-    let key = header(IDEMPOTENCY_HEADER);
-    let signature = header(SIGNATURE_HEADER);
-    let body = req.into_body().collect().await?.to_bytes().to_vec();
-    let _ = tx.send(Delivery {
-        key,
-        signature,
-        body,
-    });
-    Ok(HttpResponse::builder()
-        .status(200)
-        .body(HttpBody::from("ok"))?)
-}
-
-/// Accept connections on `listener` and record every POST.
-async fn receiver(listener: TcpListener, tx: mpsc::UnboundedSender<Delivery>) {
-    while let Ok((sock, _)) = listener.accept().await {
-        let tx = tx.clone();
-        let svc = tower::service_fn(move |req| record(req, tx.clone()));
-        tokio::spawn(jsonrpsee::server::serve(sock, svc));
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_webhook_subscriber_down_at_the_event_gets_it_once_when_up() {
-    let stack = Stack::start().await;
-    // The receiver's port is known, but nothing listens on it yet.
-    let addr: SocketAddr = kardamom_obs::testkit::free_port();
-    let secret = "s3cret".to_string();
-    let request = WebhookRequest {
-        url: format!("http://{addr}/hook"),
-        filter: StatusFilter::all(),
-        secret: secret.clone(),
-    };
-    let http = reqwest::Client::new();
-    let ack: WebhookAck = http
-        .post(format!("{}/webhooks", stack.url("http")))
-        .json(&request)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(ack.owner, 0);
-    // The same registration names the same subscription.
-    let again: WebhookAck = http
-        .post(format!("{}/webhooks", stack.url("http")))
-        .json(&request)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(again.id, ack.id);
-
-    let alice = Address::repeat_byte(0xA1);
-    let h = B256::repeat_byte(7);
-    stack.push(TxStatus::offered(h, alice, 3)).await;
-    stack.push(TxStatus::sealed(h)).await;
-    stack.push(TxStatus::executed(&receipt(h, alice, 3))).await;
-    stack.settle(3).await;
-    // The first attempt fails against the closed port and the loop backs
-    // off. The receiver comes up in the meantime.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    let listener = TcpListener::bind(addr).await.unwrap();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    tokio::spawn(receiver(listener, tx));
-
-    let mut seen = Vec::new();
-    let deadline = Duration::from_secs(20);
-    while seen.len() < 3 {
-        let d = tokio::time::timeout(deadline, rx.recv())
-            .await
-            .expect("a delivery within the retry window")
-            .expect("the receiver is up");
-        seen.push(d);
-    }
-    let keys: Vec<&str> = seen.iter().map(|d| d.key.as_str()).collect();
-    assert_eq!(
-        keys,
-        vec![
-            format!("{h:#x}:offered"),
-            format!("{h:#x}:sealed"),
-            format!("{h:#x}:executed")
-        ]
-    );
-    for d in &seen {
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(&d.body);
-        let expected = format!(
-            "sha256={}",
-            alloy_primitives::hex::encode(mac.finalize().into_bytes())
-        );
-        assert_eq!(d.signature, expected, "the signature covers the body");
-        let event: TxStatusEvent = serde_json::from_slice(&d.body).unwrap();
-        assert_eq!(event.tx_hash, h);
-        assert_eq!(event.sender, Some(alice));
-    }
-    // Nothing is delivered twice.
-    assert!(
-        tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .is_err()
-    );
-    stack.stop().await;
-}
-
-/// The events path: the stages come from `tx_events` and the merged
-/// receipts, through the stage table. A `tx_status` record that the path
-/// replaces is dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_events_path_sends_the_latest_state_of_each_hash() {
     use kardamom_log::aeron_live::ReceiptFrame;

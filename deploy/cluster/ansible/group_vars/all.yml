@@ -133,7 +133,7 @@ ports:
   redis: 6379
   redis_sentinel: 26379
   state_mirror_metrics: 9007
-  # The notifier's client port (the status feed and POST /webhooks) and
+  # The notifier's client port (the status feed) and
   # its Prometheus exporter, on the ingress nodes or the notifier nodes
   # (nomad/notifier.nomad.hcl).
   notifier_feed: 8547
@@ -161,7 +161,6 @@ paths:
   state_dir: /opt/kardamom/state           # executor StateWriter (libmdbx) data
   checkpoints_dir: /opt/kardamom/checkpoints # executor state checkpoints (fast recovery)
   mirror_dir: /opt/kardamom/mirror         # state mirror head file + rebuild scratch
-  notifier_dir: /opt/kardamom/notifier     # webhook subscriptions, outboxes and cursors
   canary_dir: /opt/kardamom/canary         # the canary's nonce journal and contract addresses
   egress_dir: /opt/kardamom/egress         # the egress store: the canonical frames and the receipts
   batcher_dir: /opt/kardamom/batcher       # live batcher cursor file + DA blob store
@@ -183,7 +182,6 @@ node_data_dirs:
     - "{{ paths.state_dir }}"
     - "{{ paths.checkpoints_dir }}"
     - "{{ paths.mirror_dir }}"
-    - "{{ paths.notifier_dir }}"
     - "{{ paths.canary_dir }}"
     - "{{ paths.egress_dir }}"
     - "{{ paths.batcher_dir }}"

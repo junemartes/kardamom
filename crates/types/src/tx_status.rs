@@ -5,8 +5,7 @@
 //! The sequencer publishes `Offered` and `Rejected`. The ingress's egress
 //! tap publishes `Sealed`. The notifier derives `Executed` from
 //! `tx_receipts` and never puts it on the stream; the variant exists so
-//! one type describes the whole lifecycle in the notifier's ring and in
-//! its webhook outboxes.
+//! one type describes the whole lifecycle in the notifier's ring.
 //!
 //! The record carries the identity the publisher holds. A relayed egress
 //! frame names a transaction by hash only, so `Sealed` has no sender and

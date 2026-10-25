@@ -269,7 +269,7 @@ Each dashboard is a JSON file in `deploy/grafana/provisioning/dashboards-json/`.
 | `kardamom-da-watcher` | The L1 watcher. |
 | `kardamom-validator` | The validator. |
 | `kardamom-state-mirror` | The account-state mirror. |
-| `kardamom-notifier` | The status feed and the webhooks. |
+| `kardamom-notifier` | The status feed. |
 | `kardamom-canary` | The transaction canary: the success ratio per probe and per endpoint, the failures by outcome, the stage latencies, the last success, the balances, the feed gaps and the stalled accounts. |
 | `kardamom-performance` | Throughput and latency against the two load goals: 10,000 tx/s sustained, and 1,000,000 tx/s with a p99 of 1 ms from submit to the executed receipt. It shows the share of each goal, the rate at each pipeline step, the submit-to-sealed and submit-to-executed percentiles, the canary stages, the step times inside the services, the queues and the back pressure. |
 | `kardamom-availability` | The service levels against a 99.9999 % target over the selected range: the canary success and its error budget, the submit success, the chain liveness, the ingress reachability and the validator verdict. Over time: the failures, the head lag of each replica, the scrape targets, the settlement and the sealer leader changes. |
@@ -818,7 +818,7 @@ All canary metrics start with `kardamom_canary_`. The dashboard is `kardamom-can
 ### Notifier
 
 All notifier metrics start with `kardamom_notifier_`. The dashboard is `kardamom-notifier`.
-See [tx-status-events.md](tx-status-events.md) for the feed and the webhooks.
+See [tx-status-events.md](tx-status-events.md) for the feed.
 
 | Metric | Meaning |
 | --- | --- |
@@ -830,14 +830,6 @@ See [tx-status-events.md](tx-status-events.md) for the feed and the webhooks.
 | `ws_subscriptions` | Open WebSocket subscriptions. |
 | `ws_events_total` | Events sent to WebSocket subscribers. |
 | `ws_lagged_total` | Lag markers sent to slow WebSocket subscribers. |
-| `webhook_subscriptions{owned}` | Webhook subscriptions that this instance holds. |
-| `webhook_feed_lagged_total` | Live events that the webhook fan-out missed. |
-| `webhook_queue_full_total{subscription}` | Events dropped by a full worker queue. |
-| `outbox_appended_total{subscription}` | Events appended to an outbox. |
-| `outbox_delivered_total{subscription,outcome}` | Events finished by a delivery loop. The outcomes are `delivered` and `gave_up`. |
-| `outbox_backlog_bytes{subscription}` | Bytes of an outbox that are not delivered. |
-| `webhook_attempts_total{outcome}` | Webhook POST attempts. The outcomes are `ok`, `status`, and `error`. |
-| `webhook_delivery_seconds` | Histogram of the time from event arrival to delivery. |
 
 ### Egress
 

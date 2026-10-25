@@ -531,8 +531,9 @@ notifier-1 ansible_host=10.20.0.59 kardamom_node=notifier-1 role=notifier node_r
   #79 adds the line of notifier-0. The phase of notifier-1 adds its line.
 
   The group `notifier` goes into `[cloud:children]` (`hosts.ini:146-155`).
-- **The directories.** The node build runs the `common` role, which makes
-  `/opt/kardamom/notifier` with mode 0777 (`deploy/cluster/ansible/roles/common/tasks/main.yml:81-99`).
+- **The directories.** (Superseded 2026-10-25: the webhooks are removed, and the notifier keeps no
+  directory. See `docs/specs/2026-10-25-client-events.md`, decision 2.) The node build runs the
+  `common` role, which makes `/opt/kardamom/notifier` with mode 0777 (`deploy/cluster/ansible/roles/common/tasks/main.yml:81-99`).
   #78 says that only a node build makes the directories. A new node is a node build, so #78 does
   not block this step.
 
@@ -586,8 +587,10 @@ notifier-1 ansible_host=10.20.0.59 kardamom_node=notifier-1 role=notifier node_r
   canary, on `ws://kardamom-notifier.service.consul:8547` (`deploy/cluster/nomad/canary.nomad.hcl:141`).
   It follows the Consul service, so it reconnects to the new nodes with no change. The monitoring
   job scrapes `kardamom-notifier-metrics` through Consul (`monitoring.nomad.hcl:148-150`).
-- **The state.** `/opt/kardamom/notifier` holds the webhook subscriptions, the outboxes and the
-  cursors (`crates/notifier/src/main.rs:79-85`). A registration is stored on both instances
+- **The state.** (Superseded 2026-10-25, from here to the end of phase 1's merge: the webhooks are
+  removed, the notifier keeps no state, and a move or a count change moves nothing. See
+  `docs/specs/2026-10-25-client-events.md`, decision 2.) `/opt/kardamom/notifier` holds the webhook
+  subscriptions, the outboxes and the cursors (`crates/notifier/src/main.rs:79-85`). A registration is stored on both instances
   (`notifier.nomad.hcl:11-14`).
 - **The shards follow the instance index, not the node.** The owner of a subscription is a
   rendezvous hash over `--instance-index ${NOMAD_ALLOC_INDEX}` and `--instance-count`

@@ -449,17 +449,6 @@ code = ["crates/egress/src/ref_mark.rs#pub struct RefMark"]
 [format.egress-ref-mark.layout]
 RefMark = "09000000000000000300000000000000"
 
-# Frozen layout. The notifier outbox: rkyv OutboxRecord frames. An unknown
-# stage code reads as no stage.
-[format.notifier-outbox]
-writes = 1
-reads_min = 1
-reads_max = 1
-shared = false
-code = ["crates/notifier/src/outbox.rs#pub struct OutboxRecord"]
-[format.notifier-outbox.layout]
-OutboxRecord = "rkyv size 120 align 8"
-
 # Frozen layout. The Redis cache keys and values. Redis keeps no data on
 # disk, and the cache is advisory. A new layout uses a new key prefix.
 [format.redis-cache]
@@ -498,6 +487,10 @@ code = ["crates/log/src/discovery/record.rs#DISCOVERY_VERSION"]
 [coordinated]
 
 [retired]
+
+[retired.notifier-outbox]
+version = 1
+reason = "The notifier webhooks are removed (2026-10-25), so the notifier keeps no outbox. No running service reads the old files, and a rollback starts the old notifier on its own files. Deploy with KARDAMOM_ALLOW_RETIRED=notifier-outbox."
 
 # Frozen layout. The canary's nonce journal: one serde JSON file per ring
 # account. A file that does not parse stops the canary at start; the

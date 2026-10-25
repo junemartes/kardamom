@@ -1,5 +1,5 @@
 //! The JSON shapes a client sees: the status event, the subscription
-//! filter, the lag marker, and the webhook registration.
+//! filter, and the lag marker.
 //!
 //! Keys are `snake_case`. An absent optional value is omitted, never
 //! `null`.
@@ -197,23 +197,4 @@ impl Lagged {
             skipped,
         }
     }
-}
-
-/// A webhook registration: `POST /webhooks`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WebhookRequest {
-    /// The URL the notifier posts every matching event to.
-    pub url: String,
-    pub filter: StatusFilter,
-    /// The HMAC-SHA256 key of the signature header.
-    pub secret: String,
-}
-
-/// The answer to a registration: the subscription id and the instance
-/// that delivers it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WebhookAck {
-    pub id: B256,
-    pub owner: u32,
 }
