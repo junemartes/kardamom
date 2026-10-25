@@ -13,6 +13,8 @@ mod verdict;
 
 use std::time::Duration;
 
+use kardamom_types::shard_map::LANE_COUNT;
+
 use crate::evidence::{StampedLog, number_after};
 use crate::harness::Harness;
 use crate::nomad::Streams;
@@ -72,14 +74,10 @@ const SUBSCRIPTION_CLOSED: &str = "auto closing AeronSubscription";
 /// the end of a lane.
 const DESTINATION_CHANNEL: &str = "control-mode=dynamic";
 
-/// What the channel of an archive replay holds. The refetch opens one
-/// replay subscription per gap, with a stream id from
-/// [`REPLAY_STREAM_BASE`] up, and closes it when the replay drains.
-const REPLAY_CHANNEL: &str = "session-id=";
-
-/// The first stream id of a refetch replay subscription
-/// (`kardamom_log::refetch`).
-const REPLAY_STREAM_BASE: u64 = 1 << 30;
+/// The first `tx_data` stream id: lane `i` publishes on stream
+/// `TX_DATA_STREAM_BASE + i` (`tx_data_stream_id_base` in
+/// `deploy/cluster/config/channels.toml.tpl`).
+const TX_DATA_STREAM_BASE: u64 = 2000;
 
 /// How many lane subscriptions the batcher closed after its last start.
 /// The log of a task holds every start of it, and a process that ends
@@ -96,12 +94,15 @@ fn lanes_closed_since_start(logs: &str) -> usize {
         .count()
 }
 
-/// True when a closed subscription is a lane: not the subscription of a
-/// publisher destination, and not a refetch replay.
+/// True when a closed subscription is a `tx_data` lane: its stream id is
+/// a lane stream, and it is not the subscription of a publisher
+/// destination. Every other close is not a lane: a refetch replay (its
+/// stream id is far above the lanes), a cluster session that reconnects,
+/// or the egress readers of a carry-mode batcher, which holds no lane.
 fn closes_a_lane(line: &str) -> bool {
-    let replay = line.contains(REPLAY_CHANNEL)
-        && number_after(line, "stream_id: ").is_some_and(|id| id >= REPLAY_STREAM_BASE);
-    !line.contains(DESTINATION_CHANNEL) && !replay
+    let lanes = TX_DATA_STREAM_BASE..TX_DATA_STREAM_BASE + u64::from(LANE_COUNT);
+    number_after(line, "stream_id: ").is_some_and(|id| lanes.contains(&id))
+        && !line.contains(DESTINATION_CHANNEL)
 }
 
 /// The last `n` lines of `text`.
@@ -251,6 +252,23 @@ mod tests {
         assert_eq!(lanes_closed_since_start(&log), 0);
         let low = format!("{log}{}", closed(4, replay, 2000));
         assert_eq!(lanes_closed_since_start(&low), 1);
+    }
+
+    /// A carry-mode batcher reads the egress and holds no lane. A close of
+    /// another subscription, such as a cluster session that reconnects,
+    /// is not a lane close.
+    #[test]
+    fn a_close_off_the_lane_streams_is_not_a_lane_close() {
+        let session = "aeron:udp?endpoint=192.168.56.10:0";
+        let log = format!(
+            "{}{}{}",
+            stamped(1, BATCHER_START),
+            closed(2, session, 102),
+            closed(3, session, 1009),
+        );
+        assert_eq!(lanes_closed_since_start(&log), 0);
+        let lane = format!("{log}{}", closed(4, LANE, 2007));
+        assert_eq!(lanes_closed_since_start(&lane), 1);
     }
 
     #[test]
