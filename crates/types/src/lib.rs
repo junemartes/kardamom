@@ -47,6 +47,7 @@ pub mod state;
 pub mod time;
 pub mod tx_drop;
 pub mod tx_error;
+pub mod tx_events;
 pub mod tx_ordering;
 pub mod tx_status;
 pub mod txref;

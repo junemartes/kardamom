@@ -382,6 +382,22 @@ code = ["crates/types/src/tx_drop.rs#pub struct TxDrop"]
 [format.tx-drops.layout]
 TxDrop = "rkyv size 72 align 8"
 
+# Frozen layout. The tx_events frame (docs/specs/2026-10-25-client-events.md,
+# 4.1): a 16-byte header (magic 0x4B45, version 1, kind, origin, count, seq)
+# and fixed records of the kind: accepted 32 and sent 33 bytes. The kinds 3, 4
+# and 5 are reserved for rejected, posted and included. A fixed layout, not
+# rkyv: the encode on the hot path is a copy. A reader refuses another magic,
+# another version or an unknown kind.
+[format.tx-events]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = true
+code = ["crates/types/src/tx_events.rs#pub struct TxEventsFrame"]
+[format.tx-events.layout]
+Sent = "454b0102020101000100000000000000111111111111111111111111111111111111111111111111111111111111111103"
+Accepted = "454b01010700010000000000000000001111111111111111111111111111111111111111111111111111111111111111"
+
 # Frozen layout. The rollback record on the tx_receipts receipt stream: a
 # 40-byte rkyv ReceiptRollback frame (the last valid block and the identity
 # of the event). A receipt batch frame is 16 bytes with no receipt and more
