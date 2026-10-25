@@ -120,6 +120,24 @@ paths of today. This amendment removes them.
     removal does not change it.
     Reason: a new chain has no history in reference mode, so it has nothing to migrate.
 
+53. **The sequencer reads only the egress (D20, user decision of 2026-10-25).** The sequencer
+    takes nothing from a sealer session:
+    - Egress kind 17 (the sealer information to the sequencer sessions) goes, and so do the
+      sealer-version tracking of the sequencer (`sealer_rules.rs`) and the version floor
+      (`KARDAMOM_SEALER_VERSION_FLOOR`).
+    - The sequencer reads the feature schedule from the state changes of `KardamomChainState`
+      (`setFeature`) on the egress, and the block time from the boundaries on the egress. A
+      feature is active for the sequencer from the first block whose time is at or after the
+      activation.
+    - The path of an upgrade: the sealer builds a block with a time after the activation; the
+      executors see that boundary; the egress sees it and sends the state changes to the
+      sequencer; the sequencer sees the feature as active.
+    - Consequence: the sequencer learns a switch a few blocks after the sealer. A future feature
+      that changes what the sequencer sends needs the sealer to accept the old and the new format
+      for a while after the switch.
+
+    Reason: one input for the sequencer, and no message from the sealer to an earlier stage.
+
 ### A.3 What replaces each refusal kind (decision 48)
 
 Under decision versions 4 and 5, the sealer answers a positioned or carried reference only with
@@ -256,9 +274,10 @@ The load balancer must read the method of each request (open question 9).
    window, and the egress holds no copy above its store. The options: the egress keeps storing
    to disk and stops only at a local block budget; the window grows; or an operator restores from
    a seed.
-8. **The frames that the decisions do not name.** Egress kinds 6 and 12 to the sequencer, kind 17
-   (the version report), and the `tx_status` side stream of the sequencer. This spec keeps kinds
-   6, 12 and 17, and keeps `tx_status` until the notifier reads only the egress. Is that correct?
+8. **The frames that the decisions do not name.** Egress kinds 6 and 12 to the sequencer, and
+   the `tx_status` side stream of the sequencer. Kind 17 goes (decision 53). This spec keeps
+   kinds 6 and 12, and keeps `tx_status` until the notifier reads only the egress. Is that
+   correct?
 9. **The routing of the load balancer.** The method is in the JSON body, and a batch can mix a
    send with reads. Which option: a load balancer that reads the body, two URLs, or an egress that
    forwards the send methods to the ingress?
@@ -309,8 +328,9 @@ client ─TLS─▶ LB ─HTTP (sends)─▶ ingress ─▶ sequencer ─▶ sea
   - The receipts of the egress go to the sequencers, the state mirror and the notifier. They
     carry account state and the admission credit (decision 45). They are not an answer to a
     stage. Their delay is the signal of the back-pressure (amendment A.4).
-  - The session frames of the sealer to its own clients carry no transaction and no cursor: the
-    version report (kind 17) and the status for the liveness of a session (kind 9).
+  - The session frame of the sealer to its own clients carries no transaction and no cursor:
+    the status for the liveness of a session (kind 9). The version report (kind 17) goes: the
+    sequencer reads the feature schedule from the egress (decision 53).
 - Every read goes to the egress. The ingress takes only the submit (decision 46).
 - TLS ends at the load balancer. The ingress has no TLS code. The answer to a request goes back on
   the connection that carried the request, so the process that took the request answers it.
