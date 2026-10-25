@@ -244,9 +244,10 @@ removal of `tx_status` leaves no kind unmapped:
     `observed`, and the bit decides a copy: the notifier sends `dropped` once, and only while
     `state` is below `executed`. A drop on `tx_drops` is provisional, as
     `kardamom_getTransactionStatus` says today. So a `receipt` after a `dropped` is sent.
-  - A `rejected` record is final. The sequencer does not order the transaction. It sets `state`
-    to the terminal value, above `included`, so no later event is sent: a late `sent` after a
-    `rejected` is dropped.
+  - A `rejected` record suppresses later `accepted` and `sent` events. A twin can reject a
+    duplicate after the other twin ordered it, so an `executed` or `receipt` overrides a
+    rejection in either arrival order. A rejection never replaces execution or settlement
+    evidence. The terminal value above `included` applies only to admission events.
 - **Loss.** Every stage is best effort (decision 5). MDC offers can fail, for example with
   `NOT_CONNECTED` during a restart, and a publisher drops a batch that it cannot offer (4.8).
   - A lost `accepted`, `sent`, `dropped`, `executed`, `posted` or `included` is not sent again.
@@ -283,7 +284,7 @@ removal of `tx_status` leaves no kind unmapped:
     | 4 | `receipt` |
     | 5 | `posted` |
     | 6 | `included` |
-    | 7 | `rejected`, terminal |
+    | 7 | `rejected`, terminal for admission events; execution takes precedence |
 
   - `observed` is a bitmap, one bit for each stage that really came, for the latencies and for
     the copy of `dropped`. It keeps the bits of `TxStageKind::bit`
@@ -756,3 +757,4 @@ the chain", and "we should ensure this has a negligible impact on the hot path".
 | The egress runs on its own nodes on staging, and the lesson of #831: an image change and a constraint change in one deploy place both instances again. | 4.7 |
 | The metric deviation of P3: the drop counters as built, and a frame flush when full or 1 ms old. | 6 |
 | P1, P2, P3 (#821, #822) and the core of P4 (#823, #824) are done. The rest of P3 and P4 and the scope of P7 are listed. P6 waits for #819 decisions 48-49. | 9 |
+| Review: a delayed twin rejection cannot revoke an execution or receipt. Both arrival orders are covered by the notifier regression test. | 4.4 |
