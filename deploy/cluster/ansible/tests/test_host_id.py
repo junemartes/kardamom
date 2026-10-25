@@ -14,9 +14,9 @@ NOMAD = Path(__file__).resolve().parents[2] / 'nomad'
 # The jobs that run a service built on kardamom_obs.
 SERVICES = ['ingress', 'executor', 'sequencer', 'batcher', 'da-watcher', 'l1-indexer',
             'validator', 'notifier', 'state-mirror', 'canary']
-# A value is per instance when it names the allocation index, the node, or
-# the task group key.
-PER_INSTANCE = re.compile(r'NOMAD_ALLOC_INDEX|node_index|node\.unique|group\.key')
+# A value is per instance when it names the allocation index, the node, the
+# task group key, or the id of a dynamic group with one instance.
+PER_INSTANCE = re.compile(r'NOMAD_ALLOC_INDEX|node_index|node\.unique|group\.key|group\.value\.id')
 
 
 class HostId(unittest.TestCase):

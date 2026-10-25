@@ -18,6 +18,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use kardamom_da_watcher::interop::CursorReconcile;
 
+pub use super::consumers::{
+    ExecutorRun, ValidatorOptions, spawn_executor, spawn_executor_at, spawn_validator,
+};
 use super::proc::{ExistingFile, Proc};
 use kardamom_obs::testkit::{free_port, free_udp_port};
 
@@ -51,7 +54,7 @@ pub fn driver_timeout_ms() -> String {
 
 /// Environment variables every spawned Rust service shares. This is the
 /// one place for them, so the services cannot drift apart.
-fn common_service_env(cmd: &mut Command) {
+pub(super) fn common_service_env(cmd: &mut Command) {
     cmd.env("RUST_LOG", "info");
     // The Aeron C client reads this directly in `aeron_context_init`. This
     // code never calls `set_driver_timeout_ms`, so nothing overrides it.
@@ -77,8 +80,8 @@ pub fn bin(name: &str) -> Result<ExistingFile> {
         bin_dir()?.join(name),
         "build the service binaries first: `cargo build --bins -p kardamom-ingress \
          -p kardamom-sequencer -p kardamom-executor -p kardamom-validator -p kardamom-state \
-         -p kardamom-da-watcher -p kardamom-l1-indexer -p kardamom-reconstruct -p kardamom-notifier -p kardamom-canary` (or just \
-         `just test-e2e-local`)",
+         -p kardamom-da-watcher -p kardamom-l1-indexer -p kardamom-reconstruct -p kardamom-notifier -p kardamom-canary \
+         -p kardamom-batcher -p kardamom-egress` (or just `just test-e2e-local`)",
     )
 }
 
@@ -104,6 +107,10 @@ keep_alive_interval_ms = 1000
     )
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent setting that a stack passes to its services"
+)]
 pub struct ServiceSpec<'a> {
     pub root: &'a Path,
     pub aeron_dir: &'a Path,
@@ -138,18 +145,9 @@ pub struct ServiceSpec<'a> {
     /// it, at admission. The ingress reads its `tx_verdicts` stream and no
     /// receipts.
     pub verdicts: bool,
-}
-
-/// The parts of a stateful service's (executor, validator) bring-up that
-/// vary per spawn: the binary name (also the config file's name and the
-/// registry's `kardamom-<bin_name>` lookup), the state directory, the
-/// reserved ports, and the `--host-id`.
-pub struct StateService<'a> {
-    pub bin_name: &'a str,
-    pub state_dir: &'a Path,
-    pub metrics_port: u16,
-    pub egress_port: u16,
-    pub host_id: &'a str,
+    /// `--exec-frames` on the executor: it forwards its frames to the
+    /// egress.
+    pub exec_frames: bool,
 }
 
 impl ServiceSpec<'_> {
@@ -157,7 +155,7 @@ impl ServiceSpec<'_> {
     /// empty for services that have none) followed by the `[cluster]`
     /// block every Rust cluster client parses at `--config`. Shared by
     /// every spawner that needs a config file.
-    fn write_cluster_config(&self, name: &str, prefix: &str) -> Result<PathBuf> {
+    pub(super) fn write_cluster_config(&self, name: &str, prefix: &str) -> Result<PathBuf> {
         let cfg_path = self.root.join(format!("{name}.toml"));
         std::fs::write(
             &cfg_path,
@@ -165,43 +163,10 @@ impl ServiceSpec<'_> {
         )?;
         Ok(cfg_path)
     }
-
-    /// Build the `Command` shared by every stateful service (executor,
-    /// validator): the config file (`<root>/<svc.bin_name>.toml`, no
-    /// prefix), aeron dir, shard/chain wiring, state dir, durability
-    /// mode, cluster egress endpoint, and metrics address. The caller
-    /// adds its own flags (e.g. `--parallel-validation`) after this
-    /// returns.
-    ///
-    /// # Errors
-    /// Returns an error when the binary is not built, or when writing
-    /// the config file fails.
-    fn state_service_cmd(&self, svc: &StateService<'_>) -> Result<Command> {
-        let cfg_path = self.write_cluster_config(svc.bin_name, "")?;
-        let mut cmd = Command::new(bin(&format!("kardamom-{}", svc.bin_name))?);
-        cmd.arg("--config")
-            .arg(&cfg_path)
-            .arg("--aeron-dir")
-            .arg(self.aeron_dir)
-            .args(["--chain-id", &self.chain_id.to_string()])
-            .arg("--chain")
-            .arg(self.genesis)
-            .arg("--state-dir")
-            .arg(svc.state_dir)
-            // Ephemeral test DBs: skip the per-block fsync.
-            .args(["--state-durability", "safe-no-sync"])
-            .args([
-                "--cluster-egress-endpoint",
-                &format!("127.0.0.1:{}", svc.egress_port),
-            ])
-            .args(["--metrics-addr", &format!("127.0.0.1:{}", svc.metrics_port)])
-            .args(["--host-id", svc.host_id]);
-        Ok(cmd)
-    }
 }
 
 /// Add `--log-config` when the spec carries one.
-fn with_log_config(cmd: &mut Command, spec: &ServiceSpec<'_>) {
+pub(super) fn with_log_config(cmd: &mut Command, spec: &ServiceSpec<'_>) {
     if let Some(p) = spec.log_config {
         cmd.arg("--log-config").arg(p);
     }
@@ -490,18 +455,18 @@ pub struct Spawned {
 /// Everything needed to spawn one service process and wrap it as a
 /// [`Spawned`]: the process, its metrics address
 /// (`127.0.0.1:<metrics_port>`), and its state dir (if any).
-struct SpawnPlan {
-    name: String,
-    cmd: Command,
-    log: PathBuf,
-    metrics_port: u16,
-    state_dir: Option<PathBuf>,
+pub(super) struct SpawnPlan {
+    pub(super) name: String,
+    pub(super) cmd: Command,
+    pub(super) log: PathBuf,
+    pub(super) metrics_port: u16,
+    pub(super) state_dir: Option<PathBuf>,
 }
 
 impl SpawnPlan {
     /// # Errors
     /// Returns an error when the process fails to spawn.
-    fn spawn(self) -> Result<Spawned> {
+    pub(super) fn spawn(self) -> Result<Spawned> {
         let proc = Proc::spawn(&self.name, self.cmd, self.log)?;
         Ok(Spawned {
             proc,
@@ -533,6 +498,13 @@ pub struct SequencerOptions {
     /// A suffix for the log file name, so a restarted process does not
     /// overwrite the log of the one it replaced.
     pub log_tag: String,
+    /// `--sealer-version-floor`: the decision version that the process
+    /// keeps until the sealer reports its own. 0 is the default.
+    pub sealer_version_floor: u8,
+    /// Run the v1 loop, also on a stack whose sequencers run the v2 loop.
+    /// The v1 loop offers every transaction as a reference without its
+    /// bytes (record type 0), as a sequencer of an older release does.
+    pub v1_loop: bool,
 }
 
 impl SequencerOptions {
@@ -553,6 +525,12 @@ impl SequencerOptions {
         }
         if let Some(warm) = self.shadow_warm {
             cmd.args(["--shadow-warm-ms", &warm.as_millis().to_string()]);
+        }
+        if self.sealer_version_floor > 0 {
+            cmd.args([
+                "--sealer-version-floor",
+                &self.sealer_version_floor.to_string(),
+            ]);
         }
     }
 }
@@ -580,7 +558,7 @@ pub fn spawn_sequencer_with(
         "partition_count = {partition_count}\npartition_index = 0\nsequencer_id = 0\n\
          max_pending_per_sender = 512\nbackpressure_policy = \"return_immediately\"\n\n",
     );
-    if spec.admission {
+    if spec.admission && !opts.v1_loop {
         prefix.push_str("[admission]\nenabled = true\nmax_parked = 512\n");
         if spec.verdicts {
             prefix.push_str("verdicts = true\n");
@@ -620,164 +598,6 @@ pub fn spawn_sequencer_with(
         log: spec.root.join(format!("{name}.log")),
         metrics_port,
         state_dir: None,
-    }
-    .spawn()
-}
-
-/// # Errors
-/// Returns an error under the same conditions as [`spawn_executor_at`].
-pub fn spawn_executor(spec: &ServiceSpec<'_>) -> Result<Spawned> {
-    spawn_executor_at(spec, None)
-}
-
-/// Join-miss refetch only matters alongside a log config that lists
-/// durability-archive endpoints (the archive-durability variant). Without
-/// it, a restarted executor cannot get envelopes for canonical records
-/// replayed from before the crash, and aborts by design.
-fn add_archive_endpoints(cmd: &mut Command, spec: &ServiceSpec<'_>) {
-    if spec.log_config.is_some() {
-        cmd.args([
-            "--replay-destination-endpoint",
-            &format!("127.0.0.1:{}", free_udp_port().port()),
-        ])
-        .args([
-            "--archive-control-response-endpoint",
-            &format!("127.0.0.1:{}", free_udp_port().port()),
-        ]);
-    }
-}
-
-/// Spawn the executor, or respawn it. `fixed_metrics_port` reuses a
-/// previous instance's port, so a restarted executor keeps the address
-/// scenarios already hold. The crash-recovery scenario restarts it
-/// against the same state directory, which drives the resume-from-cursor
-/// path.
-///
-/// # Errors
-/// Returns an error when the binary is not built, when the state
-/// directory or config file cannot be created, or when the process fails
-/// to spawn.
-pub fn spawn_executor_at(
-    spec: &ServiceSpec<'_>,
-    fixed_metrics_port: Option<u16>,
-) -> Result<Spawned> {
-    let state_dir = spec.root.join("executor-state");
-    std::fs::create_dir_all(&state_dir)?;
-    let metrics_port = match fixed_metrics_port {
-        Some(p) => p,
-        None => free_port().port(),
-    };
-    let egress_port = free_udp_port().port();
-    let mut cmd = spec.state_service_cmd(&StateService {
-        bin_name: "executor",
-        state_dir: &state_dir,
-        metrics_port,
-        egress_port,
-        host_id: "e2e-exec",
-    })?;
-    cmd.args(["--nonce-query-addr", &spec.executor_query.to_string()]);
-    // The footprint shadow is on for every e2e executor. It only
-    // measures: execution stays sequential, and the handoff never blocks.
-    // Running it here gives the shadow thread real multi-process pipeline
-    // coverage in CI. Its per-block summary lines land in executor.log.
-    cmd.env("KARDAMOM_FOOTPRINT_SHADOW", "1");
-    with_log_config(&mut cmd, spec);
-    add_archive_endpoints(&mut cmd, spec);
-    common_service_env(&mut cmd);
-    // A respawn logs to its own file, so the pre-crash log survives for
-    // later inspection (`Proc::spawn` truncates its log file).
-    let log = if fixed_metrics_port.is_some() {
-        "executor-restarted.log"
-    } else {
-        "executor.log"
-    };
-    SpawnPlan {
-        name: "executor".to_string(),
-        cmd,
-        log: spec.root.join(log),
-        metrics_port,
-        state_dir: Some(state_dir),
-    }
-    .spawn()
-}
-
-/// Validator spawn knobs beyond the shared [`ServiceSpec`].
-pub struct ValidatorOptions<'a> {
-    /// Trie shadow-check cadence. `Some(1)` checks every block, the
-    /// semantics-suite default. The production cluster runs 8.
-    pub trie_shadow_check: Option<std::num::NonZeroU64>,
-    /// L1 output attestation + epoch verification wiring.
-    pub attester: Option<&'a L1Wiring>,
-    /// `--parallel-validation` (the deployed cluster's mode).
-    pub parallel: bool,
-    /// `Some(path)` enables the egress-E1 serving role: `--serve-feed
-    /// 127.0.0.1:0` with the bound address written to `path`.
-    pub serve_feed_addr_file: Option<&'a Path>,
-}
-
-/// The egress-E1 serving role: port 0 (OS-assigned, so concurrent stacks
-/// never collide), real address discovered through the addr file.
-fn add_serve_feed_args(cmd: &mut Command, opts: &ValidatorOptions<'_>) {
-    if let Some(addr_file) = opts.serve_feed_addr_file {
-        cmd.args(["--serve-feed", "127.0.0.1:0"])
-            .arg("--serve-feed-addr-file")
-            .arg(addr_file);
-    }
-}
-
-/// L1 output attestation needs all three flags together, or none of them
-/// (the binary rejects a partial set). `--attester-post-interval 1` posts
-/// an output per block, so a withdrawal becomes finalizable promptly.
-fn add_attester_args(cmd: &mut Command, opts: &ValidatorOptions<'_>) {
-    if let Some(l1) = opts.attester {
-        cmd.args(["--l1-rpc-url", &l1.rpc_url])
-            .args(["--output-oracle", &l1.oracle])
-            .args(["--attester-key", &l1.attester_key])
-            .args(["--attester-post-interval", "1"])
-            // With the RPC URL, this turns on epoch verification. Every
-            // epoch is re-derived from L1, and a mismatch counts as a
-            // divergence. So the whole L1-backed suite runs with
-            // verification on. An honest producer that quietly stopped
-            // matching L1 would then surface as a failure in every bridge
-            // scenario, not only the forged-epoch one.
-            .args(["--lockbox", &l1.lockbox]);
-    }
-}
-
-/// Spawn `kardamom-validator` with its own state directory.
-///
-/// # Errors
-/// Returns an error when the binary is not built, when the state
-/// directory or config file cannot be created, or when the process fails
-/// to spawn.
-pub fn spawn_validator(spec: &ServiceSpec<'_>, opts: &ValidatorOptions<'_>) -> Result<Spawned> {
-    let state_dir = spec.root.join("validator-state");
-    std::fs::create_dir_all(&state_dir)?;
-    let metrics_port = free_port().port();
-    let egress_port = free_udp_port().port();
-    let mut cmd = spec.state_service_cmd(&StateService {
-        bin_name: "validator",
-        state_dir: &state_dir,
-        metrics_port,
-        egress_port,
-        host_id: "e2e-validator",
-    })?;
-    with_log_config(&mut cmd, spec);
-    if let Some(n) = opts.trie_shadow_check {
-        cmd.args(["--trie-shadow-check", &n.to_string()]);
-    }
-    if opts.parallel {
-        cmd.arg("--parallel-validation");
-    }
-    add_serve_feed_args(&mut cmd, opts);
-    add_attester_args(&mut cmd, opts);
-    common_service_env(&mut cmd);
-    SpawnPlan {
-        name: "validator".to_string(),
-        cmd,
-        log: spec.root.join("validator.log"),
-        metrics_port,
-        state_dir: Some(state_dir),
     }
     .spawn()
 }

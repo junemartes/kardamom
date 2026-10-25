@@ -202,6 +202,12 @@ impl LocalStack {
             .chain(self.validator.as_ref().map(|v| &v.proc))
             .chain(self.da_watcher.as_ref().map(|w| &w.proc))
             .chain(self.l1_follower.as_ref().map(|f| &f.service.proc))
+            .chain(self.egress.as_ref().map(|e| &e.service.proc))
+            .chain(
+                self.batcher
+                    .as_ref()
+                    .and_then(super::carry::BatcherSide::proc),
+            )
             .chain(self.sequencers.iter().map(|s| &s.proc))
             .chain(self.sealer.procs.iter())
             .chain(std::iter::once(&self.driver.proc))

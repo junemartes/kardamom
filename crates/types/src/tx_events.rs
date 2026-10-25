@@ -28,6 +28,8 @@
 //! A frame holds one kind. A publisher sends each frame once and does not
 //! send it again, so a lost frame shows to the notifier as a gap in `seq`.
 
+use alloc::boxed::Box;
+use alloc::vec;
 use alloy_primitives::B256;
 
 /// The first two bytes of every frame.

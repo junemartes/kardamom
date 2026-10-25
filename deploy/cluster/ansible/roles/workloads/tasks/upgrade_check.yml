@@ -34,6 +34,17 @@
 # FEATURE_SEALER_V5 (feature id 4, the carry flag) switches the sealer
 # from decision version 4 to 5. It needs every sealer member to read
 # snapshot version 16.
+#
+# FEATURE_CARRY_WINDOW (feature id 5) turns on the exact window and the
+# refusal of a reference of record type 0 while version 5 runs. It needs
+# every member to read snapshot version 18, to run version 5, and to keep
+# its retained frames on the heap. It needs the services of
+# workloads_upgrade_window_jobs, and every reader of the egress past the
+# last stored reference. Feature 5 can turn off and on again, so the check
+# allows any activation time for it. Feature 3 or 4 off stops version 5
+# and the rules of feature 5 with it, and a carry executor then stops on
+# the first reference. So the check refuses feature 3 or 4 with an
+# activation time other than 0 while a member holds feature 5.
 - name: Keep the feature and the activation time of the upgrade transaction
   ansible.builtin.set_fact:
     workloads_upgrade_feature: "{{ lookup('env', 'KARDAMOM_UPGRADE_FEATURE') | trim }}"
@@ -118,6 +129,114 @@
       ({{ workloads_upgrade_reads_max }}). Deploy the release that reads version 16 to every member, then run the
       check again.
 
+# A member writes snapshot version 18 once it holds the activation of
+# feature 5, and a member that reads only up to version 17 stops on it.
+# Below decision version 5 the record changes nothing (EARLY). A member
+# with the retained file never stores it (UNSUPPORTED).
+- name: Check the members for feature 5
+  when: workloads_upgrade_feature | int == 5
+  block:
+    - name: Refuse feature 5 on a member that reads no snapshot version 18
+      ansible.builtin.assert:
+        that: workloads_upgrade_reads_max | min >= 18
+        fail_msg: >-
+          Refused: the upgrade transaction of FEATURE_CARRY_WINDOW (feature id 5) needs every sealer member to read
+          snapshot version 18, and a member reads only up to {{ workloads_upgrade_reads_max | min }}
+          ({{ workloads_upgrade_reads_max }}). Deploy the release that reads version 18 to every member, then run the
+          check again.
+
+    - name: Refuse feature 5 on a member below decision version 5
+      ansible.builtin.assert:
+        that: workloads_upgrade_versions | reject('equalto', 5) | list | length == 0
+        fail_msg: >-
+          Refused: feature 5 needs decision version 5 on every member, and the members run
+          {{ workloads_upgrade_versions }}. Below version 5 a member ignores the record (EARLY). Activate features 3
+          and 4 first.
+      vars:
+        workloads_upgrade_versions: >-
+          {{ workloads_sealer_status.results | map(attribute='json') | map(attribute='decisionVersion', default=0)
+             | map('int') | list }}
+
+    - name: Refuse feature 5 on a member with the retained file
+      ansible.builtin.assert:
+        that: workloads_upgrade_stores | reject('equalto', 'heap') | list | length == 0
+        fail_msg: >-
+          Refused: feature 5 needs the retained frames on the heap of every member, and the members report the
+          stores {{ workloads_upgrade_stores }}. A member with the retained file never stores the activation
+          (UNSUPPORTED).
+      vars:
+        workloads_upgrade_stores: >-
+          {{ workloads_sealer_status.results | map(attribute='json') | map(attribute='retainedStore', default='none')
+             | list }}
+
+    - name: Check the services of the carry window
+      ansible.builtin.include_tasks: upgrade_check_job.yml
+      loop: "{{ workloads_upgrade_window_jobs | rejectattr('name', 'equalto', 'egress') | list }}"
+      loop_control:
+        loop_var: workloads_upgrade_job
+        label: "{{ workloads_upgrade_job.name }}"
+
+    # The exact window answers a cursor below it with REPLAY_UNAVAILABLE, so
+    # the batcher and the validator read the egress. A reader cursor at or
+    # below R can still meet a reference in the egress range.
+    - name: Read the reference mark for feature 5
+      ansible.builtin.include_tasks: egress_mark.yml
+
+    - name: Read the egress cursor of each reader
+      ansible.builtin.include_tasks: metrics_read.yml
+      loop: [batcher, validator]
+      loop_control:
+        loop_var: workloads_upgrade_reader
+      vars:
+        workloads_metrics_job: "{{ workloads_upgrade_reader }}"
+        workloads_metrics_port: "{{ workloads_metrics_ports[workloads_upgrade_reader] }}"
+        workloads_metrics_gauges: ["{{ workloads_reader_cursor_gauges[workloads_upgrade_reader] }}"]
+
+    - name: Refuse feature 5 while a reader cursor is not past the last stored reference
+      ansible.builtin.assert:
+        that:
+          - workloads_upgrade_cursors | length > 0
+          - workloads_upgrade_cursors | min > workloads_ref_index | int
+        fail_msg: >-
+          Refused: the {{ item }} cursors {{ workloads_upgrade_cursors }} ({{ workloads_reader_cursor_gauges[item] }};
+          -1 is no answer) are not all above the index {{ workloads_ref_index }} of the last stored reference
+          (kardamom_egress_ref_frame_max_index), or no {{ item }} runs. Wait until every reader passes it, then run the
+          check again.
+      loop: [batcher, validator]
+      vars:
+        workloads_upgrade_cursors: "{{ workloads_metrics_of[item][workloads_reader_cursor_gauges[item]] }}"
+
+# A member that holds an activation of feature 5 reports the gauge
+# kardamom_sealer_feature_state{feature="5"} at 1 (held, off) or 2 (on). A
+# member of an older release reports no such gauge, and holds none. A
+# member whose page does not answer can hold it, so the guard refuses.
+- name: Read the state of feature 5 on every member
+  ansible.builtin.include_tasks: metrics_read.yml
+  vars:
+    workloads_metrics_job: cluster
+    workloads_metrics_port: "{{ workloads_sealer_admin_port }}"
+    workloads_metrics_gauges: ['kardamom_sealer_feature_state{feature="5"}']
+  when:
+    - workloads_upgrade_feature | int in [3, 4]
+    - workloads_upgrade_activation_ms != '0'
+
+- name: Refuse feature 3 or 4 off while a member holds feature 5
+  ansible.builtin.assert:
+    that:
+      - workloads_metrics_of.cluster.silent | length == 0
+      - workloads_metrics_of.cluster['kardamom_sealer_feature_state{feature="5"}'] | select('ge', 1) | list | length == 0
+    fail_msg: >-
+      Refused: the upgrade transaction of feature {{ workloads_upgrade_feature }} with the activation time
+      "{{ workloads_upgrade_activation_ms }}" can turn decision version 5 off, and a member holds feature 5 or does not answer
+      (kardamom_sealer_feature_state{feature="5"} of {{ workloads_metrics_of.cluster.groups }}:
+      {{ workloads_metrics_of.cluster['kardamom_sealer_feature_state{feature="5"}'] }}; members whose /metrics
+      does not answer: {{ workloads_metrics_of.cluster.silent }}). Without version 5 the
+      rules of feature 5 stop, and a carry executor stops on the first reference. Turn feature 5 off first, and move
+      the executors to reference mode (KARDAMOM_CARRY_EXECUTORS empty).
+  when:
+    - workloads_upgrade_feature | int in [3, 4]
+    - workloads_upgrade_activation_ms != '0'
+
 # Each service that executes or reads a skip must run this release: an
 # older executor or validator does not use the nonce of a skipped
 # transaction, and forks the state at the first such skip. On a genesis
@@ -143,6 +262,6 @@
   ansible.builtin.debug:
     msg: >-
       The upgrade check passed: {{ workloads_sealer_running | length }} sealer members read snapshot version
-      {{ {3: 15, 4: 16}.get(workloads_upgrade_feature | int, 14) }},
+      {{ {3: 15, 4: 16, 5: 18}.get(workloads_upgrade_feature | int, 14) }},
       and the live allocations of {{ workloads_upgrade_jobs | map(attribute='name') | join(', ') }}
       run this release. The upgrade transaction of feature {{ workloads_upgrade_feature }} may go to the Safe.
