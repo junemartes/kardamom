@@ -214,6 +214,9 @@ The load balancer must read the method of each request (open question 9).
   8.4 (the two read tiers).
 - `docs/specs/2026-10-23-carry-activation.md`: section 4.3 (kind 18 and its `TxDrop`), and the
   sentence "The DA-lag guard does not change" in section 8.
+- Issue [#678](https://github.com/junemartes/kardamom/issues/678) (a sealer disk reserve and an
+  ingress pause while a quorum is low on disk): the back-pressure chain of decision 49 likely
+  replaces the ingress pause. The disk reserve itself is not a back edge.
 - `docs/failure-modes.md` and `docs/json-rpc.md` describe the current state. The PRs of section
   9.2 update them.
 
@@ -243,12 +246,35 @@ The load balancer must read the method of each request (open question 9).
    to disk and stops only at a local block budget; the window grows; or an operator restores from
    a seed.
 8. **The frames that the decisions do not name.** Egress kinds 6 and 12 to the sequencer, kind 17
-   (the version report), the stored cursor (ingress kind 12, #639), and the `tx_status` side
-   stream of the sequencer. This spec keeps kinds 6, 12 and 17, does not build kind 12, and keeps
-   `tx_status` until the notifier reads only the egress. Is that correct?
+   (the version report), and the `tx_status` side stream of the sequencer. This spec keeps kinds
+   6, 12 and 17, and keeps `tx_status` until the notifier reads only the egress. Is that correct?
 9. **The routing of the load balancer.** The method is in the JSON body, and a batch can mix a
    send with reads. Which option: a load balancer that reads the body, two URLs, or an egress that
    forwards the send methods to the ingress?
+10. **The Raft-log purge floor.** Today the sealer purges its Raft log only below the posted head
+    (`PurgePlanner`), and the posted head comes from the posted cursor of the batcher (ingress
+    kind 7). Decision 49 removes the posted cursor from the sealer. On 2026-10-24 the user decided
+    that the purge floor moves to the stored head of the egress, through ingress kind 12, with the
+    egress fed by the executors ([#639](https://github.com/junemartes/kardamom/issues/639) and its
+    two decision comments). Kind 12 is a message from a later stage to the sealer, so it is a back
+    edge in the sense of decision 48. Which floor holds:
+    - #639: the egress stored head through kind 12 (an exception to decision 48);
+    - the snapshot margin only: the sealer purges below its newest snapshot and keeps a fixed
+      margin, and a reader below that margin recovers from the egress or a peer checkpoint;
+    - another source that sends no message to the sealer?
+
+11. **The conflict with the notifier spec of #817 (revision 6, approved on 2026-10-25).** Four
+    points differ. Which design holds for each?
+    - Decision 46: the egress serves the subscriptions. #817: the notifier serves the WebSocket
+      feeds and the webhooks, and the notifier stays a separate service.
+    - Decision 45: no service reads an executor. #817: the notifier taps the executors'
+      `tx_receipts` for an `executed` stage, behind a switch, for the evaluation.
+    - Decisions 48 and 50: no `TxDrop` from kind 18 and no `tx_errors`. #817: the notifier pushes
+      `dropped` and `rejected` events.
+    - Decision 49: no DA-lag guard. #817: the ingress halts on an explicit `da_lag` status.
+
+    A possible middle way: the notifier stays the push service, and it reads only the egress
+    (receipts and drop records). Decisions 45 and 50 then hold, and the push API of #817 stays.
 
 ## 1. The principle
 
