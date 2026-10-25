@@ -1121,8 +1121,17 @@ class DeployTest(Deploys):
         the nodes with egress in meta.roles, and its peers name the egress
         nodes and the executor nodes, so a moved instance fills its store
         from the one that did not move. No other job changes."""
-        self.manifest.write_text(self.manifest.read_text()
-                                 + f'egress registry.example:5000/kardamom-egress:test@sha256:{"a" * 64}\n')
+        self.add_egress_image()
+        # A new reader starts on the egress only while every egress
+        # instance holds no reference (gate 8b). So the egress runs first,
+        # and the readers are new jobs, as in the egress switch test.
+        readers = ('workloads_validator_egress', 'workloads_batcher_egress')
+        self.run_deploy({k: v for k, v in self.EGRESS_ON.items() if k not in readers})
+        for job in ('batcher', 'validator'):
+            del self.api.state['jobs'][job]
+        for node in ('node-egress', 'node-egress.1'):
+            self.api.state.setdefault('metrics', {})[node] = (
+                'kardamom_egress_ref_frame_max_index 0\nkardamom_egress_ref_frame_max_block 0\n')
         plans = {}
         cases = (
             ({}, ('${meta.role}', '=', 'executor'), [f'executor-{i}' for i in range(3)]),
