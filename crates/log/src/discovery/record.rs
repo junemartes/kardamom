@@ -45,6 +45,9 @@ pub enum Topic {
     /// The drops of the sequencers. Each sequencer registers its
     /// publication with its lane id.
     TxDrops,
+    /// The client stages that no other stream carries: `accepted` and
+    /// `sent` for now. Many publishers, best effort.
+    TxEvents,
 }
 
 impl Topic {
@@ -67,6 +70,7 @@ impl Topic {
             Self::EgressOrder => "egress_order",
             Self::EgressReceipts => "egress_receipts",
             Self::TxDrops => "tx_drops",
+            Self::TxEvents => "tx_events",
         }
     }
 
@@ -94,7 +98,8 @@ impl Topic {
             | Self::ExecFrames
             | Self::EgressOrder
             | Self::EgressReceipts
-            | Self::TxDrops => None,
+            | Self::TxDrops
+            | Self::TxEvents => None,
         }
     }
 
@@ -116,6 +121,7 @@ impl Topic {
             "egress_order" => Some(Self::EgressOrder),
             "egress_receipts" => Some(Self::EgressReceipts),
             "tx_drops" => Some(Self::TxDrops),
+            "tx_events" => Some(Self::TxEvents),
             _ => None,
         }
     }

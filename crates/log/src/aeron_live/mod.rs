@@ -89,6 +89,7 @@ pub use handles::simple::{
     TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle, TxStatusSubscriberHandle,
 };
 pub use handles::tx_data::{TxDataPublisherHandle, TxDataSubscriberHandle};
+pub use handles::tx_events::{FRAME_MAX_AGE, FrameOffer, TxEventsPublisherHandle, TxEventsSink};
 pub use handles::tx_receipts::{
     ReceiptFrame, TxReceiptsBoundarySubscriberHandle, TxReceiptsPublisherHandle,
     TxReceiptsReceiver, TxReceiptsSubscriberHandle,
