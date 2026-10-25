@@ -31,6 +31,13 @@ pub(crate) const L1_OWNER_KEY: &str =
 /// `finalized` tag of the in-cluster anvil is the head minus two epochs
 /// of 32 slots, and the L1 follower reads only finalized blocks.
 const FINALITY_BLOCKS: u64 = 66;
+/// The wait for the receipt of an upgrade transaction. Right after
+/// `eth_sendTransaction`, the block that holds the transaction can be
+/// missing, and the receipt is then `null`.
+const RECEIPT_BUDGET: Budget = Budget {
+    timeout: Duration::from_secs(60),
+    interval: Duration::from_secs(1),
+};
 
 /// One posted batch as its `BatchPosted` log names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,8 +183,9 @@ impl L1 {
     ///
     /// # Errors
     ///
-    /// Returns an error if anvil refuses the transaction, or if its
-    /// receipt does not have the status `0x1`.
+    /// Returns an error if anvil refuses the transaction, if no receipt
+    /// comes within [`RECEIPT_BUDGET`], or if its receipt does not have
+    /// the status `0x1`.
     pub async fn initiate_upgrade(
         &self,
         lockbox: &str,
@@ -191,7 +199,18 @@ impl L1 {
                 json!([{ "from": L1_OWNER, "to": lockbox, "data": data }]),
             )
             .await?;
-        let receipt = self.rpc("eth_getTransactionReceipt", json!([hash])).await?;
+        let (receipt, _) = poll::until(RECEIPT_BUDGET, |_| async {
+            let receipt = self
+                .rpc("eth_getTransactionReceipt", json!([&hash]))
+                .await?;
+            Ok((!receipt.is_null()).then_some(receipt))
+        })
+        .await?
+        .or_fail(|elapsed| {
+            anyhow::anyhow!(
+                "initiateUpgrade({feature}, {activation_ms}): no receipt after {elapsed:?}"
+            )
+        })?;
         anyhow::ensure!(
             receipt["status"] == "0x1",
             "initiateUpgrade({feature}, {activation_ms}) failed: {receipt}"
