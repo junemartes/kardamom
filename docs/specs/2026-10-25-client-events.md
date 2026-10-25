@@ -1,7 +1,7 @@
 # Client events from one-way stage publications, and the egress on its own nodes
 
-Status: draft, revision 3, 2026-10-25. The decisions in section 1 are the user's (2026-10-25).
-Section 10 lists the changes from revision 1.
+Status: draft, revision 4, 2026-10-25. The decisions in section 1 are the user's (2026-10-25).
+Section 10 lists the changes from revision 1 and from revision 3.
 
 ## 1. Decisions
 
@@ -11,20 +11,26 @@ Section 10 lists the changes from revision 1.
    The notifier and the egress stay two processes.
 3. There is no "sealed" status. The client events come from one-way stage publications:
 
-   | Stage | Publisher | Meaning |
+   | Stage | Publisher | Stream that the notifier reads |
    |---|---|---|
-   | `accepted` | ingress | The ingress checked the transaction and published it on `tx_data`. |
-   | `sent` | sequencer | The sequencer offered the transaction to the sealer. |
-   | `dropped` | sequencer | The transaction will not land. The event carries the reason. |
-   | `executed` | executor, each of them | The executor applied the transaction. One event for each executor, with the block and the index, not the receipt. |
-   | `receipt` | egress | The egress holds the merged receipt. The event carries the receipt. |
-   | `posted` | batcher | The batch that holds the block of the transaction was sent to L1. |
+   | `accepted` | ingress | `tx_events` (new) |
+   | `sent` | sequencer | `tx_events` (new, in place of the `Offered` status of each transaction) |
+   | `dropped` | sequencer | `tx_drops` (exists, #768), and `tx_events` for a final rejection |
+   | `executed` | executor, each of them | `tx_receipts` (exists), for the evaluation only (Q7) |
+   | `receipt` | egress | `egress_receipts` (exists), with its rollback frames |
+   | `posted` | batcher | `tx_events` (new, once for each batch) |
 
 4. The egress runs on its own nodes (`role=egress`), not on the executor nodes.
+5. The notifier publications are best effort. They never halt the chain. A lost event, a lost
+   batch, a stalled notifier or a notifier that is down never stops admission, ordering or
+   execution (4.8).
+6. The events have a negligible cost on the hot path: no allocation and no encode for each
+   event, one offer for each poll cycle, and no wait (4.8).
 
-For now the executors and the egress both publish, so that the stages can be measured apart: the
-time of each executor, and the time from the executors to the merged receipt. A switch turns the
-executor events off after the evaluation (Q7).
+For now the notifier reads both the executors and the egress, so that the stages can be measured
+apart: the time of each executor, and the time from the executors to the merged receipt. A switch
+of the notifier turns the executor tap off after the evaluation (Q7). The executors and the egress
+publish nothing new: their streams already carry these stages.
 
 The `dropped` stage is not in the user's list. It is here because without it a client sees `sent`
 and then nothing (section 4.3).
@@ -122,81 +128,83 @@ validator. The `kardamom-egress` crate replaced it. P9 of section 9 marks it sup
 
 ### 4.1 The topic `tx_events`
 
-One MDC topic with many publishers. A publication is a batch:
+One MDC topic with many publishers. It carries only the stages that no existing stream carries:
+`accepted`, `sent`, a final rejection, `posted` and `included`.
+
+**The hot frame.** The ingress and the sequencer publish a fixed-layout frame, not rkyv. The
+encode is a copy of fixed records into a buffer.
 
 ```
-TxEventBatch {
-    origin: Origin,          // ingress, sequencer, executor, egress, batcher, and the instance index
-    seq: u64,                // the batch number of this origin, from 0 at its start
-    events: Vec<TxEvent>,
-}
-TxEvent =
-    Accepted { hash }
-  | Sent { hash, lane }
-  | Dropped { hash, sender, nonce, reason }    // reason: a DropReason or a TxErrorReason (4.2)
-  | Executed { hash, block, position }         // from one executor, its own copy
-  | Receipt { hash, block, position, receipt } // from the egress: the receipt of egress_receipts
-  | RolledBack { from_block }                  // an egress rollback frame
-  | Posted { batch_index, first_block, last_block, l1_tx }
-  | Included { batch_index, l1_block }
+header (16 bytes, little endian):
+    magic: u16        // 0x4B45 ("KE")
+    version: u8       // 1
+    kind: u8          // 1 = accepted, 2 = sent, 3 = rejected
+    origin: u16       // the instance index of the publisher
+    count: u16        // the number of records
+    seq: u64          // the frame number of this origin and kind, from 0 at its start
+records, `count` of them, each of a fixed size for its kind:
+    accepted:  hash [u8; 32]                          // 32 bytes
+    sent:      hash [u8; 32], lane: u8                // 33 bytes
+    rejected:  hash [u8; 32], reason: u16             // 34 bytes, a TxErrorReason code
 ```
 
-- The codec is rkyv, as the other streams. The format goes in `formats.toml` (until #664
-  removes it) with `writes = 1`.
-- A publisher fills a batch for each poll cycle of its loop. It sends the batch at the end of
-  the cycle.
-- A publisher never waits for the notifier. A failed offer is counted
-  (`kardamom_tx_events_dropped_total{origin}`), and the batch is dropped.
-- `position` is the canonical position of the transaction (`BPosition`). The egress catch-up of
-  4.5 reads by it.
+- A frame holds one kind, and at most 1,024 records (about 34 KB, below the maximum message of
+  the term).
+- The format goes in `formats.toml` (until #664 removes it) with `writes = 1`, and a golden
+  layout test, as the other fixed layouts.
+- The notifier reads the records in place from the Aeron buffer. It copies only a hash that a
+  client follows.
+
+**The batcher frame.** `Posted { batch_index, first_block, last_block, l1_tx }` and
+`Included { batch_index, l1_block }` come once for each batch, off the hot path. Their codec is
+rkyv, with their own format entry.
+
 - `Posted` and `Included` name a block range, not hashes. The notifier maps them to hashes
   (4.4).
-- The stream `chain_status` carries one `ChainStatus { status: ClusterStatus }` for each status
-  frame. Its codec is rkyv, and its format goes in `formats.toml` with `writes = 1`, as
-  `tx_events`.
+
+**The stream `chain_status`** carries one `ChainStatus { status: ClusterStatus }` for each
+status frame. Its codec is rkyv, and its format goes in `formats.toml` with `writes = 1`.
 
 ### 4.2 The publishers
 
 | Publisher | The change |
 |---|---|
-| ingress | `Accepted` for each transaction that it published on `tx_data`. |
-| sequencer | `Sent` and `Dropped` on `tx_events`, and `ChainStatus` on `chain_status`, by the map below. |
-| executor | `Executed` for each transaction that it applied, behind its own switch (Q7). |
-| egress | `Receipt` and `RolledBack` from the merged receipts, the same frames as `egress_receipts`. |
+| ingress | An `accepted` record for each transaction that it published on `tx_data` (4.8). |
+| sequencer | A `sent` record for each offer to the sealer, in place of its `TxStatus` `Offered` publish of each transaction. A `rejected` record for each rejection. `ChainStatus` on `chain_status`. |
+| executor | Nothing. The notifier taps `tx_receipts` behind its switch (Q7). |
+| egress | Nothing. The notifier taps `egress_receipts`, with the rollback frames. |
 | batcher | `Posted` when it sends a batch, `Included` when the L1 receipt of the batch transaction comes. |
 
-The egress keeps `egress_receipts` for the sequencers. The executors keep `tx_receipts`. The
-`Executed` events carry no receipt bytes, so they stay small: 32 bytes of hash and two numbers.
+The map of each sequencer output:
 
-The map of each sequencer output to `tx_events`:
-
-| Sequencer output today | Code | `tx_events` |
+| Sequencer output today | Code | After the change |
 |---|---|---|
-| `TxStatus` `Offered { sender, nonce }` on `tx_status` | `sequencer.rs:598` (v1), `v2/mod.rs:510` | `Sent` |
-| `TxStatus` `Rejected { sender, nonce, reason }` on `tx_status` | `sequencer.rs:380` (v1), `v2/mod.rs:580` | `Dropped`, reason `Rejected(TxErrorReason)`. Final: the sequencer never orders it. |
-| `TxDrop { sender, nonce, reason }` on `tx_drops` | the drops of #768 | `Dropped`, reason `Drop(DropReason)`. Provisional (4.3). |
-| a status frame of the cluster egress (kind 9) | `bin/kardamom-sequencer/feeds.rs:494` (`on_status_frame`) | `ChainStatus`, on its own stream `chain_status` (4.6) |
-| the v2 verdicts `Accepted` and `Rejected` on `tx_verdicts` to an ingress | `v2/verdicts.rs:51`, `:62` | none. The verdicts answer the ingress (the admission ack), not the clients. |
+| `TxStatus` `Offered { sender, nonce }` on `tx_status`, one publish for each transaction | `sequencer.rs:583` (`record_one_published`, v1), `v2/mod.rs:496` (`flush`) | a `sent` record in the hot frame of the cycle |
+| `TxStatus` `Rejected { sender, nonce, reason }` on `tx_status` | `sequencer.rs:380` (v1), `v2/mod.rs:580` | a `rejected` record. Final: the sequencer never orders it. |
+| `TxDrop { sender, nonce, reason }` on `tx_drops` | the drops of #768 | no change. The notifier taps `tx_drops`. Provisional (4.3). |
+| a status frame of the cluster egress (kind 9) | `bin/kardamom-sequencer/feeds.rs:494` (`on_status_frame`) | `ChainStatus` on `chain_status` (4.6) |
+| the v2 verdicts `Accepted` and `Rejected` on `tx_verdicts` to an ingress | `v2/verdicts.rs:51`, `:62` | no change. The verdicts answer the ingress (the admission ack), not the clients. |
 
 The two other kinds of `TxStatus` (`crates/types/src/tx_status.rs:70-85`) also have a stage, so the
 removal of `tx_status` leaves no kind unmapped:
 
-| `TxStatus` kind | Publisher today | `tx_events` |
+| `TxStatus` kind | Where it comes from today | After the change |
 |---|---|---|
-| `Accepted` | the ingress | `Accepted`, from the ingress |
-| `Executed` | the ingress, from its receipt fan-in | the notifier derives it from `receipt` |
+| `Accepted` | the v2 sequencer, as its admission verdict on `tx_verdicts` (`v2/verdicts.rs:51`) | the client stage `accepted` comes from the ingress. The verdict stays on `tx_verdicts`. |
+| `Executed` | the notifier derives it from each receipt (`crates/notifier/src/taps.rs:44`) | the notifier derives `receipt` from `egress_receipts`, and `executed` from `tx_receipts` |
 
 ### 4.3 Copies, order and loss
 
 - **Copies.**
-  - Two sequencers race each transaction, so two `sent` events come.
-  - Three executors apply it, so three `executed` events come.
-  - Two egress instances publish each receipt, so two `receipt` events come.
+  - Two sequencers race each transaction, so two `sent` records come, and a drop can come twice
+    on `tx_drops`.
+  - Three executors apply it, so three receipts come on `tx_receipts` while the tap is on.
+  - Two egress instances publish each receipt on `egress_receipts`, so two copies come.
   - The notifier keeps the first event of each `(hash, stage)`. It drops the copies (the stage
     table of 4.4).
   - A copy of `Posted` or `Included` is dropped by `(batch_index, stage)`.
   - Clients already deduplicate by `tx_hash` plus stage.
-- **Order.** The topic has no order across publishers. `sent` can come before `accepted`, and
+- **Order.** The streams have no order across publishers. `sent` can come before `accepted`, and
   `receipt` before `executed`. A client must still see the stages in order. So the notifier
   applies these rules:
   - The order is `accepted` < `sent` < `executed` < `receipt` < `posted` < `included`.
@@ -206,24 +214,30 @@ removal of `tx_status` leaves no kind unmapped:
   - A late `executed` still sets its bit in `observed` and in `executors`. So the latency of a
     slow executor stays in section 6.
   - `dropped` implies `accepted` only. A sequencer can drop before it offers (`txpool_full`).
-  - A `Drop` reason is provisional, as `kardamom_getTransactionStatus` says today. A `receipt`
-    after it is emitted, after the stages before it that are not emitted yet.
-  - A `Rejected` reason is final. The sequencer does not order the transaction.
+  - A drop on `tx_drops` is provisional, as `kardamom_getTransactionStatus` says today. A
+    `receipt` after it is emitted, after the stages before it that are not emitted yet.
+  - A `rejected` record is final. The sequencer does not order the transaction.
   - The latencies of section 6 count only the stages that the notifier observed. They do not
     count the implied ones.
-- **Loss.** MDC offers are best effort, for example `NOT_CONNECTED` during a restart.
-  - `accepted`, `sent`, `dropped` and `executed` are hints. A lost one is not sent again.
-  - `receipt` must not be lost. A gap in the `seq` of an egress origin, or a new session of an
-    origin, starts the catch-up of 4.5.
-  - `posted` and `included` come from L1. After a gap, the notifier reads them again (Q3).
-- **Rollback.** `RolledBack { from_block }` revokes every `executed` and `receipt` at or above
-  `from_block`. The notifier sends a `rolled_back` event to each subscriber of an affected hash.
-  A client must treat `executed` and `receipt` as revocable until `posted`.
+- **Loss.** Every stage is best effort (decision 5). MDC offers can fail, for example with
+  `NOT_CONNECTED` during a restart, and a publisher drops a batch that it cannot offer (4.8).
+  - A lost `accepted`, `sent`, `dropped`, `executed`, `posted` or `included` is not sent again.
+  - A lost `receipt` has a catch-up that is best effort and capped (4.5). A receipt that the
+    catch-up misses is not pushed. The client can still read it from the egress.
+  - The notifier counts each gap that it sees: a jump in the `seq` of a hot frame, and a new or
+    a lost image of a publisher (`kardamom_notifier_event_gaps_total{origin}`).
+- **Rollback.** A rollback frame of `egress_receipts` revokes every `executed` and `receipt` at or
+  above its block. The notifier sends a `rolled_back` event to each subscriber of an affected
+  hash. A client must treat `executed` and `receipt` as revocable until `posted`.
 
 ### 4.4 The notifier
 
-- It reads only `tx_events`. The taps on `tx_status`, `tx_receipts`, `egress_receipts` and
-  `tx_errors` go in step 7 of section 7.
+- **Its inputs.**
+  - `tx_events`: `accepted`, `sent`, `rejected`, `posted` and `included`.
+  - `egress_receipts`: `receipt`, and the rollback frames. The tap exists today.
+  - `tx_drops`: `dropped`. The egress already reads this stream (`crates/egress/src/main.rs:179`).
+  - `tx_receipts` of every executor: `executed`, only with `KARDAMOM_NOTIFIER_EXECUTED=on` (Q7).
+  - The taps on `tx_status` and `tx_errors` go in step 8 of section 7.
 - **The stage table.** Each instance has one fixed table. It allocates the table at the start,
   with the size of the ring (250,000 entries on the notifier nodes). The table holds no `Vec`,
   no `String` and no box. The event path allocates nothing for a hash that no client follows.
@@ -242,7 +256,8 @@ removal of `tx_status` leaves no kind unmapped:
   - The table uses open addressing on the first 8 bytes of the hash, with a bounded probe.
   - A full probe overwrites its oldest entry, the one with the smallest `accepted_ms`.
   - A hash older than the table gets `posted` only through a status query (4.5).
-  - The batch decode reads the archived rkyv bytes in place. It does not copy each event.
+  - The decode reads the hot frames and the archived rkyv receipts in place. It does not copy
+    each event.
   - A rollback clears the `executed` and `receipt` bits and `executors` of each entry at or above
     `from_block`. It sets `block` to 0. Then the new receipt after the rollback is emitted again.
   - One thread owns the table: the ingest thread of the notifier. No lock is necessary.
@@ -251,10 +266,10 @@ removal of `tx_status` leaves no kind unmapped:
 - **The load.**
   - The measure on staging is about 0.2 core for each 1,000 tx/s, today, with every instance
     reading every event.
-  - With the executor events, about 11 events come in for each transaction before the copies
-    are dropped: 1 accepted, 2 sent, 3 executed, 2 receipts, and the batch events.
-  - So 10,000 tx/s needs about 3 to 4 cores of decode. Without the executor events, it needs
-    about half that.
+  - About 5 events come in for each transaction before the copies are dropped: 1 accepted, 2
+    sent and 2 receipts. The hot records cost almost nothing to read; the receipts cost most.
+  - The executor tap adds 3 full receipts for each transaction. So 10,000 tx/s needs about 2
+    cores of decode without the tap, and about twice that with it.
   - The shards of P5 (section 9) split that work. Q4 holds the step after them.
 - **The shards (P5).**
   - Each instance reads every batch.
@@ -289,12 +304,22 @@ removal of `tx_status` leaves no kind unmapped:
   - When `from` is below the oldest receipt of the index, it answers `410` with the position of
     the oldest receipt that it holds.
   - The index keeps the newest `KARDAMOM_EGRESS_RECEIPTS` receipts (1,000,000 by default).
-- **The catch-up of the notifier.** After a gap of an egress origin, the notifier reads
-  `/v1/receipts` from the newest position that it took.
+- **The catch-up of the notifier.** It is best effort and capped (decision 5). A loss is
+  acceptable.
+  - A gap is a new or a lost image of an egress publisher on `egress_receipts`, or a jump in the
+    block of its receipts.
+  - After a gap, the notifier reads `/v1/receipts` from the position of the newest receipt that
+    it took. Each receipt carries its position (`BPosition`).
+  - The cap: one request each second for each notifier instance, and at most 4,096 receipts or
+    1 MiB in each answer. A larger gap takes more seconds, or stays a gap.
   - On a `410`, the gap is older than the index. The notifier then asks
-    `eth_getTransactionReceipt` for each followed hash of its table that has no `receipt` bit. A
-    hash that no client follows gets nothing.
+    `eth_getTransactionReceipt` for each followed hash of its table that has no `receipt` bit,
+    with at most 64 reads in flight. A hash that no client follows gets nothing.
   - It counts both cases (`kardamom_notifier_catchup_receipts_total{source}`).
+  - **The cost on the egress owner thread.** One request is one `Input` to the owner, and one
+    copy of at most 4,096 entries of the receipt index. That is less than 1 ms, once each second
+    for each notifier instance. So it adds less than 0.1 % to the owner thread, and nothing while
+    the stream has no gap.
 - **The second endpoint.** The edge load balancer serves one JSON-RPC port, so it cannot send one
   method to another backend. So the egress reads get their own endpoint: a separate host or port
   on the load balancer, with the egress instances as targets (P8). Each client of 3.1 learns that
@@ -319,23 +344,38 @@ removal of `tx_status` leaves no kind unmapped:
   - The admission ack (`AckMode::Admission`, on the `tx_verdicts` of the v2 loop) waits for no
     receipt, and has no job variable. This spec does not change it.
 - **No cluster tap.** No "sealed", no `tx_status`, no `kardamom_ingress_cluster_*` gauges.
-- **The halt status from `tx_events`.**
-  - Each sequencer publishes each status frame of its cluster session as `ChainStatus`. The
-    status frame does not reach the egress: `exec_frames` carries only the kinds 1 and 2
-    (`crates/engine/src/reader/tee.rs:62-63`).
+- **The halt status from `chain_status`.**
+  - Each sequencer publishes each status frame of its cluster session as `ChainStatus` on
+    `chain_status`. The status frame does not reach the egress: `exec_frames` carries only the
+    kinds 1 and 2 (`crates/engine/src/reader/tee.rs:62-63`).
   - Both twins publish, so each status comes twice. The ingress keeps the status with the higher
     `sealed_head`. At an equal `sealed_head`, it keeps the one that came last.
-  - `chain.rs` keeps its rules of 3.2 on these statuses, with the same budgets. A `ChainStatus`
-    is a status for the silence rule: no `ChainStatus` for 10 s, or for 60 s after one with the
-    snapshot notice, raises `sealer_no_quorum`, and the ingress pauses the submits. The next
-    `ChainStatus` ends it.
-  - So a gap of both sequencers pauses the submits after 10 s, as a lost quorum does today. With
-    both sequencers down, no submit can land anyway.
-  - The sequencer forwards every status frame, not only the ones with the snapshot notice. That
-    is one event each 2 s for each twin.
-  - The `ChainStatus` events go on their own stream, `chain_status`, with the sequencers as its
-    only publishers. So the ingress does not read `tx_events`, and its hot node decodes no
-    batch of the other publishers. The rate is one frame each 2 s for each twin.
+  - The rate is one frame each 2 s for each twin. The ingress does not read `tx_events`.
+  - **The ingress halts only on an explicit halt in a status.** `record_lag` while a status says
+    that the record-lag guard refuses, `da_lag` while a status says that the DA-lag guard
+    refuses (3.2).
+  - **A silence of `chain_status` does not halt.** This replaces the silence rule of `chain.rs`
+    (`check_silence`, with `SEALER_SILENCE` of 10 s and `SNAPSHOT_SILENCE` of 60 s, raising
+    `sealer_no_quorum`). `chain_status` is best effort (decision 5), so its silence is not proof
+    of a lost quorum, and a best-effort stream must not stop admission.
+  - **Why this is safe.** Without a quorum, the chain already refuses:
+    - The sealer commits nothing, so no transaction is ordered or executed.
+    - The sequencer's offer to the cluster fails with back-pressure, also while its cluster
+      session reconnects (`crates/sequencer/src/sequencer.rs:1147`). It keeps the references,
+      notes a publish stall for its resync, and its pending pool is bounded.
+    - An offer that a leader without a quorum takes gets no receipt. Its reference passes the
+      confirm timeout of 15 s (`crates/sequencer/src/resync/mod.rs:162`), and the sequencer
+      offers it again. The window of the sealer drops a copy that did commit.
+    - So the client sees `accepted`, then `dropped` (`txpool_full` or `expired`, on `tx_drops`),
+      or the `receipt` after the quorum comes back.
+    - The record-lag and DA-lag guards are in the sealer too (`onRefRefused` in
+      `SealerClusteredService.java`). The ingress halt is only an early refusal: it saves a
+      client a later drop.
+  - The one cost: while the quorum is lost and the statuses do not come, the ingress keeps its
+    `validated` ack for transactions that then drop. The alert on
+    `kardamom_ingress_chain_status_age_seconds` (section 6) tells the operator.
+  - The rule of `chain.rs` on the executors (every live executor halted pauses the submits) does
+    not change.
 
 ### 4.7 The egress nodes
 
@@ -356,6 +396,68 @@ removal of `tx_status` leaves no kind unmapped:
 
   With two instances, one always serves.
 
+### 4.8 The hot path budget
+
+Decisions 5 and 6 bind every publisher of `tx_events` and `chain_status`.
+
+**The publish path of `accepted` and `sent`.**
+
+- Each publisher keeps one buffer for each kind, allocated at its start: a 16-byte header and
+  room for 1,024 records.
+- For each event it copies the 32-byte hash (and the lane for `sent`) into the next record. No
+  allocation, no encode, no hash computation: the hash is already there.
+- It offers the frame once for each poll cycle, or at once when the buffer is full. The offer is
+  non-blocking (`try_claim` or `offer` on the publication).
+- On back-pressure or `NOT_CONNECTED`, it drops the frame and counts it
+  (`kardamom_tx_events_dropped_total{origin}`). It never waits, and never retries.
+- It then clears the count and moves `seq` on, so a drop shows as a gap to the notifier.
+
+**Where the append and the offer go.**
+
+- **The ingress.** `submit_raw` (`crates/ingress/src/proxy/submit.rs:53`) publishes each
+  transaction from its own request task, in `offer` (`submit.rs:441`), through `publish_tx_data`
+  (`:451`, `LiveIngressPublication::publish_tx_data` in `crates/ingress/src/aeron_adapters.rs:75`).
+  The ingress has no poll cycle. So:
+  - After `publish_tx_data` succeeds, the task pushes the hash into a bounded queue with no
+    lock, allocated at the start (`try_push`). On a full queue it drops the hash and counts it.
+  - One task drains the queue each 1 ms into the frame buffer, and offers the frame.
+  - The request task does one copy and one atomic operation for each transaction.
+- **The sequencer, v1.** `Sequencer::record_one_published` (`crates/sequencer/src/sequencer.rs:583`)
+  publishes `TxStatus::offered` for each reference today. It appends a `sent` record instead.
+  `run_once` (`sequencer.rs:840`) offers the frame at the end of the cycle.
+- **The sequencer, v2.** `flush` (`crates/sequencer/src/v2/mod.rs:496`) publishes
+  `TxStatus::offered` for each candidate today (`:510`). It appends a `sent` record instead.
+  `run_once` (`v2/mod.rs:255`) offers the frame at the end of the cycle.
+- So for the sequencer, the change takes work away from the hot path: today it encodes and
+  offers one `TxStatus` for each transaction (`publish_best_effort`,
+  `crates/sequencer/src/outbound.rs:203`).
+- **The batcher** publishes once for each batch, off the hot path.
+
+**The taps of the notifier add no work to the publisher threads.** The notifier reads
+`egress_receipts` already. Its taps of `tx_drops` and of `tx_receipts` add one subscriber to
+those publications. The media driver of the publisher then sends each frame to one more
+destination. That costs bandwidth on the driver thread, not time on the service thread. For
+`tx_receipts` it is three full receipts for each transaction, so that tap stays behind its
+switch (Q7), and the A/B ramp measures it.
+
+**The proof.**
+
+- **Allocation tests.** The repository profiles the hot paths with DHAT:
+  `crates/sequencer/tests/alloc_profile.rs` (the `run_once` loop) and
+  `crates/bench/tests/alloc_profile_ingress.rs` (`submit_raw`). Each gets a case with
+  `KARDAMOM_TX_EVENTS` on. It asserts zero extra allocations for each transaction against the
+  case with the switch off.
+- **A micro-benchmark** of the append and the frame offer, next to
+  `crates/sequencer/benches/throughput.rs` and `v2_loop.rs`: the cost for each event, in ns.
+- **A staging A/B ramp.** The same ramp with `KARDAMOM_TX_EVENTS` off, then on. The budget:
+  - below 1 % more CPU on the ingress and on the sequencer at each step;
+  - no change in the p99 of the stage latencies (the ingress execute latency, and the load tool
+    p99), within the noise of two runs with the switch off.
+- **The failure test.** An e2e case: the notifier is down, or its subscriptions are gone. The
+  chain keeps its rate. Only `kardamom_tx_events_dropped_total` moves: a publication with no
+  subscriber answers `NOT_CONNECTED`. The same case stops the sequencers' `chain_status`, and
+  the ingress keeps its admission.
+
 ## 5. What this removes
 
 - **The ingress:**
@@ -366,9 +468,13 @@ removal of `tx_status` leaves no kind unmapped:
   - the cluster tap and its thread, the `Sealed` publish on `tx_status`, and the record-lag
     gauges and the `kardamom_ingress_cluster_*` gauges of the tap;
   - their tests and flags.
-- **The notifier:** its receipt source switch (`--receipts-from-egress`, the executor fan-in).
+- **The ingress halt on silence:** the silence rule of `chain.rs` (`check_silence`, the use of
+  `SEALER_SILENCE` and `SNAPSHOT_SILENCE` by the ingress) and its `sealer_no_quorum` halt (4.6).
+- **The notifier:** its receipt source switch (`--receipts-from-egress`). It reads
+  `egress_receipts` always, and `tx_receipts` only behind `KARDAMOM_NOTIFIER_EXECUTED`.
 - **The streams:**
-  - `tx_status`, after the sequencers publish `Sent` and `Dropped` (4.2);
+  - `tx_status`, after the sequencers publish `sent` and `rejected` records (4.2). With it goes
+    the `TxStatus` `Offered` publish of each transaction in the sequencer;
   - `tx_errors` for the notifier. The ingress reads `tx_errors` only for the receipt ack
     (`crates/ingress/src/proxy/watchers.rs`), so it goes with that ack (Q6).
 - **The switches:** `KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS` (job variable
@@ -389,17 +495,21 @@ removal of `tx_status` leaves no kind unmapped:
 ## 6. Observability
 
 - `kardamom_notifier_stage_latency_seconds{stage}`: the time from the first `accepted` of a hash
-  to the first event of each later stage, on the clock of the notifier.
-- `kardamom_notifier_executed_latency_seconds{executor}`: the time from `accepted` to the
-  `executed` of each executor. So a slow executor shows.
+  to the first observed event of each later stage, on the clock of the notifier. The stages come
+  from several taps: `accepted` and `sent` from `tx_events`, `dropped` from `tx_drops`,
+  `executed` from `tx_receipts`, `receipt` from `egress_receipts`, `posted` and `included` from
+  `tx_events`. So each latency includes the transport of its stream to the notifier.
+- `kardamom_notifier_executed_latency_seconds{executor}`: the time from `accepted` to the receipt
+  of each executor on `tx_receipts`. So a slow executor shows. Only with the executor tap on.
 - `kardamom_notifier_merge_latency_seconds`: the time from the first `executed` to the first
-  `receipt`: the cost of the hop to the egress and its merge.
-- `kardamom_tx_events_published_total{origin}` and `kardamom_tx_events_dropped_total{origin}` on
-  each publisher.
+  `receipt`: the cost of the hop to the egress and its merge. Only with the executor tap on.
+- `kardamom_tx_events_published_total{origin,kind}` and
+  `kardamom_tx_events_dropped_total{origin,kind}` on each publisher. A drop of the ingress queue
+  counts here too.
 - `kardamom_notifier_event_gaps_total{origin}` and
   `kardamom_notifier_catchup_receipts_total{source}`.
 - `kardamom_ingress_chain_status_age_seconds`: the time since the last `ChainStatus` that the
-  ingress took.
+  ingress took. An alert fires above 30 s. It does not halt (4.6).
 - The canary reads its stages from the notifier feed. The performance dashboard takes the
   notifier stage latencies in place of the ingress seal latency.
 
@@ -411,39 +521,44 @@ transaction and a feature flag. Each step has a switch, off by default.
 1. **Measure.** Ramp with the current layout. Record the egress CPU and memory
    (`nomad alloc status -stats`) and the notifier CPU on notifier-0. This sizes 4.4 and 4.7.
 2. **The egress nodes.** P1, then P2 with `KARDAMOM_EGRESS_NODES=on`, then the move of 4.7.
-3. **The publishers.** `KARDAMOM_TX_EVENTS=on` adds the `tx_events` publications in the ingress,
-   the sequencer, the egress and the batcher. `KARDAMOM_TX_EVENTS_EXECUTORS=on` adds the
-   `executed` events of the executors. The old streams stay.
-4. **The notifier reads both.** `KARDAMOM_NOTIFIER_EVENTS=on`: the notifier takes `tx_events`. It
-   ignores the old streams for the stages that `tx_events` carries. Compare the two on the canary
-   for a day.
-5. **The ingress halt from `tx_events`.** `KARDAMOM_INGRESS_CHAIN_STATUS=events`: the ingress takes
-   its status from `ChainStatus`. The tap stays, and compares its status with the events. Then
-   the tap stops publishing `Sealed`.
-6. **The clients.** P6, P7 and P8: the receipt feed on the notifier, the egress reads, the second
+3. **The publishers.** `KARDAMOM_TX_EVENTS=on` adds the `tx_events` publications of the ingress,
+   the sequencer and the batcher, and `chain_status`. The sequencer keeps its `TxStatus`
+   publishes until step 8. The old streams stay.
+4. **The A/B ramp of 4.8.** The same ramp with `KARDAMOM_TX_EVENTS` off and on. The step passes
+   only inside the budget of 4.8.
+5. **The notifier reads both.** `KARDAMOM_NOTIFIER_EVENTS=on`: the notifier takes `tx_events` and
+   its taps. It ignores the old streams for the stages that the new inputs carry. Compare the two
+   on the canary for a day. `KARDAMOM_NOTIFIER_EXECUTED=on` adds the executor tap for the
+   evaluation of Q7.
+6. **The ingress halt from `chain_status`.** `KARDAMOM_INGRESS_CHAIN_STATUS=events`: the ingress
+   takes its explicit halts from `ChainStatus`, with no silence rule. The tap stays, and compares
+   its status with the events. Then the tap stops publishing `Sealed`.
+7. **The clients.** P6, P7 and P8: the receipt feed on the notifier, the egress reads, the second
    endpoint, the clients of 3.1, the canary and the e2e scenario. The ack default becomes
    `validated` on every network.
-7. **The removals** of section 5 (P9). This step is one way: only a deploy of the release before
-   undoes it. So it comes last, after a week on staging, after steps 1 to 6.
+8. **The removals** of section 5 (P9). This step is one way: only a deploy of the release before
+   undoes it. So it comes last, after a week on staging, after steps 1 to 7.
 
 ## 8. Open questions, with the recommended answer
 
 - **Q1. The source of the `ClusterStatus` for the ingress halt.** Answered in revision 2: the
   sequencer, as `ChainStatus` on the stream `chain_status` (4.6). The egress does not see the status frames.
-- **Q2. The catch-up of `receipt`.** Answered in revision 2: the `seq` of each origin, and
-  `GET /v1/receipts` on the egress (4.5).
+- **Q2. The catch-up of `receipt`.** Answered in revision 4: a new or a lost image, or a jump in
+  the block, starts a capped, best-effort read of `GET /v1/receipts` on the egress (4.5).
 - **Q3. The catch-up of `posted`.** Recommended: the notifier reads the batcher's posted cursor at
   the start and after a gap, from the L1 `BatchPosted` logs through the L1 indexer.
 - **Q4. Notifier scale past one decode for each instance.** Recommended: later, a topic for each
   shard. The publishers then split their batches by the shard of the hash. Not in this change.
 - **Q5. The receipt ack and the ack policies go.** Recommended: yes (4.6). Staging and the load
   tests use `--ack validated`, and the push of `receipt` gives a client the same certainty sooner.
-- **Q6. `tx_errors`.** Recommended: the `Dropped` events cover the client side. The ingress reads
+- **Q6. `tx_errors`.** Recommended: the `dropped` and `rejected` events cover the client side. The ingress reads
   `tx_errors` only for the receipt ack, so it goes with Q5.
-- **Q7. The executor events after the evaluation.** Recommended: keep the switch. Decide from the
-  two latencies of section 6. If the merge latency stays below 1 ms at the peak, turn the
-  executor events off, and keep `receipt` only. If a client needs the earliest signal, keep them,
-  and send only the first executor copy to the clients.
+- **Q7. The executor tap after the evaluation.** Recommended: keep the switch
+  `KARDAMOM_NOTIFIER_EXECUTED`, off by default. Turn it on for the evaluation. Decide from the two
+  latencies of section 6 and from the driver bandwidth that the A/B ramp measures on the executor
+  nodes. If the merge latency stays below 1 ms at the peak, turn the tap off, and keep `receipt`
+  only. If a client needs the earliest signal, keep it, and send only the first executor copy to
+  the clients.
 - **Q8. io_uring in the notifier.** It does not replace the stage table: the table is memory
   state, and io_uring is a way to submit I/O. It can serve the output side: the WebSocket sends,
   the webhook posts, and the outbox and cursor writes with their syncs. The `tx_events` ingest
@@ -459,11 +574,11 @@ Each PR merges alone. Each new path is behind a switch that is off by default, u
 |---|---|---|---|
 | P1 | kardamom-infra | the egress nodes | none |
 | P2 | kardamom | `KARDAMOM_EGRESS_NODES` and the constraint `role=egress`, the README move steps | none (off by default); the move needs P1 |
-| P3 | kardamom | the `tx_events` format and codec, the publishers (the executors included), the `chain_status` stream, `KARDAMOM_TX_EVENTS` and `KARDAMOM_TX_EVENTS_EXECUTORS` | none |
-| P4 | kardamom | the notifier on `tx_events`: the stage table with its bitmaps, the copies, the implied stages, the rollback, the stage metrics, `KARDAMOM_NOTIFIER_EVENTS` | P3 |
+| P3 | kardamom | the `tx_events` hot frame and the batcher frame, with their formats and golden tests; the publishers of the ingress, the sequencer and the batcher; the `chain_status` stream; `KARDAMOM_TX_EVENTS`; the allocation cases and the micro-benchmark of 4.8; the e2e failure case with the notifier down | none |
+| P4 | kardamom | the notifier on `tx_events` and its taps (`egress_receipts` with the rollback frames, `tx_drops`, and `tx_receipts` behind `KARDAMOM_NOTIFIER_EXECUTED`): the stage table with its bitmaps, the copies, the implied stages, the rollback, the gaps, the stage metrics, `KARDAMOM_NOTIFIER_EVENTS` | P3 |
 | P5 | kardamom | the shards of the notifier (4.4) | P4 |
-| P6 | kardamom | the ingress halt from `ChainStatus` (`KARDAMOM_INGRESS_CHAIN_STATUS`), the e2e scenario on `tx_events`, the dashboard panels | P3 |
-| P7 | kardamom | the receipt feed on the notifier; the egress short wait, the fallback and `/v1/receipts`; the notifier catch-up; the receipt endpoint flag of the canary, the chaos suite, the e2e harness and the load tool | P4 |
+| P6 | kardamom | the ingress halt from the explicit halts of `ChainStatus`, with no silence rule (`KARDAMOM_INGRESS_CHAIN_STATUS`), the age gauge and its alert, the e2e scenario on `tx_events`, the dashboard panels | P3 |
+| P7 | kardamom | the receipt feed on the notifier; the egress short wait, the fallback and `/v1/receipts`; the capped notifier catch-up; the receipt endpoint flag of the canary, the chaos suite, the e2e harness and the load tool | P4 |
 | P8 | kardamom-infra | the second endpoint for the egress reads, and the infra variables of the new switches | P7 |
 | P9 | kardamom | the removals of section 5, the ack default `validated`, `docs/specs/egress-node-spec.md` marked superseded, the docs | P6, P7, P8 on staging for a week |
 
@@ -484,3 +599,18 @@ Each PR merges alone. Each new path is behind a switch that is off by default, u
 | 11 (minor). STE in 4.3 and 4.4 | 4.3 and 4.4: short sentences in lists, one instruction in each. |
 | Revision 2 review, note 1. `TxStatus` `Accepted` and `Executed` | 4.2: a second table maps them. |
 | Revision 2 review, note 2. The ingress decodes `tx_events` for `ChainStatus` | 4.1, 4.2, 4.6, P3: `ChainStatus` goes on its own stream `chain_status`, with the sequencers as its only publishers. |
+
+### 10.1 Changes from revision 3
+
+The user's rules of 2026-10-25: "the notifier publication is best effort. It shouldn't ever halt
+the chain", and "we should ensure this has a negligible impact on the hot path".
+
+| Change | Where |
+|---|---|
+| The two rules are decisions 5 and 6. | 1 |
+| The ingress halts only on an explicit halt of a `ChainStatus` (record lag, DA lag). A silence of `chain_status` does not halt. This replaces the silence rule of `chain.rs` (`check_silence`, `SEALER_SILENCE`, `SNAPSHOT_SILENCE`). The safety: without a quorum the sealer commits nothing, and the sequencer back-pressures and drops. | 4.6, 5, 6 (the age alert), 7 step 6, P6 |
+| No new work on the hot services for the stages that existing streams carry: the notifier taps `egress_receipts` (with the rollback frames) for `receipt`, `tx_receipts` for `executed` (behind `KARDAMOM_NOTIFIER_EXECUTED`), and `tx_drops` for `dropped`. The executors and the egress publish nothing new. `tx_events` carries only `accepted`, `sent`, `rejected`, `posted` and `included`. | 1, 4.1, 4.2, 4.3, 4.4, 6, 7, Q7, P3, P4 |
+| The receipt catch-up is best effort and capped: one request each second for each notifier instance, at most 4,096 receipts or 1 MiB, and 64 lookups in flight after a `410`. A loss is acceptable. The cost on the egress owner thread is less than 1 ms each second. | 4.3, 4.5, Q2, P7 |
+| A hot path budget: a fixed-layout frame, an append with no allocation and no encode, one non-blocking offer for each cycle, a drop on back-pressure. The places in the ingress and the sequencer. The proof: the DHAT allocation cases, a micro-benchmark, a staging A/B ramp (below 1 % CPU, no p99 change), and an e2e case with the notifier down. | 4.8, 7 step 4, P3 |
+| The sequencer `sent` record replaces its `TxStatus` `Offered` publish of each transaction, so the sequencer hot path does less work than today. | 4.2, 4.8, 5 |
+| A fix of revision 3: the `TxStatus` kind `Accepted` comes from the v2 sequencer verdict on `tx_verdicts`, not from the ingress, and `Executed` is derived by the notifier from the receipts. | 4.2 |
