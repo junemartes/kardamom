@@ -1194,7 +1194,10 @@ class DeployTest(Deploys):
         # so a step of the move holds the group of the executor nodes too.
         executor = plans['executor']
         self.assertIsNone(executor['Constraints'])
-        peers = ','.join(f'sealer-{i}.node.dc1.consul:9014' for i in range(3))
+        # The executor nodes stay peers: the first executor that moves has
+        # no state, and only the executors there hold a checkpoint.
+        peers = ','.join([f'sealer-{i}.node.dc1.consul:9014' for i in range(3)]
+                         + [f'executor-{i}.node.dc1.consul:9014' for i in range(3)])
         for i, group in enumerate(executor['TaskGroups']):
             self.assertEqual((group['Name'], group['Count']), (f'executor-{i}', 1))
             self.assertEqual(group['Constraints'],
