@@ -18,13 +18,14 @@ mod feeds;
 use std::num::NonZeroU32;
 
 use anyhow::{Context, Result};
-use args::Args;
+use args::{Args, TxEventsArg};
 use clap::Parser;
 use feeds::{LaneSub, LaneSubscriptions, PublishLoops};
 use kardamom_cluster_adapter::LiveCluster;
 use kardamom_log::aeron_live::{
     AeronRuntime, ServiceEventsPublisherHandle, TxDepositsSubscriberHandle, TxDropsPublisherHandle,
-    TxErrorsPublisherHandle, TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle,
+    TxErrorsPublisherHandle, TxEventsPublisherHandle, TxEventsSink, TxRemoteEpochsSubscriberHandle,
+    TxStatusPublisherHandle,
 };
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
@@ -32,6 +33,7 @@ use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::fees::FeeGate;
 use kardamom_sequencer::lookup::LookupRequester;
+use kardamom_sequencer::outbound::SideChannels;
 use kardamom_sequencer::sealer_rules::{SealerRules, SealerVersion};
 use kardamom_sequencer::sequencer::Shutdown;
 
@@ -45,10 +47,29 @@ struct Handles {
     data_subs: LaneSubscriptions,
     deposits_sub: TxDepositsSubscriberHandle,
     remote_epochs_sub: TxRemoteEpochsSubscriberHandle,
+    side: SideHandles,
+}
+
+/// The publications of the side channels of the publish loop.
+struct SideHandles {
     errors_pub: TxErrorsPublisherHandle,
     status_pub: TxStatusPublisherHandle,
     /// The drops of the own lane, for the status that the egress serves.
     drops_pub: TxDropsPublisherHandle,
+    /// The `tx_events` publication, with `KARDAMOM_TX_EVENTS=on`.
+    events: Option<TxEventsPublisherHandle>,
+}
+
+impl SideHandles {
+    /// The side channels of the publish loop, with the `sent` records of
+    /// `lane` on `tx_events` for `origin` when the stream is open.
+    fn into_channels(self, origin: u16, lane: u8) -> SideChannels {
+        let side = SideChannels::new(self.errors_pub, self.status_pub, self.drops_pub);
+        match self.events {
+            Some(publisher) => side.with_tx_events(TxEventsSink::new(publisher, origin), lane),
+            None => side,
+        }
+    }
 }
 
 impl Handles {
@@ -59,6 +80,7 @@ impl Handles {
         rt: &AeronRuntime,
         plane: &mut StreamPlane,
         cfg: &SequencerConfig,
+        tx_events: bool,
     ) -> Result<Self> {
         let own = Self::open_lane(rt, plane, cfg.lane())?;
         let old = cfg
@@ -74,18 +96,30 @@ impl Handles {
             remote_epochs_sub: plane
                 .subscriber::<TxRemoteEpochsSubscriberHandle>(rt)
                 .context("open TxRemoteEpochsSubscriberHandle")?,
-            errors_pub: plane
-                .publisher::<TxErrorsPublisherHandle>(rt)
-                .await
-                .context("open TxErrorsPublisherHandle")?,
-            status_pub: plane
-                .publisher::<TxStatusPublisherHandle>(rt)
-                .await
-                .context("open TxStatusPublisherHandle")?,
-            drops_pub: plane
-                .tx_drops_publisher(rt, cfg.lane())
-                .await
-                .context("open TxDropsPublisherHandle")?,
+            side: SideHandles {
+                errors_pub: plane
+                    .publisher::<TxErrorsPublisherHandle>(rt)
+                    .await
+                    .context("open TxErrorsPublisherHandle")?,
+                status_pub: plane
+                    .publisher::<TxStatusPublisherHandle>(rt)
+                    .await
+                    .context("open TxStatusPublisherHandle")?,
+                drops_pub: plane
+                    .tx_drops_publisher(rt, cfg.lane())
+                    .await
+                    .context("open TxDropsPublisherHandle")?,
+                events: if tx_events {
+                    Some(
+                        plane
+                            .publisher::<TxEventsPublisherHandle>(rt)
+                            .await
+                            .context("open TxEventsPublisherHandle")?,
+                    )
+                } else {
+                    None
+                },
+            },
         })
     }
 
@@ -539,7 +573,7 @@ async fn main() -> anyhow::Result<()> {
     let mut plane = StreamPlane::from_config(&log_cfg, &format!("sequencer-{}", cfg.lane()))
         .context("build the stream plane")?;
 
-    let handles = Handles::open(&rt, &mut plane, &cfg).await?;
+    let handles = Handles::open(&rt, &mut plane, &cfg, args.tx_events == TxEventsArg::On).await?;
     spawn_events_beacon(&mut plane, &rt).await?;
 
     let shutdown = Shutdown::new();
@@ -584,7 +618,7 @@ async fn main() -> anyhow::Result<()> {
         rules: SealerRules::new(
             cfg.partition_index,
             sealer_version.clone(),
-            handles.drops_pub.clone(),
+            handles.side.drops_pub.clone(),
         ),
     };
     let mut resync = ResyncWiring::spawn(
@@ -608,11 +642,9 @@ async fn main() -> anyhow::Result<()> {
         main_pub: cluster_pub.clone(),
         epoch_pub: cluster_pub.clone(),
         remote_epoch_pub: cluster_pub,
-        side: kardamom_sequencer::outbound::SideChannels::new(
-            handles.errors_pub,
-            handles.status_pub,
-            handles.drops_pub,
-        ),
+        side: handles
+            .side
+            .into_channels(args.tx_events_origin(cfg.lane()), cfg.lane()),
         epochs: handles.deposits_sub,
         epoch_lane: resync.epoch_lane,
         remote_epochs: handles.remote_epochs_sub,

@@ -596,6 +596,7 @@ impl Sequencer {
             "published ref"
         );
         rc.publish_status(TxStatus::offered(meta.tx_hash, sender, n));
+        rc.note_sent(&meta.tx_hash);
         self.state.clear_refused(sender, n);
         if self.resync.is_some() {
             self.unconfirmed.record_published(sender, n, meta);
@@ -841,6 +842,7 @@ impl Sequencer {
         // Resync bookkeeping runs first, every iteration. See `resync_tick`.
         self.resync_tick(ports);
         let (_, _, rc) = ports.split();
+        rc.flush_events();
         self.expiry_tick(rc);
         if self.pause.paused() {
             return Ok(false);

@@ -22,7 +22,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use kardamom_cache::{ExecutorQueryConfig, LiveAccountsConfig};
 use kardamom_log::aeron_live::{
-    AeronRuntime, ServiceEventsPublisherHandle, TxStatusPublisherHandle,
+    AeronRuntime, ServiceEventsPublisherHandle, TxEventsPublisherHandle, TxStatusPublisherHandle,
 };
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
@@ -35,12 +35,13 @@ use crate::cluster::cluster_watermark_observer;
 use crate::config::{AckMode, AdmissionAck, IngressConfig, IngressFileConfig};
 use crate::proxy::{IngressHandle, IngressProxy};
 use crate::stage_latency::{StageClock, StageClocks, StageStamps};
+use crate::tx_events::AcceptedQueue;
 use recorders::{
     spawn_discovered_tx_data_recorder, spawn_tx_data_recorders, wait_for_discovered_recorder,
     wait_for_recorders,
 };
-use settings::AckArg;
 pub use settings::IngressSettings;
+use settings::{AckArg, TxEventsArg};
 
 /// What [`IngressService::spawn_recorders`] returns: the threads, the
 /// per-lane readiness receivers of the static recorders, and the one
@@ -246,9 +247,16 @@ impl IngressService {
         // count). The proxy reads this only when MDS is enabled.
         let executor_count = self.executor_count();
 
-        let publication = LiveIngressPublication::open(&rt, &mut plane, LANE_PLANE, stamps)
+        let mut publication = LiveIngressPublication::open(&rt, &mut plane, LANE_PLANE, stamps)
             .await
             .context("open IngressPublication")?;
+        if args.tx_events == TxEventsArg::On {
+            let events = plane
+                .publisher::<TxEventsPublisherHandle>(&rt)
+                .await
+                .context("open TxEventsPublisherHandle")?;
+            publication = publication.with_accepted(AcceptedQueue::spawn(events, args.ingress_id));
+        }
 
         // This is the recorder barrier: with the tx_data publications now
         // open, every lane's recording can start.

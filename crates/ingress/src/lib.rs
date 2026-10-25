@@ -55,6 +55,7 @@ pub(crate) mod sync_util;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub(crate) mod tx_error_dedup;
+pub mod tx_events;
 
 pub use channels::{IngressPublication, IngressSubscription, MockChannels, ReceiptItem};
 pub use config::IngressConfig;

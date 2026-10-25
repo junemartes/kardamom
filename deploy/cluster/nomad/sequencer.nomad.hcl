@@ -128,6 +128,17 @@ variable "admission" {
     error_message = "The admission value must be on or off."
   }
 }
+# The tx_events stream (docs/specs/2026-10-25-client-events.md), "on" or
+# "off". On, the job publishes its client stage records on tx_events, best
+# effort. Ansible deployment passes -var from KARDAMOM_TX_EVENTS.
+variable "tx_events" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.tx_events)
+    error_message = "The tx_events value must be on or off."
+  }
+}
 variable "metrics_base" {
   type    = number
   default = 9001
@@ -301,6 +312,10 @@ job "sequencer" {
               "--shadow-vslots", join(",", group.value.incoming),
               ], var.sealer_version_floor == 0 ? [] : [
               "--sealer-version-floor", format("%d", var.sealer_version_floor),
+              ], var.tx_events == "off" ? [] : [
+              # The replica of the lane: the twins publish under two origins.
+              "--tx-events", var.tx_events,
+              "--tx-events-origin", "${NOMAD_ALLOC_INDEX}",
             ])
           }
 
