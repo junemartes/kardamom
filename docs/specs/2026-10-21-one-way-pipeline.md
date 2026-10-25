@@ -62,7 +62,10 @@ paths of today. This amendment removes them.
     `kardamom_blockNumberByTag` (with `safe` and `finalized`), `kardamom_chainStatus` and
     `kardamom_getTransactionStatus`.
     - The notifier serves the subscriptions (WebSocket), not the egress (user decision of
-      2026-10-25, resolving the conflict with #817). No webhooks for the new stage events for now.
+      2026-10-25, resolving the conflict with #817).
+    - The notifier has no webhooks for now (user decision of 2026-10-25). It is stateless: no
+      registrations, no outboxes, no delivery cursors, and no state copy when it moves. Webhooks
+      come back later through a task queue (for example SQS).
     - The load balancer sends the read methods to the egress. It sends only
       `eth_sendRawTransaction` and `kardamom_sendRawTransactionAsync` to the ingress.
     - The ingress has no read path and no receipt stream.
@@ -206,7 +209,7 @@ The consequences:
 | `safe`, `finalized` | The posted head from `l1_blocks` (#807). The L1 follower publishes only finalized L1 blocks (open question 1). |
 | `kardamom_chainStatus` | `posted_head` from `l1_blocks`. `sealed_head` becomes the head of the store, which lags the sealer by the executor delay. The halts come from the `events` stream. The sealer state comes from the age of the newest frame (open question 2). `da_lag_budget_blocks`, `best_recorded` and the `record_lag_*` fields go. |
 | `kardamom_getTransactionStatus` | The receipts and the drops, as built (section 10.4). |
-| `kardamom_subscribeReceipts`, `kardamom_subscribeTxStatus` | The notifier, fed by `egress_receipts` and the drop and refusal events (decisions 46 and 50, updated on 2026-10-25). No webhooks for the new stage events for now. |
+| `kardamom_subscribeReceipts`, `kardamom_subscribeTxStatus` | The notifier, fed by `egress_receipts` and the drop and refusal events (decisions 46 and 50, updated on 2026-10-25). The notifier has no webhooks for now and keeps no state. |
 | `eth_chainId` | A setting. |
 
 The load balancer must read the method of each request (open question 9).
