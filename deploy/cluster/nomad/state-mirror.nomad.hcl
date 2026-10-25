@@ -180,9 +180,15 @@ EOF
         }
       }
 
+      # A cold rebuild restores the newest executor checkpoint into
+      # /opt/kardamom/mirror/rebuild. The dirty pages of that copy count
+      # against the memory limit of the task, and a checkpoint of a loaded
+      # chain is several GB (3.6 GB on staging). A Redis restart makes
+      # every mirror rebuild cold at once, so the limit must hold a full
+      # restore, or each rebuild is killed for OOM and no mirror serves.
       resources {
         cpu    = 500
-        memory = 512
+        memory = 4096
       }
     }
   }

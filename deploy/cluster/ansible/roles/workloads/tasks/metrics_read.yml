@@ -10,8 +10,10 @@
 # sample that carries each of those labels.
 # The result is workloads_metrics_of[<job>]:
 # - groups: the task group of each running allocation;
+# - silent: the task group of each allocation whose page does not answer;
 # - one list for each gauge, in the order of groups. The value is -1 when
-#   the allocation does not answer or does not report the gauge.
+#   the allocation does not answer or does not report the gauge. A gate
+#   that must not pass a member without an answer also checks silent.
 # A job that Nomad does not know has no allocation. The tasks read only,
 # so they also run in check mode.
 - name: Read the allocations of {{ workloads_metrics_job }}
@@ -54,7 +56,9 @@
   ansible.builtin.set_fact:
     workloads_metrics_of: >-
       {{ workloads_metrics_of | default({}) | combine({workloads_metrics_job:
-           {'groups': workloads_metrics_pages.results | map(attribute='item.item.TaskGroup') | list}}) }}
+           {'groups': workloads_metrics_pages.results | map(attribute='item.item.TaskGroup') | list,
+            'silent': workloads_metrics_pages.results | rejectattr('status', 'equalto', 200)
+                        | map(attribute='item.item.TaskGroup') | list}}) }}
 
 - name: Keep each gauge of {{ workloads_metrics_job }}
   ansible.builtin.set_fact:

@@ -12,8 +12,11 @@ import io.kardamom.sealer.VersionSwitch;
 import io.kardamom.sealer.cluster.DriverlessLog.Entry;
 import io.kardamom.sealer.cluster.DriverlessLog.Member;
 import io.kardamom.sealer.cluster.DriverlessLog.Outcome;
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -70,7 +73,9 @@ class SealerCarryActivationTest {
         /** The boundary tick that seals the block of the epoch of the activation. */
         TIMER,
         /** The boundary that the next epoch forces. */
-        FORCED
+        FORCED,
+        /** The boundary that a remote-origin record forces. */
+        FORCED_REMOTE
     }
 
     /** The log of a test: frames and ticks, with the times, the ids and the positions that each entry takes. */
@@ -148,10 +153,11 @@ class SealerCarryActivationTest {
             .lag("lag", 3)
             .epoch("window-epoch", VersionSwitch.FEATURE_CARRY_WINDOW, 0L)
             .frame("ref-in-deposit-block", s.ref());
-        if (at == Switch.TIMER) {
-            s.tick("switch");
-        } else {
-            s.epoch("switch");
+        switch (at) {
+            case TIMER -> s.tick("switch");
+            case FORCED -> s.epoch("switch");
+            case FORCED_REMOTE -> s.frame("switch", IngressFrames.remoteOriginRecordFrame(
+                IngressFrames.canonicalId(2000), DriverlessLog.REMOTE_CHAIN, 1, 2, 0, 0, new byte[] {0x03}));
         }
         s.frame("ref-refused", s.ref()).frame("full-after", s.full())
             .frame("batch", FullRef.batch(s.ref(), s.full(), s.ref()))
@@ -190,6 +196,40 @@ class SealerCarryActivationTest {
     @Test
     void the_forced_boundary_turns_the_carry_window_on() {
         checkTheSwitch(Switch.FORCED, List.of(BOUNDARY, RELAYED));
+    }
+
+    @Test
+    void the_boundary_of_a_remote_origin_record_turns_the_carry_window_on() {
+        checkTheSwitch(Switch.FORCED_REMOTE, List.of(BOUNDARY, RELAYED));
+    }
+
+    /** Four refusals in one second of cluster time print one line, and the next second prints again. */
+    @Test
+    void the_refusal_log_prints_at_most_once_a_second() {
+        final List<Entry> entries = stream(Switch.TIMER);
+        final Member member = log.member(Optional.empty());
+        member.applyAll(entries.subList(0, at(entries, "switch") + 1));
+        final Script refs = new Script();
+        final long start = entries.get(at(entries, "switch")).timeMs();
+        final List<Entry> burst = IntStream.range(0, 5)
+            .mapToObj(i -> Entry.frame("burst-" + i, refs.ref(), start + (i < 4 ? 100L * (i + 1) : 2_000L)))
+            .toList();
+        final PrintStream out = System.out;
+        final ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        System.setOut(new PrintStream(captured, true, StandardCharsets.UTF_8));
+        final List<Outcome> outcomes;
+        try {
+            outcomes = member.applyAll(burst);
+        } finally {
+            System.setOut(out);
+        }
+        outcomes.forEach(o -> assertEquals(List.of(REFUSED), o.kinds(), o.name()));
+        final List<String> lines = captured.toString(StandardCharsets.UTF_8).lines()
+            .filter(line -> line.contains("cluster REF-REFUSED")).toList();
+        assertEquals(2, lines.size(), String.join("\n", lines));
+        assertTrue(lines.get(0).contains("total=1"), lines.get(0));
+        assertTrue(lines.get(1).contains("total=5"), lines.get(1));
+        assertEquals(5.0, PromText.value(member.metrics(), "kardamom_sealer_ref_refused_total", ""));
     }
 
     /**
@@ -274,7 +314,7 @@ class SealerCarryActivationTest {
     /** Three members apply the log: after each entry, their frames, retained frames and snapshots are equal. */
     @Test
     void every_member_has_the_same_bytes_after_each_entry() {
-        List.of(Switch.TIMER, Switch.FORCED).forEach(at -> {
+        List.of(Switch.values()).forEach(at -> {
             final List<Member> members = List.of(
                 log.member(Optional.empty()), log.member(Optional.empty()), log.member(Optional.empty()));
             stream(at).forEach(entry -> {
@@ -296,7 +336,7 @@ class SealerCarryActivationTest {
      */
     @Test
     void a_member_restored_at_any_entry_ends_with_the_bytes_of_its_peer() {
-        List.of(Switch.TIMER, Switch.FORCED).forEach(at -> {
+        List.of(Switch.values()).forEach(at -> {
             final List<Entry> entries = stream(at);
             IntStream.range(1, entries.size()).forEach(cut -> replayFrom(entries, cut, at));
         });
@@ -341,6 +381,8 @@ class SealerCarryActivationTest {
         assertArrayEquals(before, member.svc().snapshot());
         assertEquals(1.0, PromText.value(member.metrics(), "kardamom_sealer_feature_unsupported_total", ""));
         assertEquals("file", member.svc().metrics().carry().retainedStore());
+        assertEquals(1.0, PromText.value(member.metrics(), "kardamom_sealer_full_ref_below_v5_total", ""),
+            "full-in-v4 counts on a file member too");
         assertEquals(1.0, PromText.value(member.metrics(), "kardamom_sealer_retained_store", ""));
         final List<Outcome> rest = member.applyAll(entries.subList(activation + 1, entries.size()));
         assertFalse(carryWindow(member));

@@ -208,7 +208,8 @@
 
 # A member that holds an activation of feature 5 reports the gauge
 # kardamom_sealer_feature_state{feature="5"} at 1 (held, off) or 2 (on). A
-# member of an older release reports no such gauge, and holds none.
+# member of an older release reports no such gauge, and holds none. A
+# member whose page does not answer can hold it, so the guard refuses.
 - name: Read the state of feature 5 on every member
   ansible.builtin.include_tasks: metrics_read.yml
   vars:
@@ -221,12 +222,15 @@
 
 - name: Refuse feature 3 or 4 off while a member holds feature 5
   ansible.builtin.assert:
-    that: workloads_metrics_of.cluster['kardamom_sealer_feature_state{feature="5"}'] | select('ge', 1) | list | length == 0
+    that:
+      - workloads_metrics_of.cluster.silent | length == 0
+      - workloads_metrics_of.cluster['kardamom_sealer_feature_state{feature="5"}'] | select('ge', 1) | list | length == 0
     fail_msg: >-
       Refused: the upgrade transaction of feature {{ workloads_upgrade_feature }} with the activation time
-      "{{ workloads_upgrade_activation_ms }}" can turn decision version 5 off, and a member holds feature 5
+      "{{ workloads_upgrade_activation_ms }}" can turn decision version 5 off, and a member holds feature 5 or does not answer
       (kardamom_sealer_feature_state{feature="5"} of {{ workloads_metrics_of.cluster.groups }}:
-      {{ workloads_metrics_of.cluster['kardamom_sealer_feature_state{feature="5"}'] }}). Without version 5 the
+      {{ workloads_metrics_of.cluster['kardamom_sealer_feature_state{feature="5"}'] }}; members whose /metrics
+      does not answer: {{ workloads_metrics_of.cluster.silent }}). Without version 5 the
       rules of feature 5 stop, and a carry executor stops on the first reference. Turn feature 5 off first, and move
       the executors to reference mode (KARDAMOM_CARRY_EXECUTORS empty).
   when:

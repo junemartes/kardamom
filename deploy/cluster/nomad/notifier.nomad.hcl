@@ -1,5 +1,6 @@
 # kardamom-notifier: transaction status events for clients. Two
-# instances, one per ingress node, behind the edge load balancer. Each
+# instances behind the edge load balancer: one per ingress node, or with
+# notifier_nodes on, one per node of role notifier. Each
 # taps tx_status, tx_receipts and tx_errors itself (multi-destination
 # cast: a new reader costs the publishers nothing), keeps a ring of the
 # last minutes of events, and serves:
@@ -8,9 +9,9 @@
 #   - POST /webhooks on the same port, delivered at least once from a
 #     per-subscription outbox under /opt/kardamom/notifier.
 #
-# Webhook subscriptions are sharded across the two instances by a
+# Webhook subscriptions are sharded across the instances by a
 # rendezvous hash of the subscription id. A registration that lands on
-# either instance is stored on both (the peers list), so the other
+# one instance is stored on every instance (the peers list), so another
 # instance can take a shard over when the instance count changes.
 #
 # The edge forwards the client route to kardamom-notifier.service.consul
@@ -63,7 +64,8 @@ variable "executor_count" {
 # The ring: the last minutes of events a late subscriber can replay, and
 # a hard cap on their count. An event costs about 300 bytes with its
 # indexes, so one million events is about 300 MB; the cap, not the age,
-# bounds the memory under load.
+# bounds the memory under load. With notifier_nodes on, the placement
+# lowers the cap to fit the smaller memory reservation.
 variable "ring_minutes" {
   type        = number
   description = "How many minutes of status events the ring keeps."
@@ -96,22 +98,86 @@ variable "receipts_from_egress" {
   }
 }
 
+# The notifier on its own nodes, "on" or "off". Off, the notifier runs
+# one instance per ingress node. On, it runs notifier_count instances, one
+# per node whose role set holds notifier, with a smaller memory
+# reservation. The aeron job takes the same switch for the idle cap of
+# the driver on those nodes. Ansible deployment passes -var from
+# KARDAMOM_NOTIFIER_NODES.
+variable "notifier_nodes" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.notifier_nodes)
+    error_message = "The notifier_nodes value must be on or off."
+  }
+}
+
+# The instance count with notifier_nodes on: the count of the notifier
+# nodes, which are notifier-0 to notifier-<count - 1>. The first phase
+# has one notifier node. Ansible deployment passes -var from
+# KARDAMOM_NOTIFIER_COUNT, and its preflight refuses a count above the
+# count of the notifier nodes.
+variable "notifier_count" {
+  type        = number
+  description = "The notifier instance count with notifier_nodes on, one per notifier node."
+  default     = 1
+
+  validation {
+    condition     = var.notifier_count >= 1 && floor(var.notifier_count) == var.notifier_count
+    error_message = "The notifier count must be a whole number, at least 1."
+  }
+}
+
+# The placement of each value of notifier_nodes. The peers are the node
+# records of the nodes that run the instances: every node of the class
+# runs one instance (distinct_hosts), so the list is complete before any
+# instance starts.
+#
+# On a notifier node, the ring keeps at most 250,000 events: about 75 MB,
+# and about 50 seconds at the staging load-test peak of 5,100 events a
+# second (1,700 tx/s, three stages). With the process, the Aeron client
+# and the outboxes, the task stays in its 512 MB.
 locals {
-  peers = join(",", [for i in range(var.ingress_count) : "http://ingress-${i}.node.${var.datacenter}.consul:8547"])
+  placement = {
+    off = {
+      attribute  = "${meta.role}"
+      operator   = "="
+      value      = "ingress"
+      count      = 2
+      memory     = 1024
+      node_class = "ingress"
+      node_count = var.ingress_count
+      ring_max   = var.ring_max_events
+    }
+    on = {
+      attribute  = "${meta.roles}"
+      operator   = "set_contains"
+      value      = "notifier"
+      count      = var.notifier_count
+      memory     = 512
+      node_class = "notifier"
+      node_count = var.notifier_count
+      ring_max   = min(var.ring_max_events, 250000)
+    }
+  }[var.notifier_nodes]
+  peers = join(",", [for i in range(local.placement.node_count) : "http://${local.placement.node_class}-${i}.node.${var.datacenter}.consul:8547"])
 }
 
 job "notifier" {
   datacenters = [var.datacenter]
   type        = "service"
 
-  # One instance per ingress node, next to the front door it extends.
+  # One instance per node of the placement: an ingress node, next to the
+  # front door it extends, or a notifier node.
   constraint {
-    attribute = "${meta.role}"
-    value     = "ingress"
+    attribute = local.placement.attribute
+    operator  = local.placement.operator
+    value     = local.placement.value
   }
 
   group "notifier" {
-    count = 2
+    count = local.placement.count
 
     constraint {
       distinct_hosts = true
@@ -179,10 +245,10 @@ job "notifier" {
           "--bind", "0.0.0.0:8547",
           "--dir", "/opt/kardamom/notifier",
           "--ring-minutes", "${var.ring_minutes}",
-          "--ring-max-events", "${var.ring_max_events}",
+          "--ring-max-events", "${local.placement.ring_max}",
           "--outbox-retain-bytes", "${var.outbox_retain_bytes}",
           "--instance-index", "${NOMAD_ALLOC_INDEX}",
-          "--instance-count", "2",
+          "--instance-count", format("%d", local.placement.count),
           # Every instance, this one included: a registration forwarded
           # to itself is the same subscription again, a no-op.
           "--peers", local.peers,
@@ -229,7 +295,7 @@ job "notifier" {
 
       resources {
         cpu    = 500
-        memory = 1024
+        memory = local.placement.memory
       }
     }
   }

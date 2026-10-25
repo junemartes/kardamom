@@ -189,12 +189,18 @@ job "sequencer" {
   # the highest sealer version across its sessions, so it sends no
   # reference of record type 0 while every member runs version 5
   # (sealer_version_kept). The upgrade check
-  # (`just sealer-upgrade-check`) reads these metas.
-  meta {
-    nonce_burn          = "true"
-    sealer_v4           = "true"
-    sealer_version_kept = "true"
-  }
+  # (`just sealer-upgrade-check`) reads these metas. A sequencer job with
+  # the [admission] table runs the v2 loop (v2_loop), the only loop that
+  # offers the bytes of a transaction. The upgrade check of the carry
+  # window and the gate of the version floor read it.
+  meta = merge(
+    {
+      nonce_burn          = "true"
+      sealer_v4           = "true"
+      sealer_version_kept = "true"
+    },
+    var.admission == "on" ? { v2_loop = "true" } : {},
+  )
 
   datacenters = [var.datacenter]
   type        = "service"

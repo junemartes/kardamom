@@ -33,9 +33,10 @@ import org.junit.jupiter.api.io.TempDir;
  *   <li>A request below the floor gets {@code REPLAY_UNAVAILABLE} with the
  *       floors. A request from the floors gets every retained frame, then
  *       {@code REPLAY_DONE}, then the live frames.</li>
- *   <li>A walk while the window evicts ends with the frames, or gaps when
- *       the front passes the walk. After a gap, a request from a cursor
- *       inside the window serves.</li>
+ *   <li>A walk while the window evicts ends with the frames, or ends with
+ *       a gap when the front passes the walk. After a gap, a request from a
+ *       cursor inside the window serves.</li>
+ *   <li>A walk across a growth of the byte ring ends with the frames.</li>
  *   <li>A member restored from a snapshot gives the same answer.</li>
  *   <li>A member with no feed dir runs no feed.</li>
  * </ul>
@@ -101,6 +102,11 @@ class SealerHeapFeedTest {
     }
 
     private void block(final Member member) {
+        block(member, true);
+    }
+
+    /** One block of {@link #PER_BLOCK} full references. Only a posted block lets the window evict. */
+    private void block(final Member member, final boolean posted) {
         IntStream.range(0, PER_BLOCK).forEach(i -> {
             records++;
             final byte[] frame = new FullRef(records, 9, 64L * records, FullRef.filled(ENVELOPE_BYTES, records)).frame();
@@ -112,7 +118,9 @@ class SealerHeapFeedTest {
         });
         ticks++;
         member.apply(Entry.tick("tick-" + ticks, time()));
-        member.apply(Entry.frame("posted-" + ticks, IngressFrames.postedCursorFrame(ticks), time()));
+        if (posted) {
+            member.apply(Entry.frame("posted-" + ticks, IngressFrames.postedCursorFrame(ticks), time()));
+        }
     }
 
     /** A log time that each block moves past the tick interval. */
@@ -217,7 +225,7 @@ class SealerHeapFeedTest {
     }
 
     @Test
-    void a_walk_that_the_front_passes_gaps_and_a_request_inside_the_window_serves() {
+    void a_walk_that_the_front_passes_ends_with_a_gap_and_a_request_inside_the_window_serves() {
         final Member member = log.feeding(Optional.empty(), feed);
         blocks(member, FILL_BLOCKS);
         final FeedReader reader = reader();
@@ -249,6 +257,25 @@ class SealerHeapFeedTest {
         assertSameFrames(streamFrom(member, moved[0], moved[1]), answerFrames(reader, again),
             "the request inside the window");
         assertEquals(FeedState.LIVE, member.svc().metrics().feed());
+    }
+
+    /**
+     * No block is posted, so no frame leaves. Before the request, the store
+     * holds about 700 KB, so the byte ring holds at most 2 MiB. During the
+     * walk, the frames pass 2 MiB: the byte ring grows while the walk holds
+     * its key.
+     */
+    @Test
+    void a_walk_across_a_growth_of_the_byte_ring_ends_with_every_frame() {
+        final Member member = log.feeding(Optional.empty(), feed);
+        IntStream.range(0, FILL_BLOCKS).forEach(b -> block(member, false));
+        final FeedReader reader = reader();
+        final long id = request(reader, 0, GENESIS);
+        awaitState(member, FeedState.WALKING);
+        IntStream.range(0, 4 * FILL_BLOCKS).forEach(b -> block(member, false));
+        assertTrue(member.svc().retained().bytes() > 2 << 20, "the frames pass the byte ring of the request");
+        await(member, reader, SealerWire.EGRESS_KIND_REPLAY_DONE, id);
+        assertSameFrames(streamFrom(member, 0, GENESIS), answerFrames(reader, 0), "the walk across the growth");
     }
 
     @Test
