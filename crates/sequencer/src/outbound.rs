@@ -241,12 +241,18 @@ pub mod fakes {
         pub epochs: Arc<Mutex<Vec<EpochRecord>>>,
         pub remote_epochs: Arc<Mutex<Vec<RemoteEpochRecord>>>,
         pub fail_with_backpressure: Arc<Mutex<bool>>,
+        /// The next ref offer reports a new session, as a fenced cluster
+        /// publisher does, and takes nothing. The flag then clears.
+        pub new_session: Arc<Mutex<bool>>,
     }
 
     impl TxOrderingRefPublisher for InMemoryTxOrderingRefPublisher {
         fn try_publish_ref(&mut self, offer: &RefOffer) -> Result<(), SequencerError> {
             if *self.fail_with_backpressure.lock().unwrap() {
                 return Err(SequencerError::Backpressure);
+            }
+            if std::mem::take(&mut *self.new_session.lock().unwrap()) {
+                return Err(SequencerError::SessionChanged);
             }
             self.offers.lock().unwrap().push(offer.clone());
             Ok(())
