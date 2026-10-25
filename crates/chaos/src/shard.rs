@@ -106,7 +106,6 @@ impl Shard {
                 "validator-lapse",
                 "validator-join",
                 "lookup-blackout",
-                "resize-scale-out-in",
             ],
             Self::Cluster => &[
                 "cluster-leader-kill",
@@ -189,8 +188,15 @@ impl Shard {
             // seeded restart of the sealer fleet. The fleet wipe runs last:
             // it restarts the chain from a state rebuilt from L1, the
             // longest recovery, and a failure there must not hide the
-            // storm.
-            Self::Integrity => &["executor-restart-storm", "sealer-fleet-total-wipe-recover"],
+            // storm. The lane resize runs here, last, because the v2 loop
+            // of the carry-born shards has no resize protocol yet: it needs
+            // the v1 loop of a reference-born cluster, and it leaves the
+            // shard map at a later version.
+            Self::Integrity => &[
+                "executor-restart-storm",
+                "sealer-fleet-total-wipe-recover",
+                "resize-scale-out-in",
+            ],
             // The activation of the carry window in the order of the
             // staging rollout, then the faults around its switch. Each
             // step needs the steps before it.
@@ -384,7 +390,7 @@ mod tests {
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
         assert_eq!(all.len(), 67);
         assert_eq!(
-            Shard::Sequencer.cases().last(),
+            Shard::Integrity.cases().last(),
             Some(&"resize-scale-out-in")
         );
         for shard in ALL {
@@ -425,7 +431,11 @@ mod tests {
         );
         assert_eq!(
             Shard::Integrity.cases(),
-            ["executor-restart-storm", "sealer-fleet-total-wipe-recover"]
+            [
+                "executor-restart-storm",
+                "sealer-fleet-total-wipe-recover",
+                "resize-scale-out-in"
+            ]
         );
         assert_eq!(Shard::Integrity.name(), "chaos-integrity");
         // The carry shard tells its probes where the executors run, and

@@ -64,7 +64,7 @@ Every regular chaos shard brings up a carry-born cluster. `Shard::deploy_vars` s
 Two shards stay reference-born:
 
 - `chaos-carry` starts in reference mode and tests the upgrade of a live chain to the carry window.
-- The nightly `chaos-integrity` keeps the reference mode, the recorded cursor, the voids and the seeded restart of the sealer fleet under test.
+- The nightly `chaos-integrity` keeps the reference mode, the recorded cursor, the voids, the seeded restart of the sealer fleet and the lane resize under test.
 
 The knobs of a shard follow its deploy variables (see [Environment knobs](#environment-knobs)). So `Knobs::executor_nodes` reads `sealer` on a carry-born shard, and the probes, the convergence check, the progress probes and the persisted-state audit find the executors on the sealer nodes.
 
@@ -76,7 +76,7 @@ The knobs of a shard follow its deploy variables (see [Environment knobs](#envir
 | `semantics` | The chain-semantics suite (`SEMANTICS_CASES`) | `RUN_LOAD=0` |
 | `chaos-executor` | `graceful-executor`, `hard-executor`, `node-failure-executor`, `node-replace-executor`, `state-checkpoint-restore`, `replay-window-resync`, `deploy-broken-image` | carry-born, `RUN_LOAD=0`, the block log of the checkpoints on (`KARDAMOM_CHECKPOINT_LOG=on`) |
 | `chaos-ingress` | `graceful-ingress`, `hard-ingress`, `archive-driver-loss`, `archive-tx-data-wipe`, `archive-corruption` | carry-born, `RUN_LOAD=0` |
-| `chaos-sequencer` | `graceful-sequencer`, `hard-sequencer`, `sequencer-replica-kill`, `sequencer-lapse`, `validator-lapse`, `validator-join`, `lookup-blackout`, `resize-scale-out-in` | carry-born, `RUN_LOAD=0` |
+| `chaos-sequencer` | `graceful-sequencer`, `hard-sequencer`, `sequencer-replica-kill`, `sequencer-lapse`, `validator-lapse`, `validator-join`, `lookup-blackout` | carry-born, `RUN_LOAD=0` |
 | `chaos-cluster` | `cluster-leader-kill`, `cluster-follower-kill`, `cluster-member-rejoin`, `node-replace-sealer`, `cpu-squeeze` | carry-born, `RUN_LOAD=0`, sealer snapshot interval 60 s (`KARDAMOM_CLUSTER_SNAPSHOT_S=60`), `SQUEEZE_CYCLES=3`, `SQUEEZE_S=60`, `SQUEEZE_CPUS_PER_NODE=0.4` |
 | `chaos-fleet` | `executor-fleet-loss-recover`, `executor-fleet-wipe-recover`, `executor-fleet-total-wipe-recover`, `redis-total-loss-recover`, `cluster-quorum-loss-recover`, `cluster-total-loss-recover` | carry-born, `RUN_LOAD=0` |
 | `chaos-coordinated` | `ingress-pair-loss-recover`, `sequencer-lane-loss-recover`, `pipeline-blackout-recover` | carry-born, `RUN_LOAD=0` |
@@ -87,11 +87,11 @@ The knobs of a shard follow its deploy variables (see [Environment knobs](#envir
 | `chaos-l1` | `l1-liar`, `l1-null-receipts`, `two-day-outage`, `batcher-outage-past-retention` | carry-born, `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
 | `chaos-follower` | `follower-instance-loss`, `follower-total-loss`, `follower-disagreement` | carry-born, `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
 | `chaos-carry` | `carry-versions-on`, `carry-full-ref-below-v5`, `carry-readers-on-egress`, `carry-window-on`, `carry-executor-first`, `carry-executors-rest`, `carry-window-off-on`, `carry-leader-kill-at-switch`, `carry-egress-restart` | reference-born, `RUN_LOAD=0`, retention 16384, snapshot interval 60 s, the member feed and the executors on the sealer nodes (`KARDAMOM_EXEC_ON_SEALERS=on`), the frames of the executors and the egress, the v2 loop of the sequencers (`KARDAMOM_SEQUENCER_ADMISSION=on`) |
-| `chaos-integrity` (nightly) | `executor-restart-storm`, `sealer-fleet-total-wipe-recover` | reference-born, `RUN_LOAD=0` |
+| `chaos-integrity` (nightly) | `executor-restart-storm`, `sealer-fleet-total-wipe-recover`, `resize-scale-out-in` | reference-born, `RUN_LOAD=0` |
 
 Case order matters in six places.
 
-- `resize-scale-out-in` runs last in `chaos-sequencer`. A resize leaves the shard map at a later version.
+- `resize-scale-out-in` runs last in the nightly reference-born `chaos-integrity`. The v2 loop of the carry-born shards has no lane resize protocol yet, and a resize leaves the shard map at a later version.
 - `sealer-fleet-total-wipe-recover` runs last in `chaos-integrity`. It restarts the chain from a state rebuilt from L1, the longest recovery. A failure there must not hide the storm.
 - `pipeline-blackout-recover` runs last in `chaos-coordinated`. Every pipeline node dies, the longest recovery of the shard.
 - `mirror-kill-rebuild` runs last in `chaos-cache`. It flushes the projection.
@@ -116,7 +116,7 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 - [`hard-executor`](failure-modes.md#executor): kills one executor task. While it is down, the sealer's best recorded cursor (`kardamom_ingress_cluster_recorded_head`) must move within 20 s. With `KARDAMOM_EXEC_CURSOR` off, the case skips this check with a log line. On a carry-born cluster, the ingress must instead show no recorded cursor (head -1, lag 0): the sealer drops every cursor under decision version 5. The job returns to three replicas. The restarted executor records a new `exec_txs` session, and its recorded cursor advances.
 - [`node-failure-executor`](failure-modes.md#executor): kills the whole node of the executor of a follower member. The fleet keeps progressing with two replicas. The node returns, with its executor and, on a sealer node, its member.
 - [`node-replace-executor`](failure-modes.md#executor): replaces the node of the executor of a follower member through the Terraform root. The new node has a new address and empty volumes. The executor catches up from empty disks. On a sealer node, the member returns too.
-- [`state-checkpoint-restore`](failure-modes.md#executor): wipes the state of executor 0 on its node. It restores from the checkpoint of executor 1.
+- [`state-checkpoint-restore`](failure-modes.md#executor): wipes the state of executor 0 on its node. It restores from the checkpoint of executor 1. With the block log on, the harness copies the newest base and the log after it, so the restore reaches past the base.
 - [`replay-window-resync`](failure-modes.md#executor): wipes executor 1 with its checkpoints. It fetches a peer checkpoint and resumes. A carry executor takes the same path: the restore of a fresh state directory runs before it opens the member feed or the egress.
 - [`deploy-broken-image`](failure-modes.md#deploys): deploys a manifest with a bad executor image. The deploy must fail, and the old replicas must keep running.
 
