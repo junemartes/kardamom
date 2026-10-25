@@ -1580,6 +1580,17 @@ class DeployTest(Deploys):
                    for volume in (task['Config'].get('volumes') or [])}
         self.assertEqual({d for d in mounted if d.startswith('/opt/kardamom/')} - exempt - set(dirs), set())
 
+    def test_a_second_deploy_of_the_same_release_runs_the_data_directory_job_again(self):
+        # A sysbatch job runs once for each version, and Nomad can remove the
+        # allocations of the last run. So each deploy gives the job a new
+        # version, and the wait finds allocations of that version.
+        self.run_deploy()
+        first = self.api.state['jobs']['data-dirs']['Meta']['run']
+        self.api.state['writes'] = []
+        self.run_deploy()
+        self.assertEqual(self.api.state['writes'][0], 'data-dirs')
+        self.assertNotEqual(self.api.state['jobs']['data-dirs']['Meta']['run'], first)
+
     def test_a_down_node_does_not_hold_the_data_directory_job(self):
         self.api.state['down_node_jobs'] = ['data-dirs']
         self.run_deploy()

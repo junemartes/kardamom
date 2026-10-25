@@ -42,11 +42,25 @@ variable "mode" {
   description = "The mode of each data directory: node_data_dirs.mode."
 }
 
+variable "run" {
+  type        = string
+  default     = ""
+  description = "The start of the deploy. A new value each deploy gives the job a new version, so Nomad runs it again on every node."
+}
+
 job "data-dirs" {
   datacenters = [var.datacenter]
   type        = "sysbatch"
   # Every node of every pool, the elastic pools included.
   node_pool = "all"
+
+  # A sysbatch job runs once for each version. The deploy waits for the
+  # allocations of the current version, so each deploy needs a new one:
+  # with the same version, Nomad runs nothing, and the allocations of the
+  # last run can be gone.
+  meta {
+    run = var.run
+  }
 
   group "data-dirs" {
     task "data-dirs" {
