@@ -56,6 +56,14 @@ workloads_common_vars:
   # One value for the longest idle wait of every hot-path thread: the
   # media drivers, the sealer and the Rust poll loops.
   idle_cap_us: "{{ workloads_idle_cap_us }}"
+  # The member feed: "on" or "off". One value for the sealer members and
+  # the shared media drivers on the sealer nodes. Empty leaves both jobs
+  # at their "off" default.
+  member_feed: "{{ workloads_member_feed }}"
+  # The executors on the sealer nodes: "on" or "off". One value for the
+  # executors, the state mirrors and every job that reaches an executor by
+  # its node. Empty leaves every job at its "off" default.
+  exec_on_sealers: "{{ workloads_exec_on_sealers }}"
   # The notifier on its own nodes: the notifier job places on them, and the
   # aeron job gives their media drivers the notifier idle cap.
   notifier_nodes: "{{ workloads_notifier_nodes }}"
@@ -180,6 +188,64 @@ workloads_priority_fees: "{{ lookup('env', 'PRIORITY_FEES') }}"
 # The recorded cursor of the executors (nomad/executor.nomad.hcl): "on" or
 # "off". Empty keeps the job's "off" default.
 workloads_exec_cursor: "{{ lookup('env', 'KARDAMOM_EXEC_CURSOR') }}"
+# The switches of the carry window. Every switch is off by default, and
+# with every switch off no job changes. README.md, "The carry window",
+# gives the order.
+# The member feed (KARDAMOM_MEMBER_FEED): "on" or "off". On, each sealer
+# member feeds its retained frames to the executor on its own node, on the
+# shared media driver of that node. It is not a setting that every member
+# must match, so a rolling deploy turns it on member by member.
+workloads_member_feed: "{{ lookup('env', 'KARDAMOM_MEMBER_FEED') }}"
+# The executors on the sealer nodes (KARDAMOM_EXEC_ON_SEALERS): "on" or
+# "off". On, executor <i> runs on sealer-<i> in its own group
+# executor-<i>, and the executor job rolls one group at a time
+# (tasks/executor.yml). It needs the member feed.
+workloads_exec_on_sealers: "{{ lookup('env', 'KARDAMOM_EXEC_ON_SEALERS') }}"
+# The executors in carry mode (KARDAMOM_CARRY_EXECUTORS): a
+# comma-separated list of member indexes, such as "0", then "0,1". Each
+# listed executor runs with --carry-bytes and --egress. Empty: none.
+workloads_carry_executors: "{{ lookup('env', 'KARDAMOM_CARRY_EXECUTORS') | replace(' ', '') }}"
+workloads_carry_executor_ids: "{{ workloads_carry_executors | split(',') | reject('equalto', '') | map('int') | list }}"
+# The first sealer decision version of the sequencers
+# (KARDAMOM_SEALER_VERSION_FLOOR), from 0 to 5. Empty is 0. The release
+# gate refuses a floor above the lowest decisionVersion of the members,
+# and a floor above 0 until every reader reads a relayed full reference.
+workloads_sealer_version_floor: "{{ lookup('env', 'KARDAMOM_SEALER_VERSION_FLOOR') }}"
+# The v2 loop of the sequencers (KARDAMOM_SEQUENCER_ADMISSION): "on" or
+# "off". Empty keeps the job's "off" default. The carry window needs it:
+# only the v2 loop carries the bytes of a transaction under decision
+# version 5.
+workloads_sequencer_admission: "{{ lookup('env', 'KARDAMOM_SEQUENCER_ADMISSION') }}"
+# The ceiling of the sealer retention in frames, and in bytes: the
+# retained frames times their mean size. A replay over a cluster session
+# queues every wanted frame at once, and the sealer closes a session whose
+# backlog passes 64 MiB. The cap in bytes, 48 MiB, stays well below that.
+workloads_retention_cap_frames: 131072
+workloads_retention_cap_bytes: 50331648
+# A carry executor compares its first stream with its committed blocks of
+# this window (the executor's rollback_compare_blocks). So its committed
+# block minus this window must be above the block of the last stored
+# reference before it moves to carry mode.
+workloads_carry_compare_blocks: 32
+# The metrics ports that the carry window checks read, by job.
+workloads_metrics_ports:
+  executor: 9004
+  batcher: 9002
+  validator: 9006
+  egress: "{{ ports.egress_metrics }}"
+# The block gauge of each reader of the egress: the posted block of the
+# batcher and the committed block of the validator. A reader moves to the
+# egress only when this block is above the block of the last stored
+# reference.
+workloads_reader_block_gauges:
+  batcher: kardamom_batcher_last_posted_block
+  validator: validator_committed_block
+# The egress cursor gauge of each reader: the canonical index of the
+# newest frame that it took from the egress. The upgrade check of
+# feature 5 needs each one above the index of the last stored reference.
+workloads_reader_cursor_gauges:
+  batcher: kardamom_batcher_egress_cursor_index
+  validator: kardamom_validator_egress_cursor_index
 # The egress (nomad/egress.nomad.hcl) and its readers. Every switch is
 # off by default, and with every switch off no job changes. Switch them on
 # in this order, one deploy each: the executors' frames, the egress, then
@@ -203,18 +269,24 @@ workloads_ingress_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_INGRESS_RECE
 workloads_notifier_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS') }}"
 # The readers reach the egress through its Consul service.
 workloads_egress_url: "http://kardamom-egress.service.{{ datacenter }}.consul:{{ ports.egress_http }}"
-# The job variables of the switches, by job. Every compile of a job takes
-# them (tasks/compile.yml), so a resize keeps them too. An empty value
-# keeps the job's default, off.
+# The job variables of the switches, by job: the egress switches and the
+# switches of the carry window. Every compile of a job takes them
+# (tasks/compile.yml), so a resize keeps them too. An empty value keeps the
+# job's default, off.
 workloads_egress_job_vars:
   executor:
     exec_frames: "{{ workloads_exec_frames }}"
+    carry_executors: "{{ workloads_carry_executors }}"
+    # The egress is the second source of a carry executor.
+    egress_url: "{{ workloads_egress_url if workloads_carry_executor_ids | length > 0 else '' }}"
   validator:
     egress_url: "{{ workloads_egress_url if workloads_validator_egress == 'on' else '' }}"
   batcher:
     egress_url: "{{ workloads_egress_url if workloads_batcher_egress == 'on' else '' }}"
   sequencer:
     receipts_from_egress: "{{ workloads_sequencer_receipts_from_egress }}"
+    sealer_version_floor: "{{ workloads_sealer_version_floor }}"
+    admission: "{{ workloads_sequencer_admission }}"
   ingress:
     receipt_query_endpoints: "{{ workloads_egress_url if workloads_ingress_receipts_from_egress == 'on' else '' }}"
   notifier:
@@ -471,3 +543,49 @@ workloads_upgrade_v4_jobs:
   - name: validator
     metas: [first_receipt]
     does: keep the receipt that used the nonce of a transaction ordered twice
+
+# The services that the carry window (feature 5) needs.
+# sealer_version_kept: the sequencer keeps the highest sealer version, so
+# it sends no reference of record type 0 under version 5. reads_egress:
+# the batcher and the validator read the canonical stream from the egress,
+# because the exact window answers a cursor below it with
+# REPLAY_UNAVAILABLE. ref_mark: the egress keeps the highest stored
+# reference in a side file, so the check can trust its mark. v2_loop: the
+# sequencer runs the v2 loop (KARDAMOM_SEQUENCER_ADMISSION=on). The v1 loop
+# offers each transaction as a reference of record type 0 at every
+# version and every floor, and the carry window refuses such a reference.
+workloads_upgrade_window_jobs:
+  - name: sequencer
+    metas: [sealer_version_kept]
+    does: keep the highest sealer version across its sessions
+  - name: sequencer
+    metas: [v2_loop]
+    does: run the v2 loop, the only loop that offers the bytes of a transaction
+  - name: batcher
+    metas: [reads_egress]
+    does: read the canonical stream from the egress
+  - name: validator
+    metas: [reads_egress]
+    does: read the canonical stream from the egress
+  - name: egress
+    metas: [ref_mark]
+    does: keep the mark of the highest stored reference
+
+# The readers that a sequencer version floor above 0 needs: each runs a
+# full reference that a sealer below decision version 5 relays as is
+# (relayed_full_ref). A floor above the version of the chain makes such a
+# frame. The egress is a reader only where it runs.
+workloads_floor_jobs:
+  - name: executor
+    metas: [relayed_full_ref]
+    does: run a relayed full reference
+  - name: validator
+    metas: [relayed_full_ref]
+    does: run a relayed full reference
+  - name: batcher
+    metas: [relayed_full_ref]
+    does: run a relayed full reference
+  - name: egress
+    metas: [relayed_full_ref]
+    does: run a relayed full reference
+    optional: true

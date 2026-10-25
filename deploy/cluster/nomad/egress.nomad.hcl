@@ -147,9 +147,14 @@ job "egress" {
   # The egress of this release belongs to the release whose readers run a
   # full reference that a sealer below decision version 5 relays as is
   # (relayed_full_ref). The deploy reads this meta before it sets a
-  # sequencer version floor above 0.
+  # sequencer version floor above 0. The egress of this release keeps the
+  # highest stored reference of record type 0 in the side file ref-mark of
+  # its store, so the mark survives a restart (ref_mark). The deploy reads
+  # this meta before it trusts the mark: an older egress stores
+  # references and does not raise the mark.
   meta {
     relayed_full_ref = "true"
+    ref_mark         = "true"
   }
 
   datacenters = [var.datacenter]

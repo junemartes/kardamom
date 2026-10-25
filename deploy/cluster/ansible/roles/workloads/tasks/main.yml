@@ -88,8 +88,10 @@
         backup_file_sync_level: "{{ workloads_backup_file_sync_level }}"
   when: groups['backup'] | default([]) | length > 0
 
+# A job with `tasks` deploys through that file: the executor job rolls
+# its pinned groups one at a time (executor.yml).
 - name: Deploy pipeline dependencies
-  ansible.builtin.include_tasks: job.yml
+  ansible.builtin.include_tasks: "{{ workloads_job.tasks | default('job.yml') }}"
   loop:
     - name: sequencer
       wait: false
@@ -102,6 +104,7 @@
       vars:
         ack: "{{ workloads_ingress_ack | default('receipt', true) }}"
     - name: executor
+      tasks: executor.yml
       wait: false
       vars:
         exec_cursor: "{{ workloads_exec_cursor }}"
