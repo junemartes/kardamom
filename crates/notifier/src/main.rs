@@ -19,7 +19,7 @@ use kardamom_notifier::metrics;
 use kardamom_notifier::ring::RingConfig;
 use kardamom_notifier::server::{Hooks, ListenConfig, serve};
 use kardamom_notifier::shard::InstanceSet;
-use kardamom_notifier::taps::{ReceiptSource, Taps};
+use kardamom_notifier::taps::{EventTaps, ReceiptSource, Taps};
 use kardamom_notifier::webhooks::{Webhooks, WebhooksConfig};
 use kardamom_obs::bin::wait_for_shutdown;
 
@@ -49,6 +49,19 @@ struct Args {
         default_value_t = false
     )]
     receipts_from_egress: bool,
+    /// The events path (`docs/specs/2026-10-25-client-events.md`): the
+    /// stages from `tx_events`, `egress_receipts` and, with
+    /// `--executed on`, `tx_receipts`, through the stage table. Off, the
+    /// notifier reads its streams as before.
+    #[arg(long, env = "KARDAMOM_NOTIFIER_EVENTS", value_enum, default_value_t = Switch::Off)]
+    events: Switch,
+    /// With the events path on, also read the `tx_receipts` of every
+    /// executor for the `executed` stage, for the evaluation of the stages.
+    #[arg(long, env = "KARDAMOM_NOTIFIER_EXECUTED", value_enum, default_value_t = Switch::Off)]
+    executed: Switch,
+    /// The entries of the stage table.
+    #[arg(long, env = "KARDAMOM_NOTIFIER_STAGE_TABLE", default_value = "250000")]
+    stage_table: NonZeroUsize,
     /// The address of the WebSocket feed and the webhook endpoint.
     #[arg(long, env = "KARDAMOM_NOTIFIER_BIND", default_value = "127.0.0.1:8547")]
     bind: SocketAddr,
@@ -115,6 +128,13 @@ struct Args {
     host_id: String,
 }
 
+/// An on/off switch, as the deploy writes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Switch {
+    On,
+    Off,
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     kardamom_obs::bin::init_tracing();
@@ -136,7 +156,11 @@ async fn main() -> Result<()> {
     } else {
         ReceiptSource::Executors(executor_count)
     };
-    let taps = Taps::open(&rt, &mut plane, source).context("open the taps")?;
+    let events = (args.events == Switch::On).then_some(EventTaps {
+        executed: args.executed == Switch::On,
+        executor_count,
+    });
+    let taps = Taps::open(&rt, &mut plane, source, events).context("open the taps")?;
     let shutdown = plane.cancellation().child_token();
 
     let (hub, handle) = Hub::new(
@@ -147,6 +171,7 @@ async fn main() -> Result<()> {
             },
             feed_buffer: args.feed_buffer,
             ingest_buffer: args.feed_buffer,
+            stage_table: events.map(|_| args.stage_table),
         },
         shutdown.clone(),
     );
@@ -164,7 +189,7 @@ async fn main() -> Result<()> {
     .context("start the webhooks")?;
     let hub_task = tokio::spawn(hub.run());
     let webhooks_task = tokio::spawn(webhooks.run());
-    let tap_tasks = taps.spawn(handle.ingest());
+    let tap_tasks = taps.spawn(&handle.ingest());
     let listener = serve(
         ListenConfig {
             bind: args.bind,

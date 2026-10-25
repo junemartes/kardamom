@@ -34,6 +34,7 @@
 
 pub mod delivery;
 pub mod dto;
+pub mod events;
 pub mod feed;
 pub mod hub;
 pub mod metrics;
@@ -41,5 +42,6 @@ pub mod outbox;
 pub mod ring;
 pub mod server;
 pub mod shard;
+pub mod stages;
 pub mod taps;
 pub mod webhooks;

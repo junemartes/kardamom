@@ -40,6 +40,30 @@ pub const WEBHOOK_ATTEMPTS_TOTAL: &str = "kardamom_notifier_webhook_attempts_tot
 /// Seconds from the event's arrival at the notifier to its delivery.
 pub const WEBHOOK_DELIVERY_SECONDS: &str = "kardamom_notifier_webhook_delivery_seconds";
 
+/// The events path (`KARDAMOM_NOTIFIER_EVENTS`): seconds from the first
+/// observed `accepted` of a hash to the first observed event of each later
+/// stage, by `stage`.
+pub const STAGE_LATENCY_SECONDS: &str = "kardamom_notifier_stage_latency_seconds";
+/// Seconds from the first observed `accepted` to the receipt of each
+/// executor on `tx_receipts`, by `executor` (the slot of its session).
+pub const EXECUTED_LATENCY_SECONDS: &str = "kardamom_notifier_executed_latency_seconds";
+/// Seconds from the first `executed` of a hash to its first `receipt`.
+pub const MERGE_LATENCY_SECONDS: &str = "kardamom_notifier_merge_latency_seconds";
+/// Events of the stage table that were not sent, by `stage`: a copy, or
+/// an event that came after a later stage.
+pub const STAGE_NOT_SENT_TOTAL: &str = "kardamom_notifier_stage_not_sent_total";
+/// Entries that a full probe of the stage table overwrote.
+pub const STAGE_TABLE_EVICTED_TOTAL: &str = "kardamom_notifier_stage_table_evicted_total";
+/// Jumps in the `seq` of a publisher's `tx_events` frames, by `origin`.
+pub const EVENT_GAPS_TOTAL: &str = "kardamom_notifier_event_gaps_total";
+/// `tx_events` frames that did not read.
+pub const BAD_FRAMES_TOTAL: &str = "kardamom_notifier_bad_frames_total";
+/// A rollback that reached an entry at `posted` or above. Any increase
+/// needs an operator.
+pub const ROLLBACK_PAST_POSTED_TOTAL: &str = "kardamom_notifier_rollback_past_posted_total";
+/// `tx_status` records that the events path replaces, dropped by the hub.
+pub const SUPERSEDED_TOTAL: &str = "kardamom_notifier_superseded_total";
+
 /// A count as a gauge value.
 #[allow(
     clippy::cast_precision_loss,
@@ -85,6 +109,36 @@ pub fn describe() {
     );
     metrics::describe_gauge!(OUTBOX_BACKLOG_BYTES, "outbox bytes not yet delivered");
     metrics::describe_counter!(WEBHOOK_ATTEMPTS_TOTAL, "webhook POST attempts, by outcome");
+    metrics::describe_histogram!(
+        STAGE_LATENCY_SECONDS,
+        "seconds from the first accepted of a hash to each later stage, by stage"
+    );
+    metrics::describe_histogram!(
+        EXECUTED_LATENCY_SECONDS,
+        "seconds from the first accepted of a hash to the receipt of each executor"
+    );
+    metrics::describe_histogram!(
+        MERGE_LATENCY_SECONDS,
+        "seconds from the first executed of a hash to its first receipt"
+    );
+    metrics::describe_counter!(STAGE_NOT_SENT_TOTAL, "stage events not sent, by stage");
+    metrics::describe_counter!(
+        STAGE_TABLE_EVICTED_TOTAL,
+        "stage table entries a full probe overwrote"
+    );
+    metrics::describe_counter!(
+        EVENT_GAPS_TOTAL,
+        "jumps in the seq of tx_events frames, by origin"
+    );
+    metrics::describe_counter!(BAD_FRAMES_TOTAL, "tx_events frames that did not read");
+    metrics::describe_counter!(
+        ROLLBACK_PAST_POSTED_TOTAL,
+        "rollbacks that reached an entry at posted or above"
+    );
+    metrics::describe_counter!(
+        SUPERSEDED_TOTAL,
+        "tx_status records that the events path replaces"
+    );
     metrics::describe_histogram!(
         WEBHOOK_DELIVERY_SECONDS,
         "seconds from event arrival to webhook delivery"

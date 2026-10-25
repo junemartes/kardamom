@@ -10,11 +10,13 @@
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
-use kardamom_types::{TxError, TxStatus};
+use kardamom_log::aeron_live::ReceiptFrame;
+use kardamom_types::{TxError, TxStageKind, TxStatus};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::dto::StatusFilter;
+use crate::events::{EventsPath, Send};
 use crate::metrics as m;
 use crate::ring::{Insert, Ring, RingConfig, Stamped};
 
@@ -25,6 +27,15 @@ pub enum Observed {
     /// A `tx_errors` record. It names the transaction by sender and
     /// nonce; the ring resolves the hash.
     Error(TxError),
+    /// A `tx_events` frame, for the events path.
+    Events(Vec<u8>),
+    /// A frame of `egress_receipts`, for the events path.
+    Merged(ReceiptFrame),
+    /// A frame of one executor's `tx_receipts`, for the events path.
+    Copy {
+        session: i32,
+        frame: ReceiptFrame,
+    },
 }
 
 /// A replay request: the events `filter` selects after `after_seq`, at
@@ -43,6 +54,9 @@ pub struct HubConfig {
     pub ring: RingConfig,
     pub feed_buffer: NonZeroUsize,
     pub ingest_buffer: NonZeroUsize,
+    /// The entries of the stage table with the events path on
+    /// (`KARDAMOM_NOTIFIER_EVENTS`), `None` with it off.
+    pub stage_table: Option<NonZeroUsize>,
 }
 
 /// The eviction cadence. Eviction is cheap, so a short period keeps the
@@ -90,6 +104,9 @@ impl HubHandle {
 
 pub struct Hub {
     ring: Ring,
+    /// The events path, when it is on. With it on, `tx_status` records
+    /// keep only the rejections: the path makes the other stages.
+    events: Option<EventsPath>,
     ingest: mpsc::Receiver<Observed>,
     queries: mpsc::Receiver<Replay>,
     live: broadcast::Sender<Stamped>,
@@ -105,6 +122,9 @@ impl Hub {
         let (live, _) = broadcast::channel(cfg.feed_buffer.get());
         let hub = Self {
             ring: Ring::new(cfg.ring),
+            events: cfg
+                .stage_table
+                .map(|capacity| EventsPath::new(capacity.get(), Instant::now())),
             ingest,
             queries,
             live: live.clone(),
@@ -139,7 +159,35 @@ impl Hub {
     }
 
     fn on_observed(&mut self, observed: Observed) {
+        let now = Instant::now();
         let status = match observed {
+            Observed::Events(frame) => {
+                if let Some(path) = self.events.as_mut() {
+                    path.on_frame(&frame, now, fanout(&mut self.ring, &self.live, now));
+                }
+                return;
+            }
+            Observed::Merged(frame) => {
+                if let Some(path) = self.events.as_mut() {
+                    path.on_merged(&frame, now, fanout(&mut self.ring, &self.live, now));
+                }
+                return;
+            }
+            Observed::Copy { session, frame } => {
+                if let Some(path) = self.events.as_mut() {
+                    path.on_copy(
+                        session,
+                        &frame,
+                        now,
+                        fanout(&mut self.ring, &self.live, now),
+                    );
+                }
+                return;
+            }
+            Observed::Status(s) if self.events.is_some() && s.kind() != TxStageKind::Rejected => {
+                metrics::counter!(m::SUPERSEDED_TOTAL).increment(1);
+                return;
+            }
             Observed::Status(s) => s,
             Observed::Error(e) => {
                 let Some(hash) = self.ring.resolve(e.sender, e.nonce) else {
@@ -175,6 +223,22 @@ impl Hub {
         metrics::counter!(m::EVICTED_TOTAL).increment(as_u64(evicted));
         metrics::gauge!(m::RING_EVENTS).set(m::count(self.ring.len()));
         metrics::gauge!(m::RING_TRANSACTIONS).set(m::count(self.ring.transactions()));
+    }
+}
+
+/// The sink of the events path: store each event that the path sends in
+/// the ring, and fan it out.
+fn fanout<'a>(
+    ring: &'a mut Ring,
+    live: &'a broadcast::Sender<Stamped>,
+    now: Instant,
+) -> impl FnMut(Send) + 'a {
+    move |send: Send| {
+        let stage = send.event.stage;
+        let stamped = ring.store(send.event, send.identity, now);
+        metrics::counter!(m::EVENTS_TOTAL, "stage" => stage.as_str()).increment(1);
+        // No receiver is not an error: the ring still serves the replay.
+        let _ = live.send(stamped);
     }
 }
 

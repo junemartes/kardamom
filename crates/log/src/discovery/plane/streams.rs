@@ -197,6 +197,38 @@ impl StreamPlane {
         }
     }
 
+    /// The `tx_events` subscription of the notifier: the raw frames of
+    /// every publisher (`docs/specs/2026-10-25-client-events.md`). The
+    /// frames are not rkyv, so the caller reads them with
+    /// `kardamom_types::tx_events::TxEventsView`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription fails to open.
+    pub fn tx_events_subscription(
+        &mut self,
+        rt: &AeronRuntime,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<crate::aeron_live::RawFrame>, LogError> {
+        let key = self.tx_events_key();
+        match &mut self.discovered {
+            None => Ok(rt
+                .open_subscription_raw(
+                    &self.channels.tx_events_channel,
+                    self.channels.tx_events_stream_id,
+                )?
+                .1),
+            Some(d) => d.open_raw_subscription(rt, key),
+        }
+    }
+
+    fn tx_events_key(&self) -> StreamKey {
+        StreamKey {
+            topic: Topic::TxEvents,
+            stream_id: self.channels.tx_events_stream_id,
+            lane: None,
+        }
+    }
+
     fn exec_frames_key(&self) -> StreamKey {
         StreamKey {
             topic: Topic::ExecFrames,

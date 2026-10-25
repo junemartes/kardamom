@@ -98,6 +98,33 @@ variable "receipts_from_egress" {
   }
 }
 
+# The events path, "on" or "off" (--events,
+# docs/specs/2026-10-25-client-events.md). On, the notifier takes the
+# stages from tx_events and the merged receipts of the egress, through its
+# stage table, and keeps only the rejections of tx_status. It needs
+# KARDAMOM_EGRESS=1. Ansible deployment passes -var from
+# KARDAMOM_NOTIFIER_EVENTS.
+variable "events" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.events)
+    error_message = "The events value must be on or off."
+  }
+}
+
+# With the events path on, the executed stage from the tx_receipts of every
+# executor, "on" or "off" (--executed), for the evaluation of the stages.
+# Ansible deployment passes -var from KARDAMOM_NOTIFIER_EXECUTED.
+variable "executed" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.executed)
+    error_message = "The executed value must be on or off."
+  }
+}
+
 # The notifier on its own nodes, "on" or "off". Off, the notifier runs
 # one instance per ingress node. On, it runs notifier_count instances, one
 # per node whose role set holds notifier, with a smaller memory
@@ -256,6 +283,8 @@ job "notifier" {
           "--metrics-addr", "0.0.0.0:9008",
           ],
           var.receipts_from_egress == "on" ? ["--receipts-from-egress"] : [],
+          # Off renders no flag, so the job stays as before.
+          var.events == "on" ? ["--events", "on", "--executed", var.executed] : [],
         )
       }
 
