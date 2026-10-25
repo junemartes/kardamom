@@ -1,6 +1,6 @@
 # Client events from one-way stage publications, and the egress on its own nodes
 
-Status: draft, revision 2, 2026-10-25. The decisions in section 1 are the user's (2026-10-25).
+Status: draft, revision 3, 2026-10-25. The decisions in section 1 are the user's (2026-10-25).
 Section 10 lists the changes from revision 1.
 
 ## 1. Decisions
@@ -139,7 +139,6 @@ TxEvent =
   | RolledBack { from_block }                  // an egress rollback frame
   | Posted { batch_index, first_block, last_block, l1_tx }
   | Included { batch_index, l1_block }
-  | ChainStatus { status }                     // from the sequencer: the ClusterStatus (4.6)
 ```
 
 - The codec is rkyv, as the other streams. The format goes in `formats.toml` (until #664
@@ -152,13 +151,16 @@ TxEvent =
   4.5 reads by it.
 - `Posted` and `Included` name a block range, not hashes. The notifier maps them to hashes
   (4.4).
+- The stream `chain_status` carries one `ChainStatus { status: ClusterStatus }` for each status
+  frame. Its codec is rkyv, and its format goes in `formats.toml` with `writes = 1`, as
+  `tx_events`.
 
 ### 4.2 The publishers
 
 | Publisher | The change |
 |---|---|
 | ingress | `Accepted` for each transaction that it published on `tx_data`. |
-| sequencer | `Sent`, `Dropped` and `ChainStatus`, by the map below. |
+| sequencer | `Sent` and `Dropped` on `tx_events`, and `ChainStatus` on `chain_status`, by the map below. |
 | executor | `Executed` for each transaction that it applied, behind its own switch (Q7). |
 | egress | `Receipt` and `RolledBack` from the merged receipts, the same frames as `egress_receipts`. |
 | batcher | `Posted` when it sends a batch, `Included` when the L1 receipt of the batch transaction comes. |
@@ -173,8 +175,16 @@ The map of each sequencer output to `tx_events`:
 | `TxStatus` `Offered { sender, nonce }` on `tx_status` | `sequencer.rs:598` (v1), `v2/mod.rs:510` | `Sent` |
 | `TxStatus` `Rejected { sender, nonce, reason }` on `tx_status` | `sequencer.rs:380` (v1), `v2/mod.rs:580` | `Dropped`, reason `Rejected(TxErrorReason)`. Final: the sequencer never orders it. |
 | `TxDrop { sender, nonce, reason }` on `tx_drops` | the drops of #768 | `Dropped`, reason `Drop(DropReason)`. Provisional (4.3). |
-| a status frame of the cluster egress (kind 9) | `bin/kardamom-sequencer/feeds.rs:494` (`on_status_frame`) | `ChainStatus` |
+| a status frame of the cluster egress (kind 9) | `bin/kardamom-sequencer/feeds.rs:494` (`on_status_frame`) | `ChainStatus`, on its own stream `chain_status` (4.6) |
 | the v2 verdicts `Accepted` and `Rejected` on `tx_verdicts` to an ingress | `v2/verdicts.rs:51`, `:62` | none. The verdicts answer the ingress (the admission ack), not the clients. |
+
+The two other kinds of `TxStatus` (`crates/types/src/tx_status.rs:70-85`) also have a stage, so the
+removal of `tx_status` leaves no kind unmapped:
+
+| `TxStatus` kind | Publisher today | `tx_events` |
+|---|---|---|
+| `Accepted` | the ingress | `Accepted`, from the ingress |
+| `Executed` | the ingress, from its receipt fan-in | the notifier derives it from `receipt` |
 
 ### 4.3 Copies, order and loss
 
@@ -323,9 +333,9 @@ The map of each sequencer output to `tx_events`:
     both sequencers down, no submit can land anyway.
   - The sequencer forwards every status frame, not only the ones with the snapshot notice. That
     is one event each 2 s for each twin.
-  - The `ChainStatus` events go to the ingress over `tx_events`, so the ingress subscribes to the
-    topic. It decodes only `ChainStatus` from the sequencer origins, and skips the rest of each
-    batch.
+  - The `ChainStatus` events go on their own stream, `chain_status`, with the sequencers as its
+    only publishers. So the ingress does not read `tx_events`, and its hot node decodes no
+    batch of the other publishers. The rate is one frame each 2 s for each twin.
 
 ### 4.7 The egress nodes
 
@@ -419,7 +429,7 @@ transaction and a feature flag. Each step has a switch, off by default.
 ## 8. Open questions, with the recommended answer
 
 - **Q1. The source of the `ClusterStatus` for the ingress halt.** Answered in revision 2: the
-  sequencer, as `ChainStatus` on `tx_events` (4.6). The egress does not see the status frames.
+  sequencer, as `ChainStatus` on the stream `chain_status` (4.6). The egress does not see the status frames.
 - **Q2. The catch-up of `receipt`.** Answered in revision 2: the `seq` of each origin, and
   `GET /v1/receipts` on the egress (4.5).
 - **Q3. The catch-up of `posted`.** Recommended: the notifier reads the batcher's posted cursor at
@@ -449,7 +459,7 @@ Each PR merges alone. Each new path is behind a switch that is off by default, u
 |---|---|---|---|
 | P1 | kardamom-infra | the egress nodes | none |
 | P2 | kardamom | `KARDAMOM_EGRESS_NODES` and the constraint `role=egress`, the README move steps | none (off by default); the move needs P1 |
-| P3 | kardamom | the `tx_events` format and codec, the publishers (the executors and `ChainStatus` included), `KARDAMOM_TX_EVENTS` and `KARDAMOM_TX_EVENTS_EXECUTORS` | none |
+| P3 | kardamom | the `tx_events` format and codec, the publishers (the executors included), the `chain_status` stream, `KARDAMOM_TX_EVENTS` and `KARDAMOM_TX_EVENTS_EXECUTORS` | none |
 | P4 | kardamom | the notifier on `tx_events`: the stage table with its bitmaps, the copies, the implied stages, the rollback, the stage metrics, `KARDAMOM_NOTIFIER_EVENTS` | P3 |
 | P5 | kardamom | the shards of the notifier (4.4) | P4 |
 | P6 | kardamom | the ingress halt from `ChainStatus` (`KARDAMOM_INGRESS_CHAIN_STATUS`), the e2e scenario on `tx_events`, the dashboard panels | P3 |
@@ -472,3 +482,5 @@ Each PR merges alone. Each new path is behind a switch that is off by default, u
 | 9 (minor). A new constraint does not move an allocation | 4.7: `KARDAMOM_EGRESS_NODES`, then `nomad alloc stop` one instance at a time. P2 merges alone. |
 | 10 (minor). P4 is large | 9: the shards are P5. Each PR names what it depends on. |
 | 11 (minor). STE in 4.3 and 4.4 | 4.3 and 4.4: short sentences in lists, one instruction in each. |
+| Revision 2 review, note 1. `TxStatus` `Accepted` and `Executed` | 4.2: a second table maps them. |
+| Revision 2 review, note 2. The ingress decodes `tx_events` for `ChainStatus` | 4.1, 4.2, 4.6, P3: `ChainStatus` goes on its own stream `chain_status`, with the sequencers as its only publishers. |
