@@ -27,9 +27,12 @@
 # one node loss never takes the egress and its readers together. Ports:
 # HTTP 8548, metrics 9013.
 #
-# The merge chains a copy only from the start of the stream. An instance
-# with an empty store on a running chain finds no frame to chain to. So
-# start the egress with the chain, or give a new instance a store.
+# The merge chains the copy of an executor only behind a frame that
+# another source delivers. After a start, an instance reads the frames
+# between its head and the copies from the range read of a peer
+# (--peers, crates/egress/src/catchup.rs). So an instance with an empty
+# store fills it from a running peer. With no peer that holds the frames,
+# it starts again after the next boundary of a copy.
 #
 # This job uses file() for its templates, so submit it from the
 # deploy/cluster/ directory. ansible/deploy.yml does this.

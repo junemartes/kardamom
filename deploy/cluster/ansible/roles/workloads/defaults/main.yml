@@ -208,8 +208,9 @@ workloads_notifier_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_NOTIFIER_RE
 # nodes").
 workloads_egress_nodes: "{{ lookup('env', 'KARDAMOM_EGRESS_NODES') }}"
 # The egress instances: the default of egress_count in
-# nomad/egress.nomad.hcl. The preflight needs one ready egress node for
-# each instance when the switch is on.
+# nomad/egress.nomad.hcl. No environment variable sets egress_count, so a
+# change of egress_count must change this value too. The preflight needs
+# one ready egress node for each instance when the switch is on.
 workloads_egress_instances: 2
 # The roles that a switch moves to their own nodes, for the node count of
 # the preflight: the role, the instance count and the name of the count
