@@ -78,25 +78,13 @@
     state: present
     reload: true
 
+# The deploy makes the same directories again (the data-dirs job).
 - name: Create on-node kardamom directories
   ansible.builtin.file:
     path: "{{ item }}"
     state: directory
-    mode: "0777"
-  loop:
-    - "{{ paths.base }}"
-    - "{{ paths.archive_dir }}"
-    - "{{ paths.state_dir }}"
-    - "{{ paths.checkpoints_dir }}"
-    - "{{ paths.mirror_dir }}"
-    - "{{ paths.notifier_dir }}"
-    - "{{ paths.canary_dir }}"
-    - "{{ paths.egress_dir }}"
-    - "{{ paths.batcher_dir }}"
-    - "{{ paths.da_watcher_dir }}"
-    - "{{ paths.l1_indexer_dir }}"
-    - "{{ paths.da_store_dir }}"
-    - "{{ paths.config_dir }}"
+    mode: "{{ node_data_dirs.mode }}"
+  loop: "{{ node_data_dirs.paths }}"
 
 - name: Create the Aeron tmpfs mount point
   ansible.builtin.file:

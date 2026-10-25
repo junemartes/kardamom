@@ -1,5 +1,4 @@
-//! The activation steps: the versions, the provoked full reference below
-//! version 5, the readers on the egress, the switch with a member down,
+//! The activation steps: the versions, a parked offer across a downgrade, the readers on the egress, the switch with a member down,
 //! and the moves of the executors to carry mode.
 
 use std::time::Duration;
@@ -9,8 +8,7 @@ use kardamom_types::upgrades::{FEATURE_CARRY_WINDOW, FEATURE_SEALER_V4, FEATURE_
 use super::Run;
 use super::egress::{BLOCKS, CURSORS, Egress};
 use super::members::{
-    ALL, DECISION_VERSION, FEED_LIVE, FEED_STATE, FULL_REF_BELOW_V5, Lanes, Members, REF_REFUSED,
-    Window,
+    ALL, DECISION_VERSION, FEED_LIVE, FEED_STATE, Lanes, Members, REF_REFUSED, Window,
 };
 use super::upgrade::Upgrade;
 use crate::accounts::ACCT_SHARD;
@@ -23,7 +21,7 @@ use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
 use crate::rpc::Rpc;
 
-/// The sender of the provoked full reference: a load-reserve account. A
+/// The sender of the downgrade probe: a load-reserve account. A
 /// chaos shard runs no load stage, so no other sender spends it.
 const PROBE_ACCOUNT: u32 = 1;
 
@@ -52,21 +50,20 @@ impl Run<'_> {
         Lanes::new(self.h).await_version(5).await
     }
 
-    /// Step 2: a full reference that the sealer orders below version 5.
+    /// Step 2: a parked offer uses the version at release after a downgrade.
     /// The v2 loop holds the transfer for its nonce gap for at most the
     /// transaction lifetime (30 s), and less under load: the hold expires
     /// when the image of the lane moves past its width. So the upgrade
     /// transaction that turns feature 4 off is final on L1 first. The
     /// hold starts after it, while the lane still keeps version 5, and
     /// lasts only until every member runs version 4.
-    pub(super) async fn full_ref_below_v5(&mut self) -> anyhow::Result<()> {
+    pub(super) async fn held_offer_after_downgrade(&mut self) -> anyhow::Result<()> {
         let rpc = Rpc::new(&self.h.rpc_url, self.h.knobs.chain_id)?;
         let nonce = rpc.nonce_of(PROBE_ACCOUNT).await?;
         let next = nonce
             .checked_add(1)
             .ok_or_else(|| crate::chaos_fail!("{}: the probe nonce overflows", self.ctx))?;
         let held = rpc.sign_transfer(PROBE_ACCOUNT, next)?;
-        let before = Members::new(self.h)?.counts(FULL_REF_BELOW_V5).await?;
         let off = Upgrade::off(FEATURE_SEALER_V5);
         off.check(self.h, self.ctx).await?;
         off.send(self.h, self.ctx).await?;
@@ -78,6 +75,7 @@ impl Run<'_> {
         Members::new(self.h)?
             .await_all(&ALL, DECISION_VERSION, |v| v == 4)
             .await?;
+        Lanes::new(self.h).await_version(4).await?;
         anyhow::ensure!(
             Lanes::new(self.h).holds(PROBE_LANE).await,
             "{}: {}: the park expired: lane {PROBE_LANE} holds no transfer when every member runs version 4",
@@ -88,15 +86,18 @@ impl Run<'_> {
             .await?;
         rpc.await_receipt(&held.hash, RECEIPT_WAIT).await?;
         parked.abort();
-        let after = Members::new(self.h)?.counts(FULL_REF_BELOW_V5).await?;
+        let expected = next
+            .checked_add(1)
+            .ok_or_else(|| crate::chaos_fail!("{}: the probe nonce overflows", self.ctx))?;
+        let after = rpc.nonce_of(PROBE_ACCOUNT).await?;
         anyhow::ensure!(
-            after.iter().zip(&before).all(|(a, b)| a > b),
-            "{}: {}: not every member ordered the held transfer as a full reference below version 5: {before:?} -> {after:?}",
+            after == expected,
+            "{}: {}: the downgrade stranded the probe sender: nonce {after}, expected {expected}",
             crate::FAIL_PREFIX,
             self.ctx
         );
         crate::log(format!(
-            "{}: full references below version 5 {before:?} -> {after:?}",
+            "{}: both probe transactions executed; sender nonce {after}",
             self.ctx
         ));
         self.version(Upgrade::on(FEATURE_SEALER_V5), 5).await?;

@@ -404,7 +404,7 @@ read them:
 ## 5. The sequencer
 
 All of this section is the v2 loop (`crates/sequencer/src/bin/kardamom-sequencer/main.rs:239-275`).
-Staging runs the v1 loop today, so the rollout turns on the v2 loop first (F7, section 12). The
+On a chain that still runs the v1 loop, the rollout turns on the v2 loop first (F7, section 12). The
 kept version, its floor and the drop record of kind 18 run on the egress feed thread, so the v1
 loop gets them too. Only the v2 loop gets the refusal event for its filter.
 
@@ -513,15 +513,14 @@ loop gets them too. Only the v2 loop gets the refusal event for its filter.
   - Implementation note (2026-10-24): the file holds the mark plus a lead of 65,536 indexes and
     32 blocks, and the store writes it only when the mark passes it. Two syncs for each batch
     stalled the owner thread of the egress under the v1 loop, and with it `egress_receipts`. The
-    mark in memory stays exact. A clean stop writes the exact mark. After a crash R is at most the
-    lead above the stored references.
+    mark in memory stays exact. At the start the store reconstructs the exact mark from its
+    segments, so no restart leaves the lead in R.
   - The order: the mark, then the frames of the batch, then the sync of the segment. So no frame
-    on disk is above the mark, also before the sync. This is stronger than the order of revision
-    4 (the frames before the mark). A mark above the segment only delays a switch. It never lets
-    a reader meet a reference.
+    on disk is above the mark, also before the sync. A mark above the segment only delays a
+    switch. It never lets a reader meet a reference.
   - The rule in `append` also covers the catch-up frames of `Input::Caught`. They reach the
     store through the same `append` (`take_caught` and `flush`, `crates/egress/src/owner.rs`).
-  - `Store::open` reads the mark. A missing mark is `(0, 0)`: no reference is stored.
+  - `Store::open` scans the stored segments for the exact mark. A missing side file does not hide a stored reference.
   - A store copied from a peer at a scale-up (decision 27) copies the mark with the segments.
   - `Owner::start_at_floor` resets the store to the floor of a peer (`rebase`,
     `crates/egress/src/owner.rs:298-302`, then `Store::reset`, `store.rs:185-192`). `reset` keeps
@@ -734,7 +733,7 @@ The list of #781, without the file:
   `UnjoinableReference { index }`. Faults at two different indexes do not.
 - The egress store: a stored reference moves R. A restart of the store reads the same R from
   `ref-mark`, also when the reference is in an older segment than the last one. A store with no
-  mark opens with `(0, 0)`.
+  mark still reconstructs the highest stored reference from its segments.
 - The egress store: a `reset` after a stored reference keeps R. A `reset` with a higher mark of
   the peer raises R. A `reset` with a lower mark of the peer keeps R.
 - The reader cursor gauges.
@@ -755,21 +754,27 @@ A new scenario in `crates/e2e/src/scenarios/carry_window.rs`, run from
 6. Restart member 1 from its snapshot. Receipts keep landing.
 7. Turn feature 5 off, then on again. Receipts keep landing.
 
-A second case starts a sequencer with floor 5 on a chain on version 4. Its first offers go out as
-type 7. Every executor and the validator run them, and every receipt lands.
+S13f starts a sequencer with floor 5 on a chain at version 4 and checks that the chain does not
+stall. It then parks nonce 1 under version 5, switches the members and sequencer back to version 4,
+and releases it with nonce 0. Both offers use the version-4 format at release, both receipts land,
+and the batcher posts them. The test compares persisted executor and validator state. The sealer
+unit tests separately verify that an old type-7 offer below version 5 relays unchanged.
 
-### 11.4 The container shard `carry` (CI only)
+### 11.4 The container shard `chaos-carry`
 
-The plan of #781 ("E2E shard"), with these changes:
+The shard starts a reference-born chain. It enables the member feed, places the executors on
+sealer nodes, publishes executor frames to the egress, and enables the v2 sequencer loop. The
+batcher and validator move onto the egress only after their cursors pass the stored reference mark.
 
-- Deploy with `KARDAMOM_MEMBER_FEED=on` and `KARDAMOM_EXEC_ON_SEALERS=on`, and the batcher and
-  the validator on `--egress`.
-- After `up`: deploy a lockbox (`kardamom-deploy`). Send features 3, 4 and 5. Wait for
-  `carryWindow`.
-- Move the executors to carry mode one at a time with `KARDAMOM_CARRY_EXECUTORS`.
-- Run `smoke_gate`, 60 s at 100 tx/s, the converged-executors check, and `assert_persisted_state`.
-- Chaos cases: kill the leader within 2 s after the switch; stop a member before the switch and
-  start it after; turn feature 5 off and on under load; restart an egress instance.
+The cases activate features 3 and 4; release a parked sender across a version-5-to-4 downgrade;
+move the readers past R; enable feature 5 with a follower down; move the first executor and then
+the remaining executors to carry mode; disable and enable the window; kill the leader within
+2 seconds of the switch; and restart an egress instance.
+
+`carry-held-offer-after-downgrade` waits for every member and sequencer lane to report version 4.
+Both probe receipts must succeed, and the sender nonce must advance by two. The common tail
+checks the load verdict, converged executors, recovery probe and validator verdict. Persisted-state
+audits run after the first executor moves to carry mode and at the end of the shard.
 
 ### 11.5 Gate tests
 
@@ -993,6 +998,6 @@ the sections above now say what the code does.
 | C6. The job metas | Sections 9 and 10.1. The deploy sets `sealer_version_kept` and `v2_loop` (sequencer), `carried_ref_fault` (executor) and `ref_mark` (egress). `ref_mark` is new: the release gate and the upgrade check refuse while an egress of an older release runs. |
 | C6. The floor | Sections 5 and 10.1. The operator sets the floor. The release gate reads `decisionVersion` on every member and refuses a floor above the lowest value. Revision 4 said that the deploy reads and passes the value. |
 | C6. The cap in bytes | Section 4.4: 48 MiB, not 32 MiB. |
-| C6. The v2 loop | F7, section 5 and section 12, step 1. Staging runs the v1 loop, which offers record type 0 at every version and every floor. The deploy turns on the v2 loop (`KARDAMOM_SEQUENCER_ADMISSION=on`, job meta `v2_loop`) before the floor. Revision 4 said that staging runs the v2 loop. |
+| C6. The v2 loop | F7, section 5 and section 12, step 1. A chain on the v1 loop offers record type 0 at every version and every floor. The deploy turns on the v2 loop (`KARDAMOM_SEQUENCER_ADMISSION=on`, job meta `v2_loop`) before the floor. Revision 4 said that staging runs the v2 loop. |
 | C6. The staged roll | Section 10.1: `roll_step.yml` replaces `sealer_step.yml`, and the sealer and the executor share it. |
 | C2. The switch log line | Section 12, step 9: `cluster CARRY-WINDOW` with `carryWindow=true windowOnly=true`. |

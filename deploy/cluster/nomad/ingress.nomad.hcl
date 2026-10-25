@@ -29,6 +29,17 @@ variable "ack_policy" {
   default     = "on-offer"
 }
 
+# The tx_events stream (docs/specs/2026-10-25-client-events.md), "on" or
+# "off". On, the job publishes its client stage records on tx_events, best
+# effort. Ansible deployment passes -var from KARDAMOM_TX_EVENTS.
+variable "tx_events" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.tx_events)
+    error_message = "The tx_events value must be on or off."
+  }
+}
 variable "ack" {
   type        = string
   description = "When eth_sendRawTransaction answers. receipt (the default) waits for the receipt. validated answers when the ingress validated the transaction and published it on tx_data. Override with: nomad job run -var ack=validated ingress.nomad.hcl."
@@ -327,6 +338,7 @@ job "ingress" {
           "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://${var.exec_on_sealers == "on" ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:9024"]),
           ],
           var.receipt_query_endpoints == "" ? [] : ["--receipt-query-endpoints", var.receipt_query_endpoints],
+          var.tx_events == "off" ? [] : ["--tx-events", var.tx_events],
         )
       }
 

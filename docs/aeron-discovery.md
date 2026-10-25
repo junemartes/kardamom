@@ -70,6 +70,7 @@ The streams and their publishers:
 | `egress_order` | egress | the readers after the executors (batcher, validator) |
 | `egress_receipts` | egress | sequencers (with `receipts_from_egress = true`), notifier (with `--receipts-from-egress`) |
 | `tx_drops` (one record per sequencer, with its lane) | sequencer | egress |
+| `tx_events` (with `KARDAMOM_TX_EVENTS=on`) | ingress, sequencer | notifier |
 | `l1_blocks` | L1 follower (two instances) | da-watcher, batcher, follower archives |
 
 A consumer joins the publishers that the catalog lists, wherever it runs. So a move of a consumer to another node changes no channel. The notifier runs on the ingress nodes, or on its own nodes of role `notifier` with `KARDAMOM_NOTIFIER_NODES=on` (see "The notifier nodes" in `deploy/cluster/README.md`). A notifier node records no topic.
@@ -116,6 +117,14 @@ The `tx_drops` stream carries the transactions that the sequencers dropped: one 
 - Both twins of a lane publish their drops. The egress keeps one status for each hash, and a receipt of the hash wins over a drop.
 - The egress serves the status with `kardamom_getTransactionStatus`.
 - A drop with the reason `transaction dropped by the sealer, send it again` (code -32000) is provisional. The sealer refused the reference of one twin, and the other twin can still offer the transaction with its bytes. Client text: safe to send again; the status can still become executed.
+
+The `tx_events` stream carries the client stages that no other stream carries (`docs/specs/2026-10-25-client-events.md`): `accepted` from the ingress and `sent` from the sequencers. The frame reserves the kinds 3, 4 and 5 for the other stages of the spec.
+
+- The stream id is 1013. The keys are `tx_events_channel` and `tx_events_stream_id` of `[channels]`.
+- A frame has the fixed layout of `kardamom_types::tx_events`, not rkyv: a 16-byte header and fixed records of one kind.
+- Each publisher opens one dynamic MDC publication with no lane id. It publishes only with `KARDAMOM_TX_EVENTS=on`. With no subscriber, the offer answers `NOT_CONNECTED`, and the frame drops.
+- A publisher sends a frame when it is full (1,024 records) or 1 ms old, so it sends at most 1,000 frames a second for each kind.
+- Every publish is one offer with no retry. A refused offer drops the frame and counts it in `kardamom_log_best_effort_dropped_total{stream_id}`. The ingress counts a hash that its full queue dropped in `kardamom_tx_events_queue_full_total`. A publisher never waits, so the stream never slows the chain.
 
 The `l1_blocks` stream carries the finalized L1 blocks: one `L1Block` for each block, in block order.
 

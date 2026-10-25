@@ -218,3 +218,19 @@ fn a_receipt_floor_publishes_a_drop_for_each_buffered_entry_below_it() {
         "the entry at the floor publishes"
     );
 }
+
+/// With `tx_events` on, each offered reference adds one `sent` record, and
+/// a duplicate adds none, after the frames go out.
+#[test]
+fn tx_events_carry_one_sent_record_for_each_offer() {
+    let offers = kardamom_sequencer::outbound::fakes::CountedOffers::default();
+    let mut lane = Lane::new(one_partition_cfg(), 7);
+    lane.rig.errors = std::mem::take(&mut lane.rig.errors).with_tx_events(offers.clone());
+    lane.submit(0);
+    lane.submit(0);
+    lane.submit(1);
+    std::thread::sleep(kardamom_log::aeron_live::FRAME_MAX_AGE);
+    lane.step();
+    let count = |c: &std::sync::atomic::AtomicUsize| c.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(count(&offers.sent), 2);
+}

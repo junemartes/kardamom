@@ -11,13 +11,11 @@
 //!    address to the L1 follower, then features 3 and 4 by upgrade
 //!    transaction. Every member runs decision version 5, and every
 //!    sequencer keeps it.
-//! 2. `carry-full-ref-below-v5`: a full reference that the sealer orders
-//!    below version 5, on purpose. The upgrade transaction that turns
-//!    feature 4 off is final on L1. Then the v2 loop takes nonce `n + 1`
-//!    with its bytes, while its lane still keeps version 5, and holds it
-//!    for nonce `n`. When every member runs version 4, nonce `n` releases
-//!    the held nonce, which goes out with its bytes under version 4. Every
-//!    member counts it. Feature 4 turns on again.
+//! 2. `carry-held-offer-after-downgrade`: the v2 loop parks nonce `n + 1`
+//!    under version 5. Feature 4 turns off, and every member and lane
+//!    reaches version 4 before nonce `n` releases the held offer. Both
+//!    receipts must succeed and the sender nonce must advance by two.
+//!    Feature 4 turns on again.
 //! 3. `carry-readers-on-egress`: the batcher and the validator move to
 //!    the egress once they are past R, the highest stored reference, and
 //!    the sequencers get the version floor 5. R does not move.
@@ -54,7 +52,7 @@ use crate::knobs::Knobs;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     VersionsOn,
-    FullRefBelowV5,
+    HeldOfferAfterDowngrade,
     ReadersOnEgress,
     WindowOn,
     ExecutorFirst,
@@ -67,7 +65,7 @@ pub enum Step {
 /// Every step, in run order.
 pub(crate) const STEPS: &[Step] = &[
     Step::VersionsOn,
-    Step::FullRefBelowV5,
+    Step::HeldOfferAfterDowngrade,
     Step::ReadersOnEgress,
     Step::WindowOn,
     Step::ExecutorFirst,
@@ -88,7 +86,7 @@ impl Step {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::VersionsOn => "carry-versions-on",
-            Self::FullRefBelowV5 => "carry-full-ref-below-v5",
+            Self::HeldOfferAfterDowngrade => "carry-held-offer-after-downgrade",
             Self::ReadersOnEgress => "carry-readers-on-egress",
             Self::WindowOn => "carry-window-on",
             Self::ExecutorFirst => "carry-executor-first",
@@ -107,7 +105,7 @@ impl Step {
             // The lockbox deploy, then two upgrade transactions.
             Self::VersionsOn => inject + Duration::from_mins(10),
             // Two upgrade transactions and the held transfer.
-            Self::FullRefBelowV5 | Self::WindowOffOn => inject + Duration::from_mins(4),
+            Self::HeldOfferAfterDowngrade | Self::WindowOffOn => inject + Duration::from_mins(4),
             // A deploy that rolls the sequencers, the batcher and the
             // validator.
             Self::ReadersOnEgress => inject + Duration::from_mins(8),
@@ -134,7 +132,7 @@ impl Step {
         };
         match self {
             Self::VersionsOn => run.versions_on().await,
-            Self::FullRefBelowV5 => run.full_ref_below_v5().await,
+            Self::HeldOfferAfterDowngrade => run.held_offer_after_downgrade().await,
             Self::ReadersOnEgress => run.readers_on_egress().await,
             Self::WindowOn => run.window_on().await,
             Self::ExecutorFirst => run.executor_first().await,

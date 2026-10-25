@@ -446,6 +446,13 @@ pub struct ChannelsConfig {
     pub tx_drops_channel: ChannelUri,
     pub tx_drops_stream_id: i32,
 
+    /// `tx_events`: the client stages that no other stream carries, in the
+    /// fixed frames of `kardamom_types::tx_events`. The ingress and the
+    /// sequencers publish, and the notifier reads. Best effort, RAM only,
+    /// not recorded.
+    pub tx_events_channel: ChannelUri,
+    pub tx_events_stream_id: i32,
+
     /// `l1_blocks`: the L1 follower publishes one `L1Block` for each
     /// finalized L1 block, in block order. Every follower instance
     /// publishes every block; a consumer keeps the first record of each
@@ -545,7 +552,7 @@ impl ChannelsConfig {
 
     /// The id of every stream except the `tx_data` lanes, with the key
     /// that sets it.
-    fn single_stream_ids(&self) -> [(&'static str, i32); 15] {
+    fn single_stream_ids(&self) -> [(&'static str, i32); 16] {
         [
             ("tx_receipts_stream_id", self.tx_receipts_stream_id),
             (
@@ -566,6 +573,7 @@ impl ChannelsConfig {
             ("egress_order_stream_id", self.egress_order_stream_id),
             ("egress_receipts_stream_id", self.egress_receipts_stream_id),
             ("tx_drops_stream_id", self.tx_drops_stream_id),
+            ("tx_events_stream_id", self.tx_events_stream_id),
             ("l1_blocks_stream_id", self.l1_blocks_stream_id),
             ("fsync_watermark_stream_id", self.fsync_watermark_stream_id),
         ]
@@ -812,6 +820,9 @@ impl Default for ChannelsConfig {
             // transaction status that the egress serves.
             tx_drops_channel: "aeron:ipc?alias=tx-drops".into(),
             tx_drops_stream_id: 1012,
+            // 1013 follows tx_drops (1012): the other client signal.
+            tx_events_channel: "aeron:ipc?alias=tx-events".into(),
+            tx_events_stream_id: 1013,
             // 1020 follows the events stream (1019), the last of the
             // 1015..=1019 side-stream block.
             l1_blocks_channel: "aeron:ipc?alias=l1-blocks".into(),

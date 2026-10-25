@@ -7,6 +7,12 @@
   differ, this spec wins.
 - Amends the design comments of #585 (the serving service, called the egress here) and #706 (the
   sequencer gateway).
+- Status update (2026-10-25). The body of this spec does not show these changes:
+  - P1 to P12 and P14 are done. Feature 4 is active on staging since 2026-10-21. P13 (the
+    cleanup, #599) waits until feature 4 and feature 5 are active on every network.
+  - Sections 1 and 6.4: the egress will send its stored head to the sealer (ingress kind 12), and
+    the Raft-log purge floor will follow it (owner decision of 2026-10-24, #639). The egress keeps
+    its order from the executors (D6).
 
 ## 1. The principle
 

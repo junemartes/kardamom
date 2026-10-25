@@ -3,6 +3,7 @@
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 use alloy_primitives::{Address, Bytes};
 use alloy_provider::{Provider, ProviderBuilder};
@@ -10,11 +11,15 @@ use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
+use kardamom_deployer::smoke::TransferSmoke;
 use kardamom_deployer::{
     ContractId, Deployer, FactoryStatus, Op, RegistryEntry, VerifyMismatch, encode_address_arg,
     encode_address_pair, encode_oracle_init_args,
 };
 use kardamom_formats::FormatGate;
+
+/// The time that the receipt of a smoke transfer has to arrive in.
+const SMOKE_BUDGET: Duration = Duration::from_mins(1);
 
 #[derive(Debug, Parser)]
 #[command(name = "kardamom-deploy", version)]
@@ -25,7 +30,7 @@ struct Cli {
 
     /// Canonical owner address (Safe or EOA). The same owner gives the same
     /// factory address. Each command that reads or writes the contracts
-    /// requires it; `formats` reads no chain. Pass `--owner` before the
+    /// requires it; `formats` and `smoke` read no contract. Pass `--owner` before the
     /// subcommand.
     #[arg(long)]
     owner: Option<Address>,
@@ -141,6 +146,18 @@ enum Command {
         #[arg(long)]
         root: PathBuf,
     },
+
+    /// Send one signed transfer of one wei from a genesis account through
+    /// the ingress at `--rpc-url`, and wait for its receipt. The deploy
+    /// role smokes a canary with it.
+    Smoke {
+        /// The chain id that the transfer signs for.
+        #[arg(long)]
+        chain_id: NonZeroU64,
+        /// The index of the genesis account that sends.
+        #[arg(long, default_value_t = 0)]
+        account: u32,
+    },
 }
 
 #[tokio::main]
@@ -210,6 +227,15 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string(&findings)?);
             Ok(())
         }
+        Command::Smoke { chain_id, account } => TransferSmoke {
+            rpc_url: cli.rpc_url,
+            chain_id,
+            account,
+            budget: SMOKE_BUDGET,
+        }
+        .run()
+        .await
+        .map(|_| ()),
     }
 }
 

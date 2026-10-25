@@ -13,7 +13,7 @@ use kardamom_types::cluster_status::SilenceDeadline;
 
 use super::endpoints::{now_ms, now_ms_i64, open_leader_pub, open_next_member_pub, to_aligned};
 use super::meters::{Depths, SessionMeters};
-use super::{LiveClusterConfig, OfferReq, ReplayOnConnect};
+use super::{LiveClusterConfig, OfferReply, OfferReq, ReplayOnConnect, SessionMark};
 use crate::gateway::OfferOutcome;
 use crate::wire::{
     EGRESS_KIND_BOUNDARY, EGRESS_KIND_REPLAY_AHEAD, EGRESS_KIND_REPLAY_DONE,
@@ -281,6 +281,9 @@ struct SessionLoop {
     endpoints: String,
     target_member: i32,
     ingress: PubHandle,
+    /// The mark of the session that opened last, `None` before the first
+    /// one. A fenced offer for another session gets no publish.
+    session: Option<SessionMark>,
     replay: Option<ReplayOnConnect>,
     subscribe: bool,
     egress_kind_filter: Option<Vec<u8>>,
@@ -366,6 +369,7 @@ impl SessionLoop {
             endpoints,
             target_member,
             ingress,
+            session: None,
             replay,
             subscribe,
             egress_kind_filter,
@@ -456,6 +460,7 @@ impl SessionLoop {
                 // delivery cursor on every establishment. Force an
                 // immediate (re)send below.
                 self.replay_ask.rearm();
+                self.session = Some(SessionMark::after(self.session));
                 self.mark_session_start(cluster_session_id);
                 self.subscribe_resend.rearm();
                 self.subscribe_confirmed = false;
@@ -691,25 +696,35 @@ impl SessionLoop {
         let mut worked = false;
         while let Some(req) = next_item(&self.req_rx, &mut self.req_rx_dead) {
             worked = true;
-            self.handle_one_offer(req, now);
+            self.handle_one_offer(&req, now);
         }
         worked
     }
 
     /// One offer request, for [`Self::handle_offers`]'s loop: wrap and
-    /// publish the payload, then reply with the outcome.
-    fn handle_one_offer(&mut self, req: OfferReq, now: u64) {
-        let OfferReq { payload, reply } = req;
+    /// publish the payload, then reply with the outcome and the open
+    /// session. A fenced offer for another session gets no publish.
+    fn handle_one_offer(&mut self, req: &OfferReq, now: u64) {
         let started = Instant::now();
-        let outcome = match self.driver.wrap_app(payload.as_bytes(), now_ms_i64(now)) {
+        let outcome = if req.fenced_off(self.session) {
+            OfferOutcome::SessionChanged
+        } else {
+            self.publish_offer(req.payload.as_bytes(), now)
+        };
+        self.meters.offered(started);
+        let session = self.session;
+        let _ = req.reply.send(OfferReply { outcome, session });
+    }
+
+    /// Wrap and publish one payload on the open session.
+    fn publish_offer(&mut self, payload: &[u8], now: u64) -> OfferOutcome {
+        match self.driver.wrap_app(payload, now_ms_i64(now)) {
             Some(framed) => match self.ingress.publish_bytes(to_aligned(&framed)) {
                 Ok(_) => OfferOutcome::Accepted,
                 Err(_) => OfferOutcome::BackPressured,
             },
             None => OfferOutcome::NotConnected,
-        };
-        self.meters.offered(started);
-        let _ = reply.send(outcome);
+        }
     }
 
     /// Wait for work instead of sleeping through it. Block until an
