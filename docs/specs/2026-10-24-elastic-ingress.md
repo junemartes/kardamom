@@ -497,6 +497,12 @@ The order of the findings holds. This spec adds two steps (marked new):
 
 ## 6. Part C: the notifier on its own nodes
 
+> **Superseded in part (2026-10-25).** The client-events spec, decision 2
+> (`docs/specs/2026-10-25-client-events.md`), removes the notifier webhooks. So the peers list,
+> `--instance-count` and the webhook checks in this section are superseded (lines 123, 163,
+> 544-549, 805-806, 860 and 904 of revision 3). The notifier keeps no state, and a change of
+> its count moves nothing.
+
 ### 6.1 The infra change (kardamom-infra)
 
 - **Two phases.** kardamom-infra #79 (approved) adds notifier-0 now. notifier-1 follows after a
@@ -767,6 +773,12 @@ The user's last pool shape was min 2 and max 3 cpx32. These blockers stay open:
 - **The tests.** A chaos shard for a scale-out and a scale-in under load.
 
 ## 10. The staging rollout
+
+> **Superseded in part (2026-10-25).** The client-events spec, decision 2
+> (`docs/specs/2026-10-25-client-events.md`), removes the notifier webhooks. So the peers list,
+> `--instance-count` and the webhook checks in this rollout are superseded (lines 123, 163,
+> 544-549, 805-806, 860 and 904 of revision 3). The notifier keeps no state, and a change of
+> its count moves nothing.
 
 Each step names its checks. Do not start a step until the checks of the step before pass.
 **A step marked "needs the user's explicit approval" does not start without it.**
