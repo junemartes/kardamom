@@ -141,6 +141,16 @@ pub enum ExecutorError {
     )]
     UnjoinableReference { index: u64 },
 
+    /// Every source of the carried reader sent an entry at `index` whose
+    /// raw transaction does not hash to its canonical id. A source that
+    /// never connected counts as one that sent it. No source serves the
+    /// right bytes, so the consumer stops. The entry does not execute. A
+    /// validator latches this error as a divergence.
+    #[error(
+        "no source holds the right bytes of the entry at index {index}: the raw transaction does not hash to its canonical id"
+    )]
+    HashMismatch { index: u64 },
+
     /// `sequencer_id` is the `tx_data` lane index, `TxRef::shard_id`. It
     /// names the archive that holds the envelope, not the process that
     /// published the ref.

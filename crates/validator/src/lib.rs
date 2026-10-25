@@ -172,10 +172,13 @@ impl Divergence {
 /// Classify the engine loop's terminal error for exit semantics.
 ///
 /// A [`ExecutorError::RecordIdentity`] error is proof: keccak or ecrecover
-/// rejected the canonical stream's claimed identity. This is the same class
-/// as a proven divergence, so the process must latch (exit 2, page the
-/// humans). It must not exit 1 into the supervisor's restart loop, or a
-/// forging sequencer would look like an outage and retry forever.
+/// rejected the canonical stream's claimed identity. A
+/// [`ExecutorError::HashMismatch`] error is the same proof from the carried
+/// reader: no source sent bytes that hash to the canonical id. This is the
+/// same class as a proven divergence, so the process must latch and hold
+/// the `validator_divergence` halt. It must not exit 1 into the
+/// supervisor's restart loop, or a forging sequencer would look like an
+/// outage and retry forever.
 ///
 /// No `Divergence` arm is needed here: every validator seam that proves a
 /// divergence records it before it returns the error. Every other error is
@@ -183,11 +186,11 @@ impl Divergence {
 ///
 /// Returns whether the error latched.
 pub fn latch_integrity_failure(divergence: &Divergence, err: &ExecutorError) -> bool {
-    match err {
-        ExecutorError::RecordIdentity(reason) => {
-            divergence.record(format!("record identity forged: {reason}"));
-            true
-        }
-        _ => false,
-    }
+    let reason = match err {
+        ExecutorError::RecordIdentity(reason) => reason.clone(),
+        ExecutorError::HashMismatch { .. } => err.to_string(),
+        _ => return false,
+    };
+    divergence.record(format!("record identity forged: {reason}"));
+    true
 }
