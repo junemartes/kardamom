@@ -20,6 +20,8 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import yaml
+
 ANSIBLE = Path(__file__).resolve().parents[1]
 SERVICES = ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher',
             'batcher', 'state-mirror', 'notifier', 'da-store', 'canary']
@@ -355,18 +357,26 @@ class NomadAPI(BaseHTTPRequestHandler):
         allocs = []
         job = state['jobs'][name]
         for group in job['TaskGroups']:
-            # The scheduler places a system group on the nodes its
-            # constraints admit; the playbook must not assume a node count.
-            count = 8 if job['Type'] == 'system' else group['Count']
+            # The scheduler places a system or sysbatch group on the nodes
+            # its constraints admit; the playbook must not assume a node count.
+            per_node = job['Type'] in ('system', 'sysbatch')
+            count = 8 if per_node else group['Count']
+            # A sysbatch allocation that ends well is complete; the others run.
+            done = 'complete' if job['Type'] == 'sysbatch' else 'running'
             for i in range(count):
                 # Historical/stopping allocations must not satisfy readiness.
                 stale = state.get('missing_replica') == name and i > 0
                 # A job the test names has no running allocation: a crash loop.
                 running = name not in state.get('not_running', ()) \
                     and group['Name'] not in state.get('down_groups', ())
+                # A node that the test takes down holds the first allocation
+                # of the job. Nomad stops the allocation of a down node and
+                # marks it lost.
+                lost = name in state.get('down_node_jobs', ()) and i == 0
                 # Each instance of a group has its own node.
                 allocs.append({'TaskGroup': group['Name'], 'JobVersion': self.version(name) - int(stale),
-                               'DesiredStatus': 'run', 'ClientStatus': 'running' if running else 'pending',
+                               'DesiredStatus': 'stop' if lost else 'run',
+                               'ClientStatus': 'lost' if lost else done if running else 'pending',
                                'NodeID': f'node-{group["Name"]}' + (f'.{i}' if i else ''),
                                'DeploymentStatus': {'Canary': False}})
         return allocs
@@ -516,8 +526,9 @@ class Deploys(unittest.TestCase):
         return result.stdout
 
     # The jobs a manifest with new digests changes, in deploy order: every
-    # pinned image, and not anvil or the monitoring.
-    REPINNED = ['aeron', 'cluster', 'sequencer', 'redis', 'ingress', 'executor', 'state-mirror', 'notifier',
+    # pinned image, and not anvil or the monitoring. The data directory job
+    # runs the Aeron image of the manifest.
+    REPINNED = ['data-dirs', 'aeron', 'cluster', 'sequencer', 'redis', 'ingress', 'executor', 'state-mirror', 'notifier',
                 'validator', 'da-watcher', 'da-store', 'l1-indexer', 'batcher']
 
     def record(self):
@@ -612,7 +623,7 @@ class DeployTest(Deploys):
         local_canary = {'CANARY_LOCAL': '1'}
         self.run_deploy(environ=local_canary)
         self.assertIn('-Daeron.archive.file.sync.level=1', json.dumps(self.api.state['jobs']['aeron']))
-        expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
+        expected = ['data-dirs', 'aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
                     'da-store', 'l1-indexer', 'batcher', 'canary']
         self.assertEqual(self.api.state['writes'], expected)
@@ -1484,6 +1495,55 @@ class DeployTest(Deploys):
         self.run_deploy(success=False)
         self.assertNotIn('batcher', self.api.state['writes'])
 
+    def test_the_deploy_makes_every_data_directory_on_every_node_first(self):
+        self.run_deploy(environ={'CANARY_LOCAL': '1'})
+        self.assertEqual(self.api.state['writes'][0], 'data-dirs')
+        job = self.api.state['jobs']['data-dirs']
+        self.assertEqual((job['Type'], job['NodePool']), ('sysbatch', 'all'))
+        task = job['TaskGroups'][0]['Tasks'][0]
+        config = task['Config']
+        # The signed Aeron image of the manifest, as root: no other image.
+        self.assertEqual(config['image'], f'registry.example:5000/kardamom-aeron:test@sha256:{"a" * 64}')
+        self.assertEqual(task['User'], 'root')
+        self.assertEqual(config['volumes'], ['/opt/kardamom:/opt/kardamom'])
+        self.assertEqual(config['entrypoint'], ['/bin/sh', '-c', 'mkdir -p "$@" && chmod 0777 "$@"', 'data-dirs'])
+        dirs = config['args']
+        self.assertIn('/opt/kardamom/canary', dirs)
+        # One list: the common role makes the same directories.
+        group_vars = yaml.safe_load((ANSIBLE / 'group_vars/all.yml').read_text())
+        listed = [group_vars['paths'][re.fullmatch(r'\{\{ paths\.(\w+) \}\}', d).group(1)]
+                  for d in group_vars['node_data_dirs']['paths']]
+        self.assertEqual(dirs, listed)
+        common = yaml.safe_load((ANSIBLE / 'roles/common/tasks/main.yml').read_text())
+        task = next(t for t in common if t['name'] == 'Create on-node kardamom directories')
+        self.assertEqual((task['loop'], task['ansible.builtin.file']['mode']),
+                         ('{{ node_data_dirs.paths }}', '{{ node_data_dirs.mode }}'))
+        # Every host directory that a job mounts is in the list. The
+        # exceptions: the Aeron tmpfs, which the common role mounts, and the
+        # directories of the sealer, whose image runs as root.
+        exempt = {'/opt/kardamom/aeron-mount', '/opt/kardamom/cluster', '/opt/kardamom/seed'}
+        mounted = {volume.split(':')[0] for job in self.api.state['jobs'].values()
+                   for group in job['TaskGroups'] for task in group['Tasks']
+                   for volume in (task['Config'].get('volumes') or [])}
+        self.assertEqual({d for d in mounted if d.startswith('/opt/kardamom/')} - exempt - set(dirs), set())
+
+    def test_a_down_node_does_not_hold_the_data_directory_job(self):
+        self.api.state['down_node_jobs'] = ['data-dirs']
+        self.run_deploy()
+        self.assertEqual(self.api.state['writes'][:2], ['data-dirs', 'aeron'])
+
+    def test_an_incomplete_data_directory_job_stops_the_deploy_before_any_service(self):
+        self.api.state['not_running'] = ['data-dirs']
+        self.run_deploy(success=False)
+        self.assertEqual(self.api.state['writes'], ['data-dirs'])
+
+    def test_an_unhealthy_canary_job_fails_the_deploy(self):
+        self.api.state['deployments']['canary'] = Deployment('canary', ['running', 'failed'])
+        output = self.run_deploy(environ={'CANARY_LOCAL': '1'}, success=False)
+        self.assertIn('scripted failed', output)
+        self.assertEqual(self.api.state['writes'][-1], 'canary')
+        self.assertFalse((self.record_dir / 'images.digests').exists(), 'a failed deploy records nothing')
+
     def test_a_canary_is_smoked_by_its_node_then_promoted(self):
         self.api.state['deployments']['ingress'] = Deployment('ingress', [], canary=True)
         self.run_deploy()
@@ -1556,7 +1616,7 @@ class RecordTest(Deploys):
         self.run_deploy(success=False)
         attempt = self.record()['attempt']
         self.assertEqual(attempt['status'], 'started')
-        self.assertEqual(attempt['changed'], ['aeron', 'cluster', 'sequencer', 'redis', 'ingress'])
+        self.assertEqual(attempt['changed'], ['data-dirs', 'aeron', 'cluster', 'sequencer', 'redis', 'ingress'])
         self.assertEqual(self.record()['accepted'], accepted, 'a failed attempt is never the accepted release')
         self.assertEqual(json.loads((self.record_dir / 'accepted.json').read_text()), accepted)
         # The attempt is still started: it runs, or it died. Only the
@@ -2033,7 +2093,7 @@ class RollbackTest(Deploys):
         reverted = [w for w in self.api.state['writes'] if w.startswith('revert:')]
         self.assertEqual(reverted, ['revert:da-watcher:0', 'revert:validator:0', 'revert:notifier:0', 'revert:state-mirror:0',
                                     'revert:executor:0', 'revert:ingress:0', 'revert:redis:0', 'revert:sequencer:0',
-                                    'revert:aeron:0'])
+                                    'revert:aeron:0', 'revert:data-dirs:0'])
         self.assertEqual(self.api.state['writes'].count('cluster'), 3)
         self.assertNotIn('revert:batcher:0', self.api.state['writes'], 'the failed attempt never reached the batcher')
         self.assertEqual(self.record()['accepted']['target']['manifest']['executor'],
@@ -2056,7 +2116,7 @@ class RollbackTest(Deploys):
         self.assertIn('ingress is at version 2, the pre-release definition', output)
         self.assertNotIn('revert:ingress:0', self.api.state['writes'])
         self.assertIn('revert:redis:0', self.api.state['writes'])
-        self.assertEqual(self.record()['attempt']['rolled_back'], ['ingress', 'redis', 'sequencer', 'cluster', 'aeron'])
+        self.assertEqual(self.record()['attempt']['rolled_back'], ['ingress', 'redis', 'sequencer', 'cluster', 'aeron', 'data-dirs'])
         self.assertEqual(self.record()['attempt']['status'], 'rolled_back')
 
     def test_a_rollback_that_stops_resumes_after_the_jobs_it_reverted(self):
@@ -2079,9 +2139,11 @@ class RollbackTest(Deploys):
         output = self.run_rollback()
         self.assertIn('executor is at version 2, the pre-release definition', output)
         self.assertEqual(self.api.state['writes'],
-                         ['revert:ingress:0', 'revert:redis:0', 'revert:sequencer:0', 'cluster', 'cluster', 'cluster', 'revert:aeron:0'])
+                         ['revert:ingress:0', 'revert:redis:0', 'revert:sequencer:0', 'cluster', 'cluster', 'cluster', 'revert:aeron:0',
+                          'revert:data-dirs:0'])
         self.assertEqual(self.record()['attempt']['status'], 'rolled_back')
-        self.assertEqual(self.record()['attempt']['rolled_back'], done + ['executor', 'ingress', 'redis', 'sequencer', 'cluster', 'aeron'])
+        self.assertEqual(self.record()['attempt']['rolled_back'],
+                         done + ['executor', 'ingress', 'redis', 'sequencer', 'cluster', 'aeron', 'data-dirs'])
 
     def test_a_rollback_does_not_cross_the_floor(self):
         self.gate_formats([{'rule': 'rollback', 'id': 'state-db', 'head': 4, 'base': 3}])
