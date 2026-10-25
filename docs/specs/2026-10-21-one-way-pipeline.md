@@ -55,8 +55,10 @@ paths of today. This amendment removes them.
 
 46. **The egress serves every JSON-RPC read (D13).** The egress serves `eth_getTransactionReceipt`,
     `eth_getBalance`, `eth_getTransactionCount`, `eth_blockNumber`, the fee methods,
-    `kardamom_blockNumberByTag` (with `safe` and `finalized`), `kardamom_chainStatus`,
-    `kardamom_getTransactionStatus` and the subscriptions.
+    `kardamom_blockNumberByTag` (with `safe` and `finalized`), `kardamom_chainStatus` and
+    `kardamom_getTransactionStatus`.
+    - The notifier serves the subscriptions (WebSocket), not the egress (user decision of
+      2026-10-25, resolving the conflict with #817). No webhooks for the new stage events for now.
     - The load balancer sends the read methods to the egress. It sends only
       `eth_sendRawTransaction` and `kardamom_sendRawTransactionAsync` to the ingress.
     - The ingress has no read path and no receipt stream.
@@ -88,8 +90,10 @@ paths of today. This amendment removes them.
     in, at the ingress, and not on the order.
 
 50. **No `tx_errors` and no `tx_verdicts` (D17).** The sequencer sends nothing to the ingress. A
-    rejected or dropped transaction is visible only through the status API of the egress:
-    `kardamom_getTransactionStatus`, `kardamom_subscribeTxStatus` and the webhooks.
+    rejected or dropped transaction is visible in two ways (user decision of 2026-10-25,
+    resolving the conflict with #817):
+    - the status API of the egress (`kardamom_getTransactionStatus`);
+    - a pushed event through the notifier, which also pushes the receipts.
     Reason: with decision 47, no reader of these streams answers a client. The drops already go
     to the egress on `tx_drops` (section 3.3).
 
@@ -198,7 +202,7 @@ The consequences:
 | `safe`, `finalized` | The posted head from `l1_blocks` (#807). The L1 follower publishes only finalized L1 blocks (open question 1). |
 | `kardamom_chainStatus` | `posted_head` from `l1_blocks`. `sealed_head` becomes the head of the store, which lags the sealer by the executor delay. The halts come from the `events` stream. The sealer state comes from the age of the newest frame (open question 2). `da_lag_budget_blocks`, `best_recorded` and the `record_lag_*` fields go. |
 | `kardamom_getTransactionStatus` | The receipts and the drops, as built (section 10.4). |
-| `kardamom_subscribeReceipts`, `kardamom_subscribeTxStatus`, the webhooks | `egress_receipts` and the drops. The client side of the notifier moves into the egress (P8). |
+| `kardamom_subscribeReceipts`, `kardamom_subscribeTxStatus` | The notifier, fed by `egress_receipts` and the drop and refusal events (decisions 46 and 50, updated on 2026-10-25). No webhooks for the new stage events for now. |
 | `eth_chainId` | A setting. |
 
 The load balancer must read the method of each request (open question 9).
@@ -263,18 +267,17 @@ The load balancer must read the method of each request (open question 9).
       margin, and a reader below that margin recovers from the egress or a peer checkpoint;
     - another source that sends no message to the sealer?
 
-11. **The conflict with the notifier spec of #817 (revision 6, approved on 2026-10-25).** Four
-    points differ. Which design holds for each?
-    - Decision 46: the egress serves the subscriptions. #817: the notifier serves the WebSocket
-      feeds and the webhooks, and the notifier stays a separate service.
-    - Decision 45: no service reads an executor. #817: the notifier taps the executors'
-      `tx_receipts` for an `executed` stage, behind a switch, for the evaluation.
-    - Decisions 48 and 50: no `TxDrop` from kind 18 and no `tx_errors`. #817: the notifier pushes
-      `dropped` and `rejected` events.
-    - Decision 49: no DA-lag guard. #817: the ingress halts on an explicit `da_lag` status.
+11. **The conflict with the notifier spec of #817.** The user decided on 2026-10-25:
+    - the notifier serves the subscriptions, and the egress serves every other read method
+      (decision 46, updated);
+    - drops and refusals are pushed as events through the notifier, and the egress status API
+      serves them too (decision 50, updated);
+    - no webhooks for the new stage events for now.
 
-    A possible middle way: the notifier stays the push service, and it reads only the egress
-    (receipts and drop records). Decisions 45 and 50 then hold, and the push API of #817 stays.
+    Still open: the executor `executed` tap of #817 (a read of the executors against decision
+    45). The proposal of #817 keeps it behind `KARDAMOM_NOTIFIER_EXECUTED`, off by default, for the
+    evaluation only. Also open: the ingress halt on an explicit `da_lag` status of #817 against
+    decision 49.
 
 ## 1. The principle
 
@@ -538,7 +541,7 @@ Amended on 2026-10-25 by decisions 45, 46 and 49.
 | State mirror | Decision 45: `egress_receipts`, in place of `tx_receipts`. It feeds Redis. |
 | Notifier | Decision 45: `egress_receipts` and the drops of the egress, until P8 moves its client side into the egress. |
 | Ingress | `eth_getTransactionReceipt` reads the egress. (Superseded by decision 46 (2026-10-25): the ingress reads nothing from the egress. Its nonce check reads Redis, section 3.5.) |
-| Clients | Webhooks and `kardamom_subscribeTxStatus` of the egress. Decision 46: every JSON-RPC read, through the load balancer (amendment A.5). |
+| Clients | Decision 46: every JSON-RPC read except the subscriptions, through the load balancer (amendment A.5). The notifier serves the subscriptions. |
 
 - A reader keeps its old source until the carry flag is active on every network. (Amended by
   decision 51 (2026-10-25): the old sources go after the activation on staging.)
