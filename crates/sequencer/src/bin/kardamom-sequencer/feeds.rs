@@ -323,9 +323,10 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
     ///
     /// The sealer rejected one of this sequencer's refs because a known
     /// sender's nonce was not the expected next one. Forward
-    /// `(sender, nonce, expected)` to the publish loop, which rewinds
+    /// `(sender, nonce, expected)` to the publish loop. The v1 loop rewinds
     /// the unconfirmed ledger and republishes right away, instead of
-    /// waiting out the confirm timeout.
+    /// waiting out the confirm timeout. The rules tell the v2 loop, which
+    /// offers the run again from the expected nonce.
     fn on_reject_frame(&mut self, frame: &[u8]) -> bool {
         if frame.first() != Some(&wire::EGRESS_KIND_CONTIGUITY_REJECT) {
             return false;
@@ -345,6 +346,7 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
             expected,
             "sealer contiguity reject received"
         );
+        self.rules.on_contiguity_reject(sender, nonce, expected);
         self.forward_answer(SealerAnswer::ContiguityReject {
             sender,
             nonce,

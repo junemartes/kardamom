@@ -14,6 +14,10 @@ pub enum OfferOutcome {
     Accepted,
     BackPressured,
     NotConnected,
+    /// The session changed since the last offer of a fenced ingress, and
+    /// the ingress offered nothing. The old session can have lost the
+    /// payloads that it took. The next offer goes to the new session.
+    SessionChanged,
     /// The payload does not fit one cluster session message. A retry
     /// cannot succeed.
     TooLarge {

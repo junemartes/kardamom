@@ -19,6 +19,23 @@
 //! confirms within its loss window. Offers wait in an outbox while the
 //! sealer is back-pressured; a full outbox stops the intake.
 //!
+//! The filter keeps each forwarded transaction until a row confirms it.
+//! The loop offers it again in two cases, so the sealer never orders a
+//! later nonce of a sender in place of a lost one:
+//! - The cluster session changed (a leader change or a reconnect). The
+//!   old session can have lost the offers that it took. The publisher
+//!   refuses the first offer on the new session, and the loop then puts
+//!   every unconfirmed run in the outbox again, in nonce order, before any
+//!   new offer. The sealer absorbs a copy of an ordered offer.
+//! - The contiguity guard of the sealer rejects a nonce. The loop offers
+//!   the transaction at the expected nonce and the rejected one again,
+//!   when the filter still holds the expected one.
+//!
+//! The loop builds each offer when it goes to the outbox, in the format of
+//! the decision version that the sealer reports at that time. So the
+//! offers of one sender change format once, in nonce order, at a version
+//! switch, also for a transaction that waited for a nonce gap.
+//!
 //! The loop records the counters of the v1 loop under the same names, and
 //! the parked depth of each vslot ([`depth`]) at each sweep.
 
@@ -158,22 +175,35 @@ pub enum AccountEvent {
     /// The sealer refused the forwarded transaction of `sender` at `nonce`
     /// (egress kind 18). The filter forgets the run, so a resend goes out.
     Refused { sender: Address, nonce: u64 },
+    /// The contiguity guard of the sealer rejected the forwarded
+    /// transaction of `sender` at `nonce`, because it expects `expected`
+    /// (egress kind 5).
+    Rejected {
+        sender: Address,
+        nonce: u64,
+        expected: u64,
+    },
 }
 
 /// What the loop needs to offer one forwarded transaction.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RefPayload {
     /// The vslot of the sender, for the parked depth.
     vslot: u8,
     lane: u8,
     loc: TxDataLoc,
-    /// The deadline field of the guard header.
-    deadline: u64,
+    /// The deadline of the envelope, for the deadline field below decision
+    /// version 4.
+    max_inclusion_block: u64,
+    /// The position of the transaction in its image, for the deadline field
+    /// from decision version 4 on.
+    stream_position: u64,
     tip: u128,
-    /// The archived envelope, when the sealer carries the bytes. A parked
-    /// transaction keeps it until it goes out: the filter bounds the parked
-    /// transactions of each sender, and the park width and time to live
-    /// bound how long they stay.
+    /// The archived envelope, when the sealer carried the bytes at
+    /// admission. A parked or forwarded transaction keeps it until it goes
+    /// out or a row confirms it: the filter bounds the parked and the
+    /// forwarded transactions of each sender, and the park width, the time
+    /// to live and the loss window bound how long they stay.
     envelope: Option<bytes::Bytes>,
 }
 
@@ -353,7 +383,50 @@ impl AdmissionLoop {
             AccountEvent::Refused { sender, nonce } => {
                 self.admission.on_refused(sender, nonce, &mut self.verdicts);
             }
+            AccountEvent::Rejected {
+                sender,
+                nonce,
+                expected,
+            } => self.offer_rejected(sender, nonce, expected),
         }
+    }
+
+    /// The guard of the sealer expects `expected` of `sender`, and rejected
+    /// `nonce`. Offer the transactions at both nonces again, when the
+    /// filter holds the one at `expected`. Each such reject moves the
+    /// expected nonce up by at least one, so the offers end. A guard that
+    /// expects a nonce that the filter does not hold changes nothing: the
+    /// loss window frees the run.
+    fn offer_rejected(&mut self, sender: Address, nonce: u64, expected: u64) {
+        if self.admission.unconfirmed_at(sender, expected).is_none() {
+            return;
+        }
+        let offers: Vec<RefOffer> = [expected, nonce]
+            .into_iter()
+            .filter_map(|n| self.admission.unconfirmed_at(sender, n))
+            .map(|c| self.offer_of(c))
+            .collect();
+        self.outbox.extend(offers);
+    }
+
+    /// The cluster session changed: the old session can have lost the
+    /// offers that it took. Put every unconfirmed run in the outbox again,
+    /// in place of what waits there, so the runs go out before any new
+    /// offer. The outbox holds only forwarded transactions, and each one is
+    /// in its run.
+    fn offer_again_on_new_session(&mut self) {
+        let offers: Vec<RefOffer> = self
+            .admission
+            .unconfirmed()
+            .map(|c| self.offer_of(c))
+            .collect();
+        tracing::warn!(
+            partition = self.cfg.partition,
+            offers = offers.len(),
+            "sequencer v2: the sealer session changed; offering the unconfirmed runs again"
+        );
+        self.outbox.clear();
+        self.outbox.extend(offers);
     }
 
     fn sweep_if_due(&mut self, now: Instant) {
@@ -395,10 +468,6 @@ impl AdmissionLoop {
                 return Ok(());
             }
         };
-        let deadline = self.guard_deadline(
-            inbound.envelope.max_inclusion_block,
-            inbound.stream_position,
-        );
         let candidate = Candidate {
             sender,
             nonce: fields.nonce,
@@ -415,7 +484,8 @@ impl AdmissionLoop {
                 vslot,
                 lane: inbound.lane,
                 loc: inbound.loc,
-                deadline,
+                max_inclusion_block: inbound.envelope.max_inclusion_block,
+                stream_position: inbound.stream_position,
                 tip,
                 envelope: self.carried(&inbound.envelope)?,
             },
@@ -440,13 +510,29 @@ impl AdmissionLoop {
             .map_err(|e| SequencerError::EncodeFailed(format!("envelope: {e}")))
     }
 
-    /// The deadline field: the tagged position under decision version 4,
-    /// the envelope's deadline otherwise.
-    fn guard_deadline(&self, max_inclusion_block: u64, stream_position: u64) -> u64 {
-        if !self.sealer_version.orders_by_position() {
-            return max_inclusion_block;
+    /// The offer of `c` in the format of the decision version that the
+    /// sealer reports now: the bytes from version 5 on, and the tagged
+    /// position in the deadline field from version 4 on.
+    fn offer_of(&self, c: &Candidate<RefPayload>) -> RefOffer {
+        let p = &c.payload;
+        let deadline = if self.sealer_version.orders_by_position() {
+            position_deadline(p.stream_position).unwrap_or(p.max_inclusion_block)
+        } else {
+            p.max_inclusion_block
+        };
+        RefOffer {
+            tx_ref: kardamom_types::TxRef::new(c.tx_hash, p.lane, p.loc.position, p.loc.session_id),
+            guard: GuardHeader {
+                sender: c.sender,
+                nonce: c.nonce,
+                max_inclusion_block: deadline,
+                tip: p.tip,
+            },
+            envelope: p
+                .envelope
+                .clone()
+                .filter(|_| self.sealer_version.carries_bytes()),
         }
-        position_deadline(stream_position).unwrap_or(max_inclusion_block)
     }
 
     /// Turn the verdicts into offers, client errors and lookups.
@@ -470,7 +556,7 @@ impl AdmissionLoop {
                 if let Some(ack) = c.answer() {
                     self.to_ingress.accept(ack);
                 }
-                self.outbox.push_back(offer_of(&c));
+                self.outbox.push_back(self.offer_of(&c));
             }
             Verdict::Reject(mut c, refusal) => {
                 self.depth.gave(c.payload.vslot);
@@ -504,9 +590,6 @@ impl AdmissionLoop {
         }
         let (published, err) = self.pipeline.offer(refs, self.outbox.make_contiguous());
         self.hot.publish.increment(published as u64);
-        if matches!(err, Some(SequencerError::Backpressure)) {
-            self.hot.backpressure.increment(1);
-        }
         for offer in self.outbox.drain(..published) {
             side.publish_status(TxStatus::offered(
                 offer.tx_ref.tx_hash,
@@ -515,7 +598,17 @@ impl AdmissionLoop {
             ));
             side.note_sent(&offer.tx_ref.tx_hash);
         }
-        err.map_or(Ok(()), Err)
+        match err {
+            Some(SequencerError::SessionChanged) => {
+                self.offer_again_on_new_session();
+                Ok(())
+            }
+            Some(SequencerError::Backpressure) => {
+                self.hot.backpressure.increment(1);
+                Err(SequencerError::Backpressure)
+            }
+            other => other.map_or(Ok(()), Err),
+        }
     }
 
     /// Count the refusals that the v1 loop counts: the parked transactions
@@ -528,24 +621,6 @@ impl AdmissionLoop {
             | Refusal::InFlight { .. }
             | Refusal::InsufficientFunds { .. } => {}
         }
-    }
-}
-
-fn offer_of(c: &Candidate<RefPayload>) -> RefOffer {
-    RefOffer {
-        tx_ref: kardamom_types::TxRef::new(
-            c.tx_hash,
-            c.payload.lane,
-            c.payload.loc.position,
-            c.payload.loc.session_id,
-        ),
-        guard: GuardHeader {
-            sender: c.sender,
-            nonce: c.nonce,
-            max_inclusion_block: c.payload.deadline,
-            tip: c.payload.tip,
-        },
-        envelope: c.payload.envelope.clone(),
     }
 }
 
@@ -589,5 +664,7 @@ fn reject<R: SideChannelPublisher>(
     side.publish_error(err);
 }
 
+#[cfg(test)]
+mod resend_tests;
 #[cfg(test)]
 mod tests;
