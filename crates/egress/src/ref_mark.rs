@@ -16,8 +16,10 @@
 //! batches cost no sync: under the v1 loop every transaction is a
 //! reference, and two syncs for each batch stalled the owner thread of
 //! the egress, and with it the receipts. A clean stop writes the exact
-//! mark. After a crash the mark is at most [`LEAD`] above the highest
-//! stored reference.
+//! mark. The open takes the exact mark from the segments, and keeps at
+//! least the file value minus [`LEAD`]: the side file holds the mark or
+//! the mark plus the lead. So the lead never stays in the mark after a
+//! restart.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -100,6 +102,23 @@ impl RefMark {
         Self {
             index: self.index.saturating_add(LEAD.index),
             block: self.block.saturating_add(LEAD.block),
+        }
+    }
+
+    /// The lowest mark that the side file value `self` can stand for: the
+    /// file holds the mark, or the mark plus [`LEAD`] (`ahead`).
+    pub(crate) fn behind(self) -> Self {
+        Self {
+            index: self.index.saturating_sub(LEAD.index),
+            block: self.block.saturating_sub(LEAD.block),
+        }
+    }
+
+    /// The higher of `self` and `other` in each field.
+    pub(crate) fn joined(self, other: Self) -> Self {
+        Self {
+            index: self.index.max(other.index),
+            block: self.block.max(other.block),
         }
     }
 

@@ -214,8 +214,8 @@ fn a_restart_reads_the_mark_of_a_reference_in_an_older_segment() {
     assert_eq!(again.head().next_block, 7);
     assert_eq!(
         again.mark(),
-        REFERENCE.ahead(),
-        "the file holds R plus the lead"
+        REFERENCE,
+        "the file holds R plus the lead, and the open reads the exact R from the segments"
     );
 }
 
@@ -314,7 +314,11 @@ fn a_reset_keeps_or_raises_the_mark() {
     assert_eq!(store.mark(), higher, "a lower mark of the peer keeps R");
     drop(store);
     let again = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
-    assert!(higher.within(again.mark()), "the raised mark is on disk");
+    assert_eq!(
+        again.mark(),
+        REFERENCE,
+        "the segments after the resets hold no reference, and the file minus the lead is R"
+    );
 }
 
 /// A crash after the mark and before the sync of the segment can lose the
@@ -340,8 +344,8 @@ fn a_crash_before_the_segment_sync_leaves_the_mark_at_or_above_the_frames() {
     assert_eq!(again.head(), GENESIS, "the frames of the batch are lost");
     assert_eq!(
         again.mark(),
-        REFERENCE.ahead(),
-        "the mark is above the surviving frames"
+        REFERENCE,
+        "the file minus the lead keeps the mark of the lost frames"
     );
 }
 

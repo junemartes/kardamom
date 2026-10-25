@@ -103,7 +103,8 @@ impl Store {
         file.set_len(end).map_err(io(&last.path))?;
         let mut writer = BufWriter::new(file);
         writer.seek(SeekFrom::Start(end)).map_err(io(&last.path))?;
-        let mark = RefMark::read(dir)?;
+        let written = RefMark::read(dir)?;
+        let mark = Self::stored_mark(&segments)?.joined(written.behind());
         mark.show();
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -113,8 +114,24 @@ impl Store {
             blocks_in_segment: blocks,
             head,
             mark,
-            written: mark,
+            written,
         })
+    }
+
+    /// The highest reference in the segments, from a read of every frame.
+    /// The side file can hold the mark plus the lead, so the open takes the
+    /// exact mark from the frames. A reference that a prune deleted is
+    /// below the floor, and a reader below the floor gets
+    /// [`Range::Unavailable`], so it does not count.
+    fn stored_mark(segments: &[Segment]) -> Result<RefMark, StoreError> {
+        segments
+            .iter()
+            .try_fold(RefMark::default(), |mark, segment| {
+                let mut reader = Self::reader(segment)?;
+                let frames: Vec<Vec<u8>> = std::iter::from_fn(|| read_frame(&mut reader)).collect();
+                Ok(RefMark::top(&frames, segment.start.next_block)
+                    .map_or(mark, |top| mark.joined(top)))
+            })
     }
 
     /// The highest stored transaction reference.
