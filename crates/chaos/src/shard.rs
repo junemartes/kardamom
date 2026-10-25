@@ -2,7 +2,11 @@
 //! of the cases. The lists and the per-shard settings mirror the
 //! `cluster-e2e` workflow, so a local shard run behaves like CI.
 
-use crate::lifecycle::DeployVars;
+use crate::lifecycle::{CarrySwitches, DeployVars, EgressStage};
+
+/// The sealer retention of the carry shard, in frames. The exact window
+/// keeps this many frames.
+const CARRY_RETENTION: u64 = 16_384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shard {
@@ -19,6 +23,7 @@ pub enum Shard {
     L1,
     Follower,
     Integrity,
+    Carry,
 }
 
 impl Shard {
@@ -39,6 +44,7 @@ impl Shard {
             Self::L1 => "chaos-l1",
             Self::Follower => "chaos-follower",
             Self::Integrity => "chaos-integrity",
+            Self::Carry => "chaos-carry",
         }
     }
 
@@ -47,13 +53,15 @@ impl Shard {
     /// proves the rebuild from L1 before the next. The executor and
     /// sealer nodes die together in the first exec case, so the state
     /// every executor kept is compared with the validator's before the
-    /// next case builds on it. The last case's stage is the one in the
-    /// shard's tail.
+    /// next case builds on it. The carry shard compares the state of the
+    /// first executor in carry mode with the executors in reference
+    /// mode. The last case's stage is the one in the shard's tail.
     #[must_use]
     pub fn audits_after(self, case: &str) -> bool {
         match self {
             Self::L1 | Self::Follower => true,
             Self::CombinedExec => case == "executor-sealer-loss-recover",
+            Self::Carry => case == "carry-executor-first",
             _ => false,
         }
     }
@@ -175,6 +183,20 @@ impl Shard {
             // The nightly shard: the long repetition cases, too slow for
             // every pull request.
             Self::Integrity => &["executor-restart-storm"],
+            // The activation of the carry window in the order of the
+            // staging rollout, then the faults around its switch. Each
+            // step needs the steps before it.
+            Self::Carry => &[
+                "carry-versions-on",
+                "carry-held-offer-after-downgrade",
+                "carry-readers-on-egress",
+                "carry-window-on",
+                "carry-executor-first",
+                "carry-executors-rest",
+                "carry-window-off-on",
+                "carry-leader-kill-at-switch",
+                "carry-egress-restart",
+            ],
         }
     }
 
@@ -188,7 +210,11 @@ impl Shard {
     /// executor, retention and cache shards turn the block log of the
     /// checkpoints on: they run the checkpoint restore, the peer resync,
     /// the retention overrun and the state mirror rebuild. The other
-    /// shards keep it off, so both modes stay tested.
+    /// shards keep it off, so both modes stay tested. The carry shard
+    /// deploys the member feed, the executors on the sealer nodes, the
+    /// egress and the v2 loop of the sequencers, with a snapshot each
+    /// minute, so a member that stops before the switch restores a
+    /// snapshot, and a retention that the exact window keeps.
     #[must_use]
     pub fn deploy_vars(self) -> DeployVars {
         match self {
@@ -216,6 +242,17 @@ impl Shard {
                 l1_fault_proxy: true,
                 indexer_poll_s: Some(2),
                 da_watcher_silence_s: Some(30),
+                ..DeployVars::default()
+            },
+            Self::Carry => DeployVars {
+                cluster_snapshot_interval_s: Some(60),
+                cluster_retention: Some(CARRY_RETENTION),
+                carry: CarrySwitches {
+                    exec_on_sealers: true,
+                    egress: EgressStage::On,
+                    admission: true,
+                    ..CarrySwitches::default()
+                },
                 ..DeployVars::default()
             },
             Self::Ingress
@@ -262,6 +299,12 @@ impl Shard {
                 ("KARDAMOM_CHECKPOINT_LOG", "on"),
             ],
             Self::Cache => &[("RUN_LOAD", "0"), ("KARDAMOM_CHECKPOINT_LOG", "on")],
+            Self::Carry => &[
+                ("RUN_LOAD", "0"),
+                ("KARDAMOM_CLUSTER_SNAPSHOT_S", "60"),
+                ("KARDAMOM_CLUSTER_RETENTION", "16384"),
+                ("KARDAMOM_EXEC_ON_SEALERS", "on"),
+            ],
             Self::Ingress
             | Self::Sequencer
             | Self::Fleet
@@ -293,6 +336,7 @@ mod tests {
             Shard::L1,
             Shard::Follower,
             Shard::Integrity,
+            Shard::Carry,
         ]
         .iter()
         .flat_map(|s| s.cases().iter().copied())
@@ -301,7 +345,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 58);
+        assert_eq!(all.len(), 67);
         assert_eq!(
             Shard::Sequencer.cases().last(),
             Some(&"resize-scale-out-in")
@@ -320,6 +364,7 @@ mod tests {
             Shard::L1,
             Shard::Follower,
             Shard::Integrity,
+            Shard::Carry,
         ] {
             assert!(
                 shard.env().contains(&("RUN_LOAD", "0")),
@@ -366,5 +411,22 @@ mod tests {
         );
         assert_eq!(Shard::Integrity.cases(), ["executor-restart-storm"]);
         assert_eq!(Shard::Integrity.name(), "chaos-integrity");
+        // The carry shard tells its probes where the executors run, and
+        // its cases the retention that the exact window keeps.
+        let carry = Shard::Carry.deploy_vars();
+        assert!(carry.carry.exec_on_sealers && carry.carry.admission);
+        assert_eq!(carry.carry.egress, EgressStage::On);
+        assert!(carry.carry.carry_executors.is_empty());
+        assert!(
+            Shard::Carry
+                .env()
+                .contains(&("KARDAMOM_EXEC_ON_SEALERS", "on"))
+        );
+        assert!(Shard::Carry.env().contains(&(
+            "KARDAMOM_CLUSTER_RETENTION",
+            CARRY_RETENTION.to_string().as_str()
+        )));
+        assert!(Shard::Carry.audits_after("carry-executor-first"));
+        assert_eq!(Shard::Carry.cases().first(), Some(&"carry-versions-on"));
     }
 }

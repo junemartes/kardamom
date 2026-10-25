@@ -11,7 +11,9 @@
 //!   that the executor publishes for each block, or the answer of a
 //!   lookup for a sender that it has not seen;
 //! - the run of transactions that it forwarded and that no state confirmed
-//!   yet, with their summed worst-case cost;
+//!   yet, with their summed worst-case cost. The filter keeps each of them
+//!   until a state confirms it or the run is lost, so the caller can offer
+//!   it again when the sealer can have lost the offer;
 //! - the transactions that wait for a nonce gap to close.
 //!
 //! A transaction at the next nonce goes out when the balance of the state,
@@ -113,7 +115,7 @@ pub struct ImagePos {
 
 /// One transaction that the filter may forward. `payload` is what the
 /// caller needs to publish it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Candidate<T> {
     pub sender: Address,
     pub nonce: u64,
@@ -234,7 +236,7 @@ pub struct Admission<T> {
     now: Instant,
 }
 
-impl<T> Admission<T> {
+impl<T: Clone> Admission<T> {
     #[must_use]
     pub fn new(cfg: AdmissionConfig, now: Instant) -> Self {
         Self {
@@ -405,6 +407,19 @@ impl<T> Admission<T> {
         self.lose(sender, nonce, out);
     }
 
+    /// The forwarded transaction of `sender` at `nonce` that no state
+    /// confirmed.
+    #[must_use]
+    pub fn unconfirmed_at(&self, sender: Address, nonce: u64) -> Option<&Candidate<T>> {
+        self.senders.get(&sender)?.forwarded_at(nonce)
+    }
+
+    /// Every forwarded transaction that no state confirmed: the run of each
+    /// sender, in nonce order.
+    pub fn unconfirmed(&self) -> impl Iterator<Item = &Candidate<T>> {
+        self.senders.values().flat_map(SenderState::unconfirmed)
+    }
+
     /// The forwarded transaction of `sender` at `nonce` is gone. When the
     /// run still holds it, the run ends, and the parked transactions that
     /// go out from the chain nonce get their marks.
@@ -451,7 +466,7 @@ impl ParkLimit {
 impl ImageMarks {
     /// Expire the parked transactions of this image past `limit`. The mark
     /// of a transaction that left the park drops with no verdict.
-    fn expire<T>(
+    fn expire<T: Clone>(
         &mut self,
         limit: ParkLimit,
         senders: &mut HashMap<Address, SenderState<T>>,
@@ -466,7 +481,7 @@ impl ImageMarks {
         }
     }
 
-    fn expire_front<T>(
+    fn expire_front<T: Clone>(
         &mut self,
         senders: &mut HashMap<Address, SenderState<T>>,
         out: &mut Vec<Verdict<T>>,

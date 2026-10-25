@@ -19,7 +19,7 @@ pub(crate) fn sealer(h: &Harness, id: u32) -> anyhow::Result<String> {
 }
 
 /// A memberId in 0..3 that is not the leader.
-fn a_follower(leader: u32) -> u32 {
+pub(crate) fn a_follower(leader: u32) -> u32 {
     (0..3).find(|m| *m != leader).unwrap_or(0)
 }
 
