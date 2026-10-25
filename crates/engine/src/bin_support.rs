@@ -416,7 +416,9 @@ impl crate::TxOrderingSubscription for LiveOrdering {
     }
 }
 
-/// The egress that a reader after the executors reads.
+/// The egress that a reader after the executors reads. Such a reader is
+/// never the executor, so it exports the head under the validator's name
+/// (see [`crate::reader::carried::CarriedSubscription::suppress_sealer_metrics`]).
 pub struct EgressSource {
     /// The base URL of the egress (`http://host:port`).
     pub base: String,
@@ -439,10 +441,9 @@ pub fn open_egress(
 ) -> Result<LiveEgressSub> {
     use crate::reader::carried::{CarriedSubscription, NoSource};
     let transport = open_egress_transport(rt, plane, source.base)?;
-    Ok(
-        CarriedSubscription::new(transport, NoSource, cursor)
-            .with_cursor_gauge(source.cursor_gauge),
-    )
+    Ok(CarriedSubscription::new(transport, NoSource, cursor)
+        .with_cursor_gauge(source.cursor_gauge)
+        .suppress_sealer_metrics())
 }
 
 /// Open one source of the egress at `base` (`http://host:port`): its range

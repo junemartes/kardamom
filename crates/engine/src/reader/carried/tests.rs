@@ -467,3 +467,48 @@ fn the_cursor_gauge_names_the_newest_delivered_record() {
         "a boundary does not move the gauge"
     );
 }
+
+/// The text of the gauges after a reader at the cursor `(7, 4)` gets the
+/// `REPLAY_DONE` of its first request at that cursor, with no frame before
+/// it. `suppress` makes it the reader of a validator or a batcher.
+fn head_at_the_cursor(suppress: bool) -> String {
+    crate::meter::tests::render(|| {
+        let Rig { sub, feed, service } = Rig::new(7, 4);
+        let mut rig = Rig {
+            sub: if suppress {
+                sub.suppress_sealer_metrics()
+            } else {
+                sub
+            },
+            feed,
+            service,
+        };
+        let request = rig.request(Source::Feed);
+        rig.feed.send(done(request.request_id, 7, 4));
+        assert_eq!(rig.deliver(3), [] as [String; 0]);
+    })
+}
+
+#[test]
+fn a_suppressed_reader_at_the_head_exports_the_validator_head() {
+    let text = head_at_the_cursor(true);
+    assert_eq!(
+        crate::meter::tests::value(&text, crate::metrics::VALIDATOR_SEALER_BLOCK_NUMBER),
+        3.0,
+        "the head is the block before the next block of the answer"
+    );
+    assert!(
+        !text.contains(crate::metrics::SEALER_BLOCK_NUMBER),
+        "only the executor exports the sealer series"
+    );
+}
+
+#[test]
+fn the_executor_reader_at_the_head_exports_the_sealer_head() {
+    let text = head_at_the_cursor(false);
+    assert_eq!(
+        crate::meter::tests::value(&text, crate::metrics::SEALER_BLOCK_NUMBER),
+        3.0
+    );
+    assert!(!text.contains(crate::metrics::VALIDATOR_SEALER_BLOCK_NUMBER));
+}
