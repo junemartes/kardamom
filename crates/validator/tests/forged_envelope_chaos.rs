@@ -24,6 +24,10 @@
 //! - flag on, forged sender from the egress: the reader reads the egress,
 //!   as a validator with `--egress` does. The entry carries its bytes, so
 //!   no `tx_data` join runs. The halt and the latch are the same.
+//! - forged hash from the egress: the raw transaction does not hash to the
+//!   canonical id. The egress is the only source of the reader, so no
+//!   source serves the right bytes. The reader stops with `HashMismatch`
+//!   before the identity check runs, and the latch is the same.
 //! - flag off, the same forgery: the theft commits. This is a documented
 //!   blind spot, pinned as a test so the executor-side decision
 //!   (defense-in-depth against latency) rests on a red/green fact, not a
@@ -147,22 +151,22 @@ fn run_pipeline_on_egress(envelope: &KtTxEnvelope, victim: Address) -> HarnessOu
     )
 }
 
-/// The pipeline halts with the identity error before the first EVM step:
-/// nothing reaches the C stream, and nothing reaches the writer. The
-/// validator binary's exit classification latches the error as an
-/// integrity failure (exit 2, page the humans), not an availability
-/// restart.
-fn assert_halts_and_latches(outcome: HarnessOutcome, victim: Address) {
+/// The pipeline halts before the first EVM step: nothing reaches the C
+/// stream, and nothing reaches the writer. The validator binary's exit
+/// classification latches the error as an integrity failure (the
+/// `validator_divergence` halt), not an availability restart. The latched
+/// reason contains `proof`. Returns the error.
+fn assert_halts_and_latches(
+    outcome: HarnessOutcome,
+    victim: Address,
+    proof: &str,
+) -> ExecutorError {
     let HarnessOutcome {
         result: res,
         receipts: out,
         state: snap,
     } = outcome;
-    let err = res.expect_err("forged sender must halt the pipeline");
-    assert!(
-        matches!(err, ExecutorError::RecordIdentity(_)),
-        "expected RecordIdentity, got: {err:?}"
-    );
+    let err = res.expect_err("a forged record must halt the pipeline");
     assert!(out.is_empty(), "no receipt/boundary may be published");
     let (_, victim_balance, _) = snap.basic(victim).unwrap().expect("victim account");
     assert_eq!(
@@ -177,9 +181,10 @@ fn assert_halts_and_latches(outcome: HarnessOutcome, victim: Address) {
     assert!(divergence.is_halted());
     let reason = divergence.reason().expect("latched reason");
     assert!(
-        reason.contains("sender mismatch"),
+        reason.contains(proof),
         "reason must carry the proof: {reason}"
     );
+    err
 }
 
 #[test]
@@ -210,9 +215,14 @@ fn forged_sender_halts_and_latches_with_verification_on() {
     let victim = address!("00000000000000000000000000000000000F1C71");
     assert_ne!(attacker.address(), victim);
 
-    assert_halts_and_latches(
+    let err = assert_halts_and_latches(
         run_pipeline(envelope_claiming(&attacker, victim), victim, true),
         victim,
+        "sender mismatch",
+    );
+    assert!(
+        matches!(err, ExecutorError::RecordIdentity(_)),
+        "expected RecordIdentity, got: {err:?}"
     );
 
     // Availability errors must not look like integrity failures.
@@ -263,8 +273,36 @@ fn forged_sender_from_the_egress_halts_and_latches() {
         PrivateKeySigner::from_bytes(&alloy_primitives::B256::repeat_byte(0x44)).unwrap();
     let victim = address!("00000000000000000000000000000000000F1C73");
 
-    assert_halts_and_latches(
+    let err = assert_halts_and_latches(
         run_pipeline_on_egress(&envelope_claiming(&attacker, victim), victim),
         victim,
+        "sender mismatch",
+    );
+    assert!(
+        matches!(err, ExecutorError::RecordIdentity(_)),
+        "expected RecordIdentity, got: {err:?}"
+    );
+}
+
+/// The egress is the only source, so the reader stops after one silence
+/// window of its absent second source. It does not read the egress again
+/// without end.
+#[test]
+fn forged_hash_from_the_egress_halts_and_latches() {
+    let signer = PrivateKeySigner::from_bytes(&alloy_primitives::B256::repeat_byte(0x55)).unwrap();
+    let victim = signer.address();
+    let forged = KtTxEnvelope {
+        tx_hash: alloy_primitives::B256::repeat_byte(0x66),
+        ..envelope_claiming(&signer, victim)
+    };
+
+    let err = assert_halts_and_latches(
+        run_pipeline_on_egress(&forged, victim),
+        victim,
+        "does not hash to its canonical id",
+    );
+    assert!(
+        matches!(err, ExecutorError::HashMismatch { index: 0 }),
+        "expected HashMismatch at index 0, got: {err:?}"
     );
 }

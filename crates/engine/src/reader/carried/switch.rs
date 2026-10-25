@@ -67,6 +67,10 @@ pub(crate) enum Verdict {
     /// Both sources hold a transaction reference with no bytes at the
     /// cursor `index`. No source of this reader can serve the entry.
     Unjoinable { index: u64 },
+    /// Both sources sent an entry at `index` whose raw transaction does
+    /// not hash to its canonical id. No source of this reader can serve
+    /// the right bytes.
+    Mismatch { index: u64 },
 }
 
 /// The fault of the latest answer of each source. A new request to a
@@ -95,6 +99,9 @@ impl Marks {
     /// - A stop when every source has a reference with no bytes at the same
     ///   index, refused the cursor below its floor, or never connected. A
     ///   floor only rises, so another try gets the same faults.
+    /// - A stop, by the same rule, when every source sent wrong bytes at
+    ///   the same index. A source that never connects, such as
+    ///   [`super::NoSource`], cannot serve the right bytes.
     /// - Else the reader tries the other source again: a silent, lost or
     ///   bad source can serve again later, for example a member that
     ///   restarts.
@@ -122,16 +129,16 @@ impl Marks {
                 _ => None,
             })
             .max();
-        let unjoinable = pair
-            .iter()
-            .flatten()
-            .filter_map(|fault| match fault {
-                Fault::Unjoinable { index } => Some(*index),
-                _ => None,
-            })
-            .min();
-        match (floor, head, unjoinable) {
-            (Some((oldest_block, oldest_index)), _, _)
+        let unjoinable = self.stuck(|fault| match fault {
+            Fault::Unjoinable { index } => Some(index),
+            _ => None,
+        });
+        let mismatch = self.stuck(|fault| match fault {
+            Fault::Mismatch { index } => Some(index),
+            _ => None,
+        });
+        match (floor, head, unjoinable, mismatch) {
+            (Some((oldest_block, oldest_index)), _, _, _)
                 if self.every(|f| matches!(f, Fault::Unavailable { .. })) =>
             {
                 Verdict::Unavailable {
@@ -139,7 +146,7 @@ impl Marks {
                     oldest_block,
                 }
             }
-            (_, Some((head_index, head_block)), _)
+            (_, Some((head_index, head_block)), _, _)
                 if self.every(|f| matches!(f, Fault::Ahead { .. })) =>
             {
                 Verdict::Behind {
@@ -147,13 +154,8 @@ impl Marks {
                     head_block,
                 }
             }
-            (_, _, Some(index))
-                if self.every(|f| {
-                    *f == Fault::Unjoinable { index } || matches!(f, Fault::Unavailable { .. })
-                }) =>
-            {
-                Verdict::Unjoinable { index }
-            }
+            (_, _, Some(index), _) => Verdict::Unjoinable { index },
+            (_, _, _, Some(index)) => Verdict::Mismatch { index },
             _ => Verdict::Switched,
         }
     }
@@ -164,6 +166,19 @@ impl Marks {
         [self.feed, self.service]
             .iter()
             .all(|mark| mark.is_some_and(|f| f == Fault::Absent || accept(&f)))
+    }
+
+    /// The lowest index that `at` takes from a mark, when no source can
+    /// serve that index: each source has a mark that `at` maps to the
+    /// index, refused the cursor below its floor, or never connected.
+    fn stuck(&self, at: impl Fn(Fault) -> Option<u64>) -> Option<u64> {
+        let index = [self.feed, self.service]
+            .into_iter()
+            .flatten()
+            .filter_map(&at)
+            .min()?;
+        self.every(|f| at(*f) == Some(index) || matches!(f, Fault::Unavailable { .. }))
+            .then_some(index)
     }
 }
 
@@ -454,3 +469,7 @@ impl<F: Transport, S: Transport> Switch<F, S> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "switch_tests.rs"]
+mod tests;
