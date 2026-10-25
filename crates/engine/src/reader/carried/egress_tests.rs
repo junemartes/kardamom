@@ -1,85 +1,18 @@
-use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
 use kardamom_cluster_adapter::wire::{
     EGRESS_KIND_REPLAY_DONE, encode_egress_boundary, encode_egress_record, encode_feed_answer,
 };
-use kardamom_egress::drops::Drops;
-use kardamom_egress::http::Http;
-use kardamom_egress::merge::{Head, Merge, MergeConfig};
-use kardamom_egress::owner::{FramePublisher, Input, Owner, OwnerConfig, Parts};
-use kardamom_egress::receipts::Receipts;
-use kardamom_egress::store::Store;
+use kardamom_egress::merge::Head;
 
 use super::EgressTransport;
 use crate::ExecutorError;
+use crate::actor::fixtures::TestEgress;
 use crate::reader::carried::CarriedSubscription;
 use crate::reader::carried::memory::{MemoryRemote, MemoryTransport};
 use crate::reader::carried::tests::{TIMING, boundary, label, tx_at, unavailable};
 use crate::reader::carried::transport::{Poll, Request, Transport};
 use crate::reader::cluster::ReplayCursor;
-
-struct NoLive;
-
-impl FramePublisher for NoLive {
-    fn publish(&self, _frame: &[u8]) {}
-}
-
-/// The head of an empty chain.
-const GENESIS: Head = Head {
-    next_index: 0,
-    next_block: 1,
-    last: None,
-};
-
-/// An egress whose store starts at `genesis` and holds `frames`, served on
-/// `rt`. Returns its base URL.
-fn egress(
-    rt: &tokio::runtime::Runtime,
-    dir: &std::path::Path,
-    genesis: Head,
-    frames: &[Vec<u8>],
-) -> String {
-    let store = Store::open(dir, NonZeroU64::new(10).unwrap(), genesis).unwrap();
-    let merge = Merge::new(
-        MergeConfig {
-            max_waiting: NonZeroUsize::new(64).unwrap(),
-            compared: NonZeroUsize::new(64).unwrap(),
-        },
-        store.head(),
-    );
-    let cfg = OwnerConfig {
-        sync_every: Duration::from_millis(10),
-        keep_blocks: NonZeroU64::new(1_000).unwrap(),
-        join: kardamom_egress::owner::Join::FromPeer,
-    };
-    let parts = Parts {
-        merge,
-        store,
-        receipts: Receipts::new(NonZeroUsize::new(16).unwrap()),
-        drops: Drops::new(NonZeroUsize::new(16).unwrap()),
-        live: NoLive,
-        receipts_live: NoLive,
-    };
-    let owner = Owner::new(cfg, parts);
-    let (inputs, rx) = crossbeam_channel::bounded(64);
-    frames.iter().zip(0u64..).for_each(|(frame, seq)| {
-        let message = [seq.to_le_bytes().as_slice(), frame].concat();
-        inputs
-            .send(Input::Frame {
-                session: 1,
-                message,
-            })
-            .unwrap();
-    });
-    std::thread::spawn(move || owner.run(&rx));
-    let http = rt
-        .block_on(Http::bind("127.0.0.1:0".parse().unwrap(), inputs))
-        .unwrap();
-    let base = format!("http://{}", http.local_addr().unwrap());
-    rt.spawn(http.serve());
-    base
-}
 
 /// Poll `t` until it sends `n` frames.
 fn frames(t: &mut EgressTransport, n: usize) -> Vec<Vec<u8>> {
@@ -102,11 +35,10 @@ fn a_request_replays_the_store_answers_done_then_reads_live() {
         encode_egress_boundary(1, 1, 0, 0),
         encode_egress_record(1, &[2; 40]).unwrap(),
     ];
-    let base = egress(&rt, dir.path(), GENESIS, &stored);
-    let (live_tx, live) = crossbeam_channel::unbounded();
+    let (mut t, live_tx) =
+        TestEgress::serve(&rt, dir.path(), TestEgress::GENESIS, &stored).transport(&rt);
     let next_live = encode_egress_record(2, &[3; 40]).unwrap();
     live_tx.send(next_live.clone()).unwrap();
-    let mut t = EgressTransport::new(base, live, rt.handle().clone());
     assert_eq!(t.connection(), Some(1));
     t.request(Request {
         from_index: 0,
@@ -151,14 +83,13 @@ impl Recovery {
     /// The window of the member starts at index 20, block 8.
     const WINDOW: (u64, u64) = (20, 8);
 
-    fn new(rt: &tokio::runtime::Runtime, base: String, cursor: ReplayCursor) -> Self {
+    fn new(rt: &tokio::runtime::Runtime, egress: &TestEgress, cursor: ReplayCursor) -> Self {
         let (feed, remote) = MemoryTransport::pair();
-        let (live_tx, live) = crossbeam_channel::unbounded();
-        let egress = EgressTransport::new(base, live, rt.handle().clone());
+        let (service, live) = egress.transport(rt);
         Self {
-            sub: CarriedSubscription::with_timing(feed, egress, cursor, TIMING),
+            sub: CarriedSubscription::with_timing(feed, service, cursor, TIMING),
             feed: remote,
-            _live: live_tx,
+            _live: live,
         }
     }
 
@@ -199,8 +130,8 @@ fn a_cursor_below_the_window_recovers_from_the_egress() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let stored = [tx_at(0), boundary(1, 1), tx_at(1), boundary(2, 2)];
-    let base = egress(&rt, dir.path(), GENESIS, &stored);
-    let mut reader = Recovery::new(&rt, base, ReplayCursor::new(0, 1));
+    let egress = TestEgress::serve(&rt, dir.path(), TestEgress::GENESIS, &stored);
+    let mut reader = Recovery::new(&rt, &egress, ReplayCursor::new(0, 1));
     assert_eq!(
         reader.run(4).expect("no peer checkpoint"),
         ["t0", "b1", "t1", "b2"],
@@ -217,8 +148,8 @@ fn a_cursor_below_the_floor_of_the_egress_goes_to_a_peer_checkpoint() {
         next_block: 5,
         last: None,
     };
-    let base = egress(&rt, dir.path(), floor, &[]);
-    let mut reader = Recovery::new(&rt, base, ReplayCursor::new(3, 2));
+    let egress = TestEgress::serve(&rt, dir.path(), floor, &[]);
+    let mut reader = Recovery::new(&rt, &egress, ReplayCursor::new(3, 2));
     match reader.run(1) {
         Err(ExecutorError::ClusterReplayUnavailable {
             from_index,

@@ -44,14 +44,21 @@ toml = { workspace = true }
 # behind `test-support`, so a production build of this crate never links
 # a signer.
 kardamom-test-support = { workspace = true, optional = true }
+# The egress that `actor::fixtures::TestEgress` serves. Optional, behind
+# `test-support`, as the signer above.
+kardamom-egress = { path = "../egress", optional = true }
 
 [features]
-# Exposes `actor::fixtures` (the signed-legacy-tx builder and the
-# channel-backed `ChannelHarness`) as `pub`, so an integration test in
-# another crate (`kardamom-validator`, `kardamom-executor`) can reach it
-# instead of copying it. Off by default: a production build never
-# compiles test fixtures in.
-test-support = ["dep:kardamom-test-support"]
+# Exposes `actor::fixtures` (the signed-legacy-tx builder, the
+# channel-backed `ChannelHarness`, and the `TestEgress`) as `pub`, so an
+# integration test in another crate (`kardamom-validator`,
+# `kardamom-executor`, `kardamom-batcher`) can reach it instead of copying
+# it. Off by default: a production build never compiles test fixtures in.
+test-support = [
+    "dep:kardamom-test-support",
+    "dep:kardamom-egress",
+    "kardamom-cluster-adapter/testing",
+]
 # Tests against a real media driver in a container. They need Docker and
 # run with `--ignored`.
 docker-e2e = ["kardamom-log/docker-e2e"]
