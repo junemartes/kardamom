@@ -176,3 +176,22 @@ fn a_refused_reference_tells_the_loop_once() {
         [AccountEvent::Refused { sender, nonce: 7 }] if sender == Address::repeat_byte(0x13)
     ));
 }
+
+/// A contiguity reject goes to the v2 loop with the expected nonce.
+#[test]
+fn a_contiguity_reject_tells_the_loop() {
+    let (accounts_tx, accounts_rx) = crossbeam_channel::unbounded();
+    let rules = SealerRules::new(
+        0,
+        SealerVersion::default(),
+        InMemorySidePublisher::default(),
+    )
+    .telling(accounts_tx);
+    rules.on_contiguity_reject(Address::repeat_byte(0x13), 9, 8);
+    let events: Vec<_> = accounts_rx.try_iter().collect();
+    assert!(matches!(
+        events[..],
+        [AccountEvent::Rejected { sender, nonce: 9, expected: 8 }]
+            if sender == Address::repeat_byte(0x13)
+    ));
+}

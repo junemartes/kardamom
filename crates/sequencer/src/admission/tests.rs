@@ -369,3 +369,26 @@ fn a_refusal_of_another_nonce_keeps_the_run() {
     a.on_refused(sender(2), 5, &mut Vec::new());
     assert!(offer(&mut a, tx(1, 5, 2))[0].starts_with("R5:InFlight"));
 }
+
+/// The filter keeps each forwarded transaction until a state confirms it.
+/// A lost run keeps nothing.
+#[test]
+fn the_filter_keeps_the_unconfirmed_run_until_a_state_confirms_it() {
+    let mut a = known(state(5, 9 * COST, 1));
+    (5..8).for_each(|n| {
+        offer(&mut a, tx(1, n, n));
+    });
+    let payloads =
+        |a: &Admission<u64>| -> Vec<u64> { a.unconfirmed().map(|c| c.payload).collect() };
+    assert_eq!(payloads(&a), [5, 6, 7]);
+    assert_eq!(a.unconfirmed_at(sender(1), 6).map(|c| c.nonce), Some(6));
+    assert!(a.unconfirmed_at(sender(1), 8).is_none());
+    assert!(a.unconfirmed_at(sender(2), 6).is_none());
+
+    a.on_rows(1, [(sender(1), state(6, 9 * COST, 2))], &mut Vec::new());
+    assert_eq!(payloads(&a), [6, 7]);
+    assert!(a.unconfirmed_at(sender(1), 5).is_none());
+
+    a.on_refused(sender(1), 7, &mut Vec::new());
+    assert_eq!(payloads(&a), [] as [u64; 0]);
+}

@@ -635,11 +635,12 @@ async fn main() -> anyhow::Result<()> {
     // Cloning shares the single session thread, and offers serialize
     // through it. All three loops use `cluster_pub` (it implements
     // `TxOrderingRefPublisher`): the canonical `TxRef` loop and the two
-    // origin pumps.
+    // origin pumps. The v2 loop takes a fenced clone: see
+    // `ClusterRefPublisher::for_publish_loop`.
     let (join_main, join_deposits, join_remote_epochs) = PublishLoops {
         cfg: cfg.clone(),
         tx_data: handles.data_subs,
-        main_pub: cluster_pub.clone(),
+        main_pub: cluster_pub.for_publish_loop(cfg.admission.enabled),
         epoch_pub: cluster_pub.clone(),
         remote_epoch_pub: cluster_pub,
         side: handles

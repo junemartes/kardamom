@@ -71,6 +71,7 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
             OfferOutcome::BackPressured | OfferOutcome::NotConnected => {
                 Err(SequencerError::Backpressure)
             }
+            OfferOutcome::SessionChanged => Err(SequencerError::SessionChanged),
             OfferOutcome::TooLarge { len } => Err(SequencerError::EncodeFailed(format!(
                 "cluster frame of {len} bytes exceeds one session message"
             ))),
@@ -104,6 +105,25 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
             Ok(()) => (taken, None),
             Err(e) => (0, Some(e)),
         }
+    }
+}
+
+impl ClusterRefPublisher<LiveIngress> {
+    /// A publisher on the same session that offers nothing on a new
+    /// session until it reports [`SequencerError::SessionChanged`] once.
+    /// See [`LiveIngress::fenced`].
+    #[must_use]
+    pub fn fenced(&self) -> Self {
+        Self::new(self.ingress.fenced())
+    }
+
+    /// The publisher of the publish loop. The v2 loop (`v2_loop`) takes a
+    /// fenced clone: it learns of a new session before its first offer
+    /// there, and offers its unconfirmed runs again first. The v1 loop
+    /// takes a plain clone.
+    #[must_use]
+    pub fn for_publish_loop(&self, v2_loop: bool) -> Self {
+        if v2_loop { self.fenced() } else { self.clone() }
     }
 }
 
