@@ -27,6 +27,7 @@
         base: "{{ paths.base }}"
         dirs: "{{ node_data_dirs.paths | join(' ') }}"
         mode: "{{ node_data_dirs.mode }}"
+        run: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%S.%fZ') }}"
 
 - name: Deploy Aeron
   ansible.builtin.include_tasks: job.yml

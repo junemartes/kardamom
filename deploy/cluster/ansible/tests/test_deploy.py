@@ -666,7 +666,10 @@ class DeployTest(Deploys):
         self.assertEqual(sorted(self.api.state['variable_writes']),
                          ['nomad/jobs/batcher', 'nomad/jobs/canary', 'nomad/jobs/l1-indexer'])
         self.run_deploy(environ=local_canary)
-        self.assertEqual(self.api.state['writes'], expected, 'unchanged redeploy must not register jobs')
+        # An unchanged redeploy registers only the data directory job: each
+        # deploy gives it a new version, so it runs again on every node.
+        self.assertEqual(self.api.state['writes'], expected + ['data-dirs'],
+                         'unchanged redeploy must register no job but the data directories')
         self.assertEqual(len(self.api.state['variable_writes']), 3, 'unchanged redeploy must not write secrets')
 
     def test_the_local_profile_runs_no_canary_by_default(self):
@@ -1580,6 +1583,17 @@ class DeployTest(Deploys):
                    for volume in (task['Config'].get('volumes') or [])}
         self.assertEqual({d for d in mounted if d.startswith('/opt/kardamom/')} - exempt - set(dirs), set())
 
+    def test_a_second_deploy_of_the_same_release_runs_the_data_directory_job_again(self):
+        # A sysbatch job runs once for each version, and Nomad can remove the
+        # allocations of the last run. So each deploy gives the job a new
+        # version, and the wait finds allocations of that version.
+        self.run_deploy()
+        first = self.api.state['jobs']['data-dirs']['Meta']['run']
+        self.api.state['writes'] = []
+        self.run_deploy()
+        self.assertEqual(self.api.state['writes'][0], 'data-dirs')
+        self.assertNotEqual(self.api.state['jobs']['data-dirs']['Meta']['run'], first)
+
     def test_a_down_node_does_not_hold_the_data_directory_job(self):
         self.api.state['down_node_jobs'] = ['data-dirs']
         self.run_deploy()
@@ -1740,7 +1754,7 @@ class RecordTest(Deploys):
         self.assertEqual(self.api.state['writes'], [])
         self.api.state['chain_status'] = NO_QUORUM_CHAIN
         self.run_deploy()
-        self.assertEqual(self.api.state['writes'], ['cluster'], 'the sealer registers in one step')
+        self.assertEqual(self.api.state['writes'], ['data-dirs', 'cluster'], 'the sealer registers in one step')
 
     def test_a_missing_image_refuses_the_release(self):
         self.api.state['missing_images'] = {'kardamom-executor'}
@@ -1831,7 +1845,7 @@ class RecordTest(Deploys):
         # A documented procedure names the settings it changes.
         # The batcher takes the same budget, so it rolls after the sealer.
         self.run_deploy({'workloads_da_lag_budget_blocks': '5000'}, environ={'KARDAMOM_ALLOW_MUST_MATCH': 'daLagBudgetBlocks'})
-        self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster', 'batcher'])
+        self.assertEqual(self.api.state['writes'], ['data-dirs', 'cluster', 'cluster', 'cluster', 'batcher'])
 
     def test_a_sealer_job_that_names_a_decision_version_rolls(self):
         """The job of the release before names decisionVersion; this release names none."""
@@ -1900,7 +1914,7 @@ class RecordTest(Deploys):
                                         self.manifest.read_text(), flags=re.M))
         output = self.run_deploy()
         self.assertIn('The sealer job does not change, so no sealer member restarts on the target release.', output)
-        self.assertEqual(self.api.state['writes'], ['executor'])
+        self.assertEqual(self.api.state['writes'], ['data-dirs', 'executor'])
 
     def test_a_new_sealer_cluster_skips_the_snapshot_check(self):
         self.target_snapshot_reads_max(16)
@@ -2321,7 +2335,7 @@ class SealerTest(Deploys):
 
     def test_the_sealer_rolls_followers_first_and_the_leader_last(self):
         groups = self.sealer_roll(leader=1)
-        self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster'])
+        self.assertEqual(self.api.state['writes'], ['data-dirs', 'cluster', 'cluster', 'cluster'])
         self.assertEqual(sorted(groups), ['cluster-0', 'cluster-1', 'cluster-2'])
         # Every step holds the current definition of the members not rolled
         # yet, so the retention reaches the groups in the roll order.
@@ -2348,7 +2362,7 @@ class SealerTest(Deploys):
         self.api.state['deployments']['cluster'] = Deployment('cluster', ['successful'])
         self.api.state['writes'] = []
         self.run_deploy({'workloads_cluster_bootstrap': True, 'workloads_cluster_retention': '131072'})
-        self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster'])
+        self.assertEqual(self.api.state['writes'], ['data-dirs', 'cluster', 'cluster', 'cluster'])
 
     def test_a_failed_bootstrap_closes_the_bootstrap(self):
         self.api.state['deployments']['cluster'] = Deployment('cluster', ['failed'])
