@@ -168,6 +168,15 @@ The sealer refuses user records when the batcher falls too far behind on L1. Bel
   - A frame past the window leaves at once, at any posted head. The retained frames have a fixed bound at any DA lag.
   - A cursor below the window gets `REPLAY_UNAVAILABLE`, the batcher too. The reader recovers from another source.
   - The guard still refuses user records. It holds no frame.
+- **Egress floor.** The store of each egress instance keeps every block above `min(posted_head, final_head)`. So the batcher finds every block that it did not post in the egress, at any DA lag.
+  - The posted head is the highest `l2_block_end` of a post on the `l1_blocks` stream of the L1 follower. The follower publishes only finalized L1 blocks.
+  - The final head is the newest L2 block of an output whose challenge window ended (`WithdrawalOutputOracle.isFinalizable`). The egress reads it from L1 with `--withdrawal-oracle` and `--l1-rpc-url`, at the finalized L1 block. Without an oracle, the floor is the posted head.
+  - A head that the egress did not read yet is 0: the store keeps every block. After a start, the egress learns the posted head from the next finalized post.
+  - The store also keeps `--keep-blocks` blocks below its head (default 43,200: 1 day at 2 s a block), for the readers that resume. It deletes a segment only when the segment is below both the floor and this window.
+  - A reader further behind than the window and the floor gets `410` with the floor of the store. The executor and the validator then recover from a peer checkpoint (see "Replay-window overrun"). The batcher never reads below the floor: the floor is at or below its posted head.
+  - The prune is local to each instance. It changes no replicated state.
+  - The disk of the store grows with the DA lag and, with an oracle, with the challenge window. `KardamomEgressDiskFillsSoon` fires when the free disk runs out within 6 hours at the rate of the last hour. A full disk stops the instance.
+  - Proof: the unit tests `a_frozen_posted_head_keeps_every_block_above_it_past_the_window` and `the_prune_follows_the_lower_of_the_posted_head_and_the_final_head` in `crates/egress/src/owner_prune_tests.rs`.
 - **Retained file.** With `kardamom.cluster.carryBytes=true`, the retained frames are in an append-only file on the disk of each member, not on the heap. The default is off.
   - The heap keeps only an index: the end index and the file position of each retained boundary. The heap does not grow with the retained bytes.
   - The member orders a full entry (record type 5) and retains it as a canonical entry with its envelope (record type 6). Each egress session gets the relayed reference (egress kind 15), live and in a replay, never the envelope. The twin copy drops at the dedup, and each refusal is the same as without the file.

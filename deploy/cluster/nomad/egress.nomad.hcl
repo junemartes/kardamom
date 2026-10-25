@@ -108,8 +108,26 @@ variable "segment_blocks" {
 
 variable "keep_blocks" {
   type        = number
-  description = "The blocks that the store keeps below its head (--keep-blocks)."
-  default     = 1000000
+  description = "The blocks that the store keeps below its head, whatever the L1 heads say (--keep-blocks). The default is 1 day at 2 s a block."
+  default     = 43200
+}
+
+# The floor of the store. The egress keeps every block above the posted
+# head, which it reads from the l1_blocks stream of the L1 follower. With
+# an output oracle, it keeps every block above the lower of the posted
+# head and the final head, which it reads from the oracle on L1. The
+# egress appends each flag only when its variable is set, and refuses to
+# start with one of the two alone.
+variable "l1_rpc_url" {
+  type        = string
+  description = "The L1 JSON-RPC endpoint of the output oracle: the light client (--l1-rpc-url). Empty: no oracle."
+  default     = ""
+}
+
+variable "withdrawal_oracle" {
+  type        = string
+  description = "The L1 address of WithdrawalOutputOracle (--withdrawal-oracle). Empty: the floor is the posted head."
+  default     = ""
 }
 
 variable "sync_ms" {
@@ -260,7 +278,7 @@ job "egress" {
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
           "/opt/kardamom/egress:/opt/kardamom/egress",
         ]
-        args = [
+        args = concat([
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
           "--dir", "/opt/kardamom/egress",
@@ -277,7 +295,10 @@ job "egress" {
           # records. Each instance must have its own.
           "--host-id", "egress-${NOMAD_ALLOC_INDEX}",
           "--metrics-addr", "0.0.0.0:${var.metrics_port}",
-        ]
+          ],
+          var.l1_rpc_url == "" ? [] : ["--l1-rpc-url", var.l1_rpc_url],
+          var.withdrawal_oracle == "" ? [] : ["--withdrawal-oracle", var.withdrawal_oracle],
+        )
       }
 
       # Cluster LogConfig (Aeron streams and discovery), read through

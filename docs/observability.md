@@ -367,11 +367,6 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
 - `kardamom_egress_rebased_total{reason}` counts the times that the egress started its stream again: after a boundary of a copy with no peer (`boundary`), or at the floor of a peer above its head (`peer-floor`). After a `boundary` start, the store holds no frame before that boundary, and a reader of an older cursor reads another instance.
 - `kardamom_executor_egress_frames_dropped_total` counts the canonical frames that the reader did not forward on `exec_frames`, because the queue to the publication was full.
 
-`kardamom_egress_head_distance_frames` is a gauge of each egress instance. It gives the canonical indexes between the stored head and the newest record that any executor copy sent. The egress sets it after each sync of its store.
-
-- The sealer keeps only its replay window. A reader below the window recovers from the store of the egress, so the distance must stay well inside the window.
-- The egress does not see the sealed head. The distance does not include the lag of every executor behind the sealer.
-- `KardamomEgressHeadNearWindow` in `deploy/alerts.yml` fires when the distance stays above 32,768 for 1 minute: half the default window of 65,536 frames.
   - `peer-checkpoint`: the node fell behind the retention window and repaired itself from a peer checkpoint.
   - `unrecoverable`: the node could not repair itself and waits for an operator.
   - See "Replay-window overrun" in [failure-modes.md](failure-modes.md).
@@ -402,6 +397,18 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
 
 Each service instruments its own hot path. The metrics of a service are the metrics that its dashboard queries.
 The groups that need an explanation follow.
+
+`kardamom_egress_head_distance_frames` is a gauge of each egress instance. It gives the canonical indexes between the stored head and the newest record that any executor copy sent. The egress sets it after each sync of its store.
+
+- The sealer keeps only its replay window. A reader below the window recovers from the store of the egress, so the distance must stay well inside the window.
+- The egress does not see the sealed head. The distance does not include the lag of every executor behind the sealer.
+- `KardamomEgressHeadNearWindow` in `deploy/alerts.yml` fires when the distance stays above 32,768 for 1 minute: half the default window of 65,536 frames.
+
+`kardamom_egress_disk_free_bytes` is a gauge of each egress instance: the free bytes of the file system of its store. The egress sets it after each sync of its store.
+
+- The store keeps every block above the lower of the posted head and the final head, and the window of `--keep-blocks` blocks below its head (default 43,200). Its disk grows with the DA lag.
+- `KardamomEgressDiskFillsSoon` in `deploy/alerts.yml` fires when `predict_linear` over the last hour gives a full disk within 6 hours, for 15 minutes.
+- `kardamom_egress_posted_distance_blocks` and `kardamom_egress_floor_distance_blocks` show why the store grows: the batcher does not post, or the final head does not move.
 
 ### Batcher
 
@@ -849,6 +856,9 @@ The egress (`kardamom-egress`) exports these metrics on `--metrics-addr` (`KARDA
 | `kardamom_egress_waiting_dropped_total` | Times that every copy missed a frame and the merge dropped the frames that waited behind it. |
 | `kardamom_egress_ref_frame_max_index` | R: the highest canonical index of a stored transaction reference (`RT_TXREF`). 0 when the store holds none. |
 | `kardamom_egress_ref_frame_max_block` | The block of R. 0 when the store holds none. |
+| `kardamom_egress_posted_distance_blocks` | Blocks between the stored head and the posted head: the newest L2 block that a finalized post on L1 covers. 0 when the posted head is above the stored head. Before the egress reads a posted head, it is the whole stored range. |
+| `kardamom_egress_floor_distance_blocks` | Blocks between the stored head and the floor of the store: the lower of the posted head and the final head. Without an oracle, the floor is the posted head. |
+| `kardamom_egress_disk_free_bytes` | Free bytes of the file system of the store, for an unprivileged writer. |
 
 - Any increment of `kardamom_egress_copy_mismatch_total` needs an operator.
 - R is durable. The store keeps it in the side file `ref-mark` of its directory (16 bytes: the index, then the block, little endian), and reads it at start.

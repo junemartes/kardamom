@@ -396,3 +396,6 @@ fn after_the_peers_give_up_a_boundary_starts_the_stream() {
     assert_eq!(state(&mut o).head.next_block, 32);
     assert!(state(&mut o).joined);
 }
+
+#[path = "owner_prune_tests.rs"]
+mod prune;
