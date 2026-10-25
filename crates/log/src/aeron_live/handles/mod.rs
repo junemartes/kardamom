@@ -7,5 +7,6 @@
 mod service_events;
 pub(super) mod simple;
 pub(super) mod tx_data;
+pub(super) mod tx_events;
 pub(super) mod tx_receipts;
 pub(super) mod tx_verdicts;

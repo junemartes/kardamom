@@ -52,8 +52,12 @@ pub(crate) struct Reorder {
     /// in the open block, and the executor would execute it, and stream its
     /// receipt, with the wrong block number.
     catching_up: bool,
-    /// The gauge that each delivered boundary sets.
+    /// The gauge that each delivered boundary and each replay end set.
     pub(crate) metrics: BoundaryMetrics,
+    /// The block that the head gauge shows. The gauge does not move down:
+    /// a `REPLAY_DONE` can show a head above a boundary that the reorder
+    /// delivers after it, and a lower head would hide that lag.
+    shown_head: Option<u64>,
 }
 
 impl Reorder {
@@ -64,6 +68,7 @@ impl Reorder {
             pending_boundaries: BTreeMap::new(),
             catching_up: false,
             metrics: BoundaryMetrics::Sealer,
+            shown_head: None,
         }
     }
 
@@ -92,15 +97,27 @@ impl Reorder {
     /// as the `kardamom_sealer_*` series (see `crate::metrics`). The
     /// validator exports the head under its own name, so its readiness
     /// rule can compare the head with its committed block.
-    fn record_boundary(&self, block_number: u64) {
+    fn record_boundary(&mut self, block_number: u64) {
+        if self.metrics == BoundaryMetrics::Sealer {
+            metrics::counter!(crate::metrics::SEALER_BOUNDARIES_TOTAL).increment(1);
+        }
+        self.show_head(block_number);
+    }
+
+    /// Set the head gauge to `block`, the newest sealed block that this
+    /// reader knows of, unless the gauge shows that block or a higher one.
+    fn show_head(&mut self, block: u64) {
+        if self.shown_head.is_some_and(|shown| shown >= block) {
+            return;
+        }
+        self.shown_head = Some(block);
         #[allow(
             clippy::cast_precision_loss,
             reason = "block numbers stay far below 2^52"
         )]
-        let head = block_number as f64;
+        let head = block as f64;
         match self.metrics {
             BoundaryMetrics::Sealer => {
-                metrics::counter!(crate::metrics::SEALER_BOUNDARIES_TOTAL).increment(1);
                 metrics::gauge!(crate::metrics::SEALER_BLOCK_NUMBER).set(head);
             }
             BoundaryMetrics::Validator => {
@@ -167,6 +184,11 @@ impl Reorder {
     /// a cursor with `REPLAY_AHEAD`; this check covers a sealer that
     /// answers `REPLAY_DONE` instead.
     ///
+    /// The head gauge then shows the block before the next block of the
+    /// marker. So a reader that is at the head, and has no boundary to
+    /// deliver, still exports the head, and a reader below the head shows
+    /// its lag before the boundaries come.
+    ///
     /// # Errors
     ///
     /// Returns [`ExecutorError::ClusterBehindCursor`] when the head lies
@@ -181,6 +203,9 @@ impl Reorder {
             return Err(self.behind_cursor(up_to_index, up_to_block));
         }
         self.catching_up = false;
+        if let Some(head) = up_to_block.checked_sub(1) {
+            self.show_head(head);
+        }
         Ok(())
     }
 
@@ -293,3 +318,7 @@ impl Reorder {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "reorder_tests.rs"]
+mod tests;
