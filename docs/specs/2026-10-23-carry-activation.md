@@ -87,11 +87,15 @@
   then drops the frame (`crates/engine/src/reader/cluster/mod.rs:285-290`). So the executor has a
   gap at that index and stops. A sequencer with a high version on a chain below version 5 makes
   such a frame. Section 7.4 fixes the decoder.
-- **F7. The v2 sequencer has no answer path.** Staging runs the v2 loop of the sequencer
-  (`crates/sequencer/src/bin/kardamom-sequencer/main.rs:239-275`, `admission.enabled`). The v2
-  loop keeps no candidate after its offer and handles no sealer answer
-  (`crates/sequencer/src/v2/mod.rs:417`, `:426-433`). So a refusal of the sealer cannot make it
-  offer the transaction again. Section 4.3 and section 5 use a drop record instead.
+- **F7. The v2 sequencer has no answer path.** Staging runs the v1 loop of the sequencer: the
+  rendered `sequencer.toml` has no `[admission]` table, so `admission.enabled` is false
+  (`crates/sequencer/src/bin/kardamom-sequencer/main.rs:239-275`). The v1 loop offers each
+  transaction as a reference of record type 0 at every decision version and every floor. Only the
+  v2 loop offers the bytes (record type 7, `crates/sequencer/src/v2/mod.rs:434`). So the rollout
+  turns on the v2 loop first (`KARDAMOM_SEQUENCER_ADMISSION=on`, the deploy C6), before the floor
+  and before feature 5. The v2 loop keeps no candidate after its offer and handles no sealer
+  answer (`crates/sequencer/src/v2/mod.rs:417`, `:426-433`). So a refusal of the sealer cannot
+  make it offer the transaction again. Section 4.3 and section 5 use a drop record instead.
 - **F8. The egress store rebuilds its head from the last segment only.** `Store::open` scans only
   the last segment (`crates/egress/src/store.rs:81-105`, `:290-300`). So a value that the egress
   computes from the frames, such as the highest stored reference, would go back at a restart.
@@ -399,8 +403,9 @@ read them:
 
 ## 5. The sequencer
 
-All of this section is the v2 loop, which staging runs
-(`crates/sequencer/src/bin/kardamom-sequencer/main.rs:239-275`). The v1 loop does not change.
+All of this section is the v2 loop (`crates/sequencer/src/bin/kardamom-sequencer/main.rs:239-275`).
+Staging runs the v1 loop today, so the rollout turns on the v2 loop first (F7, section 12). The v1
+loop does not change.
 
 - **The kept version.** `SealerVersion` keeps the highest version that any session of the
   process reported.
@@ -500,6 +505,11 @@ All of this section is the v2 loop, which staging runs
     above the mark.
   - It writes a temporary file, syncs it, and renames it over `ref-mark`. A crash leaves the old
     mark or the new mark, never a part.
+  - Implementation note (2026-10-24): the file holds the mark plus a lead of 65,536 indexes and
+    32 blocks, and the store writes it only when the mark passes it. Two syncs for each batch
+    stalled the owner thread of the egress under the v1 loop, and with it `egress_receipts`. The
+    mark in memory stays exact. A clean stop writes the exact mark. After a crash R is at most the
+    lead above the stored references.
   - The order: the frames of the batch, then the mark, then the sync of the segment
     (`store.rs:128`). So after a crash the mark is at or above every reference that the segment
     holds. A mark above the segment only delays a switch. It never lets a reader meet a
@@ -768,6 +778,9 @@ Each step names its checks. Do not start a step until the checks of the step bef
      `relayed_full_ref = "true"`, and every live allocation runs it.
    - No `FATAL` line in the sealer logs.
    - Rollback: allowed. Nothing wrote version 18.
+   - Then a rolling deploy with `KARDAMOM_SEQUENCER_ADMISSION=on` turns on the v2 loop of the
+     sequencers (F7). Each `sequencer.toml` holds `[admission]` with `enabled = true`, and receipts
+     keep landing.
 2. **The sequencer floor.** Deploy the sequencers with the floor from the members (5).
    - Each sequencer: `kardamom_sequencer_sealer_version` 5.
    - `kardamom_sealer_full_ref_below_v5_total` stays 0.

@@ -122,12 +122,25 @@ final class CarriedPathAllocationTest {
         final FeedReader.Frame floor = awaitAnswer(SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE,
             request(0, CanonicalSealerState.GENESIS_BLOCK_NUMBER));
         final long frames = svc.retained().count();
+        // The first walk warms the walk up; the second one is measured.
+        walk(floor);
+        walkBytes = 0;
+        walkSteps = 0;
+        walk(floor);
+        assertTrue(walkSteps > 10, "the walk takes many duty cycles: " + walkSteps);
+        check("heap_feed_walk", (double) walkBytes / frames);
+        check("heap_feed_walk_cycle", (double) walkBytes / walkSteps);
+    }
+
+    /** Walk the window from {@code floor} to the head, until the feed is live again. */
+    private void walk(final FeedReader.Frame floor) {
         request(floor.a(), floor.b());
+        while (svc.metrics().feed() != FeedState.WALKING) {
+            afterOffer.run();
+        }
         while (svc.metrics().feed() != FeedState.LIVE) {
             walkCycle();
         }
-        assertTrue(walkSteps > 10, "the walk takes many duty cycles: " + walkSteps);
-        check("heap_feed_walk", (double) walkBytes / frames);
     }
 
     /** Run one duty cycle of the feed, and count its bytes when it starts and ends inside the walk. */

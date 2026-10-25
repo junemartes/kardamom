@@ -31,7 +31,7 @@ The local profile defines these classes:
 |-------|-------|------|
 | `control` | 1 | Nomad and Consul server, Docker registry, anvil (the in-cluster L1) |
 | `sequencer` | 2 | 2 lanes with 2 racing replicas each. One job group per lane (`seq-<lane>`, expanded by the Nomad HCL). The metrics port is `9001 + 10 * lane`. |
-| `ingress` | 2 | The active/active JSON-RPC front door (`:8545`) and the notifier status feed (`:8547`). Role `redis`. Instance 1 also has role `redis-replica`. |
+| `ingress` | 2 | The active/active JSON-RPC front door (`:8545`) and the notifier status feed (`:8547`). Role `redis`. Instance 1 also has role `redis-replica`. With `KARDAMOM_NOTIFIER_NODES=on`, the notifier moves to the `notifier` nodes. See [The notifier nodes](#the-notifier-nodes). |
 | `executor` | 3 | State-machine replica appliers (libmdbx state). The state mirror runs here too. With `KARDAMOM_EGRESS=1`, the egress runs on two of them (`:8548`, metrics `:9013`). See [The egress](#the-egress). |
 | `sealer` | 3 | A 3-member Aeron Cluster (Raft). The Java `cluster` job orders the transactions. The Raft log and its archive hold the canonical log. |
 | `aux` | 1 | The service roles `redis`, `redis-primary`, `batcher`, `monitoring`, `validator`, `da-watcher` and `indexer`. |
@@ -285,7 +285,7 @@ Run `just sealer-upgrade-check <env> <feature> <activation_ms>` before the Safe 
 - feature 3 or 4 with an activation time other than 0 while a member reports `kardamom_sealer_feature_state{feature="5"}` at 1 (held) or 2 (on). Without decision version 5 the rules of feature 5 stop, and a carry executor stops on the first reference. Turn feature 5 off first, and empty `KARDAMOM_CARRY_EXECUTORS`;
 - feature 5 (`FEATURE_CARRY_WINDOW`, the carry window), at any activation time, unless:
   - every member reports `snapshotReadsMax` 18 or more, `decisionVersion` 5 and `retainedStore` `heap`;
-  - the sequencer job has the meta `sealer_version_kept`, the batcher and the validator jobs have `reads_egress`, and the egress job has `ref_mark`, each with every live allocation on that job version (`workloads_upgrade_window_jobs`);
+  - the sequencer job has the metas `sealer_version_kept` and `v2_loop` (the v2 loop, `KARDAMOM_SEQUENCER_ADMISSION=on`), the batcher and the validator jobs have `reads_egress`, and the egress job has `ref_mark`, each with every live allocation on that job version (`workloads_upgrade_window_jobs`);
   - every egress instance reports its reference mark, and every `kardamom_batcher_egress_cursor_index` and `kardamom_validator_egress_cursor_index` is above the highest `kardamom_egress_ref_frame_max_index`. An instance that does not answer is a refusal;
 - a job without its metas (`workloads_upgrade_jobs` in `ansible/roles/workloads/defaults/main.yml`), or a live allocation of an older job version:
   - the sequencer: `nonce_burn`;
@@ -393,7 +393,8 @@ The gates of the carry window refuse a move before any job changes. Each gate ru
   - a sealer job that Nomad does not know: a new chain starts on decision version 3;
   - a member that does not run, or a floor above the lowest `decisionVersion` of the members;
   - an executor, validator, batcher or egress job without the meta `relayed_full_ref`, or a live allocation of an older job version. Without the egress job, the egress passes.
-- A batcher or validator job that Nomad does not know, switched to the egress on a live chain (a registered sealer). It has no block to read. Deploy it on the cluster egress first.
+  - the v1 loop of the sequencers: a target without `KARDAMOM_SEQUENCER_ADMISSION=on`, or a registered sequencer job without the meta `v2_loop`. The v1 loop offers record type 0 at every floor.
+- A batcher or validator job that Nomad does not know, switched to the egress, while an egress instance reports a stored reference (`kardamom_egress_ref_frame_max_index` above 0). It has no block to read against it. Under decision versions 3 and 4 both loops of the sequencer offer record type 0, so a new chain stores references too. Deploy the reader on the cluster egress first.
 - The move of the batcher or the validator to the egress (`KARDAMOM_BATCHER_EGRESS`, `KARDAMOM_VALIDATOR_EGRESS`), when the registered job does not carry the meta `reads_egress`:
   - an egress job without the meta `ref_mark`, or a live egress allocation of an older job version;
   - an egress instance that does not report `kardamom_egress_ref_frame_max_index` and `kardamom_egress_ref_frame_max_block`;
@@ -406,6 +407,7 @@ The gates of the carry window refuse a move before any job changes. Each gate ru
   - the member `cluster-<i>` that reports the feed `off`;
   - the egress checks above;
   - `kardamom_executor_block_number` of the executor minus 32 not above the highest `kardamom_egress_ref_frame_max_block`. At its first carry start, the executor compares the stream with its committed blocks of that window.
+- The move back to the v1 loop: a target without `KARDAMOM_SEQUENCER_ADMISSION=on` while the registered sequencer job carries `v2_loop`, and a member reports `carryWindow` true, holds feature 5 (`kardamom_sealer_feature_state{feature="5"}` at 1 or 2), or does not run. `KARDAMOM_ALLOW_MUST_MATCH=admission` allows it.
 - The sealer retention, when the sealer job changes:
   - a lower value than the registered sealer, unless `KARDAMOM_ALLOW_MUST_MATCH` names `retention`;
   - a value whose frames, at the mean frame size of the members, pass 48 MiB, well below the 64 MiB backlog limit of a cluster session. At a mean of 300 bytes, 131,072 frames (about 39.3 MB) fit. The mean is the sum of `retainedBytes` over the sum of `retainedFrames` of the member status (the gauges `kardamom_sealer_retained_bytes` and `kardamom_sealer_retained_frames`).
@@ -415,6 +417,7 @@ The gates read the metrics of each instance by the node address that the Nomad A
 The order on a live chain:
 
 1. Deploy the release with every switch off and the floor 0.
+   The sequencers run the v2 loop (`KARDAMOM_SEQUENCER_ADMISSION=on`). The v1 loop offers each transaction without its bytes, and the sealer refuses such an offer after the switch.
 2. Set `KARDAMOM_SEALER_VERSION_FLOOR` to the lowest `decisionVersion` of the members.
 3. Move the batcher and the validator to the egress.
 4. Deploy with `KARDAMOM_MEMBER_FEED=on`.
@@ -436,6 +439,77 @@ The infrastructure of an environment sets these. The deploy does not change them
 - The fixed ports of the executor (9004, 9014, 9024) and of the state mirror (9007) are free on a sealer node and open between the nodes.
 - The executor nodes stay: they run the egress.
 
+### The notifier nodes
+
+The notifier (`nomad/notifier.nomad.hcl`) runs on the ingress nodes by default. The switch `KARDAMOM_NOTIFIER_NODES=on` moves it to its own nodes:
+
+- A notifier node has the class `notifier` (`role=notifier`, `tier=worker`). Its name is `notifier-<i>`.
+- The notifier job constrains on `meta.roles` with `set_contains "notifier"`, with `distinct_hosts`.
+- `KARDAMOM_NOTIFIER_COUNT` sets the instance count and `--instance-count`. The default is 1. Set it to the count of the notifier nodes.
+- The peers are the node records `notifier-<i>.node.<datacenter>.consul:8547`, for `i` from 0 to the count minus 1. The list is complete before an instance starts, so a registration reaches every instance.
+- The memory reservation is 512 MB, not 1024 MB. On staging the notifier uses at most about 300 MiB.
+- The ring keeps at most 250,000 events, not `ring_max_events` (1,000,000 by default). 250,000 events use about 75 MB. At the staging load-test peak of 5,100 events a second (1,700 tx/s, three stages), the ring holds about 50 seconds. So a client that reconnects replays at most 250,000 events, and on a load peak only the last 50 seconds. We measure the memory in the first load test on the notifier nodes and adjust the cap.
+- The media driver of a notifier node idles at 1000 µs. The aeron job runs a second group, `aeron-notifier`, on the nodes of class `notifier`. The group `aeron` keeps `KARDAMOM_IDLE_CAP_US` on every other node. The notifier is not on the transaction hot path.
+
+Off, the deploy renders every job as before. On, only the notifier and aeron jobs change. The canary and Prometheus find the notifier through its Consul services `kardamom-notifier` and `kardamom-notifier-metrics`.
+
+The edge load balancer needs a change only in an environment that exposes the feed on `:8547`. There, add the notifier nodes to its targets before the switch goes on. The staging load balancer (kardamom-infra) serves only the JSON-RPC, so staging needs no change.
+
+Do the move in this order:
+
+1. Create `notifier-0`. Bootstrap it like the other nodes, with `role=notifier`.
+2. Merge the webhook state onto `notifier-0` (see [The webhook state](#the-webhook-state)). Deploy with `KARDAMOM_NOTIFIER_NODES=on` and `KARDAMOM_NOTIFIER_COUNT=1`. The `aeron-notifier` driver on `notifier-0` fails its first start: the old `aeron` driver stops in the same evaluation and leaves a fresh `cnc.dat`. The new driver starts after the restart delay of 15 s.
+3. Measure the memory and the CPU of the notifier and of its media driver on `notifier-0`.
+4. Create `notifier-1`. Copy the webhook state of `notifier-0` to it. Deploy with `KARDAMOM_NOTIFIER_NODES=on` and `KARDAMOM_NOTIFIER_COUNT=2`.
+
+`KARDAMOM_NOTIFIER_COUNT` must not be above the count of the notifier nodes. With `distinct_hosts`, an instance without a node is never placed, and the deployment never turns healthy. So with the switch on, the preflight of the deploy counts the Nomad nodes that are `ready` and `eligible` and have `notifier` in `meta.roles`. The deploy stops before it changes a job when the count is above that number.
+
+The WebSocket clients reconnect when the notifier moves: Nomad stops the instances on the ingress nodes and starts new ones on the notifier nodes. The ring of a new instance starts empty, so a client that reconnects cannot replay the events from before the move.
+
+#### The webhook state
+
+The webhook shards follow the rendezvous hash of the subscription id over `--instance-index` (the Nomad allocation index) and `--instance-count`. They do not follow the node name.
+
+- Each instance stores every subscription in `/opt/kardamom/notifier`, as `<id>.json`.
+- The instance that owns a subscription keeps its outbox `<id>.outbox` and its delivery cursor `<id>.cursor` there. Only the owner writes them.
+- With `KARDAMOM_NOTIFIER_COUNT=1`, the one instance owns every subscription.
+- From 1 to 2, the new instance 1 takes about half of the subscriptions. Instance 0 keeps the rest. Instance 0 stops the deliveries of the subscriptions that move.
+
+The state does not move with the notifier. Before the deploy, merge the state of all the old nodes onto each new node, and rely on at-least-once delivery. Do not copy by allocation index:
+
+- The file names carry the subscription id, not the instance index. So one merged directory serves any index.
+- Nomad does not keep an allocation index on a node. The index-to-node map of the old nodes and of the new nodes is not fixed, so a copy by index can put a shard on the wrong node.
+- A cursor that is behind its outbox only delivers some events again. The subscriber deduplicates by the idempotency key (`tx_hash` plus stage).
+
+Merge by subscription, not file by file:
+
+- The cursor is a byte position in one outbox. So take `<id>.outbox` and `<id>.cursor` together, from the same node. Do not use `rsync --update`, because it selects each file alone.
+- A past owner can leave a stale pair on another node. The current owner opens the outbox when it takes the subscription, and the open sets the modification time. So take the pair from the node with the newer `<id>.outbox`.
+- The modification times come from the clocks of different nodes. So the merge relies on NTP on every node.
+- The `<id>.json` files are the same on every node. Copy each one from any node.
+
+The merges of the move:
+
+- Step 2 (ingress to `notifier-0`): the one new instance owns every subscription, so it needs the outboxes of both old instances. On `notifier-0`, run:
+
+  ```sh
+  dir=/opt/kardamom/notifier
+  for host in ingress-0 ingress-1; do
+    rsync -a --ignore-existing --include='*.json' --exclude='*' "$host:$dir/" "$dir/"
+    ssh "$host" "cd $dir && stat -c '%Y %n' -- *.outbox" | sed "s/\$/ $host/"
+  done | sort -k2,2 -k1,1nr | awk '!seen[$2]++ { print $3, $2 }' |
+  while read -r host outbox; do
+    id=${outbox%.outbox}
+    rsync -a --ignore-missing-args "$host:$dir/$id.outbox" "$host:$dir/$id.cursor" "$dir/"
+  done
+  ```
+
+- Step 4 (count 1 to 2): `rsync -a` the directory of `notifier-0` to `notifier-1`, then deploy at once. One node is the source, so each pair stays together. The new instance 1 then has every subscription and the outboxes of the shards that it takes.
+
+An event that the old owner appends between the copy and the deploy, and does not deliver before it stops, is not delivered. Keep that interval short. The receipt stays the truth for a client that misses a status.
+
+To go back, deploy with `KARDAMOM_NOTIFIER_NODES=off`.
+
 ### Configuration switches
 
 The workloads role reads these environment variables. The defaults are in `ansible/roles/workloads/defaults/main.yml`. An Ansible extra variable can set the matching `workloads_*` variable directly. An empty value means "use the default of the job".
@@ -449,11 +523,12 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Controller | `NOMAD_NAMESPACE` | `default` | The Nomad namespace. |
 | Controller | `KARDAMOM_ENV` | `local` | The environment name. It selects `deployed/<env>/`. |
 | Controller | `KARDAMOM_CLUSTER_BIN` | `target/release/kardamom-cluster` | The operator binary that smokes a canary. |
-| Controller | `KARDAMOM_OPERATOR`, `KARDAMOM_REVISION` | `GITHUB_ACTOR` or `USER`; `GITHUB_SHA` or the git or jj revision | The operator and the revision of the deploy record. |
+| Controller | `KARDAMOM_OPERATOR`, `KARDAMOM_REVISION` | `GITHUB_ACTOR` or `USER`; `GITHUB_SHA` or the git or jj revision | The operator and the revision of the deploy record. The snapshot check also takes `KARDAMOM_REVISION` as the revision of a sealer image that no record, registration or tag names. |
 | Controller | `KARDAMOM_REGISTRY_URL` | the Nomad API host on the registry port | The registry API that holds the images of the manifest, as the controller reaches it. `off` skips the image check, in the local profile only. A registry that answers 401, such as `https://ghcr.io`, gets an anonymous pull token from the realm of its challenge. |
 | Controller | `KARDAMOM_ALLOW_ONE_WAY` | empty | The format ids whose one-way change the operator accepts, comma-separated. The record then carries a rollback floor. |
 | Controller | `KARDAMOM_ALLOW_RETIRED` | empty | The retired format ids that the operator accepts in the rolling path, comma-separated. Each must be neither shared nor permanent, and the release must remove the service that owned it. The record keeps the list in `retired`. No floor follows. |
 | Controller | `KARDAMOM_ALLOW_MUST_MATCH` | empty | The sealer settings of a documented procedure that change in the rolling path, comma-separated. |
+| Controller | `KARDAMOM_ALLOW_SEALER_DOWN` | empty | The sealer groups that do not run and that a roll of the sealer accepts, comma-separated: a member that crash-loops on its release. The snapshot check does not read their snapshots, and the staged roll rolls them first. A named group that runs is refused. |
 | Controller | `KARDAMOM_REPLACE_ATTEMPT` | `0` | `1` deploys over an attempt that is still `started`, when it died. |
 | Controller | `KARDAMOM_ROLLBACK_BELOW_FLOOR` | empty | The format ids of a floor that `just rollback` crosses on purpose, after a check that no writer wrote the new version. |
 | Signing | `DIGEST_MANIFEST` | `images.digests` | The image manifest. A relative path starts in `deploy/cluster/`. |
@@ -509,13 +584,16 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Executor | `KARDAMOM_EXEC_ON_SEALERS` (job variable `exec_on_sealers` of every job that it changes) | empty (`off` in the jobs) | `on` or `off`. On, executor `<i>` runs on `sealer-<i>`, and the executor job rolls one group at a time. It needs `KARDAMOM_MEMBER_FEED=on`. |
 | Executor | `KARDAMOM_CARRY_EXECUTORS` (job variable `carry_executors`) | empty | The member indexes of the carry executors, such as `0,1`. Each one runs with `--carry-bytes` and `--egress`. It needs `KARDAMOM_EXEC_ON_SEALERS=on` and `KARDAMOM_EGRESS=1`. |
 | Sequencer | `KARDAMOM_SEALER_VERSION_FLOOR` (job variable `sealer_version_floor`) | empty (`0` in the job) | The decision version that a sequencer assumes before the first report of a sealer session, from 0 to 5. The release gate refuses a value above the lowest `decisionVersion` of the members, and a value above 0 before every reader runs this release. |
+| Sequencer | `KARDAMOM_SEQUENCER_ADMISSION` (job variable `admission`) | empty (`off` in the job) | `on` or `off`. On, the sequencers run the v2 loop (the `[admission]` section of the config), with 512 forwarded and 512 parked transactions for each sender. The carry window needs it: only the v2 loop takes the bytes of a transaction under decision version 5, and the sealer refuses a reference without bytes while the window is on. |
 | Executor | `KARDAMOM_EXEC_CURSOR` (job variable `exec_cursor`) | empty (`off` in the job) | `on` or `off`. On, each executor sends its recorded cursor to the sealer, the floor of the record-lag guard. Switch it on only after every sealer member reads ingress kind 9. A sealer member that does not read it drops the frame. |
 | Egress | `KARDAMOM_EGRESS` | `0` | `1` deploys the egress job (`nomad/egress.nomad.hcl`) and its scrape (job variable `egress` of the monitoring job). It needs `KARDAMOM_EXEC_FRAMES=on`. See [The egress](#the-egress). |
 | Egress | `KARDAMOM_EXEC_FRAMES` (job variable `exec_frames` of the executor) | empty (`off` in the job) | `on` or `off`. On, each executor publishes the frames that it executes on `exec_frames` (`--exec-frames`). |
 | Egress | `KARDAMOM_VALIDATOR_EGRESS`, `KARDAMOM_BATCHER_EGRESS` (job variable `egress_url`) | empty (the job reads the cluster egress) | `on` or `off`. On, the validator or the batcher reads the canonical stream from the egress (`--egress`), and its job carries the meta `reads_egress`. Switch it on only on a chain where the carry flag is active. It needs `KARDAMOM_EGRESS=1`. The release gate refuses the move while the reader is not past the last stored reference. See [The carry window](#the-carry-window). |
 | Egress | `KARDAMOM_SEQUENCER_RECEIPTS_FROM_EGRESS` (job variable `receipts_from_egress` of the sequencer) | empty (`off` in the job) | `on` or `off`. On, the sequencers read the receipts and their account rows from `egress_receipts` (`receipts_from_egress = true` in the config). It needs `KARDAMOM_EGRESS=1`. |
-| Egress | `KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS` (job variable `receipt_query_endpoints` of the ingress) | empty (the executors) | `on` or `off`. On, `eth_getTransactionReceipt` asks the egress on a cache miss (`--receipt-query-endpoints`). It needs `KARDAMOM_EGRESS=1`. |
+| Egress | `KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS` (job variable `receipt_query_endpoints` of the ingress) | empty (the executors) | `on` or `off`. On, `eth_getTransactionReceipt` asks the egress on a cache miss (`--receipt-query-endpoints`), then the executors when the egress has no receipt. It needs `KARDAMOM_EGRESS=1`. |
 | Egress | `KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS` (job variable `receipts_from_egress` of the notifier) | empty (`off` in the job) | `on` or `off`. On, the notifier reads the receipts from `egress_receipts` (`--receipts-from-egress`). It needs `KARDAMOM_EGRESS=1`. |
+| Notifier | `KARDAMOM_NOTIFIER_NODES` (job variable `notifier_nodes` of the notifier and the aeron jobs) | empty (`off` in the jobs) | `on` or `off`. On, the notifier runs on the nodes of role `notifier`, and their media drivers idle at 1000 µs. Off, it runs on the ingress nodes. See [The notifier nodes](#the-notifier-nodes). |
+| Notifier | `KARDAMOM_NOTIFIER_COUNT` (job variable `notifier_count` of the notifier) | empty (`1` in the job) | The notifier instance count with `KARDAMOM_NOTIFIER_NODES=on`: the count of the notifier nodes. The preflight refuses a count above the count of the ready notifier nodes. |
 | Executor | `KARDAMOM_CHECKPOINT_LOG` (job variable `checkpoint_log`) | empty (`off` in the job) | `on` or `off`. On, each executor keeps the block log of its checkpoints and copies the state only when the base rule asks for a new base, at 16 MiB/s. Off, it copies the whole state each 20 s. Each release reads the bases of both modes. See [`../../docs/specs/2026-10-22-incremental-checkpoints.md`](../../docs/specs/2026-10-22-incremental-checkpoints.md). |
 | Fees | `PRIORITY_FEES` | empty (`off`) | `on` or `off`. One value sets the sequencer tip, the sealer ordering window and the executor and validator fee schedule. Turning it on for an existing chain is a chain upgrade. See [`../../docs/priority-fees.md`](../../docs/priority-fees.md). |
 | Aeron | `KARDAMOM_AERON_THREADING_MODE` | empty (`SHARED` in the job) | The threading mode of the media driver of each node: `SHARED` (one thread), `SHARED_NETWORK` (the sender and the receiver on one thread, the conductor on its own) or `DEDICATED` (three threads). `SHARED` costs the least CPU, but at a high message rate its one thread saturates and every stream of the node waits. |
@@ -538,12 +616,12 @@ The release gate (`roles/workloads/tasks/gate.yml`) refuses a release before it 
 | The last attempt is still started | The record's `attempt.status`. | Let it finish. If it died, `just rollback <env>`, or `KARDAMOM_REPLACE_ATTEMPT=1`. |
 | The chain stands on a halt or a pause | `kardamom_chainStatus` on a running ingress: `roots` is empty, and no `pause` stands on the sealer, the ingress or a service. A cluster without the ingress job has no chain to check; an ingress job without a running allocation is refused. When Nomad does not know the sealer job, the gate excuses `sealer_no_quorum` and the upstream pauses on it: the coordinated restart of the sealer purges the job, and the deploy brings it back. | Clear the halt (`docs/runbooks/`). A deploy cannot tell a failed release from a halted environment. |
 | An image is not in the registry | `HEAD /v2/<name>/manifests/<digest>` for every manifest record, at `KARDAMOM_REGISTRY_URL`. `off` skips it in the local profile only. | Push the images, or fix the manifest. |
-| A coordinated format change | `kardamom-deploy formats` compares the `formats.toml` of the accepted release with the target's, with the rules of [`docs/formats.md`](../../docs/formats.md). A `rolling`, `mixed_fleet` or `retired` finding is coordinated. A `retired` finding that `KARDAMOM_ALLOW_RETIRED` names rolls, when the format is neither shared nor permanent. The comparison needs the formats text in the accepted release. A deploy does not write the text into the record, so after the first deploy of this release there is no base and no comparison, until compatibility fixtures and a mixed-version chaos shard replace the format gate. Do not rely on this check in that window. | Stop the writers, or follow the runbook of the format. When the release removes the service that owned a retired format, set `KARDAMOM_ALLOW_RETIRED=<ids>`. |
+| A coordinated format change | `kardamom-deploy formats` compares the `formats.toml` of the accepted release with the target's, with the rules of [`docs/formats.md`](../../docs/formats.md). A `rolling`, `mixed_fleet` or `retired` finding is coordinated. A `retired` finding that `KARDAMOM_ALLOW_RETIRED` names rolls, when the format is neither shared nor permanent. The comparison needs the formats text in the accepted release. A deploy does not write the text into the record, so after the first deploy of this release there is no base and no comparison. Do not rely on this check after that deploy. | Stop the writers, or follow the runbook of the format. When the release removes the service that owned a retired format, set `KARDAMOM_ALLOW_RETIRED=<ids>`. |
 | A stale retired allowance | `KARDAMOM_ALLOW_RETIRED` names a format that the release does not retire, or one that is shared or permanent. | Unset it, or remove the id. |
 | A one-way format change | A `rollback` finding that `KARDAMOM_ALLOW_ONE_WAY` does not name. An allowance that covers no finding is refused too. | Set `KARDAMOM_ALLOW_ONE_WAY=<ids>`. The record then carries a rollback floor. |
 | A sealer setting that every member must match | The settings of `workloads_sealer_must_match` in the compiled sealer job against the registered cluster. | Change it through a coordinated restart of the sealer. A documented procedure names the settings in `KARDAMOM_ALLOW_MUST_MATCH`. |
 | A shard map change | `config/shard-map.toml` against the map of the registered ingress. | Use the resize controller (`kardamom-cluster scale-sequencers`). |
-| A sealer member holds a snapshot that the target cannot read | `snapshotLatest` of `GET /status` on the admin port of every configured member, against `reads_max` of `sealer-snapshot` in the target's `formats.toml`. The check runs only when the plan of the sealer job shows a change, such as a new image digest: a running member reads no snapshot. A sealer job that Nomad does not know skips the check. When the sealer job changes, a configured member that does not run is refused: the gate cannot read its version. | Deploy a release that reads that snapshot version. Start a member that does not run, and let it catch up. |
+| A sealer member holds a snapshot that the target cannot read | `snapshotLatest` of `GET /status` on the admin port of every configured member, against `reads_max` of `sealer-snapshot` in `formats.toml` at the revision of the target sealer. That revision comes from the first of: a deploy record that names the target sealer image; the target revision, when the image is the registered one or the manifest pins no sealer image; the image tag (`main-<12 hex>` or `vX.Y.Z`); `KARDAMOM_REVISION`. A sealer image that none of them names is refused. The check runs only when the plan of the sealer job shows a change, such as a new image digest: a running member reads no snapshot. A sealer job that Nomad does not know skips the check. When the sealer job changes, a configured member that does not run is refused: the gate cannot read its version. `KARDAMOM_ALLOW_SEALER_DOWN` names the down members that the operator accepts. `just rollback` runs the same check against the release before. | Deploy a release that reads that snapshot version. Start a member that does not run, and let it catch up. For an image without a revision, set `KARDAMOM_REVISION` to its revision. |
 
 The gate reads only, so it also runs in check mode. A cluster without an accepted release has no formats to compare with.
 
@@ -704,7 +782,7 @@ deploy/cluster/
     ingress.nomad.hcl  sequencer.nomad.hcl  executor.nomad.hcl
     validator.nomad.hcl  da-watcher.nomad.hcl  batcher.nomad.hcl
     state-mirror.nomad.hcl  redis.nomad.hcl  monitoring.nomad.hcl
-    notifier.nomad.hcl      the transaction status feed and webhooks, on the ingress nodes
+    notifier.nomad.hcl      the transaction status feed and webhooks, on the ingress nodes or the notifier nodes
     canary.nomad.hcl        the transaction canary, on the monitoring node
     da-proxy.nomad.hcl      the EigenDA proxy, on an EigenDA network
     da-store.nomad.hcl      the file-backed stand-in for it, without one

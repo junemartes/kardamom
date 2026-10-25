@@ -17,7 +17,9 @@
 //! rkyv bytes, or `null`, with the block of the newest receipt in the
 //! header `x-state-block`. So a client of the executor query reads the
 //! egress with no change. A dropped hash has no receipt, so the answer is
-//! `null`.
+//! `null`. The index keeps only the newest receipts since the start, so a
+//! hash that it does not hold also answers `null`. The ingress then asks
+//! the state query of an executor.
 //!
 //! `POST /` with the JSON-RPC call `kardamom_getTransactionStatus` answers
 //! the status of one hash:

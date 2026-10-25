@@ -83,6 +83,9 @@ kardamom-formats.workspace = true
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-deployer = { path = "../deployer", features = ["test-support"] }
 kardamom-batcher = { path = ".", features = ["test-support"] }
+# `actor::fixtures::TestStream`: the canonical stream of a test, read from
+# the cluster egress and from the egress.
+kardamom-engine = { workspace = true, features = ["test-support"] }
 kardamom-obs = { path = "../obs", features = ["test-support"] }
 tempfile.workspace = true
 proptest = "1"

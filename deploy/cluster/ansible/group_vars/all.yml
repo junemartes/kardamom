@@ -134,7 +134,8 @@ ports:
   redis_sentinel: 26379
   state_mirror_metrics: 9007
   # The notifier's client port (the status feed and POST /webhooks) and
-  # its Prometheus exporter, on the ingress nodes (nomad/notifier.nomad.hcl).
+  # its Prometheus exporter, on the ingress nodes or the notifier nodes
+  # (nomad/notifier.nomad.hcl).
   notifier_feed: 8547
   notifier_metrics: 9008
   # The transaction canary's Prometheus exporter, on the monitoring node
