@@ -19,6 +19,7 @@ pub(super) const TIMING: Timing = Timing {
     silence: Duration::from_millis(300),
     ready: Duration::from_millis(150),
     poll: Duration::from_millis(5),
+    stall: Duration::from_secs(1),
 };
 
 /// A reader of two in-memory sources, and the test's side of each.
@@ -30,15 +31,16 @@ pub(super) struct Rig {
 
 impl Rig {
     pub(super) fn new(next_index: u64, next_block: u64) -> Self {
+        Self::with(ReplayCursor::new(next_index, next_block), TIMING, false)
+    }
+
+    /// A rig with the waits of `timing`. The feed is lossy, as the egress
+    /// is, when `lossy` holds.
+    pub(super) fn with(cursor: ReplayCursor, timing: Timing, lossy: bool) -> Self {
         let (feed, feed_remote) = MemoryTransport::pair();
         let (service, service_remote) = MemoryTransport::pair();
         Self {
-            sub: CarriedSubscription::with_timing(
-                feed,
-                service,
-                ReplayCursor::new(next_index, next_block),
-                TIMING,
-            ),
+            sub: CarriedSubscription::with_timing(feed.with_lossy(lossy), service, cursor, timing),
             feed: feed_remote,
             service: service_remote,
         }
@@ -107,10 +109,17 @@ impl Rig {
 
     /// Run the reader until it fails, and return the error.
     pub(super) fn error(&mut self) -> ExecutorError {
+        self.sub.error()
+    }
+}
+
+impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
+    /// Run the reader until it fails, and return the error.
+    pub(super) fn error(&mut self) -> ExecutorError {
         let deadline = Instant::now() + Duration::from_secs(5);
         std::iter::repeat_with(|| {
             assert!(Instant::now() < deadline, "the reader did not fail");
-            self.sub.step()
+            self.step()
         })
         .find_map(Result::err)
         .expect("an error")

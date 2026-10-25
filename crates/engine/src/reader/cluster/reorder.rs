@@ -43,7 +43,8 @@ pub(crate) struct Reorder {
     /// only once the boundary at `next_block` proves it comes before it
     /// (`end_tx_idx > index`). Only `REPLAY_DONE` ends the mode. In live
     /// mode, frames arrive in emission order, so an absent boundary is a
-    /// future boundary.
+    /// future boundary. A reader of a lossy source stays in this mode
+    /// after `REPLAY_DONE` too: such a source can lose a boundary.
     ///
     /// A new session must enter this mode even with no key gap. The session
     /// can receive live frames before its replay, and the first live record
