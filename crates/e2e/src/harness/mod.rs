@@ -16,7 +16,9 @@
 //! keep the temp root (its path is printed) for later inspection.
 
 pub mod aeron;
+mod carry;
 mod config;
+mod consumers;
 mod control;
 pub mod inject;
 pub mod l1;
@@ -35,7 +37,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-pub use config::{DEV_CHAIN_ID, Genesis, StackConfig};
+pub use carry::CarrySeams;
+pub use config::{CarryOptions, DEV_CHAIN_ID, Genesis, StackConfig};
 use load_sampler::LoadSampler;
 use sealer::SealerCluster;
 use services::{ServiceSpec, Spawned, SpawnedIngress, SpawnedNotifier};
@@ -54,6 +57,12 @@ pub struct LocalStack {
     /// The L1 follower the da-watcher reads `l1_blocks` from.
     l1_follower: Option<services::SpawnedFollower>,
     verified_l1: Option<l1_verified::VerifiedL1>,
+    /// The live batcher and its fake DA proxy (`StackConfig::carry` with
+    /// `StackConfig::l1`).
+    batcher: Option<carry::BatcherSide>,
+    /// The egress (`StackConfig::carry`). It reads the frames of the
+    /// executor.
+    egress: Option<carry::SpawnedEgress>,
     executor: Spawned,
     validator: Option<Spawned>,
     sequencers: Vec<Spawned>,
@@ -73,6 +82,8 @@ pub struct LocalStack {
     /// archive-durability `channels.toml`, written once at launch). Also
     /// reused by [`Self::service_spec`] for a restarted service.
     log_config: Option<PathBuf>,
+    /// The L1 wiring of the validator, reused by a restarted validator.
+    validator_l1: Option<services::L1Wiring>,
     /// The executor's nonce query port. Picked before the sequencers
     /// spawn, and reused by a restarted executor.
     executor_query_port: u16,

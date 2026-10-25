@@ -54,9 +54,9 @@ impl Scrape {
     }
 }
 
-/// Scrape `http://addr/metrics` with a plain HTTP/1.0 GET. This needs no
-/// client library: the exporter answers with a non-chunked HTTP/1.0 body
-/// and closes the connection.
+/// Read `http://addr<path>` with a plain HTTP/1.0 GET. This needs no
+/// client library: the exporters and the admin endpoint of the sealer
+/// answer with a non-chunked HTTP/1.0 body and close the connection.
 ///
 /// # Errors
 /// Returns an error when the connection fails, when a read or write times
@@ -66,13 +66,13 @@ impl Scrape {
 /// succeeded and the counter is genuinely absent, so any other failure
 /// (a dead port, an unregistered exporter, a non-metrics server on that
 /// port) must surface as `Err`, not as an empty or partial body.
-fn scrape_blocking(addr: SocketAddr, timeout: Duration) -> Result<Scrape> {
+fn get_blocking(addr: SocketAddr, path: &str, timeout: Duration) -> Result<Response> {
     let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)
         .with_context(|| format!("connect {addr}"))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     stream
-        .write_all(format!("GET /metrics HTTP/1.0\r\nHost: {addr}\r\n\r\n").as_bytes())
+        .write_all(format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\n\r\n").as_bytes())
         .context("send scrape request")?;
     let mut buf = String::new();
     stream
@@ -87,20 +87,53 @@ fn scrape_blocking(addr: SocketAddr, timeout: Duration) -> Result<Scrape> {
         .with_context(|| format!("{addr}: scrape response has no status line"))?;
     anyhow::ensure!(
         status_line.split_whitespace().nth(1) == Some("200"),
-        "{addr}: scrape returned {status_line:?}, not 200 OK"
+        "{addr}: GET {path} returned {status_line:?}, not 200 OK"
     );
-    Ok(Scrape(body.to_string()))
+    Ok(Response {
+        head: head.to_string(),
+        body: body.to_string(),
+    })
 }
 
-/// Async wrapper for [`scrape_blocking`].
+/// The head (the status line and the headers) and the body of one answer.
+pub struct Response {
+    pub head: String,
+    pub body: String,
+}
+
+impl Response {
+    /// The value of the header `name`, matched without regard to case.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then_some(value.trim())
+        })
+    }
+}
+
+/// Async wrapper for [`get_blocking`] on `/metrics`.
 ///
 /// # Errors
-/// Returns an error under the same conditions as [`scrape_blocking`], or
+/// Returns an error under the same conditions as [`get_blocking`], or
 /// when the blocking task panics or is cancelled.
 pub async fn scrape(addr: SocketAddr) -> Result<Scrape> {
-    tokio::task::spawn_blocking(move || scrape_blocking(addr, Duration::from_secs(5)))
+    get(addr, "/metrics").await.map(|r| Scrape(r.body))
+}
+
+/// The answer of `GET <path>` on `addr`, an HTTP/1.0 server that closes
+/// the connection after its answer.
+///
+/// # Errors
+/// Returns an error under the same conditions as [`get_blocking`], or
+/// when the blocking task panics or is cancelled.
+pub async fn get(addr: SocketAddr, path: &str) -> Result<Response> {
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || get_blocking(addr, &path, Duration::from_secs(5)))
         .await
-        .context("scrape task join")?
+        .context("GET task join")?
 }
 
 /// Poll `f` every `interval` until it returns `Some(v)`, or until

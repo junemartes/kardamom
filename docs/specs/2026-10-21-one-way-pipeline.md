@@ -59,6 +59,10 @@ The carry spec decisions that change:
 - **The retained file of the carry spec is not needed with D11.** The sealer holds no frame past
   its window, so its heap and its snapshot have a fixed bound at any DA lag (#751), and the
   snapshot stays small.
+- **Note: how D11 runs on a heap member.** The carry activation spec
+  (`docs/specs/2026-10-23-carry-activation.md`) gives D11 on the heap, with no retained file.
+  Feature 5 (`FEATURE_CARRY_WINDOW`) turns on the exact window, and the member feed walks the
+  heap frames. The runbook is `docs/runbooks/carry-window-rollout.md`.
 
 ## 3. The ack after validation (D1, D2)
 

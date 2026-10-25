@@ -109,6 +109,7 @@ Examples: `kardamom_sequencer_tx_ingested_total`, `kardamom_executor_block_apply
 - The validator metrics start with `validator_`, not `kardamom_validator_`.
   Examples: `validator_committed_block`, `validator_blocks_verified_total`, `validator_bal_missing_total`,
   `validator_receipt_missing_total`, `validator_divergence_total`, `validator_state_root_block`.
+  The exception is `kardamom_validator_egress_cursor_index`, which pairs with `kardamom_batcher_egress_cursor_index`.
 - The executor exports `kardamom_executor_block_number` for the chain head.
 - Each service emits `kardamom_build_info`. It is a gauge with the value 1 and the labels `version` and `sha`.
   Set `KARDAMOM_GIT_SHA` at build time to fill `sha`.
@@ -481,11 +482,11 @@ Each executor exports these metrics for its executor stream (`exec_txs`). See "T
 
 ### Executor input source
 
-With `--carry-bytes` (`KARDAMOM_CARRY_BYTES`, off by default), the executor reads the canonical entries with their bytes from the feed of its paired sealer member, on `aeron:ipc` of the media driver at `--aeron-dir`.
+With `--carry-bytes`, the executor reads the canonical entries with their bytes from the feed of its paired sealer member, on `aeron:ipc` of the media driver at `--aeron-dir`.
 
 - The executor opens no `tx_data` lane, joins nothing and votes no void.
 - It opens no cluster session and sends no recorded cursor. It refuses to start with `--exec-cursor`.
-- Switch it on only with sealer members that carry the bytes and run the member feed.
+- Switch it on only while the rules of the carry window (feature 5) apply on every member and the member of the executor runs the member feed. The deploy switch is `KARDAMOM_CARRY_EXECUTORS`, and the release gate checks these conditions. See [the carry window runbook](runbooks/carry-window-rollout.md).
 - Off: the executor joins the references of the cluster egress with `tx_data`.
 
 With `--carry-bytes`, `--egress <url>` (`KARDAMOM_EGRESS_URL`, off by default) makes the egress the second source of the executor.
@@ -619,6 +620,15 @@ Each block commit records these steps:
 - `kardamom_sequencer_fee_rejected_total{partition}` counts the envelopes that the fee gate refused.
   Each one gets a `FeeInvalid`, `FeeTooLow`, or `InsufficientFunds` error on `tx_errors`.
   See [priority-fees.md](priority-fees.md).
+
+The egress feed thread keeps the decision version of the sealer and handles the refused references (egress kind 18).
+See "The kept sealer version and the refused reference" in [failure-modes.md](failure-modes.md).
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_sequencer_sealer_version{partition}` | The kept decision version of the sealer: the highest version that a session of the process reported, or the floor `--sealer-version-floor` before the first report. At 5 in the v2 loop, the sequencer offers each transaction with its bytes (record type 7). |
+| `kardamom_sequencer_ref_refused_total{partition}` | The kind-18 frames: the references without bytes that the carry window of the sealer refused. |
+| `kardamom_sequencer_tx_drops_total{reason}` | The drop records on `tx_drops`, by reason. `sealer_refused_reference` counts the drops of a kind-18 frame. |
 
 The epoch lane exports these metrics. See "Sequencer" in [failure-modes.md](failure-modes.md).
 
