@@ -1541,7 +1541,7 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - The case deploys a manifest whose executor image is a real image that is not an executor.
   - The new replica never passes its readiness check. Nomad fails the deployment at its healthy deadline.
   - Each deploy waits until the release gate shows no root and no pause, so the gate does not refuse it.
-  - The deploy must fail at the executor rollout: the executor job has a new version. At least two old executors must keep running. The chain must keep advancing.
+  - The deploy must fail at the executor rollout: the executor job has a new version. At least two executors must keep running the old image. The case reads the image from the job spec of each running allocation, not from its job version. On the sealer nodes the deploy rolls one pinned group at a time, and Nomad moves an unchanged group to the new job version in place. The chain must keep advancing.
   - The deploy of the real manifest then heals the job.
 - The deploy flow is in [../deploy/cluster/README.md](../deploy/cluster/README.md).
 

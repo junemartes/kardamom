@@ -31,7 +31,9 @@ pub(crate) async fn broken_image(h: &mut Harness) -> anyhow::Result<()> {
     let cluster_dir = h.lifecycle.cluster_dir().to_path_buf();
     let manifest = std::fs::read_to_string(cluster_dir.join(MANIFEST))
         .with_context(|| format!("read {MANIFEST}"))?;
-    let broken = Manifest::parse(&manifest).broken_executor()?;
+    let manifest = Manifest::parse(&manifest);
+    let broken_image = manifest.broken_image()?;
+    let broken = manifest.broken_executor()?;
     std::fs::write(cluster_dir.join(BROKEN_MANIFEST), broken)
         .with_context(|| format!("write {BROKEN_MANIFEST}"))?;
     let version = h.nomad.job("executor").await?.version;
@@ -53,20 +55,15 @@ pub(crate) async fn broken_image(h: &mut Harness) -> anyhow::Result<()> {
         "{}: deploy-broken-image: the deploy failed before the executor rollout: the executor job stays at version {version}",
         crate::FAIL_PREFIX
     );
-    let old_running = h
-        .nomad
-        .allocations("executor")
-        .await?
-        .iter()
-        .filter(|a| a.job_version == version && a.client_status == "running")
-        .count();
+    let images = h.nomad.running_images("executor", "executor").await?;
+    let old_running = broken_image.spared(&images);
     anyhow::ensure!(
         old_running >= 2,
-        "deploy-broken-image: {old_running} executor(s) of the old version still run; the failed deploy must stop after one"
+        "deploy-broken-image: {old_running} running executor(s) keep the old image; the failed deploy must stop after one"
     );
     h.assert_executor_progress(Duration::from_mins(1)).await?;
     crate::log(format!(
-        "deploy-broken-image: the deploy stopped at the executor job; {old_running} old executors keep the chain advancing"
+        "deploy-broken-image: the deploy stopped at the executor job; {old_running} executors on the old image keep the chain advancing"
     ));
 
     await_gate_open(h, "the healing deploy").await?;
@@ -139,10 +136,16 @@ impl<'a> Manifest<'a> {
             .with_context(|| format!("no {service} record in the manifest"))
     }
 
+    /// The executor image of the broken manifest: the DA stand-in's
+    /// image.
+    fn broken_image(&self) -> anyhow::Result<BrokenImage<'a>> {
+        self.image("da-store").map(BrokenImage)
+    }
+
     /// The manifest with the executor record pointing at the DA
     /// stand-in's image.
     fn broken_executor(&self) -> anyhow::Result<String> {
-        let wrong = self.image("da-store")?;
+        let BrokenImage(wrong) = self.broken_image()?;
         let text: String = self
             .lines
             .iter()
@@ -155,15 +158,31 @@ impl<'a> Manifest<'a> {
     }
 }
 
+/// The image reference that the broken deploy gives the executor.
+struct BrokenImage<'a>(&'a str);
+
+impl BrokenImage<'_> {
+    /// The number of `images` that are not the broken image: the
+    /// executors that keep the old image. The job version does not tell
+    /// this. The deploy rolls pinned executor groups one at a time, and
+    /// Nomad moves a group that the step does not change to the new job
+    /// version in place, on the old image.
+    fn spared(&self, images: &[String]) -> usize {
+        images.iter().filter(|image| *image != self.0).count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Manifest;
 
+    /// A manifest with an executor and a DA stand-in record.
+    const TEXT: &str =
+        "executor r/kardamom-executor:t@sha256:aa\nda-store r/kardamom-da-store:t@sha256:bb\n";
+
     #[test]
     fn the_broken_manifest_swaps_only_the_executor_image() {
-        let text =
-            "executor r/kardamom-executor:t@sha256:aa\nda-store r/kardamom-da-store:t@sha256:bb\n";
-        let broken = Manifest::parse(text).broken_executor().unwrap();
+        let broken = Manifest::parse(TEXT).broken_executor().unwrap();
         assert_eq!(
             broken,
             "executor r/kardamom-da-store:t@sha256:bb\nda-store r/kardamom-da-store:t@sha256:bb\n"
@@ -173,5 +192,17 @@ mod tests {
                 .broken_executor()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn only_the_executors_off_the_broken_image_count_as_old() {
+        let broken = Manifest::parse(TEXT).broken_image().unwrap();
+        let (old, bad) = (
+            "r/kardamom-executor:t@sha256:aa".to_string(),
+            "r/kardamom-da-store:t@sha256:bb".to_string(),
+        );
+        assert_eq!(broken.spared(&[bad.clone(), old.clone(), old.clone()]), 2);
+        assert_eq!(broken.spared(&[old.clone(), old]), 2);
+        assert_eq!(broken.spared(&[bad]), 0);
     }
 }
