@@ -338,6 +338,7 @@ job "ingress" {
           "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://${var.exec_on_sealers == "on" ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:9024"]),
           ],
           var.receipt_query_endpoints == "" ? [] : ["--receipt-query-endpoints", var.receipt_query_endpoints],
+          var.tx_events == "off" ? [] : ["--tx-events", var.tx_events],
         )
       }
 
@@ -355,7 +356,6 @@ job "ingress" {
         # job scrapes it off-node. The port is the ingress convention,
         # 9006 (the validator uses the same number on the aux node).
         KARDAMOM_METRICS_ADDR = "0.0.0.0:9006"
-        KARDAMOM_TX_EVENTS    = var.tx_events
       }
 
       # Presence-checked config. Content lives in config/ingress.toml.

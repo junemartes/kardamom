@@ -312,6 +312,10 @@ job "sequencer" {
               "--shadow-vslots", join(",", group.value.incoming),
               ], var.sealer_version_floor == 0 ? [] : [
               "--sealer-version-floor", format("%d", var.sealer_version_floor),
+              ], var.tx_events == "off" ? [] : [
+              # The replica of the lane: the twins publish under two origins.
+              "--tx-events", var.tx_events,
+              "--tx-events-origin", "${NOMAD_ALLOC_INDEX}",
             ])
           }
 
@@ -324,9 +328,6 @@ job "sequencer" {
             KARDAMOM_METRICS_ADDR  = "0.0.0.0:${var.metrics_base + 10 * parseint(group.key, 10)}"
             KARDAMOM_HOST_ID       = "node${meta.node_index}-seq-${group.key}"
             KARDAMOM_PRIORITY_FEES = var.priority_fees == "on" ? "true" : "false"
-            KARDAMOM_TX_EVENTS     = var.tx_events
-            # The replica of the lane: the twins publish under two origins.
-            KARDAMOM_TX_EVENTS_ORIGIN = "${NOMAD_ALLOC_INDEX}"
           }
 
           template {
