@@ -17,6 +17,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use alloy_primitives::Address;
 use kardamom_cluster_adapter::wire::{
     RefRefused, SEALER_V4_DECISION_VERSION, SEALER_V5_DECISION_VERSION,
 };
@@ -145,7 +146,10 @@ impl<D: DropPublisher> SealerRules<D> {
             "sealer refused a reference without bytes; dropping the transaction"
         );
         self.publish(self.shared.get().max(refused.decision_version));
-        self.tell_loop(refused);
+        self.tell_loop(AccountEvent::Refused {
+            sender: refused.sender,
+            nonce: refused.nonce,
+        });
         self.drops.publish_drop(TxDrop {
             tx_hash: refused.canonical_id,
             sender: refused.sender,
@@ -154,13 +158,22 @@ impl<D: DropPublisher> SealerRules<D> {
         });
     }
 
-    /// Put the refusal on the queue of the v2 loop. A full queue loses it:
-    /// the loss window of the filter then frees the nonce, later.
-    fn tell_loop(&self, refused: &RefRefused) {
-        let event = AccountEvent::Refused {
-            sender: refused.sender,
-            nonce: refused.nonce,
-        };
+    /// The contiguity guard of the sealer rejected the reference of
+    /// `sender` at `nonce`, because it expects `expected` (egress kind 5).
+    /// Tell the v2 loop, so it offers the run again from the expected
+    /// nonce.
+    pub fn on_contiguity_reject(&self, sender: Address, nonce: u64, expected: u64) {
+        self.tell_loop(AccountEvent::Rejected {
+            sender,
+            nonce,
+            expected,
+        });
+    }
+
+    /// Put the answer of the sealer on the queue of the v2 loop. A full
+    /// queue loses it: the loss window of the filter then frees the nonce,
+    /// later.
+    fn tell_loop(&self, event: AccountEvent) {
         let full = self
             .refusals
             .as_ref()

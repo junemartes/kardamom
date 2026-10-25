@@ -3,19 +3,14 @@
 //! 1. Feature 3 turns on version 4. Each sequencer restarts with the floor
 //!    5, under load. The first report of the sealer lowers the kept
 //!    version to 4, and every transfer lands.
-//! 2. Feature 4 turns on version 5. A probe sends its nonce 1 first: the v2
-//!    loop of its sequencer takes it with its bytes, and holds it for nonce
-//!    0. Feature 4 turns off with a later activation, so the chain runs
-//!    version 4 again, and the sequencer keeps version 4. Then nonce 0 goes
-//!    out as a reference without bytes, and the held nonce 1 goes out with
-//!    its bytes, below version 5. Every member counts it, the readers run
-//!    it, and both receipts land.
+//! 2. Feature 4 turns on version 5. A probe sends nonce 1 first, and the
+//!    sequencer holds it for nonce 0. Feature 4 turns off, and the chain
+//!    returns to version 4. Both nonces then leave in the current format,
+//!    without carried bytes. Both receipts land, and the batcher posts them.
 //!
-//! The first case is what a wrong floor does. Its offers with bytes race
-//! the first report of the sealer, which comes a few milliseconds after the
-//! session opens, so the case does not count on one. The second case makes
-//! the same kind of offer on purpose: the sequencer took the bytes under
-//! version 5, and the offer goes out under version 4.
+//! A parked transaction must use the version at release, rather than the
+//! version at admission. The sealer tests cover old full references below
+//! version 5 separately.
 
 use anyhow::{Context, Result};
 use kardamom_types::upgrades::{FEATURE_SEALER_V4, FEATURE_SEALER_V5};
@@ -35,9 +30,9 @@ pub async fn wrong_floor(stack: &mut LocalStack, p: Params) -> Result<()> {
     r.activate(FEATURE_SEALER_V4, 0, 4).await?;
     r.await_sequencer_version(4).await?;
     r.floor_above_the_chain().await?;
-    r.full_reference_below_five().await?;
+    r.held_offer_after_downgrade().await?;
     r.rounds(3).await?;
-    r.t.assert_validator_verdict("a full reference below version 5")
+    r.t.assert_validator_verdict("a held offer after a downgrade")
         .await
 }
 
@@ -53,8 +48,8 @@ impl Rollout<'_> {
         self.rounds(3).await
     }
 
-    /// Case 2: a full reference that the sealer orders below version 5.
-    async fn full_reference_below_five(&mut self) -> Result<()> {
+    /// Case 2: the held offer uses the version at release.
+    async fn held_offer_after_downgrade(&mut self) -> Result<()> {
         self.activate(FEATURE_SEALER_V5, 0, 5).await?;
         self.await_sequencer_version(5).await?;
         let shard = 1;
@@ -72,9 +67,8 @@ impl Rollout<'_> {
         parked.abort();
         let after = self.members.values(reads::FULL_REF_BELOW_V5, "").await?;
         anyhow::ensure!(
-            after.iter().zip(&before).all(|(a, b)| a > b),
-            "every member orders the held offer as a full reference below version 5: \
-             {before:?} -> {after:?}"
+            after == before,
+            "the held offer must use the version-4 reference format: {before:?} -> {after:?}"
         );
         self.egress.await_status(first.hash, "executed").await?;
         self.egress.await_status(held.hash, "executed").await?;
@@ -82,7 +76,7 @@ impl Rollout<'_> {
         Gauge::of(self.batcher, reads::BATCHER_POSTED)
             .await_above(block)
             .await
-            .context("the batcher posts the block of the full reference")
+            .context("the batcher posts the held transaction")
             .map(|_| ())
     }
 
