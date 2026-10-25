@@ -316,8 +316,31 @@ workloads_batcher_egress: >-
 workloads_sequencer_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_SEQUENCER_RECEIPTS_FROM_EGRESS') }}"
 # eth_getTransactionReceipt of the ingress from the egress on a cache miss.
 workloads_ingress_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS') }}"
+# The tx_events stream of the ingress and the sequencers
+# (docs/specs/2026-10-25-client-events.md): "on" or "off". Empty keeps the
+# jobs' "off" default.
+workloads_tx_events: "{{ lookup('env', 'KARDAMOM_TX_EVENTS') }}"
 # The receipts of the notifier from egress_receipts.
 workloads_notifier_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS') }}"
+# The egress on its own nodes (nomad/egress.nomad.hcl, egress_nodes): "on"
+# or "off". Empty keeps the job's "off" default: the egress stays on the
+# executor nodes. Switch it on only when the egress nodes exist, and move
+# the instances one at a time (deploy/cluster/README.md, "The egress
+# nodes").
+workloads_egress_nodes: "{{ lookup('env', 'KARDAMOM_EGRESS_NODES') }}"
+# The egress instances: the default of egress_count in
+# nomad/egress.nomad.hcl. No environment variable sets egress_count, so a
+# change of egress_count must change this value too. The preflight needs
+# one ready egress node for each instance when the switch is on.
+workloads_egress_instances: 2
+# The roles that a switch moves to their own nodes, for the node count of
+# the preflight: the role, the instance count and the name of the count
+# in the message. The egress counts only where it runs (KARDAMOM_EGRESS).
+workloads_moved_roles: >-
+  {{ ([{'role': 'notifier', 'instances': workloads_notifier_count | default('1', true) | int,
+        'count_name': 'KARDAMOM_NOTIFIER_COUNT'}] if workloads_notifier_nodes == 'on' else [])
+     + ([{'role': 'egress', 'instances': workloads_egress_instances,
+          'count_name': 'The egress count'}] if workloads_egress | bool and workloads_egress_nodes == 'on' else []) }}
 # The readers reach the egress through its Consul service.
 workloads_egress_url: "http://kardamom-egress.service.{{ datacenter }}.consul:{{ ports.egress_http }}"
 # The job variables of the switches, by job: the egress switches and the
@@ -325,6 +348,8 @@ workloads_egress_url: "http://kardamom-egress.service.{{ datacenter }}.consul:{{
 # (tasks/compile.yml), so a resize keeps them too. An empty value keeps the
 # job's default, off.
 workloads_egress_job_vars:
+  egress:
+    egress_nodes: "{{ workloads_egress_nodes }}"
   executor:
     exec_frames: "{{ workloads_exec_frames }}"
     carry_executors: "{{ workloads_carry_executors }}"
@@ -336,10 +361,12 @@ workloads_egress_job_vars:
     egress_url: "{{ workloads_egress_url if workloads_batcher_egress == 'on' else '' }}"
   sequencer:
     receipts_from_egress: "{{ workloads_sequencer_receipts_from_egress }}"
+    tx_events: "{{ workloads_tx_events }}"
     sealer_version_floor: "{{ workloads_sealer_version_floor }}"
     admission: "{{ workloads_sequencer_admission }}"
   ingress:
     receipt_query_endpoints: "{{ workloads_egress_url if workloads_ingress_receipts_from_egress == 'on' else '' }}"
+    tx_events: "{{ workloads_tx_events }}"
   notifier:
     receipts_from_egress: "{{ workloads_notifier_receipts_from_egress }}"
   # Prometheus scrapes the egress only where it runs.
@@ -492,10 +519,6 @@ workloads_sealer_must_match:
 # and closes it when the new cluster is up. On a registered job the flag
 # does nothing, so a re-deploy that keeps it set is safe.
 workloads_cluster_bootstrap: "{{ lookup('env', 'KARDAMOM_CLUSTER_BOOTSTRAP') | default('0', true) | bool }}"
-# The operator binary that runs the smoke against a canary.
-workloads_cluster_binary: >-
-  {{ lookup('env', 'KARDAMOM_CLUSTER_BIN')
-     | default(workloads_cluster_dir ~ '/../../target/release/kardamom-cluster', true) }}
 # The deploy record, by environment. The Nomad variable
 # kardamom/deploys/<env> holds the current attempt and the last accepted
 # release; deployed/<env>/ mirrors it (attempt.json, accepted.json,

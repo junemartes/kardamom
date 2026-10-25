@@ -203,6 +203,28 @@ paths:
   da_store_dir: /opt/kardamom/da-store     # the DA stand-in's payloads (no EigenDA network)
   config_dir: /opt/kardamom/config         # rendered service configs + genesis
 
+# The data directories of the services on a node, and their mode: the one
+# list of them. The common role makes them when it provisions a node. The
+# data-dirs job of each deploy makes the missing ones and sets the mode,
+# so a node keeps up with a new service. The services run as uid 10001,
+# so every user can write to each directory.
+node_data_dirs:
+  mode: "0777"
+  paths:
+    - "{{ paths.base }}"
+    - "{{ paths.archive_dir }}"
+    - "{{ paths.state_dir }}"
+    - "{{ paths.checkpoints_dir }}"
+    - "{{ paths.mirror_dir }}"
+    - "{{ paths.notifier_dir }}"
+    - "{{ paths.canary_dir }}"
+    - "{{ paths.egress_dir }}"
+    - "{{ paths.batcher_dir }}"
+    - "{{ paths.da_watcher_dir }}"
+    - "{{ paths.l1_indexer_dir }}"
+    - "{{ paths.da_store_dir }}"
+    - "{{ paths.config_dir }}"
+
 # tmpfs size for the Aeron media-driver shared-memory dir.
 aeron_tmpfs_size: "2g"
 

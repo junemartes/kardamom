@@ -20,6 +20,7 @@ pub mod ids;
 pub mod mnemonic;
 #[cfg(any(test, feature = "test-support"))]
 pub mod signers;
+pub mod smoke;
 pub mod spec;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testkit;

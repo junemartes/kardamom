@@ -32,7 +32,7 @@ The local profile defines these classes:
 | `control` | 1 | Nomad and Consul server, Docker registry, anvil (the in-cluster L1) |
 | `sequencer` | 2 | 2 lanes with 2 racing replicas each. One job group per lane (`seq-<lane>`, expanded by the Nomad HCL). The metrics port is `9001 + 10 * lane`. |
 | `ingress` | 2 | The active/active JSON-RPC front door (`:8545`) and the notifier status feed (`:8547`). Role `redis`. Instance 1 also has role `redis-replica`. With `KARDAMOM_NOTIFIER_NODES=on`, the notifier moves to the `notifier` nodes. See [The notifier nodes](#the-notifier-nodes). |
-| `executor` | 3 | State-machine replica appliers (libmdbx state). The state mirror runs here too. With `KARDAMOM_EGRESS=1`, the egress runs on two of them (`:8548`, metrics `:9013`). See [The egress](#the-egress). |
+| `executor` | 3 | State-machine replica appliers (libmdbx state). The state mirror runs here too. With `KARDAMOM_EGRESS=1`, the egress runs on two of them (`:8548`, metrics `:9013`), unless `KARDAMOM_EGRESS_NODES=on` moves it to its own nodes. See [The egress](#the-egress). |
 | `sealer` | 3 | A 3-member Aeron Cluster (Raft). The Java `cluster` job orders the transactions. The Raft log and its archive hold the canonical log. |
 | `aux` | 1 | The service roles `redis`, `redis-primary`, `batcher`, `monitoring`, `validator`, `da-watcher` and `indexer`. |
 
@@ -181,6 +181,15 @@ A deploy rolls each service job one instance at a time, under a health check.
   - The rules of each service are in [Readiness](../../docs/observability.md#readiness).
 - The role waits for the Nomad deployment of each job and requires `successful`. A deployment that Nomad marks `failed` fails the play at that job. The next job is not touched.
 - A system job (the Aeron drivers) has no deployment. The role waits for its allocations instead.
+- The first job of each deploy is `data-dirs`, a sysbatch job on every node of every pool. It makes each data directory of `node_data_dirs` in `ansible/group_vars/all.yml` and sets its mode (`0777`). The role waits until each allocation is complete, and registers no other job before.
+  - The job runs the Aeron image of the release manifest, as root, with a shell as its entrypoint. It needs no image outside the manifest.
+  - A release changes the Aeron image, so each release registers the job again, and it runs again on every node. A rollback reverts it with the other jobs.
+  - Nomad stops the allocation of a node that goes down, and the wait no longer counts it. An allocation that does not complete fails the deploy when the poll budget runs out (`workloads_poll_retries` polls, `workloads_poll_delay` seconds apart).
+  - The common role makes the same directories when it provisions a node. The job gives a node that existed before a service the directory of that service.
+  - Without the directory, Docker makes the bind-mount source as `root` with mode `0755`, and a service that runs as uid 10001 cannot write to it.
+  - A new data directory goes into `node_data_dirs` only.
+- The role waits for every job except `cluster-backup`. The transaction canary is the last job: an unhealthy canary fails the deploy.
+  - The canary is healthy when its task runs and `/ready` answers for 10 s (`min_healthy_time`), within 2 minutes (`healthy_deadline`). Its `/ready` reads only the liveness of its exporter. A failed or slow probe does not change it, so only a canary that does not start, or that does not stay running, fails the deploy.
 
 The `update` stanza of each job:
 
@@ -206,6 +215,7 @@ The canary:
 
 - The ingress and the sequencer can deploy a canary. Set `KARDAMOM_CANARY=1`. The canary is one allocation more than the count, so it needs one spare node of the class. The container profile has none.
 - The role smokes the ingress canary by its node address, and promotes it. Then it replaces the old instances.
+- `kardamom-deploy smoke` sends the smoke transfer, from genesis account #0. Every release ships this binary, signed.
 - For the sequencer, the canary is healthy by its own check. The smoke then goes through a running ingress and proves that the chain still accepts a transaction.
 - A failed smoke fails the play. The deployment stays unpromoted, and the old instances keep serving. `nomad deployment fail` removes the canary.
 - `auto_revert` is on for these two stateless classes only.
@@ -340,7 +350,30 @@ Every switch is off by default. With every switch off, the deploy renders every 
 
 The preflight refuses a reader switch without the egress, the egress without the frames, and a value other than `on`, `off` or empty. To go back, switch off in the reverse order.
 
-The merge chains the copy of an executor only from the start of the stream. An instance with an empty store on a running chain finds no frame to chain to. So start the egress with a new chain, or give a new instance a store. A new node of a rescheduled instance has an empty store too.
+The merge chains the copy of an executor only behind a frame that another source delivers. After a start, an instance reads the frames between its head and the copies from the range read of a peer (`--peers`, `crates/egress/src/catchup.rs`, #743). So an instance with an empty store fills it from a running peer. With no peer that holds the frames, it starts again after the next boundary of a copy, and its store then begins there. A new node of a rescheduled instance has an empty store too.
+
+#### The egress nodes
+
+The switch `KARDAMOM_EGRESS_NODES=on` (job variable `egress_nodes`) moves the egress off the executor nodes to its own nodes (`docs/specs/2026-10-25-client-events.md`, 4.7). Off, the deploy renders every job as before.
+
+- An egress node has `egress` in `meta.roles`. Its name is `egress-<i>`. The kardamom-infra staging inventory names `egress-0` and `egress-1`.
+- On, the job constrains on `meta.roles` with `set_contains "egress"`, with `distinct_hosts`. Only the egress job changes.
+- On, the peers of each instance name the egress nodes and every executor node. So during the move, a moved instance fills its empty store from the instance that is still on an executor node.
+- The preflight counts the Nomad nodes that are `ready` and `eligible` and have `egress` in `meta.roles`. With the egress deployed (`KARDAMOM_EGRESS=1`), the deploy stops before it changes a job when the count is below `egress_count` (2).
+- The readers reach the egress through the Consul service `kardamom-egress`, so no reader changes.
+
+A change of the constraint does not move a running allocation. Move the instances one at a time:
+
+1. Create the egress nodes and bootstrap them (kardamom-infra).
+2. Deploy with `KARDAMOM_EGRESS_NODES=on`. The job registers with the new constraint. The two instances keep running on the executor nodes.
+3. Stop one instance: `nomad alloc stop <alloc>`. Nomad places it again on an egress node. Its store is empty, and it fills from the other instance.
+4. Check the moved instance before the next step:
+   - `kardamom_egress_head_distance_frames` is near 0;
+   - its `GET /health` answers;
+   - its `kardamom_egress_ref_frame_max_index` equals the one of the other instance.
+5. Stop the other instance. It moves and fills from the moved one.
+
+To go back, deploy with `KARDAMOM_EGRESS_NODES=off`, then move the instances back the same way, one at a time.
 
 ### The carry window
 
@@ -567,7 +600,6 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Controller | `NOMAD_TOKEN` | empty | The Nomad ACL token. |
 | Controller | `NOMAD_NAMESPACE` | `default` | The Nomad namespace. |
 | Controller | `KARDAMOM_ENV` | `local` | The environment name. It selects `deployed/<env>/`. |
-| Controller | `KARDAMOM_CLUSTER_BIN` | `target/release/kardamom-cluster` | The operator binary that smokes a canary. |
 | Controller | `KARDAMOM_OPERATOR`, `KARDAMOM_REVISION` | `GITHUB_ACTOR` or `USER`; `GITHUB_SHA` or the git or jj revision | The operator and the revision of the deploy record. The snapshot check also takes `KARDAMOM_REVISION` as the revision of a sealer image that no record, registration or tag names. |
 | Controller | `KARDAMOM_REGISTRY_URL` | the Nomad API host on the registry port | The registry API that holds the images of the manifest, as the controller reaches it. `off` skips the image check, in the local profile only. A registry that answers 401, such as `https://ghcr.io`, gets an anonymous pull token from the realm of its challenge. |
 | Controller | `KARDAMOM_ALLOW_ONE_WAY` | empty | The format ids whose one-way change the operator accepts, comma-separated. The record then carries a rollback floor. |
@@ -582,7 +614,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Signing | `KARDAMOM_CERT_OIDC_ISSUER` | `https://token.actions.githubusercontent.com` | The OIDC issuer of the signer. |
 | Signing | `KARDAMOM_COSIGN_CACHE`, `KARDAMOM_COSIGN_VERSION` | the user cache, the pinned version | Where the controller finds a cosign that is not on `PATH`. |
 | Settlement | `SETTLEMENT_ADDRESS` | empty | An existing settlement address. Empty: deploy one with `kardamom-deploy`. |
-| Settlement | `DEPLOY_BIN` | `target/release/kardamom-deploy` | The settlement deployer. The release gate also runs its `formats` command. |
+| Settlement | `DEPLOY_BIN` | `target/release/kardamom-deploy` | The settlement deployer. The release gate also runs its `formats` command, and the canary gate its `smoke` command. |
 | Settlement | `L1_OWNER`, `L1_OWNER_KEY` | the Anvil dev account 0 | The owner address and key that the deployer uses. |
 | Settlement | `BATCHER_EOA` | the Anvil dev account 2 | The batcher address that the deployer registers. |
 | Settlement | `L2_CHAIN_ID` | `chain_id` of `all.yml` (412346) | The L2 chain id. |
@@ -632,11 +664,13 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Sequencer | `KARDAMOM_SEALER_VERSION_FLOOR` (job variable `sealer_version_floor`) | empty (`0` in the job) | The decision version that a sequencer assumes before the first report of a sealer session, from 0 to 5. The release gate refuses a value above the lowest `decisionVersion` of the members, and a value above 0 before every reader runs this release. |
 | Sequencer | `KARDAMOM_SEQUENCER_ADMISSION` (job variable `admission`) | empty (`off` in the job) | `on` or `off`. On, the sequencers run the v2 loop (the `[admission]` section of the config), with 512 forwarded and 512 parked transactions for each sender. The carry window needs it: only the v2 loop takes the bytes of a transaction under decision version 5, and the sealer refuses a reference without bytes while the window is on. |
 | Executor | `KARDAMOM_EXEC_CURSOR` (job variable `exec_cursor`) | empty (`off` in the job) | `on` or `off`. On, each executor sends its recorded cursor to the sealer, the floor of the record-lag guard. Switch it on only after every sealer member reads ingress kind 9. A sealer member that does not read it drops the frame. |
+| Egress | `KARDAMOM_EGRESS_NODES` (job variable `egress_nodes`) | empty (`off` in the job) | `on` or `off`. On, the egress runs on the nodes with `egress` in `meta.roles`, and its peers name those nodes too. Off, it runs on the executor nodes. See [The egress nodes](#the-egress-nodes). |
 | Egress | `KARDAMOM_EGRESS` | `0` | `1` deploys the egress job (`nomad/egress.nomad.hcl`) and its scrape (job variable `egress` of the monitoring job). It needs `KARDAMOM_EXEC_FRAMES=on`. See [The egress](#the-egress). |
 | Egress | `KARDAMOM_EXEC_FRAMES` (job variable `exec_frames` of the executor) | empty (`off` in the job) | `on` or `off`. On, each executor publishes the frames that it executes on `exec_frames` (`--exec-frames`). |
 | Egress | `KARDAMOM_VALIDATOR_EGRESS`, `KARDAMOM_BATCHER_EGRESS` (job variable `egress_url`) | empty (the job reads the cluster egress) | `on` or `off`. On, the validator or the batcher reads the canonical stream from the egress (`--egress`), and its job carries the meta `reads_egress`. Switch it on only on a chain where the carry flag is active. It needs `KARDAMOM_EGRESS=1`. The release gate refuses the move while the reader is not past the last stored reference. See [The carry window](#the-carry-window). |
 | Egress | `KARDAMOM_SEQUENCER_RECEIPTS_FROM_EGRESS` (job variable `receipts_from_egress` of the sequencer) | empty (`off` in the job) | `on` or `off`. On, the sequencers read the receipts and their account rows from `egress_receipts` (`receipts_from_egress = true` in the config). It needs `KARDAMOM_EGRESS=1`. |
 | Egress | `KARDAMOM_INGRESS_RECEIPTS_FROM_EGRESS` (job variable `receipt_query_endpoints` of the ingress) | empty (the executors) | `on` or `off`. On, `eth_getTransactionReceipt` asks the egress on a cache miss (`--receipt-query-endpoints`), then the executors when the egress has no receipt. It needs `KARDAMOM_EGRESS=1`. |
+| Client events | `KARDAMOM_TX_EVENTS` (job variable `tx_events` of the ingress and the sequencer) | empty (`off` in the jobs) | `on` or `off`. On, the ingress publishes an `accepted` record and each sequencer a `sent` record on `tx_events` (`docs/specs/2026-10-25-client-events.md`). Each sequencer twin publishes under its own origin: its allocation index (`--tx-events-origin`) and its lane. With `off`, the jobs render as before the switch. Best effort: a refused offer drops the frame, and no service waits for it. |
 | Egress | `KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS` (job variable `receipts_from_egress` of the notifier) | empty (`off` in the job) | `on` or `off`. On, the notifier reads the receipts from `egress_receipts` (`--receipts-from-egress`). It needs `KARDAMOM_EGRESS=1`. |
 | Notifier | `KARDAMOM_NOTIFIER_NODES` (job variable `notifier_nodes` of the notifier and the aeron jobs) | empty (`off` in the jobs) | `on` or `off`. On, the notifier runs on the nodes of role `notifier`, and their media drivers idle at 1000 µs. Off, it runs on the ingress nodes. See [The notifier nodes](#the-notifier-nodes). |
 | Notifier | `KARDAMOM_NOTIFIER_COUNT` (job variable `notifier_count` of the notifier) | empty (`1` in the job) | The notifier instance count with `KARDAMOM_NOTIFIER_NODES=on`: the count of the notifier nodes. The preflight refuses a count above the count of the ready notifier nodes. |
@@ -827,6 +861,7 @@ deploy/cluster/
     node.Dockerfile         systemd + Docker-in-Docker node container (local profile)
     helios/Dockerfile       the L1 light client, from the pinned helios release
   nomad/
+    data-dirs.sysbatch.nomad.hcl  the data directories of the services, on every node
     aeron.system.nomad.hcl  ArchivingMediaDriver (driver + archive)
     cluster.nomad.hcl       3-member Aeron Cluster (Raft) sealer
     anvil.nomad.hcl         in-cluster L1 for the smoke test, the follower and the batcher
@@ -938,6 +973,8 @@ KARDAMOM_CHAOS_CASES="graceful-executor" just shard chaos-executor   # narrow to
 - The knobs (`CHAOS_TPS`, `LOAD_DURATION_S` and others) are the environment variables that `crates/chaos/src/knobs.rs` reads.
 - The operator commands are `kardamom-cluster smoke | diagnostics | scale-sequencers` (`cargo run -p kardamom-chaos --bin kardamom-cluster -- ...`).
 - `kardamom-deploy formats --base <registry> --root <tree>` prints the format findings of the tree against the registry as JSON. The release gate reads them.
+- `kardamom-deploy smoke --rpc-url <ingress> --chain-id <id>` sends one signed transfer from a genesis account (`--account`, default `0`) and waits one minute for its receipt. The canary gate of the deploy runs it.
+  - While the ingress answers the nonce read with `account state unavailable`, the read repeats each second, for at most 60 s. Any other error fails the smoke at once.
 
 The shards, their cases, the gates, the load verdict, the L1 fault proxy and the knobs are in [`../../docs/chaos-suite.md`](../../docs/chaos-suite.md).
 

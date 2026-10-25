@@ -41,5 +41,6 @@ pub mod outbox;
 pub mod ring;
 pub mod server;
 pub mod shard;
+pub mod stages;
 pub mod taps;
 pub mod webhooks;

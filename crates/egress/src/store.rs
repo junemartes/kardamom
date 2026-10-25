@@ -103,7 +103,8 @@ impl Store {
         file.set_len(end).map_err(io(&last.path))?;
         let mut writer = BufWriter::new(file);
         writer.seek(SeekFrom::Start(end)).map_err(io(&last.path))?;
-        let mark = RefMark::read(dir)?;
+        let written = RefMark::read(dir)?;
+        let mark = Self::stored_mark(&segments, written.behind())?;
         mark.show();
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -113,8 +114,44 @@ impl Store {
             blocks_in_segment: blocks,
             head,
             mark,
-            written: mark,
+            written,
         })
+    }
+
+    /// The highest reference in the segments that can hold one above
+    /// `behind`, the file value minus the lead (see [`Self::mark_segments`]).
+    /// The side file can hold the mark plus the lead, so the open takes the
+    /// exact mark from the frames. It reads one frame at a time, as
+    /// [`Self::scan`] does.
+    ///
+    /// A reference that a prune deleted does not count. A reader below the
+    /// floor gets [`Range::Unavailable`], so it cannot meet that reference.
+    /// This assumes that no reader is `keep_blocks` behind the head with a
+    /// cursor that still needs the pruned frames.
+    fn stored_mark(segments: &[Segment], behind: RefMark) -> Result<RefMark, StoreError> {
+        Self::mark_segments(segments, behind)
+            .iter()
+            .try_fold(behind, |mark, segment| {
+                let mut reader = Self::reader(segment)?;
+                let frames = std::iter::from_fn(|| read_frame(&mut reader));
+                Ok(RefMark::top(frames, segment.start.next_block)
+                    .map_or(mark, |top| mark.joined(top)))
+            })
+    }
+
+    /// The segments that can hold a reference above `behind`: from the
+    /// first segment whose successor starts above `behind` in the index or
+    /// the block. Every frame of an earlier segment is below the start of
+    /// its successor in both fields, so no reference there is above
+    /// `behind`.
+    fn mark_segments(segments: &[Segment], behind: RefMark) -> &[Segment] {
+        let skip = segments
+            .windows(2)
+            .take_while(|pair| {
+                pair[1].start.next_index <= behind.index && pair[1].start.next_block <= behind.block
+            })
+            .count();
+        &segments[skip..]
     }
 
     /// The highest stored transaction reference.
@@ -137,7 +174,7 @@ impl Store {
     ///
     /// Returns an error when a write fails.
     pub fn append(&mut self, frames: &[Vec<u8>]) -> Result<(), StoreError> {
-        if let Some(top) = RefMark::top(frames, self.head.next_block) {
+        if let Some(top) = RefMark::top(frames.iter(), self.head.next_block) {
             self.raise_mark(top)?;
         }
         frames.iter().try_for_each(|frame| self.append_one(frame))?;

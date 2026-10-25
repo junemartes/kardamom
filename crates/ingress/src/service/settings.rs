@@ -69,6 +69,12 @@ pub struct IngressSettings {
     /// metric label. Defaults to 0.
     #[arg(long, env = "KARDAMOM_INGRESS_ID", default_value_t = 0)]
     pub(crate) ingress_id: u16,
+    /// Publish an `accepted` record on `tx_events` for each transaction
+    /// that this ingress publishes on `tx_data`
+    /// (`docs/specs/2026-10-25-client-events.md`). Best effort: the submit
+    /// never waits for it.
+    #[arg(long, env = "KARDAMOM_TX_EVENTS", value_enum, default_value_t = TxEventsArg::Off)]
+    pub(crate) tx_events: TxEventsArg,
     /// This node's cluster-egress endpoint, `ip:port`, in cluster mode.
     /// Overrides `[cluster] egress_channel` as
     /// `aeron:udp?endpoint=<ip:port>`, the cluster client's per-node
@@ -219,6 +225,13 @@ impl IngressSettings {
     pub fn ingress_id(&self) -> u16 {
         self.ingress_id
     }
+}
+
+/// The values of `--tx-events`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum TxEventsArg {
+    On,
+    Off,
 }
 
 /// The values of `--ack`.
