@@ -2541,5 +2541,35 @@ class CarryTest(Deploys):
         output = self.upgrade_check(success=False, feature='4', activation_ms='18446744073709551615')
         self.assertIn("members whose /metrics does not answer: ['cluster-2']", output)
 
+
+def load_tests(loader, tests, pattern):
+    """Keep one shard of each class when DEPLOY_TEST_SHARD is `i/n`: the
+    tests whose place in the sorted names of their class is i modulo n. CI
+    runs each shard of a long class on its own runner, so a class with
+    more tests needs only a larger n, and a new test lands in a shard by
+    itself."""
+    shard = os.environ.get('DEPLOY_TEST_SHARD', '')
+    if not shard:
+        return tests
+    index, count = (int(part) for part in shard.split('/'))
+    kept = unittest.TestSuite()
+    places = {}
+    for test in iter_tests(tests):
+        place = places.setdefault(type(test), 0)
+        places[type(test)] = place + 1
+        if place % count == index:
+            kept.addTest(test)
+    return kept
+
+
+def iter_tests(suite):
+    """Every test of `suite`, in its order, with the nested suites flat."""
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from iter_tests(item)
+        else:
+            yield item
+
+
 if __name__ == '__main__':
     unittest.main()
