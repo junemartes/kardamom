@@ -54,13 +54,13 @@ MEMBER_CARRY = {'decisionVersion': 5, 'retainedStore': 'heap', 'carryWindow': Fa
 FORMATS = (ANSIBLE.parents[2] / 'formats.toml').read_text()
 # The filter of the notifier node preflight, and its meaning on a node.
 # A Nomad 1.9 agent evaluates the filter on the whole node.
-NOTIFIER_NODE_FILTER = ('Meta.roles matches "(^|,) *notifier *(,|$)" and Status == "ready" '
-                        'and SchedulingEligibility == "eligible"')
+ROLE_NODE_FILTER = ('Meta.roles matches "(^|,) *{role} *(,|$)" and Status == "ready" '
+                    'and SchedulingEligibility == "eligible"')
 
 
-def notifier_node(node):
-    """Whether NOTIFIER_NODE_FILTER admits the node."""
-    return (re.search(r'(^|,) *notifier *(,|$)', node['Meta'].get('roles', '')) is not None
+def role_node(node, role):
+    """Whether ROLE_NODE_FILTER of `role` admits the node."""
+    return (re.search(rf'(^|,) *{role} *(,|$)', node['Meta'].get('roles', '')) is not None
             and node['Status'] == 'ready' and node['SchedulingEligibility'] == 'eligible')
 
 
@@ -276,11 +276,12 @@ class NomadAPI(BaseHTTPRequestHandler):
             self.respond({'ID': parts[3], 'Status': 'complete',
                           'DeploymentID': job if job in state['deployments'] else ''})
         elif parts[2] == 'nodes':
-            # The node list of the notifier preflight: the stubs of the
-            # nodes that the filter admits.
+            # The node list of the preflight of a moved role (the notifier,
+            # the egress): the stubs of the nodes that the filter admits.
             [query] = urllib.parse.parse_qs(self.path.split('?')[1])['filter']
-            assert query == NOTIFIER_NODE_FILTER, query
-            self.respond([{'Name': n['Name']} for n in state['nodes'] if notifier_node(n)])
+            role = re.search(r'\* *([a-z-]+) \*', query).group(1)
+            assert query == ROLE_NODE_FILTER.format(role=role), query
+            self.respond([{'Name': n['Name']} for n in state['nodes'] if role_node(n, role)])
         elif parts[2] == 'node':
             # Every node advertises an address of this fake API, so the
             # member status and the smoke target resolve back here. A
@@ -439,7 +440,8 @@ class Deploys(unittest.TestCase):
         self.api.state = {'jobs': {}, 'writes': [], 'deployments': {}, 'roles': {},
                           'variables': {}, 'variable_writes': [], 'records': {}, 'record_index': {},
                           'record_writes': [],
-                          'nodes': [nomad_node('ingress-0', 'ingress,redis'), nomad_node('notifier-0', 'notifier'),
+                          'nodes': [nomad_node('ingress-0', 'ingress,redis'), nomad_node('egress-0', 'egress'),
+                                    nomad_node('egress-1', 'egress'), nomad_node('notifier-0', 'notifier'),
                                     nomad_node('notifier-1', 'notifier')]}
         self.record_dir = Path(self.tmp.name) / 'deployed'
         # The target tree: a git checkout with the formats.toml of this
@@ -1130,6 +1132,54 @@ class DeployTest(Deploys):
         self.assertIn('--receipts-from-egress', self.job_args(plans['notifier']))
         self.assertIn('receipts_from_egress = true', self.job_templates(plans['sequencer']))
         self.assertIn('service "kardamom-egress-metrics|any"', self.job_templates(plans['monitoring']))
+
+    def test_the_egress_nodes_switch_moves_only_the_egress(self):
+        """Off, the egress places on the executor nodes. On, it places on
+        the nodes with egress in meta.roles, and its peers name the egress
+        nodes and the executor nodes, so a moved instance fills its store
+        from the one that did not move. No other job changes."""
+        self.add_egress_image()
+        # A new reader starts on the egress only while every egress
+        # instance holds no reference (gate 8b). So the egress runs first,
+        # and the readers are new jobs, as in the egress switch test.
+        readers = ('workloads_validator_egress', 'workloads_batcher_egress')
+        self.run_deploy({k: v for k, v in self.EGRESS_ON.items() if k not in readers})
+        for job in ('batcher', 'validator'):
+            del self.api.state['jobs'][job]
+        for node in ('node-egress', 'node-egress.1'):
+            self.api.state.setdefault('metrics', {})[node] = (
+                'kardamom_egress_ref_frame_max_index 0\nkardamom_egress_ref_frame_max_block 0\n')
+        plans = {}
+        cases = (
+            ({}, ('${meta.role}', '=', 'executor'), [f'executor-{i}' for i in range(3)]),
+            ({'KARDAMOM_EGRESS_NODES': 'on'}, ('${meta.roles}', 'set_contains', 'egress'),
+             ['egress-0', 'egress-1'] + [f'executor-{i}' for i in range(3)]),
+        )
+        for environ, constraint, peers in cases:
+            with self.subTest(environ=environ):
+                self.run_deploy(self.EGRESS_ON, check=True, environ=environ)
+                plans[bool(environ)] = self.api.state['plans']
+                egress = plans[bool(environ)]['egress']
+                [placed] = egress['Constraints']
+                self.assertEqual((placed['LTarget'], placed['Operand'], placed['RTarget']), constraint)
+                self.assertIn({'LTarget': '', 'RTarget': 'true', 'Operand': 'distinct_hosts'},
+                              egress['TaskGroups'][0]['Constraints'])
+                args = self.job_args(egress)
+                self.assertEqual(args[args.index('--peers') + 1],
+                                 ','.join(f'http://{n}.node.dc1.consul:8548' for n in peers))
+        self.assertEqual({n: j for n, j in plans[True].items() if n != 'egress'},
+                         {n: j for n, j in plans[False].items() if n != 'egress'})
+
+    def test_the_preflight_refuses_the_egress_nodes_switch_without_two_egress_nodes(self):
+        """With the switch on, each egress instance needs a ready, eligible
+        node with egress in meta.roles, before any job changes. Without the
+        egress (KARDAMOM_EGRESS empty) the switch counts no node."""
+        self.api.state['nodes'] = [nomad_node('egress-0', 'egress'), nomad_node('egress-1', 'egress', status='down')]
+        output = self.run_deploy(self.EGRESS_ON, check=True, success=False, environ={'KARDAMOM_EGRESS_NODES': 'on'})
+        self.assertIn("The egress count (2) is above the count of the ready, eligible Nomad nodes "
+                      "with egress in meta.roles (['egress-0'])", output)
+        self.assertNotIn('plans', self.api.state)
+        self.run_deploy(check=True, environ={'KARDAMOM_EGRESS_NODES': 'on'})
 
     def test_the_egress_switches_refuse_a_reader_before_its_source(self):
         cases = (
