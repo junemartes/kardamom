@@ -167,6 +167,20 @@ variable "aeron_threading_mode" {
   }
 }
 
+# The member feed, "on" or "off". On, each sealer member publishes its
+# feed into the shared media driver of its node (cluster.nomad.hcl), so
+# the driver runs on the sealer nodes too. The executor of the member
+# reads the feed there when it runs on that node (executor.nomad.hcl).
+# The deploy passes it from KARDAMOM_MEMBER_FEED.
+variable "member_feed" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.member_feed)
+    error_message = "The member_feed value must be on or off."
+  }
+}
+
 job "aeron" {
   datacenters = [var.datacenter]
   type        = "system"
@@ -182,9 +196,10 @@ job "aeron" {
     value     = "control"
   }
 
-  # Keep the shared media driver off the sealer nodes too. In cluster
-  # mode, they run only the Aeron Cluster (cluster.nomad.hcl), which
-  # boots its own embedded ClusteredMediaDriver on a private aeron.dir
+  # Keep the shared media driver off the sealer nodes too, unless the
+  # member feed is on. Without the feed, they run only the Aeron Cluster
+  # (cluster.nomad.hcl), which boots its own embedded
+  # ClusteredMediaDriver on a private aeron.dir
   # (.../aeron-mount/cluster-dir), and never touches the shared
   # substrate (.../aeron-mount/dir). Running an unused
   # ArchivingMediaDriver on all 3 sealer nodes would add 3 more
@@ -192,10 +207,19 @@ job "aeron" {
   # deploy time, the main bring-up bottleneck under CI contention.
   # Ansible mounts the on-node tmpfs independently, so the cluster's
   # cluster-dir is unaffected.
-  constraint {
-    attribute = "${meta.role}"
-    operator  = "!="
-    value     = "sealer"
+  #
+  # With the member feed, the member publishes its feed into this
+  # driver. An executor on the sealer node uses this driver for all its
+  # streams. The archive of this driver records the exec_txs stream of
+  # that executor in /opt/kardamom/archive/dir, beside the archive of the
+  # member in /opt/kardamom/archive.
+  dynamic "constraint" {
+    for_each = var.member_feed == "on" ? [] : ["sealer"]
+    content {
+      attribute = "${meta.role}"
+      operator  = "!="
+      value     = constraint.value
+    }
   }
 
   # One group per idle cap. With notifier_nodes off, the one group

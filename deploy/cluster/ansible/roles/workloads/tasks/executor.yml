@@ -1,0 +1,72 @@
+---
+# The executor job. On the executor nodes it has one group, and the update
+# stanza of that group replaces one executor at a time. On the sealer
+# nodes (KARDAMOM_EXEC_ON_SEALERS=on) it has one pinned group for each
+# member, and Nomad orders no groups: one registration would replace
+# every executor at once. So the role rolls the pinned groups one at a
+# time (roll_step.yml), and waits for the health check of each group
+# before the next step:
+# - A registered job with the pinned groups rolls in the order of the
+#   groups.
+# - A registered job with the group on the executor nodes moves one
+#   executor at a time. Each step stops one instance of that group and
+#   starts the pinned group of the same id, from the highest id down.
+#   When a count falls, Nomad stops the allocation of the highest index
+#   first, and that index is the id of the executor.
+# - A new job, or a move back to the executor nodes, registers in one
+#   step.
+- name: Keep the executor job of the deploy
+  ansible.builtin.set_fact:
+    workloads_executor_job: "{{ workloads_job }}"
+
+- name: Plan the executor
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job: "{{ workloads_executor_job | combine({'submit': false}) }}"
+
+- name: Keep the planned executor definition
+  ansible.builtin.set_fact:
+    workloads_executor_new: "{{ workloads_job_definition }}"
+    workloads_executor_diff: "{{ workloads_plan.json.Diff.Type }}"
+
+- name: Read the registered executor
+  ansible.builtin.include_tasks: read_job.yml
+  vars:
+    workloads_read_job: executor
+  when: workloads_executor_diff == 'Edited'
+
+- name: Decide the executor roll
+  ansible.builtin.set_fact:
+    workloads_executor_staged: >-
+      {{ workloads_executor_diff == 'Edited'
+         and workloads_executor_new.TaskGroups | map(attribute='Name') | reject('match', '^executor-') | list | length == 0 }}
+    workloads_executor_current: "{{ workloads_registered_job | default({}) }}"
+
+- name: Register the executor in one step
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job: "{{ workloads_executor_job }}"
+  when:
+    - workloads_executor_diff != 'None'
+    - not workloads_executor_staged | bool
+
+- name: Roll the executor one group at a time
+  ansible.builtin.include_tasks: roll_step.yml
+  loop: "{{ workloads_executor_order }}"
+  loop_control:
+    loop_var: workloads_roll_group
+    index_var: workloads_roll_index
+  vars:
+    workloads_executor_order: >-
+      {{ workloads_executor_new.TaskGroups | map(attribute='Name') | list
+         | reverse | list if 'executor' in workloads_executor_current.json.TaskGroups | map(attribute='Name')
+         else workloads_executor_new.TaskGroups | map(attribute='Name') | list }}
+    workloads_roll_job: executor
+    workloads_roll_new: "{{ workloads_executor_new }}"
+    workloads_roll_current: "{{ workloads_executor_current }}"
+    workloads_roll_order: "{{ workloads_executor_order }}"
+    workloads_roll_spec: "{{ workloads_executor_job }}"
+    workloads_roll_retire: true
+  when:
+    - workloads_executor_staged | bool
+    - not ansible_check_mode

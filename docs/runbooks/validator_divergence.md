@@ -5,6 +5,10 @@
 The validator's re-execution of a block disagreed with the executor's published
 receipts, block access list, or state root.
 
+A forged record on the canonical stream gives the same halt. The raw
+transaction does not hash to its id, or the signature does not recover the
+sender.
+
 ## Confirm
 
 1. Read `/halt` on the validator. The detail carries the divergence reason:
@@ -18,6 +22,14 @@ receipts, block access list, or state root.
 3. Read the validator log for the lines before `service halted`. A forged
    epoch says `epoch verification failed`; a receipt or write-set mismatch
    names the transaction.
+4. A forged record gives a reason that starts with `record identity forged:`.
+   - A forged sender or transaction hash says `sender mismatch` or
+     `tx_hash mismatch`.
+   - With `--egress`, a raw transaction that does not hash to its canonical
+     id says `does not hash to its canonical id`, with the canonical index.
+     The reader logs `no source holds the right bytes of the entry;
+     stopping` first. `kardamom_executor_source_mismatch_total{source}`
+     on the validator counts the mismatches.
 
 ## Steps
 

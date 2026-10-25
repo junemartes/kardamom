@@ -49,7 +49,7 @@ use memory::{MemoryRemote, MemoryTransport};
 use switch::Source;
 use switch::{Switch, Verdict};
 
-use super::cluster::{Reorder, ReplayCursor};
+use super::cluster::{BoundaryMetrics, Reorder, ReplayCursor};
 use super::tee::Forward;
 use super::{FrameTee, Ordered, TxOrderingSubscription};
 use crate::ExecutorError;
@@ -138,6 +138,14 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
     #[must_use]
     pub fn with_cursor_gauge(mut self, name: &'static str) -> Self {
         self.cursor_gauge = Some(metrics::gauge!(name));
+        self
+    }
+
+    /// Export the head under the validator's name, not as the
+    /// `kardamom_sealer_*` series: only the executor emits that series.
+    #[must_use]
+    pub fn suppress_sealer_metrics(mut self) -> Self {
+        self.reorder.metrics = BoundaryMetrics::Validator;
         self
     }
 
@@ -347,6 +355,13 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
                     "no source holds the bytes of the transaction reference; stopping"
                 );
                 Err(ExecutorError::UnjoinableReference { index })
+            }
+            Verdict::Mismatch { index } => {
+                tracing::error!(
+                    index,
+                    "no source holds the right bytes of the entry; stopping"
+                );
+                Err(ExecutorError::HashMismatch { index })
             }
         }
     }

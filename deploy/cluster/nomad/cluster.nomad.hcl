@@ -27,7 +27,8 @@
 # 321s at 200 tps). The retention-overrun chaos case deploys a small
 # window; Ansible deployment passes -var from KARDAMOM_CLUSTER_RETENTION. This
 # lets a frozen consumer's cursor age out, and exercises recovery-D,
-# inside one chaos case.
+# inside one chaos case. On a live chain the deploy only raises it, up
+# to 131072 frames (tasks/gate.yml).
 variable "cluster_retention" {
   type    = string
   default = "65536"
@@ -181,6 +182,29 @@ variable "cluster_seed_snapshot" {
   default = ""
 }
 
+# The member feed, "on" or "off". On, each member sends its retained
+# frames to the executor on its own node over IPC, on the shared media
+# driver of the node (aeron.system.nomad.hcl). The feed is local to the
+# member: it writes nothing that the replicated state or a cluster
+# session reads. So it is not a setting that every member must match,
+# and a rolling deploy turns it on member by member. The deploy passes it
+# from KARDAMOM_MEMBER_FEED.
+variable "member_feed" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.member_feed)
+    error_message = "The member_feed value must be on or off."
+  }
+}
+
+# The frame ring of the member feed in bytes (-Dkardamom.cluster.feedRingBytes),
+# off the heap, with the member feed only. A power of two of at least 8 MiB.
+variable "cluster_feed_ring_bytes" {
+  type    = number
+  default = 16777216
+}
+
 # Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests). The empty default falls back to the
@@ -306,6 +330,14 @@ locals {
     for i in range(var.sealer_count) :
     "${i},${join(",", [for p in local.member_ports : "sealer-${i}.node.${var.datacenter}.consul:${p}"])}"
   ])
+  # The settings of the member feed, empty when it is off. The feed
+  # publishes on the shared media driver of the node
+  # (aeron.system.nomad.hcl), not on the embedded driver of the member:
+  # the executor on the same node reads it there, at the same aeron.dir.
+  feed_opts = var.member_feed == "on" ? join("", [
+    " -Dkardamom.cluster.feedAeronDir=/opt/kardamom/aeron-mount/dir",
+    " -Dkardamom.cluster.feedRingBytes=${var.cluster_feed_ring_bytes}",
+  ]) : ""
 }
 
 job "cluster" {
@@ -451,7 +483,7 @@ job "cluster" {
         # archive, consensus module, service and feeder threads. The image
         # entrypoint also sets the timer slack of the JVM when it is set.
         env {
-          JAVA_TOOL_OPTIONS    = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} ${local.cycle_threshold_opts} ${local.jvm_pause_log_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.logPurgeKeepSnapshots=${var.cluster_log_purge_keep_snapshots} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.driverThreadingMode=${var.cluster_driver_threading_mode} -Dkardamom.cluster.remoteOrigins=${var.cluster_seed_snapshot != "" ? "" : var.cluster_remote_origins} -Dkardamom.cluster.seedSnapshot=${var.cluster_seed_snapshot} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}"
+          JAVA_TOOL_OPTIONS    = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} ${local.cycle_threshold_opts} ${local.jvm_pause_log_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.logPurgeKeepSnapshots=${var.cluster_log_purge_keep_snapshots} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.driverThreadingMode=${var.cluster_driver_threading_mode} -Dkardamom.cluster.remoteOrigins=${var.cluster_seed_snapshot != "" ? "" : var.cluster_remote_origins} -Dkardamom.cluster.seedSnapshot=${var.cluster_seed_snapshot} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}${local.feed_opts}"
           KARDAMOM_IDLE_CAP_US     = var.idle_cap_us
           KARDAMOM_CLUSTER_HEAP_MB = var.cluster_heap_mb
         }

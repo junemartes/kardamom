@@ -361,6 +361,19 @@ meta of the node:
 - `exec_txs` on a node with the `executor` role. The archive keeps the stream of the executor on that node.
 - Empty on every other node.
 
+The switches of the carry window change the placement (see [the deploy README](../deploy/cluster/README.md#the-carry-window)):
+
+| Process | With every switch off | With the switch on |
+| --- | --- | --- |
+| Shared media driver and archive (`aeron` job) | every node except the control and sealer nodes | every node except the control node (`KARDAMOM_MEMBER_FEED=on`) |
+| Executor `i` | an executor node | `sealer-<i>`, the node of member `i` (`KARDAMOM_EXEC_ON_SEALERS=on`) |
+| State mirror | the executor nodes | the sealer nodes (`KARDAMOM_EXEC_ON_SEALERS=on`) |
+| Egress | the executor nodes | the executor nodes |
+
+- The executor records its `exec_txs` stream on the archive of the shared driver of its sealer node. The recorder reaches that archive over IPC, so it needs no archive record.
+- The `archive_topics` meta follows the role set of the node. A sealer node advertises `exec_txs` only when its role set also names `executor`.
+- The member feed (streams 1006 and 1007) is an IPC stream on the shared driver of the sealer node. The member publishes into that driver through `feedAeronDir`, not through its own embedded driver. The feed has no record in the catalog: the node is the pair.
+
 An archive record with an unknown topic fails to parse, and a refetch
 client then skips the whole record. So a runtime that knows `exec_txs`
 deploys before the executor nodes advertise it.
