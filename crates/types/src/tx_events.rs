@@ -48,6 +48,15 @@ pub enum TxEventKind {
 }
 
 impl TxEventKind {
+    /// Every kind that a frame can carry, in the order of their codes.
+    pub const ALL: [Self; 2] = [Self::Accepted, Self::Sent];
+
+    /// The place of the kind in [`Self::ALL`].
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize - 1
+    }
+
     /// The bytes of one record of this kind.
     #[must_use]
     pub const fn record_len(self) -> usize {
@@ -209,17 +218,35 @@ impl<'a> TxEventsView<'a> {
     /// Returns a [`FrameError`] when the header is wrong or the length
     /// does not match the count.
     pub fn parse(frame: &'a [u8]) -> Result<Self, FrameError> {
-        let header = frame.get(..HEADER_LEN).ok_or(FrameError::Short)?;
-        if u16::from_le_bytes([header[0], header[1]]) != MAGIC {
+        let (header, records) = frame
+            .split_first_chunk::<HEADER_LEN>()
+            .ok_or(FrameError::Short)?;
+        let [
+            m0,
+            m1,
+            version,
+            code,
+            o0,
+            o1,
+            c0,
+            c1,
+            s0,
+            s1,
+            s2,
+            s3,
+            s4,
+            s5,
+            s6,
+            s7,
+        ] = *header;
+        if u16::from_le_bytes([m0, m1]) != MAGIC {
             return Err(FrameError::Magic);
         }
-        if header[2] != VERSION {
-            return Err(FrameError::Version(header[2]));
+        if version != VERSION {
+            return Err(FrameError::Version(version));
         }
-        let kind = TxEventKind::from_code(header[3]).ok_or(FrameError::Kind(header[3]))?;
-        let count = usize::from(u16::from_le_bytes([header[6], header[7]]));
-        let records = &frame[HEADER_LEN..];
-        let want = count * kind.record_len();
+        let kind = TxEventKind::from_code(code).ok_or(FrameError::Kind(code))?;
+        let want = usize::from(u16::from_le_bytes([c0, c1])) * kind.record_len();
         if records.len() != want {
             return Err(FrameError::Length {
                 got: records.len(),
@@ -228,8 +255,8 @@ impl<'a> TxEventsView<'a> {
         }
         Ok(Self {
             kind,
-            origin: u16::from_le_bytes([header[4], header[5]]),
-            seq: u64::from_le_bytes(header[8..16].try_into().unwrap_or_default()),
+            origin: u16::from_le_bytes([o0, o1]),
+            seq: u64::from_le_bytes([s0, s1, s2, s3, s4, s5, s6, s7]),
             records,
         })
     }
