@@ -57,14 +57,14 @@ impl Streamed {
     /// spawning the writer fails.
     pub(crate) fn spawn_writer(self) -> Result<Written> {
         let args = &self.opened.base.args;
-        let (genesis_accounts, genesis_code) =
+        let genesis_alloc =
             kardamom_engine::bin_support::build_genesis_alloc(self.opened.state.genesis.as_ref());
-        let seeded =
-            kardamom_state::seed_genesis(&self.opened.state.env, &genesis_accounts, &genesis_code)
-                .context("seed genesis into validator state env")?;
+        let seeded = kardamom_state::seed_genesis(&self.opened.state.env, &genesis_alloc)
+            .context("seed genesis into validator state env")?;
         tracing::info!(
             state_dir = %args.state_dir.display(),
-            genesis_accounts = genesis_accounts.len(),
+            genesis_accounts = genesis_alloc.accounts.len(),
+            genesis_words = genesis_alloc.storage.len(),
             seeded,
             "validator state env opened"
         );

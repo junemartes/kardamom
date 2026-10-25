@@ -111,28 +111,55 @@ pub(crate) async fn scale_out_in(h: &mut Harness) -> anyhow::Result<()> {
     result
 }
 
-async fn scale_out_in_body(h: &mut Harness, cluster_dir: &Path) -> anyhow::Result<()> {
-    let to_three = resize(h, cluster_dir, 3)?;
-    let scale_out = tokio::spawn(async move { to_three.run().await });
-    let (hs, scale_ref): (&Harness, &tokio::task::JoinHandle<anyhow::Result<()>>) = (h, &scale_out);
+/// The scale-out task, which runs while the case waits for lane 2.
+struct ScaleOut(tokio::task::JoinHandle<anyhow::Result<()>>);
+
+impl ScaleOut {
+    /// The failure of a scale-out that ended before lane 2 ran. It
+    /// carries the error of the rollout, for example a refused preflight.
+    async fn early_exit(&mut self) -> anyhow::Error {
+        let cause = match (&mut self.0).await {
+            Ok(Ok(())) => "it reported success".to_string(),
+            Ok(Err(e)) => format!("{e:#}"),
+            Err(e) => format!("the task did not join: {e}"),
+        };
+        crate::chaos_fail!("resize: scale-out exited before lane 2 ran: {cause}")
+    }
+
+    async fn finish(self) -> anyhow::Result<()> {
+        self.0.await.context("join the scale-out task")?
+    }
+}
+
+async fn lane_two_running(h: &Harness) -> anyhow::Result<()> {
     let outcome = poll::until(Budget::secs(300, 3), |_| async move {
-        anyhow::ensure!(
-            !scale_ref.is_finished(),
-            "{}: resize: scale-out exited before lane 2 ran",
-            crate::FAIL_PREFIX
-        );
-        Ok(hs
-            .nomad
-            .running_in_group("sequencer", "seq-2")
-            .await?
-            .len()
-            .ge(&2)
-            .then_some(()))
+        Ok::<_, anyhow::Error>(
+            h.nomad
+                .running_in_group("sequencer", "seq-2")
+                .await?
+                .len()
+                .ge(&2)
+                .then_some(()),
+        )
     })
     .await?;
-    outcome.or_fail(|_| {
-        crate::chaos_fail!("resize: lane 2 did not reach 2 running replicas within 300s")
-    })?;
+    outcome
+        .or_fail(|_| {
+            crate::chaos_fail!("resize: lane 2 did not reach 2 running replicas within 300s")
+        })
+        .map(|_| ())
+}
+
+async fn scale_out_in_body(h: &mut Harness, cluster_dir: &Path) -> anyhow::Result<()> {
+    let to_three = resize(h, cluster_dir, 3)?;
+    let mut scale_out = ScaleOut(tokio::spawn(async move { to_three.run().await }));
+    tokio::select! {
+        err = scale_out.early_exit() => {
+            report_lanes(h, 2).await;
+            return Err(err);
+        }
+        running = lane_two_running(h) => running?,
+    }
     crate::log(
         "resize: lane 2 runs in shadow mode; hard-killing one of its replicas during the overlap",
     );
@@ -145,7 +172,7 @@ async fn scale_out_in_body(h: &mut Harness, cluster_dir: &Path) -> anyhow::Resul
     let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
     h.inject_hard(&refs, "sequencer-2").await?;
     h.assert_count("sequencer", 6, h.knobs.restart_slo).await?;
-    if let Err(e) = scale_out.await.context("join the scale-out task")? {
+    if let Err(e) = scale_out.finish().await {
         report_lanes(h, 3).await;
         return Err(crate::chaos_fail!("resize: scale-out failed: {e}"));
     }
@@ -191,24 +218,39 @@ async fn lookups_failed(h: &Harness) -> i64 {
     t.saturating_add(e)
 }
 
-async fn lookups_ok(h: &Harness) -> i64 {
-    h.probes
-        .seq_lane0_metric_where(0, LOOKUPS, "outcome=\"ok\"")
-        .await
-        .unwrap_or(0)
+/// The outcomes of an answered lookup. The v1 loop records `redis`
+/// and then `ok` for an answer from Redis, and `ok` for an answer from
+/// an executor. The v2 loop records one outcome for the source that
+/// answered: `live`, `redis`, or `ok` (an executor).
+const ANSWERED: [&str; 3] = ["ok", "redis", "live"];
+
+/// The answered-lookup outcomes of lane 0's replica on node 0.
+async fn lookups_answered(h: &Harness) -> i64 {
+    let mut answered: i64 = 0;
+    for outcome in ANSWERED {
+        let n = h
+            .probes
+            .seq_lane0_metric_where(0, LOOKUPS, &format!("outcome=\"{outcome}\""))
+            .await
+            .unwrap_or(0);
+        answered = answered.saturating_add(n);
+    }
+    answered
 }
 
 /// Blackhole every executor from the sequencer node, hard-kill lane 0's
 /// replica so it comes back cold, and require its lookups to fail while
 /// the twin keeps the lane live. Then restore the routes, drop only the
 /// executors' UDP on the node, kill the replica once more, and require
-/// an answered lookup.
+/// an answered lookup from any source.
 ///
 /// Both phases hard-kill the replica, and the replacement is a new
 /// process whose counters start at zero, so each wait counts from zero:
 /// an answered lookup is a one-off (the floor is known after it), so the
-/// newborn's `ok` count stays at exactly one and never rises past the
-/// killed process's count.
+/// newborn's answered count stays small and never rises past the killed
+/// process's count. Phase 2 accepts an answer from any source
+/// ([`ANSWERED`]): it removes the cache rules, so Redis can answer, and
+/// the v2 loop of a carry-born shard then records `redis`, not `ok`.
 ///
 /// Why phase 2 drops the UDP: a receipt-proven floor makes the sequencer
 /// skip the lookup by design, and with a live twin the first receipt
@@ -319,7 +361,7 @@ async fn answered_phase(h: &mut Harness, node: &str) -> anyhow::Result<()> {
     h.assert_count("sequencer", 4, h.knobs.restart_slo).await?;
     let hs: &Harness = h;
     let outcome = poll::until(Budget::secs(120, 3), |_| async move {
-        Ok::<_, anyhow::Error>((lookups_ok(hs).await > 0).then_some(()))
+        Ok::<_, anyhow::Error>((lookups_answered(hs).await > 0).then_some(()))
     })
     .await?;
     outcome
@@ -354,6 +396,39 @@ async fn lookup_snapshot(h: &Harness, node: &str, ctx: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answered_covers_every_v2_source() {
+        let body = "kardamom_sequencer_nonce_lookups_total{partition=\"0\",outcome=\"live\"} 1\n\
+            kardamom_sequencer_nonce_lookups_total{partition=\"0\",outcome=\"redis\"} 2\n\
+            kardamom_sequencer_nonce_lookups_total{partition=\"0\",outcome=\"ok\"} 4\n\
+            kardamom_sequencer_nonce_lookups_total{partition=\"0\",outcome=\"error\"} 8\n";
+        let answered: i64 = ANSWERED
+            .iter()
+            .filter_map(|o| crate::metrics::sum_where(body, LOOKUPS, &format!("outcome=\"{o}\"")))
+            .sum();
+        assert_eq!(answered, 7);
+    }
+
+    #[tokio::test]
+    async fn an_early_exit_carries_the_rollout_error() {
+        let mut failed = ScaleOut(tokio::spawn(async {
+            Err(anyhow::anyhow!("preflight: lanes 0 1 not idle"))
+        }));
+        let message = failed.early_exit().await.to_string();
+        assert!(message.contains("exited before lane 2 ran"), "{message}");
+        assert!(
+            message.contains("preflight: lanes 0 1 not idle"),
+            "{message}"
+        );
+        let mut done = ScaleOut(tokio::spawn(async { Ok(()) }));
+        assert!(
+            done.early_exit()
+                .await
+                .to_string()
+                .contains("reported success")
+        );
+    }
 
     #[test]
     fn selects_accounts_that_cross_lanes() {

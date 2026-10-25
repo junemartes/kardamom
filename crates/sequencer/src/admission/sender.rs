@@ -7,13 +7,6 @@ use alloy_primitives::U256;
 
 use super::{AccountState, AdmissionConfig, Candidate, Refusal, Verdict};
 
-/// One forwarded transaction that no state confirmed yet.
-#[derive(Clone, Copy)]
-struct Forwarded {
-    /// Its worst-case cost.
-    cost: U256,
-}
-
 /// When a parked transaction gets its ack.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Answer {
@@ -37,8 +30,10 @@ pub(super) struct SenderState<T> {
     relook_due: bool,
     /// The nonce of the first forwarded transaction that no state confirmed.
     first: u64,
-    /// The forwarded run, from `first` on.
-    forwarded: VecDeque<Forwarded>,
+    /// The forwarded run, from `first` on. The filter keeps each
+    /// transaction until a state confirms it, so the caller can offer the
+    /// run again when the sealer can have lost an offer.
+    forwarded: VecDeque<Candidate<T>>,
     /// The sum of `forwarded`.
     spend: U256,
     /// The transactions that wait for a nonce gap, or for a lookup.
@@ -60,7 +55,7 @@ impl<T> Default for SenderState<T> {
     }
 }
 
-impl<T> SenderState<T> {
+impl<T: Clone> SenderState<T> {
     /// Decide one transaction of this sender. Returns whether it parked.
     pub(super) fn offer(
         &mut self,
@@ -154,7 +149,7 @@ impl<T> SenderState<T> {
         cfg: &AdmissionConfig,
         out: &mut Vec<Verdict<T>>,
     ) -> bool {
-        if !self.holds_forwarded(nonce) {
+        if self.forwarded_at(nonce).is_none() {
             return false;
         }
         self.forwarded.clear();
@@ -222,8 +217,15 @@ impl<T> SenderState<T> {
         self.first + self.forwarded.len() as u64
     }
 
-    fn holds_forwarded(&self, nonce: u64) -> bool {
-        nonce >= self.first && nonce - self.first < self.forwarded.len() as u64
+    /// The forwarded transaction at `nonce` that no state confirmed.
+    pub(super) fn forwarded_at(&self, nonce: u64) -> Option<&Candidate<T>> {
+        let at = usize::try_from(nonce.checked_sub(self.first)?).ok()?;
+        self.forwarded.get(at)
+    }
+
+    /// The forwarded transactions that no state confirmed, in nonce order.
+    pub(super) fn unconfirmed(&self) -> impl Iterator<Item = &Candidate<T>> {
+        self.forwarded.iter()
     }
 
     /// Drop the first forwarded transaction when the chain is past it.
@@ -231,7 +233,7 @@ impl<T> SenderState<T> {
         if self.forwarded.is_empty() || self.first >= chain_nonce {
             return false;
         }
-        let cost = self.forwarded.pop_front().map_or(U256::ZERO, |f| f.cost);
+        let cost = self.forwarded.pop_front().map_or(U256::ZERO, |c| c.cost);
         self.spend = self.spend.saturating_sub(cost);
         self.first += 1;
         true
@@ -314,8 +316,8 @@ impl<T> SenderState<T> {
         if self.forwarded.is_empty() {
             self.first = c.nonce;
         }
-        self.forwarded.push_back(Forwarded { cost: c.cost });
         self.spend = self.spend.saturating_add(c.cost);
+        self.forwarded.push_back(c.clone());
         out.push(Verdict::Forward(c));
         false
     }

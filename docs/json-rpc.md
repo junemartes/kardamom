@@ -304,7 +304,7 @@ An error `-32010` means that the chain, or this ingress, does not take submits n
 
 ## Further reading
 
-- [Transaction status events](tx-status-events.md): the notifier feed and the webhooks.
+- [Transaction status events](tx-status-events.md): the notifier feed.
 - [Priority fees](priority-fees.md): the fee rules, the admission checks and the settlement.
 - [Failure modes](failure-modes.md): how the ingress behaves when other actors fail. The section [halts and service events](failure-modes.md#halts-and-service-events) has the halt model.
 - [Runbooks](runbooks/README.md): one runbook for each halt cause.

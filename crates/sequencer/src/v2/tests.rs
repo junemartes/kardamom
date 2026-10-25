@@ -150,17 +150,12 @@ fn a_sealer_on_version_four_gets_the_tagged_position() {
     );
 }
 
-/// A sealer on decision version 5 takes each offer with the bytes of its
-/// transaction: the archived envelope that the ingress published. The
-/// version comes from the report of the session, through the rules.
-#[test]
-fn a_sealer_on_version_five_gets_the_bytes() {
+/// Offer one transaction of a known sender through a loop that keeps the
+/// version of `shared`. Assert that the offer carries the bytes of the
+/// transaction: the archived envelope that the ingress published.
+fn assert_first_offer_carries_the_bytes(shared: SealerVersion) {
     let s = signer(5);
     let (mut l, accounts, _) = new_loop();
-    let shared = SealerVersion::default();
-    let mut rules = SealerRules::new(0, shared.clone(), InMemorySidePublisher::default());
-    rules.on_session_start(1);
-    rules.on_sealer_info(1, 5);
     l.enable_positioned_refs(shared);
     accounts
         .send(AccountEvent::Rows {
@@ -172,11 +167,37 @@ fn a_sealer_on_version_five_gets_the_bytes() {
     let envelope = signed_envelope(&s, 0, 1);
     rig.push(TxDataLoc::new(7, pos(256)), envelope.clone());
     l.run_once(&mut rig.ports()).unwrap();
-    let carried = rig.offers()[0].envelope.clone().expect("the bytes");
+    let offers = rig.offers();
+    assert_eq!(offers.len(), 1);
+    let carried = offers[0].envelope.clone().expect("the bytes");
     assert_eq!(
         carried.as_ref(),
         kardamom_log::codec::encode(&envelope).unwrap().as_slice()
     );
+}
+
+/// A sealer on decision version 5 takes each offer with the bytes of its
+/// transaction. The version comes from the report of the session, through
+/// the rules.
+#[test]
+fn a_sealer_on_version_five_gets_the_bytes() {
+    let shared = SealerVersion::default();
+    let mut rules = SealerRules::new(0, shared.clone(), InMemorySidePublisher::default());
+    rules.on_session_start(1);
+    rules.on_sealer_info(1, 5);
+    assert_first_offer_carries_the_bytes(shared);
+}
+
+/// A process with the floor 5 sends no reference without bytes before the
+/// first report of the sealer: the session is open, and no kind 17 has
+/// come yet. A chain that runs version 5 from genesis needs this, because
+/// its sealer refuses each reference without bytes.
+#[test]
+fn the_floor_five_offers_the_bytes_before_the_first_report() {
+    let shared = SealerVersion::starting_at(5);
+    let mut rules = SealerRules::new(0, shared.clone(), InMemorySidePublisher::default());
+    rules.on_session_start(1);
+    assert_first_offer_carries_the_bytes(shared);
 }
 
 /// While the sealer takes no offer, the loop takes no envelope: the offer

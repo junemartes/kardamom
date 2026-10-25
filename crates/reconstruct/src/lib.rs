@@ -100,7 +100,7 @@ pub fn strip_to_executor_image(state_dir: &Path) -> Result<(), ReconstructError>
 /// replaying the blocks through the engine fails.
 pub fn reconstruct_state(
     state_dir: &Path,
-    genesis: &ReplayGenesis<'_>,
+    genesis: &ReplayGenesis,
     blocks: &[BlockFrame],
 ) -> Result<ReplayOutcome, ReconstructError> {
     Reconstruction {
@@ -128,7 +128,7 @@ impl Reconstruction<'_> {
     /// Returns an error if the state env cannot open or the replay fails.
     pub fn run(
         &self,
-        genesis: &ReplayGenesis<'_>,
+        genesis: &ReplayGenesis,
         blocks: Vec<ReplayBlock>,
     ) -> Result<ReplayOutcome, ReconstructError> {
         let env = StateEnvBuilder::new(self.state_dir)
@@ -139,7 +139,9 @@ impl Reconstruction<'_> {
     }
 }
 
+mod rules;
 mod seed;
+pub use rules::SealerRules;
 pub use seed::{SealerSeed, SeedInput, SeedSender, SenderOrder};
 
 /// Shared test fixtures: signed transfers, a funded-EOA genesis, closed-
@@ -240,14 +242,14 @@ pub mod test_support {
     /// The replay chain of a test allocation on [`CHAIN_ID`], with no
     /// fee schedule.
     #[must_use]
-    pub fn test_genesis<'a>(
-        accounts: &'a [AccountChange],
-        code: &'a [CodeEntry],
-    ) -> ReplayGenesis<'a> {
+    pub fn test_genesis(accounts: &[AccountChange], code: &[CodeEntry]) -> ReplayGenesis {
         ReplayGenesis {
             chain_id: CHAIN_ID,
-            accounts,
-            code,
+            alloc: kardamom_types::GenesisAlloc {
+                accounts: accounts.to_vec(),
+                code: code.to_vec(),
+                storage: Vec::new(),
+            },
             fees: None,
         }
     }
@@ -391,7 +393,9 @@ mod tests {
             let chain: kardamom_types::Genesis = toml::from_str(&raw).expect("parse genesis");
             chain.validate().expect("valid genesis");
             assert_eq!(chain.chain_id, CHAIN_ID, "test pins the dev chain id");
-            let (mut accounts, code) = chain.to_alloc();
+            let kardamom_types::GenesisAlloc {
+                mut accounts, code, ..
+            } = chain.to_alloc();
 
             // Fund a random user so the block also carries an ordinary tx.
             let signer = PrivateKeySigner::random();

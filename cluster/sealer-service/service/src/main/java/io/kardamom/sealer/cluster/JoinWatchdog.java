@@ -50,6 +50,22 @@ import java.util.Set;
  * the leader reads through the peer probe, so the rule waits for it. A
  * relaunch replays the member's own log, and the members elect again.</p>
  *
+ * <p>The truncated log. The service of the member applied the log past the
+ * end of the member's own log. Aeron 1.44 replays the whole local log at a
+ * start, an uncommitted tail included. When a new leader lacks that tail,
+ * Aeron truncates the member's log to the leader's term base and closes the
+ * last term there, but the service keeps the tail. Each new election then
+ * takes its log position from the commit position, so each join fails at
+ * once on the leader's join position, and only a relaunch clears it: the
+ * relaunch replays the truncated log up to the leader's position. The rule
+ * compares the commit position with the position that a relaunch reaches:
+ * the end of the closed last term, or the latest snapshot when that is
+ * higher. It fires when the election is open and the commit position stays
+ * above that position for the confirm window. A relaunch keeps the
+ * recording log, and the member joins the waiting leader in the same term.
+ * The leader keeps its term: its log is the one that the members keep, and
+ * a new election cannot bring back a tail that no member's log holds.</p>
+ *
  * <p>The follower stall. The member reached a follower state, which means
  * that it found a leader, and it then makes no progress for longer than the
  * stall limit. Two shapes reach it. The election cycles: each join attempt
@@ -98,6 +114,8 @@ final class JoinWatchdog {
         LEADER_WEDGE,
         /** The member waits in LEADER_READY with no progress for the stall limit. */
         LEADER_STALL,
+        /** The service applied the log past the position that a relaunch reaches, for the confirm window. */
+        LOG_TRUNCATED,
         /** The member found a leader, and then makes no progress for the stall limit. */
         FOLLOWER_STALL,
         /** The member tried a catch-up with no progress; the decision needs a peer check. */
@@ -106,6 +124,18 @@ final class JoinWatchdog {
 
     /** The stall window when none is given: 5 minutes, longer than any catch-up of the purge margin. */
     static final long DEFAULT_STALL_WINDOW_S = 300L;
+
+    /** The relaunch position of a member whose recording log does not fix the end of its log. */
+    static final long NO_RELAUNCH_POSITION = Long.MAX_VALUE;
+
+    /**
+     * How long the commit position must stay above the relaunch position
+     * before the member relaunches. The thread reads the recording log while
+     * the consensus module writes it, so one read can meet a half-written
+     * entry. Five samples in a row rule out such a read. The wait is small
+     * against the relaunch itself, which took 29 s to 58 s in CI.
+     */
+    static final long TRUNCATED_CONFIRM_MS = 5_000L;
 
     /**
      * The windows of the rules.
@@ -177,6 +207,9 @@ final class JoinWatchdog {
      *     while it replicates the leader's log, else its last value.
      * @param peerCommitMark the sum of the highest commit positions of the
      *     peers while the member waits as a leader, else its last value.
+     * @param relaunchPosition the commit position that a relaunch of the
+     *     member reaches, or {@link #NO_RELAUNCH_POSITION} when the recording
+     *     log does not fix the end of the member's log.
      * @param toggleCode the value of the control toggle counter of the
      *     consensus module. Any value but INACTIVE means that a leader's
      *     election completed: NEUTRAL, or an action such as SNAPSHOT.
@@ -187,6 +220,7 @@ final class JoinWatchdog {
             long commitPosition,
             long recordingPosition,
             long peerCommitMark,
+            long relaunchPosition,
             long toggleCode,
             long nowMs) {
     }
@@ -253,6 +287,7 @@ final class JoinWatchdog {
     private final Persistence init = new Persistence();
     private final Persistence halfElected = new Persistence();
     private final Persistence leaderReady = new Persistence();
+    private final Persistence truncated = new Persistence();
     private long highestCommit = Long.MIN_VALUE;
     private long highestRecording = Long.MIN_VALUE;
     private long highestPeerMark = Long.MIN_VALUE;
@@ -283,6 +318,10 @@ final class JoinWatchdog {
             sample.toggleCode() != ClusterControl.ToggleState.INACTIVE.code() && state != ElectionState.CLOSED,
             nowMs,
             limits.halfElectedMs());
+        final boolean logTruncated = truncated.exceeds(
+            state != ElectionState.CLOSED && sample.commitPosition() > sample.relaunchPosition(),
+            nowMs,
+            TRUNCATED_CONFIRM_MS);
         track(sample);
         final boolean leaderStalled = leaderReady.exceeds(state == ElectionState.LEADER_READY, nowMs, limits.stallMs())
             && sinceProgressMs(nowMs) > limits.stallMs();
@@ -291,6 +330,9 @@ final class JoinWatchdog {
         }
         if (leaderWedged) {
             return Verdict.LEADER_WEDGE;
+        }
+        if (logTruncated) {
+            return Verdict.LOG_TRUNCATED;
         }
         return leaderStalled ? Verdict.LEADER_STALL : followerVerdict(state, nowMs);
     }
@@ -327,6 +369,11 @@ final class JoinWatchdog {
     /** How long the election has stayed open with an active toggle, in ms, or 0 when it has not. */
     long halfElectedForMs(final long nowMs) {
         return halfElected.forMs(nowMs);
+    }
+
+    /** How long the commit position has stayed above the relaunch position, in ms, or 0 when it is not. */
+    long truncatedForMs(final long nowMs) {
+        return truncated.forMs(nowMs);
     }
 
     /** How long the member has gone without progress, in ms, or 0 before it reaches a follower state. */

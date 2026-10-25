@@ -6,7 +6,7 @@
 //! deployer's `deploy_e2e.rs`).
 
 use alloy_primitives::{Address, B256, Bytes, address};
-use alloy_provider::{Provider, ProviderBuilder};
+use alloy_provider::Provider;
 use alloy_sol_types::SolEvent;
 
 use kardamom_batcher::settlement::IKardamomL2Settlement;
@@ -185,21 +185,24 @@ fn empty_block(block_number: u64, l2_timestamp: u64) -> kardamom_batcher::batch:
 
 /// Deploy a `KardamomL2Settlement` with a real wallet-signing key (not an
 /// impersonated account) as its `l1Batcher`. The live sender signs its
-/// own `postBatch` transactions, so it needs a wallet-filled provider.
+/// own `postBatch` transactions, so it needs a wallet-filled provider:
+/// the provider of the live service ([`connect_l1`]).
 async fn setup_wallet_and_settlement() -> Option<Scenario<impl Provider + Clone>> {
-    use alloy_network::EthereumWallet;
     use alloy_signer_local::PrivateKeySigner;
+    use kardamom_batcher::live::connect_l1;
 
     let rig = AnvilRig::spawn(
         alloy_node_bindings::Anvil::new(),
         &[(DEV_OWNER, Funding::FundAndImpersonate)],
     )
     .await?;
-    let batcher_signer: PrivateKeySigner = rig.anvil.keys()[2].clone().into();
-    let batcher_addr = batcher_signer.address();
-    let provider = ProviderBuilder::new()
-        .wallet(EthereumWallet::from(batcher_signer))
-        .connect_http(rig.anvil.endpoint_url());
+    let batcher_key = rig.anvil.keys()[2].clone();
+    let batcher_addr = PrivateKeySigner::from(batcher_key.clone()).address();
+    let provider = connect_l1(
+        &[rig.anvil.endpoint()],
+        &alloy_primitives::hex::encode(batcher_key.to_bytes()),
+    )
+    .expect("connect the live L1 provider");
     let deployer = Deployer::new(rig.provider, DEV_OWNER);
     let settlement_addr = deployer
         .deploy_settlement(DEV_OWNER, L2_CHAIN_ID, batcher_addr)
@@ -310,4 +313,76 @@ async fn live_sender_confirms_and_rejects_foreign_writer() {
         msg.contains("second batcher"),
         "unexpected error chain: {msg}"
     );
+}
+
+/// A post whose transaction landed while the sender saw an error (a
+/// receipt timeout) reconciles as confirmed, with no second post. The
+/// failed gas estimate of the duplicate send takes no nonce, so the next
+/// post mines at once.
+#[tokio::test]
+async fn a_landed_post_reconciles_and_the_next_post_takes_the_next_nonce() {
+    use kardamom_batcher::batcher::{BatcherConfig, pack_blocks};
+    use kardamom_batcher::da::DaProxy;
+    use kardamom_batcher::live::{BatchCursor, LiveSender};
+    use kardamom_batcher::testkit_da::FakeDaProxy;
+
+    let Some(s) = setup_wallet_and_settlement().await else {
+        eprintln!("SKIP: anvil unavailable");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let fake_da = FakeDaProxy::start();
+    let mut sender = LiveSender::new(
+        s.provider.clone(),
+        s.settlement_addr,
+        DaProxy::new(fake_da.url()).unwrap(),
+        0,
+        2,
+        dir.path().join("cursor.json"),
+    );
+    let cursor = BatchCursor {
+        next_index: 0,
+        next_block: 2,
+        last_batch_index: 0,
+    };
+    let batch1 = pack_blocks(&BatcherConfig::default(), &[empty_block(1, 7)]).unwrap();
+    // The first send of batch 1 lands, and the sender does not see it.
+    let landed = s
+        .settlement
+        .postBatch(
+            0,
+            Bytes::from(vec![0x02, 0xC0, 0xFF, 0xEE]),
+            batch1.l2_block_start,
+            batch1.l2_block_end,
+            batch1.records_commitment,
+        )
+        .send()
+        .await
+        .expect("first send")
+        .get_receipt()
+        .await
+        .unwrap();
+    // The retry of batch 1 fails its gas estimate on the CAS check.
+    sender
+        .post_confirmed(&batch1, cursor)
+        .await
+        .expect("the landed post reconciles as ours");
+    let index_after_retry = s.settlement.lastBatchIndex().call().await.unwrap();
+    let batch2 = pack_blocks(&BatcherConfig::default(), &[empty_block(2, 8)]).unwrap();
+    let next = BatchCursor {
+        next_block: 3,
+        ..cursor
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        sender.post_confirmed(&batch2, next),
+    )
+    .await
+    .expect("a nonce gap leaves the post unmined")
+    .expect("the next post confirms");
+    let index_after_next = s.settlement.lastBatchIndex().call().await.unwrap();
+
+    assert!(landed.status());
+    assert_eq!(index_after_retry, 1, "the retry must not post twice");
+    assert_eq!(index_after_next, 2);
 }

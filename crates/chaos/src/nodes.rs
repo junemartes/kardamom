@@ -36,6 +36,26 @@ impl Signal {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Nodes;
 
+/// A stream from a script in one node into a script in another: the
+/// stdout of `read` in `from` is the stdin of `write` in `to`.
+#[derive(Debug, Clone, Copy)]
+pub struct Pipe<'a> {
+    pub from: &'a str,
+    pub read: &'a str,
+    pub to: &'a str,
+    pub write: &'a str,
+    /// The highest exit status of `read` that passes. tar exits 1 when a
+    /// file changed as it read it.
+    pub max_read_status: i32,
+}
+
+/// What a pipe moved, and how long it took.
+#[derive(Debug, Clone, Copy)]
+pub struct Streamed {
+    pub bytes: u64,
+    pub elapsed: Duration,
+}
+
 impl Nodes {
     /// Run `docker <args>` on the host, within the bound. The output is
     /// returned whatever the exit status; callers judge it.
@@ -44,10 +64,20 @@ impl Nodes {
     ///
     /// Returns an error if the command cannot spawn or exceeds the bound.
     pub async fn docker(&self, args: &[&str]) -> anyhow::Result<Output> {
+        Self::docker_within(args, DOCKER_TIMEOUT).await
+    }
+
+    async fn docker_within(args: &[&str], bound: Duration) -> anyhow::Result<Output> {
         let run = Command::new("docker").args(args).output();
-        tokio::time::timeout(DOCKER_TIMEOUT, run)
+        tokio::time::timeout(bound, run)
             .await
-            .with_context(|| format!("docker {} timed out", args.join(" ")))?
+            .with_context(|| {
+                format!(
+                    "docker {} timed out after {}s",
+                    args.join(" "),
+                    bound.as_secs()
+                )
+            })?
             .with_context(|| format!("spawn docker {}", args.join(" ")))
     }
 
@@ -58,7 +88,23 @@ impl Nodes {
     ///
     /// Returns an error if the command fails, hangs, or exits non-zero.
     pub async fn docker_ok(&self, args: &[&str]) -> anyhow::Result<String> {
-        let out = self.docker(args).await?;
+        Self::stdout_of(args, &self.docker(args).await?)
+    }
+
+    /// `docker_ok` under the streaming bound, for a command that moves
+    /// a large file, such as a `docker cp` of a state directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails, exceeds the streaming
+    /// bound, or exits non-zero.
+    pub async fn docker_ok_long(&self, args: &[&str]) -> anyhow::Result<String> {
+        Self::stdout_of(args, &Self::docker_within(args, STREAM_TIMEOUT).await?)
+    }
+
+    /// The trimmed stdout of a finished command, or an error on a
+    /// non-zero exit.
+    fn stdout_of(args: &[&str], out: &Output) -> anyhow::Result<String> {
         anyhow::ensure!(
             out.status.success(),
             "docker {} failed ({}): {}",
@@ -167,6 +213,80 @@ impl Nodes {
             String::from_utf8_lossy(&out.stderr).trim()
         );
         Ok(out.stdout)
+    }
+
+    /// Stream the stdout of a script in one node into the stdin of a
+    /// script in another, under the streaming bound. The host holds only
+    /// the copy buffer, not the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a side cannot spawn, the stream exceeds the
+    /// bound, the reader exits above its highest passing status, or the
+    /// writer exits non-zero.
+    pub async fn stream(&self, pipe: &Pipe<'_>) -> anyhow::Result<Streamed> {
+        let started = std::time::Instant::now();
+        let mut reader = Command::new("docker")
+            .args(["exec", pipe.from, "bash", "-lc", pipe.read])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("spawn docker exec {}", pipe.from))?;
+        let mut writer = Command::new("docker")
+            .args(["exec", "-i", pipe.to, "bash", "-lc", pipe.write])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("spawn docker exec -i {}", pipe.to))?;
+        let source = reader.stdout.take().context("reader stdout")?;
+        let sink = writer.stdin.take().context("writer stdin")?;
+        let run = async {
+            tokio::join!(
+                Self::pump(source, sink),
+                reader.wait_with_output(),
+                writer.wait_with_output()
+            )
+        };
+        let (copied, read, written) = tokio::time::timeout(STREAM_TIMEOUT, run)
+            .await
+            .with_context(|| {
+                format!(
+                    "stream {} -> {} timed out after {}s",
+                    pipe.from,
+                    pipe.to,
+                    STREAM_TIMEOUT.as_secs()
+                )
+            })?;
+        let (read, written) = (read?, written?);
+        let code = read.status.code().unwrap_or(-1);
+        anyhow::ensure!(
+            (0..=pipe.max_read_status).contains(&code) && written.status.success(),
+            "stream {} -> {} failed (reader {}: {}; writer {}: {})",
+            pipe.from,
+            pipe.to,
+            read.status,
+            String::from_utf8_lossy(&read.stderr).trim(),
+            written.status,
+            String::from_utf8_lossy(&written.stderr).trim()
+        );
+        Ok(Streamed {
+            bytes: copied?,
+            elapsed: started.elapsed(),
+        })
+    }
+
+    /// Copy `source` into `sink` to its end, then close `sink`: the
+    /// writer reads to the end of its input.
+    async fn pump(
+        mut source: tokio::process::ChildStdout,
+        mut sink: tokio::process::ChildStdin,
+    ) -> anyhow::Result<u64> {
+        tokio::io::copy(&mut source, &mut sink)
+            .await
+            .context("copy the stream")
     }
 
     /// The first running inner container on `node` whose name starts

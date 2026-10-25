@@ -93,6 +93,29 @@ impl ChainView {
                 .all(|s| s["state"] != "halted" && s["state"] != "paused")
     }
 
+    /// What the release gate of a deploy refuses on: every root, and
+    /// every pause on the board, the sealer's and the ingress's own
+    /// included. Empty when the gate lets a deploy start.
+    pub(crate) fn gate_refusals(&self) -> Vec<String> {
+        let roots = self
+            .roots()
+            .into_iter()
+            .map(|(service, cause)| format!("{service} halted on {cause}"));
+        let own = [
+            ("sealer", &self.0["sealer"]),
+            ("ingress", &self.0["ingress"]),
+        ];
+        let board = self
+            .services()
+            .map(|s| (s["service"].as_str().unwrap_or("?"), s));
+        let pauses = own
+            .into_iter()
+            .chain(board)
+            .filter(|(_, record)| !record["pause"].is_null())
+            .map(|(service, record)| format!("{service} paused on {}", Self::cause(record)));
+        roots.chain(pauses).collect()
+    }
+
     /// Every process of `service` on the board runs, and one at least.
     pub(crate) fn all_running(&self, service: &str) -> bool {
         let states = self.states_of(service);
@@ -172,6 +195,39 @@ mod tests {
             "services": [{"service": "batcher", "state": "gone"}],
         }));
         assert!(calm.settled(), "a gone record is not a pause");
+    }
+
+    /// The gate refuses on a root, and on a pause with no root, as a
+    /// stale upstream pause of the batcher leaves it.
+    #[test]
+    fn the_gate_refuses_on_a_root_or_any_pause() {
+        let paused = ChainView(serde_json::json!({
+        "roots": [],
+        "sealer": {"halted": false, "state": "running", "pause": null},
+        "ingress": {"halted": false, "state": "running", "pause": null},
+        "services": [
+            {"service": "batcher", "state": "paused", "pause": {"reason": "upstream"}},
+            {"service": "executor", "state": "running", "pause": null},
+            {"service": "da-watcher", "state": "paused", "pause": {"reason": "upstream", "root": {"cause": "da_lag"}}}
+        ]}));
+        assert_eq!(
+            paused.gate_refusals(),
+            ["batcher paused on upstream", "da-watcher paused on da_lag"]
+        );
+        let halted = ChainView(serde_json::json!({
+            "roots": [{"service": "sealer", "cause": "sealer_no_quorum"}],
+            "ingress": {"state": "paused", "pause": {"reason": "upstream", "root": {"cause": "sealer_no_quorum"}}}}));
+        assert_eq!(
+            halted.gate_refusals(),
+            [
+                "sealer halted on sealer_no_quorum",
+                "ingress paused on sealer_no_quorum"
+            ]
+        );
+        let open = ChainView(serde_json::json!({
+            "roots": [], "sealer": {"pause": null}, "ingress": {"pause": null},
+            "services": [{"service": "batcher", "state": "running", "pause": null}]}));
+        assert_eq!(open.gate_refusals(), Vec::<String>::new());
     }
 
     #[test]

@@ -92,6 +92,18 @@ variable "priority_fees" {
     error_message = "The priority_fees value must be on or off."
   }
 }
+# The carry from genesis, "on" or "off" (config/genesis/carry.toml): the
+# genesis features 3, 4 and 5. The deploy sets it from
+# KARDAMOM_GENESIS_CARRY, the same value as the sealer members. Only a new
+# chain takes it: an executor refuses a changed genesis.
+variable "genesis_carry" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.genesis_carry)
+    error_message = "The genesis_carry value must be on or off."
+  }
+}
 # The genesis fragment of the local canary, "on" or "off"
 # (config/genesis/canary.toml). The deploy sets it on only for the local
 # canary. A live chain keeps "off": its executors refuse a changed genesis.
@@ -491,10 +503,12 @@ job "executor" {
         # It prefunds Anvil accounts #0 through #15 with 1000 ETH each,
         # plus the ERC-7955 factory predeploy. The local canary's accounts
         # and, with priority fees on, the fee schedule fragment follow it;
-        # the validator renders the same.
+        # the validator renders the same. The fragment of the carry from
+        # genesis comes first: its key is a top-level key.
         template {
           destination = "local/genesis.toml"
           data = join("\n", concat(
+            var.genesis_carry == "on" ? [file("config/genesis/carry.toml")] : [],
             [file("config/genesis/dev.toml")],
             var.canary_genesis == "on" ? [file("config/genesis/canary.toml")] : [],
             var.priority_fees == "on" ? [file("config/genesis/fees.toml")] : [],

@@ -37,10 +37,28 @@ nomad_region: "global"
 consul_retry_join: ["kardamom-control-0"]
 consul_server_expect: 1
 nomad_server_expect: 1
+# The Nomad servers mark a node down when its client misses a heartbeat
+# for this time after the heartbeat TTL (10 s with few nodes). A down node
+# loses its allocations, and Nomad starts replacements. The local profile
+# runs every node in a container on one shared host. There, a node
+# container stalls for more than 10 s under CPU load (the reason for the
+# 30 s AERON_STALL_TOLERANCE_MS of the container recipes), its client
+# misses a heartbeat, and Nomad replaces healthy allocations, anvil with
+# an empty chain among them. 60 s is twice that stall budget, because the
+# client and the server both stall.
+# A real dead node of the local profile is down 50 s later, and its
+# replacement takes minutes of provisioning anyway. Production keeps the
+# Nomad default of 10 s: a dedicated host does not stall, and a dead host
+# must lose its allocations quickly.
+nomad_heartbeat_grace: "{{ '60s' if deployment_profile == 'local' else '10s' }}"
 # The Consul HTTP and DNS listener address. Nomad and the applications use
 # the local agent at 127.0.0.1. The local profile also listens on the node
 # address for the smoke and chaos scripts.
 consul_client_addr: "0.0.0.0"
+# The HTTP connection limit of one client address on a Consul agent
+# (limits.http_max_conns_per_client; roles/consul/templates/consul.hcl.j2
+# explains the value). Consul's default is 200.
+consul_http_max_conns_per_client: 1024
 # Production security inputs. An empty value disables its block, and the
 # production profile refuses empty values. Supply them from the secret
 # store through protected Ansible inputs (a vault file), never through
@@ -88,6 +106,21 @@ image_prefix: "{{ registry_host }}:{{ registry_port }}/kardamom"
 # The plain-HTTP registries the Docker daemon trusts: the in-cluster
 # registry of the local profile only. Production pulls from a TLS registry.
 docker_insecure_registries: "{{ [registry_host ~ ':' ~ registry_port] if deployment_profile == 'local' else [] }}"
+# The third-party images of the Nomad jobs, by the job variable that takes
+# the reference. Each reference pins a release tag and a digest. The job
+# files repeat each reference as the variable default, and
+# ansible/contract.yml checks that copy. The deploy passes these values.
+# On the container path (REGISTRY_PUSH_NODE set), the images role pulls
+# each image one time and pushes a copy into the in-cluster registry. The
+# image manifest records the copy as upstream-<variable>, and the deploy
+# passes the copy in place of the upstream reference. A node then pulls
+# from no external registry.
+upstream_images:
+  anvil_image: "ghcr.io/foundry-rs/foundry:v1.5.0@sha256:2a4c7c28807504292da7f76a069dae6d027e7993e9b274f6bf01eb41b0f4bdc6"
+  node_exporter_image: "prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0"
+  prometheus_image: "prom/prometheus:v3.5.1@sha256:38c3b05c3bc744ff1b0b7b4eb82196026442845e62a1e2073795565da506d7a2"
+  alertmanager_image: "prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a"
+  grafana_image: "grafana/grafana:12.1.1@sha256:a1701c2180249361737a99a01bc770db39381640e4d631825d38ff4535efa47d"
 
 # --- L2 chain -------------------------------------------------------------
 chain_id: 412346                 # matches chains/dev.toml
@@ -133,7 +166,7 @@ ports:
   redis: 6379
   redis_sentinel: 26379
   state_mirror_metrics: 9007
-  # The notifier's client port (the status feed and POST /webhooks) and
+  # The notifier's client port (the status feed) and
   # its Prometheus exporter, on the ingress nodes or the notifier nodes
   # (nomad/notifier.nomad.hcl).
   notifier_feed: 8547
@@ -161,7 +194,6 @@ paths:
   state_dir: /opt/kardamom/state           # executor StateWriter (libmdbx) data
   checkpoints_dir: /opt/kardamom/checkpoints # executor state checkpoints (fast recovery)
   mirror_dir: /opt/kardamom/mirror         # state mirror head file + rebuild scratch
-  notifier_dir: /opt/kardamom/notifier     # webhook subscriptions, outboxes and cursors
   canary_dir: /opt/kardamom/canary         # the canary's nonce journal and contract addresses
   egress_dir: /opt/kardamom/egress         # the egress store: the canonical frames and the receipts
   batcher_dir: /opt/kardamom/batcher       # live batcher cursor file + DA blob store
@@ -183,7 +215,6 @@ node_data_dirs:
     - "{{ paths.state_dir }}"
     - "{{ paths.checkpoints_dir }}"
     - "{{ paths.mirror_dir }}"
-    - "{{ paths.notifier_dir }}"
     - "{{ paths.canary_dir }}"
     - "{{ paths.egress_dir }}"
     - "{{ paths.batcher_dir }}"

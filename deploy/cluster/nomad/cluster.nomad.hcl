@@ -198,6 +198,23 @@ variable "member_feed" {
   }
 }
 
+# The carry from genesis, "on" or "off". On, every member starts a new
+# chain with features 3, 4 and 5 active at genesis
+# (-Dkardamom.cluster.genesisFeatures=3,4,5): decision version 5 and the
+# carry window from the first block. The setting applies only to a member
+# that starts at genesis, but every member must match it for the life of
+# the chain: a member with no snapshot replays the log from genesis with
+# it. Off renders no setting. The deploy passes it from
+# KARDAMOM_GENESIS_CARRY, and accepts it only for a new chain.
+variable "genesis_carry" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.genesis_carry)
+    error_message = "The genesis_carry value must be on or off."
+  }
+}
+
 # The frame ring of the member feed in bytes (-Dkardamom.cluster.feedRingBytes),
 # off the heap, with the member feed only. A power of two of at least 8 MiB.
 variable "cluster_feed_ring_bytes" {
@@ -226,7 +243,7 @@ variable "image_ref" {
 # detection of a dead process. CI raises it to ride out host stalls.
 variable "aeron_stall_tolerance_ms" {
   type        = number
-  description = "The client liveness timeout of the media driver and the driver timeout of its Java clients, in milliseconds. Aeron's default is 10000."
+  description = "The client liveness and image liveness timeouts of the media driver and the driver timeout of its Java clients, in milliseconds. Aeron's default is 10000."
   default     = 10000
 
   validation {
@@ -265,6 +282,14 @@ variable "datacenter" {
 #   keepalive every 500 ms, far below it.
 # - aeron.publication.unblock.timeout (ns): Aeron requires it above the
 #   client liveness timeout. It keeps Aeron's default ratio, 3/2.
+# - aeron.image.liveness.timeout (ns): a receiving driver keeps the image
+#   of a silent publisher this long, and a stalled receiver thread loses
+#   the image when its stall is longer. An archive that loses an image
+#   leaves a hole in its recording. A publisher sends a heartbeat every
+#   100 ms, far below it. Aeron checks no order against the other
+#   timeouts. A publisher that closes sends an end of stream, and its
+#   images go at once. Only the image of a dead publisher or a dead
+#   driver waits for the full timeout.
 # - aeron.archive.message.timeout: the archive clients of the consensus
 #   module and the service wait this long for an archive response.
 #   Aeron's default is 10 s, the same as the stall tolerance default.
@@ -279,6 +304,7 @@ locals {
     "-Daeron.driver.timeout=${var.aeron_stall_tolerance_ms}",
     "-Daeron.client.liveness.timeout=${var.aeron_stall_tolerance_ms * 1000000}",
     "-Daeron.publication.unblock.timeout=${floor(var.aeron_stall_tolerance_ms * 3 / 2) * 1000000}",
+    "-Daeron.image.liveness.timeout=${var.aeron_stall_tolerance_ms * 1000000}",
     "-Daeron.archive.message.timeout=${var.aeron_stall_tolerance_ms}ms",
     "-Daeron.archive.connect.timeout=${floor(var.aeron_stall_tolerance_ms / 2)}ms",
   ])
@@ -338,6 +364,8 @@ locals {
     " -Dkardamom.cluster.feedAeronDir=/opt/kardamom/aeron-mount/dir",
     " -Dkardamom.cluster.feedRingBytes=${var.cluster_feed_ring_bytes}",
   ]) : ""
+  # The genesis features of the carry from genesis, empty when it is off.
+  genesis_opts = var.genesis_carry == "on" ? " -Dkardamom.cluster.genesisFeatures=3,4,5" : ""
 }
 
 job "cluster" {
@@ -387,12 +415,27 @@ job "cluster" {
       # so it has rejoined and caught up before the next member stops.
       # Two members never restart together. No revert: a member carries
       # the Raft log, and the role's rollback is the path.
+      #
+      # The healthy deadline covers the self-heal of a member that waits
+      # for a log tail that the leader does not have. Its join watchdog
+      # exits it after a 160 s stall, and the relaunch rejoins. The steps,
+      # as measured on a CI bring-up:
+      #   allocation to task start (image, JVM)           72 s
+      #   task start to the stall verdict (leader + 160)  200 s
+      #   verdict to the relaunch (restart delay, JVM)     34 s
+      #   relaunch to the closed election                 53 s
+      #   min_healthy_time                                60 s
+      # That is 419 s, 7 minutes. 9 minutes leaves 2 minutes for the check
+      # interval and a slower host. A deadline below the total marks the
+      # healing member unhealthy, and the deployment fails. The progress
+      # deadline stays above the healthy deadline, and the poll budget of
+      # the deploy (workloads_deployment_retries) covers it.
       update {
         max_parallel      = 1
         health_check      = "checks"
         min_healthy_time  = "60s"
-        healthy_deadline  = "5m"
-        progress_deadline = "10m"
+        healthy_deadline  = "9m"
+        progress_deadline = "12m"
         auto_revert       = false
       }
 
@@ -437,12 +480,12 @@ job "cluster" {
           # ingress endpoint is an Aeron UDP channel, so it has no
           # connect check of its own.
           check {
-            name      = "member-ready"
-            type      = "http"
-            port      = "admin"
-            path      = "/ready"
-            interval  = "10s"
-            timeout   = "2s"
+            name     = "member-ready"
+            type     = "http"
+            port     = "admin"
+            path     = "/ready"
+            interval = "10s"
+            timeout  = "2s"
           }
         }
 
@@ -483,7 +526,7 @@ job "cluster" {
         # archive, consensus module, service and feeder threads. The image
         # entrypoint also sets the timer slack of the JVM when it is set.
         env {
-          JAVA_TOOL_OPTIONS    = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} ${local.cycle_threshold_opts} ${local.jvm_pause_log_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.logPurgeKeepSnapshots=${var.cluster_log_purge_keep_snapshots} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.driverThreadingMode=${var.cluster_driver_threading_mode} -Dkardamom.cluster.remoteOrigins=${var.cluster_seed_snapshot != "" ? "" : var.cluster_remote_origins} -Dkardamom.cluster.seedSnapshot=${var.cluster_seed_snapshot} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}${local.feed_opts}"
+          JAVA_TOOL_OPTIONS        = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} ${local.cycle_threshold_opts} ${local.jvm_pause_log_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.logPurgeKeepSnapshots=${var.cluster_log_purge_keep_snapshots} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.driverThreadingMode=${var.cluster_driver_threading_mode} -Dkardamom.cluster.remoteOrigins=${var.cluster_seed_snapshot != "" ? "" : var.cluster_remote_origins} -Dkardamom.cluster.seedSnapshot=${var.cluster_seed_snapshot} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}${local.feed_opts}${local.genesis_opts}"
           KARDAMOM_IDLE_CAP_US     = var.idle_cap_us
           KARDAMOM_CLUSTER_HEAP_MB = var.cluster_heap_mb
         }

@@ -23,7 +23,7 @@ use kardamom_log::config::AeronConfig;
 use kardamom_log::refetch::{EndpointSource, RefetchConfig};
 use kardamom_obs::pipeline::Queue;
 use kardamom_state::Durability;
-use kardamom_types::{AccountChange, CodeEntry, TxDataLoc, TxEnvelope};
+use kardamom_types::{GenesisAlloc, TxDataLoc, TxEnvelope};
 
 use crate::error::ExecutorError;
 use crate::reader::{JoinRecoveryFactory, TxDataSubscription};
@@ -87,17 +87,17 @@ pub fn resolve_genesis(
     Ok((genesis, chain_id))
 }
 
-/// Build the genesis allocation set (accounts and code) from a `Genesis`,
-/// ready for `kardamom_state::seed_genesis`. Each `AllocEntry` becomes one
-/// `AccountChange`, with its balance, nonce, and the keccak256 hash of its
-/// code (if any). Code bytes become a `CodeEntry`, retrievable through
-/// `code_by_hash`. This returns empty vecs when no genesis is given.
+/// Build the genesis state (accounts, code and storage words) from a
+/// `Genesis`, ready for `kardamom_state::seed_genesis`. Each `AllocEntry`
+/// becomes one `AccountChange`, with its balance, nonce, and the keccak256
+/// hash of its code (if any). Code bytes become a `CodeEntry`, retrievable
+/// through `code_by_hash`. The genesis features add the chain-state code
+/// and their activation words. This returns an empty state when no genesis
+/// is given.
 #[must_use]
-pub fn build_genesis_alloc(
-    genesis: Option<&kardamom_types::Genesis>,
-) -> (Vec<AccountChange>, Vec<CodeEntry>) {
+pub fn build_genesis_alloc(genesis: Option<&kardamom_types::Genesis>) -> GenesisAlloc {
     let Some(g) = genesis else {
-        return (Vec::new(), Vec::new());
+        return GenesisAlloc::default();
     };
     for entry in &g.alloc {
         tracing::info!(
@@ -297,8 +297,9 @@ fn archive_endpoints(
 pub fn expected_genesis_digest(
     genesis: Option<&kardamom_types::Genesis>,
 ) -> Option<alloy_primitives::B256> {
-    let (a, c) = build_genesis_alloc(genesis);
-    Some(kardamom_state::genesis_digest(&a, &c))
+    Some(kardamom_state::genesis_digest(&build_genesis_alloc(
+        genesis,
+    )))
 }
 
 /// The cold-start restore ladder. It tries the newest local checkpoint

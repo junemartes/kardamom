@@ -10,11 +10,16 @@ use serde::Deserialize;
 
 use crate::poll::Budget;
 
+mod alloc_spec;
 mod job;
 mod log;
+mod node;
 mod saved_job;
+mod task;
+use alloc_spec::AllocSpec;
 pub(crate) use job::{Job, Nodes};
 pub(crate) use saved_job::SavedJob;
+pub(crate) use task::TaskEvent;
 
 /// The log streams to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +47,10 @@ pub struct Alloc {
     pub job_version: u64,
     #[serde(rename = "DesiredStatus")]
     pub desired_status: String,
+    /// Why Nomad wants the allocation in its desired status, such as a
+    /// lost node.
+    #[serde(rename = "DesiredDescription", default)]
+    pub desired_description: Option<String>,
     #[serde(rename = "ID")]
     pub id: String,
     #[serde(rename = "TaskGroup")]
@@ -270,6 +279,30 @@ impl Nomad {
             .into_iter()
             .filter(|a| a.task_group == group)
             .collect())
+    }
+
+    /// The image of the docker task `task` in each running allocation
+    /// of `job`, read from the job spec that the allocation runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a request fails, or if an allocation has no
+    /// task `task` with an image.
+    pub(crate) async fn running_images(
+        &self,
+        job: &str,
+        task: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut images = Vec::new();
+        for alloc in self.running(job).await? {
+            images.push(self.alloc_image(&alloc, task).await?);
+        }
+        Ok(images)
+    }
+
+    async fn alloc_image(&self, alloc: &Alloc, task: &str) -> anyhow::Result<String> {
+        let spec: AllocSpec = self.read(&format!("/v1/allocation/{}", alloc.id)).await?;
+        spec.image(task).map(str::to_owned)
     }
 
     /// The number of running allocations of `job`.

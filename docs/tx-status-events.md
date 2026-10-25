@@ -1,7 +1,10 @@
 # Transaction status events
 
 The notifier tells a client how far a transaction has gone through the pipeline. It serves a
-WebSocket feed and webhooks. The service is `kardamom-notifier`. It runs apart from the ingress, on its own port.
+WebSocket feed. The service is `kardamom-notifier`. It runs apart from the ingress, on its own port.
+
+The webhooks are removed (2026-10-25). Offline delivery to a server that is not connected comes later
+through a task queue, such as SQS. The notifier keeps no state on disk.
 
 - The feed is best effort. It tells you early. The receipt is the truth.
 - The notifier is off the hot path. A slow client costs only that client.
@@ -117,87 +120,12 @@ Example of a rejection:
 - After the marker, the stream continues from the present.
 - To fill the gap, read the receipt, or subscribe again. A new subscription replays the ring.
 
-## Webhooks
-
-A webhook posts each matching event to a URL that you give. Delivery is at least once.
-
-### Register
-
-`POST /webhooks` on the notifier port.
-
-```json
-{"url":"https://example.org/hook","filter":{"sender":"0x1111111111111111111111111111111111111111"},"secret":"a-long-random-string"}
-```
-
-- `url` must be an `http` or `https` URL. `secret` must not be empty. `filter` is the same object as for the WebSocket feed.
-- An unknown key in the body is an error. The body can have at most 64 KiB.
-- The answer is `201` with the subscription `id` and the `owner`:
-
-```json
-{"id":"0x…","owner":0}
-```
-
-- `id` is the keccak256 hash of the request. The same request gives the same `id`. A repeated registration is the same subscription.
-- `owner` is the index of the instance that delivers the subscription.
-- A bad request gets `400` with `{"error":"…"}`. A notifier that is shutting down answers `503`.
-- The notifier stores each subscription, with its secret, in a file in its directory. A restart loads the subscriptions again.
-- The API has no call to list or remove a subscription.
-
-### Delivery
-
-For each event, the notifier sends an HTTP `POST` to the URL. The body is the event JSON, as in the WebSocket feed. The content type is `application/json`.
-
-| Header | Value |
-|---|---|
-| `X-Kardamom-Signature` | `sha256=` and the hex HMAC-SHA256 of the body bytes, with the `secret` as the key. |
-| `X-Kardamom-Idempotency-Key` | `<tx_hash>:<stage>`, for example `0xab…:sealed`. |
-| `X-Kardamom-Subscription` | The subscription `id`. |
-
-- Answer with any 2xx status to confirm. Any other answer, and a timeout, is a failed attempt.
-- Verify the signature on the raw body, before you parse it. Example in Python:
-
-```python
-import hashlib
-import hmac
-
-def verify(secret: bytes, body: bytes, header: str) -> bool:
-    expected = "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, header)
-```
-
-- Delivery is at least once. The same event can arrive more than once, for example after a crash of the notifier.
-  - Use the idempotency key to find a repeat. A transaction has at most one event for each stage.
-- Events of one subscription go out one at a time, in the order of its outbox.
-
-### Retries and give-up
-
-- The notifier makes up to 10 attempts for each event.
-- The wait after a failed attempt doubles from 1 second and stops at 60 seconds: 1, 2, 4, 8, 16, 32, 60, 60, 60 seconds.
-- Each attempt has a timeout of 5 seconds (`KARDAMOM_NOTIFIER_WEBHOOK_TIMEOUT_MS`).
-- After the 10th failure, the notifier gives up on that event and goes on to the next one. It counts the event as `gave_up`. A dead endpoint does not block the events behind it for ever.
-- A notifier that stops during a retry keeps the event. It sends the event again at the next start.
-
-### Outbox
-
-- Each subscription has an outbox file and a cursor file in the notifier directory. The notifier appends each matching live event to the outbox, then delivers from the cursor.
-- The cursor is stored after every 64 deliveries and when the loop is idle. A crash can repeat up to that many events.
-- If every event is delivered and the outbox is at least `KARDAMOM_NOTIFIER_OUTBOX_RETAIN_BYTES` long, the notifier cuts it to zero.
-- An event enters the outbox only if the owner instance is running and its queue has room.
-  - The queue of one subscription has room for `KARDAMOM_NOTIFIER_FEED_BUFFER` events. If it is full, the notifier drops the event. The drop shows in `kardamom_notifier_webhook_queue_full_total`.
-  - An event that arrives while the owner instance is down is not in its outbox.
-
-## Sharding and instances
+## Instances
 
 - Run one or more instances. Each instance reads the three streams itself and keeps its own ring. A WebSocket client can connect to any instance.
-- Webhook subscriptions are sharded. The owner of a subscription is the instance with the highest rendezvous hash of the subscription `id`. Every instance computes the same owner from the instance count.
-  - Only the owner delivers.
-  - A change of the instance count moves only the subscriptions whose owner changes.
-- A registration goes to one instance. That instance stores it and forwards it to every peer in `KARDAMOM_NOTIFIER_PEERS`, so that a peer can take over a shard.
-  - The forward is best effort: up to 3 attempts, one second apart.
-  - A peer that gets a forwarded registration stores it. It does not forward it again.
-  - The peer list can include the instance itself. That forward is a repeat of the same subscription, and it changes nothing.
-- Set `KARDAMOM_NOTIFIER_INSTANCE_INDEX` (from 0) and `KARDAMOM_NOTIFIER_INSTANCE_COUNT` on each instance. The index must be below the count.
-- The deploy job `notifier` runs 2 instances, one on each ingress node. With `KARDAMOM_NOTIFIER_NODES=on`, it runs `KARDAMOM_NOTIFIER_COUNT` instances, one on each node of role `notifier`. See `deploy/cluster/nomad/notifier.nomad.hcl`, and "The notifier nodes" in `deploy/cluster/README.md` for the move of the webhook state.
+- An instance keeps no state on disk and needs no peers. A change of the instance count only starts or stops instances.
+- `KARDAMOM_NOTIFIER_INSTANCE_INDEX` (from 0) names the stream plane of each instance.
+- The deploy job `notifier` runs 2 instances, one on each ingress node. With `KARDAMOM_NOTIFIER_NODES=on`, it runs `KARDAMOM_NOTIFIER_COUNT` instances, one on each node of role `notifier`. See `deploy/cluster/nomad/notifier.nomad.hcl`, and "The notifier nodes" in `deploy/cluster/README.md`.
 
 ## Configuration
 
@@ -205,25 +133,20 @@ Each setting is a flag or an environment variable. The flag overrides the variab
 
 | Flag | Environment variable | Default | Meaning |
 |---|---|---|---|
-| `--bind` | `KARDAMOM_NOTIFIER_BIND` | `127.0.0.1:8547` | The address of the WebSocket feed and `POST /webhooks`. |
+| `--bind` | `KARDAMOM_NOTIFIER_BIND` | `127.0.0.1:8547` | The address of the WebSocket feed. |
 | `--max-connections` | `KARDAMOM_NOTIFIER_MAX_CONNECTIONS` | `10000` | The connection limit of the listener. |
 | `--ring-minutes` | `KARDAMOM_NOTIFIER_RING_MINUTES` | `10` | The age bound of the ring, in minutes. |
 | `--ring-max-events` | `KARDAMOM_NOTIFIER_RING_MAX_EVENTS` | `1000000` | The count bound of the ring. An event takes about 300 bytes, so the default is about 300 MB. |
-| `--feed-buffer` | `KARDAMOM_NOTIFIER_FEED_BUFFER` | `65536` | The live buffer of each subscriber. It is also the queue of each webhook subscription and the ingest queue. |
+| `--feed-buffer` | `KARDAMOM_NOTIFIER_FEED_BUFFER` | `65536` | The live buffer of each subscriber. It is also the ingest queue. |
 | `--replay-page` | `KARDAMOM_NOTIFIER_REPLAY_PAGE` | `1000` | The number of events in one replay page. |
-| `--dir` | `KARDAMOM_NOTIFIER_DIR` | `/opt/kardamom/notifier` | The directory of the subscriptions, outboxes and cursors. |
-| `--outbox-retain-bytes` | `KARDAMOM_NOTIFIER_OUTBOX_RETAIN_BYTES` | `268435456` (256 MiB) | The size at which a fully delivered outbox is cut. |
-| `--webhook-timeout-ms` | `KARDAMOM_NOTIFIER_WEBHOOK_TIMEOUT_MS` | `5000` | The timeout of one webhook POST. |
-| `--instance-index` | `KARDAMOM_NOTIFIER_INSTANCE_INDEX` | `0` | The index of this instance. |
-| `--instance-count` | `KARDAMOM_NOTIFIER_INSTANCE_COUNT` | `1` | The number of instances that share the subscriptions. |
-| `--peers` | `KARDAMOM_NOTIFIER_PEERS` | none | The base URLs of the instances, separated by commas. |
+| `--instance-index` | `KARDAMOM_NOTIFIER_INSTANCE_INDEX` | `0` | The index of this instance. It names its stream plane. |
 | `--metrics-addr` | `KARDAMOM_METRICS_ADDR` | `127.0.0.1:9008` | The address of the Prometheus `/metrics` listener. |
 | `--host-id` | `KARDAMOM_HOST_ID` | `local` | The host label on each metric. |
 | `--log-config` | `KARDAMOM_LOG_CONFIG` | none | The `LogConfig` file with the Aeron streams. |
 | `--aeron-dir` | none | none | The Aeron media-driver directory. |
 | `--executor-count` | `KARDAMOM_EXECUTOR_COUNT` | from `channels.tx_receipts_executor_count` | The number of executors whose receipts the notifier reads. |
 
-- The deploy sets `ring_minutes`, `ring_max_events` and `outbox_retain_bytes` as Nomad variables. The defaults are the same as in the table.
+- The deploy sets `ring_minutes` and `ring_max_events` as Nomad variables. The defaults are the same as in the table.
 - The deploy runs the notifier with a 1024 MB memory limit, or 512 MB on the notifier nodes. A full ring at the default count bound takes about 300 MB of it.
 
 ## Metrics
@@ -241,14 +164,6 @@ The notifier serves these metrics on `--metrics-addr`. All names start with `kar
 | `ws_subscriptions` | gauge | none | Open WebSocket subscriptions. |
 | `ws_events_total` | counter | none | Events sent to WebSocket subscribers. |
 | `ws_lagged_total` | counter | none | Lag markers sent. |
-| `webhook_subscriptions` | gauge | `owned` | Subscriptions that this instance holds. `owned` is `true` for the ones it delivers. |
-| `webhook_feed_lagged_total` | counter | none | Live events that the webhook fan-out missed because it fell behind. |
-| `webhook_queue_full_total` | counter | `subscription` | Live events that a full subscription queue dropped. |
-| `outbox_appended_total` | counter | `subscription` | Events appended to an outbox. |
-| `outbox_delivered_total` | counter | `subscription`, `outcome` | Events that delivery finished. `outcome` is `delivered` or `gave_up`. |
-| `outbox_backlog_bytes` | gauge | `subscription` | Outbox bytes not yet delivered. |
-| `webhook_attempts_total` | counter | `outcome` | POST attempts. `outcome` is `ok`, `status` (a non-2xx answer) or `error` (no answer). |
-| `webhook_delivery_seconds` | histogram | none | Seconds from the arrival of an event at the notifier to its delivery. |
 
 - The publishers count the drops of `tx_status` records in `kardamom_log_best_effort_dropped_total{stream_id="1018"}`.
 - The Grafana dashboard is `deploy/grafana/provisioning/dashboards-json/kardamom-notifier.json`.
@@ -265,4 +180,3 @@ The notifier serves these metrics on `--metrics-addr`. All names start with `kar
 - A `tx_errors` record names a transaction by sender and nonce. The notifier needs an earlier event with that sender and nonce to find the hash. Without it, the error is dropped (`unresolved_errors_total`). The `rejected` status on `tx_status` carries the hash.
 - The notifier has no event for a drop on `tx_drops`. When the sealer refuses a reference without the bytes of its transaction, the sequencer publishes only a drop. The egress status (`kardamom_getTransactionStatus`) then answers `dropped` with the reason `transaction dropped by the sealer, send it again` (code -32000). This status is provisional: safe to send again; the status can still become executed. The feed can still show `sealed` and `executed` for the copy of the twin.
 - Filters do not protect data. Every client can read the full feed.
-- A webhook endpoint must be reachable from the notifier. The notifier does not retry for longer than the schedule above.

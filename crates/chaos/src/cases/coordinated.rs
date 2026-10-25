@@ -14,7 +14,8 @@ use crate::harness::Harness;
 use crate::probes::CLUSTER_TASK;
 
 /// The gauge of buffered refs below their sender's floor. It is zero
-/// unless a restart or a rewind stranded a ref.
+/// unless a restart or a rewind stranded a ref. Only the v1 loop exports
+/// it. See [`crate::knobs::SequencerLoop::can_strand_refs`].
 const REF_BELOW_FLOOR: &str = "kardamom_sequencer_ref_below_floor";
 
 /// The jobs a blackout takes down, with their allocation counts.
@@ -26,6 +27,13 @@ const PIPELINE_JOBS: [(&str, usize); 6] = [
     ("redis", 5),
     ("state-mirror", 3),
 ];
+
+/// The egress job of a carry-born cluster, with its allocation count (the
+/// `egress_count` default of the egress job).
+const EGRESS_JOB: (&str, usize) = ("egress", 2);
+
+/// The sealer's line of a void decision, one for each member and entry.
+const VOID_DECIDED: &str = "result=DECIDED";
 
 /// Hard-kill both ingress tasks. The whole client edge is gone: no
 /// submit lands and no receipt is served. Nomad restarts both, both
@@ -51,7 +59,7 @@ pub(crate) async fn ingress_pair_loss_recover(h: &mut Harness) -> anyhow::Result
 /// node. No twin keeps the lane: its senders are unordered until a
 /// replica returns with empty state and learns each sender's floor
 /// from the executors. Both replicas must come back healthy, no ref may
-/// sit below a floor, and the pipeline must progress. The load is
+/// sit below a floor (v1 loop), and the pipeline must progress. The load is
 /// pinned to shard 0, so the case's sender rides the killed lane.
 pub(crate) async fn sequencer_lane_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "sequencer-lane-loss-recover";
@@ -79,7 +87,16 @@ pub(crate) async fn sequencer_lane_loss_recover(h: &mut Harness) -> anyhow::Resu
 }
 
 /// No replica of lane 0 holds a buffered ref below its sender's floor.
+/// The v2 loop cannot strand a ref and exports no such gauge, so the
+/// check passes on it. The recovery probe then proves that the senders
+/// send again.
 pub(crate) async fn assert_no_ref_below_floor(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+    if !h.knobs.sequencer_loop.can_strand_refs() {
+        crate::log(format!(
+            "{ctx}: the v2 loop expires every transaction it holds, so no ref can sit below a floor"
+        ));
+        return Ok(());
+    }
     for i in 0..h.probes.sequencers.len() {
         let stranded = h.probes.seq_lane0_metric(i, REF_BELOW_FLOOR).await;
         anyhow::ensure!(
@@ -101,11 +118,14 @@ pub(crate) async fn assert_no_ref_below_floor(h: &Harness, ctx: &str) -> anyhow:
 /// an executor exporter must answer, both ingresses must be live, and
 /// the pipeline must progress.
 ///
-/// The kill can lose the transaction data of an entry that the sealers
-/// already ordered. No consumer can execute that entry. Each consumer asks
-/// the sealer to void it, and the chain moves again only after the void
-/// record. The case prints the number of voided entries as evidence. It
-/// does not assert the number: a kill between two entries loses nothing.
+/// In reference mode, the kill can lose the transaction data of an entry
+/// that the sealers already ordered. No consumer can execute that entry.
+/// Each consumer asks the sealer to void it, and the chain moves again
+/// only after the void record. The case prints the number of voided
+/// entries as evidence. It does not assert the number: a kill between two
+/// entries loses nothing. On a carry-born cluster, the sealer carries the
+/// bytes of every entry and decides no void under decision version 5, so
+/// the number must be 0, and the egress job must return too.
 pub(crate) async fn pipeline_blackout_recover(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "pipeline-blackout-recover";
     let nodes = h.nodes.pipeline_nodes().await?;
@@ -119,14 +139,18 @@ pub(crate) async fn pipeline_blackout_recover(h: &mut Harness) -> anyhow::Result
     await_exporters_dark(h, ctx).await?;
     crate::log(format!("{ctx}: docker start all {} nodes", nodes.len()));
     h.start_nodes(&nodes).await?;
-    for (job, count) in PIPELINE_JOBS {
+    let egress = h.knobs.genesis_carry.then_some(EGRESS_JOB);
+    for (job, count) in PIPELINE_JOBS.into_iter().chain(egress) {
         h.assert_count(job, count, h.knobs.reschedule_slo).await?;
     }
-    let leader = h
+    let elected = h
         .evidence
-        .cluster_leader(crate::cases::fleet::FULL_RESTART_ELECTION)
+        .cluster_elected(crate::cases::fleet::FULL_RESTART_ELECTION)
         .await?;
-    crate::log(format!("{ctx}: members elected memberId={leader}"));
+    crate::log(format!(
+        "{ctx}: members elected memberId={} (term {} closed on a majority)",
+        elected.leader, elected.term
+    ));
     await_exporter_back(h, ctx).await?;
     h.assert_ingress_pair_live(ctx).await?;
     h.assert_executor_progress(Duration::from_mins(3)).await?;
@@ -139,12 +163,17 @@ pub(crate) async fn pipeline_blackout_recover(h: &mut Harness) -> anyhow::Result
         .evidence
         .count_lines(
             CLUSTER_TASK,
-            "result=DECIDED",
+            VOID_DECIDED,
             crate::nomad::Streams::StdoutOnly,
         )
         .await?;
     crate::log(format!(
         "{ctx}: void decisions in the sealer logs: {voided} (one line per member per entry)"
     ));
+    anyhow::ensure!(
+        !h.knobs.genesis_carry || voided == 0,
+        "{}: {ctx}: the sealer decided {voided} voids under decision version 5",
+        crate::FAIL_PREFIX
+    );
     Ok(())
 }

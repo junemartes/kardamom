@@ -32,7 +32,8 @@ impl Fixture {
 
     fn database(path: &Path, balance: u64) {
         let env = StateEnvBuilder::new(path).open().unwrap();
-        kardamom_state::genesis::seed_genesis(&env, &[], &[]).unwrap();
+        kardamom_state::genesis::seed_genesis(&env, &kardamom_types::GenesisAlloc::default())
+            .unwrap();
         let mut writer = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
         let boundary = BlockBoundary {
             block_number: 1,

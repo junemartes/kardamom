@@ -70,9 +70,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
       - uses: ./.github/actions/rust-build-cache
-      - uses: extractions/setup-just@v4
-        with:
-          just-version: 1.49.0
+      - uses: ./.github/actions/just
       - run: just style
       # The format registry against the base branch (docs/formats.md). The
       # checkout of a pull request is its merge into the base, so the tip
@@ -162,9 +160,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: extractions/setup-just@v4
-        with:
-          just-version: 1.49.0
+      - uses: ./.github/actions/just
       # A release build of one test: its own rust-cache key.
       - uses: ./.github/actions/rust-build-cache
         with:
@@ -242,9 +238,7 @@ jobs:
       - run: forge build --sizes
       # The Rust `sol!` bindings read the committed ABIs, so they must match
       # this build.
-      - uses: extractions/setup-just@v4
-        with:
-          just-version: 1.49.0
+      - uses: ./.github/actions/just
       - run: just abi-check
         working-directory: .
 
@@ -342,8 +336,6 @@ jobs:
       - uses: ./.github/actions/rust-build-cache
         with:
           key: alloc-gate
-      - uses: extractions/setup-just@v4
-        with:
-          just-version: 1.49.0
+      - uses: ./.github/actions/just
       - name: DHAT allocation ceilings (perf/alloc-baselines.env)
         run: just alloc-gate

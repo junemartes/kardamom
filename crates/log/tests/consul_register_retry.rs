@@ -1,17 +1,19 @@
-//! The start-up registration against a fake Consul agent. The agent
-//! fails the first requests and then accepts. A transient failure (a
-//! dropped connection, a server error status) makes the registration try
-//! again. A refusal (an ACL denial) ends it at once.
+//! The start-up catalog calls against a fake Consul agent: a registration
+//! and the read of the cluster members. The agent fails the first
+//! requests and then accepts. A transient failure (a dropped connection,
+//! a server error status) makes the call try again. A refusal (an ACL
+//! denial) ends it at once.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use kardamom_log::config::DiscoveryConfig;
+use kardamom_log::config::{DiscoveryConfig, LogConfig};
 use kardamom_log::discovery::{
-    PublisherRecord, Registration, RegistrationSpec, Scope, ServiceId, StartRetry, Topic,
-    WatchTiming, catalog_from_config,
+    Instance, PublisherRecord, Registration, RegistrationSpec, Scope, ServiceId, StartRetry,
+    StreamPlane, Topic, WatchTiming, catalog_from_config,
 };
 use kardamom_log::error::LogError;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -27,7 +29,8 @@ enum Answer {
 }
 
 /// A fake Consul agent. It gives the answers of `script` in order, one
-/// per request, and `200 OK` after the script ends.
+/// per request, and `200 OK` after the script ends. A `200 OK` carries
+/// an index and an empty list, so a catalog read finds no record.
 struct FakeAgent {
     script: Vec<Answer>,
     requests: Arc<AtomicU32>,
@@ -66,8 +69,9 @@ impl FakeAgent {
         let mut body = vec![0; body_len];
         let _ = stream.read_exact(&mut body).await;
         if let Answer::Status(status) = answer {
-            let reply =
-                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nX-Consul-Index: 1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]"
+            );
             let _ = stream.get_mut().write_all(reply.as_bytes()).await;
         }
     }
@@ -179,4 +183,46 @@ async fn a_registration_gives_up_on_an_agent_that_never_listens() {
             .starts_with("discovery: register alloc-1:tx_errors:1015: "),
         "{error}"
     );
+}
+
+/// A plane over the agent at `agent`, with short catalog pauses.
+fn plane(agent: SocketAddr) -> StreamPlane {
+    let cfg = LogConfig {
+        discovery: DiscoveryConfig {
+            backoff_min_ms: NonZeroU64::new(20).expect("20 != 0"),
+            backoff_max_ms: NonZeroU64::new(100).expect("100 != 0"),
+            ..config(agent)
+        },
+        ..LogConfig::default()
+    };
+    let catalog = catalog_from_config(&cfg.discovery).expect("consul client");
+    let instance = Instance {
+        id: "alloc-1".into(),
+    };
+    StreamPlane::with_catalog(&cfg, "test", catalog, instance, Ipv4Addr::LOCALHOST)
+}
+
+#[tokio::test]
+async fn the_cluster_member_read_tries_again_while_the_agent_has_no_server() {
+    let no_server = Answer::Status("500 Internal Server Error");
+    let (agent, requests) = FakeAgent::start(vec![no_server, no_server]).await;
+    let endpoints = plane(agent)
+        .cluster_ingress_endpoints(Duration::from_secs(2))
+        .await
+        .expect("read on the third try");
+    // The agent lists no member, so the static endpoints apply.
+    assert_eq!(endpoints, None);
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn the_cluster_member_read_fails_after_the_limit() {
+    let (agent, requests) =
+        FakeAgent::start(vec![Answer::Status("500 Internal Server Error"); 1000]).await;
+    let error = plane(agent)
+        .cluster_ingress_endpoints(Duration::from_millis(300))
+        .await
+        .expect_err("no answer within the limit");
+    assert!(matches!(error, LogError::CatalogUnavailable(_)), "{error}");
+    assert!(requests.load(Ordering::SeqCst) > 1);
 }

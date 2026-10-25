@@ -82,6 +82,13 @@ impl RpcError {
     }
 }
 
+/// One signed transaction: its `0x` encoding and its hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signed {
+    pub raw: String,
+    pub hash: String,
+}
+
 /// A JSON-RPC client of one ingress.
 #[derive(Debug, Clone)]
 pub struct Rpc {
@@ -204,29 +211,44 @@ impl Rpc {
     }
 
     /// The next nonce of `address`, from the latest block the ingress
-    /// serves. The read repeats on `account state unavailable` for at most
-    /// [`NONCE_READ`]; any other failure ends it at once.
+    /// serves. The read repeats on `account state unavailable`, and on a
+    /// connection to the ingress that fails or times out, for at most
+    /// [`NONCE_READ`]: an ingress that Nomad replaces after a node loss
+    /// refuses connections until its replacement binds. Any other failure
+    /// ends the read at once.
     async fn nonce_at(&self, address: Address) -> anyhow::Result<u64> {
         let (nonce, _) = poll::until(NONCE_READ, |_| self.try_nonce_at(address))
             .await?
             .or_fail(|elapsed| {
                 anyhow::anyhow!(
-                    "eth_getTransactionCount of {address:#x}: {STATE_UNAVAILABLE} for {elapsed:?}; \
-                     no executor answered the ingress in that time"
+                    "eth_getTransactionCount of {address:#x} through {}: no nonce for {elapsed:?}; \
+                     the ingress did not connect, or no executor answered it (see the lines above)",
+                    self.url
                 )
             })?;
         Ok(nonce)
     }
 
-    /// One nonce read. `None` is `account state unavailable`, which the
-    /// caller repeats; the refusal is logged with its reason.
+    /// One nonce read. `None` is `account state unavailable` or a failed
+    /// connection, which the caller repeats; each is logged with its
+    /// reason.
     async fn try_nonce_at(&self, address: Address) -> anyhow::Result<Option<u64>> {
-        let answer = self
+        let call = self
             .call_typed(
                 "eth_getTransactionCount",
                 serde_json::json!([format!("{address:#x}"), "latest"]),
             )
-            .await?;
+            .await;
+        let answer = match call {
+            Ok(answer) => answer,
+            Err(e) if Self::is_unreachable(&e) => {
+                crate::log(format!(
+                    "eth_getTransactionCount of {address:#x}: {e:#}; the read repeats"
+                ));
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
         match answer {
             Ok(nonce) => Self::quantity(&nonce).map(Some),
             Err(err) if err.is_state_unavailable() => {
@@ -238,6 +260,13 @@ impl Rpc {
             }
             Err(err) => Err(err.into_error("eth_getTransactionCount")),
         }
+    }
+
+    /// True when a call got no answer: the connection failed, or the
+    /// request timed out.
+    fn is_unreachable(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<reqwest::Error>()
+            .is_some_and(|e| e.is_connect() || e.is_timeout())
     }
 
     /// A `0x` quantity of a nonce answer as a `u64`.
@@ -301,6 +330,18 @@ impl Rpc {
         account: u32,
         nonce: u64,
     ) -> anyhow::Result<Result<String, RpcError>> {
+        self.send_raw(&self.sign_transfer(account, nonce)?.raw)
+            .await
+    }
+
+    /// A one-wei transfer from genesis account `account` at `nonce`,
+    /// signed and not sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signer cannot derive or the signature
+    /// fails.
+    pub fn sign_transfer(&self, account: u32, nonce: u64) -> anyhow::Result<Signed> {
         let signer = Self::genesis_signer(account)?;
         let mut tx = TxLegacy {
             chain_id: Some(self.chain_id),
@@ -318,11 +359,21 @@ impl Rpc {
         let envelope: TxEnvelope = tx.into_signed(sig).into();
         let mut raw = Vec::with_capacity(110);
         envelope.encode_2718(&mut raw);
+        Ok(Signed {
+            raw: format!("0x{}", hex(&raw)),
+            hash: format!("{:#x}", envelope.tx_hash()),
+        })
+    }
+
+    /// Submit the signed transaction `raw`. `Ok(Ok(hash))` is an accepted
+    /// submit, `Ok(Err(..))` the ingress's refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the call fails.
+    pub async fn send_raw(&self, raw: &str) -> anyhow::Result<Result<String, RpcError>> {
         let answer = self
-            .call_typed(
-                "eth_sendRawTransaction",
-                serde_json::json!([format!("0x{}", hex(&raw))]),
-            )
+            .call_typed("eth_sendRawTransaction", serde_json::json!([raw]))
             .await?;
         Ok(answer.and_then(|hash| {
             hash.as_str().map(str::to_string).ok_or_else(|| RpcError {
@@ -332,7 +383,14 @@ impl Rpc {
         }))
     }
 
-    async fn await_receipt(&self, hash: &str, budget: Duration) -> anyhow::Result<()> {
+    /// Poll the receipt of `hash` for up to `budget`, and require the
+    /// status `0x1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a call fails, no receipt arrives in time, or
+    /// the status is not `0x1`.
+    pub async fn await_receipt(&self, hash: &str, budget: Duration) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + budget;
         loop {
             match self.receipt_status(hash).await? {
