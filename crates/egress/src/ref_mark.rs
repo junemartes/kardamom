@@ -132,10 +132,14 @@ impl RefMark {
     /// The highest reference of `frames`, in stream order from the block
     /// `next_block`. A record belongs to the block of the next boundary.
     /// `None` when no frame is a reference.
-    pub(crate) fn top(frames: &[Vec<u8>], next_block: u64) -> Option<Self> {
+    pub(crate) fn top<F: AsRef<[u8]>>(
+        frames: impl IntoIterator<Item = F>,
+        next_block: u64,
+    ) -> Option<Self> {
         frames
-            .iter()
+            .into_iter()
             .scan(next_block, |block, frame| {
+                let frame = frame.as_ref();
                 let mark = match Key::of(frame) {
                     Some(Key::Boundary(closed)) => {
                         // No chain reaches block `u64::MAX`, so the cap

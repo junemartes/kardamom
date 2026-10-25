@@ -217,6 +217,76 @@ fn a_restart_reads_the_mark_of_a_reference_in_an_older_segment() {
         REFERENCE,
         "the file holds R plus the lead, and the open reads the exact R from the segments"
     );
+    let mut again = again;
+    again.close().unwrap();
+    assert_eq!(
+        RefMark::read(dir.path()).unwrap(),
+        REFERENCE,
+        "a close after the open writes the exact R over the lead"
+    );
+}
+
+/// A prune deletes the segment of the reference. The open then keeps the
+/// file value minus the lead, not 0.
+#[test]
+fn a_prune_of_the_reference_segment_keeps_the_file_minus_the_lead() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
+    store.append(&with_a_reference()).unwrap();
+    store.append(&[record(6), boundary(6, 7)]).unwrap();
+    store.prune_below(5).unwrap();
+    store.sync().unwrap();
+    drop(store);
+    let again = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
+    assert_eq!(
+        again.mark(),
+        REFERENCE.ahead().behind(),
+        "no segment holds the reference, so the mark is the file minus the lead"
+    );
+    assert_ne!(again.mark(), RefMark::default());
+}
+
+/// A store whose references are in old segments, with an exact file far
+/// above them: the open reads only the segments that can hold a reference
+/// above the file minus the lead.
+#[test]
+fn the_open_reads_no_segment_below_the_file_minus_the_lead() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
+    store.append(&with_a_reference()).unwrap();
+    // A reference far above the old segments, in index and in block.
+    let far = RefMark {
+        index: 200_000,
+        block: 100,
+    };
+    // A record takes the block of the head, so a boundary moves the head
+    // to the block of the far reference first.
+    store.append(&[boundary(far.block - 1, far.index)]).unwrap();
+    store
+        .append(&[ref_record(far.index), boundary(far.block, far.index + 1)])
+        .unwrap();
+    store.close().unwrap();
+    assert_eq!(
+        RefMark::read(dir.path()).unwrap(),
+        far,
+        "a close writes the exact mark"
+    );
+    let segments = Store::list(dir.path()).unwrap();
+    let read = Store::mark_segments(&segments, far.behind());
+    // The segments start at (index, block) (0, 1), (3, 3), (5, 5) and
+    // (6, 100). The first two have a successor at or below the file minus
+    // the lead in both fields, so they cannot hold a reference above it.
+    assert_eq!(segments.len(), 4);
+    assert_eq!(
+        read.iter()
+            .map(|segment| segment.start.next_block)
+            .collect::<Vec<_>>(),
+        [5, 100],
+        "the two oldest segments are not read"
+    );
+    drop(store);
+    let again = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
+    assert_eq!(again.mark(), far);
 }
 
 /// The side file changes only when the mark passes it: a run of
