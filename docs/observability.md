@@ -173,7 +173,9 @@ Four names locate a bottleneck on the transaction path. Every service records th
 | `kardamom_step_seconds` | histogram | `step` | The duration of one step of work. A hot loop records it per batch. |
 | `kardamom_batch_items` | histogram | `batch` | The items in one batch. |
 
-- The busy share of a loop is `busy / (busy + idle + blocked)`. A share near 1 means that the loop is saturated.
+- The busy share of a loop is `busy / max(busy + idle + blocked, 1 s)` for each second. A share near 1 means that the loop is saturated.
+- The sealer service reports only its busy time. The floor of 1 s makes its share the busy time in each second.
+- A loop that reports nothing in a window shows a share of 0, not a gap.
 - `blocked` is time with work but no room on the output: a full queue or a back-pressured publication.
 - A queue that grows sits in front of the bottleneck.
 - A loop adds its time to the counter at most every 100 ms.
@@ -271,7 +273,7 @@ Each dashboard is a JSON file in `deploy/grafana/provisioning/dashboards-json/`.
 | `kardamom-notifier` | The status feed and the webhooks. |
 | `kardamom-canary` | The transaction canary: the success ratio per probe and per endpoint, the failures by outcome, the stage latencies, the last success, the balances, the feed gaps and the stalled accounts. |
 | `kardamom-performance` | Throughput and latency against the two load goals: 10,000 tx/s sustained, and 1,000,000 tx/s with a p99 of 1 ms from submit to the executed receipt. It shows the share of each goal, the rate at each pipeline step, the submit-to-sealed and submit-to-executed percentiles, the canary stages, the step times inside the services, the queues and the back pressure. |
-| `kardamom-availability` | The service levels against a 99.9 % target over the selected range: the canary success and its error budget, the submit success, the chain liveness, the ingress reachability and the validator verdict. Over time: the failures, the head lag of each replica, the scrape targets, the settlement and the sealer leader changes. |
+| `kardamom-availability` | The service levels against a 99.9999 % target over the selected range: the canary success and its error budget, the submit success, the chain liveness, the ingress reachability and the validator verdict. Over time: the failures, the head lag of each replica, the scrape targets, the settlement and the sealer leader changes. |
 | `kardamom-bottlenecks` | The pipeline metrics of every service in path order: the busy and blocked share of each loop, the queue depths, the step p50 and p99, the batch sizes, the latency of each stage, and the misses and retries. |
 
 - A dashboard queries `kardamom`-scoped metrics of its service.
@@ -480,7 +482,7 @@ Each executor exports these metrics for its executor stream (`exec_txs`). See "T
 
 ### Executor input source
 
-With `--carry-bytes` (`KARDAMOM_CARRY_BYTES`, off by default), the executor reads the canonical entries with their bytes from the feed of its paired sealer member, on `aeron:ipc` of the media driver at `--aeron-dir`.
+With `--carry-bytes`, the executor reads the canonical entries with their bytes from the feed of its paired sealer member, on `aeron:ipc` of the media driver at `--aeron-dir`.
 
 - The executor opens no `tx_data` lane, joins nothing and votes no void.
 - It opens no cluster session and sends no recorded cursor. It refuses to start with `--exec-cursor`.
@@ -624,7 +626,7 @@ See "The kept sealer version and the refused reference" in [failure-modes.md](fa
 
 | Metric | Meaning |
 | --- | --- |
-| `kardamom_sequencer_sealer_version{partition}` | The kept decision version of the sealer: the highest version that a session of the process reported, or the floor `--sealer-version-floor` before the first report. At 5, the sequencer offers each transaction with its bytes (record type 7). |
+| `kardamom_sequencer_sealer_version{partition}` | The kept decision version of the sealer: the highest version that a session of the process reported, or the floor `--sealer-version-floor` before the first report. At 5 in the v2 loop, the sequencer offers each transaction with its bytes (record type 7). |
 | `kardamom_sequencer_ref_refused_total{partition}` | The kind-18 frames: the references without bytes that the carry window of the sealer refused. |
 | `kardamom_sequencer_tx_drops_total{reason}` | The drop records on `tx_drops`, by reason. `sealer_refused_reference` counts the drops of a kind-18 frame. |
 
@@ -683,7 +685,7 @@ A ClusteredService cannot see its idle time, so the loop exports busy time only.
 | `kardamom_sealer_window_exact` | 1 when the egress keeps only its replay window, at any posted head. |
 | `kardamom_sealer_decision_version` | The decision version of the open block. |
 | `kardamom_sealer_feature_state{feature}` | Features 3, 4 and 5: 0 no activation held, 1 held and off, 2 on. |
-| `kardamom_sealer_feature_activation_ms{feature}` | The time of the newest held activation of the feature, 0 when none. |
+| `kardamom_sealer_feature_activation_ms{feature}` | The time of the newest held activation of the feature, 0 when none. A held activation with time 0 whose epoch is not sealed yet also reports 0: the time resolves when the activation becomes visible. Use `kardamom_sealer_feature_state` to tell it from no activation. |
 | `kardamom_sealer_feature_unsupported_total` | The activations of feature 5 on a member with the retained file. The member never stores them. |
 | `kardamom_sealer_snapshot_bytes`, `kardamom_sealer_snapshot_version` | The size and the version of the newest snapshot that the member took or restored. |
 | `kardamom_sealer_ref_refused_total` | The references of record type 0 that the carry window refused with egress kind 18. |
@@ -751,13 +753,14 @@ The ingress records these names of the pipeline metrics (see "Pipeline metrics")
 | `ingress.publish_round_trip` | step | The `tx_data` publish: the hop to the blocking pool and the round trip to the Aeron thread up to its ack. |
 | `ingress.recover_batch` | step | The recovery of one verifier batch on the blocking pool, up to the end of its last worker. |
 | `ingress.recover_batch` | batch | The requests in each verifier batch. |
-| `ingress.recover_intake` | queue | The requests that wait in the verifier intake after the flush task takes a batch. The intake holds four times the batch depth; a full intake makes a submit wait. |
+| `ingress.recover_intake` | queue | The requests that queued in the verifier intake while the batch before ran, read when the flush task comes back for the next batch. While the verifier is idle, the gauge holds the last backlog that it read (sample and hold), not a live depth. The intake holds four times the batch depth; a full intake makes a submit wait. |
+| `ingress.recover_wait` | step | The wait of each request from its submit to the take of its batch: the flush window plus the time behind the batch before it. |
 | `ingress.ack_waiters` | queue | The submissions that wait for the verdict of the sequencer (ack at admission). The shed check counts them with `kardamom_ingress_queue_depth`. |
 | `ingress.watermark` | loop | The cluster egress thread. Idle while it waits for an egress event (the receive and the decode), busy while it handles the event. |
 | `ingress.receipt_pump` | loop | The `tx_receipts` pump task. Idle while it waits for a frame, busy while it applies the rows and fans out the receipts. |
 | `ingress.receipt_batch` | batch | The receipts in each `tx_receipts` batch frame. A boundary-only frame adds no sample. |
 
-- A high `ingress.recover` with a low `ingress.recover_batch` step means that submits wait for the intake or the batch window, not for the recovery.
+- A high `ingress.recover` with a low `ingress.recover_batch` step means that submits wait for the intake or the batch window, not for the recovery. `ingress.recover_wait` shows that wait directly.
 - A busy share of `ingress.watermark` near 1 means that the egress frames queue in the cluster client before the thread reads them.
 
 ### Aeron thread
@@ -779,13 +782,16 @@ Each process has one Aeron thread. It carries the publishes and the subscription
 
 | Layer | Outcomes |
 | --- | --- |
-| `receipt` | `hit`, `state_hit`, `miss`, `shed`, `state_error` |
+| `receipt` | `hit`, `state_hit`, `miss`, `shed`, `state_error`, `fallback_hit`, `fallback_miss`, `fallback_error` |
 | `live` | `hit`, `miss` |
 | `redis` | `hit`, `miss`, `error`, `timeout` |
 
 - On the `receipt` layer, a lookup first reads the receipt cache of the ingress. That read is a `hit`.
-- A miss asks an executor for the receipt. The outcome is `state_hit` when the executor has it, `miss` when it has not,
-  and `state_error` when the query fails.
+- A miss asks the receipt query for the receipt: the egress with `--receipt-query-endpoints`, else an executor. The
+  outcome is `state_hit` when it has the receipt, `miss` when it has not, and `state_error` when the query fails.
+- When the egress gives no receipt, the ingress asks an executor. The outcome of that second query is `fallback_hit`,
+  `fallback_miss` or `fallback_error`. A high `fallback_hit` rate means that clients ask for receipts older than the
+  egress index.
 - A client that is over its rate limit gets `shed`, and the ingress answers `null` without a query.
 - The receipt cache keeps the newest 131072 receipts and evicts the oldest first.
 - `kardamom_cache_reconnects_total` counts the Redis reconnects that a failed command started. One failure burst starts one reconnect.
@@ -852,6 +858,7 @@ The egress (`kardamom-egress`) exports these metrics on `--metrics-addr` (`KARDA
 - Any increment of `kardamom_egress_copy_mismatch_total` needs an operator.
 - R is durable. The store keeps it in the side file `ref-mark` of its directory (16 bytes: the index, then the block, little endian), and reads it at start. A restart does not lower R.
   - The store writes the mark of a batch before the frames of the batch. After a crash, R is at or above every reference that the segments hold.
+  - The file holds R plus a lead of 65,536 indexes and 32 blocks. The store writes the file again only when R passes it, about once a minute at 1,000 tx/s. So a batch costs no sync of the mark. A clean stop writes the exact R. After a crash, R is up to that lead above the highest stored reference. The gates of a reader move then wait longer: up to 32 blocks for the gates that compare blocks, and up to 65,536 canonical indexes for the feature-5 upgrade check, which compares the reader cursors with the index of R. At the staging idle rate that is hours. After a crash, copy `ref-mark` from a peer that stopped cleanly, or wait.
   - A start at the floor of a peer keeps the higher of the two marks. The peer sends its mark in the headers `x-egress-ref-mark-index` and `x-egress-ref-mark-block` of its `410` answer.
   - R can stay above the stored references. That only delays the move of a reader to the egress.
   - A corrupt or hostile mark of a peer, for example `u64::MAX`, raises R for good: R never goes down. To recover, stop the egress, then copy `ref-mark` from the store directory of a healthy peer, then start the egress. Delete `ref-mark` only when the store holds no `RT_TXREF` frame.

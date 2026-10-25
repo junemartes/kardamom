@@ -41,6 +41,13 @@ impl LocalStack {
         }
     }
 
+    /// SIGCONT the DA watcher after [`Self::suspend_da_watcher`].
+    pub fn resume_da_watcher(&self) {
+        if let Some(w) = &self.da_watcher {
+            w.proc.resume();
+        }
+    }
+
     /// Freeze the executor (SIGSTOP). Its genuine BAL and receipt
     /// publications stop, so an injected corrupt frame faces no
     /// competition (the divergence-detection test).
@@ -61,7 +68,13 @@ impl LocalStack {
     /// Returns an error when the executor fails to spawn.
     pub fn restart_executor(&mut self) -> Result<()> {
         let port = self.executor.metrics_addr.port();
-        let respawned = services::spawn_executor_at(&self.service_spec(), Some(port))?;
+        let respawned = services::spawn_executor_at(
+            &self.service_spec(),
+            &services::ExecutorRun {
+                metrics_port: Some(port),
+                ..services::ExecutorRun::default()
+            },
+        )?;
         self.executor = respawned;
         Ok(())
     }

@@ -13,7 +13,7 @@ use alloy_primitives::{Address, B256};
 use kardamom_da_watcher::feed::fakes::{ScriptedFeed, ScriptedStream};
 use kardamom_da_watcher::publisher::fakes::{InMemoryEpochPublisher, PublisherTap};
 use kardamom_da_watcher::{
-    DaWatcherConfig, L1ResumeAfter, L1Watcher, MonitorError, ResumeAfterError,
+    DaWatcherConfig, L1ResumeAfter, L1Watcher, MonitorError, PACED_BACKLOG, ResumeAfterError,
 };
 use kardamom_obs::halt::{Clears, HaltCause};
 use kardamom_types::epoch::{DepositLog, LockboxLog, UpgradeLog, source_hash};
@@ -29,12 +29,25 @@ fn watcher(
     L1Watcher<ScriptedFeed, InMemoryEpochPublisher>,
     PublisherTap,
 ) {
+    paced_watcher(stream, after, Duration::ZERO)
+}
+
+/// [`watcher`] with an epoch pace of `pace`.
+fn paced_watcher(
+    stream: &ScriptedStream,
+    after: Option<u64>,
+    pace: Duration,
+) -> (
+    L1Watcher<ScriptedFeed, InMemoryEpochPublisher>,
+    PublisherTap,
+) {
     let (publisher, tap) = InMemoryEpochPublisher::new();
     let config = DaWatcherConfig {
         tick: TICK,
         silence: Duration::from_secs(3600),
         resume_after: after
             .map(|b| L1ResumeAfter::from(NonZeroU64::new(b).expect("a test block is not 0"))),
+        epoch_pace: pace,
     };
     (L1Watcher::new(publisher, stream.feed(), config, None), tap)
 }
@@ -125,6 +138,42 @@ async fn each_record_s_epoch_is_published_unchanged() {
     );
     assert!(epochs[1].deposits[1].is_system_transaction);
     assert!(epochs[0].deposits.is_empty() && epochs[3].deposits.is_empty());
+}
+
+/// A finality step of a few records goes out one epoch per pace, so the
+/// sealer does not seal a burst of blocks. A pass inside the pace
+/// publishes nothing.
+#[tokio::test]
+async fn a_paced_watcher_spreads_a_finality_step() {
+    let stream = ScriptedStream::default();
+    stream.tips(&[100, 103]);
+    let (mut w, tap) = paced_watcher(&stream, None, TICK * 4);
+    w.process_once().await.unwrap();
+    assert_eq!(w.process_once().await.unwrap(), 1);
+    assert_eq!(w.process_once().await.unwrap(), 0, "not before the pace");
+    tokio::time::sleep(TICK * 5).await;
+    assert_eq!(w.process_once().await.unwrap(), 1);
+    tokio::time::sleep(TICK * 5).await;
+    assert_eq!(w.process_once().await.unwrap(), 1);
+    assert_eq!(numbers(&tap), [101, 102, 103]);
+}
+
+/// A backlog larger than [`PACED_BACKLOG`] is a catch-up: it publishes at
+/// full speed, with no pace.
+#[tokio::test]
+async fn a_paced_watcher_publishes_a_catch_up_at_once() {
+    let stream = ScriptedStream::default();
+    let last = 100 + u64::try_from(PACED_BACKLOG).unwrap() + 10;
+    stream.archive_up_to(last - 2);
+    stream.tips(&[last]);
+    let (mut w, tap) = paced_watcher(&stream, Some(100), Duration::from_secs(3600));
+    let first = w.process_once().await.unwrap();
+    assert!(
+        first > 1,
+        "a catch-up of {} records published only {first} at once",
+        last - 100
+    );
+    assert_eq!(numbers(&tap).first(), Some(&101));
 }
 
 /// The second follower instance publishes the same records: the copies

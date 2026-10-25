@@ -11,6 +11,7 @@ use crate::knobs::Knobs;
 
 pub(crate) mod archive;
 pub(crate) mod cache;
+pub mod carry;
 pub(crate) mod chain_status;
 pub(crate) mod cluster;
 pub(crate) mod combined;
@@ -94,6 +95,8 @@ pub enum Case {
     FollowerTotalLoss,
     ExecutorRestartStorm,
     FollowerDisagreement,
+    /// One step of the carry window.
+    Carry(carry::Step),
 }
 
 // A slice, not a fixed-size array: two branches that each add a case
@@ -174,6 +177,7 @@ impl Case {
     pub fn parse(name: &str) -> anyhow::Result<Self> {
         ALL.iter()
             .copied()
+            .chain(carry::STEPS.iter().copied().map(Self::Carry))
             .find(|c| c.name() == name)
             .ok_or_else(|| crate::chaos_fail!("unknown chaos case: {name}"))
     }
@@ -244,6 +248,7 @@ impl Case {
             Self::FollowerTotalLoss => "follower-total-loss",
             Self::ExecutorRestartStorm => "executor-restart-storm",
             Self::FollowerDisagreement => "follower-disagreement",
+            Self::Carry(step) => step.name(),
         }
     }
 
@@ -374,6 +379,7 @@ impl Case {
                     .saturating_add(Duration::from_mins(1))
                     .saturating_mul(fleet::ROUNDS),
             ),
+            Self::Carry(step) => step.floor(k),
             _ => Duration::ZERO,
         };
         k.case_window.max(floor)
@@ -508,6 +514,7 @@ impl Case {
             Self::FollowerTotalLoss => l1::follower_total_loss(h).await,
             Self::ExecutorRestartStorm => fleet::executor_restart_storm(h).await,
             Self::FollowerDisagreement => l1::follower_disagreement(h).await,
+            Self::Carry(step) => step.run(h).await,
         }
     }
 }
@@ -532,6 +539,7 @@ mod tests {
             crate::Shard::L1,
             crate::Shard::Follower,
             crate::Shard::Integrity,
+            crate::Shard::Carry,
         ] {
             shard
                 .cases()

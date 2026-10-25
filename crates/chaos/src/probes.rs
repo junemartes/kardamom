@@ -79,7 +79,8 @@ impl Probed {
 #[derive(Debug, Clone)]
 pub struct Probes {
     scrape: Scrape,
-    /// The executor nodes, by index.
+    /// The nodes of the executors, by index: the executor nodes, or the
+    /// sealer nodes when the executors run there.
     pub executors: Vec<Probed>,
     /// The ingress nodes, by index.
     pub ingresses: Vec<Probed>,
@@ -101,19 +102,20 @@ fn probed(contract: &NodeContract, role: &str) -> Vec<Probed> {
 }
 
 impl Probes {
-    /// The probes of the cluster the contract describes.
+    /// The probes of the cluster the contract describes, with the
+    /// executors on the nodes of `executor_role`.
     ///
     /// # Errors
     ///
     /// Returns an error if the contract has no aux node.
-    pub fn new(contract: &NodeContract) -> anyhow::Result<Self> {
+    pub fn new(contract: &NodeContract, executor_role: &str) -> anyhow::Result<Self> {
         let validator = probed(contract, "aux")
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("node contract has no aux node for the validator"))?;
         Ok(Self {
             scrape: Scrape::new(),
-            executors: probed(contract, "executor"),
+            executors: probed(contract, executor_role),
             ingresses: probed(contract, "ingress"),
             validator,
             sequencers: probed(contract, "sequencer"),

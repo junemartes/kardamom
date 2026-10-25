@@ -89,7 +89,7 @@ jobs:
         env:
           NIGHTLY: ${{ github.event_name == 'schedule' || github.event.action == 'labeled' }}
         run: |
-          regular='"load","chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-combined-ordering","chaos-combined-exec","chaos-retention","chaos-cache","chaos-l1","chaos-follower","semantics"'
+          regular='"load","chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-combined-ordering","chaos-combined-exec","chaos-retention","chaos-cache","chaos-l1","chaos-follower","chaos-carry","semantics"'
           nightly='"chaos-integrity"'
           if [ "$NIGHTLY" = true ]; then
             shards="[$nightly]"
@@ -232,6 +232,12 @@ jobs:
         # an outage past the sealer's retention.
         # chaos-follower runs behind the same lying L1: the loss of one and
         # of both L1 follower instances, and the disagreement of the two.
+        # chaos-carry turns the carry window on in the order of the staging
+        # rollout: the member feed, the executors on the sealer nodes, the
+        # egress, the v2 loop of the sequencers, features 3, 4 and 5 by
+        # upgrade transaction, and the executors to carry mode one at a
+        # time. Then it kills the leader at the switch, turns feature 5
+        # off and on, and restarts an egress instance.
         # chaos-integrity (nightly) stops and restores the executor job ten
         # times under load; every executor must advance after each round.
         # The build job picks the list (see "Pick the shards").

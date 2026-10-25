@@ -178,7 +178,12 @@ public final class VersionSwitch {
         return List.of(
             v4.feature(FEATURE_SEALER_V4, version >= ON_VERSION),
             carry.feature(FEATURE_SEALER_V5, version == CARRY_VERSION),
-            window.feature(FEATURE_CARRY_WINDOW, carryWindow));
+            windowFeature());
+    }
+
+    /** The state of the carry window, for the admin endpoint. */
+    public Feature windowFeature() {
+        return window.feature(FEATURE_CARRY_WINDOW, carryWindow);
     }
 
     /** The newest held activation of either feature, as a value, for the admin endpoint. */
@@ -216,7 +221,7 @@ public final class VersionSwitch {
         if (schedule == window && fileStore) {
             return Outcome.UNSUPPORTED;
         }
-        if (schedule == carry && version < ON_VERSION || schedule == window && version != CARRY_VERSION) {
+        if ((schedule == carry && version < ON_VERSION) || (schedule == window && version != CARRY_VERSION)) {
             return Outcome.EARLY;
         }
         if (schedule.held == MAX_HELD) {
@@ -424,7 +429,7 @@ public final class VersionSwitch {
         /** The state of this feature, which is on when {@code on}, with its newest held activation. */
         Feature feature(final long id, final boolean on) {
             if (held == 0) {
-                return new Feature(id, Feature.NONE, 0L, 0L);
+                return Feature.none(id);
             }
             return new Feature(id, on ? Feature.ON : Feature.HELD_OFF, origins[held - 1], times[held - 1]);
         }
@@ -498,5 +503,10 @@ public final class VersionSwitch {
         public static final int HELD_OFF = 1;
         /** The feature is on. */
         public static final int ON = 2;
+
+        /** Feature {@code id} with no held activation. */
+        public static Feature none(final long id) {
+            return new Feature(id, NONE, 0L, 0L);
+        }
     }
 }

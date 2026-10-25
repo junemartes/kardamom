@@ -49,7 +49,7 @@ Every chaos case follows the same steps.
 
 ## Shards
 
-There are fourteen shards. `just container-test` lists their names. Thirteen run on every pull request. `chaos-integrity` runs nightly.
+There are fifteen shards. `just container-test` lists their names. Fourteen run on every pull request. `chaos-integrity` runs nightly.
 
 | Shard | Cases, in run order | Shard settings |
 |---|---|---|
@@ -67,17 +67,19 @@ There are fourteen shards. `just container-test` lists their names. Thirteen run
 | `chaos-cache` | `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze`, `mirror-kill-rebuild` | `RUN_LOAD=0` |
 | `chaos-l1` | `l1-liar`, `l1-null-receipts`, `two-day-outage`, `batcher-outage-past-retention` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
 | `chaos-follower` | `follower-instance-loss`, `follower-total-loss`, `follower-disagreement` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
+| `chaos-carry` | `carry-versions-on`, `carry-full-ref-below-v5`, `carry-readers-on-egress`, `carry-window-on`, `carry-executor-first`, `carry-executors-rest`, `carry-window-off-on`, `carry-leader-kill-at-switch`, `carry-egress-restart` | `RUN_LOAD=0`, retention 16384, snapshot interval 60 s, the member feed and the executors on the sealer nodes (`KARDAMOM_EXEC_ON_SEALERS=on`), the frames of the executors and the egress, the v2 loop of the sequencers (`KARDAMOM_SEQUENCER_ADMISSION=on`) |
 | `chaos-integrity` (nightly) | `executor-restart-storm` | `RUN_LOAD=0` |
 
-Case order matters in five places.
+Case order matters in six places.
 
 - `resize-scale-out-in` runs last in `chaos-sequencer`. A resize leaves the shard map at a later version.
 - `sealer-fleet-total-wipe-recover` runs last in `chaos-fleet`. It restarts the chain from a state rebuilt from L1, the longest recovery. A failure there must not hide the other cases.
 - `pipeline-blackout-recover` runs last in `chaos-coordinated`. It can leave an entry that no archive serves.
 - `mirror-kill-rebuild` runs last in `chaos-cache`. It flushes the projection.
 - `executor-sealer-loss-recover` runs first in `chaos-combined-exec`. The persisted-state audit runs after it, before the other cases build on the state it leaves.
+- `chaos-carry` runs the order of the staging rollout. Each case needs the cases before it.
 
-`chaos-l1` and `chaos-follower` run the persisted-state audit after every case, not only at the end of the shard. Each case leaves a DA record that a silent gap could hide in. `chaos-combined-exec` runs it after `executor-sealer-loss-recover`: the executor nodes and the sealer nodes die at once, so the state every executor kept is compared with the validator's before the next case.
+`chaos-l1` and `chaos-follower` run the persisted-state audit after every case, not only at the end of the shard. Each case leaves a DA record that a silent gap could hide in. `chaos-combined-exec` runs it after `executor-sealer-loss-recover`: the executor nodes and the sealer nodes die at once, so the state every executor kept is compared with the validator's before the next case. `chaos-carry` runs it after `carry-executor-first`: it compares the executor in carry mode with the two executors in reference mode and the validator.
 
 After each of these audits, the next case waits until the chain runs again. See [Recovery after an audit](#recovery-after-an-audit).
 
@@ -207,6 +209,20 @@ The executors are dark in every case, so the head the judgement reads is the hig
   - The sealer keeps every frame above the posted head. The batcher normally gets its replay served.
   - A sealer that prunes by the window alone refuses the replay. The batcher then rebuilds the gap.
   - In both cases the L1 record must be contiguous.
+
+**Carry shard**
+
+The cases turn the carry window on in the order of the staging rollout, then make faults around its switch. See [Carry mode](failure-modes.md#carry-mode-the-executor-next-to-its-member) and [L1-governed upgrades](failure-modes.md#l1-governed-upgrades-feature-flags). Each upgrade transaction goes to the lockbox from the dev owner, after `just sealer-upgrade-check` passes for it. The harness then mines 66 L1 blocks, so the L1 follower reads the transaction as final.
+
+- `carry-versions-on`: deploys a lockbox with `kardamom-deploy`, and deploys again with `LOCKBOX_ADDRESS`. Then features 3 and 4. Every member must report decision version 5, and every sequencer replica must keep it.
+- `carry-full-ref-below-v5`: makes a full reference below version 5 on purpose. The upgrade transaction that turns feature 4 off with a later activation is final on L1 first. Then a probe sender sends nonce `n + 1`, and the v2 loop holds it with its bytes while its lane still keeps version 5. When every member runs version 4, the hold must still be there (else the case reports that the park expired), and nonce `n` releases the held nonce. Both must get a receipt, and `kardamom_sealer_full_ref_below_v5_total` must rise on every member. Feature 4 then turns on again.
+- `carry-readers-on-egress`: waits until the batcher and the validator are past the block of R, the highest stored reference of the egress. Then it deploys them on the egress, with the sequencer version floor 5. Their egress cursors must pass R, and R must not move.
+- `carry-window-on`: stops a follower, sends feature 5, and starts the follower after the two other members switch. Every member must then report `carryWindow`, the feature state 2, the window gauge 1 and at most `retention` frames. No member may refuse a reference.
+- `carry-executor-first`: moves executor 0 to carry mode (`KARDAMOM_CARRY_EXECUTORS=0`). It must log that it reads the member feed, the feed of member 0 must serve it live, and the chain must advance.
+- `carry-executors-rest`: moves executor 1, then executor 2, in the same way, one deploy each. Then the smoke gate.
+- `carry-window-off-on`: turns feature 5 off and on again. Each state must hold on every member.
+- `carry-leader-kill-at-switch`: turns feature 5 off, then on, and kills the leader within 2 s after it reports the switch. The first read of the leader must report the window off, so the switch came less than one 100 ms poll before the read that saw it. The cluster must elect, every member must keep the window, and the chain must advance.
+- `carry-egress-restart`: kills one egress instance. It must return with the same R, and the egress cursors of the batcher and the validator must move on.
 
 **Integrity shard (nightly)**
 

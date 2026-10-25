@@ -90,7 +90,18 @@
           'JobVersion': workloads_revert_before,
           'EnforcePriorVersion': workloads_revert_enforce | int,
           'Namespace': workloads_namespace} }}
+  register: workloads_revert_response
   changed_when: true
+  when:
+    - workloads_revert_before is not none
+    - not workloads_revert_done | bool
+    - not workloads_revert_staged | bool
+
+# The wait follows the evaluation of the revert (wait.yml).
+- name: Keep the evaluation of the revert of {{ workloads_revert_job }}
+  ansible.builtin.set_fact:
+    workloads_register_evals: >-
+      {{ workloads_register_evals | default({}) | combine({workloads_revert_job: workloads_revert_response.json.EvalID}) }}
   when:
     - workloads_revert_before is not none
     - not workloads_revert_done | bool

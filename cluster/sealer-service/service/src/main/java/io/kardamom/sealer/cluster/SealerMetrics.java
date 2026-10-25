@@ -43,30 +43,24 @@ final class SealerMetrics {
     /**
      * The rules of the open block, for the admin thread: the store of the
      * retained frames, whether the egress keeps only its replay window, the
-     * decision version, whether the rules of the carry window apply, and
-     * the state of each feature. The service sets a new value at the start
-     * and at each change.
+     * decision version, whether the rules of the carry window apply, the
+     * state of each feature, and the state of the carry window. The
+     * service sets a new value at the start and at each change.
      */
     record Rules(
             boolean fileStore,
             boolean windowExact,
             int decisionVersion,
             boolean carryWindow,
-            List<VersionSwitch.Feature> features) {
+            List<VersionSwitch.Feature> features,
+            VersionSwitch.Feature window) {
         /** The rules before the start. */
-        static final Rules START = new Rules(false, false, VersionSwitch.OFF_VERSION, false, List.of());
+        static final Rules START = new Rules(false, false, VersionSwitch.OFF_VERSION, false, List.of(),
+            VersionSwitch.Feature.none(VersionSwitch.FEATURE_CARRY_WINDOW));
 
         /** The store of the retained frames: {@code heap} or {@code file}. */
         String retainedStore() {
             return fileStore ? "file" : "heap";
-        }
-
-        /** The state of the carry window. */
-        VersionSwitch.Feature window() {
-            return features.stream()
-                .filter(f -> f.id() == VersionSwitch.FEATURE_CARRY_WINDOW)
-                .findFirst()
-                .orElse(new VersionSwitch.Feature(VersionSwitch.FEATURE_CARRY_WINDOW, VersionSwitch.Feature.NONE, 0L, 0L));
         }
     }
 
@@ -307,7 +301,7 @@ final class SealerMetrics {
             .single("kardamom_sealer_feature_unsupported_total", "counter",
                 "The activations of the carry window on a member with the retained file.", featureUnsupported.get())
             .single("kardamom_sealer_feed_state", "gauge",
-                "The state of the member feed: 0 off, 1 idle, 2 walking, 3 live, 4 gapped.", feed.ordinal());
+                "The state of the member feed: 0 off, 1 idle, 2 walking, 3 live, 4 gapped.", feed.value());
         text.family("kardamom_sealer_feature_state", "gauge",
             "The state of each feature: 0 no activation held, 1 held and off, 2 on.");
         now.features().forEach(f -> text.sample("kardamom_sealer_feature_state", featureLabel(f), f.state()));

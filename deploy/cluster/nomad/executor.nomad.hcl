@@ -456,7 +456,11 @@ job "executor" {
             var.exec_frames == "on" ? ["--exec-frames"] : [],
             # Carry mode: the member feed on the shared driver of this node
             # (--aeron-dir above), and the egress as the second source.
-            group.value.carry ? ["--carry-bytes", "--egress", var.egress_url] : [],
+            # Without a URL a carry executor has no egress source: a cursor
+            # below the window of its member goes to a peer checkpoint. The
+            # deploy refuses a carry executor without the URL.
+            group.value.carry ? ["--carry-bytes"] : [],
+            group.value.carry && var.egress_url != "" ? ["--egress", var.egress_url] : [],
           )
         }
 

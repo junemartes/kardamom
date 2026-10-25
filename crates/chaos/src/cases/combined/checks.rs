@@ -12,14 +12,12 @@ use crate::cases::coordinated::assert_no_ref_below_floor;
 use crate::cases::da_watcher::assert_no_origin_gap;
 use crate::evidence::number_after;
 use crate::harness::Harness;
-use crate::poll::{self, Budget, Outcome};
-use crate::probes::{DA_WATCHER_PORT, Probed};
+use crate::poll::{self, Budget};
+use crate::probes::Probed;
 use crate::rpc::Rpc;
 
-/// The da-watcher's count of epochs it published again. A lost epoch
-/// moves it when the da-watcher fills the gap. The sequencer's
-/// origin-gap counter is not a baseline: it resets with the sequencer.
-const EPOCHS_REPUBLISHED: &str = "kardamom_da_watcher_epochs_republished_total";
+use super::refill::RefillBaseline;
+
 /// The ingress reader counter, by layer and outcome. The receipt layer
 /// counts a `state_hit` when a receipt the memory cache does not hold
 /// comes from an executor's state DB.
@@ -38,67 +36,12 @@ const SEALER_MEMBERS: u64 = 3;
 /// How long a receipted transfer gets to execute before the fault.
 const TRANSFER_BUDGET: Duration = Duration::from_secs(60);
 
-/// The counter that rises when a lost epoch is filled again. `None` when
-/// the exporter did not answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Refills {
-    pub(super) republished: Option<i64>,
-}
-
-impl Refills {
-    pub(super) async fn read(h: &Harness) -> Self {
-        Self {
-            republished: h
-                .probes
-                .aux_metric_where(DA_WATCHER_PORT, EPOCHS_REPUBLISHED, "")
-                .await,
-        }
-    }
-
-    /// Whether the counter rose from `self` to `now`.
-    pub(super) fn rose_to(self, now: Self) -> bool {
-        self.republished
-            .zip(now.republished)
-            .is_some_and(|(a, b)| b > a)
-    }
-
-    pub(super) fn describe(self) -> String {
-        self.republished
-            .map_or("republished ?".to_string(), |v| format!("republished {v}"))
-    }
-
-    /// The counter rises past this baseline within the budget: the
-    /// da-watcher published a lost epoch again.
-    async fn assert_rose(self, h: &Harness, ctx: &str) -> anyhow::Result<()> {
-        let outcome = poll::until(Budget::secs(60, 3), |_| async move {
-            let now = Self::read(h).await;
-            Ok::<_, anyhow::Error>(self.rose_to(now).then_some(now))
-        })
-        .await?;
-        let now = match outcome {
-            Outcome::Ready { value, .. } => value,
-            Outcome::TimedOut { elapsed } => {
-                return Err(crate::chaos_fail!(
-                    "{ctx}: no epoch was published again within {}s ({} -> {})",
-                    elapsed.as_secs(),
-                    self.describe(),
-                    Self::read(h).await.describe()
-                ));
-            }
-        };
-        crate::log(format!(
-            "{ctx}: a lost epoch was filled again ({} -> {})",
-            self.describe(),
-            now.describe()
-        ));
-        Ok(())
-    }
-}
-
 /// What the checks compare against: the readings before the fault, and
 /// the transfer a check asks the receipt of after it.
 pub(super) struct Baseline {
-    refills: Refills,
+    /// The counters and the runs of the da-watcher, when a check asks
+    /// for a refill.
+    refill: Option<RefillBaseline>,
     /// The finished rebuilds in the state-mirror logs.
     rebuilds: usize,
     /// A transfer receipted through ingress-0 before the fault. Its
@@ -118,8 +61,13 @@ impl Baseline {
         } else {
             None
         };
+        let refill = if checks.contains(&Check::EpochRefill) {
+            Some(RefillBaseline::read(h).await?)
+        } else {
+            None
+        };
         Ok(Self {
-            refills: Refills::read(h).await,
+            refill,
             rebuilds: mirror_rebuilds(h).await?,
             receipted,
         })
@@ -134,6 +82,17 @@ impl Baseline {
             "{ctx}: transfer {hash} receipted before the fault; only the memory caches of the ingresses hold its receipt"
         ));
         Ok(hash)
+    }
+
+    /// The da-watcher filled a lost epoch again.
+    async fn assert_refill(&self, h: &Harness, ctx: &str) -> anyhow::Result<()> {
+        self.refill
+            .as_ref()
+            .ok_or_else(|| {
+                crate::chaos_fail!("{ctx}: no refill baseline was read before the fault")
+            })?
+            .assert(h, ctx)
+            .await
     }
 
     /// Every restarted ingress serves the receipt of the transfer from
@@ -387,7 +346,7 @@ impl Check {
             Self::OneLeaderPerTerm => Terms::parse(&h.evidence.cluster_logs().await?)
                 .assert_one_leader(ctx, SEALER_MEMBERS),
             Self::NoRefBelowFloor => assert_no_ref_below_floor(h, ctx).await,
-            Self::EpochRefill => baseline.refills.assert_rose(h, ctx).await,
+            Self::EpochRefill => baseline.assert_refill(h, ctx).await,
             Self::ReceiptFromState => baseline.assert_receipt_from_state(h, ctx).await,
             Self::EveryMirrorRebuilt => wait_every_mirror_rebuilt(h, ctx, baseline.rebuilds).await,
             Self::ReadersRecovered => wait_readers_recovered(h, ctx).await,

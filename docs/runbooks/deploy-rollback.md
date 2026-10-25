@@ -80,11 +80,21 @@ deploy succeeded and the release degrades the chain after it.
 4. When it refuses with `is already rolled back`, the record holds no older
    versions. A deeper rollback is a deploy of an older manifest:
    `DIGEST_MANIFEST=<file> just deploy`.
-5. When the sealer reverse roll stops with `The sealer has no settled leader
+5. When the rollback refuses with `the sealer members <groups> do not run`,
+   or the sealer reverse roll stops with `The sealer has no settled leader
    or a member is down`, a member of the release does not run. The roll
    needs every member and one leader. Do not revert the whole cluster job:
-   it replaces the members at once and the cluster loses its quorum. Bring
-   the member back, or follow `sealer-fleet-rebuild.md`.
+   it replaces the members at once and the cluster loses its quorum. When
+   the member crash-loops on the release, name its group:
+
+   ```sh
+   KARDAMOM_ALLOW_SEALER_DOWN=<groups> just rollback <env>
+   ```
+
+   The snapshot check does not read the snapshots of those members. The
+   reverse roll rolls them first, then the followers, then the leader. A
+   down member that the variable does not name is still refused. Otherwise,
+   bring the member back, or follow `sealer-fleet-rebuild.md`.
 6. A job whose registered definition already equals the pre-release
    version is done: Nomad reverted it itself (`auto_revert` on the ingress
    and the sequencer), or an earlier run of the rollback did. The play
@@ -131,6 +141,13 @@ On a genesis without the `KardamomChainState` code (the staging genesis), the fi
 - `just sealer-upgrade-check <env> <feature> <activation_ms>` refuses the upgrade transaction until every live allocation of the executor and validator jobs runs a job version with the meta `chain_state_install`.
 - The prover's zk guest links the install too. Roll the prover and its verifying key before the first upgrade transaction.
 
+### A deploy onto a purged sealer
+
+A coordinated restart purges the sealer job. Nomad then does not know the job, and the snapshot check has no member to read, so it skips. The members keep their snapshots on disk. No check refuses a release that cannot read them.
+
+- Before you deploy onto a purged sealer, read `reads_max` of the `sealer-snapshot` entry in `formats.toml` of the release that ran before the purge. A feature activation or a flag can make its members write any version up to it.
+- Deploy a release whose `reads_max` is at or above that version. A member of a release that reads less stops at its first restore.
+
 ## Clear
 
 The rollback writes the record: the attempt gets `status: rolled_back`, and
@@ -161,14 +178,22 @@ with `Refused:`.
 | `KARDAMOM_ALLOW_RETIRED names <ids>, and the release retires no format of that id ...` | A stale allowance, or a shared or permanent format. | Unset it, or remove the id. |
 | `a rolling deploy cannot change a sealer setting that every member must match: <settings>` | A change of `daLagBudgetBlocks`, `voidVoters`, `remoteOrigins`, `orderingWindow` or another setting of the list. | A coordinated restart of the sealer. A documented procedure, such as the return from a seeded start, names the settings in `KARDAMOM_ALLOW_MUST_MATCH=<settings>`. |
 | `config/shard-map.toml ... differs from the shard map of the registered ingress` | A routing change in the rolling path. | `kardamom-cluster scale-sequencers`. |
-| `the target release reads sealer snapshots only up to version <N> ..., and these sealer members hold a newer snapshot: <member> at version <M>` | The `snapshotLatest` of a member is above the sealer snapshot `reads_max` in the `formats.toml` of the target. After the roll that member cannot restore its own snapshot, and stops. | Deploy a release that reads snapshot version `<M>`. Do not roll the sealer back below it. Fix forward. |
-| `the sealer members <members> do not run, so the gate cannot read the version of their newest snapshot` | The release changes the sealer job, and a configured sealer member has no running allocation. A release that does not change the sealer job passes. | Start the member and let it catch up, then deploy. When the member cannot restore its snapshot, follow `sealer-fleet-rebuild.md`. |
+| `the sealer release of revision <rev> reads sealer snapshots only up to version <N> ..., and these sealer members hold a newer snapshot: <member> at version <M>` | The `snapshotLatest` of a member is above the sealer snapshot `reads_max` in `formats.toml` at the revision of the target sealer. After the restart that member cannot restore its own snapshot, and stops. `just rollback` refuses the same way, before its first revert. | Deploy a release that reads snapshot version `<M>`. Do not roll the sealer back below it. Fix forward. |
+| `the checkout ... holds no formats.toml at the revision "<rev>" of the sealer release` | The check reads `formats.toml` at the revision of the sealer release, and the checkout does not hold that revision. | Fetch the revision into the checkout, then run again. |
+| `the sealer members <members> do not run, so the check cannot read the version of their newest snapshot` | The release changes the sealer job, or `just rollback` rolls the sealer back, and a configured sealer member has no running allocation. A release that does not change the sealer job passes. | Start the member and let it catch up, then deploy. When the member crash-loops on the release that it runs, and the run restarts it on a release that it can start on, set `KARDAMOM_ALLOW_SEALER_DOWN=<groups>`. The staged roll then rolls those members first. When the member cannot restore its snapshot, follow `sealer-fleet-rebuild.md`. |
+| `KARDAMOM_ALLOW_SEALER_DOWN names <groups>, and no such sealer member is down` | A stale allowance. | Unset it, or remove the group. |
+| `no deploy record names the sealer image <image>, it is not the registered sealer, and its tag names no release revision` | The gate takes the revision of the target sealer from a deploy record of its image, from the checkout for the registered image, or from the image tag (`main-<12 hex>` or `vX.Y.Z`). An image of a release two or more back with another tag has none of these. | Set `KARDAMOM_REVISION` to the revision of that image, then deploy. |
+| `the sealer release has no revision` | The revision of the sealer release is empty or `unknown`: a deploy outside a git or jj checkout, or a deploy record without `before.revision`. | For a deploy, set `KARDAMOM_REVISION`. For a rollback, deploy the release before by its manifest with `KARDAMOM_REVISION` set to its revision. |
 | `the target lowers the sealer retention from <old> to <new> frames` | A rolling deploy only raises `KARDAMOM_CLUSTER_RETENTION`. A member with the lower window answers more cursors with `REPLAY_UNAVAILABLE`. | Keep the value, or raise it. Lower it only on purpose: `KARDAMOM_ALLOW_MUST_MATCH=retention just deploy`. |
 | `the sealer retention <n> frames at the mean frame size of the members ... is above the cap of 50331648 bytes` | A replay of the whole window would pass the 64 MiB backlog limit of a cluster session. | Set at most the value that the message names. A higher rate needs the retained file or a change to the replay path. |
 | `KARDAMOM_SEALER_VERSION_FLOOR is <n>, and Nomad does not know the sealer job` | A new chain starts on decision version 3. | Deploy a new chain with the floor 0. |
 | `the sealer members <members> do not run, so the gate cannot read their decision version` | The floor changes, and a member has no running allocation. | Start the member and let it catch up, then deploy. |
 | `KARDAMOM_SEALER_VERSION_FLOOR is <n>, and a sealer member runs decision version <v>` | A floor above the lowest `decisionVersion` of the members. | Set the floor to the lowest `decisionVersion`. Before a fleet rebuild from a seed, set 0. |
 | `the <job> job does not run a relayed full reference (job meta relayed_full_ref)` | A floor above 0 needs every executor, validator, batcher and egress of the release that reads a relayed full reference. | Deploy the release to every reader with the floor 0 first. |
+| `KARDAMOM_SEALER_VERSION_FLOOR is <n>, and the target runs the v1 loop of the sequencers` | The v1 loop offers record type 0 at every floor, so the floor changes nothing. | Deploy with `KARDAMOM_SEQUENCER_ADMISSION=on` first, then set the floor. |
+| `the sequencer job does not run the v2 loop, the only loop that offers the bytes of a transaction (job meta v2_loop)` | The registered sequencers run the v1 loop. The floor gate and the upgrade check of feature 5 refuse. | Deploy with `KARDAMOM_SEQUENCER_ADMISSION=on`, and wait until every live allocation runs that job version. |
+| `the target turns the v2 loop of the sequencers off ..., and a member holds the carry window` | A deploy without `KARDAMOM_SEQUENCER_ADMISSION=on`, while the registered sequencer job carries `v2_loop`, and a member reports `carryWindow` true or holds feature 5. The v1 loop offers record type 0, and the sealer refuses every such transaction. | Keep `KARDAMOM_SEQUENCER_ADMISSION=on`. To turn it off on purpose, for example after feature 5 went off, set `KARDAMOM_ALLOW_MUST_MATCH=admission`. |
+| `Nomad does not know the <reader> job, the deploy starts it on the egress (--egress), and the egress holds a reference` | A new reader has no block to read against R. A new chain stores references too, under decision versions 3 and 4. | Deploy the reader on the cluster egress first, then switch it. |
 | `the egress job does not keep the mark of the highest stored reference (job meta ref_mark)` | An egress of an older release runs, for example after a rollback of the egress. Its mark of the highest stored reference can be too low. | Deploy the release of the egress. Then follow "After a rollback of the egress" in `carry-window-rollout.md`. |
 | `an egress instance does not report its reference mark` | The gate needs R from every egress instance, and one does not answer on its metrics port. | Bring the instance back, then deploy. |
 | `the <reader> moves to the egress, and its block <blocks> ... is not above the block <b> of the last stored reference` | Below that block the egress range holds a reference that the reader cannot join. | Wait until the reader passes the block, then deploy. |
@@ -193,7 +218,7 @@ The upgrade check (`just sealer-upgrade-check`) refuses with these messages too:
 | `feature 5 needs decision version 5 on every member` | Features 3 and 4 are not on. A member below version 5 ignores the record (`EARLY`). | Activate features 3 and 4 first. |
 | `feature 5 needs the retained frames on the heap of every member` | A member with the retained file never stores the record (`UNSUPPORTED`). | The chain cannot take feature 5. |
 | `the sequencer job does not keep the highest sealer version across its sessions (job meta sealer_version_kept)` | A sequencer of an older release runs. It can send a reference without bytes after a new session. | Deploy the release to every sequencer. |
-| `the <reader> job does not read the canonical stream from the egress (job meta reads_egress)` | The batcher or the validator still reads the cluster egress. Under the carry window it gets `REPLAY_UNAVAILABLE` below the window. | Do step 4 of `carry-window-rollout.md` first. |
+| `the <reader> job does not read the canonical stream from the egress (job meta reads_egress)` | The batcher or the validator still reads the cluster egress. Under the carry window it gets `REPLAY_UNAVAILABLE` below the window. | Do step 5 of `carry-window-rollout.md` first. |
 | `the egress job does not keep the mark of the highest stored reference (job meta ref_mark)` | An egress of an older release runs. | Deploy the release of the egress. Then follow "After a rollback of the egress" in `carry-window-rollout.md`. |
 | `an egress instance does not report its reference mark` | An egress instance does not answer on its metrics port. | Bring the instance back, then run the check again. |
 | `the <reader> cursors <cursors> ... are not all above the index <r> of the last stored reference` | A reader cursor at or below R can still meet a reference in the egress range. | Wait until every reader passes R. |

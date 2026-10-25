@@ -602,5 +602,13 @@ mod tests {
             toml::from_str(&raw).expect("deployed sequencer.toml.tpl parses");
         cfg.validate()
             .expect("deployed sequencer.toml.tpl validates");
+        // The job appends this table with its `admission` switch on
+        // (`deploy/cluster/nomad/sequencer.nomad.hcl`).
+        let v2 =
+            format!("{raw}\n[admission]\nenabled = true\nmax_parked = 512\nmax_forwarded = 512\n");
+        let cfg: SequencerConfig = toml::from_str(&v2).expect("the v2 table parses");
+        cfg.validate().expect("the v2 table validates");
+        assert!(cfg.admission.enabled);
+        assert_eq!(cfg.admission.max_forwarded.get(), 512);
     }
 }

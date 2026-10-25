@@ -59,7 +59,24 @@ pub struct DaWatcherConfig {
     /// sealer's origin, or after the block in the cursor file, or, with
     /// neither, anchors at the first record of the stream.
     pub resume_after: Option<L1ResumeAfter>,
+    /// The pause between two epochs of one finality step. L1 finalizes a
+    /// whole epoch of slots at once, so up to 32 records arrive together,
+    /// and each epoch seals its own L2 block. Published at once, they make
+    /// a burst of blocks that the executors commit one after another, and
+    /// the transactions behind the burst wait for their receipts. A pace
+    /// spreads the burst. A backlog larger than [`PACED_BACKLOG`] (a
+    /// catch-up after a restart) is not paced. Zero publishes at once.
+    /// The pace must stay below the 4 s gather window of the validator's
+    /// epoch check, or each epoch of a step becomes its own range there.
+    /// An epoch that waits for the pace stays in the inbox, not in the
+    /// publish window, so the pace causes no re-publish.
+    pub epoch_pace: Duration,
 }
+
+/// The largest backlog of records that [`DaWatcherConfig::epoch_pace`]
+/// spreads: two finality steps. A larger backlog is a catch-up, and it
+/// publishes at full speed.
+pub const PACED_BACKLOG: usize = 64;
 
 /// Why a record stops the watcher. A chain break and a disagreement also
 /// raise the watcher's halt (see [`MonitorError::halt`]).
@@ -157,6 +174,8 @@ pub struct L1Watcher<F, P> {
     feed: F,
     publisher: P,
     tick: Duration,
+    /// See [`DaWatcherConfig::epoch_pace`].
+    pace: Duration,
     position: Position,
     confirmation: Confirmation,
     cursor_file: Option<CursorFile<L1Cursor>>,
@@ -169,7 +188,8 @@ pub struct L1Watcher<F, P> {
     wanted: Option<Wanted>,
     /// No history read before this instant.
     history_at: Option<Instant>,
-    /// No publish before this instant: the last one failed.
+    /// No publish before this instant: the last one failed, or the pace
+    /// spreads a finality step.
     retry_at: Option<Instant>,
     /// An operator halt stands: the watcher takes no record until the
     /// clear.
@@ -191,6 +211,7 @@ impl<F: BlockFeed, P: EpochPublisher> L1Watcher<F, P> {
             feed,
             publisher,
             tick: config.tick,
+            pace: config.epoch_pace,
             position: Position::Tip,
             confirmation: Confirmation::Publish,
             cursor_file,
@@ -415,6 +436,7 @@ impl<F: BlockFeed, P: EpochPublisher> L1Watcher<F, P> {
                 ControlFlow::Continue(())
             }
             () = Self::sleep_until(due) => Self::report_republish(&self.republish_due()),
+            () = Self::sleep_until(self.retry_at) => ControlFlow::Continue(()),
             _ = housekeeping.tick() => {
                 self.housekeep();
                 ControlFlow::Continue(())

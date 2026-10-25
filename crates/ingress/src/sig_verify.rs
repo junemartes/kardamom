@@ -25,6 +25,7 @@ use alloy_consensus::TxEnvelope;
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_primitives::{Address, B256, Bytes, keccak256};
 use kardamom_obs::pipeline::{Batch, Queue, Step};
+use nonzero_ext::nonzero;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -53,6 +54,8 @@ struct VerifyRequest {
     env: TxEnvelope,
     raw_tx: Bytes,
     respond: oneshot::Sender<Result<(Address, B256), IngressError>>,
+    /// When the caller submitted it, for the wait before its batch.
+    queued: Instant,
 }
 
 impl VerifyRequest {
@@ -80,7 +83,8 @@ impl RequestCursor {
 
     /// Take the next request off the cursor. The lock guard dies with
     /// this call, before the caller starts recovery, so a worker never
-    /// holds the shared cursor lock across the 42µs of ECDSA work.
+    /// holds the shared cursor lock across the ECDSA work (42 µs in the
+    /// bench, 76-120 µs under load on staging).
     fn next(&self) -> Option<VerifyRequest> {
         self.requests.lock_ignore_poison().next()
     }
@@ -103,13 +107,30 @@ impl RequestCursor {
 /// slot, at almost no extra cost next to the ECDSA work. On failure, the
 /// caller rejects the tx at the RPC boundary.
 ///
-/// A batch smaller than this threshold is recovered on a single blocking
-/// thread. Each extra worker costs a wake of a pool thread, and on a
-/// shared 4-vCPU node a wake costs about as much as several recoveries.
-/// 16 recoveries are about 0.7 ms of work, enough to pay for the wakes. At deployed rates, the ring almost always
-/// holds one transaction (a 50µs window at 3.8k tx/s sees 0.2 arrivals on
-/// average), so this is the common path.
-const PARALLEL_THRESHOLD: usize = 16;
+/// The fewest recoveries that one blocking worker gets. A batch of `n`
+/// requests uses `n / MIN_PER_WORKER` workers, at most the parallelism and
+/// at least one.
+///
+/// Each extra worker costs the wake of a pool thread. A worker pays for its
+/// wake only when its share of the work costs more than the wake. Staging
+/// measured these costs on a shared 4-vCPU node under load:
+/// - One recovery: 76-120 µs.
+/// - The fixed cost of a batch (a wake): 0.17-0.30 ms.
+///
+/// A split over two workers saves at most half of the work, that is the
+/// share of the second worker:
+/// - A batch of 4 saves 2 recoveries, 0.15-0.24 ms. That is not more than
+///   the wake, so 4 is break-even or a loss.
+/// - In the worst case a worker needs 0.30 ms / 76 µs = 3.9 recoveries to
+///   pay for its wake. So 5 is the first count with a margin.
+/// - A batch of 10 on two workers saves 5 recoveries, 0.38-0.60 ms. That
+///   is more than the wake in every measured case.
+///
+/// A load that sends in bursts every 10 ms makes batches of about 10 at
+/// 1,700 tx/s, so the common batch splits over two workers. The rule is
+/// per worker, not per batch. So on an 8-core node a batch of 10 also
+/// wakes 2 workers, not 4.
+const MIN_PER_WORKER: NonZeroUsize = nonzero!(5usize);
 
 /// Intake capacity, as a multiple of the ring depth. A full intake
 /// makes `recover` wait, so overload turns into backpressure on the RPC
@@ -144,8 +165,13 @@ struct FlushMeters {
     /// The recovery of one batch on the blocking pool, from the hop to the
     /// end of its last worker.
     recover: Step,
-    /// The requests that wait in the intake after a batch is taken.
+    /// The requests that queued in the intake while the batch before ran.
+    /// The flush task reads it once per batch, before it waits for the
+    /// next request. So while the verifier is idle, the gauge holds the
+    /// last backlog that it read (sample and hold), not a live depth.
     intake: Queue,
+    /// The wait of each request from its submit to the take of its batch.
+    wait: Step,
 }
 
 impl FlushMeters {
@@ -154,6 +180,7 @@ impl FlushMeters {
             batch: Batch::new("ingress.recover_batch"),
             recover: Step::new("ingress.recover_batch"),
             intake: Queue::new("ingress.recover_intake"),
+            wait: Step::new("ingress.recover_wait"),
         }
     }
 }
@@ -193,13 +220,16 @@ impl FlushLoop {
     async fn run_one_batch(&mut self) -> ControlFlow<()> {
         let depth = self.depth.get();
         let mut buf = Vec::with_capacity(depth);
+        self.meters.intake.set(self.rx.len());
         if self.rx.recv_many(&mut buf, depth).await == 0 {
             return ControlFlow::Break(());
         }
         if buf.len() < depth {
             self.fill_until_deadline(&mut buf).await;
         }
-        self.meters.intake.set(self.rx.len());
+        for req in &buf {
+            self.meters.wait.since(req.queued);
+        }
         self.meters.batch.record(buf.len());
         let started = Instant::now();
         self.process_batch(buf).await;
@@ -210,7 +240,8 @@ impl FlushLoop {
     /// Recovers a batch off the async runtime, fanned out across the
     /// blocking pool.
     ///
-    /// Recovery costs 42µs of pure CPU per transaction. Running it inline
+    /// Recovery costs 42 µs of pure CPU per transaction in the bench, and
+    /// 76-120 µs under load on staging. Running it inline
     /// on the flush task would block a tokio worker that also serves RPC
     /// connections. The work parallelizes easily: 23.3k tx/s on one
     /// thread, 45.3k on two, 85.7k on four (see `tests/stage_costs.rs`).
@@ -221,17 +252,8 @@ impl FlushLoop {
     /// or BLS aggregation uses. Parallelism is the only gain available
     /// here.
     async fn process_batch(&self, batch: Vec<VerifyRequest>) {
-        let Some(batch_len) = NonZeroUsize::new(batch.len()) else {
-            return;
-        };
-        // Below the threshold, splitting costs more than it saves: one
-        // chunk is 42µs of work against the cost of a spawn_blocking hop.
-        let workers = if batch.len() < PARALLEL_THRESHOLD || self.parallelism == NonZeroUsize::MIN {
-            1
-        } else {
-            self.parallelism.min(batch_len).get()
-        };
-        if workers == 1 {
+        let workers = self.workers(batch.len());
+        if workers == NonZeroUsize::MIN {
             let _ = tokio::task::spawn_blocking(move || {
                 batch
                     .into_iter()
@@ -249,9 +271,10 @@ impl FlushLoop {
         // late simply takes fewer requests.
         //
         // Lock cost does not matter here: one uncontended acquire per
-        // request, against 42µs of ECDSA work on the other side of it.
+        // request, against the ECDSA work on the other side of it (42 µs
+        // in the bench, 76-120 µs under load on staging).
         let cursor = Arc::new(RequestCursor::new(batch));
-        let handles: Vec<_> = (0..workers)
+        let handles: Vec<_> = (0..workers.get())
             .map(|_| {
                 let cursor = cursor.clone();
                 tokio::task::spawn_blocking(move || cursor.drain())
@@ -262,6 +285,16 @@ impl FlushLoop {
             // callers see the verifier as gone, instead of hanging.
             let _ = h.await;
         }
+    }
+
+    /// The blocking workers for a batch of `batch_len` requests. Each
+    /// worker gets at least `MIN_PER_WORKER` recoveries, so that its share
+    /// of the work pays for its wake. The count is at most the parallelism,
+    /// and at least one.
+    fn workers(&self, batch_len: usize) -> NonZeroUsize {
+        NonZeroUsize::new(batch_len / MIN_PER_WORKER)
+            .unwrap_or(NonZeroUsize::MIN)
+            .min(self.parallelism)
     }
 
     /// Takes further arrivals until `buf` reaches `self.depth`, or the
@@ -292,7 +325,6 @@ impl FlushLoop {
 impl BatchVerifier {
     #[must_use]
     pub fn new(depth: NonZeroUsize, flush_window: Duration) -> Self {
-        use nonzero_ext::nonzero;
         // Half of the cores, at most 8: the other half stays for the tokio
         // workers and the Aeron threads, which serve the same requests.
         let parallelism = std::thread::available_parallelism().map_or(NonZeroUsize::MIN, |n| {
@@ -337,6 +369,7 @@ impl BatchVerifier {
                 env,
                 raw_tx,
                 respond: tx,
+                queued: Instant::now(),
             })
             .await
             .map_err(|_| IngressError::Internal("verifier dropped".into()))?;
@@ -369,11 +402,67 @@ mod tests {
 #[cfg(test)]
 mod batch_tests {
     use super::*;
+    use crate::rendered_metrics_tests::Rendered;
     use crate::test_support::{SignedTx, sign_legacy_tx};
     use alloy_signer_local::PrivateKeySigner;
 
     fn depth(n: usize) -> NonZeroUsize {
         NonZeroUsize::new(n).unwrap()
+    }
+
+    /// A request for a new signed tx. Its caller is gone, so the answer
+    /// goes nowhere.
+    fn request() -> VerifyRequest {
+        let SignedTx { env, raw, .. } = sign_legacy_tx(&PrivateKeySigner::random(), 0);
+        VerifyRequest {
+            env,
+            raw_tx: raw,
+            respond: oneshot::channel().0,
+            queued: Instant::now(),
+        }
+    }
+
+    // A worker joins a batch only for 5 or more recoveries, and the
+    // parallelism caps the count. A batch of 4 stays on one worker.
+    #[test]
+    fn each_worker_gets_at_least_five_recoveries() {
+        let flush = FlushLoop::new(mpsc::channel(1).1, depth(64), Duration::ZERO, depth(4));
+        let workers = [1, 4, 9, 10, 14, 15, 64].map(|n| flush.workers(n).get());
+        assert_eq!(workers, [1, 1, 1, 2, 2, 3, 4]);
+    }
+
+    // Regression test for the intake gauge: it read the channel after
+    // the take, so it was always 0. The requests that queue while a
+    // batch runs must show in the gauge when the flush task comes back
+    // for the next batch.
+    #[test]
+    fn the_intake_gauge_reads_the_requests_that_queued_while_a_batch_ran() {
+        let text = Rendered::of(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let (tx, rx) = mpsc::channel(16);
+                let mut flush = FlushLoop::new(rx, depth(4), Duration::ZERO, NonZeroUsize::MIN);
+                tx.send(request()).await.unwrap();
+                // `join!` polls the batch first. It takes the one request
+                // and waits for the blocking pool. Then the second arm
+                // queues 3 more requests while that batch runs.
+                tokio::join!(
+                    async { assert!(flush.run_one_batch().await.is_continue()) },
+                    async {
+                        for _ in 0..3 {
+                            tx.send(request()).await.unwrap();
+                        }
+                    },
+                );
+                assert!(flush.run_one_batch().await.is_continue());
+            });
+        });
+        assert_eq!(
+            text.value(r#"kardamom_queue_depth{queue="ingress.recover_intake"}"#),
+            3.0
+        );
     }
 
     #[tokio::test]
