@@ -32,7 +32,7 @@ The local profile defines these classes:
 | `control` | 1 | Nomad and Consul server, Docker registry, anvil (the in-cluster L1) |
 | `sequencer` | 2 | 2 lanes with 2 racing replicas each. One job group per lane (`seq-<lane>`, expanded by the Nomad HCL). The metrics port is `9001 + 10 * lane`. |
 | `ingress` | 2 | The active/active JSON-RPC front door (`:8545`) and the notifier status feed (`:8547`). Role `redis`. Instance 1 also has role `redis-replica`. With `KARDAMOM_NOTIFIER_NODES=on`, the notifier moves to the `notifier` nodes. See [The notifier nodes](#the-notifier-nodes). |
-| `executor` | 3 | State-machine replica appliers (libmdbx state). The state mirror runs here too. With `KARDAMOM_EGRESS=1`, the egress runs on two of them (`:8548`, metrics `:9013`). See [The egress](#the-egress). |
+| `executor` | 3 | State-machine replica appliers (libmdbx state). The state mirror runs here too. With `KARDAMOM_EGRESS=1`, the egress runs on two of them (`:8548`, metrics `:9013`), unless `KARDAMOM_EGRESS_NODES=on` moves it to its own nodes. See [The egress](#the-egress). |
 | `sealer` | 3 | A 3-member Aeron Cluster (Raft). The Java `cluster` job orders the transactions. The Raft log and its archive hold the canonical log. |
 | `aux` | 1 | The service roles `redis`, `redis-primary`, `batcher`, `monitoring`, `validator`, `da-watcher` and `indexer`. |
 
@@ -333,7 +333,30 @@ Every switch is off by default. With every switch off, the deploy renders every 
 
 The preflight refuses a reader switch without the egress, the egress without the frames, and a value other than `on`, `off` or empty. To go back, switch off in the reverse order.
 
-The merge chains the copy of an executor only from the start of the stream. An instance with an empty store on a running chain finds no frame to chain to. So start the egress with a new chain, or give a new instance a store. A new node of a rescheduled instance has an empty store too.
+The merge chains the copy of an executor only behind a frame that another source delivers. After a start, an instance reads the frames between its head and the copies from the range read of a peer (`--peers`, `crates/egress/src/catchup.rs`, #743). So an instance with an empty store fills it from a running peer. With no peer that holds the frames, it starts again after the next boundary of a copy, and its store then begins there. A new node of a rescheduled instance has an empty store too.
+
+#### The egress nodes
+
+The switch `KARDAMOM_EGRESS_NODES=on` (job variable `egress_nodes`) moves the egress off the executor nodes to its own nodes (`docs/specs/2026-10-25-client-events.md`, 4.7). Off, the deploy renders every job as before.
+
+- An egress node has `egress` in `meta.roles`. Its name is `egress-<i>`. The kardamom-infra staging inventory names `egress-0` and `egress-1`.
+- On, the job constrains on `meta.roles` with `set_contains "egress"`, with `distinct_hosts`. Only the egress job changes.
+- On, the peers of each instance name the egress nodes and every executor node. So during the move, a moved instance fills its empty store from the instance that is still on an executor node.
+- The preflight counts the Nomad nodes that are `ready` and `eligible` and have `egress` in `meta.roles`. With the egress deployed (`KARDAMOM_EGRESS=1`), the deploy stops before it changes a job when the count is below `egress_count` (2).
+- The readers reach the egress through the Consul service `kardamom-egress`, so no reader changes.
+
+A change of the constraint does not move a running allocation. Move the instances one at a time:
+
+1. Create the egress nodes and bootstrap them (kardamom-infra).
+2. Deploy with `KARDAMOM_EGRESS_NODES=on`. The job registers with the new constraint. The two instances keep running on the executor nodes.
+3. Stop one instance: `nomad alloc stop <alloc>`. Nomad places it again on an egress node. Its store is empty, and it fills from the other instance.
+4. Check the moved instance before the next step:
+   - `kardamom_egress_head_distance_frames` is near 0;
+   - its `GET /health` answers;
+   - its `kardamom_egress_ref_frame_max_index` equals the one of the other instance.
+5. Stop the other instance. It moves and fills from the moved one.
+
+To go back, deploy with `KARDAMOM_EGRESS_NODES=off`, then move the instances back the same way, one at a time.
 
 ### The notifier nodes
 
@@ -477,6 +500,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Sealer | `KARDAMOM_REMOTE_ORIGINS` | empty (`412347,412399` in the job) | The peer chain ids whose cross-chain records the sealer seals. All members use the same list. |
 | Ingress | `KARDAMOM_INGRESS_ACK` (job variable `ack`) | empty (`receipt`) | When `eth_sendRawTransaction` answers. `receipt` waits for the receipt. `validated` answers when the ingress validated the transaction and published it on `tx_data`. See [`../../docs/json-rpc.md`](../../docs/json-rpc.md). |
 | Executor | `KARDAMOM_EXEC_CURSOR` (job variable `exec_cursor`) | empty (`off` in the job) | `on` or `off`. On, each executor sends its recorded cursor to the sealer, the floor of the record-lag guard. Switch it on only after every sealer member reads ingress kind 9. A sealer member that does not read it drops the frame. |
+| Egress | `KARDAMOM_EGRESS_NODES` (job variable `egress_nodes`) | empty (`off` in the job) | `on` or `off`. On, the egress runs on the nodes with `egress` in `meta.roles`, and its peers name those nodes too. Off, it runs on the executor nodes. See [The egress nodes](#the-egress-nodes). |
 | Egress | `KARDAMOM_EGRESS` | `0` | `1` deploys the egress job (`nomad/egress.nomad.hcl`) and its scrape (job variable `egress` of the monitoring job). It needs `KARDAMOM_EXEC_FRAMES=on`. See [The egress](#the-egress). |
 | Egress | `KARDAMOM_EXEC_FRAMES` (job variable `exec_frames` of the executor) | empty (`off` in the job) | `on` or `off`. On, each executor publishes the frames that it executes on `exec_frames` (`--exec-frames`). |
 | Egress | `KARDAMOM_VALIDATOR_EGRESS`, `KARDAMOM_BATCHER_EGRESS` (job variable `egress_url`) | empty (the job reads the cluster egress) | `on` or `off`. On, the validator or the batcher reads the canonical stream from the egress (`--egress`). Switch it on only on a chain where the carry flag is active. It needs `KARDAMOM_EGRESS=1`. |

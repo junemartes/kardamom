@@ -16,14 +16,16 @@
 # (--receipt-query-endpoints) and the notifier (--receipts-from-egress).
 # They reach the HTTP port through the Consul service kardamom-egress.
 #
-# Placement: independent instances, one for each host, at least two. They
-# run on the executor nodes. The egress reads every executor, and the
-# executor nodes keep state on their own disks. The aux node keeps the
-# readers (the validator and the batcher), so one node loss never takes
-# the egress and its readers together. distinct_hosts keeps two
-# instances on two of the three executor nodes. Ports on an executor
-# node: HTTP 8548, metrics 9013. The executor holds 9004, 9014 and 9024,
-# and the state mirror holds 9007.
+# Placement: independent instances, one for each host, at least two.
+# With egress_nodes off (the default) they run on the executor nodes:
+# distinct_hosts keeps two instances on two of the three executor nodes.
+# The executor holds 9004, 9014 and 9024 there, and the state mirror
+# 9007. With egress_nodes on they run on the nodes with egress in
+# meta.roles, one on each: their store syncs then do not share a disk
+# with the state DB of an executor (docs/specs/2026-10-25-client-events.md,
+# 4.7). The aux node keeps the readers (the validator and the batcher), so
+# one node loss never takes the egress and its readers together. Ports:
+# HTTP 8548, metrics 9013.
 #
 # The merge chains a copy only from the start of the stream. An instance
 # with an empty store on a running chain finds no frame to chain to. So
@@ -131,16 +133,40 @@ variable "receipts" {
   default     = 1000000
 }
 
-# The peers of each instance: the HTTP surface on each executor node. An
-# instance reads the frames between its head and the copies of the
-# executors from a peer after a start. A node with no instance refuses the
-# connection, and the instance itself costs one empty read, so the list
-# names every executor node.
+# The egress on its own nodes: "on" or "off". Ansible deployment passes
+# -var from KARDAMOM_EGRESS_NODES. Off keeps the egress on the executor
+# nodes.
+variable "egress_nodes" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.egress_nodes)
+    error_message = "The egress_nodes value must be on or off."
+  }
+}
+
+# The peers of each instance: the HTTP surface on each node where an
+# instance can run. An instance reads the frames between its head and the
+# copies of the executors from a peer after a start, so a moved instance
+# with an empty store fills it from the instance that did not move yet. A
+# node with no instance refuses the connection, and the instance itself
+# costs one empty read. So with egress_nodes on, the list names the egress
+# nodes and every executor node, for the move one instance at a time.
 locals {
-  peers = join(",", [
+  executor_peers = [
     for i in range(var.executor_count) :
     "http://executor-${i}.node.${var.datacenter}.consul:${var.http_port}"
-  ])
+  ]
+  egress_peers = [
+    for i in range(var.egress_count) :
+    "http://egress-${i}.node.${var.datacenter}.consul:${var.http_port}"
+  ]
+  peers = join(",", var.egress_nodes == "on" ? concat(local.egress_peers, local.executor_peers) : local.executor_peers)
+  # The node constraint of each value of egress_nodes.
+  placement = {
+    off = { attribute = "$${meta.role}", operator = "=", value = "executor" }
+    on  = { attribute = "$${meta.roles}", operator = "set_contains", value = "egress" }
+  }[var.egress_nodes]
 }
 
 job "egress" {
@@ -156,8 +182,9 @@ job "egress" {
   type        = "service"
 
   constraint {
-    attribute = "${meta.role}"
-    value     = "executor"
+    attribute = local.placement.attribute
+    operator  = local.placement.operator
+    value     = local.placement.value
   }
 
   group "egress" {
