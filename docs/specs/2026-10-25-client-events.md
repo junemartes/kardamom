@@ -15,10 +15,15 @@ Status: draft, revision 1, 2026-10-25. The decisions in section 1 are the user's
    | `accepted` | ingress | The ingress checked the transaction and published it on `tx_data`. |
    | `sent` | sequencer | The sequencer offered the transaction to the sealer. |
    | `dropped` | sequencer | The transaction will not land. The event carries the reason. |
-   | `executed` | egress | The egress holds the merged receipt. The event carries the receipt. |
+   | `executed` | executor, each of them | The executor applied the transaction. One event for each executor, with the block and the index, not the receipt. |
+   | `receipt` | egress | The egress holds the merged receipt. The event carries the receipt. |
    | `posted` | batcher | The batch that holds the block of the transaction was sent to L1. |
 
 4. The egress runs on its own nodes (`role=egress`), not on the executor nodes.
+
+For now the executors and the egress both publish, so that the stages can be measured apart: the
+time of each executor, and the time from the executors to the merged receipt. A switch turns the
+executor events off after the evaluation (Q7).
 
 The `dropped` stage is not in the user's list. It is here because without it a client sees `sent`
 and then nothing (section 4.3).
@@ -93,7 +98,8 @@ TxEvent =
     Accepted { hash }
   | Sent { hash, lane }
   | Dropped { hash, sender, nonce, reason }
-  | Executed { hash, block, index, receipt }   // the receipt bytes of egress_receipts
+  | Executed { hash, block, index }            // from one executor, its own copy
+  | Receipt { hash, block, index, receipt }    // from the egress: the receipt bytes of egress_receipts
   | RolledBack { from_block }                  // an egress rollback frame
   | Posted { batch_index, first_block, last_block, l1_tx }
   | Included { batch_index, l1_block }
@@ -113,42 +119,76 @@ TxEvent =
 |---|---|
 | ingress | `Accepted` for each transaction that it published on `tx_data`. |
 | sequencer | `Sent` for each offer to the sealer, `Dropped` for each drop (the drops of #768, which the egress also takes). |
-| egress | `Executed` and `RolledBack` from the merged receipts, the same frames as `egress_receipts`. |
+| executor | `Executed` for each transaction that it applied, behind its own switch (Q7). |
+| egress | `Receipt` and `RolledBack` from the merged receipts, the same frames as `egress_receipts`. |
 | batcher | `Posted` when it sends a batch, `Included` when the L1 receipt of the batch transaction comes. |
 
-The egress keeps `egress_receipts` for the sequencers. The executors publish nothing new.
+The egress keeps `egress_receipts` for the sequencers. The executors keep `tx_receipts`. The
+`Executed` events carry no receipt bytes, so they stay small: 32 bytes of hash and two numbers.
 
 ### 4.3 Copies, order and loss
 
-- **Copies.** Two sequencers race each transaction, and two egress instances publish each
-  receipt. The notifier keeps the first event of each `(hash, stage)` and drops the copies. A
-  `Posted` or `Included` copy is dropped by `(batch_index, stage)`. Clients already deduplicate
-  by `tx_hash` plus stage.
-- **Order.** The topic has no order across publishers. `Executed` can come before `Accepted`. The
-  notifier emits each stage when it comes, and does not wait for the stage before it.
+- **Copies.** Two sequencers race each transaction, three executors apply it, and two egress
+  instances publish each receipt. The notifier keeps the first event of each `(hash, stage)`
+  and drops the copies (the stage table of 4.4). A `Posted` or `Included` copy is dropped by
+  `(batch_index, stage)`. Clients already deduplicate by `tx_hash` plus stage.
+- **Order.** The topic has no order across publishers: `sent` can come before `accepted`, and
+  `receipt` before `executed`. A client must still see the stages in order. So when an event
+  comes, the notifier first emits every earlier stage of the order that it did not emit yet,
+  marked `implied`, then the stage itself. A real event of an implied stage that comes later is
+  dropped as a copy.
+  - The order: `accepted` < `sent` < `executed` < `receipt` < `posted` < `included`.
+  - `dropped` implies `accepted` only: a sequencer can drop before it offers (`txpool_full`).
+  - A drop is provisional (as `kardamom_getTransactionStatus` says today): a `receipt` after
+    `dropped` is emitted, with the stages before it that are not emitted yet.
+  - The stage latencies of section 6 count only the stages that the notifier observed, not the
+    implied ones.
 - **Loss.** MDC offers are best effort, for example `NOT_CONNECTED` during a restart.
   - `accepted`, `sent` and `dropped` are hints. A lost one is not sent again.
-  - `executed` must not be lost. The egress keeps its receipts. After a gap in the egress
+  - `executed` is a hint, as the stages before it.
+  - `receipt` must not be lost. The egress keeps its receipts. After a gap in the egress
     publications (a new publisher session, or a gap in the batch sequence of an origin), the
     notifier reads the missing receipts from the egress. Section 8, Q2, holds the mechanism.
   - `posted` and `included` come from L1. After a gap, the notifier reads the batcher's
     posted cursor or the `BatchPosted` logs (Q3).
-- **Rollback.** `RolledBack { from_block }` revokes every `executed` at or above `from_block`.
+- **Rollback.** `RolledBack { from_block }` revokes every `executed` and `receipt` at or above
+  `from_block`.
   The notifier sends a `rolled_back` event to each subscriber of an affected hash. A client must
-  treat `executed` as revocable until `posted`.
+  treat `executed` and `receipt` as revocable until `posted`.
 
 ### 4.4 The notifier
 
 - It reads only `tx_events`. The taps on `tx_status`, `tx_receipts`, `egress_receipts` and
   `tx_errors` go after the move (step 6 of section 7).
-- It keeps a map from hash to block for its recent `executed` events, bounded as the ring
-  (250,000 events on the notifier nodes). A `Posted` range then gives the hashes of the range.
-  A hash older than the map gets `posted` only through a status query (4.5).
+- **The stage table.** One fixed table for each instance, allocated at the start, sized as the
+  ring (250,000 entries on the notifier nodes). It holds no `Vec`, no `String` and no box, and
+  the event path allocates nothing for a hash that no client follows.
+  - An entry is `{ hash: [u8; 32], emitted: u8, observed: u8, executors: u8, block: u64,
+    accepted_ms: u32 }`, about 56 bytes, so the table uses about 14 MB.
+  - `emitted` and `observed` are bitmaps with one bit for each stage. `emitted` decides the
+    copies and the implied stages. `observed` keeps the stages that really came, for the
+    latencies.
+  - `executors` has one bit for each executor index, so the notifier sees which executors
+    reported.
+  - `block` comes from the first `executed` or `receipt`. It maps a `Posted` range to its
+    hashes, so the table replaces a separate map from hash to block.
+  - `accepted_ms` is the time of the first observed event of the hash, in milliseconds from
+    the start of the instance. The latencies of section 6 count from it.
+  - The table uses open addressing on the first 8 bytes of the hash, with a bounded probe. A
+    full probe overwrites the oldest entry in it (the smallest `accepted_ms`). A hash older than
+    the table gets `posted` only through a status query (4.5).
+  - The batch decode reads the archived rkyv bytes in place, with no copy of each event.
+  - A rollback clears the `executed` and `receipt` bits (and `executors`) of each entry at or
+    above `from_block`, and sets `block` to 0. The new receipt after the rollback is then
+    emitted again.
+  - The table is owned by one thread, the ingest thread of the notifier. No lock.
 - **The receipt feed.** `kardamom_subscribeReceipts` moves from the ingress to the notifier,
   next to its status feed, with the same frames. Its users (3.1) point to the notifier.
 - **Sharding.** Today every instance reads every event, and only the webhooks are sharded. The
-  measure on staging is about 0.2 core for each 1,000 tx/s. With about 5 events for each
-  transaction after the copies, 10,000 tx/s is about 2 cores. So each instance reads every
+  measure on staging is about 0.2 core for each 1,000 tx/s. With the executor events, about 11
+  events come in for each transaction before the copies are dropped: 1 accepted, 2 sent, 3
+  executed, 2 receipts, and the batch events. So 10,000 tx/s is about 3 to 4 cores of decode,
+  and about half that without the executor events. So each instance reads every
   batch but keeps only the hashes of its shard (the rendezvous hash of the webhooks), and a
   WebSocket client subscribes on the instance of its shard, or the instance forwards. The
   decode of a batch stays on every instance. Q4 holds the step past that.
@@ -204,6 +244,10 @@ The egress keeps `egress_receipts` for the sequencers. The executors publish not
 
 - `kardamom_notifier_stage_latency_seconds{stage}`: the time from the first `accepted` of a hash
   to the first event of each later stage, on the clock of the notifier.
+- `kardamom_notifier_executed_latency_seconds{executor}`: the time from `accepted` to the
+  `executed` of each executor. So a slow executor shows.
+- `kardamom_notifier_merge_latency_seconds`: the time from the first `executed` to the first
+  `receipt`: the cost of the hop to the egress and its merge.
 - `kardamom_tx_events_published_total{origin}` and `kardamom_tx_events_dropped_total{origin}` on each
   publisher.
 - `kardamom_notifier_event_gaps_total{origin}` and `kardamom_notifier_catchup_receipts_total`.
@@ -218,7 +262,8 @@ Every deploy stays backward compatible: a breaking change goes only through an u
    status -stats`) and the notifier CPU on notifier-0. This sizes 4.4 and 4.7.
 2. **The egress nodes** (kardamom-infra, then the job constraint). The move of 4.7.
 3. **The publishers.** `KARDAMOM_TX_EVENTS=on` adds the `tx_events` publications in the ingress, the
-   sequencer, the egress and the batcher. The old streams stay.
+   sequencer, the egress and the batcher. `KARDAMOM_TX_EVENTS_EXECUTORS=on` adds the `executed`
+   events of the executors. The old streams stay.
 4. **The notifier reads both.** `KARDAMOM_NOTIFIER_EVENTS=on`: the notifier takes `tx_events`, and
    ignores the old streams for the stages that `tx_events` carries. Compare the two on the
    canary for a day.
@@ -232,7 +277,7 @@ Every deploy stays backward compatible: a breaking change goes only through an u
 - **Q1. The source of the `ClusterStatus` for the ingress halt.** Recommended: the egress. It
   takes the order from the executors, and the status frames come with it, if `exec_frames`
   carries them. If not, the sequencer, which has a cluster session. To check in the review.
-- **Q2. The catch-up of `executed`.** Recommended: each egress publication carries a sequence
+- **Q2. The catch-up of `receipt`.** Recommended: each egress publication carries a sequence
   number for each origin. A gap makes the notifier read `GET /v1/frames` or the receipt index
   of the egress from the last receipt it took.
 - **Q3. The catch-up of `posted`.** Recommended: the notifier reads `kardamom_batcher` posted
@@ -241,9 +286,14 @@ Every deploy stays backward compatible: a breaking change goes only through an u
   shard, with the publishers splitting their batches by the shard of the hash. Not in this
   change.
 - **Q5. The on-quorum ack goes.** Recommended: yes. Staging and the load tests use
-  `--ack validated`, and the push of `executed` gives a client the same certainty sooner.
+  `--ack validated`, and the push of `receipt` gives a client the same certainty sooner.
 - **Q6. `tx_errors`.** Recommended: the sequencer drops (`Dropped`) cover the client side. The
   ingress keeps its `tx_errors` watcher only while the on-quorum ack exists, so it goes with Q5.
+
+- **Q7. The executor events after the evaluation.** Recommended: keep the switch, and decide
+  from the two latencies of section 6. If the merge latency stays below 1 ms at the peak, turn
+  the executor events off and keep `receipt` only. If a client needs the earliest signal, keep
+  them, and only for the first executor copy to the clients.
 
 ## 9. The PRs
 
@@ -251,8 +301,8 @@ Every deploy stays backward compatible: a breaking change goes only through an u
 |---|---|---|
 | P1 | kardamom-infra | the egress nodes |
 | P2 | kardamom | the egress constraint `role=egress`, the README move steps |
-| P3 | kardamom | the `tx_events` format and codec, the publishers, `KARDAMOM_TX_EVENTS` |
-| P4 | kardamom | the notifier on `tx_events`: copies, rollback, the hash-to-block map, the stage metrics, `KARDAMOM_NOTIFIER_EVENTS` |
+| P3 | kardamom | the `tx_events` format and codec, the publishers (the executors included), `KARDAMOM_TX_EVENTS` and `KARDAMOM_TX_EVENTS_EXECUTORS` |
+| P4 | kardamom | the notifier on `tx_events`: the stage table with its bitmaps, copies, implied stages, rollback, the stage metrics, `KARDAMOM_NOTIFIER_EVENTS` |
 | P5 | kardamom | the receipt feed on the notifier, the egress short wait and fallback, the load tool and the canary |
 | P6 | kardamom-infra | the edge target for the egress reads |
 | P7 | kardamom | the removals of section 5, `docs/specs/egress-node-spec.md` marked superseded, the docs |
