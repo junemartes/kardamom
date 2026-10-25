@@ -160,7 +160,6 @@ public final class ClusterNode {
         final Optional<FeedConfig> feed = FeedConfig.parse(
             System.getProperty(FeedConfig.DIR_SETTING),
             System.getProperty(FeedConfig.RING_SETTING),
-            carryBytes.isPresent(),
             idleCap);
         System.out.println("cluster feed memberId=" + memberId + feed
             .map(f -> " aeronDir=" + f.aeronDir() + " ringBytes=" + f.ringBytes() + " termBytes=" + f.termBytes())
@@ -244,7 +243,8 @@ public final class ClusterNode {
                 seed.ifPresent(service::seededFrom);
                 service.holdAtStart(startHold);
                 final SealerClusteredService built = service;
-                carryBytes.map(CarryBytes::file).ifPresent(file -> built.carryingBytes(file, feed));
+                carryBytes.map(CarryBytes::file).ifPresent(built::carryingBytes);
+                feed.ifPresent(built::feeding);
                 snapshotSchedule.ifPresent(service::snapshotEvery);
                 container = ClusteredServiceContainer.launch(
                     serviceContext(aeronDir, clusterDir, memberId, service, stop)

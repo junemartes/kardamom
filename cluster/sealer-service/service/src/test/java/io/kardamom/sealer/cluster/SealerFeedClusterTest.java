@@ -39,7 +39,8 @@ import org.junit.jupiter.api.io.TempDir;
 /**
  * Three in-JVM members, each with a member feed on its own media driver,
  * and a test reader on each feed. The feed of every member carries the
- * same retained frames as the leader's, byte for byte. A reader that does
+ * same retained frames as the leader's, byte for byte, from the retained
+ * file and from the heap. A reader that does
  * not poll fills the ring of its member: the member keeps its commit pace,
  * writes {@code FEED_GAP}, and a replay from the gap reaches the head.
  */
@@ -81,16 +82,32 @@ class SealerFeedClusterTest {
         return CommonContext.getAeronDirectoryName() + "-" + memberId + "-driver";
     }
 
-    /** Start the cluster, with the feed of member {@code i} of {@code size.apply(i)}. */
+    /** Start the cluster with the retained file, with the feed of member {@code i} of {@code size.apply(i)}. */
     private void startCluster(final IntFunction<FeedSize> size) {
+        startCluster(size, true);
+    }
+
+    /**
+     * Start the cluster, with the feed of member {@code i} of
+     * {@code size.apply(i)}. With {@code file}, every member keeps its
+     * retained frames in the file, else on the heap.
+     */
+    private void startCluster(final IntFunction<FeedSize> size, final boolean file) {
         cluster = ClusterTestHarness.start(systemTestWatcher, ClusterTestHarness.builder(MEMBER_COUNT,
-            memberId -> new SealerTestService(new SealerClusteredService(DEDUP_CAPACITY, TICK_MS, memberId)
-                .carryingBytes(new RetainedFile.Config(dir.resolve("retained-" + memberId), SEGMENT_BYTES),
-                    Optional.of(new FeedConfig(driverDir(memberId),
-                        size.apply(memberId).ringBytes(), size.apply(memberId).termBytes(), IdleCap.DEFAULT))))));
+            memberId -> new SealerTestService(service(memberId, file)
+                .feeding(new FeedConfig(driverDir(memberId),
+                    size.apply(memberId).ringBytes(), size.apply(memberId).termBytes(), IdleCap.DEFAULT)))));
         cluster.awaitLeader();
         cluster.egressListener(egress);
         cluster.connectClient();
+    }
+
+    /** The service of {@code memberId}, with the retained file when {@code file}. */
+    private SealerClusteredService service(final int memberId, final boolean file) {
+        final SealerClusteredService service = new SealerClusteredService(DEDUP_CAPACITY, TICK_MS, memberId);
+        return file
+            ? service.carryingBytes(new RetainedFile.Config(dir.resolve("retained-" + memberId), SEGMENT_BYTES))
+            : service;
     }
 
     /** A reader on the feed of {@code member} that asked for the stream from genesis and got its answer. */
@@ -151,6 +168,18 @@ class SealerFeedClusterTest {
     @InterruptAfter(value = 120, unit = TimeUnit.SECONDS)
     void every_member_feeds_the_leaders_frames_byte_for_byte() {
         startCluster(memberId -> ROOMY);
+        assertTheLeadersFrames();
+    }
+
+    @Test
+    @InterruptAfter(value = 120, unit = TimeUnit.SECONDS)
+    void every_heap_member_feeds_the_leaders_frames_byte_for_byte() {
+        startCluster(memberId -> ROOMY, false);
+        assertTheLeadersFrames();
+    }
+
+    /** Each member feeds the retained frames of the leader, byte for byte, with one {@code REPLAY_DONE}. */
+    private void assertTheLeadersFrames() {
         final TestNode leader = cluster.awaitLeader();
         final Map<Integer, FeedReader> feeds = IntStream.range(0, MEMBER_COUNT).boxed()
             .collect(Collectors.toMap(i -> i, i -> readFromGenesis(cluster.node(i))));

@@ -20,7 +20,7 @@ A node has one class and a set of roles. A job selects its nodes by class or by 
 
 How jobs place themselves:
 
-- The pipeline jobs constrain on `meta.role`. These are the sealer (`cluster`), `executor`, `state-mirror`, `egress`, `ingress`, `sequencer`, `notifier` and `anvil`.
+- The pipeline jobs constrain on `meta.role`. These are the sealer (`cluster`), `executor`, `state-mirror`, `egress`, `ingress`, `sequencer`, `notifier` and `anvil`. With `KARDAMOM_NOTIFIER_NODES=on`, the `notifier` job constrains on `meta.roles` instead.
 - The service jobs constrain on `meta.roles` with `set_contains`.
 - No job names a node or a node index.
 
@@ -36,6 +36,7 @@ How jobs place themselves:
 | `l1-light-client` | `validator` |
 | `da-watcher` | `da-watcher` |
 | `l1-indexer` | `indexer` |
+| `notifier`, with `KARDAMOM_NOTIFIER_NODES=on` | `notifier` |
 
 Pools of elastic nodes:
 

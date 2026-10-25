@@ -46,6 +46,22 @@ NO_QUORUM_CHAIN = HEALTHY_CHAIN | {'roots': [NO_QUORUM_ROOT],
                                    'ingress': {'pause': {'reason': 'upstream', 'root': NO_QUORUM_ROOT}}}
 # The format registry of the repository: the formats of every target.
 FORMATS = (ANSIBLE.parents[2] / 'formats.toml').read_text()
+# The filter of the notifier node preflight, and its meaning on a node.
+# A Nomad 1.9 agent evaluates the filter on the whole node.
+NOTIFIER_NODE_FILTER = ('Meta.roles matches "(^|,) *notifier *(,|$)" and Status == "ready" '
+                        'and SchedulingEligibility == "eligible"')
+
+
+def notifier_node(node):
+    """Whether NOTIFIER_NODE_FILTER admits the node."""
+    return (re.search(r'(^|,) *notifier *(,|$)', node['Meta'].get('roles', '')) is not None
+            and node['Status'] == 'ready' and node['SchedulingEligibility'] == 'eligible')
+
+
+def nomad_node(name, roles, status='ready', eligibility='eligible'):
+    return {'Name': name, 'Meta': {'roles': roles}, 'Status': status, 'SchedulingEligibility': eligibility}
+
+
 # The formats text that an accepted release holds in the record. The deploy
 # binary of the tests scripts its findings, so the text is a small fixed
 # registry: a record holds it up to four times within Nomad's 64 KiB limit.
@@ -242,6 +258,12 @@ class NomadAPI(BaseHTTPRequestHandler):
                 self.register(state['versions'][parts[3]][-2])
                 state['writes'].append(f'auto-revert:{parts[3]}')
             self.respond(verdict)
+        elif parts[2] == 'nodes':
+            # The node list of the notifier preflight: the stubs of the
+            # nodes that the filter admits.
+            [query] = urllib.parse.parse_qs(self.path.split('?')[1])['filter']
+            assert query == NOTIFIER_NODE_FILTER, query
+            self.respond([{'Name': n['Name']} for n in state['nodes'] if notifier_node(n)])
         elif parts[2] == 'node':
             # Every node advertises an address of this fake API, so the
             # member status and the smoke target resolve back here. A
@@ -363,7 +385,9 @@ class Deploys(unittest.TestCase):
         self.api = ThreadingHTTPServer(('0.0.0.0', 0), NomadAPI)
         self.api.state = {'jobs': {}, 'writes': [], 'deployments': {}, 'roles': {},
                           'variables': {}, 'variable_writes': [], 'records': {}, 'record_index': {},
-                          'record_writes': []}
+                          'record_writes': [],
+                          'nodes': [nomad_node('ingress-0', 'ingress,redis'), nomad_node('notifier-0', 'notifier'),
+                                    nomad_node('notifier-1', 'notifier')]}
         self.record_dir = Path(self.tmp.name) / 'deployed'
         # The target tree: a git checkout with the formats.toml of this
         # repository. A deploy records its HEAD as the revision, which must
@@ -1056,6 +1080,91 @@ class DeployTest(Deploys):
         for value in ('0', 'abc', '1000001'):
             with self.subTest(value=value):
                 self.run_deploy(check=True, success=False, environ={'KARDAMOM_IDLE_CAP_US': value})
+
+    # The plan of the notifier and of the media drivers for each value of
+    # the notifier switch: the job constraint, the count, the peers, the
+    # memory, the ring cap, and each driver group with its node class
+    # constraint and its idle cap. The fake cluster has two notifier nodes.
+    NOTIFIER_PLACEMENTS = (
+        ({}, {
+            'constraint': ('${meta.role}', '=', 'ingress'), 'count': 2, 'memory': 1024, 'ring': 1000000,
+            'peers': [f'http://ingress-{i}.node.dc1.consul:8547' for i in range(2)],
+            'drivers': {'aeron': (None, '50')}}),
+        ({'KARDAMOM_NOTIFIER_NODES': 'off'}, {
+            'constraint': ('${meta.role}', '=', 'ingress'), 'count': 2, 'memory': 1024, 'ring': 1000000,
+            'peers': [f'http://ingress-{i}.node.dc1.consul:8547' for i in range(2)],
+            'drivers': {'aeron': (None, '50')}}),
+        ({'KARDAMOM_NOTIFIER_NODES': 'on'}, {
+            'constraint': ('${meta.roles}', 'set_contains', 'notifier'), 'count': 1, 'memory': 512, 'ring': 250000,
+            'peers': ['http://notifier-0.node.dc1.consul:8547'],
+            'drivers': {'aeron': ('!=', '50'), 'aeron-notifier': ('=', '1000')}}),
+        ({'KARDAMOM_NOTIFIER_NODES': 'on', 'KARDAMOM_NOTIFIER_COUNT': '2'}, {
+            'constraint': ('${meta.roles}', 'set_contains', 'notifier'), 'count': 2, 'memory': 512, 'ring': 250000,
+            'peers': [f'http://notifier-{i}.node.dc1.consul:8547' for i in range(2)],
+            'drivers': {'aeron': ('!=', '50'), 'aeron-notifier': ('=', '1000')}}),
+    )
+
+    def test_the_notifier_nodes_switch_defaults_off_and_moves_the_notifier(self):
+        """Off, every plan is the default plan. On, only the notifier and
+        the media drivers change: the monitoring and the canary find the
+        notifier through its Consul service records. The local canary
+        runs, so its plan is in the comparison."""
+        plans = {}
+        for environ, expected in self.NOTIFIER_PLACEMENTS:
+            with self.subTest(environ=environ):
+                self.run_deploy(check=True, environ=environ | {'CANARY_LOCAL': '1'})
+                plans[json.dumps(environ)] = self.api.state['plans']
+                self.assert_notifier_placement(self.api.state['plans'], expected)
+        default = plans['{}']
+        for environ, current in plans.items():
+            moved = {'notifier', 'aeron'} if '"on"' in environ else set()
+            self.assertEqual({n: j for n, j in current.items() if n not in moved},
+                             {n: j for n, j in default.items() if n not in moved}, environ)
+        self.assertIn('service "kardamom-notifier-metrics|any"', self.job_templates(default['monitoring']))
+        self.assertIn('ws://kardamom-notifier.service.consul:8547', self.job_args(default['canary']))
+
+    def test_a_bad_notifier_switch_fails_the_deploy(self):
+        for environ in ({'KARDAMOM_NOTIFIER_NODES': 'yes'}, {'KARDAMOM_NOTIFIER_COUNT': '0'}):
+            with self.subTest(environ=environ):
+                self.run_deploy(check=True, success=False, environ=environ)
+
+    def test_the_preflight_refuses_more_notifiers_than_notifier_nodes(self):
+        """The preflight counts the ready, eligible nodes whose role set
+        holds notifier, before any job changes. A down node, a drained node
+        and a role that only starts with notifier do not count."""
+        self.api.state['nodes'] = [
+            nomad_node('notifier-0', 'redis, notifier'), nomad_node('notifier-1', 'notifier', status='down'),
+            nomad_node('notifier-2', 'notifier', eligibility='ineligible'), nomad_node('aux-0', 'notifiers')]
+        output = self.run_deploy(check=True, success=False,
+                                 environ={'KARDAMOM_NOTIFIER_NODES': 'on', 'KARDAMOM_NOTIFIER_COUNT': '2'})
+        self.assertIn("KARDAMOM_NOTIFIER_COUNT (2) is above the count of the ready, eligible Nomad nodes "
+                      "with notifier in meta.roles (['notifier-0'])", output)
+        self.assertNotIn('plans', self.api.state)
+        self.api.state['nodes'] = []
+        output = self.run_deploy(check=True, success=False, environ={'KARDAMOM_NOTIFIER_NODES': 'on'})
+        self.assertIn('KARDAMOM_NOTIFIER_COUNT (1) is above the count', output)
+        self.run_deploy(check=True, environ={'KARDAMOM_NOTIFIER_NODES': 'off'})
+
+    def assert_notifier_placement(self, plans, expected):
+        notifier = plans['notifier']
+        group = notifier['TaskGroups'][0]
+        task = group['Tasks'][0]
+        args = task['Config']['args']
+        [constraint] = notifier['Constraints']
+        self.assertEqual((constraint['LTarget'], constraint['Operand'], constraint['RTarget']),
+                         expected['constraint'])
+        self.assertEqual(group['Count'], expected['count'])
+        self.assertEqual(args[args.index('--instance-count') + 1], str(expected['count']))
+        self.assertIn({'LTarget': '', 'RTarget': 'true', 'Operand': 'distinct_hosts'}, group['Constraints'])
+        self.assertEqual(args[args.index('--peers') + 1].split(','), expected['peers'])
+        self.assertEqual(task['Resources']['MemoryMB'], expected['memory'])
+        self.assertEqual(args[args.index('--ring-max-events') + 1], expected['ring'])
+        drivers = {g['Name']: (g['Constraints'], g['Tasks'][0]['Env']['KARDAMOM_IDLE_CAP_US'])
+                   for g in plans['aeron']['TaskGroups']}
+        self.assertEqual(drivers, {
+            name: (None if operator is None else [{'LTarget': '${meta.role}', 'RTarget': 'notifier',
+                                                    'Operand': operator}], cap)
+            for name, (operator, cap) in expected['drivers'].items()})
 
     @staticmethod
     def aeron_tasks(plans):
@@ -1933,6 +2042,35 @@ class SealerTest(Deploys):
         self.api.state['deployments']['cluster'] = Deployment('cluster', ['failed'])
         self.run_deploy({'workloads_cluster_bootstrap': True}, success=False)
         self.assertEqual(self.api.state['writes'][-3:], ['bootstrap-open', 'cluster', 'bootstrap-close'])
+
+
+def load_tests(loader, tests, pattern):
+    """Keep one shard of each class when DEPLOY_TEST_SHARD is `i/n`: the
+    tests whose place in the sorted names of their class is i modulo n. CI
+    runs each shard of a long class on its own runner, so a class with
+    more tests needs only a larger n, and a new test lands in a shard by
+    itself."""
+    shard = os.environ.get('DEPLOY_TEST_SHARD', '')
+    if not shard:
+        return tests
+    index, count = (int(part) for part in shard.split('/'))
+    kept = unittest.TestSuite()
+    places = {}
+    for test in iter_tests(tests):
+        place = places.setdefault(type(test), 0)
+        places[type(test)] = place + 1
+        if place % count == index:
+            kept.addTest(test)
+    return kept
+
+
+def iter_tests(suite):
+    """Every test of `suite`, in its order, with the nested suites flat."""
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from iter_tests(item)
+        else:
+            yield item
 
 
 if __name__ == '__main__':

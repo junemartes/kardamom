@@ -3,6 +3,8 @@ package io.kardamom.sealer.cluster;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.aeron.driver.MediaDriver;
+import io.aeron.driver.ThreadingMode;
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.LagBudgets;
 import io.kardamom.sealer.VersionSwitch;
@@ -13,13 +15,18 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.management.ManagementFactory;
 import java.nio.ByteOrder;
+import java.nio.file.Path;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
+import java.util.function.Predicate;
+import java.util.stream.IntStream;
+import org.agrona.CloseHelper;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 /**
  * The allocation gate of the service record path of decision version 5: the
@@ -29,7 +36,9 @@ import org.junit.jupiter.api.Test;
  * sequencers. The gate measures only the delivery of each reference: the
  * ticks and the posted cursors between the blocks are not measured. A
  * second case runs with the carry window on, so each new frame evicts the
- * oldest one of the replay window at once.
+ * oldest one of the replay window at once. A third case runs with a live
+ * member feed on the heap, so each new frame also goes into the frame ring.
+ * A fourth case measures the walk of a feed answer over the heap frames.
  *
  * <p>The member is a follower with no client session, so no frame goes to
  * a stub session that copies it. The {@code allocationGate} task runs this
@@ -60,10 +69,24 @@ final class CarriedPathAllocationTest {
     private long ticks;
     private long freshBytes;
     private long copyBytes;
+    /** The media driver and the reader of a feed case, else null. */
+    private MediaDriver driver;
+    private FeedReader reader;
+    /** The work between two measured offers: the duty cycle of the feed and its reader, in a feed case. */
+    private Runnable afterOffer = () -> { };
+    /** The id of the newest feed request. */
+    private long nextRequest;
+    /** The bytes and the duty cycles of the walk case, inside the walk. */
+    private long walkBytes;
+    private int walkSteps;
+
+    @TempDir
+    Path dir;
 
     @AfterEach
     void stop() {
         svc.onTerminate(cluster);
+        CloseHelper.closeAll(reader, driver);
     }
 
     @Test
@@ -76,14 +99,110 @@ final class CarriedPathAllocationTest {
         measure(true, "carried_window_fresh", "carried_window_copy");
     }
 
+    @Test
+    void with_a_live_heap_feed_a_full_reference_and_its_copy_allocate_at_most_their_baselines() {
+        feeding();
+        startOnVersionFive(false);
+        final long served = request(0, CanonicalSealerState.GENESIS_BLOCK_NUMBER);
+        awaitAnswer(SealerWire.EGRESS_KIND_REPLAY_DONE, served);
+        run("carried_feed_fresh", "carried_feed_copy");
+        assertEquals(FeedState.LIVE, svc.metrics().feed(), "the feed stays live through the measurement");
+    }
+
+    /**
+     * The walk of a feed answer over the full window. Only the duty cycles
+     * that start and end inside the walk count: the start of the answer
+     * and its end log a line.
+     */
+    @Test
+    void the_walk_of_a_heap_feed_allocates_at_most_its_baseline() {
+        feeding();
+        startOnVersionFive(false);
+        IntStream.range(0, WARMUP).forEach(this::offerTwice);
+        final FeedReader.Frame floor = awaitAnswer(SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE,
+            request(0, CanonicalSealerState.GENESIS_BLOCK_NUMBER));
+        final long frames = svc.retained().count();
+        // The first walk warms the walk up; the second one is measured.
+        walk(floor);
+        walkBytes = 0;
+        walkSteps = 0;
+        walk(floor);
+        assertTrue(walkSteps > 10, "the walk takes many duty cycles: " + walkSteps);
+        check("heap_feed_walk", (double) walkBytes / frames);
+        check("heap_feed_walk_cycle", (double) walkBytes / walkSteps);
+    }
+
+    /** Walk the window from {@code floor} to the head, until the feed is live again. */
+    private void walk(final FeedReader.Frame floor) {
+        request(floor.a(), floor.b());
+        while (svc.metrics().feed() != FeedState.WALKING) {
+            afterOffer.run();
+        }
+        while (svc.metrics().feed() != FeedState.LIVE) {
+            walkCycle();
+        }
+    }
+
+    /** Run one duty cycle of the feed, and count its bytes when it starts and ends inside the walk. */
+    private void walkCycle() {
+        final FeedState before = svc.metrics().feed();
+        final long start = THREADS.getCurrentThreadAllocatedBytes();
+        svc.doBackgroundWork(0);
+        final long end = THREADS.getCurrentThreadAllocatedBytes();
+        final boolean inside = before == FeedState.WALKING && svc.metrics().feed() == FeedState.WALKING;
+        walkBytes += inside ? end - start : 0;
+        walkSteps += inside ? 1 : 0;
+        reader.drain();
+    }
+
     /** Run the references on version 5, with the carry window when {@code window}, and check both baselines. */
     private void measure(final boolean window, final String freshCase, final String copyCase) {
+        startOnVersionFive(window);
+        run(freshCase, copyCase);
+    }
+
+    /** Start the member, and switch to version 5, then the carry window when {@code window}. */
+    private void startOnVersionFive(final boolean window) {
         cluster.role = io.aeron.cluster.service.Cluster.Role.FOLLOWER;
         svc.start(cluster, Optional.empty());
         switchToVersionFive();
         if (window) {
             switchOnTheCarryWindow();
         }
+    }
+
+    /** A media driver, a member feed of the service on it, and a reader of the feed. */
+    private void feeding() {
+        final String aeronDir = dir.resolve("aeron").toString();
+        driver = MediaDriver.launch(new MediaDriver.Context()
+            .aeronDirectoryName(aeronDir)
+            .threadingMode(ThreadingMode.SHARED)
+            .dirDeleteOnStart(true)
+            .dirDeleteOnShutdown(true));
+        svc.feeding(new FeedConfig(aeronDir, 16 << 20, 1 << 20, IdleCap.DEFAULT));
+        reader = new FeedReader(aeronDir);
+        afterOffer = () -> {
+            svc.doBackgroundWork(0);
+            reader.drain();
+        };
+    }
+
+    /** Send a feed request from {@code (fromIndex, fromBlock)}, and return its id. */
+    private long request(final long fromIndex, final long fromBlock) {
+        nextRequest++;
+        reader.request(fromIndex, fromBlock, nextRequest);
+        return nextRequest;
+    }
+
+    /** Run the duty cycles of the feed until the answer {@code kind} of request {@code id} comes. */
+    private FeedReader.Frame awaitAnswer(final byte kind, final long id) {
+        final Predicate<FeedReader.Frame> answer = f -> !f.canonical() && f.kind() == kind && f.requestId() == id;
+        reader.pollUntil(frames -> frames.stream().anyMatch(answer), () -> svc.doBackgroundWork(0));
+        return reader.frames().stream().filter(answer).findFirst().orElseThrow();
+    }
+
+    /** Offer the warm-up references, then the measured ones, and check both baselines. */
+    private void run(final String freshCase, final String copyCase) {
         for (int i = 0; i < WARMUP; i++) {
             offerTwice(i);
         }
@@ -132,6 +251,7 @@ final class CarriedPathAllocationTest {
         final long after = THREADS.getCurrentThreadAllocatedBytes();
         freshBytes += between - before;
         copyBytes += after - between;
+        afterOffer.run();
         if (i % RECORDS_PER_BLOCK == RECORDS_PER_BLOCK - 1) {
             tick();
             deliver(IngressFrames.postedCursorFrame(ticks));

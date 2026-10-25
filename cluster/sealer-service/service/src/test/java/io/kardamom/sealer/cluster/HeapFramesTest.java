@@ -2,12 +2,16 @@ package io.kardamom.sealer.cluster;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import java.util.stream.IntStream;
+import java.util.stream.LongStream;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.junit.jupiter.api.Test;
 
@@ -78,6 +82,91 @@ class HeapFramesTest {
         store.append(new UnsafeBuffer(boundary), boundary.length);
         assertEquals(42L, store.boundaryEnd(7L));
         assertEquals(-1L, store.boundaryEnd(8L));
+    }
+
+    /**
+     * The walk keys against a list of every appended frame: the key of a
+     * frame is its place in that list. Random appends and evictions wrap
+     * the byte ring and grow both rings, and a walker that holds one key
+     * reads the same bytes at it until the front passes it.
+     */
+    @Test
+    void the_frame_numbers_stay_the_same_across_growth_and_eviction() {
+        final NumberedWalk walk = new NumberedWalk(new Random(11));
+        IntStream.range(0, 100_000).forEach(i -> walk.step());
+        assertTrue(walk.mostFrames > 1 << 14, "the index ring grew past its first size");
+        assertTrue(walk.mostBytes > 1 << 20, "the byte ring grew past its first size");
+        final HeapFrames store = walk.store;
+        final List<byte[]> walked = LongStream.iterate(store.walkFront(), k -> k < store.walkHead(), store::walkNext)
+            .mapToObj(walk::bytesAt)
+            .toList();
+        assertFrames(store.wanted(0, 0).toList(), walked);
+    }
+
+    /** One store, every frame that it appended, and a walker that holds one key. */
+    private static final class NumberedWalk {
+        private final Random random;
+        private final HeapFrames store = new HeapFrames();
+        private final List<byte[]> appended = new ArrayList<>();
+        private final UnsafeBuffer view = new UnsafeBuffer(0, 0);
+        private long walker;
+        private long mostFrames;
+        private long mostBytes;
+
+        NumberedWalk(final Random random) {
+            this.random = random;
+        }
+
+        /** Append or evict one frame, check the keys, and move the walker on at random. */
+        void step() {
+            if (store.count() > 0 && random.nextInt(100) < 40) {
+                store.evictFront();
+            } else {
+                append();
+            }
+            assertEquals(appended.size(), store.walkHead());
+            assertEquals(appended.size() - store.count(), store.walkFront());
+            mostFrames = Math.max(mostFrames, store.count());
+            mostBytes = Math.max(mostBytes, store.bytes());
+            walker = Math.max(walker, store.walkFront());
+            if (walker < store.walkHead()) {
+                assertArrayEquals(appended.get((int) walker), bytesAt(walker), "key " + walker);
+                walker = random.nextInt(4) == 0 ? store.walkNext(walker) : walker;
+            }
+        }
+
+        /** A rare large frame makes the byte ring grow. */
+        private void append() {
+            final int length = random.nextInt(1_000) == 0 ? 300_000 : 20 + random.nextInt(400);
+            final byte[] f = frame(random.nextInt(50) == 0, appended.size(), length, random);
+            store.append(new UnsafeBuffer(f), f.length);
+            appended.add(f);
+        }
+
+        byte[] bytesAt(final long key) {
+            store.view(key, view);
+            final byte[] out = new byte[view.capacity()];
+            view.getBytes(0, out);
+            return out;
+        }
+    }
+
+    @Test
+    void the_walk_starts_after_the_boundary_of_the_block_before_and_a_clear_keeps_the_numbers() {
+        final Random random = new Random(13);
+        final HeapFrames store = new HeapFrames();
+        List.of(frame(false, 0, 40, random), frame(true, 4, 40, random), frame(false, 1, 40, random),
+                frame(true, 5, 40, random), frame(false, 2, 40, random))
+            .forEach(f -> store.append(new UnsafeBuffer(f), f.length));
+        assertEquals(2L, store.walkStart(5), "after the boundary of block 4");
+        assertEquals(4L, store.walkStart(6), "after the boundary of block 5");
+        assertEquals(0L, store.walkStart(9), "no boundary of block 8: the front");
+        store.evictFront();
+        store.evictFront();
+        assertEquals(2L, store.walkStart(5), "the boundary of block 4 left: the front");
+        store.clear();
+        assertEquals(5L, store.walkFront(), "a key from before the clear is below the front");
+        assertEquals(5L, store.walkHead());
     }
 
     private static void assertFrames(final List<byte[]> expected, final List<byte[]> actual) {

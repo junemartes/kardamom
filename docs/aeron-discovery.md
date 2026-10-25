@@ -72,6 +72,8 @@ The streams and their publishers:
 | `tx_drops` (one record per sequencer, with its lane) | sequencer | egress |
 | `l1_blocks` | L1 follower (two instances) | da-watcher, batcher, follower archives |
 
+A consumer joins the publishers that the catalog lists, wherever it runs. So a move of a consumer to another node changes no channel. The notifier runs on the ingress nodes, or on its own nodes of role `notifier` with `KARDAMOM_NOTIFIER_NODES=on` (see "The notifier nodes" in `deploy/cluster/README.md`). A notifier node records no topic.
+
 The `exec_txs` stream carries the transactions that an executor joins, in canonical order: one `ExecTxRecord` for each `TxRef`.
 
 The `tx_verdicts` stream carries the verdict of the sequencer for each transaction of one ingress: one `TxStatus` record, `Accepted` or `Rejected` with the reason. The ingress answers `eth_sendRawTransaction` on it. The stream of ingress `i` has the id `tx_verdicts_stream_id_base + i` (3000 + i by default), so `i` is at most 255 and each ingress joins only its own stream. A sequencer opens the publication of an ingress on its first verdict for it. Each offer is best effort: the Aeron thread holds a refused frame until the offer deadline, so the first verdicts wait for the image of the ingress to connect. A frame past the deadline drops, and the client gets the ack timeout of its ingress.

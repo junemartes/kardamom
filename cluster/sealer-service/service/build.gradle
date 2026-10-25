@@ -85,7 +85,12 @@ def allocationGate = tasks.register('allocationGate', Test) {
         includeTags 'allocation'
     }
     forkEvery = 1
-    jvmArgs '-XX:-DoEscapeAnalysis'
+    // The feed cases run a media driver in the test JVM, as the test task does.
+    jvmArgs(
+        '-XX:-DoEscapeAnalysis',
+        '--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED',
+        '--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED'
+    )
 }
 
 tasks.named('check') {

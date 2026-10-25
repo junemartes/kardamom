@@ -30,11 +30,10 @@ import org.junit.jupiter.api.io.TempDir;
  * replay below the window gets REPLAY_UNAVAILABLE. A replay of the log and
  * a restore from a snapshot at any entry evict the same frames.
  *
- * <p>The window-only rule needs a member that carries the bytes: only
- * then does the member feed run, so every reader below the window can
- * recover from the egress. A member that keeps its frames on the heap
- * keeps the posted rule under version 5 too, while the carry window is
- * off: see {@link SealerCarryActivationTest}.</p>
+ * <p>Without the carry window, the window-only rule needs a member that
+ * carries the bytes. A member that keeps its frames on the heap keeps the
+ * posted rule under version 5 too, while the carry window is off: see
+ * {@link SealerCarryActivationTest}.</p>
  */
 class SealerCarryWindowTest {
 
@@ -212,9 +211,9 @@ class SealerCarryWindowTest {
     }
 
     /**
-     * A member that keeps its frames on the heap runs no member feed, so no
-     * reader below the window can recover from the egress. Under version 5
-     * it keeps every frame above the posted head, as version 4 does.
+     * A member that keeps its frames on the heap, with the carry window off,
+     * keeps every frame above the posted head under version 5, as version 4
+     * does.
      */
     @Test
     void version_five_on_the_heap_keeps_the_frames_above_the_posted_head() {

@@ -47,11 +47,12 @@ sealed interface Feed permits MemberFeed, Feed.Off {
     }
 
     /**
-     * Start the feed of {@code config} on the retained file, or return
-     * {@link Off} when either is empty. The settings refuse a feed without
-     * the retained file at the start ({@link FeedConfig#parse}).
+     * Start the feed of {@code config} on the retained frames of
+     * {@code member}, on the heap or in the file, or return {@link Off}
+     * when {@code config} is empty. The feed is local to the member: it
+     * changes no replicated state, so each member can turn it on alone.
      */
-    static Feed open(final Optional<FeedConfig> config, final Optional<RetainedFile> file, final int memberId) {
-        return file.<Feed>flatMap(f -> config.map(c -> MemberFeed.start(c, f, memberId))).orElse(Off.INSTANCE);
+    static Feed open(final Optional<FeedConfig> config, final MemberFeed.Member member) {
+        return config.<Feed>map(c -> MemberFeed.start(c, member)).orElse(Off.INSTANCE);
     }
 }

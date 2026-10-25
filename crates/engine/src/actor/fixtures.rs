@@ -1,6 +1,9 @@
 //! The channel-backed [`ChannelHarness`] that runs the real
-//! [`crate::Executor`] pipeline in-process over channels, and a re-export
-//! of the signed-legacy-transaction fixture from `kardamom-test-support`.
+//! [`crate::Executor`] pipeline in-process over channels, the
+//! [`TestEgress`] that serves the canonical stream with its bytes, the
+//! [`TestStream`] that the `tx_ordering` reader reads from either source,
+//! and a re-export of the signed-legacy-transaction fixture from
+//! `kardamom-test-support`.
 //!
 //! [`LegacyTx`] and the signer helpers live in `kardamom-test-support`.
 //! This module re-exports them, so a caller that already imports
@@ -14,7 +17,12 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use kardamom_types::TxEnvelope as KtTxEnvelope;
 
+pub use egress::{EgressReader, TestEgress};
 pub use kardamom_test_support::{LegacyTx, anvil_signer_0, byte_signer, seeded_signer};
+pub use stream::{TestEntry, TestStream};
+
+mod egress;
+mod stream;
 
 // ---------------------------------------------------------------------------
 // The chain-state predeploy and its upgrade transactions.
@@ -220,8 +228,9 @@ impl crate::TxReceiptsPublication for ChanReceiptsPub {
     }
 }
 
-/// The channel-backed wiring [`ChannelHarness`] drives.
-type HarnessWiring = TestWiring<ChanTxDataSub, ChanTxOrderingSub, ChanReceiptsPub>;
+/// The channel-backed wiring [`ChannelHarness`] drives, over the
+/// `tx_ordering` source `O`.
+type HarnessWiring<O> = TestWiring<ChanTxDataSub, O, ChanReceiptsPub>;
 
 /// Depth of the `tx_receipts` channel. The test thread drains it while the
 /// engine runs, so this only bounds how far commit runs ahead of the drain.
@@ -267,9 +276,7 @@ pub struct HarnessOutcome {
 pub struct ChannelHarness {
     tx_data: Vec<Sender<(crate::BPosition, KtTxEnvelope)>>,
     tx_ordering: Sender<(crate::BPosition, crate::TxOrderingMessage)>,
-    tx_receipts: Receiver<crate::CMessage>,
-    threads: crate::Threads,
-    state: crate::MockStateDatabase,
+    pipeline: Pipeline,
 }
 
 impl ChannelHarness {
@@ -279,12 +286,6 @@ impl ChannelHarness {
     /// blocks the test thread.
     #[must_use]
     pub fn spawn(setup: HarnessSetup, lanes: u8) -> Self {
-        let HarnessSetup {
-            cfg,
-            start,
-            snap,
-            tx_hook,
-        } = setup;
         let (tx_data, tx_data_subs): (Vec<_>, Vec<_>) = (0..lanes)
             .map(|sequencer_id| {
                 let (tx, rx) = unbounded();
@@ -292,35 +293,20 @@ impl ChannelHarness {
             })
             .unzip();
         let (tx_ordering, b_rx) = unbounded();
-        let (c_tx, tx_receipts) = bounded(RECEIPTS_DEPTH);
-        let threads = crate::Executor::<HarnessWiring>::new(
-            cfg,
-            crate::Inbound {
-                tx_data: tx_data_subs,
-                tx_ordering: ChanTxOrderingSub(b_rx),
-                join_recovery: None,
-                exec_stream: crate::reader::NoExecStream,
-            },
-            crate::Outbound {
-                tx_receipts: ChanReceiptsPub(c_tx),
-                snapshots: crate::MutatingSnapshotSource(snap.clone()),
-                writer_signal: Imm,
-                writer_queue: crate::WriterApplyingQueue::new(snap.clone()),
-            },
-            start,
-            crate::RoleHooks {
-                tx_hook,
-                ..crate::RoleHooks::none()
-            },
-        )
-        .spawn();
         Self {
             tx_data,
             tx_ordering,
-            tx_receipts,
-            threads,
-            state: snap,
+            pipeline: Pipeline::spawn(setup, tx_data_subs, ChanTxOrderingSub(b_rx)),
         }
+    }
+
+    /// Run the pipeline over `reader`, with no `tx_data` lane, as a binary
+    /// with `--egress` runs. The drain ends when the commit thread stops,
+    /// or when no receipt comes within the drain wait. Then the live
+    /// stream of the egress closes, the reader stops, and the threads join.
+    #[must_use]
+    pub fn run_on_egress(setup: HarnessSetup, reader: EgressReader) -> HarnessOutcome {
+        Pipeline::spawn(setup, Vec::new(), reader.sub).finish_closing(reader.live)
     }
 
     /// Feed every record of `input`, close the inputs, drain
@@ -376,7 +362,7 @@ impl ChannelHarness {
     /// engine runs.
     #[must_use]
     pub fn tx_receipts(&self) -> &Receiver<crate::CMessage> {
-        &self.tx_receipts
+        &self.pipeline.tx_receipts
     }
 
     /// Close every input, drain the rest of `tx_receipts`, and join the
@@ -392,30 +378,87 @@ impl ChannelHarness {
 
     /// End every input sender, so each reader sees EOF once it drains what
     /// was sent. The senders are the only fields that do not move out.
-    fn close_inputs(self) -> Draining {
-        Draining {
-            tx_receipts: self.tx_receipts,
-            threads: self.threads,
-            state: self.state,
-        }
+    fn close_inputs(self) -> Pipeline {
+        self.pipeline
     }
 }
 
-/// A harness whose inputs are closed: what is left is draining the
-/// receipts and joining the threads.
-struct Draining {
+/// The running pipeline: its `tx_receipts` stream, its threads, and the
+/// shared state.
+struct Pipeline {
     tx_receipts: Receiver<crate::CMessage>,
     threads: crate::Threads,
     state: crate::MockStateDatabase,
 }
 
-impl Draining {
-    /// Drain `tx_receipts` until the commit thread closes it, then join.
-    /// The drain runs first: a commit thread blocked on a full channel
-    /// would never exit.
+impl Pipeline {
+    /// Spawn the pipeline over the `tx_data` lanes `tx_data` and the
+    /// `tx_ordering` source `tx_ordering`, with one `tx_receipts`.
+    fn spawn<O>(setup: HarnessSetup, tx_data: Vec<ChanTxDataSub>, tx_ordering: O) -> Self
+    where
+        O: crate::TxOrderingSubscription + 'static,
+    {
+        let HarnessSetup {
+            cfg,
+            start,
+            snap,
+            tx_hook,
+        } = setup;
+        let (c_tx, tx_receipts) = bounded(RECEIPTS_DEPTH);
+        let threads = crate::Executor::<HarnessWiring<O>>::new(
+            cfg,
+            crate::Inbound {
+                tx_data,
+                tx_ordering,
+                join_recovery: None,
+                exec_stream: crate::reader::NoExecStream,
+            },
+            crate::Outbound {
+                tx_receipts: ChanReceiptsPub(c_tx),
+                snapshots: crate::MutatingSnapshotSource(snap.clone()),
+                writer_signal: Imm,
+                writer_queue: crate::WriterApplyingQueue::new(snap.clone()),
+            },
+            start,
+            crate::RoleHooks {
+                tx_hook,
+                ..crate::RoleHooks::none()
+            },
+        )
+        .spawn();
+        Self {
+            tx_receipts,
+            threads,
+            state: snap,
+        }
+    }
+
+    /// Drain `tx_receipts`, then join. The drain runs first: a commit
+    /// thread blocked on a full channel would never exit.
     fn finish(self) -> HarnessOutcome {
-        let receipts: Vec<_> =
-            std::iter::from_fn(|| self.tx_receipts.recv_timeout(RECEIPT_WAIT).ok()).collect();
+        let receipts = self.drain();
+        self.join(receipts)
+    }
+
+    /// Drain `tx_receipts`, close the live stream `live` of an egress
+    /// reader, then join.
+    fn finish_closing(self, live: Sender<Vec<u8>>) -> HarnessOutcome {
+        let receipts = self.drain_closing(live);
+        self.join(receipts)
+    }
+
+    /// Every receipt until the commit thread closes `tx_receipts`, or until
+    /// none comes within [`RECEIPT_WAIT`].
+    fn drain(&self) -> Vec<crate::CMessage> {
+        std::iter::from_fn(|| self.tx_receipts.recv_timeout(RECEIPT_WAIT).ok()).collect()
+    }
+
+    /// [`Self::drain`]. The live stream `_live` closes when this returns.
+    fn drain_closing(&self, _live: Sender<Vec<u8>>) -> Vec<crate::CMessage> {
+        self.drain()
+    }
+
+    fn join(self, receipts: Vec<crate::CMessage>) -> HarnessOutcome {
         HarnessOutcome {
             result: self.threads.join(),
             receipts,

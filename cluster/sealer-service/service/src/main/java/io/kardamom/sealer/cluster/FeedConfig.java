@@ -29,20 +29,16 @@ record FeedConfig(String aeronDir, int ringBytes, int termBytes, IdleCap idleCap
 
     /**
      * The settings from their property values, or empty when
-     * {@code aeronDir} is unset or empty.
+     * {@code aeronDir} is unset or empty. The feed walks the retained
+     * frames of the member on the heap or in the file, so it needs no
+     * other setting.
      *
-     * @param carryBytes whether the member keeps its retained frames in a file
-     * @param idleCap    the longest idle park of the feeder thread
-     * @throws IllegalArgumentException when the feed is on without the retained file, or the ring does not parse
+     * @param idleCap the longest idle park of the feeder thread
+     * @throws IllegalArgumentException when the ring does not parse
      */
-    static Optional<FeedConfig> parse(
-            final String aeronDir, final String ringBytes, final boolean carryBytes, final IdleCap idleCap) {
-        final Optional<String> dir = Optional.ofNullable(aeronDir).map(String::trim).filter(s -> !s.isEmpty());
-        if (dir.isPresent() && !carryBytes) {
-            throw new IllegalArgumentException(DIR_SETTING + " needs " + RetainedFile.Config.SETTING
-                + "=true: the feed replays from the retained file");
-        }
-        return dir.map(d -> new FeedConfig(d, ring(ringBytes), TERM_BYTES, idleCap));
+    static Optional<FeedConfig> parse(final String aeronDir, final String ringBytes, final IdleCap idleCap) {
+        return Optional.ofNullable(aeronDir).map(String::trim).filter(s -> !s.isEmpty())
+            .map(d -> new FeedConfig(d, ring(ringBytes), TERM_BYTES, idleCap));
     }
 
     private static int ring(final String ringBytes) {

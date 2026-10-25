@@ -98,6 +98,7 @@ final class SealerMetrics {
     private final AtomicLong fullRefBelowV5 = new AtomicLong();
     private final AtomicLong featureUnsupported = new AtomicLong();
     private volatile Rules rules = Rules.START;
+    private volatile FeedState feed = FeedState.OFF;
     /** The offers since the last sampled one. Only the service thread reads it. */
     private int offersToSample;
 
@@ -240,12 +241,22 @@ final class SealerMetrics {
         rules = next;
     }
 
-    /** The carry part of the admin status: the store, the carry window, and the retained frames. */
+    /** Set the state of the member feed. */
+    void feed(final FeedState next) {
+        feed = next;
+    }
+
+    /** The state of the member feed, for any thread. */
+    FeedState feed() {
+        return feed;
+    }
+
+    /** The carry part of the admin status: the store, the carry window, the retained frames and the feed. */
     MemberStatus.Carry carry() {
         final Rules now = rules;
         final VersionSwitch.Feature window = now.window();
         return new MemberStatus.Carry(now.retainedStore(), now.carryWindow(), window.activationOrigin(),
-            window.activationMs(), retainedFrames.get(), retainedBytes.get());
+            window.activationMs(), retainedFrames.get(), retainedBytes.get(), feed.label());
     }
 
     /** Write every series. Only the admin thread calls this. */
@@ -288,7 +299,9 @@ final class SealerMetrics {
             .single("kardamom_sealer_full_ref_below_v5_total", "counter",
                 "The full references that the member ordered below decision version 5.", fullRefBelowV5.get())
             .single("kardamom_sealer_feature_unsupported_total", "counter",
-                "The activations of the carry window on a member with the retained file.", featureUnsupported.get());
+                "The activations of the carry window on a member with the retained file.", featureUnsupported.get())
+            .single("kardamom_sealer_feed_state", "gauge",
+                "The state of the member feed: 0 off, 1 idle, 2 walking, 3 live, 4 gapped.", feed.value());
         text.family("kardamom_sealer_feature_state", "gauge",
             "The state of each feature: 0 no activation held, 1 held and off, 2 on.");
         now.features().forEach(f -> text.sample("kardamom_sealer_feature_state", featureLabel(f), f.state()));
