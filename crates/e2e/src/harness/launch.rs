@@ -205,18 +205,25 @@ impl<'a> StackLaunch<'a> {
             log_config,
             admission: self.v2_loop(),
             // KARDAMOM_E2E_VERDICTS=1 adds the verdict path to the v2 loop.
+            // The carry window restarts a sequencer on the v1 loop, which
+            // sends no verdict, so it keeps the receipts path.
             verdicts: self.v2_loop()
                 && !self.cfg.ingress_rows
+                && self.cfg.carry.is_none()
                 && std::env::var("KARDAMOM_E2E_VERDICTS").is_ok_and(|v| v == "1"),
+            exec_frames: self.cfg.carry.is_some(),
         }
     }
 
     /// `KARDAMOM_E2E_ADMISSION=1` runs the sequencers on the v2 loop, so the
     /// suite covers both loops. A scenario that needs transactions that
-    /// cannot pay keeps the v1 loop: the v2 filter refuses them.
+    /// cannot pay keeps the v1 loop: the v2 filter refuses them. The carry
+    /// window always runs the v2 loop: only the v2 loop offers a
+    /// transaction with its bytes.
     fn v2_loop(&self) -> bool {
         !self.cfg.unpayable_spends
-            && std::env::var("KARDAMOM_E2E_ADMISSION").is_ok_and(|v| v == "1")
+            && (self.cfg.carry.is_some()
+                || std::env::var("KARDAMOM_E2E_ADMISSION").is_ok_and(|v| v == "1"))
     }
 }
 
@@ -330,14 +337,7 @@ impl LocalStack {
         let (driver, sealer) =
             tokio::task::block_in_place(|| -> Result<(MediaDriver, SealerCluster)> {
                 let driver = MediaDriver::launch(&rootp)?;
-                let sealer = SealerCluster::launch(
-                    &rootp,
-                    &repo,
-                    cfg.sealer_members,
-                    cfg.cluster_tick_ms,
-                    &cfg.remote_origins,
-                    cfg.priority_fees,
-                )?;
+                let sealer = SealerCluster::launch(&rootp, &repo, &cfg, &driver.aeron_dir)?;
                 Ok((driver, sealer))
             })?;
 
@@ -351,6 +351,7 @@ impl LocalStack {
             .map(|i| services::spawn_sequencer(&spec, i))
             .collect::<Result<Vec<_>>>()?;
         let executor = services::spawn_executor(&spec)?;
+        let egress = cfg.carry.map(|_| spec.spawn_egress(None)).transpose()?;
         let wirings = stack_launch.build_l1_wiring(l1.as_ref()).await?;
         let feed_addr_file = root.path().join("validator-feed.addr");
         let validator = if cfg.validator {
@@ -363,6 +364,8 @@ impl LocalStack {
                     serve_feed_addr_file: cfg
                         .validator_serve_feed
                         .then_some(feed_addr_file.as_path()),
+                    egress: None,
+                    metrics_port: None,
                 },
             )?)
         } else {
@@ -377,6 +380,11 @@ impl LocalStack {
             .as_ref()
             .map(|f| services::spawn_da_watcher(&spec, &f.api_url))
             .transpose()?;
+        let batcher = cfg
+            .carry
+            .and(l1.as_ref())
+            .map(|l| super::carry::BatcherSide::launch(&spec, l))
+            .transpose()?;
         let ingress = services::spawn_ingress(&spec, &cfg.ingress)?;
         let notifier = cfg
             .notifier
@@ -390,6 +398,8 @@ impl LocalStack {
             da_watcher,
             l1_follower,
             verified_l1: wirings.verified_l1,
+            batcher,
+            egress,
             executor,
             validator,
             sequencers,
@@ -399,6 +409,7 @@ impl LocalStack {
             l1,
             genesis,
             log_config,
+            validator_l1: wirings.validator,
             executor_query_port,
             root,
             keep,
@@ -442,6 +453,16 @@ impl LocalStack {
                 self.notifier
                     .as_ref()
                     .map(|n| ("notifier".to_string(), n.service.metrics_addr)),
+            )
+            .chain(
+                self.egress
+                    .as_ref()
+                    .map(|e| ("egress".to_string(), e.service.metrics_addr)),
+            )
+            .chain(
+                self.batcher
+                    .as_ref()
+                    .map(|b| ("batcher".to_string(), b.metrics_addr())),
             )
             .chain(
                 self.sequencers
