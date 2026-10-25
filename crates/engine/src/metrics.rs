@@ -9,19 +9,23 @@ pub const STATE_COMMIT_DURATION_SECONDS: &str = "kardamom_executor_state_commit_
 pub const BLOCK_NUMBER: &str = "kardamom_executor_block_number";
 
 // The clustered sealer (the Java Aeron Cluster service) has no Prometheus
-// endpoint. So the executor re-exports the sealer's output as it decodes
-// cluster egress (`reader/cluster.rs`). Each in-order Boundary message bumps
-// the counter and sets the gauge to the sealer's block number. These metrics
-// measure the boundary stream at that executor's subscription. They do not
-// measure JVM-internal state.
+// endpoint. So the executor re-exports the sealer's output as it reads the
+// canonical stream (`reader::cluster::Reorder`). Each in-order Boundary
+// message bumps the counter and sets the gauge to the sealer's block number.
+// The end of each replay sets the gauge to the head that the replay reached,
+// so a reader at the head exports the head before the next boundary. The
+// gauge does not move down. These metrics measure the stream at that
+// executor's subscription. They do not measure JVM-internal state.
 //
-// The validator uses the same shared subscription, but it suppresses the
-// emission (`suppress_sealer_metrics`). So only executor exporters publish
-// these series. Probes can still take the `max()` across executor replicas;
-// each replica re-exports its own view.
+// The validator and the batcher read the same stream, but they suppress the
+// emission (`suppress_sealer_metrics`), on the cluster egress and on the
+// egress of the executors. So only executor exporters publish these series.
+// Probes can still take the `max()` across executor replicas; each replica
+// re-exports its own view.
 pub const SEALER_BLOCK_NUMBER: &str = "kardamom_sealer_block_number";
 pub const SEALER_BOUNDARIES_TOTAL: &str = "kardamom_sealer_boundaries_emitted_total";
-/// The sealer's block number as the validator's reader sees it. The name
+/// The sealer's block number as the reader of the validator, or of the
+/// batcher, sees it: by the same rules as `SEALER_BLOCK_NUMBER`. The name
 /// differs from `SEALER_BLOCK_NUMBER` on purpose: the executor's series is
 /// the documented observation point, and a second copy under that name
 /// breaks every `sum()` query over it. The validator's readiness rule
@@ -147,7 +151,7 @@ pub fn describe() {
     );
     metrics::describe_gauge!(
         SEALER_BLOCK_NUMBER,
-        "sealer's block number per its latest boundary, observed at cluster egress"
+        "sealer's block number per its latest boundary or replay end, observed by the executor's reader"
     );
     metrics::describe_counter!(
         SEALER_BOUNDARIES_TOTAL,
@@ -155,7 +159,7 @@ pub fn describe() {
     );
     metrics::describe_gauge!(
         VALIDATOR_SEALER_BLOCK_NUMBER,
-        "sealer's block number per its latest boundary, as the validator's reader sees it"
+        "sealer's block number per its latest boundary or replay end, as the validator's reader sees it"
     );
     metrics::describe_counter!(
         INVALID_TX_SKIPPED_TOTAL,

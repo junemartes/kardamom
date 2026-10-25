@@ -212,6 +212,81 @@ fn a_restart_reads_the_mark_of_a_reference_in_an_older_segment() {
     drop(store);
     let again = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
     assert_eq!(again.head().next_block, 7);
+    assert_eq!(
+        again.mark(),
+        REFERENCE.ahead(),
+        "the file holds R plus the lead"
+    );
+}
+
+/// The side file changes only when the mark passes it: a run of
+/// references inside the lead writes it once.
+#[test]
+fn a_mark_inside_the_lead_does_not_write_the_side_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path(), NonZeroU64::new(1000).unwrap(), GENESIS).unwrap();
+    let file = || RefMark::read(dir.path()).unwrap();
+    store.append(&with_a_reference()).unwrap();
+    assert_eq!(file(), REFERENCE.ahead());
+    // Block b holds the reference at index b, from block 6 on.
+    let refs = |blocks: std::ops::RangeInclusive<u64>| {
+        blocks
+            .flat_map(|b| [ref_record(b), boundary(b, b + 1)])
+            .collect::<Vec<_>>()
+    };
+    let lead_end = REFERENCE.ahead().block;
+    store.append(&refs(6..=lead_end)).unwrap();
+    let inside = RefMark {
+        index: lead_end,
+        block: lead_end,
+    };
+    assert_eq!(store.mark(), inside, "R in memory is exact");
+    assert_eq!(file(), REFERENCE.ahead(), "R stays inside the lead");
+    store.append(&refs(lead_end + 1..=lead_end + 1)).unwrap();
+    let past = RefMark {
+        index: lead_end + 1,
+        block: lead_end + 1,
+    };
+    assert_eq!(store.mark(), past);
+    assert_eq!(file(), past.ahead(), "R passed the file, so the file moves");
+}
+
+/// Empty blocks move the block of the next reference past the lead while
+/// its index stays inside it. The file then moves too.
+#[test]
+fn a_reference_past_the_lead_in_blocks_only_writes_the_side_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path(), NonZeroU64::new(1000).unwrap(), GENESIS).unwrap();
+    store.append(&with_a_reference()).unwrap();
+    let lead_end = REFERENCE.ahead().block;
+    // Block b holds only its boundary, at index b, from block 6 on.
+    let empty: Vec<_> = (6..=lead_end).map(|b| boundary(b, b + 1)).collect();
+    store.append(&empty).unwrap();
+    let block = lead_end + 1;
+    store
+        .append(&[ref_record(block), boundary(block, block + 1)])
+        .unwrap();
+    let top = RefMark {
+        index: block,
+        block,
+    };
+    assert!(
+        top.index < REFERENCE.ahead().index,
+        "the index is inside the lead"
+    );
+    assert_eq!(RefMark::read(dir.path()).unwrap(), top.ahead());
+}
+
+/// A clean stop writes the exact mark, so a restart after it reads no
+/// lead.
+#[test]
+fn a_close_writes_the_exact_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
+    store.append(&with_a_reference()).unwrap();
+    store.close().unwrap();
+    drop(store);
+    let again = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
     assert_eq!(again.mark(), REFERENCE);
 }
 
@@ -239,7 +314,7 @@ fn a_reset_keeps_or_raises_the_mark() {
     assert_eq!(store.mark(), higher, "a lower mark of the peer keeps R");
     drop(store);
     let again = Store::open(dir.path(), two_block_segments(), GENESIS).unwrap();
-    assert_eq!(again.mark(), higher, "the raised mark is on disk");
+    assert!(higher.within(again.mark()), "the raised mark is on disk");
 }
 
 /// A crash after the mark and before the sync of the segment can lose the
@@ -265,7 +340,7 @@ fn a_crash_before_the_segment_sync_leaves_the_mark_at_or_above_the_frames() {
     assert_eq!(again.head(), GENESIS, "the frames of the batch are lost");
     assert_eq!(
         again.mark(),
-        REFERENCE,
+        REFERENCE.ahead(),
         "the mark is above the surviving frames"
     );
 }

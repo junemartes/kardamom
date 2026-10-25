@@ -498,13 +498,18 @@ With `--carry-bytes`, `--egress <url>` (`KARDAMOM_EGRESS_URL`, off by default) m
 | Metric | Meaning |
 | --- | --- |
 | `kardamom_executor_input_source{source}` | 1 for the source that the executor reads, 0 for the other. `source` is `feed` (the member feed) or `service` (the serving service, or the egress with `--egress`). |
-| `kardamom_executor_source_mismatch_total{source}` | Canonical entries whose `keccak256(raw_tx)` is not the canonical id, by the source that sent them. The executor does not execute such an entry and does not stop: it leaves the source and reads the same index from the other source. |
+| `kardamom_executor_source_mismatch_total{source}` | Canonical entries whose `keccak256(raw_tx)` is not the canonical id, by the source that sent them. The executor does not execute such an entry. It leaves the source and reads the same index from the other source. It stops only when no source can serve the right bytes (see below). |
 
 - The executor leaves the feed when no frame comes for 6 s, when the feed loses its image, or on a mismatch. It goes back to the feed after the feed has one image for 30 s and a replay of the feed from its cursor reaches `REPLAY_DONE`.
 - Any increment of `kardamom_executor_source_mismatch_total` needs an operator: a member or a service sends bytes that do not match the ordered id. The log line is `the raw transaction does not hash to its canonical id; replaying from the other source`, with the source and the index.
 - A switch logs `switching the input source` with the old and the new source and the cursor.
 - A transaction reference at the cursor is a fault of the source: the reader has no `tx_data` lane to join it. The reader leaves the source and reads the same index from the other source.
 - When every source gives a reference at the same index, the reader stops with `UnjoinableReference { index }`. The log line is `no source holds the bytes of the transaction reference; stopping`, with the index. A source that never connected counts as one that gives the reference. Only a sequencer that offers a type-0 reference makes such an entry.
+- When every source gives a mismatch at the same index, the reader stops with `HashMismatch { index }`. The log line is `no source holds the right bytes of the entry; stopping`, with the index.
+  - A source that never connected counts as one that gives the mismatch. So a reader with one source stops on its first mismatch, after the silence window of the absent second source. This is an executor with no `--egress`, and a validator or a batcher with `--egress`.
+  - A source that refused the cursor below its floor also counts, as for a reference.
+  - A reader with two sources that connect keeps the switch for a mismatch on one source: the other source can serve the right bytes.
+  - The executor exits with status 1. The batcher run ends with the error `tx_ordering reader failed`. The validator holds the `validator_divergence` halt: see [`validator_divergence`](runbooks/validator_divergence.md).
 
 ### Executor pipeline
 
@@ -848,6 +853,7 @@ The egress (`kardamom-egress`) exports these metrics on `--metrics-addr` (`KARDA
 - Any increment of `kardamom_egress_copy_mismatch_total` needs an operator.
 - R is durable. The store keeps it in the side file `ref-mark` of its directory (16 bytes: the index, then the block, little endian), and reads it at start. A restart does not lower R.
   - The store writes the mark of a batch before the frames of the batch. After a crash, R is at or above every reference that the segments hold.
+  - The file holds R plus a lead of 65,536 indexes and 32 blocks. The store writes the file again only when R passes it, about once a minute at 1,000 tx/s. So a batch costs no sync of the mark. A clean stop writes the exact R. After a crash, R is up to that lead above the highest stored reference. The gates of a reader move then wait longer: up to 32 blocks for the gates that compare blocks, and up to 65,536 canonical indexes for the feature-5 upgrade check, which compares the reader cursors with the index of R. At the staging idle rate that is hours. After a crash, copy `ref-mark` from a peer that stopped cleanly, or wait.
   - A start at the floor of a peer keeps the higher of the two marks. The peer sends its mark in the headers `x-egress-ref-mark-index` and `x-egress-ref-mark-block` of its `410` answer.
   - R can stay above the stored references. That only delays the move of a reader to the egress.
   - A corrupt or hostile mark of a peer, for example `u64::MAX`, raises R for good: R never goes down. To recover, stop the egress, then copy `ref-mark` from the store directory of a healthy peer, then start the egress. Delete `ref-mark` only when the store holds no `RT_TXREF` frame.

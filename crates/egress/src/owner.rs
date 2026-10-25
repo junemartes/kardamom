@@ -173,7 +173,7 @@ impl<P: FramePublisher> Owner<P> {
             Ok(input) => self.on(input),
             Err(RecvTimeoutError::Timeout) => Ok(()),
             Err(RecvTimeoutError::Disconnected) => {
-                return ControlFlow::Break(self.parts.store.sync());
+                return ControlFlow::Break(self.parts.store.close());
             }
         };
         match taken.and_then(|()| self.sync_if_due()) {
