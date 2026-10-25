@@ -30,6 +30,7 @@ Section 10 lists the changes of each revision.
    | `executed` | executor, each of them | `tx_receipts` (exists), behind `KARDAMOM_NOTIFIER_EXECUTED` (decision 9) |
    | `receipt` | egress | `egress_receipts` (exists), with its rollback frames |
    | `posted` | batcher | `tx_events` (new, once for each batch) |
+   | `included` | batcher | `tx_events` (new, once for each batch) |
 
 4. The egress runs on its own nodes (`role=egress`), not on the executor nodes.
 5. The notifier publications are best effort. They never halt the chain. A lost event, a lost
@@ -681,12 +682,22 @@ Each PR merges alone. Each new path is behind a switch that is off by default, u
 | P2 | kardamom | `KARDAMOM_EGRESS_NODES` and the constraint `role=egress`, the README move steps. **Done:** #820, deployed on staging (see the lesson of #831 in 4.7) | none (off by default); the move needs P1 |
 | P3 | kardamom | **Done:** #821 (the `tx_events` frame, its format and stream) and #822 (the `accepted` and `sent` publishers of the ingress and the sequencer, `KARDAMOM_TX_EVENTS`, the allocation cases and the micro-benchmark). Left: the `rejected` record of the sequencer (kind 3), the batcher frame and its `posted`/`included` publisher, the `chain_status` stream, and the e2e case with the notifier down | none |
 | P4 | kardamom | **Done (core):** #823 (the stage table: the state and the bitmaps, the latest-state rule, the rollback) and #824 (the events path: `tx_events`, the `egress_receipts` tap with the rollbacks, the `tx_receipts` tap behind `KARDAMOM_NOTIFIER_EXECUTED`, the gaps, the stage metrics, `KARDAMOM_NOTIFIER_EVENTS`). Left: the `dropped` events from the `tx_drops` tap and the `rejected` events of `tx_events` kind 3 (decision 8) | P3 |
-| P4a | kardamom | the removal of the notifier webhooks (decision 2): the registry, the outbox, the cursors, the delivery loop, the forwarding of registrations to the peers, the sharding by subscription, `--peers`, the state directory `/opt/kardamom/notifier` and its volume, the move procedure of the webhook state in `deploy/cluster/README.md`, their tests and docs. No switch: no client uses webhooks, and staging had no webhook state. The rollout checks first that notifier-0 holds no registration (`/opt/kardamom/notifier` is empty). It comes before P7, the client feed work | none |
-| P5 | kardamom | the shards of the notifier (4.4) | P4 |
+| P4a | kardamom | the removal of the notifier webhooks (decision 2): the registry, the outbox, the cursors, the delivery loop, the forwarding of registrations to the peers, the sharding by subscription, `--peers`, the state directory `/opt/kardamom/notifier` and its volume, the move procedure of the webhook state in `deploy/cluster/README.md`, their tests and docs. The full removal list follows the table. No switch: no client uses webhooks, and staging had no webhook state. The rollout checks first that notifier-0 holds no registration (`/opt/kardamom/notifier` is empty). It comes before P7, the client feed work | none |
+| P5 | kardamom | the shards of the notifier (4.4). P4a removes `--peers`, so P5 brings back a peer list for the WebSocket forwarding, or redirects the client to the instance that owns its shard | P4 |
 | P6 | kardamom | the ingress halt from the explicit halts of `ChainStatus`, with no silence rule and a lifetime of 30 s for an explicit halt (`KARDAMOM_INGRESS_CHAIN_STATUS`), the age gauge and its alert, the users of the `sealer_no_quorum` halt of section 5 (the chaos recovery stage and cases, the proofs, the alert, the gate excuse, the runbooks, `docs/chaos-suite.md`, the chain status dashboard), the e2e scenario on `tx_events`, the dashboard panels | P3. Waits for #819 decisions 48-49 (no custom refusal kinds, no DA-lag guard) |
 | P7 | kardamom | after P4a. The receipt feed (`kardamom_subscribeReceipts`) on the notifier; the egress short wait, the executor fallback and `/v1/receipts`; the capped catch-up of the notifier; the receipt endpoints of the clients: the canary, the chaos suite, the e2e harness and the load tool | P4, P4a |
 | P8 | kardamom-infra | the second endpoint for the egress reads, and the infra variables of the new switches | P7 |
 | P9 | kardamom | the removals of section 5, the ack default `validated`, `docs/specs/egress-node-spec.md` marked superseded, the docs | P6, P7, P8 on staging for a week |
+
+The removal list of P4a, in full:
+
+- the webhook metrics and panels in `deploy/grafana/provisioning/dashboards-json/kardamom-notifier.json:82-121`;
+- `paths.notifier_dir` in `group_vars/all.yml:164` and `:186`, and the directory of the common role;
+- `--dir` and `KARDAMOM_NOTIFIER_DIR`;
+- the webhook sections of `docs/tx-status-events.md:214`, `docs/json-rpc.md:307`, `docs/failure-modes.md:1390` and `crates/types/src/tx_status.rs:9`;
+- the state paragraphs of `docs/specs/2026-10-24-elastic-ingress.md:535` and `:589-606`, marked superseded;
+- the off-identity fixture of the deploy tests: the notifier args change with no switch;
+- in kardamom-infra: the state notes in `docs/staging-launch.md`, the `hosts.ini` comment, and the `keep_disk` reason of the notifier nodes.
 
 ## 10. Changes from revision 1
 
