@@ -18,7 +18,7 @@ mod feeds;
 use std::num::NonZeroU32;
 
 use anyhow::{Context, Result};
-use args::Args;
+use args::{Args, TxEventsArg};
 use clap::Parser;
 use feeds::{LaneSub, LaneSubscriptions, PublishLoops};
 use kardamom_cluster_adapter::LiveCluster;
@@ -36,7 +36,6 @@ use kardamom_sequencer::lookup::LookupRequester;
 use kardamom_sequencer::outbound::SideChannels;
 use kardamom_sequencer::sealer_rules::{SealerRules, SealerVersion};
 use kardamom_sequencer::sequencer::Shutdown;
-use kardamom_types::tx_events::TxEventKind;
 
 /// The Aeron subscriptions and publisher this sequencer needs, all opened
 /// on the same runtime `rt`.
@@ -67,10 +66,7 @@ impl SideHandles {
     fn into_channels(self, origin: u16, lane: u8) -> SideChannels {
         let side = SideChannels::new(self.errors_pub, self.status_pub, self.drops_pub);
         match self.events {
-            Some(publisher) => side.with_tx_events(
-                TxEventsSink::new(publisher, origin, &[TxEventKind::Sent]),
-                lane,
-            ),
+            Some(publisher) => side.with_tx_events(TxEventsSink::new(publisher, origin), lane),
             None => side,
         }
     }
@@ -577,7 +573,7 @@ async fn main() -> anyhow::Result<()> {
     let mut plane = StreamPlane::from_config(&log_cfg, &format!("sequencer-{}", cfg.lane()))
         .context("build the stream plane")?;
 
-    let handles = Handles::open(&rt, &mut plane, &cfg, args.tx_events).await?;
+    let handles = Handles::open(&rt, &mut plane, &cfg, args.tx_events == TxEventsArg::On).await?;
     spawn_events_beacon(&mut plane, &rt).await?;
 
     let shutdown = Shutdown::new();
@@ -648,7 +644,7 @@ async fn main() -> anyhow::Result<()> {
         remote_epoch_pub: cluster_pub,
         side: handles
             .side
-            .into_channels(args.tx_events_origin(&cfg), cfg.lane()),
+            .into_channels(args.tx_events_origin(cfg.lane()), cfg.lane()),
         epochs: handles.deposits_sub,
         epoch_lane: resync.epoch_lane,
         remote_epochs: handles.remote_epochs_sub,

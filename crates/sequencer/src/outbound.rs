@@ -261,7 +261,7 @@ pub mod fakes {
 
     use alloy_primitives::B256;
     use kardamom_log::aeron_live::{FrameOffer, TxEventsSink};
-    use kardamom_types::tx_events::{TxEventKind, TxEventsView};
+    use kardamom_types::tx_events::TxEventsView;
     use kardamom_types::xchain::RemoteEpochRecord;
     use kardamom_types::{EpochRecord, TxRef, TxStatus};
 
@@ -347,7 +347,7 @@ pub mod fakes {
         /// frames that the sink sends.
         #[must_use]
         pub fn with_tx_events(mut self, offers: CountedOffers) -> Self {
-            let sink = TxEventsSink::new(offers, 0, &[TxEventKind::Sent]);
+            let sink = TxEventsSink::new(offers, 0);
             self.events = Some(Arc::new(Mutex::new(sink)));
             self
         }

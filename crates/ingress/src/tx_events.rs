@@ -14,7 +14,7 @@ use std::sync::Arc;
 use alloy_primitives::B256;
 use crossbeam_queue::ArrayQueue;
 use kardamom_log::aeron_live::{FRAME_MAX_AGE, FrameOffer, TxEventsPublisherHandle, TxEventsSink};
-use kardamom_types::tx_events::TxEventKind;
+use metrics::Counter;
 
 /// The hashes waiting for the next frame: about 2 MiB, more than 60 ms of
 /// the target rate of 1,000,000 tx/s.
@@ -27,14 +27,17 @@ const QUEUE_FULL_TOTAL: &str = "kardamom_tx_events_queue_full_total";
 #[derive(Clone)]
 pub struct AcceptedQueue {
     hashes: Arc<ArrayQueue<B256>>,
+    /// `kardamom_tx_events_queue_full_total{origin}`, registered once.
+    full: Counter,
 }
 
 impl AcceptedQueue {
-    /// An empty queue.
+    /// An empty queue of the ingress `origin`.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(origin: u16) -> Self {
         Self {
             hashes: Arc::new(ArrayQueue::new(QUEUE_HASHES)),
+            full: metrics::counter!(QUEUE_FULL_TOTAL, "origin" => origin.to_string()),
         }
     }
 
@@ -42,10 +45,10 @@ impl AcceptedQueue {
     /// and return the queue that feeds it.
     #[must_use]
     pub fn spawn(publisher: TxEventsPublisherHandle, origin: u16) -> Self {
-        let queue = Self::new();
+        let queue = Self::new(origin);
         let drain = queue.clone();
         tokio::spawn(async move {
-            let mut sink = TxEventsSink::new(publisher, origin, &[TxEventKind::Accepted]);
+            let mut sink = TxEventsSink::new(publisher, origin);
             let mut tick = tokio::time::interval(FRAME_MAX_AGE);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -59,7 +62,7 @@ impl AcceptedQueue {
     /// Queue the `accepted` record of `tx_hash`. Never waits.
     pub fn note(&self, tx_hash: B256) {
         if self.hashes.push(tx_hash).is_err() {
-            metrics::counter!(QUEUE_FULL_TOTAL).increment(1);
+            self.full.increment(1);
         }
     }
 
@@ -69,11 +72,5 @@ impl AcceptedQueue {
             sink.accepted(&hash);
         }
         sink.flush();
-    }
-}
-
-impl Default for AcceptedQueue {
-    fn default() -> Self {
-        Self::new()
     }
 }

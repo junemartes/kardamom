@@ -9,7 +9,7 @@ use std::hint::black_box;
 use alloy_primitives::B256;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use kardamom_log::aeron_live::{FrameOffer, TxEventsSink};
-use kardamom_types::tx_events::{MAX_RECORDS, TxEventKind};
+use kardamom_types::tx_events::MAX_RECORDS;
 
 /// An offer that only reads the frame.
 struct NoOffer;
@@ -25,7 +25,7 @@ fn sent_records(c: &mut Criterion) {
     let hashes: Vec<B256> = (0..MAX_RECORDS as u64)
         .map(|i| B256::left_padding_from(&i.to_be_bytes()))
         .collect();
-    let mut sink = TxEventsSink::new(NoOffer, 0, &[TxEventKind::Sent]);
+    let mut sink = TxEventsSink::new(NoOffer, 0);
     group.throughput(Throughput::Elements(MAX_RECORDS as u64));
     group.bench_function("sent_full_frame", |b| {
         b.iter(|| {

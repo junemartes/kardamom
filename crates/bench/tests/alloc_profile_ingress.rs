@@ -303,10 +303,9 @@ impl kardamom_log::aeron_live::FrameOffer for NoOffer {
 fn accepted_records_allocate_nothing_for_each_transaction() {
     use kardamom_ingress::tx_events::AcceptedQueue;
     use kardamom_log::aeron_live::TxEventsSink;
-    use kardamom_types::tx_events::TxEventKind;
     const TXS: u64 = 50_000;
-    let queue = AcceptedQueue::new();
-    let mut sink = TxEventsSink::new(NoOffer, 0, &[TxEventKind::Accepted]);
+    let queue = AcceptedQueue::new(0);
+    let mut sink = TxEventsSink::new(NoOffer, 0);
     let hashes: Vec<B256> = (0..TXS).map(|i| keccak256(i.to_le_bytes())).collect();
     let profiler = dhat::Profiler::builder().testing().build();
     let before = dhat::HeapStats::get().total_blocks;

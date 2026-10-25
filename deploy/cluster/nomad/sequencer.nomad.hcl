@@ -268,7 +268,9 @@ job "sequencer" {
             KARDAMOM_METRICS_ADDR  = "0.0.0.0:${var.metrics_base + 10 * parseint(group.key, 10)}"
             KARDAMOM_HOST_ID       = "node${meta.node_index}-seq-${group.key}"
             KARDAMOM_PRIORITY_FEES = var.priority_fees == "on" ? "true" : "false"
-            KARDAMOM_TX_EVENTS     = var.tx_events == "on" ? "true" : "false"
+            KARDAMOM_TX_EVENTS     = var.tx_events
+            # The replica of the lane: the twins publish under two origins.
+            KARDAMOM_TX_EVENTS_ORIGIN = "${NOMAD_ALLOC_INDEX}"
           }
 
           template {
