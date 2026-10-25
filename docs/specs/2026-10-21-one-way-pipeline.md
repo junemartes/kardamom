@@ -132,11 +132,28 @@ paths of today. This amendment removes them.
     - The path of an upgrade: the sealer builds a block with a time after the activation; the
       executors see that boundary; the egress sees it and sends the state changes to the
       sequencer; the sequencer sees the feature as active.
-    - Consequence: the sequencer learns a switch a few blocks after the sealer. A future feature
-      that changes what the sequencer sends needs the sealer to accept the old and the new format
-      for a while after the switch.
+    - The sequencer learns a switch a few blocks after the sealer. Decision 54 makes a format
+      change independent of that delay.
 
     Reason: one input for the sequencer, and no message from the sealer to an earlier stage.
+
+54. **Separate feature flags for the sealer and the sequencer (D21, user decision of
+    2026-10-25).** The chain config and `KardamomChainState` hold feature flags in one namespace
+    per service (for example a sealer namespace and a sequencer namespace). Each service reads
+    only its own flags.
+    - The sealer takes its flags through the generic activation (ingress kind 11), as today.
+    - The sequencer reads its flags from the state changes on the egress (decision 53).
+    - A change of the format between the sequencer and the sealer goes in three upgrade
+      transactions:
+      1. a sealer flag "accept the new format": the sealer accepts both formats from a block
+         boundary;
+      2. a sequencer flag "send the new format": the sequencer switches when it sees a block at or
+         after the activation time, whatever the delay of the egress;
+      3. a sealer flag "require the new format", sent only after the sequencer has switched.
+    - No step depends on the delay of the egress.
+
+    Reason: a service never depends on the schedule of another service, and the order of the
+    transactions makes each step safe.
 
 ### A.3 What replaces each refusal kind (decision 48)
 
