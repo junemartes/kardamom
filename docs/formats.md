@@ -66,7 +66,6 @@ The layout tests of the frozen formats:
 | `executor-markers` | `kardamom-executor` | the text of a fixed rollback marker, and its parse |
 | `receipt-ledger` | `kardamom-executor` | the slot count and the bytes of a fixed slot, and its decode |
 | `egress-ref-mark` | `kardamom-egress` | the bytes of a fixed mark, and its read |
-| `notifier-outbox` | `kardamom-notifier` | rkyv archived size and alignment of `OutboxRecord` |
 | `redis-cache` | `kardamom-cache` | the keys of fixed samples |
 | `canary-journal`, `canary-store`, `canary-market` | `kardamom-canary` | the JSON of fixed samples |
 
@@ -152,9 +151,11 @@ to a retired format:
   neither shared nor permanent. The rolling deploy then carries the
   change, with no rollback floor. The deploy record keeps the list.
 - Give the allowance only when the release removes the service that
-  owned the format, as the removal of the notifier did for
-  `notifier-outbox`. A rollback then starts the old service on its own
-  file, which no release changed in the meantime.
+  owned the format, or the part of it that used the file, as the removal
+  of the notifier webhooks did for `notifier-outbox`: the service stays,
+  and no release reads or writes the file again. A rollback then starts
+  the old service on its own file, which no release changed in the
+  meantime.
 - Do not give it for a format that a running service renames, for
   example a new layout of a frozen format under a new id (rule 6). The
   new release stops updating the old file, and a rollback starts the old

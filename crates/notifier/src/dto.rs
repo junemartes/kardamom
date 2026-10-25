@@ -1,5 +1,5 @@
 //! The JSON shapes a client sees: the status event, the subscription
-//! filter, the lag marker, and the webhook registration.
+//! filter, and the lag marker.
 //!
 //! Keys are `snake_case`. An absent optional value is omitted, never
 //! `null`.
@@ -31,13 +31,43 @@ pub struct TxStatusEvent {
 
 /// The `stage` word of an event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Stage {
     Accepted,
     Offered,
     Sealed,
     Executed,
     Rejected,
+    /// The sequencer offered the transaction to the sealer (`tx_events`).
+    Sent,
+    /// The egress holds the merged receipt (`egress_receipts`).
+    Receipt,
+    /// A rollback revoked the `executed` and `receipt` of the transaction.
+    RolledBack,
+    /// The batch of the block of the transaction was sent to L1. No input
+    /// makes it yet: the batcher frames wait for the decisions on #819.
+    Posted,
+    /// The batch transaction is in an L1 block. No input makes it yet.
+    Included,
+}
+
+impl Stage {
+    /// The word of the stage, as the JSON shows it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Offered => "offered",
+            Self::Sealed => "sealed",
+            Self::Executed => "executed",
+            Self::Rejected => "rejected",
+            Self::Sent => "sent",
+            Self::Receipt => "receipt",
+            Self::RolledBack => "rolled_back",
+            Self::Posted => "posted",
+            Self::Included => "included",
+        }
+    }
 }
 
 impl From<TxStageKind> for Stage {
@@ -167,23 +197,4 @@ impl Lagged {
             skipped,
         }
     }
-}
-
-/// A webhook registration: `POST /webhooks`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WebhookRequest {
-    /// The URL the notifier posts every matching event to.
-    pub url: String,
-    pub filter: StatusFilter,
-    /// The HMAC-SHA256 key of the signature header.
-    pub secret: String,
-}
-
-/// The answer to a registration: the subscription id and the instance
-/// that delivers it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WebhookAck {
-    pub id: B256,
-    pub owner: u32,
 }

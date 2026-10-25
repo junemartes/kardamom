@@ -271,6 +271,10 @@ workloads_ingress_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_INGRESS_RECE
 workloads_tx_events: "{{ lookup('env', 'KARDAMOM_TX_EVENTS') }}"
 # The receipts of the notifier from egress_receipts.
 workloads_notifier_receipts_from_egress: "{{ lookup('env', 'KARDAMOM_NOTIFIER_RECEIPTS_FROM_EGRESS') }}"
+# The events path of the notifier, and its executor stage
+# (docs/specs/2026-10-25-client-events.md).
+workloads_notifier_events: "{{ lookup('env', 'KARDAMOM_NOTIFIER_EVENTS') }}"
+workloads_notifier_executed: "{{ lookup('env', 'KARDAMOM_NOTIFIER_EXECUTED') }}"
 # The egress on its own nodes (nomad/egress.nomad.hcl, egress_nodes): "on"
 # or "off". Empty keeps the job's "off" default: the egress stays on the
 # executor nodes. Switch it on only when the egress nodes exist, and move
@@ -318,6 +322,8 @@ workloads_egress_job_vars:
     tx_events: "{{ workloads_tx_events }}"
   notifier:
     receipts_from_egress: "{{ workloads_notifier_receipts_from_egress }}"
+    events: "{{ workloads_notifier_events }}"
+    executed: "{{ workloads_notifier_executed }}"
   # Prometheus scrapes the egress only where it runs.
   monitoring:
     egress: "{{ 'on' if workloads_egress | bool else '' }}"

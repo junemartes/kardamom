@@ -247,7 +247,7 @@ Beyond `cargo test`, two suites answer different questions.
 | [`docs/l1-data-path.md`](docs/l1-data-path.md) | The batcher, the EigenDA proxy, the settlement contract, the inbox indexer, the L1 followers and `kardamom-reconstruct`. |
 | [`docs/json-rpc.md`](docs/json-rpc.md) | The client JSON-RPC API of the ingress: methods, errors, receipt fields, fee RPCs and subscriptions. |
 | [`docs/priority-fees.md`](docs/priority-fees.md) | Priority fees from end to end. |
-| [`docs/tx-status-events.md`](docs/tx-status-events.md) | The notifier: the WebSocket status feed and the webhooks. |
+| [`docs/tx-status-events.md`](docs/tx-status-events.md) | The notifier: the WebSocket status feed. |
 | [`docs/STYLE.md`](docs/STYLE.md) | The code style rules and the checks that `just style` runs. |
 | [`deploy/cluster/README.md`](deploy/cluster/README.md) | The cluster deploy: the local container profile, recipes, environment switches and images. |
 | [`deploy/cluster/PRODUCTION.md`](deploy/cluster/PRODUCTION.md) | The production profile: role placement, bootstrap, enrollment, and host and network settings. |

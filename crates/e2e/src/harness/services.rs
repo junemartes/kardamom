@@ -280,7 +280,7 @@ pub struct SpawnedNotifier {
 }
 
 /// Spawn `kardamom-notifier`: the status feed over the stack's Aeron
-/// dir, with its webhook directory under the stack root.
+/// dir.
 ///
 /// # Errors
 /// Returns an error when the binary is not built or the process fails to
@@ -291,9 +291,7 @@ pub fn spawn_notifier(spec: &ServiceSpec<'_>) -> Result<SpawnedNotifier> {
     let mut cmd = Command::new(bin("kardamom-notifier")?);
     cmd.arg("--aeron-dir")
         .arg(spec.aeron_dir)
-        .args(["--bind", &format!("127.0.0.1:{feed_port}")])
-        .arg("--dir")
-        .arg(spec.root.join("notifier"));
+        .args(["--bind", &format!("127.0.0.1:{feed_port}")]);
     with_log_config(&mut cmd, spec);
     cmd.args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
         .args(["--host-id", "e2e-notifier"]);

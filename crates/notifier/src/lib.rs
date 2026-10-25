@@ -4,12 +4,11 @@
 //! `tx_errors`, and derives one feed of status events: `offered`,
 //! `sealed`, `executed`, `rejected`, one per step a transaction takes.
 //! It keeps the last minutes of events in a ring, indexed by hash and by
-//! sender, and serves them two ways:
-//!
-//! - the WebSocket method `kardamom_subscribeTxStatus(filter)`, which
-//!   replays the ring for the filter and then streams;
-//! - webhook subscriptions, `POST /webhooks`, delivered at least once
-//!   from a per-subscription outbox on disk.
+//! sender, and serves them through the WebSocket method
+//! `kardamom_subscribeTxStatus(filter)`, which replays the ring for the
+//! filter and then streams. The service holds no state on disk: a
+//! restarted instance starts with an empty ring. The webhooks are gone
+//! (2026-10-25). Offline delivery comes later through a task queue.
 //!
 //! Every instance taps the streams itself: the streams are the queue,
 //! and no broker sits between the pipeline and the fan-out. Nothing here
@@ -22,25 +21,19 @@
 //! - [`hub`]: the task that owns the ring and fans events out.
 //! - [`taps`]: the three Aeron subscriptions.
 //! - [`feed`]: the WebSocket subscription.
-//! - [`webhooks`], [`delivery`], [`outbox`], [`shard`]: webhook
-//!   registration, the appender and the delivery loop, the on-disk
-//!   outbox, and the instance sharding.
-//! - [`server`]: the one listener for both client surfaces.
+//! - [`server`]: the listener of the feed.
 
 // The `#[rpc]` subscription methods expand to functions that carry a bare
 // `#[must_use]` and return a pinned boxed future, which is `#[must_use]` on
 // its own. The lint fires in the macro's output, so it is allowed here.
 #![allow(clippy::double_must_use)]
 
-pub mod delivery;
 pub mod dto;
+pub mod events;
 pub mod feed;
 pub mod hub;
 pub mod metrics;
-pub mod outbox;
 pub mod ring;
 pub mod server;
-pub mod shard;
 pub mod stages;
 pub mod taps;
-pub mod webhooks;

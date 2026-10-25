@@ -1093,7 +1093,8 @@ class DeployTest(Deploys):
         self.run_deploy(check=True)
         plans = self.api.state['plans']
         self.assertNotIn('egress', plans)
-        flags = {'--exec-frames', '--egress', '--receipt-query-endpoints', '--receipts-from-egress'}
+        flags = {'--exec-frames', '--egress', '--receipt-query-endpoints', '--receipts-from-egress', '--events',
+                 '--executed'}
         for name in ('executor', 'validator', 'batcher', 'ingress', 'notifier'):
             self.assertEqual(flags & set(self.job_args(plans[name])), set(), name)
         self.assertNotIn('receipts_from_egress', self.job_templates(plans['sequencer']))
@@ -1135,6 +1136,18 @@ class DeployTest(Deploys):
         self.assertIn('--receipts-from-egress', self.job_args(plans['notifier']))
         self.assertIn('receipts_from_egress = true', self.job_templates(plans['sequencer']))
         self.assertIn('service "kardamom-egress-metrics|any"', self.job_templates(plans['monitoring']))
+
+    def test_the_notifier_events_path_takes_its_two_switches(self):
+        """KARDAMOM_NOTIFIER_EVENTS and KARDAMOM_NOTIFIER_EXECUTED reach the notifier, and only the notifier."""
+        self.run_deploy({'workloads_notifier_events': 'on'}, check=True)
+        args = self.job_args(self.api.state['plans']['notifier'])
+        self.assertEqual(args[args.index('--events') + 1], 'on')
+        self.assertEqual(args[args.index('--executed') + 1], 'off')
+        self.run_deploy({'workloads_notifier_events': 'on', 'workloads_notifier_executed': 'on'}, check=True)
+        args = self.job_args(self.api.state['plans']['notifier'])
+        self.assertEqual(args[args.index('--executed') + 1], 'on')
+        for name in ('ingress', 'sequencer', 'executor'):
+            self.assertNotIn('--events', self.job_args(self.api.state['plans'][name]), name)
 
     def test_the_egress_nodes_switch_moves_only_the_egress(self):
         """Off, the egress places on the executor nodes. On, it places on
@@ -1346,25 +1359,21 @@ class DeployTest(Deploys):
                 self.run_deploy(check=True, success=False, environ={'KARDAMOM_IDLE_CAP_US': value})
 
     # The plan of the notifier and of the media drivers for each value of
-    # the notifier switch: the job constraint, the count, the peers, the
-    # memory, the ring cap, and each driver group with its node class
+    # the notifier switch: the job constraint, the count, the memory, the
+    # ring cap, and each driver group with its node class
     # constraint and its idle cap. The fake cluster has two notifier nodes.
     NOTIFIER_PLACEMENTS = (
         ({}, {
             'constraint': ('${meta.role}', '=', 'ingress'), 'count': 2, 'memory': 1024, 'ring': 1000000,
-            'peers': [f'http://ingress-{i}.node.dc1.consul:8547' for i in range(2)],
             'drivers': {'aeron': (None, '50')}}),
         ({'KARDAMOM_NOTIFIER_NODES': 'off'}, {
             'constraint': ('${meta.role}', '=', 'ingress'), 'count': 2, 'memory': 1024, 'ring': 1000000,
-            'peers': [f'http://ingress-{i}.node.dc1.consul:8547' for i in range(2)],
             'drivers': {'aeron': (None, '50')}}),
         ({'KARDAMOM_NOTIFIER_NODES': 'on'}, {
             'constraint': ('${meta.roles}', 'set_contains', 'notifier'), 'count': 1, 'memory': 512, 'ring': 250000,
-            'peers': ['http://notifier-0.node.dc1.consul:8547'],
             'drivers': {'aeron': ('!=', '50'), 'aeron-notifier': ('=', '1000')}}),
         ({'KARDAMOM_NOTIFIER_NODES': 'on', 'KARDAMOM_NOTIFIER_COUNT': '2'}, {
             'constraint': ('${meta.roles}', 'set_contains', 'notifier'), 'count': 2, 'memory': 512, 'ring': 250000,
-            'peers': [f'http://notifier-{i}.node.dc1.consul:8547' for i in range(2)],
             'drivers': {'aeron': ('!=', '50'), 'aeron-notifier': ('=', '1000')}}),
     )
 
@@ -1418,9 +1427,11 @@ class DeployTest(Deploys):
         self.assertEqual((constraint['LTarget'], constraint['Operand'], constraint['RTarget']),
                          expected['constraint'])
         self.assertEqual(group['Count'], expected['count'])
-        self.assertEqual(args[args.index('--instance-count') + 1], str(expected['count']))
+        # The notifier keeps no state, so the instances need no count and
+        # no peers.
+        self.assertNotIn('--instance-count', args)
+        self.assertNotIn('--peers', args)
         self.assertIn({'LTarget': '', 'RTarget': 'true', 'Operand': 'distinct_hosts'}, group['Constraints'])
-        self.assertEqual(args[args.index('--peers') + 1].split(','), expected['peers'])
         self.assertEqual(task['Resources']['MemoryMB'], expected['memory'])
         self.assertEqual(args[args.index('--ring-max-events') + 1], expected['ring'])
         drivers = {g['Name']: (g['Constraints'], g['Tasks'][0]['Env']['KARDAMOM_IDLE_CAP_US'])

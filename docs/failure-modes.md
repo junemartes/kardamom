@@ -1387,8 +1387,7 @@ The notifier is off the hot path by construction. It reads `tx_status`, `tx_rece
 - A back-pressured frame is dropped after a bounded retry. The drop counts in `kardamom_log_best_effort_dropped_total{stream_id="1018"}`.
 - The receipt stream stays the truth. A client that misses a status reads the receipt.
 - A restart loses the in-memory ring. A WebSocket client that reconnects replays what the new ring holds.
-- Webhook subscriptions and their outboxes live on disk. A restart resumes delivery from the persisted cursor, at least once.
-- The two instances shard subscriptions by a rendezvous hash of the id. Both store every registration. The shard of a lost instance moves to the twin when the instance count changes.
+- The notifier keeps no state on disk. The webhooks are removed (2026-10-25); offline delivery comes later through a task queue. A lost instance loses only its ring, and its clients reconnect to another instance.
 - The `Sealed` stage needs an egress channel on the ingress. See [`tx-status-events.md`](tx-status-events.md) for the API, the settings and the metrics.
 
 ## Transaction canary
