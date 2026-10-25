@@ -307,6 +307,14 @@ impl<F: Transport, S: Transport> Switch<F, S> {
         }
     }
 
+    /// Whether the active source is [`Transport::lossy`].
+    pub(crate) fn lossy(&self) -> bool {
+        match self.active {
+            Source::Feed => self.feed.lossy(),
+            Source::Service => self.service.lossy(),
+        }
+    }
+
     /// The replay of the active source reached its head.
     pub(crate) fn live(&mut self) {
         *self.marks.slot(self.active) = None;
