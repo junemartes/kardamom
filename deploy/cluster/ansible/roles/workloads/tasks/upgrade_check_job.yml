@@ -2,7 +2,9 @@
 # One service of the upgrade check: the registered job
 # workloads_upgrade_job.name must carry every job meta of
 # workloads_upgrade_job.metas, and every live allocation must run that job
-# version. upgrade_check.yml loops over workloads_upgrade_jobs.
+# version. upgrade_check.yml loops over workloads_upgrade_jobs. A job with
+# `optional: true` passes when Nomad does not know it: no instance of it
+# runs.
 - name: Read the registered {{ workloads_upgrade_job.name }}
   ansible.builtin.include_tasks: read_job.yml
   vars:
@@ -15,6 +17,7 @@
       X-Nomad-Token: "{{ workloads_nomad_token }}"
     status_code: [200, 404]
   register: workloads_upgrade_allocations
+  check_mode: false
 
 - name: Keep the live allocations and the missing metas of {{ workloads_upgrade_job.name }}
   ansible.builtin.set_fact:
@@ -38,3 +41,4 @@
       {{ workloads_upgrade_missing | join(', ') }}), no {{ workloads_upgrade_job.name }} runs, or an allocation of
       an older job version still runs ({{ workloads_upgrade_live | map(attribute='JobVersion') | unique | list }}).
       Deploy the release to every {{ workloads_upgrade_job.name }}, then run the check again.
+  when: not (workloads_upgrade_job.optional | default(false) and workloads_registered_job.status == 404)

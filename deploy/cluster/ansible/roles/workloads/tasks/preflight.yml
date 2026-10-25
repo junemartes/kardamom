@@ -57,34 +57,95 @@
       Each egress switch is on, off or empty: {{ workloads_switches }}.
       A reader switch ({{ workloads_readers_on }}) needs KARDAMOM_EGRESS=1, and the egress needs KARDAMOM_EXEC_FRAMES=on.
 
-# With the switch on, the notifier places one instance on each notifier
-# node (distinct_hosts). An instance without a node is never placed, and
-# the deployment never turns healthy. The filter matches the exact role
-# in the comma-separated role set, as set_contains does. An empty count
-# is the job's default, 1.
-- name: Read the ready notifier nodes
+# The switches of the carry window. The executor on a sealer node uses
+# the shared media driver of that node, which runs there only with the
+# member feed. One executor for each member keeps the void voters and the
+# peers of the egress the same.
+- name: Validate the executors on the sealer nodes
+  ansible.builtin.assert:
+    that:
+      - workloads_member_feed in ['', 'on', 'off']
+      - workloads_exec_on_sealers in ['', 'on', 'off']
+      - >-
+        workloads_exec_on_sealers != 'on'
+        or (workloads_member_feed == 'on' and node_classes.sealer.count | int == node_classes.executor.count | int)
+    fail_msg: >-
+      KARDAMOM_MEMBER_FEED and KARDAMOM_EXEC_ON_SEALERS are on, off or empty. KARDAMOM_EXEC_ON_SEALERS=on needs
+      KARDAMOM_MEMBER_FEED=on and one executor for each sealer member (node_classes.executor.count equal to
+      node_classes.sealer.count).
+
+# A carry executor reads the member feed of its node, then the egress. It
+# sends no recorded cursor: the executor refuses --exec-cursor with
+# --carry-bytes.
+- name: Validate the carry executors
+  ansible.builtin.assert:
+    that:
+      - workloads_carry_executors | string is match('^([0-9]+(,[0-9]+)*)?$')
+      - workloads_carry_executor_ids | unique | length == workloads_carry_executor_ids | length
+      - workloads_carry_executor_ids | select('ge', node_classes.sealer.count | int) | list | length == 0
+      - >-
+        workloads_carry_executor_ids | length == 0
+        or (workloads_exec_on_sealers == 'on' and workloads_egress | bool and workloads_exec_cursor != 'on'
+            and workloads_egress_job_vars.executor.egress_url | length > 0)
+    fail_msg: >-
+      KARDAMOM_CARRY_EXECUTORS ("{{ workloads_carry_executors }}") is empty or a list of distinct member indexes
+      below {{ node_classes.sealer.count }}, such as 0,1. A list needs KARDAMOM_EXEC_ON_SEALERS=on, KARDAMOM_EGRESS=1
+      with the egress URL of the executors, and KARDAMOM_EXEC_CURSOR not on.
+
+- name: Validate the sequencer version floor
+  ansible.builtin.assert:
+    that: workloads_sealer_version_floor | string is match('^[0-5]?$')
+    fail_msg: >-
+      KARDAMOM_SEALER_VERSION_FLOOR ("{{ workloads_sealer_version_floor }}") is empty or a decision version from 0 to 5.
+
+# The release gate compares the value with the registered sealer, so it
+# only rises on a live chain.
+- name: Validate the sealer retention
+  ansible.builtin.assert:
+    that: >-
+      workloads_cluster_retention | string | length == 0
+      or (workloads_cluster_retention | string is match('^[0-9]+$')
+          and workloads_cluster_retention | int > 0
+          and workloads_cluster_retention | int <= workloads_retention_cap_frames | int)
+    fail_msg: >-
+      KARDAMOM_CLUSTER_RETENTION ("{{ workloads_cluster_retention }}") is empty or a frame count from 1 to
+      {{ workloads_retention_cap_frames }}. A replay over a cluster session queues every wanted frame at once, and a
+      larger window passes the backlog limit of the session.
+
+# With its switch on, the notifier and the egress each place one instance
+# on each node of their role (distinct_hosts). An instance without a node
+# is never placed, and the deployment never turns healthy. So the
+# preflight counts the ready, eligible nodes of each role before any job
+# changes. The filter matches the exact role in the comma-separated role
+# set, as set_contains does. An empty notifier count is the job's
+# default, 1.
+- name: Read the ready nodes of each moved role
   ansible.builtin.uri:
-    url: "{{ workloads_nomad_addr }}/v1/nodes?filter={{ workloads_notifier_node_filter | urlencode }}"
+    url: "{{ workloads_nomad_addr }}/v1/nodes?filter={{ workloads_role_node_filter | urlencode }}"
     headers:
       X-Nomad-Token: "{{ workloads_nomad_token }}"
   vars:
-    workloads_notifier_node_filter: >-
-      Meta.roles matches "(^|,) *notifier *(,|$)" and Status == "ready" and SchedulingEligibility == "eligible"
-  register: workloads_notifier_node_list
+    workloads_role_node_filter: >-
+      Meta.roles matches "(^|,) *{{ item.role }} *(,|$)" and Status == "ready" and SchedulingEligibility == "eligible"
+  loop: "{{ workloads_moved_roles }}"
+  loop_control:
+    label: "{{ item.role }}"
+  register: workloads_role_node_lists
   check_mode: false
-  when: workloads_notifier_nodes == 'on'
 
-- name: Require a notifier node for each notifier instance
+- name: Require a node for each instance of a moved role
   vars:
-    workloads_notifier_instances: "{{ workloads_notifier_count | default('1', true) | int }}"
-    workloads_notifier_ready: "{{ workloads_notifier_node_list.json | map(attribute='Name') | sort }}"
+    workloads_role_ready: "{{ item.json | map(attribute='Name') | sort }}"
   ansible.builtin.assert:
     that:
-      - workloads_notifier_instances | int <= workloads_notifier_ready | length
+      - item.item.instances | int <= workloads_role_ready | length
     fail_msg: >-
-      KARDAMOM_NOTIFIER_COUNT ({{ workloads_notifier_instances }}) is above the count of the ready, eligible
-      Nomad nodes with notifier in meta.roles ({{ workloads_notifier_ready }}). Add the notifier nodes or lower the count.
-  when: workloads_notifier_nodes == 'on'
+      {{ item.item.count_name }} ({{ item.item.instances }}) is above the count of the ready, eligible
+      Nomad nodes with {{ item.item.role }} in meta.roles ({{ workloads_role_ready }}). Add the {{ item.item.role }}
+      nodes or lower the count.
+  loop: "{{ workloads_role_node_lists.results }}"
+  loop_control:
+    label: "{{ item.item.role }}"
 
 - name: Validate image provenance
   ansible.builtin.import_tasks: provenance.yml

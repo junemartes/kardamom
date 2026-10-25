@@ -47,6 +47,34 @@ variable "datacenter" {
   type    = string
   default = "dc1"
 }
+# The executors on the sealer nodes, "on" or "off" (executor.nomad.hcl).
+# On, the executors run on the sealer nodes, so the executor queries go
+# to sealer-<i>, not to executor-<i>. The deploy passes it from
+# KARDAMOM_EXEC_ON_SEALERS.
+variable "exec_on_sealers" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.exec_on_sealers)
+    error_message = "The exec_on_sealers value must be on or off."
+  }
+}
+
+# The first decision version of the sealer that the sequencer assumes
+# (--sealer-version-floor), from 0 to 5. The sequencer keeps the highest
+# version that any sealer session reports, and starts from this floor
+# before the first report. 0 sends no flag. The deploy passes it from
+# KARDAMOM_SEALER_VERSION_FLOOR, and refuses a floor above 0 until every
+# reader runs a release that reads a relayed full reference.
+variable "sealer_version_floor" {
+  type    = number
+  default = 0
+  validation {
+    condition     = var.sealer_version_floor >= 0 && var.sealer_version_floor <= 5 && floor(var.sealer_version_floor) == var.sealer_version_floor
+    error_message = "The sealer version floor must be a whole number from 0 to 5."
+  }
+}
+
 variable "executor_count" {
   type    = number
   default = 3
@@ -82,6 +110,33 @@ variable "receipts_from_egress" {
   validation {
     condition     = contains(["on", "off"], var.receipts_from_egress)
     error_message = "The receipts_from_egress value must be on or off."
+  }
+}
+# The v2 loop, "on" or "off" (the [admission] section of the config). On,
+# the sequencer takes the bytes of each transaction under decision version
+# 5, and the sealer carries them. The carry window needs it: the v1 loop
+# offers each transaction as a reference without its bytes, and the sealer
+# refuses such a reference while the window is on. Each sender may keep
+# 512 transactions forwarded and 512 parked, the same bound as
+# max_pending_per_sender of the v1 loop. Ansible deployment passes -var
+# from KARDAMOM_SEQUENCER_ADMISSION.
+variable "admission" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.admission)
+    error_message = "The admission value must be on or off."
+  }
+}
+# The tx_events stream (docs/specs/2026-10-25-client-events.md), "on" or
+# "off". On, the job publishes its client stage records on tx_events, best
+# effort. Ansible deployment passes -var from KARDAMOM_TX_EVENTS.
+variable "tx_events" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.tx_events)
+    error_message = "The tx_events value must be on or off."
   }
 }
 variable "metrics_base" {
@@ -141,12 +196,22 @@ job "sequencer" {
   # The sequencer of this release moves the nonce floor past a skip that
   # used its nonce (nonce_burn). It sends the activation record of
   # FEATURE_SEALER_V4 in front of its epoch, and the stream position of
-  # each reference to a sealer on decision version 4 (sealer_v4). The
-  # upgrade check (`just sealer-upgrade-check`) reads these metas.
-  meta {
-    nonce_burn = "true"
-    sealer_v4  = "true"
-  }
+  # each reference to a sealer on decision version 4 (sealer_v4). It keeps
+  # the highest sealer version across its sessions, so it sends no
+  # reference of record type 0 while every member runs version 5
+  # (sealer_version_kept). The upgrade check
+  # (`just sealer-upgrade-check`) reads these metas. A sequencer job with
+  # the [admission] table runs the v2 loop (v2_loop), the only loop that
+  # offers the bytes of a transaction. The upgrade check of the carry
+  # window and the gate of the version floor read it.
+  meta = merge(
+    {
+      nonce_burn          = "true"
+      sealer_v4           = "true"
+      sealer_version_kept = "true"
+    },
+    var.admission == "on" ? { v2_loop = "true" } : {},
+  )
 
   datacenters = [var.datacenter]
   type        = "service"
@@ -240,11 +305,17 @@ job "sequencer" {
               "--lane", group.key,
               "--vslots", join(",", group.value.slots),
               "--tx-ttl-ms", format("%d", var.tx_ttl_ms),
-              "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:${var.executor_query_port}"]),
+              "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://${var.exec_on_sealers == "on" ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:${var.executor_query_port}"]),
               "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
               ], length(group.value.incoming) == 0 ? [] : [
               "--extra-lanes", join(",", sort(distinct([for slot in group.value.incoming : var.previous_shard_table[slot]]))),
               "--shadow-vslots", join(",", group.value.incoming),
+              ], var.sealer_version_floor == 0 ? [] : [
+              "--sealer-version-floor", format("%d", var.sealer_version_floor),
+              ], var.tx_events == "off" ? [] : [
+              # The replica of the lane: the twins publish under two origins.
+              "--tx-events", var.tx_events,
+              "--tx-events-origin", "${NOMAD_ALLOC_INDEX}",
             ])
           }
 
@@ -265,13 +336,15 @@ job "sequencer" {
             change_mode = "noop"
           }
 
-          # The switch goes in front of the file: a top-level key after
-          # the first table of the file would belong to that table.
+          # The receipts switch goes in front of the file: a top-level key
+          # after the first table of the file would belong to that table.
+          # The [admission] table goes after the file.
           template {
             destination = "local/sequencer.toml"
             data = join("\n", concat(
               var.receipts_from_egress == "on" ? ["receipts_from_egress = true"] : [],
               [file("config/sequencer.toml.tpl")],
+              var.admission == "on" ? ["[admission]\nenabled = true\nmax_parked = 512\nmax_forwarded = 512\n"] : [],
             ))
           }
 

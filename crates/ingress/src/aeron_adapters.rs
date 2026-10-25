@@ -31,6 +31,7 @@ use crate::channels::{BUS_CAPACITY, IngressPublication, IngressSubscription, Rec
 use crate::error::IngressError;
 use crate::rollback_log::RollbackLog;
 use crate::stage_latency::{StageClock, StageStamps};
+use crate::tx_events::AcceptedQueue;
 
 // ---------------------------------------------------------------------------
 // IngressPublication adapter over M TxDataPublisherHandle.
@@ -43,6 +44,8 @@ use crate::stage_latency::{StageClock, StageStamps};
 pub struct LiveIngressPublication {
     tx_data: Vec<TxDataPublisherHandle>,
     stamps: StageStamps,
+    /// The `accepted` records of `tx_events`, with `KARDAMOM_TX_EVENTS=on`.
+    accepted: Option<AcceptedQueue>,
 }
 
 impl LiveIngressPublication {
@@ -67,7 +70,19 @@ impl LiveIngressPublication {
                 .map_err(|e| IngressError::internal(format!("open tx_data[{lane}]"), e))?;
             tx_data.push(handle);
         }
-        Ok(Self { tx_data, stamps })
+        Ok(Self {
+            tx_data,
+            stamps,
+            accepted: None,
+        })
+    }
+
+    /// Queue an `accepted` record on `tx_events` for each published
+    /// transaction (`KARDAMOM_TX_EVENTS=on`).
+    #[must_use]
+    pub fn with_accepted(mut self, accepted: AcceptedQueue) -> Self {
+        self.accepted = Some(accepted);
+        self
     }
 }
 
@@ -86,11 +101,15 @@ impl IngressPublication for LiveIngressPublication {
         self.stamps.stamp(envelope.tx_hash);
         // The task awaits the ack of the Aeron thread, so no thread blocks
         // and the publish costs no hop to the blocking pool.
+        let tx_hash = envelope.tx_hash;
         pub_handle
             .publish_async(&envelope)
             .await
-            .map(|_| ())
-            .map_err(|e| IngressError::internal("publish_tx_data", e))
+            .map_err(|e| IngressError::internal("publish_tx_data", e))?;
+        if let Some(accepted) = &self.accepted {
+            accepted.note(tx_hash);
+        }
+        Ok(())
     }
 }
 
@@ -639,6 +658,7 @@ mod tests {
         let publication = LiveIngressPublication {
             tx_data: Vec::new(),
             stamps: StageClock::pair().0,
+            accepted: None,
         };
         let err = publication
             .publish_tx_data(0, TxEnvelope::default())

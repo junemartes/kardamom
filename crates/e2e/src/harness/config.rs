@@ -99,6 +99,28 @@ pub struct StackConfig {
     /// only the full receipt stream fills. The ingress keeps `tx_receipts`
     /// under `KARDAMOM_E2E_VERDICTS=1`.
     pub ingress_rows: bool,
+    /// The carry window rollout: the member feed, the egress, and the
+    /// batcher. `None` runs none of them.
+    pub carry: Option<CarryOptions>,
+}
+
+/// The parts of the stack that the carry window rollout needs.
+///
+/// - Each sealer member serves its admin endpoint (`/status`, `/metrics`)
+///   and keeps `retention` frames in its replay window.
+/// - Member 0 runs the member feed on the shared media driver, so the
+///   executor can read it in carry mode. The feed uses fixed stream ids on
+///   IPC, so only one member of a host can feed one driver.
+/// - The sequencers run the v2 loop: only the v2 loop offers a transaction
+///   with its bytes.
+/// - The executor forwards its frames on `exec_frames`, and the egress
+///   stores them.
+/// - With `StackConfig::l1`, a live batcher posts to the settlement
+///   contract through a fake DA proxy.
+#[derive(Clone, Copy, Debug)]
+pub struct CarryOptions {
+    /// `-Dkardamom.cluster.retention` on every member.
+    pub retention: NonZeroU32,
 }
 
 /// The L2 genesis a stack boots from.
@@ -161,6 +183,7 @@ impl Default for StackConfig {
             notifier: false,
             unpayable_spends: false,
             ingress_rows: false,
+            carry: None,
         }
     }
 }

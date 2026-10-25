@@ -367,17 +367,6 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
 - `kardamom_egress_rebased_total{reason}` counts the times that the egress started its stream again: after a boundary of a copy with no peer (`boundary`), or at the floor of a peer above its head (`peer-floor`). After a `boundary` start, the store holds no frame before that boundary, and a reader of an older cursor reads another instance.
 - `kardamom_executor_egress_frames_dropped_total` counts the canonical frames that the reader did not forward on `exec_frames`, because the queue to the publication was full.
 
-`kardamom_egress_head_distance_frames` is a gauge of each egress instance. It gives the canonical indexes between the stored head and the newest record that any executor copy sent. The egress sets it after each sync of its store.
-
-- The sealer keeps only its replay window. A reader below the window recovers from the store of the egress, so the distance must stay well inside the window.
-- The egress does not see the sealed head. The distance does not include the lag of every executor behind the sealer.
-- `KardamomEgressHeadNearWindow` in `deploy/alerts.yml` fires when the distance stays above 32,768 for 1 minute: half the default window of 65,536 frames.
-
-`kardamom_egress_disk_free_bytes` is a gauge of each egress instance: the free bytes of the file system of its store. The egress sets it after each sync of its store.
-
-- The store keeps every block above the lower of the posted head and the final head, and the window of `--keep-blocks` blocks below its head (default 43,200). Its disk grows with the DA lag.
-- `KardamomEgressDiskFillsSoon` in `deploy/alerts.yml` fires when `predict_linear` over the last hour gives a full disk within 6 hours, for 15 minutes.
-- `kardamom_egress_posted_distance_blocks` and `kardamom_egress_floor_distance_blocks` show why the store grows: the batcher does not post, or the final head does not move.
   - `peer-checkpoint`: the node fell behind the retention window and repaired itself from a peer checkpoint.
   - `unrecoverable`: the node could not repair itself and waits for an operator.
   - See "Replay-window overrun" in [failure-modes.md](failure-modes.md).
@@ -408,6 +397,18 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
 
 Each service instruments its own hot path. The metrics of a service are the metrics that its dashboard queries.
 The groups that need an explanation follow.
+
+`kardamom_egress_head_distance_frames` is a gauge of each egress instance. It gives the canonical indexes between the stored head and the newest record that any executor copy sent. The egress sets it after each sync of its store.
+
+- The sealer keeps only its replay window. A reader below the window recovers from the store of the egress, so the distance must stay well inside the window.
+- The egress does not see the sealed head. The distance does not include the lag of every executor behind the sealer.
+- `KardamomEgressHeadNearWindow` in `deploy/alerts.yml` fires when the distance stays above 32,768 for 1 minute: half the default window of 65,536 frames.
+
+`kardamom_egress_disk_free_bytes` is a gauge of each egress instance: the free bytes of the file system of its store. The egress sets it after each sync of its store.
+
+- The store keeps every block above the lower of the posted head and the final head, and the window of `--keep-blocks` blocks below its head (default 43,200). Its disk grows with the DA lag.
+- `KardamomEgressDiskFillsSoon` in `deploy/alerts.yml` fires when `predict_linear` over the last hour gives a full disk within 6 hours, for 15 minutes.
+- `kardamom_egress_posted_distance_blocks` and `kardamom_egress_floor_distance_blocks` show why the store grows: the batcher does not post, or the final head does not move.
 
 ### Batcher
 
@@ -504,13 +505,18 @@ With `--carry-bytes`, `--egress <url>` (`KARDAMOM_EGRESS_URL`, off by default) m
 | Metric | Meaning |
 | --- | --- |
 | `kardamom_executor_input_source{source}` | 1 for the source that the executor reads, 0 for the other. `source` is `feed` (the member feed) or `service` (the serving service, or the egress with `--egress`). |
-| `kardamom_executor_source_mismatch_total{source}` | Canonical entries whose `keccak256(raw_tx)` is not the canonical id, by the source that sent them. The executor does not execute such an entry and does not stop: it leaves the source and reads the same index from the other source. |
+| `kardamom_executor_source_mismatch_total{source}` | Canonical entries whose `keccak256(raw_tx)` is not the canonical id, by the source that sent them. The executor does not execute such an entry. It leaves the source and reads the same index from the other source. It stops only when no source can serve the right bytes (see below). |
 
 - The executor leaves the feed when no frame comes for 6 s, when the feed loses its image, or on a mismatch. It goes back to the feed after the feed has one image for 30 s and a replay of the feed from its cursor reaches `REPLAY_DONE`.
 - Any increment of `kardamom_executor_source_mismatch_total` needs an operator: a member or a service sends bytes that do not match the ordered id. The log line is `the raw transaction does not hash to its canonical id; replaying from the other source`, with the source and the index.
 - A switch logs `switching the input source` with the old and the new source and the cursor.
 - A transaction reference at the cursor is a fault of the source: the reader has no `tx_data` lane to join it. The reader leaves the source and reads the same index from the other source.
 - When every source gives a reference at the same index, the reader stops with `UnjoinableReference { index }`. The log line is `no source holds the bytes of the transaction reference; stopping`, with the index. A source that never connected counts as one that gives the reference. Only a sequencer that offers a type-0 reference makes such an entry.
+- When every source gives a mismatch at the same index, the reader stops with `HashMismatch { index }`. The log line is `no source holds the right bytes of the entry; stopping`, with the index.
+  - A source that never connected counts as one that gives the mismatch. So a reader with one source stops on its first mismatch, after the silence window of the absent second source. This is an executor with no `--egress`, and a validator or a batcher with `--egress`.
+  - A source that refused the cursor below its floor also counts, as for a reference.
+  - A reader with two sources that connect keeps the switch for a mismatch on one source: the other source can serve the right bytes.
+  - The executor exits with status 1. The batcher run ends with the error `tx_ordering reader failed`. The validator holds the `validator_divergence` halt: see [`validator_divergence`](runbooks/validator_divergence.md).
 
 ### Executor pipeline
 
@@ -855,9 +861,11 @@ The egress (`kardamom-egress`) exports these metrics on `--metrics-addr` (`KARDA
 | `kardamom_egress_disk_free_bytes` | Free bytes of the file system of the store, for an unprivileged writer. |
 
 - Any increment of `kardamom_egress_copy_mismatch_total` needs an operator.
-- R is durable. The store keeps it in the side file `ref-mark` of its directory (16 bytes: the index, then the block, little endian), and reads it at start. A restart does not lower R.
+- R is durable. The store keeps it in the side file `ref-mark` of its directory (16 bytes: the index, then the block, little endian), and reads it at start.
   - The store writes the mark of a batch before the frames of the batch. After a crash, R is at or above every reference that the segments hold.
+  - The file holds R plus a lead of 65,536 indexes and 32 blocks. The store writes the file again only when R passes it, about once a minute at 1,000 tx/s. So a batch costs no sync of the mark. At the start the store takes the exact R from the frames of its segments, and keeps at least the file value minus the lead. It reads only the segments that can hold a reference above the file minus the lead: the last one or two. So no restart, clean or a crash, leaves the lead in R (#825).
   - A start at the floor of a peer keeps the higher of the two marks. The peer sends its mark in the headers `x-egress-ref-mark-index` and `x-egress-ref-mark-block` of its `410` answer.
+  - A start can lower R: to the highest stored reference, or to the file value minus the lead. A mark of a peer within the lead, and a reference whose segment a prune deleted, then leave R. The gates take the highest R of all the egress instances, and a reader below the floor gets `410`, so it cannot meet such a reference.
   - R can stay above the stored references. That only delays the move of a reader to the egress.
   - A corrupt or hostile mark of a peer, for example `u64::MAX`, raises R for good: R never goes down. To recover, stop the egress, then copy `ref-mark` from the store directory of a healthy peer, then start the egress. Delete `ref-mark` only when the store holds no `RT_TXREF` frame.
 - A reader below R can meet a reference in the egress range that it cannot join. The readers after the executors export their cursor on the egress: `kardamom_batcher_egress_cursor_index` and `kardamom_validator_egress_cursor_index`, the canonical index of the newest record that the reader took. A reader is past every reference when its cursor is above the highest R of all egress instances.

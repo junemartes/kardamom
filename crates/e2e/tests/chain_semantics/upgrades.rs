@@ -142,3 +142,55 @@ async fn s13c_upgrade_authority_is_enforced() {
     )
     .await;
 }
+
+/// The stack of the carry window: `members` sealer members with the
+/// member feed, the egress and a live batcher, on the staging genesis.
+fn carry_stack_config(members: std::num::NonZeroUsize, park: ParkTimeout) -> StackConfig {
+    StackConfig {
+        sealer_members: members,
+        carry: Some(e2e::harness::CarryOptions {
+            retention: std::num::NonZeroU32::new(512).unwrap(),
+        }),
+        ingress: IngressOptions {
+            pending_receipt_timeout: park,
+            ..IngressOptions::default()
+        },
+        ..upgrade_stack_config(e2e::harness::Genesis::ClusterDev)
+    }
+}
+
+/// S13e: the carry window rollout on a live chain. Features 3 and 4,
+/// the sequencer floor, the readers on the egress, feature 5 under a DA
+/// lag, the executor in carry mode, a member restart, a refused
+/// reference without bytes, and feature 5 off and on again. Then the
+/// persisted state of the executor and the validator matches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s13e_carry_window_rollout() {
+    let three = std::num::NonZeroUsize::new(3).unwrap();
+    let park = IngressOptions::default().pending_receipt_timeout;
+    let mut stack = launch_l1_or_skip!(carry_stack_config(three, park));
+    e2e::scenarios::carry_window::run(&mut stack, e2e::scenarios::carry_window::Params::default())
+        .await
+        .expect("S13e");
+    let exec_dir = stack.executor_state_dir().expect("executor state dir");
+    let val_dir = stack.validator_state_dir().expect("validator state dir");
+    stack.shutdown_graceful().await.expect("graceful shutdown");
+    consistency::verify_state_dirs(&exec_dir, &val_dir).expect("S13e persisted state");
+}
+
+/// S13f: a sequencer floor above the version of the chain. The floor 5
+/// on a chain at version 4 costs no stall, and a full reference that the
+/// sealer orders below version 5 runs on every reader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s13f_a_wrong_floor_costs_no_stall() {
+    let park = ParkTimeout::from_secs(std::num::NonZeroU64::new(90).unwrap());
+    let mut stack = launch_l1_or_skip!(carry_stack_config(std::num::NonZeroUsize::MIN, park));
+    e2e::scenarios::carry_window::wrong_floor(
+        &mut stack,
+        e2e::scenarios::carry_window::Params::default(),
+    )
+    .await
+    .expect("S13f");
+}

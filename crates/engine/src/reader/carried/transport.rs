@@ -54,6 +54,15 @@ pub trait Transport: Send {
     /// reader also calls it at each timer step while it reads the other
     /// source, so the call must be cheap.
     fn close(&mut self);
+
+    /// Whether the live frames after the replay can come with a frame
+    /// lost or out of order. A boundary takes no slot, so the reader sees
+    /// no hole when such a source loses one. The reader then delivers a
+    /// record only after the boundary of its block, also after the
+    /// replay end.
+    fn lossy(&self) -> bool {
+        false
+    }
 }
 
 /// The source of a reader that has no second source. It never connects,
@@ -101,5 +110,9 @@ impl<T: Transport> Transport for Option<T> {
         if let Some(source) = self {
             source.close();
         }
+    }
+
+    fn lossy(&self) -> bool {
+        self.as_ref().is_some_and(Transport::lossy)
     }
 }

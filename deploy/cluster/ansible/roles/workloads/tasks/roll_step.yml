@@ -1,0 +1,94 @@
+---
+# One step of the staged roll of the job workloads_roll_job: the groups
+# rolled so far carry the new definition workloads_roll_new, and the
+# others keep the registered definition workloads_roll_current, so the
+# plan touches one group. The update stanza of that group holds the next
+# step until its new allocation is healthy. The sealer rolls its members
+# this way, and the executor job its pinned groups.
+#
+# With workloads_roll_retire, the one registered group that the new
+# definition drops loses one instance at each step, and leaves at the
+# last step, whatever its count. The executor job moves from its group on
+# the executor nodes to its pinned groups this way, one executor at a time.
+# Each step then has two registrations:
+# 1. The count of the retiring group falls by one. When a count falls,
+#    Nomad stops the allocation of the highest index, and that index is
+#    the id of the executor. The role waits until that allocation stops.
+# 2. The pinned group of the same id starts.
+# So two executors never run with one recorder and void voter id. The
+# retiring group keeps the job constraints of the registered definition,
+# because the new definition places its own groups by group constraints.
+# A plan on a dev agent shows that this move of a constraint from the job
+# to the group is an in-place update, not a destructive one: it restarts
+# no executor.
+- name: Keep the groups of the roll step of {{ workloads_roll_group }}
+  ansible.builtin.set_fact:
+    workloads_roll_rolled: "{{ workloads_roll_order[: workloads_roll_index + 1] }}"
+    workloads_roll_kept: >-
+      {{ workloads_roll_current.json.TaskGroups | selectattr('Name', 'in', workloads_roll_names) | list
+         if workloads_roll_retire | default(false) else workloads_roll_current.json.TaskGroups }}
+    workloads_roll_retiring: "{{ workloads_roll_retiring_group }}"
+    workloads_roll_retiring_left: >-
+      {{ [workloads_roll_retiring_group | combine({
+            'Count': workloads_roll_retiring_group.Count | int - workloads_roll_index - 1,
+            'Constraints': (workloads_roll_current.json.Constraints or [])
+                           + (workloads_roll_retiring_group.Constraints or [])})]
+         if workloads_roll_retiring_group | length > 0
+            and workloads_roll_index + 1 < workloads_roll_order | length
+            and workloads_roll_retiring_group.Count | int > workloads_roll_index + 1
+         else [] }}
+  vars:
+    workloads_roll_names: "{{ workloads_roll_new.TaskGroups | map(attribute='Name') | list }}"
+    workloads_roll_retiring_group: >-
+      {{ (workloads_roll_current.json.TaskGroups | rejectattr('Name', 'in', workloads_roll_names) | list + [{}]) | first
+         if workloads_roll_retire | default(false) else {} }}
+
+- name: Count down the retiring group for {{ workloads_roll_group }}
+  when: workloads_roll_retiring | length > 0
+  block:
+    - name: Build the count-down of the retiring group for {{ workloads_roll_group }}
+      ansible.builtin.set_fact:
+        workloads_job_definition: >-
+          {{ workloads_roll_new | combine({'TaskGroups':
+               (workloads_roll_new.TaskGroups | selectattr('Name', 'in', workloads_roll_rolled[:-1]) | list)
+               + (workloads_roll_kept | rejectattr('Name', 'in', workloads_roll_rolled[:-1]) | list)
+               + workloads_roll_retiring_left}) }}
+
+    - name: Register the count-down of the retiring group for {{ workloads_roll_group }}
+      ansible.builtin.include_tasks: register.yml
+      vars:
+        workloads_register_job: "{{ workloads_roll_job }}"
+        workloads_register_submit: true
+
+    - name: Wait until the retiring allocation stops for {{ workloads_roll_group }}
+      ansible.builtin.uri:
+        url: "{{ workloads_nomad_addr }}/v1/job/{{ workloads_roll_job }}/allocations?namespace={{ workloads_namespace | urlencode }}"
+        headers:
+          X-Nomad-Token: "{{ workloads_nomad_token }}"
+      register: workloads_roll_allocations
+      until: >-
+        workloads_roll_allocations.json | selectattr('TaskGroup', 'equalto', workloads_roll_retiring.Name)
+        | selectattr('ClientStatus', 'equalto', 'running') | list | length
+        <= (workloads_roll_retiring_left | map(attribute='Count') | list + [0]) | first | int
+      retries: "{{ workloads_poll_retries }}"
+      delay: "{{ workloads_poll_delay }}"
+
+- name: Build the roll step of {{ workloads_roll_group }}
+  ansible.builtin.set_fact:
+    workloads_job_definition: >-
+      {{ workloads_roll_new | combine({'TaskGroups':
+           (workloads_roll_new.TaskGroups | selectattr('Name', 'in', workloads_roll_rolled) | list)
+           + (workloads_roll_kept | rejectattr('Name', 'in', workloads_roll_rolled) | list)
+           + workloads_roll_retiring_left}) }}
+
+- name: Register the roll step of {{ workloads_roll_group }}
+  ansible.builtin.include_tasks: register.yml
+  vars:
+    workloads_register_job: "{{ workloads_roll_job }}"
+    workloads_register_submit: true
+
+- name: Wait for the roll step of {{ workloads_roll_group }}
+  ansible.builtin.include_tasks: wait.yml
+  vars:
+    workloads_wait_job: "{{ workloads_roll_job }}"
+    workloads_job: "{{ workloads_roll_spec }}"

@@ -184,3 +184,91 @@ fn sequencer_core_loop_allocation_profile() {
     drop(profiler); // writes dhat-heap.json with per-callsite data
     let _ = std::fs::rename("dhat-heap.json", "dhat-heap-sequencer.json");
 }
+
+/// One loaded rig: every envelope of `SENDERS` senders, `WARMUP_NONCES`
+/// of them already run, and the vectors of the fakes reserved for the
+/// measured window. Returns the transactions of the measured window too.
+fn warm_rig(
+    side: kardamom_sequencer::outbound::fakes::InMemorySidePublisher,
+) -> (Rig, Sequencer, u64) {
+    let signers: Vec<_> = (1..=SENDERS as u64).map(signer).collect();
+    let mut rig = Rig {
+        errors: side,
+        ..Rig::default()
+    };
+    for (i, (nonce, s)) in (0..WARMUP_NONCES + MEASURED_NONCES)
+        .flat_map(|nonce| signers.iter().map(move |s| (nonce, s)))
+        .enumerate()
+    {
+        let i = i as u64;
+        rig.push(
+            TxDataLoc::new(0, BPosition::from_index(i)),
+            signed_envelope(s, nonce, i),
+        );
+    }
+    let mut seq = Sequencer::new(SequencerConfig {
+        max_pending_per_sender: 16,
+        ..one_partition_cfg()
+    })
+    .unwrap();
+    for _ in 0..SENDERS as u64 * WARMUP_NONCES {
+        assert!(rig.step(&mut seq).expect("warmup"));
+    }
+    let measured = SENDERS * usize::try_from(MEASURED_NONCES).unwrap();
+    rig.refs.offers.lock().unwrap().reserve(measured + 16);
+    rig.errors.statuses.lock().unwrap().reserve(measured + 16);
+    (rig, seq, measured as u64)
+}
+
+/// The heap blocks that the measured window of `rig` allocates.
+fn measured_blocks(rig: &mut Rig, seq: &mut Sequencer) -> u64 {
+    let before = dhat::HeapStats::get().total_blocks;
+    while rig.step(seq).expect("run") {}
+    dhat::HeapStats::get().total_blocks - before
+}
+
+/// `KARDAMOM_TX_EVENTS=on` adds no allocation for each transaction: the
+/// `sent` record is a copy into the frame that the sink allocated at its
+/// start (docs/specs/2026-10-25-client-events.md, 4.8). The offer fake
+/// allocates nothing, so the live cost of the stream is only its copy of
+/// each frame, at most 1,000 frames a second.
+#[test]
+fn tx_events_add_no_allocation_for_each_transaction() {
+    let offers = kardamom_sequencer::outbound::fakes::CountedOffers::default();
+    let (mut off_rig, mut off_seq, measured) =
+        warm_rig(kardamom_sequencer::outbound::fakes::InMemorySidePublisher::default());
+    let (mut on_rig, mut on_seq, _) = warm_rig(
+        kardamom_sequencer::outbound::fakes::InMemorySidePublisher::default()
+            .with_tx_events(offers.clone()),
+    );
+    let profiler = dhat::Profiler::builder().testing().build();
+    let off = measured_blocks(&mut off_rig, &mut off_seq);
+    let on = measured_blocks(&mut on_rig, &mut on_seq);
+    drop(profiler);
+    on_rig
+        .errors
+        .events
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .flush();
+    let all = SENDERS * usize::try_from(WARMUP_NONCES + MEASURED_NONCES).unwrap();
+    assert_eq!(
+        offers.sent.load(std::sync::atomic::Ordering::Relaxed),
+        all,
+        "one sent record for each offered reference"
+    );
+    println!(
+        "tx_events: {off} blocks off, {on} blocks on, {} frames",
+        offers.frames.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    // The two windows can differ by a few blocks in either direction (a
+    // map that grew in one window and not in the other). The bound is 1 %
+    // of the transactions of the window: one allocation for each record
+    // would exceed it by a factor of 100.
+    assert!(
+        on.abs_diff(off) * 100 < measured,
+        "the sent records allocate: {on} blocks on, {off} off, {measured} transactions"
+    );
+}

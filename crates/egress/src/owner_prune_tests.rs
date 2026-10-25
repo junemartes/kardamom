@@ -93,3 +93,30 @@ fn the_prune_follows_the_lower_of_the_posted_head_and_the_final_head() {
         "both heads are above the window: the store keeps the window"
     );
 }
+
+#[test]
+fn unposted_blocks_remain_replayable_after_pruning_and_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (mut o, _published) = pruning(dir.path(), L1Heads::posted_only());
+        heads(&mut o, [Input::Posted(25)]);
+        blocks(&mut o, 1, 300);
+        assert_eq!(first_block(&mut o), 21);
+    }
+    let (mut o, _published) = pruning(dir.path(), L1Heads::posted_only());
+    o.sync_if_due().unwrap();
+    let Range::Frames {
+        frames,
+        after,
+        head,
+    } = o.parts.store.read_from(0, 26, usize::MAX).unwrap()
+    else {
+        panic!("the posted cursor must still be replayable");
+    };
+    let expected: Vec<_> = (26..=300)
+        .map(|block| encode_egress_boundary(block, 0, 0, 0))
+        .collect();
+    assert_eq!(frames, expected, "every unposted block survives in order");
+    assert_eq!(after, head);
+    assert_eq!(head.next_block, 301);
+}

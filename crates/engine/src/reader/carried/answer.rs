@@ -24,6 +24,10 @@ pub(crate) struct Timing {
     pub(crate) ready: Duration,
     /// The wait of one poll of the source, and the period of the timers.
     pub(crate) poll: Duration,
+    /// Start the run again from the state DB when the reader asks again,
+    /// and the cursor does not move within this wait: five silence
+    /// windows.
+    pub(crate) stall: Duration,
 }
 
 impl Default for Timing {
@@ -33,6 +37,7 @@ impl Default for Timing {
             silence: Duration::from_secs(6),
             ready: Duration::from_secs(30),
             poll: Duration::from_millis(50),
+            stall: Duration::from_secs(30),
         }
     }
 }
@@ -309,20 +314,32 @@ impl Answer {
         Step::Ask
     }
 
-    /// A boundary. It closes the block at the cursor: its end is the next
-    /// index, and its block is the block of the cursor.
+    /// A boundary. It closes the block at the cursor: its block is the
+    /// block of the cursor, and its end is the next index.
+    ///
+    /// A boundary of that block that ends below the next index comes late.
+    /// A boundary takes no slot, so a lossy stream can lose it with no
+    /// hole in the indexes, and the reader takes the records after it
+    /// first. The copy of a second egress instance, for example, then
+    /// brings it. The pending set puts it at its end, and fails when it
+    /// delivered records past that end. It is no hole: a new request
+    /// cannot repair it, because each answer from the cursor starts with
+    /// that boundary again.
     fn boundary(&mut self, b: BlockBoundaryStart) -> Step {
         if b.block_number < self.expect_block {
             return Step::Drop;
         }
+        let end = b.end_tx_idx.as_index();
         let next = self.expect_block.checked_add(1);
         match (
-            b.block_number == self.expect_block && b.end_tx_idx.as_index() == self.expect_index,
+            b.block_number == self.expect_block && end <= self.expect_index,
             next,
         ) {
             (true, Some(next)) => {
                 self.expect_block = next;
-                self.hole_open = false;
+                // A late boundary does not follow the cursor, so it is no
+                // frame of a new answer.
+                self.hole_open &= end < self.expect_index;
                 Step::Boundary(b)
             }
             _ => self.hole(),

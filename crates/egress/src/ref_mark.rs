@@ -10,6 +10,16 @@
 //! So after a crash the mark is at or above every reference that the
 //! segments hold. A mark above the segments only delays the move of a
 //! reader to the egress. It never lets a reader meet a reference.
+//!
+//! The file holds the mark plus [`LEAD`], not the mark itself. The store
+//! writes the file again only when its mark passes the file. So most
+//! batches cost no sync: under the v1 loop every transaction is a
+//! reference, and two syncs for each batch stalled the owner thread of
+//! the egress, and with it the receipts. A clean stop writes the exact
+//! mark. The open takes the exact mark from the segments, and keeps at
+//! least the file value minus [`LEAD`]: the side file holds the mark or
+//! the mark plus the lead. So the lead never stays in the mark after a
+//! restart.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -24,6 +34,14 @@ use crate::store::{StoreError, io};
 const FILE: &str = "ref-mark";
 /// The name of the temporary file of a write.
 const TEMP: &str = "ref-mark.tmp";
+
+/// The lead of the side file over the mark: 65,536 indexes (about 65 s at
+/// 1,000 tx/s) and 32 blocks (about 64 s). A restart can raise the mark by
+/// this much, and the gates of a reader move then wait that much longer.
+pub(crate) const LEAD: RefMark = RefMark {
+    index: 1 << 16,
+    block: 32,
+};
 
 /// The canonical index and the block of the highest stored reference.
 /// `(0, 0)` means that the store holds no reference: block 0 holds no
@@ -79,13 +97,49 @@ impl RefMark {
         File::open(dir).and_then(|d| d.sync_all()).map_err(io(dir))
     }
 
+    /// The mark that the side file holds for `self`: [`LEAD`] above it.
+    pub(crate) fn ahead(self) -> Self {
+        Self {
+            index: self.index.saturating_add(LEAD.index),
+            block: self.block.saturating_add(LEAD.block),
+        }
+    }
+
+    /// The lowest mark that the side file value `self` can stand for: the
+    /// file holds the mark, or the mark plus [`LEAD`] (`ahead`).
+    pub(crate) fn behind(self) -> Self {
+        Self {
+            index: self.index.saturating_sub(LEAD.index),
+            block: self.block.saturating_sub(LEAD.block),
+        }
+    }
+
+    /// The higher of `self` and `other` in each field.
+    pub(crate) fn joined(self, other: Self) -> Self {
+        Self {
+            index: self.index.max(other.index),
+            block: self.block.max(other.block),
+        }
+    }
+
+    /// True when `bound` is at or above `self` in the index and in the
+    /// block. The order of `RefMark` compares the index first, so it does
+    /// not tell this.
+    pub(crate) fn within(self, bound: Self) -> bool {
+        self.index <= bound.index && self.block <= bound.block
+    }
+
     /// The highest reference of `frames`, in stream order from the block
     /// `next_block`. A record belongs to the block of the next boundary.
     /// `None` when no frame is a reference.
-    pub(crate) fn top(frames: &[Vec<u8>], next_block: u64) -> Option<Self> {
+    pub(crate) fn top<F: AsRef<[u8]>>(
+        frames: impl IntoIterator<Item = F>,
+        next_block: u64,
+    ) -> Option<Self> {
         frames
-            .iter()
+            .into_iter()
             .scan(next_block, |block, frame| {
+                let frame = frame.as_ref();
                 let mark = match Key::of(frame) {
                     Some(Key::Boundary(closed)) => {
                         // No chain reaches block `u64::MAX`, so the cap
