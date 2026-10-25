@@ -1,6 +1,6 @@
 # Client events from one-way stage publications, and the egress on its own nodes
 
-Status: draft, revision 4, 2026-10-25. The decisions in section 1 are the user's (2026-10-25).
+Status: draft, revision 5, 2026-10-25. The decisions in section 1 are the user's (2026-10-25).
 Section 10 lists the changes from revision 1 and from revision 3.
 
 ## 1. Decisions
@@ -205,20 +205,21 @@ removal of `tx_status` leaves no kind unmapped:
   - A copy of `Posted` or `Included` is dropped by `(batch_index, stage)`.
   - Clients already deduplicate by `tx_hash` plus stage.
 - **Order.** The streams have no order across publishers. `sent` can come before `accepted`, and
-  `receipt` before `executed`. A client must still see the stages in order. So the notifier
-  applies these rules:
+  `receipt` before `executed`. The notifier sends only the latest state of a hash (user decision,
+  2026-10-25). It does not fill in the stages that it missed. These rules apply:
   - The order is `accepted` < `sent` < `executed` < `receipt` < `posted` < `included`.
-  - When an event comes, the notifier emits each earlier stage that it did not emit. It marks
-    them `implied`. Then it emits the stage of the event.
-  - A real event of an implied stage that comes later is not emitted again.
-  - A late `executed` still sets its bit in `observed` and in `executors`. So the latency of a
-    slow executor stays in section 6.
-  - `dropped` implies `accepted` only. A sequencer can drop before it offers (`txpool_full`).
-  - A drop on `tx_drops` is provisional, as `kardamom_getTransactionStatus` says today. A
-    `receipt` after it is emitted, after the stages before it that are not emitted yet.
-  - A `rejected` record is final. The sequencer does not order the transaction.
-  - The latencies of section 6 count only the stages that the notifier observed. They do not
-    count the implied ones.
+  - Each hash has a state: the highest stage that the notifier sent for it.
+  - An event above the state is sent, and it becomes the state.
+  - An event at or below the state came too late. The notifier does not send it.
+  - So a client sees the stages in order, and it can see a stage skipped. For example,
+    `accepted` then `receipt`, with no `sent` and no `executed`.
+  - A late event still sets its bit in `observed`, and a late `executed` sets its bit in
+    `executors`. So the latencies of section 6 keep every stage that came, also a slow executor.
+  - `dropped` is sent only while the state is below `executed`. A drop on `tx_drops` is
+    provisional, as `kardamom_getTransactionStatus` says today. So a `receipt` after a `dropped`
+    is sent.
+  - A `rejected` record is final. The sequencer does not order the transaction. Nothing after it
+    is sent.
 - **Loss.** Every stage is best effort (decision 5). MDC offers can fail, for example with
   `NOT_CONNECTED` during a restart, and a publisher drops a batch that it cannot offer (4.8).
   - A lost `accepted`, `sent`, `dropped`, `executed`, `posted` or `included` is not sent again.
@@ -241,12 +242,12 @@ removal of `tx_status` leaves no kind unmapped:
 - **The stage table.** Each instance has one fixed table. It allocates the table at the start,
   with the size of the ring (250,000 entries on the notifier nodes). The table holds no `Vec`,
   no `String` and no box. The event path allocates nothing for a hash that no client follows.
-  - An entry is `{ hash: [u8; 32], emitted: u8, observed: u8, executors: u8, block: u64,
+  - An entry is `{ hash: [u8; 32], state: u8, observed: u8, executors: u8, block: u64,
     accepted_ms: u32 }`, about 56 bytes. So the table uses about 14 MB.
-  - `emitted` and `observed` are bitmaps, one bit for each stage. They extend the bits of
-    `TxStageKind::bit`.
-  - `emitted` decides the copies and the implied stages.
-  - `observed` keeps the stages that really came, for the latencies.
+  - `state` is the highest stage that the notifier sent (4.3). One comparison decides a copy and
+    a late event.
+  - `observed` is a bitmap, one bit for each stage that really came, for the latencies. It
+    extends the bits of `TxStageKind::bit`.
   - `executors` has one bit for each executor index. So the notifier sees which executors
     reported.
   - `block` comes from the first `executed` or `receipt`. It maps a `Posted` range to its
@@ -258,8 +259,9 @@ removal of `tx_status` leaves no kind unmapped:
   - A hash older than the table gets `posted` only through a status query (4.5).
   - The decode reads the hot frames and the archived rkyv receipts in place. It does not copy
     each event.
-  - A rollback clears the `executed` and `receipt` bits and `executors` of each entry at or above
-    `from_block`. It sets `block` to 0. Then the new receipt after the rollback is emitted again.
+  - A rollback sets `state` back to `sent` (or to `accepted` if `sent` is not in `observed`),
+    clears the `executed` and `receipt` bits and `executors`, and sets `block` to 0, for each
+    entry at or above `from_block`. Then the new receipt after the rollback is sent again.
   - One thread owns the table: the ingest thread of the notifier. No lock is necessary.
 - **The receipt feed.** `kardamom_subscribeReceipts` moves from the ingress to the notifier,
   next to its status feed, with the same frames. Its users (3.1) point to the notifier.
@@ -575,7 +577,7 @@ Each PR merges alone. Each new path is behind a switch that is off by default, u
 | P1 | kardamom-infra | the egress nodes | none |
 | P2 | kardamom | `KARDAMOM_EGRESS_NODES` and the constraint `role=egress`, the README move steps | none (off by default); the move needs P1 |
 | P3 | kardamom | the `tx_events` hot frame and the batcher frame, with their formats and golden tests; the publishers of the ingress, the sequencer and the batcher; the `chain_status` stream; `KARDAMOM_TX_EVENTS`; the allocation cases and the micro-benchmark of 4.8; the e2e failure case with the notifier down | none |
-| P4 | kardamom | the notifier on `tx_events` and its taps (`egress_receipts` with the rollback frames, `tx_drops`, and `tx_receipts` behind `KARDAMOM_NOTIFIER_EXECUTED`): the stage table with its bitmaps, the copies, the implied stages, the rollback, the gaps, the stage metrics, `KARDAMOM_NOTIFIER_EVENTS` | P3 |
+| P4 | kardamom | the notifier on `tx_events` and its taps (`egress_receipts` with the rollback frames, `tx_drops`, and `tx_receipts` behind `KARDAMOM_NOTIFIER_EXECUTED`): the stage table with its state and bitmaps, the copies, the latest-state rule, the rollback, the gaps, the stage metrics, `KARDAMOM_NOTIFIER_EVENTS` | P3 |
 | P5 | kardamom | the shards of the notifier (4.4) | P4 |
 | P6 | kardamom | the ingress halt from the explicit halts of `ChainStatus`, with no silence rule (`KARDAMOM_INGRESS_CHAIN_STATUS`), the age gauge and its alert, the e2e scenario on `tx_events`, the dashboard panels | P3 |
 | P7 | kardamom | the receipt feed on the notifier; the egress short wait, the fallback and `/v1/receipts`; the capped notifier catch-up; the receipt endpoint flag of the canary, the chaos suite, the e2e harness and the load tool | P4 |
@@ -614,3 +616,4 @@ the chain", and "we should ensure this has a negligible impact on the hot path".
 | A hot path budget: a fixed-layout frame, an append with no allocation and no encode, one non-blocking offer for each cycle, a drop on back-pressure. The places in the ingress and the sequencer. The proof: the DHAT allocation cases, a micro-benchmark, a staging A/B ramp (below 1 % CPU, no p99 change), and an e2e case with the notifier down. | 4.8, 7 step 4, P3 |
 | The sequencer `sent` record replaces its `TxStatus` `Offered` publish of each transaction, so the sequencer hot path does less work than today. | 4.2, 4.8, 5 |
 | A fix of revision 3: the `TxStatus` kind `Accepted` comes from the v2 sequencer verdict on `tx_verdicts`, not from the ingress, and `Executed` is derived by the notifier from the receipts. | 4.2 |
+| Revision 5. The user: send the latest state, not the missed stages | 4.3, 4.4, P4: the latest-state rule replaces the implied stages, and `state: u8` replaces the `emitted` bitmap. |
