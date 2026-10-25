@@ -144,6 +144,29 @@ fn a_hash_mismatch_replays_the_index_from_the_other_source() {
 }
 
 #[test]
+fn mismatches_at_the_same_index_on_both_sources_stop_the_reader() {
+    let mut rig = Rig::new(4, 2);
+    rig.request(Source::Feed);
+    rig.feed.send(forged_at(4));
+    rig.request(Source::Service);
+    rig.service.send(forged_at(4));
+    match rig.error() {
+        ExecutorError::HashMismatch { index } => assert_eq!(index, 4),
+        other => panic!("expected the hash mismatch error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_mismatch_with_no_second_source_stops_the_reader() {
+    let (feed, remote) = MemoryTransport::pair();
+    let mut sub = CarriedSubscription::with_timing(feed, NoSource, ReplayCursor::new(3, 2), TIMING);
+    match fail_answering(&mut sub, &remote, |_| forged_at(3)) {
+        ExecutorError::HashMismatch { index } => assert_eq!(index, 3),
+        other => panic!("expected the hash mismatch error, got {other:?}"),
+    }
+}
+
+#[test]
 fn both_sources_below_their_floor_go_to_a_peer_checkpoint() {
     let mut rig = Rig::new(3, 2);
     let request = rig.request(Source::Feed);

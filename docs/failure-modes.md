@@ -830,6 +830,10 @@ The ordering shard keeps the executors up. These cases take the executors down w
 The failure philosophy is inverted here: **halting is the feature**. A divergence halts the validator. The process stays up.
 
 - Trigger: any divergence. Examples are re-executed receipts or a BAL that disagree with the executor, or an MPT state-root mismatch.
+- A forged record on the canonical stream is a divergence too. The halt reason starts with `record identity forged:`.
+  - The validator checks each transaction record before it executes it: `keccak256(raw_tx)` must be the transaction hash, and the signature must recover the sender.
+  - With `--egress`, the reader also checks that `keccak256(raw_tx)` is the canonical id. The egress is the only source of the reader. So a wrong hash stops the reader with `HashMismatch` after one silence window (6 s), and the validator halts. It does not read the egress again without end.
+  - Proof: the tests `forged_sender_from_the_egress_halts_and_latches` and `forged_hash_from_the_egress_halts_and_latches` in `crates/validator/tests/forged_envelope_chaos.rs`.
 - Every executor replica publishes its own BAL and receipts. The validator compares the BAL and the receipts of **every** replica with its own re-execution. The arrival order does not matter.
   - The re-execution of the validator is the reference. A replica whose result differs is a divergence, also when the other replicas agree with the validator.
   - Such a divergence halts the validator, like any other divergence. A wrong executor must never pass silently, and the consumers of `tx_receipts` can read the receipts of any replica.
