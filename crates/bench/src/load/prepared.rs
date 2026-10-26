@@ -8,8 +8,8 @@ use tokio::sync::Semaphore;
 use super::progress::Progress;
 use super::report::ReportInput;
 use super::{
-    LoadConfig, LoadRun, ReceiptFeed, RunHandles, RunSetup, SubmitOpts, Tracker, engine, pacer,
-    print_report,
+    BackgroundTasks, LoadConfig, LoadRun, ReceiptFeed, RunHandles, RunSetup, SubmitOpts, Tracker,
+    engine, pacer, print_report,
 };
 
 /// The signed queues and their configuration. See [`super::prepare`].
@@ -92,6 +92,7 @@ impl Prepared {
             ))
             .spawn_pending_sweeper(Duration::from_secs(5), Duration::from_secs(2)),
         );
+        let background = BackgroundTasks([feed, sweeper]);
 
         // --- ramp (soak mode only) -------------------------------------------
         let mut ramp = Vec::new();
@@ -141,7 +142,7 @@ impl Prepared {
         .run()
         .await;
 
-        let settled = run.settle_and_snapshot(&mut tasks, feed, sweeper).await;
+        let settled = run.settle_and_snapshot(&mut tasks, background).await?;
 
         let verdict = run.build_verdict(&base, &settled.fin, settled.recheck.as_ref());
         let report = run.build_report(ReportInput {

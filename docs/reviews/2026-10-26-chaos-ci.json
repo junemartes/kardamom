@@ -380,7 +380,7 @@
         "188 sequencer library and 14 binary tests pass. Workspace style passes.",
         "Five alternating pinned release pairs with a live clear watch: median in-order/reversed/verdict throughput differences -1.2%/+0.2%/-0.5%. Method, limits, estimates and raw samples are in docs/benches/2026-10-26-v2-pause-profile.json."
       ],
-      "status": "Validated locally. The existing PR 849 candidate does not include this fix; deployed validation and full workload comparison remain pending."
+      "status": "Published in PR 850. Local pause controls and controlled resident throughput comparison pass. Deployed halt and queued-offer recovery and full workload performance validation remain pending."
     },
     {
       "id": "consul-dns-fault-port",
@@ -465,6 +465,25 @@
       "observed": "After whole sealer-node loss the majority election closes, every executor converges and blocks advance, but the case-owned sender accepts no new transaction within 60 seconds. It has 410 accepted/receipted transactions and 256 additional offered submissions.",
       "change": "Keep own-load recovery and receipt oracles. Retain aborted counters and allocation logs. The final V2 pause change still needs deployment; an advancing chain is insufficient evidence that the established sender recovered.",
       "status": "Unresolved; do not widen the own-load recovery SLO."
+    },
+    {
+      "id": "unfinished-submit-can-pass-measurement",
+      "classification": "harness",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "observed": "A real HTTP fixture accepts and receipts one transaction, then holds the next submit past the drain deadline. The verifier reports PASS with offered=2, accepted=1, receipted=1, missing=0 and unlanded=0. The unfinished submit outcome is absent from pending accounting. A separate held receipt response also overruns the complete drain budget.",
+      "cause": "Submit joining logs a timeout but returns success, ignores task failures, and leaves in-flight outcomes unknown. Receipt draining checks the deadline only between complete sweeps. Cancelling a prepared run also detaches its receipt reader because plain JoinHandles do not abort on drop.",
+      "change": "Fail measurements with unfinished or failed submit tasks. Cancel and reap their submit workers before returning the error. Bound the complete receipt drain, including reads. Own feed and sweeper handles in an abort-on-drop guard, including cancellation during pacing. Retain a failed-load snapshot on join or harness errors; a stale passing report cannot replace the failure.",
+      "reason_missed": "The old deadline unit test asserts that the task is left behind. It does not require an error, combine one successful receipt with one unknown outcome, or check the final PASS result.",
+      "verification": [
+        "Before: /tmp/chaos-gaps-unfinished-submit-before.log prints RESULT: PASS with one unknown outcome.",
+        "Before: /tmp/chaos-gaps-receipt-drain-before.log shows the pending read exceeds the outer one-second bound despite a 100ms drain budget.",
+        "After: 89 benchmark library tests pass, including real HTTP unknown-outcome and held-receipt controls, task panic, already completed tasks at the deadline, healthy drain, and cancellation releasing the delivery tracker.",
+        "224 chaos tests pass, two manual tests ignored. Failed load errors retain an incomplete snapshot and cannot reuse a stale passing report.",
+        "Workspace just style passes. No transaction submission, service or production hot path changes; only phase joining, drain bounds and harness task ownership change."
+      ],
+      "status": "Validated locally after PR 850 is published. Keep this follow-up local until that diagnostic batch yields its remaining failure evidence. The final head remains unfrozen; streak 0/10."
     }
   ],
   "coverage": [
@@ -604,7 +623,7 @@
       "existing_shards": [
         "all existing shards"
       ],
-      "status": "Owned load remains required through recovery. Local regression now bounds every poll by actual monotonic time, including probes and initial delays; hanging hold probes fail. Full rollout load windows cover measured Ansible cost without extending product recovery SLOs. Deployed latency/throughput/RTO proof remains pending."
+      "status": "Owned load remains required through recovery. Local regression now bounds every poll by actual monotonic time, including probes and initial delays; hanging hold probes fail. Full rollout load windows cover measured Ansible cost without extending product recovery SLOs. Deployed latency/throughput/RTO proof remains pending. A real HTTP regression now exposes and corrects a PASS with an unfinished submit. Unknown outcomes fail the measurement, pending receipt reads consume the whole drain budget, and cancellation stops background readers. 89 benchmark tests and 224 chaos tests pass locally; this follow-up is not yet published."
     },
     {
       "gap": "Nomad, Consul and DNS control-plane loss while the data plane stays live",
@@ -846,6 +865,13 @@
       ],
       "cluster_run": 40308406065,
       "integrity_run": 40308474177
+    },
+    {
+      "commit": "7aa49b3f9a4557a24ccb540de33b65450697b348",
+      "url": "https://github.com/junemartes/kardamom/pull/850",
+      "cluster_run": 40320872242,
+      "integrity_run": 40321151376,
+      "status": "Diagnostic candidate: CI, Docker and chain-semantics pass. Static deployment checks still run; regular and integrity cluster artifacts build. No qualifying frozen-head round; 0/10. A local follow-up now rejects unfinished-submit false passes and bounds receipt draining."
     }
   ],
   "integration": {
@@ -856,12 +882,8 @@
   "unpublished": {
     "workspace": "/home/dev/kardamom-chaos-gaps",
     "changes": [
-      "V2 lifecycle pause wiring and pinned resident-loop comparison.",
-      "Interrupt concurrent mirror checkpoint scans and require fallback traffic plus exact per-mirror recovery.",
-      "Correct Consul DNS probe and fault ports.",
-      "Use closed quorum elections, real polling deadlines and fresh validator verification proof.",
-      "Enable the carry fault proxy and cover measured full rollout time in paced windows and the carry-only job budget."
+      "Reject unfinished-submit false passes, bound complete receipt drains, stop background receipt readers on cancellation, and retain failed-load snapshots."
     ],
-    "status": "Candidate local checks pass: 224 chaos tests, two ignored manual tests; 14 audit tests; workspace style; workflow actionlint. Deployment validation is next. PR 849 diagnostics are complete. Final head is not frozen and streak stays 0/10."
+    "status": "89 benchmark tests and 224 chaos tests pass; two manual chaos tests ignored. Workspace style passes. Hold this follow-up while published PR 850 diagnostics run. Final head is not frozen; streak stays 0/10."
   }
 }

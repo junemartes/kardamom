@@ -1,5 +1,6 @@
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use alloy_primitives::{hex, keccak256};
@@ -14,26 +15,32 @@ struct Ingress {
 
 impl Ingress {
     async fn start() -> Self {
-        Self::with_release(None).await
+        Self::with_release(None, 0).await
     }
 
-    async fn with_release(release: Option<tokio::sync::watch::Receiver<bool>>) -> Self {
-        let mut module = RpcModule::new(());
+    async fn with_release(
+        release: Option<tokio::sync::watch::Receiver<bool>>,
+        accepted_prefix: usize,
+    ) -> Self {
+        let mut module = RpcModule::new(AtomicUsize::new(0));
         module
-            .register_method("eth_chainId", |_, &(), _| "0x1")
+            .register_method("eth_chainId", |_, _, _| "0x1")
             .unwrap();
         module
-            .register_async_method("eth_sendRawTransaction", move |params, _, _| {
+            .register_async_method("eth_sendRawTransaction", move |params, calls, _| {
                 let release = release.clone();
+                let held = calls.fetch_add(1, Ordering::Relaxed) >= accepted_prefix;
                 async move {
-                    Self::await_release(release).await;
+                    if held {
+                        Self::await_release(release).await;
+                    }
                     let raw = params.one::<String>().unwrap();
                     format!("{:#x}", keccak256(hex::decode(raw).unwrap()))
                 }
             })
             .unwrap();
         module
-            .register_method("eth_getTransactionReceipt", |_, &(), _| {
+            .register_method("eth_getTransactionReceipt", |_, _, _| {
                 serde_json::json!({
                     "status":"0x1", "gasUsed":"0x5208", "blockNumber":"0x1",
                     "from":"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
@@ -134,7 +141,7 @@ async fn a_run_without_external_control_reports_its_measured_window() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_full_inflight_queue_cannot_extend_the_submission_window() {
     let (release, held) = tokio::sync::watch::channel(false);
-    let ingress = Ingress::with_release(Some(held)).await;
+    let ingress = Ingress::with_release(Some(held), 0).await;
     let directory = tempfile::tempdir().unwrap();
     let output = directory.path().join("report.json");
     let mut config = ingress.config(Duration::from_millis(100), &output);
@@ -170,4 +177,73 @@ async fn a_full_inflight_queue_cannot_extend_the_submission_window() {
         report["verdict"]["receipted"], 1,
         "already offered work still drains"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unfinished_submit_cannot_produce_a_passing_measurement() {
+    let (release, held) = tokio::sync::watch::channel(false);
+    let ingress = Ingress::with_release(Some(held), 1).await;
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("report.json");
+    let mut config = ingress.config(Duration::from_millis(250), &output);
+    config.chaos_mode = false;
+    config.max_in_flight = NonZeroU32::MIN;
+    config.drain_timeout = Duration::from_millis(100);
+    let prepared = prepare(config).await.unwrap();
+    let progress = prepared.progress();
+    let result = tokio::time::timeout(Duration::from_secs(8), prepared.run())
+        .await
+        .unwrap();
+    release.send_replace(true);
+    let counts = progress.tracker.counts();
+    assert_eq!(
+        (counts.offered, counts.accepted, counts.receipted),
+        (2, 1, 1)
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("unfinished submit")
+    );
+    assert!(
+        !output.exists(),
+        "an unknown outcome cannot publish a passing report"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_prepared_run_stops_its_background_receipt_readers() {
+    let (release, held) = tokio::sync::watch::channel(false);
+    let ingress = Ingress::with_release(Some(held), 0).await;
+    let directory = tempfile::tempdir().unwrap();
+    let config = ingress.config(
+        Duration::from_secs(5),
+        &directory.path().join("report.json"),
+    );
+    let prepared = prepare(config).await.unwrap();
+    let progress = prepared.progress();
+    let task = tokio::spawn(prepared.run());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while progress.tracker.counts().offered == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let stopped = tokio::time::timeout(Duration::from_secs(1), async {
+        while std::sync::Arc::strong_count(&progress.tracker) != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    release.send_replace(true);
+    assert!(
+        stopped,
+        "a detached background reader still owns the delivery tracker"
+    );
+    assert!(!progress.is_submitting());
 }

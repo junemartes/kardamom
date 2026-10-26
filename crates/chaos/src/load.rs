@@ -234,8 +234,12 @@ impl LoadRun {
     ///
     /// Returns an error if the harness failed before a verdict, or the
     /// report is missing or unreadable.
-    pub async fn finish(self) -> anyhow::Result<Verdict> {
-        let outcome = self.task.await.context("join the load task")??;
+    pub async fn finish(mut self) -> anyhow::Result<Verdict> {
+        let outcome = (&mut self.task)
+            .await
+            .context("join the load task")
+            .and_then(std::convert::identity)
+            .inspect_err(|error| self.save_incomplete(Some(error)))?;
         let report_text = std::fs::read_to_string(&self.report_path).with_context(|| {
             format!(
                 "load report {} missing (harness: {outcome:?})",
@@ -253,9 +257,15 @@ impl LoadRun {
 
     /// Abort the load, for cleanup after a failed case.
     pub fn abort(&self) {
+        self.save_incomplete(None);
+        self.task.abort();
+    }
+
+    fn save_incomplete(&self, failure: Option<&anyhow::Error>) {
         let progress = self.ready.borrow().as_ref().map(Progress::snapshot);
         let report = serde_json::json!({
             "aborted_before_final_verdict": true,
+            "failure": failure.map(|error| format!("{error:#}")),
             "report": self.report_path,
             "progress": progress,
         });
@@ -269,7 +279,6 @@ impl LoadRun {
                 path.display()
             ));
         }
-        self.task.abort();
     }
 }
 
@@ -306,6 +315,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let report_path = directory.path().join("report.json");
         std::fs::write(&report_path, r#"{"verdict":{"pass":true,"missing":0}}"#).unwrap();
+        let aborted_path = report_path.with_extension("aborted.json");
         let run = stub_run(report_path, async {
             anyhow::bail!("load failed before report")
         });
@@ -316,6 +326,10 @@ mod tests {
                 .to_string()
                 .contains("load failed before report")
         );
+        let aborted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(aborted_path).unwrap()).unwrap();
+        assert_eq!(aborted["aborted_before_final_verdict"], true);
+        assert_eq!(aborted["failure"], "load failed before report");
     }
 
     #[tokio::test]

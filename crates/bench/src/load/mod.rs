@@ -260,6 +260,18 @@ struct ReceiptFeed {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// The feed and sweeper stop when the run ends, fails, or is cancelled.
+struct BackgroundTasks([Option<tokio::task::JoinHandle<()>>; 2]);
+
+impl Drop for BackgroundTasks {
+    fn drop(&mut self) {
+        self.0
+            .iter()
+            .flatten()
+            .for_each(tokio::task::JoinHandle::abort);
+    }
+}
+
 /// The result of `settle_and_snapshot`.
 struct Settled {
     fin: MetricsSnapshot,
@@ -331,19 +343,19 @@ impl LoadRun<'_> {
     async fn settle_and_snapshot(
         &self,
         tasks: &mut tokio::task::JoinSet<()>,
-        feed: Option<tokio::task::JoinHandle<()>>,
-        sweeper: Option<tokio::task::JoinHandle<()>>,
-    ) -> Settled {
+        background: BackgroundTasks,
+    ) -> anyhow::Result<Settled> {
         let deadline = Instant::now() + self.cfg.drain_timeout;
-        join_submit_tasks(tasks, deadline).await;
-        engine::Drainer::new(self.receipt_clients.clone(), Arc::clone(self.tracker))
-            .drain(deadline)
-            .await;
-        if let Some(feed) = feed {
-            feed.abort();
-        }
-        if let Some(sweeper) = sweeper {
-            sweeper.abort();
+        {
+            let _background = background;
+            let joined = join_submit_tasks(tasks, deadline).await;
+            if joined.is_err() {
+                tasks.shutdown().await;
+            }
+            joined?;
+            engine::Drainer::new(self.receipt_clients.clone(), Arc::clone(self.tracker))
+                .drain(deadline)
+                .await;
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
         let fin = self.scraper.snapshot().await;
@@ -353,7 +365,7 @@ impl LoadRun<'_> {
         } else {
             None
         };
-        Settled { fin, recheck }
+        Ok(Settled { fin, recheck })
     }
 
     /// Build the verdict from the tracker's final counts and the
