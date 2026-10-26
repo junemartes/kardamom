@@ -17,7 +17,8 @@ import org.agrona.concurrent.status.AtomicCounter;
  * it restores the snapshot, replays its copy of the log, and its election
  * catches up the rest from the leader.
  *
- * <p>Each round clears both directories and runs an Aeron ClusterBackup
+ * <p>Each round clears the cluster directory and the Raft archive's root
+ * files. Other archives in child directories stay intact. The round runs an Aeron ClusterBackup
  * with {@code LATEST_SNAPSHOT} against the consensus endpoints of the
  * other members. The backup writes into the member's own directories and
  * listens on the member's own consensus endpoint, which is free until the
@@ -110,7 +111,7 @@ final class PeerSeed {
     /** Run one round. Return whether it seeded the member; wait out the backoff when it did not. */
     private boolean seeded(final int round) {
         clusterDir.clear();
-        archiveDir.clear();
+        archiveDir.clearFiles();
         final Round result = backUp();
         if (result.outcome() == SeedWatch.Outcome.SEEDED && copiedRetained(result.backup())) {
             clusterDir.dropMarkFiles();

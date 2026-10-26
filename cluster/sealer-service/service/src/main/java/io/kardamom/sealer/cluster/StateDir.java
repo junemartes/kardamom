@@ -132,6 +132,17 @@ record StateDir(Path root) {
         }
     }
 
+    /** Clear the Raft archive's root files and preserve other archives in child directories. */
+    void clearFiles() {
+        unchecked(() -> Files.createDirectories(root));
+        unchecked(() -> {
+            try (Stream<Path> paths = Files.list(root)) {
+                paths.filter(Files::isRegularFile)
+                        .forEach(path -> unchecked(() -> Files.delete(path)));
+            }
+        });
+    }
+
     /** Delete the mark files that a closed process left in the directory. */
     void dropMarkFiles() {
         try (Stream<Path> paths = Files.list(root)) {
