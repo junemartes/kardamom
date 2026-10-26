@@ -28,7 +28,7 @@ mod tests;
 mod tracker;
 
 pub use prepared::Prepared;
-pub use progress::Progress;
+pub use progress::{Progress, ProgressSnapshot};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

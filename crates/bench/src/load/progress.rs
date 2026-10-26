@@ -4,7 +4,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::watch;
 
-use super::tracker::Tracker;
+use super::tracker::{PendingSample, Tracker};
+
+/// Failure evidence reads existing counters. Concurrent tasks can advance between reads.
+#[derive(Debug, serde::Serialize)]
+pub struct ProgressSnapshot {
+    offered: u64,
+    accepted: u64,
+    receipted: u64,
+    submitting: bool,
+    accepted_pending: u64,
+    unaccepted_pending: u64,
+    pending_sample: Vec<PendingSample>,
+}
 
 #[derive(Clone)]
 pub struct Progress {
@@ -20,6 +32,21 @@ impl Progress {
             tracker,
             submitting: Arc::new(AtomicBool::new(false)),
             stop,
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> ProgressSnapshot {
+        let counts = self.tracker.counts();
+        let pending = self.tracker.remaining_pending();
+        ProgressSnapshot {
+            offered: counts.offered,
+            accepted: counts.accepted,
+            receipted: counts.receipted,
+            submitting: self.is_submitting(),
+            accepted_pending: pending.missing,
+            unaccepted_pending: pending.unlanded,
+            pending_sample: self.tracker.sample_pending(16),
         }
     }
 

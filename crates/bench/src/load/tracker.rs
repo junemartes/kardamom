@@ -169,10 +169,13 @@ struct Pending {
 /// One still-pending entry, from [`Tracker::sample_pending`]: its
 /// hash, whether ingress accepted the submit, and how long it has been
 /// pending.
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct PendingSample {
     pub(crate) hash: B256,
     pub(crate) accepted: bool,
     pub(crate) age: Duration,
+    sender: Option<Address>,
+    nonce: Option<u64>,
 }
 
 /// A shared, thread-safe delivery tracker.
@@ -356,6 +359,8 @@ impl Tracker {
                 hash: *h,
                 accepted: v.accepted,
                 age: v.submit_ts.elapsed(),
+                sender: self.expected.get(h).map(|expected| expected.sender),
+                nonce: self.expected.get(h).map(|expected| expected.nonce),
             })
             .collect()
     }

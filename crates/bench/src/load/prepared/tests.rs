@@ -14,14 +14,22 @@ struct Ingress {
 
 impl Ingress {
     async fn start() -> Self {
+        Self::with_release(None).await
+    }
+
+    async fn with_release(release: Option<tokio::sync::watch::Receiver<bool>>) -> Self {
         let mut module = RpcModule::new(());
         module
             .register_method("eth_chainId", |_, &(), _| "0x1")
             .unwrap();
         module
-            .register_method("eth_sendRawTransaction", |params, &(), _| {
-                let raw = params.one::<String>().unwrap();
-                format!("{:#x}", keccak256(hex::decode(raw).unwrap()))
+            .register_async_method("eth_sendRawTransaction", move |params, _, _| {
+                let release = release.clone();
+                async move {
+                    Self::await_release(release).await;
+                    let raw = params.one::<String>().unwrap();
+                    format!("{:#x}", keccak256(hex::decode(raw).unwrap()))
+                }
             })
             .unwrap();
         module
@@ -36,6 +44,12 @@ impl Ingress {
         Self {
             url: format!("http://{}", server.local_addr().unwrap()),
             handle: server.start(module),
+        }
+    }
+
+    async fn await_release(release: Option<tokio::sync::watch::Receiver<bool>>) {
+        if let Some(mut release) = release {
+            release.wait_for(|released| *released).await.unwrap();
         }
     }
 
@@ -98,7 +112,7 @@ async fn an_external_stop_drains_accepted_transactions_and_reports_actual_durati
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_run_without_external_control_keeps_its_configured_window() {
+async fn a_run_without_external_control_reports_its_measured_window() {
     let ingress = Ingress::start().await;
     let directory = tempfile::tempdir().unwrap();
     let output = directory.path().join("report.json");
@@ -112,7 +126,48 @@ async fn a_run_without_external_control_keeps_its_configured_window() {
     );
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-    assert_eq!(report["duration_secs"], 0.25);
+    assert!((0.20..2.0).contains(&report["duration_secs"].as_f64().unwrap()));
     assert!(report["verdict"]["accepted"].as_u64().unwrap() > 0);
     assert_eq!(report["verdict"]["missing"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_inflight_queue_cannot_extend_the_submission_window() {
+    let (release, held) = tokio::sync::watch::channel(false);
+    let ingress = Ingress::with_release(Some(held)).await;
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("report.json");
+    let mut config = ingress.config(Duration::from_millis(100), &output);
+    config.max_in_flight = NonZeroU32::MIN;
+    let prepared = prepare(config).await.unwrap();
+    let progress = prepared.progress();
+    let task = tokio::spawn(prepared.run());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while progress.tracker.counts().offered == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(2), async {
+        while progress.is_submitting() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    release.send_replace(true);
+    assert!(task.await.unwrap().unwrap());
+    assert!(ended, "the paced window stays open behind the held submit");
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(
+        report["verdict"]["offered"], 1,
+        "no new submit after the deadline"
+    );
+    assert_eq!(report["verdict"]["accepted"], 1);
+    assert_eq!(
+        report["verdict"]["receipted"], 1,
+        "already offered work still drains"
+    );
 }

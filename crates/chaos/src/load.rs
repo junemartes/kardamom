@@ -253,6 +253,22 @@ impl LoadRun {
 
     /// Abort the load, for cleanup after a failed case.
     pub fn abort(&self) {
+        let progress = self.ready.borrow().as_ref().map(Progress::snapshot);
+        let report = serde_json::json!({
+            "aborted_before_final_verdict": true,
+            "report": self.report_path,
+            "progress": progress,
+        });
+        let path = self.report_path.with_extension("aborted.json");
+        let saved = serde_json::to_vec_pretty(&report)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| std::fs::write(&path, bytes).map_err(anyhow::Error::from));
+        if let Err(error) = saved {
+            crate::log(format!(
+                "failed to save aborted load evidence at {}: {error:#}",
+                path.display()
+            ));
+        }
         self.task.abort();
     }
 }

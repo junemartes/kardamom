@@ -177,9 +177,12 @@ impl Submission<'_> {
         let mut stopped = self.progress.stop_requested();
         let started = Instant::now();
         tokio::select! {
-            () = pacer(self.handles, self.tasks, self.queues, self.rate, self.duration, self.opts) => self.duration,
-            _ = stopped.wait_for(|stop| *stop) => started.elapsed(),
+            biased;
+            () = tokio::time::sleep(self.duration) => {},
+            _ = stopped.wait_for(|stop| *stop) => {},
+            () = pacer(self.handles, self.tasks, self.queues, self.rate, self.duration, self.opts) => {},
         }
+        started.elapsed()
     }
 }
 

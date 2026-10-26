@@ -335,7 +335,7 @@ impl Harness {
             duration: window,
             tps: case.tps(&self.knobs),
             retry_submit: case.load_retry(&self.knobs),
-            pause_wait: Duration::ZERO,
+            pause_wait: window,
             max_gap: self.knobs.load_max_gap,
             drain_timeout: self
                 .knobs
