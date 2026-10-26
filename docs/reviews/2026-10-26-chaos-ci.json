@@ -10,7 +10,11 @@
     "new_shards": false,
     "product_changes_require_latency_and_throughput_comparison": true,
     "green_requires_repeated_full_runs_of_the_same_head": true,
-    "failures_require_classification_before_retry": true
+    "failures_require_classification_before_retry": true,
+    "required_consecutive_green_rounds": 10,
+    "green_round_definition": "Every required workflow and affected chaos coverage completes successfully on one unchanged final commit. Failure resets the streak. Incomplete or cancelled rounds do not count.",
+    "green_streak": 0,
+    "final_commit": null
   },
   "failures": [
     {
@@ -55,6 +59,26 @@
       "status": "fix awaiting CI",
       "verification": [
         "Fake-agent tests verify live 404 fallback, live missing-log failure, and terminal 404 compatibility."
+      ]
+    },
+    {
+      "id": "stale-account-rpc-under-mirror-backlog",
+      "classification": "product",
+      "source": "crates/ingress/src/proxy/accounts.rs",
+      "observed": "With a live Redis head at position 10 and local progress 100 beyond max_stale_txs=8, cold nonce/balance RPCs return (3,0) while the executor returns (5,42).",
+      "before_test_log": "/tmp/chaos-gaps-stale-rpc-before.log",
+      "cause": "Account RPCs share the admission cache lookup without requiring Redis freshness. A lower bound is suitable for nonce admission, but a known-stale row must not answer a head-state RPC.",
+      "change": "Require freshness for the RPC specialization of the cache read. Keep the admission specialization independent of freshness and executor queries. Local resident rows retain priority.",
+      "hot_path_changed": true,
+      "hot_path_detail": "The shared async helper has a const REQUIRE_FRESH parameter. RPC instantiates true; admission instantiates false, eliminating the new condition and head loads from admission. Healthy cold RPC adds the freshness check; stale cold RPC uses the existing bounded executor query.",
+      "service_wiring_changed": false,
+      "status": "fix validated locally; full CI and full workload comparison pending",
+      "verification": [
+        "A real Redis regression fails with (3,0), then passes with (5,42).",
+        "Fresh Redis and local reads make zero executor queries.",
+        "Validated admission uses stale nonce lower bounds and makes zero executor queries.",
+        "Five release repeats per version, 400 samples per phase: fresh RPC p99 221.81 -> 205.52 us; serial admission median 3282.38 -> 3988.67 TPS. Shared-host variation prevents a speedup claim.",
+        "Performance summary and raw samples: docs/benches/2026-10-26-ingress-rpc-cache-profile.json"
       ]
     }
   ],
@@ -213,9 +237,9 @@
     }
   ],
   "validation": {
-    "runtime_product_files_changed": false,
+    "runtime_product_files_changed": true,
     "service_wiring_changed": false,
-    "performance_claim": "No Cluster or general throughput speedup is claimed. Product changes require identical-workload baseline measurements.",
+    "performance_claim": "No speedup is claimed. Local release microbenchmarks show no observed regression. Full cluster workload comparison and repeated green CI remain required.",
     "completed": [
       {
         "check": "chaos library unit tests",
@@ -232,15 +256,27 @@
       {
         "check": "workflow YAML lint",
         "result": "passed"
+      },
+      {
+        "check": "ingress library and account layer tests",
+        "result": "132 library tests and 14 account tests passed"
+      },
+      {
+        "check": "real Redis ingress regression and profile tests",
+        "result": "8 passed; includes 5 profile rounds"
+      },
+      {
+        "check": "release RPC and serial-admission comparison",
+        "result": "5 before and 5 after repeats, 400 samples per phase per repeat; raw samples checked in"
       }
     ],
     "pending": [
-      "full CI",
-      "repeat full CI at same head",
-      "per-shard runtime comparison",
-      "client p50/p95/p99 and throughput comparison for any product changes"
+      "Full CI for the product fix",
+      "Remaining coverage gaps",
+      "Full cluster workload comparison",
+      "10 consecutive complete green CI rounds on the final unchanged commit"
     ],
-    "ci_wiring_changed": "Retain successful and failed load report JSON artifacts for 14 days. Keep large state evidence limited to failures."
+    "ci_wiring_changed": "Keep successful load reports for 14 days and preserve account-cache profile JSONL, labeled by build profile. CI records debug profile samples; the checked-in comparison uses release builds."
   },
   "iterations": [
     {
@@ -248,6 +284,13 @@
       "commit": "a510a518685864b3cf9419dd52c0535040108f15",
       "workflow_run": 40267573235,
       "url": "https://github.com/junemartes/kardamom/actions/runs/40267573235",
+      "status": "in progress"
+    },
+    {
+      "pull_request": 840,
+      "commit": "5e2ce0523bc9b27889af69b8061dde66aa259bd4",
+      "workflow_run": 40268972862,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40268972862",
       "status": "in progress"
     }
   ]

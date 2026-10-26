@@ -108,3 +108,12 @@ jobs:
             -p kardamom-ingress \
             --features 'docker-e2e,test-support' \
             --test account_cache_redis_test -- --ignored --nocapture
+
+      - name: Preserve account cache performance samples
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingress-account-cache-profile
+          path: /tmp/kardamom-ingress-account-profile.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
