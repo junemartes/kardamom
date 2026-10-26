@@ -8,34 +8,89 @@ use super::{history, outcome, reader, request, serve};
 use crate::reader::carried::tests::{boundary, done, entry, tx_at, tx_frame};
 use crate::reader::{FrameTee, TxOrderingSubscription};
 
-#[test]
-fn restarted_copies_join_the_egress_without_skipping_an_unposted_block() {
-    let mut merge = Merge::new(
+fn merge(head: Head) -> Merge {
+    Merge::new(
         MergeConfig {
             max_waiting: NonZeroUsize::new(64).unwrap(),
             compared: NonZeroUsize::new(64).unwrap(),
         },
-        Head {
-            next_index: 3,
-            next_block: 4,
-            last: Some(Key::Boundary(3)),
-        },
-    );
+        head,
+    )
+}
+
+#[test]
+fn restarted_copies_join_the_egress_without_skipping_an_unposted_block() {
+    for (head, from) in [
+        (
+            Head {
+                next_index: 3,
+                next_block: 4,
+                last: Some(Key::Boundary(3)),
+            },
+            6,
+        ),
+        (
+            Head {
+                next_index: 2,
+                next_block: 2,
+                last: Some(Key::Record(1)),
+            },
+            3,
+        ),
+        (
+            Head {
+                next_index: 1,
+                next_block: 2,
+                last: Some(Key::Boundary(1)),
+            },
+            2,
+        ),
+    ] {
+        assert_restarted_at(head, from);
+    }
+}
+
+fn assert_restarted_at(head: Head, from: usize) {
+    let mut merge = merge(head);
     let mut delivered = Vec::new();
     for session in 1..=3 {
-        restarted_copy(session, &mut merge, &mut delivered);
+        restarted_copy(session, (0, 1), &mut merge, &mut delivered);
     }
-    assert_eq!(delivered, [tx_at(3), boundary(4, 4)]);
+    let stream: Vec<_> = (0..4)
+        .flat_map(|i| [tx_at(i), boundary(i + 1, i + 1)])
+        .collect();
+    assert_eq!(delivered, stream[from..]);
     assert_eq!(merge.head().next_index, 4);
     assert_eq!(merge.head().next_block, 5);
 }
 
-fn restarted_copy(session: i32, merge: &mut Merge, delivered: &mut Vec<Vec<u8>>) {
-    let (sub, feed) = reader(history((0, 1), 3));
+#[test]
+fn a_gap_before_the_checked_window_cannot_skip_unposted_history() {
+    let head = Head {
+        next_index: 1,
+        next_block: 2,
+        last: Some(Key::Boundary(1)),
+    };
+    let mut merge = merge(head);
+    let mut delivered = Vec::new();
+    for session in 1..=3 {
+        restarted_copy(session, (2, 3), &mut merge, &mut delivered);
+    }
+    assert!(delivered.is_empty());
+    assert_eq!(merge.head(), head);
+}
+
+fn restarted_copy(
+    session: i32,
+    floor: (u64, u64),
+    merge: &mut Merge,
+    delivered: &mut Vec<Vec<u8>>,
+) {
+    let (sub, feed) = reader(history(floor, 3));
     let (out, frames) = crossbeam_channel::bounded(64);
     let mut sub = sub.with_tee(FrameTee::new(out));
     let first = request(&mut sub, &feed);
-    serve(&feed, first.request_id, 1..4);
+    serve(&feed, first.request_id, floor.1..4);
     let next = request(&mut sub, &feed);
     assert_eq!((next.from_index, next.from_block), (3, 4));
     feed.send(tx_at(3));

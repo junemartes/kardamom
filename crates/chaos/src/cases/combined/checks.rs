@@ -376,6 +376,10 @@ pub(crate) enum Check {
 }
 
 impl Check {
+    pub(crate) async fn assert_one_leader(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+        Terms::parse(&h.evidence.cluster_logs().await?).assert_one_leader(ctx, SEALER_MEMBERS)
+    }
+
     pub(super) async fn assert(
         self,
         h: &Harness,
@@ -384,8 +388,7 @@ impl Check {
     ) -> anyhow::Result<()> {
         match self {
             Self::NoOriginGap => assert_no_origin_gap(h, ctx).await,
-            Self::OneLeaderPerTerm => Terms::parse(&h.evidence.cluster_logs().await?)
-                .assert_one_leader(ctx, SEALER_MEMBERS),
+            Self::OneLeaderPerTerm => Self::assert_one_leader(h, ctx).await,
             Self::NoRefBelowFloor => assert_no_ref_below_floor(h, ctx).await,
             Self::EpochRefill => baseline.assert_refill(h, ctx).await,
             Self::ReceiptFromState => baseline.assert_receipt_from_state(h, ctx).await,

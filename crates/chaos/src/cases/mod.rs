@@ -26,6 +26,7 @@ pub(crate) mod fleet;
 pub(crate) mod l1;
 pub(crate) mod l1_canary;
 mod member_storage;
+mod raft_partition;
 pub(crate) mod recorded_cursor;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
@@ -49,6 +50,7 @@ pub enum Case {
     ReplayWindowResync,
     DeployBrokenImage,
     ClusterLeaderKill,
+    RaftLeaderOneWayPartition,
     ClusterFollowerKill,
     ClusterMemberRejoin,
     NodeReplaceSealer,
@@ -122,6 +124,7 @@ const ALL: &[Case] = &[
     Case::ReplayWindowResync,
     Case::DeployBrokenImage,
     Case::ClusterLeaderKill,
+    Case::RaftLeaderOneWayPartition,
     Case::ClusterFollowerKill,
     Case::ClusterMemberRejoin,
     Case::NodeReplaceSealer,
@@ -208,6 +211,7 @@ impl Case {
             Self::ReplayWindowResync => "replay-window-resync",
             Self::DeployBrokenImage => "deploy-broken-image",
             Self::ClusterLeaderKill => "cluster-leader-kill",
+            Self::RaftLeaderOneWayPartition => "raft-leader-one-way-partition",
             Self::ClusterFollowerKill => "cluster-follower-kill",
             Self::ClusterMemberRejoin => "cluster-member-rejoin",
             Self::NodeReplaceSealer => "node-replace-sealer",
@@ -310,6 +314,9 @@ impl Case {
                 inject
                     .saturating_add(k.restart_slo.saturating_mul(4))
                     .saturating_add(sequencer_recovery::SequencerRecovery::PROOF_WINDOW)
+            }
+            Self::RaftLeaderOneWayPartition => {
+                inject + k.leader_slo + k.rejoin_slo + Duration::from_mins(4)
             }
             Self::SequencerLapse => inject + k.seq_lapse + Duration::from_mins(1),
             Self::ControlPlaneLossRecover => inject
@@ -496,6 +503,7 @@ impl Case {
             Self::ReplayWindowResync => component::replay_window_resync(h).await,
             Self::DeployBrokenImage => deploy::broken_image(h).await,
             Self::ClusterLeaderKill => cluster::leader_kill(h).await,
+            Self::RaftLeaderOneWayPartition => raft_partition::leader_one_way(h).await,
             Self::ClusterFollowerKill => cluster::follower_kill(h).await,
             Self::ClusterMemberRejoin => cluster::member_rejoin(h).await,
             Self::NodeReplaceSealer => cluster::node_replace_sealer(h).await,

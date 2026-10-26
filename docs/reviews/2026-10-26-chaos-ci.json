@@ -275,6 +275,16 @@
         "This fixes a restart anchor gap. It does not prove recovery after every copy loses a canonical frame outside the checked restart window.",
         "Five alternating pinned release repeats: median frame p50 120 -> 120 ns, p95 130 -> 130 ns, p99 160 -> 150 ns; measured phase throughput 4.80 -> 5.40 million frames/s. No speedup claim; full cluster comparison pending. Summary and raw samples are in docs/benches/2026-10-26-egress-restart-tee-* ."
       ]
+    },
+    {
+      "id": "incomplete-benchmark-evidence",
+      "classification": "harness",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "observed": "The upload keeps kardamom-load.json but excludes kardamom-load-defi.json. scrape_fallbacks counts fallback metric reads through docker exec, not executor state queries.",
+      "change": "Retain kardamom-load*.json. Record per-executor query counter deltas from existing metrics across callers, methods and outcomes. Missing/invalid samples and observed counter decreases are null. A restart between snapshots can still hide counts; these are counter differences, not complete client-attempt accounting.",
+      "status": "83 benchmark library tests pass; workspace style passes. No new service counters or steady transaction work."
     }
   ],
   "coverage": [
@@ -294,7 +304,7 @@
       "existing_shards": [
         "chaos-cache"
       ],
-      "status": "pending"
+      "status": "Open: bucket-local coverage certification is designed in docs/specs/2026-10-05-redis-cluster-support.md, tracking #397. Its freshness protocol review is explicitly open. The standalone maximum-head oracle does not prove this fault safe; no Cluster transport or deployment is added here."
     },
     {
       "gap": "Interrupted and concurrent mirror rebuilds with per-mirror proof",
@@ -359,7 +369,7 @@
       "existing_shards": [
         "chaos-cluster"
       ],
-      "status": "pending"
+      "status": "One-way live-leader Raft partition is added to the existing cluster shard. Only old-leader outbound UDP to the two peers on consensus/log/catchup/archive-control ports is dropped. The old process and start time must stay unchanged; the surviving quorum must elect and receipt clients; fault counters must be positive; terms must have one leader and all members must return after cleanup. 203 local chaos tests pass; deployed validation pending. Packet delay and probabilistic loss remain open."
     },
     {
       "gap": "ENOSPC, I/O errors, and corrupt recovery sources",
@@ -480,7 +490,7 @@
       "Remaining coverage gaps",
       "Full cluster workload comparison",
       "10 consecutive complete green CI rounds on the final unchanged commit",
-      "Deployed validation of the 74 scheduled cases, including the scoped canary genesis and guard restoration"
+      "Deployed validation of the 75 scheduled cases, including the scoped canary genesis and guard restoration"
     ],
     "ci_wiring_changed": "Retain load/profile evidence; add suite=all to the cluster workflow without changing normal PR/scheduled selection; make static validation dispatchable; test the persistent ten-round audit utility in CI. The serial carry rollout has a 180-minute job budget; all per-case recovery deadlines remain unchanged.",
     "streak_command": "python3 scripts/ci/green_streak.py --branch BRANCH --head FULL_SHA --state AUDIT.json --poll --run CI_ID --run CLUSTER_ID --run DOCKER_ID --run SEMANTICS_ID --run VALIDATION_ID",
@@ -620,8 +630,11 @@
   "unpublished": {
     "workspace": "/home/dev/kardamom-chaos-gaps",
     "changes": [
-      "mirror-backlog-client-restart in the existing cache shard; total 74 scheduled cases"
+      "mirror-backlog-client-restart in the existing cache shard; total 74 scheduled cases",
+      "One-way live-leader partition in the existing cluster shard; total 75 scheduled cases",
+      "Preserve both transfer and DeFi reports and expose existing executor query counter deltas",
+      "Egress restart regression covers an unposted gap inside checked history and rejects a gap before it"
     ],
-    "status": "202 chaos tests (two ignored) and workspace style pass. Test-only fault holds old mirror heads live for at most 600 seconds, stops the mirror job, restarts ingress-1, removes held heads and restores the exact mirror job even on error. No production code or configuration change. Not pushed while PR 848 diagnostic evidence is collected. Streak remains 0/10; final head is not frozen."
+    "status": "214 engine tests (one manual profile ignored), 203 chaos tests (two ignored), 83 benchmark tests and workspace style pass. No service code changes after PR 848. Local test-only faults and report collection are ready for the next diagnostic candidate. PR 848 has green CI and docker workflows; all regular cluster shards and integrity are now running. Streak stays 0/10, and the final head is not frozen."
   }
 }

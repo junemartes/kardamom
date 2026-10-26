@@ -150,6 +150,7 @@ impl Prepared {
             discovered_max: discovered_max.get(),
             soak_rate: soak_rate.get(),
             scrape_fallbacks: settled.scrape_fallbacks(&base),
+            executor_queries_served_delta: settled.fin.query_deltas(&base),
             duration,
         });
 

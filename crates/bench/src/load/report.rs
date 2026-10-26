@@ -9,6 +9,7 @@ pub(super) struct ReportInput {
     pub(super) discovered_max: u32,
     pub(super) soak_rate: u32,
     pub(super) scrape_fallbacks: u64,
+    pub(super) executor_queries_served_delta: Vec<(String, Option<u64>)>,
     pub(super) duration: Duration,
 }
 
@@ -22,6 +23,7 @@ impl LoadRun<'_> {
             discovered_max,
             soak_rate,
             scrape_fallbacks,
+            executor_queries_served_delta,
             duration,
         } = input;
         let lat = self.tracker.latency_us();
@@ -46,6 +48,7 @@ impl LoadRun<'_> {
             total_gas: self.tracker.total_gas(),
             workload: self.cfg.workload.to_string(),
             scrape_fallbacks,
+            executor_queries_served_delta,
             verdict,
         }
     }

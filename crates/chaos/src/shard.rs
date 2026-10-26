@@ -116,6 +116,7 @@ impl Shard {
             ],
             Self::Cluster => &[
                 "cluster-leader-kill",
+                "raft-leader-one-way-partition",
                 "cluster-follower-kill",
                 "cluster-member-rejoin",
                 "node-replace-sealer",
@@ -413,7 +414,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 74);
+        assert_eq!(all.len(), 75);
         assert_eq!(
             Shard::Integrity.cases().last(),
             Some(&"resize-scale-out-in")

@@ -488,6 +488,11 @@ pub struct LoadReport {
     /// of an older harness.
     #[serde(default)]
     pub scrape_fallbacks: u64,
+    /// Responses served by each executor during the window and drain, across all
+    /// callers, methods and outcomes. Missing scrapes and observed decreases are
+    /// null. A restart between snapshots can hide counts without a decrease.
+    #[serde(default)]
+    pub executor_queries_served_delta: Vec<(String, Option<u64>)>,
     /// The completeness, drop accounting, and keep-pace verdict.
     pub verdict: Verdict,
 }

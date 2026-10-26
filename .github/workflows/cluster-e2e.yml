@@ -363,7 +363,7 @@ jobs:
           name: chaos-load-${{ matrix.shard }}
           path: |
             /tmp/chaos-*.json
-            /tmp/kardamom-load.json
+            /tmp/kardamom-load*.json
           if-no-files-found: ignore
           retention-days: 14
 
