@@ -19,10 +19,16 @@ pub(crate) mod engine;
 mod exporter;
 mod feed;
 pub mod plan;
+mod prepared;
+mod progress;
+mod report;
 pub(crate) mod scrape;
 #[cfg(test)]
 mod tests;
 mod tracker;
+
+pub use prepared::Prepared;
+pub use progress::Progress;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,7 +36,6 @@ use std::time::{Duration, Instant};
 use alloy_primitives::Address;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClient;
-use tokio::sync::Semaphore;
 
 use crate::config::{MAX_IN_FLIGHT_SLACK, preflight_chain_id, rpc_client};
 use crate::load::accounting::{EvalInput, evaluate, print_report, step_gap_ok, step_seq_clean};
@@ -387,42 +392,6 @@ impl LoadRun<'_> {
         })
     }
 
-    /// Assemble the final [`LoadReport`] from the run's timing, the
-    /// tracker's latency percentiles and gas total, and the verdict.
-    fn build_report(
-        &self,
-        verdict: accounting::Verdict,
-        ramp: Vec<RampStep>,
-        discovered_max: u32,
-        soak_rate: u32,
-        scrape_fallbacks: u64,
-    ) -> LoadReport {
-        let lat = self.tracker.latency_us();
-        LoadReport {
-            mode: if self.cfg.chaos_mode {
-                "chaos"
-            } else if self.cfg.fixed_rate {
-                "fixed"
-            } else {
-                "soak"
-            }
-            .to_string(),
-            target_tps: self.cfg.target_tps.get(),
-            discovered_max_tps: discovered_max,
-            soak_rate_tps: soak_rate,
-            duration_secs: self.cfg.duration.as_secs_f64(),
-            ramp,
-            lat_p50_us: lat.p50,
-            lat_p95_us: lat.p95,
-            lat_p99_us: lat.p99,
-            lat_max_us: lat.max,
-            total_gas: self.tracker.total_gas(),
-            workload: self.cfg.workload.to_string(),
-            scrape_fallbacks,
-            verdict,
-        }
-    }
-
     /// Write the report as pretty JSON to `cfg.output`, if set.
     fn write_report_json(&self, report: &LoadReport) -> anyhow::Result<()> {
         let Some(path) = &self.cfg.output else {
@@ -554,135 +523,7 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
 /// Returns the same errors as [`run`], except the verdict.
 pub async fn prepare(cfg: LoadConfig) -> anyhow::Result<Prepared> {
     let setup = prepare_run(&cfg).await?;
-    Ok(Prepared { cfg, setup })
-}
-
-/// The signed queues and their configuration. See [`prepare`].
-pub struct Prepared {
-    cfg: LoadConfig,
-    setup: RunSetup,
-}
-
-impl Prepared {
-    /// Run the prepared harness. Returns whether the verdict passed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error on a submission-loop failure or a report write.
-    pub async fn run(self) -> anyhow::Result<bool> {
-        let Self {
-            cfg,
-            setup:
-                RunSetup {
-                    client,
-                    signers,
-                    mut queues,
-                },
-        } = self;
-
-        let scraper = cfg.scraper()?;
-        let mut tracker = Tracker::new()?;
-        tracker.expect(&signers, queues.planned());
-        let tracker = Arc::new(tracker);
-        let sem = Arc::new(Semaphore::new(cfg.max_in_flight.get() as usize));
-        let handles = RunHandles {
-            client: Arc::clone(&client),
-            sem: Arc::clone(&sem),
-            tracker: Arc::clone(&tracker),
-        };
-        let mut tasks = tokio::task::JoinSet::new();
-        let mode = cfg.submit_mode();
-
-        let run = LoadRun {
-            cfg: &cfg,
-            tracker: &tracker,
-            scraper: &scraper,
-            receipt_clients: cfg.receipt_clients(&client)?,
-        };
-
-        let ReceiptFeed {
-            confirm: feed_confirm,
-            task: feed,
-        } = run.spawn_receipt_feed(&signers);
-        // A live sweeper, in every mode. An entry the feed misses, or an
-        // accepted submit whose immediate re-fetch answered null, is
-        // re-fetched within 2 to 7 seconds, instead of waiting for the
-        // end-of-run drain. Keep this cadence well inside the ingress receipt
-        // cache's query horizon (capacity divided by rate, about 27 seconds at
-        // 4,800 tx/s with the default 128k capacity, oldest out first), and
-        // inside the window in which a receipt is still on some ingress: a
-        // job update restarts every replica in turn, and a receipt that only
-        // the drain asks for is then on none of them.
-        let sweeper = Some(
-            Arc::new(engine::Drainer::new(
-                run.receipt_clients.clone(),
-                Arc::clone(&tracker),
-            ))
-            .spawn_pending_sweeper(Duration::from_secs(5), Duration::from_secs(2)),
-        );
-
-        // --- ramp (soak mode only) -------------------------------------------
-        let mut ramp = Vec::new();
-        let discovered_max: std::num::NonZeroU32 = if cfg.chaos_mode || cfg.fixed_rate {
-            cfg.target_tps
-        } else {
-            run.ramp_to_max(&handles, &mut tasks, &mut queues, &mut ramp)
-                .await
-        };
-
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "a discovered tx/s rate stays far under i64::MAX, rounded for the soak target"
-        )]
-        let soak_rate: std::num::NonZeroU32 = if cfg.chaos_mode || cfg.fixed_rate {
-            cfg.target_tps
-        } else {
-            let rate = ((f64::from(discovered_max.get()) * cfg.soak_fraction).round() as u32)
-                .clamp(1, cfg.target_tps.get());
-            std::num::NonZeroU32::new(rate)
-                .ok_or_else(|| anyhow::anyhow!("discovered soak rate rounds to zero"))?
-        };
-
-        // --- soak ------------------------------------------------------------
-        tracing::info!(
-            soak_rate = soak_rate.get(),
-            discovered_max = discovered_max.get(),
-            "kardamom-load: soaking"
-        );
-        let base = scraper.snapshot().await;
-        pacer(
-            &handles,
-            &mut tasks,
-            &mut queues,
-            soak_rate,
-            cfg.duration,
-            SubmitOpts {
-                retry: cfg.retry_submit,
-                pause_wait: cfg.pause_wait,
-                mode,
-                feed_confirm,
-            },
-        )
-        .await;
-
-        let settled = run.settle_and_snapshot(&mut tasks, feed, sweeper).await;
-
-        let verdict = run.build_verdict(&base, &settled.fin, settled.recheck.as_ref());
-        let report = run.build_report(
-            verdict,
-            ramp,
-            discovered_max.get(),
-            soak_rate.get(),
-            settled.scrape_fallbacks(&base),
-        );
-
-        print_report(&report);
-        run.write_report_json(&report)?;
-
-        Ok(report.verdict.pass)
-    }
+    Prepared::new(cfg, setup)
 }
 
 /// The state one ramp-to-max run needs across every step: the fixed

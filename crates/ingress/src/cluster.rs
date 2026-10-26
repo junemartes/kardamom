@@ -224,30 +224,28 @@ mod tests {
     #[test]
     fn canonical_entries_advance_quorum_and_report_the_sealed_hash() {
         let golden = include_str!("../../cluster-adapter/testdata/wire_golden.txt");
-        ["tx_egress", "txref_offer_egress"]
-            .into_iter()
-            .for_each(|name| {
-                let frame = golden
-                    .lines()
-                    .find_map(|line| {
-                        let (key, bytes) = line.split_once(' ')?;
-                        (key == name).then(|| alloy_primitives::hex::decode(bytes).unwrap())
-                    })
-                    .unwrap();
-                let egress = FakeEgress::new();
-                egress.push(frame);
-                egress.close();
-                let mut observer = ClusterWatermarkObserver::new(egress);
-                assert_eq!(
-                    observer.next_event(),
-                    Some(Observed::Progress(EgressProgress {
-                        durable: Some(BPosition::from_index(5)),
-                        sealed: Some(B256::repeat_byte(0xAB)),
-                    })),
-                    "{name} must release the quorum gate and match the ingress publish stamp"
-                );
-                assert_eq!(observer.next_event(), None);
-            });
+        for name in ["tx_egress", "txref_offer_egress"] {
+            let frame = golden
+                .lines()
+                .find_map(|line| {
+                    let (key, bytes) = line.split_once(' ')?;
+                    (key == name).then(|| alloy_primitives::hex::decode(bytes).unwrap())
+                })
+                .unwrap();
+            let egress = FakeEgress::new();
+            egress.push(frame);
+            egress.close();
+            let mut observer = ClusterWatermarkObserver::new(egress);
+            assert_eq!(
+                observer.next_event(),
+                Some(Observed::Progress(EgressProgress {
+                    durable: Some(BPosition::from_index(5)),
+                    sealed: Some(B256::repeat_byte(0xAB)),
+                })),
+                "{name} must release the quorum gate and match the ingress publish stamp"
+            );
+            assert_eq!(observer.next_event(), None);
+        }
     }
 
     #[test]

@@ -377,6 +377,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
+      - name: Preserve failed allocation logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-diagnostics-${{ matrix.shard }}
+          path: /tmp/chaos-diagnostics/**
+          if-no-files-found: ignore
+          retention-days: 14
+
   # One issue per failed shard of a nightly run. The issue carries the
   # `chaos-nightly` label and the shard name in its title. A later failure
   # of the same shard adds a comment with the run, so one open issue

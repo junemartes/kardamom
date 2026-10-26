@@ -29,7 +29,7 @@
       "product_bug": false,
       "service_wiring_changed": false,
       "hot_path_changed": false,
-      "status": "fix awaiting CI",
+      "status": "Harness scope corrected; PR 839 still reproduces the stall because peer seeding also recursively deletes the nested archive.",
       "verification": [
         "Temporary-tree wipe test verifies member data is removed, including hidden files, while live archive/dir, executor state, and egress files survive."
       ]
@@ -157,7 +157,16 @@
       "url": "https://github.com/junemartes/kardamom/actions/runs/40260202176/job/121376240086",
       "observed": "The 120-minute job limit cancels case 7 after six cases pass. In carry-executors-rest, main load finishes at 04:40:33; the rollout finishes at about 04:56:46. The case passes after fault work with no background load.",
       "cause": "Full deployment steps take longer than the fixed load windows and the shard budget. Completion of the load is not checked after injection.",
-      "status": "fix in unpublished wip/chaos-owned-load-20261026; further validation required"
+      "status": "Local load-control and chaos tests pass; full CI pending",
+      "change": "Require accepted traffic from the case-owned load before injection and an open submission window through recovery. Stop new work after recovery, drain offered transactions, and report actual paced duration. Size carry case windows from observed full-deploy time; set only chaos-carry to a 180-minute job budget.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "verification": [
+        "61 load library tests pass, including owned counters, cancellation, stop-before-start, actual duration, and accepted-transaction drain.",
+        "192 chaos library tests pass; 2 ignored.",
+        "Workspace style check passes; baseline proc-macro-error2 future-compatibility notice remains."
+      ]
     },
     {
       "id": "canonical-carry-ingress-seal-observer",
@@ -166,9 +175,30 @@
       "cause": "ClusterWatermarkObserver discards EgressItem::Tx, which decodes both RT_TX and relayed full references. The canonical count and sealed transaction hash never reach the quorum gate or latency clock.",
       "change": "Observe each canonical transaction index and canonical ID through the same progress event as legacy references.",
       "verification": [
-        "Golden RT_TX and full-reference egress frames both fail with no progress event before the fix."
+        "Golden RT_TX and full-reference egress frames both fail with no progress event before the fix.",
+        "Both golden frames pass after the fix; all 133 ingress library tests pass."
       ],
-      "status": "regression and combined CI pending"
+      "status": "validated locally; full CI pending"
+    },
+    {
+      "id": "abandoned-egress-http-replays",
+      "classification": "product",
+      "source": "crates/engine/src/reader/carried/egress.rs",
+      "observed": "A peer accepts request headers and never answers. Closing the source, replacing the request, or dropping the reader leaves each old HTTP request alive. All three cancellation regressions fail before the fix.",
+      "cause": "EgressTransport discards the spawned replay JoinHandle. Dropping the output receiver does not cancel the HTTP task, and the request has no deadline. Reader resends can leave more abandoned workers.",
+      "change": "Make Replay own its worker and abort it on replacement, close, or drop. Bound each page request, including its body, to five seconds.",
+      "product_bug": true,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "hot_path_detail": "Only replay setup, teardown, and HTTP reads change. Polling still reads the same receiver. Admission and execution add no work. Full deployed workload comparison remains pending.",
+      "reason_missed": "Existing egress tests use an answering local peer or a refused connection. They do not hold a connection open without a response or check abandoned requests.",
+      "status": "All 209 engine library tests pass, including five real-socket cancellation and deadline regressions. This independently reproduced bug is not established as the cause of the validator CI stall.",
+      "verification": [
+        "Before-fix failure: /tmp/chaos-gaps-replay-cancel-before.log",
+        "After-fix carried-reader tests: /tmp/chaos-gaps-replay-cancel-after.log",
+        "Workspace style passes.",
+        "A stalled response body expires even after the peer sends valid response headers."
+      ]
     }
   ],
   "coverage": [
@@ -323,6 +353,13 @@
         "chaos-integrity"
       ],
       "status": "pending; compare egress reference mark with stored records, not only its prior value"
+    },
+    {
+      "gap": "Load lasts throughout the fault and recovery, with measured RTO and latency/throughput budgets",
+      "existing_shards": [
+        "all existing shards"
+      ],
+      "status": "Owned traffic gate and an active submission window through fault recovery implemented; local tests pass. Stop and drain after recovery, report actual paced duration. Full CI and recovery latency/throughput budgets pending."
     }
   ],
   "validation": {
@@ -414,6 +451,38 @@
       "workflow_run": 40268972862,
       "url": "https://github.com/junemartes/kardamom/actions/runs/40268972862",
       "status": "in progress"
+    },
+    {
+      "pull_request": 839,
+      "commit": "a510a518685864b3cf9419dd52c0535040108f15",
+      "workflow_run": 40267573235,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40267573235",
+      "status": "cluster run cancelled after preserving member-rejoin, provider-refusal assertion, and validator-stall failures; fixes continue on descendants"
+    },
+    {
+      "pull_request": 841,
+      "commit": "81217cfe54e0843a46bb43e5bba5bccafa790d19",
+      "workflow_run": 40270824321,
+      "status": "superseded cluster run cancelled; fixes continue on descendants"
+    },
+    {
+      "pull_request": 842,
+      "commit": "42cb927aaa5ba588676e824e8c98df9799095c9a",
+      "workflow_run": 40271525408,
+      "status": "superseded cluster run cancelled; fixes continue on descendants"
+    },
+    {
+      "pull_request": 843,
+      "commit": "743d590e",
+      "workflow_run": 40275014189,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40275014189",
+      "status": "in progress; diagnostic only, not a qualifying frozen-head round"
+    },
+    {
+      "pull_request": 844,
+      "commit": "8c3c81a5e1e0",
+      "url": "https://github.com/junemartes/kardamom/pull/844",
+      "status": "CI pending; owned-load coverage correction; diagnostic only"
     }
   ]
 }
