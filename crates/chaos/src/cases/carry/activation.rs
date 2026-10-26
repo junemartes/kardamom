@@ -234,8 +234,8 @@ impl Run<'_> {
     }
 
     /// The lockbox of the in-cluster L1. The deploy CLI deploys it when
-    /// the registry has none. The suite sends no deposit, so the owner is
-    /// the minter and the oracle is the zero address.
+    /// the registry has none. The owner mints the test deposits, and the
+    /// oracle is the zero address.
     async fn lockbox(&self) -> anyhow::Result<String> {
         let chain = self.h.knobs.chain_id.to_string();
         let find = [

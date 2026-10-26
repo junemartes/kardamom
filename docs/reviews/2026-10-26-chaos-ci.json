@@ -114,7 +114,8 @@
         "First executor cut-over passes persisted account, storage, code, header, receipt and index parity.",
         "L1 reconstruction verifies 303155 transactions and matches the validator root before cancellation.",
         "Actionlint validates the matrix-specific timeout expression."
-      ]
+      ],
+      "follow_up": "PR 848 carry-executor-first takes about 29 minutes for a full Ansible rollout and exceeds its 20-minute load window. Use 40 minutes for one full rollout and 80 for two serial rolls. The carry-only outer job allows 300 minutes for bootstrap, five full deployment passes, upgrades and audits. Keep product recovery SLOs unchanged; the load must remain open through recovery."
     },
     {
       "id": "audit-early-failure-round-overlap",
@@ -169,7 +170,8 @@
         "First executor cut-over passes persisted account, storage, code, header, receipt and index parity.",
         "L1 reconstruction verifies 303155 transactions and matches the validator root before cancellation.",
         "Actionlint validates the matrix-specific timeout expression."
-      ]
+      ],
+      "follow_up": "PR 848 carry-executor-first takes about 29 minutes for a full Ansible rollout and exceeds its 20-minute load window. Use 40 minutes for one full rollout and 80 for two serial rolls. The carry-only outer job allows 300 minutes for bootstrap, five full deployment passes, upgrades and audits. Keep product recovery SLOs unchanged; the load must remain open through recovery."
     },
     {
       "id": "canonical-carry-ingress-seal-observer",
@@ -379,6 +381,90 @@
         "Five alternating pinned release pairs with a live clear watch: median in-order/reversed/verdict throughput differences -1.2%/+0.2%/-0.5%. Method, limits, estimates and raw samples are in docs/benches/2026-10-26-v2-pause-profile.json."
       ],
       "status": "Validated locally. The existing PR 849 candidate does not include this fix; deployed validation and full workload comparison remain pending."
+    },
+    {
+      "id": "consul-dns-fault-port",
+      "classification": "harness",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "job": 121533651854,
+      "observed": "Control-plane isolation fails its healthy DNS baseline before it arms any fault. The harness probes port 8600; the deployed Consul configuration listens on loopback port 53.",
+      "change": "Probe and isolate DNS TCP/UDP on the configured port 53. Keep positive healthy, isolated and recovery checks.",
+      "status": "Corrected locally; deployed proof pending."
+    },
+    {
+      "id": "raft-stale-role-hides-majority",
+      "classification": "harness",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "job": 121533651619,
+      "observed": "Members 0 and 1 close a new term with member 1 as leader. The isolated old leader retains its old last LEADER line while canvassing. A first-role match repeatedly chooses the old member. The majority helper also stops at the first minority candidate.",
+      "change": "Check all candidates for a completed majority election. The one-way fault samples this once per poll and requires a different leader in a higher term. Preserve live old-process identity, real receipts, dropped packets and term safety checks.",
+      "verification": [
+        "The stale-minority regression returns None before the correction and leader 1, term 4 after it."
+      ],
+      "status": "Local regression passes; deployed client progress still requires proof."
+    },
+    {
+      "id": "poll-budget-excludes-probes",
+      "classification": "harness",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "observed": "A five-second budget with four-second probes takes 29 seconds and reports only five seconds. A pending probe has no deadline. Initial after_sleep delay is excluded too.",
+      "change": "Use a monotonic wall clock and bound the complete poll, including initial delay, probes and sleeps. Report real elapsed time. A hanging condition probe cannot certify a successful hold. No recovery budget is enlarged.",
+      "verification": [
+        "The five-second regression fails at 29 seconds before the correction. Probe timeout, slow success, initial delay, normal hold and hanging-hold negative controls pass after it."
+      ],
+      "status": "Validated locally; tightened real recovery deadlines require deployed validation."
+    },
+    {
+      "id": "validator-restart-verification-race",
+      "classification": "harness",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "job": 121533651681,
+      "observed": "All executors recover and clients receive every transaction. The validator restarts after its replica source resets, reaches the lag bound, and fails the instant final scrape because fresh verification counters are still zero.",
+      "change": "Require cursor convergence, positive BAL verification and positive trie shadow checks in one scrape within the existing sync budget. Missing or zero positive evidence stays pending; divergence and mismatch fail immediately, including during startup. Retain allocation-log divergence checks.",
+      "status": "Local restart, missing-evidence and divergence controls pass. The underlying source-reset restart is not established as a new product bug; deployed recovery remains pending."
+    },
+    {
+      "id": "carry-provider-proxy-not-enabled",
+      "classification": "harness wiring",
+      "product_bug": false,
+      "service_wiring_changed": true,
+      "hot_path_changed": false,
+      "job": 121533651822,
+      "observed": "The first deposit is credited, but the all-provider fault cannot arm: carry never deploys the proxy at aux:8547. The endpoint refuses both arm and cleanup requests.",
+      "change": "Enable the existing fault proxy, two-second indexer cadence and 30-second watcher silence bound for the carry CI shard and all of its redeployments. Followers use the same existing proxy topology as L1/follower shards. Production defaults stay unchanged.",
+      "status": "Local shard tests pass; deployed deposit proof pending."
+    },
+    {
+      "id": "cache-baseline-row-not-projected",
+      "classification": "unresolved",
+      "job": 121533651670,
+      "observed": "The new mirror-backlog case fails before stopping mirrors or holding heads. The executor has the smoke transaction state but the exact Redis account row is not observed in its baseline wait. Mirrors complete initial scans and later log write/WAIT timeouts; client traffic continues.",
+      "change": "Retain expected account values, the last raw Redis row, primary identity and measured wait time. Preserve exact nonce/balance equality and the timeout. Do not classify the unseen row as a decoder or product fault without values.",
+      "status": "Unresolved. The next diagnostic must distinguish missing, stale and incorrect projection before the backlog fault can be validated."
+    },
+    {
+      "id": "da-lag-failed-status-receipts",
+      "classification": "unresolved",
+      "job": 121533651664,
+      "observed": "The DA-lag case has 1764 receipts and no missing receipts, but 510 statuses are non-success. All executors advance. V2 did not honor lifecycle pauses on this candidate.",
+      "change": "Keep every receipt-status assertion. Validate the separately reproduced V2 pause fix against this deployed case; do not assume it is the entire cause.",
+      "status": "Unresolved; no relaxation or retry counted as a pass."
+    },
+    {
+      "id": "fleet-own-sender-stalls-after-total-loss",
+      "classification": "unresolved",
+      "job": 121533651803,
+      "observed": "After whole sealer-node loss the majority election closes, every executor converges and blocks advance, but the case-owned sender accepts no new transaction within 60 seconds. It has 410 accepted/receipted transactions and 256 additional offered submissions.",
+      "change": "Keep own-load recovery and receipt oracles. Retain aborted counters and allocation logs. The final V2 pause change still needs deployment; an advancing chain is insufficient evidence that the established sender recovered.",
+      "status": "Unresolved; do not widen the own-load recovery SLO."
     }
   ],
   "coverage": [
@@ -406,7 +492,7 @@
         "chaos-cache",
         "chaos-combined-exec"
       ],
-      "status": "Per-mirror evidence and exact nonce/balance comparison for a used idle sender and untouched funded account implemented; awaiting CI. Interrupted scans pending."
+      "status": "Existing mirror-kill-rebuild now stops mirrors, flushes Redis, blocks Redis writes, requires all three current scans to attempt and fail a write without completing or serving, proves a real transaction receives a receipt through fallback, kills those exact scan processes, unblocks writes and requires fresh per-mirror complete scans plus exact used and untouched account rows. Cleanup restores the exact job on every path. Local controls pass; deployed proof pending. The small checkpoint does not force a partially materialized multi-chunk scan; that coverage remains open."
     },
     {
       "gap": "DA lag halt, canary page inhibition, and prune floor in scheduled runs",
@@ -448,7 +534,7 @@
         "chaos-l1",
         "chaos-retention"
       ],
-      "status": "pending stronger retention and replay-path assertions"
+      "status": "The carry-born prune-floor case freezes posting and proves a durable snapshot and every sealer floor pass an unposted cursor beyond both short scoped egress windows. Every egress copy must serve the same exact paged frames; thaw must post contiguous coverage through the frozen head. Real HTTP divergence, truncated and 410 controls pass. The retention case passes on PR 849; L1 proof and ten final-head runs remain pending."
     },
     {
       "gap": "Deposits before, during, and after L1 follower faults; source identity and exact balances",
@@ -518,14 +604,14 @@
       "existing_shards": [
         "all existing shards"
       ],
-      "status": "Owned traffic gate and an active submission window through fault recovery implemented; local tests pass. Stop and drain after recovery, report actual paced duration. Full CI and recovery latency/throughput budgets pending."
+      "status": "Owned load remains required through recovery. Local regression now bounds every poll by actual monotonic time, including probes and initial delays; hanging hold probes fail. Full rollout load windows cover measured Ansible cost without extending product recovery SLOs. Deployed latency/throughput/RTO proof remains pending."
     },
     {
       "gap": "Nomad, Consul and DNS control-plane loss while the data plane stays live",
       "existing_shards": [
         "chaos-coordinated"
       ],
-      "status": "Control-plane isolation scheduled in existing coordination shard. Block Nomad HTTP/RPC and Consul HTTP/DNS while data ports and current processes stay live; require receipted transfers during the fault, restore metadata access and prove worker identities unchanged. Local unit/style and script syntax checks pass; deployed validation pending."
+      "status": "Scheduled in the existing coordinated shard. Diagnostic PR 849 fails before arming because DNS is probed on 8600 while deployed Consul uses 53. Correct probe and TCP/UDP fault rules to 53; preserve all isolation, receipt and unchanged-worker checks. Deployed proof pending."
     },
     {
       "gap": "Populated old deployment layouts and crash/open/clean-restart/upgrade sequence",
@@ -606,7 +692,7 @@
       "10 consecutive complete green CI rounds on the final unchanged commit",
       "Deployed validation of the 76 scheduled cases, including the scoped canary genesis and guard restoration"
     ],
-    "ci_wiring_changed": "Retain load/profile evidence; add suite=all to the cluster workflow without changing normal PR/scheduled selection; make static validation dispatchable; test the persistent ten-round audit utility in CI. The serial carry rollout has a 180-minute job budget; all per-case recovery deadlines remain unchanged.",
+    "ci_wiring_changed": "Retain load/profile evidence; add suite=all to the cluster workflow without changing normal PR/scheduled selection; make static validation dispatchable; test the persistent ten-round audit utility in CI. The serial carry rollout has a 300-minute job budget; all per-case recovery deadlines remain unchanged.",
     "streak_command": "python3 scripts/ci/green_streak.py --branch BRANCH --head FULL_SHA --state AUDIT.json --poll --run CI_ID --run CLUSTER_ID --run DOCKER_ID --run SEMANTICS_ID --run VALIDATION_ID",
     "streak_dispatch": [
       {
@@ -632,7 +718,7 @@
         "inputs": {}
       }
     ],
-    "fault_fixture_wiring_changed": "The carry prune-floor case temporarily shortens egress reader-window and segment lengths. It keeps the registered L1 safety floors and restores the exact job. No deployment default changes."
+    "fault_fixture_wiring_changed": "The carry prune-floor case temporarily shortens egress reader-window and segment lengths. It keeps the registered L1 safety floors and restores the exact job. No deployment default changes. Carry now enables the existing L1 fault proxy topology for its deposit fault. The checkpoint-scan interruption temporarily pauses Redis writes, permits read fallbacks and always clears the pause/restores the saved mirror job."
   },
   "iterations": [
     {
@@ -734,18 +820,18 @@
       "workflow_run": 40292596498,
       "nightly_workflow_run": 40292659324,
       "url": "https://github.com/junemartes/kardamom/pull/848",
-      "status": "Draft diagnostic candidate. Both existing regular and integrity groups run. No qualifying frozen-head round. Local style, 213 engine tests, 201 chaos tests and 14 audit tests pass; controlled release tee profile is recorded."
+      "status": "Terminal diagnostic failure: seven regular shards fail, including carry-executor-first when its full Ansible rollout outlasts the 20-minute load window. Eight regular jobs and separate integrity run 40292659324 pass. Four supporting workflows pass. No qualifying round; streak 0/10."
     },
     {
       "commit": "663d25766a02b01c813ff6fc0b2b67054652e741",
       "url": "https://github.com/junemartes/kardamom/actions/runs/40292596498",
-      "status": "Diagnostic regular run: six failed shards (ingress, coordination, fleet, retention, executor, combined-exec). Carry is still running. Both standalone stages and combined ordering, cluster, cache, sequencer, L1 and follower pass. Separate integrity run 40292659324 succeeds. Four non-cluster workflows succeed. No qualifying round; 0/10.",
+      "status": "Terminal diagnostic failure: seven regular shards fail, including carry-executor-first when its full Ansible rollout outlasts the 20-minute load window. Eight regular jobs and separate integrity run 40292659324 pass. Four supporting workflows pass. No qualifying round; streak 0/10.",
       "integrity_run": 40292659324
     },
     {
       "commit": "9adefc86b488cb72ec46b290c3f08acff478ea2d",
       "url": "https://github.com/junemartes/kardamom/pull/849",
-      "status": "Published diagnostic follow-up: CI, Docker and chain-semantics succeed. Regular cluster and integrity builds succeed and their shards run; static deployment checks still run. No qualifying round; 0/10. A separate local V2 lifecycle fix follows this candidate.",
+      "status": "Terminal diagnostic failure. CI, Docker, chain-semantics, static deployment checks and separate integrity run 40308474177 pass. Eight regular cluster jobs pass; seven fail (cluster, cache, executor, coordinated, retention, fleet and carry). No qualifying frozen-head round; streak 0/10.",
       "changes": [
         "mirror-backlog-client-restart in the existing cache shard; total 74 scheduled cases",
         "One-way live-leader partition in the existing cluster shard; total 75 scheduled cases",
@@ -757,7 +843,9 @@
         "Retry failed V2 account lookups without another request, bound retry concurrency and cancel on shutdown.",
         "Carry-aware prune-floor proof with exact egress range comparison and scoped retention settings.",
         "Keep the broken-image workload active through both Ansible passes and recovery."
-      ]
+      ],
+      "cluster_run": 40308406065,
+      "integrity_run": 40308474177
     }
   ],
   "integration": {
@@ -768,9 +856,12 @@
   "unpublished": {
     "workspace": "/home/dev/kardamom-chaos-gaps",
     "changes": [
-      "Wire the existing lifecycle pause gate into V2 without blocking account event draining.",
-      "Add intake, outbox and account-feed pause regressions. Benchmark the live clear gate in the resident V2 loop."
+      "V2 lifecycle pause wiring and pinned resident-loop comparison.",
+      "Interrupt concurrent mirror checkpoint scans and require fallback traffic plus exact per-mirror recovery.",
+      "Correct Consul DNS probe and fault ports.",
+      "Use closed quorum elections, real polling deadlines and fresh validator verification proof.",
+      "Enable the carry fault proxy and cover measured full rollout time in paced windows and the carry-only job budget."
     ],
-    "status": "188 library tests, 14 binary tests and style pass. Controlled resident throughput comparison is recorded. Keep local while PR 849 diagnostic shards produce evidence; do not cancel or rerun them. Final head is not frozen; streak stays 0/10."
+    "status": "Candidate local checks pass: 224 chaos tests, two ignored manual tests; 14 audit tests; workspace style; workflow actionlint. Deployment validation is next. PR 849 diagnostics are complete. Final head is not frozen and streak stays 0/10."
   }
 }
