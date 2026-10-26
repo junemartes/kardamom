@@ -80,3 +80,28 @@ fn account_rows_keep_draining_while_ready_offers_wait_for_clear() {
     bench.run();
     assert_eq!(bench.offers(), [(1, true)]);
 }
+
+#[test]
+fn a_session_retry_waits_for_resume_and_excludes_confirmed_offers() {
+    let (mut bench, life) = Bench::with_lifecycle();
+    let mut rules = SealerRules::new(
+        0,
+        bench.l.sealer_version.clone(),
+        InMemorySidePublisher::default(),
+    );
+    rules.on_session_start(1);
+    bench.sweep();
+    bench.send(0);
+    bench.send(1);
+    life.follow(Some(HaltRef::sealer(HaltCause::SealerNoQuorum)));
+    bench.confirm_first();
+    rules.on_session_start(2);
+    *bench.rig.refs.new_session.lock().unwrap() = true;
+    bench.sweep();
+    assert_eq!(bench.offers(), [(0, true), (1, true)]);
+    assert!(bench.l.accounts.is_empty());
+    life.follow(None);
+    bench.run();
+    bench.run();
+    assert_eq!(bench.offers(), [(0, true), (1, true), (1, true)]);
+}

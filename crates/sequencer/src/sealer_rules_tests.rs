@@ -195,3 +195,18 @@ fn a_contiguity_reject_tells_the_loop() {
             if sender == Address::repeat_byte(0x13)
     ));
 }
+
+#[test]
+fn a_new_session_remains_observable_when_the_account_event_queue_is_full() {
+    let shared = SealerVersion::starting_at(5);
+    let (accounts, pending) = crossbeam_channel::bounded(1);
+    accounts.send(AccountEvent::Rollback).unwrap();
+    let mut rules =
+        SealerRules::new(0, shared.clone(), InMemorySidePublisher::default()).telling(accounts);
+    let before = shared.session_generation();
+    rules.on_session_start(1);
+    rules.on_session_start(1);
+    assert_ne!(shared.session_generation(), before);
+    assert!(matches!(pending.try_recv(), Ok(AccountEvent::Rollback)));
+    assert!(pending.is_empty());
+}

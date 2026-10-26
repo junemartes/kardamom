@@ -26,7 +26,9 @@
 //!   old session can have lost the offers that it took. The publisher
 //!   refuses the first offer on the new session, and the loop then puts
 //!   every unconfirmed run in the outbox again, in nonce order, before any
-//!   new offer. The sealer absorbs a copy of an ordered offer.
+//!   new offer. The sweep also observes the session generation, so an idle
+//!   sender needs no new offer to retry. The sealer absorbs a copy of an
+//!   ordered offer.
 //! - The contiguity guard of the sealer rejects a nonce. The loop offers
 //!   the transaction at the expected nonce and the rejected one again,
 //!   when the filter still holds the expected one.
@@ -214,6 +216,7 @@ pub struct AdmissionLoop {
     admission: Admission<RefPayload>,
     vslots: VslotSet,
     sealer_version: SealerVersion,
+    session_generation: u64,
     fees: FeeGate,
     pause: PauseGate,
     accounts: crossbeam_channel::Receiver<AccountEvent>,
@@ -244,6 +247,7 @@ impl AdmissionLoop {
             cfg,
             vslots,
             sealer_version: SealerVersion::default(),
+            session_generation: 0,
             fees: FeeGate::off(),
             pause: PauseGate::default(),
             accounts,
@@ -269,6 +273,7 @@ impl AdmissionLoop {
     /// Follow the decision version that the sealer reports. See
     /// [`crate::sequencer::Sequencer::enable_positioned_refs`].
     pub fn enable_positioned_refs(&mut self, version: SealerVersion) {
+        self.session_generation = version.session_generation();
         self.sealer_version = version;
     }
 
@@ -392,6 +397,11 @@ impl AdmissionLoop {
         }
         self.last_sweep = now;
         self.admission.sweep(now, &mut self.verdicts);
+        let generation = self.sealer_version.session_generation();
+        if generation != self.session_generation {
+            self.session_generation = generation;
+            self.offer_again_on_new_session();
+        }
         self.depth.publish(self.cfg.partition);
     }
 

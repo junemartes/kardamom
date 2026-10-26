@@ -1,0 +1,112 @@
+{
+  "baseline_commit": "7aa49b3f9a4557a24ccb540de33b65450697b348",
+  "method": "Criterion v2_loop, release builds, CPU 8, 256 resident senders x 16 transactions (4096 per batch). Five alternating before/after pairs per mode and workload; mode order alternates too. Each run has 20 samples, 0.1 second warmup, 0.5 second requested measurement and 1000 bootstrap resamples. No local builds or tests overlap the measurements. Both builds use identical benchmark code and a live unpaused lifecycle watch.",
+  "modes": {
+    "normal": "50 millisecond sweep cadence. A short batch can end before its first timer tick. This measures the healthy loop and layout.",
+    "forced_sweeps": "KARDAMOM_V2_BENCH_FORCE_SWEEPS=1 forces every turn to sweep in both builds. This is a timer overhead control, not a production setting."
+  },
+  "medians_transactions_per_second": {
+    "normal": {
+      "in_order": {
+        "before": 675157.4334732465,
+        "after": 688145.7143846089,
+        "delta_percent": 1.9237410813276679,
+        "paired_delta_percent": [
+          -0.8448546594489792,
+          1.091343378497811,
+          4.085614802165671,
+          4.708923235378726,
+          1.3151319743903267
+        ]
+      },
+      "reversed": {
+        "before": 593615.9531736722,
+        "after": 586155.1638581306,
+        "delta_percent": -1.2568377375395179,
+        "paired_delta_percent": [
+          1.8027680781653066,
+          -2.1100328392398837,
+          0.888807106163858,
+          -1.2568377375395179,
+          -3.5792760804027712
+        ]
+      },
+      "with_verdicts": {
+        "before": 620274.8761136847,
+        "after": 622295.58368705,
+        "delta_percent": 0.3257761439615203,
+        "paired_delta_percent": [
+          0.8548792668305438,
+          -9.083963638619618,
+          -2.8430977552069248,
+          0.47442762452434284,
+          2.1395719071040986
+        ]
+      }
+    },
+    "forced_sweeps": {
+      "in_order": {
+        "before": 551811.0440824376,
+        "after": 581975.2055900054,
+        "delta_percent": 5.466393221202259,
+        "paired_delta_percent": [
+          7.12947833239026,
+          4.826753664476824,
+          10.992626152581298,
+          2.701626707206306,
+          3.334518976523082
+        ]
+      },
+      "reversed": {
+        "before": 496893.0174897244,
+        "after": 510546.95146694063,
+        "delta_percent": 2.747861913253513,
+        "paired_delta_percent": [
+          -0.06994619671365498,
+          1.7163023152745538,
+          0.7597346227801616,
+          8.534985124267113,
+          3.047042163093927
+        ]
+      },
+      "with_verdicts": {
+        "before": 505792.73141145805,
+        "after": 525726.6539325557,
+        "delta_percent": 3.9411247499485214,
+        "paired_delta_percent": [
+          2.2582292418015903,
+          4.266320349714925,
+          1.702045817912179,
+          4.818320382134833,
+          1.8717463291034964
+        ]
+      }
+    }
+  },
+  "build": {
+    "baseline": "7aa49b3f9a4557a24ccb540de33b65450697b348",
+    "sources": {
+      "crates/sequencer/src/sealer_rules.rs": {
+        "before_sha256": "a806ee70283556fc5dcca6a665376662f6e24612889156c651506d227b12feec",
+        "after_sha256": "d46de04844caea6776adf7b5ead4e480353ae54f6b59d55c9174192a2bd1a99b"
+      },
+      "crates/sequencer/src/v2/mod.rs": {
+        "before_sha256": "252867e31f724fe34a82d4bedac3a159055aa5cd681df669e0bb567cefde6e2a",
+        "after_sha256": "4375eac07b0fca9edb08471c6ca153348c2d9d8063ae17974fc03d2576b5eea0"
+      }
+    },
+    "binaries": {
+      "before": {
+        "path": "/tmp/chaos-v2-idle-before",
+        "sha256": "af1e2044eb1816cbff71ce4c5d2ae8f4e94daf26e942020020a1d9bc08b058fb"
+      },
+      "after": {
+        "path": "/tmp/chaos-v2-idle-after",
+        "sha256": "bd814d7497660575814f351af56faf1030bdf2bda09b9c95dc1fa5b440a768b3"
+      }
+    }
+  },
+  "raw_samples": "2026-10-26-v2-idle-session-samples.jsonl",
+  "scope": "Resident V2 loop only. This does not measure RPC or client receipt latency, networking, full-chain capacity or deployed reconnect recovery.",
+  "interpretation": "Normal median differences are +1.9 percent ordered, -1.3 percent reversed and +0.3 percent with verdicts. Pair differences vary; all repeats and outliers remain in the raw evidence. Forced-sweep medians are higher in this sample; no speedup or full-workload guarantee is claimed. The production addition is one atomic session-generation read per existing sweep, normally 20 reads per second, and recovery work only when the generation changes. No new per-transaction check or network probe."
+}

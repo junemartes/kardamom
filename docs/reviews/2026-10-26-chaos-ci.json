@@ -484,6 +484,27 @@
         "Workspace just style passes. No transaction submission, service or production hot path changes; only phase joining, drain bounds and harness task ownership change."
       ],
       "status": "Validated locally after PR 850 is published. Keep this follow-up local until that diagnostic batch yields its remaining failure evidence. The final head remains unfrozen; streak 0/10."
+    },
+    {
+      "id": "v2-idle-session-does-not-reoffer",
+      "classification": "product",
+      "product_bug": true,
+      "source": "crates/sequencer/src/sealer_rules.rs and crates/sequencer/src/v2/mod.rs",
+      "observed": "A real SealerRules session-start callback follows two offered, unconfirmed transactions. No new input arrives and the outbox is empty. The V2 loop never retries them, even after a sweep and another turn. The regression returns only offers [0,1], instead of [0,1,0,1].",
+      "cause": "The transport reports SessionChanged only at an offer. V2 detects it only while flushing a nonempty outbox. An idle sender with an unconfirmed run has no offer that can expose the new session. The existing tests all admit nonce 2, which forces the flush and hides the idle case.",
+      "change": "The existing shared sealer rules also hold a session generation. The existing session-start callback updates it after publishing the version. V2 samples it on the normal sweep and queues only the remaining unconfirmed runs on change. The transport fence, nonce order and pause gate stay in force. Coalesce multiple new sessions into one sweep. No queue can drop the session generation.",
+      "service_wiring_changed": "Extend the existing shared in-process SealerVersion state between the egress feed and V2. No new subscription, service, network request or deployment setting.",
+      "hot_path_changed": false,
+      "hot_path_detail": "The version getter keeps its existing atomic read. Add one atomic session-generation read per sweep (normally one every 50 ms), no per-transaction check. Requeue work runs only after a generation change. The loop and shared-state layouts gain one u64 each.",
+      "before_test_log": "/tmp/chaos-gaps-idle-session-before.log",
+      "verification": [
+        "The idle no-new-input regression fails before the fix through the production SealerRules callback.",
+        "193 sequencer library tests and 14 binary tests pass, one manual binary profile ignored. Controls cover confirmed suffixes, repeated sweeps, version reports without a new session, coalesced sessions, a full account queue and reconnects during a pause.",
+        "Five alternating pinned release pairs per normal and forced-sweep mode. Normal median TPS differences: ordered +1.9%, reversed -1.3%, with verdicts +0.3%. Forced-sweep medians are higher; no speedup or full-chain guarantee is claimed. All 60 workload observations and raw Criterion samples are retained.",
+        "Method, source/binary hashes, limits and raw samples: docs/benches/2026-10-26-v2-idle-session-profile.json and docs/benches/2026-10-26-v2-idle-session-samples.jsonl.",
+        "Workspace style passes. Baseline product files are restored after an isolated baseline build; candidate file hashes match the build manifest. No local build or test overlaps the measurements."
+      ],
+      "status": "Validated locally after PR 850 is published. This could explain the same-sender fleet stall, but that cause is not yet proved on a deployed run. Full client latency/throughput validation and ten final-head green rounds remain pending."
     }
   ],
   "coverage": [
@@ -545,7 +566,7 @@
       "existing_shards": [
         "chaos-carry"
       ],
-      "status": "Session and release-time format controls are implemented. New local controls expose missing lifecycle pause wiring: V2 continues intake and publication during a reported pause. The fix follows the existing process watch and drains account updates while offers wait. Local tests and controlled throughput comparison pass. Deployed queued-offer and broader halt-refusal proofs remain pending."
+      "status": "Session and release-time format controls are implemented. New local controls expose missing lifecycle pause wiring: V2 continues intake and publication during a reported pause. The fix follows the existing process watch and drains account updates while offers wait. Local tests and controlled throughput comparison pass. Deployed queued-offer and broader halt-refusal proofs remain pending. A new callback-level regression also proves that an idle unconfirmed sender is not retried on reconnect until a new offer arrives. The local fix samples a shared session generation on the sweep, without per-transaction or network work; positive, negative and paused controls pass. Deployed validation remains pending."
     },
     {
       "gap": "Posting freeze beyond every retention floor and exact resumed coverage",
@@ -871,7 +892,7 @@
       "url": "https://github.com/junemartes/kardamom/pull/850",
       "cluster_run": 40320872242,
       "integrity_run": 40321151376,
-      "status": "Diagnostic candidate: CI, Docker and chain-semantics pass. Static deployment checks still run; regular and integrity cluster artifacts build. No qualifying frozen-head round; 0/10. A local follow-up now rejects unfinished-submit false passes and bounds receipt draining."
+      "status": "All four supporting workflows pass. Both regular and integrity cluster builds pass. The semantics stage passes; other stages and shards remain live. This candidate is diagnostic, not a qualifying frozen-head round; 0/10. Local follow-ups reject incomplete load measurements and recover idle V2 offers after reconnect."
     }
   ],
   "integration": {
@@ -882,8 +903,9 @@
   "unpublished": {
     "workspace": "/home/dev/kardamom-chaos-gaps",
     "changes": [
-      "Reject unfinished-submit false passes, bound complete receipt drains, stop background receipt readers on cancellation, and retain failed-load snapshots."
+      "Reject unfinished-submit false passes, bound complete receipt drains, stop background receipt readers on cancellation, and retain failed-load snapshots.",
+      "Recover idle unconfirmed V2 offers from the existing session callback via a sweep-time generation check; add controls and a pinned normal/forced-sweep release comparison."
     ],
-    "status": "89 benchmark tests and 224 chaos tests pass; two manual chaos tests ignored. Workspace style passes. Hold this follow-up while published PR 850 diagnostics run. Final head is not frozen; streak stays 0/10."
+    "status": "89 benchmark tests, 224 chaos tests (two manual ignored), 193 sequencer library tests and 14 binary tests (one manual ignored) pass. Workspace style and controlled release comparisons pass. Hold these follow-ups while PR 850 diagnostics run. Final head remains unfrozen; streak 0/10."
   }
 }

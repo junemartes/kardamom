@@ -40,7 +40,11 @@ fn cfg() -> V2Config {
             relook_after: Duration::from_millis(500),
             max_senders: NonZeroUsize::new(1 << 20).unwrap(),
         },
-        sweep_every: Duration::from_millis(50),
+        sweep_every: if std::env::var_os("KARDAMOM_V2_BENCH_FORCE_SWEEPS").is_some() {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(50)
+        },
         outbox_cap: NonZeroUsize::new(4096).unwrap(),
     }
 }
