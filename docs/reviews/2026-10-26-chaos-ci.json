@@ -359,6 +359,82 @@
       "service_wiring_changed": false,
       "hot_path_changed": false,
       "status": "Corrected locally; deployed validation pending."
+    },
+    {
+      "id": "metadata-dns-port-fixture",
+      "classification": "harness",
+      "job": 121533651854,
+      "case": "control-plane-loss-recover",
+      "observed": "The pre-fault DNS probe fails on every node. Consul binds its DNS service to port 53; the fault and probe target port 8600.",
+      "change": "Target port 53 in both TCP/UDP drop rules and the DNS probe. Keep pre-fault, isolated and restored reachability checks.",
+      "status": "Corrected locally. The exact DNS probe succeeds on staging port 53. Fault validation pending."
+    },
+    {
+      "id": "isolated-leader-hides-new-election",
+      "classification": "harness",
+      "job": 121533651619,
+      "case": "raft-leader-one-way-partition",
+      "observed": "The surviving members close term 3 with member 1 as leader while the isolated old leader retains older role evidence. The oracle selects the old leader first and reports no election.",
+      "change": "Select the highest majority-closed election across all candidates. Require a different leader and a higher term during the partition. Keep old-process identity, packet drops, receipts and one-leader-per-term checks.",
+      "verification": [
+        "The stale-old-leader regression fails before the correction and passes after it."
+      ],
+      "status": "Local regression passes; live partition validation pending."
+    },
+    {
+      "id": "validator-verdict-during-process-restart",
+      "classification": "harness timing",
+      "job": 121533651681,
+      "case": "hard-executor",
+      "observed": "The validator restarts at 11:29:27. Its committed cursor is near the head at 11:29:33, but the new process has not yet recorded BAL verification and a trie shadow check.",
+      "change": "Require a synced cursor and positive verification evidence from one exporter response within the existing sync deadline. Divergence and trie mismatches still fail immediately. Add verification counters to stall diagnostics.",
+      "status": "Local tests pass. No deadline or correctness assertion is relaxed; live validation pending."
+    },
+    {
+      "id": "idle-v2-loop-session-recovery",
+      "classification": "product",
+      "job": 121533651803,
+      "case": "cluster-total-loss-recover",
+      "observed": "The cluster resumes empty-block progress, while the owned load remains at 410 accepted with 256 requests in flight.",
+      "cause": "The loop learns a new session from its next offer. An empty outbox can leave unconfirmed offers waiting indefinitely without another client transaction. The regression proves this independent defect; the live failure remains to be verified.",
+      "change": "Share a session generation between the egress feed and the V2 loop. Check it even with an empty outbox, then offer only unconfirmed transactions. A full account-event queue cannot lose the signal. Duplicate markers do not advance the generation.",
+      "verification": [
+        "The idle-session regression fails before the correction and passes afterwards.",
+        "Confirmed transactions and duplicate session markers have negative controls.",
+        "187 sequencer library and 14 binary tests pass; one existing manual binary profile is ignored.",
+        "Four alternating pinned local V2 in_order measurements: normalized median iteration cost 1107.65 ns/transaction before and 1039.07 after. No speedup or end-to-end latency claim. Raw samples remain in the staging benchmark artifact profiles/local-v2-session-generation."
+      ],
+      "hot_path_changed": true,
+      "status": "Validated locally; full cluster and staging workload checks pending."
+    },
+    {
+      "id": "carry-deposit-fault-proxy-not-deployed",
+      "classification": "harness wiring",
+      "job": 121533651822,
+      "case": "carry-versions-on",
+      "observed": "The deposit provider-fault case cannot reach the control endpoint because the carry shard does not deploy the L1 fault proxy.",
+      "change": "Deploy the existing fault proxy and its follower settings for the carry shard. Require the proxy in the shard wiring test.",
+      "status": "Corrected locally; full carry validation pending."
+    },
+    {
+      "id": "mirror-backlog-baseline-not-projected",
+      "classification": "unresolved",
+      "job": 121533651670,
+      "case": "mirror-backlog-client-restart",
+      "observed": "The exact account baseline does not appear in Redis within 120 seconds. Mirror logs also show WAIT and write timeouts. The first failed run does not retain the expected and observed row values.",
+      "cause": null,
+      "change": "Preserve the expected account, last observed projection and primary address in the failure. Keep the exact-state requirement and 120-second deadline.",
+      "status": "Unresolved. Additional live evidence required; no passing result is claimed."
+    },
+    {
+      "id": "da-halt-failed-execution-receipts",
+      "classification": "unresolved",
+      "job": 121533651664,
+      "case": "da-lag-halt",
+      "observed": "The owned load resumes after the guard clears, but 510 receipted transactions have non-success status. The verdict correctly fails.",
+      "cause": null,
+      "change": "Keep the failed-receipt verdict mandatory. Session recovery now has an idle-path repair, but its effect on this failure is not yet established.",
+      "status": "Unresolved. No receipt-status assertion is waived."
     }
   ],
   "coverage": [
@@ -739,5 +815,14 @@
       "Keep the broken-image workload active through both Ansible passes and recovery."
     ],
     "status": "Follow-up review, final local checks and cold-lookup performance comparison in progress. Deployed validation pending. Final head is not frozen. Streak stays 0/10."
+  },
+  "latest_reviewed_run": {
+    "head": "9adefc86b488cb72ec46b290c3f08acff478ea2d",
+    "regular_run": 40308406065,
+    "integrity_run": 40308474177,
+    "runtime_passed": 9,
+    "runtime_failed": 7,
+    "qualifying_streak": 0,
+    "note": "A separate duplicate integration build of this failed tree is cancelled. The complete source-run failure evidence is retained. A new candidate requires fresh full validation."
   }
 }

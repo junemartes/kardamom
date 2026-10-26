@@ -297,6 +297,9 @@ impl Shard {
             Self::Carry => DeployVars {
                 cluster_snapshot_interval_s: Some(60),
                 cluster_retention: Some(CARRY_RETENTION),
+                l1_fault_proxy: true,
+                indexer_poll_s: Some(2),
+                da_watcher_silence_s: Some(30),
                 carry: CarrySwitches {
                     exec_on_sealers: true,
                     egress: EgressStage::On,
@@ -429,6 +432,7 @@ mod tests {
         }
         assert!(Shard::L1.deploy_vars().l1_fault_proxy);
         assert!(Shard::Follower.deploy_vars().l1_fault_proxy);
+        assert!(Shard::Carry.deploy_vars().l1_fault_proxy);
         assert_eq!(Shard::Follower.env(), Shard::L1.env());
         assert!(Shard::Follower.audits_after("follower-total-loss"));
         // The shards that turn the block log on tell their cases so, and

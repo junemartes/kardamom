@@ -15,7 +15,7 @@
 //! a sealer that refuses them.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use alloy_primitives::Address;
 use kardamom_cluster_adapter::wire::{
@@ -31,23 +31,43 @@ use crate::v2::AccountEvent;
 
 /// The kept decision version of the sealer, shared between the egress feed
 /// thread, which writes it, and the publish loop, which reads it to choose
-/// the shape of each offer. The default starts at 0.
+/// the shape of each offer. The default starts at 0. Its session generation
+/// survives a full account-event queue, so an idle loop with unconfirmed
+/// offers can recover without new client traffic.
 #[derive(Clone, Default)]
-pub struct SealerVersion(Arc<AtomicU8>);
+pub struct SealerVersion(Arc<SharedRules>);
+
+#[derive(Default)]
+struct SharedRules {
+    version: AtomicU8,
+    generation: AtomicU64,
+}
 
 impl SealerVersion {
     /// A version that starts at `floor`, before the first report.
     #[must_use]
     pub fn starting_at(floor: u8) -> Self {
-        Self(Arc::new(AtomicU8::new(floor)))
+        Self(Arc::new(SharedRules {
+            version: AtomicU8::new(floor),
+            generation: AtomicU64::new(0),
+        }))
     }
 
     fn set(&self, version: u8) {
-        self.0.store(version, Ordering::Release);
+        self.0.version.store(version, Ordering::Release);
     }
 
     fn get(&self) -> u8 {
-        self.0.load(Ordering::Acquire)
+        self.0.version.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.0.generation.load(Ordering::Acquire)
+    }
+
+    fn next_session(&self) {
+        // Generations identify changes; wrapping preserves that meaning.
+        self.0.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Whether the kept version is 4 or newer: the sealer then orders a
@@ -109,6 +129,7 @@ impl<D: DropPublisher> SealerRules<D> {
     /// The session `session_id` starts. A report that came first for it
     /// sets the version. Otherwise the version stays.
     pub fn on_session_start(&mut self, session_id: i64) {
+        let changed = self.session != Some(session_id);
         self.session = Some(session_id);
         let report = self
             .early
@@ -116,6 +137,9 @@ impl<D: DropPublisher> SealerRules<D> {
             .filter(|(id, _)| *id == session_id)
             .map(|(_, version)| version);
         self.publish(report.unwrap_or(self.shared.get()));
+        if changed {
+            self.shared.next_session();
+        }
     }
 
     /// The sealer reports `version` for the session `session_id`. A report

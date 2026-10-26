@@ -144,6 +144,55 @@ fn a_new_session_offers_the_unconfirmed_run_before_a_new_offer() {
     );
 }
 
+#[test]
+fn a_session_start_recovers_unconfirmed_offers_without_new_client_traffic() {
+    let shared = SealerVersion::starting_at(5);
+    let mut b = Bench::new(shared.clone());
+    let mut rules =
+        SealerRules::new(0, shared, InMemorySidePublisher::default()).telling(b.accounts.clone());
+    rules.on_session_start(1);
+    b.run();
+    b.send(0);
+    b.send(1);
+    *b.rig.refs.new_session.lock().unwrap() = true;
+    rules.on_session_start(2);
+    b.run();
+    assert_eq!(b.offers(), [(0, true), (1, true), (0, true), (1, true)]);
+}
+
+#[test]
+fn an_idle_session_return_preserves_confirmations_and_ignores_duplicate_markers() {
+    let shared = SealerVersion::starting_at(5);
+    let mut b = Bench::new(shared.clone());
+    let mut rules =
+        SealerRules::new(0, shared, InMemorySidePublisher::default()).telling(b.accounts.clone());
+    rules.on_session_start(1);
+    b.run();
+    b.send(0);
+    b.send(1);
+    b.accounts
+        .send(AccountEvent::Rows {
+            block: 2,
+            rows: vec![(
+                b.sender(),
+                AccountState {
+                    nonce: 1,
+                    balance: U256::from(10u64).pow(U256::from(24u64)),
+                    delegated: false,
+                    tx_idx: 2,
+                },
+            )],
+        })
+        .unwrap();
+    b.run();
+    *b.rig.refs.new_session.lock().unwrap() = true;
+    rules.on_session_start(2);
+    b.run();
+    rules.on_session_start(2);
+    b.run();
+    assert_eq!(b.offers(), [(0, true), (1, true), (1, true)]);
+}
+
 /// A row confirms nonce 0. The new session then gets only the unconfirmed
 /// part of the run again.
 #[test]

@@ -244,10 +244,19 @@ impl Elected {
     /// with them, closed their elections in one term.
     fn from_member_logs(logs: &[String]) -> Option<Self> {
         let views: Vec<MemberView> = logs.iter().map(|l| MemberView::parse(l)).collect();
-        let (leader, term) = views.iter().find_map(|v| v.leader.zip(v.closed_term))?;
-        let closed = views.iter().filter(|v| v.closed_term == Some(term)).count();
         let majority = usize::try_from(SEALER_MEMBERS / 2 + 1).ok()?;
-        (closed >= majority).then_some(Self { leader, term })
+        views
+            .iter()
+            .filter_map(|view| view.leader.zip(view.closed_term))
+            .filter(|(_, term)| {
+                views
+                    .iter()
+                    .filter(|view| view.closed_term == Some(*term))
+                    .count()
+                    >= majority
+            })
+            .max_by_key(|(_, term)| *term)
+            .map(|(leader, term)| Self { leader, term })
     }
 }
 
@@ -461,6 +470,31 @@ mod tests {
             Elected::from_member_logs(&majority),
             Some(Elected { leader: 1, term: 4 })
         );
+    }
+
+    #[test]
+    fn an_isolated_old_leader_cannot_hide_a_new_majority_election() {
+        let old = member(
+            2,
+            "cluster role=LEADER memberId=2\ncluster ELECTION memberId=2 state=CLOSED logLeadershipTermId=1\n",
+        );
+        let leader = member(
+            1,
+            "cluster role=LEADER memberId=1\ncluster ELECTION memberId=1 state=CLOSED logLeadershipTermId=3\n",
+        );
+        let follower = member(
+            0,
+            "cluster role=FOLLOWER memberId=0\ncluster ELECTION memberId=0 state=CLOSED logLeadershipTermId=3\n",
+        );
+        for logs in [
+            [old.clone(), leader.clone(), follower.clone()],
+            [leader, follower, old],
+        ] {
+            assert_eq!(
+                Elected::from_member_logs(&logs),
+                Some(Elected { leader: 1, term: 3 })
+            );
+        }
     }
 
     /// A closed line whose log term reads `unknown` takes the term of the

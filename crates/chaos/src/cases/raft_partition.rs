@@ -20,12 +20,14 @@ const HOLD: Duration = Duration::from_secs(30);
 #[derive(Serialize)]
 struct Proof {
     leader: u32,
+    term: u64,
     dropped_packets: u64,
     election_seconds: f64,
 }
 
 struct Partition {
     leader: u32,
+    term: u64,
     node: String,
     inner: String,
     started: String,
@@ -34,7 +36,8 @@ struct Partition {
 
 impl Partition {
     async fn capture(h: &Harness) -> anyhow::Result<Self> {
-        let leader = h.evidence.cluster_leader(h.knobs.leader_slo).await?;
+        let elected = h.evidence.cluster_elected(h.knobs.leader_slo).await?;
+        let leader = elected.leader;
         let victim = h.contract.node(&format!("sealer-{leader}"))?;
         let node = victim.container.clone();
         let inner = h
@@ -56,6 +59,7 @@ impl Partition {
             .collect();
         Ok(Self {
             leader,
+            term: elected.term,
             node,
             inner,
             started,
@@ -98,16 +102,19 @@ impl Partition {
             |_| async move {
                 Ok::<_, anyhow::Error>(
                     h.evidence
-                        .cluster_leader(Duration::from_secs(3))
+                        .cluster_elected(Duration::from_secs(3))
                         .await
                         .ok()
-                        .filter(|leader| *leader != self.leader),
+                        .filter(|elected| {
+                            elected.leader != self.leader && elected.term > self.term
+                        }),
                 )
             },
         )
         .await?;
-        let (new, elapsed) = outcome
+        let (elected, elapsed) = outcome
             .or_fail(|_| crate::chaos_fail!("{CTX}: the surviving quorum elects no new leader"))?;
+        let new = elected.leader;
         self.assert_live(h).await?;
         Self::transfer(h).await?;
         tokio::time::sleep(HOLD).await;
@@ -121,6 +128,7 @@ impl Partition {
         ));
         Ok(Proof {
             leader: new,
+            term: elected.term,
             dropped_packets,
             election_seconds: elapsed.as_secs_f64(),
         })
@@ -187,7 +195,7 @@ impl Partition {
         }
         let report = serde_json::json!({
             "case": CTX, "direction": "old leader to peers only", "ports": PORTS,
-            "old_leader": self.leader, "proof": during.as_ref().ok(),
+            "old_leader": self.leader, "old_term": self.term, "proof": during.as_ref().ok(),
             "node": self.node, "container": self.inner, "started": self.started,
             "peers": self.peers, "hold_secs": HOLD.as_secs(),
             "failure": during.as_ref().err().map(|error| format!("{error:#}")),

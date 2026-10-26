@@ -20,7 +20,13 @@ const BAL_MISSING: &str = "validator_bal_missing_total";
 const RECEIPT_MISSING: &str = "validator_receipt_missing_total";
 /// The counters that tell a stalled validator from a slow one: a cursor
 /// that does not move, and the waits that timed out with no replica data.
-const STALL_COUNTERS: [&str; 3] = [COMMITTED, BAL_MISSING, RECEIPT_MISSING];
+const STALL_COUNTERS: [&str; 5] = [
+    COMMITTED,
+    VERIFIED,
+    SHADOW_CHECKS,
+    BAL_MISSING,
+    RECEIPT_MISSING,
+];
 /// The validator must answer its exporter within two minutes.
 const FOUND_SECS: u64 = 120;
 const POLL_EVERY: Duration = Duration::from_secs(5);
@@ -48,14 +54,7 @@ impl Harness {
             .probes
             .val_metric_required(COMMITTED, "committed cursor")
             .await?;
-        self.wait_validator_sync(start).await?;
-        let body = self
-            .probes
-            .scrape()
-            .fetch(&self.probes.validator_target())
-            .await
-            .ok_or_else(|| anyhow::anyhow!("validator exporter missing at final verdict"))?;
-        let sample = Sample::read(&body)?;
+        let sample = self.wait_validator_sync(start).await?;
         let verified = sample.verified;
         let checks = sample.checks;
         self.assert_no_divergence_halt().await?;
@@ -80,36 +79,39 @@ impl Harness {
         Ok(())
     }
 
-    async fn wait_validator_sync(&self, start: i64) -> anyhow::Result<()> {
+    async fn wait_validator_sync(&self, start: i64) -> anyhow::Result<Sample> {
         let lag_max = self.knobs.stages.validator_lag_max;
         let budget = Budget::new(self.knobs.stages.validator_sync_timeout, POLL_EVERY);
         let outcome = poll::until(budget, |_| async {
             let executor = self.probes.executor_progress().await;
-            let validator = self
+            let body = self
                 .probes
-                .val_metric_required(COMMITTED, "committed cursor")
-                .await?;
+                .scrape()
+                .fetch(&self.probes.validator_target())
+                .await;
+            let sample = body.as_deref().map(Sample::read).transpose()?.flatten();
             Ok(executor
-                .filter(|e| validator > 0 && e.saturating_sub(validator) <= lag_max)
-                .map(|e| (e, validator)))
+                .zip(sample)
+                .filter(|(executor, sample)| executor.saturating_sub(sample.committed) <= lag_max))
         })
         .await?;
         let Outcome::Ready {
-            value: (executor, validator),
+            value: (executor, sample),
             ..
         } = outcome
         else {
             self.dump_validator_tails().await;
             anyhow::bail!(
-                "validator did not sync within {}s (started at {start})",
+                "validator did not sync with BAL verification and trie shadow-check evidence within {}s (started at {start})",
                 budget.timeout.as_secs()
             );
         };
+        let validator = sample.committed;
         crate::log(format!(
             "validator synced: block {validator} vs executor {executor} (lag {} <= {lag_max})",
             executor.saturating_sub(validator)
         ));
-        Ok(())
+        Ok(sample)
     }
 
     async fn assert_no_divergence_halt(&self) -> anyhow::Result<()> {
@@ -164,23 +166,17 @@ impl Harness {
 
 /// All success and failure counters come from one exporter response.
 struct Sample {
+    committed: i64,
     verified: i64,
     checks: i64,
 }
 
 impl Sample {
-    fn read(body: &str) -> anyhow::Result<Self> {
+    fn read(body: &str) -> anyhow::Result<Option<Self>> {
         use crate::metrics;
-        anyhow::ensure!(
-            metrics::first(body, COMMITTED).is_some_and(|v| v > 0),
-            "validator committed cursor missing or zero"
-        );
+        let committed = metrics::first(body, COMMITTED).unwrap_or(0);
         let verified = metrics::first(body, VERIFIED).unwrap_or(0);
         let checks = metrics::first(body, SHADOW_CHECKS).unwrap_or(0);
-        anyhow::ensure!(
-            verified > 0 && checks > 0,
-            "validator has no BAL verification or trie shadow-check evidence"
-        );
         anyhow::ensure!(
             metrics::first(body, DIVERGENCE).unwrap_or(0) == 0,
             "validator counted divergence"
@@ -189,7 +185,13 @@ impl Sample {
             metrics::first(body, SHADOW_MISMATCH).unwrap_or(0) == 0,
             "validator counted trie mismatch"
         );
-        Ok(Self { verified, checks })
+        Ok(
+            (committed > 0 && verified > 0 && checks > 0).then_some(Self {
+                committed,
+                verified,
+                checks,
+            }),
+        )
     }
 }
 

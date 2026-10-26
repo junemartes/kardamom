@@ -213,6 +213,8 @@ pub struct AdmissionLoop {
     admission: Admission<RefPayload>,
     vslots: VslotSet,
     sealer_version: SealerVersion,
+    /// The session generation whose unconfirmed offers this loop sends.
+    sealer_generation: u64,
     fees: FeeGate,
     accounts: crossbeam_channel::Receiver<AccountEvent>,
     lookups: tokio::sync::mpsc::Sender<Address>,
@@ -242,6 +244,7 @@ impl AdmissionLoop {
             cfg,
             vslots,
             sealer_version: SealerVersion::default(),
+            sealer_generation: 0,
             fees: FeeGate::off(),
             accounts,
             lookups,
@@ -284,6 +287,12 @@ impl AdmissionLoop {
     /// offer, and the errors of the input and of the decode.
     pub fn run_once<P: SequencerPorts>(&mut self, ports: &mut P) -> Result<bool, SequencerError> {
         let applied = self.apply_accounts();
+        let generation = self.sealer_version.generation();
+        let renewed = generation != self.sealer_generation;
+        if renewed {
+            self.sealer_generation = generation;
+            self.offer_again_on_new_session();
+        }
         self.sweep_if_due(Instant::now());
         let (input, refs, side) = ports.split();
         side.flush_events();
@@ -293,7 +302,7 @@ impl AdmissionLoop {
             return Ok(true);
         }
         let Some(inbound) = input.poll()? else {
-            return Ok(applied);
+            return Ok(applied || renewed);
         };
         self.admit(&inbound, side)?;
         self.dispatch(side);

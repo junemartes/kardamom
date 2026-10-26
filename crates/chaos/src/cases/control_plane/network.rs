@@ -8,10 +8,10 @@ use crate::nodes::Nodes;
 
 const ARM: &str = r"set -eu
 iptables -w 5 -N KDM_CHAOS_CP
-for control_port in 4646 4647 8500 8600; do
+for control_port in 4646 4647 8500 53; do
     iptables -w 5 -A KDM_CHAOS_CP -p tcp --dport $control_port -j DROP
 done
-iptables -w 5 -A KDM_CHAOS_CP -p udp --dport 8600 -j DROP
+iptables -w 5 -A KDM_CHAOS_CP -p udp --dport 53 -j DROP
 iptables -w 5 -I OUTPUT 1 -j KDM_CHAOS_CP
 iptables -w 5 -C OUTPUT -j KDM_CHAOS_CP";
 
@@ -33,7 +33,7 @@ question = b''.join(bytes([len(label)]) + label for label in name.split(b'.')) +
 packet = struct.pack('!HHHHHH', 0x6b64, 0x0100, 1, 0, 0, 0) + question + struct.pack('!HH', 1, 1)
 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
     sock.settimeout(2)
-    sock.connect(('127.0.0.1', 8600))
+    sock.connect(('127.0.0.1', 53))
     sock.send(packet)
     response = sock.recv(4096)
     assert len(response) >= 12 and response[:2] == packet[:2] and response[2] & 0x80

@@ -109,15 +109,19 @@ impl Baseline {
     }
 
     async fn await_row(&self, h: &Harness, account: &AccountState) -> anyhow::Result<()> {
+        let last = std::cell::RefCell::new(String::new());
+        let last_ref = &last;
         poll::until(Budget::secs(120, 2), |_| async move {
-            Ok::<_, anyhow::Error>(
-                account
-                    .matches_projection(&self.row(h).await?)
-                    .then_some(()),
-            )
+            let observed = self.row(h).await?;
+            let matches = account.matches_projection(&observed);
+            last_ref.replace(observed);
+            Ok::<_, anyhow::Error>(matches.then_some(()))
         })
         .await?
-        .or_fail(|_| crate::chaos_fail!("{CTX}: exact account row is not projected"))?;
+        .or_fail(|_| crate::chaos_fail!(
+            "{CTX}: exact account row is not projected on {}: expected {account:?}, observed {:?}",
+            self.primary, last.borrow()
+        ))?;
         Ok(())
     }
 
