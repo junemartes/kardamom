@@ -337,12 +337,20 @@ impl Case {
             // The node replacement; the Redis loss and three rebuilds; the
             // total wipe, the rebuild from L1 and the install; or the
             // blackout and the return of every job.
-            Self::NodeReplaceExecutor
-            | Self::RedisTotalLossRecover
+            Self::RedisTotalLossRecover
             | Self::ExecutorFleetTotalWipeRecover
             | Self::PipelineBlackoutRecover => inject + k.reschedule_slo + Duration::from_mins(7),
-            Self::NodeReplaceSealer => {
-                inject + k.reschedule_slo + k.rejoin_slo + Duration::from_mins(5)
+            // Replacing a machine also runs Terraform and the full substrate play.
+            Self::NodeReplaceExecutor | Self::NodeReplaceSealer => {
+                inject + Duration::from_mins(30) + k.rejoin_slo
+            }
+            Self::ArchiveCorruption => inject + Duration::from_mins(15),
+            Self::ClusterFollowerKill => inject + Duration::from_mins(9) + k.restart_slo,
+            Self::ClusterMemberRejoin => {
+                inject + Duration::from_mins(9) + k.restart_slo + k.rejoin_slo
+            }
+            Self::ClusterQuorumLossRecover => {
+                inject + k.reschedule_slo * 2 + Duration::from_mins(6)
             }
             // The quiet stop, two rebuilds from L1, a seeded election, a
             // restart without the seed, two executor starts, and the

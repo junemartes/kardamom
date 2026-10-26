@@ -103,7 +103,7 @@ impl Step {
         let inject = k.inject_delay;
         match self {
             // Full deploy checks cover the lockbox upgrades and the move of the readers.
-            Self::VersionsOn | Self::ReadersOnEgress => inject + Duration::from_mins(25),
+            Self::VersionsOn | Self::ReadersOnEgress => inject + Duration::from_mins(40),
             // Two upgrade transactions and the held transfer.
             Self::HeldOfferAfterDowngrade | Self::WindowOffOn => inject + Duration::from_mins(8),
             Self::WindowOn => inject + k.restart_slo + Duration::from_mins(8),
