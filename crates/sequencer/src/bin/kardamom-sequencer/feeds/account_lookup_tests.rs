@@ -84,6 +84,19 @@ impl Fixture {
         .await
         .expect("shutdown must release all lookup permits");
     }
+
+    async fn profile_sample(&self) -> u128 {
+        let offered = Instant::now();
+        self.requests.send(ADDRESS).await.unwrap();
+        while self.answers.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let AccountEvent::Answer { state, .. } = self.answers.try_recv().unwrap() else {
+            panic!("lookup emits an answer");
+        };
+        assert_eq!(state.nonce, 42);
+        offered.elapsed().as_nanos()
+    }
 }
 
 struct Recording(PrometheusHandle);
@@ -180,6 +193,30 @@ fn a_healthy_first_lookup_answers_without_a_retry() {
             .await
             .expect("healthy lookups must not wait for a retry timer");
         assert!(!recording.has_failure());
+        fixture.stop().await;
+    });
+}
+
+#[test]
+#[ignore = "manual release profile of successful first-attempt lookup tasks"]
+fn healthy_lookup_profile() {
+    Recording::run(|_| async move {
+        let mut fixture = Fixture::new();
+        fixture.restore();
+        let mut samples = Vec::with_capacity(20_000);
+        let started = Instant::now();
+        for _ in 0..20_000 {
+            samples.push(fixture.profile_sample().await);
+        }
+        let elapsed_ns = started.elapsed().as_nanos();
+        samples.sort_unstable();
+        println!(
+            "LOOKUP_PROFILE {{\"samples\":{},\"elapsed_ns\":{elapsed_ns},\"p50_ns\":{},\"p95_ns\":{},\"p99_ns\":{}}}",
+            samples.len(),
+            samples[10_000],
+            samples[19_000],
+            samples[19_800]
+        );
         fixture.stop().await;
     });
 }

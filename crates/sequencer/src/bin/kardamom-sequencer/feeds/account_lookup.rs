@@ -27,7 +27,7 @@ use kardamom_sequencer::admission::AccountState;
 use kardamom_sequencer::metrics;
 use kardamom_sequencer::sequencer::Shutdown;
 use kardamom_sequencer::v2::AccountEvent;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 /// The lookups that run at once.
 const IN_FLIGHT: usize = 64;
@@ -101,26 +101,40 @@ impl AccountLookupFeed {
                 None => return ControlFlow::Break(()),
             },
         };
-        let permit = tokio::select! {
-            biased;
-            () = self.shutdown.cancelled() => return ControlFlow::Break(()),
-            permit = self.limit.clone().acquire_owned() => permit,
-        };
-        let Ok(permit) = permit else {
+        let Some(permit) = self.permit().await else {
             return ControlFlow::Break(());
         };
         let sources = self.sources.clone();
         let answers = self.answers.clone();
         tokio::spawn(async move {
-            // The permit ends with the task.
-            let _permit = permit;
-            if let Some(state) = sources.observe(address).await {
+            let started = Instant::now();
+            let (outcome, state) = sources.state_of(address).await;
+            sources.record(started, outcome);
+            if let Some(state) = state {
                 let _ = answers.send(AccountEvent::Answer { address, state });
             } else {
-                sources.retry(address, &answers).await;
+                // Only failed lookups allocate a retry task. Moving the
+                // permit keeps first attempts and retries under one limit.
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    sources.retry(address, &answers).await;
+                });
             }
         });
         ControlFlow::Continue(())
+    }
+
+    /// Only a saturated feed waits on a permit and shutdown together.
+    async fn permit(&self) -> Option<OwnedSemaphorePermit> {
+        match self.limit.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(TryAcquireError::Closed) => None,
+            Err(TryAcquireError::NoPermits) => tokio::select! {
+                biased;
+                () = self.shutdown.cancelled() => None,
+                permit = self.limit.clone().acquire_owned() => permit.ok(),
+            },
+        }
     }
 }
 
@@ -128,12 +142,16 @@ impl Sources {
     async fn observe(&self, address: Address) -> Option<AccountState> {
         let started = Instant::now();
         let (outcome, state) = self.state_of(address).await;
-        self.latency.since(started);
-        metrics::record_nonce_lookup(self.partition, outcome);
+        self.record(started, outcome);
         state
     }
 
-    /// The original task and permit bound retries to the lookup limit.
+    fn record(&self, started: Instant, outcome: &'static str) {
+        self.latency.since(started);
+        metrics::record_nonce_lookup(self.partition, outcome);
+    }
+
+    /// The original permit bounds retries to the lookup limit.
     async fn retry(&self, address: Address, answers: &crossbeam_channel::Sender<AccountEvent>) {
         while self.retry_once(address, answers).await.is_continue() {}
     }
