@@ -2815,10 +2815,10 @@ class CarryTest(Deploys):
             self.assertEqual(jobs[name]['Meta']['reads_egress'], 'true', name)
         self.assertEqual(jobs['sequencer']['Meta']['v2_loop'], 'true')
         # A redeploy without the bootstrap: the registered sealer job carries
-        # the genesis features, so the gate accepts it, and nothing changes.
+        # the genesis features, so only the data directory job registers.
         self.api.state['writes'] = []
         self.run_deploy(environ=self.GENESIS)
-        self.assertEqual(self.api.state['writes'], [])
+        self.assertEqual(self.api.state['writes'], ['data-dirs'])
 
     def test_a_genesis_bootstrap_stops_at_a_member_without_the_genesis_rules(self):
         """A sealer image that does not take the genesis features starts on
