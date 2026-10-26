@@ -286,7 +286,7 @@
         "chaos-cache",
         "chaos-sequencer"
       ],
-      "status": "pending"
+      "status": "New mirror-backlog-client-restart case runs first in the existing cache shard. It holds an old live projection, commits an established sender transfer, restarts one ingress, requires exact nonce/balance equality with the executor, checks stale fallbacks and no local hits, and verifies stale Redis rows/heads do not change. The original mirror job is restored and every mirror must complete its own rebuild. 202 local chaos tests pass; deployed validation pending. Many-sender throughput/backlog reproduction remains open."
     },
     {
       "gap": "Partial account regression with a surviving advanced mirror head",
@@ -480,7 +480,7 @@
       "Remaining coverage gaps",
       "Full cluster workload comparison",
       "10 consecutive complete green CI rounds on the final unchanged commit",
-      "Deployed validation of the 73 scheduled cases, including the scoped canary genesis and guard restoration"
+      "Deployed validation of the 74 scheduled cases, including the scoped canary genesis and guard restoration"
     ],
     "ci_wiring_changed": "Retain load/profile evidence; add suite=all to the cluster workflow without changing normal PR/scheduled selection; make static validation dispatchable; test the persistent ten-round audit utility in CI. The serial carry rollout has a 180-minute job budget; all per-case recovery deadlines remain unchanged.",
     "streak_command": "python3 scripts/ci/green_streak.py --branch BRANCH --head FULL_SHA --state AUDIT.json --poll --run CI_ID --run CLUSTER_ID --run DOCKER_ID --run SEMANTICS_ID --run VALIDATION_ID",
@@ -602,6 +602,14 @@
       "workflow_run": 40282010861,
       "url": "https://github.com/junemartes/kardamom/actions/runs/40282010861",
       "status": "Diagnostic integrity run fails resize-scale-out-in after scale-out and scale-in finish. The load window is 13 minutes; six Ansible submissions plus overlap recovery take 16m17s. Resize recovery deadlines remain unchanged; the load bound needs the full rollout budget. No qualifying round."
+    },
+    {
+      "pull_request": 848,
+      "commit": "663d25766a02b01c813ff6fc0b2b67054652e741",
+      "workflow_run": 40292596498,
+      "nightly_workflow_run": 40292659324,
+      "url": "https://github.com/junemartes/kardamom/pull/848",
+      "status": "Draft diagnostic candidate. Both existing regular and integrity groups run. No qualifying frozen-head round. Local style, 213 engine tests, 201 chaos tests and 14 audit tests pass; controlled release tee profile is recorded."
     }
   ],
   "integration": {
@@ -612,15 +620,8 @@
   "unpublished": {
     "workspace": "/home/dev/kardamom-chaos-gaps",
     "changes": [
-      "Scoped DA halt and prune-floor scheduling",
-      "Funded local canary lifecycle and exact alert inhibition proof",
-      "L1 reconstruction includes the canonical canary genesis fragment",
-      "Control-plane HTTP/RPC/DNS isolation in the existing coordination shard",
-      "Case-owned accepted traffic after recovery",
-      "Load bounds from diagnostic recovery timelines",
-      "Committed local lookup evidence and timeout counter diagnostics",
-      "Checked restart history anchors new executor copies in the egress merge"
+      "mirror-backlog-client-restart in the existing cache shard; total 74 scheduled cases"
     ],
-    "status": "Prepared for diagnostic PR. 213 engine tests (one manual profile ignored), 201 chaos tests (two ignored), 14 audit tests and workspace style pass. Five controlled release A/B repeats show no observed steady tee regression. Final head is not frozen; streak remains 0/10."
+    "status": "202 chaos tests (two ignored) and workspace style pass. Test-only fault holds old mirror heads live for at most 600 seconds, stops the mirror job, restarts ingress-1, removes held heads and restores the exact mirror job even on error. No production code or configuration change. Not pushed while PR 848 diagnostic evidence is collected. Streak remains 0/10; final head is not frozen."
   }
 }

@@ -187,6 +187,7 @@ impl Shard {
             ],
             // The mirror rebuild runs last: it flushes the projection.
             Self::Cache => &[
+                "mirror-backlog-client-restart",
                 "redis-partition-ingress",
                 "redis-primary-kill",
                 "redis-primary-freeze",
@@ -412,7 +413,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 73);
+        assert_eq!(all.len(), 74);
         assert_eq!(
             Shard::Integrity.cases().last(),
             Some(&"resize-scale-out-in")

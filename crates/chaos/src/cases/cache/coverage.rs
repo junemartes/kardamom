@@ -82,7 +82,7 @@ impl CacheRecovery {
 }
 
 impl AccountState {
-    fn matches_projection(&self, observed: &str) -> bool {
+    pub(super) fn matches_projection(&self, observed: &str) -> bool {
         let fields: Vec<_> = observed.lines().collect();
         let [nonce, balance, tx_idx] = fields.as_slice() else {
             return false;

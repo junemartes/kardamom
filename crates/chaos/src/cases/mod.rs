@@ -88,6 +88,7 @@ pub enum Case {
     RedisPartitionIngress,
     RedisTotalLossRecover,
     MirrorKillRebuild,
+    MirrorBacklogClientRestart,
     DaLagHalt,
     CanaryDaLag,
     PruneFloor,
@@ -160,6 +161,7 @@ const ALL: &[Case] = &[
     Case::RedisPartitionIngress,
     Case::RedisTotalLossRecover,
     Case::MirrorKillRebuild,
+    Case::MirrorBacklogClientRestart,
     Case::DaLagHalt,
     Case::CanaryDaLag,
     Case::PruneFloor,
@@ -245,6 +247,7 @@ impl Case {
             Self::RedisPartitionIngress => "redis-partition-ingress",
             Self::RedisTotalLossRecover => "redis-total-loss-recover",
             Self::MirrorKillRebuild => "mirror-kill-rebuild",
+            Self::MirrorBacklogClientRestart => "mirror-backlog-client-restart",
             Self::DaLagHalt => "da-lag-halt",
             Self::CanaryDaLag => "canary-da-lag",
             Self::PruneFloor => "prune-floor",
@@ -335,6 +338,7 @@ impl Case {
             }
             // The mirrors restart, wait for a checkpoint, and rebuild.
             Self::MirrorKillRebuild => inject + k.restart_slo + Duration::from_mins(10),
+            Self::MirrorBacklogClientRestart => inject + k.restart_slo + Duration::from_mins(15),
             // The node replacement; the Redis loss and three rebuilds; the
             // total wipe, the rebuild from L1 and the install; or the
             // blackout and the return of every job.
@@ -539,6 +543,7 @@ impl Case {
             Self::RedisPartitionIngress => cache::redis_partition_ingress(h).await,
             Self::RedisTotalLossRecover => cache::redis_total_loss_recover(h).await,
             Self::MirrorKillRebuild => cache::mirror_kill_rebuild(h).await,
+            Self::MirrorBacklogClientRestart => cache::client_restart(h).await,
             Self::DaLagHalt => da_lag::GuardedCase::Halt.run(h).await,
             Self::CanaryDaLag => l1_canary::scheduled_canary(h).await,
             Self::PruneFloor => da_lag::prune_floor(h).await,
