@@ -53,6 +53,7 @@ pub enum Case {
     RaftLeaderOneWayPartition,
     ClusterFollowerKill,
     ClusterMemberRejoin,
+    ClusterTwoBlankRecover,
     NodeReplaceSealer,
     ClusterQuorumLossRecover,
     ClusterTotalLossRecover,
@@ -127,6 +128,7 @@ const ALL: &[Case] = &[
     Case::RaftLeaderOneWayPartition,
     Case::ClusterFollowerKill,
     Case::ClusterMemberRejoin,
+    Case::ClusterTwoBlankRecover,
     Case::NodeReplaceSealer,
     Case::ClusterQuorumLossRecover,
     Case::ClusterTotalLossRecover,
@@ -214,6 +216,7 @@ impl Case {
             Self::RaftLeaderOneWayPartition => "raft-leader-one-way-partition",
             Self::ClusterFollowerKill => "cluster-follower-kill",
             Self::ClusterMemberRejoin => "cluster-member-rejoin",
+            Self::ClusterTwoBlankRecover => "cluster-two-blank-recover",
             Self::NodeReplaceSealer => "node-replace-sealer",
             Self::ClusterQuorumLossRecover => "cluster-quorum-loss-recover",
             Self::ClusterTotalLossRecover => "cluster-total-loss-recover",
@@ -364,6 +367,7 @@ impl Case {
             Self::ClusterQuorumLossRecover => {
                 inject + k.reschedule_slo * 2 + Duration::from_mins(6)
             }
+            Self::ClusterTwoBlankRecover => inject + Duration::from_mins(10) + k.rejoin_slo * 2,
             // The quiet stop, two rebuilds from L1, a seeded election, a
             // restart without the seed, two executor starts, and the
             // return of every other job.
@@ -467,7 +471,8 @@ impl Case {
             | Self::IngressExecutorLossRecover
             | Self::ReadPathLossRecover
             | Self::SequencerExecutorRedisLoss
-            | Self::ControlPlaneLossRecover => 90,
+            | Self::ControlPlaneLossRecover
+            | Self::ClusterTwoBlankRecover => 90,
             Self::ClusterQuorumLossRecover => 6,
             Self::ClusterTotalLossRecover
             | Self::ExecutorFleetLossRecover
@@ -506,6 +511,7 @@ impl Case {
             Self::RaftLeaderOneWayPartition => raft_partition::leader_one_way(h).await,
             Self::ClusterFollowerKill => cluster::follower_kill(h).await,
             Self::ClusterMemberRejoin => cluster::member_rejoin(h).await,
+            Self::ClusterTwoBlankRecover => cluster::two_blank_recover(h).await,
             Self::NodeReplaceSealer => cluster::node_replace_sealer(h).await,
             Self::ClusterQuorumLossRecover => cluster::quorum_loss_recover(h).await,
             Self::ClusterTotalLossRecover => fleet::cluster_total_loss_recover(h).await,

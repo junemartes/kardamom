@@ -10,6 +10,7 @@ use std::time::Duration;
 use super::member_storage::MemberStorage;
 use crate::evidence::CountWait;
 use crate::harness::Harness;
+use crate::nomad::SavedJob;
 use crate::nomad::Streams;
 use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
@@ -140,6 +141,51 @@ pub(crate) async fn member_rejoin(h: &mut Harness) -> anyhow::Result<()> {
     before.await_caught_up(h).await
 }
 
+/// A full restart keeps only the current leader's persistent Raft data.
+/// Both other members must seed and catch up without an intact quorum.
+pub(crate) async fn two_blank_recover(h: &mut Harness) -> anyhow::Result<()> {
+    let ctx = "cluster-two-blank-recover";
+    let leader = h.evidence.cluster_leader(h.knobs.leader_slo).await?;
+    await_log_purge(h, leader, ctx).await?;
+    let mut blank = Vec::new();
+    for member in (0..3).filter(|member| *member != leader) {
+        blank.push(Blank::observe(h, member, ctx).await?);
+    }
+    let job = SavedJob::capture(&h.nomad, CLUSTER_TASK).await?;
+    let stopped = job.stop().await;
+    let wiped = match stopped {
+        Ok(()) => Blank::wipe_all(h, &blank, ctx).await,
+        Err(error) => Err(error),
+    };
+    let restored = job.restore().await;
+    if let Err(error) = &restored {
+        crate::log(format!("{ctx}: restoring the cluster job fails: {error:#}"));
+    }
+    let report = serde_json::json!({
+        "case": ctx, "surviving_data_member": leader,
+        "blank_members": blank.iter().map(|proof| proof.member).collect::<Vec<_>>(),
+        "target_blocks": blank.iter().map(|proof| proof.head).collect::<Vec<_>>(),
+        "fault": "all member tasks stopped; two member directories and local seeds erased; shared executor archives preserved",
+        "wipe_failure": wiped.as_ref().err().map(|error| format!("{error:#}")),
+        "restore_failure": restored.as_ref().err().map(|error| format!("{error:#}")),
+    });
+    let saved = std::fs::write(
+        "/tmp/chaos-cluster-two-blank-recover-fault.json",
+        serde_json::to_vec_pretty(&report)?,
+    );
+    wiped?;
+    restored?;
+    saved?;
+    h.assert_count(CLUSTER_TASK, 3, h.knobs.restart_slo).await?;
+    h.evidence
+        .cluster_elected(super::fleet::FULL_RESTART_ELECTION)
+        .await?;
+    for member in blank {
+        member.await_caught_up(h).await?;
+    }
+    h.assert_progress().await
+}
+
 /// Wait until `leader` logs a purge of its Raft log. The purge lines stay
 /// in the logs of the leader's allocation, so an earlier purge counts.
 async fn await_log_purge(h: &Harness, leader: u32, ctx: &str) -> anyhow::Result<()> {
@@ -208,6 +254,16 @@ struct Blank {
 }
 
 impl Blank {
+    async fn wipe_all(h: &Harness, blank: &[Self], ctx: &str) -> anyhow::Result<()> {
+        for member in blank {
+            MemberStorage::wipe(h, &sealer(h, member.member)?, ctx).await?;
+        }
+        crate::log(format!(
+            "{ctx}: two members lose all local Raft and seed files; one member keeps its full data"
+        ));
+        Ok(())
+    }
+
     async fn observe(h: &Harness, member: u32, ctx: &'static str) -> anyhow::Result<Self> {
         let start = BlankStart::of(member);
         let (before, _) = Self::starts_by_alloc(h, &start).await?;

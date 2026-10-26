@@ -386,7 +386,7 @@
       "existing_shards": [
         "chaos-integrity"
       ],
-      "status": "pending; process kill must not be reported as power-loss proof"
+      "status": "The existing cluster shard now also stops all member tasks, erases Raft and seed data on two members, and restores the exact job with one intact data copy. Both empty members must prove a fresh seed and reach the pre-loss target after a real log purge. Shared executor archives remain intact. Local checks pass; deployed validation pending. This covers two empty members/one survivor, not loss of unsynced writes or a power cut."
     },
     {
       "gap": "Canonical rewind invalidates already served receipts and derived caches",
@@ -490,7 +490,7 @@
       "Remaining coverage gaps",
       "Full cluster workload comparison",
       "10 consecutive complete green CI rounds on the final unchanged commit",
-      "Deployed validation of the 75 scheduled cases, including the scoped canary genesis and guard restoration"
+      "Deployed validation of the 76 scheduled cases, including the scoped canary genesis and guard restoration"
     ],
     "ci_wiring_changed": "Retain load/profile evidence; add suite=all to the cluster workflow without changing normal PR/scheduled selection; make static validation dispatchable; test the persistent ten-round audit utility in CI. The serial carry rollout has a 180-minute job budget; all per-case recovery deadlines remain unchanged.",
     "streak_command": "python3 scripts/ci/green_streak.py --branch BRANCH --head FULL_SHA --state AUDIT.json --poll --run CI_ID --run CLUSTER_ID --run DOCKER_ID --run SEMANTICS_ID --run VALIDATION_ID",
@@ -634,8 +634,9 @@
       "One-way live-leader partition in the existing cluster shard; total 75 scheduled cases",
       "Preserve both transfer and DeFi reports and expose existing executor query counter deltas",
       "Egress restart regression covers an unposted gap inside checked history and rejects a gap before it",
-      "Native deposits before/during/after provider loss within carry-versions-on; no extra shard, case account or deployment. Reuse exact lockbox logs for reconstruction."
+      "Native deposits before/during/after provider loss within carry-versions-on; no extra shard, case account or deployment. Reuse exact lockbox logs for reconstruction.",
+      "Two empty Raft members and one intact data copy in the existing cluster shard; remove stale local seed staging from blank-member faults; 76 cases total"
     ],
-    "status": "214 engine tests (one manual profile ignored), 207 chaos tests (two ignored), 83 benchmark tests, 14 audit tests and workspace style pass. No product service code changes after PR 848. Four non-cluster workflows on PR 848 are green; regular and integrity cluster shards are running. Follow-up coverage is not pushed while diagnostic evidence is collected. Streak stays 0/10; the final head is not frozen."
+    "status": "214 engine tests, 207 chaos tests, 83 benchmark tests, 14 audit tests and style pass. PR 848 has green non-cluster workflows plus load and semantics. Ingress and coordination fail the new own-load resumption oracle. The client retry count assumes a 30-second parked RPC, but connection errors return immediately and exhaust retries before ingress returns. No rerun before classification/fix. Streak is 0/10; final head is not frozen."
   }
 }

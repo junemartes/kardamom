@@ -12,6 +12,8 @@ fn blank_member_keeps_the_shared_driver_archive_and_other_services() {
         "archive/17.rec",
         "archive/.catalog",
         "archive/member/snapshot.rec",
+        "seed/old/snapshot.bin",
+        "seed/.metadata",
         "archive/dir/catalog.dat",
         "archive/dir/19.rec",
         "archive/dir/archive-mark.dat",
@@ -33,14 +35,14 @@ fn blank_member_keeps_the_shared_driver_archive_and_other_services() {
         fs::read_dir(root.path().join("cluster")).unwrap().count(),
         0
     );
-    files[..5].iter().for_each(|file| {
+    files[..7].iter().for_each(|file| {
         assert!(
             !root.path().join(file).exists(),
             "member file survives: {file}"
         );
     });
-    files[5..].iter().for_each(|file| {
+    files[7..].iter().for_each(|file| {
         assert_eq!(fs::read_to_string(root.path().join(file)).unwrap(), *file);
     });
-    assert!(root.path().join("seed").is_dir());
+    assert_eq!(fs::read_dir(root.path().join("seed")).unwrap().count(), 0);
 }
