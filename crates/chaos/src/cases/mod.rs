@@ -24,6 +24,7 @@ pub(crate) mod exec_stream;
 pub(crate) mod fleet;
 pub(crate) mod l1;
 pub(crate) mod l1_canary;
+mod member_storage;
 pub(crate) mod recorded_cursor;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
@@ -89,6 +90,7 @@ pub enum Case {
     PruneFloor,
     L1Liar,
     L1NullReceipts,
+    L1TransportRefusals,
     TwoDayOutage,
     BatcherOutagePastRetention,
     FollowerInstanceLoss,
@@ -159,6 +161,7 @@ const ALL: &[Case] = &[
     Case::PruneFloor,
     Case::L1Liar,
     Case::L1NullReceipts,
+    Case::L1TransportRefusals,
     Case::TwoDayOutage,
     Case::BatcherOutagePastRetention,
     Case::FollowerInstanceLoss,
@@ -242,6 +245,7 @@ impl Case {
             Self::PruneFloor => "prune-floor",
             Self::L1Liar => "l1-liar",
             Self::L1NullReceipts => "l1-null-receipts",
+            Self::L1TransportRefusals => "l1-transport-refusals",
             Self::TwoDayOutage => "two-day-outage",
             Self::BatcherOutagePastRetention => "batcher-outage-past-retention",
             Self::FollowerInstanceLoss => "follower-instance-loss",
@@ -260,6 +264,7 @@ impl Case {
         match self {
             Self::L1Liar
             | Self::L1NullReceipts
+            | Self::L1TransportRefusals
             | Self::TwoDayOutage
             | Self::BatcherOutagePastRetention
             | Self::FollowerInstanceLoss
@@ -353,6 +358,7 @@ impl Case {
             Self::L1Liar => inject + (k.l1_fault + Duration::from_mins(3)) * 3,
             // One fault, a batcher restart inside it, and the posts after.
             Self::L1NullReceipts => inject + k.l1_fault + k.restart_slo + Duration::from_mins(3),
+            Self::L1TransportRefusals => inject + (k.l1_fault + Duration::from_mins(3)) * 2,
             // The liar, two restarts, the floor passing, and the resume.
             Self::TwoDayOutage => {
                 inject
@@ -508,6 +514,7 @@ impl Case {
             Self::PruneFloor => da_lag::prune_floor(h).await,
             Self::L1Liar => l1::liar(h).await,
             Self::L1NullReceipts => l1::null_receipts(h).await,
+            Self::L1TransportRefusals => l1::transport_refusals(h).await,
             Self::TwoDayOutage => l1::two_day_outage(h).await,
             Self::BatcherOutagePastRetention => l1::batcher_outage_past_retention(h).await,
             Self::FollowerInstanceLoss => l1::follower_instance_loss(h).await,
@@ -520,32 +527,4 @@ impl Case {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_shard_case_parses_and_names_round_trip() {
-        for shard in [
-            crate::Shard::Executor,
-            crate::Shard::Ingress,
-            crate::Shard::Sequencer,
-            crate::Shard::Cluster,
-            crate::Shard::Fleet,
-            crate::Shard::Coordinated,
-            crate::Shard::CombinedOrdering,
-            crate::Shard::CombinedExec,
-            crate::Shard::Retention,
-            crate::Shard::Cache,
-            crate::Shard::L1,
-            crate::Shard::Follower,
-            crate::Shard::Integrity,
-            crate::Shard::Carry,
-        ] {
-            shard
-                .cases()
-                .iter()
-                .for_each(|name| assert_eq!(Case::parse(name).unwrap().name(), *name));
-        }
-        assert!(Case::parse("sealer-hard").is_err());
-    }
-}
+mod tests;

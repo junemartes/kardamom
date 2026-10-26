@@ -148,13 +148,13 @@ impl Shard {
             // sealers and the validator, the ingresses, and the read path
             // (Redis and the state mirrors). The executor-and-sealer case
             // runs first and audits the persisted state after it. The
-            // sequencer-and-Redis case runs by name only: a media driver
-            // error can cut a replica off its stream.
+            // sequencer-and-Redis case removes every source of a sender floor.
             Self::CombinedExec => &[
                 "executor-sealer-loss-recover",
                 "executor-sealer-validator-recover",
                 "ingress-executor-loss-recover",
                 "read-path-loss-recover",
+                "sequencer-executor-redis-loss",
             ],
             Self::Retention => &["retention-overrun", "retention-overrun-validator"],
             // A lying L1 in front of the followers. The outage past the
@@ -172,6 +172,7 @@ impl Shard {
             // their own: with the liar cases, one shard passed the job's
             // limit.
             Self::Follower => &[
+                "l1-transport-refusals",
                 "follower-instance-loss",
                 "follower-total-loss",
                 "follower-disagreement",
@@ -388,7 +389,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 67);
+        assert_eq!(all.len(), 69);
         assert_eq!(
             Shard::Integrity.cases().last(),
             Some(&"resize-scale-out-in")

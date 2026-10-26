@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
 
+use super::member_storage::MemberStorage;
 use crate::evidence::CountWait;
 use crate::harness::Harness;
 use crate::nomad::Streams;
@@ -133,13 +134,7 @@ pub(crate) async fn member_rejoin(h: &mut Harness) -> anyhow::Result<()> {
         "{ctx}: leader=memberId={leader}; killing FOLLOWER memberId={follower} and WIPING its cluster + archive dirs"
     ));
     h.inject_hard(&[&node], CLUSTER_TASK).await?;
-    h.nodes
-        .exec(
-            &node,
-            "rm -rf /opt/kardamom/cluster/* /opt/kardamom/archive/*",
-        )
-        .await
-        .map_err(|e| crate::chaos_fail!("{ctx}: could not wipe memberId={follower} state: {e}"))?;
+    MemberStorage::wipe(h, &node, ctx).await?;
     h.assert_executor_progress(Duration::from_mins(1)).await?;
     h.assert_count(CLUSTER_TASK, 3, h.knobs.restart_slo).await?;
     before.await_caught_up(h).await

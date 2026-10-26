@@ -20,6 +20,7 @@ use super::{
 };
 use crate::cases::cache::freeze_and_flush;
 use crate::cases::component::wipe_dirs;
+use crate::cases::member_storage::MemberStorage;
 use crate::evidence::CountWait;
 use crate::harness::Harness;
 use crate::l1::L1;
@@ -48,11 +49,6 @@ const DA_WATCHER_PORT: u16 = 9005;
 const EPOCH_ORIGIN: &str = "kardamom_da_watcher_epoch_origin_block_number";
 const L1_FINALIZED: &str = "kardamom_da_watcher_l1_finalized_block_number";
 const EPOCHS_PUBLISHED: &str = "kardamom_da_watcher_epochs_published_total";
-
-/// The script that empties a member's cluster and archive directories,
-/// and makes the seed directory. It keeps `archive/dir`: that is the
-/// node's shared Aeron archive, not the member's.
-const SEALER_WIPE: &str = "find /opt/kardamom/cluster -mindepth 1 -delete && find /opt/kardamom/archive -mindepth 1 -maxdepth 1 ! -name dir -exec rm -rf {} + && mkdir -p /opt/kardamom/seed";
 
 /// The L1 blocks the wait for the batcher's first new post mines at each
 /// poll: two finality windows of anvil's default (2 x 32 slots) pass in
@@ -343,7 +339,7 @@ impl<'a> FleetWipe<'a> {
 
     /// Wipe one member's directories and copy the seed to its node.
     async fn seed_node(&self, node: &str, seeded: &Seeded) -> anyhow::Result<()> {
-        wipe_dirs(self.h, node, CTX, SEALER_WIPE).await?;
+        MemberStorage::wipe(self.h, node, CTX).await?;
         let seed = seeded.seed.display().to_string();
         self.h
             .nodes

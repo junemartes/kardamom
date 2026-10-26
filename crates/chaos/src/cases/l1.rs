@@ -19,6 +19,7 @@ mod halt;
 mod liar;
 mod null_receipts;
 mod outage;
+mod transport;
 mod two_day;
 
 pub(crate) use disagreement::follower_disagreement;
@@ -28,4 +29,5 @@ pub(crate) use follower_loss::{
 pub(crate) use liar::liar;
 pub(crate) use null_receipts::null_receipts;
 pub(crate) use outage::batcher_outage_past_retention;
+pub(crate) use transport::transport_refusals;
 pub(crate) use two_day::two_day_outage;

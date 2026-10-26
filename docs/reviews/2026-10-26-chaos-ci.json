@@ -1,0 +1,241 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "pull_request": 838,
+    "commit": "29924d832aae03a17b969c0baf1f46decc00bf1d",
+    "workflow_run": 40260202176,
+    "url": "https://github.com/junemartes/kardamom/actions/runs/40260202176"
+  },
+  "policy": {
+    "new_shards": false,
+    "product_changes_require_latency_and_throughput_comparison": true,
+    "green_requires_repeated_full_runs_of_the_same_head": true,
+    "failures_require_classification_before_retry": true
+  },
+  "failures": [
+    {
+      "id": "cluster-member-wipe-scope",
+      "classification": "harness",
+      "job": 121376239919,
+      "case": "cluster-member-rejoin",
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40260202176/job/121376239919",
+      "observed": "Blank member 0 reaches block 510 after 20s. Its colocated executor then stalls at block 523 while the surviving fleet reaches block 640; convergence fails with lag 117. Executor logs show exec_txs recordings time out after the wipe.",
+      "cause": "The case removes archive/dir, which belongs to the shared Aeron driver and records the live executor. The fault is intended to remove only member data.",
+      "change": "Share the fleet wipe operation with the member rejoin case. Preserve archive/dir, remove hidden member files as well as ordinary files, and test the operation on a temporary tree.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "fix awaiting CI",
+      "verification": [
+        "Temporary-tree wipe test verifies member data is removed, including hidden files, while live archive/dir, executor state, and egress files survive."
+      ]
+    },
+    {
+      "id": "mirror-rebuild-aggregate-false-positive",
+      "classification": "harness",
+      "case": "redis-total-loss-recover, read-path-loss-recover, mirror-kill-rebuild",
+      "observed": "An aggregate increase of three rebuild lines can come entirely from one mirror. The mirror-kill case previously required only one rebuild.",
+      "change": "Require an increased log count from each node and allocation; a replacement allocation needs its own completed rebuild. Report missing nodes on timeout.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "fix awaiting CI",
+      "verification": [
+        "Unit tests reject repeated rebuilds on one mirror, missing or regressed evidence, and replacement allocations without their own completed rebuild."
+      ]
+    },
+    {
+      "id": "live-log-404-false-negative",
+      "classification": "harness",
+      "observed": "A 404 for a live allocation is interpreted as an empty clean log, so the divergence scan can pass without evidence.",
+      "change": "Try the node agent and retry missing live logs. Preserve empty-log behavior for terminal allocations.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "fix awaiting CI",
+      "verification": [
+        "Fake-agent tests verify live 404 fallback, live missing-log failure, and terminal 404 compatibility."
+      ]
+    }
+  ],
+  "coverage": [
+    {
+      "gap": "Established sender and high mirror backlog; stale cached nonce on client restart",
+      "incident": "https://github.com/junemartes/kardamom/issues/754",
+      "reason_missed": "Fresh single-sender load at 200 TPS does not exceed the old mirror throughput; final completeness alone does not check the RPC nonce seen by a restarted client.",
+      "existing_shards": [
+        "chaos-cache",
+        "chaos-sequencer"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "Partial account regression with a surviving advanced mirror head",
+      "reason_missed": "FLUSHALL removes the head too, and a maximum head or a nonempty account hash does not certify account coverage.",
+      "existing_shards": [
+        "chaos-cache"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "Interrupted and concurrent mirror rebuilds with per-mirror proof",
+      "existing_shards": [
+        "chaos-cache",
+        "chaos-combined-exec"
+      ],
+      "status": "per-mirror evidence implemented; interrupted scan and exact account assertions pending"
+    },
+    {
+      "gap": "DA lag halt, canary page inhibition, and prune floor in scheduled runs",
+      "reason_missed": "These cases exist but need special small-budget and canary configuration and are not assigned to CI shards.",
+      "existing_shards": [
+        "chaos-retention",
+        "chaos-follower"
+      ],
+      "status": "pending per-case configuration and restoration"
+    },
+    {
+      "gap": "No nonce source after sequencer, executor, and Redis loss",
+      "existing_shards": [
+        "chaos-combined-exec"
+      ],
+      "status": "existing case scheduled; awaiting CI"
+    },
+    {
+      "gap": "Provider HTTP 503 and 429 with backoff and automatic recovery",
+      "reason_missed": "The fault proxy supports these refusals, but no chaos case arms them.",
+      "existing_shards": [
+        "chaos-follower"
+      ],
+      "status": "case implemented; awaiting CI; all-provider timeout still pending"
+    },
+    {
+      "gap": "V2 refusal and offer recovery across session changes, halt, and downgrade",
+      "incident": "https://github.com/junemartes/kardamom/pull/834",
+      "existing_shards": [
+        "chaos-carry"
+      ],
+      "status": "dependency covers new-session reoffer and release-time format; halt refusals pending"
+    },
+    {
+      "gap": "Posting freeze beyond every retention floor and exact resumed coverage",
+      "existing_shards": [
+        "chaos-l1",
+        "chaos-retention"
+      ],
+      "status": "pending stronger retention and replay-path assertions"
+    },
+    {
+      "gap": "Deposits before, during, and after L1 follower faults; source identity and exact balances",
+      "existing_shards": [
+        "chaos-follower",
+        "chaos-l1"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "Asymmetric Raft partition with an isolated live old leader and packet loss/delay",
+      "existing_shards": [
+        "chaos-cluster"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "ENOSPC, I/O errors, and corrupt recovery sources",
+      "existing_shards": [
+        "chaos-executor",
+        "chaos-ingress",
+        "chaos-cluster"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "Loss of unsynced disk writes rather than a process-only SIGKILL",
+      "incident": "https://github.com/junemartes/kardamom/issues/644",
+      "existing_shards": [
+        "chaos-integrity"
+      ],
+      "status": "pending; process kill must not be reported as power-loss proof"
+    },
+    {
+      "gap": "Canonical rewind invalidates already served receipts and derived caches",
+      "existing_shards": [
+        "chaos-integrity",
+        "chaos-cache"
+      ],
+      "status": "pending; existing fleet wipe quiesces and posts user transactions before rewind"
+    },
+    {
+      "gap": "Recovered sequencer makes progress while its healthy twin is disabled",
+      "existing_shards": [
+        "chaos-sequencer"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "Persist divergence evidence through restart and allocation collection; deployed negative control",
+      "existing_shards": [
+        "chaos-executor",
+        "chaos-integrity"
+      ],
+      "status": "live 404 rejection implemented; durable evidence and negative control pending"
+    },
+    {
+      "gap": "Mixed senders, lanes, contract storage and subscriptions under sustained faults",
+      "existing_shards": [
+        "chaos-sequencer",
+        "chaos-combined-exec"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "Load lasts throughout the fault and recovery, with measured RTO and latency/throughput budgets",
+      "existing_shards": [
+        "all existing shards"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "Nomad, Consul and DNS control-plane loss while the data plane stays live",
+      "existing_shards": [
+        "chaos-coordinated"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "Populated old deployment layouts and crash/open/clean-restart/upgrade sequence",
+      "incident": "https://github.com/junemartes/kardamom/issues/825",
+      "existing_shards": [
+        "chaos-carry",
+        "chaos-integrity"
+      ],
+      "status": "pending; compare egress reference mark with stored records, not only its prior value"
+    }
+  ],
+  "validation": {
+    "runtime_product_files_changed": false,
+    "service_wiring_changed": false,
+    "performance_claim": "No Cluster or general throughput speedup is claimed. Product changes require identical-workload baseline measurements.",
+    "completed": [
+      {
+        "check": "chaos library unit tests",
+        "result": "188 passed, 2 ignored",
+        "command": "CARGO_TARGET_DIR=/home/dev/kardamom-integ/target cargo test -p kardamom-chaos --lib --locked"
+      },
+      {
+        "check": "just style",
+        "result": "passed; Cargo reports an existing future-incompatibility notice for proc-macro-error2 2.0.1"
+      },
+      {
+        "check": "format registry against baseline commit",
+        "result": "passed"
+      }
+    ],
+    "pending": [
+      "full CI",
+      "repeat full CI at same head",
+      "per-shard runtime comparison",
+      "client p50/p95/p99 and throughput comparison for any product changes"
+    ]
+  }
+}
