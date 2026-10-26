@@ -158,6 +158,17 @@
       "observed": "The 120-minute job limit cancels case 7 after six cases pass. In carry-executors-rest, main load finishes at 04:40:33; the rollout finishes at about 04:56:46. The case passes after fault work with no background load.",
       "cause": "Full deployment steps take longer than the fixed load windows and the shard budget. Completion of the load is not checked after injection.",
       "status": "fix in unpublished wip/chaos-owned-load-20261026; further validation required"
+    },
+    {
+      "id": "canonical-carry-ingress-seal-observer",
+      "classification": "product",
+      "observed": "CPX32 predeployment warmup: all 120000 transactions receive successful receipts and all six account endpoints agree, but the seal histogram has no samples and the seal stamp queue fills.",
+      "cause": "ClusterWatermarkObserver discards EgressItem::Tx, which decodes both RT_TX and relayed full references. The canonical count and sealed transaction hash never reach the quorum gate or latency clock.",
+      "change": "Observe each canonical transaction index and canonical ID through the same progress event as legacy references.",
+      "verification": [
+        "Golden RT_TX and full-reference egress frames both fail with no progress event before the fix."
+      ],
+      "status": "regression and combined CI pending"
     }
   ],
   "coverage": [
