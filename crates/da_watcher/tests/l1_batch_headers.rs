@@ -4,12 +4,14 @@
 //! block order with its parent and its timestamp.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use alloy_primitives::B256;
 use alloy_provider::ProviderBuilder;
 use alloy_rpc_types_eth::{Block, BlockNumberOrTag, Header};
 use jsonrpsee::server::{RpcModule, Server, ServerHandle};
-use kardamom_da_watcher::{L1Source, RpcL1Source};
+use kardamom_da_watcher::sources::{L1Endpoints, SourceHalt};
+use kardamom_da_watcher::{L1Source, L1SourceError, RpcL1Source};
 use kardamom_l1_fault_proxy::{Fault, FaultProxy};
 
 fn hash(number: u64) -> B256 {
@@ -41,11 +43,49 @@ async fn fake_l1() -> (SocketAddr, ServerHandle) {
     module
         .register_method("eth_getBlockByNumber", |params, (), _| {
             let (tag, _full): (BlockNumberOrTag, bool) = params.parse().unwrap();
-            let number = tag.as_number().unwrap();
+            let number = tag.as_number().unwrap_or(10);
             serde_json::to_value(block(number)).unwrap()
         })
         .unwrap();
     (addr, server.start(module))
+}
+
+#[tokio::test]
+async fn unresponsive_sources_cannot_hold_the_follower_read_forever() {
+    let (l1, _server) = fake_l1().await;
+    let proxy = FaultProxy::spawn(&format!("http://{l1}"), "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let sources = L1Endpoints {
+        rpcs: vec![proxy.url(), format!("{}/second", proxy.url())],
+        light_client: None,
+    }
+    .connect()
+    .await
+    .unwrap()
+    .backoff(Duration::from_secs(2));
+    assert_eq!(sources.finalized_block_number().await.unwrap(), 10);
+    proxy.set_fault(Fault::Unresponsive { all_sources: true });
+    let result = tokio::time::timeout(Duration::from_secs(35), sources.finalized_block_number())
+        .await
+        .expect("a stalled provider must return control so the follower can halt");
+    assert!(matches!(
+        result,
+        Err(L1SourceError::Halt(SourceHalt::NoQuorum { .. }))
+    ));
+    proxy.set_fault(Fault::None);
+    let requests = proxy.served();
+    assert!(matches!(
+        sources.finalized_block_number().await,
+        Err(L1SourceError::Halt(SourceHalt::NoQuorum { .. }))
+    ));
+    assert_eq!(
+        proxy.served(),
+        requests,
+        "the backoff sends no provider requests"
+    );
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert_eq!(sources.finalized_block_number().await.unwrap(), 10);
 }
 
 #[tokio::test]

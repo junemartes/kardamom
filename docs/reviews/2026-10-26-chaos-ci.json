@@ -101,7 +101,8 @@
         "The real peer-seed regression fails with NoSuchFileException before the correction and passes after it.",
         "Stale Raft recording removed while executor catalog and recording contents survive peer-seed retries.",
         "Full Java check: 208 core and 414 service tests, zero failures, including allocation gates.",
-        "Final merged Java tree: ./gradlew check passes 615 tests, including live Aeron peer seed and open nested-catalog fixtures; no failures, errors or skips."
+        "Final merged Java tree: ./gradlew check passes 615 tests, including live Aeron peer seed and open nested-catalog fixtures; no failures, errors or skips.",
+        "Final merged tree: 625 checks pass, including 615 tests and 10 allocation checks; earlier branch counts are not the merged-tree total."
       ],
       "source": "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/PeerSeed.java",
       "product_bug": true
@@ -186,6 +187,27 @@
         "A regression reproduces the missing overlap rejection.",
         "All 14 audit tests pass, including completing the failed round before a new round is accepted."
       ]
+    },
+    {
+      "id": "unbounded-l1-source-reads",
+      "classification": "product",
+      "source": "crates/da_watcher/src/sources.rs",
+      "observed": "Two configured providers accept HTTP calls but send no reply. finalized_block_number remains pending past 35 seconds; the follower has no returned error to raise its halt or rotate the sources.",
+      "cause": "The set joins all provider reads without a deadline. The default HTTP transport has no configured request timeout. An established but silent connection differs from an immediate HTTP refusal.",
+      "change": "Bound each member read, including light-client reads and all log/header methods, to 30 seconds. Timeout becomes a provider error and uses the existing source rotation, halt, and backoff rules. HTTP and WebSocket selection stays unchanged.",
+      "product_bug": true,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "hot_path_detail": "The L1 read path adds a deadline per source operation. It changes failure timing. Admission and execution add no work. Full deployed workload comparison remains pending.",
+      "reason_missed": "Scripted source mocks return answers or errors. Earlier transport faults answer 503/429 immediately. No case holds every provider connection open without a response.",
+      "status": "Real HTTP regression fails before the deadline, then passes with source-out halt, no requests during backoff, and automatic recovery. Full CI pending.",
+      "verification": [
+        "Before: /tmp/chaos-gaps-l1-deadline-before.log (35-second bound expires).",
+        "After: /tmp/chaos-gaps-l1-deadline-after.log (3 tests pass, including deadline/backoff/recovery).",
+        "15 fault-proxy tests pass, including control availability during two provider timeouts.",
+        "32 watcher library tests and 14 source-set integration tests pass.",
+        "193 chaos tests pass (2 ignored), 15 fault-proxy tests pass; workspace style passes."
+      ]
     }
   ],
   "coverage": [
@@ -237,7 +259,7 @@
       "existing_shards": [
         "chaos-follower"
       ],
-      "status": "case implemented; awaiting CI; all-provider timeout still pending"
+      "status": "The existing follower case covers 503, 429, and both providers accepting requests without replies. The last fault exposes an unbounded product read; a 30-second per-source deadline returns control for halt and backoff. Real HTTP deadline/backoff/recovery regression passes; deployed CI pending."
     },
     {
       "gap": "V2 refusal and offer recovery across session changes, halt, and downgrade",
@@ -300,7 +322,7 @@
       "existing_shards": [
         "chaos-sequencer"
       ],
-      "status": "Isolated lane-0 restart proof implemented with an established sender and a frozen healthy twin; awaiting CI. Lane rotation pending."
+      "status": "Four isolated recovery proofs run in the existing sequencer-replica-kill case: both nodes of both lanes. Each uses a reserved established sender, checks publication by the recovered replica, and verifies its healthy twin stays frozen. 193 local chaos tests pass; deployed CI pending."
     },
     {
       "gap": "Persist divergence evidence through restart and allocation collection; deployed negative control",
@@ -460,11 +482,18 @@
       "commit": "8c3c81a5e1e0",
       "url": "https://github.com/junemartes/kardamom/pull/844",
       "status": "CI pending; owned-load coverage correction; diagnostic only"
+    },
+    {
+      "pull_request": 845,
+      "commit": "08d31a3227f870abb14ea83f1a3c0ab5cecd953c",
+      "workflow_run": 40277103561,
+      "url": "https://github.com/junemartes/kardamom/pull/845",
+      "status": "CI pending; replay lifetime correction; diagnostic only"
     }
   ],
   "integration": {
     "reviewed_head": "2c051fc9a3c978a05a7f98bc35dad174f246e32a",
     "changes": "Peer-seed retry regression and wording, canonical contract cursor for provider recovery, carry-only 180-minute limit, egress stream diagnostics, and early-failure round-overlap rejection. Merge retains owned-load control, replay cancellation, and full allocation artifacts.",
-    "verification": "Merged tree checks pending; no frozen-head round started."
+    "verification": "Merged tree: 615 Java tests and 10 allocation checks pass (202 core tests + 6 core allocation checks, 413 service tests + 4 service allocation checks). Workspace style, 14 CI audit tests, 193 chaos tests (2 ignored), 15 proxy tests, 32 watcher library tests, 14 source-set tests and the three real HTTP header/deadline tests pass."
   }
 }
