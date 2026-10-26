@@ -183,10 +183,7 @@ impl Evidence {
     /// Returns an error if no election closes within `max`.
     pub async fn cluster_elected(&self, max: Duration) -> anyhow::Result<Elected> {
         let budget = Budget::new(max, Duration::from_secs(3));
-        let outcome = poll::until(budget, |_| async move {
-            Ok(Elected::from_member_logs(&self.member_logs().await?))
-        })
-        .await?;
+        let outcome = poll::until(budget, |_| self.election_once()).await?;
         outcome
             .or_fail(|t| {
                 crate::chaos_fail!(
@@ -195,6 +192,10 @@ impl Evidence {
                 )
             })
             .map(|(elected, _)| elected)
+    }
+
+    pub(crate) async fn election_once(&self) -> anyhow::Result<Option<Elected>> {
+        Ok(Elected::from_member_logs(&self.member_logs().await?))
     }
 
     /// Whether any validator allocation logged `halted on divergence`.
@@ -244,10 +245,12 @@ impl Elected {
     /// with them, closed their elections in one term.
     fn from_member_logs(logs: &[String]) -> Option<Self> {
         let views: Vec<MemberView> = logs.iter().map(|l| MemberView::parse(l)).collect();
-        let (leader, term) = views.iter().find_map(|v| v.leader.zip(v.closed_term))?;
-        let closed = views.iter().filter(|v| v.closed_term == Some(term)).count();
         let majority = usize::try_from(SEALER_MEMBERS / 2 + 1).ok()?;
-        (closed >= majority).then_some(Self { leader, term })
+        views.iter().find_map(|view| {
+            let (leader, term) = view.leader.zip(view.closed_term)?;
+            let closed = views.iter().filter(|v| v.closed_term == Some(term)).count();
+            (closed >= majority).then_some(Self { leader, term })
+        })
     }
 }
 
@@ -459,6 +462,28 @@ mod tests {
         ];
         assert_eq!(
             Elected::from_member_logs(&majority),
+            Some(Elected { leader: 1, term: 4 })
+        );
+    }
+
+    #[test]
+    fn a_stale_leader_cannot_hide_the_new_majoritys_closed_election() {
+        let logs = [
+            member(
+                0,
+                "cluster role=LEADER memberId=0\ncluster ELECTION memberId=0 state=CLOSED commitPosition=1 logLeadershipTermId=3\n",
+            ),
+            member(
+                1,
+                "cluster role=LEADER memberId=1\ncluster ELECTION memberId=1 state=CLOSED commitPosition=2 logLeadershipTermId=4\n",
+            ),
+            member(
+                2,
+                "cluster role=FOLLOWER memberId=2\ncluster ELECTION memberId=2 state=CLOSED commitPosition=2 logLeadershipTermId=4\n",
+            ),
+        ];
+        assert_eq!(
+            Elected::from_member_logs(&logs),
             Some(Elected { leader: 1, term: 4 })
         );
     }
