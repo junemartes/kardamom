@@ -47,7 +47,8 @@ impl Run<'_> {
         self.redeploy(|c| c.lockbox = Some(lockbox)).await?;
         self.version(Upgrade::on(FEATURE_SEALER_V4), 4).await?;
         self.version(Upgrade::on(FEATURE_SEALER_V5), 5).await?;
-        Lanes::new(self.h).await_version(5).await
+        Lanes::new(self.h).await_version(5).await?;
+        super::deposits::across_provider_fault(self.h).await
     }
 
     /// Step 2: a parked offer uses the version at release after a downgrade.

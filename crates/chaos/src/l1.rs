@@ -13,6 +13,9 @@ use serde_json::{Value, json};
 use crate::harness::Harness;
 use crate::poll::{self, Budget};
 
+mod deposit;
+pub(crate) use deposit::Deposit;
+
 /// The proxy's JSON-RPC pipe and control endpoint on the aux node
 /// (`ports.l1_fault_proxy` in `group_vars/all.yml`).
 pub const FAULT_PROXY_PORT: u16 = 8547;

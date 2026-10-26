@@ -26,6 +26,8 @@ pub(crate) use disagreement::follower_disagreement;
 pub(crate) use follower_loss::{
     instance_loss as follower_instance_loss, total_loss as follower_total_loss,
 };
+pub(crate) use followers::{Followers, await_resume};
+pub(crate) use halt::await_followers_halted;
 pub(crate) use liar::liar;
 pub(crate) use null_receipts::null_receipts;
 pub(crate) use outage::batcher_outage_past_retention;

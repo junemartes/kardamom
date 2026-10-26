@@ -6,6 +6,9 @@
 //! same way. The balance probe drives the ingress's account layers for
 //! the Redis cases.
 
+mod deposit;
+pub(crate) use deposit::ReceiptPosition;
+
 use std::time::Duration;
 
 use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
@@ -209,7 +212,11 @@ impl Rpc {
     }
 
     pub(crate) async fn account_state(&self, account: u32) -> anyhow::Result<AccountState> {
-        let address = Self::genesis_signer(account)?.address;
+        self.account_state_at(Self::genesis_signer(account)?.address)
+            .await
+    }
+
+    pub(crate) async fn account_state_at(&self, address: Address) -> anyhow::Result<AccountState> {
         let nonce = self.nonce_at(address).await?;
         let value = self
             .call(

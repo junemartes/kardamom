@@ -34,7 +34,7 @@ const ARCHIVE_BUDGET: Duration = Duration::from_secs(240);
 /// One sample of both followers. A failed scrape stays `None`: it is
 /// evidence, not zero.
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct Followers {
+pub(crate) struct Followers {
     watcher_paused: Option<i64>,
     batcher_paused: Option<i64>,
     watcher_origin: Option<i64>,
@@ -70,7 +70,7 @@ impl Followers {
     /// The first sample where both followers show progress. A case
     /// cannot start before it: its halt and resume judgments compare
     /// against these gauges.
-    pub(super) async fn ready(h: &Harness, ctx: &str) -> anyhow::Result<Self> {
+    pub(crate) async fn ready(h: &Harness, ctx: &str) -> anyhow::Result<Self> {
         let last = std::cell::Cell::new(Self::default());
         let last_ref = &last;
         let outcome = poll::until(
@@ -97,7 +97,7 @@ impl Followers {
     /// gauges here, and `before` (the sample before the lie) is already
     /// behind it. A follower restarted under the lie has no gauge yet;
     /// its value from `before` stands in.
-    pub(super) async fn at_clear(h: &Harness, l1: &L1, before: Self) -> anyhow::Result<Self> {
+    pub(crate) async fn at_clear(h: &Harness, l1: &L1, before: Self) -> anyhow::Result<Self> {
         let now = Self::read(h).await.or(before);
         l1.clear_faults().await?;
         Ok(now)
@@ -159,7 +159,7 @@ fn rose(now: Option<i64>, base: Option<i64>) -> bool {
 }
 
 /// Both followers move again past `base`.
-pub(super) async fn await_resume(h: &Harness, base: Followers, ctx: &str) -> anyhow::Result<()> {
+pub(crate) async fn await_resume(h: &Harness, base: Followers, ctx: &str) -> anyhow::Result<()> {
     let last = std::cell::Cell::new(base);
     let last_ref = &last;
     let outcome = poll::until(

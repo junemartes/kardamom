@@ -10,7 +10,8 @@
 //! 1. `carry-versions-on`: a lockbox on L1, a deploy that gives its
 //!    address to the L1 follower, then features 3 and 4 by upgrade
 //!    transaction. Every member runs decision version 5, and every
-//!    sequencer keeps it.
+//!    sequencer keeps it. Three native deposits cross a provider outage,
+//!    preserve source-hash receipt order, and credit every executor exactly.
 //! 2. `carry-held-offer-after-downgrade`: the v2 loop parks nonce `n + 1`
 //!    under version 5. Feature 4 turns off, and every member and lane
 //!    reaches version 4 before nonce `n` releases the held offer. Both
@@ -36,6 +37,7 @@
 //! Every upgrade transaction passes `just sealer-upgrade-check` first.
 
 mod activation;
+mod deposits;
 mod egress;
 mod members;
 mod switch;

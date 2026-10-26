@@ -238,12 +238,9 @@ struct Tool {
 /// root. The batcher posts the target block within a few seconds of
 /// the drain, so the run retries while the batches end before it.
 ///
-/// The run passes no `--lockbox`. The suite never deposits, so the L1
-/// epochs add no state, and the e2e scenario
-/// `da_parity_batcher_matches_validator` proves the deposit path. With
-/// the flag, the tool also refuses a block whose L1 origin step names
-/// more epochs than the chain holds. A chain that lost an epoch to an
-/// earlier fault, such as a da-watcher restart, has fewer.
+/// A carry deployment passes its lockbox, so reconstruction derives its
+/// upgrade and native deposit epochs from the same L1 logs. A deployment
+/// with no lockbox passes none. The tool then rebuilds only its DA payloads.
 pub(crate) struct Rebuild<'a> {
     pub(crate) harness: &'a Harness,
     /// The evidence directory; the DA copy and the rebuilt state land

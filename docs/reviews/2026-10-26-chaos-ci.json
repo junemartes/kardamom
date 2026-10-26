@@ -362,7 +362,7 @@
         "chaos-follower",
         "chaos-l1"
       ],
-      "status": "pending"
+      "status": "The existing carry-versions-on case reuses its installed lockbox. Native deposits before, during and after an all-provider unresponsive fault require exact direct-L1 source identities, increasing L1 nonce/log and L2 receipt order, no credit while halted, and exact cumulative balances/unchanged recipient nonce on every executor. Every provider fault is cleared on error. ABI bytes match cast calldata; malformed and wrong-hash receipts fail local controls. 207 local chaos tests pass; deployed validation pending. Deposits with other fault families and restart combinations remain open."
     },
     {
       "gap": "Asymmetric Raft partition with an isolated live old leader and packet loss/delay",
@@ -633,8 +633,9 @@
       "mirror-backlog-client-restart in the existing cache shard; total 74 scheduled cases",
       "One-way live-leader partition in the existing cluster shard; total 75 scheduled cases",
       "Preserve both transfer and DeFi reports and expose existing executor query counter deltas",
-      "Egress restart regression covers an unposted gap inside checked history and rejects a gap before it"
+      "Egress restart regression covers an unposted gap inside checked history and rejects a gap before it",
+      "Native deposits before/during/after provider loss within carry-versions-on; no extra shard, case account or deployment. Reuse exact lockbox logs for reconstruction."
     ],
-    "status": "214 engine tests (one manual profile ignored), 203 chaos tests (two ignored), 83 benchmark tests and workspace style pass. No service code changes after PR 848. Local test-only faults and report collection are ready for the next diagnostic candidate. PR 848 has green CI and docker workflows; all regular cluster shards and integrity are now running. Streak stays 0/10, and the final head is not frozen."
+    "status": "214 engine tests (one manual profile ignored), 207 chaos tests (two ignored), 83 benchmark tests, 14 audit tests and workspace style pass. No product service code changes after PR 848. Four non-cluster workflows on PR 848 are green; regular and integrity cluster shards are running. Follow-up coverage is not pushed while diagnostic evidence is collected. Streak stays 0/10; the final head is not frozen."
   }
 }
