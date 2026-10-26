@@ -537,3 +537,18 @@ fn the_tables_are_the_shards() {
         [3, 3, 1, 3, 5, 4, 2]
     );
 }
+
+#[test]
+fn floor_answers_include_both_versions_of_the_committed_live_layer() {
+    for source in ["local", "live", "redis", "ok"] {
+        let metrics = format!(
+            "kardamom_sequencer_nonce_lookup_requests_total{{partition=\"0\"}} 2\n\
+             kardamom_sequencer_nonce_lookups_total{{partition=\"0\",outcome=\"{source}\"}} 1\n"
+        );
+        assert!(Lookups::parse(&metrics).looked_up(), "{source}");
+    }
+    let failed = "kardamom_sequencer_nonce_lookup_requests_total 3\n\
+        kardamom_sequencer_nonce_lookups_total{outcome=\"error\"} 2\n\
+        kardamom_sequencer_nonce_lookups_total{outcome=\"timeout\"} 1\n";
+    assert!(!Lookups::parse(failed).looked_up());
+}

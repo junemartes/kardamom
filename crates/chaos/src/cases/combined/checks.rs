@@ -24,12 +24,16 @@ use super::refill::RefillBaseline;
 const CACHE_LOOKUPS: &str = "kardamom_cache_lookups_total";
 const STATE_HIT: &str = "outcome=\"state_hit\"";
 /// The sequencer's count of parks that asked for a floor, and its count
-/// of lookups by outcome. `ok` is an executor's answer, `redis` the
-/// projection's.
+/// of lookups by outcome. Answers can come from an executor, Redis,
+/// or committed account updates in the local live layer.
 const LOOKUP_REQUESTS: &str = "kardamom_sequencer_nonce_lookup_requests_total";
 const LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
-const FROM_EXECUTOR: &str = "outcome=\"ok\"";
-const FROM_REDIS: &str = "outcome=\"redis\"";
+const ANSWERED: [&str; 4] = [
+    "outcome=\"ok\"",
+    "outcome=\"redis\"",
+    "outcome=\"local\"",
+    "outcome=\"live\"",
+];
 /// How long the state-hit count of a restarted ingress may take to
 /// answer: a few scrapes past one that fails.
 const HITS_BUDGET: Budget = Budget {
@@ -292,15 +296,21 @@ impl Lookups {
             .scrape()
             .fetch(&h.probes.sequencer_lane0_target(i))
             .await?;
-        let count = |label| crate::metrics::sum_where(&body, LOOKUPS, label).unwrap_or(0);
-        Some(Self {
-            asked: crate::metrics::sum_where(&body, LOOKUP_REQUESTS, "").unwrap_or(0),
-            answered: count(FROM_EXECUTOR).saturating_add(count(FROM_REDIS)),
-        })
+        Some(Self::parse(&body))
+    }
+
+    pub(super) fn parse(body: &str) -> Self {
+        Self {
+            asked: crate::metrics::sum_where(body, LOOKUP_REQUESTS, "").unwrap_or(0),
+            // The answer count is an existence check. Saturation keeps it positive.
+            answered: ANSWERED.into_iter().fold(0i64, |total, label| {
+                total.saturating_add(crate::metrics::sum_where(body, LOOKUPS, label).unwrap_or(0))
+            }),
+        }
     }
 
     /// A replica that restarted with no floor parked a sender and asked
-    /// for its floor, and a source answered: the floor was looked up,
+    /// for its floor, and a committed source answered: the floor was looked up,
     /// not guessed.
     pub(super) fn looked_up(self) -> bool {
         self.asked > 0 && self.answered > 0
@@ -327,9 +337,10 @@ impl Lookups {
             Ok::<_, anyhow::Error>(all.then_some(lanes))
         })
         .await?;
+        let last = Self::read_lanes(h).await;
         let (lanes, elapsed) = outcome.or_fail(|t| {
             crate::chaos_fail!(
-                "{ctx}: a lane-0 replica did not look a floor up within {}s of its return: it guessed one, or its sender never parked",
+                "{ctx}: a lane-0 replica did not look a floor up within {}s of its return (last {last:?}): the case has no proof of a park and a committed answer",
                 t.as_secs()
             )
         })?;
