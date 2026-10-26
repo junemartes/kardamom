@@ -186,7 +186,7 @@ impl Baseline {
             self.account
         );
         anyhow::ensure!(
-            after.stale >= before.stale.saturating_add(2) && after.live == before.live,
+            after.bypassed(&before),
             "{CTX}: nonce and balance did not both bypass stale Redis on a local miss: {before:?} -> {after:?}"
         );
         anyhow::ensure!(
@@ -217,7 +217,8 @@ impl Baseline {
 #[derive(Debug)]
 struct Reader {
     stale: i64,
-    live: i64,
+    live_hits: i64,
+    live_misses: i64,
 }
 
 impl Reader {
@@ -228,12 +229,39 @@ impl Reader {
             .fetch(&h.probes.ingress_target(ingress))
             .await
             .context("restart client exporter is unavailable")?;
-        Ok(Self {
-            stale: metrics::sum_where(&body, "kardamom_cache_degraded_total", "reason=\"stale\"")
+        Ok(Self::parse(&body))
+    }
+
+    fn parse(body: &str) -> Self {
+        let live = body
+            .lines()
+            .filter(|line| line.contains("layer=\"live\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self {
+            stale: metrics::sum_where(body, "kardamom_cache_degraded_total", "reason=\"stale\"")
                 .unwrap_or(0),
-            live: metrics::sum_where(&body, "kardamom_cache_lookups_total", "layer=\"live\"")
+            live_hits: metrics::sum_where(&live, "kardamom_cache_lookups_total", "outcome=\"hit\"")
                 .unwrap_or(0),
-        })
+            live_misses: metrics::sum_where(
+                &live,
+                "kardamom_cache_lookups_total",
+                "outcome=\"miss\"",
+            )
+            .unwrap_or(0),
+        }
+    }
+
+    /// Each RPC misses the local layer and rejects the stale projection.
+    /// Local hits cannot establish the cold-read fallback proof.
+    fn bypassed(&self, before: &Self) -> bool {
+        self.live_hits == before.live_hits
+            && [
+                (self.stale, before.stale),
+                (self.live_misses, before.live_misses),
+            ]
+            .into_iter()
+            .all(|(after, before)| after.checked_sub(before).is_some_and(|delta| delta >= 2))
     }
 }
 
@@ -281,7 +309,43 @@ pub(crate) async fn client_restart(h: &mut Harness) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Heads;
+    use super::{Heads, Reader};
+
+    #[test]
+    fn cold_fallback_requires_live_misses_and_never_counts_them_as_hits() {
+        let after = Reader::parse(
+            "kardamom_cache_lookups_total{outcome=\"miss\",layer=\"live\",service=\"ingress\"} 2\n\
+            kardamom_cache_lookups_total{layer=\"redis\",outcome=\"hit\"} 100\n\
+            kardamom_cache_degraded_total{reason=\"stale\"} 2\n",
+        );
+        assert_eq!((after.stale, after.live_hits, after.live_misses), (2, 0, 2));
+        assert!(after.bypassed(&Reader::parse("")));
+        assert!(
+            !Reader {
+                live_hits: 1,
+                ..after
+            }
+            .bypassed(&Reader::parse(""))
+        );
+    }
+
+    #[test]
+    fn one_rpc_missing_either_proof_or_a_regressed_counter_fails() {
+        let before = Reader {
+            stale: 10,
+            live_hits: 3,
+            live_misses: 20,
+        };
+        let actual = |stale, live_misses| Reader {
+            stale,
+            live_misses,
+            live_hits: 3,
+        };
+        assert!(actual(12, 22).bypassed(&before));
+        for (stale, misses) in [(11, 22), (12, 21), (9, 22), (12, 19)] {
+            assert!(!actual(stale, misses).bypassed(&before));
+        }
+    }
 
     #[test]
     fn held_heads_require_three_complete_positive_position_tags() {

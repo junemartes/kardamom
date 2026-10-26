@@ -26,13 +26,14 @@
 
 #![cfg(feature = "cluster-e2e")]
 
-use kardamom_chaos::{Harness, Knobs, Lifecycle, Shard};
+use kardamom_chaos::{DeployVars, Harness, Knobs, Lifecycle, Shard};
 
 /// The two shards without chaos: the sustained load, and the
 /// chain-semantics suite.
 #[derive(Debug, Clone, Copy)]
 enum Stage {
     Load,
+    LoadV2,
     Semantics,
 }
 
@@ -40,6 +41,7 @@ impl Stage {
     fn name(self) -> &'static str {
         match self {
             Self::Load => "load",
+            Self::LoadV2 => "load-v2",
             Self::Semantics => "semantics",
         }
     }
@@ -49,7 +51,7 @@ impl Stage {
     /// runner sustains; the semantics shard runs no load.
     fn env(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Self::Load => &[
+            Self::Load | Self::LoadV2 => &[
                 ("LOAD_DURATION_S", "300"),
                 ("LOAD_TARGET_TPS", "300"),
                 ("LOAD_SENDERS", "6"),
@@ -58,9 +60,16 @@ impl Stage {
         }
     }
 
+    fn deploy_vars(self) -> DeployVars {
+        match self {
+            Self::LoadV2 => Shard::Sequencer.deploy_vars(),
+            Self::Load | Self::Semantics => DeployVars::default(),
+        }
+    }
+
     async fn run(self, harness: &Harness) -> anyhow::Result<()> {
         match self {
-            Self::Load => harness.soak().await,
+            Self::Load | Self::LoadV2 => harness.soak().await,
             Self::Semantics => harness.semantics().await,
         }
     }
@@ -127,8 +136,9 @@ async fn run_shard(shard: Shard) -> anyhow::Result<()> {
 }
 
 async fn run_stage(stage: Stage) -> anyhow::Result<()> {
-    let knobs = Knobs::read(stage.env())?;
-    let lifecycle = Lifecycle::in_workspace();
+    let vars = stage.deploy_vars();
+    let knobs = Knobs::deployed(stage.env(), &vars)?;
+    let lifecycle = Lifecycle::in_workspace().with_vars(vars);
     let contract = if reuse() {
         lifecycle.contract()?
     } else {
@@ -185,7 +195,12 @@ async fn shard_test(shard: Shard) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
 async fn load() {
+    assert!(
+        !reuse(),
+        "load compares fresh reference and carry deployments; unset KARDAMOM_CHAOS_REUSE"
+    );
     stage_test(Stage::Load).await;
+    stage_test(Stage::LoadV2).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

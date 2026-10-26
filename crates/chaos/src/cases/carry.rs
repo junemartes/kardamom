@@ -103,24 +103,23 @@ impl Step {
     /// transactions with their finality, and the restarts.
     pub(crate) fn floor(self, k: &Knobs) -> Duration {
         let inject = k.inject_delay;
+        let two_upgrades = upgrade::Upgrade::LOAD_WINDOW.saturating_mul(2);
         match self {
             // The first step has a deploy, two checked upgrades, and the
             // three-credit proof across a provider fault. Their load
             // windows add; each runtime proof keeps its own deadline.
             Self::VersionsOn => inject
                 .saturating_add(Duration::from_mins(40))
-                .saturating_add(Duration::from_mins(8))
+                .saturating_add(two_upgrades)
                 .saturating_add(Duration::from_mins(20))
                 .saturating_add(k.l1_fault),
             Self::ReadersOnEgress | Self::ExecutorFirst => inject + Duration::from_mins(40),
             // Two upgrade transactions and the held transfer.
-            Self::HeldOfferAfterDowngrade | Self::WindowOffOn => inject + Duration::from_mins(8),
-            Self::WindowOn => inject + k.restart_slo + Duration::from_mins(8),
+            Self::HeldOfferAfterDowngrade | Self::WindowOffOn => inject + two_upgrades,
+            Self::WindowOn => inject + k.restart_slo + upgrade::Upgrade::LOAD_WINDOW,
             // One staged executor roll for each move.
             Self::ExecutorsRest => inject + Duration::from_mins(80),
-            Self::LeaderKillAtSwitch => {
-                inject + k.leader_slo + k.restart_slo + Duration::from_mins(8)
-            }
+            Self::LeaderKillAtSwitch => inject + k.leader_slo + k.restart_slo + two_upgrades,
             Self::EgressRestart => inject + k.restart_slo + Duration::from_mins(2),
         }
     }

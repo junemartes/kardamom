@@ -56,6 +56,13 @@ pub struct Streamed {
     pub elapsed: Duration,
 }
 
+/// A task process, including an in-place restart of its Docker container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunningProcess {
+    pub(crate) cid: String,
+    pub(crate) started: String,
+}
+
 impl Nodes {
     /// Run `docker <args>` on the host, within the bound. The output is
     /// returned whatever the exit status; callers judge it.
@@ -310,6 +317,31 @@ impl Nodes {
             .await
             .ok()
             .filter(|s| !s.is_empty())
+    }
+
+    pub(crate) async fn running_process(&self, node: &str, task: &str) -> Option<RunningProcess> {
+        let cid = self.inner_cid(node, task).await?;
+        let started = self.started_at(node, &cid).await?;
+        Some(RunningProcess { cid, started })
+    }
+
+    /// Restrict evidence to this start, even when Docker keeps the same
+    /// container and its old log across a process restart.
+    pub(crate) async fn process_logs(
+        &self,
+        node: &str,
+        process: &RunningProcess,
+        tail: u32,
+    ) -> Option<String> {
+        self.exec(
+            node,
+            &format!(
+                "docker logs --since '{}' --tail {tail} {} 2>&1",
+                process.started, process.cid,
+            ),
+        )
+        .await
+        .ok()
     }
 
     /// The `StartedAt` timestamp of an inner container. A container name

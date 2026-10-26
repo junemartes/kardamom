@@ -2,6 +2,7 @@
 //! `ETHLockbox.initiateUpgrade` on the in-cluster L1.
 
 use std::fmt;
+use std::time::Duration;
 
 use crate::harness::Harness;
 use crate::l1::L1;
@@ -25,6 +26,10 @@ impl fmt::Display for Upgrade {
 }
 
 impl Upgrade {
+    /// Each checked upgrade owns a load allowance for the controller
+    /// gate, L1 finality, and the member and lane observations.
+    pub(super) const LOAD_WINDOW: Duration = Duration::from_mins(8);
+
     /// `feature` on at once.
     pub(super) const fn on(feature: u64) -> Self {
         Self {
