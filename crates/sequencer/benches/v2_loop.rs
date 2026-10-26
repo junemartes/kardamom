@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use alloy_primitives::U256;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use kardamom_obs::lifecycle::process;
 use kardamom_sequencer::admission::{AccountState, AdmissionConfig};
 use kardamom_sequencer::testkit::{Rig, one_partition_cfg, signed_envelope, signer};
 use kardamom_sequencer::v2::{AccountEvent, AdmissionLoop, V2Config};
@@ -91,10 +92,9 @@ fn seeded_loop() -> (AdmissionLoop, crossbeam_channel::Sender<AccountEvent>) {
     let (lookups_tx, _) = tokio::sync::mpsc::channel(16);
     let vslots = one_partition_cfg().vslot_set().unwrap();
     accounts_tx.send(rows(1, 0)).unwrap();
-    (
-        AdmissionLoop::new(cfg(), vslots, accounts_rx, lookups_tx),
-        accounts_tx,
-    )
+    let mut admission = AdmissionLoop::new(cfg(), vslots, accounts_rx, lookups_tx);
+    admission.enable_pause(process().subscribe());
+    (admission, accounts_tx)
 }
 
 fn bench_order(c: &mut Criterion, name: &str, nonce_at: fn(u64) -> u64) {

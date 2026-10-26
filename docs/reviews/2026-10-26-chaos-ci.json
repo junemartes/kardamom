@@ -359,6 +359,26 @@
       "service_wiring_changed": false,
       "hot_path_changed": false,
       "status": "Corrected locally; deployed validation pending."
+    },
+    {
+      "id": "v2-lifecycle-pause-not-wired",
+      "classification": "product",
+      "source": "crates/sequencer/src/v2/mod.rs and crates/sequencer/src/bin/kardamom-sequencer/feeds.rs",
+      "observed": "V2 consumes queued tx_data and publishes an outbox offer while the process lifecycle is paused. V1 follows the pause watch; V2 never subscribes to it.",
+      "cause": "The V2 wiring bypasses Sequencer::enable_pause and its loop has no pause gate. Reported lifecycle state and actual publication diverge.",
+      "reason_missed": "The chaos halt cases check reported lifecycle and ingress refusal. Quiet ingress during the halt leaves little queued work, so those checks do not force V2 publication while paused.",
+      "change": "Subscribe V2 to the existing process lifecycle. Use the existing cached PauseGate before flushing offers or polling input. Keep applying account events and dispatching their side effects so bounded account feeds can drain; ready offers wait for the clear. Move unchanged run/backoff methods into a sibling module to keep the parent below 500 code lines.",
+      "product_bug": true,
+      "service_wiring_changed": "V2 now subscribes to the existing in-process lifecycle watch. No deployment setting, network topology or transport changes.",
+      "hot_path_changed": true,
+      "hot_path_detail": "One cached watch-version read per V2 loop turn. The watch is borrowed only after its version changes.",
+      "before_test_log": "/tmp/chaos-gaps-v2-pause-before.log",
+      "verification": [
+        "With the pause input exposed, both intake and queued-offer controls fail before the behavior guard; they pass after it. A third control proves account rows drain while offers wait and are published once after clear.",
+        "188 sequencer library and 14 binary tests pass. Workspace style passes.",
+        "Five alternating pinned release pairs with a live clear watch: median in-order/reversed/verdict throughput differences -1.2%/+0.2%/-0.5%. Method, limits, estimates and raw samples are in docs/benches/2026-10-26-v2-pause-profile.json."
+      ],
+      "status": "Validated locally. The existing PR 849 candidate does not include this fix; deployed validation and full workload comparison remain pending."
     }
   ],
   "coverage": [
@@ -420,7 +440,7 @@
       "existing_shards": [
         "chaos-carry"
       ],
-      "status": "dependency covers new-session reoffer and release-time format; halt refusals pending"
+      "status": "Session and release-time format controls are implemented. New local controls expose missing lifecycle pause wiring: V2 continues intake and publication during a reported pause. The fix follows the existing process watch and drains account updates while offers wait. Local tests and controlled throughput comparison pass. Deployed queued-offer and broader halt-refusal proofs remain pending."
     },
     {
       "gap": "Posting freeze beyond every retention floor and exact resumed coverage",
@@ -519,7 +539,7 @@
   ],
   "validation": {
     "runtime_product_files_changed": true,
-    "service_wiring_changed": false,
+    "service_wiring_changed": "V2 now subscribes to the existing in-process lifecycle watch. No deployment setting, network topology or transport changes.",
     "performance_claim": "No speedup is claimed. Controlled alternating pinned release tee repeats show no observed steady latency or throughput regression. The RPC comparison is recorded separately. Full cluster workload comparison and ten green rounds remain required.",
     "completed": [
       {
@@ -573,6 +593,10 @@
       {
         "check": "V2 healthy cold-lookup release profile",
         "result": "No speedup claim. Final p50/p95/p99 and throughput are close to the baseline with mixed paired differences. This short shared-host microbenchmark cannot establish a full workload performance guarantee. Full cluster workload evidence and ten green rounds remain pending."
+      },
+      {
+        "check": "V2 pause regressions and resident-loop profile",
+        "result": "188 library tests, 14 binary tests, style and five alternating pinned release pairs complete. Full workload and deployed pause validation pending."
       }
     ],
     "pending": [
@@ -717,6 +741,23 @@
       "url": "https://github.com/junemartes/kardamom/actions/runs/40292596498",
       "status": "Diagnostic regular run: six failed shards (ingress, coordination, fleet, retention, executor, combined-exec). Carry is still running. Both standalone stages and combined ordering, cluster, cache, sequencer, L1 and follower pass. Separate integrity run 40292659324 succeeds. Four non-cluster workflows succeed. No qualifying round; 0/10.",
       "integrity_run": 40292659324
+    },
+    {
+      "commit": "9adefc86b488cb72ec46b290c3f08acff478ea2d",
+      "url": "https://github.com/junemartes/kardamom/pull/849",
+      "status": "Published diagnostic follow-up: CI, Docker and chain-semantics succeed. Regular cluster and integrity builds succeed and their shards run; static deployment checks still run. No qualifying round; 0/10. A separate local V2 lifecycle fix follows this candidate.",
+      "changes": [
+        "mirror-backlog-client-restart in the existing cache shard; total 74 scheduled cases",
+        "One-way live-leader partition in the existing cluster shard; total 75 scheduled cases",
+        "Preserve both transfer and DeFi reports and expose existing executor query counter deltas",
+        "Egress restart regression covers an unposted gap inside checked history and rejects a gap before it",
+        "Native deposits before/during/after provider loss within carry-versions-on; no extra shard, case account or deployment. Reuse exact lockbox logs for reconstruction.",
+        "Two empty Raft members and one intact data copy in the existing cluster shard; remove stale local seed staging from blank-member faults; 76 cases total",
+        "Keep client retries through intentional endpoint and chain-halt faults; stop pacing at its complete deadline and retain abort evidence.",
+        "Retry failed V2 account lookups without another request, bound retry concurrency and cancel on shutdown.",
+        "Carry-aware prune-floor proof with exact egress range comparison and scoped retention settings.",
+        "Keep the broken-image workload active through both Ansible passes and recovery."
+      ]
     }
   ],
   "integration": {
@@ -727,17 +768,9 @@
   "unpublished": {
     "workspace": "/home/dev/kardamom-chaos-gaps",
     "changes": [
-      "mirror-backlog-client-restart in the existing cache shard; total 74 scheduled cases",
-      "One-way live-leader partition in the existing cluster shard; total 75 scheduled cases",
-      "Preserve both transfer and DeFi reports and expose existing executor query counter deltas",
-      "Egress restart regression covers an unposted gap inside checked history and rejects a gap before it",
-      "Native deposits before/during/after provider loss within carry-versions-on; no extra shard, case account or deployment. Reuse exact lockbox logs for reconstruction.",
-      "Two empty Raft members and one intact data copy in the existing cluster shard; remove stale local seed staging from blank-member faults; 76 cases total",
-      "Keep client retries through intentional endpoint and chain-halt faults; stop pacing at its complete deadline and retain abort evidence.",
-      "Retry failed V2 account lookups without another request, bound retry concurrency and cancel on shutdown.",
-      "Carry-aware prune-floor proof with exact egress range comparison and scoped retention settings.",
-      "Keep the broken-image workload active through both Ansible passes and recovery."
+      "Wire the existing lifecycle pause gate into V2 without blocking account event draining.",
+      "Add intake, outbox and account-feed pause regressions. Benchmark the live clear gate in the resident V2 loop."
     ],
-    "status": "Follow-up review, final local checks and cold-lookup performance comparison in progress. Deployed validation pending. Final head is not frozen. Streak stays 0/10."
+    "status": "188 library tests, 14 binary tests and style pass. Controlled resident throughput comparison is recorded. Keep local while PR 849 diagnostic shards produce evidence; do not cancel or rerun them. Final head is not frozen; streak stays 0/10."
   }
 }

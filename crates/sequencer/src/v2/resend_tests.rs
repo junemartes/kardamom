@@ -16,6 +16,9 @@ use crate::outbound::fakes::InMemorySidePublisher;
 use crate::sealer_rules::{SealerRules, SealerVersion};
 use crate::testkit::{Rig, one_partition_cfg, pos, signed_envelope, signer};
 
+#[path = "pause_tests.rs"]
+mod pause_tests;
+
 /// A loop that keeps the version of `shared`, with room in its outbox for
 /// every offer of a test, and a sender with the chain nonce 0.
 struct Bench {
@@ -74,12 +77,16 @@ impl Bench {
     /// Send the transaction at `nonce`, at its own place in the image, and
     /// run the loop until it is idle.
     fn send(&mut self, nonce: u64) {
+        self.queue(nonce);
+        self.run();
+    }
+
+    fn queue(&mut self, nonce: u64) {
         let at = pos(64 * (i32::try_from(nonce).unwrap() + 1));
         self.rig.push(
             TxDataLoc::new(7, at),
             signed_envelope(&self.signer, nonce, 1),
         );
-        self.run();
     }
 
     fn run(&mut self) {
