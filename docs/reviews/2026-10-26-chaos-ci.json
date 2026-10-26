@@ -82,43 +82,72 @@
       ]
     },
     {
-      "id": "peer-seed-deletes-live-executor-archive",
+      "id": "peer-seed-collocated-archive-deletion",
       "classification": "product",
-      "job": 121399758442,
-      "case": "cluster-member-rejoin",
-      "url": "https://github.com/junemartes/kardamom/actions/runs/40267573235/job/121399758442",
-      "observed": "Member 1 rejoins through block 510, then its executor stalls at 521 while peers reach 634. exec_txs recordings time out. Preserving archive/dir in the harness alone does not fix it.",
-      "cause": "PeerSeed.seeded calls StateDir.clear on the member archive parent. Its recursive walk deletes the independent live executor archive in archive/dir.",
-      "reason_missed": "Earlier reference-born topology places executors on separate nodes. Existing peer-seed JUnit fixtures contain only member archive files.",
-      "change": "Use flat-file archive cleanup while retaining recursive cleanup for consensus and retained state. Preserve independent nested archive directories.",
-      "hot_path_changed": false,
+      "source": "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/PeerSeed.java",
+      "observed": "A real Aeron peer-seed regression deletes archive/dir/archive.catalog while the Raft member retries without peers. The executor archive is a separate live component.",
+      "cause": "PeerSeed recursively clears the Raft archive parent, including child archives.",
+      "change": "Clear only root files for the Raft archive. Preserve recursive cleanup for the dedicated cluster and retained-file directories.",
+      "product_bug": true,
       "service_wiring_changed": false,
-      "status": "fix validated locally; full CI pending",
+      "hot_path_changed": false,
+      "status": "validated locally; combined CI pending",
       "verification": [
-        "The new live-catalog regression fails before the cleanup fix and passes after it.",
-        "All 615 Java tests pass (202 core, 413 service).",
-        "192 chaos library tests pass, 2 ignored; just style passes.",
         "The real peer-seed regression fails with NoSuchFileException before the correction and passes after it.",
         "Stale Raft recording removed while executor catalog and recording contents survive peer-seed retries.",
         "Full Java check: 208 core and 414 service tests, zero failures, including allocation gates.",
-        "Final merged Java tree: ./gradlew check passes 615 tests, including live Aeron peer seed and open nested-catalog fixtures; no failures, errors or skips.",
-        "Final merged tree: 625 checks pass, including 615 tests and 10 allocation checks; earlier branch counts are not the merged-tree total."
-      ],
-      "source": "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/PeerSeed.java",
-      "product_bug": true
+        "Final merged Java tree: ./gradlew check passes 615 tests, including live Aeron peer seed and open nested-catalog fixtures; no failures, errors or skips."
+      ]
     },
     {
-      "id": "provider-refusal-process-counter-reset",
-      "classification": "harness",
-      "job": 121399758434,
-      "case": "l1-transport-refusals",
-      "url": "https://github.com/junemartes/kardamom/actions/runs/40267573235/job/121399758434",
-      "observed": "The canonical L1 posting record stays flat, but the test fails on a changed batcher post counter. The batcher restarts after provider retries exhaust, resetting its counter.",
-      "cause": "A per-process counter is compared for equality across a fault that can restart the process. A reset is incorrectly reported as a new post.",
-      "change": "Keep exact on-chain record equality during refusal. Require a higher durable contract batch index after clearing each refusal, independent of process restarts.",
-      "hot_path_changed": false,
+      "id": "carry-job-wall-budget",
+      "classification": "ci budget",
+      "job": 121376240086,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40260202176/job/121376240086",
+      "observed": "The 120-minute job passes six carry cases and the intermediate persisted-state audit, then is cancelled during the seventh case while the pipeline still advances.",
+      "change": "Allow 180 minutes only for chaos-carry. Keep all nine cases, state checks and per-case recovery deadlines. Other shards retain 120 minutes.",
+      "product_bug": false,
       "service_wiring_changed": false,
-      "status": "assertion corrected; CI pending"
+      "hot_path_changed": false,
+      "status": "combined CI pending",
+      "verification": [
+        "First executor cut-over passes persisted account, storage, code, header, receipt and index parity.",
+        "L1 reconstruction verifies 303155 transactions and matches the validator root before cancellation.",
+        "Actionlint validates the matrix-specific timeout expression."
+      ]
+    },
+    {
+      "id": "audit-early-failure-round-overlap",
+      "classification": "audit tool",
+      "source": "scripts/ci/green_streak.py:Streak.validate_order",
+      "observed": "An early failed round can open another round while its other workflows are still running.",
+      "change": "Require every workflow of the prior round to be completed before accepting the next round. Retain the failed outcome.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "validated locally; combined CI pending",
+      "verification": [
+        "A regression reproduces the missing overlap rejection.",
+        "All 14 audit tests pass, including completing the failed round before a new round is accepted."
+      ]
+    },
+    {
+      "id": "provider-counter-reset",
+      "classification": "harness",
+      "case": "l1-transport-refusals",
+      "job": 121399758434,
+      "observed": "The on-chain posting record stays flat during HTTP 503. The batcher exits after refusals and restarts, resetting its process counter. Counter inequality falsely reports a new post.",
+      "change": "Keep exact on-chain record equality during refusal. Require a higher durable contract batch index after clearing each refusal, independent of process restarts.",
+      "status": "fix awaiting CI"
+    },
+    {
+      "id": "combined-sealer-validator-stall",
+      "classification": "unresolved",
+      "case": "ingress-sealer-loss-recover",
+      "job": 121399758458,
+      "observed": "All executor heads advance beyond 870 and recovery probes deliver every transaction. The validator and batcher egress readers remain at index 82106, next block 595 after a full cluster outage.",
+      "change": "Capture every executor and egress frame-forwarding metric and HTTP range cursor on failure. Keep the validator recovery assertion and timeout unchanged.",
+      "status": "unresolved; merge requires green combined-head recovery"
     },
     {
       "id": "carry-shard-budget-and-expired-load",
@@ -143,15 +172,16 @@
       ]
     },
     {
-      "id": "validator-carried-input-stall-after-ingress-sealer-loss",
-      "classification": "under investigation",
-      "job": 121399758458,
-      "case": "ingress-sealer-loss-recover",
-      "url": "https://github.com/junemartes/kardamom/actions/runs/40267573235/job/121399758458",
-      "observed": "All client completeness and recovery probes pass, but validator stays at block 594 while executors reach 873. It alternates service/feed Silent faults at cursor (82106,595). The integration review also identifies the batcher egress reader at the same cursor.",
-      "status": "preserved log /tmp/chaos-gaps-pr839-ordering.log; root cause and reproducer pending",
-      "evidence_gap": "The existing printed head, tail, and filtered events omit the replay transition that first stalls. Full available allocation logs and task-state metadata are now retained as a failure artifact for the next iteration. Nomad rotation and collection can still remove old logs.",
-      "change": "Capture every executor and egress frame-forwarding metric and HTTP range cursor on failure. Keep the validator recovery assertion and timeout unchanged."
+      "id": "canonical-carry-ingress-seal-observer",
+      "classification": "product",
+      "observed": "CPX32 predeployment warmup: all 120000 transactions receive successful receipts and all six account endpoints agree, but the seal histogram has no samples and the seal stamp queue fills.",
+      "cause": "ClusterWatermarkObserver discards EgressItem::Tx, which decodes both RT_TX and relayed full references. The canonical count and sealed transaction hash never reach the quorum gate or latency clock.",
+      "change": "Observe each canonical transaction index and canonical ID through the same progress event as legacy references.",
+      "verification": [
+        "Golden RT_TX and full-reference egress frames both fail with no progress event before the fix.",
+        "Both golden frames pass after the fix; all 133 ingress library tests pass."
+      ],
+      "status": "validated locally; full CI pending"
     },
     {
       "id": "abandoned-egress-http-replays",
@@ -174,21 +204,6 @@
       ]
     },
     {
-      "id": "audit-early-failure-round-overlap",
-      "classification": "audit tool",
-      "source": "scripts/ci/green_streak.py:Streak.validate_order",
-      "observed": "An early failed round can open another round while its other workflows are still running.",
-      "change": "Require every workflow of the prior round to be completed before accepting the next round. Retain the failed outcome.",
-      "product_bug": false,
-      "service_wiring_changed": false,
-      "hot_path_changed": false,
-      "status": "validated locally; combined CI pending",
-      "verification": [
-        "A regression reproduces the missing overlap rejection.",
-        "All 14 audit tests pass, including completing the failed round before a new round is accepted."
-      ]
-    },
-    {
       "id": "unbounded-l1-source-reads",
       "classification": "product",
       "source": "crates/da_watcher/src/sources.rs",
@@ -208,6 +223,20 @@
         "32 watcher library tests and 14 source-set integration tests pass.",
         "193 chaos tests pass (2 ignored), 15 fault-proxy tests pass; workspace style passes."
       ]
+    },
+    {
+      "id": "validator-evicted-receipt-waits",
+      "classification": "product",
+      "issue": 847,
+      "source": "crates/validator/src/buffers.rs",
+      "observed": "On staging release 0d34d78b, a CPX32 five-minute 4k TPS soak successfully receipts all 1200000 offers. The validator misses the 180s state catch-up bound, records 1935343 evicted receipt replica results, and then advances a missing receipt about once per five seconds while background inserts continue.",
+      "cause": "The bounded verification buffer forgets discarded tail keys. Near the live head, neither the distance shortcut nor the idle shortcut proves them unavailable, so each known-lost result consumes a fresh wait.",
+      "change": "Keep a bounded set of discarded keys, give an available result priority, and report known evictions unavailable without another wait. Retain four-key catch-up evidence for older discarded keys. Reinserted and late data remain available for comparison. Withdrawals clear obsolete eviction and quiet state.",
+      "verification": [
+        "Before-fix regression consumes the full two-second wait and fails.",
+        "All 142 validator library tests pass, including bounded evidence, live unrelated traffic, replacement data, withdrawal invalidation and isolated far-key coverage."
+      ],
+      "status": "validated locally; full CI and postdeployment 4k benchmark pending"
     }
   ],
   "coverage": [
@@ -401,15 +430,11 @@
       },
       {
         "check": "ten-round audit utility",
-        "result": "13 tests pass; real GitHub run and job evidence reads verified"
+        "result": "14 tests pass, including rejecting overlap after an early failure; real GitHub evidence reads verified"
       },
       {
-        "check": "peer-seed recovery regression",
-        "result": "Fails before the fix; passes after. All 615 Java tests pass."
-      },
-      {
-        "check": "chaos library tests after canonical posting assertion fix",
-        "result": "192 passed, 2 ignored"
+        "check": "sealer Java recovery and allocation gates",
+        "result": "622 tests pass: 208 core and 414 service"
       }
     ],
     "pending": [
@@ -419,7 +444,7 @@
       "10 consecutive complete green CI rounds on the final unchanged commit",
       "Deployed validation of the 72 scheduled cases, including the scoped canary genesis and guard restoration"
     ],
-    "ci_wiring_changed": "Retain load/profile evidence; add suite=all to the cluster workflow without changing normal PR/scheduled selection; make static validation dispatchable; test the persistent ten-round audit utility in CI.",
+    "ci_wiring_changed": "Retain load/profile evidence; add suite=all to the cluster workflow without changing normal PR/scheduled selection; make static validation dispatchable; test the persistent ten-round audit utility in CI. The serial carry rollout has a 180-minute job budget; all per-case recovery deadlines remain unchanged.",
     "streak_command": "python3 scripts/ci/green_streak.py --branch BRANCH --head FULL_SHA --state AUDIT.json --poll --run CI_ID --run CLUSTER_ID --run DOCKER_ID --run SEMANTICS_ID --run VALIDATION_ID",
     "streak_dispatch": [
       {
@@ -452,14 +477,21 @@
       "commit": "a510a518685864b3cf9419dd52c0535040108f15",
       "workflow_run": 40267573235,
       "url": "https://github.com/junemartes/kardamom/actions/runs/40267573235",
-      "status": "cluster run cancelled after preserving member-rejoin, provider-refusal assertion, and validator-stall failures; fixes continue on descendants"
+      "status": "in progress"
     },
     {
       "pull_request": 840,
       "commit": "5e2ce0523bc9b27889af69b8061dde66aa259bd4",
       "workflow_run": 40268972862,
       "url": "https://github.com/junemartes/kardamom/actions/runs/40268972862",
-      "status": "cancelled externally at 2026-10-26T05:58:59Z; follower oracle failure retained; cache and sequencer deployed recovery verdicts incomplete"
+      "status": "in progress"
+    },
+    {
+      "pull_request": 839,
+      "commit": "a510a518685864b3cf9419dd52c0535040108f15",
+      "workflow_run": 40267573235,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40267573235",
+      "status": "cluster run cancelled after preserving member-rejoin, provider-refusal assertion, and validator-stall failures; fixes continue on descendants"
     },
     {
       "pull_request": 841,
@@ -478,13 +510,27 @@
       "commit": "743d590e",
       "workflow_run": 40275014189,
       "url": "https://github.com/junemartes/kardamom/actions/runs/40275014189",
-      "status": "cancelled externally; archive fix included in integration head 2c051fc9; no qualifying round"
+      "status": "in progress; diagnostic only, not a qualifying frozen-head round"
     },
     {
       "pull_request": 844,
       "commit": "8c3c81a5e1e0",
       "url": "https://github.com/junemartes/kardamom/pull/844",
       "status": "CI pending; owned-load coverage correction; diagnostic only"
+    },
+    {
+      "pull_request": 840,
+      "commit": "5e2ce0523bc9b27889af69b8061dde66aa259bd4",
+      "workflow_run": 40268972862,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40268972862",
+      "status": "cancelled externally at 2026-10-26T05:58:59Z; follower oracle failure retained; cache and sequencer deployed recovery verdicts incomplete"
+    },
+    {
+      "pull_request": 843,
+      "commit": "743d590e",
+      "workflow_run": 40275014189,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40275014189",
+      "status": "cancelled externally; archive fix included in integration head 2c051fc9; no qualifying round"
     },
     {
       "pull_request": 845,
@@ -500,8 +546,8 @@
     }
   ],
   "integration": {
-    "reviewed_head": "2c051fc9a3c978a05a7f98bc35dad174f246e32a",
-    "changes": "Peer-seed retry regression and wording, canonical contract cursor for provider recovery, carry-only 180-minute limit, egress stream diagnostics, and early-failure round-overlap rejection. Merge retains owned-load control, replay cancellation, and full allocation artifacts.",
+    "reviewed_head": "30bf66483eda44a5746347c34a9c3a30d4461a92",
+    "changes": "Peer-seed retry regression and wording, canonical contract cursor for provider recovery, carry-only 180-minute limit, egress stream diagnostics, and early-failure round-overlap rejection. Merge retains owned-load control, replay cancellation, and full allocation artifacts. Canonical carry transactions now update ingress seal latency and quorum progress; both golden wire formats have regression coverage.",
     "verification": "Merged tree: 615 Java tests and 10 allocation checks pass (202 core tests + 6 core allocation checks, 413 service tests + 4 service allocation checks). Workspace style, 14 CI audit tests, 193 chaos tests (2 ignored), 15 proxy tests, 32 watcher library tests, 14 source-set tests and the three real HTTP header/deadline tests pass."
   },
   "unpublished": {

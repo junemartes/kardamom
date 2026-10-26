@@ -11,7 +11,7 @@
 //! gate releases parked submits against.
 //!
 //! The same tap is the `Sealed` publisher of the status stream: every
-//! relayed `TxRef` names the transaction the sealer gave a canonical index.
+//! canonical transaction or relayed `TxRef` names the transaction the sealer indexed.
 //! The ingress decodes these frames already, so it reports the sealed
 //! hash next to the durable position and never touches the sealer.
 //!
@@ -45,7 +45,7 @@ pub enum Observed {
 
 /// What one egress frame moved: the durable position, once the count
 /// passed zero, and the hash of the transaction the frame sealed, when
-/// the frame relayed a `TxRef`. A deposit, an epoch, or a boundary seals
+/// the frame carries a canonical transaction or a `TxRef`. A deposit, an epoch, or a boundary seals
 /// no user transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EgressProgress {
@@ -98,6 +98,9 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
                 self.watermark.observe_record(index),
                 Self::sealed_hash(&msg),
             ),
+            Ok(EgressItem::Tx { index, tx }) => {
+                (self.watermark.observe_record(index), Some(tx.canonical_id))
+            }
             Ok(EgressItem::Boundary(b)) => (
                 self.watermark.observe_boundary(b.end_tx_idx.as_index()),
                 None,
@@ -133,9 +136,8 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
                 | EgressItem::OriginGap { .. },
             ) => return ControlFlow::Continue(()),
             // The watermark moves on relayed records and boundaries. A
-            // canonical entry, a relayed reference and a feed gap do not
-            // move it.
-            Ok(EgressItem::Tx { .. } | EgressItem::RelayedRef(_) | EgressItem::FeedGap { .. }) => {
+            // relayed reference and a feed gap do not move it.
+            Ok(EgressItem::RelayedRef(_) | EgressItem::FeedGap { .. }) => {
                 return ControlFlow::Continue(());
             }
             Err(e) => {
@@ -216,6 +218,34 @@ mod tests {
         let ingress = encode_ingress_txref(&r, GuardHeader::EXEMPT);
         let (_cid, relayed) = split_ingress(&ingress).unwrap();
         encode_egress_record(index, relayed).unwrap()
+    }
+
+    /// Both carry versions relay a transaction as a canonical entry.
+    #[test]
+    fn canonical_entries_advance_quorum_and_report_the_sealed_hash() {
+        let golden = include_str!("../../cluster-adapter/testdata/wire_golden.txt");
+        for name in ["tx_egress", "txref_offer_egress"] {
+            let frame = golden
+                .lines()
+                .find_map(|line| {
+                    let (key, bytes) = line.split_once(' ')?;
+                    (key == name).then(|| alloy_primitives::hex::decode(bytes).unwrap())
+                })
+                .unwrap();
+            let egress = FakeEgress::new();
+            egress.push(frame);
+            egress.close();
+            let mut observer = ClusterWatermarkObserver::new(egress);
+            assert_eq!(
+                observer.next_event(),
+                Some(Observed::Progress(EgressProgress {
+                    durable: Some(BPosition::from_index(5)),
+                    sealed: Some(B256::repeat_byte(0xAB)),
+                })),
+                "{name} must release the quorum gate and match the ingress publish stamp"
+            );
+            assert_eq!(observer.next_event(), None);
+        }
     }
 
     #[test]

@@ -381,3 +381,95 @@ fn a_rollback_withdraws_every_bal_above_its_block() {
     );
     assert_eq!(bals.len(), 0, "block 3 is withdrawn");
 }
+
+/// A discarded tail is unavailable even while unrelated live results arrive.
+#[test]
+fn an_evicted_result_near_the_live_head_does_not_wait_again() {
+    let bals = BalBuffer::with_cap(NonZeroUsize::new(8).unwrap());
+    (0..=12).for_each(|block| insert(&bals, R1, block, block));
+    (0..8).for_each(|block| {
+        assert_eq!(bals.take(block, Duration::ZERO).current.len(), 1);
+    });
+    let producer = Arc::clone(&bals);
+    let thread = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(10));
+        insert(&producer, R1, 13, 13);
+        std::thread::sleep(Duration::from_millis(10));
+        insert(&producer, R1, 14, 14);
+    });
+    let started = std::time::Instant::now();
+    let taken = bals.take(12, Duration::from_secs(2));
+    assert!(
+        taken.current.is_empty(),
+        "the discarded result stays unverified"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "known eviction must not consume its wait window"
+    );
+    thread.join().unwrap();
+}
+
+#[test]
+fn a_reinserted_evicted_result_is_still_checked() {
+    let bals = BalBuffer::with_cap(NonZeroUsize::new(2).unwrap());
+    (1..=3).for_each(|block| insert(&bals, R1, block, block));
+    assert_eq!(bals.take(1, Duration::ZERO).current.len(), 1);
+    insert(&bals, R2, 3, 42);
+    assert_eq!(
+        balances(&bals.take(3, Duration::ZERO)),
+        [(U256::from(42), vec![R2])]
+    );
+}
+
+#[test]
+fn eviction_evidence_is_bounded_and_still_proves_an_older_backlog() {
+    let bals = BalBuffer::with_cap(NonZeroUsize::new(8).unwrap());
+    (0..=100).for_each(|block| insert(&bals, R1, block, block));
+    {
+        let inner = bals.core.inner.lock().unwrap();
+        assert_eq!(inner.map.len(), 8);
+        assert_eq!(inner.evicted.len(), 8);
+    }
+    (0..8).for_each(|block| {
+        assert_eq!(bals.take(block, Duration::ZERO).current.len(), 1);
+    });
+    let started = std::time::Instant::now();
+    assert!(bals.take(20, Duration::from_secs(2)).current.is_empty());
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn a_withdrawal_forgets_evictions_and_waits_for_replacement_data() {
+    let bals = BalBuffer::with_cap(NonZeroUsize::new(2).unwrap());
+    (1..=3).for_each(|block| insert(&bals, R1, block, block));
+    bals.take(1, Duration::ZERO);
+    bals.withdraw(|_, _, _| false);
+    let producer = Arc::clone(&bals);
+    let thread = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        insert(&producer, R2, 3, 42);
+    });
+    assert_eq!(
+        balances(&bals.take(3, Duration::from_secs(2))),
+        [(U256::from(42), vec![R2])]
+    );
+    thread.join().unwrap();
+}
+
+#[test]
+fn one_evicted_key_far_ahead_does_not_skip_a_live_result() {
+    let bals = BalBuffer::with_cap(NonZeroUsize::MIN);
+    insert(&bals, R1, 0, 0);
+    insert(&bals, R1, 10_000, 10_000);
+    let producer = Arc::clone(&bals);
+    let thread = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        insert(&producer, R2, 1, 42);
+    });
+    assert_eq!(
+        balances(&bals.take(1, Duration::from_secs(2))),
+        [(U256::from(42), vec![R2])]
+    );
+    thread.join().unwrap();
+}

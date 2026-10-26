@@ -19,7 +19,6 @@ use serde::Deserialize;
 use crate::poll::{self, Budget};
 
 /// The burn address of every load transfer.
-/// The burn address of every load transfer.
 pub const SINK: Address = address!("000000000000000000000000000000000000dEaD");
 
 /// The verdict fields the suite reads back from the report.
