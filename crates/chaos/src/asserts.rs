@@ -459,8 +459,8 @@ impl Harness {
     }
 
     /// The restarted-replica health probe: the sequencer exporter at
-    /// `target` answers with sequencer samples. Established-sender
-    /// coverage stays on the twin, by design.
+    /// `target` answers with sequencer samples. A separate transaction
+    /// probe proves that the replica can order an established sender.
     ///
     /// # Errors
     ///
@@ -485,7 +485,7 @@ impl Harness {
             )
         })?;
         crate::log(format!(
-            "restarted replica on {} (:{}) is up and exporting ({samples} sequencer metrics; established-sender coverage stays on the twin)",
+            "restarted replica on {} (:{}) is up and exporting ({samples} sequencer metrics)",
             target.name,
             target.port()
         ));

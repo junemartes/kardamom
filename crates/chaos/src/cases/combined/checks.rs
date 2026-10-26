@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use crate::cases::cache::{MirrorRebuilds, wait_readers_recovered};
+use crate::cases::cache::{CacheRecovery, wait_readers_recovered};
 use crate::cases::coordinated::assert_no_ref_below_floor;
 use crate::cases::da_watcher::assert_no_origin_gap;
 use crate::evidence::{SEALER_MEMBERS, number_after};
@@ -45,8 +45,8 @@ pub(super) struct Baseline {
     /// The counters and the runs of the da-watcher, when a check asks
     /// for a refill.
     refill: Option<RefillBaseline>,
-    /// The finished rebuilds in the state-mirror logs.
-    rebuilds: MirrorRebuilds,
+    /// Per-mirror rebuild evidence and exact idle account values.
+    rebuilds: Option<CacheRecovery>,
     /// A transfer receipted through ingress-0 before the fault. Its
     /// receipt lives in the memory caches of the ingresses, which their
     /// restart empties, so a restarted ingress can serve it only from an
@@ -69,9 +69,14 @@ impl Baseline {
         } else {
             None
         };
+        let rebuilds = if checks.contains(&Check::EveryMirrorRebuilt) {
+            Some(CacheRecovery::capture(h).await?)
+        } else {
+            None
+        };
         Ok(Self {
             refill,
-            rebuilds: MirrorRebuilds::read(h).await?,
+            rebuilds,
             receipted,
         })
     }
@@ -373,7 +378,14 @@ impl Check {
             Self::NoRefBelowFloor => assert_no_ref_below_floor(h, ctx).await,
             Self::EpochRefill => baseline.assert_refill(h, ctx).await,
             Self::ReceiptFromState => baseline.assert_receipt_from_state(h, ctx).await,
-            Self::EveryMirrorRebuilt => baseline.rebuilds.await_all(h, ctx).await,
+            Self::EveryMirrorRebuilt => {
+                baseline
+                    .rebuilds
+                    .as_ref()
+                    .ok_or_else(|| crate::chaos_fail!("{ctx}: no cache recovery baseline"))?
+                    .await_restored(h, ctx)
+                    .await
+            }
             Self::ReadersRecovered => wait_readers_recovered(h, ctx).await,
             Self::FloorsLookedUp => Lookups::assert_every_lane(h, ctx).await,
         }

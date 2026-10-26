@@ -89,6 +89,14 @@ pub struct Signed {
     pub hash: String,
 }
 
+/// Account values read while its sender stays idle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AccountState {
+    pub(crate) address: Address,
+    pub(crate) nonce: u64,
+    pub(crate) balance: U256,
+}
+
 /// A JSON-RPC client of one ingress.
 #[derive(Debug, Clone)]
 pub struct Rpc {
@@ -198,6 +206,30 @@ impl Rpc {
     /// Returns an error if the signer cannot derive or the call fails.
     pub async fn nonce_of(&self, account: u32) -> anyhow::Result<u64> {
         self.nonce_at(Self::genesis_signer(account)?.address).await
+    }
+
+    pub(crate) async fn account_state(&self, account: u32) -> anyhow::Result<AccountState> {
+        let address = Self::genesis_signer(account)?.address;
+        let nonce = self.nonce_at(address).await?;
+        let value = self
+            .call(
+                "eth_getBalance",
+                serde_json::json!([format!("{address}"), "latest"]),
+            )
+            .await?;
+        let text = value
+            .as_str()
+            .context("the balance is not a JSON quantity")?;
+        let balance = U256::from_str_radix(
+            text.strip_prefix("0x")
+                .context("the balance has no 0x prefix")?,
+            16,
+        )?;
+        Ok(AccountState {
+            address,
+            nonce,
+            balance,
+        })
     }
 
     /// The signer of genesis account `account` of the dev mnemonic.

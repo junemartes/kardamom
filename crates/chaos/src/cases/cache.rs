@@ -17,16 +17,16 @@
 use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
-use kardamom_bench::mnemonic::derive_signers;
 
 use crate::harness::Harness;
 use crate::nomad::SavedJob;
 use crate::poll::{self, Budget};
 use crate::probes::Probed;
-use crate::rpc::{ANVIL_MNEMONIC, Rpc};
+use crate::rpc::Rpc;
 
+mod coverage;
 mod rebuilds;
-pub(crate) use rebuilds::MirrorRebuilds;
+pub(crate) use coverage::CacheRecovery;
 
 const DEGRADED: &str = "kardamom_cache_degraded_total";
 const LOOKUPS: &str = "kardamom_cache_lookups_total";
@@ -408,7 +408,7 @@ async fn mirror_write_retries(h: &Harness) -> i64 {
 pub(crate) async fn redis_total_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "redis-total-loss-recover";
     wait_readers_connected(h, ctx).await?;
-    let rebuilds0 = MirrorRebuilds::read(h).await?;
+    let recovery = CacheRecovery::capture(h).await?;
     let retries0 = mirror_write_retries(h).await;
     let job = SavedJob::capture(&h.nomad, "redis").await?;
     crate::log(format!(
@@ -423,10 +423,9 @@ pub(crate) async fn redis_total_loss_recover(h: &mut Harness) -> anyhow::Result<
     restored?;
     h.assert_count("redis", REDIS_ALLOCS, h.knobs.reschedule_slo)
         .await?;
-    let master = wait_primary_named(h, ctx).await?;
-    rebuilds0.await_all(h, ctx).await?;
+    wait_primary_named(h, ctx).await?;
     wait_mirror_advances(h, ctx).await?;
-    assert_chaos_account_projected(h, ctx, &master).await?;
+    recovery.await_restored(h, ctx).await?;
     wait_readers_recovered(h, ctx).await?;
     h.assert_group_never_restarted("redis", "sentinel", ctx)
         .await?;
@@ -520,13 +519,13 @@ async fn partitioned_phase(h: &Harness, ctx: &str) -> anyhow::Result<()> {
 
 /// The three mirrors hard-killed and the projection flushed: the
 /// restarted mirrors find Redis cold, rebuild from the executors'
-/// newest checkpoint, and the head advances again. The first chaos
-/// account, funded at genesis because the load spends it, proves the
-/// rebuild wrote the checkpoint's accounts, not only the live rows.
+/// newest checkpoint, and the head advances again. Exact values for an
+/// idle used sender and an untouched funded account prove the rebuild
+/// restores checkpoint coverage beyond the new live rows.
 pub(crate) async fn mirror_kill_rebuild(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "mirror-kill-rebuild";
     wait_readers_connected(h, ctx).await?;
-    let rebuilds0 = MirrorRebuilds::read(h).await?;
+    let recovery = CacheRecovery::capture(h).await?;
     let nodes: Vec<String> = h
         .probes
         .executors
@@ -550,9 +549,8 @@ pub(crate) async fn mirror_kill_rebuild(h: &mut Harness) -> anyhow::Result<()> {
     ));
     h.assert_count("state-mirror", MIRROR_ALLOCS, h.knobs.restart_slo)
         .await?;
-    rebuilds0.await_all(h, ctx).await?;
     wait_mirror_advances(h, ctx).await?;
-    assert_chaos_account_projected(h, ctx, &master).await?;
+    recovery.await_restored(h, ctx).await?;
     wait_readers_recovered(h, ctx).await?;
     h.assert_progress().await
 }
@@ -586,44 +584,4 @@ pub(crate) async fn freeze_and_flush(
         .await
         .map_err(|e| crate::chaos_fail!("{ctx}: FLUSHALL on {master} failed: {e}"))?;
     Ok(master)
-}
-
-/// The first chaos account has a projected row: the rebuild scanned
-/// the checkpoint, so an account the flush emptied is present again.
-async fn assert_chaos_account_projected(
-    h: &Harness,
-    ctx: &str,
-    master: &str,
-) -> anyhow::Result<()> {
-    let count = h
-        .knobs
-        .account_base
-        .checked_add(1)
-        .ok_or_else(|| crate::chaos_fail!("{ctx}: the chaos account index overflows"))?;
-    let address = derive_signers(ANVIL_MNEMONIC, count)?
-        .pop()
-        .ok_or_else(|| crate::chaos_fail!("{ctx}: no chaos signer"))?
-        .signer
-        .address();
-    let script = redis_cli(&format!("-h {master} -p 6379 HLEN acct:{address}"));
-    let script = &script;
-    let outcome = poll::until(Budget::secs(120, 5), |_| async move {
-        let fields: i64 = h
-            .nodes
-            .exec(&aux(h), script)
-            .await?
-            .trim()
-            .parse()
-            .unwrap_or(0);
-        Ok::<_, anyhow::Error>((fields > 0).then_some(fields))
-    })
-    .await?;
-    outcome
-        .or_fail(|t| {
-            crate::chaos_fail!(
-                "{ctx}: chaos account {address} has no projected row within {}s of the rebuild",
-                t.as_secs()
-            )
-        })
-        .map(|_| ())
 }

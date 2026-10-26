@@ -28,6 +28,7 @@ mod member_storage;
 pub(crate) mod recorded_cursor;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
+mod sequencer_recovery;
 pub(crate) mod squeeze;
 pub(crate) mod validator;
 
@@ -297,7 +298,9 @@ impl Case {
     pub fn window(self, k: &Knobs) -> Duration {
         let inject = k.inject_delay;
         let floor = match self {
-            Self::SequencerReplicaKill => inject + k.restart_slo + Duration::from_mins(1),
+            Self::SequencerReplicaKill => {
+                inject + k.restart_slo + sequencer_recovery::SequencerRecovery::PROOF_WINDOW
+            }
             Self::SequencerLapse => inject + k.seq_lapse + Duration::from_mins(1),
             Self::ValidatorLapse => inject + k.validator_lapse + Duration::from_mins(1),
             Self::RetentionOverrun

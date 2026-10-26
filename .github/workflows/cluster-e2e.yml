@@ -353,14 +353,24 @@ jobs:
         env:
           KARDAMOM_STAGED: "1"
 
-      - name: Preserve state and load evidence
+      - name: Preserve load and latency reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-load-${{ matrix.shard }}
+          path: |
+            /tmp/chaos-*.json
+            /tmp/kardamom-load.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Preserve failed state evidence
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: chaos-evidence-${{ matrix.shard }}
           path: |
             /tmp/chaos-state-*/**
-            /tmp/chaos-*.json
           if-no-files-found: ignore
           retention-days: 3
 

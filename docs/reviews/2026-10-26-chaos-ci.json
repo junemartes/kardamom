@@ -83,7 +83,7 @@
         "chaos-cache",
         "chaos-combined-exec"
       ],
-      "status": "per-mirror evidence implemented; interrupted scan and exact account assertions pending"
+      "status": "Per-mirror evidence and exact nonce/balance comparison for a used idle sender and untouched funded account implemented; awaiting CI. Interrupted scans pending."
     },
     {
       "gap": "DA lag halt, canary page inhibition, and prune floor in scheduled runs",
@@ -170,7 +170,7 @@
       "existing_shards": [
         "chaos-sequencer"
       ],
-      "status": "pending"
+      "status": "Isolated lane-0 restart proof implemented with an established sender and a frozen healthy twin; awaiting CI. Lane rotation pending."
     },
     {
       "gap": "Persist divergence evidence through restart and allocation collection; deployed negative control",
@@ -219,15 +219,18 @@
     "completed": [
       {
         "check": "chaos library unit tests",
-        "result": "188 passed, 2 ignored",
-        "command": "CARGO_TARGET_DIR=/home/dev/kardamom-integ/target cargo test -p kardamom-chaos --lib --locked"
+        "result": "192 passed, 2 ignored"
       },
       {
         "check": "just style",
-        "result": "passed; Cargo reports an existing future-incompatibility notice for proc-macro-error2 2.0.1"
+        "result": "passed; existing proc-macro-error2 future-incompatibility notice"
       },
       {
-        "check": "format registry against baseline commit",
+        "check": "format registry against PR 839 head",
+        "result": "passed"
+      },
+      {
+        "check": "workflow YAML lint",
         "result": "passed"
       }
     ],
@@ -236,6 +239,16 @@
       "repeat full CI at same head",
       "per-shard runtime comparison",
       "client p50/p95/p99 and throughput comparison for any product changes"
-    ]
-  }
+    ],
+    "ci_wiring_changed": "Retain successful and failed load report JSON artifacts for 14 days. Keep large state evidence limited to failures."
+  },
+  "iterations": [
+    {
+      "pull_request": 839,
+      "commit": "a510a518685864b3cf9419dd52c0535040108f15",
+      "workflow_run": 40267573235,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40267573235",
+      "status": "in progress"
+    }
+  ]
 }
