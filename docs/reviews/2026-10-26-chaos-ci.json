@@ -12,7 +12,7 @@
     "green_requires_repeated_full_runs_of_the_same_head": true,
     "failures_require_classification_before_retry": true,
     "required_consecutive_green_rounds": 10,
-    "green_round_definition": "Every required workflow and affected chaos coverage completes successfully on one unchanged final commit. Failure resets the streak. Incomplete or cancelled rounds do not count.",
+    "green_round_definition": "Five explicit workflow_dispatch runs on the same frozen branch and head: CI, cluster-e2e with suite=all, docker-e2e, chain-semantics-e2e, and cluster-validate. Every existing chaos shard and both stages must be green. Failure, cancellation, or missing coverage resets the streak. Incomplete rounds do not advance it; partial reruns cannot replace complete rounds.",
     "green_streak": 0,
     "final_commit": null
   },
@@ -268,6 +268,10 @@
       {
         "check": "release RPC and serial-admission comparison",
         "result": "5 before and 5 after repeats, 400 samples per phase per repeat; raw samples checked in"
+      },
+      {
+        "check": "ten-round audit utility",
+        "result": "13 tests pass; real GitHub run and job evidence reads verified"
       }
     ],
     "pending": [
@@ -276,7 +280,32 @@
       "Full cluster workload comparison",
       "10 consecutive complete green CI rounds on the final unchanged commit"
     ],
-    "ci_wiring_changed": "Keep successful load reports for 14 days and preserve account-cache profile JSONL, labeled by build profile. CI records debug profile samples; the checked-in comparison uses release builds."
+    "ci_wiring_changed": "Retain load/profile evidence; add suite=all to the cluster workflow without changing normal PR/scheduled selection; make static validation dispatchable; test the persistent ten-round audit utility in CI.",
+    "streak_command": "python3 scripts/ci/green_streak.py --branch BRANCH --head FULL_SHA --state AUDIT.json --poll --run CI_ID --run CLUSTER_ID --run DOCKER_ID --run SEMANTICS_ID --run VALIDATION_ID",
+    "streak_dispatch": [
+      {
+        "workflow": "ci.yml",
+        "inputs": {}
+      },
+      {
+        "workflow": "cluster-e2e.yml",
+        "inputs": {
+          "suite": "all"
+        }
+      },
+      {
+        "workflow": "docker-e2e.yml",
+        "inputs": {}
+      },
+      {
+        "workflow": "chain-semantics-e2e.yml",
+        "inputs": {}
+      },
+      {
+        "workflow": "cluster-validate.yml",
+        "inputs": {}
+      }
+    ]
   },
   "iterations": [
     {

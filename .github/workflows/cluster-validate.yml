@@ -17,6 +17,7 @@ on:
   # request that leaves deploy/cluster alone, so that pull request could
   # never merge.
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
