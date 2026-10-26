@@ -6,10 +6,11 @@ import java.util.List;
  * When a member is stable after its start, and its {@link StartHold} ends.
  *
  * <p>A member is stable when it holds a settled role with a closed election,
- * its service applied the start of a leadership term, and every peer reports
- * the same term with a closed election. A service applies the start of a
- * term only when the leader committed it, so the leader committed an entry
- * in that term. A peer that does not answer cannot agree. After a full
+ * its service restored or applied the current consensus term, and every
+ * peer reports the same term with a closed election. The applied term
+ * comes from snapshot recovery metadata or a committed term entry. It is
+ * reported only while it matches the current consensus term. A peer that
+ * does not answer cannot agree. After a full
  * restart a dead member must not block the chain, so after the stall limit a
  * majority that agrees is enough. A member with no known peers is stable
  * once its own election closes.</p>
@@ -60,8 +61,8 @@ record StartHoldRule(int peers, long stallLimitMs) {
      * The member's own view.
      *
      * @param settled whether it holds a settled role with a closed election
-     * @param term the leadership term whose start its service applied last,
-     *     or -1 before any
+     * @param term the current consensus term restored or applied by the
+     *     service, or -1 before it is known
      */
     record Own(boolean settled, long term) {
     }

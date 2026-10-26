@@ -294,7 +294,8 @@ public final class ClusterNode {
             final JoinWatchdogThread.Member watched = new JoinWatchdogThread.Member(memberId, consensus,
                 container.context(), stop, PeerProbe.forMembers(clusterMembers, memberId, adminPort()));
             new StartHoldThread(new StartHoldThread.Member(memberId, consensus.clusterNodeRoleCounter(),
-                consensus.electionStateCounter(), launched::leadershipTermId,
+                consensus.electionStateCounter(),
+                () -> launched.leadershipTermId(consensus.leadershipTermIdCounter()),
                 PeerProbe.forMembers(clusterMembers, memberId, adminPort()), stop),
                 startHold, watched.timeouts().stallLimitMs()).start();
             // The watchdog starts last. A start-up step that throws before it
@@ -359,6 +360,7 @@ public final class ClusterNode {
             consensus.clusterNodeRoleCounter(),
             consensus.electionStateCounter(),
             consensus.commitPositionCounter(),
+            consensus.leadershipTermIdCounter(),
             service,
             stateDir);
         // The driver created the CnC file before the launch returned.
@@ -388,6 +390,7 @@ public final class ClusterNode {
         private final AtomicCounter role;
         private final AtomicCounter election;
         private final AtomicCounter commitPosition;
+        private final AtomicCounter leadershipTerm;
         private final SealerClusteredService service;
         /** A directory on the disk of the member state: the log and the retained file. */
         private final Path stateDir;
@@ -397,12 +400,14 @@ public final class ClusterNode {
                 final AtomicCounter role,
                 final AtomicCounter election,
                 final AtomicCounter commitPosition,
+                final AtomicCounter leadershipTerm,
                 final SealerClusteredService service,
                 final Path stateDir) {
             this.memberId = memberId;
             this.role = role;
             this.election = election;
             this.commitPosition = commitPosition;
+            this.leadershipTerm = leadershipTerm;
             this.service = service;
             this.stateDir = stateDir;
         }
@@ -417,7 +422,7 @@ public final class ClusterNode {
                 MemberStatus.SnapshotVersions.of(service.latestSnapshotVersion()),
                 service.decisionRules(),
                 diskFreeBytes())
-                .withStart(service.leadershipTermId(), service.holdingAtStart())
+                .withStart(service.leadershipTermId(leadershipTerm), service.holdingAtStart())
                 .withCarry(service.metrics().carry())
                 .withGenesis(service.genesisFeatures());
         }

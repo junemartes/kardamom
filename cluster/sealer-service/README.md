@@ -807,13 +807,15 @@ After its start, a member holds its outputs until the members are stable: its se
 
 The hold ends once per process start, at the first of these:
 
-- **All.** The member holds a settled role with a closed election, its service applied the start of a term, and every peer reports the same term with a closed election.
+- **All.** The member holds a settled role with a closed election, its service restored or applied the current consensus term, and every peer reports the same term with a closed election.
 - **Partial restart.** A majority agrees as above, and both of these are true:
   - A peer in the majority reports `startHold` `false`. That peer did not restart, or it already found the members stable.
   - Every peer that answered in any round since the start agrees now. A leader of a higher term is a live member with an open election, and it answers its status, so it holds the member. A peer that never answered was down for the whole hold.
 - **Majority.** A majority agrees after the stall limit (see above).
 
 A running member alone is not enough. Two members that restart together while the third runs can still give the running member two votes. A peer of an older release states no `startHold`, so it never opens the partial release. The member logs `cluster START-HOLD released memberId=.. term=.. verdict=ALL|PARTIAL_RESTART|MAJORITY heldMs=.. answers=../.. heard=..`.
+
+Snapshot recovery metadata supplies the committed term of a restored service. A same-term restart needs no new term event. Until the applied term matches the current consensus term, status reports `leadershipTermId=-1` and the startup hold remains.
 
 ## Log lines
 

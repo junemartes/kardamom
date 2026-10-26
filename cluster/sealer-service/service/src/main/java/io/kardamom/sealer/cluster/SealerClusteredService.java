@@ -6,6 +6,7 @@ import io.aeron.cluster.codecs.CloseReason;
 import io.aeron.cluster.service.ClientSession;
 import io.aeron.cluster.service.Cluster;
 import io.aeron.cluster.service.ClusteredService;
+import io.aeron.cluster.service.RecoveryState;
 import io.aeron.logbuffer.Header;
 import io.kardamom.sealer.Boundary;
 import io.kardamom.sealer.CanonicalSealerState;
@@ -30,6 +31,8 @@ import java.util.concurrent.TimeUnit;
 import org.agrona.DirectBuffer;
 import org.agrona.concurrent.AgentTerminationException;
 import org.agrona.concurrent.UnsafeBuffer;
+import org.agrona.concurrent.status.AtomicCounter;
+import org.agrona.concurrent.status.CountersReader;
 
 /**
  * Thin Aeron Cluster {@link ClusteredService} that sends all deterministic
@@ -407,8 +410,24 @@ public final class SealerClusteredService implements ClusteredService {
         // An unreadable or empty snapshot image is fatal. Restarting silently
         // at genesis would diverge from the rest of the cluster, which assumes
         // the snapshotted state (and the log replayed after it) is correct.
-        start(cluster, Optional.ofNullable(snapshotImage)
-            .map(image -> SnapshotIo.readSnapshot(image, cluster.idleStrategy())));
+        final Optional<byte[]> snapshot = Optional.ofNullable(snapshotImage)
+            .map(image -> SnapshotIo.readSnapshot(image, cluster.idleStrategy()));
+        start(cluster, snapshot);
+        leadershipTermId = snapshot.isPresent() ? snapshotLeadershipTerm() : -1L;
+    }
+
+    /** The committed term of the loaded snapshot, even when replay contains no new term entry. */
+    private long snapshotLeadershipTerm() {
+        final CountersReader counters = cluster.aeron().countersReader();
+        final int counter = RecoveryState.findCounterId(counters, cluster.context().clusterId());
+        if (counter == CountersReader.NULL_COUNTER_ID) {
+            throw new IllegalStateException("snapshot recovery state counter is missing");
+        }
+        final long term = RecoveryState.getLeadershipTermId(counters, counter);
+        if (term < 0) {
+            throw new IllegalStateException("snapshot recovery state has no committed leadership term");
+        }
+        return term;
     }
 
     /** Start from {@code snapshot} when there is one, else from the seed or at genesis. */
@@ -1773,9 +1792,10 @@ public final class SealerClusteredService implements ClusteredService {
         return work;
     }
 
-    /** The leadership term whose start this service applied last, or -1 before any. */
-    long leadershipTermId() {
-        return leadershipTermId;
+    /** The committed term when it matches the member's current consensus term, else -1. */
+    long leadershipTermId(final AtomicCounter currentTerm) {
+        final long appliedTerm = leadershipTermId;
+        return !currentTerm.isClosed() && currentTerm.get() == appliedTerm ? appliedTerm : -1L;
     }
 
     /** Whether this member still holds its outputs after its start. */
