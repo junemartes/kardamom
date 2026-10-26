@@ -65,12 +65,7 @@ impl Baseline {
     }
 
     async fn capture(h: &Harness) -> anyhow::Result<Self> {
-        Rpc::new(&h.rpc_url, h.knobs.chain_id)?
-            .transfer_smoke(h.knobs.gate_account, Duration::from_secs(60))
-            .await?;
-        let account = Self::executor(h)?
-            .account_state(h.knobs.gate_account)
-            .await?;
+        let account = Self::transfer_committed(h).await?;
         let primary = live_primary(h, CTX).await?;
         let raw = h
             .nodes
@@ -87,6 +82,20 @@ impl Baseline {
         };
         baseline.await_row(h, &baseline.account).await?;
         Ok(baseline)
+    }
+
+    async fn transfer_committed(h: &Harness) -> anyhow::Result<AccountState> {
+        let rpc = Rpc::new(&h.rpc_url, h.knobs.chain_id)?;
+        let account = h.knobs.gate_account;
+        let nonce = rpc.nonce_of(account).await?;
+        let committed = nonce
+            .checked_add(1)
+            .context("the fixture nonce overflows")?;
+        rpc.transfer_hash(account, nonce, Duration::from_secs(60))
+            .await?;
+        Self::executor(h)?
+            .await_account_nonce(account, committed, Budget::secs(120, 1))
+            .await
     }
 
     fn executor(h: &Harness) -> anyhow::Result<Rpc> {
@@ -139,16 +148,7 @@ impl Baseline {
                 )),
             )
             .await?;
-        Rpc::new(&h.rpc_url, h.knobs.chain_id)?
-            .transfer_hash(
-                h.knobs.gate_account,
-                self.account.nonce,
-                Duration::from_secs(60),
-            )
-            .await?;
-        let expected = Self::executor(h)?
-            .account_state(h.knobs.gate_account)
-            .await?;
+        let expected = Self::transfer_committed(h).await?;
         anyhow::ensure!(
             expected.nonce > self.account.nonce && expected.balance < self.account.balance,
             "{CTX}: the executor did not commit the established sender's transfer"

@@ -422,9 +422,14 @@
       "job": 121533651670,
       "case": "mirror-backlog-client-restart",
       "observed": "The exact account baseline does not appear in Redis within 120 seconds. Mirror logs also show WAIT and write timeouts. The first failed run does not retain the expected and observed row values.",
-      "cause": null,
-      "change": "Preserve the expected account, last observed projection and primary address in the failure. Keep the exact-state requirement and 120-second deadline.",
-      "status": "Unresolved. Additional live evidence required; no passing result is claimed."
+      "cause": "The fixture reads expected nonce and balance immediately after a receipt. Receipts stream at execution time, ahead of the state DB commit; a stale DB snapshot can become an impossible projection target. The failed live run lacks the row values needed to attribute that run conclusively. Mirror WAIT timeouts remain additional observed evidence.",
+      "change": "Wait for the exact post-transfer nonce on the executor state DB before capturing baseline and post-fault expectations. Keep the exact Redis nonce/balance comparison, its existing 120-second deadline, and the last-value diagnostic.",
+      "status": "Independent fixture race corrected and validated locally. Full live cache validation remains required; the previous failure is retained.",
+      "verification": [
+        "A real HTTP test returns the old committed nonce and balance on the first read, then the correct post-transfer values. The immediate snapshot fails; the commit fence passes.",
+        "A different nonce cannot satisfy the exact commit fence.",
+        "215 chaos library tests pass, with two existing ignored tests."
+      ]
     },
     {
       "id": "da-halt-failed-execution-receipts",
