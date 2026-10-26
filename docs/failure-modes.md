@@ -262,6 +262,7 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
     - Without a peer, the member waits and logs `cluster SEED waiting-for-peer`. It never falls back to position 0.
     - See [Start modes](../cluster/sealer-service/README.md#start-modes).
   - Proof: `cluster-member-rejoin` and `node-replace-sealer`. Each case checks that the member starts blank, then reaches the head that the executors had at the wipe.
+    - The member rejoin drill wipes the cluster directory and the Raft archive root files. The live executor archive in the `dir` child stays intact. The node replacement drill loses all state on the node.
 - **Raft log purge**
   - Rule: each member purges its own Raft log below a purge point. The purge point is the newest snapshot that obeys two rules:
     - It is older than the 3 newest snapshots (`kardamom.cluster.logPurgeKeepSnapshots`, env `KARDAMOM_CLUSTER_LOG_PURGE_KEEP`). The value 0 turns the purge off.
