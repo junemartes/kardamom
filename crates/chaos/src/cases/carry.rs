@@ -104,10 +104,15 @@ impl Step {
     pub(crate) fn floor(self, k: &Knobs) -> Duration {
         let inject = k.inject_delay;
         match self {
-            // Full deploy checks cover the lockbox upgrades and the move of the readers.
-            Self::VersionsOn | Self::ReadersOnEgress | Self::ExecutorFirst => {
-                inject + Duration::from_mins(40)
-            }
+            // The first step has a deploy, two checked upgrades, and the
+            // three-credit proof across a provider fault. Their load
+            // windows add; each runtime proof keeps its own deadline.
+            Self::VersionsOn => inject
+                .saturating_add(Duration::from_mins(40))
+                .saturating_add(Duration::from_mins(8))
+                .saturating_add(Duration::from_mins(20))
+                .saturating_add(k.l1_fault),
+            Self::ReadersOnEgress | Self::ExecutorFirst => inject + Duration::from_mins(40),
             // Two upgrade transactions and the held transfer.
             Self::HeldOfferAfterDowngrade | Self::WindowOffOn => inject + Duration::from_mins(8),
             Self::WindowOn => inject + k.restart_slo + Duration::from_mins(8),

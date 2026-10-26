@@ -591,6 +591,34 @@
         "A real flat head can prove a stall; it cannot prove the seal-only expectation without positive boundary progress."
       ],
       "status": "Validated locally; deployed combined ordering remains pending."
+    },
+    {
+      "id": "checkpoint-copy-subdeadline-preempts-healthy-restore",
+      "classification": "harness",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "job": 121579144982,
+      "observed": "The copy subdeadline fails at 13:44:19.45. Executor 0 starts at 13:44:19.52, fetches an 88 MB checkpoint and 174 log blocks, and completes a verified restore at 13:44:23.05.",
+      "cause": "A six-second copy timeout includes allocation log scans, donor selection and filesystem transfer and ends the case before the existing two-minute restore proof. The proof also counts restore lines globally, allowing unrelated replicas to satisfy it.",
+      "change": "Copy and actual victim restore share the existing 120-second recovery budget. Capture the victim container before the fault, and require a restore in its replacement container. Preserve a successful peer self-heal. Stop manual retries once the executor is running, remove repeated deletion of its checkpoint directory, retain the last operation in timeout errors, and use mv -T to avoid nesting a copy inside an existing peer checkpoint.",
+      "verification": [
+        "232 chaos library tests pass, two manual profiles ignored. Controls reject the pre-fault container, fetch without restore and genesis startup. A real filesystem control preserves an existing peer checkpoint when install races it.",
+        "Workspace style passes."
+      ],
+      "status": "Validated locally; deployed checkpoint restore remains pending."
+    },
+    {
+      "id": "carry-activation-phases-share-deploy-load-cap",
+      "classification": "harness",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "job": 121579144838,
+      "observed": "The initial deploy takes 32 minutes; two upgrade checks and their transactions follow. All three source-hash deposits then pass exact receipt-order and account-credit checks. At 41 minutes, the case fails because its 40-minute load has already stopped.",
+      "cause": "The activation load floor budgets only a rollout and shares the same cap with single-roll cases. It omits two sequential upgrade checks and the newly added provider-fault credit proof.",
+      "change": "Give activation additive load allowances for the rollout, both upgrade checks, and deposit/follower recovery plus the configured fault hold. Keep single-roll and two-roll windows, runtime proof deadlines, workflow timeout and the positive case-owned traffic check. The load still stops as soon as the case completes.",
+      "status": "Corrected locally; deployed carry activation and later steps remain pending."
     }
   ],
   "coverage": [
@@ -813,6 +841,10 @@
       {
         "check": "strict drain, idle V2 reconnect and replicated cache baselines",
         "result": "89 benchmark tests, 193 sequencer library tests, 14 binary tests and 226 chaos tests pass. Three manual tests remain ignored. Workspace style passes. Pinned normal/forced-sweep release comparison is recorded. Deployment validation pending."
+      },
+      {
+        "check": "offline quorum recovery, bounded observations and checkpoint proof",
+        "result": "232 chaos library tests pass, two manual profiles ignored. 49 batcher tests pass. Workspace style passes. Offline-copy hash/corruption and real filesystem install-race controls pass. All deployed proofs remain pending on the follow-up candidate."
       }
     ],
     "pending": [
@@ -982,7 +1014,7 @@
       "url": "https://github.com/junemartes/kardamom/pull/850",
       "cluster_run": 40320872242,
       "integrity_run": 40321151376,
-      "status": "Diagnostic batch is complete. Four supporting workflows, integrity and eight regular stages/shards pass. Seven regular shards fail: cluster, cache, combined ordering, coordinated, retention, executor and carry. Local fixes cover the cache baseline, batcher error classification, offline quorum recovery procedure and concurrent head observation. DA-lag missing-nonce skips, checkpoint-copy timing and carry measurement coverage remain under investigation. Streak 0/10; head is not frozen."
+      "status": "Diagnostic batch complete: four supporting workflows, integrity and eight regular stages/shards pass; seven regular shards fail. Local fixes address cache baseline synchronization, batcher error classification, offline quorum recovery, head-probe starvation, checkpoint restore proof/deadline and carry phase load coverage. DA-lag missing-nonce canonical skips remain a product gap. Streak 0/10; head is not frozen."
     }
   ],
   "integration": {
@@ -990,13 +1022,18 @@
     "changes": "Peer-seed retry regression and wording, canonical contract cursor for provider recovery, carry-only 180-minute limit, egress stream diagnostics, and early-failure round-overlap rejection. Merge retains owned-load control, replay cancellation, and full allocation artifacts. Canonical carry transactions now update ingress seal latency and quorum progress; both golden wire formats have regression coverage. Retain bounded validator receipt-eviction evidence and its regression tests. The diagnostic run on this head still fails combined ordering.",
     "verification": "Merged tree: 615 Java tests and 10 allocation checks pass (202 core tests + 6 core allocation checks, 413 service tests + 4 service allocation checks). Workspace style, 14 CI audit tests, 193 chaos tests (2 ignored), 15 proxy tests, 32 watcher library tests, 14 source-set tests and the three real HTTP header/deadline tests pass."
   },
-  "unpublished": {
+  "followup_candidate": {
     "workspace": "/home/dev/kardamom-chaos-gaps",
     "changes": [
       "Reject unfinished-submit false passes, bound complete receipt drains, stop background receipt readers on cancellation, and retain failed-load snapshots.",
       "Recover idle unconfirmed V2 offers from the existing session callback via a sweep-time generation check; add controls and a pinned normal/forced-sweep release comparison.",
-      "Wait for every executor to agree after a receipted transfer before capturing exact cache account baselines; retain the strict row oracle."
+      "Wait for every executor to agree after a receipted transfer before capturing exact cache account baselines; retain the strict row oracle.",
+      "Recognize structured batcher retry-exhaustion context and enter its existing automatic halt instead of exiting.",
+      "Follow the specified offline copy for two blank members, bind start/snapshot proofs to one allocation, and retain completed head observations while dead probes time out.",
+      "Tie checkpoint restore evidence to the replacement victim and share its 120-second budget across copying and restore; cover all carry activation phases with live load."
     ],
-    "status": "89 benchmark, 193 sequencer library, 14 binary and 226 chaos tests pass; three manual tests ignored. Style and controlled release comparisons pass. Hold these local follow-ups while PR 850 yields further failure evidence. Final head remains unfrozen; streak 0/10."
+    "status": "Local follow-up candidate for a diagnostic PR. 89 benchmark, 193 sequencer library, 14 sequencer binary, 49 batcher library and 232 chaos library tests pass. Three manual profiles remain ignored. Style and the recorded controlled release comparisons pass. No full deployed workload performance claim. DA-lag missing-nonce skips remain open. Head is not frozen; streak 0/10.",
+    "branch": "test/chaos-runtime-recovery-20261026",
+    "base": "7aa49b3f9a4557a24ccb540de33b65450697b348"
   }
 }

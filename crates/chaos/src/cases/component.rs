@@ -3,16 +3,16 @@
 
 use std::time::Duration;
 
+mod checkpoint;
+use checkpoint::CheckpointRestore;
+
 use super::cluster::a_follower;
 use super::exec_stream::ExecStreamSessions;
 use super::recorded_cursor::BestRecorded;
 use super::sequencer_recovery::SequencerRecovery;
-use crate::evidence::CountWait;
 use crate::harness::Harness;
-use crate::nomad::Streams;
 use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
-use kardamom_state::checkpoint::replay::LOG_DIR;
 
 pub(crate) const RESTORED: &str = "restored state from checkpoint";
 pub(crate) const FETCHED: &str = "fetched checkpoint from peer";
@@ -176,30 +176,16 @@ pub(crate) async fn state_checkpoint_restore(h: &mut Harness) -> anyhow::Result<
     let victim = h.probes.executors[0].container.clone();
     let donor = h.probes.executors[1].container.clone();
     wait_peer_checkpoint(h, &donor, "state-checkpoint-restore").await?;
-    let baseline = h
-        .evidence
-        .count_lines("executor", RESTORED, Streams::Both)
-        .await?;
+    let restore = CheckpointRestore::observe(h, &victim, &donor).await?;
     crate::log(
         "state-checkpoint-restore: killing executor 0 + wiping its state DB and checkpoints",
     );
     h.inject_hard(&[&victim], "executor").await?;
     wipe_state(h, &victim, "state-checkpoint-restore").await?;
     crate::log("state-checkpoint-restore: re-replicating checkpoints from executor 1");
-    copy_checkpoint(h, &donor, &victim, baseline).await?;
+    restore.await_restored(h).await?;
     h.assert_executor_progress(Duration::from_mins(3)).await?;
     h.assert_count("executor", 3, h.knobs.reschedule_slo)
-        .await?;
-    h.evidence
-        .wait_count_gt(&CountWait {
-            job: "executor",
-            needle: RESTORED,
-            baseline,
-            timeout: Duration::from_mins(2),
-            interval: Duration::from_secs(6),
-            streams: Streams::Both,
-            fail_msg: "state-checkpoint-restore: executor 0 did NOT restore from checkpoint — fell back to genesis re-sync",
-        })
         .await?;
     crate::log(
         "state-checkpoint-restore: executor 0 restored from checkpoint + rejoined (no genesis re-sync)",
@@ -317,184 +303,4 @@ pub(crate) async fn wipe_dirs(
         .await
         .map(|_| ())
         .map_err(|e| crate::chaos_fail!("{ctx}: could not wipe {node} state: {e}"))
-}
-
-/// Copy one complete checkpoint from the donor. Visible checkpoint
-/// directories are immutable; the retry covers the window where the
-/// picked one gets pruned mid-copy. A restarted victim that self-heals
-/// from a peer first satisfies the case's assertion with the same log
-/// line, so the copy stops when the restore count moved.
-async fn copy_checkpoint(
-    h: &Harness,
-    donor: &str,
-    victim: &str,
-    baseline: usize,
-) -> anyhow::Result<()> {
-    let outcome = poll::until(Budget::secs(6, 2), |_| async move {
-        copy_checkpoint_once(h, donor, victim, baseline).await
-    })
-    .await?;
-    outcome
-        .or_fail(|_| crate::chaos_fail!("state-checkpoint-restore: checkpoint copy failed"))
-        .map(|_| ())
-}
-
-async fn copy_checkpoint_once(
-    h: &Harness,
-    donor: &str,
-    victim: &str,
-    baseline: usize,
-) -> anyhow::Result<Option<()>> {
-    if h.evidence
-        .count_lines("executor", RESTORED, Streams::Both)
-        .await?
-        > baseline
-    {
-        crate::log(
-            "state-checkpoint-restore: executor 0 self-healed from a peer before the harness copy landed",
-        );
-        return Ok(Some(()));
-    }
-    let name = h
-        .nodes
-        .exec(donor, "ls -d /opt/kardamom/checkpoints/checkpoint-* 2>/dev/null | sort | tail -1 | xargs -rn1 basename")
-        .await
-        .unwrap_or_default();
-    if name.is_empty() {
-        return Ok(None);
-    }
-    h.nodes
-        .exec(victim, "rm -rf /opt/kardamom/checkpoints/*")
-        .await?;
-    // The donor's writer can prune the picked checkpoint while tar reads
-    // it ("Cannot stat"). That is the same race as a torn copy, so it
-    // takes the same retry with a fresh pick.
-    let copy = CheckpointCopy {
-        name,
-        log: h.knobs.checkpoint_log,
-    };
-    let tar = match h
-        .nodes
-        .exec_bytes(
-            donor,
-            &format!(
-                "tar -C /opt/kardamom --warning=no-file-changed -cf - {}",
-                copy.sources()
-            ),
-            1,
-        )
-        .await
-    {
-        Ok(tar) => tar,
-        Err(e) => {
-            crate::log(format!(
-                "state-checkpoint-restore: read of {} on the donor failed (pruned mid-copy?); retrying: {e}",
-                copy.name
-            ));
-            return Ok(None);
-        }
-    };
-    // Extract into a staging directory and rename into place, as the
-    // checkpoint writer does: the restarted executor may start while the
-    // copy is in flight, and a visible but partial checkpoint would be
-    // restored torn.
-    h.nodes
-        .exec_with_stdin(
-            victim,
-            &format!("rm -rf {STAGING} && mkdir -p {STAGING} && tar -C {STAGING} -xf -"),
-            tar,
-        )
-        .await?;
-    h.nodes.exec(victim, &copy.install()).await?;
-    let name = copy.name;
-    let complete = h
-        .nodes
-        .exec_status(
-            victim,
-            &format!("test -s /opt/kardamom/checkpoints/{name}/MANIFEST && test -s /opt/kardamom/checkpoints/{name}/mdbx.dat"),
-        )
-        .await?;
-    if !complete {
-        crate::log(format!(
-            "state-checkpoint-restore: copy of {name} incomplete (raced the writer's prune?); retrying"
-        ));
-    }
-    Ok(complete.then_some(()))
-}
-
-/// The staging directory of a checkpoint copy on the victim.
-const STAGING: &str = "/opt/kardamom/checkpoints/.harness-staging";
-
-/// One checkpoint copy from the donor to the victim: the newest base
-/// `name`, and with the block log on, the log next to it. With the log
-/// on, a base is rare, so the newest base can be many blocks old. The
-/// log carries the blocks after the base. Without it, the victim
-/// restores at the old base and executes the full tail.
-struct CheckpointCopy {
-    name: String,
-    log: bool,
-}
-
-impl CheckpointCopy {
-    /// The paths under `/opt/kardamom` that the donor sends.
-    fn sources(&self) -> String {
-        let base = format!("checkpoints/{}", self.name);
-        if self.log {
-            format!("{base} checkpoints/{LOG_DIR}")
-        } else {
-            base
-        }
-    }
-
-    /// The script that moves the staged copy into place on the victim.
-    /// The log moves first. A restore reads the log when the base
-    /// becomes visible, so the base must not come before the log. A
-    /// reader of the log stops at a torn last record, so a log copied
-    /// during an append is a valid log.
-    fn install(&self) -> String {
-        let base = format!(
-            "mv {STAGING}/checkpoints/{name} /opt/kardamom/checkpoints/{name}",
-            name = self.name
-        );
-        let log =
-            format!("mv {STAGING}/checkpoints/{LOG_DIR} /opt/kardamom/checkpoints/{LOG_DIR} && ");
-        let first = if self.log { log.as_str() } else { "" };
-        format!("{first}{base} && rm -rf {STAGING}")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::CheckpointCopy;
-
-    #[test]
-    fn a_copy_with_the_log_sends_the_log_and_installs_it_before_the_base() {
-        let copy = CheckpointCopy {
-            name: "checkpoint-000000000000000089".to_string(),
-            log: true,
-        };
-        assert_eq!(
-            copy.sources(),
-            "checkpoints/checkpoint-000000000000000089 checkpoints/log"
-        );
-        let install = copy.install();
-        let log = install.find("checkpoints/log /opt").unwrap();
-        let base = install
-            .find("checkpoints/checkpoint-000000000000000089 /opt")
-            .unwrap();
-        assert!(
-            log < base,
-            "the log must be in place before the base: {install}"
-        );
-    }
-
-    #[test]
-    fn a_copy_without_the_log_sends_only_the_base() {
-        let copy = CheckpointCopy {
-            name: "checkpoint-000000000000000089".to_string(),
-            log: false,
-        };
-        assert_eq!(copy.sources(), "checkpoints/checkpoint-000000000000000089");
-        assert!(!copy.install().contains("/log"), "{}", copy.install());
-    }
 }
