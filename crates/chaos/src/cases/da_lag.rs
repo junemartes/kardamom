@@ -5,7 +5,11 @@
 //! by itself once the batcher thaws and posts. `prune-floor` stays under
 //! the budget but runs past the sealer's retention window and a Raft
 //! snapshot, and asserts the sealer still replays from the batcher's
-//! cursor: nothing is pruned below the posted head.
+//! cursor: nothing is pruned below the posted head. On a carry-born
+//! cluster the sealer evicts its old frames. The case instead requires
+//! every durable egress copy to serve identical retained bytes below the
+//! sealer's floor, beyond a scoped short reader window. L1 must cover
+//! the gap after the thaw. The egress's L1 safety floors stay configured.
 //!
 //! Both read the chain status of the service events: `da-lag-halt` sees
 //! the sealer halted on `da_lag` as the root and the ingresses paused on
@@ -23,6 +27,7 @@ use crate::poll::{self, Budget};
 use crate::probes::{CLUSTER_TASK, EXECUTOR_BLOCK_METRIC};
 use crate::rpc::{CHAIN_HALTED_CODE, Rpc};
 
+mod carry_floor;
 mod setup;
 pub(crate) use setup::GuardedCase;
 
@@ -293,6 +298,9 @@ async fn assert_halted_chain(h: &Harness, ctx: &str, halted: &Status) -> anyhow:
 ///
 /// Returns the first assertion that fails.
 pub(crate) async fn prune_floor(h: &mut Harness) -> anyhow::Result<()> {
+    if h.knobs.genesis_carry {
+        return carry_floor::CarryFloor::run(h).await;
+    }
     let ctx = "prune-floor";
     let retention = i64::try_from(
         h.knobs

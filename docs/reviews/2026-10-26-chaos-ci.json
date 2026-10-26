@@ -256,7 +256,7 @@
       "hot_path_changed": false,
       "observed": "The combined recovery oracle recognizes ok/redis but excludes local/live lookup outcomes emitted by the v1/v2 committed account layers.",
       "change": "Include every committed answer source, reject error/timeout-only evidence, and retain the last per-replica counters on timeout.",
-      "status": "Source-label regression passes; actual combined-executor failure cause remains unconfirmed until deployed counters are available."
+      "status": "The complete source counters now show one asked and zero answered lookups on both V2 replicas. They expose the one-shot product bug; the oracle must continue to require a positive answer."
     },
     {
       "id": "restarted-executor-copy-anchor",
@@ -268,7 +268,7 @@
       "cause": "A restarted carried reader compares old frames with its committed history, but only forwards newly executed frames to exec_frames. The merge cannot infer record placement after a sequence restart.",
       "change": "Move the already held raw frames out in checked comparison order. Publish them on the existing tee only after the full comparison equals committed history. Discard staged history on rewind, skip, or divergence.",
       "hot_path_detail": "No new steady-path state, connection, lock, metric or work. The tee extraction helper is shared with existing release. Restart comparison holds checked frames and publishes extra recovery traffic. Controlled release A/B shows no observed steady tee regression; deployed workload validation remains pending.",
-      "status": "Three-copy regression fails before the fix and passes after it. Divergent, partial, skipped and reconnected histories have negative controls. Deployed validation pending.",
+      "status": "Local before/after and negative controls pass. The complete combined-ordering shard passes on PR 848. Ten final-head green rounds and full workload validation remain pending.",
       "verification": [
         "213 engine library tests pass; one manual profile ignored.",
         "Before: /tmp/chaos-gaps-egress-anchor-before.log; after: /tmp/chaos-gaps-egress-anchor-after.log.",
@@ -285,6 +285,80 @@
       "observed": "The upload keeps kardamom-load.json but excludes kardamom-load-defi.json. scrape_fallbacks counts fallback metric reads through docker exec, not executor state queries.",
       "change": "Retain kardamom-load*.json. Record per-executor query counter deltas from existing metrics across callers, methods and outcomes. Missing/invalid samples and observed counter decreases are null. A restart between snapshots can still hide counts; these are counter differences, not complete client-attempt accounting.",
       "status": "83 benchmark library tests pass; workspace style passes. No new service counters or steady transaction work."
+    },
+    {
+      "id": "v2-unanswered-account-lookup",
+      "classification": "product",
+      "source": "crates/sequencer/src/bin/kardamom-sequencer/feeds/account_lookup.rs",
+      "case": "sequencer-executor-redis-loss",
+      "job": 121482903936,
+      "observed": "Both restarted lane-0 replicas ask once and answer zero times after Redis and executors return. Empty blocks still advance.",
+      "cause": "The V2 lookup feed makes one attempt. Failure emits no answer and schedules no retry. The admission filter keeps the established sender parked.",
+      "change": "A failed lookup transfers its existing semaphore permit to one retry task. That task retries every two seconds until a source answers or the feed ends. The same 64-permit limit bounds first attempts and retries. A drop guard cancels retries; shutdown also interrupts a saturated permit wait.",
+      "before_test_log": "/tmp/chaos-gaps-lookup-retry-before.log",
+      "product_bug": true,
+      "service_wiring_changed": false,
+      "hot_path_changed": true,
+      "hot_path_detail": "Cold account lookup worker only. Resident admission is unchanged. Successful first attempts create no retry task or timer and keep the direct state_of await. Nonblocking permit acquisition keeps shutdown selection on the saturated path. Failed first attempts alone allocate one retry task and transfer the original permit.",
+      "status": "The no-second-request regression fails before the correction. Recovery, shutdown, saturation, abort and healthy-first-attempt controls pass locally. Deployed validation and final performance assessment pending.",
+      "verification": [
+        "Five alternating-order pinned release comparisons: final median worker p50/p95/p99 1920/2200/2510 ns versus baseline 1960/2210/2480 ns; median sampled rate 520587 versus 502930 lookups/s. Mixed paired differences; no speedup claim. Full chain workload comparison remains required.",
+        "docs/benches/2026-10-26-v2-account-lookup-profile.json records method and limits; all repeat summaries include the rejected higher-overhead designs."
+      ]
+    },
+    {
+      "id": "fault-client-abandons-nonces",
+      "classification": "harness",
+      "case": "hard-ingress, ingress-pair-loss-recover, cluster-quorum-loss-recover",
+      "observed": "Owned-load accepted counters stop after the endpoint or quorum returns. Connection-refused and chain-halted errors can consume count-based retries before the intentional outage ends.",
+      "cause": "Retry counts assume slow parked calls. Refused connections and paused-chain errors can return at once, leaving lower-nonce submissions abandoned.",
+      "change": "Use the existing wall-clock paused-chain retry allowance for the whole case window. Raise the client-edge fault retry count to 90. Preserve aborted pending samples with hashes, senders and nonces so future failures retain client evidence.",
+      "status": "Retry mechanism and failure timing support this cause; abandoned hashes from the old run are not independently proved. Local tests pass. The next deployed run must verify the diagnosis.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false
+    },
+    {
+      "id": "pacer-passes-load-window-deadline",
+      "classification": "harness",
+      "observed": "A full in-flight semaphore keeps pacing parked past its deadline. The submitting gauge stays true and one additional transaction is offered after the phase deadline.",
+      "change": "Prioritize the whole phase deadline and stop signal while waiting on pacing. Offered work still drains. Record actual elapsed paced time.",
+      "verification": [
+        "A real HTTP test with one blocked call and a 100 ms phase hangs before the correction, then offers and receipts exactly one transaction after it.",
+        "84 benchmark library tests pass."
+      ],
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "Validated locally; deployed validation pending."
+    },
+    {
+      "id": "carry-prune-floor-wrong-storage-oracle",
+      "classification": "harness",
+      "job": 121482903818,
+      "case": "prune-floor",
+      "observed": "The test waits 600 seconds for retained sealer frames to exceed 6144, on a carry-born sealer with a fixed exact window.",
+      "change": "Keep the reference-mode proof. In carry mode, use a scoped 64-block egress reader window and 16-block segments, retaining all L1 floor arguments. Freeze the batcher; capture an unposted cursor; require the sealer floor to pass it, a new snapshot, and more than a reader window plus a segment on the durable egress. Every running egress copy must serve identical paged bytes through the captured durable head. Thaw and require contiguous L1 coverage through the frozen sealed head. Restore the saved egress job on every result.",
+      "limitation": "An output oracle may keep the lower final head behind the posted head. The test preserves that policy and does not require unsafe pruning to the reader window after thaw.",
+      "verification": [
+        "Real HTTP controls accept equal ranges and reject divergent bytes or 410. Payload limits exclude length prefixes. Truncated/empty ranges fail. A changed job retains its oracle, L1 endpoint, replica count and saved definition."
+      ],
+      "product_bug": false,
+      "service_wiring_changed": "Only the fault fixture temporarily changes keep-blocks and segment-blocks. It restores the exact registered job.",
+      "hot_path_changed": false,
+      "status": "Local checks pass; deployed validation pending."
+    },
+    {
+      "id": "broken-image-load-window",
+      "classification": "harness",
+      "job": 121482903885,
+      "case": "deploy-broken-image",
+      "observed": "The broken rollout takes about 17 minutes and the healing deploy another 5 minutes. Its 12-minute paced load ends before the recovery proof.",
+      "change": "Cover both full Ansible passes, the existing failed deployment deadline and recovery tail in the paced window. Retain deployment and recovery deadlines. The case stops unused pacing after recovery.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "Corrected locally; deployed validation pending."
     }
   ],
   "coverage": [
@@ -483,6 +557,22 @@
       {
         "check": "sealer Java recovery and allocation gates",
         "result": "622 tests pass: 208 core and 414 service"
+      },
+      {
+        "check": "follow-up chaos library tests",
+        "result": "213 passed, 2 ignored, including real HTTP replay controls"
+      },
+      {
+        "check": "V2 account lookup feed",
+        "result": "Five controls pass: source recovery without a second request, healthy first answer, shutdown, saturation and feed abort"
+      },
+      {
+        "check": "benchmark library",
+        "result": "84 passed, including the blocked-pacer deadline regression"
+      },
+      {
+        "check": "V2 healthy cold-lookup release profile",
+        "result": "No speedup claim. Final p50/p95/p99 and throughput are close to the baseline with mixed paired differences. This short shared-host microbenchmark cannot establish a full workload performance guarantee. Full cluster workload evidence and ten green rounds remain pending."
       }
     ],
     "pending": [
@@ -517,7 +607,8 @@
         "workflow": "cluster-validate.yml",
         "inputs": {}
       }
-    ]
+    ],
+    "fault_fixture_wiring_changed": "The carry prune-floor case temporarily shortens egress reader-window and segment lengths. It keeps the registered L1 safety floors and restores the exact job. No deployment default changes."
   },
   "iterations": [
     {
@@ -620,6 +711,12 @@
       "nightly_workflow_run": 40292659324,
       "url": "https://github.com/junemartes/kardamom/pull/848",
       "status": "Draft diagnostic candidate. Both existing regular and integrity groups run. No qualifying frozen-head round. Local style, 213 engine tests, 201 chaos tests and 14 audit tests pass; controlled release tee profile is recorded."
+    },
+    {
+      "commit": "663d25766a02b01c813ff6fc0b2b67054652e741",
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40292596498",
+      "status": "Diagnostic regular run: six failed shards (ingress, coordination, fleet, retention, executor, combined-exec). Carry is still running. Both standalone stages and combined ordering, cluster, cache, sequencer, L1 and follower pass. Separate integrity run 40292659324 succeeds. Four non-cluster workflows succeed. No qualifying round; 0/10.",
+      "integrity_run": 40292659324
     }
   ],
   "integration": {
@@ -635,8 +732,12 @@
       "Preserve both transfer and DeFi reports and expose existing executor query counter deltas",
       "Egress restart regression covers an unposted gap inside checked history and rejects a gap before it",
       "Native deposits before/during/after provider loss within carry-versions-on; no extra shard, case account or deployment. Reuse exact lockbox logs for reconstruction.",
-      "Two empty Raft members and one intact data copy in the existing cluster shard; remove stale local seed staging from blank-member faults; 76 cases total"
+      "Two empty Raft members and one intact data copy in the existing cluster shard; remove stale local seed staging from blank-member faults; 76 cases total",
+      "Keep client retries through intentional endpoint and chain-halt faults; stop pacing at its complete deadline and retain abort evidence.",
+      "Retry failed V2 account lookups without another request, bound retry concurrency and cancel on shutdown.",
+      "Carry-aware prune-floor proof with exact egress range comparison and scoped retention settings.",
+      "Keep the broken-image workload active through both Ansible passes and recovery."
     ],
-    "status": "214 engine tests, 207 chaos tests, 83 benchmark tests, 14 audit tests and style pass. PR 848 has green non-cluster workflows plus load and semantics. Ingress and coordination fail the new own-load resumption oracle. The client retry count assumes a 30-second parked RPC, but connection errors return immediately and exhaust retries before ingress returns. No rerun before classification/fix. Streak is 0/10; final head is not frozen."
+    "status": "Follow-up review, final local checks and cold-lookup performance comparison in progress. Deployed validation pending. Final head is not frozen. Streak stays 0/10."
   }
 }

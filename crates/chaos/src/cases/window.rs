@@ -32,6 +32,11 @@ impl Case {
             Self::ValidatorLapse => {
                 inject + k.validator_lapse + k.reschedule_slo + Duration::from_mins(2)
             }
+            // The carry proof rolls the egress job twice, compares every
+            // retained copy, and waits for posting before the common tail.
+            Self::PruneFloor if k.genesis_carry => {
+                inject + k.retention_freeze_cap + Duration::from_mins(19)
+            }
             Self::RetentionOverrun | Self::RetentionOverrunValidator | Self::PruneFloor => {
                 inject + k.retention_freeze_cap + Duration::from_mins(2)
             }
@@ -44,9 +49,9 @@ impl Case {
                 .saturating_add(Duration::from_mins(16)),
             // Scale-out and scale-in each submit overlap, ingress and steady jobs.
             Self::ResizeScaleOutIn => inject + Duration::from_mins(30),
-            // The failed deployment runs to the executor's healthy
-            // deadline, then the real manifest replaces three executors.
-            Self::DeployBrokenImage => inject + Duration::from_mins(12),
+            // Two full Ansible passes surround the executor's failed
+            // deployment deadline, then the common tail proves recovery.
+            Self::DeployBrokenImage => inject + k.reschedule_slo + Duration::from_mins(30),
             Self::LookupBlackout => inject + k.restart_slo * 2 + Duration::from_mins(5),
             // The freeze, the election, and the recovery polls.
             Self::RedisPrimaryFreeze | Self::RedisPrimaryKill | Self::RedisPartitionIngress => {
