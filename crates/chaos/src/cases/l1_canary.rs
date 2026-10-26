@@ -6,11 +6,9 @@
 //! `KardamomHaltDaLag`. After the thaw the canary's transfers succeed
 //! again.
 //!
-//! The case needs a cluster deployed with a small DA-lag budget
-//! (`KARDAMOM_DA_LAG_BUDGET_BLOCKS`), as `da-lag-halt` does, and with the
-//! local canary (`CANARY_LOCAL=1`). So it runs by name and in no shard: a
-//! small budget for a whole shard refuses the load of the other cases,
-//! and the shards count transactions that the canary's would add to.
+//! The retention shard funds the canary at genesis, stops its job before
+//! other cases, and restores it only for this case. The small DA guard
+//! and the canary job both return to their prior state after the fault.
 
 use std::time::Duration;
 
@@ -18,6 +16,9 @@ use super::da_lag::{FrozenBatcher, await_halt};
 use crate::harness::Harness;
 use crate::metrics::Target;
 use crate::poll::{self, Budget};
+
+mod alerts;
+use alerts::Alerts;
 
 /// The canary's exporter on the monitoring node.
 const CANARY_PORT: u16 = 9012;
@@ -27,6 +28,22 @@ const PROBE_TOTAL: &str = "kardamom_canary_probe_total";
 /// The canary page fires after two minutes of failed transfers; the
 /// Alertmanager evaluation adds a little.
 const PAGE_PATIENCE: Duration = Duration::from_mins(6);
+
+pub(crate) async fn scheduled_canary(h: &mut Harness) -> anyhow::Result<()> {
+    let started = h.start_case_canary().await;
+    let verdict = match started {
+        Ok(()) => super::da_lag::GuardedCase::Canary.run(h).await,
+        Err(error) => Err(error),
+    };
+    let stopped = h.stop_case_canary().await;
+    if let Err(error) = &stopped {
+        crate::log(format!(
+            "canary-da-lag: stopping the case canary fails: {error:#}"
+        ));
+    }
+    verdict?;
+    stopped
+}
 
 /// The canary's transfer runs whose labels hold `fragment`.
 async fn transfers(h: &Harness, fragment: &str) -> Option<i64> {
@@ -81,7 +98,7 @@ async fn await_runs(
 /// Wait until Alertmanager holds a canary page inhibited.
 async fn await_inhibited_page(h: &Harness, ctx: &str) -> anyhow::Result<()> {
     let url = format!(
-        "http://{}:{ALERTMANAGER_PORT}/api/v2/alerts?filter=alertname%3D~%22KardamomCanary.%2A%22",
+        "http://{}:{ALERTMANAGER_PORT}/api/v2/alerts",
         h.probes.validator.ip
     );
     let http = reqwest::Client::builder()
@@ -90,24 +107,12 @@ async fn await_inhibited_page(h: &Harness, ctx: &str) -> anyhow::Result<()> {
     let outcome = poll::until(Budget::new(PAGE_PATIENCE, Duration::from_secs(10)), |_| {
         let http = http.clone();
         let url = url.clone();
-        async move {
-            let alerts: serde_json::Value = match http.get(&url).send().await {
-                Ok(r) => r.json().await.unwrap_or_default(),
-                Err(_) => serde_json::Value::Null,
-            };
-            let inhibited = alerts.as_array().into_iter().flatten().find(|a| {
-                a["labels"]["severity"] == "critical"
-                    && a["status"]["inhibitedBy"]
-                        .as_array()
-                        .is_some_and(|by| !by.is_empty())
-            });
-            Ok::<_, anyhow::Error>(inhibited.map(|a| a["labels"]["alertname"].to_string()))
-        }
+        async move { Ok::<_, anyhow::Error>(Alerts::read(&http, &url).await) }
     })
     .await?;
     let (page, _) = outcome.or_fail(|elapsed| {
         crate::chaos_fail!(
-            "{ctx}: no canary page was inhibited within {}s; Alertmanager must mute it behind the halt",
+            "{ctx}: no canary page names an active DA-lag alert as its inhibitor within {}s",
             elapsed.as_secs()
         )
     })?;
@@ -129,6 +134,8 @@ pub(crate) async fn canary_da_lag(h: &mut Harness) -> anyhow::Result<()> {
     .unwrap_or(i64::MAX);
     let refused = "code=\"-32010\"";
     let success = "outcome=\"success\"";
+    let healthy_before = transfers(h, success).await.unwrap_or(0);
+    await_runs(h, ctx, success, healthy_before, Duration::from_mins(2)).await?;
     let refused_before = transfers(h, refused)
         .await
         .ok_or_else(|| crate::chaos_fail!("{ctx}: the canary exports no transfer runs"))?;

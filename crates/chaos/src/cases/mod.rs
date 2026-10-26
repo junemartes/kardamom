@@ -306,14 +306,16 @@ impl Case {
             }
             Self::SequencerLapse => inject + k.seq_lapse + Duration::from_mins(1),
             Self::ValidatorLapse => inject + k.validator_lapse + Duration::from_mins(1),
-            Self::RetentionOverrun
-            | Self::RetentionOverrunValidator
-            | Self::CanaryDaLag
-            | Self::PruneFloor => inject + k.retention_freeze_cap + Duration::from_mins(2),
+            Self::RetentionOverrun | Self::RetentionOverrunValidator | Self::PruneFloor => {
+                inject + k.retention_freeze_cap + Duration::from_mins(2)
+            }
             // The scoped guard rolls the members before and after the fault.
             Self::DaLagHalt => inject
                 .saturating_add(k.retention_freeze_cap.saturating_mul(2))
                 .saturating_add(Duration::from_mins(8)),
+            Self::CanaryDaLag => inject
+                .saturating_add(k.retention_freeze_cap.saturating_mul(2))
+                .saturating_add(Duration::from_mins(16)),
             Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
             // The failed deployment runs to the executor's healthy
             // deadline, then the real manifest replaces three executors.
@@ -519,8 +521,8 @@ impl Case {
             Self::RedisPartitionIngress => cache::redis_partition_ingress(h).await,
             Self::RedisTotalLossRecover => cache::redis_total_loss_recover(h).await,
             Self::MirrorKillRebuild => cache::mirror_kill_rebuild(h).await,
-            Self::DaLagHalt => da_lag::scheduled_halt(h).await,
-            Self::CanaryDaLag => l1_canary::canary_da_lag(h).await,
+            Self::DaLagHalt => da_lag::GuardedCase::Halt.run(h).await,
+            Self::CanaryDaLag => l1_canary::scheduled_canary(h).await,
             Self::PruneFloor => da_lag::prune_floor(h).await,
             Self::L1Liar => l1::liar(h).await,
             Self::L1NullReceipts => l1::null_receipts(h).await,

@@ -244,7 +244,9 @@
         "chaos-retention",
         "chaos-follower"
       ],
-      "status": "pending per-case configuration and restoration"
+      "status": "All three cases now ride the existing retention shard. da-lag-halt and canary-da-lag temporarily set an eight-block guard, verify its active value, restore the exact saved job even on failure, and verify the original guard. The shard keeps its normal DA guard. Snapshot cadence is 60 seconds. Public canary accounts are funded at genesis; the canary is stopped outside its own case. Local tests pass; deployed validation pending.",
+      "evidence": "The canary oracle requires a critical suppressed canary alert to name the fingerprint of an active critical KardamomHaltDaLag alert. Unrelated inhibitors do not pass.",
+      "reference": "https://github.com/prometheus/alertmanager/blob/main/inhibit/inhibit.go"
     },
     {
       "gap": "No nonce source after sequencer, executor, and Redis loss",
@@ -414,7 +416,8 @@
       "Full CI for the product fix",
       "Remaining coverage gaps",
       "Full cluster workload comparison",
-      "10 consecutive complete green CI rounds on the final unchanged commit"
+      "10 consecutive complete green CI rounds on the final unchanged commit",
+      "Deployed validation of the 72 scheduled cases, including the scoped canary genesis and guard restoration"
     ],
     "ci_wiring_changed": "Retain load/profile evidence; add suite=all to the cluster workflow without changing normal PR/scheduled selection; make static validation dispatchable; test the persistent ten-round audit utility in CI.",
     "streak_command": "python3 scripts/ci/green_streak.py --branch BRANCH --head FULL_SHA --state AUDIT.json --poll --run CI_ID --run CLUSTER_ID --run DOCKER_ID --run SEMANTICS_ID --run VALIDATION_ID",
@@ -489,11 +492,25 @@
       "workflow_run": 40277103561,
       "url": "https://github.com/junemartes/kardamom/pull/845",
       "status": "CI pending; replay lifetime correction; diagnostic only"
+    },
+    {
+      "pull_request": 846,
+      "commit": "c5dd06630eb2efd5efe70021e288dff16d4b28db",
+      "status": "Merged externally into integration; local checks pass; no frozen-head qualification"
     }
   ],
   "integration": {
     "reviewed_head": "2c051fc9a3c978a05a7f98bc35dad174f246e32a",
     "changes": "Peer-seed retry regression and wording, canonical contract cursor for provider recovery, carry-only 180-minute limit, egress stream diagnostics, and early-failure round-overlap rejection. Merge retains owned-load control, replay cancellation, and full allocation artifacts.",
     "verification": "Merged tree: 615 Java tests and 10 allocation checks pass (202 core tests + 6 core allocation checks, 413 service tests + 4 service allocation checks). Workspace style, 14 CI audit tests, 193 chaos tests (2 ignored), 15 proxy tests, 32 watcher library tests, 14 source-set tests and the three real HTTP header/deadline tests pass."
+  },
+  "unpublished": {
+    "workspace": "/home/dev/kardamom-chaos-gaps",
+    "changes": [
+      "Scoped DA halt and prune-floor scheduling",
+      "Funded local canary lifecycle and exact alert inhibition proof",
+      "L1 reconstruction includes the canonical canary genesis fragment"
+    ],
+    "status": "Not pushed while the combined diagnostic CI run is collecting evidence. Final head is not frozen; streak remains 0/10."
   }
 }

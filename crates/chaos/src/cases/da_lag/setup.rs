@@ -16,17 +16,32 @@ const SMALL_BUDGET: NonZeroU64 = NonZeroU64::new(8).unwrap();
 const PROPERTY: &str = "-Dkardamom.cluster.daLagBudgetBlocks=";
 const BUDGET_METRIC: &str = "kardamom_ingress_cluster_da_lag_budget_blocks";
 
-pub(crate) async fn scheduled_halt(h: &mut Harness) -> anyhow::Result<()> {
-    if h.knobs.da_lag_budget_blocks.is_some() {
-        return da_lag_halt(h).await;
+#[derive(Clone, Copy)]
+pub(crate) enum GuardedCase {
+    Halt,
+    Canary,
+}
+
+impl GuardedCase {
+    pub(crate) async fn run(self, h: &mut Harness) -> anyhow::Result<()> {
+        if h.knobs.da_lag_budget_blocks.is_some() {
+            return self.exercise(h).await;
+        }
+        SmallBudget::run(h, self).await
     }
-    SmallBudget::run(h).await
+
+    async fn exercise(self, h: &mut Harness) -> anyhow::Result<()> {
+        match self {
+            Self::Halt => da_lag_halt(h).await,
+            Self::Canary => super::super::l1_canary::canary_da_lag(h).await,
+        }
+    }
 }
 
 struct SmallBudget;
 
 impl SmallBudget {
-    async fn run(h: &mut Harness) -> anyhow::Result<()> {
+    async fn run(h: &mut Harness, case: GuardedCase) -> anyhow::Result<()> {
         Self::await_caught_up(h).await?;
         let previous = Self::observed_budget(h)
             .await
@@ -38,7 +53,7 @@ impl SmallBudget {
             configured.tasks
         ));
         h.knobs.da_lag_budget_blocks = Some(SMALL_BUDGET);
-        let verdict = Self::exercise(h, &saved, &configured).await;
+        let verdict = Self::exercise(h, &saved, &configured, case).await;
         let restored = match saved.restore().await {
             Ok(()) => Self::await_budget(h, previous).await,
             Err(error) => Err(error),
@@ -58,12 +73,13 @@ impl SmallBudget {
         h: &mut Harness,
         saved: &SavedJob,
         configured: &BudgetJob,
+        case: GuardedCase,
     ) -> anyhow::Result<()> {
         saved.register(&configured.definition).await?;
         h.assert_count(CLUSTER_TASK, 3, h.knobs.restart_slo).await?;
         Self::await_budget(h, 8).await?;
         await_halt(h, "da-lag-halt: guard setup", 8, false).await?;
-        da_lag_halt(h).await
+        case.exercise(h).await
     }
 
     async fn await_caught_up(h: &Harness) -> anyhow::Result<()> {

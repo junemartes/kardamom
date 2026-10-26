@@ -24,7 +24,7 @@ use crate::probes::{CLUSTER_TASK, EXECUTOR_BLOCK_METRIC};
 use crate::rpc::{CHAIN_HALTED_CODE, Rpc};
 
 mod setup;
-pub(crate) use setup::scheduled_halt;
+pub(crate) use setup::GuardedCase;
 
 /// The batcher's exporter: on the aux node, bound to every interface.
 const BATCHER_PORT: u16 = 9002;

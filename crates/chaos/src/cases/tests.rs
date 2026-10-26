@@ -33,8 +33,7 @@ fn every_shard_case_parses_and_names_round_trip() {
         })
         .copied()
         .collect();
-    // The canary needs its funded genesis and a scoped job lifecycle.
-    assert_eq!(unscheduled, [Case::CanaryDaLag]);
+    assert!(unscheduled.is_empty());
     shards
         .iter()
         .try_for_each(|shard| {

@@ -36,6 +36,7 @@ const GENESIS: &str = "deploy/cluster/config/genesis/dev.toml";
 /// holds a top-level key, so it comes before the first table of
 /// [`GENESIS`].
 const CARRY_GENESIS: &str = "deploy/cluster/config/genesis/carry.toml";
+const CANARY_GENESIS: &str = "deploy/cluster/config/genesis/canary.toml";
 
 /// What the tool prints when L1 does not cover the target block yet: the
 /// posted batches end before it, or no batch is posted. Every other
@@ -120,22 +121,24 @@ impl Attempt {
 }
 
 /// The genesis of the cluster's chain, as the executor and validator
-/// jobs render it (nomad/executor.nomad.hcl): the carry fragment first on
-/// a carry-born cluster, then the dev genesis, joined by a newline. The
+/// jobs render it: the carry fragment first on a carry-born cluster,
+/// then dev genesis and the funded local canary when enabled. The
 /// rebuild must start from the same genesis, or its root differs from
 /// the live root at every block.
 #[derive(Debug, Clone, Copy)]
 struct Genesis {
     carry: bool,
+    canary: bool,
 }
 
 impl Genesis {
     /// The fragments, in the order the jobs join them.
     fn fragments(self) -> &'static [&'static str] {
-        if self.carry {
-            &[CARRY_GENESIS, GENESIS]
-        } else {
-            &[GENESIS]
+        match (self.carry, self.canary) {
+            (true, true) => &[CARRY_GENESIS, GENESIS, CANARY_GENESIS],
+            (true, false) => &[CARRY_GENESIS, GENESIS],
+            (false, true) => &[GENESIS, CANARY_GENESIS],
+            (false, false) => &[GENESIS],
         }
     }
 
@@ -351,6 +354,7 @@ impl Rebuild<'_> {
     fn write_genesis(&self) -> anyhow::Result<PathBuf> {
         let genesis = Genesis {
             carry: self.harness.knobs.genesis_carry,
+            canary: self.harness.lifecycle.vars().canary_local == Some(true),
         }
         .render(&self.harness.lifecycle.repo_root())?;
         let path = self.evidence.join("genesis.toml");

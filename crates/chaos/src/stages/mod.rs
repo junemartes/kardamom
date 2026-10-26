@@ -3,6 +3,7 @@
 //! ingress-churn re-smoke and the validator verdict. A shard test
 //! composes them; `run-tests.sh` used to.
 
+mod canary;
 mod churn;
 pub(crate) mod rebuild;
 mod recovery;

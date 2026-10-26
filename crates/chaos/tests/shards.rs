@@ -101,6 +101,7 @@ async fn run_shard(shard: Shard) -> anyhow::Result<()> {
         lifecycle.up().await?
     };
     let mut harness = Harness::new(contract, knobs, lifecycle.clone())?;
+    harness.prepare_case_services().await?;
     harness.smoke_gate(harness.knobs.gate_account).await?;
     let cases = case_list(shard);
     kardamom_chaos::log(format!(

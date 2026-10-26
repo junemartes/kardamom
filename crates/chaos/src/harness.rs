@@ -77,7 +77,7 @@ impl ProbeLeg {
     }
 }
 use crate::nodes::Nodes;
-use crate::nomad::Nomad;
+use crate::nomad::{Nomad, SavedJob};
 use crate::poll::{self, Budget};
 use crate::probes::{IngressCounts, Probed, Probes};
 
@@ -97,6 +97,7 @@ pub struct Harness {
     pub rpc_url: String,
     pub(crate) accounts: Accounts,
     pub(crate) killed: Option<Killed>,
+    pub(crate) case_canary: Option<SavedJob>,
 }
 
 impl Harness {
@@ -118,6 +119,7 @@ impl Harness {
             probes,
             accounts: Accounts::new(knobs.account_base, knobs.run_load),
             killed: None,
+            case_canary: None,
             knobs,
             lifecycle,
             rpc_url,

@@ -16,11 +16,12 @@ use crate::lifecycle::{CarrySwitches, DeployVars, EgressStage};
 /// The sealer retention of the carry shard, in frames. The exact window
 /// keeps this many frames.
 const CARRY_RETENTION: u64 = 16_384;
-const RETENTION_CASES: [&str; 4] = [
+const RETENTION_CASES: [&str; 5] = [
     "retention-overrun",
     "retention-overrun-validator",
     "prune-floor",
     "da-lag-halt",
+    "canary-da-lag",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +277,7 @@ impl Shard {
             },
             Self::Retention => DeployVars {
                 cluster_snapshot_interval_s: Some(60),
+                canary_local: Some(true),
                 cluster_retention: Some(6144),
                 checkpoint_log: true,
                 ..DeployVars::default()
@@ -390,13 +392,26 @@ mod tests {
     }
 
     #[test]
+    fn the_retention_shard_funds_the_canary_without_lowering_its_da_guard() {
+        let vars = Shard::Retention.deploy_vars();
+        assert_eq!(vars.da_lag_budget_blocks, None);
+        assert_eq!(vars.canary_local, Some(true));
+        assert_eq!(vars.cluster_snapshot_interval_s, Some(60));
+        assert!(
+            ALL.iter()
+                .filter(|shard| **shard != Shard::Retention)
+                .all(|shard| shard.deploy_vars().canary_local.is_none())
+        );
+    }
+
+    #[test]
     fn every_shard_lists_distinct_cases_and_the_resize_runs_last() {
         let all: Vec<&str> = ALL.iter().flat_map(|s| s.cases().iter().copied()).collect();
         let mut unique = all.clone();
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 71);
+        assert_eq!(all.len(), 72);
         assert_eq!(
             Shard::Integrity.cases().last(),
             Some(&"resize-scale-out-in")

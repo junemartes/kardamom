@@ -48,6 +48,8 @@ pub struct DeployVars {
     pub cluster_retention: Option<u64>,
     /// `-Dkardamom.cluster.daLagBudgetBlocks` of the sealer, in blocks.
     pub da_lag_budget_blocks: Option<u64>,
+    /// Fund the public local canary at genesis and deploy its job.
+    pub canary_local: Option<bool>,
     /// Deploy the L1 fault proxy in front of the in-cluster anvil, and
     /// point the followers (the batcher, the da-watcher, the indexer) at
     /// it. The indexer is deployed only with it on a container cluster.
@@ -160,6 +162,8 @@ impl DeployVars {
                 .map(|v| ("KARDAMOM_CLUSTER_RETENTION", v.to_string())),
             self.da_lag_budget_blocks
                 .map(|v| ("KARDAMOM_DA_LAG_BUDGET_BLOCKS", v.to_string())),
+            self.canary_local
+                .map(|enabled| ("CANARY_LOCAL", if enabled { "1" } else { "0" }.to_string())),
             Self::switch(self.l1_fault_proxy, "KARDAMOM_L1_FAULT_PROXY", "1"),
             self.indexer_poll_s
                 .map(|v| ("L1_INDEXER_POLL_S", v.to_string())),
@@ -234,6 +238,14 @@ impl Lifecycle {
         let mut cmd = Command::new(program);
         cmd.current_dir(&self.cluster_dir);
         cmd.envs(env.iter().map(|(k, v)| (*k, v.as_str())));
+        if self.vars.canary_local == Some(true) {
+            cmd.env("CANARY_MNEMONIC", "");
+            cmd.env("CANARY_L1_KEY", "");
+            cmd.env(
+                "ALERTMANAGER_CONFIG_FILE",
+                self.cluster_dir.join("config/alertmanager-chaos.yml"),
+            );
+        }
         cmd
     }
 
@@ -505,6 +517,34 @@ mod tests {
         assert_eq!(
             DeployVars::default().env(),
             vec![("KARDAMOM_GENESIS_CARRY", String::new())]
+        );
+    }
+
+    #[test]
+    fn a_local_canary_uses_the_cluster_test_alert_receiver() {
+        let vars = DeployVars {
+            canary_local: Some(true),
+            ..DeployVars::default()
+        };
+        assert!(vars.env().contains(&("CANARY_LOCAL", "1".to_string())));
+        let lifecycle = Lifecycle::new(Path::new("/repo")).with_vars(vars);
+        let command = lifecycle.command("ansible-playbook", &[]);
+        let setting = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == "ALERTMANAGER_CONFIG_FILE");
+        assert_eq!(
+            setting.unwrap().1,
+            Some(std::ffi::OsStr::new(
+                "/repo/deploy/cluster/config/alertmanager-chaos.yml"
+            ))
+        );
+        let defaults = Lifecycle::new(Path::new("/repo")).command("ansible-playbook", &[]);
+        assert!(
+            !defaults
+                .as_std()
+                .get_envs()
+                .any(|(key, _)| key == "ALERTMANAGER_CONFIG_FILE")
         );
     }
 

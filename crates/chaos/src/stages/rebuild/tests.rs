@@ -107,8 +107,18 @@ fn a_refusal_ends_the_wait_and_a_short_record_waits() {
 #[test]
 fn the_rebuild_genesis_matches_the_jobs() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let carry = Genesis { carry: true }.render(&repo).unwrap();
-    let dev = Genesis { carry: false }.render(&repo).unwrap();
+    let carry = Genesis {
+        carry: true,
+        canary: false,
+    }
+    .render(&repo)
+    .unwrap();
+    let dev = Genesis {
+        carry: false,
+        canary: false,
+    }
+    .render(&repo)
+    .unwrap();
     let fragment = std::fs::read_to_string(repo.join(CARRY_GENESIS)).unwrap();
     assert_eq!(carry, format!("{fragment}\n{dev}"));
     let parse = |text: &str| toml::from_str::<kardamom_types::Genesis>(text).unwrap();
@@ -119,5 +129,44 @@ fn the_rebuild_genesis_matches_the_jobs() {
     assert_eq!(
         parse(&dev).genesis_features,
         kardamom_types::upgrades::GenesisFeatures::None
+    );
+}
+
+#[test]
+fn the_rebuild_includes_the_same_funded_canary_accounts() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dev = Genesis {
+        carry: false,
+        canary: false,
+    }
+    .render(&repo)
+    .unwrap();
+    let carry = Genesis {
+        carry: true,
+        canary: false,
+    }
+    .render(&repo)
+    .unwrap();
+    let canary = std::fs::read_to_string(repo.join(CANARY_GENESIS)).unwrap();
+    let funded_dev = Genesis {
+        carry: false,
+        canary: true,
+    }
+    .render(&repo)
+    .unwrap();
+    let funded_carry = Genesis {
+        carry: true,
+        canary: true,
+    }
+    .render(&repo)
+    .unwrap();
+    assert_eq!(funded_dev, format!("{dev}\n{canary}"));
+    assert_eq!(funded_carry, format!("{carry}\n{canary}"));
+    let parse = |text: &str| toml::from_str::<kardamom_types::Genesis>(text).unwrap();
+    assert_eq!(parse(&funded_dev).alloc.len(), parse(&dev).alloc.len() + 4);
+    assert_eq!(parse(&funded_carry).alloc, parse(&funded_dev).alloc);
+    assert_eq!(
+        parse(&funded_carry).genesis_features,
+        parse(&carry).genesis_features
     );
 }
