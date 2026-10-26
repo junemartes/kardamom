@@ -533,10 +533,21 @@
     },
     {
       "id": "control-plane-aux-process-disappears",
-      "classification": "unresolved",
+      "classification": "product",
       "job": 121579144931,
       "observed": "The DNS port correction reaches the actual metadata partition. Three client transfers receive receipts while Nomad/Consul/DNS are isolated. The unchanged-process check detects aux container db1e1c593e5662408895d27bb276b8da83fd322e6759bf5b1d62e0369ba32b29 disappearing.",
-      "status": "Identify the missing task from full allocation diagnostics and determine why it stopped. Keep the process identity check and client receipt proof."
+      "status": "Reproduced and fixed locally. Deployed metadata-partition recovery remains pending. Final head remains unfrozen; streak 0/10.",
+      "product_bug": true,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "cause": "The batcher stores PostExhausted as typed anyhow context. ReaderHandles searches only the standard error-source chain, which cannot downcast this context. Exhausted DA retries become a fatal process exit instead of the existing automatic L1Unreachable halt and backoff.",
+      "change": "Use anyhow Error::is to recognize typed retry-exhaustion context. Keep the existing retry limit, spool recovery and automatic halt/backoff. Move unchanged reader setup and diagnosis into a sibling module to keep both files below 500 code lines. Preserve reader/runtime field and drop order.",
+      "verification": [
+        "The regression fails before the classifier change with nested typed PostExhausted context. A display-only lookalike remains fatal; a structured root error enters the halt.",
+        "49 batcher library tests pass after the module split. Workspace just style passes.",
+        "The vanished aux container maps to batcher allocation 72711ce5-f941-2e6d-c931-0c0de2c45adf. Its log ends at 13:16:14 UTC after six DA DNS failures, before fault cleanup.",
+        "No service wiring, healthy posting-path work, retry count or protocol change."
+      ]
     }
   ],
   "coverage": [
@@ -928,7 +939,7 @@
       "url": "https://github.com/junemartes/kardamom/pull/850",
       "cluster_run": 40320872242,
       "integrity_run": 40321151376,
-      "status": "All four supporting workflows pass. Both cluster builds pass. Load, semantics and follower pass. Cache fails because its executor baseline is behind Redis (nonce 1 vs 2); corrected locally. Combined ordering fails its outage observation when every head source is down. Coordination proves metadata isolation and three receipted client transactions, then detects a lost aux process; classification continues. Other shards and integrity remain live. Diagnostic only; streak 0/10."
+      "status": "All four supporting workflows and integrity pass. Nine regular shards/stages pass, carry remains live, and six fail. Cache baseline and batcher retry-exhaustion classification are corrected locally. Two-blank recovery, combined outage observation, DA-lag failed receipts and executor checkpoint copying remain under investigation. Diagnostic only; streak 0/10."
     }
   ],
   "integration": {
