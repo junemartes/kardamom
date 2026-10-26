@@ -111,7 +111,7 @@ final class PeerSeed {
     /** Run one round. Return whether it seeded the member; wait out the backoff when it did not. */
     private boolean seeded(final int round) {
         clusterDir.clear();
-        archiveDir.clearFiles();
+        archiveDir.clearArchive();
         final Round result = backUp();
         if (result.outcome() == SeedWatch.Outcome.SEEDED && copiedRetained(result.backup())) {
             clusterDir.dropMarkFiles();

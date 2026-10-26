@@ -95,7 +95,8 @@
       "verification": [
         "The real peer-seed regression fails with NoSuchFileException before the correction and passes after it.",
         "Stale Raft recording removed while executor catalog and recording contents survive peer-seed retries.",
-        "Full Java check: 208 core and 414 service tests, zero failures, including allocation gates."
+        "Full Java check: 208 core and 414 service tests, zero failures, including allocation gates.",
+        "Final merged Java tree: ./gradlew check passes 615 tests, including live Aeron peer seed and open nested-catalog fixtures; no failures, errors or skips."
       ]
     },
     {
@@ -147,6 +148,16 @@
       "observed": "All executor heads advance beyond 870 and recovery probes deliver every transaction. The validator and batcher egress readers remain at index 82106, next block 595 after a full cluster outage.",
       "change": "Capture every executor and egress frame-forwarding metric and HTTP range cursor on failure. Keep the validator recovery assertion and timeout unchanged.",
       "status": "unresolved; merge requires green combined-head recovery"
+    },
+    {
+      "id": "carry-shard-budget-and-expired-load",
+      "classification": "harness",
+      "job": 121376240086,
+      "case": "chaos-carry",
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40260202176/job/121376240086",
+      "observed": "The 120-minute job limit cancels case 7 after six cases pass. In carry-executors-rest, main load finishes at 04:40:33; the rollout finishes at about 04:56:46. The case passes after fault work with no background load.",
+      "cause": "Full deployment steps take longer than the fixed load windows and the shard budget. Completion of the load is not checked after injection.",
+      "status": "fix in unpublished wip/chaos-owned-load-20261026; further validation required"
     }
   ],
   "coverage": [

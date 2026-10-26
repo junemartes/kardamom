@@ -120,27 +120,26 @@ record StateDir(Path root) {
 
     /** Delete everything under the directory. Create the directory when it is missing. */
     void clear() {
+        clearContents(true);
+    }
+
+    /** Archive segments and metadata are flat. Nested directories hold independent archives. */
+    void clearArchive() {
+        clearContents(false);
+    }
+
+    private void clearContents(final boolean recursive) {
         try {
             Files.createDirectories(root);
-            try (Stream<Path> paths = Files.walk(root)) {
+            try (Stream<Path> paths = Files.walk(root, recursive ? Integer.MAX_VALUE : 1)) {
                 paths.filter(path -> !path.equals(root))
+                        .filter(path -> recursive || !Files.isDirectory(path))
                         .sorted(Comparator.reverseOrder())
                         .forEach(path -> unchecked(() -> Files.delete(path)));
             }
         } catch (final IOException ex) {
             throw new UncheckedIOException(ex);
         }
-    }
-
-    /** Clear the Raft archive's root files and preserve other archives in child directories. */
-    void clearFiles() {
-        unchecked(() -> Files.createDirectories(root));
-        unchecked(() -> {
-            try (Stream<Path> paths = Files.list(root)) {
-                paths.filter(Files::isRegularFile)
-                        .forEach(path -> unchecked(() -> Files.delete(path)));
-            }
-        });
     }
 
     /** Delete the mark files that a closed process left in the directory. */

@@ -4,7 +4,6 @@ use std::time::Instant;
 
 use kardamom_l1_fault_proxy::Fault;
 
-use super::batcher::require_posting;
 use super::followers::{Followers, await_archive_complete, await_resume};
 use super::halt::await_followers_halted;
 use crate::harness::Harness;
@@ -29,7 +28,8 @@ impl Refusal {
 
     async fn run(self, h: &mut Harness, l1: &L1, ctx: &str) -> anyhow::Result<()> {
         let base = Followers::ready(h, ctx).await?;
-        require_posting(h, ctx).await?;
+        let before = l1.last_batch_index().await?;
+        self.await_posting(l1, before, ctx).await?;
         let fault = self.fault();
         crate::log(format!(
             "{ctx}: refuse the first provider with {fault:?}; the second remains reachable"
