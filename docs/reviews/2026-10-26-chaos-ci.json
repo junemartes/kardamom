@@ -621,6 +621,6 @@
       "Committed local lookup evidence and timeout counter diagnostics",
       "Checked restart history anchors new executor copies in the egress merge"
     ],
-    "status": "Local tests and release profile in progress before publication. Diagnostic CI failed and was classified. Final head is not frozen; streak remains 0/10."
+    "status": "Prepared for diagnostic PR. 213 engine tests (one manual profile ignored), 201 chaos tests (two ignored), 14 audit tests and workspace style pass. Five controlled release A/B repeats show no observed steady tee regression. Final head is not frozen; streak remains 0/10."
   }
 }

@@ -323,7 +323,8 @@ impl Case {
             Self::CanaryDaLag => inject
                 .saturating_add(k.retention_freeze_cap.saturating_mul(2))
                 .saturating_add(Duration::from_mins(16)),
-            Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
+            // Scale-out and scale-in each submit overlap, ingress and steady jobs.
+            Self::ResizeScaleOutIn => inject + Duration::from_mins(30),
             // The failed deployment runs to the executor's healthy
             // deadline, then the real manifest replaces three executors.
             Self::DeployBrokenImage => inject + Duration::from_mins(12),
