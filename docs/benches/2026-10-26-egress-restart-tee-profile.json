@@ -1,0 +1,27 @@
+{
+  "profile": "steady FrameTee hold/release and immediate queue consumption",
+  "build": "cargo test -p kardamom-engine --lib --release --locked steady_tee_profile -- --ignored --nocapture --test-threads=1; repository thin LTO, codegen-units=1",
+  "baseline": "70d57d7a (production reader files only; identical manual profile in both test binaries)",
+  "comparison": "checked restart history forwarding; no steady FrameTee state added",
+  "method": "Five paired repeats, alternating execution order, same CPU affinity (CPU 0), 2000 warmup frames and 20000 timed frames per repeat. Every sample includes hold, release and consumer receive. Whole-phase throughput includes per-sample clocks and collection.",
+  "medians": {
+    "before": {
+      "p50_ns": 120,
+      "p95_ns": 130,
+      "p99_ns": 160,
+      "frames_per_second": 4801108.095748499
+    },
+    "after": {
+      "p50_ns": 120,
+      "p95_ns": 130,
+      "p99_ns": 150,
+      "frames_per_second": 5398026.157755155
+    }
+  },
+  "raw_samples": "docs/benches/2026-10-26-egress-restart-tee-samples.jsonl",
+  "conclusion": "No observed steady tee latency or throughput regression in controlled repeats. No speedup claim. These are local frame timings, not full client or deployed chain performance.",
+  "limitations": [
+    "Short local samples on a shared host. An initial unpinned pair varied from p50 120 to 160 ns; alternating pinned repeats remove that difference.",
+    "Extra checked-history publications occur during restart. Deployed recovery traffic and full client p50/p95/p99, throughput, lag and fallback volume remain unvalidated."
+  ]
+}

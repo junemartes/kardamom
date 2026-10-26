@@ -345,7 +345,7 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
         let Some(compare) = self.compare.as_mut() else {
             return Ok(());
         };
-        let progress = compare.drain()?;
+        let progress = compare.drain(&mut self.tee)?;
         self.close_compare(progress)
     }
 
@@ -358,7 +358,9 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
             return Ok(());
         };
         settled.log();
-        self.compare = None;
+        if let Some(compare) = self.compare.take().filter(|_| progress == Progress::Equal) {
+            compare.forward(&mut self.tee);
+        }
         self.ask(Instant::now());
         Ok(())
     }

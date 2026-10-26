@@ -523,3 +523,6 @@ fn an_equal_epoch_with_a_published_deposit_is_equal() {
         "the comparison ends equal, and delivery starts at the cursor"
     );
 }
+
+#[path = "tests_compare_tee.rs"]
+mod tee;

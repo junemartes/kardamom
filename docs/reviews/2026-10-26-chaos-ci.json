@@ -237,6 +237,44 @@
         "All 142 validator library tests pass, including bounded evidence, live unrelated traffic, replacement data, withdrawal invalidation and isolated far-key coverage."
       ],
       "status": "validated locally; full CI and postdeployment 4k benchmark pending"
+    },
+    {
+      "id": "expired-case-load-45ac",
+      "classification": "harness",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "observed": "Six cases complete recovery after their case-owned load window closes. Five regular cases and the nightly resize case expose uncovered load tails.",
+      "change": "Size load bounds for purge/rejoin, staggered quorum recovery, archive detect/heal, machine provisioning, and full carry deployment. Early stop keeps unused tail out of passing case runtime. Keep existing fault and recovery deadlines. Include the six Ansible submissions in the scale-out and scale-in load bound.",
+      "status": "201 chaos tests pass locally, deployed validation pending."
+    },
+    {
+      "id": "committed-local-floor-oracle",
+      "classification": "harness",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "observed": "The combined recovery oracle recognizes ok/redis but excludes local/live lookup outcomes emitted by the v1/v2 committed account layers.",
+      "change": "Include every committed answer source, reject error/timeout-only evidence, and retain the last per-replica counters on timeout.",
+      "status": "Source-label regression passes; actual combined-executor failure cause remains unconfirmed until deployed counters are available."
+    },
+    {
+      "id": "restarted-executor-copy-anchor",
+      "classification": "product",
+      "product_bug": true,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "observed": "Three restarted copies replay from their committed cursor and send the next canonical transaction and boundary. The existing egress merge delivers nothing because each copy lacks the previous boundary that anchors its new sequence.",
+      "cause": "A restarted carried reader compares old frames with its committed history, but only forwards newly executed frames to exec_frames. The merge cannot infer record placement after a sequence restart.",
+      "change": "Move the already held raw frames out in checked comparison order. Publish them on the existing tee only after the full comparison equals committed history. Discard staged history on rewind, skip, or divergence.",
+      "hot_path_detail": "No new steady-path state, connection, lock, metric or work. The tee extraction helper is shared with existing release. Restart comparison holds checked frames and publishes extra recovery traffic. Controlled release A/B shows no observed steady tee regression; deployed workload validation remains pending.",
+      "status": "Three-copy regression fails before the fix and passes after it. Divergent, partial, skipped and reconnected histories have negative controls. Deployed validation pending.",
+      "verification": [
+        "213 engine library tests pass; one manual profile ignored.",
+        "Before: /tmp/chaos-gaps-egress-anchor-before.log; after: /tmp/chaos-gaps-egress-anchor-after.log.",
+        "This fixes a restart anchor gap. It does not prove recovery after every copy loses a canonical frame outside the checked restart window.",
+        "Five alternating pinned release repeats: median frame p50 120 -> 120 ns, p95 130 -> 130 ns, p99 160 -> 150 ns; measured phase throughput 4.80 -> 5.40 million frames/s. No speedup claim; full cluster comparison pending. Summary and raw samples are in docs/benches/2026-10-26-egress-restart-tee-* ."
+      ]
     }
   ],
   "coverage": [
@@ -282,7 +320,7 @@
       "existing_shards": [
         "chaos-combined-exec"
       ],
-      "status": "existing case scheduled; awaiting CI"
+      "status": "Scheduled case runs in combined-exec; diagnostic run fails its source metric oracle. Correct local/live source coverage and retain last counters; deployed proof pending."
     },
     {
       "gap": "Provider HTTP 503 and 429 with backoff and automatic recovery",
@@ -290,7 +328,7 @@
       "existing_shards": [
         "chaos-follower"
       ],
-      "status": "The existing follower case covers 503, 429, and both providers accepting requests without replies. The last fault exposes an unbounded product read; a 30-second per-source deadline returns control for halt and backoff. Real HTTP deadline/backoff/recovery regression passes; deployed CI pending."
+      "status": "The existing follower case covers 503, 429, and both providers accepting requests without replies. The last fault exposes an unbounded product read; a 30-second per-source deadline returns control for halt and backoff. Real HTTP deadline/backoff/recovery regression passes; deployed CI pending. The follower shard passes on diagnostic head 45ac912f, including the scheduled provider refusal/timeout cases."
     },
     {
       "gap": "V2 refusal and offer recovery across session changes, halt, and downgrade",
@@ -353,7 +391,7 @@
       "existing_shards": [
         "chaos-sequencer"
       ],
-      "status": "Four isolated recovery proofs run in the existing sequencer-replica-kill case: both nodes of both lanes. Each uses a reserved established sender, checks publication by the recovered replica, and verifies its healthy twin stays frozen. 193 local chaos tests pass; deployed CI pending."
+      "status": "Four isolated recovery proofs run in the existing sequencer-replica-kill case: both nodes of both lanes. Each uses a reserved established sender, checks publication by the recovered replica, and verifies its healthy twin stays frozen. 193 local chaos tests pass; deployed CI pending. The sequencer shard passes on diagnostic head 45ac912f."
     },
     {
       "gap": "Persist divergence evidence through restart and allocation collection; deployed negative control",
@@ -361,7 +399,7 @@
         "chaos-executor",
         "chaos-integrity"
       ],
-      "status": "live 404 rejection implemented; durable evidence and negative control pending"
+      "status": "Full allocation logs and task metadata are retained in failure artifacts; missing live logs fail the scan. Terminal allocation 404, log rotation/GC, durable evidence and deployed negative controls remain open."
     },
     {
       "gap": "Mixed senders, lanes, contract storage and subscriptions under sustained faults",
@@ -383,7 +421,7 @@
       "existing_shards": [
         "chaos-coordinated"
       ],
-      "status": "pending"
+      "status": "Control-plane isolation scheduled in existing coordination shard. Block Nomad HTTP/RPC and Consul HTTP/DNS while data ports and current processes stay live; require receipted transfers during the fault, restore metadata access and prove worker identities unchanged. Local unit/style and script syntax checks pass; deployed validation pending."
     },
     {
       "gap": "Populated old deployment layouts and crash/open/clean-restart/upgrade sequence",
@@ -398,7 +436,7 @@
   "validation": {
     "runtime_product_files_changed": true,
     "service_wiring_changed": false,
-    "performance_claim": "No speedup is claimed. Local release microbenchmarks show no observed regression. Full cluster workload comparison and repeated green CI remain required.",
+    "performance_claim": "No speedup is claimed. Controlled alternating pinned release tee repeats show no observed steady latency or throughput regression. The RPC comparison is recorded separately. Full cluster workload comparison and ten green rounds remain required.",
     "completed": [
       {
         "check": "chaos library unit tests",
@@ -442,7 +480,7 @@
       "Remaining coverage gaps",
       "Full cluster workload comparison",
       "10 consecutive complete green CI rounds on the final unchanged commit",
-      "Deployed validation of the 72 scheduled cases, including the scoped canary genesis and guard restoration"
+      "Deployed validation of the 73 scheduled cases, including the scoped canary genesis and guard restoration"
     ],
     "ci_wiring_changed": "Retain load/profile evidence; add suite=all to the cluster workflow without changing normal PR/scheduled selection; make static validation dispatchable; test the persistent ten-round audit utility in CI. The serial carry rollout has a 180-minute job budget; all per-case recovery deadlines remain unchanged.",
     "streak_command": "python3 scripts/ci/green_streak.py --branch BRANCH --head FULL_SHA --state AUDIT.json --poll --run CI_ID --run CLUSTER_ID --run DOCKER_ID --run SEMANTICS_ID --run VALIDATION_ID",
@@ -543,11 +581,32 @@
       "pull_request": 846,
       "commit": "c5dd06630eb2efd5efe70021e288dff16d4b28db",
       "status": "Merged externally into integration; local checks pass; no frozen-head qualification"
+    },
+    {
+      "commit": "45ac912f81c3f4ee6a64f7a555404587a8cad5b3",
+      "workflow_run": 40281346742,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40281346742",
+      "status": "Diagnostic PR run, not a qualifying frozen-head round. Eight stages/shards pass; seven fail. Integrity has a separate run still in progress. Streak stays 0/10.",
+      "failures": {
+        "chaos-cluster": "cluster-member-rejoin exceeds the 120-second load window while waiting for a real log purge and a blank follower rejoin.",
+        "chaos-fleet": "cluster-quorum-loss-recover exceeds the 120-second load window during staggered member recovery.",
+        "chaos-ingress": "archive-corruption completes the detect/heal drill after 8m41s, beyond its 120-second load window.",
+        "chaos-executor": "node-replace-executor runs Terraform and the substrate play for 14m37s, beyond the load bound based only on Nomad rescheduling.",
+        "chaos-carry": "carry-versions-on completes its deployment and two upgrades after 25m44s, beyond the 25-minute load bound.",
+        "chaos-combined-exec": "The floor-lookup oracle times out; it excludes valid live/local committed outcomes and does not retain the last counters. Correct the oracle and collect evidence before claiming the case fixed.",
+        "chaos-combined-ordering": "Validator stays at block 401 while every executor restarts at committed cursor (11034,402). Both egress instances remain behind the seen stream. A three-copy restart regression reproduces the inability to anchor new copies without the checked old boundary."
+      }
+    },
+    {
+      "commit": "45ac912f81c3f4ee6a64f7a555404587a8cad5b3",
+      "workflow_run": 40282010861,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40282010861",
+      "status": "Diagnostic integrity run fails resize-scale-out-in after scale-out and scale-in finish. The load window is 13 minutes; six Ansible submissions plus overlap recovery take 16m17s. Resize recovery deadlines remain unchanged; the load bound needs the full rollout budget. No qualifying round."
     }
   ],
   "integration": {
-    "reviewed_head": "30bf66483eda44a5746347c34a9c3a30d4461a92",
-    "changes": "Peer-seed retry regression and wording, canonical contract cursor for provider recovery, carry-only 180-minute limit, egress stream diagnostics, and early-failure round-overlap rejection. Merge retains owned-load control, replay cancellation, and full allocation artifacts. Canonical carry transactions now update ingress seal latency and quorum progress; both golden wire formats have regression coverage.",
+    "reviewed_head": "45ac912f81c3f4ee6a64f7a555404587a8cad5b3",
+    "changes": "Peer-seed retry regression and wording, canonical contract cursor for provider recovery, carry-only 180-minute limit, egress stream diagnostics, and early-failure round-overlap rejection. Merge retains owned-load control, replay cancellation, and full allocation artifacts. Canonical carry transactions now update ingress seal latency and quorum progress; both golden wire formats have regression coverage. Retain bounded validator receipt-eviction evidence and its regression tests. The diagnostic run on this head still fails combined ordering.",
     "verification": "Merged tree: 615 Java tests and 10 allocation checks pass (202 core tests + 6 core allocation checks, 413 service tests + 4 service allocation checks). Workspace style, 14 CI audit tests, 193 chaos tests (2 ignored), 15 proxy tests, 32 watcher library tests, 14 source-set tests and the three real HTTP header/deadline tests pass."
   },
   "unpublished": {
@@ -555,8 +614,13 @@
     "changes": [
       "Scoped DA halt and prune-floor scheduling",
       "Funded local canary lifecycle and exact alert inhibition proof",
-      "L1 reconstruction includes the canonical canary genesis fragment"
+      "L1 reconstruction includes the canonical canary genesis fragment",
+      "Control-plane HTTP/RPC/DNS isolation in the existing coordination shard",
+      "Case-owned accepted traffic after recovery",
+      "Load bounds from diagnostic recovery timelines",
+      "Committed local lookup evidence and timeout counter diagnostics",
+      "Checked restart history anchors new executor copies in the egress merge"
     ],
-    "status": "Not pushed while the combined diagnostic CI run is collecting evidence. Final head is not frozen; streak remains 0/10."
+    "status": "Local tests and release profile in progress before publication. Diagnostic CI failed and was classified. Final head is not frozen; streak remains 0/10."
   }
 }
