@@ -20,7 +20,7 @@
 //! sealer is back-pressured; a full outbox stops the intake.
 //!
 //! The filter keeps each forwarded transaction until a row confirms it.
-//! The loop offers it again in two cases, so the sealer never orders a
+//! The loop offers it again after recovery, so the sealer never orders a
 //! later nonce of a sender in place of a lost one:
 //! - The cluster session changed (a leader change or a reconnect). The
 //!   old session can have lost the offers that it took. The publisher
@@ -32,6 +32,11 @@
 //! - The contiguity guard of the sealer rejects a nonce. The loop offers
 //!   the transaction at the expected nonce and the rejected one again,
 //!   when the filter still holds the expected one.
+//! - The lifecycle clears a pause. The sealer can have refused offers
+//!   during its upstream halt. The loop retries its unconfirmed runs
+//!   before it reads new input, also when the whole pause passes between
+//!   turns. Empty blocks during a pause do not expire those runs. Rows
+//!   still confirm them, and recovery starts a new loss window.
 //!
 //! The loop builds each offer when it goes to the outbox, in the format of
 //! the decision version that the sealer reports at that time. So the
@@ -42,6 +47,8 @@
 //! the parked depth of each vslot ([`depth`]) at each sweep.
 
 mod depth;
+mod offers;
+use offers::OfferReplay;
 mod runner;
 mod verdicts;
 
@@ -52,7 +59,6 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, B256};
-use kardamom_cluster_adapter::wire::{GuardHeader, position_deadline};
 use kardamom_obs::pipeline::Queue;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
 use kardamom_types::{TxDataLoc, TxDrop, TxEnvelope, TxError, TxErrorReason, TxStatus};
@@ -303,11 +309,22 @@ impl AdmissionLoop {
     /// offer, and the errors of the input and of the decode.
     pub fn run_once<P: SequencerPorts>(&mut self, ports: &mut P) -> Result<bool, SequencerError> {
         let applied = self.apply_accounts();
-        self.sweep_if_due(Instant::now());
+        let paused = self.pause.read_with(|paused| {
+            if !paused {
+                OfferReplay::new(
+                    &mut self.admission,
+                    &mut self.outbox,
+                    &self.sealer_version,
+                    self.cfg.partition,
+                )
+                .resume();
+            }
+        });
+        self.sweep_if_due(Instant::now(), paused);
         let (input, refs, side) = ports.split();
         side.flush_events();
         self.dispatch(side);
-        if self.pause.paused() {
+        if paused {
             return Ok(applied);
         }
         self.flush(refs, side)?;
@@ -366,41 +383,35 @@ impl AdmissionLoop {
         let offers: Vec<RefOffer> = [expected, nonce]
             .into_iter()
             .filter_map(|n| self.admission.unconfirmed_at(sender, n))
-            .map(|c| self.offer_of(c))
+            .map(|c| c.ref_offer(&self.sealer_version))
             .collect();
         self.outbox.extend(offers);
     }
 
-    /// The cluster session changed: the old session can have lost the
-    /// offers that it took. Put every unconfirmed run in the outbox again,
-    /// in place of what waits there, so the runs go out before any new
-    /// offer. The outbox holds only forwarded transactions, and each one is
-    /// in its run.
-    fn offer_again_on_new_session(&mut self) {
-        let offers: Vec<RefOffer> = self
-            .admission
-            .unconfirmed()
-            .map(|c| self.offer_of(c))
-            .collect();
-        tracing::warn!(
-            partition = self.cfg.partition,
-            offers = offers.len(),
-            "sequencer v2: the sealer session changed; offering the unconfirmed runs again"
-        );
-        self.outbox.clear();
-        self.outbox.extend(offers);
+    fn offer_again_unconfirmed(&mut self, reason: &str) {
+        OfferReplay::new(
+            &mut self.admission,
+            &mut self.outbox,
+            &self.sealer_version,
+            self.cfg.partition,
+        )
+        .queue(reason);
     }
 
-    fn sweep_if_due(&mut self, now: Instant) {
+    fn sweep_if_due(&mut self, now: Instant, paused: bool) {
         if now.duration_since(self.last_sweep) < self.cfg.sweep_every {
             return;
         }
         self.last_sweep = now;
-        self.admission.sweep(now, &mut self.verdicts);
+        if paused {
+            self.admission.sweep_while_paused(now, &mut self.verdicts);
+        } else {
+            self.admission.sweep(now, &mut self.verdicts);
+        }
         let generation = self.sealer_version.session_generation();
         if generation != self.session_generation {
             self.session_generation = generation;
-            self.offer_again_on_new_session();
+            self.offer_again_unconfirmed("sealer session changed");
         }
         self.depth.publish(self.cfg.partition);
     }
@@ -477,31 +488,6 @@ impl AdmissionLoop {
             .map_err(|e| SequencerError::EncodeFailed(format!("envelope: {e}")))
     }
 
-    /// The offer of `c` in the format of the decision version that the
-    /// sealer reports now: the bytes from version 5 on, and the tagged
-    /// position in the deadline field from version 4 on.
-    fn offer_of(&self, c: &Candidate<RefPayload>) -> RefOffer {
-        let p = &c.payload;
-        let deadline = if self.sealer_version.orders_by_position() {
-            position_deadline(p.stream_position).unwrap_or(p.max_inclusion_block)
-        } else {
-            p.max_inclusion_block
-        };
-        RefOffer {
-            tx_ref: kardamom_types::TxRef::new(c.tx_hash, p.lane, p.loc.position, p.loc.session_id),
-            guard: GuardHeader {
-                sender: c.sender,
-                nonce: c.nonce,
-                max_inclusion_block: deadline,
-                tip: p.tip,
-            },
-            envelope: p
-                .envelope
-                .clone()
-                .filter(|_| self.sealer_version.carries_bytes()),
-        }
-    }
-
     /// Turn the verdicts into offers, client errors and lookups.
     fn dispatch<R: SideChannelPublisher>(&mut self, side: &mut R) {
         // The vector goes back after the drain, so its capacity stays.
@@ -523,7 +509,7 @@ impl AdmissionLoop {
                 if let Some(ack) = c.answer() {
                     self.to_ingress.accept(ack);
                 }
-                self.outbox.push_back(self.offer_of(&c));
+                self.outbox.push_back(c.ref_offer(&self.sealer_version));
             }
             Verdict::Reject(mut c, refusal) => {
                 self.depth.gave(c.payload.vslot);
@@ -567,7 +553,7 @@ impl AdmissionLoop {
         }
         match err {
             Some(SequencerError::SessionChanged) => {
-                self.offer_again_on_new_session();
+                self.offer_again_unconfirmed("sealer session changed");
                 Ok(())
             }
             Some(SequencerError::Backpressure) => {

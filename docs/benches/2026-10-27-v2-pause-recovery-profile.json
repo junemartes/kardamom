@@ -1,0 +1,555 @@
+{
+  "baseline_commit": "5d8ac285a57f3162a2d8bebe2346d9263335c3ab",
+  "final_variant": "watch-hook",
+  "method": "Criterion v2_loop, release builds pinned to CPU 8 on a shared host (schedutil, SMT siblings 2 and 8). Both builds use the same benchmark source, a live clear lifecycle watch and carried reference bytes (KARDAMOM_V2_BENCH_CARRY=1). Batches contain 256 resident senders x 16 transactions (4096). Five before/after pairs per mode and workload alternate phase order. No local build or test overlaps measurement. Short comparisons group the three workloads by phase; longer comparisons put each workload before/after back to back and alternate workload and mode order. All observations and outliers remain.",
+  "modes": {
+    "normal": "Existing 50ms sweep cadence. A short batch can end before a timer tick.",
+    "forced_sweeps": "Benchmark-only KARDAMOM_V2_BENCH_FORCE_SWEEPS=1 forces every turn to sweep in both builds."
+  },
+  "comparisons": {
+    "initial": {
+      "samples_per_invocation": 20,
+      "warmup_seconds": 0.1,
+      "requested_measurement_seconds": 0.5,
+      "bootstrap_resamples": 1000,
+      "build": {
+        "restored": true,
+        "baseline": "5d8ac285a57f3162a2d8bebe2346d9263335c3ab",
+        "sources": {
+          "crates/sequencer/src/admission/mod.rs": {
+            "before_sha256": "c58a8135034e74d066d10675af629e2d351ae5f85e1f1b04c1b5c3a316157271",
+            "after_sha256": "19513360a28e60dcca7a928add961d1a2fbeabb13a49ffbc6e8c4da90abea499"
+          },
+          "crates/sequencer/src/pause_gate.rs": {
+            "before_sha256": "0b35eb90e1af932d85aa26eea4527d85c1919933dc8ad25c1fa5376bc0196167",
+            "after_sha256": "1d8e4abe7f0905cb4caf7b636287b147ac86c3ee669e965531d2dbcc23003fca"
+          },
+          "crates/sequencer/src/v2/mod.rs": {
+            "before_sha256": "4375eac07b0fca9edb08471c6ca153348c2d9d8063ae17974fc03d2576b5eea0",
+            "after_sha256": "9905129249d63a522aa1bb27904f2c32ff7d5fdb055555180c71dc16cb06d6a2"
+          }
+        },
+        "binaries": {
+          "before": {
+            "path": "/tmp/chaos-v2-pause-recovery-before",
+            "sha256": "b1f5872eca2b18957dec75098453a186dc5a9a67d9c80127ecf17b70a6e0845d"
+          },
+          "after": {
+            "path": "/tmp/chaos-v2-pause-recovery-after",
+            "sha256": "c86f9944e67abd20438c947fb86d17a5d46c6c1d28ed030e08e5a4249156ebb5"
+          }
+        },
+        "benchmark_sha256": "73d33942a880d3ef48198eec9c49eb5e20a34d9d4dfa0799edc64e2edd1df078",
+        "benchmark_env": {
+          "KARDAMOM_V2_BENCH_CARRY": "1"
+        }
+      },
+      "results": {
+        "normal": {
+          "in_order": {
+            "median_transactions_per_second": {
+              "before": 626384.6679629078,
+              "after": 699479.6629532652
+            },
+            "ratio_of_medians_delta_percent": 11.669346126889213,
+            "paired_delta_percent": [
+              13.835804645986283,
+              6.261185088553534,
+              -4.231437296421181,
+              12.15576507072873,
+              10.32230456003742
+            ],
+            "median_paired_delta_percent": 10.32230456003742
+          },
+          "reversed": {
+            "median_transactions_per_second": {
+              "before": 610821.2547692729,
+              "after": 611741.6643626787
+            },
+            "ratio_of_medians_delta_percent": 0.1506839498821133,
+            "paired_delta_percent": [
+              -3.225843502221304,
+              0.8869567118694244,
+              -6.7179712332693935,
+              -4.337340884814056,
+              1.8155520438602801
+            ],
+            "median_paired_delta_percent": -3.225843502221304
+          },
+          "with_verdicts": {
+            "median_transactions_per_second": {
+              "before": 605705.5749785866,
+              "after": 608097.6215217626
+            },
+            "ratio_of_medians_delta_percent": 0.39491902369570564,
+            "paired_delta_percent": [
+              -1.9553434353519306,
+              2.6284794813150603,
+              0.39491902369570564,
+              0.3599408243271318,
+              -0.4822556555749702
+            ],
+            "median_paired_delta_percent": 0.3599408243271318
+          }
+        },
+        "forced_sweeps": {
+          "in_order": {
+            "median_transactions_per_second": {
+              "before": 551439.3600573152,
+              "after": 555977.5043846177
+            },
+            "ratio_of_medians_delta_percent": 0.8229634400472863,
+            "paired_delta_percent": [
+              -0.4743658817212948,
+              2.0249654938656603,
+              6.242089269208995,
+              -1.8752510832983904,
+              -3.9897837365541866
+            ],
+            "median_paired_delta_percent": -0.4743658817212948
+          },
+          "reversed": {
+            "median_transactions_per_second": {
+              "before": 511136.1607207759,
+              "after": 523697.0819984715
+            },
+            "ratio_of_medians_delta_percent": 2.4574511143924838,
+            "paired_delta_percent": [
+              3.302178849296311,
+              2.905661200628673,
+              -2.01107984218053,
+              -2.7482836530453914,
+              4.644630552101625
+            ],
+            "median_paired_delta_percent": 2.905661200628673
+          },
+          "with_verdicts": {
+            "median_transactions_per_second": {
+              "before": 512806.4650873196,
+              "after": 514417.5955131935
+            },
+            "ratio_of_medians_delta_percent": 0.31417903937689395,
+            "paired_delta_percent": [
+              3.1319064301127852,
+              -3.821897174056932,
+              -1.4048379065886407,
+              5.270941576991683,
+              -1.4418410903663914
+            ],
+            "median_paired_delta_percent": -1.4048379065886407
+          }
+        }
+      }
+    },
+    "cold-helper": {
+      "samples_per_invocation": 20,
+      "warmup_seconds": 0.1,
+      "requested_measurement_seconds": 0.5,
+      "bootstrap_resamples": 1000,
+      "build": {
+        "restored": true,
+        "baseline": "5d8ac285a57f3162a2d8bebe2346d9263335c3ab",
+        "sources": {
+          "crates/sequencer/src/admission/mod.rs": {
+            "before_sha256": "c58a8135034e74d066d10675af629e2d351ae5f85e1f1b04c1b5c3a316157271",
+            "after_sha256": "9ba0ba562e0d0b56f27b8e2f4d138f663d6bd2ebf725b7fb950247e336fccb06"
+          },
+          "crates/sequencer/src/pause_gate.rs": {
+            "before_sha256": "0b35eb90e1af932d85aa26eea4527d85c1919933dc8ad25c1fa5376bc0196167",
+            "after_sha256": "1d8e4abe7f0905cb4caf7b636287b147ac86c3ee669e965531d2dbcc23003fca"
+          },
+          "crates/sequencer/src/v2/mod.rs": {
+            "before_sha256": "4375eac07b0fca9edb08471c6ca153348c2d9d8063ae17974fc03d2576b5eea0",
+            "after_sha256": "93a08c6eda980bf7d2e97a95410b167faac97de9a35425fc4856a6188b936a14"
+          }
+        },
+        "binaries": {
+          "before": {
+            "path": "/tmp/chaos-v2-pause-recovery-before",
+            "sha256": "b1f5872eca2b18957dec75098453a186dc5a9a67d9c80127ecf17b70a6e0845d"
+          },
+          "after": {
+            "path": "/tmp/chaos-v2-pause-recovery-optimized-after",
+            "sha256": "d0aa043487a4a2093e933d30ffa85d9935a092d2450797e14d3ffc31c840bfc4"
+          }
+        },
+        "benchmark_sha256": "73d33942a880d3ef48198eec9c49eb5e20a34d9d4dfa0799edc64e2edd1df078",
+        "benchmark_env": {
+          "KARDAMOM_V2_BENCH_CARRY": "1"
+        }
+      },
+      "results": {
+        "normal": {
+          "in_order": {
+            "median_transactions_per_second": {
+              "before": 822230.9983515332,
+              "after": 790283.6477733565
+            },
+            "ratio_of_medians_delta_percent": -3.885447111848983,
+            "paired_delta_percent": [
+              -5.95100517288496,
+              -1.957832915978519,
+              16.22677434772215,
+              -10.642637205827299,
+              -3.9041088479444763
+            ],
+            "median_paired_delta_percent": -3.9041088479444763
+          },
+          "reversed": {
+            "median_transactions_per_second": {
+              "before": 729474.3422315519,
+              "after": 750704.9760738678
+            },
+            "ratio_of_medians_delta_percent": 2.9104017253531733,
+            "paired_delta_percent": [
+              2.9104017253531733,
+              2.935031008273681,
+              -1.2946674556041038,
+              -6.423212426728231,
+              4.560227721602761
+            ],
+            "median_paired_delta_percent": 2.9104017253531733
+          },
+          "with_verdicts": {
+            "median_transactions_per_second": {
+              "before": 724303.4432494459,
+              "after": 735291.5041267339
+            },
+            "ratio_of_medians_delta_percent": 1.5170521388097047,
+            "paired_delta_percent": [
+              5.424257024608603,
+              -2.0578183107237913,
+              1.6006022389267294,
+              -9.774479160892469,
+              5.7841656976980405
+            ],
+            "median_paired_delta_percent": 1.6006022389267294
+          }
+        },
+        "forced_sweeps": {
+          "in_order": {
+            "median_transactions_per_second": {
+              "before": 670388.6439044299,
+              "after": 655840.0985623911
+            },
+            "ratio_of_medians_delta_percent": -2.1701658395205103,
+            "paired_delta_percent": [
+              -1.9446680452999798,
+              -5.0543608492097825,
+              0.1557214439682042,
+              1.705181454210991,
+              -9.252813848790776
+            ],
+            "median_paired_delta_percent": -1.9446680452999798
+          },
+          "reversed": {
+            "median_transactions_per_second": {
+              "before": 621465.9269831323,
+              "after": 620178.2668057702
+            },
+            "ratio_of_medians_delta_percent": -0.2071972285935142,
+            "paired_delta_percent": [
+              -1.2767596118294144,
+              11.646656587930448,
+              -1.210055465338955,
+              -4.871457475675256,
+              -6.359073147770422
+            ],
+            "median_paired_delta_percent": -1.2767596118294144
+          },
+          "with_verdicts": {
+            "median_transactions_per_second": {
+              "before": 603913.7384713811,
+              "after": 572245.4622042036
+            },
+            "ratio_of_medians_delta_percent": -5.243841007382255,
+            "paired_delta_percent": [
+              -0.06415111245267058,
+              -3.507064852923314,
+              -9.419021319383681,
+              -12.772608174593014,
+              0.9796189643866304
+            ],
+            "median_paired_delta_percent": -3.507064852923314
+          }
+        }
+      }
+    },
+    "cold-helper-confirmation": {
+      "samples_per_invocation": 60,
+      "warmup_seconds": 1,
+      "requested_measurement_seconds": 3,
+      "bootstrap_resamples": 1000,
+      "build": {
+        "restored": true,
+        "baseline": "5d8ac285a57f3162a2d8bebe2346d9263335c3ab",
+        "sources": {
+          "crates/sequencer/src/admission/mod.rs": {
+            "before_sha256": "c58a8135034e74d066d10675af629e2d351ae5f85e1f1b04c1b5c3a316157271",
+            "after_sha256": "9ba0ba562e0d0b56f27b8e2f4d138f663d6bd2ebf725b7fb950247e336fccb06"
+          },
+          "crates/sequencer/src/pause_gate.rs": {
+            "before_sha256": "0b35eb90e1af932d85aa26eea4527d85c1919933dc8ad25c1fa5376bc0196167",
+            "after_sha256": "1d8e4abe7f0905cb4caf7b636287b147ac86c3ee669e965531d2dbcc23003fca"
+          },
+          "crates/sequencer/src/v2/mod.rs": {
+            "before_sha256": "4375eac07b0fca9edb08471c6ca153348c2d9d8063ae17974fc03d2576b5eea0",
+            "after_sha256": "93a08c6eda980bf7d2e97a95410b167faac97de9a35425fc4856a6188b936a14"
+          }
+        },
+        "binaries": {
+          "before": {
+            "path": "/tmp/chaos-v2-pause-recovery-before",
+            "sha256": "b1f5872eca2b18957dec75098453a186dc5a9a67d9c80127ecf17b70a6e0845d"
+          },
+          "after": {
+            "path": "/tmp/chaos-v2-pause-recovery-optimized-after",
+            "sha256": "d0aa043487a4a2093e933d30ffa85d9935a092d2450797e14d3ffc31c840bfc4"
+          }
+        },
+        "benchmark_sha256": "73d33942a880d3ef48198eec9c49eb5e20a34d9d4dfa0799edc64e2edd1df078",
+        "benchmark_env": {
+          "KARDAMOM_V2_BENCH_CARRY": "1"
+        }
+      },
+      "results": {
+        "normal": {
+          "in_order": {
+            "median_transactions_per_second": {
+              "before": 814785.1023135,
+              "after": 794564.9241685158
+            },
+            "ratio_of_medians_delta_percent": -2.481657812295668,
+            "paired_delta_percent": [
+              1.7441083247328848,
+              -4.386562771670066,
+              -14.575466673193848,
+              -10.173234238285023,
+              0.8655014094865576
+            ],
+            "median_paired_delta_percent": -4.386562771670066
+          },
+          "reversed": {
+            "median_transactions_per_second": {
+              "before": 721040.9049308243,
+              "after": 730263.2979633674
+            },
+            "ratio_of_medians_delta_percent": 1.2790388131208585,
+            "paired_delta_percent": [
+              1.3944648682284733,
+              3.1443203395121966,
+              -0.7265506234979902,
+              -2.4075809920233726,
+              -1.0075927579506927
+            ],
+            "median_paired_delta_percent": -0.7265506234979902
+          },
+          "with_verdicts": {
+            "median_transactions_per_second": {
+              "before": 728975.6313466298,
+              "after": 724859.5647023651
+            },
+            "ratio_of_medians_delta_percent": -0.564637069782592,
+            "paired_delta_percent": [
+              1.3897234915206447,
+              -1.9953684533389526,
+              3.4706371521997514,
+              -2.257317656274649,
+              -1.9101351793134325
+            ],
+            "median_paired_delta_percent": -1.9101351793134325
+          }
+        },
+        "forced_sweeps": {
+          "in_order": {
+            "median_transactions_per_second": {
+              "before": 642057.0225116592,
+              "after": 644379.4195659386
+            },
+            "ratio_of_medians_delta_percent": 0.36171196215477597,
+            "paired_delta_percent": [
+              2.074992189539082,
+              -1.838112528945124,
+              -0.7231704601824429,
+              -0.777700134703041,
+              2.643577092240368
+            ],
+            "median_paired_delta_percent": -0.7231704601824429
+          },
+          "reversed": {
+            "median_transactions_per_second": {
+              "before": 602146.5992131256,
+              "after": 612161.5445893238
+            },
+            "ratio_of_medians_delta_percent": 1.6632071640503288,
+            "paired_delta_percent": [
+              -0.7654487912019392,
+              6.030366028979861,
+              2.612296982302098,
+              -3.462662935862193,
+              -3.489464311307011
+            ],
+            "median_paired_delta_percent": -0.7654487912019392
+          },
+          "with_verdicts": {
+            "median_transactions_per_second": {
+              "before": 617168.7015988398,
+              "after": 597743.6994649752
+            },
+            "ratio_of_medians_delta_percent": -3.147437983089907,
+            "paired_delta_percent": [
+              -4.707587867318286,
+              -4.176973947451157,
+              -3.6571024523669005,
+              0.6384622436147902,
+              0.9594187201284576
+            ],
+            "median_paired_delta_percent": -3.6571024523669005
+          }
+        }
+      }
+    },
+    "watch-hook": {
+      "samples_per_invocation": 60,
+      "warmup_seconds": 1,
+      "requested_measurement_seconds": 3,
+      "bootstrap_resamples": 1000,
+      "build": {
+        "restored": true,
+        "baseline": "5d8ac285a57f3162a2d8bebe2346d9263335c3ab",
+        "sources": {
+          "crates/sequencer/src/admission/mod.rs": {
+            "before_sha256": "c58a8135034e74d066d10675af629e2d351ae5f85e1f1b04c1b5c3a316157271",
+            "after_sha256": "d3f4c0956b753849409a5a57a780fe7bc016c8f07479c47997cad27422deb797"
+          },
+          "crates/sequencer/src/pause_gate.rs": {
+            "before_sha256": "0b35eb90e1af932d85aa26eea4527d85c1919933dc8ad25c1fa5376bc0196167",
+            "after_sha256": "89b26fc84c8b647f7159dbca69e6d34184e32f932a5a8b96104d2942f245a810"
+          },
+          "crates/sequencer/src/v2/mod.rs": {
+            "before_sha256": "4375eac07b0fca9edb08471c6ca153348c2d9d8063ae17974fc03d2576b5eea0",
+            "after_sha256": "8a66763a079b4221957b50689988777502343fdf6e557424ba304a2b4c1a52ad"
+          },
+          "crates/sequencer/src/v2/offers.rs": {
+            "before_sha256": null,
+            "after_sha256": "009baaa32eb842da8fd56288dd986202812aedc92a365081909c508e4f069fff"
+          }
+        },
+        "binaries": {
+          "before": {
+            "path": "/tmp/chaos-v2-pause-recovery-before",
+            "sha256": "b1f5872eca2b18957dec75098453a186dc5a9a67d9c80127ecf17b70a6e0845d"
+          },
+          "after": {
+            "path": "/tmp/chaos-v2-pause-recovery-hook-after",
+            "sha256": "8ce1844c205eaf58377bf482aac030d93601ce102a2f979d6d4db1971e09348b"
+          }
+        },
+        "benchmark_sha256": "73d33942a880d3ef48198eec9c49eb5e20a34d9d4dfa0799edc64e2edd1df078",
+        "benchmark_env": {
+          "KARDAMOM_V2_BENCH_CARRY": "1"
+        }
+      },
+      "results": {
+        "normal": {
+          "in_order": {
+            "median_transactions_per_second": {
+              "before": 822743.7695002983,
+              "after": 813600.3144755906
+            },
+            "ratio_of_medians_delta_percent": -1.111336890495207,
+            "paired_delta_percent": [
+              14.157426981942978,
+              -0.4240841861602118,
+              -3.3339250687235977,
+              0.09797493159511284,
+              2.1916369379325396
+            ],
+            "median_paired_delta_percent": 0.09797493159511284
+          },
+          "reversed": {
+            "median_transactions_per_second": {
+              "before": 717208.7998515806,
+              "after": 718105.8758344156
+            },
+            "ratio_of_medians_delta_percent": 0.1250787752493432,
+            "paired_delta_percent": [
+              -0.46374320610242936,
+              0.06474038838133467,
+              2.30389757039402,
+              -3.007422148032335,
+              -1.8596119063008842
+            ],
+            "median_paired_delta_percent": -0.46374320610242936
+          },
+          "with_verdicts": {
+            "median_transactions_per_second": {
+              "before": 737912.5881106717,
+              "after": 734569.2316521109
+            },
+            "ratio_of_medians_delta_percent": -0.4530829955240345,
+            "paired_delta_percent": [
+              -3.7159045747490738,
+              -0.7810851746584135,
+              0.5136574043679065,
+              0.5180731686266871,
+              0.5870920228537857
+            ],
+            "median_paired_delta_percent": 0.5136574043679065
+          }
+        },
+        "forced_sweeps": {
+          "in_order": {
+            "median_transactions_per_second": {
+              "before": 651093.0969820177,
+              "after": 635974.1610033285
+            },
+            "ratio_of_medians_delta_percent": -2.322085128650475,
+            "paired_delta_percent": [
+              -4.036161681493633,
+              0.465624812652643,
+              0.8984825710690147,
+              0.6134622422901304,
+              -0.4287819325511033
+            ],
+            "median_paired_delta_percent": 0.465624812652643
+          },
+          "reversed": {
+            "median_transactions_per_second": {
+              "before": 616819.1580556869,
+              "after": 610112.2475539448
+            },
+            "ratio_of_medians_delta_percent": -1.0873382277689414,
+            "paired_delta_percent": [
+              4.133809676732758,
+              -12.281842633017447,
+              0.7934962928129785,
+              -0.8711796745648481,
+              -4.056566222887525
+            ],
+            "median_paired_delta_percent": -0.8711796745648481
+          },
+          "with_verdicts": {
+            "median_transactions_per_second": {
+              "before": 592916.4282042702,
+              "after": 589026.6581738964
+            },
+            "ratio_of_medians_delta_percent": -0.656040184643647,
+            "paired_delta_percent": [
+              -7.337570727810294,
+              30.90125183876429,
+              -0.42591048827957945,
+              -0.656040184643647,
+              -0.08503648747711923
+            ],
+            "median_paired_delta_percent": -0.42591048827957945
+          }
+        }
+      }
+    }
+  },
+  "raw_samples": "2026-10-27-v2-pause-recovery-samples.jsonl",
+  "observation_count": 240,
+  "interpretation": "Early shapes raised a throughput concern; they remain here rather than being discarded. The final watch-hook shape has no new Admission field or extra normal-turn change test. Normal median paired throughput deltas are +0.10% ordered, -0.46% reversed and +0.51% with verdicts. Independent median ratios differ and all pair values are retained. Forced-sweep results include large host-noise outliers; they are an overhead control, not production capacity. No speedup or performance guarantee is claimed.",
+  "scope": "Resident V2 loop only. No client p50/p95/p99, RPC/network cost, deployed mirror lag or full-chain capacity is measured. Identical-workload deployed comparisons remain required."
+}

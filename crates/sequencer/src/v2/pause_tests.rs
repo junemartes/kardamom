@@ -11,6 +11,16 @@ impl Bench {
         bench.run();
         (bench, life)
     }
+
+    fn empty_block(&mut self, block: u64) {
+        self.accounts
+            .send(AccountEvent::Rows {
+                block,
+                rows: vec![],
+            })
+            .unwrap();
+        self.sweep();
+    }
 }
 
 #[test]
@@ -104,4 +114,101 @@ fn a_session_retry_waits_for_resume_and_excludes_confirmed_offers() {
     bench.run();
     bench.run();
     assert_eq!(bench.offers(), [(0, true), (1, true), (1, true)]);
+}
+
+#[test]
+fn a_da_pause_keeps_unconfirmed_offers_past_the_block_loss_window() {
+    let (mut bench, life) = Bench::with_lifecycle();
+    bench.send(0);
+    life.follow(Some(HaltRef::sealer(HaltCause::DaLag)));
+    bench.empty_block(100);
+    bench.empty_block(200);
+    assert!(
+        bench
+            .l
+            .admission
+            .unconfirmed_at(bench.sender(), 0)
+            .is_some(),
+        "empty blocks during an upstream halt do not prove that a held offer is lost"
+    );
+    assert_eq!(bench.offers(), [(0, true)]);
+    life.follow(None);
+    bench.run();
+    assert_eq!(bench.offers(), [(0, true), (0, true)]);
+}
+
+#[test]
+fn clearing_a_da_pause_retries_the_missing_nonce_before_new_input() {
+    let (mut bench, life) = Bench::with_lifecycle();
+    bench.send(0);
+    life.follow(Some(HaltRef::sealer(HaltCause::DaLag)));
+    bench.queue(1);
+    bench.run();
+    life.follow(None);
+    bench.run();
+    assert_eq!(bench.offers(), [(0, true), (0, true), (1, true)]);
+}
+
+#[test]
+fn a_pause_and_clear_between_turns_still_retries_the_unconfirmed_suffix() {
+    let (mut bench, life) = Bench::with_lifecycle();
+    bench.send(0);
+    bench.send(1);
+    life.follow(Some(HaltRef::sealer(HaltCause::DaLag)));
+    bench.confirm_first();
+    life.follow(None);
+    bench.run();
+    bench.run();
+    assert_eq!(bench.offers(), [(0, true), (1, true), (1, true)]);
+}
+
+#[test]
+fn a_resumed_offer_gets_one_new_loss_window_and_then_expires() {
+    let (mut bench, life) = Bench::with_lifecycle();
+    bench.send(0);
+    life.follow(Some(HaltRef::sealer(HaltCause::DaLag)));
+    for block in [100, 200] {
+        bench.empty_block(block);
+    }
+    life.follow(None);
+    bench.run();
+    assert_eq!(bench.offers(), [(0, true), (0, true)]);
+    bench.empty_block(201);
+    assert!(
+        bench
+            .l
+            .admission
+            .unconfirmed_at(bench.sender(), 0)
+            .is_some()
+    );
+    life.follow(None);
+    bench.empty_block(216);
+    assert!(
+        bench
+            .l
+            .admission
+            .unconfirmed_at(bench.sender(), 0)
+            .is_none()
+    );
+    assert_eq!(bench.offers(), [(0, true), (0, true)]);
+}
+
+#[test]
+fn a_gate_attached_during_a_pause_also_holds_the_existing_run() {
+    let mut bench = Bench::new(SealerVersion::starting_at(5));
+    bench.send(0);
+    let life = Lifecycle::new(Some("sequencer"));
+    life.follow(Some(HaltRef::sealer(HaltCause::DaLag)));
+    bench.l.enable_pause(life.subscribe());
+    for block in [100, 200] {
+        bench.empty_block(block);
+    }
+    assert!(
+        bench
+            .l
+            .admission
+            .unconfirmed_at(bench.sender(), 0)
+            .is_some()
+    );
+    assert_eq!(bench.offers(), [(0, true)]);
 }
