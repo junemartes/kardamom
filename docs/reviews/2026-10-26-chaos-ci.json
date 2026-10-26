@@ -29,7 +29,7 @@
       "product_bug": false,
       "service_wiring_changed": false,
       "hot_path_changed": false,
-      "status": "fix awaiting CI",
+      "status": "Harness scope corrected; PR 839 still reproduces the stall because peer seeding also recursively deletes the nested archive.",
       "verification": [
         "Temporary-tree wipe test verifies member data is removed, including hidden files, while live archive/dir, executor state, and egress files survive."
       ]
@@ -80,6 +80,57 @@
         "Five release repeats per version, 400 samples per phase: fresh RPC p99 221.81 -> 205.52 us; serial admission median 3282.38 -> 3988.67 TPS. Shared-host variation prevents a speedup claim.",
         "Performance summary and raw samples: docs/benches/2026-10-26-ingress-rpc-cache-profile.json"
       ]
+    },
+    {
+      "id": "peer-seed-deletes-live-executor-archive",
+      "classification": "product",
+      "job": 121399758442,
+      "case": "cluster-member-rejoin",
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40267573235/job/121399758442",
+      "observed": "Member 1 rejoins through block 510, then its executor stalls at 521 while peers reach 634. exec_txs recordings time out. Preserving archive/dir in the harness alone does not fix it.",
+      "cause": "PeerSeed.seeded calls StateDir.clear on the member archive parent. Its recursive walk deletes the independent live executor archive in archive/dir.",
+      "reason_missed": "Earlier reference-born topology places executors on separate nodes. Existing peer-seed JUnit fixtures contain only member archive files.",
+      "change": "Use flat-file archive cleanup while retaining recursive cleanup for consensus and retained state. Preserve independent nested archive directories.",
+      "hot_path_changed": false,
+      "service_wiring_changed": false,
+      "status": "fix validated locally; full CI pending",
+      "verification": [
+        "The new live-catalog regression fails before the cleanup fix and passes after it.",
+        "All 615 Java tests pass (202 core, 413 service).",
+        "192 chaos library tests pass, 2 ignored; just style passes."
+      ]
+    },
+    {
+      "id": "provider-refusal-process-counter-reset",
+      "classification": "harness",
+      "job": 121399758434,
+      "case": "l1-transport-refusals",
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40267573235/job/121399758434",
+      "observed": "The canonical L1 posting record stays flat, but the test fails on a changed batcher post counter. The batcher restarts after provider retries exhaust, resetting its counter.",
+      "cause": "A per-process counter is compared for equality across a fault that can restart the process. A reset is incorrectly reported as a new post.",
+      "change": "Use the complete canonical L1 batch record for the freeze and absolute batch count for recovery, including pre-fault readiness.",
+      "hot_path_changed": false,
+      "service_wiring_changed": false,
+      "status": "assertion corrected; CI pending"
+    },
+    {
+      "id": "carry-shard-budget-and-expired-load",
+      "classification": "harness",
+      "job": 121376240086,
+      "case": "chaos-carry",
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40260202176/job/121376240086",
+      "observed": "The 120-minute job limit cancels case 7 after six cases pass. In carry-executors-rest, main load finishes at 04:40:33; the rollout finishes at about 04:56:46. The case passes after fault work with no background load.",
+      "cause": "Full deployment steps take longer than the fixed load windows and the shard budget. Completion of the load is not checked after injection.",
+      "status": "fix in unpublished wip/chaos-owned-load-20261026; further validation required"
+    },
+    {
+      "id": "validator-carried-input-stall-after-ingress-sealer-loss",
+      "classification": "under investigation",
+      "job": 121399758458,
+      "case": "ingress-sealer-loss-recover",
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40267573235/job/121399758458",
+      "observed": "All client completeness and recovery probes pass, but validator stays at block 594 while executors reach 873. It alternates service/feed Silent faults at cursor (82106,595).",
+      "status": "preserved log /tmp/chaos-gaps-pr839-ordering.log; root cause and reproducer pending"
     }
   ],
   "coverage": [
@@ -272,6 +323,14 @@
       {
         "check": "ten-round audit utility",
         "result": "13 tests pass; real GitHub run and job evidence reads verified"
+      },
+      {
+        "check": "peer-seed recovery regression",
+        "result": "Fails before the fix; passes after. All 615 Java tests pass."
+      },
+      {
+        "check": "chaos library tests after canonical posting assertion fix",
+        "result": "192 passed, 2 ignored"
       }
     ],
     "pending": [
@@ -321,6 +380,18 @@
       "workflow_run": 40268972862,
       "url": "https://github.com/junemartes/kardamom/actions/runs/40268972862",
       "status": "in progress"
+    },
+    {
+      "pull_request": 841,
+      "commit": "81217cfe54e0843a46bb43e5bba5bccafa790d19",
+      "workflow_run": 40270824321,
+      "status": "superseded cluster run cancelled; fixes continue on descendants"
+    },
+    {
+      "pull_request": 842,
+      "commit": "42cb927aaa5ba588676e824e8c98df9799095c9a",
+      "workflow_run": 40271525408,
+      "status": "superseded cluster run cancelled; fixes continue on descendants"
     }
   ]
 }

@@ -120,10 +120,20 @@ record StateDir(Path root) {
 
     /** Delete everything under the directory. Create the directory when it is missing. */
     void clear() {
+        clearContents(true);
+    }
+
+    /** Archive segments and metadata are flat. Nested directories hold independent archives. */
+    void clearArchive() {
+        clearContents(false);
+    }
+
+    private void clearContents(final boolean recursive) {
         try {
             Files.createDirectories(root);
-            try (Stream<Path> paths = Files.walk(root)) {
+            try (Stream<Path> paths = Files.walk(root, recursive ? Integer.MAX_VALUE : 1)) {
                 paths.filter(path -> !path.equals(root))
+                        .filter(path -> recursive || !Files.isDirectory(path))
                         .sorted(Comparator.reverseOrder())
                         .forEach(path -> unchecked(() -> Files.delete(path)));
             }
