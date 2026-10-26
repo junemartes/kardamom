@@ -33,11 +33,8 @@ fn every_shard_case_parses_and_names_round_trip() {
         })
         .copied()
         .collect();
-    // These cases need a small DA budget or the local canary, set for their own fault window.
-    assert_eq!(
-        unscheduled,
-        [Case::DaLagHalt, Case::CanaryDaLag, Case::PruneFloor]
-    );
+    // The canary needs its funded genesis and a scoped job lifecycle.
+    assert_eq!(unscheduled, [Case::CanaryDaLag]);
     shards
         .iter()
         .try_for_each(|shard| {

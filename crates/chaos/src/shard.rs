@@ -16,6 +16,12 @@ use crate::lifecycle::{CarrySwitches, DeployVars, EgressStage};
 /// The sealer retention of the carry shard, in frames. The exact window
 /// keeps this many frames.
 const CARRY_RETENTION: u64 = 16_384;
+const RETENTION_CASES: [&str; 4] = [
+    "retention-overrun",
+    "retention-overrun-validator",
+    "prune-floor",
+    "da-lag-halt",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shard {
@@ -156,7 +162,7 @@ impl Shard {
                 "read-path-loss-recover",
                 "sequencer-executor-redis-loss",
             ],
-            Self::Retention => &["retention-overrun", "retention-overrun-validator"],
+            Self::Retention => &RETENTION_CASES,
             // A lying L1 in front of the followers. The outage past the
             // retention runs last: it holds the load until the sealers'
             // floor passes, the longest case, and a failure there must
@@ -269,6 +275,7 @@ impl Shard {
                 ..DeployVars::default()
             },
             Self::Retention => DeployVars {
+                cluster_snapshot_interval_s: Some(60),
                 cluster_retention: Some(6144),
                 checkpoint_log: true,
                 ..DeployVars::default()
@@ -389,7 +396,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 69);
+        assert_eq!(all.len(), 71);
         assert_eq!(
             Shard::Integrity.cases().last(),
             Some(&"resize-scale-out-in")

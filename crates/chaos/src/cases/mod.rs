@@ -308,9 +308,12 @@ impl Case {
             Self::ValidatorLapse => inject + k.validator_lapse + Duration::from_mins(1),
             Self::RetentionOverrun
             | Self::RetentionOverrunValidator
-            | Self::DaLagHalt
             | Self::CanaryDaLag
             | Self::PruneFloor => inject + k.retention_freeze_cap + Duration::from_mins(2),
+            // The scoped guard rolls the members before and after the fault.
+            Self::DaLagHalt => inject
+                .saturating_add(k.retention_freeze_cap.saturating_mul(2))
+                .saturating_add(Duration::from_mins(8)),
             Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
             // The failed deployment runs to the executor's healthy
             // deadline, then the real manifest replaces three executors.
@@ -516,7 +519,7 @@ impl Case {
             Self::RedisPartitionIngress => cache::redis_partition_ingress(h).await,
             Self::RedisTotalLossRecover => cache::redis_total_loss_recover(h).await,
             Self::MirrorKillRebuild => cache::mirror_kill_rebuild(h).await,
-            Self::DaLagHalt => da_lag::da_lag_halt(h).await,
+            Self::DaLagHalt => da_lag::scheduled_halt(h).await,
             Self::CanaryDaLag => l1_canary::canary_da_lag(h).await,
             Self::PruneFloor => da_lag::prune_floor(h).await,
             Self::L1Liar => l1::liar(h).await,
