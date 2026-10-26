@@ -16,6 +16,8 @@ use kardamom_bench::load::{
 };
 use serde::Deserialize;
 
+use crate::poll::{self, Budget};
+
 /// The burn address of every load transfer.
 /// The burn address of every load transfer.
 pub const SINK: Address = address!("000000000000000000000000000000000000dEaD");
@@ -167,6 +169,35 @@ impl LoadRun {
             .borrow()
             .as_ref()
             .is_some_and(Progress::is_flowing)
+    }
+
+    pub(crate) fn accepted(&self) -> u64 {
+        self.ready.borrow().as_ref().map_or(0, Progress::accepted)
+    }
+
+    pub(crate) async fn await_accepted_after(
+        &self,
+        case: &str,
+        before: u64,
+        budget: Duration,
+    ) -> anyhow::Result<()> {
+        let outcome = poll::until(
+            Budget::new(budget, Duration::from_secs(1)),
+            |_| async move {
+                self.assert_submitting(case)?;
+                let accepted = self.accepted();
+                Ok::<_, anyhow::Error>((accepted > before).then_some(accepted))
+            },
+        )
+        .await?;
+        let (accepted, elapsed) = outcome.or_fail(|_| crate::chaos_fail!(
+            "{case}: the case's own load accepts no transaction after recovery (accepted {before}, budget {}s)", budget.as_secs()
+        ))?;
+        crate::log(format!(
+            "{case}: case-owned accepted traffic {before} -> {accepted} after {}s of recovery observation",
+            elapsed.as_secs()
+        ));
+        Ok(())
     }
 
     pub(crate) fn assert_submitting(&self, case: &str) -> anyhow::Result<()> {

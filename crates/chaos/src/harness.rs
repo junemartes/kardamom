@@ -292,8 +292,10 @@ impl Harness {
         self.inject_gate(case, load, rx0).await?;
         case.run(self).await?;
         load.assert_submitting(case.name())?;
+        let accepted = load.accepted();
         case.assert_recovered_progress(self).await?;
-        load.assert_submitting(case.name())
+        load.await_accepted_after(case.name(), accepted, self.knobs.restart_slo)
+            .await
     }
 
     fn pick_account(&mut self, case: Case) -> anyhow::Result<u32> {
