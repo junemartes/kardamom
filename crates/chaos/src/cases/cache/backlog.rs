@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 
-use super::rebuilds::MirrorRebuilds;
-use super::{aux, live_primary, redis_cli, wait_readers_recovered};
+use super::rebuilds::{MirrorRebuilds, RebuildPhase};
+use super::{MIRROR_HEAD_KEYS, aux, live_primary, redis_cli, wait_readers_recovered};
 use crate::harness::Harness;
 use crate::metrics;
 use crate::nomad::SavedJob;
@@ -17,7 +17,6 @@ use crate::rpc::{AccountState, Rpc};
 const CTX: &str = "mirror-backlog-client-restart";
 /// The fixture uses the service default of 8192 canonical positions.
 const STALE_GAP: i64 = 8_192;
-const HEAD_KEYS: &str = "head:0 head:1 head:2";
 
 struct Baseline {
     primary: String,
@@ -76,7 +75,7 @@ impl Baseline {
             .nodes
             .exec(
                 &aux(h),
-                &redis_cli(&format!("--raw -h {primary} MGET {HEAD_KEYS}")),
+                &redis_cli(&format!("--raw -h {primary} MGET {MIRROR_HEAD_KEYS}")),
             )
             .await?;
         let baseline = Self {
@@ -109,15 +108,19 @@ impl Baseline {
     }
 
     async fn await_row(&self, h: &Harness, account: &AccountState) -> anyhow::Result<()> {
+        let last = std::cell::RefCell::new(String::from("no row response"));
+        let last_ref = &last;
         poll::until(Budget::secs(120, 2), |_| async move {
-            Ok::<_, anyhow::Error>(
-                account
-                    .matches_projection(&self.row(h).await?)
-                    .then_some(()),
-            )
+            let observed = self.row(h).await?;
+            let complete = account.matches_projection(&observed);
+            last_ref.replace(observed);
+            Ok::<_, anyhow::Error>(complete.then_some(()))
         })
         .await?
-        .or_fail(|_| crate::chaos_fail!("{CTX}: exact account row is not projected"))?;
+        .or_fail(|elapsed| crate::chaos_fail!(
+            "{CTX}: exact account row is not projected after {}s: expected {account:?}, observed {:?}, primary {}",
+            elapsed.as_secs(), last.borrow(), self.primary
+        ))?;
         Ok(())
     }
 
@@ -203,7 +206,10 @@ impl Baseline {
             .nodes
             .exec(
                 &aux(h),
-                &redis_cli(&format!("--raw -h {} MGET {HEAD_KEYS}", self.primary)),
+                &redis_cli(&format!(
+                    "--raw -h {} MGET {MIRROR_HEAD_KEYS}",
+                    self.primary
+                )),
             )
             .await?;
         anyhow::ensure!(
@@ -248,7 +254,7 @@ pub(crate) async fn client_restart(h: &mut Harness) -> anyhow::Result<()> {
         .nodes
         .exec(
             &aux(h),
-            &redis_cli(&format!("-h {} DEL {HEAD_KEYS}", baseline.primary)),
+            &redis_cli(&format!("-h {} DEL {MIRROR_HEAD_KEYS}", baseline.primary)),
         )
         .await;
     let restored = mirrors.restore().await;
@@ -273,7 +279,10 @@ pub(crate) async fn client_restart(h: &mut Harness) -> anyhow::Result<()> {
     cleared?;
     restored?;
     saved?;
-    baseline.rebuilds.await_all(h, CTX).await?;
+    baseline
+        .rebuilds
+        .await_phase(h, CTX, RebuildPhase::Complete)
+        .await?;
     baseline.await_row(h, &expected).await?;
     wait_readers_recovered(h, CTX).await?;
     h.assert_progress().await

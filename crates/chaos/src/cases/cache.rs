@@ -26,6 +26,7 @@ use crate::rpc::Rpc;
 
 mod backlog;
 mod coverage;
+mod interrupted;
 pub(crate) use backlog::client_restart;
 mod rebuilds;
 pub(crate) use coverage::CacheRecovery;
@@ -47,6 +48,7 @@ const PROMOTION_BUDGET: Duration = Duration::from_mins(1);
 const REDIS_ALLOCS: usize = 5;
 /// The mirror job: one mirror per executor node.
 const MIRROR_ALLOCS: usize = 3;
+const MIRROR_HEAD_KEYS: &str = "head:0 head:1 head:2";
 /// The ports ingress-0 drops in the partition case: Redis, then the
 /// sentinels. One rule per port; a multiport match needs a kernel
 /// module the host may lack.
@@ -525,36 +527,7 @@ async fn partitioned_phase(h: &Harness, ctx: &str) -> anyhow::Result<()> {
 /// idle used sender and an untouched funded account prove the rebuild
 /// restores checkpoint coverage beyond the new live rows.
 pub(crate) async fn mirror_kill_rebuild(h: &mut Harness) -> anyhow::Result<()> {
-    let ctx = "mirror-kill-rebuild";
-    wait_readers_connected(h, ctx).await?;
-    let recovery = CacheRecovery::capture(h).await?;
-    let nodes: Vec<String> = h
-        .probes
-        .executors
-        .iter()
-        .map(|e| e.container.clone())
-        .collect();
-    let mut mirrors = Vec::with_capacity(nodes.len());
-    for node in &nodes {
-        if let Some(cid) = h.nodes.inner_cid(node, "state-mirror").await {
-            mirrors.push((node.clone(), cid));
-        }
-    }
-    let flushed = freeze_and_flush(h, ctx, &mirrors).await;
-    for (node, cid) in mirrors.iter().filter(|(node, _)| *node != nodes[0]) {
-        h.nodes.inner_kill(node, cid).await?;
-    }
-    h.inject_hard(&[&nodes[0]], "state-mirror").await?;
-    let master = flushed?;
-    crate::log(format!(
-        "{ctx}: mirrors frozen, {master} flushed, mirrors killed"
-    ));
-    h.assert_count("state-mirror", MIRROR_ALLOCS, h.knobs.restart_slo)
-        .await?;
-    wait_mirror_advances(h, ctx).await?;
-    recovery.await_restored(h, ctx).await?;
-    wait_readers_recovered(h, ctx).await?;
-    h.assert_progress().await
+    interrupted::InterruptedRebuild::run(h).await
 }
 
 /// Freeze every mirror with SIGSTOP, then flush the primary. A frozen

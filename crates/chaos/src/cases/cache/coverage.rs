@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 
-use super::rebuilds::MirrorRebuilds;
+use super::rebuilds::{MirrorRebuilds, RebuildPhase};
 use super::{aux, live_primary, redis_cli};
 use crate::harness::Harness;
 use crate::poll::{self, Budget};
@@ -35,7 +35,9 @@ impl CacheRecovery {
     }
 
     pub(crate) async fn await_restored(&self, h: &Harness, ctx: &str) -> anyhow::Result<()> {
-        self.mirrors.await_all(h, ctx).await?;
+        self.mirrors
+            .await_phase(h, ctx, RebuildPhase::Complete)
+            .await?;
         let master = live_primary(h, ctx).await?;
         let last = RefCell::new(Vec::new());
         let (master_ref, last_ref) = (&master, &last);
