@@ -188,6 +188,8 @@ struct KeyedBuffer<K, S> {
 
 struct KeyedInner<K, S> {
     map: BTreeMap<K, S>,
+    /// Discarded keys, bounded by the value cap. They carry no verified result.
+    evicted: BTreeSet<K>,
     /// Index of the latest key requested by `take`. Requests only
     /// increase. An insert more than the late window below this index is
     /// for a key that the consumer can no longer use, so the buffer
@@ -200,6 +202,23 @@ struct KeyedInner<K, S> {
     /// wait. The producer is idle or gone, so a missing key does not
     /// come: a take for it returns at once. The next insert clears it.
     quiet: bool,
+}
+
+impl<K: BufKey, S: Slot> KeyedInner<K, S> {
+    /// Keep the nearest values and bounded evidence of discarded tail keys.
+    fn evict(&mut self, cap: NonZeroUsize) -> usize {
+        let Some((key, slot)) = (self.map.len() > cap.get())
+            .then(|| self.map.pop_last())
+            .flatten()
+        else {
+            return 0;
+        };
+        self.evicted.insert(key);
+        if self.evicted.len() > cap.get() {
+            self.evicted.pop_first();
+        }
+        slot.results()
+    }
 }
 
 /// What an insert did: the reason the buffer refused the item, and how
@@ -238,6 +257,7 @@ impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
         Self {
             inner: Mutex::new(KeyedInner {
                 map: BTreeMap::new(),
+                evicted: BTreeSet::new(),
                 cursor: None,
                 inserts: 0,
                 quiet: false,
@@ -276,24 +296,25 @@ impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
                     Entry::Occupied(mut e) => e.get_mut().join(item).err(),
                 });
         if refused.is_none() {
+            g.evicted.remove(&key);
             g.inserts = g.inserts.wrapping_add(1);
             g.quiet = false;
         }
-        let evicted = (g.map.len() > self.bounds.cap.get())
-            .then(|| g.map.pop_last())
-            .flatten()
-            .map_or(0, |(_, slot)| slot.results());
+        let evicted = g.evict(self.bounds.cap);
         Inserted { refused, evicted }
     }
 
     /// Call `keep` on each slot under the lock, and drop each slot for
     /// which it returns `false`.
     fn retain(&self, keep: impl FnMut(&K, &mut S) -> bool) {
-        self.inner
+        let mut g = self
+            .inner
             .lock()
-            .expect("verification buffer lock poisoned")
-            .map
-            .retain(keep);
+            .expect("verification buffer lock poisoned");
+        // A withdrawal changes producer history: replacement data can arrive.
+        g.evicted.clear();
+        g.quiet = false;
+        g.map.retain(keep);
     }
 
     /// Why `key` is outside the window around `cursor`, if it is.
@@ -327,6 +348,7 @@ impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
         // lie beyond the reach; they go now.
         let cursor = g.cursor.map_or(key.index(), |c| c.max(key.index()));
         g.cursor = Some(cursor);
+        g.evicted = g.evicted.split_off(&key);
         let beyond = g.map.split_off(&K::from_index(
             cursor.saturating_add(self.bounds.reach).saturating_add(1),
         ));
@@ -365,6 +387,9 @@ impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
         if let Some(v) = g.map.remove(key) {
             return TakeStep::Done(Some(v));
         }
+        if g.evicted.remove(key) {
+            return TakeStep::Done(None);
+        }
         // Catch-up check: if the live head (a run of buffered keys) is
         // far ahead of `key`, this item has aged out of the live stream's
         // buffer and will never arrive. Return None now instead of
@@ -377,7 +402,13 @@ impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
                 .saturating_add(self.bounds.lookbehind)
                 .saturating_add(1),
         );
-        if g.map.range(horizon..).nth(SKIP_EVIDENCE - 1).is_some() {
+        if g.map
+            .range(horizon..)
+            .map(|(key, _)| key)
+            .chain(g.evicted.range(horizon..))
+            .nth(SKIP_EVIDENCE - 1)
+            .is_some()
+        {
             return TakeStep::Done(None);
         }
         // Quiet check: a catch-up after a restart on an idle chain has no

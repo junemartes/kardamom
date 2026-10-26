@@ -223,6 +223,20 @@
         "32 watcher library tests and 14 source-set integration tests pass.",
         "193 chaos tests pass (2 ignored), 15 fault-proxy tests pass; workspace style passes."
       ]
+    },
+    {
+      "id": "validator-evicted-receipt-waits",
+      "classification": "product",
+      "issue": 847,
+      "source": "crates/validator/src/buffers.rs",
+      "observed": "On staging release 0d34d78b, a CPX32 five-minute 4k TPS soak successfully receipts all 1200000 offers. The validator misses the 180s state catch-up bound, records 1935343 evicted receipt replica results, and then advances a missing receipt about once per five seconds while background inserts continue.",
+      "cause": "The bounded verification buffer forgets discarded tail keys. Near the live head, neither the distance shortcut nor the idle shortcut proves them unavailable, so each known-lost result consumes a fresh wait.",
+      "change": "Keep a bounded set of discarded keys, give an available result priority, and report known evictions unavailable without another wait. Retain four-key catch-up evidence for older discarded keys. Reinserted and late data remain available for comparison. Withdrawals clear obsolete eviction and quiet state.",
+      "verification": [
+        "Before-fix regression consumes the full two-second wait and fails.",
+        "All 142 validator library tests pass, including bounded evidence, live unrelated traffic, replacement data, withdrawal invalidation and isolated far-key coverage."
+      ],
+      "status": "validated locally; full CI and postdeployment 4k benchmark pending"
     }
   ],
   "coverage": [
