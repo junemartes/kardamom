@@ -85,19 +85,9 @@ pub(crate) async fn hard_sequencer(h: &mut Harness) -> anyhow::Result<()> {
     h.assert_count("sequencer", 4, h.knobs.restart_slo).await
 }
 
-/// Hard-kill lane 0's replica on node 0. Its twin on node 1 keeps the
-/// lane live with no stall, the killed replica restarts to full
-/// strength, and it then orders a used sender with its twin frozen.
+/// Each replica returns and orders a used sender while its twin is frozen.
 pub(crate) async fn sequencer_replica_kill(h: &mut Harness) -> anyhow::Result<()> {
-    let recovery = SequencerRecovery::establish(h).await?;
-    let node = h.container("sequencer-0")?;
-    h.inject_hard(&[&node], "sequencer-0").await?;
-    h.assert_progress().await?;
-    h.assert_count("sequencer", 4, h.knobs.restart_slo).await?;
-    let target = h.probes.sequencer_lane0_target(0);
-    h.assert_replica_healthy(&target, Duration::from_secs(90))
-        .await?;
-    recovery.assert_orders_alone(h).await
+    SequencerRecovery::run(h).await
 }
 
 /// The index of the executor whose node a node drill takes: the executor

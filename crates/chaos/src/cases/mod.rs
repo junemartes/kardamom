@@ -299,7 +299,10 @@ impl Case {
         let inject = k.inject_delay;
         let floor = match self {
             Self::SequencerReplicaKill => {
-                inject + k.restart_slo + sequencer_recovery::SequencerRecovery::PROOF_WINDOW
+                // An upper load bound caps at the largest representable duration.
+                inject
+                    .saturating_add(k.restart_slo.saturating_mul(4))
+                    .saturating_add(sequencer_recovery::SequencerRecovery::PROOF_WINDOW)
             }
             Self::SequencerLapse => inject + k.seq_lapse + Duration::from_mins(1),
             Self::ValidatorLapse => inject + k.validator_lapse + Duration::from_mins(1),
