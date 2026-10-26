@@ -1,0 +1,185 @@
+use std::future::Future;
+use std::time::Duration;
+
+use alloy_primitives::U256;
+use kardamom_cache::{LiveAccountsConfig, LiveAccountsWriter};
+use kardamom_types::{AccountRow, BPosition};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+use super::*;
+
+const ADDRESS: Address = Address::repeat_byte(0xad);
+
+struct Fixture {
+    requests: tokio::sync::mpsc::Sender<Address>,
+    answers: crossbeam_channel::Receiver<AccountEvent>,
+    writer: LiveAccountsWriter,
+    limit: Arc<Semaphore>,
+    shutdown: Shutdown,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let (live, writer) = LiveAccounts::new(&LiveAccountsConfig::default());
+        let (requests, rx) = tokio::sync::mpsc::channel(1);
+        let (answers_tx, answers) = crossbeam_channel::unbounded();
+        let shutdown = Shutdown::new();
+        let feed = AccountLookupFeed::new(rx, answers_tx, live, None, None, shutdown.clone(), 0);
+        let limit = feed.limit.clone();
+        Self {
+            requests,
+            answers,
+            writer,
+            limit,
+            shutdown,
+            task: feed.spawn(),
+        }
+    }
+
+    fn restore(&mut self) {
+        self.writer.apply(
+            BPosition::from_index(10),
+            &[AccountRow {
+                address: ADDRESS,
+                nonce: 42,
+                balance: U256::from(123),
+            }],
+        );
+    }
+
+    async fn answer(&self) {
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            while self.answers.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            self.answers.try_recv().unwrap()
+        })
+        .await
+        .expect("one request must recover without a second request");
+        let AccountEvent::Answer { address, state } = event else {
+            panic!("lookup emits an answer");
+        };
+        assert_eq!(address, ADDRESS);
+        assert_eq!(state.nonce, 42);
+        assert_eq!(state.balance, U256::from(123));
+        assert_eq!(state.tx_idx, 10);
+    }
+
+    async fn stop(mut self) {
+        self.shutdown.signal();
+        tokio::time::timeout(Duration::from_secs(1), &mut self.task)
+            .await
+            .expect("feed must stop while lookups wait")
+            .unwrap();
+        self.release_permits().await;
+    }
+
+    async fn release_permits(&self) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while self.limit.available_permits() != IN_FLIGHT {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown must release all lookup permits");
+    }
+}
+
+struct Recording(PrometheusHandle);
+
+impl Recording {
+    fn run<F: Future<Output = ()>>(test: impl FnOnce(Self) -> F) {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let recording = Self(recorder.handle());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        ::metrics::with_local_recorder(&recorder, || runtime.block_on(test(recording)));
+    }
+
+    async fn failed(&self) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !self.has_failure() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first attempt must fail before sources return");
+    }
+
+    fn has_failure(&self) -> bool {
+        self.0.render().lines().any(|line| {
+            line.starts_with("kardamom_sequencer_nonce_lookups_total{")
+                && line.contains("outcome=\"error\"")
+                && line.ends_with(" 1")
+        })
+    }
+}
+
+#[test]
+fn a_failed_lookup_recovers_without_a_second_request() {
+    Recording::run(|recording| async move {
+        let mut fixture = Fixture::new();
+        fixture.requests.send(ADDRESS).await.unwrap();
+        recording.failed().await;
+        fixture.restore();
+        fixture.answer().await;
+        fixture.stop().await;
+    });
+}
+
+#[test]
+fn shutdown_cancels_failed_lookups() {
+    Recording::run(|recording| async move {
+        let fixture = Fixture::new();
+        fixture.requests.send(ADDRESS).await.unwrap();
+        recording.failed().await;
+        fixture.stop().await;
+    });
+}
+
+#[test]
+fn shutdown_cancels_a_feed_with_all_lookup_permits_held() {
+    Recording::run(|_| async move {
+        let fixture = Fixture::new();
+        for _ in 0..=IN_FLIGHT {
+            fixture.requests.send(ADDRESS).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while fixture.limit.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        fixture.stop().await;
+    });
+}
+
+#[test]
+fn aborting_the_feed_cancels_its_retry_workers() {
+    Recording::run(|recording| async move {
+        let fixture = Fixture::new();
+        fixture.requests.send(ADDRESS).await.unwrap();
+        recording.failed().await;
+        fixture.task.abort();
+        tokio::task::yield_now().await;
+        fixture.release_permits().await;
+    });
+}
+
+#[test]
+fn a_healthy_first_lookup_answers_without_a_retry() {
+    Recording::run(|recording| async move {
+        let mut fixture = Fixture::new();
+        fixture.restore();
+        fixture.requests.send(ADDRESS).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), fixture.answer())
+            .await
+            .expect("healthy lookups must not wait for a retry timer");
+        assert!(!recording.has_failure());
+        fixture.stop().await;
+    });
+}
