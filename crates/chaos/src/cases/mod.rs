@@ -16,6 +16,7 @@ pub(crate) mod chain_status;
 pub(crate) mod cluster;
 pub(crate) mod combined;
 pub(crate) mod component;
+mod control_plane;
 pub(crate) mod coordinated;
 pub(crate) mod da_lag;
 pub(crate) mod da_watcher;
@@ -60,6 +61,7 @@ pub enum Case {
     IngressPairLossRecover,
     SequencerLaneLossRecover,
     PipelineBlackoutRecover,
+    ControlPlaneLossRecover,
     IngressSequencerLossRecover,
     IngressSealerLossRecover,
     SequencerSealerLossRecover,
@@ -131,6 +133,7 @@ const ALL: &[Case] = &[
     Case::IngressPairLossRecover,
     Case::SequencerLaneLossRecover,
     Case::PipelineBlackoutRecover,
+    Case::ControlPlaneLossRecover,
     Case::IngressSequencerLossRecover,
     Case::IngressSealerLossRecover,
     Case::SequencerSealerLossRecover,
@@ -215,6 +218,7 @@ impl Case {
             Self::IngressPairLossRecover => "ingress-pair-loss-recover",
             Self::SequencerLaneLossRecover => "sequencer-lane-loss-recover",
             Self::PipelineBlackoutRecover => "pipeline-blackout-recover",
+            Self::ControlPlaneLossRecover => "control-plane-loss-recover",
             Self::IngressSequencerLossRecover => "ingress-sequencer-loss-recover",
             Self::IngressSealerLossRecover => "ingress-sealer-loss-recover",
             Self::SequencerSealerLossRecover => "sequencer-sealer-loss-recover",
@@ -305,6 +309,9 @@ impl Case {
                     .saturating_add(sequencer_recovery::SequencerRecovery::PROOF_WINDOW)
             }
             Self::SequencerLapse => inject + k.seq_lapse + Duration::from_mins(1),
+            Self::ControlPlaneLossRecover => inject
+                .saturating_add(k.reschedule_slo)
+                .saturating_add(Duration::from_mins(5)),
             Self::ValidatorLapse => inject + k.validator_lapse + Duration::from_mins(1),
             Self::RetentionOverrun | Self::RetentionOverrunValidator | Self::PruneFloor => {
                 inject + k.retention_freeze_cap + Duration::from_mins(2)
@@ -439,7 +446,8 @@ impl Case {
             | Self::ExecutorSealerValidatorRecover
             | Self::IngressExecutorLossRecover
             | Self::ReadPathLossRecover
-            | Self::SequencerExecutorRedisLoss => 90,
+            | Self::SequencerExecutorRedisLoss
+            | Self::ControlPlaneLossRecover => 90,
             Self::ClusterQuorumLossRecover => 6,
             Self::ClusterTotalLossRecover
             | Self::ExecutorFleetLossRecover
@@ -489,6 +497,7 @@ impl Case {
             Self::IngressPairLossRecover => coordinated::ingress_pair_loss_recover(h).await,
             Self::SequencerLaneLossRecover => coordinated::sequencer_lane_loss_recover(h).await,
             Self::PipelineBlackoutRecover => coordinated::pipeline_blackout_recover(h).await,
+            Self::ControlPlaneLossRecover => control_plane::loss_recover(h).await,
             Self::IngressSequencerLossRecover => combined::INGRESS_SEQUENCER.run(h).await,
             Self::IngressSealerLossRecover => combined::INGRESS_SEALER.run(h).await,
             Self::SequencerSealerLossRecover => combined::SEQUENCER_SEALER.run(h).await,
