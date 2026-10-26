@@ -64,12 +64,7 @@ impl Baseline {
     }
 
     async fn capture(h: &Harness) -> anyhow::Result<Self> {
-        Rpc::new(&h.rpc_url, h.knobs.chain_id)?
-            .transfer_smoke(h.knobs.gate_account, Duration::from_secs(60))
-            .await?;
-        let account = Self::executor(h)?
-            .account_state(h.knobs.gate_account)
-            .await?;
+        let account = AccountState::after_transfer(h, h.knobs.gate_account).await?;
         let primary = live_primary(h, CTX).await?;
         let raw = h
             .nodes
@@ -86,13 +81,6 @@ impl Baseline {
         };
         baseline.await_row(h, &baseline.account).await?;
         Ok(baseline)
-    }
-
-    fn executor(h: &Harness) -> anyhow::Result<Rpc> {
-        Rpc::new(
-            &format!("http://{}:9024", h.probes.executors[0].ip),
-            h.knobs.chain_id,
-        )
     }
 
     async fn row(&self, h: &Harness) -> anyhow::Result<String> {
@@ -145,9 +133,12 @@ impl Baseline {
                 Duration::from_secs(60),
             )
             .await?;
-        let expected = Self::executor(h)?
-            .account_state(h.knobs.gate_account)
-            .await?;
+        let floor = self
+            .account
+            .nonce
+            .checked_add(1)
+            .context("established sender nonce overflows")?;
+        let expected = AccountState::replicated(h, h.knobs.gate_account, floor).await?;
         anyhow::ensure!(
             expected.nonce > self.account.nonce && expected.balance < self.account.balance,
             "{CTX}: the executor did not commit the established sender's transfer"

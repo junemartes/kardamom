@@ -444,11 +444,29 @@
     },
     {
       "id": "cache-baseline-row-not-projected",
-      "classification": "unresolved",
+      "classification": "harness",
       "job": 121533651670,
       "observed": "The new mirror-backlog case fails before stopping mirrors or holding heads. The executor has the smoke transaction state but the exact Redis account row is not observed in its baseline wait. Mirrors complete initial scans and later log write/WAIT timeouts; client traffic continues.",
-      "change": "Retain expected account values, the last raw Redis row, primary identity and measured wait time. Preserve exact nonce/balance equality and the timeout. Do not classify the unseen row as a decoder or product fault without values.",
-      "status": "Unresolved. The next diagnostic must distinguish missing, stale and incorrect projection before the backlog fault can be validated."
+      "change": "After the receipt, wait for exact nonce/balance agreement across every executor at or beyond the consumed nonce. Use that snapshot before comparing Redis. Reuse the same account baseline for all mirror rebuild coverage checks. Preserve the exact Redis equality check and its existing 120-second bound; do not accept a merely present or nonzero row.",
+      "status": "Root cause established by the raw row in PR 850. Corrected locally; deployed backlog and interrupted-scan proofs remain pending.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "diagnostic_850": {
+        "job": 121579144933,
+        "expected_nonce": 1,
+        "expected_balance": "999999978999999999999",
+        "observed_nonce": 2,
+        "observed_balance": "999999957999999999998",
+        "observed_tx_idx": 177,
+        "url": "https://github.com/junemartes/kardamom/actions/runs/40320872242/job/121579144933"
+      },
+      "cause": "The baseline samples executor 0 immediately after a receipt from the fleet. That executor still holds nonce 1 while Redis already projects nonce 2. A lagging executor is mistaken for a wrong cache row.",
+      "verification": [
+        "A real three-replica HTTP control holds executor 0 at nonce 1 while two peers report 2. No baseline publishes until the first catches up.",
+        "Negative controls reject an empty sample, all replicas below the receipted nonce, a lagging replica and differing balances.",
+        "226 chaos tests pass, two manual tests ignored. Workspace style passes."
+      ]
     },
     {
       "id": "da-lag-failed-status-receipts",
@@ -505,6 +523,20 @@
         "Workspace style passes. Baseline product files are restored after an isolated baseline build; candidate file hashes match the build manifest. No local build or test overlaps the measurements."
       ],
       "status": "Validated locally after PR 850 is published. This could explain the same-sender fleet stall, but that cause is not yet proved on a deployed run. Full client latency/throughput validation and ten final-head green rounds remain pending."
+    },
+    {
+      "id": "combined-no-head-during-planned-total-source-loss",
+      "classification": "unresolved harness observation",
+      "job": 121579144928,
+      "observed": "ingress-sealer-loss-recover stops both ingresses and every sealer node. Co-located executors are down too. Its stall observer then requires a current head from those down sources and fails before recovery.",
+      "status": "Investigate a surviving observer or explicit expected-dark fault proof. Do not turn missing metrics into a false zero or weaken recovery checks."
+    },
+    {
+      "id": "control-plane-aux-process-disappears",
+      "classification": "unresolved",
+      "job": 121579144931,
+      "observed": "The DNS port correction reaches the actual metadata partition. Three client transfers receive receipts while Nomad/Consul/DNS are isolated. The unchanged-process check detects aux container db1e1c593e5662408895d27bb276b8da83fd322e6759bf5b1d62e0369ba32b29 disappearing.",
+      "status": "Identify the missing task from full allocation diagnostics and determine why it stopped. Keep the process identity check and client receipt proof."
     }
   ],
   "coverage": [
@@ -723,6 +755,10 @@
       {
         "check": "V2 pause regressions and resident-loop profile",
         "result": "188 library tests, 14 binary tests, style and five alternating pinned release pairs complete. Full workload and deployed pause validation pending."
+      },
+      {
+        "check": "strict drain, idle V2 reconnect and replicated cache baselines",
+        "result": "89 benchmark tests, 193 sequencer library tests, 14 binary tests and 226 chaos tests pass. Three manual tests remain ignored. Workspace style passes. Pinned normal/forced-sweep release comparison is recorded. Deployment validation pending."
       }
     ],
     "pending": [
@@ -892,7 +928,7 @@
       "url": "https://github.com/junemartes/kardamom/pull/850",
       "cluster_run": 40320872242,
       "integrity_run": 40321151376,
-      "status": "All four supporting workflows pass. Both regular and integrity cluster builds pass. The semantics stage passes; other stages and shards remain live. This candidate is diagnostic, not a qualifying frozen-head round; 0/10. Local follow-ups reject incomplete load measurements and recover idle V2 offers after reconnect."
+      "status": "All four supporting workflows pass. Both cluster builds pass. Load, semantics and follower pass. Cache fails because its executor baseline is behind Redis (nonce 1 vs 2); corrected locally. Combined ordering fails its outage observation when every head source is down. Coordination proves metadata isolation and three receipted client transactions, then detects a lost aux process; classification continues. Other shards and integrity remain live. Diagnostic only; streak 0/10."
     }
   ],
   "integration": {
@@ -904,8 +940,9 @@
     "workspace": "/home/dev/kardamom-chaos-gaps",
     "changes": [
       "Reject unfinished-submit false passes, bound complete receipt drains, stop background receipt readers on cancellation, and retain failed-load snapshots.",
-      "Recover idle unconfirmed V2 offers from the existing session callback via a sweep-time generation check; add controls and a pinned normal/forced-sweep release comparison."
+      "Recover idle unconfirmed V2 offers from the existing session callback via a sweep-time generation check; add controls and a pinned normal/forced-sweep release comparison.",
+      "Wait for every executor to agree after a receipted transfer before capturing exact cache account baselines; retain the strict row oracle."
     ],
-    "status": "89 benchmark tests, 224 chaos tests (two manual ignored), 193 sequencer library tests and 14 binary tests (one manual ignored) pass. Workspace style and controlled release comparisons pass. Hold these follow-ups while PR 850 diagnostics run. Final head remains unfrozen; streak 0/10."
+    "status": "89 benchmark, 193 sequencer library, 14 binary and 226 chaos tests pass; three manual tests ignored. Style and controlled release comparisons pass. Hold these local follow-ups while PR 850 yields further failure evidence. Final head remains unfrozen; streak 0/10."
   }
 }
