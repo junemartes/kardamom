@@ -299,7 +299,10 @@ impl Case {
         let inject = k.inject_delay;
         let floor = match self {
             Self::SequencerReplicaKill => {
-                inject + k.restart_slo + sequencer_recovery::SequencerRecovery::PROOF_WINDOW
+                // An upper load bound caps at the largest representable duration.
+                inject
+                    .saturating_add(k.restart_slo.saturating_mul(4))
+                    .saturating_add(sequencer_recovery::SequencerRecovery::PROOF_WINDOW)
             }
             Self::SequencerLapse => inject + k.seq_lapse + Duration::from_mins(1),
             Self::ValidatorLapse => inject + k.validator_lapse + Duration::from_mins(1),
@@ -358,10 +361,11 @@ impl Case {
                 inject + cycle * k.squeeze.cycles.get() + Duration::from_secs(90)
             }
             // Three faults, each with its halt and resume waits.
-            Self::L1Liar => inject + (k.l1_fault + Duration::from_mins(3)) * 3,
+            Self::L1Liar | Self::L1TransportRefusals => {
+                inject + (k.l1_fault + Duration::from_mins(3)) * 3
+            }
             // One fault, a batcher restart inside it, and the posts after.
             Self::L1NullReceipts => inject + k.l1_fault + k.restart_slo + Duration::from_mins(3),
-            Self::L1TransportRefusals => inject + (k.l1_fault + Duration::from_mins(3)) * 2,
             // The liar, two restarts, the floor passing, and the resume.
             Self::TwoDayOutage => {
                 inject

@@ -14,15 +14,17 @@ use crate::poll::{self, Budget};
 enum Refusal {
     Unavailable,
     RateLimited,
+    Unresponsive,
 }
 
 impl Refusal {
-    const ALL: [Self; 2] = [Self::Unavailable, Self::RateLimited];
+    const ALL: [Self; 3] = [Self::Unavailable, Self::RateLimited, Self::Unresponsive];
 
     fn fault(self) -> Fault {
         match self {
             Self::Unavailable => Fault::Down,
             Self::RateLimited => Fault::RateLimit,
+            Self::Unresponsive => Fault::Unresponsive { all_sources: true },
         }
     }
 
@@ -31,9 +33,7 @@ impl Refusal {
         let before = l1.last_batch_index().await?;
         self.await_posting(l1, before, ctx).await?;
         let fault = self.fault();
-        crate::log(format!(
-            "{ctx}: refuse the first provider with {fault:?}; the second remains reachable"
-        ));
+        crate::log(format!("{ctx}: provider fault {fault:?}"));
         l1.set_faults(&[fault]).await?;
         let held = self.hold(h, l1, base, ctx).await;
         let cleared = Followers::at_clear(h, l1, base).await;
