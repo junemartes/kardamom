@@ -180,6 +180,7 @@ impl Harness {
             load.abort();
             return Err(e);
         }
+        load.finish_submissions();
         let verdict = load.finish().await?;
         case.judge_load(&verdict)?;
         self.assert_executors_converged(case.name()).await?;
@@ -288,7 +289,9 @@ impl Harness {
     ) -> anyhow::Result<()> {
         self.inject_gate(case, load, rx0).await?;
         case.run(self).await?;
-        case.assert_recovered_progress(self).await
+        load.assert_submitting(case.name())?;
+        case.assert_recovered_progress(self).await?;
+        load.assert_submitting(case.name())
     }
 
     fn pick_account(&mut self, case: Case) -> anyhow::Result<u32> {
@@ -386,7 +389,12 @@ impl Harness {
                 crate::FAIL_PREFIX,
                 case.name()
             );
-            Ok(self.probes.ingress_counts().await.rose_over(rx0))
+            Ok(self
+                .probes
+                .ingress_counts()
+                .await
+                .rose_over(rx0)
+                .filter(|_| load.is_flowing()))
         })
         .await?;
         let (rx1, _) = match outcome {

@@ -121,7 +121,16 @@
       "url": "https://github.com/junemartes/kardamom/actions/runs/40260202176/job/121376240086",
       "observed": "The 120-minute job limit cancels case 7 after six cases pass. In carry-executors-rest, main load finishes at 04:40:33; the rollout finishes at about 04:56:46. The case passes after fault work with no background load.",
       "cause": "Full deployment steps take longer than the fixed load windows and the shard budget. Completion of the load is not checked after injection.",
-      "status": "fix in unpublished wip/chaos-owned-load-20261026; further validation required"
+      "status": "Local load-control and chaos tests pass; full CI pending",
+      "change": "Require accepted traffic from the case-owned load before injection and an open submission window through recovery. Stop new work after recovery, drain offered transactions, and report actual paced duration. Size carry case windows from observed full-deploy time; set only chaos-carry to a 180-minute job budget.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "verification": [
+        "61 load library tests pass, including owned counters, cancellation, stop-before-start, actual duration, and accepted-transaction drain.",
+        "192 chaos library tests pass; 2 ignored.",
+        "Workspace style check passes; baseline proc-macro-error2 future-compatibility notice remains."
+      ]
     },
     {
       "id": "validator-carried-input-stall-after-ingress-sealer-loss",
@@ -268,7 +277,7 @@
       "existing_shards": [
         "all existing shards"
       ],
-      "status": "pending"
+      "status": "Owned traffic gate and an active submission window through fault recovery implemented; local tests pass. Stop and drain after recovery, report actual paced duration. Full CI and recovery latency/throughput budgets pending."
     },
     {
       "gap": "Nomad, Consul and DNS control-plane loss while the data plane stays live",
@@ -372,7 +381,7 @@
       "commit": "a510a518685864b3cf9419dd52c0535040108f15",
       "workflow_run": 40267573235,
       "url": "https://github.com/junemartes/kardamom/actions/runs/40267573235",
-      "status": "in progress"
+      "status": "cluster run cancelled after preserving member-rejoin, provider-refusal assertion, and validator-stall failures; fixes continue on descendants"
     },
     {
       "pull_request": 840,
@@ -392,6 +401,13 @@
       "commit": "42cb927aaa5ba588676e824e8c98df9799095c9a",
       "workflow_run": 40271525408,
       "status": "superseded cluster run cancelled; fixes continue on descendants"
+    },
+    {
+      "pull_request": 843,
+      "commit": "743d590e",
+      "workflow_run": 40275014189,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40275014189",
+      "status": "in progress; diagnostic only, not a qualifying frozen-head round"
     }
   ]
 }

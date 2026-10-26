@@ -11,7 +11,8 @@ use alloy_primitives::{Address, U256, address};
 use anyhow::Context;
 use kardamom_bench::ANVIL_MNEMONIC;
 use kardamom_bench::load::{
-    self, CalldataMix, Completeness, LoadConfig, MetricsTargets, NonceStart, SenderRange, Workload,
+    self, CalldataMix, Completeness, LoadConfig, MetricsTargets, NonceStart, Progress, SenderRange,
+    Workload,
 };
 use serde::Deserialize;
 
@@ -121,9 +122,8 @@ impl LoadSpec {
 pub struct LoadRun {
     task: tokio::task::JoinHandle<anyhow::Result<bool>>,
     report_path: PathBuf,
-    /// Flips to `true` when the queues are signed and the first submit
-    /// is next.
-    ready: tokio::sync::watch::Receiver<bool>,
+    /// The signed run's own counters and submission window.
+    ready: tokio::sync::watch::Receiver<Option<Progress>>,
 }
 
 impl LoadRun {
@@ -141,14 +141,12 @@ impl LoadRun {
     /// `report_path` is where `cfg.output` writes the report.
     #[must_use]
     pub fn from_config(cfg: LoadConfig, report_path: PathBuf) -> Self {
-        let (signal, ready) = tokio::sync::watch::channel(false);
-        // The load signs its whole window before the first submit:
-        // about 200,000 transactions for the longest case. The
-        // injection gate waits for this signal, because an ingress
-        // counter that stands still during the signing proves nothing.
+        let (signal, ready) = tokio::sync::watch::channel(None);
+        // Signing precedes every submission. The injection gate waits for
+        // the prepared run and its own accepted traffic before the fault.
         let task = tokio::spawn(async move {
             let prepared = load::prepare(cfg).await?;
-            signal.send_replace(true);
+            signal.send_replace(Some(prepared.progress()));
             prepared.run().await
         });
         Self {
@@ -158,10 +156,37 @@ impl LoadRun {
         }
     }
 
-    /// Whether the load signed its queues and started to submit.
+    /// Whether the load signed its queues and published its observer.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        *self.ready.borrow()
+        self.ready.borrow().is_some()
+    }
+
+    pub(crate) fn is_flowing(&self) -> bool {
+        self.ready
+            .borrow()
+            .as_ref()
+            .is_some_and(Progress::is_flowing)
+    }
+
+    pub(crate) fn assert_submitting(&self, case: &str) -> anyhow::Result<()> {
+        let submitting = self
+            .ready
+            .borrow()
+            .as_ref()
+            .is_some_and(Progress::is_submitting);
+        anyhow::ensure!(
+            submitting && !self.is_finished(),
+            "{}: {case}: the case load stops submitting before fault recovery completes; the load window does not cover the case",
+            crate::FAIL_PREFIX
+        );
+        Ok(())
+    }
+
+    pub(crate) fn finish_submissions(&self) {
+        if let Some(progress) = self.ready.borrow().as_ref() {
+            progress.finish_submissions();
+        }
     }
 
     /// Whether the load task has already ended, which before the window
@@ -222,7 +247,7 @@ mod tests {
         report_path: PathBuf,
         task: impl std::future::Future<Output = anyhow::Result<bool>> + Send + 'static,
     ) -> LoadRun {
-        let (_, ready) = tokio::sync::watch::channel(true);
+        let (_, ready) = tokio::sync::watch::channel(None);
         LoadRun {
             task: tokio::spawn(task),
             report_path,

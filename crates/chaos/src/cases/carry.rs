@@ -102,19 +102,16 @@ impl Step {
     pub(crate) fn floor(self, k: &Knobs) -> Duration {
         let inject = k.inject_delay;
         match self {
-            // The lockbox deploy, then two upgrade transactions.
-            Self::VersionsOn => inject + Duration::from_mins(10),
+            // Full deploy checks cover the lockbox upgrades and the move of the readers.
+            Self::VersionsOn | Self::ReadersOnEgress => inject + Duration::from_mins(25),
             // Two upgrade transactions and the held transfer.
-            Self::HeldOfferAfterDowngrade | Self::WindowOffOn => inject + Duration::from_mins(4),
-            // A deploy that rolls the sequencers, the batcher and the
-            // validator.
-            Self::ReadersOnEgress => inject + Duration::from_mins(8),
-            Self::WindowOn => inject + k.restart_slo + Duration::from_mins(4),
+            Self::HeldOfferAfterDowngrade | Self::WindowOffOn => inject + Duration::from_mins(8),
+            Self::WindowOn => inject + k.restart_slo + Duration::from_mins(8),
             // One staged executor roll for each move.
-            Self::ExecutorFirst => inject + Duration::from_mins(5),
-            Self::ExecutorsRest => inject + Duration::from_mins(9),
+            Self::ExecutorFirst => inject + Duration::from_mins(20),
+            Self::ExecutorsRest => inject + Duration::from_mins(30),
             Self::LeaderKillAtSwitch => {
-                inject + k.leader_slo + k.restart_slo + Duration::from_mins(3)
+                inject + k.leader_slo + k.restart_slo + Duration::from_mins(8)
             }
             Self::EgressRestart => inject + k.restart_slo + Duration::from_mins(2),
         }

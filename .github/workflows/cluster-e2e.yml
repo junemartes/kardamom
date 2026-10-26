@@ -209,9 +209,10 @@ jobs:
     # minutes. The chaos-fleet shard ends with the sealer fleet wipe, two
     # rebuilds from L1 and a seeded restart, and it runs about 92 minutes
     # on a slow runner. The chaos-combined-exec shard runs about 45 minutes
-    # after a 21-minute bring-up on a local host. 120 keeps a real hang
-    # bounded.
-    timeout-minutes: 120
+    # after a 21-minute bring-up on a local host. The carry shard runs nine
+    # cases with full deployment checks. Its executor moves take up to
+    # 27 minutes per case. It needs 180 minutes; other shards keep 120.
+    timeout-minutes: ${{ matrix.shard == 'chaos-carry' && 180 || 120 }}
     strategy:
       # Don't cancel the other shards if one fails — we want every shard's
       # result on a single run.
