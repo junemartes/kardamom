@@ -1614,6 +1614,7 @@ A deploy replaces service instances one at a time under readiness checks. The ch
     - `mirror_archive` never copies the mark file. The destination daemon creates its own.
     - `mirror_archive` copies the catalog by a **stable read**: two consecutive identical snapshots, catalog before segments. The chaos restore does the same.
     - The post-restore verify of the wipe case is CRC-armed.
+    - `ArchiveTool verify` changes the catalog: it writes stop positions and can mark entries invalid. Run it only on a stopped archive or an isolated copy of its catalog and segments. The wipe drill verifies an isolated copy while the live daemon recovers.
   - One caveat of Aeron 1.45 bounds what that gate can check.
     - Catalog **entry** checksums go stale when a restored archive is adopted. Active recordings get their recovered stop positions patched in with no entry-checksum recompute. `ArchiveTool.verify` does this, and the adoption path shows the same signature.
     - The gate treats per-frame CRC32 failures, missing files and structural errors as fatal.

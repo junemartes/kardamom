@@ -173,8 +173,9 @@ async fn catalog_copy_once(h: &Harness, mirror: &str, victim: &str) -> anyhow::R
     Ok((before == catalog_hash(h, mirror).await?).then_some(()))
 }
 
-/// A CRC-armed verify inside the restarted daemon container: every
-/// recording OK, no exception, no other error. Stale catalog entry
+/// Verify a private archive copy inside the restarted daemon container.
+/// The tool writes stop positions and invalidates descriptors, so it
+/// must not open the live catalog or segment files. Stale catalog entry
 /// checksums are tolerated and counted: the daemon's adoption path
 /// rewrites entries without recomputing them.
 async fn verify_restored(h: &Harness, victim: &str) -> anyhow::Result<()> {
@@ -188,7 +189,7 @@ async fn verify_restored(h: &Harness, victim: &str) -> anyhow::Result<()> {
             )
         })?;
     let script = format!(
-        "docker exec {daemon} bash -lc 'java --add-opens java.base/java.util.zip=ALL-UNNAMED -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool {ARCHIVE_DIR} {CRC_VERIFY} 2>&1'"
+        r#"docker exec {daemon} bash -lc 'set -eu; snapshot=$(mktemp -d); trap "rm -rf -- \"$snapshot\"" EXIT; cp -a --reflink=auto --sparse=always {ARCHIVE_DIR}/. "$snapshot/"; rm -f "$snapshot/archive-mark.dat"; java --add-opens java.base/java.util.zip=ALL-UNNAMED -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool "$snapshot" {CRC_VERIFY} 2>&1'"#
     );
     // Three attempts, as the bash case ran: the verify itself runs
     // under the streaming bound, since a CRC pass over a large archive
