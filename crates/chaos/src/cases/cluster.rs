@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
 
+use super::member_storage::MemberStorage;
 use crate::evidence::CountWait;
 use crate::harness::Harness;
 use crate::nomad::Streams;
@@ -114,11 +115,6 @@ pub(crate) async fn follower_kill(h: &mut Harness) -> anyhow::Result<()> {
 /// the purge point's block.
 const PURGE_WAIT: Duration = Duration::from_mins(6);
 
-// Raft owns the archive root files. The `dir` child holds the live executor
-// archive, which remains running while the Raft member loses its state.
-const WIPE_RAFT_STATE: &str =
-    r#"set -eu; find "$1" -mindepth 1 -delete; find "$2" -mindepth 1 -maxdepth 1 -type f -delete"#;
-
 /// The blank-member catch-up drill: a follower's cluster directory and
 /// Raft archive are wiped after its kill, so the restarted member owns
 /// nothing. The drill first waits until the leader has purged its log,
@@ -138,13 +134,7 @@ pub(crate) async fn member_rejoin(h: &mut Harness) -> anyhow::Result<()> {
         "{ctx}: leader=memberId={leader}; killing FOLLOWER memberId={follower} and WIPING its cluster + Raft archive state"
     ));
     h.inject_hard(&[&node], CLUSTER_TASK).await?;
-    h.nodes
-        .exec(
-            &node,
-            &format!("sh -c '{WIPE_RAFT_STATE}' -- /opt/kardamom/cluster /opt/kardamom/archive"),
-        )
-        .await
-        .map_err(|e| crate::chaos_fail!("{ctx}: could not wipe memberId={follower} state: {e}"))?;
+    MemberStorage::wipe(h, &node, ctx).await?;
     h.assert_executor_progress(Duration::from_mins(1)).await?;
     h.assert_count(CLUSTER_TASK, 3, h.knobs.restart_slo).await?;
     before.await_caught_up(h).await
@@ -420,40 +410,6 @@ pub(crate) async fn quorum_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_member_wipe_preserves_the_live_executor_archive() {
-        let root = tempfile::tempdir().unwrap();
-        let cluster = root.path().join("cluster");
-        let archive = root.path().join("archive");
-        let executor = archive.join("dir");
-        std::fs::create_dir_all(cluster.join("snapshot")).unwrap();
-        std::fs::create_dir_all(&executor).unwrap();
-        std::fs::write(cluster.join("recording.log"), b"member log").unwrap();
-        std::fs::write(cluster.join("snapshot/state"), b"member snapshot").unwrap();
-        let files = ["archive.catalog", "archive-mark.dat", "0-0.rec"];
-        files
-            .iter()
-            .try_for_each(|name| {
-                std::fs::write(archive.join(name), b"raft")?;
-                std::fs::write(executor.join(name), b"executor")
-            })
-            .unwrap();
-
-        let status = std::process::Command::new("sh")
-            .args(["-c", WIPE_RAFT_STATE, "wipe-test"])
-            .arg(&cluster)
-            .arg(&archive)
-            .status()
-            .unwrap();
-
-        assert!(status.success());
-        assert_eq!(std::fs::read_dir(&cluster).unwrap().count(), 0);
-        assert_eq!(std::fs::read_dir(&archive).unwrap().count(), 1);
-        for name in files {
-            assert_eq!(std::fs::read(executor.join(name)).unwrap(), b"executor");
-        }
-    }
 
     #[test]
     fn the_catchup_block_counts_only_lines_after_the_last_fresh_start() {

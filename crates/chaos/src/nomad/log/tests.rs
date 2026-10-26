@@ -132,15 +132,31 @@ async fn a_5xx_from_the_control_agent_reads_the_node_agent() {
 }
 
 #[tokio::test]
-async fn a_log_that_no_agent_has_reads_as_empty() {
-    let gone = control_agent(&closed_port().await).spawn().await;
-    assert_eq!(read(&nomad(&gone)).await.unwrap(), "");
-    let node = FakeAgent::default().spawn().await;
-    let control = control_agent(&node)
-        .route(LOGS, 500, FORWARD_FAILED)
+async fn a_live_404_reads_the_node_agent_before_it_rejects_missing_evidence() {
+    let node = FakeAgent::default()
+        .route(LOGS, 200, "diverged\n")
         .spawn()
         .await;
-    assert_eq!(read(&nomad(&control)).await.unwrap(), "");
+    let control = control_agent(&node).spawn().await;
+    assert_eq!(read(&nomad(&control)).await.unwrap(), "diverged\n");
+}
+
+#[tokio::test]
+async fn a_live_404_on_both_agents_cannot_certify_a_clean_log() {
+    let node = FakeAgent::default().spawn().await;
+    let control = control_agent(&node).spawn().await;
+    let err = format!("{:#}", read(&nomad(&control)).await.unwrap_err());
+    assert!(err.contains("404"), "{err}");
+    assert!(err.contains("of retries"), "{err}");
+}
+
+#[tokio::test]
+async fn a_terminal_404_remains_empty() {
+    let control = control_agent(&closed_port().await).spawn().await;
+    let log = nomad(&control)
+        .task_log(&collected(), "executor", "stdout")
+        .await;
+    assert_eq!(log.unwrap(), "");
 }
 
 /// The 500 a client agent answers for a log directory it removed.

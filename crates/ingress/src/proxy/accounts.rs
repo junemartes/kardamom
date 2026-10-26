@@ -58,7 +58,7 @@ where
             return Err(IngressError::RateLimited(client_ip.to_string()));
         }
         self.check_block_tag(block)?;
-        if let Some(view) = self.cached_view(address).await {
+        if let Some(view) = self.cached_view::<true>(address).await {
             return Ok(field.of(&view));
         }
         let Some(query) = &self.query else {
@@ -75,14 +75,23 @@ where
             .map_err(|e| IngressError::StateUnavailable(e.to_string()))
     }
 
-    /// The two cache layers, each counted: the local layer, then Redis.
-    pub(super) async fn cached_view(&self, address: Address) -> Option<AccountView> {
+    /// The local layer, then Redis. Head RPCs need a fresh projection;
+    /// admission uses a committed nonce as a lower bound at any lag.
+    pub(super) async fn cached_view<const REQUIRE_FRESH: bool>(
+        &self,
+        address: Address,
+    ) -> Option<AccountView> {
         if let Some(view) = self.live.get(address) {
             cache_metrics::record_lookup("live", "hit");
             return Some(view);
         }
         cache_metrics::record_lookup("live", "miss");
-        self.redis.as_ref()?.account(address).await
+        let redis = self.redis.as_ref()?;
+        if REQUIRE_FRESH && !redis.fresh() {
+            cache_metrics::record_degraded("stale");
+            return None;
+        }
+        redis.account(address).await
     }
 
     /// The ingress serves only the head. `latest` and `pending` name it.

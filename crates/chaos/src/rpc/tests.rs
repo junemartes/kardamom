@@ -18,6 +18,34 @@ const NEXT_NONCE: u64 = 5;
 /// The smoke account of the test.
 const ACCOUNT: u32 = 3;
 
+#[tokio::test]
+async fn an_account_read_keeps_the_full_balance_quantity() {
+    let mut module = RpcModule::new(());
+    module
+        .register_method("eth_getTransactionCount", |_, &(), _| {
+            format!("{NEXT_NONCE:#x}")
+        })
+        .unwrap();
+    module
+        .register_method("eth_getBalance", |_, &(), _| format!("{:#x}", U256::MAX))
+        .unwrap();
+    let server = Server::builder().build("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", server.local_addr().unwrap());
+    let handle = server.start(module);
+    let account = Rpc::new(&url, 1)
+        .unwrap()
+        .account_state(ACCOUNT)
+        .await
+        .unwrap();
+    assert_eq!(
+        account.address,
+        Rpc::genesis_signer(ACCOUNT).unwrap().address
+    );
+    assert_eq!(account.nonce, NEXT_NONCE);
+    assert_eq!(account.balance, U256::MAX);
+    handle.stop().unwrap();
+}
+
 /// A fake ingress answers an account that already sent five transfers.
 /// The smoke signs its transfer at nonce 5, not at nonce 0, so a second
 /// smoke on a used chain is not a duplicate.

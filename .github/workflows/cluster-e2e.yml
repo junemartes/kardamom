@@ -37,6 +37,13 @@ name: cluster-e2e
 
 on:
   workflow_dispatch:
+    inputs:
+      suite:
+        description: Shards to validate
+        type: choice
+        required: true
+        default: regular
+        options: [regular, all]
   pull_request:
     # `labeled` is the trigger of the nightly shards on a pull request.
     types: [opened, synchronize, reopened, labeled]
@@ -88,10 +95,13 @@ jobs:
         id: shards
         env:
           NIGHTLY: ${{ github.event_name == 'schedule' || github.event.action == 'labeled' }}
+          ALL: ${{ github.event.inputs.suite == 'all' }}
         run: |
           regular='"load","chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-combined-ordering","chaos-combined-exec","chaos-retention","chaos-cache","chaos-l1","chaos-follower","chaos-carry","semantics"'
           nightly='"chaos-integrity"'
-          if [ "$NIGHTLY" = true ]; then
+          if [ "$ALL" = true ]; then
+            shards="[$regular,$nightly]"
+          elif [ "$NIGHTLY" = true ]; then
             shards="[$nightly]"
           else
             shards="[$regular]"
@@ -346,14 +356,24 @@ jobs:
         env:
           KARDAMOM_STAGED: "1"
 
-      - name: Preserve state and load evidence
+      - name: Preserve load and latency reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-load-${{ matrix.shard }}
+          path: |
+            /tmp/chaos-*.json
+            /tmp/kardamom-load.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Preserve failed state evidence
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: chaos-evidence-${{ matrix.shard }}
           path: |
             /tmp/chaos-state-*/**
-            /tmp/chaos-*.json
           if-no-files-found: ignore
           retention-days: 3
 

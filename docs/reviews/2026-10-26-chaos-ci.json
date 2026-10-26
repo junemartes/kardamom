@@ -1,0 +1,397 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "pull_request": 838,
+    "commit": "29924d832aae03a17b969c0baf1f46decc00bf1d",
+    "workflow_run": 40260202176,
+    "url": "https://github.com/junemartes/kardamom/actions/runs/40260202176"
+  },
+  "policy": {
+    "new_shards": false,
+    "product_changes_require_latency_and_throughput_comparison": true,
+    "green_requires_repeated_full_runs_of_the_same_head": true,
+    "failures_require_classification_before_retry": true,
+    "required_consecutive_green_rounds": 10,
+    "green_round_definition": "Five explicit workflow_dispatch runs on the same frozen branch and head: CI, cluster-e2e with suite=all, docker-e2e, chain-semantics-e2e, and cluster-validate. Every existing chaos shard and both stages must be green. Failure, cancellation, or missing coverage resets the streak. Incomplete rounds do not advance it; partial reruns cannot replace complete rounds.",
+    "green_streak": 0,
+    "final_commit": null
+  },
+  "failures": [
+    {
+      "id": "cluster-member-wipe-scope",
+      "classification": "harness",
+      "job": 121376239919,
+      "case": "cluster-member-rejoin",
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40260202176/job/121376239919",
+      "observed": "Blank member 0 reaches block 510 after 20s. Its colocated executor then stalls at block 523 while the surviving fleet reaches block 640; convergence fails with lag 117. Executor logs show exec_txs recordings time out after the wipe.",
+      "cause": "The case removes archive/dir, which belongs to the shared Aeron driver and records the live executor. The fault is intended to remove only member data.",
+      "change": "Share the fleet wipe operation with the member rejoin case. Preserve archive/dir, remove hidden member files as well as ordinary files, and test the operation on a temporary tree.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "fix awaiting CI",
+      "verification": [
+        "Temporary-tree wipe test verifies member data is removed, including hidden files, while live archive/dir, executor state, and egress files survive."
+      ]
+    },
+    {
+      "id": "mirror-rebuild-aggregate-false-positive",
+      "classification": "harness",
+      "case": "redis-total-loss-recover, read-path-loss-recover, mirror-kill-rebuild",
+      "observed": "An aggregate increase of three rebuild lines can come entirely from one mirror. The mirror-kill case previously required only one rebuild.",
+      "change": "Require an increased log count from each node and allocation; a replacement allocation needs its own completed rebuild. Report missing nodes on timeout.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "fix awaiting CI",
+      "verification": [
+        "Unit tests reject repeated rebuilds on one mirror, missing or regressed evidence, and replacement allocations without their own completed rebuild."
+      ]
+    },
+    {
+      "id": "live-log-404-false-negative",
+      "classification": "harness",
+      "observed": "A 404 for a live allocation is interpreted as an empty clean log, so the divergence scan can pass without evidence.",
+      "change": "Try the node agent and retry missing live logs. Preserve empty-log behavior for terminal allocations.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "fix awaiting CI",
+      "verification": [
+        "Fake-agent tests verify live 404 fallback, live missing-log failure, and terminal 404 compatibility."
+      ]
+    },
+    {
+      "id": "stale-account-rpc-under-mirror-backlog",
+      "classification": "product",
+      "source": "crates/ingress/src/proxy/accounts.rs",
+      "observed": "With a live Redis head at position 10 and local progress 100 beyond max_stale_txs=8, cold nonce/balance RPCs return (3,0) while the executor returns (5,42).",
+      "before_test_log": "/tmp/chaos-gaps-stale-rpc-before.log",
+      "cause": "Account RPCs share the admission cache lookup without requiring Redis freshness. A lower bound is suitable for nonce admission, but a known-stale row must not answer a head-state RPC.",
+      "change": "Require freshness for the RPC specialization of the cache read. Keep the admission specialization independent of freshness and executor queries. Local resident rows retain priority.",
+      "hot_path_changed": true,
+      "hot_path_detail": "The shared async helper has a const REQUIRE_FRESH parameter. RPC instantiates true; admission instantiates false, eliminating the new condition and head loads from admission. Healthy cold RPC adds the freshness check; stale cold RPC uses the existing bounded executor query.",
+      "service_wiring_changed": false,
+      "status": "fix validated locally; full CI and full workload comparison pending",
+      "verification": [
+        "A real Redis regression fails with (3,0), then passes with (5,42).",
+        "Fresh Redis and local reads make zero executor queries.",
+        "Validated admission uses stale nonce lower bounds and makes zero executor queries.",
+        "Five release repeats per version, 400 samples per phase: fresh RPC p99 221.81 -> 205.52 us; serial admission median 3282.38 -> 3988.67 TPS. Shared-host variation prevents a speedup claim.",
+        "Performance summary and raw samples: docs/benches/2026-10-26-ingress-rpc-cache-profile.json"
+      ]
+    },
+    {
+      "id": "peer-seed-collocated-archive-deletion",
+      "classification": "product",
+      "source": "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/PeerSeed.java",
+      "observed": "A real Aeron peer-seed regression deletes archive/dir/archive.catalog while the Raft member retries without peers. The executor archive is a separate live component.",
+      "cause": "PeerSeed recursively clears the Raft archive parent, including child archives.",
+      "change": "Clear only root files for the Raft archive. Preserve recursive cleanup for the dedicated cluster and retained-file directories.",
+      "product_bug": true,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "validated locally; combined CI pending",
+      "verification": [
+        "The real peer-seed regression fails with NoSuchFileException before the correction and passes after it.",
+        "Stale Raft recording removed while executor catalog and recording contents survive peer-seed retries.",
+        "Full Java check: 208 core and 414 service tests, zero failures, including allocation gates."
+      ]
+    },
+    {
+      "id": "carry-job-wall-budget",
+      "classification": "ci budget",
+      "job": 121376240086,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40260202176/job/121376240086",
+      "observed": "The 120-minute job passes six carry cases and the intermediate persisted-state audit, then is cancelled during the seventh case while the pipeline still advances.",
+      "change": "Allow 180 minutes only for chaos-carry. Keep all nine cases, state checks and per-case recovery deadlines. Other shards retain 120 minutes.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "combined CI pending",
+      "verification": [
+        "First executor cut-over passes persisted account, storage, code, header, receipt and index parity.",
+        "L1 reconstruction verifies 303155 transactions and matches the validator root before cancellation.",
+        "Actionlint validates the matrix-specific timeout expression."
+      ]
+    },
+    {
+      "id": "audit-early-failure-round-overlap",
+      "classification": "audit tool",
+      "source": "scripts/ci/green_streak.py:Streak.validate_order",
+      "observed": "An early failed round can open another round while its other workflows are still running.",
+      "change": "Require every workflow of the prior round to be completed before accepting the next round. Retain the failed outcome.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "validated locally; combined CI pending",
+      "verification": [
+        "A regression reproduces the missing overlap rejection.",
+        "All 14 audit tests pass, including completing the failed round before a new round is accepted."
+      ]
+    },
+    {
+      "id": "provider-counter-reset",
+      "classification": "harness",
+      "case": "l1-transport-refusals",
+      "job": 121399758434,
+      "observed": "The on-chain posting record stays flat during HTTP 503. The batcher exits after refusals and restarts, resetting its process counter. Counter inequality falsely reports a new post.",
+      "change": "Keep exact on-chain record equality during refusal. Require a higher durable contract batch index after clearing each refusal, independent of process restarts.",
+      "status": "fix awaiting CI"
+    },
+    {
+      "id": "combined-sealer-validator-stall",
+      "classification": "unresolved",
+      "case": "ingress-sealer-loss-recover",
+      "job": 121399758458,
+      "observed": "All executor heads advance beyond 870 and recovery probes deliver every transaction. The validator and batcher egress readers remain at index 82106, next block 595 after a full cluster outage.",
+      "change": "Capture every executor and egress frame-forwarding metric and HTTP range cursor on failure. Keep the validator recovery assertion and timeout unchanged.",
+      "status": "unresolved; merge requires green combined-head recovery"
+    }
+  ],
+  "coverage": [
+    {
+      "gap": "Established sender and high mirror backlog; stale cached nonce on client restart",
+      "incident": "https://github.com/junemartes/kardamom/issues/754",
+      "reason_missed": "Fresh single-sender load at 200 TPS does not exceed the old mirror throughput; final completeness alone does not check the RPC nonce seen by a restarted client.",
+      "existing_shards": [
+        "chaos-cache",
+        "chaos-sequencer"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "Partial account regression with a surviving advanced mirror head",
+      "reason_missed": "FLUSHALL removes the head too, and a maximum head or a nonempty account hash does not certify account coverage.",
+      "existing_shards": [
+        "chaos-cache"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "Interrupted and concurrent mirror rebuilds with per-mirror proof",
+      "existing_shards": [
+        "chaos-cache",
+        "chaos-combined-exec"
+      ],
+      "status": "Per-mirror evidence and exact nonce/balance comparison for a used idle sender and untouched funded account implemented; awaiting CI. Interrupted scans pending."
+    },
+    {
+      "gap": "DA lag halt, canary page inhibition, and prune floor in scheduled runs",
+      "reason_missed": "These cases exist but need special small-budget and canary configuration and are not assigned to CI shards.",
+      "existing_shards": [
+        "chaos-retention",
+        "chaos-follower"
+      ],
+      "status": "pending per-case configuration and restoration"
+    },
+    {
+      "gap": "No nonce source after sequencer, executor, and Redis loss",
+      "existing_shards": [
+        "chaos-combined-exec"
+      ],
+      "status": "existing case scheduled; awaiting CI"
+    },
+    {
+      "gap": "Provider HTTP 503 and 429 with backoff and automatic recovery",
+      "reason_missed": "The fault proxy supports these refusals, but no chaos case arms them.",
+      "existing_shards": [
+        "chaos-follower"
+      ],
+      "status": "case implemented; awaiting CI; all-provider timeout still pending"
+    },
+    {
+      "gap": "V2 refusal and offer recovery across session changes, halt, and downgrade",
+      "incident": "https://github.com/junemartes/kardamom/pull/834",
+      "existing_shards": [
+        "chaos-carry"
+      ],
+      "status": "dependency covers new-session reoffer and release-time format; halt refusals pending"
+    },
+    {
+      "gap": "Posting freeze beyond every retention floor and exact resumed coverage",
+      "existing_shards": [
+        "chaos-l1",
+        "chaos-retention"
+      ],
+      "status": "pending stronger retention and replay-path assertions"
+    },
+    {
+      "gap": "Deposits before, during, and after L1 follower faults; source identity and exact balances",
+      "existing_shards": [
+        "chaos-follower",
+        "chaos-l1"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "Asymmetric Raft partition with an isolated live old leader and packet loss/delay",
+      "existing_shards": [
+        "chaos-cluster"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "ENOSPC, I/O errors, and corrupt recovery sources",
+      "existing_shards": [
+        "chaos-executor",
+        "chaos-ingress",
+        "chaos-cluster"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "Loss of unsynced disk writes rather than a process-only SIGKILL",
+      "incident": "https://github.com/junemartes/kardamom/issues/644",
+      "existing_shards": [
+        "chaos-integrity"
+      ],
+      "status": "pending; process kill must not be reported as power-loss proof"
+    },
+    {
+      "gap": "Canonical rewind invalidates already served receipts and derived caches",
+      "existing_shards": [
+        "chaos-integrity",
+        "chaos-cache"
+      ],
+      "status": "pending; existing fleet wipe quiesces and posts user transactions before rewind"
+    },
+    {
+      "gap": "Recovered sequencer makes progress while its healthy twin is disabled",
+      "existing_shards": [
+        "chaos-sequencer"
+      ],
+      "status": "Isolated lane-0 restart proof implemented with an established sender and a frozen healthy twin; awaiting CI. Lane rotation pending."
+    },
+    {
+      "gap": "Persist divergence evidence through restart and allocation collection; deployed negative control",
+      "existing_shards": [
+        "chaos-executor",
+        "chaos-integrity"
+      ],
+      "status": "live 404 rejection implemented; durable evidence and negative control pending"
+    },
+    {
+      "gap": "Mixed senders, lanes, contract storage and subscriptions under sustained faults",
+      "existing_shards": [
+        "chaos-sequencer",
+        "chaos-combined-exec"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "Load lasts throughout the fault and recovery, with measured RTO and latency/throughput budgets",
+      "existing_shards": [
+        "all existing shards"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "Nomad, Consul and DNS control-plane loss while the data plane stays live",
+      "existing_shards": [
+        "chaos-coordinated"
+      ],
+      "status": "pending"
+    },
+    {
+      "gap": "Populated old deployment layouts and crash/open/clean-restart/upgrade sequence",
+      "incident": "https://github.com/junemartes/kardamom/issues/825",
+      "existing_shards": [
+        "chaos-carry",
+        "chaos-integrity"
+      ],
+      "status": "pending; compare egress reference mark with stored records, not only its prior value"
+    }
+  ],
+  "validation": {
+    "runtime_product_files_changed": true,
+    "service_wiring_changed": false,
+    "performance_claim": "No speedup is claimed. Local release microbenchmarks show no observed regression. Full cluster workload comparison and repeated green CI remain required.",
+    "completed": [
+      {
+        "check": "chaos library unit tests",
+        "result": "192 passed, 2 ignored"
+      },
+      {
+        "check": "just style",
+        "result": "passed; existing proc-macro-error2 future-incompatibility notice"
+      },
+      {
+        "check": "format registry against PR 839 head",
+        "result": "passed"
+      },
+      {
+        "check": "workflow YAML lint",
+        "result": "passed"
+      },
+      {
+        "check": "ingress library and account layer tests",
+        "result": "132 library tests and 14 account tests passed"
+      },
+      {
+        "check": "real Redis ingress regression and profile tests",
+        "result": "8 passed; includes 5 profile rounds"
+      },
+      {
+        "check": "release RPC and serial-admission comparison",
+        "result": "5 before and 5 after repeats, 400 samples per phase per repeat; raw samples checked in"
+      },
+      {
+        "check": "ten-round audit utility",
+        "result": "14 tests pass, including rejecting overlap after an early failure; real GitHub evidence reads verified"
+      },
+      {
+        "check": "sealer Java recovery and allocation gates",
+        "result": "622 tests pass: 208 core and 414 service"
+      }
+    ],
+    "pending": [
+      "Full CI for the product fix",
+      "Remaining coverage gaps",
+      "Full cluster workload comparison",
+      "10 consecutive complete green CI rounds on the final unchanged commit"
+    ],
+    "ci_wiring_changed": "Retain load/profile evidence; add suite=all to the cluster workflow without changing normal PR/scheduled selection; make static validation dispatchable; test the persistent ten-round audit utility in CI. The serial carry rollout has a 180-minute job budget; all per-case recovery deadlines remain unchanged.",
+    "streak_command": "python3 scripts/ci/green_streak.py --branch BRANCH --head FULL_SHA --state AUDIT.json --poll --run CI_ID --run CLUSTER_ID --run DOCKER_ID --run SEMANTICS_ID --run VALIDATION_ID",
+    "streak_dispatch": [
+      {
+        "workflow": "ci.yml",
+        "inputs": {}
+      },
+      {
+        "workflow": "cluster-e2e.yml",
+        "inputs": {
+          "suite": "all"
+        }
+      },
+      {
+        "workflow": "docker-e2e.yml",
+        "inputs": {}
+      },
+      {
+        "workflow": "chain-semantics-e2e.yml",
+        "inputs": {}
+      },
+      {
+        "workflow": "cluster-validate.yml",
+        "inputs": {}
+      }
+    ]
+  },
+  "iterations": [
+    {
+      "pull_request": 839,
+      "commit": "a510a518685864b3cf9419dd52c0535040108f15",
+      "workflow_run": 40267573235,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40267573235",
+      "status": "in progress"
+    },
+    {
+      "pull_request": 840,
+      "commit": "5e2ce0523bc9b27889af69b8061dde66aa259bd4",
+      "workflow_run": 40268972862,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40268972862",
+      "status": "in progress"
+    }
+  ]
+}

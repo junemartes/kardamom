@@ -17,13 +17,16 @@
 use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
-use kardamom_bench::mnemonic::derive_signers;
 
 use crate::harness::Harness;
-use crate::nomad::{SavedJob, Streams};
+use crate::nomad::SavedJob;
 use crate::poll::{self, Budget};
 use crate::probes::Probed;
-use crate::rpc::{ANVIL_MNEMONIC, Rpc};
+use crate::rpc::Rpc;
+
+mod coverage;
+mod rebuilds;
+pub(crate) use coverage::CacheRecovery;
 
 const DEGRADED: &str = "kardamom_cache_degraded_total";
 const LOOKUPS: &str = "kardamom_cache_lookups_total";
@@ -34,10 +37,6 @@ const MIRROR_WRITE_RETRIES: &str = "kardamom_state_mirror_write_retries_total";
 /// outage rebuild for a write that retried past 10 s, so the loss
 /// lasts three times that.
 const TOTAL_LOSS: Duration = Duration::from_secs(30);
-/// The log line of a finished rebuild. The case counts these lines, not
-/// the rebuild counter: the kill restarts every mirror process, and a
-/// counter in a new process starts again at zero.
-const REBUILD_DONE: &str = "rebuild: done";
 /// How long the sentinels get to promote the replica of a frozen
 /// primary: their `down-after-milliseconds` (5 s), the election, and
 /// slack. The freeze lasts until the promotion is observed.
@@ -197,14 +196,6 @@ async fn mirror_head(h: &Harness) -> Option<i64> {
         best = best.max(h.probes.mirror_metric(i, MIRROR_HEAD).await);
     }
     best
-}
-
-/// The finished rebuilds in the mirror job's logs. A task log survives
-/// an in-place restart, so the count only grows.
-pub(crate) async fn mirror_rebuilds(h: &Harness) -> anyhow::Result<usize> {
-    h.evidence
-        .count_lines("state-mirror", REBUILD_DONE, Streams::Both)
-        .await
 }
 
 /// The mirror head advances: the projection follows the chain again.
@@ -417,7 +408,7 @@ async fn mirror_write_retries(h: &Harness) -> i64 {
 pub(crate) async fn redis_total_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "redis-total-loss-recover";
     wait_readers_connected(h, ctx).await?;
-    let rebuilds0 = mirror_rebuilds(h).await?;
+    let recovery = CacheRecovery::capture(h).await?;
     let retries0 = mirror_write_retries(h).await;
     let job = SavedJob::capture(&h.nomad, "redis").await?;
     crate::log(format!(
@@ -432,10 +423,9 @@ pub(crate) async fn redis_total_loss_recover(h: &mut Harness) -> anyhow::Result<
     restored?;
     h.assert_count("redis", REDIS_ALLOCS, h.knobs.reschedule_slo)
         .await?;
-    let master = wait_primary_named(h, ctx).await?;
-    wait_every_mirror_rebuilt(h, ctx, rebuilds0).await?;
+    wait_primary_named(h, ctx).await?;
     wait_mirror_advances(h, ctx).await?;
-    assert_chaos_account_projected(h, ctx, &master).await?;
+    recovery.await_restored(h, ctx).await?;
     wait_readers_recovered(h, ctx).await?;
     h.assert_group_never_restarted("redis", "sentinel", ctx)
         .await?;
@@ -488,31 +478,6 @@ async fn wait_primary_named(h: &Harness, ctx: &str) -> anyhow::Result<String> {
     Ok(master)
 }
 
-/// Every mirror finished a rebuild since `rebuilds0`: each one wrote
-/// into the empty Redis from its own executor's checkpoint.
-pub(crate) async fn wait_every_mirror_rebuilt(
-    h: &Harness,
-    ctx: &str,
-    rebuilds0: usize,
-) -> anyhow::Result<()> {
-    let target = rebuilds0 + MIRROR_ALLOCS;
-    let outcome = poll::until(Budget::secs(300, 5), |_| async move {
-        Ok::<_, anyhow::Error>(Some(mirror_rebuilds(h).await?).filter(|n| *n >= target))
-    })
-    .await?;
-    let (rebuilds, elapsed) = outcome.or_fail(|t| {
-        crate::chaos_fail!(
-            "{ctx}: not every mirror rebuilt within {}s of the restart (need {target} finished rebuilds)",
-            t.as_secs()
-        )
-    })?;
-    crate::log(format!(
-        "{ctx}: rebuilds {rebuilds0} -> {rebuilds} after {}s",
-        elapsed.as_secs()
-    ));
-    Ok(())
-}
-
 /// The iptables rule that drops ingress-0's packets to `port`.
 fn drop_rule(port: u16) -> String {
     format!("OUTPUT -p tcp --dport {port} -j DROP")
@@ -554,13 +519,13 @@ async fn partitioned_phase(h: &Harness, ctx: &str) -> anyhow::Result<()> {
 
 /// The three mirrors hard-killed and the projection flushed: the
 /// restarted mirrors find Redis cold, rebuild from the executors'
-/// newest checkpoint, and the head advances again. The first chaos
-/// account, funded at genesis because the load spends it, proves the
-/// rebuild wrote the checkpoint's accounts, not only the live rows.
+/// newest checkpoint, and the head advances again. Exact values for an
+/// idle used sender and an untouched funded account prove the rebuild
+/// restores checkpoint coverage beyond the new live rows.
 pub(crate) async fn mirror_kill_rebuild(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "mirror-kill-rebuild";
     wait_readers_connected(h, ctx).await?;
-    let rebuilds0 = mirror_rebuilds(h).await?;
+    let recovery = CacheRecovery::capture(h).await?;
     let nodes: Vec<String> = h
         .probes
         .executors
@@ -584,19 +549,8 @@ pub(crate) async fn mirror_kill_rebuild(h: &mut Harness) -> anyhow::Result<()> {
     ));
     h.assert_count("state-mirror", MIRROR_ALLOCS, h.knobs.restart_slo)
         .await?;
-    let hs: &Harness = h;
-    let outcome = poll::until(Budget::secs(300, 5), |_| async move {
-        Ok::<_, anyhow::Error>(Some(mirror_rebuilds(hs).await?).filter(|n| *n > rebuilds0))
-    })
-    .await?;
-    let (rebuilds, elapsed) = outcome
-        .or_fail(|t| crate::chaos_fail!("{ctx}: no mirror rebuilt within {}s", t.as_secs()))?;
-    crate::log(format!(
-        "{ctx}: rebuilds {rebuilds0} -> {rebuilds} after {}s",
-        elapsed.as_secs()
-    ));
     wait_mirror_advances(h, ctx).await?;
-    assert_chaos_account_projected(h, ctx, &master).await?;
+    recovery.await_restored(h, ctx).await?;
     wait_readers_recovered(h, ctx).await?;
     h.assert_progress().await
 }
@@ -630,44 +584,4 @@ pub(crate) async fn freeze_and_flush(
         .await
         .map_err(|e| crate::chaos_fail!("{ctx}: FLUSHALL on {master} failed: {e}"))?;
     Ok(master)
-}
-
-/// The first chaos account has a projected row: the rebuild scanned
-/// the checkpoint, so an account the flush emptied is present again.
-async fn assert_chaos_account_projected(
-    h: &Harness,
-    ctx: &str,
-    master: &str,
-) -> anyhow::Result<()> {
-    let count = h
-        .knobs
-        .account_base
-        .checked_add(1)
-        .ok_or_else(|| crate::chaos_fail!("{ctx}: the chaos account index overflows"))?;
-    let address = derive_signers(ANVIL_MNEMONIC, count)?
-        .pop()
-        .ok_or_else(|| crate::chaos_fail!("{ctx}: no chaos signer"))?
-        .signer
-        .address();
-    let script = redis_cli(&format!("-h {master} -p 6379 HLEN acct:{address}"));
-    let script = &script;
-    let outcome = poll::until(Budget::secs(120, 5), |_| async move {
-        let fields: i64 = h
-            .nodes
-            .exec(&aux(h), script)
-            .await?
-            .trim()
-            .parse()
-            .unwrap_or(0);
-        Ok::<_, anyhow::Error>((fields > 0).then_some(fields))
-    })
-    .await?;
-    outcome
-        .or_fail(|t| {
-            crate::chaos_fail!(
-                "{ctx}: chaos account {address} has no projected row within {}s of the rebuild",
-                t.as_secs()
-            )
-        })
-        .map(|_| ())
 }

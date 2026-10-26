@@ -14,6 +14,7 @@ use crate::nodes::Nodes;
 use crate::nomad::{Alloc, Nomad, Streams};
 use crate::stages::{head_lines, matching_lines, tail_lines};
 
+mod egress;
 mod exits;
 mod nodes;
 
@@ -341,6 +342,7 @@ impl Diagnostics {
             println!("  task {task}: {}", task_summary(state));
         }
         Self::task_records(job, alloc);
+        self.stream_section(job, alloc).await;
         let logs = self
             .nomad
             .alloc_logs(alloc, Streams::Both)
