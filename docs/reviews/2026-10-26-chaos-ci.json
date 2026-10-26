@@ -474,7 +474,18 @@
       "job": 121533651664,
       "observed": "The DA-lag case has 1764 receipts and no missing receipts, but 510 statuses are non-success. All executors advance. V2 did not honor lifecycle pauses on this candidate.",
       "change": "Keep every receipt-status assertion. Validate the separately reproduced V2 pause fix against this deployed case; do not assume it is the entire cause.",
-      "status": "Unresolved; no relaxation or retry counted as a pass."
+      "status": "Product gap remains open. The lifecycle pause fix alone does not prevent missing-nonce skips in PR 850. Retain the failed-status oracle; do not count these receipts as successful transactions.",
+      "diagnostic_850": {
+        "job": 121579144991,
+        "accepted": 6522,
+        "receipted": 6522,
+        "bad_status": 506,
+        "missing": 0,
+        "state_nonce": 2138,
+        "first_da_refused_nonce": 2138,
+        "observed_skipped_through_nonce": 2649
+      },
+      "cause_evidence": "The sealer refuses nonces starting at 2138 during DA lag. After clear, executors log nonce_too_high for higher canonical nonces while account state still expects 2138. V2 does not consume the existing DA/record-lag terminal-refusal channel; it goes to the V1 controller. Complete recovery semantics, including queued higher offers and client outcomes, remain to be fixed and reproduced locally."
     },
     {
       "id": "fleet-own-sender-stalls-after-total-loss",
@@ -522,7 +533,7 @@
         "Method, source/binary hashes, limits and raw samples: docs/benches/2026-10-26-v2-idle-session-profile.json and docs/benches/2026-10-26-v2-idle-session-samples.jsonl.",
         "Workspace style passes. Baseline product files are restored after an isolated baseline build; candidate file hashes match the build manifest. No local build or test overlaps the measurements."
       ],
-      "status": "Validated locally after PR 850 is published. This could explain the same-sender fleet stall, but that cause is not yet proved on a deployed run. Full client latency/throughput validation and ten final-head green rounds remain pending."
+      "status": "Validated locally. PR 850 fleet passes without this follow-up, so it is not an established cause of the earlier fleet failure. Full client latency/throughput validation and ten final-head green rounds remain pending."
     },
     {
       "id": "combined-no-head-during-planned-total-source-loss",
@@ -548,6 +559,38 @@
         "The vanished aux container maps to batcher allocation 72711ce5-f941-2e6d-c931-0c0de2c45adf. Its log ends at 13:16:14 UTC after six DA DNS failures, before fault cleanup.",
         "No service wiring, healthy posting-path work, retry count or protocol change."
       ]
+    },
+    {
+      "id": "two-blank-members-require-offline-copy",
+      "classification": "harness",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "job": 121579144900,
+      "observed": "One intact survivor stays in CANVASS while both blank members repeatedly report NO_PEER/BACKUP_QUERY. The closed-majority deadline expires.",
+      "cause": "The drill expects automatic seeding without a quorum, but the existing recovery design requires an offline copy from the stopped survivor to one blank member.",
+      "change": "Follow the offline-copy runbook. Verify all copied file hashes; exclude cluster/archive process marks and links and archive/dir. Remove a partial target copy on failure. Restore the saved job on every result. Require new same-allocation start and snapshot evidence for both recovered members.",
+      "verification": [
+        "230 chaos library tests pass, two manual profiles ignored. Controls include changed copy bytes, preserved victim shared archive, service mark/link exclusion, post-resume snapshots and unrelated old allocation evidence.",
+        "docs/runbooks/sealer-two-blank-members.md records the concrete procedure and validation."
+      ],
+      "status": "Validated locally; deployed proof remains pending."
+    },
+    {
+      "id": "combined-progress-probe-starvation",
+      "classification": "harness",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "job": 121579144928,
+      "observed": "The validator verifies block 442 at 13:15:40 and does not restart. At the next planned loss of ingress/sealer nodes, the 12-second head wait fails before recovery.",
+      "cause": "Head sources are read serially. Dead executor and ingress reads, with direct and node-exec timeouts, can exhaust the complete budget before the live validator is read. The completed head also waits behind optional statistics.",
+      "change": "Poll independent sources concurrently. Keep only completed values during the same bounded observation, even if another probe consumes the remaining deadline. No source, absent metric or hung read becomes a synthetic zero.",
+      "verification": [
+        "Paused-clock controls preserve a real height 475 when unrelated probes hang until the existing 12-second deadline. Missing and hung heads still fail.",
+        "A real flat head can prove a stall; it cannot prove the seal-only expectation without positive boundary progress."
+      ],
+      "status": "Validated locally; deployed combined ordering remains pending."
     }
   ],
   "coverage": [
@@ -649,7 +692,7 @@
       "existing_shards": [
         "chaos-integrity"
       ],
-      "status": "The existing cluster shard now also stops all member tasks, erases Raft and seed data on two members, and restores the exact job with one intact data copy. Both empty members must prove a fresh seed and reach the pre-loss target after a real log purge. Shared executor archives remain intact. Local checks pass; deployed validation pending. This covers two empty members/one survivor, not loss of unsynced writes or a power cut."
+      "status": "The cluster case follows the offline-copy procedure: stop every member; erase two members; hash-verify a copy from the survivor to one wiped member; restore the saved job. The copied member needs a new RESUME and snapshot; the other needs a fresh peer seed. Bind each start and snapshot proof to the same allocation. Preserve shared executor archives. Local file-copy, corruption, mark exclusion and observer controls pass; deployed validation is pending. This does not cover unsynced-write loss or power cuts."
     },
     {
       "gap": "Canonical rewind invalidates already served receipts and derived caches",
@@ -939,7 +982,7 @@
       "url": "https://github.com/junemartes/kardamom/pull/850",
       "cluster_run": 40320872242,
       "integrity_run": 40321151376,
-      "status": "All four supporting workflows and integrity pass. Nine regular shards/stages pass, carry remains live, and six fail. Cache baseline and batcher retry-exhaustion classification are corrected locally. Two-blank recovery, combined outage observation, DA-lag failed receipts and executor checkpoint copying remain under investigation. Diagnostic only; streak 0/10."
+      "status": "Diagnostic batch is complete. Four supporting workflows, integrity and eight regular stages/shards pass. Seven regular shards fail: cluster, cache, combined ordering, coordinated, retention, executor and carry. Local fixes cover the cache baseline, batcher error classification, offline quorum recovery procedure and concurrent head observation. DA-lag missing-nonce skips, checkpoint-copy timing and carry measurement coverage remain under investigation. Streak 0/10; head is not frozen."
     }
   ],
   "integration": {
