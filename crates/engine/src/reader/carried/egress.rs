@@ -27,6 +27,8 @@ use super::transport::{Poll, Request, Transport};
 
 /// The bytes of one page of the range read.
 const PAGE: u64 = 4 * 1024 * 1024;
+/// A range read ends within the silence window of the source.
+const PAGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One reader of the egress: its HTTP base, and the live stream.
 pub struct EgressTransport {
@@ -35,7 +37,7 @@ pub struct EgressTransport {
     handle: tokio::runtime::Handle,
     live: Receiver<Vec<u8>>,
     /// The frames of the running replay, and then its answer.
-    replay: Option<Receiver<Vec<u8>>>,
+    replay: Option<Replay>,
     connection: u64,
     /// A failed range read: the next poll counts a new connection.
     failed: Receiver<()>,
@@ -78,8 +80,11 @@ impl Transport for EgressTransport {
             frames,
             fail: self.fail.clone(),
         };
-        self.handle.spawn(page.run());
-        self.replay = Some(replay);
+        let task = self.handle.spawn(page.run());
+        self.replay = Some(Replay {
+            frames: replay,
+            task,
+        });
     }
 
     fn poll(&mut self, wait: Duration) -> Poll {
@@ -90,7 +95,7 @@ impl Transport for EgressTransport {
                 Err(RecvTimeoutError::Disconnected) => Poll::Closed,
             };
         };
-        match replay.recv_timeout(wait) {
+        match replay.frames.recv_timeout(wait) {
             Ok(frame) => Poll::Frame(frame),
             Err(RecvTimeoutError::Timeout) => Poll::Idle,
             Err(RecvTimeoutError::Disconnected) => {
@@ -107,6 +112,18 @@ impl Transport for EgressTransport {
 
     fn lossy(&self) -> bool {
         true
+    }
+}
+
+/// A replay owns its HTTP worker. Replacing or closing it cancels the read.
+struct Replay {
+    frames: Receiver<Vec<u8>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Replay {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -180,6 +197,7 @@ impl Pages {
         let response = self
             .client
             .get(format!("{}/v1/frames", self.base))
+            .timeout(PAGE_TIMEOUT)
             .query(&[
                 ("from_index", index),
                 ("from_block", block),
@@ -231,3 +249,7 @@ fn split(mut body: &[u8]) -> impl Iterator<Item = &[u8]> {
 #[cfg(test)]
 #[path = "egress_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "egress_replay_tests.rs"]
+mod replay_tests;

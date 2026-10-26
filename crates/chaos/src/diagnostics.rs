@@ -15,6 +15,7 @@ use crate::nomad::{Alloc, Nomad, Streams};
 use crate::stages::{head_lines, matching_lines, tail_lines};
 
 mod exits;
+mod logs;
 mod nodes;
 
 const JOBS: [&str; 18] = [
@@ -345,7 +346,10 @@ impl Diagnostics {
             .nomad
             .alloc_logs(alloc, Streams::Both)
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|error| format!("log collection failed: {error:#}\n"));
+        if let Err(error) = Self::preserve_alloc_logs(job, alloc, &logs) {
+            eprintln!("could not preserve {job} alloc {} logs: {error}", alloc.id);
+        }
         let tail = if job == "cluster" {
             CLUSTER_LOG_TAIL
         } else {

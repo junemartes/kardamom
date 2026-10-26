@@ -139,7 +139,28 @@
       "case": "ingress-sealer-loss-recover",
       "url": "https://github.com/junemartes/kardamom/actions/runs/40267573235/job/121399758458",
       "observed": "All client completeness and recovery probes pass, but validator stays at block 594 while executors reach 873. It alternates service/feed Silent faults at cursor (82106,595).",
-      "status": "preserved log /tmp/chaos-gaps-pr839-ordering.log; root cause and reproducer pending"
+      "status": "preserved log /tmp/chaos-gaps-pr839-ordering.log; root cause and reproducer pending",
+      "evidence_gap": "The existing printed head, tail, and filtered events omit the replay transition that first stalls. Full available allocation logs and task-state metadata are now retained as a failure artifact for the next iteration. Nomad rotation and collection can still remove old logs."
+    },
+    {
+      "id": "abandoned-egress-http-replays",
+      "classification": "product",
+      "source": "crates/engine/src/reader/carried/egress.rs",
+      "observed": "A peer accepts request headers and never answers. Closing the source, replacing the request, or dropping the reader leaves each old HTTP request alive. All three cancellation regressions fail before the fix.",
+      "cause": "EgressTransport discards the spawned replay JoinHandle. Dropping the output receiver does not cancel the HTTP task, and the request has no deadline. Reader resends can leave more abandoned workers.",
+      "change": "Make Replay own its worker and abort it on replacement, close, or drop. Bound each page request, including its body, to five seconds.",
+      "product_bug": true,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "hot_path_detail": "Only replay setup, teardown, and HTTP reads change. Polling still reads the same receiver. Admission and execution add no work. Full deployed workload comparison remains pending.",
+      "reason_missed": "Existing egress tests use an answering local peer or a refused connection. They do not hold a connection open without a response or check abandoned requests.",
+      "status": "All 209 engine library tests pass, including five real-socket cancellation and deadline regressions. This independently reproduced bug is not established as the cause of the validator CI stall.",
+      "verification": [
+        "Before-fix failure: /tmp/chaos-gaps-replay-cancel-before.log",
+        "After-fix carried-reader tests: /tmp/chaos-gaps-replay-cancel-after.log",
+        "Workspace style passes.",
+        "A stalled response body expires even after the peer sends valid response headers."
+      ]
     }
   ],
   "coverage": [
@@ -408,6 +429,12 @@
       "workflow_run": 40275014189,
       "url": "https://github.com/junemartes/kardamom/actions/runs/40275014189",
       "status": "in progress; diagnostic only, not a qualifying frozen-head round"
+    },
+    {
+      "pull_request": 844,
+      "commit": "8c3c81a5e1e0",
+      "url": "https://github.com/junemartes/kardamom/pull/844",
+      "status": "CI pending; owned-load coverage correction; diagnostic only"
     }
   ]
 }
