@@ -86,6 +86,19 @@ class StreakTest(unittest.TestCase):
         self.streak.record(runs)
         self.assertEqual(self.streak.state["streak"], 2)
 
+    def test_an_early_failure_cannot_open_the_next_round_while_jobs_still_run(self):
+        self.green(1)
+        runs = self.runs(2)
+        runs[0]["conclusion"] = "failure"
+        runs[1].update(status="in_progress", conclusion=None)
+        self.assertEqual(self.streak.record(runs), "failed")
+        with self.assertRaisesRegex(ValueError, "must finish"):
+            self.streak.record(self.runs(3))
+        runs[1].update(status="completed", conclusion="success")
+        self.streak.record(runs)
+        self.streak.record(self.runs(3))
+        self.assertEqual(self.streak.state["streak"], 1)
+
     def test_regular_shards_alone_do_not_complete_a_round(self):
         runs = self.runs(1)
         cluster = next(run for run in runs if run["path"].endswith("cluster-e2e.yml"))

@@ -252,7 +252,7 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
   - Trigger: one follower dies.
   - Effect: quorum 2 of 3 holds. There is no stall.
   - Recovery: the member restarts and rejoins.
-  - Proof: `cluster-follower-kill`. The case asserts zero stall and an unchanged leader.
+  - Proof: `cluster-follower-kill`. The case requires executor progress, three running members and a snapshot restore on the restarted member. A leadership change is logged and tolerated.
 - **Member state loss**
   - Trigger: a member comes back with no Raft recording log: its directories are wiped, or its node is replaced.
   - Effect: the member must not start at log position 0 in a running cluster. It could not catch up after the leader purges its log. Blank members that elect each other would start a second history.
@@ -262,6 +262,8 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
     - Without a peer, the member waits and logs `cluster SEED waiting-for-peer`. It never falls back to position 0.
     - See [Start modes](../cluster/sealer-service/README.md#start-modes).
   - Proof: `cluster-member-rejoin` and `node-replace-sealer`. Each case checks that the member starts blank, then reaches the head that the executors had at the wipe.
+    - The member rejoin drill wipes the cluster directory and the Raft archive root files. The live executor archive in the `dir` child stays intact. The node replacement drill loses all state on the node.
+    - Each peer-seed round clears the Raft archive root files and preserves other archives in child directories.
 - **Raft log purge**
   - Rule: each member purges its own Raft log below a purge point. The purge point is the newest snapshot that obeys two rules:
     - It is older than the 3 newest snapshots (`kardamom.cluster.logPurgeKeepSnapshots`, env `KARDAMOM_CLUSTER_LOG_PURGE_KEEP`). The value 0 turns the purge off.

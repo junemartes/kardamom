@@ -97,8 +97,14 @@
       "verification": [
         "The new live-catalog regression fails before the cleanup fix and passes after it.",
         "All 615 Java tests pass (202 core, 413 service).",
-        "192 chaos library tests pass, 2 ignored; just style passes."
-      ]
+        "192 chaos library tests pass, 2 ignored; just style passes.",
+        "The real peer-seed regression fails with NoSuchFileException before the correction and passes after it.",
+        "Stale Raft recording removed while executor catalog and recording contents survive peer-seed retries.",
+        "Full Java check: 208 core and 414 service tests, zero failures, including allocation gates.",
+        "Final merged Java tree: ./gradlew check passes 615 tests, including live Aeron peer seed and open nested-catalog fixtures; no failures, errors or skips."
+      ],
+      "source": "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/PeerSeed.java",
+      "product_bug": true
     },
     {
       "id": "provider-refusal-process-counter-reset",
@@ -108,7 +114,7 @@
       "url": "https://github.com/junemartes/kardamom/actions/runs/40267573235/job/121399758434",
       "observed": "The canonical L1 posting record stays flat, but the test fails on a changed batcher post counter. The batcher restarts after provider retries exhaust, resetting its counter.",
       "cause": "A per-process counter is compared for equality across a fault that can restart the process. A reset is incorrectly reported as a new post.",
-      "change": "Use the complete canonical L1 batch record for the freeze and absolute batch count for recovery, including pre-fault readiness.",
+      "change": "Keep exact on-chain record equality during refusal. Require a higher durable contract batch index after clearing each refusal, independent of process restarts.",
       "hot_path_changed": false,
       "service_wiring_changed": false,
       "status": "assertion corrected; CI pending"
@@ -129,7 +135,10 @@
       "verification": [
         "61 load library tests pass, including owned counters, cancellation, stop-before-start, actual duration, and accepted-transaction drain.",
         "192 chaos library tests pass; 2 ignored.",
-        "Workspace style check passes; baseline proc-macro-error2 future-compatibility notice remains."
+        "Workspace style check passes; baseline proc-macro-error2 future-compatibility notice remains.",
+        "First executor cut-over passes persisted account, storage, code, header, receipt and index parity.",
+        "L1 reconstruction verifies 303155 transactions and matches the validator root before cancellation.",
+        "Actionlint validates the matrix-specific timeout expression."
       ]
     },
     {
@@ -138,9 +147,10 @@
       "job": 121399758458,
       "case": "ingress-sealer-loss-recover",
       "url": "https://github.com/junemartes/kardamom/actions/runs/40267573235/job/121399758458",
-      "observed": "All client completeness and recovery probes pass, but validator stays at block 594 while executors reach 873. It alternates service/feed Silent faults at cursor (82106,595).",
+      "observed": "All client completeness and recovery probes pass, but validator stays at block 594 while executors reach 873. It alternates service/feed Silent faults at cursor (82106,595). The integration review also identifies the batcher egress reader at the same cursor.",
       "status": "preserved log /tmp/chaos-gaps-pr839-ordering.log; root cause and reproducer pending",
-      "evidence_gap": "The existing printed head, tail, and filtered events omit the replay transition that first stalls. Full available allocation logs and task-state metadata are now retained as a failure artifact for the next iteration. Nomad rotation and collection can still remove old logs."
+      "evidence_gap": "The existing printed head, tail, and filtered events omit the replay transition that first stalls. Full available allocation logs and task-state metadata are now retained as a failure artifact for the next iteration. Nomad rotation and collection can still remove old logs.",
+      "change": "Capture every executor and egress frame-forwarding metric and HTTP range cursor on failure. Keep the validator recovery assertion and timeout unchanged."
     },
     {
       "id": "abandoned-egress-http-replays",
@@ -160,6 +170,21 @@
         "After-fix carried-reader tests: /tmp/chaos-gaps-replay-cancel-after.log",
         "Workspace style passes.",
         "A stalled response body expires even after the peer sends valid response headers."
+      ]
+    },
+    {
+      "id": "audit-early-failure-round-overlap",
+      "classification": "audit tool",
+      "source": "scripts/ci/green_streak.py:Streak.validate_order",
+      "observed": "An early failed round can open another round while its other workflows are still running.",
+      "change": "Require every workflow of the prior round to be completed before accepting the next round. Retain the failed outcome.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "validated locally; combined CI pending",
+      "verification": [
+        "A regression reproduces the missing overlap rejection.",
+        "All 14 audit tests pass, including completing the failed round before a new round is accepted."
       ]
     }
   ],
@@ -409,7 +434,7 @@
       "commit": "5e2ce0523bc9b27889af69b8061dde66aa259bd4",
       "workflow_run": 40268972862,
       "url": "https://github.com/junemartes/kardamom/actions/runs/40268972862",
-      "status": "in progress"
+      "status": "cancelled externally at 2026-10-26T05:58:59Z; follower oracle failure retained; cache and sequencer deployed recovery verdicts incomplete"
     },
     {
       "pull_request": 841,
@@ -428,7 +453,7 @@
       "commit": "743d590e",
       "workflow_run": 40275014189,
       "url": "https://github.com/junemartes/kardamom/actions/runs/40275014189",
-      "status": "in progress; diagnostic only, not a qualifying frozen-head round"
+      "status": "cancelled externally; archive fix included in integration head 2c051fc9; no qualifying round"
     },
     {
       "pull_request": 844,
@@ -436,5 +461,10 @@
       "url": "https://github.com/junemartes/kardamom/pull/844",
       "status": "CI pending; owned-load coverage correction; diagnostic only"
     }
-  ]
+  ],
+  "integration": {
+    "reviewed_head": "2c051fc9a3c978a05a7f98bc35dad174f246e32a",
+    "changes": "Peer-seed retry regression and wording, canonical contract cursor for provider recovery, carry-only 180-minute limit, egress stream diagnostics, and early-failure round-overlap rejection. Merge retains owned-load control, replay cancellation, and full allocation artifacts.",
+    "verification": "Merged tree checks pending; no frozen-head round started."
+  }
 }

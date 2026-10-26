@@ -14,6 +14,7 @@ fn blank_member_keeps_the_shared_driver_archive_and_other_services() {
         "archive/member/snapshot.rec",
         "archive/dir/catalog.dat",
         "archive/dir/19.rec",
+        "archive/dir/archive-mark.dat",
         "state/mdbx.dat",
         "egress/frames.log",
     ];

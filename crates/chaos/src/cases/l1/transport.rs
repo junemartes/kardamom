@@ -28,7 +28,7 @@ impl Refusal {
 
     async fn run(self, h: &mut Harness, l1: &L1, ctx: &str) -> anyhow::Result<()> {
         let base = Followers::ready(h, ctx).await?;
-        let before = l1.posted().await?.len();
+        let before = l1.last_batch_index().await?;
         self.await_posting(l1, before, ctx).await?;
         let fault = self.fault();
         crate::log(format!(
@@ -50,7 +50,7 @@ impl Refusal {
         l1: &L1,
         base: Followers,
         ctx: &str,
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<u64> {
         let started = Instant::now();
         await_followers_halted(h, base, ctx).await?;
         let record = l1.posted().await?;
@@ -66,21 +66,25 @@ impl Refusal {
             self.fault(),
             started.elapsed().as_secs()
         ));
-        Ok(record.len())
+        Ok(record.last().map_or(0, |batch| batch.index))
     }
 
-    async fn await_posting(self, l1: &L1, before: usize, ctx: &str) -> anyhow::Result<()> {
+    /// The contract cursor survives a batcher restart; its process counter does not.
+    async fn await_posting(self, l1: &L1, base: u64, ctx: &str) -> anyhow::Result<()> {
         let outcome = poll::until(Budget::secs(120, 3), |_| async move {
-            let now = l1.posted().await?.len();
-            Ok::<_, anyhow::Error>((now > before).then_some(now))
+            let now = l1.last_batch_index().await?;
+            Ok::<_, anyhow::Error>((now > base).then_some(now))
         })
         .await?;
-        let (now, elapsed) = outcome.or_fail(|t| crate::chaos_fail!(
-            "{ctx}: the canonical L1 posting record did not advance past {before} batches in {}s", t.as_secs()
-        ))?;
+        let (now, elapsed) = outcome.or_fail(|t| {
+            crate::chaos_fail!(
+                "{ctx}: L1 holds no new batch within {}s of clearing {:?} (last batch {base})",
+                t.as_secs(),
+                self.fault()
+            )
+        })?;
         crate::log(format!(
-            "{ctx}: {:?}: canonical L1 batches {before} -> {now} after {}s",
-            self.fault(),
+            "{ctx}: L1 posting resumed after {}s ({base} -> {now})",
             elapsed.as_secs()
         ));
         Ok(())

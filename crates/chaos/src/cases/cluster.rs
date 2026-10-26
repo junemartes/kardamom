@@ -116,7 +116,7 @@ pub(crate) async fn follower_kill(h: &mut Harness) -> anyhow::Result<()> {
 const PURGE_WAIT: Duration = Duration::from_mins(6);
 
 /// The blank-member catch-up drill: a follower's cluster directory and
-/// archive are wiped after its kill, so the restarted member owns
+/// Raft archive are wiped after its kill, so the restarted member owns
 /// nothing. The drill first waits until the leader has purged its log,
 /// so a replay from position 0 is impossible. The member seeds from a
 /// peer's latest snapshot and catches up from the leader. The proof is
@@ -131,7 +131,7 @@ pub(crate) async fn member_rejoin(h: &mut Harness) -> anyhow::Result<()> {
     let before = Blank::observe(h, follower, ctx).await?;
     let node = sealer(h, follower)?;
     crate::log(format!(
-        "{ctx}: leader=memberId={leader}; killing FOLLOWER memberId={follower} and WIPING its cluster + archive dirs"
+        "{ctx}: leader=memberId={leader}; killing FOLLOWER memberId={follower} and WIPING its cluster + Raft archive state"
     ));
     h.inject_hard(&[&node], CLUSTER_TASK).await?;
     MemberStorage::wipe(h, &node, ctx).await?;

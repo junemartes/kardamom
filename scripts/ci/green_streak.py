@@ -109,7 +109,8 @@ class Streak:
     @staticmethod
     def validate_order(rounds):
         for before, after in zip(rounds, rounds[1:]):
-            if before["status"] == "pending" or after["started_at"] < before["updated_at"]:
+            unfinished = any(run["status"] != "completed" for run in before["workflows"])
+            if unfinished or after["started_at"] < before["updated_at"]:
                 raise ValueError("rounds must finish before the next round starts")
 
     @staticmethod
