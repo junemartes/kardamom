@@ -355,7 +355,17 @@ jobs:
           # first vmstat row, whose counters average the time since boot.
           TZ=UTC vmstat --wide --timestamp --no-first --one-header -S K 1 >> /tmp/chaos-runner-resources.log 2>&1 &
           resource_sampler=$!
-          trap 'kill "$resource_sampler" 2>/dev/null || true; wait "$resource_sampler" 2>/dev/null || true' EXIT
+          # CPU time and thread counts identify the processes behind contention.
+          # Process names omit command arguments, which can contain credentials.
+          (
+            while true; do
+              date --utc --iso-8601=seconds
+              ps -eo pid,ppid,nlwp,stat,pcpu,time,comm --sort=-pcpu | awk 'NR <= 81'
+              sleep 5
+            done
+          ) > /tmp/chaos-runner-processes.log 2>&1 &
+          process_sampler=$!
+          trap 'kill "$resource_sampler" "$process_sampler" 2>/dev/null || true; wait "$resource_sampler" "$process_sampler" 2>/dev/null || true' EXIT
           just --justfile deploy/cluster/justfile shard "${{ matrix.shard }}"
         env:
           KARDAMOM_STAGED: "1"
@@ -376,6 +386,7 @@ jobs:
             /tmp/chaos-*.json
             /tmp/kardamom-load*.json
             /tmp/chaos-runner-resources.log
+            /tmp/chaos-runner-processes.log
           if-no-files-found: ignore
           retention-days: 14
 
