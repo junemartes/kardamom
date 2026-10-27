@@ -91,6 +91,8 @@ The knobs of a shard follow its deploy variables (see [Environment knobs](#envir
 
 `raft-leader-packet-loss` applies random 10% loss only to the selected live member's outbound Raft UDP to its two peers. It uses the [Netfilter statistic match](https://ipset.netfilter.org/iptables-extensions.man.html). Separate counters must show both dropped packets and packets that pass the fault rules for each peer. Two bounded client transfers surround a 30-second hold. The selected process must stay unchanged; elections remain allowed. Cleanup removes the dedicated chain even after partial setup, then the case requires all members, progress and one leader per term. The common load, receipt, validator and persisted-state checks still apply. This covers probabilistic loss; it does not inject packet delay.
 
+The Raft fault transfers and checkpoint disk-full transfer bound nonce lookup, submission and receipt polling by one 60-second deadline. A `sealer_no_quorum` refusal can precede ingress session recovery even after peers elect a leader. Only that explicit refusal retries, once a second, with the same signed bytes and nonce. Other refusals fail immediately. The returned hash must match the signed transaction; a persistent halt, missing receipt or failed receipt still fails the case.
+
 Case order matters in seven places.
 
 - `resize-scale-out-in` runs last in the nightly reference-born `chaos-integrity`. The v2 loop of the carry-born shards has no lane resize protocol yet, and a resize leaves the shard map at a later version.
