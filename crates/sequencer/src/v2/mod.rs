@@ -62,7 +62,7 @@ use std::time::{Duration, Instant};
 use alloy_primitives::{Address, B256};
 use kardamom_obs::pipeline::Queue;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
-use kardamom_types::{TxDataLoc, TxDrop, TxEnvelope, TxError, TxErrorReason, TxStatus};
+use kardamom_types::{DropReason, TxDataLoc, TxDrop, TxEnvelope, TxError, TxErrorReason, TxStatus};
 
 use crate::admission::{
     AccountState, Ack, Admission, AdmissionConfig, Candidate, ImagePos, Refusal, Verdict,
@@ -376,11 +376,7 @@ impl AdmissionLoop {
             }
             AccountEvent::Rollback => self.admission.on_rollback(),
             AccountEvent::Refused(refused) => {
-                return self
-                    .remove_refused(refused.sender, refused.nonce, |c| {
-                        c.tx_hash == refused.canonical_id
-                    })
-                    .is_some();
+                return self.on_reference_refused(*refused);
             }
             AccountEvent::Refusal(refusal) => return self.on_sealer_refusal(*refusal),
             AccountEvent::Retry { sender, nonce } => {
@@ -546,6 +542,12 @@ impl AdmissionLoop {
                 }
                 reject(side, c.tx_hash, c.sender, c.nonce, reason);
             }
+            Verdict::DropReference(c) => side.publish_drop(TxDrop {
+                tx_hash: c.tx_hash,
+                sender: c.sender,
+                nonce: c.nonce,
+                reason: DropReason::SealerRefusedReference,
+            }),
             Verdict::Accept(ack) => self.to_ingress.accept(ack),
             Verdict::Lookup(address) => {
                 self.hot.lookup_requests.increment(1);

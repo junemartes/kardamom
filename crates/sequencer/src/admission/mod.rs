@@ -179,17 +179,27 @@ pub enum Refusal {
 pub enum Verdict<T> {
     /// Offer the transaction to the sealer. The generation ties its loss
     /// marker to this forwarded run.
-    Forward(Candidate<T>, u64),
+    Forward(Candidate<T>, RunGeneration),
     /// Tell the client why the filter did not forward it.
     Reject(Candidate<T>, Refusal),
     /// A terminal refusal identifies a copy that the sealer cannot order.
     SealerRefused(Candidate<T>, kardamom_types::TxErrorReason),
+    /// The named reference has no bytes that the sealer can order.
+    DropReference(Candidate<T>),
     /// The filter holds no state of the sender: ask Redis, then the
     /// executor, and give the answer to [`Admission::on_lookup`].
     Lookup(Address),
     /// The filter holds the transaction for a nonce gap or a busy run: it is
     /// in the mempool, so tell the client.
     Accept(Ack),
+}
+
+/// The loss-marker tag of a forwarded run. Rollover removes the older
+/// tags of the sender before the first marker of the new run is recorded.
+#[derive(Clone, Copy, Debug)]
+pub struct RunGeneration {
+    value: u32,
+    reset: bool,
 }
 
 /// A forwarded transaction, in forward order, for the loss expiry. `block`
@@ -199,7 +209,7 @@ struct ForwardMark {
     block: u64,
     sender: Address,
     nonce: u64,
-    generation: u64,
+    generation: u32,
 }
 
 /// A parked transaction, in arrival order within its image, for the park expiry.
@@ -452,7 +462,7 @@ impl<T: Clone> Admission<T> {
         &mut self,
         sender: Address,
         nonce: u64,
-        generation: Option<u64>,
+        generation: Option<u32>,
         out: &mut Vec<Verdict<T>>,
     ) {
         let from = out.len();
@@ -468,19 +478,24 @@ impl<T: Clone> Admission<T> {
     /// Mark each forward of `verdicts` for the loss expiry.
     /// The next rows stamp the marks with their block.
     fn record_forwards(&mut self, verdicts: &[Verdict<T>]) {
-        self.forwards
-            .extend(verdicts.iter().filter_map(|v| match v {
-                Verdict::Forward(c, generation) => Some(ForwardMark {
-                    block: 0,
-                    sender: c.sender,
-                    nonce: c.nonce,
-                    generation: *generation,
-                }),
-                Verdict::Reject(..)
-                | Verdict::SealerRefused(..)
-                | Verdict::Lookup(_)
-                | Verdict::Accept(_) => None,
-            }));
+        for verdict in verdicts {
+            self.record_forward(verdict);
+        }
+    }
+
+    fn record_forward(&mut self, verdict: &Verdict<T>) {
+        let Verdict::Forward(c, generation) = verdict else {
+            return;
+        };
+        if generation.reset {
+            self.remove_forward_marks(c.sender, 0);
+        }
+        self.forwards.push_back(ForwardMark {
+            block: 0,
+            sender: c.sender,
+            nonce: c.nonce,
+            generation: generation.value,
+        });
     }
 }
 

@@ -266,6 +266,28 @@ fn a_hash_specific_refusal_does_not_remove_another_transaction_at_the_nonce() {
 }
 
 #[test]
+fn a_late_reference_refusal_keeps_a_copy_that_already_carries_bytes() {
+    let mut b = Bench::new(SealerVersion::starting_at(5));
+    b.copy(0, 100, 64);
+    b.run();
+    let hash = b.rig.offers()[0].tx_ref.tx_hash;
+    b.accounts
+        .send(AccountEvent::Refused(Box::new(RefRefused {
+            canonical_id: hash,
+            sender: b.sender(),
+            nonce: 0,
+            decision_version: 5,
+        })))
+        .unwrap();
+    b.run();
+    assert!(
+        b.l.admission.unconfirmed_at(b.sender(), 0).is_some(),
+        "an old missing-bytes notice cannot remove an eligible copy"
+    );
+    assert!(b.rig.drops().is_empty());
+}
+
+#[test]
 fn a_terminal_refusal_removes_queued_suffix_offers_before_backpressure_clears() {
     let mut b = Bench::new(SealerVersion::starting_at(3));
     b.copy(1, 100, 64);

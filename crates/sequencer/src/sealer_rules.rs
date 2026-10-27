@@ -167,13 +167,14 @@ impl<D: DropPublisher> SealerRules<D> {
             "sealer refused a reference without bytes; dropping the transaction"
         );
         self.publish(self.shared.get().max(refused.decision_version));
-        self.tell_loop(|| AccountEvent::Refused(Box::new(*refused)));
-        self.drops.publish_drop(TxDrop {
-            tx_hash: refused.canonical_id,
-            sender: refused.sender,
-            nonce: refused.nonce,
-            reason: DropReason::SealerRefusedReference,
-        });
+        if !self.tell_loop(|| AccountEvent::Refused(Box::new(*refused))) {
+            self.drops.publish_drop(TxDrop {
+                tx_hash: refused.canonical_id,
+                sender: refused.sender,
+                nonce: refused.nonce,
+                reason: DropReason::SealerRefusedReference,
+            });
+        }
     }
 
     /// The contiguity guard of the sealer rejected the reference of

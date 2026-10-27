@@ -21,14 +21,14 @@ impl<T: Clone> Admission<T> {
     ) -> Option<RefusedRun<T>> {
         let run = self.senders.get_mut(&sender)?.take_refused(nonce, named)?;
         if !run.was_parked {
-            self.remove_refused_marks(sender, nonce);
+            self.remove_forward_marks(sender, nonce);
         }
         Some(run)
     }
 
     /// A replacement at the same nonce gets its own full loss window.
     /// The refused copy and its parked suffix leave no old loss marks.
-    fn remove_refused_marks(&mut self, sender: Address, nonce: u64) {
+    pub(super) fn remove_forward_marks(&mut self, sender: Address, nonce: u64) {
         let keep = |mark: &super::ForwardMark| mark.sender != sender || mark.nonce < nonce;
         let pending = self.forwards.split_off(self.stamped);
         self.forwards.retain(keep);

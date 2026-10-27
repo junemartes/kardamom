@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use alloy_primitives::U256;
 
-use super::{AccountState, AdmissionConfig, Candidate, Refusal, Verdict};
+use super::{AccountState, AdmissionConfig, Candidate, Refusal, RunGeneration, Verdict};
 
 /// When a parked transaction gets its ack.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -16,6 +16,10 @@ enum Answer {
     /// When the state of the sender comes: a lookup is out.
     Wait,
 }
+
+#[cfg(test)]
+#[path = "sender_loss_tests.rs"]
+mod tests;
 
 pub(super) struct SenderState<T> {
     /// The newest chain state, `None` until a row or a lookup gives one.
@@ -31,7 +35,7 @@ pub(super) struct SenderState<T> {
     /// The nonce of the first forwarded transaction that no state confirmed.
     first: u64,
     /// Loss markers identify this run, including after a nonce is reused.
-    generation: u64,
+    generation: u32,
     /// The forwarded run, from `first` on. The filter keeps each
     /// transaction until a state confirms it, so the caller can offer the
     /// run again when the sealer can have lost an offer.
@@ -183,7 +187,7 @@ impl<T: Clone> SenderState<T> {
     pub(super) fn on_lost(
         &mut self,
         nonce: u64,
-        generation: Option<u64>,
+        generation: Option<u32>,
         cfg: &AdmissionConfig,
         out: &mut Vec<Verdict<T>>,
     ) -> bool {
@@ -353,14 +357,23 @@ impl<T: Clone> SenderState<T> {
             ));
             return false;
         }
-        if self.forwarded.is_empty() {
+        let reset = if self.forwarded.is_empty() {
             self.first = c.nonce;
-            // Only marks that coexist in bounded storage compare these run tags.
+            // Rollover removes older tags before the first new loss marker.
             self.generation = self.generation.wrapping_add(1);
-        }
+            self.generation == 0
+        } else {
+            false
+        };
         self.spend = self.spend.saturating_add(c.cost);
         self.forwarded.push_back(c.clone());
-        out.push(Verdict::Forward(c, self.generation));
+        out.push(Verdict::Forward(
+            c,
+            RunGeneration {
+                value: self.generation,
+                reset,
+            },
+        ));
         false
     }
 

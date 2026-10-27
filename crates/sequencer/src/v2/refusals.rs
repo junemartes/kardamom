@@ -8,6 +8,29 @@ use crate::admission::{Candidate, Verdict};
 use crate::resync::SealerRefusal;
 
 impl AdmissionLoop {
+    #[cold]
+    pub(super) fn on_reference_refused(
+        &mut self,
+        refused: kardamom_cluster_adapter::wire::RefRefused,
+    ) -> bool {
+        let eligible = self
+            .admission
+            .unconfirmed_at(refused.sender, refused.nonce)
+            .is_some_and(|candidate| {
+                candidate.tx_hash == refused.canonical_id && candidate.payload.envelope.is_some()
+            });
+        if eligible {
+            return true;
+        }
+        let Some(candidate) = self.remove_refused(refused.sender, refused.nonce, |candidate| {
+            candidate.tx_hash == refused.canonical_id && candidate.payload.envelope.is_none()
+        }) else {
+            return false;
+        };
+        self.verdicts.push(Verdict::DropReference(candidate));
+        true
+    }
+
     pub(super) fn on_sealer_refusal(&mut self, refusal: SealerRefusal) -> bool {
         if matches!(
             refusal.reason,

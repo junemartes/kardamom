@@ -178,6 +178,18 @@ fn a_refused_reference_tells_the_loop_once() {
     ));
 }
 
+#[test]
+fn a_late_reference_refusal_waits_for_v2_to_check_the_current_copy_before_a_drop() {
+    let (accounts, _rx) = crossbeam_channel::unbounded();
+    let mut r = Rig::new();
+    r.rules = r.rules.telling(accounts);
+    r.rules.on_ref_refused(&refused(5));
+    assert!(
+        r.drops().is_empty(),
+        "V2 owns copy identity and emits a drop only for the held refused copy"
+    );
+}
+
 /// A contiguity reject goes to the v2 loop with the expected nonce.
 #[test]
 fn a_contiguity_reject_tells_the_loop() {

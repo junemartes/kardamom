@@ -60,6 +60,7 @@ fn names(out: &[Verdict<u64>]) -> Vec<String> {
             Verdict::Forward(c, _) => format!("F{}{}", c.nonce, star(c)),
             Verdict::Reject(c, r) => format!("R{}{}:{r:?}", c.nonce, star(c)),
             Verdict::SealerRefused(c, r) => format!("S{}{}:{r:?}", c.nonce, star(c)),
+            Verdict::DropReference(c) => format!("D{}{}", c.nonce, star(c)),
             Verdict::Lookup(_) => "L".to_owned(),
             Verdict::Accept(ack) => format!("A{}", ack.nonce),
         })
