@@ -82,14 +82,14 @@ The knobs of a shard follow its deploy variables (see [Environment knobs](#envir
 | `chaos-coordinated` | `ingress-pair-loss-recover`, `sequencer-lane-loss-recover`, `pipeline-blackout-recover` | carry-born, `RUN_LOAD=0` |
 | `chaos-combined-ordering` | `ingress-sequencer-loss-recover`, `ingress-sealer-loss-recover`, `sequencer-sealer-loss-recover`, `ingress-sequencer-sealer-loss-recover`, `ingress-sequencer-sealer-reverse` | carry-born, `RUN_LOAD=0` |
 | `chaos-combined-exec` | `executor-sealer-loss-recover`, `executor-sealer-validator-recover`, `ingress-executor-loss-recover`, `read-path-loss-recover` | carry-born, `RUN_LOAD=0` |
-| `chaos-retention` | `retention-overrun`, `retention-overrun-validator` | carry-born, `RUN_LOAD=0`, sealer retention 6144 frames (`KARDAMOM_CLUSTER_RETENTION=6144`), the block log of the checkpoints on |
+| `chaos-retention` | `retention-overrun`, `retention-overrun-validator`, `prune-floor`, `da-lag-halt`, `canary-da-lag` | Two sequential fresh carry chains in one job. Both use `RUN_LOAD=0`, retention 6144 frames, snapshots every 60 s, canary funding and checkpoint block logs. The first three cases keep the normal DA guard. The last two start with an eight-block guard. |
 | `chaos-cache` | `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze`, `mirror-kill-rebuild` | carry-born, `RUN_LOAD=0`, the block log of the checkpoints on |
 | `chaos-l1` | `l1-liar`, `l1-null-receipts`, `two-day-outage`, `batcher-outage-past-retention` | carry-born, `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
 | `chaos-follower` | `follower-instance-loss`, `follower-total-loss`, `follower-disagreement` | carry-born, `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
 | `chaos-carry` | `carry-versions-on`, `carry-held-offer-after-downgrade`, `carry-readers-on-egress`, `carry-window-on`, `carry-executor-first`, `carry-executors-rest`, `carry-window-off-on`, `carry-leader-kill-at-switch`, `carry-egress-restart` | reference-born, `RUN_LOAD=0`, retention 16384, snapshot interval 60 s, the member feed and the executors on the sealer nodes (`KARDAMOM_EXEC_ON_SEALERS=on`), the frames of the executors and the egress, the v2 loop of the sequencers (`KARDAMOM_SEQUENCER_ADMISSION=on`) |
 | `chaos-integrity` (nightly) | `executor-restart-storm`, `sealer-fleet-total-wipe-recover`, `resize-scale-out-in` | reference-born, `RUN_LOAD=0` |
 
-Case order matters in six places.
+Case order matters in seven places.
 
 - `resize-scale-out-in` runs last in the nightly reference-born `chaos-integrity`. The v2 loop of the carry-born shards has no lane resize protocol yet, and a resize leaves the shard map at a later version.
 - `sealer-fleet-total-wipe-recover` runs last in `chaos-integrity`. It restarts the chain from a state rebuilt from L1, the longest recovery. A failure there must not hide the storm.
@@ -97,6 +97,7 @@ Case order matters in six places.
 - `mirror-kill-rebuild` runs last in `chaos-cache`. It flushes the projection.
 - `executor-sealer-loss-recover` runs first in `chaos-combined-exec`. The persisted-state audit runs after it, before the other cases build on the state it leaves.
 - `chaos-carry` runs the order of the staging rollout. Each case needs the cases before it.
+- `chaos-retention` verifies receipts, the validator and persisted state before it tears down the first chain. It then deploys a fresh chain for `da-lag-halt` and `canary-da-lag`. The DA guard stays fixed from genesis: changing it during snapshot replay changes canonical decisions. Custom case order is preserved, with another fresh chain at each guard change. A reuse run keeps its existing configuration and requires the matching `KARDAMOM_DA_LAG_BUDGET_BLOCKS`.
 
 `chaos-l1` and `chaos-follower` run the persisted-state audit after every case, not only at the end of the shard. Each case leaves a DA record that a silent gap could hide in. `chaos-combined-exec` runs it after `executor-sealer-loss-recover`: the executors and the members die at once, so the state every executor kept is compared with the validator's before the next case. `chaos-carry` runs it after `carry-executor-first`: it compares the executor in carry mode with the two executors in reference mode and the validator.
 

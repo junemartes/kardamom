@@ -13,6 +13,9 @@
 use crate::knobs::Knobs;
 use crate::lifecycle::{CarrySwitches, DeployVars, EgressStage};
 
+mod runs;
+pub use runs::ShardRun;
+
 /// The sealer retention of the carry shard, in frames. The exact window
 /// keeps this many frames.
 const CARRY_RETENTION: u64 = 16_384;

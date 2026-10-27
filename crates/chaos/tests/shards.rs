@@ -102,8 +102,16 @@ async fn run_audited(harness: &mut Harness, case: &str, audit: bool) -> anyhow::
 }
 
 async fn run_shard(shard: Shard) -> anyhow::Result<()> {
-    let knobs = shard.knobs()?;
-    let lifecycle = Lifecycle::in_workspace().with_vars(shard.deploy_vars());
+    for run in shard.runs(&case_list(shard), reuse()) {
+        run_shard_chain(run).await?;
+    }
+    Ok(())
+}
+
+async fn run_shard_chain(run: kardamom_chaos::shard::ShardRun) -> anyhow::Result<()> {
+    let shard = run.shard;
+    let knobs = Knobs::deployed(shard.env(), &run.vars)?;
+    let lifecycle = Lifecycle::in_workspace().with_vars(run.vars);
     let contract = if reuse() {
         lifecycle.contract()?
     } else {
@@ -112,7 +120,7 @@ async fn run_shard(shard: Shard) -> anyhow::Result<()> {
     let mut harness = Harness::new(contract, knobs, lifecycle.clone())?;
     harness.prepare_case_services().await?;
     harness.smoke_gate(harness.knobs.gate_account).await?;
-    let cases = case_list(shard);
+    let cases = run.cases;
     kardamom_chaos::log(format!(
         "chaos suite: shard={} cases=[{}] tps={} case_s={}",
         shard.name(),
