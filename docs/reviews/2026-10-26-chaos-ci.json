@@ -817,7 +817,7 @@
         "248 chaos library tests pass; two manual profiles remain ignored.",
         "Workspace just style passes with no warnings."
       ],
-      "status": "Local fix; full runtime validation remains required. No main merge or staging rollout."
+      "status": "The first local implementation is superseded by the stronger864 fixture: both process identities are pinned, scan evidence shares one scrape, and forced replacement rebuilds keep process-specific completion proof. The real Redis controls remain retained. Combined runtime validation is pending."
     },
     {
       "id": "live-da-guard-change-forks-replay",
@@ -841,6 +841,115 @@
         "Workspace just style passes with no warnings."
       ],
       "status": "Local fix; full runtime validation pending. No main merge or staging rollout."
+    },
+    {
+      "id": "encoded-guard-recovery-followup",
+      "classification": "product",
+      "case": "da-lag-halt, canary-da-lag",
+      "observed": "PR 853 resumes case-owned submit progress, but all 6,962 offered transfers include 509 failed-status receipts. Executor logs on three replicas show canonical nonce_too_high, including tx nonce 1317 with state nonce 1314. Missing and unlanded counts remain zero. The regular run later ends cancelled with 12 regular shards successful, cache and retention failed, and carry cancelled; integrity and the four supporting workflows succeed. None counts toward the frozen-head streak.",
+      "change": "Preserve the latest DA/record guard across boundaries. Keep boundary silence until a real boundary, even when healthy status frames arrive. Route DA, record-lag, past-deadline and window-full frames into the existing V2 account-event queue. Coalesce retry notices before publication; retry only still-unconfirmed runs. Keep the per-turn session-generation fence and duplicate session-marker handling from the combined integration.",
+      "product_bug": true,
+      "service_wiring_changed": "V2 sealer controls use its existing account-event queue. Cold control production backpressures that queue instead of dropping a terminal answer. Account events drain while publication pauses; receiver closure releases a stopped producer. The dedicated per-turn refusal receiver is removed. V1 retains its existing channels. No deployment defaults change.",
+      "hot_path_changed": "The existing account-event dispatch handles additional variants. No new receiver polling is added. Final profile and deployed comparison remain required.",
+      "verification": [
+        "Five encoded-status/boundary controls fail with the original callback behavior.",
+        "Ten library controls fail with terminal account delivery disabled; three encoded-frame controls fail when the V2 route and window-full route are absent.",
+        "Actual encoded DA and record refusals cover both twins, a notice before status, delayed delivery after clear, confirmed prefixes and recovery without new input."
+      ],
+      "status": "Local implementation against combined head 58465a1e8a480a8cabc434cb9be57f340fb9453f. Full deployed recovery is pending. This does not establish safety for a higher offer already queued in the sealer when its guard clears. Issue 852 remains open."
+    },
+    {
+      "id": "v2-terminal-copy-and-suffix-identity",
+      "classification": "product",
+      "case": "past-deadline, missing-bytes refusal, backpressure",
+      "observed": "The earlier V2 missing-bytes handler forgets an entire forwarded run. The combined terminal handler also removes a whole sender run. The deadline test uses the current format of an offer, which can differ from the refused copy after a version change.",
+      "change": "Use the transaction hash for missing-bytes identity and the envelope deadline for past-deadline identity. Remove the named copy, park its suffix behind the gap, and remove stale outbox and pending forward verdicts. Reuse the existing parked bound; every excess suffix transaction gets its own retryable eviction status, error and drop. Already acknowledged suffix entries do not get another submit verdict. V2 defers missing-byte drops until the loop checks the current copy. A full-byte replacement survives and retries; only the held missing-byte copy emits its drop.",
+      "product_bug": true,
+      "service_wiring_changed": false,
+      "hot_path_changed": "Terminal verdicts share the existing dispatch. Copy matching and suffix repair run only on refusal.",
+      "verification": [
+        "A late old-deadline notice preserves a replacement.",
+        "A different hash at the same nonce preserves the held transaction.",
+        "A backpressured suffix cannot escape before its prefix is replaced.",
+        "A terminal notice cancels pending forward verdicts created earlier in the same account-event batch.",
+        "A 32-entry run reparks the bounded suffix and reports each of 15 excess entries explicitly.",
+        "Two late-reference controls fail before V2 owns the drop decision and checks full-byte eligibility.",
+        "A genuine missing-byte copy emits one named drop after the loop consumes the frame; its suffix waits behind the gap."
+      ],
+      "status": "Local controls pass; deployed exact-state and successful-receipt proof remains pending."
+    },
+    {
+      "id": "old-loss-mark-expires-replacement-run",
+      "classification": "product",
+      "case": "sequencer loss timeout and terminal recovery",
+      "observed": "A deterministic control loses nonce 0, accepts a replacement run, then expires the old nonce-1 marker. The old marker clears the new run before its own full loss window. A separate control reproduces an old terminal-copy marker expiring a replacement.",
+      "change": "Tag each forwarded run and its loss markers with a compact generation. Expiry acts only on its original run. Rollover purges old sender tags before reuse; idle eviction removes marks of the removed state. Terminal suffix repair removes the old suffix marks. Resume retains only marks that still name current unconfirmed transactions, so repeated guard cycles cannot retain confirmed history indefinitely.",
+      "product_bug": true,
+      "service_wiring_changed": false,
+      "hot_path_changed": "The tag fits existing padding: loss marker 40 bytes and sender state 160 bytes, unchanged from the baseline. Candidate 192 bytes, verdict 272 bytes and account event 80 bytes are unchanged. Rollover and metadata pruning use cold paths. No new receiver poll, lock, atomic or map lookup is added to healthy admission.",
+      "verification": [
+        "The old lost-suffix control fails before the generation change.",
+        "The old terminal-copy control fails before old suffix markers are removed.",
+        "Replacement runs keep their own finite loss window, including after rollback.",
+        "A reused-nonce rollover control fails when old-tag cleanup is disabled; later forwards under tag zero retain their first loss marker.",
+        "The idle-eviction control fails before ownerless markers are removed.",
+        "One hundred recovery cycles retain 101 markers before resume pruning; afterward only the one live waiting transaction retains a marker."
+      ],
+      "status": "All final local controls pass. The exact final binary is under controlled measurement. Deployed failure and client-workload repetitions remain pending."
+    },
+    {
+      "id": "interrupted-scan-proof-races-shared-head",
+      "classification": "harness",
+      "case": "mirror-kill-rebuild",
+      "observed": "A shared Redis head can let a later-starting mirror resume legally while an explicit interrupted-scan fixture still demands scan completion from every mirror.",
+      "change": "Only the explicit interrupted-scan recovery temporarily requests KARDAMOM_MIRROR_REBUILD=true on every mirror task. Prove per-allocation scan completion and exact account recovery, then always restore the captured original job. Keep the combined backlog fixture that certifies each legal writer resume using advancing heads and exact rows.",
+      "product_bug": false,
+      "service_wiring_changed": "Scoped CI fixture using an existing flag; original job restored after proof. No production default changes.",
+      "hot_path_changed": false,
+      "verification": [
+        "Four JSON controls verify every mirror task, unchanged original data, preservation of other tasks, absent/null environment handling and malformed-job rejection.",
+        "All 248 chaos library tests pass; the two local Nomad-agent tests remain ignored."
+      ],
+      "status": "Local verification passes. Deployed proof is pending."
+    },
+    {
+      "id": "0cf-interrupted-scan-serving-observation",
+      "classification": "harness",
+      "case": "mirror-kill-rebuild",
+      "observed": "Run 40458018122 job 122041411237 passes backlog, ingress partition, primary kill and primary freeze. At 06:43:06 every replacement scan has fresh write retries and no completion. A reserve-account transfer receipts at 06:43:11, then the serving observation fails at 06:43:14 before the kill. The ten-minute write pause is still within its lifetime.",
+      "product_bug": false,
+      "status": "Local controls pass. Deployed diagnostic validation is pending. No assertion relaxation, missing-as-zero interpretation, fault timeout increase or green qualification is claimed.",
+      "cause": "The write pause names only the original primary. Sentinel declares it down at 06:43:06, promotes ingress-1 at 06:43:07 and switches at 06:43:08. The same sealer-0 mirror completes its scan at 06:43:08.675, before the reserve transfer and second serving check. The pause has not expired; the writable destination moved.",
+      "change": "Capture both live Redis data allocations and process starts. Confirm cold heads on both, pause writes on both and verify identities before the mirror kill. Always attempt both unpauses after partial failure. Read serving and retry evidence from one scrape; missing evidence and serving=1 still fail immediately. Retain the nine-minute fault deadline, per-process scan/retry proof, reserve-account receipt and forced rebuild recovery.",
+      "service_wiring_changed": "Only the existing interrupted-scan CI fixture targets both Redis data processes. Production configuration is unchanged.",
+      "hot_path_changed": false,
+      "verification": [
+        "Seven focused tests cover both destination groups, incomplete topology, partial arm cleanup and strict single-scrape evidence.",
+        "Routing both requests to only the original primary fails two negative controls. Final source is restored and hash checked.",
+        "259 chaos library tests pass; two local Nomad-agent tests remain ignored.",
+        "just style passes; the existing proc-macro-error2 future-incompatibility notice remains."
+      ],
+      "evidence": [
+        "https://github.com/junemartes/kardamom/actions/runs/40458018122/job/122041411237",
+        "/tmp/chaos-gaps-0cf-cache-diagnostics",
+        "/tmp/chaos-gaps-all-data-pause-negative.log"
+      ],
+      "references": [
+        "https://redis.io/docs/latest/commands/CLIENT-PAUSE/",
+        "https://raw.githubusercontent.com/redis/redis/7.4/src/replication.c"
+      ]
+    },
+    {
+      "id": "0cf-retention-validator-divergence",
+      "classification": "unclassified",
+      "case": "da-lag-halt",
+      "observed": "Diagnostic run 40458018122 job 122041411232 completes the main load with 5123 offered, accepted and receipted and zero missing, unlanded or bad status. Own-sender recovery also completes exactly. The final validator oracle fails at 07:03:58 with validator counted divergence. A separate fresh-sender recovery reports 949 offered and receipted but 933 accepted and is not strict acceptance evidence.",
+      "product_bug": null,
+      "status": "Preserve diagnostics and identify the actual divergence. This failure blocks qualification; successful receipts alone cannot certify state parity.",
+      "evidence": [
+        "https://github.com/junemartes/kardamom/actions/runs/40458018122/job/122041411232",
+        "/tmp/chaos-gaps-0cf-retention.log"
+      ]
     }
   ],
   "coverage": [
@@ -1001,8 +1110,8 @@
   ],
   "validation": {
     "runtime_product_files_changed": true,
-    "service_wiring_changed": "V2 uses the existing lifecycle watch and session generation. Validator readiness now also requires an active pipeline; its activity gauge changes only at pipeline start/stop. Source-reset retries use the existing committed-state startup path. No deployment defaults, network topology or transport settings change. A startup-owned cancellation guard now covers failed opens and transfers to the existing ordered shutdown.",
-    "performance_claim": "No speedup or full-chain performance guarantee. Final V2 pause-recovery normal median paired throughput deltas are +0.10% ordered, -0.46% reversed and +0.51% with verdicts. All 240 observations from four comparisons, source hashes and binary hashes are retained, including early slower shapes and outliers. Identical-workload deployed client p50/p95/p99, throughput and executor fallback comparisons remain pending.",
+    "service_wiring_changed": "V2 uses the existing lifecycle watch and session generation. Validator readiness now also requires an active pipeline; its activity gauge changes only at pipeline start/stop. Source-reset retries use the existing committed-state startup path. No deployment defaults, network topology or transport settings change. A startup-owned cancellation guard now covers failed opens and transfers to the existing ordered shutdown. The local follow-up moves V2 controls to its existing account-event queue and removes the dedicated receiver. Cold control production uses bounded backpressure; receiver closure releases a stopped producer. V1 keeps its channels.",
+    "performance_claim": "No deployed latency or capacity claim. All 240 follow-up observations from four implementations are retained, including the rejected larger-tag result. Final normal median paired throughput changes in percent: {\"in_order\": 3.367, \"reversed\": 2.232, \"with_verdicts\": 2.127}. Actual layout remains marker 40, sender state 160, candidate 192, verdict 272 and account event 80 bytes; loop size decreases from 1256 to 984 bytes. Shared-host noise and every outlier remain in the record. Final deployed comparisons remain pending.",
     "completed": [
       {
         "check": "chaos library unit tests",
@@ -1071,6 +1180,18 @@
       {
         "check": "PR 851 failure classification and local follow-up",
         "result": "198 sequencer library + 14 binary, 142 validator library + 15 binary, 97 adapter library and 234 chaos library tests pass. Three manual profiles are ignored. Workspace style passes. The dedicated load job now runs reference and V2 topologies separately."
+      },
+      {
+        "check": "guard transport, terminal identity and run-scoped loss markers",
+        "result": "214 sequencer library tests and 26 binary tests pass. One existing manual lookup profile is ignored. 248 chaos library tests pass; the two existing local Nomad-agent checks remain ignored. Workspace style passes. Negative controls and raw diagnostic reports are retained."
+      },
+      {
+        "check": "final compact tag, eviction lifetime and bounded resume metadata",
+        "result": "224 sequencer library tests, 26 binary tests and 252 chaos library tests pass. One manual lookup profile and two local Nomad-agent tests remain ignored. Workspace style passes. Four exact-binary comparisons retain all observations; the final comparison remains in progress."
+      },
+      {
+        "check": "final exact-binary controlled core profile",
+        "result": "60 observations retained, five alternating pairs per workload and mode, 60 samples each. {\"in_order\": 3.367, \"reversed\": 2.232, \"with_verdicts\": 2.127} median paired percent in normal mode. All source and binary hashes are recorded. Earlier 180 follow-up observations are retained as intermediate evidence."
       }
     ],
     "pending": [
@@ -1584,18 +1705,19 @@
   },
   "followup_candidate": {
     "workspace": "/home/dev/kardamom-chaos-gaps",
-    "branch": "test/chaos-pause-resume-20261027",
-    "base": "5d8ac285a57f3162a2d8bebe2346d9263335c3ab",
+    "branch": "fix/chaos-guard-recovery-20261027",
+    "base": "0cf8d4b64c302091cdf67586879ef774e4f1e74f",
     "changes": [
-      "Freeze only forwarded-run loss expiry while paused. On a changed watch that reads clear, reset the loss window and requeue the remaining unconfirmed runs before new intake. Keep confirmations, parked expiry and lookup work active.",
-      "Treat the typed stream-source reset as an in-process reopen from the committed database. After a reset, retry typed catalog-unavailable opens with one-second shutdown-aware waits. First-start configuration failures retain their errors, refused replay still needs its staged checkpoint, and proven divergence still holds for the operator. Mark readiness unavailable outside an active pipeline. Startup owns cancellation before the runtime field. Failed opens cancel every discovery/pump task before dropping runtime handles; the same guard transfers to normal ordered shutdown.",
-      "Make each busy/idle span cross the flush interval independently and assert both positive spans. Bound age by the observed before/after clock readings. Production meter code is unchanged.",
-      "Count live hits and misses separately, independent of label ordering. Require zero new live hits, at least two live misses and two stale bypasses; reject regressed counters. Keep exact account and frozen Redis checks.",
-      "Capture Docker container ID plus StartedAt. Read logs since the observed start. Accept a replacement container or a restart of the same container only when its own process logs prove restore.",
-      "Give each checked upgrade an eight-minute load allowance; compose two allowances for two-upgrade steps, plus existing deploy, provider fault and restart allowances. Stop load when the case completes. Keep runtime proof deadlines and the workflow ceiling.",
-      "Within the existing load job, run identical transfer and DeFi workloads on separate fresh reference and carry/V2 deployments. Read knobs from each actual deployment. Preserve distinct V2 report files and log the topology. No new shard."
+      "Preserve encoded guard state and repair V2 refusals through the existing account-event queue.",
+      "Preserve terminal copy identity, bounded suffix outcomes and pending-offer cancellation.",
+      "Scope timeout markers to their original forwarded run.",
+      "Request every scan only in the explicit interrupted-scan fixture; retain the combined legal-resume backlog proof.",
+      "Retain all 60 observations of the larger-tag implementation and measure a compact tag with explicit safe rollover.",
+      "Defer missing-byte drops until the V2 loop checks the held copy; preserve an eligible replacement.",
+      "Prune stale confirmed and older-generation loss markers during resume to bound metadata across repeated guard cycles.",
+      "Remove loss markers when their idle sender state is evicted."
     ],
-    "status": "Local diagnostic candidate. Runtime bugs, test-oracle failures and coverage gaps remain distinct. Deployed validation and full workload comparison remain required. Head is not frozen; streak 0/10."
+    "status": "Ready for draft review and deployed diagnostics. Core source is fixed at 3105e98691bacebb93eede493c704a8e94679aac. Complete qualifying streak remains 0/10; PR head is not frozen."
   },
   "source_followup_validation": {
     "runtime_product_files_changed": true,
@@ -1728,5 +1850,14 @@
       "measurement_validity": "Require zero unlanded/missing/bad-status/bad-receipt counts and offered==accepted==receipted, regardless of a legacy pass flag. Compare measured counts per paced second alongside configured target and p50/p95/p99; target TPS is not measured throughput."
     },
     "historical_reference_load": "docs/benches/2026-10-27-reference-ci-load.json"
+  },
+  "interrupted_scan_followup": {
+    "runtime_product_files_changed": false,
+    "service_wiring_changed": "Only the interrupted-scan fault targets every Redis data process.",
+    "hot_path_changed": false,
+    "local_tests": "259 passed, 2 ignored",
+    "negative_control": "2 expected failures when both commands target only the original primary",
+    "style": "pass",
+    "qualifying_streak": 0
   }
 }

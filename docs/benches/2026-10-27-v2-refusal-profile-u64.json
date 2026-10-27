@@ -1,0 +1,455 @@
+{
+  "schema_version": 1,
+  "purpose": "Retain all observations of the first refusal/generation implementation, including the measured normal-path regression. This implementation is not accepted as the final performance result.",
+  "source_revision": "d9e2cc5d3be1d86ffee4413ac207121d754ad322",
+  "baseline_revision": "58465a1e8a480a8cabc434cb9be57f340fb9453f",
+  "build_manifest": {
+    "baseline": "58465a1e8a480a8cabc434cb9be57f340fb9453f",
+    "candidate_revision": "0afe2bd9e3690d67a141e4f1d57b0495d2966c36",
+    "restored": true,
+    "complete": true,
+    "sources": {
+      "crates/sequencer/benches/admission.rs": {
+        "before_sha256": "05240edee12fb93453c7b7b55b9f635f27b53f10185cf65924813a645585e190",
+        "after_sha256": "3fb73894dbd4812bb9b8f54a2d42459fcc3d9ed5af60824a90e39bf6fbc0ad5a"
+      },
+      "crates/sequencer/benches/throughput.rs": {
+        "before_sha256": "21ef7d4ca93e769df5aa83c4efd3b283d4a6855ba3208928f8b3ad5a1da884ba",
+        "after_sha256": "21ef7d4ca93e769df5aa83c4efd3b283d4a6855ba3208928f8b3ad5a1da884ba"
+      },
+      "crates/sequencer/benches/tx_events.rs": {
+        "before_sha256": "b076ff44cc83842e0eb4092cbb6f3d75dedc5c717491705102b22bc36d76b113",
+        "after_sha256": "b076ff44cc83842e0eb4092cbb6f3d75dedc5c717491705102b22bc36d76b113"
+      },
+      "crates/sequencer/benches/v2_loop.rs": {
+        "before_sha256": "8a28440159921b222f7f85dd987907dc24d8dcda7b37280b1c8cde3dfe1159e8",
+        "after_sha256": "2283f1dd0044945a51b42efbaab841938c64d730b1caa88f87e6870cf734f4ec"
+      },
+      "crates/sequencer/src/admission/mod.rs": {
+        "before_sha256": "d2243e17c0adc21166c2d328ce830d4e9105a30a8491b34829158170248adc0e",
+        "after_sha256": "8935b0c674d5dccd932eba390444a38ef77ef4372ba65c02a0e500cb92bd989a"
+      },
+      "crates/sequencer/src/admission/refusals.rs": {
+        "before_sha256": null,
+        "after_sha256": "ecadf3a8e7b2b6c85cadbd69f5966488c92e72418f9ca0db58cc4e540c337285"
+      },
+      "crates/sequencer/src/admission/sender.rs": {
+        "before_sha256": "8c000c9cf173631a1101ed643a2917d75ae440d34e525a0fa190fdf41e2b90da",
+        "after_sha256": "1d9fba1dc47440318efdd44eb920899eae240d5736f4d0387a2df5a0d4e51841"
+      },
+      "crates/sequencer/src/admission/tests.rs": {
+        "before_sha256": "7323d18475213ba2e1908a89f6a0d506fa12d63cdf852c5b22e6e010227054cd",
+        "after_sha256": "2d70ede5a02caae72c09f40f5f5e37b9c4aaa57a89f3fe818fa3a25e7de586f7"
+      },
+      "crates/sequencer/src/bin/kardamom-sequencer/args.rs": {
+        "before_sha256": "3559c9112d01c494fb183ce0cc8eebc8be0156bc07187d90842126fbec451a34",
+        "after_sha256": "3559c9112d01c494fb183ce0cc8eebc8be0156bc07187d90842126fbec451a34"
+      },
+      "crates/sequencer/src/bin/kardamom-sequencer/args_tests.rs": {
+        "before_sha256": "61cad4ff8f33964fd9d83d0429b06b9f84b242774cd8147207c96fd341f6c2d4",
+        "after_sha256": "61cad4ff8f33964fd9d83d0429b06b9f84b242774cd8147207c96fd341f6c2d4"
+      },
+      "crates/sequencer/src/bin/kardamom-sequencer/feeds.rs": {
+        "before_sha256": "1b278a6b441c93b6d1dc6949cd2de31acb7afaf0d65648ebb60ba5415a677f39",
+        "after_sha256": "243ba986cac6ba77bda1616f84c25582d8bcca0aa125c1b347332e06d61b6d5f"
+      },
+      "crates/sequencer/src/bin/kardamom-sequencer/feeds/account_lookup.rs": {
+        "before_sha256": "65bf3afab3b1875b152bb5bc2e08f2bf448639841ad20643aa3cbc0e04e1f64f",
+        "after_sha256": "65bf3afab3b1875b152bb5bc2e08f2bf448639841ad20643aa3cbc0e04e1f64f"
+      },
+      "crates/sequencer/src/bin/kardamom-sequencer/feeds/account_lookup_tests.rs": {
+        "before_sha256": "b8c7dc0aca330982c124ebb097abf146423b56565647260870f483527a83478d",
+        "after_sha256": "b8c7dc0aca330982c124ebb097abf146423b56565647260870f483527a83478d"
+      },
+      "crates/sequencer/src/bin/kardamom-sequencer/feeds/guards.rs": {
+        "before_sha256": "2193b68380bba89a7875fa6b547e16e9ca45b3eb8a1ffee941b8a1f0294bf146",
+        "after_sha256": "5fff3ee8882ebbe9c1829a078393c552d2d4f181a8238614479c725dbbaefcce"
+      },
+      "crates/sequencer/src/bin/kardamom-sequencer/feeds/guards_recovery_tests.rs": {
+        "before_sha256": null,
+        "after_sha256": "80febcdbb2899573da0e79e34bce7b1cd151bd4493f261912638a3ff7111c8d7"
+      },
+      "crates/sequencer/src/bin/kardamom-sequencer/feeds/guards_tests.rs": {
+        "before_sha256": null,
+        "after_sha256": "0a90f722fd2c94a9cd4b3297dfe6d2219f552a8a5c1620c245bc85c3870a987b"
+      },
+      "crates/sequencer/src/bin/kardamom-sequencer/feeds/lookup.rs": {
+        "before_sha256": "bb0a6b860a970a74c5ee89fc716c7f8400b8ed8d7882afc90e5132b81e328082",
+        "after_sha256": "bb0a6b860a970a74c5ee89fc716c7f8400b8ed8d7882afc90e5132b81e328082"
+      },
+      "crates/sequencer/src/bin/kardamom-sequencer/feeds/origin_pump.rs": {
+        "before_sha256": "c34aab2a778e00eb4c56e017c4ab1b4a04bae360592822f19ef283e1bc1355e3",
+        "after_sha256": "c34aab2a778e00eb4c56e017c4ab1b4a04bae360592822f19ef283e1bc1355e3"
+      },
+      "crates/sequencer/src/bin/kardamom-sequencer/feeds/receipts.rs": {
+        "before_sha256": "f78b25f8da35584b32613308b7160f4018181d1abab0bc5539ff8e443a43de1f",
+        "after_sha256": "f78b25f8da35584b32613308b7160f4018181d1abab0bc5539ff8e443a43de1f"
+      },
+      "crates/sequencer/src/bin/kardamom-sequencer/feeds/steps.rs": {
+        "before_sha256": "f418301037e99057eb75903f2606a62906c7212859170fbc78fda62a4515dbf1",
+        "after_sha256": "64fd1f9f0332c4c0acc2ee504fcc8f658a2c19c393b8c2ea66be2f826c040c8b"
+      },
+      "crates/sequencer/src/bin/kardamom-sequencer/feeds/steps_tests.rs": {
+        "before_sha256": "250ce472c0bbc9d298371d7a9084edc0dad4c24fb0a76e9631cb2c36a175372d",
+        "after_sha256": "1632a60161814af52307ba51c1a4bfb1871e229d5e8415830a0178207e5a23f9"
+      },
+      "crates/sequencer/src/bin/kardamom-sequencer/feeds/verdicts.rs": {
+        "before_sha256": "ba2276a3bafba8dd2a22b3f08ff6525e0b3362716228dace543707f6dd2ce738",
+        "after_sha256": "ba2276a3bafba8dd2a22b3f08ff6525e0b3362716228dace543707f6dd2ce738"
+      },
+      "crates/sequencer/src/bin/kardamom-sequencer/main.rs": {
+        "before_sha256": "85d2cf1feaa65a125a6544d562c53daca83dc77d04f1f1e1adf8a706a9d7dc27",
+        "after_sha256": "0934c49885ba88568f259c483a2a3111f6c8a81150513985686309f298dc71c6"
+      },
+      "crates/sequencer/src/config.rs": {
+        "before_sha256": "8782425bf91e6dbf96834261c3d9a0b455f13b22423976c2043e67503ed50057",
+        "after_sha256": "8782425bf91e6dbf96834261c3d9a0b455f13b22423976c2043e67503ed50057"
+      },
+      "crates/sequencer/src/epoch.rs": {
+        "before_sha256": "5b51ca72acd7802a343c157065732b58d27e7b28105d76e9c43a1207dab6d5bc",
+        "after_sha256": "5b51ca72acd7802a343c157065732b58d27e7b28105d76e9c43a1207dab6d5bc"
+      },
+      "crates/sequencer/src/epoch_tests.rs": {
+        "before_sha256": "832a641123f14b42e20063e1849a585b30c7f53d35df43ee5e7ab59baac30652",
+        "after_sha256": "832a641123f14b42e20063e1849a585b30c7f53d35df43ee5e7ab59baac30652"
+      },
+      "crates/sequencer/src/error.rs": {
+        "before_sha256": "07ebd9b568551e0ec1d8168db97fed4ed0f1d844bb947f53180f1f0c65b7d233",
+        "after_sha256": "07ebd9b568551e0ec1d8168db97fed4ed0f1d844bb947f53180f1f0c65b7d233"
+      },
+      "crates/sequencer/src/fakes.rs": {
+        "before_sha256": "4fc4d5bf92e90b34a5408a54e48b2dc75fc579fe2746a42993f65da62ef3d359",
+        "after_sha256": "4fc4d5bf92e90b34a5408a54e48b2dc75fc579fe2746a42993f65da62ef3d359"
+      },
+      "crates/sequencer/src/fees.rs": {
+        "before_sha256": "899a720babd1809e56a8ecb7c4120dbbb16f924e68b0c6afce6f360b67935975",
+        "after_sha256": "899a720babd1809e56a8ecb7c4120dbbb16f924e68b0c6afce6f360b67935975"
+      },
+      "crates/sequencer/src/inbound.rs": {
+        "before_sha256": "3f9b805780355c1fd2efcaa95407b67a0a9948d24385ba8f2a7d4a777ac5fe8f",
+        "after_sha256": "3f9b805780355c1fd2efcaa95407b67a0a9948d24385ba8f2a7d4a777ac5fe8f"
+      },
+      "crates/sequencer/src/lib.rs": {
+        "before_sha256": "ec751b6a5d46d51a4f5f5756ebffd7431558fdfe658a48d7f90c92cd85b213e5",
+        "after_sha256": "ec751b6a5d46d51a4f5f5756ebffd7431558fdfe658a48d7f90c92cd85b213e5"
+      },
+      "crates/sequencer/src/lookup.rs": {
+        "before_sha256": "34da0dd939cd3d966c4f2e8d17fd8a5a789bd53c75866a2edc8ddef00ea7d2b6",
+        "after_sha256": "34da0dd939cd3d966c4f2e8d17fd8a5a789bd53c75866a2edc8ddef00ea7d2b6"
+      },
+      "crates/sequencer/src/metrics.rs": {
+        "before_sha256": "ee2e365bf785357569c832076947aeead94790ba0713069380dff2e28b1aafb1",
+        "after_sha256": "ee2e365bf785357569c832076947aeead94790ba0713069380dff2e28b1aafb1"
+      },
+      "crates/sequencer/src/nonce_ahead.rs": {
+        "before_sha256": "80547cf8054fac304f45e6e825f3ecacb7de48b4c26b2cb13f041d64cd4559d2",
+        "after_sha256": "80547cf8054fac304f45e6e825f3ecacb7de48b4c26b2cb13f041d64cd4559d2"
+      },
+      "crates/sequencer/src/outbound.rs": {
+        "before_sha256": "3c3fa8dd0d3bdbd4da2682803204b8caf737063427a6807e049e1bd2d15ad5da",
+        "after_sha256": "3c3fa8dd0d3bdbd4da2682803204b8caf737063427a6807e049e1bd2d15ad5da"
+      },
+      "crates/sequencer/src/outbound/cluster.rs": {
+        "before_sha256": "8c189668cfa3faaa5071498b237454a86c9ceb1536e4fef940edf00f3cf2edc7",
+        "after_sha256": "8c189668cfa3faaa5071498b237454a86c9ceb1536e4fef940edf00f3cf2edc7"
+      },
+      "crates/sequencer/src/partition.rs": {
+        "before_sha256": "b995e5210faa7e05dad95dde9bd10a9467ae73cdade277ec7a5c7c536dd6301c",
+        "after_sha256": "b995e5210faa7e05dad95dde9bd10a9467ae73cdade277ec7a5c7c536dd6301c"
+      },
+      "crates/sequencer/src/pause_gate.rs": {
+        "before_sha256": "89b26fc84c8b647f7159dbca69e6d34184e32f932a5a8b96104d2942f245a810",
+        "after_sha256": "89b26fc84c8b647f7159dbca69e6d34184e32f932a5a8b96104d2942f245a810"
+      },
+      "crates/sequencer/src/pending.rs": {
+        "before_sha256": "96a3c62cb6b56c56ac0d27316c1c0c9ba24728bfd7752744345331f296d3bb35",
+        "after_sha256": "96a3c62cb6b56c56ac0d27316c1c0c9ba24728bfd7752744345331f296d3bb35"
+      },
+      "crates/sequencer/src/pipeline.rs": {
+        "before_sha256": "1868ea5fb2bb852a58a9354a1cfe29b0cefd7809a018773b7e50b31b12b803f4",
+        "after_sha256": "1868ea5fb2bb852a58a9354a1cfe29b0cefd7809a018773b7e50b31b12b803f4"
+      },
+      "crates/sequencer/src/pipeline_tests.rs": {
+        "before_sha256": "746ef8065a62f557e503158fe786c06be346f10f4c2a8cd8b04dccd4e19291e7",
+        "after_sha256": "746ef8065a62f557e503158fe786c06be346f10f4c2a8cd8b04dccd4e19291e7"
+      },
+      "crates/sequencer/src/pump.rs": {
+        "before_sha256": "68dff95ea462b253cf0b472c27e42c41d8107ec95e09c16e103f427668aa7689",
+        "after_sha256": "68dff95ea462b253cf0b472c27e42c41d8107ec95e09c16e103f427668aa7689"
+      },
+      "crates/sequencer/src/remote_epoch.rs": {
+        "before_sha256": "f23c4eabb555f175de4e1fe58e32b178f61ec967d9f8f605c3c7862e73257eff",
+        "after_sha256": "f23c4eabb555f175de4e1fe58e32b178f61ec967d9f8f605c3c7862e73257eff"
+      },
+      "crates/sequencer/src/resync/answers.rs": {
+        "before_sha256": "96b9e1bb81097898ceb767efb17619d99acb5f973f23da1dc2c1795d79592e31",
+        "after_sha256": "96b9e1bb81097898ceb767efb17619d99acb5f973f23da1dc2c1795d79592e31"
+      },
+      "crates/sequencer/src/resync/floor.rs": {
+        "before_sha256": "3b394a320788ac1c9d74bc6a0e73c4b4785de5ab6a49d321d86b7b0f8200711e",
+        "after_sha256": "3b394a320788ac1c9d74bc6a0e73c4b4785de5ab6a49d321d86b7b0f8200711e"
+      },
+      "crates/sequencer/src/resync/mod.rs": {
+        "before_sha256": "0aefefcb8f0f14fc53a7572eba515616ed1259bfdd75cea836547787ecd14cce",
+        "after_sha256": "0aefefcb8f0f14fc53a7572eba515616ed1259bfdd75cea836547787ecd14cce"
+      },
+      "crates/sequencer/src/resync/tests.rs": {
+        "before_sha256": "bb242bbce71d1ff1809cae1e6dfc8967db065bdc557a876ea599743fbecbd3a8",
+        "after_sha256": "bb242bbce71d1ff1809cae1e6dfc8967db065bdc557a876ea599743fbecbd3a8"
+      },
+      "crates/sequencer/src/sealer_rules.rs": {
+        "before_sha256": "4557a0058903b37bf6ef26de01064613abe80f09310d25c65c3a72683a0ac602",
+        "after_sha256": "d7200a246cb05f9ea0b2241adbcc70f40ab2d9252d562d3788874442c1e9df4d"
+      },
+      "crates/sequencer/src/sealer_rules_tests.rs": {
+        "before_sha256": "22f31e8f1b69092b5d5937c8ca3e5c30031feb457160f1f00ba96d7bd1e859f9",
+        "after_sha256": "d23d952d759078e060fa6be23a81f736cd825a1dfadc2c71a461b03af8168928"
+      },
+      "crates/sequencer/src/sender.rs": {
+        "before_sha256": "27281c43efd49b8c29814661ef8dd7b61a671fad1928689c47a5a8156e32ca5f",
+        "after_sha256": "27281c43efd49b8c29814661ef8dd7b61a671fad1928689c47a5a8156e32ca5f"
+      },
+      "crates/sequencer/src/sequencer.rs": {
+        "before_sha256": "1e6fd94d0d12a5b24b8b5a24736b18b2349274a640163ee91e2184d7bab23302",
+        "after_sha256": "1e6fd94d0d12a5b24b8b5a24736b18b2349274a640163ee91e2184d7bab23302"
+      },
+      "crates/sequencer/src/sequencer/receipt_floor.rs": {
+        "before_sha256": "976674b5efa2494441c74d5ebb0e28ec104734de2bbfcf0278a7e3d98f6bf755",
+        "after_sha256": "976674b5efa2494441c74d5ebb0e28ec104734de2bbfcf0278a7e3d98f6bf755"
+      },
+      "crates/sequencer/src/sequencer/sealer_answers.rs": {
+        "before_sha256": "f32714544517003232aeb291d5910eadac761cf0988fca2546caaf3175883e5d",
+        "after_sha256": "f32714544517003232aeb291d5910eadac761cf0988fca2546caaf3175883e5d"
+      },
+      "crates/sequencer/src/shutdown.rs": {
+        "before_sha256": "2bb3287567a5f2814c7086b5701ae5bd44b305e33a139772adc1cbcbbb226469",
+        "after_sha256": "2bb3287567a5f2814c7086b5701ae5bd44b305e33a139772adc1cbcbbb226469"
+      },
+      "crates/sequencer/src/state/mod.rs": {
+        "before_sha256": "10ac5c96a07199a9e693f15a45d7546b0c901f30766ac191b098055c60f6d892",
+        "after_sha256": "10ac5c96a07199a9e693f15a45d7546b0c901f30766ac191b098055c60f6d892"
+      },
+      "crates/sequencer/src/state/proptest_tests.rs": {
+        "before_sha256": "28372221f217935a2714caac335006d56909fb6ef97d5567845dbe3f7e3e6acf",
+        "after_sha256": "28372221f217935a2714caac335006d56909fb6ef97d5567845dbe3f7e3e6acf"
+      },
+      "crates/sequencer/src/state/tests.rs": {
+        "before_sha256": "750f5dba4b7b470458f83d937a8facecd765806ebc7082957a0603a9c6e0b516",
+        "after_sha256": "750f5dba4b7b470458f83d937a8facecd765806ebc7082957a0603a9c6e0b516"
+      },
+      "crates/sequencer/src/testkit.rs": {
+        "before_sha256": "ef66d7a7791c880ee60cd9f9ef49920d12f07c0c19e76c2270c4e56678a0b4fb",
+        "after_sha256": "ef66d7a7791c880ee60cd9f9ef49920d12f07c0c19e76c2270c4e56678a0b4fb"
+      },
+      "crates/sequencer/src/tx_decode.rs": {
+        "before_sha256": "329fadc0ed7af3f8eb93e652cb5423b2ec571a0b09eabdd2e35ae664be8a5838",
+        "after_sha256": "329fadc0ed7af3f8eb93e652cb5423b2ec571a0b09eabdd2e35ae664be8a5838"
+      },
+      "crates/sequencer/src/unconfirmed.rs": {
+        "before_sha256": "9ea5620079901c317e18c023509006f9fb6d65eb491436467d38dccfc38b65a1",
+        "after_sha256": "9ea5620079901c317e18c023509006f9fb6d65eb491436467d38dccfc38b65a1"
+      },
+      "crates/sequencer/src/v2/depth.rs": {
+        "before_sha256": "9c0b86dae8be649ce8e5c86e082d0f9e1c3c480783965dc1988d657973b2060a",
+        "after_sha256": "9c0b86dae8be649ce8e5c86e082d0f9e1c3c480783965dc1988d657973b2060a"
+      },
+      "crates/sequencer/src/v2/mod.rs": {
+        "before_sha256": "d374c80aef52255f1e230839f051774a9df3e6b7e7b92166bdb12865f69cdecf",
+        "after_sha256": "b7a8a086dcffc3ddc2a522a79bd8a3edd09729719d593418fd55e002a08bf88e"
+      },
+      "crates/sequencer/src/v2/offers.rs": {
+        "before_sha256": "009baaa32eb842da8fd56288dd986202812aedc92a365081909c508e4f069fff",
+        "after_sha256": "009baaa32eb842da8fd56288dd986202812aedc92a365081909c508e4f069fff"
+      },
+      "crates/sequencer/src/v2/pause_tests.rs": {
+        "before_sha256": "9ac9ff633f1d087db4f858a329f4c758c75723ab4cc07e2cac99e1ffbbdfd7b1",
+        "after_sha256": "9ac9ff633f1d087db4f858a329f4c758c75723ab4cc07e2cac99e1ffbbdfd7b1"
+      },
+      "crates/sequencer/src/v2/refusal_tests.rs": {
+        "before_sha256": "64e229f7510e792e9f93da914233ecd4dbe61d220b88beee734c9efbe8b58617",
+        "after_sha256": "b21b96b6072dc57c159ccc50446e96051067301a1a911b66de195698bee33aa7"
+      },
+      "crates/sequencer/src/v2/refusals.rs": {
+        "before_sha256": "193633fddb571603c6372652c45a8cbd35d75aff18f144a38731f6cbdaac8cfa",
+        "after_sha256": "963b6fdebc992cd672621f93c09f97cfd1915c09b68841c58240143e4e6ecbf4"
+      },
+      "crates/sequencer/src/v2/resend_tests.rs": {
+        "before_sha256": "348b01d35e1d3ba5bb69ca4400669143cacc1c18bbc2f920c046617900846267",
+        "after_sha256": "348b01d35e1d3ba5bb69ca4400669143cacc1c18bbc2f920c046617900846267"
+      },
+      "crates/sequencer/src/v2/runner.rs": {
+        "before_sha256": "8a4ce0a0a9f1101ff1a031575edb11a6456202dd5c66118089e94f3e3d7c502b",
+        "after_sha256": "8a4ce0a0a9f1101ff1a031575edb11a6456202dd5c66118089e94f3e3d7c502b"
+      },
+      "crates/sequencer/src/v2/tests.rs": {
+        "before_sha256": "293ba9745d41f8f3af89bcb186b4524cf1c8381ad58b51ff9cf79bc61e6b4edb",
+        "after_sha256": "293ba9745d41f8f3af89bcb186b4524cf1c8381ad58b51ff9cf79bc61e6b4edb"
+      },
+      "crates/sequencer/src/v2/verdicts.rs": {
+        "before_sha256": "695993cf2f165782cda1225919fb88e98ce5fa5337427d3f76a3fbae6e1a2263",
+        "after_sha256": "695993cf2f165782cda1225919fb88e98ce5fa5337427d3f76a3fbae6e1a2263"
+      }
+    },
+    "binaries": {
+      "before": {
+        "path": "/tmp/chaos-guard-refusal-profile/before-v2-loop",
+        "sha256": "7f97da711a744a18a20fa5b937048a24385d51e3c2f07d4b82abc57052a67730"
+      },
+      "after": {
+        "path": "/tmp/chaos-guard-refusal-profile/after-v2-loop",
+        "sha256": "b739faa80d565e77fd9c1a4a9f24e6a35b3192566ce256d87440faff5f78a44e"
+      }
+    },
+    "layouts": {
+      "before": {
+        "ForwardMark": 40,
+        "SenderState": 160,
+        "Candidate": 192,
+        "Verdict": 272,
+        "AccountEvent": 80,
+        "AdmissionLoop": 1256
+      },
+      "after": {
+        "ForwardMark": 48,
+        "SenderState": 168,
+        "Candidate": 192,
+        "Verdict": 272,
+        "AccountEvent": 80,
+        "AdmissionLoop": 984
+      }
+    },
+    "harness_difference": "Both harnesses use the same inputs, limits, timed runner, real pause watch and environment. Baseline holds the old dedicated refusal channel; candidate holds the SealerRules sender for the shared account-event queue. This setup difference matches the intended production transport change.",
+    "candidate_source_revision": "d9e2cc5d3be1d86ffee4413ac207121d754ad322"
+  },
+  "methodology": {
+    "cpu": 8,
+    "transactions_per_batch": 4096,
+    "senders": 256,
+    "nonces_per_sender": 16,
+    "samples": 60,
+    "warmup_seconds": 1,
+    "requested_measurement_seconds": 3,
+    "bootstrap_resamples": 1000,
+    "alternating_pairs_per_mode": 5,
+    "modes": [
+      "normal",
+      "forced_sweeps"
+    ],
+    "all_observations_retained": 60,
+    "our_builds_or_tests_overlap_measurement": false,
+    "environment": {
+      "KARDAMOM_V2_BENCH_CARRY": "1",
+      "KARDAMOM_V2_BENCH_TERMINAL_REFUSALS": "1"
+    },
+    "limits": [
+      "Shared host with existing containers; CPU/load and per-invocation resource evidence are retained.",
+      "These are single-core in-memory loop measurements; they do not prove deployed client latency or chain capacity.",
+      "Production-equivalent producer setup differs with the intended refusal transport change; inputs, limits and the timed runner remain the same."
+    ]
+  },
+  "summary": [
+    {
+      "mode": "normal",
+      "workload": "in_order",
+      "paired_changes_percent": [
+        -1.3069815155834497,
+        -2.101657062755047,
+        -4.176218151133638,
+        -0.547384480242652,
+        -6.9544466023675255
+      ],
+      "median_paired_change_percent": -2.101657062755047,
+      "phase_median_transactions_per_second": {
+        "before": 790974.1693785827,
+        "after": 769971.4887373563
+      },
+      "ratio_of_phase_medians_percent": -2.6552928596551895
+    },
+    {
+      "mode": "normal",
+      "workload": "reversed",
+      "paired_changes_percent": [
+        -1.7258146964352683,
+        -2.4833825069219384,
+        -3.563718934278526,
+        -5.339720073237286,
+        -4.062099289579524
+      ],
+      "median_paired_change_percent": -3.563718934278526,
+      "phase_median_transactions_per_second": {
+        "before": 704442.3945322788,
+        "after": 687146.6247034016
+      },
+      "ratio_of_phase_medians_percent": -2.4552426093493285
+    },
+    {
+      "mode": "normal",
+      "workload": "with_verdicts",
+      "paired_changes_percent": [
+        -5.493490765225051,
+        -2.7232768725581225,
+        -0.9170571657316828,
+        -0.13605140078251088,
+        2.231273293860392
+      ],
+      "median_paired_change_percent": -0.9170571657316828,
+      "phase_median_transactions_per_second": {
+        "before": 688768.2515996286,
+        "after": 679678.9891474234
+      },
+      "ratio_of_phase_medians_percent": -1.3196401592401874
+    },
+    {
+      "mode": "forced_sweeps",
+      "workload": "in_order",
+      "paired_changes_percent": [
+        -3.6383287949128706,
+        -4.006750886994459,
+        -2.6204025526687658,
+        -2.3456791219547912,
+        -2.834670108080206
+      ],
+      "median_paired_change_percent": -2.834670108080206,
+      "phase_median_transactions_per_second": {
+        "before": 636741.056465858,
+        "after": 613574.3232594283
+      },
+      "ratio_of_phase_medians_percent": -3.6383287949128706
+    },
+    {
+      "mode": "forced_sweeps",
+      "workload": "reversed",
+      "paired_changes_percent": [
+        -1.6046661393020023,
+        1.2177061070705042,
+        1.0304566870774856,
+        -4.457464459017069,
+        -1.180355302286329
+      ],
+      "median_paired_change_percent": -1.180355302286329,
+      "phase_median_transactions_per_second": {
+        "before": 576122.6022654804,
+        "after": 574727.8654631476
+      },
+      "ratio_of_phase_medians_percent": -0.2420902767654498
+    },
+    {
+      "mode": "forced_sweeps",
+      "workload": "with_verdicts",
+      "paired_changes_percent": [
+        11.434861588167777,
+        -2.5732769534976385,
+        0.4364989706076905,
+        -5.711295697865548,
+        -0.13372824995476762
+      ],
+      "median_paired_change_percent": -0.13372824995476762,
+      "phase_median_transactions_per_second": {
+        "before": 578019.8102977837,
+        "after": 569985.409315148
+      },
+      "ratio_of_phase_medians_percent": -1.3899871318418189
+    }
+  ],
+  "next_step": "Test a generation representation that keeps the original marker and sender-state layouts, with explicit safe rollover. Retain this result regardless of subsequent measurements."
+}
