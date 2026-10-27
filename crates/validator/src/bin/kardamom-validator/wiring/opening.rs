@@ -71,10 +71,15 @@ impl Opening {
     /// failure. State, configuration and permission failures retain their
     /// errors, also when reopening a previously running pipeline.
     async fn after_failure(&self, error: anyhow::Error) -> Result<ControlFlow<()>> {
-        if self.mode == OpenMode::Normal
-            || !error
-                .downcast_ref::<LogError>()
-                .is_some_and(LogError::is_transient)
+        if self.mode == OpenMode::Normal {
+            return Err(error);
+        }
+        if self.stop.is_cancelled() {
+            return Ok(ControlFlow::Break(()));
+        }
+        if !error
+            .downcast_ref::<LogError>()
+            .is_some_and(LogError::is_transient)
         {
             return Err(error);
         }
@@ -181,5 +186,19 @@ mod tests {
             ControlFlow::Break(())
         );
         assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_a_catalog_open_ends_the_resume_cleanly() {
+        let stop = CancellationToken::new();
+        let restart = Opening::new(OpenMode::Resume, stop.clone());
+        stop.cancel();
+        assert_eq!(
+            restart
+                .after_failure(LogError::Discovery("stopped during start-up open".into()).into())
+                .await
+                .unwrap(),
+            ControlFlow::Break(())
+        );
     }
 }
