@@ -11,6 +11,15 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn recovered_confirmation(&mut self, sender: Address, nonce: u64) {
+        let block = nonce.checked_mul(3).unwrap().checked_add(2).unwrap();
+        self.state(sender, nonce, block);
+        self.offer(sender, nonce);
+        self.admission.on_rows(block + 1, [], &mut Vec::new());
+        self.state(sender, nonce + 1, block + 2);
+        self.admission.resume_loss_window();
+    }
+
     fn new() -> Self {
         Self::with_sender_limit(NonZeroUsize::new(100).unwrap())
     }
@@ -74,6 +83,22 @@ impl Fixture {
         self.admission.on_rows(block, [], &mut Vec::new());
         self.admission.sweep(Instant::now(), &mut Vec::new());
     }
+}
+
+#[test]
+fn repeated_resumes_keep_only_markers_that_can_still_expire_a_live_run() {
+    let mut f = Fixture::new();
+    let sender = Address::repeat_byte(1);
+    let waiting = Address::repeat_byte(2);
+    f.state(waiting, 0, 1);
+    f.offer(waiting, 0);
+    (0..100).for_each(|nonce| f.recovered_confirmation(sender, nonce));
+    assert!(f.admission.unconfirmed_at(waiting, 0).is_some());
+    assert_eq!(
+        f.admission.forwards.len(),
+        1,
+        "confirmed runs cannot grow metadata through repeated recovery"
+    );
 }
 
 #[test]

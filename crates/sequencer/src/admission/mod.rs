@@ -438,7 +438,18 @@ impl<T: Clone> Admission<T> {
     /// Empty blocks during an upstream pause do not prove offer loss.
     /// On resume the retained runs get a full loss window for recovery;
     /// account rows can still confirm them throughout the pause.
+    #[cold]
     pub(crate) fn resume_loss_window(&mut self) {
+        let senders = &self.senders;
+        MarkRetention {
+            marks: &mut self.forwards,
+            stamped: &mut self.stamped,
+        }
+        .retain(|mark| {
+            senders
+                .get(&mark.sender)
+                .is_some_and(|sender| sender.holds_loss_mark(mark.nonce, mark.generation))
+        });
         self.forwards
             .range_mut(..self.stamped)
             .for_each(|mark| mark.block = self.block);

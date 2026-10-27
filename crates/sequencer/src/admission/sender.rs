@@ -191,9 +191,11 @@ impl<T: Clone> SenderState<T> {
         cfg: &AdmissionConfig,
         out: &mut Vec<Verdict<T>>,
     ) -> bool {
-        if generation.is_some_and(|generation| generation != self.generation)
-            || self.forwarded_at(nonce).is_none()
-        {
+        let current = generation.map_or_else(
+            || self.forwarded_at(nonce).is_some(),
+            |generation| self.holds_loss_mark(nonce, generation),
+        );
+        if !current {
             return false;
         }
         self.forwarded.clear();
@@ -265,6 +267,10 @@ impl<T: Clone> SenderState<T> {
     pub(super) fn forwarded_at(&self, nonce: u64) -> Option<&Candidate<T>> {
         let at = usize::try_from(nonce.checked_sub(self.first)?).ok()?;
         self.forwarded.get(at)
+    }
+
+    pub(super) fn holds_loss_mark(&self, nonce: u64, generation: u32) -> bool {
+        self.generation == generation && self.forwarded_at(nonce).is_some()
     }
 
     /// The forwarded transactions that no state confirmed, in nonce order.
