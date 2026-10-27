@@ -649,7 +649,8 @@
         "Typed reset, staged repair, unrecoverable outcome and divergence controls retain distinct verdicts.",
         "Paused-clock controls cover first-start failure, delayed retry and immediate shutdown. A recorder control verifies the pipeline activity gauge clears when the guard ends.",
         "State/configuration and catalog permission failures keep their error results after a source reset; only typed transient catalog failures retry."
-      ]
+      ],
+      "issue": "https://github.com/junemartes/kardamom/issues/854"
     },
     {
       "id": "meter-fixture-assumes-scheduler-wakeup",
@@ -703,6 +704,32 @@
       "service_wiring_changed": false,
       "hot_path_changed": false,
       "status": "Both targets compile under workspace style. Deployed paired runtime comparisons remain pending."
+    },
+    {
+      "id": "validator-missing-executor-can-pass-catchup",
+      "classification": "harness",
+      "observed": "wait_verifying_live, recovery_sample and validator-join turn a missing executor-head scrape into zero. An advancing validator at block 1000 then appears caught up with lag -1000. The warm-up also counts its first historical positive counter as progress without a previous observation.",
+      "change": "Share one complete observation reader. Missing verified count, committed block or executor head yields no sample. Require positive observed heads and bounded lag. Warm-up needs a verified-count increase across two complete observations; newborn/survivor proofs keep their process-specific counter floors. Read independent metrics concurrently within the existing poll deadline.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "The extracted original behavior fails two negative controls. After correction, all 237 chaos library tests pass, two manual profiles remain ignored, and workspace style passes. The follow-up is local; deployed validation remains pending.",
+      "verification": [
+        "Reject an advancing validator when the executor head is absent.",
+        "Require every source to answer; missing values never count as zero.",
+        "Retain positive live samples and reject historical-only, zero-head, non-advancing, regressed-counter and excessive-lag samples."
+      ]
+    },
+    {
+      "id": "validator-resume-stop-error-is-fatal",
+      "classification": "product follow-up",
+      "observed": "The source-reset opener in PR 853 handles cancellation during its retry wait, but a cancellation during an in-flight catalog open returns a Discovery stopped error. That error is classified as non-transient before checking the shutdown token, so an intentional shutdown returns an error.",
+      "change": "During resume, let the canceled shutdown token end the open cleanly before classifying its error. First-start errors and uncanceled state/permission errors retain their results.",
+      "product_bug": true,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "issue": "https://github.com/junemartes/kardamom/issues/854",
+      "status": "The new control fails on PR 853 runtime code and passes after correction. All 16 validator binary tests and workspace style pass locally. This changes only resume cancellation; no healthy transaction-path work is added."
     }
   ],
   "coverage": [
@@ -714,7 +741,8 @@
         "chaos-cache",
         "chaos-sequencer"
       ],
-      "status": "New mirror-backlog-client-restart case runs first in the existing cache shard. It holds an old live projection, commits an established sender transfer, restarts one ingress, requires exact nonce/balance equality with the executor, checks stale fallbacks and no local hits, and verifies stale Redis rows/heads do not change. The original mirror job is restored and every mirror must complete its own rebuild. 202 local chaos tests pass; deployed validation pending. Many-sender throughput/backlog reproduction remains open."
+      "status": "New mirror-backlog-client-restart case runs first in the existing cache shard. It holds an old live projection, commits an established sender transfer, restarts one ingress, requires exact nonce/balance equality with the executor, checks stale fallbacks and no local hits, and verifies stale Redis rows/heads do not change. The original mirror job is restored and every mirror must complete its own rebuild. 202 local chaos tests pass; deployed validation pending. Many-sender throughput/backlog reproduction remains open.",
+      "incident_evidence": "Issue 754 reports about 2500 aggregate TPS, 100 senders, recently used accounts, 30-second pending receipt timeouts and all transactions ultimately landing. The fixed healthy CI run uses six senders at 300 TPS; it does not reproduce this load shape."
     },
     {
       "gap": "Partial account regression with a surviving advanced mirror head",
@@ -842,7 +870,8 @@
       "existing_shards": [
         "all existing shards"
       ],
-      "status": "Owned load remains required through recovery. Local regression now bounds every poll by actual monotonic time, including probes and initial delays; hanging hold probes fail. Full rollout load windows cover measured Ansible cost without extending product recovery SLOs. Deployed latency/throughput/RTO proof remains pending. A real HTTP regression now exposes and corrects a PASS with an unfinished submit. Unknown outcomes fail the measurement, pending receipt reads consume the whole drain budget, and cancellation stops background readers. 89 benchmark tests and 224 chaos tests pass locally; this follow-up is not yet published. PR 851 load passes but uses V1. The follow-up runs identical healthy workloads on fresh reference and V2 deployments in that same job, with separate reports. Full runtime baseline/candidate comparison remains pending."
+      "status": "Owned load remains required through recovery. Local regression now bounds every poll by actual monotonic time, including probes and initial delays; hanging hold probes fail. Full rollout load windows cover measured Ansible cost without extending product recovery SLOs. Deployed latency/throughput/RTO proof remains pending. A real HTTP regression now exposes and corrects a PASS with an unfinished submit. Unknown outcomes fail the measurement, pending receipt reads consume the whole drain budget, and cancellation stops background readers. 89 benchmark tests and 224 chaos tests pass locally; this follow-up is not yet published. PR 851 load passes but uses V1. The follow-up runs identical healthy workloads on fresh reference and V2 deployments in that same job, with separate reports. Full runtime baseline/candidate comparison remains pending.",
+      "validator_evidence": "Issue 847 delivers all 1.2 million transfers in a five-minute 4000 TPS soak but fails validator state catch-up. Receipt completeness alone does not cover verification backlog. Local eviction controls are present; the repeat deployed campaign remains open."
     },
     {
       "gap": "Nomad, Consul and DNS control-plane loss while the data plane stays live",
@@ -858,7 +887,9 @@
         "chaos-carry",
         "chaos-integrity"
       ],
-      "status": "pending; compare egress reference mark with stored records, not only its prior value"
+      "status": "pending; compare egress reference mark with stored records, not only its prior value",
+      "unit_evidence": "The current egress Store unit test reopens a populated store after an unclean drop, checks exact R reconstructed from older segments, then closes cleanly and checks the exact side file. Pruned-reference and bounded-segment-scan controls also exist.",
+      "remaining": "The deployed carry-egress-restart case still compares mark gauges before/after. Equal wrong marks can pass. A populated legacy-layout fixture and a stored-reference oracle through crash/open/clean restart remain required."
     }
   ],
   "validation": {
@@ -933,6 +964,14 @@
       {
         "check": "PR 851 failure classification and local follow-up",
         "result": "198 sequencer library + 14 binary, 142 validator library + 15 binary, 97 adapter library and 234 chaos library tests pass. Three manual profiles are ignored. Workspace style passes. The dedicated load job now runs reference and V2 topologies separately."
+      },
+      {
+        "check": "strict validator recovery observations",
+        "result": "Two negative controls reproduce the false pass. The complete-sample fix and three controls pass with all 237 chaos library tests (two manual profiles ignored). Workspace style passes. No product runtime or service wiring changes."
+      },
+      {
+        "check": "validator resume cancellation during an open",
+        "result": "The exact stopped-discovery error fails before correction. All 16 validator binary controls and workspace style pass after correction."
       }
     ],
     "pending": [
@@ -968,7 +1007,16 @@
         "inputs": {}
       }
     ],
-    "fault_fixture_wiring_changed": "The carry prune-floor case temporarily shortens egress reader-window and segment lengths. It keeps the registered L1 safety floors and restores the exact job. No deployment default changes. Carry now enables the existing L1 fault proxy topology for its deposit fault. The checkpoint-scan interruption temporarily pauses Redis writes, permits read fallbacks and always clears the pause/restores the saved mirror job."
+    "fault_fixture_wiring_changed": "The carry prune-floor case temporarily shortens egress reader-window and segment lengths. It keeps the registered L1 safety floors and restores the exact job. No deployment default changes. Carry now enables the existing L1 fault proxy topology for its deposit fault. The checkpoint-scan interruption temporarily pauses Redis writes, permits read fallbacks and always clears the pause/restores the saved mirror job.",
+    "performance_profiles_pending": {
+      "baseline_branch": "profile/v2-pause-baseline-20261027",
+      "baseline_head": "60c3b0120a16e64de6b5f53c2df314cb6bde92cc",
+      "baseline_run": 40446103527,
+      "candidate_branch": "profile/v2-pause-candidate-20261027",
+      "candidate_head": "3a025e7d171f100469af4b92ccd4c907032744fa",
+      "candidate_run": null,
+      "method": "The same load harness runs fresh reference and V2 clusters. Only four sequencer production source files differ between runtime conditions. Each profile branch narrows the regular matrix to the existing load job. These runs cannot qualify for a complete green round. Finish baseline before dispatching candidate; retain failures and all reports."
+    }
   },
   "iterations": [
     {
@@ -1259,6 +1307,8 @@
       "Give each checked upgrade an eight-minute load allowance; compose two allowances for two-upgrade steps, plus existing deploy, provider fault and restart allowances. Stop load when the case completes. Keep runtime proof deadlines and the workflow ceiling.",
       "Within the existing load job, run identical transfer and DeFi workloads on separate fresh reference and carry/V2 deployments. Read knobs from each actual deployment. Preserve distinct V2 report files and log the topology. No new shard."
     ],
-    "status": "Local diagnostic candidate. Runtime bugs, test-oracle failures and coverage gaps remain distinct. Deployed validation and full workload comparison remain required. Head is not frozen; streak 0/10."
+    "status": "Published as draft PR 853. Diagnostic workflows are running. Head is not frozen; streak 0/10. A separate local follow-up corrects incomplete validator recovery samples.",
+    "pull_request": "https://github.com/junemartes/kardamom/pull/853",
+    "commit": "2b6a8acd898feb7e15df5b519a4334954f6b3d88"
   }
 }

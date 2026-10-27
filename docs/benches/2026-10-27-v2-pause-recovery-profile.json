@@ -551,5 +551,16 @@
   "raw_samples": "2026-10-27-v2-pause-recovery-samples.jsonl",
   "observation_count": 240,
   "interpretation": "Early shapes raised a throughput concern; they remain here rather than being discarded. The final watch-hook shape has no new Admission field or extra normal-turn change test. Normal median paired throughput deltas are +0.10% ordered, -0.46% reversed and +0.51% with verdicts. Independent median ratios differ and all pair values are retained. Forced-sweep results include large host-noise outliers; they are an overhead control, not production capacity. No speedup or performance guarantee is claimed.",
-  "scope": "Resident V2 loop only. No client p50/p95/p99, RPC/network cost, deployed mirror lag or full-chain capacity is measured. Identical-workload deployed comparisons remain required."
+  "scope": "Resident V2 loop only. No client p50/p95/p99, RPC/network cost, deployed mirror lag or full-chain capacity is measured. Identical-workload deployed comparisons remain required.",
+  "reproduction": {
+    "build": "cargo bench --locked -p kardamom-sequencer --bench v2_loop --no-run",
+    "runtime_conditions": {
+      "before_branch": "profile/v2-pause-baseline-20261027",
+      "after_branch": "profile/v2-pause-candidate-20261027"
+    },
+    "command_template": "KARDAMOM_V2_BENCH_CARRY=1 taskset -c 8 BENCHMARK_BINARY v2_loop/WORKLOAD$ --bench --noplot --sample-size 60 --warm-up-time 1 --measurement-time 3 --nresamples 1000 --save-baseline PHASE-REPEAT",
+    "forced_sweeps": "Also set KARDAMOM_V2_BENCH_FORCE_SWEEPS=1 in both phases. Leave it unset for normal turns.",
+    "runtime_library_path": "When invoking a benchmark executable directly, set LD_LIBRARY_PATH to the directory containing the Aeron shared library built by Cargo.",
+    "pair_order": "Odd repeats use before then after; even repeats reverse it. Odd repeats use normal then forced_sweeps and workloads in_order, reversed, with_verdicts; even repeats reverse both orders. Each workload pair runs back to back. Use separate Criterion output directories per mode and retain estimates.json and sample.json for every phase/repeat."
+  }
 }
