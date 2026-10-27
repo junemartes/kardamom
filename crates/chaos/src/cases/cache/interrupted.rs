@@ -8,13 +8,16 @@ use std::time::Duration;
 
 use super::rebuilds::{ForcedRebuild, MirrorRebuilds, RebuildPhase};
 use super::{
-    CacheRecovery, MIRROR_ALLOCS, MIRROR_HEAD_KEYS, MIRROR_WRITE_RETRIES, aux, freeze_and_flush,
-    live_primary, redis_cli,
+    CacheRecovery, MIRROR_ALLOCS, MIRROR_HEAD_KEYS, MIRROR_WRITE_RETRIES, freeze_and_flush,
+    live_primary,
 };
 use crate::harness::Harness;
 use crate::inject::Killed;
 use crate::nomad::SavedJob;
 use crate::rpc::Rpc;
+
+mod writes;
+use writes::WritePause;
 
 const CTX: &str = "mirror-kill-rebuild";
 const TASK: &str = "state-mirror";
@@ -34,24 +37,15 @@ struct Target {
 
 impl Target {
     async fn verify_blocked(&mut self, h: &Harness) -> anyhow::Result<()> {
-        let retries = h
+        let body = h
             .probes
-            .mirror_metric(self.index, MIRROR_WRITE_RETRIES)
+            .scrape()
+            .fetch(&h.probes.mirror_target(self.index))
             .await
-            .with_context(|| format!("{CTX}: no retry metric on {}", self.node))?;
-        self.write_retries = Some(NonZeroU64::new(u64::try_from(retries)?).with_context(|| {
-            format!(
-                "{CTX}: the current mirror on {} has retried no write",
-                self.node
-            )
-        })?);
-        anyhow::ensure!(
-            h.probes
-                .mirror_metric(self.index, "kardamom_state_mirror_serving")
-                .await
-                == Some(0),
-            "{CTX}: the mirror on {} is not rebuilding",
-            self.node
+            .with_context(|| format!("{CTX}: no mirror scrape on {}", self.node))?;
+        self.write_retries = Some(
+            Self::blocked_scan(&body)
+                .with_context(|| format!("{CTX}: blocked scan on {}", self.node))?,
         );
         anyhow::ensure!(
             h.nodes.inner_cid(&self.node, TASK).await.as_ref() == Some(&self.cid)
@@ -62,12 +56,22 @@ impl Target {
         );
         Ok(())
     }
+
+    fn blocked_scan(body: &str) -> anyhow::Result<NonZeroU64> {
+        let serving = crate::metrics::first(body, "kardamom_state_mirror_serving")
+            .context("missing serving metric")?;
+        anyhow::ensure!(serving == 0, "mirror serves before interruption: {serving}");
+        let retries = crate::metrics::first(body, MIRROR_WRITE_RETRIES)
+            .context("missing write retry metric")?;
+        NonZeroU64::new(u64::try_from(retries)?).context("mirror has retried no write")
+    }
 }
 
 pub(super) struct InterruptedRebuild<'a> {
     h: &'a mut Harness,
     saved: SavedJob,
     primary: String,
+    writes: WritePause,
     baseline: MirrorRebuilds,
     blocked: Option<MirrorRebuilds>,
     targets: Vec<Target>,
@@ -81,10 +85,12 @@ impl InterruptedRebuild<'_> {
         let saved = SavedJob::capture(&h.nomad, TASK).await?;
         let primary = live_primary(h, CTX).await?;
         let baseline = MirrorRebuilds::read(h).await?;
+        let writes = WritePause::capture(h).await?;
         let mut fault = InterruptedRebuild {
             h,
             saved,
             primary,
+            writes,
             baseline,
             blocked: None,
             targets: Vec::new(),
@@ -94,7 +100,7 @@ impl InterruptedRebuild<'_> {
             .await
             .context("mirror scan interruption exceeds nine minutes")
             .and_then(std::convert::identity);
-        let unpaused = fault.command("CLIENT UNPAUSE").await;
+        let unpaused = fault.writes.command(fault.h, "CLIENT UNPAUSE").await;
         let rebuilt = match (&verdict, &unpaused) {
             (Ok(()), Ok(())) => fault.recover(&coverage).await,
             _ => Ok(()),
@@ -138,9 +144,11 @@ impl InterruptedRebuild<'_> {
             flushed == self.primary,
             "{CTX}: primary changed before the write pause"
         );
-        self.require_cold_heads().await?;
-        self.command(&format!("CLIENT PAUSE {PAUSE_MS} WRITE"))
+        self.writes.await_cold_heads(self.h).await?;
+        self.writes
+            .command(self.h, &format!("CLIENT PAUSE {PAUSE_MS} WRITE"))
             .await?;
+        self.writes.verify(self.h).await?;
         self.saved.restore().await?;
         self.capture_targets().await?;
         self.blocked = Some(
@@ -152,22 +160,14 @@ impl InterruptedRebuild<'_> {
         super::wait_readers_degraded(self.h, CTX).await?;
         self.prove_traffic().await?;
         self.verify_targets().await?;
-        self.require_cold_heads().await?;
+        self.writes.verify(self.h).await?;
+        self.writes.require_cold_heads(self.h).await?;
         crate::log(format!(
             "{CTX}: every mirror is inside an unfinished checkpoint scan with a failed write; killing {} tasks",
             self.targets.len()
         ));
         self.kill_targets().await?;
         self.saved.stop().await
-    }
-
-    async fn command(&self, command: &str) -> anyhow::Result<()> {
-        let answer = self.request(command).await?;
-        anyhow::ensure!(
-            answer.trim() == "OK",
-            "{CTX}: Redis rejects {command}: {answer}"
-        );
-        Ok(())
     }
 
     async fn verify_targets(&mut self) -> anyhow::Result<()> {
@@ -187,28 +187,6 @@ impl InterruptedRebuild<'_> {
         crate::log(format!(
             "{CTX}: a transfer from the unused cache-shard reserve {FAULT_ACCOUNT} receipts while all mirror scans remain blocked"
         ));
-        Ok(())
-    }
-
-    async fn request(&self, command: &str) -> anyhow::Result<String> {
-        self.h
-            .nodes
-            .exec(
-                &aux(self.h),
-                &redis_cli(&format!("--raw -h {} -p 6379 {command}", self.primary)),
-            )
-            .await
-    }
-
-    async fn require_cold_heads(&self) -> anyhow::Result<()> {
-        let heads: usize = self
-            .request(&format!("EXISTS {MIRROR_HEAD_KEYS}"))
-            .await?
-            .parse()?;
-        anyhow::ensure!(
-            heads == 0,
-            "{CTX}: a fresh head exists before the rebuild completes"
-        );
         Ok(())
     }
 
@@ -269,9 +247,10 @@ impl InterruptedRebuild<'_> {
     ) -> anyhow::Result<()> {
         let report = serde_json::json!({
             "case": CTX,
-            "fault": "CLIENT PAUSE WRITE; kill every mirror after its scan reports a failed write and before completion",
+            "fault": "CLIENT PAUSE WRITE on every Redis data node; kill every mirror after its scan reports a failed write and before completion",
             "max_pause_ms": PAUSE_MS,
             "primary": self.primary,
+            "paused_data_nodes": self.writes,
             "baseline": self.baseline,
             "blocked": self.blocked,
             "targets": self.targets,
@@ -289,3 +268,6 @@ impl InterruptedRebuild<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;
