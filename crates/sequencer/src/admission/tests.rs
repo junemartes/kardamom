@@ -57,10 +57,8 @@ fn state(nonce: u64, balance: u64, tx_idx: u64) -> AccountState {
 fn names(out: &[Verdict<u64>]) -> Vec<String> {
     out.iter()
         .map(|v| match v {
-            Verdict::Forward(c, _) => format!("F{}{}", c.nonce, star(c)),
+            Verdict::Forward(c) => format!("F{}{}", c.nonce, star(c)),
             Verdict::Reject(c, r) => format!("R{}{}:{r:?}", c.nonce, star(c)),
-            Verdict::SealerRefused(c, r) => format!("S{}{}:{r:?}", c.nonce, star(c)),
-            Verdict::DropReference(c) => format!("D{}{}", c.nonce, star(c)),
             Verdict::Lookup(_) => "L".to_owned(),
             Verdict::Accept(ack) => format!("A{}", ack.nonce),
         })
@@ -289,7 +287,7 @@ fn the_rows_of_the_first_transaction_replace_an_answer_of_the_empty_chain() {
     f.on_rows(19, [(sender(1), state(1, 9 * COST, 0))], &mut out);
     out.clear();
     f.offer(tx(1, 1, 2), &mut out);
-    assert!(matches!(out.as_slice(), [Verdict::Forward(c, _)] if c.nonce == 1));
+    assert!(matches!(out.as_slice(), [Verdict::Forward(c)] if c.nonce == 1));
 }
 
 /// A transaction forwarded before any rows came is not lost when the

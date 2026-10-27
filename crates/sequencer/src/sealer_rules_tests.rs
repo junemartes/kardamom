@@ -4,7 +4,6 @@ use kardamom_types::{DropReason, TxDrop};
 
 use super::{SealerRules, SealerVersion};
 use crate::outbound::fakes::InMemorySidePublisher;
-use crate::resync::SealerRefusal;
 use crate::v2::AccountEvent;
 
 struct Rig {
@@ -174,20 +173,8 @@ fn a_refused_reference_tells_the_loop_once() {
     let events: Vec<_> = accounts_rx.try_iter().collect();
     assert!(matches!(
         events[..],
-        [AccountEvent::Refused(ref refused)] if refused.sender == Address::repeat_byte(0x13) && refused.nonce == 7 && refused.canonical_id == B256::repeat_byte(0xAB)
+        [AccountEvent::Refused { sender, nonce: 7 }] if sender == Address::repeat_byte(0x13)
     ));
-}
-
-#[test]
-fn a_late_reference_refusal_waits_for_v2_to_check_the_current_copy_before_a_drop() {
-    let (accounts, _rx) = crossbeam_channel::unbounded();
-    let mut r = Rig::new();
-    r.rules = r.rules.telling(accounts);
-    r.rules.on_ref_refused(&refused(5));
-    assert!(
-        r.drops().is_empty(),
-        "V2 owns copy identity and emits a drop only for the held refused copy"
-    );
 }
 
 /// A contiguity reject goes to the v2 loop with the expected nonce.
@@ -207,52 +194,6 @@ fn a_contiguity_reject_tells_the_loop() {
         [AccountEvent::Rejected { sender, nonce: 9, expected: 8 }]
             if sender == Address::repeat_byte(0x13)
     ));
-}
-
-#[test]
-fn terminal_refusals_use_the_wired_account_queue_and_preserve_every_field() {
-    let (tx, rx) = crossbeam_channel::bounded(1);
-    let rules = Rig::new().rules.telling(tx);
-    let refusal = SealerRefusal {
-        sender: Address::repeat_byte(3),
-        nonce: 17,
-        reason: kardamom_types::TxErrorReason::PastDeadline {
-            max_inclusion_block: 100,
-            at_block: 101,
-        },
-    };
-    assert!(rules.on_refusal(&refusal));
-    assert!(matches!(rx.try_recv().unwrap(),AccountEvent::Refusal(actual) if *actual==refusal));
-    assert!(
-        !Rig::new().rules.on_refusal(&refusal),
-        "V1 retains its terminal-refusal channel"
-    );
-}
-
-#[test]
-fn a_full_account_queue_retains_the_terminal_refusal_until_its_consumer_drains() {
-    let (tx, rx) = crossbeam_channel::bounded(1);
-    tx.send(AccountEvent::Rollback).unwrap();
-    let rules = Rig::new().rules.telling(tx);
-    let refusal = SealerRefusal {
-        sender: Address::repeat_byte(3),
-        nonce: 17,
-        reason: kardamom_types::TxErrorReason::PastDeadline {
-            max_inclusion_block: 100,
-            at_block: 101,
-        },
-    };
-    std::thread::scope(|scope| {
-        let producer = scope.spawn(|| rules.on_refusal(&refusal));
-        assert!(matches!(
-            rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
-            AccountEvent::Rollback
-        ));
-        assert!(
-            matches!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),AccountEvent::Refusal(actual) if *actual==refusal)
-        );
-        assert!(producer.join().unwrap());
-    });
 }
 
 #[test]

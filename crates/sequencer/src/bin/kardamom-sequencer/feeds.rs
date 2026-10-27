@@ -30,7 +30,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(crate) use account_lookup::AccountLookupFeed;
-use guards::GuardPauses;
 use kardamom_cluster_adapter::LiveEgress;
 use kardamom_cluster_adapter::live::EgressPoll;
 use kardamom_cluster_adapter::wire::{self, EgressItem};
@@ -38,7 +37,8 @@ use kardamom_log::aeron_live::{
     IdleCap, TxDataSubscriberHandle, TxDepositsSubscriberHandle,
     TxReceiptsBoundarySubscriberHandle, TxRemoteEpochsSubscriberHandle,
 };
-use kardamom_obs::lifecycle::{Lifecycle, process};
+use kardamom_obs::halt::{HaltCause, HaltRef};
+use kardamom_obs::lifecycle::process;
 use kardamom_obs::pipeline::{LoopMeter, LoopState};
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::epoch::{EpochPump, OriginSignalTx};
@@ -153,7 +153,8 @@ pub(crate) struct EgressWatermarkFeed<D> {
     /// snapshot budget: the leader sends no boundary until the snapshot
     /// is complete, so that gap is neither a lag nor a lost quorum.
     silence: SilenceDeadline,
-    pauses: GuardPauses,
+    /// A live boundary does not clear a sealer guard that still refuses offers.
+    guard: Option<HaltRef>,
     /// The kept decision version of the sealer, and the drops of the
     /// references that it refused.
     rules: SealerRules<D>,
@@ -182,7 +183,7 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
             last_origin: 0,
             last_boundary_at: Some(Instant::now()),
             silence: SilenceDeadline::new(Instant::now()),
-            pauses: GuardPauses::default(),
+            guard: None,
             meter: LoopMeter::new("sequencer.egress_feed"),
         }
     }
@@ -210,8 +211,8 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
         let poll = egress.recv_timeout(Duration::from_millis(500));
         self.meter.mark(LoopState::Idle);
         match poll {
-            EgressPoll::Frame(frame) => self.on_frame(&frame, process()),
-            EgressPoll::Idle => self.on_idle(process()),
+            EgressPoll::Frame(frame) => self.on_frame(&frame),
+            EgressPoll::Idle => self.on_idle(),
             EgressPoll::Closed => return ControlFlow::Break(()),
         }
         self.meter.mark(LoopState::Busy);
@@ -221,16 +222,25 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
     /// Egress is silent while this thread is demonstrably alive. This
     /// could be a partition from egress, or a dead cluster boundary
     /// clock. Either way, the response is the same.
-    fn on_idle(&mut self, lifecycle: &Lifecycle) {
+    fn on_idle(&mut self) {
         let now = Instant::now();
         if self.silence.in_snapshot(now) {
             return;
         }
         self.flag(now);
-        self.pause_on_silence(now, lifecycle);
+        self.pause_on_silence(now);
     }
 
-    fn on_frame(&mut self, frame: &[u8], lifecycle: &Lifecycle) {
+    /// Pause the replica on the sealer's lost quorum once no boundary
+    /// arrived for the silence budget. A frame that is not a boundary
+    /// does not end the silence.
+    fn pause_on_silence(&self, now: Instant) {
+        if self.silence.expired(now).is_some() {
+            process().follow(Some(HaltRef::sealer(HaltCause::SealerNoQuorum)));
+        }
+    }
+
+    fn on_frame(&mut self, frame: &[u8]) {
         if self.on_rules_frame(frame) {
             return;
         }
@@ -246,16 +256,16 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
         if self.on_deadline_frame(frame) {
             return;
         }
-        if self.on_da_lag_frame(frame, lifecycle) {
+        if self.on_da_lag_frame(frame) {
             return;
         }
-        if self.on_record_lag_frame(frame, lifecycle) {
+        if self.on_record_lag_frame(frame) {
             return;
         }
         if self.on_origin_gap_frame(frame) {
             return;
         }
-        if self.on_status_frame(frame, lifecycle) {
+        if self.on_status_frame(frame) {
             return;
         }
         // Check the cheap kind byte first. Relayed records arrive at
@@ -264,7 +274,7 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
         if frame.first() != Some(&wire::EGRESS_KIND_BOUNDARY) {
             return;
         }
-        self.on_boundary_frame(frame, lifecycle);
+        self.on_boundary_frame(frame);
     }
 
     /// Handle the sealer's rules and the start of a session. Returns `true`
@@ -340,13 +350,12 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
             expected,
             "sealer contiguity reject received"
         );
-        if !self.rules.on_contiguity_reject(sender, nonce, expected) {
-            self.forward_answer(SealerAnswer::ContiguityReject {
-                sender,
-                nonce,
-                expected,
-            });
-        }
+        self.rules.on_contiguity_reject(sender, nonce, expected);
+        self.forward_answer(SealerAnswer::ContiguityReject {
+            sender,
+            nonce,
+            expected,
+        });
         true
     }
 
@@ -400,14 +409,53 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
                         nonce,
                         "sealer window-full reject received; republishing the ref"
                     );
-                    if !self.rules.on_window_full(sender, nonce) {
-                        self.forward_answer(SealerAnswer::WindowFull { sender, nonce });
-                    }
+                    self.forward_answer(SealerAnswer::WindowFull { sender, nonce });
                 }
                 true
             }
             _ => false,
         }
+    }
+
+    /// Handle one DA-lag reject frame. Returns `true` when `frame` was
+    /// one, so the caller does not also check it for a boundary.
+    ///
+    /// The sealer refused the ref because the chain is halted on a DA
+    /// lag. No republish can order it until the batcher posts again, so
+    /// it takes the terminal-refusal channel: the publish loop drops the
+    /// ledger entry and tells the client to resubmit later.
+    fn on_da_lag_frame(&mut self, frame: &[u8]) -> bool {
+        if frame.first() != Some(&wire::EGRESS_KIND_DA_LAG_REJECT) {
+            return false;
+        }
+        if let Ok(EgressItem::DaLagReject {
+            sender,
+            nonce,
+            sealed_head,
+            posted_head,
+            budget_blocks,
+        }) = EgressItem::decode(frame)
+        {
+            tracing::warn!(
+                partition = self.partition,
+                ?sender,
+                nonce,
+                sealed_head,
+                posted_head,
+                budget_blocks,
+                "sealer DA-lag reject received; dropping the ref"
+            );
+            self.forward_refusal(SealerRefusal {
+                sender,
+                nonce,
+                reason: kardamom_types::TxErrorReason::DaLag {
+                    sealed_head,
+                    posted_head,
+                    budget_blocks,
+                },
+            });
+        }
+        true
     }
 
     /// Handle one remote-origin-reject frame. Returns `true` when
@@ -442,6 +490,26 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
             seq_metrics::record_remote_origin_reject(origin_chain_id, reason);
         }
         true
+    }
+
+    /// Store the canonical count from one boundary frame, and re-arm the
+    /// silence timer. A 30 second freeze shows up here as one long
+    /// inter-arrival gap. The backlog drains instantly on resume, but
+    /// the gap between the last pre-freeze arrival and this one is real
+    /// wall-clock time. A gap that a snapshot notice announced is no lag.
+    fn on_boundary_frame(&mut self, frame: &[u8]) {
+        if let Ok(EgressItem::Boundary(b)) = EgressItem::decode(frame) {
+            let now = Instant::now();
+            if !self.silence.in_snapshot(now) {
+                self.flag(now);
+            }
+            self.last_boundary_at = Some(now);
+            self.silence.on_boundary(now);
+            process().follow(self.guard.clone());
+            kardamom_obs::ready::mark_now(seq_metrics::LAST_BOUNDARY_UNIX_SECONDS);
+            self.watermark.store(b.end_tx_idx.as_index());
+            self.confirm_origin(b.l1_origin);
+        }
     }
 
     /// Raise the sticky lag flag, and the starvation-proof metric, once
@@ -542,6 +610,7 @@ pub(crate) struct V2Wiring {
     pub(crate) accounts: crossbeam_channel::Receiver<kardamom_sequencer::v2::AccountEvent>,
     pub(crate) lookups: tokio::sync::mpsc::Sender<alloy_primitives::Address>,
     pub(crate) verdicts: Option<tokio::sync::mpsc::Sender<kardamom_sequencer::v2::VerdictOut>>,
+    pub(crate) refusals: Option<ResyncController>,
 }
 
 impl V2Wiring {
@@ -565,6 +634,9 @@ impl V2Wiring {
         admission.enable_fees(fees);
         admission.enable_positioned_refs(sealer_version);
         admission.enable_pause(process().subscribe());
+        if let Some(controller) = self.refusals {
+            admission.enable_sealer_refusals(controller);
+        }
         if let Some(verdicts) = self.verdicts {
             admission.enable_verdicts(verdicts);
         }
@@ -620,7 +692,8 @@ where
                 refs: &mut main_pub,
                 errors: &mut side,
             };
-            if let Some(v2) = v2 {
+            if let Some(mut v2) = v2 {
+                v2.refusals = resync;
                 return v2.run(
                     &cfg,
                     fees,

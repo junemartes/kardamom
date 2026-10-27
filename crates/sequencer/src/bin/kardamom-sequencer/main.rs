@@ -30,11 +30,12 @@ use kardamom_log::aeron_live::{
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::bin::wait_for_shutdown;
+use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::fees::FeeGate;
 use kardamom_sequencer::lookup::LookupRequester;
 use kardamom_sequencer::outbound::SideChannels;
 use kardamom_sequencer::sealer_rules::{SealerRules, SealerVersion};
-use kardamom_sequencer::{SequencerConfig, Shutdown};
+use kardamom_sequencer::sequencer::Shutdown;
 
 /// The Aeron subscriptions and publisher this sequencer needs, all opened
 /// on the same runtime `rt`.
@@ -231,8 +232,11 @@ impl ResyncWiring {
             answer_tx,
             deadline_tx,
             watermark,
-        } = kardamom_sequencer::resync::ResyncChannel::for_config(cfg)
-            .context("build resync channel")?;
+        } = kardamom_sequencer::resync::ResyncChannel::open(
+            cfg.resync.clone(),
+            cfg.partition_index,
+        )
+        .context("build resync channel")?;
 
         // The epoch lane reads the same egress: the boundaries confirm its
         // epochs, and an origin-gap reject makes it offer them again.
@@ -370,6 +374,7 @@ impl ResyncWiring {
                 accounts: accounts_rx,
                 lookups,
                 verdicts: None,
+                refusals: None,
             },
             task,
         )

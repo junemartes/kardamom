@@ -4,8 +4,6 @@
 //! struct that owns it.
 
 use kardamom_cluster_adapter::wire::{self, EgressItem};
-use kardamom_obs::halt::HaltCause;
-use kardamom_obs::lifecycle::Lifecycle;
 use kardamom_sequencer::epoch::OriginSignal;
 use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::outbound::DropPublisher;
@@ -48,9 +46,11 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
     /// one, so the caller does not also check it for a boundary.
     ///
     /// The sealer refused the ref because no executor recorded the chain
-    /// within the record-lag budget. V1 reports the refusal to the client.
-    /// V2 retains its run until the guard clears and then retries it.
-    pub(super) fn on_record_lag_frame(&mut self, frame: &[u8], lifecycle: &Lifecycle) -> bool {
+    /// within the record-lag budget. No republish can order it until an
+    /// executor records again, so it takes the terminal-refusal channel:
+    /// the publish loop drops the ledger entry and tells the client to
+    /// resubmit later.
+    pub(super) fn on_record_lag_frame(&mut self, frame: &[u8]) -> bool {
         if frame.first() != Some(&wire::EGRESS_KIND_RECORD_LAG_REJECT) {
             return false;
         }
@@ -62,7 +62,6 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
             budget,
         }) = EgressItem::decode(frame)
         {
-            self.pauses.on_guard(HaltCause::RecordLag, lifecycle);
             tracing::warn!(
                 partition = self.partition,
                 ?sender,
@@ -70,7 +69,7 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
                 sealed_index,
                 recorded_index,
                 budget,
-                "sealer record-lag reject received"
+                "sealer record-lag reject received; dropping the ref"
             );
             self.forward_refusal(SealerRefusal {
                 sender,
@@ -104,12 +103,11 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
         let _ = self.origins.send(signal);
     }
 
-    /// V2 uses account-queue backpressure to retain the control. V1 uses
-    /// its terminal-refusal channel and confirm-timeout fallback.
-    pub(super) fn forward_refusal(&self, refusal: SealerRefusal) {
-        if self.rules.on_refusal(&refusal) {
-            return;
-        }
+    /// Forward one terminal refusal without blocking the egress feed.
+    /// A full channel loses the answer and logs the loss; the filter's
+    /// loss window remains the fallback for unconfirmed transactions.
+    pub(super) fn forward_refusal(&mut self, refusal: SealerRefusal) {
+        self.pause_for_refusal(&refusal);
         match self.deadline_tx.try_send(refusal) {
             Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
             Err(crossbeam_channel::TrySendError::Full(_)) => {
