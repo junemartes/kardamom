@@ -109,6 +109,18 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
 }
 
 impl ClusterRefPublisher<LiveIngress> {
+    fn connection_options(v2_loop: bool) -> live::ConnectOptions {
+        let mut kinds = PUBLISHER_EGRESS_KINDS.to_vec();
+        if v2_loop {
+            kinds.extend([wire::EGRESS_KIND_RELAYED, wire::EGRESS_KIND_RELAYED_REF]);
+        }
+        live::ConnectOptions {
+            subscribe: v2_loop,
+            egress_kind_filter: Some(kinds),
+            ..Default::default()
+        }
+    }
+
     /// A publisher on the same session that offers nothing on a new
     /// session until it reports [`SequencerError::SessionChanged`] once.
     /// See [`LiveIngress::fenced`].
@@ -208,48 +220,22 @@ pub const PUBLISHER_EGRESS_KINDS: [u8; 11] = [
     wire::EGRESS_KIND_REF_REFUSED,
 ];
 
-/// Connect to the cluster, wrap ingress as a `TxOrderingRefPublisher`, and
-/// keep the egress receiver. The cluster also broadcasts every relayed
-/// record and boundary to publisher sessions; the caller uses this to
-/// drive the lag-resync watermark trigger from the boundary frames'
-/// `end_tx_idx` (the global canonical count).
+/// Connect the publish loop and its egress feed to one cluster session.
+/// V2 subscribes to canonical records and reads both full and retained
+/// references, so each sender can advance without an executor receipt.
+/// V1 reads boundaries and controls without the per-record subscription.
 ///
-/// Keep the returned `LiveCluster` guard alive while the publisher is in
-/// use.
+/// Keep the returned `LiveCluster` guard alive while the publisher is in use.
 ///
 /// # Errors
-///
 /// Returns an error if the cluster session fails to connect.
 pub fn cluster_ref_publisher_with_egress(
     rt: kardamom_log::aeron_live::AeronRuntime,
     cfg: LiveClusterConfig,
+    v2_loop: bool,
 ) -> Result<(LiveCluster, ClusterRefPublisher<LiveIngress>, LiveEgress), LiveError> {
-    // Only boundaries and reject frames pass through. Line-rate record
-    // frames are dropped at the session thread, instead of being allocated
-    // and channelled to a receiver that discards them (the session thread
-    // also services the publish offers). A contiguity reject is the sealer
-    // telling this publisher that a known sender's ref would seal a nonce
-    // gap; the watermark thread forwards it into the rewind path. A
-    // remote-origin reject is the sealer refusing a relayed kind-5 record;
-    // the watermark thread logs and counts it. The past-deadline, the
-    // window-full, the DA-lag, the record-lag, and the origin-gap rejects
-    // go to the offering session only, and the feed answers each one. The
-    // boundaries' L1 origin and the origin-gap rejects drive the epoch
-    // lane's confirm and its offer again.
-    let (cluster, ingress, egress) = live::connect_with(
-        rt,
-        cfg,
-        live::ConnectOptions {
-            egress_kind_filter: Some(PUBLISHER_EGRESS_KINDS.to_vec()),
-            // `subscribe` stays at its default (false): no SUBSCRIBE
-            // announcement. Boundaries broadcast to every session (see
-            // SealerClusteredService.offerBoundary), and contiguity
-            // rejects go directly to the offering session. So this feed
-            // needs no consumer registration, and stays out of the
-            // per-record fan-out.
-            ..Default::default()
-        },
-    )?;
+    let (cluster, ingress, egress) =
+        live::connect_with(rt, cfg, ClusterRefPublisher::connection_options(v2_loop))?;
     Ok((cluster, ClusterRefPublisher::new(ingress), egress))
 }
 
@@ -275,6 +261,29 @@ mod tests {
         }
         assert!(!PUBLISHER_EGRESS_KINDS.contains(&wire::EGRESS_KIND_RELAYED));
     }
+    #[test]
+    fn positioned_admission_receives_both_canonical_forms_and_all_controls() {
+        let options = ClusterRefPublisher::connection_options(true);
+        assert!(options.subscribe);
+        let kinds = options.egress_kind_filter.unwrap();
+        assert!(kinds.contains(&wire::EGRESS_KIND_RELAYED));
+        assert!(kinds.contains(&wire::EGRESS_KIND_RELAYED_REF));
+        assert!(
+            PUBLISHER_EGRESS_KINDS
+                .iter()
+                .all(|kind| kinds.contains(kind))
+        );
+        assert!(options.replay.is_none());
+    }
+
+    #[test]
+    fn legacy_admission_keeps_its_control_only_connection() {
+        let options = ClusterRefPublisher::connection_options(false);
+        assert!(!options.subscribe);
+        assert_eq!(options.egress_kind_filter.unwrap(), PUBLISHER_EGRESS_KINDS);
+        assert!(options.replay.is_none());
+    }
+
     use alloy_primitives::B256;
     use kardamom_cluster_adapter::gateway::fakes::FakeIngress;
     use kardamom_cluster_adapter::wire::{
