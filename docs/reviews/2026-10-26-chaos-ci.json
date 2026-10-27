@@ -788,6 +788,14 @@
         "Fresh runtime gates still require actual coverage, fresh Redis reads and exact account state. No deadline increase or forced rebuild masks recovery."
       ],
       "status": "Local correction, deployed runtime validation pending."
+    },
+    {
+      "id": "v2-legacy-startup-resync-gauge-and-lapse-proof",
+      "classification": "startup metric and harness assertion",
+      "issue": "https://github.com/junemartes/kardamom/issues/858",
+      "observed": "The staging job declares v2_loop=true. Construction enters the legacy startup resync and sets its gauge to1. V2 never runs that observer. The lapse oracle accepts the stale active gauge as evidence even without fresh publication by the affected replica.",
+      "change": "Choose startup metrics by the configured loop. Require fresh V2 publication progress after thaw, with full process-start precision and a new floor after restart. Keep legacy guard checks and all receipt/state proof.",
+      "status": "Local regressions and workspace style pass. Full runtime validation remains required."
     }
   ],
   "coverage": [
@@ -1494,6 +1502,27 @@
         "independent_red": "two strict measurement failures and canceled catalog-open error reproduce against451f9645"
       },
       "remaining": "Issue857 tracks the real source853 cache failure, the permitted shared-projection resume and the separate observed Redis timeouts. The new proof requires two actual coverage advances from every writer and exact projected account state within300seconds. Full runtime validation remains required."
+    },
+    "v2_startup_metric_followup": {
+      "issue": 858,
+      "base": "58465a1e8a480a8cabc434cb9be57f340fb9453f",
+      "status": "Reviewed local follow-up; final integration requires this change and fresh full runtime CI. The published58465a1e run remains diagnostic.",
+      "changes": [
+        "Select startup recovery once from the existing admission config. Receipt-floor mode keeps its startup resync trigger. Admission mode records the legacy gauge as inactive without entering that state machine. Keep the same bounded channels and terminal-refusal drain.",
+        "Move cold constructors into a sibling module to retain the file bound. No transaction-loop work, deployment default or wire/stored format changes.",
+        "The V2 lapse case requires two complete post-thaw observations from the affected replica with its publication counter increasing in one process generation. A changed process start establishes a new floor. Preserve fractional process-start clock bits. Missing or invalid metrics cannot count as zero. Keep V1 resync checks, pipeline progress, the exporter check and the full receipt/state recovery gates."
+      ],
+      "independent_red": "A behavior-preserving extraction of published58465a1e startup fails the V2 inactive-mode assertion while its V1 positive control passes. A precision control also rejects the first version of the new oracle, which truncates two starts within one second.",
+      "validation": {
+        "sequencer_library": 209,
+        "sequencer_binary": 15,
+        "manual_profile_ignored": 1,
+        "chaos_library": 248,
+        "chaos_ignored": 2,
+        "workspace_style": "pass; no warnings"
+      },
+      "performance_scope": "Only startup selection changes in the product; no extra polling or healthy transaction-path work is added. Deployed CPX32 latency and throughput comparisons remain required.",
+      "remaining": "Full runtime proof and actual staging resync-warning clearance are required before closing858. No green stability round is claimed."
     }
   },
   "followup_candidate": {

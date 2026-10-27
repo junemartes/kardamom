@@ -232,11 +232,8 @@ impl ResyncWiring {
             answer_tx,
             deadline_tx,
             watermark,
-        } = kardamom_sequencer::resync::ResyncChannel::open(
-            cfg.resync.clone(),
-            cfg.partition_index,
-        )
-        .context("build resync channel")?;
+        } = kardamom_sequencer::resync::ResyncChannel::for_config(cfg)
+            .context("build resync channel")?;
 
         // The epoch lane reads the same egress: the boundaries confirm its
         // epochs, and an origin-gap reject makes it offer them again.

@@ -17,6 +17,8 @@ const LAG_SUSPECTED: &str = "kardamom_sequencer_resync_lag_suspected_total";
 const RESYNC_ENTERED: &str = "kardamom_sequencer_resync_entered_total";
 const RESYNC_MODE: &str = "kardamom_sequencer_resync_mode";
 
+mod admission;
+
 /// Forensics for a sequencer-lapse failure: container identity, the
 /// resync metrics, and the replica's recent log lines.
 async fn seqa_debug(h: &Harness) {
@@ -82,12 +84,12 @@ impl LapseSample {
 }
 
 /// Pause lane 0's replica on node 0 for a window under shard-0 load,
-/// then resume. The twin keeps ordering; the lapsed replica must detect
-/// the lapse and engage resync, on the survivor path (counters move
-/// past their baselines or resync mode is active) or on the newborn
-/// path (the freeze got its Aeron client evicted, Nomad restarted it,
-/// and the fresh process entered startup resync). The default window is
-/// the evicting freeze of the deployed Aeron stall tolerance.
+/// then resume. The twin keeps ordering. The receipt-floor loop must
+/// engage its resync guard, or a new process must start with that guard.
+/// The admission loop must publish fresh work between two observations
+/// of the affected replica after thaw. Its legacy resync gauge proves
+/// no recovery. The default window crosses the deployed Aeron stall
+/// tolerance and can replace the process.
 pub(crate) async fn sequencer_lapse(h: &mut Harness) -> anyhow::Result<()> {
     let node = h.probes.sequencers[0].container.clone();
     let inner = h
@@ -126,6 +128,11 @@ pub(crate) async fn sequencer_lapse(h: &mut Harness) -> anyhow::Result<()> {
         .map_err(|e| crate::chaos_fail!("sequencer-lapse: SIGCONT failed: {e}"))?;
     crate::log("sequencer-lapse: resumed; twin must have covered (no stall)");
     h.assert_progress().await?;
+    if !h.knobs.sequencer_loop.can_strand_refs() {
+        h.assert_admission_lapse().await?;
+        h.assert_lapse_exporter().await?;
+        return Ok(());
+    }
     let good = Cell::new(0_u32);
     let last = Cell::new(LapseSample::default());
     let (hs, node_ref, started0_ref) = (&*h, node.as_str(), started0.as_deref());
@@ -172,14 +179,20 @@ pub(crate) async fn sequencer_lapse(h: &mut Harness) -> anyhow::Result<()> {
         "sequencer-lapse: lapsed replica engaged resync (baseline lag {l0} entered {r0}; now {})",
         s.show()
     ));
-    let target = h.probes.sequencer_lane0_target(0);
-    h.assert_replica_healthy(&target, Duration::from_secs(90))
-        .await?;
-    report_past_deadline_refusals(h).await?;
+    h.assert_lapse_exporter().await?;
     crate::log(
         "sequencer-lapse PASS: progress held, lag detected, resync engaged, replica healthy",
     );
     Ok(())
+}
+
+impl Harness {
+    async fn assert_lapse_exporter(&self) -> anyhow::Result<()> {
+        let target = self.probes.sequencer_lane0_target(0);
+        self.assert_replica_healthy(&target, Duration::from_secs(90))
+            .await?;
+        report_past_deadline_refusals(self).await
+    }
 }
 
 /// Report how many of a thawed replica's re-offers the sealer refused for
