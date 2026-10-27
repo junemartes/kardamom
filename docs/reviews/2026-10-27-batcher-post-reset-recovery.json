@@ -1,0 +1,32 @@
+{
+  "issue": 870,
+  "source_run": 40464669489,
+  "source_job": 122067016549,
+  "source_head": "72461d2f1741e2453c91bf2cbf440a67e8c52767",
+  "case": "control-plane-loss-recover",
+  "observed": {
+    "batcher_exit": "08:08:36 UTC, code1, no OOM",
+    "post_error": "structured PostExhausted after6 DA DNS lookup failures",
+    "ordering_error": "SourceRestarted at delivery index28854/block312",
+    "client_probes": "all3 timed transfers receive successful receipts",
+    "failed_oracle": "exact running process identity changes on aux-0"
+  },
+  "change": "The ordering-end classifier retains the existing automatic L1Unreachable halt only when its typed SourceRestarted coincides with a structured exhausted post. The existing spool/cursor reconciliation path performs the next run.",
+  "unchanged_safety": "Replay refusal retains its range recovery. Fatal ordering divergence, local write failure, behind-cursor and unjoinable references still fail. Untyped display text never establishes a recoverable post. Retry budgets, backoff, Nomad settings and strict runtime oracles are unchanged.",
+  "local_validation": {
+    "batcher_library": "53 pass on final source",
+    "broader_batcher_targets": "all executed test groups pass before the borrow-only style correction; raw log retained",
+    "classification_controls": "6 pass",
+    "negative_control": "Removing the typed SourceRestarted/exhausted-post recovery restores the published classifier behavior and fails the new regression. Five safety/context controls stay green.",
+    "style": "pass with no warnings",
+    "invalid_attempt": "The first negative-control build lacks generated contract artifacts and is excluded. /tmp/kardamom-870-invalid-missing-contracts.log is retained. A corrected run supplies the same contract artifacts as positive validation."
+  },
+  "logs": [
+    "/tmp/kardamom-870-batcher.log",
+    "/tmp/kardamom-870-batcher-final.log",
+    "/tmp/kardamom-870-style.log",
+    "/tmp/kardamom-870-negative-control.log",
+    "/tmp/kardamom-870-positive-control.log"
+  ],
+  "runtime_proof": "pending; no final-state or validator qualification is inferred from the3 successful probes"
+}

@@ -273,6 +273,24 @@ impl ReaderEnd {
             .is::<PostExhausted>()
             .then(|| Self::Halted(Halt::new(HaltCause::L1Unreachable, format!("{error:#}"))))
     }
+
+    fn ordering_failure(error: &ExecutorError, feed_error: &anyhow::Error) -> Self {
+        if let ExecutorError::ClusterReplayUnavailable { oldest_block, .. } = error {
+            return Self::ReplayRefused {
+                oldest_block: *oldest_block,
+            };
+        }
+        // A source reset and an exhausted post both restart from the
+        // persisted cursor. The post keeps its automatic halt and backoff.
+        if matches!(error, ExecutorError::SourceRestarted { .. })
+            && let Some(halted) = Self::exhausted_post(feed_error)
+        {
+            return halted;
+        }
+        Self::Failed(anyhow::anyhow!(
+            "tx_ordering reader failed: {error:#} (feed loop: {feed_error:#})"
+        ))
+    }
 }
 
 impl ReaderHandles {
@@ -287,12 +305,7 @@ impl ReaderHandles {
         if self.ordering_handle.is_finished()
             && let Ok(Err(re)) = self.ordering_handle.join()
         {
-            if let ExecutorError::ClusterReplayUnavailable { oldest_block, .. } = re {
-                return ReaderEnd::ReplayRefused { oldest_block };
-            }
-            return ReaderEnd::Failed(anyhow::anyhow!(
-                "tx_ordering reader failed: {re:#} (feed loop: {feed_err:#})"
-            ));
+            return ReaderEnd::ordering_failure(&re, &feed_err);
         }
         if let Some(halted) = ReaderEnd::exhausted_post(&feed_err) {
             return halted;
