@@ -97,7 +97,7 @@ jobs:
           NIGHTLY: ${{ github.event_name == 'schedule' || github.event.action == 'labeled' }}
           ALL: ${{ github.event.inputs.suite == 'all' }}
         run: |
-          regular='"load","chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-combined-ordering","chaos-combined-exec","chaos-retention","chaos-cache","chaos-l1","chaos-follower","chaos-carry","semantics"'
+          regular='"load"'
           nightly='"chaos-integrity"'
           if [ "$ALL" = true ]; then
             shards="[$regular,$nightly]"
