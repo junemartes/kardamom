@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
-use super::rebuilds::{MirrorRebuilds, RebuildPhase};
+use super::rebuilds::{ForcedRebuild, MirrorRebuilds, RebuildPhase};
 use super::{
     CacheRecovery, MIRROR_ALLOCS, MIRROR_HEAD_KEYS, MIRROR_WRITE_RETRIES, aux, freeze_and_flush,
     live_primary, redis_cli,
@@ -95,16 +95,25 @@ impl InterruptedRebuild<'_> {
             .context("mirror scan interruption exceeds nine minutes")
             .and_then(std::convert::identity);
         let unpaused = fault.command("CLIENT UNPAUSE").await;
+        let rebuilt = match (&verdict, &unpaused) {
+            (Ok(()), Ok(())) => fault.recover(&coverage).await,
+            _ => Ok(()),
+        };
         let restored = fault.saved.restore().await;
-        let report = fault.report(&verdict, &unpaused, &restored);
-        for error in [unpaused.as_ref().err(), restored.as_ref().err()]
-            .into_iter()
-            .flatten()
+        let report = fault.report(&verdict, &unpaused, &rebuilt, &restored);
+        for error in [
+            unpaused.as_ref().err(),
+            rebuilt.as_ref().err(),
+            restored.as_ref().err(),
+        ]
+        .into_iter()
+        .flatten()
         {
             crate::log(format!("{CTX}: fault cleanup fails: {error:#}"));
         }
         verdict?;
         unpaused?;
+        rebuilt?;
         restored?;
         report?;
         fault
@@ -112,9 +121,14 @@ impl InterruptedRebuild<'_> {
             .assert_count(TASK, MIRROR_ALLOCS, fault.h.knobs.restart_slo)
             .await?;
         super::wait_mirror_advances(fault.h, CTX).await?;
-        coverage.await_restored(fault.h, CTX).await?;
         super::wait_readers_recovered(fault.h, CTX).await?;
         fault.h.assert_progress().await
+    }
+
+    async fn recover(&self, coverage: &CacheRecovery) -> anyhow::Result<()> {
+        let forced = ForcedRebuild::new(self.saved.definition())?;
+        self.saved.register(forced.definition()).await?;
+        coverage.await_restored(self.h, CTX).await
     }
 
     async fn exercise(&mut self) -> anyhow::Result<()> {
@@ -250,6 +264,7 @@ impl InterruptedRebuild<'_> {
         &self,
         verdict: &anyhow::Result<()>,
         unpaused: &anyhow::Result<()>,
+        rebuilt: &anyhow::Result<()>,
         restored: &anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let report = serde_json::json!({
@@ -264,6 +279,7 @@ impl InterruptedRebuild<'_> {
             "traffic_receipt_hash": self.traffic_hash,
             "failure": verdict.as_ref().err().map(|error| format!("{error:#}")),
             "unpause_failure": unpaused.as_ref().err().map(|error| format!("{error:#}")),
+            "rebuild_failure": rebuilt.as_ref().err().map(|error| format!("{error:#}")),
             "restore_failure": restored.as_ref().err().map(|error| format!("{error:#}")),
         });
         std::fs::write(

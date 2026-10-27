@@ -1,77 +1,111 @@
-//! Terminal sealer answers must settle each transaction that leaves admission.
+//! Refusals preserve transaction identity and never silently discard a suffix.
 
+use alloy_primitives::Address;
 use kardamom_types::TxErrorReason;
 
-use super::{AdmissionLoop, RefPayload, reject};
-use crate::admission::Candidate;
-use crate::outbound::SideChannelPublisher;
-use crate::resync::{ResyncController, SealerRefusal};
+use super::{AdmissionLoop, RefPayload};
+use crate::admission::{Candidate, Verdict};
+use crate::resync::SealerRefusal;
 
 impl AdmissionLoop {
-    /// Consume the terminal answers of the existing egress feed.
-    pub fn enable_sealer_refusals(&mut self, controller: ResyncController) {
-        self.sealer_refusals = Some(controller);
-    }
-
-    pub(super) fn apply_sealer_refusals<R: SideChannelPublisher>(&mut self, side: &mut R) -> bool {
-        let answers = self
-            .sealer_refusals
-            .as_mut()
-            .map(ResyncController::drain_deadline_rejects)
-            .unwrap_or_default();
-        let applied = !answers.is_empty();
-        for answer in &answers {
-            self.refused(side, answer);
-        }
-        applied
-    }
-
-    fn refused<R: SideChannelPublisher>(&mut self, side: &mut R, answer: &SealerRefusal) {
-        let Some(candidate) = self.admission.unconfirmed_at(answer.sender, answer.nonce) else {
-            return;
-        };
-        if let TxErrorReason::PastDeadline {
-            max_inclusion_block,
-            ..
-        } = &answer.reason
-            && candidate
-                .ref_offer(&self.sealer_version)
-                .guard
-                .max_inclusion_block
-                != *max_inclusion_block
-        {
-            return;
-        }
-        let run: Vec<_> = self
+    #[cold]
+    pub(super) fn on_reference_refused(
+        &mut self,
+        refused: kardamom_cluster_adapter::wire::RefRefused,
+    ) -> bool {
+        let eligible = self
             .admission
-            .unconfirmed_for(answer.sender)
-            .cloned()
-            .collect();
-        self.outbox
-            .retain(|offer| offer.guard.sender != answer.sender);
-        self.admission
-            .on_refused(answer.sender, answer.nonce, &mut self.verdicts);
-        for candidate in &run {
-            answer.report(side, candidate);
+            .unconfirmed_at(refused.sender, refused.nonce)
+            .is_some_and(|candidate| {
+                candidate.tx_hash == refused.canonical_id && candidate.payload.envelope.is_some()
+            });
+        if eligible {
+            return true;
         }
-    }
-}
-
-impl SealerRefusal {
-    fn report<R: SideChannelPublisher>(&self, side: &mut R, candidate: &Candidate<RefPayload>) {
-        let reason = match &self.reason {
-            TxErrorReason::DaLag { .. } | TxErrorReason::RecordLag { .. } => self.reason.clone(),
-            reason if candidate.nonce == self.nonce => reason.clone(),
-            _ => TxErrorReason::Expired {
-                expected_nonce: self.nonce,
-            },
+        let Some(candidate) = self.remove_refused(refused.sender, refused.nonce, |candidate| {
+            candidate.tx_hash == refused.canonical_id && candidate.payload.envelope.is_none()
+        }) else {
+            return false;
         };
-        reject(
-            side,
-            candidate.tx_hash,
-            candidate.sender,
-            candidate.nonce,
-            reason,
-        );
+        self.verdicts.push(Verdict::DropReference(candidate));
+        true
+    }
+
+    pub(super) fn on_sealer_refusal(&mut self, refusal: SealerRefusal) -> bool {
+        if matches!(
+            refusal.reason,
+            TxErrorReason::DaLag { .. } | TxErrorReason::RecordLag { .. }
+        ) {
+            return self
+                .admission
+                .unconfirmed_at(refusal.sender, refusal.nonce)
+                .is_some();
+        }
+        let named = |c: &Candidate<RefPayload>| match &refusal.reason {
+            TxErrorReason::PastDeadline {
+                max_inclusion_block,
+                ..
+            } => c.payload.max_inclusion_block == *max_inclusion_block,
+            _ => true,
+        };
+        let Some(candidate) = self.remove_refused(refusal.sender, refusal.nonce, named) else {
+            return false;
+        };
+        self.verdicts
+            .push(Verdict::SealerRefused(candidate, refusal.reason));
+        true
+    }
+
+    pub(super) fn remove_refused(
+        &mut self,
+        sender: Address,
+        nonce: u64,
+        named: impl Fn(&Candidate<RefPayload>) -> bool,
+    ) -> Option<Candidate<RefPayload>> {
+        let run = self.admission.take_refused(sender, nonce, named)?;
+        let candidate = if run.was_parked {
+            self.depth.gave(run.candidate.payload.vslot);
+            run.candidate
+        } else {
+            self.mark_answered(run.candidate)
+        };
+        run.suffix
+            .into_iter()
+            .for_each(|candidate| self.repark(candidate));
+        Some(candidate)
+    }
+
+    fn mark_answered(&self, mut candidate: Candidate<RefPayload>) -> Candidate<RefPayload> {
+        let answer_waits = self.verdicts.iter().any(|verdict| matches!(verdict, Verdict::Forward(c, _) if c.tx_hash == candidate.tx_hash && c.image == candidate.image));
+        candidate.answered |= !answer_waits;
+        candidate
+    }
+
+    fn repark(&mut self, candidate: Candidate<RefPayload>) {
+        let candidate = self.mark_answered(candidate);
+        self.depth.took(candidate.payload.vslot);
+        self.admission.offer(candidate, &mut self.verdicts);
+    }
+
+    /// Coalesce a batch of notices into one replay. Pending forwards that
+    /// a terminal refusal removed cannot escape from the verdict queue.
+    #[cold]
+    pub(super) fn replay_after_refusals(&mut self) {
+        let admission = &self.admission;
+        let depth = &mut self.depth;
+        self.verdicts.retain(|verdict| {
+            let Verdict::Forward(candidate, _) = verdict else {
+                return true;
+            };
+            let held = admission
+                .unconfirmed_at(candidate.sender, candidate.nonce)
+                .is_some_and(|c| c.tx_hash == candidate.tx_hash && c.image == candidate.image);
+            if !held {
+                depth.gave(candidate.payload.vslot);
+            }
+            held
+        });
+        self.admission.resume_loss_window();
+        self.offer_again_unconfirmed("sealer refusal");
     }
 }

@@ -20,8 +20,8 @@ use alloy_primitives::U256;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use kardamom_obs::lifecycle::process;
 use kardamom_sequencer::admission::{AccountState, AdmissionConfig};
-use kardamom_sequencer::resync::{ResyncChannel, ResyncConfig, SealerRefusal};
-use kardamom_sequencer::sealer_rules::SealerVersion;
+use kardamom_sequencer::outbound::fakes::InMemorySidePublisher;
+use kardamom_sequencer::sealer_rules::{SealerRules, SealerVersion};
 use kardamom_sequencer::testkit::{Rig, one_partition_cfg, signed_envelope, signer};
 use kardamom_sequencer::v2::{AccountEvent, AdmissionLoop, V2Config};
 use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
@@ -95,7 +95,7 @@ fn rows(block: u64, nonce: u64) -> AccountEvent {
 /// and the sender side of its account events.
 struct Inputs {
     _accounts: crossbeam_channel::Sender<AccountEvent>,
-    _refusals: Option<crossbeam_channel::Sender<SealerRefusal>>,
+    _refusals: Option<SealerRules<InMemorySidePublisher>>,
 }
 
 fn seeded_loop() -> (AdmissionLoop, Inputs) {
@@ -109,9 +109,14 @@ fn seeded_loop() -> (AdmissionLoop, Inputs) {
         admission.enable_positioned_refs(SealerVersion::starting_at(5));
     }
     let refusals = if std::env::var_os("KARDAMOM_V2_BENCH_TERMINAL_REFUSALS").is_some() {
-        let channel = ResyncChannel::open(ResyncConfig::default(), 0).unwrap();
-        admission.enable_sealer_refusals(channel.controller);
-        Some(channel.deadline_tx)
+        Some(
+            SealerRules::new(
+                0,
+                SealerVersion::default(),
+                InMemorySidePublisher::default(),
+            )
+            .telling(accounts_tx.clone()),
+        )
     } else {
         None
     };
