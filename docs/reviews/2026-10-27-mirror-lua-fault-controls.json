@@ -1,0 +1,709 @@
+{
+  "issue": 872,
+  "change": "Deny only EVAL and EVALSHA on both pinned Redis data processes. Validate that both commands are initially allowed; restore both afterward. A per-fault token fences the600-second cleanup lease. Never pause Sentinel PUBLISH traffic.",
+  "controls": {
+    "old_write_pause": {
+      "observed_at": "2026-10-27T08:28:03.923104+00:00",
+      "image": "sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541",
+      "network": "isolated --network none, loopback only",
+      "before": {
+        "elapsed_seconds": 1.0202638804912567e-06,
+        "sentinels": {
+          "26379": {
+            "port": "6379",
+            "flags": "master",
+            "last-ok-ping-reply": "545",
+            "role-reported": "master",
+            "config-epoch": "0",
+            "num-slaves": "1",
+            "num-other-sentinels": "2"
+          },
+          "26380": {
+            "port": "6379",
+            "flags": "master",
+            "last-ok-ping-reply": "380",
+            "role-reported": "master",
+            "config-epoch": "0",
+            "num-slaves": "1",
+            "num-other-sentinels": "2"
+          },
+          "26381": {
+            "port": "6379",
+            "flags": "master",
+            "last-ok-ping-reply": "351",
+            "role-reported": "master",
+            "config-epoch": "0",
+            "num-slaves": "1",
+            "num-other-sentinels": "2"
+          }
+        },
+        "data": {
+          "6379": {
+            "ping": "PONG",
+            "role": "master",
+            "head_exists": "0"
+          },
+          "6380": {
+            "ping": "PONG",
+            "role": "slave",
+            "head_exists": "0"
+          }
+        }
+      },
+      "during": [
+        {
+          "elapsed_seconds": 0.6513549662195146,
+          "sentinels": {
+            "26379": {
+              "port": "6379",
+              "flags": "master",
+              "last-ok-ping-reply": "168",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            },
+            "26380": {
+              "port": "6379",
+              "flags": "master",
+              "last-ok-ping-reply": "10",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            },
+            "26381": {
+              "port": "6379",
+              "flags": "master",
+              "last-ok-ping-reply": "994",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            }
+          },
+          "data": {
+            "6379": {
+              "ping": "PONG",
+              "role": "master",
+              "head_exists": "0"
+            },
+            "6380": {
+              "ping": "PONG",
+              "role": "slave",
+              "head_exists": "0"
+            }
+          }
+        },
+        {
+          "elapsed_seconds": 6.00007983809337,
+          "sentinels": {
+            "26379": {
+              "port": "6379",
+              "flags": "master",
+              "last-ok-ping-reply": "5525",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            },
+            "26380": {
+              "port": "6379",
+              "flags": "master",
+              "last-ok-ping-reply": "5385",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            },
+            "26381": {
+              "port": "6379",
+              "flags": "master",
+              "last-ok-ping-reply": "5317",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            }
+          },
+          "data": {
+            "6379": {
+              "ping": "PONG",
+              "role": "master",
+              "head_exists": "0"
+            },
+            "6380": {
+              "ping": "PONG",
+              "role": "slave",
+              "head_exists": "0"
+            }
+          }
+        },
+        {
+          "elapsed_seconds": 12.000075904186815,
+          "sentinels": {
+            "26379": {
+              "port": "6379",
+              "flags": "s_down,o_down,master",
+              "last-ok-ping-reply": "11512",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            },
+            "26380": {
+              "port": "6379",
+              "flags": "s_down,o_down,master",
+              "last-ok-ping-reply": "11342",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            },
+            "26381": {
+              "port": "6379",
+              "flags": "s_down,o_down,master",
+              "last-ok-ping-reply": "11357",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            }
+          },
+          "data": {
+            "6379": {
+              "ping": "PONG",
+              "role": "master",
+              "head_exists": "0"
+            },
+            "6380": {
+              "ping": "PONG",
+              "role": "slave",
+              "head_exists": "0"
+            }
+          }
+        },
+        {
+          "elapsed_seconds": 20.000076559372246,
+          "sentinels": {
+            "26379": {
+              "port": "6379",
+              "flags": "s_down,o_down,master",
+              "last-ok-ping-reply": "7416",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            },
+            "26380": {
+              "port": "6379",
+              "flags": "s_down,o_down,master",
+              "last-ok-ping-reply": "7416",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            },
+            "26381": {
+              "port": "6379",
+              "flags": "s_down,o_down,master",
+              "last-ok-ping-reply": "7328",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            }
+          },
+          "data": {
+            "6379": {
+              "ping": "PONG",
+              "role": "master",
+              "head_exists": "0"
+            },
+            "6380": {
+              "ping": "PONG",
+              "role": "slave",
+              "head_exists": "0"
+            }
+          }
+        }
+      ],
+      "after_unpause": {
+        "elapsed_seconds": 20.635073331184685,
+        "sentinels": {
+          "26379": {
+            "port": "6379",
+            "flags": "master",
+            "last-ok-ping-reply": "120",
+            "role-reported": "master",
+            "config-epoch": "0",
+            "num-slaves": "1",
+            "num-other-sentinels": "2"
+          },
+          "26380": {
+            "port": "6379",
+            "flags": "master",
+            "last-ok-ping-reply": "176",
+            "role-reported": "master",
+            "config-epoch": "0",
+            "num-slaves": "1",
+            "num-other-sentinels": "2"
+          },
+          "26381": {
+            "port": "6379",
+            "flags": "master",
+            "last-ok-ping-reply": "234",
+            "role-reported": "master",
+            "config-epoch": "0",
+            "num-slaves": "1",
+            "num-other-sentinels": "2"
+          }
+        },
+        "data": {
+          "6379": {
+            "ping": "PONG",
+            "role": "master",
+            "head_exists": "0"
+          },
+          "6380": {
+            "ping": "PONG",
+            "role": "slave",
+            "head_exists": "0"
+          }
+        }
+      },
+      "write_after_unpause": "OK",
+      "scope": "Real Redis7.4.11 with one primary, one synchronized replica and3 Sentinels using the deployed5-second failure detector and quorum2. This diagnoses Sentinel discovery while both data nodes pause writes; it does not certify the complete Nomad scan/kill/rebuild case."
+    },
+    "lua_denial_and_promotion": {
+      "observed_at": "2026-10-27T08:43:24.036580+00:00",
+      "image": "sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541",
+      "network": "isolated --network none, loopback only",
+      "fault": "ACL SETUSER default -eval -evalsha; restored +eval +evalsha",
+      "before": {
+        "elapsed_seconds": 1.4398247003555298e-06,
+        "sentinels": {
+          "26379": {
+            "port": "6379",
+            "flags": "master",
+            "last-ok-ping-reply": "546",
+            "role-reported": "master",
+            "config-epoch": "0",
+            "num-slaves": "1",
+            "num-other-sentinels": "2"
+          },
+          "26380": {
+            "port": "6379",
+            "flags": "master",
+            "last-ok-ping-reply": "480",
+            "role-reported": "master",
+            "config-epoch": "0",
+            "num-slaves": "1",
+            "num-other-sentinels": "2"
+          },
+          "26381": {
+            "port": "6379",
+            "flags": "master",
+            "last-ok-ping-reply": "357",
+            "role-reported": "master",
+            "config-epoch": "0",
+            "num-slaves": "1",
+            "num-other-sentinels": "2"
+          }
+        },
+        "data": {
+          "6379": {
+            "ping": "PONG",
+            "role": "master",
+            "head_exists": "0"
+          },
+          "6380": {
+            "ping": "PONG",
+            "role": "slave",
+            "head_exists": "0"
+          }
+        }
+      },
+      "during": [
+        {
+          "elapsed_seconds": 0.6460480587556958,
+          "sentinels": {
+            "26379": {
+              "port": "6379",
+              "flags": "master",
+              "last-ok-ping-reply": "171",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            },
+            "26380": {
+              "port": "6379",
+              "flags": "master",
+              "last-ok-ping-reply": "94",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            },
+            "26381": {
+              "port": "6379",
+              "flags": "master",
+              "last-ok-ping-reply": "1011",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            }
+          },
+          "data": {
+            "6379": {
+              "ping": "PONG",
+              "role": "master",
+              "head_exists": "0"
+            },
+            "6380": {
+              "ping": "PONG",
+              "role": "slave",
+              "head_exists": "0"
+            }
+          }
+        },
+        {
+          "elapsed_seconds": 6.000079229939729,
+          "sentinels": {
+            "26379": {
+              "port": "6379",
+              "flags": "master",
+              "last-ok-ping-reply": "279",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            },
+            "26380": {
+              "port": "6379",
+              "flags": "master",
+              "last-ok-ping-reply": "259",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            },
+            "26381": {
+              "port": "6379",
+              "flags": "master",
+              "last-ok-ping-reply": "227",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            }
+          },
+          "data": {
+            "6379": {
+              "ping": "PONG",
+              "role": "master",
+              "head_exists": "0"
+            },
+            "6380": {
+              "ping": "PONG",
+              "role": "slave",
+              "head_exists": "0"
+            }
+          }
+        },
+        {
+          "elapsed_seconds": 12.000073140952736,
+          "sentinels": {
+            "26379": {
+              "port": "6379",
+              "flags": "master",
+              "last-ok-ping-reply": "40",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            },
+            "26380": {
+              "port": "6379",
+              "flags": "master",
+              "last-ok-ping-reply": "1022",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            },
+            "26381": {
+              "port": "6379",
+              "flags": "master",
+              "last-ok-ping-reply": "965",
+              "role-reported": "master",
+              "config-epoch": "0",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            }
+          },
+          "data": {
+            "6379": {
+              "ping": "PONG",
+              "role": "master",
+              "head_exists": "0"
+            },
+            "6380": {
+              "ping": "PONG",
+              "role": "slave",
+              "head_exists": "0"
+            }
+          }
+        },
+        {
+          "elapsed_seconds": 20.000079169869423,
+          "sentinels": {
+            "26379": {
+              "port": "6380",
+              "flags": "master",
+              "last-ok-ping-reply": "774",
+              "role-reported": "master",
+              "config-epoch": "1",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            },
+            "26380": {
+              "port": "6380",
+              "flags": "master",
+              "last-ok-ping-reply": "713",
+              "role-reported": "master",
+              "config-epoch": "1",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            },
+            "26381": {
+              "port": "6380",
+              "flags": "master",
+              "last-ok-ping-reply": "962",
+              "role-reported": "master",
+              "config-epoch": "1",
+              "num-slaves": "1",
+              "num-other-sentinels": "2"
+            }
+          },
+          "data": {
+            "6379": {
+              "ping": "PONG",
+              "role": "master",
+              "head_exists": "0"
+            },
+            "6380": {
+              "ping": "PONG",
+              "role": "master",
+              "head_exists": "0"
+            }
+          }
+        }
+      ],
+      "after_unpause": {
+        "elapsed_seconds": 20.863804989960045,
+        "sentinels": {
+          "26379": {
+            "port": "6380",
+            "flags": "master",
+            "last-ok-ping-reply": "632",
+            "role-reported": "master",
+            "config-epoch": "1",
+            "num-slaves": "1",
+            "num-other-sentinels": "2"
+          },
+          "26380": {
+            "port": "6380",
+            "flags": "master",
+            "last-ok-ping-reply": "568",
+            "role-reported": "master",
+            "config-epoch": "1",
+            "num-slaves": "1",
+            "num-other-sentinels": "2"
+          },
+          "26381": {
+            "port": "6380",
+            "flags": "master",
+            "last-ok-ping-reply": "826",
+            "role-reported": "master",
+            "config-epoch": "1",
+            "num-slaves": "1",
+            "num-other-sentinels": "2"
+          }
+        },
+        "data": {
+          "6379": {
+            "ping": "PONG",
+            "role": "master",
+            "head_exists": "0"
+          },
+          "6380": {
+            "ping": "PONG",
+            "role": "master",
+            "head_exists": "0"
+          }
+        }
+      },
+      "recovered_topology_and_state": {
+        "elapsed_seconds": 28.804260125849396,
+        "sentinels": {
+          "26379": {
+            "port": "6380",
+            "flags": "master",
+            "last-ok-ping-reply": "345",
+            "role-reported": "master",
+            "config-epoch": "1",
+            "num-slaves": "1",
+            "num-other-sentinels": "2"
+          },
+          "26380": {
+            "port": "6380",
+            "flags": "master",
+            "last-ok-ping-reply": "202",
+            "role-reported": "master",
+            "config-epoch": "1",
+            "num-slaves": "1",
+            "num-other-sentinels": "2"
+          },
+          "26381": {
+            "port": "6380",
+            "flags": "master",
+            "last-ok-ping-reply": "497",
+            "role-reported": "master",
+            "config-epoch": "1",
+            "num-slaves": "1",
+            "num-other-sentinels": "2"
+          }
+        },
+        "data": {
+          "6379": {
+            "ping": "PONG",
+            "role": "slave",
+            "head_exists": "1"
+          },
+          "6380": {
+            "ping": "PONG",
+            "role": "master",
+            "head_exists": "1"
+          }
+        }
+      },
+      "final_head_values": {
+        "6379": "42",
+        "6380": "42"
+      },
+      "write_after_unpause": "OK",
+      "scope": "Real Redis7.4.11 with one primary, one synchronized replica and3 Sentinels using the deployed5-second failure detector and quorum2. Denying EVAL/EVALSHA on both data nodes keeps Sentinel discovery healthy for20s while both EVAL and EVALSHA fail before and after an actual Sentinel promotion. Cleanup restores a successful Lua write and exact head value42; it does not certify the complete Nomad scan/kill/rebuild case."
+    },
+    "cleanup_lease": {
+      "observed_at": "2026-10-27T08:39:29.029449+00:00",
+      "image": "sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541",
+      "events": [
+        {
+          "phase": "baseline both Lua entry points",
+          "expect_denied": false,
+          "observations": [
+            {
+              "data_node": "kardamom-lua-lease-d9a2399c-primary",
+              "eval": "1",
+              "evalsha": "1",
+              "ping": "PONG"
+            },
+            {
+              "data_node": "kardamom-lua-lease-38a075c7-replica",
+              "eval": "1",
+              "evalsha": "1",
+              "ping": "PONG"
+            }
+          ]
+        },
+        {
+          "phase": "armed both nodes",
+          "expect_denied": true,
+          "observations": [
+            {
+              "data_node": "kardamom-lua-lease-d9a2399c-primary",
+              "eval": "NOPERM User default has no permissions to run the 'eval' command",
+              "evalsha": "NOPERM User default has no permissions to run the 'evalsha' command",
+              "ping": "PONG"
+            },
+            {
+              "data_node": "kardamom-lua-lease-38a075c7-replica",
+              "eval": "NOPERM User default has no permissions to run the 'eval' command",
+              "evalsha": "NOPERM User default has no permissions to run the 'evalsha' command",
+              "ping": "PONG"
+            }
+          ]
+        },
+        {
+          "phase": "automatic restoration after lease expiry",
+          "expect_denied": false,
+          "observations": [
+            {
+              "data_node": "kardamom-lua-lease-d9a2399c-primary",
+              "eval": "1",
+              "evalsha": "1",
+              "ping": "PONG"
+            },
+            {
+              "data_node": "kardamom-lua-lease-38a075c7-replica",
+              "eval": "1",
+              "evalsha": "1",
+              "ping": "PONG"
+            }
+          ]
+        },
+        {
+          "phase": "retired old lease cannot clear a later fault",
+          "expect_denied": true,
+          "observations": [
+            {
+              "data_node": "kardamom-lua-lease-d9a2399c-primary",
+              "eval": "NOPERM User default has no permissions to run the 'eval' command",
+              "evalsha": "NOPERM User default has no permissions to run the 'evalsha' command",
+              "ping": "PONG"
+            },
+            {
+              "data_node": "kardamom-lua-lease-38a075c7-replica",
+              "eval": "NOPERM User default has no permissions to run the 'eval' command",
+              "evalsha": "NOPERM User default has no permissions to run the 'evalsha' command",
+              "ping": "PONG"
+            }
+          ]
+        },
+        {
+          "phase": "explicit cleanup restores both Lua entry points",
+          "expect_denied": false,
+          "observations": [
+            {
+              "data_node": "kardamom-lua-lease-d9a2399c-primary",
+              "eval": "1",
+              "evalsha": "1",
+              "ping": "PONG"
+            },
+            {
+              "data_node": "kardamom-lua-lease-38a075c7-replica",
+              "eval": "1",
+              "evalsha": "1",
+              "ping": "PONG"
+            }
+          ]
+        }
+      ],
+      "lease_protocol": "Same generated shell sequence as DataNode::access_script; local control shortens the600-second expiry to3 seconds. Each Redis process is isolated with --network none. The prior-lease token is removed before explicit cleanup, so its later timer cannot clear a newly armed fault.",
+      "scope": "Real Redis Lua ACL and cleanup lease protocol; no complete Nomad scan/kill/rebuild or staging claim."
+    }
+  },
+  "local_validation": {
+    "chaos_library": "268 passed, two existing manual profiles ignored",
+    "style": "pass with no warnings"
+  },
+  "scope": "Real Redis7.4.11 protocol controls use isolated local containers. These do not certify a complete Nomad fault case, staging release or performance. Full exact-head runtime validation remains required.",
+  "control_programs": {
+    "/tmp/kardamom-sentinel-pause-controls.py": "55848acac6eafdbf2b9b9ab28d58641d0561f35f43f8ebbb86e6da389f492ae4",
+    "/tmp/kardamom-sentinel-lua-promotion-final-controls.py": "a5234af7a43e71503282a16638f28d172c1cf3988fa3dd577121309df670ac0c",
+    "/tmp/kardamom-lua-lease-controls.py": "dad867d9029d94c687507b28dcb3106f3fab57febfd9dadc24cb9ef6b6377985"
+  }
+}

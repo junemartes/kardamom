@@ -1,7 +1,8 @@
-//! A write pause covers both data processes, including a promoted replica.
+//! A Lua write fault covers both data processes and leaves Sentinel traffic live.
 
 use std::future::Future;
 use std::net::Ipv4Addr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde::Serialize;
@@ -10,6 +11,15 @@ use super::{CTX, MIRROR_HEAD_KEYS};
 use crate::harness::Harness;
 use crate::nomad::Alloc;
 use crate::poll::{self, Budget};
+
+/// The fault expires after the case's nine-minute deadline, even if its process dies.
+pub(super) const LEASE_SECONDS: u64 = 600;
+
+#[derive(Clone, Copy)]
+enum ScriptAccess {
+    Blocked,
+    Allowed,
+}
 
 #[derive(Serialize)]
 struct DataNode {
@@ -28,13 +38,37 @@ impl DataNode {
             .running_process(&node.container, "redis-")
             .await
             .with_context(|| format!("{CTX}: no Redis process on {}", node.name))?;
-        Ok(Self {
+        let target = Self {
             allocation: allocation.id.clone(),
             node: node.container.clone(),
             ip: node.ip,
             cid: process.cid,
             started_at: process.started,
-        })
+        };
+        let check = format!(
+            "{}\n{}",
+            target.script("ACL DRYRUN default EVAL 'return 1' 0"),
+            target.script("ACL DRYRUN default EVALSHA 0000000000000000000000000000000000000000 0"),
+        );
+        Self::require_script_access(&h.nodes.exec(&target.node, &check).await?)?;
+        Ok(target)
+    }
+
+    fn require_script_access(answer: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            answer.lines().collect::<Vec<_>>() == ["OK", "OK"],
+            "{CTX}: the Redis default user must allow EVAL and EVALSHA before the fault"
+        );
+        Ok(())
+    }
+
+    fn require_denied_scripts(answer: &str) -> anyhow::Result<()> {
+        let answers = answer.lines().collect::<Vec<_>>();
+        anyhow::ensure!(
+            answers.len() == 2 && answers.iter().all(|answer| answer.starts_with("NOPERM")),
+            "{CTX}: both Redis Lua entry points must reject writes before the mirror kill"
+        );
+        Ok(())
     }
 
     fn script(&self, command: &str) -> String {
@@ -44,15 +78,36 @@ impl DataNode {
         )
     }
 
+    fn access_script(&self, lease: &str, access: ScriptAccess) -> String {
+        let path = format!("/tmp/kardamom-chaos-lua-{lease}");
+        let allow = self.script("ACL SETUSER default +eval +evalsha");
+        match access {
+            ScriptAccess::Blocked => format!(
+                "set -eu\ndocker exec {} touch {path}\ndocker exec -d {} sh -c 'sleep {LEASE_SECONDS}; if [ -e {path} ]; then redis-cli --raw -h {} -p 6379 ACL SETUSER default +eval +evalsha; rm -f {path}; fi'\n{}",
+                self.cid,
+                self.cid,
+                self.ip,
+                self.script("ACL SETUSER default -eval -evalsha"),
+            ),
+            ScriptAccess::Allowed => format!("docker exec {} rm -f {path}\n{allow}", self.cid),
+        }
+    }
+
     async fn verify(&self, h: &Harness) -> anyhow::Result<()> {
         let process = h.nodes.running_process(&self.node, "redis-").await;
         anyhow::ensure!(
             process.is_some_and(
                 |process| process.cid == self.cid && process.started == self.started_at
             ),
-            "{CTX}: paused Redis process changed on {}",
+            "{CTX}: faulted Redis process changed on {}",
             self.node
         );
+        let check = format!(
+            "{}\n{}",
+            self.script("EVAL 'return 1' 0"),
+            self.script("EVALSHA 0000000000000000000000000000000000000000 0"),
+        );
+        Self::require_denied_scripts(&h.nodes.exec(&self.node, &check).await?)?;
         Ok(())
     }
 
@@ -69,11 +124,12 @@ impl DataNode {
 }
 
 #[derive(Serialize)]
-pub(super) struct WritePause {
+pub(super) struct WriteBlock {
     targets: [DataNode; 2],
+    lease: String,
 }
 
-impl WritePause {
+impl WriteBlock {
     pub(super) async fn capture(h: &Harness) -> anyhow::Result<Self> {
         let allocations = h.nomad.allocations("redis").await?;
         let [primary, replica] = Self::data_nodes(&allocations)?;
@@ -82,6 +138,10 @@ impl WritePause {
                 DataNode::capture(h, primary).await?,
                 DataNode::capture(h, replica).await?,
             ],
+            lease: SystemTime::now()
+                .duration_since(UNIX_EPOCH)?
+                .as_nanos()
+                .to_string(),
         })
     }
 
@@ -111,28 +171,46 @@ impl WritePause {
         Ok(allocation)
     }
 
-    pub(super) async fn command(&self, h: &Harness, command: &str) -> anyhow::Result<()> {
-        self.command_with(command, |target, script| async move {
+    pub(super) async fn arm(&self, h: &Harness) -> anyhow::Result<()> {
+        self.change(h, ScriptAccess::Blocked).await
+    }
+
+    pub(super) async fn restore(&self, h: &Harness) -> anyhow::Result<()> {
+        self.change(h, ScriptAccess::Allowed).await
+    }
+
+    async fn change(&self, h: &Harness, access: ScriptAccess) -> anyhow::Result<()> {
+        self.command_with(access, |target, script| async move {
             h.nodes.exec(&target.node, &script).await
         })
         .await
     }
 
     /// Both destinations run to completion, even when one rejects the command.
-    /// Cleanup therefore attempts every unpause after a partial arm failure.
-    async fn command_with<'a, F, Fut>(&'a self, command: &str, execute: F) -> anyhow::Result<()>
+    /// Cleanup therefore restores both nodes after a partial arm failure.
+    async fn command_with<'a, F, Fut>(
+        &'a self,
+        access: ScriptAccess,
+        execute: F,
+    ) -> anyhow::Result<()>
     where
         F: Fn(&'a DataNode, String) -> Fut,
         Fut: Future<Output = anyhow::Result<String>>,
     {
         let (first, second) = tokio::join!(
-            execute(&self.targets[0], self.targets[0].script(command)),
-            execute(&self.targets[1], self.targets[1].script(command)),
+            execute(
+                &self.targets[0],
+                self.targets[0].access_script(&self.lease, access)
+            ),
+            execute(
+                &self.targets[1],
+                self.targets[1].access_script(&self.lease, access)
+            ),
         );
         let answers = [first?, second?];
         anyhow::ensure!(
             answers.iter().all(|answer| answer.trim() == "OK"),
-            "{CTX}: Redis rejects {command}: {answers:?}"
+            "{CTX}: Redis rejects the Lua access change: {answers:?}"
         );
         Ok(())
     }
@@ -145,7 +223,7 @@ impl WritePause {
                 .iter()
                 .zip(&self.targets)
                 .all(|(allocation, target)| allocation.id == target.allocation),
-            "{CTX}: paused Redis allocations changed"
+            "{CTX}: faulted Redis allocations changed"
         );
         let (first, second) = tokio::join!(self.targets[0].verify(h), self.targets[1].verify(h));
         first.and(second)

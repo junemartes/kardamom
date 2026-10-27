@@ -17,12 +17,10 @@ use crate::nomad::SavedJob;
 use crate::rpc::Rpc;
 
 mod writes;
-use writes::WritePause;
+use writes::WriteBlock;
 
 const CTX: &str = "mirror-kill-rebuild";
 const TASK: &str = "state-mirror";
-/// The pause also expires if the test process dies before cleanup.
-const PAUSE_MS: u64 = 600_000;
 /// The ingress-churn reserve is unused by cache-shard workloads.
 const FAULT_ACCOUNT: u32 = 16;
 
@@ -71,7 +69,7 @@ pub(super) struct InterruptedRebuild<'a> {
     h: &'a mut Harness,
     saved: SavedJob,
     primary: String,
-    writes: WritePause,
+    writes: WriteBlock,
     baseline: MirrorRebuilds,
     blocked: Option<MirrorRebuilds>,
     targets: Vec<Target>,
@@ -85,7 +83,7 @@ impl InterruptedRebuild<'_> {
         let saved = SavedJob::capture(&h.nomad, TASK).await?;
         let primary = live_primary(h, CTX).await?;
         let baseline = MirrorRebuilds::read(h).await?;
-        let writes = WritePause::capture(h).await?;
+        let writes = WriteBlock::capture(h).await?;
         let mut fault = InterruptedRebuild {
             h,
             saved,
@@ -100,15 +98,15 @@ impl InterruptedRebuild<'_> {
             .await
             .context("mirror scan interruption exceeds nine minutes")
             .and_then(std::convert::identity);
-        let unpaused = fault.writes.command(fault.h, "CLIENT UNPAUSE").await;
-        let rebuilt = match (&verdict, &unpaused) {
+        let unblocked = fault.writes.restore(fault.h).await;
+        let rebuilt = match (&verdict, &unblocked) {
             (Ok(()), Ok(())) => fault.recover(&coverage).await,
             _ => Ok(()),
         };
         let restored = fault.saved.restore().await;
-        let report = fault.report(&verdict, &unpaused, &rebuilt, &restored);
+        let report = fault.report(&verdict, &unblocked, &rebuilt, &restored);
         for error in [
-            unpaused.as_ref().err(),
+            unblocked.as_ref().err(),
             rebuilt.as_ref().err(),
             restored.as_ref().err(),
         ]
@@ -118,7 +116,7 @@ impl InterruptedRebuild<'_> {
             crate::log(format!("{CTX}: fault cleanup fails: {error:#}"));
         }
         verdict?;
-        unpaused?;
+        unblocked?;
         rebuilt?;
         restored?;
         report?;
@@ -142,12 +140,10 @@ impl InterruptedRebuild<'_> {
         let flushed = freeze_and_flush(self.h, CTX, &[]).await?;
         anyhow::ensure!(
             flushed == self.primary,
-            "{CTX}: primary changed before the write pause"
+            "{CTX}: primary changed before the write fault"
         );
         self.writes.await_cold_heads(self.h).await?;
-        self.writes
-            .command(self.h, &format!("CLIENT PAUSE {PAUSE_MS} WRITE"))
-            .await?;
+        self.writes.arm(self.h).await?;
         self.writes.verify(self.h).await?;
         self.saved.restore().await?;
         self.capture_targets().await?;
@@ -241,23 +237,24 @@ impl InterruptedRebuild<'_> {
     fn report(
         &self,
         verdict: &anyhow::Result<()>,
-        unpaused: &anyhow::Result<()>,
+        unblocked: &anyhow::Result<()>,
         rebuilt: &anyhow::Result<()>,
         restored: &anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let report = serde_json::json!({
             "case": CTX,
-            "fault": "CLIENT PAUSE WRITE on every Redis data node; kill every mirror after its scan reports a failed write and before completion",
-            "max_pause_ms": PAUSE_MS,
+            "fault": "Deny Lua writes on both Redis data nodes; kill every mirror after its scan reports a failed write and before completion",
+            "write_fault_lease_seconds": writes::LEASE_SECONDS,
+            "write_fault": "EVAL and EVALSHA denied on both data processes",
             "primary": self.primary,
-            "paused_data_nodes": self.writes,
+            "faulted_data_nodes": self.writes,
             "baseline": self.baseline,
             "blocked": self.blocked,
             "targets": self.targets,
             "fault_account": FAULT_ACCOUNT,
             "traffic_receipt_hash": self.traffic_hash,
             "failure": verdict.as_ref().err().map(|error| format!("{error:#}")),
-            "unpause_failure": unpaused.as_ref().err().map(|error| format!("{error:#}")),
+            "write_restore_failure": unblocked.as_ref().err().map(|error| format!("{error:#}")),
             "rebuild_failure": rebuilt.as_ref().err().map(|error| format!("{error:#}")),
             "restore_failure": restored.as_ref().err().map(|error| format!("{error:#}")),
         });

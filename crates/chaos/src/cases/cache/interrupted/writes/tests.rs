@@ -3,9 +3,10 @@ use std::future::ready;
 
 use super::*;
 
-impl WritePause {
+impl WriteBlock {
     fn fixture() -> Self {
         Self {
+            lease: "test-lease".into(),
             targets: ["primary", "replica"].map(|name| DataNode {
                 allocation: name.into(),
                 node: format!("node-{name}"),
@@ -39,7 +40,7 @@ fn both_data_groups_are_selected_independent_of_the_sentinel_role() {
         stopped,
     ];
     assert_eq!(
-        WritePause::data_nodes(&allocations)
+        WriteBlock::data_nodes(&allocations)
             .unwrap()
             .map(|a| a.node_name.as_str()),
         ["demoted-node", "promoted-node"]
@@ -56,16 +57,16 @@ fn missing_duplicate_or_colocated_data_nodes_cannot_arm_the_fault() {
         vec![primary.clone(), primary.clone(), replica],
         vec![primary, Alloc::redis_fixture("replica", "p")],
     ] {
-        assert!(WritePause::data_nodes(&allocations).is_err());
+        assert!(WriteBlock::data_nodes(&allocations).is_err());
     }
 }
 
 #[tokio::test]
-async fn every_destination_is_paused_and_unpaused_even_after_the_first_error() {
-    let pause = WritePause::fixture();
+async fn every_destination_is_blocked_and_restored_even_after_the_first_error() {
+    let pause = WriteBlock::fixture();
     let calls = RefCell::new(Vec::new());
     let armed = pause
-        .command_with("CLIENT PAUSE 600000 WRITE", |target, script| {
+        .command_with(ScriptAccess::Blocked, |target, script| {
             calls.borrow_mut().push((target.node.clone(), script));
             ready(if target.allocation == "primary" {
                 Err(anyhow::anyhow!("first destination fails"))
@@ -76,26 +77,45 @@ async fn every_destination_is_paused_and_unpaused_even_after_the_first_error() {
         .await;
     assert!(armed.is_err());
     pause
-        .command_with("CLIENT UNPAUSE", |target, script| {
+        .command_with(ScriptAccess::Allowed, |target, script| {
             calls.borrow_mut().push((target.node.clone(), script));
             ready(Ok("OK".into()))
         })
         .await
         .unwrap();
-    assert_eq!(*calls.borrow(), [
-        ("node-primary".into(), "docker exec cid-primary redis-cli --raw -h 127.0.0.1 -p 6379 CLIENT PAUSE 600000 WRITE".into()),
-        ("node-replica".into(), "docker exec cid-replica redis-cli --raw -h 127.0.0.1 -p 6379 CLIENT PAUSE 600000 WRITE".into()),
-        ("node-primary".into(), "docker exec cid-primary redis-cli --raw -h 127.0.0.1 -p 6379 CLIENT UNPAUSE".into()),
-        ("node-replica".into(), "docker exec cid-replica redis-cli --raw -h 127.0.0.1 -p 6379 CLIENT UNPAUSE".into()),
-    ]);
+    let calls = calls.borrow();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|(node, _)| node.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "node-primary",
+            "node-replica",
+            "node-primary",
+            "node-replica"
+        ]
+    );
+    calls[..2].iter().for_each(|(_, script)| {
+        assert!(script.contains("sleep 600"));
+        assert!(script.contains("if [ -e /tmp/kardamom-chaos-lua-test-lease ]"));
+        assert!(script.ends_with("ACL SETUSER default -eval -evalsha"));
+        assert!(!script.contains("CLIENT PAUSE"));
+    });
+    calls[2..].iter().for_each(|(_, script)| {
+        assert!(script.contains("rm -f /tmp/kardamom-chaos-lua-test-lease"));
+        assert!(script.ends_with("ACL SETUSER default +eval +evalsha"));
+    });
+    assert!(calls[0].1.contains("docker exec cid-primary redis-cli"));
+    assert!(calls[1].1.contains("docker exec cid-replica redis-cli"));
 }
 
 #[tokio::test]
 async fn an_error_reply_from_either_data_node_rejects_the_fault() {
-    let pause = WritePause::fixture();
+    let pause = WriteBlock::fixture();
     for failed in ["primary", "replica"] {
         let result = pause
-            .command_with("CLIENT PAUSE 600000 WRITE", |target, _| {
+            .command_with(ScriptAccess::Blocked, |target, _| {
                 ready(Ok(if target.allocation == failed {
                     "ERR denied"
                 } else {
@@ -105,5 +125,26 @@ async fn an_error_reply_from_either_data_node_rejects_the_fault() {
             })
             .await;
         assert!(result.is_err());
+    }
+}
+
+#[test]
+fn both_lua_permissions_must_be_allowed_before_the_fault() {
+    DataNode::require_script_access("OK\nOK\n").unwrap();
+    for answer in ["", "OK", "OK\nNOPERM", "NOPERM\nOK", "OK\nOK\nOK"] {
+        assert!(DataNode::require_script_access(answer).is_err());
+    }
+}
+
+#[test]
+fn both_lua_entry_points_must_remain_denied_before_the_kill() {
+    DataNode::require_denied_scripts("NOPERM eval denied\nNOPERM evalsha denied\n").unwrap();
+    for answer in [
+        "",
+        "NOPERM eval denied",
+        "1\nNOPERM evalsha denied",
+        "NOPERM eval denied\nNOSCRIPT",
+    ] {
+        assert!(DataNode::require_denied_scripts(answer).is_err());
     }
 }
