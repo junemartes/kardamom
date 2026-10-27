@@ -16,8 +16,11 @@ class Fault:
 
     @staticmethod
     def digest(path):
+        digest = hashlib.sha256()
         with path.open("rb") as image:
-            return hashlib.file_digest(image, "sha256").hexdigest()
+            for chunk in iter(lambda: image.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def images(self):
         return sorted(
