@@ -6,6 +6,7 @@ use kardamom_cluster_adapter::wire::{
     RefRefused, SEALER_V5_DECISION_VERSION, encode_egress_boundary, encode_record_lag_reject,
     encode_status,
 };
+use kardamom_obs::lifecycle::Lifecycle;
 use kardamom_sequencer::outbound::fakes::InMemorySidePublisher;
 use kardamom_sequencer::resync::{SealerRefusal, SharedWatermark};
 use kardamom_sequencer::sealer_rules::{SealerRules, SealerVersion};
@@ -26,6 +27,7 @@ fn rules(
 /// values, and never the rewind channel.
 #[test]
 fn a_record_lag_reject_is_a_terminal_refusal() {
+    let lifecycle = Lifecycle::new(None);
     let (deadline_tx, deadline_rx) = crossbeam_channel::bounded(4);
     let (answer_tx, answer_rx) = crossbeam_channel::bounded(4);
     let (origins, _origins_rx) = crossbeam_channel::unbounded();
@@ -45,7 +47,10 @@ fn a_record_lag_reject_is_a_terminal_refusal() {
         halted: true,
     };
 
-    feed.on_frame(&encode_record_lag_reject(sender, 7, 20_000, &lag));
+    feed.on_frame(
+        &encode_record_lag_reject(sender, 7, 20_000, &lag),
+        &lifecycle,
+    );
 
     assert_eq!(
         deadline_rx.try_recv().unwrap(),
@@ -67,6 +72,7 @@ fn a_record_lag_reject_is_a_terminal_refusal() {
 /// boundary gap flags again.
 #[test]
 fn a_snapshot_notice_holds_the_lag_flag_until_the_next_boundary() {
+    let lifecycle = Lifecycle::new(None);
     let (deadline_tx, _deadline_rx) = crossbeam_channel::bounded(4);
     let (reject_tx, _reject_rx) = crossbeam_channel::bounded(4);
     let (origins, _origins_rx) = crossbeam_channel::unbounded();
@@ -85,10 +91,10 @@ fn a_snapshot_notice_holds_the_lag_flag_until_the_next_boundary() {
         ..ClusterStatus::default()
     });
 
-    feed.on_frame(&notice);
+    feed.on_frame(&notice, &lifecycle);
     std::thread::sleep(Duration::from_millis(5));
-    feed.on_idle();
-    feed.on_frame(&encode_egress_boundary(9, 100, 0, 0));
+    feed.on_idle(&lifecycle);
+    feed.on_frame(&encode_egress_boundary(9, 100, 0, 0), &lifecycle);
     assert_eq!(
         watermark.take_lag(),
         None,
@@ -96,7 +102,7 @@ fn a_snapshot_notice_holds_the_lag_flag_until_the_next_boundary() {
     );
 
     std::thread::sleep(Duration::from_millis(5));
-    feed.on_idle();
+    feed.on_idle(&lifecycle);
     assert!(
         watermark.take_lag().is_some(),
         "the boundary after the snapshot ends the stall"
@@ -108,6 +114,7 @@ fn a_snapshot_notice_holds_the_lag_flag_until_the_next_boundary() {
 /// and publishes one drop for the hash, with the reason of the refusal.
 #[test]
 fn a_reference_refusal_raises_the_version_and_drops_the_transaction() {
+    let lifecycle = Lifecycle::new(None);
     let (deadline_tx, deadline_rx) = crossbeam_channel::bounded(4);
     let (answer_tx, answer_rx) = crossbeam_channel::bounded(4);
     let (origins, origins_rx) = crossbeam_channel::unbounded();
@@ -131,6 +138,7 @@ fn a_reference_refusal_raises_the_version_and_drops_the_transaction() {
             decision_version: SEALER_V5_DECISION_VERSION,
         }
         .encode(),
+        &lifecycle,
     );
 
     assert!(deadline_rx.try_recv().is_err());
@@ -154,6 +162,7 @@ fn a_reference_refusal_raises_the_version_and_drops_the_transaction() {
 /// not lower it.
 #[test]
 fn a_reference_refusal_below_the_kept_version_does_not_lower_it() {
+    let lifecycle = Lifecycle::new(None);
     let (deadline_tx, _deadline_rx) = crossbeam_channel::bounded(4);
     let (answer_tx, _answer_rx) = crossbeam_channel::bounded(4);
     let (origins, _origins_rx) = crossbeam_channel::unbounded();
@@ -177,6 +186,7 @@ fn a_reference_refusal_below_the_kept_version_does_not_lower_it() {
             decision_version: 4,
         }
         .encode(),
+        &lifecycle,
     );
 
     assert!(version.carries_bytes(), "the version stays 5");

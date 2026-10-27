@@ -18,6 +18,7 @@
 //! channel, is a plain task. It uses `select!` on `Shutdown::cancelled`.
 
 mod account_lookup;
+mod guards;
 mod lookup;
 mod origin_pump;
 mod receipts;
@@ -29,6 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(crate) use account_lookup::AccountLookupFeed;
+use guards::GuardPauses;
 use kardamom_cluster_adapter::LiveEgress;
 use kardamom_cluster_adapter::live::EgressPoll;
 use kardamom_cluster_adapter::wire::{self, EgressItem};
@@ -36,8 +38,7 @@ use kardamom_log::aeron_live::{
     IdleCap, TxDataSubscriberHandle, TxDepositsSubscriberHandle,
     TxReceiptsBoundarySubscriberHandle, TxRemoteEpochsSubscriberHandle,
 };
-use kardamom_obs::halt::{HaltCause, HaltRef};
-use kardamom_obs::lifecycle::process;
+use kardamom_obs::lifecycle::{Lifecycle, process};
 use kardamom_obs::pipeline::{LoopMeter, LoopState};
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::epoch::{EpochPump, OriginSignalTx};
@@ -152,6 +153,7 @@ pub(crate) struct EgressWatermarkFeed<D> {
     /// snapshot budget: the leader sends no boundary until the snapshot
     /// is complete, so that gap is neither a lag nor a lost quorum.
     silence: SilenceDeadline,
+    pauses: GuardPauses,
     /// The kept decision version of the sealer, and the drops of the
     /// references that it refused.
     rules: SealerRules<D>,
@@ -180,6 +182,7 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
             last_origin: 0,
             last_boundary_at: Some(Instant::now()),
             silence: SilenceDeadline::new(Instant::now()),
+            pauses: GuardPauses::default(),
             meter: LoopMeter::new("sequencer.egress_feed"),
         }
     }
@@ -207,8 +210,8 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
         let poll = egress.recv_timeout(Duration::from_millis(500));
         self.meter.mark(LoopState::Idle);
         match poll {
-            EgressPoll::Frame(frame) => self.on_frame(&frame),
-            EgressPoll::Idle => self.on_idle(),
+            EgressPoll::Frame(frame) => self.on_frame(&frame, process()),
+            EgressPoll::Idle => self.on_idle(process()),
             EgressPoll::Closed => return ControlFlow::Break(()),
         }
         self.meter.mark(LoopState::Busy);
@@ -218,25 +221,16 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
     /// Egress is silent while this thread is demonstrably alive. This
     /// could be a partition from egress, or a dead cluster boundary
     /// clock. Either way, the response is the same.
-    fn on_idle(&mut self) {
+    fn on_idle(&mut self, lifecycle: &Lifecycle) {
         let now = Instant::now();
         if self.silence.in_snapshot(now) {
             return;
         }
         self.flag(now);
-        self.pause_on_silence(now);
+        self.pause_on_silence(now, lifecycle);
     }
 
-    /// Pause the replica on the sealer's lost quorum once no boundary
-    /// arrived for the silence budget. A frame that is not a boundary
-    /// does not end the silence.
-    fn pause_on_silence(&self, now: Instant) {
-        if self.silence.expired(now).is_some() {
-            process().follow(Some(HaltRef::sealer(HaltCause::SealerNoQuorum)));
-        }
-    }
-
-    fn on_frame(&mut self, frame: &[u8]) {
+    fn on_frame(&mut self, frame: &[u8], lifecycle: &Lifecycle) {
         if self.on_rules_frame(frame) {
             return;
         }
@@ -252,16 +246,16 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
         if self.on_deadline_frame(frame) {
             return;
         }
-        if self.on_da_lag_frame(frame) {
+        if self.on_da_lag_frame(frame, lifecycle) {
             return;
         }
-        if self.on_record_lag_frame(frame) {
+        if self.on_record_lag_frame(frame, lifecycle) {
             return;
         }
         if self.on_origin_gap_frame(frame) {
             return;
         }
-        if self.on_status_frame(frame) {
+        if self.on_status_frame(frame, lifecycle) {
             return;
         }
         // Check the cheap kind byte first. Relayed records arrive at
@@ -270,7 +264,7 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
         if frame.first() != Some(&wire::EGRESS_KIND_BOUNDARY) {
             return;
         }
-        self.on_boundary_frame(frame);
+        self.on_boundary_frame(frame, lifecycle);
     }
 
     /// Handle the sealer's rules and the start of a session. Returns `true`
@@ -420,7 +414,7 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
     /// lag. No republish can order it until the batcher posts again, so
     /// it takes the terminal-refusal channel: the publish loop drops the
     /// ledger entry and tells the client to resubmit later.
-    fn on_da_lag_frame(&mut self, frame: &[u8]) -> bool {
+    fn on_da_lag_frame(&mut self, frame: &[u8], lifecycle: &Lifecycle) -> bool {
         if frame.first() != Some(&wire::EGRESS_KIND_DA_LAG_REJECT) {
             return false;
         }
@@ -432,6 +426,8 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
             budget_blocks,
         }) = EgressItem::decode(frame)
         {
+            self.pauses
+                .on_guard(kardamom_obs::halt::HaltCause::DaLag, lifecycle);
             tracing::warn!(
                 partition = self.partition,
                 ?sender,
@@ -486,47 +482,6 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
             seq_metrics::record_remote_origin_reject(origin_chain_id, reason);
         }
         true
-    }
-
-    /// Handle one status frame. Returns `true` when `frame` was a status.
-    /// A status with the snapshot notice starts the snapshot stall: until
-    /// its budget ends or the next boundary arrives, the boundary gap
-    /// neither flags a lag nor pauses the replica. A plain status does
-    /// not prove the boundary clock, so it changes nothing here.
-    fn on_status_frame(&mut self, frame: &[u8]) -> bool {
-        if frame.first() != Some(&wire::EGRESS_KIND_STATUS) {
-            return false;
-        }
-        if let Ok(EgressItem::Status(status)) = EgressItem::decode(frame)
-            && status.snapshot_follows
-        {
-            self.silence.on_status(&status, Instant::now());
-            tracing::info!(
-                partition = self.partition,
-                "sequencer: the sealer takes a snapshot; the boundaries stop until it is complete"
-            );
-        }
-        true
-    }
-
-    /// Store the canonical count from one boundary frame, and re-arm the
-    /// silence timer. A 30 second freeze shows up here as one long
-    /// inter-arrival gap. The backlog drains instantly on resume, but
-    /// the gap between the last pre-freeze arrival and this one is real
-    /// wall-clock time. A gap that a snapshot notice announced is no lag.
-    fn on_boundary_frame(&mut self, frame: &[u8]) {
-        if let Ok(EgressItem::Boundary(b)) = EgressItem::decode(frame) {
-            let now = Instant::now();
-            if !self.silence.in_snapshot(now) {
-                self.flag(now);
-            }
-            self.last_boundary_at = Some(now);
-            self.silence.on_boundary(now);
-            process().follow(None);
-            kardamom_obs::ready::mark_now(seq_metrics::LAST_BOUNDARY_UNIX_SECONDS);
-            self.watermark.store(b.end_tx_idx.as_index());
-            self.confirm_origin(b.l1_origin);
-        }
     }
 
     /// Raise the sticky lag flag, and the starvation-proof metric, once
