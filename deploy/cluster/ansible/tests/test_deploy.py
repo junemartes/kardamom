@@ -423,6 +423,19 @@ class Deployment:
                 'StatusDescription': f'scripted {status}', 'TaskGroups': groups}
 
 
+class PostingDependency(Deployment):
+    """A paused sequencer becomes ready only after the posting path exists."""
+
+    def __init__(self, jobs):
+        super().__init__('sequencer', ['running'])
+        self.jobs = jobs
+
+    def state(self, poll=True):
+        ready = {'da-store', 'l1-indexer', 'batcher'} <= self.jobs.keys()
+        self.outcomes = ['successful' if ready else 'running']
+        return super().state(poll)
+
+
 @unittest.skipUnless(shutil.which('nomad') and shutil.which('ansible-playbook'),
                      'nomad and ansible-playbook required')
 class Deploys(unittest.TestCase):
@@ -532,8 +545,8 @@ class Deploys(unittest.TestCase):
     # The jobs a manifest with new digests changes, in deploy order: every
     # pinned image, and not anvil or the monitoring. The data directory job
     # runs the Aeron image of the manifest.
-    REPINNED = ['data-dirs', 'aeron', 'cluster', 'sequencer', 'redis', 'ingress', 'executor', 'state-mirror', 'notifier',
-                'validator', 'da-watcher', 'da-store', 'l1-indexer', 'batcher']
+    REPINNED = ['data-dirs', 'aeron', 'cluster', 'redis', 'ingress', 'executor', 'state-mirror', 'notifier',
+                'validator', 'da-watcher', 'da-store', 'l1-indexer', 'batcher', 'sequencer']
 
     def record(self):
         return self.api.state['records']['kardamom/deploys/local']
@@ -626,15 +639,27 @@ class Deploys(unittest.TestCase):
 class DeployTest(Deploys):
     """The deploy: order, pins, secrets, waits, canary, sealer roll."""
 
+    def test_a_da_paused_sequencer_gets_its_posting_dependencies_before_readiness(self):
+        self.api.state['deployments']['sequencer'] = PostingDependency(self.api.state['jobs'])
+        self.run_deploy({'workloads_da_lag_budget_blocks': '8'})
+        writes = self.api.state['writes']
+        for dependency in ('da-store', 'l1-indexer', 'batcher'):
+            self.assertLess(writes.index(dependency), writes.index('sequencer'))
+        definition = self.api.state['jobs']['sequencer']
+        for group in definition['TaskGroups']:
+            self.assertEqual(group['Update']['HealthyDeadline'], 180_000_000_000)
+            self.assertEqual(group['Update']['ProgressDeadline'], 600_000_000_000)
+        self.assertEqual(self.api.state['deployments']['sequencer'].state()['Status'], 'successful')
+
     def test_deploy_order_pinning_and_repeat(self):
         # The local canary runs only on request: the CI shards count
         # transactions.
         local_canary = {'CANARY_LOCAL': '1'}
         self.run_deploy(environ=local_canary)
         self.assertIn('-Daeron.archive.file.sync.level=1', json.dumps(self.api.state['jobs']['aeron']))
-        expected = ['data-dirs', 'aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
+        expected = ['data-dirs', 'aeron', 'anvil', 'cluster', 'redis', 'ingress', 'executor',
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
-                    'da-store', 'l1-indexer', 'batcher', 'canary']
+                    'da-store', 'l1-indexer', 'batcher', 'sequencer', 'canary']
         self.assertEqual(self.api.state['writes'], expected)
         exporter = self.api.state['jobs']['node-exporter']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertIn('--collector.disable-defaults', exporter, 'the local profile skips the host hardware collectors')
@@ -1830,7 +1855,7 @@ class RecordTest(Deploys):
         self.run_deploy(success=False)
         attempt = self.record()['attempt']
         self.assertEqual(attempt['status'], 'started')
-        self.assertEqual(attempt['changed'], ['data-dirs', 'aeron', 'cluster', 'sequencer', 'redis', 'ingress'])
+        self.assertEqual(attempt['changed'], ['data-dirs', 'aeron', 'cluster', 'redis', 'ingress'])
         self.assertEqual(self.record()['accepted'], accepted, 'a failed attempt is never the accepted release')
         self.assertEqual(json.loads((self.record_dir / 'accepted.json').read_text()), accepted)
         # The attempt is still started: it runs, or it died. Only the

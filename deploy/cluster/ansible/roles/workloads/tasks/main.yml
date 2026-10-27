@@ -69,8 +69,7 @@
 - name: Resolve settlement before deploying its consumers
   ansible.builtin.import_tasks: settlement.yml
 
-# Submit sequencers without waiting: they may need downstream subscribers.
-# Ingress must subscribe to receipts before executors start publishing them.
+# Ingress subscribes to receipts before executors start publishing them.
 - name: Deploy the sealer
   ansible.builtin.include_tasks: sealer.yml
 
@@ -94,10 +93,6 @@
 - name: Deploy pipeline dependencies
   ansible.builtin.include_tasks: "{{ workloads_job.tasks | default('job.yml') }}"
   loop:
-    - name: sequencer
-      wait: false
-      vars:
-        shard_table: "{{ (lookup('file', workloads_cluster_dir ~ '/config/shard-map.toml') | community.general.from_toml).table | to_json }}"
     # The cache before its readers and its writer: the ingress reads it,
     # the state mirror writes it.
     - {name: redis}
@@ -189,7 +184,7 @@
 
 - name: Wait for pipeline followers
   ansible.builtin.include_tasks: wait.yml
-  loop: [sequencer, executor, state-mirror, notifier, validator, da-watcher, node-exporter, monitoring]
+  loop: [executor, state-mirror, notifier, validator, da-watcher, node-exporter, monitoring]
   loop_control:
     loop_var: workloads_wait_job
   when: not ansible_check_mode
@@ -279,6 +274,17 @@
              else workloads_batcher_rpc if workloads_l1_rpc_given | length > 0
              else workloads_anvil_service_rpc }}
         KARDAMOM_L1_KEY: "{{ workloads_batcher_key | default(workloads_batcher_dev_key, true) }}"
+
+# A sequencer paused by the DA guard is not ready until posting catches up.
+# Register it after the posting path is ready, so its health deadline starts
+# with every dependency available. Its downstream subscribers already run.
+- name: Deploy the sequencers after the posting path
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job:
+      name: sequencer
+      vars:
+        shard_table: "{{ (lookup('file', workloads_cluster_dir ~ '/config/shard-map.toml') | community.general.from_toml).table | to_json }}"
 
 # The transaction canary uses the chain through the ingresses and the
 # notifier. It comes up last, so its first transactions find every
