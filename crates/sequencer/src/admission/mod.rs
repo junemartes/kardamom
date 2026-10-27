@@ -478,6 +478,20 @@ impl<T: Clone> Admission<T> {
         self.senders.get(&sender)?.forwarded_at(nonce)
     }
 
+    pub(crate) fn unconfirmed_at_mut(
+        &mut self,
+        sender: Address,
+        nonce: u64,
+    ) -> Option<&mut Candidate<T>> {
+        self.senders.get_mut(&sender)?.forwarded_at_mut(nonce)
+    }
+
+    pub(crate) fn retained_mut(&mut self) -> impl Iterator<Item = &mut Candidate<T>> {
+        self.senders
+            .values_mut()
+            .flat_map(SenderState::retained_mut)
+    }
+
     /// Every forwarded transaction that no state confirmed: the run of each
     /// sender, in nonce order.
     pub fn unconfirmed(&self) -> impl Iterator<Item = &Candidate<T>> {

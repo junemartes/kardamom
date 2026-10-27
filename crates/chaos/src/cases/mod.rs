@@ -24,6 +24,7 @@ pub(crate) mod exec_stream;
 pub(crate) mod fleet;
 pub(crate) mod l1;
 pub(crate) mod l1_canary;
+mod lookup_blackout;
 mod member_storage;
 mod raft_partition;
 pub(crate) mod recorded_cursor;
@@ -427,7 +428,7 @@ impl Case {
             Self::ValidatorJoin => validator::join(h).await,
             Self::CpuSqueeze => squeeze::cpu_squeeze(h).await,
             Self::ResizeScaleOutIn => resize::scale_out_in(h).await,
-            Self::LookupBlackout => resize::lookup_blackout(h).await,
+            Self::LookupBlackout => lookup_blackout::LookupBlackout::run(h).await,
             Self::RedisPrimaryFreeze => cache::redis_primary_freeze(h).await,
             Self::RedisPrimaryKill => cache::redis_primary_kill(h).await,
             Self::RedisPartitionIngress => cache::redis_partition_ingress(h).await,

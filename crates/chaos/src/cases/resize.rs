@@ -1,6 +1,5 @@
 //! The dynamic sequencer sizing cases: a scale-out and scale-in under
-//! load, and the executor lookup blackout. Both run last in their
-//! shard: the resize leaves the shard map at a later version, so the
+//! load. The resize leaves the shard map at a later version, so the
 //! account-to-shard table no longer pins the cases after it.
 
 use std::path::{Path, PathBuf};
@@ -11,8 +10,6 @@ use crate::accounts::ACCT_VSLOT;
 use crate::harness::Harness;
 use crate::poll::{self, Budget};
 use crate::scale::Resize;
-
-const LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
 
 /// The funded accounts whose slots move when the current map grows to three lanes.
 ///
@@ -203,212 +200,9 @@ async fn scale_out_in_body(h: &mut Harness, cluster_dir: &Path) -> anyhow::Resul
     h.assert_progress().await
 }
 
-/// The failed-lookup outcomes of lane 0's replica on node 0.
-async fn lookups_failed(h: &Harness) -> i64 {
-    let t = h
-        .probes
-        .seq_lane0_metric_where(0, LOOKUPS, "outcome=\"timeout\"")
-        .await
-        .unwrap_or(0);
-    let e = h
-        .probes
-        .seq_lane0_metric_where(0, LOOKUPS, "outcome=\"error\"")
-        .await
-        .unwrap_or(0);
-    t.saturating_add(e)
-}
-
-/// The outcomes of an answered lookup. The v1 loop records `redis`
-/// and then `ok` for an answer from Redis, and `ok` for an answer from
-/// an executor. The v2 loop records one outcome for the source that
-/// answered: `live`, `redis`, or `ok` (an executor).
-const ANSWERED: [&str; 3] = ["ok", "redis", "live"];
-
-/// The answered-lookup outcomes of lane 0's replica on node 0.
-async fn lookups_answered(h: &Harness) -> i64 {
-    let mut answered: i64 = 0;
-    for outcome in ANSWERED {
-        let n = h
-            .probes
-            .seq_lane0_metric_where(0, LOOKUPS, &format!("outcome=\"{outcome}\""))
-            .await
-            .unwrap_or(0);
-        answered = answered.saturating_add(n);
-    }
-    answered
-}
-
-/// Blackhole every executor from the sequencer node, hard-kill lane 0's
-/// replica so it comes back cold, and require its lookups to fail while
-/// the twin keeps the lane live. Then restore the routes, drop only the
-/// executors' UDP on the node, kill the replica once more, and require
-/// an answered lookup from any source.
-///
-/// Both phases hard-kill the replica, and the replacement is a new
-/// process whose counters start at zero, so each wait counts from zero:
-/// an answered lookup is a one-off (the floor is known after it), so the
-/// newborn's answered count stays small and never rises past the killed
-/// process's count. Phase 2 accepts an answer from any source
-/// ([`ANSWERED`]): it removes the cache rules, so Redis can answer, and
-/// the v2 loop of a carry-born shard then records `redis`, not `ok`.
-///
-/// Why phase 2 drops the UDP: a receipt-proven floor makes the sequencer
-/// skip the lookup by design, and with a live twin the first receipt
-/// often beats the first park. Receipts ride UDP from the executors; the
-/// lookup is TCP to the executors. In phase 1 the route blackhole blocks
-/// both, so every park requests a lookup that fails.
-pub(crate) async fn lookup_blackout(h: &mut Harness) -> anyhow::Result<()> {
-    let node = h.probes.sequencers[0].container.clone();
-    let executors: Vec<String> = h
-        .probes
-        .executors
-        .iter()
-        .map(|e| e.ip.to_string())
-        .collect();
-    for e in &executors {
-        h.nodes
-            .exec(&node, &format!("ip route add blackhole {e}/32"))
-            .await
-            .map_err(|err| {
-                crate::chaos_fail!("lookup-blackout: could not blackhole {e} on {node}: {err}")
-            })?;
-    }
-    cache_traffic(h, &node, "-I").await?;
-    crate::log(format!(
-        "lookup-blackout: executors blackholed and the cache ports dropped on {node}; hard-killing lane 0's replica there"
-    ));
-    let phase1 = blackout_phase(h, &node).await;
-    let _ = cache_traffic(h, &node, "-D").await;
-    for e in &executors {
-        let _ = h
-            .nodes
-            .exec(&node, &format!("ip route del blackhole {e}/32"))
-            .await;
-    }
-    lookup_snapshot(h, &node, "lookup-blackout: blackout phase").await;
-    phase1.map_err(|e| crate::chaos_fail!("lookup-blackout: blackout phase failed: {e}"))?;
-    crate::log(format!(
-        "lookup-blackout: routes restored; dropping the executors' UDP on {node} (receipts, not lookups), then hard-killing the replica again for an answered lookup"
-    ));
-    for e in &executors {
-        h.nodes
-            .exec(
-                &node,
-                &format!("iptables -w 5 -I INPUT -p udp -s {e} -j DROP"),
-            )
-            .await
-            .map_err(|err| {
-                crate::chaos_fail!("lookup-blackout: could not drop UDP from {e} on {node}: {err}")
-            })?;
-    }
-    let phase2 = answered_phase(h, &node).await;
-    // The block is short: the lookup answers within seconds of the
-    // restart, and the node's other replica needs its receipts back.
-    for e in &executors {
-        let _ = h
-            .nodes
-            .exec(
-                &node,
-                &format!("iptables -w 5 -D INPUT -p udp -s {e} -j DROP"),
-            )
-            .await;
-    }
-    lookup_snapshot(h, &node, "lookup-blackout: answered phase").await;
-    phase2.map_err(|e| crate::chaos_fail!("lookup-blackout: answered-lookup phase failed: {e}"))?;
-    h.assert_progress().await
-}
-
-/// The Redis and Sentinel ports of the cache layer.
-const CACHE_PORTS: [u16; 2] = [6379, 26379];
-
-/// Insert (`-I`) or delete (`-D`) the rules that drop this node's cache
-/// traffic. The blackout phase needs them: since the cache flag day a
-/// nonce lookup can be answered from Redis, and then no lookup reaches
-/// the blackholed executors and none fails. Run 35061276238 showed
-/// exactly that, with `outcome="redis"` and no timeout. The rules are
-/// TCP only, so the node keeps the Aeron traffic it needs, which is UDP.
-async fn cache_traffic(h: &Harness, node: &str, rule: &str) -> anyhow::Result<()> {
-    for port in CACHE_PORTS {
-        h.nodes
-            .exec(
-                node,
-                &format!("iptables -w 5 {rule} OUTPUT -p tcp --dport {port} -j DROP"),
-            )
-            .await
-            .map_err(|e| {
-                crate::chaos_fail!("lookup-blackout: iptables {rule} port {port} on {node}: {e}")
-            })?;
-    }
-    Ok(())
-}
-
-async fn blackout_phase(h: &mut Harness, node: &str) -> anyhow::Result<()> {
-    h.inject_hard(&[node], "sequencer-0").await?;
-    h.assert_progress().await?;
-    h.assert_count("sequencer", 4, h.knobs.restart_slo).await?;
-    let hs: &Harness = h;
-    let outcome = poll::until(Budget::secs(120, 3), |_| async move {
-        Ok::<_, anyhow::Error>((lookups_failed(hs).await > 0).then_some(()))
-    })
-    .await?;
-    outcome
-        .or_fail(|_| crate::chaos_fail!("lookup-blackout: cold replica's lookups failed with no executor reachable: not reached within 120s"))
-        .map(|_| ())
-}
-
-async fn answered_phase(h: &mut Harness, node: &str) -> anyhow::Result<()> {
-    h.inject_hard(&[node], "sequencer-0").await?;
-    h.assert_count("sequencer", 4, h.knobs.restart_slo).await?;
-    let hs: &Harness = h;
-    let outcome = poll::until(Budget::secs(120, 3), |_| async move {
-        Ok::<_, anyhow::Error>((lookups_answered(hs).await > 0).then_some(()))
-    })
-    .await?;
-    outcome
-        .or_fail(|_| {
-            crate::chaos_fail!(
-                "lookup-blackout: cold replica's lookup answered: not reached within 120s"
-            )
-        })
-        .map(|_| ())
-}
-
-/// The lane report of lane 0 and the tail of the replica's own log, so a
-/// red run tells the cases apart: no park at all, a park with the floor
-/// already known (no request), or a lookup that ran. Never fails the
-/// case.
-async fn lookup_snapshot(h: &Harness, node: &str, ctx: &str) {
-    for line in h.probes.sequencer_lane_report(1).await {
-        crate::log(format!("{ctx}: {line}"));
-    }
-    let Some(inner) = h.nodes.inner_container(node, "sequencer-0").await else {
-        crate::log(format!("{ctx}: no inner sequencer-0 container on {node}"));
-        return;
-    };
-    let tail = h
-        .nodes
-        .inner_logs(node, &inner, 40)
-        .await
-        .unwrap_or_default();
-    crate::log(format!("{ctx}: log tail of {inner} on {node}\n{tail}"));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn answered_covers_every_v2_source() {
-        let body = "kardamom_sequencer_nonce_lookups_total{partition=\"0\",outcome=\"live\"} 1\n\
-            kardamom_sequencer_nonce_lookups_total{partition=\"0\",outcome=\"redis\"} 2\n\
-            kardamom_sequencer_nonce_lookups_total{partition=\"0\",outcome=\"ok\"} 4\n\
-            kardamom_sequencer_nonce_lookups_total{partition=\"0\",outcome=\"error\"} 8\n";
-        let answered: i64 = ANSWERED
-            .iter()
-            .filter_map(|o| crate::metrics::sum_where(body, LOOKUPS, &format!("outcome=\"{o}\"")))
-            .sum();
-        assert_eq!(answered, 7);
-    }
 
     #[tokio::test]
     async fn an_early_exit_carries_the_rollout_error() {

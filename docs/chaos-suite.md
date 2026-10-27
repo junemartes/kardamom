@@ -138,7 +138,7 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 - [`sequencer-lapse`](failure-modes.md#sequencer-2-shards-x-2-racing-replicas): freezes a replica for `SEQ_LAPSE_S`. The replica must detect the lapse and resync.
 - [`validator-lapse`](failure-modes.md#validator-off-the-hot-path-halts-on-divergence): pauses the validator for `LAPSE_S`. It must catch up and verify with no divergence.
 - [`validator-join`](failure-modes.md#validator-off-the-hot-path-halts-on-divergence): kills the validator and wipes its state. The new validator adopts a peer checkpoint and verifies live.
-- [`lookup-blackout`](failure-modes.md#sequencer-2-shards-x-2-racing-replicas): cuts the executor and Redis traffic of a sequencer node. It kills the lane-0 replica there.
+- [`lookup-blackout`](failure-modes.md#sequencer-2-shards-x-2-racing-replicas): blocks receipt DATA frames (Aeron stream 1002), executor query TCP 9024 and Redis/Sentinel TCP 6379/26379 on one sequencer node. It restarts lane 0 and requires failed lookups, no answered source, a received canonical boundary and positive receipt-drop counters. It then restores query/cache traffic, keeps receipt data blocked, restarts the replica again and requires an answered lookup with a live boundary and fresh drop counters. Cluster egress and Aeron control frames remain reachable even when executors share sealer hosts. Both phases keep their 120-second proof bounds, preserve the twin-progress check, record process identities and restore both fault chains after any result.
 - [`resize-scale-out-in`](failure-modes.md#sequencer-2-shards-x-2-racing-replicas): grows the sequencer from two lanes to three under load, kills a replica of the new lane, and shrinks back.
 
 **Cluster shard**

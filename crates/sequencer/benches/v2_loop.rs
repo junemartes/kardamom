@@ -4,14 +4,17 @@
 //! The input is the input of `benches/throughput.rs`: the proxy supplies
 //! the sender, so the loop does no secp256k1 work. Each sender has a row,
 //! so no transaction waits for a lookup. Two orders:
-//! - `in_order`: each sender's nonces arrive in order, and each one goes
-//!   out at once;
+//! - `in_order`: each sender's nonces arrive in order;
 //! - `reversed`: each sender's nonces arrive last first, so each one parks
 //!   until nonce 0 arrives and frees the run.
 //!
 //! A third case, `with_verdicts`, takes the `in_order` input with the
 //! verdicts on: the loop queues one verdict for each transaction, to the
 //! ingress that published it. Eight ingress ids publish the input.
+//!
+//! Carry mode feeds each published hash back as a canonical event before
+//! the next turn. It measures local loop cost with zero transport delay;
+//! every case asserts that all input transactions publish.
 
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
@@ -22,7 +25,7 @@ use kardamom_obs::lifecycle::process;
 use kardamom_sequencer::admission::{AccountState, AdmissionConfig};
 use kardamom_sequencer::outbound::fakes::InMemorySidePublisher;
 use kardamom_sequencer::sealer_rules::{SealerRules, SealerVersion};
-use kardamom_sequencer::testkit::{Rig, one_partition_cfg, signed_envelope, signer};
+use kardamom_sequencer::testkit::{EnvelopeSpec, Rig, envelope_with, one_partition_cfg, signer};
 use kardamom_sequencer::v2::{AccountEvent, AdmissionLoop, V2Config};
 use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 
@@ -69,7 +72,15 @@ fn batch(nonce_at: fn(u64) -> u64) -> Vec<(TxDataLoc, TxEnvelope)> {
             let id = TxEnvelope::pack_correlation_id(ingress, correlation);
             (
                 TxDataLoc::new(0, position),
-                signed_envelope(s, nonce_at(k), id),
+                envelope_with(
+                    s,
+                    nonce_at(k),
+                    id,
+                    EnvelopeSpec {
+                        real_hash: true,
+                        ..EnvelopeSpec::default()
+                    },
+                ),
             )
         })
         .collect()
@@ -94,8 +105,28 @@ fn rows(block: u64, nonce: u64) -> AccountEvent {
 /// A loop whose filter holds a rich row for every sender of the batch,
 /// and the sender side of its account events.
 struct Inputs {
-    _accounts: crossbeam_channel::Sender<AccountEvent>,
+    accounts: crossbeam_channel::Sender<AccountEvent>,
+    canonical: bool,
+    observed: usize,
     _refusals: Option<SealerRules<InMemorySidePublisher>>,
+}
+
+impl Inputs {
+    fn turn(&mut self, admission: &mut AdmissionLoop, rig: &mut Rig) -> bool {
+        let worked = admission.run_once(&mut rig.ports()).unwrap();
+        if !self.canonical {
+            return worked;
+        }
+        let offers = rig.refs.offers.lock().unwrap();
+        offers[self.observed..].iter().for_each(|offer| {
+            self.accounts
+                .send(AccountEvent::Canonical(offer.tx_ref.tx_hash))
+                .unwrap();
+        });
+        let confirmed = offers.len() != self.observed;
+        self.observed = offers.len();
+        worked || confirmed
+    }
 }
 
 fn seeded_loop() -> (AdmissionLoop, Inputs) {
@@ -123,7 +154,9 @@ fn seeded_loop() -> (AdmissionLoop, Inputs) {
     (
         admission,
         Inputs {
-            _accounts: accounts_tx,
+            accounts: accounts_tx,
+            canonical: std::env::var_os("KARDAMOM_V2_BENCH_CARRY").is_some(),
+            observed: 0,
             _refusals: refusals,
         },
     )
@@ -172,8 +205,9 @@ fn bench_with_verdicts(c: &mut Criterion) {
                 l.enable_verdicts(verdicts_tx);
                 (l, rig, verdicts, inputs)
             },
-            |(mut l, mut rig, mut verdicts, _inputs)| {
-                while l.run_once(&mut rig.ports()).unwrap() {}
+            |(mut l, mut rig, mut verdicts, mut inputs)| {
+                while inputs.turn(&mut l, &mut rig) {}
+                assert_eq!(rig.refs.offers.lock().unwrap().len(), total);
                 let sent = std::iter::from_fn(|| verdicts.try_recv().ok()).count();
                 assert_eq!(sent, total, "one verdict for each transaction");
             },
@@ -185,8 +219,8 @@ fn bench_with_verdicts(c: &mut Criterion) {
 
 /// Drain the batch through the loop, then check that every transaction
 /// went out.
-fn run_to_completion((mut l, mut rig, _inputs): (AdmissionLoop, Rig, Inputs)) {
-    while l.run_once(&mut rig.ports()).unwrap() {}
+fn run_to_completion((mut l, mut rig, mut inputs): (AdmissionLoop, Rig, Inputs)) {
+    while inputs.turn(&mut l, &mut rig) {}
     let published = rig.refs.offers.lock().unwrap().len();
     assert_eq!(published, usize::try_from(SENDERS * NONCES).unwrap());
 }

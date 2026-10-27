@@ -13,7 +13,11 @@ impl Bench {
         (0..3).for_each(|nonce| b.refusal(nonce, reason.clone()));
         b.run();
         b.run();
-        assert_eq!(b.nonces(), [0, 1, 2, 0, 1, 2]);
+        assert_eq!(b.nonces(), [0, 0]);
+        b.canonical(0);
+        assert_eq!(b.nonces(), [0, 0, 1]);
+        b.canonical(1);
+        assert_eq!(b.nonces(), [0, 0, 1, 2]);
         assert!(b.rig.errors().is_empty());
         assert!(b.rig.drops().is_empty());
     }
@@ -27,7 +31,7 @@ impl Bench {
             .unwrap();
         self.sweep();
     }
-    fn refusal(&self, nonce: u64, reason: TxErrorReason) {
+    pub(super) fn refusal(&self, nonce: u64, reason: TxErrorReason) {
         self.accounts
             .send(AccountEvent::Refusal(Box::new(SealerRefusal {
                 sender: self.sender(),
@@ -64,6 +68,26 @@ impl Bench {
     fn nonces(&self) -> Vec<u64> {
         self.offers().iter().map(|(nonce, _)| *nonce).collect()
     }
+}
+
+#[test]
+fn a_delayed_guard_notice_cannot_leave_a_suffix_queued_at_the_sealer() {
+    let mut b = Bench::new(SealerVersion::starting_at(5));
+    b.send(0);
+    b.send(1);
+    assert_eq!(b.nonces(), [0]);
+    b.refusal(
+        0,
+        TxErrorReason::DaLag {
+            sealed_head: 10,
+            posted_head: 1,
+            budget_blocks: 1,
+        },
+    );
+    b.run();
+    assert_eq!(b.nonces(), [0, 0]);
+    b.canonical(0);
+    assert_eq!(b.nonces(), [0, 0, 1]);
 }
 
 #[test]
@@ -161,6 +185,7 @@ fn a_delayed_guard_refusal_retries_only_the_still_unconfirmed_suffix() {
     b.send(0);
     b.send(1);
     b.confirm_first();
+    b.run();
     b.refusal(
         1,
         TxErrorReason::DaLag {
@@ -261,6 +286,8 @@ fn a_hash_specific_refusal_does_not_remove_another_transaction_at_the_nonce() {
         .unwrap();
     b.run();
     b.send(1);
+    assert_eq!(b.nonces(), [0]);
+    b.canonical(0);
     assert_eq!(b.nonces(), [0, 1]);
     assert!(b.l.admission.unconfirmed_at(b.sender(), 0).is_some());
 }
