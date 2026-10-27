@@ -28,9 +28,8 @@
   },
   "fixture_limit": "The fake API models the observed readiness dependency. It runs the real playbook and Nomad HCL compiler, not real service processes; fresh full retention CI remains required.",
   "validation_pending": [
-    "Failed-attempt record",
-    "Carry genesis bootstrap and reader transition",
-    "Fresh integration cluster CI"
+    "Fresh integration cluster CI, including complete small-budget retention phase",
+    "Ten consecutive complete green rounds on one unchanged final SHA"
   ],
   "style": "just style passes; existing proc-macro-error2 future compatibility notice remains.",
   "source_sha256": {
@@ -40,21 +39,32 @@
   "streak": 0,
   "validation_completed": [
     {
+      "command": "CARGO_TARGET_DIR=/home/dev/kardamom-integ/target just style",
+      "result": "pass with baseline proc-macro-error2 future compatibility notice",
+      "log": "/tmp/chaos-posting-order-style-20261027.log"
+    },
+    {
       "command": "just --justfile deploy/cluster/justfile validate",
       "result": "pass: YAML/Ansible lint, Nomad HCL validation, contract check and Terraform validation",
       "log": "/tmp/chaos-posting-order-deploy-validate-20261027.log"
     },
     {
-      "test": "DeployTest.test_deploy_order_pinning_and_repeat",
-      "result": "pass"
+      "tests": [
+        "DeployTest.test_deploy_order_pinning_and_repeat",
+        "DeployTest.test_an_undecided_deployment_fails_when_the_budget_runs_out",
+        "RecordTest.test_a_failed_attempt_stays_distinct_from_the_accepted_release"
+      ],
+      "result": "3 pass in 527.673 seconds",
+      "log": "/tmp/chaos-posting-order-deploy-checks-20261027.log"
     },
     {
-      "test": "DeployTest.test_an_undecided_deployment_fails_when_the_budget_runs_out",
-      "result": "pass"
-    },
-    {
-      "test": "RollbackTest.test_a_rollback_reverts_the_accepted_release_in_reverse_order",
-      "result": "pass"
+      "tests": [
+        "RollbackTest.test_a_rollback_reverts_the_accepted_release_in_reverse_order",
+        "CarryTest.test_a_genesis_bootstrap_starts_a_chain_with_the_carry_window",
+        "CarryTest.test_the_readers_move_to_the_egress_past_the_last_stored_reference"
+      ],
+      "result": "3 pass in 743.486 seconds",
+      "log": "/tmp/chaos-posting-order-roll-carry-checks-20261027.log"
     }
   ]
 }
