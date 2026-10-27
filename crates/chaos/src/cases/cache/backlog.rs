@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 
-use super::rebuilds::{MirrorRebuilds, RebuildPhase};
 use super::{MIRROR_HEAD_KEYS, aux, live_primary, redis_cli, wait_readers_recovered};
 use crate::harness::Harness;
 use crate::metrics;
@@ -22,9 +21,9 @@ struct Baseline {
     primary: String,
     heads: Heads,
     account: AccountState,
-    rebuilds: MirrorRebuilds,
 }
 
+#[derive(Clone, Copy)]
 struct Heads([NonZeroU64; 3]);
 
 impl Heads {
@@ -54,6 +53,10 @@ impl Heads {
                 script
             })
     }
+
+    fn advanced_over(self, before: Self) -> bool {
+        self.0.into_iter().zip(before.0).all(|(now, old)| now > old)
+    }
 }
 
 impl Baseline {
@@ -77,7 +80,6 @@ impl Baseline {
             primary,
             heads: Heads::parse(raw.trim_end())?,
             account,
-            rebuilds: MirrorRebuilds::read(h).await?,
         };
         baseline.await_row(h, &baseline.account).await?;
         Ok(baseline)
@@ -109,6 +111,38 @@ impl Baseline {
             "{CTX}: exact account row is not projected after {}s: expected {account:?}, observed {:?}, primary {}",
             elapsed.as_secs(), last.borrow(), self.primary
         ))?;
+        Ok(())
+    }
+
+    /// A writer can resume from a projection another writer rebuilt.
+    /// Every writer must publish two later coverage heads, and the shared
+    /// row must match the committed account within the same budget.
+    async fn await_recovery(&self, h: &Harness, account: &AccountState) -> anyhow::Result<()> {
+        let first = std::cell::Cell::new(None::<Heads>);
+        let last = std::cell::RefCell::new(String::from("no projection response"));
+        poll::until(Budget::secs(300, 5), |_| async {
+            let raw = h.nodes.exec(&aux(h), &redis_cli(&format!(
+                "--raw -h {} MGET {MIRROR_HEAD_KEYS}", self.primary
+            ))).await?;
+            last.replace(raw.clone());
+            let Ok(heads) = Heads::parse(raw.trim_end()) else {
+                return Ok(None);
+            };
+            if !heads.advanced_over(self.heads) {
+                return Ok(None);
+            }
+            let advancing = first.get().is_some_and(|floor| heads.advanced_over(floor));
+            if first.get().is_none() {
+                first.set(Some(heads));
+            }
+            Ok((advancing && account.matches_projection(&self.row(h).await?)).then_some(()))
+        }).await?.or_fail(|elapsed| crate::chaos_fail!(
+            "{CTX}: restored writers do not advance every coverage head twice with exact account state within {}s (heads {:?})",
+            elapsed.as_secs(), last.borrow()
+        ))?;
+        crate::log(format!(
+            "{CTX}: every restored writer advances its coverage head twice and the projected account matches committed state"
+        ));
         Ok(())
     }
 
@@ -303,11 +337,7 @@ pub(crate) async fn client_restart(h: &mut Harness) -> anyhow::Result<()> {
     cleared?;
     restored?;
     saved?;
-    baseline
-        .rebuilds
-        .await_phase(h, CTX, RebuildPhase::Complete)
-        .await?;
-    baseline.await_row(h, &expected).await?;
+    baseline.await_recovery(h, &expected).await?;
     wait_readers_recovered(h, CTX).await?;
     h.assert_progress().await
 }
@@ -315,6 +345,17 @@ pub(crate) async fn client_restart(h: &mut Harness) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Heads, Reader};
+
+    #[test]
+    fn projection_recovery_requires_a_later_head_from_every_writer() {
+        let parse =
+            |values: [u64; 3]| Heads(values.map(|value| std::num::NonZeroU64::new(value).unwrap()));
+        let before = parse([10, 20, 30]);
+        assert!(parse([11, 21, 31]).advanced_over(before));
+        assert!(!parse([100, 200, 30]).advanced_over(before));
+        assert!(!parse([100, 19, 300]).advanced_over(before));
+        assert!(!before.advanced_over(before));
+    }
 
     #[test]
     fn held_heads_require_three_complete_positive_position_tags() {

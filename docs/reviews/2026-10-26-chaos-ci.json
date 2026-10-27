@@ -732,6 +732,62 @@
       "product_bug": false,
       "hot_path_changed": false,
       "status": "Local regression passes; fresh runtime CI required."
+    },
+    {
+      "id": "validator-missing-executor-can-pass-catchup",
+      "classification": "harness",
+      "observed": "wait_verifying_live, recovery_sample and validator-join turn a missing executor-head scrape into zero. An advancing validator at block 1000 then appears caught up with lag -1000. The warm-up also counts its first historical positive counter as progress without a previous observation.",
+      "change": "Share one complete observation reader. Missing verified count, committed block or executor head yields no sample. Require positive observed heads and bounded lag. Warm-up needs a verified-count increase across two complete observations; newborn/survivor proofs keep their process-specific counter floors. Read independent metrics concurrently within the existing poll deadline.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "The extracted original behavior fails two negative controls. After correction, all 237 chaos library tests pass, two manual profiles remain ignored, and workspace style passes. The follow-up is local; deployed validation remains pending.",
+      "verification": [
+        "Reject an advancing validator when the executor head is absent.",
+        "Require every source to answer; missing values never count as zero.",
+        "Retain positive live samples and reject historical-only, zero-head, non-advancing, regressed-counter and excessive-lag samples."
+      ]
+    },
+    {
+      "id": "validator-resume-stop-error-is-fatal",
+      "classification": "product follow-up",
+      "observed": "The source-reset opener in PR 853 handles cancellation during its retry wait, but a cancellation during an in-flight catalog open returns a Discovery stopped error. That error is classified as non-transient before checking the shutdown token, so an intentional shutdown returns an error.",
+      "change": "During resume, let the canceled shutdown token end the open cleanly before classifying its error. First-start errors and uncanceled state/permission errors retain their results.",
+      "product_bug": true,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "issue": "https://github.com/junemartes/kardamom/issues/854",
+      "status": "The new control fails on PR 853 runtime code and passes after correction. All 16 validator binary tests and workspace style pass locally. This changes only resume cancellation; no healthy transaction-path work is added."
+    },
+    {
+      "id": "receipt-measurement-can-excuse-an-unacknowledged-offer",
+      "classification": "harness measurement",
+      "observed": "With complete zero drop counters and ack_proves_receipt enabled, the benchmark verdict passes one unobserved accepted receipt and also passes three unacknowledged offers under Offered completeness. The combined undelivered count enters a small-tail exception, even though no acknowledgment exists for those offers. The production caller sets that flag whenever subscriptions are disabled.",
+      "change": "Remove the acknowledgment/counter exception and its inferred proof flag. Under assert_all_delivered, every undelivered transaction counted by the selected completeness policy fails. Healthy reference and V2 soak stages select Offered completeness. Fault-case Accepted completeness remains supported.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "Both controls fail with the complete original zero-counter fixture. All 91 benchmark library tests and workspace style pass after correction. Deployed validation remains pending.",
+      "verification": [
+        "Reject an accepted transaction whose receipt is never observed even when every drop counter is zero.",
+        "Reject an unacknowledged offer under Offered completeness; a blocking-RPC assumption cannot prove its delivery.",
+        "Existing Accepted/Offered policy controls, complete drain deadlines, pending submits, cancellation and receipt identity controls remain green."
+      ]
+    },
+    {
+      "id": "mirror-backlog-requires-rebuild-from-legitimately-resumed-writer",
+      "classification": "harness with unresolved runtime timeout observations",
+      "commit": "2b6a8acd898feb7e15df5b519a4334954f6b3d88",
+      "job": 122002299386,
+      "issue": "https://github.com/junemartes/kardamom/issues/857",
+      "observed": "Two new writers complete cold rebuilds. The third starts after another writer refreshed shared Redis and uses the declared resume path. Requiring a new completion line from it fails after300seconds. Every process also records sustained command/WAIT timeouts; their cause remains unproven.",
+      "change": "The backlog case requires all three actual Redis writer coverage heads to advance beyond the held values and advance again on a later observation while exact committed account state is visible. Use one300-second budget. Keep strict stale-read bypass evidence, fresh Redis reader recovery and pipeline progress. Forced-rebuild cases retain their per-process scan/completion proof.",
+      "verification": [
+        "Reject a missing writer, one unchanged head, a regressed head and a single writer advancing repeatedly.",
+        "All244 chaos tests and workspace style pass locally.",
+        "Fresh runtime gates still require actual coverage, fresh Redis reads and exact account state. No deadline increase or forced rebuild masks recovery."
+      ],
+      "status": "Local correction, deployed runtime validation pending."
     }
   ],
   "coverage": [
@@ -1288,6 +1344,31 @@
         "IN_PROGRESS": 13,
         "FAILURE": 1
       }
+    },
+    {
+      "commit": "2b6a8acd898feb7e15df5b519a4334954f6b3d88",
+      "url": "https://github.com/junemartes/kardamom/pull/853",
+      "cluster_run": 40445346246,
+      "integrity_run": 40445382312,
+      "status": "Diagnostic cluster shards are running. CI 40445346266, Docker 40445346263, chain-semantics 40445346250 and cluster-validate 40445346292 pass on attempt 1. No qualifying frozen-head round; streak 0/10."
+    },
+    {
+      "commit": "db74ce19adaad3382eaa3de1df5fd54e600b4677",
+      "url": "https://github.com/junemartes/kardamom/pull/855",
+      "cluster_run": 40448375718,
+      "integrity_run": 40448394112,
+      "status": "Diagnostic workflows are running. CI 40448375658 and Docker 40448375692 pass; the other supporting workflows and cluster shards are pending. No qualifying frozen-head round; streak 0/10."
+    },
+    {
+      "commit": "451f96459ce6f40a23c389db14058fcac05980db",
+      "cluster_run": 40448560013,
+      "integrity_run": 40448622797,
+      "status": "Diagnostic batch superseded by reviewed855/856 and mirror recovery proof. The published head independently reproduces permissive receipt measurement and canceled reopen errors. Preserve its actual runtime results as diagnostics; no qualifying stability round. Streak0/10.",
+      "checks_at_next_publication": {
+        "SUCCESS": 31,
+        "IN_PROGRESS": 11,
+        "QUEUED": 8
+      }
     }
   ],
   "integration": {
@@ -1396,6 +1477,23 @@
         "interpretation": "Median paired resident-loop cost changes are -0.23%, -0.94% and -0.97%. The short shared-host comparison shows no observed slowdown. Variation prevents a speedup claim. It does not measure per-transaction latency, full release throughput, a lifecycle pause or deployed recovery.",
         "invalid_attempt_excluded": true
       }
+    },
+    "complete_evidence_followups": {
+      "sources": {
+        "855": "db74ce19adaad3382eaa3de1df5fd54e600b4677",
+        "856": "ad6c76beaeea75b6a9141378a46c3be215eceeef"
+      },
+      "review": "Keep the integration pause, queue saturation, strict progress deadline, cache-hit negative control and active-pipeline verdict. Case warm-up/recovery reads activity, verified count and committed block from one scrape and requires a real executor head. Warm-up observes a later verification increase. Strict receipt completeness removes the inferred-ack exception; healthy loads use Offered completeness. Resume cancellation ends cleanly before classifying its stopped-open error.",
+      "independent_red": "The published451f9645 falsely passes both complete zero-counter receipt controls when the old inferred acknowledgment flag is true. Its validator resume returns an error on an intentionally stopped catalog open. Both fail independently in an isolated workspace.",
+      "validation": {
+        "bench_library": 91,
+        "chaos_library": 244,
+        "chaos_ignored": 2,
+        "validator_binary": 16,
+        "workspace_style": "pass, no warnings",
+        "independent_red": "two strict measurement failures and canceled catalog-open error reproduce against451f9645"
+      },
+      "remaining": "Issue857 tracks the real source853 cache failure, the permitted shared-projection resume and the separate observed Redis timeouts. The new proof requires two actual coverage advances from every writer and exact projected account state within300seconds. Full runtime validation remains required."
     }
   },
   "followup_candidate": {
@@ -1412,5 +1510,137 @@
       "Within the existing load job, run identical transfer and DeFi workloads on separate fresh reference and carry/V2 deployments. Read knobs from each actual deployment. Preserve distinct V2 report files and log the topology. No new shard."
     ],
     "status": "Local diagnostic candidate. Runtime bugs, test-oracle failures and coverage gaps remain distinct. Deployed validation and full workload comparison remain required. Head is not frozen; streak 0/10."
+  },
+  "source_followup_validation": {
+    "runtime_product_files_changed": true,
+    "service_wiring_changed": "V2 uses the existing lifecycle watch and session generation. Validator readiness now also requires an active pipeline; its activity gauge changes only at pipeline start/stop. Source-reset retries use the existing committed-state startup path. No deployment defaults, network topology or transport settings change. A startup-owned cancellation guard now covers failed opens and transfers to the existing ordered shutdown.",
+    "performance_claim": "No speedup or full-chain performance guarantee. Final V2 pause-recovery normal median paired throughput deltas are +0.10% ordered, -0.46% reversed and +0.51% with verdicts. All 240 observations from four comparisons, source hashes and binary hashes are retained, including early slower shapes and outliers. Identical-workload deployed client p50/p95/p99, throughput and executor fallback comparisons remain pending.",
+    "completed": [
+      {
+        "check": "chaos library unit tests",
+        "result": "192 passed, 2 ignored"
+      },
+      {
+        "check": "just style",
+        "result": "passed; existing proc-macro-error2 future-incompatibility notice"
+      },
+      {
+        "check": "format registry against PR 839 head",
+        "result": "passed"
+      },
+      {
+        "check": "workflow YAML lint",
+        "result": "passed"
+      },
+      {
+        "check": "ingress library and account layer tests",
+        "result": "132 library tests and 14 account tests passed"
+      },
+      {
+        "check": "real Redis ingress regression and profile tests",
+        "result": "8 passed; includes 5 profile rounds"
+      },
+      {
+        "check": "release RPC and serial-admission comparison",
+        "result": "5 before and 5 after repeats, 400 samples per phase per repeat; raw samples checked in"
+      },
+      {
+        "check": "ten-round audit utility",
+        "result": "14 tests pass, including rejecting overlap after an early failure; real GitHub evidence reads verified"
+      },
+      {
+        "check": "sealer Java recovery and allocation gates",
+        "result": "622 tests pass: 208 core and 414 service"
+      },
+      {
+        "check": "follow-up chaos library tests",
+        "result": "213 passed, 2 ignored, including real HTTP replay controls"
+      },
+      {
+        "check": "V2 account lookup feed",
+        "result": "Five controls pass: source recovery without a second request, healthy first answer, shutdown, saturation and feed abort"
+      },
+      {
+        "check": "benchmark library",
+        "result": "84 passed, including the blocked-pacer deadline regression"
+      },
+      {
+        "check": "V2 healthy cold-lookup release profile",
+        "result": "No speedup claim. Final p50/p95/p99 and throughput are close to the baseline with mixed paired differences. This short shared-host microbenchmark cannot establish a full workload performance guarantee. Full cluster workload evidence and ten green rounds remain pending."
+      },
+      {
+        "check": "V2 pause regressions and resident-loop profile",
+        "result": "188 library tests, 14 binary tests, style and five alternating pinned release pairs complete. Full workload and deployed pause validation pending."
+      },
+      {
+        "check": "strict drain, idle V2 reconnect and replicated cache baselines",
+        "result": "89 benchmark tests, 193 sequencer library tests, 14 binary tests and 226 chaos tests pass. Three manual tests remain ignored. Workspace style passes. Pinned normal/forced-sweep release comparison is recorded. Deployment validation pending."
+      },
+      {
+        "check": "offline quorum recovery, bounded observations and checkpoint proof",
+        "result": "232 chaos library tests pass, two manual profiles ignored. 49 batcher tests pass. Workspace style passes. Offline-copy hash/corruption and real filesystem install-race controls pass. All deployed proofs remain pending on the follow-up candidate."
+      },
+      {
+        "check": "PR 851 failure classification and local follow-up",
+        "result": "198 sequencer library + 14 binary, 142 validator library + 15 binary, 97 adapter library and 234 chaos library tests pass. Three manual profiles are ignored. Workspace style passes. The dedicated load job now runs reference and V2 topologies separately."
+      },
+      {
+        "check": "strict validator recovery observations",
+        "result": "Two negative controls reproduce the false pass. The complete-sample fix and three controls pass with all 237 chaos library tests (two manual profiles ignored). Workspace style passes. No product runtime or service wiring changes."
+      },
+      {
+        "check": "validator resume cancellation during an open",
+        "result": "The exact stopped-discovery error fails before correction. All 16 validator binary controls and workspace style pass after correction."
+      },
+      {
+        "check": "strict receipt measurement",
+        "result": "Two complete zero-counter controls fail before correction, then all 91 benchmark library tests and workspace style pass. Healthy soak now requires every offered transaction. No chain-runtime or healthy submit-path change."
+      }
+    ],
+    "pending": [
+      "Full CI for the product fix",
+      "Remaining coverage gaps",
+      "Full cluster workload comparison",
+      "10 consecutive complete green CI rounds on the final unchanged commit",
+      "Deployed validation of the 76 scheduled cases, including the scoped canary genesis and guard restoration"
+    ],
+    "ci_wiring_changed": "Retain load/profile evidence; add suite=all to the cluster workflow without changing normal PR/scheduled selection; make static validation dispatchable; test the persistent ten-round audit utility in CI. The serial carry rollout has a 300-minute job budget; all per-case recovery deadlines remain unchanged.",
+    "streak_command": "python3 scripts/ci/green_streak.py --branch BRANCH --head FULL_SHA --state AUDIT.json --poll --run CI_ID --run CLUSTER_ID --run DOCKER_ID --run SEMANTICS_ID --run VALIDATION_ID",
+    "streak_dispatch": [
+      {
+        "workflow": "ci.yml",
+        "inputs": {}
+      },
+      {
+        "workflow": "cluster-e2e.yml",
+        "inputs": {
+          "suite": "all"
+        }
+      },
+      {
+        "workflow": "docker-e2e.yml",
+        "inputs": {}
+      },
+      {
+        "workflow": "chain-semantics-e2e.yml",
+        "inputs": {}
+      },
+      {
+        "workflow": "cluster-validate.yml",
+        "inputs": {}
+      }
+    ],
+    "fault_fixture_wiring_changed": "The carry prune-floor case temporarily shortens egress reader-window and segment lengths. It keeps the registered L1 safety floors and restores the exact job. No deployment default changes. Carry now enables the existing L1 fault proxy topology for its deposit fault. The checkpoint-scan interruption temporarily pauses Redis writes, permits read fallbacks and always clears the pause/restores the saved mirror job.",
+    "performance_profiles_pending": {
+      "baseline_branch": "profile/v2-pause-baseline-20261027",
+      "baseline_head": "60c3b0120a16e64de6b5f53c2df314cb6bde92cc",
+      "baseline_run": 40446103527,
+      "candidate_branch": "profile/v2-pause-candidate-20261027",
+      "candidate_head": "3a025e7d171f100469af4b92ccd4c907032744fa",
+      "candidate_run": null,
+      "method": "The same load harness runs fresh reference and V2 clusters. Only four sequencer production source files differ between runtime conditions. Each profile branch narrows the regular matrix to the existing load job. These runs cannot qualify for a complete green round. Finish baseline before dispatching candidate; retain failures and all reports.",
+      "measurement_validity": "Require zero unlanded/missing/bad-status/bad-receipt counts and offered==accepted==receipted, regardless of a legacy pass flag. Compare measured counts per paced second alongside configured target and p50/p95/p99; target TPS is not measured throughput."
+    },
+    "historical_reference_load": "docs/benches/2026-10-27-reference-ci-load.json"
   }
 }

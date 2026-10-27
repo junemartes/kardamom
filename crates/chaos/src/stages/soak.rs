@@ -132,7 +132,8 @@ impl Harness {
             ramp_step_tps,
             ramp_step_secs: RAMP_STEP_SECS,
             soak_fraction: SOAK_FRACTION,
-            completeness: Completeness::Accepted,
+            // A healthy stage requires a receipt for every offered transaction.
+            completeness: Completeness::Offered,
             assert_all_delivered: true,
             chaos_mode: false,
             fixed_rate: true,
