@@ -1008,6 +1008,25 @@
         "/tmp/chaos-gaps-quorum-sampling-negative.log"
       ],
       "status": "Local verification passes. Fresh deployed validation remains pending; unchanged fault, recovery, receipt and final-state gates."
+    },
+    {
+      "id": "raft-fault-submit-before-ingress-session-reconnect",
+      "classification": "harness",
+      "case": "raft-leader-one-way-partition",
+      "observed": "Run 40491865944 job 122162680082 elects member 2 at 12:40:46.775 UTC, then the single-shot fault transfer aborts at 12:40:49.611 on sealer_no_quorum. Its 60-second outer deadline does not retry a refused submit.",
+      "change": "Keep the exact signed bytes and retry only explicit sealer_no_quorum refusals inside the same 60-second deadline. Require the signed hash and a successful receipt; keep all other failures strict.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "verification": [
+        "Five socket controls and two negative mutations pass their expected verdicts.",
+        "299 chaos library tests pass; two existing tests remain ignored. just style passes with the baseline dependency notice."
+      ],
+      "evidence": [
+        "https://github.com/junemartes/kardamom/actions/runs/40491865944/job/122162680082",
+        "docs/reviews/2026-10-27-raft-refusal-retry.json"
+      ],
+      "status": "Local controls pass; runtime Raft recovery, final performance and ten fresh complete green rounds remain unproven."
     }
   ],
   "coverage": [

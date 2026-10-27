@@ -7,6 +7,7 @@
 //! the Redis cases.
 
 mod deposit;
+mod recovery;
 pub(crate) use deposit::ReceiptPosition;
 
 use std::time::Duration;
@@ -330,17 +331,6 @@ impl Rpc {
     pub async fn transfer_smoke(&self, account: u32, budget: Duration) -> anyhow::Result<()> {
         let nonce = self.nonce_of(account).await?;
         self.transfer_hash(account, nonce, budget).await.map(|_| ())
-    }
-
-    /// Bound nonce lookup, submission and receipt polling by one deadline.
-    pub(crate) async fn transfer_within(
-        &self,
-        account: u32,
-        budget: Duration,
-    ) -> anyhow::Result<()> {
-        tokio::time::timeout(budget, self.transfer_smoke(account, budget))
-            .await
-            .context("fault blocks the client past its transfer bound")?
     }
 
     /// [`Self::transfer_smoke`] at `nonce`, for a case that sets the nonce
