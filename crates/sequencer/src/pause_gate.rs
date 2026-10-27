@@ -32,20 +32,12 @@ impl PauseGate {
 
     /// Whether the loop must offer nothing this turn.
     pub(crate) fn paused(&mut self) -> bool {
-        self.read_with(|_| {})
-    }
-
-    /// A changed watch that already reads clear can include an entire
-    /// pause and resume between turns. Its unconfirmed offers still need
-    /// recovery even when this loop never observed the paused state.
-    pub(crate) fn read_with(&mut self, on_change: impl FnOnce(bool)) -> bool {
         if let Some(rx) = self
             .rx
             .as_mut()
             .filter(|rx| rx.has_changed().unwrap_or(false))
         {
             self.paused = rx.borrow_and_update().pause.is_some();
-            on_change(self.paused);
         }
         self.paused
     }
