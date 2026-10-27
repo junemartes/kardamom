@@ -49,9 +49,11 @@ impl Case {
                 .saturating_add(Duration::from_mins(16)),
             // Scale-out and scale-in each submit overlap, ingress and steady jobs.
             Self::ResizeScaleOutIn => inject + Duration::from_mins(30),
-            // Two full Ansible passes surround the executor's failed
-            // deployment deadline, then the common tail proves recovery.
-            Self::DeployBrokenImage => inject + k.reschedule_slo + Duration::from_mins(30),
+            // Each full Ansible pass gets thirty minutes of traffic.
+            // Unused submissions stop after the case proves recovery.
+            Self::DeployBrokenImage => inject
+                .saturating_add(k.reschedule_slo)
+                .saturating_add(Duration::from_mins(30).saturating_mul(2)),
             Self::LookupBlackout => inject + k.restart_slo * 2 + Duration::from_mins(5),
             // The freeze, the election, and the recovery polls.
             Self::RedisPrimaryFreeze | Self::RedisPrimaryKill | Self::RedisPartitionIngress => {

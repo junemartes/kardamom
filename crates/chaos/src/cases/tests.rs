@@ -1,6 +1,19 @@
 use super::*;
 
 #[test]
+fn broken_image_traffic_covers_both_full_deployments_and_the_recovery_tail() {
+    let knobs = crate::knobs::Knobs::read(&[]).unwrap();
+    let window = Case::DeployBrokenImage.window(&knobs);
+    // The fault and healing passes take 1232 and 1093 seconds. The
+    // common tail must still observe case-owned traffic afterwards.
+    let observed = std::time::Duration::from_secs(1232 + 1093);
+    assert!(window >= knobs.inject_delay + observed + knobs.reschedule_slo);
+    let mut longer = knobs.clone();
+    longer.case_window = window + std::time::Duration::from_mins(1);
+    assert_eq!(Case::DeployBrokenImage.window(&longer), longer.case_window);
+}
+
+#[test]
 fn every_shard_case_parses_and_names_round_trip() {
     let shards = [
         crate::Shard::Executor,
