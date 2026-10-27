@@ -14,7 +14,8 @@
     "required_consecutive_green_rounds": 10,
     "green_round_definition": "Five explicit workflow_dispatch runs on the same frozen branch and head: CI, cluster-e2e with suite=all, docker-e2e, chain-semantics-e2e, and cluster-validate. Every existing chaos shard and both stages must be green. Failure, cancellation, or missing coverage resets the streak. Incomplete rounds do not advance it; partial reruns cannot replace complete rounds.",
     "green_streak": 0,
-    "final_commit": null
+    "final_commit": null,
+    "merge_policy": "Review and merge independently verified fixes as their relevant checks pass. Ten serial complete green rounds gate the overall flakiness-fixed claim. Freeze the resulting integration head for qualification after merging."
   },
   "failures": [
     {
@@ -939,6 +940,29 @@
         "Disabling the fixed fresh-chain budget fails two plan controls; source is restored afterward."
       ],
       "remaining": "Deployed confirmation and exact state parity remain required. The product still treats lag budgets as external replicated configuration; changing one on a live chain is a separate operational/protocol risk. No canonical rule or snapshot format changes here."
+    },
+    {
+      "id": "quorum-stall-survivor-lost-by-sequential-aggregate",
+      "classification": "harness",
+      "case": "cluster-quorum-loss-recover",
+      "source": "crates/chaos/src/asserts.rs and asserts/stall.rs",
+      "observed": "Independent full audit40461296734 job122056543388 kills sealer nodes1 and2, with their colocated executors. The survivor keeps head622. Serial exporter reads can lose that completed value when the12second aggregate times out on unavailable peers.",
+      "change": "Adopt reviewed PR868: sample endpoints concurrently and retain the maximum completed value. Cancel unfinished reads at the same12second bound. Missing readings remain absent, before and after are independent, and the unchanged stall proof requires equal real samples.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "verification": [
+        "Four paused-clock survivor-position, maximum, all-missing and fresh-observation controls pass.",
+        "Discarding completed samples when another read remains pending fails the survivor and maximum controls; final source is restored.",
+        "265 chaos library tests pass, two local Nomad-agent tests remain ignored; six pure phase tests pass without starting a local cluster."
+      ],
+      "evidence": [
+        "https://github.com/junemartes/kardamom/pull/868",
+        "https://github.com/junemartes/kardamom/actions/runs/40461296734/job/122056543388",
+        "docs/reviews/2026-10-27-quorum-stall-sampling.json",
+        "/tmp/chaos-gaps-quorum-sampling-negative.log"
+      ],
+      "status": "Local verification passes. Fresh deployed validation remains pending; unchanged fault, recovery, receipt and final-state gates."
     }
   ],
   "coverage": [
@@ -1856,21 +1880,44 @@
     "qualifying_streak": 0,
     "deployed_validation": "pending",
     "guard_rule": "A snapshot tail replays with the same DA guard from genesis; no temporary live budget switch.",
-    "local_tests": "260 chaos tests pass, 2 existing local Nomad-agent tests ignored; full Java core suite passes including three budget replay controls",
+    "local_tests": "265 chaos library tests pass, 2 ignored; 6 pure phase tests pass; all205 Java core tests pass.",
     "negative_control": "2 expected plan failures without a fixed fresh-chain budget",
     "style": "pass",
-    "java_core_tests": 205
+    "java_core_tests": 205,
+    "consolidation": "Adopt reviewed PR865 phase owner and guard readings. Keep the existing catch-up prerequisite in the same120second observation budget. Remove the duplicate public shard-plan helper. Every ingress must observe the guard. Reject empty plans and reuse across distinct settings before lifecycle work. Wait for a fresh short-budget chain to recover before its smoke transfer.",
+    "evidence": [
+      "https://github.com/junemartes/kardamom/pull/865",
+      "docs/reviews/2026-10-27-da-guard-divergence.json"
+    ]
   },
   "deployment_traffic_followup": {
     "runtime_product_files_changed": false,
     "service_wiring_changed": false,
     "hot_path_changed": false,
-    "local_tests": "261 chaos tests pass; two local Nomad-agent tests remain ignored",
+    "local_tests": "265 chaos library tests pass, 2 ignored; 6 pure phase tests pass",
     "style": "pass",
     "existing_full_play_allowance_minutes": 40,
     "broken_image_full_plays": 2,
     "unchanged_executor_job_minutes": 120,
     "deployed_validation": "pending",
+    "qualification_streak": 0,
+    "consolidation": "Merge reviewed PR869 ancestry and preserve its timing evidence. Use the shared40minute full-deploy allowance already used by carry; keep one timeline regression and its longer-configured-window control.",
+    "evidence": [
+      "https://github.com/junemartes/kardamom/pull/869",
+      "docs/reviews/2026-10-27-broken-image-load-coverage.json"
+    ]
+  },
+  "remaining_pr_consolidation": {
+    "pull_request": 864,
+    "reviewed_heads": {
+      "861": "72461d2f1741e2453c91bf2cbf440a67e8c52767",
+      "865": "833362794466387781fc2501764b095072057c90",
+      "868": "5e057c2d2c35ceec7c59aa31d2db31ff3381a8b9",
+      "869": "74c82e6582edf4451ab5e7d88c552681d1acdedb"
+    },
+    "policy": "Review and merge independently verified fixes as their relevant checks pass. Ten serial complete green rounds gate the overall flakiness-fixed claim. Freeze the resulting integration head for qualification after merging.",
+    "excluded_pr": 645,
+    "exclusion": "Scheduled disk-sync changes remain outside the authorized stack.",
     "qualification_streak": 0
   }
 }

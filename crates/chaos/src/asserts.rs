@@ -12,10 +12,12 @@ use crate::knobs::ExecutorNodes;
 use crate::metrics;
 use crate::nomad::Alloc;
 use crate::poll::{self, Budget};
-use crate::probes::EXECUTOR_BLOCK_METRIC;
+use crate::probes::{EXECUTOR_BLOCK_METRIC, INGRESS_SEALED_HEAD_METRIC};
 
 mod progress;
 use progress::ExecutorProgress;
+mod stall;
+use stall::Samples;
 
 /// How long the sealer boundary counter may stay flat after a recovery.
 /// An executor that misses a join waits 10 s (`join_refetch_after`)
@@ -112,25 +114,48 @@ impl StallHead {
         }
     }
 
-    async fn read(self, h: &Harness) -> Option<i64> {
-        match self {
-            Self::Executor => h.probes.executor_progress().await,
-            Self::Ingress => h.probes.ingress_sealed_head().await,
+    /// One concurrent reading within twelve seconds. A dark endpoint
+    /// cannot discard a completed reading from a surviving node.
+    async fn sample(self, h: &Harness) -> Option<i64> {
+        let (targets, metric) = match self {
+            Self::Executor => (
+                (0..h.probes.executors.len())
+                    .map(|index| h.probes.executor_target(index))
+                    .collect::<Vec<_>>(),
+                EXECUTOR_BLOCK_METRIC,
+            ),
+            Self::Ingress => (
+                h.probes
+                    .ingresses
+                    .iter()
+                    .map(|node| h.probes.ingress_target(node))
+                    .collect(),
+                INGRESS_SEALED_HEAD_METRIC,
+            ),
+        };
+        let mut samples = Samples::default();
+        for target in targets {
+            samples.start(Self::read(h.probes.scrape().clone(), target, metric));
         }
+        samples.maximum().await
     }
 
-    /// One reading, retried for twelve seconds.
-    async fn sample(self, h: &Harness) -> Option<i64> {
-        let outcome = poll::until(
-            Budget::secs(12, 3),
-            |_| async move { Ok(self.read(h).await) },
-        )
+    async fn read(
+        scrape: metrics::Scrape,
+        target: metrics::Target,
+        metric: &'static str,
+    ) -> Option<i64> {
+        poll::until(Budget::secs(12, 3), |_| async {
+            Ok(scrape
+                .fetch(&target)
+                .await
+                .and_then(|body| metrics::first(&body, metric)))
+        })
         .await
-        .ok()?;
-        outcome
-            .or_fail(|_| anyhow::anyhow!("no sample"))
-            .ok()
-            .map(|(v, _)| v)
+        .ok()?
+        .or_fail(|_| anyhow::anyhow!("no sample"))
+        .ok()
+        .map(|(value, _)| value)
     }
 }
 

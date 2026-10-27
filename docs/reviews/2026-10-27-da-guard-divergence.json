@@ -1,0 +1,18 @@
+{
+  "observed_at": "2026-10-27T07:17:46.807026+00:00",
+  "head": "0cf8d4b64c302091cdf67586879ef774e4f1e74f",
+  "run": 40458018122,
+  "job": 122041411232,
+  "case": "da-lag-halt",
+  "observed": "Validator halts on block1087 BAL write-set mismatch: local0 versus published3 accounts, session1967898965, one of four observed BAL sessions. All three executors report286 identical nonce-too-low canonical skips, at blocks1073,1084,1103. All three later detect committed canonical history changes and roll back from divergence block1083.",
+  "fixture_violation": "SmallBudget directly registers a saved cluster job with daLagBudgetBlocks=8, then restores the original budget. The workloads release gate explicitly lists daLagBudgetBlocks as must-match because mixed values fork replicated accept/reject decisions. The fixture bypasses that gate while replaying an existing log.",
+  "evidence": [
+    "deploy/cluster/ansible/roles/workloads/defaults/main.yml:workloads_sealer_must_match",
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerClusteredService.java:budgets",
+    "crates/chaos/src/cases/da_lag/setup.rs:SmallBudget::run",
+    "retained executor, validator and sealer logs in chaos-diagnostics-chaos-retention/"
+  ],
+  "classification": "Invalid live change of replicated configuration is established. It can change decisions during historical log replay. The mismatch verdict is real and remains fatal. Fresh guard-from-genesis runtime validation is required to determine whether any further product failure remains.",
+  "scope": "Retain the failed shard. Do not ignore a replica, reset divergence counters, weaken state checks or retry the same head. The preceding retention-overrun, validator overrun and prune-floor cases pass.",
+  "proposed_fix": "Run the two DA-guard cases on a separate fresh chain inside the existing retention job, with the small guard fixed from genesis. Keep all cases and complete end-of-phase receipt, validator and exact persisted-state gates. Never change must-match settings on a running chain. No new shard or recovery deadline increase."
+}

@@ -28,6 +28,9 @@
 
 use kardamom_chaos::{DeployVars, Harness, Knobs, Lifecycle, Shard};
 
+#[path = "shards/phases.rs"]
+mod phases;
+
 /// The two shards without chaos: the sustained load, and the
 /// chain-semantics suite.
 #[derive(Debug, Clone, Copy)]
@@ -102,45 +105,9 @@ async fn run_audited(harness: &mut Harness, case: &str, audit: bool) -> anyhow::
 }
 
 async fn run_shard(shard: Shard) -> anyhow::Result<()> {
-    for run in shard.runs(&case_list(shard), reuse()) {
-        run_shard_chain(run).await?;
-    }
-    Ok(())
-}
-
-async fn run_shard_chain(run: kardamom_chaos::shard::ShardRun) -> anyhow::Result<()> {
-    let shard = run.shard;
-    let knobs = Knobs::deployed(shard.env(), &run.vars)?;
-    let lifecycle = Lifecycle::in_workspace().with_vars(run.vars);
-    let contract = if reuse() {
-        lifecycle.contract()?
-    } else {
-        lifecycle.up().await?
-    };
-    let mut harness = Harness::new(contract, knobs, lifecycle.clone())?;
-    harness.prepare_case_services().await?;
-    harness.smoke_gate(harness.knobs.gate_account).await?;
-    let cases = run.cases;
-    kardamom_chaos::log(format!(
-        "chaos suite: shard={} cases=[{}] tps={} case_s={}",
-        shard.name(),
-        cases.join(" "),
-        harness.knobs.tps,
-        harness.knobs.case_window.as_secs()
-    ));
-    for (i, case) in cases.iter().enumerate() {
-        let audit = i + 1 < cases.len() && shard.audits_after(case);
-        run_audited(&mut harness, case, audit).await?;
-    }
-    kardamom_chaos::log(format!("chaos suite PASSED ({})", cases.join(" ")));
-    harness.ingress_churn().await?;
-    harness.validator_verdict().await?;
-    harness.assert_persisted_state().await?;
-    kardamom_chaos::log("cluster-e2e PASSED");
-    if !reuse() {
-        lifecycle.down().await?;
-    }
-    Ok(())
+    phases::Phases::read(shard, &case_list(shard), reuse())?
+        .run()
+        .await
 }
 
 async fn run_stage(stage: Stage) -> anyhow::Result<()> {
