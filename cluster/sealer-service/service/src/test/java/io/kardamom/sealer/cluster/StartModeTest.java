@@ -130,29 +130,29 @@ final class StartModeTest {
     @Test
     void aRoundSeedsAtBackingUp() {
         final SeedWatch watch = new SeedWatch(TIMEOUT_MS, 0);
-        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.BACKUP_QUERY, 10));
-        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.SNAPSHOT_RETRIEVE, 20));
-        assertEquals(SeedWatch.Outcome.SEEDED, watch.observe(State.BACKING_UP, 30));
+        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.BACKUP_QUERY, SeedWatch.Copy.MISSING, 10));
+        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.SNAPSHOT_RETRIEVE, SeedWatch.Copy.MISSING, 20));
+        assertEquals(SeedWatch.Outcome.SEEDED, watch.observe(State.BACKING_UP, new SeedWatch.Copy(0, true), 30));
     }
 
     @Test
     void aRoundWithoutAPeerAnswerEndsAtThePeerTimeout() {
         final SeedWatch watch = new SeedWatch(TIMEOUT_MS, 0);
-        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.BACKUP_QUERY, TIMEOUT_MS - 1));
-        assertEquals(SeedWatch.Outcome.NO_PEER, watch.observe(State.RESET_BACKUP, TIMEOUT_MS));
+        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.BACKUP_QUERY, SeedWatch.Copy.MISSING, TIMEOUT_MS - 1));
+        assertEquals(SeedWatch.Outcome.NO_PEER, watch.observe(State.RESET_BACKUP, SeedWatch.Copy.MISSING, TIMEOUT_MS));
     }
 
     @Test
     void aPeerAnswerRestartsThePeerTimeout() {
         final SeedWatch watch = new SeedWatch(TIMEOUT_MS, 0);
-        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.LIVE_LOG_REPLAY, TIMEOUT_MS - 1));
-        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.RESET_BACKUP, 2 * TIMEOUT_MS - 2));
-        assertEquals(SeedWatch.Outcome.NO_PEER, watch.observe(State.BACKUP_QUERY, 2 * TIMEOUT_MS - 1));
+        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.LIVE_LOG_REPLAY, SeedWatch.Copy.MISSING, TIMEOUT_MS - 1));
+        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.RESET_BACKUP, SeedWatch.Copy.MISSING, 2 * TIMEOUT_MS - 2));
+        assertEquals(SeedWatch.Outcome.NO_PEER, watch.observe(State.BACKUP_QUERY, SeedWatch.Copy.MISSING, 2 * TIMEOUT_MS - 1));
     }
 
     @Test
     void aClosedBackupEndsTheRound() {
-        assertEquals(SeedWatch.Outcome.BACKUP_CLOSED, new SeedWatch(TIMEOUT_MS, 0).observe(State.CLOSED, 0));
+        assertEquals(SeedWatch.Outcome.BACKUP_CLOSED, new SeedWatch(TIMEOUT_MS, 0).observe(State.CLOSED, SeedWatch.Copy.MISSING, 0));
     }
 
     @Test

@@ -1,0 +1,45 @@
+{
+  "issue": 885,
+  "run": 40487608466,
+  "job": 122143878989,
+  "head": "1911596e1616bf24f9025d3257a9a84836e260a6",
+  "classification": "Product recovery startup defect: peer seed publishes last-term metadata before copied log reaches its base.",
+  "evidence": {
+    "member": 2,
+    "snapshot_position": 30593888,
+    "restored_block": 420,
+    "append_position": 31784192,
+    "term_base": 32317216,
+    "term": 3,
+    "cycle": "INIT/CANVASS; repeated invalid newLeadershipTerm; no sampled follower state",
+    "other_members": "0 and 1 continue through snapshot block690",
+    "artifacts": [
+      "chaos-diagnostics-chaos-cluster",
+      "chaos-load-chaos-cluster"
+    ],
+    "local_diagnostics": "/tmp/chaos-current-cluster-40487608466-diagnostics",
+    "runner": "CPU saturated; exact term/base mismatch is independently visible."
+  },
+  "fix": "Backup-agent callbacks publish a coherent recording identity, required term/snapshot position, and copied position. BACKING_UP needs copied coverage. Stalled incomplete copies retry using the existing20-second peer window. After backup shutdown, recheck actual recording metadata against the last copy proof. No startup at genesis fallback.",
+  "validation": {
+    "positive": "52 pure Java tests pass: SeedProgress5, StartMode13, StateDir3, JoinWatchdog31; no local cluster or media driver started",
+    "log": "/tmp/chaos-peer-seed-boundary-verified-20261027.log",
+    "negative": "Restoring unconditional BACKING_UP success makes the exact observed metadata/bytes mismatch test fail; mutation restored and full focused suite passes.",
+    "negative_log": "/tmp/chaos-peer-seed-boundary-negative-20261027.log",
+    "style": "PASS; existing proc-macro-error2 future compatibility and Gradle deprecation notices remain.",
+    "style_log": "/tmp/chaos-peer-seed-boundary-style-20261027.log",
+    "excluded": "Initial test-file creation used the wrong working directory. Its narrower test run is excluded."
+  },
+  "review": "R1\u2013R16 reviewed: immutable callback observations use volatile publication across the backup agent and seed caller; no mutex; bounded methods and separate tests; startup-only allocation; no stored/wire format or deployment changes.",
+  "limits": "Deployed recovery proof pending. Existing cluster-two-blank-recover stays in the same shard with its360-second bound. Watchdog INIT/CANVASS gap not changed; no destructive reseed for ordinary no-quorum. Qualification0/10.",
+  "primary_sources": [
+    "https://github.com/real-logic/aeron/blob/1.44.0/aeron-cluster/src/main/java/io/aeron/cluster/ClusterBackupAgent.java",
+    "https://github.com/real-logic/aeron/blob/1.44.0/aeron-cluster/src/main/java/io/aeron/cluster/Election.java"
+  ],
+  "source_sha256": {
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/PeerSeed.java": "349d1738a7ecaa9dd0f40de92a37f81dffcee204ef12296e9aef328bd4970fa8",
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SeedProgress.java": "15b2a408e09a9e288055820b699381b3251d38ed976ce5965e2eadb2c3556492",
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SeedWatch.java": "642de718728d30d7fae2d59d7786a30a46c5dc676fdc0fda392a86ca585a062c",
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/StateDir.java": "e5928e81701c78b79db39493bc55a5909fefcb9825e169a9a670a6a31337af83"
+  }
+}

@@ -103,6 +103,11 @@ record StateDir(Path root) {
         }
     }
 
+    /** The copied log boundary required by a stopped peer backup. */
+    Optional<SeedProgress.Floor> seedFloor() {
+        return withRecordingLog(SeedProgress.Floor::of);
+    }
+
     /** The archive recording id of the Raft log. */
     long logRecordingId() {
         return withRecordingLog(RecordingLog::findLastTermRecordingId);

@@ -325,10 +325,10 @@ A blank member without the bootstrap copies state from a running peer before it 
 
 - Each round clears the cluster directory and the archive directory. It then runs an Aeron ClusterBackup with `LATEST_SNAPSHOT` against the consensus endpoints of the other members.
 - The backup writes the snapshot and the recording log into the own directories of the member. The recording log keeps the real log position, so the member joins at the snapshot position, not at 0.
-- The round ends when the backup reaches `BACKING_UP`. The member then launches. It restores the snapshot and catches up from the leader.
-- A round ends with no result when no peer answers for 20 s. The next round starts after a backoff of 1 s that doubles up to 30 s.
+- The round ends at `BACKING_UP` only when the copied log reaches both the last recorded term base and the snapshot position. Term metadata can arrive before those bytes. After the backup stops, its recording identity and required position are checked again. The member then restores the snapshot and catches up the remaining live tail.
+- A round ends with no result when no peer answers for 20 s, or when an incomplete log copy makes no progress for 20 s (`LOG_INCOMPLETE`). The next round starts after a backoff of 1 s that doubles up to 30 s.
 - A blank member never falls back to position 0. It waits and prints `cluster SEED waiting-for-peer`.
-- If the cluster has no snapshot yet, the member holds the whole log. The line `cluster SEED from-peer` shows `snapshotPosition=-1`.
+- If the cluster has no snapshot yet, the member copies from the start of the log through the required term base, then catches up the remaining tail. The line `cluster SEED from-peer` shows `snapshotPosition=-1`.
 - With `carryBytes`, the round then copies the segment files of the retained file from the admin endpoint of a peer (`GET /retained`).
   - The round reads the sealer snapshot that the backup copied. It walks the copy from the front to the head of that snapshot, as a restore does. See [Retained file](#retained-file).
   - The line `cluster SEED retained-copy` shows the peer and the segment count. A copy that fails the walk prints `cluster SEED retained-copy FAILED` with the reason, and the round tries the next peer.

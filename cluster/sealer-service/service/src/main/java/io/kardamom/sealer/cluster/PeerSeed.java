@@ -26,11 +26,11 @@ import org.agrona.concurrent.status.AtomicCounter;
  * position of each entry, so the member joins the running cluster at the
  * snapshot position, not at 0.</p>
  *
- * <p>The round ends at {@code BACKING_UP}, not at the leader's commit
- * position. At that state the snapshots are complete and the recording log
- * is written. The log after the snapshot needs no copy: the leader keeps
- * its log from the snapshot position on, and the member's election
- * catches up from there. A longer copy only shortens that catch-up.</p>
+ * <p>The round ends at {@code BACKING_UP} once the copied log reaches the
+ * last recorded term base and snapshot position. Term metadata can precede
+ * the copied bytes. A member cannot join with its log end below the base
+ * of the term it claims. The stopped backup is checked again before the
+ * member starts; its election catches up the remaining live tail.</p>
  *
  * <p>A member with a retained file also copies the segment files from a
  * peer ({@link RetainedCopy}), and checks the copy against the backed-up
@@ -95,8 +95,8 @@ final class PeerSeed {
 
     /**
      * Seed the member from a peer. Return the log position of the seeded
-     * snapshot, or -1 when the cluster has no snapshot yet: the member
-     * then holds the whole log.
+     * snapshot, or -1 when the cluster has no snapshot yet. The member
+     * holds the log through its recorded term base and catches up the tail.
      */
     long run() {
         System.out.println("cluster SEED start memberId=" + memberId + " peers=" + peers
@@ -190,14 +190,22 @@ final class PeerSeed {
     }
 
     private Round backUp() {
+        final ClusterBackup.Context context = backupContext();
+        final SeedProgress progress = new SeedProgress(() -> context.liveLogPositionCounter().get());
+        context.eventsListener(progress);
+        final Round result;
         try (ClusterBackupMediaDriver backup = ClusterBackupMediaDriver.launch(
-                contexts.driver(), contexts.archive(), backupContext())) {
-            final Round round = await(backup.clusterBackup().context().stateCounter());
+                contexts.driver(), contexts.archive(), context)) {
+            final Round round = await(backup.clusterBackup().context().stateCounter(), progress);
             final boolean wanted = round.outcome() == SeedWatch.Outcome.SEEDED && retainedCopy.isPresent();
-            return new Round(round.outcome(), round.lastState(), wanted
+            result = new Round(round.outcome(), round.lastState(), wanted
                 ? clusterDir.latestServiceSnapshotRecording().map(this::readSnapshot).orElseGet(NoSnapshot::new)
                 : new NoSnapshot());
         }
+        if (result.outcome() == SeedWatch.Outcome.SEEDED && !progress.covers(clusterDir.seedFloor())) {
+            return new Round(SeedWatch.Outcome.LOG_INCOMPLETE, result.lastState(), new NoSnapshot());
+        }
+        return result;
     }
 
     /**
@@ -247,18 +255,19 @@ final class PeerSeed {
         }
     }
 
-    private Round await(final AtomicCounter stateCounter) {
+    private Round await(final AtomicCounter stateCounter, final SeedProgress progress) {
         final SeedWatch watch = new SeedWatch(timing.peerTimeoutMs(), System.currentTimeMillis());
         Round round;
-        while ((round = sample(watch, stateCounter)).outcome() == SeedWatch.Outcome.PENDING) {
+        while ((round = sample(watch, stateCounter, progress)).outcome() == SeedWatch.Outcome.PENDING) {
             pause(POLL_MS);
         }
         return round;
     }
 
-    private static Round sample(final SeedWatch watch, final AtomicCounter stateCounter) {
+    private static Round sample(
+            final SeedWatch watch, final AtomicCounter stateCounter, final SeedProgress progress) {
         final ClusterBackup.State state = ClusterBackup.State.get(stateCounter);
-        return new Round(watch.observe(state, System.currentTimeMillis()), state, new NoSnapshot());
+        return new Round(watch.observe(state, progress.sample(), System.currentTimeMillis()), state, new NoSnapshot());
     }
 
     private ClusterBackup.Context backupContext() {
