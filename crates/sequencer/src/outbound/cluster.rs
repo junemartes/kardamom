@@ -109,18 +109,6 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
 }
 
 impl ClusterRefPublisher<LiveIngress> {
-    fn connection_options(v2_loop: bool) -> live::ConnectOptions {
-        let mut kinds = PUBLISHER_EGRESS_KINDS.to_vec();
-        if v2_loop {
-            kinds.extend([wire::EGRESS_KIND_RELAYED, wire::EGRESS_KIND_RELAYED_REF]);
-        }
-        live::ConnectOptions {
-            subscribe: v2_loop,
-            egress_kind_filter: Some(kinds),
-            ..Default::default()
-        }
-    }
-
     /// A publisher on the same session that offers nothing on a new
     /// session until it reports [`SequencerError::SessionChanged`] once.
     /// See [`LiveIngress::fenced`].
@@ -220,11 +208,23 @@ pub const PUBLISHER_EGRESS_KINDS: [u8; 11] = [
     wire::EGRESS_KIND_REF_REFUSED,
 ];
 
-/// Connect the publish loop and its egress feed to one cluster session.
-/// V2 subscribes to canonical records and reads both full and retained
-/// references, so each sender can advance without an executor receipt.
-/// V1 reads boundaries and controls without the per-record subscription.
-///
+impl crate::v2::AdmissionSettings {
+    /// V2 needs canonical confirmations to release each sender's suffix.
+    /// V1 reads only boundaries, status, rules and rejection controls.
+    pub(crate) fn cluster_options(&self) -> live::ConnectOptions {
+        let mut kinds = PUBLISHER_EGRESS_KINDS.to_vec();
+        if self.enabled {
+            kinds.extend([wire::EGRESS_KIND_RELAYED, wire::EGRESS_KIND_RELAYED_REF]);
+        }
+        live::ConnectOptions {
+            subscribe: self.enabled,
+            egress_kind_filter: Some(kinds),
+            ..Default::default()
+        }
+    }
+}
+
+/// Connect the publisher and its egress feed using the admission mode.
 /// Keep the returned `LiveCluster` guard alive while the publisher is in use.
 ///
 /// # Errors
@@ -232,10 +232,9 @@ pub const PUBLISHER_EGRESS_KINDS: [u8; 11] = [
 pub fn cluster_ref_publisher_with_egress(
     rt: kardamom_log::aeron_live::AeronRuntime,
     cfg: LiveClusterConfig,
-    v2_loop: bool,
+    admission: &crate::v2::AdmissionSettings,
 ) -> Result<(LiveCluster, ClusterRefPublisher<LiveIngress>, LiveEgress), LiveError> {
-    let (cluster, ingress, egress) =
-        live::connect_with(rt, cfg, ClusterRefPublisher::connection_options(v2_loop))?;
+    let (cluster, ingress, egress) = live::connect_with(rt, cfg, admission.cluster_options())?;
     Ok((cluster, ClusterRefPublisher::new(ingress), egress))
 }
 
@@ -261,29 +260,6 @@ mod tests {
         }
         assert!(!PUBLISHER_EGRESS_KINDS.contains(&wire::EGRESS_KIND_RELAYED));
     }
-    #[test]
-    fn positioned_admission_receives_both_canonical_forms_and_all_controls() {
-        let options = ClusterRefPublisher::connection_options(true);
-        assert!(options.subscribe);
-        let kinds = options.egress_kind_filter.unwrap();
-        assert!(kinds.contains(&wire::EGRESS_KIND_RELAYED));
-        assert!(kinds.contains(&wire::EGRESS_KIND_RELAYED_REF));
-        assert!(
-            PUBLISHER_EGRESS_KINDS
-                .iter()
-                .all(|kind| kinds.contains(kind))
-        );
-        assert!(options.replay.is_none());
-    }
-
-    #[test]
-    fn legacy_admission_keeps_its_control_only_connection() {
-        let options = ClusterRefPublisher::connection_options(false);
-        assert!(!options.subscribe);
-        assert_eq!(options.egress_kind_filter.unwrap(), PUBLISHER_EGRESS_KINDS);
-        assert!(options.replay.is_none());
-    }
-
     use alloy_primitives::B256;
     use kardamom_cluster_adapter::gateway::fakes::FakeIngress;
     use kardamom_cluster_adapter::wire::{

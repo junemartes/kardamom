@@ -220,7 +220,7 @@ impl ResyncWiring {
         //  1. The egress-watermark thread. The cluster broadcasts every
         //     boundary to this publisher session. Decode `end_tx_idx` (the
         //     global canonical count) into the shared watermark. V2 also
-        //     confirms each sender's canonical prefix from the records.
+        //     subscribes to canonical records to release sender prefixes.
         //  2. The receipts thread: tx_receipts to per-sender executed-truth
         //     floors (only this shard's senders).
         //  3. The controller itself, handed to the Sequencer through
@@ -597,7 +597,7 @@ async fn main() -> anyhow::Result<()> {
         kardamom_sequencer::outbound::cluster::cluster_ref_publisher_with_egress(
             cluster_rt,
             cluster_cfg,
-            cfg.admission.enabled,
+            &cfg.admission,
         )
         .context("connect cluster ref publisher")?;
     tracing::info!("kardamom-sequencer: tx_ordering via Aeron Cluster");

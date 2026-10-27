@@ -9,6 +9,7 @@ use crate::v2::AccountEvent;
 struct Feed {
     rules: SealerRules<InMemorySidePublisher>,
     events: crossbeam_channel::Receiver<AccountEvent>,
+    connection: kardamom_cluster_adapter::live::ConnectOptions,
 }
 
 impl Feed {
@@ -22,6 +23,11 @@ impl Feed {
             )
             .telling(tx),
             events,
+            connection: crate::v2::AdmissionSettings {
+                enabled: true,
+                ..Default::default()
+            }
+            .cluster_options(),
         }
     }
 
@@ -56,6 +62,18 @@ impl Feed {
     }
 
     fn assert_confirmation(&self, frame: &[u8], hash: B256) {
+        assert!(
+            self.connection.subscribe,
+            "the sealer excludes unregistered sessions"
+        );
+        assert!(
+            self.connection
+                .egress_kind_filter
+                .as_ref()
+                .unwrap()
+                .contains(&frame[0]),
+            "the session filter must deliver canonical frames to the feed"
+        );
         assert!(self.rules.on_canonical_frame(frame));
         assert!(
             matches!(self.events.try_recv().unwrap(), AccountEvent::Canonical(actual) if actual == hash)
@@ -136,4 +154,30 @@ fn legacy_admission_does_not_receive_canonical_events() {
             .on_canonical_frame(&Feed::reference(wire::RT_TX).encode())
     );
     assert!(feed.events.is_empty());
+}
+
+#[test]
+fn legacy_admission_keeps_its_control_only_connection() {
+    let options = crate::v2::AdmissionSettings::default().cluster_options();
+    assert!(!options.subscribe);
+    assert!(options.replay.is_none());
+    assert_eq!(
+        options.egress_kind_filter.unwrap(),
+        crate::outbound::cluster::PUBLISHER_EGRESS_KINDS
+    );
+}
+
+#[test]
+fn v2_keeps_all_control_frames_alongside_canonical_confirmations() {
+    let feed = Feed::new(5);
+    let kinds = feed.connection.egress_kind_filter.unwrap();
+    assert!(
+        crate::outbound::cluster::PUBLISHER_EGRESS_KINDS
+            .iter()
+            .all(|kind| kinds.contains(kind))
+    );
+    assert!(
+        feed.connection.replay.is_none(),
+        "reconnect recovery uses retained admission copies"
+    );
 }
