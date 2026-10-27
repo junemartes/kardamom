@@ -143,36 +143,19 @@ impl CorruptCheckpoint {
         let name = baseline["checkpoint"]
             .as_str()
             .context("missing checkpoint name")?;
-        let block = name
-            .strip_prefix("checkpoint-")
-            .context("invalid checkpoint name")?
-            .parse::<u64>()?;
-        let directory = tempfile::tempdir()?;
-        let copies = directory.path().join("checkpoints");
-        std::fs::create_dir(&copies)?;
-        h.nodes
-            .docker_ok_long(&[
-                "cp",
-                &format!("{}:/opt/kardamom/checkpoints/{name}", self.victim),
-                copies
-                    .to_str()
-                    .context("checkpoint copy path is not UTF-8")?,
-            ])
-            .await?;
-        tokio::task::spawn_blocking(move || {
-            let restored = kardamom_state::restore_best_checkpoint(
-                &copies,
-                &directory.path().join("state"),
-                kardamom_state::BlockRange::ANY,
-                None,
-            )?;
-            anyhow::ensure!(
-                restored.is_some_and(|(observed, _)| observed == block),
-                "checkpoint baseline does not restore at its declared block"
-            );
-            Ok::<_, anyhow::Error>(())
-        })
-        .await??;
+        let block = super::checkpoint_copy::CheckpointCopy::block(name)?;
+        let restored = super::checkpoint_copy::CheckpointCopy {
+            node: &self.victim,
+            root: "/opt/kardamom/checkpoints",
+            name,
+            with_log: false,
+        }
+        .verify(h)
+        .await?;
+        anyhow::ensure!(
+            restored == block,
+            "checkpoint baseline does not restore at its declared block"
+        );
         Ok(baseline)
     }
 

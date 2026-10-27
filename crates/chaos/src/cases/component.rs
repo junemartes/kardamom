@@ -4,6 +4,8 @@
 use std::time::Duration;
 
 mod checkpoint;
+mod checkpoint_copy;
+pub(super) mod checkpoint_full;
 pub(super) mod corrupt_checkpoint;
 use checkpoint::CheckpointRestore;
 

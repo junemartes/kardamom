@@ -119,13 +119,10 @@ impl Partition {
     }
 
     async fn transfer(h: &Harness, context: &str) -> anyhow::Result<()> {
-        tokio::time::timeout(
-            Duration::from_secs(60),
-            Rpc::new(&h.rpc_url, h.knobs.chain_id)?
-                .transfer_smoke(h.knobs.gate_account, Duration::from_secs(60)),
-        )
-        .await
-        .with_context(|| format!("{context}: fault blocks the client past its bound"))?
+        Rpc::new(&h.rpc_url, h.knobs.chain_id)?
+            .transfer_within(h.knobs.gate_account, Duration::from_secs(60))
+            .await
+            .with_context(|| format!("{context}: fault blocks the client past its bound"))
     }
 
     async fn assert_live(&self, h: &Harness, context: &str) -> anyhow::Result<()> {

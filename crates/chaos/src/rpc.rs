@@ -332,6 +332,17 @@ impl Rpc {
         self.transfer_hash(account, nonce, budget).await.map(|_| ())
     }
 
+    /// Bound nonce lookup, submission and receipt polling by one deadline.
+    pub(crate) async fn transfer_within(
+        &self,
+        account: u32,
+        budget: Duration,
+    ) -> anyhow::Result<()> {
+        tokio::time::timeout(budget, self.transfer_smoke(account, budget))
+            .await
+            .context("fault blocks the client past its transfer bound")?
+    }
+
     /// [`Self::transfer_smoke`] at `nonce`, for a case that sets the nonce
     /// itself. Returns the hash of the receipted transfer.
     ///

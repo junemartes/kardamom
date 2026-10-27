@@ -89,6 +89,7 @@ impl Shard {
         "node-replace-executor",
         "state-checkpoint-restore",
         "checkpoint-corrupt-recover",
+        "checkpoint-disk-full",
         "replay-window-resync",
         "deploy-broken-image",
     ];
@@ -422,7 +423,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 78);
+        assert_eq!(all.len(), 79);
         assert_eq!(
             Shard::Integrity.cases().last(),
             Some(&"resize-scale-out-in")
