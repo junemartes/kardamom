@@ -1092,7 +1092,7 @@
       "existing_shards": [
         "chaos-cluster"
       ],
-      "status": "One-way live-leader Raft partition is added to the existing cluster shard. Only old-leader outbound UDP to the two peers on consensus/log/catchup/archive-control ports is dropped. The old process and start time must stay unchanged; the surviving quorum must elect and receipt clients; fault counters must be positive; terms must have one leader and all members must return after cleanup. 203 local chaos tests pass; deployed validation pending. Packet delay and probabilistic loss remain open."
+      "status": "One-way live-leader Raft partition is added to the existing cluster shard. Only old-leader outbound UDP to the two peers on consensus/log/catchup/archive-control ports is dropped. The old process and start time must stay unchanged; the surviving quorum must elect and receipt clients; fault counters must be positive; terms must have one leader and all members must return after cleanup. 203 local chaos tests pass; deployed validation pending. Packet delay and probabilistic loss remain open. The existing cluster shard now also schedules raft-leader-packet-loss: random 10% outbound peer Raft UDP loss on the selected live member, with positive drop and pass counters for each peer, bounded transfers during the fault, unchanged process identity, cleanup and recovery. Local rule/scope/counter controls and negative mutations are recorded separately; live validation is pending. Packet delay remains open."
     },
     {
       "gap": "ENOSPC, I/O errors, and corrupt recovery sources",

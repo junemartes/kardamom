@@ -1,6 +1,5 @@
 //! A live old leader loses only its outbound Raft peer traffic.
 
-use std::fmt::Write;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -13,6 +12,11 @@ use crate::probes::CLUSTER_TASK;
 use crate::rpc::Rpc;
 
 const CTX: &str = "raft-leader-one-way-partition";
+mod loss;
+mod rules;
+pub(crate) use loss::PacketLoss;
+use rules::Rules;
+
 const CHAIN: &str = "KDM_CHAOS_RAFT";
 const PORTS: [u16; 4] = [40201, 40202, 40203, 40204];
 const HOLD: Duration = Duration::from_secs(30);
@@ -68,27 +72,11 @@ impl Partition {
     }
 
     fn arm_script(&self) -> String {
-        let rules = self
-            .peers
-            .iter()
-            .flat_map(|peer| PORTS.into_iter().map(move |port| (peer, port)))
-            .fold(String::new(), |mut script, (peer, port)| {
-                writeln!(
-                    script,
-                    "iptables -w 5 -A {CHAIN} -p udp -d {peer} --dport {port} -j DROP"
-                )
-                .expect("writing to a String is infallible");
-                script
-            });
-        format!(
-            "set -eu\niptables -w 5 -N {CHAIN}\n{rules}iptables -w 5 -I OUTPUT 1 -j {CHAIN}\niptables -w 5 -C OUTPUT -j {CHAIN}"
-        )
+        Rules::partition(&self.peers).arm()
     }
 
     fn clear_script() -> String {
-        format!(
-            "set -eu\nif iptables -w 5 -S {CHAIN} >/dev/null 2>&1; then\niptables -w 5 -D OUTPUT -j {CHAIN} 2>/dev/null || true\niptables -w 5 -F {CHAIN}\niptables -w 5 -X {CHAIN}\nfi"
-        )
+        Rules::cleanup(CHAIN)
     }
 
     async fn exercise(&self, h: &Harness) -> anyhow::Result<Proof> {
@@ -109,11 +97,11 @@ impl Partition {
         .await?;
         let (new, elapsed) = outcome
             .or_fail(|_| crate::chaos_fail!("{CTX}: the surviving quorum elects no new leader"))?;
-        self.assert_live(h).await?;
-        Self::transfer(h).await?;
+        self.assert_live(h, CTX).await?;
+        Self::transfer(h, CTX).await?;
         tokio::time::sleep(HOLD).await;
-        Self::transfer(h).await?;
-        self.assert_live(h).await?;
+        Self::transfer(h, CTX).await?;
+        self.assert_live(h, CTX).await?;
         let dropped_packets = self.assert_dropped(h).await?;
         Check::assert_one_leader(h, CTX).await?;
         crate::log(format!(
@@ -130,17 +118,17 @@ impl Partition {
         })
     }
 
-    async fn transfer(h: &Harness) -> anyhow::Result<()> {
+    async fn transfer(h: &Harness, context: &str) -> anyhow::Result<()> {
         tokio::time::timeout(
             Duration::from_secs(60),
             Rpc::new(&h.rpc_url, h.knobs.chain_id)?
                 .transfer_smoke(h.knobs.gate_account, Duration::from_secs(60)),
         )
         .await
-        .context("one-way Raft partition blocks the client past its bound")?
+        .with_context(|| format!("{context}: fault blocks the client past its bound"))?
     }
 
-    async fn assert_live(&self, h: &Harness) -> anyhow::Result<()> {
+    async fn assert_live(&self, h: &Harness, context: &str) -> anyhow::Result<()> {
         let inner = h.nodes.inner_container(&self.node, CLUSTER_TASK).await;
         let started = h
             .nodes
@@ -149,7 +137,7 @@ impl Partition {
             .context("the old leader start time is unavailable")?;
         anyhow::ensure!(
             inner.as_deref() == Some(&self.inner) && started == self.started,
-            "{CTX}: the old leader restarted; this is no live-leader partition"
+            "{context}: the selected member restarted during the network fault"
         );
         let admin = "curl -fsS --max-time 3 http://127.0.0.1:40205/status >/dev/null";
         h.nodes.exec(&self.node, admin).await?;
