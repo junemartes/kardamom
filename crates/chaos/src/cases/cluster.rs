@@ -10,8 +10,8 @@ use std::time::Duration;
 use super::member_storage::MemberStorage;
 use crate::evidence::CountWait;
 use crate::harness::Harness;
-use crate::nomad::SavedJob;
 use crate::nomad::Streams;
+use crate::nomad::{Nomad, SavedJob};
 use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
 
@@ -286,7 +286,9 @@ impl Blank {
         ctx: &'static str,
         start: BlankStart,
     ) -> anyhow::Result<Self> {
-        let before = Self::starts_by_alloc(h, member, &start).await?.counts();
+        let before = Self::starts_by_alloc(&h.nomad, member, &start)
+            .await?
+            .counts();
         let head = h.probes.executor_progress().await.filter(|h| *h > 0).ok_or_else(|| {
             crate::chaos_fail!("{ctx}: could not read the executor head before the member lost its state — refusing to run: the catch-up proof needs a real target position or it proves nothing")
         })?;
@@ -299,17 +301,18 @@ impl Blank {
         })
     }
 
-    /// Start and snapshot evidence stays in the same allocation. A lost
-    /// allocation is skipped: its node is gone, and so are its logs.
+    /// Start and snapshot evidence stays in the same allocation. A removed
+    /// node is excluded by its Nomad identity, even while its old
+    /// allocation still reports running or complete.
     async fn starts_by_alloc(
-        h: &Harness,
+        nomad: &Nomad,
         member: u32,
         start: &BlankStart,
     ) -> anyhow::Result<StartLogs> {
-        let allocs = h.nomad.allocations(CLUSTER_TASK).await?;
+        let allocs = nomad.allocations_with_logs(CLUSTER_TASK).await?;
         let mut logs = StartLogs(HashMap::new());
         for alloc in allocs.iter().filter(|a| a.client_status != "lost") {
-            let text = h.nomad.alloc_logs(alloc, Streams::StdoutOnly).await?;
+            let text = nomad.alloc_logs(alloc, Streams::StdoutOnly).await?;
             logs.0.insert(
                 alloc.id.clone(),
                 StartSample {
@@ -328,7 +331,7 @@ impl Blank {
         let budget = Budget::new(h.knobs.rejoin_slo, Duration::from_secs(10));
         let (track_ref, me) = (&track, &self);
         let outcome = poll::until(budget, |_| async move {
-            let logs = Self::starts_by_alloc(h, me.member, &me.start).await?;
+            let logs = Self::starts_by_alloc(&h.nomad, me.member, &me.start).await?;
             let block = logs.new_block(&me.before);
             let mut track = track_ref.borrow_mut();
             track.observe(block.unwrap_or(0), block.is_some());
