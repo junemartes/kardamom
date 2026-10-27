@@ -1,0 +1,239 @@
+{
+  "scope": "Short local cost comparison in one candidate release binary: live empty terminal-refusal channel enabled versus disabled. Alternating order, CPU 0, 4096 transactions per iteration, 20 samples. No Aeron, fault recovery, staging throughput or end-to-end latency result.",
+  "binary_sha256": "b88af317ea506c032dc6462820a25d1d2728219e970ddfeb4442efd4cc01591c",
+  "sources": {
+    "crates/sequencer/src/v2/mod.rs": "3a8eca331b58658c3069dec190a5f5e1e0ed6c8a633e19a27490be75a7a1ef30",
+    "crates/sequencer/src/v2/refusals.rs": "591f2104738f8726db09f6ec5bc8904ffeba3a46dbd444cb9bac43823a4484e8",
+    "crates/sequencer/benches/v2_loop.rs": "3d61908956ff9e03d7452ee51892af417de1252a000c362590e399c265ae2ae9",
+    "crates/sequencer/src/admission/mod.rs": "0f00c79859dc316c41e4fb032971988b8c111459294bb65b7580c8839ef8bc9d"
+  },
+  "samples": [
+    {
+      "repeat": 0,
+      "enabled": false,
+      "workload": "in_order",
+      "median_iteration_ns": 4543954.372222222,
+      "mean_iteration_ns": 4526696.519637051
+    },
+    {
+      "repeat": 0,
+      "enabled": false,
+      "workload": "reversed",
+      "median_iteration_ns": 5096375.75,
+      "mean_iteration_ns": 5141944.550000001
+    },
+    {
+      "repeat": 0,
+      "enabled": false,
+      "workload": "with_verdicts",
+      "median_iteration_ns": 4619381.083333334,
+      "mean_iteration_ns": 4653819.791666666
+    },
+    {
+      "repeat": 1,
+      "enabled": true,
+      "workload": "in_order",
+      "median_iteration_ns": 3642834.3,
+      "mean_iteration_ns": 3652684.4800000004
+    },
+    {
+      "repeat": 1,
+      "enabled": true,
+      "workload": "reversed",
+      "median_iteration_ns": 4109386.9166666665,
+      "mean_iteration_ns": 4147817.508333334
+    },
+    {
+      "repeat": 1,
+      "enabled": true,
+      "workload": "with_verdicts",
+      "median_iteration_ns": 4043226.75,
+      "mean_iteration_ns": 4110008.7
+    },
+    {
+      "repeat": 2,
+      "enabled": true,
+      "workload": "in_order",
+      "median_iteration_ns": 3717594.4,
+      "mean_iteration_ns": 3747915.9400000004
+    },
+    {
+      "repeat": 2,
+      "enabled": true,
+      "workload": "reversed",
+      "median_iteration_ns": 4197395.4,
+      "mean_iteration_ns": 4236854.78
+    },
+    {
+      "repeat": 2,
+      "enabled": true,
+      "workload": "with_verdicts",
+      "median_iteration_ns": 4098610.0,
+      "mean_iteration_ns": 4108298.1100000003
+    },
+    {
+      "repeat": 3,
+      "enabled": false,
+      "workload": "in_order",
+      "median_iteration_ns": 4449748.083333334,
+      "mean_iteration_ns": 4507572.383333334
+    },
+    {
+      "repeat": 3,
+      "enabled": false,
+      "workload": "reversed",
+      "median_iteration_ns": 5493867.166666666,
+      "mean_iteration_ns": 5549250.783333333
+    },
+    {
+      "repeat": 3,
+      "enabled": false,
+      "workload": "with_verdicts",
+      "median_iteration_ns": 4673526.333333333,
+      "mean_iteration_ns": 4721310.358333333
+    },
+    {
+      "repeat": 4,
+      "enabled": false,
+      "workload": "in_order",
+      "median_iteration_ns": 4563638.941666666,
+      "mean_iteration_ns": 4572495.074585685
+    },
+    {
+      "repeat": 4,
+      "enabled": false,
+      "workload": "reversed",
+      "median_iteration_ns": 4907241.666666667,
+      "mean_iteration_ns": 4993199.066666666
+    },
+    {
+      "repeat": 4,
+      "enabled": false,
+      "workload": "with_verdicts",
+      "median_iteration_ns": 4674806.147660819,
+      "mean_iteration_ns": 4705440.631543719
+    },
+    {
+      "repeat": 5,
+      "enabled": true,
+      "workload": "in_order",
+      "median_iteration_ns": 3698388.5,
+      "mean_iteration_ns": 3750010.5699999994
+    },
+    {
+      "repeat": 5,
+      "enabled": true,
+      "workload": "reversed",
+      "median_iteration_ns": 4314975.6,
+      "mean_iteration_ns": 4321733.470000001
+    },
+    {
+      "repeat": 5,
+      "enabled": true,
+      "workload": "with_verdicts",
+      "median_iteration_ns": 4080821.3,
+      "mean_iteration_ns": 4165383.2900000014
+    },
+    {
+      "repeat": 6,
+      "enabled": true,
+      "workload": "in_order",
+      "median_iteration_ns": 3691008.3,
+      "mean_iteration_ns": 3738084.2800000003
+    },
+    {
+      "repeat": 6,
+      "enabled": true,
+      "workload": "reversed",
+      "median_iteration_ns": 4159912.4000000004,
+      "mean_iteration_ns": 4244024.14
+    },
+    {
+      "repeat": 6,
+      "enabled": true,
+      "workload": "with_verdicts",
+      "median_iteration_ns": 4003688.9,
+      "mean_iteration_ns": 4031053.5100000007
+    },
+    {
+      "repeat": 7,
+      "enabled": false,
+      "workload": "in_order",
+      "median_iteration_ns": 4392332.715384616,
+      "mean_iteration_ns": 4395911.043066339
+    },
+    {
+      "repeat": 7,
+      "enabled": false,
+      "workload": "reversed",
+      "median_iteration_ns": 4883600.833333334,
+      "mean_iteration_ns": 4924802.058333334
+    },
+    {
+      "repeat": 7,
+      "enabled": false,
+      "workload": "with_verdicts",
+      "median_iteration_ns": 4691003.083333334,
+      "mean_iteration_ns": 4751976.583333333
+    },
+    {
+      "repeat": 8,
+      "enabled": false,
+      "workload": "in_order",
+      "median_iteration_ns": 4528659.071428571,
+      "mean_iteration_ns": 4486120.255877046
+    },
+    {
+      "repeat": 8,
+      "enabled": false,
+      "workload": "reversed",
+      "median_iteration_ns": 5353850.5,
+      "mean_iteration_ns": 5416904.55
+    },
+    {
+      "repeat": 8,
+      "enabled": false,
+      "workload": "with_verdicts",
+      "median_iteration_ns": 5114488.5,
+      "mean_iteration_ns": 5137755.316666667
+    },
+    {
+      "repeat": 9,
+      "enabled": true,
+      "workload": "in_order",
+      "median_iteration_ns": 3639397.4,
+      "mean_iteration_ns": 3686036.09
+    },
+    {
+      "repeat": 9,
+      "enabled": true,
+      "workload": "reversed",
+      "median_iteration_ns": 4153602.4,
+      "mean_iteration_ns": 4239519.35
+    },
+    {
+      "repeat": 9,
+      "enabled": true,
+      "workload": "with_verdicts",
+      "median_iteration_ns": 4086761.8,
+      "mean_iteration_ns": 4150012.7600000002
+    }
+  ],
+  "normalized_results": {
+    "in_order": {
+      "enabled_median_ns_per_transaction": 901.1250732421875,
+      "disabled_median_ns_per_transaction": 1105.629656110491
+    },
+    "reversed": {
+      "enabled_median_ns_per_transaction": 1015.6036132812501,
+      "disabled_median_ns_per_transaction": 1244.2323608398438
+    },
+    "with_verdicts": {
+      "enabled_median_ns_per_transaction": 996.2942626953125,
+      "disabled_median_ns_per_transaction": 1141.3100946437546
+    }
+  },
+  "interpretation": "No slowdown is observed for polling an empty channel in this local resident-loop fixture. The lower enabled times do not establish a production speedup. Both branches use the candidate binary; this does not compare whole releases, fault recovery, network throughput or per-transaction latency. Full deployed p50/p99 and throughput validation remain required.",
+  "method": "One candidate release binary, five enabled and five disabled runs in balanced alternating order, each with 256 senders and 16 transactions, CPU 0, 20 samples, 1 s warmup and 2 s requested measurement. The enabled fixture retains a live sender on an empty terminal-refusal channel. No build overlaps these measurements.",
+  "raw": "2026-10-27-v2-terminal-refusal-samples.jsonl"
+}

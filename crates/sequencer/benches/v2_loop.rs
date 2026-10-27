@@ -20,6 +20,7 @@ use alloy_primitives::U256;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use kardamom_obs::lifecycle::process;
 use kardamom_sequencer::admission::{AccountState, AdmissionConfig};
+use kardamom_sequencer::resync::{ResyncChannel, ResyncConfig, SealerRefusal};
 use kardamom_sequencer::testkit::{Rig, one_partition_cfg, signed_envelope, signer};
 use kardamom_sequencer::v2::{AccountEvent, AdmissionLoop, V2Config};
 use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
@@ -91,14 +92,32 @@ fn rows(block: u64, nonce: u64) -> AccountEvent {
 
 /// A loop whose filter holds a rich row for every sender of the batch,
 /// and the sender side of its account events.
-fn seeded_loop() -> (AdmissionLoop, crossbeam_channel::Sender<AccountEvent>) {
+struct Inputs {
+    _accounts: crossbeam_channel::Sender<AccountEvent>,
+    _refusals: Option<crossbeam_channel::Sender<SealerRefusal>>,
+}
+
+fn seeded_loop() -> (AdmissionLoop, Inputs) {
     let (accounts_tx, accounts_rx) = crossbeam_channel::unbounded();
     let (lookups_tx, _) = tokio::sync::mpsc::channel(16);
     let vslots = one_partition_cfg().vslot_set().unwrap();
     accounts_tx.send(rows(1, 0)).unwrap();
     let mut admission = AdmissionLoop::new(cfg(), vslots, accounts_rx, lookups_tx);
     admission.enable_pause(process().subscribe());
-    (admission, accounts_tx)
+    let refusals = if std::env::var_os("KARDAMOM_V2_BENCH_TERMINAL_REFUSALS").is_some() {
+        let channel = ResyncChannel::open(ResyncConfig::default(), 0).unwrap();
+        admission.enable_sealer_refusals(channel.controller);
+        Some(channel.deadline_tx)
+    } else {
+        None
+    };
+    (
+        admission,
+        Inputs {
+            _accounts: accounts_tx,
+            _refusals: refusals,
+        },
+    )
 }
 
 fn bench_order(c: &mut Criterion, name: &str, nonce_at: fn(u64) -> u64) {
@@ -110,7 +129,8 @@ fn bench_order(c: &mut Criterion, name: &str, nonce_at: fn(u64) -> u64) {
             || {
                 let mut rig = Rig::default();
                 rig.tx_data.queue = batch.clone().into_iter().collect();
-                (seeded_loop().0, rig)
+                let (admission, inputs) = seeded_loop();
+                (admission, rig, inputs)
             },
             run_to_completion,
             BatchSize::SmallInput,
@@ -138,12 +158,12 @@ fn bench_with_verdicts(c: &mut Criterion) {
             || {
                 let mut rig = Rig::default();
                 rig.tx_data.queue = batch.clone().into_iter().collect();
-                let (mut l, _) = seeded_loop();
+                let (mut l, inputs) = seeded_loop();
                 let (verdicts_tx, verdicts) = tokio::sync::mpsc::channel(total);
                 l.enable_verdicts(verdicts_tx);
-                (l, rig, verdicts)
+                (l, rig, verdicts, inputs)
             },
-            |(mut l, mut rig, mut verdicts)| {
+            |(mut l, mut rig, mut verdicts, _inputs)| {
                 while l.run_once(&mut rig.ports()).unwrap() {}
                 let sent = std::iter::from_fn(|| verdicts.try_recv().ok()).count();
                 assert_eq!(sent, total, "one verdict for each transaction");
@@ -156,7 +176,7 @@ fn bench_with_verdicts(c: &mut Criterion) {
 
 /// Drain the batch through the loop, then check that every transaction
 /// went out.
-fn run_to_completion((mut l, mut rig): (AdmissionLoop, Rig)) {
+fn run_to_completion((mut l, mut rig, _inputs): (AdmissionLoop, Rig, Inputs)) {
     while l.run_once(&mut rig.ports()).unwrap() {}
     let published = rig.refs.offers.lock().unwrap().len();
     assert_eq!(published, usize::try_from(SENDERS * NONCES).unwrap());

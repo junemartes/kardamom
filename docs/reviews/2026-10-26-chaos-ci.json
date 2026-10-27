@@ -1067,6 +1067,39 @@
         "workflow_actionlint": "pass"
       },
       "remaining_issue": "https://github.com/junemartes/kardamom/issues/852"
+    },
+    "terminal_refusal_candidate": {
+      "issue": 852,
+      "base": "9f4b2493ffe89678d3db723aa928a802f437e7d8",
+      "changes": [
+        "Move the existing ResyncController into the V2 loop and drain its bounded terminal-refusal channel before publication, also during a lifecycle pause.",
+        "Report a terminal outcome for every unconfirmed transaction discarded by the existing sender-run reset. DA-lag and record-lag outcomes retain their retryable reason. A named past-deadline copy must match; other lost run entries receive expiry. Confirmed nonces and another copy remain unchanged.",
+        "Remove refused-run offers from a backpressured outbox before any can escape.",
+        "Keep the sealer lag guard through live boundaries; a healthy status and boundary resume the loop. A typed lag refusal pauses immediately."
+      ],
+      "regressions": [
+        "RED: DA-lag refusal produces no client error before the consumer is wired; GREEN: both forgotten nonces receive retryable outcomes and the same sender can offer nonce 0 then 1 again.",
+        "Record-lag removes a queued backpressured suffix before publication.",
+        "A delayed refusal below confirmed nonce does not remove the remaining run.",
+        "A past-deadline answer cannot remove another offer copy.",
+        "A paused loop drains refusals while new input stays archived, then resumes in nonce order.",
+        "Live boundaries retain both DA-lag and record-lag guards until a clearing status."
+      ],
+      "validation": {
+        "sequencer_lib": 200,
+        "sequencer_bin": 15,
+        "manual_profile_ignored": 1
+      },
+      "status": "Local candidate. Full deployed retention, exact-state and performance gates remain required. Issue stays open and streak remains zero.",
+      "limits": [
+        "The existing bounded terminal channel can still lose an answer when full. This candidate does not establish recovery at channel saturation.",
+        "The local regression proves retryable outcomes and nonce-ordered resubmission. Full deployed retention and exact-state proof remain required."
+      ],
+      "performance": {
+        "profile": "docs/benches/2026-10-27-v2-terminal-refusal-profile.json",
+        "interpretation": "No slowdown is observed for polling an empty channel in this local resident-loop fixture. The lower enabled times do not establish a production speedup. Both branches use the candidate binary; this does not compare whole releases, fault recovery, network throughput or per-transaction latency. Full deployed p50/p99 and throughput validation remain required.",
+        "measurement_count": 30
+      }
     }
   },
   "followup_candidate": {

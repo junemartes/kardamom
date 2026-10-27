@@ -414,6 +414,14 @@ impl<T: Clone> Admission<T> {
         self.senders.get(&sender)?.forwarded_at(nonce)
     }
 
+    /// The unconfirmed run of one sender, in nonce order.
+    pub(crate) fn unconfirmed_for(&self, sender: Address) -> impl Iterator<Item = &Candidate<T>> {
+        self.senders
+            .get(&sender)
+            .into_iter()
+            .flat_map(SenderState::unconfirmed)
+    }
+
     /// Every forwarded transaction that no state confirmed: the run of each
     /// sender, in nonce order.
     pub fn unconfirmed(&self) -> impl Iterator<Item = &Candidate<T>> {

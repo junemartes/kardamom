@@ -18,6 +18,8 @@ use crate::testkit::{Rig, one_partition_cfg, pos, signed_envelope, signer};
 
 #[path = "pause_tests.rs"]
 mod pause_tests;
+#[path = "refusal_tests.rs"]
+mod refusal_tests;
 
 /// A loop that keeps the version of `shared`, with room in its outbox for
 /// every offer of a test, and a sender with the chain nonce 0.

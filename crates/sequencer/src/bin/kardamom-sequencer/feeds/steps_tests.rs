@@ -182,3 +182,41 @@ fn a_reference_refusal_below_the_kept_version_does_not_lower_it() {
     assert!(version.carries_bytes(), "the version stays 5");
     assert_eq!(drops.drops.lock().unwrap().len(), 1);
 }
+
+#[test]
+fn live_boundaries_do_not_clear_a_lag_guard_before_its_status_clears() {
+    let (deadline_tx, _deadline_rx) = crossbeam_channel::bounded(4);
+    let (answer_tx, _answer_rx) = crossbeam_channel::bounded(4);
+    let (origins, _origins_rx) = crossbeam_channel::unbounded();
+    let mut feed = EgressWatermarkFeed::new(
+        1_000,
+        0,
+        SharedWatermark::new(),
+        answer_tx,
+        deadline_tx,
+        origins,
+        rules(&SealerVersion::default(), &InMemorySidePublisher::default()),
+    );
+    let mut status = ClusterStatus {
+        halted: true,
+        ..ClusterStatus::default()
+    };
+    feed.on_frame(&encode_status(&status));
+    feed.on_frame(&encode_egress_boundary(9, 100, 0, 0));
+    assert_eq!(
+        feed.guard.as_ref().map(|guard| guard.cause),
+        Some(kardamom_obs::halt::HaltCause::DaLag)
+    );
+    status.halted = false;
+    status.record_lag.halted = true;
+    feed.on_frame(&encode_status(&status));
+    feed.on_frame(&encode_egress_boundary(10, 100, 0, 0));
+    assert_eq!(
+        feed.guard.as_ref().map(|guard| guard.cause),
+        Some(kardamom_obs::halt::HaltCause::RecordLag)
+    );
+    status.record_lag.halted = false;
+    feed.on_frame(&encode_status(&status));
+    feed.on_frame(&encode_egress_boundary(11, 100, 0, 0));
+    assert!(feed.guard.is_none());
+}

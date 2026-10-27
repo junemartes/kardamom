@@ -42,6 +42,7 @@
 //! the parked depth of each vslot ([`depth`]) at each sweep.
 
 mod depth;
+mod refusals;
 mod runner;
 mod verdicts;
 
@@ -219,6 +220,7 @@ pub struct AdmissionLoop {
     session_generation: u64,
     fees: FeeGate,
     pause: PauseGate,
+    sealer_refusals: Option<crate::resync::ResyncController>,
     accounts: crossbeam_channel::Receiver<AccountEvent>,
     lookups: tokio::sync::mpsc::Sender<Address>,
     verdicts: Vec<Verdict<RefPayload>>,
@@ -250,6 +252,7 @@ impl AdmissionLoop {
             session_generation: 0,
             fees: FeeGate::off(),
             pause: PauseGate::default(),
+            sealer_refusals: None,
             accounts,
             lookups,
             verdicts: Vec::new(),
@@ -303,6 +306,9 @@ impl AdmissionLoop {
     /// offer, and the errors of the input and of the decode.
     pub fn run_once<P: SequencerPorts>(&mut self, ports: &mut P) -> Result<bool, SequencerError> {
         let applied = self.apply_accounts();
+        let (input, refs, side) = ports.split();
+        side.flush_events();
+        let refused = self.apply_sealer_refusals(side);
         let generation = self.sealer_version.session_generation();
         let renewed = generation != self.session_generation;
         if renewed {
@@ -311,18 +317,16 @@ impl AdmissionLoop {
         }
 
         self.sweep_if_due(Instant::now());
-        let (input, refs, side) = ports.split();
-        side.flush_events();
         self.dispatch(side);
         if self.pause.paused() {
-            return Ok(applied || renewed);
+            return Ok(applied || renewed || refused);
         }
         self.flush(refs, side)?;
         if self.outbox.len() >= self.cfg.outbox_cap.get() {
             return Ok(true);
         }
         let Some(inbound) = input.poll()? else {
-            return Ok(applied || renewed);
+            return Ok(applied || renewed || refused);
         };
         self.admit(&inbound, side)?;
         self.dispatch(side);

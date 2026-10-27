@@ -18,6 +18,7 @@
 //! channel, is a plain task. It uses `select!` on `Shutdown::cancelled`.
 
 mod account_lookup;
+mod guards;
 mod lookup;
 mod origin_pump;
 mod receipts;
@@ -152,6 +153,8 @@ pub(crate) struct EgressWatermarkFeed<D> {
     /// snapshot budget: the leader sends no boundary until the snapshot
     /// is complete, so that gap is neither a lag nor a lost quorum.
     silence: SilenceDeadline,
+    /// A live boundary does not clear a sealer guard that still refuses offers.
+    guard: Option<HaltRef>,
     /// The kept decision version of the sealer, and the drops of the
     /// references that it refused.
     rules: SealerRules<D>,
@@ -180,6 +183,7 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
             last_origin: 0,
             last_boundary_at: Some(Instant::now()),
             silence: SilenceDeadline::new(Instant::now()),
+            guard: None,
             meter: LoopMeter::new("sequencer.egress_feed"),
         }
     }
@@ -488,27 +492,6 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
         true
     }
 
-    /// Handle one status frame. Returns `true` when `frame` was a status.
-    /// A status with the snapshot notice starts the snapshot stall: until
-    /// its budget ends or the next boundary arrives, the boundary gap
-    /// neither flags a lag nor pauses the replica. A plain status does
-    /// not prove the boundary clock, so it changes nothing here.
-    fn on_status_frame(&mut self, frame: &[u8]) -> bool {
-        if frame.first() != Some(&wire::EGRESS_KIND_STATUS) {
-            return false;
-        }
-        if let Ok(EgressItem::Status(status)) = EgressItem::decode(frame)
-            && status.snapshot_follows
-        {
-            self.silence.on_status(&status, Instant::now());
-            tracing::info!(
-                partition = self.partition,
-                "sequencer: the sealer takes a snapshot; the boundaries stop until it is complete"
-            );
-        }
-        true
-    }
-
     /// Store the canonical count from one boundary frame, and re-arm the
     /// silence timer. A 30 second freeze shows up here as one long
     /// inter-arrival gap. The backlog drains instantly on resume, but
@@ -522,7 +505,7 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
             }
             self.last_boundary_at = Some(now);
             self.silence.on_boundary(now);
-            process().follow(None);
+            process().follow(self.guard.clone());
             kardamom_obs::ready::mark_now(seq_metrics::LAST_BOUNDARY_UNIX_SECONDS);
             self.watermark.store(b.end_tx_idx.as_index());
             self.confirm_origin(b.l1_origin);
@@ -627,6 +610,7 @@ pub(crate) struct V2Wiring {
     pub(crate) accounts: crossbeam_channel::Receiver<kardamom_sequencer::v2::AccountEvent>,
     pub(crate) lookups: tokio::sync::mpsc::Sender<alloy_primitives::Address>,
     pub(crate) verdicts: Option<tokio::sync::mpsc::Sender<kardamom_sequencer::v2::VerdictOut>>,
+    pub(crate) refusals: Option<ResyncController>,
 }
 
 impl V2Wiring {
@@ -650,6 +634,9 @@ impl V2Wiring {
         admission.enable_fees(fees);
         admission.enable_positioned_refs(sealer_version);
         admission.enable_pause(process().subscribe());
+        if let Some(controller) = self.refusals {
+            admission.enable_sealer_refusals(controller);
+        }
         if let Some(verdicts) = self.verdicts {
             admission.enable_verdicts(verdicts);
         }
@@ -705,7 +692,8 @@ where
                 refs: &mut main_pub,
                 errors: &mut side,
             };
-            if let Some(v2) = v2 {
+            if let Some(mut v2) = v2 {
+                v2.refusals = resync;
                 return v2.run(
                     &cfg,
                     fees,

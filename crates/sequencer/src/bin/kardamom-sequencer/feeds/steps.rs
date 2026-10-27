@@ -103,11 +103,11 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
         let _ = self.origins.send(signal);
     }
 
-    /// Forward one terminal refusal to the publish loop. A full channel
-    /// means the loop has stalled far past the horizon already, and
-    /// every ref in flight is refused: dropping is safe, because the
-    /// confirm-timeout sweep still clears the ledger.
-    pub(super) fn forward_refusal(&self, refusal: SealerRefusal) {
+    /// Forward one terminal refusal without blocking the egress feed.
+    /// A full channel loses the answer and logs the loss; the filter's
+    /// loss window remains the fallback for unconfirmed transactions.
+    pub(super) fn forward_refusal(&mut self, refusal: SealerRefusal) {
+        self.pause_for_refusal(&refusal);
         match self.deadline_tx.try_send(refusal) {
             Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
             Err(crossbeam_channel::TrySendError::Full(_)) => {
