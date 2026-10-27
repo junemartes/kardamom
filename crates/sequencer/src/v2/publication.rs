@@ -48,6 +48,9 @@ impl AdmissionLoop {
         ready
             .drain(..published)
             .for_each(|offer| offer.note_sent(side));
+        if !ready.is_empty() {
+            self.canonical.changed();
+        }
         ready
             .drain(..)
             .rev()

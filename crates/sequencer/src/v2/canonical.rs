@@ -22,6 +22,9 @@ pub(super) struct CanonicalGate {
     history_cap: NonZeroUsize,
     selected: HashSet<Address>,
     ready: Vec<RefOffer>,
+    changed: bool,
+    #[cfg(test)]
+    pub(super) scans: usize,
 }
 
 impl CanonicalGate {
@@ -34,6 +37,9 @@ impl CanonicalGate {
             history_cap,
             selected: HashSet::new(),
             ready: Vec::new(),
+            changed: true,
+            #[cfg(test)]
+            scans: 0,
         }
     }
 
@@ -91,6 +97,7 @@ impl CanonicalGate {
     /// A reconnect or refusal reoffers each retained sender prefix first.
     /// Canonical observations remain valid across a session change.
     pub(super) fn reset(&mut self) {
+        self.changed();
         self.flights.clear();
     }
 
@@ -101,6 +108,7 @@ impl CanonicalGate {
     }
 
     pub(super) fn prune(&mut self, admission: &Admission<RefPayload>) {
+        self.changed();
         self.flights.retain(|address, flight| {
             admission
                 .unconfirmed_at(*address, flight.nonce)
@@ -121,9 +129,22 @@ impl CanonicalGate {
         admission: &mut Admission<RefPayload>,
     ) -> Vec<RefOffer> {
         self.ready.clear();
+        if !std::mem::take(&mut self.changed) {
+            return std::mem::take(&mut self.ready);
+        }
+        #[cfg(test)]
+        {
+            self.scans = self.scans.checked_add(1).unwrap();
+        }
         self.selected.clear();
         outbox.retain(|offer| self.keep_queued(offer, admission));
         std::mem::take(&mut self.ready)
+    }
+
+    /// Intake, account events, replay and sweeps invalidate a blocked queue.
+    /// Unpublished prefixes also require another scan on the next retry.
+    pub(super) fn changed(&mut self) {
+        self.changed = true;
     }
 
     fn keep_queued(&mut self, offer: &RefOffer, admission: &mut Admission<RefPayload>) -> bool {

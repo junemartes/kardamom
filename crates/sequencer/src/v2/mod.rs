@@ -394,6 +394,7 @@ impl AdmissionLoop {
     }
 
     fn apply(&mut self, event: AccountEvent) -> bool {
+        self.canonical.changed();
         match event {
             AccountEvent::Canonical(hash) => self.canonical.observe(hash, &mut self.admission),
             AccountEvent::Rows { block, rows } => self.apply_rows(block, rows),
@@ -531,6 +532,7 @@ impl AdmissionLoop {
         };
         self.depth.took(vslot);
         let started = Instant::now();
+        self.canonical.changed();
         self.admission.offer(candidate, &mut self.verdicts);
         self.hot
             .nonce_check_seconds

@@ -18,6 +18,8 @@ use crate::testkit::{EnvelopeSpec, Rig, envelope_with, one_partition_cfg, pos, s
 
 #[path = "canonical_tests.rs"]
 mod canonical_tests;
+#[path = "canonical_wait_tests.rs"]
+mod canonical_wait_tests;
 #[path = "pause_tests.rs"]
 mod pause_tests;
 #[path = "refusal_tests.rs"]

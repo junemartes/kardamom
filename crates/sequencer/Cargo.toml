@@ -93,5 +93,9 @@ name = "v2_loop"
 harness = false
 
 [[bench]]
+name = "v2_wait"
+harness = false
+
+[[bench]]
 name = "tx_events"
 harness = false
