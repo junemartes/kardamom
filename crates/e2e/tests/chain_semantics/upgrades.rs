@@ -56,13 +56,13 @@ async fn s13d_on(genesis: e2e::harness::Genesis) {
     upgrade_case(
         unpayable_stack_config(genesis),
         async |t, l1, exec_dir, val_dir| {
-            sealer_upgrade::skip_uses_its_nonce_only_after_the_upgrade(
+            let upgrade_block = sealer_upgrade::skip_uses_its_nonce_only_after_the_upgrade(
                 t,
                 l1,
                 sealer_upgrade::Params::default(),
             )
             .await?;
-            upgrade::assert_chain_state_code(exec_dir, val_dir).await
+            upgrade::assert_chain_state_code(exec_dir, val_dir, upgrade_block).await
         },
         "S13d",
     )
