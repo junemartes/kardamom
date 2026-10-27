@@ -112,16 +112,16 @@ impl Step {
             // three-credit proof across a provider fault. Their load
             // windows add; each runtime proof keeps its own deadline.
             Self::VersionsOn => inject
-                .saturating_add(Duration::from_mins(40))
+                .saturating_add(super::window::FULL_DEPLOY_LOAD)
                 .saturating_add(two_upgrades)
                 .saturating_add(Duration::from_mins(20))
                 .saturating_add(k.l1_fault),
-            Self::ReadersOnEgress | Self::ExecutorFirst => inject + Duration::from_mins(40),
+            Self::ReadersOnEgress | Self::ExecutorFirst => inject + super::window::FULL_DEPLOY_LOAD,
             // Two upgrade transactions and the held transfer.
             Self::HeldOfferAfterDowngrade | Self::WindowOffOn => inject + two_upgrades,
             Self::WindowOn => inject + k.restart_slo + upgrade::Upgrade::LOAD_WINDOW,
             // One staged executor roll for each move.
-            Self::ExecutorsRest => inject + Duration::from_mins(80),
+            Self::ExecutorsRest => inject + super::window::FULL_DEPLOY_LOAD.saturating_mul(2),
             Self::LeaderKillAtSwitch => inject + k.leader_slo + k.restart_slo + two_upgrades,
             Self::EgressRestart => inject + k.restart_slo + Duration::from_mins(2),
         }

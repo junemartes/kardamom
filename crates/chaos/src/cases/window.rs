@@ -5,6 +5,10 @@ use std::time::Duration;
 use super::{Case, fleet, sequencer_recovery};
 use crate::knobs::Knobs;
 
+/// A full workload play can take 29 minutes before the runtime proof.
+/// This bounds pacing only; deployment and recovery retain their own deadlines.
+pub(super) const FULL_DEPLOY_LOAD: Duration = Duration::from_mins(40);
+
 impl Case {
     /// The per-case load window: the global window, widened to the
     /// case's floor so the load still flows through its whole
@@ -40,7 +44,7 @@ impl Case {
             Self::RetentionOverrun | Self::RetentionOverrunValidator | Self::PruneFloor => {
                 inject + k.retention_freeze_cap + Duration::from_mins(2)
             }
-            // The scoped guard rolls the members before and after the fault.
+            // Halt, paging and posting recovery each keep their own deadline.
             Self::DaLagHalt => inject
                 .saturating_add(k.retention_freeze_cap.saturating_mul(2))
                 .saturating_add(Duration::from_mins(8)),
@@ -51,7 +55,9 @@ impl Case {
             Self::ResizeScaleOutIn => inject + Duration::from_mins(30),
             // Two full Ansible passes surround the executor's failed
             // deployment deadline, then the common tail proves recovery.
-            Self::DeployBrokenImage => inject + k.reschedule_slo + Duration::from_mins(30),
+            Self::DeployBrokenImage => inject
+                .saturating_add(k.reschedule_slo)
+                .saturating_add(FULL_DEPLOY_LOAD.saturating_mul(2)),
             Self::LookupBlackout => inject + k.restart_slo * 2 + Duration::from_mins(5),
             // The freeze, the election, and the recovery polls.
             Self::RedisPrimaryFreeze | Self::RedisPrimaryKill | Self::RedisPartitionIngress => {
@@ -164,3 +170,6 @@ impl Case {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
