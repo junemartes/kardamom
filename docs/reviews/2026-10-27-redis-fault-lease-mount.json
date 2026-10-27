@@ -1,0 +1,24 @@
+{
+  "run": 40487608466,
+  "job": 122143879049,
+  "head": "1911596e1616bf24f9025d3257a9a84836e260a6",
+  "case": "mirror-kill-rebuild",
+  "classification": "Harness fault setup fails before the intended cache recovery exercise.",
+  "observed": "11:22:04 UTC: touch /tmp/kardamom-chaos-lua-* returns Read-only file system inside Redis. The Nomad job sets readonly_rootfs=true and Redis uses writable /local.",
+  "fix": "Keep the fault lease under /local. Preserve explicit cleanup, independent600-second expiry and both destination checks.",
+  "validation": {
+    "tests": "274 passed,2 ignored;10 write-fault controls pass. Exact generated shell commands run against an isolated Docker-command fixture with only /local writable. No local Docker or cluster starts.",
+    "positive_log": "/tmp/chaos-redis-lease-full-final-20261027.log",
+    "negative": "The original /tmp path fails before the ACL change; explicit cleanup prevents an old expiry worker from lifting a newer lease.",
+    "style": "PASS with baseline proc-macro-error2 future notice",
+    "style_log": "/tmp/chaos-redis-lease-style-final-20261027.log",
+    "excluded": "Initial style reports two needless_for_each findings in the fixture; helper reuse and an iterator predicate fix them."
+  },
+  "review": "R1\u2013R16: self-contained mount invariant, helper reuse, isolated temporary fixtures, no new locks or production behavior.",
+  "limits": "Deployed mirror interruption remains pending. No SLO, rate, matrix, service configuration, runtime hot path or stored format change. Streak0/10.",
+  "source_sha256": {
+    "crates/chaos/src/cases/cache/interrupted/writes.rs": "7008f186b4ac62a788160558228ef9fa64f68eb60eedd4275af3e525445528dd",
+    "crates/chaos/src/cases/cache/interrupted/writes/lease_tests.rs": "ca81ad01981a459f20dd260088dd37c5e974e0b1dbbd534f5fd698278188b0f5",
+    "crates/chaos/src/cases/cache/interrupted/writes/lease_docker.py": "60b8d2a93248abd81ce348f042172191e8c17d302ad638fc25884d2c95d248a1"
+  }
+}

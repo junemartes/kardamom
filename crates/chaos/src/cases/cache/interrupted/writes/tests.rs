@@ -98,12 +98,12 @@ async fn every_destination_is_blocked_and_restored_even_after_the_first_error() 
     );
     calls[..2].iter().for_each(|(_, script)| {
         assert!(script.contains("sleep 600"));
-        assert!(script.contains("if [ -e /tmp/kardamom-chaos-lua-test-lease ]"));
+        assert!(script.contains("if [ -e /local/kardamom-chaos-lua-test-lease ]"));
         assert!(script.ends_with("ACL SETUSER default -eval -evalsha"));
         assert!(!script.contains("CLIENT PAUSE"));
     });
     calls[2..].iter().for_each(|(_, script)| {
-        assert!(script.contains("rm -f /tmp/kardamom-chaos-lua-test-lease"));
+        assert!(script.contains("rm -f /local/kardamom-chaos-lua-test-lease"));
         assert!(script.ends_with("ACL SETUSER default +eval +evalsha"));
     });
     assert!(calls[0].1.contains("docker exec cid-primary redis-cli"));
