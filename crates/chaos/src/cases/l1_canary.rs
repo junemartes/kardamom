@@ -7,8 +7,8 @@
 //! again.
 //!
 //! The retention shard funds the canary at genesis, stops its job before
-//! other cases, and restores it only for this case. The small DA guard
-//! and the canary job both return to their prior state after the fault.
+//! other cases, and restores it only for this case. Its chain starts with
+//! a fixed small DA guard. The canary job stops after the fault.
 
 use std::time::Duration;
 

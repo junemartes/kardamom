@@ -932,24 +932,46 @@
       "evidence": [
         "https://github.com/junemartes/kardamom/actions/runs/40458018122/job/122041411237",
         "/tmp/chaos-gaps-0cf-cache-diagnostics",
-        "/tmp/chaos-gaps-all-data-pause-negative.log"
+        "/tmp/chaos-gaps-all-data-pause-negative.log",
+        "https://github.com/junemartes/kardamom/pull/861",
+        "docs/reviews/2026-10-27-mirror-write-pause-controls.json"
       ],
       "references": [
         "https://redis.io/docs/latest/commands/CLIENT-PAUSE/",
         "https://raw.githubusercontent.com/redis/redis/7.4/src/replication.c"
-      ]
+      ],
+      "consolidation": "Merge the published PR861 ancestry and preserve its real Redis command-control evidence. Keep one implementation with the added process-start fences, strict single-scrape oracle and mock command controls. No duplicate pause module remains."
     },
     {
       "id": "0cf-retention-validator-divergence",
-      "classification": "unclassified",
+      "classification": "harness configuration replay hazard",
       "case": "da-lag-halt",
       "observed": "Diagnostic run 40458018122 job 122041411232 completes the main load with 5123 offered, accepted and receipted and zero missing, unlanded or bad status. Own-sender recovery also completes exactly. The final validator oracle fails at 07:03:58 with validator counted divergence. A separate fresh-sender recovery reports 949 offered and receipted but 933 accepted and is not strict acceptance evidence.",
       "product_bug": null,
-      "status": "Preserve diagnostics and identify the actual divergence. This failure blocks qualification; successful receipts alone cannot certify state parity.",
+      "status": "A deterministic replay hazard is proved locally. The fixed genesis fixture preserves all fatal comparison and state gates. A fresh full runtime run must establish whether an additional runtime defect remains; the old BAL mismatch is not waived.",
       "evidence": [
         "https://github.com/junemartes/kardamom/actions/runs/40458018122/job/122041411232",
         "/tmp/chaos-gaps-0cf-retention.log"
-      ]
+      ],
+      "cause": "The DA fixture changes the deterministic sealer budget from 10000 to 8 and later restores 10000 on the same chain. Snapshot loading takes the current process budget, not the budget that made tail-log decisions. Pure Java controls show that the same snapshot tail changes from refusal to admission when the budget increases, and the reverse when it decreases. This mechanism matches the observed canonical rewind; deployed confirmation remains required.",
+      "timeline": [
+        "06:59:33 the fixture replaces all cluster task definitions with budget 8.",
+        "07:00:33 the sealer rejects a retained run of user nonces under budget 8.",
+        "07:01:26 restored task definitions restart members with budget 10000.",
+        "07:01:33 a member restores snapshot block1083, canonicalCount114278 and postedHead1072.",
+        "07:02:00 executor2 detects canonical divergence at block1083 and parks state above block1082.",
+        "07:02:07 the executor publishes a rollback to1082 on its next run.",
+        "07:02:19 the validator compares an older empty delta for block1087 with a new BAL holding three accounts on session1967898965 and halts."
+      ],
+      "change": "Keep all existing cases in the same retention CI job. Run the first three cases on their original fresh-chain configuration and finish every receipt, validator and persisted-state gate. Tear that chain down. Start a second fresh carry chain with budget8 from genesis for da-lag-halt and canary-da-lag, then finish the same gates. Preserve custom case order by starting a fresh chain whenever its guard setting differs. Reuse never reconfigures a live chain and requires its configured fixed budget.",
+      "service_wiring_changed": "CI topology only: the existing retention job owns two sequential fresh deployments. Production service configuration and canonical formats are unchanged.",
+      "hot_path_changed": false,
+      "verification": [
+        "Three pure Java snapshot-tail controls prove identical-budget replay and the decision changes in both budget directions. No Aeron or local container cluster is started.",
+        "Fresh-chain plan controls require both fixed budgets, every original case exactly once, stable case order, carry/canary/checkpoint settings and unchanged reuse.",
+        "Disabling the fixed fresh-chain budget fails two plan controls; source is restored afterward."
+      ],
+      "remaining": "Deployed confirmation and exact state parity remain required. The product still treats lag budgets as external replicated configuration; changing one on a live chain is a separate operational/protocol risk. No canonical rule or snapshot format changes here."
     }
   ],
   "coverage": [
@@ -986,7 +1008,7 @@
         "chaos-retention",
         "chaos-follower"
       ],
-      "status": "All three cases now ride the existing retention shard. da-lag-halt and canary-da-lag temporarily set an eight-block guard, verify its active value, restore the exact saved job even on failure, and verify the original guard. The shard keeps its normal DA guard. Snapshot cadence is 60 seconds. Public canary accounts are funded at genesis; the canary is stopped outside its own case. Local tests pass; deployed validation pending.",
+      "status": "All three cases ride the existing retention shard. Its first fresh carry chain runs retention-overrun, retention-overrun-validator and prune-floor with the normal guard. After receipt, validator and persisted-state proof, a second fresh carry chain starts with the eight-block guard for da-lag-halt and canary-da-lag. Neither phase changes a live replay budget. Canary accounts are funded at genesis and its job stops outside its case. Local controls pass; deployed validation is pending.",
       "evidence": "The canary oracle requires a critical suppressed canary alert to name the fingerprint of an active critical KardamomHaltDaLag alert. Unrelated inhibitors do not pass.",
       "reference": "https://github.com/prometheus/alertmanager/blob/main/inhibit/inhibit.go"
     },
@@ -1859,5 +1881,17 @@
     "negative_control": "2 expected failures when both commands target only the original primary",
     "style": "pass",
     "qualifying_streak": 0
+  },
+  "fixed_da_budget_followup": {
+    "runtime_product_files_changed": false,
+    "service_wiring_changed": "Two sequential fresh deployments inside the existing retention shard; no new CI job or shard.",
+    "hot_path_changed": false,
+    "qualifying_streak": 0,
+    "deployed_validation": "pending",
+    "guard_rule": "A snapshot tail replays with the same DA guard from genesis; no temporary live budget switch.",
+    "local_tests": "260 chaos tests pass, 2 existing local Nomad-agent tests ignored; full Java core suite passes including three budget replay controls",
+    "negative_control": "2 expected plan failures without a fixed fresh-chain budget",
+    "style": "pass",
+    "java_core_tests": 205
   }
 }

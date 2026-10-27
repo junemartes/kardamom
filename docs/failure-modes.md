@@ -207,7 +207,7 @@ The sealer refuses user records when the batcher falls too far behind on L1. Bel
   - The admin endpoint exports `kardamom_sealer_disk_free_bytes` (`GET /metrics`) and `diskFreeBytes` (`GET /status`).
   - Recovery: free the disk or add disk. The member restarts, truncates its file at its snapshot, and replays its log.
 - The wire layouts are in [`../cluster/sealer-service/README.md`](../cluster/sealer-service/README.md).
-- Proof: `da-lag-halt` and `prune-floor`. Both run by name with `KARDAMOM_CHAOS_CASES`. They are in no shard.
+- Proof: `da-lag-halt` and `prune-floor` run in `chaos-retention` and by name with `KARDAMOM_CHAOS_CASES`. The shard uses separate fresh chains for their distinct DA guard settings. Every snapshot tail replays with its chain's original guard; a live budget change can change canonical decisions.
   - `da-lag-halt` freezes the batcher and lets the sealed head pass the budget. It needs `KARDAMOM_DA_LAG_BUDGET_BLOCKS`, set to the small budget that the cluster runs with.
     - It asserts that the chain refuses a new transaction with the typed error.
     - It asserts that the chain status shows the sealer halted on `da_lag` as the root, and the ingresses paused on it.
