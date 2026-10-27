@@ -62,7 +62,9 @@ impl Fixture {
         let mut command = Command::new("python3");
         command
             .arg("-c")
-            .arg(FAULT)
+            .arg(format!(
+                "import hashlib\nhashlib.__dict__.pop('file_digest', None)\n{FAULT}"
+            ))
             .arg(self.root.path())
             .arg(operation);
         if operation == "arm" {
@@ -238,4 +240,28 @@ fn a_changed_baseline_refuses_the_fault_before_mutating_state_or_checkpoint() {
     );
     let destination = tempfile::tempdir().unwrap();
     assert!(f.restore(destination.path()).is_some());
+}
+
+#[test]
+fn streaming_evidence_hashes_every_chunk_without_the_new_python_api() {
+    let f = Fixture::new();
+    let image = f.checkpoint.join("mdbx.dat");
+    let mut bytes = vec![0xAB; 2 * 1024 * 1024 + 13];
+    bytes[1024 * 1024] = 0xCD;
+    bytes[2 * 1024 * 1024] = 0xEF;
+    std::fs::write(&image, bytes).unwrap();
+    let reference = Command::new("sha256sum").arg(&image).output().unwrap();
+    assert!(reference.status.success());
+    let expected = String::from_utf8(reference.stdout).unwrap();
+    let inspected = f.script("inspect");
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let observed: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(
+        observed["original_sha256"],
+        expected.split_whitespace().next().unwrap()
+    );
 }

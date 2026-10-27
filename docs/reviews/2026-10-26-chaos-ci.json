@@ -1027,6 +1027,26 @@
         "docs/reviews/2026-10-27-raft-refusal-retry.json"
       ],
       "status": "Local controls pass; runtime Raft recovery, final performance and ten fresh complete green rounds remain unproven."
+    },
+    {
+      "id": "checkpoint-fault-python-file-digest-unavailable",
+      "classification": "harness",
+      "case": "checkpoint-corrupt-recover",
+      "observed": "The executor shard passes graceful/hard kill, node failure, node replacement and state-checkpoint-restore. At 12:52:48 UTC the checkpoint corruption baseline fails with AttributeError: module hashlib has no attribute file_digest, before injecting corruption.",
+      "change": "Use hashlib.sha256 with 1 MiB reads. Keep baseline, corruption and quarantined-image SHA-256 evidence identical. Remove file_digest in the exact-script fixture so the compatibility requirement is exercised throughout the fault lifecycle.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "verification": [
+        "Four pre-fix controls reproduce the missing API failure.",
+        "The fixed exact-script lifecycle controls pass with file_digest removed; multi-chunk bytes match sha256sum.",
+        "300 chaos tests pass, two existing ignored; just style passes with the baseline dependency notice."
+      ],
+      "evidence": [
+        "https://github.com/junemartes/kardamom/actions/runs/40491865944/job/122162679978",
+        "docs/reviews/2026-10-27-checkpoint-python-compatibility.json"
+      ],
+      "status": "Local regression controls pass. Live checkpoint corruption and ENOSPC proofs remain pending; this failed run reached no injected corruption."
     }
   ],
   "coverage": [
@@ -1120,7 +1140,7 @@
         "chaos-ingress",
         "chaos-cluster"
       ],
-      "status": "The existing executor shard now includes checkpoint-corrupt-recover: stop only pinned executor-0, prove it has no writers, corrupt one byte without changing its manifest, remove other local bases and state, restore the exact saved job, and require ordered rejection/quarantine/peer fetch/restore in the replacement process. Verify exact quarantined bytes and manifest, then require fleet convergence and the common receipt, validator and persisted-state checks. The local production-verifier and fault-oracle controls pass (275 chaos library tests, 2 ignored). Deployed validation remains pending. The same shard now schedules checkpoint-disk-full: a bounded 512 MiB temporary checkpoint/log volume on executor-0, actual ENOSPC, fresh application failure evidence, same-process transaction progress, bounded client receipts, and production verification of a new base plus its subsequent log after release. Original state and recovery files remain intact; the exact job is restored before removing the temporary mount. Local fault/oracle controls pass; live CI remains pending. Active MDBX ENOSPC, device EIO and power-loss coverage remain open."
+      "status": "The existing executor shard now includes checkpoint-corrupt-recover: stop only pinned executor-0, prove it has no writers, corrupt one byte without changing its manifest, remove other local bases and state, restore the exact saved job, and require ordered rejection/quarantine/peer fetch/restore in the replacement process. Verify exact quarantined bytes and manifest, then require fleet convergence and the common receipt, validator and persisted-state checks. The local production-verifier and fault-oracle controls pass (275 chaos library tests, 2 ignored). Deployed validation remains pending. The same shard now schedules checkpoint-disk-full: a bounded 512 MiB temporary checkpoint/log volume on executor-0, actual ENOSPC, fresh application failure evidence, same-process transaction progress, bounded client receipts, and production verification of a new base plus its subsequent log after release. Original state and recovery files remain intact; the exact job is restored before removing the temporary mount. Local fault/oracle controls pass; live CI remains pending. Active MDBX ENOSPC, device EIO and power-loss coverage remain open. The first deployed corruption run reached the case but stopped before injection because the node lacked Python file_digest. The portable streaming-hash fix reproduces that failure locally with the API removed and preserves all hash fences. Both live recovery proofs remain pending."
     },
     {
       "gap": "Loss of unsynced disk writes rather than a process-only SIGKILL",
