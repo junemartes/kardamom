@@ -15,8 +15,19 @@ impl Case {
     /// inject-and-recover sequence.
     #[must_use]
     pub fn window(self, k: &Knobs) -> Duration {
+        let floor = self.fault_window(k).max(self.l1_window(k));
+        // This is an upper load bound. Unused time stops after recovery.
+        let recovery = k
+            .inject_delay
+            .saturating_add(k.restart_slo)
+            .saturating_add(k.reschedule_slo)
+            .saturating_add(Duration::from_mins(3));
+        k.case_window.max(floor).max(recovery)
+    }
+
+    fn fault_window(self, k: &Knobs) -> Duration {
         let inject = k.inject_delay;
-        let floor = match self {
+        match self {
             Self::SequencerReplicaKill => {
                 // An upper load bound caps at the largest representable duration.
                 inject
@@ -83,6 +94,7 @@ impl Case {
             Self::ArchiveCorruption | Self::CheckpointCorruptRecover => {
                 inject + Duration::from_mins(15)
             }
+            Self::CheckpointDiskFull => inject + Duration::from_mins(18),
             Self::ArchiveDriverLoss | Self::ArchiveTxDataWipe => {
                 inject + k.reschedule_slo + k.driver_restart_slo() + Duration::from_mins(5)
             }
@@ -131,14 +143,7 @@ impl Case {
             ),
             Self::Carry(step) => step.floor(k),
             _ => Duration::ZERO,
-        };
-        let floor = floor.max(self.l1_window(k));
-        // This is an upper load bound. Unused time stops after recovery.
-        let recovery = inject
-            .saturating_add(k.restart_slo)
-            .saturating_add(k.reschedule_slo)
-            .saturating_add(Duration::from_mins(3));
-        k.case_window.max(floor).max(recovery)
+        }
     }
 
     fn l1_window(self, k: &Knobs) -> Duration {
