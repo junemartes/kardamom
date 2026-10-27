@@ -1,6 +1,10 @@
 //! The session thread's duty cycle. [`run_session`] builds a
 //! [`SessionLoop`] and runs its numbered duty methods until `stop`.
 
+#[path = "session_requests.rs"]
+mod requests;
+use requests::SessionRequests;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -62,21 +66,12 @@ const EGRESS_SILENCE_RESET_MS: u64 = 10_000;
 // churn well below the reap rate. Any real egress frame resets the
 // backoff.
 const EGRESS_SILENCE_RESET_MAX_MS: u64 = 60_000;
-// Egress-subscribe announcement resend state. Like the replay request,
-// the announcement rides the ingress publication, which is often not
-// yet connected right after a (re)connect. Resend every
-// SUBSCRIBE_RESEND_MS until the first app egress frame proves the
-// service has us in the fan-out (a boundary arrives within one tick, 2s
-// or less).
+// The protocol has no subscription acknowledgement. Refresh registration
+// every three seconds, including while broadcast egress keeps arriving.
 const SUBSCRIBE_RESEND_MS: u64 = 3_000;
 
-/// Shared timing gate for the subscribe-announcement and
-/// replay-request resends. Both ride the ingress publication, which is
-/// often not yet connected right after a (re)connect, so a single send
-/// can be silently lost. Both resend on a fixed interval until egress
-/// confirms them. `due` fires immediately after [`Resend::rearm`]
-/// (session establishment), and every `interval_ms` after that. It
-/// records the send time when it fires.
+/// The bounded cadence for subscription refreshes and replay retries.
+/// A new session sends at once; subsequent attempts wait one interval.
 struct Resend {
     /// `None` means "never sent" (or just [`Resend::rearm`]ed), distinct
     /// from a real send timestamp of 0 ms since epoch.
@@ -264,10 +259,6 @@ fn next_item<T>(rx: &Receiver<T>, dead: &mut bool) -> Option<T> {
 /// The session thread's state. It holds the sans-IO [`SessionDriver`],
 /// the live ingress publication, the owner seams, and the loop-carried
 /// duty state.
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "independent flags on unrelated axes (an egress consumer detached, a receiver died, a subscribe was confirmed), not a state machine to collapse into one enum"
-)]
 struct SessionLoop {
     rt: AeronRuntime,
     cfg: LiveClusterConfig,
@@ -285,7 +276,6 @@ struct SessionLoop {
     /// one. A fenced offer for another session gets no publish.
     session: Option<SessionMark>,
     replay: Option<ReplayOnConnect>,
-    subscribe: bool,
     egress_kind_filter: Option<Vec<u8>>,
     frame_rx: Receiver<RawFrame>,
     req_rx: Receiver<OfferReq>,
@@ -296,9 +286,7 @@ struct SessionLoop {
     out_tx: Sender<Vec<u8>>,
     stop: Arc<AtomicBool>,
     egress_watch: EgressWatch,
-    replay_ask: ReplayAsk,
-    subscribe_resend: Resend,
-    subscribe_confirmed: bool,
+    requests: SessionRequests,
     // Whether an egress consumer (a `LiveEgress`) is still attached. A
     // publisher-only client (the sequencer) drops its `LiveEgress`. After
     // that, the loop stops routing application payloads (and never
@@ -371,7 +359,6 @@ impl SessionLoop {
             ingress,
             session: None,
             replay,
-            subscribe,
             egress_kind_filter,
             frame_rx: seams.frame_rx,
             req_rx: seams.req_rx,
@@ -380,9 +367,7 @@ impl SessionLoop {
             out_tx: seams.out_tx,
             stop: seams.stop,
             egress_watch: EgressWatch::new(Instant::now()),
-            replay_ask: ReplayAsk::new(),
-            subscribe_resend: Resend::new(SUBSCRIBE_RESEND_MS),
-            subscribe_confirmed: false,
+            requests: SessionRequests::new(subscribe),
             egress_alive: true,
             backoff: IdleBackoff::new(Duration::from_millis(1), Duration::from_millis(5), 5),
             meters: SessionMeters::new(subscribe),
@@ -459,11 +444,9 @@ impl SessionLoop {
                 // Canonical-stream consumers request replay from their
                 // delivery cursor on every establishment. Force an
                 // immediate (re)send below.
-                self.replay_ask.rearm();
+                self.requests.rearm();
                 self.session = Some(SessionMark::after(self.session));
                 self.mark_session_start(cluster_session_id);
-                self.subscribe_resend.rearm();
-                self.subscribe_confirmed = false;
                 self.egress_watch.on_connect(Instant::now());
             }
             DriverEvent::Failed(reason) => {
@@ -471,17 +454,6 @@ impl SessionLoop {
                 crate::metrics::record_failed();
             }
         }
-    }
-
-    /// Whether an egress frame of `kind` proves that the sealer saw the
-    /// subscribe announcement of this session. The sealer sends its rules
-    /// (kind 17) to every session when the session opens, before it can
-    /// have read the announcement, so that frame proves nothing: a
-    /// session that took it as the proof would never resend a lost
-    /// announcement, and the sealer would leave it out of the record
-    /// fan-out.
-    fn confirms_subscribe(kind: u8) -> bool {
-        kind != crate::wire::EGRESS_KIND_SEALER_INFO
     }
 
     /// Tell a replay consumer, or a consumer of the sealer's rules, that a
@@ -510,20 +482,15 @@ impl SessionLoop {
         }
     }
 
-    /// One app payload from egress. The session filter already passed, so
-    /// this confirms the subscribe. The kind filter then decides whether the
-    /// consumer sees the payload. A closed consumer channel ends the egress
-    /// direction.
+    /// One session-filtered payload updates request and liveness state.
+    /// The kind filter decides whether the consumer sees it. A closed
+    /// consumer channel ends the egress direction.
     fn on_app_message(&mut self, payload: Vec<u8>) {
-        self.subscribe_confirmed |= payload
-            .first()
-            .copied()
-            .is_some_and(Self::confirms_subscribe);
         // The replay gate reads the kind byte before the egress filter: a
         // replay answer (REPLAY_DONE, REPLAY_AHEAD or REPLAY_UNAVAILABLE)
         // ends the resends even when the consumer does not want the frame.
         if let Some(&kind) = payload.first() {
-            self.replay_ask.on_payload(kind);
+            self.requests.on_payload(kind);
         }
         self.egress_watch.on_payload(&payload, Instant::now());
         let wanted = self
@@ -591,14 +558,14 @@ impl SessionLoop {
     }
 
     /// Duty 1a': egress-subscribe announcement (canonical-stream
-    /// consumers). Send on session establishment, and resend until the
-    /// first app egress frame arrives (see [`SUBSCRIBE_RESEND_MS`]).
+    /// consumers). Send on session establishment and refresh on the
+    /// bounded cadence, since broadcasts do not prove registration.
     fn send_subscribe(&mut self) {
-        if !self.subscribe || !self.driver.is_connected() || self.subscribe_confirmed {
+        if !self.driver.is_connected() {
             return;
         }
         let now = now_ms();
-        if !self.subscribe_resend.due(now) {
+        if !self.requests.subscribe_due(now) {
             return;
         }
         let req = crate::wire::encode_subscribe();
@@ -621,7 +588,7 @@ impl SessionLoop {
     /// silently lost.
     fn send_replay(&mut self) {
         let Some(r) = &self.replay else { return };
-        if !self.driver.is_connected() || !self.replay_ask.due(now_ms()) {
+        if !self.driver.is_connected() || !self.requests.replay_due(now_ms()) {
             return;
         }
         let cursor = (

@@ -304,8 +304,9 @@ pub struct ConnectOptions {
     /// canonical-stream consumer — but callers set both explicitly.
     pub replay: Option<ReplayOnConnect>,
     /// Send the egress-subscribe announcement whenever a session is
-    /// established. Use this for canonical-stream consumers (for example,
-    /// the ingress watermark observer, which derives watermarks only from
+    /// established and refresh it every three seconds. Egress broadcasts
+    /// do not acknowledge registration. Use this for canonical-stream
+    /// consumers (for example, the ingress watermark observer, which derives watermarks only from
     /// live egress). Without the announcement, the service excludes the
     /// session from the per-record egress fan-out.
     pub subscribe: bool,
