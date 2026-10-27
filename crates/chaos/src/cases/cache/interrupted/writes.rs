@@ -79,7 +79,8 @@ impl DataNode {
     }
 
     fn access_script(&self, lease: &str, access: ScriptAccess) -> String {
-        let path = format!("/tmp/kardamom-chaos-lua-{lease}");
+        // Nomad mounts the task directory writable at /local; the image root is read-only.
+        let path = format!("/local/kardamom-chaos-lua-{lease}");
         let allow = self.script("ACL SETUSER default +eval +evalsha");
         match access {
             ScriptAccess::Blocked => format!(
@@ -255,3 +256,6 @@ impl WriteBlock {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod lease_tests;

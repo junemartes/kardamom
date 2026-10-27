@@ -257,6 +257,7 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
   - Trigger: a member comes back with no Raft recording log: its directories are wiped, or its node is replaced.
   - Effect: the member must not start at log position 0 in a running cluster. It could not catch up after the leader purges its log. Blank members that elect each other would start a second history.
   - Recovery: before it launches, the member copies the latest snapshot, and the log after it, from a peer (an Aeron ClusterBackup).
+    - `BACKING_UP` alone is not completion. The copied log must reach the snapshot position and last recorded term base. The stopped backup is checked again before startup; an incomplete copy that stops advancing for 20 seconds retries with backoff.
     - It restores the snapshot and catches up from the leader.
     - A blank member starts at position 0 only during the bootstrap of a new cluster (`KARDAMOM_CLUSTER_BOOTSTRAP=1`).
     - Without a peer, the member waits and logs `cluster SEED waiting-for-peer`. It never falls back to position 0.
