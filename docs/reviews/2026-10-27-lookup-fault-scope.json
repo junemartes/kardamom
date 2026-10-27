@@ -1,0 +1,56 @@
+{
+  "source_run": 40478905782,
+  "source_job": 122123354835,
+  "source_head": "9f64a420670be90d9e951cb82594aee371506def",
+  "case": "lookup-blackout",
+  "classification": "Harness fault scope; no product lookup defect is inferred from this failure.",
+  "timeline": [
+    "All preceding sequencer cases pass, including four isolated recovered-replica proofs.",
+    "10:42:01UTC: phase1 blackholes every executor IP and cache TCP ports on sequencer-0. Carry executors share the sealer addresses.",
+    "10:42:20: the cold replica reports failed lookups.",
+    "10:42:25: phase2 restores routes and drops all incoming UDP from executor/sealer IPs.",
+    "10:42:38: the replica reports sealer_no_quorum after silence on its cluster session; repeated reconnect attempts follow.",
+    "10:44:56: the phase misses its120s lookup deadline; rules are removed and stream images return.",
+    "10:44:57: the case fails. No lookup deadline is extended."
+  ],
+  "change": "Match only unfragmented IPv4 Aeron DATA stream1002 from executor addresses, irrespective of ephemeral receive port. Restrict phase1 query loss to executor TCP9024 plus cache TCP6379/26379. Allow cluster DATA streams101/102, receipt boundaries1003 and Aeron control packets. Both phases restart the cold process; require lookup outcome, received canonical boundary, active receipt-drop counters and unchanged replacement identity. Phase1 also requires zero answered outcomes. Preserve live twin progress. Always clear both dedicated chains, including after partial arm failures.",
+  "wiring_and_hot_path": "Harness fault injection only. No production code, service wiring, ports, formats, retry budgets, offered rate or shard matrix changes.",
+  "wire_basis": {
+    "local_dependency": "rusteron-client0.1.163/aeron/aeron-client/src/main/c/protocol/aeron_udp_protocol.h: aeron_frame_header_t and aeron_data_header_t; Java DataHeaderFlyweight uses little-endian fields.",
+    "fields": "IPv4 IHL locates UDP. Payload offset4 holds version/flags/type; offset16 holds stream id. DATA type1 and stream1002 are little endian. u32 reads network-order words.",
+    "u32_reference": "https://www.iptables.org/documentation/HOWTO/netfilter-extensions-HOWTO-3.html",
+    "manual": "https://ipset.netfilter.org/iptables-extensions.man.html"
+  },
+  "positive": {
+    "command": "CARGO_TARGET_DIR=/home/dev/kardamom-integ/target cargo test -p kardamom-chaos --lib --locked",
+    "result": "278 passed,2 ignored,0 failed",
+    "log": "/tmp/chaos-lookup-scope-full-final-20261027.log"
+  },
+  "negative": {
+    "mutation": "Replace the receipt selector with an unfragmented-IP match, reproducing the broad UDP fault scope.",
+    "result": "The compiled sealer/control isolation test fails on stream101. The original selector is restored before the passing full suite.",
+    "log": "/tmp/chaos-lookup-scope-negative-20261027.log"
+  },
+  "controls": [
+    "Receipt DATA matches with IPv4 options and Aeron fragmentation flags.",
+    "Colocated sealer ingress/egress, receipt boundary and other streams, Aeron control packets, truncated packets, IP fragments and another protocol version do not match.",
+    "The selector constants agree with the committed deployment profile.",
+    "An answer without a canonical boundary, and a failed query alongside an answered source, cannot certify the requested phase.",
+    "Only positive DROP counters certify an active receipt fault.",
+    "Exact arm/allow/cleanup shell scripts run against an isolated iptables table fixture: partial arm at three boundaries restores unrelated rules; allowing queries keeps the receipt fault."
+  ],
+  "limits": "Packet controls interpret the documented u32 language; they do not run the local kernel netfilter module. Deployed CI must install the rules and observe positive counters. No local Docker/staging cluster is run. Runtime proof and ten unchanged-head rounds remain pending; streak0/10.",
+  "excluded_attempts": "The first compile caught borrowed temporary cleanup-script strings across tokio::join; named bindings fix the lifetime. No product behavior is changed.",
+  "source_sha256": {
+    "crates/chaos/src/cases/lookup_blackout.rs": "7d60a266684d12309de1bb07c04f189bb681e137a216b6ec5d289aa21b8069ef",
+    "crates/chaos/src/cases/lookup_blackout/rules.rs": "c95560d3d0e794fec63fab1034279e7e40d9fa921bb640b93f72d6a9011827c2",
+    "crates/chaos/src/cases/lookup_blackout/tests.rs": "85a723d94acbd28115ff5feb97025404f716acc5bf2bf98be37096a88101a538",
+    "crates/chaos/src/cases/lookup_blackout/rules/tests.rs": "3d4b2720c935cf15e9a225741ee41484285edfdd8855231d851dcc069719d850",
+    "crates/chaos/src/cases/lookup_blackout/rules/test_iptables.py": "72048caf3b0aae7d9d4a138b4be02a0591c98c22ca2604325c073faf8c46a763"
+  },
+  "style": {
+    "result": "PASS; baseline proc-macro-error2 future compatibility notice remains",
+    "log": "/tmp/chaos-lookup-scope-style-final-20261027.log",
+    "review": "R1\u2013R16 reviewed. Owned fault state and typed phases; static dispatch; bounded methods; sibling tests; no mutex, runtime hot path, format or service wiring changes."
+  }
+}
