@@ -25,6 +25,37 @@ impl Warm {
     pub(crate) fn lag(self) -> i64 {
         self.exec.saturating_sub(self.block)
     }
+
+    async fn read(h: &Harness, elapsed: Duration) -> Option<Self> {
+        let values = tokio::join!(
+            h.probes.val_metric(VERIFIED),
+            h.probes.val_metric(COMMITTED),
+            h.probes.executor_progress(),
+        );
+        Self::observed([values.0, values.1, values.2], elapsed)
+    }
+
+    fn observed(values: [Option<i64>; 3], elapsed: Duration) -> Option<Self> {
+        let [Some(verified), Some(block), Some(exec)] = values else {
+            return None;
+        };
+        Some(Self {
+            verified,
+            block,
+            exec,
+            elapsed,
+        })
+    }
+
+    fn verifies_after(self, floor: Option<i64>, max_lag: i64) -> bool {
+        floor.is_some_and(|floor| {
+            self.verified > 0
+                && self.verified > floor
+                && self.block > 0
+                && self.exec > 0
+                && self.lag() <= max_lag
+        })
+    }
 }
 
 /// Wait until the validator verifies live: its verified counter is
@@ -40,23 +71,18 @@ pub(crate) async fn wait_verifying_live(
     timeout: Duration,
     max_lag: i64,
 ) -> Result<Warm, Warm> {
-    let prev = Cell::new(-1_i64);
+    let prev = Cell::new(None::<i64>);
     let last = Cell::new(Warm::default());
     let (prev_ref, last_ref) = (&prev, &last);
     let outcome = poll::until(
         Budget::new(timeout, Duration::from_secs(6)),
         |elapsed| async move {
-            let warm = Warm {
-                verified: h.probes.val_metric(VERIFIED).await.unwrap_or(0),
-                block: h.probes.val_metric(COMMITTED).await.unwrap_or(0),
-                exec: h.probes.executor_progress().await.unwrap_or(0),
-                elapsed,
+            let Some(warm) = Warm::read(h, elapsed).await else {
+                crate::log("validator warm-up: incomplete scrape (not counted)");
+                return Ok::<_, anyhow::Error>(None);
             };
-            let live = warm.verified > 0
-                && warm.verified > prev_ref.get()
-                && warm.block > 0
-                && warm.lag() <= max_lag;
-            prev_ref.set(warm.verified);
+            let live = warm.verifies_after(prev_ref.get(), max_lag);
+            prev_ref.set(Some(warm.verified));
             last_ref.set(warm);
             Ok::<_, anyhow::Error>(live.then_some(warm))
         },
@@ -64,6 +90,10 @@ pub(crate) async fn wait_verifying_live(
     .await;
     match outcome {
         Ok(poll::Outcome::Ready { value, .. }) => Ok(value),
+        Ok(poll::Outcome::TimedOut { elapsed }) => Err(Warm {
+            elapsed,
+            ..last.get()
+        }),
         _ => Err(last.get()),
     }
 }
@@ -271,11 +301,11 @@ async fn sample_recovery(
             elapsed.as_secs(),
             warm_line(w)
         ));
-        let ok = match path {
-            Path::Newborn => w.verified > 0 && w.block > 0 && w.lag() <= 25,
-            Path::Survivor => w.verified > vf0 && w.lag() <= 25,
+        let floor = match path {
+            Path::Newborn => 0,
+            Path::Survivor => vf0,
         };
-        Ok(ok.then_some((path, w)))
+        Ok(w.verifies_after(Some(floor), 25).then_some((path, w)))
     })
     .await?;
     let last = last.get();
@@ -304,24 +334,14 @@ async fn recovery_sample(
         Some(c) => h.nodes.started_at(node, c).await,
         None => None,
     };
-    let verified = h.probes.val_metric(VERIFIED).await?;
-    let block = h.probes.val_metric(COMMITTED).await?;
-    let exec = h.probes.executor_progress().await.unwrap_or(0);
+    let warm = Warm::read(h, elapsed).await?;
     let newborn = matches!((started0, started1.as_deref()), (Some(a), Some(b)) if a != b);
     let path = if newborn {
         Path::Newborn
     } else {
         Path::Survivor
     };
-    Some((
-        path,
-        Warm {
-            verified,
-            block,
-            exec,
-            elapsed,
-        },
-    ))
+    Some((path, warm))
 }
 
 /// A fresh validator joins a running chain: kill the validator, wipe
@@ -365,15 +385,12 @@ pub(crate) async fn join(h: &mut Harness) -> anyhow::Result<()> {
         if newborn_ref.borrow().is_none() {
             *newborn_ref.borrow_mut() = newborn_container(hs, node_ref, started0_ref).await;
         }
-        let w = Warm {
-            verified: hs.probes.val_metric(VERIFIED).await.unwrap_or(0),
-            block: hs.probes.val_metric(COMMITTED).await.unwrap_or(0),
-            exec: hs.probes.executor_progress().await.unwrap_or(0),
-            elapsed,
+        let Some(w) = Warm::read(hs, elapsed).await else {
+            crate::log("validator-join: incomplete scrape (not counted)");
+            return Ok::<_, anyhow::Error>(None);
         };
         last_ref.set(w);
-        let joined =
-            newborn_ref.borrow().is_some() && w.verified > 0 && w.block > 0 && w.lag() <= 25;
+        let joined = newborn_ref.borrow().is_some() && w.verifies_after(Some(0), 25);
         Ok::<_, anyhow::Error>(joined.then_some(w))
     })
     .await?;
@@ -454,3 +471,7 @@ async fn newborn_container(h: &Harness, node: &str, started0: Option<&str>) -> O
     ));
     Some(current)
 }
+
+#[cfg(test)]
+#[path = "validator_tests.rs"]
+mod tests;
