@@ -374,7 +374,6 @@ impl ResyncWiring {
                 accounts: accounts_rx,
                 lookups,
                 verdicts: None,
-                refusals: None,
             },
             task,
         )

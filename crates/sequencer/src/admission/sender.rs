@@ -30,6 +30,8 @@ pub(super) struct SenderState<T> {
     relook_due: bool,
     /// The nonce of the first forwarded transaction that no state confirmed.
     first: u64,
+    /// Loss markers identify this run, including after a nonce is reused.
+    generation: u64,
     /// The forwarded run, from `first` on. The filter keeps each
     /// transaction until a state confirms it, so the caller can offer the
     /// run again when the sealer can have lost an offer.
@@ -48,6 +50,7 @@ impl<T> Default for SenderState<T> {
             from_lookup: false,
             relook_due: false,
             first: 0,
+            generation: 0,
             forwarded: VecDeque::new(),
             spend: U256::ZERO,
             parked: BTreeMap::new(),
@@ -56,6 +59,40 @@ impl<T> Default for SenderState<T> {
 }
 
 impl<T: Clone> SenderState<T> {
+    /// Remove only the copy the refusal names. A forwarded suffix leaves
+    /// with it, so the caller parks it behind the missing nonce.
+    pub(super) fn take_refused(
+        &mut self,
+        nonce: u64,
+        named: impl Fn(&Candidate<T>) -> bool,
+    ) -> Option<super::refusals::RefusedRun<T>> {
+        if self.forwarded_at(nonce).is_some_and(&named) {
+            let at = usize::try_from(nonce.checked_sub(self.first)?).ok()?;
+            let mut suffix = self.forwarded.split_off(at);
+            self.spend = suffix
+                .iter()
+                .fold(self.spend, |spend, c| spend.saturating_sub(c.cost));
+            return suffix
+                .pop_front()
+                .map(|candidate| super::refusals::RefusedRun {
+                    candidate,
+                    suffix,
+                    was_parked: false,
+                });
+        }
+        if self.parked.get(&nonce).is_some_and(named) {
+            return self
+                .parked
+                .remove(&nonce)
+                .map(|candidate| super::refusals::RefusedRun {
+                    candidate,
+                    suffix: VecDeque::new(),
+                    was_parked: true,
+                });
+        }
+        None
+    }
+
     /// Decide one transaction of this sender. Returns whether it parked.
     pub(super) fn offer(
         &mut self,
@@ -146,10 +183,13 @@ impl<T: Clone> SenderState<T> {
     pub(super) fn on_lost(
         &mut self,
         nonce: u64,
+        generation: Option<u64>,
         cfg: &AdmissionConfig,
         out: &mut Vec<Verdict<T>>,
     ) -> bool {
-        if self.forwarded_at(nonce).is_none() {
+        if generation.is_some_and(|generation| generation != self.generation)
+            || self.forwarded_at(nonce).is_none()
+        {
             return false;
         }
         self.forwarded.clear();
@@ -315,10 +355,12 @@ impl<T: Clone> SenderState<T> {
         }
         if self.forwarded.is_empty() {
             self.first = c.nonce;
+            // Only marks that coexist in bounded storage compare these run tags.
+            self.generation = self.generation.wrapping_add(1);
         }
         self.spend = self.spend.saturating_add(c.cost);
         self.forwarded.push_back(c.clone());
-        out.push(Verdict::Forward(c));
+        out.push(Verdict::Forward(c, self.generation));
         false
     }
 

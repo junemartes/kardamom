@@ -8,6 +8,9 @@ use crate::harness::Harness;
 use crate::nomad::{Alloc, Streams};
 use crate::poll::{self, Budget};
 
+mod forced;
+pub(crate) use forced::ForcedRebuild;
+
 #[derive(Debug, Default, serde::Serialize)]
 struct Counts {
     scanning: usize,

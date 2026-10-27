@@ -23,8 +23,6 @@ use kardamom_cluster_adapter::wire::{
 };
 use kardamom_types::{DropReason, TxDrop};
 
-use crossbeam_channel::TrySendError;
-
 use crate::metrics;
 use crate::outbound::DropPublisher;
 use crate::v2::AccountEvent;
@@ -169,10 +167,7 @@ impl<D: DropPublisher> SealerRules<D> {
             "sealer refused a reference without bytes; dropping the transaction"
         );
         self.publish(self.shared.get().max(refused.decision_version));
-        self.tell_loop(AccountEvent::Refused {
-            sender: refused.sender,
-            nonce: refused.nonce,
-        });
+        self.tell_loop(|| AccountEvent::Refused(Box::new(*refused)));
         self.drops.publish_drop(TxDrop {
             tx_hash: refused.canonical_id,
             sender: refused.sender,
@@ -185,28 +180,35 @@ impl<D: DropPublisher> SealerRules<D> {
     /// `sender` at `nonce`, because it expects `expected` (egress kind 5).
     /// Tell the v2 loop, so it offers the run again from the expected
     /// nonce.
-    pub fn on_contiguity_reject(&self, sender: Address, nonce: u64, expected: u64) {
-        self.tell_loop(AccountEvent::Rejected {
+    pub fn on_contiguity_reject(&self, sender: Address, nonce: u64, expected: u64) -> bool {
+        self.tell_loop(|| AccountEvent::Rejected {
             sender,
             nonce,
             expected,
-        });
+        })
     }
 
-    /// Put the answer of the sealer on the queue of the v2 loop. A full
-    /// queue loses it: the loss window of the filter then frees the nonce,
-    /// later.
-    fn tell_loop(&self, event: AccountEvent) {
-        let full = self
-            .refusals
-            .as_ref()
-            .is_some_and(|tx| matches!(tx.try_send(event), Err(TrySendError::Full(_))));
-        if full {
-            tracing::warn!(
-                partition = self.partition,
-                "account event queue full; the refusal waits for the loss window"
-            );
-        }
+    /// Route a refusal to v2 when its account queue is wired. V1 keeps its
+    /// terminal-refusal channel. The box lives only on this cold path.
+    #[must_use]
+    pub fn on_refusal(&self, refusal: &crate::resync::SealerRefusal) -> bool {
+        self.tell_loop(|| AccountEvent::Refusal(Box::new(refusal.clone())))
+    }
+
+    /// A full sealer window requests replay without freeing any nonce.
+    pub fn on_window_full(&self, sender: Address, nonce: u64) -> bool {
+        self.tell_loop(|| AccountEvent::Retry { sender, nonce })
+    }
+
+    /// Account events drain even while publication pauses. Backpressure
+    /// keeps a refusal until the loop consumes it. A stopped loop drops
+    /// the receiver and releases this producer.
+    fn tell_loop(&self, event: impl FnOnce() -> AccountEvent) -> bool {
+        let Some(tx) = &self.refusals else {
+            return false;
+        };
+        let _ = tx.send(event());
+        true
     }
 
     fn publish(&self, version: u8) {
