@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use super::{Case, fleet, sequencer_recovery};
+use super::{Case, fleet, raft_partition::PacketLoss, sequencer_recovery};
 use crate::knobs::Knobs;
 
 /// A full workload play can take 29 minutes before the runtime proof.
@@ -23,6 +23,7 @@ impl Case {
                     .saturating_add(k.restart_slo.saturating_mul(4))
                     .saturating_add(sequencer_recovery::SequencerRecovery::PROOF_WINDOW)
             }
+            Self::RaftLeaderPacketLoss => PacketLoss::window(k),
             Self::RaftLeaderOneWayPartition => {
                 inject + k.leader_slo + k.rejoin_slo + Duration::from_mins(4)
             }
