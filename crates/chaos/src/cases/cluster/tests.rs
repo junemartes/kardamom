@@ -73,3 +73,127 @@ fn only_a_new_start_in_the_same_allocation_certifies_a_snapshot() {
     assert_eq!(observed(1, 1, 810).new_block(&before), Some(810));
     assert_eq!(observed(2, 0, 888).new_block(&before), Some(999));
 }
+
+struct ReplacementAgent {
+    old_status: &'static str,
+    live_status: u16,
+    live_logs: &'static str,
+}
+
+impl ReplacementAgent {
+    async fn read(self) -> anyhow::Result<StartLogs> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let nomad = Nomad::new(&format!("http://{}", listener.local_addr()?))?;
+        let server = tokio::spawn(async move {
+            loop {
+                self.answer(&listener).await;
+            }
+        });
+        let result = Blank::starts_by_alloc(&nomad, 0, &BlankStart::of(0)).await;
+        server.abort();
+        result
+    }
+
+    async fn answer(&self, listener: &tokio::net::TcpListener) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut reader = tokio::io::BufReader::new(socket);
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        let mut header = String::new();
+        while reader.read_line(&mut header).await.unwrap() > 2 {
+            header.clear();
+        }
+        let path = request.split_whitespace().nth(1).unwrap();
+        let (status, body) = self.response(path.split('?').next().unwrap());
+        reader.get_mut().write_all(format!(
+            "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        ).as_bytes()).await.unwrap();
+    }
+
+    fn response(&self, path: &str) -> (u16, String) {
+        match path {
+            "/v1/nodes" => (
+                200,
+                serde_json::json!([
+                    {"ID":"removed-node", "Name":"sealer-0", "Status":"down"},
+                    {"ID":"replacement-node", "Name":"sealer-0", "Status":"ready"}
+                ])
+                .to_string(),
+            ),
+            "/v1/job/cluster/allocations" => (
+                200,
+                serde_json::json!([
+                    Self::allocation("old", "removed-node", self.old_status),
+                    Self::allocation("new", "replacement-node", "running")
+                ])
+                .to_string(),
+            ),
+            "/v1/client/fs/logs/new" => (self.live_status, self.live_logs.to_string()),
+            _ => (
+                400,
+                format!("unexpected request to unavailable evidence: {path}"),
+            ),
+        }
+    }
+
+    fn allocation(id: &str, node: &str, status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "ID": id, "NodeID": node, "NodeName": "sealer-0", "TaskGroup": "cluster",
+            "ClientStatus": status, "DesiredStatus": "run", "JobVersion": 1,
+            "TaskStates": {"cluster": {"State": "running"}}
+        })
+    }
+}
+
+#[tokio::test]
+async fn replacement_catchup_ignores_old_allocations_by_node_identity() {
+    for old_status in ["running", "complete", "failed", "lost"] {
+        let logs = ReplacementAgent {
+            old_status,
+            live_status: 200,
+            live_logs: "sealer state FRESH at genesis memberId=0\nsealer snapshot TAKEN memberId=0 block=969\n",
+        }.read().await.unwrap();
+        assert_eq!(
+            logs.new_block(&HashMap::from([("old".to_string(), 1)])),
+            Some(969)
+        );
+        assert_eq!(logs.counts(), HashMap::from([("new".to_string(), 1)]));
+    }
+}
+
+#[tokio::test]
+async fn replacement_catchup_requires_live_start_and_snapshot_evidence() {
+    for (live_logs, expected) in [
+        ("", None),
+        ("sealer snapshot TAKEN memberId=0 block=969\n", None),
+        ("sealer state FRESH at genesis memberId=0\n", Some(0)),
+    ] {
+        let logs = ReplacementAgent {
+            old_status: "complete",
+            live_status: 200,
+            live_logs,
+        }
+        .read()
+        .await
+        .unwrap();
+        assert_eq!(logs.new_block(&HashMap::new()), expected);
+    }
+}
+
+#[tokio::test]
+async fn replacement_catchup_keeps_live_log_failures_fatal() {
+    let error = ReplacementAgent {
+        old_status: "complete",
+        live_status: 400,
+        live_logs: "live log unavailable",
+    }
+    .read()
+    .await
+    .err()
+    .unwrap();
+    let error = format!("{error:#}");
+    assert!(error.contains("(400 "), "{error}");
+    assert!(error.contains("/v1/client/fs/logs/new"), "{error}");
+}
