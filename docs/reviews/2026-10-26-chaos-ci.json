@@ -818,7 +818,7 @@
       "classification": "product",
       "case": "past-deadline, missing-bytes refusal, backpressure",
       "observed": "The earlier V2 missing-bytes handler forgets an entire forwarded run. The combined terminal handler also removes a whole sender run. The deadline test uses the current format of an offer, which can differ from the refused copy after a version change.",
-      "change": "Use the transaction hash for missing-bytes identity and the envelope deadline for past-deadline identity. Remove the named copy, park its suffix behind the gap, and remove stale outbox and pending forward verdicts. Reuse the existing parked bound; every excess suffix transaction gets its own retryable eviction status, error and drop. Already acknowledged suffix entries do not get another submit verdict.",
+      "change": "Use the transaction hash for missing-bytes identity and the envelope deadline for past-deadline identity. Remove the named copy, park its suffix behind the gap, and remove stale outbox and pending forward verdicts. Reuse the existing parked bound; every excess suffix transaction gets its own retryable eviction status, error and drop. Already acknowledged suffix entries do not get another submit verdict. V2 defers missing-byte drops until the loop checks the current copy. A full-byte replacement survives and retries; only the held missing-byte copy emits its drop.",
       "product_bug": true,
       "service_wiring_changed": false,
       "hot_path_changed": "Terminal verdicts share the existing dispatch. Copy matching and suffix repair run only on refusal.",
@@ -827,7 +827,9 @@
         "A different hash at the same nonce preserves the held transaction.",
         "A backpressured suffix cannot escape before its prefix is replaced.",
         "A terminal notice cancels pending forward verdicts created earlier in the same account-event batch.",
-        "A 32-entry run reparks the bounded suffix and reports each of 15 excess entries explicitly."
+        "A 32-entry run reparks the bounded suffix and reports each of 15 excess entries explicitly.",
+        "Two late-reference controls fail before V2 owns the drop decision and checks full-byte eligibility.",
+        "A genuine missing-byte copy emits one named drop after the loop consumes the frame; its suffix waits behind the gap."
       ],
       "status": "Local controls pass; deployed exact-state and successful-receipt proof remains pending."
     },
@@ -836,16 +838,19 @@
       "classification": "product",
       "case": "sequencer loss timeout and terminal recovery",
       "observed": "A deterministic control loses nonce 0, accepts a replacement run, then expires the old nonce-1 marker. The old marker clears the new run before its own full loss window. A separate control reproduces an old terminal-copy marker expiring a replacement.",
-      "change": "Tag each forwarded run and its loss markers with a generation. Expiry acts only on its original run. A new run starts a new tag, including after confirmation and rollback. Terminal suffix repair removes the old marks of the removed suffix.",
+      "change": "Tag each forwarded run and its loss markers with a compact generation. Expiry acts only on its original run. Rollover purges old sender tags before reuse; idle eviction removes marks of the removed state. Terminal suffix repair removes the old suffix marks. Resume retains only marks that still name current unconfirmed transactions, so repeated guard cycles cannot retain confirmed history indefinitely.",
       "product_bug": true,
       "service_wiring_changed": false,
-      "hot_path_changed": "One owned generation value per sender and one per loss marker. The existing new-run branch advances the tag. There is no new map lookup, lock or atomic operation on admission. Measure actual layout and healthy throughput before acceptance.",
+      "hot_path_changed": "The tag fits existing padding: loss marker 40 bytes and sender state 160 bytes, unchanged from the baseline. Candidate 192 bytes, verdict 272 bytes and account event 80 bytes are unchanged. Rollover and metadata pruning use cold paths. No new receiver poll, lock, atomic or map lookup is added to healthy admission.",
       "verification": [
         "The old lost-suffix control fails before the generation change.",
         "The old terminal-copy control fails before old suffix markers are removed.",
-        "Replacement runs keep their own finite loss window, including after rollback."
+        "Replacement runs keep their own finite loss window, including after rollback.",
+        "A reused-nonce rollover control fails when old-tag cleanup is disabled; later forwards under tag zero retain their first loss marker.",
+        "The idle-eviction control fails before ownerless markers are removed.",
+        "One hundred recovery cycles retain 101 markers before resume pruning; afterward only the one live waiting transaction retains a marker."
       ],
-      "status": "Local controls pass. The final release profile is building; deployed failure repetitions remain pending."
+      "status": "All final local controls pass. The exact final binary is under controlled measurement. Deployed failure and client-workload repetitions remain pending."
     },
     {
       "id": "interrupted-scan-proof-races-shared-head",
@@ -861,6 +866,14 @@
         "All 248 chaos library tests pass; the two local Nomad-agent tests remain ignored."
       ],
       "status": "Local verification passes. Deployed proof is pending."
+    },
+    {
+      "id": "0cf-interrupted-scan-serving-observation",
+      "classification": "unclassified",
+      "case": "mirror-kill-rebuild",
+      "observed": "Run 40458018122 job 122041411237 passes backlog, ingress partition, primary kill and primary freeze. At 06:43:06 every replacement scan has fresh write retries and no completion. A reserve-account transfer receipts at 06:43:11, then the serving observation fails at 06:43:14 before the kill. The ten-minute write pause is still within its lifetime.",
+      "product_bug": null,
+      "status": "Preserve all evidence. Determine whether serving is 1, missing, or the target changed before changing this oracle. No timeout increase or assertion relaxation."
     }
   ],
   "coverage": [
@@ -1022,7 +1035,7 @@
   "validation": {
     "runtime_product_files_changed": true,
     "service_wiring_changed": "V2 uses the existing lifecycle watch and session generation. Validator readiness now also requires an active pipeline; its activity gauge changes only at pipeline start/stop. Source-reset retries use the existing committed-state startup path. No deployment defaults, network topology or transport settings change. A startup-owned cancellation guard now covers failed opens and transfers to the existing ordered shutdown. The local follow-up moves V2 controls to its existing account-event queue and removes the dedicated receiver. Cold control production uses bounded backpressure; receiver closure releases a stopped producer. V1 keeps its channels.",
-    "performance_claim": "No speedup or full-chain performance guarantee. Final V2 pause-recovery normal median paired throughput deltas are +0.10% ordered, -0.46% reversed and +0.51% with verdicts. All 240 observations from four comparisons, source hashes and binary hashes are retained, including early slower shapes and outliers. Identical-workload deployed client p50/p95/p99, throughput and executor fallback comparisons remain pending. The first shared-queue implementation enlarges each loss marker and sender state by 8 bytes. All 60 controlled observations are retained: normal median paired changes are -2.10% ordered, -3.56% reversed and -0.92% with verdicts. This is a material cost, so that implementation is not accepted. A compact tag with safe rollover is under review and needs a fresh profile. The deployed baseline has three fewer acknowledged V2 transfer submits than offers and fails the predeclared performance-sample criteria.",
+    "performance_claim": "No deployed latency or capacity claim. All 240 follow-up observations from four implementations are retained, including the rejected larger-tag result. Final normal median paired throughput changes in percent: {\"in_order\": 3.367, \"reversed\": 2.232, \"with_verdicts\": 2.127}. Actual layout remains marker 40, sender state 160, candidate 192, verdict 272 and account event 80 bytes; loop size decreases from 1256 to 984 bytes. Shared-host noise and every outlier remain in the record. Final deployed comparisons remain pending.",
     "completed": [
       {
         "check": "chaos library unit tests",
@@ -1095,6 +1108,14 @@
       {
         "check": "guard transport, terminal identity and run-scoped loss markers",
         "result": "214 sequencer library tests and 26 binary tests pass. One existing manual lookup profile is ignored. 248 chaos library tests pass; the two existing local Nomad-agent checks remain ignored. Workspace style passes. Negative controls and raw diagnostic reports are retained."
+      },
+      {
+        "check": "final compact tag, eviction lifetime and bounded resume metadata",
+        "result": "224 sequencer library tests, 26 binary tests and 252 chaos library tests pass. One manual lookup profile and two local Nomad-agent tests remain ignored. Workspace style passes. Four exact-binary comparisons retain all observations; the final comparison remains in progress."
+      },
+      {
+        "check": "final exact-binary controlled core profile",
+        "result": "60 observations retained, five alternating pairs per workload and mode, 60 samples each. {\"in_order\": 3.367, \"reversed\": 2.232, \"with_verdicts\": 2.127} median paired percent in normal mode. All source and binary hashes are recorded. Earlier 180 follow-up observations are retained as intermediate evidence."
       }
     ],
     "pending": [
@@ -1608,7 +1629,7 @@
   },
   "followup_candidate": {
     "workspace": "/home/dev/kardamom-chaos-gaps",
-    "branch": null,
+    "branch": "fix/chaos-guard-recovery-20261027",
     "base": "0cf8d4b64c302091cdf67586879ef774e4f1e74f",
     "changes": [
       "Preserve encoded guard state and repair V2 refusals through the existing account-event queue.",
@@ -1616,9 +1637,11 @@
       "Scope timeout markers to their original forwarded run.",
       "Request every scan only in the explicit interrupted-scan fixture; retain the combined legal-resume backlog proof.",
       "Retain all 60 observations of the larger-tag implementation and measure a compact tag with explicit safe rollover.",
-      "Defer missing-byte drops until the V2 loop checks the held copy; preserve an eligible replacement."
+      "Defer missing-byte drops until the V2 loop checks the held copy; preserve an eligible replacement.",
+      "Prune stale confirmed and older-generation loss markers during resume to bound metadata across repeated guard cycles.",
+      "Remove loss markers when their idle sender state is evicted."
     ],
-    "status": "Local review and controlled performance validation. Head is not frozen; complete qualifying streak remains 0/10."
+    "status": "Ready for draft review and deployed diagnostics. Core source is fixed at 3105e98691bacebb93eede493c704a8e94679aac. Complete qualifying streak remains 0/10; PR head is not frozen."
   },
   "source_followup_validation": {
     "runtime_product_files_changed": true,
