@@ -1,0 +1,315 @@
+{
+  "scope": "Intermediate pause-only runtime; this is not the final guard/refusal runtime and is not a stability qualification.",
+  "run": 40458996247,
+  "url": "https://github.com/junemartes/kardamom/actions/runs/40458996247",
+  "artifact": 12717325495,
+  "head": "3a025e7d171f100469af4b92ccd4c907032744fa",
+  "all_reports_strict_complete": true,
+  "comparison": "Retain these four valid samples. The old paired baseline has a V2 accepted/offered discrepancy, so it cannot establish a valid paired performance result. A new common-harness baseline and final-runtime candidate are prepared separately. No generic latency, throughput or capacity improvement is claimed.",
+  "reports": [
+    {
+      "name": "kardamom-load-defi.json",
+      "sha256": "978f329b4fde4a2910ed1b9c0436098f71e3d27c7b3e12630c7eb4ad529b782b",
+      "strict_complete": true,
+      "actual_receipted_per_paced_second": 89.74791011258328,
+      "report": {
+        "mode": "fixed",
+        "target_tps": 100,
+        "discovered_max_tps": 100,
+        "soak_rate_tps": 100,
+        "duration_secs": 45.003833459,
+        "ramp": [],
+        "lat_p50_us": 31903,
+        "lat_p95_us": 107583,
+        "lat_p99_us": 184191,
+        "lat_max_us": 321535,
+        "total_gas": 180237172,
+        "workload": "defi",
+        "scrape_fallbacks": 0,
+        "executor_queries_served_delta": [
+          [
+            "kardamom-executor-0",
+            0
+          ],
+          [
+            "kardamom-executor-1",
+            0
+          ],
+          [
+            "kardamom-executor-2",
+            0
+          ]
+        ],
+        "verdict": {
+          "pass": true,
+          "failures": [],
+          "offered": 4039,
+          "accepted": 4039,
+          "receipted": 4039,
+          "missing": 0,
+          "unlanded": 0,
+          "bad_status": 0,
+          "bad_receipt": 0,
+          "inferred_ingress_drop": 0,
+          "seq_dropped": 0,
+          "seq_evicted": 0,
+          "seq_backpressure": 0,
+          "keep_pace": [
+            {
+              "node": "kardamom-executor-0",
+              "base": 353,
+              "final_block": 387,
+              "advanced": 34,
+              "gap": 0,
+              "verdict": "OK"
+            },
+            {
+              "node": "kardamom-executor-1",
+              "base": 353,
+              "final_block": 387,
+              "advanced": 34,
+              "gap": 0,
+              "verdict": "OK"
+            },
+            {
+              "node": "kardamom-executor-2",
+              "base": 353,
+              "final_block": 387,
+              "advanced": 34,
+              "gap": 0,
+              "verdict": "OK"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "kardamom-load-v2-defi.json",
+      "sha256": "b39e0c93f554f99642624247ff42fba22e4bdee8731a37e86af198f85966c566",
+      "strict_complete": true,
+      "actual_receipted_per_paced_second": 83.33157916100029,
+      "report": {
+        "mode": "fixed",
+        "target_tps": 100,
+        "discovered_max_tps": 100,
+        "soak_rate_tps": 100,
+        "duration_secs": 45.000947273,
+        "ramp": [],
+        "lat_p50_us": 34239,
+        "lat_p95_us": 117119,
+        "lat_p99_us": 195839,
+        "lat_max_us": 385791,
+        "total_gas": 167367174,
+        "workload": "defi",
+        "scrape_fallbacks": 0,
+        "executor_queries_served_delta": [
+          [
+            "kardamom-sealer-0",
+            0
+          ],
+          [
+            "kardamom-sealer-1",
+            0
+          ],
+          [
+            "kardamom-sealer-2",
+            0
+          ]
+        ],
+        "verdict": {
+          "pass": true,
+          "failures": [],
+          "offered": 3750,
+          "accepted": 3750,
+          "receipted": 3750,
+          "missing": 0,
+          "unlanded": 0,
+          "bad_status": 0,
+          "bad_receipt": 0,
+          "inferred_ingress_drop": 0,
+          "seq_dropped": 0,
+          "seq_evicted": 0,
+          "seq_backpressure": 0,
+          "keep_pace": [
+            {
+              "node": "kardamom-sealer-0",
+              "base": 397,
+              "final_block": 433,
+              "advanced": 36,
+              "gap": 0,
+              "verdict": "OK"
+            },
+            {
+              "node": "kardamom-sealer-1",
+              "base": 397,
+              "final_block": 433,
+              "advanced": 36,
+              "gap": 0,
+              "verdict": "OK"
+            },
+            {
+              "node": "kardamom-sealer-2",
+              "base": 397,
+              "final_block": 433,
+              "advanced": 36,
+              "gap": 0,
+              "verdict": "OK"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "kardamom-load-v2.json",
+      "sha256": "58acefad643a84b3f2df418be20c94e6c26aa669337cae3a39a69622ae1e432f",
+      "strict_complete": true,
+      "actual_receipted_per_paced_second": 253.21743351807882,
+      "report": {
+        "mode": "fixed",
+        "target_tps": 300,
+        "discovered_max_tps": 300,
+        "soak_rate_tps": 300,
+        "duration_secs": 300.003040646,
+        "ramp": [],
+        "lat_p50_us": 50975,
+        "lat_p95_us": 202751,
+        "lat_p99_us": 319231,
+        "lat_max_us": 543231,
+        "total_gas": 1595286000,
+        "workload": "transfers",
+        "scrape_fallbacks": 0,
+        "executor_queries_served_delta": [
+          [
+            "kardamom-sealer-0",
+            0
+          ],
+          [
+            "kardamom-sealer-1",
+            0
+          ],
+          [
+            "kardamom-sealer-2",
+            0
+          ]
+        ],
+        "verdict": {
+          "pass": true,
+          "failures": [],
+          "offered": 75966,
+          "accepted": 75966,
+          "receipted": 75966,
+          "missing": 0,
+          "unlanded": 0,
+          "bad_status": 0,
+          "bad_receipt": 0,
+          "inferred_ingress_drop": 0,
+          "seq_dropped": 0,
+          "seq_evicted": 0,
+          "seq_backpressure": 0,
+          "keep_pace": [
+            {
+              "node": "kardamom-sealer-0",
+              "base": 198,
+              "final_block": 397,
+              "advanced": 199,
+              "gap": 0,
+              "verdict": "OK"
+            },
+            {
+              "node": "kardamom-sealer-1",
+              "base": 198,
+              "final_block": 397,
+              "advanced": 199,
+              "gap": 0,
+              "verdict": "OK"
+            },
+            {
+              "node": "kardamom-sealer-2",
+              "base": 198,
+              "final_block": 397,
+              "advanced": 199,
+              "gap": 0,
+              "verdict": "OK"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "kardamom-load.json",
+      "sha256": "c738959e92fc4566c0f15c54426824e441431560c0850e4bceee5908a3dcf2be",
+      "strict_complete": true,
+      "actual_receipted_per_paced_second": 267.4759539500893,
+      "report": {
+        "mode": "fixed",
+        "target_tps": 300,
+        "discovered_max_tps": 300,
+        "soak_rate_tps": 300,
+        "duration_secs": 300.004538034,
+        "ramp": [],
+        "lat_p50_us": 48575,
+        "lat_p95_us": 172415,
+        "lat_p99_us": 278015,
+        "lat_max_us": 880639,
+        "total_gas": 1685124000,
+        "workload": "transfers",
+        "scrape_fallbacks": 0,
+        "executor_queries_served_delta": [
+          [
+            "kardamom-executor-0",
+            14
+          ],
+          [
+            "kardamom-executor-1",
+            12
+          ],
+          [
+            "kardamom-executor-2",
+            11
+          ]
+        ],
+        "verdict": {
+          "pass": true,
+          "failures": [],
+          "offered": 80244,
+          "accepted": 80244,
+          "receipted": 80244,
+          "missing": 0,
+          "unlanded": 0,
+          "bad_status": 0,
+          "bad_receipt": 0,
+          "inferred_ingress_drop": 0,
+          "seq_dropped": 0,
+          "seq_evicted": 0,
+          "seq_backpressure": 0,
+          "keep_pace": [
+            {
+              "node": "kardamom-executor-0",
+              "base": 169,
+              "final_block": 353,
+              "advanced": 184,
+              "gap": 0,
+              "verdict": "OK"
+            },
+            {
+              "node": "kardamom-executor-1",
+              "base": 169,
+              "final_block": 353,
+              "advanced": 184,
+              "gap": 0,
+              "verdict": "OK"
+            },
+            {
+              "node": "kardamom-executor-2",
+              "base": 169,
+              "final_block": 353,
+              "advanced": 184,
+              "gap": 0,
+              "verdict": "OK"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -887,12 +887,15 @@
       "evidence": [
         "https://github.com/junemartes/kardamom/actions/runs/40458018122/job/122041411237",
         "/tmp/chaos-gaps-0cf-cache-diagnostics",
-        "/tmp/chaos-gaps-all-data-pause-negative.log"
+        "/tmp/chaos-gaps-all-data-pause-negative.log",
+        "https://github.com/junemartes/kardamom/pull/861",
+        "docs/reviews/2026-10-27-mirror-write-pause-controls.json"
       ],
       "references": [
         "https://redis.io/docs/latest/commands/CLIENT-PAUSE/",
         "https://raw.githubusercontent.com/redis/redis/7.4/src/replication.c"
-      ]
+      ],
+      "consolidation": "Merge the published PR861 ancestry and preserve its real Redis command-control evidence. Keep one implementation with the added process-start fences, strict single-scrape oracle and mock command controls. No duplicate pause module remains."
     },
     {
       "id": "0cf-retention-validator-divergence",
@@ -1843,6 +1846,7 @@
     "guard_rule": "A snapshot tail replays with the same DA guard from genesis; no temporary live budget switch.",
     "local_tests": "260 chaos tests pass, 2 existing local Nomad-agent tests ignored; full Java core suite passes including three budget replay controls",
     "negative_control": "2 expected plan failures without a fixed fresh-chain budget",
-    "style": "pass; rerun before publication"
+    "style": "pass",
+    "java_core_tests": 205
   }
 }

@@ -185,7 +185,7 @@ impl InterruptedRebuild<'_> {
                 .await?,
         );
         crate::log(format!(
-            "{CTX}: a transfer from the unused cache-shard reserve {FAULT_ACCOUNT} receipts while all mirror scans remain blocked"
+            "{CTX}: a transfer from the unused cache-shard reserve {FAULT_ACCOUNT} receipts before the final blocked-scan check"
         ));
         Ok(())
     }
