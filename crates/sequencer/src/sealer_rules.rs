@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use kardamom_cluster_adapter::wire::{
     RefRefused, SEALER_V4_DECISION_VERSION, SEALER_V5_DECISION_VERSION,
 };
@@ -101,6 +101,47 @@ pub struct SealerRules<D> {
 }
 
 impl<D: DropPublisher> SealerRules<D> {
+    /// Canonical hashes release a held sender prefix in the positioned loop.
+    /// Other records do not confirm a transaction, and malformed frames do
+    /// not release publication.
+    pub fn on_canonical_frame(&self, frame: &[u8]) -> bool {
+        use kardamom_cluster_adapter::wire::{self, EgressItem};
+        if !matches!(
+            frame.first(),
+            Some(&(wire::EGRESS_KIND_RELAYED | wire::EGRESS_KIND_RELAYED_REF))
+        ) {
+            return false;
+        }
+        if self.refusals.is_none() || !self.shared.orders_by_position() {
+            return true;
+        }
+        match EgressItem::decode(frame) {
+            Ok(EgressItem::RelayedRef(reference)) => {
+                self.canonical_reference(reference.canonical_id, reference.record_type);
+            }
+            Ok(EgressItem::Tx { tx, .. }) => self.canonical_reference(tx.canonical_id, wire::RT_TX),
+            Ok(EgressItem::Record {
+                msg: kardamom_types::TxOrderingMessage::TxRef(reference),
+                ..
+            }) => {
+                self.canonical_reference(reference.tx_hash, wire::RT_TXREF);
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "canonical confirmation does not decode"),
+        }
+        true
+    }
+
+    fn canonical_reference(&self, hash: B256, record_type: u8) {
+        use kardamom_cluster_adapter::wire;
+        if matches!(
+            record_type,
+            wire::RT_TX | wire::RT_TXREF | wire::RT_TXREF_OFFER
+        ) {
+            self.tell_loop(|| AccountEvent::Canonical(hash));
+        }
+    }
+
     /// Rules that keep the version of `shared`, from its start value.
     #[must_use]
     pub fn new(partition: u32, shared: SealerVersion, drops: D) -> Self {
@@ -226,3 +267,7 @@ impl<D: DropPublisher> SealerRules<D> {
 #[cfg(test)]
 #[path = "sealer_rules_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "canonical_feed_tests.rs"]
+mod canonical_feed_tests;

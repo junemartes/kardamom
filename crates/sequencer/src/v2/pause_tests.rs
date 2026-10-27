@@ -55,6 +55,8 @@ fn an_offer_waiting_on_backpressure_cannot_escape_a_pause() {
 
     life.follow(None);
     bench.run();
+    assert_eq!(bench.offers(), [(0, true)]);
+    bench.canonical(0);
     assert_eq!(bench.offers(), [(0, true), (1, true)]);
 }
 
@@ -102,6 +104,7 @@ fn a_session_retry_waits_for_resume_and_excludes_confirmed_offers() {
     rules.on_session_start(1);
     bench.sweep();
     bench.send(0);
+    bench.canonical(0);
     bench.send(1);
     life.follow(Some(HaltRef::sealer(HaltCause::SealerNoQuorum)));
     bench.confirm_first();
@@ -146,6 +149,8 @@ fn clearing_a_da_pause_retries_the_missing_nonce_before_new_input() {
     bench.run();
     life.follow(None);
     bench.run();
+    assert_eq!(bench.offers(), [(0, true), (0, true)]);
+    bench.canonical(0);
     assert_eq!(bench.offers(), [(0, true), (0, true), (1, true)]);
 }
 
@@ -153,6 +158,7 @@ fn clearing_a_da_pause_retries_the_missing_nonce_before_new_input() {
 fn a_pause_and_clear_between_turns_still_retries_the_unconfirmed_suffix() {
     let (mut bench, life) = Bench::with_lifecycle();
     bench.send(0);
+    bench.canonical(0);
     bench.send(1);
     life.follow(Some(HaltRef::sealer(HaltCause::DaLag)));
     bench.confirm_first();

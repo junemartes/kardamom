@@ -1,6 +1,8 @@
 use alloy_primitives::{Address, U256};
 use kardamom_sequencer::admission::AccountState;
-use kardamom_sequencer::testkit::{Rig, one_partition_cfg, pos, signed_envelope, signer};
+use kardamom_sequencer::testkit::{
+    EnvelopeSpec, Rig, envelope_with, one_partition_cfg, pos, signer,
+};
 use kardamom_sequencer::v2::{AccountEvent, AdmissionLoop, AdmissionSettings};
 use kardamom_types::TxDataLoc;
 
@@ -19,17 +21,20 @@ impl Twin {
         self.status(true);
         self.fixture.boundary();
         self.turn();
-        assert_eq!(self.nonces(), [9, 10, 11]);
+        assert_eq!(self.nonces(), [9, 10]);
     }
 
     fn recover_after_empty_block(&mut self) {
         self.rows(100, None);
         self.fixture.boundary();
         self.turn();
-        assert_eq!(self.nonces(), [9, 10, 11]);
+        assert_eq!(self.nonces(), [9, 10]);
         self.status(false);
         self.turn();
-        assert_eq!(self.nonces(), [9, 10, 11, 10, 11]);
+        assert_eq!(self.nonces(), [9, 10, 10]);
+        self.canonical(10);
+        assert_eq!(self.nonces(), [9, 10, 10, 11]);
+        self.canonical(11);
         assert!(self.rig.errors().is_empty());
     }
 
@@ -96,9 +101,38 @@ impl Twin {
     }
 
     fn copy(&mut self, nonce: u64, deadline: u64, offset: i32) {
-        let mut envelope = signed_envelope(&signer(11), nonce, 1);
+        let mut envelope = envelope_with(
+            &signer(11),
+            nonce,
+            1,
+            EnvelopeSpec {
+                real_hash: true,
+                ..EnvelopeSpec::default()
+            },
+        );
         envelope.max_inclusion_block = deadline;
         self.rig.push(TxDataLoc::new(7, pos(offset)), envelope);
+        self.turn();
+    }
+
+    fn canonical(&mut self, nonce: u64) {
+        use kardamom_cluster_adapter::wire::{RT_TX, RelayedRef};
+        let hash = self
+            .rig
+            .offers()
+            .iter()
+            .rev()
+            .find(|offer| offer.guard.nonce == nonce)
+            .unwrap()
+            .tx_ref
+            .tx_hash;
+        let frame = RelayedRef {
+            index: nonce,
+            canonical_id: hash,
+            record_type: RT_TX,
+        }
+        .encode();
+        self.fixture.feed.on_frame(&frame, &self.fixture.life);
         self.turn();
     }
 
@@ -155,11 +189,14 @@ impl Twin {
         self.fixture.feed.on_frame(&frame, &self.fixture.life);
         self.fixture.boundary();
         self.turn();
-        assert_eq!(self.nonces(), [9, 10, 11]);
+        assert_eq!(self.nonces(), [9, 10]);
         assert!(self.fixture.root().is_some());
         self.status(false);
         self.turn();
-        assert_eq!(self.nonces(), [9, 10, 11, 10, 11]);
+        assert_eq!(self.nonces(), [9, 10, 10]);
+        self.canonical(10);
+        assert_eq!(self.nonces(), [9, 10, 10, 11]);
+        self.canonical(11);
         assert!(self.rig.errors().is_empty());
         assert!(self.rig.drops().is_empty());
     }
@@ -196,7 +233,8 @@ fn a_delayed_refusal_after_clear_keeps_rows_and_the_confirmed_prefix() {
     twin.turn();
     twin.status(false);
     twin.turn();
-    assert_eq!(twin.nonces(), [9, 10, 11, 10, 11, 11]);
+    assert_eq!(twin.nonces(), [9, 10, 10, 11, 11]);
+    twin.canonical(11);
     assert!(twin.rig.errors().is_empty());
     assert!(twin.rig.drops().is_empty());
 }
@@ -251,7 +289,7 @@ fn a_status_pulse_between_turns_replays_after_rows_confirm_its_prefix() {
     t.fixture.boundary();
     t.fixture.status(&ClusterStatus::default());
     t.rows(3, Some(11));
-    assert_eq!(t.nonces(), [9, 10, 11, 11]);
+    assert_eq!(t.nonces(), [9, 10, 11]);
     t.turn();
-    assert_eq!(t.nonces(), [9, 10, 11, 11]);
+    assert_eq!(t.nonces(), [9, 10, 11]);
 }

@@ -234,6 +234,9 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
         if self.on_rules_frame(frame) {
             return;
         }
+        if self.rules.on_canonical_frame(frame) {
+            return;
+        }
         if self.on_ref_refused_frame(frame) {
             return;
         }

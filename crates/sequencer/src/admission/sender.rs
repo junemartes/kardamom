@@ -269,6 +269,15 @@ impl<T: Clone> SenderState<T> {
         self.forwarded.get(at)
     }
 
+    pub(super) fn forwarded_at_mut(&mut self, nonce: u64) -> Option<&mut Candidate<T>> {
+        let at = usize::try_from(nonce.checked_sub(self.first)?).ok()?;
+        self.forwarded.get_mut(at)
+    }
+
+    pub(super) fn retained_mut(&mut self) -> impl Iterator<Item = &mut Candidate<T>> {
+        self.forwarded.iter_mut().chain(self.parked.values_mut())
+    }
+
     pub(super) fn holds_loss_mark(&self, nonce: u64, generation: u32) -> bool {
         self.generation == generation && self.forwarded_at(nonce).is_some()
     }

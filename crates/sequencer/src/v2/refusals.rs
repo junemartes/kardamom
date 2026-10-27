@@ -17,7 +17,8 @@ impl AdmissionLoop {
             .admission
             .unconfirmed_at(refused.sender, refused.nonce)
             .is_some_and(|candidate| {
-                candidate.tx_hash == refused.canonical_id && candidate.payload.envelope.is_some()
+                candidate.tx_hash == refused.canonical_id
+                    && (candidate.payload.envelope.is_some() || candidate.payload.canonical)
             });
         if eligible {
             return true;
@@ -41,12 +42,15 @@ impl AdmissionLoop {
                 .unconfirmed_at(refusal.sender, refusal.nonce)
                 .is_some();
         }
-        let named = |c: &Candidate<RefPayload>| match &refusal.reason {
-            TxErrorReason::PastDeadline {
-                max_inclusion_block,
-                ..
-            } => c.payload.max_inclusion_block == *max_inclusion_block,
-            _ => true,
+        let named = |c: &Candidate<RefPayload>| {
+            !c.payload.canonical
+                && match &refusal.reason {
+                    TxErrorReason::PastDeadline {
+                        max_inclusion_block,
+                        ..
+                    } => c.payload.max_inclusion_block == *max_inclusion_block,
+                    _ => true,
+                }
         };
         let Some(candidate) = self.remove_refused(refusal.sender, refusal.nonce, named) else {
             return false;

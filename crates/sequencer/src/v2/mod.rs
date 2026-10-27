@@ -14,10 +14,13 @@
 //! - With verdicts on, the answer to each transaction goes to the ingress
 //!   that published it ([`verdicts`]).
 //!
-//! The loop keeps no ledger of offers and no resync: the sealer orders a
-//! reference once, and the filter forgets a forwarded run that no row
-//! confirms within its loss window. Offers wait in an outbox while the
-//! sealer is back-pressured; a full outbox stops the intake.
+//! From decision version 4, each sender has at most one offer awaiting
+//! canonical confirmation. A guard refusal cannot leave a later nonce
+//! already queued at the sealer. Other senders can publish while it waits.
+//! Canonical proof stays with the retained transaction across reconnects;
+//! only executed rows free its reserved balance. A rollback clears the
+//! proof. The filter forgets a run that no row confirms within its loss
+//! window. Offers wait in an outbox; a full outbox stops the intake.
 //!
 //! The filter keeps each forwarded transaction until a row confirms it.
 //! The loop offers it again after recovery, so the sealer never orders a
@@ -46,8 +49,10 @@
 //! The loop records the counters of the v1 loop under the same names, and
 //! the parked depth of each vslot ([`depth`]) at each sweep.
 
+mod canonical;
 mod depth;
 mod offers;
+mod publication;
 mod refusals;
 use offers::OfferReplay;
 mod runner;
@@ -71,7 +76,7 @@ use crate::error::SequencerError;
 use crate::fees::FeeGate;
 use crate::inbound::{Inbound, TxDataSubscriber};
 use crate::metrics::HotMetrics;
-use crate::outbound::{RefOffer, SideChannelPublisher, TxOrderingRefPublisher};
+use crate::outbound::{RefOffer, SideChannelPublisher};
 use crate::pause_gate::PauseGate;
 use crate::pipeline::PublishMeters;
 use crate::sealer_rules::SealerVersion;
@@ -170,6 +175,8 @@ pub struct V2Config {
 /// One change of the chain state that the filter holds.
 #[derive(Clone, Debug)]
 pub enum AccountEvent {
+    /// The sealer ordered this transaction. Its sender's suffix can follow.
+    Canonical(B256),
     /// The account rows of a block, for the senders of this replica.
     Rows {
         block: u64,
@@ -207,6 +214,8 @@ pub struct RefPayload {
     /// The vslot of the sender, for the parked depth.
     vslot: u8,
     lane: u8,
+    /// Canonical proof stays with this copy until rows remove it or a rollback resets it.
+    canonical: bool,
     loc: TxDataLoc,
     /// The deadline of the envelope, for the deadline field below decision
     /// version 4.
@@ -236,6 +245,7 @@ pub struct AdmissionLoop {
     lookups: tokio::sync::mpsc::Sender<Address>,
     verdicts: Vec<Verdict<RefPayload>>,
     outbox: VecDeque<RefOffer>,
+    canonical: canonical::CanonicalGate,
     last_sweep: Instant,
     hot: HotMetrics,
     depth: depth::ParkDepth,
@@ -267,6 +277,7 @@ impl AdmissionLoop {
             lookups,
             verdicts: Vec::new(),
             outbox: VecDeque::new(),
+            canonical: canonical::CanonicalGate::new(cfg.outbox_cap),
             last_sweep: Instant::now(),
             hot: HotMetrics::new(cfg.partition),
             depth: depth::ParkDepth::default(),
@@ -326,6 +337,7 @@ impl AdmissionLoop {
         }
         let paused = self.pause.read_with(|paused| {
             if !paused {
+                self.canonical.reset();
                 OfferReplay::new(
                     &mut self.admission,
                     &mut self.outbox,
@@ -358,24 +370,45 @@ impl AdmissionLoop {
         let events: Vec<AccountEvent> = self.accounts.try_iter().collect();
         let applied = !events.is_empty();
         // Every event applies, including rows after a replay request.
-        let replay = events
-            .into_iter()
-            .fold(false, |replay, event| self.apply(event) | replay);
+        let replay = events.into_iter().fold(false, |replay, event| {
+            let from = self.verdicts.len();
+            let requested = self.apply(event);
+            self.track_forwards(from);
+            requested | replay
+        });
         if replay {
             self.replay_after_refusals();
         }
         applied
     }
 
+    fn track_forwards(&mut self, from: usize) {
+        if !self.sealer_version.orders_by_position() {
+            return;
+        }
+        self.verdicts[from..].iter().for_each(|verdict| {
+            if let Verdict::Forward(candidate, _) = verdict {
+                self.canonical.track(candidate);
+            }
+        });
+    }
+
     fn apply(&mut self, event: AccountEvent) -> bool {
         match event {
-            AccountEvent::Rows { block, rows } => {
-                self.admission.on_rows(block, rows, &mut self.verdicts);
-            }
+            AccountEvent::Canonical(hash) => self.canonical.observe(hash, &mut self.admission),
+            AccountEvent::Rows { block, rows } => self.apply_rows(block, rows),
             AccountEvent::Answer { address, state } => {
                 self.admission.on_lookup(address, state, &mut self.verdicts);
+                self.canonical.confirmed(address, &self.admission);
             }
-            AccountEvent::Rollback => self.admission.on_rollback(),
+            AccountEvent::Rollback => {
+                self.canonical.rollback();
+                self.admission
+                    .retained_mut()
+                    .for_each(|candidate| candidate.payload.canonical = false);
+                self.admission.on_rollback();
+                return true;
+            }
             AccountEvent::Refused(refused) => {
                 return self.on_reference_refused(*refused);
             }
@@ -390,6 +423,14 @@ impl AdmissionLoop {
             } => self.offer_rejected(sender, nonce, expected),
         }
         false
+    }
+
+    fn apply_rows(&mut self, block: u64, rows: Vec<(Address, AccountState)>) {
+        self.admission
+            .on_rows(block, rows.iter().copied(), &mut self.verdicts);
+        for (address, _) in rows {
+            self.canonical.confirmed(address, &self.admission);
+        }
     }
 
     /// The guard of the sealer expects `expected` of `sender`, and rejected
@@ -411,6 +452,7 @@ impl AdmissionLoop {
     }
 
     fn offer_again_unconfirmed(&mut self, reason: &str) {
+        self.canonical.reset();
         OfferReplay::new(
             &mut self.admission,
             &mut self.outbox,
@@ -431,6 +473,7 @@ impl AdmissionLoop {
             self.admission.sweep(now, &mut self.verdicts);
         }
         self.depth.publish(self.cfg.partition);
+        self.canonical.prune(&self.admission);
     }
 
     /// Guard, decode and check one envelope, and give it to the filter.
@@ -478,6 +521,7 @@ impl AdmissionLoop {
             payload: RefPayload {
                 vslot,
                 lane: inbound.lane,
+                canonical: false,
                 loc: inbound.loc,
                 max_inclusion_block: inbound.envelope.max_inclusion_block,
                 stream_position: inbound.stream_position,
@@ -522,6 +566,9 @@ impl AdmissionLoop {
     ) {
         match verdict {
             Verdict::Forward(mut c, _) => {
+                if self.sealer_version.orders_by_position() {
+                    self.canonical.track(&c);
+                }
                 self.depth.gave(c.payload.vslot);
                 if let Some(ack) = c.answer() {
                     self.to_ingress.accept(ack);
@@ -557,39 +604,6 @@ impl AdmissionLoop {
                     tracing::warn!(%address, "the lookup queue is full; the sender waits for its rows");
                 }
             }
-        }
-    }
-
-    /// Offer what waits in the outbox, in order, and report each offer
-    /// that went out.
-    fn flush<B, R>(&mut self, refs: &mut B, side: &mut R) -> Result<(), SequencerError>
-    where
-        B: TxOrderingRefPublisher,
-        R: SideChannelPublisher,
-    {
-        if self.outbox.is_empty() {
-            return Ok(());
-        }
-        let (published, err) = self.pipeline.offer(refs, self.outbox.make_contiguous());
-        self.hot.publish.increment(published as u64);
-        for offer in self.outbox.drain(..published) {
-            side.publish_status(TxStatus::offered(
-                offer.tx_ref.tx_hash,
-                offer.guard.sender,
-                offer.guard.nonce,
-            ));
-            side.note_sent(&offer.tx_ref.tx_hash);
-        }
-        match err {
-            Some(SequencerError::SessionChanged) => {
-                self.offer_again_unconfirmed("sealer session changed");
-                Ok(())
-            }
-            Some(SequencerError::Backpressure) => {
-                self.hot.backpressure.increment(1);
-                Err(SequencerError::Backpressure)
-            }
-            other => other.map_or(Ok(()), Err),
         }
     }
 

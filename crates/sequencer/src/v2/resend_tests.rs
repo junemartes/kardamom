@@ -14,8 +14,10 @@ use super::{AccountEvent, AdmissionLoop, V2Config};
 use crate::admission::{AccountState, AdmissionConfig};
 use crate::outbound::fakes::InMemorySidePublisher;
 use crate::sealer_rules::{SealerRules, SealerVersion};
-use crate::testkit::{Rig, one_partition_cfg, pos, signed_envelope, signer};
+use crate::testkit::{EnvelopeSpec, Rig, envelope_with, one_partition_cfg, pos, signer};
 
+#[path = "canonical_tests.rs"]
+mod canonical_tests;
 #[path = "pause_tests.rs"]
 mod pause_tests;
 #[path = "refusal_tests.rs"]
@@ -87,12 +89,34 @@ impl Bench {
         let at = pos(64 * (i32::try_from(nonce).unwrap() + 1));
         self.rig.push(
             TxDataLoc::new(7, at),
-            signed_envelope(&self.signer, nonce, 1),
+            envelope_with(
+                &self.signer,
+                nonce,
+                1,
+                EnvelopeSpec {
+                    real_hash: true,
+                    ..EnvelopeSpec::default()
+                },
+            ),
         );
     }
 
     fn run(&mut self) {
         while self.l.run_once(&mut self.rig.ports()).unwrap() {}
+    }
+
+    fn canonical(&mut self, nonce: u64) {
+        let hash = self
+            .rig
+            .offers()
+            .iter()
+            .rev()
+            .find(|offer| offer.guard.nonce == nonce)
+            .unwrap()
+            .tx_ref
+            .tx_hash;
+        self.accounts.send(AccountEvent::Canonical(hash)).unwrap();
+        self.run();
     }
 
     fn confirm_first(&self) {
@@ -146,6 +170,8 @@ fn a_parked_transaction_goes_out_in_the_format_of_its_release() {
 
     rules.on_sealer_info(1, 4);
     b.send(0);
+    assert_eq!(b.offers(), [(0, false)]);
+    b.canonical(0);
     assert_eq!(b.offers(), [(0, false), (1, false)]);
     let deadlines: Vec<u64> = b
         .rig
@@ -156,23 +182,27 @@ fn a_parked_transaction_goes_out_in_the_format_of_its_release() {
     assert_eq!(deadlines, [POSITION_TAG, POSITION_TAG]);
 }
 
-/// The leader of the sealer dies after it took the offers of nonces 0 and
-/// 1, and before it ordered them. The publisher reports the new session
-/// at the next offer. The loop offers 0 and 1 again before nonce 2, so
-/// the sealer never orders 2 without them. The sealer absorbs a copy of
-/// an ordered offer.
+/// A new session retries the unconfirmed prefix. Each later nonce waits
+/// for its prefix to become canonical, including after a reconnect.
 #[test]
 fn a_new_session_offers_the_unconfirmed_run_before_a_new_offer() {
-    let mut b = Bench::new(SealerVersion::starting_at(5));
+    let shared = SealerVersion::starting_at(5);
+    let mut rules = SealerRules::new(0, shared.clone(), InMemorySidePublisher::default());
+    rules.on_session_start(1);
+    let mut b = Bench::new(shared);
     b.send(0);
     b.send(1);
-    assert_eq!(b.offers(), [(0, true), (1, true)]);
+    assert_eq!(b.offers(), [(0, true)]);
 
     *b.rig.refs.new_session.lock().unwrap() = true;
+    rules.on_session_start(2);
     b.send(2);
+    assert_eq!(b.offers(), [(0, true), (0, true)]);
+    b.canonical(0);
+    b.canonical(1);
     assert_eq!(
         b.offers(),
-        [(0, true), (1, true), (0, true), (1, true), (2, true)],
+        [(0, true), (0, true), (1, true), (2, true)],
         "the run goes out again, before nonce 2"
     );
 }
@@ -190,7 +220,9 @@ fn a_session_start_recovers_unconfirmed_offers_without_new_client_traffic() {
     *b.rig.refs.new_session.lock().unwrap() = true;
     rules.on_session_start(2);
     b.run();
-    assert_eq!(b.offers(), [(0, true), (1, true), (0, true), (1, true)]);
+    assert_eq!(b.offers(), [(0, true), (0, true)]);
+    b.canonical(0);
+    assert_eq!(b.offers(), [(0, true), (0, true), (1, true)]);
 }
 
 #[test]
@@ -232,10 +264,19 @@ fn an_idle_session_return_preserves_confirmations_and_ignores_duplicate_markers(
 fn a_new_session_does_not_offer_a_confirmed_transaction_again() {
     let mut b = Bench::new(SealerVersion::starting_at(5));
     b.send(0);
+    b.canonical(0);
     b.send(1);
     b.confirm_first();
     *b.rig.refs.new_session.lock().unwrap() = true;
+    let mut rules = SealerRules::new(
+        0,
+        b.l.sealer_version.clone(),
+        InMemorySidePublisher::default(),
+    );
+    rules.on_session_start(2);
     b.send(2);
+    assert_eq!(b.offers(), [(0, true), (1, true), (1, true)]);
+    b.canonical(1);
     let nonces: Vec<u64> = b.offers().iter().map(|(n, _)| *n).collect();
     assert_eq!(nonces, [0, 1, 1, 2]);
 }
@@ -244,7 +285,7 @@ fn a_new_session_does_not_offer_a_confirmed_transaction_again() {
 /// The loop offers 1 and 2 again, in that order.
 #[test]
 fn a_contiguity_reject_offers_the_expected_and_the_rejected_nonce_again() {
-    let mut b = Bench::new(SealerVersion::starting_at(5));
+    let mut b = Bench::new(SealerVersion::starting_at(3));
     (0..3).for_each(|n| b.send(n));
     b.accounts
         .send(AccountEvent::Rejected {
@@ -262,7 +303,7 @@ fn a_contiguity_reject_offers_the_expected_and_the_rejected_nonce_again() {
 /// offer: an offer that it rejects again would repeat without end.
 #[test]
 fn a_contiguity_reject_for_a_nonce_out_of_the_run_offers_nothing() {
-    let mut b = Bench::new(SealerVersion::starting_at(5));
+    let mut b = Bench::new(SealerVersion::starting_at(3));
     (0..2).for_each(|n| b.send(n));
     b.accounts
         .send(AccountEvent::Rejected {
@@ -283,13 +324,15 @@ fn a_new_session_reoffers_an_idle_unconfirmed_sender_without_new_input() {
     let mut b = Bench::new(shared);
     b.send(0);
     b.send(1);
-    assert!(b.l.outbox.is_empty());
-    assert_eq!(b.offers(), [(0, true), (1, true)]);
+    assert_eq!(b.l.outbox.len(), 1);
+    assert_eq!(b.offers(), [(0, true)]);
     *b.rig.refs.new_session.lock().unwrap() = true;
     rules.on_session_start(2);
     b.sweep();
     b.run();
-    assert_eq!(b.offers(), [(0, true), (1, true), (0, true), (1, true)]);
+    assert_eq!(b.offers(), [(0, true), (0, true)]);
+    b.canonical(0);
+    assert_eq!(b.offers(), [(0, true), (0, true), (1, true)]);
 }
 
 #[test]
@@ -299,6 +342,7 @@ fn a_session_sweep_retries_only_the_unconfirmed_suffix_once() {
     rules.on_session_start(1);
     let mut b = Bench::new(shared);
     b.send(0);
+    b.canonical(0);
     b.send(1);
     b.confirm_first();
     rules.on_session_start(2);
@@ -317,6 +361,7 @@ fn a_healthy_session_sweep_and_a_version_report_do_not_repeat_offers() {
     rules.on_session_start(1);
     let mut b = Bench::new(shared);
     b.send(0);
+    b.canonical(0);
     b.send(1);
     b.sweep();
     rules.on_sealer_info(1, 4);
