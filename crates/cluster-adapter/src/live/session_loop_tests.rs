@@ -127,17 +127,68 @@ fn replay_ask_resends_until_the_leader_answers() {
     assert!(!ask.due(1_000 + 30 * REPLAY_RESEND_MS));
 }
 
-/// The rules frame that the sealer sends when a session opens comes
-/// before the sealer can have read the subscribe announcement, so it does
-/// not stop the resends. Every other frame of the sealer does.
 #[test]
-fn the_sealer_rules_do_not_confirm_a_subscribe() {
-    assert!(!SessionLoop::confirms_subscribe(
-        crate::wire::EGRESS_KIND_SEALER_INFO
-    ));
-    assert!(SessionLoop::confirms_subscribe(EGRESS_KIND_BOUNDARY));
-    assert!(SessionLoop::confirms_subscribe(EGRESS_KIND_RELAYED));
-    assert!(SessionLoop::confirms_subscribe(
-        crate::wire::EGRESS_KIND_STATUS
-    ));
+fn broadcasts_and_fallback_records_cannot_stop_subscription_refresh() {
+    [
+        EGRESS_KIND_BOUNDARY,
+        crate::wire::EGRESS_KIND_STATUS,
+        EGRESS_KIND_RELAYED,
+        crate::wire::EGRESS_KIND_RELAYED_REF,
+        crate::wire::EGRESS_KIND_SEALER_INFO,
+    ]
+    .into_iter()
+    .for_each(SessionRequests::assert_subscription_refresh);
+}
+
+#[test]
+fn subscription_refresh_rearms_on_reconnect_and_stays_off_for_publishers() {
+    let mut requests = SessionRequests::new(true);
+    assert!(requests.subscribe_due(100));
+    requests.on_payload(EGRESS_KIND_BOUNDARY);
+    requests.rearm();
+    assert!(requests.subscribe_due(101));
+    assert!(!requests.subscribe_due(102));
+    let mut publisher = SessionRequests::new(false);
+    (0..=u8::MAX).for_each(|kind| {
+        publisher.on_payload(kind);
+        publisher.rearm();
+        assert!(!publisher.subscribe_due(u64::from(kind) * SUBSCRIBE_RESEND_MS));
+    });
+}
+
+#[test]
+fn replay_acknowledgements_stop_replay_but_never_subscription_refresh() {
+    [
+        EGRESS_KIND_REPLAY_DONE,
+        EGRESS_KIND_REPLAY_AHEAD,
+        EGRESS_KIND_REPLAY_UNAVAILABLE,
+    ]
+    .into_iter()
+    .for_each(SessionRequests::assert_replay_answer);
+}
+
+impl SessionRequests {
+    fn assert_subscription_refresh(kind: u8) {
+        let mut requests = SessionRequests::new(true);
+        assert!(requests.subscribe_due(100));
+        requests.on_payload(kind);
+        assert!(!requests.subscribe_due(100 + SUBSCRIBE_RESEND_MS - 1));
+        assert!(
+            requests.subscribe_due(100 + SUBSCRIBE_RESEND_MS),
+            "kind {kind} is not a subscription acknowledgement"
+        );
+        requests.on_payload(kind);
+        assert!(requests.subscribe_due(100 + 2 * SUBSCRIBE_RESEND_MS));
+    }
+
+    fn assert_replay_answer(kind: u8) {
+        let mut requests = SessionRequests::new(true);
+        assert!(requests.subscribe_due(0));
+        assert!(requests.replay_due(0));
+        requests.on_payload(kind);
+        assert!(!requests.replay_due(10 * REPLAY_RESEND_MS));
+        assert!(requests.subscribe_due(10 * SUBSCRIBE_RESEND_MS));
+        requests.rearm();
+        assert!(requests.replay_due(1));
+    }
 }

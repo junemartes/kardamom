@@ -1630,6 +1630,12 @@ A deploy replaces service instances one at a time under readiness checks. The ch
     - On the **live** path, the join-miss refetcher of the executor rotates to the mirror archive when a replay produces no fragments. That is the signature of a corrupt recording when replay-side CRC validation is on. A reader never stays pinned to a bad copy.
     - The offline segment reader fail-stops on structural damage. A zeroed or undersized frame header with data behind it is `Corruption`. It is not read as a live tail.
     - Proof: `archive-corruption`.
+- **Canonical subscription lost while boundaries continue**
+  - Trigger: the subscription announcement is lost or not connected while the session receives ordinary egress. Boundaries and status broadcast to unregistered sessions. Even records can arrive through the empty-consumer fallback before another consumer registers.
+  - A received frame does not prove registration. Treating it as an acknowledgement can stop retries while the session remains outside the record fan-out.
+  - Recovery: subscribing clients refresh the existing announcement every three seconds and at each reconnect. Duplicate registration keeps the cached recipient list. Publisher-only clients send no announcement. Replay requests retain their separate acknowledgement rules.
+  - Cost: one small ingress control message and the existing status response per subscribing session per refresh interval. No transaction or stored format changes.
+  - Proof: client controls exercise broadcast traffic after an unconfirmed announcement, the refresh bound, reconnects, publisher-only mode and replay answers. The driverless sealer test proves that fallback records and boundaries reach an unregistered observer, another registration excludes it from records, and a repeated announcement restores exactly one copy of each new record. A live fault run remains required.
 - **Aeron stall tolerance**
   - One deploy value sets how long every Aeron party waits through a stalled peer: `aeron_stall_tolerance_ms` (env `AERON_STALL_TOLERANCE_MS`, workloads role).
   - It sets these timeouts:

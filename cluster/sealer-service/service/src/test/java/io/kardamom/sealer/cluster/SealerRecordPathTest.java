@@ -163,6 +163,30 @@ class SealerRecordPathTest {
     }
 
     @Test
+    void broadcast_frames_do_not_prove_registration_and_refresh_restores_fanout() {
+        final StubSession publisher = cluster.addSession(1);
+        final StubSession observer = cluster.addSession(2);
+        final StubSession other = cluster.addSession(3);
+        final SealerClusteredService svc = fileMember("refresh");
+        deliver(svc, publisher, offer(1, 0));
+        assertSameFrames(List.of(referenceFrame(1, 0)), withoutStatus(observer));
+        observer.offered.clear();
+
+        deliver(svc, other, IngressFrames.subscribeFrame());
+        tick(svc);
+        assertTrue(observer.offered.stream().anyMatch(f -> f[0] == SealerWire.EGRESS_KIND_BOUNDARY));
+        observer.offered.clear();
+        deliver(svc, publisher, offer(2, 1));
+        assertTrue(withoutStatus(observer).isEmpty(), "broadcasts do not register the observer");
+
+        deliver(svc, observer, IngressFrames.subscribeFrame());
+        deliver(svc, observer, IngressFrames.subscribeFrame());
+        observer.offered.clear();
+        deliver(svc, publisher, offer(3, 2));
+        assertSameFrames(List.of(referenceFrame(3, 2)), withoutStatus(observer));
+    }
+
+    @Test
     void an_egress_replay_serves_the_reference_of_a_retained_entry() {
         final StubSession twin = cluster.addSession(1);
         final SealerClusteredService svc = fileMember("a");
