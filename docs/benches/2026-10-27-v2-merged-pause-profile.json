@@ -1,0 +1,282 @@
+{
+  "baseline_commit": "2660162e6da8840de9484f36347d9b4e7a82f886",
+  "method": "Same benchmark source in isolated baseline and merged candidate; release binaries pinned to CPU0; both carry bytes at decision version5 and retain a live empty terminal-refusal channel. Five alternating pairs per workload,20samples,1s warmup,2s requested measurement,4096transactions per iteration. No builds/tests overlap measurement.",
+  "builds": {
+    "before": {
+      "binary": "/tmp/kardamom-853-merged-profile/v2-loop-before",
+      "binary_sha256": "7105796503ad65b413f136ecd8c41ae0be510e54a438c7e9c9dd6a52ca69ae47",
+      "sources": {
+        "crates/sequencer/src/v2/mod.rs": "3a8eca331b58658c3069dec190a5f5e1e0ed6c8a633e19a27490be75a7a1ef30",
+        "crates/sequencer/src/admission/mod.rs": "0f00c79859dc316c41e4fb032971988b8c111459294bb65b7580c8839ef8bc9d",
+        "crates/sequencer/src/pause_gate.rs": "0b35eb90e1af932d85aa26eea4527d85c1919933dc8ad25c1fa5376bc0196167",
+        "crates/sequencer/benches/v2_loop.rs": "8a28440159921b222f7f85dd987907dc24d8dcda7b37280b1c8cde3dfe1159e8"
+      }
+    },
+    "after": {
+      "binary": "/tmp/kardamom-853-merged-profile/v2-loop-after",
+      "binary_sha256": "8d65b5b6b10a7cc4e95396930e18ddc9f5985c76046b69d955b8807a21925dc5",
+      "sources": {
+        "crates/sequencer/src/v2/mod.rs": "fc7ed38e008356b6457d7b70089554b49bfe79801f3236f816d9013e185c66ef",
+        "crates/sequencer/src/admission/mod.rs": "d2243e17c0adc21166c2d328ce830d4e9105a30a8491b34829158170248adc0e",
+        "crates/sequencer/src/pause_gate.rs": "89b26fc84c8b647f7159dbca69e6d34184e32f932a5a8b96104d2942f245a810",
+        "crates/sequencer/benches/v2_loop.rs": "8a28440159921b222f7f85dd987907dc24d8dcda7b37280b1c8cde3dfe1159e8"
+      }
+    }
+  },
+  "records": [
+    {
+      "pair": 0,
+      "workload": "in_order",
+      "phase": "before",
+      "median_iteration_ns": 4826055.2,
+      "mean_iteration_ns": 4910146.06
+    },
+    {
+      "pair": 0,
+      "workload": "in_order",
+      "phase": "after",
+      "median_iteration_ns": 4764289.4,
+      "mean_iteration_ns": 4866572.600000001
+    },
+    {
+      "pair": 0,
+      "workload": "reversed",
+      "phase": "before",
+      "median_iteration_ns": 5347530.8,
+      "mean_iteration_ns": 5396627.15
+    },
+    {
+      "pair": 0,
+      "workload": "reversed",
+      "phase": "after",
+      "median_iteration_ns": 5296999.699999999,
+      "mean_iteration_ns": 5349716.959999999
+    },
+    {
+      "pair": 0,
+      "workload": "with_verdicts",
+      "phase": "before",
+      "median_iteration_ns": 5319396.2,
+      "mean_iteration_ns": 5386819.550000001
+    },
+    {
+      "pair": 0,
+      "workload": "with_verdicts",
+      "phase": "after",
+      "median_iteration_ns": 5369479.9,
+      "mean_iteration_ns": 5477232.000000002
+    },
+    {
+      "pair": 1,
+      "workload": "in_order",
+      "phase": "after",
+      "median_iteration_ns": 4714215.6,
+      "mean_iteration_ns": 4741140.47
+    },
+    {
+      "pair": 1,
+      "workload": "in_order",
+      "phase": "before",
+      "median_iteration_ns": 4707081.699999999,
+      "mean_iteration_ns": 4804305.01
+    },
+    {
+      "pair": 1,
+      "workload": "reversed",
+      "phase": "after",
+      "median_iteration_ns": 5243911.0,
+      "mean_iteration_ns": 5282420.92
+    },
+    {
+      "pair": 1,
+      "workload": "reversed",
+      "phase": "before",
+      "median_iteration_ns": 5388313.300000001,
+      "mean_iteration_ns": 5428092.65
+    },
+    {
+      "pair": 1,
+      "workload": "with_verdicts",
+      "phase": "after",
+      "median_iteration_ns": 5344360.5,
+      "mean_iteration_ns": 5378942.45
+    },
+    {
+      "pair": 1,
+      "workload": "with_verdicts",
+      "phase": "before",
+      "median_iteration_ns": 5396791.5,
+      "mean_iteration_ns": 5466641.42
+    },
+    {
+      "pair": 2,
+      "workload": "in_order",
+      "phase": "before",
+      "median_iteration_ns": 4806517.0,
+      "mean_iteration_ns": 4817724.779999999
+    },
+    {
+      "pair": 2,
+      "workload": "in_order",
+      "phase": "after",
+      "median_iteration_ns": 4795575.9,
+      "mean_iteration_ns": 4813394.409999999
+    },
+    {
+      "pair": 2,
+      "workload": "reversed",
+      "phase": "before",
+      "median_iteration_ns": 5315697.875,
+      "mean_iteration_ns": 5376967.9125
+    },
+    {
+      "pair": 2,
+      "workload": "reversed",
+      "phase": "after",
+      "median_iteration_ns": 5366299.0,
+      "mean_iteration_ns": 5431881.57
+    },
+    {
+      "pair": 2,
+      "workload": "with_verdicts",
+      "phase": "before",
+      "median_iteration_ns": 5376013.75,
+      "mean_iteration_ns": 5434567.775
+    },
+    {
+      "pair": 2,
+      "workload": "with_verdicts",
+      "phase": "after",
+      "median_iteration_ns": 5267840.4,
+      "mean_iteration_ns": 5371720.819999999
+    },
+    {
+      "pair": 3,
+      "workload": "in_order",
+      "phase": "after",
+      "median_iteration_ns": 4752251.2,
+      "mean_iteration_ns": 4787731.110000001
+    },
+    {
+      "pair": 3,
+      "workload": "in_order",
+      "phase": "before",
+      "median_iteration_ns": 4763225.300000001,
+      "mean_iteration_ns": 4824688.680000001
+    },
+    {
+      "pair": 3,
+      "workload": "reversed",
+      "phase": "after",
+      "median_iteration_ns": 5273144.300000001,
+      "mean_iteration_ns": 5355890.07
+    },
+    {
+      "pair": 3,
+      "workload": "reversed",
+      "phase": "before",
+      "median_iteration_ns": 5322685.2,
+      "mean_iteration_ns": 5438604.07
+    },
+    {
+      "pair": 3,
+      "workload": "with_verdicts",
+      "phase": "after",
+      "median_iteration_ns": 5320937.199999999,
+      "mean_iteration_ns": 5368831.34
+    },
+    {
+      "pair": 3,
+      "workload": "with_verdicts",
+      "phase": "before",
+      "median_iteration_ns": 5302795.9,
+      "mean_iteration_ns": 5317597.35
+    },
+    {
+      "pair": 4,
+      "workload": "in_order",
+      "phase": "before",
+      "median_iteration_ns": 4710029.5,
+      "mean_iteration_ns": 4777963.16
+    },
+    {
+      "pair": 4,
+      "workload": "in_order",
+      "phase": "after",
+      "median_iteration_ns": 4740674.1,
+      "mean_iteration_ns": 4779947.74
+    },
+    {
+      "pair": 4,
+      "workload": "reversed",
+      "phase": "before",
+      "median_iteration_ns": 5451415.4,
+      "mean_iteration_ns": 5468970.260000001
+    },
+    {
+      "pair": 4,
+      "workload": "reversed",
+      "phase": "after",
+      "median_iteration_ns": 5313171.1,
+      "mean_iteration_ns": 5409261.579999999
+    },
+    {
+      "pair": 4,
+      "workload": "with_verdicts",
+      "phase": "before",
+      "median_iteration_ns": 5362614.8,
+      "mean_iteration_ns": 5391954.83
+    },
+    {
+      "pair": 4,
+      "workload": "with_verdicts",
+      "phase": "after",
+      "median_iteration_ns": 5298486.0,
+      "mean_iteration_ns": 5345467.73
+    }
+  ],
+  "results": {
+    "in_order": {
+      "before_median_ns_per_tx": 1162.8968017578127,
+      "after_median_ns_per_tx": 1160.217578125,
+      "paired_cost_deltas_percent": [
+        -1.2798403134717473,
+        0.15155674905749095,
+        -0.22763052746925805,
+        -0.23039220924528925,
+        0.6506243750702634
+      ],
+      "median_paired_cost_delta_percent": -0.22763052746925805
+    },
+    "reversed": {
+      "before_median_ns_per_tx": 1305.54951171875,
+      "after_median_ns_per_tx": 1293.2128173828123,
+      "paired_cost_deltas_percent": [
+        -0.9449426640048664,
+        -2.6799165519941215,
+        0.9519187544118957,
+        -0.9307501409250962,
+        -2.535934062188705
+      ],
+      "median_paired_cost_delta_percent": -0.9449426640048664
+    },
+    "with_verdicts": {
+      "before_median_ns_per_tx": 1309.23212890625,
+      "after_median_ns_per_tx": 1299.0569335937498,
+      "paired_cost_deltas_percent": [
+        0.9415297924226795,
+        -0.9715216902487334,
+        -2.0121479413998777,
+        0.3421082074835047,
+        -1.1958494576190692
+      ],
+      "median_paired_cost_delta_percent": -0.9715216902487334
+    }
+  },
+  "scope": "Resident loop and in-memory publisher, no network, Aeron, live recovery, client receipt latency or chain throughput. Deployed comparison remains required.",
+  "build_method": "Run cargo clean -p kardamom-sequencer --release before each build to prevent shared-target artifact reuse; preserve dependencies. Confirm distinct copied executable SHA256 values before measurement.",
+  "interpretation": "Median paired resident-loop cost changes are -0.23%, -0.94% and -0.97%. The short shared-host comparison shows no observed slowdown. Variation prevents a speedup claim. It does not measure per-transaction latency, full release throughput, a lifecycle pause or deployed recovery.",
+  "excluded_attempt": "The first merged comparison used identical binary hashes because Cargo reused the baseline artifact. Its thirty invocations are excluded from all comparisons and preserved as invalid evidence in the campaign profiles directory.",
+  "candidate_note": "Source hashes identify the measured production files. The final merge also corrects the session-generation module comment from sweep to each turn; this changes no executable behavior. Later changes affect only chaos recovery assertions and their tests.",
+  "raw_samples": "2026-10-27-v2-merged-pause-samples.jsonl"
+}

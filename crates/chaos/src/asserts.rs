@@ -14,6 +14,9 @@ use crate::nomad::Alloc;
 use crate::poll::{self, Budget};
 use crate::probes::EXECUTOR_BLOCK_METRIC;
 
+mod progress;
+use progress::ExecutorProgress;
+
 /// How long the sealer boundary counter may stay flat after a recovery.
 /// An executor that misses a join waits 10 s (`join_refetch_after`)
 /// before it refetches from the archive, and the refetch took up to 9 s
@@ -254,28 +257,21 @@ impl Harness {
     }
 
     /// The cluster-mode progress probe: the executor block gauge must
-    /// advance within `timeout`. Recovery is not instant after a leader
-    /// kill, so this succeeds as soon as progress shows.
+    /// advance within `timeout`. The first real reading and the later
+    /// higher reading consume the same recovery budget.
     ///
     /// # Errors
     ///
     /// Returns an error if the gauge never advances.
     pub async fn assert_executor_progress(&self, timeout: Duration) -> anyhow::Result<()> {
-        let e0 = self
-            .progress_sample()
-            .await
-            .ok_or_else(|| crate::chaos_fail!("no executor baseline before progress window"))?;
-        let outcome = poll::after_sleep(
-            Budget::new(timeout, Duration::from_secs(5)),
-            |_| async move {
-                let e1 = self.probes.executor_progress().await.unwrap_or(0);
-                Ok((e1 > e0).then_some(e1))
-            },
-        )
-        .await?;
-        let (e1, elapsed) = outcome.or_fail(|t| {
+        let outcome = ExecutorProgress::default()
+            .wait(Budget::new(timeout, Duration::from_secs(5)), || {
+                self.probes.executor_progress()
+            })
+            .await?;
+        let ((e0, e1), elapsed) = outcome.or_fail(|t| {
             crate::chaos_fail!(
-                "pipeline NOT progressing (executor block {e0} -> ? over {}s)",
+                "pipeline NOT progressing (two increasing executor block samples required within {}s)",
                 t.as_secs()
             )
         })?;

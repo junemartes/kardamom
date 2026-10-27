@@ -13,6 +13,7 @@ use crate::probes::VALIDATOR_PORT;
 use crate::stages::{matching_lines, tail_lines};
 
 const COMMITTED: &str = "validator_committed_block";
+const PIPELINE_ACTIVE: &str = "validator_pipeline_active";
 const VERIFIED: &str = "validator_blocks_verified_total";
 const DIVERGENCE: &str = "validator_divergence_total";
 const SHADOW_CHECKS: &str = "kardamom_state_trie_shadow_checks_total";
@@ -21,7 +22,8 @@ const BAL_MISSING: &str = "validator_bal_missing_total";
 const RECEIPT_MISSING: &str = "validator_receipt_missing_total";
 /// The counters that tell a stalled validator from a slow one: a cursor
 /// that does not move, and the waits that timed out with no replica data.
-const STALL_COUNTERS: [&str; 7] = [
+const STALL_COUNTERS: [&str; 8] = [
+    PIPELINE_ACTIVE,
     COMMITTED,
     VERIFIED,
     SHADOW_CHECKS,
@@ -196,13 +198,15 @@ impl Sample {
         let committed = metrics::first(body, COMMITTED).unwrap_or(0);
         let verified = metrics::first(body, VERIFIED).unwrap_or(0);
         let checks = metrics::first(body, SHADOW_CHECKS).unwrap_or(0);
-        Ok(
-            (committed > 0 && verified > 0 && checks > 0).then_some(Self {
+        Ok((metrics::first(body, PIPELINE_ACTIVE) == Some(1)
+            && committed > 0
+            && verified > 0
+            && checks > 0)
+            .then_some(Self {
                 committed,
                 verified,
                 checks,
-            }),
-        )
+            }))
     }
 
     fn synced_with(&self, executor: Option<i64>, lag_max: i64) -> Option<i64> {

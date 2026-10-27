@@ -258,8 +258,13 @@ impl Reader {
     }
 
     fn proves_bypass(&self, before: &Self) -> bool {
-        self.stale >= before.stale.saturating_add(2)
-            && self.live_misses >= before.live_misses.saturating_add(2)
+        self.stale
+            .checked_sub(before.stale)
+            .is_some_and(|delta| delta >= 2)
+            && self
+                .live_misses
+                .checked_sub(before.live_misses)
+                .is_some_and(|delta| delta >= 2)
             && self.live_hits == before.live_hits
             && self.redis_hits == before.redis_hits
     }
@@ -328,6 +333,32 @@ mod tests {
         ] {
             assert!(Heads::parse(raw).is_err());
         }
+    }
+
+    #[test]
+    fn regressed_or_single_step_counters_cannot_prove_both_fallback_reads() {
+        let before = Reader {
+            stale: 10,
+            live_hits: 3,
+            live_misses: 20,
+            redis_hits: 5,
+        };
+        let after = |stale, live_misses| Reader {
+            stale,
+            live_misses,
+            live_hits: 3,
+            redis_hits: 5,
+        };
+        assert!(after(12, 22).proves_bypass(&before));
+        for (stale, misses) in [(11, 22), (12, 21), (9, 22), (12, 19)] {
+            assert!(!after(stale, misses).proves_bypass(&before));
+        }
+        let near_limit = Reader {
+            stale: i64::MAX - 1,
+            live_misses: i64::MAX - 1,
+            ..before
+        };
+        assert!(!after(i64::MAX, i64::MAX).proves_bypass(&near_limit));
     }
 
     #[test]

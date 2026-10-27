@@ -448,7 +448,7 @@
       "job": 121533651670,
       "observed": "The new mirror-backlog case fails before stopping mirrors or holding heads. The executor has the smoke transaction state but the exact Redis account row is not observed in its baseline wait. Mirrors complete initial scans and later log write/WAIT timeouts; client traffic continues.",
       "change": "After the receipt, wait for exact nonce/balance agreement across every executor at or beyond the consumed nonce. Use that snapshot before comparing Redis. Reuse the same account baseline for all mirror rebuild coverage checks. Preserve the exact Redis equality check and its existing 120-second bound; do not accept a merely present or nonzero row.",
-      "status": "Root cause established by the raw row in PR 850. Corrected locally; deployed backlog and interrupted-scan proofs remain pending.",
+      "status": "Exact replica-synchronized nonce and balance assertions pass on PR 851. The following local-source metric oracle confuses misses with hits; corrected locally. Later cache cases remain unexecuted in that shard.",
       "product_bug": false,
       "service_wiring_changed": false,
       "hot_path_changed": false,
@@ -493,7 +493,7 @@
       "job": 121533651803,
       "observed": "After whole sealer-node loss the majority election closes, every executor converges and blocks advance, but the case-owned sender accepts no new transaction within 60 seconds. It has 410 accepted/receipted transactions and 256 additional offered submissions.",
       "change": "Keep own-load recovery and receipt oracles. Retain aborted counters and allocation logs. The final V2 pause change still needs deployment; an advancing chain is insufficient evidence that the established sender recovered.",
-      "status": "Unresolved; do not widen the own-load recovery SLO."
+      "status": "The fleet shard passes on PR 850 and PR 851. Idle V2 session recovery is independently reproduced and tested, but it is not established as the cause of the earlier fleet failure. Final-head repetitions remain required."
     },
     {
       "id": "unfinished-submit-can-pass-measurement",
@@ -512,7 +512,7 @@
         "224 chaos tests pass, two manual tests ignored. Failed load errors retain an incomplete snapshot and cannot reuse a stale passing report.",
         "Workspace just style passes. No transaction submission, service or production hot path changes; only phase joining, drain bounds and harness task ownership change."
       ],
-      "status": "Validated locally after PR 850 is published. Keep this follow-up local until that diagnostic batch yields its remaining failure evidence. The final head remains unfrozen; streak 0/10."
+      "status": "Strict measurement tests and the PR 851 load stage pass. V2 throughput and client latency need their own deployed load evidence; the existing load topology is reference/V1."
     },
     {
       "id": "v2-idle-session-does-not-reoffer",
@@ -540,14 +540,14 @@
       "classification": "unresolved harness observation",
       "job": 121579144928,
       "observed": "ingress-sealer-loss-recover stops both ingresses and every sealer node. Co-located executors are down too. Its stall observer then requires a current head from those down sources and fails before recovery.",
-      "status": "Investigate a surviving observer or explicit expected-dark fault proof. Do not turn missing metrics into a false zero or weaken recovery checks."
+      "status": "PR 851 combined-ordering passes with concurrent bounded observations and retained completed evidence. It never substitutes zero for missing heads. Final-head repetitions remain required."
     },
     {
       "id": "control-plane-aux-process-disappears",
       "classification": "product",
       "job": 121579144931,
       "observed": "The DNS port correction reaches the actual metadata partition. Three client transfers receive receipts while Nomad/Consul/DNS are isolated. The unchanged-process check detects aux container db1e1c593e5662408895d27bb276b8da83fd322e6759bf5b1d62e0369ba32b29 disappearing.",
-      "status": "Reproduced and fixed locally. Deployed metadata-partition recovery remains pending. Final head remains unfrozen; streak 0/10.",
+      "status": "The batcher fix survives the PR 851 partition. A separate validator SourceRestarted exit is the next failure; it is corrected locally with committed-state reopen and an unavailable readiness state while reopening.",
       "product_bug": true,
       "service_wiring_changed": false,
       "hot_path_changed": false,
@@ -574,7 +574,7 @@
         "230 chaos library tests pass, two manual profiles ignored. Controls include changed copy bytes, preserved victim shared archive, service mark/link exclusion, post-resume snapshots and unrelated old allocation evidence.",
         "docs/runbooks/sealer-two-blank-members.md records the concrete procedure and validation."
       ],
-      "status": "Validated locally; deployed proof remains pending."
+      "status": "The complete cluster shard passes on PR 851, including the hash-verified offline quorum copy and fresh allocation-bound seed proof. Final-head repetitions remain required."
     },
     {
       "id": "combined-progress-probe-starvation",
@@ -590,7 +590,7 @@
         "Paused-clock controls preserve a real height 475 when unrelated probes hang until the existing 12-second deadline. Missing and hung heads still fail.",
         "A real flat head can prove a stall; it cannot prove the seal-only expectation without positive boundary progress."
       ],
-      "status": "Validated locally; deployed combined ordering remains pending."
+      "status": "The complete combined-ordering shard passes on PR 851. Missing sources remain absent; completed observations survive slower probes. Final-head repetitions remain required."
     },
     {
       "id": "checkpoint-copy-subdeadline-preempts-healthy-restore",
@@ -606,7 +606,7 @@
         "232 chaos library tests pass, two manual profiles ignored. Controls reject the pre-fault container, fetch without restore and genesis startup. A real filesystem control preserves an existing peer checkpoint when install races it.",
         "Workspace style passes."
       ],
-      "status": "Validated locally; deployed checkpoint restore remains pending."
+      "status": "PR 851 reaches a verified peer checkpoint and victim restore in four seconds. Its new identity oracle is wrong: inner_container returns a reusable name. The local follow-up uses container ID plus StartedAt and logs restricted to that start. The 120-second deadline remains."
     },
     {
       "id": "carry-activation-phases-share-deploy-load-cap",
@@ -618,7 +618,120 @@
       "observed": "The initial deploy takes 32 minutes; two upgrade checks and their transactions follow. All three source-hash deposits then pass exact receipt-order and account-credit checks. At 41 minutes, the case fails because its 40-minute load has already stopped.",
       "cause": "The activation load floor budgets only a rollout and shares the same cap with single-roll cases. It omits two sequential upgrade checks and the newly added provider-fault credit proof.",
       "change": "Give activation additive load allowances for the rollout, both upgrade checks, and deposit/follower recovery plus the configured fault hold. Keep single-roll and two-roll windows, runtime proof deadlines, workflow timeout and the positive case-owned traffic check. The load still stops as soon as the case completes.",
-      "status": "Corrected locally; deployed carry activation and later steps remain pending."
+      "status": "The first six carry cases pass on PR 851, including native deposits across provider loss. Window-off-on exposes a separate two-upgrade load allowance gap; corrected locally without changing runtime recovery deadlines."
+    },
+    {
+      "id": "v2-pause-expires-unconfirmed-runs",
+      "classification": "product",
+      "case": "da-lag-halt",
+      "observed": "Before the fix, empty blocks beyond loss_blocks expire nonce 0 during an upstream pause. Resume publishes nonce 1 without retrying nonce 0. A pause and clear coalesced between turns also fails to retry an unconfirmed suffix. These are local reproductions; deployed retention causality is not yet established.",
+      "change": "Freeze only forwarded-run loss expiry while paused. On a changed watch that reads clear, reset the loss window and requeue the remaining unconfirmed runs before new intake. Keep confirmations, parked expiry and lookup work active.",
+      "product_bug": true,
+      "service_wiring_changed": false,
+      "hot_path_changed": true,
+      "status": "198 sequencer library and 14 binary tests pass; one manual profile is ignored. Final watch-hook production source hashes match the measured release binary. Deployed recovery and full workload comparison remain pending.",
+      "verification": [
+        "Five controls cover long empty-block pauses, lower-before-higher retries, coalesced watch changes with a confirmed prefix, one new loss window followed by ordinary expiry, and a gate attached already paused.",
+        "All 240 before/after observations from four profile comparisons are retained in docs/benches/2026-10-27-v2-pause-recovery-profile.json and its raw sample file."
+      ]
+    },
+    {
+      "id": "validator-exits-on-source-reset",
+      "classification": "product",
+      "case": "metadata-control-plane-partition",
+      "observed": "PR 851 validator allocation 224b5b34-397e-b07c-5379-8321172421af reports SourceRestarted at delivery cursor index 28978/block 471 at 15:24:45 UTC, then exits 1. The fault blocks Nomad/DNS recovery, so the case loses the original worker.",
+      "change": "Treat the typed stream-source reset as an in-process reopen from the committed database. After a reset, retry typed catalog-unavailable opens with one-second shutdown-aware waits. First-start configuration failures retain their errors, refused replay still needs its staged checkpoint, and proven divergence still holds for the operator. Mark readiness unavailable outside an active pipeline. Startup owns cancellation before the runtime field. Failed opens cancel every discovery/pump task before dropping runtime handles; the same guard transfers to normal ordered shutdown.",
+      "product_bug": true,
+      "service_wiring_changed": true,
+      "hot_path_changed": false,
+      "status": "142 validator library and 15 binary tests pass. Deployed partition recovery remains pending.",
+      "verification": [
+        "Typed reset, staged repair, unrecoverable outcome and divergence controls retain distinct verdicts.",
+        "Paused-clock controls cover first-start failure, delayed retry and immediate shutdown. A recorder control verifies the pipeline activity gauge clears when the guard ends.",
+        "State/configuration and catalog permission failures keep their error results after a source reset; only typed transient catalog failures retry."
+      ]
+    },
+    {
+      "id": "meter-fixture-assumes-scheduler-wakeup",
+      "classification": "test",
+      "observed": "PR 851 CI fails a_cycle_splits_its_time_into_busy_and_idle with idle=0. A delayed first 60ms sleep crosses the 100ms flush threshold; the next 60ms span need not cross another threshold. A separate age test has an arbitrary 500ms scheduler margin.",
+      "change": "Make each busy/idle span cross the flush interval independently and assert both positive spans. Bound age by the observed before/after clock readings. Production meter code is unchanged.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "All 97 cluster-adapter library tests pass locally; CI repetition remains pending."
+    },
+    {
+      "id": "cache-oracle-counts-misses-as-hits",
+      "classification": "harness",
+      "case": "mirror-backlog-client-restart",
+      "observed": "PR 851 exact account values pass. Reader changes from stale=0/live=0 to stale=2/live=2 because live sums both hit and miss outcomes. Two cold local misses are expected.",
+      "change": "Count live hits and misses separately, independent of label ordering. Require zero new live hits, at least two live misses and two stale bypasses; reject regressed counters. Keep exact account and frozen Redis checks.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "Two counter controls and all 234 chaos library tests pass; two manual profiles are ignored. Deployed cache validation pending."
+    },
+    {
+      "id": "checkpoint-identity-is-container-name",
+      "classification": "harness",
+      "case": "state-checkpoint-restore",
+      "observed": "The PR 851 proof introduced by this work compares inner_container values, which are reusable Docker names. The victim finishes a verified restore at 15:39:30 UTC, but the proof waits until 15:41:15 and fails.",
+      "change": "Capture Docker container ID plus StartedAt. Read logs since the observed start. Accept a replacement container or a restart of the same container only when its own process logs prove restore.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "Old-process, fetch-only and genesis logs fail local controls. New-ID and same-ID/new-start restore proofs pass. Deployed validation pending."
+    },
+    {
+      "id": "carry-two-upgrades-share-one-load-allowance",
+      "classification": "harness",
+      "case": "carry-window-off-on",
+      "observed": "PR 851 starts window-off-on at 18:37:58 UTC, submits the checked off upgrade at 18:43:58 and on at 18:48:02; its proof ends at 18:48:10. The load stops after the single eight-minute ceiling.",
+      "change": "Give each checked upgrade an eight-minute load allowance; compose two allowances for two-upgrade steps, plus existing deploy, provider fault and restart allowances. Stop load when the case completes. Keep runtime proof deadlines and the workflow ceiling.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "Corrected locally; deployed last-three carry cases remain pending."
+    },
+    {
+      "id": "healthy-load-stage-does-not-exercise-v2",
+      "classification": "coverage",
+      "observed": "The PR 851 load stage uses default reference/V1 deployment variables. Its passing latency and throughput reports cannot validate V2 runtime changes.",
+      "change": "Within the existing load job, run identical transfer and DeFi workloads on separate fresh reference and carry/V2 deployments. Read knobs from each actual deployment. Preserve distinct V2 report files and log the topology. No new shard.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "Both targets compile under workspace style. Deployed paired runtime comparisons remain pending."
+    },
+    {
+      "id": "executor-progress-baseline-outside-recovery-budget",
+      "classification": "harness",
+      "commit": "2660162e6da8840de9484f36347d9b4e7a82f886",
+      "job": 121993893310,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40442583542/job/121993893310",
+      "observed": "Metadata connectivity returns; running executor count recovers. The check fails after12seconds without a baseline. New executor0 resumes cursor344 and checkpoints block349 shortly afterwards. Executors stay assigned to their sealer nodes before and after the fault.",
+      "change": "Acquire a real baseline and a later higher block within one existing recovery budget. No absent sample supplies a zero. Probe time and all sleeps consume that budget.",
+      "verification": [
+        "Delayed first metric at20s followed by block advance at25s passes within60s.",
+        "A stalled returning exporter, absent metric and hanging probe each fail within the unchanged budget."
+      ],
+      "product_bug": false,
+      "hot_path_changed": false,
+      "status": "Local controls pass; fresh runtime CI required."
+    },
+    {
+      "id": "validator-closed-pipeline-stale-verification-verdict",
+      "classification": "harness",
+      "observed": "The validator keeps its exporter and old verification counters while a source reset closes its pipeline. The old verdict can accept those counters.",
+      "change": "Require validator_pipeline_active=1 in the same scrape as the positive cursor, BAL and trie proof.",
+      "verification": [
+        "The new closed-pipeline regression fails against the old verdict.",
+        "Missing and zero activity fail; active positive proof passes."
+      ],
+      "product_bug": false,
+      "hot_path_changed": false,
+      "status": "Local regression passes; fresh runtime CI required."
     }
   ],
   "coverage": [
@@ -680,7 +793,7 @@
       "existing_shards": [
         "chaos-carry"
       ],
-      "status": "Session and release-time format controls are implemented. New local controls expose missing lifecycle pause wiring: V2 continues intake and publication during a reported pause. The fix follows the existing process watch and drains account updates while offers wait. Local tests and controlled throughput comparison pass. Deployed queued-offer and broader halt-refusal proofs remain pending. A new callback-level regression also proves that an idle unconfirmed sender is not retried on reconnect until a new offer arrives. The local fix samples a shared session generation on the sweep, without per-transaction or network work; positive, negative and paused controls pass. Deployed validation remains pending."
+      "status": "Session and release-time format controls are implemented. New local controls expose missing lifecycle pause wiring: V2 continues intake and publication during a reported pause. The fix follows the existing process watch and drains account updates while offers wait. Local tests and controlled throughput comparison pass. Deployed queued-offer and broader halt-refusal proofs remain pending. A new callback-level regression also proves that an idle unconfirmed sender is not retried on reconnect until a new offer arrives. The local fix samples a shared session generation on the sweep, without per-transaction or network work; positive, negative and paused controls pass. Deployed validation remains pending. Independently reproduced long-pause loss expiry and missed/coalesced resume retries are corrected locally, with five controls and all profile observations retained. Complete non-pause terminal-refusal handling remains open."
     },
     {
       "gap": "Posting freeze beyond every retention floor and exact resumed coverage",
@@ -696,7 +809,7 @@
         "chaos-follower",
         "chaos-l1"
       ],
-      "status": "The existing carry-versions-on case reuses its installed lockbox. Native deposits before, during and after an all-provider unresponsive fault require exact direct-L1 source identities, increasing L1 nonce/log and L2 receipt order, no credit while halted, and exact cumulative balances/unchanged recipient nonce on every executor. Every provider fault is cleared on error. ABI bytes match cast calldata; malformed and wrong-hash receipts fail local controls. 207 local chaos tests pass; deployed validation pending. Deposits with other fault families and restart combinations remain open."
+      "status": "The existing carry-versions-on case reuses its installed lockbox. Native deposits before, during and after an all-provider unresponsive fault require exact direct-L1 source identities, increasing L1 nonce/log and L2 receipt order, no credit while halted, and exact cumulative balances/unchanged recipient nonce on every executor. Every provider fault is cleared on error. ABI bytes match cast calldata; malformed and wrong-hash receipts fail local controls. 207 local chaos tests pass; deployed validation pending. Deposits with other fault families and restart combinations remain open. The carry-versions-on deposit proof passes on PR 851; final-head repetitions remain required."
     },
     {
       "gap": "Asymmetric Raft partition with an isolated live old leader and packet loss/delay",
@@ -720,7 +833,7 @@
       "existing_shards": [
         "chaos-integrity"
       ],
-      "status": "The cluster case follows the offline-copy procedure: stop every member; erase two members; hash-verify a copy from the survivor to one wiped member; restore the saved job. The copied member needs a new RESUME and snapshot; the other needs a fresh peer seed. Bind each start and snapshot proof to the same allocation. Preserve shared executor archives. Local file-copy, corruption, mark exclusion and observer controls pass; deployed validation is pending. This does not cover unsynced-write loss or power cuts."
+      "status": "The cluster case follows the offline-copy procedure: stop every member; erase two members; hash-verify a copy from the survivor to one wiped member; restore the saved job. The copied member needs a new RESUME and snapshot; the other needs a fresh peer seed. Bind each start and snapshot proof to the same allocation. Preserve shared executor archives. Local file-copy, corruption, mark exclusion and observer controls pass; deployed validation is pending. This does not cover unsynced-write loss or power cuts. PR 851 cluster passes its two-blank offline-copy proof. True unsynced-write loss remains open."
     },
     {
       "gap": "Canonical rewind invalidates already served receipts and derived caches",
@@ -758,14 +871,14 @@
       "existing_shards": [
         "all existing shards"
       ],
-      "status": "Owned load remains required through recovery. Local regression now bounds every poll by actual monotonic time, including probes and initial delays; hanging hold probes fail. Full rollout load windows cover measured Ansible cost without extending product recovery SLOs. Deployed latency/throughput/RTO proof remains pending. A real HTTP regression now exposes and corrects a PASS with an unfinished submit. Unknown outcomes fail the measurement, pending receipt reads consume the whole drain budget, and cancellation stops background readers. 89 benchmark tests and 224 chaos tests pass locally; this follow-up is not yet published."
+      "status": "Owned load remains required through recovery. Local regression now bounds every poll by actual monotonic time, including probes and initial delays; hanging hold probes fail. Full rollout load windows cover measured Ansible cost without extending product recovery SLOs. Deployed latency/throughput/RTO proof remains pending. A real HTTP regression now exposes and corrects a PASS with an unfinished submit. Unknown outcomes fail the measurement, pending receipt reads consume the whole drain budget, and cancellation stops background readers. 89 benchmark tests and 224 chaos tests pass locally; this follow-up is not yet published. PR 851 load passes but uses V1. The follow-up runs identical healthy workloads on fresh reference and V2 deployments in that same job, with separate reports. Full runtime baseline/candidate comparison remains pending."
     },
     {
       "gap": "Nomad, Consul and DNS control-plane loss while the data plane stays live",
       "existing_shards": [
         "chaos-coordinated"
       ],
-      "status": "Scheduled in the existing coordinated shard. Diagnostic PR 849 fails before arming because DNS is probed on 8600 while deployed Consul uses 53. Correct probe and TCP/UDP fault rules to 53; preserve all isolation, receipt and unchanged-worker checks. Deployed proof pending."
+      "status": "PR 851 reaches the real port-53 partition. The batcher survives. A typed source reset makes the validator exit; local committed-state reopen and unavailable-during-reopen readiness controls pass. Deployed unchanged-worker proof remains pending."
     },
     {
       "gap": "Populated old deployment layouts and crash/open/clean-restart/upgrade sequence",
@@ -779,8 +892,8 @@
   ],
   "validation": {
     "runtime_product_files_changed": true,
-    "service_wiring_changed": "V2 now subscribes to the existing in-process lifecycle watch. No deployment setting, network topology or transport changes.",
-    "performance_claim": "No speedup is claimed. Controlled alternating pinned release tee repeats show no observed steady latency or throughput regression. The RPC comparison is recorded separately. Full cluster workload comparison and ten green rounds remain required.",
+    "service_wiring_changed": "V2 uses the existing lifecycle watch and session generation. Validator readiness now also requires an active pipeline; its activity gauge changes only at pipeline start/stop. Source-reset retries use the existing committed-state startup path. No deployment defaults, network topology or transport settings change. A startup-owned cancellation guard now covers failed opens and transfers to the existing ordered shutdown.",
+    "performance_claim": "No speedup or full-chain performance guarantee. Final V2 pause-recovery normal median paired throughput deltas are +0.10% ordered, -0.46% reversed and +0.51% with verdicts. All 240 observations from four comparisons, source hashes and binary hashes are retained, including early slower shapes and outliers. Identical-workload deployed client p50/p95/p99, throughput and executor fallback comparisons remain pending.",
     "completed": [
       {
         "check": "chaos library unit tests",
@@ -845,6 +958,10 @@
       {
         "check": "offline quorum recovery, bounded observations and checkpoint proof",
         "result": "232 chaos library tests pass, two manual profiles ignored. 49 batcher tests pass. Workspace style passes. Offline-copy hash/corruption and real filesystem install-race controls pass. All deployed proofs remain pending on the follow-up candidate."
+      },
+      {
+        "check": "PR 851 failure classification and local follow-up",
+        "result": "198 sequencer library + 14 binary, 142 validator library + 15 binary, 97 adapter library and 234 chaos library tests pass. Three manual profiles are ignored. Workspace style passes. The dedicated load job now runs reference and V2 topologies separately."
       }
     ],
     "pending": [
@@ -1017,6 +1134,142 @@
       "status": "Diagnostic batch complete: four supporting workflows, integrity and eight regular stages/shards pass; seven regular shards fail. Local fixes address cache baseline synchronization, batcher error classification, offline quorum recovery, head-probe starvation, checkpoint restore proof/deadline and carry phase load coverage. DA-lag missing-nonce canonical skips remain a product gap. Streak 0/10; head is not frozen."
     },
     {
+      "commit": "5d8ac285a57f3162a2d8bebe2346d9263335c3ab",
+      "url": "https://github.com/junemartes/kardamom/pull/851",
+      "cluster_run": 40340203136,
+      "integrity_run": 40340334267,
+      "status": "Terminal diagnostic failure. Ten of fifteen regular stages/shards and the separate integrity shard pass. CI fails its meter timing fixture; Docker, chain-semantics and cluster-validate pass. No qualifying frozen-head round; streak 0/10.",
+      "cluster_jobs": [
+        {
+          "id": 121632543830,
+          "name": "build cluster artifact",
+          "conclusion": "success",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121632543830"
+        },
+        {
+          "id": 121645722989,
+          "name": "container cluster e2e (chaos-executor)",
+          "conclusion": "failure",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121645722989"
+        },
+        {
+          "id": 121645723010,
+          "name": "container cluster e2e (chaos-sequencer)",
+          "conclusion": "success",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121645723010"
+        },
+        {
+          "id": 121645723070,
+          "name": "container cluster e2e (chaos-fleet)",
+          "conclusion": "success",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121645723070"
+        },
+        {
+          "id": 121645723124,
+          "name": "container cluster e2e (chaos-cluster)",
+          "conclusion": "success",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121645723124"
+        },
+        {
+          "id": 121645723128,
+          "name": "container cluster e2e (chaos-coordinated)",
+          "conclusion": "failure",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121645723128"
+        },
+        {
+          "id": 121645723132,
+          "name": "container cluster e2e (load)",
+          "conclusion": "success",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121645723132"
+        },
+        {
+          "id": 121645723149,
+          "name": "container cluster e2e (chaos-ingress)",
+          "conclusion": "success",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121645723149"
+        },
+        {
+          "id": 121645723155,
+          "name": "container cluster e2e (semantics)",
+          "conclusion": "success",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121645723155"
+        },
+        {
+          "id": 121645723169,
+          "name": "container cluster e2e (chaos-carry)",
+          "conclusion": "failure",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121645723169"
+        },
+        {
+          "id": 121645723174,
+          "name": "container cluster e2e (chaos-retention)",
+          "conclusion": "failure",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121645723174"
+        },
+        {
+          "id": 121645723204,
+          "name": "container cluster e2e (chaos-combined-exec)",
+          "conclusion": "success",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121645723204"
+        },
+        {
+          "id": 121645723209,
+          "name": "container cluster e2e (chaos-combined-ordering)",
+          "conclusion": "success",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121645723209"
+        },
+        {
+          "id": 121645723251,
+          "name": "container cluster e2e (chaos-l1)",
+          "conclusion": "success",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121645723251"
+        },
+        {
+          "id": 121645723259,
+          "name": "container cluster e2e (chaos-cache)",
+          "conclusion": "failure",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121645723259"
+        },
+        {
+          "id": 121645723582,
+          "name": "container cluster e2e (chaos-follower)",
+          "conclusion": "success",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121645723582"
+        },
+        {
+          "id": 121777805091,
+          "name": "open an issue per failed nightly shard",
+          "conclusion": "skipped",
+          "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121777805091"
+        }
+      ],
+      "supporting_runs": [
+        {
+          "id": 40340203237,
+          "conclusion": "failure"
+        },
+        {
+          "id": 40340203357,
+          "conclusion": "success"
+        },
+        {
+          "id": 40340203471,
+          "conclusion": "success"
+        },
+        {
+          "id": 40340203450,
+          "conclusion": "success"
+        }
+      ],
+      "failures": {
+        "chaos-executor": "The checkpoint check compares a reusable container name. The victim verifies its peer checkpoint and restore four seconds after startup, but the name never changes.",
+        "chaos-cache": "Exact nonce/balance checks pass. The local-source metric oracle counts two expected misses as two hits.",
+        "chaos-coordinated": "The batcher survives its typed retry exhaustion. The validator exits on a recoverable SourceRestarted notice during the DNS/control-plane partition.",
+        "chaos-retention": "DA-lag clear still leaves the case sender without new accepted traffic. Local tests independently reproduce lost unconfirmed runs during a long pause and missing resume retries; deployed cause and complete refusal handling remain under validation.",
+        "chaos-carry": "The first six cases pass, including the full deposit fault proof. Window-off-on takes about ten minutes across two checked upgrades; its load ceiling is eight minutes."
+      }
+    },
+    {
       "commit": "e4ac70913cfa00679872dc238d743d564be3ccc6",
       "cluster_run": 40322032464,
       "status": "Complete diagnostic batch: eleven of sixteen runtime stages/shards pass, including executor and fleet; cluster, coordinated, retention, cache and carry fail. The strict failures remain recorded. Integration is not merged or deployed; streak 0/10."
@@ -1025,6 +1278,16 @@
       "commit": "5d8ac285a57f3162a2d8bebe2346d9263335c3ab",
       "cluster_run": 40340203136,
       "status": "Complete follow-up batch: cluster and fleet pass. Executor, coordinated, retention, cache and carry fail. CI test also fails because the busy meter can flush before the idle span begins; other supporting workflow checks pass. Streak 0/10."
+    },
+    {
+      "commit": "2660162e6da8840de9484f36347d9b4e7a82f886",
+      "cluster_run": 40442583542,
+      "status": "Nonqualifying diagnostic run. Coordinated fails its separate twelve-second executor baseline gate; other jobs remain pending at publication of the reviewed pause and recovery fixes. Fresh exact-head CI is required. No previous failure is waived. Streak0/10.",
+      "checks_at_publication": {
+        "SUCCESS": 37,
+        "IN_PROGRESS": 13,
+        "FAILURE": 1
+      }
     }
   ],
   "integration": {
@@ -1100,20 +1363,54 @@
         "interpretation": "No slowdown is observed for polling an empty channel in this local resident-loop fixture. The lower enabled times do not establish a production speedup. Both branches use the candidate binary; this does not compare whole releases, fault recovery, network throughput or per-transaction latency. Full deployed p50/p99 and throughput validation remain required.",
         "measurement_count": 30
       }
+    },
+    "pause_recovery_followup": {
+      "source": "2b6a8acd898feb7e15df5b519a4334954f6b3d88",
+      "pr": 853,
+      "status": "Reviewed merge with local validation complete. Fresh full runtime CI is required before merge and staging deployment. Qualifying streak stays zero.",
+      "independent_red": "Five new pause tests fail on the published2660162e in an isolated baseline workspace: missing lower nonce replay, retained runs lost during empty blocks, coalesced pulse, initial paused gate and resumed loss window.",
+      "validation": {
+        "sequencer_library": 206,
+        "sequencer_binary": 15,
+        "validator_library": 142,
+        "validator_binary": 15,
+        "chaos_library": 239,
+        "cluster_adapter_library": 97,
+        "manual_tests_ignored": 3,
+        "cluster_e2e_shard_compile": "pass",
+        "workspace_style": "pass; no warnings",
+        "cache_counter_controls": "3 pass; total chaos tests now234",
+        "chaos_ignored": 2,
+        "executor_progress_controls": "4 pass after final style correction"
+      },
+      "additional_control": "PASS: fill the real terminal channel to4096 entries, fail to enqueue a second sender refusal, advance empty blocks100 and200 while paused, retain both unconfirmed transactions, then reoffer nonce0 followed by1 on resume. This covers this precise saturation and pause sequence; deployed fault recovery remains required.",
+      "limits": "Deployed retention, V2 load and exact state remain unproven. Source and integration microbenchmarks cannot prove full-chain performance.",
+      "additional_oracles": [
+        "The coordinated run on2660162e fails its separate12-second baseline gate after metadata recovery. Executors resume and create a checkpoint soon afterwards. Baseline acquisition and the later strictly increasing block now consume one existing recovery budget. Virtual-time tests reject a returning but stalled exporter, missing metrics and a hanging probe.",
+        "RED: existing verification counters from a closed validator pipeline pass the old verdict. GREEN: the same scrape must report validator_pipeline_active=1 plus positive committed, BAL and trie checks. Missing or zero active state cannot reuse old counters."
+      ],
+      "performance": {
+        "profile": "docs/benches/2026-10-27-v2-merged-pause-profile.json",
+        "samples": "docs/benches/2026-10-27-v2-merged-pause-samples.jsonl",
+        "invocations": 30,
+        "interpretation": "Median paired resident-loop cost changes are -0.23%, -0.94% and -0.97%. The short shared-host comparison shows no observed slowdown. Variation prevents a speedup claim. It does not measure per-transaction latency, full release throughput, a lifecycle pause or deployed recovery.",
+        "invalid_attempt_excluded": true
+      }
     }
   },
   "followup_candidate": {
     "workspace": "/home/dev/kardamom-chaos-gaps",
+    "branch": "test/chaos-pause-resume-20261027",
+    "base": "5d8ac285a57f3162a2d8bebe2346d9263335c3ab",
     "changes": [
-      "Reject unfinished-submit false passes, bound complete receipt drains, stop background receipt readers on cancellation, and retain failed-load snapshots.",
-      "Recover idle unconfirmed V2 offers from the existing session callback via a sweep-time generation check; add controls and a pinned normal/forced-sweep release comparison.",
-      "Wait for every executor to agree after a receipted transfer before capturing exact cache account baselines; retain the strict row oracle.",
-      "Recognize structured batcher retry-exhaustion context and enter its existing automatic halt instead of exiting.",
-      "Follow the specified offline copy for two blank members, bind start/snapshot proofs to one allocation, and retain completed head observations while dead probes time out.",
-      "Tie checkpoint restore evidence to the replacement victim and share its 120-second budget across copying and restore; cover all carry activation phases with live load."
+      "Freeze only forwarded-run loss expiry while paused. On a changed watch that reads clear, reset the loss window and requeue the remaining unconfirmed runs before new intake. Keep confirmations, parked expiry and lookup work active.",
+      "Treat the typed stream-source reset as an in-process reopen from the committed database. After a reset, retry typed catalog-unavailable opens with one-second shutdown-aware waits. First-start configuration failures retain their errors, refused replay still needs its staged checkpoint, and proven divergence still holds for the operator. Mark readiness unavailable outside an active pipeline. Startup owns cancellation before the runtime field. Failed opens cancel every discovery/pump task before dropping runtime handles; the same guard transfers to normal ordered shutdown.",
+      "Make each busy/idle span cross the flush interval independently and assert both positive spans. Bound age by the observed before/after clock readings. Production meter code is unchanged.",
+      "Count live hits and misses separately, independent of label ordering. Require zero new live hits, at least two live misses and two stale bypasses; reject regressed counters. Keep exact account and frozen Redis checks.",
+      "Capture Docker container ID plus StartedAt. Read logs since the observed start. Accept a replacement container or a restart of the same container only when its own process logs prove restore.",
+      "Give each checked upgrade an eight-minute load allowance; compose two allowances for two-upgrade steps, plus existing deploy, provider fault and restart allowances. Stop load when the case completes. Keep runtime proof deadlines and the workflow ceiling.",
+      "Within the existing load job, run identical transfer and DeFi workloads on separate fresh reference and carry/V2 deployments. Read knobs from each actual deployment. Preserve distinct V2 report files and log the topology. No new shard."
     ],
-    "status": "Local follow-up candidate for a diagnostic PR. 89 benchmark, 193 sequencer library, 14 sequencer binary, 49 batcher library and 232 chaos library tests pass. Three manual profiles remain ignored. Style and the recorded controlled release comparisons pass. No full deployed workload performance claim. DA-lag missing-nonce skips remain open. Head is not frozen; streak 0/10.",
-    "branch": "test/chaos-runtime-recovery-20261026",
-    "base": "7aa49b3f9a4557a24ccb540de33b65450697b348"
+    "status": "Local diagnostic candidate. Runtime bugs, test-oracle failures and coverage gaps remain distinct. Deployed validation and full workload comparison remain required. Head is not frozen; streak 0/10."
   }
 }

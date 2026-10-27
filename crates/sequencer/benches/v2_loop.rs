@@ -21,6 +21,7 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 use kardamom_obs::lifecycle::process;
 use kardamom_sequencer::admission::{AccountState, AdmissionConfig};
 use kardamom_sequencer::resync::{ResyncChannel, ResyncConfig, SealerRefusal};
+use kardamom_sequencer::sealer_rules::SealerVersion;
 use kardamom_sequencer::testkit::{Rig, one_partition_cfg, signed_envelope, signer};
 use kardamom_sequencer::v2::{AccountEvent, AdmissionLoop, V2Config};
 use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
@@ -104,6 +105,9 @@ fn seeded_loop() -> (AdmissionLoop, Inputs) {
     accounts_tx.send(rows(1, 0)).unwrap();
     let mut admission = AdmissionLoop::new(cfg(), vslots, accounts_rx, lookups_tx);
     admission.enable_pause(process().subscribe());
+    if std::env::var_os("KARDAMOM_V2_BENCH_CARRY").is_some() {
+        admission.enable_positioned_refs(SealerVersion::starting_at(5));
+    }
     let refusals = if std::env::var_os("KARDAMOM_V2_BENCH_TERMINAL_REFUSALS").is_some() {
         let channel = ResyncChannel::open(ResyncConfig::default(), 0).unwrap();
         admission.enable_sealer_refusals(channel.controller);

@@ -55,6 +55,10 @@ impl Harness {
         let stages = &self.knobs.stages;
         let _sampler = HostSampler::start();
         crate::log(format!(
+            "load topology: genesis_carry={} sequencer_loop={:?} executor_nodes={:?}",
+            self.knobs.genesis_carry, self.knobs.sequencer_loop, self.knobs.executor_nodes
+        ));
+        crate::log(format!(
             "load runner: name={} host={} cpus={} {}",
             runner_name(),
             hostname(),
@@ -65,16 +69,21 @@ impl Harness {
             workload: Workload::Transfers,
             values: &stages.transfers,
             first_sender: FIRST_SENDER,
-            report: std::env::temp_dir().join("kardamom-load.json"),
+            report: self.soak_report(""),
         };
         self.soak_run(&transfers).await?;
         let defi = Run {
             workload: Workload::Defi,
             values: &stages.defi,
             first_sender: FIRST_SENDER.saturating_add(stages.transfers.senders.get()),
-            report: std::env::temp_dir().join("kardamom-load-defi.json"),
+            report: self.soak_report("-defi"),
         };
         self.soak_run(&defi).await
+    }
+
+    fn soak_report(&self, workload: &str) -> PathBuf {
+        let topology = if self.knobs.genesis_carry { "-v2" } else { "" };
+        std::env::temp_dir().join(format!("kardamom-load{topology}{workload}.json"))
     }
 
     async fn soak_run(&self, run: &Run<'_>) -> anyhow::Result<()> {

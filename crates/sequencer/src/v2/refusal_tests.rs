@@ -177,3 +177,85 @@ fn a_paused_loop_reports_refusals_and_leaves_new_input_archived_until_resume() {
     bench.run();
     assert_eq!(bench.offers(), [(0, true), (1, true), (0, true), (1, true)]);
 }
+
+#[test]
+fn a_full_terminal_channel_cannot_lose_a_paused_senders_unanswered_run() {
+    use kardamom_obs::halt::{HaltCause, HaltRef};
+    use kardamom_obs::lifecycle::Lifecycle;
+    let mut bench = Bench::new(SealerVersion::starting_at(5));
+    let life = Lifecycle::new(Some("sequencer"));
+    bench.l.enable_pause(life.subscribe());
+    let channel = ResyncChannel::open(ResyncConfig::default(), 0).unwrap();
+    bench.l.enable_sealer_refusals(channel.controller);
+    bench.send(0);
+    let other = signer(12);
+    bench
+        .accounts
+        .send(AccountEvent::Rows {
+            block: 1,
+            rows: vec![(
+                other.address(),
+                AccountState {
+                    nonce: 0,
+                    balance: U256::from(10u64).pow(U256::from(24u64)),
+                    delegated: false,
+                    tx_idx: 1,
+                },
+            )],
+        })
+        .unwrap();
+    for nonce in 0..2 {
+        bench.rig.push(
+            TxDataLoc::new(7, pos(4096 + i32::try_from(nonce).unwrap() * 64)),
+            signed_envelope(&other, nonce, 1),
+        );
+    }
+    bench.run();
+    life.follow(Some(HaltRef::sealer(HaltCause::DaLag)));
+    let reason = TxErrorReason::DaLag {
+        sealed_head: 100,
+        posted_head: 1,
+        budget_blocks: 10,
+    };
+    let flood = SealerRefusal {
+        sender: bench.sender(),
+        nonce: 0,
+        reason: reason.clone(),
+    };
+    let queued = std::iter::repeat_with(|| channel.deadline_tx.try_send(flood.clone()))
+        .take_while(Result::is_ok)
+        .count();
+    assert_eq!(Some(queued), channel.deadline_tx.capacity());
+    assert!(matches!(
+        channel.deadline_tx.try_send(SealerRefusal {
+            sender: other.address(),
+            nonce: 0,
+            reason,
+        }),
+        Err(crossbeam_channel::TrySendError::Full(_))
+    ));
+    for block in [100, 200] {
+        bench.empty_block(block);
+    }
+    assert_eq!(
+        bench.l.admission.unconfirmed_for(other.address()).count(),
+        2
+    );
+    life.follow(None);
+    bench.run();
+    let nonces: Vec<_> = bench
+        .rig
+        .offers()
+        .into_iter()
+        .filter(|offer| offer.guard.sender == other.address())
+        .map(|offer| offer.guard.nonce)
+        .collect();
+    assert_eq!(nonces, [0, 1, 0, 1]);
+    assert!(
+        bench
+            .rig
+            .errors()
+            .iter()
+            .all(|error| error.sender != other.address())
+    );
+}

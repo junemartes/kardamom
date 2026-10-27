@@ -364,13 +364,24 @@ impl<T: Clone> Admission<T> {
     }
 
     /// Expire the forwarded runs that no state confirmed within the loss
-    /// window, and the parked transactions that their image left behind or
-    /// that waited longer than the time to live at `now`. Forget the idle
-    /// senders above the sender bound.
+    /// window while publication is active. Expire parked transactions past
+    /// their image window or time to live. Forget idle senders above the
+    /// sender bound.
     pub fn sweep(&mut self, now: Instant, out: &mut Vec<Verdict<T>>) {
+        self.sweep_mode::<false>(now, out);
+    }
+
+    /// Keep forwarded runs while an upstream pause prevents publication.
+    /// Parked expiry and account lookups still run.
+    pub(crate) fn sweep_while_paused(&mut self, now: Instant, out: &mut Vec<Verdict<T>>) {
+        self.sweep_mode::<true>(now, out);
+    }
+
+    fn sweep_mode<const HOLD: bool>(&mut self, now: Instant, out: &mut Vec<Verdict<T>>) {
         self.now = now;
         let window = self.cfg.loss_blocks.get();
-        while self.stamped > 0
+        while !HOLD
+            && self.stamped > 0
             && self
                 .forwards
                 .front()
@@ -389,6 +400,15 @@ impl<T: Clone> Admission<T> {
         if self.senders.len() > self.cfg.max_senders.get() {
             self.senders.retain(|_, s| !s.is_idle());
         }
+    }
+
+    /// Empty blocks during an upstream pause do not prove offer loss.
+    /// On resume the retained runs get a full loss window for recovery;
+    /// account rows can still confirm them throughout the pause.
+    pub(crate) fn resume_loss_window(&mut self) {
+        self.forwards
+            .range_mut(..self.stamped)
+            .for_each(|mark| mark.block = self.block);
     }
 
     fn expire_forward(&mut self, out: &mut Vec<Verdict<T>>) {

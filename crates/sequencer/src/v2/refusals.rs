@@ -34,7 +34,11 @@ impl AdmissionLoop {
             max_inclusion_block,
             ..
         } = &answer.reason
-            && self.offer_of(candidate).guard.max_inclusion_block != *max_inclusion_block
+            && candidate
+                .ref_offer(&self.sealer_version)
+                .guard
+                .max_inclusion_block
+                != *max_inclusion_block
         {
             return;
         }

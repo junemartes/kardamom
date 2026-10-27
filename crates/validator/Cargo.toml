@@ -57,6 +57,7 @@ name = "kardamom-validator"
 path = "src/bin/kardamom-validator/main.rs"
 
 [dev-dependencies]
+metrics-exporter-prometheus.workspace = true
 # `actor::fixtures::ChannelHarness`: the channel-backed engine harness
 # `forged_envelope_chaos.rs` drives, shared with `kardamom-executor`.
 kardamom-engine = { workspace = true, features = ["test-support"] }
@@ -75,4 +76,4 @@ kardamom-obs = { path = "../obs", features = ["test-support"] }
 # shared test fixtures need to name the builder type directly.
 kardamom-exec-core = { workspace = true }
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

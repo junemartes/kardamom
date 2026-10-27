@@ -5,35 +5,29 @@ use std::cell::{Cell, RefCell};
 use anyhow::Context;
 
 use super::{Harness, RESTORED};
+use crate::nodes::RunningProcess;
 use crate::poll::{self, Budget};
 use kardamom_state::checkpoint::replay::LOG_DIR;
 
 pub(super) struct CheckpointRestore {
     victim: String,
     donor: String,
-    previous_inner: String,
-    previous_started: String,
+    previous: RunningProcess,
     copied: Cell<bool>,
     phase: RefCell<String>,
 }
 
 impl CheckpointRestore {
     pub(super) async fn observe(h: &Harness, victim: &str, donor: &str) -> anyhow::Result<Self> {
-        let previous_inner = h
+        let previous = h
             .nodes
-            .inner_cid(victim, "executor")
+            .running_process(victim, "executor")
             .await
             .context("state-checkpoint-restore: no live victim before the fault")?;
-        let previous_started = h
-            .nodes
-            .started_at(victim, &previous_inner)
-            .await
-            .context("state-checkpoint-restore: no victim process start time")?;
         Ok(Self {
             victim: victim.into(),
             donor: donor.into(),
-            previous_inner,
-            previous_started,
+            previous,
             copied: Cell::new(false),
             phase: RefCell::new("waiting for a replacement executor".into()),
         })
@@ -55,21 +49,15 @@ impl CheckpointRestore {
     }
 
     async fn step(&self, h: &Harness) -> anyhow::Result<Option<()>> {
-        if let Some(inner) = h.nodes.inner_cid(&self.victim, "executor").await {
-            let started = h
-                .nodes
-                .started_at(&self.victim, &inner)
-                .await
-                .context("state-checkpoint-restore: no replacement start time")?;
+        if let Some(process) = h.nodes.running_process(&self.victim, "executor").await {
             let logs = h
                 .nodes
-                .exec(
-                    &self.victim,
-                    &format!("docker logs --since {started} --tail 100000 {inner} 2>&1"),
-                )
-                .await?;
-            *self.phase.borrow_mut() = format!("waiting for restore in executor container {inner}");
-            return Ok(self.proves_restore(&inner, &started, &logs).then_some(()));
+                .process_logs(&self.victim, &process, 100_000)
+                .await
+                .unwrap_or_default();
+            *self.phase.borrow_mut() =
+                format!("waiting for restore in executor process {process:?}");
+            return Ok(self.proves_restore(&process, &logs).then_some(()));
         }
         if !self.copied.get() {
             match self.copy(h).await {
@@ -80,9 +68,8 @@ impl CheckpointRestore {
         Ok(None)
     }
 
-    fn proves_restore(&self, inner: &str, started: &str, logs: &str) -> bool {
-        (inner != self.previous_inner || started != self.previous_started)
-            && logs.contains(RESTORED)
+    fn proves_restore(&self, process: &RunningProcess, logs: &str) -> bool {
+        *process != self.previous && logs.contains(RESTORED)
     }
 
     async fn copy(&self, h: &Harness) -> anyhow::Result<bool> {
@@ -179,16 +166,26 @@ mod tests {
         let proof = CheckpointRestore {
             victim: "victim".into(),
             donor: "donor".into(),
-            previous_inner: "old".into(),
-            previous_started: "before".into(),
+            previous: RunningProcess {
+                cid: "old-cid".into(),
+                started: "first-start".into(),
+            },
             copied: Cell::new(false),
             phase: RefCell::new(String::new()),
         };
-        assert!(!proof.proves_restore("old", "before", RESTORED));
-        assert!(!proof.proves_restore("new", "after", "fetched checkpoint from peer"));
-        assert!(!proof.proves_restore("new", "after", "seeding genesis account"));
-        assert!(proof.proves_restore("new", "after", RESTORED));
-        assert!(proof.proves_restore("old", "after", RESTORED));
+        let replacement = RunningProcess {
+            cid: "replacement-cid".into(),
+            started: "second-start".into(),
+        };
+        assert!(!proof.proves_restore(&proof.previous, RESTORED));
+        assert!(!proof.proves_restore(&replacement, "fetched checkpoint from peer"));
+        assert!(!proof.proves_restore(&replacement, "seeding genesis account"));
+        assert!(proof.proves_restore(&replacement, RESTORED));
+        let restarted = RunningProcess {
+            cid: "old-cid".into(),
+            started: "second-start".into(),
+        };
+        assert!(proof.proves_restore(&restarted, RESTORED));
     }
 
     #[test]

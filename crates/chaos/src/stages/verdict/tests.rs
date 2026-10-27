@@ -4,7 +4,7 @@ struct Exporter;
 
 impl Exporter {
     fn healthy() -> String {
-        format!("{COMMITTED} 10\n{VERIFIED} 5\n{SHADOW_CHECKS} 3\n")
+        format!("{PIPELINE_ACTIVE} 1\n{COMMITTED} 10\n{VERIFIED} 5\n{SHADOW_CHECKS} 3\n")
     }
 }
 
@@ -22,6 +22,22 @@ fn verdict_needs_positive_evidence_and_checks_errors_in_the_same_scrape() {
     assert!(Sample::read(&format!("{healthy}{SHADOW_MISMATCH} 1\n")).is_err());
     assert!(Sample::read(&format!("{DIVERGENCE} 1\n")).is_err());
     assert!(Sample::read(&format!("{SHADOW_MISMATCH} 1\n")).is_err());
+}
+
+#[test]
+fn a_closed_pipeline_cannot_reuse_its_previous_verification_counts() {
+    let stale = format!("{COMMITTED} 10\n{VERIFIED} 5\n{SHADOW_CHECKS} 3\n");
+    assert!(Sample::read(&stale).unwrap().is_none());
+    assert!(
+        Sample::read(&format!("{stale}{PIPELINE_ACTIVE} 0\n"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        Sample::read(&format!("{stale}{PIPELINE_ACTIVE} 1\n"))
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test(start_paused = true)]

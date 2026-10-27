@@ -4533,6 +4533,7 @@ dependencies = [
  "kardamom-stm",
  "kardamom-types",
  "metrics",
+ "metrics-exporter-prometheus",
  "reqwest 0.13.4",
  "revm",
  "rkyv",
