@@ -1,0 +1,39 @@
+{
+  "gap": "The deployed checkpoint restore case supplies a valid image. Local library corruption tests do not prove that the deployed replacement rejects a damaged image and fetches a healthy peer checkpoint.",
+  "case": "checkpoint-corrupt-recover",
+  "shard": "chaos-executor",
+  "scope": "Harness only. No production runtime, hot path, format, service endpoint or deployment configuration changes. The case temporarily scales only pinned executor-0 to zero, then restores the complete saved job definition. Other groups keep running.",
+  "protocol": [
+    "Wait for checkpoints on victim and peer; capture victim process identity and exact registered job.",
+    "Scale the pinned victim group to zero; require terminal allocations and no victim process before touching its files.",
+    "Copy the stopped victim checkpoint into a temporary directory; production restore must verify its manifest, image and declared block within120s. Temporary copies are removed on completion.",
+    "Fence the fault by the original image and manifest SHA256 values. Flip one image byte, preserve the manifest, remove other local bases and state. Keep the checkpoint block log.",
+    "Restore the exact job on success or failure. Within120s require a new process to report this image as CORRUPT, quarantine it, fetch a peer checkpoint and restore, in that order. Genesis fallback does not pass.",
+    "Verify the quarantined image and manifest against the fault hashes; verify the same replacement process still runs. Require executor progress/convergence and common receipt, validator and persisted-state checks."
+  ],
+  "workload": "Uses the existing15-minute upper load window of archive corruption; stops unused load after recovery. No existing recovery deadline, offered rate or shard matrix changes. The harness adds bounded checkpoint copy/hash I/O and removes local temporary copies.",
+  "local_tests": {
+    "command": "CARGO_TARGET_DIR=/home/dev/kardamom-integ/target cargo test -p kardamom-chaos --lib --locked",
+    "result": "275 passed, 2 ignored, 0 failed",
+    "log": "/tmp/chaos-checkpoint-corrupt-full-final-20261027.log",
+    "controls": [
+      "Actual checkpoint bytes restore before fault, fail production verification after fault, then restore from an unmodified peer copy; quarantine hashes remain exact.",
+      "No quarantine, changed manifest, unchanged/old process, unrelated image rejection, wrong event order and genesis fallback do not certify recovery.",
+      "A stale baseline digest refuses injection before changing checkpoint or live state.",
+      "Only the selected pinned executor group changes; saved job and healthy peers retain their configuration.",
+      "The image selector chooses numeric newest, removes older local bases and retains the block log."
+    ]
+  },
+  "excluded_attempts": [
+    "The first local fixture used block0, which BlockRange::ANY intentionally excludes. It is corrected to a real committed block1.",
+    "The writer snapshot channel first returns its genesis snapshot; the fixture now waits for committed block1.",
+    "The fixed case-count test changes76 to77. Extracting the executor list keeps the shard dispatch function below the100-line style bound."
+  ],
+  "source_sha256": {
+    "crates/chaos/src/cases/component/corrupt_checkpoint.rs": "df5bceab9d8e8238e52d07cd42a5489067898aa0090eabdfa0d6d31536267ba7",
+    "crates/chaos/src/cases/component/corrupt_checkpoint/fault.py": "0d8847170c2be66191fb2ade799ea4ab524dd53935c15021f32ed7b7597ad001",
+    "crates/chaos/src/cases/component/corrupt_checkpoint/tests.rs": "815b106d07f68442b6839beb52b7b1ac6e941836f3f4f239956c07000212345d"
+  },
+  "runtime_validation": "Pending GitHub CI. No local Docker or staging cluster is run. Qualification stays0/10.",
+  "remaining_gaps": "ENOSPC and injected I/O failures remain open; this case covers corruption of the local recovery source and verified peer recovery only."
+}

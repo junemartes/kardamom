@@ -1101,7 +1101,7 @@
         "chaos-ingress",
         "chaos-cluster"
       ],
-      "status": "pending"
+      "status": "The existing executor shard now includes checkpoint-corrupt-recover: stop only pinned executor-0, prove it has no writers, corrupt one byte without changing its manifest, remove other local bases and state, restore the exact saved job, and require ordered rejection/quarantine/peer fetch/restore in the replacement process. Verify exact quarantined bytes and manifest, then require fleet convergence and the common receipt, validator and persisted-state checks. The local production-verifier and fault-oracle controls pass (275 chaos library tests, 2 ignored). Deployed validation remains pending. ENOSPC and I/O-error coverage remain open."
     },
     {
       "gap": "Loss of unsynced disk writes rather than a process-only SIGKILL",

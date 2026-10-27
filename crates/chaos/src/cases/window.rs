@@ -79,7 +79,9 @@ impl Case {
             Self::NodeReplaceExecutor | Self::NodeReplaceSealer => {
                 inject + Duration::from_mins(30) + k.rejoin_slo
             }
-            Self::ArchiveCorruption => inject + Duration::from_mins(15),
+            Self::ArchiveCorruption | Self::CheckpointCorruptRecover => {
+                inject + Duration::from_mins(15)
+            }
             Self::ArchiveDriverLoss | Self::ArchiveTxDataWipe => {
                 inject + k.reschedule_slo + k.driver_restart_slo() + Duration::from_mins(5)
             }

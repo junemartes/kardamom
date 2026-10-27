@@ -82,6 +82,17 @@ impl Shard {
         }
     }
 
+    const EXECUTOR_CASES: &'static [&'static str] = &[
+        "graceful-executor",
+        "hard-executor",
+        "node-failure-executor",
+        "node-replace-executor",
+        "state-checkpoint-restore",
+        "checkpoint-corrupt-recover",
+        "replay-window-resync",
+        "deploy-broken-image",
+    ];
+
     /// The cases of the shard, in run order. The sequencer shard runs
     /// the two resize cases last: a resize leaves the shard map at a
     /// later version, so the account-to-shard table no longer pins the
@@ -89,15 +100,7 @@ impl Shard {
     #[must_use]
     pub fn cases(self) -> &'static [&'static str] {
         match self {
-            Self::Executor => &[
-                "graceful-executor",
-                "hard-executor",
-                "node-failure-executor",
-                "node-replace-executor",
-                "state-checkpoint-restore",
-                "replay-window-resync",
-                "deploy-broken-image",
-            ],
+            Self::Executor => Self::EXECUTOR_CASES,
             Self::Ingress => &[
                 "graceful-ingress",
                 "hard-ingress",
@@ -418,7 +421,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 76);
+        assert_eq!(all.len(), 77);
         assert_eq!(
             Shard::Integrity.cases().last(),
             Some(&"resize-scale-out-in")

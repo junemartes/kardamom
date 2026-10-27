@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 mod checkpoint;
+pub(super) mod corrupt_checkpoint;
 use checkpoint::CheckpointRestore;
 
 use super::cluster::a_follower;

@@ -48,6 +48,7 @@ pub enum Case {
     NodeFailureExecutor,
     NodeReplaceExecutor,
     StateCheckpointRestore,
+    CheckpointCorruptRecover,
     ReplayWindowResync,
     DeployBrokenImage,
     ClusterLeaderKill,
@@ -123,6 +124,7 @@ const ALL: &[Case] = &[
     Case::NodeFailureExecutor,
     Case::NodeReplaceExecutor,
     Case::StateCheckpointRestore,
+    Case::CheckpointCorruptRecover,
     Case::ReplayWindowResync,
     Case::DeployBrokenImage,
     Case::ClusterLeaderKill,
@@ -211,6 +213,7 @@ impl Case {
             Self::NodeFailureExecutor => "node-failure-executor",
             Self::NodeReplaceExecutor => "node-replace-executor",
             Self::StateCheckpointRestore => "state-checkpoint-restore",
+            Self::CheckpointCorruptRecover => "checkpoint-corrupt-recover",
             Self::ReplayWindowResync => "replay-window-resync",
             Self::DeployBrokenImage => "deploy-broken-image",
             Self::ClusterLeaderKill => "cluster-leader-kill",
@@ -375,6 +378,9 @@ impl Case {
             Self::NodeFailureExecutor => component::node_failure_executor(h).await,
             Self::NodeReplaceExecutor => component::node_replace_executor(h).await,
             Self::StateCheckpointRestore => component::state_checkpoint_restore(h).await,
+            Self::CheckpointCorruptRecover => {
+                component::corrupt_checkpoint::CorruptCheckpoint::run(h).await
+            }
             Self::ReplayWindowResync => component::replay_window_resync(h).await,
             Self::DeployBrokenImage => deploy::broken_image(h).await,
             Self::ClusterLeaderKill => cluster::leader_kill(h).await,
