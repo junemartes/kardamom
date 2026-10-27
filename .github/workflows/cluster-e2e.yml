@@ -345,7 +345,18 @@ jobs:
       # healthy client or media driver. 30 s is the value of the local
       # e2e harness. The deploy and the chaos knobs read the same value.
       - name: Run shard (${{ matrix.shard }})
-        run: just --justfile deploy/cluster/justfile shard "${{ matrix.shard }}"
+        run: |
+          {
+            date --utc --iso-8601=seconds
+            printf 'available_cpus=%s\n' "$(nproc)"
+            free --bytes
+          } > /tmp/chaos-runner-resources.log
+          # Sample host contention through the fault and recovery. Skip the
+          # first vmstat row, whose counters average the time since boot.
+          TZ=UTC vmstat --wide --timestamp --no-first --one-header -S K 1 >> /tmp/chaos-runner-resources.log 2>&1 &
+          resource_sampler=$!
+          trap 'kill "$resource_sampler" 2>/dev/null || true; wait "$resource_sampler" 2>/dev/null || true' EXIT
+          just --justfile deploy/cluster/justfile shard "${{ matrix.shard }}"
         env:
           KARDAMOM_STAGED: "1"
           AERON_STALL_TOLERANCE_MS: "30000"
@@ -356,7 +367,7 @@ jobs:
         env:
           KARDAMOM_STAGED: "1"
 
-      - name: Preserve load and latency reports
+      - name: Preserve load, latency and runner resource reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -364,6 +375,7 @@ jobs:
           path: |
             /tmp/chaos-*.json
             /tmp/kardamom-load*.json
+            /tmp/chaos-runner-resources.log
           if-no-files-found: ignore
           retention-days: 14
 
