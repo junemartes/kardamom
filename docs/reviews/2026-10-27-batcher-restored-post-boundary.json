@@ -1,0 +1,43 @@
+{
+  "issue": 874,
+  "source_run": 40468345654,
+  "source_job": 122069115349,
+  "source_head": "833362794466387781fc2501764b095072057c90",
+  "case": "s13e_carry_window_rollout",
+  "observed": {
+    "startup": "07:57:35.150011 UTC; L1 index2 covers through53",
+    "restored": "07:57:35.151318 UTC;29 blocks through82",
+    "failure": "07:57:35.647015 UTC; L1 index3 covers82, local send ends85",
+    "oracle": "60-second egress cursor deadline fails; the case and bound stay unchanged"
+  },
+  "protocol": "Before reading any record on each feed entry, post its restored or rebuilt pending group unchanged. The existing sender either confirms it, reconciles the same boundary against L1, or reports its existing bounded failure. Only a successful post clears spool entries and advances the cursor/posted head.",
+  "production_change": "Three executable lines before the existing feed loop; no changed sender checks, post retry budgets, backoff, normal close policy, wire/storage schema or service wiring.",
+  "performance_scope": "The additional await runs at feed entry during startup/recovery, never on the healthy per-record loop. A restored/rebuilt group can post sooner. No performance claim is inferred from local recovery tests.",
+  "positive": {
+    "command": "cargo test -p kardamom-batcher --lib --locked",
+    "result": "57 passed, zero ignored",
+    "log": "/tmp/chaos-batcher-restored-group-final-tests.log"
+  },
+  "negative": {
+    "source": "9526a068 production feed with the new regression controls",
+    "result": "The original two controls compile and fail with range widening; zero pass.",
+    "log": "/tmp/chaos-batcher-restored-group-negative-v2.log",
+    "invalid_attempt": "The first control attempt fails compilation on an opaque return type lifetime capture and is excluded; retained at /tmp/chaos-batcher-restored-group-negative.log."
+  },
+  "controls": [
+    "A prior L1 post confirms after startup: first DA range54..82, second83..85; final batch index4, cursor86, spool empty.",
+    "A conflicting L1 range54..81 remains fatal before live blocks join; no cursor/head advance, all29 spooled blocks stay.",
+    "An exhausted restored post retains the structured PostExhausted classification, original29 blocks, and old posted head.",
+    "An empty spool preserves one normal live group83..85."
+  ],
+  "harness": "Only a loopback HTTP503 DA endpoint and Alloy mocked L1 provider. Production packing, recovery entry, reconciliation, cursor I/O and spool I/O execute. No local cluster, Docker or staging deployment.",
+  "source_sha256": {
+    "crates/batcher/src/live/feed.rs": "0d8141d92151584908a8e8b7a241cdb081c2b6eb6c4e2ae45c79ec81d34eb8c6",
+    "crates/batcher/src/live/feed_tests.rs": "7074a685b5bca0342a6a6a5c8947f67cbf052a5135d5ab90248df3c9bbdf5915",
+    "crates/batcher/src/live/feed_recovery_tests.rs": "94c43f18dd8dcf16fa25ab888f2fac88341c9f33a7a2842a3944787b5b9cafd4"
+  },
+  "style": "just style passes; the existing proc-macro-error2 future compatibility notice remains. /tmp/chaos-batcher-restored-post-final-style.log",
+  "runtime_validation": "pending on the final integrated head; no stability qualification is claimed",
+  "streak": 0,
+  "integration_consolidation": "16 duplicate stacked PRs close after their exact heads are verified as ancestors of9526a068. The code remains in shared integration PR838. Their closure is not delivery to main."
+}
