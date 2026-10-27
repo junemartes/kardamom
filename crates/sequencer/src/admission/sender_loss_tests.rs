@@ -7,10 +7,15 @@ use super::super::{AccountState, Admission, AdmissionConfig, Candidate, ImagePos
 
 struct Fixture {
     admission: Admission<()>,
+    unit: u64,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_sender_limit(NonZeroUsize::new(100).unwrap())
+    }
+
+    fn with_sender_limit(limit: NonZeroUsize) -> Self {
         Self {
             admission: Admission::new(
                 AdmissionConfig {
@@ -20,10 +25,11 @@ impl Fixture {
                     park_width: NonZeroU64::new(1 << 17).unwrap(),
                     park_ttl: Duration::from_secs(60),
                     relook_after: Duration::from_millis(500),
-                    max_senders: NonZeroUsize::new(100).unwrap(),
+                    max_senders: limit,
                 },
                 Instant::now(),
             ),
+            unit: 0,
         }
     }
 
@@ -44,6 +50,7 @@ impl Fixture {
     }
 
     fn offer(&mut self, sender: Address, nonce: u64) {
+        self.unit = self.unit.checked_add(1).unwrap();
         self.admission.offer(
             Candidate {
                 sender,
@@ -53,7 +60,7 @@ impl Fixture {
                 image: ImagePos {
                     lane: 0,
                     session: 1,
-                    unit: nonce + 1,
+                    unit: self.unit,
                 },
                 ingress: 0,
                 answered: false,
@@ -67,6 +74,36 @@ impl Fixture {
         self.admission.on_rows(block, [], &mut Vec::new());
         self.admission.sweep(Instant::now(), &mut Vec::new());
     }
+}
+
+#[test]
+fn an_evicted_senders_old_marks_cannot_expire_a_recreated_sender() {
+    let mut f = Fixture::with_sender_limit(NonZeroUsize::new(1).unwrap());
+    let sender = Address::repeat_byte(1);
+    let other = Address::repeat_byte(2);
+    f.state(sender, 0, 1);
+    f.offer(sender, 0);
+    f.block(2);
+    f.state(sender, 1, 3);
+    f.state(other, 0, 3);
+    f.offer(other, 0);
+    f.block(3);
+    assert!(!f.admission.senders.contains_key(&sender));
+    f.admission.on_rollback();
+    f.state(sender, 0, 4);
+    f.offer(sender, 0);
+    f.block(5);
+    f.block(18);
+    assert!(
+        f.admission.unconfirmed_at(sender, 0).is_some(),
+        "an old tag from the evicted state cannot name the new state"
+    );
+    assert!(f.admission.unconfirmed_at(other, 0).is_some());
+    f.block(19);
+    assert!(f.admission.unconfirmed_at(other, 0).is_none());
+    assert!(f.admission.unconfirmed_at(sender, 0).is_some());
+    f.block(21);
+    assert!(f.admission.unconfirmed_at(sender, 0).is_none());
 }
 
 #[test]

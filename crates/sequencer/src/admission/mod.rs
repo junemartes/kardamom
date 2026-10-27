@@ -60,6 +60,7 @@ use std::time::{Duration, Instant};
 use alloy_primitives::map::HashMap;
 use alloy_primitives::{Address, B256, U256};
 
+use self::refusals::MarkRetention;
 use self::sender::SenderState;
 
 /// The limits of the filter.
@@ -413,8 +414,25 @@ impl<T: Clone> Admission<T> {
         }
         self.relook_due(now, out);
         if self.senders.len() > self.cfg.max_senders.get() {
-            self.senders.retain(|_, s| !s.is_idle());
+            self.evict_idle();
         }
+    }
+
+    /// A recreated sender starts its tags again. Markers of an evicted
+    /// state cannot name that sender's next forwarded run.
+    #[cold]
+    fn evict_idle(&mut self) {
+        let count = self.senders.len();
+        self.senders.retain(|_, sender| !sender.is_idle());
+        if self.senders.len() == count {
+            return;
+        }
+        let senders = &self.senders;
+        MarkRetention {
+            marks: &mut self.forwards,
+            stamped: &mut self.stamped,
+        }
+        .retain(|mark| senders.contains_key(&mark.sender));
     }
 
     /// Empty blocks during an upstream pause do not prove offer loss.

@@ -6,6 +6,20 @@ use alloy_primitives::Address;
 
 use super::{Admission, Candidate};
 
+pub(super) struct MarkRetention<'a> {
+    pub(super) marks: &'a mut VecDeque<super::ForwardMark>,
+    pub(super) stamped: &'a mut usize,
+}
+
+impl MarkRetention<'_> {
+    pub(super) fn retain(&mut self, keep: impl Fn(&super::ForwardMark) -> bool) {
+        let pending = self.marks.split_off(*self.stamped);
+        self.marks.retain(&keep);
+        *self.stamped = self.marks.len();
+        self.marks.extend(pending.into_iter().filter(keep));
+    }
+}
+
 pub(crate) struct RefusedRun<T> {
     pub(crate) candidate: Candidate<T>,
     pub(crate) suffix: VecDeque<Candidate<T>>,
@@ -30,9 +44,10 @@ impl<T: Clone> Admission<T> {
     /// The refused copy and its parked suffix leave no old loss marks.
     pub(super) fn remove_forward_marks(&mut self, sender: Address, nonce: u64) {
         let keep = |mark: &super::ForwardMark| mark.sender != sender || mark.nonce < nonce;
-        let pending = self.forwards.split_off(self.stamped);
-        self.forwards.retain(keep);
-        self.stamped = self.forwards.len();
-        self.forwards.extend(pending.into_iter().filter(keep));
+        MarkRetention {
+            marks: &mut self.forwards,
+            stamped: &mut self.stamped,
+        }
+        .retain(keep);
     }
 }

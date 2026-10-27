@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "purpose": "Retain all observations of the first refusal/generation implementation, including the measured normal-path regression. This implementation is not accepted as the final performance result.",
-  "source_revision": "d9e2cc5d",
+  "source_revision": "d9e2cc5d3be1d86ffee4413ac207121d754ad322",
   "baseline_revision": "58465a1e8a480a8cabc434cb9be57f340fb9453f",
   "build_manifest": {
     "baseline": "58465a1e8a480a8cabc434cb9be57f340fb9453f",
@@ -319,7 +319,7 @@
       }
     },
     "harness_difference": "Both harnesses use the same inputs, limits, timed runner, real pause watch and environment. Baseline holds the old dedicated refusal channel; candidate holds the SealerRules sender for the shared account-event queue. This setup difference matches the intended production transport change.",
-    "candidate_source_revision": "d9e2cc5d"
+    "candidate_source_revision": "d9e2cc5d3be1d86ffee4413ac207121d754ad322"
   },
   "methodology": {
     "cpu": 8,
