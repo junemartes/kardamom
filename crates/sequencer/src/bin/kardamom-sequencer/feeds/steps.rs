@@ -111,6 +111,9 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
     /// every ref in flight is refused: dropping is safe, because the
     /// confirm-timeout sweep still clears the ledger.
     pub(super) fn forward_refusal(&self, refusal: SealerRefusal) {
+        if self.rules.on_refusal(&refusal) {
+            return;
+        }
         match self.deadline_tx.try_send(refusal) {
             Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
             Err(crossbeam_channel::TrySendError::Full(_)) => {

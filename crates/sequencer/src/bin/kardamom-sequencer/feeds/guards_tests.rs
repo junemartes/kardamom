@@ -135,3 +135,20 @@ fn repeated_healthy_frames_do_not_publish_watch_changes() {
         "healthy ticks must not force full-run retries"
     );
 }
+
+#[test]
+fn a_da_refusal_cannot_clear_the_known_record_lag_guard() {
+    let mut f = Fixture::new();
+    f.feed.pauses.on_guard(HaltCause::RecordLag, &f.life);
+    f.feed.pauses.on_guard(HaltCause::DaLag, &f.life);
+    assert_eq!(f.root(), Some(HaltCause::RecordLag));
+    f.status(&ClusterStatus {
+        halted: true,
+        ..ClusterStatus::default()
+    });
+    assert_eq!(
+        f.root(),
+        Some(HaltCause::DaLag),
+        "a status can establish that record lag cleared"
+    );
+}

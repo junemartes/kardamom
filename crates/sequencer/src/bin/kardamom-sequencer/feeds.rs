@@ -399,55 +399,13 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
                         nonce,
                         "sealer window-full reject received; republishing the ref"
                     );
+                    self.rules.on_window_full(sender, nonce);
                     self.forward_answer(SealerAnswer::WindowFull { sender, nonce });
                 }
                 true
             }
             _ => false,
         }
-    }
-
-    /// Handle one DA-lag reject frame. Returns `true` when `frame` was
-    /// one, so the caller does not also check it for a boundary.
-    ///
-    /// The sealer refused the ref because the chain is halted on a DA
-    /// lag. No republish can order it until the batcher posts again, so
-    /// it takes the terminal-refusal channel: the publish loop drops the
-    /// ledger entry and tells the client to resubmit later.
-    fn on_da_lag_frame(&mut self, frame: &[u8], lifecycle: &Lifecycle) -> bool {
-        if frame.first() != Some(&wire::EGRESS_KIND_DA_LAG_REJECT) {
-            return false;
-        }
-        if let Ok(EgressItem::DaLagReject {
-            sender,
-            nonce,
-            sealed_head,
-            posted_head,
-            budget_blocks,
-        }) = EgressItem::decode(frame)
-        {
-            self.pauses
-                .on_guard(kardamom_obs::halt::HaltCause::DaLag, lifecycle);
-            tracing::warn!(
-                partition = self.partition,
-                ?sender,
-                nonce,
-                sealed_head,
-                posted_head,
-                budget_blocks,
-                "sealer DA-lag reject received; dropping the ref"
-            );
-            self.forward_refusal(SealerRefusal {
-                sender,
-                nonce,
-                reason: kardamom_types::TxErrorReason::DaLag {
-                    sealed_head,
-                    posted_head,
-                    budget_blocks,
-                },
-            });
-        }
-        true
     }
 
     /// Handle one remote-origin-reject frame. Returns `true` when

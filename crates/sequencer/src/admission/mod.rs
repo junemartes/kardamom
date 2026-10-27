@@ -50,6 +50,7 @@
 //! [`AdmissionConfig::max_senders`], a sweep forgets the idle senders: the
 //! next transaction of one asks for a lookup.
 
+mod refusals;
 mod sender;
 
 use std::collections::VecDeque;
@@ -180,6 +181,8 @@ pub enum Verdict<T> {
     Forward(Candidate<T>),
     /// Tell the client why the filter did not forward it.
     Reject(Candidate<T>, Refusal),
+    /// A terminal refusal identifies a copy that the sealer cannot order.
+    SealerRefused(Candidate<T>, kardamom_types::TxErrorReason),
     /// The filter holds no state of the sender: ask Redis, then the
     /// executor, and give the answer to [`Admission::on_lookup`].
     Lookup(Address),
@@ -464,7 +467,10 @@ impl<T: Clone> Admission<T> {
                     sender: c.sender,
                     nonce: c.nonce,
                 }),
-                Verdict::Reject(..) | Verdict::Lookup(_) | Verdict::Accept(_) => None,
+                Verdict::Reject(..)
+                | Verdict::SealerRefused(..)
+                | Verdict::Lookup(_)
+                | Verdict::Accept(_) => None,
             }));
     }
 }

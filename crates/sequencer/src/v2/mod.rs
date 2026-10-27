@@ -48,6 +48,7 @@
 
 mod depth;
 mod offers;
+mod refusals;
 use offers::OfferReplay;
 mod runner;
 mod verdicts;
@@ -181,9 +182,14 @@ pub enum AccountEvent {
     },
     /// The executor rolled back.
     Rollback,
-    /// The sealer refused the forwarded transaction of `sender` at `nonce`
-    /// (egress kind 18). The filter forgets the run, so a resend goes out.
-    Refused { sender: Address, nonce: u64 },
+    /// The sealer refused a reference without bytes (egress kind 18).
+    /// Only the named transaction leaves; its suffix waits for a resend.
+    Refused(Box<kardamom_cluster_adapter::wire::RefRefused>),
+    /// A guard refusal retains the run for replay. A past-deadline refusal
+    /// removes the named copy and parks its suffix behind the missing nonce.
+    Refusal(Box<crate::resync::SealerRefusal>),
+    /// Backpressure at the sealer requests another offer of a held run.
+    Retry { sender: Address, nonce: u64 },
     /// The contiguity guard of the sealer rejected the forwarded
     /// transaction of `sender` at `nonce`, because it expects `expected`
     /// (egress kind 5).
@@ -344,13 +350,17 @@ impl AdmissionLoop {
     fn apply_accounts(&mut self) -> bool {
         let events: Vec<AccountEvent> = self.accounts.try_iter().collect();
         let applied = !events.is_empty();
-        for event in events {
-            self.apply(event);
+        // Every event applies, including rows after a replay request.
+        let replay = events
+            .into_iter()
+            .fold(false, |replay, event| self.apply(event) | replay);
+        if replay {
+            self.replay_after_refusals();
         }
         applied
     }
 
-    fn apply(&mut self, event: AccountEvent) {
+    fn apply(&mut self, event: AccountEvent) -> bool {
         match event {
             AccountEvent::Rows { block, rows } => {
                 self.admission.on_rows(block, rows, &mut self.verdicts);
@@ -359,8 +369,16 @@ impl AdmissionLoop {
                 self.admission.on_lookup(address, state, &mut self.verdicts);
             }
             AccountEvent::Rollback => self.admission.on_rollback(),
-            AccountEvent::Refused { sender, nonce } => {
-                self.admission.on_refused(sender, nonce, &mut self.verdicts);
+            AccountEvent::Refused(refused) => {
+                return self
+                    .remove_refused(refused.sender, refused.nonce, |c| {
+                        c.tx_hash == refused.canonical_id
+                    })
+                    .is_some();
+            }
+            AccountEvent::Refusal(refusal) => return self.on_sealer_refusal(*refusal),
+            AccountEvent::Retry { sender, nonce } => {
+                return self.admission.unconfirmed_at(sender, nonce).is_some();
             }
             AccountEvent::Rejected {
                 sender,
@@ -368,6 +386,7 @@ impl AdmissionLoop {
                 expected,
             } => self.offer_rejected(sender, nonce, expected),
         }
+        false
     }
 
     /// The guard of the sealer expects `expected` of `sender`, and rejected
@@ -515,6 +534,12 @@ impl AdmissionLoop {
                 self.depth.gave(c.payload.vslot);
                 self.count_refusal(refusal);
                 let reason = reason_of(refusal);
+                if let Some(ack) = c.answer() {
+                    self.to_ingress.reject(ack, reason.clone());
+                }
+                reject(side, c.tx_hash, c.sender, c.nonce, reason);
+            }
+            Verdict::SealerRefused(mut c, reason) => {
                 if let Some(ack) = c.answer() {
                     self.to_ingress.reject(ack, reason.clone());
                 }

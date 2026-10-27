@@ -56,6 +56,40 @@ impl<T> Default for SenderState<T> {
 }
 
 impl<T: Clone> SenderState<T> {
+    /// Remove only the copy the refusal names. A forwarded suffix leaves
+    /// with it, so the caller parks it behind the missing nonce.
+    pub(super) fn take_refused(
+        &mut self,
+        nonce: u64,
+        named: impl Fn(&Candidate<T>) -> bool,
+    ) -> Option<super::refusals::RefusedRun<T>> {
+        if self.forwarded_at(nonce).is_some_and(&named) {
+            let at = usize::try_from(nonce.checked_sub(self.first)?).ok()?;
+            let mut suffix = self.forwarded.split_off(at);
+            self.spend = suffix
+                .iter()
+                .fold(self.spend, |spend, c| spend.saturating_sub(c.cost));
+            return suffix
+                .pop_front()
+                .map(|candidate| super::refusals::RefusedRun {
+                    candidate,
+                    suffix,
+                    was_parked: false,
+                });
+        }
+        if self.parked.get(&nonce).is_some_and(named) {
+            return self
+                .parked
+                .remove(&nonce)
+                .map(|candidate| super::refusals::RefusedRun {
+                    candidate,
+                    suffix: VecDeque::new(),
+                    was_parked: true,
+                });
+        }
+        None
+    }
+
     /// Decide one transaction of this sender. Returns whether it parked.
     pub(super) fn offer(
         &mut self,

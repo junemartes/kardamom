@@ -23,8 +23,6 @@ use kardamom_cluster_adapter::wire::{
 };
 use kardamom_types::{DropReason, TxDrop};
 
-use crossbeam_channel::TrySendError;
-
 use crate::metrics;
 use crate::outbound::DropPublisher;
 use crate::v2::AccountEvent;
@@ -166,10 +164,7 @@ impl<D: DropPublisher> SealerRules<D> {
             "sealer refused a reference without bytes; dropping the transaction"
         );
         self.publish(self.shared.get().max(refused.decision_version));
-        self.tell_loop(AccountEvent::Refused {
-            sender: refused.sender,
-            nonce: refused.nonce,
-        });
+        self.tell_loop(AccountEvent::Refused(Box::new(*refused)));
         self.drops.publish_drop(TxDrop {
             tx_hash: refused.canonical_id,
             sender: refused.sender,
@@ -190,19 +185,28 @@ impl<D: DropPublisher> SealerRules<D> {
         });
     }
 
-    /// Put the answer of the sealer on the queue of the v2 loop. A full
-    /// queue loses it: the loss window of the filter then frees the nonce,
-    /// later.
+    /// Route a refusal to v2 when its account queue is wired. V1 keeps its
+    /// terminal-refusal channel. The box lives only on this cold path.
+    #[must_use]
+    pub fn on_refusal(&self, refusal: &crate::resync::SealerRefusal) -> bool {
+        let Some(tx) = &self.refusals else {
+            return false;
+        };
+        let _ = tx.send(AccountEvent::Refusal(Box::new(refusal.clone())));
+        true
+    }
+
+    /// A full sealer window requests replay without freeing any nonce.
+    pub fn on_window_full(&self, sender: Address, nonce: u64) {
+        self.tell_loop(AccountEvent::Retry { sender, nonce });
+    }
+
+    /// Account events drain even while publication pauses. Backpressure
+    /// keeps a refusal until the loop consumes it. A stopped loop drops
+    /// the receiver and releases this producer.
     fn tell_loop(&self, event: AccountEvent) {
-        let full = self
-            .refusals
-            .as_ref()
-            .is_some_and(|tx| matches!(tx.try_send(event), Err(TrySendError::Full(_))));
-        if full {
-            tracing::warn!(
-                partition = self.partition,
-                "account event queue full; the refusal waits for the loss window"
-            );
+        if let Some(tx) = &self.refusals {
+            let _ = tx.send(event);
         }
     }
 
