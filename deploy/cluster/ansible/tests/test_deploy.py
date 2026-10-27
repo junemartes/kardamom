@@ -1796,11 +1796,15 @@ class DeployTest(Deploys):
     def test_a_failed_smoke_leaves_the_canary_unpromoted(self):
         self.api.state['deployments']['sequencer'] = Deployment('sequencer', [], canary=True)
         Path(str(self.deploy_bin) + '.smoke-fails').touch()
-        self.run_deploy(success=False)
+        self.run_deploy(environ={'CANARY_LOCAL': '1'}, success=False)
         calls = Path(str(self.deploy_bin) + '.calls').read_text().splitlines()
         self.assertEqual(calls, ['smoke --rpc-url http://127.0.0.1:8545 --chain-id 412346'])
         self.assertFalse(self.api.state['deployments']['sequencer'].promoted)
-        self.assertNotIn('batcher', self.api.state['writes'])
+        self.assertEqual(self.api.state['writes'][-4:], ['da-store', 'l1-indexer', 'batcher', 'sequencer'])
+        self.assertNotIn('canary', self.api.state['writes'])
+        self.assertEqual(self.record()['attempt']['status'], 'started')
+        self.assertNotIn('accepted', self.record())
+        self.assertFalse((self.record_dir / 'images.digests').exists())
 
     def test_a_successful_deploy_records_the_manifest_and_keeps_the_previous_one(self):
         self.run_deploy()
@@ -2331,10 +2335,11 @@ class RollbackTest(Deploys):
         # the attempt reached them too.
         reverted = [w for w in self.api.state['writes'] if w.startswith('revert:')]
         self.assertEqual(reverted, ['revert:da-watcher:0', 'revert:validator:0', 'revert:notifier:0', 'revert:state-mirror:0',
-                                    'revert:executor:0', 'revert:ingress:0', 'revert:redis:0', 'revert:sequencer:0',
+                                    'revert:executor:0', 'revert:ingress:0', 'revert:redis:0',
                                     'revert:aeron:0', 'revert:data-dirs:0'])
         self.assertEqual(self.api.state['writes'].count('cluster'), 3)
         self.assertNotIn('revert:batcher:0', self.api.state['writes'], 'the failed attempt never reached the batcher')
+        self.assertNotIn('revert:sequencer:0', self.api.state['writes'], 'the failed attempt never reached the sequencer')
         self.assertEqual(self.record()['accepted']['target']['manifest']['executor'],
                          f'registry.example:5000/kardamom-executor:test@sha256:{"a" * 64}')
 
@@ -2355,7 +2360,7 @@ class RollbackTest(Deploys):
         self.assertIn('ingress is at version 2, the pre-release definition', output)
         self.assertNotIn('revert:ingress:0', self.api.state['writes'])
         self.assertIn('revert:redis:0', self.api.state['writes'])
-        self.assertEqual(self.record()['attempt']['rolled_back'], ['ingress', 'redis', 'sequencer', 'cluster', 'aeron', 'data-dirs'])
+        self.assertEqual(self.record()['attempt']['rolled_back'], ['ingress', 'redis', 'cluster', 'aeron', 'data-dirs'])
         self.assertEqual(self.record()['attempt']['status'], 'rolled_back')
 
     def test_a_rollback_that_stops_resumes_after_the_jobs_it_reverted(self):
@@ -2367,7 +2372,7 @@ class RollbackTest(Deploys):
         # the jobs before it recorded.
         self.api.state['deployments']['executor'] = Deployment('executor', ['failed'])
         self.run_rollback(success=False)
-        done = ['batcher', 'l1-indexer', 'da-store', 'da-watcher', 'validator', 'notifier', 'state-mirror']
+        done = ['sequencer', 'batcher', 'l1-indexer', 'da-store', 'da-watcher', 'validator', 'notifier', 'state-mirror']
         self.assertEqual(self.record()['attempt']['rolled_back'], done)
         self.assertEqual(self.record()['attempt']['status'], 'accepted', 'the rollback is not complete')
         self.assertEqual(self.api.state['writes'], [f'revert:{job}:0' for job in done + ['executor']])
@@ -2378,11 +2383,11 @@ class RollbackTest(Deploys):
         output = self.run_rollback()
         self.assertIn('executor is at version 2, the pre-release definition', output)
         self.assertEqual(self.api.state['writes'],
-                         ['revert:ingress:0', 'revert:redis:0', 'revert:sequencer:0', 'cluster', 'cluster', 'cluster', 'revert:aeron:0',
+                         ['revert:ingress:0', 'revert:redis:0', 'cluster', 'cluster', 'cluster', 'revert:aeron:0',
                           'revert:data-dirs:0'])
         self.assertEqual(self.record()['attempt']['status'], 'rolled_back')
         self.assertEqual(self.record()['attempt']['rolled_back'],
-                         done + ['executor', 'ingress', 'redis', 'sequencer', 'cluster', 'aeron', 'data-dirs'])
+                         done + ['executor', 'ingress', 'redis', 'cluster', 'aeron', 'data-dirs'])
 
     def test_a_rollback_does_not_cross_the_floor(self):
         self.gate_formats([{'rule': 'rollback', 'id': 'state-db', 'head': 4, 'base': 3}])
