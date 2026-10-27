@@ -153,7 +153,8 @@ jobs:
     name: nomad job validate
     runs-on: ubuntu-latest
     needs: deploy-tests
-    if: always()
+    # Failed parts still report failure; a cancelled workflow releases its slot.
+    if: ${{ !cancelled() }}
     steps:
       - name: Every part passed
         run: |
