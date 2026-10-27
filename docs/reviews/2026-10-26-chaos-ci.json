@@ -796,6 +796,28 @@
       "observed": "The staging job declares v2_loop=true. Construction enters the legacy startup resync and sets its gauge to1. V2 never runs that observer. The lapse oracle accepts the stale active gauge as evidence even without fresh publication by the affected replica.",
       "change": "Choose startup metrics by the configured loop. Require fresh V2 publication progress after thaw, with full process-start precision and a new floor after restart. Keep legacy guard checks and all receipt/state proof.",
       "status": "Local regressions and workspace style pass. Full runtime validation remains required."
+    },
+    {
+      "id": "mirror-scan-pause-escapes-on-promotion",
+      "classification": "harness",
+      "case": "mirror-kill-rebuild",
+      "workflow_run": 40458018122,
+      "job": 122041411237,
+      "issue": 860,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40458018122/job/122041411237",
+      "observed": "All three scans report failed writes with no completion at06:43:06. Sentinel promotes the unpaused replica at06:43:08. All scans complete by06:43:09, before the intended kill. The current serving check rejects the lost fault. The first four cache cases pass; the shard remains failed.",
+      "cause": "CLIENT PAUSE WRITE covers one Redis server. Sentinel promotion directs mirror writes to the unpaused data node.",
+      "change": "Capture one running data allocation in each Redis group. Wait for cold coverage on both before the pause. Pause both and clean up both even when one command fails. Require cold heads on both before the kill. Keep the existing scan/retry/serving/process, forced-kill, replacement-rebuild, reader, receipt and exact-state gates.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "deadlines": "The whole exercise retains its nine-minute deadline, the pause expires after ten minutes, and existing recovery budgets stay unchanged. The initial replica-flush observation has a sixty-second bound within the existing exercise deadline.",
+      "verification": [
+        "Real Redis before/after promotion controls reproduce the old write escape. Both-node pause blocks the Lua write and preserves cold heads and readable PING/EXISTS across promotion. Cleanup restores writes.",
+        "248 chaos library tests pass; two manual profiles remain ignored.",
+        "Workspace just style passes with no warnings."
+      ],
+      "status": "Local fix; full runtime validation remains required. No main merge or staging rollout."
     }
   ],
   "coverage": [
@@ -1678,7 +1700,7 @@
       "baseline_run": 40446103527,
       "candidate_branch": "profile/v2-pause-candidate-20261027",
       "candidate_head": "3a025e7d171f100469af4b92ccd4c907032744fa",
-      "candidate_run": null,
+      "candidate_run": 40458996247,
       "method": "The same load harness runs fresh reference and V2 clusters. Only four sequencer production source files differ between runtime conditions. Each profile branch narrows the regular matrix to the existing load job. These runs cannot qualify for a complete green round. Finish baseline before dispatching candidate; retain failures and all reports.",
       "measurement_validity": "Require zero unlanded/missing/bad-status/bad-receipt counts and offered==accepted==receipted, regardless of a legacy pass flag. Compare measured counts per paced second alongside configured target and p50/p95/p99; target TPS is not measured throughput."
     },

@@ -7,10 +7,8 @@ use std::num::NonZeroU64;
 use std::time::Duration;
 
 use super::rebuilds::{MirrorRebuilds, RebuildPhase};
-use super::{
-    CacheRecovery, MIRROR_ALLOCS, MIRROR_HEAD_KEYS, MIRROR_WRITE_RETRIES, aux, freeze_and_flush,
-    live_primary, redis_cli,
-};
+use super::write_pause::WritePause;
+use super::{CacheRecovery, MIRROR_ALLOCS, MIRROR_WRITE_RETRIES, freeze_and_flush, live_primary};
 use crate::harness::Harness;
 use crate::inject::Killed;
 use crate::nomad::SavedJob;
@@ -18,8 +16,6 @@ use crate::rpc::Rpc;
 
 const CTX: &str = "mirror-kill-rebuild";
 const TASK: &str = "state-mirror";
-/// The pause also expires if the test process dies before cleanup.
-const PAUSE_MS: u64 = 600_000;
 /// The ingress-churn reserve is unused by cache-shard workloads.
 const FAULT_ACCOUNT: u32 = 16;
 
@@ -68,6 +64,7 @@ pub(super) struct InterruptedRebuild<'a> {
     h: &'a mut Harness,
     saved: SavedJob,
     primary: String,
+    writes: WritePause,
     baseline: MirrorRebuilds,
     blocked: Option<MirrorRebuilds>,
     targets: Vec<Target>,
@@ -80,11 +77,13 @@ impl InterruptedRebuild<'_> {
         let coverage = CacheRecovery::capture(h).await?;
         let saved = SavedJob::capture(&h.nomad, TASK).await?;
         let primary = live_primary(h, CTX).await?;
+        let writes = WritePause::capture(h).await?;
         let baseline = MirrorRebuilds::read(h).await?;
         let mut fault = InterruptedRebuild {
             h,
             saved,
             primary,
+            writes,
             baseline,
             blocked: None,
             targets: Vec::new(),
@@ -94,7 +93,7 @@ impl InterruptedRebuild<'_> {
             .await
             .context("mirror scan interruption exceeds nine minutes")
             .and_then(std::convert::identity);
-        let unpaused = fault.command("CLIENT UNPAUSE").await;
+        let unpaused = fault.writes.unpause(fault.h).await;
         let restored = fault.saved.restore().await;
         let report = fault.report(&verdict, &unpaused, &restored);
         for error in [unpaused.as_ref().err(), restored.as_ref().err()]
@@ -124,9 +123,8 @@ impl InterruptedRebuild<'_> {
             flushed == self.primary,
             "{CTX}: primary changed before the write pause"
         );
-        self.require_cold_heads().await?;
-        self.command(&format!("CLIENT PAUSE {PAUSE_MS} WRITE"))
-            .await?;
+        self.writes.await_cold(self.h).await?;
+        self.writes.pause(self.h).await?;
         self.saved.restore().await?;
         self.capture_targets().await?;
         self.blocked = Some(
@@ -138,22 +136,13 @@ impl InterruptedRebuild<'_> {
         super::wait_readers_degraded(self.h, CTX).await?;
         self.prove_traffic().await?;
         self.verify_targets().await?;
-        self.require_cold_heads().await?;
+        self.writes.require_cold(self.h).await?;
         crate::log(format!(
             "{CTX}: every mirror is inside an unfinished checkpoint scan with a failed write; killing {} tasks",
             self.targets.len()
         ));
         self.kill_targets().await?;
         self.saved.stop().await
-    }
-
-    async fn command(&self, command: &str) -> anyhow::Result<()> {
-        let answer = self.request(command).await?;
-        anyhow::ensure!(
-            answer.trim() == "OK",
-            "{CTX}: Redis rejects {command}: {answer}"
-        );
-        Ok(())
     }
 
     async fn verify_targets(&mut self) -> anyhow::Result<()> {
@@ -171,30 +160,8 @@ impl InterruptedRebuild<'_> {
                 .await?,
         );
         crate::log(format!(
-            "{CTX}: a transfer from the unused cache-shard reserve {FAULT_ACCOUNT} receipts while all mirror scans remain blocked"
+            "{CTX}: a transfer from the unused cache-shard reserve {FAULT_ACCOUNT} receipts before the final blocked-scan check"
         ));
-        Ok(())
-    }
-
-    async fn request(&self, command: &str) -> anyhow::Result<String> {
-        self.h
-            .nodes
-            .exec(
-                &aux(self.h),
-                &redis_cli(&format!("--raw -h {} -p 6379 {command}", self.primary)),
-            )
-            .await
-    }
-
-    async fn require_cold_heads(&self) -> anyhow::Result<()> {
-        let heads: usize = self
-            .request(&format!("EXISTS {MIRROR_HEAD_KEYS}"))
-            .await?
-            .parse()?;
-        anyhow::ensure!(
-            heads == 0,
-            "{CTX}: a fresh head exists before the rebuild completes"
-        );
         Ok(())
     }
 
@@ -254,9 +221,10 @@ impl InterruptedRebuild<'_> {
     ) -> anyhow::Result<()> {
         let report = serde_json::json!({
             "case": CTX,
-            "fault": "CLIENT PAUSE WRITE; kill every mirror after its scan reports a failed write and before completion",
-            "max_pause_ms": PAUSE_MS,
+            "fault": "CLIENT PAUSE WRITE on both data nodes; kill every mirror after its scan reports a failed write and before completion",
+            "max_pause_ms": WritePause::MAX_MS,
             "primary": self.primary,
+            "paused_data_nodes": self.writes,
             "baseline": self.baseline,
             "blocked": self.blocked,
             "targets": self.targets,

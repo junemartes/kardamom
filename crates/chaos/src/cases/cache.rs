@@ -27,6 +27,7 @@ use crate::rpc::Rpc;
 mod backlog;
 mod coverage;
 mod interrupted;
+mod write_pause;
 pub(crate) use backlog::client_restart;
 mod rebuilds;
 pub(crate) use coverage::CacheRecovery;
