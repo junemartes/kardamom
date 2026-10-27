@@ -29,27 +29,26 @@ use crate::metrics;
 use crate::outbound::DropPublisher;
 use crate::v2::AccountEvent;
 
-/// The kept decision version of the sealer, shared between the egress feed
-/// thread, which writes it, and the publish loop, which reads it to choose
-/// the shape of each offer. The default starts at 0. Its session generation
-/// survives a full account-event queue, so an idle loop with unconfirmed
-/// offers can recover without new client traffic.
+/// The kept decision version and session generation of the sealer. The
+/// egress feed writes them. The publish loop reads the version to choose
+/// each offer and samples the generation to recover idle offers. Both
+/// values start at zero.
 #[derive(Clone, Default)]
-pub struct SealerVersion(Arc<SharedRules>);
+pub struct SealerVersion(Arc<KeptRules>);
 
 #[derive(Default)]
-struct SharedRules {
+struct KeptRules {
     version: AtomicU8,
-    generation: AtomicU64,
+    sessions: AtomicU64,
 }
 
 impl SealerVersion {
     /// A version that starts at `floor`, before the first report.
     #[must_use]
     pub fn starting_at(floor: u8) -> Self {
-        Self(Arc::new(SharedRules {
+        Self(Arc::new(KeptRules {
             version: AtomicU8::new(floor),
-            generation: AtomicU64::new(0),
+            sessions: AtomicU64::new(0),
         }))
     }
 
@@ -61,13 +60,13 @@ impl SealerVersion {
         self.0.version.load(Ordering::Acquire)
     }
 
-    pub(crate) fn generation(&self) -> u64 {
-        self.0.generation.load(Ordering::Acquire)
+    fn session_started(&self) {
+        // Only change detection uses this counter, so wrapping starts a new generation.
+        self.0.sessions.fetch_add(1, Ordering::Release);
     }
 
-    fn next_session(&self) {
-        // Generations identify changes; wrapping preserves that meaning.
-        self.0.generation.fetch_add(1, Ordering::Release);
+    pub(crate) fn session_generation(&self) -> u64 {
+        self.0.sessions.load(Ordering::Acquire)
     }
 
     /// Whether the kept version is 4 or newer: the sealer then orders a
@@ -138,7 +137,7 @@ impl<D: DropPublisher> SealerRules<D> {
             .map(|(_, version)| version);
         self.publish(report.unwrap_or(self.shared.get()));
         if changed {
-            self.shared.next_session();
+            self.shared.session_started();
         }
     }
 

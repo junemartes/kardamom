@@ -295,11 +295,11 @@ impl Shard {
                 ..DeployVars::default()
             },
             Self::Carry => DeployVars {
-                cluster_snapshot_interval_s: Some(60),
-                cluster_retention: Some(CARRY_RETENTION),
                 l1_fault_proxy: true,
                 indexer_poll_s: Some(2),
                 da_watcher_silence_s: Some(30),
+                cluster_snapshot_interval_s: Some(60),
+                cluster_retention: Some(CARRY_RETENTION),
                 carry: CarrySwitches {
                     exec_on_sealers: true,
                     egress: EgressStage::On,

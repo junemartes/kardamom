@@ -649,6 +649,7 @@ impl V2Wiring {
         );
         admission.enable_fees(fees);
         admission.enable_positioned_refs(sealer_version);
+        admission.enable_pause(process().subscribe());
         if let Some(verdicts) = self.verdicts {
             admission.enable_verdicts(verdicts);
         }

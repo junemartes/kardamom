@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 
-use super::rebuilds::MirrorRebuilds;
-use super::{aux, live_primary, redis_cli, wait_readers_recovered};
+use super::rebuilds::{MirrorRebuilds, RebuildPhase};
+use super::{MIRROR_HEAD_KEYS, aux, live_primary, redis_cli, wait_readers_recovered};
 use crate::harness::Harness;
 use crate::metrics;
 use crate::nomad::SavedJob;
@@ -17,7 +17,6 @@ use crate::rpc::{AccountState, Rpc};
 const CTX: &str = "mirror-backlog-client-restart";
 /// The fixture uses the service default of 8192 canonical positions.
 const STALE_GAP: i64 = 8_192;
-const HEAD_KEYS: &str = "head:0 head:1 head:2";
 
 struct Baseline {
     primary: String,
@@ -65,13 +64,13 @@ impl Baseline {
     }
 
     async fn capture(h: &Harness) -> anyhow::Result<Self> {
-        let account = Self::transfer_committed(h).await?;
+        let account = AccountState::after_transfer(h, h.knobs.gate_account).await?;
         let primary = live_primary(h, CTX).await?;
         let raw = h
             .nodes
             .exec(
                 &aux(h),
-                &redis_cli(&format!("--raw -h {primary} MGET {HEAD_KEYS}")),
+                &redis_cli(&format!("--raw -h {primary} MGET {MIRROR_HEAD_KEYS}")),
             )
             .await?;
         let baseline = Self {
@@ -82,27 +81,6 @@ impl Baseline {
         };
         baseline.await_row(h, &baseline.account).await?;
         Ok(baseline)
-    }
-
-    async fn transfer_committed(h: &Harness) -> anyhow::Result<AccountState> {
-        let rpc = Rpc::new(&h.rpc_url, h.knobs.chain_id)?;
-        let account = h.knobs.gate_account;
-        let nonce = rpc.nonce_of(account).await?;
-        let committed = nonce
-            .checked_add(1)
-            .context("the fixture nonce overflows")?;
-        rpc.transfer_hash(account, nonce, Duration::from_secs(60))
-            .await?;
-        Self::executor(h)?
-            .await_account_nonce(account, committed, Budget::secs(120, 1))
-            .await
-    }
-
-    fn executor(h: &Harness) -> anyhow::Result<Rpc> {
-        Rpc::new(
-            &format!("http://{}:9024", h.probes.executors[0].ip),
-            h.knobs.chain_id,
-        )
     }
 
     async fn row(&self, h: &Harness) -> anyhow::Result<String> {
@@ -118,18 +96,18 @@ impl Baseline {
     }
 
     async fn await_row(&self, h: &Harness, account: &AccountState) -> anyhow::Result<()> {
-        let last = std::cell::RefCell::new(String::new());
+        let last = std::cell::RefCell::new(String::from("no row response"));
         let last_ref = &last;
         poll::until(Budget::secs(120, 2), |_| async move {
             let observed = self.row(h).await?;
-            let matches = account.matches_projection(&observed);
+            let complete = account.matches_projection(&observed);
             last_ref.replace(observed);
-            Ok::<_, anyhow::Error>(matches.then_some(()))
+            Ok::<_, anyhow::Error>(complete.then_some(()))
         })
         .await?
-        .or_fail(|_| crate::chaos_fail!(
-            "{CTX}: exact account row is not projected on {}: expected {account:?}, observed {:?}",
-            self.primary, last.borrow()
+        .or_fail(|elapsed| crate::chaos_fail!(
+            "{CTX}: exact account row is not projected after {}s: expected {account:?}, observed {:?}, primary {}",
+            elapsed.as_secs(), last.borrow(), self.primary
         ))?;
         Ok(())
     }
@@ -148,7 +126,19 @@ impl Baseline {
                 )),
             )
             .await?;
-        let expected = Self::transfer_committed(h).await?;
+        Rpc::new(&h.rpc_url, h.knobs.chain_id)?
+            .transfer_hash(
+                h.knobs.gate_account,
+                self.account.nonce,
+                Duration::from_secs(60),
+            )
+            .await?;
+        let floor = self
+            .account
+            .nonce
+            .checked_add(1)
+            .context("established sender nonce overflows")?;
+        let expected = AccountState::replicated(h, h.knobs.gate_account, floor).await?;
         anyhow::ensure!(
             expected.nonce > self.account.nonce && expected.balance < self.account.balance,
             "{CTX}: the executor did not commit the established sender's transfer"
@@ -196,7 +186,7 @@ impl Baseline {
             self.account
         );
         anyhow::ensure!(
-            after.stale >= before.stale.saturating_add(2) && after.live == before.live,
+            after.proves_bypass(&before),
             "{CTX}: nonce and balance did not both bypass stale Redis on a local miss: {before:?} -> {after:?}"
         );
         anyhow::ensure!(
@@ -207,7 +197,10 @@ impl Baseline {
             .nodes
             .exec(
                 &aux(h),
-                &redis_cli(&format!("--raw -h {} MGET {HEAD_KEYS}", self.primary)),
+                &redis_cli(&format!(
+                    "--raw -h {} MGET {MIRROR_HEAD_KEYS}",
+                    self.primary
+                )),
             )
             .await?;
         anyhow::ensure!(
@@ -224,7 +217,9 @@ impl Baseline {
 #[derive(Debug)]
 struct Reader {
     stale: i64,
-    live: i64,
+    live_hits: i64,
+    live_misses: i64,
+    redis_hits: i64,
 }
 
 impl Reader {
@@ -235,12 +230,38 @@ impl Reader {
             .fetch(&h.probes.ingress_target(ingress))
             .await
             .context("restart client exporter is unavailable")?;
-        Ok(Self {
-            stale: metrics::sum_where(&body, "kardamom_cache_degraded_total", "reason=\"stale\"")
+        Ok(Self::parse(&body))
+    }
+
+    fn parse(body: &str) -> Self {
+        Self {
+            stale: metrics::sum_where(body, "kardamom_cache_degraded_total", "reason=\"stale\"")
                 .unwrap_or(0),
-            live: metrics::sum_where(&body, "kardamom_cache_lookups_total", "layer=\"live\"")
-                .unwrap_or(0),
-        })
+            live_hits: Self::lookups(body, "live", "hit"),
+            live_misses: Self::lookups(body, "live", "miss"),
+            redis_hits: Self::lookups(body, "redis", "hit"),
+        }
+    }
+
+    fn lookups(body: &str, layer: &str, outcome: &str) -> i64 {
+        let matching = body
+            .lines()
+            .filter(|line| line.contains(&format!("outcome=\"{outcome}\"")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        metrics::sum_where(
+            &matching,
+            "kardamom_cache_lookups_total",
+            &format!("layer=\"{layer}\""),
+        )
+        .unwrap_or(0)
+    }
+
+    fn proves_bypass(&self, before: &Self) -> bool {
+        self.stale >= before.stale.saturating_add(2)
+            && self.live_misses >= before.live_misses.saturating_add(2)
+            && self.live_hits == before.live_hits
+            && self.redis_hits == before.redis_hits
     }
 }
 
@@ -252,7 +273,7 @@ pub(crate) async fn client_restart(h: &mut Harness) -> anyhow::Result<()> {
         .nodes
         .exec(
             &aux(h),
-            &redis_cli(&format!("-h {} DEL {HEAD_KEYS}", baseline.primary)),
+            &redis_cli(&format!("-h {} DEL {MIRROR_HEAD_KEYS}", baseline.primary)),
         )
         .await;
     let restored = mirrors.restore().await;
@@ -277,7 +298,10 @@ pub(crate) async fn client_restart(h: &mut Harness) -> anyhow::Result<()> {
     cleared?;
     restored?;
     saved?;
-    baseline.rebuilds.await_all(h, CTX).await?;
+    baseline
+        .rebuilds
+        .await_phase(h, CTX, RebuildPhase::Complete)
+        .await?;
     baseline.await_row(h, &expected).await?;
     wait_readers_recovered(h, CTX).await?;
     h.assert_progress().await
@@ -285,7 +309,7 @@ pub(crate) async fn client_restart(h: &mut Harness) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Heads;
+    use super::{Heads, Reader};
 
     #[test]
     fn held_heads_require_three_complete_positive_position_tags() {
@@ -304,5 +328,24 @@ mod tests {
         ] {
             assert!(Heads::parse(raw).is_err());
         }
+    }
+
+    #[test]
+    fn a_nonce_and_balance_fallback_needs_two_misses_and_no_cache_hit() {
+        let before = Reader::parse("# exporter is live\n");
+        let body = concat!(
+            "kardamom_cache_degraded_total{reason=\"stale\"} 2\n",
+            "kardamom_cache_lookups_total{outcome=\"miss\",layer=\"live\"} 2\n",
+        );
+        assert!(Reader::parse(body).proves_bypass(&before));
+        for extra in [
+            "kardamom_cache_lookups_total{layer=\"live\",outcome=\"hit\"} 1\n",
+            "kardamom_cache_lookups_total{layer=\"redis\",outcome=\"hit\"} 1\n",
+        ] {
+            assert!(!Reader::parse(&format!("{body}{extra}")).proves_bypass(&before));
+        }
+        assert!(!Reader::parse(&body.replace("stale\"} 2", "stale\"} 1")).proves_bypass(&before));
+        assert!(!Reader::parse(&body.replace("live\"} 2", "live\"} 1")).proves_bypass(&before));
+        assert!(!Reader::parse("").proves_bypass(&before));
     }
 }

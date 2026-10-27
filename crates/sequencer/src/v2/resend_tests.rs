@@ -16,6 +16,9 @@ use crate::outbound::fakes::InMemorySidePublisher;
 use crate::sealer_rules::{SealerRules, SealerVersion};
 use crate::testkit::{Rig, one_partition_cfg, pos, signed_envelope, signer};
 
+#[path = "pause_tests.rs"]
+mod pause_tests;
+
 /// A loop that keeps the version of `shared`, with room in its outbox for
 /// every offer of a test, and a sender with the chain nonce 0.
 struct Bench {
@@ -74,16 +77,44 @@ impl Bench {
     /// Send the transaction at `nonce`, at its own place in the image, and
     /// run the loop until it is idle.
     fn send(&mut self, nonce: u64) {
+        self.queue(nonce);
+        self.run();
+    }
+
+    fn queue(&mut self, nonce: u64) {
         let at = pos(64 * (i32::try_from(nonce).unwrap() + 1));
         self.rig.push(
             TxDataLoc::new(7, at),
             signed_envelope(&self.signer, nonce, 1),
         );
-        self.run();
     }
 
     fn run(&mut self) {
         while self.l.run_once(&mut self.rig.ports()).unwrap() {}
+    }
+
+    fn confirm_first(&self) {
+        self.accounts
+            .send(AccountEvent::Rows {
+                block: 2,
+                rows: vec![(
+                    self.sender(),
+                    AccountState {
+                        nonce: 1,
+                        balance: U256::from(10u64).pow(U256::from(24u64)),
+                        delegated: false,
+                        tx_idx: 2,
+                    },
+                )],
+            })
+            .unwrap();
+    }
+
+    fn sweep(&mut self) {
+        self.l.last_sweep = std::time::Instant::now()
+            .checked_sub(self.l.cfg.sweep_every)
+            .unwrap();
+        self.run();
     }
 
     /// The nonce of each offer so far, and whether it carries the bytes.
@@ -200,18 +231,7 @@ fn a_new_session_does_not_offer_a_confirmed_transaction_again() {
     let mut b = Bench::new(SealerVersion::starting_at(5));
     b.send(0);
     b.send(1);
-    let confirmed = AccountState {
-        nonce: 1,
-        balance: U256::from(10u64).pow(U256::from(24u64)),
-        delegated: false,
-        tx_idx: 2,
-    };
-    b.accounts
-        .send(AccountEvent::Rows {
-            block: 2,
-            rows: vec![(b.sender(), confirmed)],
-        })
-        .unwrap();
+    b.confirm_first();
     *b.rig.refs.new_session.lock().unwrap() = true;
     b.send(2);
     let nonces: Vec<u64> = b.offers().iter().map(|(n, _)| *n).collect();
@@ -251,4 +271,53 @@ fn a_contiguity_reject_for_a_nonce_out_of_the_run_offers_nothing() {
         .unwrap();
     b.run();
     assert_eq!(b.offers().len(), 2);
+}
+
+#[test]
+fn a_new_session_reoffers_an_idle_unconfirmed_sender_without_new_input() {
+    let shared = SealerVersion::starting_at(5);
+    let mut rules = SealerRules::new(0, shared.clone(), InMemorySidePublisher::default());
+    rules.on_session_start(1);
+    let mut b = Bench::new(shared);
+    b.send(0);
+    b.send(1);
+    assert!(b.l.outbox.is_empty());
+    assert_eq!(b.offers(), [(0, true), (1, true)]);
+    *b.rig.refs.new_session.lock().unwrap() = true;
+    rules.on_session_start(2);
+    b.sweep();
+    b.run();
+    assert_eq!(b.offers(), [(0, true), (1, true), (0, true), (1, true)]);
+}
+
+#[test]
+fn a_session_sweep_retries_only_the_unconfirmed_suffix_once() {
+    let shared = SealerVersion::starting_at(5);
+    let mut rules = SealerRules::new(0, shared.clone(), InMemorySidePublisher::default());
+    rules.on_session_start(1);
+    let mut b = Bench::new(shared);
+    b.send(0);
+    b.send(1);
+    b.confirm_first();
+    rules.on_session_start(2);
+    rules.on_session_start(3);
+    *b.rig.refs.new_session.lock().unwrap() = true;
+    b.sweep();
+    b.run();
+    b.sweep();
+    assert_eq!(b.offers(), [(0, true), (1, true), (1, true)]);
+}
+
+#[test]
+fn a_healthy_session_sweep_and_a_version_report_do_not_repeat_offers() {
+    let shared = SealerVersion::starting_at(5);
+    let mut rules = SealerRules::new(0, shared.clone(), InMemorySidePublisher::default());
+    rules.on_session_start(1);
+    let mut b = Bench::new(shared);
+    b.send(0);
+    b.send(1);
+    b.sweep();
+    rules.on_sealer_info(1, 4);
+    b.sweep();
+    assert_eq!(b.offers(), [(0, true), (1, true)]);
 }

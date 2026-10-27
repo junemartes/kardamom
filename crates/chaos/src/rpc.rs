@@ -216,24 +216,6 @@ impl Rpc {
             .await
     }
 
-    /// A receipt precedes the state DB commit. A state expectation waits
-    /// for the idle sender's exact post-transfer nonce before it captures
-    /// the balance from that DB.
-    pub(crate) async fn await_account_nonce(
-        &self,
-        account: u32,
-        nonce: u64,
-        budget: Budget,
-    ) -> anyhow::Result<AccountState> {
-        poll::until(budget, |_| async move {
-            let state = self.account_state(account).await?;
-            Ok::<_, anyhow::Error>((state.nonce == nonce).then_some(state))
-        })
-        .await?
-        .or_fail(|_| anyhow::anyhow!("account #{account} does not commit nonce {nonce}"))
-        .map(|(state, _)| state)
-    }
-
     pub(crate) async fn account_state_at(&self, address: Address) -> anyhow::Result<AccountState> {
         let nonce = self.nonce_at(address).await?;
         let value = self

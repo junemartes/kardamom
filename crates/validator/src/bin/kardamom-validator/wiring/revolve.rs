@@ -30,6 +30,8 @@ pub(crate) enum Verdict {
     /// A peer checkpoint is staged and the stale state parked: run the
     /// pipeline again, which adopts it.
     Revolve,
+    /// The source reconnects: reopen the pipeline from its committed state.
+    Restart,
     /// A proven divergence, with its reason: the process holds, halted,
     /// until an operator clears it, then runs the pipeline again from
     /// its cursor.
@@ -51,6 +53,9 @@ pub(crate) fn verdict(outcome: &EngineOutcome, repaired: Option<&str>) -> Verdic
         // fault. Any other engine failure is an availability problem,
         // not an integrity one, and must not look like one.
         EngineOutcome::Diverged(reason) => Verdict::Halt(reason.clone()),
+        EngineOutcome::Failed(kardamom_engine::ExecutorError::SourceRestarted { .. }) => {
+            Verdict::Restart
+        }
         EngineOutcome::Failed(_) | EngineOutcome::Panicked => match repaired {
             Some("peer-checkpoint") => Verdict::Revolve,
             _ => Verdict::Exit(1),
@@ -106,6 +111,9 @@ fn persist_divergence(boot: &Boot, outcome: &EngineOutcome) {
 /// for a refused replay.
 fn repair(boot: &Boot, end: &RunEnd) -> Result<Option<&'static str>> {
     let cause = match &end.outcome {
+        EngineOutcome::Failed(kardamom_engine::ExecutorError::SourceRestarted { .. }) => {
+            return Ok(None);
+        }
         EngineOutcome::Failed(e) => Some(e),
         EngineOutcome::Panicked => None,
         EngineOutcome::Clean | EngineOutcome::Diverged(_) => return Ok(None),
@@ -134,6 +142,18 @@ pub(crate) async fn turn(boot: &Boot, revolutions: &mut u32) -> Result<ControlFl
     match revolution(boot).await? {
         Verdict::Done => return Ok(ControlFlow::Break(())),
         Verdict::Exit(status) => exit(status),
+        Verdict::Restart => {
+            tokio::select! {
+                () = boot.stop.cancelled() => return Ok(ControlFlow::Break(())),
+                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => (),
+            }
+            *revolutions = revolutions.saturating_add(1);
+            tracing::info!(
+                revolutions,
+                "the source reconnects; the pipeline starts from committed state in-process"
+            );
+            return Ok(ControlFlow::Continue(()));
+        }
         Verdict::Halt(reason) => {
             if super::halted::Halted::of(boot)
                 .hold_on(boot, reason)
@@ -178,6 +198,16 @@ fn exit(status: i32) -> ! {
 mod tests {
     use super::*;
     use kardamom_engine::ExecutorError;
+
+    #[test]
+    fn a_source_reconnect_reopens_committed_state_without_a_checkpoint_repair() {
+        let outcome = EngineOutcome::Failed(ExecutorError::SourceRestarted {
+            next_index: 28_978,
+            next_block: 471,
+        });
+        assert_eq!(verdict(&outcome, None), Verdict::Restart);
+        assert_eq!(verdict(&outcome, Some("unrecoverable")), Verdict::Restart);
+    }
 
     #[test]
     fn verdict_revolves_only_on_a_staged_checkpoint() {

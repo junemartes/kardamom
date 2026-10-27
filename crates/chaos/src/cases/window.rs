@@ -58,7 +58,10 @@ impl Case {
                 inject + k.restart_slo + Duration::from_mins(5)
             }
             // The mirrors restart, wait for a checkpoint, and rebuild.
-            Self::MirrorKillRebuild => inject + k.restart_slo + Duration::from_mins(10),
+            // The interrupted scan includes two full job starts and a new rebuild.
+            Self::MirrorKillRebuild => inject
+                .saturating_add(k.restart_slo)
+                .saturating_add(Duration::from_mins(25)),
             Self::MirrorBacklogClientRestart => inject + k.restart_slo + Duration::from_mins(15),
             // The node replacement; the Redis loss and three rebuilds; the
             // total wipe, the rebuild from L1 and the install; or the

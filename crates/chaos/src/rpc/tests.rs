@@ -19,54 +19,6 @@ const NEXT_NONCE: u64 = 5;
 const ACCOUNT: u32 = 3;
 
 #[tokio::test]
-async fn a_receipted_transfer_waits_for_its_committed_nonce_and_balance() {
-    let reads = Arc::new(AtomicUsize::new(0));
-    let mut module = RpcModule::new(Arc::clone(&reads));
-    module
-        .register_method("eth_getTransactionCount", |_, reads, _| {
-            if reads.fetch_add(1, Ordering::Relaxed) == 0 {
-                "0x5"
-            } else {
-                "0x6"
-            }
-        })
-        .unwrap();
-    module
-        .register_method("eth_getBalance", |_, reads, _| {
-            if reads.load(Ordering::Relaxed) < 2 {
-                "0x64"
-            } else {
-                "0x63"
-            }
-        })
-        .unwrap();
-    let server = Server::builder().build("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", server.local_addr().unwrap());
-    let handle = server.start(module);
-    let state = Rpc::new(&url, 1)
-        .unwrap()
-        .await_account_nonce(
-            ACCOUNT,
-            6,
-            Budget::new(Duration::from_secs(1), Duration::from_millis(10)),
-        )
-        .await
-        .unwrap();
-    assert_eq!(state.nonce, 6);
-    assert_eq!(state.balance, U256::from(99));
-    assert!(reads.load(Ordering::Relaxed) >= 2);
-    assert!(
-        Rpc::new(&url, 1)
-            .unwrap()
-            .await_account_nonce(ACCOUNT, 7, Budget::new(Duration::ZERO, Duration::ZERO))
-            .await
-            .is_err(),
-        "another nonce cannot satisfy the exact commit fence"
-    );
-    handle.stop().unwrap();
-}
-
-#[tokio::test]
 async fn an_account_read_keeps_the_full_balance_quantity() {
     let mut module = RpcModule::new(());
     module

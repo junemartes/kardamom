@@ -1,6 +1,8 @@
 //! What the pipeline must do while the classes of a combined case are
 //! down, and the readings that judge it.
 
+use std::cell::Cell;
+use std::future::Future;
 use std::time::Duration;
 
 use super::Class;
@@ -44,29 +46,23 @@ impl Progress {
     /// or the validator is up through every combined case, so no head at
     /// all is a harness failure.
     async fn read(h: &Harness, ctx: &str) -> anyhow::Result<Self> {
-        let outcome = poll::until(Budget::secs(12, 3), |_| async move {
-            let block = h
-                .probes
-                .executor_progress()
-                .await
-                .max(h.probes.ingress_sealed_head().await)
-                .max(h.probes.val_metric(COMMITTED).await);
-            let boundaries = h.probes.sealer_member_boundaries().await;
-            let applied = h.probes.executor_tx_applied().await;
-            Ok(block.map(|block| Self {
-                block,
-                boundaries,
-                applied,
-            }))
-        })
-        .await?;
-        outcome
-            .or_fail(|_| {
-                crate::chaos_fail!(
-                    "{ctx}: no client reports a head, so the outage cannot be observed"
-                )
-            })
-            .map(|(progress, _)| progress)
+        let observed = Observation::default();
+        Box::pin(observed.read(ctx, || async {
+            tokio::join!(
+                observed.head(h.probes.executor_progress()),
+                observed.head(h.probes.ingress_sealed_head()),
+                observed.head(h.probes.val_metric(COMMITTED)),
+                async {
+                    observed
+                        .boundaries
+                        .set(h.probes.sealer_member_boundaries().await);
+                },
+                async {
+                    observed.applied.set(h.probes.executor_tx_applied().await);
+                },
+            );
+        }))
+        .await
     }
 
     /// Whether the sealers sealed a block since `before`: the head rose,
@@ -86,6 +82,51 @@ impl Progress {
         )
     }
 }
+
+/// Completed reads survive cancellation of slower, independent probes.
+/// Every value comes from a source that answers during this observation.
+#[derive(Default)]
+struct Observation {
+    block: Cell<Option<i64>>,
+    boundaries: Cell<Option<Boundaries>>,
+    applied: Cell<Option<i64>>,
+}
+
+impl Observation {
+    async fn head(&self, read: impl Future<Output = Option<i64>>) {
+        let block = read.await;
+        self.block.set(self.block.get().max(block));
+    }
+
+    fn progress(&self) -> Option<Progress> {
+        self.block.get().map(|block| Progress {
+            block,
+            boundaries: self.boundaries.get(),
+            applied: self.applied.get(),
+        })
+    }
+
+    async fn read<F, Fut>(&self, ctx: &str, mut sample: F) -> anyhow::Result<Progress>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        poll::until(Budget::secs(12, 3), |_| {
+            let pending = sample();
+            async move {
+                pending.await;
+                Ok(self.progress())
+            }
+        })
+        .await?;
+        self.progress().ok_or_else(|| {
+            crate::chaos_fail!("{ctx}: no client reports a head, so the outage cannot be observed")
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests;
 
 /// What the pipeline must do while the classes are down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

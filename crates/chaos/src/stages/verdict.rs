@@ -2,6 +2,7 @@
 //! answers, it keeps up with the executor, it verified blocks against the BAL, it counted no divergence
 //! and halted on none, and the incremental trie matched the rebuild.
 
+use std::cell::RefCell;
 use std::time::Duration;
 
 use crate::evidence;
@@ -20,10 +21,12 @@ const BAL_MISSING: &str = "validator_bal_missing_total";
 const RECEIPT_MISSING: &str = "validator_receipt_missing_total";
 /// The counters that tell a stalled validator from a slow one: a cursor
 /// that does not move, and the waits that timed out with no replica data.
-const STALL_COUNTERS: [&str; 5] = [
+const STALL_COUNTERS: [&str; 7] = [
     COMMITTED,
     VERIFIED,
     SHADOW_CHECKS,
+    DIVERGENCE,
+    SHADOW_MISMATCH,
     BAL_MISSING,
     RECEIPT_MISSING,
 ];
@@ -50,11 +53,7 @@ impl Harness {
             "validator found on {}",
             self.probes.validator.container
         ));
-        let start = self
-            .probes
-            .val_metric_required(COMMITTED, "committed cursor")
-            .await?;
-        let sample = self.wait_validator_sync(start).await?;
+        let sample = self.wait_validator_sync().await?;
         let verified = sample.verified;
         let checks = sample.checks;
         self.assert_no_divergence_halt().await?;
@@ -79,20 +78,30 @@ impl Harness {
         Ok(())
     }
 
-    async fn wait_validator_sync(&self, start: i64) -> anyhow::Result<Sample> {
+    async fn wait_validator_sync(&self) -> anyhow::Result<Sample> {
         let lag_max = self.knobs.stages.validator_lag_max;
         let budget = Budget::new(self.knobs.stages.validator_sync_timeout, POLL_EVERY);
+        let last = RefCell::new(String::new());
         let outcome = poll::until(budget, |_| async {
             let executor = self.probes.executor_progress().await;
-            let body = self
+            let Some(body) = self
                 .probes
                 .scrape()
                 .fetch(&self.probes.validator_target())
-                .await;
-            let sample = body.as_deref().map(Sample::read).transpose()?.flatten();
-            Ok(executor
-                .zip(sample)
-                .filter(|(executor, sample)| executor.saturating_sub(sample.committed) <= lag_max))
+                .await
+            else {
+                *last.borrow_mut() = format!("executor={executor:?}, validator exporter missing");
+                return Ok(None);
+            };
+            *last.borrow_mut() = format!(
+                "executor={executor:?}, validator={:?}",
+                crate::metrics::samples_of_interest(&body, &STALL_COUNTERS)
+            );
+            Ok(Sample::read(&body)?.and_then(|sample| {
+                sample
+                    .synced_with(executor, lag_max)
+                    .map(|executor| (executor, sample))
+            }))
         })
         .await?;
         let Outcome::Ready {
@@ -102,14 +111,15 @@ impl Harness {
         else {
             self.dump_validator_tails().await;
             anyhow::bail!(
-                "validator did not sync with BAL verification and trie shadow-check evidence within {}s (started at {start})",
-                budget.timeout.as_secs()
+                "validator does not sync with BAL and trie verification within {}s ({})",
+                budget.timeout.as_secs(),
+                last.borrow()
             );
         };
-        let validator = sample.committed;
         crate::log(format!(
-            "validator synced: block {validator} vs executor {executor} (lag {} <= {lag_max})",
-            executor.saturating_sub(validator)
+            "validator synced: block {} vs executor {executor} (lag {} <= {lag_max})",
+            sample.committed,
+            executor.saturating_sub(sample.committed)
         ));
         Ok(sample)
     }
@@ -165,6 +175,7 @@ impl Harness {
 }
 
 /// All success and failure counters come from one exporter response.
+#[derive(Debug)]
 struct Sample {
     committed: i64,
     verified: i64,
@@ -174,9 +185,6 @@ struct Sample {
 impl Sample {
     fn read(body: &str) -> anyhow::Result<Option<Self>> {
         use crate::metrics;
-        let committed = metrics::first(body, COMMITTED).unwrap_or(0);
-        let verified = metrics::first(body, VERIFIED).unwrap_or(0);
-        let checks = metrics::first(body, SHADOW_CHECKS).unwrap_or(0);
         anyhow::ensure!(
             metrics::first(body, DIVERGENCE).unwrap_or(0) == 0,
             "validator counted divergence"
@@ -185,6 +193,9 @@ impl Sample {
             metrics::first(body, SHADOW_MISMATCH).unwrap_or(0) == 0,
             "validator counted trie mismatch"
         );
+        let committed = metrics::first(body, COMMITTED).unwrap_or(0);
+        let verified = metrics::first(body, VERIFIED).unwrap_or(0);
+        let checks = metrics::first(body, SHADOW_CHECKS).unwrap_or(0);
         Ok(
             (committed > 0 && verified > 0 && checks > 0).then_some(Self {
                 committed,
@@ -192,6 +203,10 @@ impl Sample {
                 checks,
             }),
         )
+    }
+
+    fn synced_with(&self, executor: Option<i64>, lag_max: i64) -> Option<i64> {
+        executor.filter(|e| e.saturating_sub(self.committed) <= lag_max)
     }
 }
 

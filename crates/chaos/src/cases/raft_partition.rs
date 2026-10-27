@@ -100,21 +100,15 @@ impl Partition {
         let outcome = poll::until(
             Budget::new(h.knobs.leader_slo, Duration::from_secs(2)),
             |_| async move {
-                Ok::<_, anyhow::Error>(
-                    h.evidence
-                        .cluster_elected(Duration::from_secs(3))
-                        .await
-                        .ok()
-                        .filter(|elected| {
-                            elected.leader != self.leader && elected.term > self.term
-                        }),
-                )
+                Ok(h.evidence
+                    .election_once()
+                    .await?
+                    .filter(|elected| elected.leader != self.leader && elected.term > self.term))
             },
         )
         .await?;
-        let (elected, elapsed) = outcome
+        let (new, elapsed) = outcome
             .or_fail(|_| crate::chaos_fail!("{CTX}: the surviving quorum elects no new leader"))?;
-        let new = elected.leader;
         self.assert_live(h).await?;
         Self::transfer(h).await?;
         tokio::time::sleep(HOLD).await;
@@ -123,12 +117,14 @@ impl Partition {
         let dropped_packets = self.assert_dropped(h).await?;
         Check::assert_one_leader(h, CTX).await?;
         crate::log(format!(
-            "{CTX}: member {new} wins after {}s; clients receive receipts with the old member still live",
+            "{CTX}: member {} closes term {} after {}s; clients receive receipts with the old member still live",
+            new.leader,
+            new.term,
             elapsed.as_secs()
         ));
         Ok(Proof {
-            leader: new,
-            term: elected.term,
+            leader: new.leader,
+            term: new.term,
             dropped_packets,
             election_seconds: elapsed.as_secs_f64(),
         })

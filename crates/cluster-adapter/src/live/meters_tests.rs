@@ -86,8 +86,8 @@ fn a_cycle_splits_its_time_into_busy_and_idle() {
         };
         std::thread::sleep(Duration::from_millis(60));
         meters.duties_done(true, &depths);
-        // The meter adds its time to the counters at most every 100 ms.
-        std::thread::sleep(Duration::from_millis(60));
+        // Idle time crosses a full flush interval even if the busy span already flushed.
+        std::thread::sleep(Duration::from_millis(120));
         meters.waited();
     });
     let state = |s: &str| {
