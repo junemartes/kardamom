@@ -24,7 +24,7 @@ fn counts(offered: u64, accepted: u64, receipted: u64, bad: u64) -> Counts {
 /// The clean-run baseline `EvalInput`: 300 offered, accepted, and
 /// receipted with no bad statuses, no missing or unlanded
 /// transactions, no recheck sample, `max_gap` 5, strict delivery,
-/// no feed-ack trust, and soak (non-chaos) mode. Every test below
+/// and soak (non-chaos) mode. Every test below
 /// overrides only the fields its scenario varies, with
 /// `..base_input(&base, &fin)`.
 pub(crate) fn base_input<'a>(base: &'a MetricsSnapshot, fin: &'a MetricsSnapshot) -> EvalInput<'a> {
@@ -38,7 +38,6 @@ pub(crate) fn base_input<'a>(base: &'a MetricsSnapshot, fin: &'a MetricsSnapshot
         recheck: None,
         max_gap: 5,
         assert_all_delivered: true,
-        ack_proves_receipt: false,
         chaos_mode: false,
     }
 }
@@ -210,4 +209,46 @@ fn accepted_completeness_ignores_unlanded() {
     });
     assert!(v.pass, "{:?}", v.failures);
     assert_eq!(v.missing, 0);
+}
+
+#[test]
+fn zero_drop_counters_do_not_excuse_an_unobserved_receipt() {
+    let base = snap(&[("exec-0", 10)], 10).with_zero_drop_counters();
+    let fin = snap(&[("exec-0", 50)], 50).with_zero_drop_counters();
+    let v = evaluate(&EvalInput {
+        counts: counts(300, 300, 299, 0),
+        missing: 1,
+        ..base_input(&base, &fin)
+    });
+    assert!(!v.pass, "an unobserved receipt invalidates the measurement");
+    assert_eq!(v.missing, 1);
+}
+
+#[test]
+fn offered_completeness_never_excuses_an_unacknowledged_offer() {
+    let base = snap(&[("exec-0", 10)], 10).with_zero_drop_counters();
+    let fin = snap(&[("exec-0", 50)], 50).with_zero_drop_counters();
+    let v = evaluate(&EvalInput {
+        counts: counts(300, 297, 297, 0),
+        unlanded: 3,
+        completeness: Completeness::Offered,
+        ..base_input(&base, &fin)
+    });
+    assert!(!v.pass, "these offers have no acknowledgment or receipt");
+    assert_eq!((v.missing, v.unlanded), (3, 3));
+}
+
+impl MetricsSnapshot {
+    fn with_zero_drop_counters(self) -> Self {
+        Self {
+            ingress_received: Some(0),
+            ingress_accepted: Some(0),
+            ingress_rejected: Some(0),
+            ingress_queue_depth: Some(0),
+            seq_dropped_past: Some(0),
+            seq_evictions: Some(0),
+            seq_backpressure: Some(0),
+            ..self
+        }
+    }
 }

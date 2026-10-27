@@ -730,6 +730,21 @@
       "hot_path_changed": false,
       "issue": "https://github.com/junemartes/kardamom/issues/854",
       "status": "The new control fails on PR 853 runtime code and passes after correction. All 16 validator binary tests and workspace style pass locally. This changes only resume cancellation; no healthy transaction-path work is added."
+    },
+    {
+      "id": "receipt-measurement-can-excuse-an-unacknowledged-offer",
+      "classification": "harness measurement",
+      "observed": "With complete zero drop counters and ack_proves_receipt enabled, the benchmark verdict passes one unobserved accepted receipt and also passes three unacknowledged offers under Offered completeness. The combined undelivered count enters a small-tail exception, even though no acknowledgment exists for those offers. The production caller sets that flag whenever subscriptions are disabled.",
+      "change": "Remove the acknowledgment/counter exception and its inferred proof flag. Under assert_all_delivered, every undelivered transaction counted by the selected completeness policy fails. Healthy reference and V2 soak stages select Offered completeness. Fault-case Accepted completeness remains supported.",
+      "product_bug": false,
+      "service_wiring_changed": false,
+      "hot_path_changed": false,
+      "status": "Both controls fail with the complete original zero-counter fixture. All 91 benchmark library tests and workspace style pass after correction. Deployed validation remains pending.",
+      "verification": [
+        "Reject an accepted transaction whose receipt is never observed even when every drop counter is zero.",
+        "Reject an unacknowledged offer under Offered completeness; a blocking-RPC assumption cannot prove its delivery.",
+        "Existing Accepted/Offered policy controls, complete drain deadlines, pending submits, cancellation and receipt identity controls remain green."
+      ]
     }
   ],
   "coverage": [
@@ -972,6 +987,10 @@
       {
         "check": "validator resume cancellation during an open",
         "result": "The exact stopped-discovery error fails before correction. All 16 validator binary controls and workspace style pass after correction."
+      },
+      {
+        "check": "strict receipt measurement",
+        "result": "Two complete zero-counter controls fail before correction, then all 91 benchmark library tests and workspace style pass. Healthy soak now requires every offered transaction. No chain-runtime or healthy submit-path change."
       }
     ],
     "pending": [
@@ -1015,8 +1034,10 @@
       "candidate_branch": "profile/v2-pause-candidate-20261027",
       "candidate_head": "3a025e7d171f100469af4b92ccd4c907032744fa",
       "candidate_run": null,
-      "method": "The same load harness runs fresh reference and V2 clusters. Only four sequencer production source files differ between runtime conditions. Each profile branch narrows the regular matrix to the existing load job. These runs cannot qualify for a complete green round. Finish baseline before dispatching candidate; retain failures and all reports."
-    }
+      "method": "The same load harness runs fresh reference and V2 clusters. Only four sequencer production source files differ between runtime conditions. Each profile branch narrows the regular matrix to the existing load job. These runs cannot qualify for a complete green round. Finish baseline before dispatching candidate; retain failures and all reports.",
+      "measurement_validity": "Require zero unlanded/missing/bad-status/bad-receipt counts and offered==accepted==receipted, regardless of a legacy pass flag. Compare measured counts per paced second alongside configured target and p50/p95/p99; target TPS is not measured throughput."
+    },
+    "historical_reference_load": "docs/benches/2026-10-27-reference-ci-load.json"
   },
   "iterations": [
     {
@@ -1287,6 +1308,20 @@
         "chaos-retention": "DA-lag clear still leaves the case sender without new accepted traffic. Local tests independently reproduce lost unconfirmed runs during a long pause and missing resume retries; deployed cause and complete refusal handling remain under validation.",
         "chaos-carry": "The first six cases pass, including the full deposit fault proof. Window-off-on takes about ten minutes across two checked upgrades; its load ceiling is eight minutes."
       }
+    },
+    {
+      "commit": "2b6a8acd898feb7e15df5b519a4334954f6b3d88",
+      "url": "https://github.com/junemartes/kardamom/pull/853",
+      "cluster_run": 40445346246,
+      "integrity_run": 40445382312,
+      "status": "Diagnostic cluster shards are running. CI 40445346266, Docker 40445346263, chain-semantics 40445346250 and cluster-validate 40445346292 pass on attempt 1. No qualifying frozen-head round; streak 0/10."
+    },
+    {
+      "commit": "db74ce19adaad3382eaa3de1df5fd54e600b4677",
+      "url": "https://github.com/junemartes/kardamom/pull/855",
+      "cluster_run": 40448375718,
+      "integrity_run": 40448394112,
+      "status": "Diagnostic workflows are running. CI 40448375658 and Docker 40448375692 pass; the other supporting workflows and cluster shards are pending. No qualifying frozen-head round; streak 0/10."
     }
   ],
   "integration": {
@@ -1296,19 +1331,13 @@
   },
   "followup_candidate": {
     "workspace": "/home/dev/kardamom-chaos-gaps",
-    "branch": "test/chaos-pause-resume-20261027",
-    "base": "5d8ac285a57f3162a2d8bebe2346d9263335c3ab",
+    "branch": "test/chaos-strict-measurement-20261027",
+    "base": "db74ce19adaad3382eaa3de1df5fd54e600b4677",
     "changes": [
-      "Freeze only forwarded-run loss expiry while paused. On a changed watch that reads clear, reset the loss window and requeue the remaining unconfirmed runs before new intake. Keep confirmations, parked expiry and lookup work active.",
-      "Treat the typed stream-source reset as an in-process reopen from the committed database. After a reset, retry typed catalog-unavailable opens with one-second shutdown-aware waits. First-start configuration failures retain their errors, refused replay still needs its staged checkpoint, and proven divergence still holds for the operator. Mark readiness unavailable outside an active pipeline. Startup owns cancellation before the runtime field. Failed opens cancel every discovery/pump task before dropping runtime handles; the same guard transfers to normal ordered shutdown.",
-      "Make each busy/idle span cross the flush interval independently and assert both positive spans. Bound age by the observed before/after clock readings. Production meter code is unchanged.",
-      "Count live hits and misses separately, independent of label ordering. Require zero new live hits, at least two live misses and two stale bypasses; reject regressed counters. Keep exact account and frozen Redis checks.",
-      "Capture Docker container ID plus StartedAt. Read logs since the observed start. Accept a replacement container or a restart of the same container only when its own process logs prove restore.",
-      "Give each checked upgrade an eight-minute load allowance; compose two allowances for two-upgrade steps, plus existing deploy, provider fault and restart allowances. Stop load when the case completes. Keep runtime proof deadlines and the workflow ceiling.",
-      "Within the existing load job, run identical transfer and DeFi workloads on separate fresh reference and carry/V2 deployments. Read knobs from each actual deployment. Preserve distinct V2 report files and log the topology. No new shard."
+      "Remove the benchmark missing-tail exception based on an assumed blocking acknowledgment and zero drop counters.",
+      "Require Offered completeness for healthy reference and V2 soak stages.",
+      "Retain the historical reference reports and compare achieved rates alongside configured target and client latency."
     ],
-    "status": "Published as draft PR 853. Diagnostic workflows are running. Head is not frozen; streak 0/10. A separate local follow-up corrects incomplete validator recovery samples.",
-    "pull_request": "https://github.com/junemartes/kardamom/pull/853",
-    "commit": "2b6a8acd898feb7e15df5b519a4334954f6b3d88"
+    "status": "Local diagnostic follow-up. Both complete zero-counter controls fail before correction; all 91 benchmark library tests and workspace style pass afterward. No healthy submit-path, chain-runtime or service-wiring changes. Head is not frozen; streak 0/10."
   }
 }

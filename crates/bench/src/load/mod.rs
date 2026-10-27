@@ -399,7 +399,6 @@ impl LoadRun<'_> {
             recheck,
             max_gap: self.cfg.max_gap,
             assert_all_delivered: self.cfg.assert_all_delivered,
-            ack_proves_receipt: !self.cfg.subscribe,
             chaos_mode: self.cfg.chaos_mode,
         })
     }
