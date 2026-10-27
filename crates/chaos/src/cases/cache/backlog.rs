@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 
-use super::rebuilds::{MirrorRebuilds, RebuildPhase};
+use super::rebuilds::{ForcedRebuild, MirrorRebuilds, RebuildPhase};
 use super::{MIRROR_HEAD_KEYS, aux, live_primary, redis_cli, wait_readers_recovered};
 use crate::harness::Harness;
 use crate::metrics;
@@ -152,6 +152,21 @@ impl Baseline {
         Ok(expected)
     }
 
+    async fn rebuild(
+        &self,
+        h: &Harness,
+        mirrors: &SavedJob,
+        expected: &AccountState,
+    ) -> anyhow::Result<()> {
+        let forced = ForcedRebuild::new(mirrors.definition())?;
+        mirrors.register(forced.definition()).await?;
+        self.rebuilds
+            .await_phase(h, CTX, RebuildPhase::Complete)
+            .await?;
+        self.await_row(h, expected).await?;
+        wait_readers_recovered(h, CTX).await
+    }
+
     async fn await_stale(h: &Harness, ingress: &crate::probes::Probed) -> anyhow::Result<()> {
         poll::until(Budget::secs(180, 2), |_| async move {
             let body = h
@@ -276,8 +291,16 @@ pub(crate) async fn client_restart(h: &mut Harness) -> anyhow::Result<()> {
             &redis_cli(&format!("-h {} DEL {MIRROR_HEAD_KEYS}", baseline.primary)),
         )
         .await;
+    let rebuilt = match (&verdict, &cleared) {
+        (Ok(expected), Ok(_)) => baseline.rebuild(h, &mirrors, expected).await,
+        _ => Ok(()),
+    };
     let restored = mirrors.restore().await;
-    for result in [cleared.as_ref().map(|_| ()), restored.as_ref().copied()] {
+    for result in [
+        cleared.as_ref().map(|_| ()),
+        rebuilt.as_ref().copied(),
+        restored.as_ref().copied(),
+    ] {
         Baseline::report_cleanup(result);
     }
     let report = serde_json::json!({
@@ -288,21 +311,18 @@ pub(crate) async fn client_restart(h: &mut Harness) -> anyhow::Result<()> {
         "expected": verdict.as_ref().ok().map(|account| format!("{account:?}")),
         "failure": verdict.as_ref().err().map(|error| format!("{error:#}")),
         "clear_failure": cleared.as_ref().err().map(|error| format!("{error:#}")),
+        "rebuild_failure": rebuilt.as_ref().err().map(|error| format!("{error:#}")),
         "restore_failure": restored.as_ref().err().map(|error| format!("{error:#}")),
     });
     let saved = std::fs::write(
         "/tmp/chaos-mirror-backlog-client-restart-fault.json",
         serde_json::to_vec_pretty(&report)?,
     );
-    let expected = verdict?;
+    verdict?;
     cleared?;
+    rebuilt?;
     restored?;
     saved?;
-    baseline
-        .rebuilds
-        .await_phase(h, CTX, RebuildPhase::Complete)
-        .await?;
-    baseline.await_row(h, &expected).await?;
     wait_readers_recovered(h, CTX).await?;
     h.assert_progress().await
 }

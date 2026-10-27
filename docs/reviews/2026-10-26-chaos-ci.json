@@ -571,7 +571,7 @@
       "cause": "The drill expects automatic seeding without a quorum, but the existing recovery design requires an offline copy from the stopped survivor to one blank member.",
       "change": "Follow the offline-copy runbook. Verify all copied file hashes; exclude cluster/archive process marks and links and archive/dir. Remove a partial target copy on failure. Restore the saved job on every result. Require new same-allocation start and snapshot evidence for both recovered members.",
       "verification": [
-        "230 chaos library tests pass, two manual profiles ignored. Controls include changed copy bytes, preserved victim shared archive, service mark/link exclusion, post-resume snapshots and unrelated old allocation evidence.",
+        "230 chaos library tests pass, two manual Nomad agent checks ignored. Controls include changed copy bytes, preserved victim shared archive, service mark/link exclusion, post-resume snapshots and unrelated old allocation evidence.",
         "docs/runbooks/sealer-two-blank-members.md records the concrete procedure and validation."
       ],
       "status": "The complete cluster shard passes on PR 851, including the hash-verified offline quorum copy and fresh allocation-bound seed proof. Final-head repetitions remain required."
@@ -603,7 +603,7 @@
       "cause": "A six-second copy timeout includes allocation log scans, donor selection and filesystem transfer and ends the case before the existing two-minute restore proof. The proof also counts restore lines globally, allowing unrelated replicas to satisfy it.",
       "change": "Copy and actual victim restore share the existing 120-second recovery budget. Capture the victim container before the fault, and require a restore in its replacement container. Preserve a successful peer self-heal. Stop manual retries once the executor is running, remove repeated deletion of its checkpoint directory, retain the last operation in timeout errors, and use mv -T to avoid nesting a copy inside an existing peer checkpoint.",
       "verification": [
-        "232 chaos library tests pass, two manual profiles ignored. Controls reject the pre-fault container, fetch without restore and genesis startup. A real filesystem control preserves an existing peer checkpoint when install races it.",
+        "232 chaos library tests pass, two manual Nomad agent checks ignored. Controls reject the pre-fault container, fetch without restore and genesis startup. A real filesystem control preserves an existing peer checkpoint when install races it.",
         "Workspace style passes."
       ],
       "status": "PR 851 reaches a verified peer checkpoint and victim restore in four seconds. Its new identity oracle is wrong: inner_container returns a reusable name. The local follow-up uses container ID plus StartedAt and logs restricted to that start. The 120-second deadline remains."
@@ -671,7 +671,7 @@
       "product_bug": false,
       "service_wiring_changed": false,
       "hot_path_changed": false,
-      "status": "Two counter controls and all 234 chaos library tests pass; two manual profiles are ignored. Deployed cache validation pending."
+      "status": "Two counter controls and all 234 chaos library tests pass; two manual Nomad agent checks are ignored. Deployed cache validation pending."
     },
     {
       "id": "checkpoint-identity-is-container-name",
@@ -713,7 +713,7 @@
       "product_bug": false,
       "service_wiring_changed": false,
       "hot_path_changed": false,
-      "status": "The extracted original behavior fails two negative controls. After correction, all 237 chaos library tests pass, two manual profiles remain ignored, and workspace style passes. The follow-up is local; deployed validation remains pending.",
+      "status": "The extracted original behavior fails two negative controls. After correction, all 237 chaos library tests pass, two manual Nomad agent checks remain ignored, and workspace style passes. The follow-up is local; deployed validation remains pending.",
       "verification": [
         "Reject an advancing validator when the executor head is absent.",
         "Require every source to answer; missing values never count as zero.",
@@ -745,6 +745,17 @@
         "Reject an unacknowledged offer under Offered completeness; a blocking-RPC assumption cannot prove its delivery.",
         "Existing Accepted/Offered policy controls, complete drain deadlines, pending submits, cancellation and receipt identity controls remain green."
       ]
+    },
+    {
+      "id": "per-mirror-scan-proof-races-legal-resume",
+      "classification": "harness",
+      "case": "mirror-backlog-client-restart, mirror-kill-rebuild",
+      "observed": "PR853 cache cold nonce/balance and fallback counters pass. Replacement mirror 1 finishes its scan at 04:29:59.736 UTC; mirror 2 starts at 04:30:00.491 and legitimately resumes from the already fresh shared Redis head. The fixture waits 300s for a scan it did not request from that mirror.",
+      "change": "For the explicit stopped-mirror scan fixtures, register a copy of the saved job with KARDAMOM_MIRROR_REBUILD=true on every state-mirror task. Prove per-allocation scan completion and exact rows while that scoped version runs. Always restore the captured original job afterward, including failure paths. Automatic cache-loss cases retain their existing recovery behavior.",
+      "product_bug": false,
+      "service_wiring_changed": "Scoped CI fixture only: existing rebuild flag; original job restored after proof. No production defaults change.",
+      "hot_path_changed": false,
+      "status": "All 241 chaos library tests pass, including four job-schema/preservation controls; two local Nomad-agent checks remain ignored. Workspace style passes. Deployed proof remains pending."
     }
   ],
   "coverage": [
@@ -974,15 +985,15 @@
       },
       {
         "check": "offline quorum recovery, bounded observations and checkpoint proof",
-        "result": "232 chaos library tests pass, two manual profiles ignored. 49 batcher tests pass. Workspace style passes. Offline-copy hash/corruption and real filesystem install-race controls pass. All deployed proofs remain pending on the follow-up candidate."
+        "result": "232 chaos library tests pass, two manual Nomad agent checks ignored. 49 batcher tests pass. Workspace style passes. Offline-copy hash/corruption and real filesystem install-race controls pass. All deployed proofs remain pending on the follow-up candidate."
       },
       {
         "check": "PR 851 failure classification and local follow-up",
-        "result": "198 sequencer library + 14 binary, 142 validator library + 15 binary, 97 adapter library and 234 chaos library tests pass. Three manual profiles are ignored. Workspace style passes. The dedicated load job now runs reference and V2 topologies separately."
+        "result": "198 sequencer library + 14 binary, 142 validator library + 15 binary, 97 adapter library and 234 chaos library tests pass. Three manual checks are ignored. Workspace style passes. The dedicated load job now runs reference and V2 topologies separately."
       },
       {
         "check": "strict validator recovery observations",
-        "result": "Two negative controls reproduce the false pass. The complete-sample fix and three controls pass with all 237 chaos library tests (two manual profiles ignored). Workspace style passes. No product runtime or service wiring changes."
+        "result": "Two negative controls reproduce the false pass. The complete-sample fix and three controls pass with all 237 chaos library tests (two manual Nomad agent checks ignored). Workspace style passes. No product runtime or service wiring changes."
       },
       {
         "check": "validator resume cancellation during an open",
@@ -1026,7 +1037,7 @@
         "inputs": {}
       }
     ],
-    "fault_fixture_wiring_changed": "The carry prune-floor case temporarily shortens egress reader-window and segment lengths. It keeps the registered L1 safety floors and restores the exact job. No deployment default changes. Carry now enables the existing L1 fault proxy topology for its deposit fault. The checkpoint-scan interruption temporarily pauses Redis writes, permits read fallbacks and always clears the pause/restores the saved mirror job.",
+    "fault_fixture_wiring_changed": "The carry prune-floor case temporarily shortens egress reader-window and segment lengths. It keeps the registered L1 safety floors and restores the exact job. No deployment default changes. Carry now enables the existing L1 fault proxy topology for its deposit fault. The checkpoint-scan interruption temporarily pauses Redis writes, permits read fallbacks and always clears the pause/restores the saved mirror job. Explicit backlog and interrupted-scan recovery fixtures temporarily set the existing KARDAMOM_MIRROR_REBUILD=true flag so a peer head cannot turn an expected scan into a legal resume. The original job is restored after the per-mirror proof.",
     "performance_profiles_pending": {
       "baseline_branch": "profile/v2-pause-baseline-20261027",
       "baseline_head": "60c3b0120a16e64de6b5f53c2df314cb6bde92cc",
