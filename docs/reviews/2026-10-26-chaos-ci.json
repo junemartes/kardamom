@@ -360,7 +360,19 @@
       "product_bug": false,
       "service_wiring_changed": false,
       "hot_path_changed": false,
-      "status": "Corrected locally; deployed validation pending."
+      "status": "Corrected locally; deployed validation pending.",
+      "follow_up": {
+        "run": 40458018122,
+        "job": 122041411166,
+        "url": "https://github.com/junemartes/kardamom/actions/runs/40458018122/job/122041411166",
+        "observed": "The case spends account13. Its traffic is ready07:15:45. The broken full deploy finishes07:36:17, about20m32s later; healing finishes07:54:30, another18m13s. The original33m30s paced window expires before recovery and the strict ownership gate fails. The failed Nomad deployment consumes575s inside its existing10minute progress deadline; the rest is normal full-play task overhead.",
+        "change": "Use the same40minute per-full-deploy pacing allowance as the carry rollout cases. Both full plays get that allowance, followed by the existing injection and reschedule coverage. Stop unused pacing after recovery. Deployment deadlines, recovery SLOs, strict active-load checks and the existing120minute executor CI job deadline do not change.",
+        "verification": "The observed two-play timeline fails with the old30minute combined allowance and passes with the shared per-play coverage. Full local tests and style pass; deployed validation is pending.",
+        "product_bug": false,
+        "service_wiring_changed": false,
+        "hot_path_changed": false,
+        "qualification": "The previously frozen06ade7e8 candidate is superseded before any complete green round. Its five explicit workflow runs continue. Start the replacement head at0/10 only after those five finish; no CI run is canceled or reused."
+      }
     },
     {
       "id": "v2-lifecycle-pause-not-wired",
@@ -1893,5 +1905,17 @@
     "negative_control": "2 expected plan failures without a fixed fresh-chain budget",
     "style": "pass",
     "java_core_tests": 205
+  },
+  "deployment_traffic_followup": {
+    "runtime_product_files_changed": false,
+    "service_wiring_changed": false,
+    "hot_path_changed": false,
+    "local_tests": "261 chaos tests pass; two local Nomad-agent tests remain ignored",
+    "style": "pass",
+    "existing_full_play_allowance_minutes": 40,
+    "broken_image_full_plays": 2,
+    "unchanged_executor_job_minutes": 120,
+    "deployed_validation": "pending",
+    "qualification_streak": 0
   }
 }
