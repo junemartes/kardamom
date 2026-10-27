@@ -818,6 +818,29 @@
         "Workspace just style passes with no warnings."
       ],
       "status": "Local fix; full runtime validation remains required. No main merge or staging rollout."
+    },
+    {
+      "id": "live-da-guard-change-forks-replay",
+      "classification": "harness",
+      "case": "da-lag-halt",
+      "workflow_run": 40458018122,
+      "job": 122041411232,
+      "issue": 863,
+      "url": "https://github.com/junemartes/kardamom/actions/runs/40458018122/job/122041411232",
+      "observed": "The three preceding retention/prune cases pass. All three executors later log matching canonical skips and a committed-history rollback at block1083. The validator halts on block1087: local write-set0 accounts versus BAL3 accounts from one observed replica session. The mismatch verdict is real.",
+      "cause": "The fixture directly registers a small DA budget on the running sealer job, then restores the old budget. This bypasses the release gate for the replicated daLagBudgetBlocks must-match setting. Different budgets can accept or reject the same historical log entries differently.",
+      "change": "Partition contiguous cases by their guard requirement. Every phase creates a new chain, completes the existing validator and exact persisted-state verdicts, then tears down. The two DA cases use a guard fixed at8 from genesis. The case only observes that fixed guard on every ingress. Empty case plans and reuse across guard settings fail before lifecycle actions. No case or shard is removed.",
+      "product_bug": false,
+      "classification_limit": "The invalid live configuration change is established. Fresh guard-from-genesis runtime proof is still required to establish whether another runtime defect remains. No mismatch counter, replica comparison or receipt/state assertion is weakened.",
+      "service_wiring_changed": "Only the new isolated DA-case deployment receives the small guard from genesis. Other phases keep the original shard deployment variables. Production and staging defaults stay fixed.",
+      "hot_path_changed": false,
+      "deadlines": "Existing fault/recovery and workflow ceilings remain unchanged. The new phase waits for startup lag using the existing chain recovery budget.",
+      "verification": [
+        "249 chaos library tests pass; two manual profiles remain ignored.",
+        "Six phase controls preserve the complete case order and carry topology, reject empty or mixed-reuse plans, and retain validator evidence for each tail verdict.",
+        "Workspace just style passes with no warnings."
+      ],
+      "status": "Local fix; full runtime validation pending. No main merge or staging rollout."
     }
   ],
   "coverage": [
