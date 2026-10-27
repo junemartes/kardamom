@@ -1377,6 +1377,16 @@
         "IN_PROGRESS": 11,
         "QUEUED": 8
       }
+    },
+    {
+      "commit": "58465a1e8a480a8cabc434cb9be57f340fb9453f",
+      "cluster_run": 40452878586,
+      "integrity_run": 40452933724,
+      "status": "Diagnostic batch. Supporting checks pass; all16runtime checks remain live at the next publication. The known858 lapse assertion can use a stale V2 gauge, so this revision cannot qualify for the final reliability audit. Preserve actual outcomes; no stability round is certified.",
+      "checks_at_next_publication": {
+        "SUCCESS": 35,
+        "IN_PROGRESS": 16
+      }
     }
   ],
   "integration": {
@@ -1506,7 +1516,7 @@
     "v2_startup_metric_followup": {
       "issue": 858,
       "base": "58465a1e8a480a8cabc434cb9be57f340fb9453f",
-      "status": "Reviewed local follow-up; final integration requires this change and fresh full runtime CI. The published58465a1e run remains diagnostic.",
+      "status": "Reviewed and included in the combined candidate. Exact-head runtime CI remains required.",
       "changes": [
         "Select startup recovery once from the existing admission config. Receipt-floor mode keeps its startup resync trigger. Admission mode records the legacy gauge as inactive without entering that state machine. Keep the same bounded channels and terminal-refusal drain.",
         "Move cold constructors into a sibling module to retain the file bound. No transaction-loop work, deployment default or wire/stored format changes.",
@@ -1522,7 +1532,9 @@
         "workspace_style": "pass; no warnings"
       },
       "performance_scope": "Only startup selection changes in the product; no extra polling or healthy transaction-path work is added. Deployed CPX32 latency and throughput comparisons remain required.",
-      "remaining": "Full runtime proof and actual staging resync-warning clearance are required before closing858. No green stability round is claimed."
+      "remaining": "Full runtime proof and actual staging resync-warning clearance are required before closing858. No green stability round is claimed.",
+      "source": "479fc4a6ea1d90d7158eaca2a075a05c28fc474a",
+      "pull_request": 859
     }
   },
   "followup_candidate": {
