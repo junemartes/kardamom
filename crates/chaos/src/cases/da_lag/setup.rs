@@ -4,7 +4,7 @@ use std::num::NonZeroU64;
 
 use anyhow::Context;
 
-use super::da_lag_halt;
+use super::{da_lag_halt, status};
 use crate::harness::Harness;
 use crate::metrics;
 use crate::poll::{self, Budget};
@@ -63,7 +63,11 @@ impl GuardReadings {
 
     async fn await_budget(h: &Harness, expected: NonZeroU64) -> anyhow::Result<()> {
         poll::until(Budget::secs(120, 2), |_| async move {
-            Ok::<_, anyhow::Error>(Self::sample(h).await.matches(expected).then_some(()))
+            let observed = Self::sample(h).await;
+            let caught_up = status(h).await.is_some_and(|sample| {
+                !sample.halted && sample.sealed.saturating_sub(sample.posted) <= 4
+            });
+            Ok::<_, anyhow::Error>((observed.matches(expected) && caught_up).then_some(()))
         })
         .await?
         .or_fail(|_| {
