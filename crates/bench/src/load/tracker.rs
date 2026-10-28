@@ -82,6 +82,8 @@ struct Expected {
 #[derive(Default)]
 struct Placement {
     by_sender: HashMap<Address, BTreeMap<u64, u64>>,
+    /// The pacer registers each streamed batch before any submit can race its receipt.
+    streamed: HashMap<B256, Expected>,
 }
 
 impl Placement {
@@ -255,6 +257,29 @@ impl Tracker {
         }));
     }
 
+    pub(crate) fn expect_streamed<'a>(
+        &self,
+        signers: &[DerivedSigner],
+        planned: impl Iterator<Item = &'a PlannedTx>,
+    ) {
+        lock(&self.placement).streamed.extend(planned.map(|tx| {
+            (
+                tx.hash,
+                Expected {
+                    sender: signers[tx.sender].address,
+                    nonce: tx.nonce,
+                },
+            )
+        }));
+    }
+
+    fn expectation(&self, hash: &B256) -> Option<Expected> {
+        self.expected
+            .get(hash)
+            .copied()
+            .or_else(|| lock(&self.placement).streamed.get(hash).copied())
+    }
+
     /// Register an attempted submit.
     pub(crate) fn note_offered(&self) {
         self.offered.fetch_add(1, Ordering::Relaxed);
@@ -359,8 +384,8 @@ impl Tracker {
                 hash: *h,
                 accepted: v.accepted,
                 age: v.submit_ts.elapsed(),
-                sender: self.expected.get(h).map(|expected| expected.sender),
-                nonce: self.expected.get(h).map(|expected| expected.nonce),
+                sender: self.expectation(h).map(|expected| expected.sender),
+                nonce: self.expectation(h).map(|expected| expected.nonce),
             })
             .collect()
     }
@@ -446,7 +471,7 @@ impl Tracker {
     /// hash with no expectation. A skip receipt does not take a place in
     /// the nonce order, because its nonce stays unspent.
     fn contradiction(&self, hash: B256, receipt: &ReceiptStatus) -> Option<String> {
-        let e = *self.expected.get(&hash)?;
+        let e = self.expectation(&hash)?;
         if receipt.from != Some(e.sender) {
             return Some(format!(
                 "from {:?}, signed by {} nonce {}",

@@ -17,7 +17,6 @@
 //! `missing` if it never confirms. This is the independent must-deliver
 //! check.
 
-use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,52 +50,8 @@ pub(crate) enum SubmitMode {
     Subscribe,
 }
 
-/// Per-sender FIFO queues, consumed in rotation. This keeps each
-/// sender's nonce order: a sender's nonce k is popped before k+1.
-pub(crate) struct Queues {
-    per_sender: Vec<VecDeque<PlannedTx>>,
-    rr: usize,
-}
-
-impl Queues {
-    /// Build from a set of per-sender pre-generated queues.
-    #[must_use]
-    pub(crate) fn new(queues: Vec<Vec<PlannedTx>>) -> Self {
-        Self {
-            per_sender: queues.into_iter().map(VecDeque::from).collect(),
-            rr: 0,
-        }
-    }
-
-    /// Pop the next transaction in rotation across senders. Returns
-    /// `None` when all queues are drained.
-    pub(crate) fn pop_next(&mut self) -> Option<PlannedTx> {
-        let n = self.per_sender.len();
-        (0..n).find_map(|_| {
-            let i = self.rr % n;
-            // `rr` is a rotating counter, immediately taken mod `n`: a
-            // wrap back to 0 is the intended behavior, not an edge case,
-            // so wrapping (not a panic on overflow, unreachable in
-            // practice, but not free to rule out on a hot path) is the
-            // correct arithmetic here.
-            self.rr = self.rr.wrapping_add(1) % n;
-            self.per_sender[i].pop_front()
-        })
-    }
-
-    /// Every queued transaction, for the tracker's expectations.
-    pub(crate) fn planned(&self) -> impl Iterator<Item = &PlannedTx> {
-        self.per_sender.iter().flatten()
-    }
-
-    /// The total transactions still queued. Test-only: production code
-    /// drains with `pop_next` until it returns `None`, and never needs
-    /// the count.
-    #[cfg(test)]
-    fn remaining(&self) -> usize {
-        self.per_sender.iter().map(VecDeque::len).sum()
-    }
-}
+mod queues;
+pub(crate) use queues::Queues;
 
 /// Look up a receipt. Returns `None` if not mined yet.
 async fn receipt_status(client: &HttpClient, hash: B256) -> Option<ReceiptStatus> {
@@ -298,29 +253,29 @@ impl Pacer<'_> {
     /// Accrue this tick's credit and spend it. Returns
     /// [`ControlFlow::Break`] once the deadline passes, the queues
     /// drain, or the semaphore closes.
-    async fn tick(&mut self) -> ControlFlow<()> {
+    async fn tick(&mut self) -> anyhow::Result<ControlFlow<()>> {
         if self.start.elapsed() >= self.dur {
-            return ControlFlow::Break(());
+            return Ok(ControlFlow::Break(()));
         }
         self.credit =
             (self.credit + f64::from(self.rate) * self.tick_len.as_secs_f64()).min(self.cap);
-        if self.spend_credit().await {
-            return ControlFlow::Break(());
+        if self.spend_credit().await? {
+            return Ok(ControlFlow::Break(()));
         }
-        ControlFlow::Continue(())
+        Ok(ControlFlow::Continue(()))
     }
 
     /// Spend the accumulated credit: submit as many queued transactions
     /// as `self.credit` allows, spawning one bounded task per submit.
     /// Returns `true` if the queues drained or the semaphore closed,
     /// meaning the caller should stop pacing.
-    async fn spend_credit(&mut self) -> bool {
+    async fn spend_credit(&mut self) -> anyhow::Result<bool> {
         while self.credit >= 1.0 {
-            let ControlFlow::Continue(()) = self.spend_one_credit().await else {
-                return true;
+            let ControlFlow::Continue(()) = self.spend_one_credit().await? else {
+                return Ok(true);
             };
         }
-        false
+        Ok(false)
     }
 
     /// Spend one credit: pop the next queued transaction and spawn its
@@ -328,16 +283,16 @@ impl Pacer<'_> {
     /// [`ControlFlow::Break`] once the queues are empty, or the
     /// semaphore has closed (the run is shutting down) — either means
     /// the caller should stop pacing.
-    async fn spend_one_credit(&mut self) -> ControlFlow<()> {
-        let Some(tx) = self.queues.pop_next() else {
-            return ControlFlow::Break(());
+    async fn spend_one_credit(&mut self) -> anyhow::Result<ControlFlow<()>> {
+        let Some(tx) = self.queues.next(&self.handles.tracker).await? else {
+            return Ok(ControlFlow::Break(()));
         };
         self.credit -= 1.0;
         // `acquire_owned` waits at the max in-flight limit. This gives
         // natural back pressure: the offered rate drops to match the
         // pipeline's drain rate.
         let Ok(permit) = Arc::clone(&self.handles.sem).acquire_owned().await else {
-            return ControlFlow::Break(());
+            return Ok(ControlFlow::Break(()));
         };
         self.tasks.spawn(submit_task(
             Arc::clone(&self.handles.client),
@@ -346,7 +301,7 @@ impl Pacer<'_> {
             permit,
             self.opts,
         ));
-        ControlFlow::Continue(())
+        Ok(ControlFlow::Continue(()))
     }
 }
 
@@ -362,7 +317,7 @@ pub(crate) async fn pacer(
     rate: std::num::NonZeroU32,
     dur: Duration,
     opts: SubmitOpts,
-) {
+) -> anyhow::Result<()> {
     let tick_len = Duration::from_millis(10);
     let mut ticker = tokio::time::interval(tick_len);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -386,8 +341,8 @@ pub(crate) async fn pacer(
     };
     loop {
         ticker.tick().await;
-        let ControlFlow::Continue(()) = pacer.tick().await else {
-            return;
+        let ControlFlow::Continue(()) = pacer.tick().await? else {
+            return Ok(());
         };
     }
 }

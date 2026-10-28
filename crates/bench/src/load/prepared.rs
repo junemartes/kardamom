@@ -100,7 +100,7 @@ impl Prepared {
             cfg.target_tps
         } else {
             run.ramp_to_max(&handles, &mut tasks, &mut queues, &mut ramp)
-                .await
+                .await?
         };
 
         #[allow(
@@ -142,7 +142,9 @@ impl Prepared {
         .run()
         .await;
 
+        queues.stop_refill();
         let settled = run.settle_and_snapshot(&mut tasks, background).await?;
+        let duration = duration?;
 
         let verdict = run.build_verdict(&base, &settled.fin, settled.recheck.as_ref());
         let report = run.build_report(ReportInput {
@@ -173,7 +175,7 @@ struct Submission<'a> {
 }
 
 impl Submission<'_> {
-    async fn run(self) -> Duration {
+    async fn run(self) -> anyhow::Result<Duration> {
         let _window = self.progress.begin();
         let mut stopped = self.progress.stop_requested();
         let started = Instant::now();
@@ -181,9 +183,9 @@ impl Submission<'_> {
             biased;
             () = tokio::time::sleep(self.duration) => {},
             _ = stopped.wait_for(|stop| *stop) => {},
-            () = pacer(self.handles, self.tasks, self.queues, self.rate, self.duration, self.opts) => {},
+            result = pacer(self.handles, self.tasks, self.queues, self.rate, self.duration, self.opts) => { result?; },
         }
-        started.elapsed()
+        Ok(started.elapsed())
     }
 }
 
