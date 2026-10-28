@@ -29,7 +29,7 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 179 checks.
+head. Both targets run in the existing Docker CI job. `all` runs 180 checks.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
@@ -254,13 +254,20 @@ p50/p95/p99. CPU ticks cover the Rust process; they exclude the Java driver. A
 single rejoin observation is not a population percentile. This profile does not
 measure transaction performance or reproduce the full deployment.
 
-`just test-component chaos-cache-coverage` checks the distributed recovery
-observer with controlled failures and a paused Tokio clock. A failed observation
-retries primary discovery and the complete account comparison under the original
-120-second budget. Reads from different attempts cannot combine into a coverage
-certificate. Persistent errors and hanging reads still fail at that deadline.
-Existing tests retain exact nonce, full-width balance, and executor-agreement
-checks. These controls do not establish the cause of a live Redis timeout.
+`just test-component chaos-projection` checks the exact account recovery observer.
+Each observation refreshes Sentinel discovery and checks the primary ROLE on the
+connection used for its account reads. The node contract resolves the address;
+these reads do not depend on an inner Docker command or Consul DNS. Failed reads
+remain missing evidence within the existing 120-second budget. One complete
+observation must match the nonce and full-width balance of both the used sender
+and the untouched funded account, with a valid transaction index. Rows from
+separate observations cannot combine into a pass. Persistent and hanging failures
+still fail at the deadline. Five local controls exercise these verdicts; they do
+not certify the deployed Redis or mirror recovery. Restoring immediate error
+propagation makes the transient-recovery and persistent-deadline controls fail.
+
+`just test-component chaos-cache-baseline` checks exact nonce, full-width balance,
+transaction-index shape, and executor agreement before the cache comparison.
 
 The mirror actor target also pauses a real Redis server for 400 ms. The head
 observer retains its 200-ms request timeout and five-second recovery budget;

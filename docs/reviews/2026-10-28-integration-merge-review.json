@@ -91,6 +91,23 @@
       "evidence": "/tmp/kardamom-components-buwpxdeb/results.json",
       "all_pass": true
     },
-    "scope": "Local observer fixes and independent transport recovery test. Distributed validation is pending; the initial 169/170 failure above is retained as evidence."
+    "scope": "Local observer fixes and independent transport recovery test. Distributed validation is pending; the initial 169/170 failure above is retained as evidence.",
+    "combined_matrix": {
+      "checks": 180,
+      "targets": 28,
+      "seconds": 166.972,
+      "source_revision": "415c1dda4f2d1bc6179b9221caa51bbeff78c118",
+      "evidence": "/tmp/kardamom-components-j6pw2lxk/results.json",
+      "all_pass": true
+    }
+  },
+  "current_integration_after_followups": {
+    "head": "f48610979e9902d7b6da83fb444436b84876fb4d",
+    "merged_followups": [
+      934,
+      936
+    ],
+    "review": "Direct Redis coverage reads refresh discovery and validate ROLE on their read connection. Executor outer job budget is 180 minutes; individual case and reconstruction deadlines are unchanged.",
+    "ci": "Fresh CI pending; no main merge or qualification credit."
   }
 }

@@ -1075,7 +1075,7 @@
         }
       ]
     },
-    "chaos-cache-coverage": {
+    "chaos-cache-baseline": {
       "command": [
         "cargo",
         "test",
@@ -1083,7 +1083,7 @@
         "-p",
         "kardamom-chaos",
         "--lib",
-        "cases::cache::coverage::"
+        "cases::cache::coverage::tests::"
       ],
       "real": [
         "Distributed cache coverage predicate and recovery wait",
@@ -1091,20 +1091,53 @@
       ],
       "controlled": [
         "Executor HTTP replies",
-        "Coverage observation failures and incomplete account sets",
-        "Paused Tokio clock for the unchanged 120-second wait"
+        "Malformed account projections and exact baseline agreement"
       ],
       "tests": [
         "a_present_row_does_not_prove_correct_coverage",
         "untouched_funded_accounts_keep_full_width_balances",
         "a_receipted_transfer_waits_for_the_lagging_executor_before_comparing_redis",
-        "an_executor_baseline_requires_full_state_agreement_and_the_receipted_nonce",
-        "a_failed_read_retries_a_complete_observation_within_the_original_budget",
-        "persistent_read_errors_fail_at_the_total_deadline_with_the_cause",
-        "partial_observations_cannot_combine_into_complete_coverage",
-        "a_hanging_first_observation_cannot_extend_the_total_deadline"
+        "an_executor_baseline_requires_full_state_agreement_and_the_receipted_nonce"
       ],
-      "limitation": "Observer controls do not reproduce Redis promotion or establish the cause of a deployed HMGET timeout. Existing Sentinel and mirror actor suites exercise those components separately."
+      "limitation": "Checks exact account predicates and the executor baseline; distributed recovery remains required."
+    },
+    "chaos-projection": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "cases::cache::coverage::projection::tests"
+      ],
+      "real": [
+        "exact account projection observer",
+        "shared bounded polling loop"
+      ],
+      "controlled": [
+        "paused Tokio clock",
+        "failed, hanging, malformed, partial and complete primary observations"
+      ],
+      "tests": [
+        "a_failed_read_is_retried_and_only_a_complete_fresh_read_passes",
+        "separate_partial_observations_cannot_be_combined_into_a_pass",
+        "persistent_read_failure_preserves_its_cause_at_the_original_deadline",
+        "a_hanging_read_cannot_extend_the_original_deadline",
+        "missing_extra_malformed_and_wrong_rows_cannot_certify_coverage"
+      ],
+      "limitation": "Observer controls do not run Redis, Sentinel or a deployed mirror. Full cache and combined-execution shards remain required.",
+      "negative_controls": [
+        {
+          "mutation": "Propagate a read error immediately instead of retrying within the original budget",
+          "compiled": true,
+          "exit_code": 101,
+          "failed": [
+            "a_failed_read_is_retried_and_only_a_complete_fresh_read_passes",
+            "persistent_read_failure_preserves_its_cause_at_the_original_deadline"
+          ]
+        }
+      ]
     }
   },
   "families": {
@@ -1455,20 +1488,24 @@
           "test": "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close"
         },
         {
-          "suite": "chaos-cache-coverage",
-          "test": "a_failed_read_retries_a_complete_observation_within_the_original_budget"
+          "suite": "chaos-projection",
+          "test": "a_failed_read_is_retried_and_only_a_complete_fresh_read_passes"
         },
         {
-          "suite": "chaos-cache-coverage",
-          "test": "persistent_read_errors_fail_at_the_total_deadline_with_the_cause"
+          "suite": "chaos-projection",
+          "test": "separate_partial_observations_cannot_be_combined_into_a_pass"
         },
         {
-          "suite": "chaos-cache-coverage",
-          "test": "partial_observations_cannot_combine_into_complete_coverage"
+          "suite": "chaos-projection",
+          "test": "persistent_read_failure_preserves_its_cause_at_the_original_deadline"
         },
         {
-          "suite": "chaos-cache-coverage",
-          "test": "a_hanging_first_observation_cannot_extend_the_total_deadline"
+          "suite": "chaos-projection",
+          "test": "a_hanging_read_cannot_extend_the_original_deadline"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "missing_extra_malformed_and_wrong_rows_cannot_certify_coverage"
         }
       ],
       "full_case_locally_validated": false
@@ -1636,20 +1673,24 @@
           "test": "a_failed_egress_falls_back_to_the_executor"
         },
         {
-          "suite": "chaos-cache-coverage",
-          "test": "a_failed_read_retries_a_complete_observation_within_the_original_budget"
+          "suite": "chaos-projection",
+          "test": "a_failed_read_is_retried_and_only_a_complete_fresh_read_passes"
         },
         {
-          "suite": "chaos-cache-coverage",
-          "test": "persistent_read_errors_fail_at_the_total_deadline_with_the_cause"
+          "suite": "chaos-projection",
+          "test": "separate_partial_observations_cannot_be_combined_into_a_pass"
         },
         {
-          "suite": "chaos-cache-coverage",
-          "test": "partial_observations_cannot_combine_into_complete_coverage"
+          "suite": "chaos-projection",
+          "test": "persistent_read_failure_preserves_its_cause_at_the_original_deadline"
         },
         {
-          "suite": "chaos-cache-coverage",
-          "test": "a_hanging_first_observation_cannot_extend_the_total_deadline"
+          "suite": "chaos-projection",
+          "test": "a_hanging_read_cannot_extend_the_original_deadline"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "missing_extra_malformed_and_wrong_rows_cannot_certify_coverage"
         }
       ],
       "full_case_locally_validated": false

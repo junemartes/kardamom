@@ -1,5 +1,5 @@
 {
-  "status": "179 local component checks, negative controls, 332 ordinary chaos unit tests and style pass. Changes are not yet in integration.",
+  "status": "Final combined 180-check component matrix and style pass. Distributed validation remains required.",
   "observed_failures": [
     {
       "kind": "distributed",
@@ -58,5 +58,19 @@
     },
     "runner_controls": 8,
     "style": "Pass; existing proc-macro-error2 future-incompatibility notice remains."
+  },
+  "reconciliation": {
+    "source_pr": 934,
+    "source_head": "1fe4f499152f7868c8e56a5a84bb4eacbb5a602e",
+    "decision": "Use the independently authored direct Redis observer and ROLE check from #934. Remove the duplicate CoverageWait implementation and its four tests. Retain the real Redis pause control and transport probe.",
+    "validation": "The final combined matrix passes with the direct Redis observer from #934."
+  },
+  "combined_validation": {
+    "checks": 180,
+    "targets": 28,
+    "seconds": 166.972,
+    "source_revision": "415c1dda4f2d1bc6179b9221caa51bbeff78c118",
+    "evidence": "/tmp/kardamom-components-j6pw2lxk/results.json",
+    "all_pass": true
   }
 }
