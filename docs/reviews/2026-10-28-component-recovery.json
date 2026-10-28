@@ -576,6 +576,139 @@
       ],
       "limitation": "Proves the harness can verify a checkpoint on the fault volume. It does not prove executor progress during ENOSPC, disk/power-loss durability, or pruning races. The container starts only a bounded sleep process, not chain services.",
       "negative_control": "The Docker fixture asserts that the old docker cp path fails on the same tmpfs whose exec/tar copy verifies successfully."
+    },
+    "sealer-actor": {
+      "command": [
+        "cluster/sealer-service/gradlew",
+        "-p",
+        "cluster/sealer-service",
+        ":service:test",
+        "--no-daemon",
+        "--rerun-tasks",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerFanoutTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerCarryWindowTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest"
+      ],
+      "junit_reports": [
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerFanoutTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerSeedServiceTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerCarryWindowTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerCarryActivationTest.xml"
+      ],
+      "tests": [
+        "io.kardamom.sealer.cluster.SealerFanoutTest::batchEntriesProcessLikeIndividualRecords()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::contiguityGapRejectsToOfferingSessionOnly()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::zeroSenderIsGuardExempt()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::broadcastsToAllWhileNoConsumerAnnounced()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::relaysOnlyToAnnouncedConsumers()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::boundariesStayBroadcastToEverySession()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::closedConsumerLeavesTheSetAndEmptySetRestoresBroadcast()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::origin_record_relays_id_and_fields_with_no_trailing_slack()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::origin_record_consumes_its_declared_slot_range()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::an_origin_gap_is_answered_to_the_offering_session_only()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::a_consumer_at_the_seed_head_resumes_at_e_h_and_h_plus_one()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::the_first_boundary_is_h_plus_one_and_the_first_record_is_e_h()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::each_term_offers_the_seed_record_until_one_confirms_it()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::a_snapshot_keeps_the_seed_and_its_confirmation()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::a_seed_record_with_another_digest_stops_the_member()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::a_member_started_at_genesis_stops_on_the_seed_record()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::a_seed_record_from_a_client_is_dropped()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::a_seed_with_interop_on_is_refused()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::the_node_reads_no_seed_when_the_property_is_unset_and_refuses_a_missing_file()",
+        "io.kardamom.sealer.cluster.SealerCarryWindowTest::below_version_five_the_frames_above_the_posted_head_stay()",
+        "io.kardamom.sealer.cluster.SealerCarryWindowTest::version_five_keeps_only_the_window_at_any_posted_head()",
+        "io.kardamom.sealer.cluster.SealerCarryWindowTest::version_five_refuses_a_replay_below_the_window_and_serves_one_inside_it()",
+        "io.kardamom.sealer.cluster.SealerCarryWindowTest::version_five_keeps_the_da_lag_guard()",
+        "io.kardamom.sealer.cluster.SealerCarryWindowTest::version_five_on_the_heap_keeps_the_frames_above_the_posted_head()",
+        "io.kardamom.sealer.cluster.SealerCarryWindowTest::a_replay_from_a_snapshot_at_any_entry_evicts_alike()",
+        "io.kardamom.sealer.cluster.SealerCarryWindowTest::below_version_five_a_replay_from_a_snapshot_at_any_entry_evicts_alike()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::the_timer_boundary_turns_the_carry_window_on()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::the_forced_boundary_turns_the_carry_window_on()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::the_boundary_of_a_remote_origin_record_turns_the_carry_window_on()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::the_refusal_log_prints_at_most_once_a_second()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::the_window_holds_while_the_carry_window_is_on()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::the_refusal_carries_the_id_the_sender_the_nonce_and_version_five()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::the_gauges_show_the_carry_window_and_the_counters()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::every_member_has_the_same_bytes_after_each_entry()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::a_member_restored_at_any_entry_ends_with_the_bytes_of_its_peer()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::a_member_writes_version_eighteen_only_once_it_holds_the_carry_window()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::a_file_member_answers_the_carry_window_unsupported()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::a_file_member_stops_on_version_eighteen()"
+      ],
+      "real": [
+        "SealerClusteredService",
+        "CanonicalSealerState",
+        "wire parsing and snapshot codec"
+      ],
+      "controlled": [
+        "stub cluster/session outcomes and direct leadership/timer callbacks",
+        "four-frame retention windows",
+        "explicit per-entry leader timestamps and timer callbacks",
+        "snapshot/restore at every log cut and decision-version changes"
+      ],
+      "limitation": "The actor suite mocks consensus. The Raft suite uses real in-JVM members but does not prove OS process loss, network partitions, deployment or disk power-loss durability.",
+      "negative_controls": [
+        {
+          "mutation": "remove seed reoffer on a new leadership term",
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.SealerSeedServiceTest::a_snapshot_keeps_the_seed_and_its_confirmation()",
+            "io.kardamom.sealer.cluster.SealerSeedServiceTest::each_term_offers_the_seed_record_until_one_confirms_it()"
+          ]
+        }
+      ]
+    },
+    "sealer-raft": {
+      "command": [
+        "cluster/sealer-service/gradlew",
+        "-p",
+        "cluster/sealer-service",
+        ":service:test",
+        "--no-daemon",
+        "--rerun-tasks",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerClusterFailoverTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerSeedClusterTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerSnapshotStallClusterTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerReplayTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerCarryClusterTest"
+      ],
+      "junit_reports": [
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerClusterFailoverTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerSeedClusterTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerSnapshotStallClusterTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerReplayTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerCarryClusterTest.xml"
+      ],
+      "tests": [
+        "io.kardamom.sealer.cluster.SealerClusterFailoverTest::egressContinuesGaplesslyAcrossLeaderKill()",
+        "io.kardamom.sealer.cluster.SealerSeedClusterTest::a_seeded_cluster_confirms_relays_from_e_h_and_restarts_from_its_snapshot()",
+        "io.kardamom.sealer.cluster.SealerSnapshotStallClusterTest::theFramesStopForTheSnapshotAndTheNoticeComesFirst()",
+        "io.kardamom.sealer.cluster.SealerReplayTest::reconnectedSessionCatchesUpViaReplay()",
+        "io.kardamom.sealer.cluster.SealerReplayTest::replayDuringLiveTrafficReachesLiveCursorAndCompletes()",
+        "io.kardamom.sealer.cluster.SealerReplayTest::evictedRangeIsRefusedHonestly()",
+        "io.kardamom.sealer.cluster.SealerCarryClusterTest::every_member_orders_each_full_reference_once_with_its_bytes()"
+      ],
+      "real": [
+        "SealerClusteredService",
+        "CanonicalSealerState",
+        "three Aeron consensus members, media drivers, archives and real cluster client"
+      ],
+      "controlled": [
+        "leader stop, whole-group restart and deliberate service snapshot stalls",
+        "client reconnect and small replay retention",
+        "carry-version activation with duplicate references"
+      ],
+      "limitation": "The actor suite mocks consensus. The Raft suite uses real in-JVM members but does not prove OS process loss, network partitions, deployment or disk power-loss durability."
     }
   },
   "families": {
@@ -835,6 +968,10 @@
         {
           "suite": "sequencer",
           "test": "lost_offer_on_session_restart_replays_the_exact_prefix_before_its_suffix"
+        },
+        {
+          "suite": "sealer-raft",
+          "test": "io.kardamom.sealer.cluster.SealerClusterFailoverTest::egressContinuesGaplesslyAcrossLeaderKill()"
         }
       ],
       "full_case_locally_validated": false
@@ -863,8 +1000,13 @@
     {
       "case": "cluster-member-rejoin",
       "family": "Cluster",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sealer-raft",
+          "test": "io.kardamom.sealer.cluster.SealerSeedClusterTest::a_seeded_cluster_confirms_relays_from_e_h_and_restarts_from_its_snapshot()"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -1265,8 +1407,13 @@
     {
       "case": "carry-versions-on",
       "family": "Carry",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sealer-raft",
+          "test": "io.kardamom.sealer.cluster.SealerCarryClusterTest::every_member_orders_each_full_reference_once_with_its_bytes()"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -1291,8 +1438,13 @@
     {
       "case": "carry-window-on",
       "family": "Carry",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sealer-actor",
+          "test": "io.kardamom.sealer.cluster.SealerCarryWindowTest::version_five_keeps_only_the_window_at_any_posted_head()"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -1312,8 +1464,13 @@
     {
       "case": "carry-window-off-on",
       "family": "Carry",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sealer-actor",
+          "test": "io.kardamom.sealer.cluster.SealerCarryActivationTest::a_member_restored_at_any_entry_ends_with_the_bytes_of_its_peer()"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -1432,8 +1589,13 @@
     {
       "case": "replay-window-resync",
       "family": "Executor",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sealer-raft",
+          "test": "io.kardamom.sealer.cluster.SealerReplayTest::evictedRangeIsRefusedHonestly()"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
