@@ -3778,6 +3778,7 @@ dependencies = [
  "bytes",
  "clap",
  "criterion 0.7.0",
+ "jsonrpsee",
  "kardamom-batcher",
  "kardamom-deployer",
  "kardamom-engine",

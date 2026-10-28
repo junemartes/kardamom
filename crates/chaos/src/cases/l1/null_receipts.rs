@@ -1,7 +1,8 @@
 //! `l1-null-receipts`: the proxy answers null receipts and empty
-//! settlement logs while it serves blocks. The batcher cannot confirm a
-//! post, the stale-post alert fires, and a restart inside the fault
-//! resumes from the contract with no wait on the indexer.
+//! settlement logs while it serves blocks. Contract reconciliation can
+//! confirm a post despite its hidden receipt. Swallowed logs halt the
+//! follower's certified view, so its observed-post age grows. A restart
+//! inside the fault resumes from the contract without waiting on the indexer.
 
 use std::time::{Duration, Instant};
 
@@ -38,8 +39,8 @@ pub(crate) async fn null_receipts(h: &mut Harness) -> anyhow::Result<()> {
     // The follower's two sources disagree on the swallowed logs: it halts,
     // and the da-watcher pauses on it.
     await_followers_halted(h, base, ctx).await?;
-    // The batcher waits on a receipt that never comes, so its last post
-    // ages on L1: the one signal of this fault that pages.
+    // The age follows the newest post the follower can certify. It grows
+    // through the halted stream even when contract reconciliation succeeds.
     l1.await_alert_held(STALE_POST_ALERT, ALERT_HOLD, window, ctx)
         .await?;
     let before = BeforeRestart::read(h, &l1).await?;
@@ -48,7 +49,7 @@ pub(crate) async fn null_receipts(h: &mut Harness) -> anyhow::Result<()> {
     tokio::time::sleep(window.saturating_sub(armed.elapsed())).await;
     let stalled = h.probes.batcher_posts().await.unwrap_or(0);
     let stuck = Followers::at_clear(h, &l1, base).await?;
-    // The receipt of the post in flight arrives; the batcher continues.
+    // The restored view permits another confirmed post and follower catch-up.
     await_posting(
         h,
         stalled,

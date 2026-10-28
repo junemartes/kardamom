@@ -10,10 +10,10 @@ just test-component executor-pipeline
 just test-component all
 ```
 
-Thirteen targets run 94 checks without external services. They cover sequencer admission, executor
+The initial Rust targets cover sequencer admission, executor
 commit and execution-pipeline behavior, ingress accounts/receipts/DA halt, egress
 ownership/retention/peer catch-up, batcher recovery, and L1 source/watcher recovery.
-Run one target to iterate, or `all` for the current matrix. These thirteen targets
+Run one target to iterate, or `all` for the current matrix. These targets
 start no Docker, Nomad, Redis or Java cluster. The HTTP-source target uses real
 HTTP with a paused clock after requests reach the fault proxy. It exercises the
 unchanged 30-second deadline and backoff in about 0.12 seconds of test execution.
@@ -29,7 +29,7 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 182 checks across 29 targets.
+head. Both targets run in the existing Docker CI job. `all` runs 191 checks across 30 targets.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
@@ -306,3 +306,34 @@ instant for timeout bookkeeping, so advancing only Tokio time would not prove
 that deadline. Deterministic mining and cancellation reproduce the recovery cuts
 without waiting for expiry. Follower recovery, alert behavior, distributed DA,
 Nomad restart and the rest of the deployed case remain separate validation.
+
+`just test-component batcher-post-age` adds nine checks for the actual post-age
+actor and its archive seed. A loopback archive accepts the real HTTP request and
+never answers. Live follower records must still update the exported age, and
+closing input must stop the actor. The old loop fails both controls because it
+awaits the seed inside its tick before reading more input.
+
+The actor now owns at most one archive-read task. The complete three-RPC seed
+shares the existing observation interval as its deadline, ten seconds in service
+wiring. Timer ticks and follower input continue while that task waits. Completion
+publishes the seeded age immediately; failures can retry on a later tick. The
+actor cancels the owned task on exit. Tests also require no overlapping attempts,
+one deadline across all three RPCs, successful seed publication without another
+tick, and no age regression when an older seed follows a newer live post.
+
+These are product changes to the observability actor's startup and recovery.
+Transaction posting, receipt deadlines, stored formats and network topology stay
+unchanged. The input trait is private and production still uses the same Aeron
+subscriber. The test replaces only its decoded-record boundary with a two-entry
+channel and uses the real archive client and metric emission. Virtual time starts
+after the actual HTTP request reaches its peer; it advances scheduling and RPC
+deadlines. The exported age still uses real wall time, bounded by observations
+before and after the record. Nine checks execute in about 0.06 seconds, excluding
+compilation. No client latency or throughput improvement is claimed.
+
+The deployed null-receipt case can pass while the batcher confirms through
+contract reconciliation. Its stale-post alert measures the last post certified by
+the follower, whose sources disagree on swallowed logs. That alert alone cannot
+prove receipt confirmation is stuck. The deployed case does not stall the
+batcher's archive HTTP seed; this target covers that missing output-failure
+combination. It does not prove Prometheus behavior or full follower recovery.

@@ -1172,6 +1172,78 @@
         "restart_during_hidden_receipts_uses_contract_truth_without_waiting_for_the_indexer"
       ],
       "limitation": "No full follower fleet, Prometheus alert, Nomad restart, consensus retention or EigenDA proof. These tests cover null receipt reconciliation and restart, not expiry of the 120-second receipt deadline. Alloy timeout bookkeeping includes the wall clock, so Tokio virtual time alone cannot prove that deadline. The existing local DA helper serves until the test process exits. Payloads contain empty boundary blocks; transaction execution and full-chain transfer progress are outside this fixture."
+    },
+    "batcher-post-age": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-batcher",
+        "--lib",
+        "live::post_age::",
+        "--",
+        "--nocapture"
+      ],
+      "real": [
+        "PostAge::run with its actual timer and state transitions",
+        "IndexerClient and all three HTTP JSON-RPC reads",
+        "archive seed task deadline and ownership",
+        "post-age metric emission and monotone last-post timestamps"
+      ],
+      "controlled": [
+        "two-entry channel of decoded L1 follower records",
+        "loopback archive that accepts a request but never replies",
+        "real JSON-RPC server with explicitly released replies",
+        "task-local metrics recorder",
+        "Tokio time advances only after each real HTTP request reaches its peer"
+      ],
+      "tests": [
+        "the_age_runs_from_the_newest_block_that_carried_a_post",
+        "a_seed_attempt_times_out_and_can_start_again_without_overlapping",
+        "input_close_stops_the_actor_during_an_unresponsive_archive_read",
+        "a_late_archive_seed_cannot_replace_a_newer_live_post",
+        "all_three_archive_requests_share_one_deadline",
+        "closing_the_owner_cancels_the_inflight_archive_task",
+        "an_unresponsive_archive_does_not_hide_a_live_post",
+        "the_complete_archive_seed_publishes_without_waiting_for_another_tick",
+        "a_failed_archive_read_retries_with_the_same_client_and_recovers"
+      ],
+      "limitation": "This adds the stalled archive-seed failure absent from the deployed L1 receipt/log fault. It does not run Aeron discovery, the follower fleet, Prometheus, Nomad, or transaction posting. Wall-clock post age remains real; virtual time controls only actor scheduling and RPC deadlines.",
+      "negative_controls": [
+        {
+          "mutation": "extended_seed_deadline",
+          "test": "all_three_archive_requests_share_one_deadline",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/post-age-extended_seed_deadline-negative-20261028.log"
+        },
+        {
+          "mutation": "overlapping_seed",
+          "test": "a_seed_attempt_times_out_and_can_start_again_without_overlapping",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/post-age-overlapping_seed-negative-20261028.log"
+        },
+        {
+          "mutation": "uncancelled_seed",
+          "test": "closing_the_owner_cancels_the_inflight_archive_task",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/post-age-uncancelled_seed-negative-20261028.log"
+        },
+        {
+          "mutation": "regressing_seed",
+          "test": "a_late_archive_seed_cannot_replace_a_newer_live_post",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/post-age-regressing_seed-negative-20261028.log"
+        }
+      ]
     }
   },
   "families": {
@@ -1784,6 +1856,42 @@
         {
           "suite": "batcher-null-receipts",
           "test": "restart_during_hidden_receipts_uses_contract_truth_without_waiting_for_the_indexer"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "the_age_runs_from_the_newest_block_that_carried_a_post"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "a_seed_attempt_times_out_and_can_start_again_without_overlapping"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "input_close_stops_the_actor_during_an_unresponsive_archive_read"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "a_late_archive_seed_cannot_replace_a_newer_live_post"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "all_three_archive_requests_share_one_deadline"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "closing_the_owner_cancels_the_inflight_archive_task"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "an_unresponsive_archive_does_not_hide_a_live_post"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "the_complete_archive_seed_publishes_without_waiting_for_another_tick"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "a_failed_archive_read_retries_with_the_same_client_and_recovers"
         }
       ],
       "full_case_locally_validated": false
