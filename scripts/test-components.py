@@ -40,14 +40,15 @@ class Run:
                 timed_out = True
         text = log.read_text()
         passed = re.findall(r"^test ([\w:]+) \.\.\. ok$", text, re.MULTILINE)
+        failed = re.findall(r"^test ([\w:]+) \.\.\. FAILED$", text, re.MULTILINE)
         missing = [name for name in suite["tests"]
                    if not any(test == name or test.endswith("::" + name) for test in passed)]
         result = {"command": suite["command"], "exit_code": code, "timed_out": timed_out,
-                  "seconds": round(time.monotonic() - started, 3), "passed": passed,
+                  "seconds": round(time.monotonic() - started, 3), "passed": passed, "failed": failed,
                   "missing_expected_tests": missing, "log": str(log),
                   "success": code == 0 and not missing}
         print(f"{name}: {'PASS' if result['success'] else 'FAIL'}; "
-              f"{len(passed)} tests; {result['seconds']}s; {log}", flush=True)
+              f"{len(passed)} passed, {len(failed)} failed tests; {result['seconds']}s; {log}", flush=True)
         if not result["success"]:
             print("\n".join(text.splitlines()[-30:]), flush=True)
         return result
