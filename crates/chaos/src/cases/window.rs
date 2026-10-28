@@ -34,7 +34,7 @@ impl Case {
                     .saturating_add(k.restart_slo.saturating_mul(4))
                     .saturating_add(sequencer_recovery::SequencerRecovery::PROOF_WINDOW)
             }
-            Self::RaftLeaderPacketLoss => PacketLoss::window(k),
+            Self::RaftLeaderPacketLoss | Self::RaftLeaderPacketDelay => PacketLoss::window(k),
             Self::RaftLeaderOneWayPartition => {
                 inject + k.leader_slo + k.rejoin_slo + Duration::from_mins(4)
             }
