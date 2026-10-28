@@ -203,6 +203,37 @@ async fn a_rotated_source_returns_after_the_backoff() {
     assert!(set.block_ids(5).await.is_ok());
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_rotated_source_waits_until_the_nonzero_backoff_deadline() {
+    let flaky = Arc::new(rate_limited());
+    let set = L1Sources::new(vec![
+        ("flaky".into(), flaky.clone()),
+        ("honest".into(), Arc::new(MockL1Source::new())),
+    ])
+    .backoff(Duration::from_secs(3_600));
+    assert!(set.block_ids(5).await.is_err());
+    assert_eq!(flaky.calls(), 1);
+    *flaky.rate_limited.lock().unwrap() = false;
+
+    tokio::time::advance(
+        Duration::from_secs(3_600)
+            .checked_sub(Duration::from_nanos(1))
+            .unwrap(),
+    )
+    .await;
+    assert!(set.block_ids(5).await.is_err());
+    assert_eq!(
+        flaky.calls(),
+        1,
+        "a recovered source stays out before its deadline"
+    );
+    tokio::time::advance(Duration::from_nanos(1)).await;
+    assert!(set.block_ids(5).await.is_ok());
+    assert_eq!(flaky.calls(), 2, "the source rejoins at the deadline");
+    assert!(set.block_ids(6).await.is_ok());
+    assert_eq!(flaky.calls(), 3, "the source remains usable after recovery");
+}
+
 /// The light client settles a disagreement: its answer is served, and
 /// the public source that disagrees with it is the liar, rotated out.
 #[tokio::test]

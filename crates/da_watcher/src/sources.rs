@@ -20,13 +20,14 @@
 
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{Filter, Log as RpcLog};
 use async_trait::async_trait;
 use futures::future::join_all;
+use tokio::time::Instant;
 use tracing::{error, warn};
 
 use crate::metrics;

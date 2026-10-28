@@ -120,3 +120,51 @@ fn unposted_blocks_remain_replayable_after_pruning_and_a_restart() {
     assert_eq!(after, head);
     assert_eq!(head.next_block, 301);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_small_retention_window_prunes_only_after_sync_and_segment_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let interval = Duration::from_secs(3_600);
+    {
+        let (mut owner, _published) = pruning(dir.path(), L1Heads::with_oracle());
+        owner.cfg.sync_every = interval;
+        heads(&mut owner, [Input::Posted(100), Input::Final(100)]);
+        blocks(&mut owner, 1, 29);
+        assert_eq!(first_block(&mut owner), 1);
+
+        tokio::time::advance(interval.checked_sub(Duration::from_nanos(1)).unwrap()).await;
+        owner.sync_if_due().unwrap();
+        assert_eq!(
+            first_block(&mut owner),
+            1,
+            "no prune before the sync deadline"
+        );
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        owner.sync_if_due().unwrap();
+        assert_eq!(
+            first_block(&mut owner),
+            11,
+            "block 20 still lies in the retained window"
+        );
+
+        blocks(&mut owner, 30, 30);
+        assert_eq!(
+            first_block(&mut owner),
+            11,
+            "the next segment waits for the next sync"
+        );
+        tokio::time::advance(interval).await;
+        owner.sync_if_due().unwrap();
+        assert_eq!(first_block(&mut owner), 21);
+    }
+    let (mut restored, _published) = pruning(dir.path(), L1Heads::with_oracle());
+    assert_eq!(first_block(&mut restored), 21);
+    let Range::Frames { frames, .. } = restored.parts.store.read_from(0, 21, usize::MAX).unwrap()
+    else {
+        panic!("the retained window must survive restart");
+    };
+    let expected: Vec<_> = (21..=30)
+        .map(|block| encode_egress_boundary(block, 0, 0, 0))
+        .collect();
+    assert_eq!(frames, expected);
+}
