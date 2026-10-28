@@ -423,7 +423,15 @@ impl L1 {
         ctx: &str,
     ) -> anyhow::Result<()> {
         let observation = alert::Held::new(hold);
-        let outcome = observation.run(budget, || self.alert_state(name)).await?;
+        let outcome = observation
+            .run(budget, || async {
+                let response = self.alert_state(name).await;
+                if let Err(error) = &response {
+                    crate::log(format!("{ctx}: {error:#}; the held run starts again"));
+                }
+                response
+            })
+            .await?;
         let (state, elapsed) = outcome.or_fail(|t| {
             crate::chaos_fail!(
                 "{ctx}: the alert {name} did not hold for {}s within {}s; {}",

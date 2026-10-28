@@ -33,9 +33,12 @@ async fn slow_alert_samples_use_elapsed_time_within_the_original_budget() {
     assert_eq!(elapsed, Duration::from_secs(47));
 }
 
-#[tokio::test(start_paused = true)]
-async fn inactive_unknown_and_failed_reads_each_reset_the_hold() {
-    for broken in [Ok(None), Ok(Some("unknown".into())), Err("unavailable")] {
+struct Reset {
+    broken: Result<Option<String>, &'static str>,
+}
+
+impl Reset {
+    async fn verify(self) {
         let observation = Held::new(HOLD);
         let reads = Cell::new(0_u32);
         let outcome = observation
@@ -43,7 +46,7 @@ async fn inactive_unknown_and_failed_reads_each_reset_the_hold() {
                 let read = reads.get();
                 reads.set(read.checked_add(1).unwrap());
                 let response = if read == 2 {
-                    broken.clone().map_err(anyhow::Error::msg)
+                    self.broken.clone().map_err(anyhow::Error::msg)
                 } else {
                     Ok(Some(if read < 2 { "pending" } else { "firing" }.into()))
                 };
@@ -55,6 +58,13 @@ async fn inactive_unknown_and_failed_reads_each_reset_the_hold() {
             panic!("the new run from 15 to 45 seconds must pass");
         };
         assert_eq!(elapsed, Duration::from_secs(45));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn inactive_unknown_and_failed_reads_each_reset_the_hold() {
+    for broken in [Ok(None), Ok(Some("unknown".into())), Err("unavailable")] {
+        Reset { broken }.verify().await;
     }
 }
 
