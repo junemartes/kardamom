@@ -44,7 +44,13 @@ impl Queues {
         let Some(refill) = &mut self.refill else {
             return Ok(None);
         };
+        let waiting = std::time::Instant::now();
         let batch = refill.receive().await?;
+        tracing::info!(
+            wait_us = waiting.elapsed().as_micros(),
+            transactions = batch.planned().count(),
+            "chaos load signed batch ready"
+        );
         tracker.expect_streamed(refill.signers(), batch.planned());
         self.per_sender = batch.per_sender;
         Ok(self.pop_next())

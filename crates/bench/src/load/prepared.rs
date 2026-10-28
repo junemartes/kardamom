@@ -190,4 +190,4 @@ impl Submission<'_> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

@@ -143,8 +143,8 @@ impl LoadRun {
     #[must_use]
     pub fn from_config(cfg: LoadConfig, report_path: PathBuf) -> Self {
         let (signal, ready) = tokio::sync::watch::channel(None);
-        // Signing precedes every submission. The injection gate waits for
-        // the prepared run and its own accepted traffic before the fault.
+        // The first signed batch precedes submission. The injection gate
+        // waits for the prepared run and its own accepted traffic before the fault.
         let task = tokio::spawn(async move {
             let prepared = load::prepare(cfg).await?;
             signal.send_replace(Some(prepared.progress()));
@@ -157,7 +157,7 @@ impl LoadRun {
         }
     }
 
-    /// Whether the load signed its queues and published its observer.
+    /// Whether the load signed its first batch and published its observer.
     #[must_use]
     pub fn is_ready(&self) -> bool {
         self.ready.borrow().is_some()

@@ -135,3 +135,106 @@ async fn a_stalled_signer_is_cancellable_and_stopping_closes_its_bounded_channel
     assert!(sender.is_closed());
     assert!(queues.next(&tracker).await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn a_signer_failure_cannot_write_a_passing_run_report() {
+    let (sender, receiver) = mpsc::channel(1);
+    sender
+        .send(Err(anyhow::anyhow!("signer failed")))
+        .await
+        .unwrap();
+    let signers = SignerSet::derive(crate::ANVIL_MNEMONIC, 1).unwrap();
+    let ingress = crate::load::prepared::tests::Ingress::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("report.json");
+    let config = ingress.config(Duration::from_secs(30), &output);
+    let first = config
+        .build_queues(
+            &signers,
+            &QueuePlan {
+                chain_id: 1,
+                per_sender: 1,
+                starts: vec![0],
+            },
+        )
+        .unwrap();
+    let queues = first.queues.with_refill(SignedBatches {
+        receiver,
+        signers: signers.clone(),
+    });
+    let setup = crate::load::RunSetup {
+        client: std::sync::Arc::new(
+            crate::config::rpc_client(&config.rpc, config.max_in_flight.get()).unwrap(),
+        ),
+        signers,
+        queues,
+    };
+    let prepared = crate::load::Prepared::new(config, setup).unwrap();
+    let progress = prepared.progress();
+    let error = tokio::time::timeout(Duration::from_secs(20), prepared.run())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("signer failed"));
+    let counts = progress.tracker.counts();
+    assert_eq!(
+        (counts.offered, counts.accepted, counts.receipted),
+        (1, 1, 1)
+    );
+    assert!(!output.exists());
+}
+
+#[tokio::test]
+async fn closing_a_real_producers_consumer_stops_signing() {
+    let (sender, mut receiver) = mpsc::channel(BUFFERED_BATCHES);
+    let producer = Producer {
+        cfg: config(),
+        signers: SignerSet::derive(crate::ANVIL_MNEMONIC, 2).unwrap(),
+        plan: QueuePlan {
+            chain_id: 1,
+            per_sender: BATCH_PER_SENDER,
+            starts: vec![0, 0],
+        },
+        sender,
+    };
+    let task = tokio::task::spawn_blocking(move || producer.run());
+    assert!(receiver.recv().await.unwrap().is_ok());
+    receiver.close();
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn streamed_expectations_check_receipts_when_the_ack_precedes_the_feed() {
+    let cfg = config();
+    let signers = SignerSet::derive(crate::ANVIL_MNEMONIC, 2).unwrap();
+    let batch = cfg
+        .build_queues(
+            &signers,
+            &QueuePlan {
+                chain_id: 1,
+                per_sender: 1,
+                starts: vec![0, 0],
+            },
+        )
+        .unwrap();
+    let tracker = Tracker::new().unwrap();
+    tracker.expect_streamed(&signers, batch.queues.planned());
+    let tx = batch.queues.planned().next().unwrap();
+    tracker.await_feed(tx.hash, Instant::now());
+    tracker.confirm_from_feed(
+        tx.hash,
+        &ReceiptStatus {
+            status: 1,
+            gas: 21_000,
+            from: Some(signers[1].address),
+            block: Some(10),
+        },
+    );
+    assert_eq!(
+        (tracker.counts().receipted, tracker.counts().bad_receipt),
+        (1, 1)
+    );
+}
