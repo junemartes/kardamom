@@ -91,7 +91,7 @@ impl CheckpointFull {
             .assert_bind(h, &self.node, &process.cid, true)
             .await?;
         let baseline = self.checkpoint(h, 0).await?;
-        self.verify(h, &baseline, false).await?;
+        self.verify(&baseline, false).await?;
         let before = self.progress(h, &process).await?;
         let armed = self.command(h, "arm").await?;
         let failed = poll::until(Budget::secs(90, 2), |_| async {
@@ -130,7 +130,7 @@ impl CheckpointFull {
         let recovered = self.checkpoint(h, during.block).await?;
         // The restored block must include log records after the new base.
         tokio::time::sleep(Duration::from_secs(3)).await;
-        let restored_block = self.verify(h, &recovered, true).await?;
+        let restored_block = self.verify(&recovered, true).await?;
         let after = self.progress(h, &process).await?;
         anyhow::ensure!(
             after.advanced_after(&during),
@@ -182,7 +182,7 @@ impl CheckpointFull {
         .0)
     }
 
-    async fn verify(&self, h: &Harness, image: &Value, with_log: bool) -> anyhow::Result<u64> {
+    async fn verify(&self, image: &Value, with_log: bool) -> anyhow::Result<u64> {
         let name = image["checkpoint"].as_str().context("missing checkpoint")?;
         let root = self.volume.root();
         let copy = CheckpointCopy {
@@ -191,9 +191,7 @@ impl CheckpointFull {
             name,
             with_log,
         };
-        let restored = tokio::time::timeout(Duration::from_secs(120), copy.verify(h))
-            .await
-            .context("checkpoint copy verification exceeds 120s")??;
+        let restored = copy.verify().await?;
         let base = CheckpointCopy::block(name)?;
         anyhow::ensure!(
             if with_log {

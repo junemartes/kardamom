@@ -545,6 +545,37 @@
       ],
       "status": "known_failure",
       "limitation": "This diagnostic must fail until coverage-safe recovery is implemented. It asserts the required behavior, not the observed bug. It participates in all and keeps the complete local matrix red. The ordinary docker-e2e job runs the four recovery checks separately. See issue #397."
+    },
+    "checkpoint-copy": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "checkpoint_copy::tests::",
+        "--",
+        "--include-ignored"
+      ],
+      "real": [
+        "StateWriter and MDBX checkpoint",
+        "disposable Docker container with tmpfs",
+        "CheckpointCopy exec/tar transfer",
+        "production checkpoint manifest and image verifier"
+      ],
+      "controlled": [
+        "ordinary rootfs versus tmpfs source path",
+        "removed manifest",
+        "GNU tar read-status and warning contract"
+      ],
+      "tests": [
+        "a_tmpfs_checkpoint_is_copied_and_verified_in_the_container_mount_namespace",
+        "a_live_log_growth_warning_is_the_only_tolerated_archive_read_failure",
+        "missing_files_and_mixed_archive_errors_fail_the_copy"
+      ],
+      "limitation": "Proves the harness can verify a checkpoint on the fault volume. It does not prove executor progress during ENOSPC, disk/power-loss durability, or pruning races. The container starts only a bounded sleep process, not chain services.",
+      "negative_control": "The Docker fixture asserts that the old docker cp path fails on the same tmpfs whose exec/tar copy verifies successfully."
     }
   },
   "families": {
@@ -1377,15 +1408,25 @@
     {
       "case": "checkpoint-corrupt-recover",
       "family": "Executor",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "checkpoint-copy",
+          "test": "a_tmpfs_checkpoint_is_copied_and_verified_in_the_container_mount_namespace"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
       "case": "checkpoint-disk-full",
       "family": "Executor",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "checkpoint-copy",
+          "test": "a_tmpfs_checkpoint_is_copied_and_verified_in_the_container_mount_namespace"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
