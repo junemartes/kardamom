@@ -148,3 +148,17 @@ fn both_lua_entry_points_must_remain_denied_before_the_kill() {
         assert!(DataNode::require_denied_scripts(answer).is_err());
     }
 }
+
+#[test]
+fn raw_cli_error_separators_do_not_invalidate_two_denials() {
+    let denied = "NOPERM this user has no permissions to run the command\n\n";
+    DataNode::require_denied_scripts(&denied.repeat(2)).unwrap();
+    for answer in [
+        denied.to_string(),
+        format!("{denied}1\n"),
+        format!("{denied}NOSCRIPT No matching script\n\n"),
+        denied.repeat(3),
+    ] {
+        assert!(DataNode::require_denied_scripts(&answer).is_err());
+    }
+}
