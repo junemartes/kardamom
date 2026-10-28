@@ -111,6 +111,9 @@ jobs:
       - name: checkpoint copy across container mounts
         run: python3 scripts/test-components.py checkpoint-copy
 
+      - name: bounded checkpoint fault controller
+        run: python3 scripts/test-components.py checkpoint-fault
+
       - name: checkpoint and block-log recovery after ENOSPC
         run: python3 scripts/test-components.py state-aux-enospc
 

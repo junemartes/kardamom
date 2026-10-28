@@ -103,3 +103,7 @@ impl Volume {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "kernel_tests.rs"]
+mod kernel_tests;

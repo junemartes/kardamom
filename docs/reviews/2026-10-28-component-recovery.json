@@ -935,6 +935,51 @@
         }
       ],
       "limitation": "Harness recovery evidence only. Does not run a sealer, Nomad cluster or reproduce election consensus. A readable closed majority is still required; persistent missing logs fail at the complete deadline."
+    },
+    "checkpoint-fault": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "checkpoint_full::",
+        "--",
+        "--include-ignored",
+        "--nocapture"
+      ],
+      "real": [
+        "shipped checkpoint ENOSPC controller",
+        "Linux tmpfs writes, ENOSPC, file sizes and age",
+        "job patch and checkpoint/block-log/progress proof parser"
+      ],
+      "controlled": [
+        "one network-isolated Python container with read-only root and a fixed 512-MiB tmpfs",
+        "80-MiB baseline and 160-MiB replacement files",
+        "controlled metric/log fixtures and nine Python boundary controls"
+      ],
+      "tests": [
+        "only_the_victim_checkpoint_source_changes",
+        "enospc_proof_needs_both_failures_after_baseline_and_victim_transaction_progress",
+        "exact_fault_script_refuses_unbounded_storage_and_requires_enospc",
+        "large_images_survive_the_exact_controller_enospc_and_release"
+      ],
+      "limitation": "The large files test controller and filesystem behavior; they are not MDBX checkpoints. Real checkpoint/log recovery is covered separately by state-aux-enospc. Deployed process continuity, mounts, transaction progress and restore proof still require the executor shard.",
+      "negative_controls": [
+        {
+          "mutation": "arbitrary_64m_image_limit",
+          "exit_code": 101,
+          "compiled": true,
+          "kernel_probe_failed": true
+        },
+        {
+          "mutation": "enospc_without_exhaustion",
+          "exit_code": 101,
+          "compiled": true,
+          "kernel_probe_failed": true
+        }
+      ]
     }
   },
   "families": {
@@ -1852,6 +1897,22 @@
         {
           "suite": "state-aux-enospc",
           "test": "auxiliary_enospc_preserves_commits_and_recovers_checkpoint_and_log"
+        },
+        {
+          "suite": "checkpoint-fault",
+          "test": "only_the_victim_checkpoint_source_changes"
+        },
+        {
+          "suite": "checkpoint-fault",
+          "test": "enospc_proof_needs_both_failures_after_baseline_and_victim_transaction_progress"
+        },
+        {
+          "suite": "checkpoint-fault",
+          "test": "exact_fault_script_refuses_unbounded_storage_and_requires_enospc"
+        },
+        {
+          "suite": "checkpoint-fault",
+          "test": "large_images_survive_the_exact_controller_enospc_and_release"
         }
       ],
       "full_case_locally_validated": false
