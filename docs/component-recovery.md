@@ -32,7 +32,7 @@ progress with missing accounts. The diagnostic requires those accounts to be res
 and therefore fails on the current implementation. The four recovery checks use an
 explicit rebuild; they do not prove automatic recovery. This gap relates to the
 coverage protocol in [issue #397](https://github.com/junemartes/kardamom/issues/397).
-`all` includes the diagnostic and remains red until the gap is fixed: 146 passing
+`all` includes the diagnostic and remains red until the gap is fixed: 149 passing
 checks do not cancel a failed correctness assumption. The existing Docker CI job
 runs the four recovery checks; the known failing diagnostic remains separately named.
 
@@ -59,6 +59,24 @@ running. The runner requires fresh reports, preserves them with the logs, names
 every passing/failing test, and rejects skipped or missing expected tests even
 when Gradle exits zero. A negative control that removes seed reoffering on a new
 leadership term must fail the real service test.
+
+`just test-component cache-sentinel` runs three checks with a real primary, replica
+and three Sentinels. It freezes or kills the primary, observes a failed cache read,
+requires promotion, flushes scripts and requires the same cache client to recover.
+It restarts the old primary and rejects an older account update. Losing only the
+replica must still allow primary writes and return zero replication acknowledgements.
+The fixture uses 500ms failure detection and a five-second failover interval, with
+30-second recovery bounds. Redis uses its own real clock. Production defaults stay
+unchanged. Docker sends the stop signal from outside the PID namespace; the test
+also checks the Redis process state, so a successful but ineffective signal cannot
+pass. Role probes reconnect when Redis closes clients during demotion.
+
+This target requires Linux Docker bridge routing: Sentinel advertises container
+addresses to the real client. It starts no chain services and removes its five
+containers and network after each test. It does not reproduce CPU-pressure TILT,
+whole-chain fallback or Nomad placement. Both negative controls fail at recovery:
+not replacing the cached connection, and loading a script only once before failover.
+The existing Docker CI job runs this target.
 
 The executor fixtures mock the state-writer durability signal. Egress tests use a
 real temporary store and peer HTTP server; batcher tests use a real temporary spool
@@ -94,7 +112,7 @@ test rejects a new chaos case without a corresponding plan. Each family lists th
 real actors, boundary faults, recovery invariants and dependencies that still need
 real integration. `partial` means that named local tests validate some boundary
 assumptions. It does not mean the complete distributed case has passed locally.
-Thirty-four cases have partial mappings. No full case is marked locally validated yet.
+Thirty-six cases have partial mappings. No full case is marked locally validated yet.
 
 For each remaining case:
 
@@ -118,7 +136,8 @@ or syscall faults. Nomad placement, container ownership, advertised addresses an
 kernel network scheduling need integration checks. Mocking those guarantees would
 assume the behavior under test. Small local groups can validate many of them
 without deploying the entire chain. The local Raft fixture covers selected lifecycle
-and replay cases; local Sentinel groups and the remaining faults are still needed.
+and replay cases; the local Sentinel fixture covers promotion and client recovery.
+Other fault combinations remain open.
 
 Component success does not replace latency/throughput measurements or the required
 ten consecutive full CI rounds on one unchanged final revision.

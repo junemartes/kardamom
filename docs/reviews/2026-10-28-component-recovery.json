@@ -709,6 +709,55 @@
         "carry-version activation with duplicate references"
       ],
       "limitation": "The actor suite mocks consensus. The Raft suite uses real in-JVM members but does not prove OS process loss, network partitions, deployment or disk power-loss durability."
+    },
+    "cache-sentinel": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-cache",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "sentinel_recovery",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "production AccountCache and Sentinel discovery/reconnect",
+        "Redis primary and replica",
+        "three Redis Sentinel processes",
+        "real Lua script and WAIT acknowledgements"
+      ],
+      "controlled": [
+        "500ms failure detection and 5s failover interval in test-only Sentinel configuration",
+        "Docker SIGSTOP with /proc stopped-state proof",
+        "Docker SIGKILL and restart of the original primary",
+        "SCRIPT FLUSH on the promoted primary",
+        "replica process stop"
+      ],
+      "tests": [
+        "a_frozen_primary_promotes_a_replica_and_the_same_cache_client_recovers",
+        "a_killed_primary_promotes_a_replica_and_the_same_cache_client_recovers",
+        "replica_loss_reports_zero_acknowledgements_without_stopping_primary_writes"
+      ],
+      "limitation": "Requires Linux host routing to Docker bridge addresses. Uses five disposable containers per test and real service clocks. Proves promotion, same-client reconnect, script reload, monotone replay and zero replica acknowledgements. Does not prove whole-chain progress/fallback, CPU-pressure TILT behavior, persistence, total loss or deployment placement.",
+      "negative_controls": [
+        {
+          "mutation": "connection_not_replaced",
+          "exit_code": 101,
+          "failed_at_recovery": true,
+          "compiled": true
+        },
+        {
+          "mutation": "script_loaded_only_once",
+          "exit_code": 101,
+          "failed_at_recovery": true,
+          "compiled": true
+        }
+      ]
     }
   },
   "families": {
@@ -1359,15 +1408,25 @@
     {
       "case": "redis-primary-kill",
       "family": "Cache",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "cache-sentinel",
+          "test": "a_killed_primary_promotes_a_replica_and_the_same_cache_client_recovers"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
       "case": "redis-primary-freeze",
       "family": "Cache",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "cache-sentinel",
+          "test": "a_frozen_primary_promotes_a_replica_and_the_same_cache_client_recovers"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
