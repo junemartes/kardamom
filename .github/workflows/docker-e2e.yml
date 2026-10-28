@@ -103,6 +103,9 @@ jobs:
       - name: cache Sentinel component recovery
         run: python3 scripts/test-components.py cache-sentinel
 
+      - name: mirror backlog Redis observations
+        run: python3 scripts/test-components.py chaos-backlog-redis
+
       - name: state mirror component recovery
         run: |
           python3 scripts/test-components.py state-mirror

@@ -6,24 +6,29 @@ use std::time::Duration;
 
 use anyhow::Context;
 
-use super::{MIRROR_HEAD_KEYS, aux, live_primary, redis_cli, wait_readers_recovered};
+use super::wait_readers_recovered;
+
+mod observe;
+mod store;
 use crate::harness::Harness;
 use crate::metrics;
 use crate::nomad::SavedJob;
 use crate::poll::{self, Budget};
 use crate::rpc::{AccountState, Rpc};
+use observe::Observe;
+use store::Store;
 
 const CTX: &str = "mirror-backlog-client-restart";
 /// The fixture uses the service default of 8192 canonical positions.
 const STALE_GAP: i64 = 8_192;
 
 struct Baseline {
-    primary: String,
+    store: Store,
     heads: Heads,
     account: AccountState,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Heads([NonZeroU64; 3]);
 
 impl Heads {
@@ -68,78 +73,52 @@ impl Baseline {
 
     async fn capture(h: &Harness) -> anyhow::Result<Self> {
         let account = AccountState::after_transfer(h, h.knobs.gate_account).await?;
-        let primary = live_primary(h, CTX).await?;
-        let raw = h
-            .nodes
-            .exec(
-                &aux(h),
-                &redis_cli(&format!("--raw -h {primary} MGET {MIRROR_HEAD_KEYS}")),
-            )
-            .await?;
-        let baseline = Self {
-            primary,
-            heads: Heads::parse(raw.trim_end())?,
-            account,
-        };
-        baseline.await_row(h, &baseline.account).await?;
-        Ok(baseline)
-    }
-
-    async fn row(&self, h: &Harness) -> anyhow::Result<String> {
-        h.nodes
-            .exec(
-                &aux(h),
-                &redis_cli(&format!(
-                    "--raw -h {} HMGET acct:{} nonce balance tx_idx",
-                    self.primary, self.account.address
-                )),
-            )
+        Observe::new("complete baseline", Budget::secs(120, 2))
+            .wait(|| async {
+                let store = Store::discover(h).await?;
+                let heads = store.heads().await?;
+                let observed = store.row(&account).await?;
+                anyhow::ensure!(
+                    account.matches_projection(&observed),
+                    "expected {account:?}, observed {observed:?}"
+                );
+                Ok(Self {
+                    store,
+                    heads,
+                    account: account.clone(),
+                })
+            })
             .await
-    }
-
-    async fn await_row(&self, h: &Harness, account: &AccountState) -> anyhow::Result<()> {
-        let last = std::cell::RefCell::new(String::from("no row response"));
-        let last_ref = &last;
-        poll::until(Budget::secs(120, 2), |_| async move {
-            let observed = self.row(h).await?;
-            let complete = account.matches_projection(&observed);
-            last_ref.replace(observed);
-            Ok::<_, anyhow::Error>(complete.then_some(()))
-        })
-        .await?
-        .or_fail(|elapsed| crate::chaos_fail!(
-            "{CTX}: exact account row is not projected after {}s: expected {account:?}, observed {:?}, primary {}",
-            elapsed.as_secs(), last.borrow(), self.primary
-        ))?;
-        Ok(())
     }
 
     /// A writer can resume from a projection another writer rebuilt.
     /// Every writer must publish two later coverage heads, and the shared
     /// row must match the committed account within the same budget.
-    async fn await_recovery(&self, h: &Harness, account: &AccountState) -> anyhow::Result<()> {
+    async fn await_recovery(&self, account: &AccountState) -> anyhow::Result<()> {
         let first = std::cell::Cell::new(None::<Heads>);
-        let last = std::cell::RefCell::new(String::from("no projection response"));
-        poll::until(Budget::secs(300, 5), |_| async {
-            let raw = h.nodes.exec(&aux(h), &redis_cli(&format!(
-                "--raw -h {} MGET {MIRROR_HEAD_KEYS}", self.primary
-            ))).await?;
-            last.replace(raw.clone());
-            let Ok(heads) = Heads::parse(raw.trim_end()) else {
-                return Ok(None);
-            };
-            if !heads.advanced_over(self.heads) {
-                return Ok(None);
-            }
-            let advancing = first.get().is_some_and(|floor| heads.advanced_over(floor));
-            if first.get().is_none() {
-                first.set(Some(heads));
-            }
-            Ok((advancing && account.matches_projection(&self.row(h).await?)).then_some(()))
-        }).await?.or_fail(|elapsed| crate::chaos_fail!(
-            "{CTX}: restored writers do not advance every coverage head twice with exact account state within {}s (heads {:?})",
-            elapsed.as_secs(), last.borrow()
-        ))?;
+        Observe::new(
+            "two later coverage heads and exact account state",
+            Budget::secs(300, 5),
+        )
+        .wait(|| async {
+            let heads = self.store.heads().await?;
+            anyhow::ensure!(
+                heads.advanced_over(self.heads),
+                "not every coverage head advances"
+            );
+            let floor = first.replace(Some(first.get().unwrap_or(heads)));
+            anyhow::ensure!(
+                floor.is_some_and(|floor| heads.advanced_over(floor)),
+                "not every coverage head advances twice"
+            );
+            let observed = self.store.row(account).await?;
+            anyhow::ensure!(
+                account.matches_projection(&observed),
+                "expected {account:?}, observed {observed:?}"
+            );
+            Ok(())
+        })
+        .await?;
         crate::log(format!(
             "{CTX}: every restored writer advances its coverage head twice and the projected account matches committed state"
         ));
@@ -150,16 +129,7 @@ impl Baseline {
         mirrors.stop().await?;
         // The held heartbeat models live writers whose completed coverage is behind.
         // Its value never advances; no account row is changed by the fault.
-        h.nodes
-            .exec(
-                &aux(h),
-                &redis_cli(&format!(
-                    "-h {} EVAL \"{} return 1\" 0",
-                    self.primary,
-                    self.heads.keep_alive()
-                )),
-            )
-            .await?;
+        self.store.hold(self.heads).await?;
         Rpc::new(&h.rpc_url, h.knobs.chain_id)?
             .transfer_hash(
                 h.knobs.gate_account,
@@ -224,21 +194,12 @@ impl Baseline {
             "{CTX}: nonce and balance did not both bypass stale Redis on a local miss: {before:?} -> {after:?}"
         );
         anyhow::ensure!(
-            self.account.matches_projection(&self.row(h).await?),
+            self.account
+                .matches_projection(&self.store.row(&self.account).await?),
             "{CTX}: the stale row changed while its mirror job was stopped"
         );
-        let raw = h
-            .nodes
-            .exec(
-                &aux(h),
-                &redis_cli(&format!(
-                    "--raw -h {} MGET {MIRROR_HEAD_KEYS}",
-                    self.primary
-                )),
-            )
-            .await?;
         anyhow::ensure!(
-            Heads::parse(raw.trim_end())?.0 == self.heads.0,
+            self.store.heads().await?.0 == self.heads.0,
             "{CTX}: held progress markers changed"
         );
         crate::log(format!(
@@ -308,15 +269,9 @@ pub(crate) async fn client_restart(h: &mut Harness) -> anyhow::Result<()> {
     let baseline = Baseline::capture(h).await?;
     let mirrors = SavedJob::capture(&h.nomad, "state-mirror").await?;
     let verdict = baseline.exercise(h, &mirrors).await;
-    let cleared = h
-        .nodes
-        .exec(
-            &aux(h),
-            &redis_cli(&format!("-h {} DEL {MIRROR_HEAD_KEYS}", baseline.primary)),
-        )
-        .await;
+    let cleared = baseline.store.clear().await;
     let restored = mirrors.restore().await;
-    for result in [cleared.as_ref().map(|_| ()), restored.as_ref().copied()] {
+    for result in [cleared.as_ref().copied(), restored.as_ref().copied()] {
         Baseline::report_cleanup(result);
     }
     let report = serde_json::json!({
@@ -337,7 +292,7 @@ pub(crate) async fn client_restart(h: &mut Harness) -> anyhow::Result<()> {
     cleared?;
     restored?;
     saved?;
-    baseline.await_recovery(h, &expected).await?;
+    baseline.await_recovery(&expected).await?;
     wait_readers_recovered(h, CTX).await?;
     h.assert_progress().await
 }

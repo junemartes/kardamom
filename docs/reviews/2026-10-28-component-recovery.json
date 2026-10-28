@@ -1069,6 +1069,53 @@
           ]
         }
       ]
+    },
+    "chaos-backlog-redis": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "cases::cache::backlog::",
+        "--",
+        "--include-ignored",
+        "--nocapture"
+      ],
+      "real": [
+        "direct bounded Redis client and primary ROLE validation",
+        "one disposable Redis server",
+        "backlog head parser, heartbeat EVAL and cleanup DEL",
+        "bounded observation loop"
+      ],
+      "controlled": [
+        "3.5-second Redis CLIENT PAUSE",
+        "replica demotion with the same old rows present",
+        "paused clock for persistent and hanging observations"
+      ],
+      "tests": [
+        "direct_backlog_reads_preserve_state_retry_a_pause_and_reject_a_demoted_primary",
+        "a_transient_read_failure_retries_until_complete_evidence",
+        "persistent_missing_heads_fail_at_the_recovery_deadline_with_the_cause",
+        "a_hanging_baseline_read_cannot_extend_its_budget",
+        "projection_recovery_requires_a_later_head_from_every_writer",
+        "held_heads_require_three_complete_positive_position_tags",
+        "regressed_or_single_step_counters_cannot_prove_both_fallback_reads",
+        "a_nonce_and_balance_fallback_needs_two_misses_and_no_cache_hit"
+      ],
+      "limitation": "No deployed mirror, ingress or Sentinel promotion. Full cache shard remains required.",
+      "negative_controls": [
+        {
+          "mutation": "Remove ROLE validation from the production connection helper",
+          "compiled": true,
+          "exit_code": 101,
+          "failed": [
+            "direct_backlog_reads_preserve_state_retry_a_pause_and_reject_a_demoted_primary"
+          ],
+          "evidence": "The demoted server returns the retained Heads([10,20,30]); the control rejects that success."
+        }
+      ]
     }
   },
   "families": {

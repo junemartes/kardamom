@@ -249,3 +249,13 @@ separate observations cannot combine into a pass. Persistent and hanging failure
 still fail at the deadline. Five local controls exercise these verdicts; they do
 not certify the deployed Redis or mirror recovery. Restoring immediate error
 propagation makes the transient-recovery and persistent-deadline controls fail.
+
+`just test-component chaos-backlog-redis` runs the backlog fixture's direct Redis
+observations against one disposable server. It checks all three positive coverage
+heads, exact full-width account state, the 600-second held heartbeat and cleanup.
+A 3.5-second pause must outlast a bounded read and recover within the observation
+budget. A demoted server cannot certify even unchanged rows. Clock controls retain
+the 120-second baseline and 300-second recovery limits. The distributed fixture
+still requires two later heads from every writer and exact account state, then
+proves cold-client fallback and reader recovery. These local checks do not run a
+mirror, ingress or Sentinel failover and do not qualify the distributed case.
