@@ -111,6 +111,9 @@ jobs:
       - name: checkpoint copy across container mounts
         run: python3 scripts/test-components.py checkpoint-copy
 
+      - name: checkpoint and block-log recovery after ENOSPC
+        run: python3 scripts/test-components.py state-aux-enospc
+
       # The ingress admission checks and the receipt index with the Redis
       # layer on: the case of an ingress that just restarted.
       - name: kardamom-ingress admission over redis
