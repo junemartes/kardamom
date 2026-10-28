@@ -833,7 +833,8 @@
         "isolated eight-MiB container tmpfs for checkpoint/log files",
         "authoritative state on a separate filesystem",
         "five small blocks, one-byte segment limit and two-entry log queue",
-        "bounded filler writes and removal after observed failures"
+        "bounded filler writes and removal after observed failures",
+        "every fixture storage key checked at every commit and restore, including absence of future writes"
       ],
       "tests": [
         "auxiliary_enospc_preserves_commits_and_recovers_checkpoint_and_log"
@@ -850,6 +851,13 @@
           "exit_code": 101,
           "compiled": true,
           "assertion_failed": true
+        },
+        {
+          "mutation": "delete a storage key written during ENOSPC from the restored block5 database",
+          "original_oracle_exit_code": 0,
+          "full_history_oracle_exit_code": 101,
+          "clean_recovery_exit_code": 0,
+          "failed_assertion": "storage written in block 2, slot 0, after block 5"
         }
       ],
       "limitation": "Linux Docker only. Runs the real test binary with its host shared libraries mounted read-only, without network or added capabilities. Proves auxiliary-volume ENOSPC, same-writer progress, no partial checkpoint publication and restored state after the log resumes. Does not prove state-volume ENOSPC, EIO, power loss, checkpointer scheduling, transaction/receipt end-to-end progress, Nomad mounts or deployment recovery."
