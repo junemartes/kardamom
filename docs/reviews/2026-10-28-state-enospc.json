@@ -1,0 +1,77 @@
+{
+  "status": "Implemented. ENOSPC regressions, negative control, full component matrix and upstream Linux checks pass. No qualification credit.",
+  "bug": {
+    "trigger": "A durable state transaction reaches actual ENOSPC during commit.",
+    "before": "MDBX aborts and releases the failed transaction. The Rust wrapper propagates the error before marking its pointer ended. The synchronized pointer destructor submits another abort and panics on BadTxn.",
+    "after": "Record the ended handle before returning the original error, except MDBX_THREAD_MISMATCH. The writer returns error 28, closes publication, preserves its prior snapshot and can reopen/replay after space is freed.",
+    "native_contract": "signet-mdbx-sys 0.1.0 libmdbx/mdbx.h, mdbx_txn_commit: every result except MDBX_THREAD_MISMATCH ends the transaction."
+  },
+  "patch": {
+    "package": "signet-libmdbx 0.8.3",
+    "archive_sha256": "bd334ebaa7603e0ba8c9d701c883b3d264232e539860b6ff751c94aa959f6f0d",
+    "location": "vendor/signet-libmdbx",
+    "modified_archive_files": [
+      "src/tx/access.rs",
+      "src/tx/impl.rs",
+      "CLAUDE.md"
+    ],
+    "scope": "Both synchronized and unsynchronized commit error paths. The existing success completion marker and transaction manager are unchanged. No native MDBX, wire or stored-format change.",
+    "removal": "Use an upstream release with equivalent cleanup only after the same commit failure and normal-commit checks pass."
+  },
+  "test": {
+    "target": "just test-component state-enospc",
+    "isolation": "One owned Linux Docker container per parent test, network disabled, no added capabilities. The real test executable and shared libraries are mounted read-only. An eight-MiB tmpfs holds authoritative state; the parent has a 120-second execution bound and removes its container.",
+    "data": "Two small blocks and a one-MiB code payload; actual kernel ENOSPC before commit.",
+    "assertions": [
+      "Failed commit returns error 28 without a panic or new snapshot.",
+      "Reopen preserves block/account/storage/cursors and excludes the failed header/code/receipt/hash index.",
+      "Free space and replay the failed batch; require exact resulting code, account, storage and receipt/index.",
+      "Unsynchronized commit preserves the old value, excludes the failed new value and succeeds on retry."
+    ],
+    "negative_control": {
+      "mutation": "failed_sync_commit_not_marked_ended",
+      "exit_code": 101,
+      "compiled": true,
+      "bad_txn_panic": true
+    },
+    "limitation": "The unsynchronized test does not directly count abort calls. No EIO, power loss, trie mode, process supervision, full executor receipt publication or whole-chain recovery proof."
+  },
+  "validation": {
+    "state_library": "127 passed",
+    "binding_host_all_features": "210 unit/integration/property tests and 14 doctests passed; one upstream doctest ignored.",
+    "style": "just style passes; the existing proc-macro-error2 future-incompatibility notice remains.",
+    "component_matrix": {
+      "source_revision": "48163250560ced474b80ed83a34d89a42e4a43ab",
+      "checks": 156,
+      "targets": 22,
+      "seconds": 386.879,
+      "full_suite_locally_validated": false,
+      "qualification_credit": 0
+    },
+    "catalog_and_runner": "One catalog registry check and eight component runner contract tests pass.",
+    "binding_linux": "The published Dockerfile passes nightly formatting, both clippy feature sets with -D warnings, and both test feature sets: 448 passed, two ignored upstream doctest executions. Source hashes match the local patch.",
+    "binding_rustdoc": "cargo doc --locked --no-deps with RUSTDOCFLAGS=-D warnings passes."
+  },
+  "performance": {
+    "before-enospc-cleanup": {
+      "mean_ms": 258.5638905613095,
+      "mean_95_interval_ms": {
+        "lower_bound": 220.61957155954764,
+        "upper_bound": 303.71338060244346
+      },
+      "median_ms": 229.319856
+    },
+    "new": {
+      "mean_ms": 206.1008937273016,
+      "mean_95_interval_ms": {
+        "lower_bound": 186.76581543193254,
+        "upper_bound": 226.6665727157143
+      },
+      "median_ms": 205.57133119999997
+    },
+    "limitations": "Existing 25MB account-only SafeNoSync microbenchmark on a shared host. Not deployed client latency/throughput, durable fsync performance, or proof of a speedup."
+  },
+  "service_wiring": "No service placement, configuration or publication wiring change. The workspace uses the pinned patched binding through a Cargo path patch.",
+  "hot_path": "Commit cleanup is on the state write path. The new helper runs only for errors. The existing 25MB account-only SafeNoSync benchmark shows no measured slowdown; it is not deployed latency/throughput validation and does not prove a speedup.",
+  "qualification_credit": 0
+}

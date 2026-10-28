@@ -6936,8 +6936,6 @@ dependencies = [
 [[package]]
 name = "signet-libmdbx"
 version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd334ebaa7603e0ba8c9d701c883b3d264232e539860b6ff751c94aa959f6f0d"
 dependencies = [
  "bitflags 2.11.1",
  "byteorder",

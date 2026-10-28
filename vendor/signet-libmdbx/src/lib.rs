@@ -1,0 +1,238 @@
+//! Idiomatic and safe Rust bindings for [libmdbx].
+//!
+//! # Overview
+//!
+//! [libmdbx] is a high-performance embedded key-value database based on
+//! LMDB, with additional features like nested transactions, automatic
+//! compaction, and improved durability options.
+//!
+//! This crate provides a safe, idiomatic Rust interface for:
+//! - Creating and managing memory-mapped database environments
+//! - Performing transactional read and write operations
+//! - Iterating over key-value pairs with cursors
+//! - Custom deserialization via the [`TableObject`] trait
+//!
+//! # Quick Start
+//!
+//! Databases are stored in a directory on disk. The following example
+//! demonstrates creating an environment, writing a key-value pair, and
+//! reading it back.
+//!
+//! ```no_run
+//! use signet_libmdbx::{
+//!     Environment, DatabaseFlags, WriteFlags, Geometry, MdbxResult,
+//! };
+//! use std::path::Path;
+//!
+//! fn main() -> MdbxResult<()> {
+//!     // Open an environment (creates directory if needed)
+//!     let env = Environment::builder()
+//!         .set_geometry(Geometry {
+//!             size: Some(0..(1024 * 1024 * 1024)), // up to 1GB
+//!             ..Default::default()
+//!         })
+//!         .open(Path::new("/tmp/my_database"))?;
+//!
+//!     // Write data in a read-write transaction
+//!     let txn = env.begin_rw_sync()?;
+//!     let db = txn.create_db(None, DatabaseFlags::empty())?;
+//!     txn.put(db, b"hello", b"world", WriteFlags::empty())?;
+//!     txn.commit()?;
+//!
+//!     // Read data in a read-only transaction
+//!     let txn = env.begin_ro_sync()?;
+//!     let db = txn.open_db(None)?;
+//!     let value: Option<Vec<u8>> = txn.get(db.dbi(), b"hello").expect("read failed");
+//!     assert_eq!(value.as_deref(), Some(b"world".as_slice()));
+//!
+//!     Ok(())
+//! }
+//! ```
+//! # Imports
+//!
+//! For most use cases, import from the crate root:
+//! ```rust,ignore
+//! use signet_libmdbx::{Environment, DatabaseFlags, WriteFlags, Geometry, MdbxResult};
+//! ```
+//!
+//! Transaction and cursor types are returned from `Environment` and transaction
+//! methods - you rarely need to import them directly.
+//!
+//! For advanced usage, import from submodules:
+//! - [`tx`] - Transaction type aliases (`RoTxSync`, `RwTxUnsync`, etc.) and
+//!   cursor type aliases
+//! - [`tx::iter`] - Iterator types for cursor iteration
+//! - [`sys`] - Environment internals (`EnvironmentKind`, `PageSize`, etc.)
+//!
+//! # Key Concepts
+//!
+//! - [`Environment`] - A directory containing one or more databases. Created
+//!   via [`Environment::builder()`].
+//! - [`TxSync`] and [`TxUnsync`] - Transactions for performing database
+//!   operations.
+//!     - Synchronized transactions (`TxSync`) can be shared between
+//!       threads.
+//!     - Unsynchronized transactions (`TxUnsync`) offer better
+//!       performance for single-threaded use cases.
+//! - [`Ro`] and [`Rw`] - Marker types indicating read-only (`Ro`) or
+//!   read-write (`Rw`) transactions.
+//!     - These also exist in sync flavors: [`RoSync`] and [`RwSync`].
+//! - [`Database`] - A named or unnamed key-value store within an environment.
+//!   - Accessed with [`Tx::open_db`].
+//!   - or created via [`Tx::create_db`].
+//! - [`Cursor`]: Enables iteration and positioned access within a database.
+//!   Created via [`TxSync::cursor()`] or [`TxUnsync::cursor()`].
+//!
+//! [`Tx::open_db`]: crate::tx::Tx::open_db
+//! [`Tx::create_db`]: crate::tx::Tx::create_db
+//!
+//! # Cursor Iterators
+//!
+//! Cursors provide several iterator types for traversing databases. The
+//! iterator to use depends on your database flags and access pattern.
+//!
+//! | Iterator | Cursor Methods | Yields | Description |
+//! |----------|----------------|--------|-------------|
+//! | [`Iter`] | `iter_start`, `iter_from` | `(Key, Value)` | Forward iteration over all key-value pairs. |
+//! | [`IterDup`] | `iter_dup_start`, `iter_dup_from` | [`DupItem`] | Flat iteration over DUPSORT tables. Yields `NewKey` for first value of each key, `SameKey` for subsequent. |
+//! | [`IterDupOfKey`] | `iter_dup_of` | `Value` | Single-key iteration over DUPSORT duplicate values. |
+//! | [`IterDupFixed`] | `iter_dupfixed_start`, `iter_dupfixed_from` | [`DupItem`] | Flat iteration over DUPFIXED tables using page-based access. |
+//! | [`IterDupFixedOfKey`] | `iter_dupfixed_of` | `Value` | Single-key iteration over DUPFIXED values. Exact `size_hint()`. |
+//!
+//! [`Iter`]: crate::tx::iter::Iter
+//! [`IterDup`]: crate::tx::iter::IterDup
+//! [`IterDupOfKey`]: crate::tx::iter::IterDupOfKey
+//! [`IterDupFixed`]: crate::tx::iter::IterDupFixed
+//! [`IterDupFixedOfKey`]: crate::tx::iter::IterDupFixedOfKey
+//! [`DupItem`]: crate::tx::iter::DupItem
+//!
+//! # Custom Zero-copy Deserialization with [`TableObject`]
+//!
+//! Implement [`TableObject`] to decode custom types directly from the
+//! database:
+//!
+//! ```
+//! # use std::borrow::Cow;
+//! use signet_libmdbx::{TableObject, ReadResult, MdbxError};
+//!
+//! struct MyKey([u8; 32]);
+//!
+//! impl TableObject<'_> for MyKey {
+//!     fn decode_borrow(data: Cow<'_, [u8]>) -> ReadResult<Self> {
+//!         let arr: [u8; 32] = data.as_ref().try_into()
+//!             .map_err(|_| MdbxError::DecodeErrorLenDiff)?;
+//!         Ok(Self(arr))
+//!     }
+//! }
+//! ```
+//!
+//! See the [`TableObject`] docs for more examples.
+//!
+//! # Input Validation
+//!
+//! MDBX's C layer **aborts the process** on certain constraint violations,
+//! such as passing a key that is not exactly 4 or 8 bytes to an
+//! [`DatabaseFlags::INTEGER_KEY`] database, or exceeding the maximum
+//! key/value size for the configured page size. These aborts cannot be
+//! caught or recovered from.
+//!
+//! This crate uses a **debug-only validation model**:
+//!
+//! - **Debug builds** (`cfg(debug_assertions)`): Rust-side assertions
+//!   check key/value constraints before they reach FFI. Violations panic
+//!   with a descriptive message. This catches bugs during development.
+//! - **Release builds**: No validation is performed. Invalid input passes
+//!   directly to MDBX for maximum performance. If the input violates
+//!   MDBX constraints, the process may abort.
+//!
+//! The following checks are performed in debug builds:
+//!
+//! 1. Key sizes are checked against the database's configured
+//!    `pagesize` and `DatabaseFlags` (e.g. `INTEGER_KEY`).
+//! 2. Value sizes are checked against the database's configured
+//!    `pagesize` and `DatabaseFlags` (e.g. `INTEGER_DUP`).
+//! 3. `INTEGER_KEY` databases require keys of exactly 4 or 8 bytes.
+//! 4. `INTEGER_DUP` databases require values of exactly 4 or 8 bytes.
+//! 5. For `append` operations, it checks that the key being appended is
+//!    greater than the current last key using lexicographic comparison.
+//!    This check is skipped for `REVERSE_KEY` and `REVERSE_DUP` databases
+//!    since they use different comparison semantics.
+//!
+//! **Callers are responsible for ensuring inputs are valid in release
+//! builds.** This is a deliberate design choice: the library trusts its
+//! callers in release mode for performance, and the debug assertions
+//! exist to catch bugs during development.
+//!
+//! # Provenance
+//!
+//! Forked from [reth-libmdbx], which was forked from an earlier Apache
+//! licensed version of the `libmdbx-rs` crate. Original LMDB bindings from
+//! [lmdb-rs].
+//!
+//! [libmdbx]: https://github.com/erthink/libmdbx
+//! [reth-libmdbx]: https://github.com/paradigmxyz/reth
+//! [lmdb-rs]: https://github.com/mozilla/lmdb-rs
+
+#![warn(
+    missing_copy_implementations,
+    missing_debug_implementations,
+    missing_docs,
+    unreachable_pub,
+    clippy::missing_const_for_fn,
+    rustdoc::all
+)]
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#![deny(unused_must_use, rust_2018_idioms)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+pub extern crate signet_mdbx_sys as ffi;
+
+mod codec;
+pub use codec::{ObjectLength, TableObject, TableObjectOwned};
+mod error;
+pub use error::{MdbxError, MdbxResult, ReadError, ReadResult};
+
+mod flags;
+pub use flags::{DatabaseFlags, EnvironmentFlags, Mode, SyncMode, WriteFlags};
+
+pub mod sys;
+pub use sys::{Environment, EnvironmentBuilder, Geometry, Info, Stat};
+
+pub mod tx;
+pub use tx::aliases::{TxSync, TxUnsync};
+pub use tx::iter::DupItem;
+pub use tx::{CommitLatency, Cursor, Database, Ro, RoSync, Rw, RwSync, TransactionKind};
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use byteorder::{ByteOrder, LittleEndian};
+    use tempfile::tempdir;
+
+    /// Regression test for <https://github.com/danburkert/lmdb-rs/issues/21>.
+    /// This test reliably segfaults when run against lmdb compiled with opt
+    /// level -O3 and newer GCC compilers.
+    #[test]
+    fn issue_21_regression() {
+        const HEIGHT_KEY: [u8; 1] = [0];
+
+        let dir = tempdir().unwrap();
+
+        let env = {
+            let mut builder = Environment::builder();
+            builder.set_max_dbs(2);
+            builder
+                .set_geometry(Geometry { size: Some(1_000_000..1_000_000), ..Default::default() });
+            builder.open(dir.path()).expect("open mdbx env")
+        };
+
+        for height in 0..1000 {
+            let mut value = [0u8; 8];
+            LittleEndian::write_u64(&mut value, height);
+            let tx = env.begin_rw_sync().expect("begin_rw_sync");
+            let index = tx.create_db(None, DatabaseFlags::DUP_SORT).expect("open index db");
+            tx.put(index, HEIGHT_KEY, value, WriteFlags::empty()).expect("tx.put");
+            tx.commit().expect("tx.commit");
+        }
+    }
+}
