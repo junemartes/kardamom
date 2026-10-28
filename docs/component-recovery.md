@@ -29,7 +29,7 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 163 checks.
+head. Both targets run in the existing Docker CI job. `all` runs 169 checks.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
@@ -229,3 +229,11 @@ segments, checks just before and at each boundary, then reopens the real store a
 compares every retained frame. L1 watcher tests also use a paused clock for
 republish and startup deadlines. Other actors and external service clocks still
 need individual review; virtual time does not prove operating-system scheduling.
+
+`just test-component chaos-alert` runs six paused-clock checks for the alert hold
+observer used by `l1-liar`. A 30-second hold starts at the first completed active
+read. Later consecutive active reads must span that duration. Inactive, unknown
+or failed reads reset it. A slow first read cannot certify earlier time, and a
+hanging read cannot extend the 60-second total budget. Failure evidence reports
+the last completed observation and the longest observed active span. These checks
+do not run Prometheus or establish alert behavior under runner contention.
