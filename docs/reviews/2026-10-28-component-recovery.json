@@ -430,6 +430,81 @@
         "a_watcher_without_its_record_pauses_on_the_follower_and_resumes"
       ],
       "limitation": "Validates pause/resume for missing archived records, not transport deployment."
+    },
+    "state-mirror": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-state-mirror",
+        "--features",
+        "docker-e2e",
+        "component_tests::recovery::",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "Mirror::run",
+        "TxReceiptsReceiver production frame decoder",
+        "Rebuild with real 1,025-account MDBX checkpoint",
+        "AccountCache and Redis Lua scripts",
+        "one disposable Redis process from the existing testcontainers fixture"
+      ],
+      "controlled": [
+        "encoded receipt frames instead of Aeron",
+        "Redis ACL refusal after 512 accounts or within a live batch",
+        "actor cancellation and replacement",
+        "SCRIPT FLUSH"
+      ],
+      "tests": [
+        "interrupted_partial_rebuild_restores_untouched_accounts_without_regressing_live_rows",
+        "partial_live_batch_retries_without_new_input_and_publishes_head_last",
+        "script_loss_and_older_replica_frames_preserve_newest_account_state",
+        "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close"
+      ],
+      "negative_controls": {
+        "regressing_rows": {
+          "test": "interrupted_partial_rebuild_restores_untouched_accounts_without_regressing_live_rows",
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "premature_head": {
+          "test": "partial_live_batch_retries_without_new_input_and_publishes_head_last",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      },
+      "limitation": "The interrupted-scan recovery explicitly forces rebuilding. Automatic restart with a surviving advanced head has a separately runnable failing diagnostic. No Sentinel promotion, process kill, disk failure or packet-loss proof."
+    },
+    "state-mirror-coverage-gap": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-state-mirror",
+        "--features",
+        "docker-e2e",
+        "component_tests::coverage_gap::",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "same production mirror/checkpoint/Redis fixture as state-mirror"
+      ],
+      "controlled": [
+        "partial scan interrupted after 512 of 1,025 accounts",
+        "another mirror publishes position 30",
+        "automatic replacement without force_rebuild"
+      ],
+      "tests": [
+        "automatic_restart_must_restore_coverage_despite_another_live_head"
+      ],
+      "status": "known_failure",
+      "limitation": "This diagnostic must fail until coverage-safe recovery is implemented. It asserts the required behavior, not the observed bug. It participates in all and keeps the complete local matrix red. The ordinary docker-e2e job runs the four recovery checks separately. See issue #397."
     }
   },
   "families": {
@@ -766,8 +841,13 @@
     {
       "case": "redis-total-loss-recover",
       "family": "Fleet",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "state-mirror",
+          "test": "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -1080,9 +1160,15 @@
     {
       "case": "mirror-kill-rebuild",
       "family": "Cache",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "state-mirror",
+          "test": "interrupted_partial_rebuild_restores_untouched_accounts_without_regressing_live_rows"
+        }
+      ],
+      "full_case_locally_validated": false,
+      "known_gap": "Automatic restart can resume an incomplete projection when another mirror head survives; state-mirror-coverage-gap reproduces this with unchanged production behavior."
     },
     {
       "case": "executor-restart-storm",

@@ -100,6 +100,9 @@ jobs:
             --features 'docker-e2e' \
             --test redis_e2e -- --ignored --nocapture
 
+      - name: state mirror component recovery
+        run: python3 scripts/test-components.py state-mirror
+
       # The ingress admission checks and the receipt index with the Redis
       # layer on: the case of an ingress that just restarted.
       - name: kardamom-ingress admission over redis

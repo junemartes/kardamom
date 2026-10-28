@@ -15,6 +15,9 @@ use crate::head::HeadFile;
 use crate::metrics::MirrorSteps;
 use crate::rebuild::Rebuild;
 
+#[cfg(all(test, feature = "docker-e2e"))]
+mod component_tests;
+
 /// How long to wait after a failed batch write before the retry.
 const WRITE_RETRY: Duration = Duration::from_millis(100);
 /// A write outage longer than this may have lost frames in the Aeron

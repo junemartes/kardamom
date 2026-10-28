@@ -32,6 +32,11 @@ class EvidenceTests(unittest.TestCase):
     def test_nonzero_exit_fails_even_if_expected_test_passed(self):
         self.assertFalse(self.run_fixture("test recovers ... ok", 1)["success"])
 
+    def test_failed_assertion_is_named_in_the_evidence(self):
+        result = self.run_fixture("test actor::recovers ... FAILED", 101)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["failed"], ["actor::recovers"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,6 +15,9 @@ publish = false
 name = "kardamom-state-mirror"
 path = "src/main.rs"
 
+[features]
+docker-e2e = ["kardamom-cache/docker-e2e", "kardamom-log/testing"]
+
 [dependencies]
 kardamom-cache = { workspace = true }
 kardamom-log = { workspace = true }
@@ -33,3 +36,5 @@ tracing = { workspace = true }
 [dev-dependencies]
 alloy-primitives = { workspace = true }
 tempfile = { workspace = true }
+redis = { workspace = true }
+testcontainers = { workspace = true }
