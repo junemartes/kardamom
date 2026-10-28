@@ -219,7 +219,9 @@
       "controlled": [
         "canonical input copies",
         "posted/final head inputs",
-        "live publication sink"
+        "live publication sink",
+        "10-block retention window and 10-block store segments",
+        "paused clock across two one-hour sync intervals"
       ],
       "tests": [
         "delivered_frames_go_out_live_and_a_read_finds_them_stored",
@@ -237,7 +239,8 @@
         "after_the_peers_give_up_a_boundary_starts_the_stream",
         "a_frozen_posted_head_keeps_every_block_above_it_past_the_window",
         "the_prune_follows_the_lower_of_the_posted_head_and_the_final_head",
-        "unposted_blocks_remain_replayable_after_pruning_and_a_restart"
+        "unposted_blocks_remain_replayable_after_pruning_and_a_restart",
+        "a_small_retention_window_prunes_only_after_sync_and_segment_boundaries"
       ],
       "limitation": "Covers real local storage reopen, not power-loss durability or network deployment.",
       "negative_controls": [
@@ -246,6 +249,15 @@
           "test": "the_prune_follows_the_lower_of_the_posted_head_and_the_final_head",
           "exit_code": 101,
           "failed_as_expected": true
+        }
+      ],
+      "clock_negative_controls": [
+        {
+          "experiment": "mixed_egress_clock",
+          "test": "a_small_retention_window_prunes_only_after_sync_and_segment_boundaries",
+          "exit_code": 101,
+          "assertion_failed": true,
+          "seconds": 1.918
         }
       ]
     },
@@ -320,7 +332,8 @@
         "L1Sources agreement, rotation and backoff"
       ],
       "controlled": [
-        "independent scripted L1 source replies"
+        "independent scripted L1 source replies",
+        "paused clock immediately before and at a one-hour backoff deadline"
       ],
       "tests": [
         "two_sources_that_agree_serve_the_block_and_the_lowest_tip",
@@ -336,9 +349,19 @@
         "log_queries_are_cross_checked",
         "a_source_halt_names_its_halt_cause",
         "a_header_batch_needs_two_agreeing_sources",
-        "an_endpoint_name_never_carries_the_key"
+        "an_endpoint_name_never_carries_the_key",
+        "a_rotated_source_waits_until_the_nonzero_backoff_deadline"
       ],
-      "limitation": "Scripted providers do not prove real HTTP behavior or watcher halt publication."
+      "limitation": "Scripted providers do not prove real HTTP behavior or watcher halt publication.",
+      "clock_negative_controls": [
+        {
+          "experiment": "mixed_backoff_clock",
+          "test": "a_rotated_source_waits_until_the_nonzero_backoff_deadline",
+          "exit_code": 101,
+          "assertion_failed": true,
+          "seconds": 2.525
+        }
+      ]
     },
     "l1-provider-http": {
       "command": [
@@ -355,7 +378,8 @@
         "L1Sources per-source deadlines"
       ],
       "controlled": [
-        "real local HTTP endpoints with batched replies or no response"
+        "real local HTTP endpoints with batched replies or no response",
+        "paused clock after both real HTTP requests reach the fault proxy, then across the unchanged 30-second read timeout and two-second backoff"
       ],
       "tests": [
         "unresponsive_sources_cannot_hold_the_follower_read_forever",
@@ -369,6 +393,22 @@
           "test": "unresponsive_sources_cannot_hold_the_follower_read_forever",
           "exit_code": 101,
           "failed_as_expected": true
+        }
+      ],
+      "clock_negative_controls": [
+        {
+          "experiment": "missing_request_deadline",
+          "test": "unresponsive_sources_cannot_hold_the_follower_read_forever",
+          "exit_code": 101,
+          "assertion_failed": true,
+          "seconds": 3.582
+        },
+        {
+          "experiment": "shortened_request_deadline",
+          "test": "unresponsive_sources_cannot_hold_the_follower_read_forever",
+          "exit_code": 101,
+          "assertion_failed": true,
+          "seconds": 3.439
         }
       ]
     },

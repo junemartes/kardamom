@@ -10,14 +10,14 @@ just test-component executor-pipeline
 just test-component all
 ```
 
-Thirteen targets run 92 checks without external services. They cover sequencer admission, executor
+Thirteen targets run 94 checks without external services. They cover sequencer admission, executor
 commit and execution-pipeline behavior, ingress accounts/receipts/DA halt, egress
 ownership/retention/peer catch-up, batcher recovery, and L1 source/watcher recovery.
 Run one target to iterate, or `all` for the current matrix. These thirteen targets
-start no Docker, Nomad, Redis or Java cluster. The first expanded local run takes
-about one minute including incremental compilation. About 32 seconds exercise the
-unchanged production HTTP-source deadline and backoff. These timings measure tests,
-not transaction performance.
+start no Docker, Nomad, Redis or Java cluster. The HTTP-source target uses real
+HTTP with a paused clock after requests reach the fault proxy. It exercises the
+unchanged 30-second deadline and backoff in about 0.12 seconds of test execution.
+Compilation adds time. These timings measure tests, not transaction performance.
 
 `just test-component state-mirror` adds four checks with one disposable Redis
 container at a time and a real 1,025-account checkpoint. It needs Docker, but starts
@@ -32,7 +32,7 @@ progress with missing accounts. The diagnostic requires those accounts to be res
 and therefore fails on the current implementation. The four recovery checks use an
 explicit rebuild; they do not prove automatic recovery. This gap relates to the
 coverage protocol in [issue #397](https://github.com/junemartes/kardamom/issues/397).
-`all` includes the diagnostic and remains red until the gap is fixed: 96 passing
+`all` includes the diagnostic and remains red until the gap is fixed: 98 passing
 checks do not cancel a failed correctness assumption. The existing Docker CI job
 runs the four recovery checks; the known failing diagnostic remains separately named.
 
@@ -103,5 +103,11 @@ same production boundaries quickly. Tests must assert behavior immediately befor
 at and after a threshold. Advancing Tokio time does not advance `std::time::Instant`,
 Redis expiry, filesystem timestamps or a remote process. Such dependencies need their
 own control or a bounded real-service check. Production retention and timeout defaults
-remain unchanged. The L1 watcher tests already use a paused Tokio clock for republish
-and startup deadlines; additional mixed-clock actors still need this treatment.
+remain unchanged. L1 source backoff and egress sync scheduling use the same Tokio
+monotonic clock as their tests. Without the test clock, Tokio reads the system
+monotonic clock. The tests cross a one-hour source backoff and two one-hour egress
+sync intervals instantly. Egress uses a 10-block retention window and 10-block
+segments, checks just before and at each boundary, then reopens the real store and
+compares every retained frame. L1 watcher tests also use a paused clock for
+republish and startup deadlines. Other actors and external service clocks still
+need individual review; virtual time does not prove operating-system scheduling.

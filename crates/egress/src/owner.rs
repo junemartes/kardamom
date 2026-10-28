@@ -30,7 +30,8 @@
 
 use std::num::NonZeroU64;
 use std::ops::ControlFlow;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use tokio::sync::oneshot;
