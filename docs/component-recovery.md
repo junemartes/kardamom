@@ -32,9 +32,17 @@ progress with missing accounts. The diagnostic requires those accounts to be res
 and therefore fails on the current implementation. The four recovery checks use an
 explicit rebuild; they do not prove automatic recovery. This gap relates to the
 coverage protocol in [issue #397](https://github.com/junemartes/kardamom/issues/397).
-`all` includes the diagnostic and remains red until the gap is fixed: 98 passing
+`all` includes the diagnostic and remains red until the gap is fixed: 101 passing
 checks do not cancel a failed correctness assumption. The existing Docker CI job
 runs the four recovery checks; the known failing diagnostic remains separately named.
+
+`just test-component checkpoint-copy` adds three checks for the checkpoint proof
+transport. One disposable container holds a real MDBX checkpoint on tmpfs. The test
+reproduces the failed `docker cp`, verifies a streamed `docker exec`/tar copy through
+the production restore code, then requires an unmanifested copy to fail. The other
+checks distinguish a growing live log from missing-file or mixed archive failures.
+This covers the harness failure that prevented the disk-full case from reaching its
+fault; executor behavior during ENOSPC still needs the existing chaos shard.
 
 The executor fixtures mock the state-writer durability signal. Egress tests use a
 real temporary store and peer HTTP server; batcher tests use a real temporary spool
@@ -70,7 +78,7 @@ test rejects a new chaos case without a corresponding plan. Each family lists th
 real actors, boundary faults, recovery invariants and dependencies that still need
 real integration. `partial` means that named local tests validate some boundary
 assumptions. It does not mean the complete distributed case has passed locally.
-Twenty-seven cases have partial mappings. No full case is marked locally validated yet.
+Twenty-nine cases have partial mappings. No full case is marked locally validated yet.
 
 For each remaining case:
 

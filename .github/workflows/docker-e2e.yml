@@ -103,6 +103,9 @@ jobs:
       - name: state mirror component recovery
         run: python3 scripts/test-components.py state-mirror
 
+      - name: checkpoint copy across container mounts
+        run: python3 scripts/test-components.py checkpoint-copy
+
       # The ingress admission checks and the receipt index with the Redis
       # layer on: the case of an ingress that just restarted.
       - name: kardamom-ingress admission over redis

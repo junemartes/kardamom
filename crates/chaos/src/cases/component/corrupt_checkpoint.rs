@@ -150,7 +150,7 @@ impl CorruptCheckpoint {
             name,
             with_log: false,
         }
-        .verify(h)
+        .verify()
         .await?;
         anyhow::ensure!(
             restored == block,
