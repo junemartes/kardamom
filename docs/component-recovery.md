@@ -237,3 +237,15 @@ or failed reads reset it. A slow first read cannot certify earlier time, and a
 hanging read cannot extend the 60-second total budget. Failure evidence reports
 the last completed observation and the longest observed active span. These checks
 do not run Prometheus or establish alert behavior under runner contention.
+
+`just test-component chaos-projection` checks the exact account recovery observer.
+Each observation refreshes Sentinel discovery and checks the primary ROLE on the
+connection used for its account reads. The node contract resolves the address;
+these reads do not depend on an inner Docker command or Consul DNS. Failed reads
+remain missing evidence within the existing 120-second budget. One complete
+observation must match the nonce and full-width balance of both the used sender
+and the untouched funded account, with a valid transaction index. Rows from
+separate observations cannot combine into a pass. Persistent and hanging failures
+still fail at the deadline. Five local controls exercise these verdicts; they do
+not certify the deployed Redis or mirror recovery. Restoring immediate error
+propagation makes the transient-recovery and persistent-deadline controls fail.

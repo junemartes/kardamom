@@ -1031,6 +1031,44 @@
           "compiled": true
         }
       ]
+    },
+    "chaos-projection": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "cases::cache::coverage::projection::tests"
+      ],
+      "real": [
+        "exact account projection observer",
+        "shared bounded polling loop"
+      ],
+      "controlled": [
+        "paused Tokio clock",
+        "failed, hanging, malformed, partial and complete primary observations"
+      ],
+      "tests": [
+        "a_failed_read_is_retried_and_only_a_complete_fresh_read_passes",
+        "separate_partial_observations_cannot_be_combined_into_a_pass",
+        "persistent_read_failure_preserves_its_cause_at_the_original_deadline",
+        "a_hanging_read_cannot_extend_the_original_deadline",
+        "missing_extra_malformed_and_wrong_rows_cannot_certify_coverage"
+      ],
+      "limitation": "Observer controls do not run Redis, Sentinel or a deployed mirror. Full cache and combined-execution shards remain required.",
+      "negative_controls": [
+        {
+          "mutation": "Propagate a read error immediately instead of retrying within the original budget",
+          "compiled": true,
+          "exit_code": 101,
+          "failed": [
+            "a_failed_read_is_retried_and_only_a_complete_fresh_read_passes",
+            "persistent_read_failure_preserves_its_cause_at_the_original_deadline"
+          ]
+        }
+      ]
     }
   },
   "families": {
