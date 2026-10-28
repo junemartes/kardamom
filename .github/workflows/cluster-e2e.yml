@@ -202,9 +202,10 @@ jobs:
     # Every shard creates its own cluster. Recovery shards also audit the
     # persisted state and rebuild it from L1. The carry shard runs nine
     # serial rollout cases with staged Ansible deployments. It has a
-    # five-hour job budget; other shards have two hours. Per-case recovery
-    # deadlines bound the faults.
-    timeout-minutes: ${{ matrix.shard == 'chaos-carry' && 300 || 120 }}
+    # five-hour job budget. The executor shard has three hours for node
+    # replacement, two full deployment passes and the final state proofs.
+    # Other shards have two hours. Per-case recovery deadlines bound the faults.
+    timeout-minutes: ${{ matrix.shard == 'chaos-carry' && 300 || matrix.shard == 'chaos-executor' && 180 || 120 }}
     strategy:
       # Don't cancel the other shards if one fails — we want every shard's
       # result on a single run.
