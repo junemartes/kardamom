@@ -41,6 +41,7 @@ enum RebuildReason {
     Outage,
     Audit,
     Rollback,
+    Interrupted,
 }
 
 impl RebuildReason {
@@ -52,6 +53,7 @@ impl RebuildReason {
             Self::Outage => "outage",
             Self::Audit => "audit",
             Self::Rollback => "rollback",
+            Self::Interrupted => "interrupted",
         }
     }
 }
@@ -107,7 +109,7 @@ impl Mirror {
     /// Run until shutdown or the subscription closes.
     pub(crate) async fn run(mut self) -> Result<()> {
         if self.progress.pending_rebuild.is_none() {
-            self.progress.pending_rebuild = self.resume_or_rebuild().await;
+            self.progress.pending_rebuild = self.resume_or_rebuild().await?;
         }
         crate::metrics::set_serving(true);
         loop {
@@ -173,29 +175,34 @@ impl Mirror {
             id = %rollback.id,
             "an executor rolled back; clearing the projection"
         );
+        self.head.begin_rebuild()?;
         self.write_until_landed(&Write::Clear).await
     }
 
-    /// Decide at start: resume when Redis carries a live head at or beyond
+    /// An unfinished recovery cannot resume from another writer's head.
+    /// Otherwise resume when Redis carries a live head at or beyond
     /// this mirror's persisted head, rebuild otherwise. A cold Redis (no
     /// live head from any mirror) rebuilds. A Redis head below the local
     /// head is a failover regression and rebuilds.
-    async fn resume_or_rebuild(&self) -> Option<RebuildReason> {
+    async fn resume_or_rebuild(&self) -> Result<Option<RebuildReason>> {
+        if self.head.rebuild_pending()? {
+            return Ok(Some(RebuildReason::Interrupted));
+        }
         let ids: Vec<u32> = (0..self.head_count).collect();
         let heads = match self.cache.heads(&ids).await {
             Ok(heads) => heads,
             Err(e) => {
                 warn!(error = %e, "start: heads unreadable; rebuilding");
-                return Some(RebuildReason::Cold);
+                return Ok(Some(RebuildReason::Cold));
             }
         };
         let redis_head = heads.iter().flatten().max().copied();
         let local_head = self.head.read();
-        match (redis_head, local_head) {
+        Ok(match (redis_head, local_head) {
             (None, _) => Some(RebuildReason::Cold),
             (Some(redis), Some(local)) if redis < local => Some(RebuildReason::Regression),
             _ => None,
-        }
+        })
     }
 
     /// Apply a group of batches: their rows and receipts through the write
@@ -224,10 +231,12 @@ impl Mirror {
     async fn run_rebuild(&mut self, reason: RebuildReason, first_live: BPosition) -> Result<()> {
         info!(reason = reason.label(), "rebuild: starting");
         crate::metrics::set_serving(false);
+        self.head.begin_rebuild()?;
         let started = Instant::now();
         self.rebuild
             .run(&self.cache, first_live, &self.shutdown)
             .await?;
+        self.head.finish_rebuild()?;
         crate::metrics::record_rebuild(reason.label(), started.elapsed().as_secs_f64());
         crate::metrics::set_serving(true);
         self.last_rebuild = Instant::now();
@@ -243,6 +252,7 @@ impl Mirror {
             match self.try_write(write).await {
                 Ok(()) => break,
                 Err(e) => {
+                    self.head.begin_rebuild()?;
                     crate::metrics::record_write_retry();
                     warn!(error = %e, write = write.label(), "write failed; retrying");
                 }

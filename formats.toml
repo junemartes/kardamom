@@ -534,3 +534,14 @@ shared = false
 code = ["crates/canary/src/store.rs#pub struct Market"]
 [format.canary-market.layout]
 Market = '{"rwa":"0x0606060606060606060606060606060606060606","pool":"0x0707070707070707070707070707070707070707","setup":8,"supply":"0x9","pending":{"Burn":"0x1"},"shares":"0x2"}'
+
+# The empty head.rebuild file beside a mirror's numeric head is a durable
+# local recovery obligation. Only a complete scan removes it. Older binaries
+# ignore it and retain their prior resume rule; an interrupted recovery needs
+# an explicit rebuild when rolling back to such a binary.
+[format.state-mirror-rebuild]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = false
+code = ["crates/state-mirror/src/head.rs#begin_rebuild"]

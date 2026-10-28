@@ -53,7 +53,15 @@ impl Fixture {
     }
 
     pub(super) async fn interrupted_scan() -> Self {
+        Self::interrupted_scan_from(None).await
+    }
+
+    pub(super) async fn interrupted_scan_from(persisted: Option<u64>) -> Self {
         let mut fixture = Self::new().await;
+        let head = fixture.head_file(0);
+        if let Some(position) = persisted {
+            head.write(position).unwrap();
+        }
         fixture.permit_prefix(512).await;
         let first = fixture.start(0, true).await;
         first.send(&Self::batch(0, 1, 20));
@@ -76,6 +84,8 @@ impl Fixture {
                 .to_string()
                 .contains("shutdown")
         );
+        assert!(head.rebuild_pending().unwrap());
+        assert_eq!(head.read(), persisted);
 
         fixture.permit_all().await;
         fixture
@@ -102,6 +112,10 @@ impl Fixture {
         .unwrap();
         live.close().await.unwrap();
         fixture
+    }
+
+    pub(super) fn head_file(&self, id: u32) -> HeadFile {
+        HeadFile::new(self.root.path().join(format!("mirror-{id}/head")))
     }
 
     fn checkpoint(&self) {
@@ -255,7 +269,7 @@ impl Fixture {
             receipts: TxReceiptsReceiver::from_test_frames(rx),
             id,
             head_count: 2,
-            head: HeadFile::new(self.root.path().join(format!("mirror-{id}/head"))),
+            head: self.head_file(id),
             rebuild: Rebuild::new(
                 self.root.path().join("checkpoints"),
                 self.root.path().join(format!("scratch-{id}")),
