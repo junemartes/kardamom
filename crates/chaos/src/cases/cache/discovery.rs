@@ -15,6 +15,19 @@ const PROBE_BUDGET: Duration = Duration::from_secs(3);
 pub(super) struct Discovery;
 
 impl Discovery {
+    pub(super) async fn connect_primary(
+        address: SocketAddr,
+    ) -> anyhow::Result<redis::aio::MultiplexedConnection> {
+        let mut primary = Probe::connect(address).await?;
+        let role: Vec<redis::Value> = redis::cmd("ROLE").query_async(&mut primary).await?;
+        let name = role.first().context("empty Redis ROLE response")?;
+        anyhow::ensure!(
+            redis::from_redis_value::<String>(name.clone())? == "master",
+            "Sentinel names a node that is not a primary"
+        );
+        Ok(primary)
+    }
+
     pub(super) async fn primary(h: &Harness) -> anyhow::Result<Option<String>> {
         let mut tasks = JoinSet::new();
         std::iter::once(&h.probes.validator)
@@ -74,13 +87,7 @@ impl Probe {
         // The node contract resolves Consul names on the Docker host, which
         // does not use the cluster's DNS. ROLE still checks the live process.
         let address = SocketAddr::from((self.contract.node_at(&host)?.ip, port));
-        let mut primary = Self::connect(address).await?;
-        let role: Vec<redis::Value> = redis::cmd("ROLE").query_async(&mut primary).await?;
-        let name = role.first().context("empty Redis ROLE response")?;
-        anyhow::ensure!(
-            redis::from_redis_value::<String>(name.clone())? == "master",
-            "Sentinel names a node that is not a primary"
-        );
+        Discovery::connect_primary(address).await?;
         Ok(host)
     }
 
