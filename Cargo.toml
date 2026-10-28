@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/*"]
+exclude = ["vendor/signet-libmdbx"]
 resolver = "3"
 
 [workspace.package]
@@ -91,3 +92,6 @@ codegen-units = 1
 
 [profile.bench]
 debug = true
+
+[patch.crates-io]
+signet-libmdbx = { path = "vendor/signet-libmdbx" }

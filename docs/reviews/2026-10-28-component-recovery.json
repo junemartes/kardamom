@@ -853,6 +853,50 @@
         }
       ],
       "limitation": "Linux Docker only. Runs the real test binary with its host shared libraries mounted read-only, without network or added capabilities. Proves auxiliary-volume ENOSPC, same-writer progress, no partial checkpoint publication and restored state after the log resumes. Does not prove state-volume ENOSPC, EIO, power loss, checkpointer scheduling, transaction/receipt end-to-end progress, Nomad mounts or deployment recovery."
+    },
+    "state-enospc": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-state",
+        "--features",
+        "docker-e2e",
+        "--lib",
+        "checkpoint::disk_full_tests::state::",
+        "--",
+        "--ignored",
+        "--skip",
+        "state_full_child",
+        "--skip",
+        "unsync_full_child",
+        "--nocapture"
+      ],
+      "real": [
+        "StateWriter and durable MDBX commits",
+        "synchronized and unsynchronized MDBX transactions",
+        "snapshot publication, recovery cursors, accounts, storage, code and receipt indexes",
+        "Linux tmpfs returning ENOSPC"
+      ],
+      "controlled": [
+        "isolated eight-MiB tmpfs for authoritative state",
+        "two blocks and one one-MiB code payload",
+        "bounded filler writes and removal after observed commit failure"
+      ],
+      "tests": [
+        "state_enospc_stops_without_false_publication_and_resumes_after_reopen",
+        "unsynchronized_commit_failure_preserves_data_and_allows_retry"
+      ],
+      "limitation": "Linux Docker only. The synchronized writer regression catches a second abort after a failed commit. The unsynchronized check verifies data preservation and retry, but does not directly observe abort calls. Does not simulate EIO, power loss, trie mode, process supervision, full executor receipt publication or whole-chain recovery.",
+      "negative_controls": [
+        {
+          "mutation": "failed_sync_commit_not_marked_ended",
+          "exit_code": 101,
+          "compiled": true,
+          "bad_txn_panic": true
+        }
+      ]
     }
   },
   "families": {
@@ -1001,9 +1045,7 @@
       "remaining_real_dependencies": "Mocked cursor values alone do not prove persisted coverage, contracts or alert-routing behavior."
     }
   },
-  "pending_registration": {
-    "raft-leader-packet-delay": 917
-  },
+  "pending_registration": {},
   "cases": [
     {
       "case": "graceful-ingress",

@@ -114,6 +114,9 @@ jobs:
       - name: checkpoint and block-log recovery after ENOSPC
         run: python3 scripts/test-components.py state-aux-enospc
 
+      - name: state commit recovery after ENOSPC
+        run: python3 scripts/test-components.py state-enospc
+
       # The ingress admission checks and the receipt index with the Redis
       # layer on: the case of an ingress that just restarted.
       - name: kardamom-ingress admission over redis

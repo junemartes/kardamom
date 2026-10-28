@@ -29,7 +29,7 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 154 checks.
+head. Both targets run in the existing Docker CI job. `all` runs 156 checks.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
@@ -65,6 +65,22 @@ reported by `ldd` read-only into one disposable container. It uses no network or
 extra capabilities. The parent bounds execution and removes the container on exit.
 The existing Docker CI job runs it. It does not prove state-volume ENOSPC, EIO,
 power loss, checkpointer scheduling, Nomad mounts or full transaction progress.
+
+`just test-component state-enospc` adds two checks on the authoritative state
+volume, using two blocks and a one-MiB code payload. A full eight-MiB tmpfs must
+stop the real writer with error 28 and close snapshot publication. Reopening must
+preserve the prior account, storage and replay cursors, with no failed block,
+code, receipt or transaction index. Freeing space and replaying the batch must
+commit it exactly. A second check exercises unsynchronized transactions and retry.
+
+The synchronized check reproduces a product panic in the database binding:
+MDBX ends the failed transaction, but the wrapper aborts its released handle again.
+The pinned patch in [vendor/README.md](../vendor/README.md) marks the failed handle
+ended before returning its error, except for thread mismatch. It changes commit
+error cleanup; successful commits retain their existing completion marker. The
+unsynchronized test checks visible recovery behavior, not the number of abort
+calls. Both tests run in the existing Docker job. They do not prove EIO, power
+loss, trie mode, process supervision or full-chain recovery.
 
 `just test-component sealer-actor` runs 38 Java service checks with controlled
 cluster/session peers, explicit timestamps, four-frame carry/replay windows, and

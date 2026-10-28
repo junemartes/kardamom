@@ -2,6 +2,35 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
+#[derive(Clone, Copy)]
+pub(super) enum Case {
+    Auxiliary,
+    State,
+    Unsync,
+}
+
+impl Case {
+    fn child(self) -> &'static str {
+        match self {
+            Self::Auxiliary => "checkpoint::disk_full_tests::disk_full_child",
+            Self::State => "checkpoint::disk_full_tests::state::state_full_child",
+            Self::Unsync => "checkpoint::disk_full_tests::state::unsync_full_child",
+        }
+    }
+
+    fn proof(self) -> &'static str {
+        match self {
+            Self::Auxiliary => {
+                "ENOSPC proof: checkpoint=28 block_log=28 committed_during=3 restored=5"
+            }
+            Self::State => {
+                "State ENOSPC proof: commit=28 no_false_snapshot=1 recovered=1 resumed=2"
+            }
+            Self::Unsync => "Unsync ENOSPC proof: commit=28 prior_value=1 retry=1",
+        }
+    }
+}
+
 pub(super) struct Container {
     name: String,
     process: Child,
@@ -9,8 +38,8 @@ pub(super) struct Container {
 }
 
 impl Container {
-    pub(super) fn run() {
-        let mut fixture = Self::start();
+    pub(super) fn run(case: Case) {
+        let mut fixture = Self::start(case);
         let deadline = Instant::now()
             .checked_add(Duration::from_secs(120))
             .unwrap();
@@ -20,15 +49,11 @@ impl Container {
             .unwrap();
         let output = std::fs::read_to_string(fixture.log.path()).unwrap();
         assert!(status.success(), "{output}");
-        assert!(
-            output
-                .contains("ENOSPC proof: checkpoint=28 block_log=28 committed_during=3 restored=5"),
-            "{output}"
-        );
+        assert!(output.contains(case.proof()), "{output}");
         println!("{output}");
     }
 
-    fn start() -> Self {
+    fn start(case: Case) -> Self {
         let token = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -48,6 +73,8 @@ impl Container {
             "8m",
             "--env",
             "KARDAMOM_CHECKPOINT_COMPONENT=1",
+            "--env",
+            "RUST_BACKTRACE=1",
             "--entrypoint",
             "/fixture/test",
         ]);
@@ -58,7 +85,7 @@ impl Container {
             .args([
                 "redis:7-alpine",
                 "--exact",
-                "checkpoint::disk_full_tests::disk_full_child",
+                case.child(),
                 "--ignored",
                 "--nocapture",
                 "--test-threads=1",

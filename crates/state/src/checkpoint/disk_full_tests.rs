@@ -1,6 +1,7 @@
-//! Real ENOSPC on an owned eight-MiB tmpfs, with state on a separate filesystem.
+//! Real ENOSPC on an owned eight-MiB tmpfs for auxiliary or authoritative data.
 
 mod container;
+mod state;
 
 use std::fs::File;
 use std::io::Write;
@@ -24,7 +25,7 @@ const BOUND: Duration = Duration::from_secs(5);
 #[test]
 #[ignore = "requires Linux Docker and one disposable container with an eight-MiB tmpfs"]
 fn auxiliary_enospc_preserves_commits_and_recovers_checkpoint_and_log() {
-    container::Container::run();
+    container::Container::run(container::Case::Auxiliary);
 }
 
 #[test]
@@ -36,7 +37,7 @@ fn disk_full_child() {
     fixture.commit(1);
     fixture.wait_for_log(0, 1);
     create_checkpoint(&fixture.env, &fixture.checkpoints).unwrap();
-    fixture.fill();
+    Volume::fill();
 
     fixture.commit(2);
     fixture.wait_for_failures(0);
@@ -64,7 +65,7 @@ fn disk_full_child() {
         "{logs}"
     );
 
-    std::fs::remove_file(fixture.checkpoints.with_file_name("filler")).unwrap();
+    Volume::clear();
     fixture.commit(4);
     fixture.wait_for_log(3, 4);
     assert_eq!(
@@ -127,14 +128,15 @@ impl Fixture {
     }
 
     fn commit(&self, block: u64) {
-        self.writer
-            .delta_tx
-            .send(block_batch(ADDR, block, 2))
-            .unwrap();
+        Self::commit_on(&self.writer, block);
+    }
+
+    fn commit_on(writer: &WriterHandle, block: u64) {
+        writer.delta_tx.send(block_batch(ADDR, block, 2)).unwrap();
         let deadline = Instant::now().checked_add(BOUND).unwrap();
-        let snapshot = std::iter::from_fn(|| self.writer.snapshot_rx.recv_deadline(deadline))
+        let snapshot = std::iter::from_fn(|| writer.snapshot_rx.recv_deadline(deadline))
             .find(|snapshot| snapshot.block_number() == block)
-            .expect("the same writer must commit while its auxiliary filesystem is full");
+            .expect("the writer must commit the requested block");
         Self::assert_state(&snapshot, block);
     }
 
@@ -155,18 +157,6 @@ impl Fixture {
                 U256::from(slot.checked_add(1).unwrap())
             );
         });
-    }
-
-    fn fill(&self) {
-        let mut filler = File::create(self.checkpoints.with_file_name("filler")).unwrap();
-        let error = (0..=2048)
-            .try_for_each(|_| filler.write_all(&[0x5a; 4096]))
-            .unwrap_err();
-        assert_eq!(
-            error.raw_os_error(),
-            Some(28),
-            "the actual tmpfs must run out of space"
-        );
     }
 
     fn failures(&self) -> u64 {
@@ -220,5 +210,25 @@ impl Fixture {
         assert_eq!(restored.0, block);
         let env = StateEnvBuilder::new(path).open().unwrap();
         Self::assert_state(&StateSnapshot::open(&env).unwrap(), block);
+    }
+}
+
+struct Volume;
+
+impl Volume {
+    fn fill() {
+        let mut filler = File::create("/dev/shm/filler").unwrap();
+        let error = (0..=2048)
+            .try_for_each(|_| filler.write_all(&[0x5a; 4096]))
+            .unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(28),
+            "the actual tmpfs must run out of space"
+        );
+    }
+
+    fn clear() {
+        std::fs::remove_file("/dev/shm/filler").unwrap();
     }
 }
