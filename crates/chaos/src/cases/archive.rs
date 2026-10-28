@@ -2,14 +2,14 @@
 //! from the mirror, and segment corruption with detect-and-heal.
 
 use std::cell::RefCell;
-use std::path::Path;
 use std::time::{Duration, SystemTime};
-
-use anyhow::Context;
 
 use crate::harness::Harness;
 use crate::nodes::Pipe;
 use crate::poll::{self, Budget};
+
+mod heal;
+mod staging;
 
 const DRIVER_TASK: &str = "archiving-media-driver";
 const ARCHIVE_DIR: &str = "/opt/kardamom/archive/dir";
@@ -332,7 +332,15 @@ pub(crate) async fn corruption(h: &mut Harness) -> anyhow::Result<()> {
         tail(&pre, 20)
     );
     crate::log("archive-corruption: corruption detected by CRC-armed verify");
-    heal_on_runner(h, &rerep, &victim, &mirror, &seg).await?;
+    heal::Repair {
+        harness: h,
+        tool: &rerep,
+        victim: &victim,
+        mirror: &mirror,
+        segment: &seg,
+    }
+    .run()
+    .await?;
     tool.mark_valid(&seg.rid).await;
     let post = tool.verify(&seg.rid).await;
     anyhow::ensure!(
@@ -536,124 +544,6 @@ print(best + 40 if best >= 0 else -1)
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(-1)
-}
-
-/// Stage both archives on the runner, require `--diff` to name the
-/// segment, heal it, and write only the healed segment back. The staged
-/// mirror copy holds the mirror's bytes under the victim's name first,
-/// because the heal tool pairs segments by name.
-async fn heal_on_runner(
-    h: &Harness,
-    rerep: &Path,
-    victim: &str,
-    mirror: &str,
-    segment: &Segment,
-) -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir().context("staging dir")?;
-    for (node, sub) in [(victim, "victim"), (mirror, "mirror")] {
-        stage_archive(h, node, &tmp.path().join(sub)).await?;
-    }
-    let source = tmp.path().join("mirror/dir");
-    let dest = tmp.path().join("victim/dir");
-    let seg = segment.name.as_str();
-    if segment.mirror_name != segment.name {
-        std::fs::copy(source.join(&segment.mirror_name), source.join(seg))
-            .context("stage the mirror segment under the victim's name")?;
-    }
-    let diff = run_tool(
-        rerep,
-        &[
-            "--diff",
-            "--source-dir",
-            path(&source),
-            "--dest-dir",
-            path(&dest),
-        ],
-    )
-    .await;
-    anyhow::ensure!(
-        diff.contains(seg),
-        "{}: archive-corruption: --diff did not name the corrupted segment {seg}",
-        crate::FAIL_PREFIX
-    );
-    let heal = run_tool(
-        rerep,
-        &[
-            "--heal",
-            "--segments",
-            seg,
-            "--no-verify",
-            "--source-dir",
-            path(&source),
-            "--dest-dir",
-            path(&dest),
-        ],
-    )
-    .await;
-    anyhow::ensure!(
-        heal.contains("healed segments=1"),
-        "{}: archive-corruption: --heal did not repair the segment\n{}",
-        crate::FAIL_PREFIX,
-        tail(&heal, 20)
-    );
-    let healed = std::fs::read(dest.join(seg)).context("read the healed segment")?;
-    h.nodes
-        .exec_with_stdin(victim, &format!("cat > {ARCHIVE_DIR}/{seg}"), healed)
-        .await
-        .map_err(|e| {
-            crate::chaos_fail!("archive-corruption: writing healed segment back failed: {e}")
-        })
-}
-
-fn path(p: &Path) -> &str {
-    p.to_str().unwrap_or("")
-}
-
-async fn stage_archive(h: &Harness, node: &str, into: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(into).context("create staging dir")?;
-    let tar = h
-        .nodes
-        .exec_bytes(node, "tar -C /opt/kardamom/archive -cf - dir", 1)
-        .await
-        .map_err(|e| {
-            crate::chaos_fail!("archive-corruption: staging copy from {node} failed: {e}")
-        })?;
-    untar_into(into, tar).await
-}
-
-/// Extract a tar stream into a runner directory.
-async fn untar_into(into: &Path, tar: Vec<u8>) -> anyhow::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let mut child = tokio::process::Command::new("tar")
-        .args(["-C", path(into), "-xf", "-"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .context("spawn tar on the runner")?;
-    let mut stdin = child.stdin.take().context("tar stdin")?;
-    stdin.write_all(&tar).await.context("feed tar")?;
-    stdin.shutdown().await.context("close tar stdin")?;
-    let status = child.wait().await.context("wait for tar")?;
-    anyhow::ensure!(
-        status.success(),
-        "tar extraction into {} failed: {status}",
-        into.display()
-    );
-    Ok(())
-}
-
-async fn run_tool(tool: &Path, args: &[&str]) -> String {
-    tokio::process::Command::new(tool)
-        .args(args)
-        .output()
-        .await
-        .map(|o| {
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            )
-        })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
