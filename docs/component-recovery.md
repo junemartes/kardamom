@@ -29,7 +29,7 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 151 checks.
+head. Both targets run in the existing Docker CI job. `all` runs 153 checks.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
@@ -84,7 +84,21 @@ whole-chain fallback or Nomad placement. Both negative controls fail at recovery
 not replacing the cached connection, and loading a script only once before failover.
 The existing Docker CI job runs this target.
 
-The executor fixtures mock the state-writer durability signal. Egress tests use a
+`just test-component state-writer-crash` runs two real durable MDBX process-crash
+checks in about 0.3 seconds of test execution. A child runs the production writer.
+An owned metrics recorder blocks its existing synchronous callback after account
+writes but before commit, or after commit but before snapshot publication. The
+parent observes the exact cut, sends SIGKILL, and verifies signal termination.
+Recovery must discard the uncommitted block or preserve the committed block,
+including account/storage values, receipts, hash index and both replay cursors.
+The writer must accept the next block after reopening. Each child has a deadline
+and is killed and reaped on assertion failure. The test uses only two blocks and
+owned temporary storage. The ignored child entry point is invoked by the two
+ordinary tests; the existing workspace CI test job runs them automatically.
+This proves process-crash boundaries while the host filesystem stays alive. Power
+loss, ENOSPC/EIO, trie mode and full executor publication remain separate cases.
+
+The executor commit/pipeline fixtures mock the state-writer durability signal. Egress tests use a
 real temporary store and peer HTTP server; batcher tests use a real temporary spool
 and an HTTP endpoint that refuses dispersal. L1 tests exercise real source/watch
 logic, wire parsers and cursor files with controlled providers and publisher peers.
@@ -118,7 +132,7 @@ test rejects a new chaos case without a corresponding plan. Each family lists th
 real actors, boundary faults, recovery invariants and dependencies that still need
 real integration. `partial` means that named local tests validate some boundary
 assumptions. It does not mean the complete distributed case has passed locally.
-Thirty-six cases have partial mappings. No full case is marked locally validated yet.
+Thirty-seven cases have partial mappings. No full case is marked locally validated yet.
 
 For each remaining case:
 

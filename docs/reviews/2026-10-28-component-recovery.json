@@ -758,6 +758,53 @@
           "compiled": true
         }
       ]
+    },
+    "state-writer-crash": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-state",
+        "--test",
+        "writer_crash"
+      ],
+      "real": [
+        "StateWriter thread and production BatchWriter",
+        "durable MDBX transactions and recovery cursors",
+        "state snapshot, account/storage/receipt/hash-index reads",
+        "owned child process killed with SIGKILL"
+      ],
+      "controlled": [
+        "metrics recorder blocks the production writer after account writes before commit",
+        "metrics recorder blocks after successful MDBX commit before snapshot publication",
+        "two-block fixture; parent verifies the selected cut before killing the child"
+      ],
+      "tests": [
+        "process_loss_before_commit_discards_the_entire_uncommitted_block",
+        "process_loss_after_commit_preserves_a_block_without_a_published_snapshot"
+      ],
+      "limitation": "Unix process crash with the host and filesystem alive. Uses existing synchronous metric callbacks, no production hook. Does not simulate power loss, disk ENOSPC/EIO, checkpoint restore, full executor receipt publication, trie mode or whole-chain recovery.",
+      "negative_controls": [
+        {
+          "mutation": "account_rows_not_written",
+          "exit_code": 101,
+          "failed_tests": [
+            "process_loss_before_commit_discards_the_entire_uncommitted_block",
+            "process_loss_after_commit_preserves_a_block_without_a_published_snapshot"
+          ],
+          "compiled": true
+        },
+        {
+          "mutation": "reader_cursor_not_advanced",
+          "exit_code": 101,
+          "failed_tests": [
+            "process_loss_before_commit_discards_the_entire_uncommitted_block",
+            "process_loss_after_commit_preserves_a_block_without_a_published_snapshot"
+          ],
+          "compiled": true
+        }
+      ]
     }
   },
   "families": {
@@ -1599,6 +1646,14 @@
         {
           "suite": "executor-pipeline",
           "test": "exec_settles_inflight_commits_while_idle"
+        },
+        {
+          "suite": "state-writer-crash",
+          "test": "process_loss_before_commit_discards_the_entire_uncommitted_block"
+        },
+        {
+          "suite": "state-writer-crash",
+          "test": "process_loss_after_commit_preserves_a_block_without_a_published_snapshot"
         }
       ],
       "full_case_locally_validated": false
@@ -1606,8 +1661,17 @@
     {
       "case": "node-failure-executor",
       "family": "Executor",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "state-writer-crash",
+          "test": "process_loss_before_commit_discards_the_entire_uncommitted_block"
+        },
+        {
+          "suite": "state-writer-crash",
+          "test": "process_loss_after_commit_preserves_a_block_without_a_published_snapshot"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
