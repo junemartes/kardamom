@@ -91,7 +91,7 @@ async fn an_external_stop_drains_accepted_transactions_and_reports_actual_durati
     let ingress = Ingress::start().await;
     let directory = tempfile::tempdir().unwrap();
     let output = directory.path().join("report.json");
-    let prepared = prepare(ingress.config(Duration::from_secs(5), &output))
+    let prepared = prepare(ingress.config(Duration::from_secs(7200), &output))
         .await
         .unwrap();
     let progress = prepared.progress();
