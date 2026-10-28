@@ -8,13 +8,13 @@ use jsonrpsee::server::{RpcModule, Server, ServerHandle};
 
 use crate::load::{LoadConfig, NonceStart, SenderRange, prepare};
 
-struct Ingress {
+pub(in crate::load) struct Ingress {
     url: String,
     handle: ServerHandle,
 }
 
 impl Ingress {
-    async fn start() -> Self {
+    pub(in crate::load) async fn start() -> Self {
         Self::with_release(None, 0).await
     }
 
@@ -60,7 +60,7 @@ impl Ingress {
         }
     }
 
-    fn config(&self, duration: Duration, output: &Path) -> LoadConfig {
+    pub(in crate::load) fn config(&self, duration: Duration, output: &Path) -> LoadConfig {
         LoadConfig {
             rpc: self.url.clone(),
             chain_id: Some(1),
@@ -246,4 +246,20 @@ async fn cancelling_a_prepared_run_stops_its_background_receipt_readers() {
         "a detached background reader still owns the delivery tracker"
     );
     assert!(!progress.is_submitting());
+}
+
+#[tokio::test]
+async fn preparation_bounds_chaos_signing_but_presigns_the_performance_run() {
+    let ingress = Ingress::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("report.json");
+    let config = ingress.config(Duration::from_secs(5), &output);
+    let planned = config.per_sender_estimate();
+    let chaos = prepare(config.clone()).await.unwrap();
+    assert_eq!(chaos.setup.queues.planned().count(), 256);
+    let mut performance_config = config;
+    performance_config.chaos_mode = false;
+    let performance = prepare(performance_config).await.unwrap();
+    assert_eq!(performance.setup.queues.planned().count(), planned);
+    assert!(planned > 256);
 }
