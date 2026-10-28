@@ -63,10 +63,14 @@ impl DataNode {
     }
 
     fn require_denied_scripts(answer: &str) -> anyhow::Result<()> {
-        let answers = answer.lines().collect::<Vec<_>>();
+        // redis-cli --raw separates error replies with a blank line.
+        let answers = answer
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
         anyhow::ensure!(
             answers.len() == 2 && answers.iter().all(|answer| answer.starts_with("NOPERM")),
-            "{CTX}: both Redis Lua entry points must reject writes before the mirror kill"
+            "{CTX}: both Redis Lua entry points must reject writes before the mirror kill: {answer:?}"
         );
         Ok(())
     }

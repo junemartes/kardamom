@@ -1,0 +1,47 @@
+{
+  "date": "2026-10-28",
+  "base": "b45c57b2f5492cccec36290be787e1c23fc23129",
+  "defect": "The Lua fault assertion counts redis-cli error separator blank lines as responses. Two correct NOPERM errors appear as four lines and fail before the mirror kill.",
+  "live_failures": [
+    122575075070,
+    122580305292,
+    122585005425
+  ],
+  "reproduction": {
+    "cli": "redis-cli 7.0.15",
+    "responses": [
+      "NOPERM this user has no permissions to run the command\n\n",
+      "NOPERM this user has no permissions to run the command\n\n"
+    ],
+    "combined_lines": [
+      "NOPERM this user has no permissions to run the command",
+      "",
+      "NOPERM this user has no permissions to run the command",
+      ""
+    ],
+    "transport": "local fake RESP server; no Redis or cluster process started"
+  },
+  "redis_74_source": {
+    "url": "https://github.com/redis/redis/blob/7.4/src/redis-cli.c",
+    "raw_error_newline": 1999,
+    "raw_response_delimiter": 2212,
+    "note": "The deployed image pins Redis 7.4. Its source adds an error newline and the command delimiter. The runnable local client is 7.0.15 and reproduces the same formatting against a fake RESP socket."
+  },
+  "fix": "Ignore only empty separator lines. Still require exactly two NOPERM responses; include actual output when proof fails.",
+  "validation": {
+    "negative": "The captured raw-format regression fails on the parent.",
+    "controls": "Single denial, successful EVAL, NOSCRIPT and three denials all remain rejected.",
+    "passed": 308,
+    "ignored": 2,
+    "test_log": "/tmp/chaos-lua-cli-full-20261028.log",
+    "style": "passed",
+    "style_log": "/tmp/chaos-lua-cli-style-20261028.log",
+    "notice": "Existing proc-macro-error2 future-compatibility notice"
+  },
+  "impact": "Chaos proof parser only. No product hot path, service wiring, fault duration or assertion requirement changed.",
+  "limitations": [
+    "Actual mirror rebuild recovery is still pending live validation after this assertion is fixed.",
+    "No local Redis or cluster process started. Only the packaged CLI and a local fake RESP socket ran."
+  ],
+  "qualification_streak": 0
+}
