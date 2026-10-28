@@ -104,7 +104,9 @@ jobs:
         run: python3 scripts/test-components.py cache-sentinel
 
       - name: state mirror component recovery
-        run: python3 scripts/test-components.py state-mirror
+        run: |
+          python3 scripts/test-components.py state-mirror
+          python3 scripts/test-components.py state-mirror-coverage-gap
 
       - name: checkpoint copy across container mounts
         run: python3 scripts/test-components.py checkpoint-copy

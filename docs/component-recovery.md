@@ -25,16 +25,22 @@ no chain services. The tests cover partial scan interruption, partial live write
 script loss, input close and monotone replay. Redis ACL logs prove write refusal
 before recovery. Container and scratch storage owners clean up on test exit.
 
-`just test-component state-mirror-coverage-gap` is a failing diagnostic for a real
-coverage bug. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
-publishes position 30. Automatic restart sees that head, skips the scan and publishes
-progress with missing accounts. The diagnostic requires those accounts to be restored
-and therefore fails on the current implementation. The four recovery checks use an
-explicit rebuild; they do not prove automatic recovery. This gap relates to the
-coverage protocol in [issue #397](https://github.com/junemartes/kardamom/issues/397).
-`all` includes the diagnostic and remains red until the gap is fixed: 149 passing
-checks do not cancel a failed correctness assumption. The existing Docker CI job
-runs the four recovery checks; the known failing diagnostic remains separately named.
+`just test-component state-mirror-coverage-gap` runs two automatic recovery
+regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
+publishes position 30. The replacement must restore every untouched account and
+retain newer live rows before publishing progress, even with a persisted local
+head. Both targets run in the existing Docker CI job. `all` runs 151 checks.
+
+The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
+and when a projection write fails. Its presence requires a checkpoint rebuild on
+restart regardless of other writer heads. Only a complete scan removes and syncs
+the marker; a later head write cannot clear it. Keep the marker with the mirror's
+head directory across task replacement. An older binary ignores this new marker
+and retains its prior recovery behavior; use an explicit rebuild when rolling
+back a mirror with incomplete recovery. This local recovery obligation does not
+certify shared cache generations or detect loss of the entire mirror directory.
+The broader bucket coverage protocol remains in
+[issue #397](https://github.com/junemartes/kardamom/issues/397).
 
 `just test-component checkpoint-copy` adds three checks for the checkpoint proof
 transport. One disposable container holds a real MDBX checkpoint on tmpfs. The test

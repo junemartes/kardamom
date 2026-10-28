@@ -516,7 +516,7 @@
           "failed_as_expected": true
         }
       },
-      "limitation": "The interrupted-scan recovery explicitly forces rebuilding. Automatic restart with a surviving advanced head has a separately runnable failing diagnostic. No Sentinel promotion, process kill, disk failure or packet-loss proof."
+      "limitation": "The partial-scan target forces rebuilding; state-mirror-coverage-gap separately proves automatic recovery from a persisted incomplete-rebuild marker. No Sentinel promotion, process kill, disk failure or packet-loss proof."
     },
     "state-mirror-coverage-gap": {
       "command": [
@@ -541,10 +541,10 @@
         "automatic replacement without force_rebuild"
       ],
       "tests": [
-        "automatic_restart_must_restore_coverage_despite_another_live_head"
+        "automatic_restart_must_restore_coverage_despite_another_live_head",
+        "persisted_progress_cannot_hide_an_interrupted_rebuild"
       ],
-      "status": "known_failure",
-      "limitation": "This diagnostic must fail until coverage-safe recovery is implemented. It asserts the required behavior, not the observed bug. It participates in all and keeps the complete local matrix red. The ordinary docker-e2e job runs the four recovery checks separately. See issue #397."
+      "limitation": "Proves automatic recovery of this mirror after interrupted rebuilding, with or without a persisted head. No claim of shared bucket certification, cache failover durability, or recovery after loss of the mirror data directory."
     },
     "checkpoint-copy": {
       "command": [
@@ -1437,10 +1437,13 @@
         {
           "suite": "state-mirror",
           "test": "interrupted_partial_rebuild_restores_untouched_accounts_without_regressing_live_rows"
+        },
+        {
+          "suite": "state-mirror-coverage-gap",
+          "test": "persisted_progress_cannot_hide_an_interrupted_rebuild"
         }
       ],
-      "full_case_locally_validated": false,
-      "known_gap": "Automatic restart can resume an incomplete projection when another mirror head survives; state-mirror-coverage-gap reproduces this with unchanged production behavior."
+      "full_case_locally_validated": false
     },
     {
       "case": "executor-restart-storm",
