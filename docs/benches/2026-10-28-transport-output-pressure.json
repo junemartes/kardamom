@@ -1,0 +1,455 @@
+{
+  "profile": "release",
+  "independent_publisher": true,
+  "frames_per_phase": {
+    "50": 4096,
+    "1000": 2048
+  },
+  "cpus": "8-11 shared host",
+  "image": "sha256:5f091d6456a75476de0e26ca66c037969d87c32f1fa8b0ee692e4ea10b4ff2dc",
+  "clock_ticks_per_second": 100,
+  "decision": "Keep production command waits unchanged. Merge the recovery probe independently. CPU reduction does not establish acceptable throughput.",
+  "baseline_revision": "4af7cf3c233c374767ce9831356bc4905271d137",
+  "candidate": "Reuse crossbeam Select for unset or >=1ms idle caps; retain recv_timeout below 1ms. Poll/retry cadence and offer deadlines unchanged.",
+  "limits": [
+    "Shared host; four pinned CPUs are not exclusive. Rust process CPU excludes the Java media driver.",
+    "Serialized 1KiB transport frames are not transaction throughput. These trials do not qualify deployed performance or CI.",
+    "Five paired trials at 50us, three paired trials per runtime count at 1ms. Order alternates. All 22 trials pass delivery and recovery.",
+    "At 1ms with 32 receiving runtimes, mean blocked-output idle CPU is 3.2531 baseline versus 0.8012 candidate cores; mean serialized fault-phase rate is 6917.7 versus 5743.5 messages/s. The rate decrease remains unresolved.",
+    "At 50us the candidate retains the baseline receive implementation; recovered mean rate still varies from 35990.4 to 33423.0 messages/s. These samples cannot prove equivalence.",
+    "Rejoin samples include asynchronous subscriber setup and are too few to establish tail latency."
+  ],
+  "rejected_experiments": [
+    "Backing off pending outputs reduced CPU but increased independent quiet-arrival median from about 0.398ms to 0.920ms.",
+    "Unconditional Select reduced CPU but increased 50us-cap connected p99 from about 75us to 178us in the preceding comparison.",
+    "An initial shared publisher/receiver runtime masked independent inbound latency. Final trials use a separate publisher runtime."
+  ],
+  "summary": [
+    {
+      "cap_us": 50,
+      "runtimes": 1,
+      "mode": "baseline",
+      "phase": "idle",
+      "samples": 5,
+      "mean_cores": 0.2539,
+      "median_p99_us": null,
+      "mean_messages_per_second": 0.0
+    },
+    {
+      "cap_us": 50,
+      "runtimes": 1,
+      "mode": "baseline",
+      "phase": "connected",
+      "samples": 5,
+      "mean_cores": 1.2239,
+      "median_p99_us": 89.621,
+      "mean_messages_per_second": 27684.6
+    },
+    {
+      "cap_us": 50,
+      "runtimes": 1,
+      "mode": "baseline",
+      "phase": "outputs_unavailable_idle",
+      "samples": 5,
+      "mean_cores": 0.6784,
+      "median_p99_us": null,
+      "mean_messages_per_second": 0.0
+    },
+    {
+      "cap_us": 50,
+      "runtimes": 1,
+      "mode": "baseline",
+      "phase": "quiet_arrivals_outputs_unavailable",
+      "samples": 5,
+      "mean_cores": 0.685,
+      "median_p99_us": 186.863,
+      "mean_messages_per_second": 89.5
+    },
+    {
+      "cap_us": 50,
+      "runtimes": 1,
+      "mode": "baseline",
+      "phase": "outputs_unavailable",
+      "samples": 5,
+      "mean_cores": 1.2944,
+      "median_p99_us": 79.961,
+      "mean_messages_per_second": 31529.5
+    },
+    {
+      "cap_us": 50,
+      "runtimes": 1,
+      "mode": "baseline",
+      "phase": "output_rejoin",
+      "samples": 5,
+      "mean_cores": 0.4874,
+      "median_p99_us": 82626.66,
+      "mean_messages_per_second": 7.7
+    },
+    {
+      "cap_us": 50,
+      "runtimes": 1,
+      "mode": "baseline",
+      "phase": "recovered",
+      "samples": 5,
+      "mean_cores": 1.4014,
+      "median_p99_us": 58.741,
+      "mean_messages_per_second": 35990.4
+    },
+    {
+      "cap_us": 50,
+      "runtimes": 1,
+      "mode": "policy",
+      "phase": "idle",
+      "samples": 5,
+      "mean_cores": 0.2486,
+      "median_p99_us": null,
+      "mean_messages_per_second": 0.0
+    },
+    {
+      "cap_us": 50,
+      "runtimes": 1,
+      "mode": "policy",
+      "phase": "connected",
+      "samples": 5,
+      "mean_cores": 1.2916,
+      "median_p99_us": 92.391,
+      "mean_messages_per_second": 28879.7
+    },
+    {
+      "cap_us": 50,
+      "runtimes": 1,
+      "mode": "policy",
+      "phase": "outputs_unavailable_idle",
+      "samples": 5,
+      "mean_cores": 0.6736,
+      "median_p99_us": null,
+      "mean_messages_per_second": 0.0
+    },
+    {
+      "cap_us": 50,
+      "runtimes": 1,
+      "mode": "policy",
+      "phase": "quiet_arrivals_outputs_unavailable",
+      "samples": 5,
+      "mean_cores": 0.6895,
+      "median_p99_us": 155.602,
+      "mean_messages_per_second": 89.7
+    },
+    {
+      "cap_us": 50,
+      "runtimes": 1,
+      "mode": "policy",
+      "phase": "outputs_unavailable",
+      "samples": 5,
+      "mean_cores": 1.3429,
+      "median_p99_us": 63.651,
+      "mean_messages_per_second": 31045.9
+    },
+    {
+      "cap_us": 50,
+      "runtimes": 1,
+      "mode": "policy",
+      "phase": "output_rejoin",
+      "samples": 5,
+      "mean_cores": 0.5441,
+      "median_p99_us": 81307.44,
+      "mean_messages_per_second": 7.4
+    },
+    {
+      "cap_us": 50,
+      "runtimes": 1,
+      "mode": "policy",
+      "phase": "recovered",
+      "samples": 5,
+      "mean_cores": 1.3921,
+      "median_p99_us": 56.031,
+      "mean_messages_per_second": 33423.0
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 1,
+      "mode": "baseline",
+      "phase": "idle",
+      "samples": 3,
+      "mean_cores": 0.04,
+      "median_p99_us": null,
+      "mean_messages_per_second": 0.0
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 1,
+      "mode": "baseline",
+      "phase": "connected",
+      "samples": 3,
+      "mean_cores": 0.2536,
+      "median_p99_us": 412.507,
+      "mean_messages_per_second": 5769.9
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 1,
+      "mode": "baseline",
+      "phase": "outputs_unavailable_idle",
+      "samples": 3,
+      "mean_cores": 0.1366,
+      "median_p99_us": null,
+      "mean_messages_per_second": 0.0
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 1,
+      "mode": "baseline",
+      "phase": "quiet_arrivals_outputs_unavailable",
+      "samples": 3,
+      "mean_cores": 0.1679,
+      "median_p99_us": 1189.52,
+      "mean_messages_per_second": 87.1
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 1,
+      "mode": "baseline",
+      "phase": "outputs_unavailable",
+      "samples": 3,
+      "mean_cores": 0.2688,
+      "median_p99_us": 324.315,
+      "mean_messages_per_second": 5903.6
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 1,
+      "mode": "baseline",
+      "phase": "output_rejoin",
+      "samples": 3,
+      "mean_cores": 0.175,
+      "median_p99_us": 46615.677,
+      "mean_messages_per_second": 10.7
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 1,
+      "mode": "baseline",
+      "phase": "recovered",
+      "samples": 3,
+      "mean_cores": 0.2626,
+      "median_p99_us": 330.895,
+      "mean_messages_per_second": 5758.4
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 1,
+      "mode": "policy",
+      "phase": "idle",
+      "samples": 3,
+      "mean_cores": 0.0155,
+      "median_p99_us": null,
+      "mean_messages_per_second": 0.0
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 1,
+      "mode": "policy",
+      "phase": "connected",
+      "samples": 3,
+      "mean_cores": 0.191,
+      "median_p99_us": 315.635,
+      "mean_messages_per_second": 6173.1
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 1,
+      "mode": "policy",
+      "phase": "outputs_unavailable_idle",
+      "samples": 3,
+      "mean_cores": 0.0466,
+      "median_p99_us": null,
+      "mean_messages_per_second": 0.0
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 1,
+      "mode": "policy",
+      "phase": "quiet_arrivals_outputs_unavailable",
+      "samples": 3,
+      "mean_cores": 0.0452,
+      "median_p99_us": 1237.17,
+      "mean_messages_per_second": 86.8
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 1,
+      "mode": "policy",
+      "phase": "outputs_unavailable",
+      "samples": 3,
+      "mean_cores": 0.1903,
+      "median_p99_us": 320.595,
+      "mean_messages_per_second": 6151.3
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 1,
+      "mode": "policy",
+      "phase": "output_rejoin",
+      "samples": 3,
+      "mean_cores": 0.0548,
+      "median_p99_us": 70388.253,
+      "mean_messages_per_second": 8.6
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 1,
+      "mode": "policy",
+      "phase": "recovered",
+      "samples": 3,
+      "mean_cores": 0.1892,
+      "median_p99_us": 320.015,
+      "mean_messages_per_second": 6118.3
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 32,
+      "mode": "baseline",
+      "phase": "idle",
+      "samples": 3,
+      "mean_cores": 0.5031,
+      "median_p99_us": null,
+      "mean_messages_per_second": 0.0
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 32,
+      "mode": "baseline",
+      "phase": "connected",
+      "samples": 3,
+      "mean_cores": 0.7765,
+      "median_p99_us": 320.715,
+      "mean_messages_per_second": 6127.2
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 32,
+      "mode": "baseline",
+      "phase": "outputs_unavailable_idle",
+      "samples": 3,
+      "mean_cores": 3.2531,
+      "median_p99_us": null,
+      "mean_messages_per_second": 0.0
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 32,
+      "mode": "baseline",
+      "phase": "quiet_arrivals_outputs_unavailable",
+      "samples": 3,
+      "mean_cores": 3.231,
+      "median_p99_us": 1397.513,
+      "mean_messages_per_second": 85.7
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 32,
+      "mode": "baseline",
+      "phase": "outputs_unavailable",
+      "samples": 3,
+      "mean_cores": 2.7363,
+      "median_p99_us": 351.316,
+      "mean_messages_per_second": 6917.7
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 32,
+      "mode": "baseline",
+      "phase": "output_rejoin",
+      "samples": 3,
+      "mean_cores": 0.5762,
+      "median_p99_us": 127087.731,
+      "mean_messages_per_second": 9.4
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 32,
+      "mode": "baseline",
+      "phase": "recovered",
+      "samples": 3,
+      "mean_cores": 0.7687,
+      "median_p99_us": 329.146,
+      "mean_messages_per_second": 6054.2
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 32,
+      "mode": "policy",
+      "phase": "idle",
+      "samples": 3,
+      "mean_cores": 0.1589,
+      "median_p99_us": null,
+      "mean_messages_per_second": 0.0
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 32,
+      "mode": "policy",
+      "phase": "connected",
+      "samples": 3,
+      "mean_cores": 0.2944,
+      "median_p99_us": 313.715,
+      "mean_messages_per_second": 6462.0
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 32,
+      "mode": "policy",
+      "phase": "outputs_unavailable_idle",
+      "samples": 3,
+      "mean_cores": 0.8012,
+      "median_p99_us": null,
+      "mean_messages_per_second": 0.0
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 32,
+      "mode": "policy",
+      "phase": "quiet_arrivals_outputs_unavailable",
+      "samples": 3,
+      "mean_cores": 0.8056,
+      "median_p99_us": 1230.77,
+      "mean_messages_per_second": 85.5
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 32,
+      "mode": "policy",
+      "phase": "outputs_unavailable",
+      "samples": 3,
+      "mean_cores": 0.9066,
+      "median_p99_us": 332.316,
+      "mean_messages_per_second": 5743.5
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 32,
+      "mode": "policy",
+      "phase": "output_rejoin",
+      "samples": 3,
+      "mean_cores": 0.1815,
+      "median_p99_us": 127897.933,
+      "mean_messages_per_second": 9.5
+    },
+    {
+      "cap_us": 1000,
+      "runtimes": 32,
+      "mode": "policy",
+      "phase": "recovered",
+      "samples": 3,
+      "mean_cores": 0.3005,
+      "median_p99_us": 315.026,
+      "mean_messages_per_second": 6366.7
+    }
+  ],
+  "raw_samples": {
+    "path": "2026-10-28-transport-output-pressure.csv",
+    "sha256": "8db472febab5d35e4bc6c6dcfea793846e45eb7e291f160fb549551cd8f1626a",
+    "trials": 22,
+    "passing_trials": 22
+  }
+}

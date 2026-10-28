@@ -1,0 +1,62 @@
+{
+  "status": "179 local component checks, negative controls, 332 ordinary chaos unit tests and style pass. Changes are not yet in integration.",
+  "observed_failures": [
+    {
+      "kind": "distributed",
+      "run": 40653610052,
+      "job": 122733119601,
+      "failure": "After every mirror reports Complete, an HMGET observation times out at 20 seconds and terminates the 120-second coverage wait. Timeout root cause remains unknown."
+    },
+    {
+      "kind": "local",
+      "evidence": "/tmp/kardamom-components-buamh_x2/results.json",
+      "failure": "Cold mirror observer unwraps one Redis head-read timeout before the five-second recovery wait completes."
+    }
+  ],
+  "changes": [
+    "Discover a live primary again for each full account observation.",
+    "Retry failed observations inside the unchanged 120-second coverage budget; preserve the last error or incomplete account list on failure.",
+    "Require one complete comparison of every expected account; do not combine partial attempts.",
+    "Retry local head observations inside the unchanged five-second budget, leaving the cache command timeout unchanged."
+  ],
+  "controls": [
+    {
+      "name": "mirror",
+      "exit_code": 101,
+      "compiled": true,
+      "intended_failure": true
+    },
+    {
+      "name": "coverage",
+      "exit_code": 101,
+      "compiled": true,
+      "intended_failure": true
+    }
+  ],
+  "test_scope": [
+    "Four paused-clock coverage wait checks, four existing exact account/executor baseline checks.",
+    "A real Redis CLIENT PAUSE fault crosses the existing 200-ms command timeout and verifies observer recovery.",
+    "These are observer controls. Separate real mirror and Sentinel suites remain required. No deployed failover root cause or full-case equivalence is claimed."
+  ],
+  "product_bug": false,
+  "service_wiring_changed": false,
+  "hot_path_changed": false,
+  "qualification_credit": 0,
+  "review": "R1-R16: comments state invariants; generic observation future with static dispatch; scoped borrows and owned test queues; existing polling utility owns the deadline; no manual drop or new synchronization; no product configuration or stored-format changes.",
+  "validation": {
+    "matrix": {
+      "checks": 179,
+      "targets": 27,
+      "seconds": 170.357,
+      "source_revision": "163d15e81acde38202358f952c2c09ffc16df992",
+      "evidence": "/tmp/kardamom-components-buwpxdeb/results.json",
+      "all_pass": true
+    },
+    "chaos_unit": {
+      "passed": 332,
+      "ignored": 4
+    },
+    "runner_controls": 8,
+    "style": "Pass; existing proc-macro-error2 future-incompatibility notice remains."
+  }
+}

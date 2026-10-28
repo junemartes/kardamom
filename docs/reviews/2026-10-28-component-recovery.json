@@ -502,7 +502,8 @@
         "interrupted_partial_rebuild_restores_untouched_accounts_without_regressing_live_rows",
         "partial_live_batch_retries_without_new_input_and_publishes_head_last",
         "script_loss_and_older_replica_frames_preserve_newest_account_state",
-        "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close"
+        "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close",
+        "a_transient_head_read_timeout_does_not_end_the_recovery_wait"
       ],
       "negative_controls": {
         "regressing_rows": {
@@ -1031,6 +1032,79 @@
           "compiled": true
         }
       ]
+    },
+    "transport-pressure": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-log",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "transport_pressure",
+        "--",
+        "--ignored",
+        "--exact",
+        "unavailable_outputs_preserve_live_delivery_and_recover",
+        "--nocapture"
+      ],
+      "real": [
+        "AeronRuntime poll and retry loop",
+        "Aeron C client and Java media driver",
+        "UDP publications, subscriptions and payload delivery"
+      ],
+      "controlled": [
+        "eight runtimes by default with distinct UDP streams and a 64-KiB term length",
+        "absent output subscribers followed by late joins",
+        "one disposable driver; no chain services",
+        "optional bounded runtime and message counts for profiling",
+        "independent publisher runtime; quiet arrivals cannot wake the receiver through its command channel"
+      ],
+      "tests": [
+        "unavailable_outputs_preserve_live_delivery_and_recover"
+      ],
+      "limitation": "Transport-level composition only. Does not run the executor, sequencer, Redis, sealer consensus or cross-host network. CPU samples cover the Rust process, not the Java driver or full cluster. No timing speedup or deployment performance claim follows from this regression.",
+      "negative_controls": [
+        {
+          "mutation": "Do not poll subscriptions while an output is pending.",
+          "exit_code": 101,
+          "compiled": true,
+          "starvation_observed": true
+        }
+      ]
+    },
+    "chaos-cache-coverage": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "cases::cache::coverage::"
+      ],
+      "real": [
+        "Distributed cache coverage predicate and recovery wait",
+        "HTTP executor account-query client"
+      ],
+      "controlled": [
+        "Executor HTTP replies",
+        "Coverage observation failures and incomplete account sets",
+        "Paused Tokio clock for the unchanged 120-second wait"
+      ],
+      "tests": [
+        "a_present_row_does_not_prove_correct_coverage",
+        "untouched_funded_accounts_keep_full_width_balances",
+        "a_receipted_transfer_waits_for_the_lagging_executor_before_comparing_redis",
+        "an_executor_baseline_requires_full_state_agreement_and_the_receipted_nonce",
+        "a_failed_read_retries_a_complete_observation_within_the_original_budget",
+        "persistent_read_errors_fail_at_the_total_deadline_with_the_cause",
+        "partial_observations_cannot_combine_into_complete_coverage",
+        "a_hanging_first_observation_cannot_extend_the_total_deadline"
+      ],
+      "limitation": "Observer controls do not reproduce Redis promotion or establish the cause of a deployed HMGET timeout. Existing Sentinel and mirror actor suites exercise those components separately."
     }
   },
   "families": {
@@ -1379,6 +1453,22 @@
         {
           "suite": "state-mirror",
           "test": "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close"
+        },
+        {
+          "suite": "chaos-cache-coverage",
+          "test": "a_failed_read_retries_a_complete_observation_within_the_original_budget"
+        },
+        {
+          "suite": "chaos-cache-coverage",
+          "test": "persistent_read_errors_fail_at_the_total_deadline_with_the_cause"
+        },
+        {
+          "suite": "chaos-cache-coverage",
+          "test": "partial_observations_cannot_combine_into_complete_coverage"
+        },
+        {
+          "suite": "chaos-cache-coverage",
+          "test": "a_hanging_first_observation_cannot_extend_the_total_deadline"
         }
       ],
       "full_case_locally_validated": false
@@ -1484,8 +1574,13 @@
     {
       "case": "executor-sealer-loss-recover",
       "family": "CombinedExec",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "transport-pressure",
+          "test": "unavailable_outputs_preserve_live_delivery_and_recover"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -1539,6 +1634,22 @@
         {
           "suite": "ingress-receipts",
           "test": "a_failed_egress_falls_back_to_the_executor"
+        },
+        {
+          "suite": "chaos-cache-coverage",
+          "test": "a_failed_read_retries_a_complete_observation_within_the_original_budget"
+        },
+        {
+          "suite": "chaos-cache-coverage",
+          "test": "persistent_read_errors_fail_at_the_total_deadline_with_the_cause"
+        },
+        {
+          "suite": "chaos-cache-coverage",
+          "test": "partial_observations_cannot_combine_into_complete_coverage"
+        },
+        {
+          "suite": "chaos-cache-coverage",
+          "test": "a_hanging_first_observation_cannot_extend_the_total_deadline"
         }
       ],
       "full_case_locally_validated": false

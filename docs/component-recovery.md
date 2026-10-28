@@ -29,7 +29,7 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 169 checks.
+head. Both targets run in the existing Docker CI job. `all` runs 179 checks.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
@@ -237,3 +237,32 @@ or failed reads reset it. A slow first read cannot certify earlier time, and a
 hanging read cannot extend the 60-second total budget. Failure evidence reports
 the last completed observation and the longest observed active span. These checks
 do not run Prometheus or establish alert behavior under runner contention.
+
+`just test-component transport-pressure` runs eight real Aeron runtimes against
+one disposable media driver. Independent output streams lack subscribers while a
+live stream from a separate publisher runtime must deliver every 1-KiB frame. The output offers must remain pending
+through the sample, then report NOT_CONNECTED at the existing deadline. Late
+subscribers must receive a fresh pending frame without an expired frame preceding
+it. Quiet-arrival samples also keep the receiving runtime asleep until UDP input arrives.
+Delivery is checked again after recovery. The driver and scratch files are
+removed on exit. The target runs in the existing Docker CI job.
+
+For an isolated transport profile, set `KARDAMOM_PROFILE_RUNTIMES` to 1–64 and
+`KARDAMOM_PROFILE_FRAMES` to 1–4096. Defaults are eight runtimes and 256 frames per
+phase. `TRANSPORT_SAMPLE` lines report process CPU ticks, elapsed time and delivery
+p50/p95/p99. CPU ticks cover the Rust process; they exclude the Java driver. A
+single rejoin observation is not a population percentile. This profile does not
+measure transaction performance or reproduce the full deployment.
+
+`just test-component chaos-cache-coverage` checks the distributed recovery
+observer with controlled failures and a paused Tokio clock. A failed observation
+retries primary discovery and the complete account comparison under the original
+120-second budget. Reads from different attempts cannot combine into a coverage
+certificate. Persistent errors and hanging reads still fail at that deadline.
+Existing tests retain exact nonce, full-width balance, and executor-agreement
+checks. These controls do not establish the cause of a live Redis timeout.
+
+The mirror actor target also pauses a real Redis server for 400 ms. The head
+observer retains its 200-ms request timeout and five-second recovery budget;
+a transient observation error no longer aborts that recovery wait. This test
+checks observer behavior, separately from the actor's recovery assertions.

@@ -106,3 +106,24 @@ async fn a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input
     );
     actor.close().await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires one disposable Redis container"]
+async fn a_transient_head_read_timeout_does_not_end_the_recovery_wait() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .cache
+        .set_head(0, BPosition::from_index(20))
+        .await
+        .unwrap();
+    redis::cmd("CLIENT")
+        .arg("PAUSE")
+        .arg(400)
+        .arg("ALL")
+        .query_async::<()>(&mut fixture.admin)
+        .await
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    fixture.head(0, 20).await;
+    assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+}

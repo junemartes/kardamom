@@ -1,6 +1,7 @@
 //! Exact account coverage includes a used sender and an untouched funded account.
 
 use std::cell::RefCell;
+use std::future::Future;
 
 use super::rebuilds::{MirrorRebuilds, RebuildPhase};
 use super::{aux, live_primary, redis_cli};
@@ -34,31 +35,21 @@ impl CacheRecovery {
         self.mirrors
             .await_phase(h, ctx, RebuildPhase::Complete)
             .await?;
-        let master = live_primary(h, ctx).await?;
-        let last = RefCell::new(Vec::new());
-        let (master_ref, last_ref) = (&master, &last);
-        let outcome = poll::until(Budget::secs(120, 3), |_| async move {
-            let mut missing = Vec::new();
-            for account in &self.expected {
-                Self::check(h, master_ref, account, &mut missing).await?;
-            }
-            let complete = missing.is_empty();
-            last_ref.replace(missing);
-            Ok::<_, anyhow::Error>(complete.then_some(()))
-        })
-        .await?;
-        outcome.or_fail(|t| {
-            crate::chaos_fail!(
-                "{ctx}: exact account coverage did not return after {}s: {:?}",
-                t.as_secs(),
-                last.borrow()
-            )
-        })?;
+        CoverageWait::run(ctx, Budget::secs(120, 3), || self.missing(h, ctx)).await?;
         crate::log(format!(
             "{ctx}: exact rebuilt nonce and balance match the executor for {:?}",
             self.expected
         ));
         Ok(())
+    }
+
+    async fn missing(&self, h: &Harness, ctx: &str) -> anyhow::Result<Vec<String>> {
+        let master = live_primary(h, ctx).await?;
+        let mut missing = Vec::new();
+        for account in &self.expected {
+            Self::check(h, &master, account, &mut missing).await?;
+        }
+        Ok(missing)
     }
 
     async fn check(
@@ -75,6 +66,46 @@ impl CacheRecovery {
         if !account.matches_projection(&observed) {
             missing.push(format!("expected {account:?}, observed {observed:?}"));
         }
+        Ok(())
+    }
+}
+
+struct CoverageWait;
+
+impl CoverageWait {
+    // One complete observation must match every account. Errors never certify
+    // coverage, and retries share the original recovery deadline.
+    async fn run<F, Fut>(ctx: &str, budget: Budget, mut observe: F) -> anyhow::Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = anyhow::Result<Vec<String>>>,
+    {
+        let last = RefCell::new(vec!["no completed coverage observation".to_owned()]);
+        let outcome = poll::until(budget, |_| {
+            let observation = observe();
+            let last = &last;
+            async move {
+                let missing = match observation.await {
+                    Ok(missing) => missing,
+                    Err(error) => {
+                        let message = format!("coverage observation failed: {error:#}");
+                        crate::log(format!("{ctx}: {message}"));
+                        vec![message]
+                    }
+                };
+                let complete = missing.is_empty();
+                last.replace(missing);
+                Ok::<_, anyhow::Error>(complete.then_some(()))
+            }
+        })
+        .await?;
+        outcome.or_fail(|t| {
+            crate::chaos_fail!(
+                "{ctx}: exact account coverage did not return after {}s: {:?}",
+                t.as_secs(),
+                last.borrow()
+            )
+        })?;
         Ok(())
     }
 }
@@ -165,3 +196,6 @@ impl ReplicaAccount {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod wait_tests;
