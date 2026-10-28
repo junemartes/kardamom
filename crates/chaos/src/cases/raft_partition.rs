@@ -9,7 +9,7 @@ use crate::cases::combined::Check;
 use crate::harness::Harness;
 use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
-use crate::rpc::Rpc;
+use crate::rpc::{RecoveryCause, Rpc};
 
 const CTX: &str = "raft-leader-one-way-partition";
 mod loss;
@@ -120,7 +120,11 @@ impl Partition {
 
     async fn transfer(h: &Harness, context: &str) -> anyhow::Result<()> {
         Rpc::new(&h.rpc_url, h.knobs.chain_id)?
-            .transfer_within(h.knobs.gate_account, Duration::from_secs(60))
+            .transfer_within(
+                h.knobs.gate_account,
+                Duration::from_secs(60),
+                RecoveryCause::NoQuorum,
+            )
             .await
             .with_context(|| format!("{context}: fault blocks the client past its bound"))
     }

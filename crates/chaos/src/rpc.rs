@@ -9,6 +9,7 @@
 mod deposit;
 mod recovery;
 pub(crate) use deposit::ReceiptPosition;
+pub(crate) use recovery::RecoveryCause;
 
 use std::time::Duration;
 

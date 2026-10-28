@@ -10,7 +10,7 @@ use crate::harness::Harness;
 use crate::nodes::RunningProcess;
 use crate::nomad::SavedJob;
 use crate::poll::{self, Budget};
-use crate::rpc::Rpc;
+use crate::rpc::{RecoveryCause, Rpc};
 
 mod proof;
 mod volume;
@@ -102,7 +102,11 @@ impl CheckpointFull {
         .or_fail(|_| anyhow::anyhow!("{CTX}: no executor checkpoint and block-log ENOSPC in 90s"))?
         .0;
         Rpc::new(&h.rpc_url, h.knobs.chain_id)?
-            .transfer_within(h.knobs.gate_account, Duration::from_secs(60))
+            .transfer_within(
+                h.knobs.gate_account,
+                Duration::from_secs(60),
+                RecoveryCause::NoQuorum,
+            )
             .await?;
         let during = poll::until(Budget::secs(30, 2), |_| async {
             let current = self.progress(h, &process).await?;
