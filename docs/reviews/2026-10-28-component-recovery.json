@@ -1,0 +1,912 @@
+{
+  "version": 1,
+  "policy": "A local boundary test is partial evidence for its distributed case. No case is complete until all listed invariants, real dependencies and negative controls are validated. Do not replace final-head chaos qualification with this inventory.",
+  "local_suites": {
+    "sequencer": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-sequencer",
+        "--test",
+        "component_recovery"
+      ],
+      "real": [
+        "AdmissionLoop::run",
+        "ClusterRefPublisher",
+        "SealerRules",
+        "production ingress/egress wire codecs"
+      ],
+      "controlled": [
+        "bounded tx_data channel",
+        "account lookup replies",
+        "cluster ingress acceptance/disconnect/backpressure",
+        "canonical feed delivery"
+      ],
+      "tests": [
+        "output_backpressure_and_disconnect_recover_without_new_client_input",
+        "lost_offer_on_session_restart_replays_the_exact_prefix_before_its_suffix",
+        "absent_lookup_reply_holds_the_sender_until_the_real_account_event_arrives",
+        "stalled_input_resumes_and_permanent_input_close_stops_the_actor",
+        "delayed_canonical_input_fills_the_outbox_then_resumes_in_order",
+        "a_permanent_output_encoding_failure_is_reported_instead_of_retried",
+        "shutdown_completes_while_output_is_disconnected"
+      ],
+      "negative_controls": {
+        "lost_session_replay": {
+          "test": "lost_offer_on_session_restart",
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "disconnect_accepted": {
+          "test": "output_backpressure_and_disconnect",
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "permanent_error_retried": {
+          "test": "a_permanent_output_encoding_failure",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      }
+    },
+    "executor-commit": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-engine",
+        "--lib",
+        "actor::commit_tests::"
+      ],
+      "real": [
+        "CommitLoop production thread",
+        "must-deliver suffix retry",
+        "publication escalation"
+      ],
+      "controlled": [
+        "receipt publication outcomes",
+        "subscriber visibility",
+        "publication reopen"
+      ],
+      "tests": [
+        "commit_thread_preserves_order",
+        "commit_thread_retries_until_delivered",
+        "commit_thread_batches_queued_receipts_and_flushes_on_boundary",
+        "commit_thread_resumes_batch_at_failed_suffix",
+        "commit_thread_fail_stops_on_a_fatal_error",
+        "commit_thread_reopens_an_unconnected_publication_once_and_delivers",
+        "commit_thread_escalates_only_while_a_subscriber_is_listed",
+        "commit_thread_exits_after_the_total_budget_without_a_subscriber",
+        "the_rollback_goes_out_before_the_first_receipt"
+      ],
+      "limitation": "These existing actor tests do not prove disk durability or process/node recovery. Their blocking joins are bounded by the runner process timeout."
+    },
+    "executor-pipeline": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-engine",
+        "--lib",
+        "actor::exec_pipeline_tests::"
+      ],
+      "real": [
+        "execution actor",
+        "REVM execution",
+        "pipelined commit settlement"
+      ],
+      "controlled": [
+        "state snapshots",
+        "state-writer durability signal",
+        "reader and commit channels"
+      ],
+      "tests": [
+        "exec_pipelines_commit_and_next_block_reads_parent_layer",
+        "exec_pipelines_k_deep_and_blocks_only_at_capacity",
+        "exec_settles_inflight_commits_while_idle"
+      ],
+      "limitation": "These existing actor tests do not prove disk durability or process/node recovery. Their blocking joins are bounded by the runner process timeout."
+    }
+  },
+  "families": {
+    "Ingress": {
+      "real_actors": [
+        "ingress",
+        "archive reader/writer"
+      ],
+      "fault_plan": "Stall or close publication, receipt and lookup peers; reopen real temporary archive storage after missing/corrupt records.",
+      "recovery_invariants": "Exact submit hash, bounded fallback/refusal, no invented receipt, replay resumes from the retained cursor.",
+      "remaining_real_dependencies": "Real archive/media-driver integration and process restart remain required."
+    },
+    "Sequencer": {
+      "real_actors": [
+        "sequencer admission",
+        "validator replay"
+      ],
+      "fault_plan": "Stall intake and lookup replies; disconnect or backpressure orderer output; lose acknowledgements and renew sessions; restart replay from real checkpoints.",
+      "recovery_invariants": "Preserve sender order and exact bytes, bound queues, recover without new client input, stop cleanly; validator verifies canonical state.",
+      "remaining_real_dependencies": "Replica racing, process restart, validator checkpoint selection and sustained catch-up are not covered by the first admission fixture."
+    },
+    "Cluster": {
+      "real_actors": [
+        "Java sealer",
+        "Aeron Cluster peers"
+      ],
+      "fault_plan": "Run real consensus members in a small local group; fail transports or members, vary delay/loss, reopen member storage.",
+      "recovery_invariants": "One leader per term, quorum admission, consistent canonical order, replay/catch-up, and bounded recovery.",
+      "remaining_real_dependencies": "Mocking an elected leader or accepted consensus result cannot validate elections, partition safety or primary replacement; real consensus/network scheduling is required."
+    },
+    "Fleet": {
+      "real_actors": [
+        "executor",
+        "state writer",
+        "state mirror",
+        "Redis/Sentinel",
+        "sealer"
+      ],
+      "fault_plan": "Stop and restart the affected real actor group; delete only its owned test storage and feed retained checkpoint/log or authoritative upstream data.",
+      "recovery_invariants": "Exact state and receipt parity, complete rebuild coverage before serving, bounded recovery, no stale balance rejection.",
+      "remaining_real_dependencies": "Redis promotion requires real Redis/Sentinel processes; total consensus/storage loss requires real persistence and quorum members."
+    },
+    "Coordinated": {
+      "real_actors": [
+        "ingress",
+        "sequencer",
+        "executor",
+        "discovery"
+      ],
+      "fault_plan": "Fail role boundaries together and restore dependencies in specified order; run the real discovery adapter against a controlled service.",
+      "recovery_invariants": "Every retained request resolves or fails explicitly; resume with existing senders and no orphaned queues or false readiness.",
+      "remaining_real_dependencies": "Nomad/Consul rescheduling, network identity and all-node power loss still need deployment checks."
+    },
+    "CombinedOrdering": {
+      "real_actors": [
+        "ingress",
+        "sequencer admission",
+        "sealer session adapter"
+      ],
+      "fault_plan": "Cut ingress/orderer boundaries in the case order; return peers in dependency order and reverse order; replay retained offers.",
+      "recovery_invariants": "No lost or reordered sender prefix, no false acknowledgement, no dependency deadlock, exact recovery without new intake.",
+      "remaining_real_dependencies": "The first sequencer fixture covers boundary assumptions only; real ingress composition and real Raft election closure remain pending."
+    },
+    "CombinedExec": {
+      "real_actors": [
+        "executor",
+        "state writer",
+        "validator",
+        "ingress",
+        "state mirror"
+      ],
+      "fault_plan": "Close reader/writer boundaries and remove account sources together; restore state and input in both orders.",
+      "recovery_invariants": "Atomic durable boundary, state-root parity, no unsafe sender-floor assumption or balance rejection, bounded fallback.",
+      "remaining_real_dependencies": "Requires real MDBX/commit actor and combined read-path fixtures; a mocked commit success is insufficient."
+    },
+    "L1": {
+      "real_actors": [
+        "L1 follower",
+        "batcher",
+        "validator"
+      ],
+      "fault_plan": "Serve controlled HTTP lies, missing receipts and retained history gaps; resume posting after upstream blackout.",
+      "recovery_invariants": "Verify headers/receipts, preserve canonical positions, bounded retry, exact contiguous posting and no pruning of needed data.",
+      "remaining_real_dependencies": "Wall-clock outages can be shortened only with a real clock seam or equivalent boundary-crossing evidence; contracts/retention still need integration checks."
+    },
+    "Follower": {
+      "real_actors": [
+        "L1 follower quorum",
+        "provider client"
+      ],
+      "fault_plan": "Run real follower logic against independent controlled HTTP providers; inject timeout/refusal/disagreement and restart one or all actors.",
+      "recovery_invariants": "Independent source deadlines and backoff, no false quorum, halt on disagreement and resume after valid replies.",
+      "remaining_real_dependencies": "Single-provider mocks do not validate provider quorum or process restart; retain real protocol parsers."
+    },
+    "Cache": {
+      "real_actors": [
+        "state mirror",
+        "ingress account/receipt reader",
+        "Redis/Sentinel"
+      ],
+      "fault_plan": "Inject stale rows, partial writes, absent script, lookup timeout, lost connection and interrupted checkpoint scans; retain real checkpoint state.",
+      "recovery_invariants": "Complete coverage before freshness, monotonic account updates, exact receipt identity, bounded executor fallback and rollback-safe rebuild.",
+      "remaining_real_dependencies": "Real Lua/Redis transactions and Sentinel promotion need real local services; an in-memory dictionary cannot establish their semantics."
+    },
+    "Integrity": {
+      "real_actors": [
+        "executor and MDBX writer",
+        "sealer recovery",
+        "sequencer ownership"
+      ],
+      "fault_plan": "Repeat restart sequences against real temporary stores; restore from retained authoritative history; change ownership while traffic is pending.",
+      "recovery_invariants": "Durable state survives restarts, duplicate/replayed data remains idempotent, ownership changes neither lose nor duplicate canonical transactions.",
+      "remaining_real_dependencies": "Unflushed power-loss behavior and full-chain reseeding require real storage and protocol integration."
+    },
+    "Carry": {
+      "real_actors": [
+        "sequencer admission",
+        "sealer rules",
+        "egress",
+        "executor readers"
+      ],
+      "fault_plan": "Drive actual feature/session/retention transitions while offers and reader requests are held; restart readers and outputs at each boundary.",
+      "recovery_invariants": "Correct wire format at each version, retained offers replay safely, exact carry/reference parity and readable retained windows.",
+      "remaining_real_dependencies": "The first admission fixture does not validate Java feature activation, deployed rollout order or complete carry/reference parity."
+    },
+    "Executor": {
+      "real_actors": [
+        "executor",
+        "state writer",
+        "checkpoint restore"
+      ],
+      "fault_plan": "Run real actors with controlled reader/writer failures and temporary MDBX/checkpoint files; interrupt writes, corrupt images and exhaust the checkpoint device.",
+      "recovery_invariants": "No acknowledgement before durable commit, exact replay/state parity, reject corrupt bases, preserve data on failed recovery, remain cancellable.",
+      "remaining_real_dependencies": "ENOSPC/EIO and process crash must be real fault effects; node replacement and image rollout remain deployment checks."
+    },
+    "Retention": {
+      "real_actors": [
+        "egress retention",
+        "batcher",
+        "validator",
+        "DA guard",
+        "canary"
+      ],
+      "fault_plan": "Hold posting or reader cursors beyond actual retention floors, resume requests, and drive halt/canary inputs through real actors.",
+      "recovery_invariants": "No pruning of unposted required data, exact contiguous resumed output, correct halt and alert inhibition, no false healthy state.",
+      "remaining_real_dependencies": "Mocked cursor values alone do not prove persisted coverage, contracts or alert-routing behavior."
+    }
+  },
+  "pending_registration": {
+    "raft-leader-packet-delay": 917
+  },
+  "cases": [
+    {
+      "case": "graceful-ingress",
+      "family": "Ingress",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "hard-ingress",
+      "family": "Ingress",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "archive-driver-loss",
+      "family": "Ingress",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "archive-tx-data-wipe",
+      "family": "Ingress",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "archive-corruption",
+      "family": "Ingress",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "graceful-sequencer",
+      "family": "Sequencer",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "shutdown_completes_while_output_is_disconnected"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "hard-sequencer",
+      "family": "Sequencer",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "sequencer-replica-kill",
+      "family": "Sequencer",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "sequencer-lapse",
+      "family": "Sequencer",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "delayed_canonical_input_fills_the_outbox_then_resumes_in_order"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "validator-lapse",
+      "family": "Sequencer",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "validator-join",
+      "family": "Sequencer",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "lookup-blackout",
+      "family": "Sequencer",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "absent_lookup_reply_holds_the_sender_until_the_real_account_event_arrives"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "cluster-leader-kill",
+      "family": "Cluster",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "lost_offer_on_session_restart_replays_the_exact_prefix_before_its_suffix"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "raft-leader-one-way-partition",
+      "family": "Cluster",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "raft-leader-packet-loss",
+      "family": "Cluster",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "cluster-follower-kill",
+      "family": "Cluster",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "cluster-member-rejoin",
+      "family": "Cluster",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "cluster-two-blank-recover",
+      "family": "Cluster",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "node-replace-sealer",
+      "family": "Cluster",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "cpu-squeeze",
+      "family": "Cluster",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "executor-fleet-loss-recover",
+      "family": "Fleet",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "executor-fleet-wipe-recover",
+      "family": "Fleet",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "executor-fleet-total-wipe-recover",
+      "family": "Fleet",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "redis-total-loss-recover",
+      "family": "Fleet",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "cluster-quorum-loss-recover",
+      "family": "Fleet",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "cluster-total-loss-recover",
+      "family": "Fleet",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "ingress-pair-loss-recover",
+      "family": "Coordinated",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "sequencer-lane-loss-recover",
+      "family": "Coordinated",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "control-plane-loss-recover",
+      "family": "Coordinated",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "pipeline-blackout-recover",
+      "family": "Coordinated",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "ingress-sequencer-loss-recover",
+      "family": "CombinedOrdering",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "ingress-sealer-loss-recover",
+      "family": "CombinedOrdering",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "sequencer-sealer-loss-recover",
+      "family": "CombinedOrdering",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "output_backpressure_and_disconnect_recover_without_new_client_input"
+        },
+        {
+          "suite": "sequencer",
+          "test": "lost_offer_on_session_restart_replays_the_exact_prefix_before_its_suffix"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "ingress-sequencer-sealer-loss-recover",
+      "family": "CombinedOrdering",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "ingress-sequencer-sealer-reverse",
+      "family": "CombinedOrdering",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "executor-sealer-loss-recover",
+      "family": "CombinedExec",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "executor-sealer-validator-recover",
+      "family": "CombinedExec",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "ingress-executor-loss-recover",
+      "family": "CombinedExec",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_resumes_batch_at_failed_suffix"
+        },
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_fail_stops_on_a_fatal_error"
+        },
+        {
+          "suite": "executor-pipeline",
+          "test": "exec_settles_inflight_commits_while_idle"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "read-path-loss-recover",
+      "family": "CombinedExec",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_resumes_batch_at_failed_suffix"
+        },
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_fail_stops_on_a_fatal_error"
+        },
+        {
+          "suite": "executor-pipeline",
+          "test": "exec_settles_inflight_commits_while_idle"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "sequencer-executor-redis-loss",
+      "family": "CombinedExec",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "l1-liar",
+      "family": "L1",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "l1-null-receipts",
+      "family": "L1",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "two-day-outage",
+      "family": "L1",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "batcher-outage-past-retention",
+      "family": "L1",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "l1-transport-refusals",
+      "family": "Follower",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "follower-instance-loss",
+      "family": "Follower",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "follower-total-loss",
+      "family": "Follower",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "follower-disagreement",
+      "family": "Follower",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "mirror-backlog-client-restart",
+      "family": "Cache",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "redis-partition-ingress",
+      "family": "Cache",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "redis-primary-kill",
+      "family": "Cache",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "redis-primary-freeze",
+      "family": "Cache",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "mirror-kill-rebuild",
+      "family": "Cache",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "executor-restart-storm",
+      "family": "Integrity",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "sealer-fleet-total-wipe-recover",
+      "family": "Integrity",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "resize-scale-out-in",
+      "family": "Integrity",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-versions-on",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-held-offer-after-downgrade",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-readers-on-egress",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-window-on",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-executor-first",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-executors-rest",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-window-off-on",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-leader-kill-at-switch",
+      "family": "Carry",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "lost_offer_on_session_restart_replays_the_exact_prefix_before_its_suffix"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-egress-restart",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "graceful-executor",
+      "family": "Executor",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_resumes_batch_at_failed_suffix"
+        },
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_fail_stops_on_a_fatal_error"
+        },
+        {
+          "suite": "executor-pipeline",
+          "test": "exec_settles_inflight_commits_while_idle"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "hard-executor",
+      "family": "Executor",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_resumes_batch_at_failed_suffix"
+        },
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_fail_stops_on_a_fatal_error"
+        },
+        {
+          "suite": "executor-pipeline",
+          "test": "exec_settles_inflight_commits_while_idle"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "node-failure-executor",
+      "family": "Executor",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "node-replace-executor",
+      "family": "Executor",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "state-checkpoint-restore",
+      "family": "Executor",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "checkpoint-corrupt-recover",
+      "family": "Executor",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "checkpoint-disk-full",
+      "family": "Executor",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "replay-window-resync",
+      "family": "Executor",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "deploy-broken-image",
+      "family": "Executor",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "retention-overrun",
+      "family": "Retention",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "retention-overrun-validator",
+      "family": "Retention",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "prune-floor",
+      "family": "Retention",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "da-lag-halt",
+      "family": "Retention",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "canary-da-lag",
+      "family": "Retention",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "raft-leader-packet-delay",
+      "family": "Cluster",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    }
+  ]
+}

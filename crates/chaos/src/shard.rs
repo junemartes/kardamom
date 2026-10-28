@@ -381,6 +381,43 @@ mod tests {
     ];
 
     #[test]
+    fn every_chaos_case_has_a_component_recovery_plan() {
+        let catalog: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/reviews/2026-10-28-component-recovery.json"
+        ))
+        .unwrap();
+        let rows = catalog["cases"].as_array().unwrap();
+        let planned: std::collections::BTreeSet<_> = rows
+            .iter()
+            .map(|row| row["case"].as_str().unwrap())
+            .collect();
+        let scheduled: std::collections::BTreeSet<_> = ALL
+            .iter()
+            .flat_map(|shard| shard.cases().iter().copied())
+            .collect();
+        assert_eq!(planned.len(), rows.len(), "duplicate component plan");
+        assert!(
+            scheduled.is_subset(&planned),
+            "new chaos cases need a local recovery plan"
+        );
+        assert!(
+            planned
+                .difference(&scheduled)
+                .all(|case| catalog["pending_registration"][case].is_u64())
+        );
+        assert!(
+            rows.iter()
+                .all(|row| catalog["families"][row["family"].as_str().unwrap()].is_object())
+        );
+        rows.iter()
+            .flat_map(|row| row["local_tests"].as_array().unwrap())
+            .for_each(|test| {
+                let suite = &catalog["local_suites"][test["suite"].as_str().unwrap()];
+                assert!(suite["tests"].as_array().unwrap().contains(&test["test"]));
+            });
+    }
+
+    #[test]
     fn every_regular_shard_is_carry_born_and_its_knobs_follow_the_deploy() {
         let reference = [Shard::Carry, Shard::Integrity];
         for shard in ALL {
