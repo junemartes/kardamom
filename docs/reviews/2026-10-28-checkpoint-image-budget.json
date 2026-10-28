@@ -1,5 +1,5 @@
 {
-  "status": "Implemented; local controller regression and both negative controls pass. Full local matrix and style running; live executor shard pending.",
+  "status": "Local controller regression, negative controls, all 163 component checks, strengthened historical storage assertions and style pass. Live executor shard pending.",
   "failure": {
     "run": 40634457681,
     "job": 122645637589,
@@ -39,5 +39,30 @@
   },
   "service_wiring": "One local probe step is added to the existing Docker CI job. No chaos shard, product service wiring or runtime defaults change.",
   "performance": "No product hot-path change. The deployed fault retains its 512-MiB limit. The local probe temporarily uses at most that tmpfs size and removes its container on completion.",
-  "qualification_credit": 0
+  "qualification_credit": 0,
+  "validation": {
+    "matrix": {
+      "checks": 163,
+      "targets": 24,
+      "seconds": 145.324,
+      "source_revision": "ece45b2349e612bd0e36928acd9d485bf52c7fab",
+      "all_pass": true,
+      "scope": "Before incorporating the independent historical-storage assertion fix; both affected state targets pass again after integration."
+    },
+    "chaos_unit_tests": {
+      "passed": 322,
+      "ignored": 4,
+      "scope": "Both ignored Docker probes run separately in the component matrix; two Nomad-agent tests remain ignored."
+    },
+    "historical_storage": {
+      "issue": 928,
+      "mutation": "Delete block-2 storage key 2000000 only from the restored block-5 database.",
+      "corrupted_exit_code": 101,
+      "assertion": "storage written in block 2, slot 0, after block 5",
+      "clean_auxiliary_tests": 1,
+      "clean_authoritative_tests": 2,
+      "all_pass": true
+    },
+    "style": "just style passes after the final code change; Cargo reports the existing proc-macro-error2 future-incompatibility notice."
+  }
 }

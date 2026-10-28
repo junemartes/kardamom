@@ -67,8 +67,9 @@ kernel returns ENOSPC. The real checkpoint copy and block-log thread must both
 report error 28 while the same state writer continues committing on a separate
 filesystem. A failed copy must leave only the earlier complete checkpoint visible.
 After freeing space, a new base plus the resumed log must restore exactly block 5,
-including account and storage values. The fixture uses five blocks, a one-byte
-segment limit and a two-entry log queue. It takes about four seconds including
+including account values and all ten storage keys written across the five blocks.
+Each observation also rejects keys from blocks not committed yet. The fixture uses
+five blocks, a one-byte segment limit and a two-entry log queue. It takes about four seconds including
 container startup, without a chain stack. Negative controls fail when a copy uses
 its public name before completion or the log thread dies on its first write error.
 
