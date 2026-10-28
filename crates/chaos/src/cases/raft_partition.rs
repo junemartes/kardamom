@@ -12,8 +12,10 @@ use crate::probes::CLUSTER_TASK;
 use crate::rpc::{RecoveryCause, Rpc};
 
 const CTX: &str = "raft-leader-one-way-partition";
+mod delay;
 mod loss;
 mod rules;
+pub(crate) use delay::PacketDelay;
 pub(crate) use loss::PacketLoss;
 use rules::Rules;
 

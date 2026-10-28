@@ -315,6 +315,16 @@ jobs:
           # cgroup v2 + systemd-in-container needs this on some runners.
           sudo modprobe ip_tables || true
 
+      - name: Verify scoped Raft packet delay in an isolated network namespace
+        if: matrix.shard == 'chaos-cluster'
+        run: |
+          sudo modprobe sch_prio
+          sudo modprobe sch_netem
+          sudo modprobe cls_flower
+          sudo timeout --kill-after=5s 60s unshare --net python3 \
+            crates/chaos/src/cases/raft_partition/delay/kernel_probe.py \
+            > /tmp/chaos-raft-delay-kernel.json
+
       - uses: ./.github/actions/tofu-providers
         with:
           root: deploy/cluster/terraform/containers

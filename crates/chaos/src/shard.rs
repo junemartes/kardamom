@@ -122,6 +122,7 @@ impl Shard {
                 "cluster-leader-kill",
                 "raft-leader-one-way-partition",
                 "raft-leader-packet-loss",
+                "raft-leader-packet-delay",
                 "cluster-follower-kill",
                 "cluster-member-rejoin",
                 "cluster-two-blank-recover",
@@ -423,7 +424,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 79);
+        assert_eq!(all.len(), 80);
         assert_eq!(
             Shard::Integrity.cases().last(),
             Some(&"resize-scale-out-in")
