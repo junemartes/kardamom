@@ -157,6 +157,29 @@ fn the_fault_removes_older_local_bases_but_preserves_the_block_log() {
 }
 
 #[test]
+fn the_fault_preserves_the_executor_owned_state_directory() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let f = Fixture::new();
+    let state = f.root.path().join("state");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let before = std::fs::metadata(&state).unwrap();
+    let armed = f.script("arm");
+    assert!(
+        armed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&armed.stderr)
+    );
+    let after = std::fs::metadata(&state).unwrap();
+    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+    assert_eq!(
+        (after.uid(), after.gid(), after.mode()),
+        (before.uid(), before.gid(), before.mode())
+    );
+    assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
+}
+
+#[test]
 fn only_the_pinned_victim_group_stops_and_the_saved_definition_stays_intact() {
     let saved = serde_json::json!({"TaskGroups":[
         {"Name":"executor-0","Count":1,"Tasks":[{"Name":"executor","Config":{"image":"pinned"}}]},

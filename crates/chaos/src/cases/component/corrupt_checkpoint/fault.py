@@ -62,10 +62,18 @@ class Fault:
         # With no other local base, success requires a verified peer image.
         for older in images[:-1]:
             shutil.rmtree(older)
-        shutil.rmtree(self.root / "state")
-        (self.root / "state").mkdir()
+        # The executor's directory keeps its owner, permissions and mount identity.
+        for entry in (self.root / "state").iterdir():
+            self.remove_state_entry(entry)
         self.proof.write_text(json.dumps(evidence))
         return evidence
+
+    @staticmethod
+    def remove_state_entry(entry):
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
 
     def verify(self):
         evidence = json.loads(self.proof.read_text())

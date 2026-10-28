@@ -1,0 +1,32 @@
+{
+  "date": "2026-10-28",
+  "base": "9162647b569050ff3e557e723ad52c28cc94c5e6",
+  "defect": "The root-run checkpoint fault removes the active state directory and recreates it with root ownership/default permissions. The replacement executor cannot restore its database there.",
+  "live_evidence": {
+    "run": 40613002525,
+    "job": 122577425776,
+    "victim": "kardamom-sealer-0",
+    "corrupt_rejected_utc": "2026-10-28T02:49:53.047658Z",
+    "verified_peer_fetched_utc": "2026-10-28T02:49:53.313290Z",
+    "subsequent_failure": "restore fails with Permission denied; retrying quarantine then hits an existing .rejected directory",
+    "repeat_job": 122585005357
+  },
+  "fix": "Remove the contents of the stopped executor state directory while retaining the directory itself, including owner, group, mode and identity.",
+  "validation": {
+    "negative": "The new metadata regression fails on the previous script: requested directory mode 0750 becomes 0755.",
+    "positive": "The exact fault script retains dev/inode, owner, group and mode and leaves the directory empty. Existing real-MDBX image rejection, quarantine and peer-restore tests still pass.",
+    "passed": 309,
+    "ignored": 2,
+    "test_log": "/tmp/chaos-checkpoint-permissions-full-20261028.log",
+    "negative_log": "/tmp/chaos-checkpoint-permissions-negative-20261028.log",
+    "style": "passed",
+    "style_log": "/tmp/chaos-checkpoint-permissions-style-20261028.log",
+    "notice": "Existing proc-macro-error2 future-compatibility notice"
+  },
+  "impact": "Fault fixture only; no product recovery code, service wiring, hot path, fault identity, recovery deadline or proof is relaxed.",
+  "limitations": [
+    "Full CI recovery after this fixture correction remains required.",
+    "The permission-induced quarantine-name collision is observed; this change does not alter product quarantine policy."
+  ],
+  "qualification_streak": 0
+}
