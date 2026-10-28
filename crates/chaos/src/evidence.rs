@@ -3,7 +3,7 @@
 //! Callers assert on counts increasing, never on mere presence: bring-up
 //! and earlier cases log the same lines.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
 use crate::nomad::{Alloc, Nomad, Streams};
@@ -183,11 +183,28 @@ impl Evidence {
     /// Returns an error if no election closes within `max`.
     pub async fn cluster_elected(&self, max: Duration) -> anyhow::Result<Elected> {
         let budget = Budget::new(max, Duration::from_secs(3));
-        let outcome = poll::until(budget, |_| self.election_once()).await?;
+        let last = RefCell::new(None);
+        // Allocation and log availability can change during node recovery. A failed
+        // read provides no election evidence; the next attempt refreshes the listing.
+        let outcome = poll::until(budget, |_| async {
+            match self.election_once().await {
+                Ok(elected) => Ok(elected),
+                Err(error) => {
+                    let cause = format!("{error:#}");
+                    crate::log(format!("election evidence is not ready: {cause}"));
+                    last.replace(Some(cause));
+                    Ok(None)
+                }
+            }
+        })
+        .await?;
         outcome
             .or_fail(|t| {
+                let cause = last.take().map_or_else(String::new, |cause| {
+                    format!("; last evidence read failed: {cause}")
+                });
                 crate::chaos_fail!(
-                    "no election closed on a majority within {}s (checked the alloc logs for 'role=LEADER' and 'cluster ELECTION ... state=CLOSED' after the last '{START_LINE}')",
+                    "no election closed on a majority within {}s (checked the alloc logs for 'role=LEADER' and 'cluster ELECTION ... state=CLOSED' after the last '{START_LINE}'){cause}",
                     t.as_secs()
                 )
             })
