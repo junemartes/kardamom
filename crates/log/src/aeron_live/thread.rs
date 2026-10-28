@@ -28,6 +28,9 @@ use crate::offer_retry::OFFER_TIMEOUT;
 use crate::term_layout::TermLayout;
 use kardamom_types::BPosition;
 
+mod command_wait;
+use command_wait::{CommandWait, ParkIdle, Spin};
+
 /// Adapter between rusteron's fragment-handler callback and a
 /// [`FrameSink`], sitting behind an
 /// [`rusteron_client::AeronFragmentAssembler`]. It runs once per complete
@@ -162,7 +165,7 @@ pub(super) fn run_aeron_thread(
     linger: Duration,
     idle_cap: IdleCap,
 ) -> Result<(), LogError> {
-    AeronThread::new(aeron, cmd_rx, linger, idle_cap).run()
+    AeronThread::new(aeron, cmd_rx, linger, idle_cap).run(idle_cap)
 }
 
 /// The Aeron thread's whole state: every `!Send` rusteron object it owns,
@@ -228,10 +231,22 @@ impl AeronThread {
     }
 
     /// The poll/command loop. Runs until `Shutdown` or the command channel
-    /// disconnects.
-    fn run(mut self) -> Result<(), LogError> {
+    /// disconnects. Explicit caps of at least one millisecond park empty
+    /// passes; shorter caps retain the pre-park spin for prompt command handling.
+    fn run(self, cap: IdleCap) -> Result<(), LogError> {
+        if cap
+            .duration()
+            .is_none_or(|cap| cap < Duration::from_millis(1))
+        {
+            return self.drive(Spin);
+        }
+        let commands = self.cmd_rx.clone();
+        self.drive(ParkIdle::new(&commands))
+    }
+
+    fn drive<W: CommandWait>(mut self, mut waiting: W) -> Result<(), LogError> {
         loop {
-            if let ControlFlow::Break(()) = self.step() {
+            if let ControlFlow::Break(()) = self.step(&mut waiting) {
                 return Ok(());
             }
         }
@@ -242,7 +257,7 @@ impl AeronThread {
     /// command at a cadence that escalates while nothing has work.
     /// `Break(())` means the thread must stop (`Shutdown`, or the command
     /// channel disconnected).
-    fn step(&mut self) -> ControlFlow<()> {
+    fn step<W: CommandWait>(&mut self, waiting: &mut W) -> ControlFlow<()> {
         self.meter.start_pass(self.cmd_rx.len());
         // Whether this pass did anything: handled a command, or polled at
         // least one fragment. Drives the idle backoff. An empty streak
@@ -269,7 +284,7 @@ impl AeronThread {
         //    nothing to poll and nothing pending. Otherwise wait at the
         //    poll/retry cadence without busy-spinning a core.
         if self.subs.iter().flatten().next().is_none() && self.pending.is_empty() {
-            return match self.wait_for_cmd(Duration::from_millis(1)) {
+            return match self.wait_for_cmd(Duration::from_millis(1), waiting, false) {
                 ControlFlow::Break(()) => ControlFlow::Break(()),
                 ControlFlow::Continue(_) => ControlFlow::Continue(()),
             };
@@ -289,7 +304,7 @@ impl AeronThread {
         // `pending` pins the base cadence, because the retry timing of a
         // back-pressured offer must not degrade.
         let wait = self.backoff.next_wait(worked || !self.pending.is_empty());
-        let outcome = self.wait_for_cmd(wait);
+        let outcome = self.wait_for_cmd(wait, waiting, worked);
         self.finish_wait(outcome)
     }
 
@@ -356,8 +371,13 @@ impl AeronThread {
     /// was handled; `Continue(false)` means the wait timed out with
     /// nothing to do. The caller uses that distinction to decide whether
     /// to reset the idle backoff.
-    fn wait_for_cmd(&mut self, wait: Duration) -> ControlFlow<(), bool> {
-        let received = self.cmd_rx.recv_timeout(wait);
+    fn wait_for_cmd<W: CommandWait>(
+        &mut self,
+        wait: Duration,
+        waiting: &mut W,
+        worked: bool,
+    ) -> ControlFlow<(), bool> {
+        let received = waiting.receive(&self.cmd_rx, wait, worked);
         self.meter.end_wait(Backlog(self.pending.len()));
         match received {
             Ok(RuntimeCmd::Shutdown) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
