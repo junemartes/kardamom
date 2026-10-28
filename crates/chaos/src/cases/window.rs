@@ -5,9 +5,9 @@ use std::time::Duration;
 use super::{Case, fleet, raft_partition::PacketLoss, sequencer_recovery};
 use crate::knobs::Knobs;
 
-/// A full workload play can take 29 minutes before the runtime proof.
+/// A full workload or substrate play can take 44 minutes before the runtime proof.
 /// This bounds pacing only; deployment and recovery retain their own deadlines.
-pub(super) const FULL_DEPLOY_LOAD: Duration = Duration::from_mins(40);
+pub(super) const FULL_DEPLOY_LOAD: Duration = Duration::from_mins(60);
 
 impl Case {
     /// The per-case load window: the global window, widened to the
@@ -88,9 +88,9 @@ impl Case {
             | Self::ExecutorFleetTotalWipeRecover
             | Self::PipelineBlackoutRecover => inject + k.reschedule_slo + Duration::from_mins(7),
             // Replacing a machine also runs Terraform and the full substrate play.
-            Self::NodeReplaceExecutor | Self::NodeReplaceSealer => {
-                inject + Duration::from_mins(30) + k.rejoin_slo
-            }
+            Self::NodeReplaceExecutor | Self::NodeReplaceSealer => inject
+                .saturating_add(FULL_DEPLOY_LOAD)
+                .saturating_add(k.rejoin_slo),
             Self::ArchiveCorruption | Self::CheckpointCorruptRecover => {
                 inject + Duration::from_mins(15)
             }
