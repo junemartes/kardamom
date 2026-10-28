@@ -988,6 +988,49 @@
           "kernel_probe_failed": true
         }
       ]
+    },
+    "chaos-alert": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "l1::alert::tests",
+        "--",
+        "--nocapture"
+      ],
+      "real": [
+        "alert hold observer used by the deployed L1 liar case",
+        "shared bounded polling loop"
+      ],
+      "controlled": [
+        "paused Tokio clock",
+        "active, inactive, unknown, failed and delayed alert responses"
+      ],
+      "tests": [
+        "fast_alert_samples_require_the_full_hold_duration",
+        "slow_alert_samples_use_elapsed_time_within_the_original_budget",
+        "inactive_unknown_and_failed_reads_each_reset_the_hold",
+        "first_slow_response_does_not_certify_unobserved_time",
+        "failed_alert_reads_preserve_the_cause_at_the_total_deadline",
+        "hanging_alert_read_cannot_extend_the_total_budget"
+      ],
+      "limitation": "Harness timing only. Does not run Prometheus or certify the alert expression, scrape continuity, product recovery or performance under CPU contention.",
+      "negative_controls": [
+        {
+          "mutation": "Restore prior six-active-sample threshold in the production observer; retain diagnostic-only state tracking.",
+          "exit_code": 101,
+          "failed": [
+            "l1::alert::tests::first_slow_response_does_not_certify_unobserved_time",
+            "l1::alert::tests::fast_alert_samples_require_the_full_hold_duration",
+            "l1::alert::tests::slow_alert_samples_use_elapsed_time_within_the_original_budget",
+            "l1::alert::tests::inactive_unknown_and_failed_reads_each_reset_the_hold"
+          ],
+          "compiled": true
+        }
+      ]
     }
   },
   "families": {
@@ -1515,6 +1558,30 @@
         {
           "suite": "l1-source-quorum",
           "test": "one_liar_halts_the_read_with_both_answers_and_the_counter"
+        },
+        {
+          "suite": "chaos-alert",
+          "test": "fast_alert_samples_require_the_full_hold_duration"
+        },
+        {
+          "suite": "chaos-alert",
+          "test": "slow_alert_samples_use_elapsed_time_within_the_original_budget"
+        },
+        {
+          "suite": "chaos-alert",
+          "test": "inactive_unknown_and_failed_reads_each_reset_the_hold"
+        },
+        {
+          "suite": "chaos-alert",
+          "test": "first_slow_response_does_not_certify_unobserved_time"
+        },
+        {
+          "suite": "chaos-alert",
+          "test": "failed_alert_reads_preserve_the_cause_at_the_total_deadline"
+        },
+        {
+          "suite": "chaos-alert",
+          "test": "hanging_alert_read_cannot_extend_the_total_budget"
         }
       ],
       "full_case_locally_validated": false

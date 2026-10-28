@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use crate::harness::Harness;
 use crate::poll::{self, Budget};
 
+mod alert;
 mod deposit;
 pub(crate) use deposit::Deposit;
 
@@ -421,34 +422,27 @@ impl L1 {
         budget: Duration,
         ctx: &str,
     ) -> anyhow::Result<()> {
-        let every = Duration::from_secs(5);
-        let needed = u32::try_from(hold.as_secs() / every.as_secs()).unwrap_or(u32::MAX);
-        let run = std::cell::Cell::new(0_u32);
-        let run_ref = &run;
-        let outcome = poll::until(Budget::new(budget, every), |_| async move {
-            // A failed read breaks the held run, like an inactive state:
-            // a Prometheus restart loses the pending state too.
-            let state = self.alert_state(name).await.unwrap_or_else(|e| {
-                crate::log(format!("{ctx}: {e:#}; the held run starts again"));
-                None
-            });
-            let active = state
-                .as_deref()
-                .is_some_and(|s| s == "pending" || s == "firing");
-            run_ref.set(if active { run_ref.get() + 1 } else { 0 });
-            Ok::<_, anyhow::Error>((run_ref.get() >= needed).then_some(state))
-        })
-        .await?;
+        let observation = alert::Held::new(hold);
+        let outcome = observation
+            .run(budget, || async {
+                let response = self.alert_state(name).await;
+                if let Err(error) = &response {
+                    crate::log(format!("{ctx}: {error:#}; the held run starts again"));
+                }
+                response
+            })
+            .await?;
         let (state, elapsed) = outcome.or_fail(|t| {
             crate::chaos_fail!(
-                "{ctx}: the alert {name} did not hold for {}s within {}s",
+                "{ctx}: the alert {name} did not hold for {}s within {}s; {}",
                 hold.as_secs(),
-                t.as_secs()
+                t.as_secs(),
+                observation.evidence()
             )
         })?;
         crate::log(format!(
             "{ctx}: the alert {name} is {} and held {}s (after {}s)",
-            state.unwrap_or_default(),
+            state,
             hold.as_secs(),
             elapsed.as_secs()
         ));
