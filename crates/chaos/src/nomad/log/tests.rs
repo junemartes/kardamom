@@ -2,15 +2,18 @@ use super::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+mod election;
+
 const LOGS: &str = "/v1/client/fs/logs/";
 const NODE: &str = "/v1/node/node-0";
 const FORWARD_FAILED: &str = "stream reset";
 
-/// A fake Nomad agent. Each path prefix answers one canned status and
-/// body; any other path answers 404.
+/// A fake Nomad agent with canned routes or staged election replies.
+/// Unmatched paths answer 404.
 #[derive(Default)]
 struct FakeAgent {
     routes: Vec<(String, u16, String)>,
+    election: Option<election::Peer>,
 }
 
 impl FakeAgent {
@@ -58,6 +61,9 @@ impl FakeAgent {
     }
 
     fn reply(&self, path: &str) -> (u16, String) {
+        if let Some(peer) = &self.election {
+            return peer.reply(path);
+        }
         self.routes
             .iter()
             .find(|(prefix, ..)| path.starts_with(prefix.as_str()))

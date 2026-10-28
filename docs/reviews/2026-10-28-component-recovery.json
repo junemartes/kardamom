@@ -897,6 +897,44 @@
           "bad_txn_panic": true
         }
       ]
+    },
+    "chaos-election": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "nomad::log::tests::election::"
+      ],
+      "real": [
+        "Evidence::cluster_elected",
+        "Nomad HTTP client, allocation refresh and log retry",
+        "closed-majority parser and complete poll deadline"
+      ],
+      "controlled": [
+        "loopback Nomad HTTP peer with stale then replacement allocations",
+        "200-ms inner log retry budget",
+        "five-second recovery deadline, one-second missing-evidence deadline"
+      ],
+      "tests": [
+        "election_refreshes_allocations_after_a_log_retry_budget_expires",
+        "missing_logs_exhaust_the_election_deadline_with_the_read_cause",
+        "readable_logs_without_a_closed_majority_do_not_certify_recovery"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "return_first_log_budget_failure",
+          "compiled": true,
+          "exit_code": 101,
+          "failed_tests": [
+            "election_refreshes_allocations_after_a_log_retry_budget_expires",
+            "missing_logs_exhaust_the_election_deadline_with_the_read_cause"
+          ]
+        }
+      ],
+      "limitation": "Harness recovery evidence only. Does not run a sealer, Nomad cluster or reproduce election consensus. A readable closed majority is still required; persistent missing logs fail at the complete deadline."
     }
   },
   "families": {
@@ -1317,6 +1355,18 @@
         {
           "suite": "sequencer",
           "test": "lost_offer_on_session_restart_replays_the_exact_prefix_before_its_suffix"
+        },
+        {
+          "suite": "chaos-election",
+          "test": "election_refreshes_allocations_after_a_log_retry_budget_expires"
+        },
+        {
+          "suite": "chaos-election",
+          "test": "missing_logs_exhaust_the_election_deadline_with_the_read_cause"
+        },
+        {
+          "suite": "chaos-election",
+          "test": "readable_logs_without_a_closed_majority_do_not_certify_recovery"
         }
       ],
       "full_case_locally_validated": false

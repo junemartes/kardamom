@@ -29,7 +29,7 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 156 checks.
+head. Both targets run in the existing Docker CI job. `all` runs 159 checks.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
@@ -81,6 +81,15 @@ error cleanup; successful commits retain their existing completion marker. The
 unsynchronized test checks visible recovery behavior, not the number of abort
 calls. Both tests run in the existing Docker job. They do not prove EIO, power
 loss, trie mode, process supervision or full-chain recovery.
+
+`just test-component chaos-election` runs the real recovery observer and Nomad
+HTTP client against a loopback peer. An unavailable old allocation must exhaust
+its inner log-read budget, then the observer must refresh allocations and certify
+a closed majority within the remaining election deadline. Persistent missing logs
+must fail with the last read error; readable logs without a closed majority must
+also fail. The three checks take about 3.3 seconds with a 200-ms inner budget.
+This tests the chaos harness, not consensus or service recovery. The ordinary Rust
+CI test job runs these checks.
 
 `just test-component sealer-actor` runs 38 Java service checks with controlled
 cluster/session peers, explicit timestamps, four-frame carry/replay windows, and
