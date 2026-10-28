@@ -10,14 +10,20 @@ just test-component executor-pipeline
 just test-component all
 ```
 
-Three targets are registered so far: seven sequencer tests, nine existing executor
-commit-thread tests, and three existing execution-pipeline tests. They need no
-Docker, Nomad, Redis, Java cluster or full-stack deployment. The first combined run
-takes about eight seconds including incremental compilation. The sequencer test
-binary takes about 0.2 seconds. These measure test execution, not transaction
-performance. The executor fixtures mock the state-writer durability signal; they
-do not prove disk durability.
+Thirteen targets currently run 92 checks. They cover sequencer admission, executor
+commit and execution-pipeline behavior, ingress accounts/receipts/DA halt, egress
+ownership/retention/peer catch-up, batcher recovery, and L1 source/watcher recovery.
+Run one target to iterate, or `all` for the current matrix. No Docker, Nomad, Redis,
+Java cluster or full-stack deployment starts. The first expanded local run takes
+about one minute including incremental compilation. About 32 seconds exercise the
+unchanged production HTTP-source deadline and backoff. These timings measure tests,
+not transaction performance.
 
+The executor fixtures mock the state-writer durability signal. Egress tests use a
+real temporary store and peer HTTP server; batcher tests use a real temporary spool
+and an HTTP endpoint that refuses dispersal. L1 tests exercise real source/watch
+logic, wire parsers and cursor files with controlled providers and publisher peers.
+The catalog records the remaining limitations for each target.
 The command records its source revision, exact commands, elapsed time and full logs
 under a unique `/tmp/kardamom-components-*` directory. `results.json` names every
 passed test and any expected tests that did not run. An empty test selection cannot
@@ -36,8 +42,9 @@ Every wait has a deadline, and shutdown runs on both success and assertion failu
 The first cases cover output backpressure and disconnect, lost session offers,
 missing lookup replies, stalled and closed input, delayed canonical confirmation
 with a full outbox, permanent encoding failure, and shutdown during disconnect.
-Three negative controls fail when session replay is removed, a disconnected
-output is falsely acknowledged, or a permanent output error is retried. These
+Negative controls fail when session replay is removed, a disconnected output is
+falsely acknowledged, a permanent output error is retried, or the egress prunes at
+the higher posted/final head, or the production provider-read deadline is removed. These
 mutations are validation experiments; they are not runtime changes.
 
 The [coverage inventory](reviews/2026-10-28-component-recovery.json) names every
@@ -46,7 +53,7 @@ test rejects a new chaos case without a corresponding plan. Each family lists th
 real actors, boundary faults, recovery invariants and dependencies that still need
 real integration. `partial` means that named local tests validate some boundary
 assumptions. It does not mean the complete distributed case has passed locally.
-No full case is marked locally validated yet.
+Twenty-five cases have partial mappings. No full case is marked locally validated yet.
 
 For each remaining case:
 

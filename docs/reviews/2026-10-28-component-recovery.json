@@ -110,6 +110,326 @@
         "exec_settles_inflight_commits_while_idle"
       ],
       "limitation": "These existing actor tests do not prove disk durability or process/node recovery. Their blocking joins are bounded by the runner process timeout."
+    },
+    "ingress-accounts": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-ingress",
+        "--test",
+        "account_cache_test"
+      ],
+      "real": [
+        "IngressProxy admission",
+        "LiveAccounts",
+        "account JSON-RPC handlers"
+      ],
+      "controlled": [
+        "transaction channels",
+        "receipt/account updates",
+        "executor HTTP replies"
+      ],
+      "tests": [
+        "an_unknown_sender_is_admitted",
+        "a_past_nonce_without_a_receipt_publishes",
+        "an_unfunded_sender_is_rejected_and_a_funded_one_admitted",
+        "an_expired_entry_admits",
+        "the_receipt_cache_answers_a_retry_before_the_nonce_check",
+        "a_skip_receipt_leaves_its_nonce_open",
+        "a_burning_skip_receipt_uses_its_nonce",
+        "a_cold_unfunded_sender_is_refused_with_one_query",
+        "a_lagging_executor_answer_admits",
+        "an_answer_before_the_first_head_admits",
+        "a_cold_funded_sender_or_a_failed_query_admits",
+        "checks_off_admits_an_unfunded_sender",
+        "the_account_rpcs_serve_the_local_layer_and_only_the_head",
+        "a_receipt_hash_helper_is_the_keccak_of_the_raw_bytes"
+      ],
+      "limitation": "Redis is off; this does not prove Redis Lua atomicity or partial-cache coverage."
+    },
+    "ingress-receipts": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-ingress",
+        "--test",
+        "receipt_fallback_test"
+      ],
+      "real": [
+        "IngressProxy receipt lookup",
+        "executor query HTTP client",
+        "receipt codec"
+      ],
+      "controlled": [
+        "egress and executor HTTP endpoints: holds, null, 503, silent"
+      ],
+      "tests": [
+        "an_old_receipt_the_egress_lacks_comes_from_the_executor",
+        "a_new_receipt_comes_from_the_egress_with_no_second_query",
+        "a_hash_that_no_executor_knows_stays_null",
+        "a_failed_egress_falls_back_to_the_executor",
+        "with_no_egress_the_executor_answers_alone"
+      ],
+      "limitation": "These endpoint stubs do not run the egress store or executor state database."
+    },
+    "ingress-da-halt": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-ingress",
+        "--test",
+        "da_lag_test"
+      ],
+      "real": [
+        "ingress RPC server",
+        "chain status watcher",
+        "halt/pause propagation"
+      ],
+      "controlled": [
+        "cluster status input",
+        "submission transport"
+      ],
+      "tests": [
+        "the_tags_follow_the_posted_head_and_a_halt_refuses_submits"
+      ],
+      "limitation": "Cluster status is controlled; actual sealer posting budget and L1 posting remain unproven here."
+    },
+    "egress-owner": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-egress",
+        "--lib",
+        "owner::tests::"
+      ],
+      "real": [
+        "Owner",
+        "Merge",
+        "real temporary Store",
+        "retention and restart paths"
+      ],
+      "controlled": [
+        "canonical input copies",
+        "posted/final head inputs",
+        "live publication sink"
+      ],
+      "tests": [
+        "delivered_frames_go_out_live_and_a_read_finds_them_stored",
+        "the_run_ends_when_every_sender_is_gone",
+        "a_drop_that_both_twins_report_is_one_status",
+        "a_receipt_after_a_drop_wins",
+        "a_refused_reference_is_dropped_until_the_receipt_of_the_twin",
+        "a_drop_after_the_receipt_changes_nothing",
+        "the_distance_counts_the_records_above_the_stored_head",
+        "with_no_peer_the_stream_starts_after_a_boundary",
+        "the_frames_of_a_peer_join_the_copies",
+        "a_peer_floor_above_the_head_starts_the_stream_there",
+        "a_peer_floor_raises_the_mark_to_the_mark_of_the_peer",
+        "a_reference_in_the_frames_of_a_peer_raises_the_mark",
+        "after_the_peers_give_up_a_boundary_starts_the_stream",
+        "a_frozen_posted_head_keeps_every_block_above_it_past_the_window",
+        "the_prune_follows_the_lower_of_the_posted_head_and_the_final_head",
+        "unposted_blocks_remain_replayable_after_pruning_and_a_restart"
+      ],
+      "limitation": "Covers real local storage reopen, not power-loss durability or network deployment.",
+      "negative_controls": [
+        {
+          "mutation": "prune at the maximum posted/final head instead of their minimum",
+          "test": "the_prune_follows_the_lower_of_the_posted_head_and_the_final_head",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      ]
+    },
+    "egress-catchup": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-egress",
+        "--lib",
+        "catchup::tests::"
+      ],
+      "real": [
+        "CatchUp task",
+        "HTTP client",
+        "Owner"
+      ],
+      "controlled": [
+        "real peer egress HTTP server with canonical history",
+        "unreachable peer endpoint",
+        "late canonical copies"
+      ],
+      "tests": [
+        "a_restarted_egress_joins_the_copies_from_a_peer",
+        "with_no_answer_the_task_gives_up_and_a_boundary_starts_the_stream",
+        "no_peer_makes_no_task",
+        "the_mark_of_a_peer_reads_from_its_headers_and_defaults_to_none"
+      ],
+      "limitation": "Validates exact peer history and resumed live input plus unreachable-peer fallback; does not establish crash durability or all-peer divergence handling."
+    },
+    "batcher-recovery": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-batcher",
+        "--lib",
+        "live::feed::tests::recovery::"
+      ],
+      "real": [
+        "FeedLoop",
+        "LiveSender",
+        "real temporary Spool and cursor",
+        "DA HTTP client and payload packing"
+      ],
+      "controlled": [
+        "L1 provider replies",
+        "DA HTTP 503 endpoint",
+        "live reader records"
+      ],
+      "tests": [
+        "a_restored_post_is_reconciled_before_live_blocks_can_extend_it",
+        "a_foreign_post_still_stops_recovery_before_any_live_block_is_consumed",
+        "an_exhausted_restored_post_keeps_its_spool_and_does_not_absorb_live_blocks",
+        "an_empty_spool_keeps_the_live_group_together"
+      ],
+      "limitation": "Does not run L1 contracts, consensus retention or a successful DA service."
+    },
+    "l1-source-quorum": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-da-watcher",
+        "--test",
+        "l1_sources"
+      ],
+      "real": [
+        "L1Sources agreement, rotation and backoff"
+      ],
+      "controlled": [
+        "independent scripted L1 source replies"
+      ],
+      "tests": [
+        "two_sources_that_agree_serve_the_block_and_the_lowest_tip",
+        "a_member_without_a_finalized_block_holds_the_tip_back",
+        "one_liar_halts_the_read_with_both_answers_and_the_counter",
+        "a_rate_limited_source_rotates_out_and_the_rest_continue",
+        "one_live_source_of_two_is_short_of_the_quorum",
+        "every_source_out_halts",
+        "a_rotated_source_returns_after_the_backoff",
+        "the_light_client_settles_a_disagreement_and_rotates_the_liar_out",
+        "a_silent_light_client_falls_back_to_the_public_quorum",
+        "a_single_source_is_trusted_alone",
+        "log_queries_are_cross_checked",
+        "a_source_halt_names_its_halt_cause",
+        "a_header_batch_needs_two_agreeing_sources",
+        "an_endpoint_name_never_carries_the_key"
+      ],
+      "limitation": "Scripted providers do not prove real HTTP behavior or watcher halt publication."
+    },
+    "l1-provider-http": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-da-watcher",
+        "--test",
+        "l1_batch_headers"
+      ],
+      "real": [
+        "RpcL1Source HTTP parsing",
+        "L1Sources per-source deadlines"
+      ],
+      "controlled": [
+        "real local HTTP endpoints with batched replies or no response"
+      ],
+      "tests": [
+        "unresponsive_sources_cannot_hold_the_follower_read_forever",
+        "a_range_of_headers_is_one_request",
+        "a_lie_in_the_batch_reaches_the_header"
+      ],
+      "limitation": "This is provider-boundary evidence; no external L1, consensus or deployment is used.",
+      "negative_controls": [
+        {
+          "mutation": "remove the production per-source read deadline",
+          "test": "unresponsive_sources_cannot_hold_the_follower_read_forever",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      ]
+    },
+    "l1-watcher-recovery": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-da-watcher",
+        "--test",
+        "l1_follow"
+      ],
+      "real": [
+        "L1Watcher processing",
+        "BoundaryFeed",
+        "real CursorFile"
+      ],
+      "controlled": [
+        "scripted archived L1 records",
+        "epoch publisher",
+        "sealer-origin feed"
+      ],
+      "tests": [
+        "the_file_holds_the_confirmed_origin_not_the_last_publish",
+        "a_restart_in_the_publish_to_commit_window_loses_no_epoch",
+        "epochs_no_boundary_confirms_are_published_again_after_the_timeout",
+        "an_origin_that_moves_back_is_followed",
+        "a_start_resumes_after_the_sealer_origin_below_the_file",
+        "an_origin_ahead_of_the_head_is_followed_without_a_republish",
+        "two_watchers_publish_identical_copies_and_follow_one_origin",
+        "a_full_window_stops_new_publishes_and_drops_nothing",
+        "a_spawned_watcher_resumes_after_the_first_boundary",
+        "a_silent_sealer_at_start_falls_back_to_the_file",
+        "the_boundary_feed_sends_each_new_origin"
+      ],
+      "limitation": "Process reconstruction is in-process; no OS crash or real Raft commit is simulated."
+    },
+    "l1-watcher-pause": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-da-watcher",
+        "--test",
+        "l1_pause"
+      ],
+      "real": [
+        "spawned L1Watcher task",
+        "lifecycle pause propagation",
+        "real CursorFile"
+      ],
+      "controlled": [
+        "archived record availability",
+        "epoch publisher"
+      ],
+      "tests": [
+        "a_watcher_without_its_record_pauses_on_the_follower_and_resumes"
+      ],
+      "limitation": "Validates pause/resume for missing archived records, not transport deployment."
     }
   },
   "families": {
@@ -586,6 +906,14 @@
         {
           "suite": "executor-pipeline",
           "test": "exec_settles_inflight_commits_while_idle"
+        },
+        {
+          "suite": "ingress-accounts",
+          "test": "a_lagging_executor_answer_admits"
+        },
+        {
+          "suite": "ingress-receipts",
+          "test": "a_failed_egress_falls_back_to_the_executor"
         }
       ],
       "full_case_locally_validated": false
@@ -600,8 +928,13 @@
     {
       "case": "l1-liar",
       "family": "L1",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "l1-source-quorum",
+          "test": "one_liar_halts_the_read_with_both_answers_and_the_counter"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -621,50 +954,113 @@
     {
       "case": "batcher-outage-past-retention",
       "family": "L1",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "egress-owner",
+          "test": "unposted_blocks_remain_replayable_after_pruning_and_a_restart"
+        },
+        {
+          "suite": "batcher-recovery",
+          "test": "a_restored_post_is_reconciled_before_live_blocks_can_extend_it"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
       "case": "l1-transport-refusals",
       "family": "Follower",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "l1-source-quorum",
+          "test": "a_rate_limited_source_rotates_out_and_the_rest_continue"
+        },
+        {
+          "suite": "l1-source-quorum",
+          "test": "a_rotated_source_returns_after_the_backoff"
+        },
+        {
+          "suite": "l1-provider-http",
+          "test": "unresponsive_sources_cannot_hold_the_follower_read_forever"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
       "case": "follower-instance-loss",
       "family": "Follower",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "l1-watcher-recovery",
+          "test": "a_restart_in_the_publish_to_commit_window_loses_no_epoch"
+        },
+        {
+          "suite": "l1-watcher-pause",
+          "test": "a_watcher_without_its_record_pauses_on_the_follower_and_resumes"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
       "case": "follower-total-loss",
       "family": "Follower",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "l1-watcher-recovery",
+          "test": "a_restart_in_the_publish_to_commit_window_loses_no_epoch"
+        },
+        {
+          "suite": "l1-watcher-pause",
+          "test": "a_watcher_without_its_record_pauses_on_the_follower_and_resumes"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
       "case": "follower-disagreement",
       "family": "Follower",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "l1-source-quorum",
+          "test": "one_liar_halts_the_read_with_both_answers_and_the_counter"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
       "case": "mirror-backlog-client-restart",
       "family": "Cache",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "ingress-accounts",
+          "test": "a_lagging_executor_answer_admits"
+        },
+        {
+          "suite": "ingress-receipts",
+          "test": "a_failed_egress_falls_back_to_the_executor"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
       "case": "redis-partition-ingress",
       "family": "Cache",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "ingress-accounts",
+          "test": "a_lagging_executor_answer_admits"
+        },
+        {
+          "suite": "ingress-receipts",
+          "test": "a_failed_egress_falls_back_to_the_executor"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -726,8 +1122,13 @@
     {
       "case": "carry-readers-on-egress",
       "family": "Carry",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "egress-owner",
+          "test": "the_run_ends_when_every_sender_is_gone"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -773,8 +1174,17 @@
     {
       "case": "carry-egress-restart",
       "family": "Carry",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "egress-owner",
+          "test": "the_run_ends_when_every_sender_is_gone"
+        },
+        {
+          "suite": "egress-catchup",
+          "test": "a_restarted_egress_joins_the_copies_from_a_peer"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -869,36 +1279,61 @@
     {
       "case": "retention-overrun",
       "family": "Retention",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "egress-owner",
+          "test": "unposted_blocks_remain_replayable_after_pruning_and_a_restart"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
       "case": "retention-overrun-validator",
       "family": "Retention",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "egress-owner",
+          "test": "unposted_blocks_remain_replayable_after_pruning_and_a_restart"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
       "case": "prune-floor",
       "family": "Retention",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "egress-owner",
+          "test": "unposted_blocks_remain_replayable_after_pruning_and_a_restart"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
       "case": "da-lag-halt",
       "family": "Retention",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "ingress-da-halt",
+          "test": "the_tags_follow_the_posted_head_and_a_halt_refuses_submits"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
       "case": "canary-da-lag",
       "family": "Retention",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "ingress-da-halt",
+          "test": "the_tags_follow_the_posted_head_and_a_halt_refuses_submits"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
