@@ -6,10 +6,12 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG = ROOT / "docs/reviews/2026-10-28-component-recovery.json"
@@ -23,6 +25,9 @@ class Run:
     def suite(self, name):
         suite = self.suites[name]
         log = self.directory / f"{name}.log"
+        reports = [ROOT / path for path in suite.get("junit_reports", [])]
+        for report in reports:
+            report.unlink(missing_ok=True)
         started = time.monotonic()
         print(f"{name}: {' '.join(suite['command'])}", flush=True)
         timed_out = False
@@ -41,17 +46,38 @@ class Run:
         text = log.read_text()
         passed = re.findall(r"^test ([\w:]+) \.\.\. ok$", text, re.MULTILINE)
         failed = re.findall(r"^test ([\w:]+) \.\.\. FAILED$", text, re.MULTILINE)
+        report_errors = []
+        if reports:
+            passed, failed, report_errors = self.junit(name, reports)
         missing = [name for name in suite["tests"]
                    if not any(test == name or test.endswith("::" + name) for test in passed)]
         result = {"command": suite["command"], "exit_code": code, "timed_out": timed_out,
                   "seconds": round(time.monotonic() - started, 3), "passed": passed, "failed": failed,
+                  "report_errors": report_errors,
                   "missing_expected_tests": missing, "log": str(log),
-                  "success": code == 0 and not missing}
+                  "success": code == 0 and not missing and not failed and not report_errors}
         print(f"{name}: {'PASS' if result['success'] else 'FAIL'}; "
               f"{len(passed)} passed, {len(failed)} failed tests; {result['seconds']}s; {log}", flush=True)
         if not result["success"]:
             print("\n".join(text.splitlines()[-30:]), flush=True)
         return result
+
+    def junit(self, name, reports):
+        passed, failed, errors = [], [], []
+        for path in reports:
+            try:
+                root = ET.parse(path).getroot()
+                shutil.copyfile(path, self.directory / f"{name}-{path.name}")
+            except (OSError, ET.ParseError) as error:
+                errors.append(f"{path}: {error}")
+                continue
+            for test in root.iter("testcase"):
+                identifier = f"{test.get('classname', '')}::{test.get('name', '')}"
+                if test.find("failure") is not None or test.find("error") is not None:
+                    failed.append(identifier)
+                elif test.find("skipped") is None:
+                    passed.append(identifier)
+        return passed, failed, errors
 
     @staticmethod
     def revision():
