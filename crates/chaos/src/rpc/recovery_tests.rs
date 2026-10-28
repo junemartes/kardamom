@@ -12,6 +12,7 @@ use super::*;
 
 const ACCOUNT: u32 = 3;
 const NO_QUORUM: &str = "chain halted: sealer_no_quorum at sealer (no status frame for 14 s)";
+const DA_LAG: &str = "chain halted: da_lag at sealer (sealed head 383 is 9 blocks past the posted head 374; the budget is 8)";
 
 enum Reply {
     Refuse(usize, ErrorObjectOwned),
@@ -122,36 +123,47 @@ impl Fixture {
 
 #[tokio::test]
 async fn no_quorum_retries_identical_signed_bytes_and_requires_their_receipt() {
-    let mut fixture = Fixture::new(Fixture::refusal(2, -32010, NO_QUORUM)).await;
-    fixture
-        .rpc
-        .transfer_within(ACCOUNT, Duration::from_secs(5))
-        .await
-        .unwrap();
-    let events = fixture.drain();
-    assert_eq!(
-        events.iter().filter(|e| matches!(e, Event::Nonce)).count(),
-        1
-    );
-    let raw: Vec<_> = events
-        .iter()
-        .filter_map(|e| match e {
-            Event::Submit(raw) => Some(raw),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(raw.len(), 3);
-    assert!(raw.iter().all(|r| *r == raw[0]));
-    let bytes = hex::decode(raw[0]).unwrap();
-    assert_eq!(
-        TxEnvelope::decode_2718(&mut bytes.as_slice())
-            .unwrap()
-            .nonce(),
-        5
-    );
-    let expected = format!("{:#x}", keccak256(bytes));
-    assert!(matches!(events.last(), Some(Event::Receipt(hash)) if hash == &expected));
-    fixture.handle.stop().unwrap();
+    Fixture::assert_retried_receipt(RecoveryCause::NoQuorum, NO_QUORUM).await;
+}
+
+#[tokio::test]
+async fn renewed_da_lag_retries_identical_signed_bytes_and_requires_their_receipt() {
+    Fixture::assert_retried_receipt(RecoveryCause::DaLag, DA_LAG).await;
+}
+
+impl Fixture {
+    async fn assert_retried_receipt(cause: RecoveryCause, message: &str) {
+        let mut fixture = Fixture::new(Fixture::refusal(2, -32010, message)).await;
+        fixture
+            .rpc
+            .transfer_within(ACCOUNT, Duration::from_secs(5), cause)
+            .await
+            .unwrap();
+        let events = fixture.drain();
+        assert_eq!(
+            events.iter().filter(|e| matches!(e, Event::Nonce)).count(),
+            1
+        );
+        let raw: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Submit(raw) => Some(raw),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(raw.len(), 3);
+        assert!(raw.iter().all(|r| *r == raw[0]));
+        let bytes = hex::decode(raw[0]).unwrap();
+        assert_eq!(
+            TxEnvelope::decode_2718(&mut bytes.as_slice())
+                .unwrap()
+                .nonce(),
+            5
+        );
+        let expected = format!("{:#x}", keccak256(bytes));
+        assert!(matches!(events.last(), Some(Event::Receipt(hash)) if hash == &expected));
+        fixture.handle.stop().unwrap();
+    }
 }
 
 #[tokio::test]
@@ -165,10 +177,47 @@ async fn another_halt_or_rpc_refusal_fails_without_retry() {
         (-32000, NO_QUORUM),
         (-32602, "invalid transaction"),
     ] {
-        let mut fixture = Fixture::new(Fixture::refusal(usize::MAX, code, message)).await;
+        Fixture::assert_refused_once(RecoveryCause::NoQuorum, code, message).await;
+    }
+}
+
+#[tokio::test]
+async fn a_persistent_no_quorum_refusal_consumes_only_the_original_deadline() {
+    Fixture::assert_persistent_bound(RecoveryCause::NoQuorum, NO_QUORUM).await;
+}
+
+#[tokio::test]
+async fn nonce_submit_and_receipt_delays_share_one_budget() {
+    Fixture::assert_shared_budget(RecoveryCause::NoQuorum).await;
+}
+
+#[tokio::test]
+async fn a_wrong_submit_hash_or_unsuccessful_receipt_cannot_pass() {
+    Fixture::assert_invalid_receipts(RecoveryCause::NoQuorum).await;
+}
+
+#[tokio::test]
+async fn da_recovery_rejects_other_roots_causes_and_rpc_errors() {
+    for (code, message) in [
+        (-32010, NO_QUORUM),
+        (-32010, "chain halted: da_lag at executor (wrong root)"),
+        (
+            -32010,
+            "chain halted: execution_failure at sealer (invalid block)",
+        ),
+        (-32000, DA_LAG),
+        (-32602, "invalid transaction"),
+    ] {
+        Fixture::assert_refused_once(RecoveryCause::DaLag, code, message).await;
+    }
+}
+
+impl Fixture {
+    async fn assert_refused_once(cause: RecoveryCause, code: i32, message: &str) {
+        let mut fixture = Self::new(Self::refusal(usize::MAX, code, message)).await;
         let error = fixture
             .rpc
-            .transfer_within(ACCOUNT, Duration::from_secs(2))
+            .transfer_within(ACCOUNT, Duration::from_secs(2), cause)
             .await
             .unwrap_err();
         assert!(error.to_string().contains(message), "{error:#}");
@@ -176,7 +225,7 @@ async fn another_halt_or_rpc_refusal_fails_without_retry() {
             fixture
                 .drain()
                 .iter()
-                .filter(|e| matches!(e, Event::Submit(_)))
+                .filter(|event| matches!(event, Event::Submit(_)))
                 .count(),
             1
         );
@@ -185,47 +234,65 @@ async fn another_halt_or_rpc_refusal_fails_without_retry() {
 }
 
 #[tokio::test]
-async fn a_persistent_no_quorum_refusal_consumes_only_the_original_deadline() {
-    let mut fixture = Fixture::new(Fixture::refusal(usize::MAX, -32010, NO_QUORUM)).await;
-    let error = fixture
-        .rpc
-        .transfer_within(ACCOUNT, Duration::from_millis(100))
-        .await
-        .unwrap_err();
-    assert!(format!("{error:#}").contains("bound"));
-    assert!(
-        !fixture
-            .drain()
-            .iter()
-            .any(|e| matches!(e, Event::Receipt(_)))
-    );
-    fixture.handle.stop().unwrap();
+async fn a_persistent_da_lag_refusal_cannot_pass_the_transfer_bound() {
+    Fixture::assert_persistent_bound(RecoveryCause::DaLag, DA_LAG).await;
 }
 
 #[tokio::test]
-async fn nonce_submit_and_receipt_delays_share_one_budget() {
-    let fixture = Fixture::new(Reply::Slow).await;
-    let error = fixture
-        .rpc
-        .transfer_within(ACCOUNT, Duration::from_millis(250))
-        .await
-        .unwrap_err();
-    assert!(format!("{error:#}").contains("bound"));
-    fixture.handle.stop().unwrap();
+async fn da_recovery_nonce_submit_and_receipt_delays_share_one_budget() {
+    Fixture::assert_shared_budget(RecoveryCause::DaLag).await;
 }
 
 #[tokio::test]
-async fn a_wrong_submit_hash_or_unsuccessful_receipt_cannot_pass() {
-    for reply in [
-        Reply::WrongHash,
-        Reply::MissingReceipt,
-        Reply::FailedReceipt,
-    ] {
-        let fixture = Fixture::new(reply).await;
+async fn da_recovery_rejects_wrong_hashes_missing_and_unsuccessful_receipts() {
+    Fixture::assert_invalid_receipts(RecoveryCause::DaLag).await;
+}
+
+impl Fixture {
+    async fn assert_persistent_bound(cause: RecoveryCause, message: &str) {
+        let mut fixture = Fixture::new(Fixture::refusal(usize::MAX, -32010, message)).await;
+        let error = fixture
+            .rpc
+            .transfer_within(ACCOUNT, Duration::from_millis(100), cause)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("bound"));
+        assert!(
+            !fixture
+                .drain()
+                .iter()
+                .any(|e| matches!(e, Event::Receipt(_)))
+        );
+        fixture.handle.stop().unwrap();
+    }
+
+    async fn assert_shared_budget(cause: RecoveryCause) {
+        let fixture = Fixture::new(Reply::Slow).await;
+        let error = fixture
+            .rpc
+            .transfer_within(ACCOUNT, Duration::from_millis(250), cause)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("bound"));
+        fixture.handle.stop().unwrap();
+    }
+
+    async fn assert_invalid_receipts(cause: RecoveryCause) {
+        for reply in [
+            Reply::WrongHash,
+            Reply::MissingReceipt,
+            Reply::FailedReceipt,
+        ] {
+            Self::assert_invalid_receipt(cause, reply).await;
+        }
+    }
+
+    async fn assert_invalid_receipt(cause: RecoveryCause, reply: Reply) {
+        let fixture = Self::new(reply).await;
         assert!(
             fixture
                 .rpc
-                .transfer_within(ACCOUNT, Duration::from_millis(200))
+                .transfer_within(ACCOUNT, Duration::from_millis(200), cause)
                 .await
                 .is_err()
         );

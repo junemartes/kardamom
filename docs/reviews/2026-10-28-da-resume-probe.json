@@ -1,0 +1,55 @@
+{
+  "date": "2026-10-28",
+  "base": "931ae7aef755567aefc1fcfd1a6cb073938e9be3",
+  "failure": {
+    "run": 40611745059,
+    "job": 122575074818,
+    "case": "da-lag-halt",
+    "halt_utc": "02:43:24",
+    "sealed_before_thaw": 369,
+    "posted_before_thaw": 358,
+    "failure_utc": "02:43:45",
+    "refusal_after_resume": {
+      "sealed": 383,
+      "posted": 374,
+      "budget": 8,
+      "code": -32010,
+      "cause": "da_lag at sealer"
+    }
+  },
+  "finding": "A single unhalted observation after thaw does not guarantee that the moving sealed/posted lag remains below the deliberately small budget until the probe submits. The one-shot transfer fails immediately on a renewed refusal of the injected cause.",
+  "change": "The DA recovery transfer retries only the exact typed da_lag-at-sealer refusal, using one signed transaction and the existing 60-second outer deadline covering nonce lookup, submits and receipt. Other faults explicitly select NoQuorum and retain their existing retry policy.",
+  "preserved": [
+    "Proof that the batcher posts past the frozen head",
+    "Receipt success and exact submitted hash",
+    "One nonce lookup and identical bytes across refused attempts",
+    "Immediate failure for another root, cause or RPC error",
+    "Failure for a persistent halt, wrong hash, missing receipt or unsuccessful receipt",
+    "All-services-running and executor-progress assertions",
+    "Every existing fault, rate, case, shard and recovery deadline"
+  ],
+  "validation": {
+    "chaos_lib_passed": 314,
+    "ignored": 2,
+    "full_log": "/tmp/chaos-da-resume-full-20261028.log",
+    "recovery_tests_after_restoration": 10,
+    "restoration_log": "/tmp/chaos-da-resume-final-20261028.log",
+    "negative_controls": [
+      "Disabling the DA retry reproduces immediate failure on the observed refusal.",
+      "Retrying every halted-chain error violates the immediate rejection control for an unrelated no-quorum cause."
+    ],
+    "negative_logs": [
+      "/tmp/chaos-da-resume-no-retry-negative-20261028.log",
+      "/tmp/chaos-da-resume-broad-retry-negative-20261028.log"
+    ],
+    "style": "passed",
+    "style_log": "/tmp/chaos-da-resume-final-style-20261028.log",
+    "notice": "Existing proc-macro-error2 future-compatibility notice"
+  },
+  "impact": "Chaos probe only; no product runtime, admission policy, service wiring or hot path changes.",
+  "limitations": [
+    "Live DA recovery must still pass fresh CI.",
+    "This does not establish a solution to runner contention or performance regression."
+  ],
+  "qualification_streak": 0
+}
