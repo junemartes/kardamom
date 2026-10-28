@@ -349,11 +349,8 @@ impl Harness {
     /// The injection gate: the ingress received counter must move past
     /// its pre-load baseline within the flow timeout, or the case
     /// refuses to inject into an idle pipeline.
-    /// Wait for the load to sign its queues. The load signs the whole
-    /// case window before its first submit: about 200,000 transactions
-    /// for the longest case, which took over 120 s on a CI runner. The
-    /// flow check below starts after this, so slow signing never reads
-    /// as an idle pipeline.
+    /// Wait for the load's first signed batch. The flow check starts
+    /// after preparation and requires case-owned accepted traffic.
     async fn wait_load_ready(&self, case: Case, load: &LoadRun) -> anyhow::Result<()> {
         let budget = Budget::new(self.knobs.load_ready_timeout, Duration::from_secs(3));
         let outcome = poll::until(budget, |_| async move {

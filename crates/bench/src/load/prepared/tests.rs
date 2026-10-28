@@ -247,3 +247,19 @@ async fn cancelling_a_prepared_run_stops_its_background_receipt_readers() {
     );
     assert!(!progress.is_submitting());
 }
+
+#[tokio::test]
+async fn preparation_bounds_chaos_signing_but_presigns_the_performance_run() {
+    let ingress = Ingress::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("report.json");
+    let config = ingress.config(Duration::from_secs(100), &output);
+    let planned = config.per_sender_estimate();
+    let chaos = prepare(config.clone()).await.unwrap();
+    assert_eq!(chaos.setup.queues.planned().count(), 4096);
+    let mut performance_config = config;
+    performance_config.chaos_mode = false;
+    let performance = prepare(performance_config).await.unwrap();
+    assert_eq!(performance.setup.queues.planned().count(), planned);
+    assert!(planned > 4096);
+}

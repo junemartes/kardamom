@@ -1,7 +1,7 @@
 //! `kardamom-load` is an open-loop sustained-load and chaos verification
 //! harness.
 //!
-//! It drives a pre-generated transaction stream through ingress at a
+//! It drives a signed transaction stream through ingress at a
 //! paced rate, tracks every transaction to a receipt (must-deliver),
 //! reads the cluster's Prometheus metrics for drop and liveness
 //! signals, and renders a pass-fail verdict. It runs in two modes:
@@ -422,7 +422,7 @@ impl LoadRun<'_> {
         tasks: &mut tokio::task::JoinSet<()>,
         queues: &mut Queues,
         ramp: &mut Vec<RampStep>,
-    ) -> std::num::NonZeroU32 {
+    ) -> anyhow::Result<std::num::NonZeroU32> {
         let mut run = RampRun {
             cfg: self.cfg,
             handles,
@@ -436,7 +436,7 @@ impl LoadRun<'_> {
         let mut discovered: Option<std::num::NonZeroU32> = None;
         let mut rate = self.cfg.ramp_step_tps;
         while rate.get() <= self.cfg.target_tps.get() {
-            let Some(next) = run.ramp_step(rate).await else {
+            let Some(next) = run.ramp_step(rate).await? else {
                 break;
             };
             (discovered, rate) = (Some(rate), next);
@@ -444,7 +444,7 @@ impl LoadRun<'_> {
         // No step ran (the first step size already exceeds
         // `target_tps`), or none was sustainable: fall back to the
         // smallest step size.
-        discovered.unwrap_or(self.cfg.ramp_step_tps)
+        Ok(discovered.unwrap_or(self.cfg.ramp_step_tps))
     }
 }
 
@@ -486,19 +486,23 @@ async fn prepare_run(cfg: &LoadConfig) -> anyhow::Result<RunSetup> {
     );
     // Signing is CPU work, seconds to minutes for a long window. Keep
     // it off the async worker the caller's tasks share.
+    let plan = QueuePlan {
+        chain_id,
+        per_sender,
+        starts,
+    };
+    if cfg.chaos_mode && matches!(cfg.workload, Workload::Transfers) {
+        let queues = Queues::stream_transfers(cfg, &signers, plan).await?;
+        return Ok(RunSetup {
+            client,
+            signers,
+            queues,
+        });
+    }
     let built = tokio::task::spawn_blocking({
         let cfg = cfg.clone();
         let signers = signers.clone();
-        move || {
-            cfg.build_queues(
-                &signers,
-                &QueuePlan {
-                    chain_id,
-                    per_sender,
-                    starts,
-                },
-            )
-        }
+        move || cfg.build_queues(&signers, &plan)
     })
     .await
     .map_err(|e| anyhow::anyhow!("join the pre-generation: {e}"))??;
@@ -524,10 +528,11 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     prepare(cfg).await?.run().await
 }
 
-/// A load whose submit queues are signed: it starts to submit as soon
+/// A load whose first submit queues are signed: it starts to submit as soon
 /// as [`Prepared::run`] is called. A caller that must know when the
 /// submissions start prepares first and runs second, because signing a
-/// long window costs minutes of CPU.
+/// non-chaos window costs minutes of CPU. Plain-transfer chaos runs sign bounded
+/// batches ahead of pacing and register each batch before submission.
 ///
 /// # Errors
 ///
@@ -553,7 +558,7 @@ struct RampRun<'a> {
 impl RampRun<'_> {
     /// Pace at `rate` tx/s for one step, and measure whether the
     /// ingress kept pace and the cluster stayed clean.
-    async fn run_step(&mut self, rate: std::num::NonZeroU32) -> RampStep {
+    async fn run_step(&mut self, rate: std::num::NonZeroU32) -> anyhow::Result<RampStep> {
         let before = self.handles.tracker.counts();
         let s0 = self.scraper.snapshot().await;
         pacer(
@@ -569,7 +574,7 @@ impl RampRun<'_> {
                 feed_confirm: self.cfg.feed_confirm_on(),
             },
         )
-        .await;
+        .await?;
         let after = self.handles.tracker.counts();
         let s1 = self.scraper.snapshot().await;
 
@@ -623,7 +628,7 @@ impl RampRun<'_> {
             sustainable,
             "ramp step"
         );
-        RampStep {
+        Ok(RampStep {
             rate: rate.get(),
             accept_ratio,
             gap_ok,
@@ -633,15 +638,18 @@ impl RampRun<'_> {
             lat_p95_us: lat.p95,
             gas_used,
             lat_p99_us: lat.p99,
-        }
+        })
     }
 
     /// Run one ramp step at `rate`, record it, and return the next
     /// rate to try if it was sustainable, else `None` to stop ramping.
-    async fn ramp_step(&mut self, rate: std::num::NonZeroU32) -> Option<std::num::NonZeroU32> {
-        let step = self.run_step(rate).await;
+    async fn ramp_step(
+        &mut self,
+        rate: std::num::NonZeroU32,
+    ) -> anyhow::Result<Option<std::num::NonZeroU32>> {
+        let step = self.run_step(rate).await?;
         let sustainable = step.sustainable;
         self.ramp.push(step);
-        sustainable.then(|| rate.saturating_add(self.cfg.ramp_step_tps.get()))
+        Ok(sustainable.then(|| rate.saturating_add(self.cfg.ramp_step_tps.get())))
     }
 }

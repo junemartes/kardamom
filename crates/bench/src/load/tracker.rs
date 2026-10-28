@@ -76,12 +76,28 @@ struct Expected {
     nonce: u64,
 }
 
+impl Expected {
+    fn planned(signers: &[DerivedSigner], tx: &PlannedTx) -> Option<(B256, Self)> {
+        let sender = signers.get(tx.sender)?.address;
+        Some((
+            tx.hash,
+            Self {
+                sender,
+                nonce: tx.nonce,
+            },
+        ))
+    }
+}
+
 /// The blocks every confirmed transaction landed in, per sender by
 /// nonce. A sender's nonces execute in order, so its blocks must not
 /// decrease along the nonce sequence.
 #[derive(Default)]
 struct Placement {
     by_sender: HashMap<Address, BTreeMap<u64, u64>>,
+    /// A chaos queue publishes each refill before its first submit. The
+    /// submit and receipt tasks access these expectations on different threads.
+    streamed: HashMap<B256, Expected>,
 }
 
 impl Placement {
@@ -243,16 +259,26 @@ impl Tracker {
         signers: &[DerivedSigner],
         planned: impl Iterator<Item = &'a PlannedTx>,
     ) {
-        self.expected.extend(planned.filter_map(|tx| {
-            let sender = signers.get(tx.sender)?.address;
-            Some((
-                tx.hash,
-                Expected {
-                    sender,
-                    nonce: tx.nonce,
-                },
-            ))
-        }));
+        self.expected
+            .extend(planned.filter_map(|tx| Expected::planned(signers, tx)));
+    }
+
+    /// Publish a signed chaos batch before any of its hashes reach ingress.
+    pub(crate) fn expect_more<'a>(
+        &self,
+        signers: &[DerivedSigner],
+        planned: impl Iterator<Item = &'a PlannedTx>,
+    ) {
+        lock(&self.placement)
+            .streamed
+            .extend(planned.filter_map(|tx| Expected::planned(signers, tx)));
+    }
+
+    fn expected(&self, hash: &B256) -> Option<Expected> {
+        self.expected
+            .get(hash)
+            .copied()
+            .or_else(|| lock(&self.placement).streamed.get(hash).copied())
     }
 
     /// Register an attempted submit.
@@ -359,8 +385,8 @@ impl Tracker {
                 hash: *h,
                 accepted: v.accepted,
                 age: v.submit_ts.elapsed(),
-                sender: self.expected.get(h).map(|expected| expected.sender),
-                nonce: self.expected.get(h).map(|expected| expected.nonce),
+                sender: self.expected(h).map(|expected| expected.sender),
+                nonce: self.expected(h).map(|expected| expected.nonce),
             })
             .collect()
     }
@@ -446,7 +472,7 @@ impl Tracker {
     /// hash with no expectation. A skip receipt does not take a place in
     /// the nonce order, because its nonce stays unspent.
     fn contradiction(&self, hash: B256, receipt: &ReceiptStatus) -> Option<String> {
-        let e = *self.expected.get(&hash)?;
+        let e = self.expected(&hash)?;
         if receipt.from != Some(e.sender) {
             return Some(format!(
                 "from {:?}, signed by {} nonce {}",

@@ -1,0 +1,55 @@
+{
+  "date": "2026-10-28",
+  "base": "7875364817e2b8e9e509cab1daa67d756f7d009c",
+  "failure": {
+    "run": 40614853003,
+    "job": 122585005295,
+    "case": "carry-versions-on",
+    "started_utc": "02:20:32",
+    "failed_utc": "02:30:42",
+    "message": "the load is still signing its queues after 600s",
+    "fault_injected": false
+  },
+  "cause": "The chaos harness signs the entire upper load window before publishing readiness. Long deployment windows multiply signing work and retained transaction bytes even when recovery ends early.",
+  "change": {
+    "scope": "Plain-transfer chaos loads only. Other workloads and ordinary performance loads retain full pre-signing.",
+    "batch_target": 4096,
+    "batch_bound": "ceil(4096 / senders) transfers per sender; at most current, one queued and one signing batch.",
+    "invariants": [
+      "Identical signed bytes, hashes, sender rotation and per-sender nonces",
+      "Existing total plan, pacing, workload rates, recovery deadlines and receipt checks",
+      "First batch signs before readiness; each refill publishes receipt expectations before submitting",
+      "Signer errors and premature channel closure fail the run, never count as normal exhaustion",
+      "Dropping the receiver stops a blocked producer after at most its current batch",
+      "Refill waits are logged so CI can distinguish signing starvation from runtime backpressure"
+    ],
+    "memory_limit": "Signed bytes are bounded independently of duration; receipt/order evidence still grows with the traffic actually observed."
+  },
+  "validation": {
+    "bench_lib_passed": 99,
+    "chaos_lib_passed": 309,
+    "chaos_ignored": 2,
+    "negative_control": "Removing the batch bound fails the first-batch assertion: 8198 transactions instead of 4096.",
+    "controls": [
+      "Full presigning and batched streams match bytes/hash/order across multiple batches",
+      "Ordinary performance preparation still signs its full plan",
+      "Feed-before-ack and ack-before-feed preserve receipt identity checks",
+      "Nonce/block ordering spans initial and refilled expectations",
+      "Late nonce overflow and unexpected producer loss cannot end successfully",
+      "Run-level signer failure writes no passing report",
+      "Dropping a consumer releases its producer"
+    ],
+    "full_log": "/tmp/chaos-stream-final-20261028.log",
+    "negative_log": "/tmp/chaos-stream-negative-20261028.log",
+    "style": "passed",
+    "style_log": "/tmp/chaos-stream-final-style-20261028.log",
+    "notice": "Existing proc-macro-error2 future-compatibility notice"
+  },
+  "impact": "Test harness only. No product runtime, service wiring, production idle policy, shard count or case list changes.",
+  "limitations": [
+    "Distributed signing/pacing, carry and node-replacement recovery still require fresh CI. A lower offered rate is not evidence of a fix.",
+    "The global runner contention and deployed performance regressions remain unresolved.",
+    "The benchmark stream keeps fully presigned inputs but shares error propagation; final-source client performance validation remains required."
+  ],
+  "qualification_streak": 0
+}
