@@ -42,5 +42,5 @@ metrics-exporter-prometheus = { workspace = true }
 kardamom-formats.workspace = true
 # A fake executor query endpoint for the failover test of `query`.
 jsonrpsee.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process"] }
 toml = { workspace = true }

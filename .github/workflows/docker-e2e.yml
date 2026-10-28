@@ -100,6 +100,9 @@ jobs:
             --features 'docker-e2e' \
             --test redis_e2e -- --ignored --nocapture
 
+      - name: cache Sentinel component recovery
+        run: python3 scripts/test-components.py cache-sentinel
+
       - name: state mirror component recovery
         run: |
           python3 scripts/test-components.py state-mirror
