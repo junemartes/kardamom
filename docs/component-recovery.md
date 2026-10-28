@@ -29,7 +29,7 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 103 checks.
+head. Both targets run in the existing Docker CI job. `all` runs 148 checks.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
@@ -49,6 +49,22 @@ the production restore code, then requires an unmanifested copy to fail. The oth
 checks distinguish a growing live log from missing-file or mixed archive failures.
 This covers the harness failure that prevented the disk-full case from reaching its
 fault; executor behavior during ENOSPC still needs the existing chaos shard.
+
+`just test-component sealer-actor` runs 38 Java service checks with controlled
+cluster/session peers, explicit timestamps, four-frame carry/replay windows, and
+snapshot restore at each log cut. `just test-component sealer-raft` runs seven checks
+with three real in-JVM Aeron consensus members, media drivers and archives. They
+cover leader loss, snapshot restart/stall, session replay, eviction and carry
+activation. The first targets take about 14 and 38 seconds including Gradle work.
+These reuse the existing Java fixtures and start no chain stack. The Raft group
+still uses real scheduling and local Aeron transport; the actor clock does not accelerate
+its consensus protocol.
+
+Java targets force test execution and remove their selected old XML reports before
+running. The runner requires fresh reports, preserves them with the logs, names
+every passing/failing test, and rejects skipped or missing expected tests even
+when Gradle exits zero. A negative control that removes seed reoffering on a new
+leadership term must fail the real service test.
 
 The executor fixtures mock the state-writer durability signal. Egress tests use a
 real temporary store and peer HTTP server; batcher tests use a real temporary spool
@@ -84,7 +100,7 @@ test rejects a new chaos case without a corresponding plan. Each family lists th
 real actors, boundary faults, recovery invariants and dependencies that still need
 real integration. `partial` means that named local tests validate some boundary
 assumptions. It does not mean the complete distributed case has passed locally.
-Twenty-nine cases have partial mappings. No full case is marked locally validated yet.
+Thirty-four cases have partial mappings. No full case is marked locally validated yet.
 
 For each remaining case:
 
@@ -102,12 +118,13 @@ For each remaining case:
    evidence. Keep the original deadlines and workload unless a separate reviewed
    experiment requires a change.
 
-Raft quorum/election safety needs real consensus members. Sentinel promotion needs
+Raft partition/quorum-loss safety needs further real-member fault cases. Sentinel promotion needs
 real Redis/Sentinel processes. Checkpoint durability needs real storage and crash
 or syscall faults. Nomad placement, container ownership, advertised addresses and
 kernel network scheduling need integration checks. Mocking those guarantees would
 assume the behavior under test. Small local groups can validate many of them
-without deploying the entire chain, but those groups are still to be implemented.
+without deploying the entire chain. The local Raft fixture covers selected lifecycle
+and replay cases; local Sentinel groups and the remaining faults are still needed.
 
 Component success does not replace latency/throughput measurements or the required
 ten consecutive full CI rounds on one unchanged final revision.
