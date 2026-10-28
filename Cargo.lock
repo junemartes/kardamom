@@ -3782,6 +3782,7 @@ dependencies = [
  "kardamom-deployer",
  "kardamom-engine",
  "kardamom-formats",
+ "kardamom-l1-fault-proxy",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-types",

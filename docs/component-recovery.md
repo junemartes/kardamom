@@ -19,7 +19,7 @@ HTTP with a paused clock after requests reach the fault proxy. It exercises the
 unchanged 30-second deadline and backoff in about 0.12 seconds of test execution.
 Compilation adds time. These timings measure tests, not transaction performance.
 
-`just test-component state-mirror` adds four checks with one disposable Redis
+`just test-component state-mirror` adds five checks with one disposable Redis
 container at a time and a real 1,025-account checkpoint. It needs Docker, but starts
 no chain services. The tests cover partial scan interruption, partial live writes,
 script loss, input close and monotone replay. Redis ACL logs prove write refusal
@@ -29,7 +29,7 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 180 checks.
+head. Both targets run in the existing Docker CI job. `all` runs 182 checks across 29 targets.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
@@ -186,7 +186,7 @@ test rejects a new chaos case without a corresponding plan. Each family lists th
 real actors, boundary faults, recovery invariants and dependencies that still need
 real integration. `partial` means that named local tests validate some boundary
 assumptions. It does not mean the complete distributed case has passed locally.
-Thirty-seven cases have partial mappings. No full case is marked locally validated yet.
+Thirty-nine cases have partial mappings. No full case is marked locally validated yet.
 
 For each remaining case:
 
@@ -273,3 +273,36 @@ The mirror actor target also pauses a real Redis server for 400 ms. The head
 observer retains its 200-ms request timeout and five-second recovery budget;
 a transient observation error no longer aborts that recovery wait. This test
 checks observer behavior, separately from the actor's recovery assertions.
+
+`just test-component batcher-null-receipts` runs the real batcher feed, sender,
+startup and spool against Anvil and the deployed settlement contract. It uses the
+same null-receipt and swallowed-log faults as the L1 chaos case. Mining control
+holds the second post in the mempool: the spool must retain it and the cursor must
+stay at the first confirmed batch. With the fault still active after mining, the
+actor must reconcile the canonical post and advance exactly once. A second test
+cancels the actor before mining, then restarts it with receipts and logs still
+hidden and an indexer that never answers. Startup must use contract truth; replay
+of the covered block followed by the next block must produce no duplicate post.
+
+Both checks require exact contract batch indices, block ranges, reconstructed DA
+payloads, durable cursors, account nonces and an empty recovered spool. They use
+three empty boundary blocks, a two-entry input channel and a real file-backed local DA HTTP
+service. Missing Anvil fails instead of skipping. The tests run in the existing
+Docker CI workflow, but need no Docker or chain stack locally. The existing DA
+helper serves until the test process ends; Anvil and scratch directories have
+fixture owners. The two checks take about 1.5 seconds of test execution; compilation
+adds time.
+
+Production startup now constructs its feed through one private method shared with
+the fixture. The constructor arguments, defaults and side-effect order stay the
+same. This is a service-wiring extraction, with no posting algorithm or hot-path
+change. No product defect is established by these checks. Negative controls
+reject premature cursor persistence, ignoring contract coverage during replay,
+and ignoring reconciliation after a hidden receipt.
+
+The tests shorten provider polling only. They preserve the production 120-second
+receipt deadline and do not claim to test its expiry. Alloy uses a wall-clock
+instant for timeout bookkeeping, so advancing only Tokio time would not prove
+that deadline. Deterministic mining and cancellation reproduce the recovery cuts
+without waiting for expiry. Follower recovery, alert behavior, distributed DA,
+Nomad restart and the rest of the deployed case remain separate validation.

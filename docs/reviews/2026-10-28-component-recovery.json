@@ -1138,6 +1138,40 @@
           ]
         }
       ]
+    },
+    "batcher-null-receipts": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-batcher",
+        "--lib",
+        "live::run::null_receipts_tests::",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "real": [
+        "production startup and shared FeedLoop construction",
+        "LiveSender and production signed L1 provider",
+        "Anvil and deployed settlement contract",
+        "Spool and durable cursor",
+        "payload packing, local DaStore HTTP and payload reconstruction",
+        "L1 fault proxy with null receipts and swallowed settlement logs"
+      ],
+      "controlled": [
+        "bounded reader channel with one-block batches",
+        "Anvil mining at the exact pending-post cut",
+        "actor cancellation before mining and restart from the same disk",
+        "unresponsive indexer endpoint",
+        "10-ms provider polling; production receipt timeout unchanged"
+      ],
+      "tests": [
+        "hidden_mined_receipts_reconcile_without_duplicate_posts_or_early_cursor",
+        "restart_during_hidden_receipts_uses_contract_truth_without_waiting_for_the_indexer"
+      ],
+      "limitation": "No full follower fleet, Prometheus alert, Nomad restart, consensus retention or EigenDA proof. These tests cover null receipt reconciliation and restart, not expiry of the 120-second receipt deadline. Alloy timeout bookkeeping includes the wall clock, so Tokio virtual time alone cannot prove that deadline. The existing local DA helper serves until the test process exits. Payloads contain empty boundary blocks; transaction execution and full-chain transfer progress are outside this fixture."
     }
   },
   "families": {
@@ -1741,8 +1775,17 @@
     {
       "case": "l1-null-receipts",
       "family": "L1",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "batcher-null-receipts",
+          "test": "hidden_mined_receipts_reconcile_without_duplicate_posts_or_early_cursor"
+        },
+        {
+          "suite": "batcher-null-receipts",
+          "test": "restart_during_hidden_receipts_uses_contract_truth_without_waiting_for_the_indexer"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
