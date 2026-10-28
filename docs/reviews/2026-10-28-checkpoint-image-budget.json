@@ -1,0 +1,68 @@
+{
+  "status": "Local controller regression, negative controls, all 163 component checks, strengthened historical storage assertions and style pass. Live executor shard pending.",
+  "failure": {
+    "run": 40634457681,
+    "job": 122645637589,
+    "case": "checkpoint-disk-full",
+    "evidence": "https://github.com/junemartes/kardamom/actions/runs/40634457681/job/122645637589",
+    "cause": "A completed baseline exceeds an arbitrary 64-MiB inspection limit inside the already bounded 512-MiB fault volume. The case exits before ENOSPC injection.",
+    "observed_image_size": "The failed run reports only that the limit is exceeded; the exact image size is not in that failure. Add baseline capacity, available bytes and image size to the case log."
+  },
+  "change": "Remove only the per-image inspection limit. Preserve the exact mount identity and 512-MiB capacity checks, finite filler bound, real ENOSPC requirement, lease, cleanup ownership and all distributed recovery assertions. The controller can inspect a large baseline both before and during exhaustion. The actual recovery copy must still fit and verify; this change does not promise arbitrary state fits a finite volume.",
+  "local_probe": {
+    "target": "just test-component checkpoint-fault",
+    "runtime": "python:3.13-alpine in one owned Docker container, no network, no added capabilities, read-only root, 512-MiB tmpfs, 120-second parent deadline and bounded cleanup.",
+    "files": "80-MiB baseline and 160-MiB replacement, real writes and fsync. These files are not MDBX images.",
+    "proof": [
+      "Baseline size exceeds the old 64-MiB limit.",
+      "Exact controller reaches kernel ENOSPC and reports zero available bytes.",
+      "Baseline digest survives exhaustion and release.",
+      "Controller ages the baseline beyond six hours without waiting for that duration.",
+      "After release, a larger replacement is written and inspected on the same bounded filesystem."
+    ],
+    "actor_complement": "The existing state-aux-enospc target separately verifies real StateWriter, checkpoint/log failures, continued commits, restored account/storage state and resumed block-log replay.",
+    "negative_controls": [
+      {
+        "mutation": "arbitrary_64m_image_limit",
+        "exit_code": 101,
+        "compiled": true,
+        "kernel_probe_failed": true
+      },
+      {
+        "mutation": "enospc_without_exhaustion",
+        "exit_code": 101,
+        "compiled": true,
+        "kernel_probe_failed": true
+      }
+    ],
+    "controls": "Nine Python controller boundary checks; three Rust job/proof wrappers; one ignored-by-default kernel test."
+  },
+  "service_wiring": "One local probe step is added to the existing Docker CI job. No chaos shard, product service wiring or runtime defaults change.",
+  "performance": "No product hot-path change. The deployed fault retains its 512-MiB limit. The local probe temporarily uses at most that tmpfs size and removes its container on completion.",
+  "qualification_credit": 0,
+  "validation": {
+    "matrix": {
+      "checks": 163,
+      "targets": 24,
+      "seconds": 145.324,
+      "source_revision": "ece45b2349e612bd0e36928acd9d485bf52c7fab",
+      "all_pass": true,
+      "scope": "Before incorporating the independent historical-storage assertion fix; both affected state targets pass again after integration."
+    },
+    "chaos_unit_tests": {
+      "passed": 322,
+      "ignored": 4,
+      "scope": "Both ignored Docker probes run separately in the component matrix; two Nomad-agent tests remain ignored."
+    },
+    "historical_storage": {
+      "issue": 928,
+      "mutation": "Delete block-2 storage key 2000000 only from the restored block-5 database.",
+      "corrupted_exit_code": 101,
+      "assertion": "storage written in block 2, slot 0, after block 5",
+      "clean_auxiliary_tests": 1,
+      "clean_authoritative_tests": 2,
+      "all_pass": true
+    },
+    "style": "just style passes after the final code change; Cargo reports the existing proc-macro-error2 future-incompatibility notice."
+  }
+}

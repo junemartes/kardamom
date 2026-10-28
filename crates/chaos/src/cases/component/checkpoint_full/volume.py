@@ -10,7 +10,6 @@ import sys
 import time
 
 CAPACITY = 512 * 1024 * 1024
-IMAGE_LIMIT = 64 * 1024 * 1024
 
 
 class Volume:
@@ -58,8 +57,6 @@ class Volume:
             return dict(report, checkpoint=None)
         latest = images[-1]
         size = (latest / "mdbx.dat").stat().st_size
-        if size > IMAGE_LIMIT:
-            raise ValueError("checkpoint exceeds the fault volume's 64 MiB image budget")
         return dict(report, checkpoint=latest.name, image_bytes=size)
 
     def lease(self):

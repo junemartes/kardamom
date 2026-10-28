@@ -91,6 +91,7 @@ impl CheckpointFull {
             .assert_bind(h, &self.node, &process.cid, true)
             .await?;
         let baseline = self.checkpoint(h, 0).await?;
+        crate::log(format!("{CTX}: baseline volume {baseline}"));
         self.verify(&baseline, false).await?;
         let before = self.progress(h, &process).await?;
         let armed = self.command(h, "arm").await?;

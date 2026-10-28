@@ -29,7 +29,7 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 159 checks.
+head. Both targets run in the existing Docker CI job. `all` runs 163 checks.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
@@ -50,13 +50,26 @@ checks distinguish a growing live log from missing-file or mixed archive failure
 This covers the harness failure that prevented the disk-full case from reaching its
 fault; executor behavior during ENOSPC still needs the existing chaos shard.
 
+`just test-component checkpoint-fault` exercises the exact ENOSPC controller in
+one disposable Python container. It writes an 80-MiB baseline on the fixed 512-MiB
+tmpfs, requires actual ENOSPC and zero free bytes, preserves the baseline digest,
+then frees space and writes a 160-MiB replacement. The files test controller and
+filesystem behavior; they are not MDBX images. Nine Python controls also verify
+mount ownership, the byte bound, missing images, error classification and cleanup.
+The controller accepts accumulated images above 64 MiB; the kernel's unchanged
+512-MiB mount limit bounds the fault. The deployed case still requires actual
+checkpoint/log failure, same-process transaction progress and verified restore.
+The local probe uses `python:3.13-alpine`, no network or extra capabilities, a
+read-only root and a 120-second deadline. It runs in the existing Docker CI job.
+
 `just test-component state-aux-enospc` fills an isolated eight-MiB tmpfs until the
 kernel returns ENOSPC. The real checkpoint copy and block-log thread must both
 report error 28 while the same state writer continues committing on a separate
 filesystem. A failed copy must leave only the earlier complete checkpoint visible.
 After freeing space, a new base plus the resumed log must restore exactly block 5,
-including account and storage values. The fixture uses five blocks, a one-byte
-segment limit and a two-entry log queue. It takes about four seconds including
+including account values and all ten storage keys written across the five blocks.
+Each observation also rejects keys from blocks not committed yet. The fixture uses
+five blocks, a one-byte segment limit and a two-entry log queue. It takes about four seconds including
 container startup, without a chain stack. Negative controls fail when a copy uses
 its public name before completion or the log thread dies on its first write error.
 

@@ -45,6 +45,36 @@ class FaultControls(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "short"):
                 Volume.fill(Full())
 
+    def test_inspection_accepts_accumulated_state_inside_the_bounded_volume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            volume = Volume("123")
+            volume.root = Path(directory)
+            for block, size in [(9, 4096), (10, 80 * 1024 * 1024)]:
+                image = volume.root / f"checkpoint-{block}"
+                image.mkdir()
+                # Sparse files exercise the real size inspection without filling host storage.
+                with (image / "mdbx.dat").open("wb") as output:
+                    output.truncate(size)
+            (volume.root / "checkpoint-11.tmp").mkdir()
+            for available in [CAPACITY - 80 * 1024 * 1024, 0]:
+                with self.subTest(available=available), patch.object(
+                    Volume, "checked", return_value={"capacity": CAPACITY, "available": available}
+                ):
+                    observed = volume.inspect()
+                    self.assertEqual(observed["checkpoint"], "checkpoint-10")
+                    self.assertEqual(observed["image_bytes"], 80 * 1024 * 1024)
+                    self.assertEqual(observed["available"], available)
+
+    def test_inspection_does_not_invent_a_missing_checkpoint_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            volume = Volume("123")
+            volume.root = Path(directory)
+            with patch.object(Volume, "checked", return_value={"capacity": CAPACITY}):
+                self.assertIsNone(volume.inspect()["checkpoint"])
+                (volume.root / "checkpoint-10").mkdir()
+                with self.assertRaises(FileNotFoundError):
+                    volume.inspect()
+
     def test_only_the_exact_bounded_mount_can_be_filled(self):
         volume = Volume("123")
         good = f"73 42 0:22 / {volume.root} rw - tmpfs {volume.source} rw\n"

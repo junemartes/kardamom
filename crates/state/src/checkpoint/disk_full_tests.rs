@@ -146,17 +146,25 @@ impl Fixture {
         assert_eq!(nonce, block);
         assert_eq!(balance, U256::from(block.checked_mul(100).unwrap()));
         assert_eq!(snapshot.end_tx_position().unwrap().as_index(), block);
-        (0_u64..2).for_each(|slot| {
-            let key = block
-                .checked_mul(1_000_000)
-                .unwrap()
-                .checked_add(slot)
-                .unwrap();
-            assert_eq!(
-                snapshot.storage(ADDR, B256::from(U256::from(key))).unwrap(),
-                U256::from(slot.checked_add(1).unwrap())
-            );
-        });
+        (1_u64..=5)
+            .flat_map(|written| (0_u64..2).map(move |slot| (written, slot)))
+            .for_each(|(written, slot)| {
+                let key = written
+                    .checked_mul(1_000_000)
+                    .unwrap()
+                    .checked_add(slot)
+                    .unwrap();
+                let expected = if written <= block {
+                    U256::from(slot.checked_add(1).unwrap())
+                } else {
+                    U256::ZERO
+                };
+                assert_eq!(
+                    snapshot.storage(ADDR, B256::from(U256::from(key))).unwrap(),
+                    expected,
+                    "storage written in block {written}, slot {slot}, after block {block}"
+                );
+            });
     }
 
     fn failures(&self) -> u64 {
