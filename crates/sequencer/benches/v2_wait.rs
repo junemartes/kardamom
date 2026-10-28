@@ -143,7 +143,7 @@ impl Waiting {
 impl Waiting {
     fn bench(c: &mut Criterion) {
         let mut group = c.benchmark_group("v2_wait");
-        for (senders, nonces) in [(1, 2), (1, 64), (16, 64), (256, 16)] {
+        for (senders, nonces) in [(1, 2), (1, 64), (16, 64), (256, 16), (256, 17)] {
             Self::new(senders, nonces).measure(&mut group);
         }
         group.finish();

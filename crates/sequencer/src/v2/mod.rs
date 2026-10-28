@@ -352,9 +352,11 @@ impl AdmissionLoop {
         if paused {
             return Ok(applied || renewed);
         }
+        let queued = self.outbox.len();
         self.flush(refs, side)?;
         if self.outbox.len() >= self.cfg.outbox_cap.get() {
-            return Ok(true);
+            // A full queue can wait for confirmations without doing work.
+            return Ok(applied || renewed || self.outbox.len() < queued);
         }
         let Some(inbound) = input.poll()? else {
             return Ok(applied || renewed);

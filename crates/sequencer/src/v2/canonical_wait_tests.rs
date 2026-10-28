@@ -1,6 +1,17 @@
 use super::*;
 
 impl Bench {
+    fn full_outbox() -> Self {
+        let mut b = Self::new(SealerVersion::starting_at(5));
+        b.l.cfg.outbox_cap = NonZeroUsize::new(2).unwrap();
+        b.l.cfg.sweep_every = Duration::from_secs(3600);
+        b.send(0);
+        b.send(1);
+        b.queue(2);
+        assert!(b.l.run_once(&mut b.rig.ports()).unwrap());
+        b
+    }
+
     fn advance_without_sweep(&mut self, block: u64) {
         self.accounts
             .send(AccountEvent::Rows {
@@ -51,6 +62,36 @@ fn accepted_lookup_releases_an_idle_sender_without_new_intake() {
     b.run();
     assert_eq!(b.offers(), [(0, true), (1, true)]);
     assert!(b.l.outbox.is_empty());
+}
+
+#[test]
+fn a_full_blocked_outbox_idles_and_resumes_without_losing_input() {
+    let mut b = Bench::full_outbox();
+    b.queue(3);
+    assert!(!b.l.run_once(&mut b.rig.ports()).unwrap());
+    assert_eq!(b.l.outbox.len(), 2);
+    assert_eq!(b.rig.tx_data.queue.len(), 1);
+    assert_eq!(b.offers(), [(0, true)]);
+    b.canonical(0);
+    assert_eq!(b.offers(), [(0, true), (1, true)]);
+    assert!(b.rig.tx_data.queue.is_empty());
+    assert_eq!(b.l.outbox.len(), 2);
+    (1..4).for_each(|nonce| b.canonical(nonce));
+    assert_eq!(b.offers(), [(0, true), (1, true), (2, true), (3, true)]);
+    assert!(b.l.outbox.is_empty());
+    assert!(b.rig.errors().is_empty());
+    assert!(b.rig.drops().is_empty());
+}
+
+#[test]
+fn publication_from_an_oversized_replay_still_reports_work() {
+    let mut b = Bench::full_outbox();
+    b.l.offer_again_unconfirmed("test replay");
+    assert_eq!(b.l.outbox.len(), 3);
+    assert!(b.l.run_once(&mut b.rig.ports()).unwrap());
+    assert_eq!(b.l.outbox.len(), 2);
+    assert_eq!(b.offers(), [(0, true), (0, true)]);
+    assert!(!b.l.run_once(&mut b.rig.ports()).unwrap());
 }
 
 #[test]
