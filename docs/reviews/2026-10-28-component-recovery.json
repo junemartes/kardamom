@@ -1244,6 +1244,88 @@
           "log": "/tmp/post-age-regressing_seed-negative-20261028.log"
         }
       ]
+    },
+    "chaos-cache-backlog": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "cases::cache::backlog::"
+      ],
+      "real": [
+        "backlog baseline and recovery observation state machine",
+        "Redis client, ROLE check and atomic ROLE/MGET/HMGET command sequence",
+        "shared bounded polling loop and account/head predicates"
+      ],
+      "controlled": [
+        "loopback RESP peer with explicitly released replies",
+        "primary identity changes, failed reads and partial account observations",
+        "Tokio clock pauses after the real EXEC request reaches the silent peer",
+        "fixed mirror heads and exact full-width account balances"
+      ],
+      "tests": [
+        "projection_recovery_requires_a_later_head_from_every_writer",
+        "held_heads_require_three_complete_positive_position_tags",
+        "regressed_or_single_step_counters_cannot_prove_both_fallback_reads",
+        "a_nonce_and_balance_fallback_needs_two_misses_and_no_cache_hit",
+        "a_failed_baseline_read_retries_before_capturing_exact_state",
+        "a_transient_recovery_read_does_not_discard_the_remaining_budget",
+        "persistent_errors_keep_the_cause_at_the_original_recovery_deadline",
+        "a_hanging_snapshot_cannot_extend_the_baseline_deadline",
+        "every_writer_must_advance_twice_with_the_exact_account",
+        "promotion_requires_two_complete_observations_on_the_new_primary",
+        "fixed_held_heads_cannot_prove_recovery_even_with_a_correct_account",
+        "the_real_client_reads_heads_and_account_in_one_primary_transaction",
+        "demotion_after_connect_cannot_certify_the_transaction_snapshot",
+        "a_missing_head_in_the_real_reply_cannot_certify_coverage",
+        "a_silent_exec_reply_expires_the_real_client_read"
+      ],
+      "limitation": "Observer fidelity only. Does not reproduce nested Docker execution latency, Consul DNS, Sentinel elections, running mirrors, executor fallback or ingress restart. The fault writes and cleanup still use the original pinned-primary Docker path. Actual Redis 7 transaction compatibility is checked separately with a disposable container; ordinary tests use controlled peers. Full distributed recovery and performance validation remain required.",
+      "negative_controls": [
+        {
+          "mutation": "cross_primary_progress",
+          "test": "promotion_requires_two_complete_observations_on_the_new_primary",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/backlog-cross_primary_progress-negative-20261028.log"
+        },
+        {
+          "mutation": "ignore_snapshot_role",
+          "test": "demotion_after_connect_cannot_certify_the_transaction_snapshot",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/backlog-ignore_snapshot_role-negative-20261028.log"
+        },
+        {
+          "mutation": "single_writer_progress",
+          "test": "every_writer_must_advance_twice_with_the_exact_account",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/backlog-single_writer_progress-negative-20261028.log"
+        },
+        {
+          "mutation": "ignore_account_row",
+          "test": "a_failed_baseline_read_retries_before_capturing_exact_state",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/backlog-ignore_account_row-negative-20261028.log"
+        },
+        {
+          "mutation": "non_atomic_snapshot",
+          "test": "the_real_client_reads_heads_and_account_in_one_primary_transaction",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/backlog-non_atomic_snapshot-negative-20261028.log"
+        }
+      ]
     }
   },
   "families": {
@@ -1995,6 +2077,66 @@
         {
           "suite": "ingress-receipts",
           "test": "a_failed_egress_falls_back_to_the_executor"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "projection_recovery_requires_a_later_head_from_every_writer"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "held_heads_require_three_complete_positive_position_tags"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "regressed_or_single_step_counters_cannot_prove_both_fallback_reads"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_nonce_and_balance_fallback_needs_two_misses_and_no_cache_hit"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_failed_baseline_read_retries_before_capturing_exact_state"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_transient_recovery_read_does_not_discard_the_remaining_budget"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "persistent_errors_keep_the_cause_at_the_original_recovery_deadline"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_hanging_snapshot_cannot_extend_the_baseline_deadline"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "every_writer_must_advance_twice_with_the_exact_account"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "promotion_requires_two_complete_observations_on_the_new_primary"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "fixed_held_heads_cannot_prove_recovery_even_with_a_correct_account"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "the_real_client_reads_heads_and_account_in_one_primary_transaction"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "demotion_after_connect_cannot_certify_the_transaction_snapshot"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_missing_head_in_the_real_reply_cannot_certify_coverage"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_silent_exec_reply_expires_the_real_client_read"
         }
       ],
       "full_case_locally_validated": false

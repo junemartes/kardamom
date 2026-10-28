@@ -1,0 +1,165 @@
+{
+  "scope": "Bounded Redis observation for mirror-backlog-client-restart; real chaos observer and real Redis client against controlled peers. No full case-equivalence claim.",
+  "base": "4b8da0c2a5e34a0d543325795fcd71907d195be4",
+  "ci_failure": {
+    "url": "https://github.com/junemartes/kardamom/actions/runs/40688918999/job/122831915174",
+    "head": "f48610979e9902d7b6da83fb444436b84876fb4d",
+    "observed": "Before the backlog fault is armed, the inner-Docker MGET head:0 head:1 head:2 command times out after 20 seconds. The error aborts baseline capture.",
+    "unproven": "Redis, Consul DNS and Docker execution latency are not individually attributed."
+  },
+  "change": {
+    "baseline": "Replace pinned-primary Docker reads with fresh discovery and one atomic ROLE/MGET/HMGET snapshot. The existing 120-second row budget now bounds head and row observation together. Failed reads retry only inside that budget.",
+    "recovery": "Retain the 300-second budget. Every writer must advance twice beyond the baseline while exact account state is observed on the same primary. Primary change starts a new pair of observations.",
+    "during_fault": "Read the pinned fault primary directly and require exact held heads and stale account state. Fault writes, TTL, mirror stop/restore and cleanup retain their original Docker path.",
+    "errors": "Persistent errors preserve the last cause; a hanging observation cannot extend the outer deadline.",
+    "service_impact": "No product service wiring, state format, hot path or client timeout change. This modifies the chaos observer."
+  },
+  "validation": {
+    "error_propagation_control": {
+      "log": "/tmp/backlog-observer-red-20261028.log",
+      "passed": 4,
+      "failed": 3,
+      "test_execution_seconds": 0.0,
+      "scope": "The newly extracted observer initially retains the original immediate error propagation. Controls expose abort on transient baseline/recovery errors and failure before the recovery deadline. This is not a rerun of the original nested Docker command."
+    },
+    "cache_regressions": {
+      "passed": 53,
+      "failed": 0,
+      "seconds": 3.01,
+      "log": "/tmp/backlog-cache-green-final-20261028.log"
+    },
+    "component": {
+      "source_revision": "3c3b5fced37ace4c6b9de9cb4d1e0a33b43b7d22",
+      "started_utc": "2026-10-28T14:44:48.162684+00:00",
+      "cases_in_inventory": 80,
+      "full_suite_locally_validated": false,
+      "qualification_credit": 0,
+      "suites": {
+        "chaos-cache-backlog": {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "kardamom-chaos",
+            "--lib",
+            "cases::cache::backlog::"
+          ],
+          "exit_code": 0,
+          "timed_out": false,
+          "seconds": 5.727,
+          "passed": [
+            "cases::cache::backlog::observation::tests::a_hanging_snapshot_cannot_extend_the_baseline_deadline",
+            "cases::cache::backlog::observation::tests::a_failed_baseline_read_retries_before_capturing_exact_state",
+            "cases::cache::backlog::observation::tests::a_transient_recovery_read_does_not_discard_the_remaining_budget",
+            "cases::cache::backlog::tests::a_nonce_and_balance_fallback_needs_two_misses_and_no_cache_hit",
+            "cases::cache::backlog::observation::tests::every_writer_must_advance_twice_with_the_exact_account",
+            "cases::cache::backlog::tests::held_heads_require_three_complete_positive_position_tags",
+            "cases::cache::backlog::tests::projection_recovery_requires_a_later_head_from_every_writer",
+            "cases::cache::backlog::observation::tests::promotion_requires_two_complete_observations_on_the_new_primary",
+            "cases::cache::backlog::tests::regressed_or_single_step_counters_cannot_prove_both_fallback_reads",
+            "cases::cache::backlog::observation::protocol_tests::a_silent_exec_reply_expires_the_real_client_read",
+            "cases::cache::backlog::observation::tests::fixed_held_heads_cannot_prove_recovery_even_with_a_correct_account",
+            "cases::cache::backlog::observation::tests::persistent_errors_keep_the_cause_at_the_original_recovery_deadline",
+            "cases::cache::backlog::observation::protocol_tests::a_missing_head_in_the_real_reply_cannot_certify_coverage",
+            "cases::cache::backlog::observation::protocol_tests::demotion_after_connect_cannot_certify_the_transaction_snapshot",
+            "cases::cache::backlog::observation::protocol_tests::the_real_client_reads_heads_and_account_in_one_primary_transaction"
+          ],
+          "failed": [],
+          "report_errors": [],
+          "missing_expected_tests": [],
+          "log": "/tmp/kardamom-components-wx4kw2mv/chaos-cache-backlog.log",
+          "success": true
+        }
+      }
+    },
+    "catalog_registry": {
+      "result": "pass",
+      "log": "/tmp/backlog-catalog-final-20261028.log"
+    },
+    "style": {
+      "result": "pass",
+      "log": "/tmp/backlog-style-20261028.log",
+      "note": "Existing proc-macro-error2 future-incompatibility notice remains."
+    },
+    "negative_controls": [
+      {
+        "mutation": "cross_primary_progress",
+        "test": "promotion_requires_two_complete_observations_on_the_new_primary",
+        "exit_code": 101,
+        "compiled": true,
+        "intended_failure": true,
+        "log": "/tmp/backlog-cross_primary_progress-negative-20261028.log"
+      },
+      {
+        "mutation": "ignore_snapshot_role",
+        "test": "demotion_after_connect_cannot_certify_the_transaction_snapshot",
+        "exit_code": 101,
+        "compiled": true,
+        "intended_failure": true,
+        "log": "/tmp/backlog-ignore_snapshot_role-negative-20261028.log"
+      },
+      {
+        "mutation": "single_writer_progress",
+        "test": "every_writer_must_advance_twice_with_the_exact_account",
+        "exit_code": 101,
+        "compiled": true,
+        "intended_failure": true,
+        "log": "/tmp/backlog-single_writer_progress-negative-20261028.log"
+      },
+      {
+        "mutation": "ignore_account_row",
+        "test": "a_failed_baseline_read_retries_before_capturing_exact_state",
+        "exit_code": 101,
+        "compiled": true,
+        "intended_failure": true,
+        "log": "/tmp/backlog-ignore_account_row-negative-20261028.log"
+      },
+      {
+        "mutation": "non_atomic_snapshot",
+        "test": "the_real_client_reads_heads_and_account_in_one_primary_transaction",
+        "exit_code": 101,
+        "compiled": true,
+        "intended_failure": true,
+        "log": "/tmp/backlog-non_atomic_snapshot-negative-20261028.log"
+      }
+    ],
+    "redis_compatibility": {
+      "image": "redis:7-alpine",
+      "image_id": "sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541",
+      "result": "Disposable actual Redis accepts ROLE/MGET/HMGET inside MULTI/EXEC and returns exact role, all three heads and account row.",
+      "log": "/tmp/backlog-real-redis-transaction-20261028.log",
+      "cleanup": "Owned probe container removed in finally; 12 existing cluster containers remain."
+    },
+    "clock_correction": {
+      "initial_failure": "The read expires at 3.001 virtual seconds, exceeding an exact three-second assertion.",
+      "evidence": "Pinned Tokio 1.52.3 runtime/time/source.rs rounds deadlines up to a millisecond; time/sleep.rs documents millisecond granularity.",
+      "change": "Test allows 3001ms. Production Redis response timeout remains three seconds; outer baseline/recovery tests still assert exact 120/300-second budgets."
+    }
+  },
+  "limits": [
+    "No reproduction of nested Docker or Consul latency.",
+    "No Sentinel election or real service restart in this target. Existing discovery/Sentinel targets are separate evidence.",
+    "No proof of stale cache admission, mirror coverage restoration, executor fallback or sustained client load from these observer tests.",
+    "Full distributed case remains required; 39 cases partial and 41 planned, none fully locally certified.",
+    "206 registered checks across 31 targets; full 206-check matrix not rerun for this patch.",
+    "No distributed qualification credit. Integration failures remain open."
+  ],
+  "style_review": {
+    "R1": "Comments state observation invariants and timer-resolution behavior.",
+    "R2-R3": "Observer, protocol tests and predicate tests live in separate bounded files.",
+    "R4-R5": "Loopback read/server tasks are owned and aborted on fixture drop. Bounded channels control TCP replies.",
+    "R6-R8": "Static generic polling closure; private module APIs only.",
+    "R9-R13": "Wire parsing validates role and complete typed arrays. Shared RESP decoder uses checked length arithmetic. Timeouts remain bounded and Clippy passes.",
+    "R14-R16": "ROLE predicate and RESP decoder are shared; methods own protocol behavior; loop bodies call named steps."
+  },
+  "code_sha256": {
+    "crates/chaos/src/cases/cache/backlog.rs": "2879b8ae7885326fd75dab5a62e86fc4e949125cee84d8ce78bcd21774dbb09a",
+    "crates/chaos/src/cases/cache/backlog/observation.rs": "149f9c56ca1824d1702c8881e1df943a75a43acd2e1a6508f22148172a4d9461",
+    "crates/chaos/src/cases/cache/backlog/observation/tests.rs": "9cd31a0acb8933cf7cd58accf948e2dfeda03bc5e13efc10ac6e54bc0e35bd5f",
+    "crates/chaos/src/cases/cache/backlog/observation/protocol_tests.rs": "667938192430f00adb536773e027cfe15550aeba62ffbf59322ed10d970ce4a6",
+    "crates/chaos/src/cases/cache/discovery.rs": "61139a5030b9f30ae6c706df03e0b38839747be83524f4daa86dcea19b6e4057",
+    "crates/chaos/src/cases/cache/discovery/tests.rs": "dc356c2e1beb177dbb61bb1dcfd92082bfb301b03f951eaa3fe643ef9f60d93b",
+    "crates/chaos/src/cases/cache/test_support.rs": "f1f13636eb2039adce8bf545ce2db6beda028fcebadecc75ecd2c1768a5ce385"
+  }
+}

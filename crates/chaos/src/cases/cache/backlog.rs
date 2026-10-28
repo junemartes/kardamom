@@ -6,12 +6,15 @@ use std::time::Duration;
 
 use anyhow::Context;
 
-use super::{MIRROR_HEAD_KEYS, aux, live_primary, redis_cli, wait_readers_recovered};
+use super::{MIRROR_HEAD_KEYS, aux, redis_cli, wait_readers_recovered};
 use crate::harness::Harness;
 use crate::metrics;
 use crate::nomad::SavedJob;
 use crate::poll::{self, Budget};
 use crate::rpc::{AccountState, Rpc};
+
+mod observation;
+use observation::{Observation, Snapshot};
 
 const CTX: &str = "mirror-backlog-client-restart";
 /// The fixture uses the service default of 8192 canonical positions.
@@ -23,7 +26,7 @@ struct Baseline {
     account: AccountState,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Heads([NonZeroU64; 3]);
 
 impl Heads {
@@ -68,78 +71,25 @@ impl Baseline {
 
     async fn capture(h: &Harness) -> anyhow::Result<Self> {
         let account = AccountState::after_transfer(h, h.knobs.gate_account).await?;
-        let primary = live_primary(h, CTX).await?;
-        let raw = h
-            .nodes
-            .exec(
-                &aux(h),
-                &redis_cli(&format!("--raw -h {primary} MGET {MIRROR_HEAD_KEYS}")),
-            )
+        let snapshot = Observation::new(&account, None)
+            .wait(Budget::secs(120, 2), || {
+                Snapshot::current(h, account.address)
+            })
             .await?;
-        let baseline = Self {
-            primary,
-            heads: Heads::parse(raw.trim_end())?,
+        Ok(Self {
+            primary: snapshot.primary,
+            heads: snapshot.heads,
             account,
-        };
-        baseline.await_row(h, &baseline.account).await?;
-        Ok(baseline)
-    }
-
-    async fn row(&self, h: &Harness) -> anyhow::Result<String> {
-        h.nodes
-            .exec(
-                &aux(h),
-                &redis_cli(&format!(
-                    "--raw -h {} HMGET acct:{} nonce balance tx_idx",
-                    self.primary, self.account.address
-                )),
-            )
-            .await
-    }
-
-    async fn await_row(&self, h: &Harness, account: &AccountState) -> anyhow::Result<()> {
-        let last = std::cell::RefCell::new(String::from("no row response"));
-        let last_ref = &last;
-        poll::until(Budget::secs(120, 2), |_| async move {
-            let observed = self.row(h).await?;
-            let complete = account.matches_projection(&observed);
-            last_ref.replace(observed);
-            Ok::<_, anyhow::Error>(complete.then_some(()))
         })
-        .await?
-        .or_fail(|elapsed| crate::chaos_fail!(
-            "{CTX}: exact account row is not projected after {}s: expected {account:?}, observed {:?}, primary {}",
-            elapsed.as_secs(), last.borrow(), self.primary
-        ))?;
-        Ok(())
     }
 
-    /// A writer can resume from a projection another writer rebuilt.
-    /// Every writer must publish two later coverage heads, and the shared
-    /// row must match the committed account within the same budget.
+    /// Every writer advances twice with the exact account row on one current primary.
     async fn await_recovery(&self, h: &Harness, account: &AccountState) -> anyhow::Result<()> {
-        let first = std::cell::Cell::new(None::<Heads>);
-        let last = std::cell::RefCell::new(String::from("no projection response"));
-        poll::until(Budget::secs(300, 5), |_| async {
-            let raw = h.nodes.exec(&aux(h), &redis_cli(&format!(
-                "--raw -h {} MGET {MIRROR_HEAD_KEYS}", self.primary
-            ))).await?;
-            last.replace(raw.clone());
-            let Ok(heads) = Heads::parse(raw.trim_end()) else {
-                return Ok(None);
-            };
-            if !heads.advanced_over(self.heads) {
-                return Ok(None);
-            }
-            let advancing = first.get().is_some_and(|floor| heads.advanced_over(floor));
-            if first.get().is_none() {
-                first.set(Some(heads));
-            }
-            Ok((advancing && account.matches_projection(&self.row(h).await?)).then_some(()))
-        }).await?.or_fail(|elapsed| crate::chaos_fail!(
-            "{CTX}: restored writers do not advance every coverage head twice with exact account state within {}s (heads {:?})",
-            elapsed.as_secs(), last.borrow()
-        ))?;
+        Observation::new(account, Some(self.heads))
+            .wait(Budget::secs(300, 5), || {
+                Snapshot::current(h, account.address)
+            })
+            .await?;
         crate::log(format!(
             "{CTX}: every restored writer advances its coverage head twice and the projected account matches committed state"
         ));
@@ -223,22 +173,13 @@ impl Baseline {
             after.proves_bypass(&before),
             "{CTX}: nonce and balance did not both bypass stale Redis on a local miss: {before:?} -> {after:?}"
         );
+        let snapshot = Snapshot::on(h, &self.primary, self.account.address).await?;
         anyhow::ensure!(
-            self.account.matches_projection(&self.row(h).await?),
+            self.account.matches_projection(&snapshot.row),
             "{CTX}: the stale row changed while its mirror job was stopped"
         );
-        let raw = h
-            .nodes
-            .exec(
-                &aux(h),
-                &redis_cli(&format!(
-                    "--raw -h {} MGET {MIRROR_HEAD_KEYS}",
-                    self.primary
-                )),
-            )
-            .await?;
         anyhow::ensure!(
-            Heads::parse(raw.trim_end())?.0 == self.heads.0,
+            snapshot.heads.0 == self.heads.0,
             "{CTX}: held progress markers changed"
         );
         crate::log(format!(
