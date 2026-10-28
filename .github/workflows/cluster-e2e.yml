@@ -361,6 +361,9 @@ jobs:
             while true; do
               date --utc --iso-8601=seconds
               ps -eo pid,ppid,nlwp,stat,pcpu,time,comm --sort=-pcpu | awk 'NR <= 81'
+              # Thread names and CPU time identify the poll loop behind a busy process.
+              date --utc --iso-8601=seconds >> /tmp/chaos-runner-threads.log
+              ps -eLo pid,lwp,psr,stat,pcpu,time,comm --sort=-pcpu | awk 'NR <= 161' >> /tmp/chaos-runner-threads.log
               sleep 5
             done
           ) > /tmp/chaos-runner-processes.log 2>&1 &
@@ -387,6 +390,7 @@ jobs:
             /tmp/kardamom-load*.json
             /tmp/chaos-runner-resources.log
             /tmp/chaos-runner-processes.log
+            /tmp/chaos-runner-threads.log
           if-no-files-found: ignore
           retention-days: 14
 
