@@ -106,6 +106,8 @@ jobs:
           else
             shards="[$regular]"
           fi
+          # This branch diagnoses four-core contention; it cannot qualify CI.
+          shards='["chaos-cache","chaos-fleet"]'
           echo "shards=$shards" >> "$GITHUB_OUTPUT"
           echo "shards: $shards"
 
@@ -370,6 +372,7 @@ jobs:
         env:
           KARDAMOM_STAGED: "1"
           AERON_STALL_TOLERANCE_MS: "30000"
+          KARDAMOM_IDLE_CAP_US: "5000"
 
       - name: Collect diagnostics
         if: failure()
