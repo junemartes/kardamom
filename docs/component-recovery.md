@@ -29,7 +29,7 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 208 checks across 32 targets.
+head. Both targets run in the existing Docker CI job. `all` runs 210 checks across 33 targets.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
@@ -186,7 +186,7 @@ test rejects a new chaos case without a corresponding plan. Each family lists th
 real actors, boundary faults, recovery invariants and dependencies that still need
 real integration. `partial` means that named local tests validate some boundary
 assumptions. It does not mean the complete distributed case has passed locally.
-Thirty-nine cases have partial mappings. No full case is marked locally validated yet.
+Forty-one cases have partial mappings. No full case is marked locally validated yet.
 
 For each remaining case:
 
@@ -369,3 +369,36 @@ its bytes and recording name; a 64MiB unrelated segment and the catalog stay out
 of the transfer. Restoring the whole-archive copy fails both checks. The drill
 still uses the repair tool and live CRC verification, and its traffic and recovery
 deadlines stay unchanged. These two checks do not certify the distributed case.
+
+
+`just test-component archive-recovery` creates one real Aeron recording per test,
+with twelve 512-byte transaction payloads and one 64-KiB segment. The corruption
+check changes payload bytes without changing the file length. CRC verification
+must name the recording and report a checksum failure. The production diff and
+repair functions must restore exactly the named segment without changing the
+catalog. After marking the recording valid, CRC verification must pass. The wipe
+check deletes the actual segment and catalog, then restores both from a saved
+copy through the production mirror function. Both tests restart the real archive
+and require `ArchiveRefetcher` to return every original payload, position and
+publisher session exactly.
+
+The target needs Linux and Docker and runs in the existing Docker CI job. It owns
+its containers and scratch files, including cleanup after an assertion fails.
+An external driver is never adopted. Before host-side repair, a bounded utility
+container transfers ownership of the stopped test archive to the test user; this
+matches the repair process's access to its files. The first complete two-test run takes
+12.15 seconds of test execution; a later run on the shared host takes 43.68 seconds
+and 49.85 seconds including Cargo. The complete 210-check matrix passes in
+263.05 seconds; its archive target takes 15.39 seconds including Cargo. These are
+observed iteration timings, not a throughput measurement or a fixed latency
+guarantee. Production term lengths, segment sizes and timeout
+defaults stay unchanged. Aeron IPC/UDP, Docker and the JVM use real clocks.
+
+The saved copy comes from the same stopped recording. This does not establish
+independent peer recording, the distributed tar/catalog-transfer path, repair CLI
+or Nomad drain/replacement behavior, live-ingress admission, executor progress, multi-segment recovery or transaction
+load throughout a fault. These remain distributed requirements. The target adds
+partial evidence for `archive-corruption` and `archive-tx-data-wipe`; neither full
+chaos case is certified by these tests. Compiled negative controls fail when CRC
+verification, segment repair or catalog copying is removed, and when replay asks
+for a different publisher session.
