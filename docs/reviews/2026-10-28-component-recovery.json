@@ -805,6 +805,54 @@
           "compiled": true
         }
       ]
+    },
+    "state-aux-enospc": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-state",
+        "--features",
+        "docker-e2e",
+        "--lib",
+        "checkpoint::disk_full_tests::auxiliary_enospc_preserves_commits_and_recovers_checkpoint_and_log",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture"
+      ],
+      "real": [
+        "StateWriter and durable MDBX commits",
+        "BlockLogThread and segment files",
+        "checkpoint compaction/publication and manifest verification",
+        "checkpoint restore with block-log replay",
+        "Linux tmpfs returning ENOSPC"
+      ],
+      "controlled": [
+        "isolated eight-MiB container tmpfs for checkpoint/log files",
+        "authoritative state on a separate filesystem",
+        "five small blocks, one-byte segment limit and two-entry log queue",
+        "bounded filler writes and removal after observed failures"
+      ],
+      "tests": [
+        "auxiliary_enospc_preserves_commits_and_recovers_checkpoint_and_log"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "checkpoint_visible_before_copy",
+          "exit_code": 101,
+          "compiled": true,
+          "assertion_failed": true
+        },
+        {
+          "mutation": "log_thread_dies_after_write_failure",
+          "exit_code": 101,
+          "compiled": true,
+          "assertion_failed": true
+        }
+      ],
+      "limitation": "Linux Docker only. Runs the real test binary with its host shared libraries mounted read-only, without network or added capabilities. Proves auxiliary-volume ENOSPC, same-writer progress, no partial checkpoint publication and restored state after the log resumes. Does not prove state-volume ENOSPC, EIO, power loss, checkpointer scheduling, transaction/receipt end-to-end progress, Nomad mounts or deployment recovery."
     }
   },
   "families": {
@@ -1708,6 +1756,10 @@
         {
           "suite": "checkpoint-copy",
           "test": "a_tmpfs_checkpoint_is_copied_and_verified_in_the_container_mount_namespace"
+        },
+        {
+          "suite": "state-aux-enospc",
+          "test": "auxiliary_enospc_preserves_commits_and_recovers_checkpoint_and_log"
         }
       ],
       "full_case_locally_validated": false

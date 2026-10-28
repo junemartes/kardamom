@@ -29,7 +29,7 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 153 checks.
+head. Both targets run in the existing Docker CI job. `all` runs 154 checks.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
@@ -49,6 +49,22 @@ the production restore code, then requires an unmanifested copy to fail. The oth
 checks distinguish a growing live log from missing-file or mixed archive failures.
 This covers the harness failure that prevented the disk-full case from reaching its
 fault; executor behavior during ENOSPC still needs the existing chaos shard.
+
+`just test-component state-aux-enospc` fills an isolated eight-MiB tmpfs until the
+kernel returns ENOSPC. The real checkpoint copy and block-log thread must both
+report error 28 while the same state writer continues committing on a separate
+filesystem. A failed copy must leave only the earlier complete checkpoint visible.
+After freeing space, a new base plus the resumed log must restore exactly block 5,
+including account and storage values. The fixture uses five blocks, a one-byte
+segment limit and a two-entry log queue. It takes about four seconds including
+container startup, without a chain stack. Negative controls fail when a copy uses
+its public name before completion or the log thread dies on its first write error.
+
+This Linux Docker target mounts the test executable and the shared libraries
+reported by `ldd` read-only into one disposable container. It uses no network or
+extra capabilities. The parent bounds execution and removes the container on exit.
+The existing Docker CI job runs it. It does not prove state-volume ENOSPC, EIO,
+power loss, checkpointer scheduling, Nomad mounts or full transaction progress.
 
 `just test-component sealer-actor` runs 38 Java service checks with controlled
 cluster/session peers, explicit timestamps, four-frame carry/replay windows, and

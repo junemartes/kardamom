@@ -42,6 +42,9 @@ pub mod replay;
 #[cfg(test)]
 pub(crate) mod tests;
 
+#[cfg(all(test, feature = "docker-e2e", target_os = "linux"))]
+mod disk_full_tests;
+
 #[cfg(test)]
 pub(crate) use manifest::manifest_path;
 pub(crate) use manifest::{CheckpointManifest, read_manifest, verify_checkpoint};
