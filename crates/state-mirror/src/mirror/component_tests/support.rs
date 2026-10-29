@@ -292,8 +292,18 @@ impl Fixture {
     }
 
     async fn wait_for_head(&self, id: u32, position: u64) {
-        while self.cache.heads(&[id]).await.unwrap() != [Some(position)] {
+        while !self.observed_head(id, position).await {
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn observed_head(&self, id: u32, position: u64) -> bool {
+        match self.cache.heads(&[id]).await {
+            Ok(heads) => heads == [Some(position)],
+            Err(error) => {
+                eprintln!("head observation failed within the recovery budget: {error}");
+                false
+            }
         }
     }
 

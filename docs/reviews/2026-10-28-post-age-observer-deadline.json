@@ -1,0 +1,95 @@
+{
+  "negative_control_exit": 101,
+  "negative_control_compiled": true,
+  "production_timeout_changed": false,
+  "test_observer_slack_ms": 1,
+  "library_repeats": [
+    {
+      "round": 1,
+      "exit_code": 0
+    },
+    {
+      "round": 2,
+      "exit_code": 0
+    },
+    {
+      "round": 3,
+      "exit_code": 0
+    },
+    {
+      "round": 4,
+      "exit_code": 0
+    },
+    {
+      "round": 5,
+      "exit_code": 0
+    },
+    {
+      "round": 6,
+      "exit_code": 0
+    },
+    {
+      "round": 7,
+      "exit_code": 0
+    },
+    {
+      "round": 8,
+      "exit_code": 0
+    },
+    {
+      "round": 9,
+      "exit_code": 0
+    },
+    {
+      "round": 10,
+      "exit_code": 0
+    },
+    {
+      "round": 11,
+      "exit_code": 0
+    },
+    {
+      "round": 12,
+      "exit_code": 0
+    },
+    {
+      "round": 13,
+      "exit_code": 0
+    },
+    {
+      "round": 14,
+      "exit_code": 0
+    },
+    {
+      "round": 15,
+      "exit_code": 0
+    },
+    {
+      "round": 16,
+      "exit_code": 0
+    },
+    {
+      "round": 17,
+      "exit_code": 0
+    },
+    {
+      "round": 18,
+      "exit_code": 0
+    },
+    {
+      "round": 19,
+      "exit_code": 0
+    },
+    {
+      "round": 20,
+      "exit_code": 0
+    }
+  ],
+  "issue": 946,
+  "source_base": "c9a182702dcbe9870918ead749830755e62c611d",
+  "ordinary_batcher_passed_per_run": 65,
+  "ordinary_batcher_ignored_per_run": 2,
+  "workspace_style": "pass",
+  "qualification_credit": 0,
+  "scope": "The test observer allows one millisecond for Tokio timer rounding and the owned task join. Production retains its existing ten-second total RPC deadline. Local unit repeats are not distributed CI qualification."
+}

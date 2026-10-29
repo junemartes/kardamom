@@ -502,7 +502,8 @@
         "interrupted_partial_rebuild_restores_untouched_accounts_without_regressing_live_rows",
         "partial_live_batch_retries_without_new_input_and_publishes_head_last",
         "script_loss_and_older_replica_frames_preserve_newest_account_state",
-        "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close"
+        "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close",
+        "a_transient_head_read_timeout_does_not_end_the_recovery_wait"
       ],
       "negative_controls": {
         "regressing_rows": {
@@ -1032,6 +1033,74 @@
         }
       ]
     },
+    "transport-pressure": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-log",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "transport_pressure",
+        "--",
+        "--ignored",
+        "--exact",
+        "unavailable_outputs_preserve_live_delivery_and_recover",
+        "--nocapture"
+      ],
+      "real": [
+        "AeronRuntime poll and retry loop",
+        "Aeron C client and Java media driver",
+        "UDP publications, subscriptions and payload delivery"
+      ],
+      "controlled": [
+        "eight runtimes by default with distinct UDP streams and a 64-KiB term length",
+        "absent output subscribers followed by late joins",
+        "one disposable driver; no chain services",
+        "optional bounded runtime and message counts for profiling",
+        "independent publisher runtime; quiet arrivals cannot wake the receiver through its command channel"
+      ],
+      "tests": [
+        "unavailable_outputs_preserve_live_delivery_and_recover"
+      ],
+      "limitation": "Transport-level composition only. Does not run the executor, sequencer, Redis, sealer consensus or cross-host network. CPU samples cover the Rust process, not the Java driver or full cluster. No timing speedup or deployment performance claim follows from this regression.",
+      "negative_controls": [
+        {
+          "mutation": "Do not poll subscriptions while an output is pending.",
+          "exit_code": 101,
+          "compiled": true,
+          "starvation_observed": true
+        }
+      ]
+    },
+    "chaos-cache-baseline": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "cases::cache::coverage::tests::"
+      ],
+      "real": [
+        "Distributed cache coverage predicate and recovery wait",
+        "HTTP executor account-query client"
+      ],
+      "controlled": [
+        "Executor HTTP replies",
+        "Malformed account projections and exact baseline agreement"
+      ],
+      "tests": [
+        "a_present_row_does_not_prove_correct_coverage",
+        "untouched_funded_accounts_keep_full_width_balances",
+        "a_receipted_transfer_waits_for_the_lagging_executor_before_comparing_redis",
+        "an_executor_baseline_requires_full_state_agreement_and_the_receipted_nonce"
+      ],
+      "limitation": "Checks exact account predicates and the executor baseline; distributed recovery remains required."
+    },
     "chaos-projection": {
       "command": [
         "cargo",
@@ -1067,6 +1136,230 @@
             "a_failed_read_is_retried_and_only_a_complete_fresh_read_passes",
             "persistent_read_failure_preserves_its_cause_at_the_original_deadline"
           ]
+        }
+      ]
+    },
+    "batcher-null-receipts": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-batcher",
+        "--lib",
+        "live::run::null_receipts_tests::",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "real": [
+        "production startup and shared FeedLoop construction",
+        "LiveSender and production signed L1 provider",
+        "Anvil and deployed settlement contract",
+        "Spool and durable cursor",
+        "payload packing, local DaStore HTTP and payload reconstruction",
+        "L1 fault proxy with null receipts and swallowed settlement logs"
+      ],
+      "controlled": [
+        "bounded reader channel with one-block batches",
+        "Anvil mining at the exact pending-post cut",
+        "actor cancellation before mining and restart from the same disk",
+        "unresponsive indexer endpoint",
+        "10-ms provider polling; production receipt timeout unchanged"
+      ],
+      "tests": [
+        "hidden_mined_receipts_reconcile_without_duplicate_posts_or_early_cursor",
+        "restart_during_hidden_receipts_uses_contract_truth_without_waiting_for_the_indexer"
+      ],
+      "limitation": "No full follower fleet, Prometheus alert, Nomad restart, consensus retention or EigenDA proof. These tests cover null receipt reconciliation and restart, not expiry of the 120-second receipt deadline. Alloy timeout bookkeeping includes the wall clock, so Tokio virtual time alone cannot prove that deadline. The existing local DA helper serves until the test process exits. Payloads contain empty boundary blocks; transaction execution and full-chain transfer progress are outside this fixture."
+    },
+    "batcher-post-age": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-batcher",
+        "--lib",
+        "live::post_age::",
+        "--",
+        "--nocapture"
+      ],
+      "real": [
+        "PostAge::run with its actual timer and state transitions",
+        "IndexerClient and all three HTTP JSON-RPC reads",
+        "archive seed task deadline and ownership",
+        "post-age metric emission and monotone last-post timestamps"
+      ],
+      "controlled": [
+        "two-entry channel of decoded L1 follower records",
+        "loopback archive that accepts a request but never replies",
+        "real JSON-RPC server with explicitly released replies",
+        "task-local metrics recorder",
+        "Tokio time advances only after each real HTTP request reaches its peer"
+      ],
+      "tests": [
+        "the_age_runs_from_the_newest_block_that_carried_a_post",
+        "a_seed_attempt_times_out_and_can_start_again_without_overlapping",
+        "input_close_stops_the_actor_during_an_unresponsive_archive_read",
+        "a_late_archive_seed_cannot_replace_a_newer_live_post",
+        "all_three_archive_requests_share_one_deadline",
+        "closing_the_owner_cancels_the_inflight_archive_task",
+        "an_unresponsive_archive_does_not_hide_a_live_post",
+        "the_complete_archive_seed_publishes_without_waiting_for_another_tick",
+        "a_failed_archive_read_retries_with_the_same_client_and_recovers"
+      ],
+      "limitation": "This adds the stalled archive-seed failure absent from the deployed L1 receipt/log fault. It does not run Aeron discovery, the follower fleet, Prometheus, Nomad, or transaction posting. Wall-clock post age remains real; virtual time controls only actor scheduling and RPC deadlines.",
+      "negative_controls": [
+        {
+          "mutation": "extended_seed_deadline",
+          "test": "all_three_archive_requests_share_one_deadline",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/post-age-extended_seed_deadline-negative-20261028.log"
+        },
+        {
+          "mutation": "overlapping_seed",
+          "test": "a_seed_attempt_times_out_and_can_start_again_without_overlapping",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/post-age-overlapping_seed-negative-20261028.log"
+        },
+        {
+          "mutation": "uncancelled_seed",
+          "test": "closing_the_owner_cancels_the_inflight_archive_task",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/post-age-uncancelled_seed-negative-20261028.log"
+        },
+        {
+          "mutation": "regressing_seed",
+          "test": "a_late_archive_seed_cannot_replace_a_newer_live_post",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/post-age-regressing_seed-negative-20261028.log"
+        }
+      ]
+    },
+    "chaos-cache-backlog": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "cases::cache::backlog::"
+      ],
+      "real": [
+        "backlog baseline and recovery observation state machine",
+        "Redis client, ROLE check and atomic ROLE/MGET/HMGET command sequence",
+        "shared bounded polling loop and account/head predicates"
+      ],
+      "controlled": [
+        "loopback RESP peer with explicitly released replies",
+        "primary identity changes, failed reads and partial account observations",
+        "Tokio clock pauses after the real EXEC request reaches the silent peer",
+        "fixed mirror heads and exact full-width account balances"
+      ],
+      "tests": [
+        "projection_recovery_requires_a_later_head_from_every_writer",
+        "held_heads_require_three_complete_positive_position_tags",
+        "regressed_or_single_step_counters_cannot_prove_both_fallback_reads",
+        "a_nonce_and_balance_fallback_needs_two_misses_and_no_cache_hit",
+        "a_failed_baseline_read_retries_before_capturing_exact_state",
+        "a_transient_recovery_read_does_not_discard_the_remaining_budget",
+        "persistent_errors_keep_the_cause_at_the_original_recovery_deadline",
+        "a_hanging_snapshot_cannot_extend_the_baseline_deadline",
+        "every_writer_must_advance_twice_with_the_exact_account",
+        "promotion_requires_two_complete_observations_on_the_new_primary",
+        "fixed_held_heads_cannot_prove_recovery_even_with_a_correct_account",
+        "the_real_client_reads_heads_and_account_in_one_primary_transaction",
+        "demotion_after_connect_cannot_certify_the_transaction_snapshot",
+        "a_missing_head_in_the_real_reply_cannot_certify_coverage",
+        "a_silent_exec_reply_expires_the_real_client_read"
+      ],
+      "limitation": "Observer fidelity only. Does not reproduce nested Docker execution latency, Consul DNS, Sentinel elections, running mirrors, executor fallback or ingress restart. The fault writes and cleanup still use the original pinned-primary Docker path. Actual Redis 7 transaction compatibility is checked separately with a disposable container; ordinary tests use controlled peers. Full distributed recovery and performance validation remain required.",
+      "negative_controls": [
+        {
+          "mutation": "cross_primary_progress",
+          "test": "promotion_requires_two_complete_observations_on_the_new_primary",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/backlog-cross_primary_progress-negative-20261028.log"
+        },
+        {
+          "mutation": "ignore_snapshot_role",
+          "test": "demotion_after_connect_cannot_certify_the_transaction_snapshot",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/backlog-ignore_snapshot_role-negative-20261028.log"
+        },
+        {
+          "mutation": "single_writer_progress",
+          "test": "every_writer_must_advance_twice_with_the_exact_account",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/backlog-single_writer_progress-negative-20261028.log"
+        },
+        {
+          "mutation": "ignore_account_row",
+          "test": "a_failed_baseline_read_retries_before_capturing_exact_state",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/backlog-ignore_account_row-negative-20261028.log"
+        },
+        {
+          "mutation": "non_atomic_snapshot",
+          "test": "the_real_client_reads_heads_and_account_in_one_primary_transaction",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/backlog-non_atomic_snapshot-negative-20261028.log"
+        }
+      ]
+    },
+    "chaos-archive-stage": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "cases::archive::staging::tests::"
+      ],
+      "real": [
+        "production segment tar command and unpack path",
+        "GNU tar and local filesystem"
+      ],
+      "controlled": [
+        "selected victim and differently named mirror files",
+        "64MiB unrelated sparse segment and catalog"
+      ],
+      "tests": [
+        "staging_copies_only_the_selected_victim_segment",
+        "staging_reads_the_mirrors_own_recording_name"
+      ],
+      "limitation": "Fixture transport only. Actual Aeron CRC detection, repair, live archive restart and continuous case-owned traffic still require the distributed case. A separate existing repair-tool binary validates selected directories with identical CLI/library source; this does not qualify CRC recovery.",
+      "negative_controls": [
+        {
+          "mutation": "whole_archive_staging",
+          "tests": [
+            "staging_copies_only_the_selected_victim_segment",
+            "staging_reads_the_mirrors_own_recording_name"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
         }
       ]
     }
@@ -1250,8 +1543,17 @@
     {
       "case": "archive-corruption",
       "family": "Ingress",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "chaos-archive-stage",
+          "test": "staging_copies_only_the_selected_victim_segment"
+        },
+        {
+          "suite": "chaos-archive-stage",
+          "test": "staging_reads_the_mirrors_own_recording_name"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -1417,6 +1719,26 @@
         {
           "suite": "state-mirror",
           "test": "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "a_failed_read_is_retried_and_only_a_complete_fresh_read_passes"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "separate_partial_observations_cannot_be_combined_into_a_pass"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "persistent_read_failure_preserves_its_cause_at_the_original_deadline"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "a_hanging_read_cannot_extend_the_original_deadline"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "missing_extra_malformed_and_wrong_rows_cannot_certify_coverage"
         }
       ],
       "full_case_locally_validated": false
@@ -1522,8 +1844,13 @@
     {
       "case": "executor-sealer-loss-recover",
       "family": "CombinedExec",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "transport-pressure",
+          "test": "unavailable_outputs_preserve_live_delivery_and_recover"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -1577,6 +1904,26 @@
         {
           "suite": "ingress-receipts",
           "test": "a_failed_egress_falls_back_to_the_executor"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "a_failed_read_is_retried_and_only_a_complete_fresh_read_passes"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "separate_partial_observations_cannot_be_combined_into_a_pass"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "persistent_read_failure_preserves_its_cause_at_the_original_deadline"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "a_hanging_read_cannot_extend_the_original_deadline"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "missing_extra_malformed_and_wrong_rows_cannot_certify_coverage"
         }
       ],
       "full_case_locally_validated": false
@@ -1627,8 +1974,53 @@
     {
       "case": "l1-null-receipts",
       "family": "L1",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "batcher-null-receipts",
+          "test": "hidden_mined_receipts_reconcile_without_duplicate_posts_or_early_cursor"
+        },
+        {
+          "suite": "batcher-null-receipts",
+          "test": "restart_during_hidden_receipts_uses_contract_truth_without_waiting_for_the_indexer"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "the_age_runs_from_the_newest_block_that_carried_a_post"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "a_seed_attempt_times_out_and_can_start_again_without_overlapping"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "input_close_stops_the_actor_during_an_unresponsive_archive_read"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "a_late_archive_seed_cannot_replace_a_newer_live_post"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "all_three_archive_requests_share_one_deadline"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "closing_the_owner_cancels_the_inflight_archive_task"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "an_unresponsive_archive_does_not_hide_a_live_post"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "the_complete_archive_seed_publishes_without_waiting_for_another_tick"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "a_failed_archive_read_retries_with_the_same_client_and_recovers"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -1730,6 +2122,66 @@
         {
           "suite": "ingress-receipts",
           "test": "a_failed_egress_falls_back_to_the_executor"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "projection_recovery_requires_a_later_head_from_every_writer"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "held_heads_require_three_complete_positive_position_tags"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "regressed_or_single_step_counters_cannot_prove_both_fallback_reads"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_nonce_and_balance_fallback_needs_two_misses_and_no_cache_hit"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_failed_baseline_read_retries_before_capturing_exact_state"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_transient_recovery_read_does_not_discard_the_remaining_budget"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "persistent_errors_keep_the_cause_at_the_original_recovery_deadline"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_hanging_snapshot_cannot_extend_the_baseline_deadline"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "every_writer_must_advance_twice_with_the_exact_account"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "promotion_requires_two_complete_observations_on_the_new_primary"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "fixed_held_heads_cannot_prove_recovery_even_with_a_correct_account"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "the_real_client_reads_heads_and_account_in_one_primary_transaction"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "demotion_after_connect_cannot_certify_the_transaction_snapshot"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_missing_head_in_the_real_reply_cannot_certify_coverage"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_silent_exec_reply_expires_the_real_client_read"
         }
       ],
       "full_case_locally_validated": false

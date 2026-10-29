@@ -199,6 +199,46 @@ struct L1Side<P> {
     skip_through_block: u64,
 }
 
+impl<P: Provider> L1Side<P> {
+    fn feed(
+        self,
+        args: &LiveArgs,
+        spool: Spool,
+        restored: Restored,
+        resume: BatchCursor,
+    ) -> FeedLoop<P> {
+        gauge!(live_metric_names::IDLE_FLUSH_SECONDS)
+            .set(Duration::from_millis(args.idle_flush_ms.get()).as_secs_f64());
+        let sender = LiveSender::new(
+            self.provider,
+            args.settlement,
+            self.da,
+            self.l1_truth.last_batch_index,
+            args.l1_retries,
+            args.cursor_file.clone(),
+        );
+        let feed_cfg = FeedConfig {
+            blocks_per_batch: args.blocks_per_batch,
+            compress: args.compress,
+            chain_id: args.chain_id,
+            flush: Duration::from_millis(args.flush_ms.get()),
+            idle_flush: Duration::from_millis(args.idle_flush_ms.get()),
+            target_payload_bytes: args.target_payload_bytes,
+            skip_through_block: resume.skip_through(self.skip_through_block),
+            da_lag_due: NonZeroU64::new(args.da_lag_budget_blocks / 2),
+        };
+        // The sealer and the ingress learn the confirmed cursor before the
+        // first post: each reader stack publishes the current value first.
+        FeedLoop::new(
+            sender,
+            feed_cfg,
+            spool,
+            restored,
+            self.l1_truth.covered_through_block,
+        )
+    }
+}
+
 impl LiveArgs {
     /// Connect to L1 and reconcile the durable cursor against it. The L1
     /// reads retry until L1 answers, under the `l1_unreachable` halt; the
@@ -361,35 +401,7 @@ async fn run_once(args: &LiveArgs) -> Result<RunEnd> {
     let (restored, resume) = continue_from_spool(&spool, l1.cursor, l1.skip_through_block)?;
     let run_cfg = RunConfig::resolve(args)?;
 
-    gauge!(live_metric_names::IDLE_FLUSH_SECONDS)
-        .set(Duration::from_millis(args.idle_flush_ms.get()).as_secs_f64());
-    let sender = LiveSender::new(
-        l1.provider,
-        args.settlement,
-        l1.da,
-        l1.l1_truth.last_batch_index,
-        args.l1_retries,
-        args.cursor_file.clone(),
-    );
-    let feed_cfg = FeedConfig {
-        blocks_per_batch: args.blocks_per_batch,
-        compress: args.compress,
-        chain_id: args.chain_id,
-        flush: Duration::from_millis(args.flush_ms.get()),
-        idle_flush: Duration::from_millis(args.idle_flush_ms.get()),
-        target_payload_bytes: args.target_payload_bytes,
-        skip_through_block: resume.skip_through(l1.skip_through_block),
-        da_lag_due: NonZeroU64::new(args.da_lag_budget_blocks / 2),
-    };
-    // The sealer and the ingress learn the confirmed cursor before the
-    // first post: each reader stack publishes the current value first.
-    let feed = FeedLoop::new(
-        sender,
-        feed_cfg,
-        spool,
-        restored,
-        l1.l1_truth.covered_through_block,
-    );
+    let feed = l1.feed(args, spool, restored, resume);
     let mut service = Service { args, run_cfg };
     let end = match service.serve(feed, resume).await? {
         Served::Refused { feed, oldest_block } => {
@@ -578,3 +590,6 @@ impl Service<'_> {
 #[cfg(test)]
 #[path = "run_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod null_receipts_tests;
