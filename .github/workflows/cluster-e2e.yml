@@ -188,8 +188,41 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
+  node-image:
+    if: >-
+      !contains(github.event.pull_request.labels.*.name, 'skip-cluster-e2e')
+      && (github.event.action != 'labeled' || github.event.label.name == 'chaos-nightly')
+    name: prepare cluster node image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: deploy/cluster
+          file: deploy/cluster/docker/node-prepared.Dockerfile
+          tags: kardamom-node-prepared:ci
+          load: true
+          cache-from: type=gha,scope=cluster-node
+          cache-to: type=gha,mode=max,scope=cluster-node
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+      - name: Verify the prepared image offline
+        run: |
+          docker run --rm --network none --entrypoint ansible-playbook \
+            -v "$GITHUB_WORKSPACE/deploy/cluster/ansible:/ansible:ro" \
+            kardamom-node-prepared:ci -i localhost, /ansible/node-image-check.yml
+      - name: Export prepared node image
+        run: docker save kardamom-node-prepared:ci | gzip -1 > /tmp/cluster-node-image.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cluster-node-image
+          path: /tmp/cluster-node-image.tgz
+          compression-level: 0
+          retention-days: 3
+
   cluster-e2e:
-    needs: build
+    needs: [build, node-image]
     name: container cluster e2e (${{ matrix.shard }})
     # Same base as the build job: the staged binaries and libaeron.so link
     # this glibc.
@@ -264,6 +297,19 @@ jobs:
           tar -xzf cluster-dist.tgz
           rm cluster-dist.tgz
           ls -l target/release | head -n 20
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cluster-node-image
+          path: /tmp/cluster-node-artifact
+      - name: Load the prepared node image
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          docker load -i /tmp/cluster-node-artifact/cluster-node-image.tgz
+          test "$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' kardamom-node-prepared:ci)" = "$EXPECTED_REVISION"
+          echo "TF_VAR_prebuilt_node_image=kardamom-node-prepared:ci" >> "$GITHUB_ENV"
+          rm /tmp/cluster-node-artifact/cluster-node-image.tgz
 
       - name: Install Ansible
         run: |

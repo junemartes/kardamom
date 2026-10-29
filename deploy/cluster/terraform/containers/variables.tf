@@ -28,6 +28,12 @@ variable "image_name" {
   default     = "kardamom-node:ci"
 }
 
+variable "prebuilt_node_image" {
+  description = "An already-loaded node image. Empty builds the ordinary node image locally."
+  type        = string
+  default     = ""
+}
+
 variable "docker_dir" {
   description = "The build context with node.Dockerfile. A relative path is resolved from this root."
   type        = string

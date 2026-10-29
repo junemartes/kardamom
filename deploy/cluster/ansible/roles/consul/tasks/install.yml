@@ -1,0 +1,40 @@
+---
+
+- name: Create the consul system group
+  ansible.builtin.group:
+    name: consul
+    system: true
+
+- name: Create the consul system user
+  ansible.builtin.user:
+    name: consul
+    group: consul
+    system: true
+    shell: /usr/sbin/nologin
+    home: /opt/consul
+    create_home: false
+
+- name: Create consul directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: consul
+    group: consul
+    mode: "0750"
+  loop:
+    - /etc/consul.d
+    - /opt/consul
+
+- name: Download and install the Consul binary
+  ansible.builtin.unarchive:
+    src: "https://releases.hashicorp.com/consul/{{ consul_version }}/consul_{{ consul_version }}_linux_{{ common_hashicorp_arch }}.zip"
+    dest: /usr/local/bin
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+    creates: /usr/local/bin/consul
+  register: consul_download
+  until: consul_download is succeeded
+  retries: 5
+  delay: 10

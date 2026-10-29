@@ -1,0 +1,26 @@
+---
+- name: Read the prepared-software contract
+  ansible.builtin.include_vars: "{{ playbook_dir }}/node-software.yml"
+
+- name: Look for the prepared-software marker
+  ansible.builtin.stat:
+    path: "{{ node_software_marker_path }}"
+  register: common_node_software_marker_stat
+
+- name: Read the prepared-software marker
+  ansible.builtin.slurp:
+    path: "{{ node_software_marker_path }}"
+  register: common_node_software_marker
+  when: common_node_software_marker_stat.stat.exists
+
+- name: Require the prepared software to match this deploy
+  ansible.builtin.assert:
+    that:
+      - (common_node_software_marker.content | b64decode | from_json).version == 1
+      - (common_node_software_marker.content | b64decode | from_json).fingerprint == node_software_fingerprint
+    fail_msg: Prepared node software differs from this deploy; rebuild the node image before provisioning.
+  when: common_node_software_marker_stat.stat.exists
+
+- name: Keep the prepared-software result for the substrate roles
+  ansible.builtin.set_fact:
+    common_node_software_preinstalled: "{{ common_node_software_marker_stat.stat.exists }}"
