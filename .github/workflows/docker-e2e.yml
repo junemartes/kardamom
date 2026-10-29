@@ -94,6 +94,9 @@ jobs:
       - name: batcher recovery with hidden L1 receipts
         run: python3 scripts/test-components.py batcher-null-receipts
 
+      - name: archive corruption and wipe recovery
+        run: python3 scripts/test-components.py archive-recovery
+
       - name: transport recovery with unavailable outputs
         run: python3 scripts/test-components.py transport-pressure
 

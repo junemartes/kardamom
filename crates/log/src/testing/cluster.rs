@@ -14,6 +14,7 @@
 //! `testing`), so the testcontainers dependency does not reach hosts
 //! without a Docker daemon.
 
+use std::fmt::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -98,7 +99,7 @@ impl AeronTestCluster {
                 }],
             });
         }
-        Self::container_node(None).await
+        Self::container_node(None, None).await
     }
 
     /// Bring up a single Aeron node in a container whose media driver
@@ -112,14 +113,32 @@ impl AeronTestCluster {
     /// Returns an error if building the Aeron Docker image fails, or
     /// if the container fails to start.
     pub async fn single_node_with_client_liveness(liveness: Duration) -> anyhow::Result<Self> {
-        Self::container_node(Some(liveness)).await
+        Self::container_node(Some(liveness), None).await
+    }
+
+    /// Start an owned archive whose segment and term buffers share `length`.
+    /// This always starts a container; destructive fixtures cannot adopt an external driver.
+    ///
+    /// # Errors
+    /// Returns an error for an unsupported Aeron length or container startup failure.
+    pub async fn single_node_with_archive_length(
+        length: std::num::NonZeroU32,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            length.get().is_power_of_two() && (65_536..=1_073_741_824).contains(&length.get()),
+            "Aeron term length must be a power of two between 64 KiB and 1 GiB"
+        );
+        Self::container_node(None, Some(length)).await
     }
 
     /// Build the image and start one container node. `liveness` sets
     /// the client liveness timeout of the driver, or keeps the default.
-    async fn container_node(liveness: Option<Duration>) -> anyhow::Result<Self> {
+    async fn container_node(
+        liveness: Option<Duration>,
+        archive_length: Option<std::num::NonZeroU32>,
+    ) -> anyhow::Result<Self> {
         ensure_image_built().await?;
-        let node = spawn_node(liveness).await?;
+        let node = spawn_node(liveness, archive_length).await?;
         Ok(Self { nodes: vec![node] })
     }
     /// "host:port" the test should pass as the Aeron Archive control
@@ -201,6 +220,18 @@ impl AeronTestCluster {
     pub async fn stop(&mut self, i: usize) -> anyhow::Result<()> {
         if let Node::Container(c) = &mut self.nodes[i] {
             c.container.stop().await?;
+        }
+        Ok(())
+    }
+
+    /// Restart a stopped owned node with its retained archive files.
+    /// An external driver remains under operator control.
+    ///
+    /// # Errors
+    /// Returns an error if the Docker container cannot start.
+    pub async fn start(&mut self, i: usize) -> anyhow::Result<()> {
+        if let Node::Container(c) = &mut self.nodes[i] {
+            c.container.start().await?;
         }
         Ok(())
     }
@@ -386,7 +417,10 @@ async fn recv_attempt(
 /// driver refuses a liveness timeout that is not above its timer
 /// interval, so the timer interval is a tenth of the liveness timeout.
 /// An empty value keeps the defaults of the driver.
-async fn spawn_node(liveness: Option<Duration>) -> anyhow::Result<Node> {
+async fn spawn_node(
+    liveness: Option<Duration>,
+    archive_length: Option<std::num::NonZeroU32>,
+) -> anyhow::Result<Node> {
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -409,13 +443,19 @@ async fn spawn_node(liveness: Option<Duration>) -> anyhow::Result<Node> {
         .ok_or_else(|| anyhow::anyhow!("mount path not utf-8"))?
         .to_string();
     let aeron_dir_in_container = format!("{root_str}/dir");
-    let java_options = liveness.map_or_else(String::new, |l| {
+    let mut java_options = liveness.map_or_else(String::new, |l| {
         format!(
             "-Daeron.client.liveness.timeout={}ns -Daeron.timer.interval={}ns",
             l.as_nanos(),
             (l / 10).as_nanos()
         )
     });
+    if let Some(length) = archive_length {
+        write!(
+            java_options,
+            " -Daeron.archive.segment.file.length={length}"
+        )?;
+    }
     let archive_dir_in_container = format!("{root_str}/archive/dir");
 
     let image = GenericImage::new(AERON_IMAGE_NAME, AERON_IMAGE_TAG)
@@ -429,6 +469,12 @@ async fn spawn_node(liveness: Option<Duration>) -> anyhow::Result<Node> {
         .with_env_var("AERON_ARCHIVE_DIR", archive_dir_in_container)
         .with_env_var("JAVA_TOOL_OPTIONS", java_options);
 
+    let image = match archive_length {
+        Some(length) => image
+            .with_env_var("AERON_TERM_BUFFER_LENGTH", length.to_string())
+            .with_env_var("AERON_IPC_TERM_BUFFER_LENGTH", length.to_string()),
+        None => image,
+    };
     let container = image.with_shm_size(256 * 1024 * 1024).start().await?;
 
     Ok(Node::Container(Box::new(ContainerNode {

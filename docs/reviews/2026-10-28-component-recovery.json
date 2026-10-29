@@ -1363,6 +1363,41 @@
         }
       ]
     },
+    "archive-recovery": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-batcher",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "archive_recovery",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "real": [
+        "Aeron media driver and Archive with record/replay CRC32",
+        "TxDataPublisherHandle, TxDataSubscriberHandle and production recorder",
+        "mirror_archive, diff_mirror and heal_from_mirror",
+        "ArchiveTool verify and mark-valid",
+        "ArchiveRefetcher after a daemon restart"
+      ],
+      "controlled": [
+        "12 envelopes with 512-byte payloads in one 64-KiB segment",
+        "offline payload byte corruption",
+        "offline segment and catalog deletion",
+        "saved byte-identical backup of the stopped recording",
+        "owned Docker daemon lifecycle and host file ownership"
+      ],
+      "tests": [
+        "a_corrupt_recording_is_detected_repaired_and_replayed_exactly",
+        "a_wiped_archive_restores_its_catalog_and_replays_the_exact_recording"
+      ],
+      "limitation": "One recording and a saved backup, not two independent peer recordings. Wall-clock Docker, Java and Aeron timing remains real. No distributed tar/catalog transfer, Nomad drain/placement, repair CLI wiring, live-ingress admission, executor progress, multi-segment boundary or distributed load coverage."
+    },
     "chaos-cache-readers": {
       "command": [
         "cargo",
@@ -1575,8 +1610,13 @@
     {
       "case": "archive-tx-data-wipe",
       "family": "Ingress",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "archive-recovery",
+          "test": "a_wiped_archive_restores_its_catalog_and_replays_the_exact_recording"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -1591,6 +1631,10 @@
         {
           "suite": "chaos-archive-stage",
           "test": "staging_reads_the_mirrors_own_recording_name"
+        },
+        {
+          "suite": "archive-recovery",
+          "test": "a_corrupt_recording_is_detected_repaired_and_replayed_exactly"
         }
       ],
       "full_case_locally_validated": false
