@@ -1362,6 +1362,45 @@
           "intended_failure": true
         }
       ]
+    },
+    "chaos-cache-readers": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "cases::cache::readers::tests::"
+      ],
+      "real": [
+        "Per-ingress recovery observer",
+        "RPC client and exporter HTTP reader",
+        "Original120-second recovery budget"
+      ],
+      "controlled": [
+        "Two independent HTTP peers and counters",
+        "RPC errors and missing reader observations",
+        "Virtual clock and stalled observation"
+      ],
+      "tests": [
+        "every_reader_must_prove_redis_use_without_degradation",
+        "missing_duplicate_foreign_and_failed_readers_cannot_certify_recovery",
+        "separate_partial_observations_do_not_accumulate_into_recovery",
+        "a_fresh_complete_reading_recovers_after_a_failed_probe",
+        "a_hung_probe_preserves_the_original_recovery_deadline",
+        "both_real_rpc_endpoints_must_prove_their_own_redis_read",
+        "complete_http_recovery_passes_and_rpc_failure_cannot_pass_on_counters"
+      ],
+      "limitation": "Observer controls do not prove Redis, ingress process or full distributed recovery. Existing state and L1 reconstruction assertions remain required.",
+      "negative_controls": [
+        {
+          "mutation": "accept_any_reader",
+          "compiled": true,
+          "failed_tests": 6,
+          "exit_code": 101
+        }
+      ]
     }
   },
   "families": {
@@ -2182,6 +2221,34 @@
         {
           "suite": "chaos-cache-backlog",
           "test": "a_silent_exec_reply_expires_the_real_client_read"
+        },
+        {
+          "suite": "chaos-cache-readers",
+          "test": "every_reader_must_prove_redis_use_without_degradation"
+        },
+        {
+          "suite": "chaos-cache-readers",
+          "test": "missing_duplicate_foreign_and_failed_readers_cannot_certify_recovery"
+        },
+        {
+          "suite": "chaos-cache-readers",
+          "test": "separate_partial_observations_do_not_accumulate_into_recovery"
+        },
+        {
+          "suite": "chaos-cache-readers",
+          "test": "a_fresh_complete_reading_recovers_after_a_failed_probe"
+        },
+        {
+          "suite": "chaos-cache-readers",
+          "test": "a_hung_probe_preserves_the_original_recovery_deadline"
+        },
+        {
+          "suite": "chaos-cache-readers",
+          "test": "both_real_rpc_endpoints_must_prove_their_own_redis_read"
+        },
+        {
+          "suite": "chaos-cache-readers",
+          "test": "complete_http_recovery_passes_and_rpc_failure_cannot_pass_on_counters"
         }
       ],
       "full_case_locally_validated": false

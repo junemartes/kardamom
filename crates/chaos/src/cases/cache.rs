@@ -16,8 +16,6 @@
 
 use std::time::{Duration, Instant};
 
-use alloy_primitives::Address;
-
 use crate::harness::Harness;
 use crate::nomad::SavedJob;
 use crate::poll::{self, Budget};
@@ -31,6 +29,7 @@ mod interrupted;
 #[cfg(test)]
 mod test_support;
 pub(crate) use backlog::client_restart;
+mod readers;
 mod rebuilds;
 pub(crate) use coverage::CacheRecovery;
 
@@ -73,10 +72,7 @@ async fn reader_sample(h: &Harness, node: &Probed) -> Option<Readers> {
         .scrape()
         .fetch(&h.probes.ingress_target(node))
         .await?;
-    Some(Readers {
-        degraded: crate::metrics::sum(&body, DEGRADED).unwrap_or(0),
-        redis: crate::metrics::sum_where(&body, LOOKUPS, REDIS_LAYER).unwrap_or(0),
-    })
+    Some(Readers::parse(&body))
 }
 
 /// The reader counters summed over the ingress pair.
@@ -102,15 +98,7 @@ async fn readers(h: &Harness) -> anyhow::Result<Readers> {
 /// the reader touches Redis. The address is fresh per call, so the
 /// local layer never warms it.
 async fn probe_cold_read(h: &Harness, step: u32) -> anyhow::Result<()> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let mut bytes = [0u8; 20];
-    bytes[..16].copy_from_slice(&nanos.to_le_bytes());
-    bytes[16..].copy_from_slice(&step.to_le_bytes());
-    Rpc::new(&h.rpc_url, h.knobs.chain_id)?
-        .balance_probe(Address::from(bytes))
-        .await
+    Readers::probe(&Rpc::new(&h.rpc_url, h.knobs.chain_id)?, step).await
 }
 
 /// Wait until a probe read moves the counter `pick` selects: proof
@@ -145,40 +133,7 @@ async fn wait_reader_moves(
 /// scrape is one reading that shows no recovery: a recovering ingress
 /// can refuse a read or drop a scrape, and the next reading tries again.
 pub(crate) async fn wait_readers_recovered(h: &Harness, ctx: &str) -> anyhow::Result<()> {
-    let last = std::cell::RefCell::new(String::from("no reading"));
-    let last_ref = &last;
-    let outcome = poll::until(Budget::secs(120, 3), |_| async move {
-        Ok::<_, anyhow::Error>(recovery_reading(h).await.unwrap_or_else(|e| {
-            *last_ref.borrow_mut() = format!("{e:#}");
-            None
-        }))
-    })
-    .await?;
-    let (sample, elapsed) = outcome.or_fail(|t| {
-        crate::chaos_fail!(
-            "{ctx}: the readers did not use Redis again without a degraded read within {}s (last failed reading: {})",
-            t.as_secs(),
-            last.borrow()
-        )
-    })?;
-    crate::log(format!(
-        "{ctx}: readers recovered after {}s (redis lookups {} degraded {})",
-        elapsed.as_secs(),
-        sample.redis,
-        sample.degraded
-    ));
-    Ok(())
-}
-
-/// One reading of the recovery: the counters, a probe read, and the
-/// counters again. The readings after the probe when it used Redis with
-/// no degraded read, else `None`.
-async fn recovery_reading(h: &Harness) -> anyhow::Result<Option<Readers>> {
-    let before = readers(h).await?;
-    probe_cold_read(h, 1).await?;
-    let after = readers(h).await?;
-    let recovered = after.redis > before.redis && after.degraded == before.degraded;
-    Ok(recovered.then_some(after))
+    readers::Recovery::for_harness(h)?.wait(ctx).await
 }
 
 /// The readers degrade instead of stalling: a probe read raises the

@@ -369,3 +369,12 @@ its bytes and recording name; a 64MiB unrelated segment and the catalog stay out
 of the transfer. Restoring the whole-archive copy fails both checks. The drill
 still uses the repair tool and live CRC verification, and its traffic and recovery
 deadlines stay unchanged. These two checks do not certify the distributed case.
+
+`just test-component chaos-cache-readers` checks the recovery observer with two
+independent HTTP peers. Every ingress must complete a cold read and increase its
+own Redis lookup counter without increasing its degraded-read counter. Missing
+exporters, failed RPCs, falling counters and recovery split across observations
+cannot pass. A successful peer cannot mask an unrecovered peer. The observer keeps
+its 120-second budget and reports each reader's latest counters or error. These
+checks validate the observer; distributed Redis recovery and exact final state
+still require the full chaos case.
