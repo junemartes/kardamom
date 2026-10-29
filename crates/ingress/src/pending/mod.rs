@@ -52,6 +52,7 @@ pub struct ReceiptResponse {
 struct Entry {
     responder: Option<oneshot::Sender<Result<ReceiptResponse, IngressError>>>,
     receipt: Option<Receipt>,
+    duplicate_seen: bool,
 }
 
 /// The registry's index. Values are `Weak`: the map can find an entry,
@@ -127,16 +128,10 @@ struct Watermarks {
     local: Option<BPosition>,
 }
 
-/// How long a sequencer rejection is held before it releases the parked
-/// client with an error, giving a racing success a chance to win. With P
-/// racing sequencer replicas, a replica with a briefly stale nonce floor
-/// can reject a tx that its twin accepted and ordered. The rejection is
-/// emitted at ordering time, while the receipt lands only after
-/// execution, so the error usually arrives first. The grace period must
-/// exceed the ordering-to-execution-to-receipt latency, tens of
-/// milliseconds in the cluster. A genuine rejection, where both replicas
-/// reject, is only delayed by this long, which a client that submits a
-/// duplicate can easily afford.
+/// The grace for non-duplicate sequencer rejections. A receipt that arrives
+/// during this window overrides the rejection. A duplicate can refer to
+/// the transaction that is still executing, so it waits for the request
+/// deadline instead.
 pub(crate) const DEFAULT_TX_ERROR_GRACE: Duration = Duration::from_millis(500);
 
 pub(crate) struct PendingReceipts {
@@ -175,7 +170,7 @@ impl PendingReceipts {
     }
 
     /// Like [`new`](Self::new), with an explicit rejection-release
-    /// grace. `Duration::ZERO` releases errors inline, with no
+    /// grace. `Duration::ZERO` releases non-duplicate errors inline, with no
     /// success-override window.
     pub(crate) fn with_error_grace(policy: AckPolicy, error_grace: Duration) -> Self {
         Self {
@@ -205,6 +200,7 @@ impl PendingReceipts {
         let entry = Arc::new(Mutex::new(Entry {
             responder: Some(tx),
             receipt: None,
+            duplicate_seen: false,
         }));
         self.map.insert((sender, nonce), Arc::downgrade(&entry));
         self.map.set_queue_depth();
@@ -269,18 +265,20 @@ impl PendingReceipts {
         self.parked.lock_ignore_poison().insert((tx_idx, seq), weak);
     }
 
-    /// Called by the `tx_errors` watcher when a sequencer rejects an inbound
-    /// `(sender, nonce)`. Releases the parked client with a JSON-RPC
-    /// error mapped from `reason`, but only after the configured grace
-    /// period, and only if no receipt has won by then. With racing
-    /// sequencer replicas, a rejection from one replica can race a
-    /// success from its twin, and the success must override the
-    /// rejection; see [`DEFAULT_TX_ERROR_GRACE`]. A receipt that already
-    /// arrived, even one still gated on a durability watermark,
-    /// suppresses the error outright. Returns silently if no client is
-    /// parked for that key, since the error is best-effort.
+    /// Records a sequencer rejection for a parked `(sender, nonce)`.
+    /// A duplicate stays pending until the request deadline: it does not
+    /// prove that the submitted transaction failed to execute on the twin.
+    /// Other rejections release after [`DEFAULT_TX_ERROR_GRACE`]. A stored
+    /// receipt suppresses every rejection, even while its durability gate
+    /// is pending. An error with no parked client has no effect.
     pub(crate) async fn on_tx_error(&self, sender: Address, nonce: u64, reason: TxErrorReason) {
         let key = (sender, nonce);
+        if matches!(reason, TxErrorReason::DuplicatedTx { .. }) {
+            if let Some(entry) = self.map.lookup(&key) {
+                entry.lock().await.duplicate_seen = true;
+            }
+            return;
+        }
         // The deferred release holds only a Weak across the grace sleep.
         // So a client that disconnects mid-grace lets its entry die
         // right away, instead of a pending-error task keeping it alive.
@@ -511,7 +509,14 @@ impl PendingWait {
         match tokio::time::timeout(timeout, &mut self.rx).await {
             Ok(Ok(res)) => res,
             Ok(Err(_)) => Err(IngressError::Internal("oneshot dropped".into())),
-            Err(_) => Err(IngressError::Timeout),
+            Err(_) => {
+                let entry = self.entry.lock().await;
+                if entry.receipt.is_none() && entry.duplicate_seen {
+                    Err(IngressError::Duplicate(self.key))
+                } else {
+                    Err(IngressError::Timeout)
+                }
+            }
         }
     }
 }
@@ -538,3 +543,6 @@ impl Drop for PendingWait {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod duplicate_tests;
