@@ -1,9 +1,9 @@
 ---
 name: rust-build-cache
 description: >-
-  The Rust build cache of a CI job: sccache on the GitHub cache backend
-  for every rustc call (workspace crates included), rust-cache for the
-  registry and the dependency artifacts, and a fixed ISA for C objects.
+  The Rust build cache of a CI job: a bounded local compiler cache saved as
+  one archive, rust-cache for registry and dependency artifacts,
+  and a fixed ISA for C objects.
 inputs:
   key:
     description: Appended to the job's rust-cache key (a job with another feature set keeps its own).
@@ -16,11 +16,8 @@ inputs:
 runs:
   using: composite
   steps:
-    # rusteron's build.rs compiles the Aeron C library with -march=native.
-    # A cached object built on a wider-ISA runner SIGILLs on a narrower
-    # one, which is why every rust-cache key used to carry a CPU-flag
-    # hash. The compiler wrappers append -march=x86-64-v3 after it (GCC
-    # takes the last -march), so one key serves the whole fleet.
+    # The C wrappers append a fixed ISA after -march=native so artifacts
+    # are executable on every runner that consumes the shared build.
     - name: Fix the ISA of C objects and route rustc through sccache
       shell: bash
       run: |
@@ -28,9 +25,21 @@ runs:
           echo "CC=${GITHUB_WORKSPACE}/scripts/ci/cc-x86-64-v3.sh"
           echo "CXX=${GITHUB_WORKSPACE}/scripts/ci/cxx-x86-64-v3.sh"
           echo "RUSTC_WRAPPER=sccache"
-          echo "SCCACHE_GHA_ENABLED=true"
+          echo "SCCACHE_GHA_ENABLED=false"
+          echo "SCCACHE_DIR=${RUNNER_TEMP}/kardamom-sccache"
+          echo "SCCACHE_CACHE_SIZE=1G"
         } >> "$GITHUB_ENV"
+    # One archive bounds cache-service requests independently of crate count.
+    # Compiler content hashes validate restored objects across source revisions.
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/kardamom-sccache
+        key: compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.shared-key || github.job }}-${{ inputs.key }}-${{ github.sha }}
+        restore-keys: |
+          compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.shared-key || github.job }}-${{ inputs.key }}-
     - uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
+      with:
+        version: v0.19.0
     - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: v1-rust-x86-64-v3

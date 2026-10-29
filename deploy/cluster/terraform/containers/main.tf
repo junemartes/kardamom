@@ -11,6 +11,14 @@
 # `tofu apply` for a fresh chain.
 
 locals {
+  node_image = var.prebuilt_node_image == "" ? {
+    name = docker_image.node[0].name
+    id   = docker_image.node[0].image_id
+    } : {
+    name = var.prebuilt_node_image
+    id   = data.docker_image.prepared[0].id
+  }
+
   contract_path = startswith(var.contract_file, "/") ? var.contract_file : "${path.module}/${var.contract_file}"
   docker_path   = startswith(var.docker_dir, "/") ? var.docker_dir : "${path.module}/${var.docker_dir}"
   contract      = yamldecode(file(local.contract_path))
@@ -76,7 +84,18 @@ resource "docker_network" "this" {
   }
 }
 
+moved {
+  from = docker_image.node
+  to   = docker_image.node[0]
+}
+
+data "docker_image" "prepared" {
+  count = var.prebuilt_node_image == "" ? 0 : 1
+  name  = var.prebuilt_node_image
+}
+
 resource "docker_image" "node" {
+  count        = var.prebuilt_node_image == "" ? 1 : 0
   name         = var.image_name
   keep_locally = true
 
@@ -109,7 +128,7 @@ resource "docker_container" "node" {
 
   name     = each.value.container
   hostname = each.value.name
-  image    = docker_image.node.image_id
+  image    = local.node_image.id
 
   # systemd and the inner dockerd need a privileged container on the host
   # cgroup namespace with a writable cgroup tree and tmpfs run directories.
