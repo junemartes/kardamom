@@ -491,6 +491,8 @@
         "--locked",
         "-p",
         "kardamom-state-mirror",
+        "--bin",
+        "kardamom-state-mirror",
         "--features",
         "docker-e2e",
         "component_tests::recovery::",
@@ -516,7 +518,8 @@
         "partial_live_batch_retries_without_new_input_and_publishes_head_last",
         "script_loss_and_older_replica_frames_preserve_newest_account_state",
         "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close",
-        "a_transient_head_read_timeout_does_not_end_the_recovery_wait"
+        "a_transient_head_read_timeout_does_not_end_the_recovery_wait",
+        "a_transient_acl_read_timeout_does_not_end_the_fault_observation"
       ],
       "negative_controls": {
         "regressing_rows": {
@@ -530,7 +533,8 @@
           "failed_as_expected": true
         }
       },
-      "limitation": "The partial-scan target forces rebuilding; state-mirror-coverage-gap separately proves automatic recovery from a persisted incomplete-rebuild marker. No Sentinel promotion, process kill, disk failure or packet-loss proof."
+      "limitation": "The partial-scan target forces rebuilding; state-mirror-coverage-gap separately proves automatic recovery from a persisted incomplete-rebuild marker. No Sentinel promotion, process kill, disk failure or packet-loss proof.",
+      "ci_mode": "dependencies"
     },
     "state-mirror-coverage-gap": {
       "command": [
@@ -538,6 +542,8 @@
         "test",
         "--locked",
         "-p",
+        "kardamom-state-mirror",
+        "--bin",
         "kardamom-state-mirror",
         "--features",
         "docker-e2e",
@@ -558,7 +564,8 @@
         "automatic_restart_must_restore_coverage_despite_another_live_head",
         "persisted_progress_cannot_hide_an_interrupted_rebuild"
       ],
-      "limitation": "Proves automatic recovery of this mirror after interrupted rebuilding, with or without a persisted head. No claim of shared bucket certification, cache failover durability, or recovery after loss of the mirror data directory."
+      "limitation": "Proves automatic recovery of this mirror after interrupted rebuilding, with or without a persisted head. No claim of shared bucket certification, cache failover durability, or recovery after loss of the mirror data directory.",
+      "ci_mode": "dependencies"
     },
     "checkpoint-copy": {
       "command": [
@@ -589,7 +596,8 @@
         "missing_files_and_mixed_archive_errors_fail_the_copy"
       ],
       "limitation": "Proves the harness can verify a checkpoint on the fault volume. It does not prove executor progress during ENOSPC, disk/power-loss durability, or pruning races. The container starts only a bounded sleep process, not chain services.",
-      "negative_control": "The Docker fixture asserts that the old docker cp path fails on the same tmpfs whose exec/tar copy verifies successfully."
+      "negative_control": "The Docker fixture asserts that the old docker cp path fails on the same tmpfs whose exec/tar copy verifies successfully.",
+      "ci_mode": "dependencies"
     },
     "sealer-actor": {
       "command": [
@@ -771,7 +779,8 @@
           "failed_at_recovery": true,
           "compiled": true
         }
-      ]
+      ],
+      "ci_mode": "dependencies"
     },
     "state-writer-crash": {
       "command": [
@@ -874,7 +883,8 @@
           "failed_assertion": "storage written in block 2, slot 0, after block 5"
         }
       ],
-      "limitation": "Linux Docker only. Runs the real test binary with its host shared libraries mounted read-only, without network or added capabilities. Proves auxiliary-volume ENOSPC, same-writer progress, no partial checkpoint publication and restored state after the log resumes. Does not prove state-volume ENOSPC, EIO, power loss, checkpointer scheduling, transaction/receipt end-to-end progress, Nomad mounts or deployment recovery."
+      "limitation": "Linux Docker only. Runs the real test binary with its host shared libraries mounted read-only, without network or added capabilities. Proves auxiliary-volume ENOSPC, same-writer progress, no partial checkpoint publication and restored state after the log resumes. Does not prove state-volume ENOSPC, EIO, power loss, checkpointer scheduling, transaction/receipt end-to-end progress, Nomad mounts or deployment recovery.",
+      "ci_mode": "dependencies"
     },
     "state-enospc": {
       "command": [
@@ -918,7 +928,8 @@
           "compiled": true,
           "bad_txn_panic": true
         }
-      ]
+      ],
+      "ci_mode": "dependencies"
     },
     "chaos-election": {
       "command": [
@@ -1001,7 +1012,8 @@
           "compiled": true,
           "kernel_probe_failed": true
         }
-      ]
+      ],
+      "ci_mode": "dependencies"
     },
     "chaos-alert": {
       "command": [
@@ -1086,7 +1098,8 @@
           "compiled": true,
           "starvation_observed": true
         }
-      ]
+      ],
+      "ci_mode": "dependencies"
     },
     "chaos-cache-baseline": {
       "command": [
@@ -1184,7 +1197,8 @@
         "hidden_mined_receipts_reconcile_without_duplicate_posts_or_early_cursor",
         "restart_during_hidden_receipts_uses_contract_truth_without_waiting_for_the_indexer"
       ],
-      "limitation": "No full follower fleet, Prometheus alert, Nomad restart, consensus retention or EigenDA proof. These tests cover null receipt reconciliation and restart, not expiry of the 120-second receipt deadline. Alloy timeout bookkeeping includes the wall clock, so Tokio virtual time alone cannot prove that deadline. The existing local DA helper serves until the test process exits. Payloads contain empty boundary blocks; transaction execution and full-chain transfer progress are outside this fixture."
+      "limitation": "No full follower fleet, Prometheus alert, Nomad restart, consensus retention or EigenDA proof. These tests cover null receipt reconciliation and restart, not expiry of the 120-second receipt deadline. Alloy timeout bookkeeping includes the wall clock, so Tokio virtual time alone cannot prove that deadline. The existing local DA helper serves until the test process exits. Payloads contain empty boundary blocks; transaction execution and full-chain transfer progress are outside this fixture.",
+      "ci_mode": "dependencies"
     },
     "batcher-post-age": {
       "command": [
@@ -1410,7 +1424,8 @@
         "a_corrupt_recording_is_detected_repaired_and_replayed_exactly",
         "a_wiped_archive_restores_its_catalog_and_replays_the_exact_recording"
       ],
-      "limitation": "One recording and a saved backup, not two independent peer recordings. Wall-clock Docker, Java and Aeron timing remains real. No distributed tar/catalog transfer, Nomad drain/placement, repair CLI wiring, live-ingress admission, executor progress, multi-segment boundary or distributed load coverage."
+      "limitation": "One recording and a saved backup, not two independent peer recordings. Wall-clock Docker, Java and Aeron timing remains real. No distributed tar/catalog transfer, Nomad drain/placement, repair CLI wiring, live-ingress admission, executor progress, multi-segment boundary or distributed load coverage.",
+      "ci_mode": "dependencies"
     },
     "chaos-cache-readers": {
       "command": [
@@ -1510,6 +1525,137 @@
         "a_check_removed_after_registration_is_recoverable"
       ],
       "limitation": "One isolated Consul agent; this does not qualify fleet rescheduling, validator catch-up or the cause of a distributed catalog deletion."
+    },
+    "aeron-round-trip": {
+      "ci_mode": "dependencies",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-log",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "aeron_live_e2e",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "tests": [
+        "aeron_live_send_friendly_round_trip"
+      ],
+      "real": [
+        "AeronRuntime publisher and subscriber handles",
+        "Docker Aeron media driver and archive"
+      ],
+      "controlled": [
+        "50 ordered transaction envelopes over shared IPC"
+      ],
+      "limitation": "Component integration only; no distributed chaos equivalence or qualification credit."
+    },
+    "aeron-client-timeout": {
+      "ci_mode": "dependencies",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-log",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "client_timeout_exit",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "tests": [
+        "a_client_timeout_in_the_runtime_context_exits",
+        "a_client_timeout_in_the_archive_context_exits",
+        "a_client_timeout_in_both_contexts_at_once_exits"
+      ],
+      "real": [
+        "Aeron runtime and archive client contexts",
+        "Production fatal client-error handler",
+        "Docker media driver"
+      ],
+      "controlled": [
+        "Child-process SIGSTOP longer than the driver liveness timeout",
+        "Runtime, archive and simultaneous client contexts"
+      ],
+      "limitation": "Component integration only; no distributed chaos equivalence or qualification credit."
+    },
+    "cache-redis": {
+      "ci_mode": "dependencies",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-cache",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "redis_e2e",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "tests": [
+        "rows_apply_by_position_and_disagreements_are_counted",
+        "a_group_of_batches_applies_each_row_at_its_own_position",
+        "receipts_index_by_sender_and_nonce_and_expire",
+        "a_skip_that_used_no_nonce_never_replaces_the_receipt_of_its_nonce",
+        "a_clear_deletes_the_projection_and_keeps_the_heads",
+        "heads_and_pending_round_trip",
+        "reader_connects_lazily_and_gates_freshness_on_the_head"
+      ],
+      "real": [
+        "AccountCache with real Redis and Lua scripts",
+        "Ordered account rows, receipt identity and expiry, mirror heads"
+      ],
+      "controlled": [
+        "Account positions and conflicting rows",
+        "Receipt expiry and stale head observations"
+      ],
+      "limitation": "Component integration only; no distributed chaos equivalence or qualification credit."
+    },
+    "ingress-redis": {
+      "ci_mode": "dependencies",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-ingress",
+        "--features",
+        "docker-e2e,test-support",
+        "--test",
+        "account_cache_redis_test",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "tests": [
+        "fresh_redis_and_fresh_local_rows_do_not_query_executors",
+        "a_stale_projection_without_an_executor_cannot_answer_a_head_rpc",
+        "validated_admission_keeps_stale_nonce_lower_bounds_without_querying",
+        "account_rpcs_use_the_executor_while_a_live_mirror_head_lags",
+        "a_retry_of_a_landed_tx_answers_from_the_receipt_index",
+        "an_unfunded_sender_rejects_only_while_the_head_is_fresh",
+        "a_past_nonce_with_no_indexed_receipt_publishes"
+      ],
+      "real": [
+        "Ingress account lookup and transaction admission",
+        "Redis projection and receipt index"
+      ],
+      "controlled": [
+        "Fresh and stale mirror and local heads",
+        "Controlled executor query replies and availability",
+        "Funded, unfunded, duplicate and past-nonce transactions"
+      ],
+      "limitation": "Component integration only; no distributed chaos equivalence or qualification credit."
     }
   },
   "families": {

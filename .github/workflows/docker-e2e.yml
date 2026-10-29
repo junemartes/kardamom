@@ -1,15 +1,9 @@
 name: docker-e2e
 
 on:
-  # Runs on every PR (and pushes to main). Exercises the tx_data publish →
-  # record → subscribe path against a real Aeron container (the per-component
-  # docker_e2e smoke). The full multi-process pipeline proof moved to the
-  # cluster-e2e workflow in the cluster-only migration (it requires the Aeron
-  # Cluster). `skip-docker-e2e` on a PR opts out (e.g. docs-only changes).
   pull_request:
   push:
     branches: [main]
-  # Manual trigger so contributors can fire it on demand.
   workflow_dispatch:
 
 concurrency:
@@ -19,130 +13,69 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Smaller than the default 200 so this CI job stays under 30 minutes.
-  KARDAMOM_E2E_N: 100
 
 jobs:
-  full-pipeline-e2e:
-    # Runs on every PR. Opt OUT with the `skip-docker-e2e` label for changes
-    # that can't affect the pipeline (e.g. docs-only PRs) to keep their CI fast.
+  build:
     if: >-
       !contains(github.event.pull_request.labels.*.name, 'skip-docker-e2e')
-    name: full-pipeline-e2e
-    runs-on: ubuntu-latest
-    # Headroom for the two deposit round-trips on top of the original
-    # transfer + smoke tests.
-    timeout-minutes: 45
+    name: build dependency recovery artifact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-
-      # The Aeron Media Driver build requires cmake + libuuid headers; the
-      # rusteron-* crates compile the C client from source via the cmake
-      # build-script. Pre-install before we touch cargo.
       - name: Install system build deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             cmake uuid-dev libbsd-dev libssl-dev pkg-config build-essential
-
       - uses: dtolnay/rust-toolchain@stable
-      # Foundry supplies `forge` (the deployer crate's build script shells
-      # out to it to embed contract bytecode — `-p e2e --tests` builds the
-      # deployer) and `anvil` for the L1-backed deposit round-trip. Without
-      # anvil that test skips itself and passes vacuously.
       - uses: ./.github/actions/foundry
-      # forge build downloads the pinned solc on a cold host; the cache
-      # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
       - uses: ./.github/actions/rust-build-cache
         with:
           shared-key: docker-e2e
-
-      # Sanity: ensure the Docker daemon is reachable (ubuntu-latest runners
-      # ship with Docker pre-installed, but it's worth a quick probe so we
-      # fail loudly here rather than mid-test).
-      - name: docker info
-        run: docker info
-
-      # The smoke builds the Aeron image from crates/log/docker/aeron. The
-      # jar in that context keeps the build off Maven Central.
-      - uses: ./.github/actions/aeron-jar
-
-      # Build the kardamom-log docker-e2e test surface (the tx_data Aeron smoke
-      # below). The full IPC-pipeline e2e (the in-process + multi-process
-      # proof-of-pipeline + deposit round-trips) was REMOVED in the cluster-only
-      # migration — those tests spawned the standalone sealer, which no longer
-      # exists. That whole-pipeline coverage now lives in the cluster-e2e
-      # workflow (real Aeron Cluster (Raft) + nomad + chaos cases).
-      - name: cargo build (docker-e2e feature)
+      - name: Build and package the test runtime
         run: |
-          cargo build \
-            -p kardamom-log \
-            --features 'kardamom-log/docker-e2e' \
-            --tests
-
-      # Per-component docker_e2e smoke: tx_data publish → record → subscribe over
-      # a real Aeron container. (tx_ordering is the cluster's job now; the legacy
-      # tx_ordering Aeron docker_e2e was removed with the single-sealer path.)
-      - name: per-component docker_e2e smoke
-        run: |
-          cargo test \
-            -p kardamom-log \
-            --features 'docker-e2e' \
-            --test aeron_live_e2e --test client_timeout_exit -- --ignored --nocapture
-
-      - name: batcher recovery with hidden L1 receipts
-        run: python3 scripts/test-components.py batcher-null-receipts
-
-      - name: archive corruption and wipe recovery
-        run: python3 scripts/test-components.py archive-recovery
-
-      - name: transport recovery with unavailable outputs
-        run: python3 scripts/test-components.py transport-pressure
-
-      # The account cache against a real Redis container: the monotone
-      # write rule, the account and receipt reads, and the mirror heads.
-      - name: kardamom-cache redis round trips
-        run: |
-          cargo test \
-            -p kardamom-cache \
-            --features 'docker-e2e' \
-            --test redis_e2e -- --ignored --nocapture
-
-      - name: cache Sentinel component recovery
-        run: python3 scripts/test-components.py cache-sentinel
-
-      - name: state mirror component recovery
-        run: |
-          python3 scripts/test-components.py state-mirror
-          python3 scripts/test-components.py state-mirror-coverage-gap
-
-      - name: checkpoint copy across container mounts
-        run: python3 scripts/test-components.py checkpoint-copy
-
-      - name: bounded checkpoint fault controller
-        run: python3 scripts/test-components.py checkpoint-fault
-
-      - name: checkpoint and block-log recovery after ENOSPC
-        run: python3 scripts/test-components.py state-aux-enospc
-
-      - name: state commit recovery after ENOSPC
-        run: python3 scripts/test-components.py state-enospc
-
-      # The ingress admission checks and the receipt index with the Redis
-      # layer on: the case of an ingress that just restarted.
-      - name: kardamom-ingress admission over redis
-        run: |
-          cargo test \
-            -p kardamom-ingress \
-            --features 'docker-e2e,test-support' \
-            --test account_cache_redis_test -- --ignored --nocapture
-
-      - name: Preserve account cache performance samples
-        if: always()
-        uses: actions/upload-artifact@v4
+          python3 scripts/ci/dependency_tests.py prepare --bundle /tmp/dependency-bundle
+          tar -C /tmp/dependency-bundle -cf - . | gzip -1 > /tmp/dependency-bundle.tgz
+      - uses: actions/upload-artifact@v4
         with:
-          name: ingress-account-cache-profile
-          path: /tmp/kardamom-ingress-account-profile.jsonl
-          if-no-files-found: ignore
+          name: dependency-binaries
+          path: /tmp/dependency-bundle.tgz
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+
+  dependency-recovery:
+    needs: build
+    name: dependency recovery (${{ matrix.shard }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dependency-binaries
+          path: /tmp/dependency-artifact
+      - name: Unpack the shared runtime
+        run: |
+          mkdir /tmp/dependency-bundle
+          tar -C /tmp/dependency-bundle -xzf /tmp/dependency-artifact/dependency-bundle.tgz
+          rm /tmp/dependency-artifact/dependency-bundle.tgz
+      - uses: ./.github/actions/foundry
+      - uses: ./.github/actions/aeron-jar
+      - name: Run one shard without compilation
+        run: |
+          python3 scripts/ci/dependency_tests.py run --bundle /tmp/dependency-bundle --shard ${{ matrix.shard }} --output /tmp/dependency-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-results-${{ matrix.shard }}
+          path: |
+            /tmp/dependency-results
+            /tmp/kardamom-ingress-account-profile.jsonl
           retention-days: 14

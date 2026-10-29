@@ -198,14 +198,45 @@ impl Fixture {
         assert!(state.contains("State:\tT (stopped)"), "{state}");
     }
 
-    pub(super) async fn role(container: &ContainerAsync<GenericImage>, wanted: &str) {
-        tokio::time::timeout(BOUND, async {
+    pub(super) async fn role(&self, container: &ContainerAsync<GenericImage>, wanted: &str) {
+        let result = tokio::time::timeout(BOUND, async {
             while !Self::is_role(container, wanted).await.unwrap_or(false) {
                 tokio::time::sleep(PAUSE).await;
             }
         })
-        .await
-        .expect("Redis must reach the expected role");
+        .await;
+        if result.is_err() {
+            tokio::join!(
+                Self::diagnostic(&self.primary),
+                Self::diagnostic(&self.replica),
+                Self::diagnostic(&self.sentinels[0]),
+                Self::diagnostic(&self.sentinels[1]),
+                Self::diagnostic(&self.sentinels[2]),
+            );
+        }
+        result.unwrap_or_else(|error| {
+            panic!("Redis {} must reach role {wanted}: {error}", container.id())
+        });
+    }
+
+    async fn diagnostic(container: &ContainerAsync<GenericImage>) {
+        let log = tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::process::Command::new("docker")
+                .args(["logs", "--tail", "80", container.id()])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        match log {
+            Ok(Ok(output)) => eprintln!(
+                "Redis {} stdout={} stderr={}",
+                container.id(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            result => eprintln!("Redis {} log collection failed: {result:?}", container.id()),
+        }
     }
 
     async fn is_role(

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from green_streak import Command, Streak, WORKFLOWS, JOB_BUDGET_SECONDS, COMPONENT_SHARDS
+from green_streak import Command, Streak, WORKFLOWS, JOB_BUDGET_SECONDS, COMPONENT_SHARDS, SEMANTICS_SHARDS, DEPENDENCY_SHARDS
 
 
 HEAD = "a" * 40
@@ -45,7 +45,37 @@ class StreakTest(unittest.TestCase):
                            "conclusion": "success", "started_at": f"2026-10-{number:02}T00:00:00Z",
                            "completed_at": f"2026-10-{number:02}T00:04:00Z"}
                           for shard in range(COMPONENT_SHARDS))
+        semantics = next(run for run in runs if run["path"].endswith("/chain-semantics-e2e.yml"))
+        semantics["jobs"].extend({"name": f"chain-semantics-e2e ({shard})", "status": "completed",
+                                  "conclusion": "success", "started_at": f"2026-10-{number:02}T00:00:00Z",
+                                  "completed_at": f"2026-10-{number:02}T00:04:00Z"}
+                                 for shard in range(SEMANTICS_SHARDS))
+        dependencies = next(run for run in runs if run["path"].endswith("/docker-e2e.yml"))
+        dependencies["jobs"].extend({"name": f"dependency recovery ({shard})", "status": "completed",
+                                     "conclusion": "success", "started_at": f"2026-10-{number:02}T00:00:00Z",
+                                     "completed_at": f"2026-10-{number:02}T00:04:00Z"}
+                                    for shard in range(DEPENDENCY_SHARDS))
         return runs
+
+    def test_old_coverage_policy_does_not_supply_green_rounds(self):
+        old = deepcopy(self.streak.state)
+        del old["semantics_shards"]
+        with self.assertRaisesRegex(ValueError, "coverage policy changed"):
+            Streak(HEAD, BRANCH, SHARDS, old)
+
+    def test_a_missing_semantics_shard_cannot_qualify_a_round(self):
+        runs = self.runs(1)
+        semantics = next(run for run in runs if run["path"].endswith("/chain-semantics-e2e.yml"))
+        semantics["jobs"].pop()
+        self.assertEqual(self.streak.record(runs), "failed")
+        self.assertEqual(self.streak.state["streak"], 0)
+
+    def test_a_missing_dependency_shard_cannot_qualify_a_round(self):
+        runs = self.runs(1)
+        dependencies = next(run for run in runs if run["path"].endswith("/docker-e2e.yml"))
+        dependencies["jobs"].pop()
+        self.assertEqual(self.streak.record(runs), "failed")
+        self.assertEqual(self.streak.state["streak"], 0)
 
     def green(self, count):
         for number in range(1, count + 1):

@@ -3,14 +3,14 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
-import signal
 import subprocess
+
+from test_bundle import ExecutableBundle
 import time
 import tomllib
 
@@ -21,29 +21,40 @@ SHARD_SECONDS = 240
 SHARDS = 4
 
 
-class Bundle:
-    def __init__(self, directory):
-        self.directory = directory.resolve()
+class Bundle(ExecutableBundle):
+    ci_mode = "in-process"
+    include_ignored = False
 
-    @staticmethod
-    def selection(catalog):
+    @property
+    def test_seconds(self):
+        return TEST_SECONDS
+
+    @property
+    def shard_seconds(self):
+        return SHARD_SECONDS
+
+    @classmethod
+    def selection(cls, catalog):
         return {name: suite for name, suite in catalog["local_suites"].items()
-                if suite.get("ci_mode") == "in-process"}
+                if suite.get("ci_mode") == cls.ci_mode}
 
     @staticmethod
     def target(suite):
         command = suite["command"]
         package = command[command.index("-p") + 1]
-        target = command[command.index("--test") + 1] if "--test" in command else package.replace("-", "_")
+        selector = next((flag for flag in ("--test", "--bin") if flag in command), None)
+        target = command[command.index(selector) + 1] if selector else package.replace("-", "_")
         return package, target
 
     @classmethod
     def build_command(cls, suites):
         packages = sorted({cls.target(suite)[0] for suite in suites.values()})
         tests = sorted({cls.target(suite)[1] for suite in suites.values() if "--test" in suite["command"]})
+        binaries = sorted({cls.target(suite)[1] for suite in suites.values() if "--bin" in suite["command"]})
         return ["cargo", "test", "--locked", "--no-run", "--message-format=json-render-diagnostics", "--lib",
                 *[arg for package in packages for arg in ["-p", package]],
-                *[arg for target in tests for arg in ["--test", target]]]
+                *[arg for target in tests for arg in ["--test", target]],
+                *[arg for target in binaries for arg in ["--bin", target]]]
 
     @staticmethod
     def resolve(expected, names):
@@ -52,47 +63,10 @@ class Bundle:
             raise ValueError(f"expected exactly one executable test for {expected}, found {matches}")
         return matches[0]
 
-    @staticmethod
-    def digest(path):
-        with path.open("rb") as source:
-            return hashlib.file_digest(source, "sha256").hexdigest()
-
-    def environment(self):
-        return dict(os.environ, RUST_BACKTRACE="1", LD_LIBRARY_PATH=str(self.directory / "native"))
-
-    def libraries(self, artifacts, paths):
-        native = self.directory / "native"
-        native.mkdir()
-        environment = dict(os.environ, LD_LIBRARY_PATH=os.pathsep.join(paths))
-        libraries = {}
-        for source in artifacts:
-            listing = subprocess.check_output(["ldd", source], text=True, env=environment)
-            if "not found" in listing:
-                raise ValueError(f"missing native library for {source}: {listing}")
-            for match in re.finditer(r"=> (/\S+)", listing):
-                library = Path(match[1])
-                if library.is_relative_to("/lib") or library.is_relative_to("/usr/lib"):
-                    continue
-                name = "native/" + library.name
-                digest = self.digest(library)
-                if name in libraries and libraries[name] != digest:
-                    raise ValueError(f"conflicting native library: {name}")
-                shutil.copy2(library, self.directory / name)
-                libraries[name] = digest
-        return libraries
-
-    @staticmethod
-    def build_messages(log):
-        messages = [json.loads(line) for line in log.read_text().splitlines()]
-        finished = [item for item in messages if item["reason"] == "build-finished"]
-        if len(finished) != 1 or not finished[0]["success"]:
-            raise ValueError("artifact packaging requires one successful completed Cargo build")
-        return messages
-
     def prepare(self, artifacts_file=None):
         suites = self.selection(json.loads(CATALOG.read_text()))
         if not suites:
-            raise ValueError("the in-process recovery inventory is empty")
+            raise ValueError("the recovery inventory is empty")
         self.directory.mkdir(parents=True, exist_ok=False)
         log = self.directory / "build.jsonl"
         if artifacts_file is None:
@@ -112,19 +86,15 @@ class Bundle:
         tests, binaries = [], {}
         for suite_name, suite in suites.items():
             source = artifacts[self.target(suite)]
-            listing = subprocess.check_output([source, "--list", "--format", "terse"], text=True, timeout=30, env=self.environment())
-            names = [line.removesuffix(": test") for line in listing.splitlines() if line.endswith(": test")]
+            names = self.names(source)
             binary = source.name
             if binary not in binaries:
-                destination = self.directory / binary
-                shutil.copy2(source, destination)
-                subprocess.run(["strip", "--strip-debug", destination], check=True)
-                binaries[binary] = self.digest(destination)
+                binaries[binary] = self.executable(source, binary)
             tests.extend({"suite": suite_name, "test": self.resolve(test, names), "binary": binary}
                          for test in suite["tests"])
         tests.sort(key=lambda test: (test["suite"], test["test"]))
         manifest = {"revision": os.environ.get("GITHUB_SHA"), "shards": SHARDS,
-                    "test_seconds": TEST_SECONDS, "shard_seconds": SHARD_SECONDS,
+                    "test_seconds": self.test_seconds, "shard_seconds": self.shard_seconds,
                     "binaries": binaries, "libraries": libraries, "tests": tests}
         self.validate_inventory(manifest)
         (self.directory / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -151,33 +121,11 @@ class Bundle:
             raise ValueError("one executable test appears in more than one suite")
 
     def load(self):
-        manifest = json.loads((self.directory / "manifest.json").read_text())
-        if os.environ.get("GITHUB_SHA") and manifest["revision"] != os.environ["GITHUB_SHA"]:
-            raise ValueError("the bundle was built from another revision")
+        manifest = super().load()
         if not manifest["tests"] or manifest["shards"] != SHARDS:
             raise ValueError("empty test bundle or incompatible shard plan")
-        for binary, digest in (manifest["binaries"] | manifest.get("libraries", {})).items():
-            if Path(binary).is_absolute() or ".." in Path(binary).parts or self.digest(self.directory / binary) != digest:
-                raise ValueError(f"invalid executable bundle: {binary}")
         self.validate_inventory(manifest)
         return manifest
-
-    @staticmethod
-    def execute(command, log, seconds, environment=None):
-        started = time.monotonic()
-        timed_out = False
-        with log.open("w") as output:
-            process = subprocess.Popen(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
-                                       start_new_session=True, env=environment)
-            try:
-                code = process.wait(timeout=seconds)
-            except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
-                os.killpg(process.pid, signal.SIGKILL)
-                code = process.wait(timeout=5)
-                if isinstance(error, KeyboardInterrupt):
-                    raise
-                timed_out = True
-        return code, timed_out, time.monotonic() - started
 
     def run(self, shard, output):
         started = time.monotonic()
@@ -190,27 +138,28 @@ class Bundle:
         output.mkdir(parents=True, exist_ok=False)
         results = []
         for index, test in enumerate(tests):
-            remaining = SHARD_SECONDS - (time.monotonic() - started)
+            remaining = self.shard_seconds - (time.monotonic() - started)
             log = output / f"{index:03}.log"
             if remaining <= 0:
                 results.append(dict(test, success=False, timed_out=True, reason="shard budget exhausted"))
                 continue
             command = [str(self.directory / test["binary"]), "--exact", test["test"],
-                       "--nocapture", "--test-threads=1"]
-            code, timed_out, seconds = self.execute(command, log, min(TEST_SECONDS, remaining), self.environment())
+                       "--nocapture", "--test-threads=1",
+                       *(["--include-ignored"] if self.include_ignored else [])]
+            code, timed_out, seconds = self.execute(command, log, min(self.test_seconds, remaining), self.environment())
             text = log.read_text()
             passed = re.findall(r"^test ([\w:]+) \.\.\. ok$", text, re.MULTILINE)
             # Rust can print captured tracing between the test name and its verdict.
             summary = "test result: ok. 1 passed; 0 failed; 0 ignored;" in text
-            success = (code == 0 and not timed_out and seconds <= TEST_SECONDS
-                       and summary and (passed == [test["test"]] or not passed))
+            success = (code == 0 and not timed_out and seconds <= self.test_seconds
+                       and summary and (passed == [test["test"]] or not passed) and "SKIP:" not in text)
             results.append(dict(test, success=success, exit_code=code, timed_out=timed_out,
                                 seconds=round(seconds, 3), log=str(log)))
             print(f"shard {shard}: {test['suite']}::{test['test']}: {'PASS' if success else 'FAIL'} ({seconds:.3f}s)", flush=True)
         elapsed = time.monotonic() - started
         report = {"revision": manifest["revision"], "shard": shard, "seconds": round(elapsed, 3),
-                  "test_seconds": TEST_SECONDS, "shard_seconds": SHARD_SECONDS, "tests": results,
-                  "success": all(test["success"] for test in results) and elapsed <= SHARD_SECONDS}
+                  "test_seconds": self.test_seconds, "shard_seconds": self.shard_seconds, "tests": results,
+                  "success": all(test["success"] for test in results) and elapsed <= self.shard_seconds}
         (output / "results.json").write_text(json.dumps(report, indent=2) + "\n")
         return report["success"]
 

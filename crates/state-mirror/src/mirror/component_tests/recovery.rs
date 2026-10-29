@@ -127,3 +127,27 @@ async fn a_transient_head_read_timeout_does_not_end_the_recovery_wait() {
     fixture.head(0, 20).await;
     assert!(started.elapsed() >= std::time::Duration::from_millis(200));
 }
+
+#[tokio::test]
+#[ignore = "requires one disposable Redis container"]
+async fn a_transient_acl_read_timeout_does_not_end_the_fault_observation() {
+    let mut fixture = Fixture::new().await;
+    fixture.permit_prefix(0).await;
+    let actor = fixture.start(0, true).await;
+    actor.send(&Fixture::batch(0, 1, 20));
+    fixture.denied().await;
+    actor.stop().await.unwrap_err();
+    redis::cmd("CLIENT")
+        .arg("PAUSE")
+        .arg(400)
+        .arg("ALL")
+        .query_async::<()>(&mut fixture.admin)
+        .await
+        .unwrap();
+    fixture
+        .admin
+        .set_response_timeout(std::time::Duration::from_millis(50));
+    let started = tokio::time::Instant::now();
+    fixture.denied().await;
+    assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+}

@@ -26,7 +26,7 @@ impl Fixture {
             self.cache.account(Fixture::row(1).address).await.is_err(),
             "the cache output must actually fail before promotion"
         );
-        Fixture::role(&self.replica, "master").await;
+        self.role(&self.replica, "master").await;
         let mut promoted = Fixture::raw(&self.replica, 6379).await;
         redis::cmd("SCRIPT")
             .arg("FLUSH")
@@ -58,7 +58,7 @@ impl Fixture {
         );
 
         self.restore(fault).await;
-        Fixture::role(&self.primary, "slave").await;
+        self.role(&self.primary, "slave").await;
         self.write(2, 20).await;
         self.assert_row(3, 30).await;
     }

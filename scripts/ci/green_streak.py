@@ -10,6 +10,8 @@ import subprocess
 import time
 
 from component_tests import SHARDS as COMPONENT_SHARDS
+from semantics_tests import SHARDS as SEMANTICS_SHARDS
+from dependency_tests import SHARDS as DEPENDENCY_SHARDS
 
 
 WORKFLOWS = {
@@ -54,14 +56,19 @@ class Streak:
     def __init__(self, head, branch, shards, state=None):
         self.shards = set(shards)
         self.state = state or {
-            "version": 3, "head": head, "branch": branch,
+            "version": 5, "head": head, "branch": branch,
             "required": REQUIRED, "streak": 0, "rounds": [],
             "job_budget_seconds": JOB_BUDGET_SECONDS,
             "component_job_seconds": COMPONENT_JOB_SECONDS,
+            "semantics_shards": SEMANTICS_SHARDS,
+            "dependency_shards": DEPENDENCY_SHARDS,
         }
         if (self.state.get("job_budget_seconds") != JOB_BUDGET_SECONDS
                 or self.state.get("component_job_seconds") != COMPONENT_JOB_SECONDS):
             raise ValueError("timing policy changed; retain the old audit and start a new state file")
+        if (self.state.get("semantics_shards") != SEMANTICS_SHARDS
+                or self.state.get("dependency_shards") != DEPENDENCY_SHARDS):
+            raise ValueError("coverage policy changed; retain the old audit and start a new state file")
         if self.state["head"] != head or self.state["branch"] != branch:
             raise ValueError("head or branch changed; retain this audit and start a new state file")
 
@@ -129,7 +136,14 @@ class Streak:
         ci = next(run for run in runs if Path(run["path"]).name == "ci.yml")
         components = {f"in-process recovery ({shard})" for shard in range(COMPONENT_SHARDS)}
         completed = {job["name"] for job in ci["jobs"] if job["conclusion"] == "success"}
-        return sorted((expected - green) | (components - completed))
+        semantics = next(run for run in runs if Path(run["path"]).name == "chain-semantics-e2e.yml")
+        semantics_expected = {f"chain-semantics-e2e ({shard})" for shard in range(SEMANTICS_SHARDS)}
+        semantics_green = {job["name"] for job in semantics["jobs"] if job["conclusion"] == "success"}
+        dependencies = next(run for run in runs if Path(run["path"]).name == "docker-e2e.yml")
+        dependency_expected = {f"dependency recovery ({shard})" for shard in range(DEPENDENCY_SHARDS)}
+        dependency_green = {job["name"] for job in dependencies["jobs"] if job["conclusion"] == "success"}
+        return sorted((expected - green) | (components - completed) | (semantics_expected - semantics_green)
+                      | (dependency_expected - dependency_green))
 
     def record(self, runs):
         status = self.classify(runs)

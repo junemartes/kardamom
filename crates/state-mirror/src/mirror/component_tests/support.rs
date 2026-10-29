@@ -241,18 +241,23 @@ impl Fixture {
     }
 
     async fn wait_for_denial(&mut self) {
-        while self.denials().await == 0 {
+        while !self.observed_denial().await {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
-    async fn denials(&mut self) -> usize {
-        let entries: Vec<redis::Value> = redis::cmd("ACL")
+    async fn observed_denial(&mut self) -> bool {
+        let entries = redis::cmd("ACL")
             .arg("LOG")
-            .query_async(&mut self.admin)
-            .await
-            .unwrap();
-        entries.len()
+            .query_async::<Vec<redis::Value>>(&mut self.admin)
+            .await;
+        match entries {
+            Ok(entries) => !entries.is_empty(),
+            Err(error) => {
+                eprintln!("ACL observation failed within the recovery budget: {error}");
+                false
+            }
+        }
     }
 
     pub(super) async fn start(&self, id: u32, force: bool) -> Actor {
