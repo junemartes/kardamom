@@ -1,4 +1,5 @@
 use super::*;
+use crate::cases::carry::Step;
 
 #[test]
 fn replacement_traffic_covers_provisioning_and_the_recovered_fleet() {
@@ -8,6 +9,18 @@ fn replacement_traffic_covers_provisioning_and_the_recovered_fleet() {
     for case in [Case::NodeReplaceExecutor, Case::NodeReplaceSealer] {
         assert!(case.window(&knobs) > recovered, "{}", case.name());
     }
+}
+
+#[test]
+fn carry_traffic_covers_each_full_deployment_and_recovery() {
+    let knobs = Knobs::read(&[]).unwrap();
+    let deployment = Duration::from_secs(43 * 60 + 9);
+    let observed = knobs.inject_delay + deployment + knobs.restart_slo;
+    for step in [Step::ReadersOnEgress, Step::ExecutorFirst] {
+        assert!(Case::Carry(step).window(&knobs) > observed);
+    }
+    let two_deployments = knobs.inject_delay + deployment * 2 + knobs.restart_slo;
+    assert!(Case::Carry(Step::ExecutorsRest).window(&knobs) > two_deployments);
 }
 
 #[test]

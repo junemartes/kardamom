@@ -2389,6 +2389,87 @@
       "full_case_locally_validated": false
     },
     {
+      "case": "carry-versions-on",
+      "family": "Carry",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sealer-raft",
+          "test": "io.kardamom.sealer.cluster.SealerCarryClusterTest::every_member_orders_each_full_reference_once_with_its_bytes()"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-held-offer-after-downgrade",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-readers-on-egress",
+      "family": "Carry",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "egress-owner",
+          "test": "the_run_ends_when_every_sender_is_gone"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-window-on",
+      "family": "Carry",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sealer-actor",
+          "test": "io.kardamom.sealer.cluster.SealerCarryWindowTest::version_five_keeps_only_the_window_at_any_posted_head()"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-executor-first",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-executors-rest",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-window-off-on",
+      "family": "Carry",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sealer-actor",
+          "test": "io.kardamom.sealer.cluster.SealerCarryActivationTest::a_member_restored_at_any_entry_ends_with_the_bytes_of_its_peer()"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-leader-kill-at-switch",
+      "family": "Carry",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "lost_offer_on_session_restart_replays_the_exact_prefix_before_its_suffix"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
       "case": "carry-egress-restart",
       "family": "Carry",
       "status": "partial",
@@ -2611,104 +2692,6 @@
       "status": "planned",
       "local_tests": [],
       "full_case_locally_validated": false
-    },
-    {
-      "case": "carry-deposits-provider-fault",
-      "family": "Carry",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
-    }
-  ],
-  "retired_cases": [
-    {
-      "case": "carry-versions-on",
-      "family": "Carry",
-      "status": "partial",
-      "local_tests": [
-        {
-          "suite": "sealer-raft",
-          "test": "io.kardamom.sealer.cluster.SealerCarryClusterTest::every_member_orders_each_full_reference_once_with_its_bytes()"
-        }
-      ],
-      "full_case_locally_validated": false,
-      "retirement_reason": "Live feature activation, downgrade and executor rollout are deprecated; recovery runs on the final enabled configuration."
-    },
-    {
-      "case": "carry-held-offer-after-downgrade",
-      "family": "Carry",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false,
-      "retirement_reason": "Live feature activation, downgrade and executor rollout are deprecated; recovery runs on the final enabled configuration."
-    },
-    {
-      "case": "carry-readers-on-egress",
-      "family": "Carry",
-      "status": "partial",
-      "local_tests": [
-        {
-          "suite": "egress-owner",
-          "test": "the_run_ends_when_every_sender_is_gone"
-        }
-      ],
-      "full_case_locally_validated": false,
-      "retirement_reason": "Live feature activation, downgrade and executor rollout are deprecated; recovery runs on the final enabled configuration."
-    },
-    {
-      "case": "carry-window-on",
-      "family": "Carry",
-      "status": "partial",
-      "local_tests": [
-        {
-          "suite": "sealer-actor",
-          "test": "io.kardamom.sealer.cluster.SealerCarryWindowTest::version_five_keeps_only_the_window_at_any_posted_head()"
-        }
-      ],
-      "full_case_locally_validated": false,
-      "retirement_reason": "Live feature activation, downgrade and executor rollout are deprecated; recovery runs on the final enabled configuration."
-    },
-    {
-      "case": "carry-executor-first",
-      "family": "Carry",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false,
-      "retirement_reason": "Live feature activation, downgrade and executor rollout are deprecated; recovery runs on the final enabled configuration."
-    },
-    {
-      "case": "carry-executors-rest",
-      "family": "Carry",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false,
-      "retirement_reason": "Live feature activation, downgrade and executor rollout are deprecated; recovery runs on the final enabled configuration."
-    },
-    {
-      "case": "carry-window-off-on",
-      "family": "Carry",
-      "status": "partial",
-      "local_tests": [
-        {
-          "suite": "sealer-actor",
-          "test": "io.kardamom.sealer.cluster.SealerCarryActivationTest::a_member_restored_at_any_entry_ends_with_the_bytes_of_its_peer()"
-        }
-      ],
-      "full_case_locally_validated": false,
-      "retirement_reason": "Live feature activation, downgrade and executor rollout are deprecated; recovery runs on the final enabled configuration."
-    },
-    {
-      "case": "carry-leader-kill-at-switch",
-      "family": "Carry",
-      "status": "partial",
-      "local_tests": [
-        {
-          "suite": "sequencer",
-          "test": "lost_offer_on_session_restart_replays_the_exact_prefix_before_its_suffix"
-        }
-      ],
-      "full_case_locally_validated": false,
-      "retirement_reason": "Live feature activation, downgrade and executor rollout are deprecated; recovery runs on the final enabled configuration."
     }
   ]
 }

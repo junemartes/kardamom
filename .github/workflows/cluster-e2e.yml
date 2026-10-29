@@ -196,15 +196,15 @@ jobs:
     runs-on: ubuntu-24.04
     # Recovery includes the persisted-state proof and teardown.
     # The measured timing audit rejects jobs above the 15-minute target.
-    timeout-minutes: ${{ matrix.shard == 'chaos-executor' && 180 || 120 }}
+    timeout-minutes: ${{ matrix.shard == 'chaos-carry' && 300 || matrix.shard == 'chaos-executor' && 180 || 120 }}
     strategy:
       # Don't cancel the other shards if one fails — we want every shard's
       # result on a single run.
       fail-fast: false
       matrix:
-        # Every regular shard starts with carry enabled. The load shard
-        # soaks for five minutes. Recovery shards inject faults into that
-        # same configuration and prove the recovered persisted state.
+        # Most recovery shards start with carry enabled. The carry shard
+        # tests live activation from reference mode and mixed executors.
+        # Load tests both configurations; integrity keeps reference recovery.
         # chaos-fleet takes every replica of one role down at once: the sealer
         # quorum, the whole sealer set, the whole executor set, with and
         # without their state databases, and the whole redis job.

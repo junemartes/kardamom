@@ -172,15 +172,15 @@ impl Deposits {
         Ok(())
     }
 
-    fn report(&self, result: &anyhow::Result<()>) -> anyhow::Result<()> {
+    fn report(&self, context: &str, result: &anyhow::Result<()>) -> anyhow::Result<()> {
         let report = serde_json::json!({
-            "case": CTX, "recipient": RECIPIENT,
+            "case": context, "recipient": RECIPIENT,
             "initial": format!("{:?}", self.initial), "credit": self.total.to_string(),
             "deposits": self.records,
             "failure": result.as_ref().err().map(|error| format!("{error:#}")),
         });
         std::fs::write(
-            "/tmp/chaos-carry-deposits-provider-fault.json",
+            format!("/tmp/chaos-{context}-deposits.json"),
             serde_json::to_vec_pretty(&report)?,
         )?;
         Ok(())
@@ -199,11 +199,14 @@ impl Record {
     }
 }
 
-pub(super) async fn across_provider_fault(h: &mut Harness) -> anyhow::Result<()> {
+pub(super) async fn across_provider_fault(
+    h: &mut Harness,
+    context: &'static str,
+) -> anyhow::Result<()> {
     let l1 = L1::new(h).await?;
     let mut deposits = Deposits::new(h).await?;
     let result = deposits.phases(h, &l1).await;
-    let report = deposits.report(&result);
+    let report = deposits.report(context, &result);
     result?;
     report
 }
