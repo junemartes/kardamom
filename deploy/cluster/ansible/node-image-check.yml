@@ -20,6 +20,14 @@
       ansible.builtin.command: docker --version
       changed_when: false
 
+    - name: Check the registry's Python Docker client
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_facts.python.executable }}"
+          - -c
+          - import docker
+      changed_when: false
+
     - name: Read the installed Consul version
       ansible.builtin.command: consul version
       register: node_image_consul
