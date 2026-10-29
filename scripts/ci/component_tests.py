@@ -81,6 +81,14 @@ class Bundle:
                 libraries[name] = digest
         return libraries
 
+    @staticmethod
+    def build_messages(log):
+        messages = [json.loads(line) for line in log.read_text().splitlines()]
+        finished = [item for item in messages if item["reason"] == "build-finished"]
+        if len(finished) != 1 or not finished[0]["success"]:
+            raise ValueError("artifact packaging requires one successful completed Cargo build")
+        return messages
+
     def prepare(self, artifacts_file=None):
         suites = self.selection(json.loads(CATALOG.read_text()))
         if not suites:
@@ -93,8 +101,7 @@ class Bundle:
         else:
             shutil.copyfile(artifacts_file, log)
         artifacts, paths = {}, []
-        for line in log.read_text().splitlines():
-            item = json.loads(line)
+        for item in self.build_messages(log):
             if item["reason"] == "build-script-executed":
                 paths.extend(path.removeprefix("native=") for path in item["linked_paths"])
             if item["reason"] == "compiler-artifact" and item["profile"]["test"] and item.get("executable"):
@@ -176,7 +183,8 @@ class Bundle:
             passed = re.findall(r"^test ([\w:]+) \.\.\. ok$", text, re.MULTILINE)
             # Rust can print captured tracing between the test name and its verdict.
             summary = "test result: ok. 1 passed; 0 failed; 0 ignored;" in text
-            success = code == 0 and not timed_out and summary and (passed == [test["test"]] or not passed)
+            success = (code == 0 and not timed_out and seconds <= TEST_SECONDS
+                       and summary and (passed == [test["test"]] or not passed))
             results.append(dict(test, success=success, exit_code=code, timed_out=timed_out,
                                 seconds=round(seconds, 3), log=str(log)))
             print(f"shard {shard}: {test['suite']}::{test['test']}: {'PASS' if success else 'FAIL'} ({seconds:.3f}s)", flush=True)

@@ -19,6 +19,17 @@ class ComponentTests(unittest.TestCase):
             with self.subTest(names=names), self.assertRaises(ValueError):
                 component.Bundle.resolve("recovery", names)
 
+    def test_incomplete_or_failed_builds_cannot_supply_test_binaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "build.jsonl"
+            for messages in [[], [{"reason": "build-finished", "success": False}],
+                             [{"reason": "build-finished", "success": True}] * 2]:
+                log.write_text("\n".join(json.dumps(item) for item in messages))
+                with self.subTest(messages=messages), self.assertRaises(ValueError):
+                    component.Bundle.build_messages(log)
+            log.write_text(json.dumps({"reason": "build-finished", "success": True}))
+            self.assertEqual(len(component.Bundle.build_messages(log)), 1)
+
     def test_catalog_builds_one_graph_without_docker_features(self):
         suites = component.Bundle.selection(json.loads(component.CATALOG.read_text()))
         command = component.Bundle.build_command(suites)
@@ -62,6 +73,13 @@ class ComponentTests(unittest.TestCase):
         self.assertFalse(success)
         self.assertTrue(report["tests"][0]["timed_out"])
         self.assertLess(report["seconds"], 2)
+
+    def test_a_late_success_cannot_pass_the_test_budget(self):
+        def late_success(command, log, seconds, environment):
+            log.write_text("test recovers ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n")
+            return 0, False, component.TEST_SECONDS + 0.01
+        with patch.object(component.Bundle, "execute", side_effect=late_success):
+            self.assertFalse(self.fixture("pass\n")[0])
 
     def test_shard_deadline_bounds_a_test_with_remaining_budget(self):
         success, report = self.fixture("import time\ntime.sleep(20)\n", SHARD_SECONDS=0.05)
