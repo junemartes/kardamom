@@ -49,7 +49,8 @@
           "exit_code": 101,
           "failed_as_expected": true
         }
-      }
+      },
+      "ci_mode": "in-process"
     },
     "executor-commit": {
       "command": [
@@ -82,7 +83,8 @@
         "commit_thread_exits_after_the_total_budget_without_a_subscriber",
         "the_rollback_goes_out_before_the_first_receipt"
       ],
-      "limitation": "These existing actor tests do not prove disk durability or process/node recovery. Their blocking joins are bounded by the runner process timeout."
+      "limitation": "These existing actor tests do not prove disk durability or process/node recovery. Their blocking joins are bounded by the runner process timeout.",
+      "ci_mode": "in-process"
     },
     "executor-pipeline": {
       "command": [
@@ -109,7 +111,8 @@
         "exec_pipelines_k_deep_and_blocks_only_at_capacity",
         "exec_settles_inflight_commits_while_idle"
       ],
-      "limitation": "These existing actor tests do not prove disk durability or process/node recovery. Their blocking joins are bounded by the runner process timeout."
+      "limitation": "These existing actor tests do not prove disk durability or process/node recovery. Their blocking joins are bounded by the runner process timeout.",
+      "ci_mode": "in-process"
     },
     "ingress-accounts": {
       "command": [
@@ -147,7 +150,8 @@
         "the_account_rpcs_serve_the_local_layer_and_only_the_head",
         "a_receipt_hash_helper_is_the_keccak_of_the_raw_bytes"
       ],
-      "limitation": "Redis is off; this does not prove Redis Lua atomicity or partial-cache coverage."
+      "limitation": "Redis is off; this does not prove Redis Lua atomicity or partial-cache coverage.",
+      "ci_mode": "in-process"
     },
     "ingress-receipts": {
       "command": [
@@ -174,7 +178,8 @@
         "a_failed_egress_falls_back_to_the_executor",
         "with_no_egress_the_executor_answers_alone"
       ],
-      "limitation": "These endpoint stubs do not run the egress store or executor state database."
+      "limitation": "These endpoint stubs do not run the egress store or executor state database.",
+      "ci_mode": "in-process"
     },
     "ingress-da-halt": {
       "command": [
@@ -198,7 +203,8 @@
       "tests": [
         "the_tags_follow_the_posted_head_and_a_halt_refuses_submits"
       ],
-      "limitation": "Cluster status is controlled; actual sealer posting budget and L1 posting remain unproven here."
+      "limitation": "Cluster status is controlled; actual sealer posting budget and L1 posting remain unproven here.",
+      "ci_mode": "in-process"
     },
     "egress-owner": {
       "command": [
@@ -259,7 +265,8 @@
           "assertion_failed": true,
           "seconds": 1.918
         }
-      ]
+      ],
+      "ci_mode": "in-process"
     },
     "egress-catchup": {
       "command": [
@@ -287,7 +294,8 @@
         "no_peer_makes_no_task",
         "the_mark_of_a_peer_reads_from_its_headers_and_defaults_to_none"
       ],
-      "limitation": "Validates exact peer history and resumed live input plus unreachable-peer fallback; does not establish crash durability or all-peer divergence handling."
+      "limitation": "Validates exact peer history and resumed live input plus unreachable-peer fallback; does not establish crash durability or all-peer divergence handling.",
+      "ci_mode": "in-process"
     },
     "batcher-recovery": {
       "command": [
@@ -316,7 +324,8 @@
         "an_exhausted_restored_post_keeps_its_spool_and_does_not_absorb_live_blocks",
         "an_empty_spool_keeps_the_live_group_together"
       ],
-      "limitation": "Does not run L1 contracts, consensus retention or a successful DA service."
+      "limitation": "Does not run L1 contracts, consensus retention or a successful DA service.",
+      "ci_mode": "in-process"
     },
     "l1-source-quorum": {
       "command": [
@@ -361,7 +370,8 @@
           "assertion_failed": true,
           "seconds": 2.525
         }
-      ]
+      ],
+      "ci_mode": "in-process"
     },
     "l1-provider-http": {
       "command": [
@@ -410,7 +420,8 @@
           "assertion_failed": true,
           "seconds": 3.439
         }
-      ]
+      ],
+      "ci_mode": "in-process"
     },
     "l1-watcher-recovery": {
       "command": [
@@ -445,7 +456,8 @@
         "a_silent_sealer_at_start_falls_back_to_the_file",
         "the_boundary_feed_sends_each_new_origin"
       ],
-      "limitation": "Process reconstruction is in-process; no OS crash or real Raft commit is simulated."
+      "limitation": "Process reconstruction is in-process; no OS crash or real Raft commit is simulated.",
+      "ci_mode": "in-process"
     },
     "l1-watcher-pause": {
       "command": [
@@ -469,7 +481,8 @@
       "tests": [
         "a_watcher_without_its_record_pauses_on_the_follower_and_resumes"
       ],
-      "limitation": "Validates pause/resume for missing archived records, not transport deployment."
+      "limitation": "Validates pause/resume for missing archived records, not transport deployment.",
+      "ci_mode": "in-process"
     },
     "state-mirror": {
       "command": [
@@ -1243,7 +1256,8 @@
           "intended_failure": true,
           "log": "/tmp/post-age-regressing_seed-negative-20261028.log"
         }
-      ]
+      ],
+      "ci_mode": "in-process"
     },
     "chaos-cache-backlog": {
       "command": [

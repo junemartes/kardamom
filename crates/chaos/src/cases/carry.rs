@@ -27,7 +27,8 @@
 //!    audit after it compares the carry executor with the executors in
 //!    reference mode.
 //! 6. `carry-executors-rest`: executors 1 and 2 move, one at a time. Then
-//!    the smoke gate runs.
+//!    the smoke gate runs, and three credits cross a provider outage
+//!    with every executor in carry mode.
 //! 7. `carry-window-off-on`: feature 5 turns off and on again.
 //! 8. `carry-leader-kill-at-switch`: feature 5 turns off, then on, and the
 //!    leader dies within 2 s after it switches.
@@ -121,7 +122,10 @@ impl Step {
             Self::HeldOfferAfterDowngrade | Self::WindowOffOn => inject + two_upgrades,
             Self::WindowOn => inject + k.restart_slo + upgrade::Upgrade::LOAD_WINDOW,
             // One staged executor roll for each move.
-            Self::ExecutorsRest => inject + super::window::FULL_DEPLOY_LOAD.saturating_mul(2),
+            Self::ExecutorsRest => inject
+                .saturating_add(super::window::FULL_DEPLOY_LOAD.saturating_mul(2))
+                .saturating_add(Duration::from_mins(20))
+                .saturating_add(k.l1_fault),
             Self::LeaderKillAtSwitch => inject + k.leader_slo + k.restart_slo + two_upgrades,
             Self::EgressRestart => inject + k.restart_slo + Duration::from_mins(2),
         }

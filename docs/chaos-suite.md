@@ -47,13 +47,29 @@ Every chaos case follows the same steps.
 7. Run the recovery probe.
 8. Run the validator verdict.
 
+## In-process recovery on PRs
+
+The CI workspace build packages the test executables and native libraries for the catalog's `ci_mode: in-process` groups. Four jobs consume that shared artifact. Each exact test has a 60-second process deadline. A shard has a 240-second execution deadline, within a five-minute CI job. The test jobs install no Rust toolchain and compile nothing. Missing tests, skipped tests, timeouts and mismatched artifact hashes fail the run.
+
+Run the same partition locally from the repository root:
+
+```sh
+work=$(mktemp -d)
+python3 scripts/ci/component_tests.py prepare --bundle "$work/bundle"
+python3 scripts/ci/component_tests.py run-all --bundle "$work/bundle" --output "$work/results"
+```
+
+To reuse a workspace build, pass its Cargo JSON file with `prepare --artifacts PATH`. `run --shard 0` executes one partition. Each results directory holds exact test names, durations, logs and a JSON verdict. Compilation and artifact transfer are separate from the measured test duration.
+
+The initial inventory includes 103 Rust tests across 14 recovery groups. It does not establish full chaos-case equivalence: 39 active distributed cases have no listed local test and 41 have partial evidence. Java sealer tests and real dependency checks remain separate. Distributed chaos still runs on PRs. Moving it to main only requires closing or explicitly resolving those gaps. The ten-round qualification audit continues to require all distributed shards and all four in-process jobs on the same final SHA.
+
 ## Shards
 
-There are fifteen shards. `just container-test` lists their names. Fourteen run on every pull request. `chaos-integrity` runs nightly.
+There are sixteen distributed shards. `just container-test` lists their names. Fifteen run on every pull request. `chaos-integrity` runs nightly. A manual run with `suite=all` includes all sixteen.
 
 ### Carry-born shards
 
-Every regular chaos shard brings up a carry-born cluster. `Shard::deploy_vars` sets `DeployVars::genesis_carry`, and the bring-up passes `KARDAMOM_GENESIS_CARRY=on` to the deploy. On such a cluster:
+The regular chaos shards other than `chaos-carry` bring up a carry-born cluster. `Shard::deploy_vars` sets `DeployVars::genesis_carry`, and the bring-up passes `KARDAMOM_GENESIS_CARRY=on` to the deploy. On such a cluster:
 
 - The chain starts with features 3, 4 and 5 active at genesis. Every member runs decision version 5 with the exact window from block 1. No upgrade transaction runs.
 - The deploy turns on every switch of the carry window: the member feed, the executors on the sealer nodes in carry mode, the frames of the executors and the egress, the batcher and the validator on the egress, the v2 loop of the sequencers, and the version floor 5.
@@ -72,20 +88,20 @@ The knobs of a shard follow its deploy variables (see [Environment knobs](#envir
 
 | Shard | Cases, in run order | Shard settings |
 |---|---|---|
-| `load` | Sustained load: transfers, then the DeFi mix | `LOAD_DURATION_S=300`, `LOAD_TARGET_TPS=300`, `LOAD_SENDERS=6` |
-| `semantics` | The chain-semantics suite (`SEMANTICS_CASES`) | `RUN_LOAD=0` |
+| `load` | Sustained load: transfers, then the DeFi mix on two fresh deployments, reference then carry | `LOAD_DURATION_S=300`, `LOAD_TARGET_TPS=300`, `LOAD_SENDERS=6` |
+| `semantics` | The chain-semantics suite (`SEMANTICS_CASES`) | reference-born, `RUN_LOAD=0` |
 | `chaos-executor` | `graceful-executor`, `hard-executor`, `node-failure-executor`, `node-replace-executor`, `state-checkpoint-restore`, `checkpoint-corrupt-recover`, `checkpoint-disk-full`, `replay-window-resync`, `deploy-broken-image` | carry-born, `RUN_LOAD=0`, the block log of the checkpoints on (`KARDAMOM_CHECKPOINT_LOG=on`) |
 | `chaos-ingress` | `graceful-ingress`, `hard-ingress`, `archive-driver-loss`, `archive-tx-data-wipe`, `archive-corruption` | carry-born, `RUN_LOAD=0` |
 | `chaos-sequencer` | `graceful-sequencer`, `hard-sequencer`, `sequencer-replica-kill`, `sequencer-lapse`, `validator-lapse`, `validator-join`, `lookup-blackout` | carry-born, `RUN_LOAD=0` |
-| `chaos-cluster` | `cluster-leader-kill`, `raft-leader-one-way-partition`, `raft-leader-packet-loss`, `cluster-follower-kill`, `cluster-member-rejoin`, `cluster-two-blank-recover`, `node-replace-sealer`, `cpu-squeeze` | carry-born, `RUN_LOAD=0`, sealer snapshot interval 60 s (`KARDAMOM_CLUSTER_SNAPSHOT_S=60`), `SQUEEZE_CYCLES=3`, `SQUEEZE_S=60`, `SQUEEZE_CPUS_PER_NODE=0.4` |
+| `chaos-cluster` | `cluster-leader-kill`, `raft-leader-one-way-partition`, `raft-leader-packet-loss`, `raft-leader-packet-delay`, `cluster-follower-kill`, `cluster-member-rejoin`, `cluster-two-blank-recover`, `node-replace-sealer`, `cpu-squeeze` | carry-born, `RUN_LOAD=0`, sealer snapshot interval 60 s (`KARDAMOM_CLUSTER_SNAPSHOT_S=60`), `SQUEEZE_CYCLES=3`, `SQUEEZE_S=60`, `SQUEEZE_CPUS_PER_NODE=0.4` |
 | `chaos-fleet` | `executor-fleet-loss-recover`, `executor-fleet-wipe-recover`, `executor-fleet-total-wipe-recover`, `redis-total-loss-recover`, `cluster-quorum-loss-recover`, `cluster-total-loss-recover` | carry-born, `RUN_LOAD=0` |
-| `chaos-coordinated` | `ingress-pair-loss-recover`, `sequencer-lane-loss-recover`, `pipeline-blackout-recover` | carry-born, `RUN_LOAD=0` |
+| `chaos-coordinated` | `ingress-pair-loss-recover`, `sequencer-lane-loss-recover`, `control-plane-loss-recover`, `pipeline-blackout-recover` | carry-born, `RUN_LOAD=0` |
 | `chaos-combined-ordering` | `ingress-sequencer-loss-recover`, `ingress-sealer-loss-recover`, `sequencer-sealer-loss-recover`, `ingress-sequencer-sealer-loss-recover`, `ingress-sequencer-sealer-reverse` | carry-born, `RUN_LOAD=0` |
-| `chaos-combined-exec` | `executor-sealer-loss-recover`, `executor-sealer-validator-recover`, `ingress-executor-loss-recover`, `read-path-loss-recover` | carry-born, `RUN_LOAD=0` |
+| `chaos-combined-exec` | `executor-sealer-loss-recover`, `executor-sealer-validator-recover`, `ingress-executor-loss-recover`, `read-path-loss-recover`, `sequencer-executor-redis-loss` | carry-born, `RUN_LOAD=0` |
 | `chaos-retention` | `retention-overrun`, `retention-overrun-validator`, `prune-floor`, `da-lag-halt`, `canary-da-lag` | Two sequential fresh carry chains in one job. Both use `RUN_LOAD=0`, retention 6144 frames, snapshots every 60 s, canary funding and checkpoint block logs. The first three cases keep the normal DA guard. The last two start with an eight-block guard. |
-| `chaos-cache` | `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze`, `mirror-kill-rebuild` | carry-born, `RUN_LOAD=0`, the block log of the checkpoints on |
+| `chaos-cache` | `mirror-backlog-client-restart`, `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze`, `mirror-kill-rebuild` | carry-born, `RUN_LOAD=0`, the block log of the checkpoints on |
 | `chaos-l1` | `l1-liar`, `l1-null-receipts`, `two-day-outage`, `batcher-outage-past-retention` | carry-born, `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
-| `chaos-follower` | `follower-instance-loss`, `follower-total-loss`, `follower-disagreement` | carry-born, `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
+| `chaos-follower` | `l1-transport-refusals`, `follower-instance-loss`, `follower-total-loss`, `follower-disagreement` | carry-born, `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
 | `chaos-carry` | `carry-versions-on`, `carry-held-offer-after-downgrade`, `carry-readers-on-egress`, `carry-window-on`, `carry-executor-first`, `carry-executors-rest`, `carry-window-off-on`, `carry-leader-kill-at-switch`, `carry-egress-restart` | reference-born, `RUN_LOAD=0`, retention 16384, snapshot interval 60 s, the member feed and the executors on the sealer nodes (`KARDAMOM_EXEC_ON_SEALERS=on`), the frames of the executors and the egress, the v2 loop of the sequencers (`KARDAMOM_SEQUENCER_ADMISSION=on`) |
 | `chaos-integrity` (nightly) | `executor-restart-storm`, `sealer-fleet-total-wipe-recover`, `resize-scale-out-in` | reference-born, `RUN_LOAD=0` |
 
@@ -238,6 +254,8 @@ The executors are dark in every case, so the head the judgement reads is the hig
 
 **Carry shard**
 
+The live rollout and mixed-mode state checks remain required while the release supports these transitions. The removal plan in [#837](https://github.com/junemartes/kardamom/issues/837) places their retirement after the carry-only production and deployment changes. Starting a chain with the final configuration does not prove safe activation or downgrade.
+
 The cases turn the carry window on in the order of the staging rollout, then make faults around its switch. See [Carry mode](failure-modes.md#carry-mode-the-executor-next-to-its-member) and [L1-governed upgrades](failure-modes.md#l1-governed-upgrades-feature-flags). Each upgrade transaction goes to the lockbox from the dev owner, after `just sealer-upgrade-check` passes for it. The harness then mines 66 L1 blocks, so the L1 follower reads the transaction as final.
 
 - `carry-versions-on`: deploys a lockbox with `kardamom-deploy`, and deploys again with `LOCKBOX_ADDRESS`. Then features 3 and 4. Every member must report decision version 5, and every sequencer replica must keep it.
@@ -245,7 +263,7 @@ The cases turn the carry window on in the order of the staging rollout, then mak
 - `carry-readers-on-egress`: waits until the batcher and the validator are past the block of R, the highest stored reference of the egress. Then it deploys them on the egress, with the sequencer version floor 5. Their egress cursors must pass R, and R must not move.
 - `carry-window-on`: stops a follower, sends feature 5, and starts the follower after the two other members switch. Every member must then report `carryWindow`, the feature state 2, the window gauge 1 and at most `retention` frames. No member may refuse a reference.
 - `carry-executor-first`: moves executor 0 to carry mode (`KARDAMOM_CARRY_EXECUTORS=0`). It must log that it reads the member feed, the feed of member 0 must serve it live, and the chain must advance.
-- `carry-executors-rest`: moves executor 1, then executor 2, in the same way, one deploy each. Then the smoke gate.
+- `carry-executors-rest`: moves executor 1, then executor 2, in the same way, one deploy each. Then the smoke gate and three distinct deposits across an all-provider outage. Receipts preserve source identity and order, every executor receives the exact credit, and the recipient nonce stays unchanged. The provider-fault checks also run during `carry-versions-on` in reference execution. Each case writes its own deposit evidence file.
 - `carry-window-off-on`: turns feature 5 off and on again. Each state must hold on every member.
 - `carry-leader-kill-at-switch`: turns feature 5 off, then on, and kills the leader within 2 s after it reports the switch. The first read of the leader must report the window off, so the switch came less than one 100 ms poll before the read that saw it. The cluster must elect, every member must keep the window, and the chain must advance.
 - `carry-egress-restart`: kills one egress instance. It must return with the same R, and the egress cursors of the batcher and the validator must move on.

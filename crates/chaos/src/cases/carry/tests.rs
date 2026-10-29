@@ -32,6 +32,12 @@ fn every_load_window_covers_its_step() {
         );
     }
     assert!(Step::VersionsOn.floor(&k) >= Duration::from_mins(10));
+    assert!(
+        Step::ExecutorsRest.floor(&k)
+            >= super::super::window::FULL_DEPLOY_LOAD.saturating_mul(2)
+                + Duration::from_mins(20)
+                + k.l1_fault
+    );
 }
 
 #[test]
@@ -79,4 +85,24 @@ fn every_step_gets_a_funded_account() {
             .take(Case::Carry(*s).pin(), s.name(), |_| false)
             .unwrap();
     }
+}
+
+#[test]
+fn supported_live_transitions_keep_their_cases_and_mixed_executor_state_audit() {
+    let shard = crate::Shard::Carry;
+    for name in [
+        "carry-versions-on",
+        "carry-held-offer-after-downgrade",
+        "carry-readers-on-egress",
+        "carry-window-on",
+        "carry-executor-first",
+        "carry-executors-rest",
+        "carry-window-off-on",
+        "carry-leader-kill-at-switch",
+    ] {
+        assert!(Case::parse(name).is_ok(), "{name}");
+        assert!(shard.cases().contains(&name), "{name}");
+    }
+    assert!(!shard.carry_born());
+    assert!(shard.audits_after("carry-executor-first"));
 }

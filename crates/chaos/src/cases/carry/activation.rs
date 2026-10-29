@@ -48,7 +48,7 @@ impl Run<'_> {
         self.version(Upgrade::on(FEATURE_SEALER_V4), 4).await?;
         self.version(Upgrade::on(FEATURE_SEALER_V5), 5).await?;
         Lanes::new(self.h).await_version(5).await?;
-        super::deposits::across_provider_fault(self.h).await
+        super::deposits::across_provider_fault(self.h, self.ctx).await
     }
 
     /// Step 2: a parked offer uses the version at release after a downgrade.
@@ -193,7 +193,8 @@ impl Run<'_> {
     pub(super) async fn executors_rest(&mut self) -> anyhow::Result<()> {
         self.move_to_carry_mode(1).await?;
         self.move_to_carry_mode(2).await?;
-        self.h.smoke_gate(self.h.knobs.gate_account).await
+        self.h.smoke_gate(self.h.knobs.gate_account).await?;
+        super::deposits::across_provider_fault(self.h, self.ctx).await
     }
 
     /// Move executors `0..=id` to carry mode: the deploy rolls the group
