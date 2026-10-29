@@ -3,14 +3,14 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
-import signal
 import subprocess
+
+from test_bundle import ExecutableBundle
 import time
 import tomllib
 
@@ -21,10 +21,7 @@ SHARD_SECONDS = 240
 SHARDS = 4
 
 
-class Bundle:
-    def __init__(self, directory):
-        self.directory = directory.resolve()
-
+class Bundle(ExecutableBundle):
     @staticmethod
     def selection(catalog):
         return {name: suite for name, suite in catalog["local_suites"].items()
@@ -52,43 +49,6 @@ class Bundle:
             raise ValueError(f"expected exactly one executable test for {expected}, found {matches}")
         return matches[0]
 
-    @staticmethod
-    def digest(path):
-        with path.open("rb") as source:
-            return hashlib.file_digest(source, "sha256").hexdigest()
-
-    def environment(self):
-        return dict(os.environ, RUST_BACKTRACE="1", LD_LIBRARY_PATH=str(self.directory / "native"))
-
-    def libraries(self, artifacts, paths):
-        native = self.directory / "native"
-        native.mkdir()
-        environment = dict(os.environ, LD_LIBRARY_PATH=os.pathsep.join(paths))
-        libraries = {}
-        for source in artifacts:
-            listing = subprocess.check_output(["ldd", source], text=True, env=environment)
-            if "not found" in listing:
-                raise ValueError(f"missing native library for {source}: {listing}")
-            for match in re.finditer(r"=> (/\S+)", listing):
-                library = Path(match[1])
-                if library.is_relative_to("/lib") or library.is_relative_to("/usr/lib"):
-                    continue
-                name = "native/" + library.name
-                digest = self.digest(library)
-                if name in libraries and libraries[name] != digest:
-                    raise ValueError(f"conflicting native library: {name}")
-                shutil.copy2(library, self.directory / name)
-                libraries[name] = digest
-        return libraries
-
-    @staticmethod
-    def build_messages(log):
-        messages = [json.loads(line) for line in log.read_text().splitlines()]
-        finished = [item for item in messages if item["reason"] == "build-finished"]
-        if len(finished) != 1 or not finished[0]["success"]:
-            raise ValueError("artifact packaging requires one successful completed Cargo build")
-        return messages
-
     def prepare(self, artifacts_file=None):
         suites = self.selection(json.loads(CATALOG.read_text()))
         if not suites:
@@ -112,14 +72,10 @@ class Bundle:
         tests, binaries = [], {}
         for suite_name, suite in suites.items():
             source = artifacts[self.target(suite)]
-            listing = subprocess.check_output([source, "--list", "--format", "terse"], text=True, timeout=30, env=self.environment())
-            names = [line.removesuffix(": test") for line in listing.splitlines() if line.endswith(": test")]
+            names = self.names(source)
             binary = source.name
             if binary not in binaries:
-                destination = self.directory / binary
-                shutil.copy2(source, destination)
-                subprocess.run(["strip", "--strip-debug", destination], check=True)
-                binaries[binary] = self.digest(destination)
+                binaries[binary] = self.executable(source, binary)
             tests.extend({"suite": suite_name, "test": self.resolve(test, names), "binary": binary}
                          for test in suite["tests"])
         tests.sort(key=lambda test: (test["suite"], test["test"]))
@@ -151,33 +107,11 @@ class Bundle:
             raise ValueError("one executable test appears in more than one suite")
 
     def load(self):
-        manifest = json.loads((self.directory / "manifest.json").read_text())
-        if os.environ.get("GITHUB_SHA") and manifest["revision"] != os.environ["GITHUB_SHA"]:
-            raise ValueError("the bundle was built from another revision")
+        manifest = super().load()
         if not manifest["tests"] or manifest["shards"] != SHARDS:
             raise ValueError("empty test bundle or incompatible shard plan")
-        for binary, digest in (manifest["binaries"] | manifest.get("libraries", {})).items():
-            if Path(binary).is_absolute() or ".." in Path(binary).parts or self.digest(self.directory / binary) != digest:
-                raise ValueError(f"invalid executable bundle: {binary}")
         self.validate_inventory(manifest)
         return manifest
-
-    @staticmethod
-    def execute(command, log, seconds, environment=None):
-        started = time.monotonic()
-        timed_out = False
-        with log.open("w") as output:
-            process = subprocess.Popen(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
-                                       start_new_session=True, env=environment)
-            try:
-                code = process.wait(timeout=seconds)
-            except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
-                os.killpg(process.pid, signal.SIGKILL)
-                code = process.wait(timeout=5)
-                if isinstance(error, KeyboardInterrupt):
-                    raise
-                timed_out = True
-        return code, timed_out, time.monotonic() - started
 
     def run(self, shard, output):
         started = time.monotonic()

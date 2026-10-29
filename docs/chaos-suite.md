@@ -63,6 +63,21 @@ To reuse a workspace build, pass its Cargo JSON file with `prepare --artifacts P
 
 The initial inventory includes 103 Rust tests across 14 recovery groups. It does not establish full chaos-case equivalence: 39 active distributed cases have no listed local test and 41 have partial evidence. Java sealer tests and real dependency checks remain separate. Distributed chaos still runs on PRs. Moving it to main only requires closing or explicitly resolving those gaps. The ten-round qualification audit continues to require all distributed shards and all four in-process jobs on the same final SHA.
 
+## Prebuilt chain-semantics shards
+
+The `chain-semantics-e2e` workflow builds the services and integration executable in one Cargo graph. Its artifact contains stripped-debug binaries, resolved native libraries, the sealer jar and the verified Aeron jar. Four downstream jobs download that artifact and run one local stack at a time. They install Java and Foundry but perform no compilation.
+
+`scripts/ci/semantics_tests.py` lists the compiled tests and partitions the sorted list across four shards. Every test belongs to exactly one shard. Each runner checks the source revision and artifact hashes, verifies the plan against the executable, and rejects empty execution or a silent missing-Anvil skip. Each shard has a 12-minute execution deadline within a 15-minute job. This full-stack suite is separate from the in-process actor suite's 60-second per-test and five-minute job limits.
+
+Prepare the same shared build locally, then execute a shard:
+
+```sh
+python3 scripts/ci/semantics_tests.py prepare --bundle /tmp/semantics-bundle
+python3 scripts/ci/semantics_tests.py run --bundle /tmp/semantics-bundle --shard 0 --output /tmp/semantics-results-0
+```
+
+Repeat execution for shards 1 through 3 to cover the complete suite. Pass `--artifacts PATH` to prepare to reuse Cargo JSON from a completed build. The prepare step needs the sealer and Aeron jars at the workflow's build paths. The runner and actor suite share the same artifact and process-deadline helpers. The green-streak audit requires all four semantics shards as well as all four actor shards and the full distributed suite.
+
 ## Shards
 
 There are sixteen distributed shards. `just container-test` lists their names. Fifteen run on every pull request. `chaos-integrity` runs nightly. A manual run with `suite=all` includes all sixteen.

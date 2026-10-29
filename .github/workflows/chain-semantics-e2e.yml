@@ -21,16 +21,14 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Mirrors AERON_JAR_VERSION in the justfile (`just aeron-jar`).
-  AERON_JAR_VERSION: 1.45.0
 
 jobs:
-  chain-semantics:
+  build:
     if: >-
       !contains(github.event.pull_request.labels.*.name, 'skip-chain-semantics')
-    name: chain-semantics-e2e
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    name: build chain-semantics artifact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -63,34 +61,51 @@ jobs:
         working-directory: cluster/sealer-service
         run: ./gradlew :service:shadowJar
 
-      - name: Cache the aeron-all jar
-        run: |
-          mkdir -p /tmp/kardamom-aeron-local
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
-            "https://repo1.maven.org/maven2/io/aeron/aeron-all/${AERON_JAR_VERSION}/aeron-all-${AERON_JAR_VERSION}.jar" \
-            -o "/tmp/kardamom-aeron-local/aeron-all-${AERON_JAR_VERSION}.jar"
+      - uses: ./.github/actions/aeron-jar
 
-      # Every binary a scenario spawns or shells out to: the pipeline three,
-      # the validator (S6/S7), statecheck (S6's CLI check), the da-watcher
-      # (S1/S2 bridge), reconstruct (S8's DA-parity gate), and the batcher
-      # and the egress (S13e/S13f/S13g, the carry window).
-      - name: Build service binaries
+      - name: Build and package the semantics runtime
         run: |
-          cargo build --locked --bins \
-            -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
-            -p kardamom-validator -p kardamom-state -p kardamom-da-watcher -p kardamom-l1-indexer \
-            -p kardamom-batcher -p kardamom-reconstruct -p kardamom-notifier -p kardamom-canary \
-            -p kardamom-egress
+          python3 scripts/ci/semantics_tests.py prepare --bundle /tmp/semantics-bundle
+          tar -C /tmp/semantics-bundle -cf - . | gzip -1 > /tmp/semantics-bundle.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: semantics-binaries
+          path: /tmp/semantics-bundle.tgz
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
 
-      # Each test brings up its own stack (2 JVMs + 4 service processes), and
-      # the L1-backed ones add an anvil on top. Two of those at once on a
-      # 2-core runner starves the Aeron media driver — it shows up as
-      # "MediaDriver keepalive: age>10000ms" and then a scenario timing out
-      # waiting for a receipt that the wedged transport never delivered. Run
-      # them one at a time; the suite is ~10 min serial, well inside the
-      # 30-minute job timeout.
-      - name: Run the chain-semantics suite (Target L)
+  chain-semantics:
+    needs: build
+    name: chain-semantics-e2e (${{ matrix.shard }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: semantics-binaries
+          path: /tmp/semantics-artifact
+      - name: Unpack the shared runtime
         run: |
-          cargo test -p e2e --features full-pipeline-e2e \
-            --test chain_semantics --locked \
-            -- --ignored --nocapture --test-threads=1
+          mkdir /tmp/semantics-bundle
+          tar -C /tmp/semantics-bundle -xzf /tmp/semantics-artifact/semantics-bundle.tgz
+          rm /tmp/semantics-artifact/semantics-bundle.tgz
+      - uses: ./.github/actions/foundry
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Run one shard without compilation
+        run: |
+          python3 scripts/ci/semantics_tests.py run --bundle /tmp/semantics-bundle --shard ${{ matrix.shard }} --output /tmp/semantics-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semantics-results-${{ matrix.shard }}
+          path: /tmp/semantics-results
+          retention-days: 3
