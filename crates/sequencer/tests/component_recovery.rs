@@ -3,6 +3,10 @@
 #[path = "component_recovery/support.rs"]
 mod support;
 
+#[cfg(target_os = "linux")]
+#[path = "component_recovery/pressure.rs"]
+mod pressure;
+
 use kardamom_cluster_adapter::gateway::OfferOutcome;
 use kardamom_sequencer::SequencerError;
 use support::Actor;

@@ -11,8 +11,8 @@ use crate::sequencer::SequencerPorts;
 
 impl AdmissionLoop {
     /// Run until `shutdown` or until the input closes. An idle turn waits
-    /// with the same backoff as the v1 loop; a back-pressured one waits
-    /// 10 µs.
+    /// with the same backoff as the v1 loop. Repeated back-pressure
+    /// uses that bounded backoff until a turn makes progress.
     ///
     /// # Errors
     ///
@@ -57,12 +57,8 @@ impl AdmissionLoop {
                 backoff.reset();
                 Ok(true)
             }
-            Ok(false) => {
+            Ok(false) | Err(SequencerError::Backpressure) => {
                 std::thread::sleep(backoff.idle_wait());
-                Ok(true)
-            }
-            Err(SequencerError::Backpressure) => {
-                std::thread::sleep(Duration::from_micros(10));
                 Ok(true)
             }
             Err(SequencerError::IngressDisconnected) => Ok(false),
