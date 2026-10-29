@@ -22,25 +22,39 @@ SHARDS = 4
 
 
 class Bundle(ExecutableBundle):
-    @staticmethod
-    def selection(catalog):
+    ci_mode = "in-process"
+    include_ignored = False
+
+    @property
+    def test_seconds(self):
+        return TEST_SECONDS
+
+    @property
+    def shard_seconds(self):
+        return SHARD_SECONDS
+
+    @classmethod
+    def selection(cls, catalog):
         return {name: suite for name, suite in catalog["local_suites"].items()
-                if suite.get("ci_mode") == "in-process"}
+                if suite.get("ci_mode") == cls.ci_mode}
 
     @staticmethod
     def target(suite):
         command = suite["command"]
         package = command[command.index("-p") + 1]
-        target = command[command.index("--test") + 1] if "--test" in command else package.replace("-", "_")
+        selector = next((flag for flag in ("--test", "--bin") if flag in command), None)
+        target = command[command.index(selector) + 1] if selector else package.replace("-", "_")
         return package, target
 
     @classmethod
     def build_command(cls, suites):
         packages = sorted({cls.target(suite)[0] for suite in suites.values()})
         tests = sorted({cls.target(suite)[1] for suite in suites.values() if "--test" in suite["command"]})
+        binaries = sorted({cls.target(suite)[1] for suite in suites.values() if "--bin" in suite["command"]})
         return ["cargo", "test", "--locked", "--no-run", "--message-format=json-render-diagnostics", "--lib",
                 *[arg for package in packages for arg in ["-p", package]],
-                *[arg for target in tests for arg in ["--test", target]]]
+                *[arg for target in tests for arg in ["--test", target]],
+                *[arg for target in binaries for arg in ["--bin", target]]]
 
     @staticmethod
     def resolve(expected, names):
@@ -52,7 +66,7 @@ class Bundle(ExecutableBundle):
     def prepare(self, artifacts_file=None):
         suites = self.selection(json.loads(CATALOG.read_text()))
         if not suites:
-            raise ValueError("the in-process recovery inventory is empty")
+            raise ValueError("the recovery inventory is empty")
         self.directory.mkdir(parents=True, exist_ok=False)
         log = self.directory / "build.jsonl"
         if artifacts_file is None:
@@ -80,7 +94,7 @@ class Bundle(ExecutableBundle):
                          for test in suite["tests"])
         tests.sort(key=lambda test: (test["suite"], test["test"]))
         manifest = {"revision": os.environ.get("GITHUB_SHA"), "shards": SHARDS,
-                    "test_seconds": TEST_SECONDS, "shard_seconds": SHARD_SECONDS,
+                    "test_seconds": self.test_seconds, "shard_seconds": self.shard_seconds,
                     "binaries": binaries, "libraries": libraries, "tests": tests}
         self.validate_inventory(manifest)
         (self.directory / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -124,27 +138,28 @@ class Bundle(ExecutableBundle):
         output.mkdir(parents=True, exist_ok=False)
         results = []
         for index, test in enumerate(tests):
-            remaining = SHARD_SECONDS - (time.monotonic() - started)
+            remaining = self.shard_seconds - (time.monotonic() - started)
             log = output / f"{index:03}.log"
             if remaining <= 0:
                 results.append(dict(test, success=False, timed_out=True, reason="shard budget exhausted"))
                 continue
             command = [str(self.directory / test["binary"]), "--exact", test["test"],
-                       "--nocapture", "--test-threads=1"]
-            code, timed_out, seconds = self.execute(command, log, min(TEST_SECONDS, remaining), self.environment())
+                       "--nocapture", "--test-threads=1",
+                       *(["--include-ignored"] if self.include_ignored else [])]
+            code, timed_out, seconds = self.execute(command, log, min(self.test_seconds, remaining), self.environment())
             text = log.read_text()
             passed = re.findall(r"^test ([\w:]+) \.\.\. ok$", text, re.MULTILINE)
             # Rust can print captured tracing between the test name and its verdict.
             summary = "test result: ok. 1 passed; 0 failed; 0 ignored;" in text
-            success = (code == 0 and not timed_out and seconds <= TEST_SECONDS
-                       and summary and (passed == [test["test"]] or not passed))
+            success = (code == 0 and not timed_out and seconds <= self.test_seconds
+                       and summary and (passed == [test["test"]] or not passed) and "SKIP:" not in text)
             results.append(dict(test, success=success, exit_code=code, timed_out=timed_out,
                                 seconds=round(seconds, 3), log=str(log)))
             print(f"shard {shard}: {test['suite']}::{test['test']}: {'PASS' if success else 'FAIL'} ({seconds:.3f}s)", flush=True)
         elapsed = time.monotonic() - started
         report = {"revision": manifest["revision"], "shard": shard, "seconds": round(elapsed, 3),
-                  "test_seconds": TEST_SECONDS, "shard_seconds": SHARD_SECONDS, "tests": results,
-                  "success": all(test["success"] for test in results) and elapsed <= SHARD_SECONDS}
+                  "test_seconds": self.test_seconds, "shard_seconds": self.shard_seconds, "tests": results,
+                  "success": all(test["success"] for test in results) and elapsed <= self.shard_seconds}
         (output / "results.json").write_text(json.dumps(report, indent=2) + "\n")
         return report["success"]
 

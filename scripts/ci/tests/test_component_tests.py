@@ -65,7 +65,8 @@ class ComponentTests(unittest.TestCase):
         self.assertEqual(len(report["tests"]), 1)
 
     def test_zero_skipped_wrong_and_failed_tests_cannot_pass(self):
-        for text in ["test result: ok. 0 passed; 0 failed; 0 ignored;",
+        for text in ["SKIP: missing runtime dependency\ntest recovers ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;",
+                     "test result: ok. 0 passed; 0 failed; 0 ignored;",
                      "test result: ok. 0 passed; 0 failed; 1 ignored;",
                      "test another ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;",
                      "test result: FAILED. 0 passed; 1 failed; 0 ignored;"]:

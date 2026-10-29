@@ -630,3 +630,16 @@ Other evidence on a failure:
 - A rebuild that the tool refuses prints the error chain of the tool.
 - A failed persisted-state audit keeps its evidence directory.
 - When you read a failure, tell "the pipeline stalled" from "the probes went dark" first. [`failure-modes.md`](failure-modes.md#substrate-the-shared-failure-domain) explains the difference.
+
+The Docker dependency workflow also builds its selected test executables in one
+Cargo graph. `scripts/ci/dependency_tests.py` runs the `dependencies` catalog groups
+from that shared bundle across four jobs. These cases keep real Redis, Sentinel,
+Aeron, Anvil and constrained-filesystem fixtures. They are separate from the
+60-second in-process actor tests. Each dependency case has a 180-second outer
+budget and each shard has a 12-minute execution budget inside a 15-minute CI job.
+Exact tests include ignored fixtures, but child-process helper entry points are
+invoked only by their parent tests. The catalog includes the existing Aeron smoke,
+client-timeout, Redis and ingress admission suites. Missing catalog coverage,
+silent skips, deadline expiry and failed tests fail the shard. Logs, verdicts and
+account-cache profile samples are uploaded per shard. The green-round audit
+requires all four dependency jobs as well as all actor and semantics jobs.
