@@ -91,7 +91,7 @@ jobs:
   build:
     name: build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -104,7 +104,45 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
       - uses: ./.github/actions/rust-build-cache
-      - run: cargo build --workspace --all-targets --locked
+      - name: Build workspace and capture test artifacts
+        run: cargo build --workspace --all-targets --locked --message-format=json-render-diagnostics > /tmp/workspace-build.jsonl
+      - name: Package in-process recovery tests
+        run: |
+          python3 scripts/ci/component_tests.py prepare --artifacts /tmp/workspace-build.jsonl --bundle /tmp/component-bundle
+          tar -C /tmp/component-bundle -czf /tmp/component-bundle.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: component-test-binaries
+          path: /tmp/component-bundle.tar.gz
+          retention-days: 3
+
+  component-recovery:
+    name: in-process recovery (${{ matrix.shard }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: component-test-binaries
+          path: /tmp/component-download
+      - name: Run prebuilt actor recovery tests
+        run: |
+          mkdir /tmp/component-bundle
+          tar -C /tmp/component-bundle -xzf /tmp/component-download/component-bundle.tar.gz
+          python3 scripts/ci/component_tests.py run --bundle /tmp/component-bundle --shard ${{ matrix.shard }} --output /tmp/component-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: component-results-${{ matrix.shard }}
+          path: /tmp/component-results
+          if-no-files-found: error
+          retention-days: 7
 
   # The exec core (and the types crate under it) must stay linkable inside a
   # zk-guest build: `no_std` + `alloc`, no Aeron/libmdbx/tokio. A bare-metal

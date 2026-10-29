@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from green_streak import Command, Streak, WORKFLOWS, JOB_BUDGET_SECONDS
+from green_streak import Command, Streak, WORKFLOWS, JOB_BUDGET_SECONDS, COMPONENT_SHARDS
 
 
 HEAD = "a" * 40
@@ -23,7 +23,7 @@ class StreakTest(unittest.TestCase):
 
     @staticmethod
     def runs(number, conclusion="success"):
-        return [{
+        runs = [{
             "id": number * 100 + index,
             "head_sha": HEAD, "head_branch": BRANCH,
             "event": "workflow_dispatch", "run_attempt": 1,
@@ -40,6 +40,12 @@ class StreakTest(unittest.TestCase):
                                "started_at": f"2026-10-{number:02}T00:00:00Z",
                                "completed_at": f"2026-10-{number:02}T00:10:00Z"}],
         } for index, name in enumerate(sorted(WORKFLOWS))]
+        ci = next(run for run in runs if run["path"].endswith("/ci.yml"))
+        ci["jobs"].extend({"name": f"in-process recovery ({shard})", "status": "completed",
+                           "conclusion": "success", "started_at": f"2026-10-{number:02}T00:00:00Z",
+                           "completed_at": f"2026-10-{number:02}T00:04:00Z"}
+                          for shard in range(COMPONENT_SHARDS))
+        return runs
 
     def green(self, count):
         for number in range(1, count + 1):
@@ -199,6 +205,22 @@ class StreakTest(unittest.TestCase):
         cluster["jobs"] = [job for job in cluster["jobs"] if "(load)" not in job["name"]]
         self.assertEqual(self.streak.record(runs), "failed")
         self.assertIn("container cluster e2e (load)", self.streak.state["rounds"][0]["missing_green_coverage"])
+
+    def test_every_in_process_shard_is_required(self):
+        runs = self.runs(1)
+        ci = next(run for run in runs if run["path"].endswith("/ci.yml"))
+        ci["jobs"][-1]["conclusion"] = "skipped"
+        self.assertEqual(self.streak.record(runs), "failed")
+        self.assertIn(f"in-process recovery ({COMPONENT_SHARDS - 1})",
+                      self.streak.state["rounds"][0]["missing_green_coverage"])
+
+    def test_in_process_jobs_have_a_five_minute_budget(self):
+        for end, expected in [("00:05:00", "green"), ("00:05:01", "failed")]:
+            runs = self.runs(1)
+            ci = next(run for run in runs if run["path"].endswith("/ci.yml"))
+            ci["jobs"][-1]["completed_at"] = f"2026-10-01T{end}Z"
+            with self.subTest(end=end):
+                self.assertEqual(Streak(HEAD, BRANCH, SHARDS).record(runs), expected)
 
     def test_registry_includes_every_existing_shard(self):
         root = Path(__file__).resolve().parents[3]

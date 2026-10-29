@@ -9,6 +9,8 @@ import re
 import subprocess
 import time
 
+from component_tests import SHARDS as COMPONENT_SHARDS
+
 
 WORKFLOWS = {
     "ci.yml", "cluster-e2e.yml", "docker-e2e.yml",
@@ -16,6 +18,7 @@ WORKFLOWS = {
 }
 REQUIRED = 10
 JOB_BUDGET_SECONDS = 15 * 60
+COMPONENT_JOB_SECONDS = 5 * 60
 
 
 class GitHub:
@@ -54,8 +57,10 @@ class Streak:
             "version": 3, "head": head, "branch": branch,
             "required": REQUIRED, "streak": 0, "rounds": [],
             "job_budget_seconds": JOB_BUDGET_SECONDS,
+            "component_job_seconds": COMPONENT_JOB_SECONDS,
         }
-        if self.state.get("job_budget_seconds") != JOB_BUDGET_SECONDS:
+        if (self.state.get("job_budget_seconds") != JOB_BUDGET_SECONDS
+                or self.state.get("component_job_seconds") != COMPONENT_JOB_SECONDS):
             raise ValueError("timing policy changed; retain the old audit and start a new state file")
         if self.state["head"] != head or self.state["branch"] != branch:
             raise ValueError("head or branch changed; retain this audit and start a new state file")
@@ -111,15 +116,20 @@ class Streak:
                 if start.tzinfo is None or end.tzinfo is None or end < start:
                     raise ValueError("job timing needs ordered timestamps with time zones")
                 seconds = (end - start).total_seconds()
-                if seconds > JOB_BUDGET_SECONDS:
-                    slow.append({"workflow": run["path"], "job": job["name"], "seconds": seconds})
+                budget = COMPONENT_JOB_SECONDS if job["name"].startswith("in-process recovery (") else JOB_BUDGET_SECONDS
+                if seconds > budget:
+                    slow.append({"workflow": run["path"], "job": job["name"], "seconds": seconds,
+                                 "budget_seconds": budget})
         return slow
 
     def missing_coverage(self, runs):
         cluster = next(run for run in runs if Path(run["path"]).name == "cluster-e2e.yml")
         green = {job["name"] for job in cluster["jobs"] if job["conclusion"] == "success"}
         expected = {f"container cluster e2e ({shard})" for shard in self.shards}
-        return sorted(expected - green)
+        ci = next(run for run in runs if Path(run["path"]).name == "ci.yml")
+        components = {f"in-process recovery ({shard})" for shard in range(COMPONENT_SHARDS)}
+        completed = {job["name"] for job in ci["jobs"] if job["conclusion"] == "success"}
+        return sorted((expected - green) | (components - completed))
 
     def record(self, runs):
         status = self.classify(runs)
@@ -142,6 +152,7 @@ class Streak:
                 for run in runs for job in run["jobs"] if job["status"] == "completed"
             ) else [],
             "job_budget_seconds": JOB_BUDGET_SECONDS,
+            "component_job_seconds": COMPONENT_JOB_SECONDS,
         }
         rounds = sorted(previous + [row], key=lambda item: item["started_at"])
         self.validate_order(rounds)
