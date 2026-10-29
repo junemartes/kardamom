@@ -29,7 +29,7 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 191 checks across 30 targets.
+head. Both targets run in the existing Docker CI job. `all` runs 208 checks across 32 targets.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
@@ -337,3 +337,35 @@ the follower, whose sources disagree on swallowed logs. That alert alone cannot
 prove receipt confirmation is stuck. The deployed case does not stall the
 batcher's archive HTTP seed; this target covers that missing output-failure
 combination. It does not prove Prometheus behavior or full follower recovery.
+
+
+`just test-component chaos-cache-backlog` runs fifteen checks for the baseline,
+held-head predicates and recovery observer used by `mirror-backlog-client-restart`.
+The baseline and recovery reads refresh primary discovery and use the real Redis
+client. One transaction reads ROLE, all three heads, and the account row. A primary
+that demotes after connection setup cannot certify that snapshot. The fixture
+checks the actual command sequence over TCP, including the requested account and
+keys. A silent EXEC reply exercises the client's unchanged three-second deadline;
+Tokio time pauses only after the peer receives that request.
+
+Baseline errors retry inside one 120-second budget that includes head and account
+reads. Recovery retains its 300-second budget and requires all writers to advance
+twice with exact account state on the same primary. Promotion resets the first
+observation. Missing heads, incorrect accounts and held progress cannot pass.
+Persistent failure reports the last observation error at the deadline. Virtual
+clock controls preserve these complete budgets without waiting minutes.
+
+This fixes a chaos observation path that failed before its fault was armed in CI.
+It does not attribute the original nested-Docker MGET timeout to Redis, DNS or
+Docker. Fault mutation and cleanup still use the pinned primary through Docker;
+the assertions during the fault require that primary to keep the exact stale
+state. No product service or hot path changes. The local checks do not establish
+Sentinel promotion, mirror coverage, client fallback, distributed load or full-case
+equivalence. The existing deployed shard must still establish those properties.
+
+`just test-component chaos-archive-stage` checks the archive-corruption fixture's
+selected-file transfer with real tar and unpacking. Each selected segment retains
+its bytes and recording name; a 64MiB unrelated segment and the catalog stay out
+of the transfer. Restoring the whole-archive copy fails both checks. The drill
+still uses the repair tool and live CRC verification, and its traffic and recovery
+deadlines stay unchanged. These two checks do not certify the distributed case.

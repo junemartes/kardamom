@@ -70,10 +70,15 @@ mod tests {
         tokio::time::pause();
         seed.start(budget);
         assert_eq!(seed.pending.as_ref().unwrap().id(), original);
-        let error = tokio::time::timeout(budget, seed.next())
+        // Tokio rounds timers to milliseconds; the owned task must finish
+        // before the observer's timer can win the join wake-up race.
+        let observer_budget = budget + Duration::from_millis(1);
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(observer_budget, seed.next())
             .await
             .expect("the seed must enforce its own complete-read deadline")
             .unwrap_err();
+        assert!(started.elapsed() <= observer_budget);
         assert!(
             error
                 .to_string()
