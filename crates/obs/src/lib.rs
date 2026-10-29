@@ -111,11 +111,20 @@ fn is_addr_in_use(e: &anyhow::Error) -> bool {
     }) || format!("{e:#}").contains("Address already in use")
 }
 
-/// Shared histogram buckets (seconds). 100 µs to 5 s, exponential. Every
-/// service histogram uses these boundaries, so dashboards can compare
-/// latency panels across services.
+/// Default duration buckets (seconds), from 100 µs to 5 s. Histograms
+/// with a named override use their own boundaries.
 const DURATION_BUCKETS: &[f64] = &[
     0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+];
+
+/// Canonical publication latency needs bounds around 150 µs and strictly
+/// below 1 ms. The longer buckets retain slow samples and the original
+/// boundaries, so a tail outside the targets remains visible.
+const SEAL_LATENCY_SECONDS: &str = "kardamom_ingress_seal_latency_seconds";
+const SEAL_LATENCY_BUCKETS: &[f64] = &[
+    0.000_05, 0.000_075, 0.000_1, 0.000_125, 0.000_15, 0.000_175, 0.000_2, 0.000_25, 0.000_5,
+    0.000_75, 0.000_9, 0.000_95, 0.000_999, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
+    0.5, 1.0, 2.5, 5.0,
 ];
 
 /// The buckets of the transaction canary's histograms (seconds), 5 ms to
@@ -208,6 +217,8 @@ impl Exporter {
             .context("set_buckets")?
             .set_buckets_for_metric(Matcher::Prefix(CANARY_PREFIX.to_string()), CANARY_BUCKETS)
             .context("set the canary buckets")?
+            .set_buckets_for_metric(full(SEAL_LATENCY_SECONDS), SEAL_LATENCY_BUCKETS)
+            .context("set the canonical latency buckets")?
             .set_buckets_for_metric(full(pipeline::STEP_SECONDS), pipeline::STEP_BUCKETS)
             .context("set the step buckets")?
             .set_buckets_for_metric(full(pipeline::BATCH_ITEMS), pipeline::COUNT_BUCKETS)
