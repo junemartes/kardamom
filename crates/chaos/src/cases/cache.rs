@@ -28,6 +28,8 @@ mod backlog;
 mod coverage;
 mod discovery;
 mod interrupted;
+#[cfg(test)]
+mod test_support;
 pub(crate) use backlog::client_restart;
 mod rebuilds;
 pub(crate) use coverage::CacheRecovery;

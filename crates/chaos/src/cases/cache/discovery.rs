@@ -20,12 +20,17 @@ impl Discovery {
     ) -> anyhow::Result<redis::aio::MultiplexedConnection> {
         let mut primary = Probe::connect(address).await?;
         let role: Vec<redis::Value> = redis::cmd("ROLE").query_async(&mut primary).await?;
+        Self::require_primary(&role)?;
+        Ok(primary)
+    }
+
+    pub(super) fn require_primary(role: &[redis::Value]) -> anyhow::Result<()> {
         let name = role.first().context("empty Redis ROLE response")?;
         anyhow::ensure!(
             redis::from_redis_value::<String>(name.clone())? == "master",
             "Sentinel names a node that is not a primary"
         );
-        Ok(primary)
+        Ok(())
     }
 
     pub(super) async fn primary(h: &Harness) -> anyhow::Result<Option<String>> {

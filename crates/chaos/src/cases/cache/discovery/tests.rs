@@ -1,5 +1,6 @@
 use super::*;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use crate::cases::cache::test_support::Commands;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 struct Peer {
@@ -14,7 +15,7 @@ impl Peer {
         let task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
             let mut stream = BufReader::new(socket);
-            while let Some(command) = Self::command(&mut stream).await {
+            while let Some(command) = Commands::read(&mut stream).await {
                 if command[0] == "CLIENT" {
                     stream.get_mut().write_all(b"+OK\r\n").await.unwrap();
                 } else if let Some(reply) = &reply {
@@ -25,24 +26,6 @@ impl Peer {
             }
         });
         Self { address, task }
-    }
-
-    async fn command(stream: &mut BufReader<tokio::net::TcpStream>) -> Option<Vec<String>> {
-        let mut line = String::new();
-        if stream.read_line(&mut line).await.ok()? == 0 {
-            return None;
-        }
-        let count: usize = line.trim().strip_prefix('*')?.parse().ok()?;
-        let mut command = Vec::new();
-        for _ in 0..count {
-            line.clear();
-            stream.read_line(&mut line).await.ok()?;
-            let len: usize = line.trim().strip_prefix('$')?.parse().ok()?;
-            let mut bytes = vec![0; len + 2];
-            stream.read_exact(&mut bytes).await.ok()?;
-            command.push(String::from_utf8(bytes[..len].to_vec()).unwrap());
-        }
-        Some(command)
     }
 
     async fn sentinel(host: &str, port: u16) -> Self {
