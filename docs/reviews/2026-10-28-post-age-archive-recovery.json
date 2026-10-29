@@ -1,0 +1,183 @@
+{
+  "scope": "Real PostAge actor and archive client recovery; partial local coverage, not full l1-null-receipts equivalence.",
+  "base": "16ba662c796989b9efbeae609c485a5268e826d6",
+  "product_bug": {
+    "trigger": "Archive accepts the HTTP seed request but never answers before any post is known.",
+    "effect": "The inline seed await prevents follower input consumption, metric publication, liveness checks, and input-close shutdown.",
+    "preexisting": true,
+    "evidence": "post_age.rs is unchanged between main 0b83255b7e6489bee2289eb9207aef34f1265751 and integration f48610979e9902d7b6da83fb444436b84876fb4d. No causal link to current integration CI failures is established."
+  },
+  "red_proof": {
+    "log": "/tmp/post-age-silent-archive-red-20261028.log",
+    "failed": 2,
+    "test_execution_seconds": 0.04,
+    "scope": "Original inline-seed implementation with only the private input seam added. The real HTTP peer receives the request before Tokio time pauses.",
+    "failures": [
+      "an_unresponsive_archive_does_not_hide_a_live_post",
+      "input_close_stops_the_actor_during_an_unresponsive_archive_read"
+    ]
+  },
+  "implementation": {
+    "ownership": "PostAge owns at most one archive read task; owner destruction aborts it.",
+    "deadline": "The entire status, batch and L1-block RPC sequence shares the existing observation interval, ten seconds in service wiring.",
+    "ordering": "Live input and timer ticks continue during the read. Completion publishes immediately. The monotone timestamp rule rejects an older seed after a newer live post.",
+    "retry": "Failures clear the pending attempt; a later timer tick can retry while no last post is known. Incoming follower records do not cancel or restart the pending request.",
+    "wiring": "Private generic decoded-record seam; production still uses the original Aeron subscriber and constructor parameters. No events.rs change.",
+    "hot_path": "Observability startup/recovery gains at most one owned task. Transaction posting and receipt timeout code are unchanged. No deployed throughput or latency claim."
+  },
+  "validation": {
+    "component": {
+      "source_revision": "62565dc06c6c4463025026ddeadd17331d139287",
+      "started_utc": "2026-10-28T14:27:06.506578+00:00",
+      "cases_in_inventory": 80,
+      "full_suite_locally_validated": false,
+      "qualification_credit": 0,
+      "suites": {
+        "batcher-post-age": {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "kardamom-batcher",
+            "--lib",
+            "live::post_age::",
+            "--",
+            "--nocapture"
+          ],
+          "exit_code": 0,
+          "timed_out": false,
+          "seconds": 5.883,
+          "passed": [
+            "live::post_age::tests::the_age_runs_from_the_newest_block_that_carried_a_post",
+            "live::post_age::seed::tests::a_seed_attempt_times_out_and_can_start_again_without_overlapping",
+            "live::post_age::seed::tests::closing_the_owner_cancels_the_inflight_archive_task",
+            "live::post_age::component_tests::archive::a_late_archive_seed_cannot_replace_a_newer_live_post",
+            "live::post_age::component_tests::archive::the_complete_archive_seed_publishes_without_waiting_for_another_tick",
+            "live::post_age::component_tests::archive::all_three_archive_requests_share_one_deadline",
+            "live::post_age::component_tests::input_close_stops_the_actor_during_an_unresponsive_archive_read",
+            "live::post_age::component_tests::an_unresponsive_archive_does_not_hide_a_live_post",
+            "live::post_age::component_tests::archive::a_failed_archive_read_retries_with_the_same_client_and_recovers"
+          ],
+          "failed": [],
+          "report_errors": [],
+          "missing_expected_tests": [],
+          "log": "/tmp/kardamom-components-mjojo4in/batcher-post-age.log",
+          "success": true
+        }
+      }
+    },
+    "hidden_receipt_regression": {
+      "source_revision": "62565dc06c6c4463025026ddeadd17331d139287",
+      "started_utc": "2026-10-28T14:27:34.467930+00:00",
+      "cases_in_inventory": 80,
+      "full_suite_locally_validated": false,
+      "qualification_credit": 0,
+      "suites": {
+        "batcher-null-receipts": {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "kardamom-batcher",
+            "--lib",
+            "live::run::null_receipts_tests::",
+            "--",
+            "--ignored",
+            "--nocapture"
+          ],
+          "exit_code": 0,
+          "timed_out": false,
+          "seconds": 1.918,
+          "passed": [
+            "live::run::null_receipts_tests::restart_during_hidden_receipts_uses_contract_truth_without_waiting_for_the_indexer",
+            "live::run::null_receipts_tests::hidden_mined_receipts_reconcile_without_duplicate_posts_or_early_cursor"
+          ],
+          "failed": [],
+          "report_errors": [],
+          "missing_expected_tests": [],
+          "log": "/tmp/kardamom-components-qdxc_nxp/batcher-null-receipts.log",
+          "success": true
+        }
+      }
+    },
+    "batcher_library": {
+      "passed": 65,
+      "ignored": 2,
+      "seconds": 0.58,
+      "log": "/tmp/post-age-batcher-regressions-20261028.log",
+      "note": "The two ignored hidden-receipt checks pass separately through the component runner. The last fixture change only replaces for_each with a for loop for Clippy; all nine PostAge checks were rerun after it."
+    },
+    "existing_anvil_e2e": {
+      "passed": 4,
+      "seconds": 0.66,
+      "log": "/tmp/post-age-batcher-regressions-20261028.log"
+    },
+    "negative_controls": [
+      {
+        "mutation": "extended_seed_deadline",
+        "test": "all_three_archive_requests_share_one_deadline",
+        "exit_code": 101,
+        "compiled": true,
+        "intended_failure": true,
+        "log": "/tmp/post-age-extended_seed_deadline-negative-20261028.log"
+      },
+      {
+        "mutation": "overlapping_seed",
+        "test": "a_seed_attempt_times_out_and_can_start_again_without_overlapping",
+        "exit_code": 101,
+        "compiled": true,
+        "intended_failure": true,
+        "log": "/tmp/post-age-overlapping_seed-negative-20261028.log"
+      },
+      {
+        "mutation": "uncancelled_seed",
+        "test": "closing_the_owner_cancels_the_inflight_archive_task",
+        "exit_code": 101,
+        "compiled": true,
+        "intended_failure": true,
+        "log": "/tmp/post-age-uncancelled_seed-negative-20261028.log"
+      },
+      {
+        "mutation": "regressing_seed",
+        "test": "a_late_archive_seed_cannot_replace_a_newer_live_post",
+        "exit_code": 101,
+        "compiled": true,
+        "intended_failure": true,
+        "log": "/tmp/post-age-regressing_seed-negative-20261028.log"
+      }
+    ],
+    "style": {
+      "command": "just style",
+      "result": "pass",
+      "log": "/tmp/post-age-style-final-20261028.log",
+      "note": "The existing proc-macro-error2 future-incompatibility notice remains; no new Clippy warning."
+    },
+    "catalog_registry": {
+      "result": "pass",
+      "log": "/tmp/post-age-catalog-final-20261028.log"
+    }
+  },
+  "limits": [
+    "Follower input starts at the decoded record boundary; no Aeron discovery or fleet transport proof.",
+    "Real HTTP and JSON-RPC decoding are exercised. Tokio time advances deadlines and scheduling only after each request reaches the peer. Post-age uses real wall time.",
+    "No Prometheus scraping/alert evaluation, lifecycle-output assertion, Nomad restart, EigenDA or client transaction progress proof.",
+    "No full local chaos case marked complete; catalog remains 39 partial and 41 planned of 80.",
+    "No distributed qualification credit; 10 consecutive fresh full rounds on an unchanged final SHA are still required for a flakiness-fixed claim."
+  ],
+  "style_review": {
+    "R1": "Comments describe current invariants; corrected receipt-confirmation claims do not change chaos assertions.",
+    "R2-R3": "Helpers and sibling test files keep functions and files within bounds.",
+    "R4-R5": "Owned tasks abort on owner exit; bounded channels coordinate real peers without mutexes. Named ownership helpers close senders.",
+    "R6-R8": "Private generic input trait, no new dynamic dispatch or public API.",
+    "R9-R13": "One pending task is explicit actor state. Checked clock arithmetic in fixtures; existing interval reused; Clippy passes.",
+    "R14-R16": "Shared fixture and server use named methods. Registration loop contains one call chain. Production inputs and side-effect ordering are reviewed."
+  },
+  "code_sha256": {
+    "crates/batcher/src/live/post_age.rs": "e5a32a66e3db4da9c4cdf3845dace013c82dfb524e2a4090e459b13248fcac09",
+    "crates/batcher/src/live/post_age/seed.rs": "27e1b901757c5a93728c384f22552bcbfaa8167e901854a1b538110a624a9697",
+    "crates/batcher/src/live/post_age/component_tests.rs": "d550bfbf9d22cf41b96fa720909040a3d024e49f0102efb01d5b4a252d9ef875",
+    "crates/batcher/src/live/post_age/component_tests/archive.rs": "79c2515bbee56a5f84e800f7698c504780f9a70eb753c28243791c0f81c867e3"
+  }
+}
