@@ -123,14 +123,32 @@ class Bundle:
             tests.extend({"suite": suite_name, "test": self.resolve(test, names), "binary": binary}
                          for test in suite["tests"])
         tests.sort(key=lambda test: (test["suite"], test["test"]))
-        identities = {(test["binary"], test["test"]) for test in tests}
-        if len(identities) != len(tests):
-            raise ValueError("one executable test appears in more than one suite")
         manifest = {"revision": os.environ.get("GITHUB_SHA"), "shards": SHARDS,
                     "test_seconds": TEST_SECONDS, "shard_seconds": SHARD_SECONDS,
                     "binaries": binaries, "libraries": libraries, "tests": tests}
+        self.validate_inventory(manifest)
         (self.directory / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         print(f"Prepared {len(tests)} tests in {len(binaries)} binaries for {SHARDS} shards", flush=True)
+
+    @classmethod
+    def validate_inventory(cls, manifest):
+        suites = cls.selection(json.loads(CATALOG.read_text()))
+        expected = []
+        for suite_name, suite in suites.items():
+            entries = [test for test in manifest["tests"] if test["suite"] == suite_name]
+            names = [test["test"] for test in entries]
+            binaries = {test["binary"] for test in entries}
+            if len(binaries) != 1 or not binaries <= manifest["binaries"].keys():
+                raise ValueError(f"suite {suite_name} must name one hashed executable")
+            binary = next(iter(binaries))
+            expected.extend({"suite": suite_name, "test": cls.resolve(test, names), "binary": binary}
+                            for test in suite["tests"])
+        expected.sort(key=lambda test: (test["suite"], test["test"]))
+        if manifest["tests"] != expected:
+            raise ValueError("bundle tests differ from the complete ordered catalog selection")
+        identities = {(test["binary"], test["test"]) for test in expected}
+        if len(identities) != len(expected):
+            raise ValueError("one executable test appears in more than one suite")
 
     def load(self):
         manifest = json.loads((self.directory / "manifest.json").read_text())
@@ -141,6 +159,7 @@ class Bundle:
         for binary, digest in (manifest["binaries"] | manifest.get("libraries", {})).items():
             if Path(binary).is_absolute() or ".." in Path(binary).parts or self.digest(self.directory / binary) != digest:
                 raise ValueError(f"invalid executable bundle: {binary}")
+        self.validate_inventory(manifest)
         return manifest
 
     @staticmethod

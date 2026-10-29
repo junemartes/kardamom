@@ -51,7 +51,11 @@ class ComponentTests(unittest.TestCase):
                         "binaries": {"actor": bundle.digest(executable)},
                         "tests": [{"suite": "actor", "test": "recovers", "binary": "actor"}]}
             (root / "manifest.json").write_text(json.dumps(manifest))
-            with patch.dict(component.os.environ, {}, clear=True), patch.multiple(component, **dict(TEST_SECONDS=component.TEST_SECONDS, SHARD_SECONDS=component.SHARD_SECONDS) | budgets):
+            catalog = root / "catalog.json"
+            catalog.write_text(json.dumps({"local_suites": {
+                "actor": {"ci_mode": "in-process", "tests": ["recovers"]}
+            }}))
+            with patch.dict(component.os.environ, {}, clear=True), patch.multiple(component, **dict(CATALOG=catalog, TEST_SECONDS=component.TEST_SECONDS, SHARD_SECONDS=component.SHARD_SECONDS) | budgets):
                 success = bundle.run(0, root / "results")
             return success, json.loads((root / "results/results.json").read_text())
 
