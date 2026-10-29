@@ -16,6 +16,11 @@
       ansible.builtin.assert:
         that: common_node_software_preinstalled
 
+    - name: Check the registry Docker SDK in the target Python interpreter
+      ansible.builtin.command:
+        argv: [/usr/bin/python3, -c, "import docker"]
+      changed_when: false
+
     - name: Read the installed Docker version
       ansible.builtin.command: docker --version
       changed_when: false
