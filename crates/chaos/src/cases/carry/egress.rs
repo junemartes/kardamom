@@ -5,7 +5,6 @@
 use std::cell::Cell;
 use std::time::Duration;
 
-use crate::cases::validator::COMMITTED;
 use crate::harness::Harness;
 use crate::metrics::{self, Target};
 use crate::poll::{self, Budget};
@@ -98,27 +97,6 @@ impl Egress {
         );
         Ok(Self { instances })
     }
-
-    /// The highest R of all instances.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when an instance does not answer: a missing
-    /// instance could hold the highest R.
-    pub(super) async fn reference(&self, h: &Harness) -> anyhow::Result<Reference> {
-        let mut marks = Vec::with_capacity(self.instances.len());
-        for instance in &self.instances {
-            marks.push(instance.reference(h).await);
-        }
-        marks
-            .iter()
-            .copied()
-            .collect::<Option<Vec<Reference>>>()
-            .and_then(|marks| marks.into_iter().max())
-            .ok_or_else(|| {
-                crate::chaos_fail!("an egress instance reports no reference mark: {marks:?}")
-            })
-    }
 }
 
 /// One gauge of the batcher and one of the validator, on the aux node.
@@ -127,13 +105,6 @@ pub(super) struct Readers {
     batcher: &'static str,
     validator: &'static str,
 }
-
-/// The posted block of the batcher and the committed block of the
-/// validator.
-pub(super) const BLOCKS: Readers = Readers {
-    batcher: "kardamom_batcher_last_posted_block",
-    validator: COMMITTED,
-};
 
 /// The canonical index of the newest frame that each reader took from the
 /// egress.

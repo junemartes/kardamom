@@ -42,7 +42,7 @@ impl Deposits {
             .carry
             .lockbox
             .as_deref()
-            .context("carry activation has no configured lockbox")?
+            .context("deposit recovery has no configured lockbox")?
             .parse()?;
         Ok(Self {
             lockbox,

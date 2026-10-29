@@ -126,13 +126,10 @@ jobs:
       # wrappers below, so the cache and the artifact hold no native-ISA
       # objects and travel to any runner. (rusteron's build.rs hardcodes
       # -march=native; the wrapper appends the fixed level after it.)
-      - uses: Swatinem/rust-cache@v2
+      # The shared action also caches rustc work for workspace crates.
+      - uses: ./.github/actions/rust-build-cache
         with:
           shared-key: cluster-e2e
-          prefix-key: v1-rust-x86-64-v3
-      # rusteron builds the Aeron C library with Gradle on a rust-cache
-      # miss; the Gradle cache keeps that build off Maven Central.
-      - uses: ./.github/actions/gradle-cache
 
       # JDK for the Java Aeron-Cluster sealer node. The clustered sealer image is
       # a pure-JVM shadowJar (no native libs); temurin 17 matches cluster.Dockerfile
@@ -151,9 +148,6 @@ jobs:
       # test executable and the operator binary build here too, so a shard
       # runner compiles nothing.
       - name: cargo build --release (service binaries + shard tests)
-        env:
-          CC: ${{ github.workspace }}/scripts/ci/cc-x86-64-v3.sh
-          CXX: ${{ github.workspace }}/scripts/ci/cxx-x86-64-v3.sh
         run: |
           cargo build --release \
             -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
@@ -169,9 +163,10 @@ jobs:
           # because it links the scenario drivers.
           cargo build --release -p e2e --features full-pipeline-e2e \
             --bin kardamom-semantics
-          # The shard tests and the operator binary (diagnostics on failure).
-          cargo test -p kardamom-chaos --release --features cluster-e2e --locked --no-run
-          cargo build --release -p kardamom-chaos --locked --bin kardamom-cluster
+          # Build the integration executable and operator in one Cargo graph.
+          # Unit-test executables belong to the ordinary CI test job.
+          cargo build --release -p kardamom-chaos --features cluster-e2e --locked \
+            --bin kardamom-cluster --test shards
 
       # One download of the Aeron jar for the whole run. The artifact
       # carries it to every shard, where the images role builds the Aeron
@@ -199,30 +194,17 @@ jobs:
     # Same base as the build job: the staged binaries and libaeron.so link
     # this glibc.
     runs-on: ubuntu-24.04
-    # Every shard creates its own cluster. Recovery shards also audit the
-    # persisted state and rebuild it from L1. The carry shard runs nine
-    # serial rollout cases with staged Ansible deployments. It has a
-    # five-hour job budget. The executor shard has three hours for node
-    # replacement, two full deployment passes and the final state proofs.
-    # Other shards have two hours. Per-case recovery deadlines bound the faults.
-    timeout-minutes: ${{ matrix.shard == 'chaos-carry' && 300 || matrix.shard == 'chaos-executor' && 180 || 120 }}
+    # Recovery includes the persisted-state proof and teardown.
+    # The measured timing audit rejects jobs above the 15-minute target.
+    timeout-minutes: ${{ matrix.shard == 'chaos-executor' && 180 || 120 }}
     strategy:
       # Don't cancel the other shards if one fails — we want every shard's
       # result on a single run.
       fail-fast: false
       matrix:
-        # `load` = the 5-min sustained-load soak. The `chaos-*` shards split the
-        # chaos cases (each brings up its own cluster). Every regular chaos
-        # shard but chaos-carry is carry-born (KARDAMOM_GENESIS_CARRY=on, set
-        # by Shard::deploy_vars in crates/chaos): the chain starts with the
-        # carry window on, the executors run in carry mode on the sealer
-        # nodes, and the batcher and the validator read the egress. The cases
-        # find the executors there and expect no recorded cursor, no void and
-        # the heal from the egress. chaos-carry and the nightly
-        # chaos-integrity stay reference-born. chaos-cluster covers the
-        # 3-member Raft sealer (leader-kill / follower-kill / member-rejoin);
-        # it SUPERSEDES the old chaos-sealer shard (the single-sealer SPOF is gone
-        # now the deploy uses the clustered sealer — see "Configure shard").
+        # Every regular shard starts with carry enabled. The load shard
+        # soaks for five minutes. Recovery shards inject faults into that
+        # same configuration and prove the recovered persisted state.
         # chaos-fleet takes every replica of one role down at once: the sealer
         # quorum, the whole sealer set, the whole executor set, with and
         # without their state databases, and the whole redis job.
@@ -239,12 +221,7 @@ jobs:
         # an outage past the sealer's retention.
         # chaos-follower runs behind the same lying L1: the loss of one and
         # of both L1 follower instances, and the disagreement of the two.
-        # chaos-carry turns the carry window on in the order of the staging
-        # rollout on a reference-born chain: the member feed, the executors
-        # on the sealer nodes, the egress, the v2 loop of the sequencers,
-        # features 3, 4 and 5 by upgrade transaction, and the executors to
-        # carry mode one at a time. Then it kills the leader at the switch,
-        # turns feature 5 off and on, and restarts an egress instance.
+        # chaos-carry tests deposits across provider loss and egress restart.
         # chaos-integrity (nightly, reference-born) stops and restores the
         # executor job ten times under load; every executor must advance
         # after each round. Then it wipes the whole sealer set and restarts

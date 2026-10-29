@@ -2,13 +2,8 @@
 //! of the cases. The lists and the per-shard settings mirror the
 //! `cluster-e2e` workflow, so a local shard run behaves like CI.
 //!
-//! Every regular shard brings up a carry-born cluster
-//! (`KARDAMOM_GENESIS_CARRY=on`): the chain starts with the carry window
-//! on, and the executors run in carry mode on the sealer nodes. Two shards
-//! stay reference-born: `chaos-carry` tests the upgrade of a live chain
-//! to the carry window, and the nightly `chaos-integrity` keeps the
-//! reference mode, the recorded cursor, the voids and the seeded restart
-//! of the sealer fleet under test.
+//! Regular shards start with the final carry configuration. The nightly
+//! integrity shard retains reference mode for its v1-only resize protocol.
 
 use crate::knobs::Knobs;
 use crate::lifecycle::{CarrySwitches, DeployVars, EgressStage};
@@ -69,15 +64,12 @@ impl Shard {
     /// proves the rebuild from L1 before the next. The executors and the
     /// members die together in the first exec case, so the state every
     /// executor kept is compared with the validator's before the next
-    /// case builds on it. The carry shard compares the state of the
-    /// first executor in carry mode with the executors in reference
-    /// mode. The last case's stage is the one in the shard's tail.
+    /// case builds on it. The last case's stage is the one in the shard's tail.
     #[must_use]
     pub fn audits_after(self, case: &str) -> bool {
         match self {
             Self::L1 | Self::Follower => true,
             Self::CombinedExec => case == "executor-sealer-loss-recover",
-            Self::Carry => case == "carry-executor-first",
             _ => false,
         }
     }
@@ -215,20 +207,7 @@ impl Shard {
                 "sealer-fleet-total-wipe-recover",
                 "resize-scale-out-in",
             ],
-            // The activation of the carry window in the order of the
-            // staging rollout, then the faults around its switch. Each
-            // step needs the steps before it.
-            Self::Carry => &[
-                "carry-versions-on",
-                "carry-held-offer-after-downgrade",
-                "carry-readers-on-egress",
-                "carry-window-on",
-                "carry-executor-first",
-                "carry-executors-rest",
-                "carry-window-off-on",
-                "carry-leader-kill-at-switch",
-                "carry-egress-restart",
-            ],
+            Self::Carry => &["carry-deposits-provider-fault", "carry-egress-restart"],
         }
     }
 
@@ -242,11 +221,8 @@ impl Shard {
     /// shards turn the block log of the checkpoints on: they run the
     /// checkpoint restore, the peer resync, the retention overrun and the
     /// state mirror rebuild. The other shards keep it off, so both modes
-    /// stay tested. The carry shard deploys the member feed, the
-    /// executors on the sealer nodes, the egress and the v2 loop of the
-    /// sequencers, with a snapshot each minute, so a member that stops
-    /// before the switch restores a snapshot, and a retention that the
-    /// exact window keeps.
+    /// stay tested. The carry shard uses the L1 fault proxy
+    /// for deposit recovery and keeps the exact window's retention fixed.
     #[must_use]
     pub fn deploy_vars(self) -> DeployVars {
         DeployVars {
@@ -256,10 +232,10 @@ impl Shard {
     }
 
     /// Whether the shard brings up a carry-born cluster: every shard but
-    /// the two reference-born ones of the module doc.
+    /// the reference-born integrity shard.
     #[must_use]
     pub fn carry_born(self) -> bool {
-        !matches!(self, Self::Carry | Self::Integrity)
+        !matches!(self, Self::Integrity)
     }
 
     /// The knobs of the shard's cases: the environment, the shard's
@@ -420,7 +396,7 @@ mod tests {
 
     #[test]
     fn every_regular_shard_is_carry_born_and_its_knobs_follow_the_deploy() {
-        let reference = [Shard::Carry, Shard::Integrity];
+        let reference = [Shard::Integrity];
         for shard in ALL {
             let born = !reference.contains(&shard);
             let knobs = shard.knobs().unwrap();
@@ -429,15 +405,8 @@ mod tests {
             assert_eq!(knobs.genesis_carry, born, "{}", shard.name());
             // A carry executor sends no recorded cursor.
             assert!(!shard.deploy_vars().exec_cursor, "{}", shard.name());
-            // The carry shard deploys the executors on the sealer nodes
-            // itself, in reference mode.
             let on_sealers = knobs.executor_nodes == ExecutorNodes::Sealer;
-            assert_eq!(
-                on_sealers,
-                born || shard == Shard::Carry,
-                "{}",
-                shard.name()
-            );
+            assert_eq!(on_sealers, born, "{}", shard.name());
         }
     }
 
@@ -461,7 +430,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 80);
+        assert_eq!(all.len(), 73);
         assert_eq!(
             Shard::Integrity.cases().last(),
             Some(&"resize-scale-out-in")
@@ -524,7 +493,10 @@ mod tests {
             knobs.cluster_retention.map(std::num::NonZeroU64::get),
             Some(CARRY_RETENTION)
         );
-        assert!(Shard::Carry.audits_after("carry-executor-first"));
-        assert_eq!(Shard::Carry.cases().first(), Some(&"carry-versions-on"));
+        assert!(!Shard::Carry.audits_after("carry-executor-first"));
+        assert_eq!(
+            Shard::Carry.cases().first(),
+            Some(&"carry-deposits-provider-fault")
+        );
     }
 }

@@ -2,6 +2,7 @@
 """Record complete CI rounds on one immutable head. Never rerun a failure."""
 
 import argparse
+from datetime import datetime
 import json
 from pathlib import Path
 import re
@@ -14,6 +15,7 @@ WORKFLOWS = {
     "chain-semantics-e2e.yml", "cluster-validate.yml",
 }
 REQUIRED = 10
+JOB_BUDGET_SECONDS = 15 * 60
 
 
 class GitHub:
@@ -42,16 +44,19 @@ class GitHub:
                 "id", "head_sha", "head_branch", "event", "path", "status",
                 "conclusion", "created_at", "updated_at", "html_url", "run_attempt",
             )
-        } | {"jobs": [{key: job[key] for key in ("name", "status", "conclusion")} for job in jobs]}
+        } | {"jobs": [{key: job[key] for key in ("name", "status", "conclusion", "started_at", "completed_at")} for job in jobs]}
 
 
 class Streak:
     def __init__(self, head, branch, shards, state=None):
         self.shards = set(shards)
         self.state = state or {
-            "version": 1, "head": head, "branch": branch,
+            "version": 3, "head": head, "branch": branch,
             "required": REQUIRED, "streak": 0, "rounds": [],
+            "job_budget_seconds": JOB_BUDGET_SECONDS,
         }
+        if self.state.get("job_budget_seconds") != JOB_BUDGET_SECONDS:
+            raise ValueError("timing policy changed; retain the old audit and start a new state file")
         if self.state["head"] != head or self.state["branch"] != branch:
             raise ValueError("head or branch changed; retain this audit and start a new state file")
 
@@ -76,7 +81,39 @@ class Streak:
             return "failed"
         if self.missing_coverage(runs):
             return "failed"
+        if any(job["status"] != "completed" for run in runs for job in run["jobs"]):
+            return "pending"
+        if self.slow_jobs(runs):
+            return "failed"
         return "green"
+
+    @staticmethod
+    def elapsed_seconds(runs):
+        """The complete round includes dispatch gaps, queueing, builds and teardown."""
+        intervals = [(datetime.fromisoformat(run["created_at"].replace("Z", "+00:00")),
+                      datetime.fromisoformat(run["updated_at"].replace("Z", "+00:00")))
+                     for run in runs]
+        if any(start.tzinfo is None or end.tzinfo is None or end < start
+               for start, end in intervals):
+            raise ValueError("workflow timing needs ordered timestamps with time zones")
+        return (max(end for _, end in intervals) - min(start for start, _ in intervals)).total_seconds()
+
+    @staticmethod
+    def slow_jobs(runs):
+        """Measure execution per job; dependency and runner queue time are separate."""
+        slow = []
+        for run in runs:
+            for job in run["jobs"]:
+                if job["status"] != "completed" or job["conclusion"] == "skipped":
+                    continue
+                start = datetime.fromisoformat(job["started_at"].replace("Z", "+00:00"))
+                end = datetime.fromisoformat(job["completed_at"].replace("Z", "+00:00"))
+                if start.tzinfo is None or end.tzinfo is None or end < start:
+                    raise ValueError("job timing needs ordered timestamps with time zones")
+                seconds = (end - start).total_seconds()
+                if seconds > JOB_BUDGET_SECONDS:
+                    slow.append({"workflow": run["path"], "job": job["name"], "seconds": seconds})
+        return slow
 
     def missing_coverage(self, runs):
         cluster = next(run for run in runs if Path(run["path"]).name == "cluster-e2e.yml")
@@ -99,6 +136,12 @@ class Streak:
             "started_at": min(run["created_at"] for run in runs),
             "updated_at": max(run["updated_at"] for run in runs), "workflows": runs,
             "missing_green_coverage": self.missing_coverage(runs),
+            "elapsed_seconds": self.elapsed_seconds(runs),
+            "slow_jobs": self.slow_jobs(runs) if status == "green" or all(
+                job.get("started_at") and job.get("completed_at")
+                for run in runs for job in run["jobs"] if job["status"] == "completed"
+            ) else [],
+            "job_budget_seconds": JOB_BUDGET_SECONDS,
         }
         rounds = sorted(previous + [row], key=lambda item: item["started_at"])
         self.validate_order(rounds)
