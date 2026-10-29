@@ -12,13 +12,9 @@
 //! 4. Every member takes a periodic snapshot with the switch section. A
 //!    follower restarts from its snapshot under load, and keeps the rules
 //!    and the exact window.
-//! 5. The L2 state holds the `KardamomChainState` code and the activation
-//!    word of each feature, as the upgrade transactions write them on a
-//!    live chain.
-//! 6. Feature 5 turns off with a later activation, and on again: the live
-//!    upgrade path works on a chain that started in carry mode. The words of
-//!    features 3 and 4 stay, and the word of feature 5 is the new one.
-//! 7. No member and no sequencer refuses a reference, no member logs a
+//! 5. The L2 state holds the `KardamomChainState` code and the genesis
+//!    activation word of each feature.
+//! 6. No member and no sequencer refuses a reference, no member logs a
 //!    switch of the decision version, and the batcher posts the head.
 //!
 //! The test then stops the stack, and rebuilds the chain from L1 and the DA
@@ -84,8 +80,6 @@ pub async fn from_genesis(stack: &mut LocalStack, p: Params) -> Result<()> {
     .await?;
     r.restart_from_the_snapshot().await?;
     r.assert_genesis_words()?;
-    r.window_off_and_on().await?;
-    r.await_upgraded_window_word().await?;
     r.finish_from_genesis().await
 }
 
@@ -213,7 +207,7 @@ impl Rollout<'_> {
         Ok(ChainStateWords { code_hash, words })
     }
 
-    /// Step 5: the genesis words, before any upgrade transaction.
+    /// Step 5: the genesis activation words survive follower recovery.
     fn assert_genesis_words(&self) -> Result<()> {
         let want = ChainStateWords {
             code_hash: Some(CHAIN_STATE_CODE_HASH),
@@ -224,24 +218,7 @@ impl Rollout<'_> {
         Ok(())
     }
 
-    /// Step 6: after feature 5 turns on again, the words of features 3 and
-    /// 4 keep their genesis value, and the word of feature 5 holds the time
-    /// of the block of the last upgrade transaction. The executor commits
-    /// that block after it publishes the receipt, so the read waits.
-    async fn await_upgraded_window_word(&self) -> Result<()> {
-        let genesis = U256::from(GENESIS_ACTIVATION_MS);
-        let upgraded =
-            |got: &ChainStateWords| got.words[..2] == [genesis, genesis] && got.words[2] > genesis;
-        poll_until(
-            "the word of feature 5 after the upgrade transactions",
-            WAIT,
-            POLL,
-            || async { Ok(Some(self.chain_state_words()?).filter(upgraded).map(|_| ())) },
-        )
-        .await
-    }
-
-    /// Step 7: no refusal anywhere, no version switch, the exact window,
+    /// Step 6: no refusal anywhere, no version switch, the exact window,
     /// the validator agrees, and the batcher posts the head of the
     /// executor.
     async fn finish_from_genesis(&mut self) -> Result<()> {

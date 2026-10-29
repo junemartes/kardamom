@@ -5,16 +5,11 @@
 async fn s13h_canonical_prefix_without_execution_receipts() {
     use e2e::harness::{l2, metrics};
     use e2e::scenarios::{assert_receipt_ok, await_l2_receipt, metric_u64};
-    let base = carry_stack_config(
+    let cfg = carry_stack_config(
         std::num::NonZeroUsize::MIN,
         IngressOptions::default().pending_receipt_timeout,
     );
-    let stack = launch_l1_or_skip!(StackConfig {
-        carry: base
-            .carry
-            .map(|c| e2e::harness::CarryOptions { genesis: true, ..c }),
-        ..base
-    });
+    let stack = launch_l1_or_skip!(cfg);
     let t = target(&stack);
     let signer = l2::dev_signers_through(1).unwrap().remove(1);
     let payee = alloy_primitives::Address::repeat_byte(0xC8);

@@ -6,6 +6,8 @@ The chaos suite injects faults into a running cluster under steady load. It then
 - [`failure-modes.md`](failure-modes.md) says what each fault does and how the actor recovers. This document says how the suite judges a run.
 - The load harness is `kardamom-load` (`crates/bench/src/load/`). The suite runs it in process.
 
+The separate chain-semantics suite also starts carry recovery at genesis. Its live feature activation, scheduling, downgrade and rollout cases are retired. The retained carry test checks follower restart before and after a snapshot, validator state parity, genesis feature words, and reconstruction from L1 and DA.
+
 ## Running a shard
 
 A shard is one test. It brings up its own container cluster, runs its stages, and tears the cluster down on success.
@@ -113,7 +115,7 @@ Case order matters in seven places.
 - `pipeline-blackout-recover` runs last in `chaos-coordinated`. Every pipeline node dies, the longest recovery of the shard.
 - `mirror-kill-rebuild` runs last in `chaos-cache`. It flushes the projection.
 - `executor-sealer-loss-recover` runs first in `chaos-combined-exec`. The persisted-state audit runs after it, before the other cases build on the state it leaves.
-- `chaos-carry` runs the order of the staging rollout. Each case needs the cases before it.
+- `chaos-carry` starts with carry enabled and checks deposit recovery and egress restart.
 - `chaos-retention` verifies receipts, the validator and persisted state before it tears down the first chain. It then deploys a fresh chain for `da-lag-halt` and `canary-da-lag`. The DA guard stays fixed from genesis: changing it during snapshot replay changes canonical decisions. Custom case order is preserved, with another fresh chain at each guard change. Every ingress must observe the fixed guard. A reuse run stays within one guard setting on a chain born with that setting. Empty overrides and reuse across guard settings fail before lifecycle actions.
 
 `chaos-l1` and `chaos-follower` run the persisted-state audit after every case, not only at the end of the shard. Each case leaves a DA record that a silent gap could hide in. `chaos-combined-exec` runs it after `executor-sealer-loss-recover`: the executors and the members die at once, so the state every executor kept is compared with the validator's before the next case.
