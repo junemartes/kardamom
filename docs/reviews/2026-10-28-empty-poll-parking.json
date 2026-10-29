@@ -1,0 +1,295 @@
+{
+  "date": "2026-10-28",
+  "issue": 909,
+  "qualified_for_release": false,
+  "measured_candidate_source": "03acbe82482e5cfce2090daadaa37945a2939f1f",
+  "baseline_source": "b9bf2222d2ca07df97a9268b677512f590547374",
+  "changes": "Park empty Aeron command waits only under explicit idle caps >=1000us. Preserve recv_timeout after useful work and for unset/short caps. Pending offer retry cadence and expiry are unchanged.",
+  "environment": {
+    "cpu_affinity": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "shared_host": true,
+    "driver_image": "sha256:5f091d6456a75476de0e26ca66c037969d87c32f1fa8b0ee692e4ea10b4ff2dc",
+    "clock_ticks_per_second": 100,
+    "binary_hashes": {
+      "baseline": "a10ee5bf84180d19210d24cbe4f900423460d74d58a8dbd956efb7a4a0e34054",
+      "candidate": "b0f8d8b4704f88f22916ae846665cbc7191bcaf8a42186cefb7129d23eeb344f"
+    }
+  },
+  "limits": [
+    "Shared 12-CPU workstation; Rust process affinity limited to CPUs0-3; Docker Java driver not pinned.",
+    "No builds initiated by this experiment overlap these final trials; other agents share the host.",
+    "Process CPU excludes the Java driver. These 1KiB serialized transport messages are not transaction load measurements.",
+    "Three alternating pairs per configuration. Short phases and 64 quiet-arrival samples do not establish production p99 or statistical equivalence.",
+    "Both production latency measurements, rate, exact state and validator coverage remain unqualified.",
+    "Final-head distributed recovery with unchanged deadlines is required."
+  ],
+  "validation": {
+    "transport_trials_passed": 12,
+    "log_unit_tests_passed": 153,
+    "workspace_style": "passed",
+    "case_qualification_credit": 0
+  },
+  "summary": [
+    {
+      "idle_cap_us": 1000,
+      "phase": "idle",
+      "baseline": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.5596186538717676,
+        "mean_messages_per_second": 0.0,
+        "mean_trial_p99_us": 0.0
+      },
+      "candidate": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.174329104375542,
+        "mean_messages_per_second": 0.0,
+        "mean_trial_p99_us": 0.0
+      }
+    },
+    {
+      "idle_cap_us": 1000,
+      "phase": "quiet_arrivals_connected",
+      "baseline": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.5854995808062188,
+        "mean_messages_per_second": 82.06136655210989,
+        "mean_trial_p99_us": 2368.3546666666666
+      },
+      "candidate": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.18846227024116466,
+        "mean_messages_per_second": 82.23531094739317,
+        "mean_trial_p99_us": 2371.714
+      }
+    },
+    {
+      "idle_cap_us": 1000,
+      "phase": "connected",
+      "baseline": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.8031381718603019,
+        "mean_messages_per_second": 5946.811788928135,
+        "mean_trial_p99_us": 347.278
+      },
+      "candidate": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.36471110182553373,
+        "mean_messages_per_second": 5599.27827347636,
+        "mean_trial_p99_us": 348.2783333333333
+      }
+    },
+    {
+      "idle_cap_us": 1000,
+      "phase": "outputs_unavailable_idle",
+      "baseline": {
+        "trials": 3,
+        "mean_process_cpu_cores": 2.3087207846402755,
+        "mean_messages_per_second": 0.0,
+        "mean_trial_p99_us": 0.0
+      },
+      "candidate": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.8161856237531999,
+        "mean_messages_per_second": 0.0,
+        "mean_trial_p99_us": 0.0
+      }
+    },
+    {
+      "idle_cap_us": 1000,
+      "phase": "quiet_arrivals_outputs_unavailable",
+      "baseline": {
+        "trials": 3,
+        "mean_process_cpu_cores": 2.343981794772281,
+        "mean_messages_per_second": 85.55321702873525,
+        "mean_trial_p99_us": 1883.4346666666668
+      },
+      "candidate": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.8036159759172892,
+        "mean_messages_per_second": 86.19505950180991,
+        "mean_trial_p99_us": 1462.2556666666667
+      }
+    },
+    {
+      "idle_cap_us": 1000,
+      "phase": "outputs_unavailable",
+      "baseline": {
+        "trials": 3,
+        "mean_process_cpu_cores": 2.0737301810061175,
+        "mean_messages_per_second": 4318.567159911321,
+        "mean_trial_p99_us": 674.6353333333333
+      },
+      "candidate": {
+        "trials": 3,
+        "mean_process_cpu_cores": 1.0110558649600796,
+        "mean_messages_per_second": 5548.161204716309,
+        "mean_trial_p99_us": 458.68600000000004
+      }
+    },
+    {
+      "idle_cap_us": 1000,
+      "phase": "output_rejoin",
+      "baseline": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.6324854986841784,
+        "mean_messages_per_second": 8.550103641796063,
+        "mean_trial_p99_us": 128305.38166666667
+      },
+      "candidate": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.19931113810505757,
+        "mean_messages_per_second": 8.73258070151029,
+        "mean_trial_p99_us": 128358.84266666665
+      }
+    },
+    {
+      "idle_cap_us": 1000,
+      "phase": "recovered",
+      "baseline": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.8532241168765898,
+        "mean_messages_per_second": 6046.639333987873,
+        "mean_trial_p99_us": 391.115
+      },
+      "candidate": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.40208421207530165,
+        "mean_messages_per_second": 5881.917616644412,
+        "mean_trial_p99_us": 378.0113333333333
+      }
+    },
+    {
+      "idle_cap_us": 50,
+      "phase": "idle",
+      "baseline": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.23878689268087067,
+        "mean_messages_per_second": 0.0,
+        "mean_trial_p99_us": 0.0
+      },
+      "candidate": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.23660824815579132,
+        "mean_messages_per_second": 0.0,
+        "mean_trial_p99_us": 0.0
+      }
+    },
+    {
+      "idle_cap_us": 50,
+      "phase": "quiet_arrivals_connected",
+      "baseline": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.26024023977273625,
+        "mean_messages_per_second": 86.14137235108134,
+        "mean_trial_p99_us": 1285.0006666666668
+      },
+      "candidate": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.2607218137863341,
+        "mean_messages_per_second": 86.30742575522594,
+        "mean_trial_p99_us": 1595.5216666666665
+      }
+    },
+    {
+      "idle_cap_us": 50,
+      "phase": "connected",
+      "baseline": {
+        "trials": 3,
+        "mean_process_cpu_cores": 1.215116467026799,
+        "mean_messages_per_second": 26739.40157599847,
+        "mean_trial_p99_us": 152.02166666666665
+      },
+      "candidate": {
+        "trials": 3,
+        "mean_process_cpu_cores": 1.1074863289575665,
+        "mean_messages_per_second": 25258.34263791801,
+        "mean_trial_p99_us": 118.21466666666667
+      }
+    },
+    {
+      "idle_cap_us": 50,
+      "phase": "outputs_unavailable_idle",
+      "baseline": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.6461596838328755,
+        "mean_messages_per_second": 0.0,
+        "mean_trial_p99_us": 0.0
+      },
+      "candidate": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.6429215500827713,
+        "mean_messages_per_second": 0.0,
+        "mean_trial_p99_us": 0.0
+      }
+    },
+    {
+      "idle_cap_us": 50,
+      "phase": "quiet_arrivals_outputs_unavailable",
+      "baseline": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.6518620359544762,
+        "mean_messages_per_second": 86.9149381272635,
+        "mean_trial_p99_us": 1328.2576666666666
+      },
+      "candidate": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.6538327456042766,
+        "mean_messages_per_second": 87.17391135174435,
+        "mean_trial_p99_us": 1209.4196666666667
+      }
+    },
+    {
+      "idle_cap_us": 50,
+      "phase": "outputs_unavailable",
+      "baseline": {
+        "trials": 3,
+        "mean_process_cpu_cores": 1.1539713093375266,
+        "mean_messages_per_second": 28987.21771179429,
+        "mean_trial_p99_us": 83.90766666666666
+      },
+      "candidate": {
+        "trials": 3,
+        "mean_process_cpu_cores": 1.1531888593774988,
+        "mean_messages_per_second": 26750.859884139845,
+        "mean_trial_p99_us": 159.64866666666668
+      }
+    },
+    {
+      "idle_cap_us": 50,
+      "phase": "output_rejoin",
+      "baseline": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.5334905078881852,
+        "mean_messages_per_second": 6.158390411319742,
+        "mean_trial_p99_us": 115620.66100000001
+      },
+      "candidate": {
+        "trials": 3,
+        "mean_process_cpu_cores": 0.501634062399922,
+        "mean_messages_per_second": 7.52346049565008,
+        "mean_trial_p99_us": 81958.83533333334
+      }
+    },
+    {
+      "idle_cap_us": 50,
+      "phase": "recovered",
+      "baseline": {
+        "trials": 3,
+        "mean_process_cpu_cores": 1.1175821631489267,
+        "mean_messages_per_second": 27563.668065143454,
+        "mean_trial_p99_us": 210.97299999999998
+      },
+      "candidate": {
+        "trials": 3,
+        "mean_process_cpu_cores": 1.2378210789385813,
+        "mean_messages_per_second": 29929.878424900777,
+        "mean_trial_p99_us": 100.20466666666667
+      }
+    }
+  ]
+}
