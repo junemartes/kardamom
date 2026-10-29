@@ -5,8 +5,10 @@
 //! calls [`free_port`] for an address to pass to [`crate::init`], then
 //! [`scrape`] to poll that address until the Prometheus exporter answers.
 
+use std::fs::{File, TryLockError};
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::ops::ControlFlow;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -35,26 +37,66 @@ pub fn free_udp_port() -> SocketAddr {
 /// The ports the test helpers hand out: 20000 to 31999, below Linux's
 /// default ephemeral range (32768 to 60999).
 ///
-/// A port a helper releases is bound again later by a child process. An
-/// ephemeral port could be taken in that window by any outgoing connection
-/// or port-0 socket on the host, and the e2e stack makes many: an executor
-/// failed with "bind nonce query address: Address already in use". A port
-/// in this range is taken only by an explicit bind. One cursor per process
-/// also keeps two calls from handing out the same port; the start depends
-/// on the process id, so two test binaries at once start apart.
+/// A child binds its port after the helper returns. An ephemeral port
+/// can be taken in that window by an outgoing connection or port-0 socket.
+/// A port in this range is taken only by an explicit bind. Each process holds an
+/// exclusive file lock for every 250-port range it uses. Other test
+/// processes cannot select those ports while a child is starting. The OS
+/// releases the locks when the test process exits, including after a crash.
 struct TestPorts {
     next: AtomicU32,
+    directory: PathBuf,
+    leases: [OnceLock<Option<File>>; 48],
 }
 
 impl TestPorts {
     const FIRST: u32 = 20_000;
     const COUNT: u32 = 12_000;
+    const RANGE_SIZE: u32 = 250;
+
+    fn new(seed: u32, directory: PathBuf) -> Self {
+        std::fs::create_dir_all(&directory).expect("create the shared test-port lock directory");
+        Self {
+            next: AtomicU32::new(seed % Self::COUNT),
+            directory,
+            leases: std::array::from_fn(|_| OnceLock::new()),
+        }
+    }
 
     fn shared() -> &'static Self {
         static PORTS: OnceLock<TestPorts> = OnceLock::new();
-        PORTS.get_or_init(|| Self {
-            next: AtomicU32::new(std::process::id() % Self::COUNT),
+        PORTS.get_or_init(|| {
+            Self::new(
+                std::process::id(),
+                std::env::temp_dir().join("kardamom-test-port-locks"),
+            )
         })
+    }
+
+    fn reserve_range(&self, range: usize) -> Option<File> {
+        // Lock files stay in place so every process locks the same inode.
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.directory.join(format!("{range}.lock")))
+            .expect("open a test-port range lock");
+        match file.try_lock() {
+            Ok(()) => Some(file),
+            Err(TryLockError::WouldBlock) => None,
+            Err(TryLockError::Error(error)) => panic!("lock a test-port range: {error}"),
+        }
+    }
+
+    fn owns_range(&self, port: u16) -> bool {
+        let offset = u32::from(port)
+            .checked_sub(Self::FIRST)
+            .expect("the cursor yields a test port");
+        let range = usize::try_from(offset / Self::RANGE_SIZE).expect("range index fits usize");
+        self.leases[range]
+            .get_or_init(|| self.reserve_range(range))
+            .is_some()
     }
 
     /// The next port of the range, in cursor order, wrapping at the end.
@@ -67,6 +109,7 @@ impl TestPorts {
     fn claim(&self, bind: impl Fn(u16) -> std::io::Result<SocketAddr>) -> SocketAddr {
         (0..Self::COUNT)
             .map(|_| self.next_port())
+            .filter(|port| self.owns_range(*port))
             .find_map(|port| bind(port).ok())
             .expect("a free loopback port in 20000-31999")
     }
@@ -211,33 +254,5 @@ fn poll_outcome<T>(
 }
 
 #[cfg(test)]
-mod port_tests {
-    use super::{TestPorts, free_port, free_udp_port};
-
-    #[test]
-    fn ports_come_from_below_the_ephemeral_range_and_do_not_repeat() {
-        let ports: Vec<u16> = (0..64).map(|_| free_port().port()).collect();
-        assert!(ports.iter().all(|p| (20_000..32_000).contains(p)));
-        let mut unique = ports.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), ports.len());
-        assert!((20_000..32_000).contains(&free_udp_port().port()));
-    }
-
-    #[test]
-    fn a_port_that_does_not_bind_is_skipped() {
-        let tried = std::cell::RefCell::new(Vec::new());
-        let got = TestPorts::shared().claim(|port| {
-            tried.borrow_mut().push(port);
-            if tried.borrow().len() < 3 {
-                return Err(std::io::Error::from(std::io::ErrorKind::AddrInUse));
-            }
-            Ok(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
-        });
-        let tried = tried.into_inner();
-        assert_eq!(tried.len(), 3);
-        assert_eq!(got.port(), tried[2]);
-        assert!(tried[..2].iter().all(|p| *p != got.port()));
-    }
-}
+#[path = "testkit_port_tests.rs"]
+mod port_tests;
