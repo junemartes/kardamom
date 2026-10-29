@@ -12,6 +12,9 @@ use crate::rpc::Rpc;
 mod network;
 use network::{Action, Check, NodeView, Step};
 
+#[cfg(test)]
+mod tests;
+
 const CTX: &str = "control-plane-loss-recover";
 const HOLD: Duration = Duration::from_secs(75);
 const CLIENT_BOUND: Duration = Duration::from_secs(30);
@@ -66,14 +69,18 @@ impl ControlPlane {
         cleared?;
         report?;
         self.all(Action::Available).await?;
-        let budget = h.knobs.reschedule_slo;
-        tokio::time::timeout(budget, Self::await_workers(h, budget))
-            .await
-            .context("the workers do not return within the reschedule budget")??;
+        Self::await_workers(h).await?;
         h.assert_progress().await
     }
 
-    async fn await_workers(h: &mut Harness, budget: Duration) -> anyhow::Result<()> {
+    async fn await_workers(h: &mut Harness) -> anyhow::Result<()> {
+        let budget = h.knobs.reschedule_slo;
+        tokio::time::timeout(budget, Self::workers_ready(h, budget))
+            .await
+            .context("the workers do not return within the reschedule budget")?
+    }
+
+    async fn workers_ready(h: &mut Harness, budget: Duration) -> anyhow::Result<()> {
         for (job, count) in [
             (CLUSTER_TASK, 3),
             ("executor", 3),
@@ -82,7 +89,9 @@ impl ControlPlane {
         ] {
             h.assert_count(job, count, budget).await?;
         }
-        Ok(())
+        // Nomad can report running before the ingress connects to the
+        // cluster and binds RPC. Both listeners share the reschedule deadline.
+        h.assert_ingress_pair_live(CTX).await
     }
 
     async fn isolated(&mut self, h: &Harness) -> anyhow::Result<()> {

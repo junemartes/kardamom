@@ -1436,6 +1436,66 @@
           "exit_code": 101
         }
       ]
+    },
+    "discovery-registration": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-log",
+        "--test",
+        "consul_register_retry"
+      ],
+      "real": [
+        "ConsulClient HTTP requests and typed error classification",
+        "Registration::register",
+        "StartRetry bounded retry"
+      ],
+      "controlled": [
+        "scripted HTTP agent failures and lost TTL checks"
+      ],
+      "tests": [
+        "a_registration_tries_again_until_the_agent_accepts",
+        "a_refused_registration_fails_at_once",
+        "a_registration_gives_up_on_an_agent_that_never_listens",
+        "the_cluster_member_read_tries_again_while_the_agent_has_no_server",
+        "the_cluster_member_read_fails_after_the_limit",
+        "a_lost_check_repeats_the_whole_registration",
+        "a_check_that_keeps_disappearing_exhausts_the_existing_limit",
+        "a_check_pass_acl_denial_remains_permanent",
+        "a_missing_registration_endpoint_remains_permanent",
+        "a_missing_member_query_endpoint_remains_permanent"
+      ],
+      "limitation": "The agent is controlled; real Consul check loss is covered separately. Distributed validator catch-up and control-plane recovery remain required."
+    },
+    "discovery-check-loss": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-log",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "consul_discovery",
+        "a_check_removed_after_registration_is_recoverable",
+        "--",
+        "--ignored"
+      ],
+      "real": [
+        "Consul agent in Docker",
+        "service and TTL check registration",
+        "HTTP missing-check response and re-registration"
+      ],
+      "controlled": [
+        "explicit deregistration between registration and check pass"
+      ],
+      "tests": [
+        "a_check_removed_after_registration_is_recoverable"
+      ],
+      "limitation": "One isolated Consul agent; this does not qualify fleet rescheduling, validator catch-up or the cause of a distributed catalog deletion."
     }
   },
   "families": {

@@ -226,3 +226,61 @@ async fn the_cluster_member_read_fails_after_the_limit() {
     assert!(matches!(error, LogError::CatalogUnavailable(_)), "{error}");
     assert!(requests.load(Ordering::SeqCst) > 1);
 }
+
+#[tokio::test]
+async fn a_lost_check_repeats_the_whole_registration() {
+    let (agent, requests) = FakeAgent::start(vec![
+        Answer::Status("200 OK"),
+        Answer::Status("404 Not Found"),
+    ])
+    .await;
+    let registration = register(agent).await.expect("lost check recreated");
+    // The first register succeeds but its check is lost. Register and
+    // pass both run again before a heartbeat can start.
+    assert_eq!(requests.load(Ordering::SeqCst), 4);
+    registration.deregister().await.expect("deregistered");
+}
+
+#[tokio::test]
+async fn a_check_that_keeps_disappearing_exhausts_the_existing_limit() {
+    let script = [Answer::Status("200 OK"), Answer::Status("404 Not Found")]
+        .into_iter()
+        .cycle()
+        .take(1000)
+        .collect();
+    let (agent, requests) = FakeAgent::start(script).await;
+    let error = register(agent).await.err().expect("check never stays");
+    assert!(matches!(error, LogError::CatalogCheckMissing(_)), "{error}");
+    assert!(requests.load(Ordering::SeqCst) > 2);
+}
+
+#[tokio::test]
+async fn a_check_pass_acl_denial_remains_permanent() {
+    let (agent, requests) = FakeAgent::start(vec![
+        Answer::Status("200 OK"),
+        Answer::Status("403 Forbidden"),
+    ])
+    .await;
+    let error = register(agent).await.err().expect("check denied");
+    assert!(matches!(error, LogError::Discovery(_)), "{error}");
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_missing_registration_endpoint_remains_permanent() {
+    let (agent, requests) = FakeAgent::start(vec![Answer::Status("404 Not Found")]).await;
+    let error = register(agent).await.err().expect("endpoint missing");
+    assert!(matches!(error, LogError::Discovery(_)), "{error}");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_missing_member_query_endpoint_remains_permanent() {
+    let (agent, requests) = FakeAgent::start(vec![Answer::Status("404 Not Found")]).await;
+    let error = plane(agent)
+        .cluster_ingress_endpoints(Duration::from_secs(2))
+        .await
+        .expect_err("endpoint missing");
+    assert!(matches!(error, LogError::Discovery(_)), "{error}");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
