@@ -1,0 +1,39 @@
+{
+  "parents": [
+    "74ed5900ff1e848d8a564ecc3c040795adc211eb",
+    "578cd75dee03ac17156b92a675f121f4f231972e"
+  ],
+  "review": "Resolve catalog conflicts by preserving archive and per-ingress reader controls. Strengthen the wipe to remove the complete owned archive directory; replay must work without any retained archive side file.",
+  "matrix_before_wipe_strengthening": {
+    "source_revision": "d7d62a2dd2ab5320998142ea3ee8037cd269b809",
+    "targets": 34,
+    "passed": 217,
+    "failed": 0,
+    "seconds": 603.962,
+    "results": "/tmp/kardamom-components-wrewzgur/results.json"
+  },
+  "final_changed_archive_target": {
+    "source_revision": "b3146d36cc6b59af0ab0b80dcd84cdc8a017329b",
+    "passed": 2,
+    "failed": 0,
+    "results": "/tmp/kardamom-components-2k1v20e1/results.json"
+  },
+  "negative_control": {
+    "name": "retain_archive_side_files",
+    "compiled": true,
+    "exit_code": 101,
+    "failure": "assertion failed: !fixture.archive().exists()",
+    "log_sha256": "23603e5d5f972b035bbfed0df973efade794f78e05f84afae04d196b597acb3d"
+  },
+  "author_negative_controls": "All four supplied logs match their recorded SHA256, compile successfully and fail at the intended CRC, exact-byte, catalog-copy or session assertion. They precede the complete-directory-wipe strengthening.",
+  "runner_tests_passed": 8,
+  "workspace_style": "passed after final source restoration",
+  "final_code_sha256": {
+    "crates/batcher/tests/archive_recovery.rs": "33ae76e726bde657d339df385c8125e30b8e6924d2f409afa6fca8b1c2cbb44b",
+    "crates/batcher/tests/archive_recovery/support.rs": "83e864241ee638b335a7decd8273071fd147d1386fdeb221406227da4bdb9284",
+    "crates/log/src/testing/cluster.rs": "38f0bad504406dd8a6de3813f9d1432cfc694aeb59cdc8967175e6d3ca4d80ac",
+    ".github/workflows/docker-e2e.yml": "d0c2f2b537bc07831fd5f52fecc64d5c528e40d37aa5c6612ee8ff5c96fffbbf"
+  },
+  "distributed_qualification": false,
+  "limitations": "One recording and segment, copied from the same stopped archive. No independent peer recording, multi-segment, live ingress/executor or load-during-fault proof. Reconciliation reruns all217 controls, then the changed archive target only after strengthening its wipe; no claim of a second full217 run."
+}
