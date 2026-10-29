@@ -1326,6 +1326,42 @@
           "log": "/tmp/backlog-non_atomic_snapshot-negative-20261028.log"
         }
       ]
+    },
+    "chaos-archive-stage": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "cases::archive::staging::tests::"
+      ],
+      "real": [
+        "production segment tar command and unpack path",
+        "GNU tar and local filesystem"
+      ],
+      "controlled": [
+        "selected victim and differently named mirror files",
+        "64MiB unrelated sparse segment and catalog"
+      ],
+      "tests": [
+        "staging_copies_only_the_selected_victim_segment",
+        "staging_reads_the_mirrors_own_recording_name"
+      ],
+      "limitation": "Fixture transport only. Actual Aeron CRC detection, repair, live archive restart and continuous case-owned traffic still require the distributed case. A separate existing repair-tool binary validates selected directories with identical CLI/library source; this does not qualify CRC recovery.",
+      "negative_controls": [
+        {
+          "mutation": "whole_archive_staging",
+          "tests": [
+            "staging_copies_only_the_selected_victim_segment",
+            "staging_reads_the_mirrors_own_recording_name"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        }
+      ]
     }
   },
   "families": {
@@ -1507,8 +1543,17 @@
     {
       "case": "archive-corruption",
       "family": "Ingress",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "chaos-archive-stage",
+          "test": "staging_copies_only_the_selected_victim_segment"
+        },
+        {
+          "suite": "chaos-archive-stage",
+          "test": "staging_reads_the_mirrors_own_recording_name"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {

@@ -1,0 +1,33 @@
+{
+  "binary": "/tmp/kardamom-full-chain-b45c57b2/bin/kardamom-archive-rereplicate",
+  "sha256": "ef5861014a9bc5621d725dd433303ccbe320fb8061ec5a61a7b9fee477d14128",
+  "source_note": "rereplicate library and CLI source have no diff between b45c57b2 and c9a18270. This validates the real repair tool on selected-file directories, not full distributed CRC recovery.",
+  "controls": [
+    {
+      "mirror_segment": "16-0.rec",
+      "victim_segment": "16-0.rec",
+      "diff_exit": 3,
+      "heal_exit": 0,
+      "exact_bytes": true,
+      "destination_files": 1
+    },
+    {
+      "mirror_segment": "24-0.rec",
+      "victim_segment": "16-0.rec",
+      "diff_exit": 3,
+      "heal_exit": 0,
+      "exact_bytes": true,
+      "destination_files": 1
+    }
+  ],
+  "issue": 944,
+  "ordinary_chaos_passed": 346,
+  "ordinary_chaos_ignored": 4,
+  "whole_archive_negative_control": {
+    "compiled": true,
+    "failed_tests": 2,
+    "exit_code": 101
+  },
+  "workspace_style": "passed",
+  "distributed_qualification": false
+}

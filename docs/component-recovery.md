@@ -29,7 +29,7 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 206 checks across 31 targets.
+head. Both targets run in the existing Docker CI job. `all` runs 208 checks across 32 targets.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
@@ -362,3 +362,10 @@ the assertions during the fault require that primary to keep the exact stale
 state. No product service or hot path changes. The local checks do not establish
 Sentinel promotion, mirror coverage, client fallback, distributed load or full-case
 equivalence. The existing deployed shard must still establish those properties.
+
+`just test-component chaos-archive-stage` checks the archive-corruption fixture's
+selected-file transfer with real tar and unpacking. Each selected segment retains
+its bytes and recording name; a 64MiB unrelated segment and the catalog stay out
+of the transfer. Restoring the whole-archive copy fails both checks. The drill
+still uses the repair tool and live CRC verification, and its traffic and recovery
+deadlines stay unchanged. These two checks do not certify the distributed case.
