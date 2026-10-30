@@ -97,7 +97,7 @@ const ORIGIN: Epochs = Epochs {
 /// must stay up through it while the class it needs is still down: its
 /// cluster client connects with retries, and a failed start exits at
 /// once.
-const STAGGER: Duration = Duration::from_secs(8);
+pub(super) const STAGGER: Duration = Duration::from_secs(8);
 
 /// `ingress-sequencer-loss-recover`.
 pub const INGRESS_SEQUENCER: Combined = Combined {
@@ -165,13 +165,13 @@ pub enum Case {
 
 /// One reading of the pipeline while classes are down.
 #[derive(Debug, Clone, Copy)]
-struct Reading {
-    block: u64,
+pub(super) struct Reading {
+    pub(super) block: u64,
     applied: u64,
 }
 
 impl Run<'_> {
-    async fn reading(&self) -> Result<Reading> {
+    pub(super) async fn reading(&self) -> Result<Reading> {
         let scrape = metrics::scrape(self.stack.executor_metrics()).await?;
         Ok(Reading {
             block: metric_u64(scrape.value(EXEC_BLOCK_NUMBER).context("executor block")?)?,
@@ -189,7 +189,7 @@ impl Run<'_> {
     }
 
     /// The sequencer processes of `lane`.
-    fn lane_replicas(&self, lane: u32) -> Result<Vec<usize>> {
+    pub(super) fn lane_replicas(&self, lane: u32) -> Result<Vec<usize>> {
         (0..self.stack.sequencer_count())
             .filter_map(|i| match self.stack.sequencer_lane(i) {
                 Ok(l) if l == lane => Some(Ok(i)),
@@ -357,12 +357,17 @@ impl Case {
     }
 
     /// Set the stack up before the case load: the sequencer cases run two
-    /// replicas of the case sender's lane, as the deployment does.
+    /// replicas of the case sender's lane, as the deployment does. So does
+    /// the sequencer, executor and Redis loss: every replica of the lane
+    /// must look its floors up.
     ///
     /// # Errors
     /// Returns an error when the twin replica does not start.
     pub fn prepare(self, run: &mut Run<'_>) -> Result<()> {
-        if matches!(self, Self::SequencerLaneLoss | Self::GracefulSequencer) {
+        if matches!(
+            self,
+            Self::SequencerLaneLoss | Self::GracefulSequencer | Self::SequencerExecutorRedis
+        ) {
             let lane = run.case_lane()?;
             run.stack.add_sequencer_twin(lane)?;
         }
@@ -605,7 +610,7 @@ impl Class {
         }
     }
 
-    fn start(self, run: &mut Run<'_>) -> Result<()> {
+    pub(super) fn start(self, run: &mut Run<'_>) -> Result<()> {
         let stack = &mut *run.stack;
         match self {
             Self::Sealer => stack.start_sealer(),
@@ -618,7 +623,7 @@ impl Class {
 
     /// Every process of the class still runs: it waited for what it
     /// needs, with no exit.
-    fn assert_up(self, run: &mut Run<'_>) -> Result<()> {
+    pub(super) fn assert_up(self, run: &mut Run<'_>) -> Result<()> {
         let stack = &mut *run.stack;
         let down: Vec<usize> = match self {
             Self::Sealer => Vec::new(),

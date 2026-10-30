@@ -266,10 +266,7 @@ impl LocalStack {
         Ok(SequencerOptions {
             partition,
             lane,
-            cache_url: self.sequencer_cache_url(),
-            #[cfg(feature = "floor-seams")]
-            first_floor_from_lookup: self.cfg.first_floor_from_lookup,
-            ..SequencerOptions::default()
+            ..self.cfg.sequencer_options(self.read_path.as_ref())
         })
     }
 
@@ -360,6 +357,11 @@ impl LocalStack {
     }
 
     /// Whether any sealer member process runs.
+    /// Whether the executor process runs.
+    pub fn executor_alive(&mut self) -> bool {
+        self.executor.proc.is_alive()
+    }
+
     pub fn sealer_alive(&mut self) -> bool {
         self.sealer.procs.iter_mut().any(Proc::is_alive)
     }

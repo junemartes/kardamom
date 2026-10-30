@@ -205,6 +205,23 @@ impl StackConfig {
     pub fn carry_genesis(&self) -> bool {
         self.carry.is_some_and(|c| c.genesis)
     }
+
+    /// The options that every sequencer of the stack takes: the Redis of
+    /// `read_path` in its nonce lookup when the stack asks for it, and the
+    /// floor seam. The launch and a restart both start from these.
+    pub(crate) fn sequencer_options(
+        &self,
+        read_path: Option<&super::read_path::ReadPath>,
+    ) -> super::services::SequencerOptions {
+        super::services::SequencerOptions {
+            cache_url: read_path
+                .filter(|_| self.sequencer_cache)
+                .map(super::read_path::ReadPath::redis_url),
+            #[cfg(feature = "floor-seams")]
+            first_floor_from_lookup: self.first_floor_from_lookup,
+            ..super::services::SequencerOptions::default()
+        }
+    }
 }
 
 impl Default for StackConfig {

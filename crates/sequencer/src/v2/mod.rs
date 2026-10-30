@@ -51,6 +51,8 @@
 
 mod canonical;
 mod depth;
+#[cfg(feature = "floor-seams")]
+mod floor_seams;
 mod offers;
 mod publication;
 mod refusals;
@@ -295,15 +297,6 @@ impl AdmissionLoop {
         }
     }
 
-    /// The test seam of the stack suite: a row sets no first state of a
-    /// sender, so the first state comes only from a lookup. A sender with
-    /// parked work asks a lookup instead. Only the `floor-seams` feature
-    /// compiles this method.
-    #[cfg(feature = "floor-seams")]
-    pub fn enable_first_floor_from_lookup(&mut self, on: bool) {
-        self.first_floor_from_lookup = on;
-    }
-
     /// Send the answer to each transaction to the ingress that published
     /// it, through `out`.
     pub fn enable_verdicts(&mut self, out: tokio::sync::mpsc::Sender<VerdictOut>) {
@@ -452,43 +445,6 @@ impl AdmissionLoop {
         for (address, _) in rows {
             self.canonical.confirmed(address, &self.admission);
         }
-    }
-
-    /// The test seam: with it, only the rows of the senders that the
-    /// filter holds a state of. The other senders wait for a lookup.
-    #[cfg(feature = "floor-seams")]
-    fn rows_of_known_senders(
-        &mut self,
-        rows: Vec<(Address, AccountState)>,
-    ) -> Vec<(Address, AccountState)> {
-        if !self.first_floor_from_lookup {
-            return rows;
-        }
-        rows.into_iter()
-            .filter(|(address, _)| {
-                !self
-                    .admission
-                    .waits_for_lookup(*address, &mut self.verdicts)
-            })
-            .collect()
-    }
-
-    /// The guard of the sealer expects `expected` of `sender`, and rejected
-    /// `nonce`. Offer the transactions at both nonces again, when the
-    /// filter holds the one at `expected`. Each such reject moves the
-    /// expected nonce up by at least one, so the offers end. A guard that
-    /// expects a nonce that the filter does not hold changes nothing: the
-    /// loss window frees the run.
-    fn offer_rejected(&mut self, sender: Address, nonce: u64, expected: u64) {
-        if self.admission.unconfirmed_at(sender, expected).is_none() {
-            return;
-        }
-        let offers: Vec<RefOffer> = [expected, nonce]
-            .into_iter()
-            .filter_map(|n| self.admission.unconfirmed_at(sender, n))
-            .map(|c| c.ref_offer(&self.sealer_version))
-            .collect();
-        self.outbox.extend(offers);
     }
 
     fn offer_again_unconfirmed(&mut self, reason: &str) {

@@ -80,10 +80,12 @@ async fn pipeline_blackout_rebuilds_the_read_path() {
     .await;
 }
 
-/// The sequencers, the executor and Redis die, and no floor source is
-/// left. The sequencers read Redis in their nonce lookup, as deployed.
-/// They get a first floor only from a lookup: see the `floor-seams`
-/// feature. This test runs the v1 loop.
+/// Every sequencer, the executor and Redis die, so no floor source is
+/// left. The sequencers read Redis in their nonce lookup, as deployed,
+/// and the case lane runs two replicas. With `--first-floor-from-lookup`
+/// (the `floor-seams` feature), a replayed receipt sets no first floor,
+/// so the floor comes only from a lookup. This test runs the v1 loop. The
+/// chaos case runs the v2 loop: see the next test.
 #[cfg(feature = "floor-seams")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run the pipeline-recovery component target"]

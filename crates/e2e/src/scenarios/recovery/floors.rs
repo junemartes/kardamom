@@ -1,22 +1,32 @@
 //! `sequencer-executor-redis-loss`: the sequencers, the executor and Redis
 //! die, so no source of a sender floor is left. They return in reverse
 //! order of need, the stagger apart: the sequencers, Redis (empty), then
-//! the executor. The returned sequencers park every established sender
-//! and look its floor up. While no source can answer, no lookup answers
-//! and no transfer lands: no floor is guessed. After the executor
-//! returns, a lookup answers the floor of the case sender, every transfer
-//! lands once in nonce order, and no ref sits below a floor.
+//! the executor. The case lane runs two replicas, as deployed.
+//!
+//! - While the classes are down, the sealer keeps sealing empty blocks:
+//!   the executor head after the return, less the most blocks the sealer
+//!   can seal since the return, is past the head before the fault by at
+//!   least one block for each second of the outage.
+//! - Every returned replica of the case lane parks the case sender and
+//!   looks its floor up. While no source can answer, no lookup answers and
+//!   no transfer lands: no floor is guessed.
+//! - After the executor returns, a lookup answers the floor on every
+//!   replica of the case lane, every transfer lands once in nonce order,
+//!   and no ref sits below a floor.
+//! - No returned process exited: the sequencers, the executor and Redis
+//!   all still run at the end.
 //!
 //! The replayed receipts of the executor would otherwise give the floor
 //! first. So the stack runs the sequencers with the
-//! `--first-floor-from-lookup` test seam: a receipt sets no first floor,
-//! and the first floor comes only from a lookup.
+//! `--first-floor-from-lookup` test seam: a receipt or a row sets no first
+//! floor, and the first floor comes only from a lookup.
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use super::cases::{Class, STAGGER};
 use super::load::RunningLoad;
 use super::{RESTART_BOUND, Run};
 use crate::harness::faults::Stop;
@@ -34,9 +44,6 @@ const ANSWERED: [&str; 4] = [
     "outcome=\"local\"",
     "outcome=\"live\"",
 ];
-/// The pause between two returns. A returned process must stay up
-/// through it while the source it needs is still down.
-const STAGGER: Duration = Duration::from_secs(6);
 
 /// The floor lookups of one sequencer since its start.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -65,6 +72,8 @@ impl Run<'_> {
     /// # Errors
     /// Returns the first failed step or check.
     pub(super) async fn sequencer_executor_redis(&mut self, load: &RunningLoad) -> Result<()> {
+        let head = self.reading().await?.block;
+        let down = Instant::now();
         let stack = &mut *self.stack;
         (0..stack.sequencer_count()).try_for_each(|i| stack.stop_sequencer(i, Stop::Hard))?;
         stack.kill_executor();
@@ -78,13 +87,13 @@ impl Run<'_> {
 
         self.return_sequencers()?;
         tokio::time::sleep(STAGGER).await;
-        self.assert_sequencers_up()?;
+        Class::Sequencer.assert_up(self)?;
         self.assert_parked_unanswered(load, landed).await?;
 
         self.stack.restart_redis()?;
         eprintln!("{}: Redis returned empty", self.at());
         tokio::time::sleep(STAGGER).await;
-        self.assert_sequencers_up()?;
+        Class::Sequencer.assert_up(self)?;
         anyhow::ensure!(
             load.landed() == landed,
             "{}: a transfer landed before the executor returned ({landed} -> {})",
@@ -93,11 +102,13 @@ impl Run<'_> {
         );
 
         self.stack.restart_executor()?;
+        let returned = Instant::now();
+        let outage = returned.duration_since(down);
         eprintln!("{}: the executor returned", self.at());
         let took = match load.await_landed_above(landed, RESTART_BOUND).await {
             Ok(took) => took,
             Err(e) => {
-                let lookups = Lookups::of(self.case_sequencer()?).await;
+                let lookups = self.case_lane_lookups().await;
                 return Err(e.context(format!("the lookups of the case lane: {lookups:?}")));
             }
         };
@@ -109,62 +120,107 @@ impl Run<'_> {
         self.assert_floors_looked_up().await?;
         self.assert_ingress_pair_live(RESTART_BOUND).await?;
         self.assert_executor_progress().await?;
-        self.assert_no_ref_below_floor().await
+        self.assert_sealed_while_down(head, outage, returned)
+            .await?;
+        self.assert_no_ref_below_floor().await?;
+        self.assert_all_up()
     }
 
+    /// Start every sequencer, and wait for its cluster session.
     fn return_sequencers(&mut self) -> Result<()> {
+        Class::Sequencer.start(self)?;
         let stack = &mut *self.stack;
-        (0..stack.sequencer_count()).try_for_each(|i| stack.start_sequencer(i))?;
         (0..stack.sequencer_count())
             .try_for_each(|i| stack.await_sequencer_session(i, RESTART_BOUND))?;
         eprintln!("{}: the sequencers returned first", self.at());
         Ok(())
     }
 
-    /// Every sequencer still runs: it waited for a floor source, with no
-    /// exit.
-    fn assert_sequencers_up(&mut self) -> Result<()> {
-        let stack = &mut *self.stack;
-        let down: Vec<usize> = (0..stack.sequencer_count())
-            .filter(|&i| !stack.sequencer_alive(i).unwrap_or(false))
-            .collect();
-        anyhow::ensure!(
-            down.is_empty(),
-            "{}: sequencers {down:?} exited while no floor source answered",
-            self.name
-        );
-        Ok(())
+    /// The lookups of every replica of the case lane.
+    async fn case_lane_lookups(&self) -> Result<Vec<Lookups>> {
+        let mut lanes = Vec::new();
+        for i in self.lane_replicas(self.case_lane()?)? {
+            lanes.push(Lookups::of(self.stack.sequencer_metrics(u32::try_from(i)?)).await?);
+        }
+        Ok(lanes)
     }
 
-    /// The sequencer of the case lane parked the case sender and asked for
+    /// Every replica of the case lane parked the case sender and asked for
     /// its floor. No source answered, and no transfer landed.
     async fn assert_parked_unanswered(&self, load: &RunningLoad, landed: u64) -> Result<()> {
-        let lookups = Lookups::of(self.case_sequencer()?).await?;
+        let lanes = self.case_lane_lookups().await?;
+        let parked = lanes.iter().all(|l| l.asked > 0.0 && l.answered <= 0.0);
         anyhow::ensure!(
-            lookups.asked > 0.0 && lookups.answered <= 0.0 && load.landed() == landed,
-            "{}: expected a parked sender with no answer and no landed transfer, read {lookups:?} and {landed} -> {} landed",
+            parked && load.landed() == landed,
+            "{}: expected parked senders with no answer and no landed transfer, read {lanes:?} and {landed} -> {} landed",
             self.name,
             load.landed()
         );
-        eprintln!("{}: the case sender is parked: {lookups:?}", self.at());
+        eprintln!("{}: the case sender is parked: {lanes:?}", self.at());
         Ok(())
     }
 
-    /// The sequencer of the case lane got the floor of the case sender
+    /// Every replica of the case lane got the floor of the case sender
     /// from a lookup: an executor, Redis or the local layer answered.
     async fn assert_floors_looked_up(&self) -> Result<()> {
-        let lookups = Lookups::of(self.case_sequencer()?).await?;
+        let lanes = self.case_lane_lookups().await?;
         anyhow::ensure!(
-            lookups.answered > 0.0,
-            "{}: the case load landed with no answered floor lookup: {lookups:?}",
+            lanes.iter().all(|l| l.answered > 0.0),
+            "{}: a replica of the case lane has no answered floor lookup: {lanes:?}",
             self.name
         );
-        eprintln!("{}: the floor came from a lookup: {lookups:?}", self.at());
+        eprintln!("{}: the floors came from a lookup: {lanes:?}", self.at());
         Ok(())
     }
 
-    /// The metrics address of the sequencer of the case lane.
-    fn case_sequencer(&self) -> Result<SocketAddr> {
-        Ok(self.stack.sequencer_metrics(self.case_lane()?))
+    /// The sealer kept sealing while the classes were down. The executor
+    /// head now, less the most blocks that the sealer can seal since the
+    /// executor `returned`, is past the `head` before the fault by at
+    /// least one block for each second of the `outage`. A sealer that
+    /// stopped while the classes were down fails this.
+    async fn assert_sealed_while_down(
+        &self,
+        head: u64,
+        outage: Duration,
+        returned: Instant,
+    ) -> Result<()> {
+        let now = self.reading().await?.block;
+        let since = returned.elapsed().as_secs().saturating_add(1);
+        // The sealer seals at most one block a tick; one more covers a
+        // tick that ends early.
+        let per_second = 1000u64
+            .div_ceil(self.stack.cfg.cluster_tick_ms.get())
+            .saturating_add(1);
+        let after = since.saturating_mul(per_second);
+        let least = head.saturating_add(outage.as_secs());
+        anyhow::ensure!(
+            now.saturating_sub(after) >= least,
+            "{}: the executor head {now}, less {after} blocks sealed after the return, is not past {least}: the sealer did not seal through the {}s outage from head {head}",
+            self.name,
+            outage.as_secs()
+        );
+        eprintln!(
+            "{}: sealed while down: head {head} -> {now} ({after} of them after the return) over a {}s outage",
+            self.at(),
+            outage.as_secs()
+        );
+        Ok(())
+    }
+
+    /// No returned process exited by the end: every sequencer, the
+    /// executor and Redis still run.
+    fn assert_all_up(&mut self) -> Result<()> {
+        Class::Sequencer.assert_up(self)?;
+        anyhow::ensure!(
+            self.stack.executor_alive(),
+            "{}: the returned executor exited",
+            self.name
+        );
+        anyhow::ensure!(
+            self.stack.redis_alive(),
+            "{}: the returned Redis does not answer",
+            self.name
+        );
+        Ok(())
     }
 }

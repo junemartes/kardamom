@@ -568,7 +568,7 @@ impl V2Wiring {
         admission.enable_fees(fees);
         admission.enable_positioned_refs(sealer_version);
         admission.enable_pause(process().subscribe());
-        // The one seam flag sits in `[resync]`; it covers both loops.
+        // The one seam flag sits in `ResyncConfig`; it covers both loops.
         #[cfg(feature = "floor-seams")]
         admission.enable_first_floor_from_lookup(cfg.resync.first_floor_from_lookup);
         if let Some(verdicts) = self.verdicts {

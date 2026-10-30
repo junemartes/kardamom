@@ -239,12 +239,7 @@ impl<'a> StackLaunch<'a> {
     ) -> Result<Vec<services::Spawned>> {
         let opts = services::SequencerOptions {
             sealer_version_floor: if self.cfg.carry_genesis() { 5 } else { 0 },
-            cache_url: read_path
-                .filter(|_| self.cfg.sequencer_cache)
-                .map(|path| path.redis.url()),
-            #[cfg(feature = "floor-seams")]
-            first_floor_from_lookup: self.cfg.first_floor_from_lookup,
-            ..services::SequencerOptions::default()
+            ..self.cfg.sequencer_options(read_path)
         };
         (0..self.cfg.shards.get())
             .map(|i| services::spawn_sequencer_with(spec, i, &opts))

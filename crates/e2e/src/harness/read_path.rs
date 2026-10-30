@@ -191,6 +191,11 @@ impl ReadPath {
         .spawn()
     }
 
+    /// The URL of the Redis of the read path.
+    pub(crate) fn redis_url(&self) -> String {
+        self.redis.url()
+    }
+
     fn metrics(&self) -> SocketAddr {
         self.mirror.metrics_addr
     }
@@ -246,12 +251,12 @@ impl LocalStack {
             .restart()
     }
 
-    /// The Redis URL of the sequencers' nonce lookup, when they read one.
-    pub(crate) fn sequencer_cache_url(&self) -> Option<String> {
+    /// Whether the Redis of the read path answers PING.
+    #[must_use]
+    pub fn redis_alive(&self) -> bool {
         self.read_path
             .as_ref()
-            .filter(|_| self.cfg.sequencer_cache)
-            .map(|path| path.redis.url())
+            .is_some_and(|path| path.redis.ping())
     }
 
     /// Start Redis empty and the mirror again. The mirror rebuilds Redis

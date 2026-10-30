@@ -234,9 +234,7 @@ impl<T: Clone> SenderState<T> {
     /// state is still there and no lookup is out.
     pub(super) fn relook(&mut self) -> bool {
         self.relook_due = false;
-        let ask = self.waits_on_lookup_gap() && !self.asked;
-        self.asked |= ask;
-        ask
+        self.waits_on_lookup_gap() && self.ask_once()
     }
 
     /// A parked transaction expired. The lookup of a sender retries only
@@ -310,8 +308,10 @@ impl<T: Clone> SenderState<T> {
     }
 
     /// The test seam of the `floor-seams` feature: whether a row must
-    /// wait, because this sender has no state. With parked work, the
-    /// sender asks a lookup once, as [`Self::park_for_lookup`] does.
+    /// wait, because this sender has no state. That is a sender that no
+    /// row or lookup reached yet, and also a sender whose state a rollback
+    /// cleared. With parked work, the sender asks a lookup once, as
+    /// [`Self::park_for_lookup`] does.
     #[cfg(feature = "floor-seams")]
     pub(super) fn waits_for_lookup(
         &mut self,
@@ -321,8 +321,7 @@ impl<T: Clone> SenderState<T> {
         if self.state.is_some() {
             return false;
         }
-        if !self.parked.is_empty() && !self.asked {
-            self.asked = true;
+        if !self.parked.is_empty() && self.ask_once() {
             out.push(Verdict::Lookup(address));
         }
         true
@@ -338,11 +337,16 @@ impl<T: Clone> SenderState<T> {
     ) -> bool {
         let sender = c.sender;
         let parked = self.park(c, Answer::Wait, cfg, out);
-        if parked && !self.asked {
-            self.asked = true;
+        if parked && self.ask_once() {
             out.push(Verdict::Lookup(sender));
         }
         parked
+    }
+
+    /// Mark a lookup as out. Returns whether none was out, so that the
+    /// caller asks: a sender has one lookup out at most.
+    fn ask_once(&mut self) -> bool {
+        !std::mem::replace(&mut self.asked, true)
     }
 
     /// Park a transaction. With [`Answer::Accept`] the client gets its ack
