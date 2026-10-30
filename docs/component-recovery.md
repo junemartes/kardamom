@@ -29,7 +29,7 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 217 checks across 34 targets.
+head. Both targets run in the existing Docker CI job. `all` runs 228 checks across 36 targets.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
@@ -88,7 +88,7 @@ commit it exactly. A second check exercises unsynchronized transactions and retr
 
 The synchronized check reproduces a product panic in the database binding:
 MDBX ends the failed transaction, but the wrapper aborts its released handle again.
-The pinned patch in [vendor/README.md](../vendor/README.md) marks the failed handle
+The pinned patch in [vendor/signet-libmdbx/VENDORED.md](../vendor/signet-libmdbx/VENDORED.md) marks the failed handle
 ended before returning its error, except for thread mismatch. It changes commit
 error cleanup; successful commits retain their existing completion marker. The
 unsynchronized test checks visible recovery behavior, not the number of abort
@@ -180,7 +180,7 @@ falsely acknowledged, a permanent output error is retried, or the egress prunes 
 the higher posted/final head, or the production provider-read deadline is removed. These
 mutations are validation experiments; they are not runtime changes.
 
-The [coverage inventory](reviews/2026-10-28-component-recovery.json) names every
+The [coverage inventory](../scripts/ci/component-recovery.json) names every
 registered chaos case, plus the packet-delay case pending in PR #917. The registry
 test rejects a new chaos case without a corresponding plan. Each family lists the
 real actors, boundary faults, recovery invariants and dependencies that still need
@@ -389,7 +389,7 @@ An external driver is never adopted. Before host-side repair, a bounded utility
 container transfers ownership of the stopped test archive to the test user; this
 matches the repair process's access to its files. The first complete two-test run takes
 12.15 seconds of test execution; a later run on the shared host takes 43.68 seconds
-and 49.85 seconds including Cargo. The complete 210-check matrix passes in
+and 49.85 seconds including Cargo. The complete matrix, at 210 checks then, passed in
 263.05 seconds; its archive target takes 15.39 seconds including Cargo. These are
 observed iteration timings, not a throughput measurement or a fixed latency
 guarantee. Production term lengths, segment sizes and timeout

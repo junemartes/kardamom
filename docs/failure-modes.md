@@ -860,7 +860,7 @@ The ordering shard keeps the executors up. These cases take the executors down w
   - Trigger: the sequencer tasks, the executor tasks and the redis job die, and all three jobs stop. No source of a sender floor is left.
   - Effect: the head advances. A submit parks at the ingress and times out: no sequencer orders it.
   - Recovery: the sequencers return first with no floor. Each established sender parks, and the replica asks for its floor. The lookup misses Redis (down) and fails at the executors (down), so the sender stays parked and the replica asks again on its next park. It never seeds a floor. Redis returns empty 30 s later. The executors return 30 s after that and answer the lookups. The floors rise, the parked transactions drain in nonce order.
-  - Proof: `sequencer-executor-redis-loss`, by name only (see "Known gaps"). Every lane-0 replica shows a lookup request and an answer from an executor or from Redis, `kardamom_sequencer_ref_below_floor` reads zero on the v1 loop, and the load verdict proves that no nonce gap remains.
+  - Proof: `sequencer-executor-redis-loss`, the last case of `chaos-combined-exec` (see "Known gaps" for #545). Every lane-0 replica shows a lookup request and an answer from an executor or from Redis, `kardamom_sequencer_ref_below_floor` reads zero on the v1 loop, and the load verdict proves that no nonce gap remains.
 - Every case ends with the common tail. The load verdict proves that no accepted transaction was lost and that the receipts are in nonce order.
 
 ## Validator (off the hot path, halts on divergence)
@@ -1741,7 +1741,7 @@ A deploy replaces service instances one at a time under readiness checks. The ch
 - **Combined outages**
   - `chaos-combined-ordering` takes two or three classes down at once and brings them back in dependency order and against it: the ingresses with the sequencers, the ingresses with the sealers, the sequencers with the sealers, and all three (see "Combined outages").
   - `chaos-combined-exec` takes the executors down with the sealers, with the sealers and the validator, with the ingresses, and with Redis and the state mirrors (see "Combined outages with the executors").
-  - `sequencer-executor-redis-loss` (the executors with the sequencers and Redis) exists and runs by name. It is in no shard: the Aeron driver error below (#545) can cut a replica off its stream and fail it.
+  - `sequencer-executor-redis-loss` (the executors with the sequencers and Redis) runs last in `chaos-combined-exec`. The Aeron driver error below (#545) can cut a replica off its stream and fail it.
   - Open: the aux node with the sealers, the media drivers on every driver node, and the two ingress nodes. No case takes them down together yet.
   - Open: no combined case checks that the L1 record stays contiguous through the outage, or that a deposit lands once after it. The suite never deposits.
 - **Executor receipt publication that never connects after a job restart**

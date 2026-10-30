@@ -15,7 +15,7 @@ import time
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
-CATALOG = ROOT / "docs/reviews/2026-10-28-component-recovery.json"
+CATALOG = ROOT / "scripts/ci/component-recovery.json"
 TEST_SECONDS = 60
 SHARD_SECONDS = 240
 SHARDS = 4
