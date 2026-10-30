@@ -70,6 +70,8 @@
 
 - name: Wait for the development L1 after the sealer
   ansible.builtin.include_tasks: wave.yml
+  vars:
+    workloads_wave_jobs: [anvil]
   when: workloads_waves | bool
 
 - name: Discover the in-cluster L1 through the Nomad API
@@ -305,6 +307,7 @@
   vars:
     workloads_job:
       name: batcher
+      defer: true
       # The indexer, when it runs, so a fresh batcher node reads its last
       # batch from it.
       vars: >-
@@ -328,6 +331,8 @@
 # A sequencer paused by the DA guard is not ready until posting catches up.
 # Register it after the posting path is ready, so its health deadline starts
 # with every dependency available. Its downstream subscribers already run.
+# In the waves of a new cluster, the sequencers register while the batcher
+# starts: the health deadline of the sequencers covers that start.
 - name: Deploy the sequencers after the posting path
   ansible.builtin.include_tasks: job.yml
   vars:
@@ -340,6 +345,12 @@
 # notifier. It comes up last, so its first transactions find every
 # reader of the chain, the batcher included, already subscribed. The
 # deploy waits for its deployment: an unhealthy canary fails the deploy.
+# In the waves of a new cluster, the batcher and the sequencers start
+# together. The canary still comes up after both.
+- name: Wait for the batcher after the sequencers
+  ansible.builtin.include_tasks: wave.yml
+  when: workloads_waves | bool
+
 - name: Deploy the transaction canary
   ansible.builtin.include_tasks: job.yml
   vars:

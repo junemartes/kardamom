@@ -717,6 +717,8 @@ class DeployTest(Deploys):
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
                     'da-store', 'l1-indexer', 'batcher', 'sequencer', 'canary']
         self.assertEqual(self.api.state['writes'], expected, 'the waves keep the registration order')
+        jobs = self.record()['accepted']['before']['jobs']
+        self.assertEqual({name: jobs[name] for name in expected}, {name: {'before': None, 'after': 0} for name in expected})
         self.assertEqual(self.api.state['deployments']['ingress'].state(poll=False)['Status'], 'successful')
 
     def test_a_failed_job_of_a_wave_stops_the_deploy_at_the_end_of_the_wave(self):
@@ -763,6 +765,20 @@ class DeployTest(Deploys):
         self.assertEqual(self.chaos_knobs(), {
             'canvass': ['-Daeron.cluster.startup.canvass.timeout=15s'], 'checkpoint': '5', 'stalled': '1m',
             'force_pull': False, 'rules_unchanged': False})
+
+    def test_an_aeron_client_retries_until_the_driver_of_its_node_runs(self):
+        """An Aeron client exits until the media driver of its node runs
+        again. Ten attempts at a 5 s delay cover that start; the policy is
+        the same in every environment."""
+        self.run_deploy(check=True)
+        policies = {name: {(g['RestartPolicy']['Attempts'], g['RestartPolicy']['Interval'],
+                            g['RestartPolicy']['Delay'], g['RestartPolicy']['Mode'])
+                           for g in self.api.state['plans'][name]['TaskGroups']}
+                    for name in ('batcher', 'ingress', 'l1-indexer', 'notifier', 'state-mirror',
+                                 'da-watcher', 'executor', 'sequencer')}
+        minute, five_s = 60_000_000_000, 5_000_000_000
+        for name, policy in policies.items():
+            self.assertEqual(policy, {(10, minute, five_s, 'delay')}, name)
 
     def test_the_local_profile_runs_no_canary_by_default(self):
         self.run_deploy(check=True)
@@ -2918,6 +2934,24 @@ class CarryTest(Deploys):
         output = self.run_deploy(self.BOOTSTRAP, success=False, environ=self.GENESIS)
         self.assertIn('the new sealer members do not all report the genesis rules', output)
         self.assertIn("genesisFeatures ['3,4,5', 'missing', '3,4,5']", output)
+        self.assertEqual(self.api.state['writes'][-3:], ['bootstrap-open', 'cluster', 'bootstrap-close'])
+
+    def test_the_waves_close_the_bootstrap_when_the_members_answer(self):
+        """In the waves of a new cluster, the bootstrap closes when every
+        new member answers, before the next job registers, and the genesis
+        check still runs there."""
+        self.genesis_members()
+        output = self.run_deploy(self.BOOTSTRAP, environ=self.GENESIS | {'KARDAMOM_DEPLOY_WAVES': '1'})
+        writes = self.api.state['writes']
+        cluster = writes.index('cluster')
+        self.assertEqual(writes[cluster - 1:cluster + 2], ['bootstrap-open', 'cluster', 'bootstrap-close'])
+        self.assertIn('Refuse a new sealer member without the genesis rules', output)
+
+    def test_the_waves_stop_at_a_member_without_the_genesis_rules(self):
+        self.genesis_members()
+        self.api.state['status']['node-cluster-1'] = {'carryWindow': False}
+        output = self.run_deploy(self.BOOTSTRAP, success=False, environ=self.GENESIS | {'KARDAMOM_DEPLOY_WAVES': '1'})
+        self.assertIn('the new sealer members do not all report the genesis rules', output)
         self.assertEqual(self.api.state['writes'][-3:], ['bootstrap-open', 'cluster', 'bootstrap-close'])
 
     def test_the_genesis_carry_is_refused_on_a_chain_that_did_not_start_with_it(self):
