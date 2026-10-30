@@ -277,6 +277,35 @@ falsely acknowledged, a permanent output error is retried, or the egress prunes 
 the higher posted/final head, or the production provider-read deadline is removed. These
 mutations are validation experiments; they are not runtime changes.
 
+The same target runs two production admission loops per lane. Both read
+one `tx_data` stream and offer through the production publisher to a
+controlled sealer. The sealer does first-seen dedup and the contiguity
+guard, relays each ordered reference to every session, and sends the rows of
+each ordered transaction. The tests stop one replica gracefully, kill one
+with every port cut, and freeze one past the loss window. The twin must keep
+the lane ordering. A restarted replica starts empty and must order an
+established sender and a fresh sender alone while its twin is frozen. Each
+load nonce must be ordered once and in order, with the exact offer bytes. A
+lookup blackout runs the production account lookup task against a loopback
+executor query that holds each request. The production egress feed reads
+the session egress of that replica. Lookups must fail at the unchanged
+two-second deadline while the boundary-freshness metric stays current, then
+answer after the next restart. The lookup task and the egress feed live in
+the library for this test; their behavior is unchanged. Negative controls
+fail when the loop sends no lookup, ignores canonical and row events, the
+lookup task drops its answer, or the egress feed does not mark a boundary.
+
+`sequencer-lapse-stack` runs the same lapse with real processes on the local
+stack: the sequencers on the v2 loop, a twin of the case lane, the ingress
+pair, the executor, the validator, a sealer member and the host-native media
+driver. SIGSTOP freezes the case lane's replica for 14 seconds, past the
+10-second client liveness of the driver, while the twin keeps the load
+landing. On SIGCONT the replica must exit through the Aeron fail-fast handler.
+The test then starts it, and the cold process must publish fresh work between
+two readings of its own exporter. The case load and the recovery probe must
+land every transfer, and the validator must agree. A negative control fails
+when the fail-fast handler does not exit. The test takes about 25 seconds.
+
 The [coverage inventory](../scripts/ci/component-recovery.json) names every
 registered chaos case, plus the packet-delay case pending in PR #917. The registry
 test rejects a new chaos case without a corresponding plan. Each family lists the

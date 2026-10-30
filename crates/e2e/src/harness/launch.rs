@@ -280,6 +280,7 @@ impl<'a> StackLaunch<'a> {
     fn v2_loop(&self) -> bool {
         !self.cfg.unpayable_spends
             && (self.cfg.carry.is_some()
+                || self.cfg.admission
                 || std::env::var("KARDAMOM_E2E_ADMISSION").is_ok_and(|v| v == "1"))
     }
 }
