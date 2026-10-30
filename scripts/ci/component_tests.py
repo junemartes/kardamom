@@ -44,6 +44,8 @@ DEFAULT_SECONDS = {"in-process": 5.0, "docker": 30.0, "gradle": 15.0, "stack": 3
 # target directory: stack/deps/<test> runs stack/<service>.
 STACK = Path("stack")
 AERON_ALL_JAR = ROOT / "crates/log/docker/aeron/aeron-all.jar"
+# The system property that names the test classpath for the sealer member JVMs that a test starts.
+CLASSPATH_PROPERTY = "kardamom.testClasspath"
 # The registry images that the docker suites start. A shard pulls them once before its first test.
 IMAGES = ("redis:7-alpine", "python:3.13-alpine", "hashicorp/consul:1.21")
 # The image that the docker suites build from the Aeron image context.
@@ -306,9 +308,13 @@ class SealerRuntime:
 
     def command(self, entry, reports):
         java = Path(os.environ.get("JAVA_HOME_17_X64") or os.environ.get("JAVA_HOME", "/usr")) / "bin/java"
-        classpath = os.pathsep.join(str(self.directory / part) for part in ("test", "main", "lib/*"))
+        classpath = os.pathsep.join([*(str(self.directory / part) for part in ("test", "core-test", "main")),
+                                     *sorted(str(jar) for jar in (self.directory / "lib").glob("*.jar"))])
+        # The test task passes its own classpath to the member JVMs that a test starts. Those paths
+        # exist only on the build runner, so the shard passes the classpath of this runtime.
+        arguments = [argument for argument in self.load() if not argument.startswith(f"-D{CLASSPATH_PROPERTY}=")]
         method = entry["test"].replace("::", "#").removesuffix("()")
-        return [str(java), *self.load(), "-cp", classpath, "org.junit.platform.console.ConsoleLauncher",
+        return [str(java), *arguments, f"-D{CLASSPATH_PROPERTY}={classpath}", "-cp", classpath, "org.junit.platform.console.ConsoleLauncher",
                 "execute", "--disable-banner", "--fail-if-no-tests", "--details=summary",
                 "--select-method", method, "--reports-dir", str(reports)], dict(os.environ)
 

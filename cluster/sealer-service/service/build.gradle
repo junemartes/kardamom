@@ -114,20 +114,28 @@ dependencies {
     componentLauncher 'org.junit.platform:junit-platform-console:1.10.2'
 }
 
+// The :core tests join the runtime in core-test, with the JVM arguments of
+// their own test task.
+evaluationDependsOn(':core')
+
 tasks.register('componentTestRuntime', Sync) {
     description = 'Copies the test runtime for the component recovery runner.'
     group = 'verification'
-    def testTask = tasks.named('test', Test)
+    def core = project(':core')
+    def testTasks = [tasks.named('test', Test), core.tasks.named('test', Test)]
     def jvmArgsFile = layout.buildDirectory.file('component-runtime/jvm-args.txt')
     into layout.buildDirectory.dir('component-runtime')
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     preserve { include 'jvm-args.txt' }
     from(sourceSets.main.output) { into 'main' }
     from(sourceSets.test.output) { into 'test' }
+    from(core.sourceSets.test.output) { into 'core-test' }
     from(configurations.testRuntimeClasspath) { into 'lib' }
+    from(core.configurations.testRuntimeClasspath) { into 'lib' }
     from(configurations.componentLauncher) { into 'lib' }
     doLast {
-        jvmArgsFile.get().asFile.text = testTask.get().allJvmArgs.join('\n') + '\n'
+        def arguments = testTasks.collectMany { it.get().allJvmArgs }
+        jvmArgsFile.get().asFile.text = arguments.join('\n') + '\n'
     }
 }
 

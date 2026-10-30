@@ -140,7 +140,9 @@ class ComponentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             runtime = component.SealerRuntime(Path(directory))
             (Path(directory) / "lib").mkdir()
-            (Path(directory) / "jvm-args.txt").write_text("--add-opens\njava.base/sun.nio.ch=ALL-UNNAMED\n")
+            (Path(directory) / "lib/aeron.jar").write_text("")
+            (Path(directory) / "jvm-args.txt").write_text(
+                "--add-opens\njava.base/sun.nio.ch=ALL-UNNAMED\n-Dkardamom.testClasspath=/build/runner/only\n")
             (Path(directory) / "revision.txt").write_text("a" * 40 + "\n")
             with patch.dict(component.os.environ, GITHUB_SHA="b" * 40), self.assertRaises(ValueError):
                 runtime.load()
@@ -148,6 +150,10 @@ class ComponentTests(unittest.TestCase):
                 command, _ = runtime.command({"test": "io.kardamom.Actor::recovers()"}, Path(directory) / "reports")
             self.assertEqual(command[command.index("--select-method") + 1], "io.kardamom.Actor#recovers")
             self.assertEqual(command[1:3], ["--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED"])
+            classpath = command[command.index("-cp") + 1]
+            self.assertIn(f"{directory}/lib/aeron.jar", classpath.split(component.os.pathsep))
+            self.assertEqual([argument for argument in command if "testClasspath" in argument],
+                             [f"-Dkardamom.testClasspath={classpath}"])
 
     def test_a_stack_test_runs_beside_its_services_with_the_jars(self):
         bundle = component.Bundle(Path("/bundle"))
