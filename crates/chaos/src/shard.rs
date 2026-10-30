@@ -11,7 +11,7 @@
 //! of the sealer fleet under test.
 
 use crate::knobs::Knobs;
-use crate::lifecycle::{CarrySwitches, DeployVars, EgressStage};
+use crate::lifecycle::{CarrySwitches, ChaosKnobs, DeployVars, EgressStage};
 
 /// The sealer retention of the carry shard, in frames. The exact window
 /// keeps this many frames.
@@ -23,13 +23,20 @@ const SMALL_RETENTION: u64 = 2048;
 /// The snapshot interval of the retention and L1 shards, in seconds. A
 /// floor pass waits for one snapshot, so the interval bounds that wait.
 const SHORT_SNAPSHOT_S: u64 = 30;
-const RETENTION_CASES: [&str; 5] = [
+/// The cases of the retention shard. Its chain is born with the 8-block
+/// DA guard, for the two DA cases. None of the others stops the batcher,
+/// so the guard does not halt them.
+const RETENTION_CASES: [&str; 4] = [
     "retention-overrun",
     "retention-overrun-validator",
-    "prune-floor",
     "da-lag-halt",
     "canary-da-lag",
 ];
+
+/// The DA-lag budget of the retention chain, in blocks: two blocks of
+/// posting cadence and a margin, small enough that a frozen batcher
+/// halts the chain within seconds.
+const DA_GUARD_BLOCKS: u64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shard {
@@ -197,6 +204,7 @@ impl Shard {
                 "l1-liar",
                 "l1-null-receipts",
                 "two-day-outage",
+                "prune-floor",
                 "batcher-outage-past-retention",
             ],
             // The loss and the disagreement of the L1 follower's
@@ -274,7 +282,28 @@ impl Shard {
     pub fn deploy_vars(self) -> DeployVars {
         DeployVars {
             genesis_carry: self.carry_born(),
+            knobs: self.chaos_knobs(),
             ..self.shard_vars()
+        }
+    }
+
+    /// The chaos-only deploy knobs of the shard, so each recovery fits
+    /// the case deadline:
+    /// - every sealer member canvasses for 15 s after a full restart,
+    ///   not 60 s;
+    /// - a Nomad client is down after a 30 s heartbeat grace, not 60 s;
+    /// - the cache shard checkpoints its executors every 10 s, so a
+    ///   mirror rebuild finds a recent checkpoint;
+    /// - the shard of the canary pages a stalled canary after 1 min and
+    ///   starts the canary from the image it holds.
+    fn chaos_knobs(self) -> ChaosKnobs {
+        let canary = self == Self::Retention;
+        ChaosKnobs {
+            cluster_jvm_opts: Some("-Daeron.cluster.startup.canvass.timeout=15s".into()),
+            heartbeat_grace_s: Some(30),
+            canary_stalled_window: canary.then(|| "1m".into()),
+            canary_force_pull: canary.then_some(false),
+            checkpoint_interval_s: (self == Self::Cache).then_some(10),
         }
     }
 
@@ -311,6 +340,7 @@ impl Shard {
             Self::Retention => DeployVars {
                 cluster_snapshot_interval_s: Some(SHORT_SNAPSHOT_S),
                 canary_local: Some(true),
+                da_lag_budget_blocks: Some(DA_GUARD_BLOCKS),
                 cluster_retention: Some(SMALL_RETENTION),
                 checkpoint_log: true,
                 ..DeployVars::default()
@@ -472,9 +502,14 @@ mod tests {
     }
 
     #[test]
-    fn the_retention_shard_funds_the_canary_without_lowering_its_da_guard() {
+    fn the_retention_shard_funds_the_canary_on_a_chain_born_with_the_da_guard() {
         let vars = Shard::Retention.deploy_vars();
-        assert_eq!(vars.da_lag_budget_blocks, None);
+        assert_eq!(vars.da_lag_budget_blocks, Some(DA_GUARD_BLOCKS));
+        assert!(
+            ALL.iter()
+                .filter(|shard| **shard != Shard::Retention)
+                .all(|shard| shard.deploy_vars().da_lag_budget_blocks.is_none())
+        );
         assert_eq!(vars.canary_local, Some(true));
         assert_eq!(vars.cluster_snapshot_interval_s, Some(SHORT_SNAPSHOT_S));
         assert_eq!(vars.cluster_retention, Some(SMALL_RETENTION));

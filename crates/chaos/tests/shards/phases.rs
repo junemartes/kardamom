@@ -1,85 +1,35 @@
-//! Each replicated guard stays fixed for the lifetime of its chain.
+//! The cases of one shard on one chain, with the guard of its deploy.
 
 use kardamom_chaos::{DeployVars, Harness, Knobs, Lifecycle, Shard};
 
 use super::run_audited;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Guard {
-    Standard,
-    Short,
-}
-
-impl Guard {
-    fn of(case: &str) -> Self {
-        match case {
-            "da-lag-halt" | "canary-da-lag" => Self::Short,
-            _ => Self::Standard,
-        }
-    }
-
-    fn vars(self, shard: Shard) -> DeployVars {
-        let mut vars = shard.deploy_vars();
-        if self == Self::Short {
-            vars.da_lag_budget_blocks = Some(8);
-        }
-        vars
-    }
-}
-
-pub(super) struct Phases(Vec<Phase>);
-
-impl Phases {
-    pub(super) fn read(shard: Shard, cases: &[String], reuse: bool) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            !cases.is_empty(),
-            "a chaos phase plan needs at least one case"
-        );
-        let phases = cases
-            .chunk_by(|left, right| Guard::of(left) == Guard::of(right))
-            .map(|group| Phase::read(shard, group, reuse))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        anyhow::ensure!(
-            !reuse || phases.len() <= 1,
-            "reuse cannot cross replicated DA guard settings; run each phase on a chain born with its fixed guard"
-        );
-        Ok(Self(phases))
-    }
-
-    pub(super) async fn run(self) -> anyhow::Result<()> {
-        for phase in self.0 {
-            phase.run().await?;
-        }
-        Ok(())
-    }
-}
-
-struct Phase {
+/// The cases of one shard on one chain. A shard that deploys a DA guard
+/// deploys it from genesis, for every case: the guard is replicated, so
+/// it never changes on a live chain.
+pub(super) struct Phase {
     shard: Shard,
     cases: Vec<String>,
-    guard: Guard,
     vars: DeployVars,
     knobs: Knobs,
     reuse: bool,
 }
 
 impl Phase {
-    fn read(shard: Shard, cases: &[String], reuse: bool) -> anyhow::Result<Self> {
-        // A chunk is nonempty, so its first case selects its fixed guard.
-        let guard = Guard::of(&cases[0]);
-        let vars = guard.vars(shard);
+    pub(super) fn read(shard: Shard, cases: &[String], reuse: bool) -> anyhow::Result<Self> {
+        anyhow::ensure!(!cases.is_empty(), "a chaos phase needs at least one case");
+        let vars = shard.deploy_vars();
         let knobs = Knobs::deployed(shard.env(), &vars)?;
         Ok(Self {
             shard,
             cases: cases.to_vec(),
-            guard,
             vars,
             knobs,
             reuse,
         })
     }
 
-    async fn run(&self) -> anyhow::Result<()> {
+    pub(super) async fn run(&self) -> anyhow::Result<()> {
         let lifecycle = Lifecycle::in_workspace().with_vars(self.vars.clone());
         let contract = if self.reuse {
             lifecycle.contract()?
@@ -91,9 +41,8 @@ impl Phase {
         self.await_startup(&harness).await?;
         harness.smoke_gate(harness.knobs.gate_account).await?;
         kardamom_chaos::log(format!(
-            "chaos suite: shard={} fixed_guard={:?} da_budget={:?} cases=[{}] tps={} case_deadline_s={}",
+            "chaos suite: shard={} da_budget={:?} cases=[{}] tps={} case_deadline_s={}",
             self.shard.name(),
-            self.guard,
             self.knobs.da_lag_budget_blocks,
             self.cases.join(" "),
             harness.knobs.tps,
@@ -117,7 +66,7 @@ impl Phase {
     }
 
     async fn await_startup(&self, harness: &Harness) -> anyhow::Result<()> {
-        if self.guard == Guard::Short {
+        if self.vars.da_lag_budget_blocks.is_some() {
             kardamom_chaos::log("fixed DA guard: wait for the batcher to clear startup lag");
             harness.await_chain_recovered().await?;
         }

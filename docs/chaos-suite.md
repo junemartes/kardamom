@@ -122,9 +122,9 @@ The knobs of a shard follow its deploy variables (see [Environment knobs](#envir
 | `chaos-coordinated` | `ingress-pair-loss-recover`, `sequencer-lane-loss-recover`, `control-plane-loss-recover`, `pipeline-blackout-recover` | carry-born, `RUN_LOAD=0` |
 | `chaos-combined-ordering` | `ingress-sealer-loss-recover`, `ingress-sequencer-loss-recover`, `sequencer-sealer-loss-recover`, `ingress-sequencer-sealer-loss-recover`, `ingress-sequencer-sealer-reverse` | carry-born, `RUN_LOAD=0` |
 | `chaos-combined-exec` | `executor-sealer-loss-recover`, `executor-sealer-validator-recover`, `ingress-executor-loss-recover`, `read-path-loss-recover`, `sequencer-executor-redis-loss` | carry-born, `RUN_LOAD=0` |
-| `chaos-retention` | `retention-overrun`, `retention-overrun-validator`, `prune-floor`, `da-lag-halt`, `canary-da-lag` | Two sequential fresh carry chains in one job. Both use `RUN_LOAD=0`, retention 2048 frames, snapshots every 30 s, canary funding and checkpoint block logs. The first three cases keep the normal DA guard. The last two start with an eight-block guard. |
+| `chaos-retention` | `retention-overrun`, `retention-overrun-validator`, `da-lag-halt`, `canary-da-lag` | One carry chain, born with the eight-block DA guard for every case. `RUN_LOAD=0`, retention 2048 frames, snapshots every 30 s, canary funding, checkpoint block logs, and a 1 min window for `KardamomCanaryStalled`. No case of the shard but the two DA cases stops the batcher, so the guard halts no other case. |
 | `chaos-cache` | `mirror-backlog-client-restart`, `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze`, `mirror-kill-rebuild` | carry-born, `RUN_LOAD=0`, the block log of the checkpoints on |
-| `chaos-l1` | `l1-liar`, `l1-null-receipts`, `two-day-outage`, `batcher-outage-past-retention` | carry-born, `RUN_LOAD=0`, retention 2048, snapshot interval 30 s, `L1_FAULT_S=45`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
+| `chaos-l1` | `l1-liar`, `l1-null-receipts`, `two-day-outage`, `prune-floor`, `batcher-outage-past-retention` | carry-born, `RUN_LOAD=0`, retention 2048, snapshot interval 30 s, `L1_FAULT_S=45`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
 | `chaos-follower` | `l1-transport-refusals`, `l1-provider-unresponsive`, `follower-instance-loss`, `follower-total-loss`, `follower-disagreement` | carry-born, `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=45`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
 | `chaos-carry` | `carry-versions-on`, `carry-deposits-provider-fault`, `carry-held-offer-after-downgrade`, `carry-readers-on-egress`, `carry-window-on`, `carry-executor-first`, `carry-executors-rest`, `carry-deposits-all-carry`, `carry-window-off-on`, `carry-leader-kill-at-switch`, `carry-egress-restart` | reference-born, `RUN_LOAD=0`, `L1_FAULT_S=45`, retention 16384, snapshot interval 60 s, the member feed and the executors on the sealer nodes (`KARDAMOM_EXEC_ON_SEALERS=on`), the frames of the executors and the egress, the v2 loop of the sequencers (`KARDAMOM_SEQUENCER_ADMISSION=on`) |
 | `chaos-integrity` (nightly) | `sequencer-replica-kill-lane0-node1`, `sequencer-replica-kill-lane1-node0`, `executor-restart-storm`, `sealer-fleet-total-wipe-recover`, `resize-scale-out-in` | reference-born, `RUN_LOAD=0` |
@@ -141,7 +141,7 @@ Case order matters in seven places.
 - `mirror-kill-rebuild` runs last in `chaos-cache`. It flushes the projection.
 - `executor-sealer-loss-recover` runs first in `chaos-combined-exec`. The persisted-state audit runs after it, before the other cases build on the state it leaves.
 - `chaos-carry` runs the order of the staging rollout. Each case needs the cases before it.
-- `chaos-retention` verifies receipts, the validator and persisted state before it tears down the first chain. It then deploys a fresh chain for `da-lag-halt` and `canary-da-lag`. The DA guard stays fixed from genesis: changing it during snapshot replay changes canonical decisions. Custom case order is preserved, with another fresh chain at each guard change. Every ingress must observe the fixed guard. A reuse run stays within one guard setting on a chain born with that setting. Empty overrides and reuse across guard settings fail before lifecycle actions.
+- The DA guard stays fixed from genesis: changing it during snapshot replay changes canonical decisions. So `chaos-retention` deploys the eight-block guard for all of its cases, and `da-lag-halt` and `canary-da-lag` run on that chain. Every ingress must observe the fixed guard. No other shard deploys the guard.
 
 `chaos-l1` and `chaos-follower` run the persisted-state audit only at the end of the shard. Each case proves in its body that the DA record on L1 is contiguous and that the archive holds it. The audit at the end rebuilds the whole chain from L1, so a gap that any case leaves fails it. `chaos-combined-exec` runs it after `executor-sealer-loss-recover`: the executors and the members die at once, so the state every executor kept is compared with the validator's before the next case. `chaos-carry` runs it after `carry-executor-first`: it compares the executor in carry mode with the two executors in reference mode and the validator.
 
@@ -324,7 +324,7 @@ The DA cases freeze the batcher with SIGSTOP, so nothing posts to L1 while the c
   - A submit must fail with the typed error that names `/halt`.
   - The boundaries must keep sealing.
   - After the thaw, the halt must clear with no operator step. The batcher must post past the frozen head. A new transfer must succeed. The chain status must settle.
-- `prune-floor`: stays under the budget, but runs past the retention window and a Raft snapshot. It has two variants. `chaos-retention` is carry-born, so CI runs the carry variant.
+- `prune-floor`: stays under the budget, but runs past the retention window and a Raft snapshot. It has two variants. `chaos-l1` is carry-born, so CI runs the carry variant.
   - On a carry-born cluster (`cases/da_lag/carry_floor.rs`):
     - The exact window of decision version 5 prunes by the window alone, below the posted head. So the egress keeps the unposted range. The case freezes the batcher first. It then rolls the egress to a reader window of 24 blocks in 8-block segments while the chain seals past the frozen cursor. The egress gets its own window back while the batcher posts after the thaw.
     - The sealer floor must pass the head of the egress copies, and a new Raft snapshot must occur. The sealed head must be more than one window and one segment past that head.
@@ -371,7 +371,7 @@ The injection gate stops a case from injecting into an idle pipeline.
 
 ### Recovery probe
 
-Every case ends with the recovery probe. Two 15 s loads run at the same time, each at half of the case rate.
+Every case ends with the recovery probe. Two 10 s loads run at the same time, each at half of the case rate.
 
 - One load uses the case account through the ingress of the case load. It stands for a sender with transactions in flight during the outage.
 - One load uses the gate account through the other ingress. It stands for a sender with nothing in flight.
@@ -550,7 +550,7 @@ A value that does not parse fails the run at start. A zero value fails for a kno
 | Name | Default | Meaning |
 |---|---|---|
 | `CHAIN_ID` | `412346` | The L2 chain id. |
-| `CHAOS_TPS` | `200` | The steady load rate of every case, in tx/s. |
+| `CHAOS_TPS` | `100` | The steady load rate of every case, in tx/s. The cluster and the load share one 4-vCPU runner, and 200 tx/s starves the recovery of every case. |
 | `CHAOS_CASE_S` | `180` | The deadline of a case, in seconds, from the start of its load to its verdict. The case load window is the deadline. The nightly cases have a 60 min deadline. |
 | `LOAD_MAX_GAP` | `5` | The keep-pace bound: sealer block minus executor block. |
 | `LOAD_RETRY` | `2` | The per-submit retry attempts of the load. Some cases set their own value. |

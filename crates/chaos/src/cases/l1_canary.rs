@@ -78,6 +78,30 @@ async fn baseline(h: &Harness, ctx: &str, fragment: &str) -> anyhow::Result<i64>
     })
 }
 
+/// The first transfer runs with `fragment` of a canary that is still
+/// starting: its exporter answers once the canary runs. A canary that
+/// does not answer within `budget` fails the case.
+async fn first_baseline(
+    h: &Harness,
+    ctx: &str,
+    fragment: &str,
+    budget: Duration,
+) -> anyhow::Result<i64> {
+    let outcome = poll::until(
+        Budget::new(budget, Duration::from_secs(2)),
+        |_| async move { Ok::<_, anyhow::Error>(transfers(h, fragment).await) },
+    )
+    .await?;
+    outcome
+        .or_fail(|t| {
+            crate::chaos_fail!(
+                "{ctx}: the canary exports no transfer runs for the {fragment} baseline within {}s of its start",
+                t.as_secs()
+            )
+        })
+        .map(|(runs, _)| runs)
+}
+
 /// Wait until the transfer runs with `fragment` pass `floor`.
 async fn await_runs(
     h: &Harness,
@@ -142,7 +166,7 @@ pub(crate) async fn canary_da_lag(h: &mut Harness) -> anyhow::Result<()> {
     .unwrap_or(i64::MAX);
     let refused = "code=\"-32010\"";
     let success = "outcome=\"success\"";
-    let healthy_before = baseline(h, ctx, success).await?;
+    let healthy_before = first_baseline(h, ctx, success, Duration::from_mins(1)).await?;
     await_runs(h, ctx, success, healthy_before, Duration::from_mins(2)).await?;
     let refused_before = baseline(h, ctx, refused).await?;
     let frozen = FrozenBatcher::freeze(h, ctx).await?;

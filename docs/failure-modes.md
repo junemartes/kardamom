@@ -221,7 +221,7 @@ The sealer refuses user records when the batcher falls too far behind on L1. Bel
 Every chaos case ends with a **recovery probe**.
 
 - The case load ended and the executors converged.
-- Two 15 s loads then run at the same time. Each load runs at half the case rate. Each load holds a slot for every submit of its window, so a slow receipt does not lower its rate.
+- Two 10 s loads then run at the same time. Each load runs at half the case rate. Each load holds a slot for every submit of its window, so a slow receipt does not lower its rate.
 - Load 1 runs on the account of the case, from its next nonce. It uses the ingress that the case load used. It stands for a sender that had transactions in flight during the outage.
 - Load 2 runs on the account of the smoke gate. No case load spends that account. It uses the other ingress. It stands for a sender with nothing in flight.
 - Each load starts at the next nonce of its account. The harness reads that nonce from the ingress.

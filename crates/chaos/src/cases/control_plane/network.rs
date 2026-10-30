@@ -25,18 +25,30 @@ fi";
 const TASKS: &str = r"set -euo pipefail
 docker ps --no-trunc --format '{{.ID}}' | xargs -r docker inspect --format '{{.Id}} {{.State.Running}} {{.State.StartedAt}}' | LC_ALL=C sort";
 
+/// A UDP query can be lost on a busy runner, so the probe asks up to
+/// three times. An isolated node answers none of them.
 const DNS: &str = r"python3 - <<'PY'
 import socket
 import struct
 name = b'control-plane-probe.node.consul'
 question = b''.join(bytes([len(label)]) + label for label in name.split(b'.')) + b'\x00'
 packet = struct.pack('!HHHHHH', 0x6b64, 0x0100, 1, 0, 0, 0) + question + struct.pack('!HH', 1, 1)
-with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-    sock.settimeout(2)
-    sock.connect(('127.0.0.1', 53))
-    sock.send(packet)
-    response = sock.recv(4096)
-    assert len(response) >= 12 and response[:2] == packet[:2] and response[2] & 0x80
+def ask():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(2)
+        sock.connect(('127.0.0.1', 53))
+        sock.send(packet)
+        response = sock.recv(4096)
+        return len(response) >= 12 and response[:2] == packet[:2] and bool(response[2] & 0x80)
+def answered():
+    for _ in range(3):
+        try:
+            if ask():
+                return True
+        except OSError:
+            pass
+    return False
+assert answered()
 PY";
 
 #[derive(Clone, Serialize)]

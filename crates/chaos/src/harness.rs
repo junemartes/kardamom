@@ -19,7 +19,7 @@ use crate::rpc::Rpc;
 use kardamom_bench::load::{Completeness, Progress};
 
 /// The recovery probe's window, in seconds.
-const PROBE_SECS: NonZeroU32 = NonZeroU32::new(15).expect("a nonzero probe window");
+const PROBE_SECS: NonZeroU32 = NonZeroU32::new(10).expect("a nonzero probe window");
 
 /// The recovery probe's window.
 const PROBE_WINDOW: Duration = Duration::from_secs(PROBE_SECS.get() as u64);
@@ -185,9 +185,11 @@ impl Harness {
             "================= CHAOS CASE: {name} ================="
         ));
         let started = Instant::now();
+        let missed0 = self.nomad.missed_heartbeats().await.unwrap_or_default();
         let deadline = case.deadline(&self.knobs);
         let outcome = tokio::time::timeout(deadline, self.run_within(case)).await;
         self.case_load = None;
+        self.log_nodes_down(name, &missed0).await;
         outcome.map_err(|_| {
             crate::chaos_fail!(
                 "{name}: the case runs past its deadline of {}s; a case must finish within its deadline, so shorten its fault and recovery waits",
@@ -199,6 +201,21 @@ impl Harness {
             started.elapsed().as_secs()
         ));
         Ok(())
+    }
+
+    /// Log every node that the Nomad servers marked down during the case:
+    /// a node down that the case did not inject is a substrate fault.
+    async fn log_nodes_down(&self, name: &str, before: &[String]) {
+        match self.nomad.missed_heartbeats().await {
+            Ok(now) => {
+                let new: Vec<&String> = now.iter().filter(|m| !before.contains(m)).collect();
+                crate::log(format!(
+                    "{name}: Nomad marked {} node(s) down during the case: {new:?}",
+                    new.len()
+                ));
+            }
+            Err(error) => crate::log(format!("{name}: the node events do not answer: {error:#}")),
+        }
     }
 
     /// The case under its deadline. A failure drops the load, which
@@ -479,17 +496,26 @@ impl Case {
     /// snapshot can pause boundaries beyond the ten-second live probe.
     /// Other cases also require their family-specific progress probe.
     async fn assert_recovered_progress(self, h: &Harness) -> anyhow::Result<()> {
+        // The progress probe and the convergence read independent gauges,
+        // so they run at once.
+        tokio::try_join!(
+            self.assert_family_progress(h),
+            h.assert_executors_converged(self.name())
+        )
+        .map(|_| ())
+    }
+
+    async fn assert_family_progress(self, h: &Harness) -> anyhow::Result<()> {
         match self {
-            Self::GracefulExecutor | Self::HardExecutor => {}
+            Self::GracefulExecutor | Self::HardExecutor => Ok(()),
             _ if self.name().starts_with("cluster-") => {
-                h.assert_executor_progress(Duration::from_mins(1)).await?;
+                h.assert_executor_progress(Duration::from_mins(1)).await
             }
             _ if self.name().starts_with("node-failure-") => {
-                h.assert_executor_progress(Duration::from_mins(3)).await?;
+                h.assert_executor_progress(Duration::from_mins(3)).await
             }
-            _ => h.assert_progress().await?,
+            _ => h.assert_progress().await,
         }
-        h.assert_executors_converged(self.name()).await
     }
 
     /// Chaos mode already tolerates duplicate-submit drops. Every other

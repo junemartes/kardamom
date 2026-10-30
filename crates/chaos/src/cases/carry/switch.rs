@@ -11,17 +11,10 @@ use super::members::{Members, Window};
 use super::upgrade::Upgrade;
 use crate::cases::cluster::sealer;
 use crate::inject::Killed;
-use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
 
 /// The task of an egress instance.
 const EGRESS_TASK: &str = "egress";
-
-/// How long a killed leader may take to report its exit time.
-const EXIT_WAIT: Budget = Budget {
-    timeout: Duration::from_secs(20),
-    interval: Duration::from_millis(500),
-};
 
 /// The latest kill of the leader after its switch.
 const KILL_AFTER_SWITCH: Duration = Duration::from_secs(2);
@@ -59,9 +52,8 @@ impl Run<'_> {
             .ok_or_else(|| crate::chaos_fail!("{}: no cluster container on {node}", self.ctx))?;
         on.send(self.h, self.ctx).await?;
         let switched = members.await_switch(leader).await?;
-        self.h.nodes.inner_kill(&node, &cid).await?;
+        let died = self.kill_and_read_exit(&node, &cid).await?;
         let returned = switched.elapsed().unwrap_or_default();
-        let died = self.died_at(&node, &cid).await?;
         let late = died.duration_since(switched).map_err(|_| {
             crate::chaos_fail!(
                 "{}: the leader {leader} exited before the read that saw its switch, so the kill did not stop it",
@@ -98,30 +90,32 @@ impl Run<'_> {
             .await
     }
 
-    /// The exit time of the inner container `cid` on `node`, as its docker
-    /// daemon records it, once the container no longer runs. The node and
-    /// the runner share one clock.
-    async fn died_at(&self, node: &str, cid: &str) -> anyhow::Result<SystemTime> {
-        let script =
-            format!("docker inspect -f '{{{{.State.Running}}}} {{{{.State.FinishedAt}}}}' {cid}");
-        let script = &script;
-        let outcome = poll::until(EXIT_WAIT, |_| async move {
-            let state = self.h.nodes.exec(node, script).await?;
-            Ok(state
-                .trim()
-                .strip_prefix("false ")
-                .and_then(|stamp| humantime::parse_rfc3339(stamp).ok()))
-        })
-        .await?;
-        outcome
-            .or_fail(|t| {
+    /// Kill the inner container `cid` on `node` and read its exit time,
+    /// as its docker daemon records it, in the same exec: Nomad removes
+    /// the exited container when it restarts the task, so a later read
+    /// can find no container. The node and the runner share one clock.
+    async fn kill_and_read_exit(&self, node: &str, cid: &str) -> anyhow::Result<SystemTime> {
+        let script = format!(
+            "docker kill {cid} >/dev/null
+for _ in $(seq 1 100); do
+  state=$(docker inspect -f '{{{{.State.Running}}}} {{{{.State.FinishedAt}}}}' {cid})
+  case \"$state\" in false*) echo \"$state\"; exit 0;; esac
+  sleep 0.05
+done
+echo \"$state\""
+        );
+        let state = self.h.nodes.exec(node, &script).await?;
+        state
+            .trim()
+            .strip_prefix("false ")
+            .and_then(|stamp| humantime::parse_rfc3339(stamp).ok())
+            .ok_or_else(|| {
                 crate::chaos_fail!(
-                    "{}: {cid} on {node} reports no exit time within {}s of its kill",
+                    "{}: {cid} on {node} reports no exit time after its kill: {}",
                     self.ctx,
-                    t.as_secs()
+                    state.trim()
                 )
             })
-            .map(|(died, _)| died)
     }
 
     /// One egress instance restarts. It reads R from its mark, so
