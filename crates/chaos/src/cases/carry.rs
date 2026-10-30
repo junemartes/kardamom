@@ -46,10 +46,7 @@ mod switch;
 mod tests;
 mod upgrade;
 
-use std::time::Duration;
-
 use crate::harness::Harness;
-use crate::knobs::Knobs;
 
 /// One step of the carry window, as one case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,37 +94,6 @@ impl Step {
             Self::WindowOffOn => "carry-window-off-on",
             Self::LeaderKillAtSwitch => "carry-leader-kill-at-switch",
             Self::EgressRestart => "carry-egress-restart",
-        }
-    }
-
-    /// The least load window of the step: the deploys, the upgrade
-    /// transactions with their finality, and the restarts.
-    pub(crate) fn floor(self, k: &Knobs) -> Duration {
-        let inject = k.inject_delay;
-        // The load also covers admission warmup and post-upgrade checks.
-        let two_upgrades = upgrade::Upgrade::LOAD_WINDOW
-            .saturating_mul(2)
-            .saturating_add(Duration::from_mins(4));
-        match self {
-            // The first step has a deploy, two checked upgrades, and the
-            // three-credit proof across a provider fault. Their load
-            // windows add; each runtime proof keeps its own deadline.
-            Self::VersionsOn => inject
-                .saturating_add(super::window::FULL_DEPLOY_LOAD)
-                .saturating_add(two_upgrades)
-                .saturating_add(Duration::from_mins(20))
-                .saturating_add(k.l1_fault),
-            Self::ReadersOnEgress | Self::ExecutorFirst => inject + super::window::FULL_DEPLOY_LOAD,
-            // Two upgrade transactions and the held transfer.
-            Self::HeldOfferAfterDowngrade | Self::WindowOffOn => inject + two_upgrades,
-            Self::WindowOn => inject + k.restart_slo + upgrade::Upgrade::LOAD_WINDOW,
-            // One staged executor roll for each move.
-            Self::ExecutorsRest => inject
-                .saturating_add(super::window::FULL_DEPLOY_LOAD.saturating_mul(2))
-                .saturating_add(Duration::from_mins(20))
-                .saturating_add(k.l1_fault),
-            Self::LeaderKillAtSwitch => inject + k.leader_slo + k.restart_slo + two_upgrades,
-            Self::EgressRestart => inject + k.restart_slo + Duration::from_mins(2),
         }
     }
 

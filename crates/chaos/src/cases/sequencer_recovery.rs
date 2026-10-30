@@ -71,9 +71,6 @@ pub(super) struct SequencerRecovery {
 }
 
 impl SequencerRecovery {
-    // Four replicas each need two receipt waits, two exporter waits, and fault checks.
-    pub(super) const PROOF_WINDOW: Duration = Duration::from_mins(24);
-
     pub(super) async fn run(h: &mut Harness) -> anyhow::Result<()> {
         for replica in Replica::ALL {
             Self::exercise(h, replica).await?;

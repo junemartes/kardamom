@@ -151,8 +151,10 @@ pub struct Knobs {
     pub chain_id: u64,
     /// The steady load rate of every case.
     pub tps: NonZeroU32,
-    /// The per-case load window. A case with a longer floor widens it.
-    pub case_window: Duration,
+    /// The longest one case may run, from the start of its load to its
+    /// verdict. The case load runs until the case body ends, and at most
+    /// this long.
+    pub case_deadline: Duration,
     /// The keep-pace gap bound of the load verdict.
     pub load_max_gap: u64,
     /// The per-submit retry attempts of the load, outside the resize case.
@@ -379,7 +381,7 @@ impl Knobs {
         Ok(Self {
             chain_id: env.u64("CHAIN_ID", 412_346)?,
             tps: env.nonzero_u32("CHAOS_TPS", 200)?,
-            case_window: env.secs("CHAOS_CASE_S", 120)?,
+            case_deadline: env.secs("CHAOS_CASE_S", 180)?,
             load_max_gap: env.u64("LOAD_MAX_GAP", 5)?,
             load_retry: env.u32("LOAD_RETRY", 2)?,
             restart_slo: env.secs("CHAOS_RESTART_SLO_S", 60)?,

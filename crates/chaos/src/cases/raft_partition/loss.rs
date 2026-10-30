@@ -54,12 +54,6 @@ impl Counts {
 pub(crate) struct PacketLoss;
 
 impl PacketLoss {
-    pub(crate) fn window(k: &crate::knobs::Knobs) -> Duration {
-        k.inject_delay
-            .saturating_add(k.rejoin_slo)
-            .saturating_add(Duration::from_mins(6))
-    }
-
     pub(crate) async fn run(h: &mut Harness) -> anyhow::Result<()> {
         let target = Partition::capture(h).await?;
         let outcome = tokio::time::timeout(Duration::from_mins(4), Self::exercise(&target, h))

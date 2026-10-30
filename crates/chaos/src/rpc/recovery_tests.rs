@@ -123,17 +123,42 @@ impl Fixture {
 
 #[tokio::test]
 async fn no_quorum_retries_identical_signed_bytes_and_requires_their_receipt() {
-    Fixture::assert_retried_receipt(RecoveryCause::NoQuorum, NO_QUORUM).await;
+    Fixture::assert_retried_receipt(RecoveryCause::NoQuorum, -32010, NO_QUORUM).await;
 }
 
 #[tokio::test]
 async fn renewed_da_lag_retries_identical_signed_bytes_and_requires_their_receipt() {
-    Fixture::assert_retried_receipt(RecoveryCause::DaLag, DA_LAG).await;
+    Fixture::assert_retried_receipt(RecoveryCause::DaLag, -32010, DA_LAG).await;
+}
+
+/// A submit that parks until the timeout of the ingress can still land,
+/// so the same bytes go again.
+#[tokio::test]
+async fn a_parked_submit_resends_identical_signed_bytes() {
+    let park = "timed out waiting for receipt or watermark";
+    Fixture::assert_retried_receipt(RecoveryCause::NoQuorum, -32000, park).await;
+}
+
+/// A resend that finds its first send in the pipeline passes on the
+/// receipt of that send.
+#[tokio::test]
+async fn a_resend_of_a_held_transaction_waits_for_its_receipt() {
+    for held in ["already known", "duplicate (sender, nonce): (0x01, 5)"] {
+        let mut fixture = Fixture::new(Fixture::refusal(1, -32000, held)).await;
+        fixture
+            .rpc
+            .transfer_within(ACCOUNT, Duration::from_secs(5), RecoveryCause::NoQuorum)
+            .await
+            .unwrap();
+        let events = fixture.drain();
+        assert!(matches!(events.last(), Some(Event::Receipt(_))), "{held}");
+        fixture.handle.stop().unwrap();
+    }
 }
 
 impl Fixture {
-    async fn assert_retried_receipt(cause: RecoveryCause, message: &str) {
-        let mut fixture = Fixture::new(Fixture::refusal(2, -32010, message)).await;
+    async fn assert_retried_receipt(cause: RecoveryCause, code: i32, message: &str) {
+        let mut fixture = Fixture::new(Fixture::refusal(2, code, message)).await;
         fixture
             .rpc
             .transfer_within(ACCOUNT, Duration::from_secs(5), cause)

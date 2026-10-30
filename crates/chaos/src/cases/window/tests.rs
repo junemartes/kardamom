@@ -1,38 +1,25 @@
 use super::*;
-use crate::cases::carry::Step;
 
 #[test]
-fn replacement_traffic_covers_provisioning_and_the_recovered_fleet() {
+fn a_regular_case_has_the_three_minute_deadline_and_its_load_covers_it() {
     let knobs = Knobs::read(&[]).unwrap();
-    let provisioning = Duration::from_secs(41 * 60 + 14);
-    let recovered = knobs.inject_delay + provisioning + knobs.rejoin_slo;
-    for case in [Case::NodeReplaceExecutor, Case::NodeReplaceSealer] {
-        assert!(case.window(&knobs) > recovered, "{}", case.name());
+    assert_eq!(knobs.case_deadline, Duration::from_mins(3));
+    for case in [Case::GracefulExecutor, Case::NodeFailureExecutor, Case::L1Liar] {
+        assert_eq!(case.deadline(&knobs), Duration::from_mins(3), "{}", case.name());
+        assert_eq!(case.window(&knobs), case.deadline(&knobs), "{}", case.name());
     }
+    let shorter = Knobs::read(&[("CHAOS_CASE_S", "90")]).unwrap();
+    assert_eq!(Case::HardIngress.deadline(&shorter), Duration::from_secs(90));
 }
 
 #[test]
-fn carry_traffic_covers_each_full_deployment_and_recovery() {
+fn only_the_nightly_cases_keep_a_longer_bound() {
     let knobs = Knobs::read(&[]).unwrap();
-    let deployment = Duration::from_secs(43 * 60 + 9);
-    let observed = knobs.inject_delay + deployment + knobs.restart_slo;
-    for step in [Step::ReadersOnEgress, Step::ExecutorFirst] {
-        assert!(Case::Carry(step).window(&knobs) > observed);
+    for case in [
+        Case::ExecutorRestartStorm,
+        Case::SealerFleetTotalWipeRecover,
+        Case::ResizeScaleOutIn,
+    ] {
+        assert!(case.deadline(&knobs) > knobs.case_deadline, "{}", case.name());
     }
-    let two_deployments = knobs.inject_delay + deployment * 2 + knobs.restart_slo;
-    assert!(Case::Carry(Step::ExecutorsRest).window(&knobs) > two_deployments);
-}
-
-#[test]
-fn broken_image_traffic_covers_the_observed_failed_deploy_and_healing_timeline() {
-    let knobs = Knobs::read(&[]).unwrap();
-    // Both plays run under traffic. The failed rollout takes 20m32s;
-    // healing takes 18m13s, before the case-owned recovery observation.
-    let broken = Duration::from_secs(20 * 60 + 32);
-    let healing = Duration::from_secs(18 * 60 + 13);
-    let recovery = knobs.inject_delay + broken + healing + knobs.restart_slo;
-    assert!(Case::DeployBrokenImage.window(&knobs) > recovery);
-    let mut longer = knobs.clone();
-    longer.case_window = Case::DeployBrokenImage.window(&knobs) + Duration::from_mins(1);
-    assert_eq!(Case::DeployBrokenImage.window(&longer), longer.case_window);
 }

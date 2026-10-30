@@ -1,10 +1,8 @@
-use std::time::Duration;
-
 use serde_json::json;
 
 use super::members::Window;
 use super::upgrade::Upgrade;
-use super::{Run, STEPS, Step};
+use super::{Run, STEPS};
 use crate::cases::Case;
 use crate::knobs::Knobs;
 
@@ -19,25 +17,6 @@ fn every_step_is_a_case_of_the_carry_shard_in_run_order() {
             s.name()
         );
     }
-}
-
-#[test]
-fn every_load_window_covers_its_step() {
-    let k = Knobs::read(&[]).unwrap();
-    for s in STEPS {
-        assert!(
-            Case::Carry(*s).window(&k) >= s.floor(&k) && s.floor(&k) > k.inject_delay,
-            "{}",
-            s.name()
-        );
-    }
-    assert!(Step::VersionsOn.floor(&k) >= Duration::from_mins(10));
-    assert!(
-        Step::ExecutorsRest.floor(&k)
-            >= super::super::window::FULL_DEPLOY_LOAD.saturating_mul(2)
-                + Duration::from_mins(20)
-                + k.l1_fault
-    );
 }
 
 #[test]

@@ -91,13 +91,13 @@ impl Phase {
         self.await_startup(&harness).await?;
         harness.smoke_gate(harness.knobs.gate_account).await?;
         kardamom_chaos::log(format!(
-            "chaos suite: shard={} fixed_guard={:?} da_budget={:?} cases=[{}] tps={} case_s={}",
+            "chaos suite: shard={} fixed_guard={:?} da_budget={:?} cases=[{}] tps={} case_deadline_s={}",
             self.shard.name(),
             self.guard,
             self.knobs.da_lag_budget_blocks,
             self.cases.join(" "),
             harness.knobs.tps,
-            harness.knobs.case_window.as_secs()
+            harness.knobs.case_deadline.as_secs()
         ));
         for (index, case) in self.cases.iter().enumerate() {
             run_audited(&mut harness, case, self.audit(index, case)).await?;

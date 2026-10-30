@@ -206,6 +206,9 @@ pub(crate) async fn lapse(h: &mut Harness) -> anyhow::Result<()> {
     .await;
     thaw_validator(h, &node, &inner).await;
     confirm_thaw(h, &node, &inner).await;
+    // The catch-up runs on a chain without new traffic: the lag at the
+    // thaw must close, not a lag that the load keeps open.
+    h.end_case_load("validator-lapse");
     let (path, sample) = sample_recovery(h, &node, started0.as_deref(), vf0).await?;
     let d1 = h
         .probes
@@ -392,6 +395,9 @@ pub(crate) async fn join(h: &mut Harness) -> anyhow::Result<()> {
         .await
         .map_err(|e| crate::chaos_fail!("validator-join: state wipe failed: {e}"))?;
     crate::log("validator-join: validator killed, state + checkpoint staging wiped");
+    // The fresh validator joins a chain without new traffic: it must
+    // close the lag of the wipe, not a lag that the load keeps open.
+    h.end_case_load("validator-join");
     let newborn = RefCell::new(None::<String>);
     let last = Cell::new(Warm::default());
     let (hs, node_ref, started0_ref) = (&*h, node.as_str(), started0.as_deref());

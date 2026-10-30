@@ -30,7 +30,7 @@ mod storm;
 
 pub(crate) use exporter_back::await_exporter_back;
 pub(crate) use sealer_wipe::sealer_fleet_total_wipe_recover;
-pub(crate) use storm::{ROUNDS, executor_restart_storm};
+pub(crate) use storm::executor_restart_storm;
 
 /// How long three restarted members get to elect a leader. Each one
 /// restores its snapshot and replays the log tail before it votes, so
