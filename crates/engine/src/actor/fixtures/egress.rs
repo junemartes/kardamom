@@ -52,6 +52,23 @@ impl TestEgress {
         genesis: Head,
         frames: &[Vec<u8>],
     ) -> Self {
+        Self::serve_on(rt, "127.0.0.1:0".parse().unwrap(), dir, genesis, frames)
+    }
+
+    /// [`Self::serve`] on `addr`: a restarted egress keeps the address that
+    /// its readers know.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store does not open or the HTTP side does not bind.
+    #[must_use]
+    pub fn serve_on(
+        rt: &tokio::runtime::Runtime,
+        addr: std::net::SocketAddr,
+        dir: &Path,
+        genesis: Head,
+        frames: &[Vec<u8>],
+    ) -> Self {
         let store = Store::open(dir, NonZeroU64::new(10).unwrap(), genesis).unwrap();
         let merge = Merge::new(
             MergeConfig {
@@ -86,11 +103,17 @@ impl TestEgress {
         });
         std::thread::spawn(move || owner.run(&rx));
         let http = rt
-            .block_on(Http::bind("127.0.0.1:0".parse().unwrap(), inputs))
+            .block_on(Http::bind(addr, inputs))
             .unwrap();
         let base = format!("http://{}", http.local_addr().unwrap());
         rt.spawn(http.serve());
         Self { base }
+    }
+
+    /// The base URL of this egress, `http://host:port`.
+    #[must_use]
+    pub fn base(&self) -> &str {
+        &self.base
     }
 
     /// A transport of this egress, and the live `egress_order` stream that
@@ -129,6 +152,23 @@ impl TestEgress {
             envelope: envelope.clone(),
         };
         encode_egress_record(index, &entry.payload().unwrap()).unwrap()
+    }
+
+    /// The frame of `epoch` at the canonical index `index`, as the sealer
+    /// relays an origin record: its id, its record type, and its body.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the epoch does not serialize.
+    pub(super) fn epoch_frame(index: u64, epoch: &kardamom_types::EpochRecord) -> Vec<u8> {
+        let body = rkyv::to_bytes::<rkyv::rancor::Error>(epoch).unwrap();
+        let payload = [
+            epoch.canonical_id().as_slice(),
+            &[kardamom_cluster_adapter::wire::RT_EPOCH],
+            body.as_slice(),
+        ]
+        .concat();
+        encode_egress_record(index, &payload).unwrap()
     }
 
     /// The frame of the boundary `b`.

@@ -35,6 +35,9 @@ final class RecordingEgressListener implements EgressListener {
     long replayUnavailableCount = 0;
     long lastUnavailableOldestIndex = -1;
     long lastUnavailableOldestBlock = -1;
+    /** The decision version of every SEALER_INFO frame, in arrival order. */
+    final List<Integer> sealerInfoVersions = new ArrayList<>();
+    long refRefusedCount = 0;
 
     @Override
     public void onMessage(
@@ -63,6 +66,11 @@ final class RecordingEgressListener implements EgressListener {
             maxBoundaryBlockNumber = Math.max(maxBoundaryBlockNumber, blockNumber);
             minBoundaryBlockNumber = Math.min(minBoundaryBlockNumber, blockNumber);
             boundaryCount++;
+        } else if (kind == SealerWire.EGRESS_KIND_SEALER_INFO) {
+            // kind(1) | version(1) | session(8 LE)
+            sealerInfoVersions.add((int) buffer.getByte(offset + Byte.BYTES));
+        } else if (kind == SealerWire.EGRESS_KIND_REF_REFUSED) {
+            refRefusedCount++;
         } else if (kind == SealerWire.EGRESS_KIND_REPLAY_DONE) {
             replayDoneCount++;
         } else if (kind == SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE) {
