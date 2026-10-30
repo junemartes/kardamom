@@ -49,8 +49,10 @@ nomad_server_expect: 1
 # A real dead node of the local profile is down 50 s later, and its
 # replacement takes minutes of provisioning anyway. Production keeps the
 # Nomad default of 10 s: a dedicated host does not stall, and a dead host
-# must lose its allocations quickly.
-nomad_heartbeat_grace: "{{ '60s' if deployment_profile == 'local' else '10s' }}"
+# must lose its allocations quickly. NOMAD_HEARTBEAT_GRACE sets another
+# value on the local profile only: the chaos suite uses 30 s.
+nomad_heartbeat_grace: >-
+  {{ (lookup('env', 'NOMAD_HEARTBEAT_GRACE') | default('60s', true)) if deployment_profile == 'local' else '10s' }}
 # The Consul HTTP and DNS listener address. Nomad and the applications use
 # the local agent at 127.0.0.1. The local profile also listens on the node
 # address for the smoke and chaos scripts.

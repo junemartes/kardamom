@@ -4,6 +4,10 @@
   connection: local
   become: false
   gather_facts: false
+  # Each module runs with its input on stdin, with no temporary file:
+  # fewer process starts for each of the many API calls of a deploy.
+  vars:
+    ansible_pipelining: true
   vars_files:
     - group_vars/all.yml
   roles:

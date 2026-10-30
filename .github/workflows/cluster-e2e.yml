@@ -39,10 +39,13 @@ name: cluster-e2e
 # commits each node to an image and keeps the node volumes. The job
 # uploads them with the host binaries as the `prepared-cluster` artifact.
 #
-# A shard job loads that artifact and sets KARDAMOM_PREPARED_CLUSTER. Each
-# bring-up of the shard test then recreates the saved volumes, starts the
-# saved nodes, waits for the substrate (ansible/resume.yml) and deploys the
-# workloads in waves. A shard runner carries no Rust toolchain, no JDK and
+# The saved node images leave out the layers of the plain node image. A
+# shard job downloads that artifact and `cluster-node-image` in one step,
+# loads the plain node image and then the saved nodes, and sets
+# KARDAMOM_PREPARED_CLUSTER. Each bring-up of the shard test then
+# recreates the saved volumes, starts the saved nodes, waits for the
+# substrate (ansible/resume.yml) and deploys the workloads in waves, with
+# the Mitogen strategy of Ansible. A shard runner carries no Rust toolchain, no JDK and
 # no Foundry, and builds no image. The target of a shard job is 15 minutes.
 
 on:
@@ -223,11 +226,11 @@ jobs:
             -v "$GITHUB_WORKSPACE/deploy/cluster/ansible:/ansible:ro" \
             kardamom-node-prepared:ci -i localhost, /ansible/node-image-check.yml
       - name: Export prepared node image
-        run: docker save kardamom-node-prepared:ci | gzip -1 > /tmp/cluster-node-image.tgz
+        run: docker save kardamom-node-prepared:ci | zstd -T0 -3 -q > /tmp/cluster-node-image.tar.zst
       - uses: actions/upload-artifact@v4
         with:
           name: cluster-node-image
-          path: /tmp/cluster-node-image.tgz
+          path: /tmp/cluster-node-image.tar.zst
           compression-level: 0
           retention-days: 3
 
@@ -276,6 +279,15 @@ jobs:
           tar -xzf cluster-dist.tgz
           rm cluster-dist.tgz
 
+      # The release profile keeps debug info, about nine tenths of each
+      # binary. Without it, the service images in the registry and the
+      # host binaries of the shards are much smaller. The symbol table
+      # stays, so a backtrace still names each function.
+      - name: Strip the debug info of the binaries
+        run: |
+          strip --strip-debug target/release/kardamom-*
+          du -sh target/release/kardamom-* | sort -h | tail -n 3
+
       - uses: actions/download-artifact@v4
         with:
           name: cluster-node-image
@@ -284,10 +296,10 @@ jobs:
         env:
           EXPECTED_REVISION: ${{ github.sha }}
         run: |
-          docker load -i /tmp/cluster-node-artifact/cluster-node-image.tgz
+          zstd -dc /tmp/cluster-node-artifact/cluster-node-image.tar.zst | docker load
           test "$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' kardamom-node-prepared:ci)" = "$EXPECTED_REVISION"
           echo "TF_VAR_prebuilt_node_image=kardamom-node-prepared:ci" >> "$GITHUB_ENV"
-          rm /tmp/cluster-node-artifact/cluster-node-image.tgz
+          rm /tmp/cluster-node-artifact/cluster-node-image.tar.zst
 
       - uses: ./.github/actions/ansible-runner
 
@@ -380,13 +392,14 @@ jobs:
       # GitHub's artifact service answers 403 or 5xx now and then, and
       # download-artifact does not retry, so one bad answer failed a whole
       # shard before it started. Two more attempts follow a failure, each
-      # after a pause.
+      # after a pause. One step downloads both artifacts in parallel, each
+      # to /tmp/artifacts/<name>.
       - uses: actions/download-artifact@v4
         id: artifact-1
         continue-on-error: true
         with:
-          name: prepared-cluster
-          path: /tmp/prepared-cluster
+          pattern: "{prepared-cluster,cluster-node-image}"
+          path: /tmp/artifacts
       - name: Wait before the second artifact download
         if: steps.artifact-1.outcome == 'failure'
         run: sleep 30
@@ -395,33 +408,37 @@ jobs:
         if: steps.artifact-1.outcome == 'failure'
         continue-on-error: true
         with:
-          name: prepared-cluster
-          path: /tmp/prepared-cluster
+          pattern: "{prepared-cluster,cluster-node-image}"
+          path: /tmp/artifacts
       - name: Wait before the third artifact download
         if: steps.artifact-1.outcome == 'failure' && steps.artifact-2.outcome == 'failure'
         run: sleep 90
       - uses: actions/download-artifact@v4
         if: steps.artifact-1.outcome == 'failure' && steps.artifact-2.outcome == 'failure'
         with:
-          name: prepared-cluster
-          path: /tmp/prepared-cluster
+          pattern: "{prepared-cluster,cluster-node-image}"
+          path: /tmp/artifacts
 
-      # The host binaries go to the checkout's target/release. The node
-      # images carry the revision label of the node-image job. The shard
-      # test reads KARDAMOM_PREPARED_CLUSTER and resumes the saved cluster
-      # at each bring-up.
+      # The plain node image loads first: the archive of the saved nodes
+      # leaves out its layers. The host binaries go to the checkout's
+      # target/release while the images load. The node images carry the
+      # revision label of the node-image job. The shard test reads
+      # KARDAMOM_PREPARED_CLUSTER and resumes the saved cluster at each
+      # bring-up.
       - uses: ./.github/actions/just
       - name: Load the prepared cluster
         env:
           EXPECTED_REVISION: ${{ github.sha }}
         run: |
-          zstd -dc /tmp/prepared-cluster/dist.tar.zst | tar -xf -
-          rm /tmp/prepared-cluster/dist.tar.zst
-          just --justfile deploy/cluster/justfile container-load /tmp/prepared-cluster
-          rm -f /tmp/prepared-cluster/nodes.tar.*
+          zstd -dc /tmp/artifacts/prepared-cluster/dist.tar.zst | tar -xf - &
+          dist=$!
+          zstd -dc /tmp/artifacts/cluster-node-image/cluster-node-image.tar.zst | docker load
           test "$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' kardamom-node-prepared:ci)" = "$EXPECTED_REVISION"
+          just --justfile deploy/cluster/justfile container-load /tmp/artifacts/prepared-cluster kardamom-node-prepared:ci
+          wait "$dist"
+          rm -rf /tmp/artifacts/cluster-node-image /tmp/artifacts/prepared-cluster/nodes.tar.zst /tmp/artifacts/prepared-cluster/dist.tar.zst
           echo "TF_VAR_prebuilt_node_image=kardamom-node-prepared:ci" >> "$GITHUB_ENV"
-          echo "KARDAMOM_PREPARED_CLUSTER=/tmp/prepared-cluster" >> "$GITHUB_ENV"
+          echo "KARDAMOM_PREPARED_CLUSTER=/tmp/artifacts/prepared-cluster" >> "$GITHUB_ENV"
 
       - uses: ./.github/actions/ansible-runner
 
@@ -497,6 +514,9 @@ jobs:
         env:
           KARDAMOM_STAGED: "1"
           AERON_STALL_TOLERANCE_MS: "30000"
+          # The same playbooks and tasks, in kept Python processes (see
+          # .github/actions/ansible-runner).
+          ANSIBLE_STRATEGY: mitogen_linear
 
       - name: Collect diagnostics
         if: failure()

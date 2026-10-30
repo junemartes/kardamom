@@ -158,8 +158,8 @@ container-prepare: _container-nodes
     REGISTRY_PUSH_NODE="${REGISTRY_PUSH_NODE:-control-0}" ansible-playbook -i localhost, ansible/containers.yml
     REGISTRY_PUSH_NODE="${REGISTRY_PUSH_NODE:-control-0}" ansible-playbook -i localhost, ansible/images.yml
 
-# Stop a prepared cluster and save it under `dir`: one image per node and
-# the plain node image (nodes.tar.zst, or nodes.tar.gz without zstd), the
+# Stop a prepared cluster and save it under `dir`: one image per node
+# without the layers of the plain node image (nodes.tar.zst), the
 # two volumes of every node (volumes/<volume>.tar), the node image map of
 # terraform/containers (node-images.json) and the image manifest
 # (images.digests). A shard resumes the saved cluster with
@@ -195,24 +195,26 @@ container-save dir:
     jq -n --args '$ARGS.positional | map({key: ., value: "kardamom-node-\(.):prepared"}) | from_entries' $nodes > "$dir/node-images.json"
     cp images.digests "$dir/"
     # The node images share the layers of the plain node image, which a
-    # replaced node starts from. One archive stores each shared layer once.
-    images=("$(jq -r '.image.name' "$NODE_CONTRACT")" $(printf 'kardamom-node-%s:prepared ' $nodes))
-    if command -v zstd >/dev/null; then
-        docker save "${images[@]}" | zstd -T0 -3 -q > "$dir/nodes.tar.zst"
-    else
-        docker save "${images[@]}" | gzip -1 > "$dir/nodes.tar.gz"
-    fi
+    # replaced node starts from. The archive leaves those layers out: the
+    # loader loads the plain node image first, and `docker load` skips a
+    # layer that the engine already holds.
+    base=$(jq -r '.image.name' "$NODE_CONTRACT")
+    base_layers=$(docker image inspect "$base" | jq '.[0].RootFS.Layers | length')
+    work=$(mktemp -d)
+    docker save --output "$work/nodes.tar" $(printf 'kardamom-node-%s:prepared ' $nodes)
+    tar -xOf "$work/nodes.tar" manifest.json | jq -r --argjson n "$base_layers" '[.[].Layers[:$n][]] | unique[]' > "$work/base-layers"
+    mkdir "$work/thin"
+    tar -xf "$work/nodes.tar" -C "$work/thin" --exclude-from="$work/base-layers"
+    rm "$work/nodes.tar"
+    tar -C "$work/thin" -cf - $(ls "$work/thin") | zstd -T0 -3 -q > "$dir/nodes.tar.zst"
+    rm -rf "$work"
     du -sh "$dir"/* "$dir"/volumes/*
 
 # Load the node images of a cluster that `container-save` kept under `dir`.
-container-load dir:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ -f "{{ dir }}/nodes.tar.zst" ]]; then
-        zstd -dc "{{ dir }}/nodes.tar.zst" | docker load
-    else
-        gzip -dc "{{ dir }}/nodes.tar.gz" | docker load
-    fi
+# The plain node image (`base`) must be loaded first.
+container-load dir base:
+    docker image inspect "{{ base }}" >/dev/null
+    zstd -dc "{{ dir }}/nodes.tar.zst" | docker load
 
 # Recreate the volumes of a cluster that `container-save` kept under
 # `dir`, with the label that terraform/containers sets, and put its image

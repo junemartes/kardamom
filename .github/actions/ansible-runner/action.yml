@@ -31,3 +31,15 @@ runs:
     - name: Docker API client dependency for the Ansible interpreter
       shell: bash
       run: pipx inject ansible-core requests
+
+    # Mitogen runs each module in a kept Python process in place of a new
+    # process for each task: a deploy makes some hundred module calls.
+    # A job turns it on with ANSIBLE_STRATEGY=mitogen_linear; this step
+    # only makes the strategy plugin available.
+    - name: Mitogen strategy plugin for the Ansible interpreter
+      shell: bash
+      run: |
+        pipx inject ansible-core mitogen==0.3.54
+        python="$(pipx environment --value PIPX_LOCAL_VENVS)/ansible-core/bin/python"
+        plugins="$("$python" -c 'import ansible_mitogen, os; print(os.path.dirname(ansible_mitogen.__file__))')/plugins/strategy"
+        echo "ANSIBLE_STRATEGY_PLUGINS=$plugins" >> "$GITHUB_ENV"

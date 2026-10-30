@@ -26,15 +26,16 @@ A shard is one test. It brings up its own container cluster, runs its stages, an
 
 CI builds and provisions the cluster once per run. Each shard then deploys the workloads on a copy of that cluster.
 
-1. The `prepare-cluster` job runs `just container-prepare`: `tofu apply` of `terraform/containers`, then `ansible/containers.yml` and `ansible/images.yml`. It deploys no workload.
-2. The same job runs `just container-save <dir>`. Each node stops Nomad, Consul and Docker, and its container stops. `docker commit` keeps each node as the image `kardamom-node-<node>:prepared`. The two volumes of each node go to `volumes/<volume>.tar`. The job uploads the directory, with the host binaries of the build, as the `prepared-cluster` artifact.
-3. A shard job runs `just container-load <dir>` and sets `KARDAMOM_PREPARED_CLUSTER=<dir>`.
+1. The `prepare-cluster` job strips the debug info of the binaries. Then it runs `just container-prepare`: `tofu apply` of `terraform/containers`, then `ansible/containers.yml` and `ansible/images.yml`. It deploys no workload.
+2. The same job runs `just container-save <dir>`. Each node stops Nomad, Consul and Docker, and its container stops. `docker commit` keeps each node as the image `kardamom-node-<node>:prepared`. `nodes.tar.zst` holds these images without the layers of the plain node image. The two volumes of each node go to `volumes/<volume>.tar`. The job uploads the directory, with the host binaries of the build, as the `prepared-cluster` artifact.
+3. A shard job downloads `prepared-cluster` and `cluster-node-image` in one step. It loads the plain node image first, then runs `just container-load <dir> <plain image>`. It sets `KARDAMOM_PREPARED_CLUSTER=<dir>`.
 4. With that variable, each bring-up of the shard test (`Lifecycle::up`) does these steps:
    - `just container-restore <dir>` recreates the volumes and puts `images.digests` in place.
    - `tofu apply` starts each node of generation 0 from its saved image (the `node_images` variable). The nodes keep their names and addresses.
    - `ansible/resume.yml` prepares the host network, waits until Consul, Nomad and the registry answer on every node, and runs `ansible/deploy.yml`.
 - A replaced node (generation above 0) starts from the plain node image with empty volumes, as a new machine does.
-- The bring-up sets `KARDAMOM_DEPLOY_WAVES=1`. On a cluster without jobs and without a deploy record, the deploy starts the jobs of one wave together and waits for them at the end of the wave. A deploy over a running cluster waits for each job before the next one.
+- The bring-up sets `KARDAMOM_DEPLOY_WAVES=1`. On a cluster without jobs and without a deploy record, the deploy starts the jobs of one wave together and waits for them at the end of the wave. It mirrors the deploy record at the end, not after each registration. A deploy over a running cluster waits for each job before the next one.
+- The shard step sets `ANSIBLE_STRATEGY=mitogen_linear`. The playbooks and their tasks are the same; Mitogen runs the modules in kept Python processes.
 - Without `KARDAMOM_PREPARED_CLUSTER`, the bring-up runs `ansible/cluster.yml` on new nodes, as `just container-up` does.
 
 To use the same flow on a local host:

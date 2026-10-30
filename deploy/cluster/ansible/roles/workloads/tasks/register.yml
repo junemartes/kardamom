@@ -49,15 +49,20 @@
     - name: Record the registration of {{ workloads_register_job }}
       when: workloads_recording | default(false)
       block:
+        # Nomad gives a job that it did not know version 0, and the
+        # EnforceIndex of the registration ensures that no other write
+        # came between the plan and the registration.
         - name: Read the registered version of {{ workloads_register_job }}
           ansible.builtin.include_tasks: read_job.yml
           vars:
             workloads_read_job: "{{ workloads_register_job }}"
+          when: workloads_plan.json.Diff.Type != 'Added'
 
         - name: Record the registered version of {{ workloads_register_job }}
           ansible.builtin.include_tasks: record_change.yml
           vars:
-            workloads_record_after: "{{ workloads_registered_job.json.Version }}"
+            workloads_record_after: >-
+              {{ 0 if workloads_plan.json.Diff.Type == 'Added' else workloads_registered_job.json.Version }}
 
 - name: Report planned change for {{ workloads_register_job }}
   ansible.builtin.debug:

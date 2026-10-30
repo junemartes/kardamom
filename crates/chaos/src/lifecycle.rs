@@ -83,6 +83,54 @@ pub struct DeployVars {
     pub genesis_carry: bool,
     /// The switches of the carry window. See [`CarrySwitches`].
     pub carry: CarrySwitches,
+    /// The test-cluster settings of the deploy. See [`ChaosKnobs`].
+    pub knobs: ChaosKnobs,
+}
+
+/// Deploy settings for a test cluster only. With every field at its
+/// default, the deploy renders the values of staging and production.
+#[derive(Debug, Clone, Default)]
+pub struct ChaosKnobs {
+    /// More JVM options for every sealer member
+    /// (`KARDAMOM_CLUSTER_JVM_OPTS`), for example
+    /// `-Daeron.cluster.startup.canvass.timeout=15s`.
+    pub cluster_jvm_opts: Option<String>,
+    /// The Nomad `heartbeat_grace` of a new local-profile node
+    /// (`NOMAD_HEARTBEAT_GRACE`), in seconds. The provisioning renders it,
+    /// so a saved cluster keeps the value of its prepare job.
+    pub heartbeat_grace_s: Option<u64>,
+    /// The window of `KardamomCanaryStalled`
+    /// (`KARDAMOM_CANARY_STALLED_WINDOW`), a Prometheus duration.
+    pub canary_stalled_window: Option<String>,
+    /// Whether the canary pulls its image at each start
+    /// (`KARDAMOM_CANARY_FORCE_PULL`).
+    pub canary_force_pull: Option<bool>,
+    /// The seconds between two executor checkpoints
+    /// (`KARDAMOM_CHECKPOINT_INTERVAL_S`).
+    pub checkpoint_interval_s: Option<u64>,
+}
+
+impl ChaosKnobs {
+    fn env(&self) -> [Option<(&'static str, String)>; 5] {
+        [
+            self.cluster_jvm_opts
+                .as_ref()
+                .map(|v| ("KARDAMOM_CLUSTER_JVM_OPTS", v.clone())),
+            self.heartbeat_grace_s
+                .map(|v| ("NOMAD_HEARTBEAT_GRACE", format!("{v}s"))),
+            self.canary_stalled_window
+                .as_ref()
+                .map(|v| ("KARDAMOM_CANARY_STALLED_WINDOW", v.clone())),
+            self.canary_force_pull.map(|on| {
+                (
+                    "KARDAMOM_CANARY_FORCE_PULL",
+                    if on { "on" } else { "off" }.to_string(),
+                )
+            }),
+            self.checkpoint_interval_s
+                .map(|v| ("KARDAMOM_CHECKPOINT_INTERVAL_S", v.to_string())),
+        ]
+    }
 }
 
 /// The deploy settings of the carry window. With every field at its
@@ -183,6 +231,7 @@ impl DeployVars {
         ]
         .into_iter()
         .chain(self.carry.env())
+        .chain(self.knobs.env())
         .flatten()
         .collect()
     }
@@ -667,6 +716,32 @@ mod tests {
         };
         assert_eq!(new.bring_up_playbook(), "ansible/cluster.yml");
         assert_eq!(saved.bring_up_playbook(), "ansible/resume.yml");
+    }
+
+    #[test]
+    fn the_chaos_knobs_reach_the_deploy_variables() {
+        let vars = DeployVars {
+            knobs: ChaosKnobs {
+                cluster_jvm_opts: Some("-Daeron.cluster.startup.canvass.timeout=15s".to_string()),
+                heartbeat_grace_s: Some(30),
+                canary_stalled_window: Some("1m".to_string()),
+                canary_force_pull: Some(false),
+                checkpoint_interval_s: Some(5),
+            },
+            ..DeployVars::default()
+        };
+        let want = [
+            ("KARDAMOM_GENESIS_CARRY", ""),
+            (
+                "KARDAMOM_CLUSTER_JVM_OPTS",
+                "-Daeron.cluster.startup.canvass.timeout=15s",
+            ),
+            ("NOMAD_HEARTBEAT_GRACE", "30s"),
+            ("KARDAMOM_CANARY_STALLED_WINDOW", "1m"),
+            ("KARDAMOM_CANARY_FORCE_PULL", "off"),
+            ("KARDAMOM_CHECKPOINT_INTERVAL_S", "5"),
+        ];
+        assert_eq!(vars.env(), want.map(|(k, v)| (k, v.to_string())).to_vec());
     }
 
     #[test]
