@@ -1,0 +1,32 @@
+---
+# A replaced node of the chaos suite (Lifecycle::provision_node, with
+# --limit localhost,<node>). The node is a new machine from the plain
+# prepared node image: its packages, Docker, Consul and Nomad are in the
+# image. It joins the bridge and the host settings that the bring-up
+# already prepared. This playbook configures and starts the agents of that
+# node only. Staging and production provision a node with bootstrap.yml.
+- name: Read the node contract
+  ansible.builtin.import_playbook: container-nodes.yml
+  vars:
+    container_host_prepared: true
+
+# The node contract gives the node address and name. The roles read one
+# gathered fact, the architecture, and only to install software on a node
+# without the prepared image. The minimal subset holds it.
+- name: Configure and start the agents of the replaced node
+  hosts: container_nodes
+  become: true
+  gather_subset: [min]
+  roles:
+    - common
+    - docker
+    - consul
+    - nomad
+
+- name: Run the local Docker registry on a replaced control node
+  hosts: control
+  become: true
+  gather_facts: false
+  roles:
+    - role: registry
+      when: deployment_profile == 'local'
