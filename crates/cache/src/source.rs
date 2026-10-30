@@ -1,6 +1,7 @@
 //! Where a fresh Redis connection comes from: one URL, or the primary
 //! that the Sentinels name.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -87,7 +88,7 @@ impl Source {
                     node,
                     bound,
                 };
-                ask.any(&Self::expand(sentinels).await).await
+                ask.any(&Self::expand(sentinels, bound).await).await
             }
         }
     }
@@ -97,23 +98,53 @@ impl Source {
     /// name that has one DNS record for each Sentinel. The client
     /// library connects to the first record only, so one hung Sentinel
     /// at that record would hide the others. The names resolve again at
-    /// each connection, so a moved Sentinel is found.
-    async fn expand(sentinels: &[ConnectionInfo]) -> Vec<ConnectionInfo> {
+    /// each connection, so a moved Sentinel is found. Each lookup ends
+    /// after `bound`: a slow DNS server must not hold the reconnect, and
+    /// with it the reads that skip Redis meanwhile, past the bound of the
+    /// connection attempt.
+    async fn expand(sentinels: &[ConnectionInfo], bound: Duration) -> Vec<ConnectionInfo> {
+        Self::expand_by(sentinels, bound, |host, port| async move {
+            let found = tokio::net::lookup_host((host.as_str(), port)).await?;
+            Ok(found.collect::<Vec<_>>().into_iter())
+        })
+        .await
+    }
+
+    /// [`Self::expand`] with the address lookup `lookup`. Tests give a
+    /// lookup that never answers.
+    async fn expand_by<F, A>(
+        sentinels: &[ConnectionInfo],
+        bound: Duration,
+        lookup: impl Fn(String, u16) -> F,
+    ) -> Vec<ConnectionInfo>
+    where
+        F: Future<Output = std::io::Result<A>>,
+        A: Iterator<Item = SocketAddr>,
+    {
         let mut expanded = Vec::new();
         for info in sentinels {
-            Self::add_new(&mut expanded, Self::resolve(info).await);
+            Self::add_new(&mut expanded, Self::resolve(info, bound, &lookup).await);
         }
         expanded
     }
 
     /// One configured Sentinel as one entry for each address of its
-    /// host. A name that does not resolve stays as it is, so the
-    /// connection attempt reports the error.
-    async fn resolve(info: &ConnectionInfo) -> Vec<ConnectionInfo> {
+    /// host. A name that does not resolve within `bound` stays as it is,
+    /// so the connection attempt reports the error. A lookup that times
+    /// out counts as one that failed.
+    async fn resolve<F, A>(
+        info: &ConnectionInfo,
+        bound: Duration,
+        lookup: &impl Fn(String, u16) -> F,
+    ) -> Vec<ConnectionInfo>
+    where
+        F: Future<Output = std::io::Result<A>>,
+        A: Iterator<Item = SocketAddr>,
+    {
         let ConnectionAddr::Tcp(host, port) = info.addr() else {
             return vec![info.clone()];
         };
-        let Ok(found) = tokio::net::lookup_host((host.as_str(), *port)).await else {
+        let Ok(Ok(found)) = tokio::time::timeout(bound, lookup(host.clone(), *port)).await else {
             return vec![info.clone()];
         };
         let at = |addr: SocketAddr| {

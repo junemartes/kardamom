@@ -807,10 +807,12 @@ Each process has one Aeron thread. It carries the publishes and the subscription
   egress index.
 - A client that is over its rate limit gets `shed`, and the ingress answers `null` without a query.
 - The receipt cache keeps the newest 131072 receipts and evicts the oldest first.
-- `kardamom_cache_reconnects_total` counts the Redis reconnects that a failed command started. One failure burst starts one reconnect.
-- `kardamom_cache_live_evictions_total` counts the entries that the local account layer removed, for the TTL or for the capacity. A high rate means that the layer is too small for the active accounts.
-- `kardamom_cache_reconnects_total` counts the reconnects that a failed Redis command starts. One failure burst starts one reconnect.
-  The readers skip the cache while the reconnect runs.
+- `kardamom_cache_reconnects_total` counts the replacements of the shared Redis connection.
+  - A connection error replaces the connection at once.
+  - A command timeout alone does not. The connection is replaced only after it gives no reply for three command
+    timeouts. Until then, the reads continue on the same connection.
+  - The readers skip the cache while a replacement runs. Each Sentinel DNS lookup and each connection attempt ends
+    after the connection bound: ten command timeouts.
 - `kardamom_cache_live_evictions_total` counts the entries that the `live` layer removes, for the TTL or the capacity.
   A high rate with many `live` misses means that the layer is too small for the active accounts.
 
