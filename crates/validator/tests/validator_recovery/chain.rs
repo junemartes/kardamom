@@ -4,8 +4,10 @@
 //! set and the receipts of each block, which the feed publishes as the
 //! BAL and receipt frames of an executor replica. At one block it copies
 //! a real checkpoint, which a peer server serves to a joining validator.
-//! A second writer with the trie on gives the state root of the last block.
+//! A second writer with the trie on gives the state root at each head
+//! that a test ends on.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -53,14 +55,20 @@ pub(crate) struct Chain {
     pub(crate) blocks: Vec<Block>,
     pub(crate) checkpoints: PathBuf,
     pub(crate) checkpoint_block: u64,
-    /// The canonical state root after the last block.
-    pub(crate) head_root: B256,
+    /// The canonical state root after each head that a test ends on.
+    roots: BTreeMap<u64, B256>,
 }
 
 impl Chain {
-    /// Build `count` blocks under `dir`, and copy a checkpoint after block
-    /// `checkpoint_block`.
-    pub(crate) fn build(dir: &Path, count: u64, checkpoint_block: u64) -> Self {
+    /// The canonical state root after `head`, one of the heads of
+    /// [`Self::build`].
+    pub(crate) fn root(&self, head: u64) -> B256 {
+        self.roots[&head]
+    }
+
+    /// Build `count` blocks under `dir`, copy a checkpoint after block
+    /// `checkpoint_block`, and keep the state root after each of `heads`.
+    pub(crate) fn build(dir: &Path, count: u64, checkpoint_block: u64, heads: &[u64]) -> Self {
         let genesis_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../chains/dev.toml");
         let genesis: Genesis =
             toml::from_str(&std::fs::read_to_string(&genesis_file).unwrap()).unwrap();
@@ -76,7 +84,7 @@ impl Chain {
             checkpoint_block,
         }
         .run(&stream, count);
-        let head_root = Roots::head(&dir.join("roots"), &alloc, &run.deltas);
+        let roots = Roots::at(&dir.join("roots"), &alloc, &run.deltas, heads);
         let blocks = entries
             .split(frames)
             .into_iter()
@@ -92,7 +100,7 @@ impl Chain {
             blocks,
             checkpoints,
             checkpoint_block,
-            head_root,
+            roots,
         }
     }
 }
@@ -344,29 +352,42 @@ impl Reference {
     }
 }
 
-/// The state root after the last block: the recorded write sets, applied
-/// in order by a writer with the trie on.
+/// The state root after each of the heads: the recorded write sets,
+/// applied in order by a writer with the trie on.
 struct Roots;
 
 impl Roots {
-    fn head(dir: &Path, alloc: &GenesisAlloc, deltas: &[(BlockBoundary, BlockDelta)]) -> B256 {
+    fn at(
+        dir: &Path,
+        alloc: &GenesisAlloc,
+        deltas: &[(BlockBoundary, BlockDelta)],
+        heads: &[u64],
+    ) -> BTreeMap<u64, B256> {
         let env = open_env(dir);
         kardamom_state::seed_genesis(&env, alloc).unwrap();
         let mut writer = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
-        deltas
+        let roots = deltas
             .iter()
-            .map(|(boundary, delta)| WriteBatch::new(boundary.clone(), delta.clone()))
-            .try_for_each(|batch| writer.delta_tx.send(batch).map_err(|_| "writer gone"))
-            .unwrap();
-        let head = deltas
-            .last()
-            .map_or(0, |(boundary, _)| boundary.block_number);
-        let root = wait_block(&writer, head)
+            .filter_map(|(boundary, delta)| {
+                writer
+                    .delta_tx
+                    .send(WriteBatch::new(boundary.clone(), delta.clone()))
+                    .unwrap();
+                let head = boundary.block_number;
+                heads
+                    .contains(&head)
+                    .then(|| (head, Self::root(&writer, head)))
+            })
+            .collect();
+        writer.shutdown().unwrap();
+        roots
+    }
+
+    fn root(writer: &kardamom_state::WriterHandle, head: u64) -> B256 {
+        wait_block(writer, head)
             .state_root()
             .unwrap()
-            .expect("the trie is on");
-        writer.shutdown().unwrap();
-        root
+            .expect("the trie is on")
     }
 }
 

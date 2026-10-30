@@ -1,4 +1,4 @@
-//! The live feed of the tests: a real media driver, a real egress that
+//! The live feed of one test, on the shared media driver: a real egress that
 //! serves the canonical stream and publishes it on `egress_order`, and the
 //! `tx_bal` and `tx_receipts` publications of one executor replica. A
 //! feeder thread publishes one block of the chain at a time, at a fixed
@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use kardamom_log::aeron_live::{AeronRuntime, PubHandle, TxReceiptsPublisherHandle};
 use kardamom_log::config::ChannelsConfig;
-use kardamom_log::testing::AeronTestCluster;
 use kardamom_types::BalFrame;
 
 use super::chain::Chain;
@@ -58,35 +57,22 @@ pub(crate) struct Feed {
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     pub(crate) egress_base: String,
-    /// The client of the test; it closes before the driver stops.
+    /// The client of the test; it closes when the feeder has stopped.
     aeron: Option<AeronRuntime>,
-    http: tokio::runtime::Runtime,
-    /// The driver ends in [`Drop`], after the feeder: its container stops
-    /// on a worker of `http`, which its async drop needs.
-    driver: Option<AeronTestCluster>,
+    /// The runtime of the egress HTTP side; held for its life.
+    _http: tokio::runtime::Runtime,
 }
 
 impl Feed {
-    /// Start a driver whose client liveness timeout is `liveness`, an
-    /// egress with its store under `dir`, and a feeder of the chain that
-    /// `chain` builds meanwhile.
-    pub(crate) fn start(
-        dir: &Path,
-        chain: JoinHandle<Arc<Chain>>,
-        liveness: Duration,
-    ) -> (Self, Arc<Chain>) {
+    /// Start a client of the driver at `aeron_dir`, an egress with its
+    /// store under `dir`, and a feeder of `chain`.
+    pub(crate) fn start(dir: &Path, chain: Arc<Chain>, aeron_dir: &Path) -> Self {
         let http = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .unwrap();
-        let driver = http.block_on(async {
-            kardamom_log::testing::require_docker().await;
-            AeronTestCluster::single_node_with_client_liveness(liveness)
-                .await
-                .unwrap()
-        });
-        let rt = AeronRuntime::spawn_with_dir(driver.aeron_dir_host(0)).unwrap();
+        let rt = AeronRuntime::spawn_with_dir(aeron_dir).unwrap();
         let channels = ChannelsConfig::default();
         let live = rt
             .open_publication(
@@ -106,26 +92,23 @@ impl Feed {
         let target = Arc::new(AtomicU64::new(0));
         let published = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
-        let chain = chain.join().unwrap();
         let worker = Feeder {
-            chain: chain.clone(),
+            chain,
             outputs,
             target: target.clone(),
             published: published.clone(),
             stop: stop.clone(),
         }
         .spawn();
-        let feed = Self {
+        Self {
             target,
             published,
             stop,
             worker: Some(worker),
             egress_base,
             aeron: Some(rt),
-            http,
-            driver: Some(driver),
-        };
-        (feed, chain)
+            _http: http,
+        }
     }
 
     /// Publish blocks up to `block`, at the pace of the chain.
@@ -133,20 +116,8 @@ impl Feed {
         self.target.store(block, Ordering::Release);
     }
 
-    /// The `aeron.dir` of the driver.
-    pub(crate) fn aeron_dir(&self) -> std::path::PathBuf {
-        self.driver
-            .as_ref()
-            .unwrap()
-            .aeron_dir_host(0)
-            .to_path_buf()
-    }
-
     /// The client of the test closes here.
     fn close(_aeron: Option<AeronRuntime>) {}
-
-    /// The driver container stops here, on a runtime worker.
-    fn end(_driver: Option<AeronTestCluster>) {}
 
     /// The newest block the feed published.
     pub(crate) fn head(&self) -> u64 {
@@ -160,12 +131,7 @@ impl Drop for Feed {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        let aeron = self.aeron.take();
-        let driver = self.driver.take();
-        Self::close(aeron);
-        let _ = self
-            .http
-            .block_on(self.http.spawn(async move { Self::end(driver) }));
+        Self::close(self.aeron.take());
     }
 }
 

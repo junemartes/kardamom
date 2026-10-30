@@ -200,6 +200,17 @@ impl AeronTestCluster {
         self.nodes[i].archive_dir()
     }
 
+    /// The Docker container id of node `i`, or `None` for an external
+    /// driver. A process-wide fixture uses it to remove the container at
+    /// process exit, where no destructor of a static runs.
+    #[must_use]
+    pub fn container_id(&self, i: usize) -> Option<&str> {
+        match &self.nodes[i] {
+            Node::Container(c) => Some(c.container.id()),
+            Node::External { .. } => None,
+        }
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.nodes.len()

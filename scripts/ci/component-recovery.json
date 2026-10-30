@@ -1547,7 +1547,7 @@
         "reference executor: the production engine over a real MDBX writer, with a real checkpoint and peer checkpoint server"
       ],
       "controlled": [
-        "150 blocks for the lapses and 70 blocks for the join, two transfers each, one block per 100 ms",
+        "one reference chain and one media driver per test process; the lapse tests run to block 150 and the join to block 70, two transfers per block, one block per 100 ms",
         "SIGSTOP and SIGCONT of the validator process; the test restarts an exited process as the supervisor",
         "driver client liveness timeout of 3 s; lapses of 1.5 s and 9 s",
         "one executor replica publishes the reference BAL and receipt frames",
@@ -1567,7 +1567,7 @@
           ],
           "exit_code": 101,
           "compiled": true,
-          "failed_assertion": "coverage regressed over the lapse: bal_missing 0 -> 17"
+          "failed_assertion": "coverage regressed over the lapse: bal_missing 0 -> 15"
         },
         {
           "mutation": "the restart resumes from ResumePoint::GENESIS, not from the persisted recovery point",

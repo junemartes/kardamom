@@ -25,6 +25,8 @@ mod egress;
 mod feed;
 #[path = "validator_recovery/node.rs"]
 mod node;
+#[path = "validator_recovery/shared.rs"]
+mod shared;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,20 +35,21 @@ use std::time::{Duration, Instant};
 use chain::Chain;
 use feed::Feed;
 use node::{Node, Sample, Settings};
+use shared::Shared;
 
-/// The blocks of the lapse chain. At the pace of the feed they span 15 s:
+/// The blocks of the shared chain, and the head of the lapse tests. At the pace of the feed they span 15 s:
 /// the long lapse and the restart fit before the chain ends.
-const BLOCKS: u64 = 150;
-/// The blocks of the join chain: the join needs no long lapse.
-const JOIN_BLOCKS: u64 = 70;
+pub(crate) const BLOCKS: u64 = 150;
+/// The head of the join test: the join needs no long lapse.
+pub(crate) const JOIN_BLOCKS: u64 = 70;
 /// The block after which the reference executor copies its checkpoint.
-const CHECKPOINT_BLOCK: u64 = 20;
+pub(crate) const CHECKPOINT_BLOCK: u64 = 20;
 /// The blocks the chain runs past the checkpoint before the join, so the
 /// joining validator replays a tail.
 const JOIN_TAIL: u64 = 10;
 /// The client liveness timeout of the driver: the bound between the two
 /// lapse paths.
-const LIVENESS: Duration = Duration::from_secs(3);
+pub(crate) const LIVENESS: Duration = Duration::from_secs(3);
 /// A lapse inside the liveness timeout.
 const SHORT_LAPSE: Duration = Duration::from_millis(1_500);
 /// A lapse of three liveness timeouts.
@@ -63,10 +66,12 @@ const SURVIVOR_MISSING: u64 = 5;
 /// The handler line of a client timeout.
 const CLIENT_TIMEOUT_LINE: &str = "aeron client error; exiting";
 
-/// One test's chain, feed and scratch directory.
+/// One test: the shared chain and driver, its own feed and scratch
+/// directory, and the head its chain ends on.
 struct Rig {
     feed: Feed,
     chain: Arc<Chain>,
+    aeron_dir: PathBuf,
     dir: tempfile::TempDir,
     started: Instant,
     blocks: u64,
@@ -80,13 +85,14 @@ impl Rig {
             .prefix("kardamom-validator-recovery-")
             .tempdir()
             .unwrap();
-        let root = dir.path().to_path_buf();
-        let building =
-            std::thread::spawn(move || Arc::new(Chain::build(&root, blocks, CHECKPOINT_BLOCK)));
-        let (feed, chain) = Feed::start(dir.path(), building, LIVENESS);
+        let shared = Shared::get();
+        let chain = shared.chain.clone();
+        let aeron_dir = shared.aeron_dir();
+        let feed = Feed::start(dir.path(), chain.clone(), &aeron_dir);
         Self {
             feed,
             chain,
+            aeron_dir,
             dir,
             started,
             blocks,
@@ -100,7 +106,7 @@ impl Rig {
     fn settings(&self, checkpoints: Option<(PathBuf, String)>) -> Settings {
         Settings {
             state_dir: self.path("validator-state"),
-            aeron_dir: self.feed.aeron_dir(),
+            aeron_dir: self.aeron_dir.clone(),
             genesis: self.chain.genesis_file.clone(),
             egress: self.feed.egress_base.clone(),
             checkpoints,
@@ -108,8 +114,6 @@ impl Rig {
         }
     }
 
-    /// Wait until `node` verifies live, past `floor`, within `lag` blocks
-    /// of the executor head.
     /// Start the first validator, then let the chain run: the executor
     /// publishes to a subscribed validator from the first block.
     fn first_node(&self, settings: &Settings) -> Node {
@@ -125,6 +129,8 @@ impl Rig {
         })
     }
 
+    /// Wait until `node` verifies live, past `floor`, within `lag` blocks
+    /// of the executor head.
     fn verifying(&self, node: &Node, what: &str, floor: u64, lag: u64) -> Sample {
         node.await_sample(what, Duration::from_secs(30), |s| {
             s.verifies_after(floor, self.feed.head(), lag)
@@ -148,7 +154,7 @@ impl Rig {
         assert_eq!(snapshot.block_number(), self.blocks);
         assert_eq!(
             snapshot.state_root().unwrap(),
-            Some(self.chain.head_root),
+            Some(self.chain.root(self.blocks)),
             "the validator state root differs from the reference chain"
         );
         println!(
