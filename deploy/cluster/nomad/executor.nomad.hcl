@@ -317,8 +317,11 @@ job "executor" {
       restart {
         # An Aeron client exits until the media driver of its node runs
         # again, as after a node restart. Ten attempts at the 5 s delay
-        # cover that start; three fast failures left the rest of the
-        # interval without a try.
+        # cover that start; with three, three fast failures would leave the
+        # rest of the interval without a try. The cost: a task that crashes
+        # in a loop restarts about every 5 s, about three times the load on
+        # its targets of three attempts. A recovery after a node restart that
+        # is up to a minute faster outweighs that load.
         attempts = 10
         interval = "1m"
         delay    = "5s"

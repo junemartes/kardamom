@@ -227,7 +227,11 @@ container-restore dir:
     restore_volume() {
         local volume
         volume=$(basename "$1" .tar)
-        docker volume rm "$volume" >/dev/null 2>&1 || true
+        # A volume of an earlier cluster goes first. A volume that a node
+        # container still uses fails the restore: the cluster is up.
+        if docker volume inspect "$volume" >/dev/null 2>&1; then
+            docker volume rm "$volume" >/dev/null
+        fi
         docker volume create --label io.kardamom.cluster=kardamom-net "$volume" >/dev/null
         docker run --rm -i --privileged --network none --entrypoint tar -v "$volume:/v" "$helper" \
             -C /v --numeric-owner --xattrs --xattrs-include='*' -xpf - < "$1"

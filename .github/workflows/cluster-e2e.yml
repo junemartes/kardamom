@@ -55,8 +55,10 @@ on:
     - cron: "17 3 * * *"
 
 concurrency:
-  # A newer run of the same ref replaces the older one.
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # A newer run of the same event and ref replaces the older one. The
+  # schedule, a dispatch and a labeled pull request each have their own
+  # group, so a dispatch on main and the schedule never cancel each other.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
