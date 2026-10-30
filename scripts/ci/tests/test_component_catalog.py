@@ -14,7 +14,7 @@ DOCUMENT = {
         "guarded": {"ci_mode": "in-process", "tests": ["recovers", "restarts"],
                     "negative_controls": {"no_replay": {"test": "recovers"}}},
         "unguarded": {"ci_mode": "docker", "tests": ["observes"]},
-        "unrun": {"tests": ["drains"], "negative_control": "The old path fails."},
+        "unrun": {"ci_mode": "docker", "tests": ["drains"], "negative_control": "The old path fails."},
     },
     "cases": [
         {"case": "ported-case", "family": "Ingress", "status": "ported",
@@ -72,11 +72,29 @@ class CatalogTests(unittest.TestCase):
                           "negative control")
 
     def test_a_ported_case_needs_a_suite_that_ci_runs(self):
-        self.assert_error(lambda d: d["cases"][0].update(local_tests=[{"suite": "unrun", "test": "drains"}]),
-                          "ci_mode")
+        def unrun(document):
+            document["local_suites"]["unrun"].pop("ci_mode")
+            document["cases"][0]["local_tests"] = [{"suite": "unrun", "test": "drains"}]
+        self.assert_error(unrun, "so that CI runs it")
 
-    def test_an_unknown_ci_mode_is_rejected(self):
-        self.assert_error(lambda d: d["local_suites"]["unrun"].update(ci_mode="nightly"), "ci_mode must be")
+    def test_a_raised_test_timeout_needs_a_reason_and_a_bound(self):
+        def raise_to(seconds, reason=None):
+            def change(document):
+                document["local_suites"]["guarded"]["test_timeout_s"] = seconds
+                if reason is not None:
+                    document["local_suites"]["guarded"]["test_timeout_reason"] = reason
+            return change
+        self.assertEqual(self.catalog(raise_to(60)).errors(), [])
+        self.assertEqual(self.catalog(raise_to(120, "the first log purge pass is a fixed 30 s")).errors(), [])
+        self.assert_error(raise_to(90), "needs a test_timeout_reason")
+        self.assert_error(raise_to(90, " "), "needs a test_timeout_reason")
+        for seconds in [59, 121, 90.5, "90", True]:
+            with self.subTest(seconds=seconds):
+                self.assert_error(raise_to(seconds, "reason"), "an integer from 60 to 120")
+
+    def test_every_suite_needs_a_known_ci_mode(self):
+        self.assert_error(lambda d: d["local_suites"]["guarded"].pop("ci_mode"), "suite guarded: ci_mode")
+        self.assert_error(lambda d: d["local_suites"]["guarded"].update(ci_mode="nightly"), "suite guarded: ci_mode")
 
     def test_every_negative_control_format_counts(self):
         for key, value in [("clock_negative_controls", [{"test": "observes"}]),

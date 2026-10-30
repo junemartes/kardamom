@@ -75,10 +75,20 @@ jobs:
       - run: python3 -m unittest discover -s scripts/hooks/tests
       - run: python3 -m unittest discover -s scripts/ci/tests
 
+  # One compile of every workspace test target. The docker features of the
+  # component suites are on, so the same build supplies the component bundle
+  # and the nextest archive of the workspace tests. Only pushes save the
+  # compiler cache; a pull request restores the cache of its base branch.
   build:
     name: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Line tables keep file and line numbers in backtraces. Full debug info
+    # makes the test binaries several times larger, and the archive and the
+    # upload of the binaries take minutes.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -91,38 +101,127 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
       - uses: ./.github/actions/rust-build-cache
-      - name: Build workspace and capture test artifacts
-        run: cargo build --workspace --all-targets --locked --message-format=json-render-diagnostics > /tmp/workspace-build.jsonl
-      - name: Package in-process recovery tests
+        with:
+          save-if: ${{ github.event_name == 'push' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Build the workspace tests
         run: |
-          python3 scripts/ci/component_tests.py prepare --artifacts /tmp/workspace-build.jsonl --bundle /tmp/component-bundle
-          tar -C /tmp/component-bundle -czf /tmp/component-bundle.tar.gz .
+          features="$(python3 scripts/ci/component_tests.py features)"
+          cargo test --workspace --locked --no-run --features "$features" \
+            --message-format=json-render-diagnostics > /tmp/workspace-build.jsonl
+          # A stack suite runs the service binaries; build them only when the catalog has one.
+          if python3 scripts/ci/component_tests.py has-stack; then
+            cargo build --workspace --locked --bins --features "$features" \
+              --message-format=json-render-diagnostics > /tmp/workspace-services.jsonl
+          fi
+          cargo nextest archive --workspace --locked --features "$features" \
+            --zstd-level 1 --archive-file /tmp/workspace-tests.tar.zst
+      - name: Package the component recovery tests
+        run: |
+          logs=(--artifacts /tmp/workspace-build.jsonl)
+          if [ -e /tmp/workspace-services.jsonl ]; then logs+=(--artifacts /tmp/workspace-services.jsonl); fi
+          python3 scripts/ci/component_tests.py prepare "${logs[@]}" --bundle /tmp/component-bundle
+          tar -C /tmp/component-bundle -cf - . | zstd -T0 -3 -q -o /tmp/component-bundle.tar.zst
       - uses: actions/upload-artifact@v4
         with:
           name: component-test-binaries
-          path: /tmp/component-bundle.tar.gz
+          path: /tmp/component-bundle.tar.zst
+          compression-level: 0
+          retention-days: 3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workspace-nextest-archive
+          path: /tmp/workspace-tests.tar.zst
+          compression-level: 0
           retention-days: 3
 
-  component-recovery:
-    name: in-process recovery (${{ matrix.shard }})
-    needs: build
+  # The compiled sealer test runtime. A component shard runs JUnit methods
+  # from it without Gradle.
+  sealer-runtime:
+    name: build sealer tests
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - name: Package the sealer test runtime
+        run: |
+          python3 scripts/ci/component_tests.py prepare-sealer --sealer /tmp/sealer-runtime
+          tar -C /tmp/sealer-runtime -czf /tmp/sealer-runtime.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: component-sealer-runtime
+          path: /tmp/sealer-runtime.tar.gz
+          compression-level: 0
+          retention-days: 3
+
+  # Every catalogued component suite: in-process, docker and gradle tests,
+  # in a fixed number of shards planned from scripts/ci/component-timings.json.
+  # A shard compiles nothing. It pulls the docker images once, or loads them
+  # from the cache that a push saves.
+  component-recovery:
+    name: component recovery (${{ matrix.shard }})
+    needs: [build, sealer-runtime]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/foundry
+      - uses: ./.github/actions/aeron-jar
+      # The key names every image tag, and the week. A new tag in the list
+      # or a tag that moves upstream refreshes the cache within a week.
+      - name: Name the docker image cache
+        id: image-key
+        run: |
+          tags="$(python3 scripts/ci/component_tests.py image-names | tr ' ' '-' | tr -c 'a-zA-Z0-9.-' '_')"
+          echo "key=component-images-v2-${tags}-${{ hashFiles('crates/log/docker/aeron/**') }}-$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: images
+        with:
+          path: /tmp/component-images.tar.zst
+          key: ${{ steps.image-key.outputs.key }}
+      - name: Start the docker images in the background
+        env:
+          CACHED: ${{ steps.images.outputs.cache-hit }}
+        run: |
+          if [ "$CACHED" = "true" ]; then
+            nohup sh -c 'zstd -dc /tmp/component-images.tar.zst | docker load -q && touch /tmp/images.ok' > /tmp/images.log 2>&1 &
+          else
+            nohup sh -c 'python3 scripts/ci/component_tests.py images && touch /tmp/images.ok' > /tmp/images.log 2>&1 &
+          fi
       - uses: actions/download-artifact@v4
         with:
           name: component-test-binaries
           path: /tmp/component-download
-      - name: Run prebuilt actor recovery tests
+      - uses: actions/download-artifact@v4
+        with:
+          name: component-sealer-runtime
+          path: /tmp/component-download
+      - name: Unpack the bundles
         run: |
-          mkdir /tmp/component-bundle
-          tar -C /tmp/component-bundle -xzf /tmp/component-download/component-bundle.tar.gz
-          python3 scripts/ci/component_tests.py run --bundle /tmp/component-bundle --shard ${{ matrix.shard }} --output /tmp/component-results
+          mkdir /tmp/component-bundle /tmp/sealer-runtime
+          zstd -dc /tmp/component-download/component-bundle.tar.zst | tar -C /tmp/component-bundle -xf -
+          tar -C /tmp/sealer-runtime -xzf /tmp/component-download/sealer-runtime.tar.gz
+          rm -r /tmp/component-download
+      - name: Wait for the docker images
+        run: |
+          while ! [ -e /tmp/images.ok ] && pgrep -f "docker load|component_tests.py images" > /dev/null; do sleep 1; done
+          cat /tmp/images.log
+          test -e /tmp/images.ok
+      - name: Run the shard
+        run: |
+          python3 scripts/ci/component_tests.py run --shard ${{ matrix.shard }} \
+            --bundle /tmp/component-bundle --sealer /tmp/sealer-runtime --output /tmp/component-results
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -130,6 +229,14 @@ jobs:
           path: /tmp/component-results
           if-no-files-found: error
           retention-days: 7
+      - name: Save the docker images
+        if: github.event_name == 'push' && matrix.shard == 0 && steps.images.outputs.cache-hit != 'true'
+        run: docker save $(python3 scripts/ci/component_tests.py image-names) | zstd -T0 -3 -q -o /tmp/component-images.tar.zst
+      - uses: actions/cache/save@v4
+        if: github.event_name == 'push' && matrix.shard == 0 && steps.images.outputs.cache-hit != 'true'
+        with:
+          path: /tmp/component-images.tar.zst
+          key: ${{ steps.image-key.outputs.key }}
 
   # The sealer's JUnit suite (~2,250 lines: failover, replay, snapshot
   # restore, fanout, contiguity guard) previously ran on no workflow — both

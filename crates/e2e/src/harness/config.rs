@@ -102,6 +102,9 @@ pub struct StackConfig {
     /// The carry window rollout: the member feed, the egress, and the
     /// batcher. `None` runs none of them.
     pub carry: Option<CarryOptions>,
+    /// The read path: a Redis container and a state mirror next to the
+    /// executor, which writes checkpoints for the mirror's rebuild.
+    pub read_path: bool,
 }
 
 /// The parts of the stack that the carry window rollout needs.
@@ -216,6 +219,7 @@ impl Default for StackConfig {
             unpayable_spends: false,
             ingress_rows: false,
             carry: None,
+            read_path: false,
         }
     }
 }
