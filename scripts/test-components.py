@@ -34,7 +34,7 @@ class Run:
         started = time.monotonic()
         print(f"{name}: {' '.join(suite['command'])}", flush=True)
         timed_out = False
-        # Only the network of a killed test stays: a local run shares the host, so it removes no containers.
+        # A local run shares the host, so it removes only what the suite owns: its networks and their containers.
         owner = Docker.owner() if suite.get("ci_mode") in CONTAINER_MODES else None
         environment = dict(os.environ, CARGO_TERM_COLOR="never") | ({OWNER_VARIABLE: owner} if owner else {})
         with log.open("w") as output:
@@ -50,7 +50,7 @@ class Run:
                 timed_out = True
             finally:
                 if owner:
-                    Docker.remove_networks(owner)
+                    Docker.clean(owner)
         text = log.read_text()
         passed = re.findall(r"^test ([\w:]+) \.\.\. ok$", text, re.MULTILINE)
         failed = re.findall(r"^test ([\w:]+) \.\.\. FAILED$", text, re.MULTILINE)

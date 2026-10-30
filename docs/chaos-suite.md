@@ -114,13 +114,22 @@ fails when a worst case is over the deadline. The `style` job runs it. The targe
 worst case is about five minutes per shard. Add a shard when the plan goes over it;
 do not raise the deadline.
 
-A killed test runs no Drop, so its containers and networks stay. After each docker
-or stack test, the shard removes the containers that the test left, then the
-networks of the test. Each such test gets a unique owner in `KARDAMOM_DOCKER_OWNER`.
-A fixture that creates a Docker network must put that value in the network name.
-The shard removes the networks whose name carries the owner, so it never removes
-the network of another run. `scripts/test-components.py` removes the networks in
-the same way, but not the containers.
+A killed test runs no Drop, so its containers and networks stay. Each docker or
+stack test gets a unique owner in `KARDAMOM_DOCKER_OWNER`. A fixture that creates a
+Docker network must put that value in the network name. After the test, also on
+Ctrl-C, the runner removes what the test left:
+
+| Runner | Removes |
+| --- | --- |
+| `component_tests.py run` (one CI shard on its own runner) | The networks of the owner and every container on them, then every other container that is new on the host since the test started. |
+| `component_tests.py run-all` (all shards on one host) | The networks of the owner and every container on them. |
+| `scripts/test-components.py` | The networks of the owner and every container on them. |
+
+Only a runner that owns its host removes new containers by a host-wide snapshot.
+A runner that shares its host, with other shards or other runs, removes only what
+its tests own. So, there, a killed test can leave a container that is not on an
+owner network. A Docker error in the clean-up prints a warning; it does not
+change the test result.
 
 Missing tests, skipped tests, timeouts and mismatched artifact hashes fail the run.
 Each shard prints a timing table and uploads its logs.
