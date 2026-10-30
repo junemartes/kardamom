@@ -47,21 +47,60 @@ Every chaos case follows the same steps.
 7. Run the recovery probe.
 8. Run the validator verdict.
 
-## In-process recovery on PRs
+## Component recovery on PRs
 
-The CI workspace build packages the test executables and native libraries for the catalog's `ci_mode: in-process` groups. Four jobs consume that shared artifact. Each exact test has a 60-second process deadline. A shard has a 240-second execution deadline, within a five-minute CI job. The test jobs install no Rust toolchain and compile nothing. Missing tests, skipped tests, timeouts and mismatched artifact hashes fail the run.
+The component recovery suite is the PR gate for recovery behaviour. It runs every
+suite of `scripts/ci/component-recovery.json`. Each suite has a `ci_mode`:
 
-Run the same partition locally from the repository root:
+- `in-process`: a Cargo test binary with no external service.
+- `docker`: a Cargo test binary that starts real containers (Redis, Consul, Aeron, Python controllers).
+- `gradle`: a JUnit method of the Java sealer, with real cluster members in the JVM.
+- `stack`: a Cargo test binary that starts the real service binaries, the sealer jar and
+  the Aeron media driver as local processes. The bundle puts the test binary in
+  `stack/deps/` and the service binaries in `stack/`, as in a Cargo target directory.
+  The shard sets `KARDAMOM_CLUSTER_JAR` and `KARDAMOM_AERON_ALL_JAR`.
+
+The CI jobs:
+
+1. `build` compiles every workspace test target and binary once, with the features of the
+   component suites. It packages the component test binaries, the service binaries and
+   their native libraries.
+   It also uploads a nextest archive of the workspace tests.
+2. `build sealer tests` compiles the sealer tests once. It packages the classes, the
+   dependency jars, the JUnit console launcher, the JVM arguments of the test task and
+   the sealer jar.
+3. `component recovery (0)` to `component recovery (3)` run the suite. The shard count
+   is fixed. A shard compiles nothing. It pulls the docker images once, or loads them
+   from the cache that a push saves, then runs its planned tests one at a time.
+
+Each test runs in its own process with a 60-second deadline. A shard has a six-minute
+execution deadline in a ten-minute job. After each docker test, the shard removes the
+containers that the test left. Missing tests, skipped tests, timeouts and mismatched
+artifact hashes fail the run. Each shard prints a timing table and uploads its logs.
+
+The plan puts the longest test first onto the least loaded shard. It uses the measured
+runtimes in `scripts/ci/component-timings.json`. A test with no measured runtime uses
+a default per mode. To update the runtimes from the results of a CI run:
+
+```sh
+gh run download RUN --pattern 'component-results-*' --dir "$work/results"
+python3 scripts/ci/component_tests.py timings "$work"/results/*/results.json
+python3 scripts/ci/component_tests.py plan
+```
+
+Run the same plan locally from the repository root:
 
 ```sh
 work=$(mktemp -d)
 python3 scripts/ci/component_tests.py prepare --bundle "$work/bundle"
-python3 scripts/ci/component_tests.py run-all --bundle "$work/bundle" --output "$work/results"
+python3 scripts/ci/component_tests.py prepare-sealer --sealer "$work/sealer"
+python3 scripts/ci/component_tests.py images
+python3 scripts/ci/component_tests.py run-all --bundle "$work/bundle" --sealer "$work/sealer" --output "$work/results"
 ```
 
-To reuse a workspace build, pass its Cargo JSON file with `prepare --artifacts PATH`. `run --shard 0` executes one partition. Each results directory holds exact test names, durations, logs and a JSON verdict. Compilation and artifact transfer are separate from the measured test duration.
-
-The initial inventory includes 103 Rust tests across 14 recovery groups. It does not establish full chaos-case equivalence: 39 active distributed cases have no listed local test and 41 have partial evidence. Java sealer tests and real dependency checks remain separate. Distributed chaos still runs on PRs. Moving it to main only requires closing or explicitly resolving those gaps. The ten-round qualification audit continues to require all distributed shards and all four in-process jobs on the same final SHA.
+`run --shard 0` runs one shard. To reuse a workspace build, pass its Cargo JSON file
+with `prepare --artifacts PATH`. The ten-round qualification audit requires all four
+component jobs on the same final SHA.
 
 ## Shards
 

@@ -21,7 +21,7 @@ use kardamom_da_watcher::interop::CursorReconcile;
 pub use super::consumers::{
     ExecutorRun, ValidatorOptions, spawn_executor, spawn_executor_at, spawn_validator,
 };
-pub use super::faults::IngressSlot;
+pub use super::ingress::{IngressOptions, IngressSlot, ParkTimeout, SpawnedIngress};
 use super::proc::{ExistingFile, Proc};
 use kardamom_obs::testkit::{free_port, free_udp_port};
 
@@ -482,6 +482,9 @@ impl SpawnPlan {
 /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.5.
 #[derive(Clone, Debug, Default)]
 pub struct SequencerOptions {
+    /// `--partition-index`, for a second replica of a lane. Defaults to the
+    /// process index.
+    pub partition: Option<u32>,
     /// `--partition-count`. Defaults to the stack's shard count.
     pub partition_count: Option<std::num::NonZeroU32>,
     /// `--lane`.
@@ -573,7 +576,10 @@ pub fn spawn_sequencer_with(
         .arg(&cfg_path)
         .arg("--aeron-dir")
         .arg(spec.aeron_dir)
-        .args(["--partition-index", &index.to_string()])
+        .args([
+            "--partition-index",
+            &opts.partition.unwrap_or(index).to_string(),
+        ])
         .args(["--partition-count", &partition_count.to_string()])
         .args(["--sequencer-id", &index.to_string()]);
     opts.add_lane_args(&mut cmd);
@@ -599,53 +605,6 @@ pub fn spawn_sequencer_with(
         state_dir: None,
     }
     .spawn()
-}
-
-/// A pending-receipt park duration that must be nonzero: a zero here
-/// would make several scenario timing assertions vacuously true instead
-/// of testing anything (for example the `out.elapsed >= park / 2` lower
-/// bound in `scenarios::nonce_gap`). Parsed once at construction; every
-/// consumer reads a real `Duration` back with [`Self::as_duration`].
-#[derive(Debug, Clone, Copy)]
-pub struct ParkTimeout(std::num::NonZeroU64);
-
-impl ParkTimeout {
-    /// A park timeout of `secs` seconds. `NonZeroU64::saturating_mul` is
-    /// a `const fn`: it cannot panic, and the result is already
-    /// `NonZeroU64`, so this constructor cannot fail either.
-    #[must_use]
-    pub const fn from_secs(secs: std::num::NonZeroU64) -> Self {
-        const MILLIS_PER_SEC: std::num::NonZeroU64 = std::num::NonZeroU64::new(1000).unwrap();
-        Self(secs.saturating_mul(MILLIS_PER_SEC))
-    }
-
-    #[must_use]
-    pub fn as_duration(self) -> Duration {
-        Duration::from_millis(self.0.get())
-    }
-}
-
-pub struct IngressOptions {
-    pub pending_receipt_timeout: ParkTimeout,
-    pub rpc_max_connections: std::num::NonZeroU32,
-}
-
-impl Default for IngressOptions {
-    fn default() -> Self {
-        const THIRTY_SECS: std::num::NonZeroU64 = std::num::NonZeroU64::new(30).unwrap();
-        const DEFAULT_RPC_MAX_CONNECTIONS: std::num::NonZeroU32 =
-            std::num::NonZeroU32::new(8192).unwrap();
-        Self {
-            pending_receipt_timeout: ParkTimeout::from_secs(THIRTY_SECS),
-            rpc_max_connections: DEFAULT_RPC_MAX_CONNECTIONS,
-        }
-    }
-}
-
-pub struct SpawnedIngress {
-    pub proc: Proc,
-    pub metrics_addr: SocketAddr,
-    pub rpc_url: String,
 }
 
 /// # Errors

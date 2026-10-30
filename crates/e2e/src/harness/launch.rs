@@ -455,6 +455,7 @@ impl LocalStack {
             executor,
             validator,
             sequencers,
+            sequencer_twins: Vec::new(),
             sealer,
             driver,
             _load_sampler: load_sampler,

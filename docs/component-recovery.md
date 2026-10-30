@@ -186,7 +186,7 @@ test rejects a new chaos case without a corresponding plan. Each family lists th
 real actors, boundary faults, recovery invariants and dependencies that still need
 real integration. `partial` means that named local tests validate some boundary
 assumptions. It does not mean the complete distributed case has passed locally.
-Forty-one cases have partial mappings. No full case is marked locally validated yet.
+`just component-summary` prints the current planned, partial and ported counts.
 
 `just component-catalog` checks the catalog. `just component-summary` prints the
 planned, partial and ported counts for each family. A case is ported when its
@@ -195,8 +195,9 @@ always go together. A ported case needs:
 
 - At least one local test.
 - A local test in a suite with a `ci_mode`, so that CI runs it. The modes are
-  `in-process`, `docker` (a real container dependency) and `gradle` (the Java
-  sealer).
+  `in-process`, `docker` (a real container dependency), `gradle` (the Java
+  sealer) and `stack` (the real service binaries, the sealer jar and the media
+  driver as local processes).
 - A negative control for one of its local tests. A control that names tests
   (`test`, `tests` or `failed_tests`) guards only those tests. A control that
   names no test guards every test of its suite.
@@ -441,8 +442,9 @@ its 120-second budget and reports each reader's latest counters or error. These
 checks validate the observer; distributed Redis recovery and exact final state
 still require the full chaos case.
 
-`just test-component pipeline-recovery` runs ten chaos cases on the local stack
-of the chain-semantics suite. The real ingress pair, the sequencers, the sealer
+`just test-component pipeline-recovery` and `just test-component pipeline-combined`
+run chaos cases on the local stack of the chain-semantics suite. These are stack
+suites, not isolated ones: each case needs more than one real service. The real ingress pair, the sequencers, the sealer
 members, the executor and the validator run as processes on one host, with the
 host-native archiving media driver. The cases that read L1 epochs also run Anvil,
 the L1 follower and the da-watcher. Each test injects the fault of its chaos case
@@ -466,16 +468,24 @@ ingress and no sequencer, empty blocks still seal and no transaction applies.
 With no sealer, every member process is dead, every live ingress refuses a submit
 with `sealer_no_quorum`, and no executor block of the outage may pass the block at
 which the returned members resume. A class that returns before the class that it
-needs must still run after an eight-second stagger. The cases that take the sealer
+needs must still run after an eight-second stagger. A cluster client starts with retries,
+so a process that cannot wait exits within that time. The cases that take the sealer
 down run three members: the returned members must close an election on a majority,
 and no term may have two leaders. No sequencer may hold a ref below a floor. The
 sealer's L1 origin must reach the last epoch that the da-watcher published. After
 a loss of the sequencers and the sealer, the da-watcher must publish again, and
 the epochs of the outage must reach the chain.
 
-The local stagger and hold are shorter than the deployed ones. They still cross
-the product thresholds of these cases: the 10-second sealer silence budget, and
-the start of a cluster client against a missing sealer. The tests need the service
+The local stagger and hold are shorter than the deployed ones. The 10-second
+sealer silence budget is crossed where an ingress stays up through the sealer
+loss: the test waits for its `sealer_no_quorum` refusal. A returned ingress has
+no silence clock before its first status frame, so the stagger needs no such
+bound. The hard ingress case runs once for each replica: a returned twin must
+serve receipts of transfers that it never saw. The lane loss runs two replicas
+of the case lane and kills both: they return cold, learn the same floors, and
+offer the same references, and the sealer keeps the first copy. The graceful
+sequencer case sends SIGTERM to the replica of the case lane and requires its
+exit within ten seconds. The tests need the service
 binaries, the sealer jar and the aeron-all jar, as the chain-semantics job does.
 Each test takes 14 to 53 seconds on a loaded host, including the stack start.
 

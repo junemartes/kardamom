@@ -14,50 +14,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use super::LocalStack;
+use super::ingress::{IngressSlot, SpawnedIngress};
 use super::proc::Proc;
-use super::services::{self, SequencerOptions, SpawnedIngress};
-
-/// The identity of one ingress replica: its id, the ports that clients
-/// and probes already hold, and its log file name.
-#[derive(Debug, Clone)]
-pub struct IngressSlot {
-    /// `--ingress-id`. Each replica of an active/active pair has its own.
-    pub id: u16,
-    /// The RPC port. `None` picks a free port.
-    pub rpc_port: Option<u16>,
-    /// The metrics port. `None` picks a free port.
-    pub metrics_port: Option<u16>,
-    /// The log file name, without the `.log` extension. A respawn uses
-    /// its own name, so the log of the process it replaces survives.
-    pub log_name: String,
-}
-
-impl IngressSlot {
-    /// The first replica of a fresh stack.
-    #[must_use]
-    pub fn first() -> Self {
-        Self {
-            id: 0,
-            rpc_port: None,
-            metrics_port: None,
-            log_name: "ingress".to_string(),
-        }
-    }
-}
-
-impl SpawnedIngress {
-    /// The RPC port, the text after the last colon of the RPC URL.
-    ///
-    /// # Errors
-    /// Returns an error when the URL names no port.
-    pub fn rpc_port(&self) -> Result<u16> {
-        self.rpc_url
-            .rsplit(':')
-            .next()
-            .and_then(|p| p.parse().ok())
-            .with_context(|| format!("no port in {}", self.rpc_url))
-    }
-}
+use super::services::{self, SequencerOptions};
 
 /// How a service stops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,7 +233,7 @@ impl LocalStack {
                 .fresh_log_name(&format!("sequencer-{i}"))
                 .trim_start_matches(&format!("sequencer-{i}"))
                 .to_string(),
-            ..SequencerOptions::default()
+            ..self.sequencer_options(i)?
         };
         let spawned = services::spawn_sequencer_with(&self.service_spec(), index, &opts)?;
         *self
@@ -282,6 +241,60 @@ impl LocalStack {
             .get_mut(i)
             .with_context(|| format!("no sequencer {i}"))? = spawned;
         Ok(())
+    }
+
+    /// The options of sequencer `i`: its lane, when it is a second
+    /// replica of the lane.
+    fn sequencer_options(&self, i: usize) -> Result<SequencerOptions> {
+        let shards = usize::try_from(self.cfg.shards.get())?;
+        let partition = i
+            .checked_sub(shards)
+            .map(|k| {
+                self.sequencer_twins
+                    .get(k)
+                    .copied()
+                    .with_context(|| format!("no sequencer {i}"))
+            })
+            .transpose()?;
+        Ok(SequencerOptions {
+            partition,
+            ..SequencerOptions::default()
+        })
+    }
+
+    /// Start a second replica of `lane`, as the deployment runs two
+    /// racing replicas of each lane. Both read the lane's `tx_data` and
+    /// offer the same references; the sealer keeps the first copy.
+    /// Returns the index of the new process once its cluster session is
+    /// up.
+    ///
+    /// # Errors
+    /// Returns an error when the replica fails to spawn or to connect.
+    pub fn add_sequencer_twin(&mut self, lane: u32) -> Result<usize> {
+        let i = self.sequencers.len();
+        self.sequencer_twins.push(lane);
+        let opts = self.sequencer_options(i)?;
+        let mut spawned = services::spawn_sequencer_with(
+            &self.service_spec(),
+            u32::try_from(i).context("sequencer index")?,
+            &opts,
+        )?;
+        spawned
+            .proc
+            .wait_for_log_line("tx_ordering via Aeron Cluster", Duration::from_mins(1))?;
+        self.sequencers.push(spawned);
+        Ok(i)
+    }
+
+    /// The lane of sequencer `i`.
+    ///
+    /// # Errors
+    /// Returns an error when the stack has no sequencer `i`.
+    pub fn sequencer_lane(&self, i: usize) -> Result<u32> {
+        Ok(self
+            .sequencer_options(i)?
+            .partition
+            .unwrap_or(u32::try_from(i)?))
     }
 
     /// Whether the process of sequencer `i` runs.

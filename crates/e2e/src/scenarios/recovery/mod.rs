@@ -26,10 +26,10 @@ use std::time::{Duration, Instant};
 use alloy_primitives::Address;
 use anyhow::{Context, Result};
 
-use crate::harness::LocalStack;
 use crate::harness::l2::{self, L2Client};
 use crate::harness::metrics;
-pub use cases::Case;
+use crate::harness::{LocalStack, StackConfig};
+pub use cases::{Case, Victim};
 use load::{LoadPlan, LoadReport, RunningLoad};
 
 /// The dev-mnemonic index of the case sender.
@@ -137,6 +137,7 @@ impl<'a> Run<'a> {
     /// # Errors
     /// Returns the first failed check.
     pub async fn run(mut self, case: Case) -> Result<()> {
+        case.prepare(&mut self)?;
         let plan = self
             .plan(CASE_SENDER, 0, Address::repeat_byte(0xc1))
             .await?;
@@ -267,4 +268,58 @@ impl<'a> Run<'a> {
             .assert_validator_verdict(self.name)
             .await
     }
+}
+
+/// The stack of a case whose checks read the L1 epochs: Anvil, the
+/// bridge, the L1 follower and the da-watcher.
+#[must_use]
+pub fn with_l1() -> StackConfig {
+    StackConfig {
+        l1: true,
+        ..StackConfig::default()
+    }
+}
+
+/// The stack of a case that takes the sealer down: three members, so the
+/// return closes a real election of a majority.
+#[must_use]
+pub fn with_quorum(cfg: StackConfig) -> StackConfig {
+    StackConfig {
+        sealer_members: NonZeroUsize::new(3).unwrap_or(NonZeroUsize::MIN),
+        ..cfg
+    }
+}
+
+/// Launch a stack with a validator, run `case` on it, and print the
+/// runtime. `launch_opt` also brings up the L1 stack; a missing Anvil
+/// fails the case instead of skipping it. A failure dumps the process
+/// logs.
+///
+/// # Panics
+/// Panics when the stack does not start or the case fails.
+pub async fn run_case(name: &'static str, case: Case, cfg: StackConfig) {
+    let started = Instant::now();
+    let mut stack = LocalStack::launch_opt(StackConfig {
+        validator: true,
+        ..cfg
+    })
+    .await
+    .expect("stack")
+    .expect("the L1 cases need Anvil");
+    eprintln!(
+        "{name}: stack up in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    let outcome = match Run::new(&mut stack, name) {
+        Ok(run) => run.run(case).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = outcome {
+        stack.dump_tails();
+        panic!("{name}: {e:#}");
+    }
+    eprintln!(
+        "PIPELINE_RECOVERY {name} seconds={:.1}",
+        started.elapsed().as_secs_f64()
+    );
 }

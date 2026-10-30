@@ -140,18 +140,41 @@ pub const ALL_THREE_REVERSE: Combined = Combined {
 pub enum Case {
     /// `graceful-ingress`: SIGTERM to ingress 0, then its start.
     GracefulIngress,
-    /// `hard-ingress`: SIGKILL to ingress 0, then its start.
-    HardIngress,
+    /// `hard-ingress`: SIGKILL to one ingress, then its start. The chaos
+    /// case rotates the victim between the two replicas.
+    HardIngress(Victim),
     /// `ingress-pair-loss-recover`: SIGKILL to both ingresses.
     IngressPairLoss,
-    /// `sequencer-lane-loss-recover`: SIGKILL to the sequencer of the
-    /// case sender's lane; no twin keeps the lane.
+    /// `graceful-sequencer`: SIGTERM to the sequencer of the case sender's
+    /// lane, then its cold start.
+    GracefulSequencer,
+    /// `sequencer-lane-loss-recover`: SIGKILL to both replicas of the case
+    /// sender's lane at once; no twin keeps the lane. Both return cold.
     SequencerLaneLoss,
     /// `pipeline-blackout-recover`: every pipeline process dies at once,
     /// with the media driver, and every one starts again.
     PipelineBlackout,
     /// A combined outage of the ingress, sequencer and sealer classes.
     Combined(Combined),
+}
+
+/// The ingress that a hard stop kills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Victim {
+    /// Ingress 0, which takes the submits of the case load.
+    CaseIngress,
+    /// Ingress 1, the twin. Its return must serve the receipts of
+    /// transfers that it never saw, from state.
+    Twin,
+}
+
+impl Victim {
+    fn index(self) -> usize {
+        match self {
+            Self::CaseIngress => 0,
+            Self::Twin => 1,
+        }
+    }
 }
 
 /// One reading of the pipeline while classes are down.
@@ -168,6 +191,26 @@ impl Run<'_> {
             block: metric_u64(scrape.value(EXEC_BLOCK_NUMBER).context("executor block")?)?,
             applied: metric_u64(scrape.value(EXEC_TX_APPLIED).unwrap_or(0.0))?,
         })
+    }
+
+    /// The lane of the case sender.
+    fn case_lane(&self) -> Result<u32> {
+        let sender = crate::harness::l2::dev_signers_through(super::CASE_SENDER)?
+            .get(super::CASE_SENDER)
+            .map(|s| s.address)
+            .context("case sender")?;
+        Ok(self.stack.sequencer_for(sender))
+    }
+
+    /// The sequencer processes of `lane`.
+    fn lane_replicas(&self, lane: u32) -> Result<Vec<usize>> {
+        (0..self.stack.sequencer_count())
+            .filter_map(|i| match self.stack.sequencer_lane(i) {
+                Ok(l) if l == lane => Some(Ok(i)),
+                Ok(_) => None,
+                Err(e) => Some(Err(e)),
+            })
+            .collect()
     }
 
     /// The case load lands nothing for one second: the outage is real.
@@ -229,26 +272,44 @@ impl Case {
     /// Returns the first failed step or check.
     pub async fn inject(self, run: &mut Run<'_>, load: &RunningLoad) -> Result<()> {
         match self {
-            Self::GracefulIngress => Self::ingress(run, load, Stop::Graceful).await,
-            Self::HardIngress => Self::ingress(run, load, Stop::Hard).await,
+            Self::GracefulIngress => {
+                Self::ingress(run, load, (Stop::Graceful, Victim::CaseIngress)).await
+            }
+            Self::HardIngress(victim) => Self::ingress(run, load, (Stop::Hard, victim)).await,
             Self::IngressPairLoss => Self::ingress_pair(run, load).await,
-            Self::SequencerLaneLoss => Self::sequencer_lane(run, load).await,
+            Self::GracefulSequencer => Self::sequencer_lane(run, load, Stop::Graceful).await,
+            Self::SequencerLaneLoss => Self::sequencer_lane(run, load, Stop::Hard).await,
             Self::PipelineBlackout => Self::blackout(run).await,
             Self::Combined(c) => c.run(run, load).await,
         }
     }
 
     /// Stop ingress 0, the ingress of the case load, then start it.
-    async fn ingress(run: &mut Run<'_>, load: &RunningLoad, stop: Stop) -> Result<()> {
+    /// Stop one ingress, then start it. A stop of the case ingress stops
+    /// the case load; a stop of the twin leaves it running.
+    async fn ingress(
+        run: &mut Run<'_>,
+        load: &RunningLoad,
+        (stop, victim): (Stop, Victim),
+    ) -> Result<()> {
+        let i = victim.index();
         let stopped = Instant::now();
-        run.stack.stop_ingress(0, stop)?;
+        run.stack.stop_ingress(i, stop)?;
         eprintln!(
-            "{}: ingress 0 stopped ({stop:?}) in {:.1}s",
+            "{}: ingress {i} stopped ({stop:?}) in {:.1}s",
             run.at(),
             stopped.elapsed().as_secs_f64()
         );
-        run.assert_load_stopped(load).await?;
-        run.stack.start_ingress(0)?;
+        match victim {
+            Victim::CaseIngress => run.assert_load_stopped(load).await?,
+            Victim::Twin => {
+                let refused = run.client(i)?.chain_id().await.result.is_err();
+                anyhow::ensure!(refused, "{}: ingress {i} still answers", run.name);
+                let landed = load.landed();
+                load.await_landed_above(landed, RESTART_BOUND).await?;
+            }
+        }
+        run.stack.start_ingress(i)?;
         run.assert_ingress_pair_live(RESTART_BOUND).await
     }
 
@@ -271,19 +332,42 @@ impl Case {
     /// Kill the sequencer of the case sender's lane. Its senders wait
     /// until a cold replica returns and learns their floors from the
     /// executor.
-    async fn sequencer_lane(run: &mut Run<'_>, load: &RunningLoad) -> Result<()> {
-        let sender = crate::harness::l2::dev_signers_through(super::CASE_SENDER)?
-            .get(super::CASE_SENDER)
-            .map(|s| s.address)
-            .context("case sender")?;
-        let lane = usize::try_from(run.stack.sequencer_for(sender))?;
-        run.stack.stop_sequencer(lane, Stop::Hard)?;
-        eprintln!("{}: sequencer {lane} killed", run.at());
+    /// Stop every replica of the case sender's lane, then start them all
+    /// cold. Their senders wait until a replica learns their floors from
+    /// the executor. With two replicas, both learn the same floors and
+    /// offer the same references, and the sealer keeps the first copy.
+    async fn sequencer_lane(run: &mut Run<'_>, load: &RunningLoad, stop: Stop) -> Result<()> {
+        let lane = run.case_lane()?;
+        let replicas = run.lane_replicas(lane)?;
+        replicas
+            .iter()
+            .try_for_each(|&i| run.stack.stop_sequencer(i, stop))?;
+        eprintln!(
+            "{}: lane {lane} replicas {replicas:?} stopped ({stop:?})",
+            run.at()
+        );
         run.assert_load_stopped(load).await?;
-        run.stack.start_sequencer(lane)?;
-        run.stack.await_sequencer_session(lane, RESTART_BOUND)?;
+        replicas
+            .iter()
+            .try_for_each(|&i| run.stack.start_sequencer(i))?;
+        replicas
+            .iter()
+            .try_for_each(|&i| run.stack.await_sequencer_session(i, RESTART_BOUND))?;
         run.assert_executor_progress().await?;
         run.assert_no_ref_below_floor().await
+    }
+
+    /// Set the stack up before the case load: the lane loss runs two
+    /// replicas of the case sender's lane, as the deployment does.
+    ///
+    /// # Errors
+    /// Returns an error when the twin replica does not start.
+    pub fn prepare(self, run: &mut Run<'_>) -> Result<()> {
+        if self == Self::SequencerLaneLoss {
+            let lane = run.case_lane()?;
+            run.stack.add_sequencer_twin(lane)?;
+        }
+        Ok(())
     }
 
     /// Kill every pipeline process and the media driver at once, then

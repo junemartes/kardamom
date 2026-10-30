@@ -21,6 +21,7 @@ mod config;
 mod consumers;
 mod control;
 pub mod faults;
+pub mod ingress;
 pub mod inject;
 pub mod l1;
 pub mod l1_verified;
@@ -70,6 +71,9 @@ pub struct LocalStack {
     executor: Spawned,
     validator: Option<Spawned>,
     sequencers: Vec<Spawned>,
+    /// The lane of each sequencer past the first one per lane: the
+    /// partition of sequencer `shards + k` is `sequencer_twins[k]`.
+    sequencer_twins: Vec<u32>,
     sealer: SealerCluster,
     driver: MediaDriver,
     /// Samples `/proc/loadavg` into `<root>/host-load.log` while the stack
