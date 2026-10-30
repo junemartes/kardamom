@@ -423,15 +423,16 @@ class Deployment:
                 'StatusDescription': f'scripted {status}', 'TaskGroups': groups}
 
 
-class PostingDependency(Deployment):
-    """A paused sequencer becomes ready only after the posting path exists."""
+class Dependency(Deployment):
+    """A deployment that becomes ready only after the jobs `needs` are registered."""
 
-    def __init__(self, jobs):
-        super().__init__('sequencer', ['running'])
+    def __init__(self, name, jobs, needs):
+        super().__init__(name, ['running'])
         self.jobs = jobs
+        self.needs = needs
 
     def state(self, poll=True):
-        ready = {'da-store', 'l1-indexer', 'batcher'} <= self.jobs.keys()
+        ready = self.needs <= self.jobs.keys()
         self.outcomes = ['successful' if ready else 'running']
         return super().state(poll)
 
@@ -640,7 +641,9 @@ class DeployTest(Deploys):
     """The deploy: order, pins, secrets, waits, canary, sealer roll."""
 
     def test_a_da_paused_sequencer_gets_its_posting_dependencies_before_readiness(self):
-        self.api.state['deployments']['sequencer'] = PostingDependency(self.api.state['jobs'])
+        # A paused sequencer becomes ready only after the posting path exists.
+        self.api.state['deployments']['sequencer'] = Dependency(
+            'sequencer', self.api.state['jobs'], {'da-store', 'l1-indexer', 'batcher'})
         self.run_deploy({'workloads_da_lag_budget_blocks': '8'})
         writes = self.api.state['writes']
         for dependency in ('da-store', 'l1-indexer', 'batcher'):
@@ -703,6 +706,34 @@ class DeployTest(Deploys):
         self.assertEqual(self.api.state['writes'], expected + ['data-dirs'],
                          'unchanged redeploy must register no job but the data directories')
         self.assertEqual(len(self.api.state['variable_writes']), 3, 'unchanged redeploy must not write secrets')
+
+    def test_the_waves_of_a_new_cluster_start_a_wave_before_its_waits(self):
+        # The ingress becomes ready only after the last job of its wave
+        # registers. A deploy that waits for each job before the next one
+        # never gets there.
+        self.api.state['deployments']['ingress'] = Dependency('ingress', self.api.state['jobs'], {'l1-indexer'})
+        self.run_deploy(environ={'KARDAMOM_DEPLOY_WAVES': '1', 'CANARY_LOCAL': '1'})
+        expected = ['data-dirs', 'aeron', 'anvil', 'cluster', 'redis', 'ingress', 'executor',
+                    'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
+                    'da-store', 'l1-indexer', 'batcher', 'sequencer', 'canary']
+        self.assertEqual(self.api.state['writes'], expected, 'the waves keep the registration order')
+        self.assertEqual(self.api.state['deployments']['ingress'].state(poll=False)['Status'], 'successful')
+
+    def test_a_failed_job_of_a_wave_stops_the_deploy_at_the_end_of_the_wave(self):
+        self.api.state['deployments']['ingress'] = Deployment('ingress', ['failed'])
+        output = self.run_deploy(success=False, environ={'KARDAMOM_DEPLOY_WAVES': '1'})
+        self.assertIn('scripted failed', output)
+        self.assertIn('l1-indexer', self.api.state['writes'])
+        self.assertNotIn('batcher', self.api.state['writes'])
+
+    def test_a_deploy_over_a_record_waits_for_each_job_before_the_next(self):
+        self.deploy()
+        self.repin('b')
+        self.api.state['writes'] = []
+        self.api.state['deployments']['ingress'] = Deployment('ingress', ['failed'])
+        self.run_deploy(success=False, environ={'KARDAMOM_DEPLOY_WAVES': '1'})
+        self.assertIn('ingress', self.api.state['writes'])
+        self.assertNotIn('executor', self.api.state['writes'])
 
     def test_the_local_profile_runs_no_canary_by_default(self):
         self.run_deploy(check=True)

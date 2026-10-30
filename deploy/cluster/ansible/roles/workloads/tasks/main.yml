@@ -12,6 +12,15 @@
   ansible.builtin.import_tasks: record_start.yml
   when: not ansible_check_mode
 
+# A new cluster: Nomad knows no job and the environment has no record.
+- name: Decide the deploy waves
+  ansible.builtin.set_fact:
+    workloads_waves: >-
+      {{ workloads_deploy_waves | bool and not ansible_check_mode
+         and workloads_record_jobs.json | length == 0
+         and workloads_accepted | length == 0 and workloads_last_attempt | length == 0 }}
+    workloads_deferred: []
+
 # The data directories of the services, on every node, before any job
 # that mounts one. The list and the mode are node_data_dirs, the list
 # that the common role also makes. The job runs to completion on each
@@ -35,7 +44,8 @@
     workloads_job:
       name: aeron
       file: aeron.system.nomad.hcl
-      retries: 200
+      # 600 polls of 1 s are 10 minutes.
+      retries: 600
       vars:
         archive_file_sync_level: "{{ workloads_archive_file_sync_level }}"
         aeron_threading_mode: "{{ workloads_aeron_threading_mode }}"
@@ -48,8 +58,19 @@
   vars:
     workloads_job:
       name: anvil
+      defer: true
       vars: "{{ {'slots_in_an_epoch': '1'} if workloads_l1_fault_proxy | bool else {} }}"
   when: workloads_l1_rpc | length == 0
+
+# In the waves of a new cluster, the sealer starts together with anvil:
+# the sealer reads no L1 and no settlement address.
+- name: Deploy the sealer while the development L1 starts
+  ansible.builtin.include_tasks: sealer.yml
+  when: workloads_waves | bool
+
+- name: Wait for the development L1 after the sealer
+  ansible.builtin.include_tasks: wave.yml
+  when: workloads_waves | bool
 
 - name: Discover the in-cluster L1 through the Nomad API
   ansible.builtin.include_tasks: anvil.yml
@@ -72,6 +93,7 @@
 # Ingress subscribes to receipts before executors start publishing them.
 - name: Deploy the sealer
   ansible.builtin.include_tasks: sealer.yml
+  when: not workloads_waves | bool
 
 # The backup sealer (#746) follows the cluster from a node of role
 # "backup". The deploy registers it only when the inventory has such a
@@ -95,8 +117,9 @@
   loop:
     # The cache before its readers and its writer: the ingress reads it,
     # the state mirror writes it.
-    - {name: redis}
+    - {name: redis, defer: true}
     - name: ingress
+      defer: true
       vars:
         ack: "{{ workloads_ingress_ack | default('receipt', true) }}"
     - name: executor
@@ -108,7 +131,7 @@
     # The egress after the executors that it reads, before the readers
     # after it: the notifier here, the validator and the batcher below.
     # A healthy egress answers /health. It needs no executor up to start.
-    - {name: egress, deploy: "{{ workloads_egress }}"}
+    - {name: egress, deploy: "{{ workloads_egress }}", defer: true}
     - {name: state-mirror, wait: false}
     # The notifier taps the sequencers' and the ingress's status stream
     # and the executors' receipts; it needs none of them up to start.
@@ -182,12 +205,22 @@
     loop_var: workloads_job
     label: "{{ workloads_job.name }}"
 
+# In the waves of a new cluster, the followers start together with the
+# DA layer and the L1 follower, and the deploy waits for all of them
+# before the batcher.
 - name: Wait for pipeline followers
   ansible.builtin.include_tasks: wait.yml
-  loop: [executor, state-mirror, notifier, validator, da-watcher, node-exporter, monitoring]
+  loop: "{{ workloads_followers }}"
   loop_control:
     loop_var: workloads_wait_job
-  when: not ansible_check_mode
+  when:
+    - not ansible_check_mode
+    - not workloads_waves | bool
+
+- name: Defer the wait for the pipeline followers
+  ansible.builtin.set_fact:
+    workloads_deferred: "{{ workloads_deferred + workloads_followers }}"
+  when: workloads_waves | bool
 
 # The DA layer is the batcher's writer side and every reader's source,
 # behind one Consul service. Without an EigenDA network it is the
@@ -198,6 +231,7 @@
   vars:
     workloads_job:
       name: da-store
+      defer: true
   when: workloads_eigenda_network | length == 0
 
 - name: Deploy the DA proxy
@@ -213,11 +247,14 @@
         EIGENDA_PROXY_EIGENDA_V2_SIGNER_PRIVATE_KEY_HEX: "{{ workloads_batcher_key }}"
   when: workloads_eigenda_network | length > 0
 
+# In the waves of a new cluster, the DA job runs only after the wave
+# before the batcher, so the probe waits there.
 - name: Wait for the DA proxy's API
   ansible.builtin.include_tasks: da_proxy.yml
   when:
     - workloads_da_proxy_probe | bool
     - not ansible_check_mode
+    - not workloads_waves | bool
 
 # The indexer is the L1 follower: it reads L1 once per finality step,
 # publishes each finalized block on l1_blocks, and archives the posted
@@ -232,6 +269,7 @@
   vars:
     workloads_job:
       name: l1-indexer
+      defer: true
       vars:
         l1_light_client_rpc: "{{ workloads_followers_light_client }}"
         settlement_address: "{{ workloads_resolved_settlement }}"
@@ -249,6 +287,16 @@
              or workloads_light_execution_rpc | length > 0
              else workloads_anvil_service_rpc }}
         KARDAMOM_BEACON_API: "{{ workloads_indexer_beacon_api }}"
+
+- name: Wait for the wave before the batcher
+  ansible.builtin.include_tasks: wave.yml
+  when: workloads_waves | bool
+
+- name: Wait for the DA proxy's API after the wave
+  ansible.builtin.include_tasks: da_proxy.yml
+  when:
+    - workloads_da_proxy_probe | bool
+    - workloads_waves | bool
 
 - name: Deploy the live batcher
   ansible.builtin.include_tasks: job.yml

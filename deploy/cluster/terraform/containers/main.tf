@@ -52,6 +52,17 @@ locals {
   generation = { for name in local.names : name => lookup(var.node_generation, name, 0) }
   address    = { for name in local.names : name => cidrhost(var.subnet, var.address_offset + index(local.names, name) + local.generation[name] * length(local.names)) }
 
+  # A node of generation 0 starts from its provisioned image when
+  # node_images names one. A replaced node is a new machine, so it starts
+  # from the plain node image.
+  container_image = {
+    for name in local.names : name => (
+      local.generation[name] == 0 && contains(keys(var.node_images), name)
+      ? data.docker_image.provisioned[name].id
+      : local.node_image.id
+    )
+  }
+
   volumes = toset(["docker", "containerd"])
   ready   = "s=$(systemctl is-system-running); [ \"$s\" = running ] || [ \"$s\" = degraded ]"
 }
@@ -94,6 +105,12 @@ data "docker_image" "prepared" {
   name  = var.prebuilt_node_image
 }
 
+# The provisioned node images of a saved cluster (`just container-save`).
+data "docker_image" "provisioned" {
+  for_each = var.node_images
+  name     = each.value
+}
+
 resource "docker_image" "node" {
   count        = var.prebuilt_node_image == "" ? 1 : 0
   name         = var.image_name
@@ -128,7 +145,7 @@ resource "docker_container" "node" {
 
   name     = each.value.container
   hostname = each.value.name
-  image    = local.node_image.id
+  image    = local.container_image[each.key]
 
   # systemd and the inner dockerd need a privileged container on the host
   # cgroup namespace with a writable cgroup tree and tmpfs run directories.

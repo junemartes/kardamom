@@ -21,6 +21,7 @@ and `instance_roles`. The root turns them into the role set of each node.
 | `address_offset` | `10` | The host number of the first node address. It must be 2 or more. |
 | `ready_timeout` | `180` | The seconds to wait for systemd in a node. |
 | `prebuilt_node_image` | `""` | An image already loaded on the Docker host. Empty keeps the local image build. |
+| `node_images` | `{}` | The saved image of a node, by name (`just container-save`). A node of generation 0 starts from it. A replaced node starts from the plain node image. |
 
 ## Resources
 
