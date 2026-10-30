@@ -227,6 +227,15 @@ and each reader must count a Redis hit and no degraded read. The fixture takes i
 host ports from 20000-29999 under a lock file, so two runs on one host cannot share
 a port, also while the containers are down.
 
+`just test-component sequencer-resize` scales the real sequencer core from two
+lanes to three and back, with the production shard map. A gaining lane warms its
+incoming slots in shadow mode, reading the old lanes, and must offer nothing until
+the warm-up passes. One replica of the new lane dies during the overlap and returns.
+The ingress then routes by the new map, the old lanes drain, and every lane restarts
+with its final slots. The sealer orders first seen first, and each ordered
+transaction returns to every replica as a receipt floor. Every sender must reach the
+canonical log with every nonce once, in order.
+
 `just test-component transport-mds-remove` removes MDS receive destinations while two
 streams run, and returns a node to the same control endpoint three times. Every frame
 of the live streams must arrive in order, and the driver must log no error. On the

@@ -52,6 +52,52 @@
       },
       "ci_mode": "in-process"
     },
+    "sequencer-resize": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-sequencer",
+        "--test",
+        "resize_handoff"
+      ],
+      "real": [
+        "the v1 Sequencer core of each lane replica, with its vslot set, old-lane reads and shadow warm-up",
+        "ShardMap identity and rebalance, and lane_for routing",
+        "the resync controller and its receipt floors",
+        "the signed envelopes of the testkit"
+      ],
+      "controlled": [
+        "the ingress: one map version at a time, routing each sender by ShardMap::lane_for",
+        "the sealer: first-seen dedup of every replica offer",
+        "the executors: every ordered transaction as a receipt floor to every replica, and the committed floors for a started replica",
+        "a 300-ms transaction lifetime and a 500-ms warm-up"
+      ],
+      "tests": [
+        "a_scale_out_and_in_with_a_killed_new_replica_orders_every_nonce_once"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "a replica in shadow mode offers its incoming slots",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "a_scale_out_and_in_with_a_killed_new_replica_orders_every_nonce_once"
+          ]
+        },
+        {
+          "mutation": "a receipt floor does not raise the floor of its sender",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "a_scale_out_and_in_with_a_killed_new_replica_orders_every_nonce_once"
+          ]
+        }
+      ],
+      "limitation": "Replicas are in-process; no Aeron, no Java sealer contiguity guard, no v2 admission loop. The ingress map roll and the Nomad scale steps stay in the chaos shard.",
+      "ci_mode": "in-process"
+    },
     "executor-commit": {
       "command": [
         "cargo",
@@ -3305,9 +3351,18 @@
     {
       "case": "resize-scale-out-in",
       "family": "Integrity",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer-resize",
+          "test": "a_scale_out_and_in_with_a_killed_new_replica_orders_every_nonce_once"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the Nomad scale-out and scale-in jobs, and the count of six sequencer allocations during the overlap",
+        "the ingress roll onto each map version: a job update that the ingress map-version gauge shows"
+      ]
     },
     {
       "case": "carry-versions-on",
