@@ -136,9 +136,25 @@ impl Container {
         assert!(self.available() > 0, "clearing the filler frees no space");
     }
 
-    /// Copy the volume out to `to` through `docker exec` and tar.
+    /// Copy the volume out to `to` through `docker exec` and tar. The log
+    /// grows while tar reads it, so a read that sees a changing file is
+    /// taken again, a few times.
     fn copy_out(&self, to: &Path) {
         std::fs::create_dir_all(to).unwrap();
+        let archive = (0..5)
+            .find_map(|_| self.archive())
+            .expect("a whole archive of the volume within five reads");
+        let mut untar = Command::new("tar")
+            .args(["-C", to.to_str().unwrap(), "-xf", "-"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(untar.stdin.as_mut().unwrap(), &archive).unwrap();
+        assert!(untar.wait().unwrap().success(), "untar of the volume");
+    }
+
+    /// One tar read of the volume, or `None` when it failed.
+    fn archive(&self) -> Option<Vec<u8>> {
         let tar = Command::new("docker")
             .args([
                 "exec",
@@ -154,14 +170,13 @@ impl Container {
             ])
             .output()
             .unwrap();
-        assert!(tar.status.success(), "tar of the volume");
-        let mut untar = Command::new("tar")
-            .args(["-C", to.to_str().unwrap(), "-xf", "-"])
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap();
-        std::io::Write::write_all(untar.stdin.as_mut().unwrap(), &tar.stdout).unwrap();
-        assert!(untar.wait().unwrap().success(), "untar of the volume");
+        if !tar.status.success() {
+            eprintln!(
+                "tar of the volume failed: {}",
+                String::from_utf8_lossy(&tar.stderr)
+            );
+        }
+        tar.status.success().then_some(tar.stdout)
     }
 
     /// The newest complete base on the volume.

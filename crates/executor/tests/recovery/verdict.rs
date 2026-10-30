@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use kardamom_state::integrity::{deep_compare_to, sweep};
 use kardamom_state::{StateEnvBuilder, read_recovery_point};
+use kardamom_types::StateDatabase;
 
 use super::chain::TXS_PER_BLOCK;
 use super::fleet::{NodeHandle, World};
@@ -118,6 +119,27 @@ impl NodeHandle {
         assert_eq!(report.last_committed_block, head, "{}", self.name());
         let diff = deep_compare_to(&theirs, &mine, head).unwrap();
         assert!(diff.is_empty(), "{}: state differs: {diff:?}", self.name());
+        assert_eq!(
+            report.receipts,
+            head * TXS_PER_BLOCK,
+            "{}: one receipt per transaction",
+            self.name()
+        );
+        let snapshot = kardamom_state::StateSnapshot::open(&mine).unwrap();
+        let failed: Vec<u64> = (0..head * TXS_PER_BLOCK)
+            .filter(|index| {
+                snapshot
+                    .get_receipt(kardamom_types::BPosition::from_index(*index))
+                    .unwrap()
+                    .is_none_or(|r| !r.status)
+            })
+            .collect();
+        assert_eq!(
+            failed,
+            [] as [u64; 0],
+            "{}: transactions without a successful receipt",
+            self.name()
+        );
         Stream::read(self).assert_exact(&self.name(), head);
     }
 

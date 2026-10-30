@@ -352,3 +352,92 @@ fn executors_that_return_before_the_sealers_wait_and_then_catch_up() {
     fleet.assert_converged(&world, head, CATCH_UP);
     fleet.0.iter().for_each(NodeHandle::assert_no_republished);
 }
+
+/// One restarted ingress: the real proxy, with an empty memory cache, no
+/// egress, and the executors' committed-state endpoints as its receipt
+/// fallback.
+struct Ingress {
+    proxy: kardamom_ingress::IngressProxy<
+        kardamom_ingress::MockChannels,
+        kardamom_ingress::MockChannels,
+    >,
+    _shards: Vec<tokio::sync::mpsc::UnboundedReceiver<kardamom_types::TxEnvelope>>,
+}
+
+impl Ingress {
+    fn start(executors: &[NodeHandle]) -> Self {
+        let cfg = kardamom_ingress::config::IngressConfig {
+            executor_query: kardamom_cache::ExecutorQueryConfig {
+                endpoints: executors
+                    .iter()
+                    .map(|n| format!("http://{}", n.cfg.rpc))
+                    .collect(),
+                ..kardamom_cache::ExecutorQueryConfig::default()
+            },
+            ..kardamom_ingress::config::IngressConfig::default()
+        };
+        let (mock, shards) =
+            kardamom_ingress::MockChannels::new(std::num::NonZeroUsize::new(8).unwrap());
+        Self {
+            proxy: kardamom_ingress::IngressProxy::new(cfg, mock.clone(), mock),
+            _shards: shards,
+        }
+    }
+
+    async fn receipt(&self, hash: alloy_primitives::B256) -> Option<kardamom_types::Receipt> {
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        self.proxy.receipt_by_hash(ip, hash).await
+    }
+}
+
+/// ingress-executor-loss-recover: both ingresses and every executor die.
+/// The sealer keeps sealing and no transaction is applied. The executors
+/// return first and replay while no ingress listens; the ingresses
+/// return later with empty memory caches. Each must serve the receipt of
+/// a transfer committed before the fault, and only an executor's state
+/// can hold it. The fleet then converges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn returned_ingresses_serve_a_pre_fault_receipt_from_executor_state() {
+    let world = World::new();
+    world.seal_through(5);
+    let load = world.load(5, LAST, BLOCK_EVERY);
+    let mut fleet = world.fleet();
+    fleet.start();
+    fleet.wait_head(10, CATCH_UP);
+    let receipted = world.chain.envelope(4).tx_hash;
+    let before: Vec<Ingress> = (0..2).map(|_| Ingress::start(&fleet.0)).collect();
+    for ingress in &before {
+        assert!(
+            ingress.receipt(receipted).await.is_some(),
+            "receipted before the fault"
+        );
+    }
+    drop(before);
+    fleet.kill();
+    let heads: Vec<u64> = fleet.0.iter().map(NodeHandle::head).collect();
+    let sealed = load.sealed();
+    tokio::time::sleep(BLOCK_EVERY * 10).await;
+    assert!(
+        load.sealed() > sealed,
+        "the sealer keeps sealing while the executors are down"
+    );
+    assert_eq!(
+        fleet.0.iter().map(NodeHandle::head).collect::<Vec<_>>(),
+        heads,
+        "no block applied"
+    );
+    fleet.start();
+    fleet.wait_head(load.sealed() + 3, CATCH_UP);
+    let returned: Vec<Ingress> = (0..2).map(|_| Ingress::start(&fleet.0)).collect();
+    for ingress in &returned {
+        let receipt = ingress
+            .receipt(receipted)
+            .await
+            .expect("the receipt from an executor's state");
+        assert_eq!((receipt.tx_hash, receipt.status), (receipted, true));
+    }
+    fleet.wait_head(load.sealed() + 3, CATCH_UP);
+    let head = load.halt();
+    fleet.assert_converged(&world, head, CATCH_UP);
+    fleet.0.iter().for_each(NodeHandle::assert_no_republished);
+}

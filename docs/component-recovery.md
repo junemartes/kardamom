@@ -138,7 +138,7 @@ whole-chain fallback or Nomad placement. Both negative controls fail at recovery
 not replacing the cached connection, and loading a script only once before failover.
 The existing Docker CI job runs this target.
 
-`just test-component executor-recovery` runs thirteen executor recovery cases.
+`just test-component executor-recovery` runs fifteen executor recovery checks.
 Each executor is a child process of the test binary. It runs the production state
 startup in `kardamom_executor::state`, the engine, the MDBX writer, the checkpoint
 rounds, the checkpoint server and the replay repair. The binary uses the same state
@@ -159,7 +159,7 @@ restore, fetch, quarantine and resume log lines in their order, `/ready` before 
 rolling step, and the committed nonce and receipt answers of a restarted replica.
 
 Storage is on tmpfs when it has room. A process kill keeps the page cache, so the
-fault is a process crash, not a power loss. The thirteen checks take about 5 seconds
+fault is a process crash, not a power loss. The fifteen checks take about 5 seconds
 of test execution in parallel on a quiet host; compilation adds time. Nomad
 placement, node containers, Consul records, image rollout and the deploy gate stay
 in the chaos shard; each ported case names them under `cluster_only_checks`.
@@ -169,6 +169,29 @@ driver and archive in one disposable container. A stopped and a killed replica e
 record a new session, and its recorded cursor moves. While one replica is dead, the
 cursors of its peers move. `just test-component sealer-record-lag` runs the existing
 sealer checks that take the best cursor over the executors.
+
+`just test-component executor-checkpoint-enospc` runs one executor process in a
+disposable container, with its checkpoints and block log on a 16-MiB tmpfs. The
+parent fills the tmpfs until the kernel refuses a write. The block log and the base
+round must fail with error 28 while the same process applies transactions. After the
+filler goes, a new base above the fault must restore with its log past the base.
+
+`just test-component executor-total-wipe-l1` posts the blocks with the production
+batch post to a real Anvil and the DA store. Every state and checkpoint goes, and the
+image comes from the `BatchPosted` scan and the DA reads alone. Each executor must
+resume from the image cursor with no restore or fetch.
+
+`just test-component state-mirror-total-loss` and `cache-sentinel-total-loss` kill a
+primary, a replica and three Sentinels at once. Fixed host ports stand in for stable
+service addresses. While the group is down, the production reader degrades without a
+stall and the mirror marks a rebuild. The group returns empty, the Sentinels name a
+primary, and the mirror rebuilds every account once a checkpoint reaches its first
+live batch.
+
+`just test-component transport-mds-remove` removes MDS receive destinations while two
+streams run, and returns a node to the same control endpoint three times. Every frame
+of the live streams must arrive in order, and the driver must log no error. On the
+deployed Aeron 1.45 driver, this does not reproduce the driver crash of issue 545.
 
 `just test-component state-writer-crash` runs two real durable MDBX process-crash
 checks in about 0.3 seconds of test execution. A child runs the production writer.

@@ -76,6 +76,10 @@ kardamom-deployer = { path = "../deployer", features = ["test-support"] }
 alloy-node-bindings.workspace = true
 alloy-provider.workspace = true
 alloy-network.workspace = true
+# The combined ingress case runs the real ingress proxy against the
+# restarted executors.
+kardamom-ingress = { path = "../ingress", features = ["test-support"] }
+kardamom-cache = { workspace = true }
 
 [[bench]]
 name = "sequential_throughput"

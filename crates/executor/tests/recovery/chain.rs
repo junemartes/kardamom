@@ -95,12 +95,20 @@ impl Chain {
     pub(crate) fn envelope(&self, index: u64) -> TxEnvelope {
         let sender = usize::try_from(index % u64::from(SENDERS)).unwrap();
         LegacyTx {
-            to: Address::with_last_byte(u8::try_from(index % 200).unwrap() + 1),
+            to: Self::recipient(index),
             nonce: index / u64::from(SENDERS),
             value: index + 1,
             ..Default::default()
         }
         .sign(&self.signers[sender])
+    }
+
+    /// The recipient of record `index`: an ordinary account, never a
+    /// precompile, so that every transfer succeeds.
+    fn recipient(index: u64) -> Address {
+        let mut bytes = [0xEE; 20];
+        bytes[19] = u8::try_from(index % 200).unwrap();
+        Address::from(bytes)
     }
 
     fn record(&self, index: u64) -> Entry {
