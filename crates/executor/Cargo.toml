@@ -40,6 +40,10 @@ crc32fast = "1.5"
 # posix_fallocate for the receipt ledger.
 libc.workspace = true
 
+[features]
+# The executor-stream recovery tests need a real media driver and archive.
+docker-e2e = ["kardamom-log/docker-e2e"]
+
 [[bin]]
 name = "kardamom-executor"
 path = "src/bin/kardamom-executor/main.rs"
@@ -64,6 +68,9 @@ tempfile.workspace = true
 # The format registry: a test checks the layout of the state-dir files
 # against it.
 kardamom-formats.workspace = true
+# The executor recovery tests rebuild an executor image from DA batches.
+kardamom-batcher = { path = "../batcher" }
+kardamom-reconstruct = { path = "../reconstruct" }
 
 [[bench]]
 name = "sequential_throughput"

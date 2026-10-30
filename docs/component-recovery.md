@@ -138,6 +138,38 @@ whole-chain fallback or Nomad placement. Both negative controls fail at recovery
 not replacing the cached connection, and loading a script only once before failover.
 The existing Docker CI job runs this target.
 
+`just test-component executor-recovery` runs thirteen executor recovery cases.
+Each executor is a child process of the test binary. It runs the production state
+startup in `kardamom_executor::state`, the engine, the MDBX writer, the checkpoint
+rounds, the checkpoint server and the replay repair. The binary uses the same state
+module. The parent plays the sealer: it appends production egress frames to a
+retained log. Each process reads the log through one replay session, from its
+durable cursor and with an overlap below it. The parent can set a retention floor,
+so that an old cursor gets `REPLAY_UNAVAILABLE`, and can take every member away.
+
+The cases stop processes with SIGTERM, kill them with SIGKILL, wipe their state or
+checkpoints, corrupt one image byte, replace a node with empty storage on a new
+address, and start a build that fails its start checks. They also rebuild an
+executor image from DA batches through the production batch codec and reconstruction.
+Every case ends with each replica stopped at the same head. Its DB must pass the
+integrity sweep and equal an undisturbed replica table by table. Each process must
+publish its boundaries in order, and no transaction may get two receipt hashes. A
+replica that kept its disk publishes no boundary twice. The checks also require the
+restore, fetch, quarantine and resume log lines in their order, `/ready` before each
+rolling step, and the committed nonce and receipt answers of a restarted replica.
+
+Storage is on tmpfs when it has room. A process kill keeps the page cache, so the
+fault is a process crash, not a power loss. The thirteen checks take about 5 seconds
+of test execution in parallel on a quiet host; compilation adds time. Nomad
+placement, node containers, Consul records, image rollout and the deploy gate stay
+in the chaos shard; each ported case names them under `cluster_only_checks`.
+
+`just test-component executor-exec-stream` adds the executor stream on a real media
+driver and archive in one disposable container. A stopped and a killed replica each
+record a new session, and its recorded cursor moves. While one replica is dead, the
+cursors of its peers move. `just test-component sealer-record-lag` runs the existing
+sealer checks that take the best cursor over the executors.
+
 `just test-component state-writer-crash` runs two real durable MDBX process-crash
 checks in about 0.3 seconds of test execution. A child runs the production writer.
 An owned metrics recorder blocks its existing synchronous callback after account

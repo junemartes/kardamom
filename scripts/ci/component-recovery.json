@@ -114,6 +114,194 @@
       "limitation": "These existing actor tests do not prove disk durability or process/node recovery. Their blocking joins are bounded by the runner process timeout.",
       "ci_mode": "in-process"
     },
+    "executor-recovery": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-executor",
+        "--test",
+        "recovery"
+      ],
+      "real": [
+        "kardamom_executor::state: checkpoint restore ladder, env open, resume cursor and checkpoint rounds, shared with the binary",
+        "Executor reader, exec and commit threads with REVM",
+        "StateWriter, block log and durable MDBX in each process",
+        "ClusterTxOrderingSubscription and the production egress codec, replay cursor and replay-unavailable repair",
+        "checkpoint server and peer fetch over real HTTP, nonce and receipt query server over real HTTP",
+        "Prometheus exporter with /metrics and the /ready rule of the binary",
+        "batcher pack_blocks, recon::reconstruct, reconstruct_state and strip_to_executor_image",
+        "three or four executor processes, each a child process with SIGTERM and SIGKILL"
+      ],
+      "controlled": [
+        "the sealer: a retained log of production egress frames, read through one replay session per process, with a retention floor and an absent-member switch",
+        "the receipt stream: one line per receipt and boundary in a file",
+        "a 3-transaction-per-block load sealed every 40 ms",
+        "storage on tmpfs when it has room; a process kill keeps the page cache, so the fault is the same",
+        "a bad build: a start whose genesis file is absent"
+      ],
+      "tests": [
+        "a_graceful_stop_resumes_from_the_durable_cursor_without_loss_or_duplicate",
+        "replica::a_killed_replica_resumes_from_its_disk_while_its_peers_progress",
+        "replica::a_blank_replacement_fetches_a_peer_checkpoint_and_catches_up",
+        "replica::a_wiped_replica_restores_a_copied_donor_checkpoint",
+        "replica::a_wiped_replica_behind_the_window_fetches_a_peer_base_and_log",
+        "replica::a_cursor_below_the_retention_floor_stages_a_peer_checkpoint_in_process",
+        "replica::a_failed_start_keeps_the_state_and_a_rolling_heal_converges",
+        "replica::ten_stop_and_start_rounds_advance_every_replica_each_round",
+        "whole::a_whole_fleet_kill_resumes_each_replica_from_its_own_disk",
+        "whole::a_whole_fleet_wipe_restores_each_replica_from_its_local_checkpoint",
+        "whole::a_total_wipe_resumes_every_replica_from_a_rebuilt_da_image",
+        "whole::a_corrupt_local_checkpoint_is_quarantined_before_a_peer_restore",
+        "whole::executors_that_return_before_the_sealers_wait_and_then_catch_up"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "the restart ignores the persisted cursor and replays from genesis",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "a_graceful_stop_resumes_from_the_durable_cursor_without_loss_or_duplicate",
+            "replica::ten_stop_and_start_rounds_advance_every_replica_each_round",
+            "whole::a_whole_fleet_kill_resumes_each_replica_from_its_own_disk",
+            "replica::a_failed_start_keeps_the_state_and_a_rolling_heal_converges",
+            "replica::a_killed_replica_resumes_from_its_disk_while_its_peers_progress",
+            "whole::executors_that_return_before_the_sealers_wait_and_then_catch_up"
+          ]
+        },
+        {
+          "mutation": "a corrupt local checkpoint is not quarantined",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "whole::a_corrupt_local_checkpoint_is_quarantined_before_a_peer_restore"
+          ]
+        },
+        {
+          "mutation": "a fresh state directory is not restored from a checkpoint",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "replica::a_wiped_replica_restores_a_copied_donor_checkpoint",
+            "replica::a_blank_replacement_fetches_a_peer_checkpoint_and_catches_up",
+            "whole::a_whole_fleet_wipe_restores_each_replica_from_its_local_checkpoint",
+            "replica::a_wiped_replica_behind_the_window_fetches_a_peer_base_and_log"
+          ]
+        },
+        {
+          "mutation": "the replay-unavailable repair stages no peer checkpoint",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "replica::a_cursor_below_the_retention_floor_stages_a_peer_checkpoint_in_process"
+          ]
+        },
+        {
+          "mutation": "the rebuilt image keeps its trie",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "whole::a_total_wipe_resumes_every_replica_from_a_rebuilt_da_image"
+          ]
+        }
+      ],
+      "limitation": "Each node is a real process with real storage, but the canonical stream comes from a controlled sealer log, not Aeron Cluster members, and the receipts go to a file, not Aeron. No Nomad, Consul, Docker node, image rollout or network identity. The DA image comes from the production batch codec and reconstruction, but not from an L1 scan or the DA HTTP store. A process kill keeps the page cache: no power loss.",
+      "ci_mode": "in-process"
+    },
+    "executor-exec-stream": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-executor",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "recovery",
+        "--",
+        "--ignored",
+        "--exact",
+        "stream::restarted_replicas_record_new_sessions_and_live_cursors_keep_moving"
+      ],
+      "real": [
+        "the executor-recovery processes",
+        "ExecStream: the recorded IPC publication, the local archive recording and the publisher thread",
+        "Aeron media driver and archive in one disposable container",
+        "exec stream session and recorded-index gauges on /metrics"
+      ],
+      "controlled": [
+        "three executors share one media driver",
+        "one graceful stop and one SIGKILL"
+      ],
+      "tests": [
+        "stream::restarted_replicas_record_new_sessions_and_live_cursors_keep_moving"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "the recorded cursor ignores the archive recording position",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "stream::restarted_replicas_record_new_sessions_and_live_cursors_keep_moving"
+          ]
+        }
+      ],
+      "limitation": "One driver for all executors, not one per node. The recorded cursor goes to /metrics, not to a sealer session; the sealer side is in sealer-record-lag.",
+      "ci_mode": "docker"
+    },
+    "sealer-record-lag": {
+      "command": [
+        "cluster/sealer-service/gradlew",
+        "-p",
+        "cluster/sealer-service",
+        ":core:test",
+        "--tests",
+        "io.kardamom.sealer.RecordLagGuardTest",
+        ":service:test",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerRecordLagTest",
+        "--no-daemon",
+        "--rerun-tasks"
+      ],
+      "junit_reports": [
+        "cluster/sealer-service/core/build/test-results/test/TEST-io.kardamom.sealer.RecordLagGuardTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerRecordLagTest.xml"
+      ],
+      "tests": [
+        "io.kardamom.sealer.RecordLagGuardTest::the_best_cursor_is_the_maximum_over_the_executors()",
+        "io.kardamom.sealer.RecordLagGuardTest::the_guard_resumes_when_the_best_cursor_moves_up()",
+        "io.kardamom.sealer.RecordLagGuardTest::a_cursor_from_a_stranger_or_past_the_head_is_refused()",
+        "io.kardamom.sealer.RecordLagGuardTest::a_version_11_restore_drops_the_cursor_of_a_removed_executor()",
+        "io.kardamom.sealer.RecordLagGuardTest::a_version_11_snapshot_loads_with_its_cursors()",
+        "io.kardamom.sealer.cluster.SealerRecordLagTest::the_recorded_cursor_frame_matches_the_rust_encoder()",
+        "io.kardamom.sealer.cluster.SealerRecordLagTest::a_cursor_that_moves_the_best_up_broadcasts_the_status_tail()",
+        "io.kardamom.sealer.cluster.SealerRecordLagTest::a_move_of_the_best_cursor_prints_the_log_line_at_power_of_two_counts()"
+      ],
+      "real": [
+        "CanonicalSealerState and RecordedCursors",
+        "SealerClusteredService with the recorded-cursor wire frame"
+      ],
+      "controlled": [
+        "stub sessions and direct cursor offers from several executors"
+      ],
+      "limitation": "The best cursor over the executors, without real executors or Aeron Cluster members.",
+      "negative_controls": [
+        {
+          "mutation": "the best cursor follows the last offered cursor instead of the maximum",
+          "exit_code": 1,
+          "compiled": true,
+          "failed_tests": [
+            "io.kardamom.sealer.RecordLagGuardTest::the_best_cursor_is_the_maximum_over_the_executors()",
+            "io.kardamom.sealer.RecordLagGuardTest::a_version_11_snapshot_loads_with_its_cursors()",
+            "io.kardamom.sealer.cluster.SealerRecordLagTest::a_cursor_that_moves_the_best_up_broadcasts_the_status_tail()",
+            "io.kardamom.sealer.cluster.SealerRecordLagTest::a_move_of_the_best_cursor_prints_the_log_line_at_power_of_two_counts()"
+          ]
+        }
+      ],
+      "ci_mode": "gradle"
+    },
     "ingress-accounts": {
       "command": [
         "cargo",
@@ -1850,22 +2038,43 @@
     {
       "case": "executor-fleet-loss-recover",
       "family": "Fleet",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "whole::a_whole_fleet_kill_resumes_each_replica_from_its_own_disk"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "docker kill and docker start of the executor nodes, or Nomad job stop and restore on the sealer nodes"
+      ]
     },
     {
       "case": "executor-fleet-wipe-recover",
       "family": "Fleet",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "whole::a_whole_fleet_wipe_restores_each_replica_from_its_local_checkpoint"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad job stop after the kills and restore after the wipe"
+      ]
     },
     {
       "case": "executor-fleet-total-wipe-recover",
       "family": "Fleet",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "whole::a_total_wipe_resumes_every_replica_from_a_rebuilt_da_image"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -2006,6 +2215,10 @@
         {
           "suite": "transport-pressure",
           "test": "unavailable_outputs_preserve_live_delivery_and_recover"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::executors_that_return_before_the_sealers_wait_and_then_catch_up"
         }
       ],
       "full_case_locally_validated": false
@@ -2013,8 +2226,13 @@
     {
       "case": "executor-sealer-validator-recover",
       "family": "CombinedExec",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "whole::executors_that_return_before_the_sealers_wait_and_then_catch_up"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -2033,6 +2251,10 @@
         {
           "suite": "executor-pipeline",
           "test": "exec_settles_inflight_commits_while_idle"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::executors_that_return_before_the_sealers_wait_and_then_catch_up"
         }
       ],
       "full_case_locally_validated": false
@@ -2088,8 +2310,13 @@
     {
       "case": "sequencer-executor-redis-loss",
       "family": "CombinedExec",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "whole::executors_that_return_before_the_sealers_wait_and_then_catch_up"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -2430,9 +2657,25 @@
     {
       "case": "executor-restart-storm",
       "family": "Integrity",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "replica::ten_stop_and_start_rounds_advance_every_replica_each_round"
+        },
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_reopens_an_unconnected_publication_once_and_delivers"
+        },
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_exits_after_the_total_budget_without_a_subscriber"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad job stop and restore ten times; the tx_receipts reopen on a new Aeron control port is evidence only, and its escalation is in executor-commit"
+      ]
     },
     {
       "case": "sealer-fleet-total-wipe-recover",
@@ -2548,7 +2791,7 @@
     {
       "case": "graceful-executor",
       "family": "Executor",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "executor-commit",
@@ -2561,14 +2804,25 @@
         {
           "suite": "executor-pipeline",
           "test": "exec_settles_inflight_commits_while_idle"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "a_graceful_stop_resumes_from_the_durable_cursor_without_loss_or_duplicate"
+        },
+        {
+          "suite": "executor-exec-stream",
+          "test": "stream::restarted_replicas_record_new_sessions_and_live_cursors_keep_moving"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restart and allocation count: the orchestrator brings the task back; the local test starts the process itself"
+      ]
     },
     {
       "case": "hard-executor",
       "family": "Executor",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "executor-commit",
@@ -2589,14 +2843,33 @@
         {
           "suite": "state-writer-crash",
           "test": "process_loss_after_commit_preserves_a_block_without_a_published_snapshot"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "replica::a_killed_replica_resumes_from_its_disk_while_its_peers_progress"
+        },
+        {
+          "suite": "executor-exec-stream",
+          "test": "stream::restarted_replicas_record_new_sessions_and_live_cursors_keep_moving"
+        },
+        {
+          "suite": "sealer-record-lag",
+          "test": "io.kardamom.sealer.RecordLagGuardTest::the_best_cursor_is_the_maximum_over_the_executors()"
+        },
+        {
+          "suite": "sealer-record-lag",
+          "test": "io.kardamom.sealer.cluster.SealerRecordLagTest::a_cursor_that_moves_the_best_up_broadcasts_the_status_tail()"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restart and allocation count: the orchestrator brings the task back; the local test starts the process itself"
+      ]
     },
     {
       "case": "node-failure-executor",
       "family": "Executor",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "state-writer-crash",
@@ -2605,35 +2878,77 @@
         {
           "suite": "state-writer-crash",
           "test": "process_loss_after_commit_preserves_a_block_without_a_published_snapshot"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "replica::a_killed_replica_resumes_from_its_disk_while_its_peers_progress"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::a_whole_fleet_kill_resumes_each_replica_from_its_own_disk"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "docker kill and docker start of the node container: the deployment node, which a process kill stands in for locally",
+        "the co-located sealer member returns with its node: Nomad placement of the member task; member restart recovery is in the sealer suites",
+        "Nomad restart and allocation count: the orchestrator brings the task back; the local test starts the process itself"
+      ]
     },
     {
       "case": "node-replace-executor",
       "family": "Executor",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "replica::a_blank_replacement_fetches_a_peer_checkpoint_and_catches_up"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "machine replacement: a new container generation, address plan and substrate play",
+        "Consul forgets the old node record and Nomad places the executor on the new client",
+        "the co-located sealer member returns on the new machine"
+      ]
     },
     {
       "case": "state-checkpoint-restore",
       "family": "Executor",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
-    },
-    {
-      "case": "checkpoint-corrupt-recover",
-      "family": "Executor",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "replica::a_wiped_replica_restores_a_copied_donor_checkpoint"
+        },
         {
           "suite": "checkpoint-copy",
           "test": "a_tmpfs_checkpoint_is_copied_and_verified_in_the_container_mount_namespace"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restart and allocation count: the orchestrator brings the task back; the local test starts the process itself"
+      ]
+    },
+    {
+      "case": "checkpoint-corrupt-recover",
+      "family": "Executor",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "checkpoint-copy",
+          "test": "a_tmpfs_checkpoint_is_copied_and_verified_in_the_container_mount_namespace"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::a_corrupt_local_checkpoint_is_quarantined_before_a_peer_restore"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the Nomad job patch that pauses only the pinned executor-0 group, and its restore"
+      ]
     },
     {
       "case": "checkpoint-disk-full",
@@ -2670,21 +2985,42 @@
     {
       "case": "replay-window-resync",
       "family": "Executor",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "sealer-raft",
           "test": "io.kardamom.sealer.cluster.SealerReplayTest::evictedRangeIsRefusedHonestly()"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "replica::a_wiped_replica_behind_the_window_fetches_a_peer_base_and_log"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "replica::a_cursor_below_the_retention_floor_stages_a_peer_checkpoint_in_process"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restart and allocation count: the orchestrator brings the task back; the local test starts the process itself"
+      ]
     },
     {
       "case": "deploy-broken-image",
       "family": "Executor",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "replica::a_failed_start_keeps_the_state_and_a_rolling_heal_converges"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the deploy role and the image manifest: the broken deploy stops at the executor job and never reaches the later jobs",
+        "Nomad deployment health deadline and the rolling update of pinned groups",
+        "the release gate on the chain status before each deploy"
+      ]
     },
     {
       "case": "retention-overrun",
