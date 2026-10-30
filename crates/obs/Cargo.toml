@@ -15,6 +15,10 @@ path = "src/lib.rs"
 # `scrape`, `poll_until`, `poll_sync`). Off by default: it pulls in
 # `reqwest`, which a production build of this crate never needs.
 test-support = ["dep:reqwest"]
+# `tests/alert_rules.rs`: the alert and inhibit rules in the real
+# Prometheus rule engine and Alertmanager. They need Docker and run with
+# `--ignored`.
+docker-e2e = []
 
 [dependencies]
 # The halt, pause, and event records, shared on the `events` stream.
@@ -37,4 +41,5 @@ bytes = { workspace = true }
 reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

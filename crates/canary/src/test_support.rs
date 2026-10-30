@@ -30,6 +30,8 @@ use crate::wait::Poll;
 /// The public test mnemonic.
 const MNEMONIC: &str = "test test test test test test test test test test test junk";
 const CHAIN_ID: u64 = 1;
+/// The JSON-RPC code of a submit that a halted chain refuses.
+pub(crate) const HALT_CODE: i32 = -32010;
 
 /// The state of the fake chain.
 #[derive(Debug, Default)]
@@ -38,6 +40,8 @@ pub(crate) struct Chain {
     pub(crate) balance: U256,
     /// Whether an applied transaction reverts.
     pub(crate) revert: bool,
+    /// Whether the ingress refuses each submit, as a halted ingress does.
+    pub(crate) halted: bool,
     /// The number of submits the chain took.
     pub(crate) sends: usize,
     receipts: HashMap<B256, Value>,
@@ -88,7 +92,11 @@ impl FakeIngress {
         module
             .register_method("kardamom_sendRawTransactionAsync", |params, chain, _| {
                 let raw: Bytes = params.one().unwrap();
-                json!(chain.lock().unwrap().take(&raw))
+                let mut chain = chain.lock().unwrap();
+                if chain.halted {
+                    return Err(Self::halt_refusal());
+                }
+                Ok(json!(chain.take(&raw)))
             })
             .unwrap();
         module
@@ -107,6 +115,16 @@ impl FakeIngress {
             dir: tempfile::tempdir().unwrap(),
             _server: server.start(module),
         }
+    }
+
+    /// The refusal of an ingress paused on the DA-lag halt of the sealer:
+    /// its JSON-RPC code and the text that names the halt record.
+    fn halt_refusal() -> jsonrpsee::types::ErrorObjectOwned {
+        jsonrpsee::types::ErrorObject::owned(
+            HALT_CODE,
+            "chain halted: da_lag at sealer; see /halt and docs/runbooks/da_lag.md",
+            None::<()>,
+        )
     }
 
     /// The data directory of the test.

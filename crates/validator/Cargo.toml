@@ -62,6 +62,7 @@ metrics-exporter-prometheus.workspace = true
 # `forged_envelope_chaos.rs` drives, shared with `kardamom-executor`.
 kardamom-engine = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
+crossbeam-channel.workspace = true
 alloy-network.workspace = true
 alloy-primitives.workspace = true
 alloy-provider.workspace = true

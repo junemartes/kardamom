@@ -14,7 +14,7 @@ use crate::testkit_da::FakeDaProxy;
 
 const OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
 
-struct Post(JoinHandle<Result<()>>);
+pub(super) struct Post(JoinHandle<Result<()>>);
 
 impl Post {
     async fn finish(mut self) {
@@ -25,7 +25,7 @@ impl Post {
             .unwrap();
     }
 
-    async fn cancel(mut self) {
+    pub(super) async fn cancel(mut self) {
         self.0.abort();
         assert!((&mut self.0).await.as_ref().unwrap_err().is_cancelled());
     }
@@ -37,19 +37,19 @@ impl Drop for Post {
     }
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     proxy: FaultProxy,
-    rig: AnvilRig,
-    da: FakeDaProxy,
+    pub(super) rig: AnvilRig,
+    pub(super) da: FakeDaProxy,
     disk: tempfile::TempDir,
     indexer: TcpListener,
     key: String,
-    settlement: Address,
+    pub(super) settlement: Address,
     batcher: Address,
 }
 
 impl Fixture {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let rig = AnvilRig::spawn(Anvil::new(), &[(OWNER, Funding::FundAndImpersonate)])
             .await
             .expect("this component test requires a working Anvil; it must not skip");
@@ -74,7 +74,7 @@ impl Fixture {
         }
     }
 
-    fn args(&self) -> LiveArgs {
+    pub(super) fn args(&self) -> LiveArgs {
         LiveArgs {
             rpcs: vec![self.proxy.url()],
             key: self.key.clone(),
@@ -183,6 +183,16 @@ impl Fixture {
         resumed: L1Side<P>,
         blocks: std::ops::RangeInclusive<u64>,
     ) -> Post {
+        self.feed_from(resumed, Self::replay(blocks))
+    }
+
+    /// Run the real feed from the cursor of `resumed` over the reader
+    /// channel `records`. The post ends when the channel closes.
+    pub(super) fn feed_from<P: Provider + 'static>(
+        &self,
+        resumed: L1Side<P>,
+        records: tokio::sync::mpsc::Receiver<kardamom_engine::reader::ReaderToExec>,
+    ) -> Post {
         resumed
             .provider
             .client()
@@ -193,7 +203,7 @@ impl Fixture {
             continue_from_spool(&spool, resumed.cursor, resumed.skip_through_block).unwrap();
         let mut feed = resumed.feed(&args, spool, restored, resume);
         Post(tokio::spawn(async move {
-            let error = feed.run(Self::replay(blocks)).await;
+            let error = feed.run(records).await;
             anyhow::ensure!(
                 error.to_string().contains("reader channel closed"),
                 "{error:#}"
@@ -214,7 +224,7 @@ impl Fixture {
         );
     }
 
-    async fn await_landed(&self, index: u64) {
+    pub(super) async fn await_landed(&self, index: u64) {
         tokio::time::timeout(Duration::from_secs(10), async {
             while L1Truth::read(&self.rig.provider, self.settlement)
                 .await
