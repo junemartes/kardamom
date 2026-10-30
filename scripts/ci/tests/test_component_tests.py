@@ -138,7 +138,8 @@ class ComponentTests(unittest.TestCase):
             (Path(directory) / "revision.txt").write_text("a" * 40 + "\n")
             with patch.dict(component.os.environ, GITHUB_SHA="b" * 40), self.assertRaises(ValueError):
                 runtime.load()
-            command, _ = runtime.command({"test": "io.kardamom.Actor::recovers()"}, Path(directory) / "reports")
+            with patch.dict(component.os.environ, GITHUB_SHA="a" * 40):
+                command, _ = runtime.command({"test": "io.kardamom.Actor::recovers()"}, Path(directory) / "reports")
             self.assertEqual(command[command.index("--select-method") + 1], "io.kardamom.Actor#recovers")
             self.assertEqual(command[1:3], ["--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED"])
 
