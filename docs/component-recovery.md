@@ -29,7 +29,8 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 228 checks across 36 targets.
+head. Both targets run in the existing Docker CI job. `just component-summary`
+prints the current counts of the catalog.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
