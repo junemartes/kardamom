@@ -1,0 +1,13 @@
+---
+# Wait until every member of a new sealer cluster runs and answers its
+# admin status (the waves of a new cluster, sealer.yml).
+- name: Wait for every new sealer member to run
+  ansible.builtin.include_tasks: wait_allocations.yml
+  vars:
+    workloads_wait_job: cluster
+
+- name: Wait for the admin status of every new sealer member
+  ansible.builtin.include_tasks: sealer_status.yml
+  vars:
+    workloads_sealer_groups: "{{ workloads_jobs.cluster.TaskGroups | map(attribute='Name') | list }}"
+    workloads_sealer_status_retries: "{{ workloads_poll_retries }}"

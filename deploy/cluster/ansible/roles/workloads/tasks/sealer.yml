@@ -71,7 +71,15 @@
     - name: Register the sealer
       ansible.builtin.include_tasks: job.yml
       vars:
-        workloads_job: "{{ workloads_sealer_job }}"
+        workloads_job: "{{ workloads_sealer_job | combine({'defer': workloads_waves | default(false) | bool}) }}"
+
+    # In the waves of a new cluster, the wait for the deployment of the
+    # sealer moves to the end of the next wave. Each member reads the
+    # bootstrap flag once, at its start, so the bootstrap closes only when
+    # every new member runs and answers its admin status.
+    - name: Wait for every new sealer member to answer
+      ansible.builtin.include_tasks: sealer_started.yml
+      when: workloads_waves | default(false) | bool
   always:
     - name: Close the cluster bootstrap
       ansible.builtin.uri:
