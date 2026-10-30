@@ -2,7 +2,9 @@ package io.kardamom.sealer.cluster;
 
 import io.aeron.Publication;
 import io.aeron.cluster.client.AeronCluster;
+import io.aeron.driver.DefaultNameResolver;
 import io.aeron.driver.MediaDriver;
+import io.aeron.driver.NameResolver;
 import io.aeron.driver.ThreadingMode;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -24,6 +26,8 @@ final class CanonicalClient implements AutoCloseable {
 
     /** The wait for the relay of one offer before the client offers it again. */
     private static final long REOFFER_NS = Duration.ofSeconds(3).toNanos();
+    /** The keepalive interval of {@link #holdUntil}, far below the session timeout. */
+    private static final long KEEP_ALIVE_NS = Duration.ofSeconds(1).toNanos();
 
     private final MediaDriver driver;
     private final Supplier<String> endpoints;
@@ -36,12 +40,46 @@ final class CanonicalClient implements AutoCloseable {
     private int scanned;
 
     CanonicalClient(final Path aeronDir, final Supplier<String> endpoints) {
+        this(aeronDir, endpoints, DefaultNameResolver.INSTANCE);
+    }
+
+    /**
+     * A client that resolves the member names of {@code hosts}, a hosts
+     * file of {@code address name} lines. A new-leader event names the
+     * ingress endpoints of the members by these names.
+     */
+    CanonicalClient(final Path aeronDir, final Supplier<String> endpoints, final Path hosts) {
+        this(aeronDir, endpoints, (name, uriParamName, isReResolution) -> hostsEntry(hosts, name)
+            .orElseGet(() -> DefaultNameResolver.INSTANCE.resolve(name, uriParamName, isReResolution)));
+    }
+
+    private CanonicalClient(final Path aeronDir, final Supplier<String> endpoints, final NameResolver resolver) {
         this.endpoints = endpoints;
         this.driver = MediaDriver.launch(new MediaDriver.Context()
             .aeronDirectoryName(aeronDir.toString())
             .threadingMode(ThreadingMode.SHARED)
+            .nameResolver(resolver)
             .dirDeleteOnStart(true)
             .dirDeleteOnShutdown(true));
+    }
+
+    /** The address of {@code name} in the hosts file {@code hosts}, read now. */
+    private static java.util.Optional<java.net.InetAddress> hostsEntry(final Path hosts, final String name) {
+        try {
+            return java.nio.file.Files.readAllLines(hosts).stream()
+                .map(l -> l.trim().split("\\s+"))
+                .filter(f -> f.length == 2 && f[1].equals(name))
+                .findFirst()
+                .map(f -> {
+                    try {
+                        return java.net.InetAddress.getByName(f[0]);
+                    } catch (final java.net.UnknownHostException e) {
+                        throw new java.io.UncheckedIOException(e);
+                    }
+                });
+        } catch (final java.io.IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
     }
 
     RecordingEgressListener egress() {
@@ -119,6 +157,22 @@ final class CanonicalClient implements AutoCloseable {
     void pollUntil(final Duration bound, final String what, final java.util.function.BooleanSupplier done) {
         Await.holds(bound, what, () -> {
             poll();
+            return done.getAsBoolean();
+        });
+    }
+
+    /**
+     * Poll the egress and send a keepalive each second until {@code done}
+     * holds, within {@code bound}. The session then outlives a wait that
+     * is longer than the session timeout of the cluster.
+     */
+    void holdUntil(final Duration bound, final String what, final java.util.function.BooleanSupplier done) {
+        final long[] next = {System.nanoTime()};
+        pollUntil(bound, what, () -> {
+            if (System.nanoTime() - next[0] >= 0) {
+                session().ifPresent(AeronCluster::sendKeepAlive);
+                next[0] = System.nanoTime() + KEEP_ALIVE_NS;
+            }
             return done.getAsBoolean();
         });
     }

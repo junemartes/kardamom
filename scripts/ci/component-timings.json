@@ -233,6 +233,7 @@
   "sealer-raft-network::io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest::the_peers_of_a_leader_that_cannot_send_elect_a_new_leader_and_the_old_one_stays_up()": 33.505,
   "sealer-raft-network::io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest::a_slow_leader_link_keeps_commits_and_one_leader_per_term()": 20.366,
   "sealer-raft-network::io.kardamom.sealer.cluster.RaftLeaderPacketLossTest::a_lossy_leader_link_keeps_commits_and_one_leader_per_term()": 20.267,
+  "sealer-raft-network::io.kardamom.sealer.cluster.RaftLeaderReturnTest::a_former_leader_that_wins_again_sends_a_new_leader_event_and_no_session_ok()": 55.0,
   "sealer-raft::io.kardamom.sealer.cluster.SealerCarryClusterTest::every_member_orders_each_full_reference_once_with_its_bytes()": 1.573,
   "sealer-raft::io.kardamom.sealer.cluster.SealerClusterFailoverTest::egressContinuesGaplesslyAcrossLeaderKill()": 13.388,
   "sealer-raft::io.kardamom.sealer.cluster.SealerReplayTest::evictedRangeIsRefusedHonestly()": 1.621,

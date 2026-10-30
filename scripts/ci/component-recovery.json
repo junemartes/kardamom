@@ -1184,6 +1184,8 @@
         "--tests",
         "io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest",
         "--tests",
+        "io.kardamom.sealer.cluster.RaftLeaderReturnTest",
+        "--tests",
         "io.kardamom.sealer.cluster.RaftLeaderPacketLossTest",
         "--tests",
         "io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest",
@@ -1197,13 +1199,15 @@
         "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest.xml",
         "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderPacketLossTest.xml",
         "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest.xml",
-        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.CpuSqueezeTest.xml"
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.CpuSqueezeTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderReturnTest.xml"
       ],
       "tests": [
         "io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest::the_peers_of_a_leader_that_cannot_send_elect_a_new_leader_and_the_old_one_stays_up()",
         "io.kardamom.sealer.cluster.RaftLeaderPacketLossTest::a_lossy_leader_link_keeps_commits_and_one_leader_per_term()",
         "io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest::a_slow_leader_link_keeps_commits_and_one_leader_per_term()",
-        "io.kardamom.sealer.cluster.CpuSqueezeTest::starved_members_slow_down_but_never_fork_the_canonical_order()"
+        "io.kardamom.sealer.cluster.CpuSqueezeTest::starved_members_slow_down_but_never_fork_the_canonical_order()",
+        "io.kardamom.sealer.cluster.RaftLeaderReturnTest::a_former_leader_that_wins_again_sends_a_new_leader_event_and_no_session_ok()"
       ],
       "real": [
         "ClusterNode main class in one JVM process per member, with the deployed member settings",
@@ -1216,7 +1220,8 @@
       "controlled": [
         "a one-way cut, 10 % random loss or a 250 ms ordered delay of the frames of the leader to both peers, for 10-15 s",
         "SIGSTOP/SIGCONT of all members: 15 ms of run in each 100 ms for 20 s",
-        "the deployed 2 s tick and the deployed Raft timeouts"
+        "the deployed 2 s tick and the deployed Raft timeouts",
+        "one-way cuts of the frames of each new leader to its peers, until a member that led before wins a later term in the same process"
       ],
       "negative_controls": [
         {
