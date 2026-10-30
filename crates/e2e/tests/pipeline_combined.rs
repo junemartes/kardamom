@@ -10,8 +10,7 @@
 
 #![cfg(feature = "full-pipeline-e2e")]
 
-use e2e::harness::StackConfig;
-use e2e::scenarios::recovery::{Case, cases, run_case, with_l1, with_quorum};
+use e2e::scenarios::recovery::{Case, cases, run_case, validated, with_l1, with_quorum};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run the pipeline-combined component target"]
@@ -30,7 +29,7 @@ async fn ingress_returns_before_the_sealer_and_waits() {
     run_case(
         "ingress-sealer-loss-recover",
         Case::Combined(cases::INGRESS_SEALER),
-        with_quorum(StackConfig::default()),
+        with_quorum(validated()),
     )
     .await;
 }

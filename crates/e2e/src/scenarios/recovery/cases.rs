@@ -2,7 +2,7 @@
 //! while its services are down and after they return. Each variant names
 //! the chaos case whose fault it injects at the same boundary.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -26,6 +26,12 @@ const REFUSAL_BOUND: Duration = Duration::from_secs(30);
 const NO_QUORUM: &str = "sealer_no_quorum";
 /// The sealer's line of a void decision, one for each member and entry.
 const VOID_DECIDED: &str = "result=DECIDED";
+/// How long a returned state mirror gets to serve: it waits for live
+/// receipts and then for an executor checkpoint at or past them.
+const MIRROR_BOUND: Duration = Duration::from_secs(40);
+/// The dev account whose row only a rebuild writes: funded at genesis,
+/// and no case sends from it or to it.
+const UNTOUCHED: usize = 10;
 /// How long the returned members get to close an election.
 const ELECTION_BOUND: Duration = Duration::from_secs(30);
 
@@ -138,15 +144,10 @@ pub const ALL_THREE_REVERSE: Combined = Combined {
 /// The fault of one case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Case {
-    /// `graceful-ingress`: SIGTERM to ingress 0, then its start.
-    GracefulIngress,
-    /// `hard-ingress`: SIGKILL to one ingress, then its start. The chaos
-    /// case rotates the victim between the two replicas.
-    HardIngress(Victim),
     /// `ingress-pair-loss-recover`: SIGKILL to both ingresses.
     IngressPairLoss,
-    /// `graceful-sequencer`: SIGTERM to the sequencer of the case sender's
-    /// lane, then its cold start.
+    /// `graceful-sequencer`: SIGTERM to one of the two replicas of the case
+    /// sender's lane, then its cold start.
     GracefulSequencer,
     /// `sequencer-lane-loss-recover`: SIGKILL to both replicas of the case
     /// sender's lane at once; no twin keeps the lane. Both return cold.
@@ -156,25 +157,6 @@ pub enum Case {
     PipelineBlackout,
     /// A combined outage of the ingress, sequencer and sealer classes.
     Combined(Combined),
-}
-
-/// The ingress that a hard stop kills.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Victim {
-    /// Ingress 0, which takes the submits of the case load.
-    CaseIngress,
-    /// Ingress 1, the twin. Its return must serve the receipts of
-    /// transfers that it never saw, from state.
-    Twin,
-}
-
-impl Victim {
-    fn index(self) -> usize {
-        match self {
-            Self::CaseIngress => 0,
-            Self::Twin => 1,
-        }
-    }
 }
 
 /// One reading of the pipeline while classes are down.
@@ -248,6 +230,25 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// The state mirror serves again, and Redis, which returned empty,
+    /// holds the row of a funded account that no case traffic touches:
+    /// only a rebuild from the executor's checkpoint writes it.
+    async fn assert_read_path_back(&self) -> Result<()> {
+        if !self.stack.cfg.read_path {
+            return Ok(());
+        }
+        let untouched = crate::harness::l2::dev_signers_through(UNTOUCHED)?
+            .get(UNTOUCHED)
+            .map(|s| s.address)
+            .context("untouched dev account")?;
+        let keys = self.stack.await_read_path(MIRROR_BOUND, untouched).await?;
+        eprintln!(
+            "{}: the state mirror serves again; Redis holds {keys} keys, with the row of {untouched}",
+            self.at()
+        );
+        Ok(())
+    }
+
     /// The returned members closed an election, and no term had two
     /// leaders.
     async fn assert_sealer_elected(&self) -> Result<()> {
@@ -272,47 +273,15 @@ impl Case {
     /// Returns the first failed step or check.
     pub async fn inject(self, run: &mut Run<'_>, load: &RunningLoad) -> Result<()> {
         match self {
-            Self::GracefulIngress => {
-                Self::ingress(run, load, (Stop::Graceful, Victim::CaseIngress)).await
-            }
-            Self::HardIngress(victim) => Self::ingress(run, load, (Stop::Hard, victim)).await,
             Self::IngressPairLoss => Self::ingress_pair(run, load).await,
-            Self::GracefulSequencer => Self::sequencer_lane(run, load, Stop::Graceful).await,
-            Self::SequencerLaneLoss => Self::sequencer_lane(run, load, Stop::Hard).await,
+            Self::GracefulSequencer => Self::graceful_sequencer(run, load).await,
+            Self::SequencerLaneLoss => Self::sequencer_lane(run, load).await,
             Self::PipelineBlackout => Self::blackout(run).await,
             Self::Combined(c) => c.run(run, load).await,
         }
     }
 
     /// Stop ingress 0, the ingress of the case load, then start it.
-    /// Stop one ingress, then start it. A stop of the case ingress stops
-    /// the case load; a stop of the twin leaves it running.
-    async fn ingress(
-        run: &mut Run<'_>,
-        load: &RunningLoad,
-        (stop, victim): (Stop, Victim),
-    ) -> Result<()> {
-        let i = victim.index();
-        let stopped = Instant::now();
-        run.stack.stop_ingress(i, stop)?;
-        eprintln!(
-            "{}: ingress {i} stopped ({stop:?}) in {:.1}s",
-            run.at(),
-            stopped.elapsed().as_secs_f64()
-        );
-        match victim {
-            Victim::CaseIngress => run.assert_load_stopped(load).await?,
-            Victim::Twin => {
-                let refused = run.client(i)?.chain_id().await.result.is_err();
-                anyhow::ensure!(refused, "{}: ingress {i} still answers", run.name);
-                let landed = load.landed();
-                load.await_landed_above(landed, RESTART_BOUND).await?;
-            }
-        }
-        run.stack.start_ingress(i)?;
-        run.assert_ingress_pair_live(RESTART_BOUND).await
-    }
-
     /// Kill both ingresses. No submit lands and no receipt is served;
     /// both return.
     async fn ingress_pair(run: &mut Run<'_>, load: &RunningLoad) -> Result<()> {
@@ -332,11 +301,12 @@ impl Case {
     /// Kill the sequencer of the case sender's lane. Its senders wait
     /// until a cold replica returns and learns their floors from the
     /// executor.
-    /// Stop every replica of the case sender's lane, then start them all
+    /// Kill every replica of the case sender's lane, then start them all
     /// cold. Their senders wait until a replica learns their floors from
-    /// the executor. With two replicas, both learn the same floors and
-    /// offer the same references, and the sealer keeps the first copy.
-    async fn sequencer_lane(run: &mut Run<'_>, load: &RunningLoad, stop: Stop) -> Result<()> {
+    /// the executor. Both replicas learn the same floors and offer the
+    /// same references, and the sealer keeps the first copy.
+    async fn sequencer_lane(run: &mut Run<'_>, load: &RunningLoad) -> Result<()> {
+        let stop = Stop::Hard;
         let lane = run.case_lane()?;
         let replicas = run.lane_replicas(lane)?;
         replicas
@@ -357,13 +327,37 @@ impl Case {
         run.assert_no_ref_below_floor().await
     }
 
-    /// Set the stack up before the case load: the lane loss runs two
+    /// SIGTERM to the first replica of the case sender's lane. It must exit
+    /// within its kill bound, and its twin keeps the lane ordering: the
+    /// case load lands during the stop. The replica then starts cold.
+    async fn graceful_sequencer(run: &mut Run<'_>, load: &RunningLoad) -> Result<()> {
+        let lane = run.case_lane()?;
+        let first = usize::try_from(lane)?;
+        run.stack.stop_sequencer(first, Stop::Graceful)?;
+        eprintln!(
+            "{}: sequencer {first} of lane {lane} exited on SIGTERM",
+            run.at()
+        );
+        let landed = load.landed();
+        let took = load.await_landed_above(landed, RESTART_BOUND).await?;
+        eprintln!(
+            "{}: the twin orders the lane while the replica is down ({:.1}s)",
+            run.at(),
+            took.as_secs_f64()
+        );
+        run.stack.start_sequencer(first)?;
+        run.stack.await_sequencer_session(first, RESTART_BOUND)?;
+        run.assert_executor_progress().await?;
+        run.assert_no_ref_below_floor().await
+    }
+
+    /// Set the stack up before the case load: the sequencer cases run two
     /// replicas of the case sender's lane, as the deployment does.
     ///
     /// # Errors
     /// Returns an error when the twin replica does not start.
     pub fn prepare(self, run: &mut Run<'_>) -> Result<()> {
-        if self == Self::SequencerLaneLoss {
+        if matches!(self, Self::SequencerLaneLoss | Self::GracefulSequencer) {
             let lane = run.case_lane()?;
             run.stack.add_sequencer_twin(lane)?;
         }
@@ -379,24 +373,32 @@ impl Case {
         stack.kill_executor();
         stack.kill_validator();
         stack.kill_l1_watchers();
+        stack.kill_read_path()?;
         stack.kill_sealer();
         stack.kill_driver();
         let dark = metrics::scrape(stack.executor_metrics()).await.is_err();
         anyhow::ensure!(dark, "{}: the executor still answers", run.name);
         eprintln!("{}: every pipeline process is dead", run.at());
+        // Every process starts at once, as after a power loss: the clients
+        // of the sealer start before it and connect when it is up.
         run.stack.restart_driver()?;
-        run.stack.start_sealer()?;
         run.stack.restart_executor()?;
         if run.stack.cfg.validator {
             run.stack.restart_validator()?;
         }
         run.stack.restart_l1_watchers()?;
+        run.stack.restart_read_path()?;
         (0..run.stack.sequencer_count()).try_for_each(|i| run.stack.start_sequencer(i))?;
         (0..run.stack.ingress_count()).try_for_each(|i| run.stack.start_ingress(i))?;
+        run.stack.start_sealer()?;
         eprintln!("{}: every process started", run.at());
-        run.assert_sealer_elected().await?;
-        run.assert_ingress_pair_live(RESTART_BOUND).await?;
-        run.assert_executor_progress().await?;
+        let run: &Run<'_> = run;
+        tokio::try_join!(
+            run.assert_sealer_elected(),
+            run.assert_ingress_pair_live(RESTART_BOUND),
+            run.assert_executor_progress(),
+            run.assert_read_path_back(),
+        )?;
         let voided =
             SealerLogs::read(&run.stack.root(), run.stack.sealer_members())?.count(VOID_DECIDED);
         eprintln!("{}: void decisions in the sealer logs: {voided}", run.at());

@@ -144,6 +144,11 @@ pub fn spawn_executor_at(spec: &ServiceSpec<'_>, run: &ExecutorRun<'_>) -> Resul
     // coverage in CI. Its per-block summary lines land in executor.log.
     cmd.env("KARDAMOM_FOOTPRINT_SHADOW", "1");
     run.add_args(&mut cmd, spec);
+    if spec.checkpoints {
+        cmd.arg("--checkpoint-dir")
+            .arg(spec.root.join("checkpoints"))
+            .args(["--checkpoint-interval-secs", "2"]);
+    }
     with_log_config(&mut cmd, spec);
     add_archive_endpoints(&mut cmd, spec);
     common_service_env(&mut cmd);

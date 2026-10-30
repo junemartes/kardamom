@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use crate::harness::l2::{self, L2Client};
 use crate::harness::metrics;
 use crate::harness::{LocalStack, StackConfig};
-pub use cases::{Case, Victim};
+pub use cases::Case;
 use load::{LoadPlan, LoadReport, RunningLoad};
 
 /// The dev-mnemonic index of the case sender.
@@ -270,13 +270,22 @@ impl<'a> Run<'a> {
     }
 }
 
+/// The stack of a case: a validator, whose verdict ends the case.
+#[must_use]
+pub fn validated() -> StackConfig {
+    StackConfig {
+        validator: true,
+        ..StackConfig::default()
+    }
+}
+
 /// The stack of a case whose checks read the L1 epochs: Anvil, the
 /// bridge, the L1 follower and the da-watcher.
 #[must_use]
 pub fn with_l1() -> StackConfig {
     StackConfig {
         l1: true,
-        ..StackConfig::default()
+        ..validated()
     }
 }
 
@@ -290,8 +299,7 @@ pub fn with_quorum(cfg: StackConfig) -> StackConfig {
     }
 }
 
-/// Launch a stack with a validator, run `case` on it, and print the
-/// runtime. `launch_opt` also brings up the L1 stack; a missing Anvil
+/// Launch the stack of `cfg`, run `case` on it, and print the runtime. `launch_opt` also brings up the L1 stack; a missing Anvil
 /// fails the case instead of skipping it. A failure dumps the process
 /// logs.
 ///
@@ -299,13 +307,10 @@ pub fn with_quorum(cfg: StackConfig) -> StackConfig {
 /// Panics when the stack does not start or the case fails.
 pub async fn run_case(name: &'static str, case: Case, cfg: StackConfig) {
     let started = Instant::now();
-    let mut stack = LocalStack::launch_opt(StackConfig {
-        validator: true,
-        ..cfg
-    })
-    .await
-    .expect("stack")
-    .expect("the L1 cases need Anvil");
+    let mut stack = LocalStack::launch_opt(cfg)
+        .await
+        .expect("stack")
+        .expect("the L1 cases need Anvil");
     eprintln!(
         "{name}: stack up in {:.1}s",
         started.elapsed().as_secs_f64()

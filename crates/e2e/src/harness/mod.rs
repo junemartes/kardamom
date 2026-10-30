@@ -30,6 +30,7 @@ mod launch;
 mod load_sampler;
 pub mod metrics;
 pub mod proc;
+pub mod read_path;
 pub mod sealer;
 pub mod services;
 mod shutdown;
@@ -68,6 +69,8 @@ pub struct LocalStack {
     /// The egress (`StackConfig::carry`). It reads the frames of the
     /// executor.
     egress: Option<carry::SpawnedEgress>,
+    /// Redis and the state mirror (`StackConfig::read_path`).
+    read_path: Option<read_path::ReadPath>,
     executor: Spawned,
     validator: Option<Spawned>,
     sequencers: Vec<Spawned>,

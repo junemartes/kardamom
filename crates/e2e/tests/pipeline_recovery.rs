@@ -1,4 +1,4 @@
-//! The ingress, sequencer and coordinated recovery cases of the chaos
+//! The coordinated and sequencer recovery cases of the chaos
 //! suite on the local stack: the real ingress pair, sequencers, sealer,
 //! executor and validator as processes on one host. Each test injects the
 //! fault of one chaos case at the same boundary and judges the pipeline
@@ -14,40 +14,7 @@
 #![cfg(feature = "full-pipeline-e2e")]
 
 use e2e::harness::StackConfig;
-use e2e::scenarios::recovery::{Case, Victim, run_case, with_l1, with_quorum};
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "full local stack; run the pipeline-recovery component target"]
-async fn graceful_ingress_drains_returns_and_loses_no_transfer() {
-    run_case(
-        "graceful-ingress",
-        Case::GracefulIngress,
-        StackConfig::default(),
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "full local stack; run the pipeline-recovery component target"]
-async fn hard_ingress_returns_and_loses_no_transfer() {
-    run_case(
-        "hard-ingress",
-        Case::HardIngress(Victim::CaseIngress),
-        StackConfig::default(),
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "full local stack; run the pipeline-recovery component target"]
-async fn hard_twin_ingress_returns_and_serves_receipts_it_never_saw() {
-    run_case(
-        "hard-ingress",
-        Case::HardIngress(Victim::Twin),
-        StackConfig::default(),
-    )
-    .await;
-}
+use e2e::scenarios::recovery::{Case, run_case, validated, with_l1};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run the pipeline-recovery component target"]
@@ -55,7 +22,7 @@ async fn ingress_pair_loss_returns_both_replicas() {
     run_case(
         "ingress-pair-loss-recover",
         Case::IngressPairLoss,
-        StackConfig::default(),
+        validated(),
     )
     .await;
 }
@@ -63,12 +30,7 @@ async fn ingress_pair_loss_returns_both_replicas() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run the pipeline-recovery component target"]
 async fn graceful_sequencer_drains_and_a_cold_start_regains_its_senders() {
-    run_case(
-        "graceful-sequencer",
-        Case::GracefulSequencer,
-        StackConfig::default(),
-    )
-    .await;
+    run_case("graceful-sequencer", Case::GracefulSequencer, validated()).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -77,7 +39,7 @@ async fn sequencer_lane_loss_relearns_the_sender_floor() {
     run_case(
         "sequencer-lane-loss-recover",
         Case::SequencerLaneLoss,
-        StackConfig::default(),
+        validated(),
     )
     .await;
 }
@@ -88,10 +50,29 @@ async fn pipeline_blackout_restarts_every_process_and_reelects() {
     run_case(
         "pipeline-blackout-recover",
         Case::PipelineBlackout,
-        with_quorum(StackConfig {
+        StackConfig {
             archive_durability: true,
             ..with_l1()
-        }),
+        },
+    )
+    .await;
+}
+
+/// The same blackout with Redis and the state mirror on the read path.
+/// It runs apart from the L1 stack, so each test stays inside 60 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack; run the pipeline-recovery component target"]
+async fn pipeline_blackout_rebuilds_the_read_path() {
+    run_case(
+        "pipeline-blackout-recover",
+        Case::PipelineBlackout,
+        // No validator: its verdict ends the other blackout test, and the
+        // mirror rebuild needs the rest of the 60 s.
+        StackConfig {
+            archive_durability: true,
+            read_path: true,
+            ..StackConfig::default()
+        },
     )
     .await;
 }

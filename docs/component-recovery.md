@@ -480,29 +480,63 @@ The local stagger and hold are shorter than the deployed ones. The 10-second
 sealer silence budget is crossed where an ingress stays up through the sealer
 loss: the test waits for its `sealer_no_quorum` refusal. A returned ingress has
 no silence clock before its first status frame, so the stagger needs no such
-bound. The hard ingress case runs once for each replica: a returned twin must
-serve receipts of transfers that it never saw. The lane loss runs two replicas
+bound. The lane loss runs two replicas
 of the case lane and kills both: they return cold, learn the same floors, and
 offer the same references, and the sealer keeps the first copy. The graceful
-sequencer case sends SIGTERM to the replica of the case lane and requires its
-exit within ten seconds. The tests need the service
+sequencer case sends SIGTERM to one of the two replicas of the case lane and
+requires its exit within ten seconds, while the twin keeps the lane ordering. The tests need the service
 binaries, the sealer jar and the aeron-all jar, as the chain-semantics job does.
-Each test takes 14 to 53 seconds on a loaded host, including the stack start.
+Each test takes 14 to 50 seconds on a loaded host, including the stack start.
 
 The pipeline blackout also kills the media driver, the L1 follower and the
-da-watcher. The killed archive leaves an active mark file, so the returned driver
-starts only after it ages out, as the scheduler's restarts of the driver task see.
-The executor and the validator then refetch the envelopes of replayed records from
-the archive. The local validator now gets the refetch endpoints of the deployed
-job. The blackout is partial evidence for `archive-driver-loss`: the local driver
-serves every service, so the case cannot keep the twin ingress on its own driver.
-The local stack runs no Redis and no state mirror, so their return after a
-blackout stays with the cache cases.
+da-watcher, or Redis and the state mirror. The killed archive leaves an active mark
+file, so the returned driver starts only after it ages out, as the scheduler's
+restarts of the driver task see. Every process then starts at once. The executor
+and the validator refetch the envelopes of replayed records from the archive; the
+local validator gets the refetch endpoints of the deployed job. Redis returns
+empty, and the state mirror must serve again with keys rebuilt from the
+executor's newest checkpoint, with the row of a funded account that no traffic
+touches: only a rebuild writes it. The blackout runs as two tests, one with the
+L1 stack and the validator, one with Redis and the state mirror, so each stays
+inside 60 seconds. Both run one sealer member; the combined cases close elections
+of three members.
 
 Compiled negative controls fail these tests at recovery: an ingress that serves
 no receipt from state, a sequencer lookup that sends no query, a cluster client
 that never forces a new session after egress silence, and an executor with no
-archive refetch.
+archive refetch, and a state mirror that never rebuilds.
+
+`just test-component ingress-recovery` runs the single-service ingress cases in
+isolation. Each ingress replica is the real `kardamom-ingress` binary on its own
+host-native archiving media driver, as on its own node; the nodes talk over
+loopback UDP. A controlled stand-in for the sequencer, the sealer and the executor
+runs on the second node. It keeps the first copy of a transaction, runs each
+sender's nonces in order, and sends receipt batch frames with account rows. An
+HTTP stub serves the egress and executor receipt queries from its ledger. Each
+case requires every transfer to land, the stand-in to execute each one once in
+nonce order, and both ingresses, the returned one too, to serve every receipt:
+
+- `graceful-ingress`: SIGTERM must end in a clean exit within the drain bound.
+- `hard-ingress`: SIGKILL, once for each replica. A returned twin serves receipts
+  of transfers that it never saw.
+- `archive-driver-loss`: the driver of ingress 0 dies. Ingress 0 must exit on its
+  own after its driver timeout, while the twin on the other node keeps serving.
+  The driver returns on its archive, and ingress 0 starts with its recorders.
+
+Controls fail the tests when a returned ingress serves no receipt from state, and
+when the Aeron error handler does not end a client that lost its driver.
+
+`just test-component ingress-deadline` holds the executor head far behind the
+sealed head of the sealer's status. The ingress must stamp every new submit from
+the sealed head, so the deadline stays past the sealer's block. A control that
+stamps from the executor head alone fails it. This answers a stall seen in one
+blackout run under a load average of 46: the ingress does not age the deadline.
+That run showed refs that the v1 sequencer offered again after its confirm timeout,
+with their first deadline, which the sealer then refused as past the deadline.
+
+A restart log of the service events board now comes at most once in each expiry
+window for one service. Two processes that publish one key on one shared IPC
+session made every record of the slower counter read as a restart.
 
 `just test-component control-plane-loss` runs the production discovery adapter
 against a Consul-like agent and a real media driver. A publisher and a subscriber

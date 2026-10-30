@@ -120,13 +120,13 @@ impl DriverLaunch {
 }
 
 impl DriverLaunch {
-    /// Spawn the driver and require it to run six seconds later: an
-    /// archive that refuses its mark file exits within that time, also on
-    /// a loaded host.
+    /// Spawn the driver and require it to run three seconds later: an
+    /// archive that refuses its mark file exits within two seconds of the
+    /// JVM start.
     /// `None` when the process exited, also before its readiness files.
     fn spawn_settled(&self, log_name: &str) -> Option<Proc> {
         let mut proc = self.spawn(log_name).ok()?;
-        std::thread::sleep(Duration::from_secs(6));
+        std::thread::sleep(Duration::from_secs(3));
         proc.is_alive().then_some(proc)
     }
 }

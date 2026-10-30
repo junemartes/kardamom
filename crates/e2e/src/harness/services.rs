@@ -149,6 +149,9 @@ pub struct ServiceSpec<'a> {
     /// `--exec-frames` on the executor: it forwards its frames to the
     /// egress.
     pub exec_frames: bool,
+    /// The executor writes checkpoints to `<root>/checkpoints` every two
+    /// seconds, for the state mirror's rebuild.
+    pub checkpoints: bool,
 }
 
 impl ServiceSpec<'_> {
