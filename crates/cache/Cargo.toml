@@ -32,7 +32,9 @@ reqwest = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
-tokio = { workspace = true, features = ["rt", "time", "sync"] }
+# The Sentinel questions of one connection run at once (`select_ok`).
+futures = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "sync", "net"] }
 testcontainers = { workspace = true, optional = true }
 
 [dev-dependencies]
