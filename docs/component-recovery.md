@@ -114,6 +114,40 @@ These reuse the existing Java fixtures and start no chain stack. The Raft group
 still uses real scheduling and local Aeron transport; the actor clock does not accelerate
 its consensus protocol.
 
+`just test-component sealer-raft-network`, `sealer-raft-members` and
+`sealer-raft-fleet` run twelve checks on three real member processes. Each
+member runs the production `ClusterNode` main class in its own JVM, with the
+deployed tick, Raft timeouts and member settings. Each member has its own
+loopback address, its directories on tmpfs, and a shared driver for its
+member feed. The members name each other through a hosts file, as the deploy
+names them through Consul. A test client speaks the production ingress and
+egress codecs, and each member feed gives the canonical frames of that member.
+Every check requires one leader per term from the TERM lines of all members,
+and the same canonical frames, byte for byte, on every member.
+
+The checks cover a one-way partition, 10 % loss and a 250 ms delay of the
+frames from the leader to its peers, a CPU squeeze of every member, a leader
+kill, a follower kill with a snapshot restore, a rejoin after a log purge, two
+blank members with an offline copy, a node replacement on a new address, a
+quorum loss, a total loss, and the sealer part of a fleet wipe with a seed.
+A test endpoint supplier in each member driver applies the link faults; the
+receiving member drops, loses or holds the frames from the faulted member.
+Each check takes 15 to 55 seconds. A member stops when its test JVM dies, and
+the next group deletes the tmpfs directories of dead test JVMs.
+
+The squeeze check also runs a consumer session with the production cursor
+rules, as the validator reads the stream. Its stream must reach the live head
+with no gap and equal the members' order. `just test-component reconstruct-seed`
+posts two blocks to Anvil, rebuilds the state from the L1 log and the DA proxy,
+and writes the sealer seed of the fleet wipe at the posted head.
+
+Two optional member settings serve these checks. `kardamom.cluster.adminHost`
+binds the admin endpoint to one address, so each member on one host keeps the
+one admin port that its peers ask. `kardamom.cluster.clockClass` names the
+cluster clock class. The two-blank check moves a test clock past the 60 s
+startup canvass, as that wall time would. Both settings are unset in the
+deploy, and the defaults stay the same.
+
 Java targets force test execution and remove their selected old XML reports before
 running. The runner requires fresh reports, preserves them with the logs, names
 every passing/failing test, and rejects skipped or missing expected tests even
@@ -232,7 +266,9 @@ For each remaining case:
    evidence. Keep the original deadlines and workload unless a separate reviewed
    experiment requires a change.
 
-Raft partition/quorum-loss safety needs further real-member fault cases. Sentinel promotion needs
+The member-process Raft checks cover partition, loss, delay, squeeze, kill,
+wipe and quorum-loss cases; kernel queues and whole-node power loss stay in
+the cluster suite. Sentinel promotion needs
 real Redis/Sentinel processes. Checkpoint durability needs real storage and crash
 or syscall faults. Nomad placement, container ownership, advertised addresses and
 kernel network scheduling need integration checks. Mocking those guarantees would
