@@ -236,6 +236,11 @@ with its final slots. The sealer orders first seen first, and each ordered
 transaction returns to every replica as a receipt floor. Every sender must reach the
 canonical log with every nonce once, in order.
 
+`just test-component ingress-sealer-quorum` checks that the ingress halts on a
+lost sealer quorum once no status frame arrives for the silence budget, and that a
+status ends the halt. With the executor test that waits for absent sealers and the
+sealer total-loss test of `sealer-raft-fleet`, it covers executor-sealer-loss-recover.
+
 `just test-component transport-mds-remove` removes MDS receive destinations while two
 streams run, and returns a node to the same control endpoint three times. Every frame
 of the live streams must arrive in order, and the driver must log no error. On the

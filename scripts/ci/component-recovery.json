@@ -267,6 +267,39 @@
       "limitation": "Each node is a real process with real storage, but the canonical stream comes from a controlled sealer log, not Aeron Cluster members, and the receipts go to a file, not Aeron. No Nomad, Consul, Docker node, image rollout or network identity. The DA image comes from the production batch codec and reconstruction, but not from an L1 scan or the DA HTTP store. A process kill keeps the page cache: no power loss.",
       "ci_mode": "in-process"
     },
+    "ingress-sealer-quorum": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-ingress",
+        "--lib",
+        "chain::tests::"
+      ],
+      "real": [
+        "ChainWatch of the ingress: the sealer silence budget and the SealerNoQuorum halt",
+        "the submit root that pauses submits on a sealer halt"
+      ],
+      "controlled": [
+        "the status frames of the cluster session and the clock of each check"
+      ],
+      "tests": [
+        "chain::tests::a_silent_cluster_halts_the_sealer_on_a_lost_quorum_and_a_status_ends_it"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "a silent cluster raises no halt",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "chain::tests::a_silent_cluster_halts_the_sealer_on_a_lost_quorum_and_a_status_ends_it"
+          ]
+        }
+      ],
+      "limitation": "The watch, not a whole ingress process or a real cluster session.",
+      "ci_mode": "in-process"
+    },
     "executor-exec-stream": {
       "command": [
         "cargo",
@@ -2823,7 +2856,7 @@
     {
       "case": "executor-sealer-loss-recover",
       "family": "CombinedExec",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "transport-pressure",
@@ -2832,9 +2865,21 @@
         {
           "suite": "executor-recovery",
           "test": "whole::executors_that_return_before_the_sealers_wait_and_then_catch_up"
+        },
+        {
+          "suite": "sealer-raft-fleet",
+          "test": "io.kardamom.sealer.cluster.ClusterTotalLossRecoverTest::every_member_returns_from_its_own_state_and_the_cluster_commits_again()"
+        },
+        {
+          "suite": "ingress-sealer-quorum",
+          "test": "chain::tests::a_silent_cluster_halts_the_sealer_on_a_lost_quorum_and_a_status_ends_it"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "node kills of the executor and sealer nodes, Nomad job stops and restores, and the allocation counts that show no failed restart",
+        "the ingress pair live check on deployed ingress processes"
+      ]
     },
     {
       "case": "executor-sealer-validator-recover",
@@ -3344,6 +3389,14 @@
         {
           "suite": "state-mirror",
           "test": "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close"
+        },
+        {
+          "suite": "executor-total-wipe-l1",
+          "test": "l1::a_total_wipe_resumes_every_replica_from_an_image_rebuilt_from_l1"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::a_total_wipe_resumes_every_replica_from_a_rebuilt_da_image"
         }
       ],
       "full_case_locally_validated": false
@@ -3542,7 +3595,7 @@
     {
       "case": "node-failure-executor",
       "family": "Executor",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "state-writer-crash",
@@ -3563,28 +3616,36 @@
         {
           "suite": "sealer-raft",
           "test": "io.kardamom.sealer.cluster.SealerClusterFailoverTest::egressContinuesGaplesslyAcrossLeaderKill()"
+        },
+        {
+          "suite": "sealer-raft-members",
+          "test": "io.kardamom.sealer.cluster.ClusterFollowerKillTest::a_killed_follower_restores_its_snapshot_while_the_quorum_commits()"
         }
       ],
-      "full_case_locally_validated": false,
+      "full_case_locally_validated": true,
       "cluster_only_checks": [
-        "docker kill and docker start of the node container: the deployment node, which a process kill stands in for locally",
+        "docker kill and docker start of the node container, and Nomad placement of the executor and the member on it",
         "Nomad restart and allocation count: the orchestrator brings the task back; the local test starts the process itself"
       ]
     },
     {
       "case": "node-replace-executor",
       "family": "Executor",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "executor-recovery",
           "test": "replica::a_blank_replacement_fetches_a_peer_checkpoint_and_catches_up"
+        },
+        {
+          "suite": "sealer-raft-members",
+          "test": "io.kardamom.sealer.cluster.NodeReplaceSealerTest::a_follower_on_a_new_node_seeds_from_a_peer_and_catches_up()"
         }
       ],
-      "full_case_locally_validated": false,
+      "full_case_locally_validated": true,
       "cluster_only_checks": [
         "machine replacement: a new container generation, address plan and substrate play",
-        "Consul forgets the old node record and Nomad places the executor on the new client"
+        "Consul forgets the old node record and Nomad places the executor and the member on the new client"
       ]
     },
     {
