@@ -1,6 +1,8 @@
 //! Wire offers and replay of retained runs, before any new intake.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
+
+use alloy_primitives::Address;
 
 use kardamom_cluster_adapter::wire::{GuardHeader, position_deadline};
 
@@ -59,12 +61,6 @@ impl<'a> OfferReplay<'a> {
         }
     }
 
-    #[cold]
-    pub(super) fn resume(&mut self) {
-        self.admission.resume_loss_window();
-        self.queue("lifecycle resumed");
-    }
-
     /// Replace queued offers with the current unconfirmed runs in nonce
     /// order. Rows can confirm a prefix throughout a pause or reconnect.
     pub(super) fn queue(&mut self, reason: &str) {
@@ -81,5 +77,26 @@ impl<'a> OfferReplay<'a> {
         );
         self.outbox.clear();
         self.outbox.extend(offers);
+    }
+
+    /// Replace the queued offers of `senders` with their current runs in
+    /// nonce order. The offers of other senders keep their place.
+    #[cold]
+    pub(super) fn queue_senders(&mut self, senders: &BTreeSet<Address>) {
+        self.outbox
+            .retain(|offer| !senders.contains(&offer.guard.sender));
+        let admission = &*self.admission;
+        let version = self.version;
+        self.outbox.extend(
+            senders
+                .iter()
+                .flat_map(|sender| admission.unconfirmed_of(*sender))
+                .map(|candidate| candidate.ref_offer(version)),
+        );
+        tracing::debug!(
+            partition = self.partition,
+            senders = senders.len(),
+            "sequencer v2: offering the refused runs again"
+        );
     }
 }

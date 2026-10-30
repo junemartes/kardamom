@@ -1,5 +1,7 @@
 //! Refusals preserve transaction identity and never silently discard a suffix.
 
+use std::collections::BTreeSet;
+
 use alloy_primitives::Address;
 use kardamom_types::TxErrorReason;
 
@@ -93,8 +95,27 @@ impl AdmissionLoop {
 
     /// Coalesce a batch of notices into one replay. Pending forwards that
     /// a terminal refusal removed cannot escape from the verdict queue.
+    /// A notice that names a sender replays and restarts only that
+    /// sender's run. A rollback replays every run.
+    pub(super) fn replay_after_refusals(&mut self, replay: &Replay) {
+        if replay.all || !replay.senders.is_empty() {
+            self.replay_noticed(replay);
+        }
+    }
+
     #[cold]
-    pub(super) fn replay_after_refusals(&mut self) {
+    fn replay_noticed(&mut self, replay: &Replay) {
+        self.drop_removed_forwards();
+        if replay.all {
+            self.resume_unconfirmed("sealer refusal");
+            return;
+        }
+        self.admission.restart_loss_window(&replay.senders);
+        self.canonical.forget(&replay.senders);
+        self.replay().queue_senders(&replay.senders);
+    }
+
+    fn drop_removed_forwards(&mut self) {
         let admission = &self.admission;
         let depth = &mut self.depth;
         self.verdicts.retain(|verdict| {
@@ -109,7 +130,46 @@ impl AdmissionLoop {
             }
             held
         });
-        self.admission.resume_loss_window();
-        self.offer_again_unconfirmed("sealer refusal");
+    }
+}
+
+/// What one account event asks of the replay.
+#[derive(Clone, Copy)]
+pub(super) enum Notice {
+    Nothing,
+    /// The sealer refused an offer of this sender.
+    Sender(Address),
+    /// Every held run can be wrong at the sealer.
+    All,
+}
+
+impl Notice {
+    /// A notice for `sender` when `requested`, else nothing.
+    pub(super) fn named(requested: bool, sender: Address) -> Self {
+        if requested {
+            Self::Sender(sender)
+        } else {
+            Self::Nothing
+        }
+    }
+}
+
+/// The replay of one batch of account events.
+#[derive(Default)]
+pub(super) struct Replay {
+    all: bool,
+    senders: BTreeSet<Address>,
+}
+
+impl Replay {
+    pub(super) fn note(mut self, notice: Notice) -> Self {
+        match notice {
+            Notice::Nothing => {}
+            Notice::Sender(sender) => {
+                self.senders.insert(sender);
+            }
+            Notice::All => self.all = true,
+        }
+        self
     }
 }

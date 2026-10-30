@@ -2,7 +2,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use alloy_primitives::U256;
-use kardamom_cache::{LiveAccountsConfig, LiveAccountsWriter};
+use kardamom_cache::{ExecutorQueryConfig, LiveAccountsConfig, LiveAccountsWriter};
 use kardamom_types::{AccountRow, BPosition};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
@@ -20,12 +20,28 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// A feed whose executor query always fails: no process listens on
+    /// port 1, so each query fails at once.
     fn new() -> Self {
+        let query = ExecutorQuery::new(&ExecutorQueryConfig {
+            endpoints: vec!["http://127.0.0.1:1".to_owned()],
+            ..ExecutorQueryConfig::default()
+        });
+        Self::with_query(query)
+    }
+
+    /// A feed with no source but the local layer: a miss there is a miss
+    /// on every source.
+    fn without_sources() -> Self {
+        Self::with_query(None)
+    }
+
+    fn with_query(query: Option<ExecutorQuery>) -> Self {
         let (live, writer) = LiveAccounts::new(&LiveAccountsConfig::default());
         let (requests, rx) = tokio::sync::mpsc::channel(1);
         let (answers_tx, answers) = crossbeam_channel::unbounded();
         let shutdown = Shutdown::new();
-        let feed = AccountLookupFeed::new(rx, answers_tx, live, None, None, shutdown.clone(), 0);
+        let feed = AccountLookupFeed::new(rx, answers_tx, live, None, query, shutdown.clone(), 0);
         let limit = feed.limit.clone();
         Self {
             requests,
@@ -67,12 +83,16 @@ impl Fixture {
     }
 
     async fn stop(mut self) {
+        self.halt().await;
+        self.release_permits().await;
+    }
+
+    async fn halt(&mut self) {
         self.shutdown.signal();
         tokio::time::timeout(Duration::from_secs(1), &mut self.task)
             .await
             .expect("feed must stop while lookups wait")
             .unwrap();
-        self.release_permits().await;
     }
 
     async fn release_permits(&self) {
@@ -156,17 +176,48 @@ fn shutdown_cancels_failed_lookups() {
 #[test]
 fn shutdown_cancels_a_feed_with_all_lookup_permits_held() {
     Recording::run(|_| async move {
+        let mut fixture = Fixture::new();
+        let held = fixture
+            .limit
+            .clone()
+            .try_acquire_many_owned(u32::try_from(IN_FLIGHT).unwrap())
+            .unwrap();
+        // The second request goes in only after the feed took the first.
+        fixture.requests.send(ADDRESS).await.unwrap();
+        fixture.requests.send(ADDRESS).await.unwrap();
+        fixture.halt().await;
+        assert_eq!(held.num_permits(), IN_FLIGHT);
+    });
+}
+
+#[test]
+fn a_failed_lookup_releases_its_permit_while_it_waits_to_retry() {
+    Recording::run(|recording| async move {
         let fixture = Fixture::new();
-        for _ in 0..=IN_FLIGHT {
-            fixture.requests.send(ADDRESS).await.unwrap();
+        fixture.requests.send(ADDRESS).await.unwrap();
+        recording.failed().await;
+        fixture.release_permits().await;
+        fixture.stop().await;
+    });
+}
+
+#[test]
+fn unknown_accounts_do_not_hold_the_lookup_permits() {
+    Recording::run(|_| async move {
+        let mut fixture = Fixture::without_sources();
+        for byte in 0..=u8::try_from(IN_FLIGHT).unwrap() {
+            fixture
+                .requests
+                .send(Address::repeat_byte(byte))
+                .await
+                .unwrap();
         }
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while fixture.limit.available_permits() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        fixture.release_permits().await;
+        fixture.restore();
+        fixture.requests.send(ADDRESS).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), fixture.answer())
+            .await
+            .expect("a known account must answer after many unknown ones");
         fixture.stop().await;
     });
 }

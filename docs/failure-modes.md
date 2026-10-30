@@ -777,7 +777,7 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
 - **Nonce lookup path**
   - A parked sender needs its committed nonce. The sequencer asks the local layer first (outcome `local`). Then it asks Redis (outcome `redis`). Then it asks the executors.
   - A lookup that misses Redis, or finds Redis degraded, goes to the executors.
-  - Metrics: `kardamom_sequencer_nonce_lookup_requests_total` counts the parks that asked. `kardamom_sequencer_nonce_lookups_total{outcome}` counts the queries by outcome: `ok`, `redis`, `local`, `error`, `timeout`, `shed`. `kardamom_sequencer_nonce_lookups_in_flight` is the gauge of concurrent queries.
+  - Metrics: `kardamom_sequencer_nonce_lookup_requests_total` counts the parks that asked. `kardamom_sequencer_nonce_lookups_total{outcome}` counts the queries by outcome: `ok`, `redis`, `local`, `live`, `miss` (no source holds the account), `error`, `timeout`, `shed`. `kardamom_sequencer_nonce_lookups_in_flight` is the gauge of concurrent queries.
   - A nonce above 0 is floor evidence of the same kind as a receipt.
   - Proof: `lookup-blackout` (`chaos-sequencer` shard). The case blocks receipt DATA stream 1002 and executor nonce-query TCP 9024 on one sequencer node. It also blocks Redis/Sentinel TCP 6379/26379, then hard-kills lane 0 and requires failed lookups with no answered source. The second phase restores query/cache traffic, keeps receipt DATA blocked and kills the replica again; a lookup must answer. Both phases require a received canonical boundary, positive receipt-drop counters and the same replacement process. The rules preserve cluster egress and Aeron control frames from colocated sealers. Both fault chains are cleared after success or failure.
 - **Fee gate**

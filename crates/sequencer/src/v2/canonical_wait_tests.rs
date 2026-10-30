@@ -110,3 +110,17 @@ fn sweep_removes_lost_suffixes_from_an_idle_outbox() {
     assert!(b.l.admission.unconfirmed_at(b.sender(), 1).is_none());
     assert_eq!(b.offers(), [(0, true)]);
 }
+
+#[test]
+fn an_admitted_transaction_reads_only_the_fresh_offers() {
+    let mut b = Bench::new(SealerVersion::starting_at(5));
+    b.l.cfg.sweep_every = Duration::from_secs(3600);
+    (0..32).for_each(|nonce| b.send(nonce));
+    let scans = b.l.canonical.scans;
+    b.send(32);
+    assert_eq!(b.l.canonical.scans, scans);
+    assert_eq!(b.l.outbox.len(), 32);
+    (0..33).for_each(|nonce| b.canonical(nonce));
+    assert!(b.l.outbox.is_empty());
+    assert_eq!(b.offers().len(), 33);
+}

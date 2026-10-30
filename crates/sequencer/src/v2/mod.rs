@@ -55,6 +55,7 @@ mod offers;
 mod publication;
 mod refusals;
 use offers::OfferReplay;
+use refusals::{Notice, Replay};
 mod runner;
 mod verdicts;
 
@@ -335,18 +336,11 @@ impl AdmissionLoop {
             self.session_generation = generation;
             self.offer_again_unconfirmed("sealer session changed");
         }
-        let paused = self.pause.read_with(|paused| {
-            if !paused {
-                self.canonical.reset();
-                OfferReplay::new(
-                    &mut self.admission,
-                    &mut self.outbox,
-                    &self.sealer_version,
-                    self.cfg.partition,
-                )
-                .resume();
-            }
-        });
+        let mut resumed = false;
+        let paused = self.pause.read_with(|paused| resumed = !paused);
+        if resumed {
+            self.resume_unconfirmed("lifecycle resumed");
+        }
         self.sweep_if_due(Instant::now(), paused);
         self.dispatch(side);
         if paused {
@@ -372,15 +366,13 @@ impl AdmissionLoop {
         let events: Vec<AccountEvent> = self.accounts.try_iter().collect();
         let applied = !events.is_empty();
         // Every event applies, including rows after a replay request.
-        let replay = events.into_iter().fold(false, |replay, event| {
+        let replay = events.into_iter().fold(Replay::default(), |replay, event| {
             let from = self.verdicts.len();
-            let requested = self.apply(event);
+            let notice = self.apply(event);
             self.track_forwards(from);
-            requested | replay
+            replay.note(notice)
         });
-        if replay {
-            self.replay_after_refusals();
-        }
+        self.replay_after_refusals(&replay);
         applied
     }
 
@@ -395,8 +387,12 @@ impl AdmissionLoop {
         });
     }
 
-    fn apply(&mut self, event: AccountEvent) -> bool {
-        self.canonical.changed();
+    /// Apply one event. A canonical record changes the outbox only when it
+    /// names an offer of this loop, so the gate checks that itself.
+    fn apply(&mut self, event: AccountEvent) -> Notice {
+        if !matches!(event, AccountEvent::Canonical(_)) {
+            self.canonical.changed();
+        }
         match event {
             AccountEvent::Canonical(hash) => self.canonical.observe(hash, &mut self.admission),
             AccountEvent::Rows { block, rows } => self.apply_rows(block, rows),
@@ -410,14 +406,19 @@ impl AdmissionLoop {
                     .retained_mut()
                     .for_each(|candidate| candidate.payload.canonical = false);
                 self.admission.on_rollback();
-                return true;
+                return Notice::All;
             }
             AccountEvent::Refused(refused) => {
-                return self.on_reference_refused(*refused);
+                let sender = refused.sender;
+                return Notice::named(self.on_reference_refused(*refused), sender);
             }
-            AccountEvent::Refusal(refusal) => return self.on_sealer_refusal(*refusal),
+            AccountEvent::Refusal(refusal) => {
+                let sender = refusal.sender;
+                return Notice::named(self.on_sealer_refusal(*refusal), sender);
+            }
             AccountEvent::Retry { sender, nonce } => {
-                return self.admission.unconfirmed_at(sender, nonce).is_some();
+                let held = self.admission.unconfirmed_at(sender, nonce).is_some();
+                return Notice::named(held, sender);
             }
             AccountEvent::Rejected {
                 sender,
@@ -425,7 +426,7 @@ impl AdmissionLoop {
                 expected,
             } => self.offer_rejected(sender, nonce, expected),
         }
-        false
+        Notice::Nothing
     }
 
     fn apply_rows(&mut self, block: u64, rows: Vec<(Address, AccountState)>) {
@@ -456,13 +457,24 @@ impl AdmissionLoop {
 
     fn offer_again_unconfirmed(&mut self, reason: &str) {
         self.canonical.reset();
+        self.replay().queue(reason);
+    }
+
+    /// Empty blocks while the sealer refused offers do not prove a loss:
+    /// every held run gets a new loss window and goes out again.
+    #[cold]
+    fn resume_unconfirmed(&mut self, reason: &str) {
+        self.admission.resume_loss_window();
+        self.offer_again_unconfirmed(reason);
+    }
+
+    fn replay(&mut self) -> OfferReplay<'_> {
         OfferReplay::new(
             &mut self.admission,
             &mut self.outbox,
             &self.sealer_version,
             self.cfg.partition,
         )
-        .queue(reason);
     }
 
     fn sweep_if_due(&mut self, now: Instant, paused: bool) {
@@ -534,7 +546,6 @@ impl AdmissionLoop {
         };
         self.depth.took(vslot);
         let started = Instant::now();
-        self.canonical.changed();
         self.admission.offer(candidate, &mut self.verdicts);
         self.hot
             .nonce_check_seconds
@@ -578,6 +589,7 @@ impl AdmissionLoop {
                     self.to_ingress.accept(ack);
                 }
                 self.outbox.push_back(c.ref_offer(&self.sealer_version));
+                self.canonical.appended();
             }
             Verdict::Reject(mut c, refusal) => {
                 self.depth.gave(c.payload.vslot);
