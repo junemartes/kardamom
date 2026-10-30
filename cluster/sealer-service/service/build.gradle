@@ -97,6 +97,36 @@ tasks.named('check') {
     dependsOn allocationGate
 }
 
+// The component recovery runner (scripts/ci/component_tests.py) runs one
+// JUnit method per JVM without Gradle. This task copies the compiled test
+// runtime, the JUnit console launcher and the JVM arguments of the test task
+// into one directory. A CI shard runs the tests from that directory and
+// compiles nothing.
+configurations {
+    componentLauncher
+}
+
+dependencies {
+    componentLauncher 'org.junit.platform:junit-platform-console:1.10.2'
+}
+
+tasks.register('componentTestRuntime', Sync) {
+    description = 'Copies the test runtime for the component recovery runner.'
+    group = 'verification'
+    def testTask = tasks.named('test', Test)
+    def jvmArgsFile = layout.buildDirectory.file('component-runtime/jvm-args.txt')
+    into layout.buildDirectory.dir('component-runtime')
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    preserve { include 'jvm-args.txt' }
+    from(sourceSets.main.output) { into 'main' }
+    from(sourceSets.test.output) { into 'test' }
+    from(configurations.testRuntimeClasspath) { into 'lib' }
+    from(configurations.componentLauncher) { into 'lib' }
+    doLast {
+        jvmArgsFile.get().asFile.text = testTask.get().allJvmArgs.join('\n') + '\n'
+    }
+}
+
 // The load bench (`just sealer-bench`): real sealer members from the jar,
 // racing twin publishers and a consumer in this JVM. It never runs in CI.
 sourceSets {

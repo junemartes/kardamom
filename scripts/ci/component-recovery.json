@@ -531,6 +531,8 @@
         "--locked",
         "-p",
         "kardamom-state-mirror",
+        "--bin",
+        "kardamom-state-mirror",
         "--features",
         "docker-e2e",
         "component_tests::recovery::",
@@ -579,6 +581,8 @@
         "test",
         "--locked",
         "-p",
+        "kardamom-state-mirror",
+        "--bin",
         "kardamom-state-mirror",
         "--features",
         "docker-e2e",
@@ -864,7 +868,8 @@
           ],
           "compiled": true
         }
-      ]
+      ],
+      "ci_mode": "in-process"
     },
     "state-aux-enospc": {
       "command": [
@@ -1004,7 +1009,8 @@
           ]
         }
       ],
-      "limitation": "Harness recovery evidence only. Does not run a sealer, Nomad cluster or reproduce election consensus. A readable closed majority is still required; persistent missing logs fail at the complete deadline."
+      "limitation": "Harness recovery evidence only. Does not run a sealer, Nomad cluster or reproduce election consensus. A readable closed majority is still required; persistent missing logs fail at the complete deadline.",
+      "ci_mode": "in-process"
     },
     "checkpoint-fault": {
       "command": [
@@ -1093,7 +1099,8 @@
           ],
           "compiled": true
         }
-      ]
+      ],
+      "ci_mode": "in-process"
     },
     "transport-pressure": {
       "command": [
@@ -1162,7 +1169,8 @@
         "a_receipted_transfer_waits_for_the_lagging_executor_before_comparing_redis",
         "an_executor_baseline_requires_full_state_agreement_and_the_receipted_nonce"
       ],
-      "limitation": "Checks exact account predicates and the executor baseline; distributed recovery remains required."
+      "limitation": "Checks exact account predicates and the executor baseline; distributed recovery remains required.",
+      "ci_mode": "in-process"
     },
     "chaos-projection": {
       "command": [
@@ -1200,7 +1208,8 @@
             "persistent_read_failure_preserves_its_cause_at_the_original_deadline"
           ]
         }
-      ]
+      ],
+      "ci_mode": "in-process"
     },
     "batcher-null-receipts": {
       "command": [
@@ -1390,7 +1399,8 @@
           "intended_failure": true,
           "log": "/tmp/backlog-non_atomic_snapshot-negative-20261028.log"
         }
-      ]
+      ],
+      "ci_mode": "in-process"
     },
     "chaos-archive-stage": {
       "command": [
@@ -1426,7 +1436,8 @@
           "compiled": true,
           "intended_failure": true
         }
-      ]
+      ],
+      "ci_mode": "in-process"
     },
     "archive-recovery": {
       "command": [
@@ -1501,7 +1512,8 @@
           "failed_tests": 6,
           "exit_code": 101
         }
-      ]
+      ],
+      "ci_mode": "in-process"
     },
     "discovery-registration": {
       "command": [
@@ -1533,7 +1545,8 @@
         "a_missing_registration_endpoint_remains_permanent",
         "a_missing_member_query_endpoint_remains_permanent"
       ],
-      "limitation": "The agent is controlled; real Consul check loss is covered separately. Distributed validator catch-up and control-plane recovery remain required."
+      "limitation": "The agent is controlled; real Consul check loss is covered separately. Distributed validator catch-up and control-plane recovery remain required.",
+      "ci_mode": "in-process"
     },
     "discovery-check-loss": {
       "command": [
@@ -1561,7 +1574,178 @@
       "tests": [
         "a_check_removed_after_registration_is_recoverable"
       ],
-      "limitation": "One isolated Consul agent; this does not qualify fleet rescheduling, validator catch-up or the cause of a distributed catalog deletion."
+      "limitation": "One isolated Consul agent; this does not qualify fleet rescheduling, validator catch-up or the cause of a distributed catalog deletion.",
+      "ci_mode": "docker"
+    },
+    "pipeline-recovery": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "e2e",
+        "--features",
+        "full-pipeline-e2e",
+        "--test",
+        "pipeline_recovery",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "kardamom-ingress pair, kardamom-sequencer per lane, kardamom-executor and kardamom-validator processes",
+        "Java sealer cluster members (three for the cases that take the sealer down)",
+        "host-native ArchivingMediaDriver and archive with tx_data recording and refetch",
+        "Anvil, the L1 follower and the da-watcher for the epoch checks",
+        "SIGTERM drain and SIGKILL of the service processes, and their start on persisted state"
+      ],
+      "controlled": [
+        "a case load of 1-wei transfers through ingress 0, with resubmits and receipt reads on every ingress",
+        "a recovery probe of the case sender and a fresh sender",
+        "process stops and starts in the order of each chaos case; two replicas of the case lane for the lane loss"
+      ],
+      "tests": [
+        "graceful_ingress_drains_returns_and_loses_no_transfer",
+        "hard_ingress_returns_and_loses_no_transfer",
+        "hard_twin_ingress_returns_and_serves_receipts_it_never_saw",
+        "ingress_pair_loss_returns_both_replicas",
+        "graceful_sequencer_drains_and_a_cold_start_regains_its_senders",
+        "sequencer_lane_loss_relearns_the_sender_floor",
+        "pipeline_blackout_restarts_every_process_and_reelects"
+      ],
+      "limitation": "Stack suite, not isolated: it needs more than one real service. All services share one host and one media driver. No Redis or state mirror runs. Nomad placement, node power loss and container identity stay with the cluster suite. Needs the service binaries, the sealer jar and the aeron-all jar.",
+      "negative_controls": [
+        {
+          "mutation": "The ingress receipt query skips its egress and executor layers, so a restarted ingress serves no receipt from state.",
+          "tests": [
+            "graceful_ingress_drains_returns_and_loses_no_transfer",
+            "hard_ingress_returns_and_loses_no_transfer",
+            "ingress_pair_loss_returns_both_replicas"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        },
+        {
+          "mutation": "The sequencer nonce lookup sends no query, so a cold replica never learns the floor of an established sender.",
+          "tests": [
+            "sequencer_lane_loss_relearns_the_sender_floor"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        },
+        {
+          "mutation": "The consumer join-miss refetch from the archive is off, so a restarted executor cannot execute replayed records.",
+          "tests": [
+            "pipeline_blackout_restarts_every_process_and_reelects"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        }
+      ],
+      "ci_mode": "stack"
+    },
+    "pipeline-combined": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "e2e",
+        "--features",
+        "full-pipeline-e2e",
+        "--test",
+        "pipeline_combined",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "kardamom-ingress pair, kardamom-sequencer per lane, kardamom-executor and kardamom-validator processes",
+        "Java sealer cluster members (three for the cases that take the sealer down)",
+        "host-native ArchivingMediaDriver and archive with tx_data recording and refetch",
+        "Anvil, the L1 follower and the da-watcher for the epoch checks",
+        "SIGTERM drain and SIGKILL of the service processes, and their start on persisted state"
+      ],
+      "controlled": [
+        "a case load of 1-wei transfers through ingress 0, with resubmits and receipt reads on every ingress",
+        "a recovery probe of the case sender and a fresh sender",
+        "class stops and returns in the order of each case, with an eight-second stagger"
+      ],
+      "tests": [
+        "ingress_and_sequencer_loss_return_in_order",
+        "ingress_returns_before_the_sealer_and_waits",
+        "sequencer_and_sealer_loss_stall_then_return_together",
+        "ingress_sequencer_and_sealer_return_in_order",
+        "ingress_sequencer_and_sealer_return_in_reverse_and_wait"
+      ],
+      "limitation": "Stack suite, not isolated: the subject is the interplay of the ingress, sequencer and sealer classes. The stagger and hold are shorter than the deployed ones. Nomad job restore stays with the cluster suite. Needs the service binaries, the sealer jar, the aeron-all jar and Anvil.",
+      "negative_controls": [
+        {
+          "mutation": "The sequencer nonce lookup sends no query, so a cold replica never learns the floor of an established sender.",
+          "tests": [
+            "ingress_and_sequencer_loss_return_in_order"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        },
+        {
+          "mutation": "The cluster client never forces a new session after egress silence, so a client of a lost sealer never reconnects.",
+          "tests": [
+            "ingress_returns_before_the_sealer_and_waits",
+            "sequencer_and_sealer_loss_stall_then_return_together",
+            "ingress_sequencer_and_sealer_return_in_order",
+            "ingress_sequencer_and_sealer_return_in_reverse_and_wait"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        }
+      ],
+      "ci_mode": "stack"
+    },
+    "control-plane-loss": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-log",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "control_plane_loss",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "real": [
+        "ConsulClient, Registration heartbeat, catalog watch and StreamPlane",
+        "Aeron media driver in Docker with a discovered MDC tx_data stream"
+      ],
+      "controlled": [
+        "a Consul-like agent with TTL checks, critical deregistration, blocking health queries and a partition switch",
+        "check TTL 2 s, deregistration after 5 s, partition 9 s, in the deployed order"
+      ],
+      "tests": [
+        "workers_keep_their_data_path_through_a_metadata_partition_and_reregister"
+      ],
+      "limitation": "Isolated suite: the discovery adapter against a controlled agent. The data path is one tx_data stream, not the full client pipeline. Consul DNS, the Nomad API and Nomad placement stay with the cluster suite.",
+      "negative_controls": [
+        {
+          "mutation": "A failed check pass does not repeat the registration.",
+          "tests": [
+            "workers_keep_their_data_path_through_a_metadata_partition_and_reregister"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        }
+      ],
+      "ci_mode": "docker"
     }
   },
   "families": {
@@ -1715,22 +1899,47 @@
     {
       "case": "graceful-ingress",
       "family": "Ingress",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "pipeline-recovery",
+          "test": "graceful_ingress_drains_returns_and_loses_no_transfer"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts or replaces the stopped task: the local stack starts the process itself, and placement needs the scheduler"
+      ]
     },
     {
       "case": "hard-ingress",
       "family": "Ingress",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "pipeline-recovery",
+          "test": "hard_ingress_returns_and_loses_no_transfer"
+        },
+        {
+          "suite": "pipeline-recovery",
+          "test": "hard_twin_ingress_returns_and_serves_receipts_it_never_saw"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts or replaces the stopped task: the local stack starts the process itself, and placement needs the scheduler"
+      ]
     },
     {
       "case": "archive-driver-loss",
       "family": "Ingress",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "pipeline-recovery",
+          "test": "pipeline_blackout_restarts_every_process_and_reelects"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -2008,49 +2217,98 @@
     {
       "case": "ingress-pair-loss-recover",
       "family": "Coordinated",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "pipeline-recovery",
+          "test": "ingress_pair_loss_returns_both_replicas"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts or replaces the stopped task: the local stack starts the process itself, and placement needs the scheduler"
+      ]
     },
     {
       "case": "sequencer-lane-loss-recover",
       "family": "Coordinated",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "pipeline-recovery",
+          "test": "sequencer_lane_loss_relearns_the_sender_floor"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts or replaces the stopped task: the local stack starts the process itself, and placement needs the scheduler"
+      ]
     },
     {
       "case": "control-plane-loss-recover",
       "family": "Coordinated",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "control-plane-loss",
+          "test": "workers_keep_their_data_path_through_a_metadata_partition_and_reregister"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the data nodes lose the Nomad API and RPC and Consul DNS: these are cluster services",
+        "Nomad keeps the workers placed and returns them to their counts: placement needs the scheduler"
+      ]
     },
     {
       "case": "pipeline-blackout-recover",
       "family": "Coordinated",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "pipeline-recovery",
+          "test": "pipeline_blackout_restarts_every_process_and_reelects"
+        }
+      ],
+      "full_case_locally_validated": false,
+      "cluster_only_checks": [
+        "docker kill and start of every pipeline node container and the job counts after it: node power loss needs the cluster nodes"
+      ]
     },
     {
       "case": "ingress-sequencer-loss-recover",
       "family": "CombinedOrdering",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "pipeline-combined",
+          "test": "ingress_and_sequencer_loss_return_in_order"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restores the stopped jobs and docker starts the sealer nodes: the local stack starts the processes itself"
+      ]
     },
     {
       "case": "ingress-sealer-loss-recover",
       "family": "CombinedOrdering",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "pipeline-combined",
+          "test": "ingress_returns_before_the_sealer_and_waits"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restores the stopped jobs and docker starts the sealer nodes: the local stack starts the processes itself"
+      ]
     },
     {
       "case": "sequencer-sealer-loss-recover",
       "family": "CombinedOrdering",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "sequencer",
@@ -2071,23 +2329,46 @@
         {
           "suite": "chaos-election",
           "test": "readable_logs_without_a_closed_majority_do_not_certify_recovery"
+        },
+        {
+          "suite": "pipeline-combined",
+          "test": "sequencer_and_sealer_loss_stall_then_return_together"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restores the stopped jobs and docker starts the sealer nodes: the local stack starts the processes itself"
+      ]
     },
     {
       "case": "ingress-sequencer-sealer-loss-recover",
       "family": "CombinedOrdering",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "pipeline-combined",
+          "test": "ingress_sequencer_and_sealer_return_in_order"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restores the stopped jobs and docker starts the sealer nodes: the local stack starts the processes itself"
+      ]
     },
     {
       "case": "ingress-sequencer-sealer-reverse",
       "family": "CombinedOrdering",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "pipeline-combined",
+          "test": "ingress_sequencer_and_sealer_return_in_reverse_and_wait"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restores the stopped jobs and docker starts the sealer nodes: the local stack starts the processes itself"
+      ]
     },
     {
       "case": "executor-sealer-loss-recover",
