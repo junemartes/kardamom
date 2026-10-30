@@ -811,8 +811,8 @@ Each process has one Aeron thread. It carries the publishes and the subscription
   - A connection error replaces the connection at once.
   - A command timeout alone does not. The connection is replaced only after it gives no reply for three command
     timeouts. Until then, the reads continue on the same connection.
-  - The readers skip the cache while a replacement runs. Each Sentinel DNS lookup and each connection attempt ends
-    after the connection bound: ten command timeouts.
+  - The readers skip the cache while a replacement runs. Each connection attempt ends after the connection bound:
+    ten command timeouts. Through the Sentinels, that bound covers the name lookups and the questions together.
 - `kardamom_cache_live_evictions_total` counts the entries that the `live` layer removes, for the TTL or the capacity.
   A high rate with many `live` misses means that the layer is too small for the active accounts.
 
