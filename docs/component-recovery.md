@@ -266,6 +266,54 @@ hanging read cannot extend the 60-second total budget. Failure evidence reports
 the last completed observation and the longest observed active span. These checks
 do not run Prometheus or establish alert behavior under runner contention.
 
+`just test-component l1-follower-quorum` runs the production L1 follower
+(`Follower::run`) over the production source set (`L1Endpoints::connect`,
+`RpcL1Source` over HTTP). Two independent fault proxies stand in front of one
+controlled JSON-RPC L1, which serves real `BatchPosted` and `DepositInitiated`
+logs. The real da-watcher reads the follower's records in the production wire
+codec. A production `Beacon` publishes the follower's lifecycle to the board of
+the da-watcher and of the batcher's `FollowerWatch`. The four checks cover:
+
+- A down, rate-limited or unresponsive provider halts the follower on
+  `l1_unreachable`. The paused clock crosses the unchanged 30-second read
+  deadline and the 30-second backoff. The refused proxy serves no request
+  until the backoff ends.
+- A wrong hash, a broken parent chain, swallowed settlement logs, and null
+  receipts with swallowed logs each halt the follower on
+  `l1_source_disagreement`. No record past the blocks that L1 held before the
+  lie reaches the stream.
+- In each case, the da-watcher and the batcher pause with the follower as their
+  root, and all of them resume by themselves. Every record on the stream is the
+  chain's record, each epoch is published once, and the archive holds every
+  batch with its payload.
+- A lie that lasts two days of the paused clock holds the follower through
+  a redeploy of the follower and the da-watcher. The da-watcher's cursor file
+  holds the last published block. The follower runs on its production
+  12-second slot, and each jump of the clock waits until the woken tick ends,
+  so no jump lands inside a read. The chain grows by 2,400 blocks, not the
+  14,400 of two real days: the full backlog takes over a minute to catch up
+  in a debug build.
+
+`just test-component l1-follower-instances` runs the two follower instances
+as child processes of the test binary, each over its own two providers. The
+children send their records and lifecycle events to the parent in the
+production codec. SIGSTOP of one instance for 20 seconds, past the board's
+expiry, must not pause the da-watcher. SIGKILL of both instances past the
+silence window must pause it on the stream, and the restarted processes must
+resume it from their archives with each epoch once. An instance that reads
+a fork must halt the da-watcher on `l1_follower_disagreement`. The runbook
+then heals it: the fault ends, the liar's archive is wiped, the liar
+restarts and the operator clears the halt. The da-watcher's silence window
+is three seconds here; the chaos shard uses 30.
+
+`just test-component alert-rules-l1` runs `promtool test rules` on
+`deploy/alerts_tests/l1.yml` in the Prometheus image of the monitoring job.
+The stale-post alert must fire after its 10-minute hold on a growing post age
+and resolve when the posts show again. The follower and da-watcher halts must
+page with their causes. The batcher suite adds two Anvil checks: a restarted
+batcher posts and confirms through each lie of its endpoint, and a refusing
+endpoint fail-stops a post that a restart then posts once.
+
 `just test-component transport-pressure` runs eight real Aeron runtimes against
 one disposable media driver. Independent output streams lack subscribers while a
 live stream from a separate publisher runtime must deliver every 1-KiB frame. The output offers must remain pending

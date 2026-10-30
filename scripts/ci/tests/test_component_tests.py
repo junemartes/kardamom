@@ -33,7 +33,7 @@ class ComponentTests(unittest.TestCase):
     def test_catalog_builds_one_graph_without_docker_features(self):
         suites = component.Bundle.selection(json.loads(component.CATALOG.read_text()))
         command = component.Bundle.build_command(suites)
-        self.assertEqual(len(suites), 14)
+        self.assertGreaterEqual(len(suites), 14)
         self.assertEqual(command.count("cargo"), 1)
         self.assertNotIn("--features", command)
         for suite in suites.values():

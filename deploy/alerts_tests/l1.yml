@@ -1,0 +1,127 @@
+# promtool unit tests for the L1 rules of deploy/alerts.yml. Run them with:
+#   promtool test rules deploy/alerts_tests/l1.yml
+#
+# The series are the gauges and counters the batcher, the L1 follower and
+# the da-watcher export under the faults of the L1 chaos cases.
+rule_files:
+  - ../alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Swallowed settlement logs: the follower certifies no newer post, so
+  # the batcher's post age grows by one minute each minute. The idle
+  # flush wait is 30 s, so the condition holds from minute 2, and the
+  # alert fires after its 10-minute hold.
+  - interval: 1m
+    input_series:
+      - series: 'kardamom_batcher_last_post_age_seconds{host_id="aux-0"}'
+        values: '0+60x20 0 30 0'
+      - series: 'kardamom_batcher_idle_flush_seconds{host_id="aux-0"}'
+        values: '30x23'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: KardamomBatcherLastPostStale
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: KardamomBatcherLastPostStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              host_id: aux-0
+            exp_annotations:
+              summary: "no batch posted to L1 for 720s (aux-0)"
+              description: "The last BatchPosted log L1 serves is 720s old, past twice the batcher's idle flush wait. The batcher is not posting, or its L1 endpoint hides its posts. Check the batcher log and compare a second L1 endpoint."
+      # The lie ends and the follower certifies the new posts: the age
+      # falls under the bound and the alert resolves at once.
+      - eval_time: 21m
+        alertname: KardamomBatcherLastPostStale
+        exp_alerts: []
+
+  # A lying source: the follower halts on the disagreement at once and
+  # counts it; the halt ends when the sources agree again.
+  - interval: 1m
+    input_series:
+      - series: 'kardamom_halt{service="l1-indexer",host_id="aux-0",instance="aux-0:9549",cause="l1_source_disagreement",recovery="l1_source_disagreement"}'
+        values: '0 1 1 0'
+      - series: 'kardamom_l1_source_disagreement_total{host_id="aux-0"}'
+        values: '0 3 6 6'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: KardamomHaltL1SourceDisagreement
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: KardamomHaltL1SourceDisagreement
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              cause: l1_source_disagreement
+              service: l1-indexer
+              host_id: aux-0
+              instance: aux-0:9549
+              recovery: l1_source_disagreement
+            exp_annotations:
+              summary: "l1-indexer halted: l1_source_disagreement (aux-0)"
+              description: "Two L1 sources answered differently for one block or one log query, and no light client settled it. One source lies; the follower retries every tick and resumes when two sources agree. Detail: http://aux-0:9549/halt. Runbook: docs/runbooks/l1_source_disagreement.md (recovery id l1_source_disagreement)."
+              runbook: "docs/runbooks/l1_source_disagreement.md"
+      - eval_time: 3m
+        alertname: KardamomHaltL1SourceDisagreement
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: KardamomL1SourceDisagreement
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              host_id: aux-0
+            exp_annotations:
+              summary: "L1 sources disagree (aux-0)"
+              description: "A follower saw two L1 endpoints disagree in the last 10m and halted. Both answers are in its log. Decide which endpoint lies before the follower resumes."
+
+  # Refusing providers: the follower halts on l1_unreachable.
+  - interval: 1m
+    input_series:
+      - series: 'kardamom_halt{service="l1-indexer",host_id="aux-0",instance="aux-0:9549",cause="l1_unreachable",recovery="l1_unreachable"}'
+        values: '1 1 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: KardamomHaltL1Unreachable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              cause: l1_unreachable
+              service: l1-indexer
+              host_id: aux-0
+              instance: aux-0:9549
+              recovery: l1_unreachable
+            exp_annotations:
+              summary: "l1-indexer halted: l1_unreachable (aux-0)"
+              description: "No L1 source answers. The service retries on a backoff and resumes when a source answers. While the batcher cannot post, the DA-lag guard halts new transactions before the chain loses its recoverable range. Detail: http://aux-0:9549/halt. Runbook: docs/runbooks/l1_unreachable.md (recovery id l1_unreachable)."
+              runbook: "docs/runbooks/l1_unreachable.md"
+      - eval_time: 2m
+        alertname: KardamomHaltL1Unreachable
+        exp_alerts: []
+
+  # Two follower instances publish two hashes of one block: the
+  # da-watcher halts until an operator clears it.
+  - interval: 1m
+    input_series:
+      - series: 'kardamom_halt{service="da-watcher",host_id="aux-0",instance="aux-0:9550",cause="l1_follower_disagreement",recovery="l1_follower_disagreement"}'
+        values: '0 1 1 1 0'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: KardamomHaltL1FollowerDisagreement
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              cause: l1_follower_disagreement
+              service: da-watcher
+              host_id: aux-0
+              instance: aux-0:9550
+              recovery: l1_follower_disagreement
+            exp_annotations:
+              summary: "da-watcher halted: l1_follower_disagreement (aux-0)"
+              description: "Two records of one L1 block number with different hashes arrived on l1_blocks: one follower instance read a lie its two-source check did not catch. The consumer takes nothing more from the stream until an operator clears the halt. Detail: http://aux-0:9550/halt. Runbook: docs/runbooks/l1_follower_disagreement.md (recovery id l1_follower_disagreement)."
+              runbook: "docs/runbooks/l1_follower_disagreement.md"
+      - eval_time: 4m
+        alertname: KardamomHaltL1FollowerDisagreement
+        exp_alerts: []
