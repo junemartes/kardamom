@@ -81,11 +81,12 @@ class ComponentTests(unittest.TestCase):
         self.assertEqual(execute.call_args.args[2], 120)
 
     def test_the_plan_spreads_the_longest_tests_first(self):
-        catalog = {"local_suites": {"slow": {"ci_mode": "docker", "tests": ["a", "b", "c", "d"]},
+        slow = [f"s{i}" for i in range(component.SHARDS)]
+        catalog = {"local_suites": {"slow": {"ci_mode": "docker", "tests": slow},
                                     "fast": {"ci_mode": "in-process", "tests": [f"t{i}" for i in range(8)]}}}
-        timings = {"slow::a": 50.0, "slow::b": 40.0, "slow::c": 30.0, "slow::d": 20.0}
+        timings = {f"slow::{test}": 50.0 - 10.0 * index for index, test in enumerate(slow)}
         shards = component.Plan(catalog, timings).shards()
-        self.assertEqual([sum(test["suite"] == "slow" for test in shard) for shard in shards], [1, 1, 1, 1])
+        self.assertEqual([sum(test["suite"] == "slow" for test in shard) for shard in shards], [1] * component.SHARDS)
         loads = [sum(map(component.Plan(catalog, timings).estimate, shard)) for shard in shards]
         self.assertLessEqual(max(loads) - min(loads), 50.0)
 
