@@ -36,3 +36,4 @@
 
 - name: Mirror the deploy record
   ansible.builtin.import_tasks: record_mirror.yml
+  when: workloads_record_mirror | default(true) | bool
