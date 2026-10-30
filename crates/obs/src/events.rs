@@ -51,8 +51,7 @@ const FORGET: Duration = Duration::from_mins(5);
 /// cannot tell them apart. When both publish one key, every record of the
 /// slower `seq` counter looks like a restart. In the deployment each node
 /// has its own driver; on a shared driver the detection is wrong. One log
-/// per window bounds the log; an exclusive publication is the fix (issue
-/// #991).
+/// per window bounds the log; an exclusive publication is the fix.
 const RESTART_LOG_EVERY: Duration = EXPIRY;
 
 /// How often the board feed refreshes its view when no record arrives,
