@@ -26,11 +26,11 @@ use kardamom_engine::actor::fixtures::{
 use kardamom_engine::reader::carried::{CarriedSubscription, EgressTransport, NoSource};
 use kardamom_engine::reader::cluster::ReplayCursor;
 use kardamom_engine::{
-    BlockBoundary, BlockBoundaryStart, BlockDelta, BPosition, CMessage, EngineWiring, ExecPorts,
+    BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, CMessage, EngineWiring, ExecPorts,
     Executor, ExecutorConfig, ExecutorError, Inbound, MockStateDatabase, MutatingSnapshotSource,
     NoBlockExec, NoEpochCheck, NoExecStream, NoRemoteEpochCheck, Outbound, Receipt, ResumePoint,
-    RoleHooks, StateDatabase, StateWriterQueue, TxReceiptsPublication, TxRef,
-    VerifyRecordIdentity, WriterApplyingQueue,
+    RoleHooks, StateDatabase, StateWriterQueue, TxReceiptsPublication, TxRef, VerifyRecordIdentity,
+    WriterApplyingQueue,
 };
 use kardamom_validator::{BalBuffer, Divergence, ReceiptBuffer, ReplicaId, ValidatorWriterQueue};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -268,7 +268,10 @@ fn verified() -> u64 {
 
 /// The write-sets and the receipts that the executor published for the
 /// whole chain.
-fn executor_outputs(chain: &Chain, rt: &tokio::runtime::Runtime) -> (MockStateDatabase, Receiver<BlockDelta>, Receiver<Receipt>) {
+fn executor_outputs(
+    chain: &Chain,
+    rt: &tokio::runtime::Runtime,
+) -> (MockStateDatabase, Receiver<BlockDelta>, Receiver<Receipt>) {
     let dir = tempfile::tempdir().unwrap();
     let egress = TestEgress::serve(rt, dir.path(), TestEgress::GENESIS, &chain.through(BLOCKS));
     let run = Run {
@@ -394,7 +397,10 @@ fn wait_for_floor(egress: &TestEgress, window: u64) -> u64 {
     let deadline = Instant::now() + Duration::from_secs(10);
     let floor = std::iter::repeat_with(|| {
         std::thread::sleep(Duration::from_millis(10));
-        egress.floor().map(|f| f.next_block).filter(|block| *block > 1)
+        egress
+            .floor()
+            .map(|f| f.next_block)
+            .filter(|block| *block > 1)
     })
     .take_while(|_| Instant::now() < deadline)
     .find_map(|floor| floor)

@@ -297,6 +297,278 @@
       "limitation": "Validates exact peer history and resumed live input plus unreachable-peer fallback; does not establish crash durability or all-peer divergence handling.",
       "ci_mode": "in-process"
     },
+    "executor-retention": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-engine",
+        "--lib",
+        "reader::carried::tests_retention::"
+      ],
+      "real": [
+        "executor pipeline: reader, exec and commit threads with REVM",
+        "CarriedSubscription feed-to-egress switch",
+        "real egress Owner, Store and HTTP range reads"
+      ],
+      "controlled": [
+        "member feed in the production feed answer codec, with its window above the cursor",
+        "resume from the committed cursor and state after the stop",
+        "in-memory state database"
+      ],
+      "tests": [
+        "a_cursor_below_the_window_of_the_member_resumes_from_the_egress_with_exact_output"
+      ],
+      "limitation": "The stop is a resume of the pipeline from its committed cursor. It does not freeze a container, evict an Aeron client or restart a Nomad task. The state database is the in-memory one.",
+      "negative_controls": [
+        {
+          "mutation": "a member refusal ends the run with the peer-checkpoint error instead of a switch to the egress",
+          "test": "a_cursor_below_the_window_of_the_member_resumes_from_the_egress_with_exact_output",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "validator-retention": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-validator",
+        "--test",
+        "retention_overrun"
+      ],
+      "real": [
+        "validator pipeline with ValidatorWriterQueue and ValidatorReceiptSink",
+        "egress reader of the validator",
+        "real egress Owner, Store, prune and HTTP range reads"
+      ],
+      "controlled": [
+        "executor write-sets and receipts from a run of the same pipeline",
+        "posted head past the validator cursor",
+        "32-block reader window in 4-block segments"
+      ],
+      "tests": [
+        "a_validator_held_past_the_posted_head_resumes_inside_the_window_and_verifies_every_block"
+      ],
+      "limitation": "The stop is a resume from the verified cursor. The executor outputs go straight into the buffers, not over Aeron. The state database is the in-memory one.",
+      "negative_controls": [
+        {
+          "mutation": "the egress prune ignores the reader window and keeps only the blocks above the posted head",
+          "test": "a_validator_held_past_the_posted_head_resumes_inside_the_window_and_verifies_every_block",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "batcher-prune-floor": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-batcher",
+        "--lib",
+        "live::run::prune_floor_tests::",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "real": [
+        "batcher startup, FeedLoop, LiveSender, Spool and durable cursor",
+        "engine reader of the egress",
+        "three egress copies with real Owner, Store, prune and HTTP",
+        "Anvil and the deployed settlement contract",
+        "payload packing and reconstruction"
+      ],
+      "controlled": [
+        "8-block reader window in 4-block segments",
+        "posted head of each copy set by the test",
+        "feed cancellation after the durable cursor moves",
+        "file-backed local DA store"
+      ],
+      "tests": [
+        "unposted_blocks_past_the_reader_window_stay_on_every_copy_and_post_contiguously"
+      ],
+      "limitation": "Needs Anvil and the compiled settlement contract. The egress copies take their posted head from the test, not from an L1 watcher. Does not freeze a container or change a Nomad job.",
+      "negative_controls": [
+        {
+          "mutation": "the egress prune ignores the posted head and keeps only the reader window",
+          "test": "unposted_blocks_past_the_reader_window_stay_on_every_copy_and_post_contiguously",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      ],
+      "ci_mode": "docker"
+    },
+    "sealer-da-lag": {
+      "command": [
+        "cluster/sealer-service/gradlew",
+        "-p",
+        "cluster/sealer-service",
+        ":service:test",
+        "--no-daemon",
+        "--rerun-tasks",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerDaLagClusterTest"
+      ],
+      "junit_reports": [
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerDaLagClusterTest.xml"
+      ],
+      "tests": [
+        "io.kardamom.sealer.cluster.SealerDaLagClusterTest::a_stalled_batcher_halts_new_transactions_across_a_leader_kill_and_its_cursor_resumes_them()"
+      ],
+      "real": [
+        "SealerClusteredService and CanonicalSealerState DA-lag guard",
+        "three Aeron consensus members, media drivers, archives and real cluster client"
+      ],
+      "controlled": [
+        "4-block DA-lag budget and 100-ms boundary ticks",
+        "leader stop",
+        "posted-cursor and record frames in the pinned wire layout"
+      ],
+      "limitation": "The Java client sends the frames that the Rust batcher and sequencer send; the shared golden frames pin both sides. Does not run the Rust services against the members.",
+      "negative_controls": [
+        {
+          "mutation": "the guard never refuses a transaction past the budget",
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.SealerDaLagClusterTest::a_stalled_batcher_halts_new_transactions_across_a_leader_kill_and_its_cursor_resumes_them()"
+          ]
+        }
+      ],
+      "ci_mode": "gradle"
+    },
+    "ingress-da-observer": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-ingress",
+        "--test",
+        "da_lag_observer_test"
+      ],
+      "real": [
+        "ClusterWatermarkObserver status decoding",
+        "ingress RPC server, chain watch and pause",
+        "kardamom_obs exporter and halt gauge"
+      ],
+      "controlled": [
+        "egress status frames in the sealer layout",
+        "submission transport"
+      ],
+      "tests": [
+        "sealer_status_frames_halt_and_resume_the_ingress_and_its_halt_gauge"
+      ],
+      "limitation": "The status frames come from an in-memory egress, not from a cluster session.",
+      "negative_controls": [
+        {
+          "mutation": "the observer drops the status frames",
+          "test": "sealer_status_frames_halt_and_resume_the_ingress_and_its_halt_gauge",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "canary-transfer": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-canary",
+        "--lib",
+        "probes::transfer::tests::"
+      ],
+      "real": [
+        "transfer probe, ring lease and journal",
+        "outcome classification and probe metrics"
+      ],
+      "controlled": [
+        "JSON-RPC ingress that refuses submits with the halt code -32010, then lands them"
+      ],
+      "tests": [
+        "a_da_lag_refusal_counts_its_code_and_the_transfer_lands_after_the_halt"
+      ],
+      "limitation": "The ingress is a controlled JSON-RPC peer; ingress-da-observer and ingress-da-halt cover the real refusal.",
+      "negative_controls": [
+        {
+          "mutation": "a refusal loses its JSON-RPC code",
+          "test": "a_da_lag_refusal_counts_its_code_and_the_transfer_lands_after_the_halt",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "alert-rules-retention": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-obs",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "alert_rules",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "deploy/alerts.yml in promtool test rules",
+        "deploy/alertmanager-inhibit.yml in Alertmanager with the deployed routes",
+        "the Prometheus and Alertmanager images that the monitoring job pins"
+      ],
+      "controlled": [
+        "input series of a DA-lag halt and refused canary transfers on the promtool virtual clock",
+        "alerts sent with amtool in place of Prometheus"
+      ],
+      "tests": [
+        "promtool_pages_the_da_lag_halt_and_the_canary_pages_that_it_explains",
+        "the_deployed_inhibit_rules_mute_the_canary_page_only_while_the_da_lag_halt_pages"
+      ],
+      "limitation": "One container for each check, with no network. Does not scrape exporters or send alerts from Prometheus to Alertmanager.",
+      "negative_controls": [
+        {
+          "mutation": "the inhibit rule of the canary pages is removed",
+          "test": "the_deployed_inhibit_rules_mute_the_canary_page_only_while_the_da_lag_halt_pages",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      ],
+      "ci_mode": "docker"
+    },
+    "chain-status-board": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-obs",
+        "--lib",
+        "events::tests::"
+      ],
+      "real": [
+        "service event board, roots and gone records"
+      ],
+      "controlled": [
+        "service event deliveries and the clock of the board"
+      ],
+      "tests": [
+        "a_record_without_a_heartbeat_is_gone_and_then_forgotten",
+        "the_roots_are_the_live_halts_only"
+      ],
+      "limitation": "Board logic only; the events stream and the beacons of the services are not run.",
+      "ci_mode": "in-process"
+    },
     "batcher-recovery": {
       "command": [
         "cargo",
@@ -2701,62 +2973,133 @@
     {
       "case": "retention-overrun",
       "family": "Retention",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "egress-owner",
           "test": "unposted_blocks_remain_replayable_after_pruning_and_a_restart"
+        },
+        {
+          "suite": "executor-retention",
+          "test": "a_cursor_below_the_window_of_the_member_resumes_from_the_egress_with_exact_output"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "SIGSTOP of the executor container past the Aeron client service interval, and the Nomad restart that follows it: the freeze, the client eviction and the restart policy belong to the deployed job"
+      ]
     },
     {
       "case": "retention-overrun-validator",
       "family": "Retention",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "egress-owner",
           "test": "unposted_blocks_remain_replayable_after_pruning_and_a_restart"
+        },
+        {
+          "suite": "validator-retention",
+          "test": "a_validator_held_past_the_posted_head_resumes_inside_the_window_and_verifies_every_block"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "SIGSTOP of the validator container and the Nomad restart that follows it: the freeze and the restart policy belong to the deployed job",
+        "The deployed --keep-blocks of the egress against the 2x6144-frame freeze of the shard: the window comes from the deployed job"
+      ]
     },
     {
       "case": "prune-floor",
       "family": "Retention",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "egress-owner",
           "test": "unposted_blocks_remain_replayable_after_pruning_and_a_restart"
+        },
+        {
+          "suite": "batcher-prune-floor",
+          "test": "unposted_blocks_past_the_reader_window_stay_on_every_copy_and_post_contiguously"
+        },
+        {
+          "suite": "sealer-actor",
+          "test": "io.kardamom.sealer.cluster.SealerCarryWindowTest::version_five_keeps_only_the_window_at_any_posted_head()"
+        },
+        {
+          "suite": "chain-status-board",
+          "test": "a_record_without_a_heartbeat_is_gone_and_then_forgotten"
+        },
+        {
+          "suite": "chain-status-board",
+          "test": "the_roots_are_the_live_halts_only"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "The temporary egress job with --keep-blocks 64 and --segment-blocks 16, and its restore: the case registers a changed Nomad job",
+        "SIGSTOP of the batcher container: the freeze belongs to the deployed job"
+      ]
     },
     {
       "case": "da-lag-halt",
       "family": "Retention",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "ingress-da-halt",
           "test": "the_tags_follow_the_posted_head_and_a_halt_refuses_submits"
+        },
+        {
+          "suite": "sealer-da-lag",
+          "test": "io.kardamom.sealer.cluster.SealerDaLagClusterTest::a_stalled_batcher_halts_new_transactions_across_a_leader_kill_and_its_cursor_resumes_them()"
+        },
+        {
+          "suite": "ingress-da-observer",
+          "test": "sealer_status_frames_halt_and_resume_the_ingress_and_its_halt_gauge"
+        },
+        {
+          "suite": "chain-status-board",
+          "test": "the_roots_are_the_live_halts_only"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "The fixed genesis DA guard that every ingress of the deployed chain reads: the budget comes from the deployed genesis",
+        "SIGSTOP of the batcher container: the freeze belongs to the deployed job"
+      ]
     },
     {
       "case": "canary-da-lag",
       "family": "Retention",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "ingress-da-halt",
           "test": "the_tags_follow_the_posted_head_and_a_halt_refuses_submits"
+        },
+        {
+          "suite": "canary-transfer",
+          "test": "a_da_lag_refusal_counts_its_code_and_the_transfer_lands_after_the_halt"
+        },
+        {
+          "suite": "alert-rules-retention",
+          "test": "promtool_pages_the_da_lag_halt_and_the_canary_pages_that_it_explains"
+        },
+        {
+          "suite": "alert-rules-retention",
+          "test": "the_deployed_inhibit_rules_mute_the_canary_page_only_while_the_da_lag_halt_pages"
+        },
+        {
+          "suite": "ingress-da-observer",
+          "test": "sealer_status_frames_halt_and_resume_the_ingress_and_its_halt_gauge"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "The case canary job that the shard starts and stops: the Nomad job lifecycle",
+        "The scrape of the canary and ingress exporters by the monitoring job, and its push to Alertmanager: the targets and the network of the deployed monitoring job"
+      ]
     },
     {
       "case": "raft-leader-packet-delay",

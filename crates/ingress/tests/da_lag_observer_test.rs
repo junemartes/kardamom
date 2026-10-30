@@ -86,7 +86,13 @@ async fn sealer_status_frames_halt_and_resume_the_ingress_and_its_halt_gauge() {
     };
     egress.push(encode_status(&running));
     await_sample(&page, "kardamom_ingress_cluster_posted_head", "", 5.0).await;
-    await_sample(&page, "kardamom_ingress_cluster_da_lag_budget_blocks", "", 10.0).await;
+    await_sample(
+        &page,
+        "kardamom_ingress_cluster_da_lag_budget_blocks",
+        "",
+        10.0,
+    )
+    .await;
 
     // The batcher stops posting: the sealer halts past the budget, and the
     // boundaries go on.
@@ -96,7 +102,10 @@ async fn sealer_status_frames_halt_and_resume_the_ingress_and_its_halt_gauge() {
         ..running
     }));
     await_sample(&page, "kardamom_halt", "cause=\"da_lag\"", 1.0).await;
-    assert!(process().slots().halt.is_none(), "the ingress pauses, it does not halt");
+    assert!(
+        process().slots().halt.is_none(),
+        "the ingress pauses, it does not halt"
+    );
     assert!(process().slots().pause.is_some());
     egress.push(encode_status(&ClusterStatus {
         sealed_head: 20,
@@ -113,7 +122,10 @@ async fn sealer_status_frames_halt_and_resume_the_ingress_and_its_halt_gauge() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(refusal.contains(&CHAIN_HALTED_CODE.to_string()), "{refusal}");
+    assert!(
+        refusal.contains(&CHAIN_HALTED_CODE.to_string()),
+        "{refusal}"
+    );
     assert!(refusal.contains("/halt"), "{refusal}");
 
     // The batcher posts past the frozen head: the halt ends.

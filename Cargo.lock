@@ -3778,6 +3778,7 @@ dependencies = [
  "bytes",
  "clap",
  "criterion 0.7.0",
+ "crossbeam-channel",
  "jsonrpsee",
  "kardamom-batcher",
  "kardamom-deployer",

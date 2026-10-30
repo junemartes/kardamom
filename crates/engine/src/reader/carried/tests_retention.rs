@@ -15,13 +15,15 @@ use crossbeam_channel::{Receiver, Sender};
 use kardamom_cluster_adapter::wire::{CanonicalTx, encode_egress_boundary};
 use revm::primitives::KECCAK_EMPTY;
 
+use super::CarriedSubscription;
 use super::memory::{MemoryRemote, MemoryTransport};
 use super::tests::{TIMING, done, tx_frame, unavailable};
 use super::transport::Request;
-use super::CarriedSubscription;
 use crate::actor::fixtures::{ChannelHarness, HarnessOutcome, HarnessSetup, TestEgress};
 use crate::reader::cluster::ReplayCursor;
-use crate::{CMessage, ExecutorConfig, ExecutorError, MockStateDatabase, ResumePoint, StateDatabase};
+use crate::{
+    CMessage, ExecutorConfig, ExecutorError, MockStateDatabase, ResumePoint, StateDatabase,
+};
 
 /// The blocks of the chain. Each holds one transfer.
 const BLOCKS: u64 = 12;
@@ -198,19 +200,28 @@ fn a_cursor_below_the_window_of_the_member_resumes_from_the_egress_with_exact_ou
     let chain = Chain::new();
 
     let whole_dir = tempfile::tempdir().unwrap();
-    let whole = TestEgress::serve(&rt, whole_dir.path(), TestEgress::GENESIS, &chain.through(BLOCKS));
+    let whole = TestEgress::serve(
+        &rt,
+        whole_dir.path(),
+        TestEgress::GENESIS,
+        &chain.through(BLOCKS),
+    );
     let reference = ChannelHarness::run_on_egress(
         setup(ResumePoint::GENESIS, chain.genesis()),
         whole.reader(&rt, ReplayCursor::new(0, 1)),
     );
-    reference.result.as_ref().map_or_else(
-        |e| assert!(matches!(e, ExecutorError::TxOrderingClosed), "{e:?}"),
-        |()| (),
-    );
+    if let Err(e) = &reference.result {
+        assert!(matches!(e, ExecutorError::TxOrderingClosed), "{e:?}");
+    }
 
     // The executor commits the blocks through `STOPPED_AT`, then stops.
     let early_dir = tempfile::tempdir().unwrap();
-    let early = TestEgress::serve(&rt, early_dir.path(), TestEgress::GENESIS, &chain.through(STOPPED_AT));
+    let early = TestEgress::serve(
+        &rt,
+        early_dir.path(),
+        TestEgress::GENESIS,
+        &chain.through(STOPPED_AT),
+    );
     let stopped = ChannelHarness::run_on_egress(
         setup(ResumePoint::GENESIS, chain.genesis()),
         early.reader(&rt, ReplayCursor::new(0, 1)),
@@ -227,7 +238,12 @@ fn a_cursor_below_the_window_of_the_member_resumes_from_the_egress_with_exact_ou
     // While it is stopped, the window of the member moves past its cursor.
     // The egress keeps every block: no post covers them.
     let egress_dir = tempfile::tempdir().unwrap();
-    let egress = TestEgress::serve(&rt, egress_dir.path(), TestEgress::GENESIS, &chain.through(BLOCKS));
+    let egress = TestEgress::serve(
+        &rt,
+        egress_dir.path(),
+        TestEgress::GENESIS,
+        &chain.through(BLOCKS),
+    );
     let (feed, remote) = MemoryTransport::pair();
     let (stop, member) = Member::spawn(&chain, remote);
     let (service, live) = egress.transport(&rt);
@@ -269,9 +285,7 @@ fn a_cursor_below_the_window_of_the_member_resumes_from_the_egress_with_exact_ou
         "the state equals the state of a run that never stopped"
     );
     assert!(
-        log.served
-            .iter()
-            .any(|r| r.from_block >= WINDOW_FROM),
+        log.served.iter().any(|r| r.from_block >= WINDOW_FROM),
         "with its cursor in the window, the reader goes back to the member feed"
     );
 }

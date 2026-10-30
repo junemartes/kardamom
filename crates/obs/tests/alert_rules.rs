@@ -39,7 +39,10 @@ fn repo() -> PathBuf {
 }
 
 fn docker(args: &[&str]) -> Output {
-    Command::new("docker").args(args).output().expect("docker runs")
+    Command::new("docker")
+        .args(args)
+        .output()
+        .expect("docker runs")
 }
 
 fn text(output: &Output) -> String {
@@ -145,7 +148,13 @@ impl Alertmanager {
 
     /// The time in the container, in RFC 3339.
     fn now(&self) -> String {
-        let output = docker(&["exec", self.id.as_str(), "date", "-u", "+%Y-%m-%dT%H:%M:%SZ"]);
+        let output = docker(&[
+            "exec",
+            self.id.as_str(),
+            "date",
+            "-u",
+            "+%Y-%m-%dT%H:%M:%SZ",
+        ]);
         assert!(output.status.success(), "{}", text(&output));
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
@@ -178,7 +187,9 @@ impl Drop for Alertmanager {
 
 /// The alert named `name` in `alerts`.
 fn named<'a>(alerts: &'a [Value], name: &str) -> Option<&'a Value> {
-    alerts.iter().find(|alert| alert["labels"]["alertname"] == name)
+    alerts
+        .iter()
+        .find(|alert| alert["labels"]["alertname"] == name)
 }
 
 /// Whether `alert` is suppressed by the alert with `fingerprint`.
@@ -204,25 +215,43 @@ const HALT: [&str; 5] = [
 fn the_deployed_inhibit_rules_mute_the_canary_page_only_while_the_da_lag_halt_pages() {
     let manager = Alertmanager::start(ROUTES);
     manager.fire("KardamomHaltDaLag", &HALT, None);
-    manager.fire("KardamomCanaryStalled", &["severity=critical", "host_id=h"], None);
-    manager.fire("KardamomCanaryFailing", &["severity=critical", "probe=transfer"], None);
+    manager.fire(
+        "KardamomCanaryStalled",
+        &["severity=critical", "host_id=h"],
+        None,
+    );
+    manager.fire(
+        "KardamomCanaryFailing",
+        &["severity=critical", "probe=transfer"],
+        None,
+    );
     manager.fire(
         "KardamomServicePaused",
-        &["severity=info", "cause=da_lag", "service=ingress", "host_id=h"],
+        &[
+            "severity=info",
+            "cause=da_lag",
+            "service=ingress",
+            "host_id=h",
+        ],
         None,
     );
     let alerts = manager.await_alerts("every page arrives", |alerts| alerts.len() == 4);
     let halt = named(&alerts, "KardamomHaltDaLag").expect("the halt pages");
     assert_eq!(halt["status"]["state"], "active", "the halt pages");
     let fingerprint = &halt["fingerprint"];
-    ["KardamomCanaryStalled", "KardamomCanaryFailing", "KardamomServicePaused"]
-        .iter()
-        .for_each(|name| {
-            assert!(
-                inhibited_by(named(&alerts, name), fingerprint),
-                "{name} waits behind the halt: {alerts:?}"
-            );
-        });
+    let waiting: Vec<_> = [
+        "KardamomCanaryStalled",
+        "KardamomCanaryFailing",
+        "KardamomServicePaused",
+    ]
+    .into_iter()
+    .filter(|name| !inhibited_by(named(&alerts, name), fingerprint))
+    .collect();
+    assert_eq!(
+        waiting,
+        [] as [&str; 0],
+        "each page waits behind the halt: {alerts:?}"
+    );
 
     // The batcher posts again: the halt resolves, and a canary page that
     // stays has no halt to explain it.

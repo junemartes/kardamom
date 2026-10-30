@@ -46,7 +46,11 @@ async fn a_da_lag_refusal_counts_its_code_and_the_transfer_lands_after_the_halt(
 
     ingress.chain.lock().unwrap().halted = false;
     transfer.run().await;
-    assert_eq!(runs(&handle, &["outcome=\"success\""]), 1, "the transfer lands after the halt");
+    assert_eq!(
+        runs(&handle, &["outcome=\"success\""]),
+        1,
+        "the transfer lands after the halt"
+    );
     assert_eq!(runs(&handle, &refused), 2);
     let chain = ingress.chain.lock().unwrap();
     assert_eq!(

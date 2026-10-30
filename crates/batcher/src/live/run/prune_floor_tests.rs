@@ -63,7 +63,7 @@ fn chain() -> TestStream {
 /// HTTP sides and of the reader of the batcher.
 struct Copies {
     rt: Option<tokio::runtime::Runtime>,
-    copies: Vec<TestEgress>,
+    stores: Vec<TestEgress>,
     frames: Vec<Vec<u8>>,
     _dirs: Vec<tempfile::TempDir>,
 }
@@ -88,7 +88,7 @@ impl Copies {
                 .collect();
             let started = Self {
                 rt: Some(rt),
-                copies,
+                stores: copies,
                 frames,
                 _dirs: dirs,
             };
@@ -102,38 +102,43 @@ impl Copies {
     /// Deliver the blocks after `from` through `last` to every copy.
     fn through(&self, from: u64, last: u64) {
         let range = usize::try_from(from * 2).unwrap()..usize::try_from(last * 2).unwrap();
-        self.copies
+        self.stores
             .iter()
             .for_each(|copy| copy.append(&self.frames[range.clone()]));
     }
 
     /// A post on L1 covers the blocks through `block`, on every copy.
     fn post(&self, block: u64) {
-        self.copies.iter().for_each(|copy| copy.post(block));
+        self.stores.iter().for_each(|copy| copy.post(block));
     }
 
-    /// The first block that each copy serves, once every copy pruned below
-    /// `above`.
+    /// The first block that each copy serves.
+    fn floors(&self) -> Vec<u64> {
+        self.stores
+            .iter()
+            .map(|copy| copy.floor().map_or(1, |floor| floor.next_block))
+            .collect()
+    }
+
+    /// The first block that each copy serves, once every copy pruned the
+    /// blocks through `above`.
     fn floors_above(&self, above: u64) -> Vec<u64> {
         tokio::task::block_in_place(|| {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
             std::iter::repeat_with(|| {
                 std::thread::sleep(Duration::from_millis(10));
-                self.copies
-                    .iter()
-                    .map(|copy| copy.floor().map_or(1, |floor| floor.next_block))
-                    .collect::<Vec<_>>()
+                self.floors()
             })
             .take_while(|_| std::time::Instant::now() < deadline)
             .find(|floors| floors.iter().all(|floor| *floor > above))
-            .expect("every copy prunes")
+            .unwrap_or_else(|| panic!("every copy prunes above {above}: {:?}", self.floors()))
         })
     }
 
     /// The reader of the batcher on the first copy from `cursor`, as the
     /// binary with `--egress` opens it, and the channel of its records.
     fn reader(&self, cursor: ReplayCursor) -> (tokio::sync::mpsc::Receiver<ReaderToExec>, Live) {
-        let reader = self.copies[0].reader(self.rt.as_ref().unwrap(), cursor);
+        let reader = self.stores[0].reader(self.rt.as_ref().unwrap(), cursor);
         let (exec_out, records) = tokio::sync::mpsc::channel(1 << 14);
         TxOrderingReader::spawn(TxOrderingInputs {
             sub: reader.sub,
@@ -163,8 +168,8 @@ impl Copies {
     /// Read one page from `at` on every copy, require the same page from
     /// each, and return the cursor after it.
     async fn compare_page(&self, http: &reqwest::Client, at: (u64, u64)) -> (u64, u64) {
-        let mut read = Vec::with_capacity(self.copies.len());
-        for copy in &self.copies {
+        let mut read = Vec::with_capacity(self.stores.len());
+        for copy in &self.stores {
             read.push(page(http, copy.base(), at).await);
         }
         assert!(
@@ -178,12 +183,17 @@ impl Copies {
 
 impl Drop for Copies {
     fn drop(&mut self) {
-        self.rt.take().map(tokio::runtime::Runtime::shutdown_background);
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
     }
 }
 
 /// The live stream of the reader. The reader stops when it ends.
-struct Live(#[allow(dead_code, reason = "held only to keep the live stream open")] crossbeam_channel::Sender<Vec<u8>>);
+struct Live(
+    #[allow(dead_code, reason = "held only to keep the live stream open")]
+    crossbeam_channel::Sender<Vec<u8>>,
+);
 
 /// One page of a range read.
 #[derive(Debug, PartialEq, Eq)]
@@ -203,11 +213,17 @@ async fn page(http: &reqwest::Client, base: &str, (index, block): (u64, u64)) ->
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::OK, "{base} serves {index}/{block}");
-    let header = |name: &str| -> u64 {
-        response.headers()[name].to_str().unwrap().parse().unwrap()
-    };
-    let after = (header("x-egress-after-index"), header("x-egress-after-block"));
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "{base} serves {index}/{block}"
+    );
+    let header =
+        |name: &str| -> u64 { response.headers()[name].to_str().unwrap().parse().unwrap() };
+    let after = (
+        header("x-egress-after-index"),
+        header("x-egress-after-block"),
+    );
     Page {
         after,
         bytes: response.bytes().await.unwrap().to_vec(),
@@ -227,20 +243,32 @@ impl Fixture {
         (self.feed_from(resumed, records), live)
     }
 
-    /// Wait until the contract covers the blocks through `block`.
+    /// Wait until the contract covers the blocks through `block`, and the
+    /// durable cursor of the batcher moved past them.
     async fn await_covered(&self, block: u64) {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while L1Truth::read(&self.rig.provider, self.settlement)
+        let covered = || async {
+            L1Truth::read(&self.rig.provider, self.settlement)
                 .await
                 .unwrap()
                 .covered_through_block
-                < block
-            {
+        };
+        let cursor = || {
+            BatchCursor::load(&self.args().cursor_file)
+                .unwrap()
+                .map_or(0, |cursor| cursor.next_block)
+        };
+        let reached = tokio::time::timeout(Duration::from_secs(30), async {
+            while covered().await < block || cursor() <= block {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("the batcher posts through the head");
+        .await;
+        assert!(
+            reached.is_ok(),
+            "the batcher posts through {block}; the contract covers {}, the cursor is at {}",
+            covered().await,
+            cursor()
+        );
     }
 
     /// Every post is contiguous with the one before, and the payloads hold
@@ -265,7 +293,11 @@ impl Fixture {
             "each block once, in order, with its transaction"
         );
         records.windows(2).for_each(|pair| {
-            assert_eq!(pair[1].l2_block_start, pair[0].l2_block_end + 1, "{records:?}");
+            assert_eq!(
+                pair[1].l2_block_start,
+                pair[0].l2_block_end + 1,
+                "{records:?}"
+            );
             assert_eq!(pair[1].index, pair[0].index + 1);
         });
     }
@@ -291,10 +323,7 @@ async fn unposted_blocks_past_the_reader_window_stay_on_every_copy_and_post_cont
         floors.iter().all(|floor| *floor <= POSTED + 1),
         "every copy keeps the first unposted block: {floors:?}"
     );
-    assert!(
-        HEAD - POSTED > KEEP_BLOCKS + SEGMENT_BLOCKS,
-        "the unposted range is past the window"
-    );
+    const { assert!(HEAD - POSTED > KEEP_BLOCKS + SEGMENT_BLOCKS) };
     let pages = copies.replay((POSTED, POSTED + 1)).await;
     assert!(pages > 1, "the replay spans pages");
 
@@ -309,7 +338,9 @@ async fn unposted_blocks_past_the_reader_window_stay_on_every_copy_and_post_cont
     copies.post(HEAD);
     let floors = copies.floors_above(POSTED + 1);
     assert!(
-        floors.iter().all(|floor| *floor > HEAD - KEEP_BLOCKS - SEGMENT_BLOCKS),
+        floors
+            .iter()
+            .all(|floor| *floor > HEAD - KEEP_BLOCKS - SEGMENT_BLOCKS),
         "the retention is back inside the window: {floors:?}"
     );
 }

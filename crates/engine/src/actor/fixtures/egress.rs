@@ -144,17 +144,22 @@ impl TestEgress {
     ///
     /// Panics if the owner thread is gone.
     pub fn append(&self, frames: &[Vec<u8>]) {
-        frames.iter().for_each(|frame| {
-            let seq = self.next_seq.get();
-            self.next_seq.set(seq + 1);
-            let message = [seq.to_le_bytes().as_slice(), frame].concat();
-            self.inputs
-                .send(Input::Frame {
-                    session: 1,
-                    message,
-                })
-                .unwrap();
-        });
+        for frame in frames {
+            self.deliver(frame);
+        }
+    }
+
+    /// Deliver one frame of the copy with the next sequence number.
+    fn deliver(&self, frame: &[u8]) {
+        let seq = self.next_seq.get();
+        self.next_seq.set(seq.checked_add(1).unwrap());
+        let message = [seq.to_le_bytes().as_slice(), frame].concat();
+        self.inputs
+            .send(Input::Frame {
+                session: 1,
+                message,
+            })
+            .unwrap();
     }
 
     /// A post on L1 covers the blocks through `block`.

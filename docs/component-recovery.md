@@ -258,6 +258,38 @@ compares every retained frame. L1 watcher tests also use a paused clock for
 republish and startup deadlines. Other actors and external service clocks still
 need individual review; virtual time does not prove operating-system scheduling.
 
+The retention family runs its real actors on a carry-born chain:
+
+- `executor-retention` resumes the real executor pipeline after a stop.
+  The member feed refuses the cursor below its window. The reader then
+  reads the range from a real egress store over HTTP. The executor must
+  publish the receipts of a run that never stopped and ask for no peer
+  checkpoint. With its cursor in the window, the reader goes back to the
+  feed.
+- `validator-retention` runs the real validator seams on the pipeline. The
+  batcher posts past the cursor of the stopped validator, and the egress
+  prunes below its reader window. The validator must verify every later
+  block against the write-sets and receipts of the executor.
+- `batcher-prune-floor` stops the real batcher feed while three egress
+  copies take blocks past their reader window. Each copy must keep the
+  unposted range and serve the same bytes from the batcher cursor. The
+  restarted batcher posts that range to the settlement contract on Anvil,
+  contiguously and once per block. Then the copies prune back inside the
+  window.
+- `sealer-da-lag` runs the DA-lag guard on three real Raft members. The
+  guard refuses transactions past the budget, keeps the halt across a
+  leader kill, and resumes on a posted cursor. `ingress-da-observer` feeds
+  the status frames through the real egress observer into the ingress,
+  and reads the halt gauge on its metrics page.
+- `canary-transfer` runs the real transfer probe while the ingress refuses
+  submits with the code -32010. `alert-rules-retention` runs the alert
+  rules in `promtool test rules`, and the deployed inhibit rules in a real
+  Alertmanager. Each check uses one container with no network.
+
+Each suite has a negative control in the catalog. The SIGSTOP of a
+container, the Nomad restart that follows it, and the scrape targets of
+the monitoring job stay in the cluster chaos suite.
+
 `just test-component chaos-alert` runs six paused-clock checks for the alert hold
 observer used by `l1-liar`. A 30-second hold starts at the first completed active
 read. Later consecutive active reads must span that duration. Inactive, unknown
