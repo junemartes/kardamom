@@ -116,9 +116,6 @@ pub struct StackConfig {
     /// have the `floor-seams` feature.
     #[cfg(feature = "floor-seams")]
     pub first_floor_from_lookup: bool,
-    /// Run the sequencers on the v2 loop, as `KARDAMOM_E2E_ADMISSION=1`
-    /// does for the whole suite.
-    pub v2_loop: bool,
 }
 
 /// The parts of the stack that the carry window rollout needs.
@@ -255,7 +252,6 @@ impl Default for StackConfig {
             sequencer_cache: false,
             #[cfg(feature = "floor-seams")]
             first_floor_from_lookup: false,
-            v2_loop: false,
         }
     }
 }

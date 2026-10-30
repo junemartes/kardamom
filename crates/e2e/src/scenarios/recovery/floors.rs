@@ -45,6 +45,19 @@ const ANSWERED: [&str; 4] = [
     "outcome=\"live\"",
 ];
 
+/// The executor heads around the outage, for the sealing check.
+#[derive(Debug, Clone, Copy)]
+struct Sealed {
+    /// The head before the fault.
+    before: u64,
+    /// The head right after the case load lands again.
+    after: u64,
+    /// From the fault to the return of the executor.
+    outage: Duration,
+    /// From the return of the executor to the reading of `after`.
+    since: Duration,
+}
+
 /// The floor lookups of one sequencer since its start.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Lookups {
@@ -112,6 +125,14 @@ impl Run<'_> {
                 return Err(e.context(format!("the lookups of the case lane: {lookups:?}")));
             }
         };
+        // The head right after the return, so that few blocks sealed after
+        // the return count in it.
+        let sealed = Sealed {
+            before: head,
+            after: self.reading().await?.block,
+            outage,
+            since: returned.elapsed(),
+        };
         eprintln!(
             "{}: the case load lands again {:.1}s after the executor",
             self.at(),
@@ -120,8 +141,7 @@ impl Run<'_> {
         self.assert_floors_looked_up().await?;
         self.assert_ingress_pair_live(RESTART_BOUND).await?;
         self.assert_executor_progress().await?;
-        self.assert_sealed_while_down(head, outage, returned)
-            .await?;
+        self.assert_sealed_while_down(sealed)?;
         self.assert_no_ref_below_floor().await?;
         self.assert_all_up()
     }
@@ -173,36 +193,37 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// The sealer kept sealing while the classes were down. The executor
-    /// head now, less the most blocks that the sealer can seal since the
-    /// executor `returned`, is past the `head` before the fault by at
-    /// least one block for each second of the `outage`. A sealer that
+    /// The sealer kept sealing while the classes were down. The head
+    /// right after the return, less the most blocks that the sealer can
+    /// seal since the return, is past the head before the fault by at
+    /// least one block for each second of the outage. A sealer that
     /// stopped while the classes were down fails this.
-    async fn assert_sealed_while_down(
-        &self,
-        head: u64,
-        outage: Duration,
-        returned: Instant,
-    ) -> Result<()> {
-        let now = self.reading().await?.block;
-        let since = returned.elapsed().as_secs().saturating_add(1);
-        // The sealer seals at most one block a tick; one more covers a
-        // tick that ends early.
+    ///
+    /// The sealer stamps one block boundary on each tick
+    /// (`cluster/sealer-service/README.md`), and the stack sets the tick
+    /// with `-Dkardamom.cluster.tickMs` (`StackConfig::cluster_tick_ms`).
+    /// One more block a second covers a tick that ends early.
+    fn assert_sealed_while_down(&self, sealed: Sealed) -> Result<()> {
         let per_second = 1000u64
             .div_ceil(self.stack.cfg.cluster_tick_ms.get())
             .saturating_add(1);
-        let after = since.saturating_mul(per_second);
-        let least = head.saturating_add(outage.as_secs());
+        let since = sealed.since.as_secs().saturating_add(1);
+        let late = since.saturating_mul(per_second);
+        let least = sealed.before.saturating_add(sealed.outage.as_secs());
         anyhow::ensure!(
-            now.saturating_sub(after) >= least,
-            "{}: the executor head {now}, less {after} blocks sealed after the return, is not past {least}: the sealer did not seal through the {}s outage from head {head}",
+            sealed.after.saturating_sub(late) >= least,
+            "{}: the executor head {}, less {late} blocks sealed after the return, is not past {least}: the sealer did not seal through the {}s outage from head {}",
             self.name,
-            outage.as_secs()
+            sealed.after,
+            sealed.outage.as_secs(),
+            sealed.before
         );
         eprintln!(
-            "{}: sealed while down: head {head} -> {now} ({after} of them after the return) over a {}s outage",
+            "{}: sealed while down: head {} -> {} ({late} of them after the return at most) over a {}s outage",
             self.at(),
-            outage.as_secs()
+            sealed.before,
+            sealed.after,
+            sealed.outage.as_secs()
         );
         Ok(())
     }

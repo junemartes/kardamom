@@ -119,13 +119,13 @@ async fn sequencer_executor_redis_loss_on_the_v2_loop_looks_every_floor_up() {
 /// executor replays the references of the outage, so the archive must
 /// keep their transaction data.
 #[cfg(feature = "floor-seams")]
-fn floor_stack(v2_loop: bool) -> StackConfig {
+fn floor_stack(admission: bool) -> StackConfig {
     StackConfig {
         archive_durability: true,
         read_path: true,
         sequencer_cache: true,
         first_floor_from_lookup: true,
-        v2_loop,
+        admission,
         ..validated()
     }
 }

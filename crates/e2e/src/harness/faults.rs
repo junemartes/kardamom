@@ -356,12 +356,12 @@ impl LocalStack {
         tokio::task::block_in_place(|| self.sealer.start_all(&tag))
     }
 
-    /// Whether any sealer member process runs.
     /// Whether the executor process runs.
     pub fn executor_alive(&mut self) -> bool {
         self.executor.proc.is_alive()
     }
 
+    /// Whether any sealer member process runs.
     pub fn sealer_alive(&mut self) -> bool {
         self.sealer.procs.iter_mut().any(Proc::is_alive)
     }
