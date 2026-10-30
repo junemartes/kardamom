@@ -45,7 +45,7 @@ class RaftLeaderReturnTest {
     @InterruptAfter(value = 300, unit = TimeUnit.SECONDS)
     void a_former_leader_that_wins_again_sends_a_new_leader_event_and_no_session_ok() {
         try (LocalSealers group = new LocalSealers(dir, 3, LocalSealers.Settings.DEFAULT);
-             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints, group.hostsFile())) {
+             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
             SealerNode.View leader = group.awaitLeader(Duration.ofSeconds(20));
             client.transfer(0, Duration.ofSeconds(10));

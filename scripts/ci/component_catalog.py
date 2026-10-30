@@ -9,6 +9,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 CATALOG = ROOT / "scripts/ci/component-recovery.json"
+TIMINGS = ROOT / "scripts/ci/component-timings.json"
 CASE_KEYS = {"case", "family", "status", "local_tests", "full_case_locally_validated"}
 OPTIONAL_CASE_KEYS = {"cluster_only_checks"}
 STATUSES = ("planned", "partial", "ported")
@@ -18,19 +19,29 @@ CI_MODES = ("in-process", "docker", "gradle", "stack")
 
 
 class Catalog:
-    def __init__(self, document):
+    def __init__(self, document, timings=None):
         self.document = document
         self.suites = document["local_suites"]
         self.cases = document["cases"]
+        self.timings = timings
 
     @classmethod
-    def load(cls, path=CATALOG):
-        return cls(json.loads(Path(path).read_text()))
+    def load(cls, path=CATALOG, timings=TIMINGS):
+        return cls(json.loads(Path(path).read_text()), json.loads(Path(timings).read_text()))
+
+    def timing_errors(self):
+        """The CI shard plan needs a measured runtime for every test, so a new test brings its own."""
+        if self.timings is None:
+            return []
+        missing = [f"{name}::{test}" for name, suite in self.suites.items() for test in suite.get("tests", [])
+                   if f"{name}::{test}" not in self.timings]
+        return [f"no runtime in scripts/ci/component-timings.json for {test}" for test in missing]
 
     def errors(self):
         names = [case.get("case") for case in self.cases]
         duplicates = sorted({name for name in names if names.count(name) > 1})
         return ([f"duplicate case: {name}" for name in duplicates]
+                + self.timing_errors()
                 + [f"suite {name}: ci_mode must be one of {list(CI_MODES)}"
                    for name, suite in self.suites.items() if suite.get("ci_mode") not in CI_MODES]
                 + [f"suite {name}: {error}" for name, suite in self.suites.items()

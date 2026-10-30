@@ -1468,12 +1468,15 @@
         "Docker SIGSTOP with /proc stopped-state proof",
         "Docker SIGKILL and restart of the original primary",
         "SCRIPT FLUSH on the promoted primary",
-        "replica process stop"
+        "replica process stop",
+        "one Sentinel host name that resolves to ::1 and 127.0.0.1, each address forwarded to a different Sentinel, the first in SIGSTOP",
+        "primary SIGSTOP for 300 ms in each second, below the Sentinel down-after bound"
       ],
       "tests": [
         "a_frozen_primary_promotes_a_replica_and_the_same_cache_client_recovers",
         "a_killed_primary_promotes_a_replica_and_the_same_cache_client_recovers",
-        "replica_loss_reports_zero_acknowledgements_without_stopping_primary_writes"
+        "replica_loss_reports_zero_acknowledgements_without_stopping_primary_writes",
+        "a_reader_keeps_its_live_connection_while_the_primary_stalls_and_a_sentinel_hangs"
       ],
       "limitation": "Requires Linux host routing to Docker bridge addresses. Uses five disposable containers per test and real service clocks. Proves promotion, same-client reconnect, script reload, monotone replay and zero replica acknowledgements. Does not prove whole-chain progress/fallback, CPU-pressure TILT behavior, persistence, total loss or deployment placement.",
       "negative_controls": [
@@ -1485,6 +1488,13 @@
         },
         {
           "mutation": "script_loaded_only_once",
+          "exit_code": 101,
+          "failed_at_recovery": true,
+          "compiled": true
+        },
+        {
+          "mutation": "every_timeout_replaces_the_connection",
+          "test": "a_reader_keeps_its_live_connection_while_the_primary_stalls_and_a_sentinel_hangs",
           "exit_code": 101,
           "failed_at_recovery": true,
           "compiled": true
