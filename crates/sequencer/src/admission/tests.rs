@@ -291,6 +291,27 @@ fn a_sender_asks_again_after_its_unanswered_lookup_expired() {
     assert_eq!(offer(&mut a, tx(1, 6, 4)), ["F6"]);
 }
 
+/// A relook that no source answers ends without an event too. The
+/// expiry of the parked transaction ends it in the filter, so the next
+/// gap park of the sender relooks again.
+#[test]
+fn a_sender_relooks_again_after_its_unanswered_relook_expired() {
+    let start = Instant::now();
+    let mut a: Admission<u64> = Admission::new(cfg(), start);
+    let mut out = Vec::new();
+    a.on_lookup(sender(1), state(48, 10 * COST, 390), &mut out);
+    offer(&mut a, tx(1, 49, 1));
+    a.sweep(start + Duration::from_millis(600), &mut out);
+    assert_eq!(names(&out), ["L"], "the relook asks");
+    out.clear();
+    a.sweep(start + Duration::from_secs(5), &mut out);
+    assert_eq!(out.len(), 1, "the park expires: {:?}", names(&out));
+    out.clear();
+    offer(&mut a, tx(1, 49, 2));
+    a.sweep(start + Duration::from_millis(5600), &mut out);
+    assert_eq!(names(&out), ["L"], "the next gap park relooks again");
+}
+
 #[test]
 fn a_transaction_that_waits_for_a_lookup_gets_its_ack_with_the_state() {
     let mut a: Admission<u64> = Admission::new(cfg(), Instant::now());
