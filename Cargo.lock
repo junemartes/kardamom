@@ -4256,6 +4256,7 @@ dependencies = [
 name = "kardamom-l1-indexer"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
  "alloy-primitives",
  "alloy-rpc-types-eth",
  "alloy-sol-types",
@@ -4265,9 +4266,11 @@ dependencies = [
  "jsonrpsee",
  "kardamom-batcher",
  "kardamom-da-watcher",
+ "kardamom-l1-fault-proxy",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-types",
+ "libc",
  "metrics",
  "reqwest 0.13.4",
  "rkyv",

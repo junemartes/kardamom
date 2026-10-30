@@ -883,6 +883,191 @@
       "limitation": "Validates pause/resume for missing archived records, not transport deployment.",
       "ci_mode": "in-process"
     },
+    "l1-follower-quorum": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-l1-indexer",
+        "--test",
+        "follower_quorum",
+        "--",
+        "--test-threads=1"
+      ],
+      "real": [
+        "Follower::run with its tick, halt and slot plan",
+        "L1Endpoints, L1Sources agreement, rotation, 30-second read deadline and backoff",
+        "RpcL1Source HTTP parsing and header batches",
+        "real archive Store and DA client",
+        "L1Watcher with the board and its cursor file",
+        "Beacon, BoardFeed and the batcher's FollowerWatch",
+        "production l1_blocks wire codec"
+      ],
+      "controlled": [
+        "one JSON-RPC L1 with real BatchPosted and DepositInitiated logs",
+        "two independent fault proxies: down, rate limit, unresponsive, wrong hash, broken parent chain, swallowed logs, null receipts",
+        "file-backed DA store",
+        "l1_blocks recording instead of Aeron, with paged history",
+        "paused clock across the read deadline, the backoff and a two-day lie, jumped only between reads",
+        "100-ms follower slot, or the production 12-second slot through the two-day lie"
+      ],
+      "tests": [
+        "refused_providers_halt_the_follower_until_the_backoff_returns_them",
+        "each_lie_halts_the_follower_and_its_end_resumes_a_true_stream",
+        "null_receipts_with_swallowed_logs_halt_the_follower_until_they_end",
+        "a_two_day_lie_holds_the_follower_and_its_end_resumes_without_a_gap"
+      ],
+      "limitation": "One follower process with the da-watcher in the same process; the two-day lie grows the chain by 2,400 blocks, not 14,400. The batcher and the validator are not run here.",
+      "negative_controls": [
+        {
+          "mutation": "accept the first public answer without comparing the other sources",
+          "tests": [
+            "each_lie_halts_the_follower_and_its_end_resumes_a_true_stream",
+            "null_receipts_with_swallowed_logs_halt_the_follower_until_they_end",
+            "a_two_day_lie_holds_the_follower_and_its_end_resumes_without_a_gap"
+          ],
+          "exit_code": 101,
+          "failed_as_expected": true,
+          "compiled": true
+        },
+        {
+          "mutation": "rotate a failed source out for zero seconds instead of the backoff",
+          "test": "refused_providers_halt_the_follower_until_the_backoff_returns_them",
+          "exit_code": 101,
+          "failed_as_expected": true,
+          "compiled": true
+        },
+        {
+          "mutation": "ignore the follower halts on the board in FollowerWatch",
+          "test": "refused_providers_halt_the_follower_until_the_backoff_returns_them",
+          "exit_code": 101,
+          "failed_as_expected": true,
+          "compiled": true
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "l1-follower-instances": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-l1-indexer",
+        "--test",
+        "follower_instances",
+        "--",
+        "--test-threads=1"
+      ],
+      "real": [
+        "two follower processes: Follower::run, L1Endpoints over HTTP, archive Store, Beacon",
+        "SIGSTOP, SIGKILL and restart of those processes",
+        "L1Watcher with L1BlockDedup, the board, silence pause and operator clear"
+      ],
+      "controlled": [
+        "one JSON-RPC L1 behind four independent fault proxies, two per instance",
+        "forked chain served to one instance",
+        "TCP frames in the production codec instead of Aeron",
+        "three-second silence window (30 seconds in the chaos shard)"
+      ],
+      "tests": [
+        "one_frozen_instance_leaves_the_stream_to_the_other_without_a_pause",
+        "both_instances_lost_pause_the_watcher_and_their_restart_resumes_it",
+        "a_forked_instance_halts_the_watcher_until_the_runbook_heals_it"
+      ],
+      "limitation": "Process loss on one host; Nomad job stop and restore, node placement and the validator's own L1 read are not run.",
+      "negative_controls": [
+        {
+          "mutation": "never call a silent l1_blocks stream a root",
+          "test": "both_instances_lost_pause_the_watcher_and_their_restart_resumes_it",
+          "exit_code": 101,
+          "failed_as_expected": true,
+          "compiled": true
+        },
+        {
+          "mutation": "raise no halt on two hashes of one block",
+          "test": "a_forked_instance_halts_the_watcher_until_the_runbook_heals_it",
+          "exit_code": 101,
+          "failed_as_expected": true,
+          "compiled": true
+        },
+        {
+          "mutation": "publish the epoch of a duplicate record again",
+          "test": "one_frozen_instance_leaves_the_stream_to_the_other_without_a_pause",
+          "exit_code": 101,
+          "failed_as_expected": true,
+          "compiled": true
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "alert-rules-l1": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-l1-indexer",
+        "--test",
+        "alert_rules",
+        "--",
+        "--ignored"
+      ],
+      "real": [
+        "deploy/alerts.yml rules",
+        "promtool of the Prometheus image that the monitoring job deploys"
+      ],
+      "controlled": [
+        "input series of the batcher post age, the follower and da-watcher halts and the disagreement counter"
+      ],
+      "tests": [
+        "the_l1_alert_rules_fire_and_resolve_on_the_case_series"
+      ],
+      "limitation": "Rule evaluation only: no scrape, no Alertmanager routing or inhibition.",
+      "negative_controls": [
+        {
+          "mutation": "hold KardamomBatcherLastPostStale for 20m instead of 10m",
+          "test": "the_l1_alert_rules_fire_and_resolve_on_the_case_series",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      ],
+      "ci_mode": "docker"
+    },
+    "aeron-client-timeout-exit": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-log",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "client_timeout_exit",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "AeronRuntime and archive control session, the two Aeron client contexts of the batcher",
+        "the crate's fail-fast Aeron error handler",
+        "Aeron media driver in one disposable container",
+        "a child process stopped with SIGSTOP and continued"
+      ],
+      "controlled": [
+        "1-second client liveness timeout of the test driver",
+        "3-second stop of the child"
+      ],
+      "tests": [
+        "a_client_timeout_in_the_runtime_context_exits",
+        "a_client_timeout_in_the_archive_context_exits",
+        "a_client_timeout_in_both_contexts_at_once_exits"
+      ],
+      "limitation": "The child holds the batcher's Aeron contexts, not the whole batcher binary. The supervisor restart is the orchestrator's.",
+      "ci_mode": "docker"
+    },
     "state-mirror": {
       "command": [
         "cargo",
@@ -1849,10 +2034,22 @@
       ],
       "tests": [
         "hidden_mined_receipts_reconcile_without_duplicate_posts_or_early_cursor",
-        "restart_during_hidden_receipts_uses_contract_truth_without_waiting_for_the_indexer"
+        "restart_during_hidden_receipts_uses_contract_truth_without_waiting_for_the_indexer",
+        "every_lie_lets_a_restarted_batcher_post_and_confirm_three_batches",
+        "a_refusing_provider_fail_stops_the_post_and_a_restart_posts_it_once",
+        "a_batcher_frozen_past_the_floor_posts_its_spool_then_the_rebuilt_gap_once"
       ],
       "limitation": "No full follower fleet, Prometheus alert, Nomad restart, consensus retention or EigenDA proof. These tests cover null receipt reconciliation and restart, not expiry of the 120-second receipt deadline. Alloy timeout bookkeeping includes the wall clock, so Tokio virtual time alone cannot prove that deadline. The existing local DA helper serves until the test process exits. Payloads contain empty boundary blocks; transaction execution and full-chain transfer progress are outside this fixture.",
-      "ci_mode": "docker"
+      "ci_mode": "docker",
+      "negative_controls": [
+        {
+          "mutation": "drop the spool at a restart instead of restoring its group",
+          "test": "a_batcher_frozen_past_the_floor_posts_its_spool_then_the_rebuilt_gap_once",
+          "exit_code": 101,
+          "failed_as_expected": true,
+          "compiled": true
+        }
+      ]
     },
     "batcher-post-age": {
       "command": [
@@ -2899,7 +3096,7 @@
     {
       "case": "l1-liar",
       "family": "L1",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "l1-source-quorum",
@@ -2928,14 +3125,26 @@
         {
           "suite": "chaos-alert",
           "test": "hanging_alert_read_cannot_extend_the_total_budget"
+        },
+        {
+          "suite": "l1-follower-quorum",
+          "test": "each_lie_halts_the_follower_and_its_end_resumes_a_true_stream"
+        },
+        {
+          "suite": "batcher-null-receipts",
+          "test": "every_lie_lets_a_restarted_batcher_post_and_confirm_three_batches"
+        },
+        {
+          "suite": "alert-rules-l1",
+          "test": "the_l1_alert_rules_fire_and_resolve_on_the_case_series"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true
     },
     {
       "case": "l1-null-receipts",
       "family": "L1",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "batcher-null-receipts",
@@ -2980,21 +3189,49 @@
         {
           "suite": "batcher-post-age",
           "test": "a_failed_archive_read_retries_with_the_same_client_and_recovers"
+        },
+        {
+          "suite": "l1-follower-quorum",
+          "test": "null_receipts_with_swallowed_logs_halt_the_follower_until_they_end"
+        },
+        {
+          "suite": "alert-rules-l1",
+          "test": "the_l1_alert_rules_fire_and_resolve_on_the_case_series"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true
     },
     {
       "case": "two-day-outage",
       "family": "L1",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "l1-follower-quorum",
+          "test": "a_two_day_lie_holds_the_follower_and_its_end_resumes_without_a_gap"
+        },
+        {
+          "suite": "batcher-null-receipts",
+          "test": "every_lie_lets_a_restarted_batcher_post_and_confirm_three_batches"
+        },
+        {
+          "suite": "egress-owner",
+          "test": "the_prune_follows_the_lower_of_the_posted_head_and_the_final_head"
+        },
+        {
+          "suite": "alert-rules-l1",
+          "test": "the_l1_alert_rules_fire_and_resolve_on_the_case_series"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "deploy of the same images at T2 through Nomad job stop and restore: the local test restarts the follower and the da-watcher in one process, and Nomad drives the deployed job order"
+      ]
     },
     {
       "case": "batcher-outage-past-retention",
       "family": "L1",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "egress-owner",
@@ -3003,14 +3240,41 @@
         {
           "suite": "batcher-recovery",
           "test": "a_restored_post_is_reconciled_before_live_blocks_can_extend_it"
+        },
+        {
+          "suite": "batcher-null-receipts",
+          "test": "a_batcher_frozen_past_the_floor_posts_its_spool_then_the_rebuilt_gap_once"
+        },
+        {
+          "suite": "aeron-client-timeout-exit",
+          "test": "a_client_timeout_in_the_runtime_context_exits"
+        },
+        {
+          "suite": "aeron-client-timeout-exit",
+          "test": "a_client_timeout_in_the_archive_context_exits"
+        },
+        {
+          "suite": "aeron-client-timeout-exit",
+          "test": "a_client_timeout_in_both_contexts_at_once_exits"
+        },
+        {
+          "suite": "egress-owner",
+          "test": "a_frozen_posted_head_keeps_every_block_above_it_past_the_window"
+        },
+        {
+          "suite": "sealer-raft",
+          "test": "io.kardamom.sealer.cluster.SealerReplayTest::evictedRangeIsRefusedHonestly()"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restart of the batcher task after its fail-fast exit: the orchestrator, not the process, starts the new instance"
+      ]
     },
     {
       "case": "l1-transport-refusals",
       "family": "Follower",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "l1-source-quorum",
@@ -3023,14 +3287,26 @@
         {
           "suite": "l1-provider-http",
           "test": "unresponsive_sources_cannot_hold_the_follower_read_forever"
+        },
+        {
+          "suite": "l1-follower-quorum",
+          "test": "refused_providers_halt_the_follower_until_the_backoff_returns_them"
+        },
+        {
+          "suite": "batcher-null-receipts",
+          "test": "a_refusing_provider_fail_stops_the_post_and_a_restart_posts_it_once"
+        },
+        {
+          "suite": "alert-rules-l1",
+          "test": "the_l1_alert_rules_fire_and_resolve_on_the_case_series"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true
     },
     {
       "case": "follower-instance-loss",
       "family": "Follower",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "l1-watcher-recovery",
@@ -3039,14 +3315,18 @@
         {
           "suite": "l1-watcher-pause",
           "test": "a_watcher_without_its_record_pauses_on_the_follower_and_resumes"
+        },
+        {
+          "suite": "l1-follower-instances",
+          "test": "one_frozen_instance_leaves_the_stream_to_the_other_without_a_pause"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true
     },
     {
       "case": "follower-total-loss",
       "family": "Follower",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "l1-watcher-recovery",
@@ -3055,21 +3335,36 @@
         {
           "suite": "l1-watcher-pause",
           "test": "a_watcher_without_its_record_pauses_on_the_follower_and_resumes"
+        },
+        {
+          "suite": "l1-follower-instances",
+          "test": "both_instances_lost_pause_the_watcher_and_their_restart_resumes_it"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad stop and restore of the two-instance l1-indexer job: the local test kills and restarts the processes itself"
+      ]
     },
     {
       "case": "follower-disagreement",
       "family": "Follower",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "l1-source-quorum",
           "test": "one_liar_halts_the_read_with_both_answers_and_the_counter"
+        },
+        {
+          "suite": "l1-follower-instances",
+          "test": "a_forked_instance_halts_the_watcher_until_the_runbook_heals_it"
+        },
+        {
+          "suite": "alert-rules-l1",
+          "test": "the_l1_alert_rules_fire_and_resolve_on_the_case_series"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true
     },
     {
       "case": "mirror-backlog-client-restart",
