@@ -33,6 +33,11 @@ const RETENTION_CASES: [&str; 4] = [
     "canary-da-lag",
 ];
 
+/// How long a sealer member canvasses its peers after a full restart, in
+/// seconds. Aeron requires a multiple of the 10 s leader heartbeat
+/// timeout of the members.
+const STARTUP_CANVASS_S: u64 = 20;
+
 /// The DA-lag budget of the retention chain, in blocks: two blocks of
 /// posting cadence and a margin, small enough that a frozen batcher
 /// halts the chain within seconds.
@@ -289,7 +294,7 @@ impl Shard {
 
     /// The chaos-only deploy knobs of the shard, so each recovery fits
     /// the case deadline:
-    /// - every sealer member canvasses for 15 s after a full restart,
+    /// - every sealer member canvasses for 20 s after a full restart,
     ///   not 60 s;
     /// - a Nomad client is down after a 30 s heartbeat grace, not 60 s;
     /// - the cache shard checkpoints its executors every 10 s, so a
@@ -299,7 +304,9 @@ impl Shard {
     fn chaos_knobs(self) -> ChaosKnobs {
         let canary = self == Self::Retention;
         ChaosKnobs {
-            cluster_jvm_opts: Some("-Daeron.cluster.startup.canvass.timeout=15s".into()),
+            cluster_jvm_opts: Some(format!(
+                "-Daeron.cluster.startup.canvass.timeout={STARTUP_CANVASS_S}s"
+            )),
             heartbeat_grace_s: Some(30),
             canary_stalled_window: canary.then(|| "1m".into()),
             canary_force_pull: canary.then_some(false),
@@ -499,6 +506,16 @@ mod tests {
                 shard.name()
             );
         }
+    }
+
+    #[test]
+    fn the_startup_canvass_is_a_multiple_of_the_leader_heartbeat_timeout() {
+        // The leader heartbeat timeout of the members: the Aeron default
+        // of 10 s, which the cluster job keeps.
+        let leader_heartbeat_s = 10;
+        assert_eq!(STARTUP_CANVASS_S % leader_heartbeat_s, 0);
+        let opts = Shard::Cluster.deploy_vars().knobs.cluster_jvm_opts.unwrap();
+        assert_eq!(opts, "-Daeron.cluster.startup.canvass.timeout=20s");
     }
 
     #[test]
