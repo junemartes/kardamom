@@ -51,6 +51,15 @@ public enum GenesisFeatures {
         return value;
     }
 
+    /**
+     * The text of a refused start: the setting with this set, and
+     * {@code cause}, which names the seed or the snapshot that does not
+     * match the set and tells the operator what to do.
+     */
+    public String refusal(final String cause) {
+        return SETTING + "=" + value + ", but the " + cause;
+    }
+
     /** The number of features in the set: the set holds the first of features 3, 4 and 5 up to this count. */
     int count() {
         return ordinal();

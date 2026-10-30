@@ -161,6 +161,29 @@ class VersionSwitchGenesisTest {
         assertFalse(VersionSwitch.start().holdsEach(GenesisFeatures.SEALER_V4));
     }
 
+    /**
+     * The switch matches exactly the set that it started with: a missing
+     * feature or an extra genesis feature does not match. A real
+     * activation is no genesis activation.
+     */
+    @Test
+    void the_switch_matches_only_its_own_genesis_set() {
+        final VersionSwitch rules = VersionSwitch.genesis(GenesisFeatures.SEALER_V5);
+        assertTrue(rules.matchesGenesis(GenesisFeatures.SEALER_V5));
+        assertFalse(rules.matchesGenesis(GenesisFeatures.NONE));
+        assertFalse(rules.matchesGenesis(GenesisFeatures.SEALER_V4));
+        assertFalse(rules.matchesGenesis(GenesisFeatures.CARRY_WINDOW));
+        assertTrue(VersionSwitch.start().matchesGenesis(GenesisFeatures.NONE));
+        assertFalse(VersionSwitch.start().matchesGenesis(GenesisFeatures.SEALER_V4));
+        final CanonicalSealerState state = atGenesis(GenesisFeatures.NONE);
+        assertEquals(Outcome.STORED, activate(state, VersionSwitch.FEATURE_SEALER_V4, 7, 0L));
+        order(state, 7);
+        tick(state, 1_000L);
+        assertEquals(7L, reload(state).features().get(0).activationOrigin());
+        assertTrue(reload(state).matchesGenesis(GenesisFeatures.NONE), "a running chain with a real activation");
+        assertFalse(reload(atGenesis(GenesisFeatures.SEALER_V4)).matchesGenesis(GenesisFeatures.NONE));
+    }
+
     /** A member with the retained file holds no carry window: it drops one that it gets. */
     @Test
     void a_file_member_drops_the_carry_window() {
