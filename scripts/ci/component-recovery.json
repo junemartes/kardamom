@@ -452,24 +452,25 @@
         "kardamom-state-mirror",
         "--features",
         "docker-e2e",
-        "total_loss",
+        "component_tests::total_loss::",
         "--",
         "--ignored",
-        "--exact",
-        "mirror::component_tests::total_loss::a_total_loss_rebuilds_every_account_and_the_readers_recover"
+        "--test-threads=1"
       ],
       "real": [
         "Mirror::run and Rebuild with a 1,025-account checkpoint",
         "AccountCache over Sentinel discovery",
         "CacheReader degraded reads",
-        "Redis primary, replica and three Sentinels with no persistence"
+        "Redis primary, replica and three Sentinels with no persistence",
+        "three mirrors and two CacheReader instances with the production degraded and lookup counters"
       ],
       "controlled": [
         "docker kill of all five containers for 11 s, then a start in the first order",
         "a newer checkpoint written after the loss, as the executors do"
       ],
       "tests": [
-        "mirror::component_tests::total_loss::a_total_loss_rebuilds_every_account_and_the_readers_recover"
+        "mirror::component_tests::total_loss::a_total_loss_rebuilds_every_account_and_the_readers_recover",
+        "mirror::component_tests::total_loss::the_whole_read_path_returns_in_reverse_order_and_every_mirror_rebuilds"
       ],
       "negative_controls": [
         {
@@ -479,9 +480,17 @@
           "failed_tests": [
             "mirror::component_tests::total_loss::a_total_loss_rebuilds_every_account_and_the_readers_recover"
           ]
+        },
+        {
+          "mutation": "a cold Redis does not start a rebuild",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "mirror::component_tests::total_loss::the_whole_read_path_returns_in_reverse_order_and_every_mirror_rebuilds"
+          ]
         }
       ],
-      "limitation": "One mirror, fed by encoded frames instead of Aeron. Fixed host ports stand in for stable service addresses.",
+      "limitation": "The mirrors are fed by encoded frames instead of Aeron, and the executors stand in as a newer checkpoint and a live batch. Fixed host ports stand in for stable service addresses.",
       "ci_mode": "docker"
     },
     "cache-sentinel-total-loss": {
@@ -2827,7 +2836,7 @@
     {
       "case": "read-path-loss-recover",
       "family": "CombinedExec",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "executor-commit",
@@ -2872,9 +2881,24 @@
         {
           "suite": "state-mirror-total-loss",
           "test": "mirror::component_tests::total_loss::a_total_loss_rebuilds_every_account_and_the_readers_recover"
+        },
+        {
+          "suite": "state-mirror-total-loss",
+          "test": "mirror::component_tests::total_loss::the_whole_read_path_returns_in_reverse_order_and_every_mirror_rebuilds"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::returned_ingresses_serve_a_pre_fault_receipt_from_executor_state"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::a_whole_fleet_kill_resumes_each_replica_from_its_own_disk"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad stop and restore of the executor, redis and state-mirror jobs, and their allocation counts"
+      ]
     },
     {
       "case": "sequencer-executor-redis-loss",

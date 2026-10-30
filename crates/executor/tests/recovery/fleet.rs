@@ -118,12 +118,19 @@ impl World {
                             .parse::<i32>()
                             .ok()
                     })
-                    // SAFETY: signal 0 checks only that the process exists.
-                    .is_some_and(|pid| unsafe { libc::kill(pid, 0) } != 0)
+                    .is_some_and(Self::process_gone)
             })
             .for_each(|entry| {
                 let _ = std::fs::remove_dir_all(entry.path());
             });
+    }
+
+    /// Whether process `pid` no longer exists. Only ESRCH says so: EPERM
+    /// means a live process of another user.
+    fn process_gone(pid: i32) -> bool {
+        // SAFETY: signal 0 checks only that the process exists.
+        let failed = unsafe { libc::kill(pid, 0) } != 0;
+        failed && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
     }
 
     /// Whether `/dev/shm` exists with room for one more node.

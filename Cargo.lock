@@ -4459,6 +4459,7 @@ dependencies = [
  "kardamom-state",
  "kardamom-types",
  "metrics",
+ "metrics-exporter-prometheus",
  "redis",
  "serde",
  "tempfile",

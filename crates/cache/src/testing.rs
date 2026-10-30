@@ -9,6 +9,8 @@ use testcontainers::{ContainerAsync, GenericImage};
 
 use crate::config::CacheConfig;
 
+pub mod sentinel;
+
 /// A running Redis container, and the `[cache]` config that reaches it
 /// over a direct URL, with a short receipt TTL for the expiry tests.
 ///

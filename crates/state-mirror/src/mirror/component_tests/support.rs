@@ -32,6 +32,8 @@ pub(super) struct Fixture {
     /// Whether the mirror logs in as the ACL user `mirror`, which only
     /// the single Redis of the fixture defines.
     mirror_user: bool,
+    /// The number of mirrors whose heads a starting mirror reads.
+    mirrors: u32,
 }
 
 impl Fixture {
@@ -67,6 +69,7 @@ impl Fixture {
             cfg,
             root: tempfile::tempdir().unwrap(),
             mirror_user: redis.is_some(),
+            mirrors: 2,
             _redis: redis,
         };
         fixture.checkpoint();
@@ -133,6 +136,12 @@ impl Fixture {
         .unwrap();
         live.close().await.unwrap();
         fixture
+    }
+
+    /// Read the heads of `mirrors` mirrors at each start.
+    pub(super) fn with_mirrors(mut self, mirrors: u32) -> Self {
+        self.mirrors = mirrors;
+        self
     }
 
     pub(super) fn head_file(&self, id: u32) -> HeadFile {
@@ -320,7 +329,7 @@ impl Fixture {
             cache,
             receipts: TxReceiptsReceiver::from_test_frames(rx),
             id,
-            head_count: 2,
+            head_count: self.mirrors,
             head: self.head_file(id),
             rebuild: Rebuild::new(
                 self.root.path().join("checkpoints"),
