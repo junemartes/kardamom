@@ -11,6 +11,8 @@ use super::{DEGRADED, LOOKUPS, REDIS_LAYER, Readers};
 
 /// The newest position an ingress saw minus the highest mirror head.
 const HEAD_LAG: &str = "kardamom_cache_head_lag_txs";
+/// The reconnects of the reader to Redis through the sentinels.
+const RECONNECTS: &str = "kardamom_cache_reconnects_total";
 use crate::harness::Harness;
 use crate::metrics::{self, Scrape, Target};
 use crate::poll::{self, Budget};
@@ -63,6 +65,8 @@ impl Reader {
             before,
             after: Readers::parse(&body),
             head_lag: metrics::first(&body, HEAD_LAG),
+            degraded_by_reason: metrics::samples_of_interest(&body, &[DEGRADED]),
+            reconnects: metrics::sum(&body, RECONNECTS),
         })
     }
 
@@ -76,15 +80,22 @@ impl Reader {
 }
 
 /// One cold read of one ingress: its reader counters before and after,
-/// and the lag of the Redis projection behind the newest position the
-/// ingress saw. A lag above the stale bound of the ingress makes every
-/// head read skip Redis and count a degraded read.
+/// the lag of the Redis projection behind the newest position the
+/// ingress saw, the degraded reads by reason, and the reconnects. A lag
+/// above the stale bound makes every head read skip Redis as `stale`; a
+/// reader that reconnects skips Redis while it is not connected. The
+/// reasons and the reconnects tell the two apart in a failure.
 #[derive(Debug)]
+#[expect(
+    dead_code,
+    reason = "the failure text prints the evidence through Debug"
+)]
 struct Transition {
     before: Readers,
     after: Readers,
-    #[expect(dead_code, reason = "the failure text prints it through Debug")]
     head_lag: Option<i64>,
+    degraded_by_reason: Vec<String>,
+    reconnects: Option<i64>,
 }
 
 #[derive(Debug)]
