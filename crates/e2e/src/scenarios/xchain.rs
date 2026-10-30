@@ -566,16 +566,16 @@ async fn await_cursor(
     accept: impl Fn(u64) -> bool,
 ) -> Result<u64> {
     crate::harness::metrics::poll_until(
-        &format!(
-            "{what} cursor {} holds {want} (last: {:?})",
-            path.display(),
-            read_cursor(path)
-        ),
+        &format!("{what} cursor {} holds {want}", path.display()),
         CURSOR_PERSIST_BOUND,
         Duration::from_millis(100),
         async || Ok(read_cursor(path).filter(|c| accept(*c))),
     )
     .await
+    // The probe never fails, so an error is the timeout. Read the file
+    // again here, so that the message shows the last value and not the
+    // value before the poll.
+    .with_context(|| format!("last cursor value: {:?}", read_cursor(path)))
 }
 
 /// Wait until a durable lane cursor file is at least `min`. `what` names
