@@ -252,15 +252,21 @@ impl Mirror {
     /// removes the marker, unless a scheduled rebuild still needs it.
     async fn write_until_landed(&mut self, write: &Write<'_>) -> Result<()> {
         let started = Instant::now();
-        let mut retried = false;
-        while self.write_or_wait(write).await?.is_continue() {
-            retried = true;
+        let retried = self.write_or_wait(write).await?.is_continue();
+        if retried {
+            self.retry_until_landed(write).await?;
         }
         if started.elapsed() > OUTAGE_REBUILD_AFTER {
             self.progress.pending_rebuild = Some(RebuildReason::Outage);
         } else if retried && self.progress.pending_rebuild.is_none() {
             self.head.finish_rebuild()?;
         }
+        Ok(())
+    }
+
+    /// Retry the write until it lands or shutdown.
+    async fn retry_until_landed(&mut self, write: &Write<'_>) -> Result<()> {
+        while self.write_or_wait(write).await?.is_continue() {}
         Ok(())
     }
 
