@@ -16,13 +16,19 @@
         "AdmissionLoop::run",
         "ClusterRefPublisher",
         "SealerRules",
-        "production ingress/egress wire codecs"
+        "production ingress/egress wire codecs",
+        "two racing AdmissionLoop replicas per lane with per-process metrics",
+        "AccountLookupFeed with the ExecutorQuery HTTP client",
+        "EgressWatermarkFeed over a LiveEgress session channel, with the boundary-freshness metric"
       ],
       "controlled": [
         "bounded tx_data channel",
         "account lookup replies",
         "cluster ingress acceptance/disconnect/backpressure",
-        "canonical feed delivery"
+        "canonical feed delivery",
+        "sealer with first-seen dedup, contiguity guard and RelayedRef relay to each session",
+        "executor rows per ordered transaction and a loopback executor query that hangs or answers",
+        "replica freeze, graceful stop and hard kill with all ports cut"
       ],
       "tests": [
         "output_backpressure_and_disconnect_recover_without_new_client_input",
@@ -31,7 +37,12 @@
         "stalled_input_resumes_and_permanent_input_close_stops_the_actor",
         "delayed_canonical_input_fills_the_outbox_then_resumes_in_order",
         "a_permanent_output_encoding_failure_is_reported_instead_of_retried",
-        "shutdown_completes_while_output_is_disconnected"
+        "shutdown_completes_while_output_is_disconnected",
+        "a_graceful_replica_stop_keeps_the_lane_ordering_and_its_restart_rejoins",
+        "a_hard_replica_kill_loses_no_offer_and_its_cold_restart_rejoins",
+        "each_restarted_replica_orders_an_established_sender_while_its_twin_is_frozen",
+        "a_lapsed_replica_publishes_fresh_work_after_thaw_while_its_twin_ordered",
+        "a_lookup_blackout_fails_lookups_while_the_cluster_feed_lives_then_answers"
       ],
       "negative_controls": {
         "lost_session_replay": {
@@ -46,6 +57,35 @@
         },
         "permanent_error_retried": {
           "test": "a_permanent_output_encoding_failure",
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "lookup_request_dropped": {
+          "mutation": "The v2 loop never sends a lookup request.",
+          "tests": [
+            "a_graceful_replica_stop_keeps_the_lane_ordering_and_its_restart_rejoins",
+            "a_hard_replica_kill_loses_no_offer_and_its_cold_restart_rejoins",
+            "each_restarted_replica_orders_an_established_sender_while_its_twin_is_frozen",
+            "a_lapsed_replica_publishes_fresh_work_after_thaw_while_its_twin_ordered"
+          ],
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "lapse_backlog_ignored": {
+          "mutation": "The v2 loop ignores canonical and row events.",
+          "test": "a_lapsed_replica_publishes_fresh_work_after_thaw_while_its_twin_ordered",
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "lookup_answer_not_delivered": {
+          "mutation": "The account lookup task drops each answer.",
+          "test": "a_lookup_blackout_fails_lookups_while_the_cluster_feed_lives_then_answers",
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "boundary_freshness_not_marked": {
+          "mutation": "The egress feed does not set the boundary-freshness metric on a boundary.",
+          "test": "a_lookup_blackout_fails_lookups_while_the_cluster_feed_lives_then_answers",
           "exit_code": 101,
           "failed_as_expected": true
         }
@@ -2352,6 +2392,48 @@
       "test_timeout_s": 90,
       "test_timeout_reason": "the sequencer, executor and Redis loss returns its classes 8 s apart and waits up to 30 s for the case load; it runs 44 to 55 s locally"
     },
+    "sequencer-lapse-stack": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "e2e",
+        "--features",
+        "full-pipeline-e2e",
+        "--test",
+        "sequencer_lapse",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "kardamom-sequencer processes on the v2 loop: the case lane's replica and its twin",
+        "kardamom-ingress pair, kardamom-executor and kardamom-validator processes",
+        "Java sealer member and the host-native ArchivingMediaDriver with its client liveness",
+        "SIGSTOP and SIGCONT of the replica process, its Aeron fail-fast exit and its cold start"
+      ],
+      "controlled": [
+        "a 14-second freeze past the 10-second client liveness of the local driver",
+        "a case load of 1-wei transfers through ingress 0, and the recovery probe of the case sender and a fresh sender"
+      ],
+      "tests": [
+        "a_frozen_sequencer_exits_on_the_client_timeout_and_returns_cold_with_fresh_work"
+      ],
+      "limitation": "Stack suite: every service shares one host and one media driver. Nomad restarts the process in the deployment; here the test starts it after the exit.",
+      "negative_controls": [
+        {
+          "mutation": "The Aeron fail-fast handler logs the client error and does not exit, so the thawed replica keeps a dead client.",
+          "tests": [
+            "a_frozen_sequencer_exits_on_the_client_timeout_and_returns_cold_with_fresh_work"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        }
+      ],
+      "ci_mode": "stack"
+    },
     "pipeline-combined": {
       "command": [
         "cargo",
@@ -2779,40 +2861,78 @@
     {
       "case": "graceful-sequencer",
       "family": "Sequencer",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
+        {
+          "suite": "pipeline-recovery",
+          "test": "graceful_sequencer_drains_and_a_cold_start_regains_its_senders"
+        },
         {
           "suite": "sequencer",
           "test": "shutdown_completes_while_output_is_disconnected"
+        },
+        {
+          "suite": "sequencer",
+          "test": "a_graceful_replica_stop_keeps_the_lane_ordering_and_its_restart_rejoins"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad replaces the stopped seq-0 allocation within the restart SLO: allocation placement exists only in the deployment"
+      ]
     },
     {
       "case": "hard-sequencer",
       "family": "Sequencer",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "a_hard_replica_kill_loses_no_offer_and_its_cold_restart_rejoins"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts the killed sequencer-0 task container on its node: task supervision exists only in the deployment"
+      ]
     },
     {
       "case": "sequencer-replica-kill",
       "family": "Sequencer",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "each_restarted_replica_orders_an_established_sender_while_its_twin_is_frozen"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts the killed replica and the frozen twin keeps its container id: container identity exists only in the deployment"
+      ]
     },
     {
       "case": "sequencer-lapse",
       "family": "Sequencer",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "sequencer",
           "test": "delayed_canonical_input_fills_the_outbox_then_resumes_in_order"
+        },
+        {
+          "suite": "sequencer",
+          "test": "a_lapsed_replica_publishes_fresh_work_after_thaw_while_its_twin_ordered"
+        },
+        {
+          "suite": "sequencer-lapse-stack",
+          "test": "a_frozen_sequencer_exits_on_the_client_timeout_and_returns_cold_with_fresh_work"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the count of PAST-DEADLINE lines in the sealer logs: the case only reports it, from the deployed Java sealer"
+      ]
     },
     {
       "case": "validator-lapse",
@@ -2831,14 +2951,22 @@
     {
       "case": "lookup-blackout",
       "family": "Sequencer",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "sequencer",
           "test": "absent_lookup_reply_holds_the_sender_until_the_real_account_event_arrives"
+        },
+        {
+          "suite": "sequencer",
+          "test": "a_lookup_blackout_fails_lookups_while_the_cluster_feed_lives_then_answers"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts the lane-0 task and the replacement process stays the same through each proof: task supervision and container identity exist only in the deployment",
+        "iptables drops receipt DATA frames, executor query TCP and Redis TCP on the sequencer node: the kernel packet filter of the deployed node; the local test withholds the rows, holds every executor query and runs without Redis, so the Redis client error path is left to the deployment"
+      ]
     },
     {
       "case": "cluster-leader-kill",

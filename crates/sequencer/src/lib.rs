@@ -37,8 +37,10 @@
 #[cfg(all(feature = "floor-seams", not(debug_assertions)))]
 compile_error!("the floor-seams feature is for test builds; a release build must not enable it");
 
+pub mod account_lookup;
 pub mod admission;
 pub mod config;
+pub mod egress_feed;
 pub mod epoch;
 pub mod error;
 #[cfg(any(test, feature = "testing"))]

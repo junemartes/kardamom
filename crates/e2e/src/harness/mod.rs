@@ -21,6 +21,7 @@ mod config;
 mod consumers;
 mod control;
 pub mod faults;
+mod freeze;
 pub mod ingress;
 pub mod inject;
 pub mod l1;
