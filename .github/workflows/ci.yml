@@ -238,10 +238,8 @@ jobs:
           path: /tmp/component-images.tar.zst
           key: ${{ steps.image-key.outputs.key }}
 
-  # The sealer's JUnit suite (~2,250 lines: failover, replay, snapshot
-  # restore, fanout, contiguity guard) previously ran on no workflow — both
-  # Gradle-touching workflows only built shadowJar
-  # (docs/agents/l1-client-suite-port-spec.md, W3).
+  # The JUnit suite of the sealer, less the methods of the component
+  # recovery catalog.
   sealer-test:
     name: sealer tests
     runs-on: ubuntu-latest
@@ -256,9 +254,13 @@ jobs:
           cache-dependency-path: |
             cluster/sealer-service/**/*.gradle
             cluster/sealer-service/gradle/wrapper/gradle-wrapper.properties
+      # The component recovery shards run the catalogued JUnit methods. This
+      # job runs the rest, so that each test runs once.
+      - name: Leave out the catalogued sealer tests
+        run: python3 scripts/ci/sealer_excludes.py "$RUNNER_TEMP/sealer-excludes.gradle"
       - name: Run sealer JUnit suite
         working-directory: cluster/sealer-service
-        run: ./gradlew :core:test :core:allocationGate :service:test --no-daemon
+        run: ./gradlew --init-script "$RUNNER_TEMP/sealer-excludes.gradle" :core:test :core:allocationGate :service:test --no-daemon
       - name: Upload test reports
         if: failure()
         uses: actions/upload-artifact@v4
@@ -300,28 +302,34 @@ jobs:
           KARDAMOM_EEST_FIXTURES="$(just eest-fixtures | tail -1)" \
             cargo test -p kardamom-exec-core --release --test eest_state --locked -- --ignored --nocapture
 
+  # The workspace tests from the nextest archive of the build job: this
+  # job compiles nothing. The archive holds the lib, bin, test and example
+  # targets; the doc-test job runs the bench targets.
   test:
     name: test
+    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # anvil and forge for the tests that start an L1 or build contracts.
       - uses: ./.github/actions/foundry
-      # forge build downloads the pinned solc on a cold host; the cache
-      # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
-      - name: Install system build deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
-      # The dev-profile caches. This job compiles every target of the
-      # workspace, so it saves them for the other dev-profile jobs.
-      - uses: ./.github/actions/rust-build-cache
+      - uses: taiki-e/install-action@v2
         with:
-          shared-key: dev
-          save-if: ${{ github.event_name == 'push' }}
-      - run: cargo test --workspace --all-targets --locked
+          tool: nextest
+      - uses: actions/download-artifact@v4
+        with:
+          name: workspace-nextest-archive
+          path: /tmp/workspace-archive
+      # The archive goes to target/ of the checkout, the path of the build
+      # job: a test that finds a binary by its compile-time path
+      # (CARGO_BIN_EXE_*) finds it there.
+      - name: Run the workspace tests
+        run: |
+          cargo nextest run --archive-file /tmp/workspace-archive/workspace-tests.tar.zst \
+            --workspace-remap . --extract-to . --extract-overwrite --no-fail-fast
       - name: Component evidence runner checks
         run: python3 scripts/tests/test_components.py
 
@@ -340,11 +348,17 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+      # The dev-profile caches. This job compiles the libraries and the
+      # benches of the workspace, so it saves them for the other
+      # dev-profile jobs.
       - uses: ./.github/actions/rust-build-cache
         with:
           shared-key: dev
-          save-if: false
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo test --workspace --doc --locked
+      # The bench targets in test mode: each benchmark runs once. The
+      # nextest archive of the test job holds no bench target.
+      - run: cargo test --workspace --benches --locked
 
   # Every Solidity check on one runner: each one takes a minute or less,
   # and five runners for them cost more queue time than they save. The
