@@ -114,6 +114,47 @@ These reuse the existing Java fixtures and start no chain stack. The Raft group
 still uses real scheduling and local Aeron transport; the actor clock does not accelerate
 its consensus protocol.
 
+`just test-component sealer-carry` runs four Java checks of the carry rollout on three
+real in-JVM Aeron consensus members. The members take the same feature activation
+frames as on the deployed chain, and only epochs force a boundary. The checks are:
+
+- Feature 4 turns off. Every member goes back to decision version 4 and reports it to
+  the session. Two references without bytes, released after the downgrade, are ordered
+  in nonce order. Feature 4 turns on again.
+- Feature 5 turns on while a follower is down. The follower starts again, replays the
+  log and ends with the state bytes, the rules and the exact window of its peers.
+- Feature 5 turns off and on. Off, every unposted frame stays. On, every member drains
+  to the window at the same entry.
+- The leader stops less than two seconds after it switches. A new leader keeps the
+  canonical stream going, and the old leader starts again with the exact window.
+
+Each check also requires the exact canonical payloads, contiguous indexes and no
+refused reference. Two negative controls fail these checks: no window rule at the
+switch, and no version report to the sessions.
+
+`just test-component sequencer-carry` runs the real v2 admission loop. It holds a
+nonce gap under version 5. The sealer then reports version 4, and the loop releases
+both offers in nonce order, each in the exact format of version 4. Version 5 brings
+the bytes back. The negative control lets a report of the current session only raise
+the version.
+
+`just test-component egress-carry` runs the real egress store, owner and HTTP side in
+a child process. The first blocks hold references, so R is the last of them; the later
+blocks hold entries with their bytes. Two real carried readers start past R. A reader
+below R meets a reference and stops. The parent kills the child with SIGKILL, so the
+side file of the mark keeps its lead. A new child opens the same store on the same
+address. R must not change, and both readers must read on past a hole through it. The
+negative control takes R from the side file.
+
+`just test-component executor-carry` runs the real executor pipeline. An executor runs
+by reference, stops after a committed block, and starts again in carry mode on an egress
+that serves the entries with their bytes. Three L1 epochs credit deposits before, across
+and after the move. Each moved executor must match the receipts, boundaries and accounts
+of an executor that never moves, and each deposit must credit once, in L1 order. The
+negative control drops the record at the cursor of the carried reader. These checks use
+the egress as the carried source. The member feed over Aeron IPC has its own checks in
+the Java feed tests and the Docker feed reader test.
+
 Java targets force test execution and remove their selected old XML reports before
 running. The runner requires fresh reports, preserves them with the logs, names
 every passing/failing test, and rejects skipped or missing expected tests even
