@@ -2,47 +2,28 @@
 //! mirror heads.
 //!
 //! One `MultiplexedConnection` serves every task; it is `Clone`, and the
-//! handle swaps it for a fresh one after a failure. In Sentinel mode the
-//! fresh connection comes from asking the sentinels for the primary again,
-//! so a failover heals on the next command. The swap goes through an
-//! `ArcSwap` and a single-flight flag, never a lock.
+//! handle swaps it for a fresh one after a connection failure or a long
+//! stall (see [`crate::link`]). In Sentinel mode the fresh connection
+//! comes from asking the sentinels for the primary again, so a failover
+//! heals on the next command. The swap goes through an `ArcSwap` and a
+//! single-flight flag, never a lock.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, U256};
 use arc_swap::ArcSwap;
 use kardamom_types::{AccountRow, BPosition, Receipt, TX_TYPE_XCHAIN};
+use redis::Script;
 use redis::aio::MultiplexedConnection;
-use redis::sentinel::{SentinelClient, SentinelNodeConnectionInfo, SentinelServerType};
-use redis::{RedisConnectionInfo, Script};
 use tracing::{info, warn};
 
 use crate::config::CacheConfig;
 use crate::error::CacheError;
+use crate::link::Link;
+use crate::source::Source;
 use crate::{keys, metrics, script};
-
-/// The bound of one connection attempt is this many command timeouts.
-/// A frozen primary accepts the TCP connection and never answers the
-/// handshake; without a bound the reconnect would wait for the thaw, and
-/// the reader would never follow a sentinel failover.
-const CONNECT_TIMEOUTS: u32 = 10;
-
-fn connect_timeout(cfg: &CacheConfig) -> Duration {
-    cfg.timeout().saturating_mul(CONNECT_TIMEOUTS)
-}
-
-/// One connection attempt within `bound`.
-async fn connect_within(
-    source: &Source,
-    bound: Duration,
-) -> Result<MultiplexedConnection, CacheError> {
-    tokio::time::timeout(bound, source.connect())
-        .await
-        .map_err(|_| CacheError::Timeout)?
-}
 
 /// The keys one `SCAN` page asks for. Redis may return more or fewer.
 const SCAN_PAGE: u64 = 1_000;
@@ -103,77 +84,13 @@ impl RowsWritten {
     }
 }
 
-/// Where a fresh connection comes from.
-enum Source {
-    Url(redis::Client),
-    Sentinel {
-        addrs: Vec<String>,
-        master_name: String,
-        node: SentinelNodeConnectionInfo,
-    },
-}
-
-impl Source {
-    async fn connect(&self) -> Result<MultiplexedConnection, CacheError> {
-        match self {
-            Self::Url(client) => Ok(client.get_multiplexed_async_connection().await?),
-            Self::Sentinel {
-                addrs,
-                master_name,
-                node,
-            } => Self::from_any_sentinel(addrs, master_name, node).await,
-        }
-    }
-
-    /// The primary as the first sentinel that names a live one sees it.
-    ///
-    /// The client library asks the sentinels in order and keeps the
-    /// answer of the first that replies, even when that answer names a
-    /// replica or a primary the sentinel has marked down. After two
-    /// failovers in 30 s one sentinel kept naming the demoted node for
-    /// ten minutes, so every connection failed while the other two
-    /// sentinels named the live primary. So ask each sentinel on its
-    /// own, and keep the first answer that a primary accepts.
-    async fn from_any_sentinel(
-        addrs: &[String],
-        master_name: &str,
-        node: &SentinelNodeConnectionInfo,
-    ) -> Result<MultiplexedConnection, CacheError> {
-        let mut last = None;
-        for addr in addrs {
-            match Self::from_sentinel(addr, master_name, node).await {
-                Ok(conn) => return Ok(conn),
-                Err(e) => {
-                    warn!(sentinel = addr, error = %e, "sentinel named no live primary");
-                    last = Some(e);
-                }
-            }
-        }
-        Err(last.unwrap_or(CacheError::Disabled))
-    }
-
-    async fn from_sentinel(
-        addr: &str,
-        master_name: &str,
-        node: &SentinelNodeConnectionInfo,
-    ) -> Result<MultiplexedConnection, CacheError> {
-        let mut client = SentinelClient::build(
-            vec![addr.to_string()],
-            master_name.to_string(),
-            Some(node.clone()),
-            SentinelServerType::Master,
-        )?;
-        Ok(client.get_async_connection().await?)
-    }
-}
-
 /// The shared client. Cheap to clone; every clone shares the connection
 /// and the reconnect flag.
 #[derive(Clone)]
 pub struct AccountCache {
     conn: Arc<ArcSwap<MultiplexedConnection>>,
     source: Arc<Source>,
-    reconnecting: Arc<AtomicBool>,
+    link: Arc<Link>,
     timeout: Duration,
     /// The bound of one connection attempt, sentinel lookup included.
     connect_timeout: Duration,
@@ -192,15 +109,15 @@ impl AccountCache {
     /// named but unset, and the Redis error when the first connection
     /// fails.
     pub async fn connect(cfg: &CacheConfig) -> Result<Self, CacheError> {
-        let source = Self::source(cfg)?;
-        let conn = connect_within(&source, connect_timeout(cfg)).await?;
+        let source = Source::of(cfg)?;
+        let conn = source.connect(Source::bound(cfg)).await?;
         info!(sentinel = !cfg.sentinels.is_empty(), "cache connected");
         Ok(Self {
             conn: Arc::new(ArcSwap::from_pointee(conn)),
             source: Arc::new(source),
-            reconnecting: Arc::new(AtomicBool::new(false)),
+            link: Arc::new(Link::new(cfg.timeout())),
             timeout: cfg.timeout(),
-            connect_timeout: connect_timeout(cfg),
+            connect_timeout: Source::bound(cfg),
             receipt_ttl: Duration::from_secs(cfg.receipt_ttl_secs.get()),
             head_ttl: Duration::from_secs(cfg.head_ttl_secs.get()),
             apply_row: Arc::new(Script::new(script::APPLY_ROW)),
@@ -232,31 +149,10 @@ impl AccountCache {
         }
     }
 
-    fn source(cfg: &CacheConfig) -> Result<Source, CacheError> {
-        let password = cfg.password()?;
-        let auth = |info: RedisConnectionInfo| {
-            with_auth(info, cfg.username.as_deref(), password.as_deref())
-        };
-        if !cfg.sentinels.is_empty() {
-            let node = SentinelNodeConnectionInfo::default()
-                .set_redis_connection_info(auth(RedisConnectionInfo::default()));
-            return Ok(Source::Sentinel {
-                addrs: cfg.sentinels.clone(),
-                master_name: cfg.master_name.clone(),
-                node,
-            });
-        }
-        let url = cfg.url.as_deref().ok_or(CacheError::Disabled)?;
-        let info = redis::Client::open(url)?.get_connection_info().clone();
-        let redis = auth(info.redis_settings().clone());
-        Ok(Source::Url(redis::Client::open(
-            info.set_redis_settings(redis),
-        )?))
-    }
-
     /// Run one command against the current connection, within the
-    /// timeout. A failure schedules one reconnect and reports the error;
-    /// the caller degrades.
+    /// timeout. A failure reports the error, and the caller degrades. A
+    /// failure that proves the connection dead or stalled schedules one
+    /// reconnect.
     async fn run<T: redis::FromRedisValue>(&self, cmd: &redis::Cmd) -> Result<T, CacheError> {
         let mut conn = (**self.conn.load()).clone();
         let result = tokio::time::timeout(self.timeout, cmd.query_async::<T>(&mut conn)).await;
@@ -284,51 +180,56 @@ impl AccountCache {
         self.settle(result).map(|_sha: String| ())
     }
 
-    /// Map a timed command's outcome and schedule a reconnect on failure.
+    /// Map a timed command's outcome, and schedule a reconnect when
+    /// the failure needs one.
     fn settle<T>(
         &self,
         result: Result<redis::RedisResult<T>, tokio::time::error::Elapsed>,
     ) -> Result<T, CacheError> {
-        match result {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(e)) => {
-                self.reconnect_later();
-                Err(CacheError::Redis(e))
+        let error = match result {
+            Ok(Ok(value)) => {
+                self.link.replied();
+                return Ok(value);
             }
-            Err(_) => {
-                self.reconnect_later();
-                Err(CacheError::Timeout)
-            }
+            Ok(Err(e)) => CacheError::Redis(e),
+            Err(_) => CacheError::Timeout,
+        };
+        if self.link.must_replace(&error) {
+            self.reconnect_later();
         }
+        Err(error)
     }
 
-    /// Whether a reconnect is in flight. A reader skips its reads
-    /// meanwhile: each would pay the full timeout for nothing.
+    /// Whether the connection failed with a connection error and no new
+    /// one replaces it yet. A reader skips its reads meanwhile. A
+    /// connection that only timed out is still live, and a reader keeps
+    /// reading on it.
     #[must_use]
-    pub fn reconnecting(&self) -> bool {
-        self.reconnecting.load(Ordering::Acquire)
+    pub fn connection_lost(&self) -> bool {
+        self.link.lost()
     }
 
     /// Replace the connection in the background, once per failure burst.
+    /// A failed attempt waits out a bounded backoff before the next
+    /// failure may try again.
     fn reconnect_later(&self) {
-        let claimed = self
-            .reconnecting
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        if !claimed {
+        if !self.link.claim() {
             return;
         }
         crate::metrics::record_reconnect();
         let this = self.clone();
         tokio::spawn(async move {
-            match connect_within(&this.source, this.connect_timeout).await {
+            match this.source.connect(this.connect_timeout).await {
                 Ok(conn) => {
                     this.conn.store(Arc::new(conn));
+                    this.link.replaced();
                     info!("cache reconnected");
                 }
-                Err(e) => warn!(error = %e, "cache reconnect failed; next failure retries"),
+                Err(e) => {
+                    warn!(error = %e, "cache reconnect failed; next failure retries");
+                    this.link.failed().await;
+                }
             }
-            this.reconnecting.store(false, Ordering::Release);
         });
     }
 
@@ -623,21 +524,6 @@ impl AccountCache {
         let millis = u64::try_from(self.timeout.as_millis() / 2).unwrap_or(u64::MAX);
         self.run(redis::cmd("WAIT").arg(1).arg(millis)).await
     }
-}
-
-/// The ACL credentials from the config, over what the URL carried.
-fn with_auth(
-    mut info: RedisConnectionInfo,
-    username: Option<&str>,
-    password: Option<&str>,
-) -> RedisConnectionInfo {
-    if let Some(username) = username {
-        info = info.set_username(username);
-    }
-    if let Some(password) = password {
-        info = info.set_password(password);
-    }
-    info
 }
 
 /// Decode an account hash. A field that does not parse is a codec error:

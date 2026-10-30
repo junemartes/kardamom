@@ -32,7 +32,7 @@ reqwest = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
-tokio = { workspace = true, features = ["rt", "time", "sync"] }
+tokio = { workspace = true, features = ["rt", "time", "sync", "net"] }
 testcontainers = { workspace = true, optional = true }
 
 [dev-dependencies]

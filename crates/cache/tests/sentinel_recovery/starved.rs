@@ -114,7 +114,10 @@ impl Churn {
         let text = handle.render();
         Self {
             reconnects: Self::value(&text, "kardamom_cache_reconnects_total "),
-            skipped: Self::value(&text, "kardamom_cache_degraded_total{reason=\"reconnecting\"} "),
+            skipped: Self::value(
+                &text,
+                "kardamom_cache_degraded_total{reason=\"reconnecting\"} ",
+            ),
         }
     }
 

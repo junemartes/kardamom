@@ -187,7 +187,11 @@ struct Reads {
 }
 
 impl Reads {
-    async fn during(reader: &CacheReader, address: alloy_primitives::Address, window: Duration) -> Self {
+    async fn during(
+        reader: &CacheReader,
+        address: alloy_primitives::Address,
+        window: Duration,
+    ) -> Self {
         let end = tokio::time::Instant::now() + window;
         let mut reads = Self {
             total: 0,
