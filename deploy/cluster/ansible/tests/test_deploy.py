@@ -764,6 +764,20 @@ class DeployTest(Deploys):
             'canvass': ['-Daeron.cluster.startup.canvass.timeout=15s'], 'checkpoint': '5', 'stalled': '1m',
             'force_pull': False, 'rules_unchanged': False})
 
+    def test_an_aeron_client_retries_until_the_driver_of_its_node_runs(self):
+        """An Aeron client exits until the media driver of its node runs
+        again. Ten attempts at a 5 s delay cover that start; the policy is
+        the same in every environment."""
+        self.run_deploy(check=True)
+        policies = {name: {(g['RestartPolicy']['Attempts'], g['RestartPolicy']['Interval'],
+                            g['RestartPolicy']['Delay'], g['RestartPolicy']['Mode'])
+                           for g in self.api.state['plans'][name]['TaskGroups']}
+                    for name in ('batcher', 'ingress', 'l1-indexer', 'notifier', 'state-mirror',
+                                 'da-watcher', 'executor', 'sequencer')}
+        minute, five_s = 60_000_000_000, 5_000_000_000
+        for name, policy in policies.items():
+            self.assertEqual(policy, {(10, minute, five_s, 'delay')}, name)
+
     def test_the_local_profile_runs_no_canary_by_default(self):
         self.run_deploy(check=True)
         self.assertNotIn('canary', self.api.state['plans'])

@@ -208,7 +208,11 @@ job "batcher" {
     # an aged-out cluster replay, fail-stops repeatedly, and surfaces
     # through the semantics shard's l1-batch assertion instead.
     restart {
-      attempts = 3
+      # An Aeron client exits until the media driver of its node runs
+      # again, as after a node restart. Ten attempts at the 5 s delay
+      # cover that start; three fast failures left the rest of the
+      # interval without a try.
+      attempts = 10
       interval = "1m"
       delay    = "5s"
       mode     = "delay"
