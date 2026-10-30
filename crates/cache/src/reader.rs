@@ -3,9 +3,10 @@
 //! A reader never stalls on Redis. [`CacheReader::spawn`] returns at once
 //! and one background task connects with a backoff, then polls the mirror
 //! heads every 100 ms into an atomic. Every read before the first
-//! connection, on a lost connection, past the timeout, or on an error
-//! answers `None` and counts a degraded read; the caller admits. So Redis
-//! makes admission faster and never blocks it.
+//! connection, on a lost connection, during a reconnect, past the
+//! timeout, or on an error answers `None` and counts a degraded read;
+//! the caller admits. So Redis makes admission faster and never blocks
+//! it.
 //!
 //! Freshness is a position lag, never wall clock: the newest position the
 //! local layer has seen minus the highest live mirror head. An idle chain
@@ -33,7 +34,7 @@ const HEAD_INTERVAL: Duration = Duration::from_millis(100);
 const CONNECT_BACKOFF: Duration = Duration::from_secs(1);
 
 /// A Redis read that gave no answer: no connection, a lost connection,
-/// a timeout, or an error.
+/// a reconnect, a timeout, or an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Degraded;
 
@@ -123,7 +124,7 @@ impl CacheReader {
     /// # Errors
     ///
     /// Returns [`Degraded`] when Redis is not connected, the connection
-    /// is lost, or a read times out or fails.
+    /// is lost or reconnects, or a read times out or fails.
     pub async fn read_account(&self, address: Address) -> Result<Option<AccountView>, Degraded> {
         let cache = self.usable().ok_or(Degraded)?;
         match cache.account(address).await {
@@ -159,16 +160,17 @@ impl CacheReader {
         }
     }
 
-    /// The client, when it is connected and its connection is not lost.
-    /// A read on a lost connection fails for nothing until the reconnect
-    /// replaces it: skip and count. A connection that only timed out
-    /// stays usable, because a stalled primary answers on it again.
+    /// The client, when it is connected and not mid-reconnect. A read
+    /// on a lost connection or during a reconnect fails or pays the full
+    /// timeout for nothing, and every cold submit of an outage would pay
+    /// it: skip and count. A connection that only timed out stays
+    /// usable, because a stalled primary answers on it again.
     fn usable(&self) -> Option<Arc<AccountCache>> {
         let Some(cache) = self.cache.load_full() else {
             metrics::record_degraded("disconnected");
             return None;
         };
-        if cache.connection_lost() {
+        if cache.reconnecting() {
             metrics::record_degraded("reconnecting");
             return None;
         }

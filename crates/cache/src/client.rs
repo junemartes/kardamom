@@ -200,13 +200,14 @@ impl AccountCache {
         Err(error)
     }
 
-    /// Whether the connection failed with a connection error and no new
-    /// one replaces it yet. A reader skips its reads meanwhile. A
-    /// connection that only timed out is still live, and a reader keeps
-    /// reading on it.
+    /// Whether a reader skips its reads: the connection failed with a
+    /// connection error, or a replacement is in flight. A read then pays
+    /// the full timeout or fails, for nothing. A connection that only
+    /// timed out, with no replacement yet, stays in use: a stalled
+    /// primary answers on it again.
     #[must_use]
-    pub fn connection_lost(&self) -> bool {
-        self.link.lost()
+    pub fn reconnecting(&self) -> bool {
+        self.link.lost() || self.link.replacing()
     }
 
     /// Replace the connection in the background, once per failure burst.

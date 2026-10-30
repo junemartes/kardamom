@@ -41,15 +41,19 @@ pub(crate) struct Link {
 }
 
 impl Link {
+    /// The health of a connection that has just connected: the last
+    /// reply is now, as after [`Self::replaced`].
     pub(crate) fn new(timeout: Duration) -> Self {
-        Self {
+        let link = Self {
             epoch: Instant::now(),
             replied: AtomicU64::new(0),
             lost: AtomicBool::new(false),
             replacing: AtomicBool::new(false),
             backoff: AtomicU64::new(Self::millis(BACKOFF_FIRST)),
             stall: timeout.saturating_mul(STALL_TIMEOUTS),
-        }
+        };
+        link.replied();
+        link
     }
 
     /// The server replied on the connection.
@@ -79,6 +83,11 @@ impl Link {
     /// one replaces it yet. A command on it fails at once.
     pub(crate) fn lost(&self) -> bool {
         self.lost.load(Ordering::Acquire)
+    }
+
+    /// Whether a replacement is in flight.
+    pub(crate) fn replacing(&self) -> bool {
+        self.replacing.load(Ordering::Acquire)
     }
 
     /// Claim the one replacement. False when another one is in flight.

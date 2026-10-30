@@ -154,16 +154,24 @@ impl Ask<'_> {
     /// sentinels named the live primary. So ask each sentinel on its
     /// own, and keep the first answer that a primary accepts. A hung
     /// Sentinel accepts the TCP connection and never answers, so each
-    /// question ends after the bound.
+    /// question ends after the bound, and all questions run at once: a
+    /// hung Sentinel delays no other. `sentinels` is never empty: the
+    /// source has at least one configured Sentinel, and each one expands
+    /// to at least itself.
     async fn any(&self, sentinels: &[ConnectionInfo]) -> Result<MultiplexedConnection, CacheError> {
-        let mut last = None;
-        for sentinel in sentinels {
-            match self.one(sentinel).await {
-                Ok(conn) => return Ok(conn),
-                Err(e) => last = Some(Self::named_none(sentinel, e)),
-            }
-        }
-        Err(last.unwrap_or(CacheError::Disabled))
+        let questions = sentinels
+            .iter()
+            .map(|sentinel| Box::pin(self.named(sentinel)));
+        let (conn, _slower) = futures::future::select_ok(questions).await?;
+        Ok(conn)
+    }
+
+    /// One question, with a warning when its Sentinel names no live
+    /// primary.
+    async fn named(&self, sentinel: &ConnectionInfo) -> Result<MultiplexedConnection, CacheError> {
+        self.one(sentinel)
+            .await
+            .map_err(|error| Self::named_none(sentinel, error))
     }
 
     async fn one(&self, sentinel: &ConnectionInfo) -> Result<MultiplexedConnection, CacheError> {
