@@ -31,9 +31,15 @@ class ComponentTests(unittest.TestCase):
             self.assertEqual(len(component.Bundle.build_messages(log)), 1)
 
     def test_catalog_builds_one_graph_without_docker_features(self):
-        suites = component.Bundle.selection(json.loads(component.CATALOG.read_text()))
+        catalog = json.loads(component.CATALOG.read_text())
+        suites = component.Bundle.selection(catalog)
         command = component.Bundle.build_command(suites)
-        self.assertEqual(len(suites), 14)
+        # The selection is every suite the catalog marks in-process, so a
+        # new port changes no number here, and a lost suite still fails.
+        in_process = sorted(name for name, suite in catalog["local_suites"].items()
+                            if suite.get("ci_mode") == "in-process")
+        self.assertTrue(in_process)
+        self.assertEqual(sorted(suites), in_process)
         self.assertEqual(command.count("cargo"), 1)
         self.assertNotIn("--features", command)
         for suite in suites.values():
