@@ -32,6 +32,15 @@ const MIRROR_BOUND: Duration = Duration::from_secs(40);
 /// The dev account whose row only a rebuild writes: funded at genesis,
 /// and no case sends from it or to it.
 const UNTOUCHED: usize = 10;
+/// The sealed head of the sealer status, as ingress 0 exports it.
+const SEALED_HEAD: &str = "kardamom_ingress_cluster_sealed_head";
+/// How long the sealed head gets to rise, and the executor then gets to
+/// reach it. The new leader answers a replay request at once, so this is
+/// far above the time that a recovery needs.
+const HEAD_BOUND: Duration = Duration::from_secs(15);
+/// How many blocks the new leader seals before the executor must reach
+/// its head: about two seconds of boundary ticks.
+const HEAD_RISE: u64 = 8;
 /// How long the returned members get to close an election.
 const ELECTION_BOUND: Duration = Duration::from_secs(30);
 
@@ -157,6 +166,10 @@ pub enum Case {
     PipelineBlackout,
     /// A combined outage of the ingress, sequencer and sealer classes.
     Combined(Combined),
+    /// `sealer-leader-loss-recover`: a stop of the sealer leader alone,
+    /// while the case load flows. The other two members elect a new
+    /// leader, and every cluster session moves to it.
+    SealerLeaderLoss(Stop),
 }
 
 /// One reading of the pipeline while classes are down.
@@ -193,6 +206,56 @@ impl Run<'_> {
                 Err(e) => Some(Err(e)),
             })
             .collect()
+    }
+
+    /// One reading of a gauge at `addr`, `None` while it is absent.
+    async fn gauge(addr: std::net::SocketAddr, name: &str) -> Result<Option<u64>> {
+        metrics::scrape(addr)
+            .await?
+            .value(name)
+            .map(metric_u64)
+            .transpose()
+    }
+
+    /// The new leader seals [`HEAD_RISE`] blocks past the sealed head
+    /// that ingress 0 reads now, and the executor block reaches that
+    /// target, within [`HEAD_BOUND`]. The rise proves that the target
+    /// was sealed after every client moved to the new leader.
+    async fn assert_executor_at_sealed_head(&self) -> Result<()> {
+        let ingress = self.stack.ingress_metrics(0)?;
+        let executor = self.stack.executor_metrics();
+        let start = Self::gauge(ingress, SEALED_HEAD)
+            .await?
+            .context("the sealed head of ingress 0")?;
+        let target = start + HEAD_RISE;
+        metrics::poll_until(
+            &format!("the sealed head rises from {start} to {target}"),
+            HEAD_BOUND,
+            Duration::from_millis(200),
+            async || {
+                Ok(Self::gauge(ingress, SEALED_HEAD)
+                    .await?
+                    .filter(|h| *h >= target))
+            },
+        )
+        .await?;
+        let mut last = None;
+        metrics::poll_until(
+            &format!("the executor block reaches the sealed head {target}"),
+            HEAD_BOUND,
+            Duration::from_millis(200),
+            async || {
+                last = Self::gauge(executor, EXEC_BLOCK_NUMBER).await?;
+                Ok(last.filter(|b| *b >= target))
+            },
+        )
+        .await
+        .with_context(|| format!("last executor block: {last:?}"))?;
+        eprintln!(
+            "{}: the executor block reached the sealed head {target}",
+            self.at()
+        );
+        Ok(())
     }
 
     /// The case load lands nothing for one second: the outage is real.
@@ -278,7 +341,44 @@ impl Case {
             Self::SequencerLaneLoss => Self::sequencer_lane(run, load).await,
             Self::PipelineBlackout => Self::blackout(run).await,
             Self::Combined(c) => c.run(run, load).await,
+            Self::SealerLeaderLoss(stop) => Self::sealer_leader(run, stop).await,
         }
+    }
+
+    /// Stop the sealer leader. The two other members elect a new leader.
+    /// The executor then reaches the sealed head that the ingress reads
+    /// from the sealer status: its reader must close the frames that the
+    /// old leader never sent.
+    async fn sealer_leader(run: &mut Run<'_>, stop: Stop) -> Result<()> {
+        let root = run.stack.root();
+        let members = run.stack.sealer_members();
+        let old = SealerLogs::await_elected(&root, members, ELECTION_BOUND).await?;
+        run.stack
+            .stop_sealer_member(usize::try_from(old.leader)?, stop)?;
+        eprintln!(
+            "{}: sealer leader {} of term {} stopped ({stop:?})",
+            run.at(),
+            old.leader,
+            old.term
+        );
+        let new = metrics::poll_until(
+            "the two other sealer members elect a new leader",
+            ELECTION_BOUND,
+            Duration::from_millis(200),
+            async || {
+                Ok(SealerLogs::read(&root, members)?
+                    .elected()
+                    .filter(|e| e.term > old.term))
+            },
+        )
+        .await?;
+        eprintln!(
+            "{}: members elected member {} in term {}",
+            run.at(),
+            new.leader,
+            new.term
+        );
+        run.assert_executor_at_sealed_head().await
     }
 
     /// Stop ingress 0, the ingress of the case load, then start it.
