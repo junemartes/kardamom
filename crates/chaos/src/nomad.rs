@@ -132,6 +132,9 @@ pub struct NomadNode {
     pub name: String,
     #[serde(rename = "Status")]
     pub status: String,
+    /// The address the client advertises.
+    #[serde(rename = "Address", default)]
+    pub address: String,
 }
 
 /// A client of one Nomad HTTP endpoint.
