@@ -47,6 +47,15 @@ name: cluster-e2e
 
 on:
   workflow_dispatch:
+    inputs:
+      shard:
+        description: One shard to run. Empty runs every shard.
+        required: false
+        default: ""
+      cases:
+        description: The cases of that shard, separated by spaces (KARDAMOM_CHAOS_CASES). Empty runs every case.
+        required: false
+        default: ""
   pull_request:
     # Only the `chaos-nightly` label starts a run on a pull request.
     types: [labeled]
@@ -91,10 +100,15 @@ jobs:
       # crates/chaos/src/shard.rs plus the two stages of tests/shards.rs.
       - name: Pick the shards
         id: shards
+        env:
+          SHARD: ${{ github.event.inputs.shard }}
         run: |
           regular='"load","semantics"'
           nightly='"chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-combined-ordering","chaos-combined-exec","chaos-retention","chaos-cache","chaos-l1","chaos-follower","chaos-carry","chaos-integrity"'
           shards="[$regular,$nightly]"
+          if [ -n "$SHARD" ]; then
+            shards="$(jq -cn --arg shard "$SHARD" --argjson all "$shards" 'if ($all | index($shard)) then [$shard] else error("unknown shard " + $shard) end')"
+          fi
           echo "shards=$shards" >> "$GITHUB_OUTPUT"
           echo "shards: $shards"
 
@@ -489,8 +503,13 @@ jobs:
           ) > /tmp/chaos-runner-processes.log 2>&1 &
           process_sampler=$!
           trap 'kill "$resource_sampler" "$process_sampler" 2>/dev/null || true; wait "$resource_sampler" "$process_sampler" 2>/dev/null || true' EXIT
+          # A dispatch can narrow the cases of the shard.
+          if [ -n "$CASES" ]; then
+            export KARDAMOM_CHAOS_CASES="$CASES"
+          fi
           just --justfile deploy/cluster/justfile shard "${{ matrix.shard }}"
         env:
+          CASES: ${{ github.event.inputs.cases }}
           KARDAMOM_STAGED: "1"
           AERON_STALL_TOLERANCE_MS: "30000"
           # The same playbooks and tasks, in kept Python processes (see
