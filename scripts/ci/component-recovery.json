@@ -2249,7 +2249,7 @@
         "-p",
         "e2e",
         "--features",
-        "full-pipeline-e2e",
+        "full-pipeline-e2e,floor-seams",
         "--test",
         "pipeline_recovery",
         "--",
@@ -2278,7 +2278,7 @@
         "pipeline_blackout_rebuilds_the_read_path",
         "sequencer_executor_redis_loss_looks_every_floor_up"
       ],
-      "limitation": "Stack suite, not isolated: each case needs more than one real service. All services share one host and one media driver. The blackout runs one sealer member to stay inside 60 s; the combined suite closes elections of three. The blackout is two tests: one with the L1 stack and the validator, one with Redis and the state mirror. Nomad placement, node power loss and container identity stay with the cluster suite. Needs the service binaries, the sealer jar and the aeron-all jar.",
+      "limitation": "Stack suite, not isolated: each case needs more than one real service. All services share one host and one media driver. The blackout runs one sealer member to stay inside 60 s; the combined suite closes elections of three. The blackout is two tests: one with the L1 stack and the validator, one with Redis and the state mirror. Nomad placement, node power loss and container identity stay with the cluster suite. Needs the service binaries, the sealer jar and the aeron-all jar. The sequencer, executor and Redis loss also needs a debug sequencer with the floor-seams feature; the workspace build of the suite has it.",
       "negative_controls": [
         {
           "mutation": "The ingress receipt query skips its egress and executor layers, so a restarted ingress serves no receipt from state.",
@@ -2319,6 +2319,15 @@
         },
         {
           "mutation": "A park of a sender with no known floor asks no nonce lookup, so the returned sequencers wait for receipts alone.",
+          "tests": [
+            "sequencer_executor_redis_loss_looks_every_floor_up"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        },
+        {
+          "mutation": "The nonce lookup drops every answer, so with the floor seam no sender gets a first floor after the return.",
           "tests": [
             "sequencer_executor_redis_loss_looks_every_floor_up"
           ],
@@ -3331,7 +3340,7 @@
     {
       "case": "sequencer-executor-redis-loss",
       "family": "CombinedExec",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "executor-recovery",
@@ -3350,7 +3359,11 @@
           "test": "sequencer_executor_redis_loss_looks_every_floor_up"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the 30 s reverse stagger and the Nomad restarts of the sequencer, executor and Redis jobs",
+        "every lane-0 replica of the deployed sequencer groups looks its floors up: the local stack runs one replica per lane"
+      ]
     },
     {
       "case": "l1-liar",

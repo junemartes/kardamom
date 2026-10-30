@@ -9,7 +9,10 @@
 //! (`cargo build --bins -p kardamom-ingress -p kardamom-sequencer -p
 //! kardamom-executor -p kardamom-validator -p kardamom-state -p
 //! kardamom-da-watcher -p kardamom-l1-indexer`), the sealer jar
-//! (`just cluster-jar`), the cached aeron-all jar and Anvil.
+//! (`just cluster-jar`), the cached aeron-all jar and Anvil. The sequencer,
+//! executor and Redis loss also needs the `floor-seams` feature, on this
+//! crate and on the sequencer binary (`cargo build --bins -p
+//! kardamom-sequencer --features floor-seams`).
 
 #![cfg(feature = "full-pipeline-e2e")]
 
@@ -79,6 +82,9 @@ async fn pipeline_blackout_rebuilds_the_read_path() {
 
 /// The sequencers, the executor and Redis die, and no floor source is
 /// left. The sequencers read Redis in their nonce lookup, as deployed.
+/// They get a first floor only from a lookup: see the `floor-seams`
+/// feature.
+#[cfg(feature = "floor-seams")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run the pipeline-recovery component target"]
 async fn sequencer_executor_redis_loss_looks_every_floor_up() {
@@ -91,6 +97,7 @@ async fn sequencer_executor_redis_loss_looks_every_floor_up() {
             archive_durability: true,
             read_path: true,
             sequencer_cache: true,
+            first_floor_from_lookup: true,
             ..validated()
         },
     )

@@ -4,13 +4,13 @@
 //! the executor. The returned sequencers park every established sender
 //! and look its floor up. While no source can answer, no lookup answers
 //! and no transfer lands: no floor is guessed. After the executor
-//! returns, every transfer lands once in nonce order, and no ref sits
-//! below a floor.
+//! returns, a lookup answers the floor of the case sender, every transfer
+//! lands once in nonce order, and no ref sits below a floor.
 //!
-//! The answer after the return can come from a lookup, from the replayed
-//! receipts of the executor, or from the resync of the canonical log.
-//! Which source answers first depends on timing, so this test does not
-//! name the source.
+//! The replayed receipts of the executor would otherwise give the floor
+//! first. So the stack runs the sequencers with the
+//! `--first-floor-from-lookup` test seam: a receipt sets no first floor,
+//! and the first floor comes only from a lookup.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -100,6 +100,7 @@ impl Run<'_> {
             self.at(),
             took.as_secs_f64()
         );
+        self.assert_floors_looked_up().await?;
         self.assert_ingress_pair_live(RESTART_BOUND).await?;
         self.assert_executor_progress().await?;
         self.assert_no_ref_below_floor().await
@@ -140,6 +141,19 @@ impl Run<'_> {
             load.landed()
         );
         eprintln!("{}: the case sender is parked: {lookups:?}", self.at());
+        Ok(())
+    }
+
+    /// The sequencer of the case lane got the floor of the case sender
+    /// from a lookup: an executor, Redis or the local layer answered.
+    async fn assert_floors_looked_up(&self) -> Result<()> {
+        let lookups = Lookups::of(self.case_sequencer()?).await?;
+        anyhow::ensure!(
+            lookups.answered > 0.0,
+            "{}: the case load landed with no answered floor lookup: {lookups:?}",
+            self.name
+        );
+        eprintln!("{}: the floor came from a lookup: {lookups:?}", self.at());
         Ok(())
     }
 

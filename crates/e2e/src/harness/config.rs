@@ -108,6 +108,11 @@ pub struct StackConfig {
     /// With `read_path`: every sequencer reads that Redis in its nonce
     /// lookup before it asks the executor, as in the deployment.
     pub sequencer_cache: bool,
+    /// Every sequencer runs with `--first-floor-from-lookup`: a sender
+    /// gets its first floor only from a lookup. The sequencer binary must
+    /// have the `floor-seams` feature.
+    #[cfg(feature = "floor-seams")]
+    pub first_floor_from_lookup: bool,
 }
 
 /// The parts of the stack that the carry window rollout needs.
@@ -224,6 +229,8 @@ impl Default for StackConfig {
             carry: None,
             read_path: false,
             sequencer_cache: false,
+            #[cfg(feature = "floor-seams")]
+            first_floor_from_lookup: false,
         }
     }
 }

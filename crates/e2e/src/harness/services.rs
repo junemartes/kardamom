@@ -513,6 +513,10 @@ pub struct SequencerOptions {
     /// The `[cache]` URL of the Redis that the nonce lookup reads first.
     /// `None` runs the lookup on the executor alone.
     pub cache_url: Option<String>,
+    /// `--first-floor-from-lookup`: the test seam of the `floor-seams`
+    /// feature.
+    #[cfg(feature = "floor-seams")]
+    pub first_floor_from_lookup: bool,
 }
 
 impl SequencerOptions {
@@ -533,6 +537,10 @@ impl SequencerOptions {
         }
         if let Some(warm) = self.shadow_warm {
             cmd.args(["--shadow-warm-ms", &warm.as_millis().to_string()]);
+        }
+        #[cfg(feature = "floor-seams")]
+        if self.first_floor_from_lookup {
+            cmd.arg("--first-floor-from-lookup");
         }
         if self.sealer_version_floor > 0 {
             cmd.args([

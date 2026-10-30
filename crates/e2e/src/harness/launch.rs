@@ -242,6 +242,8 @@ impl<'a> StackLaunch<'a> {
             cache_url: read_path
                 .filter(|_| self.cfg.sequencer_cache)
                 .map(|path| path.redis.url()),
+            #[cfg(feature = "floor-seams")]
+            first_floor_from_lookup: self.cfg.first_floor_from_lookup,
             ..services::SequencerOptions::default()
         };
         (0..self.cfg.shards.get())

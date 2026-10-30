@@ -267,6 +267,8 @@ impl LocalStack {
             partition,
             lane,
             cache_url: self.sequencer_cache_url(),
+            #[cfg(feature = "floor-seams")]
+            first_floor_from_lookup: self.cfg.first_floor_from_lookup,
             ..SequencerOptions::default()
         })
     }
