@@ -15,6 +15,9 @@ const DOCKER_TIMEOUT: Duration = Duration::from_secs(20);
 /// The bound on a streamed copy into or out of a node: an archive or a
 /// checkpoint can be gigabytes on a slow runner.
 const STREAM_TIMEOUT: Duration = Duration::from_mins(10);
+/// The bound of a script of several probes, each with its own timeout of
+/// a few seconds, on a busy runner.
+const PROBES_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// A signal `docker kill -s` sends to an inner container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +132,18 @@ impl Nodes {
     /// Returns an error if the exec fails, hangs, or exits non-zero.
     pub async fn exec(&self, node: &str, script: &str) -> anyhow::Result<String> {
         self.docker_ok(&["exec", node, "bash", "-lc", script]).await
+    }
+
+    /// Run a script of several bounded probes inside a node container,
+    /// as root, under a bound that holds them all one after the other.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the exec fails, exceeds the bound, or exits
+    /// non-zero.
+    pub async fn exec_probes(&self, node: &str, script: &str) -> anyhow::Result<String> {
+        let args = ["exec", node, "bash", "-lc", script];
+        Self::stdout_of(&args, &Self::docker_within(&args, PROBES_TIMEOUT).await?)
     }
 
     /// Run a shell script inside a node container, and return whether

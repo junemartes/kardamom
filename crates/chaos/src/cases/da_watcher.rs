@@ -9,7 +9,9 @@
 
 use std::time::Duration;
 
+use crate::cases::l1::FINALIZE_HEAD;
 use crate::harness::Harness;
+use crate::l1::L1;
 use crate::poll::{self, Budget};
 use crate::probes::DA_WATCHER_PORT;
 
@@ -96,7 +98,12 @@ pub(crate) async fn assert_no_origin_gap(h: &Harness, ctx: &str) -> anyhow::Resu
         h.knobs.driver_restart_slo() + PUBLISH_BUDGET,
         Duration::from_secs(2),
     );
-    let outcome = poll::until(budget, |_| async {
+    // Anvil mines a block only for a transaction, so while the batcher
+    // posts nothing, the finalized tip stands still and no epoch comes.
+    // Each read mines a few blocks first.
+    let l1 = &L1::new(h).await?;
+    let outcome = poll::until(budget, |_| async move {
+        l1.mine(FINALIZE_HEAD).await?;
         Ok(h.probes
             .aux_metric(DA_WATCHER_PORT, PUBLISHED_ORIGIN)
             .await

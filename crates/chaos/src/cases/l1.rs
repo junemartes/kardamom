@@ -45,7 +45,7 @@ const ALERT_HOLD: Duration = Duration::from_secs(30);
 /// blocks behind its head. With these blocks mined right after a lie is
 /// armed or cleared, the followers read it within one poll, not after the
 /// next posts of the batcher.
-const FINALIZE_HEAD: u64 = 3;
+pub(crate) const FINALIZE_HEAD: u64 = 3;
 
 /// The case rate of the cases that hold until the sealer floor passes a
 /// cursor: twice the frames of the L1 case rate. A batcher restart of

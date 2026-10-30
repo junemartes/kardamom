@@ -108,6 +108,7 @@ impl Shard {
         "hard-executor",
         "node-failure-executor",
         "state-checkpoint-restore",
+        "checkpoint-corrupt-recover",
         "checkpoint-disk-full",
         "deploy-broken-image",
     ];
@@ -241,7 +242,6 @@ impl Shard {
                 "sequencer-replica-kill-lane1-node0",
                 "graceful-executor",
                 "replay-window-resync",
-                "checkpoint-corrupt-recover",
                 "node-replace-executor",
                 "cluster-leader-kill",
                 "cluster-member-rejoin",
@@ -606,7 +606,6 @@ mod tests {
                 "sequencer-replica-kill-lane1-node0",
                 "graceful-executor",
                 "replay-window-resync",
-                "checkpoint-corrupt-recover",
                 "node-replace-executor",
                 "cluster-leader-kill",
                 "cluster-member-rejoin",

@@ -167,12 +167,12 @@ impl Step {
                     self.verify_script(),
                     Self::tasks_script()
                 );
-                let output = Nodes.exec(&view.node, &script).await?;
+                let output = Nodes.exec_probes(&view.node, &script).await?;
                 self.judge_checks(&output, false)?;
                 view.tasks = Self::tasks_of(&output);
             }
             Action::Available => {
-                let output = Nodes.exec(&view.node, &self.verify_script()).await?;
+                let output = Nodes.exec_probes(&view.node, &self.verify_script()).await?;
                 self.judge_checks(&output, false)?;
             }
             Action::Isolated => {
@@ -181,13 +181,13 @@ impl Step {
                     self.verify_script(),
                     Self::tasks_script()
                 );
-                let output = Nodes.exec(&view.node, &script).await?;
+                let output = Nodes.exec_probes(&view.node, &script).await?;
                 self.judge_checks(&output, true)?;
                 self.unchanged(&output)?;
             }
             Action::Unchanged => {
                 let script = format!("{ARMED}\n{}", Self::tasks_script());
-                let output = Nodes.exec(&view.node, &script).await?;
+                let output = Nodes.exec_probes(&view.node, &script).await?;
                 self.unchanged(&output)?;
             }
         }

@@ -356,11 +356,16 @@ async fn mirror_retry_baseline(h: &Harness, ctx: &str) -> anyhow::Result<i64> {
         .map(|(retries, _)| retries)
 }
 
+/// The write retries of every mirror. A fresh mirror has not retried, so
+/// its exporter has no sample yet; that reads 0. A dark exporter is
+/// `None`.
 async fn mirror_write_retries(h: &Harness) -> Option<i64> {
-    mirror_metrics(h, MIRROR_WRITE_RETRIES)
-        .await
-        .into_iter()
-        .try_fold(0_i64, |total, retries| total.checked_add(retries?))
+    let mut total = Some(0_i64);
+    for i in 0..h.probes.executors.len() {
+        let retries = h.probes.mirror_counter(i, MIRROR_WRITE_RETRIES).await;
+        total = total.zip(retries).and_then(|(t, r)| t.checked_add(r));
+    }
+    total
 }
 
 /// The whole Redis job stopped: the primary, the replica and the three
