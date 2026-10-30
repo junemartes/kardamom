@@ -17,7 +17,7 @@ use kardamom_engine::reader::Ordered;
 use kardamom_engine::reader::carried::{CarriedSubscription, EgressTransport, NoSource};
 use kardamom_engine::reader::cluster::ReplayCursor;
 use kardamom_engine::{BPosition, BlockBoundaryStart, ExecutorError, TxOrderingMessage, TxRef};
-use kardamom_engine::{TxOrderingSubscription, TxEnvelope};
+use kardamom_engine::{TxEnvelope, TxOrderingSubscription};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 /// The longest wait for one event of a child or a reader.
@@ -144,10 +144,6 @@ impl Chain {
         Self { txs }
     }
 
-    pub(super) fn last_index(&self) -> u64 {
-        BLOCKS - 1
-    }
-
     fn boundary(block: u64) -> BlockBoundaryStart {
         BlockBoundaryStart {
             block_number: block,
@@ -224,13 +220,25 @@ impl EgressChild {
     /// phase takes the address of the first.
     pub(super) fn start(root: &Path, phase: Phase) -> Self {
         let addr = match phase {
-            Phase::First => TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap(),
-            Phase::Second => std::fs::read_to_string(root.join("addr")).unwrap().parse().unwrap(),
+            Phase::First => TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap(),
+            Phase::Second => std::fs::read_to_string(root.join("addr"))
+                .unwrap()
+                .parse()
+                .unwrap(),
         };
         std::fs::write(root.join("addr"), addr.to_string()).unwrap();
         let log = std::fs::File::create(root.join(format!("{}.log", phase.name()))).unwrap();
         let child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "carry_egress_child", "--ignored", "--nocapture", "--test-threads=1"])
+            .args([
+                "--exact",
+                "carry_egress_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
             .env(DIR_ENV, root)
             .env(PHASE_ENV, phase.name())
             .env(ADDR_ENV, addr.to_string())
@@ -244,7 +252,10 @@ impl EgressChild {
             root: root.to_path_buf(),
             addr,
             phase,
-            client: tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap(),
+            client: tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
         }
     }
 
@@ -262,12 +273,23 @@ impl EgressChild {
 
     /// Wait until the store of the child holds every block to `block`.
     pub(super) fn await_head(&self, block: u64) {
-        let url = format!("{}/v1/frames?from_index=0&from_block=1&limit=1", self.base());
+        let url = format!(
+            "{}/v1/frames?from_index=0&from_block=1&limit=1",
+            self.base()
+        );
         self.wait(|| {
             self.client
                 .block_on(reqwest::get(&url))
                 .ok()
-                .and_then(|answer| answer.headers().get("x-egress-next-block")?.to_str().ok()?.parse().ok())
+                .and_then(|answer| {
+                    answer
+                        .headers()
+                        .get("x-egress-next-block")?
+                        .to_str()
+                        .ok()?
+                        .parse()
+                        .ok()
+                })
                 .is_some_and(|next: u64| next > block)
         });
     }
@@ -281,12 +303,15 @@ impl EgressChild {
             let fresh = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .is_ok_and(|written| written > asked);
-            mark = fresh.then(|| std::fs::read_to_string(&path).ok()).flatten().and_then(|text| {
-                Some(Mark {
-                    index: gauge(&text, "kardamom_egress_ref_frame_max_index")?,
-                    block: gauge(&text, "kardamom_egress_ref_frame_max_block")?,
-                })
-            });
+            mark = fresh
+                .then(|| std::fs::read_to_string(&path).ok())
+                .flatten()
+                .and_then(|text| {
+                    Some(Mark {
+                        index: gauge(&text, "kardamom_egress_ref_frame_max_index")?,
+                        block: gauge(&text, "kardamom_egress_ref_frame_max_block")?,
+                    })
+                });
             mark.is_some()
         });
         mark.unwrap()
@@ -307,7 +332,8 @@ impl EgressChild {
         assert!(
             reached,
             "the egress child misses its deadline; {}",
-            std::fs::read_to_string(self.root.join(format!("{}.log", self.phase.name()))).unwrap_or_default()
+            std::fs::read_to_string(self.root.join(format!("{}.log", self.phase.name())))
+                .unwrap_or_default()
         );
     }
 
@@ -325,7 +351,8 @@ impl EgressChild {
         let handle = PrometheusBuilder::new().install_recorder().unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let frames = Chain::new().frames(phase.copy_blocks());
-        let _egress = TestEgress::serve_on(&rt, addr, &Self::store(&root), TestEgress::GENESIS, &frames);
+        let _egress =
+            TestEgress::serve_on(&rt, addr, &Self::store(&root), TestEgress::GENESIS, &frames);
         let out = Self::metrics_file(&root, phase);
         std::iter::repeat_with(|| Self::publish(&handle, &out)).for_each(drop);
     }
@@ -352,7 +379,11 @@ fn gauge(text: &str, name: &str) -> Option<u64> {
         .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
         .and_then(|value| value.trim().parse::<f64>().ok())
         .map(|value| {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a test gauge holds a small index")]
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a test gauge holds a small index"
+            )]
             let whole = value as u64;
             whole
         })
@@ -381,10 +412,13 @@ impl Reader {
             let rt = tokio::runtime::Runtime::new().unwrap();
             let transport = EgressTransport::new(base, frames, rt.handle().clone());
             metrics::with_local_recorder(&recorder, || {
-                let mut sub =
-                    CarriedSubscription::new(transport, NoSource, ReplayCursor::new(cursor.0, cursor.1))
-                        .with_cursor_gauge(gauge)
-                        .suppress_sealer_metrics();
+                let mut sub = CarriedSubscription::new(
+                    transport,
+                    NoSource,
+                    ReplayCursor::new(cursor.0, cursor.1),
+                )
+                .with_cursor_gauge(gauge)
+                .suppress_sealer_metrics();
                 std::iter::repeat_with(|| sub.next())
                     .map(|item| (item.is_ok(), sent.send(item)))
                     .take_while(|(ok, sent)| *ok && sent.is_ok())
@@ -400,7 +434,9 @@ impl Reader {
     }
 
     fn next(&self) -> Result<(BPosition, Ordered), ExecutorError> {
-        self.items.recv_timeout(BOUND).expect("the reader delivers within its bound")
+        self.items
+            .recv_timeout(BOUND)
+            .expect("the reader delivers within its bound")
     }
 
     /// Whether the first item of the reader is its stop.
@@ -426,19 +462,32 @@ impl Reader {
         });
     }
 
-    /// Send the live frames of `phase`, without its first block: the hole
-    /// makes the reader ask the egress again.
-    pub(super) fn live_after_a_hole(&self, chain: &Chain, phase: Phase) {
+    /// After the restart: the live frames of the second phase come with a
+    /// hole, the reader reads every block of the phase, and its cursor gauge
+    /// reaches the last index.
+    pub(super) fn read_on_after_the_restart(&self, chain: &Chain) {
+        self.live_after_a_hole(chain);
+        self.expect(chain, Phase::Second.blocks());
+        self.assert_cursor_past(BLOCKS - 1);
+    }
+
+    /// Send the live frames of the second phase, without its first block:
+    /// the hole makes the reader ask the egress again.
+    fn live_after_a_hole(&self, chain: &Chain) {
         chain
-            .frames(phase.blocks())
+            .frames(Phase::Second.blocks())
             .into_iter()
             .skip(2)
             .for_each(|frame| self.live.send(frame).unwrap());
     }
 
     /// Require the cursor gauge of the reader at `index` or above.
-    pub(super) fn assert_cursor_past(&self, index: u64) {
+    fn assert_cursor_past(&self, index: u64) {
         let value = gauge(&self.metrics.render(), self.gauge);
-        assert!(value.is_some_and(|v| v >= index), "{}: {value:?}", self.gauge);
+        assert!(
+            value.is_some_and(|v| v >= index),
+            "{}: {value:?}",
+            self.gauge
+        );
     }
 }

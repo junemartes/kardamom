@@ -102,9 +102,7 @@ impl TestEgress {
                 .unwrap();
         });
         std::thread::spawn(move || owner.run(&rx));
-        let http = rt
-            .block_on(Http::bind(addr, inputs))
-            .unwrap();
+        let http = rt.block_on(Http::bind(addr, inputs)).unwrap();
         let base = format!("http://{}", http.local_addr().unwrap());
         rt.spawn(http.serve());
         Self { base }

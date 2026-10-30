@@ -32,9 +32,9 @@ fn readers_past_r_read_on_across_a_hard_restart_and_r_stays() {
     let past = Chain::R.next_cursor();
     let batcher = Reader::start(first.base(), past, Reader::BATCHER);
     let validator = Reader::start(first.base(), past, Reader::VALIDATOR);
-    [&batcher, &validator]
-        .into_iter()
-        .for_each(|reader| reader.expect(&chain, Phase::First.blocks_past_r()));
+    for reader in [&batcher, &validator] {
+        reader.expect(&chain, Phase::First.blocks_past_r());
+    }
     assert!(
         Reader::start(first.base(), (0, 1), Reader::BATCHER).stops(),
         "a reader below R meets a reference and stops"
@@ -47,13 +47,15 @@ fn readers_past_r_read_on_across_a_hard_restart_and_r_stays() {
     );
     let second = EgressChild::start(dir.path(), Phase::Second);
     second.await_head(Phase::Second.last_block());
-    assert_eq!(second.mark(), Chain::R, "R of the egress does not change across its restart");
+    assert_eq!(
+        second.mark(),
+        Chain::R,
+        "R of the egress does not change across its restart"
+    );
 
-    [&batcher, &validator].into_iter().for_each(|reader| {
-        reader.live_after_a_hole(&chain, Phase::Second);
-        reader.expect(&chain, Phase::Second.blocks());
-        reader.assert_cursor_past(chain.last_index());
-    });
+    for reader in [&batcher, &validator] {
+        reader.read_on_after_the_restart(&chain);
+    }
     assert_eq!(second.mark(), Chain::R, "entries with bytes do not move R");
 }
 

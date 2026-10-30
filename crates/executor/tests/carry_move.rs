@@ -33,7 +33,7 @@ fn the_first_executor_in_carry_mode_matches_the_reference_executors() {
 fn the_other_executors_move_one_at_a_time_and_match_the_reference() {
     let chain = Chain::new();
     let reference = chain.reference();
-    [2, 6]
-        .into_iter()
-        .for_each(|cut| chain.moving(cut).assert_matches(&reference, &chain));
+    for cut in [2, 6] {
+        chain.moving(cut).assert_matches(&reference, &chain);
+    }
 }

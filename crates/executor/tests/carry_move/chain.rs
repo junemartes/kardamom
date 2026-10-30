@@ -46,13 +46,17 @@ impl Chain {
                     chain_id: CHAIN_ID.get(),
                     to: SINK,
                     nonce: b - 1,
-                    value: b.into(),
+                    value: b,
                     gas_limit: 21_000,
                     gas_price: 0,
                     ..LegacyTx::default()
                 }
                 .sign(&signer);
-                Self::epoch_of(b).into_iter().map(Kind::Epoch).chain([Kind::Tx(tx)]).collect()
+                Self::epoch_of(b)
+                    .into_iter()
+                    .map(Kind::Epoch)
+                    .chain([Kind::Tx(tx)])
+                    .collect()
             })
             .collect();
         let entries = blocks
@@ -156,7 +160,9 @@ impl Chain {
                 let position = BPosition::from_index(*index);
                 let message = match kind {
                     Kind::Epoch(epoch) => TxOrderingMessage::Epoch(epoch.clone()),
-                    Kind::Tx(tx) => TxOrderingMessage::TxRef(TxRef::new(tx.tx_hash, 0, position, 0)),
+                    Kind::Tx(tx) => {
+                        TxOrderingMessage::TxRef(TxRef::new(tx.tx_hash, 0, position, 0))
+                    }
                     Kind::Boundary(b) => TxOrderingMessage::BoundaryStart(b.clone()),
                 };
                 (position, message)
@@ -175,7 +181,13 @@ impl Chain {
     /// before committed: a reader of an egress that serves every entry
     /// with its bytes, from the cursor after the committed block.
     fn carried(&self, start: ResumePoint, snap: MockStateDatabase) -> HarnessOutcome {
-        let frames = TestStream(self.entries.iter().map(|(.., kind)| Self::entry(kind)).collect()).egress_frames();
+        let frames = TestStream(
+            self.entries
+                .iter()
+                .map(|(.., kind)| Self::entry(kind))
+                .collect(),
+        )
+        .egress_frames();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let egress = TestEgress::serve(&rt, dir.path(), TestEgress::GENESIS, &frames);
@@ -219,7 +231,10 @@ pub(super) struct Run {
 impl Run {
     fn of(outcome: HarnessOutcome) -> Self {
         assert!(
-            matches!(outcome.result, Ok(()) | Err(ExecutorError::TxOrderingClosed)),
+            matches!(
+                outcome.result,
+                Ok(()) | Err(ExecutorError::TxOrderingClosed)
+            ),
             "{:?}",
             outcome.result
         );
@@ -231,7 +246,12 @@ impl Run {
 
     /// The cursor after the last committed boundary.
     fn resume(&self) -> ResumePoint {
-        let boundary = self.boundaries().last().copied().cloned().expect("a committed block");
+        let boundary = self
+            .boundaries()
+            .last()
+            .copied()
+            .cloned()
+            .expect("a committed block");
         ResumePoint {
             block: boundary.block_number,
             record_count: boundary.end_tx_idx.as_index(),
@@ -295,7 +315,10 @@ impl Run {
             chain.source_hashes(),
             "one receipt for each deposit, in L1 order"
         );
-        assert!(credited.windows(2).all(|pair| pair[0].1 < pair[1].1), "the receipt order is the L1 order");
+        assert!(
+            credited.windows(2).all(|pair| pair[0].1 < pair[1].1),
+            "the receipt order is the L1 order"
+        );
         let minted: u128 = DEPOSITS.iter().map(|(.., mint)| mint).sum();
         let (nonce, balance, _) = self.account(RECIPIENT).expect("the recipient");
         assert_eq!((nonce, balance), (0, U256::from(minted)), "an exact credit");
@@ -306,12 +329,17 @@ impl Run {
     pub(super) fn assert_matches(&self, reference: &Self, chain: &Chain) {
         assert_eq!(self.receipts(), reference.receipts(), "receipts");
         assert_eq!(self.boundaries(), reference.boundaries(), "boundaries");
-        [chain.sender, SINK, RECIPIENT]
-            .into_iter()
-            .for_each(|address| assert_eq!(self.account(address), reference.account(address), "{address}"));
+        let accounts = |run: &Self| [chain.sender, SINK, RECIPIENT].map(|a| run.account(a));
+        assert_eq!(accounts(self), accounts(reference), "accounts");
         let paid: u64 = (1..=BLOCKS).sum();
-        assert_eq!(self.account(SINK).map(|(_, balance, _)| balance), Some(U256::from(paid)));
-        assert_eq!(self.account(chain.sender).map(|(nonce, ..)| nonce), Some(BLOCKS));
+        assert_eq!(
+            self.account(SINK).map(|(_, balance, _)| balance),
+            Some(U256::from(paid))
+        );
+        assert_eq!(
+            self.account(chain.sender).map(|(nonce, ..)| nonce),
+            Some(BLOCKS)
+        );
         self.assert_credits(chain);
     }
 }
