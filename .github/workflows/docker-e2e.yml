@@ -54,9 +54,11 @@ jobs:
       # forge build downloads the pinned solc on a cold host; the cache
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
+      # The dev-profile caches that the CI test job saves on a base branch.
       - uses: ./.github/actions/rust-build-cache
         with:
-          shared-key: docker-e2e
+          shared-key: dev
+          save-if: false
 
       # Sanity: ensure the Docker daemon is reachable (ubuntu-latest runners
       # ship with Docker pre-installed, but it's worth a quick probe so we
