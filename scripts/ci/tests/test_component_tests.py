@@ -139,6 +139,31 @@ class ComponentTests(unittest.TestCase):
             self.assertEqual(command[command.index("--select-method") + 1], "io.kardamom.Actor#recovers")
             self.assertEqual(command[1:3], ["--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED"])
 
+    def test_a_stack_test_runs_beside_its_services_with_the_jars(self):
+        bundle = component.Bundle(Path("/bundle"))
+        self.assertEqual(bundle.placed({"ci_mode": "stack"}, Path("/t/deps/pipeline-1")), "stack/deps/pipeline-1")
+        self.assertEqual(bundle.placed({"ci_mode": "docker"}, Path("/t/deps/mirror-1")), "mirror-1")
+        environment = component.SealerRuntime(Path("/sealer")).stack_environment()
+        self.assertEqual(environment["KARDAMOM_CLUSTER_JAR"], "/sealer/kardamom-cluster-node.jar")
+        self.assertTrue(environment["KARDAMOM_AERON_ALL_JAR"].endswith("crates/log/docker/aeron/aeron-all.jar"))
+
+    def test_service_binaries_come_from_the_non_test_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "services.jsonl"
+            manifest = Path(directory) / "Cargo.toml"
+            manifest.write_text('[package]\nname = "kardamom-ingress"\n')
+            messages = [
+                {"reason": "compiler-artifact", "executable": "/t/kardamom-ingress", "manifest_path": str(manifest),
+                 "profile": {"test": False}, "target": {"name": "kardamom-ingress", "kind": ["bin"]}},
+                {"reason": "compiler-artifact", "executable": "/t/deps/kardamom_ingress-1",
+                 "manifest_path": str(manifest), "profile": {"test": True},
+                 "target": {"name": "kardamom_ingress", "kind": ["lib"]}},
+                {"reason": "build-finished", "success": True}]
+            log.write_text("\n".join(json.dumps(message) for message in messages))
+            artifacts, services, _ = component.Bundle(Path(directory)).artifacts([log])
+        self.assertEqual(services, {"kardamom-ingress": Path("/t/kardamom-ingress")})
+        self.assertEqual(artifacts, {("kardamom-ingress", "kardamom_ingress"): Path("/t/deps/kardamom_ingress-1")})
+
     def test_a_docker_test_leaves_no_container(self):
         listings = iter([{"old"}, {"old", "new"}])
         with patch.object(component.Docker, "containers", side_effect=lambda: next(listings)), \

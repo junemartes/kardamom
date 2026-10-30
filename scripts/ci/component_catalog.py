@@ -14,7 +14,7 @@ OPTIONAL_CASE_KEYS = {"cluster_only_checks"}
 STATUSES = ("planned", "partial", "ported")
 NEGATIVE_CONTROL_KEYS = ("negative_controls", "clock_negative_controls", "negative_control")
 CONTROL_TEST_KEYS = ("test", "tests", "failed_tests")
-CI_MODES = ("in-process", "docker", "gradle")
+CI_MODES = ("in-process", "docker", "gradle", "stack")
 
 
 class Catalog:

@@ -5,6 +5,8 @@ Every catalogued suite has a ci_mode:
 - in-process: a Cargo test binary with no external service.
 - docker: a Cargo test binary that starts real containers.
 - gradle: a JUnit method of the Java sealer.
+- stack: a Cargo test binary that starts the real service binaries, the sealer
+  jar and the Aeron media driver as local processes.
 
 The build job packages the Cargo binaries. The sealer job packages the Java test
 runtime. Each shard job runs its planned tests from these two bundles and
@@ -33,9 +35,13 @@ SEALER_RUNTIME = SEALER / "service/build/component-runtime"
 TEST_SECONDS = 60
 SHARD_SECONDS = 6 * 60
 SHARDS = 4
-CARGO_MODES = ("in-process", "docker")
+CARGO_MODES = ("in-process", "docker", "stack")
 # The estimate for a test with no measured runtime yet.
-DEFAULT_SECONDS = {"in-process": 5.0, "docker": 30.0, "gradle": 15.0}
+DEFAULT_SECONDS = {"in-process": 5.0, "docker": 30.0, "gradle": 15.0, "stack": 30.0}
+# A stack test finds the service binaries in the parent of its own directory, as in a Cargo
+# target directory: stack/deps/<test> runs stack/<service>.
+STACK = Path("stack")
+AERON_ALL_JAR = ROOT / "crates/log/docker/aeron/aeron-all.jar"
 # The registry images that the docker suites start. A shard pulls them once before its first test.
 IMAGES = ("redis:7-alpine", "python:3.13-alpine", "hashicorp/consul:1.21")
 # The image that the docker suites build from the Aeron image context.
@@ -173,47 +179,70 @@ class Bundle:
                                           text=True, timeout=30, env=self.environment())
         return [line.removesuffix(": test") for line in listing.splitlines() if line.endswith(": test")]
 
-    def executable(self, source):
-        destination = self.directory / source.name
+    def executable(self, source, name):
+        destination = self.directory / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
         subprocess.run(["strip", "--strip-debug", destination], check=True)
         return self.digest(destination)
 
-    def artifacts(self, log):
-        artifacts, paths = {}, []
-        for item in self.build_messages(log):
+    def artifacts(self, logs):
+        artifacts, services, paths = {}, {}, []
+        for item in (item for log in logs for item in self.build_messages(log)):
             if item["reason"] == "build-script-executed":
                 paths.extend(path.removeprefix("native=") for path in item["linked_paths"])
-            if item["reason"] == "compiler-artifact" and item["profile"]["test"] and item.get("executable"):
+            if item["reason"] != "compiler-artifact" or not item.get("executable"):
+                continue
+            if item["profile"]["test"]:
                 package = tomllib.loads(Path(item["manifest_path"]).read_text())["package"]["name"]
                 artifacts[package, item["target"]["name"]] = Path(item["executable"])
-        return artifacts, paths
+            elif "bin" in item["target"]["kind"]:
+                services[item["target"]["name"]] = Path(item["executable"])
+        return artifacts, services, paths
 
-    def prepare(self, artifacts_file=None):
+    @staticmethod
+    def services_command(suites):
+        features = sorted(set().union(*map(Bundle.features, suites.values())))
+        return ["cargo", "build", "--locked", "--workspace", "--bins", "--message-format=json-render-diagnostics",
+                *(["--features", ",".join(features)] if features else [])]
+
+    def build(self, suites):
+        commands = {"build.jsonl": self.build_command(suites)}
+        if any(suite["ci_mode"] == "stack" for suite in suites.values()):
+            commands["services.jsonl"] = self.services_command(suites)
+        for name, command in commands.items():
+            with (self.directory / name).open("w") as output:
+                subprocess.run(command, cwd=ROOT, stdout=output, check=True)
+        return [self.directory / name for name in commands]
+
+    def placed(self, suite, source):
+        """A stack test runs from stack/deps, so that it finds the services in stack."""
+        return str(STACK / "deps" / source.name) if suite["ci_mode"] == "stack" else source.name
+
+    def prepare(self, artifacts_files=()):
         suites = self.selection(json.loads(CATALOG.read_text()))
         if not suites:
             raise ValueError("the Cargo recovery inventory is empty")
         self.directory.mkdir(parents=True, exist_ok=False)
-        log = self.directory / "build.jsonl"
-        if artifacts_file is None:
-            with log.open("w") as output:
-                subprocess.run(self.build_command(suites), cwd=ROOT, stdout=output, check=True)
-        else:
-            shutil.copyfile(artifacts_file, log)
-        artifacts, paths = self.artifacts(log)
-        sources = {artifacts[self.target(suite)] for suite in suites.values()}
-        libraries = self.libraries(sources, paths)
-        binaries = {source.name: self.executable(source) for source in sources}
-        listings = {source.name: self.names(source) for source in sources}
-        tests = sorted(({"suite": name, "test": test, "binary": artifacts[self.target(suite)].name,
-                         "name": self.resolve(test, listings[artifacts[self.target(suite)].name])}
+        logs = list(artifacts_files) or self.build(suites)
+        artifacts, services, paths = self.artifacts(logs)
+        sources = {self.placed(suite, artifacts[self.target(suite)]): artifacts[self.target(suite)]
+                   for suite in suites.values()}
+        stack = any(suite["ci_mode"] == "stack" for suite in suites.values())
+        placed_services = {str(STACK / name): source for name, source in services.items()} if stack else {}
+        libraries = self.libraries({*sources.values(), *placed_services.values()}, paths)
+        binaries = {name: self.executable(source, name) for name, source in (sources | placed_services).items()}
+        listings = {name: self.names(self.directory / name) for name in sources}
+        tests = sorted(({"suite": name, "test": test, "binary": self.placed(suite, artifacts[self.target(suite)]),
+                         "name": self.resolve(test, listings[self.placed(suite, artifacts[self.target(suite)])])}
                         for name, suite in suites.items() for test in suite["tests"]),
                        key=lambda test: (test["suite"], test["test"]))
         manifest = {"revision": os.environ.get("GITHUB_SHA"), "binaries": binaries,
                     "libraries": libraries, "tests": tests}
         self.validate_inventory(manifest)
         (self.directory / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        print(f"Prepared {len(tests)} Cargo tests in {len(binaries)} binaries", flush=True)
+        print(f"Prepared {len(tests)} Cargo tests and {len(placed_services)} service binaries "
+              f"in {len(binaries)} binaries", flush=True)
 
     @classmethod
     def validate_inventory(cls, manifest):
@@ -257,9 +286,10 @@ class SealerRuntime:
         self.directory = directory.resolve()
 
     def prepare(self):
-        subprocess.run([SEALER / "gradlew", "-p", SEALER, ":service:componentTestRuntime", "--no-daemon", "-q"],
-                       check=True)
+        subprocess.run([SEALER / "gradlew", "-p", SEALER, ":service:componentTestRuntime", ":service:shadowJar",
+                        "--no-daemon", "-q"], check=True)
         shutil.copytree(SEALER_RUNTIME, self.directory)
+        shutil.copy2(SEALER / "service/build/libs/kardamom-cluster-node.jar", self.directory)
         print(f"Prepared the sealer test runtime in {self.directory}", flush=True)
 
     def load(self):
@@ -275,6 +305,10 @@ class SealerRuntime:
         return [str(java), *self.load(), "-cp", classpath, "org.junit.platform.console.ConsoleLauncher",
                 "execute", "--disable-banner", "--fail-if-no-tests", "--details=summary",
                 "--select-method", method, "--reports-dir", str(reports)], dict(os.environ)
+
+    def stack_environment(self):
+        return {"KARDAMOM_CLUSTER_JAR": str(self.directory / "kardamom-cluster-node.jar"),
+                "KARDAMOM_AERON_ALL_JAR": str(AERON_ALL_JAR)}
 
     @staticmethod
     def verdict(entry, _text, reports):
@@ -355,6 +389,8 @@ class Shard:
         runner = self.sealer if entry["mode"] == "gradle" else self.bundle
         command, environment = (runner.command(entry, reports) if runner is self.sealer
                                 else runner.command(entry))
+        if entry["mode"] == "stack":
+            environment |= self.sealer.stack_environment()
         before = Docker.containers() if entry["mode"] == "docker" else set()
         code, timed_out, seconds = self.execute(command, log, min(TEST_SECONDS, remaining), environment)
         left = Docker.remove_new(before) if entry["mode"] == "docker" else 0
@@ -418,7 +454,8 @@ def main():
     parser.add_argument("--bundle", type=Path, help="the Cargo test bundle")
     parser.add_argument("--sealer", type=Path, help="the sealer test runtime")
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--artifacts", type=Path, help="Cargo JSON output from a shared build")
+    parser.add_argument("--artifacts", type=Path, action="append", default=[],
+                        help="Cargo JSON output from a shared build; repeat for the service binaries")
     parser.add_argument("--shard", type=int)
     parser.add_argument("results", nargs="*", type=Path, help="results.json files for the timings mode")
     args = parser.parse_args()

@@ -195,8 +195,9 @@ always go together. A ported case needs:
 
 - At least one local test.
 - A local test in a suite with a `ci_mode`, so that CI runs it. The modes are
-  `in-process`, `docker` (a real container dependency) and `gradle` (the Java
-  sealer).
+  `in-process`, `docker` (a real container dependency), `gradle` (the Java
+  sealer) and `stack` (the real service binaries, the sealer jar and the media
+  driver as local processes).
 - A negative control for one of its local tests. A control that names tests
   (`test`, `tests` or `failed_tests`) guards only those tests. A control that
   names no test guards every test of its suite.

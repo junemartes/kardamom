@@ -124,11 +124,13 @@ jobs:
           features="$(python3 scripts/ci/component_tests.py features)"
           cargo test --workspace --locked --no-run --features "$features" \
             --message-format=json-render-diagnostics > /tmp/workspace-build.jsonl
+          cargo build --workspace --locked --bins --features "$features" \
+            --message-format=json-render-diagnostics > /tmp/workspace-services.jsonl
           cargo nextest archive --workspace --locked --features "$features" \
             --zstd-level 1 --archive-file /tmp/workspace-tests.tar.zst
       - name: Package the component recovery tests
         run: |
-          python3 scripts/ci/component_tests.py prepare --artifacts /tmp/workspace-build.jsonl --bundle /tmp/component-bundle
+          python3 scripts/ci/component_tests.py prepare --artifacts /tmp/workspace-build.jsonl --artifacts /tmp/workspace-services.jsonl --bundle /tmp/component-bundle
           tar -C /tmp/component-bundle -cf - . | zstd -T0 -3 -q -o /tmp/component-bundle.tar.zst
       - uses: actions/upload-artifact@v4
         with:

@@ -55,14 +55,20 @@ suite of `scripts/ci/component-recovery.json`. Each suite has a `ci_mode`:
 - `in-process`: a Cargo test binary with no external service.
 - `docker`: a Cargo test binary that starts real containers (Redis, Consul, Aeron, Python controllers).
 - `gradle`: a JUnit method of the Java sealer, with real cluster members in the JVM.
+- `stack`: a Cargo test binary that starts the real service binaries, the sealer jar and
+  the Aeron media driver as local processes. The bundle puts the test binary in
+  `stack/deps/` and the service binaries in `stack/`, as in a Cargo target directory.
+  The shard sets `KARDAMOM_CLUSTER_JAR` and `KARDAMOM_AERON_ALL_JAR`.
 
 The CI jobs:
 
-1. `build` compiles every workspace test target once, with the docker features of the
-   component suites. It packages the component test binaries and their native libraries.
+1. `build` compiles every workspace test target and binary once, with the features of the
+   component suites. It packages the component test binaries, the service binaries and
+   their native libraries.
    It also uploads a nextest archive of the workspace tests.
 2. `build sealer tests` compiles the sealer tests once. It packages the classes, the
-   dependency jars, the JUnit console launcher and the JVM arguments of the test task.
+   dependency jars, the JUnit console launcher, the JVM arguments of the test task and
+   the sealer jar.
 3. `component recovery (0)` to `component recovery (3)` run the suite. The shard count
    is fixed. A shard compiles nothing. It pulls the docker images once, or loads them
    from the cache that a push saves, then runs its planned tests one at a time.
