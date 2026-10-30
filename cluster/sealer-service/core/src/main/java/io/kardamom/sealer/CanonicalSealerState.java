@@ -659,6 +659,18 @@ public final class CanonicalSealerState {
     }
 
     /**
+     * Whether a member with the setting {@code features} can hold this
+     * state. A state that started at genesis must hold the switch of a
+     * chain that runs exactly these features from its genesis, because a
+     * member that replays the log from position 0 starts with them. A
+     * seeded state takes its switch from the seed, and a replay starts
+     * from the seed again, so the setting does not decide its rules.
+     */
+    public boolean matchesGenesis(final GenesisFeatures features) {
+        return seedStatus != SeedStatus.GENESIS || versions.matchesGenesis(features);
+    }
+
+    /**
      * Apply a seed record: the log names the digest of the seed the
      * cluster started from. A seeded state with the same digest confirms
      * its seed. A state that started at genesis, or from another seed,

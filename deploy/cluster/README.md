@@ -515,7 +515,7 @@ To go back, deploy with `KARDAMOM_NOTIFIER_NODES=off`.
 
 The variable sets:
 
-- `-Dkardamom.cluster.genesisFeatures=3,4,5` on every sealer member (job variable `genesis_carry` of the sealer). Every member must match it. A member takes it only when it starts at genesis.
+- `-Dkardamom.cluster.genesisFeatures=3,4,5` on every sealer member (job variable `genesis_carry` of the sealer). Every member must match it. A member takes it only when it starts at genesis. A member that restores a snapshot with other genesis features stops with `sealer GENESIS-FEATURES FATAL`.
 - `genesis_features = [3, 4, 5]` in the genesis of the executors and the validator (job variable `genesis_carry`, the fragment `config/genesis/carry.toml` in front of `config/genesis/dev.toml`).
 - The default of every carry switch (`workloads_genesis_carry_switches`):
   - `KARDAMOM_MEMBER_FEED=on` and `KARDAMOM_EXEC_ON_SEALERS=on`;

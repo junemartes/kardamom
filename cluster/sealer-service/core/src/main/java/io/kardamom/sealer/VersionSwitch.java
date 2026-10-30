@@ -188,6 +188,18 @@ public final class VersionSwitch {
         return schedulesOf(features).allMatch(schedule -> schedule.held > 0);
     }
 
+    /**
+     * Whether this switch is the switch of a chain that runs exactly
+     * {@code features} from its genesis. It holds an activation of each
+     * feature of the set, and no activation at L1 origin 0 of a feature
+     * outside the set. Only a genesis activation has origin 0: the switch
+     * ignores a record at or below the origin of its newest activation.
+     */
+    public boolean matchesGenesis(final GenesisFeatures features) {
+        return holdsEach(features)
+            && Stream.of(v4, carry, window).skip(features.count()).noneMatch(Schedule::holdsGenesis);
+    }
+
     /** The schedules of {@code features}: the first of version 4, the carry flag and the carry window. */
     private Stream<Schedule> schedulesOf(final GenesisFeatures features) {
         return Stream.of(v4, carry, window).limit(features.count());
@@ -448,6 +460,11 @@ public final class VersionSwitch {
         private final long[] times = new long[MAX_HELD];
 
         private int held;
+
+        /** Whether the oldest held activation is a genesis activation, at L1 origin 0. */
+        boolean holdsGenesis() {
+            return held > 0 && origins[0] == 0L;
+        }
 
         /** The origin of the newest held activation, or 0 when none. */
         long newest() {

@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.kardamom.sealer.CanonicalSealerState;
@@ -18,6 +19,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.IntStream;
+import org.agrona.concurrent.AgentTerminationException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -28,8 +30,9 @@ import org.junit.jupiter.api.io.TempDir;
  * the carry window from the first entry, with no upgrade transaction. A
  * later activation turns the carry window off and on again. Every member
  * sends the same frames and writes the same snapshot, version 18, at every
- * entry, and a member restored at any entry, without the setting, ends
- * with the bytes of its peer.
+ * entry, and a member restored at any entry ends with the bytes of its
+ * peer. A member whose setting does not match the restored snapshot
+ * stops.
  */
 class SealerGenesisRulesTest {
 
@@ -162,8 +165,7 @@ class SealerGenesisRulesTest {
     /**
      * A member restored from a snapshot at any entry, in block 1 or in a
      * later block, ends with the bytes of its peer and of a member that
-     * replays the log from genesis. The restored member has no setting:
-     * the snapshot carries the rules.
+     * replays the log from genesis.
      */
     @Test
     void a_member_restored_at_any_entry_ends_with_the_bytes_of_its_peer() {
@@ -175,7 +177,7 @@ class SealerGenesisRulesTest {
             final String where = "cut at " + cut;
             final Member original = genesis();
             original.applyAll(entries.subList(0, cut));
-            final Member restored = log.member(Optional.of(original.svc().snapshot()));
+            final Member restored = log.genesis(Optional.of(original.svc().snapshot()), GenesisFeatures.CARRY_WINDOW);
             assertEquals(original.svc().decisionRules(), restored.svc().decisionRules(), where);
             assertEquals(original.svc().metrics().carry(), restored.svc().metrics().carry(), where);
             final List<Entry> rest = entries.subList(cut, entries.size());
@@ -194,8 +196,48 @@ class SealerGenesisRulesTest {
         member.applyAll(stream().subList(0, 3));
         final byte[] snapshot = member.svc().snapshot();
         assertEquals(CanonicalSealerState.FILE_SNAPSHOT_VERSION, version(snapshot));
-        final Member restored = log.restart(member, dir.resolve("file"), snapshot);
+        log.end(member);
+        final Member restored = log.carryingGenesis(Optional.of(snapshot), dir.resolve("file"), GenesisFeatures.SEALER_V5);
         assertEquals(5, restored.svc().decisionRules().version());
         assertArrayEquals(snapshot, restored.svc().snapshot());
+    }
+
+    /**
+     * A running chain with no genesis features: a member that restores
+     * its snapshot with the setting {@code 3,4,5} stops. It would run
+     * version 3, and a member that replays from position 0 version 5.
+     */
+    @Test
+    void a_setting_that_the_snapshot_does_not_hold_stops_the_start() {
+        final Member plain = log.member(Optional.empty());
+        plain.applyAll(stream().subList(0, 3));
+        final byte[] snapshot = plain.svc().snapshot();
+        assertEquals(3, log.member(Optional.of(snapshot)).svc().decisionRules().version(),
+            "a member without the setting starts");
+        final AgentTerminationException e = assertThrows(AgentTerminationException.class,
+            () -> log.genesis(Optional.of(snapshot), GenesisFeatures.CARRY_WINDOW));
+        assertEquals("kardamom.cluster.genesisFeatures=3,4,5, but the snapshot holds the genesis activations of"
+            + " another set of features: start the member with the setting of this chain", e.getMessage());
+    }
+
+    /**
+     * A chain with features 3, 4 and 5 from its genesis: a member that
+     * restores its snapshot without the setting, or with only a part of
+     * it, stops. The snapshot is from block 1, so it holds the genesis
+     * activation of each feature.
+     */
+    @Test
+    void a_snapshot_with_genesis_features_that_the_setting_does_not_name_stops_the_start() {
+        final Member member = genesis();
+        member.applyAll(stream().subList(0, 3));
+        final byte[] snapshot = member.svc().snapshot();
+        final AgentTerminationException none = assertThrows(AgentTerminationException.class,
+            () -> log.member(Optional.of(snapshot)));
+        assertTrue(none.getMessage().startsWith("kardamom.cluster.genesisFeatures=, but the snapshot"),
+            none.getMessage());
+        final AgentTerminationException part = assertThrows(AgentTerminationException.class,
+            () -> log.genesis(Optional.of(snapshot), GenesisFeatures.SEALER_V5));
+        assertTrue(part.getMessage().startsWith("kardamom.cluster.genesisFeatures=3,4, but the snapshot"),
+            part.getMessage());
     }
 }
