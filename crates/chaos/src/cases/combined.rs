@@ -501,14 +501,14 @@ pub(crate) const INGRESS_EXECUTOR: Combined = Combined {
 };
 
 /// The whole read path dies: the executors, Redis and the state mirrors.
-/// Redis returns empty, the mirrors return and wait for a checkpoint,
-/// and the executors return last. Every mirror must rebuild, and the
-/// readers must use Redis again.
+/// Redis returns empty, the mirrors return and wait 20 s for a
+/// checkpoint, and the executors return last. Every mirror must
+/// rebuild, and the readers must use Redis again.
 pub(crate) const READ_PATH: Combined = Combined {
     case: Case::ReadPathLossRecover,
     down: &[Class::Executor, Class::Redis, Class::StateMirror],
     expect: Expect::SealOnly,
-    recovery: Recovery::Reverse(Duration::from_secs(30)),
+    recovery: Recovery::Reverse(Duration::from_secs(20)),
     checks: &[Check::EveryMirrorRebuilt, Check::ReadersRecovered],
 };
 

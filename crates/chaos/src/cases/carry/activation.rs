@@ -52,28 +52,39 @@ const EXECUTOR_MARKER: &str = "--metrics-addr";
 const READS_EGRESS: &str = "reads_egress";
 
 impl Run<'_> {
-    /// A lockbox on L1, and the L1 follower and the validator
-    /// read it.
-    pub(super) async fn lockbox_on(&mut self) -> anyhow::Result<()> {
+    /// A lockbox on L1, and the L1 follower and the validator read it.
+    /// The two jobs do not depend on each other, so they roll at once.
+    async fn lockbox_on(&mut self) -> anyhow::Result<()> {
         let lockbox = self.lockbox().await?;
-        let patches = ["l1-indexer", "validator"].map(|job| {
+        let [indexer, validator] = ["l1-indexer", "validator"].map(|job| {
             JobPatch::new(job).edit(Edit::Value {
                 flag: "--lockbox",
                 value: lockbox.clone(),
             })
         });
-        self.switch(|c| c.lockbox = Some(lockbox.clone()), &patches)
+        crate::log(format!(
+            "{}: the follower and the validator read the lockbox {lockbox}",
+            self.ctx
+        ));
+        let (follower_read, validator_read) = tokio::join!(
+            indexer.register(self.h, self.ctx),
+            validator.register(self.h, self.ctx)
+        );
+        follower_read?;
+        validator_read?;
+        self.switch(|c| c.lockbox = Some(lockbox.clone()), &[])
             .await?;
         self.h
             .assert_executor_progress(Duration::from_mins(1))
             .await
     }
 
-    /// Features 3 and 4. Every member runs decision version 5,
-    /// and every sequencer keeps it. The check of feature 4 reads the
-    /// release of each member and service, which the switch to version 4
-    /// does not change, so it runs while the members switch.
+    /// The lockbox, then features 3 and 4. Every member runs decision
+    /// version 5, and every sequencer keeps it. The check of feature 4
+    /// reads the release of each member and service, which the switch to
+    /// version 4 does not change, so it runs while the members switch.
     pub(super) async fn versions_on(&mut self) -> anyhow::Result<()> {
+        self.lockbox_on().await?;
         let five = Upgrade::on(FEATURE_SEALER_V5);
         Upgrade::on(FEATURE_SEALER_V4)
             .apply(self.h, self.ctx)
@@ -280,14 +291,10 @@ impl Run<'_> {
         self.move_to_carry_mode(0).await
     }
 
-    /// Executor 1 moves to carry mode.
-    pub(super) async fn executor_second(&mut self) -> anyhow::Result<()> {
-        self.move_to_carry_mode(1).await
-    }
-
-    /// Executor 2 moves to carry mode, and the smoke gate runs
-    /// with every executor in carry mode.
-    pub(super) async fn executor_third(&mut self) -> anyhow::Result<()> {
+    /// Executors 1 and 2 move to carry mode, one at a time, and the
+    /// smoke gate runs with every executor in carry mode.
+    pub(super) async fn executors_rest(&mut self) -> anyhow::Result<()> {
+        self.move_to_carry_mode(1).await?;
         self.move_to_carry_mode(2).await?;
         self.h.smoke_gate(self.h.knobs.gate_account).await
     }

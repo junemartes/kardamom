@@ -100,7 +100,7 @@ impl CarryFloor {
         let last = std::cell::Cell::new(None);
         let last_ref = &last;
         let (stretched, _) = poll::until(
-            Budget::new(h.knobs.retention_freeze_cap, Duration::from_secs(10)),
+            Budget::new(h.knobs.retention_freeze_cap, Duration::from_secs(3)),
             |_| async move {
                 let status = require_status(h, CTX).await?;
                 last_ref.set(Some(status));
@@ -163,7 +163,7 @@ impl CarryFloor {
     async fn posted(h: &Harness, sealed: u64) -> anyhow::Result<()> {
         let l1 = L1::new(h).await?;
         let l1_ref = &l1;
-        poll::until(Budget::secs(300, 5), |_| async move {
+        poll::until(Budget::secs(300, 3), |_| async move {
             Ok::<_, anyhow::Error>((l1_ref.covered_through().await? >= sealed).then_some(()))
         })
         .await?

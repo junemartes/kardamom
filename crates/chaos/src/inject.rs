@@ -3,8 +3,6 @@
 //! a kill, the doomed allocation can still report running on the first
 //! poll, and a bare count would pass instantly against it.
 
-use std::time::Duration;
-
 use crate::harness::Harness;
 use crate::nomad::SavedJob;
 use crate::poll::{self, Budget};
@@ -209,16 +207,16 @@ impl Harness {
         Ok(())
     }
 
-    /// Freeze an inner container with SIGSTOP and verify it: a frozen
-    /// process cannot answer HTTP, so a metrics endpoint that still
-    /// answers means the freeze did not take, and the case fails loudly
-    /// instead of asserting against a replica that never lapsed.
-    /// `docker pause` is not used: the nested freezer of a privileged
-    /// node can silently no-op.
+    /// Freeze an inner container with SIGSTOP and verify it: the kernel
+    /// must report the process stopped. A process that does not stop
+    /// means the freeze did not take, and the case fails loudly instead
+    /// of asserting against a replica that never lapsed. `docker pause`
+    /// is not used: the nested freezer of a privileged node can silently
+    /// no-op.
     ///
     /// # Errors
     ///
-    /// Returns an error if the signal fails or the endpoint stays up.
+    /// Returns an error if the signal fails or the process does not stop.
     pub async fn freeze_verified(
         &self,
         node: &str,
@@ -226,18 +224,22 @@ impl Harness {
         target: &crate::metrics::Target,
         ctx: &str,
     ) -> anyhow::Result<()> {
-        self.nodes
-            .inner_signal(node, inner, crate::nodes::Signal::Stop)
+        let stopped = self
+            .nodes
+            .inner_freeze(node, inner)
             .await
             .map_err(|e| crate::chaos_fail!("{ctx}: SIGSTOP failed: {e}"))?;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        if self.probes.scrape().answers(target).await {
+        if !stopped {
             let _ = self.thaw(node, inner).await;
             return Err(crate::chaos_fail!(
-                "{ctx}: freeze did NOT take effect (metrics endpoint still answering mid-freeze)"
+                "{ctx}: freeze did NOT take effect (the process of {} is not stopped)",
+                target.name
             ));
         }
-        crate::log(format!("{ctx}: freeze verified (metrics endpoint dark)"));
+        crate::log(format!(
+            "{ctx}: freeze verified (the process of {} is stopped)",
+            target.name
+        ));
         Ok(())
     }
 

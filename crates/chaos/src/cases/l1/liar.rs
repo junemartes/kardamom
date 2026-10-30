@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 
 use kardamom_l1_fault_proxy::Fault;
 
-use super::ALERT_HOLD;
 use super::batcher::{assert_posted_through, require_posting};
 use super::followers::{Followers, await_archive_complete, await_resume};
 use super::halt::await_followers_halted;
+use super::{ALERT_HOLD, FINALIZE_HEAD};
 use crate::harness::Harness;
 use crate::l1::{L1, STALE_POST_ALERT};
 use crate::poll::{self, Budget};
@@ -75,6 +75,7 @@ impl Phase {
             base.show()
         ));
         l1.set_faults(&[fault]).await?;
+        l1.mine(FINALIZE_HEAD).await?;
         // The lie clears on every path, so no fault leaks into the next
         // phase or case.
         let held = self.hold(h, l1, base, posted0, ctx).await;

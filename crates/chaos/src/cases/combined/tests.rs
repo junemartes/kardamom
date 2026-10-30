@@ -8,8 +8,8 @@ use crate::probes::Boundaries;
 
 /// Every ordering case, in the shard's run order.
 const ALL: [Combined; 5] = [
-    INGRESS_SEQUENCER,
     INGRESS_SEALER,
+    INGRESS_SEQUENCER,
     SEQUENCER_SEALER,
     ALL_THREE,
     ALL_THREE_REVERSE,

@@ -4,7 +4,7 @@
 //! start again.
 
 use std::cell::{Cell, RefCell};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 
@@ -298,20 +298,21 @@ impl<'a> Members<'a> {
     }
 
     /// Wait until member `id` reports `carryWindow` true, and return the
-    /// moment of that read. The first read must report false: then the
-    /// switch came less than one poll interval before the returned moment.
+    /// wall-clock moment of that read. The first read must report false:
+    /// then the switch came less than one poll interval before the
+    /// returned moment.
     ///
     /// # Errors
     ///
     /// Returns an error when the first read does not report false, or
     /// when the wait ends first.
-    pub(super) async fn await_switch(&self, id: u32) -> anyhow::Result<Instant> {
+    pub(super) async fn await_switch(&self, id: u32) -> anyhow::Result<SystemTime> {
         let first = Cell::new(None);
         let first_ref = &first;
         let outcome = poll::until(SWITCH_POLL, |_| async move {
             let on = self.carry_window(id).await;
             first_ref.set(first_ref.get().or(Some(on)));
-            Ok((on == Some(true)).then(Instant::now))
+            Ok((on == Some(true)).then(SystemTime::now))
         })
         .await?;
         let (at, _) = outcome.or_fail(|t| {

@@ -11,6 +11,7 @@
 //! is a disagreement of the two: the follower halts and publishes none of
 //! it.
 
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 mod batcher;
@@ -38,3 +39,16 @@ pub(crate) use two_day::two_day_outage;
 
 /// How long the stale-post alert must hold to count as fired.
 const ALERT_HOLD: Duration = Duration::from_secs(30);
+
+/// The L1 blocks that finalize the head of anvil. Anvil mines a block
+/// only for a transaction, and behind the fault proxy it finalizes two
+/// blocks behind its head. With these blocks mined right after a lie is
+/// armed or cleared, the followers read it within one poll, not after the
+/// next posts of the batcher.
+const FINALIZE_HEAD: u64 = 3;
+
+/// The case rate of the cases that hold until the sealer floor passes a
+/// cursor: twice the frames of the L1 case rate. A batcher restart of
+/// 30 s at this rate leaves 3000 frames unposted, below the twice the
+/// retention (4096 frames) at which the floor passes its cursor.
+pub(crate) const FLOOR_PASS_TPS: NonZeroU32 = NonZeroU32::new(100).expect("a nonzero rate");

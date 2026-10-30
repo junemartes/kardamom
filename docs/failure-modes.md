@@ -1586,11 +1586,12 @@ A deploy replaces service instances one at a time under readiness checks. The ch
 - The release gate refuses a release before any job changes: a chain that stands on a halt or a pause, an image that the registry does not hold, a coordinated or an unaccepted one-way format change, a sealer setting that every member must match, and a shard map change. See "The release gate" in [../deploy/cluster/README.md](../deploy/cluster/README.md).
 - The deploy record (the Nomad variable `kardamom/deploys/<env>`) holds the pre-deploy version of every job. `just rollback <env>` reverts every job of the last release to that version, in reverse deploy order, under the same waits. It does not cross a rollback floor. Runbook: [runbooks/deploy-rollback.md](runbooks/deploy-rollback.md).
 - Proof: `deploy-broken-image` (`chaos-executor` shard).
-  - The case deploys a manifest whose executor image is a real image that is not an executor.
-  - The new replica never passes its readiness check. Nomad fails the deployment at its healthy deadline.
-  - Each deploy waits until the release gate shows no root and no pause, so the gate does not refuse it.
-  - The deploy must fail at the executor rollout: the executor job has a new version. At least two executors must keep running the old image. The case reads the image from the job spec of each running allocation, not from its job version. On the sealer nodes the deploy rolls one pinned group at a time, and Nomad moves an unchanged group to the new job version in place. The chain must keep advancing.
-  - The deploy of the real manifest then heals the job.
+  - The case rolls the executor job in Nomad, without the deploy play. It takes the job as Nomad holds it, and changes the first executor group: its executor image becomes a real image that is not an executor.
+  - The rolled group gets a healthy deadline of 50 s and a progress deadline of 55 s. The rest of the update stanza stays: one instance at a time, no revert.
+  - The new replica never passes its readiness check. Nomad must mark the deployment `failed`, with no healthy replica of the broken image.
+  - At least two executors must keep running the old image. The case reads the image from the job spec of each running allocation. The chain must keep advancing.
+  - The real image under the same deadlines then heals the group, and that deployment must be `successful`. So the deadline is one that a real executor meets. Then the job gets back its own update stanza.
+  - The deploy play itself (the release gate, the stop of the play at a failed job) has its tests in `deploy/cluster/ansible/tests`.
 - The deploy flow is in [../deploy/cluster/README.md](../deploy/cluster/README.md).
 
 ## Substrate (the shared failure domain)

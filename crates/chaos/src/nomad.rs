@@ -11,12 +11,14 @@ use serde::Deserialize;
 use crate::poll::Budget;
 
 mod alloc_spec;
+mod deployment;
 mod job;
 mod log;
 mod node;
 mod saved_job;
 mod task;
 use alloc_spec::AllocSpec;
+pub(crate) use deployment::Deployment;
 pub(crate) use job::{Job, Nodes};
 pub(crate) use saved_job::SavedJob;
 pub(crate) use task::TaskEvent;

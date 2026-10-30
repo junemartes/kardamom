@@ -3907,6 +3907,7 @@ dependencies = [
  "alloy-primitives",
  "anyhow",
  "clap",
+ "futures",
  "humantime",
  "jsonrpsee",
  "kardamom-bench",

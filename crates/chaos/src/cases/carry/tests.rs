@@ -75,8 +75,7 @@ fn supported_live_transitions_keep_their_cases_and_mixed_executor_state_audit() 
         "carry-readers-on-egress",
         "carry-window-on",
         "carry-executor-first",
-        "carry-executor-second",
-        "carry-executor-third",
+        "carry-executors-rest",
         "carry-deposits-provider-fault",
         "carry-deposits-all-carry",
         "carry-window-off-on",
@@ -111,7 +110,7 @@ fn the_steps_run_a_low_load_and_the_outage_steps_keep_their_senders_live() {
         );
     }
     assert_eq!(
-        Case::Carry(super::Step::Lockbox).load_retry(&k),
+        Case::Carry(super::Step::VersionsOn).load_retry(&k),
         k.load_retry
     );
 }

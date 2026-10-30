@@ -30,16 +30,12 @@ fn a_regular_case_has_the_three_minute_deadline_and_its_load_covers_it() {
 }
 
 #[test]
-fn only_the_nightly_and_deploy_tooling_cases_keep_a_longer_bound() {
+fn only_the_nightly_cases_keep_a_longer_bound() {
     let knobs = Knobs::read(&[]).unwrap();
     for case in [
         Case::ExecutorRestartStorm,
         Case::SealerFleetTotalWipeRecover,
         Case::ResizeScaleOutIn,
-        Case::DeployBrokenImage,
-        Case::NodeReplaceExecutor,
-        Case::NodeReplaceSealer,
-        Case::Carry(crate::cases::carry::Step::WindowOffOn),
     ] {
         assert!(
             case.deadline(&knobs) > knobs.case_deadline,
@@ -54,4 +50,21 @@ fn a_carry_step_without_the_check_play_has_the_case_deadline() {
     let knobs = Knobs::read(&[]).unwrap();
     let step = crate::cases::carry::Step::EgressRestart;
     assert_eq!(Case::Carry(step).deadline(&knobs), knobs.case_deadline);
+}
+
+#[test]
+fn the_deploy_tooling_cases_have_the_case_deadline() {
+    let knobs = Knobs::read(&[]).unwrap();
+    for case in [
+        Case::DeployBrokenImage,
+        Case::NodeReplaceExecutor,
+        Case::NodeReplaceSealer,
+    ] {
+        assert_eq!(
+            case.deadline(&knobs),
+            knobs.case_deadline,
+            "{}",
+            case.name()
+        );
+    }
 }

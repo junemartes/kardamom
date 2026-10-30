@@ -90,6 +90,9 @@ impl InterruptedRebuild<'_> {
         let primary = live_primary(h, CTX).await?;
         let baseline = MirrorRebuilds::read(h).await?;
         let writes = WriteBlock::capture(h).await?;
+        crate::log(format!(
+            "{CTX}: coverage, primary, rebuild counts and Redis data nodes captured"
+        ));
         let mut fault = InterruptedRebuild {
             h,
             saved,
@@ -156,6 +159,7 @@ impl InterruptedRebuild<'_> {
     }
 
     async fn exercise(&mut self) -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
         self.saved.stop().await?;
         let flushed = flush_primary(self.h, CTX).await?;
         anyhow::ensure!(
@@ -165,7 +169,15 @@ impl InterruptedRebuild<'_> {
         self.writes.await_cold_heads(self.h).await?;
         self.writes.arm(self.h).await?;
         self.writes.verify(self.h).await?;
+        crate::log(format!(
+            "{CTX}: mirrors stopped, primary flushed, writes blocked after {}s",
+            started.elapsed().as_secs()
+        ));
         self.saved.restore().await?;
+        crate::log(format!(
+            "{CTX}: mirrors run again after {}s",
+            started.elapsed().as_secs()
+        ));
         self.capture_targets().await?;
         self.blocked = Some(
             self.baseline
@@ -173,11 +185,20 @@ impl InterruptedRebuild<'_> {
                 .await?,
         );
         self.verify_targets().await?;
-        super::wait_readers_degraded(self.h, CTX).await?;
-        self.prove_traffic().await?;
-        self.verify_targets().await?;
-        self.writes.verify(self.h).await?;
-        self.writes.require_cold_heads(self.h).await?;
+        let (degraded, traffic) = tokio::join!(
+            super::wait_readers_degraded(self.h, CTX),
+            Self::prove_traffic(self.h)
+        );
+        degraded?;
+        self.traffic_hash = Some(traffic?);
+        let (targets, writes, cold) = tokio::join!(
+            Self::verify_all(self.h, &mut self.targets),
+            self.writes.verify(self.h),
+            self.writes.require_cold_heads(self.h)
+        );
+        targets?;
+        writes?;
+        cold?;
         crate::log(format!(
             "{CTX}: every mirror is inside an unfinished checkpoint scan with a failed write; killing {} tasks",
             self.targets.len()
@@ -187,23 +208,29 @@ impl InterruptedRebuild<'_> {
     }
 
     async fn verify_targets(&mut self) -> anyhow::Result<()> {
-        for target in &mut self.targets {
-            target.verify_blocked(self.h).await?;
-        }
-        Ok(())
+        Self::verify_all(self.h, &mut self.targets).await
     }
 
-    async fn prove_traffic(&mut self) -> anyhow::Result<()> {
-        let rpc = Rpc::new(&self.h.rpc_url, self.h.knobs.chain_id)?;
+    /// Every target is still blocked in its scan. The targets run on
+    /// different nodes, so their reads run at once.
+    async fn verify_all(h: &Harness, targets: &mut [Target]) -> anyhow::Result<()> {
+        futures::future::try_join_all(targets.iter_mut().map(|target| target.verify_blocked(h)))
+            .await
+            .map(|_| ())
+    }
+
+    /// A transfer from the reserve account that no case load spends gets
+    /// its receipt while every mirror is blocked. Returns its hash.
+    async fn prove_traffic(h: &Harness) -> anyhow::Result<String> {
+        let rpc = Rpc::new(&h.rpc_url, h.knobs.chain_id)?;
         let nonce = rpc.nonce_of(FAULT_ACCOUNT).await?;
-        self.traffic_hash = Some(
-            rpc.transfer_hash(FAULT_ACCOUNT, nonce, Duration::from_secs(60))
-                .await?,
-        );
+        let hash = rpc
+            .transfer_hash(FAULT_ACCOUNT, nonce, Duration::from_secs(60))
+            .await?;
         crate::log(format!(
             "{CTX}: a transfer from the unused cache-shard reserve {FAULT_ACCOUNT} receipts before the final blocked-scan check"
         ));
-        Ok(())
+        Ok(hash)
     }
 
     async fn capture_targets(&mut self) -> anyhow::Result<()> {

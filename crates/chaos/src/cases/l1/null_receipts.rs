@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 
 use kardamom_l1_fault_proxy::Fault;
 
-use super::ALERT_HOLD;
 use super::batcher::{
     BeforeRestart, assert_resumed_from_contract, await_posting, require_posting, restart,
 };
 use super::followers::{Followers, await_archive_complete, await_resume};
 use super::halt::await_followers_halted;
+use super::{ALERT_HOLD, FINALIZE_HEAD};
 use crate::harness::Harness;
 use crate::l1::{L1, STALE_POST_ALERT};
 
@@ -34,6 +34,7 @@ pub(crate) async fn null_receipts(h: &mut Harness) -> anyhow::Result<()> {
     ];
     crate::log(format!("{ctx}: {faults:?} for {}s", window.as_secs()));
     l1.set_faults(&faults).await?;
+    l1.mine(FINALIZE_HEAD).await?;
     // The faults clear on every path, so no lie leaks into the next case.
     let lied = under_faults(h, &l1, base, ctx).await;
     let cleared = Followers::at_clear(h, &l1, base).await;

@@ -302,15 +302,14 @@ impl Case {
     #[must_use]
     pub fn tps(self, k: &Knobs) -> NonZeroU32 {
         match self {
-            Self::NodeReplaceExecutor | Self::NodeReplaceSealer | Self::DeployBrokenImage => {
-                PLAY_TPS
-            }
+            Self::NodeReplaceExecutor | Self::NodeReplaceSealer => PLAY_TPS,
+            // The floor passes the frozen or resumed cursor of the batcher
+            // sooner at a higher rate.
+            Self::TwoDayOutage | Self::BatcherOutagePastRetention => l1::FLOOR_PASS_TPS,
             Self::L1Liar
             | Self::L1NullReceipts
             | Self::L1TransportRefusals
             | Self::L1ProviderUnresponsive
-            | Self::TwoDayOutage
-            | Self::BatcherOutagePastRetention
             | Self::FollowerInstanceLoss
             | Self::FollowerTotalLoss
             | Self::FollowerDisagreement => k.l1_tps,

@@ -115,6 +115,8 @@ pub(crate) async fn sequencer_lapse(h: &mut Harness) -> anyhow::Result<()> {
         h.knobs.seq_lapse.as_secs(),
         started0.as_deref().unwrap_or("?")
     ));
+    // The lapse counts from the SIGSTOP: the freeze check runs inside it.
+    let frozen_at = std::time::Instant::now();
     h.freeze_verified(
         &node,
         &inner,
@@ -122,7 +124,7 @@ pub(crate) async fn sequencer_lapse(h: &mut Harness) -> anyhow::Result<()> {
         "sequencer-lapse",
     )
     .await?;
-    tokio::time::sleep(h.knobs.seq_lapse.saturating_sub(Duration::from_secs(3))).await;
+    tokio::time::sleep(h.knobs.seq_lapse.saturating_sub(frozen_at.elapsed())).await;
     h.thaw(&node, &inner)
         .await
         .map_err(|e| crate::chaos_fail!("sequencer-lapse: SIGCONT failed: {e}"))?;
@@ -387,7 +389,7 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
 async fn require_live_victim(h: &Harness, victim: Victim, ctx: &str) -> anyhow::Result<()> {
     let prev = Cell::new(None);
     let prev_ref = &prev;
-    let outcome = poll::until(Budget::secs(120, 6), |_| async move {
+    let outcome = poll::until(Budget::secs(120, 2), |_| async move {
         let now = match victim {
             Victim::Executor => h.probes.exec_metric(2, EXECUTOR_BLOCK_METRIC).await,
             Victim::Validator => h.probes.val_metric("validator_committed_block").await,

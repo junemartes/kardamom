@@ -385,6 +385,29 @@ impl Nodes {
         .map(|_| ())
     }
 
+    /// SIGSTOP an inner container and read the state of its process from
+    /// `/proc` on the node until the kernel reports it stopped (`T`), for
+    /// at most 2 s. One exec does both, so a starved runner does not add
+    /// a scrape timeout to the proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the exec fails.
+    pub async fn inner_freeze(&self, node: &str, inner: &str) -> anyhow::Result<bool> {
+        let script = format!(
+            "docker kill -s STOP {inner} >/dev/null
+pid=$(docker inspect -f '{{{{.State.Pid}}}}' {inner})
+state=?
+for _ in $(seq 1 40); do
+  state=$(sed 's/.*) //' /proc/$pid/stat | cut -d' ' -f1)
+  [ \"$state\" = T ] && break
+  sleep 0.05
+done
+echo \"$state\""
+        );
+        Ok(self.exec(node, &script).await?.trim() == "T")
+    }
+
     /// The recent log tail of an inner container, both streams merged.
     pub async fn inner_logs(&self, node: &str, inner: &str, tail: u32) -> Option<String> {
         self.exec(node, &format!("docker logs --tail {tail} {inner} 2>&1"))

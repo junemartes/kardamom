@@ -61,8 +61,27 @@ impl Check {
         ]
     }
 
-    async fn verify(&self, node: &str, isolated: bool) -> anyhow::Result<()> {
-        let answered = Nodes.exec_status(node, &self.script).await?;
+    /// The line of the node script that runs this check and prints its
+    /// verdict as `<index>=1` when it answers, or `<index>=0`.
+    fn line(&self, index: usize) -> String {
+        format!(
+            "if (\n{}\n) >/dev/null 2>&1; then echo {index}=1; else echo {index}=0; fi",
+            self.script
+        )
+    }
+
+    /// Whether the verdict lines of a node script say that check `index`
+    /// answered. A missing line is an error, never an answer.
+    fn answered(output: &str, index: usize) -> anyhow::Result<bool> {
+        let prefix = format!("{index}=");
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .map(|verdict| verdict == "1")
+            .ok_or_else(|| anyhow::anyhow!("no verdict for check {index} in {output:?}"))
+    }
+
+    fn judge(&self, node: &str, answered: bool, isolated: bool) -> anyhow::Result<()> {
         anyhow::ensure!(
             answered != isolated,
             "{} on {node}: {} {} while isolated={isolated}",
@@ -136,11 +155,24 @@ impl Step {
         Ok(view)
     }
 
+    /// Run the four checks of the node in one exec, one after the other
+    /// inside the node: on a busy runner a docker exec costs seconds, and
+    /// many at once time out.
     async fn verify(&self, isolated: bool) -> anyhow::Result<()> {
-        for check in &self.checks {
-            check.verify(&self.view.node, isolated).await?;
-        }
-        Ok(())
+        let script = self
+            .checks
+            .iter()
+            .enumerate()
+            .map(|(index, check)| check.line(index))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = Nodes.exec(&self.view.node, &script).await?;
+        self.checks
+            .iter()
+            .enumerate()
+            .try_for_each(|(index, check)| {
+                check.judge(&self.view.node, Check::answered(&output, index)?, isolated)
+            })
     }
 
     async fn unchanged(&self) -> anyhow::Result<()> {
@@ -156,5 +188,25 @@ impl Step {
             self.view.tasks
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod script_tests {
+    use super::Check;
+
+    #[test]
+    fn each_check_line_prints_its_own_verdict_and_a_missing_one_is_an_error() {
+        let check = Check {
+            name: "Consul HTTP",
+            script: "curl -fsS http://127.0.0.1:8500".into(),
+        };
+        let line = check.line(2);
+        assert!(
+            line.starts_with("if (\ncurl") && line.ends_with("then echo 2=1; else echo 2=0; fi")
+        );
+        assert!(Check::answered("0=1\n1=0\n2=1\n", 2).unwrap());
+        assert!(!Check::answered("0=1\n1=0\n", 1).unwrap());
+        assert!(Check::answered("0=1\n", 3).is_err());
     }
 }

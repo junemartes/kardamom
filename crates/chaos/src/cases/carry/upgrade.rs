@@ -3,9 +3,9 @@
 
 use std::fmt;
 
+use super::check::UpgradeCheck;
 use crate::harness::Harness;
 use crate::l1::L1;
-use crate::lifecycle::NOMAD_HTTP_PORT;
 
 /// The feature id and the activation time of one upgrade transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +33,16 @@ impl Upgrade {
         }
     }
 
+    /// The feature id of the transaction.
+    pub(super) const fn feature(self) -> u64 {
+        self.feature
+    }
+
+    /// Whether the transaction turns the feature on at once.
+    pub(super) const fn at_once(self) -> bool {
+        self.activation_ms == 0
+    }
+
     /// `feature` off: an activation at `2^64 - 1` ms never comes, so the
     /// feature is held and off.
     pub(super) const fn off(feature: u64) -> Self {
@@ -42,22 +52,22 @@ impl Upgrade {
         }
     }
 
-    /// Run `just sealer-upgrade-check` for this transaction.
+    /// The release check of this transaction: the rules of `just
+    /// sealer-upgrade-check`, read straight from the cluster (see
+    /// `check`).
     ///
     /// # Errors
     ///
-    /// Returns an error when the check refuses it.
+    /// Returns an error when the check refuses it, with every refusal.
     pub(super) async fn check(self, h: &Harness, ctx: &str) -> anyhow::Result<()> {
-        let nomad_addr = h.contract.nomad_addr(NOMAD_HTTP_PORT)?;
-        let passed = h
-            .lifecycle
-            .upgrade_check(&nomad_addr, self.feature, self.activation_ms)
-            .await?;
+        let refused = UpgradeCheck::new(h)?.facts(self).await?.refusals(self);
         anyhow::ensure!(
-            passed,
-            "{}: {ctx}: just sealer-upgrade-check refuses {self}",
-            crate::FAIL_PREFIX
+            refused.is_empty(),
+            "{}: {ctx}: the upgrade check refuses {self}: {}",
+            crate::FAIL_PREFIX,
+            refused.join("; ")
         );
+        crate::log(format!("{ctx}: the upgrade check passes {self}"));
         Ok(())
     }
 

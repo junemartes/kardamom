@@ -219,8 +219,12 @@ impl Harness {
         load.finish_submissions();
         let verdict = load.finish().await?;
         case.judge_load(&verdict)?;
-        self.assert_executors_converged(case.name()).await?;
-        self.probe_recovery(case, account).await?;
+        // The fleet convergence and the recovery probe read independent
+        // facts, so they run at once.
+        tokio::try_join!(
+            self.assert_executors_converged(case.name()),
+            self.probe_recovery(case, account)
+        )?;
         self.validator_verdict().await
     }
 

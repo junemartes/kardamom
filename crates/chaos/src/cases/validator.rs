@@ -191,6 +191,8 @@ pub(crate) async fn lapse(h: &mut Harness) -> anyhow::Result<()> {
         h.knobs.validator_lapse.as_secs(),
         started0.as_deref().unwrap_or("?")
     ));
+    // The lapse counts from the SIGSTOP: the freeze check runs inside it.
+    let frozen_at = std::time::Instant::now();
     h.freeze_verified(
         &node,
         &inner,
@@ -198,12 +200,7 @@ pub(crate) async fn lapse(h: &mut Harness) -> anyhow::Result<()> {
         "validator-lapse",
     )
     .await?;
-    tokio::time::sleep(
-        h.knobs
-            .validator_lapse
-            .saturating_sub(Duration::from_secs(3)),
-    )
-    .await;
+    tokio::time::sleep(h.knobs.validator_lapse.saturating_sub(frozen_at.elapsed())).await;
     thaw_validator(h, &node, &inner).await;
     confirm_thaw(h, &node, &inner, started0.as_deref()).await;
     // The catch-up runs on a chain without new traffic: the lag at the
@@ -318,7 +315,7 @@ async fn sample_recovery(
 ) -> anyhow::Result<(Path, Warm)> {
     let last = Cell::new((Path::Survivor, Warm::default()));
     let last_ref = &last;
-    let outcome = poll::after_sleep(Budget::secs(240, 10), |elapsed| async move {
+    let outcome = poll::after_sleep(Budget::secs(240, 5), |elapsed| async move {
         let Some((path, w)) = recovery_sample(h, node, started0, elapsed).await else {
             crate::log(format!(
                 "validator-lapse: sample t={}s SCRAPE FAILED (not counted)",

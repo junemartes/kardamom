@@ -1,7 +1,7 @@
 //! The faults around the switch: feature 5 off and on, a leader that dies
 //! right after the switch, and the restart of an egress instance.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use kardamom_types::upgrades::FEATURE_CARRY_WINDOW;
 
@@ -11,10 +11,17 @@ use super::members::{Members, Window};
 use super::upgrade::Upgrade;
 use crate::cases::cluster::sealer;
 use crate::inject::Killed;
+use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
 
 /// The task of an egress instance.
 const EGRESS_TASK: &str = "egress";
+
+/// How long a killed leader may take to report its exit time.
+const EXIT_WAIT: Budget = Budget {
+    timeout: Duration::from_secs(20),
+    interval: Duration::from_millis(500),
+};
 
 /// The latest kill of the leader after its switch.
 const KILL_AFTER_SWITCH: Duration = Duration::from_secs(2);
@@ -34,7 +41,11 @@ impl Run<'_> {
 
     /// Feature 5 off, then on, and the leader dies within 2 s after its
     /// switch. The container of the leader is known before the
-    /// transaction, so the kill is one call after the switch.
+    /// transaction, so the kill is one call after the switch. The time of
+    /// the death is the exit time that the docker daemon of the node
+    /// records, not the return of the kill command: the command crosses
+    /// two docker clients, and on a loaded runner its return comes
+    /// seconds after the process died.
     pub(super) async fn leader_kill_at_switch(&mut self) -> anyhow::Result<()> {
         let on = self.off_then_check_on().await?;
         let members = Members::new(self.h)?;
@@ -49,11 +60,19 @@ impl Run<'_> {
         on.send(self.h, self.ctx).await?;
         let switched = members.await_switch(leader).await?;
         self.h.nodes.inner_kill(&node, &cid).await?;
-        let late = switched.elapsed();
+        let returned = switched.elapsed().unwrap_or_default();
+        let died = self.died_at(&node, &cid).await?;
+        let late = died.duration_since(switched).map_err(|_| {
+            crate::chaos_fail!(
+                "{}: the leader {leader} exited before the read that saw its switch, so the kill did not stop it",
+                self.ctx
+            )
+        })?;
         crate::log(format!(
-            "{}: leader {leader} on {node} killed {}ms after its switch",
+            "{}: leader {leader} on {node} died {}ms after its switch; the kill command returned after {}ms",
             self.ctx,
-            late.as_millis()
+            late.as_millis(),
+            returned.as_millis()
         ));
         anyhow::ensure!(
             late <= KILL_AFTER_SWITCH,
@@ -77,6 +96,32 @@ impl Run<'_> {
         Members::new(self.h)?
             .await_window(Window::On, self.retention()?)
             .await
+    }
+
+    /// The exit time of the inner container `cid` on `node`, as its docker
+    /// daemon records it, once the container no longer runs. The node and
+    /// the runner share one clock.
+    async fn died_at(&self, node: &str, cid: &str) -> anyhow::Result<SystemTime> {
+        let script =
+            format!("docker inspect -f '{{{{.State.Running}}}} {{{{.State.FinishedAt}}}}' {cid}");
+        let script = &script;
+        let outcome = poll::until(EXIT_WAIT, |_| async move {
+            let state = self.h.nodes.exec(node, script).await?;
+            Ok(state
+                .trim()
+                .strip_prefix("false ")
+                .and_then(|stamp| humantime::parse_rfc3339(stamp).ok()))
+        })
+        .await?;
+        outcome
+            .or_fail(|t| {
+                crate::chaos_fail!(
+                    "{}: {cid} on {node} reports no exit time within {}s of its kill",
+                    self.ctx,
+                    t.as_secs()
+                )
+            })
+            .map(|(died, _)| died)
     }
 
     /// One egress instance restarts. It reads R from its mark, so

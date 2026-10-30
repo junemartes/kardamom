@@ -9,16 +9,9 @@ use crate::knobs::Knobs;
 /// rebuilds a whole fleet, and the nightly job has no per-case budget.
 const NIGHTLY_DEADLINE: Duration = Duration::from_mins(60);
 
-/// The bound of a case that runs the deploy tooling itself: a full
-/// Ansible deploy play, a new machine that Terraform makes and the
-/// substrate play provisions, or the upgrade check play before an
-/// upgrade transaction. One play takes minutes on the CI runner, so these
-/// cases cannot meet the case deadline.
-const DEPLOY_DEADLINE: Duration = Duration::from_mins(30);
-
 impl Case {
     /// The longest the case may run, from the start of its load to its
-    /// verdict. Every other case of a regular shard finishes within the
+    /// verdict. Every case of a regular shard finishes within the
     /// deadline of the knobs, so a slow case fails at once with a clear
     /// cause instead of pushing its shard past the job limit.
     #[must_use]
@@ -27,10 +20,6 @@ impl Case {
             Self::ExecutorRestartStorm
             | Self::SealerFleetTotalWipeRecover
             | Self::ResizeScaleOutIn => NIGHTLY_DEADLINE,
-            Self::DeployBrokenImage | Self::NodeReplaceExecutor | Self::NodeReplaceSealer => {
-                DEPLOY_DEADLINE
-            }
-            Self::Carry(step) if step.runs_the_check_play() => DEPLOY_DEADLINE,
             _ => k.case_deadline,
         }
     }

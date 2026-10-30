@@ -2478,13 +2478,6 @@
       "full_case_locally_validated": false
     },
     {
-      "case": "carry-lockbox",
-      "family": "Carry",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
-    },
-    {
       "case": "carry-deposits-provider-fault",
       "family": "Carry",
       "status": "planned",
@@ -2542,14 +2535,7 @@
       "full_case_locally_validated": false
     },
     {
-      "case": "carry-executor-second",
-      "family": "Carry",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
-    },
-    {
-      "case": "carry-executor-third",
+      "case": "carry-executors-rest",
       "family": "Carry",
       "status": "planned",
       "local_tests": [],

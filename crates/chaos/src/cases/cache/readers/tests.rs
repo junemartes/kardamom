@@ -29,6 +29,7 @@ impl Fixture {
                     degraded: 7,
                 },
                 after: Readers { degraded, redis },
+                head_lag: None,
             }),
         }
     }

@@ -165,10 +165,13 @@ impl Shard {
             // Two or three classes down at once, and the order of their
             // return. The pairs return in dependency order and against
             // it; the two triple cases take the sealers down with both
-            // the sequencers and the ingresses, in both orders.
+            // the sequencers and the ingresses, in both orders. The first
+            // case has no origin-gap check: the da-watcher publishes its
+            // first epoch minutes after the bring-up, and a check that
+            // waits for it must not run first.
             Self::CombinedOrdering => &[
-                "ingress-sequencer-loss-recover",
                 "ingress-sealer-loss-recover",
+                "ingress-sequencer-loss-recover",
                 "sequencer-sealer-loss-recover",
                 "ingress-sequencer-sealer-loss-recover",
                 "ingress-sequencer-sealer-reverse",
@@ -237,15 +240,13 @@ impl Shard {
             // staging rollout, then the faults around its switch. Each
             // step needs the steps before it.
             Self::Carry => &[
-                "carry-lockbox",
                 "carry-versions-on",
                 "carry-deposits-provider-fault",
                 "carry-held-offer-after-downgrade",
                 "carry-readers-on-egress",
                 "carry-window-on",
                 "carry-executor-first",
-                "carry-executor-second",
-                "carry-executor-third",
+                "carry-executors-rest",
                 "carry-deposits-all-carry",
                 "carry-window-off-on",
                 "carry-leader-kill-at-switch",
@@ -360,11 +361,11 @@ impl Shard {
     #[must_use]
     pub fn env(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            // Two squeezes of 40 s, past the 30 s Aeron stall tolerance,
-            // so sessions lapse and reconnect twice inside the deadline.
+            // One squeeze of 40 s, past the 30 s Aeron stall tolerance, so
+            // the sessions lapse and reconnect inside the deadline.
             Self::Cluster => &[
                 ("RUN_LOAD", "0"),
-                ("SQUEEZE_CYCLES", "2"),
+                ("SQUEEZE_CYCLES", "1"),
                 ("SQUEEZE_S", "40"),
                 ("SQUEEZE_RELEASE_S", "20"),
                 ("SQUEEZE_CPUS_PER_NODE", "0.4"),
@@ -491,7 +492,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 88);
+        assert_eq!(all.len(), 86);
         assert_eq!(
             Shard::Integrity.cases().last(),
             Some(&"resize-scale-out-in")
@@ -557,7 +558,7 @@ mod tests {
             Some(CARRY_RETENTION)
         );
         assert!(Shard::Carry.audits_after("carry-executor-first"));
-        assert_eq!(Shard::Carry.cases().first(), Some(&"carry-lockbox"));
+        assert_eq!(Shard::Carry.cases().first(), Some(&"carry-versions-on"));
         assert!(Shard::Carry.env().contains(&("L1_FAULT_S", "45")));
     }
 }

@@ -9,7 +9,12 @@ use crate::nodes::Pipe;
 use crate::poll::{self, Budget};
 
 mod heal;
+mod segment;
 mod staging;
+
+#[cfg(test)]
+use segment::SegmentHashes;
+use segment::{Segment, pick_clean_segment};
 
 const DRIVER_TASK: &str = "archiving-media-driver";
 const ARCHIVE_DIR: &str = "/opt/kardamom/archive/dir";
@@ -322,8 +327,10 @@ pub(crate) async fn corruption(h: &mut Harness) -> anyhow::Result<()> {
 }
 
 /// The deadline of the ingress-0 drain. Nomad stops every allocation
-/// of the node by then.
-const DRAIN_DEADLINE: Duration = Duration::from_mins(2);
+/// of the node by then. The ingress cannot move to another node, so the
+/// drain always runs to its deadline, and only then does Nomad stop the
+/// system jobs of the node, the archive daemon among them.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Aeron's `ArchiveTool` in a one-off container on the node, while the
 /// daemon is down.
@@ -469,141 +476,6 @@ fn recording_err(out: &str, rid: &str) -> bool {
             (rest.starts_with(',') || rest.starts_with(')')) && rest.contains(" ERR")
         })
     })
-}
-
-/// A victim segment: clean at baseline, with a usable data frame to flip
-/// inside, and the name of the mirror segment that holds the same bytes.
-struct Segment {
-    name: String,
-    /// Recording ids are per archive. A recording that started after an
-    /// adoption has a different id on each node, so the mirror can hold
-    /// the victim's bytes under another name.
-    mirror_name: String,
-    rid: String,
-    flip_at: i64,
-}
-
-/// The sha256 and name of archive segments on one node, in listing order.
-struct SegmentHashes(Vec<(String, String)>);
-
-impl SegmentHashes {
-    /// Hash the segments `listing` names, a shell word list run in the
-    /// archive directory. Hashing every preallocated segment takes longer
-    /// than the short exec bound after a few cases (about 25 s for 4.6 GB
-    /// on a host run), so this read uses the long bound.
-    async fn read(h: &Harness, node: &str, listing: &str) -> Self {
-        let script = format!("cd {ARCHIVE_DIR} && {listing} | xargs -r sha256sum");
-        let out = h.nodes.exec_long(node, &script).await.unwrap_or_default();
-        Self::parse(&out)
-    }
-
-    fn parse(out: &str) -> Self {
-        Self(
-            out.lines()
-                .filter_map(|l| l.split_once("  "))
-                .map(|(hash, name)| (hash.to_string(), name.to_string()))
-                .collect(),
-        )
-    }
-
-    /// The name of a segment with `hash`: `name` itself when it matches,
-    /// or else the first other segment with those bytes.
-    fn name_for(&self, hash: &str, name: &str) -> Option<String> {
-        let same: Vec<&String> = self
-            .0
-            .iter()
-            .filter(|(h, _)| h == hash)
-            .map(|(_, n)| n)
-            .collect();
-        let exact = same.iter().find(|n| n.as_str() == name);
-        exact.or(same.first()).map(|n| (*n).clone())
-    }
-}
-
-/// The first victim segment that the mirror holds byte-identical, that
-/// carries a data frame, and that verifies clean. Every segment is a
-/// candidate: all segment files share one preallocated length, and a
-/// restored segment is fully allocated on disk, so neither length nor disk
-/// use ranks the segments that carry data. The mirror match is by content:
-/// an adopted recording keeps its id but its catalog entry checksum is
-/// stale, so it fails verify, and a recording made after the adoption
-/// verifies clean under a different id on each node.
-async fn pick_clean_segment(tool: &ArchiveTool<'_>, mirror: &str) -> anyhow::Result<Segment> {
-    let victim = SegmentHashes::read(tool.h, tool.node, "ls *.rec 2>/dev/null").await;
-    let mirror = SegmentHashes::read(tool.h, mirror, "ls *.rec 2>/dev/null").await;
-    crate::log(format!(
-        "archive-corruption: {} victim candidates, {} mirror segments",
-        victim.0.len(),
-        mirror.0.len()
-    ));
-    for (hash, name) in victim.0 {
-        let Some(mirror_name) = mirror.name_for(&hash, &name) else {
-            continue;
-        };
-        if let Some(seg) = qualify(tool, name, mirror_name).await {
-            return Ok(seg);
-        }
-    }
-    Err(crate::chaos_fail!(
-        "archive-corruption: no recording verifies clean at baseline (inherited catalog damage too broad)"
-    ))
-}
-
-/// Whether one candidate qualifies. Recording ids are per-archive: after
-/// a wipe and a re-replication the mirror's `40-0.rec` can hold another
-/// stream than the victim's, and a heal from it writes foreign frames
-/// (seen in CI: post-heal verify found streamId=2000 where the victim's
-/// recording is stream 2001). So the mirror's segment must be byte-identical
-/// to the victim's before the flip; then the heal restores exactly the bytes
-/// the flip destroyed. A candidate that fails the probe verify gets its
-/// state put back.
-/// `name` as a victim segment, when it carries a data frame and its
-/// recording verifies clean. The frame check runs first: it is a cheap
-/// read, and it skips the idle lanes before a verify starts a JVM.
-async fn qualify(tool: &ArchiveTool<'_>, name: String, mirror_name: String) -> Option<Segment> {
-    let flip_at = frame_payload_offset(tool.h, tool.node, &name).await;
-    if flip_at < 0 {
-        return None;
-    }
-    let rid = name.split('-').next().unwrap_or("").to_string();
-    let out = tool.verify(&rid).await;
-    if !recording_ok(&out, &rid) || out.contains(") ERR") {
-        tool.mark_valid(&rid).await;
-        return None;
-    }
-    Some(Segment {
-        name,
-        mirror_name,
-        rid,
-        flip_at,
-    })
-}
-
-/// A byte offset inside the payload of the largest data frame of a
-/// segment, walking the Aeron frame headers so the flip never lands in
-/// a header. -1 when the segment has no usable frame.
-async fn frame_payload_offset(h: &Harness, node: &str, name: &str) -> i64 {
-    let script = format!(
-        "python3 -c \"
-b = open('{ARCHIVE_DIR}/{name}', 'rb').read()
-pos = 0; best = -1; bestlen = 0
-while pos + 32 <= len(b):
-    ln = int.from_bytes(b[pos:pos+4], 'little', signed=True)
-    if ln <= 0:
-        break
-    typ = int.from_bytes(b[pos+6:pos+8], 'little')
-    if typ == 1 and ln >= 96 and pos + ln <= len(b) and ln > bestlen:
-        best = pos; bestlen = ln
-    pos += (ln + 31) // 32 * 32
-print(best + 40 if best >= 0 else -1)
-\""
-    );
-    h.nodes
-        .exec(node, &script)
-        .await
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(-1)
 }
 
 #[cfg(test)]
