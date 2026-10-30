@@ -32,6 +32,7 @@
 //! fallback path, no `recover_signer()` call, and no paranoid-check mode.
 //! The sequencer does zero secp256k1 work on the hot path.
 
+pub mod account_lookup;
 pub mod admission;
 pub mod config;
 pub mod epoch;

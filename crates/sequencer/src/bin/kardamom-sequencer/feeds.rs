@@ -17,7 +17,6 @@
 //! Async-capable work, such as the receipts fan-in on an existing tokio
 //! channel, is a plain task. It uses `select!` on `Shutdown::cancelled`.
 
-mod account_lookup;
 mod guards;
 mod lookup;
 mod origin_pump;
@@ -29,7 +28,6 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub(crate) use account_lookup::{AccountLookupFeed, LookupSources, Retries};
 use guards::GuardPauses;
 use kardamom_cluster_adapter::LiveEgress;
 use kardamom_cluster_adapter::live::EgressPoll;
@@ -40,6 +38,7 @@ use kardamom_log::aeron_live::{
 };
 use kardamom_obs::lifecycle::{Lifecycle, process};
 use kardamom_obs::pipeline::{LoopMeter, LoopState};
+pub(crate) use kardamom_sequencer::account_lookup::{AccountLookupFeed, LookupSources, Retries};
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::epoch::{EpochPump, OriginSignalTx};
 use kardamom_sequencer::error::SequencerError;

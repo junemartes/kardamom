@@ -180,6 +180,22 @@ falsely acknowledged, a permanent output error is retried, or the egress prunes 
 the higher posted/final head, or the production provider-read deadline is removed. These
 mutations are validation experiments; they are not runtime changes.
 
+The same target runs two production admission loops per lane. Both read
+one `tx_data` stream and offer through the production publisher to a
+controlled sealer. The sealer does first-seen dedup and the contiguity
+guard, relays each ordered reference to every session, and sends the rows of
+each ordered transaction. The tests stop one replica gracefully, kill one
+with every port cut, and freeze one past the loss window. The twin must keep
+the lane ordering. A restarted replica starts empty and must order an
+established sender and a fresh sender alone while its twin is frozen. Each
+load nonce must be ordered once and in order, with the exact offer bytes. A
+lookup blackout runs the production account lookup task against a loopback
+executor query that holds each request. Lookups must fail at the unchanged
+two-second deadline while canonical frames still arrive, then answer after
+the next restart. The lookup task lives in the library for this test; its
+behavior is unchanged. Negative controls fail when the loop sends no lookup,
+ignores canonical and row events, or the lookup task drops its answer.
+
 The [coverage inventory](../scripts/ci/component-recovery.json) names every
 registered chaos case, plus the packet-delay case pending in PR #917. The registry
 test rejects a new chaos case without a corresponding plan. Each family lists the
@@ -187,6 +203,34 @@ real actors, boundary faults, recovery invariants and dependencies that still ne
 real integration. `partial` means that named local tests validate some boundary
 assumptions. It does not mean the complete distributed case has passed locally.
 Forty-one cases have partial mappings. No full case is marked locally validated yet.
+
+`just component-catalog` checks the catalog. `just component-summary` prints the
+planned, partial and ported counts for each family. A case is ported when its
+status is `ported`. The status `ported` and `full_case_locally_validated: true`
+always go together. A ported case needs:
+
+- At least one local test.
+- A local test in a suite with a `ci_mode`, so that CI runs it. The modes are
+  `in-process`, `docker` (a real container dependency) and `gradle` (the Java
+  sealer).
+- A negative control for one of its local tests. A control that names tests
+  (`test`, `tests` or `failed_tests`) guards only those tests. A control that
+  names no test guards every test of its suite.
+
+The optional case field `cluster_only_checks` is a list of strings. Each string
+names a check that needs the deployed cluster, and gives the reason. The cluster
+chaos suite keeps these checks.
+
+The isolated component suite is the pull request gate for recovery behaviour. The
+cluster chaos suite runs nightly. Every nightly chaos failure gets an isolated test
+that reproduces it:
+
+1. Write the test against the real actor, as the steps below describe.
+2. Add the test to the `tests` of its suite in `local_suites`.
+3. Add `{"suite": ..., "test": ...}` to the `local_tests` of the failed case.
+
+The `local_tests` entry links the test to the failed case. If the failure needs
+the deployed cluster, add the check to `cluster_only_checks` of the case instead.
 
 For each remaining case:
 

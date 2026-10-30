@@ -16,13 +16,18 @@
         "AdmissionLoop::run",
         "ClusterRefPublisher",
         "SealerRules",
-        "production ingress/egress wire codecs"
+        "production ingress/egress wire codecs",
+        "two racing AdmissionLoop replicas per lane with per-process metrics",
+        "AccountLookupFeed with the ExecutorQuery HTTP client"
       ],
       "controlled": [
         "bounded tx_data channel",
         "account lookup replies",
         "cluster ingress acceptance/disconnect/backpressure",
-        "canonical feed delivery"
+        "canonical feed delivery",
+        "sealer with first-seen dedup, contiguity guard and RelayedRef relay to each session",
+        "executor rows per ordered transaction and a loopback executor query that hangs or answers",
+        "replica freeze, graceful stop and hard kill with all ports cut"
       ],
       "tests": [
         "output_backpressure_and_disconnect_recover_without_new_client_input",
@@ -31,7 +36,12 @@
         "stalled_input_resumes_and_permanent_input_close_stops_the_actor",
         "delayed_canonical_input_fills_the_outbox_then_resumes_in_order",
         "a_permanent_output_encoding_failure_is_reported_instead_of_retried",
-        "shutdown_completes_while_output_is_disconnected"
+        "shutdown_completes_while_output_is_disconnected",
+        "a_graceful_replica_stop_keeps_the_lane_ordering_and_its_restart_rejoins",
+        "a_hard_replica_kill_loses_no_offer_and_its_cold_restart_rejoins",
+        "each_restarted_replica_orders_an_established_sender_while_its_twin_is_frozen",
+        "a_lapsed_replica_publishes_fresh_work_after_thaw_while_its_twin_ordered",
+        "a_lookup_blackout_fails_lookups_while_the_cluster_feed_lives_then_answers"
       ],
       "negative_controls": {
         "lost_session_replay": {
@@ -46,6 +56,29 @@
         },
         "permanent_error_retried": {
           "test": "a_permanent_output_encoding_failure",
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "lookup_request_dropped": {
+          "mutation": "The v2 loop never sends a lookup request.",
+          "tests": [
+            "a_graceful_replica_stop_keeps_the_lane_ordering_and_its_restart_rejoins",
+            "a_hard_replica_kill_loses_no_offer_and_its_cold_restart_rejoins",
+            "each_restarted_replica_orders_an_established_sender_while_its_twin_is_frozen",
+            "a_lapsed_replica_publishes_fresh_work_after_thaw_while_its_twin_ordered"
+          ],
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "lapse_backlog_ignored": {
+          "mutation": "The v2 loop ignores canonical and row events.",
+          "test": "a_lapsed_replica_publishes_fresh_work_after_thaw_while_its_twin_ordered",
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "lookup_answer_not_delivered": {
+          "mutation": "The account lookup task drops each answer.",
+          "test": "a_lookup_blackout_fails_lookups_while_the_cluster_feed_lives_then_answers",
           "exit_code": 101,
           "failed_as_expected": true
         }
@@ -530,7 +563,8 @@
           "failed_as_expected": true
         }
       },
-      "limitation": "The partial-scan target forces rebuilding; state-mirror-coverage-gap separately proves automatic recovery from a persisted incomplete-rebuild marker. No Sentinel promotion, process kill, disk failure or packet-loss proof."
+      "limitation": "The partial-scan target forces rebuilding; state-mirror-coverage-gap separately proves automatic recovery from a persisted incomplete-rebuild marker. No Sentinel promotion, process kill, disk failure or packet-loss proof.",
+      "ci_mode": "docker"
     },
     "state-mirror-coverage-gap": {
       "command": [
@@ -558,7 +592,8 @@
         "automatic_restart_must_restore_coverage_despite_another_live_head",
         "persisted_progress_cannot_hide_an_interrupted_rebuild"
       ],
-      "limitation": "Proves automatic recovery of this mirror after interrupted rebuilding, with or without a persisted head. No claim of shared bucket certification, cache failover durability, or recovery after loss of the mirror data directory."
+      "limitation": "Proves automatic recovery of this mirror after interrupted rebuilding, with or without a persisted head. No claim of shared bucket certification, cache failover durability, or recovery after loss of the mirror data directory.",
+      "ci_mode": "docker"
     },
     "checkpoint-copy": {
       "command": [
@@ -589,7 +624,8 @@
         "missing_files_and_mixed_archive_errors_fail_the_copy"
       ],
       "limitation": "Proves the harness can verify a checkpoint on the fault volume. It does not prove executor progress during ENOSPC, disk/power-loss durability, or pruning races. The container starts only a bounded sleep process, not chain services.",
-      "negative_control": "The Docker fixture asserts that the old docker cp path fails on the same tmpfs whose exec/tar copy verifies successfully."
+      "negative_control": "The Docker fixture asserts that the old docker cp path fails on the same tmpfs whose exec/tar copy verifies successfully.",
+      "ci_mode": "docker"
     },
     "sealer-actor": {
       "command": [
@@ -675,7 +711,8 @@
             "io.kardamom.sealer.cluster.SealerSeedServiceTest::each_term_offers_the_seed_record_until_one_confirms_it()"
           ]
         }
-      ]
+      ],
+      "ci_mode": "gradle"
     },
     "sealer-raft": {
       "command": [
@@ -722,7 +759,8 @@
         "client reconnect and small replay retention",
         "carry-version activation with duplicate references"
       ],
-      "limitation": "The actor suite mocks consensus. The Raft suite uses real in-JVM members but does not prove OS process loss, network partitions, deployment or disk power-loss durability."
+      "limitation": "The actor suite mocks consensus. The Raft suite uses real in-JVM members but does not prove OS process loss, network partitions, deployment or disk power-loss durability.",
+      "ci_mode": "gradle"
     },
     "cache-sentinel": {
       "command": [
@@ -771,7 +809,8 @@
           "failed_at_recovery": true,
           "compiled": true
         }
-      ]
+      ],
+      "ci_mode": "docker"
     },
     "state-writer-crash": {
       "command": [
@@ -874,7 +913,8 @@
           "failed_assertion": "storage written in block 2, slot 0, after block 5"
         }
       ],
-      "limitation": "Linux Docker only. Runs the real test binary with its host shared libraries mounted read-only, without network or added capabilities. Proves auxiliary-volume ENOSPC, same-writer progress, no partial checkpoint publication and restored state after the log resumes. Does not prove state-volume ENOSPC, EIO, power loss, checkpointer scheduling, transaction/receipt end-to-end progress, Nomad mounts or deployment recovery."
+      "limitation": "Linux Docker only. Runs the real test binary with its host shared libraries mounted read-only, without network or added capabilities. Proves auxiliary-volume ENOSPC, same-writer progress, no partial checkpoint publication and restored state after the log resumes. Does not prove state-volume ENOSPC, EIO, power loss, checkpointer scheduling, transaction/receipt end-to-end progress, Nomad mounts or deployment recovery.",
+      "ci_mode": "docker"
     },
     "state-enospc": {
       "command": [
@@ -918,7 +958,8 @@
           "compiled": true,
           "bad_txn_panic": true
         }
-      ]
+      ],
+      "ci_mode": "docker"
     },
     "chaos-election": {
       "command": [
@@ -1001,7 +1042,8 @@
           "compiled": true,
           "kernel_probe_failed": true
         }
-      ]
+      ],
+      "ci_mode": "docker"
     },
     "chaos-alert": {
       "command": [
@@ -1086,7 +1128,8 @@
           "compiled": true,
           "starvation_observed": true
         }
-      ]
+      ],
+      "ci_mode": "docker"
     },
     "chaos-cache-baseline": {
       "command": [
@@ -1184,7 +1227,8 @@
         "hidden_mined_receipts_reconcile_without_duplicate_posts_or_early_cursor",
         "restart_during_hidden_receipts_uses_contract_truth_without_waiting_for_the_indexer"
       ],
-      "limitation": "No full follower fleet, Prometheus alert, Nomad restart, consensus retention or EigenDA proof. These tests cover null receipt reconciliation and restart, not expiry of the 120-second receipt deadline. Alloy timeout bookkeeping includes the wall clock, so Tokio virtual time alone cannot prove that deadline. The existing local DA helper serves until the test process exits. Payloads contain empty boundary blocks; transaction execution and full-chain transfer progress are outside this fixture."
+      "limitation": "No full follower fleet, Prometheus alert, Nomad restart, consensus retention or EigenDA proof. These tests cover null receipt reconciliation and restart, not expiry of the 120-second receipt deadline. Alloy timeout bookkeeping includes the wall clock, so Tokio virtual time alone cannot prove that deadline. The existing local DA helper serves until the test process exits. Payloads contain empty boundary blocks; transaction execution and full-chain transfer progress are outside this fixture.",
+      "ci_mode": "docker"
     },
     "batcher-post-age": {
       "command": [
@@ -1410,7 +1454,8 @@
         "a_corrupt_recording_is_detected_repaired_and_replayed_exactly",
         "a_wiped_archive_restores_its_catalog_and_replays_the_exact_recording"
       ],
-      "limitation": "One recording and a saved backup, not two independent peer recordings. Wall-clock Docker, Java and Aeron timing remains real. No distributed tar/catalog transfer, Nomad drain/placement, repair CLI wiring, live-ingress admission, executor progress, multi-segment boundary or distributed load coverage."
+      "limitation": "One recording and a saved backup, not two independent peer recordings. Wall-clock Docker, Java and Aeron timing remains real. No distributed tar/catalog transfer, Nomad drain/placement, repair CLI wiring, live-ingress admission, executor progress, multi-segment boundary or distributed load coverage.",
+      "ci_mode": "docker"
     },
     "chaos-cache-readers": {
       "command": [
@@ -1716,40 +1761,71 @@
     {
       "case": "graceful-sequencer",
       "family": "Sequencer",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "sequencer",
           "test": "shutdown_completes_while_output_is_disconnected"
+        },
+        {
+          "suite": "sequencer",
+          "test": "a_graceful_replica_stop_keeps_the_lane_ordering_and_its_restart_rejoins"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad replaces the stopped seq-0 allocation within the restart SLO: allocation placement exists only in the deployment"
+      ]
     },
     {
       "case": "hard-sequencer",
       "family": "Sequencer",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "a_hard_replica_kill_loses_no_offer_and_its_cold_restart_rejoins"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts the killed sequencer-0 task container on its node: task supervision exists only in the deployment"
+      ]
     },
     {
       "case": "sequencer-replica-kill",
       "family": "Sequencer",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "each_restarted_replica_orders_an_established_sender_while_its_twin_is_frozen"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts the killed replica and the frozen twin keeps its container id: container identity exists only in the deployment"
+      ]
     },
     {
       "case": "sequencer-lapse",
       "family": "Sequencer",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "sequencer",
           "test": "delayed_canonical_input_fills_the_outbox_then_resumes_in_order"
+        },
+        {
+          "suite": "sequencer",
+          "test": "a_lapsed_replica_publishes_fresh_work_after_thaw_while_its_twin_ordered"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "SIGSTOP of the container past the Aeron client liveness, then the Nomad restart of the newborn process: process supervision exists only in the deployment; the newborn path is the cold restart of hard-sequencer",
+        "the count of PAST-DEADLINE lines in the sealer logs: the case only reports it, from the deployed Java sealer"
+      ]
     },
     {
       "case": "validator-lapse",
@@ -1773,6 +1849,10 @@
         {
           "suite": "sequencer",
           "test": "absent_lookup_reply_holds_the_sender_until_the_real_account_event_arrives"
+        },
+        {
+          "suite": "sequencer",
+          "test": "a_lookup_blackout_fails_lookups_while_the_cluster_feed_lives_then_answers"
         }
       ],
       "full_case_locally_validated": false
