@@ -13,9 +13,17 @@ mod rules;
 use rules::Rules;
 
 const CTX: &str = "lookup-blackout";
-const LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
+/// The sequencer's count of nonce lookups by outcome.
+pub(super) const LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
 const BOUNDARY: &str = "kardamom_sequencer_last_boundary_unix_seconds";
-const ANSWERED: [&str; 3] = ["ok", "redis", "live"];
+/// The lookup outcomes with an answer: from an executor, from Redis, or
+/// from committed account updates in the local live layer.
+pub(super) const ANSWERED: [&str; 4] = [
+    "outcome=\"ok\"",
+    "outcome=\"redis\"",
+    "outcome=\"local\"",
+    "outcome=\"live\"",
+];
 
 #[derive(Clone, Copy, Debug, Serialize)]
 enum Phase {
@@ -33,7 +41,7 @@ struct Counts {
 impl Counts {
     fn read(body: &str) -> Self {
         Self {
-            failed: Self::outcomes(body, &["error", "timeout"]),
+            failed: Self::outcomes(body, &["outcome=\"error\"", "outcome=\"timeout\""]),
             answered: Self::outcomes(body, &ANSWERED),
             last_boundary: metrics::first(body, BOUNDARY).unwrap_or(0),
         }
@@ -42,9 +50,7 @@ impl Counts {
     fn outcomes(body: &str, outcomes: &[&str]) -> i64 {
         outcomes
             .iter()
-            .filter_map(|outcome| {
-                metrics::sum_where(body, LOOKUPS, &format!("outcome=\"{outcome}\""))
-            })
+            .filter_map(|outcome| metrics::sum_where(body, LOOKUPS, outcome))
             .fold(0, i64::saturating_add)
     }
 

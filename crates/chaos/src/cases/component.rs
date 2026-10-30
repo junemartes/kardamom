@@ -163,11 +163,13 @@ pub(crate) async fn node_replace_executor(h: &mut Harness) -> anyhow::Result<()>
     h.assert_executors_converged("node-replace").await
 }
 
-/// The data-loss drill: wipe executor 0's state and checkpoints, then
-/// restore one checkpoint from executor 1. Replicas are deterministic
-/// state machines at the same block, so a peer checkpoint is a valid
-/// restore source, and the restart replays only the tail instead of
-/// re-syncing from genesis. The restore log line proves the path. The
+/// The data-loss drill: stop executor 0, wipe its state and
+/// checkpoints, and install the newest checkpoint of executor 1. Replicas
+/// are deterministic state machines at the same block, so a peer
+/// checkpoint is a valid restore source, and the restart replays only
+/// the tail instead of re-syncing from genesis. The restore line of the
+/// next process must name the installed checkpoint, with no peer fetch;
+/// with the block log on, the process must apply the copied log too. The
 /// state paths are the same on an executor node and on a sealer node.
 pub(crate) async fn state_checkpoint_restore(h: &mut Harness) -> anyhow::Result<()> {
     let victim = h.probes.executors[0].container.clone();
@@ -175,12 +177,10 @@ pub(crate) async fn state_checkpoint_restore(h: &mut Harness) -> anyhow::Result<
     wait_peer_checkpoint(h, &donor, "state-checkpoint-restore").await?;
     let restore = CheckpointRestore::observe(h, &victim, &donor).await?;
     crate::log(
-        "state-checkpoint-restore: killing executor 0 + wiping its state DB and checkpoints",
+        "state-checkpoint-restore: stopping executor 0, wiping its state DB and checkpoints, and installing the newest checkpoint of executor 1",
     );
-    h.inject_hard(&[&victim], "executor").await?;
-    wipe_state(h, &victim, "state-checkpoint-restore").await?;
-    crate::log("state-checkpoint-restore: re-replicating checkpoints from executor 1");
-    restore.await_restored(h).await?;
+    let copy = restore.install(h).await?;
+    restore.await_restored(h, &copy).await?;
     h.assert_executor_progress(Duration::from_mins(3)).await?;
     h.assert_count("executor", 3, h.knobs.reschedule_slo)
         .await?;

@@ -143,14 +143,10 @@ pub(crate) async fn pipeline_blackout_recover(h: &mut Harness) -> anyhow::Result
     for (job, count) in PIPELINE_JOBS.into_iter().chain(egress) {
         h.assert_count(job, count, h.knobs.reschedule_slo).await?;
     }
-    let elected = h
-        .evidence
+    h.evidence
         .cluster_elected(crate::cases::fleet::FULL_RESTART_ELECTION)
-        .await?;
-    crate::log(format!(
-        "{ctx}: members elected memberId={} (term {} closed on a majority)",
-        elected.leader, elected.term
-    ));
+        .await?
+        .log(ctx);
     await_exporter_back(h, ctx).await?;
     // The ingresses and the sealer origin recover independently, so the
     // two waits overlap.

@@ -11,6 +11,8 @@
 //! is a disagreement of the two: the follower halts and publishes none of
 //! it.
 
+use std::time::Duration;
+
 mod batcher;
 mod disagreement;
 mod follower_loss;
@@ -33,3 +35,6 @@ pub(crate) use null_receipts::null_receipts;
 pub(crate) use outage::batcher_outage_past_retention;
 pub(crate) use transport::{provider_unresponsive, transport_refusals};
 pub(crate) use two_day::two_day_outage;
+
+/// How long the stale-post alert must hold to count as fired.
+const ALERT_HOLD: Duration = Duration::from_secs(30);

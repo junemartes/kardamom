@@ -1,19 +1,25 @@
 //! Stop each mirror inside a checkpoint scan, with its Redis writes
-//! blocked. Every replacement completes a rebuild before recovery passes.
+//! blocked. The replacements run the saved job with no forced rebuild,
+//! so the mirrors decide on their own. Each mirror died inside its
+//! rebuild, after it wrote its rebuild marker, so each one must rebuild
+//! again: every mirror completes a rebuild, the projection holds the
+//! exact captured accounts, and every mirror serves before recovery
+//! passes.
 
 use anyhow::Context;
 use serde::Serialize;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
-use super::rebuilds::{ForcedRebuild, MirrorRebuilds, RebuildPhase};
+use super::rebuilds::{MirrorRebuilds, RebuildPhase};
 use super::{
-    CacheRecovery, MIRROR_ALLOCS, MIRROR_HEAD_KEYS, MIRROR_WRITE_RETRIES, freeze_and_flush,
-    live_primary,
+    CacheRecovery, MIRROR_ALLOCS, MIRROR_HEAD_KEYS, MIRROR_SERVING, MIRROR_WRITE_RETRIES,
+    every_mirror_serves, flush_primary, live_primary,
 };
 use crate::harness::Harness;
 use crate::inject::Killed;
 use crate::nomad::SavedJob;
+use crate::poll::{self, Budget};
 use crate::rpc::Rpc;
 
 mod writes;
@@ -56,8 +62,8 @@ impl Target {
     }
 
     fn blocked_scan(body: &str) -> anyhow::Result<NonZeroU64> {
-        let serving = crate::metrics::first(body, "kardamom_state_mirror_serving")
-            .context("missing serving metric")?;
+        let serving =
+            crate::metrics::first(body, MIRROR_SERVING).context("missing serving metric")?;
         anyhow::ensure!(serving == 0, "mirror serves before interruption: {serving}");
         let retries = crate::metrics::first(body, MIRROR_WRITE_RETRIES)
             .context("missing write retry metric")?;
@@ -130,14 +136,28 @@ impl InterruptedRebuild<'_> {
     }
 
     async fn recover(&self, coverage: &CacheRecovery) -> anyhow::Result<()> {
-        let forced = ForcedRebuild::new(self.saved.definition())?;
-        self.saved.register(forced.definition()).await?;
-        coverage.await_restored(self.h, CTX).await
+        self.saved.restore().await?;
+        coverage
+            .await_restored(self.h, CTX, RebuildPhase::Complete)
+            .await?;
+        let h = &*self.h;
+        poll::until(Budget::secs(60, 3), |_| async move {
+            Ok::<_, anyhow::Error>(every_mirror_serves(h).await.then_some(()))
+        })
+        .await?
+        .or_fail(|t| {
+            crate::chaos_fail!(
+                "{CTX}: a mirror does not serve {}s after the rebuild",
+                t.as_secs()
+            )
+        })?;
+        crate::log(format!("{CTX}: every mirror serves after the rebuild"));
+        Ok(())
     }
 
     async fn exercise(&mut self) -> anyhow::Result<()> {
         self.saved.stop().await?;
-        let flushed = freeze_and_flush(self.h, CTX, &[]).await?;
+        let flushed = flush_primary(self.h, CTX).await?;
         anyhow::ensure!(
             flushed == self.primary,
             "{CTX}: primary changed before the write fault"

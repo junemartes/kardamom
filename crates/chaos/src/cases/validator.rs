@@ -205,7 +205,7 @@ pub(crate) async fn lapse(h: &mut Harness) -> anyhow::Result<()> {
     )
     .await;
     thaw_validator(h, &node, &inner).await;
-    confirm_thaw(h, &node, &inner).await;
+    confirm_thaw(h, &node, &inner, started0.as_deref()).await;
     // The catch-up runs on a chain without new traffic: the lag at the
     // thaw must close, not a lag that the load keeps open.
     h.end_case_load("validator-lapse");
@@ -262,29 +262,42 @@ async fn thaw_validator(h: &Harness, node: &str, inner: &str) {
     }
 }
 
+/// The grace window of the thaw. An evicted validator exits by design
+/// after its Aeron destination lingers 35 s, so the window ends after
+/// that exit.
+const THAW_GRACE_SECS: u64 = 45;
+
 /// The verified thaw: within a grace window the endpoint must answer or
-/// the container must have been replaced. Otherwise the frozen orphan
-/// is killed, so it frees the metrics port for the supervisor's
-/// replacement instead of stranding every restart on EADDRINUSE.
-async fn confirm_thaw(h: &Harness, node: &str, inner: &str) {
+/// the frozen process must end. A process that ended shows no running
+/// container of that name, another container, or a new start time.
+/// Otherwise the frozen orphan is killed, so it frees the metrics port
+/// for the supervisor's replacement instead of stranding every restart
+/// on EADDRINUSE.
+async fn confirm_thaw(h: &Harness, node: &str, inner: &str, started0: Option<&str>) {
     let target = h.probes.validator_target();
     let target = &target;
-    let outcome = poll::after_sleep(Budget::secs(30, 5), |_| async move {
+    let outcome = poll::after_sleep(Budget::secs(THAW_GRACE_SECS, 5), |_| async move {
         if h.probes.scrape().answers(target).await {
             return Ok::<_, anyhow::Error>(Some(()));
         }
-        let current = h.nodes.inner_container(node, "validator").await;
-        Ok(current.filter(|c| c != inner).map(|c| {
+        let running = h.nodes.inner_container(node, "validator").await;
+        let started = h.nodes.started_at(node, inner).await;
+        let ended = running.as_deref() != Some(inner)
+            || (started0.is_some() && started.as_deref() != started0);
+        Ok(ended.then(|| {
             crate::log(format!(
-                "validator-lapse: container replaced during/after freeze ({inner} -> {c})"
+                "validator-lapse: the frozen process of {inner} ended (running {}, start {} -> {})",
+                running.as_deref().unwrap_or("none"),
+                started0.unwrap_or("?"),
+                started.as_deref().unwrap_or("none")
             ));
         }))
     })
     .await;
     if !matches!(outcome, Ok(poll::Outcome::Ready { .. })) {
-        crate::log(
-            "validator-lapse: thaw NOT confirmed after 30s — killing the frozen orphan (releases the metrics port for the supervisor's replacement)",
-        );
+        crate::log(format!(
+            "validator-lapse: thaw NOT confirmed after {THAW_GRACE_SECS}s — killing the frozen orphan (releases the metrics port for the supervisor's replacement)"
+        ));
         let _ = h.nodes.inner_kill(node, inner).await;
     }
 }

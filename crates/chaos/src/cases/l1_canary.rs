@@ -70,6 +70,14 @@ async fn transfers(h: &Harness, fragment: &str) -> Option<i64> {
     )
 }
 
+/// The transfer runs with `fragment` as the floor of a later wait. A
+/// dark scrape is an error: a floor of 0 lets any later count pass.
+async fn baseline(h: &Harness, ctx: &str, fragment: &str) -> anyhow::Result<i64> {
+    transfers(h, fragment).await.ok_or_else(|| {
+        crate::chaos_fail!("{ctx}: the canary exports no transfer runs for the {fragment} baseline")
+    })
+}
+
 /// Wait until the transfer runs with `fragment` pass `floor`.
 async fn await_runs(
     h: &Harness,
@@ -134,17 +142,15 @@ pub(crate) async fn canary_da_lag(h: &mut Harness) -> anyhow::Result<()> {
     .unwrap_or(i64::MAX);
     let refused = "code=\"-32010\"";
     let success = "outcome=\"success\"";
-    let healthy_before = transfers(h, success).await.unwrap_or(0);
+    let healthy_before = baseline(h, ctx, success).await?;
     await_runs(h, ctx, success, healthy_before, Duration::from_mins(2)).await?;
-    let refused_before = transfers(h, refused)
-        .await
-        .ok_or_else(|| crate::chaos_fail!("{ctx}: the canary exports no transfer runs"))?;
+    let refused_before = baseline(h, ctx, refused).await?;
     let frozen = FrozenBatcher::freeze(h, ctx).await?;
     let verdict = halted_view(h, ctx, budget, refused, refused_before).await;
     frozen.thaw(h, ctx).await;
     verdict?;
     await_halt(h, ctx, budget, false).await?;
-    let success_after = transfers(h, success).await.unwrap_or(0);
+    let success_after = baseline(h, ctx, success).await?;
     await_runs(h, ctx, success, success_after, Duration::from_mins(2)).await?;
     h.assert_executor_progress(Duration::from_mins(2)).await
 }

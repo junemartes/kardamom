@@ -327,7 +327,7 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
         .inner_container(&node, kind)
         .await
         .ok_or_else(|| crate::chaos_fail!("{ctx}: no inner {kind} container on {node}"))?;
-    if heal == Heal::Repair {
+    if heal.needs_peer_checkpoint() {
         let donor = h.probes.executors[0].container.clone();
         super::component::wait_peer_checkpoint(h, &donor, &ctx).await?;
     }

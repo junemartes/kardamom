@@ -7,10 +7,9 @@ use anyhow::Context;
 use serde::Serialize;
 
 use super::rules::{LOSS_CHAIN, Rules};
-use super::{PORTS, Partition};
+use super::{FaultEnd, PORTS, Partition};
 use crate::cases::combined::Check;
 use crate::harness::Harness;
-use crate::probes::CLUSTER_TASK;
 
 const CTX: &str = "raft-leader-packet-loss";
 const HOLD: Duration = Duration::from_secs(30);
@@ -73,19 +72,15 @@ impl PacketLoss {
             "failure": outcome.as_ref().err().map(|e| format!("{e:#}")),
             "cleanup_failure": cleared.as_ref().err().map(|e| format!("{e:#}")),
         });
-        let saved = std::fs::write(
-            "/tmp/chaos-raft-leader-packet-loss-fault.json",
-            serde_json::to_vec_pretty(&proof)?,
-        );
-        if let Err(error) = &cleared {
-            crate::log(format!("{CTX}: cleanup fails: {error:#}"));
+        FaultEnd {
+            ctx: CTX,
+            outcome,
+            cleared,
+            path: "/tmp/chaos-raft-leader-packet-loss-fault.json",
+            report: proof,
         }
-        outcome?;
-        cleared?;
-        saved?;
-        h.assert_count(CLUSTER_TASK, 3, h.knobs.rejoin_slo).await?;
-        h.assert_progress().await?;
-        Check::assert_one_leader(h, CTX).await
+        .conclude(h)
+        .await
     }
 
     async fn exercise(target: &Partition, h: &Harness) -> anyhow::Result<serde_json::Value> {

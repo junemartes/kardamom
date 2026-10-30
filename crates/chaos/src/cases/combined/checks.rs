@@ -7,9 +7,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use crate::cases::cache::{CacheRecovery, wait_readers_recovered};
+use crate::cases::cache::{CacheRecovery, RebuildPhase, wait_readers_recovered};
 use crate::cases::coordinated::assert_no_ref_below_floor;
 use crate::cases::da_watcher::assert_no_origin_gap;
+use crate::cases::lookup_blackout::{ANSWERED, LOOKUPS};
 use crate::evidence::{SEALER_MEMBERS, number_after};
 use crate::harness::Harness;
 use crate::poll::{self, Budget, Outcome};
@@ -23,17 +24,8 @@ use super::refill::RefillBaseline;
 /// comes from an executor's state DB.
 const CACHE_LOOKUPS: &str = "kardamom_cache_lookups_total";
 const STATE_HIT: &str = "outcome=\"state_hit\"";
-/// The sequencer's count of parks that asked for a floor, and its count
-/// of lookups by outcome. Answers can come from an executor, Redis,
-/// or committed account updates in the local live layer.
+/// The sequencer's count of parks that asked for a floor.
 const LOOKUP_REQUESTS: &str = "kardamom_sequencer_nonce_lookup_requests_total";
-const LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
-const ANSWERED: [&str; 4] = [
-    "outcome=\"ok\"",
-    "outcome=\"redis\"",
-    "outcome=\"local\"",
-    "outcome=\"live\"",
-];
 /// How long the state-hit count of a restarted ingress may take to
 /// answer: a few scrapes past one that fails.
 const HITS_BUDGET: Budget = Budget {
@@ -397,7 +389,7 @@ impl Check {
                     .rebuilds
                     .as_ref()
                     .ok_or_else(|| crate::chaos_fail!("{ctx}: no cache recovery baseline"))?
-                    .await_restored(h, ctx)
+                    .await_restored(h, ctx, RebuildPhase::Complete)
                     .await
             }
             Self::ReadersRecovered => wait_readers_recovered(h, ctx).await,

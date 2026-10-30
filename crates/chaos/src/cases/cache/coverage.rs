@@ -33,10 +33,15 @@ impl CacheRecovery {
         })
     }
 
-    pub(crate) async fn await_restored(&self, h: &Harness, ctx: &str) -> anyhow::Result<()> {
-        self.mirrors
-            .await_phase(h, ctx, RebuildPhase::Complete)
-            .await?;
+    /// The mirrors reach `phase`, and the projection holds the exact
+    /// captured accounts.
+    pub(crate) async fn await_restored(
+        &self,
+        h: &Harness,
+        ctx: &str,
+        phase: RebuildPhase,
+    ) -> anyhow::Result<()> {
+        self.mirrors.await_phase(h, ctx, phase).await?;
         Projection::new(&self.expected)
             .wait(ctx, Budget::secs(120, 3), || self.read(h))
             .await?;

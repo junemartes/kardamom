@@ -32,12 +32,15 @@ pub(crate) use backlog::client_restart;
 mod readers;
 mod rebuilds;
 pub(crate) use coverage::CacheRecovery;
+pub(crate) use rebuilds::RebuildPhase;
 
 const DEGRADED: &str = "kardamom_cache_degraded_total";
 const LOOKUPS: &str = "kardamom_cache_lookups_total";
 const REDIS_LAYER: &str = "layer=\"redis\"";
 const MIRROR_HEAD: &str = "kardamom_state_mirror_head_tx_idx";
 const MIRROR_WRITE_RETRIES: &str = "kardamom_state_mirror_write_retries_total";
+/// 1 while a mirror serves the projection, 0 while it rebuilds.
+const MIRROR_SERVING: &str = "kardamom_state_mirror_serving";
 /// How long the whole Redis job stays stopped. The mirror schedules an
 /// outage rebuild for a write that retried past 10 s, so the loss
 /// lasts three times that.
@@ -150,19 +153,42 @@ async fn wait_readers_connected(h: &Harness, ctx: &str) -> anyhow::Result<()> {
     wait_reader_moves(h, ctx, "redis lookups", Budget::secs(90, 3), |r| r.redis).await
 }
 
+/// The `metric` of each mirror exporter on the executor nodes, `None`
+/// for one that does not answer.
+async fn mirror_metrics(h: &Harness, metric: &str) -> Vec<Option<i64>> {
+    let mut values = Vec::with_capacity(h.probes.executors.len());
+    for i in 0..h.probes.executors.len() {
+        values.push(h.probes.mirror_metric(i, metric).await);
+    }
+    values
+}
+
 /// The highest mirror head across the executor nodes. `None` when no
 /// mirror exporter answers.
 async fn mirror_head(h: &Harness) -> Option<i64> {
-    let mut best = None;
-    for i in 0..h.probes.executors.len() {
-        best = best.max(h.probes.mirror_metric(i, MIRROR_HEAD).await);
-    }
-    best
+    mirror_metrics(h, MIRROR_HEAD)
+        .await
+        .into_iter()
+        .flatten()
+        .max()
+}
+
+/// Whether every mirror exporter answers and reports that its mirror
+/// serves.
+async fn every_mirror_serves(h: &Harness) -> bool {
+    mirror_metrics(h, MIRROR_SERVING)
+        .await
+        .iter()
+        .all(|serving| *serving == Some(1))
 }
 
 /// The mirror head advances: the projection follows the chain again.
+/// The start is a read, not a default: a dark start would let any head
+/// pass.
 async fn wait_mirror_advances(h: &Harness, ctx: &str) -> anyhow::Result<()> {
-    let start = mirror_head(h).await.unwrap_or(0);
+    let start = mirror_head(h)
+        .await
+        .ok_or_else(|| crate::chaos_fail!("{ctx}: no mirror exporter answers the head baseline"))?;
     let outcome = poll::until(Budget::secs(120, 3), |_| async move {
         Ok::<_, anyhow::Error>(mirror_head(h).await.filter(|head| *head > start))
     })
@@ -233,11 +259,14 @@ pub(crate) async fn redis_primary_freeze(h: &mut Harness) -> anyhow::Result<()> 
         .await
         .map_err(|e| crate::chaos_fail!("{ctx}: SIGSTOP failed: {e}"))?;
     let frozen = frozen_phase(h, ctx, &node, &primary, &master0).await;
-    let _ = h
+    let thawed = h
         .nodes
         .inner_signal(&node, &primary, crate::nodes::Signal::Cont)
-        .await;
+        .await
+        .map_err(|e| crate::chaos_fail!("{ctx}: SIGCONT of {primary} on {node} failed: {e}"));
+    log_cleanup(ctx, &thawed);
     frozen?;
+    thawed?;
     wait_readers_recovered(h, ctx).await?;
     wait_mirror_advances(h, ctx).await?;
     h.assert_progress().await
@@ -306,18 +335,13 @@ pub(crate) async fn redis_primary_kill(h: &mut Harness) -> anyhow::Result<()> {
 }
 
 /// The mirror write retries summed over the executor nodes. A mirror
-/// that retries is alive and waits for Redis; a dark exporter counts
-/// as zero.
-async fn mirror_write_retries(h: &Harness) -> i64 {
-    let mut total = 0;
-    for i in 0..h.probes.executors.len() {
-        total += h
-            .probes
-            .mirror_metric(i, MIRROR_WRITE_RETRIES)
-            .await
-            .unwrap_or(0);
-    }
-    total
+/// that retries is alive and waits for Redis. `None` when a mirror
+/// exporter does not answer: a partial sum is no baseline.
+async fn mirror_write_retries(h: &Harness) -> Option<i64> {
+    mirror_metrics(h, MIRROR_WRITE_RETRIES)
+        .await
+        .into_iter()
+        .try_fold(0_i64, |total, retries| total.checked_add(retries?))
 }
 
 /// The whole Redis job stopped: the primary, the replica and the three
@@ -333,7 +357,9 @@ pub(crate) async fn redis_total_loss_recover(h: &mut Harness) -> anyhow::Result<
     let ctx = "redis-total-loss-recover";
     wait_readers_connected(h, ctx).await?;
     let recovery = CacheRecovery::capture(h).await?;
-    let retries0 = mirror_write_retries(h).await;
+    let retries0 = mirror_write_retries(h).await.ok_or_else(|| {
+        crate::chaos_fail!("{ctx}: a mirror exporter does not answer the write-retry baseline")
+    })?;
     let job = SavedJob::capture(&h.nomad, "redis").await?;
     crate::log(format!(
         "{ctx}: stop the whole redis job (primary, replica, three sentinels) for {}s",
@@ -349,7 +375,9 @@ pub(crate) async fn redis_total_loss_recover(h: &mut Harness) -> anyhow::Result<
         .await?;
     wait_primary_named(h, ctx).await?;
     wait_mirror_advances(h, ctx).await?;
-    recovery.await_restored(h, ctx).await?;
+    recovery
+        .await_restored(h, ctx, RebuildPhase::Complete)
+        .await?;
     wait_readers_recovered(h, ctx).await?;
     h.assert_group_never_restarted("redis", "sentinel", ctx)
         .await?;
@@ -364,8 +392,7 @@ async fn total_loss_phase(h: &Harness, ctx: &str, retries0: i64) -> anyhow::Resu
     wait_readers_degraded(h, ctx).await?;
     h.assert_progress().await?;
     let outcome = poll::until(Budget::secs(60, 3), |_| async move {
-        let now = mirror_write_retries(h).await;
-        Ok::<_, anyhow::Error>((now > retries0).then_some(now))
+        Ok::<_, anyhow::Error>(mirror_write_retries(h).await.filter(|now| *now > retries0))
     })
     .await?;
     let (retries, _) = outcome.or_fail(|t| {
@@ -414,31 +441,56 @@ pub(crate) async fn redis_partition_ingress(h: &mut Harness) -> anyhow::Result<(
     let ctx = "redis-partition-ingress";
     wait_readers_connected(h, ctx).await?;
     let node = h.probes.ingresses[0].container.clone();
+    let partitioned = partitioned_phase(h, ctx, &node).await;
+    let healed = heal_partition(h, ctx, &node).await;
+    log_cleanup(ctx, &healed);
+    partitioned?;
+    healed?;
+    crate::log(format!("{ctx}: partition healed on {node}"));
+    wait_readers_recovered(h, ctx).await?;
+    h.assert_progress().await
+}
+
+/// Drop the Redis packets of `node`, then prove the degraded reads and
+/// the progress. An error after the first rule leaves the cleanup to
+/// [`heal_partition`].
+async fn partitioned_phase(h: &Harness, ctx: &str, node: &str) -> anyhow::Result<()> {
     for port in REDIS_PORTS {
         h.nodes
-            .exec(&node, &format!("iptables -w 5 -I {}", drop_rule(port)))
+            .exec(node, &format!("iptables -w 5 -I {}", drop_rule(port)))
             .await
             .map_err(|e| crate::chaos_fail!("{ctx}: could not drop port {port} on {node}: {e}"))?;
     }
     crate::log(format!(
         "{ctx}: {node} dropping its Redis and sentinel packets"
     ));
-    let partitioned = partitioned_phase(h, ctx).await;
-    for port in REDIS_PORTS {
-        let _ = h
-            .nodes
-            .exec(&node, &format!("iptables -w 5 -D {}", drop_rule(port)))
-            .await;
-    }
-    partitioned?;
-    crate::log(format!("{ctx}: partition healed on {node}"));
-    wait_readers_recovered(h, ctx).await?;
+    wait_readers_degraded(h, ctx).await?;
     h.assert_progress().await
 }
 
-async fn partitioned_phase(h: &Harness, ctx: &str) -> anyhow::Result<()> {
-    wait_readers_degraded(h, ctx).await?;
-    h.assert_progress().await
+/// Delete every drop rule of `node`, and fail when a rule stays. A rule
+/// that the arm did not insert is no failure.
+async fn heal_partition(h: &Harness, ctx: &str, node: &str) -> anyhow::Result<()> {
+    let left = REDIS_PORTS.map(drop_rule).join(" | ");
+    let script = format!(
+        "for rule in {rules}; do while iptables -w 5 -C $rule 2>/dev/null; do iptables -w 5 -D $rule || exit 1; done; done",
+        rules = REDIS_PORTS
+            .map(|port| format!("'{}'", drop_rule(port)))
+            .join(" ")
+    );
+    h.nodes
+        .exec(node, &script)
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::chaos_fail!("{ctx}: a drop rule stays on {node} ({left}): {e}"))
+}
+
+/// Log a failed fault cleanup, so a fault that stays has a cause in the
+/// log also when the case fails first for another reason.
+fn log_cleanup(ctx: &str, cleanup: &anyhow::Result<()>) {
+    if let Err(error) = cleanup {
+        crate::log(format!("{ctx}: fault cleanup fails: {error:#}"));
+    }
 }
 
 /// The three mirrors hard-killed and the projection flushed: the
@@ -450,26 +502,12 @@ pub(crate) async fn mirror_kill_rebuild(h: &mut Harness) -> anyhow::Result<()> {
     interrupted::InterruptedRebuild::run(h).await
 }
 
-/// Freeze every mirror with SIGSTOP, then flush the primary. A frozen
-/// mirror writes nothing, and Nomad does not restart it. Thus Redis
-/// stays cold until the kill that follows. A kill before the flush
-/// races it: Nomad restarts a mirror after 5 s, and a mirror that starts
-/// before the flush finds the live heads and resumes with no rebuild.
-/// With the mirror job stopped, `mirrors` is empty and only the flush
-/// runs. Returns the flushed primary.
-pub(crate) async fn freeze_and_flush(
-    h: &Harness,
-    ctx: &str,
-    mirrors: &[(String, String)],
-) -> anyhow::Result<String> {
-    for (node, cid) in mirrors {
-        h.nodes
-            .inner_signal(node, cid, crate::nodes::Signal::Stop)
-            .await
-            .map_err(|e| {
-                crate::chaos_fail!("{ctx}: SIGSTOP of the mirror on {node} failed: {e}")
-            })?;
-    }
+/// Flush the primary with the mirror job stopped. No mirror writes, so
+/// Redis stays cold until the job starts again. A kill of a running
+/// mirror before the flush races it: Nomad restarts a mirror after 5 s,
+/// and a mirror that starts before the flush finds the live heads and
+/// resumes with no rebuild. Returns the flushed primary.
+pub(crate) async fn flush_primary(h: &Harness, ctx: &str) -> anyhow::Result<String> {
     let master = live_primary(h, ctx).await?;
     h.nodes
         .exec(
