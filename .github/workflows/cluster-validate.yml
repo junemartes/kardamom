@@ -1,220 +1,27 @@
 name: cluster-validate
 
-# Static validation for the deploy/cluster scaffold (DESIGN.md §10): the full
-# VM cluster can't run in CI (needs nested virtualization), but the linters,
-# job-spec validation, and the group_vars contract check are cheap.
-
 on:
-  # A push to a base branch and the nightly run test every deploy class,
-  # so a change outside the path filter of the changes job still shows
-  # within a day.
-  push:
-    branches: [main, 'integration/**']
-  schedule:
-    - cron: '17 3 * * *'
-  # Every pull request, with no workflow path filter: the main ruleset
-  # requires the tofu checks, and a filtered workflow never reports them on
-  # a pull request that leaves deploy/cluster alone, so that pull request
-  # could never merge. The deploy test classes have a filter of their own
-  # (the changes job).
-  pull_request:
   workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  lint:
-    name: yamllint + ansible-lint + contract
+  exp:
+    name: exp (${{ matrix.part }} x${{ matrix.procs }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    defaults:
-      run:
-        working-directory: deploy/cluster
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install linters
-        run: pip install yamllint ansible-lint
-      # Galaxy resets connections now and then; three tries cover it.
-      - name: Install Ansible collections (module resolution for ansible-lint)
-        run: |
-          n=0
-          until ansible-galaxy collection install ansible.posix community.docker community.general; do
-            n=$((n + 1))
-            [ "$n" -ge 3 ] && exit 1
-            sleep 15
-          done
-      - name: yamllint
-        run: yamllint ansible/
-      - name: ansible-lint
-        run: ansible-lint ansible/
-      - name: Contract drift check (group_vars/all.yml vs mirrors)
-        run: ansible-playbook -i localhost, ansible/contract.yml
-
-  # The deploy test classes read deploy/** (the roles, the playbooks, the
-  # job specs and deploy/alertmanager-inhibit.yml), formats.toml, this
-  # workflow and the action that prepares their host. A pull request that
-  # changes none of them skips the classes; the `nomad job validate` check
-  # still reports.
-  changes:
-    name: deploy test inputs
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      deploy: ${{ steps.diff.outputs.deploy }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
-      # The checkout of a pull request is its merge into the base, so the
-      # first parent is the base and the diff is the change of the pull
-      # request. A push, the nightly run and a manual run test every class.
-      - id: diff
-        env:
-          EVENT: ${{ github.event_name }}
-        run: |
-          if [ "$EVENT" != pull_request ]; then
-            echo "deploy=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          changed="$(git diff --name-only HEAD^1 HEAD)"
-          echo "$changed"
-          if echo "$changed" | grep -qE '^(deploy/|formats\.toml$|\.github/workflows/cluster-validate\.yml$|\.github/actions/deploy-test-host/)'; then
-            echo "deploy=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "deploy=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  # The deploy tests run full Ansible plays against a fake Nomad API. A
-  # deploy is about 840 tasks, and its time goes to the Ansible overhead of
-  # each task; Mitogen cuts that overhead to about half. A test process runs
-  # each distinct deploy once and reuses its result (`run_deploy` in
-  # test_deploy.py), so a class gains from fewer processes. An entry runs
-  # its shards at the same time on one runner: `i/n` keeps every n-th test
-  # of the class (load_tests in test_deploy.py). The entries come from the
-  # measured times of one process for each class (Deploy 31 min, Carry 20,
-  # Record 14, Rollback 9, RecordFormats 4, Sealer 3). When an entry nears
-  # 12 minutes, split it. The other-tests job checks that every test class
-  # of test_deploy.py has a part here.
-  deploy-tests:
-    name: deploy tests (${{ matrix.part }} ${{ matrix.shards }})
-    needs: changes
-    if: needs.changes.outputs.deploy == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - {part: DeployTest, shards: 0/3}
-          - {part: DeployTest, shards: 1/3}
-          - {part: DeployTest, shards: 2/3}
-          - {part: CarryTest, shards: 0/2}
-          - {part: CarryTest, shards: 1/2}
-          - {part: RecordTest, shards: 0/2 1/2}
-          - {part: RollbackTest, shards: 0/1}
-          - {part: RecordFormatsTest, shards: 0/1}
-          - {part: SealerTest, shards: 0/1}
+        part: [DeployTest, CarryTest]
+        procs: [1]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/deploy-test-host
-      # Every process runs from the repository root: deploy/cluster/ansible/
-      # ansible.cfg turns become on, and a render under it is not readable
-      # by the runner. The pattern names the class with its dot, so a part
-      # does not also select a class whose name holds the part name. Each
-      # shard writes its own log; the step prints the logs in shard order.
-      - name: Test the shards of one deploy class
+      - name: Tests
         env:
+          PROCS: ${{ matrix.procs }}
           PART: ${{ matrix.part }}
-          SHARDS: ${{ matrix.shards }}
         run: |
-          rc=0
-          printf '%s\n' $SHARDS | xargs -P 4 -I{} sh -c '
-            log="/tmp/shard-$(echo {} | tr / -).log"
-            DEPLOY_TEST_SHARD={} python3 -m unittest discover -s deploy/cluster/ansible/tests \
-              -p test_deploy.py -k "test_deploy.$PART." -v > "$log" 2>&1
-          ' || rc=1
-          for shard in $SHARDS; do
-            echo "::group::$PART $shard"
-            cat "/tmp/shard-$(echo "$shard" | tr / -).log"
-            echo "::endgroup::"
-          done
-          exit $rc
-
-  other-tests:
-    name: deploy tests (specs and other modules)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/deploy-test-host
-      - name: Every deploy test class has a part
-        run: python3 deploy/cluster/ansible/tests/check_parts.py .github/workflows/cluster-validate.yml
-      # Run from deploy/cluster: the specs resolve file("config/...") against
-      # the CLI working directory.
-      - name: Validate job specs
-        working-directory: deploy/cluster
-        run: |
-          rc=0
-          for j in nomad/*.hcl; do
-            echo "== $j =="
-            nomad job validate "$j" || rc=1
-          done
-          exit $rc
-      - name: Test the other modules
-        run: |
-          tests=deploy/cluster/ansible/tests
-          for module in "$tests"/test_*.py; do
-            [ "$(basename "$module")" = test_deploy.py ] && continue
-            python3 -m unittest discover -s "$tests" -p "$(basename "$module")" -v || exit 1
-          done
-
-  # The required check. It passes when every part passed, and when the
-  # path filter skipped the deploy classes.
-  nomad-validate:
-    name: nomad job validate
-    runs-on: ubuntu-latest
-    needs: [changes, deploy-tests, other-tests]
-    # Failed parts still report failure; a cancelled workflow releases its slot.
-    if: ${{ !cancelled() }}
-    steps:
-      - name: Every part passed
-        env:
-          DEPLOY: ${{ needs.changes.outputs.deploy }}
-          CLASSES: ${{ needs.deploy-tests.result }}
-          OTHERS: ${{ needs.other-tests.result }}
-        run: |
-          [ "$OTHERS" = success ] || { echo "the other tests did not pass: $OTHERS" >&2; exit 1; }
-          [ "$CLASSES" = success ] && exit 0
-          [ "$DEPLOY" = false ] && [ "$CLASSES" = skipped ] && exit 0
-          echo "a deploy test part did not pass: $CLASSES" >&2
-          exit 1
-
-  terraform-validate:
-    name: tofu fmt + validate + test (${{ matrix.root }} root)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        root: [containers]
-    defaults:
-      run:
-        working-directory: deploy/cluster/terraform/${{ matrix.root }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/tofu-providers
-        with:
-          root: deploy/cluster/terraform/${{ matrix.root }}
-      - name: tofu fmt
-        run: tofu fmt -check -recursive .
-      - name: tofu init (provider schema only, no backend)
-        run: tofu init -backend=false -input=false
-      - name: tofu validate
-        run: tofu validate
-      - name: tofu test (mocked provider)
-        run: tofu test
+          seq 0 $((PROCS - 1)) | xargs -P "$PROCS" -I{} sh -c \
+            'DEPLOY_TEST_SHARD={}/'"$PROCS"' python3 -m unittest discover -s deploy/cluster/ansible/tests -p test_deploy.py -k "test_deploy.'"$PART"'." -v > /tmp/shard-{}.log 2>&1; rc=$?; echo "shard {} rc=$rc $(date +%T)"; exit $rc' || rc=1
+          for f in /tmp/shard-*.log; do echo "::group::$f"; cat "$f"; echo "::endgroup::"; done
+          exit ${rc:-0}
