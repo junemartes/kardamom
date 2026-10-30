@@ -391,7 +391,10 @@ impl RulesWalk {
             None => self.rules.taken(&records, self.last_ms),
             Some(pending) => Self::in_order(self.rules, pending, &records, block.block_number)?,
         };
-        let origin = block.canonical_end.map_or(self.origin, |end| end.l1_origin);
+        let origin = block
+            .l1_epochs
+            .last()
+            .map_or(self.origin, |epoch| epoch.l1_number);
         let end = block.canonical_end.map(|end| end.end_tx_idx);
         self.pending = Some(PendingBoundary {
             at: Boundary {

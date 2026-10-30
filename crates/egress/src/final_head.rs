@@ -21,6 +21,7 @@ use alloy_rpc_types_eth::{BlockId, BlockNumberOrTag};
 use alloy_sol_types::sol;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Sender, TrySendError};
+use tokio::task::JoinHandle;
 use tokio::time::Interval;
 
 use crate::owner::Input;
@@ -100,8 +101,16 @@ impl FinalHead {
         }
     }
 
+    /// Run the watch as a task on the current runtime.
+    #[must_use]
+    pub fn spawn(self) -> FinalHeadTask {
+        FinalHeadTask {
+            task: tokio::spawn(self.run()),
+        }
+    }
+
     /// Poll until the owner thread is gone.
-    pub async fn run(mut self) {
+    async fn run(mut self) {
         let mut every = tokio::time::interval(EVERY);
         while self.poll(&mut every).await.is_continue() {}
     }
@@ -193,6 +202,22 @@ impl FinalHead {
             .context("the finalized L1 block")?
             .context("L1 has no finalized block")?;
         Ok(BlockId::number(block.header.number))
+    }
+}
+
+/// The running watch. The watch holds a sender of the owner queue, so the
+/// owner thread ends only after the watch stops.
+pub struct FinalHeadTask {
+    task: JoinHandle<()>,
+}
+
+impl FinalHeadTask {
+    /// Stop the watch and wait until its task ends. The end of the task
+    /// releases its sender of the owner queue.
+    pub async fn stop(self) {
+        self.task.abort();
+        // The task ends cancelled; the result carries nothing.
+        let _ = self.task.await;
     }
 }
 

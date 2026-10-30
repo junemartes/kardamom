@@ -42,7 +42,8 @@ pub const BAD_FRAMES_TOTAL: &str = "kardamom_notifier_bad_frames_total";
 /// A rollback that reached an entry at `posted` or above. Any increase
 /// needs an operator.
 pub const ROLLBACK_PAST_POSTED_TOTAL: &str = "kardamom_notifier_rollback_past_posted_total";
-/// `tx_status` records that the events path replaces, dropped by the hub.
+/// `tx_status` and `tx_errors` records that the events path replaces,
+/// dropped by the hub.
 pub const SUPERSEDED_TOTAL: &str = "kardamom_notifier_superseded_total";
 
 /// A count as a gauge value.
@@ -99,6 +100,6 @@ pub fn describe() {
     );
     metrics::describe_counter!(
         SUPERSEDED_TOTAL,
-        "tx_status records that the events path replaces"
+        "tx_status and tx_errors records that the events path replaces"
     );
 }

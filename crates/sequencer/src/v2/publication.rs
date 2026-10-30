@@ -18,6 +18,8 @@ impl AdmissionLoop {
         let error = if self.sealer_version.orders_by_position() {
             self.flush_positioned(refs, side)
         } else {
+            // A later switch to positioned offers scans this outbox in full.
+            self.canonical.changed();
             let (published, error) = self.pipeline.offer(refs, self.outbox.make_contiguous());
             self.hot.publish.increment(published as u64);
             self.outbox

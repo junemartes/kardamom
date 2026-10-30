@@ -423,3 +423,53 @@ fn a_window_full_answer_retains_and_retries_the_whole_sender_run() {
     assert!(b.rig.errors().is_empty());
     assert!(b.rig.drops().is_empty());
 }
+
+#[test]
+fn a_window_full_answer_replays_and_restarts_only_the_named_sender() {
+    let mut b = Bench::new(SealerVersion::starting_at(3));
+    let other = signer(12);
+    b.accounts
+        .send(AccountEvent::Rows {
+            block: 1,
+            rows: vec![(
+                other.address(),
+                AccountState {
+                    nonce: 0,
+                    balance: U256::from(10u64).pow(U256::from(24u64)),
+                    delegated: false,
+                    tx_idx: 1,
+                },
+            )],
+        })
+        .unwrap();
+    b.send(0);
+    let spec = EnvelopeSpec {
+        real_hash: true,
+        ..EnvelopeSpec::default()
+    };
+    b.rig.push(
+        TxDataLoc::new(7, pos(4096)),
+        envelope_with(&other, 0, 1, spec),
+    );
+    b.run();
+    b.advance(2);
+    b.advance(10);
+    b.accounts
+        .send(AccountEvent::Retry {
+            sender: b.sender(),
+            nonce: 0,
+        })
+        .unwrap();
+    b.run();
+    let senders: Vec<Address> = b.rig.offers().iter().map(|o| o.guard.sender).collect();
+    assert_eq!(senders, [b.sender(), other.address(), b.sender()]);
+    b.advance(18);
+    assert!(
+        b.l.admission.unconfirmed_at(other.address(), 0).is_none(),
+        "the other sender keeps its loss window"
+    );
+    assert!(
+        b.l.admission.unconfirmed_at(b.sender(), 0).is_some(),
+        "the named sender gets a new loss window"
+    );
+}

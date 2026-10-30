@@ -775,9 +775,9 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - A replay window that dropped a position refuses the copy as expired. Such a transaction stays unordered, and the loss window (`loss_blocks`, 16 blocks) frees the run. The client then sends it again.
   - Proof: `crates/sequencer/src/v2/resend_tests.rs` (`a_parked_transaction_goes_out_in_the_format_of_its_release`, `a_new_session_offers_the_unconfirmed_run_before_a_new_offer`, `a_new_session_does_not_offer_a_confirmed_transaction_again`, `a_contiguity_reject_offers_the_expected_and_the_rejected_nonce_again`, `a_contiguity_reject_for_a_nonce_out_of_the_run_offers_nothing`), `crates/sequencer/src/admission/tests.rs` (`the_filter_keeps_the_unconfirmed_run_until_a_state_confirms_it`), `crates/cluster-adapter/src/live/mod.rs` (`a_fenced_ingress_reports_a_new_session_once`), `crates/sequencer/src/sealer_rules_tests.rs` (`a_contiguity_reject_tells_the_loop`), and the chaos cases `carry-full-ref-below-v5` and `cluster-leader-kill`.
 - **Nonce lookup path**
-  - A parked sender needs its committed nonce. The sequencer asks the local layer first (outcome `local`). Then it asks Redis (outcome `redis`). Then it asks the executors.
+  - A parked sender needs its committed nonce. The sequencer asks the local layer first (outcome `live` in the v2 loop, `local` in the v1 loop). Then it asks Redis (outcome `redis`). Then it asks the executors.
   - A lookup that misses Redis, or finds Redis degraded, goes to the executors.
-  - Metrics: `kardamom_sequencer_nonce_lookup_requests_total` counts the parks that asked. `kardamom_sequencer_nonce_lookups_total{outcome}` counts the queries by outcome: `ok`, `redis`, `local`, `error`, `timeout`, `shed`. `kardamom_sequencer_nonce_lookups_in_flight` is the gauge of concurrent queries.
+  - Metrics: `kardamom_sequencer_nonce_lookup_requests_total` counts the parks that asked. `kardamom_sequencer_nonce_lookups_total{outcome}` counts the queries by outcome: `ok`, `redis`, `local`, `live`, `miss` (no source holds the account), `error`, `timeout`, `shed`. `kardamom_sequencer_nonce_lookups_in_flight` is the gauge of concurrent queries.
   - A nonce above 0 is floor evidence of the same kind as a receipt.
   - Proof: `lookup-blackout` (`chaos-sequencer` shard). The case blocks receipt DATA stream 1002 and executor nonce-query TCP 9024 on one sequencer node. It also blocks Redis/Sentinel TCP 6379/26379, then hard-kills lane 0 and requires failed lookups with no answered source. The second phase restores query/cache traffic, keeps receipt DATA blocked and kills the replica again; a lookup must answer. Both phases require a received canonical boundary, positive receipt-drop counters and the same replacement process. The rules preserve cluster egress and Aeron control frames from colocated sealers. Both fault chains are cleared after success or failure.
 - **Fee gate**
@@ -860,7 +860,7 @@ The ordering shard keeps the executors up. These cases take the executors down w
   - Trigger: the sequencer tasks, the executor tasks and the redis job die, and all three jobs stop. No source of a sender floor is left.
   - Effect: the head advances. A submit parks at the ingress and times out: no sequencer orders it.
   - Recovery: the sequencers return first with no floor. Each established sender parks, and the replica asks for its floor. The lookup misses Redis (down) and fails at the executors (down), so the sender stays parked and the replica asks again on its next park. It never seeds a floor. Redis returns empty 30 s later. The executors return 30 s after that and answer the lookups. The floors rise, the parked transactions drain in nonce order.
-  - Proof: `sequencer-executor-redis-loss`, by name only (see "Known gaps"). Every lane-0 replica shows a lookup request and an answer from an executor or from Redis, `kardamom_sequencer_ref_below_floor` reads zero on the v1 loop, and the load verdict proves that no nonce gap remains.
+  - Proof: `sequencer-executor-redis-loss`, the last case of `chaos-combined-exec` (see "Known gaps" for #545). Every lane-0 replica shows a lookup request and an answer from an executor or from Redis, `kardamom_sequencer_ref_below_floor` reads zero on the v1 loop, and the load verdict proves that no nonce gap remains.
 - Every case ends with the common tail. The load verdict proves that no accepted transaction was lost and that the receipts are in nonce order.
 
 ## Validator (off the hot path, halts on divergence)
@@ -1741,7 +1741,7 @@ A deploy replaces service instances one at a time under readiness checks. The ch
 - **Combined outages**
   - `chaos-combined-ordering` takes two or three classes down at once and brings them back in dependency order and against it: the ingresses with the sequencers, the ingresses with the sealers, the sequencers with the sealers, and all three (see "Combined outages").
   - `chaos-combined-exec` takes the executors down with the sealers, with the sealers and the validator, with the ingresses, and with Redis and the state mirrors (see "Combined outages with the executors").
-  - `sequencer-executor-redis-loss` (the executors with the sequencers and Redis) exists and runs by name. It is in no shard: the Aeron driver error below (#545) can cut a replica off its stream and fail it.
+  - `sequencer-executor-redis-loss` (the executors with the sequencers and Redis) runs last in `chaos-combined-exec`. The Aeron driver error below (#545) can cut a replica off its stream and fail it.
   - Open: the aux node with the sealers, the media drivers on every driver node, and the two ingress nodes. No case takes them down together yet.
   - Open: no combined case checks that the L1 record stays contiguous through the outage, or that a deposit lands once after it. The suite never deposits.
 - **Executor receipt publication that never connects after a job restart**

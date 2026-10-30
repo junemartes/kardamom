@@ -1,6 +1,6 @@
 //! A sender's next offer waits until its preceding offer is canonical.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 
 use alloy_primitives::{Address, B256};
@@ -22,6 +22,10 @@ pub(super) struct CanonicalGate {
     history_cap: NonZeroUsize,
     selected: HashSet<Address>,
     ready: Vec<RefOffer>,
+    /// The offers at the end of the outbox that no scan saw yet.
+    fresh: usize,
+    /// The reused buffer of a scan of the fresh offers.
+    tail: Vec<RefOffer>,
     changed: bool,
     #[cfg(test)]
     pub(super) scans: usize,
@@ -37,14 +41,19 @@ impl CanonicalGate {
             history_cap,
             selected: HashSet::new(),
             ready: Vec::new(),
+            fresh: 0,
+            tail: Vec::new(),
             changed: true,
             #[cfg(test)]
             scans: 0,
         }
     }
 
+    /// Every queued offer is in `held`. So a record of another hash leaves
+    /// the outbox as it is, and the next flush does not scan it.
     pub(super) fn observe(&mut self, hash: B256, admission: &mut Admission<RefPayload>) {
         if let Some((address, nonce)) = self.held.remove(&hash) {
+            self.changed();
             self.confirm_hash(address, nonce, hash, admission);
         }
         if !self.seen.insert(hash) {
@@ -123,28 +132,67 @@ impl CanonicalGate {
 
     /// At most one offer per sender enters a batch. A per-entry refusal
     /// cannot leave a higher nonce already queued at the sealer.
+    ///
+    /// After a scan, every sender with a queued offer has a flight: the
+    /// scan publishes the first offer of each other sender, and an offer
+    /// that does not go out marks the gate as changed. So while nothing
+    /// changed, only the fresh offers can be ready, and the scan reads only
+    /// them.
     pub(super) fn prepare(
         &mut self,
         outbox: &mut VecDeque<RefOffer>,
         admission: &mut Admission<RefPayload>,
     ) -> Vec<RefOffer> {
         self.ready.clear();
-        if !std::mem::take(&mut self.changed) {
-            return std::mem::take(&mut self.ready);
+        self.selected.clear();
+        let fresh = std::mem::take(&mut self.fresh);
+        if std::mem::take(&mut self.changed) {
+            self.scan_all(outbox, admission);
+        } else if fresh > 0 {
+            self.scan_fresh(fresh, outbox, admission);
         }
+        std::mem::take(&mut self.ready)
+    }
+
+    fn scan_all(&mut self, outbox: &mut VecDeque<RefOffer>, admission: &mut Admission<RefPayload>) {
         #[cfg(test)]
         {
             self.scans = self.scans.checked_add(1).unwrap();
         }
-        self.selected.clear();
         outbox.retain(|offer| self.keep_queued(offer, admission));
-        std::mem::take(&mut self.ready)
     }
 
-    /// Intake, account events, replay and sweeps invalidate a blocked queue.
+    fn scan_fresh(
+        &mut self,
+        fresh: usize,
+        outbox: &mut VecDeque<RefOffer>,
+        admission: &mut Admission<RefPayload>,
+    ) {
+        let mut tail = std::mem::take(&mut self.tail);
+        tail.extend(outbox.drain(outbox.len().saturating_sub(fresh)..));
+        outbox.extend(
+            tail.drain(..)
+                .filter(|offer| self.keep_queued(offer, admission)),
+        );
+        self.tail = tail;
+    }
+
+    /// Account events, replay and sweeps invalidate a blocked queue.
     /// Unpublished prefixes also require another scan on the next retry.
     pub(super) fn changed(&mut self) {
         self.changed = true;
+    }
+
+    /// A new offer went to the end of the outbox.
+    pub(super) fn appended(&mut self) {
+        self.fresh = self.fresh.saturating_add(1);
+    }
+
+    /// The sealer refused an offer of each sender of `senders`. Their runs
+    /// go out again from the first held nonce.
+    pub(super) fn forget(&mut self, senders: &BTreeSet<Address>) {
+        self.changed();
+        self.flights.retain(|address, _| !senders.contains(address));
     }
 
     fn keep_queued(&mut self, offer: &RefOffer, admission: &mut Admission<RefPayload>) -> bool {

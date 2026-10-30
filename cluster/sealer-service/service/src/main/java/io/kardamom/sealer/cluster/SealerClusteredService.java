@@ -440,6 +440,7 @@ public final class SealerClusteredService implements ClusteredService {
         this.feed = Feed.open(feedConfig, new MemberFeed.Member(memberId, retained, metrics));
         if (snapshot.isPresent()) {
             restore(snapshot.get());
+            requireGenesisFeatures();
             // The log position of a start from a snapshot is the snapshot's position.
             purgeView = PurgeView.EMPTY
                 .withMark(new PurgeView.Mark(cluster.logPosition(), state.blockNumber()))
@@ -591,11 +592,32 @@ public final class SealerClusteredService implements ClusteredService {
                 ? " holds a retained file, and this member keeps the frames on the heap: start it with "
                 : " holds no retained file, and this member keeps the frames in a file: start it without ")
                 + RetainedFile.Config.SETTING + "=true, or start a new chain";
-            System.out.println("sealer RETAINED-FILE FATAL memberId=" + memberId + " " + why);
-            System.out.flush();
-            retained.close();
-            throw new AgentTerminationException(why);
+            fatal("RETAINED-FILE", why);
         }
+    }
+
+    /**
+     * Stop the member when the restored state does not match the genesis
+     * features of this member, in either direction. A member that replays
+     * the log from position 0 starts at genesis with the setting. So a
+     * snapshot that holds other rules than the setting gives would decide
+     * the entries by other rules than that member, and the state would
+     * fork. A running chain with no setting and no genesis activation
+     * passes.
+     */
+    private void requireGenesisFeatures() {
+        if (!state.matchesGenesis(genesisFeatures)) {
+            fatal("GENESIS-FEATURES", genesisFeatures.refusal("snapshot holds the genesis activations of another"
+                + " set of features: start the member with the setting of this chain"));
+        }
+    }
+
+    /** Log {@code why} as the fatal error {@code kind}, close the retained frames, and end the service agent. */
+    private void fatal(final String kind, final String why) {
+        System.out.println("sealer " + kind + " FATAL memberId=" + memberId + " " + why);
+        System.out.flush();
+        retained.close();
+        throw new AgentTerminationException(why);
     }
 
     /**
