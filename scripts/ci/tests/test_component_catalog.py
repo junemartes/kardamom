@@ -11,8 +11,10 @@ from component_catalog import Catalog
 DOCUMENT = {
     "families": {"Ingress": {}, "Cache": {}},
     "local_suites": {
-        "guarded": {"tests": ["recovers"], "negative_controls": {"no_replay": {"test": "recovers"}}},
-        "unguarded": {"tests": ["observes"]},
+        "guarded": {"ci_mode": "in-process", "tests": ["recovers", "restarts"],
+                    "negative_controls": {"no_replay": {"test": "recovers"}}},
+        "unguarded": {"ci_mode": "docker", "tests": ["observes"]},
+        "unrun": {"tests": ["drains"], "negative_control": "The old path fails."},
     },
     "cases": [
         {"case": "ported-case", "family": "Ingress", "status": "ported",
@@ -65,8 +67,22 @@ class CatalogTests(unittest.TestCase):
             document["cases"][0]["local_tests"] = [{"suite": "unguarded", "test": "observes"}]
         self.assert_error(unguard, "negative control")
 
+    def test_a_control_for_another_test_of_the_suite_does_not_count(self):
+        self.assert_error(lambda d: d["cases"][0].update(local_tests=[{"suite": "guarded", "test": "restarts"}]),
+                          "negative control")
+
+    def test_a_ported_case_needs_a_suite_that_ci_runs(self):
+        self.assert_error(lambda d: d["cases"][0].update(local_tests=[{"suite": "unrun", "test": "drains"}]),
+                          "ci_mode")
+
+    def test_an_unknown_ci_mode_is_rejected(self):
+        self.assert_error(lambda d: d["local_suites"]["unrun"].update(ci_mode="nightly"), "ci_mode must be")
+
     def test_every_negative_control_format_counts(self):
         for key, value in [("clock_negative_controls", [{"test": "observes"}]),
+                           ("negative_controls", [{"failed_tests": ["actor::tests::observes"]}]),
+                           ("negative_controls", [{"tests": ["observes"]}]),
+                           ("negative_controls", [{"mutation": "skip the replay", "failed_tests": 6}]),
                            ("negative_control", "The old path fails.")]:
             def guard(document, key=key, value=value):
                 document["local_suites"]["unguarded"][key] = value
