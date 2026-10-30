@@ -23,14 +23,18 @@ env:
   RUST_BACKTRACE: 1
   # Mirrors AERON_JAR_VERSION in the justfile (`just aeron-jar`).
   AERON_JAR_VERSION: 1.45.0
+  # The shards of the suite. The `shard` matrix below names each index.
+  SHARDS: 4
 
 jobs:
-  chain-semantics:
+  # One compile for the whole suite: the service binaries, the test
+  # executable and the sealer jar, packed as one artifact.
+  build:
     if: >-
       !contains(github.event.pull_request.labels.*.name, 'skip-chain-semantics')
-    name: chain-semantics-e2e
+    name: chain-semantics build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -65,34 +69,124 @@ jobs:
         working-directory: cluster/sealer-service
         run: ./gradlew :service:shadowJar
 
-      - name: Cache the aeron-all jar
-        run: |
-          mkdir -p /tmp/kardamom-aeron-local
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
-            "https://repo1.maven.org/maven2/io/aeron/aeron-all/${AERON_JAR_VERSION}/aeron-all-${AERON_JAR_VERSION}.jar" \
-            -o "/tmp/kardamom-aeron-local/aeron-all-${AERON_JAR_VERSION}.jar"
-
       # Every binary a scenario spawns or shells out to: the pipeline three,
       # the validator (S6/S7), statecheck (S6's CLI check), the da-watcher
       # (S1/S2 bridge), reconstruct (S8's DA-parity gate), and the batcher
       # and the egress (S13e/S13f/S13g, the carry window).
       - name: Build service binaries
         run: |
-          cargo build --locked --bins \
+          set -o pipefail
+          cargo build --locked --bins --message-format=json-render-diagnostics \
             -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
             -p kardamom-validator -p kardamom-state -p kardamom-da-watcher -p kardamom-l1-indexer \
             -p kardamom-batcher -p kardamom-reconstruct -p kardamom-notifier -p kardamom-canary \
-            -p kardamom-egress
+            -p kardamom-egress | tee /tmp/bins.jsonl \
+            | jq -r 'select(.reason == "compiler-message") | .message.rendered'
 
-      # Each test brings up its own stack (2 JVMs + 4 service processes), and
-      # the L1-backed ones add an anvil on top. Two of those at once on a
-      # 2-core runner starves the Aeron media driver — it shows up as
-      # "MediaDriver keepalive: age>10000ms" and then a scenario timing out
-      # waiting for a receipt that the wedged transport never delivered. Run
-      # them one at a time; the suite is ~10 min serial, well inside the
-      # 30-minute job timeout.
-      - name: Run the chain-semantics suite (Target L)
+      - name: Build the suite
         run: |
-          cargo test -p e2e --features full-pipeline-e2e \
-            --test chain_semantics --locked \
-            -- --ignored --nocapture --test-threads=1
+          set -o pipefail
+          cargo test -p e2e --features full-pipeline-e2e --test chain_semantics --locked \
+            --no-run --message-format=json-render-diagnostics | tee /tmp/suite.jsonl \
+            | jq -r 'select(.reason == "compiler-message") | .message.rendered'
+
+      # The harness finds the service binaries next to the test executable
+      # (target/debug), so the bundle keeps the paths of the build. Cargo
+      # gives a test the native library paths of the build scripts; a shard
+      # gets the Aeron libraries from target/debug/native instead.
+      - name: Pack the suite
+        run: |
+          set -euo pipefail
+          jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable' \
+            /tmp/bins.jsonl /tmp/suite.jsonl | sort -u > /tmp/executables
+          paths="$(jq -r 'select(.reason == "build-script-executed") | .linked_paths[]' /tmp/bins.jsonl /tmp/suite.jsonl \
+            | sed 's/^[a-z]*=//' | sort -u | paste -sd:)"
+          mkdir -p target/debug/native
+          while read -r exe; do
+            LD_LIBRARY_PATH="$paths" ldd "$exe" | awk '/=> \// {print $3}' \
+              | grep -v -e '^/lib' -e '^/usr/lib' || true
+          done < /tmp/executables | sort -u | xargs -r cp -t target/debug/native
+          if LD_LIBRARY_PATH="$PWD/target/debug/native" xargs -a /tmp/executables ldd | grep 'not found'; then
+            echo "a native library is missing from the bundle" >&2
+            exit 1
+          fi
+          xargs -a /tmp/executables strip --strip-debug
+          sed "s|^$PWD/||" /tmp/executables > /tmp/members
+          echo target/debug/native >> /tmp/members
+          echo cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar >> /tmp/members
+          tar -czf /tmp/chain-semantics.tar.gz -T /tmp/members
+          ls -lh /tmp/chain-semantics.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chain-semantics-bundle
+          path: /tmp/chain-semantics.tar.gz
+          retention-days: 3
+
+  # Each test brings up its own stack (2 JVMs + 4 service processes), and
+  # the L1-backed ones add an anvil on top. Two of those at once on one
+  # runner starve the Aeron media driver: it shows up as "MediaDriver
+  # keepalive: age>10000ms" and then a scenario times out waiting for a
+  # receipt that the wedged transport never delivered. So each shard runs
+  # its tests one at a time, and the shards run on their own runners. A
+  # shard takes every SHARDS-th test in name order. The serial suite takes
+  # 14 to 21 minutes on one runner, and the largest shard about a third.
+  shard:
+    name: chain-semantics (shard ${{ matrix.shard }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      # anvil for the L1-backed scenarios.
+      - uses: ./.github/actions/foundry
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Cache the aeron-all jar
+        run: |
+          mkdir -p /tmp/kardamom-aeron-local
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
+            "https://repo1.maven.org/maven2/io/aeron/aeron-all/${AERON_JAR_VERSION}/aeron-all-${AERON_JAR_VERSION}.jar" \
+            -o "/tmp/kardamom-aeron-local/aeron-all-${AERON_JAR_VERSION}.jar"
+      - uses: actions/download-artifact@v4
+        with:
+          name: chain-semantics-bundle
+          path: /tmp/chain-semantics
+      - run: tar -xzf /tmp/chain-semantics/chain-semantics.tar.gz
+      # The test runs from the package directory, as under `cargo test`.
+      - name: Run the chain-semantics shard (Target L)
+        working-directory: crates/e2e
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/target/debug/native"
+          suite="$(ls "$GITHUB_WORKSPACE"/target/debug/deps/chain_semantics-*)"
+          "$suite" --ignored --list --format terse | sed -n 's/: test$//p' | sort \
+            | awk -v n="$SHARDS" -v i="$SHARD" '(NR - 1) % n == i' > /tmp/tests
+          echo "shard $SHARD of $SHARDS: $(wc -l < /tmp/tests) tests"
+          # With no name, the executable would run every test.
+          [ -s /tmp/tests ] || exit 0
+          xargs -a /tmp/tests "$suite" --ignored --nocapture --test-threads=1 --exact
+
+  # The required check: it passes when every shard passed, or when the
+  # label skipped the suite.
+  chain-semantics:
+    name: chain-semantics-e2e
+    needs: [build, shard]
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() }}
+    steps:
+      - name: Every shard passed
+        env:
+          BUILD: ${{ needs.build.result }}
+          SHARDS_RESULT: ${{ needs.shard.result }}
+          SKIPPED: ${{ contains(github.event.pull_request.labels.*.name, 'skip-chain-semantics') }}
+        run: |
+          [ "$SKIPPED" = true ] && [ "$BUILD" = skipped ] && exit 0
+          [ "$SHARDS_RESULT" = success ] || { echo "build: $BUILD, shards: $SHARDS_RESULT" >&2; exit 1; }
