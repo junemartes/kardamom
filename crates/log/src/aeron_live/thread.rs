@@ -231,8 +231,11 @@ impl AeronThread {
     }
 
     /// The poll/command loop. Runs until `Shutdown` or the command channel
-    /// disconnects. Explicit caps of at least one millisecond park empty
-    /// passes; shorter caps retain the pre-park spin for prompt command handling.
+    /// disconnects. An idle cap of 1 ms or more waits with [`ParkIdle`]: an
+    /// empty wait parks at once, with no spin. An unset or shorter cap
+    /// waits with [`Spin`]: `recv_timeout` spins before it parks, so a
+    /// command that comes soon ends the wait sooner. See the module doc of
+    /// `command_wait`.
     fn run(self, cap: IdleCap) -> Result<(), LogError> {
         if cap
             .duration()

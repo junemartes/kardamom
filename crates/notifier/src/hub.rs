@@ -189,6 +189,13 @@ impl Hub {
                 return;
             }
             Observed::Status(s) => s,
+            // The events path learns an identity only from a receipt, so a
+            // `tx_errors` record never resolves there. The `Rejected`
+            // record of `tx_status` carries the same rejection with its hash.
+            Observed::Error(_) if self.events.is_some() => {
+                metrics::counter!(m::SUPERSEDED_TOTAL).increment(1);
+                return;
+            }
             Observed::Error(e) => {
                 let Some(hash) = self.ring.resolve(e.sender, e.nonce) else {
                     metrics::counter!(m::UNRESOLVED_ERRORS_TOTAL).increment(1);
@@ -197,8 +204,8 @@ impl Hub {
                 TxStatus::rejected(hash, &e)
             }
         };
-        // With the path on, only a rejection reaches here, from `tx_status`
-        // or `tx_errors`. The table compares it with any execution result.
+        // With the path on, only a `Rejected` record of `tx_status` reaches
+        // here. The table compares it with any execution result.
         if let Some(path) = self.events.as_mut() {
             path.on_rejected(&status, now, fanout(&mut self.ring, &self.live, now));
             return;

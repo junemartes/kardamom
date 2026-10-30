@@ -94,23 +94,27 @@ impl EventsPath {
             return;
         };
         let _gap = self.note_seq(&view);
-        for record in view.events() {
-            let (hash, stage) = match record {
-                TxEvent::Accepted { hash } => (hash, Stage::Accepted),
-                TxEvent::Sent { hash, .. } => (hash, Stage::Sent),
-            };
-            let event = Event {
-                hash,
-                stage,
-                block: None,
-                executor: None,
-            };
-            if self.take(event, now) {
-                send(Send {
-                    event: bare(hash, word(stage)),
-                    identity: None,
-                });
-            }
+        view.events()
+            .for_each(|record| self.send_event(record, now, &mut send));
+    }
+
+    /// Take one record of `tx_events`, and send it when the table says so.
+    fn send_event(&mut self, record: TxEvent, now: Instant, send: &mut impl FnMut(Send)) {
+        let (hash, stage) = match record {
+            TxEvent::Accepted { hash } => (hash, Stage::Accepted),
+            TxEvent::Sent { hash, .. } => (hash, Stage::Sent),
+        };
+        let event = Event {
+            hash,
+            stage,
+            block: None,
+            executor: None,
+        };
+        if self.take(event, now) {
+            send(Send {
+                event: bare(hash, word(stage)),
+                identity: None,
+            });
         }
     }
 
@@ -118,13 +122,9 @@ impl EventsPath {
     /// or a rollback.
     pub fn on_merged(&mut self, frame: &ReceiptFrame, now: Instant, mut send: impl FnMut(Send)) {
         match frame {
-            ReceiptFrame::Batch(batch) => {
-                for receipt in &batch.receipts {
-                    if self.take(receipt_event(receipt, Stage::Receipt, None), now) {
-                        send(with_receipt(receipt, Word::Receipt));
-                    }
-                }
-            }
+            ReceiptFrame::Batch(batch) => batch.receipts.iter().for_each(|receipt| {
+                self.send_receipt(receipt, Stage::Receipt, None, now, &mut send);
+            }),
             ReceiptFrame::Rollback(rollback) => {
                 let rolled = self.table.roll_back(rollback.to_block, |hash| {
                     send(Send {
@@ -154,17 +154,29 @@ impl EventsPath {
             return;
         };
         let slot = self.slot_of(session);
-        for receipt in &batch.receipts {
-            if self.take(receipt_event(receipt, Stage::Executed, Some(slot)), now) {
-                send(with_receipt(receipt, Word::Executed));
-            }
+        batch.receipts.iter().for_each(|receipt| {
+            self.send_receipt(receipt, Stage::Executed, Some(slot), now, &mut send);
+        });
+    }
+
+    /// Take one receipt at `stage`, from the executor slot when it has
+    /// one, and send it when the table says so.
+    fn send_receipt(
+        &mut self,
+        receipt: &Receipt,
+        stage: Stage,
+        executor: Option<usize>,
+        now: Instant,
+        send: &mut impl FnMut(Send),
+    ) {
+        if self.take(receipt_event(receipt, stage, executor), now) {
+            send(with_receipt(receipt, word(stage)));
         }
     }
 
-    /// Take a `tx_status` rejection at `now`. The rejection suppresses a late `sent` of the twin. Execution
-    /// takes precedence over a rejection, in either arrival order. The
-    /// record of `tx_errors` and `tx_status` stays the input of `rejected`
-    /// until the decisions on #819.
+    /// Take a `tx_status` rejection at `now`. The rejection suppresses a
+    /// late `sent` of the twin. Execution takes precedence over a
+    /// rejection, in either arrival order.
     pub fn on_rejected(&mut self, status: &TxStatus, now: Instant, mut send: impl FnMut(Send)) {
         let event = Event {
             hash: status.tx_hash,

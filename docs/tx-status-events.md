@@ -178,5 +178,6 @@ The notifier serves these metrics on `--metrics-addr`. All names start with `kar
 - The receipt is the truth. Use `eth_getTransactionReceipt` to confirm a result. Do not act on a missing event.
 - A restart of an instance loses its ring. A new subscriber then gets no history from before the restart. The stream has no archive.
 - A `tx_errors` record names a transaction by sender and nonce. The notifier needs an earlier event with that sender and nonce to find the hash. Without it, the error is dropped (`unresolved_errors_total`). The `rejected` status on `tx_status` carries the hash.
+  - With the events path on (`KARDAMOM_NOTIFIER_EVENTS`), the notifier drops every `tx_errors` record and counts it in `superseded_total`. The `rejected` status on `tx_status` gives the rejection.
 - The notifier has no event for a drop on `tx_drops`. When the sealer refuses a reference without the bytes of its transaction, the sequencer publishes only a drop. The egress status (`kardamom_getTransactionStatus`) then answers `dropped` with the reason `transaction dropped by the sealer, send it again` (code -32000). This status is provisional: safe to send again; the status can still become executed. The feed can still show `sealed` and `executed` for the copy of the twin.
 - Filters do not protect data. Every client can read the full feed.

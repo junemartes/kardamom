@@ -313,3 +313,28 @@ fn the_genesis_config_names_the_genesis_features() {
     let err = parse("genesis_features = [4]").unwrap_err().to_string();
     assert!(err.contains("genesis_features"), "{err}");
 }
+
+/// A payload without a canonical end still moves the L1 origin of the
+/// walk: the epochs of each block give it, as in the sealer.
+#[test]
+fn a_block_without_a_canonical_end_takes_its_origin_from_its_epochs() {
+    let chain = Chain::default()
+        .epoch(&[])
+        .records()
+        .epoch(&[(FEATURE_SEALER_V4, 0)])
+        .records()
+        .epoch(&[(FEATURE_SEALER_V5, 0)])
+        .records();
+    let without_ends: Vec<ReplayBlock> = chain
+        .blocks
+        .iter()
+        .cloned()
+        .map(|block| ReplayBlock {
+            canonical_end: None,
+            ..block
+        })
+        .collect();
+    let rules = SealerRules::at_head(GenesisFeatures::None, &without_ends).unwrap();
+    assert_eq!(rules.version(), 5);
+    assert_eq!(rules, chain.rules(GenesisFeatures::None));
+}
