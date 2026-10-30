@@ -507,7 +507,8 @@ pub(crate) async fn quorum_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
         victims[0], victims[1]
     ));
     h.kill_nodes(&[&victims[0], &victims[1]]).await?;
-    h.assert_executor_stalled(Duration::from_secs(15)).await?;
+    h.assert_executor_stalled(super::fleet::STALL_WINDOW)
+        .await?;
     crate::log(format!(
         "cluster-quorum-loss-recover: docker start {} (quorum 2/3 returns)",
         victims[0]
@@ -524,9 +525,9 @@ pub(crate) async fn quorum_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
         victims[1]
     ));
     h.nodes.start(&victims[1]).await?;
+    // The common tail proves that the executors advance with three members.
     h.assert_count(CLUSTER_TASK, 3, h.knobs.reschedule_slo)
-        .await?;
-    h.assert_executor_progress(Duration::from_mins(1)).await
+        .await
 }
 
 #[cfg(test)]

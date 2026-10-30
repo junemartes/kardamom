@@ -297,12 +297,14 @@ impl Victim {
 /// before the refusal: a SIGSTOP longer than the Aeron client's service
 /// interval makes the client exit on resume, and Nomad restarts the task.
 /// The freeze lasts at least the evicting freeze of the deployed Aeron
-/// stall tolerance, so the restart happens at any tolerance. The freeze
-/// also crosses the cluster session timeout, so the resume goes through a
-/// fresh session.
+/// stall tolerance, so the restart happens at any tolerance. On the
+/// repair path the freeze also crosses the cluster session timeout, so
+/// the resume goes through a fresh session.
 ///
 /// On a carry-born cluster the sealer keeps the exact window, and the
-/// consumer heals from the egress instead (see [`Heal::Egress`]).
+/// consumer heals from the egress instead (see [`Heal::Egress`]). It
+/// reads the member feed and the egress, holds no cluster session, and
+/// needs no peer checkpoint.
 pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow::Result<()> {
     let kind = victim.kind();
     let ctx = format!("retention-overrun({kind})");
@@ -325,8 +327,10 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
         .inner_container(&node, kind)
         .await
         .ok_or_else(|| crate::chaos_fail!("{ctx}: no inner {kind} container on {node}"))?;
-    let donor = h.probes.executors[0].container.clone();
-    super::component::wait_peer_checkpoint(h, &donor, &ctx).await?;
+    if heal == Heal::Repair {
+        let donor = h.probes.executors[0].container.clone();
+        super::component::wait_peer_checkpoint(h, &donor, &ctx).await?;
+    }
     require_live_victim(h, victim, &ctx).await?;
     let repair = Repair::capture(h, victim, &node, heal.needles(victim)).await?;
     let need = i64::try_from(retention.get().saturating_mul(2)).unwrap_or(i64::MAX);
@@ -339,7 +343,19 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
         h.knobs.retention_freeze_cap.as_secs()
     ));
     h.freeze_verified(&node, &inner, &target, &ctx).await?;
-    let (delta, elapsed) = overrun_window(h, rx_freeze, need, &ctx, &node, &inner).await?;
+    let shortest = heal.shortest_freeze(h);
+    let (delta, elapsed) = overrun_window(
+        h,
+        Overrun {
+            rx_freeze,
+            need,
+            shortest,
+        },
+        &ctx,
+        &node,
+        &inner,
+    )
+    .await?;
     crate::log(format!(
         "{ctx}: window overrun ({delta} frames in {}s ≈ {}tps); thawing",
         elapsed.as_secs(),
@@ -386,19 +402,31 @@ async fn require_live_victim(h: &Harness, victim: Victim, ctx: &str) -> anyhow::
         .map(|_| ())
 }
 
+/// What ends an overrun freeze: the ingress count at the freeze, the
+/// frames that must flow past it, and the shortest freeze.
+#[derive(Debug, Clone, Copy)]
+struct Overrun {
+    rx_freeze: i64,
+    need: i64,
+    shortest: Duration,
+}
+
 /// Hold the freeze until enough frames flowed past the frozen cursor
-/// and the cluster session lapsed, within the cap. Frames are counted
+/// and the shortest freeze passed, within the cap. Frames are counted
 /// from observed accepted transactions, not the target rate.
 async fn overrun_window(
     h: &Harness,
-    rx_freeze: i64,
-    need: i64,
+    overrun: Overrun,
     ctx: &str,
     node: &str,
     inner: &str,
 ) -> anyhow::Result<(i64, Duration)> {
-    let budget = Budget::new(h.knobs.retention_freeze_cap, Duration::from_secs(15));
-    let shortest = Duration::from_mins(2).max(h.knobs.aeron_stall.evicting_freeze());
+    let Overrun {
+        rx_freeze,
+        need,
+        shortest,
+    } = overrun;
+    let budget = Budget::new(h.knobs.retention_freeze_cap, Duration::from_secs(5));
     let delta = Cell::new(0_i64);
     let delta_ref = &delta;
     let outcome = poll::after_sleep(budget, |elapsed| async move {

@@ -31,5 +31,5 @@ pub(crate) use halt::await_followers_halted;
 pub(crate) use liar::liar;
 pub(crate) use null_receipts::null_receipts;
 pub(crate) use outage::batcher_outage_past_retention;
-pub(crate) use transport::transport_refusals;
+pub(crate) use transport::{provider_unresponsive, transport_refusals};
 pub(crate) use two_day::two_day_outage;

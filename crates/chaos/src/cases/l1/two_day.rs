@@ -5,7 +5,7 @@
 //! live cursor, and the L1 follower, whose two sources disagree on the
 //! lie, publishes none of it and resumes by itself.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kardamom_l1_fault_proxy::Fault;
 
@@ -74,6 +74,7 @@ pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
         .await
         .complete()
         .ok_or_else(|| crate::chaos_fail!("{ctx}: no complete ingress baseline at T1"))?;
+    let t1 = Instant::now();
     // T2. The da-watcher's restart resumes after the sealer's origin, and
     // halts on the lying anchor again. Its cursor file holds the confirmed
     // origin, so it never stands past the sealer.
@@ -81,7 +82,8 @@ pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
     assert_not_past_sealer(h, ctx).await?;
     await_posting(h, 0, h.knobs.restart_slo + Duration::from_secs(30), ctx).await?;
     // T3: the floor passes the cursor the batcher resumed at in T1. The
-    // batcher kept posting, so its live cursor moved with the chain.
+    // batcher kept posting, so its live cursor moved with the chain. The
+    // least hold counts from T1: the frames count from there too.
     let snapshots0 = h
         .evidence
         .count_lines(CLUSTER_TASK, "snapshot TAKEN", Streams::StdoutOnly)
@@ -89,7 +91,8 @@ pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
     crate::log(format!(
         "{ctx}: T3: load until the floor passes the T1 cursor"
     ));
-    let (delta, held) = hold_until_floor_passes(h, rx_t1, snapshots0, MIN_HOLD, ctx).await?;
+    let min_hold = MIN_HOLD.saturating_sub(t1.elapsed());
+    let (delta, held) = hold_until_floor_passes(h, rx_t1, snapshots0, min_hold, ctx).await?;
     let at_t3 = h.probes.batcher_posts().await.unwrap_or(0);
     anyhow::ensure!(
         at_t3 > after_t1,

@@ -20,22 +20,23 @@ const EGRESS_TASK: &str = "egress";
 const KILL_AFTER_SWITCH: Duration = Duration::from_secs(2);
 
 impl Run<'_> {
-    /// Step 7: feature 5 off, then on again, under load.
+    /// Feature 5 off, then on again, under load.
     pub(super) async fn window_off_on(&mut self) -> anyhow::Result<()> {
-        self.window(Window::Off).await?;
+        let on = self.off_then_check_on().await?;
         self.h
             .assert_executor_progress(Duration::from_mins(1))
             .await?;
-        self.window(Window::On).await
+        on.send(self.h, self.ctx).await?;
+        Members::new(self.h)?
+            .await_window(Window::On, self.retention()?)
+            .await
     }
 
-    /// Step 8: feature 5 off, then on, and the leader dies within 2 s
-    /// after its switch. The container of the leader is known before the
+    /// Feature 5 off, then on, and the leader dies within 2 s after its
+    /// switch. The container of the leader is known before the
     /// transaction, so the kill is one call after the switch.
     pub(super) async fn leader_kill_at_switch(&mut self) -> anyhow::Result<()> {
-        self.window(Window::Off).await?;
-        let on = Upgrade::on(FEATURE_CARRY_WINDOW);
-        on.check(self.h, self.ctx).await?;
+        let on = self.off_then_check_on().await?;
         let members = Members::new(self.h)?;
         let leader = members.leader().await?;
         let node = sealer(self.h, leader)?;
@@ -78,7 +79,7 @@ impl Run<'_> {
             .await
     }
 
-    /// Step 9: one egress instance restarts. It reads R from its mark, so
+    /// One egress instance restarts. It reads R from its mark, so
     /// R is the same after the restart, and the readers keep reading.
     pub(super) async fn egress_restart(&mut self) -> anyhow::Result<()> {
         let egress = Egress::of(self.h).await?;
@@ -88,7 +89,13 @@ impl Run<'_> {
             .ok_or_else(|| crate::chaos_fail!("{}: no egress instance", self.ctx))?;
         let before = victim.await_reference(self.h).await?;
         let cursors = CURSORS.read(self.h).await;
-        let floors = cursors.map(|c| c.unwrap_or(0));
+        let [Some(batcher), Some(validator)] = cursors else {
+            return Err(crate::chaos_fail!(
+                "{}: a reader cursor does not answer before the restart: {cursors:?}",
+                self.ctx
+            ));
+        };
+        let floors = [batcher, validator];
         self.h.inject_hard(&[&victim.node], EGRESS_TASK).await?;
         self.h
             .assert_count(
@@ -120,15 +127,22 @@ impl Run<'_> {
             .await
     }
 
-    /// Send feature 5 to `state`, and wait until every member reports it.
-    async fn window(&self, state: Window) -> anyhow::Result<()> {
-        let upgrade = match state {
-            Window::On => Upgrade::on(FEATURE_CARRY_WINDOW),
-            Window::Off => Upgrade::off(FEATURE_CARRY_WINDOW),
-        };
-        upgrade.apply(self.h, self.ctx).await?;
-        Members::new(self.h)?
-            .await_window(state, self.retention()?)
-            .await
+    /// Check and send feature 5 off, and check the transaction that
+    /// turns it on again while the members switch off: the switch does
+    /// not change the release that the check reads. Returns the checked
+    /// transaction.
+    async fn off_then_check_on(&self) -> anyhow::Result<Upgrade> {
+        let on = Upgrade::on(FEATURE_CARRY_WINDOW);
+        Upgrade::off(FEATURE_CARRY_WINDOW)
+            .apply(self.h, self.ctx)
+            .await?;
+        let members = Members::new(self.h)?;
+        let (off, checked) = tokio::join!(
+            members.await_window(Window::Off, self.retention()?),
+            on.check(self.h, self.ctx)
+        );
+        off?;
+        checked?;
+        Ok(on)
     }
 }

@@ -30,11 +30,15 @@ mod raft_partition;
 pub(crate) mod recorded_cursor;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
-mod sequencer_recovery;
+pub mod sequencer_recovery;
 pub(crate) mod squeeze;
 pub(crate) mod validator;
 
 mod window;
+
+/// The case load rate while an Ansible play runs on the controller. It
+/// keeps traffic in the pipeline through the play.
+const PLAY_TPS: NonZeroU32 = NonZeroU32::new(20).expect("a nonzero play rate");
 
 /// Every case, by its CI name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +49,8 @@ pub enum Case {
     HardIngress,
     GracefulSequencer,
     HardSequencer,
-    SequencerReplicaKill,
+    /// One drill of the kill of one sequencer replica.
+    SequencerReplicaKill(sequencer_recovery::Drill),
     NodeFailureExecutor,
     NodeReplaceExecutor,
     StateCheckpointRestore,
@@ -104,6 +109,7 @@ pub enum Case {
     L1Liar,
     L1NullReceipts,
     L1TransportRefusals,
+    L1ProviderUnresponsive,
     TwoDayOutage,
     BatcherOutagePastRetention,
     FollowerInstanceLoss,
@@ -124,7 +130,6 @@ const ALL: &[Case] = &[
     Case::HardIngress,
     Case::GracefulSequencer,
     Case::HardSequencer,
-    Case::SequencerReplicaKill,
     Case::NodeFailureExecutor,
     Case::NodeReplaceExecutor,
     Case::StateCheckpointRestore,
@@ -183,6 +188,7 @@ const ALL: &[Case] = &[
     Case::L1Liar,
     Case::L1NullReceipts,
     Case::L1TransportRefusals,
+    Case::L1ProviderUnresponsive,
     Case::TwoDayOutage,
     Case::BatcherOutagePastRetention,
     Case::FollowerInstanceLoss,
@@ -202,6 +208,7 @@ impl Case {
         ALL.iter()
             .copied()
             .chain(carry::STEPS.iter().copied().map(Self::Carry))
+            .chain(sequencer_recovery::Drill::ALL.map(Self::SequencerReplicaKill))
             .find(|c| c.name() == name)
             .ok_or_else(|| crate::chaos_fail!("unknown chaos case: {name}"))
     }
@@ -216,7 +223,7 @@ impl Case {
             Self::HardIngress => "hard-ingress",
             Self::GracefulSequencer => "graceful-sequencer",
             Self::HardSequencer => "hard-sequencer",
-            Self::SequencerReplicaKill => "sequencer-replica-kill",
+            Self::SequencerReplicaKill(drill) => drill.name(),
             Self::NodeFailureExecutor => "node-failure-executor",
             Self::NodeReplaceExecutor => "node-replace-executor",
             Self::StateCheckpointRestore => "state-checkpoint-restore",
@@ -275,6 +282,7 @@ impl Case {
             Self::L1Liar => "l1-liar",
             Self::L1NullReceipts => "l1-null-receipts",
             Self::L1TransportRefusals => "l1-transport-refusals",
+            Self::L1ProviderUnresponsive => "l1-provider-unresponsive",
             Self::TwoDayOutage => "two-day-outage",
             Self::BatcherOutagePastRetention => "batcher-outage-past-retention",
             Self::FollowerInstanceLoss => "follower-instance-loss",
@@ -287,18 +295,26 @@ impl Case {
 
     /// The case load's rate. The L1 cases run below the steady rate: a
     /// fault that stops the batcher must not push its cursor past the
-    /// small egress retention their shard deploys.
+    /// small egress retention their shard deploys. A case that runs an
+    /// Ansible play on the controller runs at the play rate: the cluster
+    /// shares the runner with the controller, and the steady rate starves
+    /// the play.
     #[must_use]
     pub fn tps(self, k: &Knobs) -> NonZeroU32 {
         match self {
+            Self::NodeReplaceExecutor | Self::NodeReplaceSealer | Self::DeployBrokenImage => {
+                PLAY_TPS
+            }
             Self::L1Liar
             | Self::L1NullReceipts
             | Self::L1TransportRefusals
+            | Self::L1ProviderUnresponsive
             | Self::TwoDayOutage
             | Self::BatcherOutagePastRetention
             | Self::FollowerInstanceLoss
             | Self::FollowerTotalLoss
             | Self::FollowerDisagreement => k.l1_tps,
+            Self::Carry(_) => carry::CARRY_TPS,
             _ => k.tps,
         }
     }
@@ -307,8 +323,8 @@ impl Case {
     #[must_use]
     pub fn pin(self) -> Pin {
         match self {
-            Self::SequencerReplicaKill
-            | Self::SequencerLapse
+            Self::SequencerReplicaKill(drill) => drill.pin(),
+            Self::SequencerLapse
             | Self::GracefulSequencer
             | Self::HardSequencer
             | Self::SequencerLaneLossRecover
@@ -367,6 +383,7 @@ impl Case {
             | Self::SequencerLaneLossRecover => {
                 u32::try_from(k.reschedule_slo.as_secs() / 30).unwrap_or(u32::MAX) + 2
             }
+            Self::Carry(step) => step.load_retry(k),
             _ => k.load_retry,
         }
     }
@@ -384,7 +401,7 @@ impl Case {
             Self::HardIngress => component::hard_ingress(h).await,
             Self::GracefulSequencer => component::graceful_sequencer(h).await,
             Self::HardSequencer => component::hard_sequencer(h).await,
-            Self::SequencerReplicaKill => component::sequencer_replica_kill(h).await,
+            Self::SequencerReplicaKill(drill) => drill.run(h).await,
             Self::NodeFailureExecutor => component::node_failure_executor(h).await,
             Self::NodeReplaceExecutor => component::node_replace_executor(h).await,
             Self::StateCheckpointRestore => component::state_checkpoint_restore(h).await,
@@ -453,6 +470,7 @@ impl Case {
             Self::L1Liar => l1::liar(h).await,
             Self::L1NullReceipts => l1::null_receipts(h).await,
             Self::L1TransportRefusals => l1::transport_refusals(h).await,
+            Self::L1ProviderUnresponsive => l1::provider_unresponsive(h).await,
             Self::TwoDayOutage => l1::two_day_outage(h).await,
             Self::BatcherOutagePastRetention => l1::batcher_outage_past_retention(h).await,
             Self::FollowerInstanceLoss => l1::follower_instance_loss(h).await,

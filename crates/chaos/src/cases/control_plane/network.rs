@@ -136,10 +136,16 @@ impl Step {
         Ok(view)
     }
 
+    /// The four checks of a node are independent, so they run at once.
     async fn verify(&self, isolated: bool) -> anyhow::Result<()> {
-        for check in &self.checks {
-            check.verify(&self.view.node, isolated).await?;
-        }
+        let node = &self.view.node;
+        let [consul, nomad, rpc, dns] = &self.checks;
+        tokio::try_join!(
+            consul.verify(node, isolated),
+            nomad.verify(node, isolated),
+            rpc.verify(node, isolated),
+            dns.verify(node, isolated)
+        )?;
         Ok(())
     }
 

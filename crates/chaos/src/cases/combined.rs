@@ -29,9 +29,10 @@ pub(crate) use expect::Expect;
 #[cfg(test)]
 use expect::Progress;
 
-/// How long every class stays down before the first one returns. The
-/// expectation while down is checked inside it.
-const HOLD: Duration = Duration::from_secs(60);
+/// How long every class stays down before the first one returns: past
+/// the 30 s Aeron stall tolerance, so every peer of a dead class times
+/// its session out. The expectation while down is checked inside it.
+const HOLD: Duration = Duration::from_secs(35);
 /// The task of each sequencer lane on a sequencer node.
 const LANES: [&str; 2] = ["sequencer-0", "sequencer-1"];
 
@@ -412,17 +413,17 @@ pub(crate) const INGRESS_SEQUENCER: Combined = Combined {
     case: Case::IngressSequencerLossRecover,
     down: &[Class::Ingress, Class::Sequencer],
     expect: Expect::SealOnly,
-    recovery: Recovery::Ordered(Duration::from_secs(30)),
+    recovery: Recovery::Ordered(Duration::from_secs(15)),
     checks: &[Check::NoOriginGap, Check::NoRefBelowFloor],
 };
 
-/// The ingresses and the sealers die. The ingresses return a minute
-/// before the sealers, and must wait for them.
+/// The ingresses and the sealers die. The ingresses return 35 s before
+/// the sealers, past the Aeron stall tolerance, and must wait for them.
 pub(crate) const INGRESS_SEALER: Combined = Combined {
     case: Case::IngressSealerLossRecover,
     down: &[Class::Ingress, Class::Sealer],
     expect: Expect::Stall,
-    recovery: Recovery::Reverse(Duration::from_secs(60)),
+    recovery: Recovery::Reverse(Duration::from_secs(35)),
     checks: &[Check::OneLeaderPerTerm],
 };
 
@@ -440,60 +441,62 @@ pub(crate) const SEQUENCER_SEALER: Combined = Combined {
     ],
 };
 
-/// All three classes die. They return in dependency order, thirty
+/// All three classes die. They return in dependency order, fifteen
 /// seconds apart.
 pub(crate) const ALL_THREE: Combined = Combined {
     case: Case::IngressSequencerSealerLossRecover,
     down: &[Class::Ingress, Class::Sequencer, Class::Sealer],
     expect: Expect::Stall,
-    recovery: Recovery::Ordered(Duration::from_secs(30)),
+    recovery: Recovery::Ordered(Duration::from_secs(15)),
     checks: &[Check::OneLeaderPerTerm, Check::NoOriginGap],
 };
 
 /// All three classes die. They return against the dependency order,
-/// forty-five seconds apart: each one waits for the next.
+/// 35 s apart, past the Aeron stall tolerance: each one waits for the
+/// next.
 pub(crate) const ALL_THREE_REVERSE: Combined = Combined {
     case: Case::IngressSequencerSealerReverse,
     down: &[Class::Ingress, Class::Sequencer, Class::Sealer],
     expect: Expect::Stall,
-    recovery: Recovery::Reverse(Duration::from_secs(45)),
+    recovery: Recovery::Reverse(Duration::from_secs(35)),
     checks: &[Check::OneLeaderPerTerm, Check::NoOriginGap],
 };
 
-/// The executor nodes and the sealer nodes die. The executors return a
-/// minute before the sealers, and must wait for them. With the executors
+/// The executor nodes and the sealer nodes die. The executors return
+/// 35 s before the sealers, past the Aeron stall tolerance, and must wait
+/// for them. With the executors
 /// on the sealer nodes, the executor tasks and the member tasks die
 /// instead, and return in the same order.
 pub(crate) const EXECUTOR_SEALER: Combined = Combined {
     case: Case::ExecutorSealerLossRecover,
     down: &[Class::ExecutorNodes, Class::Sealer],
     expect: Expect::Stall,
-    recovery: Recovery::Reverse(Duration::from_secs(60)),
+    recovery: Recovery::Reverse(Duration::from_secs(35)),
     checks: &[Check::OneLeaderPerTerm],
 };
 
 /// The executors, the sealers and the validator die. They return in
-/// dependency order, thirty seconds apart: the sealers, the executors,
+/// dependency order, fifteen seconds apart: the sealers, the executors,
 /// then the validator.
 pub(crate) const EXECUTOR_SEALER_VALIDATOR: Combined = Combined {
     case: Case::ExecutorSealerValidatorRecover,
     down: &[Class::Executor, Class::Sealer, Class::Validator],
     expect: Expect::Stall,
-    recovery: Recovery::Ordered(Duration::from_secs(30)),
+    recovery: Recovery::Ordered(Duration::from_secs(15)),
     checks: &[Check::OneLeaderPerTerm],
 };
 
 /// The ingresses and the executor nodes die. The sealers order the
 /// transactions in flight. The executors return first and publish the
 /// receipts of their replay while no ingress listens; the ingresses
-/// return a minute later and must serve those receipts from the state
+/// return 40 s later and must serve those receipts from the state
 /// of an executor. With the executors on the sealer nodes, the executor
 /// tasks die instead of the nodes.
 pub(crate) const INGRESS_EXECUTOR: Combined = Combined {
     case: Case::IngressExecutorLossRecover,
     down: &[Class::ExecutorNodes, Class::Ingress],
     expect: Expect::SealOnly,
-    recovery: Recovery::Ordered(Duration::from_secs(60)),
+    recovery: Recovery::Ordered(Duration::from_secs(40)),
     checks: &[Check::ReceiptFromState],
 };
 

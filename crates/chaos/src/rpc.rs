@@ -49,7 +49,11 @@ const PARK_TIMEOUT: &str = "timed out waiting for receipt or watermark";
 
 /// The refusals of a resent submit whose first send reached the
 /// pipeline: a sequencer holds the transaction, or its nonce is spent.
-const HELD_ALREADY: [&str; 3] = ["already known", "duplicate (sender, nonce)", "nonce too low"];
+const HELD_ALREADY: [&str; 3] = [
+    "already known",
+    "duplicate (sender, nonce)",
+    "nonce too low",
+];
 
 /// The bound of one call. It is above the 30 s park of a blocking submit
 /// at the ingress, so a parked submit gets the answer of the ingress

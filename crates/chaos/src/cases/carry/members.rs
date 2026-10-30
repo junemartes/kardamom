@@ -40,21 +40,35 @@ const HOLD_POLL: Budget = Budget {
     interval: Duration::from_millis(100),
 };
 
+/// How a metric of a member reads when its sample is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Absent {
+    /// A gauge: no sample is no value. A member that answers before it
+    /// registers the gauge reports nothing.
+    Unknown,
+    /// A counter that omits its zero: no sample is 0.
+    Zero,
+}
+
 /// One metric of a member, with the label fragment its samples carry.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Gauge {
     name: &'static str,
     label: &'static str,
+    absent: Absent,
 }
 
 pub(super) const DECISION_VERSION: Gauge = Gauge::of("kardamom_sealer_decision_version");
-pub(super) const REF_REFUSED: Gauge = Gauge::of("kardamom_sealer_ref_refused_total");
+pub(super) const REF_REFUSED: Gauge = Gauge {
+    absent: Absent::Zero,
+    ..Gauge::of("kardamom_sealer_ref_refused_total")
+};
 pub(super) const FEED_STATE: Gauge = Gauge::of("kardamom_sealer_feed_state");
 const WINDOW_EXACT: Gauge = Gauge::of("kardamom_sealer_window_exact");
 const RETAINED_FRAMES: Gauge = Gauge::of("kardamom_sealer_retained_frames");
 const WINDOW_FEATURE: Gauge = Gauge {
-    name: "kardamom_sealer_feature_state",
     label: "feature=\"5\"",
+    ..Gauge::of("kardamom_sealer_feature_state")
 };
 
 /// `kardamom_sealer_feed_state` of a feed that serves its executor live.
@@ -62,7 +76,19 @@ pub(super) const FEED_LIVE: i64 = 3;
 
 impl Gauge {
     const fn of(name: &'static str) -> Self {
-        Self { name, label: "" }
+        Self {
+            name,
+            label: "",
+            absent: Absent::Unknown,
+        }
+    }
+
+    /// The value in the `/metrics` body of a member.
+    fn value(self, body: &str) -> Option<i64> {
+        match self.absent {
+            Absent::Unknown => metrics::first_where(body, self.name, self.label),
+            Absent::Zero => metrics::sum_where(body, self.name, self.label),
+        }
     }
 }
 
@@ -125,10 +151,10 @@ impl<'a> Members<'a> {
         answer.json().await.ok()
     }
 
-    /// `gauge` on member `id`, summed over its samples.
+    /// `gauge` on member `id`.
     async fn read(&self, id: u32, gauge: Gauge) -> Option<i64> {
         let body = self.h.probes.scrape().fetch(&self.admin(id).ok()?).await?;
-        metrics::sum_where(&body, gauge.name, gauge.label)
+        gauge.value(&body)
     }
 
     async fn reads(&self, ids: &[u32], gauge: Gauge) -> Vec<Option<i64>> {
@@ -195,11 +221,8 @@ impl<'a> Members<'a> {
     /// Returns an error when the wait ends first.
     pub(super) async fn await_carry_window(&self, ids: &[u32], on: bool) -> anyhow::Result<()> {
         let outcome = poll::until(WAIT, |_| async move {
-            let mut done = true;
-            for id in ids {
-                done &= self.carry_window(*id).await == Some(on);
-            }
-            Ok(done.then_some(()))
+            let windows = self.carry_windows(ids).await;
+            Ok(windows.iter().all(|w| *w == Some(on)).then_some(()))
         })
         .await?;
         outcome
@@ -210,6 +233,14 @@ impl<'a> Members<'a> {
                 )
             })
             .map(|_| ())
+    }
+
+    async fn carry_windows(&self, ids: &[u32]) -> Vec<Option<bool>> {
+        let mut windows = Vec::with_capacity(ids.len());
+        for id in ids {
+            windows.push(self.carry_window(*id).await);
+        }
+        windows
     }
 
     async fn carry_window(&self, id: u32) -> Option<bool> {
@@ -245,11 +276,12 @@ impl<'a> Members<'a> {
     pub(super) async fn leader(&self) -> anyhow::Result<u32> {
         let budget = Budget::new(self.h.knobs.leader_slo, Duration::from_secs(1));
         let outcome = poll::until(budget, |_| async move {
-            let mut leader = None;
-            for id in ALL {
-                leader = leader.or(self.leads(id).await.then_some(id));
-            }
-            Ok(leader)
+            let [a, b, c] = ALL;
+            let leads = tokio::join!(self.leads(a), self.leads(b), self.leads(c));
+            Ok(ALL
+                .into_iter()
+                .zip([leads.0, leads.1, leads.2])
+                .find_map(|(id, leads)| leads.then_some(id)))
         })
         .await?;
         outcome

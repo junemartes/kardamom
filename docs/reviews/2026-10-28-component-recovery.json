@@ -1733,7 +1733,28 @@
       "full_case_locally_validated": false
     },
     {
-      "case": "sequencer-replica-kill",
+      "case": "sequencer-replica-kill-lane0-node0",
+      "family": "Sequencer",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "sequencer-replica-kill-lane1-node1",
+      "family": "Sequencer",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "sequencer-replica-kill-lane0-node1",
+      "family": "Sequencer",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "sequencer-replica-kill-lane1-node0",
       "family": "Sequencer",
       "status": "planned",
       "local_tests": [],
@@ -2215,7 +2236,15 @@
         {
           "suite": "l1-source-quorum",
           "test": "a_rotated_source_returns_after_the_backoff"
-        },
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "l1-provider-unresponsive",
+      "family": "Follower",
+      "status": "partial",
+      "local_tests": [
         {
           "suite": "l1-provider-http",
           "test": "unresponsive_sources_cannot_hold_the_follower_read_forever"
@@ -2449,6 +2478,20 @@
       "full_case_locally_validated": false
     },
     {
+      "case": "carry-lockbox",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-deposits-provider-fault",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
       "case": "carry-versions-on",
       "family": "Carry",
       "status": "partial",
@@ -2499,7 +2542,21 @@
       "full_case_locally_validated": false
     },
     {
-      "case": "carry-executors-rest",
+      "case": "carry-executor-second",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-executor-third",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-deposits-all-carry",
       "family": "Carry",
       "status": "planned",
       "local_tests": [],

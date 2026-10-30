@@ -296,7 +296,7 @@ async fn await_answering(
 }
 
 /// The least hold of a floor pass when nothing else bounds it.
-pub(super) const MIN_HOLD: Duration = Duration::from_mins(2);
+pub(super) const MIN_HOLD: Duration = Duration::from_mins(1);
 
 /// Hold until the ingress delta passed twice the retention, `min_hold`
 /// passed, and the sealers took a snapshot; the delta and the time.
@@ -319,7 +319,7 @@ pub(super) async fn hold_until_floor_passes(
     ));
     let delta = Cell::new(0_i64);
     let delta_ref = &delta;
-    let budget = Budget::new(h.knobs.retention_freeze_cap, Duration::from_secs(15));
+    let budget = Budget::new(h.knobs.retention_freeze_cap, Duration::from_secs(5));
     let outcome = poll::after_sleep(budget, |elapsed| async move {
         let d = h
             .probes

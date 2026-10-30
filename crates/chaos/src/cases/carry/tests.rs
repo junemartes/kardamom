@@ -75,7 +75,10 @@ fn supported_live_transitions_keep_their_cases_and_mixed_executor_state_audit() 
         "carry-readers-on-egress",
         "carry-window-on",
         "carry-executor-first",
-        "carry-executors-rest",
+        "carry-executor-second",
+        "carry-executor-third",
+        "carry-deposits-provider-fault",
+        "carry-deposits-all-carry",
         "carry-window-off-on",
         "carry-leader-kill-at-switch",
     ] {
@@ -84,4 +87,31 @@ fn supported_live_transitions_keep_their_cases_and_mixed_executor_state_audit() 
     }
     assert!(!shard.carry_born());
     assert!(shard.audits_after("carry-executor-first"));
+}
+
+#[test]
+fn the_steps_run_a_low_load_and_the_outage_steps_keep_their_senders_live() {
+    let k = Knobs::read(crate::Shard::Carry.env()).unwrap();
+    assert_eq!(k.l1_fault, std::time::Duration::from_secs(45));
+    for s in STEPS {
+        assert_eq!(Case::Carry(*s).tps(&k), super::CARRY_TPS, "{}", s.name());
+        assert!(Case::Carry(*s).tps(&k) < k.tps, "{}", s.name());
+    }
+    // Each attempt of a parked submit takes 30 s; the attempts cover the
+    // fault, the 30 s halt detection and a resume of up to a minute.
+    let outage = k.l1_fault.as_secs() + 30 + 60;
+    for s in [
+        super::Step::DepositsProviderFault,
+        super::Step::DepositsAllCarry,
+    ] {
+        assert!(
+            u64::from(Case::Carry(s).load_retry(&k)) * 30 > outage,
+            "{}",
+            s.name()
+        );
+    }
+    assert_eq!(
+        Case::Carry(super::Step::Lockbox).load_retry(&k),
+        k.load_retry
+    );
 }

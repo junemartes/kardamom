@@ -12,7 +12,6 @@ use checkpoint::CheckpointRestore;
 use super::cluster::a_follower;
 use super::exec_stream::ExecStreamSessions;
 use super::recorded_cursor::BestRecorded;
-use super::sequencer_recovery::SequencerRecovery;
 use crate::harness::Harness;
 use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
@@ -86,11 +85,6 @@ pub(crate) async fn hard_sequencer(h: &mut Harness) -> anyhow::Result<()> {
     h.inject_hard(&[&node], "sequencer-0").await?;
     h.assert_progress().await?;
     h.assert_count("sequencer", 4, h.knobs.restart_slo).await
-}
-
-/// Each replica returns and orders a used sender while its twin is frozen.
-pub(crate) async fn sequencer_replica_kill(h: &mut Harness) -> anyhow::Result<()> {
-    SequencerRecovery::run(h).await
 }
 
 /// The index of the executor whose node a node drill takes: the executor

@@ -388,7 +388,7 @@ impl Knobs {
             reschedule_slo: env.secs("CHAOS_RESCHEDULE_SLO_S", 200)?,
             leader_slo: env.secs("CHAOS_LEADER_SLO_S", 45)?,
             rejoin_slo: env.secs("CLUSTER_REJOIN_SLO_S", 360)?,
-            inject_delay: env.secs("INJECT_DELAY", 10)?,
+            inject_delay: env.secs("INJECT_DELAY", 5)?,
             load_flow_timeout: env.secs("LOAD_FLOW_TIMEOUT_S", 60)?,
             load_ready_timeout: env.secs("LOAD_READY_TIMEOUT_S", 600)?,
             account_base: env.u32("CHAOS_ACCT_BASE", 7)?,

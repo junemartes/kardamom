@@ -1,5 +1,6 @@
 //! `l1-liar`: the proxy serves a wrong block hash, then a broken parent
-//! chain, then swallowed settlement logs, each for the fault window.
+//! chain, then swallowed settlement logs. Each lie lasts until its
+//! effects show, and at most the fault window.
 //!
 //! The L1 follower reads two sources: the proxy, which lies, and the
 //! proxy's second source, which serves L1. Each lie is a disagreement of
@@ -16,13 +17,17 @@ use super::followers::{Followers, await_archive_complete, await_resume};
 use super::halt::await_followers_halted;
 use crate::harness::Harness;
 use crate::l1::{L1, STALE_POST_ALERT};
+use crate::poll::{self, Budget};
 
-/// The least posts the batcher confirms through one fault window: it
-/// posts every flush wait, so a one-minute window holds many more.
+/// The least posts the batcher confirms through one lie: it posts every
+/// flush wait, about every 5 s.
 const MIN_POSTS_THROUGH_FAULT: i64 = 3;
 
 /// How long the stale-post alert must hold to count as fired.
 const ALERT_HOLD: Duration = Duration::from_secs(30);
+
+/// How often a phase reads the post counter while the lie runs.
+const POST_READ: Duration = Duration::from_secs(3);
 
 /// The three lies, in order.
 #[derive(Debug, Clone, Copy)]
@@ -57,8 +62,9 @@ impl Phase {
     }
 
     /// One phase: arm the lie, prove the halt, the pauses and the
-    /// batcher's posts through it, let it run out, clear it, and prove
-    /// the resume.
+    /// batcher's posts through it, clear it, and prove the resume. The
+    /// lie lasts until the batcher confirmed its posts through it, and at
+    /// most the fault window.
     async fn run(self, h: &mut Harness, l1: &L1, ctx: &str) -> anyhow::Result<()> {
         let base = Followers::ready(h, ctx).await?;
         let posted0 = require_posting(h, ctx).await?;
@@ -74,10 +80,25 @@ impl Phase {
         let armed = Instant::now();
         await_followers_halted(h, base, ctx).await?;
         self.assert_alert(l1, window, ctx).await?;
-        tokio::time::sleep(window.saturating_sub(armed.elapsed())).await;
+        Self::await_posts(h, posted0, window.saturating_sub(armed.elapsed())).await?;
         assert_posted_through(h, posted0, MIN_POSTS_THROUGH_FAULT, ctx).await?;
         let stuck = Followers::at_clear(h, l1, base).await?;
         await_resume(h, stuck, ctx).await
+    }
+
+    /// Wait until the batcher confirmed [`MIN_POSTS_THROUGH_FAULT`]
+    /// posts since `posted0`, for at most `left` and at least one read.
+    /// The caller judges the count.
+    async fn await_posts(h: &Harness, posted0: i64, left: Duration) -> anyhow::Result<()> {
+        let need = posted0.saturating_add(MIN_POSTS_THROUGH_FAULT);
+        poll::until(
+            Budget::new(left.max(POST_READ), POST_READ),
+            |_| async move {
+                Ok::<_, anyhow::Error>(h.probes.batcher_posts().await.filter(|p| *p >= need))
+            },
+        )
+        .await
+        .map(|_| ())
     }
 
     /// The stale-post alert fires on the swallowed logs: the batcher's

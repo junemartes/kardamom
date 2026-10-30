@@ -1,6 +1,8 @@
-//! Provider refusals remove a required source without changing finalized data.
+//! Provider refusals remove a required source without changing finalized
+//! data. `l1-transport-refusals` runs the refusal and the rate limit;
+//! `l1-provider-unresponsive` runs the provider that answers nothing.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kardamom_l1_fault_proxy::Fault;
 
@@ -10,6 +12,10 @@ use crate::harness::Harness;
 use crate::l1::L1;
 use crate::poll::{self, Budget};
 
+/// How long a refusal holds after the follower halted on it. Every
+/// follower read through it fails, and L1 posting must stay still.
+const HOLD_AFTER_HALT: Duration = Duration::from_secs(15);
+
 #[derive(Clone, Copy)]
 enum Refusal {
     Unavailable,
@@ -18,8 +24,6 @@ enum Refusal {
 }
 
 impl Refusal {
-    const ALL: [Self; 3] = [Self::Unavailable, Self::RateLimited, Self::Unresponsive];
-
     fn fault(self) -> Fault {
         match self {
             Self::Unavailable => Fault::Down,
@@ -54,8 +58,9 @@ impl Refusal {
         let started = Instant::now();
         await_followers_halted(h, base, ctx).await?;
         let record = l1.posted().await?;
+        let halted = Instant::now();
         h.assert_progress().await?;
-        tokio::time::sleep(h.knobs.l1_fault.saturating_sub(started.elapsed())).await;
+        tokio::time::sleep(HOLD_AFTER_HALT.saturating_sub(halted.elapsed())).await;
         anyhow::ensure!(
             l1.posted().await? == record,
             "{}: {ctx}: L1 posting advances while its provider refuses every request",
@@ -91,12 +96,39 @@ impl Refusal {
     }
 }
 
+/// The provider refuses every request, then rate-limits every request.
 pub(crate) async fn transport_refusals(h: &mut Harness) -> anyhow::Result<()> {
-    let ctx = "l1-transport-refusals";
-    let l1 = L1::new(h).await?;
-    for refusal in Refusal::ALL {
-        refusal.run(h, &l1, ctx).await?;
+    Refusals {
+        ctx: "l1-transport-refusals",
+        each: &[Refusal::Unavailable, Refusal::RateLimited],
     }
-    await_archive_complete(h, &l1, ctx).await?;
-    l1.assert_contiguous(ctx).await
+    .run(h)
+    .await
+}
+
+/// The provider answers no request: the follower halts on the silence.
+pub(crate) async fn provider_unresponsive(h: &mut Harness) -> anyhow::Result<()> {
+    Refusals {
+        ctx: "l1-provider-unresponsive",
+        each: &[Refusal::Unresponsive],
+    }
+    .run(h)
+    .await
+}
+
+/// The refusals of one case, in order, then the DA record after them.
+struct Refusals {
+    ctx: &'static str,
+    each: &'static [Refusal],
+}
+
+impl Refusals {
+    async fn run(self, h: &mut Harness) -> anyhow::Result<()> {
+        let l1 = L1::new(h).await?;
+        for refusal in self.each {
+            refusal.run(h, &l1, self.ctx).await?;
+        }
+        await_archive_complete(h, &l1, self.ctx).await?;
+        l1.assert_contiguous(self.ctx).await
+    }
 }

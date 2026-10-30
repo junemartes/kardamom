@@ -58,7 +58,10 @@ impl Accounts {
     }
 
     /// Take the next account that satisfies `pin`. Skipped accounts are
-    /// burned, never reused: their nonce chains stay at 0. `moves` says
+    /// burned until the cursor passes the last account. Then the cursor
+    /// starts again at the base: a case load starts at the live nonce of
+    /// its account, and the recovery probe of the case before landed every
+    /// nonce of it, so a used account is a clean sender. `moves` says
     /// whether an account's vslot moves under the next map.
     ///
     /// # Errors
@@ -73,6 +76,14 @@ impl Accounts {
         self.skip_unpinned(pin, case, &moves);
         if self.next > LAST && pin == Pin::MovesOnScaleOut && !self.run_load {
             return self.take_reserve(case, &moves);
+        }
+        if self.next > LAST && pin != Pin::MovesOnScaleOut {
+            crate::log(format!(
+                "{case}: every funded account #{}..#{LAST} is used; the cursor starts again at #{}",
+                self.base, self.base
+            ));
+            self.next = self.base;
+            self.skip_unpinned(pin, case, &moves);
         }
         let account = self.next;
         self.next = account.saturating_add(1);
@@ -107,8 +118,8 @@ impl Accounts {
 
     /// The resize case runs last on a chaos-only shard, where the load
     /// reserve still sits at nonce 0. Take the first moved sender from
-    /// it, and park the cursor past the end so a later case fails
-    /// loudly.
+    /// it, and park the cursor and its base past the end so a later case
+    /// fails loudly.
     fn take_reserve(&mut self, case: &str, moves: &impl Fn(u32) -> bool) -> anyhow::Result<u32> {
         let spare = LOAD_RESERVE
             .into_iter()
@@ -124,6 +135,7 @@ impl Accounts {
             self.base, ACCT_VSLOT[spare as usize]
         ));
         self.next = LAST.saturating_add(1);
+        self.base = self.next;
         Ok(spare)
     }
 }
@@ -140,6 +152,18 @@ mod tests {
         // #9 is shard 0, #10 is shard 1, #11 is shard 0.
         assert_eq!(accounts.take(Pin::Shard0, "c", |_| false).unwrap(), 9);
         assert_eq!(accounts.take(Pin::Shard0, "d", |_| false).unwrap(), 11);
+    }
+
+    #[test]
+    fn the_cursor_starts_again_at_the_base_after_the_last_account() {
+        let mut accounts = Accounts::new(14, false);
+        assert_eq!(accounts.take(Pin::Any, "a", |_| false).unwrap(), 14);
+        assert_eq!(accounts.take(Pin::Any, "b", |_| false).unwrap(), 15);
+        assert_eq!(accounts.take(Pin::Any, "c", |_| false).unwrap(), 14);
+        let mut shard0 = Accounts::new(14, false);
+        // #14 is shard 0 and #15 is shard 1.
+        assert_eq!(shard0.take(Pin::Shard0, "d", |_| false).unwrap(), 14);
+        assert_eq!(shard0.take(Pin::Shard0, "e", |_| false).unwrap(), 14);
     }
 
     #[test]
