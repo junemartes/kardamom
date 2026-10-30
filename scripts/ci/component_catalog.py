@@ -32,7 +32,7 @@ class Catalog:
         duplicates = sorted({name for name in names if names.count(name) > 1})
         return ([f"duplicate case: {name}" for name in duplicates]
                 + [f"suite {name}: ci_mode must be one of {list(CI_MODES)}"
-                   for name, suite in self.suites.items() if suite.get("ci_mode", CI_MODES[0]) not in CI_MODES]
+                   for name, suite in self.suites.items() if suite.get("ci_mode") not in CI_MODES]
                 + [error for case in self.cases for error in self.case_errors(case)])
 
     def case_errors(self, case):
