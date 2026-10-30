@@ -186,7 +186,7 @@ final class CarryCluster implements AutoCloseable {
         final List<byte[]> carried = egress.relayedPayloads.subList(from, egress.relayedPayloads.size()).stream()
             .filter(p -> p[CanonicalSealerState.CANONICAL_ID_LEN] == SealerWire.RT_TX)
             .toList();
-        assertEquals(refs.size(), carried.size(), "each full reference once");
+        assertEquals(refs.size(), carried.size(), () -> "each full reference once: " + egress.relayedIndexes);
         IntStream.range(0, refs.size()).forEach(i -> assertArrayEquals(refs.get(i).canonicalPayload(), carried.get(i)));
         final List<Long> indexes = egress.relayedIndexes.subList(from, egress.relayedIndexes.size());
         IntStream.range(1, indexes.size()).forEach(i -> assertEquals(indexes.get(i - 1) + 1, indexes.get(i),

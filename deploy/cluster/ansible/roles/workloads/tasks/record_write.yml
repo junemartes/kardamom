@@ -34,5 +34,8 @@
   ansible.builtin.set_fact:
     workloads_record_index: "{{ workloads_record_written.json.ModifyIndex }}"
 
+# An include, not an import: a deploy writes the record some forty times,
+# and a skipped include is one task, not one for each task of the file.
 - name: Mirror the deploy record
-  ansible.builtin.import_tasks: record_mirror.yml
+  ansible.builtin.include_tasks: record_mirror.yml
+  when: workloads_record_mirror | default(true) | bool

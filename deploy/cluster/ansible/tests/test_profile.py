@@ -60,7 +60,7 @@ class ProfileTest(unittest.TestCase):
 class NomadServerTest(unittest.TestCase):
     """The heartbeat grace of the Nomad servers follows the profile."""
 
-    def render(self, profile):
+    def render(self, profile, grace=None):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / 'nomad.hcl'
             (Path(tmp) / 'play.yml').write_text(json.dumps([{
@@ -71,7 +71,10 @@ class NomadServerTest(unittest.TestCase):
                 'tasks': [{'ansible.builtin.template': {
                     'src': str(ANSIBLE / 'roles/nomad/templates/nomad.hcl.j2'), 'dest': str(out), 'mode': '0644'}}],
             }]))
-            env = {k: v for k, v in os.environ.items() if not k.startswith('ANSIBLE_')}
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith('ANSIBLE_') and k != 'NOMAD_HEARTBEAT_GRACE'}
+            if grace is not None:
+                env['NOMAD_HEARTBEAT_GRACE'] = grace
             # An extra variable: group_vars/all.yml would override a play variable.
             result = subprocess.run(['ansible-playbook', '-i', 'localhost,', str(Path(tmp) / 'play.yml'),
                                      '-e', 'deployment_profile=' + profile],
@@ -84,6 +87,10 @@ class NomadServerTest(unittest.TestCase):
 
     def test_production_keeps_the_nomad_default(self):
         self.assertIn('heartbeat_grace = "10s"', self.render('production'))
+
+    def test_the_chaos_suite_sets_the_grace_of_the_local_profile(self):
+        self.assertIn('heartbeat_grace = "30s"', self.render('local', grace='30s'))
+        self.assertIn('heartbeat_grace = "10s"', self.render('production', grace='30s'))
 
 
 @unittest.skipUnless(shutil.which('ansible-playbook'), 'Ansible required')

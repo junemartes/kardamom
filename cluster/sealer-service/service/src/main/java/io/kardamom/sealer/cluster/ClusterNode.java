@@ -617,7 +617,7 @@ public final class ClusterNode {
             final String aeronDir, final String clusterDir, final String clusterMembers,
             final int memberId, final int ingressStreamId, final String[] me,
             final StopRequest stop) {
-        final ConsensusModule.Context ctx = new ConsensusModule.Context()
+        final ConsensusModule.Context ctx = ClockSetting.fromProperties().applyTo(new ConsensusModule.Context())
             .clusterMemberId(memberId)
             .clusterMembers(clusterMembers)
             .aeronDirectoryName(aeronDir)

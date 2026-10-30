@@ -155,6 +155,18 @@ variable "checkpoint_log" {
   }
 }
 
+# The seconds between two checkpoints of an executor
+# (--checkpoint-interval-secs). The deploy passes it from
+# KARDAMOM_CHECKPOINT_INTERVAL_S.
+variable "checkpoint_interval_s" {
+  type    = number
+  default = 20
+  validation {
+    condition     = var.checkpoint_interval_s > 0
+    error_message = "The checkpoint_interval_s value must be above 0."
+  }
+}
+
 # The executors on the sealer nodes, "on" or "off". On, executor <i>
 # runs on sealer-<i>, the node of member i, in its own group. Off, the
 # executors run on the executor nodes. The deploy passes it from
@@ -303,7 +315,14 @@ job "executor" {
       # degrades to 2. On the sealer nodes a group has one node, so a lost
       # replica waits for that node.
       restart {
-        attempts = 3
+        # An Aeron client exits until the media driver of its node runs
+        # again, as after a node restart. Ten attempts at the 5 s delay
+        # cover that start; with three, three fast failures would leave the
+        # rest of the interval without a try. The cost: a task that crashes
+        # in a loop restarts about every 5 s, about three times the load on
+        # its targets of three attempts. A recovery after a node restart that
+        # is up to a minute faster outweighs that load.
+        attempts = 10
         interval = "1m"
         delay    = "5s"
         mode     = "delay"
@@ -445,7 +464,7 @@ job "executor" {
             # only the tail, not from genesis. Write a checkpoint every
             # 20s as the chain advances.
             "--checkpoint-dir", "/opt/kardamom/checkpoints",
-            "--checkpoint-interval-secs", "20",
+            "--checkpoint-interval-secs", format("%d", var.checkpoint_interval_s),
             # Peer checkpoint exchange, a full-resync fallback. Each
             # replica serves its newest checkpoint on 9014, and can
             # fetch one from the others. A node whose replay cursor, or
