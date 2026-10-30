@@ -269,6 +269,16 @@ impl LiveEgress {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
+impl LiveEgress {
+    /// An egress whose frames come from `out_rx`, as the session thread
+    /// sends them. Closing the sender closes the egress.
+    #[must_use]
+    pub fn from_frames(out_rx: Receiver<Vec<u8>>) -> Self {
+        Self { out_rx }
+    }
+}
+
 impl ClusterEgress for LiveEgress {
     fn recv(&mut self) -> Option<Vec<u8>> {
         self.out_rx.recv().ok()

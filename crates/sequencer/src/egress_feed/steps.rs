@@ -3,13 +3,13 @@
 //! Each helper is one step of a loop, or one `select!` branch, on the
 //! struct that owns it.
 
+use crate::epoch::OriginSignal;
+use crate::metrics as seq_metrics;
+use crate::outbound::DropPublisher;
+use crate::resync::{SealerAnswer, SealerRefusal};
 use kardamom_cluster_adapter::wire::{self, EgressItem};
 use kardamom_obs::halt::HaltCause;
 use kardamom_obs::lifecycle::Lifecycle;
-use kardamom_sequencer::epoch::OriginSignal;
-use kardamom_sequencer::metrics as seq_metrics;
-use kardamom_sequencer::outbound::DropPublisher;
-use kardamom_sequencer::resync::{SealerAnswer, SealerRefusal};
 
 use super::EgressWatermarkFeed;
 

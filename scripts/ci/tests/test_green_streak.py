@@ -211,8 +211,7 @@ class StreakTest(unittest.TestCase):
         ci = next(run for run in runs if run["path"].endswith("/ci.yml"))
         ci["jobs"][-1]["conclusion"] = "skipped"
         self.assertEqual(self.streak.record(runs), "failed")
-        self.assertIn(f"component recovery ({COMPONENT_SHARDS - 1})",
-                      self.streak.state["rounds"][0]["missing_green_coverage"])
+        self.assertIn("component recovery (4)", self.streak.state["rounds"][0]["missing_green_coverage"])
 
     def test_component_jobs_have_a_ten_minute_budget(self):
         for end, expected in [("00:10:00", "green"), ("00:10:01", "failed")]:
