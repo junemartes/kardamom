@@ -24,7 +24,10 @@
         name: "{{ item.name }}"
         groups: "{{ [item.role, 'container_nodes'] }}"
         ansible_host: "{{ item.container }}"
-        ansible_connection: community.docker.docker
+        # The short name routes to community.docker.docker. The Mitogen
+        # strategy (the CI shard step) maps only the short name to its own
+        # docker transport, which keeps one Python process for each node.
+        ansible_connection: docker
         ansible_user: root
         ansible_python_interpreter: /usr/bin/python3
         kardamom_in_container: true

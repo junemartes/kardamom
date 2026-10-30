@@ -4,6 +4,14 @@
 # one it replaced becomes the previous one, with their signature bundles:
 # the re-render path of `just rollback-rerender <env>` deploys a manifest
 # through the normal path when Nomad dropped the versions to revert to.
+- name: Record version 0 of every new job of the waves
+  ansible.builtin.set_fact:
+    workloads_attempt: >-
+      {{ workloads_attempt | combine({'before': {'jobs': dict(workloads_attempt.changed
+           | zip(workloads_attempt.changed | map('extract', workloads_attempt.before.jobs)
+                 | map('combine', {'after': 0})))}}, recursive=true) }}
+  when: workloads_waves | default(false) | bool
+
 - name: Accept the release
   ansible.builtin.set_fact:
     workloads_attempt: >-

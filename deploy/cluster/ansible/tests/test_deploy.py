@@ -717,6 +717,8 @@ class DeployTest(Deploys):
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
                     'da-store', 'l1-indexer', 'batcher', 'sequencer', 'canary']
         self.assertEqual(self.api.state['writes'], expected, 'the waves keep the registration order')
+        jobs = self.record()['accepted']['before']['jobs']
+        self.assertEqual({name: jobs[name] for name in expected}, {name: {'before': None, 'after': 0} for name in expected})
         self.assertEqual(self.api.state['deployments']['ingress'].state(poll=False)['Status'], 'successful')
 
     def test_a_failed_job_of_a_wave_stops_the_deploy_at_the_end_of_the_wave(self):

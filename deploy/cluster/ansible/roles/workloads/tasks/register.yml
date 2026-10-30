@@ -46,8 +46,13 @@
         workloads_register_evals: >-
           {{ workloads_register_evals | default({}) | combine({workloads_register_job: workloads_registration.json.EvalID}) }}
 
+    # In the waves of a new cluster, every job is new, so its version is
+    # 0. The record gets those versions with the accepted release
+    # (record.yml), not in one more write for each registration.
     - name: Record the registration of {{ workloads_register_job }}
-      when: workloads_recording | default(false)
+      when:
+        - workloads_recording | default(false)
+        - not (workloads_waves | default(false) | bool and workloads_plan.json.Diff.Type == 'Added')
       block:
         # Nomad gives a job that it did not know version 0, and the
         # EnforceIndex of the registration ensures that no other write
