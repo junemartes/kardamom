@@ -485,13 +485,16 @@ workloads_l1_silence_s: "{{ lookup('env', 'L1_SILENCE_S') }}"
 workloads_epoch_pace_ms: "{{ lookup('env', 'EPOCH_PACE_MS') }}"
 workloads_indexer_host: "{{ lookup('env', 'L1_INDEXER_HOST') | default('kardamom-l1-indexer.service.' ~ datacenter ~ '.consul', true) }}"
 workloads_indexer_port: "{{ lookup('env', 'L1_INDEXER_PORT') | default('8549', true) }}"
-workloads_poll_delay: 3
-workloads_poll_retries: 80
+# One poll each second. A wait sees its result within about one second;
+# each budget below is the number of polls.
+workloads_poll_delay: 1
+# 240 polls of 1 s are 4 minutes.
+workloads_poll_retries: 240
 # The poll budget of one Nomad deployment, in polls of workloads_poll_delay
 # seconds. It covers the longest progress_deadline of a job (12 minutes,
 # the sealer), so a deployment that Nomad has not decided yet is never
-# read as a failure. 260 polls of 3 s are 13 minutes.
-workloads_deployment_retries: 260
+# read as a failure. 780 polls of 1 s are 13 minutes.
+workloads_deployment_retries: 780
 # Canary allocations for the ingress and the sequencer: 0 or 1. A canary
 # is one allocation more than the count, so it needs a spare node of its
 # class; the container profile has none.
@@ -540,6 +543,16 @@ workloads_sealer_must_match:
 # and closes it when the new cluster is up. On a registered job the flag
 # does nothing, so a re-deploy that keeps it set is safe.
 workloads_cluster_bootstrap: "{{ lookup('env', 'KARDAMOM_CLUSTER_BOOTSTRAP') | default('0', true) | bool }}"
+# The deploy waves of a new cluster (KARDAMOM_DEPLOY_WAVES=1). The role
+# uses them only when Nomad knows no job and the environment has no deploy
+# record. A job with `defer` then waits at the end of its wave, not before
+# the next registration: the jobs of one wave start together. Every other
+# deploy waits for each job before the next one. The container recipes set
+# the flag; a real environment does not.
+workloads_deploy_waves: "{{ lookup('env', 'KARDAMOM_DEPLOY_WAVES') == '1' }}"
+# The followers that the deploy registers without a wait and waits for
+# together, after their wave.
+workloads_followers: [executor, state-mirror, notifier, validator, da-watcher, node-exporter, monitoring]
 # The deploy record, by environment. The Nomad variable
 # kardamom/deploys/<env> holds the current attempt and the last accepted
 # release; deployed/<env>/ mirrors it (attempt.json, accepted.json,

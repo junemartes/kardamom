@@ -2,8 +2,8 @@ name: cluster-e2e
 
 # Container-based cluster end-to-end (Ansible → Nomad → Consul). Brings up the
 # multi-node cluster as privileged systemd+DinD containers on a Docker
-# bridge (the VM-less analogue of `just container-up`), provisions it through
-# ansible/cluster.yml, deploys the Nomad jobs, and runs the pipeline smoke +
+# bridge (the VM-less analogue of `just container-up`), provisions it once
+# (see prepare-cluster below), deploys the Nomad jobs, and runs the pipeline smoke +
 # sustained-load + chaos suite. Each shard is one test of crates/chaos
 # (tests/shards.rs); the test owns the lifecycle. See
 # deploy/cluster/terraform/containers and the container-* targets of
@@ -14,8 +14,8 @@ name: cluster-e2e
 # binaries (no cargo feature to toggle); the Java cluster image is built from the
 # gradle shadowJar.
 #
-# The FULL suite runs on every trigger, SHARDED across runners (each shard brings
-# up its own cluster and runs one slice): one `load` shard (5-min soak), three
+# The FULL suite runs on every trigger, SHARDED across runners (each shard
+# starts its own copy of the prepared cluster and runs one slice): one `load` shard (5-min soak), three
 # `chaos-*` component shards (executor/ingress/sequencer), one `chaos-cluster`
 # shard for the Raft resilience cases, and one `chaos-fleet` shard for the
 # whole-fleet outages. Splitting across runners keeps wall-clock
@@ -29,11 +29,21 @@ name: cluster-e2e
 # build job picks the shard list.
 #
 # One `build` job compiles the service binaries, the shard test executable,
-# the operator binary and the sealer jar once, and hands them to the shards
-# as one artifact (`just stage-dist`). A shard runner carries
-# no Rust toolchain, no JDK and no Foundry: it unpacks the artifact over
-# its checkout and runs make with KARDAMOM_STAGED=1. Before this, every
-# shard spent about 20 minutes on the same build (issue #300).
+# the operator binary and the sealer jar once (`just stage-dist`). The
+# `node-image` job builds the prepared node image once.
+#
+# One `prepare-cluster` job then builds the cluster once for the whole
+# run: `just container-prepare` creates the nodes, provisions Docker,
+# Consul, Nomad and the registry, and pushes the service images into the
+# registry, with no workload. `just container-save` stops the nodes,
+# commits each node to an image and keeps the node volumes. The job
+# uploads them with the host binaries as the `prepared-cluster` artifact.
+#
+# A shard job loads that artifact and sets KARDAMOM_PREPARED_CLUSTER. Each
+# bring-up of the shard test then recreates the saved volumes, starts the
+# saved nodes, waits for the substrate (ansible/resume.yml) and deploys the
+# workloads in waves. A shard runner carries no Rust toolchain, no JDK and
+# no Foundry, and builds no image. The target of a shard job is 15 minutes.
 
 on:
   workflow_dispatch:
@@ -221,8 +231,111 @@ jobs:
           compression-level: 0
           retention-days: 3
 
-  cluster-e2e:
+  # One job builds the cluster that every shard starts from: the nodes,
+  # their substrate (Docker, Consul, Nomad, the registry) and the images in
+  # the registry, with no workloads. `just container-save` keeps each node
+  # as an image and its volumes as files. A shard resumes this cluster and
+  # deploys the workloads on it (see the top of this file).
+  prepare-cluster:
     needs: [build, node-image]
+    name: prepare the chaos cluster
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # GitHub's artifact service answers 403 or 5xx now and then, and
+      # download-artifact does not retry. Two more attempts follow a
+      # failure, each after a pause.
+      - uses: actions/download-artifact@v4
+        id: artifact-1
+        continue-on-error: true
+        with:
+          name: cluster-dist
+      - name: Wait before the second artifact download
+        if: steps.artifact-1.outcome == 'failure'
+        run: sleep 30
+      - uses: actions/download-artifact@v4
+        id: artifact-2
+        if: steps.artifact-1.outcome == 'failure'
+        continue-on-error: true
+        with:
+          name: cluster-dist
+      - name: Wait before the third artifact download
+        if: steps.artifact-1.outcome == 'failure' && steps.artifact-2.outcome == 'failure'
+        run: sleep 90
+      - uses: actions/download-artifact@v4
+        if: steps.artifact-1.outcome == 'failure' && steps.artifact-2.outcome == 'failure'
+        with:
+          name: cluster-dist
+
+      # The artifact's layout is the checkout's: target/release for the
+      # binaries and the Aeron libraries, the Gradle output path for the jar.
+      - name: Unpack the artifact over the checkout
+        run: |
+          tar -xzf cluster-dist.tgz
+          rm cluster-dist.tgz
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cluster-node-image
+          path: /tmp/cluster-node-artifact
+      - name: Load the prepared node image
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          docker load -i /tmp/cluster-node-artifact/cluster-node-image.tgz
+          test "$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' kardamom-node-prepared:ci)" = "$EXPECTED_REVISION"
+          echo "TF_VAR_prebuilt_node_image=kardamom-node-prepared:ci" >> "$GITHUB_ENV"
+          rm /tmp/cluster-node-artifact/cluster-node-image.tgz
+
+      - uses: ./.github/actions/ansible-runner
+
+      # Images are pushed from inside the control node (REGISTRY_PUSH_NODE
+      # in the justfile), so the runner daemon trusts no registry address.
+      - name: Kernel modules for systemd-in-container
+        run: sudo modprobe ip_tables || true
+
+      - uses: ./.github/actions/tofu-providers
+        with:
+          root: deploy/cluster/terraform/containers
+      - uses: ./.github/actions/just
+
+      - name: Provision the nodes and publish the images
+        run: just --justfile deploy/cluster/justfile container-prepare
+        env:
+          KARDAMOM_STAGED: "1"
+
+      # The runner engine keeps a copy of every image that the registry
+      # holds. The save needs the disk space.
+      - name: Remove the runner copies of the pushed images
+        run: |
+          docker image ls --format '{{ .Repository }}:{{ .Tag }}' | grep '^registry.service.consul:5000/' | xargs -r docker image rm >/dev/null
+          docker builder prune --all --force >/dev/null
+          df -h /
+
+      # The shard runner needs only the host binaries of the build: the
+      # shard test, the operator, and the tools that the cases run.
+      - name: Save the prepared cluster
+        run: |
+          just --justfile deploy/cluster/justfile container-save /tmp/prepared-cluster
+          mkdir -p /tmp/prepared-dist/target/release
+          for bin in chaos-shards cluster deploy semantics reconstruct archive-rereplicate; do
+            cp "target/release/kardamom-$bin" /tmp/prepared-dist/target/release/
+          done
+          tar -C /tmp/prepared-dist -cf - . | zstd -T0 -3 -q > /tmp/prepared-cluster/dist.tar.zst
+          du -sh /tmp/prepared-cluster
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prepared-cluster
+          path: /tmp/prepared-cluster
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+
+  cluster-e2e:
+    needs: [build, prepare-cluster]
     name: container cluster e2e (${{ matrix.shard }})
     # Same base as the build job: the staged binaries and libaeron.so link
     # this glibc.
@@ -272,7 +385,8 @@ jobs:
         id: artifact-1
         continue-on-error: true
         with:
-          name: cluster-dist
+          name: prepared-cluster
+          path: /tmp/prepared-cluster
       - name: Wait before the second artifact download
         if: steps.artifact-1.outcome == 'failure'
         run: sleep 30
@@ -281,59 +395,36 @@ jobs:
         if: steps.artifact-1.outcome == 'failure'
         continue-on-error: true
         with:
-          name: cluster-dist
+          name: prepared-cluster
+          path: /tmp/prepared-cluster
       - name: Wait before the third artifact download
         if: steps.artifact-1.outcome == 'failure' && steps.artifact-2.outcome == 'failure'
         run: sleep 90
       - uses: actions/download-artifact@v4
         if: steps.artifact-1.outcome == 'failure' && steps.artifact-2.outcome == 'failure'
         with:
-          name: cluster-dist
+          name: prepared-cluster
+          path: /tmp/prepared-cluster
 
-      # The artifact's layout is the checkout's: target/release for the
-      # binaries and the Aeron libraries, the Gradle output path for the jar.
-      - name: Unpack the artifact over the checkout
-        run: |
-          tar -xzf cluster-dist.tgz
-          rm cluster-dist.tgz
-          ls -l target/release | head -n 20
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: cluster-node-image
-          path: /tmp/cluster-node-artifact
-      - name: Load the prepared node image
+      # The host binaries go to the checkout's target/release. The node
+      # images carry the revision label of the node-image job. The shard
+      # test reads KARDAMOM_PREPARED_CLUSTER and resumes the saved cluster
+      # at each bring-up.
+      - uses: ./.github/actions/just
+      - name: Load the prepared cluster
         env:
           EXPECTED_REVISION: ${{ github.sha }}
         run: |
-          docker load -i /tmp/cluster-node-artifact/cluster-node-image.tgz
+          zstd -dc /tmp/prepared-cluster/dist.tar.zst | tar -xf -
+          rm /tmp/prepared-cluster/dist.tar.zst
+          just --justfile deploy/cluster/justfile container-load /tmp/prepared-cluster
+          rm -f /tmp/prepared-cluster/nodes.tar.*
           test "$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' kardamom-node-prepared:ci)" = "$EXPECTED_REVISION"
           echo "TF_VAR_prebuilt_node_image=kardamom-node-prepared:ci" >> "$GITHUB_ENV"
-          rm /tmp/cluster-node-artifact/cluster-node-image.tgz
+          echo "KARDAMOM_PREPARED_CLUSTER=/tmp/prepared-cluster" >> "$GITHUB_ENV"
 
-      - name: Install Ansible
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ansible
+      - uses: ./.github/actions/ansible-runner
 
-      # Galaxy resets connections now and then; three tries cover it.
-      - name: Ansible docker connection plugin
-        run: |
-          n=0
-          until ansible-galaxy collection install ansible.posix community.docker community.general; do
-            n=$((n + 1))
-            [ "$n" -ge 3 ] && exit 1
-            sleep 15
-          done
-
-      # The runner image puts pipx's ansible-core first on PATH, and its venv
-      # has no requests. community.docker's container and network modules run
-      # on the controller with that interpreter and need it.
-      - name: Docker API client dependency for the Ansible interpreter
-        run: pipx inject ansible-core requests
-
-      # Images are pushed from inside the control node (REGISTRY_PUSH_NODE
-      # in the justfile), so the runner daemon trusts no registry address.
       - name: Kernel modules for systemd-in-container
         run: |
           # cgroup v2 + systemd-in-container needs this on some runners.
@@ -364,16 +455,14 @@ jobs:
         run: echo "RUNNER_NAME=${{ runner.name }}" >> "$GITHUB_ENV"
 
       # The shard test owns the lifecycle: OpenTofu applies
-      # terraform/containers, Ansible converges the nodes through
-      # ansible/cluster.yml, the shard's gates run, and the cluster is
-      # destroyed on success. The shard's values live in crates/chaos
-      # (Shard::env, the stage table in tests/shards.rs), not here. A
-      # failed shard leaves the cluster up for the diagnostics step; the
-      # runner is ephemeral, so nothing destroys it after.
-      # The shard runner carries no toolchain; just is the one tool the
-      # recipes need.
-      - uses: ./.github/actions/just
-
+      # terraform/containers with the saved node images, Ansible resumes
+      # the nodes and deploys the workloads through ansible/resume.yml, the
+      # shard's gates run, and the cluster is destroyed on success. The
+      # shard's values live in crates/chaos (Shard::env, the stage table
+      # in tests/shards.rs), not here. A failed shard leaves the cluster up
+      # for the diagnostics step; the runner is ephemeral, so nothing
+      # destroys it after. The shard runner carries no toolchain; just is
+      # the one tool the recipes need.
       # The runner stalls for more than 10 s at times (archive copies,
       # cluster restarts). At Aeron's 10 s default, a stall kills a
       # healthy client or media driver. 30 s is the value of the local
