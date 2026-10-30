@@ -263,6 +263,55 @@ fn a_parked_transaction_expires_when_it_waited_too_long() {
     assert_eq!(names(&out), ["R9*:Expired { expected_nonce: 5 }"]);
 }
 
+/// A lookup that no source answers ends without an event. The expiry of
+/// the parked transaction ends it in the filter too, so the next
+/// transaction of the sender asks again, and a source that returned in
+/// the meantime can answer it.
+#[test]
+fn a_sender_asks_again_after_its_unanswered_lookup_expired() {
+    let start = Instant::now();
+    let mut a: Admission<u64> = Admission::new(cfg(), start);
+    assert_eq!(offer(&mut a, tx(1, 5, 1)), ["L"]);
+    assert_eq!(
+        offer(&mut a, tx(1, 6, 2)),
+        Vec::<String>::new(),
+        "one lookup is out"
+    );
+    let mut out = Vec::new();
+    a.sweep(start + Duration::from_secs(4), &mut out);
+    assert_eq!(
+        out.len(),
+        2,
+        "both parked transactions expire: {:?}",
+        names(&out)
+    );
+    assert_eq!(offer(&mut a, tx(1, 5, 3)), ["L"], "the sender asks again");
+    a.on_lookup(sender(1), state(5, 10 * COST, 1), &mut out);
+    out.clear();
+    assert_eq!(offer(&mut a, tx(1, 6, 4)), ["F6"]);
+}
+
+/// A relook that no source answers ends without an event too. The
+/// expiry of the parked transaction ends it in the filter, so the next
+/// gap park of the sender relooks again.
+#[test]
+fn a_sender_relooks_again_after_its_unanswered_relook_expired() {
+    let start = Instant::now();
+    let mut a: Admission<u64> = Admission::new(cfg(), start);
+    let mut out = Vec::new();
+    a.on_lookup(sender(1), state(48, 10 * COST, 390), &mut out);
+    offer(&mut a, tx(1, 49, 1));
+    a.sweep(start + Duration::from_millis(600), &mut out);
+    assert_eq!(names(&out), ["L"], "the relook asks");
+    out.clear();
+    a.sweep(start + Duration::from_secs(5), &mut out);
+    assert_eq!(out.len(), 1, "the park expires: {:?}", names(&out));
+    out.clear();
+    offer(&mut a, tx(1, 49, 2));
+    a.sweep(start + Duration::from_millis(5600), &mut out);
+    assert_eq!(names(&out), ["L"], "the next gap park relooks again");
+}
+
 #[test]
 fn a_transaction_that_waits_for_a_lookup_gets_its_ack_with_the_state() {
     let mut a: Admission<u64> = Admission::new(cfg(), Instant::now());
