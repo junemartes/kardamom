@@ -492,6 +492,9 @@ jobs:
           # The same playbooks and tasks, in kept Python processes (see
           # .github/actions/ansible-runner).
           ANSIBLE_STRATEGY: mitogen_linear
+          # Mitogen starts its sudo and docker transports within this
+          # timeout. Under the load of a case, the 10 s default runs out.
+          ANSIBLE_TIMEOUT: "60"
 
       - name: Collect diagnostics
         if: failure()
