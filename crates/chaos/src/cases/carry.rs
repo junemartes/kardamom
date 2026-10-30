@@ -112,6 +112,19 @@ struct Run<'a> {
 }
 
 impl Step {
+    /// Whether the step runs `just sealer-upgrade-check`, an Ansible play
+    /// of 49 to 94 tasks, before an upgrade transaction.
+    pub(crate) fn runs_the_check_play(self) -> bool {
+        matches!(
+            self,
+            Self::VersionsOn
+                | Self::HeldOfferAfterDowngrade
+                | Self::WindowOn
+                | Self::WindowOffOn
+                | Self::LeaderKillAtSwitch
+        )
+    }
+
     /// The CI name.
     pub(crate) fn name(self) -> &'static str {
         match self {

@@ -39,6 +39,7 @@ fn only_the_nightly_and_deploy_tooling_cases_keep_a_longer_bound() {
         Case::DeployBrokenImage,
         Case::NodeReplaceExecutor,
         Case::NodeReplaceSealer,
+        Case::Carry(crate::cases::carry::Step::WindowOffOn),
     ] {
         assert!(
             case.deadline(&knobs) > knobs.case_deadline,
@@ -46,4 +47,11 @@ fn only_the_nightly_and_deploy_tooling_cases_keep_a_longer_bound() {
             case.name()
         );
     }
+}
+
+#[test]
+fn a_carry_step_without_the_check_play_has_the_case_deadline() {
+    let knobs = Knobs::read(&[]).unwrap();
+    let step = crate::cases::carry::Step::EgressRestart;
+    assert_eq!(Case::Carry(step).deadline(&knobs), knobs.case_deadline);
 }

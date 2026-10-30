@@ -9,10 +9,11 @@ use crate::knobs::Knobs;
 /// rebuilds a whole fleet, and the nightly job has no per-case budget.
 const NIGHTLY_DEADLINE: Duration = Duration::from_mins(60);
 
-/// The bound of a case whose fault is the deploy tooling itself: a full
-/// Ansible deploy play, or a new machine that Terraform makes and the
-/// substrate play provisions. One play takes minutes without any load,
-/// so these cases cannot meet the case deadline.
+/// The bound of a case that runs the deploy tooling itself: a full
+/// Ansible deploy play, a new machine that Terraform makes and the
+/// substrate play provisions, or the upgrade check play before an
+/// upgrade transaction. One play takes minutes on the CI runner, so these
+/// cases cannot meet the case deadline.
 const DEPLOY_DEADLINE: Duration = Duration::from_mins(30);
 
 impl Case {
@@ -29,6 +30,7 @@ impl Case {
             Self::DeployBrokenImage | Self::NodeReplaceExecutor | Self::NodeReplaceSealer => {
                 DEPLOY_DEADLINE
             }
+            Self::Carry(step) if step.runs_the_check_play() => DEPLOY_DEADLINE,
             _ => k.case_deadline,
         }
     }

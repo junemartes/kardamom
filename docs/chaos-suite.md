@@ -36,7 +36,7 @@ Every shard runs these stages in this order.
 
 ### Chaos case spine
 
-Every chaos case follows the same steps, within the case deadline (`CHAOS_CASE_S`, 180 s). A case that runs past its deadline fails at once, with the deadline in the failure text. The nightly cases `executor-restart-storm`, `sealer-fleet-total-wipe-recover` and `resize-scale-out-in` have a 60 min deadline. The cases that run the deploy tooling itself, `deploy-broken-image`, `node-replace-executor` and `node-replace-sealer`, have a 30 min deadline: one Ansible play takes minutes without any load.
+Every chaos case follows the same steps, within the case deadline (`CHAOS_CASE_S`, 180 s). A case that runs past its deadline fails at once, with the deadline in the failure text. The nightly cases `executor-restart-storm`, `sealer-fleet-total-wipe-recover` and `resize-scale-out-in` have a 60 min deadline. The cases that run the deploy tooling itself, `deploy-broken-image`, `node-replace-executor` and `node-replace-sealer`, have a 30 min deadline: one Ansible play takes minutes without any load. So do the carry steps that run `just sealer-upgrade-check` before an upgrade transaction.
 
 1. Pick a funded account and start the case load. The load window is the deadline. The load ends its submissions when the case body ends. A case that measures a catch-up ends the load before the measurement, so that new traffic does not hold the lag open.
 2. Wait for the injection gate. See [Gates](#gates).
