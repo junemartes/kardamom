@@ -5,8 +5,9 @@ use std::time::Duration;
 use super::Case;
 use crate::knobs::Knobs;
 
-/// The bound of a nightly case. Each one repeats a fault many times or
-/// rebuilds a whole fleet, and the nightly job has no per-case budget.
+/// The bound of a case of the nightly shard. Some repeat a fault many
+/// times or rebuild a whole fleet, and the nightly job has no per-case
+/// budget.
 const NIGHTLY_DEADLINE: Duration = Duration::from_mins(60);
 
 impl Case {
@@ -16,11 +17,10 @@ impl Case {
     /// cause instead of pushing its shard past the job limit.
     #[must_use]
     pub fn deadline(self, k: &Knobs) -> Duration {
-        match self {
-            Self::ExecutorRestartStorm
-            | Self::SealerFleetTotalWipeRecover
-            | Self::ResizeScaleOutIn => NIGHTLY_DEADLINE,
-            _ => k.case_deadline,
+        if crate::Shard::Integrity.cases().contains(&self.name()) {
+            NIGHTLY_DEADLINE
+        } else {
+            k.case_deadline
         }
     }
 

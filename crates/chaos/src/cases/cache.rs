@@ -337,6 +337,25 @@ pub(crate) async fn redis_primary_kill(h: &mut Harness) -> anyhow::Result<()> {
 /// The mirror write retries summed over the executor nodes. A mirror
 /// that retries is alive and waits for Redis. `None` when a mirror
 /// exporter does not answer: a partial sum is no baseline.
+/// The write retries of every mirror before the fault. A mirror that a
+/// case before restarted answers once its exporter is up, so the read
+/// waits for every mirror; a mirror still dark after the wait fails the
+/// case, since a missing baseline must not read as zero.
+async fn mirror_retry_baseline(h: &Harness, ctx: &str) -> anyhow::Result<i64> {
+    let outcome = poll::until(Budget::secs(60, 2), |_| async move {
+        Ok::<_, anyhow::Error>(mirror_write_retries(h).await)
+    })
+    .await?;
+    outcome
+        .or_fail(|t| {
+            crate::chaos_fail!(
+                "{ctx}: a mirror exporter does not answer the write-retry baseline within {}s",
+                t.as_secs()
+            )
+        })
+        .map(|(retries, _)| retries)
+}
+
 async fn mirror_write_retries(h: &Harness) -> Option<i64> {
     mirror_metrics(h, MIRROR_WRITE_RETRIES)
         .await
@@ -357,9 +376,7 @@ pub(crate) async fn redis_total_loss_recover(h: &mut Harness) -> anyhow::Result<
     let ctx = "redis-total-loss-recover";
     wait_readers_connected(h, ctx).await?;
     let recovery = CacheRecovery::capture(h).await?;
-    let retries0 = mirror_write_retries(h).await.ok_or_else(|| {
-        crate::chaos_fail!("{ctx}: a mirror exporter does not answer the write-retry baseline")
-    })?;
+    let retries0 = mirror_retry_baseline(h, ctx).await?;
     let job = SavedJob::capture(&h.nomad, "redis").await?;
     crate::log(format!(
         "{ctx}: stop the whole redis job (primary, replica, three sentinels) for {}s",

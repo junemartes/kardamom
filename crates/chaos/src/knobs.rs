@@ -381,7 +381,7 @@ impl Knobs {
         Ok(Self {
             chain_id: env.u64("CHAIN_ID", 412_346)?,
             tps: env.nonzero_u32("CHAOS_TPS", 100)?,
-            case_deadline: env.secs("CHAOS_CASE_S", 600)?,
+            case_deadline: env.secs("CHAOS_CASE_S", 180)?,
             load_max_gap: env.u64("LOAD_MAX_GAP", 5)?,
             load_retry: env.u32("LOAD_RETRY", 2)?,
             restart_slo: env.secs("CHAOS_RESTART_SLO_S", 60)?,

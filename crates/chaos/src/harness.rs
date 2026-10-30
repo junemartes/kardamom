@@ -237,11 +237,13 @@ impl Harness {
         let verdict = load.finish().await?;
         case.judge_load(&verdict)?;
         // The fleet convergence and the recovery probe read independent
-        // facts, so they run at once.
-        tokio::try_join!(
-            self.assert_executors_converged(case.name()),
-            self.probe_recovery(case, account)
-        )?;
+        // facts, so they run at once. The probe submits through both
+        // ingresses, so it starts once both answer: a restarted ingress
+        // binds its JSON-RPC port after it joins the cluster.
+        tokio::try_join!(self.assert_executors_converged(case.name()), async {
+            self.assert_ingress_pair_live(case.name()).await?;
+            self.probe_recovery(case, account).await
+        })?;
         self.validator_verdict().await
     }
 

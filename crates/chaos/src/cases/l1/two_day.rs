@@ -104,22 +104,18 @@ async fn through_outage(
         .count_lines(CLUSTER_TASK, "snapshot TAKEN", Streams::StdoutOnly)
         .await?;
     let after_t1 = await_posting(h, 0, h.knobs.restart_slo, ctx).await?;
-    // T2 runs while the frames of T3 flow. The da-watcher's restart
-    // resumes after the sealer's origin, and halts on the lying anchor
-    // again. Its cursor file holds the confirmed origin, so it never
-    // stands past the sealer. T3: the floor passes the cursor the batcher
-    // resumed at in T1, after T2 ends. The batcher kept posting, so its
-    // live cursor moved with the chain. The frames and a new snapshot
-    // bound the hold.
+    // T2: a deploy of the same images. The da-watcher's restart resumes
+    // after the sealer's origin, and halts on the lying anchor again. Its
+    // cursor file holds the confirmed origin, so it never stands past the
+    // sealer. T3 starts after T2: the followers run again, so the batcher
+    // keeps posting, and its live cursor moves with the chain while the
+    // floor passes the cursor the batcher resumed at in T1. The frames
+    // and a new snapshot bound the hold.
+    redeploy_followers(h, ctx).await?;
     crate::log(format!(
         "{ctx}: T3: load until the floor passes the T1 cursor"
     ));
-    let (redeployed, floor) = tokio::join!(
-        redeploy_followers(h, ctx),
-        hold_until_floor_passes(h, rx_t1, snapshots0, Duration::ZERO, ctx)
-    );
-    redeployed?;
-    let (delta, held) = floor?;
+    let (delta, held) = hold_until_floor_passes(h, rx_t1, snapshots0, Duration::ZERO, ctx).await?;
     let at_t3 =
         h.probes.batcher_posts().await.ok_or_else(|| {
             crate::chaos_fail!("{ctx}: the batcher exporter does not answer at T3")

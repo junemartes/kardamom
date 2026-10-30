@@ -160,8 +160,10 @@ impl Step {
                 Nodes.exec(&view.node, CLEAR).await?;
             }
             Action::ObserveAndArm => {
+                // The arm prints nothing into the task list: some
+                // iptables builds print the rule that `-C` checks.
                 let script = format!(
-                    "{}\n{}\n( {ARM} ) || exit 1",
+                    "{}\n{}\n( {ARM} ) >/dev/null || exit 1",
                     self.verify_script(),
                     Self::tasks_script()
                 );
@@ -214,8 +216,17 @@ impl Step {
             .lines()
             .skip_while(|line| *line != TASKS_MARK)
             .skip(1)
+            .filter(|line| Self::is_task_row(line))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Whether a line is a row of the task list: a 64-digit container id,
+    /// then its state. Any other line of the exec, such as a message of
+    /// iptables on stderr, is not a task.
+    fn is_task_row(line: &str) -> bool {
+        line.split_once(' ')
+            .is_some_and(|(id, _)| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
     }
 
     fn judge_checks(&self, output: &str, isolated: bool) -> anyhow::Result<()> {
@@ -254,10 +265,11 @@ mod script_tests {
 
     #[test]
     fn the_task_list_is_every_line_after_its_mark() {
-        let output = "0=1\n1=1\n__tasks__\nabc true 2026\ndef true 2026";
+        let (a, d) = ("a".repeat(64), "d".repeat(64));
+        let output = format!("0=1\n1=1\n__tasks__\n{a} true 2026\n{d} true 2026");
         assert_eq!(
-            super::Step::tasks_of(output),
-            "abc true 2026\ndef true 2026"
+            super::Step::tasks_of(&output),
+            format!("{a} true 2026\n{d} true 2026")
         );
         assert_eq!(super::Step::tasks_of("0=1\n"), "");
     }
@@ -275,5 +287,17 @@ mod script_tests {
         assert!(Check::answered("0=1\n1=0\n2=1\n", 2).unwrap());
         assert!(!Check::answered("0=1\n1=0\n", 1).unwrap());
         assert!(Check::answered("0=1\n", 3).is_err());
+    }
+
+    #[test]
+    fn the_task_list_holds_only_container_rows() {
+        let id = "a".repeat(64);
+        let output = format!(
+            "0=1\n__tasks__\n{id} true 2026-10-30T12:11:04Z\nKDM_CHAOS_CP  all opt -- in * out *\n"
+        );
+        assert_eq!(
+            super::Step::tasks_of(&output),
+            format!("{id} true 2026-10-30T12:11:04Z")
+        );
     }
 }

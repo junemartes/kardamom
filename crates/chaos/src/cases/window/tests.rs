@@ -4,11 +4,7 @@ use super::*;
 fn a_regular_case_has_the_three_minute_deadline_and_its_load_covers_it() {
     let knobs = Knobs::read(&[]).unwrap();
     assert_eq!(knobs.case_deadline, Duration::from_mins(3));
-    for case in [
-        Case::GracefulExecutor,
-        Case::NodeFailureExecutor,
-        Case::L1Liar,
-    ] {
+    for case in [Case::HardExecutor, Case::NodeFailureExecutor, Case::L1Liar] {
         assert_eq!(
             case.deadline(&knobs),
             Duration::from_mins(3),
@@ -36,6 +32,8 @@ fn only_the_nightly_cases_keep_a_longer_bound() {
         Case::ExecutorRestartStorm,
         Case::SealerFleetTotalWipeRecover,
         Case::ResizeScaleOutIn,
+        Case::NodeReplaceExecutor,
+        Case::TwoDayOutage,
     ] {
         assert!(
             case.deadline(&knobs) > knobs.case_deadline,
@@ -55,11 +53,7 @@ fn a_carry_step_without_the_check_play_has_the_case_deadline() {
 #[test]
 fn the_deploy_tooling_cases_have_the_case_deadline() {
     let knobs = Knobs::read(&[]).unwrap();
-    for case in [
-        Case::DeployBrokenImage,
-        Case::NodeReplaceExecutor,
-        Case::NodeReplaceSealer,
-    ] {
+    for case in [Case::DeployBrokenImage, Case::NodeReplaceSealer] {
         assert_eq!(
             case.deadline(&knobs),
             knobs.case_deadline,

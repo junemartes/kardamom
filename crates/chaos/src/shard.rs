@@ -105,14 +105,10 @@ impl Shard {
     }
 
     const EXECUTOR_CASES: &'static [&'static str] = &[
-        "graceful-executor",
         "hard-executor",
         "node-failure-executor",
-        "node-replace-executor",
         "state-checkpoint-restore",
-        "checkpoint-corrupt-recover",
         "checkpoint-disk-full",
-        "replay-window-resync",
         "deploy-broken-image",
     ];
 
@@ -146,12 +142,10 @@ impl Shard {
             ],
             Self::Sequencer => Self::SEQUENCER_CASES,
             Self::Cluster => &[
-                "cluster-leader-kill",
                 "raft-leader-one-way-partition",
                 "raft-leader-packet-loss",
                 "raft-leader-packet-delay",
                 "cluster-follower-kill",
-                "cluster-member-rejoin",
                 "cluster-two-blank-recover",
                 "node-replace-sealer",
             ],
@@ -185,8 +179,6 @@ impl Shard {
             Self::CombinedOrdering => &[
                 "ingress-sealer-loss-recover",
                 "ingress-sequencer-loss-recover",
-                "sequencer-sealer-loss-recover",
-                "ingress-sequencer-sealer-loss-recover",
                 "ingress-sequencer-sealer-reverse",
             ],
             // The executors down with another class: the sealers, the
@@ -198,7 +190,6 @@ impl Shard {
                 "executor-sealer-loss-recover",
                 "executor-sealer-validator-recover",
                 "ingress-executor-loss-recover",
-                "read-path-loss-recover",
                 "sequencer-executor-redis-loss",
             ],
             Self::Retention => &RETENTION_CASES,
@@ -209,7 +200,6 @@ impl Shard {
             Self::L1 => &[
                 "l1-liar",
                 "l1-null-receipts",
-                "two-day-outage",
                 "batcher-outage-past-retention",
             ],
             // The loss and the disagreement of the L1 follower's
@@ -218,14 +208,12 @@ impl Shard {
             // limit.
             Self::Follower => &[
                 "l1-transport-refusals",
-                "l1-provider-unresponsive",
                 "follower-instance-loss",
                 "follower-total-loss",
                 "follower-disagreement",
             ],
             // The mirror rebuild runs last: it flushes the projection.
             Self::Cache => &[
-                "mirror-backlog-client-restart",
                 "redis-partition-ingress",
                 "redis-primary-kill",
                 "redis-primary-freeze",
@@ -243,9 +231,26 @@ impl Shard {
             // shard map at a later version. The sequencer shard kills one
             // replica of each lane on its node; the other two replica
             // drills run here, first.
+            //
+            // The cases after the drills moved here so that each regular
+            // shard fits its job. Another case of a regular shard covers
+            // the failure mode of each one; docs/chaos-suite.md lists the
+            // pairs.
             Self::Integrity => &[
                 "sequencer-replica-kill-lane0-node1",
                 "sequencer-replica-kill-lane1-node0",
+                "graceful-executor",
+                "replay-window-resync",
+                "checkpoint-corrupt-recover",
+                "node-replace-executor",
+                "cluster-leader-kill",
+                "cluster-member-rejoin",
+                "sequencer-sealer-loss-recover",
+                "ingress-sequencer-sealer-loss-recover",
+                "read-path-loss-recover",
+                "mirror-backlog-client-restart",
+                "l1-provider-unresponsive",
+                "two-day-outage",
                 "executor-restart-storm",
                 "sealer-fleet-total-wipe-recover",
                 "resize-scale-out-in",
@@ -385,8 +390,15 @@ impl Shard {
             | Self::Fleet
             | Self::Coordinated
             | Self::CombinedOrdering
-            | Self::CombinedExec
-            | Self::Integrity => DeployVars::default(),
+            | Self::CombinedExec => DeployVars::default(),
+            // The fault proxy for the L1 cases of the nightly shard. It
+            // forwards every read while no fault is set.
+            Self::Integrity => DeployVars {
+                l1_fault_proxy: true,
+                indexer_poll_s: Some(2),
+                da_watcher_silence_s: Some(30),
+                ..DeployVars::default()
+            },
         }
     }
 
@@ -592,6 +604,18 @@ mod tests {
             [
                 "sequencer-replica-kill-lane0-node1",
                 "sequencer-replica-kill-lane1-node0",
+                "graceful-executor",
+                "replay-window-resync",
+                "checkpoint-corrupt-recover",
+                "node-replace-executor",
+                "cluster-leader-kill",
+                "cluster-member-rejoin",
+                "sequencer-sealer-loss-recover",
+                "ingress-sequencer-sealer-loss-recover",
+                "read-path-loss-recover",
+                "mirror-backlog-client-restart",
+                "l1-provider-unresponsive",
+                "two-day-outage",
                 "executor-restart-storm",
                 "sealer-fleet-total-wipe-recover",
                 "resize-scale-out-in"

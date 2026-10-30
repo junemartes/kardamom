@@ -505,8 +505,31 @@ fn a_floor_is_looked_up_when_a_park_asked_and_a_source_answered() {
 #[test]
 fn the_tables_are_the_shards() {
     let names = |table: &[Combined]| -> Vec<&str> { table.iter().map(|c| c.case.name()).collect() };
-    assert_eq!(names(&ALL), Shard::CombinedOrdering.cases());
-    assert_eq!(names(&ALL_EXEC), Shard::CombinedExec.cases());
+    // A table case runs on its shard, in table order, or on the nightly
+    // shard.
+    let on = |table: &[Combined], shard: Shard| -> Vec<&str> {
+        names(table)
+            .into_iter()
+            .filter(|n| shard.cases().contains(n))
+            .collect()
+    };
+    assert_eq!(
+        on(&ALL, Shard::CombinedOrdering),
+        Shard::CombinedOrdering.cases()
+    );
+    assert_eq!(
+        on(&ALL_EXEC, Shard::CombinedExec),
+        Shard::CombinedExec.cases()
+    );
+    assert!(names(&ALL).iter().chain(&names(&ALL_EXEC)).all(|n| {
+        [
+            Shard::CombinedOrdering,
+            Shard::CombinedExec,
+            Shard::Integrity,
+        ]
+        .iter()
+        .any(|shard| shard.cases().contains(n))
+    }));
     for c in ALL.iter().chain(&ALL_EXEC) {
         // A stall needs the sealers down; a seal-only case keeps them.
         assert_eq!(
