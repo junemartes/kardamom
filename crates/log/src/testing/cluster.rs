@@ -295,6 +295,32 @@ impl AeronTestCluster {
             .collect())
     }
 
+    /// The distinct error observations of the media driver of node `i`,
+    /// read with Aeron's `ErrorStat` in the container. In external mode
+    /// this returns an empty string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the docker command fails to run.
+    pub async fn driver_errors(&self, i: usize) -> anyhow::Result<String> {
+        let Node::Container(c) = &self.nodes[i] else {
+            return Ok(String::new());
+        };
+        let script = "java -cp /opt/aeron/aeron-all.jar \
+            -Daeron.dir=\"$AERON_DIR\" io.aeron.samples.ErrorStat";
+        let out = tokio::process::Command::new("docker")
+            .args(["exec", c.container.id(), "sh", "-c", script])
+            .output()
+            .await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "ErrorStat failed with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
     /// Bring up a single-node cluster, spawn an [`AeronRuntime`] against
     /// its bind-mounted `aeron.dir`, and build a [`LogConfig`] whose
     /// `tx_data` channel is a plain IPC template rooted at

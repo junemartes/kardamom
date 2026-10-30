@@ -50,7 +50,7 @@ nomad_server_expect: 1
 # replacement takes minutes of provisioning anyway. Production keeps the
 # Nomad default of 10 s: a dedicated host does not stall, and a dead host
 # must lose its allocations quickly. NOMAD_HEARTBEAT_GRACE sets another
-# value on the local profile only: the chaos suite uses 30 s.
+# value on the local profile only; the chaos suite keeps 60 s.
 nomad_heartbeat_grace: >-
   {{ (lookup('env', 'NOMAD_HEARTBEAT_GRACE') | default('60s', true)) if deployment_profile == 'local' else '10s' }}
 # The Consul HTTP and DNS listener address. Nomad and the applications use

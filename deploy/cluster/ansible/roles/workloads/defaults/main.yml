@@ -519,7 +519,8 @@ workloads_sealer_admin_port: "{{ cluster_ports.admin }}"
 # with the registered cluster.
 workloads_sealer_job:
   name: cluster
-  retries: 100
+  # The allocation wait of the sealer: 300 polls of 1 s are 5 minutes.
+  retries: 300
   vars:
     cluster_retention: "{{ workloads_cluster_retention }}"
     cluster_snapshot_interval_s: "{{ workloads_cluster_snapshot_s }}"

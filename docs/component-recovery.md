@@ -114,6 +114,40 @@ These reuse the existing Java fixtures and start no chain stack. The Raft group
 still uses real scheduling and local Aeron transport; the actor clock does not accelerate
 its consensus protocol.
 
+`just test-component sealer-raft-network`, `sealer-raft-members` and
+`sealer-raft-fleet` run twelve checks on three real member processes. Each
+member runs the production `ClusterNode` main class in its own JVM, with the
+deployed tick, Raft timeouts and member settings. Each member has its own
+loopback address, its directories on tmpfs, and a shared driver for its
+member feed. The members name each other through a hosts file, as the deploy
+names them through Consul. A test client speaks the production ingress and
+egress codecs, and each member feed gives the canonical frames of that member.
+Every check requires one leader per term from the TERM lines of all members,
+and the same canonical frames, byte for byte, on every member.
+
+The checks cover a one-way partition, 10 % loss and a 250 ms delay of the
+frames from the leader to its peers, a CPU squeeze of every member, a leader
+kill, a follower kill with a snapshot restore, a rejoin after a log purge, two
+blank members with an offline copy, a node replacement on a new address, a
+quorum loss, a total loss, and the sealer part of a fleet wipe with a seed.
+A test endpoint supplier in each member driver applies the link faults; the
+receiving member drops, loses or holds the frames from the faulted member.
+Each check takes 15 to 55 seconds. A member stops when its test JVM dies, and
+the next group deletes the tmpfs directories of dead test JVMs.
+
+The squeeze check also runs a consumer session with the production cursor
+rules, as the validator reads the stream. Its stream must reach the live head
+with no gap and equal the members' order. `just test-component reconstruct-seed`
+posts two blocks to Anvil, rebuilds the state from the L1 log and the DA proxy,
+and writes the sealer seed of the fleet wipe at the posted head.
+
+Two optional member settings serve these checks. `kardamom.cluster.adminHost`
+binds the admin endpoint to one address, so each member on one host keeps the
+one admin port that its peers ask. `kardamom.cluster.clockClass` names the
+cluster clock class. The two-blank check moves a test clock past the 60 s
+startup canvass, as that wall time would. Both settings are unset in the
+deploy, and the defaults stay the same.
+
 Java targets force test execution and remove their selected old XML reports before
 running. The runner requires fresh reports, preserves them with the logs, names
 every passing/failing test, and rejects skipped or missing expected tests even
@@ -137,6 +171,61 @@ containers and network after each test. It does not reproduce CPU-pressure TILT,
 whole-chain fallback or Nomad placement. Both negative controls fail at recovery:
 not replacing the cached connection, and loading a script only once before failover.
 The existing Docker CI job runs this target.
+
+`just test-component executor-recovery` runs fifteen executor recovery checks.
+Each executor is a child process of the test binary. It runs the production state
+startup in `kardamom_executor::state`, the engine, the MDBX writer, the checkpoint
+rounds, the checkpoint server and the replay repair. The binary uses the same state
+module. The parent plays the sealer: it appends production egress frames to a
+retained log. Each process reads the log through one replay session, from its
+durable cursor and with an overlap below it. The parent can set a retention floor,
+so that an old cursor gets `REPLAY_UNAVAILABLE`, and can take every member away.
+
+The cases stop processes with SIGTERM, kill them with SIGKILL, wipe their state or
+checkpoints, corrupt one image byte, replace a node with empty storage on a new
+address, and start a build that fails its start checks. They also rebuild an
+executor image from DA batches through the production batch codec and reconstruction.
+Every case ends with each replica stopped at the same head. Its DB must pass the
+integrity sweep and equal an undisturbed replica table by table. Each process must
+publish its boundaries in order, and no transaction may get two receipt hashes. A
+replica that kept its disk publishes no boundary twice. The checks also require the
+restore, fetch, quarantine and resume log lines in their order, `/ready` before each
+rolling step, and the committed nonce and receipt answers of a restarted replica.
+
+Storage is on tmpfs when it has room. A process kill keeps the page cache, so the
+fault is a process crash, not a power loss. The fifteen checks take about 5 seconds
+of test execution in parallel on a quiet host; compilation adds time. Nomad
+placement, node containers, Consul records, image rollout and the deploy gate stay
+in the chaos shard; each ported case names them under `cluster_only_checks`.
+
+`just test-component executor-exec-stream` adds the executor stream on a real media
+driver and archive in one disposable container. A stopped and a killed replica each
+record a new session, and its recorded cursor moves. While one replica is dead, the
+cursors of its peers move. `just test-component sealer-record-lag` runs the existing
+sealer checks that take the best cursor over the executors.
+
+`just test-component executor-checkpoint-enospc` runs one executor process in a
+disposable container, with its checkpoints and block log on a 16-MiB tmpfs. The
+parent fills the tmpfs until the kernel refuses a write. The block log and the base
+round must fail with error 28 while the same process applies transactions. After the
+filler goes, a new base above the fault must restore with its log past the base.
+
+`just test-component executor-total-wipe-l1` posts the blocks with the production
+batch post to a real Anvil and the DA store. Every state and checkpoint goes, and the
+image comes from the `BatchPosted` scan and the DA reads alone. Each executor must
+resume from the image cursor with no restore or fetch.
+
+`just test-component state-mirror-total-loss` and `cache-sentinel-total-loss` kill a
+primary, a replica and three Sentinels at once. Fixed host ports stand in for stable
+service addresses. While the group is down, the production reader degrades without a
+stall and the mirror marks a rebuild. The group returns empty, the Sentinels name a
+primary, and the mirror rebuilds every account once a checkpoint reaches its first
+live batch.
+
+`just test-component transport-mds-remove` removes MDS receive destinations while two
+streams run, and returns a node to the same control endpoint three times. Every frame
+of the live streams must arrive in order, and the driver must log no error. On the
+deployed Aeron 1.45 driver, this does not reproduce the driver crash of issue 545.
 
 `just test-component state-writer-crash` runs two real durable MDBX process-crash
 checks in about 0.3 seconds of test execution. A child runs the production writer.
@@ -188,6 +277,34 @@ real integration. `partial` means that named local tests validate some boundary
 assumptions. It does not mean the complete distributed case has passed locally.
 Forty-one cases have partial mappings. No full case is marked locally validated yet.
 
+`just component-catalog` checks the catalog. `just component-summary` prints the
+planned, partial and ported counts for each family. A case is ported when its
+status is `ported`. The status `ported` and `full_case_locally_validated: true`
+always go together. A ported case needs:
+
+- At least one local test.
+- A local test in a suite with a `ci_mode`, so that CI runs it. The modes are
+  `in-process`, `docker` (a real container dependency) and `gradle` (the Java
+  sealer).
+- A negative control for one of its local tests. A control that names tests
+  (`test`, `tests` or `failed_tests`) guards only those tests. A control that
+  names no test guards every test of its suite.
+
+The optional case field `cluster_only_checks` is a list of strings. Each string
+names a check that needs the deployed cluster, and gives the reason. The cluster
+chaos suite keeps these checks.
+
+The isolated component suite is the pull request gate for recovery behaviour. The
+cluster chaos suite runs nightly. Every nightly chaos failure gets an isolated test
+that reproduces it:
+
+1. Write the test against the real actor, as the steps below describe.
+2. Add the test to the `tests` of its suite in `local_suites`.
+3. Add `{"suite": ..., "test": ...}` to the `local_tests` of the failed case.
+
+The `local_tests` entry links the test to the failed case. If the failure needs
+the deployed cluster, add the check to `cluster_only_checks` of the case instead.
+
 For each remaining case:
 
 1. Review the case's fault and recovery assertions against the production actor.
@@ -204,7 +321,9 @@ For each remaining case:
    evidence. Keep the original deadlines and workload unless a separate reviewed
    experiment requires a change.
 
-Raft partition/quorum-loss safety needs further real-member fault cases. Sentinel promotion needs
+The member-process Raft checks cover partition, loss, delay, squeeze, kill,
+wipe and quorum-loss cases; kernel queues and whole-node power loss stay in
+the cluster suite. Sentinel promotion needs
 real Redis/Sentinel processes. Checkpoint durability needs real storage and crash
 or syscall faults. Nomad placement, container ownership, advertised addresses and
 kernel network scheduling need integration checks. Mocking those guarantees would
