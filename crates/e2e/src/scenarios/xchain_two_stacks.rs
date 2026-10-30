@@ -375,8 +375,8 @@ impl<'a> ForwardLeg<'a> {
     }
 
     /// B's durable lane cursor advanced past the delivered seq.
-    fn assert_forward_cursor(&self) -> Result<()> {
-        assert_cursor_at_least(self.b_cursor_file, 1, "B's A-lane")
+    async fn assert_forward_cursor(&self) -> Result<()> {
+        assert_cursor_at_least(self.b_cursor_file, 1, "B's A-lane").await
     }
 }
 
@@ -407,7 +407,7 @@ pub async fn forward_leg(
 
     leg.await_forward_delivery().await?;
     leg.settle_forward_state().await?;
-    leg.assert_forward_cursor()?;
+    leg.assert_forward_cursor().await?;
 
     Ok(ForwardOutcome {
         receiver_on_b: leg.receiver_on_b,
@@ -474,7 +474,7 @@ pub async fn callback_leg(
         .await?;
 
     // A's durable cursor for the B lane advanced past the response.
-    assert_cursor_at_least(a_cursor_file, 1, "A's B-lane")
+    assert_cursor_at_least(a_cursor_file, 1, "A's B-lane").await
 }
 
 #[cfg(test)]
