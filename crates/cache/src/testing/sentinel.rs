@@ -196,6 +196,11 @@ impl Fixture {
         .expect("the Sentinels must name a primary after the total loss");
     }
 
+    /// The Sentinel at `index`.
+    pub fn sentinel_at(&self, index: usize) -> &ContainerAsync<GenericImage> {
+        &self.sentinels[index]
+    }
+
     fn all(&self) -> impl Iterator<Item = &ContainerAsync<GenericImage>> {
         [&self.primary, &self.replica]
             .into_iter()
@@ -311,10 +316,15 @@ impl Fixture {
     }
 
     async fn signal(&self, signal: &str) {
+        Self::send(self.primary.id(), signal).await;
+    }
+
+    /// Send `signal` to the main process of the container `id`.
+    pub async fn send(id: &str, signal: &str) {
         let output = tokio::time::timeout(
             Duration::from_secs(5),
             tokio::process::Command::new("docker")
-                .args(["kill", "--signal", signal, self.primary.id()])
+                .args(["kill", "--signal", signal, id])
                 .kill_on_drop(true)
                 .output(),
         )

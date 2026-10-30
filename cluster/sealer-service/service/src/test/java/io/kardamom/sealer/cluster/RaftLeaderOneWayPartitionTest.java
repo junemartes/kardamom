@@ -43,7 +43,7 @@ class RaftLeaderOneWayPartitionTest {
     @InterruptAfter(value = 120, unit = TimeUnit.SECONDS)
     void the_peers_of_a_leader_that_cannot_send_elect_a_new_leader_and_the_old_one_stays_up() {
         try (LocalSealers group = new LocalSealers(dir, 3, LocalSealers.Settings.DEFAULT);
-             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints)) {
+             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
             final SealerNode.View before = group.awaitLeader(Duration.ofSeconds(20));
             IntStream.range(0, 3).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));

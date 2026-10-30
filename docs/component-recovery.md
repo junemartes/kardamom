@@ -318,6 +318,11 @@ always go together. A ported case needs:
   (`test`, `tests` or `failed_tests`) guards only those tests. A control that
   names no test guards every test of its suite.
 
+Every test of a suite needs a measured runtime in
+`scripts/ci/component-timings.json`, in seconds, keyed `suite::test`. The CI shard
+plan uses it. A port PR adds the runtimes of its new tests; `just component-catalog`
+fails without them.
+
 A suite can have the optional field `test_timeout_s`: the per-test limit in CI, an
 integer from 60 to 120. The default is 60. A value above 60 needs the field
 `test_timeout_reason`.
