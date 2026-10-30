@@ -1,17 +1,23 @@
 name: CI
 
 on:
+  # A push to a base branch saves the build caches. A pull request only
+  # restores them (.github/actions/rust-build-cache).
   push:
-    branches: [main]
+    branches: [main, 'integration/**']
   pull_request:
   # Manual trigger. The three e2e workflows already have one; CI lacking it
   # meant that when GitHub stopped delivering `pull_request` events for a
   # branch, the lint/test lane was the one lane with no way to run at all.
   workflow_dispatch:
 
+# A new push to a pull request cancels its older run. A push to a base
+# branch never cancels a run: that run saves the build caches, and the
+# base branch gets a new merge often. A newer push waits, and GitHub keeps
+# only the newest waiting run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,7 +52,11 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+      # The check-profile caches. This job saves them for the style job.
       - uses: ./.github/actions/rust-build-cache
+        with:
+          shared-key: check
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   # Mechanical checks from docs/STYLE.md (clippy pedantic, unreachable_pub,
@@ -70,6 +80,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
       - uses: ./.github/actions/rust-build-cache
+        with:
+          shared-key: check
+          save-if: false
       - uses: ./.github/actions/just
       - run: just style
       # The format registry against the base branch (docs/formats.md). The
@@ -161,6 +174,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v0-rust-nostd
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo check -p kardamom-types -p kardamom-exec-core --no-default-features --target riscv32imac-unknown-none-elf --locked
 
   # The sealer's JUnit suite (~2,250 lines: failover, replay, snapshot
@@ -200,10 +214,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: ./.github/actions/just
-      # A release build of one test: its own rust-cache key.
+      # A release build of one test. It restores the release caches that
+      # the allocation gate saves.
       - uses: ./.github/actions/rust-build-cache
         with:
-          key: eest
+          shared-key: release
+          save-if: false
       - name: Fixture tag
         id: eest
         run: echo "tag=$(just eest-tag)" >> "$GITHUB_OUTPUT"
@@ -234,7 +250,12 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+      # The dev-profile caches. This job compiles every target of the
+      # workspace, so it saves them for the other dev-profile jobs.
       - uses: ./.github/actions/rust-build-cache
+        with:
+          shared-key: dev
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo test --workspace --all-targets --locked
       - name: Component evidence runner checks
         run: python3 scripts/tests/test_components.py
@@ -255,6 +276,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
       - uses: ./.github/actions/rust-build-cache
+        with:
+          shared-key: dev
+          save-if: false
       - run: cargo test --workspace --doc --locked
 
   forge-build:
@@ -373,10 +397,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
       - uses: dtolnay/rust-toolchain@stable
-      # The DHAT build: its own rust-cache key.
+      # The DHAT build in the release profile. It saves the release
+      # caches, which the EEST job restores too.
       - uses: ./.github/actions/rust-build-cache
         with:
-          key: alloc-gate
+          shared-key: release
+          save-if: ${{ github.event_name == 'push' }}
       - uses: ./.github/actions/just
       - name: DHAT allocation ceilings (perf/alloc-baselines.env)
         run: just alloc-gate

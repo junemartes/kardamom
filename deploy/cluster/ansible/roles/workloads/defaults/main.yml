@@ -397,6 +397,18 @@ workloads_egress_job_vars:
 # (nomad/executor.nomad.hcl): "on" or "off". Empty keeps the job's "off"
 # default.
 workloads_checkpoint_log: "{{ lookup('env', 'KARDAMOM_CHECKPOINT_LOG') }}"
+# The seconds between two executor checkpoints
+# (nomad/executor.nomad.hcl). Empty keeps the job's 20.
+workloads_checkpoint_interval_s: "{{ lookup('env', 'KARDAMOM_CHECKPOINT_INTERVAL_S') }}"
+# More JVM options for every sealer member (nomad/cluster.nomad.hcl), for
+# a test cluster. Empty adds none.
+workloads_cluster_jvm_opts: "{{ lookup('env', 'KARDAMOM_CLUSTER_JVM_OPTS') }}"
+# The window of KardamomCanaryStalled (nomad/monitoring.nomad.hcl). Empty
+# keeps the 5m of deploy/alerts.yml.
+workloads_canary_stalled_window: "{{ lookup('env', 'KARDAMOM_CANARY_STALLED_WINDOW') }}"
+# Whether the canary pulls its image at each start
+# (nomad/canary.nomad.hcl): "on" or "off". Empty keeps the job's "on".
+workloads_canary_force_pull: "{{ lookup('env', 'KARDAMOM_CANARY_FORCE_PULL') }}"
 # When eth_sendRawTransaction answers (nomad/ingress.nomad.hcl): "receipt"
 # or "validated". Empty keeps "receipt".
 workloads_ingress_ack: "{{ lookup('env', 'KARDAMOM_INGRESS_ACK') }}"
@@ -485,13 +497,16 @@ workloads_l1_silence_s: "{{ lookup('env', 'L1_SILENCE_S') }}"
 workloads_epoch_pace_ms: "{{ lookup('env', 'EPOCH_PACE_MS') }}"
 workloads_indexer_host: "{{ lookup('env', 'L1_INDEXER_HOST') | default('kardamom-l1-indexer.service.' ~ datacenter ~ '.consul', true) }}"
 workloads_indexer_port: "{{ lookup('env', 'L1_INDEXER_PORT') | default('8549', true) }}"
-workloads_poll_delay: 3
-workloads_poll_retries: 80
+# One poll each second. A wait sees its result within about one second;
+# each budget below is the number of polls.
+workloads_poll_delay: 1
+# 240 polls of 1 s are 4 minutes.
+workloads_poll_retries: 240
 # The poll budget of one Nomad deployment, in polls of workloads_poll_delay
 # seconds. It covers the longest progress_deadline of a job (12 minutes,
 # the sealer), so a deployment that Nomad has not decided yet is never
-# read as a failure. 260 polls of 3 s are 13 minutes.
-workloads_deployment_retries: 260
+# read as a failure. 780 polls of 1 s are 13 minutes.
+workloads_deployment_retries: 780
 # Canary allocations for the ingress and the sequencer: 0 or 1. A canary
 # is one allocation more than the count, so it needs a spare node of its
 # class; the container profile has none.
@@ -504,7 +519,8 @@ workloads_sealer_admin_port: "{{ cluster_ports.admin }}"
 # with the registered cluster.
 workloads_sealer_job:
   name: cluster
-  retries: 100
+  # The allocation wait of the sealer: 300 polls of 1 s are 5 minutes.
+  retries: 300
   vars:
     cluster_retention: "{{ workloads_cluster_retention }}"
     cluster_snapshot_interval_s: "{{ workloads_cluster_snapshot_s }}"
@@ -514,6 +530,7 @@ workloads_sealer_job:
     cluster_driver_threading_mode: "{{ workloads_cluster_driver_threading_mode }}"
     cluster_heap_mb: "{{ workloads_cluster_heap_mb }}"
     cluster_remote_origins: "{{ workloads_remote_origins }}"
+    cluster_extra_jvm_opts: "{{ workloads_cluster_jvm_opts }}"
 # The sealer settings that every member must match (the Settings table of
 # cluster/sealer-service/README.md), as the deploy passes them in
 # JAVA_TOOL_OPTIONS. A rolling deploy cannot change one: members on two
@@ -540,6 +557,16 @@ workloads_sealer_must_match:
 # and closes it when the new cluster is up. On a registered job the flag
 # does nothing, so a re-deploy that keeps it set is safe.
 workloads_cluster_bootstrap: "{{ lookup('env', 'KARDAMOM_CLUSTER_BOOTSTRAP') | default('0', true) | bool }}"
+# The deploy waves of a new cluster (KARDAMOM_DEPLOY_WAVES=1). The role
+# uses them only when Nomad knows no job and the environment has no deploy
+# record. A job with `defer` then waits at the end of its wave, not before
+# the next registration: the jobs of one wave start together. Every other
+# deploy waits for each job before the next one. The container recipes set
+# the flag; a real environment does not.
+workloads_deploy_waves: "{{ lookup('env', 'KARDAMOM_DEPLOY_WAVES') == '1' }}"
+# The followers that the deploy registers without a wait and waits for
+# together, after their wave.
+workloads_followers: [executor, state-mirror, notifier, validator, da-watcher, node-exporter, monitoring]
 # The deploy record, by environment. The Nomad variable
 # kardamom/deploys/<env> holds the current attempt and the last accepted
 # release; deployed/<env>/ mirrors it (attempt.json, accepted.json,

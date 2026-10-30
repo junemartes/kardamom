@@ -239,6 +239,17 @@ impl<T: Clone> SenderState<T> {
         ask
     }
 
+    /// A parked transaction expired. The lookup of a sender retries only
+    /// for the lifetime of a parked transaction, and a lookup that ends
+    /// without an answer sends nothing back. So at the expiry, the lookup
+    /// that was out has ended, the first lookup and a relook alike: the
+    /// next transaction, or the next relook, asks again. Without this, a
+    /// sender whose lookup found no source stays parked until its rows
+    /// come, and no row comes for a sender that nothing forwards.
+    pub(super) fn on_expired(&mut self) {
+        self.asked = false;
+    }
+
     /// Forget the chain state: the next transaction asks for a lookup.
     pub(super) fn forget_state(&mut self) {
         self.state = None;

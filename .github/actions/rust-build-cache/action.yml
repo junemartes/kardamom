@@ -13,6 +13,19 @@ inputs:
     description: A rust-cache key shared across the jobs of a workflow, in place of the job-based key.
     required: false
     default: ""
+  save-if:
+    description: >-
+      "true" saves the caches at the end of the job. "false" only restores
+      them. The repository cache holds 10 GB. When each pull request saves
+      its own caches, two pull requests fill it and evict the caches of the
+      base branch. So a pull request job restores the base branch caches,
+      and only a push to a base branch saves them.
+    required: false
+    default: "true"
+  compiler-cache-size:
+    description: The size limit of the local compiler cache.
+    required: false
+    default: 1G
 runs:
   using: composite
   steps:
@@ -20,6 +33,8 @@ runs:
     # are executable on every runner that consumes the shared build.
     - name: Fix the ISA of C objects and route rustc through sccache
       shell: bash
+      env:
+        CACHE_SIZE: ${{ inputs.compiler-cache-size }}
       run: |
         {
           echo "CC=${GITHUB_WORKSPACE}/scripts/ci/cc-x86-64-v3.sh"
@@ -27,11 +42,22 @@ runs:
           echo "RUSTC_WRAPPER=sccache"
           echo "SCCACHE_GHA_ENABLED=false"
           echo "SCCACHE_DIR=${RUNNER_TEMP}/kardamom-sccache"
-          echo "SCCACHE_CACHE_SIZE=1G"
+          echo "SCCACHE_CACHE_SIZE=${CACHE_SIZE}"
         } >> "$GITHUB_ENV"
     # One archive bounds cache-service requests independently of crate count.
     # Compiler content hashes validate restored objects across source revisions.
-    - uses: actions/cache@v4
+    # The key holds no branch name: the cache service scopes each entry to
+    # its branch, and a pull request reads the entries of its base branch
+    # and of the default branch.
+    - if: inputs.save-if == 'true'
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/kardamom-sccache
+        key: compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.shared-key || github.job }}-${{ inputs.key }}-${{ github.sha }}
+        restore-keys: |
+          compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.shared-key || github.job }}-${{ inputs.key }}-
+    - if: inputs.save-if != 'true'
+      uses: actions/cache/restore@v4
       with:
         path: ${{ runner.temp }}/kardamom-sccache
         key: compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.shared-key || github.job }}-${{ inputs.key }}-${{ github.sha }}
@@ -45,6 +71,7 @@ runs:
         prefix-key: v1-rust-x86-64-v3
         key: ${{ inputs.key }}
         shared-key: ${{ inputs.shared-key }}
+        save-if: ${{ inputs.save-if == 'true' }}
     # rusteron builds the Aeron C library with Gradle on a cache miss;
     # the Gradle cache keeps that build off Maven Central.
     - uses: ./.github/actions/gradle-cache

@@ -17,10 +17,39 @@ A shard is one test. It brings up its own container cluster, runs its stages, an
 
 - Run both recipes from the repository root. The root `justfile` forwards them to `deploy/cluster/justfile`.
 - The default shard is the value of `SHARD`, or `load`.
-- CI runs every shard in `.github/workflows/cluster-e2e.yml`. Each shard has its own runner and its own cluster.
+- CI runs every shard nightly in `.github/workflows/cluster-e2e.yml`, not on a pull request or a push. Each shard has its own runner and its own cluster. See [The nightly runs](#the-nightly-runs).
 - The host needs Docker, OpenTofu, Ansible and the prebuilt artifacts. `just cluster-bootstrap` installs the host tools.
 - On a failure, the cluster stays up. `just container-diagnostics` collects the state of the nodes and the jobs.
 - The bring-up sets `KARDAMOM_CLUSTER_BOOTSTRAP=1`. The deploy opens the sealer bootstrap only for a cluster job that Nomad does not know, so a bring-up over a running cluster opens none. See [Sealer bootstrap](../deploy/cluster/README.md#sealer-bootstrap).
+
+### The prepared cluster in CI
+
+CI builds and provisions the cluster once per run. Each shard then deploys the workloads on a copy of that cluster.
+
+1. The `prepare-cluster` job strips the debug info of the binaries. Then it runs `just container-prepare`: `tofu apply` of `terraform/containers`, then `ansible/containers.yml` and `ansible/images.yml`. It deploys no workload.
+2. The same job runs `just container-save <dir>`. Each node stops Nomad, Consul and Docker, and its container stops. `docker commit` keeps each node as the image `kardamom-node-<node>:prepared`. `nodes.tar.zst` holds these images without the layers of the plain node image. The two volumes of each node go to `volumes/<volume>.tar`. The job uploads the directory, with the host binaries of the build, as the `prepared-cluster` artifact.
+3. A shard job downloads `prepared-cluster` and `cluster-node-image` in one step. It loads the plain node image first, then runs `just container-load <dir> <plain image>`. It sets `KARDAMOM_PREPARED_CLUSTER=<dir>`.
+4. With that variable, each bring-up of the shard test (`Lifecycle::up`) does these steps:
+   - `just container-restore <dir>` recreates the volumes and puts `images.digests` in place.
+   - `tofu apply` starts each node of generation 0 from its saved image (the `node_images` variable). The nodes keep their names and addresses.
+   - `ansible/resume.yml` prepares the host network, waits until Consul, Nomad and the registry answer on every node, and runs `ansible/deploy.yml`.
+- A replaced node (generation above 0) starts from the plain node image with empty volumes, as a new machine does.
+- The bring-up sets `KARDAMOM_DEPLOY_WAVES=1`. On a cluster without jobs and without a deploy record, the deploy starts the jobs of one wave together and waits for them at the end of the wave. It mirrors the deploy record at the end, not after each registration. A deploy over a running cluster waits for each job before the next one. The waves are:
+  - anvil and the sealer. The bootstrap closes and the genesis check runs when every new member answers its admin status. The deployment of the sealer ends in the next wave.
+  - the pipeline, the followers, the DA layer and the L1 follower, with the sealer deployment.
+  - the batcher and the sequencers, then the canary.
+- The saved nodes keep the Nomad configuration of the prepare job. `NOMAD_HEARTBEAT_GRACE` of that job would set the heartbeat grace of every shard; the job keeps the 60 s default.
+- The shard step sets `ANSIBLE_STRATEGY=mitogen_linear`. The playbooks and their tasks are the same; Mitogen runs the modules in kept Python processes.
+- Without `KARDAMOM_PREPARED_CLUSTER`, the bring-up runs `ansible/cluster.yml` on new nodes, as `just container-up` does.
+
+To use the same flow on a local host:
+
+```sh
+just --justfile deploy/cluster/justfile container-prepare
+just --justfile deploy/cluster/justfile container-save /tmp/prepared-cluster
+just --justfile deploy/cluster/justfile container-down
+KARDAMOM_PREPARED_CLUSTER=/tmp/prepared-cluster just shard chaos-executor
+```
 
 ### The stages of a shard
 
@@ -65,7 +94,7 @@ The initial inventory includes 103 Rust tests across 14 recovery groups. It does
 
 ## Shards
 
-There are sixteen distributed shards. `just container-test` lists their names. Fifteen run on every pull request. `chaos-integrity` runs nightly. A manual run with `suite=all` includes all sixteen.
+There are sixteen distributed shards. `just container-test` lists their names. All sixteen run nightly. See [The nightly runs](#the-nightly-runs).
 
 ### Carry-born shards
 
@@ -125,7 +154,19 @@ After each of these audits, the next case waits until the chain runs again. See 
 
 `KARDAMOM_CHAOS_CASES` narrows a run to a space-separated list of case names. An unknown name fails before any load starts.
 
-The nightly shard holds the long repetition cases and the seeded restart of the sealer fleet. The `cluster-e2e` workflow runs it on its schedule (03:17 UTC), alone. Adding the `chaos-nightly` label to a pull request runs it alone too, in a run of its own: the `labeled` event starts the run, and no other label starts one. The build job of the workflow picks the shard list. A nightly run has its own concurrency group, so it never cancels the regular run of the ref. A failed shard of the scheduled run opens an issue `nightly: the <shard> shard failed` with the `chaos-nightly` label, or adds the run to the open issue of that shard.
+The `chaos-integrity` shard holds the long repetition cases and the seeded restart of the sealer fleet.
+
+### The nightly runs
+
+- The `cluster-e2e` workflow runs every shard on its schedule (03:17 UTC): `load`, `semantics`, every `chaos-*` shard and `chaos-integrity`. A pull request and a push to main start no run.
+- workflow_dispatch runs every shard on any branch.
+- The `chaos-nightly` label runs every shard on a pull request, in a run of its own. The `labeled` event starts the run, and no other label starts one.
+- A failed shard of the scheduled run opens an issue `nightly: the <shard> shard failed` with the `chaos-nightly` label, or adds the run to the open issue of that shard. The issue names the failed cases and links the shard log.
+- Every nightly failure gets an isolated reproduction. The issue holds this checklist:
+  1. Find the cause in the shard log.
+  2. Add or extend an isolated test in `scripts/ci/component-recovery.json` (the in-process suite) that reproduces the failure. Name the case and the test in the issue.
+  3. Fix the product or the test.
+  4. Link the pull request in the issue.
 
 ### Cases
 
