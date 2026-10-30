@@ -29,6 +29,7 @@ final class CanonicalClient implements AutoCloseable {
     private final Supplier<String> endpoints;
     private final RecordingEgressListener egress = new RecordingEgressListener();
     private final Set<Integer> relayed = new HashSet<>();
+    private final java.util.Map<Integer, Long> deadlines = new java.util.HashMap<>();
     private AeronCluster client;
     private int reconnects;
     /** The relayed frames of the egress that {@link #relayed} already holds. */
@@ -124,7 +125,7 @@ final class CanonicalClient implements AutoCloseable {
 
     private void attempt(final int n, final int fillBytes, final long until) {
         final byte[] frame = IngressFrames.exemptRecordFrame(IngressFrames.canonicalId(n),
-            java.util.Arrays.copyOf(IngressFrames.canonicalId(n), 32 + fillBytes));
+            java.util.Arrays.copyOf(IngressFrames.canonicalId(n), 32 + fillBytes), deadline(n));
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer(frame.length);
         buf.putBytes(0, frame);
         if (!offered(buf, frame.length)) {
@@ -145,6 +146,18 @@ final class CanonicalClient implements AutoCloseable {
             c.pollEgress();
             return result > 0;
         }).orElse(false);
+    }
+
+    /**
+     * The inclusion deadline of record {@code n}, fixed at its first offer, as
+     * the ingress stamps it: the head that the client saw plus the inclusion
+     * horizon. A re-offer keeps it, so a re-offer after the deadline is
+     * refused as past its deadline, never ordered a second time.
+     */
+    private long deadline(final int n) {
+        return deadlines.computeIfAbsent(n, k -> Math.max(egress.maxBoundaryBlockNumber,
+            io.kardamom.sealer.CanonicalSealerState.GENESIS_BLOCK_NUMBER)
+            + io.kardamom.sealer.CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS);
     }
 
     private void pollAndPause() {
@@ -175,7 +188,7 @@ final class CanonicalClient implements AutoCloseable {
                     .messageTimeoutNs(Duration.ofSeconds(3).toNanos())
                     .egressListener(egress));
                 reconnects++;
-                resume();
+                announce();
             } catch (final RuntimeException e) {
                 return java.util.Optional.empty();
             }
@@ -184,19 +197,25 @@ final class CanonicalClient implements AutoCloseable {
     }
 
     /**
-     * Ask a new session for the stream after the last boundary that an
+     * Announce the new session as a consumer of the relayed records: once any
+     * consumer announces itself, the sealer relays records only to announced
+     * sessions. Then ask for the stream after the last boundary that an
      * earlier session saw, as a consumer resumes from its cursor. A record
      * that committed while the old session was gone reaches this session in
      * the replay; the sealer drops its re-offer as a duplicate.
      */
-    private void resume() {
-        if (reconnects == 1) {
-            return;
+    private void announce() {
+        offerOnSession(IngressFrames.subscribeFrame());
+        if (reconnects > 1) {
+            final long[] cursor = egress.boundaries.isEmpty()
+                ? new long[] {io.kardamom.sealer.CanonicalSealerState.GENESIS_BLOCK_NUMBER - 1, 0}
+                : egress.boundaries.get(egress.boundaries.size() - 1);
+            offerOnSession(IngressFrames.replayRequestFrame(cursor[1], cursor[0] + 1));
         }
-        final long[] cursor = egress.boundaries.isEmpty()
-            ? new long[] {io.kardamom.sealer.CanonicalSealerState.GENESIS_BLOCK_NUMBER - 1, 0}
-            : egress.boundaries.get(egress.boundaries.size() - 1);
-        final byte[] frame = IngressFrames.replayRequestFrame(cursor[1], cursor[0] + 1);
+    }
+
+    /** Offer {@code frame} on the new session, retrying for one re-offer interval. */
+    private void offerOnSession(final byte[] frame) {
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer(frame.length);
         buf.putBytes(0, frame);
         final long deadline = System.nanoTime() + REOFFER_NS;

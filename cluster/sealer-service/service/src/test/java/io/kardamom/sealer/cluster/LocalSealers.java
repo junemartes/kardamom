@@ -34,6 +34,8 @@ final class LocalSealers implements AutoCloseable {
 
     /** The name prefix of the tmpfs directory of a group: the prefix, the pid of the test JVM, a dash. */
     private static final String PREFIX = "kardamom-sealers-";
+    /** The free tmpfs that a group of three members needs: its Aeron logs, archives and feeds. */
+    private static final long TMPFS_ROOM = 2L << 30;
     /** The ports of one group: cluster endpoints, the admin port and the wildcard blocks. */
     private static final int PORT_SPAN = 500;
     private static final int BLOCK = 40;
@@ -72,8 +74,14 @@ final class LocalSealers implements AutoCloseable {
         System.out.println("sealer group directory: " + dir);
         this.settings = settings;
         this.dir = dir;
-        final Path tmpfs = Path.of(Files.isDirectory(Path.of("/dev/shm")) ? "/dev/shm" : dir.toString());
-        sweepStale(tmpfs);
+        final Path shared = Path.of("/dev/shm");
+        if (Files.isDirectory(shared)) {
+            sweepStale(shared);
+        }
+        // Member state lives on tmpfs where it has room: a process kill keeps
+        // the page cache, so the fault stays the same, and the fsync latency
+        // of a busy disk stays out of the recovery bounds.
+        final Path tmpfs = hasRoom(shared) ? shared : dir;
         this.shm = tmpfs.resolve(PREFIX + ProcessHandle.current().pid() + "-" + System.nanoTime());
         this.base = freePortSpan();
         final ThreadLocalRandom random = ThreadLocalRandom.current();
@@ -309,6 +317,15 @@ final class LocalSealers implements AutoCloseable {
                 java.nio.file.StandardCopyOption.ATOMIC_MOVE);
         } catch (final IOException e) {
             throw new UncheckedIOException(e);
+        }
+    }
+
+    /** Whether {@code tmpfs} exists with {@link #TMPFS_ROOM} free. */
+    private static boolean hasRoom(final Path tmpfs) {
+        try {
+            return Files.isDirectory(tmpfs) && Files.getFileStore(tmpfs).getUsableSpace() >= TMPFS_ROOM;
+        } catch (final IOException e) {
+            return false;
         }
     }
 

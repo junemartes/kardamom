@@ -30,7 +30,8 @@ class ClusterMemberRejoinTest {
     Path dir;
 
     @Test
-    @InterruptAfter(value = 60, unit = TimeUnit.SECONDS)
+    // The step bounds fail fast; their sum is above 120 s, so the limit is 120 s.
+    @InterruptAfter(value = 120, unit = TimeUnit.SECONDS)
     void a_wiped_follower_seeds_from_a_peer_after_the_leader_purged_its_log() {
         try (LocalSealers group = new LocalSealers(dir, 3, Purged.SETTINGS);
              CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints)) {

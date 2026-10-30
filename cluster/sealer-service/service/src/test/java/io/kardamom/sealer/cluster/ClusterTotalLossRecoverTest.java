@@ -38,8 +38,9 @@ class ClusterTotalLossRecoverTest {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
             group.awaitLeader(Duration.ofSeconds(20));
             IntStream.range(0, 3).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));
-            Await.holds(Duration.ofSeconds(10), "a snapshot on every member", () -> group.nodes().stream()
-                .allMatch(n -> group.count(n.id, 0, "snapshot TAKEN") > 0));
+            // The second snapshot proves that the consensus module recorded the first one.
+            Await.holds(Duration.ofSeconds(10), "two snapshots on every member", () -> group.nodes().stream()
+                .allMatch(n -> group.count(n.id, 0, "snapshot TAKEN") > 1));
             Stage.log("total-loss: leader");
 
             final List<Integer> starts = group.nodes().stream().map(SealerNode::starts).toList();

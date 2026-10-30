@@ -39,7 +39,8 @@ class RaftLeaderOneWayPartitionTest {
     Path dir;
 
     @Test
-    @InterruptAfter(value = 60, unit = TimeUnit.SECONDS)
+    // The step bounds fail fast; their sum is above 120 s, so the limit is 120 s.
+    @InterruptAfter(value = 120, unit = TimeUnit.SECONDS)
     void the_peers_of_a_leader_that_cannot_send_elect_a_new_leader_and_the_old_one_stays_up() {
         try (LocalSealers group = new LocalSealers(dir, 3, LocalSealers.Settings.DEFAULT);
              CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints)) {

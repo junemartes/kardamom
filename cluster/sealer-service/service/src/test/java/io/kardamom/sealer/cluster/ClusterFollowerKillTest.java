@@ -38,8 +38,8 @@ class ClusterFollowerKillTest {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
             final SealerNode.View leader = group.awaitLeader(Duration.ofSeconds(20));
             IntStream.range(0, 5).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));
-            Await.holds(Duration.ofSeconds(20), "a cluster snapshot",
-                () -> group.count(leader.memberId(), 0, "snapshot TAKEN") > 0);
+            Await.holds(Duration.ofSeconds(20), "a recorded cluster snapshot: the second one proves the first",
+                () -> group.count(leader.memberId(), 0, "snapshot TAKEN") > 1);
 
             final SealerNode follower = group.node((leader.memberId() + 1) % 3);
             final String restored = "sealer snapshot RESTORED memberId=" + follower.id;

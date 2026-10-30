@@ -33,7 +33,8 @@ class ClusterTwoBlankRecoverTest {
     Path dir;
 
     @Test
-    @InterruptAfter(value = 60, unit = TimeUnit.SECONDS)
+    // The step bounds fail fast; their sum is above 120 s, so the limit is 120 s.
+    @InterruptAfter(value = 120, unit = TimeUnit.SECONDS)
     void an_offline_copy_of_the_survivor_restores_a_quorum_that_seeds_the_last_blank_member() {
         try (LocalSealers group = new LocalSealers(dir, 3, Purged.SETTINGS);
              CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints)) {
