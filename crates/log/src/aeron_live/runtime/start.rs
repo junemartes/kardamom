@@ -12,6 +12,7 @@ use rusteron_client::AeronContext;
 
 use super::{AeronClient, build_aeron};
 use crate::driver_budget::DriverBudget;
+use crate::driver_wait::DriverWait;
 use crate::error::LogError;
 
 /// The longest wait for the Aeron thread to build its `AeronContext`. The
@@ -35,7 +36,10 @@ impl StartReport {
     {
         let built = make_ctx().and_then(|ctx| Ok((DriverBudget::of_client(&ctx)?, ctx)));
         let (budget, ctx) = Self::step(&self.budget, built, |(budget, _)| *budget)?;
-        let aeron = Self::step(&self.started, build_aeron(&ctx), |_| ())?;
+        let started = DriverWait::of(&ctx, budget.driver_wait())
+            .and_then(|wait| wait.wait())
+            .and_then(|()| build_aeron(&ctx));
+        let aeron = Self::step(&self.started, started, |_| ())?;
         Some((aeron, budget))
     }
 
@@ -84,14 +88,16 @@ impl StartWait {
         (report, wait)
     }
 
-    /// Wait [`CONTEXT_BUDGET`] for the context, then the [`DriverBudget`]
-    /// of that context for the client start. The Aeron C client waits up
-    /// to its driver timeout for a live driver: for the `CnC` file, and
-    /// for a heartbeat younger than the timeout after a driver restart.
-    /// Returns the budget, which the runtime keeps for its users.
+    /// Wait [`CONTEXT_BUDGET`] for the context, then the driver wait and
+    /// the [`DriverBudget`] of that context for the client start. The
+    /// Aeron thread first waits for an active driver (see
+    /// `crate::driver_wait`), then the Aeron C client waits up to its
+    /// driver timeout to connect. Returns the budget, which the runtime
+    /// keeps for its users.
     pub(super) fn wait(&self) -> Result<DriverBudget, LogError> {
         let budget = Self::recv(&self.budget, CONTEXT_BUDGET, "build its context")?;
-        Self::recv(&self.started, budget.duration(), "signal start")?;
+        let start = budget.driver_wait().saturating_add(budget.duration());
+        Self::recv(&self.started, start, "signal start")?;
         Ok(budget)
     }
 

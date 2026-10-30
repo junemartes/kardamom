@@ -20,6 +20,7 @@ pub mod fees;
 pub mod l1_batch;
 pub mod nonce_gap;
 pub mod nonce_unordered;
+pub mod recovery;
 pub mod resize;
 pub mod rpc_liveness;
 pub mod rpc_vectors;
