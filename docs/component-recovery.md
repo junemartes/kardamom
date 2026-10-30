@@ -194,7 +194,12 @@ status is `ported`. The status `ported` and `full_case_locally_validated: true`
 always go together. A ported case needs:
 
 - At least one local test.
-- A negative control in one of the suites of its local tests.
+- A local test in a suite with a `ci_mode`, so that CI runs it. The modes are
+  `in-process`, `docker` (a real container dependency) and `gradle` (the Java
+  sealer).
+- A negative control for one of its local tests. A control that names tests
+  (`test`, `tests` or `failed_tests`) guards only those tests. A control that
+  names no test guards every test of its suite.
 
 The optional case field `cluster_only_checks` is a list of strings. Each string
 names a check that needs the deployed cluster, and gives the reason. The cluster
