@@ -3,6 +3,18 @@
 #[path = "component_recovery/support.rs"]
 mod support;
 
+#[path = "component_recovery/blackout.rs"]
+mod blackout;
+
+#[path = "component_recovery/lane.rs"]
+mod lane;
+
+#[path = "component_recovery/replica.rs"]
+mod replica;
+
+#[path = "component_recovery/lane_cases.rs"]
+mod lane_cases;
+
 #[cfg(target_os = "linux")]
 #[path = "component_recovery/pressure.rs"]
 mod pressure;

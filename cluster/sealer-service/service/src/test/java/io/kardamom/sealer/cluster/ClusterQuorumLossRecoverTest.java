@@ -35,8 +35,8 @@ class ClusterQuorumLossRecoverTest {
     @InterruptAfter(value = 120, unit = TimeUnit.SECONDS)
     void a_cluster_without_a_quorum_stalls_and_commits_again_when_a_member_returns() {
         try (LocalSealers group = new LocalSealers(dir, 3, LocalSealers.Settings.DEFAULT);
-             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints);
-             CanonicalConsumer executor = new CanonicalConsumer(dir.resolve("executor"), group::ingressEndpoints)) {
+             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group);
+             CanonicalConsumer executor = new CanonicalConsumer(dir.resolve("executor"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
             group.awaitLeader(Duration.ofSeconds(20));
             IntStream.range(0, 3).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));

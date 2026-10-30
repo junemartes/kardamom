@@ -1,5 +1,8 @@
 package io.kardamom.sealer.cluster;
 
+import io.aeron.driver.DefaultNameResolver;
+import io.aeron.driver.MediaDriver;
+import io.aeron.driver.ThreadingMode;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.DatagramSocket;
@@ -144,6 +147,41 @@ final class LocalSealers implements AutoCloseable {
 
     String owners() {
         return nodes.stream().map(SealerNode::ownerEntry).collect(Collectors.joining(";"));
+    }
+
+    /**
+     * A media driver for a client of the group. It resolves the member names
+     * through the hosts file of the group, as a client of the deploy resolves
+     * them through Consul: a new-leader event names the leader's ingress by
+     * its host name.
+     */
+    MediaDriver clientDriver(final Path aeronDir) {
+        return MediaDriver.launch(new MediaDriver.Context()
+            .aeronDirectoryName(aeronDir.toString())
+            .threadingMode(ThreadingMode.SHARED)
+            .nameResolver(this::resolve)
+            .dirDeleteOnStart(true)
+            .dirDeleteOnShutdown(true));
+    }
+
+    /** The address of a member name in the hosts file, or the default lookup for any other name. */
+    private InetAddress resolve(final String name, final String uriParamName, final boolean isReResolution) {
+        try {
+            return Files.readAllLines(hostsFile()).stream().map(l -> l.split(" "))
+                .filter(f -> f.length == 2 && f[1].equals(name)).findFirst()
+                .map(f -> addressOf(f[0]))
+                .orElseGet(() -> DefaultNameResolver.INSTANCE.resolve(name, uriParamName, isReResolution));
+        } catch (final IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    private static InetAddress addressOf(final String ip) {
+        try {
+            return InetAddress.getByName(ip);
+        } catch (final IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     /** The ingress endpoints of the cluster client, by address. */
