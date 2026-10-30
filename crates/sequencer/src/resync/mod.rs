@@ -147,7 +147,8 @@ pub struct ResyncConfig {
     /// A test seam of the stack suite. With it, a receipt sets no first
     /// floor of a sender: the controller asks a lookup for the sender
     /// instead. So the first floor comes only from a lookup. The receipt
-    /// still confirms the published refs. Only the `floor-seams` feature
+    /// still confirms the published refs. The v2 loop reads the same flag:
+    /// a row sets no first state there. Only the `floor-seams` feature
     /// compiles this field, and no TOML key sets it.
     #[cfg(feature = "floor-seams")]
     #[serde(skip)]

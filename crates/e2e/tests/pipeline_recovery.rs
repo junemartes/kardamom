@@ -83,7 +83,7 @@ async fn pipeline_blackout_rebuilds_the_read_path() {
 /// The sequencers, the executor and Redis die, and no floor source is
 /// left. The sequencers read Redis in their nonce lookup, as deployed.
 /// They get a first floor only from a lookup: see the `floor-seams`
-/// feature.
+/// feature. This test runs the v1 loop.
 #[cfg(feature = "floor-seams")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run the pipeline-recovery component target"]
@@ -91,15 +91,39 @@ async fn sequencer_executor_redis_loss_looks_every_floor_up() {
     run_case(
         "sequencer-executor-redis-loss",
         Case::SequencerExecutorRedis,
-        // The returned executor replays the references of the outage, so
-        // the archive must keep their transaction data.
-        StackConfig {
-            archive_durability: true,
-            read_path: true,
-            sequencer_cache: true,
-            first_floor_from_lookup: true,
-            ..validated()
-        },
+        floor_stack(false),
     )
     .await;
+}
+
+/// The same case on the v2 loop, which the deployed shard of the chaos
+/// case runs: a row of an unknown sender sets no first state. The catalog
+/// does not list this test, so CI does not run it: on the v2 loop, the
+/// case load does not land within 30 s of the return in about half the
+/// runs, also without the seam.
+#[cfg(feature = "floor-seams")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack; run the pipeline-recovery component target"]
+async fn sequencer_executor_redis_loss_on_the_v2_loop_looks_every_floor_up() {
+    run_case(
+        "sequencer-executor-redis-loss-v2",
+        Case::SequencerExecutorRedis,
+        floor_stack(true),
+    )
+    .await;
+}
+
+/// The stack of the sequencer, executor and Redis loss. The returned
+/// executor replays the references of the outage, so the archive must
+/// keep their transaction data.
+#[cfg(feature = "floor-seams")]
+fn floor_stack(v2_loop: bool) -> StackConfig {
+    StackConfig {
+        archive_durability: true,
+        read_path: true,
+        sequencer_cache: true,
+        first_floor_from_lookup: true,
+        v2_loop,
+        ..validated()
+    }
 }

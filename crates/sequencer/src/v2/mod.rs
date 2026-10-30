@@ -256,6 +256,10 @@ pub struct AdmissionLoop {
     outbox_depth: Queue,
     /// The account events that wait in `accounts`.
     accounts_depth: Queue,
+    /// The test seam of the `floor-seams` feature: a row sets no first
+    /// state of a sender. See [`Self::enable_first_floor_from_lookup`].
+    #[cfg(feature = "floor-seams")]
+    first_floor_from_lookup: bool,
 }
 
 impl AdmissionLoop {
@@ -286,7 +290,18 @@ impl AdmissionLoop {
             pipeline: PublishMeters::new(),
             outbox_depth: Queue::new("sequencer.outbox"),
             accounts_depth: Queue::new("sequencer.accounts"),
+            #[cfg(feature = "floor-seams")]
+            first_floor_from_lookup: false,
         }
+    }
+
+    /// The test seam of the stack suite: a row sets no first state of a
+    /// sender, so the first state comes only from a lookup. A sender with
+    /// parked work asks a lookup instead. Only the `floor-seams` feature
+    /// compiles this method.
+    #[cfg(feature = "floor-seams")]
+    pub fn enable_first_floor_from_lookup(&mut self, on: bool) {
+        self.first_floor_from_lookup = on;
     }
 
     /// Send the answer to each transaction to the ingress that published
@@ -430,11 +445,32 @@ impl AdmissionLoop {
     }
 
     fn apply_rows(&mut self, block: u64, rows: Vec<(Address, AccountState)>) {
+        #[cfg(feature = "floor-seams")]
+        let rows = self.rows_of_known_senders(rows);
         self.admission
             .on_rows(block, rows.iter().copied(), &mut self.verdicts);
         for (address, _) in rows {
             self.canonical.confirmed(address, &self.admission);
         }
+    }
+
+    /// The test seam: with it, only the rows of the senders that the
+    /// filter holds a state of. The other senders wait for a lookup.
+    #[cfg(feature = "floor-seams")]
+    fn rows_of_known_senders(
+        &mut self,
+        rows: Vec<(Address, AccountState)>,
+    ) -> Vec<(Address, AccountState)> {
+        if !self.first_floor_from_lookup {
+            return rows;
+        }
+        rows.into_iter()
+            .filter(|(address, _)| {
+                !self
+                    .admission
+                    .waits_for_lookup(*address, &mut self.verdicts)
+            })
+            .collect()
     }
 
     /// The guard of the sealer expects `expected` of `sender`, and rejected

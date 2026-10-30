@@ -94,7 +94,13 @@ impl Run<'_> {
 
         self.stack.restart_executor()?;
         eprintln!("{}: the executor returned", self.at());
-        let took = load.await_landed_above(landed, RESTART_BOUND).await?;
+        let took = match load.await_landed_above(landed, RESTART_BOUND).await {
+            Ok(took) => took,
+            Err(e) => {
+                let lookups = Lookups::of(self.case_sequencer()?).await;
+                return Err(e.context(format!("the lookups of the case lane: {lookups:?}")));
+            }
+        };
         eprintln!(
             "{}: the case load lands again {:.1}s after the executor",
             self.at(),

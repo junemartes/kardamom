@@ -309,6 +309,25 @@ impl<T: Clone> SenderState<T> {
         true
     }
 
+    /// The test seam of the `floor-seams` feature: whether a row must
+    /// wait, because this sender has no state. With parked work, the
+    /// sender asks a lookup once, as [`Self::park_for_lookup`] does.
+    #[cfg(feature = "floor-seams")]
+    pub(super) fn waits_for_lookup(
+        &mut self,
+        address: alloy_primitives::Address,
+        out: &mut Vec<Verdict<T>>,
+    ) -> bool {
+        if self.state.is_some() {
+            return false;
+        }
+        if !self.parked.is_empty() && !self.asked {
+            self.asked = true;
+            out.push(Verdict::Lookup(address));
+        }
+        true
+    }
+
     /// Park a transaction of a sender with no state, and ask for a lookup
     /// once.
     fn park_for_lookup(

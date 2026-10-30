@@ -146,8 +146,9 @@ pub(crate) struct Args {
     /// under two origins and their frame counters do not mix.
     #[arg(long, env = "KARDAMOM_TX_EVENTS_ORIGIN", default_value_t = 0)]
     tx_events_origin: u8,
-    /// A test seam of the stack suite: a receipt sets no first floor of a
-    /// sender, so the first floor comes only from a lookup. Only the
+    /// A test seam of the stack suite: a receipt (v1 loop) or a row (v2
+    /// loop) sets no first floor of a sender, so the first floor comes only
+    /// from a lookup. Only the
     /// `floor-seams` feature compiles this flag.
     #[cfg(feature = "floor-seams")]
     #[arg(long)]
