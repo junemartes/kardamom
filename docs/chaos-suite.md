@@ -59,6 +59,9 @@ suite of `scripts/ci/component-recovery.json`. Each suite has a `ci_mode`:
   the Aeron media driver as local processes. The bundle puts the test binary in
   `stack/deps/` and the service binaries in `stack/`, as in a Cargo target directory.
   The shard sets `KARDAMOM_CLUSTER_JAR` and `KARDAMOM_AERON_ALL_JAR`.
+  Limitation: the shared build turns on the features of every component suite, so
+  the stack service binaries are built with the `docker-e2e` features on. A
+  deployed service binary is built without them.
 
 The CI jobs:
 

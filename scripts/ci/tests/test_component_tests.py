@@ -135,6 +135,9 @@ class ComponentTests(unittest.TestCase):
             runtime = component.SealerRuntime(Path(directory))
             (Path(directory) / "lib").mkdir()
             (Path(directory) / "jvm-args.txt").write_text("--add-opens\njava.base/sun.nio.ch=ALL-UNNAMED\n")
+            (Path(directory) / "revision.txt").write_text("a" * 40 + "\n")
+            with patch.dict(component.os.environ, GITHUB_SHA="b" * 40), self.assertRaises(ValueError):
+                runtime.load()
             command, _ = runtime.command({"test": "io.kardamom.Actor::recovers()"}, Path(directory) / "reports")
             self.assertEqual(command[command.index("--select-method") + 1], "io.kardamom.Actor#recovers")
             self.assertEqual(command[1:3], ["--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED"])
@@ -163,6 +166,22 @@ class ComponentTests(unittest.TestCase):
             artifacts, services, _ = component.Bundle(Path(directory)).artifacts([log])
         self.assertEqual(services, {"kardamom-ingress": Path("/t/kardamom-ingress")})
         self.assertEqual(artifacts, {("kardamom-ingress", "kardamom_ingress"): Path("/t/deps/kardamom_ingress-1")})
+
+    def test_an_exited_test_leaves_no_process_in_its_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "orphan.pid"
+            code = ("import subprocess, sys\n"
+                    f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                    f"open({str(marker)!r}, 'w').write(str(child.pid))\n")
+            result = component.Shard.execute([sys.executable, "-c", code], Path(directory) / "log", 10)
+            self.assertEqual(result[:2], (0, False))
+            pid = int(marker.read_text())
+            deadline = component.time.monotonic() + 5
+            while component.time.monotonic() < deadline and Path(f"/proc/{pid}").exists() \
+                    and "Z" not in Path(f"/proc/{pid}/stat").read_text().split()[2]:
+                component.time.sleep(0.05)
+            alive = Path(f"/proc/{pid}").exists() and "Z" not in Path(f"/proc/{pid}/stat").read_text().split()[2]
+            self.assertFalse(alive)
 
     def test_a_docker_test_leaves_no_container(self):
         listings = iter([{"old"}, {"old", "new"}])

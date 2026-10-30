@@ -36,6 +36,8 @@ TEST_SECONDS = 60
 SHARD_SECONDS = 6 * 60
 SHARDS = 4
 CARGO_MODES = ("in-process", "docker", "stack")
+# The modes whose tests can start containers. The shard removes what such a test leaves.
+CONTAINER_MODES = ("docker", "stack")
 # The estimate for a test with no measured runtime yet.
 DEFAULT_SECONDS = {"in-process": 5.0, "docker": 30.0, "gradle": 15.0, "stack": 30.0}
 # A stack test finds the service binaries in the parent of its own directory, as in a Cargo
@@ -290,12 +292,16 @@ class SealerRuntime:
                         "--no-daemon", "-q"], check=True)
         shutil.copytree(SEALER_RUNTIME, self.directory)
         shutil.copy2(SEALER / "service/build/libs/kardamom-cluster-node.jar", self.directory)
+        (self.directory / "revision.txt").write_text(os.environ.get("GITHUB_SHA", "") + "\n")
         print(f"Prepared the sealer test runtime in {self.directory}", flush=True)
 
     def load(self):
         arguments = (self.directory / "jvm-args.txt").read_text().splitlines()
         if not (self.directory / "lib").is_dir() or not arguments:
             raise ValueError("the sealer test runtime is incomplete")
+        revision = (self.directory / "revision.txt").read_text().strip()
+        if os.environ.get("GITHUB_SHA") and revision != os.environ["GITHUB_SHA"]:
+            raise ValueError("the sealer test runtime was built from another revision")
         return arguments
 
     def command(self, entry, reports):
@@ -370,12 +376,21 @@ class Shard:
             try:
                 code = process.wait(timeout=seconds)
             except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
-                os.killpg(process.pid, signal.SIGKILL)
+                Shard.kill_group(process.pid)
                 code = process.wait(timeout=5)
                 if isinstance(error, KeyboardInterrupt):
                     raise
                 timed_out = True
+            # A test that exits without its cleanup can leave drivers and services in its group.
+            Shard.kill_group(process.pid)
         return code, timed_out, time.monotonic() - started
+
+    @staticmethod
+    def kill_group(group):
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
     def entries(self, tests):
         cargo = self.bundle.load() if any(test["mode"] in CARGO_MODES for test in tests) else {}
@@ -391,9 +406,9 @@ class Shard:
                                 else runner.command(entry))
         if entry["mode"] == "stack":
             environment |= self.sealer.stack_environment()
-        before = Docker.containers() if entry["mode"] == "docker" else set()
+        before = Docker.containers() if entry["mode"] in CONTAINER_MODES else set()
         code, timed_out, seconds = self.execute(command, log, min(TEST_SECONDS, remaining), environment)
-        left = Docker.remove_new(before) if entry["mode"] == "docker" else 0
+        left = Docker.remove_new(before) if entry["mode"] in CONTAINER_MODES else 0
         success = (code == 0 and not timed_out and seconds <= TEST_SECONDS
                    and runner.verdict(entry, log.read_text(errors="replace"), reports))
         return dict(entry, success=success, exit_code=code, timed_out=timed_out,
@@ -417,7 +432,7 @@ class Shard:
                   "success": all(result["success"] for result in results) and elapsed <= SHARD_SECONDS}
         (self.output / "results.json").write_text(json.dumps(report, indent=2) + "\n")
         print(self.table(report), flush=True)
-        if any(entry["mode"] == "docker" for entry in entries) and Docker.unlisted():
+        if any(entry["mode"] in CONTAINER_MODES for entry in entries) and Docker.unlisted():
             print(f"warning: images outside the pulled list: {Docker.unlisted()}", flush=True)
         return report["success"]
 
@@ -450,7 +465,8 @@ class Timings:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("mode", choices=["features", "prepare", "prepare-sealer", "images", "image-names", "plan", "run", "run-all", "timings"])
+    parser.add_argument("mode", choices=["features", "has-stack", "prepare", "prepare-sealer", "images", "image-names",
+                                         "plan", "run", "run-all", "timings"])
     parser.add_argument("--bundle", type=Path, help="the Cargo test bundle")
     parser.add_argument("--sealer", type=Path, help="the sealer test runtime")
     parser.add_argument("--output", type=Path)
@@ -462,6 +478,9 @@ def main():
     if args.mode == "features":
         suites = Bundle.selection(json.loads(CATALOG.read_text()))
         print(",".join(sorted(set().union(*map(Bundle.features, suites.values())))))
+    elif args.mode == "has-stack":
+        suites = Bundle.selection(json.loads(CATALOG.read_text()))
+        raise SystemExit(0 if any(suite["ci_mode"] == "stack" for suite in suites.values()) else 1)
     elif args.mode == "prepare":
         Bundle(args.bundle).prepare(args.artifacts)
     elif args.mode == "prepare-sealer":
