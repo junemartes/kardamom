@@ -91,29 +91,65 @@ fn a_blank_replacement_fetches_a_peer_checkpoint_and_catches_up() {
 
 /// state-checkpoint-restore: the state and the checkpoints of executor
 /// 0 are wiped while it is down, and the harness installs the newest
-/// checkpoint of executor 1. Only the new process may prove the
-/// restore: it restores the copy, replays the tail and converges.
+/// base of executor 1, and its block log first, as the deployed case
+/// does with the block log on. Only the new process may prove the
+/// restore: it restores the base, applies the log past it, replays the
+/// tail and converges.
+#[test]
+fn a_wiped_replica_restores_a_copied_donor_base_and_log() {
+    copied_restore(true);
+}
+
+/// state-checkpoint-restore with the block log off: the copy is the
+/// newest base alone.
 #[test]
 fn a_wiped_replica_restores_a_copied_donor_checkpoint() {
+    copied_restore(false);
+}
+
+fn copied_restore(with_log: bool) {
     let world = World::new();
     world.seal_through(5);
     let load = world.load(5, LAST, BLOCK_EVERY);
     let mut fleet = world.fleet();
+    fleet.0.iter_mut().for_each(|n| n.cfg.block_log = with_log);
     fleet.start();
-    let (block, donor) = fleet.0[1].wait_checkpoint(10, CATCH_UP);
+    let (block, donor) = fleet.0[1].wait_checkpoint(if with_log { 1 } else { 10 }, CATCH_UP);
+    fleet.0[1].wait_head(block + 8, CATCH_UP);
     let victim = &mut fleet.0[0];
     victim.kill();
     victim.wipe_all();
-    victim.install_checkpoint(&donor);
+    victim.install_checkpoint(&donor, with_log);
     victim.start();
     fleet.wait_head(load.sealed() + 5, CATCH_UP);
     let head = load.halt();
     fleet.assert_converged(&world, head, CATCH_UP);
     let victim = &fleet.0[0];
     let log = victim.last_log();
+    let restored: u64 = log
+        .lines()
+        .find(|l| l.contains(RESTORED))
+        .and_then(|l| {
+            l.split("restored_block=")
+                .nth(1)?
+                .split(' ')
+                .next()?
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("the new process restores no copy:\n{log}"));
+    let applied = log.contains("applied the block log after the base checkpoint");
     assert!(
-        log.contains(&format!("restored_block={block}")),
-        "the new process restores the copied checkpoint {block}:\n{log}"
+        applied || !with_log,
+        "the copied log is not applied:\n{log}"
+    );
+    assert!(
+        if with_log {
+            restored > block
+        } else {
+            restored == block
+        },
+        "restored block {restored} from base {block}:\n{log}"
     );
     assert!(!log.contains(FETCHED), "the copy needs no fetch:\n{log}");
     assert_eq!(victim.count(RESTORED), 1);

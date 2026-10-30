@@ -12,8 +12,14 @@
 
 #[path = "recovery/chain.rs"]
 mod chain;
+#[cfg(feature = "docker-e2e")]
+#[path = "recovery/disk.rs"]
+mod disk;
 #[path = "recovery/fleet.rs"]
 mod fleet;
+#[cfg(feature = "docker-e2e")]
+#[path = "recovery/l1.rs"]
+mod l1;
 #[path = "recovery/node.rs"]
 mod node;
 #[path = "recovery/replica.rs"]

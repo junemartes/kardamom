@@ -38,6 +38,9 @@ pub(crate) struct NodeConfig {
     /// Checkpoint rounds every second, or none.
     pub(crate) checkpoints: bool,
     pub(crate) block_log: bool,
+    /// With the block log: a new base when the newest one is older than
+    /// this, in seconds.
+    pub(crate) base_max_age_secs: NonZeroU64,
     pub(crate) sealer: PathBuf,
     pub(crate) genesis: PathBuf,
     pub(crate) receipts: PathBuf,
@@ -58,7 +61,7 @@ impl NodeConfig {
             checkpoint_keep: NonZeroUsize::new(3).unwrap(),
             block_log: self.block_log.then_some(BlockLogConfig {
                 base_log_percent: NonZeroU64::new(100).unwrap(),
-                base_max_age_secs: NonZeroU64::new(21_600).unwrap(),
+                base_max_age_secs: self.base_max_age_secs,
                 copy_mib_per_sec: NonZeroU64::new(16).unwrap(),
                 segment_mib: NonZeroU64::MIN,
             }),

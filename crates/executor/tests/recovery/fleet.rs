@@ -2,7 +2,7 @@
 //! waits and verdicts on them.
 
 use std::net::SocketAddr;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -15,6 +15,16 @@ use super::sealer::SealerLog;
 
 /// The environment variable that names the config of a child process.
 pub(crate) const NODE_ENV: &str = "KARDAMOM_RECOVERY_NODE";
+/// The tmpfs of the host.
+const SHM: &str = "/dev/shm";
+/// The arguments that run the child entry point of the test binary.
+pub(crate) const CHILD_ARGS: [&str; 5] = [
+    "--exact",
+    "recovery_node",
+    "--ignored",
+    "--nocapture",
+    "--test-threads=1",
+];
 /// The pause of each wait poll.
 const POLL: Duration = Duration::from_millis(20);
 
@@ -36,9 +46,19 @@ fn free_addr() -> SocketAddr {
     .unwrap()
 }
 
-/// One test's world: owned storage, the chain, and the sealer.
+/// The name prefix of the storage of one test process. The process id
+/// follows, so a later run can remove the storage of a killed run.
+const STORAGE_PREFIX: &str = "kardamom-exec-recovery-";
+/// The tmpfs room a new node needs: its state, checkpoints and logs stay
+/// far below this in these small chains.
+const NODE_ROOM: u64 = 256 << 20;
+
+/// One test's world: owned storage, the chain, and the sealer. The
+/// storage goes with the world, also when a test panics.
 pub(crate) struct World {
     pub(crate) root: tempfile::TempDir,
+    /// Storage on disk, for a node that finds no tmpfs room.
+    disk: tempfile::TempDir,
     pub(crate) chain: Arc<Chain>,
     pub(crate) sealer: SealerLog,
     genesis: PathBuf,
@@ -46,13 +66,15 @@ pub(crate) struct World {
 
 impl World {
     pub(crate) fn new() -> Self {
+        Self::remove_storage_of_dead_runs();
+        let disk = Self::storage_in(&std::env::temp_dir());
         // Storage lives on tmpfs where it has room: a process kill keeps
         // the page cache, so the fault stays the same, and the busy
         // host's fsync latency stays out of the recovery bound.
         let root = if Self::tmpfs_has_room() {
-            tempfile::tempdir_in("/dev/shm").unwrap()
+            Self::storage_in(Path::new(SHM))
         } else {
-            tempfile::tempdir().unwrap()
+            Self::storage_in(&std::env::temp_dir())
         };
         if std::env::var_os("KARDAMOM_RECOVERY_KEEP").is_some() {
             eprintln!("recovery storage: {}", root.path().display());
@@ -63,21 +85,60 @@ impl World {
         let sealer = SealerLog::create(&root.path().join("sealer"));
         Self {
             root,
+            disk,
             chain,
             sealer,
             genesis,
         }
     }
 
-    /// Whether `/dev/shm` exists with at least 512 MiB free.
+    fn storage_in(dir: &Path) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("{STORAGE_PREFIX}{}-", std::process::id()))
+            .tempdir_in(dir)
+            .unwrap()
+    }
+
+    /// Remove the storage that a killed test process left: a directory
+    /// whose process no longer runs. A kill skips the drop of its world.
+    fn remove_storage_of_dead_runs() {
+        [Path::new(SHM).to_path_buf(), std::env::temp_dir()]
+            .iter()
+            .filter_map(|dir| std::fs::read_dir(dir).ok())
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| {
+                        name.strip_prefix(STORAGE_PREFIX)?
+                            .split('-')
+                            .next()?
+                            .parse::<i32>()
+                            .ok()
+                    })
+                    // SAFETY: signal 0 checks only that the process exists.
+                    .is_some_and(|pid| unsafe { libc::kill(pid, 0) } != 0)
+            })
+            .for_each(|entry| {
+                let _ = std::fs::remove_dir_all(entry.path());
+            });
+    }
+
+    /// Whether `/dev/shm` exists with room for one more node.
     fn tmpfs_has_room() -> bool {
-        const ROOM: u64 = 512 << 20;
-        let path = std::ffi::CString::new("/dev/shm").unwrap();
+        let path = std::ffi::CString::new(SHM).unwrap();
         // SAFETY: `path` is a valid C string, and `stat` is a valid
         // out-buffer for the call.
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
         let ok = unsafe { libc::statvfs(path.as_ptr(), &raw mut stat) } == 0;
-        ok && stat.f_bavail.saturating_mul(stat.f_frsize) >= ROOM
+        ok && stat.f_bavail.saturating_mul(stat.f_frsize) >= NODE_ROOM
+    }
+
+    /// The storage roots of this world, for a container that mounts them.
+    pub(crate) fn roots(&self) -> [&Path; 2] {
+        [self.root.path(), self.disk.path()]
     }
 
     /// Seal blocks `1..=n` at once.
@@ -113,8 +174,15 @@ impl World {
     }
 
     /// A new executor node named `name` with its own storage and address.
+    /// Each node checks the tmpfs room again: tests run in parallel, and
+    /// a node that finds no room lives on disk.
     pub(crate) fn node(&self, name: &str) -> NodeHandle {
-        let dir = self.root.path().join(name);
+        let shm = self.root.path().starts_with(SHM) && Self::tmpfs_has_room();
+        let dir = if shm || !self.root.path().starts_with(SHM) {
+            self.root.path().join(name)
+        } else {
+            self.disk.path().join(name)
+        };
         std::fs::create_dir_all(dir.join("state")).unwrap();
         std::fs::create_dir_all(dir.join("checkpoints")).unwrap();
         NodeHandle {
@@ -126,6 +194,7 @@ impl World {
                 rpc: free_addr(),
                 checkpoints: true,
                 block_log: false,
+                base_max_age_secs: std::num::NonZeroU64::new(21_600).unwrap(),
                 sealer: self.sealer.dir().to_path_buf(),
                 genesis: self.genesis.clone(),
                 receipts: dir.join("receipts.log"),
@@ -270,22 +339,41 @@ pub(crate) struct NodeHandle {
 impl NodeHandle {
     /// Start a new process on the node's storage.
     pub(crate) fn start(&mut self) {
+        let config = self.write_config();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        // SAFETY: the hook only calls `prctl`, which is async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                // The child ends with the test binary, also when CI kills it.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        command
+            .args(CHILD_ARGS)
+            .env(NODE_ENV, &config)
+            .env("NO_COLOR", "1")
+            .env("RUST_LOG", "info");
+        self.spawn(command);
+    }
+
+    /// Write the node's config for its next process, and return its path.
+    pub(crate) fn write_config(&self) -> PathBuf {
+        let path = self.dir.join("node.toml");
+        std::fs::write(&path, toml::to_string(&self.cfg).unwrap()).unwrap();
+        path
+    }
+
+    /// Spawn `command` as the node's next process, with its output in
+    /// the log of the run.
+    pub(crate) fn spawn(&mut self, mut command: Command) {
         assert!(self.child.is_none(), "{} already runs", self.name());
         self.runs += 1;
-        let cfg_path = self.dir.join("node.toml");
-        std::fs::write(&cfg_path, toml::to_string(&self.cfg).unwrap()).unwrap();
         let log = std::fs::File::create(self.run_log(self.runs)).unwrap();
-        let child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "recovery_node",
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(NODE_ENV, &cfg_path)
-            .env("NO_COLOR", "1")
-            .env("RUST_LOG", "info")
+        let child = command
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
             .stderr(log)
@@ -437,6 +525,20 @@ impl NodeHandle {
         Some((status, answer.split_once("\r\n\r\n")?.1.to_string()))
     }
 
+    /// The sum of every series of `name`, from `/metrics`.
+    pub(crate) fn metric_sum(&self, name: &str) -> Option<f64> {
+        let (_, body) = self.get("/metrics")?;
+        Some(
+            body.lines()
+                .filter(|l| {
+                    l.strip_prefix(name)
+                        .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with('{'))
+                })
+                .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+                .sum(),
+        )
+    }
+
     /// The value of the unlabelled gauge `name`, from `/metrics`.
     pub(crate) fn gauge(&self, name: &str) -> Option<f64> {
         let (_, body) = self.get("/metrics")?;
@@ -469,12 +571,28 @@ impl NodeHandle {
 
     /// Install a checkpoint copied from a donor: stage it under a
     /// hidden name, then rename it into place, as the harness copy does.
-    pub(crate) fn install_checkpoint(&self, donor: &Path) {
-        let name = donor.file_name().unwrap();
+    pub(crate) fn install_checkpoint(&self, donor: &Path, with_log: bool) {
         let staging = self.cfg.checkpoint_dir.join(".harness-staging");
-        Self::copy_dir(donor, &staging.join(name));
-        std::fs::rename(staging.join(name), self.cfg.checkpoint_dir.join(name)).unwrap();
+        // The log goes in before the base: a restore reads the log when
+        // the base becomes visible.
+        let log = donor.with_file_name(kardamom_state::checkpoint::replay::LOG_DIR);
+        let sources = if with_log {
+            vec![log, donor.to_path_buf()]
+        } else {
+            vec![donor.to_path_buf()]
+        };
+        for source in &sources {
+            self.install_dir(source, &staging);
+        }
         std::fs::remove_dir_all(staging).unwrap();
+    }
+
+    /// Stage a copy of `source`, then rename it into the checkpoint
+    /// directory.
+    fn install_dir(&self, source: &Path, staging: &Path) {
+        let name = source.file_name().unwrap();
+        Self::copy_dir(source, &staging.join(name));
+        std::fs::rename(staging.join(name), self.cfg.checkpoint_dir.join(name)).unwrap();
     }
 
     /// Copy the files of `from` into a new directory `to`.
