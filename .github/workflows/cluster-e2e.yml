@@ -90,7 +90,9 @@ jobs:
       - name: Pick the shards
         id: shards
         run: |
-          shards='["load","semantics","chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-combined-ordering","chaos-combined-exec","chaos-retention","chaos-cache","chaos-l1","chaos-follower","chaos-carry","chaos-integrity"]'
+          regular='"load","semantics"'
+          nightly='"chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-combined-ordering","chaos-combined-exec","chaos-retention","chaos-cache","chaos-l1","chaos-follower","chaos-carry","chaos-integrity"'
+          shards="[$regular,$nightly]"
           echo "shards=$shards" >> "$GITHUB_OUTPUT"
           echo "shards: $shards"
 
@@ -285,13 +287,10 @@ jobs:
           root: deploy/cluster/terraform/containers
       - uses: ./.github/actions/just
 
-      # The saved nodes keep the Nomad configuration of this step, so the
-      # chaos value of the heartbeat grace is set here, not per shard.
       - name: Provision the nodes and publish the images
         run: just --justfile deploy/cluster/justfile container-prepare
         env:
           KARDAMOM_STAGED: "1"
-          NOMAD_HEARTBEAT_GRACE: 30s
 
       # The runner engine keeps a copy of every image that the registry
       # holds. The save needs the disk space.
@@ -492,6 +491,9 @@ jobs:
           # The same playbooks and tasks, in kept Python processes (see
           # .github/actions/ansible-runner).
           ANSIBLE_STRATEGY: mitogen_linear
+          # Mitogen starts its sudo and docker transports within this
+          # timeout. Under the load of a case, the 10 s default runs out.
+          ANSIBLE_TIMEOUT: "60"
 
       - name: Collect diagnostics
         if: failure()

@@ -38,7 +38,7 @@ CI builds and provisions the cluster once per run. Each shard then deploys the w
   - anvil and the sealer. The bootstrap closes and the genesis check runs when every new member answers its admin status. The deployment of the sealer ends in the next wave.
   - the pipeline, the followers, the DA layer and the L1 follower, with the sealer deployment.
   - the batcher and the sequencers, then the canary.
-- The prepare job sets `NOMAD_HEARTBEAT_GRACE=30s`, so the saved nodes carry the chaos value of the Nomad heartbeat grace.
+- The saved nodes keep the Nomad configuration of the prepare job. `NOMAD_HEARTBEAT_GRACE` of that job would set the heartbeat grace of every shard; the job keeps the 60 s default.
 - The shard step sets `ANSIBLE_STRATEGY=mitogen_linear`. The playbooks and their tasks are the same; Mitogen runs the modules in kept Python processes.
 - Without `KARDAMOM_PREPARED_CLUSTER`, the bring-up runs `ansible/cluster.yml` on new nodes, as `just container-up` does.
 
