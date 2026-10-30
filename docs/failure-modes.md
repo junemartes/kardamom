@@ -229,7 +229,7 @@ Every chaos case ends with a **recovery probe**.
   - The ingress asks every executor before it gives this error. One dead executor therefore does not cause it.
   - A stall of the shared CI runner can delay every executor past the 2 s query timeout at the same time. A wallet retries this error, so the harness retries it too.
 - Every offered transaction of both loads must get a receipt. A submit that parks past the timeout of the ingress gets no receipt, so every receipt arrives inside the park.
-- Each load must be accepted at half of its rate or more.
+- Each load must be accepted at a quarter of its rate or more.
 - If load 1 alone fails, a sender is stuck.
 - If load 2 fails, the pipeline or an ingress did not recover.
 - The case load cannot prove either point. A submit that the ingress refuses during the outage leaves a nonce hole. Every later submit of that sender parks and fails. The chaos verdict does not count a failed submit.

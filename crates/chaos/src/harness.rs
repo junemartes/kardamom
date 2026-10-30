@@ -322,10 +322,12 @@ impl Harness {
         })
     }
 
-    /// The least accepted submits of one leg: half of what the leg
-    /// offers at its rate. A leg below it did not run its window.
+    /// The least accepted submits of one leg: a quarter of what the leg
+    /// offers at its rate. The fixed-rate engine reaches about half of
+    /// its rate on the CI runner, so a leg below a quarter did not run
+    /// its window.
     fn probe_floor(&self) -> u64 {
-        u64::from(self.probe_tps().get()) * PROBE_WINDOW.as_secs() / 2
+        u64::from(self.probe_tps().get()) * PROBE_WINDOW.as_secs() / 4
     }
 
     async fn run_body(

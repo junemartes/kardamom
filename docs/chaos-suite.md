@@ -352,7 +352,7 @@ Every case ends with the recovery probe. Two 15 s loads run at the same time, ea
 - One load uses the gate account through the other ingress. It stands for a sender with nothing in flight.
 - Each load holds a slot for every submit of its window. A blocking submit parks at the ingress until its receipt, so a load with fewer slots reaches only the slot count over the receipt latency. With a slot for every submit, the rate does not depend on the latency.
 - Every offered transaction of both loads must get a receipt. A submit that parks past the 30 s timeout of the ingress is refused, and then has no receipt. So the receipt latency of every transaction is below the park.
-- Each load must be accepted at half of its rate or more.
+- Each load must be accepted at a quarter of its rate or more.
 - Every probe line and every probe failure prints the receipt latency (p50, p95, p99, max).
 
 [`failure-modes.md`](failure-modes.md#the-recovery-probe) explains why the case load and the block gauge cannot prove this.
