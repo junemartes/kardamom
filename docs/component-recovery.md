@@ -227,6 +227,14 @@ streams run, and returns a node to the same control endpoint three times. Every 
 of the live streams must arrive in order, and the driver must log no error. On the
 deployed Aeron 1.45 driver, this does not reproduce the driver crash of issue 545.
 
+`just test-component executor-driver-late-start` starts the real executor binary
+12 s before its media driver, as a service on a returned node can start. Every Aeron
+client start of `kardamom-log` now waits for an active driver: the `CnC` file exists
+and the driver heartbeat is younger than the driver timeout. It logs the wait every
+5 s. The bound is two driver budgets, 30 s with the deployed 10 s driver timeout;
+past it the start fails as before. The executor must open its publications and its
+local recording with no exit. Without the wait, it exits at once.
+
 `just test-component state-writer-crash` runs two real durable MDBX process-crash
 checks in about 0.3 seconds of test execution. A child runs the production writer.
 An owned metrics recorder blocks its existing synchronous callback after account

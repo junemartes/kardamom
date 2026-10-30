@@ -221,6 +221,47 @@
       "limitation": "Each node is a real process with real storage, but the canonical stream comes from a controlled sealer log, not Aeron Cluster members, and the receipts go to a file, not Aeron. No Nomad, Consul, Docker node, image rollout or network identity. The DA image comes from the production batch codec and reconstruction, but not from an L1 scan or the DA HTTP store. A process kill keeps the page cache: no power loss.",
       "ci_mode": "in-process"
     },
+    "executor-driver-late-start": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-executor",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "driver_late_start",
+        "--",
+        "--ignored",
+        "--exact",
+        "an_executor_started_before_its_driver_waits_and_opens_its_streams"
+      ],
+      "real": [
+        "the kardamom-executor binary, started before its media driver",
+        "AeronRuntime start with the wait for an active driver: the CnC file and the driver heartbeat",
+        "the exec stream publication and its local recording on the late driver"
+      ],
+      "controlled": [
+        "the media driver and archive container, started 12 s after the executor",
+        "an unreachable cluster endpoint, so the executor waits in its session loop"
+      ],
+      "tests": [
+        "an_executor_started_before_its_driver_waits_and_opens_its_streams"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "the client start skips the wait for an active driver",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "an_executor_started_before_its_driver_waits_and_opens_its_streams"
+          ]
+        }
+      ],
+      "limitation": "One executor on one host. The Nomad restart of the node and its image pulls stay in the chaos shard.",
+      "ci_mode": "docker"
+    },
     "executor-exec-stream": {
       "command": [
         "cargo",
@@ -3484,6 +3525,10 @@
         {
           "suite": "sealer-raft",
           "test": "io.kardamom.sealer.cluster.SealerClusterFailoverTest::egressContinuesGaplesslyAcrossLeaderKill()"
+        },
+        {
+          "suite": "executor-driver-late-start",
+          "test": "an_executor_started_before_its_driver_waits_and_opens_its_streams"
         }
       ],
       "full_case_locally_validated": false,
