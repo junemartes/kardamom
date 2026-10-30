@@ -5,6 +5,21 @@
 # image. It joins the bridge and the host settings that the bring-up
 # already prepared. This playbook configures and starts the agents of that
 # node only. Staging and production provision a node with bootstrap.yml.
+- name: Refuse a replace outside the local profile
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  tasks:
+    - name: Require the local profile
+      ansible.builtin.assert:
+        that: deployment_profile == 'local'
+        fail_msg: >-
+          replace-node.yml provisions a replaced node of the chaos suite only. The {{ deployment_profile }}
+          profile provisions a node with bootstrap.yml.
+
 - name: Read the node contract
   ansible.builtin.import_playbook: container-nodes.yml
   vars:
