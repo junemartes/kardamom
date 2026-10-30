@@ -155,6 +155,18 @@ variable "checkpoint_log" {
   }
 }
 
+# The seconds between two checkpoints of an executor
+# (--checkpoint-interval-secs). The deploy passes it from
+# KARDAMOM_CHECKPOINT_INTERVAL_S.
+variable "checkpoint_interval_s" {
+  type    = number
+  default = 20
+  validation {
+    condition     = var.checkpoint_interval_s > 0
+    error_message = "The checkpoint_interval_s value must be above 0."
+  }
+}
+
 # The executors on the sealer nodes, "on" or "off". On, executor <i>
 # runs on sealer-<i>, the node of member i, in its own group. Off, the
 # executors run on the executor nodes. The deploy passes it from
@@ -445,7 +457,7 @@ job "executor" {
             # only the tail, not from genesis. Write a checkpoint every
             # 20s as the chain advances.
             "--checkpoint-dir", "/opt/kardamom/checkpoints",
-            "--checkpoint-interval-secs", "20",
+            "--checkpoint-interval-secs", format("%d", var.checkpoint_interval_s),
             # Peer checkpoint exchange, a full-resync fallback. Each
             # replica serves its newest checkpoint on 9014, and can
             # fetch one from the others. A node whose replay cursor, or

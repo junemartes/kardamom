@@ -128,6 +128,7 @@
       vars:
         exec_cursor: "{{ workloads_exec_cursor }}"
         checkpoint_log: "{{ workloads_checkpoint_log }}"
+        checkpoint_interval_s: "{{ workloads_checkpoint_interval_s }}"
     # The egress after the executors that it reads, before the readers
     # after it: the notifier here, the validator and the batcher below.
     # A healthy egress answers /health. It needs no executor up to start.
@@ -201,6 +202,7 @@
       vars:
         prometheus_retention_time: "{{ workloads_prometheus_retention_time }}"
         prometheus_retention_size: "{{ workloads_prometheus_retention_size }}"
+        canary_stalled_window: "{{ workloads_canary_stalled_window }}"
   loop_control:
     loop_var: workloads_job
     label: "{{ workloads_job.name }}"
@@ -349,6 +351,7 @@
              else workloads_canary_dev_ring_offset }}
         lockbox_address: "{{ workloads_lockbox_address if workloads_canary_l1_key | length > 0 else '' }}"
         safe_timeout_ms: "{{ workloads_canary_safe_timeout_ms }}"
+        force_pull: "{{ workloads_canary_force_pull }}"
       # The deposit probe's L1: the real L1 when one is given, else the
       # in-cluster anvil. Its key only when one is given.
       secrets:

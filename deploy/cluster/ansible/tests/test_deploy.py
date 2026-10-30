@@ -735,6 +735,35 @@ class DeployTest(Deploys):
         self.assertIn('ingress', self.api.state['writes'])
         self.assertNotIn('executor', self.api.state['writes'])
 
+    def chaos_knobs(self):
+        """The values of the five chaos knobs in the planned jobs."""
+        plans = self.api.state['plans']
+        sealer = plans['cluster']['TaskGroups'][0]['Tasks'][0]['Env']['JAVA_TOOL_OPTIONS'].split()
+        executor = [t['Config']['args'] for g in plans['executor']['TaskGroups'] for t in g['Tasks']
+                    if '--checkpoint-interval-secs' in (t['Config'].get('args') or [])][0]
+        rules = [t['EmbeddedTmpl'] for g in plans['monitoring']['TaskGroups'] for t in g['Tasks']
+                 for t in (t.get('Templates') or []) if t['DestPath'] == 'local/alerts.yml'][0]
+        stalled = re.search(r'alert: KardamomCanaryStalled\n.*?outcome="success"}\[(\w+)\]', rules, re.S).group(1)
+        canary = plans['canary']['TaskGroups'][0]['Tasks'][0]['Config']
+        return {'canvass': [o for o in sealer if 'canvass' in o],
+                'checkpoint': str(executor[executor.index('--checkpoint-interval-secs') + 1]),
+                'stalled': stalled, 'force_pull': canary['force_pull'],
+                'rules_unchanged': rules == (ANSIBLE.parents[1] / 'alerts.yml').read_text()}
+
+    def test_the_chaos_knobs_keep_todays_values_by_default(self):
+        self.run_deploy(check=True, environ={'CANARY_LOCAL': '1'})
+        self.assertEqual(self.chaos_knobs(), {'canvass': [], 'checkpoint': '20', 'stalled': '5m',
+                                              'force_pull': True, 'rules_unchanged': True})
+
+    def test_the_chaos_knobs_render_the_chaos_values(self):
+        self.run_deploy(check=True, environ={
+            'CANARY_LOCAL': '1', 'KARDAMOM_CHECKPOINT_INTERVAL_S': '5', 'KARDAMOM_CANARY_STALLED_WINDOW': '1m',
+            'KARDAMOM_CANARY_FORCE_PULL': 'off',
+            'KARDAMOM_CLUSTER_JVM_OPTS': '-Daeron.cluster.startup.canvass.timeout=15s'})
+        self.assertEqual(self.chaos_knobs(), {
+            'canvass': ['-Daeron.cluster.startup.canvass.timeout=15s'], 'checkpoint': '5', 'stalled': '1m',
+            'force_pull': False, 'rules_unchanged': False})
+
     def test_the_local_profile_runs_no_canary_by_default(self):
         self.run_deploy(check=True)
         self.assertNotIn('canary', self.api.state['plans'])
