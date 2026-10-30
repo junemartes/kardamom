@@ -111,12 +111,38 @@ impl Channels {
     }
 }
 
-/// The scratch directory of one test; removed on drop.
+/// The scratch directory of one test; removed on drop. A failed test
+/// keeps it and prints the tail of each process log, because a CI job
+/// keeps only the output of the test.
 struct Scratch(PathBuf);
+
+/// The lines of each process log that a failed test prints.
+const LOG_TAIL: usize = 80;
+
+impl Scratch {
+    /// Print the last [`LOG_TAIL`] lines of each log in the directory.
+    fn print_log_tails(&self) {
+        let mut logs: Vec<PathBuf> = std::fs::read_dir(&self.0)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "log"))
+            .collect();
+        logs.sort();
+        for path in &logs {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            let tail = lines[lines.len().saturating_sub(LOG_TAIL)..].join("\n");
+            println!("==> {}\n{tail}", path.display());
+        }
+    }
+}
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        if !std::thread::panicking() {
+        if std::thread::panicking() {
+            self.print_log_tails();
+        } else {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
