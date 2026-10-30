@@ -347,7 +347,7 @@ impl Shard {
                 ..DeployVars::default()
             },
             Self::Cluster => DeployVars {
-                cluster_snapshot_interval_s: Some(60),
+                cluster_snapshot_interval_s: Some(SHORT_SNAPSHOT_S),
                 ..DeployVars::default()
             },
             Self::Retention => DeployVars {

@@ -204,7 +204,7 @@ async fn await_log_purge(h: &Harness, leader: u32, ctx: &str) -> anyhow::Result<
     let needle = format!("cluster LOG PURGED memberId={leader} ");
     let (hs, needle_ref) = (h, &needle);
     let outcome = poll::until(
-        Budget::new(PURGE_WAIT, Duration::from_secs(10)),
+        Budget::new(PURGE_WAIT, Duration::from_secs(3)),
         |_| async move {
             Ok(hs
                 .evidence

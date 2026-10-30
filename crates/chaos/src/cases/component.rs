@@ -14,7 +14,7 @@ use super::exec_stream::ExecStreamSessions;
 use super::recorded_cursor::BestRecorded;
 use crate::harness::Harness;
 use crate::poll::{self, Budget};
-use crate::probes::CLUSTER_TASK;
+use crate::probes::{CLUSTER_TASK, EXECUTOR_BLOCK_METRIC};
 
 pub(crate) const RESTORED: &str = "restored state from checkpoint";
 pub(crate) const FETCHED: &str = "fetched checkpoint from peer";
@@ -125,7 +125,7 @@ pub(crate) async fn node_failure_executor(h: &mut Harness) -> anyhow::Result<()>
         dark_after.as_secs()
     ));
     h.assert_count("executor", 2, h.knobs.restart_slo).await?;
-    h.assert_executor_progress(Duration::from_mins(3)).await?;
+    Survivors { victim: i }.assert_progress(h).await?;
     crate::log(format!(
         "node-failure: docker start {victim} (node returns)"
     ));
@@ -137,6 +137,56 @@ pub(crate) async fn node_failure_executor(h: &mut Harness) -> anyhow::Result<()>
         .await?;
     h.assert_count(CLUSTER_TASK, 3, h.knobs.reschedule_slo)
         .await
+}
+
+/// The executors that survive the loss of the node of executor `victim`.
+/// A read of the dead node waits out its scrape timeout, so the progress
+/// proof during the outage reads only the survivors: the node then
+/// stays down only as long as the proof needs.
+struct Survivors {
+    victim: usize,
+}
+
+impl Survivors {
+    /// The highest block of the surviving executors, read at once.
+    async fn head(&self, h: &Harness) -> Option<i64> {
+        let reads = (0..h.probes.executors.len())
+            .filter(|j| *j != self.victim)
+            .map(|j| h.probes.exec_metric(j, EXECUTOR_BLOCK_METRIC));
+        futures::future::join_all(reads)
+            .await
+            .into_iter()
+            .flatten()
+            .max()
+    }
+
+    /// The survivors must advance past their first reading while the
+    /// node is down.
+    async fn assert_progress(&self, h: &Harness) -> anyhow::Result<()> {
+        let base = std::cell::Cell::new(None);
+        let base_ref = &base;
+        let outcome = poll::until(Budget::secs(180, 2), |_| async move {
+            let Some(now) = self.head(h).await else {
+                return Ok(None);
+            };
+            let first = base_ref.get().unwrap_or(now);
+            base_ref.set(Some(first));
+            Ok((now > first).then_some((first, now)))
+        })
+        .await?;
+        let ((first, now), elapsed) = outcome.or_fail(|t| {
+            crate::chaos_fail!(
+                "node-failure: the surviving executors do not advance within {}s while executor {}'s node is down",
+                t.as_secs(),
+                self.victim
+            )
+        })?;
+        crate::log(format!(
+            "pipeline progressing (surviving executor block {first} -> {now} after {}s)",
+            elapsed.as_secs()
+        ));
+        Ok(())
+    }
 }
 
 /// The machine-replacement drill: the node of one executor is replaced
