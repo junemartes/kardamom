@@ -29,7 +29,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub(crate) use account_lookup::AccountLookupFeed;
+pub(crate) use account_lookup::{AccountLookupFeed, LookupSources, Retries};
 use guards::GuardPauses;
 use kardamom_cluster_adapter::LiveEgress;
 use kardamom_cluster_adapter::live::EgressPoll;
