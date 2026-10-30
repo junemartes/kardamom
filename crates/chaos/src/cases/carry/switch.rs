@@ -90,32 +90,30 @@ impl Run<'_> {
             .await
     }
 
-    /// Kill the inner container `cid` on `node` and read its exit time,
-    /// as its docker daemon records it, in the same exec: Nomad removes
-    /// the exited container when it restarts the task, so a later read
-    /// can find no container. The node and the runner share one clock.
+    /// Kill the inner container `cid` on `node`, and read the clock of the
+    /// node in the same exec once the kill returns. The death comes before
+    /// that instant, so it is an upper bound: the delay of the exec before
+    /// the kill counts, and only the return of the exec does not. A later
+    /// read of the exit time can find no container, because Nomad removes
+    /// the exited container when it restarts the task. The node and the
+    /// runner share one clock.
     async fn kill_and_read_exit(&self, node: &str, cid: &str) -> anyhow::Result<SystemTime> {
-        let script = format!(
-            "docker kill {cid} >/dev/null
-for _ in $(seq 1 100); do
-  state=$(docker inspect -f '{{{{.State.Running}}}} {{{{.State.FinishedAt}}}}' {cid})
-  case \"$state\" in false*) echo \"$state\"; exit 0;; esac
-  sleep 0.05
-done
-echo \"$state\""
-        );
-        let state = self.h.nodes.exec(node, &script).await?;
-        state
-            .trim()
-            .strip_prefix("false ")
-            .and_then(|stamp| humantime::parse_rfc3339(stamp).ok())
-            .ok_or_else(|| {
-                crate::chaos_fail!(
-                    "{}: {cid} on {node} reports no exit time after its kill: {}",
-                    self.ctx,
-                    state.trim()
-                )
-            })
+        let script = format!("docker kill {cid} >/dev/null && date +%s.%N");
+        let stamp = self.h.nodes.exec(node, &script).await?;
+        Self::node_instant(stamp.trim()).ok_or_else(|| {
+            crate::chaos_fail!(
+                "{}: the kill of {cid} on {node} prints no node time: {}",
+                self.ctx,
+                stamp.trim()
+            )
+        })
+    }
+
+    /// The instant of a `date +%s.%N` stamp.
+    pub(super) fn node_instant(stamp: &str) -> Option<SystemTime> {
+        let (secs, nanos) = stamp.split_once('.')?;
+        let after = Duration::new(secs.parse().ok()?, nanos.parse().ok()?);
+        SystemTime::UNIX_EPOCH.checked_add(after)
     }
 
     /// One egress instance restarts. It reads R from its mark, so

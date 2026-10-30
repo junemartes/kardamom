@@ -41,7 +41,7 @@ const CONFIRMED_LINE: &str = "batch confirmed on L1";
 const SPOOL_POST_BUDGET: Duration = Duration::from_secs(90);
 
 /// The least hold of a floor pass when nothing else bounds it.
-pub(super) const MIN_HOLD: Duration = Duration::from_mins(1);
+pub(super) const MIN_HOLD: Duration = Duration::from_secs(40);
 
 /// Hold until the ingress delta passed twice the retention, `min_hold`
 /// passed, and the sealers took a snapshot; the delta and the time.

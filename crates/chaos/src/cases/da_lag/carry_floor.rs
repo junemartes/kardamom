@@ -24,7 +24,14 @@ use job::{SEGMENT_BLOCKS, WindowJob};
 use replay::{Copies, Cursor};
 
 const CTX: &str = "prune-floor";
-const KEEP_BLOCKS: u64 = 24;
+/// The reader window of the fault, in blocks. The sealed head must pass
+/// the frozen cursor by the window and one segment, at one block per 2 s
+/// tick, so a short window keeps the fault short.
+const KEEP_BLOCKS: u64 = 12;
+/// The L1 blocks mined on each read of the posts after the thaw. Anvil
+/// mines a block only for a transaction and finalizes two blocks behind
+/// its head, so the last posts confirm only after two more blocks.
+const FINALIZE_HEAD: u64 = 3;
 
 pub(super) struct CarryFloor;
 
@@ -164,6 +171,7 @@ impl CarryFloor {
         let l1 = L1::new(h).await?;
         let l1_ref = &l1;
         poll::until(Budget::secs(300, 3), |_| async move {
+            l1_ref.mine(FINALIZE_HEAD).await?;
             Ok::<_, anyhow::Error>((l1_ref.covered_through().await? >= sealed).then_some(()))
         })
         .await?

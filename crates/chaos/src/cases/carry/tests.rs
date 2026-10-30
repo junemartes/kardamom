@@ -114,3 +114,14 @@ fn the_steps_run_a_low_load_and_the_outage_steps_keep_their_senders_live() {
         k.load_retry
     );
 }
+
+#[test]
+fn a_node_clock_stamp_is_an_instant_and_garbage_is_none() {
+    let at = Run::node_instant("1761818000.000000500").unwrap();
+    assert_eq!(
+        at.duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap(),
+        std::time::Duration::new(1_761_818_000, 500)
+    );
+    assert!(Run::node_instant("no such object").is_none());
+}

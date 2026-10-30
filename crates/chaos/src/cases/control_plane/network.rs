@@ -114,11 +114,20 @@ impl Check {
     }
 }
 
+/// The line that opens the task list in the output of a node script.
+const TASKS_MARK: &str = "__tasks__";
+
+/// The line that prints whether the fault chain is in the OUTPUT chain.
+const ARMED: &str = "if iptables -w 5 -C OUTPUT -j KDM_CHAOS_CP 2>/dev/null; then echo armed=1; else echo armed=0; fi";
+
+/// One phase of the fault on one node. Each phase is one exec on the
+/// node: on a busy runner a docker exec costs seconds.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Action {
-    Observe,
+    /// The checks answer, the task list is kept, then the fault chain is
+    /// armed.
+    ObserveAndArm,
     Available,
-    Arm,
     Isolated,
     Unchanged,
     Clear,
@@ -147,54 +156,90 @@ impl Step {
     async fn execute(&self) -> anyhow::Result<NodeView> {
         let mut view = self.view.clone();
         match self.action {
-            Action::Arm => {
-                Nodes.exec(&view.node, ARM).await?;
-            }
             Action::Clear => {
                 Nodes.exec(&view.node, CLEAR).await?;
             }
-            Action::Observe => {
-                self.verify(false).await?;
-                view.tasks = Nodes.exec(&view.node, TASKS).await?;
+            Action::ObserveAndArm => {
+                let script = format!(
+                    "{}\n{}\n( {ARM} ) || exit 1",
+                    self.verify_script(),
+                    Self::tasks_script()
+                );
+                let output = Nodes.exec(&view.node, &script).await?;
+                self.judge_checks(&output, false)?;
+                view.tasks = Self::tasks_of(&output);
             }
-            Action::Available => self.verify(false).await?,
+            Action::Available => {
+                let output = Nodes.exec(&view.node, &self.verify_script()).await?;
+                self.judge_checks(&output, false)?;
+            }
             Action::Isolated => {
-                self.verify(true).await?;
-                self.unchanged().await?;
+                let script = format!(
+                    "{}\n{ARMED}\n{}",
+                    self.verify_script(),
+                    Self::tasks_script()
+                );
+                let output = Nodes.exec(&view.node, &script).await?;
+                self.judge_checks(&output, true)?;
+                self.unchanged(&output)?;
             }
-            Action::Unchanged => self.unchanged().await?,
+            Action::Unchanged => {
+                let script = format!("{ARMED}\n{}", Self::tasks_script());
+                let output = Nodes.exec(&view.node, &script).await?;
+                self.unchanged(&output)?;
+            }
         }
         Ok(view)
     }
 
-    /// Run the four checks of the node in one exec, one after the other
-    /// inside the node: on a busy runner a docker exec costs seconds, and
-    /// many at once time out.
-    async fn verify(&self, isolated: bool) -> anyhow::Result<()> {
-        let script = self
-            .checks
+    /// The four checks of the node, one after the other inside the node,
+    /// each printing its own verdict line.
+    fn verify_script(&self) -> String {
+        self.checks
             .iter()
             .enumerate()
             .map(|(index, check)| check.line(index))
             .collect::<Vec<_>>()
-            .join("\n");
-        let output = Nodes.exec(&self.view.node, &script).await?;
+            .join("\n")
+    }
+
+    /// The task list after its mark. A failed listing fails the exec.
+    fn tasks_script() -> String {
+        format!("echo {TASKS_MARK}\n(\n{TASKS}\n) || exit 1")
+    }
+
+    /// The task list of a node script output: every line after the mark.
+    fn tasks_of(output: &str) -> String {
+        output
+            .lines()
+            .skip_while(|line| *line != TASKS_MARK)
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn judge_checks(&self, output: &str, isolated: bool) -> anyhow::Result<()> {
         self.checks
             .iter()
             .enumerate()
             .try_for_each(|(index, check)| {
-                check.judge(&self.view.node, Check::answered(&output, index)?, isolated)
+                check.judge(&self.view.node, Check::answered(output, index)?, isolated)
             })
     }
 
-    async fn unchanged(&self) -> anyhow::Result<()> {
-        Nodes
-            .exec(&self.view.node, "iptables -w 5 -C OUTPUT -j KDM_CHAOS_CP")
-            .await?;
-        let now = Nodes.exec(&self.view.node, TASKS).await?;
+    /// The fault chain is still armed, and the node runs the same
+    /// processes as before the partition.
+    fn unchanged(&self, output: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            output.lines().any(|line| line == "armed=1"),
+            "{}: {} lost the fault chain during the metadata partition",
+            super::CTX,
+            self.view.node
+        );
+        let now = Self::tasks_of(output);
         anyhow::ensure!(
             now == self.view.tasks,
-            "{}: {} changes its running processes during the metadata partition; before:\n{}after:\n{now}",
+            "{}: {} changes its running processes during the metadata partition; before:\n{}\nafter:\n{now}",
             super::CTX,
             self.view.node,
             self.view.tasks
@@ -206,6 +251,16 @@ impl Step {
 #[cfg(test)]
 mod script_tests {
     use super::Check;
+
+    #[test]
+    fn the_task_list_is_every_line_after_its_mark() {
+        let output = "0=1\n1=1\n__tasks__\nabc true 2026\ndef true 2026";
+        assert_eq!(
+            super::Step::tasks_of(output),
+            "abc true 2026\ndef true 2026"
+        );
+        assert_eq!(super::Step::tasks_of("0=1\n"), "");
+    }
 
     #[test]
     fn each_check_line_prints_its_own_verdict_and_a_missing_one_is_an_error() {

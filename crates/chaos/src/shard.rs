@@ -24,11 +24,13 @@ const SMALL_RETENTION: u64 = 2048;
 /// floor pass waits for one snapshot, so the interval bounds that wait.
 const SHORT_SNAPSHOT_S: u64 = 30;
 /// The cases of the retention shard. Its chain is born with the 8-block
-/// DA guard, for the two DA cases. None of the others stops the batcher,
-/// so the guard does not halt them.
-const RETENTION_CASES: [&str; 4] = [
+/// DA guard, for the two DA cases. None of the others stops the batcher:
+/// the retention overruns freeze an executor or the validator, and the
+/// join wipes the validator. So the guard does not halt them.
+const RETENTION_CASES: [&str; 5] = [
     "retention-overrun",
     "retention-overrun-validator",
+    "validator-join",
     "da-lag-halt",
     "canary-da-lag",
 ];
@@ -123,7 +125,6 @@ impl Shard {
         "sequencer-replica-kill-lane1-node1",
         "sequencer-lapse",
         "validator-lapse",
-        "validator-join",
         "lookup-blackout",
     ];
 
@@ -141,6 +142,7 @@ impl Shard {
                 "archive-driver-loss",
                 "archive-tx-data-wipe",
                 "archive-corruption",
+                "prune-floor",
             ],
             Self::Sequencer => Self::SEQUENCER_CASES,
             Self::Cluster => &[
@@ -152,7 +154,6 @@ impl Shard {
                 "cluster-member-rejoin",
                 "cluster-two-blank-recover",
                 "node-replace-sealer",
-                "cpu-squeeze",
             ],
             // Every replica of one role down at once. Each case waits
             // for the whole fleet to return and then keeps the load on
@@ -209,7 +210,6 @@ impl Shard {
                 "l1-liar",
                 "l1-null-receipts",
                 "two-day-outage",
-                "prune-floor",
                 "batcher-outage-past-retention",
             ],
             // The loss and the disagreement of the L1 follower's
@@ -229,6 +229,7 @@ impl Shard {
                 "redis-partition-ingress",
                 "redis-primary-kill",
                 "redis-primary-freeze",
+                "cpu-squeeze",
                 "mirror-kill-rebuild",
             ],
             // The nightly shard, on a reference-born cluster: the long
@@ -400,7 +401,7 @@ impl Shard {
         match self {
             // One squeeze of 40 s, past the 30 s Aeron stall tolerance, so
             // the sessions lapse and reconnect inside the deadline.
-            Self::Cluster => &[
+            Self::Cache => &[
                 ("RUN_LOAD", "0"),
                 ("SQUEEZE_CYCLES", "1"),
                 ("SQUEEZE_S", "40"),
@@ -420,7 +421,7 @@ impl Shard {
             | Self::CombinedOrdering
             | Self::CombinedExec
             | Self::Retention
-            | Self::Cache
+            | Self::Cluster
             | Self::Integrity => &[("RUN_LOAD", "0")],
         }
     }
