@@ -1149,6 +1149,8 @@
         "--tests",
         "io.kardamom.sealer.cluster.CpuSqueezeTest"
       ],
+      "test_timeout_s": 120,
+      "test_timeout_reason": "the leader's first log purge pass is a fixed 30 s",
       "ci_mode": "gradle",
       "junit_reports": [
         "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest.xml",
@@ -1219,6 +1221,8 @@
         "--tests",
         "io.kardamom.sealer.cluster.NodeReplaceSealerTest"
       ],
+      "test_timeout_s": 120,
+      "test_timeout_reason": "the leader's first log purge pass is a fixed 30 s",
       "ci_mode": "gradle",
       "junit_reports": [
         "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.ClusterLeaderKillTest.xml",
@@ -1296,6 +1300,8 @@
         "--tests",
         "io.kardamom.sealer.cluster.SealerFleetTotalWipeTest"
       ],
+      "test_timeout_s": 120,
+      "test_timeout_reason": "the leader's first log purge pass is a fixed 30 s",
       "ci_mode": "gradle",
       "junit_reports": [
         "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.ClusterQuorumLossRecoverTest.xml",

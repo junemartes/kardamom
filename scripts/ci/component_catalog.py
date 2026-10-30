@@ -33,6 +33,8 @@ class Catalog:
         return ([f"duplicate case: {name}" for name in duplicates]
                 + [f"suite {name}: ci_mode must be one of {list(CI_MODES)}"
                    for name, suite in self.suites.items() if suite.get("ci_mode") not in CI_MODES]
+                + [f"suite {name}: {error}" for name, suite in self.suites.items()
+                   for error in self.timeout_errors(suite)]
                 + [error for case in self.cases for error in self.case_errors(case)])
 
     def case_errors(self, case):
@@ -54,6 +56,20 @@ class Catalog:
              "cluster_only_checks must be a non-empty list of non-empty strings"),
             ((case["status"] == "ported") != case["full_case_locally_validated"],
              "status ported and full_case_locally_validated true must go together"),
+        ] if failed]
+
+    @staticmethod
+    def timeout_errors(suite):
+        """A suite can raise the 60 s per-test limit to at most 120 s, and must say why."""
+        if "test_timeout_s" not in suite:
+            return []
+        seconds = suite["test_timeout_s"]
+        valid = isinstance(seconds, int) and not isinstance(seconds, bool) and 60 <= seconds <= 120
+        reason = suite.get("test_timeout_reason")
+        return [error for failed, error in [
+            (not valid, "test_timeout_s must be an integer from 60 to 120"),
+            (valid and seconds > 60 and not (isinstance(reason, str) and reason.strip()),
+             "test_timeout_s above 60 needs a test_timeout_reason"),
         ] if failed]
 
     @staticmethod

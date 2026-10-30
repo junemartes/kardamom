@@ -291,6 +291,10 @@ always go together. A ported case needs:
   (`test`, `tests` or `failed_tests`) guards only those tests. A control that
   names no test guards every test of its suite.
 
+A suite can have the optional field `test_timeout_s`: the per-test limit in CI, an
+integer from 60 to 120. The default is 60. A value above 60 needs the field
+`test_timeout_reason`.
+
 The optional case field `cluster_only_checks` is a list of strings. Each string
 names a check that needs the deployed cluster, and gives the reason. The cluster
 chaos suite keeps these checks.

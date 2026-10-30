@@ -77,6 +77,21 @@ class CatalogTests(unittest.TestCase):
             document["cases"][0]["local_tests"] = [{"suite": "unrun", "test": "drains"}]
         self.assert_error(unrun, "so that CI runs it")
 
+    def test_a_raised_test_timeout_needs_a_reason_and_a_bound(self):
+        def raise_to(seconds, reason=None):
+            def change(document):
+                document["local_suites"]["guarded"]["test_timeout_s"] = seconds
+                if reason is not None:
+                    document["local_suites"]["guarded"]["test_timeout_reason"] = reason
+            return change
+        self.assertEqual(self.catalog(raise_to(60)).errors(), [])
+        self.assertEqual(self.catalog(raise_to(120, "the first log purge pass is a fixed 30 s")).errors(), [])
+        self.assert_error(raise_to(90), "needs a test_timeout_reason")
+        self.assert_error(raise_to(90, " "), "needs a test_timeout_reason")
+        for seconds in [59, 121, 90.5, "90", True]:
+            with self.subTest(seconds=seconds):
+                self.assert_error(raise_to(seconds, "reason"), "an integer from 60 to 120")
+
     def test_every_suite_needs_a_known_ci_mode(self):
         self.assert_error(lambda d: d["local_suites"]["guarded"].pop("ci_mode"), "suite guarded: ci_mode")
         self.assert_error(lambda d: d["local_suites"]["guarded"].update(ci_mode="nightly"), "suite guarded: ci_mode")

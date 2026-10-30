@@ -76,7 +76,10 @@ The CI jobs:
    is fixed. A shard compiles nothing. It pulls the docker images once, or loads them
    from the cache that a push saves, then runs its planned tests one at a time.
 
-Each test runs in its own process with a 60-second deadline. A shard has a six-minute
+Each test runs in its own process with a 60-second deadline. A suite can raise
+its deadline to at most 120 seconds with `test_timeout_s`; it then also states
+the reason in `test_timeout_reason`. The plan checks that every shard fits its
+deadline when its slowest-limit test runs to its limit. A shard has a six-minute
 execution deadline in a ten-minute job. After each docker test, the shard removes the
 containers that the test left. Missing tests, skipped tests, timeouts and mismatched
 artifact hashes fail the run. Each shard prints a timing table and uploads its logs.

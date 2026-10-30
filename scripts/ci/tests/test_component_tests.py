@@ -58,6 +58,28 @@ class ComponentTests(unittest.TestCase):
         self.assertEqual(len(planned), len(set(planned)))
         self.assertEqual(shards, component.Plan.load().shards())
 
+    def test_one_test_at_its_limit_still_fits_every_shard(self):
+        plan = component.Plan.load()
+        self.assertTrue(all(plan.worst_case(shard) <= component.SHARD_SECONDS for shard in plan.shards()))
+
+    def test_a_suite_limit_replaces_the_default_test_limit(self):
+        catalog = {"local_suites": {"slow": {"ci_mode": "gradle", "tests": ["a"], "test_timeout_s": 120},
+                                    "fast": {"ci_mode": "in-process", "tests": ["b"]}}}
+        plan = component.Plan(catalog, {"slow::a": 300.0})
+        self.assertEqual({test["test"]: test["limit"] for test in plan.tests()}, {"a": 120, "b": 60})
+        self.assertEqual(plan.estimate(plan.tests()[0]), 120)
+        def run(command, log, seconds, environment):
+            log.write_text("")
+            return 0, False, 1.0
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(component.Shard, "execute", side_effect=run) as execute, \
+                patch.object(component.Bundle, "command", return_value=(["x"], {})):
+            output = Path(directory) / "results"
+            output.mkdir()
+            shard = component.Shard(component.Bundle(Path(directory)), None, output)
+            shard.run_test(0, dict(plan.tests()[0], mode="in-process"), 600)
+        self.assertEqual(execute.call_args.args[2], 120)
+
     def test_the_plan_spreads_the_longest_tests_first(self):
         catalog = {"local_suites": {"slow": {"ci_mode": "docker", "tests": ["a", "b", "c", "d"]},
                                     "fast": {"ci_mode": "in-process", "tests": [f"t{i}" for i in range(8)]}}}

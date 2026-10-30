@@ -32,6 +32,7 @@ CATALOG = ROOT / "scripts/ci/component-recovery.json"
 TIMINGS = ROOT / "scripts/ci/component-timings.json"
 SEALER = ROOT / "cluster/sealer-service"
 SEALER_RUNTIME = SEALER / "service/build/component-runtime"
+# The default per-test limit. A suite can raise it to at most 120 s with test_timeout_s and a reason.
 TEST_SECONDS = 60
 SHARD_SECONDS = 6 * 60
 SHARDS = 4
@@ -64,12 +65,17 @@ class Plan:
         return cls(json.loads(CATALOG.read_text()), json.loads(TIMINGS.read_text()))
 
     def tests(self, modes=None):
-        return [{"suite": name, "test": test, "mode": suite["ci_mode"]}
+        return [{"suite": name, "test": test, "mode": suite["ci_mode"],
+                 "limit": suite.get("test_timeout_s", TEST_SECONDS)}
                 for name, suite in self.suites.items() if modes is None or suite["ci_mode"] in modes
                 for test in suite["tests"]]
 
     def estimate(self, test):
-        return self.timings.get(f"{test['suite']}::{test['test']}", DEFAULT_SECONDS[test["mode"]])
+        return min(test["limit"], self.timings.get(f"{test['suite']}::{test['test']}", DEFAULT_SECONDS[test["mode"]]))
+
+    def worst_case(self, shard):
+        """The shard's time if its longest-limit test runs to its limit and every other test takes its estimate."""
+        return sum(map(self.estimate, shard)) + max(test["limit"] - self.estimate(test) for test in shard)
 
     def shards(self):
         ordered = sorted(self.tests(), key=lambda test: (-self.estimate(test), test["suite"], test["test"]))
@@ -85,7 +91,8 @@ class Plan:
         loads[index] += self.estimate(test)
 
     def describe(self):
-        return "\n".join(f"shard {index}: {len(shard)} tests, estimate {sum(map(self.estimate, shard)):.0f}s"
+        return "\n".join(f"shard {index}: {len(shard)} tests, estimate {sum(map(self.estimate, shard)):.0f}s, "
+                         f"worst case {self.worst_case(shard):.0f}s of {SHARD_SECONDS}s"
                          for index, shard in enumerate(self.shards()))
 
 
@@ -413,9 +420,10 @@ class Shard:
         if entry["mode"] == "stack":
             environment |= self.sealer.stack_environment()
         before = Docker.containers() if entry["mode"] in CONTAINER_MODES else set()
-        code, timed_out, seconds = self.execute(command, log, min(TEST_SECONDS, remaining), environment)
+        limit = entry.get("limit", TEST_SECONDS)
+        code, timed_out, seconds = self.execute(command, log, min(limit, remaining), environment)
         left = Docker.remove_new(before) if entry["mode"] in CONTAINER_MODES else 0
-        success = (code == 0 and not timed_out and seconds <= TEST_SECONDS
+        success = (code == 0 and not timed_out and seconds <= limit
                    and runner.verdict(entry, log.read_text(errors="replace"), reports))
         return dict(entry, success=success, exit_code=code, timed_out=timed_out,
                     seconds=round(seconds, 3), removed_containers=left, log=str(log))
