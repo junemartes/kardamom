@@ -32,7 +32,7 @@ class ClusterLeaderKillTest {
     @InterruptAfter(value = 60, unit = TimeUnit.SECONDS)
     void a_killed_leader_leaves_a_quorum_that_commits_and_the_member_rejoins() {
         try (LocalSealers group = new LocalSealers(dir, 3, LocalSealers.Settings.DEFAULT);
-             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints)) {
+             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
             final SealerNode.View leader = group.awaitLeader(Duration.ofSeconds(20));
             IntStream.range(0, 5).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));

@@ -41,8 +41,8 @@ class CpuSqueezeTest {
     @InterruptAfter(value = 60, unit = TimeUnit.SECONDS)
     void starved_members_slow_down_but_never_fork_the_canonical_order() {
         try (LocalSealers group = new LocalSealers(dir, 3, LocalSealers.Settings.DEFAULT);
-             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints);
-             CanonicalConsumer validator = new CanonicalConsumer(dir.resolve("validator"), group::ingressEndpoints)) {
+             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group);
+             CanonicalConsumer validator = new CanonicalConsumer(dir.resolve("validator"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
             group.awaitLeader(Duration.ofSeconds(20));
             final Set<Integer> committed = new HashSet<>();
