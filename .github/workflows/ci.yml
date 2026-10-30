@@ -96,6 +96,12 @@ jobs:
     name: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Line tables keep file and line numbers in backtraces. Full debug info
+    # makes the test binaries several times larger, and the archive and the
+    # upload of the binaries take minutes.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -119,7 +125,7 @@ jobs:
           cargo test --workspace --locked --no-run --features "$features" \
             --message-format=json-render-diagnostics > /tmp/workspace-build.jsonl
           cargo nextest archive --workspace --locked --features "$features" \
-            --archive-file /tmp/workspace-tests.tar.zst
+            --zstd-level 1 --archive-file /tmp/workspace-tests.tar.zst
       - name: Package the component recovery tests
         run: |
           python3 scripts/ci/component_tests.py prepare --artifacts /tmp/workspace-build.jsonl --bundle /tmp/component-bundle

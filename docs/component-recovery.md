@@ -186,7 +186,7 @@ test rejects a new chaos case without a corresponding plan. Each family lists th
 real actors, boundary faults, recovery invariants and dependencies that still need
 real integration. `partial` means that named local tests validate some boundary
 assumptions. It does not mean the complete distributed case has passed locally.
-Forty-one cases have partial mappings. No full case is marked locally validated yet.
+`just component-summary` prints the current planned, partial and ported counts.
 
 `just component-catalog` checks the catalog. `just component-summary` prints the
 planned, partial and ported counts for each family. A case is ported when its
