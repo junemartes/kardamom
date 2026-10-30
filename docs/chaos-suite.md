@@ -115,10 +115,11 @@ After each docker test, the shard removes the containers that the test left.
 Missing tests, skipped tests, timeouts and mismatched artifact hashes fail the run.
 Each shard prints a timing table and uploads its logs.
 
-The plan puts the longest test first onto the least loaded shard. It uses the measured
-runtimes in `scripts/ci/component-timings.json`. Every test must have a measured
-runtime there; `just component-catalog` fails without it. To update the runtimes
-from the results of a CI run:
+The plan takes the longest test first. It puts each test onto the shard whose worst
+case stays lowest. So the shards differ in estimate, but not in worst case. The plan
+uses the measured runtimes in `scripts/ci/component-timings.json`. Every test must
+have a measured runtime there; `just component-catalog` fails without it. To update
+the runtimes from the results of a CI run:
 
 ```sh
 gh run download RUN --pattern 'component-results-*' --dir "$work/results"

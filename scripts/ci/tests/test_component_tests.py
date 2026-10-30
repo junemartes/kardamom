@@ -90,6 +90,16 @@ class ComponentTests(unittest.TestCase):
         loads = [sum(map(component.Plan(catalog, timings).estimate, shard)) for shard in shards]
         self.assertLessEqual(max(loads) - min(loads), 50.0)
 
+    def test_the_plan_balances_the_worst_case_not_the_estimate(self):
+        # The wide test can run 70 s over its estimate, so its shard takes fewer other tests.
+        short = [f"s{i}" for i in range(6 * component.SHARDS)]
+        catalog = {"local_suites": {"wide": {"ci_mode": "docker", "test_timeout_s": 120, "tests": ["w"]},
+                                    "short": {"ci_mode": "docker", "tests": short}}}
+        timings = {"wide::w": 50.0} | {f"short::{test}": 10.0 for test in short}
+        plan = component.Plan(catalog, timings)
+        worst = [plan.worst_case(shard) for shard in plan.shards()]
+        self.assertLessEqual(max(worst) - min(worst), 10.0)
+
     def fixture(self, code, **budgets):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

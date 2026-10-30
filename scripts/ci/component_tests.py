@@ -56,7 +56,7 @@ BUILT_IMAGES = {"kardamom-aeron:test": ROOT / "crates/log/docker/aeron"}
 
 
 class Plan:
-    """The fixed shard plan: longest measured test first, onto the least loaded shard."""
+    """The fixed shard plan: longest measured test first, onto the shard whose worst case stays lowest."""
 
     def __init__(self, catalog, timings):
         self.suites = {name: suite for name, suite in catalog["local_suites"].items() if "ci_mode" in suite}
@@ -82,15 +82,9 @@ class Plan:
     def shards(self):
         ordered = sorted(self.tests(), key=lambda test: (-self.estimate(test), test["suite"], test["test"]))
         shards = [[] for _ in range(SHARDS)]
-        loads = [0.0] * SHARDS
         for test in ordered:
-            self.place(test, shards, loads)
+            min(shards, key=lambda shard: (self.worst_case(shard + [test]), len(shard))).append(test)
         return [sorted(shard, key=lambda test: (test["mode"], test["suite"], test["test"])) for shard in shards]
-
-    def place(self, test, shards, loads):
-        index = loads.index(min(loads))
-        shards[index].append(test)
-        loads[index] += self.estimate(test)
 
     def describe(self):
         return "\n".join(f"shard {index}: {len(shard)} tests, estimate {sum(map(self.estimate, shard)):.0f}s, "
