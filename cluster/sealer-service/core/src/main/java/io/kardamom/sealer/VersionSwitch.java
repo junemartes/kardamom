@@ -197,12 +197,22 @@ public final class VersionSwitch {
      */
     public boolean matchesGenesis(final GenesisFeatures features) {
         return holdsEach(features)
-            && Stream.of(v4, carry, window).skip(features.count()).noneMatch(Schedule::holdsGenesis);
+            && schedulesOutside(features).noneMatch(Schedule::holdsGenesis);
     }
 
     /** The schedules of {@code features}: the first of version 4, the carry flag and the carry window. */
     private Stream<Schedule> schedulesOf(final GenesisFeatures features) {
-        return Stream.of(v4, carry, window).limit(features.count());
+        return schedules().limit(features.count());
+    }
+
+    /** The schedules outside {@code features}: the ones that {@link #schedulesOf} leaves out. */
+    private Stream<Schedule> schedulesOutside(final GenesisFeatures features) {
+        return schedules().skip(features.count());
+    }
+
+    /** The schedules in feature id order: version 4, the carry flag and the carry window. */
+    private Stream<Schedule> schedules() {
+        return Stream.of(v4, carry, window);
     }
 
     /** The version of the rules of the open block. */
