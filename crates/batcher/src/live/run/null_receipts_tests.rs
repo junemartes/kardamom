@@ -191,7 +191,15 @@ impl Fixture {
         let spool = Spool::open(&args.spool_dir).unwrap();
         let (restored, resume) =
             continue_from_spool(&spool, resumed.cursor, resumed.skip_through_block).unwrap();
-        let mut feed = resumed.feed(&args, spool, restored, resume);
+        let feed = resumed.feed(&args, spool, restored, resume);
+        Self::run_feed(feed, blocks)
+    }
+
+    /// Run `feed` over the replay of `blocks` until the replay ends.
+    fn run_feed<P: Provider + 'static>(
+        mut feed: FeedLoop<P>,
+        blocks: std::ops::RangeInclusive<u64>,
+    ) -> Post {
         Post(tokio::spawn(async move {
             let error = feed.run(Self::replay(blocks)).await;
             anyhow::ensure!(
@@ -450,3 +458,6 @@ impl Post {
         assert!(error.to_string().contains("post batch"), "{error:#}");
     }
 }
+
+#[path = "outage_tests.rs"]
+mod outage;

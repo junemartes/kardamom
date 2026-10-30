@@ -636,6 +636,39 @@
       ],
       "ci_mode": "docker"
     },
+    "aeron-client-timeout-exit": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-log",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "client_timeout_exit",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "AeronRuntime and archive control session, the two Aeron client contexts of the batcher",
+        "the crate's fail-fast Aeron error handler",
+        "Aeron media driver in one disposable container",
+        "a child process stopped with SIGSTOP and continued"
+      ],
+      "controlled": [
+        "1-second client liveness timeout of the test driver",
+        "3-second stop of the child"
+      ],
+      "tests": [
+        "a_client_timeout_in_the_runtime_context_exits",
+        "a_client_timeout_in_the_archive_context_exits",
+        "a_client_timeout_in_both_contexts_at_once_exits"
+      ],
+      "limitation": "The child holds the batcher's Aeron contexts, not the whole batcher binary. The supervisor restart is the orchestrator's.",
+      "ci_mode": "docker"
+    },
     "state-mirror": {
       "command": [
         "cargo",
@@ -1346,10 +1379,20 @@
         "hidden_mined_receipts_reconcile_without_duplicate_posts_or_early_cursor",
         "restart_during_hidden_receipts_uses_contract_truth_without_waiting_for_the_indexer",
         "every_lie_lets_a_restarted_batcher_post_and_confirm_three_batches",
-        "a_refusing_provider_fail_stops_the_post_and_a_restart_posts_it_once"
+        "a_refusing_provider_fail_stops_the_post_and_a_restart_posts_it_once",
+        "a_batcher_frozen_past_the_floor_posts_its_spool_then_the_rebuilt_gap_once"
       ],
       "limitation": "No full follower fleet, Prometheus alert, Nomad restart, consensus retention or EigenDA proof. These tests cover null receipt reconciliation and restart, not expiry of the 120-second receipt deadline. Alloy timeout bookkeeping includes the wall clock, so Tokio virtual time alone cannot prove that deadline. The existing local DA helper serves until the test process exits. Payloads contain empty boundary blocks; transaction execution and full-chain transfer progress are outside this fixture.",
-      "ci_mode": "docker"
+      "ci_mode": "docker",
+      "negative_controls": [
+        {
+          "mutation": "drop the spool at a restart instead of restoring its group",
+          "test": "a_batcher_frozen_past_the_floor_posts_its_spool_then_the_rebuilt_gap_once",
+          "exit_code": 101,
+          "failed_as_expected": true,
+          "compiled": true
+        }
+      ]
     },
     "batcher-post-age": {
       "command": [
@@ -2396,7 +2439,7 @@
     {
       "case": "batcher-outage-past-retention",
       "family": "L1",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "egress-owner",
@@ -2405,9 +2448,36 @@
         {
           "suite": "batcher-recovery",
           "test": "a_restored_post_is_reconciled_before_live_blocks_can_extend_it"
+        },
+        {
+          "suite": "batcher-null-receipts",
+          "test": "a_batcher_frozen_past_the_floor_posts_its_spool_then_the_rebuilt_gap_once"
+        },
+        {
+          "suite": "aeron-client-timeout-exit",
+          "test": "a_client_timeout_in_the_runtime_context_exits"
+        },
+        {
+          "suite": "aeron-client-timeout-exit",
+          "test": "a_client_timeout_in_the_archive_context_exits"
+        },
+        {
+          "suite": "aeron-client-timeout-exit",
+          "test": "a_client_timeout_in_both_contexts_at_once_exits"
+        },
+        {
+          "suite": "egress-owner",
+          "test": "a_frozen_posted_head_keeps_every_block_above_it_past_the_window"
+        },
+        {
+          "suite": "sealer-raft",
+          "test": "io.kardamom.sealer.cluster.SealerReplayTest::evictedRangeIsRefusedHonestly()"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restart of the batcher task after its fail-fast exit: the orchestrator, not the process, starts the new instance"
+      ]
     },
     {
       "case": "l1-transport-refusals",

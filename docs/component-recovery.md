@@ -314,6 +314,19 @@ page with their causes. The batcher suite adds two Anvil checks: a restarted
 batcher posts and confirms through each lie of its endpoint, and a refusing
 endpoint fail-stops a post that a restart then posts once.
 
+A third Anvil check models a batcher frozen past the sealers' floor. The
+freeze leaves a signed post off L1 and its block in the spool. The restart
+must post that group first, right after the covered block. It then rebuilds
+the refused gap from the block references and the archived bytes, posts it,
+and posts the live blocks from the floor on. Every block lands once, in
+order, with one transaction per post. `just test-component
+aeron-client-timeout-exit` adds the exit itself. A child process holds the
+batcher's two Aeron contexts, the runtime and the archive session, against
+one disposable media driver with a one-second client liveness timeout.
+After SIGSTOP and SIGCONT, the child must exit through the fail-fast
+handler. The egress keeps every block above a frozen posted head, and a
+real sealer group refuses an evicted range with its oldest block.
+
 `just test-component transport-pressure` runs eight real Aeron runtimes against
 one disposable media driver. Independent output streams lack subscribers while a
 live stream from a separate publisher runtime must deliver every 1-KiB frame. The output offers must remain pending
