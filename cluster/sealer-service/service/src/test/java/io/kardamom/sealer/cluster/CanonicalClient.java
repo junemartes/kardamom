@@ -3,7 +3,6 @@ package io.kardamom.sealer.cluster;
 import io.aeron.Publication;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.driver.MediaDriver;
-import io.aeron.driver.ThreadingMode;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.HashSet;
@@ -32,16 +31,15 @@ final class CanonicalClient implements AutoCloseable {
     private final java.util.Map<Integer, Long> deadlines = new java.util.HashMap<>();
     private AeronCluster client;
     private int reconnects;
+    /** Whether this session has an unanswered replay request, and the replay answers before it. */
+    private boolean replayAsked;
+    private long replayDoneAtAsk;
     /** The relayed frames of the egress that {@link #relayed} already holds. */
     private int scanned;
 
-    CanonicalClient(final Path aeronDir, final Supplier<String> endpoints) {
-        this.endpoints = endpoints;
-        this.driver = MediaDriver.launch(new MediaDriver.Context()
-            .aeronDirectoryName(aeronDir.toString())
-            .threadingMode(ThreadingMode.SHARED)
-            .dirDeleteOnStart(true)
-            .dirDeleteOnShutdown(true));
+    CanonicalClient(final Path aeronDir, final LocalSealers group) {
+        this.endpoints = group::ingressEndpoints;
+        this.driver = group.clientDriver(aeronDir);
     }
 
     RecordingEgressListener egress() {
@@ -73,7 +71,10 @@ final class CanonicalClient implements AutoCloseable {
     /** Fail past {@code deadline}; else offer record {@code n} once and poll for its relay. */
     private void attemptBefore(final int n, final int fillBytes, final long deadline, final Duration bound) {
         if (System.nanoTime() - deadline > 0) {
-            throw new AssertionError("record " + n + " was not relayed within " + bound.toMillis() + " ms");
+            throw new AssertionError("record " + n + " was not relayed within " + bound.toMillis() + " ms; sessions="
+                + reconnects + " open=" + (client != null && !client.isClosed()) + " relayed=" + relayed
+                + " boundaries=" + egress.boundaries.size() + " replayDone=" + egress.replayDoneCount
+                + " leader=" + (client == null ? -1 : client.leaderMemberId()));
         }
         attempt(n, fillBytes, Math.min(deadline, System.nanoTime() + REOFFER_NS));
     }
@@ -135,6 +136,26 @@ final class CanonicalClient implements AutoCloseable {
         while (!relayed.contains(n) && System.nanoTime() - until < 0 && session().isPresent()) {
             pollAndPause();
         }
+        if (!relayed.contains(n) && client != null) {
+            recover();
+        }
+    }
+
+    /**
+     * Recover a record that the egress did not relay. A record that the new
+     * leader applied in its election reaches no session, and its re-offer is
+     * a duplicate: a replay from the cursor delivers it, as it does for a
+     * consumer that sees a gap. A session that did not answer the last
+     * replay request is dropped, and the next attempt opens a new one.
+     */
+    private void recover() {
+        if (replayAsked && egress.replayDoneCount == replayDoneAtAsk) {
+            drop();
+            return;
+        }
+        replayAsked = true;
+        replayDoneAtAsk = egress.replayDoneCount;
+        resume();
     }
 
     private boolean offered(final ExpandableArrayBuffer buf, final int length) {
@@ -207,11 +228,16 @@ final class CanonicalClient implements AutoCloseable {
     private void announce() {
         offerOnSession(IngressFrames.subscribeFrame());
         if (reconnects > 1) {
-            final long[] cursor = egress.boundaries.isEmpty()
-                ? new long[] {io.kardamom.sealer.CanonicalSealerState.GENESIS_BLOCK_NUMBER - 1, 0}
-                : egress.boundaries.get(egress.boundaries.size() - 1);
-            offerOnSession(IngressFrames.replayRequestFrame(cursor[1], cursor[0] + 1));
+            resume();
         }
+    }
+
+    /** Ask for the stream after the last boundary that this client saw. */
+    private void resume() {
+        final long[] cursor = egress.boundaries.isEmpty()
+            ? new long[] {io.kardamom.sealer.CanonicalSealerState.GENESIS_BLOCK_NUMBER - 1, 0}
+            : egress.boundaries.get(egress.boundaries.size() - 1);
+        offerOnSession(IngressFrames.replayRequestFrame(cursor[1], cursor[0] + 1));
     }
 
     /** Offer {@code frame} on the new session, retrying for one re-offer interval. */
@@ -227,6 +253,7 @@ final class CanonicalClient implements AutoCloseable {
     private void drop() {
         CloseHelper.quietClose(client);
         client = null;
+        replayAsked = false;
     }
 
     @Override

@@ -3855,6 +3855,7 @@ dependencies = [
  "alloy-primitives",
  "arc-swap",
  "dashmap",
+ "futures",
  "jsonrpsee",
  "kardamom-formats",
  "kardamom-types",
