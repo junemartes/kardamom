@@ -61,6 +61,11 @@ final class IngressFrames {
      * deadline and no tip, then the canonical id and the opaque payload.
      */
     static byte[] exemptRecordFrame(final byte[] canonicalId32, final byte[] payload) {
+        return exemptRecordFrame(canonicalId32, payload, Long.MAX_VALUE);
+    }
+
+    /** {@link #exemptRecordFrame(byte[], byte[])} with the inclusion deadline {@code deadline}, a block number. */
+    static byte[] exemptRecordFrame(final byte[] canonicalId32, final byte[] payload, final long deadline) {
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
         int pos = 0;
         buf.putByte(pos, SealerWire.KIND_INGRESS_RECORD);
@@ -69,7 +74,7 @@ final class IngressFrames {
         pos += CanonicalSealerState.SENDER_LEN;
         buf.putLong(pos, 0L, ByteOrder.LITTLE_ENDIAN);
         pos += Long.BYTES;
-        buf.putLong(pos, Long.MAX_VALUE, ByteOrder.LITTLE_ENDIAN); // no deadline
+        buf.putLong(pos, deadline, ByteOrder.LITTLE_ENDIAN);
         pos += Long.BYTES;
         buf.putBytes(pos, new byte[SealerWire.TIP_LEN]); // no tip
         pos += SealerWire.TIP_LEN;

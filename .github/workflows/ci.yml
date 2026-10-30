@@ -11,9 +11,13 @@ on:
   # branch, the lint/test lane was the one lane with no way to run at all.
   workflow_dispatch:
 
+# A new push to a pull request cancels its older run. A push to a base
+# branch never cancels a run: that run saves the build caches, and the
+# base branch gets a new merge often. A newer push waits, and GitHub keeps
+# only the newest waiting run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
