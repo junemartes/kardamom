@@ -221,8 +221,8 @@ service addresses. While the group is down, the production reader degrades witho
 stall and the mirror marks a rebuild. The group returns empty, the Sentinels name a
 primary, and the mirror rebuilds every account once a checkpoint reaches its first
 live batch. A second check kills three mirrors with the group. Two production
-readers must count a degraded read with no stall. Redis returns empty first, then
-the mirrors, then a newer checkpoint and a live batch. Every mirror must rebuild,
+readers must count a degraded read with no stall. The mirrors return first and
+wait for Redis, Redis returns empty, then a newer checkpoint and a live batch come. Every mirror must rebuild,
 and each reader must count a Redis hit and no degraded read. The fixture takes its
 host ports from 20000-29999 under a lock file, so two runs on one host cannot share
 a port, also while the containers are down.

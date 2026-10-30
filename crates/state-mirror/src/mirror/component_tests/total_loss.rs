@@ -188,10 +188,9 @@ impl Reader {
 }
 
 /// read-path-loss-recover: the executors, Redis and all three mirrors
-/// die. Both ingress readers degrade, counted, with no stall. Redis
-/// returns empty first; the three mirrors return and wait for a
-/// checkpoint; the executors return last with a newer checkpoint and a
-/// live batch. Every mirror rebuilds every account and advances, and
+/// die. Both ingress readers degrade, counted, with no stall. The three
+/// mirrors return first and wait for Redis; Redis returns empty; the
+/// executors return last with a newer checkpoint and a live batch. Every mirror rebuilds every account and advances, and
 /// each reader reads Redis again with no degraded read.
 #[tokio::test]
 #[ignore = "requires Linux Docker bridge routing and five disposable containers"]
@@ -219,13 +218,23 @@ async fn the_whole_read_path_returns_in_reverse_order_and_every_mirror_rebuilds(
         reader.assert_degraded(address).await;
     }
 
-    group.start_everything().await;
+    // The reverse order of the case: the mirrors start first and wait for
+    // Redis, Redis returns empty, and the executors return last.
     let rebuilds = counter("kardamom_state_mirror_rebuilds_total", "");
-    let actors = [
-        fixture.start(0, false).await,
-        fixture.start(1, false).await,
-        fixture.start(2, false).await,
-    ];
+    let (actors, ()) = tokio::join!(
+        async {
+            let (a, b, c) = tokio::join!(
+                fixture.start_waiting(0),
+                fixture.start_waiting(1),
+                fixture.start_waiting(2)
+            );
+            [a, b, c]
+        },
+        async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            group.start_everything().await;
+        }
+    );
     tokio::time::sleep(Duration::from_secs(2)).await;
     fixture.checkpoint_at(2, 41, &[Fixture::row(1, 2)]);
     for actor in &actors {

@@ -315,6 +315,20 @@ impl Fixture {
     }
 
     pub(super) async fn start(&self, id: u32, force: bool) -> Actor {
+        let cache = AccountCache::connect(&self.mirror_cfg()).await.unwrap();
+        self.actor(id, force, cache)
+    }
+
+    /// Start mirror `id` as the mirror process does: it waits until Redis
+    /// names a primary, so it can start before Redis returns.
+    pub(super) async fn start_waiting(&self, id: u32) -> Actor {
+        let cache = AccountCache::connect_waiting(&self.mirror_cfg(), Duration::from_millis(200))
+            .await
+            .unwrap();
+        self.actor(id, false, cache)
+    }
+
+    fn mirror_cfg(&self) -> CacheConfig {
         let mut cfg = self.cfg.clone();
         if self.mirror_user {
             cfg.username = Some("mirror".into());
@@ -322,7 +336,10 @@ impl Fixture {
                 .url
                 .map(|url| url.replacen("redis://", "redis://mirror:component-test@", 1));
         }
-        let cache = AccountCache::connect(&cfg).await.unwrap();
+        cfg
+    }
+
+    fn actor(&self, id: u32, force: bool, cache: AccountCache) -> Actor {
         let (input, rx) = unbounded_channel();
         let shutdown = CancellationToken::new();
         let mirror = Mirror::new(MirrorInputs {
