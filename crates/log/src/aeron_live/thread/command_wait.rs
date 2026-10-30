@@ -1,4 +1,15 @@
-//! Static wait strategies preserve the short-cap loop and park empty long-cap polls.
+//! The command wait of the Aeron thread, chosen once from the idle cap.
+//!
+//! - In crossbeam-channel 0.5.15, `Receiver::recv_timeout` spins with
+//!   `Backoff::snooze` before it parks (`flavors/array.rs` and
+//!   `flavors/list.rs`).
+//! - `Select::select_timeout` tries the receiver once and parks at once.
+//!
+//! [`Spin`] keeps `recv_timeout` for every wait. [`ParkIdle`] uses
+//! `select_timeout` for an empty wait, so an empty long-cap wait does not
+//! spin. After useful work it keeps `recv_timeout`, so the thread sees a
+//! command that follows the work before it parks. The measurement is in
+//! `docs/benches/2026-10-28-empty-poll-parking.md`.
 
 use std::time::Duration;
 

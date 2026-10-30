@@ -53,7 +53,7 @@ async fn partial_live_batch_retries_without_new_input_and_publishes_head_last() 
     fixture.head(0, 30).await;
     fixture.assert_row(0, 3, 30).await;
     fixture.assert_row(1, 3, 30).await;
-    assert!(fixture.head_file(0).rebuild_pending().unwrap());
+    assert!(!fixture.head_file(0).rebuild_pending().unwrap());
     assert_eq!(
         fixture
             .cache

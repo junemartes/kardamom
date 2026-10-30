@@ -844,8 +844,8 @@ public final class ClusterNode {
                 + " of feature 5, and its snapshot has no place for it");
         }
         if (seed.filter(s -> !s.rules().holdsEach(features)).isPresent()) {
-            throw new IllegalStateException(GenesisFeatures.SETTING + "=" + features.value() + ", but the seed holds"
-                + " no activation of each of these features: write the seed with the genesis of this chain");
+            throw new IllegalStateException(features.refusal("seed holds no activation of each of these features:"
+                + " write the seed with the genesis of this chain"));
         }
         return features;
     }

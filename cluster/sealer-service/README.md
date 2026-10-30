@@ -397,6 +397,7 @@ A sealer cluster that lost all its state can start after a block `H` that `karda
 - An unreadable or invalid seed stops the start.
 - A member with a non-empty `remoteOrigins` refuses a seed and does not start. The seed holds no peer anchor, so a seeded cluster runs with interop off.
 - A member with `genesisFeatures` refuses a seed whose rules do not hold an activation of each of these features, and does not start. A chain that ran the features from its genesis holds one of each for all time.
+- A member that restores a snapshot of a chain that started at genesis checks the snapshot against `genesisFeatures`, in both directions. The snapshot must hold an activation of each feature of the setting, and no genesis activation (L1 origin 0) of another feature. Else the member prints `sealer GENESIS-FEATURES FATAL` and does not start. A member that replays the log from position 0 starts with the setting, so a snapshot with other rules would fork the state. A snapshot of a seeded chain takes its rules from the seed, so the check skips it. A running chain with no setting and no genesis activation starts as before.
 
 The seeded state:
 
@@ -456,7 +457,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.backup.sourceType` | `FOLLOWER` | no | The members that a backup node copies from: `ANY`, `LEADER` or `FOLLOWER`. Any other value stops the start. |
 | `kardamom.cluster.bootstrap` | off | no | `true` starts a blank member at log position 0. The file `bootstrap` in `$NOMAD_TASK_DIR` has the same effect. See [Start modes](#start-modes). |
 | `kardamom.cluster.seedSnapshot` | none | yes, on a new seeded cluster | The path of the seed file. A cluster with no snapshot starts after the head of the seed, not at genesis. See [Seeded start](#seeded-start). |
-| `kardamom.cluster.genesisFeatures` | empty | yes, for the life of the chain | The features of the version switch that the chain runs from its genesis: empty, `3`, `3,4` or `3,4,5`. Any other value stops the start. `3,4,5` together with `carryBytes=true` stops the start. Only a member that starts at genesis (no snapshot and no seed) takes the value. See [Decision version](#decision-version). |
+| `kardamom.cluster.genesisFeatures` | empty | yes, for the life of the chain | The features of the version switch that the chain runs from its genesis: empty, `3`, `3,4` or `3,4,5`. Any other value stops the start. `3,4,5` together with `carryBytes=true` stops the start. Only a member that starts at genesis (no snapshot and no seed) takes the value. A member that restores a snapshot with other genesis features stops. See [Decision version](#decision-version). |
 
 - Block interval: the code default `tickMs` is 2000 ms. The deploy also passes `2000`.
   - The state machine floors the `l2_timestamp` of each boundary to a multiple of 250 ms.
@@ -852,6 +853,7 @@ The chaos suite and operators read these lines. The admin server also exports on
 | `sealer seed CONFIRMED` | The first seed record is in the log (`block`, `canonicalCount`). |
 | `sealer seed SNAPSHOT` | The seeded leader asked for a snapshot (`requested=true` or `false`). A refused request leaves the periodic snapshot to take one. |
 | `sealer SEED-EPOCH FATAL` | The log holds a seed record, but this member started at genesis or from another seed. The member stops. |
+| `sealer GENESIS-FEATURES FATAL` | The restored snapshot holds other genesis features than the setting `genesisFeatures`. The member stops. |
 | `sealer RETAINED-FILE FATAL` | An I/O step of the retained file failed: the preallocation, a force, a rename, a delete, or a restore whose walk fails. Or the snapshot holds the other retention layout. The line names the step. The member stops. |
 | `sealer SEED-EPOCH offer FAILED` | The offer of the seed record failed. The next leadership term offers it again. |
 | `cluster START mode=` | The start mode of the member (`RESUME`, `GENESIS` or `SEED_FROM_PEER`). |

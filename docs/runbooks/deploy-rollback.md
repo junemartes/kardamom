@@ -159,6 +159,46 @@ Confirm:
 2. `kardamom_chainStatus` shows no root and no pause, and the heads advance.
 3. The next deploy compares its formats with the restored release.
 
+## Rollout
+
+Some releases need steps before or after the deploy. Do them in the order
+below.
+
+### The integration release of 2026-10-26 (#838)
+
+1. Retire the notifier outbox (`[retired.notifier-outbox]` in
+   `formats.toml`).
+   - The release gate refuses the first deploy with
+     `a rolling deploy cannot carry a coordinated format change: notifier-outbox`.
+   - Before the deploy, make sure that the old outbox is empty.
+     `kardamom_notifier_outbox_backlog_bytes` must read 0 for every
+     subscription on every notifier.
+   - The staging deploy workflow of kardamom-infra
+     (`.github/workflows/deploy-staging.yml`) must set
+     `KARDAMOM_ALLOW_RETIRED=notifier-outbox` for this one deploy.
+   - Remove the setting after the deploy. A stale allowance makes the next
+     deploy refuse.
+2. Check the readers of the egress before the deploy.
+   - The default of the egress job variable `keep_blocks` changes from
+     1,000,000 to 43,200 blocks (1 day at 2 s a block). The deploy has no
+     variable for it, so the redeploy of the egress uses the new value.
+   - The egress keeps every block above the posted head, so the batcher is
+     safe.
+   - An executor or a validator that resumes more than 43,200 blocks below
+     the egress head gets `410`. It then recovers from a peer checkpoint.
+   - Before the deploy, make sure that no executor or validator is more
+     than 43,200 blocks behind the egress head.
+3. Deploy the sealer before you use a version-2 sealer seed.
+   - `kardamom-reconstruct --sealer-seed` writes seed version 2 when the
+     rules hold an activation (`crates/reconstruct/src/seed.rs`). No flag
+     holds the writer at version 1. A chain with `genesis_features`
+     (`deploy/cluster/config/genesis/carry.toml`) writes version 2 from the first block.
+   - A sealer of the release before refuses a version-2 seed and does not
+     start.
+   - Upgrade every sealer member to this release before a seeded start
+     (`sealer-fleet-rebuild.md`).
+   - Do not roll the sealer back while a version-2 seed is configured.
+
 ## The refusals of the release gate
 
 A deploy refuses a release before it changes a job. Each message starts

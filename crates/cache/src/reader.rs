@@ -32,6 +32,11 @@ const HEAD_INTERVAL: Duration = Duration::from_millis(100);
 /// The pause between two connection attempts.
 const CONNECT_BACKOFF: Duration = Duration::from_secs(1);
 
+/// A Redis read that gave no answer: no connection, a reconnect, a
+/// timeout, or an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Degraded;
+
 /// The Redis read side: the account projection, the receipt index, and
 /// the freshness gate. Cheap to share behind an `Arc`.
 pub struct CacheReader {
@@ -108,17 +113,32 @@ impl CacheReader {
     /// The account's projected state. `None` on a miss and on every
     /// degraded outcome, each counted.
     pub async fn account(&self, address: Address) -> Option<AccountView> {
-        let cache = self.usable()?;
+        self.read_account(address).await.ok().flatten()
+    }
+
+    /// The account's projected state: `Ok(None)` on a miss, and
+    /// [`Degraded`] on every degraded outcome, each counted. A caller that
+    /// asks again only after a failed read tells the two apart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Degraded`] when Redis is not connected, reconnects, times
+    /// out, or fails.
+    pub async fn read_account(&self, address: Address) -> Result<Option<AccountView>, Degraded> {
+        let cache = self.usable().ok_or(Degraded)?;
         match cache.account(address).await {
             Ok(Some(view)) => {
                 metrics::record_lookup("redis", "hit");
-                Some(view)
+                Ok(Some(view))
             }
             Ok(None) => {
                 metrics::record_lookup("redis", "miss");
-                None
+                Ok(None)
             }
-            Err(e) => degrade(&e),
+            Err(e) => {
+                degrade::<()>(&e);
+                Err(Degraded)
+            }
         }
     }
 

@@ -28,7 +28,6 @@
       "delta_percent": -0.46558417909688954
     }
   },
-  "raw_estimates_and_samples": "2026-10-26-v2-pause-samples.jsonl",
   "scope": "Resident v2 loop only: decoding, admission, fake publisher, metrics and optional verdicts. Does not measure RPC or client receipt latency, executor networking or full-chain capacity.",
   "interpretation": "Median differences are -1.2 percent in order, +0.2 percent reversed, and -0.5 percent with verdicts, within larger variation across repeats. No speedup or full-workload guarantee is claimed. The gate adds a cached lifecycle version read per turn; full workload validation remains required."
 }

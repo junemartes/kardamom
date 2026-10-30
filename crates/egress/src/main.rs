@@ -270,9 +270,7 @@ async fn main() -> Result<()> {
     if let Some(task) = catch_up {
         tokio::spawn(task.run());
     }
-    if let Some(task) = final_head {
-        tokio::spawn(task.run());
-    }
+    let final_head = final_head.map(FinalHead::spawn);
     let http = Http::bind(args.bind, inputs)
         .await
         .context("bind the range read")?;
@@ -282,6 +280,9 @@ async fn main() -> Result<()> {
     wait_for_shutdown().await;
     tracing::info!("kardamom-egress: shutdown signal received");
     server.abort();
+    if let Some(task) = final_head {
+        task.stop().await;
+    }
     plane.shutdown().await;
     drop_runtime(rt);
     match owner_thread.join() {

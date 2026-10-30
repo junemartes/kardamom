@@ -18,7 +18,6 @@
       "frames_per_second": 5398026.157755155
     }
   },
-  "raw_samples": "docs/benches/2026-10-26-egress-restart-tee-samples.jsonl",
   "conclusion": "No observed steady tee latency or throughput regression in controlled repeats. No speedup claim. These are local frame timings, not full client or deployed chain performance.",
   "limitations": [
     "Short local samples on a shared host. An initial unpinned pair varied from p50 120 to 160 ns; alternating pinned repeats remove that difference.",

@@ -46,3 +46,17 @@ fn the_next_poll_resumes_at_the_open_output() {
     );
     assert_eq!((w.next, w.head), (2, Some(20)));
 }
+
+#[tokio::test]
+async fn a_stopped_watch_releases_its_sender_of_the_owner_queue() {
+    let (inputs, rx) = crossbeam_channel::bounded(1);
+    let url = "http://127.0.0.1:1".parse().expect("a valid url");
+    super::FinalHead::new(url, alloy_primitives::Address::ZERO, inputs)
+        .spawn()
+        .stop()
+        .await;
+    assert_eq!(
+        rx.try_recv().map(|_| ()),
+        Err(crossbeam_channel::TryRecvError::Disconnected)
+    );
+}

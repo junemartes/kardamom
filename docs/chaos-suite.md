@@ -237,7 +237,7 @@ The executors are dark in every case, so the head the judgement reads is the hig
 - [`ingress-executor-loss-recover`](failure-modes.md#combined-outages-with-the-executors-chaos-combined-exec-shard): the executor nodes (on a carry-born cluster: the executor tasks) and the ingress tasks die. The sealers order the transactions in flight, so the boundary count of the members advances. The executors return first and publish the receipts of their replay while no ingress listens; the ingresses return 60 s later. Before the fault, the case sends one transfer from the gate account through ingress-0 and waits for its receipt. After the return, every ingress must serve that receipt and must count a receipt served from an executor's state since its restart (`kardamom_cache_lookups_total{layer="receipt",outcome="state_hit"}` above zero; the counter starts at zero with the process): the restarted memory caches hold nothing, so the state query served it. The load's drain asks every ingress for the receipts it still misses, which drives the same path at scale.
 - [`read-path-loss-recover`](failure-modes.md#combined-outages-with-the-executors-chaos-combined-exec-shard): the executor tasks, the redis job and the state-mirror tasks die. The head advances, and a cold read degrades. Redis returns empty, the mirrors return 30 s later and wait for a checkpoint, the executors return 30 s after that. Every mirror must log `rebuild: done`, and the readers must use Redis again with no degraded read.
 - [`sequencer-executor-redis-loss`](failure-modes.md#combined-outages-with-the-executors-chaos-combined-exec-shard): the sequencer tasks, the executor tasks and the redis job die: no source of a sender floor is left. The head advances, and a cold read degrades. The sequencers return first and must park every established sender, Redis returns empty 30 s later, the executors 30 s after that. Every lane-0 replica must have asked for a floor (`kardamom_sequencer_nonce_lookup_requests_total`) and got one from an executor or from Redis (`kardamom_sequencer_nonce_lookups_total{outcome="ok"|"redis"}`), and on the v1 loop no ref may sit below a floor. The load is pinned to shard 0. The load verdict proves that no nonce gap remains.
-- `sequencer-executor-redis-loss` is in no shard yet. Run it by name with `KARDAMOM_CHAOS_CASES`. The Aeron driver error (#545) can fail it. See [Known gaps](failure-modes.md#known-gaps-untested-failure-surface).
+- `sequencer-executor-redis-loss` runs last in `chaos-combined-exec`. The Aeron driver error (#545) can fail it. See [Known gaps](failure-modes.md#known-gaps-untested-failure-surface).
 - On a local host, the shard takes about 45 minutes after a bring-up of about 21 minutes. `read-path-loss-recover` alone takes about 12 minutes with the smoke gate and the tail. The job timeout is 120 minutes.
 - The load of every exec case gets 90 submit retries. With the executors down and the ingress up, each attempt parks 30 s at the ingress and times out with no receipt.
 
@@ -315,17 +315,24 @@ The DA cases freeze the batcher with SIGSTOP, so nothing posts to L1 while the c
   - A submit must fail with the typed error that names `/halt`.
   - The boundaries must keep sealing.
   - After the thaw, the halt must clear with no operator step. The batcher must post past the frozen head. A new transfer must succeed. The chain status must settle.
-- `prune-floor`: stays under the budget, but runs past the retention window and a Raft snapshot. It needs a reference-born cluster: the exact window of decision version 5 prunes by the window alone, below the posted head.
-  - The retention must grow past its window. The replay floor must not pass the posted head.
-  - The frozen batcher must show as `gone` in the chain status. No root may stand.
-  - After the thaw, the retention must return inside its window. The sealer must not refuse the replay of the batcher.
-  - The posts on L1 must be contiguous.
+- `prune-floor`: stays under the budget, but runs past the retention window and a Raft snapshot. It has two variants. `chaos-retention` is carry-born, so CI runs the carry variant.
+  - On a carry-born cluster (`cases/da_lag/carry_floor.rs`):
+    - The exact window of decision version 5 prunes by the window alone, below the posted head. So the egress keeps the unposted range. The case sets the egress `keep_blocks` to 64 for the fault and restores the job after it.
+    - The sealer floor must pass the head of the egress copies, and a new Raft snapshot must occur. The sealed head must be more than one window and one segment past that head.
+    - No post may cover that head. The frozen batcher must show as `gone`. No root may stand.
+    - Every egress copy must replay the same bytes from that head, below the sealer floor, within two minutes.
+    - After the thaw, the posts on L1 must reach the sealed head and be contiguous. Every job must run, and the executors must advance.
+  - On a reference-born cluster:
+    - The retention must grow past its window. The replay floor must not pass the posted head.
+    - The frozen batcher must show as `gone` in the chain status. No root may stand.
+    - After the thaw, the retention must return inside its window. The sealer must not refuse the replay of the batcher.
+    - The posts on L1 must be contiguous.
 - `canary-da-lag`: seals past the DA-lag budget, as `da-lag-halt` does, and watches the transaction canary.
   - The canary's `transfer` probe must report `rpc_error{code="-32010"}`.
   - Alertmanager must hold a canary page as inhibited by the halt's page.
   - After the thaw, the halt must clear, and the canary's transfers must succeed again.
-- No DA case is in a shard. Run them by name with `KARDAMOM_CHAOS_CASES` against a cluster that has the small setting that the case needs.
-- `da-lag-halt` and `canary-da-lag` need `KARDAMOM_DA_LAG_BUDGET_BLOCKS`. `canary-da-lag` also needs a cluster deployed with `CANARY_LOCAL=1`. `prune-floor` needs `KARDAMOM_CLUSTER_RETENTION`.
+- The three DA cases run in `chaos-retention` (see the shard list). To run one by name with `KARDAMOM_CHAOS_CASES`, use a cluster that has the small setting that the case needs.
+- `da-lag-halt` and `canary-da-lag` need `KARDAMOM_DA_LAG_BUDGET_BLOCKS`. `canary-da-lag` also needs a cluster deployed with `CANARY_LOCAL=1`. The reference variant of `prune-floor` needs `KARDAMOM_CLUSTER_RETENTION`.
 - The case window is `INJECT_DELAY` plus `RETENTION_FREEZE_CAP_S` plus 2 minutes. `da-lag-halt` and `canary-da-lag` retry their load up to 120 times.
 
 ## Gates
