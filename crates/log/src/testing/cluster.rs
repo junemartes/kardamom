@@ -306,6 +306,32 @@ impl AeronTestCluster {
             .collect())
     }
 
+    /// The distinct error observations of the media driver of node `i`,
+    /// read with Aeron's `ErrorStat` in the container. In external mode
+    /// this returns an empty string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the docker command fails to run.
+    pub async fn driver_errors(&self, i: usize) -> anyhow::Result<String> {
+        let Node::Container(c) = &self.nodes[i] else {
+            return Ok(String::new());
+        };
+        let script = "java -cp /opt/aeron/aeron-all.jar \
+            -Daeron.dir=\"$AERON_DIR\" io.aeron.samples.ErrorStat";
+        let out = tokio::process::Command::new("docker")
+            .args(["exec", c.container.id(), "sh", "-c", script])
+            .output()
+            .await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "ErrorStat failed with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
     /// Bring up a single-node cluster, spawn an [`AeronRuntime`] against
     /// its bind-mounted `aeron.dir`, and build a [`LogConfig`] whose
     /// `tx_data` channel is a plain IPC template rooted at
@@ -331,6 +357,43 @@ impl AeronTestCluster {
         cfg.channels.tx_data_channel_template = "aeron:ipc?alias=a-{sid}".to_string();
         cfg.channels.tx_data_stream_id_base = stream_id_base;
         SingleNodeRig { cluster, rt, cfg }
+    }
+}
+
+/// A single node whose directory exists before its media driver does.
+/// A client can point at [`Self::aeron_dir`] first, the way a service on
+/// a restarted node starts before the driver of that node.
+pub struct PendingNode {
+    root: PathBuf,
+}
+
+impl PendingNode {
+    /// Reserve the host directory of one node, with no driver yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created.
+    pub fn reserve() -> anyhow::Result<Self> {
+        Ok(Self {
+            root: prepare_root()?,
+        })
+    }
+
+    /// The `aeron.dir` the driver will create.
+    #[must_use]
+    pub fn aeron_dir(&self) -> PathBuf {
+        self.root.join("dir")
+    }
+
+    /// Start the media driver and archive of the node now.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the image build or the container start fails.
+    pub async fn start(self) -> anyhow::Result<AeronTestCluster> {
+        ensure_image_built().await?;
+        let node = start_node(self.root, None, None).await?;
+        Ok(AeronTestCluster { nodes: vec![node] })
     }
 }
 
@@ -432,12 +495,16 @@ async fn spawn_node(
     liveness: Option<Duration>,
     archive_length: Option<std::num::NonZeroU32>,
 ) -> anyhow::Result<Node> {
+    start_node(prepare_root()?, liveness, archive_length).await
+}
+
+/// Create the host root of one node, with the permissions the container
+/// user needs, and return it.
+fn prepare_root() -> anyhow::Result<PathBuf> {
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let root = std::path::PathBuf::from(format!("/tmp/kardamom-aeron-{suffix:x}"));
-    let aeron_dir = root.join("dir");
-    let archive_dir = root.join("archive").join("dir");
     std::fs::create_dir_all(root.join("archive"))?;
     for d in [&root, &root.join("archive")] {
         let mut p = std::fs::metadata(d)?.permissions();
@@ -448,6 +515,17 @@ async fn spawn_node(
         }
         std::fs::set_permissions(d, p)?;
     }
+    Ok(root)
+}
+
+/// Start the container of the node whose host root is `root`.
+async fn start_node(
+    root: PathBuf,
+    liveness: Option<Duration>,
+    archive_length: Option<std::num::NonZeroU32>,
+) -> anyhow::Result<Node> {
+    let aeron_dir = root.join("dir");
+    let archive_dir = root.join("archive").join("dir");
 
     let root_str = root
         .to_str()

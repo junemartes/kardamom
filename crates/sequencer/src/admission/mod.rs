@@ -581,8 +581,11 @@ impl ImageMarks {
     ) {
         let expired = self.parked.pop_front().and_then(|mark| {
             senders.get_mut(&mark.sender).and_then(|s| {
-                s.unpark(mark.nonce, mark.unit)
-                    .map(|c| (c, s.expected_nonce()))
+                let expired = s.unpark(mark.nonce, mark.unit);
+                expired.map(|c| {
+                    s.on_expired();
+                    (c, s.expected_nonce())
+                })
             })
         });
         out.extend(

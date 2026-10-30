@@ -21,6 +21,7 @@ use kardamom_da_watcher::interop::CursorReconcile;
 pub use super::consumers::{
     ExecutorRun, ValidatorOptions, spawn_executor, spawn_executor_at, spawn_validator,
 };
+pub use super::ingress::{IngressOptions, IngressSlot, ParkTimeout, SpawnedIngress};
 use super::proc::{ExistingFile, Proc};
 use kardamom_obs::testkit::{free_port, free_udp_port};
 
@@ -148,6 +149,9 @@ pub struct ServiceSpec<'a> {
     /// `--exec-frames` on the executor: it forwards its frames to the
     /// egress.
     pub exec_frames: bool,
+    /// The executor writes checkpoints to `<root>/checkpoints` every two
+    /// seconds, for the state mirror's rebuild.
+    pub checkpoints: bool,
 }
 
 impl ServiceSpec<'_> {
@@ -481,6 +485,9 @@ impl SpawnPlan {
 /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.5.
 #[derive(Clone, Debug, Default)]
 pub struct SequencerOptions {
+    /// `--partition-index`, for a second replica of a lane. Defaults to the
+    /// process index.
+    pub partition: Option<u32>,
     /// `--partition-count`. Defaults to the stack's shard count.
     pub partition_count: Option<std::num::NonZeroU32>,
     /// `--lane`.
@@ -572,7 +579,10 @@ pub fn spawn_sequencer_with(
         .arg(&cfg_path)
         .arg("--aeron-dir")
         .arg(spec.aeron_dir)
-        .args(["--partition-index", &index.to_string()])
+        .args([
+            "--partition-index",
+            &opts.partition.unwrap_or(index).to_string(),
+        ])
         .args(["--partition-count", &partition_count.to_string()])
         .args(["--sequencer-id", &index.to_string()]);
     opts.add_lane_args(&mut cmd);
@@ -600,63 +610,16 @@ pub fn spawn_sequencer_with(
     .spawn()
 }
 
-/// A pending-receipt park duration that must be nonzero: a zero here
-/// would make several scenario timing assertions vacuously true instead
-/// of testing anything (for example the `out.elapsed >= park / 2` lower
-/// bound in `scenarios::nonce_gap`). Parsed once at construction; every
-/// consumer reads a real `Duration` back with [`Self::as_duration`].
-#[derive(Debug, Clone, Copy)]
-pub struct ParkTimeout(std::num::NonZeroU64);
-
-impl ParkTimeout {
-    /// A park timeout of `secs` seconds. `NonZeroU64::saturating_mul` is
-    /// a `const fn`: it cannot panic, and the result is already
-    /// `NonZeroU64`, so this constructor cannot fail either.
-    #[must_use]
-    pub const fn from_secs(secs: std::num::NonZeroU64) -> Self {
-        const MILLIS_PER_SEC: std::num::NonZeroU64 = std::num::NonZeroU64::new(1000).unwrap();
-        Self(secs.saturating_mul(MILLIS_PER_SEC))
-    }
-
-    #[must_use]
-    pub fn as_duration(self) -> Duration {
-        Duration::from_millis(self.0.get())
-    }
-}
-
-pub struct IngressOptions {
-    pub pending_receipt_timeout: ParkTimeout,
-    pub rpc_max_connections: std::num::NonZeroU32,
-}
-
-impl Default for IngressOptions {
-    fn default() -> Self {
-        const THIRTY_SECS: std::num::NonZeroU64 = std::num::NonZeroU64::new(30).unwrap();
-        const DEFAULT_RPC_MAX_CONNECTIONS: std::num::NonZeroU32 =
-            std::num::NonZeroU32::new(8192).unwrap();
-        Self {
-            pending_receipt_timeout: ParkTimeout::from_secs(THIRTY_SECS),
-            rpc_max_connections: DEFAULT_RPC_MAX_CONNECTIONS,
-        }
-    }
-}
-
-pub struct SpawnedIngress {
-    pub proc: Proc,
-    pub metrics_addr: SocketAddr,
-    pub rpc_url: String,
-}
-
 /// # Errors
 /// Returns an error when the binary is not built, when the config file
 /// cannot be written, or when the process fails to spawn.
 pub fn spawn_ingress(spec: &ServiceSpec<'_>, opts: &IngressOptions) -> Result<SpawnedIngress> {
-    spawn_ingress_at(spec, opts, None, None)
+    spawn_ingress_at(spec, opts, &IngressSlot::first(), None)
 }
 
-/// Spawn the ingress, or respawn it. `fixed_rpc_port` keeps the RPC URL
-/// scenarios already hold. `shard_map` is the `--shard-map` file of a
-/// resize; `None` is the identity map over the shard count.
+/// Spawn an ingress replica, or respawn it. The ports of `slot` keep the
+/// URLs that scenarios already hold. `shard_map` is the `--shard-map`
+/// file of a resize; `None` is the identity map over the shard count.
 ///
 /// # Errors
 /// Returns an error when the binary is not built, when the config file
@@ -664,12 +627,12 @@ pub fn spawn_ingress(spec: &ServiceSpec<'_>, opts: &IngressOptions) -> Result<Sp
 pub fn spawn_ingress_at(
     spec: &ServiceSpec<'_>,
     opts: &IngressOptions,
-    fixed_rpc_port: Option<u16>,
+    slot: &IngressSlot,
     shard_map: Option<&Path>,
 ) -> Result<SpawnedIngress> {
     let cfg_path = spec.write_cluster_config("ingress", "")?;
-    let metrics_port = free_port().port();
-    let rpc_port = fixed_rpc_port.unwrap_or_else(|| free_port().port());
+    let metrics_port = slot.metrics_port.unwrap_or_else(|| free_port().port());
+    let rpc_port = slot.rpc_port.unwrap_or_else(|| free_port().port());
     // The cluster egress port of the `Sealed` status tap.
     let egress_port = free_udp_port().port();
     let mut cmd = Command::new(bin("kardamom-ingress")?);
@@ -682,6 +645,7 @@ pub fn spawn_ingress_at(
             &format!("127.0.0.1:{egress_port}"),
         ])
         .args(["--jsonrpc-bind", &format!("127.0.0.1:{rpc_port}")])
+        .args(["--ingress-id", &slot.id.to_string()])
         .args(["--shards", &spec.shards.get().to_string()]);
     if let Some(map) = shard_map {
         cmd.arg("--shard-map").arg(map);
@@ -701,7 +665,7 @@ pub fn spawn_ingress_at(
             &opts.rpc_max_connections.to_string(),
         ])
         .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
-        .args(["--host-id", "e2e-ingress"])
+        .args(["--host-id", &format!("e2e-ingress-{}", slot.id)])
         // The account RPCs ask the executor on a local miss, as the
         // sequencers' nonce lookup does.
         .args([
@@ -722,13 +686,11 @@ pub fn spawn_ingress_at(
         cmd.arg("--archive-durability");
     }
     common_service_env(&mut cmd);
-    // A respawn logs to its own file, so the first process's log survives.
-    let log_name = if fixed_rpc_port.is_some() {
-        "ingress-restarted.log"
-    } else {
-        "ingress.log"
-    };
-    let proc = Proc::spawn("ingress", cmd, spec.root.join(log_name))?;
+    let proc = Proc::spawn(
+        &slot.log_name,
+        cmd,
+        spec.root.join(format!("{}.log", slot.log_name)),
+    )?;
     Ok(SpawnedIngress {
         proc,
         metrics_addr: format!("127.0.0.1:{metrics_port}").parse()?,

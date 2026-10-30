@@ -114,6 +114,40 @@ These reuse the existing Java fixtures and start no chain stack. The Raft group
 still uses real scheduling and local Aeron transport; the actor clock does not accelerate
 its consensus protocol.
 
+`just test-component sealer-raft-network`, `sealer-raft-members` and
+`sealer-raft-fleet` run twelve checks on three real member processes. Each
+member runs the production `ClusterNode` main class in its own JVM, with the
+deployed tick, Raft timeouts and member settings. Each member has its own
+loopback address, its directories on tmpfs, and a shared driver for its
+member feed. The members name each other through a hosts file, as the deploy
+names them through Consul. A test client speaks the production ingress and
+egress codecs, and each member feed gives the canonical frames of that member.
+Every check requires one leader per term from the TERM lines of all members,
+and the same canonical frames, byte for byte, on every member.
+
+The checks cover a one-way partition, 10 % loss and a 250 ms delay of the
+frames from the leader to its peers, a CPU squeeze of every member, a leader
+kill, a follower kill with a snapshot restore, a rejoin after a log purge, two
+blank members with an offline copy, a node replacement on a new address, a
+quorum loss, a total loss, and the sealer part of a fleet wipe with a seed.
+A test endpoint supplier in each member driver applies the link faults; the
+receiving member drops, loses or holds the frames from the faulted member.
+Each check takes 15 to 55 seconds. A member stops when its test JVM dies, and
+the next group deletes the tmpfs directories of dead test JVMs.
+
+The squeeze check also runs a consumer session with the production cursor
+rules, as the validator reads the stream. Its stream must reach the live head
+with no gap and equal the members' order. `just test-component reconstruct-seed`
+posts two blocks to Anvil, rebuilds the state from the L1 log and the DA proxy,
+and writes the sealer seed of the fleet wipe at the posted head.
+
+Two optional member settings serve these checks. `kardamom.cluster.adminHost`
+binds the admin endpoint to one address, so each member on one host keeps the
+one admin port that its peers ask. `kardamom.cluster.clockClass` names the
+cluster clock class. The two-blank check moves a test clock past the 60 s
+startup canvass, as that wall time would. Both settings are unset in the
+deploy, and the defaults stay the same.
+
 Java targets force test execution and remove their selected old XML reports before
 running. The runner requires fresh reports, preserves them with the logs, names
 every passing/failing test, and rejects skipped or missing expected tests even
@@ -137,6 +171,69 @@ containers and network after each test. It does not reproduce CPU-pressure TILT,
 whole-chain fallback or Nomad placement. Both negative controls fail at recovery:
 not replacing the cached connection, and loading a script only once before failover.
 The existing Docker CI job runs this target.
+
+`just test-component executor-recovery` runs fifteen executor recovery checks.
+Each executor is a child process of the test binary. It runs the production state
+startup in `kardamom_executor::state`, the engine, the MDBX writer, the checkpoint
+rounds, the checkpoint server and the replay repair. The binary uses the same state
+module. The parent plays the sealer: it appends production egress frames to a
+retained log. Each process reads the log through one replay session, from its
+durable cursor and with an overlap below it. The parent can set a retention floor,
+so that an old cursor gets `REPLAY_UNAVAILABLE`, and can take every member away.
+
+The cases stop processes with SIGTERM, kill them with SIGKILL, wipe their state or
+checkpoints, corrupt one image byte, replace a node with empty storage on a new
+address, and start a build that fails its start checks. They also rebuild an
+executor image from DA batches through the production batch codec and reconstruction.
+Every case ends with each replica stopped at the same head. Its DB must pass the
+integrity sweep and equal an undisturbed replica table by table. Each process must
+publish its boundaries in order, and no transaction may get two receipt hashes. A
+replica that kept its disk publishes no boundary twice. The checks also require the
+restore, fetch, quarantine and resume log lines in their order, `/ready` before each
+rolling step, and the committed nonce and receipt answers of a restarted replica.
+
+Storage is on tmpfs when it has room. A process kill keeps the page cache, so the
+fault is a process crash, not a power loss. The fifteen checks take about 5 seconds
+of test execution in parallel on a quiet host; compilation adds time. Nomad
+placement, node containers, Consul records, image rollout and the deploy gate stay
+in the chaos shard; each ported case names them under `cluster_only_checks`.
+
+`just test-component executor-exec-stream` adds the executor stream on a real media
+driver and archive in one disposable container. A stopped and a killed replica each
+record a new session, and its recorded cursor moves. While one replica is dead, the
+cursors of its peers move. `just test-component sealer-record-lag` runs the existing
+sealer checks that take the best cursor over the executors.
+
+`just test-component executor-checkpoint-enospc` runs one executor process in a
+disposable container, with its checkpoints and block log on a 16-MiB tmpfs. The
+parent fills the tmpfs until the kernel refuses a write. The block log and the base
+round must fail with error 28 while the same process applies transactions. After the
+filler goes, a new base above the fault must restore with its log past the base.
+
+`just test-component executor-total-wipe-l1` posts the blocks with the production
+batch post to a real Anvil and the DA store. Every state and checkpoint goes, and the
+image comes from the `BatchPosted` scan and the DA reads alone. Each executor must
+resume from the image cursor with no restore or fetch.
+
+`just test-component state-mirror-total-loss` and `cache-sentinel-total-loss` kill a
+primary, a replica and three Sentinels at once. Fixed host ports stand in for stable
+service addresses. While the group is down, the production reader degrades without a
+stall and the mirror marks a rebuild. The group returns empty, the Sentinels name a
+primary, and the mirror rebuilds every account once a checkpoint reaches its first
+live batch.
+
+`just test-component transport-mds-remove` removes MDS receive destinations while two
+streams run, and returns a node to the same control endpoint three times. Every frame
+of the live streams must arrive in order, and the driver must log no error. On the
+deployed Aeron 1.45 driver, this does not reproduce the driver crash of issue 545.
+
+`just test-component executor-driver-late-start` starts the real executor binary
+12 s before its media driver, as a service on a returned node can start. Every Aeron
+client start of `kardamom-log` now waits for an active driver: the `CnC` file exists
+and the driver heartbeat is younger than the driver timeout. It logs the wait every
+5 s. The bound is two driver budgets, 30 s with the deployed 10 s driver timeout;
+past it the start fails as before. The executor must open its publications and its
+local recording with no exit. Without the wait, it exits at once.
 
 `just test-component state-writer-crash` runs two real durable MDBX process-crash
 checks in about 0.3 seconds of test execution. A child runs the production writer.
@@ -186,7 +283,7 @@ test rejects a new chaos case without a corresponding plan. Each family lists th
 real actors, boundary faults, recovery invariants and dependencies that still need
 real integration. `partial` means that named local tests validate some boundary
 assumptions. It does not mean the complete distributed case has passed locally.
-Forty-one cases have partial mappings. No full case is marked locally validated yet.
+`just component-summary` prints the current planned, partial and ported counts.
 
 `just component-catalog` checks the catalog. `just component-summary` prints the
 planned, partial and ported counts for each family. A case is ported when its
@@ -195,11 +292,16 @@ always go together. A ported case needs:
 
 - At least one local test.
 - A local test in a suite with a `ci_mode`, so that CI runs it. The modes are
-  `in-process`, `docker` (a real container dependency) and `gradle` (the Java
-  sealer).
+  `in-process`, `docker` (a real container dependency), `gradle` (the Java
+  sealer) and `stack` (the real service binaries, the sealer jar and the media
+  driver as local processes).
 - A negative control for one of its local tests. A control that names tests
   (`test`, `tests` or `failed_tests`) guards only those tests. A control that
   names no test guards every test of its suite.
+
+A suite can have the optional field `test_timeout_s`: the per-test limit in CI, an
+integer from 60 to 120. The default is 60. A value above 60 needs the field
+`test_timeout_reason`.
 
 The optional case field `cluster_only_checks` is a list of strings. Each string
 names a check that needs the deployed cluster, and gives the reason. The cluster
@@ -232,7 +334,9 @@ For each remaining case:
    evidence. Keep the original deadlines and workload unless a separate reviewed
    experiment requires a change.
 
-Raft partition/quorum-loss safety needs further real-member fault cases. Sentinel promotion needs
+The member-process Raft checks cover partition, loss, delay, squeeze, kill,
+wipe and quorum-loss cases; kernel queues and whole-node power loss stay in
+the cluster suite. Sentinel promotion needs
 real Redis/Sentinel processes. Checkpoint durability needs real storage and crash
 or syscall faults. Nomad placement, container ownership, advertised addresses and
 kernel network scheduling need integration checks. Mocking those guarantees would
@@ -440,3 +544,111 @@ cannot pass. A successful peer cannot mask an unrecovered peer. The observer kee
 its 120-second budget and reports each reader's latest counters or error. These
 checks validate the observer; distributed Redis recovery and exact final state
 still require the full chaos case.
+
+`just test-component pipeline-recovery` and `just test-component pipeline-combined`
+run chaos cases on the local stack of the chain-semantics suite. These are stack
+suites, not isolated ones: each case needs more than one real service. The real ingress pair, the sequencers, the sealer
+members, the executor and the validator run as processes on one host, with the
+host-native archiving media driver. The cases that read L1 epochs also run Anvil,
+the L1 follower and the da-watcher. Each test injects the fault of its chaos case
+at the same process boundary. A graceful stop is SIGTERM with the job's kill
+bound; a hard stop is SIGKILL. A returned process starts on the state that it
+persisted: the sealer members on their own logs, the executor and the validator on
+their state directories, the driver on its archive. Ingresses and sequencers
+start cold, as in the deployment.
+
+Every test ends with the checks of a chaos case. A case load sends through
+ingress 0 for the whole case, and tries a failed submit again with the same bytes.
+While a submit waits, the load also asks every ingress for the receipt. Every
+offered transfer must land. Every ingress must serve exactly one receipt for each
+transfer, in nonce order. The payee balance must equal the landed count. The load
+must land again within 30 seconds of the return. Then the executor block must
+advance. A recovery probe sends the case sender through ingress 0 and a fresh
+sender through ingress 1. The validator must verify with no divergence.
+
+The combined cases also judge the pipeline while their classes are down. With no
+ingress and no sequencer, empty blocks still seal and no transaction applies.
+With no sealer, every member process is dead, every live ingress refuses a submit
+with `sealer_no_quorum`, and no executor block of the outage may pass the block at
+which the returned members resume. A class that returns before the class that it
+needs must still run after an eight-second stagger. A cluster client starts with retries,
+so a process that cannot wait exits within that time. The cases that take the sealer
+down run three members: the returned members must close an election on a majority,
+and no term may have two leaders. No sequencer may hold a ref below a floor. The
+sealer's L1 origin must reach the last epoch that the da-watcher published. After
+a loss of the sequencers and the sealer, the da-watcher must publish again, and
+the epochs of the outage must reach the chain.
+
+The local stagger and hold are shorter than the deployed ones. The 10-second
+sealer silence budget is crossed where an ingress stays up through the sealer
+loss: the test waits for its `sealer_no_quorum` refusal. A returned ingress has
+no silence clock before its first status frame, so the stagger needs no such
+bound. The lane loss runs two replicas
+of the case lane and kills both: they return cold, learn the same floors, and
+offer the same references, and the sealer keeps the first copy. The graceful
+sequencer case sends SIGTERM to one of the two replicas of the case lane and
+requires its exit within ten seconds, while the twin keeps the lane ordering. The tests need the service
+binaries, the sealer jar and the aeron-all jar, as the chain-semantics job does.
+Each test takes 14 to 50 seconds on a loaded host, including the stack start.
+
+The pipeline blackout also kills the media driver, the L1 follower and the
+da-watcher, or Redis and the state mirror. The killed archive leaves an active mark
+file, so the returned driver starts only after it ages out, as the scheduler's
+restarts of the driver task see. Every process then starts at once. The executor
+and the validator refetch the envelopes of replayed records from the archive; the
+local validator gets the refetch endpoints of the deployed job. Redis returns
+empty, and the state mirror must serve again with keys rebuilt from the
+executor's newest checkpoint, with the row of a funded account that no traffic
+touches: only a rebuild writes it. The blackout runs as two tests, one with the
+L1 stack and the validator, one with Redis and the state mirror, so each stays
+inside 60 seconds. Both run one sealer member; the combined cases close elections
+of three members.
+
+Compiled negative controls fail these tests at recovery: an ingress that serves
+no receipt from state, a sequencer lookup that sends no query, a cluster client
+that never forces a new session after egress silence, and an executor with no
+archive refetch, and a state mirror that never rebuilds.
+
+`just test-component ingress-recovery` runs the single-service ingress cases in
+isolation. Each ingress replica is the real `kardamom-ingress` binary on its own
+host-native archiving media driver, as on its own node; the nodes talk over
+loopback UDP. A controlled stand-in for the sequencer, the sealer and the executor
+runs on the second node. It keeps the first copy of a transaction, runs each
+sender's nonces in order, and sends receipt batch frames with account rows. An
+HTTP stub serves the egress and executor receipt queries from its ledger. Each
+case requires every transfer to land, the stand-in to execute each one once in
+nonce order, and both ingresses, the returned one too, to serve every receipt:
+
+- `graceful-ingress`: SIGTERM must end in a clean exit within the drain bound.
+- `hard-ingress`: SIGKILL, once for each replica. A returned twin serves receipts
+  of transfers that it never saw.
+- `archive-driver-loss`: the driver of ingress 0 dies. Ingress 0 must exit on its
+  own after its driver timeout, while the twin on the other node keeps serving.
+  The driver returns on its archive, and ingress 0 starts with its recorders.
+
+Controls fail the tests when a returned ingress serves no receipt from state, and
+when the Aeron error handler does not end a client that lost its driver.
+
+`just test-component ingress-deadline` holds the executor head far behind the
+sealed head of the sealer's status. The ingress must stamp every new submit from
+the sealed head, so the deadline stays past the sealer's block. A control that
+stamps from the executor head alone fails it. This answers a stall seen in one
+blackout run under a load average of 46: the ingress does not age the deadline.
+That run showed refs that the v1 sequencer offered again after its confirm timeout,
+with their first deadline, which the sealer then refused as past the deadline.
+
+A restart log of the service events board now comes at most once in each expiry
+window for one service. Two processes that publish one key on one shared IPC
+session made every record of the slower counter read as a restart.
+
+`just test-component control-plane-loss` runs the production discovery adapter
+against a Consul-like agent and a real media driver. A publisher and a subscriber
+of `tx_data` find each other through the agent. The agent then partitions from
+both for longer than the check TTL and the deregistration window, and deletes the
+publisher's record. The held data connection must deliver every envelope in order
+through the partition, with no gap above one second. After the partition, the
+publisher must register again with a passing check, and a new subscriber must find
+it. The test scales the TTL, the deregistration window and the hold down in the
+same order as the deployment. A heartbeat that does not register again after a
+failed pass fails the test. Nomad placement after the partition remains a cluster
+check.

@@ -1,7 +1,9 @@
 //! The cluster lifecycle: the same commands as the `container-up` and
-//! `container-down` Make targets. `OpenTofu` creates the node containers
+//! `container-down` recipes. `OpenTofu` creates the node containers
 //! and exports the node contract; Ansible provisions the substrate,
-//! publishes the prebuilt images, and deploys the workloads.
+//! publishes the prebuilt images, and deploys the workloads. On a saved
+//! cluster (`just container-save`), the bring-up starts the provisioned
+//! nodes again and only deploys the workloads.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -23,6 +25,12 @@ const REGISTRY_PUSH_NODE: &str = "control-0";
 /// run points `images_release_dir`, `images_cluster_jar`, and
 /// `workloads_deploy_binary` at prebuilt artifacts with it.
 const CLUSTER_VARS_ENV: &str = "KARDAMOM_CHAOS_CLUSTER_VARS";
+
+/// The directory of a saved cluster (`just container-save`). When it is
+/// set, the bring-up recreates the saved volumes, starts each node from
+/// its provisioned image, and runs `ansible/resume.yml` in place of the
+/// convergence playbook.
+const PREPARED_ENV: &str = "KARDAMOM_PREPARED_CLUSTER";
 
 /// How many times the node apply runs before the bring-up fails. The apply
 /// builds the node image, and that build asks Docker Hub for the base
@@ -75,6 +83,54 @@ pub struct DeployVars {
     pub genesis_carry: bool,
     /// The switches of the carry window. See [`CarrySwitches`].
     pub carry: CarrySwitches,
+    /// The test-cluster settings of the deploy. See [`ChaosKnobs`].
+    pub knobs: ChaosKnobs,
+}
+
+/// Deploy settings for a test cluster only. With every field at its
+/// default, the deploy renders the values of staging and production.
+#[derive(Debug, Clone, Default)]
+pub struct ChaosKnobs {
+    /// More JVM options for every sealer member
+    /// (`KARDAMOM_CLUSTER_JVM_OPTS`), for example
+    /// `-Daeron.cluster.startup.canvass.timeout=15s`.
+    pub cluster_jvm_opts: Option<String>,
+    /// The Nomad `heartbeat_grace` of a new local-profile node
+    /// (`NOMAD_HEARTBEAT_GRACE`), in seconds. The provisioning renders it,
+    /// so a saved cluster keeps the value of its prepare job.
+    pub heartbeat_grace_s: Option<u64>,
+    /// The window of `KardamomCanaryStalled`
+    /// (`KARDAMOM_CANARY_STALLED_WINDOW`), a Prometheus duration.
+    pub canary_stalled_window: Option<String>,
+    /// Whether the canary pulls its image at each start
+    /// (`KARDAMOM_CANARY_FORCE_PULL`).
+    pub canary_force_pull: Option<bool>,
+    /// The seconds between two executor checkpoints
+    /// (`KARDAMOM_CHECKPOINT_INTERVAL_S`).
+    pub checkpoint_interval_s: Option<u64>,
+}
+
+impl ChaosKnobs {
+    fn env(&self) -> [Option<(&'static str, String)>; 5] {
+        [
+            self.cluster_jvm_opts
+                .as_ref()
+                .map(|v| ("KARDAMOM_CLUSTER_JVM_OPTS", v.clone())),
+            self.heartbeat_grace_s
+                .map(|v| ("NOMAD_HEARTBEAT_GRACE", format!("{v}s"))),
+            self.canary_stalled_window
+                .as_ref()
+                .map(|v| ("KARDAMOM_CANARY_STALLED_WINDOW", v.clone())),
+            self.canary_force_pull.map(|on| {
+                (
+                    "KARDAMOM_CANARY_FORCE_PULL",
+                    if on { "on" } else { "off" }.to_string(),
+                )
+            }),
+            self.checkpoint_interval_s
+                .map(|v| ("KARDAMOM_CHECKPOINT_INTERVAL_S", v.to_string())),
+        ]
+    }
 }
 
 /// The deploy settings of the carry window. With every field at its
@@ -175,6 +231,7 @@ impl DeployVars {
         ]
         .into_iter()
         .chain(self.carry.env())
+        .chain(self.knobs.env())
         .flatten()
         .collect()
     }
@@ -186,6 +243,33 @@ impl DeployVars {
 pub struct Lifecycle {
     cluster_dir: PathBuf,
     vars: DeployVars,
+    prepared: Option<Prepared>,
+}
+
+/// A cluster that `just container-save` kept: one provisioned image per
+/// node, the node volumes, and the image manifest.
+#[derive(Debug, Clone)]
+struct Prepared {
+    dir: PathBuf,
+}
+
+impl Prepared {
+    /// The saved cluster that [`PREPARED_ENV`] names, if any. A relative
+    /// directory is resolved from the working directory of this process,
+    /// because the commands run in `deploy/cluster`.
+    fn from_env() -> Option<Self> {
+        std::env::var_os(PREPARED_ENV)
+            .filter(|dir| !dir.is_empty())
+            .and_then(|dir| std::path::absolute(dir).ok())
+            .map(|dir| Self { dir })
+    }
+
+    /// The `node_images` variable of terraform/containers: the
+    /// provisioned image of each node, as a JSON object.
+    fn node_images(&self) -> anyhow::Result<String> {
+        let path = self.dir.join("node-images.json");
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
+    }
 }
 
 /// The last attempt of the environment when a deploy starts. The release
@@ -217,6 +301,7 @@ impl Lifecycle {
         Self {
             cluster_dir: repo_root.join("deploy").join("cluster"),
             vars: DeployVars::default(),
+            prepared: Prepared::from_env(),
         }
     }
 
@@ -302,22 +387,47 @@ impl Lifecycle {
     /// the apply wrote is invalid.
     pub async fn up(&self) -> anyhow::Result<NodeContract> {
         self.tofu(&["init", "-input=false"]).await?;
+        if let Some(prepared) = &self.prepared {
+            self.restore(prepared).await?;
+        }
         self.apply_with_retry().await?;
         self.write_contract().await?;
         let contract = self.contract()?;
         let nomad_addr = contract.nomad_addr(NOMAD_HTTP_PORT)?;
         // Bring-up starts a new sealer cluster. The deploy opens the
         // bootstrap only while it registers a job that Nomad does not know,
-        // so a bring-up over a running cluster opens none.
+        // so a bring-up over a running cluster opens none. The waves apply
+        // only to a cluster without jobs and without a deploy record.
         let mut env = vec![
             ("NOMAD_ADDR", nomad_addr),
             ("REGISTRY_PUSH_NODE", REGISTRY_PUSH_NODE.to_string()),
             ("KARDAMOM_CLUSTER_BOOTSTRAP", "1".to_string()),
+            ("KARDAMOM_DEPLOY_WAVES", "1".to_string()),
         ];
         env.extend(self.vars.env());
-        let cmd = self.playbook("ansible/cluster.yml", &env);
-        run_inheriting(cmd, "ansible-playbook ansible/cluster.yml").await?;
+        let playbook = self.bring_up_playbook();
+        let cmd = self.playbook(playbook, &env);
+        run_inheriting(cmd, &format!("ansible-playbook {playbook}")).await?;
         Ok(contract)
+    }
+
+    /// Recreate the volumes of the saved cluster `prepared`, empty of
+    /// anything a previous bring-up wrote, and put its image manifest in
+    /// place.
+    async fn restore(&self, prepared: &Prepared) -> anyhow::Result<()> {
+        let mut cmd = self.command("just", &[]);
+        cmd.arg("container-restore").arg(&prepared.dir);
+        run_inheriting(cmd, "just container-restore").await
+    }
+
+    /// The playbook of the bring-up: the resume of a saved cluster, or
+    /// the full convergence of new nodes.
+    fn bring_up_playbook(&self) -> &'static str {
+        if self.prepared.is_some() {
+            "ansible/resume.yml"
+        } else {
+            "ansible/cluster.yml"
+        }
     }
 
     /// Deploy the workloads of the cluster at `nomad_addr` from the image
@@ -471,8 +581,15 @@ impl Lifecycle {
         }
     }
 
+    /// Run tofu in the container root. On a saved cluster, every run
+    /// sees the provisioned node images, so an apply or a replacement
+    /// keeps the nodes of generation 0 on them.
     async fn tofu(&self, args: &[&str]) -> anyhow::Result<()> {
-        let mut cmd = self.command("tofu", &[]);
+        let env = match &self.prepared {
+            Some(prepared) => vec![("TF_VAR_node_images", prepared.node_images()?)],
+            None => Vec::new(),
+        };
+        let mut cmd = self.command("tofu", &env);
         cmd.arg(Self::tofu_chdir()).args(args);
         run_inheriting(cmd, &format!("tofu {}", args.join(" "))).await
     }
@@ -509,90 +626,5 @@ async fn run_inheriting(mut cmd: Command, what: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_default_vars_set_only_an_empty_genesis_carry() {
-        assert_eq!(
-            DeployVars::default().env(),
-            vec![("KARDAMOM_GENESIS_CARRY", String::new())]
-        );
-    }
-
-    #[test]
-    fn a_local_canary_uses_the_cluster_test_alert_receiver() {
-        let vars = DeployVars {
-            canary_local: Some(true),
-            ..DeployVars::default()
-        };
-        assert!(vars.env().contains(&("CANARY_LOCAL", "1".to_string())));
-        let lifecycle = Lifecycle::new(Path::new("/repo")).with_vars(vars);
-        let command = lifecycle.command("ansible-playbook", &[]);
-        let setting = command
-            .as_std()
-            .get_envs()
-            .find(|(key, _)| *key == "ALERTMANAGER_CONFIG_FILE");
-        assert_eq!(
-            setting.unwrap().1,
-            Some(std::ffi::OsStr::new(
-                "/repo/deploy/cluster/config/alertmanager-chaos.yml"
-            ))
-        );
-        let defaults = Lifecycle::new(Path::new("/repo")).command("ansible-playbook", &[]);
-        assert!(
-            !defaults
-                .as_std()
-                .get_envs()
-                .any(|(key, _)| key == "ALERTMANAGER_CONFIG_FILE")
-        );
-    }
-
-    #[test]
-    fn the_carry_switches_reach_the_deploy_variables() {
-        let vars = DeployVars {
-            exec_cursor: true,
-            genesis_carry: true,
-            carry: CarrySwitches {
-                exec_on_sealers: true,
-                egress: EgressStage::Readers,
-                admission: true,
-                version_floor: Some(5),
-                carry_executors: vec![0, 1],
-                lockbox: Some("0xab".to_string()),
-            },
-            ..DeployVars::default()
-        };
-        let env = vars.env();
-        let want = [
-            ("KARDAMOM_EXEC_CURSOR", "on"),
-            ("KARDAMOM_GENESIS_CARRY", "on"),
-            ("KARDAMOM_MEMBER_FEED", "on"),
-            ("KARDAMOM_EXEC_ON_SEALERS", "on"),
-            ("KARDAMOM_EXEC_FRAMES", "on"),
-            ("KARDAMOM_EGRESS", "1"),
-            ("KARDAMOM_SEQUENCER_ADMISSION", "on"),
-            ("KARDAMOM_BATCHER_EGRESS", "on"),
-            ("KARDAMOM_VALIDATOR_EGRESS", "on"),
-            ("KARDAMOM_SEALER_VERSION_FLOOR", "5"),
-            ("KARDAMOM_CARRY_EXECUTORS", "0,1"),
-            ("LOCKBOX_ADDRESS", "0xab"),
-        ];
-        assert_eq!(
-            env,
-            want.map(|(k, v)| (k, v.to_string())).to_vec(),
-            "{env:?}"
-        );
-    }
-
-    #[test]
-    fn a_lifecycle_keeps_its_vars() {
-        let vars = DeployVars {
-            checkpoint_log: true,
-            ..DeployVars::default()
-        };
-        let lifecycle = Lifecycle::new(Path::new("/repo")).with_vars(vars);
-        assert!(lifecycle.vars().checkpoint_log);
-        assert_eq!(lifecycle.cluster_dir(), Path::new("/repo/deploy/cluster"));
-    }
-}
+#[path = "lifecycle_tests.rs"]
+mod tests;

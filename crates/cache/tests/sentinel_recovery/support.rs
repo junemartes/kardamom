@@ -19,6 +19,12 @@ pub(super) enum Fault {
 
 pub(super) struct Fixture {
     pub(super) cache: AccountCache,
+    /// The configuration the cache client connected with.
+    #[allow(
+        dead_code,
+        reason = "the state-mirror total-loss test connects its mirror with it"
+    )]
+    pub(super) cfg: CacheConfig,
     pub(super) primary: ContainerAsync<GenericImage>,
     pub(super) replica: ContainerAsync<GenericImage>,
     sentinels: [ContainerAsync<GenericImage>; 3],
@@ -51,6 +57,7 @@ impl Fixture {
         let cache = AccountCache::connect(&cfg).await.unwrap();
         let fixture = Self {
             cache,
+            cfg,
             primary,
             replica,
             sentinels,
@@ -81,6 +88,7 @@ impl Fixture {
             .with_exposed_port(6379_u16.tcp())
             .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
             .with_network(network)
+            .with_mapped_port(Self::free_port(), 6379_u16.tcp())
             .with_cmd(command)
             .start()
             .await
@@ -96,10 +104,89 @@ impl Fixture {
             .with_exposed_port(26379_u16.tcp())
             .with_wait_for(WaitFor::message_on_stdout("+monitor master"))
             .with_network(network)
+            .with_mapped_port(Self::free_port(), 26379_u16.tcp())
             .with_cmd(["-c", &script])
             .start()
             .await
             .unwrap()
+    }
+
+    /// A fixed host port for one container port. A restarted container
+    /// keeps it, so the same client reaches the group after a total loss,
+    /// as a deployment reaches it at a stable address.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// Kill the primary, the replica and every Sentinel at once. No Redis
+    /// process keeps data on disk, so the group loses every key.
+    pub(super) async fn lose_everything(&self) {
+        let ids: Vec<&str> = self.all().map(ContainerAsync::id).collect();
+        let output = tokio::process::Command::new("docker")
+            .arg("kill")
+            .args(&ids)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    /// Start the group again in its first order, and wait until the
+    /// Sentinels name a primary that answers as one.
+    pub(super) async fn start_everything(&self) {
+        for container in self.all() {
+            container.start().await.unwrap();
+        }
+        Self::role(&self.primary, "master").await;
+        tokio::time::timeout(BOUND, async {
+            while !self.primary_named().await {
+                tokio::time::sleep(PAUSE).await;
+            }
+        })
+        .await
+        .expect("the Sentinels must name a primary after the total loss");
+    }
+
+    fn all(&self) -> impl Iterator<Item = &ContainerAsync<GenericImage>> {
+        [&self.primary, &self.replica]
+            .into_iter()
+            .chain(&self.sentinels)
+    }
+
+    /// Every Sentinel names the same primary, and that primary answers
+    /// as master.
+    async fn primary_named(&self) -> bool {
+        let mut named = Vec::new();
+        for sentinel in &self.sentinels {
+            named.push(Self::master_of(sentinel).await);
+        }
+        let primary = self
+            .primary
+            .get_bridge_ip_address()
+            .await
+            .ok()
+            .map(|ip| ip.to_string());
+        named.iter().all(|n| n.is_some() && *n == primary)
+    }
+
+    async fn master_of(sentinel: &ContainerAsync<GenericImage>) -> Option<String> {
+        let url = Self::url(sentinel, 26379).await;
+        let mut connection = redis::Client::open(url)
+            .ok()?
+            .get_multiplexed_async_connection()
+            .await
+            .ok()?;
+        let addr: Vec<String> = redis::cmd("SENTINEL")
+            .arg("GET-MASTER-ADDR-BY-NAME")
+            .arg("kardamom")
+            .query_async(&mut connection)
+            .await
+            .ok()?;
+        addr.into_iter().next()
     }
 
     async fn url(container: &ContainerAsync<GenericImage>, port: u16) -> String {
@@ -145,7 +232,15 @@ impl Fixture {
             .query_async(&mut sentinel)
             .await
             .unwrap();
-        others.len() == 2 && replicas.len() == 1 && self.cache.wait_replica().await.unwrap() == 1
+        // A replica that still syncs can let WAIT time out on a loaded host. The
+        // fixture is then not ready yet, and the bounded wait tries again.
+        others.len() == 2
+            && replicas.len() == 1
+            && self
+                .cache
+                .wait_replica()
+                .await
+                .is_ok_and(|count| count == 1)
     }
 
     pub(super) fn row(nonce: u64) -> AccountRow {
@@ -235,6 +330,15 @@ impl Fixture {
         })
         .await
         .expect("the same client must follow the promoted primary");
+    }
+
+    /// Read `address` again after a short pause.
+    pub(super) async fn read_again(
+        &self,
+        address: Address,
+    ) -> Result<Option<kardamom_cache::AccountView>, kardamom_cache::CacheError> {
+        tokio::time::sleep(PAUSE).await;
+        self.cache.account(address).await
     }
 
     pub(super) async fn assert_row(&self, nonce: u64, position: u64) {

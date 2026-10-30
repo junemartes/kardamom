@@ -125,9 +125,15 @@ clean:
     rm -f docker/kardamom-cluster-node.jar
     for svc in ingress sequencer executor validator da-watcher batcher state-mirror l1-indexer da-store l1-fault-proxy notifier canary egress; do docker image rm "$REGISTRY/kardamom-$svc:$TAG" || true; done
 
+# Create the node containers and write the node contract.
+_container-nodes:
+    tofu -chdir="$TF_CONTAINERS" init -input=false
+    tofu -chdir="$TF_CONTAINERS" apply -auto-approve -input=false
+    tofu -chdir="$TF_CONTAINERS" output -json node_contract > "$NODE_CONTRACT"
+
 # Create nodes, provision them, publish prebuilt images and deploy workloads.
 # CLUSTER_VARS is a JSON object passed as a single Ansible extra-vars argument.
-container-up:
+container-up: _container-nodes
     #!/usr/bin/env bash
     set -euo pipefail
     export REGISTRY_PUSH_NODE="${REGISTRY_PUSH_NODE:-control-0}"
@@ -138,14 +144,102 @@ container-up:
     # New nodes get a new sealer cluster. The deploy opens the bootstrap
     # only for a cluster job that Nomad does not know.
     export KARDAMOM_CLUSTER_BOOTSTRAP="${KARDAMOM_CLUSTER_BOOTSTRAP:-1}"
-    tofu -chdir="$TF_CONTAINERS" init -input=false
-    tofu -chdir="$TF_CONTAINERS" apply -auto-approve -input=false
-    tofu -chdir="$TF_CONTAINERS" output -json node_contract > "$NODE_CONTRACT"
+    # The first deploy of new nodes starts the jobs in waves.
+    export KARDAMOM_DEPLOY_WAVES="${KARDAMOM_DEPLOY_WAVES:-1}"
     control_address=$(jq -er '.nodes["control-0"].ip' "$NODE_CONTRACT")
     export NOMAD_ADDR="http://$control_address:$NOMAD_HTTP"
     args=()
     if [[ -n "${CLUSTER_VARS:-}" ]]; then args+=(--extra-vars "$CLUSTER_VARS"); fi
     ansible-playbook -i localhost, ansible/cluster.yml "${args[@]}"
+
+# Create nodes, provision them and publish the prebuilt images, with no
+# workloads: the cluster that `container-save` keeps.
+container-prepare: _container-nodes
+    REGISTRY_PUSH_NODE="${REGISTRY_PUSH_NODE:-control-0}" ansible-playbook -i localhost, ansible/containers.yml
+    REGISTRY_PUSH_NODE="${REGISTRY_PUSH_NODE:-control-0}" ansible-playbook -i localhost, ansible/images.yml
+
+# Stop a prepared cluster and save it under `dir`: one image per node
+# without the layers of the plain node image (nodes.tar.zst), the
+# two volumes of every node (volumes/<volume>.tar), the node image map of
+# terraform/containers (node-images.json) and the image manifest
+# (images.digests). A shard resumes the saved cluster with
+# KARDAMOM_PREPARED_CLUSTER=<dir>.
+container-save dir:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="{{ dir }}"
+    mkdir -p "$dir/volumes"
+    nodes=$(jq -r '.nodes | keys[]' "$NODE_CONTRACT")
+    push_node="kardamom-${REGISTRY_PUSH_NODE:-control-0}"
+    # The registry holds every pushed image, so the engine of the push
+    # node keeps only the registry image.
+    docker exec "$push_node" docker image ls --format json \
+        | jq -r --arg registry "$REGISTRY/" 'select(.Repository | startswith($registry)) | "\(.Repository):\(.Tag)"' \
+        | xargs -r docker exec "$push_node" docker image rm >/dev/null
+    # Each node stops its agents and its engine before the container
+    # stops, so every state file on disk is complete. SIGRTMIN+3 halts
+    # systemd.
+    save_node() {
+        docker exec "kardamom-$1" systemctl stop nomad consul docker.socket docker containerd
+        docker stop --signal SIGRTMIN+3 --time 60 "kardamom-$1" >/dev/null
+        docker commit "kardamom-$1" "kardamom-node-$1:prepared" >/dev/null
+        for volume in docker containerd; do
+            docker run --rm --privileged --network none --entrypoint tar \
+                -v "kardamom-$1-$volume:/v:ro" "kardamom-node-$1:prepared" \
+                -C /v --numeric-owner --xattrs --xattrs-include='*' -cf - . > "$dir/volumes/kardamom-$1-$volume.tar"
+        done
+    }
+    pids=()
+    for node in $nodes; do save_node "$node" & pids+=("$!"); done
+    for pid in "${pids[@]}"; do wait "$pid"; done
+    jq -n --args '$ARGS.positional | map({key: ., value: "kardamom-node-\(.):prepared"}) | from_entries' $nodes > "$dir/node-images.json"
+    cp images.digests "$dir/"
+    # The node images share the layers of the plain node image, which a
+    # replaced node starts from. The archive leaves those layers out: the
+    # loader loads the plain node image first, and `docker load` skips a
+    # layer that the engine already holds.
+    base=$(jq -r '.image.name' "$NODE_CONTRACT")
+    base_layers=$(docker image inspect "$base" | jq '.[0].RootFS.Layers | length')
+    work=$(mktemp -d)
+    docker save --output "$work/nodes.tar" $(printf 'kardamom-node-%s:prepared ' $nodes)
+    tar -xOf "$work/nodes.tar" manifest.json | jq -r --argjson n "$base_layers" '[.[].Layers[:$n][]] | unique[]' > "$work/base-layers"
+    mkdir "$work/thin"
+    tar -xf "$work/nodes.tar" -C "$work/thin" --exclude-from="$work/base-layers"
+    rm "$work/nodes.tar"
+    tar -C "$work/thin" -cf - $(ls "$work/thin") | zstd -T0 -3 -q > "$dir/nodes.tar.zst"
+    rm -rf "$work"
+    du -sh "$dir"/* "$dir"/volumes/*
+
+# Load the node images of a cluster that `container-save` kept under `dir`.
+# The plain node image (`base`) must be loaded first.
+container-load dir base:
+    docker image inspect "{{ base }}" >/dev/null
+    zstd -dc "{{ dir }}/nodes.tar.zst" | docker load
+
+# Recreate the volumes of a cluster that `container-save` kept under
+# `dir`, with the label that terraform/containers sets, and put its image
+# manifest in place. `container-load` loads the node images first.
+container-restore dir:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="{{ dir }}"
+    helper=$(jq -r 'first(.[])' "$dir/node-images.json")
+    restore_volume() {
+        local volume
+        volume=$(basename "$1" .tar)
+        # A volume of an earlier cluster goes first. A volume that a node
+        # container still uses fails the restore: the cluster is up.
+        if docker volume inspect "$volume" >/dev/null 2>&1; then
+            docker volume rm "$volume" >/dev/null
+        fi
+        docker volume create --label io.kardamom.cluster=kardamom-net "$volume" >/dev/null
+        docker run --rm -i --privileged --network none --entrypoint tar -v "$volume:/v" "$helper" \
+            -C /v --numeric-owner --xattrs --xattrs-include='*' -xpf - < "$1"
+    }
+    pids=()
+    for archive in "$dir"/volumes/*.tar; do restore_volume "$archive" & pids+=("$!"); done
+    for pid in "${pids[@]}"; do wait "$pid"; done
+    cp "$dir/images.digests" images.digests
 
 # Run a shard against an existing cluster; KARDAMOM_CHAOS_CASES narrows cases.
 # Shards: load, semantics, chaos-executor, chaos-ingress, chaos-sequencer,

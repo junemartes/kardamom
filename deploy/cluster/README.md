@@ -127,6 +127,7 @@ State and replacement:
 - A change to `node.Dockerfile` therefore gives a fresh chain on the next `just container-up`.
 - The Terraform state in `terraform/containers/` is the record of the running cluster.
 - A second `just container-up` is a no-op apply followed by a convergence run.
+- `just container-prepare` runs the bring-up without `deploy.yml`. `just container-save <dir>` then stops the nodes and keeps each one as the image `kardamom-node-<node>:prepared`, with its volumes. With `node_images` set, a node of generation 0 starts from its saved image. `ansible/resume.yml` resumes it. [The prepared cluster in CI](../../docs/chaos-suite.md#the-prepared-cluster-in-ci) describes the flow.
 
 Containers that another harness left behind under the same names block the first apply. Remove them once. Remove the volumes too: Terraform adopts an existing volume by name, and an old `kardamom-<node>-docker` volume carries stale inner Docker state into the new node.
 
@@ -808,11 +809,15 @@ deploy/cluster/
   DESIGN.md                 design record
   PRODUCTION.md             the production profile
   justfile                  container-up / container-test / shard / container-down /
+                            container-prepare / container-save / container-load / container-restore /
                             images / deploy / rollback / rollback-rerender / smoke / validate / check-contract
   ansible/
     ansible.cfg
-    containers.yml          inventory from the node contract, host preparation
+    containers.yml          container-nodes.yml + bootstrap.yml + container-host.yml
+    container-nodes.yml     inventory from the node contract, host preparation
+    container-host.yml      host network settings after the inner Docker engines start
     cluster.yml             containers.yml + images.yml + deploy.yml
+    resume.yml              a saved cluster: container-nodes.yml, substrate waits, deploy.yml
     rollback.yml            revert the last release by the deploy record
     group_vars/all.yml      the contract (classes, ports, versions, profile)
     bootstrap.yml           configure a host and join it to the substrate

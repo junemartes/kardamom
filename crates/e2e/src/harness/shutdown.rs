@@ -198,7 +198,13 @@ impl LocalStack {
     pub fn dump_tails(&self) {
         eprintln!("=== stack log tails ({}) ===", self.root.path().display());
         let procs: Vec<&super::proc::Proc> = std::iter::once(&self.ingress.proc)
+            .chain(self.extra_ingresses.iter().map(|i| &i.proc))
             .chain(std::iter::once(&self.executor.proc))
+            .chain(
+                self.read_path
+                    .as_ref()
+                    .map(super::read_path::ReadPath::proc),
+            )
             .chain(self.validator.as_ref().map(|v| &v.proc))
             .chain(self.da_watcher.as_ref().map(|w| &w.proc))
             .chain(self.l1_follower.as_ref().map(|f| &f.service.proc))
