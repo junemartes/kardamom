@@ -287,13 +287,10 @@ jobs:
           root: deploy/cluster/terraform/containers
       - uses: ./.github/actions/just
 
-      # The saved nodes keep the Nomad configuration of this step, so the
-      # chaos value of the heartbeat grace is set here, not per shard.
       - name: Provision the nodes and publish the images
         run: just --justfile deploy/cluster/justfile container-prepare
         env:
           KARDAMOM_STAGED: "1"
-          NOMAD_HEARTBEAT_GRACE: 30s
 
       # The runner engine keeps a copy of every image that the registry
       # holds. The save needs the disk space.
