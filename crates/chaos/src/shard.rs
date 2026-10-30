@@ -139,7 +139,6 @@ impl Shard {
                 "archive-driver-loss",
                 "archive-tx-data-wipe",
                 "archive-corruption",
-                "prune-floor",
             ],
             Self::Sequencer => Self::SEQUENCER_CASES,
             Self::Cluster => &[
@@ -180,7 +179,7 @@ impl Shard {
             Self::CombinedOrdering => &[
                 "ingress-sealer-loss-recover",
                 "ingress-sequencer-loss-recover",
-                "ingress-sequencer-sealer-reverse",
+                "ingress-sequencer-sealer-loss-recover",
             ],
             // The executors down with another class: the sealers, the
             // sealers and the validator, the ingresses, and the read path
@@ -201,6 +200,7 @@ impl Shard {
             Self::L1 => &[
                 "l1-liar",
                 "l1-null-receipts",
+                "prune-floor",
                 "batcher-outage-past-retention",
             ],
             // The loss and the disagreement of the L1 follower's
@@ -246,7 +246,7 @@ impl Shard {
                 "cluster-leader-kill",
                 "cluster-member-rejoin",
                 "sequencer-sealer-loss-recover",
-                "ingress-sequencer-sealer-loss-recover",
+                "ingress-sequencer-sealer-reverse",
                 "read-path-loss-recover",
                 "mirror-backlog-client-restart",
                 "l1-provider-unresponsive",
@@ -390,9 +390,11 @@ impl Shard {
             | Self::Coordinated
             | Self::CombinedOrdering
             | Self::CombinedExec => DeployVars::default(),
-            // The fault proxy for the L1 cases of the nightly shard. It
-            // forwards every read while no fault is set.
+            // The fault proxy for the L1 cases of the nightly shard: it
+            // forwards every read while no fault is set. A snapshot every
+            // 30 s, so the leader purges its log within the rejoin drill.
             Self::Integrity => DeployVars {
+                cluster_snapshot_interval_s: Some(SHORT_SNAPSHOT_S),
                 l1_fault_proxy: true,
                 indexer_poll_s: Some(2),
                 da_watcher_silence_s: Some(30),
@@ -609,7 +611,7 @@ mod tests {
                 "cluster-leader-kill",
                 "cluster-member-rejoin",
                 "sequencer-sealer-loss-recover",
-                "ingress-sequencer-sealer-loss-recover",
+                "ingress-sequencer-sealer-reverse",
                 "read-path-loss-recover",
                 "mirror-backlog-client-restart",
                 "l1-provider-unresponsive",
