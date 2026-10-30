@@ -1,0 +1,54 @@
+# promtool unit test of deploy/alerts.yml for the DA-lag halt and the
+# canary pages that it explains. The test mounts alerts.yml beside this
+# file. The batcher stops posting at 2m: the ingress exports the halt of
+# the sealer on da_lag, and each canary transfer gets the JSON-RPC code
+# -32010. The batcher posts again at 12m: the halt clears.
+rule_files:
+  - alerts.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'kardamom_halt{cause="da_lag",service="ingress",host_id="h",instance="ingress-0:9001",recovery="r1"}'
+        values: '0 0 1x10 0x8'
+      - series: 'kardamom_canary_probe_total{probe="transfer",outcome="success",endpoint="ingress-0",host_id="h"}'
+        values: '0+1x5 5x20'
+      - series: 'kardamom_canary_probe_total{probe="transfer",outcome="rpc_error",code="-32010",endpoint="ingress-0",host_id="h"}'
+        values: '0x5 0+1x20'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: KardamomHaltDaLag
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: KardamomCanaryStalled
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: KardamomCanaryFailing
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: KardamomHaltDaLag
+        exp_alerts:
+          - exp_labels: {severity: critical, cause: da_lag, service: ingress, host_id: h, instance: "ingress-0:9001", recovery: r1}
+            exp_annotations:
+              summary: "ingress halted: da_lag (h)"
+              description: "The sealed head is more than the DA-lag budget past the last block posted to L1. The sealer refuses new transactions until the batcher posts again; the ingresses pause submits on it. The ingress observes the sealer and exports this halt. Find why the batcher does not post. Detail: kardamom_chainStatus on the ingress, and http://ingress-0:9001/halt. Runbook: docs/runbooks/da_lag.md (recovery id r1)."
+              runbook: "docs/runbooks/da_lag.md"
+      - eval_time: 12m
+        alertname: KardamomCanaryStalled
+        exp_alerts:
+          - exp_labels: {severity: critical, host_id: h}
+            exp_annotations:
+              summary: "no canary transfer succeeded for 5 minutes (h)"
+              description: "The canary sends a transfer every 5 seconds through each ingress, and none landed for 5 minutes. Users cannot transact. See the failures by outcome on the Kardamom Canary dashboard."
+              runbook: "docs/failure-modes.md#transaction-canary"
+      - eval_time: 12m
+        alertname: KardamomCanaryFailing
+        exp_alerts:
+          - exp_labels: {severity: critical, probe: transfer}
+            exp_annotations:
+              summary: "canary transfer succeeds in 27.03% of its runs"
+              description: "Under 95% of the canary's transfer runs succeeded in the last 10 minutes: users fail. The failures by outcome and endpoint are on the Kardamom Canary dashboard. Check which endpoint and which outcome (rpc_error code, rejected reason, timeout stage) carry them."
+              runbook: "docs/failure-modes.md#transaction-canary"
+      - eval_time: 16m
+        alertname: KardamomHaltDaLag
+        exp_alerts: []

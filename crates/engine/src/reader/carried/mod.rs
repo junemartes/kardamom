@@ -37,6 +37,8 @@ mod tests_compare;
 #[cfg(test)]
 mod tests_late;
 #[cfg(test)]
+mod tests_retention;
+#[cfg(test)]
 mod tests_switch;
 mod transport;
 
