@@ -17,7 +17,7 @@ A shard is one test. It brings up its own container cluster, runs its stages, an
 
 - Run both recipes from the repository root. The root `justfile` forwards them to `deploy/cluster/justfile`.
 - The default shard is the value of `SHARD`, or `load`.
-- CI runs every shard in `.github/workflows/cluster-e2e.yml`. Each shard has its own runner and its own cluster.
+- CI runs every shard nightly in `.github/workflows/cluster-e2e.yml`, not on a pull request or a push. Each shard has its own runner and its own cluster. See [The nightly runs](#the-nightly-runs).
 - The host needs Docker, OpenTofu, Ansible and the prebuilt artifacts. `just cluster-bootstrap` installs the host tools.
 - On a failure, the cluster stays up. `just container-diagnostics` collects the state of the nodes and the jobs.
 - The bring-up sets `KARDAMOM_CLUSTER_BOOTSTRAP=1`. The deploy opens the sealer bootstrap only for a cluster job that Nomad does not know, so a bring-up over a running cluster opens none. See [Sealer bootstrap](../deploy/cluster/README.md#sealer-bootstrap).
@@ -94,7 +94,7 @@ The initial inventory includes 103 Rust tests across 14 recovery groups. It does
 
 ## Shards
 
-There are sixteen distributed shards. `just container-test` lists their names. Fifteen run on every pull request. `chaos-integrity` runs nightly. A manual run with `suite=all` includes all sixteen.
+There are sixteen distributed shards. `just container-test` lists their names. All sixteen run nightly. See [The nightly runs](#the-nightly-runs).
 
 ### Carry-born shards
 
@@ -154,7 +154,19 @@ After each of these audits, the next case waits until the chain runs again. See 
 
 `KARDAMOM_CHAOS_CASES` narrows a run to a space-separated list of case names. An unknown name fails before any load starts.
 
-The nightly shard holds the long repetition cases and the seeded restart of the sealer fleet. The `cluster-e2e` workflow runs it on its schedule (03:17 UTC), alone. Adding the `chaos-nightly` label to a pull request runs it alone too, in a run of its own: the `labeled` event starts the run, and no other label starts one. The build job of the workflow picks the shard list. A nightly run has its own concurrency group, so it never cancels the regular run of the ref. A failed shard of the scheduled run opens an issue `nightly: the <shard> shard failed` with the `chaos-nightly` label, or adds the run to the open issue of that shard.
+The `chaos-integrity` shard holds the long repetition cases and the seeded restart of the sealer fleet.
+
+### The nightly runs
+
+- The `cluster-e2e` workflow runs every shard on its schedule (03:17 UTC): `load`, `semantics`, every `chaos-*` shard and `chaos-integrity`. A pull request and a push to main start no run.
+- workflow_dispatch runs every shard on any branch.
+- The `chaos-nightly` label runs every shard on a pull request, in a run of its own. The `labeled` event starts the run, and no other label starts one.
+- A failed shard of the scheduled run opens an issue `nightly: the <shard> shard failed` with the `chaos-nightly` label, or adds the run to the open issue of that shard. The issue names the failed cases and links the shard log.
+- Every nightly failure gets an isolated reproduction. The issue holds this checklist:
+  1. Find the cause in the shard log.
+  2. Add or extend an isolated test in `scripts/ci/component-recovery.json` (the in-process suite) that reproduces the failure. Name the case and the test in the issue.
+  3. Fix the product or the test.
+  4. Link the pull request in the issue.
 
 ### Cases
 

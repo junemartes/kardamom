@@ -14,19 +14,16 @@ name: cluster-e2e
 # binaries (no cargo feature to toggle); the Java cluster image is built from the
 # gradle shadowJar.
 #
-# The FULL suite runs on every trigger, SHARDED across runners (each shard
-# starts its own copy of the prepared cluster and runs one slice): one `load` shard (5-min soak), three
-# `chaos-*` component shards (executor/ingress/sequencer), one `chaos-cluster`
-# shard for the Raft resilience cases, and one `chaos-fleet` shard for the
-# whole-fleet outages. Splitting across runners keeps wall-clock
-# to ~one shard instead of running everything serially. Opt out with the
-# `skip-cluster-e2e` label for changes that can't affect the cluster.
+# The suite is SHARDED across runners: each shard starts its own copy of
+# the prepared cluster and runs one slice.
 #
-# The nightly shards (`chaos-integrity`) hold the long repetition cases. The
-# schedule runs them alone, and a failed shard of a nightly run opens or
-# updates one issue per shard. Adding the `chaos-nightly` label to a pull
-# request runs them alone too, in a run of its own that cancels nothing. The
-# build job picks the shard list.
+# Every shard runs nightly, not on a pull request or a push: `load` (the
+# soak), `semantics`, every `chaos-*` shard and `chaos-integrity`. The
+# schedule runs them; workflow_dispatch runs them on any branch; the
+# `chaos-nightly` label runs them on a pull request, in a run of its own.
+# A failed shard of a scheduled run opens or updates one issue per shard.
+# The issue names the failed cases and holds the triage checklist: every
+# nightly failure gets an isolated reproduction in the in-process suite.
 #
 # One `build` job compiles the service binaries, the shard test executable,
 # the operator binary and the sealer jar once (`just stage-dist`). The
@@ -50,27 +47,16 @@ name: cluster-e2e
 
 on:
   workflow_dispatch:
-    inputs:
-      suite:
-        description: Shards to validate
-        type: choice
-        required: true
-        default: regular
-        options: [regular, all]
   pull_request:
-    # `labeled` is the trigger of the nightly shards on a pull request.
-    types: [opened, synchronize, reopened, labeled]
-  push:
-    branches: [main]
+    # Only the `chaos-nightly` label starts a run on a pull request.
+    types: [labeled]
   schedule:
-    # The nightly shards, at 03:17 UTC.
+    # Every shard, at 03:17 UTC.
     - cron: "17 3 * * *"
 
 concurrency:
-  # A nightly run (the schedule, or the label on a pull request) has its
-  # own group, so it never cancels the regular run of the ref, and the
-  # regular run never cancels it.
-  group: ${{ github.workflow }}-${{ github.ref }}${{ (github.event_name == 'schedule' || github.event.action == 'labeled') && '-nightly' || '' }}
+  # A newer run of the same ref replaces the older one.
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -99,26 +85,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The shard list of this run. The nightly shards run alone on the
-      # schedule and on the `labeled` event of the `chaos-nightly` label.
-      # The regular shards run on every other trigger. The names are the
-      # `Shard` names of crates/chaos/src/shard.rs plus the two stages of
-      # tests/shards.rs.
+      # The shard list of every run. The names are the `Shard` names of
+      # crates/chaos/src/shard.rs plus the two stages of tests/shards.rs.
       - name: Pick the shards
         id: shards
-        env:
-          NIGHTLY: ${{ github.event_name == 'schedule' || github.event.action == 'labeled' }}
-          ALL: ${{ github.event.inputs.suite == 'all' }}
         run: |
-          regular='"load","chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-combined-ordering","chaos-combined-exec","chaos-retention","chaos-cache","chaos-l1","chaos-follower","chaos-carry","semantics"'
-          nightly='"chaos-integrity"'
-          if [ "$ALL" = true ]; then
-            shards="[$regular,$nightly]"
-          elif [ "$NIGHTLY" = true ]; then
-            shards="[$nightly]"
-          else
-            shards="[$regular]"
-          fi
+          shards='["load","semantics","chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-combined-ordering","chaos-combined-exec","chaos-retention","chaos-cache","chaos-l1","chaos-follower","chaos-carry","chaos-integrity"]'
           echo "shards=$shards" >> "$GITHUB_OUTPUT"
           echo "shards: $shards"
 
@@ -581,22 +553,41 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          failed=$(gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/jobs" \
-            --jq '.jobs[] | select(.conclusion == "failure" and (.name | startswith("container cluster e2e ("))) | .name | capture("\\((?<shard>[^)]+)\\)") | .shard')
-          if [ -z "$failed" ]; then
+          gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | select(.conclusion == "failure" and (.name | startswith("container cluster e2e ("))) | "\(.id) \(.html_url) \(.name | capture("\\((?<shard>[^)]+)\\)") | .shard)"' > failed-shards
+          if [ ! -s failed-shards ]; then
             echo "every nightly shard passed"
             exit 0
           fi
-          for shard in $failed; do
+          while read -r job url shard; do
+            # The failed cases: the cases that the log starts and does not
+            # pass.
+            gh api "repos/$GH_REPO/actions/jobs/$job/logs" > shard.log || true
+            sed -n 's/.*= CHAOS CASE: \([a-z0-9-]*\).*/\1/p' shard.log | sort -u > started
+            sed -n 's/.*CHAOS CASE \([a-z0-9-]*\): PASS.*/\1/p' shard.log | sort -u > passed
+            cases=$(comm -23 started passed | paste -sd, -)
             title="nightly: the $shard shard failed"
-            body="The nightly run $RUN_URL failed the \`$shard\` shard. The job log and the chaos evidence artifact of the run hold the details."
+            {
+              echo "The nightly run $RUN_URL failed the \`$shard\` shard."
+              echo
+              echo "- Failed cases: ${cases:-none found in the log}"
+              echo "- Shard log: $url"
+              echo "- The chaos evidence artifacts of the run hold the state files."
+              echo
+              echo "Triage checklist:"
+              echo
+              echo "- [ ] Find the cause in the shard log."
+              echo "- [ ] Add or extend an isolated test in scripts/ci/component-recovery.json (the in-process suite) that reproduces the failure. Name the case and the test here."
+              echo "- [ ] Fix the product or the test."
+              echo "- [ ] Link the pull request here."
+            } > issue-body.md
             number=$(gh issue list --repo "$GH_REPO" --label chaos-nightly --state open --search "\"$title\" in:title" --json number,title \
               --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)
             if [ -n "$number" ]; then
-              gh issue comment "$number" --repo "$GH_REPO" --body "$body"
+              gh issue comment "$number" --repo "$GH_REPO" --body-file issue-body.md
               echo "updated #$number for $shard"
             else
-              gh issue create --repo "$GH_REPO" --title "$title" --label chaos-nightly --body "$body"
+              gh issue create --repo "$GH_REPO" --title "$title" --label chaos-nightly --body-file issue-body.md
               echo "opened an issue for $shard"
             fi
-          done
+          done < failed-shards
