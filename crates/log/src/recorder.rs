@@ -41,6 +41,7 @@ use tracing::{info, warn};
 use crate::archive_catalog::ArchiveCatalog;
 use crate::config::AeronConfig;
 use crate::driver_budget::DriverBudget;
+use crate::driver_wait::DriverWait;
 use crate::error::LogError;
 use crate::fail_fast::FailFast;
 
@@ -119,6 +120,9 @@ pub fn connect_archive_with_timeout(
             .map_err(|e| LogError::Aeron(format!("archive set_dir: {e}")))?;
     }
     ctx.fail_fast()?;
+    // An inline caller with a short connect timeout keeps its quick
+    // failure; a boot-time session waits up to the driver wait.
+    DriverWait::of(&ctx, driver_budget.driver_wait().min(connect_timeout))?.wait()?;
     let aeron = rusteron_archive::Aeron::new(&ctx)
         .map_err(|e| LogError::Aeron(format!("archive Aeron::new: {e}")))?;
     aeron
