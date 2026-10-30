@@ -111,6 +111,11 @@ public final class LinkFaults {
     private final AtomicLongArray released = new AtomicLongArray(MAX_MEMBERS);
     private volatile List<Fault> faults = List.of();
     private long planStamp = -1;
+    private long nextPlanNs;
+    private long nextCountsNs;
+    /** The test JVM; the member stops when it dies. */
+    private final Optional<ProcessHandle> parent = Optional.ofNullable(System.getProperty("kardamom.test.parentPid"))
+        .flatMap(pid -> ProcessHandle.of(Long.parseLong(pid)));
 
     private LinkFaults(final Path plan, final int self, final List<Owner> owners) {
         this.plan = plan;
@@ -197,21 +202,22 @@ public final class LinkFaults {
     }
 
     private void run() {
-        long nextPlan = 0;
-        long nextCounts = 0;
-        final Optional<ProcessHandle> parent = Optional.ofNullable(System.getProperty("kardamom.test.parentPid"))
-            .flatMap(pid -> ProcessHandle.of(Long.parseLong(pid)));
         while (!Thread.currentThread().isInterrupted()) {
-            // A member whose test JVM died stops at once, so it holds no port and no tmpfs past its test.
-            if (parent.isPresent() && !parent.get().isAlive()) {
-                Runtime.getRuntime().halt(1);
-            }
-            final long now = System.nanoTime();
-            nextPlan = now >= nextPlan ? readPlan(now) : nextPlan;
-            nextCounts = now >= nextCounts ? writeCounts(now) : nextCounts;
-            sendTicks();
-            java.util.concurrent.locks.LockSupport.parkNanos(TICK_PARK_NS);
+            step();
         }
+    }
+
+    /** One pass of the daemon thread: the parent check, the plan, the counts and the ticks. */
+    private void step() {
+        // A member whose test JVM died stops at once, so it holds no port and no tmpfs past its test.
+        if (parent.filter(p -> !p.isAlive()).isPresent()) {
+            Runtime.getRuntime().halt(1);
+        }
+        final long now = System.nanoTime();
+        nextPlanNs = now >= nextPlanNs ? readPlan(now) : nextPlanNs;
+        nextCountsNs = now >= nextCountsNs ? writeCounts(now) : nextCountsNs;
+        sendTicks();
+        java.util.concurrent.locks.LockSupport.parkNanos(TICK_PARK_NS);
     }
 
     private long readPlan(final long now) {

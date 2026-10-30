@@ -729,6 +729,223 @@
       "limitation": "The actor suite mocks consensus. The Raft suite uses real in-JVM members but does not prove OS process loss, network partitions, deployment or disk power-loss durability.",
       "ci_mode": "gradle"
     },
+    "sealer-raft-network": {
+      "command": [
+        "cluster/sealer-service/gradlew",
+        "-p",
+        "cluster/sealer-service",
+        ":service:test",
+        "--no-daemon",
+        "--rerun-tasks",
+        "--tests",
+        "io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.RaftLeaderPacketLossTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.CpuSqueezeTest"
+      ],
+      "ci_mode": "gradle",
+      "junit_reports": [
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderPacketLossTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.CpuSqueezeTest.xml"
+      ],
+      "tests": [
+        "io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest::the_peers_of_a_leader_that_cannot_send_elect_a_new_leader_and_the_old_one_stays_up()",
+        "io.kardamom.sealer.cluster.RaftLeaderPacketLossTest::a_lossy_leader_link_keeps_commits_and_one_leader_per_term()",
+        "io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest::a_slow_leader_link_keeps_commits_and_one_leader_per_term()",
+        "io.kardamom.sealer.cluster.CpuSqueezeTest::starved_members_slow_down_but_never_fork_the_canonical_order()"
+      ],
+      "real": [
+        "ClusterNode main class in one JVM process per member, with the deployed member settings",
+        "SealerClusteredService, CanonicalSealerState, Aeron consensus module, media driver and archive of each member",
+        "StartMode, PeerSeed, PeerNameResolver, JoinWatchdog, LogPurger, snapshot schedule and admin endpoint",
+        "member feed on a shared driver of each node, and a real Aeron cluster client with the production wire codecs",
+        "the link faults act inside each receiving member driver, on the frames from the selected member to its peers"
+      ],
+      "controlled": [
+        "a one-way cut, 10 % random loss or a 250 ms ordered delay of the frames of the leader to both peers, for 10-15 s",
+        "SIGSTOP/SIGCONT of all members: 15 ms of run in each 100 ms for 20 s",
+        "the deployed 2 s tick and the deployed Raft timeouts"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "leader failure detection slowed: a 50 s leader heartbeat timeout with a 100 s startup canvass",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest::the_peers_of_a_leader_that_cannot_send_elect_a_new_leader_and_the_old_one_stays_up()",
+            "io.kardamom.sealer.cluster.ClusterLeaderKillTest::a_killed_leader_leaves_a_quorum_that_commits_and_the_member_rejoins()"
+          ],
+          "failed_at": "no new leader within the 45 s leader bound; no commit within 30 s of the leader kill"
+        },
+        {
+          "mutation": "each member stamps its boundaries with its own clock: cluster.time() + 1000 * memberId in onTimer",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.CpuSqueezeTest::starved_members_slow_down_but_never_fork_the_canonical_order()",
+            "io.kardamom.sealer.cluster.RaftLeaderPacketLossTest::a_lossy_leader_link_keeps_commits_and_one_leader_per_term()",
+            "io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest::a_slow_leader_link_keeps_commits_and_one_leader_per_term()"
+          ],
+          "failed_at": "the member feeds differ at a boundary frame: the canonical order forks"
+        }
+      ],
+      "limitation": "The faults act in the receiving driver, not in the kernel: frames from the leader to its clients and kernel queues stay intact. The hold is 10-15 s, not the 30 s of the chaos case. The squeeze stops whole processes; it does not reproduce a CFS quota of the executor and validator, and the validator verdict of the chaos case is not covered here. The loss and delay controls guard the order oracle; Aeron retransmission has no product seam to break."
+    },
+    "sealer-raft-members": {
+      "command": [
+        "cluster/sealer-service/gradlew",
+        "-p",
+        "cluster/sealer-service",
+        ":service:test",
+        "--no-daemon",
+        "--rerun-tasks",
+        "--tests",
+        "io.kardamom.sealer.cluster.ClusterLeaderKillTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.ClusterFollowerKillTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.ClusterMemberRejoinTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.ClusterTwoBlankRecoverTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.NodeReplaceSealerTest"
+      ],
+      "ci_mode": "gradle",
+      "junit_reports": [
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.ClusterLeaderKillTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.ClusterFollowerKillTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.ClusterMemberRejoinTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.ClusterTwoBlankRecoverTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.NodeReplaceSealerTest.xml"
+      ],
+      "tests": [
+        "io.kardamom.sealer.cluster.ClusterLeaderKillTest::a_killed_leader_leaves_a_quorum_that_commits_and_the_member_rejoins()",
+        "io.kardamom.sealer.cluster.ClusterFollowerKillTest::a_killed_follower_restores_its_snapshot_while_the_quorum_commits()",
+        "io.kardamom.sealer.cluster.ClusterMemberRejoinTest::a_wiped_follower_seeds_from_a_peer_after_the_leader_purged_its_log()",
+        "io.kardamom.sealer.cluster.ClusterTwoBlankRecoverTest::an_offline_copy_of_the_survivor_restores_a_quorum_that_seeds_the_last_blank_member()",
+        "io.kardamom.sealer.cluster.NodeReplaceSealerTest::a_follower_on_a_new_node_seeds_from_a_peer_and_catches_up()"
+      ],
+      "real": [
+        "ClusterNode main class in one JVM process per member, with the deployed member settings",
+        "SealerClusteredService, CanonicalSealerState, Aeron consensus module, media driver and archive of each member",
+        "StartMode, PeerSeed, PeerNameResolver, JoinWatchdog, LogPurger, snapshot schedule and admin endpoint",
+        "member feed on a shared driver of each node, and a real Aeron cluster client with the production wire codecs"
+      ],
+      "controlled": [
+        "SIGKILL of the leader or a follower, a SIGTERM stop of every member, wiped member directories and a hash-checked offline copy",
+        "a log purge after more than one 8 MiB archive segment and a posted head",
+        "a node replacement: a new loopback address, empty volumes and a new shared driver under the same host name",
+        "a test cluster clock that passes the 60 s startup canvass at once in the two-blank case"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "leader failure detection slowed: a 50 s leader heartbeat timeout with a 100 s startup canvass",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest::the_peers_of_a_leader_that_cannot_send_elect_a_new_leader_and_the_old_one_stays_up()",
+            "io.kardamom.sealer.cluster.ClusterLeaderKillTest::a_killed_leader_leaves_a_quorum_that_commits_and_the_member_rejoins()"
+          ],
+          "failed_at": "no new leader within the 45 s leader bound; no commit within 30 s of the leader kill"
+        },
+        {
+          "mutation": "a blank member starts at log position 0 instead of a peer seed: StartMode.of returns GENESIS",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.ClusterMemberRejoinTest::a_wiped_follower_seeds_from_a_peer_after_the_leader_purged_its_log()",
+            "io.kardamom.sealer.cluster.ClusterTwoBlankRecoverTest::an_offline_copy_of_the_survivor_restores_a_quorum_that_seeds_the_last_blank_member()",
+            "io.kardamom.sealer.cluster.NodeReplaceSealerTest::a_follower_on_a_new_node_seeds_from_a_peer_and_catches_up()"
+          ],
+          "failed_at": "no peer seed and no catch-up to the head of the wipe"
+        },
+        {
+          "mutation": "a restarted member ignores its snapshot: onStart skips the snapshot restore",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.ClusterFollowerKillTest::a_killed_follower_restores_its_snapshot_while_the_quorum_commits()",
+            "io.kardamom.sealer.cluster.ClusterTotalLossRecoverTest::every_member_returns_from_its_own_state_and_the_cluster_commits_again()"
+          ],
+          "failed_at": "the restarted member logs no snapshot restore"
+        }
+      ],
+      "limitation": "Member state is on tmpfs, so a kill keeps it as the page cache does; power loss is not covered. A 1 s JVM DNS cache stands in for the minutes that a node replacement takes. Nomad placement, Terraform node replacement and Consul records stay in the cluster suite."
+    },
+    "sealer-raft-fleet": {
+      "command": [
+        "cluster/sealer-service/gradlew",
+        "-p",
+        "cluster/sealer-service",
+        ":service:test",
+        "--no-daemon",
+        "--rerun-tasks",
+        "--tests",
+        "io.kardamom.sealer.cluster.ClusterQuorumLossRecoverTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.ClusterTotalLossRecoverTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerFleetTotalWipeTest"
+      ],
+      "ci_mode": "gradle",
+      "junit_reports": [
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.ClusterQuorumLossRecoverTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.ClusterTotalLossRecoverTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerFleetTotalWipeTest.xml"
+      ],
+      "tests": [
+        "io.kardamom.sealer.cluster.ClusterQuorumLossRecoverTest::a_cluster_without_a_quorum_stalls_and_commits_again_when_a_member_returns()",
+        "io.kardamom.sealer.cluster.ClusterTotalLossRecoverTest::every_member_returns_from_its_own_state_and_the_cluster_commits_again()",
+        "io.kardamom.sealer.cluster.SealerFleetTotalWipeTest::a_wiped_fleet_restarts_after_the_posted_head_from_a_seed()"
+      ],
+      "real": [
+        "ClusterNode main class in one JVM process per member, with the deployed member settings",
+        "SealerClusteredService, CanonicalSealerState, Aeron consensus module, media driver and archive of each member",
+        "StartMode, PeerSeed, PeerNameResolver, JoinWatchdog, LogPurger, snapshot schedule and admin endpoint",
+        "member feed on a shared driver of each node, and a real Aeron cluster client with the production wire codecs",
+        "the seed file in the format that kardamom-reconstruct --sealer-seed writes"
+      ],
+      "controlled": [
+        "SIGKILL of two or three members with a 15 s stall window",
+        "a SIGTERM stop and wipe of every member, a start inside the bootstrap from a seed at the posted head, and a restart without the seed",
+        "a stale consumer cursor of the old chain and a fresh consumer at the seed head"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "the sealer ignores a replay request, so a new session cannot resume from its cursor",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.ClusterQuorumLossRecoverTest::a_cluster_without_a_quorum_stalls_and_commits_again_when_a_member_returns()"
+          ],
+          "failed_at": "the record that committed while the old session was gone never reaches the new session"
+        },
+        {
+          "mutation": "a restarted member ignores its snapshot: onStart skips the snapshot restore",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.ClusterTotalLossRecoverTest::every_member_returns_from_its_own_state_and_the_cluster_commits_again()"
+          ],
+          "failed_at": "the restarted member logs no snapshot restore"
+        },
+        {
+          "mutation": "a seeded member ignores the seed and starts at genesis",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.SealerFleetTotalWipeTest::a_wiped_fleet_restarts_after_the_posted_head_from_a_seed()"
+          ],
+          "failed_at": "no member logs SEEDED at H"
+        }
+      ],
+      "limitation": "The fleet-wipe test covers the sealer part only: the L1 rebuild of the executor image and the validator state, the executor resume, the da-watcher origin, the batcher record continuity and the cache flush are not run here."
+    },
     "cache-sentinel": {
       "command": [
         "cargo",
@@ -1792,7 +2009,7 @@
     {
       "case": "cluster-leader-kill",
       "family": "Cluster",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "sequencer",
@@ -1801,62 +2018,104 @@
         {
           "suite": "sealer-raft",
           "test": "io.kardamom.sealer.cluster.SealerClusterFailoverTest::egressContinuesGaplesslyAcrossLeaderKill()"
+        },
+        {
+          "suite": "sealer-raft-members",
+          "test": "io.kardamom.sealer.cluster.ClusterLeaderKillTest::a_killed_leader_leaves_a_quorum_that_commits_and_the_member_rejoins()"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true
     },
     {
       "case": "raft-leader-one-way-partition",
       "family": "Cluster",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-network",
+          "test": "io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest::the_peers_of_a_leader_that_cannot_send_elect_a_new_leader_and_the_old_one_stays_up()"
+        }
+      ],
+      "full_case_locally_validated": true
     },
     {
       "case": "raft-leader-packet-loss",
       "family": "Cluster",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-network",
+          "test": "io.kardamom.sealer.cluster.RaftLeaderPacketLossTest::a_lossy_leader_link_keeps_commits_and_one_leader_per_term()"
+        }
+      ],
+      "full_case_locally_validated": true
     },
     {
       "case": "cluster-follower-kill",
       "family": "Cluster",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-members",
+          "test": "io.kardamom.sealer.cluster.ClusterFollowerKillTest::a_killed_follower_restores_its_snapshot_while_the_quorum_commits()"
+        }
+      ],
+      "full_case_locally_validated": true
     },
     {
       "case": "cluster-member-rejoin",
       "family": "Cluster",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "sealer-raft",
           "test": "io.kardamom.sealer.cluster.SealerSeedClusterTest::a_seeded_cluster_confirms_relays_from_e_h_and_restarts_from_its_snapshot()"
+        },
+        {
+          "suite": "sealer-raft-members",
+          "test": "io.kardamom.sealer.cluster.ClusterMemberRejoinTest::a_wiped_follower_seeds_from_a_peer_after_the_leader_purged_its_log()"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true
     },
     {
       "case": "cluster-two-blank-recover",
       "family": "Cluster",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-members",
+          "test": "io.kardamom.sealer.cluster.ClusterTwoBlankRecoverTest::an_offline_copy_of_the_survivor_restores_a_quorum_that_seeds_the_last_blank_member()"
+        }
+      ],
+      "full_case_locally_validated": true
     },
     {
       "case": "node-replace-sealer",
       "family": "Cluster",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-members",
+          "test": "io.kardamom.sealer.cluster.NodeReplaceSealerTest::a_follower_on_a_new_node_seeds_from_a_peer_and_catches_up()"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "machine replacement: the Terraform root replaces the node and Nomad places the member on it; only the deployed cluster has them",
+        "address change through the Consul node record: the local test moves the name in a hosts file instead"
+      ]
     },
     {
       "case": "cpu-squeeze",
       "family": "Cluster",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-network",
+          "test": "io.kardamom.sealer.cluster.CpuSqueezeTest::starved_members_slow_down_but_never_fork_the_canonical_order()"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -1915,16 +2174,32 @@
     {
       "case": "cluster-quorum-loss-recover",
       "family": "Fleet",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-fleet",
+          "test": "io.kardamom.sealer.cluster.ClusterQuorumLossRecoverTest::a_cluster_without_a_quorum_stalls_and_commits_again_when_a_member_returns()"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "power-off of whole sealer nodes with Nomad on them: the local test kills the member processes only"
+      ]
     },
     {
       "case": "cluster-total-loss-recover",
       "family": "Fleet",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-fleet",
+          "test": "io.kardamom.sealer.cluster.ClusterTotalLossRecoverTest::every_member_returns_from_its_own_state_and_the_cluster_commits_again()"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "power-off of all sealer nodes with their executors and Nomad agents: the local test kills the member processes only"
+      ]
     },
     {
       "case": "ingress-pair-loss-recover",
@@ -2449,8 +2724,13 @@
     {
       "case": "sealer-fleet-total-wipe-recover",
       "family": "Integrity",
-      "status": "planned",
-      "local_tests": [],
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-fleet",
+          "test": "io.kardamom.sealer.cluster.SealerFleetTotalWipeTest::a_wiped_fleet_restarts_after_the_posted_head_from_a_seed()"
+        }
+      ],
       "full_case_locally_validated": false
     },
     {
@@ -2761,9 +3041,14 @@
     {
       "case": "raft-leader-packet-delay",
       "family": "Cluster",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-network",
+          "test": "io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest::a_slow_leader_link_keeps_commits_and_one_leader_per_term()"
+        }
+      ],
+      "full_case_locally_validated": true
     }
   ]
 }

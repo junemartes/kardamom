@@ -20,13 +20,19 @@ final class Await {
         final long deadline = System.nanoTime() + bound.toNanos();
         Optional<T> value = probe.get();
         while (value.isEmpty()) {
-            if (System.nanoTime() - deadline > 0) {
-                throw new AssertionError(what + " within " + bound.toMillis() + " ms");
-            }
-            pause(POLL_MS);
-            value = probe.get();
+            value = next(deadline, bound, what, probe);
         }
         return value.get();
+    }
+
+    /** Fail past {@code deadline}; else wait one poll and observe again. */
+    private static <T> Optional<T> next(
+            final long deadline, final Duration bound, final String what, final Supplier<Optional<T>> probe) {
+        if (System.nanoTime() - deadline > 0) {
+            throw new AssertionError(what + " within " + bound.toMillis() + " ms");
+        }
+        pause(POLL_MS);
+        return probe.get();
     }
 
     /** Poll until {@code condition} holds; fail with {@code what} when {@code bound} passes. */

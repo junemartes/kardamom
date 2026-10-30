@@ -36,12 +36,17 @@ final class Squeeze implements AutoCloseable {
 
     private void cycle() {
         while (running) {
-            signal("STOP");
-            Await.pause(stopMs);
-            signal("CONT");
-            periods++;
-            Await.pause(runMs);
+            period();
         }
+    }
+
+    /** One period: every process stops, then runs. */
+    private void period() {
+        signal("STOP");
+        Await.pause(stopMs);
+        signal("CONT");
+        periods++;
+        Await.pause(runMs);
     }
 
     private void signal(final String name) {

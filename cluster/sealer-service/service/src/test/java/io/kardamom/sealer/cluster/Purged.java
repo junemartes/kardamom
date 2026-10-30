@@ -45,17 +45,7 @@ final class Purged {
             + "' and a later snapshot at block " + head + " or more", () -> {
                 final String log = member.logSince(start);
                 final int at = log.indexOf(seeded);
-                return at >= 0 && snapshotBlock(log.substring(at), member.id) >= head;
+                return at >= 0 && LocalSealers.lastSnapshotBlock(log.substring(at), member.id) >= head;
             });
-    }
-
-    private static long snapshotBlock(final String log, final int member) {
-        final java.util.regex.Matcher m = java.util.regex.Pattern
-            .compile("snapshot TAKEN memberId=" + member + " block=(\\d+)").matcher(log);
-        long block = -1;
-        while (m.find()) {
-            block = Long.parseLong(m.group(1));
-        }
-        return block;
     }
 }

@@ -274,8 +274,12 @@ final class LocalSealers implements AutoCloseable {
 
     /** The block of the last {@code snapshot TAKEN} line of member {@code id} since start {@code start}. */
     long lastSnapshotBlock(final int id, final int start) {
-        final Matcher m = Pattern.compile("snapshot TAKEN memberId=" + id + " block=(\\d+)")
-            .matcher(node(id).logSince(start));
+        return lastSnapshotBlock(node(id).logSince(start), id);
+    }
+
+    /** The block of the last {@code snapshot TAKEN} line of member {@code id} in {@code log}, or -1. */
+    static long lastSnapshotBlock(final String log, final int id) {
+        final Matcher m = Pattern.compile("snapshot TAKEN memberId=" + id + " block=(\\d+)").matcher(log);
         long block = -1;
         while (m.find()) {
             block = Long.parseLong(m.group(1));

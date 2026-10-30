@@ -64,12 +64,17 @@ final class CanonicalClient implements AutoCloseable {
         final long start = System.nanoTime();
         final long deadline = start + bound.toNanos();
         while (!relayed.contains(n)) {
-            if (System.nanoTime() - deadline > 0) {
-                throw new AssertionError("record " + n + " was not relayed within " + bound.toMillis() + " ms");
-            }
-            attempt(n, fillBytes, Math.min(deadline, System.nanoTime() + REOFFER_NS));
+            attemptBefore(n, fillBytes, deadline, bound);
         }
         return Duration.ofNanos(System.nanoTime() - start);
+    }
+
+    /** Fail past {@code deadline}; else offer record {@code n} once and poll for its relay. */
+    private void attemptBefore(final int n, final int fillBytes, final long deadline, final Duration bound) {
+        if (System.nanoTime() - deadline > 0) {
+            throw new AssertionError("record " + n + " was not relayed within " + bound.toMillis() + " ms");
+        }
+        attempt(n, fillBytes, Math.min(deadline, System.nanoTime() + REOFFER_NS));
     }
 
     /** Offer record {@code n} for {@code window}, and return whether the egress relayed it in that time. */
@@ -87,11 +92,15 @@ final class CanonicalClient implements AutoCloseable {
         buf.putBytes(0, frame);
         final long deadline = System.nanoTime() + bound.toNanos();
         while (!offered(buf, frame.length)) {
-            if (System.nanoTime() - deadline > 0) {
-                throw new AssertionError("the ingress did not take a frame within " + bound.toMillis() + " ms");
-            }
-            Await.pause(5);
+            pauseBefore(deadline, bound);
         }
+    }
+
+    private static void pauseBefore(final long deadline, final Duration bound) {
+        if (System.nanoTime() - deadline > 0) {
+            throw new AssertionError("the ingress did not take a frame within " + bound.toMillis() + " ms");
+        }
+        Await.pause(5);
     }
 
     /** Report the posted head {@code block}, as the batcher does after an L1 post. */
@@ -123,8 +132,7 @@ final class CanonicalClient implements AutoCloseable {
             return;
         }
         while (!relayed.contains(n) && System.nanoTime() - until < 0 && session().isPresent()) {
-            poll();
-            Await.pause(1);
+            pollAndPause();
         }
     }
 
@@ -137,6 +145,11 @@ final class CanonicalClient implements AutoCloseable {
             c.pollEgress();
             return result > 0;
         }).orElse(false);
+    }
+
+    private void pollAndPause() {
+        poll();
+        Await.pause(1);
     }
 
     private void poll() {
@@ -177,18 +190,18 @@ final class CanonicalClient implements AutoCloseable {
      * the replay; the sealer drops its re-offer as a duplicate.
      */
     private void resume() {
-        if (reconnects > 1) {
-            final long[] cursor = egress.boundaries.isEmpty()
-                ? new long[] {io.kardamom.sealer.CanonicalSealerState.GENESIS_BLOCK_NUMBER - 1, 0}
-                : egress.boundaries.get(egress.boundaries.size() - 1);
-            final byte[] frame = IngressFrames.replayRequestFrame(cursor[1], cursor[0] + 1);
-            final ExpandableArrayBuffer buf = new ExpandableArrayBuffer(frame.length);
-            buf.putBytes(0, frame);
-            final long deadline = System.nanoTime() + REOFFER_NS;
-            while (client.offer(buf, 0, frame.length) < 0 && System.nanoTime() - deadline < 0) {
-                client.pollEgress();
-                Await.pause(1);
-            }
+        if (reconnects == 1) {
+            return;
+        }
+        final long[] cursor = egress.boundaries.isEmpty()
+            ? new long[] {io.kardamom.sealer.CanonicalSealerState.GENESIS_BLOCK_NUMBER - 1, 0}
+            : egress.boundaries.get(egress.boundaries.size() - 1);
+        final byte[] frame = IngressFrames.replayRequestFrame(cursor[1], cursor[0] + 1);
+        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer(frame.length);
+        buf.putBytes(0, frame);
+        final long deadline = System.nanoTime() + REOFFER_NS;
+        while (client.offer(buf, 0, frame.length) < 0 && System.nanoTime() - deadline < 0) {
+            pollAndPause();
         }
     }
 

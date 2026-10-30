@@ -39,9 +39,13 @@ public final class OffsetClusterClock implements ClusterClock {
 
     private void refresh() {
         while (!Thread.currentThread().isInterrupted()) {
-            offsetMs = Math.max(offsetMs, read());
-            Await.pause(REFRESH_MS);
+            refreshOnce();
         }
+    }
+
+    private void refreshOnce() {
+        offsetMs = Math.max(offsetMs, read());
+        Await.pause(REFRESH_MS);
     }
 
     private long read() {

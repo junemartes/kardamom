@@ -58,9 +58,13 @@ final class HeldFrames {
 
     private void release(final long now) {
         while (!frames.isEmpty() && frames.peekFirst().dueNs() <= now) {
-            final Frame frame = frames.removeFirst();
-            faults.onReleased(frame.source());
-            sink.dispatch(new UnsafeBuffer(frame.bytes()), frame.bytes().length, frame.source(), frame.transportIndex());
+            releaseFirst();
         }
+    }
+
+    private void releaseFirst() {
+        final Frame frame = frames.removeFirst();
+        faults.onReleased(frame.source());
+        sink.dispatch(new UnsafeBuffer(frame.bytes()), frame.bytes().length, frame.source(), frame.transportIndex());
     }
 }
