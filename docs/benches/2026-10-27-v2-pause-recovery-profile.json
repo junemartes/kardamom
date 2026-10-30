@@ -548,7 +548,6 @@
       }
     }
   },
-  "raw_samples": "2026-10-27-v2-pause-recovery-samples.jsonl",
   "observation_count": 240,
   "interpretation": "Early shapes raised a throughput concern; they remain here rather than being discarded. The final watch-hook shape has no new Admission field or extra normal-turn change test. Normal median paired throughput deltas are +0.10% ordered, -0.46% reversed and +0.51% with verdicts. Independent median ratios differ and all pair values are retained. Forced-sweep results include large host-noise outliers; they are an overhead control, not production capacity. No speedup or performance guarantee is claimed.",
   "scope": "Resident V2 loop only. No client p50/p95/p99, RPC/network cost, deployed mirror lag or full-chain capacity is measured. Identical-workload deployed comparisons remain required.",

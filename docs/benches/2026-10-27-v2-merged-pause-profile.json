@@ -277,6 +277,5 @@
   "build_method": "Run cargo clean -p kardamom-sequencer --release before each build to prevent shared-target artifact reuse; preserve dependencies. Confirm distinct copied executable SHA256 values before measurement.",
   "interpretation": "Median paired resident-loop cost changes are -0.23%, -0.94% and -0.97%. The short shared-host comparison shows no observed slowdown. Variation prevents a speedup claim. It does not measure per-transaction latency, full release throughput, a lifecycle pause or deployed recovery.",
   "excluded_attempt": "The first merged comparison used identical binary hashes because Cargo reused the baseline artifact. Its thirty invocations are excluded from all comparisons and preserved as invalid evidence in the campaign profiles directory.",
-  "candidate_note": "Source hashes identify the measured production files. The final merge also corrects the session-generation module comment from sweep to each turn; this changes no executable behavior. Later changes affect only chaos recovery assertions and their tests.",
-  "raw_samples": "2026-10-27-v2-merged-pause-samples.jsonl"
+  "candidate_note": "Source hashes identify the measured production files. The final merge also corrects the session-generation module comment from sweep to each turn; this changes no executable behavior. Later changes affect only chaos recovery assertions and their tests."
 }

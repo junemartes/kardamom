@@ -234,6 +234,5 @@
     }
   },
   "interpretation": "No slowdown is observed for polling an empty channel in this local resident-loop fixture. The lower enabled times do not establish a production speedup. Both branches use the candidate binary; this does not compare whole releases, fault recovery, network throughput or per-transaction latency. Full deployed p50/p99 and throughput validation remain required.",
-  "method": "One candidate release binary, five enabled and five disabled runs in balanced alternating order, each with 256 senders and 16 transactions, CPU 0, 20 samples, 1 s warmup and 2 s requested measurement. The enabled fixture retains a live sender on an empty terminal-refusal channel. No build overlaps these measurements.",
-  "raw": "2026-10-27-v2-terminal-refusal-samples.jsonl"
+  "method": "One candidate release binary, five enabled and five disabled runs in balanced alternating order, each with 256 senders and 16 transactions, CPU 0, 20 samples, 1 s warmup and 2 s requested measurement. The enabled fixture retains a live sender on an empty terminal-refusal channel. No build overlaps these measurements."
 }

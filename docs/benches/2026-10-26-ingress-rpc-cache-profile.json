@@ -73,6 +73,5 @@
     }
   },
   "reproduce": "KARDAMOM_PROFILE_LABEL=label cargo test --release -p kardamom-ingress --features docker-e2e,test-support --test account_cache_redis_test --locked -- --ignored --exact profile::profile_account_cache_paths --nocapture",
-  "source": "crates/ingress/tests/account_cache_redis_test/profile.rs",
-  "samples": "2026-10-26-ingress-rpc-cache-samples.jsonl"
+  "source": "crates/ingress/tests/account_cache_redis_test/profile.rs"
 }

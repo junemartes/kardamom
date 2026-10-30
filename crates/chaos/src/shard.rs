@@ -383,10 +383,9 @@ mod tests {
 
     #[test]
     fn every_chaos_case_has_a_component_recovery_plan() {
-        let catalog: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../docs/reviews/2026-10-28-component-recovery.json"
-        ))
-        .unwrap();
+        let catalog: serde_json::Value =
+            serde_json::from_str(include_str!("../../../scripts/ci/component-recovery.json"))
+                .unwrap();
         let rows = catalog["cases"].as_array().unwrap();
         let planned: std::collections::BTreeSet<_> = rows
             .iter()

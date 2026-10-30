@@ -14,7 +14,7 @@ import time
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
-CATALOG = ROOT / "docs/reviews/2026-10-28-component-recovery.json"
+CATALOG = ROOT / "scripts/ci/component-recovery.json"
 
 
 class Run:
