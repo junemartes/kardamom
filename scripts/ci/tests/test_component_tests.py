@@ -37,6 +37,12 @@ class ComponentTests(unittest.TestCase):
         self.assertTrue(all("ci_mode" in suite for suite in catalog["local_suites"].values()))
         suites = component.Bundle.selection(catalog)
         command = component.Bundle.build_command(suites)
+        # The selection is every suite the catalog marks with a Cargo mode, so a
+        # new port changes no number here, and a lost suite still fails.
+        cargo = sorted(name for name, suite in catalog["local_suites"].items()
+                       if suite["ci_mode"] in component.CARGO_MODES)
+        self.assertTrue(cargo)
+        self.assertEqual(sorted(suites), cargo)
         self.assertEqual(command.count("cargo"), 1)
         self.assertIn("kardamom-state/docker-e2e", command[command.index("--features") + 1])
         self.assertEqual(command[command.index("--bin") + 1], "kardamom-state-mirror")

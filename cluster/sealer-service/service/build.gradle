@@ -66,6 +66,10 @@ tasks.named('test') {
     inputs.files(idleCases, aeronEntrypoint)
     systemProperty 'kardamom.idleCapCases', idleCases.canonicalPath
     systemProperty 'kardamom.aeronEntrypoint', aeronEntrypoint.canonicalPath
+    // The member-process tests start real sealer members as separate JVMs
+    // on the test runtime classpath, so the members can load the test link
+    // faults through the Aeron endpoint supplier properties.
+    systemProperty 'kardamom.testClasspath', sourceSets.test.runtimeClasspath.asPath
     // TestCluster spins up many threads; give the forked worker a single test fork.
     maxParallelForks = 1
     useJUnitPlatform {
