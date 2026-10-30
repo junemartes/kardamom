@@ -325,8 +325,10 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
         .inner_container(&node, kind)
         .await
         .ok_or_else(|| crate::chaos_fail!("{ctx}: no inner {kind} container on {node}"))?;
-    let donor = h.probes.executors[0].container.clone();
-    super::component::wait_peer_checkpoint(h, &donor, &ctx).await?;
+    if heal.needs_peer_checkpoint() {
+        let donor = h.probes.executors[0].container.clone();
+        super::component::wait_peer_checkpoint(h, &donor, &ctx).await?;
+    }
     require_live_victim(h, victim, &ctx).await?;
     let repair = Repair::capture(h, victim, &node, heal.needles(victim)).await?;
     let need = i64::try_from(retention.get().saturating_mul(2)).unwrap_or(i64::MAX);

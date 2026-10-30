@@ -1,20 +1,21 @@
-//! One bounded checkpoint install and restore, tied to the restarted victim.
-
-use std::cell::{Cell, RefCell};
+//! One checkpoint install on a stopped victim, and its restore by the
+//! next process of the victim.
 
 use anyhow::Context;
+use serde_json::Value;
 
-use super::{Harness, RESTORED};
+use super::{FETCHED, Harness, LOG_APPLIED, LOG_FETCHED, RESTORED};
 use crate::nodes::RunningProcess;
+use crate::nomad::{Alloc, SavedJob};
 use crate::poll::{self, Budget};
 use kardamom_state::checkpoint::replay::LOG_DIR;
+
+const CTX: &str = "state-checkpoint-restore";
 
 pub(super) struct CheckpointRestore {
     victim: String,
     donor: String,
     previous: RunningProcess,
-    copied: Cell<bool>,
-    phase: RefCell<String>,
 }
 
 impl CheckpointRestore {
@@ -28,63 +29,83 @@ impl CheckpointRestore {
             victim: victim.into(),
             donor: donor.into(),
             previous,
-            copied: Cell::new(false),
-            phase: RefCell::new("waiting for a replacement executor".into()),
         })
     }
 
-    /// Copying and the victim's verified restore share one two-minute
-    /// restore budget. A healthy peer restore also satisfies the proof.
-    pub(super) async fn await_restored(&self, h: &Harness) -> anyhow::Result<()> {
-        poll::until(Budget::secs(120, 2), |_| self.step(h))
+    /// Stop the victim's group, wipe its state and checkpoints, and
+    /// install the newest checkpoint of the donor. No victim process
+    /// runs during the copy, so its next process finds only the copy.
+    /// The saved job comes back on every path.
+    pub(super) async fn install(&self, h: &Harness) -> anyhow::Result<CheckpointCopy> {
+        let saved = SavedJob::capture(&h.nomad, "executor").await?;
+        let copied = match (VictimStop {
+            victim: &self.victim,
+        })
+        .stop(h, &saved)
+        .await
+        {
+            Ok(()) => self.wipe_and_copy(h).await,
+            Err(error) => Err(error),
+        };
+        let restored = saved.restore().await;
+        let copy = copied?;
+        restored?;
+        Ok(copy)
+    }
+
+    async fn wipe_and_copy(&self, h: &Harness) -> anyhow::Result<CheckpointCopy> {
+        super::wipe_state(h, &self.victim, CTX).await?;
+        self.copy(h).await
+    }
+
+    /// The next process of the victim restores the installed copy within
+    /// two minutes.
+    pub(super) async fn await_restored(
+        &self,
+        h: &Harness,
+        copy: &CheckpointCopy,
+    ) -> anyhow::Result<()> {
+        poll::until(Budget::secs(120, 2), |_| self.step(h, copy))
             .await?
             .or_fail(|_| {
                 crate::chaos_fail!(
-                    "state-checkpoint-restore: {} does not restore in 120s; last phase: {}",
+                    "{CTX}: {} does not restore the installed {} in 120s (a peer fetch, a fresh start, or no restore line)",
                     self.victim,
-                    self.phase.borrow(),
+                    copy.name,
                 )
             })?;
         Ok(())
     }
 
-    async fn step(&self, h: &Harness) -> anyhow::Result<Option<()>> {
-        if let Some(process) = h.nodes.running_process(&self.victim, "executor").await {
-            let logs = h
-                .nodes
-                .process_logs(&self.victim, &process, 100_000)
-                .await
-                .unwrap_or_default();
-            *self.phase.borrow_mut() =
-                format!("waiting for restore in executor process {process:?}");
-            return Ok(self.proves_restore(&process, &logs).then_some(()));
-        }
-        if !self.copied.get() {
-            match self.copy(h).await {
-                Ok(copied) => self.copied.set(copied),
-                Err(error) => *self.phase.borrow_mut() = format!("checkpoint copy: {error:#}"),
-            }
-        }
-        Ok(None)
+    async fn step(&self, h: &Harness, copy: &CheckpointCopy) -> anyhow::Result<Option<()>> {
+        let Some(process) = h.nodes.running_process(&self.victim, "executor").await else {
+            return Ok(None);
+        };
+        let logs = h
+            .nodes
+            .process_logs(&self.victim, &process, 100_000)
+            .await
+            .unwrap_or_default();
+        Ok(self.proves_restore(&process, &logs, copy).then_some(()))
     }
 
-    fn proves_restore(&self, process: &RunningProcess, logs: &str) -> bool {
-        *process != self.previous && logs.contains(RESTORED)
+    fn proves_restore(&self, process: &RunningProcess, logs: &str, copy: &CheckpointCopy) -> bool {
+        *process != self.previous && copy.restored_by(logs)
     }
 
-    async fn copy(&self, h: &Harness) -> anyhow::Result<bool> {
-        *self.phase.borrow_mut() = "selecting a complete donor checkpoint".into();
+    async fn copy(&self, h: &Harness) -> anyhow::Result<CheckpointCopy> {
         let name = h.nodes.exec(&self.donor,
             "ls -d /opt/kardamom/checkpoints/checkpoint-* 2>/dev/null | sort | tail -1 | xargs -rn1 basename")
             .await?;
-        if name.is_empty() {
-            return Ok(false);
-        }
+        anyhow::ensure!(
+            !name.is_empty(),
+            "{CTX}: {} has no checkpoint to copy",
+            self.donor
+        );
         let copy = CheckpointCopy {
             name,
             log: h.knobs.checkpoint_log,
         };
-        *self.phase.borrow_mut() = format!("reading {} from {}", copy.name, self.donor);
         let tar = h
             .nodes
             .exec_bytes(
@@ -96,7 +117,6 @@ impl CheckpointRestore {
                 1,
             )
             .await?;
-        *self.phase.borrow_mut() = format!("staging {} on {}", copy.name, self.victim);
         h.nodes
             .exec_with_stdin(
                 &self.victim,
@@ -107,11 +127,76 @@ impl CheckpointRestore {
         h.nodes.exec(&self.victim, &copy.install()).await?;
         let complete = h.nodes.exec_status(&self.victim,
             &format!("test -s /opt/kardamom/checkpoints/{name}/MANIFEST && test -s /opt/kardamom/checkpoints/{name}/mdbx.dat", name=copy.name)).await?;
-        *self.phase.borrow_mut() = format!(
-            "checkpoint {} installed; waiting for the replacement to restore",
-            copy.name
+        anyhow::ensure!(
+            complete,
+            "{CTX}: the copy of {} on {} is incomplete",
+            copy.name,
+            self.victim
         );
-        Ok(complete)
+        crate::log(format!(
+            "{CTX}: installed {} from {} on the stopped {}",
+            copy.name, self.donor, self.victim
+        ));
+        Ok(copy)
+    }
+}
+
+/// The stop of one pinned executor group. The carry deployment pins one
+/// executor per group, so only the victim stops.
+pub(super) struct VictimStop<'a> {
+    pub(super) victim: &'a str,
+}
+
+impl VictimStop<'_> {
+    /// Register `saved` with the `executor-0` group at count 0, and wait
+    /// until no executor process runs on the victim.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the register fails or the victim still runs
+    /// after two minutes.
+    pub(super) async fn stop(&self, h: &Harness, saved: &SavedJob) -> anyhow::Result<()> {
+        saved.register(&Self::paused(saved.definition())?).await?;
+        poll::until(Budget::secs(120, 2), |_| async {
+            let allocs = h.nomad.allocations("executor").await?;
+            let stopped = allocs
+                .iter()
+                .filter(|a| a.task_group == "executor-0")
+                .all(Alloc::is_terminal);
+            Ok((stopped
+                && h.nodes
+                    .running_process(self.victim, "executor")
+                    .await
+                    .is_none())
+            .then_some(()))
+        })
+        .await?
+        .or_fail(|_| {
+            anyhow::anyhow!(
+                "{} still runs an executor; refusing to change its files",
+                self.victim
+            )
+        })?;
+        Ok(())
+    }
+
+    /// `saved` with the pinned `executor-0` group at count 0.
+    pub(super) fn paused(saved: &Value) -> anyhow::Result<Value> {
+        let mut paused = saved.clone();
+        let group = paused["TaskGroups"]
+            .as_array_mut()
+            .and_then(|groups| {
+                groups
+                    .iter_mut()
+                    .find(|group| group["Name"] == "executor-0")
+            })
+            .context("checkpoint fault needs the pinned executor-0 group")?;
+        anyhow::ensure!(
+            group["Count"] == 1,
+            "checkpoint victim must have one allocation"
+        );
+        group["Count"] = 0.into();
+        Ok(paused)
     }
 }
 
@@ -123,12 +208,25 @@ const STAGING: &str = "/opt/kardamom/checkpoints/.harness-staging";
 /// on, a base is rare, so the newest base can be many blocks old. The
 /// log carries the blocks after the base. Without it, the victim
 /// restores at the old base and executes the full tail.
-struct CheckpointCopy {
+pub(super) struct CheckpointCopy {
     name: String,
     log: bool,
 }
 
 impl CheckpointCopy {
+    /// Whether `logs` of one process show the restore of this copy: the
+    /// restore line names the copy, the process fetched nothing from a
+    /// peer, and with the block log on, it applied the log after the
+    /// base.
+    fn restored_by(&self, logs: &str) -> bool {
+        let restored = logs
+            .lines()
+            .any(|line| line.contains(RESTORED) && line.contains(&self.name));
+        let fetched = logs.contains(FETCHED) || logs.contains(LOG_FETCHED);
+        let applied = !self.log || logs.contains(LOG_APPLIED);
+        restored && applied && !fetched
+    }
+
     /// The paths under `/opt/kardamom` that the donor sends.
     fn sources(&self) -> String {
         let base = format!("checkpoints/{}", self.name);
@@ -162,7 +260,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_restarted_victim_can_prove_a_restore() {
+    fn only_the_restarted_victim_can_prove_a_restore_of_the_copy() {
         let proof = CheckpointRestore {
             victim: "victim".into(),
             donor: "donor".into(),
@@ -170,22 +268,51 @@ mod tests {
                 cid: "old-cid".into(),
                 started: "first-start".into(),
             },
-            copied: Cell::new(false),
-            phase: RefCell::new(String::new()),
+        };
+        let copy = CheckpointCopy {
+            name: "checkpoint-000000000000000089".into(),
+            log: false,
         };
         let replacement = RunningProcess {
             cid: "replacement-cid".into(),
             started: "second-start".into(),
         };
-        assert!(!proof.proves_restore(&proof.previous, RESTORED));
-        assert!(!proof.proves_restore(&replacement, "fetched checkpoint from peer"));
-        assert!(!proof.proves_restore(&replacement, "seeding genesis account"));
-        assert!(proof.proves_restore(&replacement, RESTORED));
+        let restored = format!(
+            "{RESTORED}; will replay tail from here restored_block=89 checkpoint=/opt/kardamom/checkpoints/{}",
+            copy.name
+        );
+        assert!(!proof.proves_restore(&proof.previous, &restored, &copy));
+        assert!(!proof.proves_restore(&replacement, "seeding genesis account", &copy));
+        assert!(proof.proves_restore(&replacement, &restored, &copy));
         let restarted = RunningProcess {
             cid: "old-cid".into(),
             started: "second-start".into(),
         };
-        assert!(proof.proves_restore(&restarted, RESTORED));
+        assert!(proof.proves_restore(&restarted, &restored, &copy));
+        let other = format!(
+            "{RESTORED} checkpoint=/opt/kardamom/checkpoints/checkpoint-000000000000000120"
+        );
+        assert!(!proof.proves_restore(&replacement, &other, &copy));
+        let healed = format!("{FETCHED} (verified) block=89\n{restored}");
+        assert!(!proof.proves_restore(&replacement, &healed, &copy));
+    }
+
+    /// With the block log on, the restore must also apply the copied log,
+    /// and a log fetched from a peer is no proof.
+    #[test]
+    fn a_copy_with_the_log_needs_the_applied_log() {
+        let copy = CheckpointCopy {
+            name: "checkpoint-000000000000000089".into(),
+            log: true,
+        };
+        let restored = format!(
+            "{RESTORED} checkpoint=/opt/kardamom/checkpoints/{}",
+            copy.name
+        );
+        assert!(!copy.restored_by(&restored));
+        let applied = format!("{restored}\n{LOG_APPLIED} base=89 block=140");
+        assert!(copy.restored_by(&applied));
+        assert!(!copy.restored_by(&format!("{LOG_FETCHED}\n{applied}")));
     }
 
     #[test]

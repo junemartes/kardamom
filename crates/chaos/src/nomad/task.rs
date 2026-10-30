@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime};
 use serde::Deserialize;
 
 use super::{Alloc, Nomad, Streams};
+use crate::evidence::without_ansi;
 
 /// The log lines of a designed recovery exit: the process fails, and
 /// its restart is the recovery.
@@ -70,101 +71,188 @@ impl TaskEvent {
 
     /// The event time in RFC 3339, comparable with `docker logs -t`.
     fn utc(&self) -> String {
+        self.at().map_or_else(
+            || format!("time={}", self.time),
+            |t| humantime::format_rfc3339_millis(t).to_string(),
+        )
+    }
+
+    /// The event time, when it is a valid Unix time.
+    fn at(&self) -> Option<SystemTime> {
         u64::try_from(self.time)
             .ok()
             .and_then(|nanos| SystemTime::UNIX_EPOCH.checked_add(Duration::from_nanos(nanos)))
-            .map_or_else(
-                || format!("time={}", self.time),
-                |t| humantime::format_rfc3339_millis(t).to_string(),
-            )
     }
 
-    /// A death of the task with a nonzero exit code.
-    fn is_failed_exit(&self) -> bool {
-        self.kind == "Terminated" && self.exit_code != 0
+    /// The end of a task process, with any exit code.
+    fn is_end(&self) -> bool {
+        self.kind == "Terminated"
+    }
+
+    /// An event that no process of the task outlives: its start, or the
+    /// end of the process before it.
+    fn bounds_process(&self) -> bool {
+        self.kind == "Started" || self.is_end()
     }
 }
 
-/// The failed exits of one allocation: one task name and Terminated
-/// event for each.
-struct FailedExits<'a> {
+/// One process end of a task: the Terminated event, and the time of
+/// the event before it that bounds the process. Nomad keeps only the
+/// last events, so the oldest listed end can have no bound.
+struct ProcessEnd<'a> {
+    task: &'a str,
+    end: TaskEvent,
+    since: Option<SystemTime>,
+}
+
+impl ProcessEnd<'_> {
+    /// Whether a recovery line stamped `at` belongs to this process.
+    fn holds(&self, at: SystemTime) -> bool {
+        self.since.is_none_or(|since| since <= at) && self.end.at().is_none_or(|end| at <= end)
+    }
+}
+
+/// The recovery exit lines of a log: the time stamp of each stamped
+/// line, and the count of lines with no stamp. The Rust services stamp
+/// each line. The sealer member prints its lines with no stamp.
+struct RecoveryLines {
+    stamped: Vec<SystemTime>,
+    unstamped: usize,
+}
+
+impl RecoveryLines {
+    fn of(logs: &str) -> Self {
+        let (stamped, unstamped): (Vec<_>, Vec<_>) = logs
+            .lines()
+            .map(without_ansi)
+            .filter(|l| RECOVERY_EXIT_LINES.iter().any(|r| l.contains(r)))
+            .map(|l| {
+                l.split_whitespace()
+                    .next()
+                    .and_then(|stamp| humantime::parse_rfc3339(stamp).ok())
+            })
+            .partition(Option::is_some);
+        Self {
+            stamped: stamped.into_iter().flatten().collect(),
+            unstamped: unstamped.len(),
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.stamped.len().saturating_add(self.unstamped)
+    }
+}
+
+/// The process ends and the restart count of one allocation.
+struct Restarts<'a> {
     alloc: &'a Alloc,
-    exits: Vec<(&'a str, TaskEvent)>,
+    ends: Vec<ProcessEnd<'a>>,
 }
 
-impl<'a> FailedExits<'a> {
-    /// The failed exits that Nomad still lists for the tasks of `alloc`.
+impl<'a> Restarts<'a> {
+    /// The process ends that Nomad still lists for the tasks of `alloc`.
     ///
     /// # Errors
     ///
     /// Returns an error if the events of a task do not decode.
     fn of(alloc: &'a Alloc) -> anyhow::Result<Self> {
-        let events = alloc
+        let ends = alloc
             .task_states
             .iter()
             .map(|(task, state)| {
                 let events: Option<Vec<TaskEvent>> =
                     serde_json::from_value(state["Events"].clone())?;
-                Ok(events
-                    .into_iter()
-                    .flatten()
-                    .filter(TaskEvent::is_failed_exit)
-                    .map(move |event| (task.as_str(), event)))
+                Ok(Self::ends_of(task, &events.unwrap_or_default()))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Self {
             alloc,
-            exits: events.into_iter().flatten().collect(),
+            ends: ends.into_iter().flatten().collect(),
         })
     }
 
-    /// One note for each failed exit when the log holds fewer recovery
-    /// lines than failed exits, else none. Each designed exit logs its
-    /// line at least once before it ends the process.
-    fn unexplained(&self, logs: &str) -> Vec<String> {
-        let designed = logs
-            .lines()
-            .filter(|l| RECOVERY_EXIT_LINES.iter().any(|r| l.contains(r)))
-            .count();
-        if designed >= self.exits.len() {
-            return Vec::new();
-        }
-        self.exits
+    /// Each end in `events`, in time order, with the bound before it.
+    fn ends_of<'t>(task: &'t str, events: &[TaskEvent]) -> Vec<ProcessEnd<'t>> {
+        events
             .iter()
-            .map(|(task, event)| {
-                format!(
-                    "{} task {task} ({designed} designed recovery lines in its log):{}",
-                    self.alloc.short_id(),
-                    event.line()
-                )
+            .enumerate()
+            .filter(|(_, event)| event.is_end())
+            .map(|(at, event)| ProcessEnd {
+                task,
+                end: event.clone(),
+                since: events[..at]
+                    .iter()
+                    .rfind(|e| e.bounds_process())
+                    .and_then(TaskEvent::at),
             })
             .collect()
+    }
+
+    /// Whether the allocation shows no restart and no process end.
+    fn is_clean(&self) -> bool {
+        self.ends.is_empty() && self.alloc.task_restarts() == 0
+    }
+
+    /// One note for each restart that no recovery line explains, else
+    /// none. A designed exit logs its line before it ends the process,
+    /// so a stamped line explains only the end of its own process. A
+    /// line with no stamp explains one end of any process. Each restart
+    /// that Nomad counts, also one whose events Nomad no longer lists,
+    /// needs one recovery line.
+    fn unexplained(&self, logs: &str) -> Vec<String> {
+        let lines = RecoveryLines::of(logs);
+        let open: Vec<&ProcessEnd<'_>> = self
+            .ends
+            .iter()
+            .filter(|end| !lines.stamped.iter().any(|at| end.holds(*at)))
+            .collect();
+        let restarts = self.alloc.task_restarts();
+        let short = u64::try_from(lines.total()).is_ok_and(|total| restarts > total);
+        let notes = open.iter().skip(lines.unstamped).map(|end| {
+            format!(
+                "{} task {} (no designed recovery line in its process):{}",
+                self.alloc.short_id(),
+                end.task,
+                end.end.line()
+            )
+        });
+        let count = short.then(|| {
+            format!(
+                "{} restarted {restarts} times with {} designed recovery lines in its log",
+                self.alloc.short_id(),
+                lines.total()
+            )
+        });
+        notes.chain(count).collect()
     }
 }
 
 impl Nomad {
-    /// The failed exits of `allocs` that no designed recovery explains,
-    /// one note each with the Nomad event. A restart with no failed exit
-    /// passes: a node loss, an image pull, or a stop for a move.
+    /// The restarts of `allocs` that no designed recovery explains, one
+    /// note each with the Nomad event. A process end with exit code 0
+    /// counts too: a task that ends at once and restarts did not wait.
     ///
     /// # Errors
     ///
     /// Returns an error if the events do not decode or a log read fails.
-    pub(crate) async fn unexplained_exits(&self, allocs: &[Alloc]) -> anyhow::Result<Vec<String>> {
+    pub(crate) async fn unexplained_restarts(
+        &self,
+        allocs: &[Alloc],
+    ) -> anyhow::Result<Vec<String>> {
         let mut notes = Vec::new();
         for alloc in allocs {
-            notes.extend(self.unexplained_exits_of(alloc).await?);
+            notes.extend(self.unexplained_restarts_of(alloc).await?);
         }
         Ok(notes)
     }
 
-    async fn unexplained_exits_of(&self, alloc: &Alloc) -> anyhow::Result<Vec<String>> {
-        let exits = FailedExits::of(alloc)?;
-        if exits.exits.is_empty() {
+    async fn unexplained_restarts_of(&self, alloc: &Alloc) -> anyhow::Result<Vec<String>> {
+        let restarts = Restarts::of(alloc)?;
+        if restarts.is_clean() {
             return Ok(Vec::new());
         }
         let logs = self.alloc_logs(alloc, Streams::Both).await?;
-        Ok(exits.unexplained(&logs))
+        Ok(restarts.unexplained(&logs))
     }
 }
 

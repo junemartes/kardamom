@@ -7,8 +7,11 @@
 //! 3 after four, so Nomad restarts it. Each round requires every
 //! executor to advance within the convergence SLO.
 
+use std::time::Duration;
+
 use crate::cases::component::executor_containers;
 use crate::harness::Harness;
+use crate::knobs::Knobs;
 use crate::nomad::{SavedJob, Streams};
 
 pub(super) const CTX: &str = "executor-restart-storm";
@@ -45,9 +48,38 @@ pub(crate) async fn executor_restart_storm(h: &mut Harness) -> anyhow::Result<()
     Ok(())
 }
 
+/// The window of one round: one minute for the stop and the start of
+/// the job, the restart SLO for every replica to run, and the
+/// convergence SLO for the fleet. The case load must cover [`ROUNDS`]
+/// of these windows.
+pub(crate) fn round_window(k: &Knobs) -> Duration {
+    k.restart_slo
+        .saturating_add(k.converge_slo)
+        .saturating_add(Duration::from_mins(1))
+}
+
+/// One round within its [`round_window`]. A round past its window fails
+/// here, with its cause, and not later as a case load that ended early.
+async fn storm_round(
+    h: &mut Harness,
+    job: &SavedJob,
+    replicas: usize,
+    round: u32,
+) -> anyhow::Result<()> {
+    let window = round_window(&h.knobs);
+    tokio::time::timeout(window, round_steps(h, job, replicas, round))
+        .await
+        .map_err(|_| {
+            crate::chaos_fail!(
+                "{CTX}: round {round}/{ROUNDS} exceeds its window of {}s",
+                window.as_secs()
+            )
+        })?
+}
+
 /// One round: stop the job, start it again, wait until every replica
 /// runs, and require every executor to advance.
-async fn storm_round(
+async fn round_steps(
     h: &mut Harness,
     job: &SavedJob,
     replicas: usize,

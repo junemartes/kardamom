@@ -40,6 +40,12 @@ impl Heal {
         }
     }
 
+    /// Whether the heal fetches a peer checkpoint, so the case must wait
+    /// for one on the donor first.
+    pub(super) fn needs_peer_checkpoint(self) -> bool {
+        matches!(self, Self::Repair)
+    }
+
     /// The log lines that tell the heal of `victim`.
     pub(super) fn needles(self, victim: Victim) -> [&'static str; 3] {
         match self {

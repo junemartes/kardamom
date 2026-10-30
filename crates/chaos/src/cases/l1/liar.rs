@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use kardamom_l1_fault_proxy::Fault;
 
+use super::ALERT_HOLD;
 use super::batcher::{assert_posted_through, require_posting};
 use super::followers::{Followers, await_archive_complete, await_resume};
 use super::halt::await_followers_halted;
@@ -20,9 +21,6 @@ use crate::l1::{L1, STALE_POST_ALERT};
 /// The least posts the batcher confirms through one fault window: it
 /// posts every flush wait, so a one-minute window holds many more.
 const MIN_POSTS_THROUGH_FAULT: i64 = 3;
-
-/// How long the stale-post alert must hold to count as fired.
-const ALERT_HOLD: Duration = Duration::from_secs(30);
 
 /// The three lies, in order.
 #[derive(Debug, Clone, Copy)]
@@ -71,13 +69,31 @@ impl Phase {
             base.show()
         ));
         l1.set_faults(&[fault]).await?;
+        // The lie clears on every path, so no fault leaks into the next
+        // phase or case.
+        let held = self.hold(h, l1, base, posted0, ctx).await;
+        let cleared = Followers::at_clear(h, l1, base).await;
+        held?;
+        let stuck = cleared?;
+        await_resume(h, stuck, ctx).await
+    }
+
+    /// Through the armed lie: the halt, the alert, and the batcher's
+    /// posts until the fault window ends.
+    async fn hold(
+        self,
+        h: &Harness,
+        l1: &L1,
+        base: Followers,
+        posted0: i64,
+        ctx: &str,
+    ) -> anyhow::Result<()> {
         let armed = Instant::now();
+        let window = h.knobs.l1_fault;
         await_followers_halted(h, base, ctx).await?;
         self.assert_alert(l1, window, ctx).await?;
         tokio::time::sleep(window.saturating_sub(armed.elapsed())).await;
-        assert_posted_through(h, posted0, MIN_POSTS_THROUGH_FAULT, ctx).await?;
-        let stuck = Followers::at_clear(h, l1, base).await?;
-        await_resume(h, stuck, ctx).await
+        assert_posted_through(h, posted0, MIN_POSTS_THROUGH_FAULT, ctx).await
     }
 
     /// The stale-post alert fires on the swallowed logs: the batcher's

@@ -229,14 +229,14 @@ impl Class {
         })
     }
 
-    /// No task of the job failed since its return, other than by a
+    /// No task of the job restarted since its return, other than by a
     /// designed recovery exit: the class waited for what it needs. A
-    /// crash loop shows as a failed exit in the task events, also when
-    /// the class got what it needs since, so the proof holds after the
-    /// pause and again at the end.
+    /// crash loop shows in the restart count and the task events, also
+    /// when the class got what it needs since, so the proof holds after
+    /// the pause and again at the end.
     async fn assert_no_restart(self, h: &Harness, ctx: &str) -> anyhow::Result<()> {
         let allocs = h.nomad.running(self.job()).await?;
-        let failed = h.nomad.unexplained_exits(&allocs).await?;
+        let failed = h.nomad.unexplained_restarts(&allocs).await?;
         anyhow::ensure!(
             allocs.len() == self.count() && failed.is_empty(),
             "{}: {ctx}: the {} job did not wait for the classes it needs: {} of {} running, {}",
@@ -248,7 +248,7 @@ impl Class {
         );
         let restarts: Vec<String> = allocs.iter().filter_map(Alloc::restart_note).collect();
         crate::log(format!(
-            "{ctx}: every {} allocation runs with no failed exit outside a designed recovery; restarts: [{}]",
+            "{ctx}: every {} allocation runs with no restart outside a designed recovery; restarts: [{}]",
             self.job(),
             restarts.join(", ")
         ));
@@ -627,11 +627,10 @@ impl Combined {
             class.assert_no_restart(h, ctx).await?;
         }
         if placed.sealers_down() {
-            let elected = h.evidence.cluster_elected(FULL_RESTART_ELECTION).await?;
-            crate::log(format!(
-                "{ctx}: members elected memberId={} (term {} closed on a majority)",
-                elected.leader, elected.term
-            ));
+            h.evidence
+                .cluster_elected(FULL_RESTART_ELECTION)
+                .await?
+                .log(ctx);
         }
         h.assert_ingress_pair_live(ctx).await?;
         if placed.executors_down() {

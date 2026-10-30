@@ -94,3 +94,18 @@ fn scan_evidence_is_parsed_from_ansi_logs_without_confusing_a_done_line() {
         (1, 1, 1)
     );
 }
+
+/// One completed rebuild reaches the first-complete phase. No completed
+/// rebuild does not, and the full phase still needs every mirror.
+#[test]
+fn one_rebuild_reaches_only_the_first_complete_phase() {
+    let before = MirrorRebuilds::fixture(&[("n0", "a", 1), ("n1", "b", 1), ("n2", "c", 1)]);
+    let one = MirrorRebuilds::fixture(&[("n0", "d", 1), ("n1", "e", 0), ("n2", "f", 0)]);
+    let none = MirrorRebuilds::fixture(&[("n0", "d", 0), ("n1", "e", 0), ("n2", "f", 0)]);
+    let reached = |now: &MirrorRebuilds, phase: RebuildPhase| {
+        phase.reached(before.pending(now, phase).len(), before.mirrors.len())
+    };
+    assert!(reached(&one, RebuildPhase::FirstComplete));
+    assert!(!reached(&none, RebuildPhase::FirstComplete));
+    assert!(!reached(&one, RebuildPhase::Complete));
+}
