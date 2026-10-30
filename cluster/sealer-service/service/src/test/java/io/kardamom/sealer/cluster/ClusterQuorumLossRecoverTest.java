@@ -31,10 +31,12 @@ class ClusterQuorumLossRecoverTest {
     Path dir;
 
     @Test
-    @InterruptAfter(value = 60, unit = TimeUnit.SECONDS)
+    // The step bounds fail fast; their sum is above 120 s, so the limit is 120 s.
+    @InterruptAfter(value = 120, unit = TimeUnit.SECONDS)
     void a_cluster_without_a_quorum_stalls_and_commits_again_when_a_member_returns() {
         try (LocalSealers group = new LocalSealers(dir, 3, LocalSealers.Settings.DEFAULT);
-             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints)) {
+             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints);
+             CanonicalConsumer executor = new CanonicalConsumer(dir.resolve("executor"), group::ingressEndpoints)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
             group.awaitLeader(Duration.ofSeconds(20));
             IntStream.range(0, 3).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));
@@ -55,6 +57,13 @@ class ClusterQuorumLossRecoverTest {
             group.assertOneLeaderPerTerm();
             MemberOrder.assertSame(group.nodes(), 0, CanonicalSealerState.GENESIS_BLOCK_NUMBER,
                 IntStream.range(0, 5).boxed().collect(Collectors.toSet()));
+            // A consumer session that lapsed with the quorum resumes from its cursor with no gap.
+            executor.awaitBlock(client.head() - 1, Duration.ofSeconds(10));
+            executor.stop();
+            MemberOrder.assertConsumerMatches(group.node(0), executor.applied(),
+                IntStream.range(0, 5).boxed().collect(Collectors.toSet()));
+            System.out.printf("quorum-loss: the consumer applied %d frames over %d sessions and %d gap replays%n",
+                executor.applied().size(), executor.sessions(), executor.gaps().size());
         }
     }
 }

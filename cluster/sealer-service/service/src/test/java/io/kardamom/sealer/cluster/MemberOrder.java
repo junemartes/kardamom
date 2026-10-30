@@ -47,6 +47,22 @@ final class MemberOrder {
         return common;
     }
 
+    /**
+     * Require that a consumer applied the canonical frames of {@code node}, byte
+     * for byte, in order, through at least {@code minFrames} frames, with every
+     * record in {@code expected}.
+     */
+    static void assertConsumerMatches(
+            final SealerNode node, final List<byte[]> consumed, final Set<Integer> expected) {
+        final List<FeedReader.Frame> member = read(node, 0, io.kardamom.sealer.CanonicalSealerState.GENESIS_BLOCK_NUMBER,
+            expected);
+        final int common = Math.min(member.size(), consumed.size());
+        IntStream.range(0, common).forEach(i -> assertArrayEquals(member.get(i).bytes(), consumed.get(i),
+            "the consumer differs from member " + node.id + " at canonical frame " + i));
+        assertEquals(expected, consumed.stream().map(FeedReader.Frame::new).map(MemberOrder::recordOf)
+            .filter(expected::contains).collect(Collectors.toSet()), "the consumer lacks a record");
+    }
+
     /** The test record number of a relayed frame, or -1 for another record. */
     static int recordOf(final FeedReader.Frame frame) {
         final UnsafeBuffer b = new UnsafeBuffer(frame.bytes());

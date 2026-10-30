@@ -764,7 +764,8 @@
         "SealerClusteredService, CanonicalSealerState, Aeron consensus module, media driver and archive of each member",
         "StartMode, PeerSeed, PeerNameResolver, JoinWatchdog, LogPurger, snapshot schedule and admin endpoint",
         "member feed on a shared driver of each node, and a real Aeron cluster client with the production wire codecs",
-        "the link faults act inside each receiving member driver, on the frames from the selected member to its peers"
+        "the link faults act inside each receiving member driver, on the frames from the selected member to its peers",
+        "a consumer session with the production cursor rules: a replay from its cursor at each new session, frames applied only in order"
       ],
       "controlled": [
         "a one-way cut, 10 % random loss or a 250 ms ordered delay of the frames of the leader to both peers, for 10-15 s",
@@ -794,7 +795,7 @@
           "failed_at": "the member feeds differ at a boundary frame: the canonical order forks"
         }
       ],
-      "limitation": "The faults act in the receiving driver, not in the kernel: frames from the leader to its clients and kernel queues stay intact. The hold is 10-15 s, not the 30 s of the chaos case. The squeeze stops whole processes; it does not reproduce a CFS quota of the executor and validator, and the validator verdict of the chaos case is not covered here. The loss and delay controls guard the order oracle; Aeron retransmission has no product seam to break."
+      "limitation": "The faults act in the receiving driver, not in the kernel: frames from the leader to its clients and kernel queues stay intact. The hold is 10-15 s, not the 30 s of the chaos case. The squeeze stops whole processes; it does not throttle executors or the validator. The squeeze checks the verdict input of the validator: its session stream reaches the live head within 15 blocks, with no gap, and equals the members' order byte for byte. The validator re-execution against executor BALs and receipts is not run here. The loss and delay controls guard the order oracle; Aeron retransmission has no product seam to break."
     },
     "sealer-raft-members": {
       "command": [
@@ -944,7 +945,47 @@
           "failed_at": "no member logs SEEDED at H"
         }
       ],
-      "limitation": "The fleet-wipe test covers the sealer part only: the L1 rebuild of the executor image and the validator state, the executor resume, the da-watcher origin, the batcher record continuity and the cache flush are not run here."
+      "limitation": "The fleet-wipe test covers the sealer: the wipe, the seeded start, the restart from the seed snapshot, REPLAY_AHEAD for a cursor of the old chain, and the resume at (E_H, H + 1). Linked tests cover the seed rebuilt from L1 (reconstruct-seed), the da-watcher start after the sealer origin (l1-watcher-recovery) and a cold cache rebuild (state-mirror). The executor resume on the rebuilt image, the validator resume on its rebuilt state and a batcher start with no cursor file are not covered locally."
+    },
+    "reconstruct-seed": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-reconstruct",
+        "--test",
+        "reconstruct_l1_e2e",
+        "rebuild_from_l1_writes_the_sealer_seed_at_the_posted_head",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "ci_mode": "docker",
+      "tests": [
+        "rebuild_from_l1_writes_the_sealer_seed_at_the_posted_head"
+      ],
+      "real": [
+        "Anvil L1 with the deployed KardamomL2Settlement",
+        "batcher post_batch, read_posted_batches and recover_blocks",
+        "reconstruct_state and SeedInput, the code of kardamom-reconstruct --sealer-seed"
+      ],
+      "controlled": [
+        "a fake EigenDA proxy",
+        "two blocks of three transfers"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "the seed names the canonical end of the head plus one",
+          "compiled": true,
+          "exit_code": 101,
+          "failed_tests": [
+            "rebuild_from_l1_writes_the_sealer_seed_at_the_posted_head"
+          ],
+          "failed_at": "the seed names (2, 4) instead of the posted head (2, 3)"
+        }
+      ],
+      "limitation": "The L1 holds no epochs, so the seed's L1 origin is 0; the chaos case requires an origin above 0 on a live chain. The Java member tests read the same seed layout (SealerSeedTest golden bytes); the two sides do not run in one process."
     },
     "cache-sentinel": {
       "command": [
@@ -2109,14 +2150,14 @@
     {
       "case": "cpu-squeeze",
       "family": "Cluster",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "sealer-raft-network",
           "test": "io.kardamom.sealer.cluster.CpuSqueezeTest::starved_members_slow_down_but_never_fork_the_canonical_order()"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true
     },
     {
       "case": "executor-fleet-loss-recover",
@@ -2729,6 +2770,18 @@
         {
           "suite": "sealer-raft-fleet",
           "test": "io.kardamom.sealer.cluster.SealerFleetTotalWipeTest::a_wiped_fleet_restarts_after_the_posted_head_from_a_seed()"
+        },
+        {
+          "suite": "reconstruct-seed",
+          "test": "rebuild_from_l1_writes_the_sealer_seed_at_the_posted_head"
+        },
+        {
+          "suite": "l1-watcher-recovery",
+          "test": "a_start_resumes_after_the_sealer_origin_below_the_file"
+        },
+        {
+          "suite": "state-mirror",
+          "test": "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close"
         }
       ],
       "full_case_locally_validated": false

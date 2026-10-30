@@ -31,6 +31,8 @@ class CpuSqueezeTest {
 
     private static final long SQUEEZE_MS = 20_000;
     private static final Duration RECOVER = Duration.ofSeconds(30);
+    /** The lag of a validator that verifies live, in blocks, as the chaos case allows. */
+    private static final long MAX_LAG_BLOCKS = 15;
 
     @TempDir(cleanup = CleanupMode.ON_SUCCESS)
     Path dir;
@@ -39,7 +41,8 @@ class CpuSqueezeTest {
     @InterruptAfter(value = 60, unit = TimeUnit.SECONDS)
     void starved_members_slow_down_but_never_fork_the_canonical_order() {
         try (LocalSealers group = new LocalSealers(dir, 3, LocalSealers.Settings.DEFAULT);
-             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints)) {
+             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints);
+             CanonicalConsumer validator = new CanonicalConsumer(dir.resolve("validator"), group::ingressEndpoints)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
             group.awaitLeader(Duration.ofSeconds(20));
             final Set<Integer> committed = new HashSet<>();
@@ -68,6 +71,13 @@ class CpuSqueezeTest {
             group.awaitJoined(List.of(0, 1, 2), Duration.ofSeconds(10));
             group.assertOneLeaderPerTerm();
             MemberOrder.assertSame(group.nodes(), 0, CanonicalSealerState.GENESIS_BLOCK_NUMBER, committed);
+            // The verdict input: the validator's session reaches the live head within
+            // the lag of the chaos case, with no gap, and holds the members' order.
+            validator.awaitBlock(client.head() - MAX_LAG_BLOCKS, RECOVER);
+            validator.stop();
+            MemberOrder.assertConsumerMatches(group.node(0), validator.applied(), committed);
+            System.out.printf("cpu-squeeze: the validator session applied %d frames over %d sessions and %d gap replays%n",
+                validator.applied().size(), validator.sessions(), validator.gaps().size());
         }
     }
 }

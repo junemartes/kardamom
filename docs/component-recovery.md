@@ -135,6 +135,12 @@ receiving member drops, loses or holds the frames from the faulted member.
 Each check takes 15 to 55 seconds. A member stops when its test JVM dies, and
 the next group deletes the tmpfs directories of dead test JVMs.
 
+The squeeze check also runs a consumer session with the production cursor
+rules, as the validator reads the stream. Its stream must reach the live head
+with no gap and equal the members' order. `just test-component reconstruct-seed`
+posts two blocks to Anvil, rebuilds the state from the L1 log and the DA proxy,
+and writes the sealer seed of the fleet wipe at the posted head.
+
 Two optional member settings serve these checks. `kardamom.cluster.adminHost`
 binds the admin endpoint to one address, so each member on one host keeps the
 one admin port that its peers ask. `kardamom.cluster.clockClass` names the

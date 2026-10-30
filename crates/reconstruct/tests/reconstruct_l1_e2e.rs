@@ -29,11 +29,15 @@ use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
 use kardamom_deployer::{ContractId, Deployer, Op, encode_address_arg, encode_address_pair};
 use kardamom_engine::{ReplayBlock, ReplayOutcome};
 use kardamom_reconstruct::test_support::{
-    genesis, oracle_replay, test_genesis, two_transfer_blocks,
+    CHAIN_ID, genesis, oracle_replay, test_genesis, two_transfer_blocks,
 };
-use kardamom_reconstruct::{L1Epochs, Reconstruction, block_frame_to_replay, reconstruct_state};
+use kardamom_reconstruct::{
+    L1Epochs, Reconstruction, SealerRules, SeedInput, SeedSender, SenderOrder,
+    block_frame_to_replay, reconstruct_state,
+};
 use kardamom_state::{Durability, StateEnvBuilder, StateSnapshot};
 use kardamom_types::epoch::{DepositLog, LockboxLog, derive_epoch};
+use kardamom_types::upgrades::GenesisFeatures;
 use kardamom_types::{BPosition, StateDatabase};
 
 const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
@@ -407,4 +411,65 @@ fn assert_rebuilt_deposit(
         snap.get_tx_position(deposit).unwrap(),
         Some(BPosition::from_index(1))
     );
+}
+
+/// The sealer seed of the fleet wipe, rebuilt from L1 alone: post two
+/// blocks, read them back from the `BatchPosted` log and the proxy, rebuild
+/// the state, and write the seed that `--sealer-seed` writes. The seed must
+/// name the posted head (block 2, canonical end 3), the root of a direct
+/// replay, and the next nonce of the sender. The sealer members start from
+/// these bytes; `SealerSeedTest.java` parses the same layout.
+///
+/// Anvil is required: the component suite runs this test with `--ignored`,
+/// and a missing Anvil fails it instead of a silent skip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Anvil; the component suite runs it"]
+async fn rebuild_from_l1_writes_the_sealer_seed_at_the_posted_head() {
+    let l1 = setup_l1()
+        .await
+        .expect("this component test requires a working Anvil; it must not skip");
+    let fake = FakeDaProxy::start();
+    let user = PrivateKeySigner::random();
+    let from = user.address();
+    let (block1, block2) = two_transfer_blocks(
+        &user,
+        address!("00000000000000000000000000000000000D0001"),
+        address!("00000000000000000000000000000000000D0002"),
+    );
+    let frames = post_and_recover_frames(
+        &l1.batcher(),
+        l1.settlement,
+        &fake,
+        [block1.clone(), block2.clone()],
+    )
+    .await;
+
+    let state = tempfile::tempdir().unwrap();
+    let outcome =
+        reconstruct_state(state.path(), &test_genesis(&genesis(from), &[]), &frames).unwrap();
+    let oracle = oracle_replay(&genesis(from), &[], oracle_blocks(&block1, &block2, None));
+    let seed = SeedInput {
+        state_dir: state.path(),
+        chain_id: CHAIN_ID,
+        outcome: &outcome,
+        senders: &SenderOrder::of([from]),
+        rules: &SealerRules::genesis(GenesisFeatures::None),
+    }
+    .seed()
+    .unwrap();
+    assert_eq!(
+        (seed.block, seed.end_tx_idx, seed.state_root),
+        (2, 3, oracle.state_root),
+        "the seed names the posted head and the root of a direct replay"
+    );
+    assert_eq!(
+        seed.senders,
+        vec![SeedSender {
+            address: from,
+            next_nonce: 3
+        }]
+    );
+    let path = state.path().join("sealer.seed");
+    seed.write(&path).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), seed.encode().unwrap());
 }
