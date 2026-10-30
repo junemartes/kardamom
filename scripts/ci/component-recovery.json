@@ -795,7 +795,7 @@
           "failed_at": "the member feeds differ at a boundary frame: the canonical order forks"
         }
       ],
-      "limitation": "The faults act in the receiving driver, not in the kernel: frames from the leader to its clients and kernel queues stay intact. The hold is 10-15 s, not the 30 s of the chaos case. The squeeze stops whole processes; it does not throttle executors or the validator. The squeeze checks the verdict input of the validator: its session stream reaches the live head within 15 blocks, with no gap, and equals the members' order byte for byte. The validator re-execution against executor BALs and receipts is not run here. The loss and delay controls guard the order oracle; Aeron retransmission has no product seam to break."
+      "limitation": "The faults act in the receiving driver, not in the kernel: frames from the leader to its clients and kernel queues stay intact. The hold is 10-15 s, not the 30 s of the chaos case. The squeeze stops whole processes; it does not throttle executors or the validator. The squeeze checks the verdict input of the validator: its session stream reaches the live head within 15 blocks, with no gap, and equals the members' order byte for byte. This is the input half of the squeeze verdict. The real validator is missing: its re-execution, the live verification within the lag, validator_divergence_total == 0 and the divergence scan are not run here, so cpu-squeeze stays partial. The loss and delay controls guard the order oracle; Aeron retransmission has no product seam to break."
     },
     "sealer-raft-members": {
       "command": [
@@ -2150,14 +2150,14 @@
     {
       "case": "cpu-squeeze",
       "family": "Cluster",
-      "status": "ported",
+      "status": "partial",
       "local_tests": [
         {
           "suite": "sealer-raft-network",
           "test": "io.kardamom.sealer.cluster.CpuSqueezeTest::starved_members_slow_down_but_never_fork_the_canonical_order()"
         }
       ],
-      "full_case_locally_validated": true
+      "full_case_locally_validated": false
     },
     {
       "case": "executor-fleet-loss-recover",
