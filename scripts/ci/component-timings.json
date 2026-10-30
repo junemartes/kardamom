@@ -181,6 +181,7 @@
   "l1-watcher-recovery::the_boundary_feed_sends_each_new_origin": 0.004,
   "l1-watcher-recovery::the_file_holds_the_confirmed_origin_not_the_last_publish": 0.003,
   "l1-watcher-recovery::two_watchers_publish_identical_copies_and_follow_one_origin": 0.008,
+  "pipeline-recovery::a_sealer_leader_stop_keeps_the_executor_at_the_sealed_head": 26.0,
   "reconstruct-seed::rebuild_from_l1_writes_the_sealer_seed_at_the_posted_head": 0.665,
   "sealer-actor::io.kardamom.sealer.cluster.SealerCarryActivationTest::a_file_member_answers_the_carry_window_unsupported()": 0.818,
   "sealer-actor::io.kardamom.sealer.cluster.SealerCarryActivationTest::a_file_member_stops_on_version_eighteen()": 3.526,
