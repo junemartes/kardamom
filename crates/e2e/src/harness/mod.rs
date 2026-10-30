@@ -20,6 +20,7 @@ mod carry;
 mod config;
 mod consumers;
 mod control;
+pub mod faults;
 pub mod inject;
 pub mod l1;
 pub mod l1_verified;
@@ -53,6 +54,9 @@ pub struct LocalStack {
     // drop in declaration order.
     notifier: Option<SpawnedNotifier>,
     ingress: SpawnedIngress,
+    /// The ingress replicas after the first, in replica order. Replica
+    /// `i + 1` is `extra_ingresses[i]`.
+    extra_ingresses: Vec<SpawnedIngress>,
     da_watcher: Option<Spawned>,
     /// The L1 follower the da-watcher reads `l1_blocks` from.
     l1_follower: Option<services::SpawnedFollower>,
@@ -82,6 +86,8 @@ pub struct LocalStack {
     /// archive-durability `channels.toml`, written once at launch). Also
     /// reused by [`Self::service_spec`] for a restarted service.
     log_config: Option<PathBuf>,
+    /// The L1 wiring of the L1 follower, reused by a restarted follower.
+    follower_l1: Option<services::L1Wiring>,
     /// The L1 wiring of the validator, reused by a restarted validator.
     validator_l1: Option<services::L1Wiring>,
     /// The executor's nonce query port. Picked before the sequencers

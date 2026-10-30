@@ -446,6 +446,7 @@ impl LocalStack {
         let stack = Self {
             notifier,
             ingress,
+            extra_ingresses: Vec::new(),
             da_watcher,
             l1_follower,
             verified_l1: wirings.verified_l1,
@@ -460,6 +461,7 @@ impl LocalStack {
             l1,
             genesis,
             log_config,
+            follower_l1: wirings.da_watcher,
             validator_l1: wirings.validator,
             executor_query_port,
             root,

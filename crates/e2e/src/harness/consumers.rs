@@ -102,7 +102,7 @@ impl ExecutorRun<'_> {
 
 /// Join-miss refetch only matters alongside a log config that lists
 /// durability-archive endpoints (the archive-durability variant). Without
-/// it, a restarted executor cannot get envelopes for canonical records
+/// it, a restarted executor or validator cannot get envelopes for canonical records
 /// replayed from before the crash, and aborts by design.
 fn add_archive_endpoints(cmd: &mut Command, spec: &ServiceSpec<'_>) {
     if spec.log_config.is_some() {
@@ -225,6 +225,9 @@ pub fn spawn_validator(spec: &ServiceSpec<'_>, opts: &ValidatorOptions<'_>) -> R
         host_id: "e2e-validator",
     })?;
     with_log_config(&mut cmd, spec);
+    // As in the deployed job: a restarted validator refetches the
+    // envelopes of replayed canonical records from the archive.
+    add_archive_endpoints(&mut cmd, spec);
     if let Some(n) = opts.trie_shadow_check {
         cmd.args(["--trie-shadow-check", &n.to_string()]);
     }

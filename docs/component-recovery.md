@@ -440,3 +440,68 @@ cannot pass. A successful peer cannot mask an unrecovered peer. The observer kee
 its 120-second budget and reports each reader's latest counters or error. These
 checks validate the observer; distributed Redis recovery and exact final state
 still require the full chaos case.
+
+`just test-component pipeline-recovery` runs ten chaos cases on the local stack
+of the chain-semantics suite. The real ingress pair, the sequencers, the sealer
+members, the executor and the validator run as processes on one host, with the
+host-native archiving media driver. The cases that read L1 epochs also run Anvil,
+the L1 follower and the da-watcher. Each test injects the fault of its chaos case
+at the same process boundary. A graceful stop is SIGTERM with the job's kill
+bound; a hard stop is SIGKILL. A returned process starts on the state that it
+persisted: the sealer members on their own logs, the executor and the validator on
+their state directories, the driver on its archive. Ingresses and sequencers
+start cold, as in the deployment.
+
+Every test ends with the checks of a chaos case. A case load sends through
+ingress 0 for the whole case, and tries a failed submit again with the same bytes.
+While a submit waits, the load also asks every ingress for the receipt. Every
+offered transfer must land. Every ingress must serve exactly one receipt for each
+transfer, in nonce order. The payee balance must equal the landed count. The load
+must land again within 30 seconds of the return. Then the executor block must
+advance. A recovery probe sends the case sender through ingress 0 and a fresh
+sender through ingress 1. The validator must verify with no divergence.
+
+The combined cases also judge the pipeline while their classes are down. With no
+ingress and no sequencer, empty blocks still seal and no transaction applies.
+With no sealer, every member process is dead, every live ingress refuses a submit
+with `sealer_no_quorum`, and no executor block of the outage may pass the block at
+which the returned members resume. A class that returns before the class that it
+needs must still run after an eight-second stagger. The cases that take the sealer
+down run three members: the returned members must close an election on a majority,
+and no term may have two leaders. No sequencer may hold a ref below a floor. The
+sealer's L1 origin must reach the last epoch that the da-watcher published. After
+a loss of the sequencers and the sealer, the da-watcher must publish again, and
+the epochs of the outage must reach the chain.
+
+The local stagger and hold are shorter than the deployed ones. They still cross
+the product thresholds of these cases: the 10-second sealer silence budget, and
+the start of a cluster client against a missing sealer. The tests need the service
+binaries, the sealer jar and the aeron-all jar, as the chain-semantics job does.
+Each test takes 14 to 53 seconds on a loaded host, including the stack start.
+
+The pipeline blackout also kills the media driver, the L1 follower and the
+da-watcher. The killed archive leaves an active mark file, so the returned driver
+starts only after it ages out, as the scheduler's restarts of the driver task see.
+The executor and the validator then refetch the envelopes of replayed records from
+the archive. The local validator now gets the refetch endpoints of the deployed
+job. The blackout is partial evidence for `archive-driver-loss`: the local driver
+serves every service, so the case cannot keep the twin ingress on its own driver.
+The local stack runs no Redis and no state mirror, so their return after a
+blackout stays with the cache cases.
+
+Compiled negative controls fail these tests at recovery: an ingress that serves
+no receipt from state, a sequencer lookup that sends no query, a cluster client
+that never forces a new session after egress silence, and an executor with no
+archive refetch.
+
+`just test-component control-plane-loss` runs the production discovery adapter
+against a Consul-like agent and a real media driver. A publisher and a subscriber
+of `tx_data` find each other through the agent. The agent then partitions from
+both for longer than the check TTL and the deregistration window, and deletes the
+publisher's record. The held data connection must deliver every envelope in order
+through the partition, with no gap above one second. After the partition, the
+publisher must register again with a passing check, and a new subscriber must find
+it. The test scales the TTL, the deregistration window and the hold down in the
+same order as the deployment. A heartbeat that does not register again after a
+failed pass fails the test. Nomad placement after the partition remains a cluster
+check.
