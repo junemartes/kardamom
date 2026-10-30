@@ -2,6 +2,7 @@
 //! head, and decide when a rebuild is due. A rollback frame of an
 //! executor clears the projection, and a rebuild follows.
 
+use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -244,28 +245,39 @@ impl Mirror {
     }
 
     /// Run one write. A failure retries until the write lands or
-    /// shutdown. An outage past the bound schedules a rebuild, because
-    /// frames may have been lost behind the mirror.
+    /// shutdown. A failure writes the rebuild marker first, so a crash
+    /// during the retries rebuilds at the next start. An outage past the
+    /// bound schedules a rebuild, because frames may have been lost behind
+    /// the mirror. A shorter outage loses no frame: the landed retry
+    /// removes the marker, unless a scheduled rebuild still needs it.
     async fn write_until_landed(&mut self, write: &Write<'_>) -> Result<()> {
         let started = Instant::now();
-        loop {
-            match self.try_write(write).await {
-                Ok(()) => break,
-                Err(e) => {
-                    self.head.begin_rebuild()?;
-                    crate::metrics::record_write_retry();
-                    warn!(error = %e, write = write.label(), "write failed; retrying");
-                }
-            }
-            tokio::select! {
-                () = self.shutdown.cancelled() => anyhow::bail!("shutdown during a write retry"),
-                () = tokio::time::sleep(WRITE_RETRY) => {}
-            }
+        let mut retried = false;
+        while self.write_or_wait(write).await?.is_continue() {
+            retried = true;
         }
         if started.elapsed() > OUTAGE_REBUILD_AFTER {
             self.progress.pending_rebuild = Some(RebuildReason::Outage);
+        } else if retried && self.progress.pending_rebuild.is_none() {
+            self.head.finish_rebuild()?;
         }
         Ok(())
+    }
+
+    /// Try the write once. A failure writes the rebuild marker and waits
+    /// for the retry period. `Break` means the write landed.
+    async fn write_or_wait(&mut self, write: &Write<'_>) -> Result<ControlFlow<()>> {
+        let Err(e) = self.try_write(write).await else {
+            return Ok(ControlFlow::Break(()));
+        };
+        self.head.begin_rebuild()?;
+        crate::metrics::record_write_retry();
+        warn!(error = %e, write = write.label(), "write failed; retrying");
+        tokio::select! {
+            () = self.shutdown.cancelled() => anyhow::bail!("shutdown during a write retry"),
+            () = tokio::time::sleep(WRITE_RETRY) => {}
+        }
+        Ok(ControlFlow::Continue(()))
     }
 
     async fn try_write(&self, write: &Write<'_>) -> Result<()> {
