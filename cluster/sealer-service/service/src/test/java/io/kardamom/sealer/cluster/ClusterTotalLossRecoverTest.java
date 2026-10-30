@@ -34,7 +34,7 @@ class ClusterTotalLossRecoverTest {
     @InterruptAfter(value = 60, unit = TimeUnit.SECONDS)
     void every_member_returns_from_its_own_state_and_the_cluster_commits_again() {
         try (LocalSealers group = new LocalSealers(dir, 3, SNAPSHOTS);
-             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints)) {
+             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
             group.awaitLeader(Duration.ofSeconds(20));
             IntStream.range(0, 3).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));
