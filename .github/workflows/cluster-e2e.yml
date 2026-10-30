@@ -126,10 +126,13 @@ jobs:
       # wrappers below, so the cache and the artifact hold no native-ISA
       # objects and travel to any runner. (rusteron's build.rs hardcodes
       # -march=native; the wrapper appends the fixed level after it.)
-      # The shared action also caches rustc work for workspace crates.
+      # The shared action also caches rustc work for workspace crates. A
+      # pull request only restores: its own entry would evict the caches
+      # of the base branches.
       - uses: ./.github/actions/rust-build-cache
         with:
           shared-key: cluster-e2e
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       # JDK for the Java Aeron-Cluster sealer node. The clustered sealer image is
       # a pure-JVM shadowJar (no native libs); temurin 17 matches cluster.Dockerfile
