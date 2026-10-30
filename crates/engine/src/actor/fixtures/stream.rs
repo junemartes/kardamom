@@ -6,7 +6,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage, TxRef};
+use kardamom_types::{
+    BPosition, BlockBoundaryStart, EpochRecord, TxEnvelope, TxOrderingMessage, TxRef,
+};
 
 use super::{ChanTxDataSub, ChanTxOrderingSub, EgressReader, TestEgress};
 use crate::ExecutorError;
@@ -25,6 +27,20 @@ pub enum TestEntry {
     Tx(TxEnvelope),
     /// A boundary. It takes no canonical index.
     Boundary(BlockBoundaryStart),
+    /// An L1 epoch. It takes one canonical index for its marker and one
+    /// for each deposit.
+    Epoch(EpochRecord),
+}
+
+impl TestEntry {
+    /// The canonical indexes of this entry.
+    fn slots(&self) -> u64 {
+        match self {
+            Self::Tx(_) => 1,
+            Self::Boundary(_) => 0,
+            Self::Epoch(epoch) => 1 + u64::try_from(epoch.deposits.len()).unwrap(),
+        }
+    }
 }
 
 /// A canonical stream of a test: its entries in canonical order, from
@@ -77,6 +93,7 @@ impl TestStream {
             .map(|(index, entry)| match entry {
                 TestEntry::Tx(envelope) => TestEgress::tx_frame(index, envelope),
                 TestEntry::Boundary(b) => TestEgress::boundary_frame(b),
+                TestEntry::Epoch(epoch) => TestEgress::epoch_frame(index, epoch),
             })
             .collect()
     }
@@ -88,7 +105,7 @@ impl TestStream {
         self.indexed()
             .filter_map(|(index, entry)| match entry {
                 TestEntry::Tx(envelope) => Some((BPosition::from_index(index), envelope.clone())),
-                TestEntry::Boundary(_) => None,
+                TestEntry::Boundary(_) | TestEntry::Epoch(_) => None,
             })
             .for_each(|record| lane.send(record).unwrap());
         rx
@@ -106,6 +123,7 @@ impl TestStream {
                         TxOrderingMessage::TxRef(TxRef::new(envelope.tx_hash, 0, position, 0))
                     }
                     TestEntry::Boundary(b) => TxOrderingMessage::BoundaryStart(b.clone()),
+                    TestEntry::Epoch(epoch) => TxOrderingMessage::Epoch(epoch.clone()),
                 };
                 (position, msg)
             })
@@ -118,7 +136,7 @@ impl TestStream {
     fn indexed(&self) -> impl Iterator<Item = (u64, &TestEntry)> {
         self.0.iter().scan(0u64, |next, entry| {
             let index = *next;
-            *next = index.checked_add(u64::from(matches!(entry, TestEntry::Tx(_))))?;
+            *next = index.checked_add(entry.slots())?;
             Some((index, entry))
         })
     }

@@ -1128,6 +1128,270 @@
       "limitation": "The actor suite mocks consensus. The Raft suite uses real in-JVM members but does not prove OS process loss, network partitions, deployment or disk power-loss durability.",
       "ci_mode": "gradle"
     },
+    "sealer-carry": {
+      "command": [
+        "cluster/sealer-service/gradlew",
+        "-p",
+        "cluster/sealer-service",
+        ":service:test",
+        "--no-daemon",
+        "--rerun-tasks",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerCarryDowngradeClusterTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerCarryWindowOnClusterTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerCarryWindowOffOnClusterTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerCarryLeaderKillClusterTest"
+      ],
+      "junit_reports": [
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerCarryDowngradeClusterTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerCarryWindowOnClusterTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerCarryWindowOffOnClusterTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerCarryLeaderKillClusterTest.xml"
+      ],
+      "tests": [
+        "io.kardamom.sealer.cluster.SealerCarryDowngradeClusterTest::references_released_after_a_downgrade_are_ordered_under_version_four()",
+        "io.kardamom.sealer.cluster.SealerCarryWindowOnClusterTest::a_follower_down_at_the_switch_starts_with_the_exact_window_of_its_peers()",
+        "io.kardamom.sealer.cluster.SealerCarryWindowOffOnClusterTest::the_window_turns_off_and_on_at_the_same_entry_on_every_member()",
+        "io.kardamom.sealer.cluster.SealerCarryLeaderKillClusterTest::a_leader_stopped_right_after_its_switch_leaves_every_member_with_the_window()"
+      ],
+      "real": [
+        "SealerClusteredService and CanonicalSealerState",
+        "three Aeron consensus members, media drivers, archives and a real cluster client",
+        "feature activation frames of features 4 and 5, egress window rules and SEALER_INFO reports"
+      ],
+      "controlled": [
+        "epochs force every boundary; no timer tick",
+        "a four-frame replay window",
+        "follower stop and restart from its own directories",
+        "leader stop within two seconds after its switch, then its restart"
+      ],
+      "limitation": "Members stop through TestCluster in one JVM, not by SIGKILL of a container. The upgrade transaction on L1, sealer-upgrade-check and Nomad restarts stay with the cluster suite.",
+      "negative_controls": [
+        {
+          "mutation": "no egress window rule at the switch of the carry window (setRules removed from switchRules)",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.SealerCarryWindowOnClusterTest::a_follower_down_at_the_switch_starts_with_the_exact_window_of_its_peers()",
+            "io.kardamom.sealer.cluster.SealerCarryWindowOffOnClusterTest::the_window_turns_off_and_on_at_the_same_entry_on_every_member()",
+            "io.kardamom.sealer.cluster.SealerCarryLeaderKillClusterTest::a_leader_stopped_right_after_its_switch_leaves_every_member_with_the_window()"
+          ],
+          "failed_assertion": "kardamom_sealer_window_exact expected 1.0, was 0.0"
+        },
+        {
+          "mutation": "no SEALER_INFO report to the sessions at a version switch",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.SealerCarryDowngradeClusterTest::references_released_after_a_downgrade_are_ordered_under_version_four()"
+          ],
+          "failed_assertion": "the session never gets version 4; the 60-second interrupt fails the test"
+        }
+      ],
+      "ci_mode": "gradle"
+    },
+    "sealer-feed": {
+      "command": [
+        "cluster/sealer-service/gradlew",
+        "-p",
+        "cluster/sealer-service",
+        ":service:test",
+        "--no-daemon",
+        "--rerun-tasks",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerFeedClusterTest"
+      ],
+      "junit_reports": [
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerFeedClusterTest.xml"
+      ],
+      "tests": [
+        "io.kardamom.sealer.cluster.SealerFeedClusterTest::every_member_feeds_the_leaders_frames_byte_for_byte()",
+        "io.kardamom.sealer.cluster.SealerFeedClusterTest::every_heap_member_feeds_the_leaders_frames_byte_for_byte()",
+        "io.kardamom.sealer.cluster.SealerFeedClusterTest::a_stalled_subscriber_does_not_slow_the_commit()",
+        "io.kardamom.sealer.cluster.SealerFeedClusterTest::a_full_ring_writes_feed_gap_and_the_replay_reaches_the_head()",
+        "io.kardamom.sealer.cluster.SealerFeedClusterTest::the_gap_after_an_epoch_with_deposits_names_a_cursor_that_replays()"
+      ],
+      "real": [
+        "the member feed of each of three Aeron consensus members",
+        "real media drivers, feed publications and request streams"
+      ],
+      "controlled": [
+        "a test reader on each feed",
+        "small rings that fill"
+      ],
+      "limitation": "The reader is a Java test reader; engine-feed-reader runs the Rust reader on a real driver.",
+      "ci_mode": "gradle"
+    },
+    "sequencer-carry": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-sequencer",
+        "--test",
+        "component_recovery",
+        "carry::"
+      ],
+      "real": [
+        "AdmissionLoop::run with positioned references",
+        "SealerRules version reports",
+        "ClusterRefPublisher and the production ingress codecs"
+      ],
+      "controlled": [
+        "account answer, transaction input and canonical frames",
+        "SEALER_INFO reports of the current session"
+      ],
+      "tests": [
+        "a_held_offer_released_after_a_downgrade_takes_the_version_at_release"
+      ],
+      "limitation": "The sealer is a controlled peer; sealer-carry orders the same reference format under version 4.",
+      "negative_controls": [
+        {
+          "mutation": "a report of the current session only raises the kept version",
+          "test": "a_held_offer_released_after_a_downgrade_takes_the_version_at_release",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "sequencer-carry-rules": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-sequencer",
+        "--lib",
+        "--",
+        "outbound::cluster::tests::publishes_the_activation",
+        "v2::tests::the_floor_five",
+        "v2::tests::a_sealer_on_version"
+      ],
+      "real": [
+        "ClusterRefPublisher feature activation frames in front of their epoch",
+        "v2 offer format by kept version and deploy floor"
+      ],
+      "controlled": [
+        "epochs with upgrade logs",
+        "in-memory cluster ingress"
+      ],
+      "tests": [
+        "publishes_the_activation_of_version_four_in_front_of_its_epoch",
+        "publishes_the_activation_of_the_carry_flag_in_front_of_its_epoch",
+        "publishes_the_activation_of_the_exact_window_in_front_of_its_epoch",
+        "a_sealer_on_version_four_gets_the_tagged_position",
+        "a_sealer_on_version_five_gets_the_bytes",
+        "the_floor_five_offers_the_bytes_before_the_first_report"
+      ],
+      "limitation": "Existing unit tests of the sequencer side of the activation and of the version floor.",
+      "ci_mode": "in-process"
+    },
+    "egress-carry": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-validator",
+        "--test",
+        "carry_egress_restart"
+      ],
+      "real": [
+        "egress Store, Owner, Merge and HTTP range read in a child process",
+        "reference mark side file and its gauges",
+        "CarriedSubscription and EgressTransport with the batcher and validator cursor gauges",
+        "SIGKILL of the child and a restart on the same store and address"
+      ],
+      "controlled": [
+        "executor copies of ten one-transaction blocks: three with references, seven with bytes",
+        "the live egress_order frames, with a hole after the restart"
+      ],
+      "tests": [
+        "readers_past_r_read_on_across_a_hard_restart_and_r_stays"
+      ],
+      "limitation": "One egress instance; peer catch-up after a restart is in egress-catchup. Nomad restart of the allocation stays with the cluster suite.",
+      "negative_controls": [
+        {
+          "mutation": "the store takes R from the side file instead of the stored frames",
+          "test": "readers_past_r_read_on_across_a_hard_restart_and_r_stays",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "executor-carry": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-executor",
+        "--test",
+        "carry_move"
+      ],
+      "real": [
+        "Executor reader, exec and commit threads",
+        "TxOrderingReader join of references with tx_data",
+        "CarriedSubscription on a real egress store and HTTP side",
+        "epoch and deposit execution"
+      ],
+      "controlled": [
+        "MockStateDatabase state carried across the move",
+        "one tx_data lane",
+        "eight blocks with three single-deposit epochs"
+      ],
+      "tests": [
+        "the_first_executor_in_carry_mode_matches_the_reference_executors",
+        "the_other_executors_move_one_at_a_time_and_match_the_reference"
+      ],
+      "limitation": "The carried source is the egress; the member feed transport is in sealer-feed and engine-feed-reader. The start comparison with the MDBX history is not exercised.",
+      "negative_controls": [
+        {
+          "mutation": "the carried reader drops the record at its cursor",
+          "failed_tests": [
+            "the_first_executor_in_carry_mode_matches_the_reference_executors",
+            "the_other_executors_move_one_at_a_time_and_match_the_reference"
+          ],
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "engine-feed-reader": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-engine",
+        "--features",
+        "docker-e2e",
+        "--lib",
+        "reader::carried::feed_tests::",
+        "--",
+        "--ignored"
+      ],
+      "real": [
+        "AeronFeed and CarriedSubscription",
+        "Aeron media driver in a disposable container",
+        "feed answer, replay done and live frames"
+      ],
+      "controlled": [
+        "the test plays the member on the feed and request streams"
+      ],
+      "tests": [
+        "the_reader_takes_the_answer_and_the_live_frames_of_a_real_feed"
+      ],
+      "limitation": "The first run builds the Aeron image and takes about 110 seconds; a warm run takes about 18 seconds.",
+      "ci_mode": "docker"
+    },
     "sealer-raft-network": {
       "command": [
         "cluster/sealer-service/gradlew",
@@ -3288,99 +3552,226 @@
     {
       "case": "carry-versions-on",
       "family": "Carry",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "sealer-raft",
           "test": "io.kardamom.sealer.cluster.SealerCarryClusterTest::every_member_orders_each_full_reference_once_with_its_bytes()"
+        },
+        {
+          "suite": "sealer-carry",
+          "test": "io.kardamom.sealer.cluster.SealerCarryDowngradeClusterTest::references_released_after_a_downgrade_are_ordered_under_version_four()"
+        },
+        {
+          "suite": "sequencer-carry-rules",
+          "test": "publishes_the_activation_of_version_four_in_front_of_its_epoch"
+        },
+        {
+          "suite": "sequencer-carry-rules",
+          "test": "publishes_the_activation_of_the_carry_flag_in_front_of_its_epoch"
+        },
+        {
+          "suite": "sequencer-carry",
+          "test": "a_held_offer_released_after_a_downgrade_takes_the_version_at_release"
+        },
+        {
+          "suite": "executor-carry",
+          "test": "the_first_executor_in_carry_mode_matches_the_reference_executors"
+        },
+        {
+          "suite": "executor-carry",
+          "test": "the_other_executors_move_one_at_a_time_and_match_the_reference"
+        },
+        {
+          "suite": "l1-provider-http",
+          "test": "unresponsive_sources_cannot_hold_the_follower_read_forever"
+        },
+        {
+          "suite": "l1-watcher-pause",
+          "test": "a_watcher_without_its_record_pauses_on_the_follower_and_resumes"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the lockbox deployment and the deploy that names it: the deploy CLI writes the address into the Nomad variables of the deployed stack",
+        "sealer-upgrade-check before each upgrade transaction: the check reads the running Nomad jobs and the admin ports of the deployed members",
+        "the rollout order of the deployed stack: the sequence of deploys and upgrade transactions exists only on the cluster"
+      ]
     },
     {
       "case": "carry-held-offer-after-downgrade",
       "family": "Carry",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer-carry",
+          "test": "a_held_offer_released_after_a_downgrade_takes_the_version_at_release"
+        },
+        {
+          "suite": "sealer-carry",
+          "test": "io.kardamom.sealer.cluster.SealerCarryDowngradeClusterTest::references_released_after_a_downgrade_are_ordered_under_version_four()"
+        },
+        {
+          "suite": "sequencer-carry-rules",
+          "test": "a_sealer_on_version_four_gets_the_tagged_position"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "sealer-upgrade-check before each upgrade transaction: the check reads the running Nomad jobs and the admin ports of the deployed members"
+      ]
     },
     {
       "case": "carry-readers-on-egress",
       "family": "Carry",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
-          "suite": "egress-owner",
-          "test": "the_run_ends_when_every_sender_is_gone"
+          "suite": "egress-carry",
+          "test": "readers_past_r_read_on_across_a_hard_restart_and_r_stays"
+        },
+        {
+          "suite": "sequencer-carry-rules",
+          "test": "the_floor_five_offers_the_bytes_before_the_first_report"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the deploy that moves the batcher and the validator to the egress and sets the sequencer floor 5: the stages are Nomad job variables of the deployed stack"
+      ]
     },
     {
       "case": "carry-window-on",
       "family": "Carry",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "sealer-actor",
           "test": "io.kardamom.sealer.cluster.SealerCarryWindowTest::version_five_keeps_only_the_window_at_any_posted_head()"
+        },
+        {
+          "suite": "sealer-carry",
+          "test": "io.kardamom.sealer.cluster.SealerCarryWindowOnClusterTest::a_follower_down_at_the_switch_starts_with_the_exact_window_of_its_peers()"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "sealer-upgrade-check refuses the switch while a member is down: it reads the running Nomad jobs and the admin ports of the deployed members",
+        "the stop and the start of the follower through its Nomad job group: Nomad scheduling"
+      ]
     },
     {
       "case": "carry-executor-first",
       "family": "Carry",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-carry",
+          "test": "the_first_executor_in_carry_mode_matches_the_reference_executors"
+        },
+        {
+          "suite": "sealer-feed",
+          "test": "io.kardamom.sealer.cluster.SealerFeedClusterTest::every_heap_member_feeds_the_leaders_frames_byte_for_byte()"
+        },
+        {
+          "suite": "engine-feed-reader",
+          "test": "the_reader_takes_the_answer_and_the_live_frames_of_a_real_feed"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the staged roll of the executor group and its feed line in the Nomad allocation logs: Nomad deployment"
+      ]
     },
     {
       "case": "carry-executors-rest",
       "family": "Carry",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-carry",
+          "test": "the_other_executors_move_one_at_a_time_and_match_the_reference"
+        },
+        {
+          "suite": "sealer-feed",
+          "test": "io.kardamom.sealer.cluster.SealerFeedClusterTest::the_gap_after_an_epoch_with_deposits_names_a_cursor_that_replays()"
+        },
+        {
+          "suite": "engine-feed-reader",
+          "test": "the_reader_takes_the_answer_and_the_live_frames_of_a_real_feed"
+        },
+        {
+          "suite": "l1-provider-http",
+          "test": "unresponsive_sources_cannot_hold_the_follower_read_forever"
+        },
+        {
+          "suite": "l1-watcher-pause",
+          "test": "a_watcher_without_its_record_pauses_on_the_follower_and_resumes"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the staged roll of executor groups 1 and 2: Nomad deployment",
+        "the smoke gate: a signed transfer through the deployed RPC endpoint and load balancer"
+      ]
     },
     {
       "case": "carry-window-off-on",
       "family": "Carry",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "sealer-actor",
           "test": "io.kardamom.sealer.cluster.SealerCarryActivationTest::a_member_restored_at_any_entry_ends_with_the_bytes_of_its_peer()"
+        },
+        {
+          "suite": "sealer-carry",
+          "test": "io.kardamom.sealer.cluster.SealerCarryWindowOffOnClusterTest::the_window_turns_off_and_on_at_the_same_entry_on_every_member()"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "sealer-upgrade-check before each upgrade transaction: the check reads the running Nomad jobs and the admin ports of the deployed members"
+      ]
     },
     {
       "case": "carry-leader-kill-at-switch",
       "family": "Carry",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "sequencer",
           "test": "lost_offer_on_session_restart_replays_the_exact_prefix_before_its_suffix"
+        },
+        {
+          "suite": "sealer-carry",
+          "test": "io.kardamom.sealer.cluster.SealerCarryLeaderKillClusterTest::a_leader_stopped_right_after_its_switch_leaves_every_member_with_the_window()"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "sealer-upgrade-check before each upgrade transaction: the check reads the running Nomad jobs and the admin ports of the deployed members",
+        "Nomad restarts the killed sealer container and the group returns to three allocations within the restart SLO: Nomad scheduling"
+      ]
     },
     {
       "case": "carry-egress-restart",
       "family": "Carry",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
-        {
-          "suite": "egress-owner",
-          "test": "the_run_ends_when_every_sender_is_gone"
-        },
         {
           "suite": "egress-catchup",
           "test": "a_restarted_egress_joins_the_copies_from_a_peer"
+        },
+        {
+          "suite": "egress-carry",
+          "test": "readers_past_r_read_on_across_a_hard_restart_and_r_stays"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts the egress allocation on the same node and address: Nomad scheduling"
+      ]
     },
     {
       "case": "graceful-executor",

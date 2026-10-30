@@ -3,6 +3,9 @@
 #[path = "component_recovery/support.rs"]
 mod support;
 
+#[path = "component_recovery/carry.rs"]
+mod carry;
+
 #[cfg(target_os = "linux")]
 #[path = "component_recovery/pressure.rs"]
 mod pressure;

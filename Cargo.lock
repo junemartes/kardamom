@@ -4534,6 +4534,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
+ "crossbeam-channel",
  "jsonrpsee",
  "kardamom-cluster-adapter",
  "kardamom-da-watcher",

@@ -58,6 +58,8 @@ path = "src/bin/kardamom-validator/main.rs"
 
 [dev-dependencies]
 metrics-exporter-prometheus.workspace = true
+# The live frame channel of an egress reader in `carry_egress_restart.rs`.
+crossbeam-channel.workspace = true
 # `actor::fixtures::ChannelHarness`: the channel-backed engine harness
 # `forged_envelope_chaos.rs` drives, shared with `kardamom-executor`.
 kardamom-engine = { workspace = true, features = ["test-support"] }
