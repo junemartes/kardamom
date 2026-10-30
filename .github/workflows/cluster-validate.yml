@@ -96,10 +96,10 @@ jobs:
   # test_deploy.py), so a class gains from fewer processes. An entry runs
   # its shards at the same time on one runner: `i/n` keeps every n-th test
   # of the class (load_tests in test_deploy.py). The entries come from the
-  # measured times of one process for each class (Deploy 31 min, Carry 20,
+  # measured times of one process for each class (Deploy 35 min, Carry 21,
   # Record 14, Rollback 9 to 12, RecordFormats 4, Sealer 3 to 5), so that
-  # no entry takes more than about 8 minutes. When an entry nears 10
-  # minutes, split it. The other-tests job checks that every test class
+  # no entry takes more than about 8 minutes. Each shard log ends with its
+  # slowest tests. When an entry nears 10 minutes, split it. The other-tests job checks that every test class
   # of test_deploy.py has a part here.
   deploy-tests:
     name: deploy tests (${{ matrix.part }} ${{ matrix.shards }})
@@ -111,13 +111,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {part: DeployTest, shards: 0/4}
-          - {part: DeployTest, shards: 1/4}
-          - {part: DeployTest, shards: 2/4}
-          - {part: DeployTest, shards: 3/4}
-          - {part: CarryTest, shards: 0/3}
-          - {part: CarryTest, shards: 1/3}
-          - {part: CarryTest, shards: 2/3}
+          - {part: DeployTest, shards: 0/5}
+          - {part: DeployTest, shards: 1/5}
+          - {part: DeployTest, shards: 2/5}
+          - {part: DeployTest, shards: 3/5}
+          - {part: DeployTest, shards: 4/5}
+          - {part: CarryTest, shards: 0/4}
+          - {part: CarryTest, shards: 1/4}
+          - {part: CarryTest, shards: 2/4}
+          - {part: CarryTest, shards: 3/4}
           - {part: RecordTest, shards: 0/2}
           - {part: RecordTest, shards: 1/2}
           - {part: RollbackTest, shards: 0/2}
@@ -141,7 +143,7 @@ jobs:
           printf '%s\n' $SHARDS | xargs -P 4 -I{} sh -c '
             log="/tmp/shard-$(echo {} | tr / -).log"
             DEPLOY_TEST_SHARD={} python3 -m unittest discover -s deploy/cluster/ansible/tests \
-              -p test_deploy.py -k "test_deploy.$PART." -v > "$log" 2>&1
+              -p test_deploy.py -k "test_deploy.$PART." -v --durations 5 > "$log" 2>&1
           ' || rc=1
           for shard in $SHARDS; do
             echo "::group::$PART $shard"

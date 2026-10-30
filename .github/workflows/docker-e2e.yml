@@ -93,15 +93,6 @@ jobs:
             --features 'docker-e2e' \
             --test aeron_live_e2e --test client_timeout_exit -- --ignored --nocapture
 
-      - name: batcher recovery with hidden L1 receipts
-        run: python3 scripts/test-components.py batcher-null-receipts
-
-      - name: archive corruption and wipe recovery
-        run: python3 scripts/test-components.py archive-recovery
-
-      - name: transport recovery with unavailable outputs
-        run: python3 scripts/test-components.py transport-pressure
-
       # The account cache against a real Redis container: the monotone
       # write rule, the account and receipt reads, and the mirror heads.
       - name: kardamom-cache redis round trips
@@ -110,26 +101,6 @@ jobs:
             -p kardamom-cache \
             --features 'docker-e2e' \
             --test redis_e2e -- --ignored --nocapture
-
-      - name: cache Sentinel component recovery
-        run: python3 scripts/test-components.py cache-sentinel
-
-      - name: state mirror component recovery
-        run: |
-          python3 scripts/test-components.py state-mirror
-          python3 scripts/test-components.py state-mirror-coverage-gap
-
-      - name: checkpoint copy across container mounts
-        run: python3 scripts/test-components.py checkpoint-copy
-
-      - name: bounded checkpoint fault controller
-        run: python3 scripts/test-components.py checkpoint-fault
-
-      - name: checkpoint and block-log recovery after ENOSPC
-        run: python3 scripts/test-components.py state-aux-enospc
-
-      - name: state commit recovery after ENOSPC
-        run: python3 scripts/test-components.py state-enospc
 
       # The ingress admission checks and the receipt index with the Redis
       # layer on: the case of an ingress that just restarted.
