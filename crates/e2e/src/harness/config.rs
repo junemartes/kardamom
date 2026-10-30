@@ -105,6 +105,9 @@ pub struct StackConfig {
     /// The read path: a Redis container and a state mirror next to the
     /// executor, which writes checkpoints for the mirror's rebuild.
     pub read_path: bool,
+    /// With `read_path`: every sequencer reads that Redis in its nonce
+    /// lookup before it asks the executor, as in the deployment.
+    pub sequencer_cache: bool,
 }
 
 /// The parts of the stack that the carry window rollout needs.
@@ -220,6 +223,7 @@ impl Default for StackConfig {
             ingress_rows: false,
             carry: None,
             read_path: false,
+            sequencer_cache: false,
         }
     }
 }

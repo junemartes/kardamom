@@ -155,6 +155,10 @@ pub enum Case {
     /// `pipeline-blackout-recover`: every pipeline process dies at once,
     /// with the media driver, and every one starts again.
     PipelineBlackout,
+    /// `sequencer-executor-redis-loss`: SIGKILL to every sequencer, the
+    /// executor and Redis. They return in reverse order of need: the
+    /// sequencers, Redis (empty), then the executor.
+    SequencerExecutorRedis,
     /// A combined outage of the ingress, sequencer and sealer classes.
     Combined(Combined),
 }
@@ -176,7 +180,7 @@ impl Run<'_> {
     }
 
     /// The lane of the case sender.
-    fn case_lane(&self) -> Result<u32> {
+    pub(super) fn case_lane(&self) -> Result<u32> {
         let sender = crate::harness::l2::dev_signers_through(super::CASE_SENDER)?
             .get(super::CASE_SENDER)
             .map(|s| s.address)
@@ -196,7 +200,7 @@ impl Run<'_> {
     }
 
     /// The case load lands nothing for one second: the outage is real.
-    async fn assert_load_stopped(&self, load: &RunningLoad) -> Result<()> {
+    pub(super) async fn assert_load_stopped(&self, load: &RunningLoad) -> Result<()> {
         let before = load.landed();
         tokio::time::sleep(Duration::from_secs(1)).await;
         // A transfer in flight at the kill can still land once.
@@ -212,7 +216,7 @@ impl Run<'_> {
     }
 
     /// No replica holds a buffered ref below its sender's floor.
-    async fn assert_no_ref_below_floor(&self) -> Result<()> {
+    pub(super) async fn assert_no_ref_below_floor(&self) -> Result<()> {
         let target = self.stack.target(Duration::from_secs(5))?;
         for addr in &target.sequencer_metrics {
             self.assert_no_stranded_ref(*addr).await?;
@@ -277,6 +281,7 @@ impl Case {
             Self::GracefulSequencer => Self::graceful_sequencer(run, load).await,
             Self::SequencerLaneLoss => Self::sequencer_lane(run, load).await,
             Self::PipelineBlackout => Self::blackout(run).await,
+            Self::SequencerExecutorRedis => run.sequencer_executor_redis(load).await,
             Self::Combined(c) => c.run(run, load).await,
         }
     }

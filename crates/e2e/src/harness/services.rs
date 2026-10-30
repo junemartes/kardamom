@@ -510,6 +510,9 @@ pub struct SequencerOptions {
     /// The v1 loop offers every transaction as a reference without its
     /// bytes (record type 0), as a sequencer of an older release does.
     pub v1_loop: bool,
+    /// The `[cache]` URL of the Redis that the nonce lookup reads first.
+    /// `None` runs the lookup on the executor alone.
+    pub cache_url: Option<String>,
 }
 
 impl SequencerOptions {
@@ -569,6 +572,11 @@ pub fn spawn_sequencer_with(
             prefix.push_str("verdicts = true\n");
         }
         prefix.push('\n');
+    }
+    if let Some(url) = opts.cache_url.as_deref() {
+        prefix.push_str("[cache]\nurl = \"");
+        prefix.push_str(url);
+        prefix.push_str("\"\n\n");
     }
     let name = format!("sequencer-{index}{}", opts.log_tag);
     let cfg_path = spec.write_cluster_config(&name, &prefix)?;

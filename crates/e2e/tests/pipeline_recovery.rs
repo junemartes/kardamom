@@ -76,3 +76,23 @@ async fn pipeline_blackout_rebuilds_the_read_path() {
     )
     .await;
 }
+
+/// The sequencers, the executor and Redis die, and no floor source is
+/// left. The sequencers read Redis in their nonce lookup, as deployed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack; run the pipeline-recovery component target"]
+async fn sequencer_executor_redis_loss_looks_every_floor_up() {
+    run_case(
+        "sequencer-executor-redis-loss",
+        Case::SequencerExecutorRedis,
+        // The returned executor replays the references of the outage, so
+        // the archive must keep their transaction data.
+        StackConfig {
+            archive_durability: true,
+            read_path: true,
+            sequencer_cache: true,
+            ..validated()
+        },
+    )
+    .await;
+}

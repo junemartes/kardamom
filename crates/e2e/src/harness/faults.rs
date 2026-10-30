@@ -266,6 +266,7 @@ impl LocalStack {
         Ok(SequencerOptions {
             partition,
             lane,
+            cache_url: self.sequencer_cache_url(),
             ..SequencerOptions::default()
         })
     }

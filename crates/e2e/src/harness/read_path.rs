@@ -114,7 +114,7 @@ impl Redis {
         self.await_ping()
     }
 
-    fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         format!("redis://127.0.0.1:{}", self.port)
     }
 }
@@ -218,6 +218,40 @@ impl LocalStack {
         };
         path.mirror.proc.kill();
         path.redis.kill()
+    }
+
+    /// SIGKILL Redis alone. The mirror keeps running.
+    ///
+    /// # Errors
+    /// Returns an error when the stack runs no read path, or when Docker
+    /// fails.
+    pub fn kill_redis(&self) -> Result<()> {
+        self.read_path
+            .as_ref()
+            .context("the stack runs no read path")?
+            .redis
+            .kill()
+    }
+
+    /// Start the killed Redis again. It returns empty.
+    ///
+    /// # Errors
+    /// Returns an error when the stack runs no read path, or when Redis
+    /// does not answer.
+    pub fn restart_redis(&self) -> Result<()> {
+        self.read_path
+            .as_ref()
+            .context("the stack runs no read path")?
+            .redis
+            .restart()
+    }
+
+    /// The Redis URL of the sequencers' nonce lookup, when they read one.
+    pub(crate) fn sequencer_cache_url(&self) -> Option<String> {
+        self.read_path
+            .as_ref()
+            .filter(|_| self.cfg.sequencer_cache)
+            .map(|path| path.redis.url())
     }
 
     /// Start Redis empty and the mirror again. The mirror rebuilds Redis
