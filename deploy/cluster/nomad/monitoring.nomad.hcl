@@ -99,6 +99,15 @@ variable "prometheus_retention_size" {
   default = "0B"
 }
 
+# The window of KardamomCanaryStalled in deploy/alerts.yml: no successful
+# canary transfer for this long fires the alert. The job renders the rule
+# of that file with this window. The deploy passes it from
+# KARDAMOM_CANARY_STALLED_WINDOW.
+variable "canary_stalled_window" {
+  type    = string
+  default = "5m"
+}
+
 # The scrape of the egress (nomad/egress.nomad.hcl), "on" or "off". The
 # workloads role sets it on with the egress job (KARDAMOM_EGRESS=1).
 variable "egress" {
@@ -135,6 +144,14 @@ variable "grafana_image" {
 }
 
 locals {
+  # deploy/alerts.yml with the window of KardamomCanaryStalled. With the
+  # default window, the file renders unchanged.
+  alert_rules = replace(
+    file("../alerts.yml"),
+    "[5m])) == 0\n          and sum by (host_id) (increase(kardamom_canary_probe_total{probe=\"transfer\",outcome!=\"unfunded\"}[5m]))",
+    "[${var.canary_stalled_window}])) == 0\n          and sum by (host_id) (increase(kardamom_canary_probe_total{probe=\"transfer\",outcome!=\"unfunded\"}[${var.canary_stalled_window}]))",
+  )
+
   dc = var.datacenter
   # The admin endpoint of a sealer member (admin_port in nomad/cluster.nomad.hcl).
   sealer_admin_port = 40205
@@ -382,7 +399,7 @@ job "monitoring" {
       # consul-template delimiters move out of their way.
       template {
         destination     = "local/alerts.yml"
-        data            = file("../alerts.yml")
+        data            = local.alert_rules
         left_delimiter  = "[[["
         right_delimiter = "]]]"
       }

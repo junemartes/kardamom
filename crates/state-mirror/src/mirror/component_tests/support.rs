@@ -26,26 +26,47 @@ pub(super) struct Fixture {
     pub(super) admin: MultiplexedConnection,
     cfg: CacheConfig,
     root: tempfile::TempDir,
-    _redis: ContainerAsync<GenericImage>,
+    /// The single Redis of the fixture; `None` on a Sentinel group that
+    /// the caller owns.
+    _redis: Option<ContainerAsync<GenericImage>>,
+    /// Whether the mirror logs in as the ACL user `mirror`, which only
+    /// the single Redis of the fixture defines.
+    mirror_user: bool,
 }
 
 impl Fixture {
     pub(super) async fn new() -> Self {
-        let (redis, mut cfg) = kardamom_cache::testing::redis().await;
-        cfg.head_ttl_secs = NonZeroU64::new(60).unwrap();
-        cfg.receipt_ttl_secs = NonZeroU64::new(60).unwrap();
+        let (redis, cfg) = kardamom_cache::testing::redis().await;
         let admin = redis::Client::open(cfg.url.as_deref().unwrap())
             .unwrap()
             .get_multiplexed_async_connection()
             .await
             .unwrap();
+        Self::with(cfg, admin, Some(redis)).await
+    }
+
+    /// A fixture on the Redis that `cfg` names, with `admin` a raw
+    /// connection to its primary.
+    pub(super) async fn on(cfg: CacheConfig, admin: MultiplexedConnection) -> Self {
+        Self::with(cfg, admin, None).await
+    }
+
+    /// The fixture on `cfg`. With `redis`, the fixture owns that single
+    /// Redis, and the mirror logs in as its ACL user.
+    async fn with(
+        mut cfg: CacheConfig,
+        admin: MultiplexedConnection,
+        redis: Option<ContainerAsync<GenericImage>>,
+    ) -> Self {
+        cfg.head_ttl_secs = NonZeroU64::new(60).unwrap();
+        cfg.receipt_ttl_secs = NonZeroU64::new(60).unwrap();
         let cache = AccountCache::connect(&cfg).await.unwrap();
-        let root = tempfile::tempdir().unwrap();
         let fixture = Self {
             cache,
             admin,
             cfg,
-            root,
+            root: tempfile::tempdir().unwrap(),
+            mirror_user: redis.is_some(),
             _redis: redis,
         };
         fixture.checkpoint();
@@ -138,20 +159,49 @@ impl Fixture {
             &kardamom_types::GenesisAlloc::of_accounts(accounts),
         )
         .unwrap();
+        self.commit_checkpoint(&env, 1, 21, &[]);
+    }
+
+    /// Commit block `block`, with canonical end `end` and the account
+    /// rows `rows`, as an executor does, and write its checkpoint.
+    pub(super) fn checkpoint_at(&self, block: u64, end: u64, rows: &[AccountRow]) {
+        let env = StateEnvBuilder::new(self.root.path().join("state"))
+            .open()
+            .unwrap();
+        self.commit_checkpoint(&env, block, end, rows);
+    }
+
+    fn commit_checkpoint(
+        &self,
+        env: &kardamom_state::StateEnv,
+        block: u64,
+        end: u64,
+        rows: &[AccountRow],
+    ) {
         let mut writer = StateWriter::spawn(env.clone()).unwrap();
+        let accounts = rows
+            .iter()
+            .map(|row| AccountChange {
+                address: row.address,
+                nonce: row.nonce,
+                balance: row.balance,
+                code_hash: B256::ZERO,
+            })
+            .collect();
         writer
             .delta_tx
             .send(WriteBatch::new(
                 BlockBoundary {
-                    block_number: 1,
-                    end_tx_idx: BPosition::from_index(21),
-                    l2_timestamp: 1,
+                    block_number: block,
+                    end_tx_idx: BPosition::from_index(end),
+                    l2_timestamp: block,
                     l1_origin: 0,
                     base_fee: 0,
                     gas_used: 0,
                 },
                 BlockDelta {
-                    block_number: 1,
+                    block_number: block,
+                    accounts,
                     ..BlockDelta::default()
                 },
             ))
@@ -162,10 +212,10 @@ impl Fixture {
             .recv_deadline(deadline)
             .expect("checkpoint commit")
             .block_number()
-            < 1
+            < block
         {}
         writer.shutdown().unwrap();
-        kardamom_state::checkpoint::create_checkpoint(&env, &self.root.path().join("checkpoints"))
+        kardamom_state::checkpoint::create_checkpoint(env, &self.root.path().join("checkpoints"))
             .unwrap();
     }
 
@@ -257,10 +307,12 @@ impl Fixture {
 
     pub(super) async fn start(&self, id: u32, force: bool) -> Actor {
         let mut cfg = self.cfg.clone();
-        cfg.username = Some("mirror".into());
-        cfg.url = cfg
-            .url
-            .map(|url| url.replacen("redis://", "redis://mirror:component-test@", 1));
+        if self.mirror_user {
+            cfg.username = Some("mirror".into());
+            cfg.url = cfg
+                .url
+                .map(|url| url.replacen("redis://", "redis://mirror:component-test@", 1));
+        }
         let cache = AccountCache::connect(&cfg).await.unwrap();
         let (input, rx) = unbounded_channel();
         let shutdown = CancellationToken::new();
@@ -286,7 +338,12 @@ impl Fixture {
     }
 
     pub(super) async fn head(&self, id: u32, position: u64) {
-        tokio::time::timeout(BOUND, self.wait_for_head(id, position))
+        self.head_within(id, position, BOUND).await;
+    }
+
+    /// Wait up to `bound` until mirror `id` publishes `position`.
+    pub(super) async fn head_within(&self, id: u32, position: u64, bound: Duration) {
+        tokio::time::timeout(bound, self.wait_for_head(id, position))
             .await
             .expect("mirror head must advance");
     }
@@ -323,8 +380,14 @@ impl Fixture {
     }
 
     pub(super) async fn assert_checkpoint_suffix(&self, from: u64) {
+        self.assert_rows_at(from, 20).await;
+    }
+
+    /// Every checkpoint account from `from` on holds its checkpoint
+    /// value, stamped with the rebuild floor `position`.
+    pub(super) async fn assert_rows_at(&self, from: u64, position: u64) {
         for index in from..ACCOUNTS {
-            self.assert_row(index, 1, 20).await;
+            self.assert_row(index, 1, position).await;
         }
     }
 }
