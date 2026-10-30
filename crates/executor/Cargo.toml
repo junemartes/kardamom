@@ -40,6 +40,10 @@ crc32fast = "1.5"
 # posix_fallocate for the receipt ledger.
 libc.workspace = true
 
+[features]
+# The executor-stream recovery tests need a real media driver and archive.
+docker-e2e = ["kardamom-log/docker-e2e"]
+
 [[bin]]
 name = "kardamom-executor"
 path = "src/bin/kardamom-executor/main.rs"
@@ -64,6 +68,18 @@ tempfile.workspace = true
 # The format registry: a test checks the layout of the state-dir files
 # against it.
 kardamom-formats.workspace = true
+# The executor recovery tests rebuild an executor image from DA batches.
+kardamom-batcher = { path = "../batcher" }
+kardamom-reconstruct = { path = "../reconstruct" }
+# The L1 rebuild test posts batches to a real Anvil and scans them back.
+kardamom-deployer = { path = "../deployer", features = ["test-support"] }
+alloy-node-bindings.workspace = true
+alloy-provider.workspace = true
+alloy-network.workspace = true
+# The combined ingress case runs the real ingress proxy against the
+# restarted executors.
+kardamom-ingress = { path = "../ingress", features = ["test-support"] }
+kardamom-cache = { workspace = true }
 
 [[bench]]
 name = "sequential_throughput"
