@@ -41,7 +41,7 @@ class StreakTest(unittest.TestCase):
                                "completed_at": f"2026-10-{number:02}T00:10:00Z"}],
         } for index, name in enumerate(sorted(WORKFLOWS))]
         ci = next(run for run in runs if run["path"].endswith("/ci.yml"))
-        ci["jobs"].extend({"name": f"in-process recovery ({shard})", "status": "completed",
+        ci["jobs"].extend({"name": f"component recovery ({shard})", "status": "completed",
                            "conclusion": "success", "started_at": f"2026-10-{number:02}T00:00:00Z",
                            "completed_at": f"2026-10-{number:02}T00:04:00Z"}
                           for shard in range(COMPONENT_SHARDS))
@@ -211,11 +211,11 @@ class StreakTest(unittest.TestCase):
         ci = next(run for run in runs if run["path"].endswith("/ci.yml"))
         ci["jobs"][-1]["conclusion"] = "skipped"
         self.assertEqual(self.streak.record(runs), "failed")
-        self.assertIn(f"in-process recovery ({COMPONENT_SHARDS - 1})",
+        self.assertIn(f"component recovery ({COMPONENT_SHARDS - 1})",
                       self.streak.state["rounds"][0]["missing_green_coverage"])
 
-    def test_in_process_jobs_have_a_five_minute_budget(self):
-        for end, expected in [("00:05:00", "green"), ("00:05:01", "failed")]:
+    def test_component_jobs_have_a_ten_minute_budget(self):
+        for end, expected in [("00:10:00", "green"), ("00:10:01", "failed")]:
             runs = self.runs(1)
             ci = next(run for run in runs if run["path"].endswith("/ci.yml"))
             ci["jobs"][-1]["completed_at"] = f"2026-10-01T{end}Z"

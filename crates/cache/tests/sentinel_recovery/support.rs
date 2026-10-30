@@ -232,7 +232,15 @@ impl Fixture {
             .query_async(&mut sentinel)
             .await
             .unwrap();
-        others.len() == 2 && replicas.len() == 1 && self.cache.wait_replica().await.unwrap() == 1
+        // A replica that still syncs can let WAIT time out on a loaded host. The
+        // fixture is then not ready yet, and the bounded wait tries again.
+        others.len() == 2
+            && replicas.len() == 1
+            && self
+                .cache
+                .wait_replica()
+                .await
+                .is_ok_and(|count| count == 1)
     }
 
     pub(super) fn row(nonce: u64) -> AccountRow {

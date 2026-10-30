@@ -283,7 +283,7 @@ test rejects a new chaos case without a corresponding plan. Each family lists th
 real actors, boundary faults, recovery invariants and dependencies that still need
 real integration. `partial` means that named local tests validate some boundary
 assumptions. It does not mean the complete distributed case has passed locally.
-Forty-one cases have partial mappings. No full case is marked locally validated yet.
+`just component-summary` prints the current planned, partial and ported counts.
 
 `just component-catalog` checks the catalog. `just component-summary` prints the
 planned, partial and ported counts for each family. A case is ported when its
@@ -292,11 +292,16 @@ always go together. A ported case needs:
 
 - At least one local test.
 - A local test in a suite with a `ci_mode`, so that CI runs it. The modes are
-  `in-process`, `docker` (a real container dependency) and `gradle` (the Java
-  sealer).
+  `in-process`, `docker` (a real container dependency), `gradle` (the Java
+  sealer) and `stack` (the real service binaries, the sealer jar and the media
+  driver as local processes).
 - A negative control for one of its local tests. A control that names tests
   (`test`, `tests` or `failed_tests`) guards only those tests. A control that
   names no test guards every test of its suite.
+
+A suite can have the optional field `test_timeout_s`: the per-test limit in CI, an
+integer from 60 to 120. The default is 60. A value above 60 needs the field
+`test_timeout_reason`.
 
 The optional case field `cluster_only_checks` is a list of strings. Each string
 names a check that needs the deployed cluster, and gives the reason. The cluster

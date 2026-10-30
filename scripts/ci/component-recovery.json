@@ -931,6 +931,8 @@
         "--locked",
         "-p",
         "kardamom-state-mirror",
+        "--bin",
+        "kardamom-state-mirror",
         "--features",
         "docker-e2e",
         "component_tests::recovery::",
@@ -979,6 +981,8 @@
         "test",
         "--locked",
         "-p",
+        "kardamom-state-mirror",
+        "--bin",
         "kardamom-state-mirror",
         "--features",
         "docker-e2e",
@@ -1186,6 +1190,8 @@
         "--tests",
         "io.kardamom.sealer.cluster.CpuSqueezeTest"
       ],
+      "test_timeout_s": 120,
+      "test_timeout_reason": "the leader's first log purge pass is a fixed 30 s",
       "ci_mode": "gradle",
       "junit_reports": [
         "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest.xml",
@@ -1256,6 +1262,8 @@
         "--tests",
         "io.kardamom.sealer.cluster.NodeReplaceSealerTest"
       ],
+      "test_timeout_s": 120,
+      "test_timeout_reason": "the leader's first log purge pass is a fixed 30 s",
       "ci_mode": "gradle",
       "junit_reports": [
         "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.ClusterLeaderKillTest.xml",
@@ -1333,6 +1341,8 @@
         "--tests",
         "io.kardamom.sealer.cluster.SealerFleetTotalWipeTest"
       ],
+      "test_timeout_s": 120,
+      "test_timeout_reason": "the leader's first log purge pass is a fixed 30 s",
       "ci_mode": "gradle",
       "junit_reports": [
         "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.ClusterQuorumLossRecoverTest.xml",
@@ -1522,7 +1532,8 @@
           ],
           "compiled": true
         }
-      ]
+      ],
+      "ci_mode": "in-process"
     },
     "state-aux-enospc": {
       "command": [
@@ -1662,7 +1673,8 @@
           ]
         }
       ],
-      "limitation": "Harness recovery evidence only. Does not run a sealer, Nomad cluster or reproduce election consensus. A readable closed majority is still required; persistent missing logs fail at the complete deadline."
+      "limitation": "Harness recovery evidence only. Does not run a sealer, Nomad cluster or reproduce election consensus. A readable closed majority is still required; persistent missing logs fail at the complete deadline.",
+      "ci_mode": "in-process"
     },
     "checkpoint-fault": {
       "command": [
@@ -1751,7 +1763,8 @@
           ],
           "compiled": true
         }
-      ]
+      ],
+      "ci_mode": "in-process"
     },
     "transport-pressure": {
       "command": [
@@ -1820,7 +1833,8 @@
         "a_receipted_transfer_waits_for_the_lagging_executor_before_comparing_redis",
         "an_executor_baseline_requires_full_state_agreement_and_the_receipted_nonce"
       ],
-      "limitation": "Checks exact account predicates and the executor baseline; distributed recovery remains required."
+      "limitation": "Checks exact account predicates and the executor baseline; distributed recovery remains required.",
+      "ci_mode": "in-process"
     },
     "chaos-projection": {
       "command": [
@@ -1858,7 +1872,8 @@
             "persistent_read_failure_preserves_its_cause_at_the_original_deadline"
           ]
         }
-      ]
+      ],
+      "ci_mode": "in-process"
     },
     "batcher-null-receipts": {
       "command": [
@@ -2048,7 +2063,8 @@
           "intended_failure": true,
           "log": "/tmp/backlog-non_atomic_snapshot-negative-20261028.log"
         }
-      ]
+      ],
+      "ci_mode": "in-process"
     },
     "chaos-archive-stage": {
       "command": [
@@ -2084,7 +2100,8 @@
           "compiled": true,
           "intended_failure": true
         }
-      ]
+      ],
+      "ci_mode": "in-process"
     },
     "archive-recovery": {
       "command": [
@@ -2159,7 +2176,8 @@
           "failed_tests": 6,
           "exit_code": 101
         }
-      ]
+      ],
+      "ci_mode": "in-process"
     },
     "discovery-registration": {
       "command": [
@@ -2191,7 +2209,8 @@
         "a_missing_registration_endpoint_remains_permanent",
         "a_missing_member_query_endpoint_remains_permanent"
       ],
-      "limitation": "The agent is controlled; real Consul check loss is covered separately. Distributed validator catch-up and control-plane recovery remain required."
+      "limitation": "The agent is controlled; real Consul check loss is covered separately. Distributed validator catch-up and control-plane recovery remain required.",
+      "ci_mode": "in-process"
     },
     "discovery-check-loss": {
       "command": [
@@ -2219,7 +2238,8 @@
       "tests": [
         "a_check_removed_after_registration_is_recoverable"
       ],
-      "limitation": "One isolated Consul agent; this does not qualify fleet rescheduling, validator catch-up or the cause of a distributed catalog deletion."
+      "limitation": "One isolated Consul agent; this does not qualify fleet rescheduling, validator catch-up or the cause of a distributed catalog deletion.",
+      "ci_mode": "docker"
     }
   },
   "families": {
