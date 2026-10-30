@@ -60,6 +60,9 @@ pub(crate) fn round_window(k: &Knobs) -> Duration {
 
 /// One round within its [`round_window`]. A round past its window fails
 /// here, with its cause, and not later as a case load that ended early.
+/// The timeout can end a round between the stop and the restore of the
+/// job, so a failed round registers the saved job again before it
+/// fails: no stopped executor job leaks into the next case.
 async fn storm_round(
     h: &mut Harness,
     job: &SavedJob,
@@ -67,14 +70,26 @@ async fn storm_round(
     round: u32,
 ) -> anyhow::Result<()> {
     let window = round_window(&h.knobs);
-    tokio::time::timeout(window, round_steps(h, job, replicas, round))
+    let outcome = tokio::time::timeout(window, round_steps(h, job, replicas, round))
         .await
         .map_err(|_| {
             crate::chaos_fail!(
                 "{CTX}: round {round}/{ROUNDS} exceeds its window of {}s",
                 window.as_secs()
             )
-        })?
+        })
+        .and_then(std::convert::identity);
+    if outcome.is_err() {
+        restore_logged(job).await;
+    }
+    outcome
+}
+
+/// Register the saved executor job again, and log a failed restore.
+async fn restore_logged(job: &SavedJob) {
+    if let Err(error) = job.restore().await {
+        crate::log(format!("{CTX}: fault cleanup fails: {error:#}"));
+    }
 }
 
 /// One round: stop the job, start it again, wait until every replica

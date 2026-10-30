@@ -1,8 +1,10 @@
 //! Stop each mirror inside a checkpoint scan, with its Redis writes
 //! blocked. The replacements run the saved job with no forced rebuild,
-//! so the mirrors decide on their own: at least one completes a rebuild,
-//! the projection holds the exact captured accounts, and every mirror
-//! serves before recovery passes.
+//! so the mirrors decide on their own. Each mirror died inside its
+//! rebuild, after it wrote its rebuild marker, so each one must rebuild
+//! again: every mirror completes a rebuild, the projection holds the
+//! exact captured accounts, and every mirror serves before recovery
+//! passes.
 
 use anyhow::Context;
 use serde::Serialize;
@@ -136,7 +138,7 @@ impl InterruptedRebuild<'_> {
     async fn recover(&self, coverage: &CacheRecovery) -> anyhow::Result<()> {
         self.saved.restore().await?;
         coverage
-            .await_restored(self.h, CTX, RebuildPhase::FirstComplete)
+            .await_restored(self.h, CTX, RebuildPhase::Complete)
             .await?;
         let h = &*self.h;
         poll::until(Budget::secs(60, 3), |_| async move {

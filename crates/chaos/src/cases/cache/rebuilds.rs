@@ -41,10 +41,6 @@ struct Mirror {
 pub(crate) enum RebuildPhase {
     /// Every mirror completes a rebuild.
     Complete,
-    /// At least one mirror completes a rebuild. A mirror that starts
-    /// after another one published the shared heads finds them warm and
-    /// resumes with no rebuild.
-    FirstComplete,
     /// Every mirror scans, and retries a write, with no completed
     /// rebuild.
     BlockedScan,
@@ -55,7 +51,7 @@ impl RebuildPhase {
         let counts = (before.allocation == after.allocation).then_some(&before.counts);
         let completed = counts.map_or(0, |counts| counts.completed);
         match self {
-            Self::Complete | Self::FirstComplete => after.counts.completed > completed,
+            Self::Complete => after.counts.completed > completed,
             Self::BlockedScan => {
                 after.counts.completed == completed
                     && after.counts.scanning > counts.map_or(0, |counts| counts.scanning)
@@ -64,18 +60,9 @@ impl RebuildPhase {
         }
     }
 
-    /// Whether the phase holds with `pending` of `mirrors` mirrors not
-    /// ready.
-    fn reached(self, pending: usize, mirrors: usize) -> bool {
-        match self {
-            Self::FirstComplete => pending < mirrors,
-            Self::Complete | Self::BlockedScan => pending == 0,
-        }
-    }
-
     fn budget(self) -> Budget {
         match self {
-            Self::Complete | Self::FirstComplete => Budget::secs(300, 5),
+            Self::Complete => Budget::secs(300, 5),
             Self::BlockedScan => Budget::secs(180, 2),
         }
     }
@@ -150,7 +137,7 @@ impl MirrorRebuilds {
         let outcome = poll::until(phase.budget(), |_| async move {
             let now = Self::sample(h).await?;
             let missing = self.pending(&now, phase);
-            let complete = phase.reached(missing.len(), self.mirrors.len());
+            let complete = missing.is_empty();
             pending_ref.replace(missing);
             Ok::<_, anyhow::Error>(complete.then_some(now))
         })

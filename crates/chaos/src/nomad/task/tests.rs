@@ -19,6 +19,13 @@ fn restarted(events: &serde_json::Value, restarts: u64) -> Alloc {
     .unwrap()
 }
 
+/// The restarts of the one task of `alloc`.
+fn only(alloc: &Alloc) -> Restarts<'_> {
+    let mut tasks = Restarts::of(alloc).unwrap();
+    assert_eq!(tasks.len(), 1);
+    tasks.remove(0)
+}
+
 fn terminated(code: i64) -> serde_json::Value {
     terminated_at(code, 1_761_301_845_000_000_000_i64)
 }
@@ -38,7 +45,7 @@ const RESTARTING: &str = r#"{"Type": "Restarting", "Time": 1761301846000000000,
 fn a_failed_exit_passes_only_with_its_designed_recovery_line() {
     let restarting: serde_json::Value = serde_json::from_str(RESTARTING).unwrap();
     let failed = alloc(&serde_json::json!([terminated(1), restarting]));
-    let exits = Restarts::of(&failed).unwrap();
+    let exits = only(&failed);
     let consul = "Error: discovery: query kardamom-cluster-member: 500 Internal Server Error: No known Consul servers\n";
     let notes = exits.unexplained(consul);
     assert_eq!(notes.len(), 2, "{notes:?}");
@@ -52,14 +59,14 @@ fn a_failed_exit_passes_only_with_its_designed_recovery_line() {
     let join = "WARN kardamom_executor::reader: join timeout: TxRef has no envelope on tx_data (archive refetch exhausted); aborting\n";
     assert_eq!(exits.unexplained(join), Vec::<String>::new());
     let none = restarted(&serde_json::Value::Null, 0);
-    assert!(Restarts::of(&none).unwrap().is_clean());
+    assert!(only(&none).is_clean());
 }
 
 /// Two failed exits need two recovery lines.
 #[test]
 fn each_failed_exit_needs_its_own_recovery_line() {
     let failed = restarted(&serde_json::json!([terminated(1), terminated(1)]), 2);
-    let exits = Restarts::of(&failed).unwrap();
+    let exits = only(&failed);
     let join = "join timeout: TxRef has no envelope on tx_data\n";
     assert_eq!(exits.unexplained(join).len(), 2);
     assert_eq!(exits.unexplained(&join.repeat(2)), Vec::<String>::new());
@@ -71,7 +78,7 @@ fn each_failed_exit_needs_its_own_recovery_line() {
 #[test]
 fn a_join_watchdog_exit_of_a_member_is_a_designed_recovery() {
     let failed = alloc(&serde_json::json!([terminated(8)]));
-    let exits = Restarts::of(&failed).unwrap();
+    let exits = only(&failed);
     let truncated = "cluster FOLLOWER STALL memberId=1 commitPosition=18339136 state=FOLLOWER_LOG_AWAIT truncated log: the service applied the log past 18338816, the position that a relaunch reaches, for 5s; a new leader cut the log tail, so no join can succeed; exiting for a relaunch that keeps the recording log\n";
     assert_eq!(exits.unexplained(truncated), Vec::<String>::new());
     let stall = "cluster LEADER STALL memberId=0 commitPosition=9 in LEADER_READY with no progress on this member or its peers for 160s (limit 160s): a member that voted cannot join this term; exiting for a relaunch from the own state so the members elect again\n";
@@ -85,13 +92,13 @@ fn a_join_watchdog_exit_of_a_member_is_a_designed_recovery() {
 #[test]
 fn a_clean_exit_that_restarts_needs_a_recovery_line() {
     let ended = alloc(&serde_json::json!([terminated(0)]));
-    let exits = Restarts::of(&ended).unwrap();
+    let exits = only(&ended);
     assert_eq!(exits.unexplained("ingress: no sealer\n").len(), 2);
     let unlisted = restarted(&serde_json::Value::Null, 3);
-    let notes = Restarts::of(&unlisted).unwrap().unexplained("");
+    let notes = only(&unlisted).unexplained("");
     assert_eq!(
         notes,
-        vec!["df280978 restarted 3 times with 0 designed recovery lines in its log"]
+        vec!["df280978 task executor restarted 3 times with 0 designed recovery lines in its log"]
     );
 }
 
@@ -110,7 +117,7 @@ fn a_recovery_line_of_an_earlier_process_explains_no_later_crash() {
         started(t0 + 105 * SECOND),
     ]);
     let crashed = restarted(&events, 2);
-    let exits = Restarts::of(&crashed).unwrap();
+    let exits = only(&crashed);
     let early = "2025-10-24T10:30:10.000000Z  WARN kardamom_executor::reader: join timeout: TxRef has no envelope on tx_data\n";
     let notes = exits.unexplained(early);
     assert_eq!(notes.len(), 2, "{notes:?}");
@@ -120,4 +127,27 @@ fn a_recovery_line_of_an_earlier_process_explains_no_later_crash() {
         exits.unexplained(&format!("{early}{late}")),
         Vec::<String>::new()
     );
+}
+
+/// A recovery line in the log of one task explains no restart of
+/// another task of the allocation.
+#[test]
+fn a_recovery_line_of_one_task_explains_no_restart_of_another() {
+    let alloc: Alloc = serde_json::from_value(serde_json::json!({
+        "JobVersion": 3, "DesiredStatus": "run", "ID": "df280978-aaaa-bbbb-cccc-000000000000",
+        "TaskGroup": "executor", "ClientStatus": "running", "NodeName": "executor-1",
+        "NodeID": "n1",
+        "TaskStates": {
+            "executor": {"State": "running", "Restarts": 1, "Events": [terminated(1)]},
+            "sidecar": {"State": "running", "Restarts": 0, "Events": []}
+        }
+    }))
+    .unwrap();
+    let tasks = Restarts::of(&alloc).unwrap();
+    let executor = tasks.iter().find(|t| t.task == "executor").unwrap();
+    let sidecar = tasks.iter().find(|t| t.task == "sidecar").unwrap();
+    assert!(sidecar.is_clean());
+    assert_eq!(executor.unexplained("").len(), 2);
+    let join = "join timeout: TxRef has no envelope on tx_data\n";
+    assert_eq!(executor.unexplained(join), Vec::<String>::new());
 }
