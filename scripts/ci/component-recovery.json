@@ -1547,11 +1547,11 @@
         "reference executor: the production engine over a real MDBX writer, with a real checkpoint and peer checkpoint server"
       ],
       "controlled": [
-        "150 blocks of two transfers each, one block per 100 ms",
+        "150 blocks for the lapses and 70 blocks for the join, two transfers each, one block per 100 ms",
         "SIGSTOP and SIGCONT of the validator process; the test restarts an exited process as the supervisor",
         "driver client liveness timeout of 3 s; lapses of 1.5 s and 9 s",
         "one executor replica publishes the reference BAL and receipt frames",
-        "a checkpoint at block 40 on one peer"
+        "a checkpoint at block 20 on one peer; the join starts 10 blocks past it"
       ],
       "tests": [
         "a_short_lapse_keeps_the_same_process_verifying_past_its_count",

@@ -34,10 +34,16 @@ use chain::Chain;
 use feed::Feed;
 use node::{Node, Sample, Settings};
 
-/// The blocks of the chain. At the pace of the feed they span 15 s.
+/// The blocks of the lapse chain. At the pace of the feed they span 15 s:
+/// the long lapse and the restart fit before the chain ends.
 const BLOCKS: u64 = 150;
+/// The blocks of the join chain: the join needs no long lapse.
+const JOIN_BLOCKS: u64 = 70;
 /// The block after which the reference executor copies its checkpoint.
-const CHECKPOINT_BLOCK: u64 = 40;
+const CHECKPOINT_BLOCK: u64 = 20;
+/// The blocks the chain runs past the checkpoint before the join, so the
+/// joining validator replays a tail.
+const JOIN_TAIL: u64 = 10;
 /// The client liveness timeout of the driver: the bound between the two
 /// lapse paths.
 const LIVENESS: Duration = Duration::from_secs(3);
@@ -63,10 +69,12 @@ struct Rig {
     chain: Arc<Chain>,
     dir: tempfile::TempDir,
     started: Instant,
+    blocks: u64,
 }
 
 impl Rig {
-    fn start() -> Self {
+    /// A rig whose chain has `blocks` blocks.
+    fn start(blocks: u64) -> Self {
         let started = Instant::now();
         let dir = tempfile::Builder::new()
             .prefix("kardamom-validator-recovery-")
@@ -74,13 +82,14 @@ impl Rig {
             .unwrap();
         let root = dir.path().to_path_buf();
         let building =
-            std::thread::spawn(move || Arc::new(Chain::build(&root, BLOCKS, CHECKPOINT_BLOCK)));
+            std::thread::spawn(move || Arc::new(Chain::build(&root, blocks, CHECKPOINT_BLOCK)));
         let (feed, chain) = Feed::start(dir.path(), building, LIVENESS);
         Self {
             feed,
             chain,
             dir,
             started,
+            blocks,
         }
     }
 
@@ -105,7 +114,7 @@ impl Rig {
     /// publishes to a subscribed validator from the first block.
     fn first_node(&self, settings: &Settings) -> Node {
         let node = Node::start(settings, &self.path("validator.log"));
-        self.feed.run_to(BLOCKS);
+        self.feed.run_to(self.blocks);
         node
     }
 
@@ -127,7 +136,7 @@ impl Rig {
     /// root of the reference chain.
     fn assert_final_state(&self, node: &mut Node) {
         let last = node.await_sample("commit the last block", Duration::from_secs(40), |s| {
-            s.committed == BLOCKS
+            s.committed == self.blocks
         });
         assert_eq!(last.divergence, 0, "{last:?}");
         assert!(last.root_block > 0, "no state root observation: {last:?}");
@@ -136,7 +145,7 @@ impl Rig {
             .open()
             .unwrap();
         let snapshot = kardamom_state::StateSnapshot::open(&env).unwrap();
-        assert_eq!(snapshot.block_number(), BLOCKS);
+        assert_eq!(snapshot.block_number(), self.blocks);
         assert_eq!(
             snapshot.state_root().unwrap(),
             Some(self.chain.head_root),
@@ -163,7 +172,7 @@ fn require_line(node: &Node, needle: &str) {
 #[test]
 #[ignore = "requires Docker; run the validator-recovery component target"]
 fn a_short_lapse_keeps_the_same_process_verifying_past_its_count() {
-    let rig = Rig::start();
+    let rig = Rig::start(BLOCKS);
     let node = rig.first_node(&rig.settings(None));
     let warm = rig.warm(&node);
     node.freeze();
@@ -194,7 +203,7 @@ fn a_short_lapse_keeps_the_same_process_verifying_past_its_count() {
 #[test]
 #[ignore = "requires Docker; run the validator-recovery component target"]
 fn a_long_lapse_ends_the_process_and_the_restart_resumes_from_its_state() {
-    let rig = Rig::start();
+    let rig = Rig::start(BLOCKS);
     let settings = rig.settings(None);
     let mut node = rig.first_node(&settings);
     let warm = rig.warm(&node);
@@ -223,7 +232,7 @@ fn a_long_lapse_ends_the_process_and_the_restart_resumes_from_its_state() {
 #[test]
 #[ignore = "requires Docker; run the validator-recovery component target"]
 fn a_fresh_validator_adopts_the_peer_checkpoint_and_verifies_live() {
-    let rig = Rig::start();
+    let rig = Rig::start(JOIN_BLOCKS);
     let server = Peer::serve(&rig.chain.checkpoints);
     let staging = rig.path("validator-checkpoints");
     let settings = rig.settings(Some((staging.clone(), server.addr.to_string())));
@@ -231,7 +240,7 @@ fn a_fresh_validator_adopts_the_peer_checkpoint_and_verifies_live() {
     rig.warm(&node);
     // The chain runs past the checkpoint, so the join replays a tail.
     node.await_sample("chain past the checkpoint", Duration::from_secs(30), |s| {
-        s.committed >= rig.chain.checkpoint_block + WARM_BLOCK
+        s.committed >= rig.chain.checkpoint_block + JOIN_TAIL
     });
     node.kill();
     Peer::wipe(&settings.state_dir);
@@ -247,7 +256,7 @@ fn a_fresh_validator_adopts_the_peer_checkpoint_and_verifies_live() {
         &format!("restored_block={}", rig.chain.checkpoint_block),
     );
     assert!(
-        joined.verified <= BLOCKS - rig.chain.checkpoint_block,
+        joined.verified <= JOIN_BLOCKS - rig.chain.checkpoint_block,
         "the newborn re-verified blocks below the adopted checkpoint: {joined:?}"
     );
 }
