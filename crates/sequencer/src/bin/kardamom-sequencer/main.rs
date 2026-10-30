@@ -358,11 +358,10 @@ impl ResyncWiring {
         let task = feeds::AccountLookupFeed::new(
             rx,
             accounts_tx,
-            live,
-            redis,
-            query,
+            feeds::LookupSources { live, redis, query },
             shutdown.clone(),
             cfg.partition_index,
+            feeds::Retries::covering(cfg.tx_ttl()),
         )
         .spawn();
         (

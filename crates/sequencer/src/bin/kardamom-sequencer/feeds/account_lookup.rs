@@ -16,9 +16,10 @@
 //! A lookup asks again only when a source failed (an error or a timeout),
 //! so a source that returns can release parked work. A miss on every
 //! source is an answer: no source holds the account, and asking again
-//! changes nothing. The retries are bounded, and each attempt holds a
-//! permit only while it runs, so first attempts never wait behind
-//! retries.
+//! changes nothing. The retries end when a parked transaction of the
+//! sender expires. Each attempt holds a permit only while it runs: a retry
+//! holds no permit while it sleeps, so a sleeping retry never blocks a
+//! first attempt.
 //!
 //! Each attempt counts once in `nonce_lookups_total`, by the source that
 //! answered (`live`, `redis`, `ok` for an executor), `miss`, or `error`.
@@ -39,10 +40,28 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 /// The lookups that run at once.
 const IN_FLIGHT: usize = 64;
 const RETRY_AFTER: Duration = Duration::from_secs(2);
-/// The retries of one lookup after a failed first attempt. With
-/// `RETRY_AFTER` they cover the default lifetime of a parked transaction,
-/// 30 s.
-const RETRIES: usize = 15;
+
+/// The retries of one lookup after a failed first attempt. They cover the
+/// lifetime of a parked transaction: after it, no parked work waits for
+/// the answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Retries(usize);
+
+impl Retries {
+    /// The retries, `RETRY_AFTER` apart, that cover `park_ttl`, rounded up.
+    pub(crate) fn covering(park_ttl: Duration) -> Self {
+        let count = park_ttl.as_millis().div_ceil(RETRY_AFTER.as_millis());
+        // A count above `usize::MAX` retries until the feed stops.
+        Self(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+}
+
+/// The sources of a lookup, in the order of their cost.
+pub(crate) struct LookupSources {
+    pub(crate) live: Arc<LiveAccounts>,
+    pub(crate) redis: Option<Arc<CacheReader>>,
+    pub(crate) query: Option<ExecutorQuery>,
+}
 
 pub(crate) struct AccountLookupFeed {
     rx: tokio::sync::mpsc::Receiver<Address>,
@@ -54,13 +73,12 @@ pub(crate) struct AccountLookupFeed {
     limit: Arc<Semaphore>,
 }
 
-/// The three sources, in the order of their cost.
+/// The sources of the feed and what each lookup shares.
 struct Sources {
     /// The partition label of the metrics.
     partition: u32,
-    live: Arc<LiveAccounts>,
-    redis: Option<Arc<CacheReader>>,
-    query: Option<ExecutorQuery>,
+    from: LookupSources,
+    retries: Retries,
     /// One lookup, from the first source to the answer.
     latency: Step,
     retry_stop: Shutdown,
@@ -70,11 +88,10 @@ impl AccountLookupFeed {
     pub(crate) fn new(
         rx: tokio::sync::mpsc::Receiver<Address>,
         answers: crossbeam_channel::Sender<AccountEvent>,
-        live: Arc<LiveAccounts>,
-        redis: Option<Arc<CacheReader>>,
-        query: Option<ExecutorQuery>,
+        sources: LookupSources,
         shutdown: Shutdown,
         partition: u32,
+        retries: Retries,
     ) -> Self {
         let retry_stop = Shutdown::new();
         Self {
@@ -83,9 +100,8 @@ impl AccountLookupFeed {
             _retry_guard: retry_stop.guard(),
             sources: Arc::new(Sources {
                 partition,
-                live,
-                redis,
-                query,
+                from: sources,
+                retries,
                 latency: Step::new("sequencer.account_lookup"),
                 retry_stop,
             }),
@@ -172,7 +188,7 @@ impl Lookup {
         if self.attempt(permit).await.is_break() {
             return;
         }
-        for _ in 0..RETRIES {
+        for _ in 0..self.sources.retries.0 {
             if self.retry_once().await.is_break() {
                 return;
             }
@@ -230,17 +246,17 @@ impl Sources {
 
     /// The state of `address` from the first source that holds it.
     async fn state_of(&self, address: Address) -> Found {
-        if let Some(view) = self.live.get(address) {
+        if let Some(view) = self.from.live.get(address) {
             return Found::State("live", state_of_view(&view));
         }
-        let cached = match &self.redis {
+        let cached = match &self.from.redis {
             Some(redis) => redis.read_account(address).await,
             None => Ok(None),
         };
         if let Ok(Some(view)) = cached {
             return Found::State("redis", state_of_view(&view));
         }
-        if self.query.is_none() {
+        if self.from.query.is_none() {
             return cached.map_or(Found::Failed, |_| Found::Missing);
         }
         self.executor_state(address)
@@ -265,7 +281,7 @@ impl Sources {
     /// One pair of queries: whether both named one position, and the state
     /// at the older of the two.
     async fn executor_pair(&self, address: Address) -> Option<(bool, AccountState)> {
-        let query = self.query.as_ref()?;
+        let query = self.from.query.as_ref()?;
         let (nonce, balance) = tokio::join!(query.nonce(address), query.balance(address));
         let (nonce, balance) = (nonce.ok()?, balance.ok()?);
         let state = AccountState {

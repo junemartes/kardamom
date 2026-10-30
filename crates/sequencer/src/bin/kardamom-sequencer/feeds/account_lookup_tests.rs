@@ -41,7 +41,13 @@ impl Fixture {
         let (requests, rx) = tokio::sync::mpsc::channel(1);
         let (answers_tx, answers) = crossbeam_channel::unbounded();
         let shutdown = Shutdown::new();
-        let feed = AccountLookupFeed::new(rx, answers_tx, live, None, query, shutdown.clone(), 0);
+        let sources = LookupSources {
+            live,
+            redis: None,
+            query,
+        };
+        let retries = Retries::covering(Duration::from_secs(30));
+        let feed = AccountLookupFeed::new(rx, answers_tx, sources, shutdown.clone(), 0, retries);
         let limit = feed.limit.clone();
         Self {
             requests,
@@ -270,4 +276,12 @@ fn healthy_lookup_profile() {
         );
         fixture.stop().await;
     });
+}
+
+#[test]
+fn the_retries_cover_the_configured_park_lifetime() {
+    assert_eq!(Retries::covering(Duration::from_secs(30)), Retries(15));
+    assert_eq!(Retries::covering(Duration::from_secs(120)), Retries(60));
+    assert_eq!(Retries::covering(Duration::from_millis(2_001)), Retries(2));
+    assert_eq!(Retries::covering(Duration::ZERO), Retries(0));
 }
