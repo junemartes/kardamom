@@ -1,0 +1,61 @@
+---
+# Resume a saved cluster and deploy the workloads. `just container-save`
+# keeps the provisioned nodes as images and volumes, `just
+# container-restore` recreates the volumes, and terraform/containers
+# starts each node from its image (node_images). The nodes keep their
+# names and addresses, so Consul, Nomad and the registry start again from
+# their own state. This playbook prepares the host, waits until the
+# substrate answers, and then runs the ordinary deploy.
+- name: Read the node contract and prepare the host
+  ansible.builtin.import_playbook: container-nodes.yml
+
+- name: Wait for the agents of every restored node
+  hosts: container_nodes
+  become: false
+  gather_facts: false
+  tasks:
+    # The local agent answers its own records only after it joined the
+    # cluster, and the registry record only while the registry passes its
+    # check.
+    - name: Wait for the Consul resolver and the registry record
+      ansible.builtin.command:
+        argv: [getent, hosts, registry.service.consul]
+      register: resume_registry_name
+      changed_when: false
+      until: resume_registry_name.rc == 0
+      retries: 60
+      delay: 2
+
+- name: Wait for the scheduler of the restored cluster
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    resume_nomad_addr: "{{ lookup('env', 'NOMAD_ADDR') }}"
+  tasks:
+    - name: Wait until every node is a ready Nomad client
+      ansible.builtin.uri:
+        url: "{{ resume_nomad_addr }}/v1/nodes"
+      register: resume_nodes
+      until: >-
+        resume_nodes.json is defined
+        and resume_nodes.json | selectattr('Status', 'equalto', 'ready') | list | length
+            == groups['container_nodes'] | length
+      retries: 60
+      delay: 2
+
+    - name: Wait for the registry API on the control node
+      ansible.builtin.uri:
+        url: "http://{{ hostvars[groups['control'][0]].node_ip }}:{{ registry_port }}/v2/"
+      register: resume_registry
+      until: resume_registry.status == 200
+      retries: 30
+      delay: 2
+
+- name: Restore host multicast settings after Docker startup
+  ansible.builtin.import_playbook: container-host.yml
+
+- name: Deploy workloads
+  ansible.builtin.import_playbook: deploy.yml

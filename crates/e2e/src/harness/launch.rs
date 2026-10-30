@@ -225,6 +225,7 @@ impl<'a> StackLaunch<'a> {
                 && self.cfg.carry.is_none()
                 && std::env::var("KARDAMOM_E2E_VERDICTS").is_ok_and(|v| v == "1"),
             exec_frames: self.cfg.carry.is_some(),
+            checkpoints: self.cfg.read_path,
         }
     }
 
@@ -416,6 +417,7 @@ impl LocalStack {
                 carry_egress: genesis_egress.as_deref(),
             },
         )?;
+        let read_path = super::read_path::ReadPath::start_if(cfg.read_path, &spec)?;
         let wirings = stack_launch.build_l1_wiring(l1.as_ref()).await?;
         let validator = stack_launch.spawn_validator(
             &spec,
@@ -446,20 +448,24 @@ impl LocalStack {
         let stack = Self {
             notifier,
             ingress,
+            extra_ingresses: Vec::new(),
             da_watcher,
             l1_follower,
             verified_l1: wirings.verified_l1,
             batcher,
             egress,
+            read_path,
             executor,
             validator,
             sequencers,
+            sequencer_twins: Vec::new(),
             sealer,
             driver,
             _load_sampler: load_sampler,
             l1,
             genesis,
             log_config,
+            follower_l1: wirings.da_watcher,
             validator_l1: wirings.validator,
             executor_query_port,
             root,

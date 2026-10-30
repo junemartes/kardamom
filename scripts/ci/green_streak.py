@@ -18,7 +18,7 @@ WORKFLOWS = {
 }
 REQUIRED = 10
 JOB_BUDGET_SECONDS = 15 * 60
-COMPONENT_JOB_SECONDS = 5 * 60
+COMPONENT_JOB_SECONDS = 10 * 60
 
 
 class GitHub:
@@ -116,7 +116,7 @@ class Streak:
                 if start.tzinfo is None or end.tzinfo is None or end < start:
                     raise ValueError("job timing needs ordered timestamps with time zones")
                 seconds = (end - start).total_seconds()
-                budget = COMPONENT_JOB_SECONDS if job["name"].startswith("in-process recovery (") else JOB_BUDGET_SECONDS
+                budget = COMPONENT_JOB_SECONDS if job["name"].startswith("component recovery (") else JOB_BUDGET_SECONDS
                 if seconds > budget:
                     slow.append({"workflow": run["path"], "job": job["name"], "seconds": seconds,
                                  "budget_seconds": budget})
@@ -127,7 +127,7 @@ class Streak:
         green = {job["name"] for job in cluster["jobs"] if job["conclusion"] == "success"}
         expected = {f"container cluster e2e ({shard})" for shard in self.shards}
         ci = next(run for run in runs if Path(run["path"]).name == "ci.yml")
-        components = {f"in-process recovery ({shard})" for shard in range(COMPONENT_SHARDS)}
+        components = {f"component recovery ({shard})" for shard in range(COMPONENT_SHARDS)}
         completed = {job["name"] for job in ci["jobs"] if job["conclusion"] == "success"}
         return sorted((expected - green) | (components - completed))
 

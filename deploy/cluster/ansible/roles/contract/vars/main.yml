@@ -14,10 +14,14 @@ contract_mirrors:
       - site.yml
   - path: deploy/cluster/ansible/containers.yml
     required:
+      - container-nodes.yml
       - bootstrap.yml
-      - node-contract.json
     forbidden:
       - site.yml
+  - path: deploy/cluster/ansible/container-nodes.yml
+    required:
+      - node-contract.json
+    forbidden: []
   - path: deploy/cluster/ansible/roles/nomad/templates/nomad.hcl.j2
     required:
       - server_auto_join

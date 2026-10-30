@@ -180,6 +180,24 @@ fn two_publishers_of_one_key_restart_only_when_one_seq_goes_down() {
 }
 
 #[test]
+fn records_that_share_a_session_log_one_restart_per_window() {
+    // Two processes publish one key on one shared session, each with its
+    // own counter: every record of the slower counter reads as a restart.
+    let flood = |board: &mut Board, now: Instant| {
+        (0..100).for_each(|i| {
+            board.observe(from(1, SEALER, 1000 + i), now);
+            board.observe(from(1, SEALER, 50 + i), now);
+        });
+    };
+    assert_eq!(restarts_in(flood), 1, "one log in the window");
+    let later = |board: &mut Board, now: Instant| {
+        flood(board, now);
+        flood(board, now + super::RESTART_LOG_EVERY);
+    };
+    assert_eq!(restarts_in(later), 2, "one more log after the window");
+}
+
+#[test]
 fn a_self_reporting_service_restarts_as_a_new_publisher() {
     let restart = |board: &mut Board, now| {
         board.observe(from(1, EXECUTOR, 9), now);

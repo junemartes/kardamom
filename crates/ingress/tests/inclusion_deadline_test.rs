@@ -59,3 +59,47 @@ async fn the_deadline_follows_the_sealed_head_without_executor_boundaries() {
         "the sealed head moves the deadline with no executor boundary"
     );
 }
+
+/// The executor head lags the sealer by more than the horizon, as after a
+/// pipeline restart while the executor catches up. Every new submit still
+/// gets a deadline past the sealer's own block: the sealed head of the
+/// sealer's status, not the executor head, is the base.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lagging_executor_head_does_not_age_the_deadline_of_a_new_submit() {
+    let cfg = IngressConfig {
+        partition_count_m: NonZeroU32::MIN,
+        pending_receipt_timeout: Duration::from_secs(30),
+        ..IngressConfig::default()
+    };
+    let horizon = cfg.inclusion_horizon_blocks.get();
+    let (mock, mut rx) = MockChannels::new(NonZeroUsize::MIN);
+    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
+    let executor_head = 10;
+    mock.send_boundary(kardamom_types::BlockBoundary {
+        block_number: executor_head,
+        ..kardamom_types::BlockBoundary::default()
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while proxy.latest_block_number() != executor_head {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the proxy takes the executor boundary");
+    for sealer_head in [executor_head + 3 * horizon, executor_head + 5 * horizon] {
+        mock.cluster_status_bus.send_replace(ClusterStatus {
+            sealed_head: sealer_head,
+            ..ClusterStatus::default()
+        });
+        let deadline = stamped_deadline(&proxy, &mut rx[0]).await;
+        assert_eq!(
+            deadline,
+            sealer_head + horizon,
+            "the executor head {executor_head} lags the sealer head {sealer_head}; the deadline must follow the sealer"
+        );
+        assert!(
+            deadline > sealer_head,
+            "the sealer would refuse a deadline at or below its block"
+        );
+    }
+}
