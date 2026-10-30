@@ -2920,6 +2920,24 @@ class CarryTest(Deploys):
         self.assertIn("genesisFeatures ['3,4,5', 'missing', '3,4,5']", output)
         self.assertEqual(self.api.state['writes'][-3:], ['bootstrap-open', 'cluster', 'bootstrap-close'])
 
+    def test_the_waves_close_the_bootstrap_when_the_members_answer(self):
+        """In the waves of a new cluster, the bootstrap closes when every
+        new member answers, before the next job registers, and the genesis
+        check still runs there."""
+        self.genesis_members()
+        output = self.run_deploy(self.BOOTSTRAP, environ=self.GENESIS | {'KARDAMOM_DEPLOY_WAVES': '1'})
+        writes = self.api.state['writes']
+        cluster = writes.index('cluster')
+        self.assertEqual(writes[cluster - 1:cluster + 2], ['bootstrap-open', 'cluster', 'bootstrap-close'])
+        self.assertIn('Refuse a new sealer member without the genesis rules', output)
+
+    def test_the_waves_stop_at_a_member_without_the_genesis_rules(self):
+        self.genesis_members()
+        self.api.state['status']['node-cluster-1'] = {'carryWindow': False}
+        output = self.run_deploy(self.BOOTSTRAP, success=False, environ=self.GENESIS | {'KARDAMOM_DEPLOY_WAVES': '1'})
+        self.assertIn('the new sealer members do not all report the genesis rules', output)
+        self.assertEqual(self.api.state['writes'][-3:], ['bootstrap-open', 'cluster', 'bootstrap-close'])
+
     def test_the_genesis_carry_is_refused_on_a_chain_that_did_not_start_with_it(self):
         self.deploy()
         no_new_chain = 'and the deploy starts no new chain'

@@ -1,13 +1,15 @@
 ---
 # The end of a wave of a new cluster: wait for each job whose wait the
-# wave deferred, then start the next wave with an empty list. The jobs of
-# the wave already run together, so each wait is short after the first.
+# wave deferred, then drop those jobs from the list. workloads_wave_jobs
+# limits the wave to those jobs; the other deferred jobs wait for a later
+# wave. The jobs of a wave already run together, so each wait is short
+# after the first.
 - name: Wait for the jobs of the wave
   ansible.builtin.include_tasks: wait.yml
-  loop: "{{ workloads_deferred }}"
+  loop: "{{ workloads_deferred | select('in', workloads_wave_jobs | default(workloads_deferred)) | list }}"
   loop_control:
     loop_var: workloads_wait_job
 
 - name: Start the next wave
   ansible.builtin.set_fact:
-    workloads_deferred: []
+    workloads_deferred: "{{ workloads_deferred | reject('in', workloads_wave_jobs | default(workloads_deferred)) | list }}"

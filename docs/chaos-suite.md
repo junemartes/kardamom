@@ -34,7 +34,11 @@ CI builds and provisions the cluster once per run. Each shard then deploys the w
    - `tofu apply` starts each node of generation 0 from its saved image (the `node_images` variable). The nodes keep their names and addresses.
    - `ansible/resume.yml` prepares the host network, waits until Consul, Nomad and the registry answer on every node, and runs `ansible/deploy.yml`.
 - A replaced node (generation above 0) starts from the plain node image with empty volumes, as a new machine does.
-- The bring-up sets `KARDAMOM_DEPLOY_WAVES=1`. On a cluster without jobs and without a deploy record, the deploy starts the jobs of one wave together and waits for them at the end of the wave. It mirrors the deploy record at the end, not after each registration. A deploy over a running cluster waits for each job before the next one.
+- The bring-up sets `KARDAMOM_DEPLOY_WAVES=1`. On a cluster without jobs and without a deploy record, the deploy starts the jobs of one wave together and waits for them at the end of the wave. It mirrors the deploy record at the end, not after each registration. A deploy over a running cluster waits for each job before the next one. The waves are:
+  - anvil and the sealer. The bootstrap closes and the genesis check runs when every new member answers its admin status. The deployment of the sealer ends in the next wave.
+  - the pipeline, the followers, the DA layer and the L1 follower, with the sealer deployment.
+  - the batcher and the sequencers, then the canary.
+- The prepare job sets `NOMAD_HEARTBEAT_GRACE=30s`, so the saved nodes carry the chaos value of the Nomad heartbeat grace.
 - The shard step sets `ANSIBLE_STRATEGY=mitogen_linear`. The playbooks and their tasks are the same; Mitogen runs the modules in kept Python processes.
 - Without `KARDAMOM_PREPARED_CLUSTER`, the bring-up runs `ansible/cluster.yml` on new nodes, as `just container-up` does.
 
