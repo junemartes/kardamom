@@ -64,6 +64,8 @@ pub(crate) struct DriverWait {
 struct Progress {
     started: Instant,
     logged: Instant,
+    /// Why the last probe found no active driver.
+    last: String,
 }
 
 impl DriverWait {
@@ -103,6 +105,7 @@ impl DriverWait {
         let mut progress = Progress {
             started: now,
             logged: now,
+            last: String::new(),
         };
         std::iter::repeat_with(|| self.probe(&mut progress))
             .find_map(std::convert::identity)
@@ -113,16 +116,19 @@ impl DriverWait {
     /// passed.
     fn probe(&self, progress: &mut Progress) -> Option<Result<(), LogError>> {
         let waited = progress.started.elapsed();
-        if self.active() {
-            if waited >= PROBE_EVERY {
-                info!(dir = ?self.dir, waited_ms = waited.as_millis(), "media driver is active");
+        match self.active() {
+            Ok(()) => {
+                if waited >= PROBE_EVERY {
+                    info!(dir = ?self.dir, waited_ms = waited.as_millis(), "media driver is active");
+                }
+                return Some(Ok(()));
             }
-            return Some(Ok(()));
+            Err(why) => progress.last = why,
         }
         if waited >= self.limit {
             return Some(Err(LogError::Aeron(format!(
-                "no active media driver at {:?} within {:?}",
-                self.dir, self.limit
+                "no active media driver at {:?} within {:?}: {}",
+                self.dir, self.limit, progress.last
             ))));
         }
         if progress.logged.elapsed() >= LOG_EVERY || waited.is_zero() {
@@ -130,6 +136,7 @@ impl DriverWait {
                 dir = ?self.dir,
                 waited_s = waited.as_secs(),
                 limit_s = self.limit.as_secs(),
+                last = %progress.last,
                 "waiting for the media driver to start"
             );
             progress.logged = Instant::now();
@@ -140,24 +147,35 @@ impl DriverWait {
 
     /// Whether a driver uses the directory: its `CnC` file maps with a
     /// version the client reads, and the driver's heartbeat on its command
-    /// buffer is younger than the driver timeout.
-    fn active(&self) -> bool {
+    /// buffer is younger than the driver timeout. The error says why not:
+    /// the Aeron error of the map, or the age of the heartbeat.
+    fn active(&self) -> Result<(), String> {
         use rusteron_client::bindings::{
             aeron_cnc_close, aeron_cnc_init, aeron_cnc_t, aeron_cnc_to_driver_heartbeat,
+            aeron_errmsg,
         };
         let mut cnc: *mut aeron_cnc_t = std::ptr::null_mut();
         // SAFETY: `dir` is a valid C string and `cnc` a valid out pointer.
         // A timeout of 0 makes the call return at once. On success the
         // call owns a mapping that `aeron_cnc_close` releases below.
         if unsafe { aeron_cnc_init(&raw mut cnc, self.dir.as_ptr(), 0) } != 0 {
-            return false;
+            // SAFETY: `aeron_errmsg` returns the error text of this thread,
+            // a NUL-terminated string that lives until the next Aeron call
+            // of this thread; it is copied at once.
+            let message = unsafe { std::ffi::CStr::from_ptr(aeron_errmsg()) };
+            return Err(message.to_string_lossy().trim().replace('\n', "; "));
         }
         // SAFETY: `cnc` is the mapping that the successful init gave, and
         // nothing else holds it. It is read once, then closed once.
         let heartbeat_ms = unsafe { aeron_cnc_to_driver_heartbeat(cnc) };
         // SAFETY: as above; `cnc` is not used after the close.
         unsafe { aeron_cnc_close(cnc) };
-        Self::now_ms().saturating_sub(heartbeat_ms) < self.timeout_ms
+        let age_ms = Self::now_ms().saturating_sub(heartbeat_ms);
+        if age_ms < self.timeout_ms {
+            Ok(())
+        } else {
+            Err(format!("the driver heartbeat is {age_ms} ms old"))
+        }
     }
 
     /// The wall clock in ms since the epoch, the clock of the heartbeat.
@@ -194,6 +212,10 @@ mod tests {
         let started = Instant::now();
         let error = wait.wait().unwrap_err().to_string();
         assert!(error.contains("no active media driver"), "{error}");
+        let (_, last) = error
+            .split_once("within 300ms: ")
+            .expect("the last probe error follows");
+        assert!(!last.is_empty(), "{error}");
         assert!(started.elapsed() >= Duration::from_millis(300));
     }
 }

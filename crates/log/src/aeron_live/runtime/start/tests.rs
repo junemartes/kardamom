@@ -26,8 +26,8 @@ fn a_failed_context_build_fails_the_spawn() {
 
 /// With no media driver, the start waits for an active driver for its
 /// driver wait, and then fails with that error, not with a start timeout
-/// of the runtime. A driver timeout above the context budget makes the
-/// wait two budgets of 16 s each.
+/// of the runtime. The wait is two budgets: the 10 s floor of a budget
+/// for a 1 s driver timeout, so 20 s, past the context budget.
 #[test]
 fn the_spawn_waits_out_a_driver_timeout_above_ten_seconds() {
     let dir = tempfile::tempdir().unwrap();
@@ -37,7 +37,7 @@ fn the_spawn_waits_out_a_driver_timeout_above_ten_seconds() {
         let ctx = AeronContext::new().map_err(|e| LogError::Aeron(e.to_string()))?;
         ctx.set_dir(dir_c.as_c_str())
             .map_err(|e| LogError::Aeron(e.to_string()))?;
-        ctx.set_driver_timeout_ms(11_000)
+        ctx.set_driver_timeout_ms(1_000)
             .map_err(|e| LogError::Aeron(e.to_string()))?;
         Ok(ctx)
     }) else {
@@ -45,5 +45,6 @@ fn the_spawn_waits_out_a_driver_timeout_above_ten_seconds() {
     };
     let msg = e.to_string();
     assert!(msg.starts_with("aeron: no active media driver"), "{msg}");
-    assert!(begin.elapsed() >= Duration::from_secs(32), "{msg}");
+    assert!(begin.elapsed() >= Duration::from_secs(20), "{msg}");
+    assert!(begin.elapsed() > CONTEXT_BUDGET, "{msg}");
 }
