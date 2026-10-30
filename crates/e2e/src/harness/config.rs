@@ -95,6 +95,9 @@ pub struct StackConfig {
     /// transaction before the sealer, so the sequencers keep the v1 loop
     /// under `KARDAMOM_E2E_ADMISSION=1`.
     pub unpayable_spends: bool,
+    /// The sequencers run the v2 admission loop, as the deployed cluster
+    /// does, also without `KARDAMOM_E2E_ADMISSION=1`.
+    pub admission: bool,
     /// The scenario reads the local account layer of the ingress, which
     /// only the full receipt stream fills. The ingress keeps `tx_receipts`
     /// under `KARDAMOM_E2E_VERDICTS=1`.
@@ -214,6 +217,7 @@ impl Default for StackConfig {
             canary_genesis: false,
             notifier: false,
             unpayable_spends: false,
+            admission: false,
             ingress_rows: false,
             carry: None,
         }

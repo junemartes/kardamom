@@ -1647,6 +1647,48 @@
       ],
       "ci_mode": "stack"
     },
+    "sequencer-lapse-stack": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "e2e",
+        "--features",
+        "full-pipeline-e2e",
+        "--test",
+        "sequencer_lapse",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "kardamom-sequencer processes on the v2 loop: the case lane's replica and its twin",
+        "kardamom-ingress pair, kardamom-executor and kardamom-validator processes",
+        "Java sealer member and the host-native ArchivingMediaDriver with its client liveness",
+        "SIGSTOP and SIGCONT of the replica process, its Aeron fail-fast exit and its cold start"
+      ],
+      "controlled": [
+        "a 14-second freeze past the 10-second client liveness of the local driver",
+        "a case load of 1-wei transfers through ingress 0, and the recovery probe of the case sender and a fresh sender"
+      ],
+      "tests": [
+        "a_frozen_sequencer_exits_on_the_client_timeout_and_returns_cold_with_fresh_work"
+      ],
+      "limitation": "Stack suite: every service shares one host and one media driver. Nomad restarts the process in the deployment; here the test starts it after the exit.",
+      "negative_controls": [
+        {
+          "mutation": "The Aeron fail-fast handler logs the client error and does not exit, so the thawed replica keeps a dead client.",
+          "tests": [
+            "a_frozen_sequencer_exits_on_the_client_timeout_and_returns_cold_with_fresh_work"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        }
+      ],
+      "ci_mode": "stack"
+    },
     "pipeline-combined": {
       "command": [
         "cargo",
@@ -1980,6 +2022,10 @@
       "status": "ported",
       "local_tests": [
         {
+          "suite": "pipeline-recovery",
+          "test": "graceful_sequencer_drains_and_a_cold_start_regains_its_senders"
+        },
+        {
           "suite": "sequencer",
           "test": "shutdown_completes_while_output_is_disconnected"
         },
@@ -2035,11 +2081,14 @@
         {
           "suite": "sequencer",
           "test": "a_lapsed_replica_publishes_fresh_work_after_thaw_while_its_twin_ordered"
+        },
+        {
+          "suite": "sequencer-lapse-stack",
+          "test": "a_frozen_sequencer_exits_on_the_client_timeout_and_returns_cold_with_fresh_work"
         }
       ],
       "full_case_locally_validated": true,
       "cluster_only_checks": [
-        "SIGSTOP of the container past the Aeron client liveness, then the Nomad restart of the newborn process: process supervision exists only in the deployment; the newborn path is the cold restart of hard-sequencer",
         "the count of PAST-DEADLINE lines in the sealer logs: the case only reports it, from the deployed Java sealer"
       ]
     },

@@ -256,8 +256,16 @@ impl LocalStack {
                     .with_context(|| format!("no sequencer {i}"))
             })
             .transpose()?;
+        // A second replica reads the tx_data lane of its partition. The
+        // lane otherwise follows the sequencer id, which is the process
+        // index, and the twin would read an idle lane.
+        let lane = partition
+            .map(u8::try_from)
+            .transpose()
+            .context("the lane of a second replica")?;
         Ok(SequencerOptions {
             partition,
+            lane,
             ..SequencerOptions::default()
         })
     }
