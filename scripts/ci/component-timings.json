@@ -287,5 +287,8 @@
   "state-writer-crash::process_loss_after_commit_preserves_a_block_without_a_published_snapshot": 0.032,
   "state-writer-crash::process_loss_before_commit_discards_the_entire_uncommitted_block": 0.016,
   "transport-mds-remove::removing_receive_destinations_keeps_the_live_images_and_logs_no_driver_error": 21.499,
-  "transport-pressure::unavailable_outputs_preserve_live_delivery_and_recover": 11.539
+  "transport-pressure::unavailable_outputs_preserve_live_delivery_and_recover": 11.539,
+  "validator-recovery::a_fresh_validator_adopts_the_peer_checkpoint_and_verifies_live": 37.0,
+  "validator-recovery::a_long_lapse_ends_the_process_and_the_restart_resumes_from_its_state": 24.0,
+  "validator-recovery::a_short_lapse_keeps_the_same_process_verifying_past_its_count": 21.0
 }
