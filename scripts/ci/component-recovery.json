@@ -718,7 +718,8 @@
           "failed_as_expected": true
         }
       },
-      "limitation": "The partial-scan target forces rebuilding; state-mirror-coverage-gap separately proves automatic recovery from a persisted incomplete-rebuild marker. No Sentinel promotion, process kill, disk failure or packet-loss proof."
+      "limitation": "The partial-scan target forces rebuilding; state-mirror-coverage-gap separately proves automatic recovery from a persisted incomplete-rebuild marker. No Sentinel promotion, process kill, disk failure or packet-loss proof.",
+      "ci_mode": "docker"
     },
     "state-mirror-coverage-gap": {
       "command": [
@@ -746,7 +747,8 @@
         "automatic_restart_must_restore_coverage_despite_another_live_head",
         "persisted_progress_cannot_hide_an_interrupted_rebuild"
       ],
-      "limitation": "Proves automatic recovery of this mirror after interrupted rebuilding, with or without a persisted head. No claim of shared bucket certification, cache failover durability, or recovery after loss of the mirror data directory."
+      "limitation": "Proves automatic recovery of this mirror after interrupted rebuilding, with or without a persisted head. No claim of shared bucket certification, cache failover durability, or recovery after loss of the mirror data directory.",
+      "ci_mode": "docker"
     },
     "checkpoint-copy": {
       "command": [
@@ -777,7 +779,8 @@
         "missing_files_and_mixed_archive_errors_fail_the_copy"
       ],
       "limitation": "Proves the harness can verify a checkpoint on the fault volume. It does not prove executor progress during ENOSPC, disk/power-loss durability, or pruning races. The container starts only a bounded sleep process, not chain services.",
-      "negative_control": "The Docker fixture asserts that the old docker cp path fails on the same tmpfs whose exec/tar copy verifies successfully."
+      "negative_control": "The Docker fixture asserts that the old docker cp path fails on the same tmpfs whose exec/tar copy verifies successfully.",
+      "ci_mode": "docker"
     },
     "sealer-actor": {
       "command": [
@@ -863,7 +866,8 @@
             "io.kardamom.sealer.cluster.SealerSeedServiceTest::each_term_offers_the_seed_record_until_one_confirms_it()"
           ]
         }
-      ]
+      ],
+      "ci_mode": "gradle"
     },
     "sealer-raft": {
       "command": [
@@ -910,7 +914,8 @@
         "client reconnect and small replay retention",
         "carry-version activation with duplicate references"
       ],
-      "limitation": "The actor suite mocks consensus. The Raft suite uses real in-JVM members but does not prove OS process loss, network partitions, deployment or disk power-loss durability."
+      "limitation": "The actor suite mocks consensus. The Raft suite uses real in-JVM members but does not prove OS process loss, network partitions, deployment or disk power-loss durability.",
+      "ci_mode": "gradle"
     },
     "cache-sentinel": {
       "command": [
@@ -959,7 +964,8 @@
           "failed_at_recovery": true,
           "compiled": true
         }
-      ]
+      ],
+      "ci_mode": "docker"
     },
     "state-writer-crash": {
       "command": [
@@ -1062,7 +1068,8 @@
           "failed_assertion": "storage written in block 2, slot 0, after block 5"
         }
       ],
-      "limitation": "Linux Docker only. Runs the real test binary with its host shared libraries mounted read-only, without network or added capabilities. Proves auxiliary-volume ENOSPC, same-writer progress, no partial checkpoint publication and restored state after the log resumes. Does not prove state-volume ENOSPC, EIO, power loss, checkpointer scheduling, transaction/receipt end-to-end progress, Nomad mounts or deployment recovery."
+      "limitation": "Linux Docker only. Runs the real test binary with its host shared libraries mounted read-only, without network or added capabilities. Proves auxiliary-volume ENOSPC, same-writer progress, no partial checkpoint publication and restored state after the log resumes. Does not prove state-volume ENOSPC, EIO, power loss, checkpointer scheduling, transaction/receipt end-to-end progress, Nomad mounts or deployment recovery.",
+      "ci_mode": "docker"
     },
     "state-enospc": {
       "command": [
@@ -1106,7 +1113,8 @@
           "compiled": true,
           "bad_txn_panic": true
         }
-      ]
+      ],
+      "ci_mode": "docker"
     },
     "chaos-election": {
       "command": [
@@ -1189,7 +1197,8 @@
           "compiled": true,
           "kernel_probe_failed": true
         }
-      ]
+      ],
+      "ci_mode": "docker"
     },
     "chaos-alert": {
       "command": [
@@ -1274,7 +1283,8 @@
           "compiled": true,
           "starvation_observed": true
         }
-      ]
+      ],
+      "ci_mode": "docker"
     },
     "chaos-cache-baseline": {
       "command": [
@@ -1372,7 +1382,8 @@
         "hidden_mined_receipts_reconcile_without_duplicate_posts_or_early_cursor",
         "restart_during_hidden_receipts_uses_contract_truth_without_waiting_for_the_indexer"
       ],
-      "limitation": "No full follower fleet, Prometheus alert, Nomad restart, consensus retention or EigenDA proof. These tests cover null receipt reconciliation and restart, not expiry of the 120-second receipt deadline. Alloy timeout bookkeeping includes the wall clock, so Tokio virtual time alone cannot prove that deadline. The existing local DA helper serves until the test process exits. Payloads contain empty boundary blocks; transaction execution and full-chain transfer progress are outside this fixture."
+      "limitation": "No full follower fleet, Prometheus alert, Nomad restart, consensus retention or EigenDA proof. These tests cover null receipt reconciliation and restart, not expiry of the 120-second receipt deadline. Alloy timeout bookkeeping includes the wall clock, so Tokio virtual time alone cannot prove that deadline. The existing local DA helper serves until the test process exits. Payloads contain empty boundary blocks; transaction execution and full-chain transfer progress are outside this fixture.",
+      "ci_mode": "docker"
     },
     "batcher-post-age": {
       "command": [
@@ -1598,7 +1609,8 @@
         "a_corrupt_recording_is_detected_repaired_and_replayed_exactly",
         "a_wiped_archive_restores_its_catalog_and_replays_the_exact_recording"
       ],
-      "limitation": "One recording and a saved backup, not two independent peer recordings. Wall-clock Docker, Java and Aeron timing remains real. No distributed tar/catalog transfer, Nomad drain/placement, repair CLI wiring, live-ingress admission, executor progress, multi-segment boundary or distributed load coverage."
+      "limitation": "One recording and a saved backup, not two independent peer recordings. Wall-clock Docker, Java and Aeron timing remains real. No distributed tar/catalog transfer, Nomad drain/placement, repair CLI wiring, live-ingress admission, executor progress, multi-segment boundary or distributed load coverage.",
+      "ci_mode": "docker"
     },
     "chaos-cache-readers": {
       "command": [
