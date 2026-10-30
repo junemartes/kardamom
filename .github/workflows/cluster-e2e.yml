@@ -90,7 +90,9 @@ jobs:
       - name: Pick the shards
         id: shards
         run: |
-          shards='["load","semantics","chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-combined-ordering","chaos-combined-exec","chaos-retention","chaos-cache","chaos-l1","chaos-follower","chaos-carry","chaos-integrity"]'
+          regular='"load","semantics"'
+          nightly='"chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-combined-ordering","chaos-combined-exec","chaos-retention","chaos-cache","chaos-l1","chaos-follower","chaos-carry","chaos-integrity"'
+          shards="[$regular,$nightly]"
           echo "shards=$shards" >> "$GITHUB_OUTPUT"
           echo "shards: $shards"
 
