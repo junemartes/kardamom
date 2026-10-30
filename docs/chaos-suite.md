@@ -107,11 +107,21 @@ The CI jobs:
 
 Each test runs in its own process with a 60-second deadline. A suite can raise
 its deadline to at most 120 seconds with `test_timeout_s`; it then also states
-the reason in `test_timeout_reason`. The plan checks that every shard fits its
-deadline when its slowest-limit test runs to its limit. A shard has a six-minute
-execution deadline in a ten-minute job. The target worst case is about five minutes
-per shard. Add a shard when the plan goes over it; do not raise the deadline.
-After each docker test, the shard removes the containers that the test left.
+the reason in `test_timeout_reason`. A shard has a six-minute execution deadline
+in a ten-minute job. The worst case of a shard is its estimate when its
+slowest-limit test runs to its limit. `just component-catalog` prints the plan and
+fails when a worst case is over the deadline. The `style` job runs it. The target
+worst case is about five minutes per shard. Add a shard when the plan goes over it;
+do not raise the deadline.
+
+A killed test runs no Drop, so its containers and networks stay. After each docker
+or stack test, the shard removes the containers that the test left, then the
+networks of the test. Each such test gets a unique owner in `KARDAMOM_DOCKER_OWNER`.
+A fixture that creates a Docker network must put that value in the network name.
+The shard removes the networks whose name carries the owner, so it never removes
+the network of another run. `scripts/test-components.py` removes the networks in
+the same way, but not the containers.
+
 Missing tests, skipped tests, timeouts and mismatched artifact hashes fail the run.
 Each shard prints a timing table and uploads its logs.
 

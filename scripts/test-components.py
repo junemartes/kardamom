@@ -9,12 +9,15 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG = ROOT / "scripts/ci/component-recovery.json"
+sys.path.insert(0, str(ROOT / "scripts/ci"))
+from component_tests import CONTAINER_MODES, OWNER_VARIABLE, Docker
 
 
 class Run:
@@ -31,10 +34,12 @@ class Run:
         started = time.monotonic()
         print(f"{name}: {' '.join(suite['command'])}", flush=True)
         timed_out = False
+        # Only the network of a killed test stays: a local run shares the host, so it removes no containers.
+        owner = Docker.owner() if suite.get("ci_mode") in CONTAINER_MODES else None
+        environment = dict(os.environ, CARGO_TERM_COLOR="never") | ({OWNER_VARIABLE: owner} if owner else {})
         with log.open("w") as output:
             process = subprocess.Popen(suite["command"], cwd=ROOT, stdout=output,
-                                       stderr=subprocess.STDOUT, start_new_session=True,
-                                       env=dict(os.environ, CARGO_TERM_COLOR="never"))
+                                       stderr=subprocess.STDOUT, start_new_session=True, env=environment)
             try:
                 code = process.wait(timeout=600)
             except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
@@ -43,6 +48,9 @@ class Run:
                 if isinstance(error, KeyboardInterrupt):
                     raise
                 timed_out = True
+            finally:
+                if owner:
+                    Docker.remove_networks(owner)
         text = log.read_text()
         passed = re.findall(r"^test ([\w:]+) \.\.\. ok$", text, re.MULTILINE)
         failed = re.findall(r"^test ([\w:]+) \.\.\. FAILED$", text, re.MULTILINE)

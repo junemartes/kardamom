@@ -248,6 +248,48 @@ class ComponentTests(unittest.TestCase):
             self.assertEqual(component.Docker.remove_new(before), 1)
         self.assertEqual(run.call_args.args[0], ["docker", "rm", "-f", "-v", "new"])
 
+    def test_a_killed_docker_test_leaves_no_network(self):
+        with patch.object(component.subprocess, "check_output", return_value="n1\nn2\n") as listing, \
+                patch.object(component.subprocess, "run") as run:
+            self.assertEqual(component.Docker.remove_networks("kardamom-test-1"), 2)
+        self.assertEqual(listing.call_args.args[0][-2:], ["--filter", "name=kardamom-test-1"])
+        self.assertEqual(run.call_args.args[0], ["docker", "network", "rm", "n1", "n2"])
+
+    def test_the_containers_go_before_their_networks(self):
+        calls = []
+        with patch.object(component.Docker, "remove_new", side_effect=lambda before: calls.append("containers")), \
+                patch.object(component.Docker, "remove_networks", side_effect=lambda owner: calls.append("networks")):
+            component.Docker.clean(set(), "kardamom-test-1")
+        self.assertEqual(calls, ["containers", "networks"])
+
+    def test_ctrl_c_still_removes_what_a_docker_test_left(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(component.Shard, "execute", side_effect=KeyboardInterrupt) as execute, \
+                patch.object(component.Bundle, "command", return_value=(["x"], {})), \
+                patch.object(component.Docker, "containers", return_value={"old"}), \
+                patch.object(component.Docker, "owner", return_value="kardamom-test-1"), \
+                patch.object(component.Docker, "clean", return_value=(0, 0)) as clean:
+            shard = component.Shard(component.Bundle(Path(directory)), None, Path(directory))
+            with self.assertRaises(KeyboardInterrupt):
+                shard.run_test(0, {"suite": "s", "test": "t", "mode": "docker"}, 600)
+        self.assertEqual(execute.call_args.args[3], {component.OWNER_VARIABLE: "kardamom-test-1"})
+        clean.assert_called_once_with({"old"}, "kardamom-test-1")
+
+    def test_every_fixture_network_carries_the_runner_owner(self):
+        sources = [path for path in (component.ROOT / "crates").rglob("*.rs")
+                   if ".with_network(" in path.read_text(errors="replace")]
+        self.assertTrue(sources)
+        for path in sources:
+            with self.subTest(path=str(path.relative_to(component.ROOT))):
+                self.assertIn(component.OWNER_VARIABLE, path.read_text())
+
+    def test_the_plan_fails_when_a_shard_can_pass_its_deadline(self):
+        catalog = {"local_suites": {"wide": {"ci_mode": "docker", "test_timeout_s": 120,
+                                             "tests": [f"w{i}" for i in range(4 * component.SHARDS)]}}}
+        plan = component.Plan(catalog, {f"wide::w{i}": 100.0 for i in range(4 * component.SHARDS)})
+        self.assertEqual(plan.over(), list(range(component.SHARDS)))
+        self.assertEqual(component.Plan.load().over(), [])
+
     def test_timings_keep_only_catalogued_tests(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
