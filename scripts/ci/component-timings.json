@@ -19,7 +19,7 @@
   "cache-sentinel-total-loss::a_total_loss_returns_an_empty_group_and_the_same_cache_client_recovers": 7.082,
   "cache-sentinel::a_frozen_primary_promotes_a_replica_and_the_same_cache_client_recovers": 3.575,
   "cache-sentinel::a_killed_primary_promotes_a_replica_and_the_same_cache_client_recovers": 19.057,
-  "cache-sentinel::a_reader_keeps_its_live_connection_while_the_primary_stalls_and_a_sentinel_hangs": 20.09,
+  "cache-sentinel::a_reader_keeps_its_live_connection_while_the_primary_stalls_and_a_sentinel_hangs": 30.0,
   "cache-sentinel::replica_loss_reports_zero_acknowledgements_without_stopping_primary_writes": 6.029,
   "chaos-alert::failed_alert_reads_preserve_the_cause_at_the_total_deadline": 0.008,
   "chaos-alert::fast_alert_samples_require_the_full_hold_duration": 0.008,
