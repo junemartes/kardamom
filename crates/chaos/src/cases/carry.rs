@@ -107,6 +107,20 @@ struct Run<'a> {
 }
 
 impl Step {
+    /// Whether the step ends with the recovery probe and the validator
+    /// verdict: a step with a fault (a provider outage, a stopped member,
+    /// a killed leader, a restarted egress), and the last step.
+    pub(crate) fn full_tail(self) -> bool {
+        matches!(
+            self,
+            Self::DepositsProviderFault
+                | Self::WindowOn
+                | Self::DepositsAllCarry
+                | Self::LeaderKillAtSwitch
+                | Self::EgressRestart
+        ) || STEPS.last() == Some(&self)
+    }
+
     /// The CI name.
     pub(crate) fn name(self) -> &'static str {
         match self {

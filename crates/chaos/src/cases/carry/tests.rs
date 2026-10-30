@@ -125,3 +125,23 @@ fn a_node_clock_stamp_is_an_instant_and_garbage_is_none() {
     );
     assert!(Run::node_instant("no such object").is_none());
 }
+
+#[test]
+fn every_fault_step_and_the_last_step_run_the_full_tail() {
+    let full: Vec<&str> = STEPS
+        .iter()
+        .filter(|s| s.full_tail())
+        .map(|s| s.name())
+        .collect();
+    assert_eq!(
+        full,
+        [
+            "carry-deposits-provider-fault",
+            "carry-window-on",
+            "carry-deposits-all-carry",
+            "carry-leader-kill-at-switch",
+            "carry-egress-restart"
+        ]
+    );
+    assert!(STEPS.last().unwrap().full_tail());
+}

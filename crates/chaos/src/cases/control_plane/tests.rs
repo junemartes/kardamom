@@ -182,15 +182,16 @@ async fn running_allocations_wait_for_both_rpcs_within_the_reschedule_deadline()
     recovery.await.unwrap();
 }
 
-/// The hold outlasts the heartbeat grace of the shard's deploy, so the
-/// servers mark the isolated clients down before the hold ends.
+/// The hold outlasts the heartbeat grace, so the servers mark the
+/// isolated clients down before the hold ends. The shard keeps the grace
+/// of the local profile.
 #[test]
 fn the_hold_outlasts_the_heartbeat_grace_of_the_shard() {
     let grace = crate::Shard::Coordinated
         .deploy_vars()
         .knobs
         .heartbeat_grace_s
-        .unwrap();
+        .unwrap_or(HEARTBEAT_GRACE_S);
     assert!(
         HOLD.as_secs() >= grace + 15,
         "hold {HOLD:?}, grace {grace}s"

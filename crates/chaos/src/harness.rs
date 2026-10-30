@@ -236,6 +236,9 @@ impl Harness {
         load.finish_submissions();
         let verdict = load.finish().await?;
         case.judge_load(&verdict)?;
+        if !case.full_tail() {
+            return self.assert_executors_converged(case.name()).await;
+        }
         // The fleet convergence and the recovery probe read independent
         // facts, so they run at once. The probe submits through both
         // ingresses, so it starts once both answer: a restarted ingress
@@ -517,6 +520,18 @@ impl Case {
                 h.assert_executor_progress(Duration::from_mins(3)).await
             }
             _ => h.assert_progress().await,
+        }
+    }
+
+    /// Whether the case ends with the recovery probe and the validator
+    /// verdict. A carry step that injects no fault and is not the last
+    /// one ends with the load verdict and the fleet convergence only: the
+    /// next step that injects a fault, and the last step, run the probe
+    /// and the verdict on a state that holds its change.
+    fn full_tail(self) -> bool {
+        match self {
+            Self::Carry(step) => step.full_tail(),
+            _ => true,
         }
     }
 

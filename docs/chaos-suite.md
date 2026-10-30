@@ -75,6 +75,8 @@ Every chaos case follows the same steps, within the case deadline (`CHAOS_CASE_S
 6. Check that the executors converged, and run the recovery probe at the same time. The two read independent facts.
 7. Run the validator verdict.
 
+A carry step that injects no fault, and is not the last step, ends after step 6 with the fleet convergence only: `carry-versions-on`, `carry-held-offer-after-downgrade`, `carry-readers-on-egress`, `carry-executor-first`, `carry-executors-rest` and `carry-window-off-on`. The next step with a fault, and the last step, run the recovery probe and the validator verdict on a state that holds their change.
+
 ## In-process recovery on PRs
 
 The CI workspace build packages the test executables and native libraries for the catalog's `ci_mode: in-process` groups. Four jobs consume that shared artifact. Each exact test has a 60-second process deadline. A shard has a 240-second execution deadline, within a five-minute CI job. The test jobs install no Rust toolchain and compile nothing. Missing tests, skipped tests, timeouts and mismatched artifact hashes fail the run.

@@ -302,7 +302,6 @@ impl Shard {
     /// the case deadline:
     /// - every sealer member canvasses for 20 s after a full restart,
     ///   not 60 s;
-    /// - a Nomad client is down after a 30 s heartbeat grace, not 60 s;
     /// - the cache shard checkpoints its executors every 10 s, so a
     ///   mirror rebuild finds a recent checkpoint;
     /// - the shard of the canary pages a stalled canary after 1 min and
@@ -313,7 +312,7 @@ impl Shard {
             cluster_jvm_opts: Some(format!(
                 "-Daeron.cluster.startup.canvass.timeout={STARTUP_CANVASS_S}s"
             )),
-            heartbeat_grace_s: Some(30),
+            heartbeat_grace_s: None,
             canary_stalled_window: canary.then(|| "1m".into()),
             canary_force_pull: canary.then_some(false),
             checkpoint_interval_s: (self == Self::Cache).then_some(10),

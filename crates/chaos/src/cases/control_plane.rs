@@ -16,13 +16,15 @@ use network::{Action, Check, NodeView, Step};
 mod tests;
 
 const CTX: &str = "control-plane-loss-recover";
-/// How long the metadata stays isolated: past the 30 s Nomad heartbeat
-/// grace of the chaos deploy, so the servers mark the isolated clients
-/// down, with a margin for the heartbeat TTL.
-const HOLD: Duration = Duration::from_secs(45);
+/// The Nomad heartbeat grace of the local profile, in seconds.
+const HEARTBEAT_GRACE_S: u64 = 60;
+/// How long the metadata stays isolated: past the Nomad heartbeat grace,
+/// so the servers mark the isolated clients down, with a margin for the
+/// heartbeat TTL.
+const HOLD: Duration = Duration::from_secs(HEARTBEAT_GRACE_S + 15);
 /// The client transfers during the hold: at its start, in its middle,
 /// and at its end.
-const CLIENT_STEPS: [u64; 3] = [0, 20, HOLD.as_secs()];
+const CLIENT_STEPS: [u64; 3] = [0, 40, HOLD.as_secs()];
 const CLIENT_BOUND: Duration = Duration::from_secs(30);
 
 struct ControlPlane {
