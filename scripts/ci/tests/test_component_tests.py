@@ -218,6 +218,17 @@ class ComponentTests(unittest.TestCase):
             alive = Path(f"/proc/{pid}").exists() and "Z" not in Path(f"/proc/{pid}/stat").read_text().split()[2]
             self.assertFalse(alive)
 
+    def test_a_crate_with_no_library_uses_its_one_bin_test_target(self):
+        bundle = component.Bundle(Path("/bundle"))
+        artifacts = {("mirror", "mirror-bin"): Path("/t/deps/mirror-1"),
+                     ("mirror", component.BIN_TESTS): [Path("/t/deps/mirror-1")],
+                     ("two", component.BIN_TESTS): [Path("/t/deps/a-1"), Path("/t/deps/b-1")]}
+        suite = {"command": ["cargo", "test", "-p", "mirror", "recovery::"]}
+        self.assertEqual(bundle.source(suite, artifacts), Path("/t/deps/mirror-1"))
+        for command in [["cargo", "test", "-p", "two"], ["cargo", "test", "-p", "two", "--test", "gone"]]:
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                bundle.source({"command": command}, artifacts)
+
     def test_a_docker_test_leaves_no_container(self):
         listings = iter([{"old"}, {"old", "new"}])
         with patch.object(component.Docker, "containers", side_effect=lambda: next(listings)), \

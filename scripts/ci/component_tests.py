@@ -47,6 +47,8 @@ STACK = Path("stack")
 AERON_ALL_JAR = ROOT / "crates/log/docker/aeron/aeron-all.jar"
 # The system property that names the test classpath for the sealer member JVMs that a test starts.
 CLASSPATH_PROPERTY = "kardamom.testClasspath"
+# The artifact key of the bin test targets of a package.
+BIN_TESTS = "<bin tests>"
 # The registry images that the docker suites start. A shard pulls them once before its first test.
 IMAGES = ("redis:7-alpine", "python:3.13-alpine", "hashicorp/consul:1.21")
 # The image that the docker suites build from the Aeron image context.
@@ -207,9 +209,21 @@ class Bundle:
             if item["profile"]["test"]:
                 package = tomllib.loads(Path(item["manifest_path"]).read_text())["package"]["name"]
                 artifacts[package, item["target"]["name"]] = Path(item["executable"])
+                if item["target"]["kind"] == ["bin"]:
+                    artifacts.setdefault((package, BIN_TESTS), []).append(Path(item["executable"]))
             elif "bin" in item["target"]["kind"]:
                 services[item["target"]["name"]] = Path(item["executable"])
         return artifacts, services, paths
+
+    def source(self, suite, artifacts):
+        """A suite with no --test or --bin uses the library tests, or the bin tests of a crate with no library."""
+        package, target = self.target(suite)
+        bins = artifacts.get((package, BIN_TESTS), [])
+        if (package, target) not in artifacts and self.selector(suite) is None and len(bins) == 1:
+            return bins[0]
+        if (package, target) not in artifacts:
+            raise ValueError(f"no test binary for {package} {target}; name it with --test or --bin")
+        return artifacts[package, target]
 
     @staticmethod
     def services_command(suites):
@@ -237,15 +251,15 @@ class Bundle:
         self.directory.mkdir(parents=True, exist_ok=False)
         logs = list(artifacts_files) or self.build(suites)
         artifacts, services, paths = self.artifacts(logs)
-        sources = {self.placed(suite, artifacts[self.target(suite)]): artifacts[self.target(suite)]
+        sources = {self.placed(suite, self.source(suite, artifacts)): self.source(suite, artifacts)
                    for suite in suites.values()}
         stack = any(suite["ci_mode"] == "stack" for suite in suites.values())
         placed_services = {str(STACK / name): source for name, source in services.items()} if stack else {}
         libraries = self.libraries({*sources.values(), *placed_services.values()}, paths)
         binaries = {name: self.executable(source, name) for name, source in (sources | placed_services).items()}
         listings = {name: self.names(self.directory / name) for name in sources}
-        tests = sorted(({"suite": name, "test": test, "binary": self.placed(suite, artifacts[self.target(suite)]),
-                         "name": self.resolve(test, listings[self.placed(suite, artifacts[self.target(suite)])])}
+        tests = sorted(({"suite": name, "test": test, "binary": self.placed(suite, self.source(suite, artifacts)),
+                         "name": self.resolve(test, listings[self.placed(suite, self.source(suite, artifacts))])}
                         for name, suite in suites.items() for test in suite["tests"]),
                        key=lambda test: (test["suite"], test["test"]))
         manifest = {"revision": os.environ.get("GITHUB_SHA"), "binaries": binaries,
