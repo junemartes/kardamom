@@ -45,6 +45,15 @@ pub use kardamom_types::cluster_status::{SEALER_SILENCE, SNAPSHOT_SILENCE};
 /// what died.
 const FORGET: Duration = Duration::from_mins(5);
 
+/// The shortest time between two restart logs of one `(service,
+/// instance)`. The service events go out on a shared publication, so two
+/// processes on one media driver get one session id, and [`Publisher`]
+/// cannot tell them apart. When both publish one key, every record of the
+/// slower `seq` counter looks like a restart. In the deployment each node
+/// has its own driver; on a shared driver the detection is wrong. One log
+/// per window bounds the log; an exclusive publication is the fix.
+const RESTART_LOG_EVERY: Duration = EXPIRY;
+
 /// How often the board feed refreshes its view when no record arrives,
 /// so a record that stops is seen as gone.
 const REFRESH: Duration = Duration::from_secs(1);
@@ -192,6 +201,8 @@ impl<T> Seen<T> {
 pub struct Board {
     entries: BTreeMap<(String, String), Seen<ServiceEvent>>,
     seqs: BTreeMap<(String, String, Publisher), Seen<u64>>,
+    /// The time of the last restart log of each key.
+    logged: BTreeMap<(String, String), Instant>,
 }
 
 impl Board {
@@ -215,7 +226,7 @@ impl Board {
     /// alone for [`FORGET`] logs one sealer restart.
     pub fn observe(&mut self, delivery: Delivery, now: Instant) {
         let Delivery { publisher, event } = delivery;
-        if self.restarted(publisher, &event, now) {
+        if self.restarted(publisher, &event, now) && self.log_due(&event, now) {
             tracing::info!(
                 service = %event.service,
                 instance = %event.instance,
@@ -230,6 +241,20 @@ impl Board {
             (event.service.clone(), event.instance.clone()),
             Seen::new(event, now),
         );
+    }
+
+    /// Whether the restart of `event`'s key may log at `now`: at most one
+    /// log in each [`RESTART_LOG_EVERY`]. Records the log when it may.
+    fn log_due(&mut self, event: &ServiceEvent, now: Instant) -> bool {
+        let key = (event.service.clone(), event.instance.clone());
+        let due = self
+            .logged
+            .get(&key)
+            .is_none_or(|at| now.saturating_duration_since(*at) >= RESTART_LOG_EVERY);
+        if due {
+            self.logged.insert(key, now);
+        }
+        due
     }
 
     /// Whether `event` from `publisher` shows a restart. See
@@ -269,6 +294,8 @@ impl Board {
     pub fn forget(&mut self, now: Instant) {
         self.entries.retain(|_, seen| seen.kept(now));
         self.seqs.retain(|_, seen| seen.kept(now));
+        self.logged
+            .retain(|_, at| now.saturating_duration_since(*at) < FORGET);
     }
 
     /// The board at `now`.

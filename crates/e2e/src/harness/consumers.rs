@@ -102,7 +102,7 @@ impl ExecutorRun<'_> {
 
 /// Join-miss refetch only matters alongside a log config that lists
 /// durability-archive endpoints (the archive-durability variant). Without
-/// it, a restarted executor cannot get envelopes for canonical records
+/// it, a restarted executor or validator cannot get envelopes for canonical records
 /// replayed from before the crash, and aborts by design.
 fn add_archive_endpoints(cmd: &mut Command, spec: &ServiceSpec<'_>) {
     if spec.log_config.is_some() {
@@ -144,6 +144,11 @@ pub fn spawn_executor_at(spec: &ServiceSpec<'_>, run: &ExecutorRun<'_>) -> Resul
     // coverage in CI. Its per-block summary lines land in executor.log.
     cmd.env("KARDAMOM_FOOTPRINT_SHADOW", "1");
     run.add_args(&mut cmd, spec);
+    if spec.checkpoints {
+        cmd.arg("--checkpoint-dir")
+            .arg(spec.root.join("checkpoints"))
+            .args(["--checkpoint-interval-secs", "2"]);
+    }
     with_log_config(&mut cmd, spec);
     add_archive_endpoints(&mut cmd, spec);
     common_service_env(&mut cmd);
@@ -225,6 +230,9 @@ pub fn spawn_validator(spec: &ServiceSpec<'_>, opts: &ValidatorOptions<'_>) -> R
         host_id: "e2e-validator",
     })?;
     with_log_config(&mut cmd, spec);
+    // As in the deployed job: a restarted validator refetches the
+    // envelopes of replayed canonical records from the archive.
+    add_archive_endpoints(&mut cmd, spec);
     if let Some(n) = opts.trie_shadow_check {
         cmd.args(["--trie-shadow-check", &n.to_string()]);
     }

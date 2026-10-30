@@ -20,6 +20,8 @@ mod carry;
 mod config;
 mod consumers;
 mod control;
+pub mod faults;
+pub mod ingress;
 pub mod inject;
 pub mod l1;
 pub mod l1_verified;
@@ -28,6 +30,7 @@ mod launch;
 mod load_sampler;
 pub mod metrics;
 pub mod proc;
+pub mod read_path;
 pub mod sealer;
 pub mod services;
 mod shutdown;
@@ -53,6 +56,9 @@ pub struct LocalStack {
     // drop in declaration order.
     notifier: Option<SpawnedNotifier>,
     ingress: SpawnedIngress,
+    /// The ingress replicas after the first, in replica order. Replica
+    /// `i + 1` is `extra_ingresses[i]`.
+    extra_ingresses: Vec<SpawnedIngress>,
     da_watcher: Option<Spawned>,
     /// The L1 follower the da-watcher reads `l1_blocks` from.
     l1_follower: Option<services::SpawnedFollower>,
@@ -63,9 +69,14 @@ pub struct LocalStack {
     /// The egress (`StackConfig::carry`). It reads the frames of the
     /// executor.
     egress: Option<carry::SpawnedEgress>,
+    /// Redis and the state mirror (`StackConfig::read_path`).
+    read_path: Option<read_path::ReadPath>,
     executor: Spawned,
     validator: Option<Spawned>,
     sequencers: Vec<Spawned>,
+    /// The lane of each sequencer past the first one per lane: the
+    /// partition of sequencer `shards + k` is `sequencer_twins[k]`.
+    sequencer_twins: Vec<u32>,
     sealer: SealerCluster,
     driver: MediaDriver,
     /// Samples `/proc/loadavg` into `<root>/host-load.log` while the stack
@@ -82,6 +93,8 @@ pub struct LocalStack {
     /// archive-durability `channels.toml`, written once at launch). Also
     /// reused by [`Self::service_spec`] for a restarted service.
     log_config: Option<PathBuf>,
+    /// The L1 wiring of the L1 follower, reused by a restarted follower.
+    follower_l1: Option<services::L1Wiring>,
     /// The L1 wiring of the validator, reused by a restarted validator.
     validator_l1: Option<services::L1Wiring>,
     /// The executor's nonce query port. Picked before the sequencers
