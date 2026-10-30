@@ -4,7 +4,9 @@
 //! The replica runs the production account lookup task against a real
 //! HTTP executor query endpoint. During the blackout the endpoint takes
 //! each connection and never answers, as a dropped TCP flow does, so each
-//! query ends at the production two-second deadline.
+//! query ends at the production two-second deadline. The production egress
+//! feed reads the session egress of the replica and sets the
+//! boundary-freshness metric that the chaos case reads.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,9 +14,15 @@ use std::sync::{Arc, Mutex};
 
 use alloy_primitives::Address;
 use kardamom_cache::{ExecutorQuery, ExecutorQueryConfig, LiveAccounts, LiveAccountsConfig};
+use kardamom_cluster_adapter::LiveEgress;
 use kardamom_sequencer::account_lookup::{AccountLookupFeed, LookupSources, Retries};
 use kardamom_sequencer::admission::AccountState;
+use kardamom_sequencer::egress_feed::EgressWatermarkFeed;
+use kardamom_sequencer::epoch::EpochPump;
+use kardamom_sequencer::metrics::LAST_BOUNDARY_UNIX_SECONDS;
+use kardamom_sequencer::resync::ResyncChannel;
 use kardamom_sequencer::sequencer::Shutdown;
+use kardamom_sequencer::testkit::one_partition_cfg;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -152,9 +160,9 @@ impl Replica {
 
 impl Lane {
     /// Kill replica 0, and start it again with the production lookup task
-    /// and no receipt rows. Redis is off and the live layer stays empty,
-    /// as the blocked receipt stream leaves it.
-    fn restart_blind(&mut self, runtime: &tokio::runtime::Runtime, executor: &Executor) -> Feed {
+    /// and egress feed, and no receipt rows. Redis is off and the live
+    /// layer stays empty, as the blocked receipt stream leaves it.
+    fn restart_blind(&mut self, runtime: &tokio::runtime::Runtime, executor: &Executor) -> Feeds {
         self.kill(0);
         self.restart(0, Lookups::Owned);
         self.set_blind(0, true);
@@ -165,7 +173,7 @@ impl Lane {
             ..ExecutorQueryConfig::default()
         });
         let shutdown = Shutdown::new();
-        let feed = AccountLookupFeed::new(
+        let lookups = AccountLookupFeed::new(
             replica.take_lookups(),
             replica.account_events(),
             LookupSources {
@@ -177,28 +185,78 @@ impl Lane {
             replica.label,
             Retries::covering(std::time::Duration::from_secs(30)),
         );
+        let cfg = one_partition_cfg();
+        let resync = ResyncChannel::for_config(&cfg).unwrap();
+        let (origins, epochs) = EpochPump::new();
+        let (frames, rx) = crossbeam_channel::unbounded();
+        let egress = EgressWatermarkFeed::new(
+            cfg.resync.boundary_silence_ms,
+            replica.label,
+            resync.watermark.clone(),
+            resync.answer_tx.clone(),
+            resync.deadline_tx.clone(),
+            origins,
+            replica.feed_egress(frames),
+        );
         let _entered = runtime.enter();
-        Feed {
+        Feeds {
+            lookup: lookups.spawn(),
+            egress: egress.spawn(LiveEgress::from_frames(rx), shutdown.clone()),
             shutdown,
-            task: feed.spawn(),
+            _resync: resync,
+            _epochs: epochs,
         }
     }
 }
 
-/// The running lookup task of one replica process.
-struct Feed {
+/// The running lookup task and egress feed of one replica process, and the
+/// receivers that the egress feed writes to.
+struct Feeds {
     shutdown: Shutdown,
-    task: tokio::task::JoinHandle<()>,
+    lookup: tokio::task::JoinHandle<()>,
+    egress: tokio::task::JoinHandle<()>,
+    _resync: ResyncChannel,
+    _epochs: EpochPump,
 }
 
-impl Feed {
-    /// The task ends at once on shutdown, also with lookups in flight.
+impl Feeds {
+    /// Both tasks end on shutdown, also with lookups in flight.
     fn stop(self, runtime: &tokio::runtime::Runtime) {
         self.shutdown.signal();
-        runtime
-            .block_on(async { tokio::time::timeout(super::lane::BOUND, self.task).await })
-            .expect("the lookup task stops")
-            .unwrap();
+        runtime.block_on(async {
+            let tasks = async { (self.lookup.await, self.egress.await) };
+            let (lookup, egress) = tokio::time::timeout(super::lane::BOUND, tasks)
+                .await
+                .expect("the feeds stop");
+            lookup.unwrap();
+            egress.unwrap();
+        });
+    }
+}
+
+impl Feeds {
+    /// The boundary-freshness gauge that the egress feed sets, in Unix
+    /// seconds.
+    fn last_boundary() -> f64 {
+        Replica::recorder()
+            .render()
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix(LAST_BOUNDARY_UNIX_SECONDS)?
+                    .trim()
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// The whole Unix second now, as the gauge counts it.
+    fn now() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+            .floor()
     }
 }
 
@@ -212,12 +270,11 @@ fn a_lookup_blackout_fails_lookups_while_the_cluster_feed_lives_then_answers() {
     let executor = runtime.block_on(Executor::bind());
     let mut lane = Lane::start(0, 2);
     lane.establish();
+    let started = Feeds::now();
     let blackout = lane.restart_blind(&runtime, &executor);
-    let relayed = lane.replica(0).relayed();
     lane.assert_progress();
-    lane.until("lookups fail while canonical frames arrive", |lane| {
-        let victim = lane.replica(0);
-        victim.lookups("error") > 0 && victim.relayed() > relayed
+    lane.until("lookups fail while boundaries stay fresh", |lane| {
+        lane.replica(0).lookups("error") > 0 && Feeds::last_boundary() >= started
     });
     let victim = lane.replica(0);
     assert_eq!(
@@ -233,7 +290,12 @@ fn a_lookup_blackout_fails_lookups_while_the_cluster_feed_lives_then_answers() {
     executor.answers.store(true, Ordering::Release);
     let answered = lane.restart_blind(&runtime, &executor);
     executor.follow(&lane);
+    let restarted = Feeds::now();
     lane.assert_orders_alone(0, 1);
+    assert!(
+        Feeds::last_boundary() >= restarted,
+        "no fresh boundary after the restart"
+    );
     assert!(
         lane.replica(0).lookups("ok") > 0,
         "no executor answer reached the replica"

@@ -89,6 +89,14 @@ pub(super) enum Lookups {
     Owned,
 }
 
+/// Where the cluster egress of a replica session goes.
+enum Egress {
+    /// The test hands each frame to the session's sealer rules.
+    Rules(SealerRules<InMemorySidePublisher>),
+    /// The production egress feed reads each frame.
+    Feed(Sender<Vec<u8>>),
+}
+
 /// One production admission loop on its own thread.
 pub(super) struct Replica {
     pub(super) input: Sender<Inbound>,
@@ -97,11 +105,9 @@ pub(super) struct Replica {
     /// Frames of `peer` that the sealer has read.
     pub(super) read: usize,
     pub(super) accounts: Sender<AccountEvent>,
-    pub(super) rules: SealerRules<InMemorySidePublisher>,
+    egress: Egress,
     pub(super) lookups: Option<tokio::sync::mpsc::Receiver<Address>>,
     pub(super) mode: Lookups,
-    /// Canonical frames that this session's rules took.
-    pub(super) relayed: usize,
     pub(super) label: u32,
     shutdown: Shutdown,
     done: Receiver<Result<(), SequencerError>>,
@@ -172,10 +178,9 @@ impl Replica {
             peer,
             read: 0,
             accounts,
-            rules,
+            egress: Egress::Rules(rules),
             lookups: Some(lookups),
             mode,
-            relayed: 0,
             label,
             shutdown,
             done,
@@ -195,6 +200,31 @@ impl Replica {
         self.peer.accepted().len()
     }
 
+    /// The session egress relays these frames of the sealer. The rules
+    /// take only canonical frames, as the egress feed hands them on.
+    pub(super) fn relay(&mut self, frames: &[Vec<u8>]) {
+        match &self.egress {
+            Egress::Rules(rules) => frames.iter().for_each(|frame| {
+                rules.on_canonical_frame(frame);
+            }),
+            Egress::Feed(egress) => frames
+                .iter()
+                .for_each(|frame| egress.send(frame.clone()).unwrap()),
+        }
+    }
+
+    /// From now on the session egress goes to a production egress feed on
+    /// `egress`, which takes the returned rules.
+    pub(super) fn feed_egress(
+        &mut self,
+        egress: Sender<Vec<u8>>,
+    ) -> SealerRules<InMemorySidePublisher> {
+        match std::mem::replace(&mut self.egress, Egress::Feed(egress)) {
+            Egress::Rules(rules) => rules,
+            Egress::Feed(_) => panic!("the egress feed already runs"),
+        }
+    }
+
     /// The lookup requests, for a test that runs its own lookup task.
     pub(super) fn take_lookups(&mut self) -> tokio::sync::mpsc::Receiver<Address> {
         self.lookups
@@ -205,10 +235,6 @@ impl Replica {
     /// The queue of account events of the loop.
     pub(super) fn account_events(&self) -> Sender<AccountEvent> {
         self.accounts.clone()
-    }
-
-    pub(super) fn relayed(&self) -> usize {
-        self.relayed
     }
 
     /// The account events that wait for the loop: a bounded queue.

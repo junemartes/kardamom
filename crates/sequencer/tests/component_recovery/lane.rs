@@ -239,12 +239,15 @@ impl Lane {
             .insert(ordered.hash, self.sealer.order.len());
         self.sealer.order.push(ordered);
         self.sealer.next.insert(ordered.sender, ordered.nonce + 1);
-        let canonical = RelayedRef {
-            index,
-            canonical_id: ordered.hash,
-            record_type: wire::RT_TX,
-        }
-        .encode();
+        let frames = [
+            RelayedRef {
+                index,
+                canonical_id: ordered.hash,
+                record_type: wire::RT_TX,
+            }
+            .encode(),
+            wire::encode_egress_boundary(index + 1, index + 1, 0, 0),
+        ];
         let rows = AccountEvent::Rows {
             block: index + 1,
             rows: vec![(ordered.sender, self.state_of(ordered.sender))],
@@ -256,8 +259,7 @@ impl Lane {
             .filter_map(|(r, blind)| r.as_mut().map(|r| (r, blind)))
             .filter(|(r, _)| !r.cut())
             .for_each(|(r, blind)| {
-                assert!(r.rules.on_canonical_frame(&canonical));
-                r.relayed += 1;
+                r.relay(&frames);
                 if !blind {
                     r.accounts.send(rows.clone()).unwrap();
                 }

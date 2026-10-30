@@ -18,7 +18,8 @@
         "SealerRules",
         "production ingress/egress wire codecs",
         "two racing AdmissionLoop replicas per lane with per-process metrics",
-        "AccountLookupFeed with the ExecutorQuery HTTP client"
+        "AccountLookupFeed with the ExecutorQuery HTTP client",
+        "EgressWatermarkFeed over a LiveEgress session channel, with the boundary-freshness metric"
       ],
       "controlled": [
         "bounded tx_data channel",
@@ -78,6 +79,12 @@
         },
         "lookup_answer_not_delivered": {
           "mutation": "The account lookup task drops each answer.",
+          "test": "a_lookup_blackout_fails_lookups_while_the_cluster_feed_lives_then_answers",
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "boundary_freshness_not_marked": {
+          "mutation": "The egress feed does not set the boundary-freshness metric on a boundary.",
           "test": "a_lookup_blackout_fails_lookups_while_the_cluster_feed_lives_then_answers",
           "exit_code": 101,
           "failed_as_expected": true
@@ -1844,7 +1851,7 @@
     {
       "case": "lookup-blackout",
       "family": "Sequencer",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "sequencer",
@@ -1855,7 +1862,11 @@
           "test": "a_lookup_blackout_fails_lookups_while_the_cluster_feed_lives_then_answers"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts the lane-0 task and the replacement process stays the same through each proof: task supervision and container identity exist only in the deployment",
+        "iptables drops receipt DATA frames, executor query TCP and Redis TCP on the sequencer node: the kernel packet filter of the deployed node; the local test withholds the rows, holds every executor query and runs without Redis, so the Redis client error path is left to the deployment"
+      ]
     },
     {
       "case": "cluster-leader-kill",

@@ -190,11 +190,13 @@ the lane ordering. A restarted replica starts empty and must order an
 established sender and a fresh sender alone while its twin is frozen. Each
 load nonce must be ordered once and in order, with the exact offer bytes. A
 lookup blackout runs the production account lookup task against a loopback
-executor query that holds each request. Lookups must fail at the unchanged
-two-second deadline while canonical frames still arrive, then answer after
-the next restart. The lookup task lives in the library for this test; its
-behavior is unchanged. Negative controls fail when the loop sends no lookup,
-ignores canonical and row events, or the lookup task drops its answer.
+executor query that holds each request. The production egress feed reads
+the session egress of that replica. Lookups must fail at the unchanged
+two-second deadline while the boundary-freshness metric stays current, then
+answer after the next restart. The lookup task and the egress feed live in
+the library for this test; their behavior is unchanged. Negative controls
+fail when the loop sends no lookup, ignores canonical and row events, the
+lookup task drops its answer, or the egress feed does not mark a boundary.
 
 The [coverage inventory](../scripts/ci/component-recovery.json) names every
 registered chaos case, plus the packet-delay case pending in PR #917. The registry

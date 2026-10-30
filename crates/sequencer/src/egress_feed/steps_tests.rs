@@ -1,5 +1,8 @@
 use std::time::Duration;
 
+use crate::outbound::fakes::InMemorySidePublisher;
+use crate::resync::{SealerRefusal, SharedWatermark};
+use crate::sealer_rules::{SealerRules, SealerVersion};
 use alloy_primitives::Address;
 use alloy_primitives::B256;
 use kardamom_cluster_adapter::wire::{
@@ -7,9 +10,6 @@ use kardamom_cluster_adapter::wire::{
     encode_status,
 };
 use kardamom_obs::lifecycle::Lifecycle;
-use kardamom_sequencer::outbound::fakes::InMemorySidePublisher;
-use kardamom_sequencer::resync::{SealerRefusal, SharedWatermark};
-use kardamom_sequencer::sealer_rules::{SealerRules, SealerVersion};
 use kardamom_types::cluster_status::RecordLagStatus;
 use kardamom_types::{ClusterStatus, DropReason, TxDrop, TxErrorReason};
 
@@ -195,8 +195,8 @@ fn a_reference_refusal_below_the_kept_version_does_not_lower_it() {
 
 #[test]
 fn all_terminal_frames_reach_v2_without_filling_the_unconsumed_v1_channel() {
+    use crate::v2::AccountEvent;
     use kardamom_cluster_adapter::wire::{encode_da_lag_reject, encode_past_deadline};
-    use kardamom_sequencer::v2::AccountEvent;
     let (deadline_tx, deadline_rx) = crossbeam_channel::bounded(1);
     let (answer_tx, _) = crossbeam_channel::unbounded();
     let (origins, _) = crossbeam_channel::unbounded();

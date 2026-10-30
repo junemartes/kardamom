@@ -35,6 +35,7 @@
 pub mod account_lookup;
 pub mod admission;
 pub mod config;
+pub mod egress_feed;
 pub mod epoch;
 pub mod error;
 #[cfg(any(test, feature = "testing"))]
