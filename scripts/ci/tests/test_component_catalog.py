@@ -92,6 +92,14 @@ class CatalogTests(unittest.TestCase):
             with self.subTest(seconds=seconds):
                 self.assert_error(raise_to(seconds, "reason"), "an integer from 60 to 120")
 
+    def test_every_test_needs_a_recorded_runtime(self):
+        timings = {f"{name}::{test}": 1.0 for name, suite in DOCUMENT["local_suites"].items()
+                   for test in suite["tests"]}
+        self.assertEqual(Catalog(copy.deepcopy(DOCUMENT), timings).errors(), [])
+        timings.pop("guarded::restarts")
+        self.assertEqual(Catalog(copy.deepcopy(DOCUMENT), timings).errors(),
+                         ["no runtime in scripts/ci/component-timings.json for guarded::restarts"])
+
     def test_every_suite_needs_a_known_ci_mode(self):
         self.assert_error(lambda d: d["local_suites"]["guarded"].pop("ci_mode"), "suite guarded: ci_mode")
         self.assert_error(lambda d: d["local_suites"]["guarded"].update(ci_mode="nightly"), "suite guarded: ci_mode")
