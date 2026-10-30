@@ -2305,7 +2305,8 @@
       ],
       "full_case_locally_validated": true,
       "cluster_only_checks": [
-        "docker kill and start of every pipeline node container, and Nomad job counts after it: node power loss needs the cluster nodes"
+        "docker kill and start of every pipeline node container, and Nomad job counts after it: node power loss needs the cluster nodes",
+        "the three-member election after a blackout: both local blackout tests run one sealer member to stay inside 60 s; the combined suite closes three-member elections after a sealer loss"
       ]
     },
     {

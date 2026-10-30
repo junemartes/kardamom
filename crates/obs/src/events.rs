@@ -46,10 +46,13 @@ pub use kardamom_types::cluster_status::{SEALER_SILENCE, SNAPSHOT_SILENCE};
 const FORGET: Duration = Duration::from_mins(5);
 
 /// The shortest time between two restart logs of one `(service,
-/// instance)`. Two processes whose records share one transport session,
-/// such as two publications of one IPC stream on one driver, look like a
-/// restart on every record of the slower counter. One log per window
-/// keeps the evidence and bounds the log.
+/// instance)`. The service events go out on a shared publication, so two
+/// processes on one media driver get one session id, and [`Publisher`]
+/// cannot tell them apart. When both publish one key, every record of the
+/// slower `seq` counter looks like a restart. In the deployment each node
+/// has its own driver; on a shared driver the detection is wrong. One log
+/// per window bounds the log; an exclusive publication is the fix (issue
+/// #991).
 const RESTART_LOG_EVERY: Duration = EXPIRY;
 
 /// How often the board feed refreshes its view when no record arrives,
