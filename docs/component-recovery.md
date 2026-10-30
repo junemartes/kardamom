@@ -188,6 +188,34 @@ real integration. `partial` means that named local tests validate some boundary
 assumptions. It does not mean the complete distributed case has passed locally.
 Forty-one cases have partial mappings. No full case is marked locally validated yet.
 
+`just component-catalog` checks the catalog. `just component-summary` prints the
+planned, partial and ported counts for each family. A case is ported when its
+status is `ported`. The status `ported` and `full_case_locally_validated: true`
+always go together. A ported case needs:
+
+- At least one local test.
+- A local test in a suite with a `ci_mode`, so that CI runs it. The modes are
+  `in-process`, `docker` (a real container dependency) and `gradle` (the Java
+  sealer).
+- A negative control for one of its local tests. A control that names tests
+  (`test`, `tests` or `failed_tests`) guards only those tests. A control that
+  names no test guards every test of its suite.
+
+The optional case field `cluster_only_checks` is a list of strings. Each string
+names a check that needs the deployed cluster, and gives the reason. The cluster
+chaos suite keeps these checks.
+
+The isolated component suite is the pull request gate for recovery behaviour. The
+cluster chaos suite runs nightly. Every nightly chaos failure gets an isolated test
+that reproduces it:
+
+1. Write the test against the real actor, as the steps below describe.
+2. Add the test to the `tests` of its suite in `local_suites`.
+3. Add `{"suite": ..., "test": ...}` to the `local_tests` of the failed case.
+
+The `local_tests` entry links the test to the failed case. If the failure needs
+the deployed cluster, add the check to `cluster_only_checks` of the case instead.
+
 For each remaining case:
 
 1. Review the case's fault and recovery assertions against the production actor.
