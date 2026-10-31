@@ -155,6 +155,59 @@ impl Recording {
                 && line.ends_with(" 1")
         })
     }
+
+    /// The attempts so far that ended with `outcome`.
+    fn attempts(&self, outcome: &str) -> u64 {
+        let label = format!("outcome=\"{outcome}\"");
+        self.0
+            .render()
+            .lines()
+            .filter(|line| line.starts_with("kardamom_sequencer_nonce_lookups_total{"))
+            .filter(|line| line.contains(&label))
+            .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+            .sum()
+    }
+}
+
+/// The requests that a sender sends while every source is down: one for
+/// each parked transaction that expires.
+const EXPIRED: usize = 20;
+
+/// Each expired transaction of a sender asks again while the first lookup
+/// of the sender still retries. The feed runs one lookup for the address,
+/// so the first round of attempts has one attempt.
+#[test]
+fn the_requests_of_a_sender_with_a_running_lookup_start_no_second_lookup() {
+    Recording::run(|recording| async move {
+        let fixture = Fixture::new();
+        for _ in 0..EXPIRED {
+            fixture.requests.send(ADDRESS).await.unwrap();
+        }
+        // The channel holds one request: the feed took all but the last.
+        recording.failed().await;
+        tokio::time::sleep(RETRY_AFTER / 4).await;
+        assert_eq!(recording.attempts("error"), 1);
+        fixture.stop().await;
+    });
+}
+
+/// A lookup that ended leaves the set: the next request of the address
+/// starts a new lookup.
+#[test]
+fn a_request_after_the_lookup_ended_starts_a_new_lookup() {
+    Recording::run(|recording| async move {
+        let fixture = Fixture::without_sources();
+        fixture.requests.send(ADDRESS).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while recording.attempts("miss") < 2 {
+                fixture.requests.send(ADDRESS).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a request after the end of a lookup must start a new one");
+        fixture.stop().await;
+    });
 }
 
 #[test]

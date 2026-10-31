@@ -21,9 +21,19 @@
 //! holds no permit while it sleeps, so a sleeping retry never blocks a
 //! first attempt.
 //!
+//! One address has at most one lookup at a time. A sender asks again each
+//! time a parked transaction of it expires, and a lookup can retry for
+//! longer than a parked transaction lives. So during an outage of every
+//! source, a second lookup of an address would only add retries that
+//! compete for the permits with the first attempts of other senders. A
+//! request for an address with a running lookup is dropped: the answer of
+//! that lookup serves the new transactions too.
+//!
 //! Each attempt counts once in `nonce_lookups_total`, by the source that
 //! answered (`live`, `redis`, `ok` for an executor), `miss`, or `error`.
 
+use std::collections::HashSet;
+use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -72,6 +82,11 @@ pub struct AccountLookupFeed {
     sources: Arc<Sources>,
     shutdown: Shutdown,
     limit: Arc<Semaphore>,
+    /// The addresses with a running lookup.
+    running: HashSet<Address>,
+    /// Each lookup sends its address here when it ends.
+    ended_tx: tokio::sync::mpsc::UnboundedSender<Address>,
+    ended: tokio::sync::mpsc::UnboundedReceiver<Address>,
 }
 
 /// The sources of the feed and what each lookup shares.
@@ -96,6 +111,7 @@ impl AccountLookupFeed {
         retries: Retries,
     ) -> Self {
         let retry_stop = Shutdown::new();
+        let (ended_tx, ended) = tokio::sync::mpsc::unbounded_channel();
         Self {
             rx,
             answers,
@@ -109,6 +125,9 @@ impl AccountLookupFeed {
             }),
             shutdown,
             limit: Arc::new(Semaphore::new(IN_FLIGHT)),
+            running: HashSet::new(),
+            ended_tx,
+            ended,
         }
     }
 
@@ -131,6 +150,12 @@ impl AccountLookupFeed {
                 None => return ControlFlow::Break(()),
             },
         };
+        while let Ok(ended) = self.ended.try_recv() {
+            self.running.remove(&ended);
+        }
+        if !self.running.insert(address) {
+            return ControlFlow::Continue(());
+        }
         let Some(permit) = self.permit().await else {
             return ControlFlow::Break(());
         };
@@ -139,6 +164,10 @@ impl AccountLookupFeed {
             sources: self.sources.clone(),
             answers: self.answers.clone(),
             limit: self.limit.clone(),
+            _end: LookupEnd {
+                address,
+                ended: self.ended_tx.clone(),
+            },
         };
         tokio::spawn(lookup.run(permit));
         ControlFlow::Continue(())
@@ -184,6 +213,21 @@ struct Lookup {
     sources: Arc<Sources>,
     answers: crossbeam_channel::Sender<AccountEvent>,
     limit: Arc<Semaphore>,
+    /// Held for its drop: the feed learns the end of the lookup.
+    _end: LookupEnd,
+}
+
+/// Tells the feed that the lookup of `address` ended, however it ends.
+struct LookupEnd {
+    address: Address,
+    ended: tokio::sync::mpsc::UnboundedSender<Address>,
+}
+
+impl Drop for LookupEnd {
+    fn drop(&mut self) {
+        // The feed is gone when the send fails, and with it the set.
+        let _ = self.ended.send(self.address);
+    }
 }
 
 impl Lookup {
@@ -216,24 +260,30 @@ impl Lookup {
 
     /// Wait, take a permit, and try again. A stopped feed ends the retry.
     async fn retry_once(&self) -> ControlFlow<()> {
-        let stop = &self.sources.retry_stop;
-        tokio::select! {
-            biased;
-            () = stop.cancelled() => return ControlFlow::Break(()),
-            () = tokio::time::sleep(RETRY_AFTER) => {},
+        if self
+            .unless_stopped(tokio::time::sleep(RETRY_AFTER))
+            .await
+            .is_none()
+        {
+            return ControlFlow::Break(());
         }
-        let permit = tokio::select! {
-            biased;
-            () = stop.cancelled() => return ControlFlow::Break(()),
-            permit = self.limit.clone().acquire_owned() => permit,
-        };
-        let Ok(permit) = permit else {
+        let Some(Ok(permit)) = self
+            .unless_stopped(self.limit.clone().acquire_owned())
+            .await
+        else {
             return ControlFlow::Break(());
         };
+        self.unless_stopped(self.attempt(permit))
+            .await
+            .unwrap_or(ControlFlow::Break(()))
+    }
+
+    /// The output of `work`, or `None` when the feed stops first.
+    async fn unless_stopped<T>(&self, work: impl Future<Output = T>) -> Option<T> {
         tokio::select! {
             biased;
-            () = stop.cancelled() => ControlFlow::Break(()),
-            flow = self.attempt(permit) => flow,
+            () = self.sources.retry_stop.cancelled() => None,
+            out = work => Some(out),
         }
     }
 }

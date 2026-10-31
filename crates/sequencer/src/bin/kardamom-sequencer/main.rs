@@ -131,8 +131,10 @@ impl Handles {
     }
 }
 
-/// The account events that may wait for the v2 loop: about one for each
-/// receipt batch. A full queue holds the receipts feed back.
+/// The account events that may wait for the v2 loop: one for each
+/// canonical transaction record of the sealer, and one for each receipt
+/// batch, lookup answer and sealer refusal. A full queue holds its
+/// senders back.
 const V2_ACCOUNT_EVENTS: usize = 65_536;
 
 /// The senders that may wait for a lookup of the v2 loop. A full queue
