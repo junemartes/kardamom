@@ -12,6 +12,10 @@ const VERIFIED: &str = "validator_blocks_verified_total";
 pub(crate) const COMMITTED: &str = "validator_committed_block";
 pub(crate) const DIVERGENCE: &str = "validator_divergence_total";
 const BAL_MISSING: &str = "validator_bal_missing_total";
+/// How long a lapsed or joining validator may take to verify live and
+/// close its lag, in seconds: inside the 180 s case deadline, after the
+/// freeze or the wipe.
+const CATCH_UP_SECS: u64 = 120;
 
 /// The last warm-up observations, for the log or the failure line.
 #[derive(Debug, Clone, Copy, Default)]
@@ -316,7 +320,7 @@ async fn sample_recovery(
 ) -> anyhow::Result<(Path, Warm)> {
     let last = Cell::new((Path::Survivor, Warm::default()));
     let last_ref = &last;
-    let outcome = poll::after_sleep(Budget::secs(240, 5), |elapsed| async move {
+    let outcome = poll::after_sleep(Budget::secs(CATCH_UP_SECS, 5), |elapsed| async move {
         let Some((path, w)) = recovery_sample(h, node, started0, elapsed).await else {
             crate::log(format!(
                 "validator-lapse: sample t={}s SCRAPE FAILED (not counted)",
@@ -413,7 +417,7 @@ pub(crate) async fn join(h: &mut Harness) -> anyhow::Result<()> {
     let last = Cell::new(Warm::default());
     let (hs, node_ref, started0_ref) = (&*h, node.as_str(), started0.as_deref());
     let (newborn_ref, last_ref) = (&newborn, &last);
-    let outcome = poll::until(Budget::secs(240, 10), |elapsed| async move {
+    let outcome = poll::until(Budget::secs(CATCH_UP_SECS, 10), |elapsed| async move {
         if newborn_ref.borrow().is_none() {
             *newborn_ref.borrow_mut() = newborn_container(hs, node_ref, started0_ref).await;
         }
@@ -430,7 +434,7 @@ pub(crate) async fn join(h: &mut Harness) -> anyhow::Result<()> {
     let poll::Outcome::Ready { value: w, .. } = outcome else {
         val_debug(h).await;
         return Err(crate::chaos_fail!(
-            "validator-join: fresh validator not verifying + caught up within 240s (newborn={}, {})",
+            "validator-join: fresh validator not verifying + caught up within {CATCH_UP_SECS}s (newborn={}, {})",
             newborn.as_deref().unwrap_or("none"),
             warm_line(last.get())
         ));

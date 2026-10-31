@@ -28,6 +28,21 @@ const FEATURE_FIVE: &str = "feature=\"5\"";
 /// The snapshot version that every member of this release reads.
 const READS_RELEASE: i64 = 14;
 
+/// The snapshot version that every member must read before each feature
+/// with its own rule in the play.
+const READS_FOR_FEATURE: [(u64, i64); 3] = [(3, 15), (4, 16), (5, 18)];
+
+impl Upgrade {
+    /// The snapshot version that every member must read before this
+    /// upgrade.
+    fn reads_needed(self) -> i64 {
+        READS_FOR_FEATURE
+            .iter()
+            .find(|(f, _)| *f == self.feature())
+            .map_or(READS_RELEASE, |(_, reads)| *reads)
+    }
+}
+
 /// One job of the check: every job meta of `metas` is `true` on the
 /// registered job, and every live allocation runs that job version
 /// (`upgrade_check_job.yml`).
@@ -178,25 +193,27 @@ impl Facts {
     /// list passes.
     pub(super) fn refusals(&self, upgrade: Upgrade) -> Vec<String> {
         let feature = upgrade.feature();
-        let mut refused = Vec::new();
-        if feature == 2 && !upgrade.at_once() {
-            refused.push("feature 2 allows only the activation time 0".to_string());
-        }
+        let at_once = (feature == 2 && !upgrade.at_once())
+            .then(|| "feature 2 allows only the activation time 0".to_string());
         let Some(groups) = &self.groups else {
-            refused.push("Nomad does not know the sealer job".to_string());
-            return refused;
+            return at_once
+                .into_iter()
+                .chain(["Nomad does not know the sealer job".to_string()])
+                .collect();
         };
-        refused.extend(self.member_refusals(groups, upgrade));
-        refused.extend(self.window_refusals(upgrade));
-        refused.extend(self.held_refusal(upgrade));
         let v4: &[Need] = if feature == 3 { &V4_JOBS } else { &[] };
-        refused.extend(
-            RELEASE_JOBS
-                .iter()
-                .chain(v4)
-                .filter_map(|need| need.refusal(&self.jobs)),
-        );
-        refused
+        at_once
+            .into_iter()
+            .chain(self.member_refusals(groups, upgrade))
+            .chain(self.window_refusals(upgrade))
+            .chain(self.held_refusal(upgrade))
+            .chain(
+                RELEASE_JOBS
+                    .iter()
+                    .chain(v4)
+                    .filter_map(|need| need.refusal(&self.jobs)),
+            )
+            .collect()
     }
 
     /// Every configured member runs and answers, and reads the snapshot
@@ -214,39 +231,26 @@ impl Facts {
             .collect();
         let statuses: Vec<&MemberStatus> = self.members.values().flatten().collect();
         let reads_max = statuses.iter().map(|s| s.reads_max).min().unwrap_or(0);
-        let needed = match upgrade.feature() {
-            3 => 15,
-            4 => 16,
-            5 => 18,
-            _ => READS_RELEASE,
-        };
-        let mut refused = Vec::new();
-        if !down.is_empty() {
-            refused.push(format!("the sealer members {down:?} do not run"));
-        }
-        if !silent.is_empty() {
-            refused.push(format!(
-                "the sealer members {silent:?} do not answer /status"
-            ));
-        }
-        if reads_max < needed {
-            refused.push(format!(
-                "a sealer member reads only up to snapshot version {reads_max}; feature {} needs {needed}",
-                upgrade.feature()
-            ));
-        }
-        if upgrade.feature() == 5 {
-            refused.extend(
-                statuses
-                    .iter()
-                    .any(|s| s.version != 5)
-                    .then(|| "feature 5 needs decision version 5 on every member".to_string()),
-            );
-            refused.extend(statuses.iter().any(|s| s.store != "heap").then(|| {
-                "feature 5 needs the retained frames on the heap of every member".to_string()
-            }));
-        }
-        refused
+        let needed = upgrade.reads_needed();
+        let window = upgrade.feature() == 5;
+        [
+            (!down.is_empty()).then(|| format!("the sealer members {down:?} do not run")),
+            (!silent.is_empty())
+                .then(|| format!("the sealer members {silent:?} do not answer /status")),
+            (reads_max < needed).then(|| {
+                format!(
+                    "a sealer member reads only up to snapshot version {reads_max}; feature {} needs {needed}",
+                    upgrade.feature()
+                )
+            }),
+            (window && statuses.iter().any(|s| s.version != 5))
+                .then(|| "feature 5 needs decision version 5 on every member".to_string()),
+            (window && statuses.iter().any(|s| s.store != "heap"))
+                .then(|| "feature 5 needs the retained frames on the heap of every member".to_string()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// Feature 5: the services of the window, the egress mark, and every
@@ -264,11 +268,11 @@ impl Facts {
         let Some(marks) =
             marks.filter(|m| !m.is_empty() && m.iter().all(|(i, b)| *i >= 0 && *b >= 0))
         else {
-            refused.push(format!(
+            let unmarked = format!(
                 "an egress instance does not report its reference mark, or no egress runs: {:?}",
                 self.window.marks
-            ));
-            return refused;
+            );
+            return refused.into_iter().chain([unmarked]).collect();
         };
         let r = marks.iter().map(|(index, _)| *index).max().unwrap_or(0);
         refused.extend(

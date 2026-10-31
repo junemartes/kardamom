@@ -278,12 +278,17 @@ fn the_snapshot_thresholds_match_the_check_play() {
     assert!(play.contains(&format!(
         "workloads_upgrade_reads_max | min >= {READS_RELEASE}"
     )));
-    for (feature, needed) in [(3, 15), (4, 16)] {
-        let rule = format!(
-            "workloads_upgrade_feature | int != {feature} or workloads_upgrade_reads_max | min >= {needed}"
-        );
+    for (feature, needed) in READS_FOR_FEATURE {
+        // The play checks feature 5 inside the block of its window rules.
+        let rule = if feature == 5 {
+            format!("workloads_upgrade_reads_max | min >= {needed}")
+        } else {
+            format!(
+                "workloads_upgrade_feature | int != {feature} or workloads_upgrade_reads_max | min >= {needed}"
+            )
+        };
         assert!(play.contains(&rule), "the play has no rule {rule}");
+        assert_eq!(Upgrade::on(feature).reads_needed(), needed);
     }
-    // The play checks feature 5 inside the block of its window rules.
-    assert!(play.contains("workloads_upgrade_reads_max | min >= 18"));
+    assert_eq!(Upgrade::on(9).reads_needed(), READS_RELEASE);
 }

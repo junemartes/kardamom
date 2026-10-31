@@ -235,7 +235,10 @@ pub(super) async fn freeze_with_spool(
     let target = &target;
     let outcome = poll::until(
         Budget::new(
-            (Duration::from_secs(4) + SETTLE + h.knobs.restart_slo) * FREEZE_ATTEMPTS,
+            Duration::from_secs(4)
+                .saturating_add(SETTLE)
+                .saturating_add(h.knobs.restart_slo)
+                .saturating_mul(FREEZE_ATTEMPTS),
             Duration::from_secs(1),
         ),
         |_| async move {

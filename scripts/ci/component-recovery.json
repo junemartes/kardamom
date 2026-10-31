@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "policy": "A local boundary test is partial evidence for its distributed case. No case is complete until all listed invariants, real dependencies and negative controls are validated. Do not replace final-head chaos qualification with this inventory.",
+  "policy": "A local boundary test is partial evidence for its distributed case. No case is complete until all listed invariants, real dependencies and negative controls are validated. Do not replace final-head chaos qualification with this inventory. The chaos recovery probe at the end of each case (10 s at 50 tx/s per leg, a floor of 125 accepted submits) proves the liveness of both ingresses, not their throughput.",
   "local_suites": {
     "sequencer": {
       "command": [
