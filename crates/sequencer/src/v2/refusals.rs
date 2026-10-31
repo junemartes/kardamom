@@ -2,11 +2,12 @@
 
 use std::collections::BTreeSet;
 
-use alloy_primitives::Address;
-use kardamom_types::TxErrorReason;
+use alloy_primitives::{Address, B256};
+use kardamom_types::{TxDrop, TxError, TxErrorReason, TxStatus};
 
 use super::{AdmissionLoop, RefPayload};
-use crate::admission::{Candidate, Verdict};
+use crate::admission::{Candidate, Refusal, Verdict};
+use crate::outbound::SideChannelPublisher;
 use crate::resync::SealerRefusal;
 
 impl AdmissionLoop {
@@ -172,4 +173,48 @@ impl Replay {
         }
         self
     }
+}
+
+impl Refusal {
+    /// The client error of a refusal of the filter.
+    pub(super) fn reason(self) -> TxErrorReason {
+        match self {
+            Refusal::NonceTooLow { chain_nonce } => TxErrorReason::DuplicatedTx {
+                expected_nonce: chain_nonce,
+            },
+            Refusal::InFlight { expected_nonce } | Refusal::Known { expected_nonce } => {
+                TxErrorReason::AlreadyKnown { expected_nonce }
+            }
+            Refusal::InsufficientFunds { available, cost } => TxErrorReason::InsufficientFunds {
+                have: available.saturating_to(),
+                want: cost.saturating_to(),
+            },
+            Refusal::TooManyPending { expected_nonce } => TxErrorReason::Evicted { expected_nonce },
+            Refusal::Expired { expected_nonce } => TxErrorReason::Expired { expected_nonce },
+        }
+    }
+}
+
+/// Tell the client on both side channels that its transaction is refused,
+/// and the egress that it dropped.
+pub(super) fn reject<R: SideChannelPublisher>(
+    side: &mut R,
+    tx_hash: B256,
+    sender: Address,
+    nonce: u64,
+    reason: TxErrorReason,
+) {
+    let err = TxError {
+        sender,
+        nonce,
+        reason,
+    };
+    side.publish_status(TxStatus::rejected(tx_hash, &err));
+    side.publish_drop(TxDrop {
+        tx_hash,
+        sender,
+        nonce,
+        reason: err.reason.drop_reason(),
+    });
+    side.publish_error(err);
 }

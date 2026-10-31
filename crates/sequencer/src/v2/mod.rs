@@ -68,7 +68,7 @@ use std::time::{Duration, Instant};
 use alloy_primitives::{Address, B256};
 use kardamom_obs::pipeline::Queue;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
-use kardamom_types::{DropReason, TxDataLoc, TxDrop, TxEnvelope, TxError, TxErrorReason, TxStatus};
+use kardamom_types::{DropReason, TxDataLoc, TxDrop, TxEnvelope};
 
 use crate::admission::{
     AccountState, Ack, Admission, AdmissionConfig, Candidate, ImagePos, Refusal, Verdict,
@@ -517,7 +517,7 @@ impl AdmissionLoop {
                     tx_hash: inbound.envelope.tx_hash,
                 };
                 self.to_ingress.reject(ack, reason.clone());
-                reject(side, ack.tx_hash, sender, fields.nonce, reason);
+                refusals::reject(side, ack.tx_hash, sender, fields.nonce, reason);
                 return Ok(());
             }
         };
@@ -594,7 +594,7 @@ impl AdmissionLoop {
             Verdict::Reject(mut c, refusal) => {
                 self.depth.gave(c.payload.vslot);
                 self.count_refusal(refusal);
-                let reason = reason_of(refusal);
+                let reason = refusal.reason();
                 if let Some(ack) = c.answer() {
                     self.to_ingress.reject(ack, reason.clone());
                 }
@@ -602,14 +602,14 @@ impl AdmissionLoop {
                 // rejected status of its hash would contradict the held
                 // one, which still gets its status and its receipt.
                 if refusal.drops() {
-                    reject(side, c.tx_hash, c.sender, c.nonce, reason);
+                    refusals::reject(side, c.tx_hash, c.sender, c.nonce, reason);
                 }
             }
             Verdict::SealerRefused(mut c, reason) => {
                 if let Some(ack) = c.answer() {
                     self.to_ingress.reject(ack, reason.clone());
                 }
-                reject(side, c.tx_hash, c.sender, c.nonce, reason);
+                refusals::reject(side, c.tx_hash, c.sender, c.nonce, reason);
             }
             Verdict::DropReference(c) => side.publish_drop(TxDrop {
                 tx_hash: c.tx_hash,
@@ -640,48 +640,6 @@ impl AdmissionLoop {
             | Refusal::InsufficientFunds { .. } => {}
         }
     }
-}
-
-/// The client error of a refusal of the filter.
-fn reason_of(refusal: Refusal) -> TxErrorReason {
-    match refusal {
-        Refusal::NonceTooLow { chain_nonce } => TxErrorReason::DuplicatedTx {
-            expected_nonce: chain_nonce,
-        },
-        Refusal::InFlight { expected_nonce } | Refusal::Known { expected_nonce } => {
-            TxErrorReason::AlreadyKnown { expected_nonce }
-        }
-        Refusal::InsufficientFunds { available, cost } => TxErrorReason::InsufficientFunds {
-            have: available.saturating_to(),
-            want: cost.saturating_to(),
-        },
-        Refusal::TooManyPending { expected_nonce } => TxErrorReason::Evicted { expected_nonce },
-        Refusal::Expired { expected_nonce } => TxErrorReason::Expired { expected_nonce },
-    }
-}
-
-/// Tell the client on both side channels that its transaction is refused,
-/// and the egress that it dropped.
-fn reject<R: SideChannelPublisher>(
-    side: &mut R,
-    tx_hash: B256,
-    sender: Address,
-    nonce: u64,
-    reason: TxErrorReason,
-) {
-    let err = TxError {
-        sender,
-        nonce,
-        reason,
-    };
-    side.publish_status(TxStatus::rejected(tx_hash, &err));
-    side.publish_drop(TxDrop {
-        tx_hash,
-        sender,
-        nonce,
-        reason: err.reason.drop_reason(),
-    });
-    side.publish_error(err);
 }
 
 #[cfg(test)]
