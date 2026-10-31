@@ -1,6 +1,54 @@
 ---
 # Wait until every member of a new sealer cluster runs and answers its
 # admin status (the waves of a new cluster, sealer.yml).
+# On a container cluster, the image pull of a member can hang with no
+# traffic and no Nomad timeout. The deploy waits up to
+# workloads_sealer_pull_s for every member to leave the image download,
+# then stops each member that still downloads, once: Nomad places a new
+# allocation, which pulls again.
+- name: Retry a hung image pull of a new sealer member
+  when: deployment_profile == 'local'
+  vars:
+    # The allocations whose task still downloads its image: pending, and
+    # the last task event is the image download.
+    workloads_sealer_downloading: >-
+      {% set found = [] %}{% for alloc in workloads_sealer_pulls.json | default([]) %}{%
+        set events = ((alloc.TaskStates | default({}, true)).cluster | default({}, true)).Events | default([], true) %}{%
+        if alloc.ClientStatus == 'pending' and alloc.DesiredStatus == 'run' and events
+           and events[-1].DisplayMessage | default('') == 'Downloading image' %}{%
+        set _ = found.append(alloc) %}{% endif %}{% endfor %}{{ found }}
+  block:
+    - name: Wait for every new sealer member to leave the image download
+      ansible.builtin.uri:
+        url: "{{ workloads_nomad_addr }}/v1/job/cluster/allocations?namespace={{ workloads_namespace | urlencode }}"
+        headers:
+          X-Nomad-Token: "{{ workloads_nomad_token }}"
+      register: workloads_sealer_pulls
+      until: workloads_sealer_downloading | length == 0
+      retries: "{{ workloads_sealer_pull_s }}"
+      delay: 1
+      failed_when: false
+
+    - name: Report each new sealer member whose image pull hangs
+      ansible.builtin.debug:
+        msg: >-
+          image pull retry: the sealer member {{ item.TaskGroup }} on {{ item.NodeName }}
+          still downloads its image after {{ workloads_sealer_pull_s }} s; the deploy stops
+          allocation {{ item.ID }} once, and Nomad places a new one
+      loop: "{{ workloads_sealer_downloading }}"
+      loop_control:
+        label: "{{ item.TaskGroup }}"
+
+    - name: Stop each new sealer member whose image pull hangs
+      ansible.builtin.uri:
+        url: "{{ workloads_nomad_addr }}/v1/allocation/{{ item.ID }}/stop?namespace={{ workloads_namespace | urlencode }}"
+        method: PUT
+        headers:
+          X-Nomad-Token: "{{ workloads_nomad_token }}"
+      loop: "{{ workloads_sealer_downloading }}"
+      loop_control:
+        label: "{{ item.TaskGroup }}"
+
 # The allocation wait of the sealer job: its own poll budget, not the
 # default one.
 - name: Wait for every new sealer member to run
