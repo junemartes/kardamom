@@ -24,53 +24,21 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  clippy:
-    name: clippy
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: ./.github/actions/foundry
-      # forge build downloads the pinned solc on a cold host; the cache
-      # keeps that download off binaries.soliditylang.org.
-      - uses: ./.github/actions/solc-cache
-      - name: Install system build deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
-      # The check-profile caches. This job saves them for the style job.
-      - uses: ./.github/actions/rust-build-cache
-        with:
-          shared-key: check
-          save-if: ${{ github.event_name == 'push' }}
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-
-  # Mechanical checks from docs/STYLE.md (clippy pedantic, unreachable_pub,
-  # rustfmt, forbidden patterns), then the format registry check. Same
-  # toolchain and cache as the clippy job.
+  # Mechanical checks from docs/STYLE.md: `just style` runs clippy
+  # (pedantic, with every default lint as an error), rustfmt and the
+  # forbidden patterns. The job also checks the no_std build of the exec
+  # core and the format registry. One job for all of them gives each push
+  # one clippy compile.
   style:
     name: style
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: riscv32imac-unknown-none-elf
       - uses: ./.github/actions/foundry
       # forge build downloads the pinned solc on a cold host; the cache
       # keeps that download off binaries.soliditylang.org.
@@ -82,9 +50,15 @@ jobs:
       - uses: ./.github/actions/rust-build-cache
         with:
           shared-key: check
-          save-if: false
+          save-if: ${{ github.event_name == 'push' }}
       - uses: ./.github/actions/just
       - run: just style
+      # The exec core (and the types crate under it) must stay linkable
+      # inside a zk-guest build: `no_std` + `alloc`, no Aeron/libmdbx/tokio.
+      # A bare-metal target is the only reliable gate. A host-target check
+      # with --no-default-features still links std transitively and passes.
+      - name: no_std exec-core
+        run: cargo check -p kardamom-types -p kardamom-exec-core --no-default-features --target riscv32imac-unknown-none-elf --locked
       # The format registry against the base branch (docs/formats.md). The
       # checkout of a pull request is its merge into the base, so the tip
       # of the base branch is the base revision.
@@ -265,30 +239,8 @@ jobs:
           path: /tmp/component-images.tar.zst
           key: ${{ steps.image-key.outputs.key }}
 
-  # The exec core (and the types crate under it) must stay linkable inside a
-  # zk-guest build: `no_std` + `alloc`, no Aeron/libmdbx/tokio. A bare-metal
-  # target is the only reliable gate — a host-target check with
-  # --no-default-features would still link std transitively and pass.
-  # Deliberately no Aeron/foundry setup: nothing here touches rusteron.
-  no-std:
-    name: no_std exec-core
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: riscv32imac-unknown-none-elf
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v0-rust-nostd
-          save-if: ${{ github.event_name == 'push' }}
-      - run: cargo check -p kardamom-types -p kardamom-exec-core --no-default-features --target riscv32imac-unknown-none-elf --locked
-
-  # The sealer's JUnit suite (~2,250 lines: failover, replay, snapshot
-  # restore, fanout, contiguity guard) previously ran on no workflow — both
-  # Gradle-touching workflows only built shadowJar
-  # (docs/agents/l1-client-suite-port-spec.md, W3).
+  # The JUnit suite of the sealer, less the methods of the component
+  # recovery catalog.
   sealer-test:
     name: sealer tests
     runs-on: ubuntu-latest
@@ -299,9 +251,17 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+          cache: gradle
+          cache-dependency-path: |
+            cluster/sealer-service/**/*.gradle
+            cluster/sealer-service/gradle/wrapper/gradle-wrapper.properties
+      # The component recovery shards run the catalogued JUnit methods. This
+      # job runs the rest, so that each test runs once.
+      - name: Leave out the catalogued sealer tests
+        run: python3 scripts/ci/sealer_excludes.py "$RUNNER_TEMP/sealer-excludes.gradle"
       - name: Run sealer JUnit suite
         working-directory: cluster/sealer-service
-        run: ./gradlew :core:test :core:allocationGate :service:test --no-daemon
+        run: ./gradlew --init-script "$RUNNER_TEMP/sealer-excludes.gradle" :core:test :core:allocationGate :service:test --no-daemon
       - name: Upload test reports
         if: failure()
         uses: actions/upload-artifact@v4
@@ -343,28 +303,48 @@ jobs:
           KARDAMOM_EEST_FIXTURES="$(just eest-fixtures | tail -1)" \
             cargo test -p kardamom-exec-core --release --test eest_state --locked -- --ignored --nocapture
 
+  # The workspace tests from the nextest archive of the build job: this
+  # job compiles nothing. The archive holds the lib, bin, test and example
+  # targets. nextest cannot list a test target without the libtest harness
+  # (alloc_stage_table), so the filter leaves it out, and the doc-test job
+  # runs it with the bench targets.
   test:
     name: test
+    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # anvil and forge for the tests that start an L1 or build contracts.
       - uses: ./.github/actions/foundry
-      # forge build downloads the pinned solc on a cold host; the cache
-      # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
-      - name: Install system build deps
+      # The deployer tests read the contract artifacts under contracts/out,
+      # which the deployer build script fills in the build job. This job
+      # compiles nothing, so it builds the contracts the same way.
+      - name: Build the contracts
+        working-directory: contracts
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
-      # The dev-profile caches. This job compiles every target of the
-      # workspace, so it saves them for the other dev-profile jobs.
-      - uses: ./.github/actions/rust-build-cache
+          forge install --no-git --shallow \
+            foundry-rs/forge-std \
+            openzeppelin/openzeppelin-contracts@v5.0.2 \
+            openzeppelin/openzeppelin-contracts-upgradeable@v5.0.2
+          forge build
+      - uses: taiki-e/install-action@v2
         with:
-          shared-key: dev
-          save-if: ${{ github.event_name == 'push' }}
-      - run: cargo test --workspace --all-targets --locked
+          tool: nextest
+      - uses: actions/download-artifact@v4
+        with:
+          name: workspace-nextest-archive
+          path: /tmp/workspace-archive
+      # The archive goes to target/ of the checkout, the path of the build
+      # job: a test that finds a binary by its compile-time path
+      # (CARGO_BIN_EXE_*) finds it there.
+      - name: Run the workspace tests
+        run: |
+          cargo nextest run --archive-file /tmp/workspace-archive/workspace-tests.tar.zst \
+            --workspace-remap . --extract-to . --extract-overwrite --no-fail-fast \
+            -E 'not binary_id(kardamom-notifier::alloc_stage_table)'
       - name: Component evidence runner checks
         run: python3 scripts/tests/test_components.py
 
@@ -383,14 +363,25 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+      # The dev-profile caches. This job compiles the libraries and the
+      # benches of the workspace, so it saves them for the other
+      # dev-profile jobs.
       - uses: ./.github/actions/rust-build-cache
         with:
           shared-key: dev
-          save-if: false
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo test --workspace --doc --locked
+      # The bench targets in test mode: each benchmark runs once. The
+      # nextest archive of the test job holds no bench target, and nextest
+      # cannot list the test target without the libtest harness.
+      - run: cargo test --workspace --benches --test alloc_stage_table --locked
 
-  forge-build:
-    name: forge build
+  # Every Solidity check on one runner: each one takes a minute or less,
+  # and five runners for them cost more queue time than they save. The
+  # steps run even when an earlier one fails, so that one run reports
+  # every finding.
+  contracts:
+    name: contracts
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -402,97 +393,45 @@ jobs:
       # forge build downloads the pinned solc on a cold host; the cache
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
-      - name: Install contract dependencies
-        run: |
-          forge install --no-git --shallow \
-            foundry-rs/forge-std \
-            openzeppelin/openzeppelin-contracts@v5.0.2 \
-            openzeppelin/openzeppelin-contracts-upgradeable@v5.0.2
-      - run: forge build --sizes
-      # The Rust `sol!` bindings read the committed ABIs, so they must match
-      # this build.
       - uses: ./.github/actions/just
-      - run: just abi-check
-        working-directory: .
-
-  forge-test:
-    name: forge test
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    defaults:
-      run:
-        working-directory: contracts
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/foundry
-      # forge build downloads the pinned solc on a cold host; the cache
-      # keeps that download off binaries.soliditylang.org.
-      - uses: ./.github/actions/solc-cache
-      - name: Install contract dependencies
-        run: |
-          forge install --no-git --shallow \
-            foundry-rs/forge-std \
-            openzeppelin/openzeppelin-contracts@v5.0.2 \
-            openzeppelin/openzeppelin-contracts-upgradeable@v5.0.2
-      - run: forge test -vvv
-
-  forge-fmt:
-    name: forge fmt
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: contracts
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/foundry
-      # forge build downloads the pinned solc on a cold host; the cache
-      # keeps that download off binaries.soliditylang.org.
-      - uses: ./.github/actions/solc-cache
-      - run: forge fmt --check
-
-  solhint:
-    name: solhint
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: contracts
-    steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Install solhint
-        run: npm install -g solhint@5.0.5
-      - name: Lint src
-        run: solhint --max-warnings 0 -c .solhint.json 'src/**/*.sol'
-      - name: Lint tests
-        run: solhint --max-warnings 0 -c test/.solhint.json 'test/**/*.sol'
-
-  slither:
-    name: slither
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/foundry
-      # forge build downloads the pinned solc on a cold host; the cache
-      # keeps that download off binaries.soliditylang.org.
-      - uses: ./.github/actions/solc-cache
+      - name: forge fmt
+        run: forge fmt --check
       - name: Install contract dependencies
-        working-directory: contracts
+        if: ${{ !cancelled() }}
         run: |
           forge install --no-git --shallow \
             foundry-rs/forge-std \
             openzeppelin/openzeppelin-contracts@v5.0.2 \
             openzeppelin/openzeppelin-contracts-upgradeable@v5.0.2
-      - uses: crytic/slither-action@v0.4.0
+      - name: forge build
+        id: build
+        if: ${{ !cancelled() }}
+        run: forge build --sizes
+      # The Rust `sol!` bindings read the committed ABIs, so they must match
+      # this build.
+      - name: ABI check
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: just abi-check
+        working-directory: .
+      - name: forge test
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: forge test -vvv
+      - name: solhint
+        if: ${{ !cancelled() }}
+        run: |
+          npm install -g solhint@5.0.5
+          solhint --max-warnings 0 -c .solhint.json 'src/**/*.sol'
+          solhint --max-warnings 0 -c test/.solhint.json 'test/**/*.sol'
+      - name: slither
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: crytic/slither-action@v0.4.0
         with:
           target: contracts/
           slither-config: contracts/slither.config.json
           fail-on: medium
-
 
   alloc-gate:
     name: allocation regression gate

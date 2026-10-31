@@ -1,0 +1,67 @@
+---
+name: deploy-test-host
+description: >-
+  Prepare a runner for the deploy tests of deploy/cluster/ansible/tests:
+  Ansible with the Mitogen strategy, the Ansible collections, Nomad at the
+  version of the cluster contract, and on request a Nomad dev agent.
+inputs:
+  agent:
+    description: >-
+      "true" starts a Nomad dev agent, which `nomad job validate` needs.
+      The deploy tests use a fake Nomad API and need only the binary.
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    # Galaxy resets connections now and then; three tries cover it.
+    - name: Install Ansible and Mitogen
+      shell: bash
+      run: |
+        pip install ansible-core mitogen
+        n=0
+        until ansible-galaxy collection install ansible.posix community.docker community.general; do
+          n=$((n + 1))
+          [ "$n" -ge 3 ] && exit 1
+          sleep 15
+        done
+    # The tests remove every ANSIBLE_* variable from the environment of a
+    # play, so the strategy goes in the user configuration. Mitogen runs
+    # the tasks of a play in one Python process. That halves the time of a
+    # deploy, which is almost all task overhead. A Mitogen release that
+    # does not support the installed ansible-core fails the probe, and the
+    # tests then run with the default strategy.
+    - name: Use the Mitogen strategy
+      shell: bash
+      run: |
+        site="$(python3 -c 'import ansible_mitogen, os; print(os.path.dirname(ansible_mitogen.__file__))')"
+        printf '[defaults]\nstrategy_plugins = %s/plugins/strategy\nstrategy = mitogen_linear\n' "$site" > ~/.ansible.cfg
+        if ! (cd "$RUNNER_TEMP" && ansible localhost -i localhost, -c local -m ping); then
+          echo "::warning::Mitogen does not run on this ansible-core; the deploy tests use the default strategy"
+          rm ~/.ansible.cfg
+        fi
+    - name: Install Nomad (version from the cluster contract)
+      shell: bash
+      run: |
+        ver="$(sed -n 's/^nomad_version: "\([^"]*\)".*/\1/p' deploy/cluster/ansible/group_vars/all.yml)"
+        curl -fsSL --retry 5 --retry-all-errors "https://releases.hashicorp.com/nomad/${ver}/nomad_${ver}_linux_amd64.zip" -o /tmp/nomad.zip
+        sudo unzip -o /tmp/nomad.zip -d /usr/local/bin
+        nomad version
+    # The cloud fingerprints wait for a metadata service, and on a busy
+    # runner that wait can outlast the start of the agent.
+    - name: Start a dev agent (job validation needs the API)
+      if: inputs.agent == 'true'
+      shell: bash
+      run: |
+        printf 'client {\n  options {\n    "fingerprint.denylist" = "env_aws,env_gce,env_azure,env_digitalocean"\n  }\n}\n' > /tmp/nomad-dev.hcl
+        nomad agent -dev -bind 127.0.0.1 -config /tmp/nomad-dev.hcl > /tmp/nomad-dev.log 2>&1 &
+        for _ in $(seq 1 60); do
+          nomad node status > /dev/null 2>&1 && exit 0
+          sleep 1
+        done
+        echo "nomad dev agent failed to start" >&2
+        cat /tmp/nomad-dev.log >&2
+        exit 1
