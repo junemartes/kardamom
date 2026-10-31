@@ -195,6 +195,7 @@
   "pipeline-combined::ingress_sequencer_and_sealer_return_in_order": 40.2,
   "pipeline-combined::ingress_sequencer_and_sealer_return_in_reverse_and_wait": 48.3,
   "pipeline-combined::sequencer_and_sealer_loss_stall_then_return_together": 42.9,
+  "pipeline-recovery::a_sealer_leader_stop_keeps_the_executor_at_the_sealed_head": 26.0,
   "pipeline-recovery::graceful_sequencer_drains_and_a_cold_start_regains_its_senders": 10.6,
   "pipeline-recovery::ingress_pair_loss_returns_both_replicas": 11.7,
   "pipeline-recovery::pipeline_blackout_rebuilds_the_read_path": 52.6,
@@ -251,6 +252,7 @@
   "sealer-raft-network::io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest::the_peers_of_a_leader_that_cannot_send_elect_a_new_leader_and_the_old_one_stays_up()": 33.505,
   "sealer-raft-network::io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest::a_slow_leader_link_keeps_commits_and_one_leader_per_term()": 20.366,
   "sealer-raft-network::io.kardamom.sealer.cluster.RaftLeaderPacketLossTest::a_lossy_leader_link_keeps_commits_and_one_leader_per_term()": 20.267,
+  "sealer-raft-network::io.kardamom.sealer.cluster.RaftLeaderReturnTest::a_former_leader_that_wins_again_sends_a_new_leader_event_and_no_session_ok()": 58.0,
   "sealer-raft::io.kardamom.sealer.cluster.SealerCarryClusterTest::every_member_orders_each_full_reference_once_with_its_bytes()": 1.573,
   "sealer-raft::io.kardamom.sealer.cluster.SealerClusterFailoverTest::egressContinuesGaplesslyAcrossLeaderKill()": 13.388,
   "sealer-raft::io.kardamom.sealer.cluster.SealerReplayTest::evictedRangeIsRefusedHonestly()": 1.621,
@@ -293,5 +295,8 @@
   "state-writer-crash::process_loss_after_commit_preserves_a_block_without_a_published_snapshot": 0.032,
   "state-writer-crash::process_loss_before_commit_discards_the_entire_uncommitted_block": 0.016,
   "transport-mds-remove::removing_receive_destinations_keeps_the_live_images_and_logs_no_driver_error": 21.499,
-  "transport-pressure::unavailable_outputs_preserve_live_delivery_and_recover": 11.539
+  "transport-pressure::unavailable_outputs_preserve_live_delivery_and_recover": 11.539,
+  "validator-recovery::a_fresh_validator_adopts_the_peer_checkpoint_and_verifies_live": 37.0,
+  "validator-recovery::a_long_lapse_ends_the_process_and_the_restart_resumes_from_its_state": 24.0,
+  "validator-recovery::a_short_lapse_keeps_the_same_process_verifying_past_its_count": 21.0
 }
