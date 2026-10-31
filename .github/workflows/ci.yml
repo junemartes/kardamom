@@ -100,6 +100,7 @@ jobs:
         run: just check-formats "origin/$BASE_REF"
       - run: python3 -m unittest discover -s scripts/hooks/tests
       - run: python3 -m unittest discover -s scripts/ci/tests
+      - run: just component-catalog
 
   # One compile of every workspace test target. The docker features of the
   # component suites are on, so the same build supplies the component bundle
@@ -199,7 +200,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/foundry

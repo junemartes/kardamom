@@ -1,11 +1,11 @@
 use std::time::{Duration, Instant};
 
+use crate::outbound::fakes::InMemorySidePublisher;
+use crate::resync::SharedWatermark;
+use crate::sealer_rules::{SealerRules, SealerVersion};
 use kardamom_cluster_adapter::wire::{encode_egress_boundary, encode_status};
 use kardamom_obs::halt::HaltCause;
 use kardamom_obs::lifecycle::Lifecycle;
-use kardamom_sequencer::outbound::fakes::InMemorySidePublisher;
-use kardamom_sequencer::resync::SharedWatermark;
-use kardamom_sequencer::sealer_rules::{SealerRules, SealerVersion};
 use kardamom_types::ClusterStatus;
 use kardamom_types::cluster_status::RecordLagStatus;
 

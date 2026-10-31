@@ -81,7 +81,12 @@ impl Fixture {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let network = format!("component-sentinel-{}-{token}", std::process::id());
+        // A killed test runs no Drop and leaves this network. The component runner sets the
+        // owner and then removes every network whose name carries it. A plain `cargo test`
+        // has no runner, so the name carries the process id.
+        let owner = std::env::var("KARDAMOM_DOCKER_OWNER")
+            .unwrap_or_else(|_| std::process::id().to_string());
+        let network = format!("component-sentinel-{owner}-{token}");
         let ports: [PortLease; 5] = std::array::from_fn(|_| PortLease::take());
         let primary = Self::redis(&network, &[], ports[0].port).await;
         let primary_ip = primary.get_bridge_ip_address().await.unwrap().to_string();
