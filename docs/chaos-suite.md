@@ -101,7 +101,7 @@ The CI jobs:
 2. `build sealer tests` compiles the sealer tests once. It packages the classes, the
    dependency jars, the JUnit console launcher, the JVM arguments of the test task and
    the sealer jar.
-3. `component recovery (0)` to `component recovery (4)` run the suite. The shard count
+3. `component recovery (0)` to `component recovery (5)` run the suite. The shard count
    is fixed. A shard compiles nothing. It pulls the docker images once, or loads them
    from the cache that a push saves, then runs its planned tests one at a time.
 

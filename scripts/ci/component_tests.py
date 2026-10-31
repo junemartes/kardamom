@@ -36,7 +36,7 @@ SEALER_RUNTIME = SEALER / "service/build/component-runtime"
 # The default per-test limit. A suite can raise it to at most 120 s with test_timeout_s and a reason.
 TEST_SECONDS = 60
 SHARD_SECONDS = 6 * 60
-SHARDS = 5
+SHARDS = 6
 CARGO_MODES = ("in-process", "docker", "stack")
 # The modes whose tests can start containers. The shard removes what such a test leaves.
 CONTAINER_MODES = ("docker", "stack")
