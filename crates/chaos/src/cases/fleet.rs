@@ -30,7 +30,7 @@ mod storm;
 
 pub(crate) use exporter_back::await_exporter_back;
 pub(crate) use sealer_wipe::sealer_fleet_total_wipe_recover;
-pub(crate) use storm::{ROUNDS, executor_restart_storm};
+pub(crate) use storm::executor_restart_storm;
 
 /// How long three restarted members get to elect a leader. Each one
 /// restores its snapshot and replays the log tail before it votes, so
@@ -38,6 +38,11 @@ pub(crate) use storm::{ROUNDS, executor_restart_storm};
 /// cluster needs after one leader kill. The failure model gives the
 /// whole recovery 180 s.
 pub(crate) const FULL_RESTART_ELECTION: Duration = Duration::from_mins(3);
+
+/// How long the head must stay flat after a loss of quorum. The sealers
+/// stamp a block on every tick while they have a quorum, so a flat head
+/// over this window is no tick.
+pub(crate) const STALL_WINDOW: Duration = Duration::from_secs(10);
 
 /// The three sealer nodes, by member id.
 pub(crate) fn sealers(h: &Harness) -> anyhow::Result<Vec<String>> {
@@ -55,16 +60,15 @@ pub(crate) async fn cluster_total_loss_recover(h: &mut Harness) -> anyhow::Resul
     let ctx = "cluster-total-loss-recover";
     let nodes = sealers(h)?;
     h.kill_all_nodes(ctx, "sealer", &nodes).await?;
-    h.assert_executor_stalled(Duration::from_secs(15)).await?;
+    h.assert_executor_stalled(STALL_WINDOW).await?;
     crate::log(format!("{ctx}: docker start all three sealer nodes"));
     h.start_nodes(&nodes).await?;
     h.assert_count(CLUSTER_TASK, 3, h.knobs.reschedule_slo)
         .await?;
-    let elected = h.evidence.cluster_elected(FULL_RESTART_ELECTION).await?;
-    crate::log(format!(
-        "{ctx}: members elected memberId={} (term {} closed on a majority)",
-        elected.leader, elected.term
-    ));
+    h.evidence
+        .cluster_elected(FULL_RESTART_ELECTION)
+        .await?
+        .log(ctx);
     await_exporter_back(h, ctx).await?;
     h.assert_executor_progress(Duration::from_mins(3)).await
 }

@@ -1,117 +1,174 @@
-//! The deploy cases: the rolling deploy under its readiness checks.
+//! The deploy cases: a rolling update of the executor job under its
+//! readiness checks.
 
-use std::cell::RefCell;
 use std::time::Duration;
 
 use anyhow::Context;
+use serde_json::Value;
 
-use crate::cases::chain_status::ChainView;
 use crate::harness::Harness;
-use crate::lifecycle::{LastAttempt, NOMAD_HTTP_PORT};
+use crate::nomad::{Deployment, SavedJob};
 use crate::poll::{self, Budget};
 
 /// The manifest of the running cluster, written by the image push.
 pub(crate) const MANIFEST: &str = "images.digests";
-/// The broken copy the case deploys, beside the real one.
-const BROKEN_MANIFEST: &str = "images.digests.broken";
 
-/// A deploy of a broken executor image stops at the executor job, and
-/// the old replicas keep the chain advancing. The executor line of the
-/// manifest points at the DA stand-in's image: a real image whose
-/// entrypoint is not an executor, so the new replica never passes its
-/// readiness check. Nomad fails the deployment at its healthy deadline,
-/// the role fails the play there, and the deploy never reaches the jobs
-/// after the executor. The deploy of the real manifest then heals the
-/// job: a rolling replacement of every executor under the same checks.
-/// The release gate refuses a deploy while the chain stands on a halt or
-/// a pause, so each deploy waits for an open gate first. The broken
-/// deploy must fail at the executor rollout, not at the gate.
+/// The job and the task that the case rolls.
+const JOB: &str = "executor";
+const TASK: &str = "executor";
+
+/// The healthy deadline of the rollouts of the case. A real executor
+/// passes its readiness check well inside it: the heal rolls the real
+/// image under the same deadline and must succeed.
+const HEALTHY_DEADLINE: Duration = Duration::from_secs(50);
+
+/// The progress deadline of the rollouts of the case: above the healthy
+/// deadline, as Nomad requires.
+const PROGRESS_DEADLINE: Duration = Duration::from_secs(55);
+
+/// How long a wait for the end of one rollout may take: its progress
+/// deadline, the placement, and a margin for the starved runner.
+const ROLLOUT_WAIT: Budget = Budget {
+    timeout: Duration::from_secs(90),
+    interval: Duration::from_secs(3),
+};
+
+/// A rollout of a broken executor image stops at its first replacement,
+/// and the old replicas keep the chain advancing. The case takes the
+/// executor job as Nomad holds it and changes one group: its executor
+/// image becomes the DA stand-in's image, a real image whose entrypoint
+/// is not an executor, so the new replica never passes its readiness
+/// check. The update stanza of the job replaces one allocation at a time
+/// and does not revert, so Nomad fails the deployment at its deadline
+/// with the other replicas on the old image. The real spec under the
+/// same deadlines then heals the group: the deadline is one that a real
+/// executor meets. Last, the job gets back the update stanza it had.
 pub(crate) async fn broken_image(h: &mut Harness) -> anyhow::Result<()> {
-    let nomad_addr = h.contract.nomad_addr(NOMAD_HTTP_PORT)?;
     let cluster_dir = h.lifecycle.cluster_dir().to_path_buf();
     let manifest = std::fs::read_to_string(cluster_dir.join(MANIFEST))
         .with_context(|| format!("read {MANIFEST}"))?;
     let manifest = Manifest::parse(&manifest);
     let broken_image = manifest.broken_image()?;
-    let broken = manifest.broken_executor()?;
-    std::fs::write(cluster_dir.join(BROKEN_MANIFEST), broken)
-        .with_context(|| format!("write {BROKEN_MANIFEST}"))?;
-    let version = h.nomad.job("executor").await?.version;
-
-    await_gate_open(h, "the broken deploy").await?;
-    crate::log("deploy-broken-image: deploying a manifest whose executor image is the DA stand-in");
-    let broken_deploy = h
-        .lifecycle
-        .deploy(&nomad_addr, BROKEN_MANIFEST, LastAttempt::Settled)
+    let saved = SavedJob::capture(&h.nomad, JOB).await?;
+    let rollout = Rollout::of(saved.definition(), broken_image.0)?;
+    crate::log(format!(
+        "deploy-broken-image: rolling group {} of the executor job to the DA stand-in image",
+        rollout.group
+    ));
+    let broken = saved.submit(&rollout.broken).await?;
+    let failed = rollout
+        .await_end(h, broken.version, Deployment::failed)
         .await?;
-    let _ = std::fs::remove_file(cluster_dir.join(BROKEN_MANIFEST));
+    let (healthy, _) = failed.health(&rollout.group);
     anyhow::ensure!(
-        !broken_deploy,
-        "deploy-broken-image: the deploy of a broken executor image succeeded"
-    );
-    let registered = h.nomad.job("executor").await?.version;
-    anyhow::ensure!(
-        registered > version,
-        "{}: deploy-broken-image: the deploy failed before the executor rollout: the executor job stays at version {version}",
+        healthy == 0,
+        "{}: deploy-broken-image: {healthy} replica(s) of the broken image passed the readiness check",
         crate::FAIL_PREFIX
     );
-    let images = h.nomad.running_images("executor", "executor").await?;
+    let images = h.nomad.running_images(JOB, TASK).await?;
     let old_running = broken_image.spared(&images);
     anyhow::ensure!(
         old_running >= 2,
-        "deploy-broken-image: {old_running} running executor(s) keep the old image; the failed deploy must stop after one"
+        "deploy-broken-image: {old_running} running executor(s) keep the old image; the failed rollout must stop after one"
     );
     h.assert_executor_progress(Duration::from_mins(1)).await?;
     crate::log(format!(
-        "deploy-broken-image: the deploy stopped at the executor job; {old_running} executors on the old image keep the chain advancing"
+        "deploy-broken-image: the rollout failed ({}); {old_running} executors on the old image keep the chain advancing",
+        failed.description
     ));
-
-    await_gate_open(h, "the healing deploy").await?;
-    crate::log("deploy-broken-image: deploying the real manifest to heal the executor job");
-    let healed = h
-        .lifecycle
-        .deploy(&nomad_addr, MANIFEST, LastAttempt::Dead)
+    let healed = saved.submit(&rollout.healed).await?;
+    rollout
+        .await_end(h, healed.version, Deployment::successful)
         .await?;
-    anyhow::ensure!(
-        healed,
-        "deploy-broken-image: the deploy of the real manifest failed"
-    );
-    h.assert_count("executor", 3, h.knobs.reschedule_slo)
-        .await?;
+    crate::log("deploy-broken-image: the real image passes under the same deadlines");
+    saved.restore().await?;
+    h.assert_count(JOB, 3, h.knobs.reschedule_slo).await?;
     h.assert_executor_progress(Duration::from_mins(1)).await
 }
 
-/// Wait until the release gate lets a deploy start: no root and no pause
-/// on the chain status. An earlier case can leave a pause that its
-/// recovery clears within the reschedule SLO.
-async fn await_gate_open(h: &Harness, deploy: &str) -> anyhow::Result<()> {
-    let last = RefCell::new(Vec::new());
-    let last_ref = &last;
-    let outcome = poll::until(
-        Budget::new(h.knobs.reschedule_slo, Duration::from_secs(5)),
-        |_| async move {
-            let refusals = ChainView::read(h).await.map_or_else(
-                |e| vec![format!("no chain status ({e:#})")],
-                |view| view.gate_refusals(),
-            );
-            let open = refusals.is_empty();
-            *last_ref.borrow_mut() = refusals;
-            Ok::<_, anyhow::Error>(open.then_some(()))
-        },
-    )
-    .await?;
-    let ((), elapsed) = outcome.or_fail(|t| {
-        crate::chaos_fail!(
-            "deploy-broken-image: the release gate stayed shut before {deploy} for {}s: {}",
-            t.as_secs(),
-            last.borrow().join(", ")
-        )
-    })?;
-    crate::log(format!(
-        "deploy-broken-image: the release gate is open before {deploy} (after {}s)",
-        elapsed.as_secs()
-    ));
-    Ok(())
+/// The two specs of the case: the job with one group on the broken
+/// image, and the job with that group healed. Both carry the short
+/// deadlines in the rolled group.
+struct Rollout {
+    group: String,
+    broken: Value,
+    healed: Value,
+}
+
+impl Rollout {
+    /// The rollout of `definition`, the executor job as Nomad holds it,
+    /// with the first group of the executor task on `image`.
+    fn of(definition: &Value, image: &str) -> anyhow::Result<Self> {
+        let mut healed = definition.clone();
+        let group = Self::first_group(&mut healed)?;
+        let name = group["Name"]
+            .as_str()
+            .context("an executor group has no name")?
+            .to_string();
+        let deadlines = &mut group["Update"];
+        deadlines["HealthyDeadline"] = Self::nanos(HEALTHY_DEADLINE).into();
+        deadlines["ProgressDeadline"] = Self::nanos(PROGRESS_DEADLINE).into();
+        let mut broken = healed.clone();
+        let task = Self::first_group(&mut broken)?["Tasks"]
+            .as_array_mut()
+            .and_then(|tasks| tasks.iter_mut().find(|t| t["Name"] == TASK))
+            .context("the executor group has no executor task")?;
+        task["Config"]["image"] = image.into();
+        Ok(Self {
+            group: name,
+            broken,
+            healed,
+        })
+    }
+
+    /// The first task group of `job` that runs the executor task.
+    fn first_group(job: &mut Value) -> anyhow::Result<&mut Value> {
+        job["TaskGroups"]
+            .as_array_mut()
+            .and_then(|groups| {
+                groups.iter_mut().find(|g| {
+                    g["Tasks"]
+                        .as_array()
+                        .is_some_and(|tasks| tasks.iter().any(|t| t["Name"] == TASK))
+                })
+            })
+            .context("the executor job has no group with the executor task")
+    }
+
+    /// A duration in the nanoseconds of the Nomad job API.
+    fn nanos(d: Duration) -> u64 {
+        u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// Wait until the deployment of `version` ends, and require the end
+    /// that `expected` accepts.
+    async fn await_end(
+        &self,
+        h: &Harness,
+        version: u64,
+        expected: fn(&Deployment) -> bool,
+    ) -> anyhow::Result<Deployment> {
+        let outcome = poll::until(ROLLOUT_WAIT, |_| async move {
+            let latest = h.nomad.latest_deployment(JOB).await?;
+            Ok(latest.filter(|d| d.job_version == version && (d.failed() || d.successful())))
+        })
+        .await?;
+        let (deployment, _) = outcome.or_fail(|t| {
+            crate::chaos_fail!(
+                "deploy-broken-image: the rollout of executor job version {version} did not end within {}s",
+                t.as_secs()
+            )
+        })?;
+        anyhow::ensure!(
+            expected(&deployment),
+            "{}: deploy-broken-image: the rollout of group {} at version {version} ended {:?}: {}",
+            crate::FAIL_PREFIX,
+            self.group,
+            deployment.health(&self.group),
+            deployment.description
+        );
+        Ok(deployment)
+    }
 }
 
 /// The image manifest: one `<service> <ref>` record per line.
@@ -141,21 +198,6 @@ impl<'a> Manifest<'a> {
     fn broken_image(&self) -> anyhow::Result<BrokenImage<'a>> {
         self.image("da-store").map(BrokenImage)
     }
-
-    /// The manifest with the executor record pointing at the DA
-    /// stand-in's image.
-    fn broken_executor(&self) -> anyhow::Result<String> {
-        let BrokenImage(wrong) = self.broken_image()?;
-        let text: String = self
-            .lines
-            .iter()
-            .map(|l| match l.split_once(' ') {
-                Some(("executor", _)) => format!("executor {wrong}\n"),
-                _ => format!("{l}\n"),
-            })
-            .collect();
-        Ok(text)
-    }
 }
 
 /// The image reference that the broken deploy gives the executor.
@@ -174,24 +216,33 @@ impl BrokenImage<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::Manifest;
+    use super::{Manifest, Rollout};
 
     /// A manifest with an executor and a DA stand-in record.
     const TEXT: &str =
         "executor r/kardamom-executor:t@sha256:aa\nda-store r/kardamom-da-store:t@sha256:bb\n";
 
     #[test]
-    fn the_broken_manifest_swaps_only_the_executor_image() {
-        let broken = Manifest::parse(TEXT).broken_executor().unwrap();
-        assert_eq!(
-            broken,
-            "executor r/kardamom-da-store:t@sha256:bb\nda-store r/kardamom-da-store:t@sha256:bb\n"
-        );
-        assert!(
-            Manifest::parse("executor r/x@sha256:aa\n")
-                .broken_executor()
-                .is_err()
-        );
+    fn the_rollout_changes_only_the_image_and_deadlines_of_the_first_executor_group() {
+        let job = serde_json::json!({"TaskGroups": [
+            {"Name": "executor-0", "Update": {"HealthyDeadline": 300_000_000_000_u64},
+             "Tasks": [{"Name": "executor", "Config": {"image": "r/exec@sha256:aa"}},
+                       {"Name": "recorder", "Config": {"image": "r/rec@sha256:cc"}}]},
+            {"Name": "executor-1", "Update": {},
+             "Tasks": [{"Name": "executor", "Config": {"image": "r/exec@sha256:aa"}}]}
+        ]});
+        let rollout = Rollout::of(&job, "r/da@sha256:bb").unwrap();
+        assert_eq!(rollout.group, "executor-0");
+        let group = &rollout.broken["TaskGroups"][0];
+        assert_eq!(group["Tasks"][0]["Config"]["image"], "r/da@sha256:bb");
+        assert_eq!(group["Tasks"][1]["Config"]["image"], "r/rec@sha256:cc");
+        assert_eq!(group["Update"]["HealthyDeadline"], 50_000_000_000_u64);
+        assert_eq!(group["Update"]["ProgressDeadline"], 55_000_000_000_u64);
+        assert_eq!(rollout.broken["TaskGroups"][1], job["TaskGroups"][1]);
+        let healed = &rollout.healed["TaskGroups"][0];
+        assert_eq!(healed["Tasks"][0]["Config"]["image"], "r/exec@sha256:aa");
+        assert_eq!(healed["Update"]["HealthyDeadline"], 50_000_000_000_u64);
+        assert!(Rollout::of(&serde_json::json!({"TaskGroups": []}), "x").is_err());
     }
 
     #[test]

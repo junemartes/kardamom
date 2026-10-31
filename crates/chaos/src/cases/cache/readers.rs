@@ -8,6 +8,11 @@ use anyhow::Context;
 use tokio::task::JoinSet;
 
 use super::{DEGRADED, LOOKUPS, REDIS_LAYER, Readers};
+
+/// The newest position an ingress saw minus the highest mirror head.
+const HEAD_LAG: &str = "kardamom_cache_head_lag_txs";
+/// The reconnects of the reader to Redis through the sentinels.
+const RECONNECTS: &str = "kardamom_cache_reconnects_total";
 use crate::harness::Harness;
 use crate::metrics::{self, Scrape, Target};
 use crate::poll::{self, Budget};
@@ -45,20 +50,24 @@ struct Reader {
 }
 
 impl Reader {
-    async fn sample(&self) -> anyhow::Result<Readers> {
-        let body = self
-            .scrape
+    async fn body(&self) -> anyhow::Result<String> {
+        self.scrape
             .fetch(&self.target)
             .await
-            .context("exporter unavailable")?;
-        Ok(Readers::parse(&body))
+            .context("exporter unavailable")
     }
 
     async fn transition(&self) -> anyhow::Result<Transition> {
-        let before = self.sample().await.context("before cold read")?;
+        let before = Readers::parse(&self.body().await.context("before cold read")?);
         Readers::probe(&self.rpc, 1).await.context("cold read")?;
-        let after = self.sample().await.context("after cold read")?;
-        Ok(Transition { before, after })
+        let body = self.body().await.context("after cold read")?;
+        Ok(Transition {
+            before,
+            after: Readers::parse(&body),
+            head_lag: metrics::first(&body, HEAD_LAG),
+            degraded_by_reason: metrics::samples_of_interest(&body, &[DEGRADED]),
+            reconnects: metrics::sum(&body, RECONNECTS),
+        })
     }
 
     async fn read(self) -> Reading {
@@ -70,10 +79,23 @@ impl Reader {
     }
 }
 
+/// One cold read of one ingress: its reader counters before and after,
+/// the lag of the Redis projection behind the newest position the
+/// ingress saw, the degraded reads by reason, and the reconnects. A lag
+/// above the stale bound makes every head read skip Redis as `stale`; a
+/// reader that reconnects skips Redis while it is not connected. The
+/// reasons and the reconnects tell the two apart in a failure.
 #[derive(Debug)]
+#[expect(
+    dead_code,
+    reason = "the failure text prints the evidence through Debug"
+)]
 struct Transition {
     before: Readers,
     after: Readers,
+    head_lag: Option<i64>,
+    degraded_by_reason: Vec<String>,
+    reconnects: Option<i64>,
 }
 
 #[derive(Debug)]

@@ -86,7 +86,7 @@ impl Baseline {
     /// Every writer advances twice with the exact account row on one current primary.
     async fn await_recovery(&self, h: &Harness, account: &AccountState) -> anyhow::Result<()> {
         Observation::new(account, Some(self.heads))
-            .wait(Budget::secs(300, 5), || {
+            .wait(Budget::secs(300, 2), || {
                 Snapshot::current(h, account.address)
             })
             .await?;

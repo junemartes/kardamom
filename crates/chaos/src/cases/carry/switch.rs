@@ -1,7 +1,7 @@
 //! The faults around the switch: feature 5 off and on, a leader that dies
 //! right after the switch, and the restart of an egress instance.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use kardamom_types::upgrades::FEATURE_CARRY_WINDOW;
 
@@ -20,22 +20,27 @@ const EGRESS_TASK: &str = "egress";
 const KILL_AFTER_SWITCH: Duration = Duration::from_secs(2);
 
 impl Run<'_> {
-    /// Step 7: feature 5 off, then on again, under load.
+    /// Feature 5 off, then on again, under load.
     pub(super) async fn window_off_on(&mut self) -> anyhow::Result<()> {
-        self.window(Window::Off).await?;
+        let on = self.off_then_check_on().await?;
         self.h
             .assert_executor_progress(Duration::from_mins(1))
             .await?;
-        self.window(Window::On).await
+        on.send(self.h, self.ctx).await?;
+        Members::new(self.h)?
+            .await_window(Window::On, self.retention()?)
+            .await
     }
 
-    /// Step 8: feature 5 off, then on, and the leader dies within 2 s
-    /// after its switch. The container of the leader is known before the
-    /// transaction, so the kill is one call after the switch.
+    /// Feature 5 off, then on, and the leader dies within 2 s after its
+    /// switch. The container of the leader is known before the
+    /// transaction, so the kill is one call after the switch. The time of
+    /// the death is the exit time that the docker daemon of the node
+    /// records, not the return of the kill command: the command crosses
+    /// two docker clients, and on a loaded runner its return comes
+    /// seconds after the process died.
     pub(super) async fn leader_kill_at_switch(&mut self) -> anyhow::Result<()> {
-        self.window(Window::Off).await?;
-        let on = Upgrade::on(FEATURE_CARRY_WINDOW);
-        on.check(self.h, self.ctx).await?;
+        let on = self.off_then_check_on().await?;
         let members = Members::new(self.h)?;
         let leader = members.leader().await?;
         let node = sealer(self.h, leader)?;
@@ -47,12 +52,19 @@ impl Run<'_> {
             .ok_or_else(|| crate::chaos_fail!("{}: no cluster container on {node}", self.ctx))?;
         on.send(self.h, self.ctx).await?;
         let switched = members.await_switch(leader).await?;
-        self.h.nodes.inner_kill(&node, &cid).await?;
-        let late = switched.elapsed();
+        let died = self.kill_and_read_exit(&node, &cid).await?;
+        let returned = switched.elapsed().unwrap_or_default();
+        let late = died.duration_since(switched).map_err(|_| {
+            crate::chaos_fail!(
+                "{}: the leader {leader} exited before the read that saw its switch, so the kill did not stop it",
+                self.ctx
+            )
+        })?;
         crate::log(format!(
-            "{}: leader {leader} on {node} killed {}ms after its switch",
+            "{}: leader {leader} on {node} died {}ms after its switch; the kill command returned after {}ms",
             self.ctx,
-            late.as_millis()
+            late.as_millis(),
+            returned.as_millis()
         ));
         anyhow::ensure!(
             late <= KILL_AFTER_SWITCH,
@@ -78,7 +90,33 @@ impl Run<'_> {
             .await
     }
 
-    /// Step 9: one egress instance restarts. It reads R from its mark, so
+    /// Kill the inner container `cid` on `node`, and read the clock of the
+    /// node in the same exec once the kill returns. The death comes before
+    /// that instant, so it is an upper bound: the delay of the exec before
+    /// the kill counts, and only the return of the exec does not. A later
+    /// read of the exit time can find no container, because Nomad removes
+    /// the exited container when it restarts the task. The node and the
+    /// runner share one clock.
+    async fn kill_and_read_exit(&self, node: &str, cid: &str) -> anyhow::Result<SystemTime> {
+        let script = format!("docker kill {cid} >/dev/null && date +%s.%N");
+        let stamp = self.h.nodes.exec(node, &script).await?;
+        Self::node_instant(stamp.trim()).ok_or_else(|| {
+            crate::chaos_fail!(
+                "{}: the kill of {cid} on {node} prints no node time: {}",
+                self.ctx,
+                stamp.trim()
+            )
+        })
+    }
+
+    /// The instant of a `date +%s.%N` stamp.
+    pub(super) fn node_instant(stamp: &str) -> Option<SystemTime> {
+        let (secs, nanos) = stamp.split_once('.')?;
+        let after = Duration::new(secs.parse().ok()?, nanos.parse().ok()?);
+        SystemTime::UNIX_EPOCH.checked_add(after)
+    }
+
+    /// One egress instance restarts. It reads R from its mark, so
     /// R is the same after the restart, and the readers keep reading.
     pub(super) async fn egress_restart(&mut self) -> anyhow::Result<()> {
         let egress = Egress::of(self.h).await?;
@@ -88,7 +126,13 @@ impl Run<'_> {
             .ok_or_else(|| crate::chaos_fail!("{}: no egress instance", self.ctx))?;
         let before = victim.await_reference(self.h).await?;
         let cursors = CURSORS.read(self.h).await;
-        let floors = cursors.map(|c| c.unwrap_or(0));
+        let [Some(batcher), Some(validator)] = cursors else {
+            return Err(crate::chaos_fail!(
+                "{}: a reader cursor does not answer before the restart: {cursors:?}",
+                self.ctx
+            ));
+        };
+        let floors = [batcher, validator];
         self.h.inject_hard(&[&victim.node], EGRESS_TASK).await?;
         self.h
             .assert_count(
@@ -120,15 +164,22 @@ impl Run<'_> {
             .await
     }
 
-    /// Send feature 5 to `state`, and wait until every member reports it.
-    async fn window(&self, state: Window) -> anyhow::Result<()> {
-        let upgrade = match state {
-            Window::On => Upgrade::on(FEATURE_CARRY_WINDOW),
-            Window::Off => Upgrade::off(FEATURE_CARRY_WINDOW),
-        };
-        upgrade.apply(self.h, self.ctx).await?;
-        Members::new(self.h)?
-            .await_window(state, self.retention()?)
-            .await
+    /// Check and send feature 5 off, and check the transaction that
+    /// turns it on again while the members switch off: the switch does
+    /// not change the release that the check reads. Returns the checked
+    /// transaction.
+    async fn off_then_check_on(&self) -> anyhow::Result<Upgrade> {
+        let on = Upgrade::on(FEATURE_CARRY_WINDOW);
+        Upgrade::off(FEATURE_CARRY_WINDOW)
+            .apply(self.h, self.ctx)
+            .await?;
+        let members = Members::new(self.h)?;
+        let (off, checked) = tokio::join!(
+            members.await_window(Window::Off, self.retention()?),
+            on.check(self.h, self.ctx)
+        );
+        off?;
+        checked?;
+        Ok(on)
     }
 }

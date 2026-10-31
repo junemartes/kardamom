@@ -11,18 +11,43 @@
 //! of the sealer fleet under test.
 
 use crate::knobs::Knobs;
-use crate::lifecycle::{CarrySwitches, DeployVars, EgressStage};
+use crate::lifecycle::{CarrySwitches, ChaosKnobs, DeployVars, EgressStage};
 
 /// The sealer retention of the carry shard, in frames. The exact window
 /// keeps this many frames.
 const CARRY_RETENTION: u64 = 16_384;
+/// The sealer retention of the retention and L1 shards, in frames. A
+/// freeze must pass twice this count to overrun the window: about 45 s
+/// at the steady load, and 85 s at the L1 load.
+const SMALL_RETENTION: u64 = 2048;
+/// The sealer retention of the follower and nightly shards, in frames: a
+/// fault behind a paused batcher must not overrun it, and the floor pass
+/// of the outage cases still comes within minutes.
+const FOLLOWER_RETENTION: u64 = 6144;
+/// The snapshot interval of the retention and L1 shards, in seconds. A
+/// floor pass waits for one snapshot, so the interval bounds that wait.
+const SHORT_SNAPSHOT_S: u64 = 30;
+/// The cases of the retention shard. Its chain is born with the 8-block
+/// DA guard, for the two DA cases. None of the others stops the batcher:
+/// the retention overruns freeze an executor or the validator, and the
+/// join wipes the validator. So the guard does not halt them.
 const RETENTION_CASES: [&str; 5] = [
     "retention-overrun",
     "retention-overrun-validator",
-    "prune-floor",
+    "validator-join",
     "da-lag-halt",
     "canary-da-lag",
 ];
+
+/// How long a sealer member canvasses its peers after a full restart, in
+/// seconds. Aeron requires a multiple of the 10 s leader heartbeat
+/// timeout of the members.
+const STARTUP_CANVASS_S: u64 = 20;
+
+/// The DA-lag budget of the retention chain, in blocks: two blocks of
+/// posting cadence and a margin, small enough that a frozen batcher
+/// halts the chain within seconds.
+const DA_GUARD_BLOCKS: u64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shard {
@@ -64,9 +89,11 @@ impl Shard {
         }
     }
 
-    /// Whether `case` ends with the persisted-state stage. The L1 cases
-    /// each leave a DA record a silent gap could hide in, so each one
-    /// proves the rebuild from L1 before the next. The executors and the
+    /// Whether `case` ends with the persisted-state stage. The L1 and
+    /// follower cases have none: each one proves inside its body that the
+    /// DA record on L1 is contiguous and that the archive holds it, and
+    /// the stage in the shard's tail rebuilds the whole chain from L1, so
+    /// a gap that any case leaves fails that rebuild. The executors and the
     /// members die together in the first exec case, so the state every
     /// executor kept is compared with the validator's before the next
     /// case builds on it. The carry shard compares the state of the
@@ -75,7 +102,6 @@ impl Shard {
     #[must_use]
     pub fn audits_after(self, case: &str) -> bool {
         match self {
-            Self::L1 | Self::Follower => true,
             Self::CombinedExec => case == "executor-sealer-loss-recover",
             Self::Carry => case == "carry-executor-first",
             _ => false,
@@ -83,15 +109,24 @@ impl Shard {
     }
 
     const EXECUTOR_CASES: &'static [&'static str] = &[
-        "graceful-executor",
         "hard-executor",
         "node-failure-executor",
-        "node-replace-executor",
         "state-checkpoint-restore",
         "checkpoint-corrupt-recover",
         "checkpoint-disk-full",
-        "replay-window-resync",
         "deploy-broken-image",
+    ];
+
+    /// The replica drills kill lane 0 on sequencer-0 and lane 1 on
+    /// sequencer-1, so they cover both lanes and both nodes.
+    const SEQUENCER_CASES: &'static [&'static str] = &[
+        "graceful-sequencer",
+        "hard-sequencer",
+        "sequencer-replica-kill-lane0-node0",
+        "sequencer-replica-kill-lane1-node1",
+        "sequencer-lapse",
+        "validator-lapse",
+        "lookup-blackout",
     ];
 
     /// The cases of the shard, in run order. The sequencer shard runs
@@ -109,25 +144,13 @@ impl Shard {
                 "archive-tx-data-wipe",
                 "archive-corruption",
             ],
-            Self::Sequencer => &[
-                "graceful-sequencer",
-                "hard-sequencer",
-                "sequencer-replica-kill",
-                "sequencer-lapse",
-                "validator-lapse",
-                "validator-join",
-                "lookup-blackout",
-            ],
+            Self::Sequencer => Self::SEQUENCER_CASES,
             Self::Cluster => &[
-                "cluster-leader-kill",
                 "raft-leader-one-way-partition",
                 "raft-leader-packet-loss",
                 "raft-leader-packet-delay",
                 "cluster-follower-kill",
-                "cluster-member-rejoin",
-                "cluster-two-blank-recover",
                 "node-replace-sealer",
-                "cpu-squeeze",
             ],
             // Every replica of one role down at once. Each case waits
             // for the whole fleet to return and then keeps the load on
@@ -138,7 +161,6 @@ impl Shard {
                 "executor-fleet-wipe-recover",
                 "executor-fleet-total-wipe-recover",
                 "redis-total-loss-recover",
-                "cluster-quorum-loss-recover",
                 "cluster-total-loss-recover",
             ],
             // Failures that cross the redundancy of a role. The blackout
@@ -146,19 +168,19 @@ impl Shard {
             Self::Coordinated => &[
                 "ingress-pair-loss-recover",
                 "sequencer-lane-loss-recover",
-                "control-plane-loss-recover",
                 "pipeline-blackout-recover",
             ],
             // Two or three classes down at once, and the order of their
             // return. The pairs return in dependency order and against
             // it; the two triple cases take the sealers down with both
-            // the sequencers and the ingresses, in both orders.
+            // the sequencers and the ingresses, in both orders. The first
+            // case has no origin-gap check: the da-watcher publishes its
+            // first epoch minutes after the bring-up, and a check that
+            // waits for it must not run first.
             Self::CombinedOrdering => &[
-                "ingress-sequencer-loss-recover",
                 "ingress-sealer-loss-recover",
-                "sequencer-sealer-loss-recover",
+                "ingress-sequencer-loss-recover",
                 "ingress-sequencer-sealer-loss-recover",
-                "ingress-sequencer-sealer-reverse",
             ],
             // The executors down with another class: the sealers, the
             // sealers and the validator, the ingresses, and the read path
@@ -169,7 +191,6 @@ impl Shard {
                 "executor-sealer-loss-recover",
                 "executor-sealer-validator-recover",
                 "ingress-executor-loss-recover",
-                "read-path-loss-recover",
                 "sequencer-executor-redis-loss",
             ],
             Self::Retention => &RETENTION_CASES,
@@ -180,7 +201,7 @@ impl Shard {
             Self::L1 => &[
                 "l1-liar",
                 "l1-null-receipts",
-                "two-day-outage",
+                "prune-floor",
                 "batcher-outage-past-retention",
             ],
             // The loss and the disagreement of the L1 follower's
@@ -195,10 +216,10 @@ impl Shard {
             ],
             // The mirror rebuild runs last: it flushes the projection.
             Self::Cache => &[
-                "mirror-backlog-client-restart",
                 "redis-partition-ingress",
                 "redis-primary-kill",
                 "redis-primary-freeze",
+                "cpu-squeeze",
                 "mirror-kill-rebuild",
             ],
             // The nightly shard, on a reference-born cluster: the long
@@ -209,8 +230,31 @@ impl Shard {
             // storm. The lane resize runs here, last, because the v2 loop
             // of the carry-born shards has no resize protocol yet: it needs
             // the v1 loop of a reference-born cluster, and it leaves the
-            // shard map at a later version.
+            // shard map at a later version. The sequencer shard kills one
+            // replica of each lane on its node; the other two replica
+            // drills run here, first.
+            //
+            // The cases after the drills moved here so that each regular
+            // shard fits its job. Another case of a regular shard covers
+            // the failure mode of each one; docs/chaos-suite.md lists the
+            // pairs.
             Self::Integrity => &[
+                "sequencer-replica-kill-lane0-node1",
+                "sequencer-replica-kill-lane1-node0",
+                "graceful-executor",
+                "replay-window-resync",
+                "node-replace-executor",
+                "cluster-leader-kill",
+                "cluster-member-rejoin",
+                "sequencer-sealer-loss-recover",
+                "ingress-sequencer-sealer-reverse",
+                "read-path-loss-recover",
+                "mirror-backlog-client-restart",
+                "l1-provider-unresponsive",
+                "two-day-outage",
+                "cluster-two-blank-recover",
+                "cluster-quorum-loss-recover",
+                "control-plane-loss-recover",
                 "executor-restart-storm",
                 "sealer-fleet-total-wipe-recover",
                 "resize-scale-out-in",
@@ -220,11 +264,13 @@ impl Shard {
             // step needs the steps before it.
             Self::Carry => &[
                 "carry-versions-on",
+                "carry-deposits-provider-fault",
                 "carry-held-offer-after-downgrade",
                 "carry-readers-on-egress",
                 "carry-window-on",
                 "carry-executor-first",
                 "carry-executors-rest",
+                "carry-deposits-all-carry",
                 "carry-window-off-on",
                 "carry-leader-kill-at-switch",
                 "carry-egress-restart",
@@ -251,7 +297,30 @@ impl Shard {
     pub fn deploy_vars(self) -> DeployVars {
         DeployVars {
             genesis_carry: self.carry_born(),
+            knobs: self.chaos_knobs(),
             ..self.shard_vars()
+        }
+    }
+
+    /// The chaos-only deploy knobs of the shard, so each recovery fits
+    /// the case deadline:
+    /// - every sealer member canvasses for 20 s after a full restart,
+    ///   not 60 s;
+    /// - the cache shard checkpoints its executors every 10 s, so a
+    ///   mirror rebuild finds a recent checkpoint;
+    /// - the shard of the canary pages a stalled canary after 1 min and
+    ///   starts the canary from the image it holds.
+    fn chaos_knobs(self) -> ChaosKnobs {
+        let canary = self == Self::Retention;
+        ChaosKnobs {
+            // The carry shard repeats the staging rollout, so it keeps the
+            // canvass of staging.
+            cluster_jvm_opts: (self != Self::Carry)
+                .then(|| format!("-Daeron.cluster.startup.canvass.timeout={STARTUP_CANVASS_S}s")),
+            heartbeat_grace_s: None,
+            canary_stalled_window: canary.then(|| "1m".into()),
+            canary_force_pull: canary.then_some(false),
+            checkpoint_interval_s: (self == Self::Cache).then_some(10),
         }
     }
 
@@ -282,19 +351,25 @@ impl Shard {
                 ..DeployVars::default()
             },
             Self::Cluster => DeployVars {
-                cluster_snapshot_interval_s: Some(60),
+                cluster_snapshot_interval_s: Some(SHORT_SNAPSHOT_S),
                 ..DeployVars::default()
             },
             Self::Retention => DeployVars {
-                cluster_snapshot_interval_s: Some(60),
+                cluster_snapshot_interval_s: Some(SHORT_SNAPSHOT_S),
                 canary_local: Some(true),
-                cluster_retention: Some(6144),
+                da_lag_budget_blocks: Some(DA_GUARD_BLOCKS),
+                cluster_retention: Some(SMALL_RETENTION),
                 checkpoint_log: true,
                 ..DeployVars::default()
             },
-            Self::L1 | Self::Follower => DeployVars {
+            Self::L1 => DeployVars {
+                cluster_snapshot_interval_s: Some(SHORT_SNAPSHOT_S),
+                cluster_retention: Some(SMALL_RETENTION),
+                ..Self::Follower.shard_vars()
+            },
+            Self::Follower => DeployVars {
                 cluster_snapshot_interval_s: Some(60),
-                cluster_retention: Some(6144),
+                cluster_retention: Some(FOLLOWER_RETENTION),
                 l1_fault_proxy: true,
                 indexer_poll_s: Some(2),
                 da_watcher_silence_s: Some(30),
@@ -319,8 +394,20 @@ impl Shard {
             | Self::Fleet
             | Self::Coordinated
             | Self::CombinedOrdering
-            | Self::CombinedExec
-            | Self::Integrity => DeployVars::default(),
+            | Self::CombinedExec => DeployVars::default(),
+            // The fault proxy for the L1 cases of the nightly shard: it
+            // forwards every read while no fault is set. A snapshot every
+            // 30 s, so the leader purges its log within the rejoin drill,
+            // and the retention of the follower shard, so the floor of
+            // two-day-outage is known.
+            Self::Integrity => DeployVars {
+                cluster_snapshot_interval_s: Some(SHORT_SNAPSHOT_S),
+                cluster_retention: Some(FOLLOWER_RETENTION),
+                l1_fault_proxy: true,
+                indexer_poll_s: Some(2),
+                da_watcher_silence_s: Some(30),
+                ..DeployVars::default()
+            },
         }
     }
 
@@ -333,16 +420,20 @@ impl Shard {
     #[must_use]
     pub fn env(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Self::Cluster => &[
+            // One squeeze of 40 s, past the 30 s Aeron stall tolerance, so
+            // the sessions lapse and reconnect inside the deadline.
+            Self::Cache => &[
                 ("RUN_LOAD", "0"),
-                ("SQUEEZE_CYCLES", "3"),
-                ("SQUEEZE_S", "60"),
+                ("SQUEEZE_CYCLES", "1"),
+                ("SQUEEZE_S", "40"),
+                ("SQUEEZE_RELEASE_S", "20"),
                 ("SQUEEZE_CPUS_PER_NODE", "0.4"),
             ],
-            // One minute per fault: every assertion holds at one minute,
-            // and four cases with their state audits must fit the job's
-            // budget.
-            Self::L1 | Self::Follower => &[("RUN_LOAD", "0"), ("L1_FAULT_S", "60")],
+            // The longest wait inside one fault is the stale-post alert:
+            // it shows within about 10 s and must hold 30 s. The provider
+            // outage of the carry deposit steps outlasts the 30 s halt
+            // detection of the followers with a margin.
+            Self::L1 | Self::Follower | Self::Carry => &[("RUN_LOAD", "0"), ("L1_FAULT_S", "45")],
             Self::Executor
             | Self::Ingress
             | Self::Sequencer
@@ -351,9 +442,8 @@ impl Shard {
             | Self::CombinedOrdering
             | Self::CombinedExec
             | Self::Retention
-            | Self::Cache
-            | Self::Integrity
-            | Self::Carry => &[("RUN_LOAD", "0")],
+            | Self::Cluster
+            | Self::Integrity => &[("RUN_LOAD", "0")],
         }
     }
 }
@@ -441,11 +531,29 @@ mod tests {
     }
 
     #[test]
-    fn the_retention_shard_funds_the_canary_without_lowering_its_da_guard() {
+    fn the_startup_canvass_is_a_multiple_of_the_leader_heartbeat_timeout() {
+        // The leader heartbeat timeout of the members: the Aeron default
+        // of 10 s, which the cluster job keeps.
+        let leader_heartbeat_s = 10;
+        assert_eq!(STARTUP_CANVASS_S % leader_heartbeat_s, 0);
+        let opts = Shard::Cluster.deploy_vars().knobs.cluster_jvm_opts.unwrap();
+        assert_eq!(opts, "-Daeron.cluster.startup.canvass.timeout=20s");
+        // The carry shard repeats the staging rollout with its canvass.
+        assert_eq!(Shard::Carry.deploy_vars().knobs.cluster_jvm_opts, None);
+    }
+
+    #[test]
+    fn the_retention_shard_funds_the_canary_on_a_chain_born_with_the_da_guard() {
         let vars = Shard::Retention.deploy_vars();
-        assert_eq!(vars.da_lag_budget_blocks, None);
+        assert_eq!(vars.da_lag_budget_blocks, Some(DA_GUARD_BLOCKS));
+        assert!(
+            ALL.iter()
+                .filter(|shard| **shard != Shard::Retention)
+                .all(|shard| shard.deploy_vars().da_lag_budget_blocks.is_none())
+        );
         assert_eq!(vars.canary_local, Some(true));
-        assert_eq!(vars.cluster_snapshot_interval_s, Some(60));
+        assert_eq!(vars.cluster_snapshot_interval_s, Some(SHORT_SNAPSHOT_S));
+        assert_eq!(vars.cluster_retention, Some(SMALL_RETENTION));
         assert!(
             ALL.iter()
                 .filter(|shard| **shard != Shard::Retention)
@@ -460,7 +568,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 80);
+        assert_eq!(all.len(), 86);
         assert_eq!(
             Shard::Integrity.cases().last(),
             Some(&"resize-scale-out-in")
@@ -476,7 +584,7 @@ mod tests {
         assert!(Shard::Follower.deploy_vars().l1_fault_proxy);
         assert!(Shard::Carry.deploy_vars().l1_fault_proxy);
         assert_eq!(Shard::Follower.env(), Shard::L1.env());
-        assert!(Shard::Follower.audits_after("follower-total-loss"));
+        assert!(!Shard::Follower.audits_after("follower-total-loss"));
         // The shards that turn the block log on tell their cases so, and
         // the others keep it off.
         for shard in [Shard::Executor, Shard::Retention, Shard::Cache] {
@@ -485,7 +593,7 @@ mod tests {
         }
         assert!(!Shard::Fleet.deploy_vars().checkpoint_log);
         assert!(
-            Shard::L1.audits_after("l1-liar")
+            !Shard::L1.audits_after("l1-liar")
                 && !Shard::Retention.audits_after("retention-overrun")
         );
         assert!(Shard::CombinedExec.audits_after("executor-sealer-loss-recover"));
@@ -505,6 +613,22 @@ mod tests {
         assert_eq!(
             Shard::Integrity.cases(),
             [
+                "sequencer-replica-kill-lane0-node1",
+                "sequencer-replica-kill-lane1-node0",
+                "graceful-executor",
+                "replay-window-resync",
+                "node-replace-executor",
+                "cluster-leader-kill",
+                "cluster-member-rejoin",
+                "sequencer-sealer-loss-recover",
+                "ingress-sequencer-sealer-reverse",
+                "read-path-loss-recover",
+                "mirror-backlog-client-restart",
+                "l1-provider-unresponsive",
+                "two-day-outage",
+                "cluster-two-blank-recover",
+                "cluster-quorum-loss-recover",
+                "control-plane-loss-recover",
                 "executor-restart-storm",
                 "sealer-fleet-total-wipe-recover",
                 "resize-scale-out-in"
@@ -525,5 +649,6 @@ mod tests {
         );
         assert!(Shard::Carry.audits_after("carry-executor-first"));
         assert_eq!(Shard::Carry.cases().first(), Some(&"carry-versions-on"));
+        assert!(Shard::Carry.env().contains(&("L1_FAULT_S", "45")));
     }
 }

@@ -1,18 +1,28 @@
-use super::Replica;
+use super::{Drill, Replica};
 
 #[test]
 fn every_lane_and_node_has_an_isolated_recovery_proof() {
-    let covered: std::collections::BTreeSet<_> = Replica::ALL
+    let covered: std::collections::BTreeSet<_> = Drill::ALL
         .iter()
-        .map(|replica| (replica.lane, replica.node))
+        .map(|drill| (drill.replica().lane, drill.replica().node))
         .collect();
     assert_eq!(covered, [(0, 0), (0, 1), (1, 0), (1, 1)].into());
+    for drill in Drill::ALL {
+        let replica = drill.replica();
+        assert_eq!(
+            drill.name(),
+            format!(
+                "sequencer-replica-kill-lane{}-node{}",
+                replica.lane, replica.node
+            )
+        );
+    }
 }
 
 #[test]
 fn recovery_senders_are_reserved_and_belong_to_the_faulted_lane() {
-    for replica in Replica::ALL {
-        replica.assert_route();
+    for drill in Drill::ALL {
+        drill.replica().assert_route();
     }
 }
 

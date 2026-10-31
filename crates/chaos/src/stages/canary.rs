@@ -18,9 +18,12 @@ impl Harness {
         Ok(())
     }
 
+    /// Register the case canary again, without a wait for its
+    /// allocation: the case waits for its first successful transfer,
+    /// which only a running canary reports.
     pub(crate) async fn start_case_canary(&self) -> anyhow::Result<()> {
         match &self.case_canary {
-            Some(saved) => saved.restore().await,
+            Some(saved) => saved.post_restore().await.map(|_| ()),
             None => Ok(()),
         }
     }

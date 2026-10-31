@@ -1,5 +1,6 @@
 //! A full auxiliary recovery volume must not stop the authoritative state writer.
 
+use std::cell::RefCell;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
@@ -129,9 +130,7 @@ impl CheckpointFull {
             "{CTX}: clearing the filler did not free space"
         );
         let recovered = self.checkpoint(h, during.block).await?;
-        // The restored block must include log records after the new base.
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let restored_block = self.verify(&recovered, true).await?;
+        let restored_block = self.verify_past_base(&recovered).await?;
         let after = self.progress(h, &process).await?;
         anyhow::ensure!(
             after.advanced_after(&during),
@@ -181,6 +180,30 @@ impl CheckpointFull {
         .await?
         .or_fail(|_| anyhow::anyhow!("{CTX}: no completed checkpoint above block {block} in 90s"))?
         .0)
+    }
+
+    /// The restore of `image` with its block log reaches past the base.
+    /// The executor appends the log records after the new base while it
+    /// runs, so the restore is tried again until one record is there.
+    async fn verify_past_base(&self, image: &Value) -> anyhow::Result<u64> {
+        let last = RefCell::new(String::new());
+        let last_ref = &last;
+        let (block, _) = poll::until(Budget::secs(60, 2), |_| async move {
+            Ok(self
+                .verify(image, true)
+                .await
+                .map_err(|e| *last_ref.borrow_mut() = format!("{e:#}"))
+                .ok())
+        })
+        .await?
+        .or_fail(|t| {
+            anyhow::anyhow!(
+                "{CTX}: no restore past the new base within {}s: {}",
+                t.as_secs(),
+                last.borrow()
+            )
+        })?;
+        Ok(block)
     }
 
     async fn verify(&self, image: &Value, with_log: bool) -> anyhow::Result<u64> {

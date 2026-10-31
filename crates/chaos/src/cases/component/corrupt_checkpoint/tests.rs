@@ -187,14 +187,12 @@ fn only_the_pinned_victim_group_stops_and_the_saved_definition_stays_intact() {
     ]});
     let mut expected = saved.clone();
     expected["TaskGroups"][0]["Count"] = 0.into();
-    assert_eq!(CorruptCheckpoint::paused(&saved).unwrap(), expected);
+    assert_eq!(VictimStop::paused(&saved).unwrap(), expected);
     assert_eq!(saved["TaskGroups"][0]["Count"], 1);
-    assert!(CorruptCheckpoint::paused(&expected).is_err());
+    assert!(VictimStop::paused(&expected).is_err());
     assert!(
-        CorruptCheckpoint::paused(
-            &serde_json::json!({"TaskGroups":[{"Name":"executor","Count":3}]})
-        )
-        .is_err()
+        VictimStop::paused(&serde_json::json!({"TaskGroups":[{"Name":"executor","Count":3}]}))
+            .is_err()
     );
 }
 

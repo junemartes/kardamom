@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "policy": "A local boundary test is partial evidence for its distributed case. No case is complete until all listed invariants, real dependencies and negative controls are validated. Do not replace final-head chaos qualification with this inventory.",
+  "policy": "A local boundary test is partial evidence for its distributed case. No case is complete until all listed invariants, real dependencies and negative controls are validated. Do not replace final-head chaos qualification with this inventory. The chaos recovery probe at the end of each case (10 s at 50 tx/s per leg, a floor of 125 accepted submits) proves the liveness of both ingresses, not their throughput.",
   "local_suites": {
     "sequencer": {
       "command": [
@@ -3068,7 +3068,28 @@
       ]
     },
     {
-      "case": "sequencer-replica-kill",
+      "case": "sequencer-replica-kill-lane0-node0",
+      "family": "Sequencer",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "sequencer-replica-kill-lane1-node1",
+      "family": "Sequencer",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "sequencer-replica-kill-lane0-node1",
+      "family": "Sequencer",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "sequencer-replica-kill-lane1-node0",
       "family": "Sequencer",
       "status": "ported",
       "local_tests": [
@@ -3854,7 +3875,15 @@
         {
           "suite": "l1-source-quorum",
           "test": "a_rotated_source_returns_after_the_backoff"
-        },
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "l1-provider-unresponsive",
+      "family": "Follower",
+      "status": "partial",
+      "local_tests": [
         {
           "suite": "l1-provider-http",
           "test": "unresponsive_sources_cannot_hold_the_follower_read_forever"
@@ -4138,6 +4167,13 @@
       ]
     },
     {
+      "case": "carry-deposits-provider-fault",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
       "case": "carry-versions-on",
       "family": "Carry",
       "status": "partial",
@@ -4189,6 +4225,13 @@
     },
     {
       "case": "carry-executors-rest",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-deposits-all-carry",
       "family": "Carry",
       "status": "planned",
       "local_tests": [],

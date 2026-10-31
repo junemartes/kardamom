@@ -1,4 +1,22 @@
 ---
+# The chaos knobs change the timing of the sealer members, the canary and
+# the executor checkpoints, for a test cluster. Only the local profile
+# takes them, so an operator shell that holds one cannot apply it to
+# staging or production.
+- name: Refuse a chaos knob outside the local profile
+  vars:
+    workloads_chaos_knobs_set: >-
+      {{ {'KARDAMOM_CHECKPOINT_INTERVAL_S': workloads_checkpoint_interval_s,
+          'KARDAMOM_CLUSTER_JVM_OPTS': workloads_cluster_jvm_opts,
+          'KARDAMOM_CANARY_STALLED_WINDOW': workloads_canary_stalled_window,
+          'KARDAMOM_CANARY_FORCE_PULL': workloads_canary_force_pull}
+         | dict2items | rejectattr('value', 'equalto', '') | map(attribute='key') | list }}
+  ansible.builtin.assert:
+    that:
+      - deployment_profile == 'local' or workloads_chaos_knobs_set | length == 0
+    fail_msg: >-
+      Refused: {{ workloads_chaos_knobs_set | join(', ') }} is set, and the deployment
+      profile is {{ deployment_profile }}. The chaos knobs apply only to the local profile.
 - name: Validate optional L1 light client configuration
   ansible.builtin.assert:
     that:

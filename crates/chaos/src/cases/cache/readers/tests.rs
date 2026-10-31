@@ -29,6 +29,11 @@ impl Fixture {
                     degraded: 7,
                 },
                 after: Readers { degraded, redis },
+                head_lag: None,
+                degraded_by_reason: vec![format!(
+                    "kardamom_cache_degraded_total{{reason=\"stale\"}} {degraded}"
+                )],
+                reconnects: Some(2),
             }),
         }
     }
@@ -100,6 +105,10 @@ async fn separate_partial_observations_do_not_accumulate_into_recovery() {
     assert_eq!(attempt, 40);
     let diagnostic = error.to_string();
     assert!(diagnostic.contains("ingress-1"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("reason=\\\"stale\\\"") && diagnostic.contains("reconnects: Some(2)"),
+        "{diagnostic}"
+    );
     assert!(diagnostic.contains("redis: 10"), "{diagnostic}");
     assert!(!diagnostic.contains("no completed observation"));
 }

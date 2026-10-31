@@ -76,6 +76,9 @@ fn only_a_new_start_in_the_same_allocation_certifies_a_snapshot() {
 
 struct ReplacementAgent {
     old_status: &'static str,
+    /// The status of the removed node: Nomad lists it as ready until its
+    /// heartbeat grace ends.
+    old_node: &'static str,
     live_status: u16,
     live_logs: &'static str,
 }
@@ -89,7 +92,8 @@ impl ReplacementAgent {
                 self.answer(&listener).await;
             }
         });
-        let result = Blank::starts_by_alloc(&nomad, 0, &BlankStart::of(0)).await;
+        let live = ["10.0.0.2".to_string()];
+        let result = Blank::starts_by_alloc(&nomad, &live, 0, &BlankStart::of(0)).await;
         server.abort();
         result
     }
@@ -117,8 +121,8 @@ impl ReplacementAgent {
             "/v1/nodes" => (
                 200,
                 serde_json::json!([
-                    {"ID":"removed-node", "Name":"sealer-0", "Status":"down"},
-                    {"ID":"replacement-node", "Name":"sealer-0", "Status":"ready"}
+                    {"ID":"removed-node", "Name":"sealer-0", "Status":self.old_node, "Address":"10.0.0.1"},
+                    {"ID":"replacement-node", "Name":"sealer-0", "Status":"ready", "Address":"10.0.0.2"}
                 ])
                 .to_string(),
             ),
@@ -149,9 +153,15 @@ impl ReplacementAgent {
 
 #[tokio::test]
 async fn replacement_catchup_ignores_old_allocations_by_node_identity() {
-    for old_status in ["running", "complete", "failed", "lost"] {
+    // The removed node is down, or still ready inside its heartbeat grace
+    // but gone from the contract.
+    for (old_status, old_node) in ["running", "complete", "failed", "lost"]
+        .into_iter()
+        .flat_map(|s| [(s, "down"), (s, "ready")])
+    {
         let logs = ReplacementAgent {
             old_status,
+            old_node,
             live_status: 200,
             live_logs: "sealer state FRESH at genesis memberId=0\nsealer snapshot TAKEN memberId=0 block=969\n",
         }.read().await.unwrap();
@@ -172,6 +182,7 @@ async fn replacement_catchup_requires_live_start_and_snapshot_evidence() {
     ] {
         let logs = ReplacementAgent {
             old_status: "complete",
+            old_node: "down",
             live_status: 200,
             live_logs,
         }
@@ -186,6 +197,7 @@ async fn replacement_catchup_requires_live_start_and_snapshot_evidence() {
 async fn replacement_catchup_keeps_live_log_failures_fatal() {
     let error = ReplacementAgent {
         old_status: "complete",
+        old_node: "down",
         live_status: 400,
         live_logs: "live log unavailable",
     }

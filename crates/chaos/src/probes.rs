@@ -205,6 +205,15 @@ impl Probes {
         metrics::first(&body, metric)
     }
 
+    /// The counter `metric` of the mirror on executor node `i`. A counter
+    /// that has not counted yet has no sample, so an exporter that
+    /// answers without it reads 0. `None` when the exporter does not
+    /// answer.
+    pub async fn mirror_counter(&self, i: usize, metric: &str) -> Option<i64> {
+        let body = self.scrape.fetch(&self.mirror_target(i)).await?;
+        metrics::sum_where(&body, metric, "")
+    }
+
     /// The validator's loopback target.
     #[must_use]
     pub fn validator_target(&self) -> Target {

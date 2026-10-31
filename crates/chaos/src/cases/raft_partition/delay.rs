@@ -5,10 +5,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use serde_json::Value;
 
-use super::{PORTS, Partition};
+use super::{FaultEnd, PORTS, Partition};
 use crate::cases::combined::Check;
 use crate::harness::Harness;
-use crate::probes::CLUSTER_TASK;
 
 const CTX: &str = "raft-leader-packet-delay";
 const SCRIPT: &str = include_str!("delay/fault.py");
@@ -38,19 +37,15 @@ impl PacketDelay {
             "failure": outcome.as_ref().err().map(|e| format!("{e:#}")),
             "cleanup_failure": cleared.as_ref().err().map(|e| format!("{e:#}")),
         });
-        let saved = std::fs::write(
-            "/tmp/chaos-raft-leader-packet-delay-fault.json",
-            serde_json::to_vec_pretty(&report)?,
-        );
-        if let Err(error) = &cleared {
-            crate::log(format!("{CTX}: cleanup fails: {error:#}"));
+        FaultEnd {
+            ctx: CTX,
+            outcome,
+            cleared,
+            path: "/tmp/chaos-raft-leader-packet-delay-fault.json",
+            report,
         }
-        outcome?;
-        cleared?;
-        saved?;
-        h.assert_count(CLUSTER_TASK, 3, h.knobs.rejoin_slo).await?;
-        h.assert_progress().await?;
-        Check::assert_one_leader(h, CTX).await
+        .conclude(h)
+        .await
     }
 }
 

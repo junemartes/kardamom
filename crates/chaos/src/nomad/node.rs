@@ -65,6 +65,21 @@ impl NodeDetail {
     }
 }
 
+/// The message of the event that marks a node down.
+const HEARTBEAT_MISSED: &str = "Node heartbeat missed";
+
+impl NodeDetail {
+    /// Each missed heartbeat of the node, as `<name>@<timestamp>`.
+    fn missed_heartbeats(&self) -> impl Iterator<Item = String> + '_ {
+        self.events
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|e| e.message == HEARTBEAT_MISSED)
+            .map(|e| format!("{}@{}", self.name, e.timestamp.as_deref().unwrap_or("-")))
+    }
+}
+
 impl NodeEvent {
     fn line(&self) -> String {
         format!(
@@ -84,6 +99,21 @@ impl Nomad {
     /// Returns an error if the request fails or the body is not a node.
     pub(crate) async fn node(&self, id: &str) -> anyhow::Result<NodeDetail> {
         self.read(&format!("/v1/node/{id}")).await
+    }
+
+    /// Every missed heartbeat that the servers recorded, on every client
+    /// node, as `<name>@<timestamp>`. A missed heartbeat marks the node
+    /// down.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a request fails.
+    pub(crate) async fn missed_heartbeats(&self) -> anyhow::Result<Vec<String>> {
+        let mut missed = Vec::new();
+        for node in self.nodes().await? {
+            missed.extend(self.node(&node.id).await?.missed_heartbeats());
+        }
+        Ok(missed)
     }
 }
 
@@ -110,6 +140,10 @@ mod tests {
             "  node control-0: status=down since=2025-10-24T10:30:45Z node heartbeat missed\n\
              \x20   2026-10-24T10:00:00Z [Cluster] Node registered\n\
              \x20   2026-10-24T10:30:45Z [Cluster] Node heartbeat missed"
+        );
+        assert_eq!(
+            node.missed_heartbeats().collect::<Vec<_>>(),
+            ["control-0@2026-10-24T10:30:45Z"]
         );
         let quiet: NodeDetail = serde_json::from_value(serde_json::json!({
             "Name": "exec-0", "Status": "ready", "StatusUpdatedAt": 0, "Events": null

@@ -1,6 +1,8 @@
 //! How a frozen consumer heals once the window of the sealer passed its
 //! cursor: the repair from a peer checkpoint, or the read of the egress.
 
+use std::time::Duration;
+
 use super::{Repair, Victim};
 use crate::harness::Harness;
 use crate::poll::{self, Budget};
@@ -38,6 +40,24 @@ impl Heal {
         } else {
             Self::Repair
         }
+    }
+
+    /// The shortest freeze of an overrun. Every path outlasts the
+    /// evicting freeze of the Aeron stall tolerance. The repair path also
+    /// crosses the 90 s cluster session timeout, so its resume goes
+    /// through a fresh session. The egress path holds no cluster session.
+    pub(super) fn shortest_freeze(self, h: &Harness) -> Duration {
+        let evicting = h.knobs.aeron_stall.evicting_freeze();
+        match self {
+            Self::Repair => evicting.max(Duration::from_mins(2)),
+            Self::Egress => evicting,
+        }
+    }
+
+    /// Whether the heal fetches a peer checkpoint, so the case must wait
+    /// for one on the donor first.
+    pub(super) fn needs_peer_checkpoint(self) -> bool {
+        matches!(self, Self::Repair)
     }
 
     /// The log lines that tell the heal of `victim`.

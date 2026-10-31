@@ -221,14 +221,14 @@ The sealer refuses user records when the batcher falls too far behind on L1. Bel
 Every chaos case ends with a **recovery probe**.
 
 - The case load ended and the executors converged.
-- Two 30 s loads then run at the same time. Each load runs at half the case rate.
+- Two 10 s loads then run at the same time. Each load runs at half the case rate. Each load holds a slot for every submit of its window, so a slow receipt does not lower its rate.
 - Load 1 runs on the account of the case, from its next nonce. It uses the ingress that the case load used. It stands for a sender that had transactions in flight during the outage.
 - Load 2 runs on the account of the smoke gate. No case load spends that account. It uses the other ingress. It stands for a sender with nothing in flight.
 - Each load starts at the next nonce of its account. The harness reads that nonce from the ingress.
   - The read repeats on `account state unavailable` (`-32000`) for at most 60 s. Any other error fails the case at once.
   - The ingress asks every executor before it gives this error. One dead executor therefore does not cause it.
   - A stall of the shared CI runner can delay every executor past the 2 s query timeout at the same time. A wallet retries this error, so the harness retries it too.
-- Every offered transaction of both loads must get a receipt.
+- Every offered transaction of both loads must get a receipt. A submit that parks past the timeout of the ingress gets no receipt, so every receipt arrives inside the park.
 - Each load must be accepted at a quarter of its rate or more.
 - If load 1 alone fails, a sender is stuck.
 - If load 2 fails, the pipeline or an ingress did not recover.
@@ -1587,11 +1587,15 @@ A deploy replaces service instances one at a time under readiness checks. The ch
 - The release gate refuses a release before any job changes: a chain that stands on a halt or a pause, an image that the registry does not hold, a coordinated or an unaccepted one-way format change, a sealer setting that every member must match, and a shard map change. See "The release gate" in [../deploy/cluster/README.md](../deploy/cluster/README.md).
 - The deploy record (the Nomad variable `kardamom/deploys/<env>`) holds the pre-deploy version of every job. `just rollback <env>` reverts every job of the last release to that version, in reverse deploy order, under the same waits. It does not cross a rollback floor. Runbook: [runbooks/deploy-rollback.md](runbooks/deploy-rollback.md).
 - Proof: `deploy-broken-image` (`chaos-executor` shard).
-  - The case deploys a manifest whose executor image is a real image that is not an executor.
-  - The new replica never passes its readiness check. Nomad fails the deployment at its healthy deadline.
-  - Each deploy waits until the release gate shows no root and no pause, so the gate does not refuse it.
-  - The deploy must fail at the executor rollout: the executor job has a new version. At least two executors must keep running the old image. The case reads the image from the job spec of each running allocation, not from its job version. On the sealer nodes the deploy rolls one pinned group at a time, and Nomad moves an unchanged group to the new job version in place. The chain must keep advancing.
-  - The deploy of the real manifest then heals the job.
+  - The case rolls the executor job in Nomad, without the deploy play. It takes the job as Nomad holds it, and changes the first executor group: its executor image becomes a real image that is not an executor.
+  - The rolled group gets a healthy deadline of 50 s and a progress deadline of 55 s. The rest of the update stanza stays: one instance at a time, no revert.
+  - The new replica never passes its readiness check. Nomad must mark the deployment `failed`, with no healthy replica of the broken image.
+  - At least two executors must keep running the old image. The case reads the image from the job spec of each running allocation. The chain must keep advancing.
+  - The real image under the same deadlines then heals the group, and that deployment must be `successful`. So the deadline is one that a real executor meets. Then the job gets back its own update stanza.
+  - The checks of the deploy play no longer run on a live cluster in this case. They moved to the mock Nomad API of `deploy/cluster/ansible/tests/test_deploy.py`:
+    - the stop of the play at a failed rollout: `DeployTest.test_a_failed_deployment_stops_the_deploy_at_its_job` and `DeployTest.test_a_failed_job_of_a_wave_stops_the_deploy_at_the_end_of_the_wave`;
+    - the release gate on a halted chain: `RecordTest.test_a_halted_chain_refuses_the_release`;
+    - the carry gates of `carry_gate.yml`: `CarryTest.test_the_version_floor_needs_every_reader_of_a_relayed_full_reference`, `CarryTest.test_the_readers_move_to_the_egress_past_the_last_stored_reference` and `CarryTest.test_the_carry_executors_move_one_at_a_time_after_the_switch`.
 - The deploy flow is in [../deploy/cluster/README.md](../deploy/cluster/README.md).
 
 ## Substrate (the shared failure domain)

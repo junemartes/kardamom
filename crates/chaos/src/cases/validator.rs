@@ -12,6 +12,10 @@ const VERIFIED: &str = "validator_blocks_verified_total";
 pub(crate) const COMMITTED: &str = "validator_committed_block";
 pub(crate) const DIVERGENCE: &str = "validator_divergence_total";
 const BAL_MISSING: &str = "validator_bal_missing_total";
+/// How long a lapsed or joining validator may take to verify live and
+/// close its lag, in seconds: inside the 180 s case deadline, after the
+/// freeze or the wipe.
+const CATCH_UP_SECS: u64 = 120;
 
 /// The last warm-up observations, for the log or the failure line.
 #[derive(Debug, Clone, Copy, Default)]
@@ -191,6 +195,8 @@ pub(crate) async fn lapse(h: &mut Harness) -> anyhow::Result<()> {
         h.knobs.validator_lapse.as_secs(),
         started0.as_deref().unwrap_or("?")
     ));
+    // The lapse counts from the SIGSTOP: the freeze check runs inside it.
+    let frozen_at = std::time::Instant::now();
     h.freeze_verified(
         &node,
         &inner,
@@ -198,15 +204,14 @@ pub(crate) async fn lapse(h: &mut Harness) -> anyhow::Result<()> {
         "validator-lapse",
     )
     .await?;
-    tokio::time::sleep(
-        h.knobs
-            .validator_lapse
-            .saturating_sub(Duration::from_secs(3)),
-    )
-    .await;
+    tokio::time::sleep(h.knobs.validator_lapse.saturating_sub(frozen_at.elapsed())).await;
     thaw_validator(h, &node, &inner).await;
-    confirm_thaw(h, &node, &inner).await;
+    confirm_thaw(h, &node, &inner, started0.as_deref()).await;
+    // The catch-up runs under a load at the probe rate: the lag at the
+    // thaw must close while new blocks still come.
+    let catch_up = h.catch_up_load("validator-lapse").await?;
     let (path, sample) = sample_recovery(h, &node, started0.as_deref(), vf0).await?;
+    catch_up.finish().await?;
     let d1 = h
         .probes
         .val_metric_required(DIVERGENCE, "validator-lapse divergence==0 assert")
@@ -259,29 +264,42 @@ async fn thaw_validator(h: &Harness, node: &str, inner: &str) {
     }
 }
 
+/// The grace window of the thaw. An evicted validator exits by design
+/// after its Aeron destination lingers 35 s, so the window ends after
+/// that exit.
+const THAW_GRACE_SECS: u64 = 45;
+
 /// The verified thaw: within a grace window the endpoint must answer or
-/// the container must have been replaced. Otherwise the frozen orphan
-/// is killed, so it frees the metrics port for the supervisor's
-/// replacement instead of stranding every restart on EADDRINUSE.
-async fn confirm_thaw(h: &Harness, node: &str, inner: &str) {
+/// the frozen process must end. A process that ended shows no running
+/// container of that name, another container, or a new start time.
+/// Otherwise the frozen orphan is killed, so it frees the metrics port
+/// for the supervisor's replacement instead of stranding every restart
+/// on EADDRINUSE.
+async fn confirm_thaw(h: &Harness, node: &str, inner: &str, started0: Option<&str>) {
     let target = h.probes.validator_target();
     let target = &target;
-    let outcome = poll::after_sleep(Budget::secs(30, 5), |_| async move {
+    let outcome = poll::after_sleep(Budget::secs(THAW_GRACE_SECS, 5), |_| async move {
         if h.probes.scrape().answers(target).await {
             return Ok::<_, anyhow::Error>(Some(()));
         }
-        let current = h.nodes.inner_container(node, "validator").await;
-        Ok(current.filter(|c| c != inner).map(|c| {
+        let running = h.nodes.inner_container(node, "validator").await;
+        let started = h.nodes.started_at(node, inner).await;
+        let ended = running.as_deref() != Some(inner)
+            || (started0.is_some() && started.as_deref() != started0);
+        Ok(ended.then(|| {
             crate::log(format!(
-                "validator-lapse: container replaced during/after freeze ({inner} -> {c})"
+                "validator-lapse: the frozen process of {inner} ended (running {}, start {} -> {})",
+                running.as_deref().unwrap_or("none"),
+                started0.unwrap_or("?"),
+                started.as_deref().unwrap_or("none")
             ));
         }))
     })
     .await;
     if !matches!(outcome, Ok(poll::Outcome::Ready { .. })) {
-        crate::log(
-            "validator-lapse: thaw NOT confirmed after 30s — killing the frozen orphan (releases the metrics port for the supervisor's replacement)",
-        );
+        crate::log(format!(
+            "validator-lapse: thaw NOT confirmed after {THAW_GRACE_SECS}s — killing the frozen orphan (releases the metrics port for the supervisor's replacement)"
+        ));
         let _ = h.nodes.inner_kill(node, inner).await;
     }
 }
@@ -302,7 +320,7 @@ async fn sample_recovery(
 ) -> anyhow::Result<(Path, Warm)> {
     let last = Cell::new((Path::Survivor, Warm::default()));
     let last_ref = &last;
-    let outcome = poll::after_sleep(Budget::secs(240, 10), |elapsed| async move {
+    let outcome = poll::after_sleep(Budget::secs(CATCH_UP_SECS, 5), |elapsed| async move {
         let Some((path, w)) = recovery_sample(h, node, started0, elapsed).await else {
             crate::log(format!(
                 "validator-lapse: sample t={}s SCRAPE FAILED (not counted)",
@@ -392,11 +410,14 @@ pub(crate) async fn join(h: &mut Harness) -> anyhow::Result<()> {
         .await
         .map_err(|e| crate::chaos_fail!("validator-join: state wipe failed: {e}"))?;
     crate::log("validator-join: validator killed, state + checkpoint staging wiped");
+    // The fresh validator joins under a load at the probe rate: it must
+    // close the lag of the wipe while new blocks still come.
+    let catch_up = h.catch_up_load("validator-join").await?;
     let newborn = RefCell::new(None::<String>);
     let last = Cell::new(Warm::default());
     let (hs, node_ref, started0_ref) = (&*h, node.as_str(), started0.as_deref());
     let (newborn_ref, last_ref) = (&newborn, &last);
-    let outcome = poll::until(Budget::secs(240, 10), |elapsed| async move {
+    let outcome = poll::until(Budget::secs(CATCH_UP_SECS, 10), |elapsed| async move {
         if newborn_ref.borrow().is_none() {
             *newborn_ref.borrow_mut() = newborn_container(hs, node_ref, started0_ref).await;
         }
@@ -413,11 +434,12 @@ pub(crate) async fn join(h: &mut Harness) -> anyhow::Result<()> {
     let poll::Outcome::Ready { value: w, .. } = outcome else {
         val_debug(h).await;
         return Err(crate::chaos_fail!(
-            "validator-join: fresh validator not verifying + caught up within 240s (newborn={}, {})",
+            "validator-join: fresh validator not verifying + caught up within {CATCH_UP_SECS}s (newborn={}, {})",
             newborn.as_deref().unwrap_or("none"),
             warm_line(last.get())
         ));
     };
+    catch_up.finish().await?;
     let newborn = newborn.unwrap_or_default();
     let logs = h
         .nodes

@@ -43,6 +43,23 @@ const STATE_UNAVAILABLE_CODE: i64 = -32000;
 /// with other refusals, so the prefix names this one.
 const STATE_UNAVAILABLE: &str = "account state unavailable";
 
+/// The message of a blocking submit that parked until the timeout of
+/// the ingress. The transaction can still land.
+const PARK_TIMEOUT: &str = "timed out waiting for receipt or watermark";
+
+/// The refusals of a resent submit whose first send reached the
+/// pipeline: a sequencer holds the transaction, or its nonce is spent.
+const HELD_ALREADY: [&str; 3] = [
+    "already known",
+    "duplicate (sender, nonce)",
+    "nonce too low",
+];
+
+/// The bound of one call. It is above the 30 s park of a blocking submit
+/// at the ingress, so a parked submit gets the answer of the ingress
+/// before the client gives up.
+const CALL_TIMEOUT: Duration = Duration::from_secs(35);
+
 /// The bound of one nonce read through `account state unavailable`. The
 /// ingress tries every executor endpoint inside one call, so this refusal
 /// means that no executor answered in its timeout. A stall of the shared
@@ -85,6 +102,16 @@ impl RpcError {
     fn is_state_unavailable(&self) -> bool {
         self.code == STATE_UNAVAILABLE_CODE && self.message.starts_with(STATE_UNAVAILABLE)
     }
+
+    /// Whether a blocking submit parked until the timeout of the ingress.
+    fn is_park_timeout(&self) -> bool {
+        self.message.starts_with(PARK_TIMEOUT)
+    }
+
+    /// Whether a resent submit finds its first send in the pipeline.
+    fn holds_the_transaction(&self) -> bool {
+        HELD_ALREADY.iter().any(|p| self.message.starts_with(p))
+    }
 }
 
 /// One signed transaction: its `0x` encoding and its hash.
@@ -118,7 +145,7 @@ impl Rpc {
     /// Returns an error if the HTTP client fails to build.
     pub fn new(url: &str, chain_id: u64) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
+            .timeout(CALL_TIMEOUT)
             .build()
             .context("build the RPC HTTP client")?;
         Ok(Self {
@@ -305,7 +332,7 @@ impl Rpc {
 
     /// True when a call got no answer: the connection failed, or the
     /// request timed out.
-    fn is_unreachable(e: &anyhow::Error) -> bool {
+    pub(super) fn is_unreachable(e: &anyhow::Error) -> bool {
         e.downcast_ref::<reqwest::Error>()
             .is_some_and(|e| e.is_connect() || e.is_timeout())
     }
