@@ -92,6 +92,52 @@
       },
       "ci_mode": "in-process"
     },
+    "sequencer-resize": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-sequencer",
+        "--test",
+        "resize_handoff"
+      ],
+      "real": [
+        "the v1 Sequencer core of each lane replica, with its vslot set, old-lane reads and shadow warm-up",
+        "ShardMap identity and rebalance, and lane_for routing",
+        "the resync controller and its receipt floors",
+        "the signed envelopes of the testkit"
+      ],
+      "controlled": [
+        "the ingress: one map version at a time, routing each sender by ShardMap::lane_for",
+        "the sealer: first-seen dedup of every replica offer",
+        "the executors: every ordered transaction as a receipt floor to every replica, and the committed floors for a started replica",
+        "a 300-ms transaction lifetime and a 500-ms warm-up"
+      ],
+      "tests": [
+        "a_scale_out_and_in_with_a_killed_new_replica_orders_every_nonce_once"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "a replica in shadow mode offers its incoming slots",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "a_scale_out_and_in_with_a_killed_new_replica_orders_every_nonce_once"
+          ]
+        },
+        {
+          "mutation": "a receipt floor does not raise the floor of its sender",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "a_scale_out_and_in_with_a_killed_new_replica_orders_every_nonce_once"
+          ]
+        }
+      ],
+      "limitation": "Replicas are in-process; no Aeron, no Java sealer contiguity guard, no v2 admission loop. The ingress map roll and the Nomad scale steps stay in the chaos shard.",
+      "ci_mode": "in-process"
+    },
     "executor-commit": {
       "command": [
         "cargo",
@@ -259,6 +305,39 @@
         }
       ],
       "limitation": "Each node is a real process with real storage, but the canonical stream comes from a controlled sealer log, not Aeron Cluster members, and the receipts go to a file, not Aeron. No Nomad, Consul, Docker node, image rollout or network identity. The DA image comes from the production batch codec and reconstruction, but not from an L1 scan or the DA HTTP store. A process kill keeps the page cache: no power loss.",
+      "ci_mode": "in-process"
+    },
+    "ingress-sealer-quorum": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-ingress",
+        "--lib",
+        "chain::tests::"
+      ],
+      "real": [
+        "ChainWatch of the ingress: the sealer silence budget and the SealerNoQuorum halt",
+        "the submit root that pauses submits on a sealer halt"
+      ],
+      "controlled": [
+        "the status frames of the cluster session and the clock of each check"
+      ],
+      "tests": [
+        "chain::tests::a_silent_cluster_halts_the_sealer_on_a_lost_quorum_and_a_status_ends_it"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "a silent cluster raises no halt",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "chain::tests::a_silent_cluster_halts_the_sealer_on_a_lost_quorum_and_a_status_ends_it"
+          ]
+        }
+      ],
+      "limitation": "The watch, not a whole ingress process or a real cluster session.",
       "ci_mode": "in-process"
     },
     "executor-driver-late-start": {
@@ -533,24 +612,25 @@
         "kardamom-state-mirror",
         "--features",
         "docker-e2e",
-        "total_loss",
+        "component_tests::total_loss::",
         "--",
         "--ignored",
-        "--exact",
-        "mirror::component_tests::total_loss::a_total_loss_rebuilds_every_account_and_the_readers_recover"
+        "--test-threads=1"
       ],
       "real": [
         "Mirror::run and Rebuild with a 1,025-account checkpoint",
         "AccountCache over Sentinel discovery",
         "CacheReader degraded reads",
-        "Redis primary, replica and three Sentinels with no persistence"
+        "Redis primary, replica and three Sentinels with no persistence",
+        "three mirrors and two CacheReader instances with the production degraded and lookup counters"
       ],
       "controlled": [
         "docker kill of all five containers for 11 s, then a start in the first order",
         "a newer checkpoint written after the loss, as the executors do"
       ],
       "tests": [
-        "mirror::component_tests::total_loss::a_total_loss_rebuilds_every_account_and_the_readers_recover"
+        "mirror::component_tests::total_loss::a_total_loss_rebuilds_every_account_and_the_readers_recover",
+        "mirror::component_tests::total_loss::the_whole_read_path_returns_in_reverse_order_and_every_mirror_rebuilds"
       ],
       "negative_controls": [
         {
@@ -560,9 +640,17 @@
           "failed_tests": [
             "mirror::component_tests::total_loss::a_total_loss_rebuilds_every_account_and_the_readers_recover"
           ]
+        },
+        {
+          "mutation": "a cold Redis does not start a rebuild",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "mirror::component_tests::total_loss::the_whole_read_path_returns_in_reverse_order_and_every_mirror_rebuilds"
+          ]
         }
       ],
-      "limitation": "One mirror, fed by encoded frames instead of Aeron. Fixed host ports stand in for stable service addresses.",
+      "limitation": "The mirrors are fed by encoded frames instead of Aeron, and the executors stand in as a newer checkpoint and a live batch. Fixed host ports stand in for stable service addresses.",
       "ci_mode": "docker"
     },
     "cache-sentinel-total-loss": {
@@ -3451,7 +3539,7 @@
     {
       "case": "executor-sealer-loss-recover",
       "family": "CombinedExec",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "transport-pressure",
@@ -3460,9 +3548,26 @@
         {
           "suite": "executor-recovery",
           "test": "whole::executors_that_return_before_the_sealers_wait_and_then_catch_up"
+        },
+        {
+          "suite": "sealer-raft-fleet",
+          "test": "io.kardamom.sealer.cluster.ClusterTotalLossRecoverTest::every_member_returns_from_its_own_state_and_the_cluster_commits_again()"
+        },
+        {
+          "suite": "ingress-sealer-quorum",
+          "test": "chain::tests::a_silent_cluster_halts_the_sealer_on_a_lost_quorum_and_a_status_ends_it"
+        },
+        {
+          "suite": "pipeline-recovery",
+          "test": "pipeline_blackout_restarts_every_process_and_reelects"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "node kills of the executor and sealer nodes, Nomad job stops and restores, and the allocation counts that show no failed restart",
+        "the ingress pair live check on deployed ingress processes",
+        "the 60 s reverse stagger of the executors before the sealers on deployed nodes"
+      ]
     },
     {
       "case": "executor-sealer-validator-recover",
@@ -3510,7 +3615,7 @@
     {
       "case": "read-path-loss-recover",
       "family": "CombinedExec",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "executor-commit",
@@ -3555,9 +3660,24 @@
         {
           "suite": "state-mirror-total-loss",
           "test": "mirror::component_tests::total_loss::a_total_loss_rebuilds_every_account_and_the_readers_recover"
+        },
+        {
+          "suite": "state-mirror-total-loss",
+          "test": "mirror::component_tests::total_loss::the_whole_read_path_returns_in_reverse_order_and_every_mirror_rebuilds"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::returned_ingresses_serve_a_pre_fault_receipt_from_executor_state"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::a_whole_fleet_kill_resumes_each_replica_from_its_own_disk"
         }
       ],
-      "full_case_locally_validated": false
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad stop and restore of the executor, redis and state-mirror jobs, and their allocation counts"
+      ]
     },
     {
       "case": "sequencer-executor-redis-loss",
@@ -3957,6 +4077,14 @@
         {
           "suite": "state-mirror",
           "test": "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close"
+        },
+        {
+          "suite": "executor-total-wipe-l1",
+          "test": "l1::a_total_wipe_resumes_every_replica_from_an_image_rebuilt_from_l1"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::a_total_wipe_resumes_every_replica_from_a_rebuilt_da_image"
         }
       ],
       "full_case_locally_validated": false
@@ -3964,9 +4092,18 @@
     {
       "case": "resize-scale-out-in",
       "family": "Integrity",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer-resize",
+          "test": "a_scale_out_and_in_with_a_killed_new_replica_orders_every_nonce_once"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the Nomad scale-out and scale-in jobs, and the count of six sequencer allocations during the overlap",
+        "the ingress roll onto each map version: a job update that the ingress map-version gauge shows"
+      ]
     },
     {
       "case": "carry-versions-on",
@@ -4146,7 +4283,7 @@
     {
       "case": "node-failure-executor",
       "family": "Executor",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "state-writer-crash",
@@ -4169,30 +4306,38 @@
           "test": "io.kardamom.sealer.cluster.SealerClusterFailoverTest::egressContinuesGaplesslyAcrossLeaderKill()"
         },
         {
+          "suite": "sealer-raft-members",
+          "test": "io.kardamom.sealer.cluster.ClusterFollowerKillTest::a_killed_follower_restores_its_snapshot_while_the_quorum_commits()"
+        },
+        {
           "suite": "executor-driver-late-start",
           "test": "an_executor_started_before_its_driver_waits_and_opens_its_streams"
         }
       ],
-      "full_case_locally_validated": false,
+      "full_case_locally_validated": true,
       "cluster_only_checks": [
-        "docker kill and docker start of the node container: the deployment node, which a process kill stands in for locally",
+        "docker kill and docker start of the node container, and Nomad placement of the executor and the member on it",
         "Nomad restart and allocation count: the orchestrator brings the task back; the local test starts the process itself"
       ]
     },
     {
       "case": "node-replace-executor",
       "family": "Executor",
-      "status": "partial",
+      "status": "ported",
       "local_tests": [
         {
           "suite": "executor-recovery",
           "test": "replica::a_blank_replacement_fetches_a_peer_checkpoint_and_catches_up"
+        },
+        {
+          "suite": "sealer-raft-members",
+          "test": "io.kardamom.sealer.cluster.NodeReplaceSealerTest::a_follower_on_a_new_node_seeds_from_a_peer_and_catches_up()"
         }
       ],
-      "full_case_locally_validated": false,
+      "full_case_locally_validated": true,
       "cluster_only_checks": [
         "machine replacement: a new container generation, address plan and substrate play",
-        "Consul forgets the old node record and Nomad places the executor on the new client"
+        "Consul forgets the old node record and Nomad places the executor and the member on the new client"
       ]
     },
     {

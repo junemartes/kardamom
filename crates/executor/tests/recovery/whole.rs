@@ -405,14 +405,14 @@ async fn returned_ingresses_serve_a_pre_fault_receipt_from_executor_state() {
     fleet.start();
     fleet.wait_head(10, CATCH_UP);
     let receipted = world.chain.envelope(4).tx_hash;
-    let before: Vec<Ingress> = (0..2).map(|_| Ingress::start(&fleet.0)).collect();
-    for ingress in &before {
+    // Both ingresses read the receipt before the fault; they end with
+    // this scope, as their processes do.
+    for ingress in [Ingress::start(&fleet.0), Ingress::start(&fleet.0)] {
         assert!(
             ingress.receipt(receipted).await.is_some(),
             "receipted before the fault"
         );
     }
-    drop(before);
     fleet.kill();
     let heads: Vec<u64> = fleet.0.iter().map(NodeHandle::head).collect();
     let sealed = load.sealed();
