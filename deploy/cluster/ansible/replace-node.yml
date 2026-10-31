@@ -27,11 +27,24 @@
 
 # The node contract gives the node address and name. The roles read one
 # gathered fact, the architecture, and only to install software on a node
-# without the prepared image. The minimal subset holds it.
+# without the prepared image. So the play gathers the minimal subset only
+# when the prepared-software marker is missing.
 - name: Configure and start the agents of the replaced node
   hosts: container_nodes
   become: true
-  gather_subset: [min]
+  gather_facts: false
+  vars_files:
+    - node-software.yml
+  pre_tasks:
+    - name: Look for the prepared-software marker of the image
+      ansible.builtin.stat:
+        path: "{{ node_software_marker_path }}"
+      register: replace_node_marker
+
+    - name: Gather the minimal facts of a node without the prepared image
+      ansible.builtin.setup:
+        gather_subset: [min]
+      when: not replace_node_marker.stat.exists
   roles:
     - common
     - docker
