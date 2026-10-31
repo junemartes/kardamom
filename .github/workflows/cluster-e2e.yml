@@ -64,10 +64,12 @@ on:
     - cron: "17 3 * * *"
 
 concurrency:
-  # A newer run of the same event and ref replaces the older one. The
-  # schedule, a dispatch and a labeled pull request each have their own
-  # group, so a dispatch on main and the schedule never cancel each other.
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  # A newer run of the same event, label and ref replaces the older one.
+  # The schedule, a dispatch and each label of a pull request have their
+  # own group: a dispatch on main and the schedule never cancel each other,
+  # and another label on a pull request never cancels its chaos-nightly
+  # run. Only a new chaos-nightly label event replaces that run.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.label.name || 'none' }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -565,15 +567,19 @@ jobs:
   # of the same shard adds a comment with the run, so one open issue
   # tracks one shard.
   nightly-report:
-    needs: cluster-e2e
-    if: always() && github.event_name == 'schedule' && needs.cluster-e2e.result != 'skipped'
+    # Every scheduled run reports, also when a stage before the shards
+    # failed and every shard was skipped.
+    needs: [build, node-image, prepare-cluster, cluster-e2e]
+    if: always() && github.event_name == 'schedule'
     name: open an issue per failed nightly shard
     runs-on: ubuntu-24.04
     permissions:
       issues: write
       actions: read
     steps:
-      - name: Open or update the issue of each failed shard
+      - uses: actions/checkout@v4
+
+      - name: Open or update the issue of each failed stage and shard
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -581,30 +587,35 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/jobs" \
-            --jq '.jobs[] | select(.conclusion == "failure" and (.name | startswith("container cluster e2e ("))) | "\(.id) \(.html_url) \(.name | capture("\\((?<shard>[^)]+)\\)") | .shard)"' > failed-shards
-          if [ ! -s failed-shards ]; then
-            echo "every nightly shard passed"
+          # scripts/ci/nightly_report.py picks the jobs that need an issue:
+          # every stage and every shard whose conclusion is not success.
+          gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/jobs" --jq '.jobs[]' \
+            | python3 scripts/ci/nightly_report.py > findings
+          if [ ! -s findings ]; then
+            echo "every nightly stage and shard passed"
             exit 0
           fi
-          while read -r job url shard; do
-            # The failed cases: the cases that the log starts and does not
-            # pass.
-            gh api "repos/$GH_REPO/actions/jobs/$job/logs" > shard.log || true
-            sed -n 's/.*= CHAOS CASE: \([a-z0-9-]*\).*/\1/p' shard.log | sort -u > started
-            sed -n 's/.*CHAOS CASE \([a-z0-9-]*\): PASS.*/\1/p' shard.log | sort -u > passed
-            cases=$(comm -23 started passed | paste -sd, -)
-            title="nightly: the $shard shard failed"
+          while IFS=$'\t' read -r kind job url conclusion title; do
+            if [ "$kind" = shard ]; then
+              # The failed cases: the cases that the log starts and does
+              # not pass.
+              gh api "repos/$GH_REPO/actions/jobs/$job/logs" > shard.log || true
+              sed -n 's/.*= CHAOS CASE: \([a-z0-9-]*\).*/\1/p' shard.log | sort -u > started
+              sed -n 's/.*CHAOS CASE \([a-z0-9-]*\): PASS.*/\1/p' shard.log | sort -u > passed
+              cases=$(comm -23 started passed | paste -sd, -)
+            else
+              cases="none: the run stopped before the shards"
+            fi
             {
-              echo "The nightly run $RUN_URL failed the \`$shard\` shard."
+              echo "The nightly run $RUN_URL ended with \`$conclusion\`: $title."
               echo
               echo "- Failed cases: ${cases:-none found in the log}"
-              echo "- Shard log: $url"
+              echo "- Job log: $url"
               echo "- The chaos evidence artifacts of the run hold the state files."
               echo
               echo "Triage checklist:"
               echo
-              echo "- [ ] Find the cause in the shard log."
+              echo "- [ ] Find the cause in the job log."
               echo "- [ ] Add or extend an isolated test in scripts/ci/component-recovery.json (the in-process suite) that reproduces the failure. Name the case and the test here."
               echo "- [ ] Fix the product or the test."
               echo "- [ ] Link the pull request here."
@@ -613,9 +624,9 @@ jobs:
               --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)
             if [ -n "$number" ]; then
               gh issue comment "$number" --repo "$GH_REPO" --body-file issue-body.md
-              echo "updated #$number for $shard"
+              echo "updated #$number: $title"
             else
               gh issue create --repo "$GH_REPO" --title "$title" --label chaos-nightly --body-file issue-body.md
-              echo "opened an issue for $shard"
+              echo "opened an issue: $title"
             fi
-          done < failed-shards
+          done < findings
