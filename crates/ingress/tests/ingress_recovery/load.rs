@@ -44,6 +44,8 @@ pub(crate) struct Report {
 pub(crate) struct Load {
     pub(crate) sender: PrivateKeySigner,
     landed: Arc<AtomicU64>,
+    /// The error of the last failed submit, for a stall report.
+    last_error: tokio::sync::watch::Receiver<String>,
     stop: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<Report>,
 }
@@ -54,6 +56,7 @@ struct Client {
     readers: Vec<HttpClient>,
     landed: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    last_error: tokio::sync::watch::Sender<String>,
 }
 
 impl Client {
@@ -99,6 +102,7 @@ impl Client {
             Ok(hash) => hash == tx.hash,
             Err(e) => {
                 *last = e.to_string();
+                self.last_error.send_replace(last.clone());
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 self.any_receipt(tx.hash).await
             }
@@ -139,6 +143,7 @@ impl Load {
         let sender = PrivateKeySigner::random();
         let landed = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
+        let (last_error, last_error_rx) = tokio::sync::watch::channel(String::new());
         let task = tokio::spawn(
             Client {
                 signer: sender.clone(),
@@ -146,12 +151,14 @@ impl Load {
                 readers: readers.iter().map(|u| client(u)).collect(),
                 landed: landed.clone(),
                 stop: stop.clone(),
+                last_error,
             }
             .run(),
         );
         Self {
             sender,
             landed,
+            last_error: last_error_rx,
             stop,
             task,
         }
@@ -170,7 +177,12 @@ impl Load {
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("the load lands nothing past {floor} within {bound:?}"));
+        .unwrap_or_else(|_| {
+            panic!(
+                "the load lands nothing past {floor} within {bound:?}; last submit error: {:?}",
+                *self.last_error.borrow()
+            )
+        });
         started.elapsed()
     }
 
