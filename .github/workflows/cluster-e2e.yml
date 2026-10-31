@@ -345,8 +345,10 @@ jobs:
     # Same base as the build job: the staged binaries and libaeron.so link
     # this glibc.
     runs-on: ubuntu-24.04
-    # Recovery includes the persisted-state proof and teardown.
-    # The measured timing audit rejects jobs above the 15-minute target.
+    # Recovery includes the persisted-state proof and teardown. The
+    # workflow runs nightly. The timing audit (scripts/ci/green_streak.py)
+    # holds a shard to 15 minutes and the carry shard to 20. The timeouts
+    # are far above that, so that a slow shard still reports its result.
     timeout-minutes: ${{ matrix.shard == 'chaos-carry' && 300 || matrix.shard == 'chaos-executor' && 180 || 120 }}
     strategy:
       # Don't cancel the other shards if one fails — we want every shard's
