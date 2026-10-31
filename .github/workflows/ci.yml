@@ -318,6 +318,17 @@ jobs:
       # anvil and forge for the tests that start an L1 or build contracts.
       - uses: ./.github/actions/foundry
       - uses: ./.github/actions/solc-cache
+      # The deployer tests read the contract artifacts under contracts/out,
+      # which the deployer build script fills in the build job. This job
+      # compiles nothing, so it builds the contracts the same way.
+      - name: Build the contracts
+        working-directory: contracts
+        run: |
+          forge install --no-git --shallow \
+            foundry-rs/forge-std \
+            openzeppelin/openzeppelin-contracts@v5.0.2 \
+            openzeppelin/openzeppelin-contracts-upgradeable@v5.0.2
+          forge build
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest

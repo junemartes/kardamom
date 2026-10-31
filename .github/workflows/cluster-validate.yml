@@ -159,6 +159,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/deploy-test-host
+        with:
+          agent: true
       - name: Every deploy test class has a part
         run: python3 deploy/cluster/ansible/tests/check_parts.py .github/workflows/cluster-validate.yml
       # Run from deploy/cluster: the specs resolve file("config/...") against

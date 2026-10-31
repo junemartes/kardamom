@@ -3,7 +3,14 @@ name: deploy-test-host
 description: >-
   Prepare a runner for the deploy tests of deploy/cluster/ansible/tests:
   Ansible with the Mitogen strategy, the Ansible collections, Nomad at the
-  version of the cluster contract, and a Nomad dev agent.
+  version of the cluster contract, and on request a Nomad dev agent.
+inputs:
+  agent:
+    description: >-
+      "true" starts a Nomad dev agent, which `nomad job validate` needs.
+      The deploy tests use a fake Nomad API and need only the binary.
+    required: false
+    default: "false"
 runs:
   using: composite
   steps:
@@ -43,11 +50,15 @@ runs:
         curl -fsSL --retry 5 --retry-all-errors "https://releases.hashicorp.com/nomad/${ver}/nomad_${ver}_linux_amd64.zip" -o /tmp/nomad.zip
         sudo unzip -o /tmp/nomad.zip -d /usr/local/bin
         nomad version
+    # The cloud fingerprints wait for a metadata service, and on a busy
+    # runner that wait can outlast the start of the agent.
     - name: Start a dev agent (job validation needs the API)
+      if: inputs.agent == 'true'
       shell: bash
       run: |
-        nomad agent -dev -bind 127.0.0.1 > /tmp/nomad-dev.log 2>&1 &
-        for _ in $(seq 1 30); do
+        printf 'client {\n  options {\n    "fingerprint.denylist" = "env_aws,env_gce,env_azure,env_digitalocean"\n  }\n}\n' > /tmp/nomad-dev.hcl
+        nomad agent -dev -bind 127.0.0.1 -config /tmp/nomad-dev.hcl > /tmp/nomad-dev.log 2>&1 &
+        for _ in $(seq 1 60); do
           nomad node status > /dev/null 2>&1 && exit 0
           sleep 1
         done
