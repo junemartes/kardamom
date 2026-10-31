@@ -598,7 +598,12 @@ impl AdmissionLoop {
                 if let Some(ack) = c.answer() {
                     self.to_ingress.reject(ack, reason.clone());
                 }
-                reject(side, c.tx_hash, c.sender, c.nonce, reason);
+                // A copy of a held transaction drops nothing. A drop or a
+                // rejected status of its hash would contradict the held
+                // one, which still gets its status and its receipt.
+                if refusal.drops() {
+                    reject(side, c.tx_hash, c.sender, c.nonce, reason);
+                }
             }
             Verdict::SealerRefused(mut c, reason) => {
                 if let Some(ack) = c.answer() {
@@ -631,6 +636,7 @@ impl AdmissionLoop {
             Refusal::TooManyPending { .. } => self.hot.evictions.increment(1),
             Refusal::NonceTooLow { .. }
             | Refusal::InFlight { .. }
+            | Refusal::Known { .. }
             | Refusal::InsufficientFunds { .. } => {}
         }
     }
@@ -642,7 +648,9 @@ fn reason_of(refusal: Refusal) -> TxErrorReason {
         Refusal::NonceTooLow { chain_nonce } => TxErrorReason::DuplicatedTx {
             expected_nonce: chain_nonce,
         },
-        Refusal::InFlight { expected_nonce } => TxErrorReason::AlreadyKnown { expected_nonce },
+        Refusal::InFlight { expected_nonce } | Refusal::Known { expected_nonce } => {
+            TxErrorReason::AlreadyKnown { expected_nonce }
+        }
         Refusal::InsufficientFunds { available, cost } => TxErrorReason::InsufficientFunds {
             have: available.saturating_to(),
             want: cost.saturating_to(),

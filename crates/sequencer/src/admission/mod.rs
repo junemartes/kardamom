@@ -169,10 +169,24 @@ pub enum Refusal {
     /// The sender has too many transactions that wait. `expected_nonce`
     /// is the next nonce of the sender, 0 while its state is unknown.
     TooManyPending { expected_nonce: u64 },
-    /// The filter forwarded or holds a transaction at this nonce already.
+    /// The filter forwarded or holds another transaction at this nonce.
     InFlight { expected_nonce: u64 },
+    /// The filter forwarded or holds this very transaction: the same hash
+    /// at the same nonce. A client sends it again after a timeout. The
+    /// copy drops nothing: the held transaction stays, and its status and
+    /// its receipt follow.
+    Known { expected_nonce: u64 },
     /// The image moved too far past the parked transaction.
     Expired { expected_nonce: u64 },
+}
+
+impl Refusal {
+    /// Whether the refusal drops the transaction. A copy of a held
+    /// transaction ([`Self::Known`]) drops nothing.
+    #[must_use]
+    pub fn drops(self) -> bool {
+        !matches!(self, Self::Known { .. })
+    }
 }
 
 /// One outcome of the filter.

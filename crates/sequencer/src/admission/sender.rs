@@ -118,12 +118,8 @@ impl<T: Clone> SenderState<T> {
         }
         let next = self.next_nonce(&state);
         if c.nonce < next {
-            out.push(Verdict::Reject(
-                c,
-                Refusal::InFlight {
-                    expected_nonce: next,
-                },
-            ));
+            let refusal = Self::held_at(self.forwarded_at(c.nonce), &c, next);
+            out.push(Verdict::Reject(c, refusal));
             return false;
         }
         if c.nonce > next {
@@ -309,6 +305,17 @@ impl<T: Clone> SenderState<T> {
         true
     }
 
+    /// The refusal of `c` at a nonce where the filter forwarded or holds
+    /// `held`: the same transaction is [`Refusal::Known`], another one
+    /// [`Refusal::InFlight`].
+    fn held_at(held: Option<&Candidate<T>>, c: &Candidate<T>, expected_nonce: u64) -> Refusal {
+        if held.is_some_and(|held| held.tx_hash == c.tx_hash) {
+            Refusal::Known { expected_nonce }
+        } else {
+            Refusal::InFlight { expected_nonce }
+        }
+    }
+
     /// Park a transaction of a sender with no state, and ask for a lookup
     /// once.
     fn park_for_lookup(
@@ -337,8 +344,9 @@ impl<T: Clone> SenderState<T> {
         out: &mut Vec<Verdict<T>>,
     ) -> bool {
         let expected_nonce = self.expected_nonce();
-        if self.parked.contains_key(&c.nonce) {
-            out.push(Verdict::Reject(c, Refusal::InFlight { expected_nonce }));
+        if let Some(held) = self.parked.get(&c.nonce) {
+            let refusal = Self::held_at(Some(held), &c, expected_nonce);
+            out.push(Verdict::Reject(c, refusal));
             return false;
         }
         if self.parked.len() >= cfg.max_parked.get() {

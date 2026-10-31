@@ -42,6 +42,14 @@ fn tx(who: u8, nonce: u64, unit: u64) -> Candidate<u64> {
     }
 }
 
+/// Another transaction of `who` at `nonce`: a hash that [`tx`] never gives.
+fn other(who: u8, nonce: u64, unit: u64) -> Candidate<u64> {
+    Candidate {
+        tx_hash: B256::repeat_byte(0xee),
+        ..tx(who, nonce, unit)
+    }
+}
+
 fn state(nonce: u64, balance: u64, tx_idx: u64) -> AccountState {
     AccountState {
         nonce,
@@ -152,12 +160,12 @@ fn a_past_nonce_and_a_nonce_in_flight_are_refused() {
     );
     offer(&mut a, tx(1, 5, 2));
     assert_eq!(
-        offer(&mut a, tx(1, 5, 3)),
+        offer(&mut a, other(1, 5, 3)),
         ["R5:InFlight { expected_nonce: 6 }"]
     );
     offer(&mut a, tx(1, 7, 4));
     assert_eq!(
-        offer(&mut a, tx(1, 7, 5)),
+        offer(&mut a, other(1, 7, 5)),
         ["R7:InFlight { expected_nonce: 6 }"]
     );
 }
@@ -204,7 +212,7 @@ fn a_run_that_no_state_confirms_is_lost_after_the_loss_window() {
     a.on_rows(4, [], &mut out);
     a.sweep(Instant::now(), &mut out);
     assert!(
-        offer(&mut a, tx(1, 5, 3))[0].starts_with("R5:InFlight"),
+        offer(&mut a, tx(1, 5, 3))[0].starts_with("R5:Known"),
         "the window of 3 blocks starts at block 2, the first rows after the forward"
     );
     a.on_rows(5, [], &mut out);
@@ -354,7 +362,7 @@ fn the_loss_window_starts_at_the_first_rows_after_the_forward() {
     f.sweep(Instant::now(), &mut out);
     assert_eq!(
         offer(&mut f, tx(1, 0, 2)),
-        ["R0:InFlight { expected_nonce: 1 }"],
+        ["R0:Known { expected_nonce: 1 }"],
         "still forwarded"
     );
     let window = cfg().loss_blocks.get();
@@ -404,7 +412,7 @@ fn a_gap_over_rows_does_not_ask_again() {
 fn a_refused_transaction_can_be_sent_again_at_once() {
     let mut a = known(state(5, 2 * COST, 1));
     offer(&mut a, tx(1, 5, 1));
-    assert!(offer(&mut a, tx(1, 5, 2))[0].starts_with("R5:InFlight"));
+    assert!(offer(&mut a, tx(1, 5, 2))[0].starts_with("R5:Known"));
     let mut out = Vec::new();
     a.on_refused(sender(1), 5, &mut out);
     assert_eq!(names(&out), [] as [&str; 0]);
@@ -418,7 +426,7 @@ fn a_refusal_of_another_nonce_keeps_the_run() {
     offer(&mut a, tx(1, 5, 1));
     a.on_refused(sender(1), 9, &mut Vec::new());
     a.on_refused(sender(2), 5, &mut Vec::new());
-    assert!(offer(&mut a, tx(1, 5, 2))[0].starts_with("R5:InFlight"));
+    assert!(offer(&mut a, tx(1, 5, 2))[0].starts_with("R5:Known"));
 }
 
 /// The filter keeps each forwarded transaction until a state confirms it.
@@ -442,4 +450,56 @@ fn the_filter_keeps_the_unconfirmed_run_until_a_state_confirms_it() {
 
     a.on_refused(sender(1), 7, &mut Vec::new());
     assert_eq!(payloads(&a), [] as [u64; 0]);
+}
+
+/// The executor answers the state after records 0 and 1 (nonce 2) with
+/// the end of its snapshot, the record count 2. The row of record 2
+/// (nonce 3) carries the record's own index, 2. The answer must sit at
+/// record 1, so that the row is newer and frees the transactions parked
+/// behind nonce 2, which executed in record 2.
+#[test]
+fn the_row_of_the_next_record_is_newer_than_an_executor_answer() {
+    let answer = |value: u64| kardamom_cache::QueryAnswer {
+        value: U256::from(value),
+        block: 1,
+        tx_idx: 2,
+    };
+    let state = AccountState::of_answers(&answer(2), &answer(10 * COST)).unwrap();
+    assert_eq!(state.tx_idx, 1, "the answer sits at its last record");
+    let mut a = Admission::new(cfg(), Instant::now());
+    let mut out = Vec::new();
+    assert_eq!(offer(&mut a, tx(1, 3, 1)), ["L"]);
+    offer(&mut a, tx(1, 4, 2));
+    a.on_lookup(sender(1), state, &mut out);
+    assert_eq!(names(&out), ["A3", "A4"], "parked behind nonce 2");
+    out.clear();
+    a.on_rows(1, [(sender(1), self::state(3, 10 * COST, 2))], &mut out);
+    assert_eq!(
+        names(&out),
+        ["F3*", "F4*"],
+        "the row of record 2 frees the run"
+    );
+}
+
+/// A client sends a parked or a forwarded transaction again after a
+/// timeout. The copy is known: the filter holds that very transaction, and
+/// the copy drops nothing. Another transaction at the nonce is in flight,
+/// and its refusal drops it.
+#[test]
+fn a_copy_of_a_held_transaction_is_known_and_drops_nothing() {
+    let mut a = known(state(5, 10 * COST, 1));
+    offer(&mut a, tx(1, 5, 1));
+    offer(&mut a, tx(1, 7, 2));
+    assert_eq!(
+        offer(&mut a, tx(1, 5, 3)),
+        ["R5:Known { expected_nonce: 6 }"],
+        "a copy of the forwarded one"
+    );
+    assert_eq!(
+        offer(&mut a, tx(1, 7, 4)),
+        ["R7:Known { expected_nonce: 6 }"],
+        "a copy of the parked one"
+    );
+    assert!(!super::Refusal::Known { expected_nonce: 6 }.drops());
+    assert!(super::Refusal::InFlight { expected_nonce: 6 }.drops());
 }
