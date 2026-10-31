@@ -59,16 +59,20 @@ pub(crate) struct LaneSub {
 
 impl LaneSub {
     /// The next frame of the lane. A lane with a repair gives the
-    /// refetched frames of a late join before the live ones.
+    /// refetched frames of a late join before the live ones. While a
+    /// refetch runs, the lane gives nothing and the poll moves on to the
+    /// other lanes.
     fn next(&mut self, refetcher: Option<&mut RefetchWorker>) -> Option<PositionedTxData> {
         let (Some(repair), Some(refetcher)) = (&mut self.repair, refetcher) else {
             return self.handle.try_recv_positioned();
         };
-        while repair.is_empty() {
+        loop {
+            if let Some(frame) = repair.pop(refetcher) {
+                return Some(frame);
+            }
             let item = self.handle.try_recv_item()?;
             repair.take(item, refetcher);
         }
-        repair.pop()
     }
 
     fn queued(&self) -> usize {

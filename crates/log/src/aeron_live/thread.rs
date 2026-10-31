@@ -113,6 +113,16 @@ impl SubRow {
             joins.scan(&self.entry.sub, &self.sink);
         }
     }
+
+    /// Send a marker for each new image of `dest` to the sink of its row,
+    /// when the row of `dest` in `subs` reports its joins.
+    fn report_dest_joins(subs: &[Option<SubRow>], dest: &mut Destination) {
+        if let Some(row) = subs.get(dest.sub_id as usize).and_then(Option::as_ref)
+            && row.joins.is_some()
+        {
+            dest.joins.scan(&dest.entry.sub, &row.sink);
+        }
+    }
 }
 
 impl SubEntry {
@@ -379,11 +389,7 @@ impl AeronThread {
             row.report_joins();
         }
         for dest in &mut self.dests {
-            if let Some(row) = self.subs.get(dest.sub_id as usize).and_then(Option::as_ref)
-                && row.joins.is_some()
-            {
-                dest.joins.scan(&dest.entry.sub, &row.sink);
-            }
+            SubRow::report_dest_joins(&self.subs, dest);
         }
         let dests = self.dests.iter_mut().map(|d| &mut d.entry);
         let rows = self.subs.iter_mut().flatten().map(|r| &mut r.entry);

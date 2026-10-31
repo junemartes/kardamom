@@ -55,7 +55,10 @@ use crate::term_layout::TermLayout;
 
 mod join_repair;
 mod recording;
-pub use join_repair::{JOIN_REPAIRS_TOTAL, JoinRepair, RefetchWorker, SessionFetch};
+pub use join_repair::{
+    FetchAnswer, JOIN_REPAIRS_TOTAL, JoinRepair, REFETCH_BUDGET, RefetchWorker, Refetched,
+    SessionFetch,
+};
 #[cfg(any(test, feature = "testing"))]
 pub use recording::FakeArchiveCatalog;
 use recording::{FoundRecording, Located, RecordedLimit, Unresolved, Wanted};
@@ -125,6 +128,16 @@ impl EndpointSource {
             Self::Discovered { .. } => true,
         }
     }
+}
+
+/// What one `tx_data` refetch replayed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Replayed {
+    /// The frames that the replay delivered.
+    pub delivered: u64,
+    /// The raw end position of the replayed range, or `None` when the
+    /// archive had nothing to replay yet.
+    pub end: Option<i64>,
 }
 
 /// Node-local transport config for the refetch client.
@@ -323,8 +336,26 @@ impl ArchiveRefetcher {
         stream_id: i32,
         session_id: i32,
         from: BPosition,
-        mut sink: impl FnMut(TxDataLoc, TxEnvelope),
+        sink: impl FnMut(TxDataLoc, TxEnvelope),
     ) -> Result<u64, LogError> {
+        self.fetch_tx_data_range(stream_id, session_id, from, sink)
+            .map(|range| range.delivered)
+    }
+
+    /// [`Self::fetch_tx_data`], with the end of the replayed range: a
+    /// caller that needs the range up to one position checks that the
+    /// replay reached it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::fetch_tx_data`].
+    pub fn fetch_tx_data_range(
+        &mut self,
+        stream_id: i32,
+        session_id: i32,
+        from: BPosition,
+        mut sink: impl FnMut(TxDataLoc, TxEnvelope),
+    ) -> Result<Replayed, LogError> {
         let endpoints = self.cfg.tx_data_endpoints.current();
         let recs = self.list_or_rotate(&endpoints, stream_id)?;
         let wanted = Wanted {
@@ -334,7 +365,10 @@ impl ArchiveRefetcher {
         };
         let found = wanted.resolve(recs).map_err(|u| self.refuse(u))?;
         let Some(plan) = self.prepare_replay(&endpoints, &found, wanted)? else {
-            return Ok(0);
+            return Ok(Replayed {
+                delivered: 0,
+                end: None,
+            });
         };
         let rec = &found.rec;
 
@@ -386,7 +420,10 @@ impl ArchiveRefetcher {
             delivered,
             "tx_data refetch drained"
         );
-        Ok(delivered)
+        Ok(Replayed {
+            delivered,
+            end: plan.from_raw.checked_add(plan.len),
+        })
     }
 
     /// Refetch `tx_deposits` from `from`, best effort across all recordings of

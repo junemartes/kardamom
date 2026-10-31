@@ -666,6 +666,18 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - Proof: `sequencer-lapse`.
 - **Sequencer node loss**
   - Cross-placement keeps one replica of every shard. Redundancy degrades, not availability, until the node returns.
+- **Late join to a new ingress session**
+  - Cause: an ingress returns on a new media driver (a driver loss or a node loss). Its new `tx_data` publication connects as soon as its own archive joins, so its first offers succeed at once. A replica on another node that joins the new publication later starts at the tail and misses the first frames.
+  - Effect without repair: the client of a missed transaction waits for its receipt and sends nothing more, so no frame follows the join. The transaction waits for the 30 s receipt timeout of the ingress. With `ack=validated`, the client gets a success, and the transaction is lost.
+  - Repair: each lane reports the join of each new image. A join after the start of its session refetches the frames from the session start to the join from the ingress archives (`JoinRepair` in `kardamom_log::refetch`). While the refetch runs, the lane holds its own live frames, and the replica keeps polling its other lanes.
+  - The repair runs only with `--replay-destination-endpoint` and `--archive-control-response-endpoint` (the Nomad job sets them as `KARDAMOM_REPLAY_DESTINATION` and `KARDAMOM_ARCHIVE_CONTROL_RESPONSE`).
+  - Bounds:
+    - A session that a replica first sees in its first 10 s is not repaired. At its start, a replica joins each running session late, by design. So an ingress and a replica that restart together lose the first frames of the new session to that replica. The twin replica, if it runs, has them.
+    - A gap above 64 MiB is not repaired: such a session is not a new publication.
+    - A refetch that gets no answer in 15 s ends. The lane then gives its held frames, and the missed frames stay lost, as without the repair.
+  - An ingress process that restarts on the same driver keeps its session (the driver shares the publication), so it does not cause a late join.
+  - Signal: `kardamom_log_tx_data_join_repairs_total{outcome}`. Any `failed` or `short` is a lost range. See [observability.md](observability.md).
+  - Proof: `ingress-recovery::a_late_join_to_a_returned_ingress_refetches_its_first_transfers`.
 - **Both replicas of one shard down**
   - That shard stalls. This is the double-failure case. Proof: `sequencer-lane-loss-recover` (see "Coordinated failures").
 - **Backpressure, not loss**

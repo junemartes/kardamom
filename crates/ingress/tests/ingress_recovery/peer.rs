@@ -152,7 +152,7 @@ impl Lane {
         while let Some(item) = self.sub.try_recv_item() {
             self.repair.take(item, &mut self.refetcher);
         }
-        std::iter::from_fn(|| self.repair.pop())
+        std::iter::from_fn(|| self.repair.pop(&mut self.refetcher))
             .map(|frame| frame.envelope)
             .collect()
     }

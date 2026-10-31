@@ -15,19 +15,29 @@
 //! frames, in order. The subscriber then reads the session as if it had
 //! joined at its start.
 //!
+//! The refetch does not block the reader. While it runs, the repair holds
+//! the live frames of its own lane and gives none of them; the reader
+//! polls its other lanes. The repair gives the held frames when the
+//! answer comes, or when [`REFETCH_BUDGET`] passes with no answer.
+//!
 //! The repair has two bounds:
 //! - A session that the lane first sees in its start grace is not
 //!   repaired. A subscriber that starts joins each running session late,
 //!   by design: the frames before its start are older than its own state.
+//!   An ingress and a sequencer that restart together fall in this case:
+//!   the frames of the first seconds of the new session are lost to that
+//!   sequencer, as before the repair.
 //! - A gap above `max_gap` bytes is not repaired. Such a session ran for a
 //!   long time before the join, so it is not a new publication.
 //!
-//! A refetch that fails loses the frames, as a late join did before the
-//! repair. Each outcome counts in [`JOIN_REPAIRS_TOTAL`].
+//! A refetch that fails or gives a short range loses the missing frames,
+//! as a late join did before the repair. Each outcome counts in
+//! [`JOIN_REPAIRS_TOTAL`].
 
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::{Receiver, TryRecvError};
 use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 use tracing::{info, warn};
 
@@ -35,44 +45,67 @@ use super::ArchiveRefetcher;
 use crate::aeron_live::{ImageJoin, PositionedTxData, TxDataItem};
 use crate::error::LogError;
 
-/// The late joins of `tx_data` lanes, by outcome: `repaired`, `failed`,
-/// `start` (a session of the start grace) and `too_large`.
+/// The late joins of `tx_data` lanes, by outcome:
+/// - `repaired`: the refetch covered the range from the session start to
+///   the join;
+/// - `short`: the replay ended before the join, or gave no frame;
+/// - `failed`: the refetch failed, passed its budget, or gave a position
+///   that does not map to the stream;
+/// - `start`: a session of the start grace;
+/// - `too_large`: a gap above the bound.
 pub const JOIN_REPAIRS_TOTAL: &str = "kardamom_log_tx_data_join_repairs_total";
+
+/// The longest wait for the answer of one refetch: the connect timeout
+/// and the drain cap of the refetch client, and some slack.
+pub const REFETCH_BUDGET: Duration = Duration::from_secs(15);
+
+/// The frames of one replayed range, and the raw end of the range.
+#[derive(Debug, Default)]
+pub struct Refetched {
+    pub frames: Vec<(TxDataLoc, TxEnvelope)>,
+    /// `None` when the archive had nothing to replay yet.
+    pub end: Option<i64>,
+}
+
+/// The answer of one refetch.
+pub type FetchAnswer = Result<Refetched, LogError>;
 
 /// The refetch of one publisher session from one position, to the end of
 /// its recording.
 pub trait SessionFetch {
-    /// Give each recorded frame of `session_id` on `stream_id` from `from`
-    /// to `sink`, in order. Return the count of frames.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when no archive gives the range.
-    fn fetch(
-        &mut self,
-        stream_id: i32,
-        session_id: i32,
-        from: BPosition,
-        sink: impl FnMut(TxDataLoc, TxEnvelope),
-    ) -> Result<u64, LogError>;
+    /// Start the refetch of the frames of `session_id` on `stream_id` from
+    /// `from`. The answer comes on the returned channel.
+    fn start(&mut self, stream_id: i32, session_id: i32, from: BPosition) -> Receiver<FetchAnswer>;
 }
 
 impl SessionFetch for ArchiveRefetcher {
-    fn fetch(
-        &mut self,
-        stream_id: i32,
-        session_id: i32,
-        from: BPosition,
-        sink: impl FnMut(TxDataLoc, TxEnvelope),
-    ) -> Result<u64, LogError> {
-        self.fetch_tx_data(stream_id, session_id, from, sink)
+    /// The refetch runs here, on the caller's thread, and the channel
+    /// holds its answer at once. For a reader that may block.
+    fn start(&mut self, stream_id: i32, session_id: i32, from: BPosition) -> Receiver<FetchAnswer> {
+        let (answer, reply) = crossbeam_channel::bounded(1);
+        let _ = answer.send(Self::fetch_all(self, stream_id, session_id, from));
+        reply
+    }
+}
+
+impl ArchiveRefetcher {
+    /// Each frame of the session from `from`, and the end of the replay.
+    fn fetch_all(&mut self, stream_id: i32, session_id: i32, from: BPosition) -> FetchAnswer {
+        let mut frames = Vec::new();
+        self.fetch_tx_data_range(stream_id, session_id, from, |loc, envelope| {
+            frames.push((loc, envelope));
+        })
+        .map(|replayed| Refetched {
+            frames,
+            end: replayed.end,
+        })
     }
 }
 
 /// A refetch client on a thread of its own, for a reader that must be
-/// `Send`: the Aeron resources of an [`ArchiveRefetcher`] are bound to
-/// the thread that made them. The reader sends each request and waits for
-/// its frames. The thread ends when the worker drops.
+/// `Send` and must not block: the Aeron resources of an
+/// [`ArchiveRefetcher`] are bound to the thread that made them. The
+/// thread runs one refetch at a time and ends when the worker drops.
 pub struct RefetchWorker {
     requests: crossbeam_channel::Sender<FetchRequest>,
 }
@@ -82,7 +115,7 @@ struct FetchRequest {
     stream_id: i32,
     session_id: i32,
     from: BPosition,
-    answer: crossbeam_channel::Sender<Result<Vec<(TxDataLoc, TxEnvelope)>, LogError>>,
+    answer: crossbeam_channel::Sender<FetchAnswer>,
 }
 
 impl RefetchWorker {
@@ -94,14 +127,10 @@ impl RefetchWorker {
         std::thread::spawn(move || {
             let mut refetcher = ArchiveRefetcher::new(cfg);
             for request in rx {
-                let mut frames = Vec::new();
-                let result = refetcher.fetch_tx_data(
-                    request.stream_id,
-                    request.session_id,
-                    request.from,
-                    |loc, envelope| frames.push((loc, envelope)),
-                );
-                let _ = request.answer.send(result.map(|_| frames));
+                let answer =
+                    refetcher.fetch_all(request.stream_id, request.session_id, request.from);
+                // A repair that passed its budget dropped its channel.
+                let _ = request.answer.send(answer);
             }
         });
         Self { requests }
@@ -109,29 +138,17 @@ impl RefetchWorker {
 }
 
 impl SessionFetch for RefetchWorker {
-    fn fetch(
-        &mut self,
-        stream_id: i32,
-        session_id: i32,
-        from: BPosition,
-        mut sink: impl FnMut(TxDataLoc, TxEnvelope),
-    ) -> Result<u64, LogError> {
-        let gone = || LogError::Aeron("the refetch worker stopped".into());
+    fn start(&mut self, stream_id: i32, session_id: i32, from: BPosition) -> Receiver<FetchAnswer> {
         let (answer, reply) = crossbeam_channel::bounded(1);
-        self.requests
-            .send(FetchRequest {
-                stream_id,
-                session_id,
-                from,
-                answer,
-            })
-            .map_err(|_| gone())?;
-        let frames = reply.recv().map_err(|_| gone())??;
-        let count = frames.len() as u64;
-        for (loc, envelope) in frames {
-            sink(loc, envelope);
-        }
-        Ok(count)
+        // A worker that stopped drops the request, and with it the answer
+        // channel: the repair then reads a disconnect.
+        let _ = self.requests.send(FetchRequest {
+            stream_id,
+            session_id,
+            from,
+            answer,
+        });
+        reply
     }
 }
 
@@ -140,39 +157,88 @@ pub struct JoinRepair {
     stream_id: i32,
     /// The publisher sessions that the lane has seen.
     seen: HashSet<i32>,
-    /// A session that the lane first sees before this instant is a session
-    /// of the start.
-    armed_at: Instant,
+    /// A session that the lane first sees within `grace` of `started` is a
+    /// session of the start.
+    started: Instant,
+    grace: Duration,
     max_gap: u64,
+    /// The longest wait for the answer of one refetch.
+    budget: Duration,
     /// The frames to give, oldest first.
     ready: VecDeque<PositionedTxData>,
+    /// The refetch in flight.
+    pending: Option<Pending>,
+    /// The joins that wait for the refetch in flight.
+    waiting: VecDeque<ImageJoin>,
+    /// The live frames of the lane that wait behind the refetch in flight.
+    held: VecDeque<PositionedTxData>,
+}
+
+/// One refetch in flight.
+struct Pending {
+    join: ImageJoin,
+    answer: Receiver<FetchAnswer>,
+    started: Instant,
 }
 
 impl JoinRepair {
-    /// The repair of lane stream `stream_id`, armed `grace` from now.
+    /// The repair of lane stream `stream_id`, with a start grace of
+    /// `grace` from now.
     #[must_use]
     pub fn new(stream_id: i32, grace: Duration, max_gap: u64) -> Self {
         Self {
             stream_id,
             seen: HashSet::new(),
-            armed_at: Instant::now() + grace,
+            started: Instant::now(),
+            grace,
             max_gap,
+            budget: REFETCH_BUDGET,
             ready: VecDeque::new(),
+            pending: None,
+            waiting: VecDeque::new(),
+            held: VecDeque::new(),
         }
     }
 
+    /// The repair with `budget` as the longest wait for one refetch, in
+    /// place of [`REFETCH_BUDGET`].
+    #[must_use]
+    pub fn with_budget(mut self, budget: Duration) -> Self {
+        self.budget = budget;
+        self
+    }
+
     /// Take one item of the lane. The join of a new session that is not
-    /// at its start first queues the refetched frames of the session up to
-    /// the join. A join comes as a marker, or as the first frame of the
-    /// session when the frame comes first.
+    /// at its start starts the refetch of the frames before the join. A
+    /// join comes as a marker, or as the first frame of the session when
+    /// the frame comes first.
     pub fn take(&mut self, item: TxDataItem, fetch: &mut impl SessionFetch) {
         match item {
             TxDataItem::Joined(join) => self.joined(join, fetch),
             TxDataItem::Frame(frame) => {
                 self.joined(Self::join_of(&frame), fetch);
-                self.ready.push_back(frame);
+                self.queue_live(frame);
             }
         }
+    }
+
+    /// The next frame to give. `None` while the refetch in flight holds
+    /// the lane.
+    pub fn pop(&mut self, fetch: &mut impl SessionFetch) -> Option<PositionedTxData> {
+        self.advance(fetch);
+        self.ready.pop_front()
+    }
+
+    /// The frames that wait to be given, held ones too.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ready.len() + self.held.len()
+    }
+
+    /// Whether no frame waits.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// The join that the first frame of a session would be.
@@ -185,88 +251,128 @@ impl JoinRepair {
         }
     }
 
+    /// Give `frame` at once, or hold it behind the refetch in flight.
+    fn queue_live(&mut self, frame: PositionedTxData) {
+        if self.pending.is_some() {
+            self.held.push_back(frame);
+        } else {
+            self.ready.push_back(frame);
+        }
+    }
+
     /// Repair `join` when it is the first of its session and not at its
     /// start.
     fn joined(&mut self, join: ImageJoin, fetch: &mut impl SessionFetch) {
-        if self.seen.insert(join.session_id) && join.stream_position > 0 {
-            self.repair(&join, fetch);
+        if !self.seen.insert(join.session_id) || join.stream_position == 0 {
+            return;
+        }
+        if self.started.elapsed() < self.grace {
+            self.count(&join, "start");
+        } else if join.stream_position > self.max_gap {
+            self.count(&join, "too_large");
+        } else if self.pending.is_some() {
+            self.waiting.push_back(join);
+        } else {
+            self.start(join, fetch);
         }
     }
 
-    /// The next frame to give.
-    pub fn pop(&mut self) -> Option<PositionedTxData> {
-        self.ready.pop_front()
+    fn start(&mut self, join: ImageJoin, fetch: &mut impl SessionFetch) {
+        self.pending = Some(Pending {
+            answer: fetch.start(self.stream_id, join.session_id, join.session_start),
+            join,
+            started: Instant::now(),
+        });
     }
 
-    /// The frames that wait to be given.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.ready.len()
-    }
-
-    /// Whether no frame waits.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.ready.is_empty()
-    }
-
-    /// Queue the frames of the session of `join` from its start to `join`.
-    fn repair(&mut self, join: &ImageJoin, fetch: &mut impl SessionFetch) {
-        let session = join.session_id;
-        let gap = join.stream_position;
-        let outcome = if Instant::now() < self.armed_at {
-            "start"
-        } else if gap > self.max_gap {
-            "too_large"
-        } else {
-            self.refetch(join, fetch)
+    /// Take the answer of the refetch in flight, when it came or its
+    /// budget passed. Then start the next waiting join, or give the held
+    /// frames.
+    fn advance(&mut self, fetch: &mut impl SessionFetch) {
+        let Some(pending) = &self.pending else {
+            return;
         };
+        let answer = match pending.answer.try_recv() {
+            Ok(answer) => answer,
+            Err(TryRecvError::Empty) if pending.started.elapsed() < self.budget => return,
+            Err(TryRecvError::Empty) => Err(LogError::Aeron("refetch passed its budget".into())),
+            Err(TryRecvError::Disconnected) => {
+                Err(LogError::Aeron("the refetch worker stopped".into()))
+            }
+        };
+        let join = pending.join;
+        self.pending = None;
+        let outcome = self.place(&join, answer);
+        self.count(&join, outcome);
+        match self.waiting.pop_front() {
+            Some(next) => self.start(next, fetch),
+            None => self.ready.extend(self.held.drain(..)),
+        }
+    }
+
+    /// Queue the refetched frames before `join`. Return the outcome.
+    fn place(&mut self, join: &ImageJoin, answer: FetchAnswer) -> &'static str {
+        let refetched = match answer {
+            Ok(refetched) => refetched,
+            Err(error) => {
+                warn!(stream_id = self.stream_id, %error, "tx_data late join refetch failed");
+                return "failed";
+            }
+        };
+        let Some(frames) = Self::before(join, refetched.frames) else {
+            return "failed";
+        };
+        let reached = refetched
+            .end
+            .and_then(|end| u64::try_from(end).ok())
+            .is_some_and(|end| end >= join.stream_position);
+        let count = frames.len();
+        self.ready.extend(frames);
+        if !reached || count == 0 {
+            return "short";
+        }
+        info!(
+            stream_id = self.stream_id,
+            session = join.session_id,
+            frames = count,
+            gap = join.stream_position,
+            "tx_data late join repaired"
+        );
+        "repaired"
+    }
+
+    /// The frames of `frames` before `join`, with their stream positions,
+    /// or `None` when a position does not map to the stream.
+    fn before(
+        join: &ImageJoin,
+        frames: Vec<(TxDataLoc, TxEnvelope)>,
+    ) -> Option<Vec<PositionedTxData>> {
+        let place = StreamPlace::of(join)?;
+        frames
+            .into_iter()
+            .filter(|(loc, _)| loc.position < join.join)
+            .map(|(loc, envelope)| {
+                Some(PositionedTxData {
+                    loc,
+                    stream_position: place.stream_position(loc.position)?,
+                    session_start: join.session_start,
+                    envelope,
+                })
+            })
+            .collect()
+    }
+
+    fn count(&self, join: &ImageJoin, outcome: &'static str) {
         if outcome != "repaired" {
             warn!(
                 stream_id = self.stream_id,
-                session, gap, outcome, "tx_data late join not repaired"
+                session = join.session_id,
+                gap = join.stream_position,
+                outcome,
+                "tx_data late join not repaired"
             );
         }
         metrics::counter!(JOIN_REPAIRS_TOTAL, "outcome" => outcome).increment(1);
-    }
-
-    /// Refetch the frames before `join` and queue them. Return the outcome.
-    fn refetch(&mut self, join: &ImageJoin, fetch: &mut impl SessionFetch) -> &'static str {
-        let place = StreamPlace::of(join);
-        let ready = &mut self.ready;
-        let mut taken = 0u64;
-        let result = fetch.fetch(
-            self.stream_id,
-            join.session_id,
-            join.session_start,
-            |loc, envelope| {
-                if loc.position < join.join {
-                    taken += 1;
-                    ready.push_back(PositionedTxData {
-                        loc,
-                        stream_position: place.stream_position(loc.position),
-                        session_start: join.session_start,
-                        envelope,
-                    });
-                }
-            },
-        );
-        match result {
-            Ok(_) => {
-                info!(
-                    stream_id = self.stream_id,
-                    session = join.session_id,
-                    frames = taken,
-                    gap = join.stream_position,
-                    "tx_data late join repaired"
-                );
-                "repaired"
-            }
-            Err(error) => {
-                warn!(stream_id = self.stream_id, %error, "tx_data late join refetch failed");
-                "failed"
-            }
-        }
     }
 }
 
@@ -275,23 +381,25 @@ impl JoinRepair {
 #[derive(Clone, Copy)]
 struct StreamPlace {
     initial_term_id: i32,
-    /// The bytes of one term. Zero when the live frame is in the first
-    /// term: each frame before it is then in the first term too.
+    /// The bytes of one term. Zero when the join is in the first term:
+    /// each frame before it is then in the first term too.
     term_length: u64,
 }
 
 impl StreamPlace {
-    fn of(join: &ImageJoin) -> Self {
+    /// The map of the session of `join`, or `None` when the join does not
+    /// fit its own stream position.
+    fn of(join: &ImageJoin) -> Option<Self> {
         let initial_term_id = join.session_start.term_id;
         let terms = Self::terms(initial_term_id, join.join);
-        let before = join.stream_position - Self::offset(join.join);
-        // Zero terms: the live frame is in the first term, and so is each
-        // frame before it.
+        let before = join.stream_position.checked_sub(Self::offset(join.join))?;
+        // Zero terms: the join is in the first term, and so is each frame
+        // before it.
         let term_length = before.checked_div(terms).unwrap_or(0);
-        Self {
+        Some(Self {
             initial_term_id,
             term_length,
-        }
+        })
     }
 
     /// The offset of `position` in its term. Aeron never gives a negative
@@ -310,8 +418,11 @@ impl StreamPlace {
         )
     }
 
-    fn stream_position(self, position: BPosition) -> u64 {
-        Self::terms(self.initial_term_id, position) * self.term_length + Self::offset(position)
+    /// The stream position of `position`, or `None` on an overflow.
+    fn stream_position(self, position: BPosition) -> Option<u64> {
+        Self::terms(self.initial_term_id, position)
+            .checked_mul(self.term_length)?
+            .checked_add(Self::offset(position))
     }
 }
 

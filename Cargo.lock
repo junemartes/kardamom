@@ -4295,6 +4295,7 @@ dependencies = [
  "kardamom-types",
  "libc",
  "metrics",
+ "metrics-exporter-prometheus",
  "reqwest 0.13.4",
  "rkyv",
  "rusteron-archive",

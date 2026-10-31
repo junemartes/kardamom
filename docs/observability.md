@@ -634,6 +634,14 @@ Each block commit records these steps:
   Each one gets a `FeeInvalid`, `FeeTooLow`, or `InsufficientFunds` error on `tx_errors`.
   See [priority-fees.md](priority-fees.md).
 
+- `kardamom_log_tx_data_join_repairs_total{outcome}` counts the late joins of the `tx_data` lanes to a new ingress session, by outcome. See "Late join to a new ingress session" in [failure-modes.md](failure-modes.md).
+  - `repaired`: the refetch from the ingress archives covered the frames from the session start to the join.
+  - `short`: the replay ended before the join, or gave no frame. The rest of the range is lost.
+  - `failed`: the refetch failed or passed its 15 s budget, or a position did not map to the stream. The range is lost.
+  - `start`: the replica saw the session in its first 10 s, so it did not repair it, by design.
+  - `too_large`: the gap was above 64 MiB.
+  - Each outcome but `repaired` also logs a `tx_data late join not repaired` warning with the stream, the session and the gap.
+
 The egress feed thread keeps the decision version of the sealer and handles the refused references (egress kind 18).
 See "The kept sealer version and the refused reference" in [failure-modes.md](failure-modes.md).
 
