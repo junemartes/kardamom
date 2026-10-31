@@ -1224,6 +1224,8 @@
         "--tests",
         "io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest",
         "--tests",
+        "io.kardamom.sealer.cluster.RaftLeaderReturnTest",
+        "--tests",
         "io.kardamom.sealer.cluster.RaftLeaderPacketLossTest",
         "--tests",
         "io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest",
@@ -1237,13 +1239,15 @@
         "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest.xml",
         "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderPacketLossTest.xml",
         "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest.xml",
-        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.CpuSqueezeTest.xml"
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.CpuSqueezeTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderReturnTest.xml"
       ],
       "tests": [
         "io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest::the_peers_of_a_leader_that_cannot_send_elect_a_new_leader_and_the_old_one_stays_up()",
         "io.kardamom.sealer.cluster.RaftLeaderPacketLossTest::a_lossy_leader_link_keeps_commits_and_one_leader_per_term()",
         "io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest::a_slow_leader_link_keeps_commits_and_one_leader_per_term()",
-        "io.kardamom.sealer.cluster.CpuSqueezeTest::starved_members_slow_down_but_never_fork_the_canonical_order()"
+        "io.kardamom.sealer.cluster.CpuSqueezeTest::starved_members_slow_down_but_never_fork_the_canonical_order()",
+        "io.kardamom.sealer.cluster.RaftLeaderReturnTest::a_former_leader_that_wins_again_sends_a_new_leader_event_and_no_session_ok()"
       ],
       "real": [
         "ClusterNode main class in one JVM process per member, with the deployed member settings",
@@ -1256,7 +1260,8 @@
       "controlled": [
         "a one-way cut, 10 % random loss or a 250 ms ordered delay of the frames of the leader to both peers, for 10-15 s",
         "SIGSTOP/SIGCONT of all members: 15 ms of run in each 100 ms for 20 s",
-        "the deployed 2 s tick and the deployed Raft timeouts"
+        "the deployed 2 s tick and the deployed Raft timeouts",
+        "one-way cuts of the frames of each new leader to its peers, until a member that led before wins a later term in the same process"
       ],
       "negative_controls": [
         {
@@ -2291,6 +2296,73 @@
       "limitation": "One isolated Consul agent; this does not qualify fleet rescheduling, validator catch-up or the cause of a distributed catalog deletion.",
       "ci_mode": "docker"
     },
+    "validator-recovery": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-validator",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "validator_recovery",
+        "--",
+        "--ignored",
+        "--test-threads=1",
+        "--nocapture"
+      ],
+      "real": [
+        "kardamom-validator binary: startup, revolution loop, pumps, trie-aware MDBX writer, checkpoint adoption and trie bootstrap",
+        "Aeron media driver in Docker with tx_bal, tx_receipts and egress_order IPC streams",
+        "Aeron client timeout and the crate's exit handler",
+        "egress store, owner and HTTP range reads with the carried egress reader",
+        "reference executor: the production engine over a real MDBX writer, with a real checkpoint and peer checkpoint server"
+      ],
+      "controlled": [
+        "one reference chain and one media driver per test process; the lapse tests run to block 150 and the join to block 70, two transfers per block, one block per 100 ms",
+        "SIGSTOP and SIGCONT of the validator process; the test restarts an exited process as the supervisor",
+        "driver client liveness timeout of 3 s; lapses of 1.5 s and 9 s",
+        "one executor replica publishes the reference BAL and receipt frames",
+        "a checkpoint at block 20 on one peer; the join starts 10 blocks past it"
+      ],
+      "tests": [
+        "a_short_lapse_keeps_the_same_process_verifying_past_its_count",
+        "a_long_lapse_ends_the_process_and_the_restart_resumes_from_its_state",
+        "a_fresh_validator_adopts_the_peer_checkpoint_and_verifies_live"
+      ],
+      "limitation": "The validator reads the canonical stream from the egress (--egress), a deployed option; the default deployment reads the Aeron Cluster egress with tx_data joins. The driver liveness timeout is a local driver setting; the deployed freeze length follows the deployed Aeron stall tolerance. Peers are addressed by IP, not by Consul DNS.",
+      "negative_controls": [
+        {
+          "mutation": "BalBuffer::MAX_BUFFERED = 4",
+          "tests": [
+            "a_short_lapse_keeps_the_same_process_verifying_past_its_count"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "failed_assertion": "coverage regressed over the lapse: bal_missing 0 -> 15"
+        },
+        {
+          "mutation": "the restart resumes from ResumePoint::GENESIS, not from the persisted recovery point",
+          "tests": [
+            "a_long_lapse_ends_the_process_and_the_restart_resumes_from_its_state"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "failed_assertion": "missing log line validator resuming from persisted cursor"
+        },
+        {
+          "mutation": "bootstrap_trie_if_adopted returns before the trie bootstrap",
+          "tests": [
+            "a_fresh_validator_adopts_the_peer_checkpoint_and_verifies_live"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "failed_assertion": "missing log line trie bootstrap complete"
+        }
+      ],
+      "ci_mode": "docker"
+    },
     "pipeline-recovery": {
       "command": [
         "cargo",
@@ -2317,14 +2389,16 @@
         "a case load of 1-wei transfers through ingress 0, with resubmits and receipt reads on every ingress",
         "a recovery probe of the case sender and a fresh sender",
         "process stops and starts in the order of each chaos case; two replicas of the case lane for the lane loss",
-        "a Redis container with no persistence and a state mirror for the blackout"
+        "a Redis container with no persistence and a state mirror for the blackout",
+        "a SIGTERM stop of the sealer leader of three members, with the case load flowing"
       ],
       "tests": [
         "ingress_pair_loss_returns_both_replicas",
         "graceful_sequencer_drains_and_a_cold_start_regains_its_senders",
         "sequencer_lane_loss_relearns_the_sender_floor",
         "pipeline_blackout_restarts_every_process_and_reelects",
-        "pipeline_blackout_rebuilds_the_read_path"
+        "pipeline_blackout_rebuilds_the_read_path",
+        "a_sealer_leader_stop_keeps_the_executor_at_the_sealed_head"
       ],
       "limitation": "Stack suite, not isolated: each case needs more than one real service. All services share one host and one media driver. The blackout runs one sealer member to stay inside 60 s; the combined suite closes elections of three. The blackout is two tests: one with the L1 stack and the validator, one with Redis and the state mirror. Nomad placement, node power loss and container identity stay with the cluster suite. Needs the service binaries, the sealer jar and the aeron-all jar.",
       "negative_controls": [
@@ -2360,6 +2434,15 @@
           "mutation": "The state mirror never rebuilds, so an empty Redis gets only the rows of live traffic.",
           "tests": [
             "pipeline_blackout_rebuilds_the_read_path"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        },
+        {
+          "mutation": "The session loop sends no replay request when a new leader confirms the open session again, so a reader that keeps its session holds every record after the session-start marker.",
+          "tests": [
+            "a_sealer_leader_stop_keeps_the_executor_at_the_sealed_head"
           ],
           "exit_code": 101,
           "compiled": true,
@@ -2913,16 +2996,37 @@
     {
       "case": "validator-lapse",
       "family": "Sequencer",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "validator-recovery",
+          "test": "a_short_lapse_keeps_the_same_process_verifying_past_its_count"
+        },
+        {
+          "suite": "validator-recovery",
+          "test": "a_long_lapse_ends_the_process_and_the_restart_resumes_from_its_state"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts the task that exits after the client timeout: the restart policy and the container replacement belong to the deployment; the test starts the same binary on the same state as the supervisor"
+      ]
     },
     {
       "case": "validator-join",
       "family": "Sequencer",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "validator-recovery",
+          "test": "a_fresh_validator_adopts_the_peer_checkpoint_and_verifies_live"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Consul DNS resolves the executor checkpoint peers: the names exist only in the deployed catalog; the test addresses the peer server by IP",
+        "Nomad restarts the killed task on its wiped volume: the restart policy belongs to the deployment"
+      ]
     },
     {
       "case": "lookup-blackout",

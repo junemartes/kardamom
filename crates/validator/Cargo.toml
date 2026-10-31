@@ -52,6 +52,11 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "
 tokio-util = { workspace = true }
 toml.workspace = true
 
+[features]
+# Gates the component recovery tests that need a real Aeron media driver in
+# Docker (the AeronTestCluster harness of kardamom-log).
+docker-e2e = ["kardamom-log/docker-e2e"]
+
 [[bin]]
 name = "kardamom-validator"
 path = "src/bin/kardamom-validator/main.rs"
@@ -77,3 +82,9 @@ kardamom-obs = { path = "../obs", features = ["test-support"] }
 kardamom-exec-core = { workspace = true }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# The component recovery tests: a real egress store and HTTP side, the
+# validator's frozen child process, and the published frame types.
+crossbeam-channel.workspace = true
+kardamom-egress = { path = "../egress" }
+kardamom-log = { workspace = true, features = ["testing"] }
+libc.workspace = true
