@@ -1,10 +1,13 @@
 ---
 # Wait until every member of a new sealer cluster runs and answers its
 # admin status (the waves of a new cluster, sealer.yml).
+# The allocation wait of the sealer job: its own poll budget, not the
+# default one.
 - name: Wait for every new sealer member to run
   ansible.builtin.include_tasks: wait_allocations.yml
   vars:
     workloads_wait_job: cluster
+    workloads_job: "{{ workloads_sealer_job }}"
 
 - name: Wait for the admin status of every new sealer member
   ansible.builtin.include_tasks: sealer_status.yml
