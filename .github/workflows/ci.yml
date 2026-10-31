@@ -304,7 +304,9 @@ jobs:
 
   # The workspace tests from the nextest archive of the build job: this
   # job compiles nothing. The archive holds the lib, bin, test and example
-  # targets; the doc-test job runs the bench targets.
+  # targets. nextest cannot list a test target without the libtest harness
+  # (alloc_stage_table), so the filter leaves it out, and the doc-test job
+  # runs it with the bench targets.
   test:
     name: test
     needs: build
@@ -329,7 +331,8 @@ jobs:
       - name: Run the workspace tests
         run: |
           cargo nextest run --archive-file /tmp/workspace-archive/workspace-tests.tar.zst \
-            --workspace-remap . --extract-to . --extract-overwrite --no-fail-fast
+            --workspace-remap . --extract-to . --extract-overwrite --no-fail-fast \
+            -E 'not binary_id(kardamom-notifier::alloc_stage_table)'
       - name: Component evidence runner checks
         run: python3 scripts/tests/test_components.py
 
@@ -357,8 +360,9 @@ jobs:
           save-if: ${{ github.event_name == 'push' }}
       - run: cargo test --workspace --doc --locked
       # The bench targets in test mode: each benchmark runs once. The
-      # nextest archive of the test job holds no bench target.
-      - run: cargo test --workspace --benches --locked
+      # nextest archive of the test job holds no bench target, and nextest
+      # cannot list the test target without the libtest harness.
+      - run: cargo test --workspace --benches --test alloc_stage_table --locked
 
   # Every Solidity check on one runner: each one takes a minute or less,
   # and five runners for them cost more queue time than they save. The
