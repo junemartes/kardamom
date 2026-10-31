@@ -120,6 +120,21 @@ impl Driver {
             && self.archive_dir().join("archive.catalog").exists()
     }
 
+    /// SIGSTOP the driver now and SIGCONT it `hold` later, from a thread
+    /// of its own. A driver that holds below its client timeout (10 s)
+    /// keeps its clients. Its subscriptions join each new publication
+    /// late: the publication can connect to its own archive first.
+    pub(crate) fn freeze_for(&self, hold: Duration) {
+        let pid = i32::try_from(self.child.as_ref().expect("the driver runs").id()).unwrap();
+        // SAFETY: `kill` sends one signal to the child's pid.
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            // SAFETY: as above.
+            unsafe { libc::kill(pid, libc::SIGCONT) };
+        });
+    }
+
     /// SIGKILL the driver, as a crash of its task does.
     pub(crate) fn kill(&mut self) {
         if let Some(mut child) = self.child.take() {

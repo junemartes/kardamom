@@ -72,6 +72,7 @@ mod bound;
 mod destination;
 mod handles;
 mod idle;
+mod image_joins;
 mod image_log;
 mod meter;
 mod pending;
@@ -98,8 +99,8 @@ pub use handles::tx_verdicts::TxVerdictsPublisherHandle;
 pub use idle::{IdleBackoff, IdleCap};
 pub use pending::BEST_EFFORT_DROPPED_TOTAL;
 pub use runtime::{
-    AeronRuntime, Destinations, PollRecv, PositionedTxData, PubHandle, TxDataSubscription,
-    TypedSubscription,
+    AeronRuntime, Destinations, ImageJoin, PollRecv, PositionedTxData, PubHandle, TxDataItem,
+    TxDataSubscription, TypedSubscription,
 };
 
 use std::time::Duration;
@@ -134,6 +135,13 @@ pub struct RawFrame {
     /// The stream position of the frame in its image, from the same header
     /// read as `pos`. Every subscriber of the image sees the same value.
     pub stream_pos: i64,
+    /// The initial term id of the image, from the same header read. The
+    /// first frame of the publication is at `(initial_term_id, 0)`.
+    pub initial_term_id: i32,
+    /// A marker of the join of a new image, with no bytes: `pos` and
+    /// `stream_pos` are the join position. Only a subscription that
+    /// reports its joins gets markers (see `image_joins`).
+    pub joined: bool,
 }
 
 /// Where an [`AeronRuntime::open_subscription_raw`]-family call sends its

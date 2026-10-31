@@ -434,6 +434,8 @@ impl Actor {
                 pos: batch.end_tx_idx().unwrap(),
                 session: 7,
                 stream_pos: 1,
+                initial_term_id: 0,
+                joined: false,
             })
             .unwrap();
     }

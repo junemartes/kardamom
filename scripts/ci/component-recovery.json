@@ -2724,15 +2724,17 @@
         "UDP MDC tx_data and unicast tx_receipts between the nodes"
       ],
       "controlled": [
-        "one stand-in for the sequencer, the sealer and the executor on the second node: first-copy dedup, nonce order, receipt batch frames with account rows",
+        "one stand-in for the sequencer, the sealer and the executor on the second node, which reads each lane through the sequencer late-join repair (JoinRepair): first-copy dedup, nonce order, receipt batch frames with account rows",
         "an HTTP stub of the egress and the executor query that serves rkyv receipts from the stand-in's ledger",
-        "one client per case that resubmits and reads receipts from both ingresses"
+        "one client per case that resubmits and reads receipts from both ingresses",
+        "SIGSTOP of the second node driver for 4 s while ingress 0 returns on a new driver, so the stand-in joins the new session after its first frame"
       ],
       "tests": [
         "a_graceful_stop_drains_and_the_returned_ingress_serves_every_receipt",
         "a_hard_killed_case_ingress_returns_with_no_lost_or_doubled_transfer",
         "a_hard_killed_twin_returns_and_serves_receipts_that_it_never_saw",
-        "a_lost_archiving_driver_ends_its_ingress_while_the_twin_serves"
+        "a_lost_archiving_driver_ends_its_ingress_while_the_twin_serves",
+        "a_late_join_to_a_returned_ingress_refetches_its_first_transfers"
       ],
       "limitation": "Isolated suite: the real ingress against controlled peers. The sequencer, sealer, executor and egress are stand-ins. Needs the ingress binary, Java and the aeron-all jar.",
       "negative_controls": [
@@ -2752,6 +2754,15 @@
           "mutation": "The Aeron error handler logs and returns, so an ingress that lost its driver does not exit.",
           "tests": [
             "a_lost_archiving_driver_ends_its_ingress_while_the_twin_serves"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        },
+        {
+          "mutation": "JoinRepair never refetches, so a late join to a returned ingress loses the frames before the join.",
+          "tests": [
+            "a_late_join_to_a_returned_ingress_refetches_its_first_transfers"
           ],
           "exit_code": 101,
           "compiled": true,
@@ -2990,6 +3001,10 @@
         {
           "suite": "pipeline-recovery",
           "test": "pipeline_blackout_restarts_every_process_and_reelects"
+        },
+        {
+          "suite": "ingress-recovery",
+          "test": "a_late_join_to_a_returned_ingress_refetches_its_first_transfers"
         }
       ],
       "full_case_locally_validated": true,

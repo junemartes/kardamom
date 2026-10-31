@@ -17,6 +17,7 @@ use super::add_wait::{AddWait, PubAdd, SubAdd};
 use super::bound::BoundControl;
 use super::destination::Destination;
 use super::idle::{IdleBackoff, IdleCap};
+use super::image_joins::ImageJoins;
 use super::image_log::ImageHandlers;
 use super::meter::{Backlog, ThreadMeter};
 use super::pending::{PendingPublish, PubEntry, PublishAck, drain_pending};
@@ -48,12 +49,14 @@ struct AssembledDeliver {
 
 impl rusteron_client::AeronFragmentHandlerCallback for AssembledDeliver {
     fn handle_aeron_fragment_handler(&mut self, buffer: &[u8], header: Header) {
-        if let Some((pos, session, stream_pos)) = header_loc(&header) {
+        if let Some((pos, session, stream_pos, initial_term_id)) = header_loc(&header) {
             self.sink.send(RawFrame {
                 bytes: buffer.to_vec(),
                 pos,
                 session,
                 stream_pos,
+                initial_term_id,
+                joined: false,
             });
         }
     }
@@ -76,6 +79,8 @@ struct SubRow {
     entry: SubEntry,
     stream_id: i32,
     sink: FrameSink,
+    /// The joins of new images, when the subscription reports them.
+    joins: Option<ImageJoins>,
 }
 
 /// One open Aeron subscription behind a fragment assembler: a row of the
@@ -98,6 +103,25 @@ impl Drop for SubEntry {
     fn drop(&mut self) {
         self.assembler.release();
         self.inner.release();
+    }
+}
+
+impl SubRow {
+    /// Send a marker for each new image, when the row reports its joins.
+    fn report_joins(&mut self) {
+        if let Some(joins) = &mut self.joins {
+            joins.scan(&self.entry.sub, &self.sink);
+        }
+    }
+
+    /// Send a marker for each new image of `dest` to the sink of its row,
+    /// when the row of `dest` in `subs` reports its joins.
+    fn report_dest_joins(subs: &[Option<SubRow>], dest: &mut Destination) {
+        if let Some(row) = subs.get(dest.sub_id as usize).and_then(Option::as_ref)
+            && row.joins.is_some()
+        {
+            dest.joins.scan(&dest.entry.sub, &row.sink);
+        }
     }
 }
 
@@ -361,12 +385,30 @@ impl AeronThread {
     /// has work.
     fn poll_subscriptions(&mut self) -> bool {
         let mut worked = false;
+        for row in self.subs.iter_mut().flatten() {
+            row.report_joins();
+        }
+        for dest in &mut self.dests {
+            SubRow::report_dest_joins(&self.subs, dest);
+        }
         let dests = self.dests.iter_mut().map(|d| &mut d.entry);
         let rows = self.subs.iter_mut().flatten().map(|r| &mut r.entry);
         for entry in rows.chain(dests) {
             worked |= entry.poll_once();
         }
         worked
+    }
+
+    /// Report the joins of new images of the subscription at `sub_id`
+    /// from now on.
+    fn cmd_report_joins(&mut self, sub_id: u32) -> Result<(), LogError> {
+        let row = self
+            .subs
+            .get_mut(sub_id as usize)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| LogError::Aeron(format!("report joins: no subscription {sub_id}")))?;
+        row.joins.get_or_insert_with(ImageJoins::default);
+        Ok(())
     }
 
     /// Block waiting for the next command, up to `wait`. `Break(())` means
@@ -525,6 +567,7 @@ impl AeronThread {
             entry,
             stream_id,
             sink,
+            joins: None,
         }));
         Ok(id)
     }
@@ -649,6 +692,9 @@ impl AeronThread {
             RuntimeCmd::SubImageId { sub_id, ack } => {
                 let _ = ack.send(self.cmd_image_id(sub_id));
             }
+            RuntimeCmd::SubReportJoins { sub_id, ack } => {
+                let _ = ack.send(self.cmd_report_joins(sub_id));
+            }
             RuntimeCmd::CloseSubscription { sub_id, ack } => {
                 let _ = ack.send(self.cmd_close_subscription(sub_id));
             }
@@ -716,7 +762,8 @@ impl AeronThread {
 }
 
 /// Read the fragment-start [`BPosition`], the Aeron publisher
-/// `session_id` and the stream position from a single `get_values()` FFI
+/// `session_id`, the stream position and the initial term id from a
+/// single `get_values()` FFI
 /// call, the hottest per-fragment path. They must come from the same
 /// header read: returning them together guarantees the session belongs to
 /// the position's fragment, and avoids a divergent second-read error path
@@ -728,7 +775,7 @@ impl AeronThread {
 /// Term ids wrap, so the term count is a wrapping difference. The count is
 /// below 2^31 and the shift is at most 30 (a term holds at most 1 GiB), so
 /// the position stays below 2^61.
-fn header_loc(h: &Header) -> Option<(BPosition, i32, i64)> {
+fn header_loc(h: &Header) -> Option<(BPosition, i32, i64, i32)> {
     let v = h.get_values().ok()?;
     let frame = v.frame();
     let pos = BPosition {
@@ -738,5 +785,5 @@ fn header_loc(h: &Header) -> Option<(BPosition, i32, i64)> {
     let terms = i64::from(frame.term_id().wrapping_sub(v.initial_term_id()));
     let shift = u32::try_from(v.position_bits_to_shift()).ok()?;
     let stream_pos = (terms << shift) + i64::from(frame.term_offset());
-    Some((pos, frame.session_id(), stream_pos))
+    Some((pos, frame.session_id(), stream_pos, v.initial_term_id()))
 }
