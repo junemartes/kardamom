@@ -37,6 +37,20 @@ impl Fixture {
     }
 
     fn with_query(query: Option<ExecutorQuery>) -> Self {
+        Self::with_retries(query, Retries::covering(Duration::from_secs(30)))
+    }
+
+    /// A feed whose executor query always fails, and whose lookups end
+    /// after two retries.
+    fn short_lived() -> Self {
+        let query = ExecutorQuery::new(&ExecutorQueryConfig {
+            endpoints: vec!["http://127.0.0.1:1".to_owned()],
+            ..ExecutorQueryConfig::default()
+        });
+        Self::with_retries(query, Retries(2))
+    }
+
+    fn with_retries(query: Option<ExecutorQuery>, retries: Retries) -> Self {
         let (live, writer) = LiveAccounts::new(&LiveAccountsConfig::default());
         let (requests, rx) = tokio::sync::mpsc::channel(1);
         let (answers_tx, answers) = crossbeam_channel::unbounded();
@@ -46,7 +60,6 @@ impl Fixture {
             redis: None,
             query,
         };
-        let retries = Retries::covering(Duration::from_secs(30));
         let feed = AccountLookupFeed::new(rx, answers_tx, sources, shutdown.clone(), 0, retries);
         let limit = feed.limit.clone();
         Self {
@@ -183,7 +196,8 @@ fn the_requests_of_a_sender_with_a_running_lookup_start_no_second_lookup() {
         for _ in 0..EXPIRED {
             fixture.requests.send(ADDRESS).await.unwrap();
         }
-        // The channel holds one request: the feed took all but the last.
+        // The request channel holds one request, so each send returns once
+        // the feed took the request before it.
         recording.failed().await;
         tokio::time::sleep(RETRY_AFTER / 4).await;
         assert_eq!(recording.attempts("error"), 1);
@@ -337,4 +351,38 @@ fn the_retries_cover_the_configured_park_lifetime() {
     assert_eq!(Retries::covering(Duration::from_secs(120)), Retries(60));
     assert_eq!(Retries::covering(Duration::from_millis(2_001)), Retries(2));
     assert_eq!(Retries::covering(Duration::ZERO), Retries(0));
+}
+
+/// A request comes during the last retry of a lookup that the sources fail.
+/// The lookup then ends with no answer. The feed starts a new lookup at
+/// once, so the sources that return after the end answer the sender
+/// before its next expiry.
+#[test]
+fn a_request_during_the_last_retry_starts_a_new_lookup_when_the_lookup_fails() {
+    Recording::run(|recording| async move {
+        let mut fixture = Fixture::short_lived();
+        fixture.requests.send(ADDRESS).await.unwrap();
+        // The first attempt and the first retry fail; the last retry waits.
+        tokio::time::timeout(RETRY_AFTER * 2, async {
+            while recording.attempts("error") < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first retry must fail");
+        fixture.requests.send(ADDRESS).await.unwrap();
+        // The last retry fails, and the lookup ends with no answer.
+        tokio::time::timeout(RETRY_AFTER * 2, async {
+            while recording.attempts("error") < 3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the last retry must fail");
+        fixture.restore();
+        tokio::time::timeout(RETRY_AFTER * 2, fixture.answer())
+            .await
+            .expect("the request of the last retry must start a new lookup");
+        fixture.stop().await;
+    });
 }

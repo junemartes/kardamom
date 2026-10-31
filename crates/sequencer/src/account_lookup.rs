@@ -26,13 +26,17 @@
 //! longer than a parked transaction lives. So during an outage of every
 //! source, a second lookup of an address would only add retries that
 //! compete for the permits with the first attempts of other senders. A
-//! request for an address with a running lookup is dropped: the answer of
-//! that lookup serves the new transactions too.
+//! request for an address with a running lookup starts no second lookup:
+//! the answer of that lookup serves the new transactions too. The feed
+//! remembers the request. When the lookup ends with no answer, its last
+//! retry failed, and the request came after the expiry that ended the
+//! retries. The feed then starts a new lookup at once, so a source that
+//! returns serves the sender before its next expiry.
 //!
 //! Each attempt counts once in `nonce_lookups_total`, by the source that
 //! answered (`live`, `redis`, `ok` for an executor), `miss`, or `error`.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -82,11 +86,12 @@ pub struct AccountLookupFeed {
     sources: Arc<Sources>,
     shutdown: Shutdown,
     limit: Arc<Semaphore>,
-    /// The addresses with a running lookup.
-    running: HashSet<Address>,
-    /// Each lookup sends its address here when it ends.
-    ended_tx: tokio::sync::mpsc::UnboundedSender<Address>,
-    ended: tokio::sync::mpsc::UnboundedReceiver<Address>,
+    /// The addresses with a running lookup, each with whether a request
+    /// came for it while the lookup ran.
+    running: HashMap<Address, bool>,
+    /// Each lookup sends its end here.
+    ended_tx: tokio::sync::mpsc::UnboundedSender<Ended>,
+    ended: tokio::sync::mpsc::UnboundedReceiver<Ended>,
 }
 
 /// The sources of the feed and what each lookup shares.
@@ -125,7 +130,7 @@ impl AccountLookupFeed {
             }),
             shutdown,
             limit: Arc::new(Semaphore::new(IN_FLIGHT)),
-            running: HashSet::new(),
+            running: HashMap::new(),
             ended_tx,
             ended,
         }
@@ -140,22 +145,43 @@ impl AccountLookupFeed {
         while self.tick().await.is_continue() {}
     }
 
-    /// Wait for a request or for shutdown, and start its lookup.
+    /// Wait for the end of a lookup, a request or shutdown. The end of a
+    /// lookup comes first, so a request after it starts a new lookup.
     async fn tick(&mut self) -> ControlFlow<()> {
-        let address = tokio::select! {
+        tokio::select! {
             biased;
-            () = self.shutdown.cancelled() => return ControlFlow::Break(()),
+            () = self.shutdown.cancelled() => ControlFlow::Break(()),
+            Some(ended) = self.ended.recv() => self.on_ended(ended).await,
             request = self.rx.recv() => match request {
-                Some(address) => address,
-                None => return ControlFlow::Break(()),
+                Some(address) => self.on_request(address).await,
+                None => ControlFlow::Break(()),
             },
-        };
-        while let Ok(ended) = self.ended.try_recv() {
-            self.running.remove(&ended);
         }
-        if !self.running.insert(address) {
+    }
+
+    /// A request for `address`: remember it when a lookup runs for the
+    /// address, else start one.
+    async fn on_request(&mut self, address: Address) -> ControlFlow<()> {
+        if let Some(asked) = self.running.get_mut(&address) {
+            *asked = true;
             return ControlFlow::Continue(());
         }
+        self.start(address).await
+    }
+
+    /// A lookup ended. Start a new one when it ended with no answer and a
+    /// request came for it while it ran.
+    async fn on_ended(&mut self, ended: Ended) -> ControlFlow<()> {
+        let asked = self.running.remove(&ended.address) == Some(true);
+        if asked && !ended.answered {
+            return self.start(ended.address).await;
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Start the lookup of `address`.
+    async fn start(&mut self, address: Address) -> ControlFlow<()> {
+        self.running.insert(address, false);
         let Some(permit) = self.permit().await else {
             return ControlFlow::Break(());
         };
@@ -164,8 +190,9 @@ impl AccountLookupFeed {
             sources: self.sources.clone(),
             answers: self.answers.clone(),
             limit: self.limit.clone(),
-            _end: LookupEnd {
+            end: LookupEnd {
                 address,
+                answered: false,
                 ended: self.ended_tx.clone(),
             },
         };
@@ -213,69 +240,82 @@ struct Lookup {
     sources: Arc<Sources>,
     answers: crossbeam_channel::Sender<AccountEvent>,
     limit: Arc<Semaphore>,
-    /// Held for its drop: the feed learns the end of the lookup.
-    _end: LookupEnd,
+    /// Tells the feed the end of the lookup when it drops.
+    end: LookupEnd,
+}
+
+/// The end of the lookup of one address.
+struct Ended {
+    address: Address,
+    /// A source answered, or every source missed the account.
+    answered: bool,
 }
 
 /// Tells the feed that the lookup of `address` ended, however it ends.
 struct LookupEnd {
     address: Address,
-    ended: tokio::sync::mpsc::UnboundedSender<Address>,
+    answered: bool,
+    ended: tokio::sync::mpsc::UnboundedSender<Ended>,
 }
 
 impl Drop for LookupEnd {
     fn drop(&mut self) {
         // The feed is gone when the send fails, and with it the set.
-        let _ = self.ended.send(self.address);
+        let _ = self.ended.send(Ended {
+            address: self.address,
+            answered: self.answered,
+        });
     }
 }
 
 impl Lookup {
-    async fn run(self, permit: OwnedSemaphorePermit) {
-        if self.attempt(permit).await.is_break() {
-            return;
-        }
+    async fn run(mut self, permit: OwnedSemaphorePermit) {
+        let mut flow = self.attempt(permit).await;
         for _ in 0..self.sources.retries.0 {
-            if self.retry_once().await.is_break() {
-                return;
+            if flow.is_break() {
+                break;
             }
+            flow = self.retry_once().await;
         }
+        self.end.answered = flow == ControlFlow::Break(true);
     }
 
-    /// One attempt. The permit ends with it. Continue means that a source
-    /// failed.
-    async fn attempt(&self, _permit: OwnedSemaphorePermit) -> ControlFlow<()> {
+    /// One attempt. The permit ends with it. `Break(true)` is an answer
+    /// or a miss on every source; `Continue` means that a source failed.
+    async fn attempt(&self, _permit: OwnedSemaphorePermit) -> ControlFlow<bool> {
         match self.sources.observe(self.address).await {
             Found::State(_, state) => {
                 let _ = self.answers.send(AccountEvent::Answer {
                     address: self.address,
                     state,
                 });
-                ControlFlow::Break(())
+                ControlFlow::Break(true)
             }
-            Found::Missing => ControlFlow::Break(()),
+            Found::Missing => ControlFlow::Break(true),
             Found::Failed => ControlFlow::Continue(()),
         }
     }
 
-    /// Wait, take a permit, and try again. A stopped feed ends the retry.
-    async fn retry_once(&self) -> ControlFlow<()> {
+    /// Wait, take a permit, and try again. A stopped feed ends the retry
+    /// with `Break(false)`.
+    async fn retry_once(&self) -> ControlFlow<bool> {
+        let stopped = ControlFlow::Break(false);
         if self
             .unless_stopped(tokio::time::sleep(RETRY_AFTER))
             .await
             .is_none()
         {
-            return ControlFlow::Break(());
+            return stopped;
         }
         let Some(Ok(permit)) = self
             .unless_stopped(self.limit.clone().acquire_owned())
             .await
         else {
-            return ControlFlow::Break(());
+            return stopped;
         };
         self.unless_stopped(self.attempt(permit))
             .await
-            .unwrap_or(ControlFlow::Break(()))
+            .unwrap_or(stopped)
     }
 
     /// The output of `work`, or `None` when the feed stops first.
