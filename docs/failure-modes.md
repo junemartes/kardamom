@@ -1591,7 +1591,10 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - The new replica never passes its readiness check. Nomad must mark the deployment `failed`, with no healthy replica of the broken image.
   - At least two executors must keep running the old image. The case reads the image from the job spec of each running allocation. The chain must keep advancing.
   - The real image under the same deadlines then heals the group, and that deployment must be `successful`. So the deadline is one that a real executor meets. Then the job gets back its own update stanza.
-  - The deploy play itself (the release gate, the stop of the play at a failed job) has its tests in `deploy/cluster/ansible/tests`.
+  - The checks of the deploy play no longer run on a live cluster in this case. They moved to the mock Nomad API of `deploy/cluster/ansible/tests/test_deploy.py`:
+    - the stop of the play at a failed rollout: `DeployTest.test_a_failed_deployment_stops_the_deploy_at_its_job` and `DeployTest.test_a_failed_job_of_a_wave_stops_the_deploy_at_the_end_of_the_wave`;
+    - the release gate on a halted chain: `RecordTest.test_a_halted_chain_refuses_the_release`;
+    - the carry gates of `carry_gate.yml`: `CarryTest.test_the_version_floor_needs_every_reader_of_a_relayed_full_reference`, `CarryTest.test_the_readers_move_to_the_egress_past_the_last_stored_reference` and `CarryTest.test_the_carry_executors_move_one_at_a_time_after_the_switch`.
 - The deploy flow is in [../deploy/cluster/README.md](../deploy/cluster/README.md).
 
 ## Substrate (the shared failure domain)

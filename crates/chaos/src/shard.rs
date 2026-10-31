@@ -150,7 +150,6 @@ impl Shard {
                 "raft-leader-packet-loss",
                 "raft-leader-packet-delay",
                 "cluster-follower-kill",
-                "cluster-two-blank-recover",
                 "node-replace-sealer",
             ],
             // Every replica of one role down at once. Each case waits
@@ -162,7 +161,6 @@ impl Shard {
                 "executor-fleet-wipe-recover",
                 "executor-fleet-total-wipe-recover",
                 "redis-total-loss-recover",
-                "cluster-quorum-loss-recover",
                 "cluster-total-loss-recover",
             ],
             // Failures that cross the redundancy of a role. The blackout
@@ -170,7 +168,6 @@ impl Shard {
             Self::Coordinated => &[
                 "ingress-pair-loss-recover",
                 "sequencer-lane-loss-recover",
-                "control-plane-loss-recover",
                 "pipeline-blackout-recover",
             ],
             // Two or three classes down at once, and the order of their
@@ -255,6 +252,9 @@ impl Shard {
                 "mirror-backlog-client-restart",
                 "l1-provider-unresponsive",
                 "two-day-outage",
+                "cluster-two-blank-recover",
+                "cluster-quorum-loss-recover",
+                "control-plane-loss-recover",
                 "executor-restart-storm",
                 "sealer-fleet-total-wipe-recover",
                 "resize-scale-out-in",
@@ -313,9 +313,10 @@ impl Shard {
     fn chaos_knobs(self) -> ChaosKnobs {
         let canary = self == Self::Retention;
         ChaosKnobs {
-            cluster_jvm_opts: Some(format!(
-                "-Daeron.cluster.startup.canvass.timeout={STARTUP_CANVASS_S}s"
-            )),
+            // The carry shard repeats the staging rollout, so it keeps the
+            // canvass of staging.
+            cluster_jvm_opts: (self != Self::Carry)
+                .then(|| format!("-Daeron.cluster.startup.canvass.timeout={STARTUP_CANVASS_S}s")),
             heartbeat_grace_s: None,
             canary_stalled_window: canary.then(|| "1m".into()),
             canary_force_pull: canary.then_some(false),
@@ -537,6 +538,8 @@ mod tests {
         assert_eq!(STARTUP_CANVASS_S % leader_heartbeat_s, 0);
         let opts = Shard::Cluster.deploy_vars().knobs.cluster_jvm_opts.unwrap();
         assert_eq!(opts, "-Daeron.cluster.startup.canvass.timeout=20s");
+        // The carry shard repeats the staging rollout with its canvass.
+        assert_eq!(Shard::Carry.deploy_vars().knobs.cluster_jvm_opts, None);
     }
 
     #[test]
@@ -623,6 +626,9 @@ mod tests {
                 "mirror-backlog-client-restart",
                 "l1-provider-unresponsive",
                 "two-day-outage",
+                "cluster-two-blank-recover",
+                "cluster-quorum-loss-recover",
+                "control-plane-loss-recover",
                 "executor-restart-storm",
                 "sealer-fleet-total-wipe-recover",
                 "resize-scale-out-in"

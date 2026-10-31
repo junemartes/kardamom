@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use super::rebuilds::{MirrorRebuilds, RebuildPhase};
 use super::{
-    CacheRecovery, MIRROR_ALLOCS, MIRROR_HEAD_KEYS, MIRROR_SERVING, MIRROR_WRITE_RETRIES,
-    every_mirror_serves, flush_primary, live_primary,
+    CacheRecovery, MIRROR_ALLOCS, MIRROR_HEAD_KEYS, MIRROR_SERVING, MIRROR_WRITE_RETRIES, Mirrors,
+    flush_primary, live_primary,
 };
 use crate::harness::Harness;
 use crate::inject::Killed;
@@ -145,7 +145,7 @@ impl InterruptedRebuild<'_> {
             .await?;
         let h = &*self.h;
         poll::until(Budget::secs(60, 3), |_| async move {
-            Ok::<_, anyhow::Error>(every_mirror_serves(h).await.then_some(()))
+            Ok::<_, anyhow::Error>(Mirrors { h }.every_one_serves().await.then_some(()))
         })
         .await?
         .or_fail(|t| {

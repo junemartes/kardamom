@@ -266,3 +266,24 @@ fn a_member_status_without_a_field_takes_the_default_of_the_play() {
         (0, 5, "none")
     );
 }
+
+/// The check mirrors the rules of the check play. The snapshot versions
+/// that each feature needs stand in the play as its refusal conditions,
+/// so a change of a threshold in the play fails this test.
+#[test]
+fn the_snapshot_thresholds_match_the_check_play() {
+    let play = include_str!(
+        "../../../../../deploy/cluster/ansible/roles/workloads/tasks/upgrade_check.yml"
+    );
+    assert!(play.contains(&format!(
+        "workloads_upgrade_reads_max | min >= {READS_RELEASE}"
+    )));
+    for (feature, needed) in [(3, 15), (4, 16)] {
+        let rule = format!(
+            "workloads_upgrade_feature | int != {feature} or workloads_upgrade_reads_max | min >= {needed}"
+        );
+        assert!(play.contains(&rule), "the play has no rule {rule}");
+    }
+    // The play checks feature 5 inside the block of its window rules.
+    assert!(play.contains("workloads_upgrade_reads_max | min >= 18"));
+}

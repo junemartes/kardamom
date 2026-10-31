@@ -153,44 +153,84 @@ async fn wait_readers_connected(h: &Harness, ctx: &str) -> anyhow::Result<()> {
     wait_reader_moves(h, ctx, "redis lookups", Budget::secs(90, 3), |r| r.redis).await
 }
 
-/// The `metric` of each mirror exporter on the executor nodes, `None`
-/// for one that does not answer.
-async fn mirror_metrics(h: &Harness, metric: &str) -> Vec<Option<i64>> {
-    let mut values = Vec::with_capacity(h.probes.executors.len());
-    for i in 0..h.probes.executors.len() {
-        values.push(h.probes.mirror_metric(i, metric).await);
+/// The state mirrors on the executor nodes, read through their
+/// exporters.
+#[derive(Clone, Copy)]
+struct Mirrors<'a> {
+    h: &'a Harness,
+}
+
+impl Mirrors<'_> {
+    /// The `metric` of each mirror exporter on the executor nodes, `None`
+    /// for one that does not answer.
+    async fn metrics(&self, metric: &str) -> Vec<Option<i64>> {
+        let mut values = Vec::with_capacity(self.h.probes.executors.len());
+        for i in 0..self.h.probes.executors.len() {
+            values.push(self.h.probes.mirror_metric(i, metric).await);
+        }
+        values
     }
-    values
-}
 
-/// The highest mirror head across the executor nodes. `None` when no
-/// mirror exporter answers.
-async fn mirror_head(h: &Harness) -> Option<i64> {
-    mirror_metrics(h, MIRROR_HEAD)
-        .await
-        .into_iter()
-        .flatten()
-        .max()
-}
+    /// The highest mirror head across the executor nodes. `None` when no
+    /// mirror exporter answers.
+    async fn head(&self) -> Option<i64> {
+        self.metrics(MIRROR_HEAD).await.into_iter().flatten().max()
+    }
 
-/// Whether every mirror exporter answers and reports that its mirror
-/// serves.
-async fn every_mirror_serves(h: &Harness) -> bool {
-    mirror_metrics(h, MIRROR_SERVING)
-        .await
-        .iter()
-        .all(|serving| *serving == Some(1))
+    /// Whether every mirror exporter answers and reports that its mirror
+    /// serves.
+    async fn every_one_serves(&self) -> bool {
+        self.metrics(MIRROR_SERVING)
+            .await
+            .iter()
+            .all(|serving| *serving == Some(1))
+    }
+
+    /// The write retries of every mirror before the fault. A mirror that a
+    /// case before restarted answers once its exporter is up, so the read
+    /// waits for every mirror; a mirror still dark after the wait fails
+    /// the case, since a missing baseline must not read as zero.
+    async fn retry_baseline(&self, ctx: &str) -> anyhow::Result<i64> {
+        let outcome = poll::until(Budget::secs(60, 2), |_| async move {
+            Ok::<_, anyhow::Error>(self.write_retries().await)
+        })
+        .await?;
+        outcome
+            .or_fail(|t| {
+                crate::chaos_fail!(
+                    "{ctx}: a mirror exporter does not answer the write-retry baseline within {}s",
+                    t.as_secs()
+                )
+            })
+            .map(|(retries, _)| retries)
+    }
+
+    /// The write retries of every mirror, summed over the executor nodes.
+    /// A mirror that retries is alive and waits for Redis.
+    /// A fresh mirror has not retried, so its exporter has no sample yet;
+    /// that reads 0. A dark exporter is `None`: a partial sum is no
+    /// baseline.
+    async fn write_retries(&self) -> Option<i64> {
+        let mut total = Some(0_i64);
+        for i in 0..self.h.probes.executors.len() {
+            let retries = self.h.probes.mirror_counter(i, MIRROR_WRITE_RETRIES).await;
+            total = total.zip(retries).and_then(|(t, r)| t.checked_add(r));
+        }
+        total
+    }
 }
 
 /// The mirror head advances: the projection follows the chain again.
 /// The start is a read, not a default: a dark start would let any head
 /// pass.
 async fn wait_mirror_advances(h: &Harness, ctx: &str) -> anyhow::Result<()> {
-    let start = mirror_head(h)
+    let mirrors = Mirrors { h };
+    let start = mirrors
+        .head()
         .await
         .ok_or_else(|| crate::chaos_fail!("{ctx}: no mirror exporter answers the head baseline"))?;
     let outcome = poll::until(Budget::secs(120, 3), |_| async move {
-        Ok::<_, anyhow::Error>(mirror_head(h).await.filter(|head| *head > start))
+        Ok::<_, anyhow::Error>(mirrors.head().await.filter(|head| *head > start))
     })
     .await?;
     let (head, elapsed) = outcome.or_fail(|t| {
@@ -264,7 +304,11 @@ pub(crate) async fn redis_primary_freeze(h: &mut Harness) -> anyhow::Result<()> 
         .inner_signal(&node, &primary, crate::nodes::Signal::Cont)
         .await
         .map_err(|e| crate::chaos_fail!("{ctx}: SIGCONT of {primary} on {node} failed: {e}"));
-    log_cleanup(ctx, &thawed);
+    Cleanup {
+        ctx,
+        outcome: &thawed,
+    }
+    .log();
     frozen?;
     thawed?;
     wait_readers_recovered(h, ctx).await?;
@@ -334,40 +378,6 @@ pub(crate) async fn redis_primary_kill(h: &mut Harness) -> anyhow::Result<()> {
     h.assert_progress().await
 }
 
-/// The mirror write retries summed over the executor nodes. A mirror
-/// that retries is alive and waits for Redis. `None` when a mirror
-/// exporter does not answer: a partial sum is no baseline.
-/// The write retries of every mirror before the fault. A mirror that a
-/// case before restarted answers once its exporter is up, so the read
-/// waits for every mirror; a mirror still dark after the wait fails the
-/// case, since a missing baseline must not read as zero.
-async fn mirror_retry_baseline(h: &Harness, ctx: &str) -> anyhow::Result<i64> {
-    let outcome = poll::until(Budget::secs(60, 2), |_| async move {
-        Ok::<_, anyhow::Error>(mirror_write_retries(h).await)
-    })
-    .await?;
-    outcome
-        .or_fail(|t| {
-            crate::chaos_fail!(
-                "{ctx}: a mirror exporter does not answer the write-retry baseline within {}s",
-                t.as_secs()
-            )
-        })
-        .map(|(retries, _)| retries)
-}
-
-/// The write retries of every mirror. A fresh mirror has not retried, so
-/// its exporter has no sample yet; that reads 0. A dark exporter is
-/// `None`.
-async fn mirror_write_retries(h: &Harness) -> Option<i64> {
-    let mut total = Some(0_i64);
-    for i in 0..h.probes.executors.len() {
-        let retries = h.probes.mirror_counter(i, MIRROR_WRITE_RETRIES).await;
-        total = total.zip(retries).and_then(|(t, r)| t.checked_add(r));
-    }
-    total
-}
-
 /// The whole Redis job stopped: the primary, the replica and the three
 /// sentinels. No reader can resolve a primary, so every cold read
 /// degrades, the pipeline progresses, and the mirrors retry their
@@ -381,7 +391,7 @@ pub(crate) async fn redis_total_loss_recover(h: &mut Harness) -> anyhow::Result<
     let ctx = "redis-total-loss-recover";
     wait_readers_connected(h, ctx).await?;
     let recovery = CacheRecovery::capture(h).await?;
-    let retries0 = mirror_retry_baseline(h, ctx).await?;
+    let retries0 = Mirrors { h }.retry_baseline(ctx).await?;
     let job = SavedJob::capture(&h.nomad, "redis").await?;
     crate::log(format!(
         "{ctx}: stop the whole redis job (primary, replica, three sentinels) for {}s",
@@ -413,8 +423,9 @@ async fn total_loss_phase(h: &Harness, ctx: &str, retries0: i64) -> anyhow::Resu
     let dark = Instant::now();
     wait_readers_degraded(h, ctx).await?;
     h.assert_progress().await?;
+    let mirrors = Mirrors { h };
     let outcome = poll::until(Budget::secs(60, 3), |_| async move {
-        Ok::<_, anyhow::Error>(mirror_write_retries(h).await.filter(|now| *now > retries0))
+        Ok::<_, anyhow::Error>(mirrors.write_retries().await.filter(|now| *now > retries0))
     })
     .await?;
     let (retries, _) = outcome.or_fail(|t| {
@@ -463,9 +474,18 @@ pub(crate) async fn redis_partition_ingress(h: &mut Harness) -> anyhow::Result<(
     let ctx = "redis-partition-ingress";
     wait_readers_connected(h, ctx).await?;
     let node = h.probes.ingresses[0].container.clone();
-    let partitioned = partitioned_phase(h, ctx, &node).await;
-    let healed = heal_partition(h, ctx, &node).await;
-    log_cleanup(ctx, &healed);
+    let partition = Partition {
+        h,
+        ctx,
+        node: &node,
+    };
+    let partitioned = partition.cut().await;
+    let healed = partition.heal().await;
+    Cleanup {
+        ctx,
+        outcome: &healed,
+    }
+    .log();
     partitioned?;
     healed?;
     crate::log(format!("{ctx}: partition healed on {node}"));
@@ -473,45 +493,66 @@ pub(crate) async fn redis_partition_ingress(h: &mut Harness) -> anyhow::Result<(
     h.assert_progress().await
 }
 
-/// Drop the Redis packets of `node`, then prove the degraded reads and
-/// the progress. An error after the first rule leaves the cleanup to
-/// [`heal_partition`].
-async fn partitioned_phase(h: &Harness, ctx: &str, node: &str) -> anyhow::Result<()> {
-    for port in REDIS_PORTS {
-        h.nodes
-            .exec(node, &format!("iptables -w 5 -I {}", drop_rule(port)))
-            .await
-            .map_err(|e| crate::chaos_fail!("{ctx}: could not drop port {port} on {node}: {e}"))?;
+/// The Redis partition of one ingress node.
+struct Partition<'a> {
+    h: &'a Harness,
+    ctx: &'a str,
+    node: &'a str,
+}
+
+impl Partition<'_> {
+    /// Drop the Redis packets of the node, then prove the degraded reads
+    /// and the progress. An error after the first rule leaves the cleanup
+    /// to [`Partition::heal`].
+    async fn cut(&self) -> anyhow::Result<()> {
+        let Self { h, ctx, node } = *self;
+        for port in REDIS_PORTS {
+            h.nodes
+                .exec(node, &format!("iptables -w 5 -I {}", drop_rule(port)))
+                .await
+                .map_err(|e| {
+                    crate::chaos_fail!("{ctx}: could not drop port {port} on {node}: {e}")
+                })?;
+        }
+        crate::log(format!(
+            "{ctx}: {node} dropping its Redis and sentinel packets"
+        ));
+        wait_readers_degraded(h, ctx).await?;
+        h.assert_progress().await
     }
-    crate::log(format!(
-        "{ctx}: {node} dropping its Redis and sentinel packets"
-    ));
-    wait_readers_degraded(h, ctx).await?;
-    h.assert_progress().await
+
+    /// Delete every drop rule of the node, and fail when a rule stays. A
+    /// rule that the arm did not insert is no failure.
+    async fn heal(&self) -> anyhow::Result<()> {
+        let Self { h, ctx, node } = *self;
+        let left = REDIS_PORTS.map(drop_rule).join(" | ");
+        let script = format!(
+            "for rule in {rules}; do while iptables -w 5 -C $rule 2>/dev/null; do iptables -w 5 -D $rule || exit 1; done; done",
+            rules = REDIS_PORTS
+                .map(|port| format!("'{}'", drop_rule(port)))
+                .join(" ")
+        );
+        h.nodes
+            .exec(node, &script)
+            .await
+            .map(|_| ())
+            .map_err(|e| crate::chaos_fail!("{ctx}: a drop rule stays on {node} ({left}): {e}"))
+    }
 }
 
-/// Delete every drop rule of `node`, and fail when a rule stays. A rule
-/// that the arm did not insert is no failure.
-async fn heal_partition(h: &Harness, ctx: &str, node: &str) -> anyhow::Result<()> {
-    let left = REDIS_PORTS.map(drop_rule).join(" | ");
-    let script = format!(
-        "for rule in {rules}; do while iptables -w 5 -C $rule 2>/dev/null; do iptables -w 5 -D $rule || exit 1; done; done",
-        rules = REDIS_PORTS
-            .map(|port| format!("'{}'", drop_rule(port)))
-            .join(" ")
-    );
-    h.nodes
-        .exec(node, &script)
-        .await
-        .map(|_| ())
-        .map_err(|e| crate::chaos_fail!("{ctx}: a drop rule stays on {node} ({left}): {e}"))
+/// The outcome of one fault cleanup in the case `ctx`.
+struct Cleanup<'a> {
+    ctx: &'a str,
+    outcome: &'a anyhow::Result<()>,
 }
 
-/// Log a failed fault cleanup, so a fault that stays has a cause in the
-/// log also when the case fails first for another reason.
-fn log_cleanup(ctx: &str, cleanup: &anyhow::Result<()>) {
-    if let Err(error) = cleanup {
-        crate::log(format!("{ctx}: fault cleanup fails: {error:#}"));
+impl Cleanup<'_> {
+    /// Log a failed fault cleanup, so a fault that stays has a cause in
+    /// the log also when the case fails first for another reason.
+    fn log(&self) {
+        if let Err(error) = self.outcome {
+            crate::log(format!("{}: fault cleanup fails: {error:#}", self.ctx));
+        }
     }
 }
 

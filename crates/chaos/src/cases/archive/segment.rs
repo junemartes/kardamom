@@ -81,54 +81,59 @@ pub(super) async fn pick_clean_segment(
         victim.0.len(),
         mirrored.0.len()
     ));
+    let pick = SegmentPick { tool, mirror };
     for name in victim.0.iter().filter(|name| mirrored.0.contains(name)) {
-        if let Some(seg) = same_name(tool, mirror, name).await {
+        if let Some(seg) = pick.same_name(name).await {
             return Ok(seg);
         }
     }
-    by_content(tool, mirror).await
+    pick.by_content().await
 }
 
-/// `name` as a victim segment when the mirror holds the same bytes under
-/// the same name.
-async fn same_name(tool: &ArchiveTool<'_>, mirror: &str, name: &str) -> Option<Segment> {
-    let listing = format!("echo {name}");
-    let (victim, mirrored) = tokio::join!(
-        SegmentHashes::read(tool.h, tool.node, &listing),
-        SegmentHashes::read(tool.h, mirror, &listing)
-    );
-    let hash = &victim.0.first()?.0;
-    let mirror_name = mirrored.name_for(hash, name)?;
-    qualify(tool, name.to_string(), mirror_name).await
+/// The search for a victim segment on the node of `tool`, with `mirror`
+/// as the node that holds the heal copy.
+struct SegmentPick<'a, 't> {
+    tool: &'a ArchiveTool<'t>,
+    mirror: &'a str,
 }
 
-/// The match by content over every segment of both nodes.
-async fn by_content(tool: &ArchiveTool<'_>, mirror: &str) -> anyhow::Result<Segment> {
-    let listing = "ls *.rec 2>/dev/null";
-    let (victim, mirror) = tokio::join!(
-        SegmentHashes::read(tool.h, tool.node, listing),
-        SegmentHashes::read(tool.h, mirror, listing)
-    );
-    for (hash, name) in victim.0 {
-        if let Some(seg) = by_hash(tool, &mirror, &hash, name).await {
-            return Ok(seg);
-        }
+impl SegmentPick<'_, '_> {
+    /// `name` as a victim segment when the mirror holds the same bytes
+    /// under the same name.
+    async fn same_name(&self, name: &str) -> Option<Segment> {
+        let listing = format!("echo {name}");
+        let (victim, mirrored) = tokio::join!(
+            SegmentHashes::read(self.tool.h, self.tool.node, &listing),
+            SegmentHashes::read(self.tool.h, self.mirror, &listing)
+        );
+        let hash = &victim.0.first()?.0;
+        let mirror_name = mirrored.name_for(hash, name)?;
+        qualify(self.tool, name.to_string(), mirror_name).await
     }
-    Err(crate::chaos_fail!(
-        "archive-corruption: no recording verifies clean at baseline (inherited catalog damage too broad)"
-    ))
-}
 
-/// `name` as a victim segment when the mirror holds its bytes under any
-/// name.
-async fn by_hash(
-    tool: &ArchiveTool<'_>,
-    mirror: &SegmentHashes,
-    hash: &str,
-    name: String,
-) -> Option<Segment> {
-    let mirror_name = mirror.name_for(hash, &name)?;
-    qualify(tool, name, mirror_name).await
+    /// The match by content over every segment of both nodes.
+    async fn by_content(&self) -> anyhow::Result<Segment> {
+        let listing = "ls *.rec 2>/dev/null";
+        let (victim, mirror) = tokio::join!(
+            SegmentHashes::read(self.tool.h, self.tool.node, listing),
+            SegmentHashes::read(self.tool.h, self.mirror, listing)
+        );
+        for (hash, name) in victim.0 {
+            if let Some(seg) = self.by_hash(&mirror, &hash, name).await {
+                return Ok(seg);
+            }
+        }
+        Err(crate::chaos_fail!(
+            "archive-corruption: no recording verifies clean at baseline (inherited catalog damage too broad)"
+        ))
+    }
+
+    /// `name` as a victim segment when the mirror holds its bytes under
+    /// any name.
+    async fn by_hash(&self, mirror: &SegmentHashes, hash: &str, name: String) -> Option<Segment> {
+        let mirror_name = mirror.name_for(hash, &name)?;
+        qualify(self.tool, name, mirror_name).await
+    }
 }
 
 /// The segment names of one node, in listing order.

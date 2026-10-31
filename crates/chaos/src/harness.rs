@@ -260,6 +260,49 @@ impl Harness {
         }
     }
 
+    /// End the case load and start a load at the probe rate for a
+    /// catch-up measurement. The catch-up then closes a lag under load,
+    /// not on an idle chain, and the case load no longer holds the lag
+    /// open at its full rate. The load uses the gate account, from its
+    /// next nonce, and every offered transaction must get a receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the nonce read or the load start fails.
+    pub(crate) async fn catch_up_load(&mut self, ctx: &str) -> anyhow::Result<CatchUpLoad> {
+        self.end_case_load(ctx);
+        let account = self.knobs.gate_account;
+        let nonce_start = Rpc::new(&self.rpc_url, self.knobs.chain_id)?
+            .nonce_of(account)
+            .await?;
+        let spec = LoadSpec {
+            rpc_url: self.rpc_url.clone(),
+            receipt_rpcs: self.receipt_rpcs(),
+            chain_id: self.knobs.chain_id,
+            account,
+            nonce_start,
+            completeness: Completeness::Offered,
+            fixed_rate: true,
+            duration: self.knobs.case_deadline,
+            tps: self.probe_tps(),
+            max_in_flight: self.probe_tps().saturating_mul(PROBE_SECS),
+            retry_submit: self.knobs.load_retry,
+            pause_wait: PROBE_PAUSE_WAIT,
+            max_gap: self.knobs.load_max_gap,
+            drain_timeout: self.knobs.converge_slo,
+            report_path: Self::report_path(&format!("{ctx}-catch-up")),
+            metrics: self.probes.load_metrics(&self.probes.ingresses[0]),
+        };
+        crate::log(format!(
+            "{ctx}: the catch-up runs under a load of {} tx/s from account #{account}",
+            spec.tps
+        ));
+        Ok(CatchUpLoad {
+            run: LoadRun::start(&spec)?,
+            ctx: ctx.to_string(),
+        })
+    }
+
     /// The recovery probe: two short loads at once, after the case load
     /// ended and the executors converged. The first runs on the case's
     /// account from its next nonce, through the ingress the case load
@@ -268,7 +311,7 @@ impl Harness {
     /// spends, through the other ingress: a sender with nothing in
     /// flight. Every offered transaction of both must get a receipt
     /// within the park of the ingress, and each leg must offer at least
-    /// half of its rate. A failure of the first alone is a stuck sender; a
+    /// a quarter of its rate. A failure of the first alone is a stuck sender; a
     /// failure of the second is a pipeline, or an ingress, that did not
     /// recover. The case load cannot prove either: a submit refused
     /// during the outage leaves a nonce hole, every later submit of the
@@ -353,7 +396,7 @@ impl Harness {
     /// its rate on the CI runner, so a leg below a quarter did not run
     /// its window.
     fn probe_floor(&self) -> u64 {
-        u64::from(self.probe_tps().get()) * PROBE_WINDOW.as_secs() / 4
+        u64::from(self.probe_tps().get()).saturating_mul(PROBE_WINDOW.as_secs()) / 4
     }
 
     async fn run_body(
@@ -489,6 +532,40 @@ impl Harness {
         crate::log(format!(
             "load flowing (ingress received [{}] -> {rx1}); injecting",
             rx0.describe()
+        ));
+        Ok(())
+    }
+}
+
+/// The load that runs while a case measures a catch-up.
+pub(crate) struct CatchUpLoad {
+    run: LoadRun,
+    ctx: String,
+}
+
+impl CatchUpLoad {
+    /// End the load after the catch-up and require a receipt for every
+    /// offered transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the load fails or a transaction has no receipt.
+    pub(crate) async fn finish(self) -> anyhow::Result<()> {
+        self.run.finish_submissions();
+        let verdict = self.run.finish().await?;
+        anyhow::ensure!(
+            verdict.pass && verdict.missing == 0,
+            "{}: {}: the load during the catch-up is not PASS: {:?} (missing={} of {} offered; {})",
+            crate::FAIL_PREFIX,
+            self.ctx,
+            verdict.failures,
+            verdict.missing,
+            verdict.offered,
+            verdict.latency
+        );
+        crate::log(format!(
+            "{}: the load during the catch-up: {} offered, all receipted",
+            self.ctx, verdict.offered
         ));
         Ok(())
     }

@@ -1635,6 +1635,18 @@ class DeployTest(Deploys):
             with self.subTest(environ=environ):
                 self.run_deploy(check=True, success=False, environ=environ)
 
+    def test_the_preflight_refuses_a_chaos_knob_outside_the_local_profile(self):
+        """A chaos knob in the operator's shell stops a deploy of another
+        profile before any job changes. The local profile takes it."""
+        environ = {'KARDAMOM_CLUSTER_JVM_OPTS': '-Daeron.cluster.startup.canvass.timeout=20s',
+                   'KARDAMOM_CANARY_FORCE_PULL': 'off'}
+        output = self.run_deploy(check=True, success=False, environ=environ,
+                                 extra={'deployment_profile': 'production'})
+        self.assertIn('Refused: KARDAMOM_CLUSTER_JVM_OPTS, KARDAMOM_CANARY_FORCE_PULL is set, and the '
+                      'deployment profile is production', output)
+        self.assertNotIn('plans', self.api.state)
+        self.run_deploy(check=True, environ=environ)
+
     def test_the_preflight_refuses_more_notifiers_than_notifier_nodes(self):
         """The preflight counts the ready, eligible nodes whose role set
         holds notifier, before any job changes. A down node, a drained node

@@ -203,10 +203,11 @@ pub(crate) async fn lapse(h: &mut Harness) -> anyhow::Result<()> {
     tokio::time::sleep(h.knobs.validator_lapse.saturating_sub(frozen_at.elapsed())).await;
     thaw_validator(h, &node, &inner).await;
     confirm_thaw(h, &node, &inner, started0.as_deref()).await;
-    // The catch-up runs on a chain without new traffic: the lag at the
-    // thaw must close, not a lag that the load keeps open.
-    h.end_case_load("validator-lapse");
+    // The catch-up runs under a load at the probe rate: the lag at the
+    // thaw must close while new blocks still come.
+    let catch_up = h.catch_up_load("validator-lapse").await?;
     let (path, sample) = sample_recovery(h, &node, started0.as_deref(), vf0).await?;
+    catch_up.finish().await?;
     let d1 = h
         .probes
         .val_metric_required(DIVERGENCE, "validator-lapse divergence==0 assert")
@@ -405,9 +406,9 @@ pub(crate) async fn join(h: &mut Harness) -> anyhow::Result<()> {
         .await
         .map_err(|e| crate::chaos_fail!("validator-join: state wipe failed: {e}"))?;
     crate::log("validator-join: validator killed, state + checkpoint staging wiped");
-    // The fresh validator joins a chain without new traffic: it must
-    // close the lag of the wipe, not a lag that the load keeps open.
-    h.end_case_load("validator-join");
+    // The fresh validator joins under a load at the probe rate: it must
+    // close the lag of the wipe while new blocks still come.
+    let catch_up = h.catch_up_load("validator-join").await?;
     let newborn = RefCell::new(None::<String>);
     let last = Cell::new(Warm::default());
     let (hs, node_ref, started0_ref) = (&*h, node.as_str(), started0.as_deref());
@@ -434,6 +435,7 @@ pub(crate) async fn join(h: &mut Harness) -> anyhow::Result<()> {
             warm_line(last.get())
         ));
     };
+    catch_up.finish().await?;
     let newborn = newborn.unwrap_or_default();
     let logs = h
         .nodes

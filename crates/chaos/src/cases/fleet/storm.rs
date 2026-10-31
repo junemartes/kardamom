@@ -33,11 +33,11 @@ const EXITED: &str = "the process exits so the supervisor restarts it";
 /// fails the case; a replica that does not advance does.
 pub(crate) async fn executor_restart_storm(h: &mut Harness) -> anyhow::Result<()> {
     let job = SavedJob::capture(&h.nomad, "executor").await?;
-    let replicas = executor_containers(h).len();
+    let storm = Storm::new(&job, executor_containers(h).len(), &h.knobs);
     let reopened = count(h, REOPENED).await;
     let exited = count(h, EXITED).await;
     for round in 1..=ROUNDS {
-        storm_round(h, &job, replicas, round).await?;
+        storm.round(h, round).await?;
     }
     crate::log(format!(
         "{CTX}: {ROUNDS} rounds done; every executor advanced after each one; \
@@ -48,67 +48,73 @@ pub(crate) async fn executor_restart_storm(h: &mut Harness) -> anyhow::Result<()
     Ok(())
 }
 
-/// The window of one round: one minute for the stop and the start of
-/// the job, the restart SLO for every replica to run, and the
-/// convergence SLO for the fleet. The case load must cover [`ROUNDS`]
-/// of these windows.
-pub(crate) fn round_window(k: &Knobs) -> Duration {
-    k.restart_slo
-        .saturating_add(k.converge_slo)
-        .saturating_add(Duration::from_mins(1))
-}
-
-/// One round within its [`round_window`]. A round past its window fails
-/// here, with its cause, and not later as a case load that ended early.
-/// The timeout can end a round between the stop and the restore of the
-/// job, so a failed round registers the saved job again before it
-/// fails: no stopped executor job leaks into the next case.
-async fn storm_round(
-    h: &mut Harness,
-    job: &SavedJob,
+/// The rounds of one storm over the saved executor job.
+struct Storm<'a> {
+    job: &'a SavedJob,
+    /// The number of executor replicas that must run after each round.
     replicas: usize,
-    round: u32,
-) -> anyhow::Result<()> {
-    let window = round_window(&h.knobs);
-    let outcome = tokio::time::timeout(window, round_steps(h, job, replicas, round))
-        .await
-        .map_err(|_| {
-            crate::chaos_fail!(
-                "{CTX}: round {round}/{ROUNDS} exceeds its window of {}s",
-                window.as_secs()
-            )
-        })
-        .and_then(std::convert::identity);
-    if outcome.is_err() {
-        restore_logged(job).await;
-    }
-    outcome
+    /// The window of one round: one minute for the stop and the start of
+    /// the job, the restart SLO for every replica to run, and the
+    /// convergence SLO for the fleet. The case load must cover [`ROUNDS`]
+    /// of these windows.
+    window: Duration,
 }
 
-/// Register the saved executor job again, and log a failed restore.
-async fn restore_logged(job: &SavedJob) {
-    if let Err(error) = job.restore().await {
-        crate::log(format!("{CTX}: fault cleanup fails: {error:#}"));
+impl<'a> Storm<'a> {
+    fn new(job: &'a SavedJob, replicas: usize, k: &Knobs) -> Self {
+        let window = k
+            .restart_slo
+            .saturating_add(k.converge_slo)
+            .saturating_add(Duration::from_mins(1));
+        Self {
+            job,
+            replicas,
+            window,
+        }
     }
-}
 
-/// One round: stop the job, start it again, wait until every replica
-/// runs, and require every executor to advance.
-async fn round_steps(
-    h: &mut Harness,
-    job: &SavedJob,
-    replicas: usize,
-    round: u32,
-) -> anyhow::Result<()> {
-    crate::log(format!(
-        "{CTX}: round {round}/{ROUNDS}: stop and restore the executor job"
-    ));
-    job.stop().await?;
-    job.restore().await?;
-    h.assert_count("executor", replicas, h.knobs.restart_slo)
-        .await?;
-    h.assert_executors_converged(&format!("{CTX} round {round}"))
-        .await
+    /// One round within its window. A round past its window fails here,
+    /// with its cause, and not later as a case load that ended early.
+    /// The timeout can end a round between the stop and the restore of
+    /// the job, so a failed round registers the saved job again before
+    /// it fails: no stopped executor job leaks into the next case.
+    async fn round(&self, h: &mut Harness, round: u32) -> anyhow::Result<()> {
+        let window = self.window;
+        let outcome = tokio::time::timeout(window, self.round_steps(h, round))
+            .await
+            .map_err(|_| {
+                crate::chaos_fail!(
+                    "{CTX}: round {round}/{ROUNDS} exceeds its window of {}s",
+                    window.as_secs()
+                )
+            })
+            .and_then(std::convert::identity);
+        if outcome.is_err() {
+            self.restore_logged().await;
+        }
+        outcome
+    }
+
+    /// Register the saved executor job again, and log a failed restore.
+    async fn restore_logged(&self) {
+        if let Err(error) = self.job.restore().await {
+            crate::log(format!("{CTX}: fault cleanup fails: {error:#}"));
+        }
+    }
+
+    /// One round: stop the job, start it again, wait until every replica
+    /// runs, and require every executor to advance.
+    async fn round_steps(&self, h: &mut Harness, round: u32) -> anyhow::Result<()> {
+        crate::log(format!(
+            "{CTX}: round {round}/{ROUNDS}: stop and restore the executor job"
+        ));
+        self.job.stop().await?;
+        self.job.restore().await?;
+        h.assert_count("executor", self.replicas, h.knobs.restart_slo)
+            .await?;
+        h.assert_executors_converged(&format!("{CTX} round {round}"))
+            .await
+    }
 }
 
 /// The number of executor log lines that hold `needle`. A log that
