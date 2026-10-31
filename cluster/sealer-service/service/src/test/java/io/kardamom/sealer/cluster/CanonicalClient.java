@@ -23,6 +23,8 @@ final class CanonicalClient implements AutoCloseable {
 
     /** The wait for the relay of one offer before the client offers it again. */
     private static final long REOFFER_NS = Duration.ofSeconds(3).toNanos();
+    /** The keepalive interval of {@link #holdUntil}, far below the session timeout. */
+    private static final long KEEP_ALIVE_NS = Duration.ofSeconds(1).toNanos();
 
     private final MediaDriver driver;
     private final Supplier<String> endpoints;
@@ -120,6 +122,22 @@ final class CanonicalClient implements AutoCloseable {
     void pollUntil(final Duration bound, final String what, final java.util.function.BooleanSupplier done) {
         Await.holds(bound, what, () -> {
             poll();
+            return done.getAsBoolean();
+        });
+    }
+
+    /**
+     * Poll the egress and send a keepalive each second until {@code done}
+     * holds, within {@code bound}. The session then outlives a wait that
+     * is longer than the session timeout of the cluster.
+     */
+    void holdUntil(final Duration bound, final String what, final java.util.function.BooleanSupplier done) {
+        final long[] next = {System.nanoTime()};
+        pollUntil(bound, what, () -> {
+            if (System.nanoTime() - next[0] >= 0) {
+                session().ifPresent(AeronCluster::sendKeepAlive);
+                next[0] = System.nanoTime() + KEEP_ALIVE_NS;
+            }
             return done.getAsBoolean();
         });
     }
