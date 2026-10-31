@@ -379,7 +379,7 @@
         }
       ],
       "limitation": "One executor on one host. The Nomad restart of the node and its image pulls stay in the chaos shard.",
-      "ci_mode": "docker"
+      "ci_mode": "stack"
     },
     "executor-exec-stream": {
       "command": [
