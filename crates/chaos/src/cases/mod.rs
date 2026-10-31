@@ -3,7 +3,6 @@
 //! the common tail.
 
 use std::num::NonZeroU32;
-use std::time::Duration;
 
 use crate::accounts::Pin;
 use crate::harness::Harness;
@@ -11,10 +10,12 @@ use crate::knobs::Knobs;
 
 pub(crate) mod archive;
 pub(crate) mod cache;
+pub mod carry;
 pub(crate) mod chain_status;
 pub(crate) mod cluster;
 pub(crate) mod combined;
 pub(crate) mod component;
+mod control_plane;
 pub(crate) mod coordinated;
 pub(crate) mod da_lag;
 pub(crate) mod da_watcher;
@@ -23,11 +24,21 @@ pub(crate) mod exec_stream;
 pub(crate) mod fleet;
 pub(crate) mod l1;
 pub(crate) mod l1_canary;
+mod lookup_blackout;
+mod member_storage;
+mod raft_partition;
 pub(crate) mod recorded_cursor;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
+pub mod sequencer_recovery;
 pub(crate) mod squeeze;
 pub(crate) mod validator;
+
+mod window;
+
+/// The case load rate while an Ansible play runs on the controller. It
+/// keeps traffic in the pipeline through the play.
+const PLAY_TPS: NonZeroU32 = NonZeroU32::new(20).expect("a nonzero play rate");
 
 /// Every case, by its CI name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,15 +49,22 @@ pub enum Case {
     HardIngress,
     GracefulSequencer,
     HardSequencer,
-    SequencerReplicaKill,
+    /// One drill of the kill of one sequencer replica.
+    SequencerReplicaKill(sequencer_recovery::Drill),
     NodeFailureExecutor,
     NodeReplaceExecutor,
     StateCheckpointRestore,
+    CheckpointCorruptRecover,
+    CheckpointDiskFull,
     ReplayWindowResync,
     DeployBrokenImage,
     ClusterLeaderKill,
+    RaftLeaderOneWayPartition,
+    RaftLeaderPacketLoss,
+    RaftLeaderPacketDelay,
     ClusterFollowerKill,
     ClusterMemberRejoin,
+    ClusterTwoBlankRecover,
     NodeReplaceSealer,
     ClusterQuorumLossRecover,
     ClusterTotalLossRecover,
@@ -57,6 +75,7 @@ pub enum Case {
     IngressPairLossRecover,
     SequencerLaneLossRecover,
     PipelineBlackoutRecover,
+    ControlPlaneLossRecover,
     IngressSequencerLossRecover,
     IngressSealerLossRecover,
     SequencerSealerLossRecover,
@@ -83,17 +102,22 @@ pub enum Case {
     RedisPartitionIngress,
     RedisTotalLossRecover,
     MirrorKillRebuild,
+    MirrorBacklogClientRestart,
     DaLagHalt,
     CanaryDaLag,
     PruneFloor,
     L1Liar,
     L1NullReceipts,
+    L1TransportRefusals,
+    L1ProviderUnresponsive,
     TwoDayOutage,
     BatcherOutagePastRetention,
     FollowerInstanceLoss,
     FollowerTotalLoss,
     ExecutorRestartStorm,
     FollowerDisagreement,
+    /// One step of the carry window.
+    Carry(carry::Step),
 }
 
 // A slice, not a fixed-size array: two branches that each add a case
@@ -106,15 +130,20 @@ const ALL: &[Case] = &[
     Case::HardIngress,
     Case::GracefulSequencer,
     Case::HardSequencer,
-    Case::SequencerReplicaKill,
     Case::NodeFailureExecutor,
     Case::NodeReplaceExecutor,
     Case::StateCheckpointRestore,
+    Case::CheckpointCorruptRecover,
+    Case::CheckpointDiskFull,
     Case::ReplayWindowResync,
     Case::DeployBrokenImage,
     Case::ClusterLeaderKill,
+    Case::RaftLeaderOneWayPartition,
+    Case::RaftLeaderPacketLoss,
+    Case::RaftLeaderPacketDelay,
     Case::ClusterFollowerKill,
     Case::ClusterMemberRejoin,
+    Case::ClusterTwoBlankRecover,
     Case::NodeReplaceSealer,
     Case::ClusterQuorumLossRecover,
     Case::ClusterTotalLossRecover,
@@ -125,6 +154,7 @@ const ALL: &[Case] = &[
     Case::IngressPairLossRecover,
     Case::SequencerLaneLossRecover,
     Case::PipelineBlackoutRecover,
+    Case::ControlPlaneLossRecover,
     Case::IngressSequencerLossRecover,
     Case::IngressSealerLossRecover,
     Case::SequencerSealerLossRecover,
@@ -151,11 +181,14 @@ const ALL: &[Case] = &[
     Case::RedisPartitionIngress,
     Case::RedisTotalLossRecover,
     Case::MirrorKillRebuild,
+    Case::MirrorBacklogClientRestart,
     Case::DaLagHalt,
     Case::CanaryDaLag,
     Case::PruneFloor,
     Case::L1Liar,
     Case::L1NullReceipts,
+    Case::L1TransportRefusals,
+    Case::L1ProviderUnresponsive,
     Case::TwoDayOutage,
     Case::BatcherOutagePastRetention,
     Case::FollowerInstanceLoss,
@@ -174,6 +207,8 @@ impl Case {
     pub fn parse(name: &str) -> anyhow::Result<Self> {
         ALL.iter()
             .copied()
+            .chain(carry::STEPS.iter().copied().map(Self::Carry))
+            .chain(sequencer_recovery::Drill::ALL.map(Self::SequencerReplicaKill))
             .find(|c| c.name() == name)
             .ok_or_else(|| crate::chaos_fail!("unknown chaos case: {name}"))
     }
@@ -188,15 +223,21 @@ impl Case {
             Self::HardIngress => "hard-ingress",
             Self::GracefulSequencer => "graceful-sequencer",
             Self::HardSequencer => "hard-sequencer",
-            Self::SequencerReplicaKill => "sequencer-replica-kill",
+            Self::SequencerReplicaKill(drill) => drill.name(),
             Self::NodeFailureExecutor => "node-failure-executor",
             Self::NodeReplaceExecutor => "node-replace-executor",
             Self::StateCheckpointRestore => "state-checkpoint-restore",
+            Self::CheckpointCorruptRecover => "checkpoint-corrupt-recover",
+            Self::CheckpointDiskFull => "checkpoint-disk-full",
             Self::ReplayWindowResync => "replay-window-resync",
             Self::DeployBrokenImage => "deploy-broken-image",
             Self::ClusterLeaderKill => "cluster-leader-kill",
+            Self::RaftLeaderOneWayPartition => "raft-leader-one-way-partition",
+            Self::RaftLeaderPacketLoss => "raft-leader-packet-loss",
+            Self::RaftLeaderPacketDelay => "raft-leader-packet-delay",
             Self::ClusterFollowerKill => "cluster-follower-kill",
             Self::ClusterMemberRejoin => "cluster-member-rejoin",
+            Self::ClusterTwoBlankRecover => "cluster-two-blank-recover",
             Self::NodeReplaceSealer => "node-replace-sealer",
             Self::ClusterQuorumLossRecover => "cluster-quorum-loss-recover",
             Self::ClusterTotalLossRecover => "cluster-total-loss-recover",
@@ -207,6 +248,7 @@ impl Case {
             Self::IngressPairLossRecover => "ingress-pair-loss-recover",
             Self::SequencerLaneLossRecover => "sequencer-lane-loss-recover",
             Self::PipelineBlackoutRecover => "pipeline-blackout-recover",
+            Self::ControlPlaneLossRecover => "control-plane-loss-recover",
             Self::IngressSequencerLossRecover => "ingress-sequencer-loss-recover",
             Self::IngressSealerLossRecover => "ingress-sealer-loss-recover",
             Self::SequencerSealerLossRecover => "sequencer-sealer-loss-recover",
@@ -233,33 +275,45 @@ impl Case {
             Self::RedisPartitionIngress => "redis-partition-ingress",
             Self::RedisTotalLossRecover => "redis-total-loss-recover",
             Self::MirrorKillRebuild => "mirror-kill-rebuild",
+            Self::MirrorBacklogClientRestart => "mirror-backlog-client-restart",
             Self::DaLagHalt => "da-lag-halt",
             Self::CanaryDaLag => "canary-da-lag",
             Self::PruneFloor => "prune-floor",
             Self::L1Liar => "l1-liar",
             Self::L1NullReceipts => "l1-null-receipts",
+            Self::L1TransportRefusals => "l1-transport-refusals",
+            Self::L1ProviderUnresponsive => "l1-provider-unresponsive",
             Self::TwoDayOutage => "two-day-outage",
             Self::BatcherOutagePastRetention => "batcher-outage-past-retention",
             Self::FollowerInstanceLoss => "follower-instance-loss",
             Self::FollowerTotalLoss => "follower-total-loss",
             Self::ExecutorRestartStorm => "executor-restart-storm",
             Self::FollowerDisagreement => "follower-disagreement",
+            Self::Carry(step) => step.name(),
         }
     }
 
     /// The case load's rate. The L1 cases run below the steady rate: a
     /// fault that stops the batcher must not push its cursor past the
-    /// small egress retention their shard deploys.
+    /// small egress retention their shard deploys. A case that runs an
+    /// Ansible play on the controller runs at the play rate: the cluster
+    /// shares the runner with the controller, and the steady rate starves
+    /// the play.
     #[must_use]
     pub fn tps(self, k: &Knobs) -> NonZeroU32 {
         match self {
+            Self::NodeReplaceExecutor | Self::NodeReplaceSealer => PLAY_TPS,
+            // The floor passes the frozen or resumed cursor of the batcher
+            // sooner at a higher rate.
+            Self::TwoDayOutage | Self::BatcherOutagePastRetention => l1::FLOOR_PASS_TPS,
             Self::L1Liar
             | Self::L1NullReceipts
-            | Self::TwoDayOutage
-            | Self::BatcherOutagePastRetention
+            | Self::L1TransportRefusals
+            | Self::L1ProviderUnresponsive
             | Self::FollowerInstanceLoss
             | Self::FollowerTotalLoss
             | Self::FollowerDisagreement => k.l1_tps,
+            Self::Carry(_) => carry::CARRY_TPS,
             _ => k.tps,
         }
     }
@@ -268,8 +322,8 @@ impl Case {
     #[must_use]
     pub fn pin(self) -> Pin {
         match self {
-            Self::SequencerReplicaKill
-            | Self::SequencerLapse
+            Self::SequencerReplicaKill(drill) => drill.pin(),
+            Self::SequencerLapse
             | Self::GracefulSequencer
             | Self::HardSequencer
             | Self::SequencerLaneLossRecover
@@ -280,116 +334,10 @@ impl Case {
         }
     }
 
-    /// The per-case load window: the global window, widened to the
-    /// case's floor so the load still flows through its whole
-    /// inject-and-recover sequence.
-    #[must_use]
-    pub fn window(self, k: &Knobs) -> Duration {
-        let inject = k.inject_delay;
-        let floor = match self {
-            Self::SequencerReplicaKill => inject + k.restart_slo + Duration::from_mins(1),
-            Self::SequencerLapse => inject + k.seq_lapse + Duration::from_mins(1),
-            Self::ValidatorLapse => inject + k.validator_lapse + Duration::from_mins(1),
-            Self::RetentionOverrun
-            | Self::RetentionOverrunValidator
-            | Self::DaLagHalt
-            | Self::CanaryDaLag
-            | Self::PruneFloor => inject + k.retention_freeze_cap + Duration::from_mins(2),
-            Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
-            // The failed deployment runs to the executor's healthy
-            // deadline, then the real manifest replaces three executors.
-            Self::DeployBrokenImage => inject + Duration::from_mins(12),
-            Self::LookupBlackout => inject + k.restart_slo * 2 + Duration::from_mins(5),
-            // The freeze, the election, and the recovery polls.
-            Self::RedisPrimaryFreeze | Self::RedisPrimaryKill | Self::RedisPartitionIngress => {
-                inject + k.restart_slo + Duration::from_mins(5)
-            }
-            // The mirrors restart, wait for a checkpoint, and rebuild.
-            Self::MirrorKillRebuild => inject + k.restart_slo + Duration::from_mins(10),
-            // The node replacement; the Redis loss and three rebuilds; the
-            // total wipe, the rebuild from L1 and the install; or the
-            // blackout and the return of every job.
-            Self::NodeReplaceExecutor
-            | Self::RedisTotalLossRecover
-            | Self::ExecutorFleetTotalWipeRecover
-            | Self::PipelineBlackoutRecover => inject + k.reschedule_slo + Duration::from_mins(7),
-            Self::NodeReplaceSealer => {
-                inject + k.reschedule_slo + k.rejoin_slo + Duration::from_mins(5)
-            }
-            // The quiet stop, two rebuilds from L1, a seeded election, a
-            // restart without the seed, two executor starts, and the
-            // return of every other job.
-            Self::SealerFleetTotalWipeRecover => {
-                inject + k.reschedule_slo + Duration::from_mins(15)
-            }
-            // The hold, the staggered return of up to three classes, a
-            // full-restart election, and the ingress bind after it.
-            Self::IngressSequencerLossRecover
-            | Self::IngressSealerLossRecover
-            | Self::SequencerSealerLossRecover
-            | Self::IngressSequencerSealerLossRecover
-            | Self::IngressSequencerSealerReverse => {
-                inject + k.reschedule_slo + Duration::from_mins(5)
-            }
-            // The same, plus the replay of the executors after their
-            // return.
-            Self::ExecutorSealerLossRecover
-            | Self::ExecutorSealerValidatorRecover
-            | Self::IngressExecutorLossRecover
-            | Self::ReadPathLossRecover
-            | Self::SequencerExecutorRedisLoss => {
-                inject + k.reschedule_slo + Duration::from_mins(6)
-            }
-            Self::CpuSqueeze => {
-                let cycle = k.squeeze.window + k.squeeze.release;
-                inject + cycle * k.squeeze.cycles.get() + Duration::from_secs(90)
-            }
-            // Three faults, each with its halt and resume waits.
-            Self::L1Liar => inject + (k.l1_fault + Duration::from_mins(3)) * 3,
-            // One fault, a batcher restart inside it, and the posts after.
-            Self::L1NullReceipts => inject + k.l1_fault + k.restart_slo + Duration::from_mins(3),
-            // The liar, two restarts, the floor passing, and the resume.
-            Self::TwoDayOutage => {
-                inject
-                    + k.l1_fault
-                    + k.restart_slo * 2
-                    + k.retention_freeze_cap
-                    + Duration::from_mins(5)
-            }
-            // The freeze, the resume, and the commit of the last epoch.
-            Self::FollowerInstanceLoss => inject + k.l1_fault + Duration::from_mins(5),
-            // The stop, the resume, and the commit of the last epoch.
-            Self::FollowerTotalLoss => inject + Duration::from_mins(9),
-            // The lead, the halt, the heal, and the commit after it.
-            Self::FollowerDisagreement => inject + Duration::from_mins(14),
-            // The freeze until the floor passes, the restart, and the
-            // rebuild of the gap after it.
-            Self::BatcherOutagePastRetention => {
-                inject + k.retention_freeze_cap + k.restart_slo + Duration::from_mins(8)
-            }
-            // Every round: a job stop, a restart within the SLO, and the
-            // convergence of the fleet.
-            Self::ExecutorRestartStorm => inject.saturating_add(
-                k.restart_slo
-                    .saturating_add(Duration::from_mins(1))
-                    .saturating_mul(fleet::ROUNDS),
-            ),
-            _ => Duration::ZERO,
-        };
-        k.case_window.max(floor)
-    }
-
-    /// The load's per-submit retry count. The resize case rolls the
-    /// ingress the load submits to, so it gets a wide retry. The
-    /// quorum-loss case stalls ordering for about a minute, past the
-    /// ingress's 30 s parked-submit timeout; a refused submit leaves a
-    /// nonce hole, and every later transaction of that sender then
-    /// executes as failed, which the verdict would count as bad receipts.
-    /// Each attempt parks up to 30 s at the ingress while the stall
-    /// lasts, so six attempts cover the stall; sixty made the case take
-    /// 23 minutes and the shard hit its job timeout. A whole-fleet
-    /// outage lasts up to the reschedule SLO plus an election, so its
-    /// attempts cover that SLO in 30 s parks, plus two.
+    /// Retry connection loss long enough for the client edge to return.
+    /// A refused connection returns immediately, so its count cannot assume
+    /// a parked RPC timeout. Paused-chain refusals use the case's wall clock
+    /// wait. The case still requires accepted traffic inside its recovery SLO.
     #[must_use]
     pub fn load_retry(self, k: &Knobs) -> u32 {
         match self {
@@ -406,7 +354,14 @@ impl Case {
             // attempt, so ninety attempts span about fourteen minutes.
             // With the executors down and the ingress up, each attempt
             // parks 30 s at the ingress instead, for about the same time.
-            Self::IngressSequencerLossRecover
+            Self::GracefulIngress
+            | Self::HardIngress
+            | Self::ArchiveDriverLoss
+            | Self::ArchiveTxDataWipe
+            | Self::ArchiveCorruption
+            | Self::IngressPairLossRecover
+            | Self::PipelineBlackoutRecover
+            | Self::IngressSequencerLossRecover
             | Self::IngressSealerLossRecover
             | Self::SequencerSealerLossRecover
             | Self::IngressSequencerSealerLossRecover
@@ -415,18 +370,19 @@ impl Case {
             | Self::ExecutorSealerValidatorRecover
             | Self::IngressExecutorLossRecover
             | Self::ReadPathLossRecover
-            | Self::SequencerExecutorRedisLoss => 90,
+            | Self::SequencerExecutorRedisLoss
+            | Self::ControlPlaneLossRecover
+            | Self::ClusterTwoBlankRecover => 90,
             Self::ClusterQuorumLossRecover => 6,
             Self::ClusterTotalLossRecover
             | Self::ExecutorFleetLossRecover
             | Self::ExecutorFleetWipeRecover
             | Self::ExecutorFleetTotalWipeRecover
             | Self::ExecutorRestartStorm
-            | Self::IngressPairLossRecover
-            | Self::SequencerLaneLossRecover
-            | Self::PipelineBlackoutRecover => {
+            | Self::SequencerLaneLossRecover => {
                 u32::try_from(k.reschedule_slo.as_secs() / 30).unwrap_or(u32::MAX) + 2
             }
+            Self::Carry(step) => step.load_retry(k),
             _ => k.load_retry,
         }
     }
@@ -444,15 +400,23 @@ impl Case {
             Self::HardIngress => component::hard_ingress(h).await,
             Self::GracefulSequencer => component::graceful_sequencer(h).await,
             Self::HardSequencer => component::hard_sequencer(h).await,
-            Self::SequencerReplicaKill => component::sequencer_replica_kill(h).await,
+            Self::SequencerReplicaKill(drill) => drill.run(h).await,
             Self::NodeFailureExecutor => component::node_failure_executor(h).await,
             Self::NodeReplaceExecutor => component::node_replace_executor(h).await,
             Self::StateCheckpointRestore => component::state_checkpoint_restore(h).await,
+            Self::CheckpointDiskFull => component::checkpoint_full::CheckpointFull::run(h).await,
+            Self::CheckpointCorruptRecover => {
+                component::corrupt_checkpoint::CorruptCheckpoint::run(h).await
+            }
             Self::ReplayWindowResync => component::replay_window_resync(h).await,
             Self::DeployBrokenImage => deploy::broken_image(h).await,
             Self::ClusterLeaderKill => cluster::leader_kill(h).await,
+            Self::RaftLeaderOneWayPartition => raft_partition::leader_one_way(h).await,
+            Self::RaftLeaderPacketLoss => raft_partition::PacketLoss::run(h).await,
+            Self::RaftLeaderPacketDelay => raft_partition::PacketDelay::run(h).await,
             Self::ClusterFollowerKill => cluster::follower_kill(h).await,
             Self::ClusterMemberRejoin => cluster::member_rejoin(h).await,
+            Self::ClusterTwoBlankRecover => cluster::two_blank_recover(h).await,
             Self::NodeReplaceSealer => cluster::node_replace_sealer(h).await,
             Self::ClusterQuorumLossRecover => cluster::quorum_loss_recover(h).await,
             Self::ClusterTotalLossRecover => fleet::cluster_total_loss_recover(h).await,
@@ -465,6 +429,7 @@ impl Case {
             Self::IngressPairLossRecover => coordinated::ingress_pair_loss_recover(h).await,
             Self::SequencerLaneLossRecover => coordinated::sequencer_lane_loss_recover(h).await,
             Self::PipelineBlackoutRecover => coordinated::pipeline_blackout_recover(h).await,
+            Self::ControlPlaneLossRecover => control_plane::loss_recover(h).await,
             Self::IngressSequencerLossRecover => combined::INGRESS_SEQUENCER.run(h).await,
             Self::IngressSealerLossRecover => combined::INGRESS_SEALER.run(h).await,
             Self::SequencerSealerLossRecover => combined::SEQUENCER_SEALER.run(h).await,
@@ -491,53 +456,30 @@ impl Case {
             Self::ValidatorJoin => validator::join(h).await,
             Self::CpuSqueeze => squeeze::cpu_squeeze(h).await,
             Self::ResizeScaleOutIn => resize::scale_out_in(h).await,
-            Self::LookupBlackout => resize::lookup_blackout(h).await,
+            Self::LookupBlackout => lookup_blackout::LookupBlackout::run(h).await,
             Self::RedisPrimaryFreeze => cache::redis_primary_freeze(h).await,
             Self::RedisPrimaryKill => cache::redis_primary_kill(h).await,
             Self::RedisPartitionIngress => cache::redis_partition_ingress(h).await,
             Self::RedisTotalLossRecover => cache::redis_total_loss_recover(h).await,
             Self::MirrorKillRebuild => cache::mirror_kill_rebuild(h).await,
-            Self::DaLagHalt => da_lag::da_lag_halt(h).await,
-            Self::CanaryDaLag => l1_canary::canary_da_lag(h).await,
+            Self::MirrorBacklogClientRestart => cache::client_restart(h).await,
+            Self::DaLagHalt => da_lag::GuardedCase::Halt.run(h).await,
+            Self::CanaryDaLag => l1_canary::scheduled_canary(h).await,
             Self::PruneFloor => da_lag::prune_floor(h).await,
             Self::L1Liar => l1::liar(h).await,
             Self::L1NullReceipts => l1::null_receipts(h).await,
+            Self::L1TransportRefusals => l1::transport_refusals(h).await,
+            Self::L1ProviderUnresponsive => l1::provider_unresponsive(h).await,
             Self::TwoDayOutage => l1::two_day_outage(h).await,
             Self::BatcherOutagePastRetention => l1::batcher_outage_past_retention(h).await,
             Self::FollowerInstanceLoss => l1::follower_instance_loss(h).await,
             Self::FollowerTotalLoss => l1::follower_total_loss(h).await,
             Self::ExecutorRestartStorm => fleet::executor_restart_storm(h).await,
             Self::FollowerDisagreement => l1::follower_disagreement(h).await,
+            Self::Carry(step) => step.run(h).await,
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_shard_case_parses_and_names_round_trip() {
-        for shard in [
-            crate::Shard::Executor,
-            crate::Shard::Ingress,
-            crate::Shard::Sequencer,
-            crate::Shard::Cluster,
-            crate::Shard::Fleet,
-            crate::Shard::Coordinated,
-            crate::Shard::CombinedOrdering,
-            crate::Shard::CombinedExec,
-            crate::Shard::Retention,
-            crate::Shard::Cache,
-            crate::Shard::L1,
-            crate::Shard::Follower,
-            crate::Shard::Integrity,
-        ] {
-            shard
-                .cases()
-                .iter()
-                .for_each(|name| assert_eq!(Case::parse(name).unwrap().name(), *name));
-        }
-        assert!(Case::parse("sealer-hard").is_err());
-    }
-}
+mod tests;

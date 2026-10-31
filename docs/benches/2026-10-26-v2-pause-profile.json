@@ -1,0 +1,33 @@
+{
+  "baseline_commit": "9adefc86b488cb72ec46b290c3f08acff478ea2d",
+  "method": "Criterion v2_loop benchmark, release profile, CPU 8, 256 resident senders and 16 transactions each (4096 per batch). Five alternating-order pairs per workload, 20 samples per run, 0.1 second warmup, 0.5 second requested measurement, 1000 bootstrap resamples. Candidate uses a live, unpaused process lifecycle watch. Baseline uses the published production source and original benchmark without a pause gate.",
+  "included_repeats": [
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "excluded_repeats": {
+    "1": "A local test build overlaps the first pair; retain raw evidence but exclude it from comparisons."
+  },
+  "medians_transactions_per_second": {
+    "in_order": {
+      "before": 713554.5833935692,
+      "after": 704927.8505441436,
+      "delta_percent": -1.2089800906887938
+    },
+    "reversed": {
+      "before": 589543.2543143149,
+      "after": 590945.7651625028,
+      "delta_percent": 0.2378978705844137
+    },
+    "with_verdicts": {
+      "before": 617754.4825149805,
+      "after": 614878.3153787289,
+      "delta_percent": -0.46558417909688954
+    }
+  },
+  "scope": "Resident v2 loop only: decoding, admission, fake publisher, metrics and optional verdicts. Does not measure RPC or client receipt latency, executor networking or full-chain capacity.",
+  "interpretation": "Median differences are -1.2 percent in order, +0.2 percent reversed, and -0.5 percent with verdicts, within larger variation across repeats. No speedup or full-workload guarantee is claimed. The gate adds a cached lifecycle version read per turn; full workload validation remains required."
+}

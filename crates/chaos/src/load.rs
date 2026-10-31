@@ -11,11 +11,11 @@ use alloy_primitives::{Address, U256, address};
 use anyhow::Context;
 use kardamom_bench::ANVIL_MNEMONIC;
 use kardamom_bench::load::{
-    self, CalldataMix, Completeness, LoadConfig, MetricsTargets, NonceStart, SenderRange, Workload,
+    self, CalldataMix, Completeness, LoadConfig, MetricsTargets, NonceStart, Progress, SenderRange,
+    Workload,
 };
 use serde::Deserialize;
 
-/// The burn address of every load transfer.
 /// The burn address of every load transfer.
 pub const SINK: Address = address!("000000000000000000000000000000000000dEaD");
 
@@ -38,11 +38,44 @@ pub struct Verdict {
     pub accepted: u64,
     #[serde(default)]
     pub seq_dropped: Option<i64>,
+    /// The receipt latency of the run, from the top of the report.
+    #[serde(skip)]
+    pub latency: Latency,
+}
+
+/// The receipt latency percentiles of one run, in microseconds. A
+/// blocking submit parks at the ingress until its receipt, so this is
+/// also the time each submit held its in-flight slot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct Latency {
+    #[serde(default)]
+    pub lat_p50_us: u64,
+    #[serde(default)]
+    pub lat_p95_us: u64,
+    #[serde(default)]
+    pub lat_p99_us: u64,
+    #[serde(default)]
+    pub lat_max_us: u64,
+}
+
+impl std::fmt::Display for Latency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "receipt latency p50={}ms p95={}ms p99={}ms max={}ms",
+            self.lat_p50_us / 1000,
+            self.lat_p95_us / 1000,
+            self.lat_p99_us / 1000,
+            self.lat_max_us / 1000
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct Report {
     verdict: Verdict,
+    #[serde(flatten)]
+    latency: Latency,
 }
 
 /// The inputs of one case's load.
@@ -65,6 +98,10 @@ pub struct LoadSpec {
     pub fixed_rate: bool,
     pub duration: Duration,
     pub tps: NonZeroU32,
+    /// The most blocking submits in flight at once. Each one holds its
+    /// slot until its receipt, so the rate the load reaches is at most
+    /// this count over the receipt latency.
+    pub max_in_flight: NonZeroU32,
     pub retry_submit: u32,
     /// How long one submit waits out the refusals of a paused ingress,
     /// from the first one. Zero turns the wait off.
@@ -96,7 +133,7 @@ impl LoadSpec {
             to: SINK,
             value: U256::from(1),
             gas_price: 1_000_000_000,
-            max_in_flight: NonZeroU32::new(256).context("max in flight")?,
+            max_in_flight: self.max_in_flight,
             max_gap: self.max_gap,
             drain_timeout: self.drain_timeout,
             retry_submit: self.retry_submit,
@@ -121,9 +158,8 @@ impl LoadSpec {
 pub struct LoadRun {
     task: tokio::task::JoinHandle<anyhow::Result<bool>>,
     report_path: PathBuf,
-    /// Flips to `true` when the queues are signed and the first submit
-    /// is next.
-    ready: tokio::sync::watch::Receiver<bool>,
+    /// The signed run's own counters and submission window.
+    ready: tokio::sync::watch::Receiver<Option<Progress>>,
 }
 
 impl LoadRun {
@@ -141,14 +177,12 @@ impl LoadRun {
     /// `report_path` is where `cfg.output` writes the report.
     #[must_use]
     pub fn from_config(cfg: LoadConfig, report_path: PathBuf) -> Self {
-        let (signal, ready) = tokio::sync::watch::channel(false);
-        // The load signs its whole window before the first submit:
-        // about 200,000 transactions for the longest case. The
-        // injection gate waits for this signal, because an ingress
-        // counter that stands still during the signing proves nothing.
+        let (signal, ready) = tokio::sync::watch::channel(None);
+        // The first signed batch precedes submission. The injection gate
+        // waits for the prepared run and its own accepted traffic before the fault.
         let task = tokio::spawn(async move {
             let prepared = load::prepare(cfg).await?;
-            signal.send_replace(true);
+            signal.send_replace(Some(prepared.progress()));
             prepared.run().await
         });
         Self {
@@ -158,10 +192,43 @@ impl LoadRun {
         }
     }
 
-    /// Whether the load signed its queues and started to submit.
+    /// Whether the load signed its first batch and published its observer.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        *self.ready.borrow()
+        self.ready.borrow().is_some()
+    }
+
+    pub(crate) fn is_flowing(&self) -> bool {
+        self.ready
+            .borrow()
+            .as_ref()
+            .is_some_and(Progress::is_flowing)
+    }
+
+    pub(crate) fn assert_submitting(&self, case: &str) -> anyhow::Result<()> {
+        let submitting = self
+            .ready
+            .borrow()
+            .as_ref()
+            .is_some_and(Progress::is_submitting);
+        anyhow::ensure!(
+            submitting && !self.is_finished(),
+            "{}: {case}: the case load stops submitting before fault recovery completes; the load window does not cover the case",
+            crate::FAIL_PREFIX
+        );
+        Ok(())
+    }
+
+    pub(crate) fn finish_submissions(&self) {
+        if let Some(progress) = self.progress() {
+            progress.finish_submissions();
+        }
+    }
+
+    /// The observer of the signed run, once the load is ready. A case
+    /// body ends the submissions through it.
+    pub(crate) fn progress(&self) -> Option<Progress> {
+        self.ready.borrow().clone()
     }
 
     /// Whether the load task has already ended, which before the window
@@ -179,8 +246,12 @@ impl LoadRun {
     ///
     /// Returns an error if the harness failed before a verdict, or the
     /// report is missing or unreadable.
-    pub async fn finish(self) -> anyhow::Result<Verdict> {
-        let outcome = self.task.await.context("join the load task")??;
+    pub async fn finish(mut self) -> anyhow::Result<Verdict> {
+        let outcome = (&mut self.task)
+            .await
+            .context("join the load task")
+            .and_then(std::convert::identity)
+            .inspect_err(|error| self.save_incomplete(Some(error)))?;
         let report_text = std::fs::read_to_string(&self.report_path).with_context(|| {
             format!(
                 "load report {} missing (harness: {outcome:?})",
@@ -193,12 +264,41 @@ impl LoadRun {
             outcome == report.verdict.pass,
             "load return and report verdict disagree"
         );
-        Ok(report.verdict)
+        Ok(Verdict {
+            latency: report.latency,
+            ..report.verdict
+        })
     }
 
-    /// Abort the load, for cleanup after a failed case.
-    pub fn abort(&self) {
-        self.task.abort();
+    fn save_incomplete(&self, failure: Option<&anyhow::Error>) {
+        let progress = self.ready.borrow().as_ref().map(Progress::snapshot);
+        let report = serde_json::json!({
+            "aborted_before_final_verdict": true,
+            "failure": failure.map(|error| format!("{error:#}")),
+            "report": self.report_path,
+            "progress": progress,
+        });
+        let path = self.report_path.with_extension("aborted.json");
+        let saved = serde_json::to_vec_pretty(&report)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| std::fs::write(&path, bytes).map_err(anyhow::Error::from));
+        if let Err(error) = saved {
+            crate::log(format!(
+                "failed to save aborted load evidence at {}: {error:#}",
+                path.display()
+            ));
+        }
+    }
+}
+
+/// A run that ends before its verdict, on a failed case or a case past
+/// its deadline, stops its load and keeps the evidence of how far it got.
+impl Drop for LoadRun {
+    fn drop(&mut self) {
+        if !self.task.is_finished() {
+            self.save_incomplete(None);
+            self.task.abort();
+        }
     }
 }
 
@@ -208,13 +308,19 @@ mod tests {
 
     #[test]
     fn the_report_verdict_decodes() {
-        let text = r#"{"mode":"chaos","verdict":{"pass":false,"failures":["x"],"offered":10,
+        let text = r#"{"mode":"chaos","lat_p50_us":19841000,"lat_p95_us":29442000,
+            "lat_p99_us":29540000,"lat_max_us":29655000,
+            "verdict":{"pass":false,"failures":["x"],"offered":10,
             "accepted":10,"receipted":9,"missing":1,"unlanded":0,"bad_status":0,
             "inferred_ingress_drop":null,"seq_dropped":2,"keep_pace":[]}}"#;
         let report: Report = serde_json::from_str(text).unwrap();
         assert!(!report.verdict.pass);
         assert_eq!(report.verdict.missing, 1);
         assert_eq!(report.verdict.seq_dropped, Some(2));
+        assert_eq!(
+            report.latency.to_string(),
+            "receipt latency p50=19841ms p95=29442ms p99=29540ms max=29655ms"
+        );
     }
 
     /// A run whose load task is `task`, for the finish checks.
@@ -222,7 +328,7 @@ mod tests {
         report_path: PathBuf,
         task: impl std::future::Future<Output = anyhow::Result<bool>> + Send + 'static,
     ) -> LoadRun {
-        let (_, ready) = tokio::sync::watch::channel(true);
+        let (_, ready) = tokio::sync::watch::channel(None);
         LoadRun {
             task: tokio::spawn(task),
             report_path,
@@ -235,6 +341,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let report_path = directory.path().join("report.json");
         std::fs::write(&report_path, r#"{"verdict":{"pass":true,"missing":0}}"#).unwrap();
+        let aborted_path = report_path.with_extension("aborted.json");
         let run = stub_run(report_path, async {
             anyhow::bail!("load failed before report")
         });
@@ -245,6 +352,10 @@ mod tests {
                 .to_string()
                 .contains("load failed before report")
         );
+        let aborted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(aborted_path).unwrap()).unwrap();
+        assert_eq!(aborted["aborted_before_final_verdict"], true);
+        assert_eq!(aborted["failure"], "load failed before report");
     }
 
     #[tokio::test]

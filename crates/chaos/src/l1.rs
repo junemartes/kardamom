@@ -13,6 +13,10 @@ use serde_json::{Value, json};
 use crate::harness::Harness;
 use crate::poll::{self, Budget};
 
+mod alert;
+mod deposit;
+pub(crate) use deposit::Deposit;
+
 /// The proxy's JSON-RPC pipe and control endpoint on the aux node
 /// (`ports.l1_fault_proxy` in `group_vars/all.yml`).
 pub const FAULT_PROXY_PORT: u16 = 8547;
@@ -20,6 +24,24 @@ pub const FAULT_PROXY_PORT: u16 = 8547;
 pub const PROMETHEUS_PORT: u16 = 9090;
 /// The alert on the age of the last post, as `deploy/alerts.yml` names it.
 pub const STALE_POST_ALERT: &str = "KardamomBatcherLastPostStale";
+/// The dev L1 owner that deployed the settlement contracts: anvil
+/// account #0, which anvil unlocks.
+pub(crate) const L1_OWNER: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+/// The private key of [`L1_OWNER`], the well-known anvil key #0. The
+/// deploy CLI signs with it.
+pub(crate) const L1_OWNER_KEY: &str =
+    "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+/// The blocks that the harness mines after an upgrade transaction. The
+/// `finalized` tag of the in-cluster anvil is the head minus two epochs
+/// of 32 slots, and the L1 follower reads only finalized blocks.
+const FINALITY_BLOCKS: u64 = 66;
+/// The wait for the receipt of an upgrade transaction. Right after
+/// `eth_sendTransaction`, the block that holds the transaction can be
+/// missing, and the receipt is then `null`.
+const RECEIPT_BUDGET: Budget = Budget {
+    timeout: Duration::from_secs(60),
+    interval: Duration::from_secs(1),
+};
 
 /// One posted batch as its `BatchPosted` log names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +171,55 @@ impl L1 {
         self.rpc("anvil_mine", json!([format!("{blocks:#x}")]))
             .await
             .map(|_| ())
+    }
+
+    /// The call data of `ETHLockbox.initiateUpgrade(feature, activation_ms)`.
+    fn upgrade_call(feature: u64, activation_ms: u64) -> String {
+        format!(
+            "{}{feature:064x}{activation_ms:064x}",
+            selector("initiateUpgrade(uint256,uint64)")
+        )
+    }
+
+    /// Send `ETHLockbox.initiateUpgrade(feature, activation_ms)` to
+    /// `lockbox` from [`L1_OWNER`], the owner of the factory, and mine
+    /// past its finality, so that the L1 follower reads its log.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if anvil refuses the transaction, if no receipt
+    /// comes within [`RECEIPT_BUDGET`], or if its receipt does not have
+    /// the status `0x1`.
+    pub async fn initiate_upgrade(
+        &self,
+        lockbox: &str,
+        feature: u64,
+        activation_ms: u64,
+    ) -> anyhow::Result<()> {
+        let data = Self::upgrade_call(feature, activation_ms);
+        let hash = self
+            .rpc(
+                "eth_sendTransaction",
+                json!([{ "from": L1_OWNER, "to": lockbox, "data": data }]),
+            )
+            .await?;
+        let (receipt, _) = poll::until(RECEIPT_BUDGET, |_| async {
+            let receipt = self
+                .rpc("eth_getTransactionReceipt", json!([&hash]))
+                .await?;
+            Ok((!receipt.is_null()).then_some(receipt))
+        })
+        .await?
+        .or_fail(|elapsed| {
+            anyhow::anyhow!(
+                "initiateUpgrade({feature}, {activation_ms}): no receipt after {elapsed:?}"
+            )
+        })?;
+        anyhow::ensure!(
+            receipt["status"] == "0x1",
+            "initiateUpgrade({feature}, {activation_ms}) failed: {receipt}"
+        );
+        self.mine(FINALITY_BLOCKS).await
     }
 
     /// The contract's `lastBatchIndex`.
@@ -351,34 +422,27 @@ impl L1 {
         budget: Duration,
         ctx: &str,
     ) -> anyhow::Result<()> {
-        let every = Duration::from_secs(5);
-        let needed = u32::try_from(hold.as_secs() / every.as_secs()).unwrap_or(u32::MAX);
-        let run = std::cell::Cell::new(0_u32);
-        let run_ref = &run;
-        let outcome = poll::until(Budget::new(budget, every), |_| async move {
-            // A failed read breaks the held run, like an inactive state:
-            // a Prometheus restart loses the pending state too.
-            let state = self.alert_state(name).await.unwrap_or_else(|e| {
-                crate::log(format!("{ctx}: {e:#}; the held run starts again"));
-                None
-            });
-            let active = state
-                .as_deref()
-                .is_some_and(|s| s == "pending" || s == "firing");
-            run_ref.set(if active { run_ref.get() + 1 } else { 0 });
-            Ok::<_, anyhow::Error>((run_ref.get() >= needed).then_some(state))
-        })
-        .await?;
+        let observation = alert::Held::new(hold);
+        let outcome = observation
+            .run(budget, || async {
+                let response = self.alert_state(name).await;
+                if let Err(error) = &response {
+                    crate::log(format!("{ctx}: {error:#}; the held run starts again"));
+                }
+                response
+            })
+            .await?;
         let (state, elapsed) = outcome.or_fail(|t| {
             crate::chaos_fail!(
-                "{ctx}: the alert {name} did not hold for {}s within {}s",
+                "{ctx}: the alert {name} did not hold for {}s within {}s; {}",
                 hold.as_secs(),
-                t.as_secs()
+                t.as_secs(),
+                observation.evidence()
             )
         })?;
         crate::log(format!(
             "{ctx}: the alert {name} is {} and held {}s (after {}s)",
-            state.unwrap_or_default(),
+            state,
             hold.as_secs(),
             elapsed.as_secs()
         ));
@@ -416,6 +480,18 @@ mod tests {
         assert_eq!(word_u64(&data, 2).unwrap(), 12);
         assert!(word_u64(&data, 3).is_err());
         assert_eq!(quantity(&json!("0x10")).unwrap(), 16);
+    }
+
+    #[test]
+    fn the_upgrade_call_has_the_lockbox_selector_and_two_words() {
+        let data = L1::upgrade_call(5, u64::MAX);
+        assert!(data.starts_with("0xbb8fbf56"), "{data}");
+        assert_eq!(data.len(), 10 + 2 * 64);
+        assert_eq!(word_u64(&format!("0x{}", &data[10..]), 0).unwrap(), 5);
+        assert_eq!(
+            word_u64(&format!("0x{}", &data[10..]), 1).unwrap(),
+            u64::MAX
+        );
     }
 
     #[test]

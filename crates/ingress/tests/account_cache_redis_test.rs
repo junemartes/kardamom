@@ -7,15 +7,20 @@
 
 #![cfg(feature = "docker-e2e")]
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use alloy_primitives::{Address, U256};
+use alloy_rpc_types_eth::BlockNumberOrTag;
 use alloy_signer_local::PrivateKeySigner;
+use jsonrpsee::server::{RpcModule, Server, ServerHandle};
 
-use kardamom_cache::{AccountCache, CacheConfig};
+use kardamom_cache::{AccountCache, CacheConfig, ExecutorQueryConfig};
 use kardamom_ingress::config::IngressConfig;
 use kardamom_ingress::error::IngressError;
+use kardamom_ingress::proxy::AccountField;
 use kardamom_ingress::test_support::{receipt, sign_legacy};
 use kardamom_ingress::{IngressProxy, MockChannels};
 use kardamom_types::{AccountRow, BPosition};
@@ -31,15 +36,45 @@ struct Fixture {
     proxy: IngressProxy<MockChannels, MockChannels>,
     mock: MockChannels,
     cache: AccountCache,
-    _shard_rx: Vec<tokio::sync::mpsc::UnboundedReceiver<kardamom_types::TxEnvelope>>,
+    shard_rx: Vec<tokio::sync::mpsc::UnboundedReceiver<kardamom_types::TxEnvelope>>,
 }
 
 impl Fixture {
+    fn advance_local_head(&self) {
+        let _ = self.mock.apply_rows(
+            BPosition::from_index(100),
+            &[AccountRow {
+                address: Address::repeat_byte(0xee),
+                nonce: 0,
+                balance: U256::ZERO,
+            }],
+        );
+    }
+
+    async fn fields(&self, address: Address) -> (U256, U256) {
+        let nonce = self
+            .proxy
+            .account_field(IP, address, BlockNumberOrTag::Latest, AccountField::Nonce)
+            .await
+            .unwrap();
+        let balance = self
+            .proxy
+            .account_field(IP, address, BlockNumberOrTag::Latest, AccountField::Balance)
+            .await
+            .unwrap();
+        (nonce, balance)
+    }
+
     async fn new(cfg: &CacheConfig) -> Self {
+        Self::with_query(cfg, ExecutorQueryConfig::default()).await
+    }
+
+    async fn with_query(cfg: &CacheConfig, executor_query: ExecutorQueryConfig) -> Self {
         let cache = AccountCache::connect(cfg).await.expect("connect");
         let (mock, shard_rx) = MockChannels::new(SHARDS);
         let ingress = IngressConfig {
             cache: cfg.clone(),
+            executor_query,
             ..IngressConfig::default()
         };
         let proxy = IngressProxy::new(ingress, mock.clone(), mock.clone());
@@ -55,7 +90,7 @@ impl Fixture {
             proxy,
             mock,
             cache,
-            _shard_rx: shard_rx,
+            shard_rx,
         }
     }
 
@@ -86,6 +121,154 @@ impl Fixture {
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
+}
+
+struct QueryServer {
+    endpoint: String,
+    calls: Arc<AtomicUsize>,
+    handle: ServerHandle,
+}
+
+impl QueryServer {
+    async fn start() -> Self {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut module = RpcModule::new(calls.clone());
+        module
+            .register_method("eth_getTransactionCount", |_, calls, _| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                "0x5"
+            })
+            .unwrap();
+        module
+            .register_method("eth_getBalance", |_, calls, _| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                "0x2a"
+            })
+            .unwrap();
+        let server = Server::builder().build("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", server.local_addr().unwrap());
+        Self {
+            endpoint,
+            calls,
+            handle: server.start(module),
+        }
+    }
+
+    fn config(&self) -> ExecutorQueryConfig {
+        ExecutorQueryConfig {
+            endpoints: vec![self.endpoint.clone()],
+            ..ExecutorQueryConfig::default()
+        }
+    }
+}
+
+impl Drop for QueryServer {
+    fn drop(&mut self) {
+        let _ = self.handle.stop();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker; run with --features docker-e2e -- --ignored"]
+async fn fresh_redis_and_fresh_local_rows_do_not_query_executors() {
+    let (_container, mut cfg) = kardamom_cache::testing::redis().await;
+    cfg.max_stale_txs = NonZeroU64::new(8).unwrap();
+    let query = QueryServer::start().await;
+    let fixture = Fixture::with_query(&cfg, query.config()).await;
+    let address = Address::repeat_byte(0xab);
+    fixture.seed(address, 3, 123).await;
+    assert_eq!(
+        fixture.fields(address).await,
+        (U256::from(3), U256::from(123))
+    );
+    let _ = fixture.mock.apply_rows(
+        BPosition::from_index(100),
+        &[AccountRow {
+            address,
+            nonce: 4,
+            balance: U256::from(456),
+        }],
+    );
+    assert_eq!(
+        fixture.fields(address).await,
+        (U256::from(4), U256::from(456))
+    );
+    assert_eq!(query.calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker; run with --features docker-e2e -- --ignored"]
+async fn a_stale_projection_without_an_executor_cannot_answer_a_head_rpc() {
+    let (_container, mut cfg) = kardamom_cache::testing::redis().await;
+    cfg.max_stale_txs = NonZeroU64::new(8).unwrap();
+    let fixture = Fixture::new(&cfg).await;
+    let address = Address::repeat_byte(0xab);
+    fixture.seed(address, 3, 0).await;
+    fixture.advance_local_head();
+    let err = fixture
+        .proxy
+        .account_field(IP, address, BlockNumberOrTag::Latest, AccountField::Nonce)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IngressError::StateUnavailable(_)), "{err:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires Docker; run with --features docker-e2e -- --ignored"]
+async fn validated_admission_keeps_stale_nonce_lower_bounds_without_querying() {
+    let (_container, mut cfg) = kardamom_cache::testing::redis().await;
+    cfg.max_stale_txs = NonZeroU64::new(8).unwrap();
+    let query = QueryServer::start().await;
+    let fixture = Fixture::with_query(&cfg, query.config()).await;
+    let signer = PrivateKeySigner::random();
+    fixture.seed(signer.address(), 3, 0).await;
+    fixture.advance_local_head();
+    let err = fixture
+        .proxy
+        .submit_validated(IP, sign_legacy(&signer, 2))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IngressError::NonceTooLow { .. }), "{err:?}");
+    assert_eq!(query.calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker; run with --features docker-e2e -- --ignored"]
+async fn account_rpcs_use_the_executor_while_a_live_mirror_head_lags() {
+    let (_container, mut cfg) = kardamom_cache::testing::redis().await;
+    cfg.max_stale_txs = NonZeroU64::new(8).unwrap();
+    cfg.head_ttl_secs = NonZeroU64::new(60).unwrap();
+    let query = QueryServer::start().await;
+    let fixture = Fixture::with_query(
+        &cfg,
+        ExecutorQueryConfig {
+            endpoints: vec![query.endpoint.clone()],
+            ..ExecutorQueryConfig::default()
+        },
+    )
+    .await;
+    let address = Address::repeat_byte(0xab);
+    fixture.seed(address, 3, 0).await;
+    let _ = fixture.mock.apply_rows(
+        BPosition::from_index(100),
+        &[AccountRow {
+            address: Address::repeat_byte(0xee),
+            nonce: 0,
+            balance: U256::ZERO,
+        }],
+    );
+    let nonce = fixture
+        .proxy
+        .account_field(IP, address, BlockNumberOrTag::Latest, AccountField::Nonce)
+        .await
+        .unwrap();
+    let balance = fixture
+        .proxy
+        .account_field(IP, address, BlockNumberOrTag::Latest, AccountField::Balance)
+        .await
+        .unwrap();
+    assert_eq!((nonce, balance), (U256::from(5), U256::from(42)));
+    assert_eq!(query.calls.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]
@@ -182,3 +365,6 @@ fn sign_legacy_value(signer: &PrivateKeySigner, nonce: u64, value: u64) -> alloy
     };
     sign_and_encode(tx, signer).1
 }
+
+#[path = "account_cache_redis_test/profile.rs"]
+mod profile;

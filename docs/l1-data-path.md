@@ -409,6 +409,8 @@ One of `--da-proxy` and `--indexer-url` is required.
   It needs a cursor through the last block. Without one, the tool exits with an error.
 - `--sealer-seed <file>` writes the head `H` of the rebuilt state for a new sealer cluster.
   - The file holds the chain id, `H`, the canonical end of `H`, the timestamp and L1 origin of `H`, the state root and the next nonce of each sender.
+  - It also holds the decision rules of the sealer at `H` (seed version 2), when the rules hold an activation of feature 3, 4 or 5. The rules come from the `genesis_features` of `--chain` and from every upgrade transaction of these features in the epochs of the blocks, so the tool needs every block from block 1. Without `--lockbox`, the epochs hold no upgrade transaction, and the rules are those of the genesis alone.
+  - The tool refuses to write the seed when the rules depend on whether a timer tick or an epoch closed the block before the epoch of an activation. The log line `sealer seed written` shows `decision_version`, `carry_window` and `rules`.
   - It needs a payload that carries the canonical cursor through the last block. The tool refuses a head that it did not rebuild from L1.
   - The sealer reads the file in `-Dkardamom.cluster.seedSnapshot`. See [the sealer README](../cluster/sealer-service/README.md#seeded-start).
 - The tool covers L2 transactions, interop deliveries and L1 deposits.

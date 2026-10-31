@@ -16,5 +16,9 @@
                       'after': workloads_record_after | default(none)}}}},
                    recursive=true) }}
 
+# The waves of a new cluster mirror the record at the end of the deploy,
+# not after each registration.
 - name: Write the attempt record
   ansible.builtin.import_tasks: record_write.yml
+  vars:
+    workloads_record_mirror: "{{ not workloads_waves | default(false) }}"

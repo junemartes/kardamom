@@ -19,10 +19,17 @@ pub(crate) mod engine;
 mod exporter;
 mod feed;
 pub mod plan;
+mod prepared;
+mod progress;
+mod report;
 pub(crate) mod scrape;
+mod stream;
 #[cfg(test)]
 mod tests;
 mod tracker;
+
+pub use prepared::Prepared;
+pub use progress::{Progress, ProgressSnapshot};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,7 +37,6 @@ use std::time::{Duration, Instant};
 use alloy_primitives::Address;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClient;
-use tokio::sync::Semaphore;
 
 use crate::config::{MAX_IN_FLIGHT_SLACK, preflight_chain_id, rpc_client};
 use crate::load::accounting::{EvalInput, evaluate, print_report, step_gap_ok, step_seq_clean};
@@ -255,6 +261,18 @@ struct ReceiptFeed {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// The feed and sweeper stop when the run ends, fails, or is cancelled.
+struct BackgroundTasks([Option<tokio::task::JoinHandle<()>>; 2]);
+
+impl Drop for BackgroundTasks {
+    fn drop(&mut self) {
+        self.0
+            .iter()
+            .flatten()
+            .for_each(tokio::task::JoinHandle::abort);
+    }
+}
+
 /// The result of `settle_and_snapshot`.
 struct Settled {
     fin: MetricsSnapshot,
@@ -326,19 +344,19 @@ impl LoadRun<'_> {
     async fn settle_and_snapshot(
         &self,
         tasks: &mut tokio::task::JoinSet<()>,
-        feed: Option<tokio::task::JoinHandle<()>>,
-        sweeper: Option<tokio::task::JoinHandle<()>>,
-    ) -> Settled {
+        background: BackgroundTasks,
+    ) -> anyhow::Result<Settled> {
         let deadline = Instant::now() + self.cfg.drain_timeout;
-        join_submit_tasks(tasks, deadline).await;
-        engine::Drainer::new(self.receipt_clients.clone(), Arc::clone(self.tracker))
-            .drain(deadline)
-            .await;
-        if let Some(feed) = feed {
-            feed.abort();
-        }
-        if let Some(sweeper) = sweeper {
-            sweeper.abort();
+        {
+            let _background = background;
+            let joined = join_submit_tasks(tasks, deadline).await;
+            if joined.is_err() {
+                tasks.shutdown().await;
+            }
+            joined?;
+            engine::Drainer::new(self.receipt_clients.clone(), Arc::clone(self.tracker))
+                .drain(deadline)
+                .await;
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
         let fin = self.scraper.snapshot().await;
@@ -348,7 +366,7 @@ impl LoadRun<'_> {
         } else {
             None
         };
-        Settled { fin, recheck }
+        Ok(Settled { fin, recheck })
     }
 
     /// Build the verdict from the tracker's final counts and the
@@ -382,45 +400,8 @@ impl LoadRun<'_> {
             recheck,
             max_gap: self.cfg.max_gap,
             assert_all_delivered: self.cfg.assert_all_delivered,
-            ack_proves_receipt: !self.cfg.subscribe,
             chaos_mode: self.cfg.chaos_mode,
         })
-    }
-
-    /// Assemble the final [`LoadReport`] from the run's timing, the
-    /// tracker's latency percentiles and gas total, and the verdict.
-    fn build_report(
-        &self,
-        verdict: accounting::Verdict,
-        ramp: Vec<RampStep>,
-        discovered_max: u32,
-        soak_rate: u32,
-        scrape_fallbacks: u64,
-    ) -> LoadReport {
-        let lat = self.tracker.latency_us();
-        LoadReport {
-            mode: if self.cfg.chaos_mode {
-                "chaos"
-            } else if self.cfg.fixed_rate {
-                "fixed"
-            } else {
-                "soak"
-            }
-            .to_string(),
-            target_tps: self.cfg.target_tps.get(),
-            discovered_max_tps: discovered_max,
-            soak_rate_tps: soak_rate,
-            duration_secs: self.cfg.duration.as_secs_f64(),
-            ramp,
-            lat_p50_us: lat.p50,
-            lat_p95_us: lat.p95,
-            lat_p99_us: lat.p99,
-            lat_max_us: lat.max,
-            total_gas: self.tracker.total_gas(),
-            workload: self.cfg.workload.to_string(),
-            scrape_fallbacks,
-            verdict,
-        }
     }
 
     /// Write the report as pretty JSON to `cfg.output`, if set.
@@ -442,7 +423,7 @@ impl LoadRun<'_> {
         tasks: &mut tokio::task::JoinSet<()>,
         queues: &mut Queues,
         ramp: &mut Vec<RampStep>,
-    ) -> std::num::NonZeroU32 {
+    ) -> anyhow::Result<std::num::NonZeroU32> {
         let mut run = RampRun {
             cfg: self.cfg,
             handles,
@@ -456,7 +437,7 @@ impl LoadRun<'_> {
         let mut discovered: Option<std::num::NonZeroU32> = None;
         let mut rate = self.cfg.ramp_step_tps;
         while rate.get() <= self.cfg.target_tps.get() {
-            let Some(next) = run.ramp_step(rate).await else {
+            let Some(next) = run.ramp_step(rate).await? else {
                 break;
             };
             (discovered, rate) = (Some(rate), next);
@@ -464,7 +445,7 @@ impl LoadRun<'_> {
         // No step ran (the first step size already exceeds
         // `target_tps`), or none was sustainable: fall back to the
         // smallest step size.
-        discovered.unwrap_or(self.cfg.ramp_step_tps)
+        Ok(discovered.unwrap_or(self.cfg.ramp_step_tps))
     }
 }
 
@@ -501,8 +482,7 @@ async fn prepare_run(cfg: &LoadConfig) -> anyhow::Result<RunSetup> {
         per_sender,
         target_tps = cfg.target_tps.get(),
         chaos = cfg.chaos_mode,
-        "kardamom-load: pre-generating {} txs",
-        per_sender.saturating_mul(signers.len())
+        "kardamom-load: preparing queues; chaos transfers sign bounded batches"
     );
     // Signing is CPU work, seconds to minutes for a long window. Keep
     // it off the async worker the caller's tasks share.
@@ -510,14 +490,16 @@ async fn prepare_run(cfg: &LoadConfig) -> anyhow::Result<RunSetup> {
         let cfg = cfg.clone();
         let signers = signers.clone();
         move || {
-            cfg.build_queues(
-                &signers,
-                &QueuePlan {
-                    chain_id,
-                    per_sender,
-                    starts,
-                },
-            )
+            let plan = QueuePlan {
+                chain_id,
+                per_sender,
+                starts,
+            };
+            if cfg.chaos_mode && matches!(cfg.workload, Workload::Transfers) {
+                stream::SignedBatches::prepare(cfg, signers, plan)
+            } else {
+                cfg.build_queues(&signers, &plan)
+            }
         }
     })
     .await
@@ -545,144 +527,16 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
 }
 
 /// A load whose submit queues are signed: it starts to submit as soon
-/// as [`Prepared::run`] is called. A caller that must know when the
-/// submissions start prepares first and runs second, because signing a
-/// long window costs minutes of CPU.
+/// as [`Prepared::run`] is called. Chaos transfers prepare one bounded
+/// batch and sign ahead on a worker. Other workloads pre-sign the run
+/// before its latency and throughput measurements begin.
 ///
 /// # Errors
 ///
 /// Returns the same errors as [`run`], except the verdict.
 pub async fn prepare(cfg: LoadConfig) -> anyhow::Result<Prepared> {
     let setup = prepare_run(&cfg).await?;
-    Ok(Prepared { cfg, setup })
-}
-
-/// The signed queues and their configuration. See [`prepare`].
-pub struct Prepared {
-    cfg: LoadConfig,
-    setup: RunSetup,
-}
-
-impl Prepared {
-    /// Run the prepared harness. Returns whether the verdict passed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error on a submission-loop failure or a report write.
-    pub async fn run(self) -> anyhow::Result<bool> {
-        let Self {
-            cfg,
-            setup:
-                RunSetup {
-                    client,
-                    signers,
-                    mut queues,
-                },
-        } = self;
-
-        let scraper = cfg.scraper()?;
-        let mut tracker = Tracker::new()?;
-        tracker.expect(&signers, queues.planned());
-        let tracker = Arc::new(tracker);
-        let sem = Arc::new(Semaphore::new(cfg.max_in_flight.get() as usize));
-        let handles = RunHandles {
-            client: Arc::clone(&client),
-            sem: Arc::clone(&sem),
-            tracker: Arc::clone(&tracker),
-        };
-        let mut tasks = tokio::task::JoinSet::new();
-        let mode = cfg.submit_mode();
-
-        let run = LoadRun {
-            cfg: &cfg,
-            tracker: &tracker,
-            scraper: &scraper,
-            receipt_clients: cfg.receipt_clients(&client)?,
-        };
-
-        let ReceiptFeed {
-            confirm: feed_confirm,
-            task: feed,
-        } = run.spawn_receipt_feed(&signers);
-        // A live sweeper, in every mode. An entry the feed misses, or an
-        // accepted submit whose immediate re-fetch answered null, is
-        // re-fetched within 2 to 7 seconds, instead of waiting for the
-        // end-of-run drain. Keep this cadence well inside the ingress receipt
-        // cache's query horizon (capacity divided by rate, about 27 seconds at
-        // 4,800 tx/s with the default 128k capacity, oldest out first), and
-        // inside the window in which a receipt is still on some ingress: a
-        // job update restarts every replica in turn, and a receipt that only
-        // the drain asks for is then on none of them.
-        let sweeper = Some(
-            Arc::new(engine::Drainer::new(
-                run.receipt_clients.clone(),
-                Arc::clone(&tracker),
-            ))
-            .spawn_pending_sweeper(Duration::from_secs(5), Duration::from_secs(2)),
-        );
-
-        // --- ramp (soak mode only) -------------------------------------------
-        let mut ramp = Vec::new();
-        let discovered_max: std::num::NonZeroU32 = if cfg.chaos_mode || cfg.fixed_rate {
-            cfg.target_tps
-        } else {
-            run.ramp_to_max(&handles, &mut tasks, &mut queues, &mut ramp)
-                .await
-        };
-
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "a discovered tx/s rate stays far under i64::MAX, rounded for the soak target"
-        )]
-        let soak_rate: std::num::NonZeroU32 = if cfg.chaos_mode || cfg.fixed_rate {
-            cfg.target_tps
-        } else {
-            let rate = ((f64::from(discovered_max.get()) * cfg.soak_fraction).round() as u32)
-                .clamp(1, cfg.target_tps.get());
-            std::num::NonZeroU32::new(rate)
-                .ok_or_else(|| anyhow::anyhow!("discovered soak rate rounds to zero"))?
-        };
-
-        // --- soak ------------------------------------------------------------
-        tracing::info!(
-            soak_rate = soak_rate.get(),
-            discovered_max = discovered_max.get(),
-            "kardamom-load: soaking"
-        );
-        let base = scraper.snapshot().await;
-        pacer(
-            &handles,
-            &mut tasks,
-            &mut queues,
-            soak_rate,
-            cfg.duration,
-            SubmitOpts {
-                retry: cfg.retry_submit,
-                pause_wait: cfg.pause_wait,
-                mode,
-                feed_confirm,
-            },
-        )
-        .await;
-
-        let settled = run.settle_and_snapshot(&mut tasks, feed, sweeper).await;
-
-        let verdict = run.build_verdict(&base, &settled.fin, settled.recheck.as_ref());
-        let report = run.build_report(
-            verdict,
-            ramp,
-            discovered_max.get(),
-            soak_rate.get(),
-            settled.scrape_fallbacks(&base),
-        );
-
-        print_report(&report);
-        run.write_report_json(&report)?;
-
-        Ok(report.verdict.pass)
-    }
+    Prepared::new(cfg, setup)
 }
 
 /// The state one ramp-to-max run needs across every step: the fixed
@@ -701,7 +555,7 @@ struct RampRun<'a> {
 impl RampRun<'_> {
     /// Pace at `rate` tx/s for one step, and measure whether the
     /// ingress kept pace and the cluster stayed clean.
-    async fn run_step(&mut self, rate: std::num::NonZeroU32) -> RampStep {
+    async fn run_step(&mut self, rate: std::num::NonZeroU32) -> anyhow::Result<RampStep> {
         let before = self.handles.tracker.counts();
         let s0 = self.scraper.snapshot().await;
         pacer(
@@ -717,7 +571,7 @@ impl RampRun<'_> {
                 feed_confirm: self.cfg.feed_confirm_on(),
             },
         )
-        .await;
+        .await?;
         let after = self.handles.tracker.counts();
         let s1 = self.scraper.snapshot().await;
 
@@ -771,7 +625,7 @@ impl RampRun<'_> {
             sustainable,
             "ramp step"
         );
-        RampStep {
+        Ok(RampStep {
             rate: rate.get(),
             accept_ratio,
             gap_ok,
@@ -781,15 +635,18 @@ impl RampRun<'_> {
             lat_p95_us: lat.p95,
             gas_used,
             lat_p99_us: lat.p99,
-        }
+        })
     }
 
     /// Run one ramp step at `rate`, record it, and return the next
     /// rate to try if it was sustainable, else `None` to stop ramping.
-    async fn ramp_step(&mut self, rate: std::num::NonZeroU32) -> Option<std::num::NonZeroU32> {
-        let step = self.run_step(rate).await;
+    async fn ramp_step(
+        &mut self,
+        rate: std::num::NonZeroU32,
+    ) -> anyhow::Result<Option<std::num::NonZeroU32>> {
+        let step = self.run_step(rate).await?;
         let sustainable = step.sustainable;
         self.ramp.push(step);
-        sustainable.then(|| rate.saturating_add(self.cfg.ramp_step_tps.get()))
+        Ok(sustainable.then(|| rate.saturating_add(self.cfg.ramp_step_tps.get())))
     }
 }

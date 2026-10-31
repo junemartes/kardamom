@@ -8,10 +8,27 @@ use std::time::Duration;
 
 use crate::harness::Harness;
 use crate::inject::Killed;
+use crate::knobs::ExecutorNodes;
 use crate::metrics;
 use crate::nomad::Alloc;
 use crate::poll::{self, Budget};
-use crate::probes::EXECUTOR_BLOCK_METRIC;
+use crate::probes::{EXECUTOR_BLOCK_METRIC, INGRESS_SEALED_HEAD_METRIC};
+
+mod progress;
+use progress::ExecutorProgress;
+mod stall;
+use stall::Samples;
+
+/// How long the sealer boundary counter may stay flat after a recovery.
+/// An executor that misses a join waits 10 s (`join_refetch_after`)
+/// before it refetches from the archive, and the refetch took up to 9 s
+/// in CI, with one failed archive connect. The boundaries can stall over
+/// one such miss and refetch, so the budget holds two of them with a
+/// margin.
+const PROGRESS_BUDGET: Budget = Budget {
+    timeout: Duration::from_secs(45),
+    interval: Duration::from_secs(2),
+};
 
 /// Where an executor stands against the fleet head.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +94,68 @@ impl Standing {
             Some(floor) if block <= floor => Self::Stalled(node.to_string(), block),
             _ => Self::Converged,
         }
+    }
+}
+
+/// The head that a stall check reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallHead {
+    /// The highest executor block.
+    Executor,
+    /// The highest sealed head that an ingress read from the sealer.
+    Ingress,
+}
+
+impl StallHead {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Executor => "executor block",
+            Self::Ingress => "ingress sealed head",
+        }
+    }
+
+    /// One concurrent reading within twelve seconds. A dark endpoint
+    /// cannot discard a completed reading from a surviving node.
+    async fn sample(self, h: &Harness) -> Option<i64> {
+        let (targets, metric) = match self {
+            Self::Executor => (
+                (0..h.probes.executors.len())
+                    .map(|index| h.probes.executor_target(index))
+                    .collect::<Vec<_>>(),
+                EXECUTOR_BLOCK_METRIC,
+            ),
+            Self::Ingress => (
+                h.probes
+                    .ingresses
+                    .iter()
+                    .map(|node| h.probes.ingress_target(node))
+                    .collect(),
+                INGRESS_SEALED_HEAD_METRIC,
+            ),
+        };
+        let mut samples = Samples::default();
+        for target in targets {
+            samples.start(Self::read(h.probes.scrape().clone(), target, metric));
+        }
+        samples.maximum().await
+    }
+
+    async fn read(
+        scrape: metrics::Scrape,
+        target: metrics::Target,
+        metric: &'static str,
+    ) -> Option<i64> {
+        poll::until(Budget::secs(12, 3), |_| async {
+            Ok(scrape
+                .fetch(&target)
+                .await
+                .and_then(|body| metrics::first(&body, metric)))
+        })
+        .await
+        .ok()?
+        .or_fail(|_| anyhow::anyhow!("no sample"))
+        .ok()
+        .map(|(value, _)| value)
     }
 }
 
@@ -169,8 +248,9 @@ impl Harness {
         })
     }
 
-    /// The pipeline-progress probe of the component cases: the sealer
-    /// boundary counter must tick over a ten-second window. When no
+    /// The pipeline-progress probe of the component cases: the count of
+    /// the boundaries that reach an executor must tick within
+    /// `PROGRESS_BUDGET`. The probe passes on the first tick. When no
     /// executor exporter answers, the executor block gauge stands in.
     ///
     /// # Errors
@@ -180,42 +260,43 @@ impl Harness {
         let Some(b0) = self.probes.sealer_boundaries().await else {
             return self.assert_executor_progress(Duration::from_mins(1)).await;
         };
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        let b1 = self.probes.sealer_boundaries().await.unwrap_or(0);
-        anyhow::ensure!(
-            b1 > b0,
-            "{}: pipeline NOT progressing after recovery (sealer boundaries {b0} -> {b1})",
-            crate::FAIL_PREFIX
-        );
+        let outcome = poll::after_sleep(PROGRESS_BUDGET, |_| async move {
+            Ok(self
+                .probes
+                .sealer_boundaries()
+                .await
+                .filter(|b1| b1.rose_over(b0)))
+        })
+        .await?;
+        let (b1, elapsed) = outcome.or_fail(|t| {
+            crate::chaos_fail!(
+                "pipeline NOT progressing after recovery (sealer boundaries {b0} -> ? over {}s)",
+                t.as_secs()
+            )
+        })?;
         crate::log(format!(
-            "pipeline progressing (sealer boundaries {b0} -> {b1})"
+            "pipeline progressing (sealer boundaries {b0} -> {b1} after {}s)",
+            elapsed.as_secs()
         ));
         Ok(())
     }
 
     /// The cluster-mode progress probe: the executor block gauge must
-    /// advance within `timeout`. Recovery is not instant after a leader
-    /// kill, so this succeeds as soon as progress shows.
+    /// advance within `timeout`. The first real reading and the later
+    /// higher reading consume the same recovery budget.
     ///
     /// # Errors
     ///
     /// Returns an error if the gauge never advances.
     pub async fn assert_executor_progress(&self, timeout: Duration) -> anyhow::Result<()> {
-        let e0 = self
-            .progress_sample()
-            .await
-            .ok_or_else(|| crate::chaos_fail!("no executor baseline before progress window"))?;
-        let outcome = poll::after_sleep(
-            Budget::new(timeout, Duration::from_secs(5)),
-            |_| async move {
-                let e1 = self.probes.executor_progress().await.unwrap_or(0);
-                Ok((e1 > e0).then_some(e1))
-            },
-        )
-        .await?;
-        let (e1, elapsed) = outcome.or_fail(|t| {
+        let outcome = ExecutorProgress::default()
+            .wait(Budget::new(timeout, Duration::from_secs(5)), || {
+                self.probes.executor_progress()
+            })
+            .await?;
+        let ((e0, e1), elapsed) = outcome.or_fail(|t| {
             crate::chaos_fail!(
-                "pipeline NOT progressing (executor block {e0} -> ? over {}s)",
+                "pipeline NOT progressing (two increasing executor block samples required within {}s)",
                 t.as_secs()
             )
         })?;
@@ -353,49 +434,54 @@ impl Harness {
     }
 
     /// The must-not-progress check: the executor block gauge stays flat
-    /// over `window`. Both samples must be real scrapes; an unreachable
-    /// gauge is a harness failure, because the executors survive a
-    /// sealer quorum loss.
+    /// over `window`. Both samples must be real scrapes of one head. The
+    /// executors survive a sealer quorum loss, so they give the head. When
+    /// no executor answers and the executors run on the sealer nodes, they
+    /// died with the nodes, and the sealed head of the ingresses gives it.
     ///
     /// # Errors
     ///
-    /// Returns an error if a sample is missing or the gauge advanced.
+    /// Returns an error if a sample is missing or the head advanced.
     pub async fn assert_executor_stalled(&self, window: Duration) -> anyhow::Result<()> {
-        let e0 = self.progress_sample().await.ok_or_else(|| {
-            crate::chaos_fail!("stall assert: no executor gauge scrapeable BEFORE the window — cannot observe the stall")
+        let head = match (self.progress_sample().await, self.knobs.executor_nodes) {
+            (None, ExecutorNodes::Sealer) => StallHead::Ingress,
+            _ => StallHead::Executor,
+        };
+        let e0 = head.sample(self).await.ok_or_else(|| {
+            crate::chaos_fail!(
+                "stall assert: no {} scrapeable BEFORE the window — cannot observe the stall",
+                head.name()
+            )
         })?;
         tokio::time::sleep(window).await;
-        let e1 = self.progress_sample().await.ok_or_else(|| {
-            crate::chaos_fail!("stall assert: no executor gauge scrapeable AFTER the window — cannot observe the stall")
+        let e1 = head.sample(self).await.ok_or_else(|| {
+            crate::chaos_fail!(
+                "stall assert: no {} scrapeable AFTER the window — cannot observe the stall",
+                head.name()
+            )
         })?;
         anyhow::ensure!(
             e1 == e0,
-            "{}: pipeline UNEXPECTEDLY progressed while quorum lost (executor block {e0} -> {e1})",
-            crate::FAIL_PREFIX
+            "{}: pipeline UNEXPECTEDLY progressed while quorum lost ({} {e0} -> {e1})",
+            crate::FAIL_PREFIX,
+            head.name()
         );
         crate::log(format!(
-            "pipeline correctly STALLED (executor block {e0} -> {e1} over {}s, no false progress)",
+            "pipeline correctly STALLED ({} {e0} -> {e1} over {}s, no false progress)",
+            head.name(),
             window.as_secs()
         ));
         Ok(())
     }
 
-    /// One executor-progress reading, retried five times.
+    /// One executor-progress reading, retried for twelve seconds.
     async fn progress_sample(&self) -> Option<i64> {
-        let outcome = poll::until(Budget::secs(12, 3), |_| async move {
-            Ok(self.probes.executor_progress().await)
-        })
-        .await
-        .ok()?;
-        outcome
-            .or_fail(|_| anyhow::anyhow!("no sample"))
-            .ok()
-            .map(|(v, _)| v)
+        StallHead::Executor.sample(self).await
     }
 
     /// The restarted-replica health probe: the sequencer exporter at
-    /// `target` answers with sequencer samples. Established-sender
-    /// coverage stays on the twin, by design.
+    /// `target` answers with sequencer samples. A separate transaction
+    /// probe proves that the replica can order an established sender.
     ///
     /// # Errors
     ///
@@ -420,7 +506,7 @@ impl Harness {
             )
         })?;
         crate::log(format!(
-            "restarted replica on {} (:{}) is up and exporting ({samples} sequencer metrics; established-sender coverage stays on the twin)",
+            "restarted replica on {} (:{}) is up and exporting ({samples} sequencer metrics)",
             target.name,
             target.port()
         ));

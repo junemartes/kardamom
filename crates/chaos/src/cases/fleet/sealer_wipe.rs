@@ -18,15 +18,19 @@ use super::{
     FULL_RESTART_ELECTION, RESUMED, StateOwner, evidence_dir, install_image, install_rebuilt_image,
     sealers, unchecked_target, wipe_node,
 };
-use crate::cases::cache::freeze_and_flush;
+use crate::cases::cache::flush_primary;
 use crate::cases::component::wipe_dirs;
+use crate::cases::member_storage::MemberStorage;
 use crate::evidence::CountWait;
 use crate::harness::Harness;
 use crate::l1::L1;
-use crate::nomad::{Nodes, SavedJob, Streams};
+use crate::nomad::{SavedJob, Streams};
 use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
 use crate::stages::rebuild::{Output, Rebuild, Rebuilt};
+
+mod executors;
+use executors::Executors;
 
 pub(super) const CTX: &str = "sealer-fleet-total-wipe-recover";
 
@@ -48,11 +52,6 @@ const DA_WATCHER_PORT: u16 = 9005;
 const EPOCH_ORIGIN: &str = "kardamom_da_watcher_epoch_origin_block_number";
 const L1_FINALIZED: &str = "kardamom_da_watcher_l1_finalized_block_number";
 const EPOCHS_PUBLISHED: &str = "kardamom_da_watcher_epochs_published_total";
-
-/// The script that empties a member's cluster and archive directories,
-/// and makes the seed directory. It keeps `archive/dir`: that is the
-/// node's shared Aeron archive, not the member's.
-const SEALER_WIPE: &str = "find /opt/kardamom/cluster -mindepth 1 -delete && find /opt/kardamom/archive -mindepth 1 -maxdepth 1 ! -name dir -exec rm -rf {} + && mkdir -p /opt/kardamom/seed";
 
 /// The L1 blocks the wait for the batcher's first new post mines at each
 /// poll: two finality windows of anvil's default (2 x 32 slots) pass in
@@ -334,7 +333,7 @@ impl<'a> FleetWipe<'a> {
         wipe_dirs(self.h, &self.aux, CTX, &owner.wipe_script()).await?;
         install_image(self.h, CTX, &self.aux, &owner, &seeded.validator).await?;
         wipe_dirs(self.h, &self.aux, CTX, BATCHER_WIPE).await?;
-        let primary = freeze_and_flush(self.h, CTX, &[]).await?;
+        let primary = flush_primary(self.h, CTX).await?;
         crate::log(format!(
             "{CTX}: old state wiped; account cache {primary} flushed"
         ));
@@ -343,7 +342,7 @@ impl<'a> FleetWipe<'a> {
 
     /// Wipe one member's directories and copy the seed to its node.
     async fn seed_node(&self, node: &str, seeded: &Seeded) -> anyhow::Result<()> {
-        wipe_dirs(self.h, node, CTX, SEALER_WIPE).await?;
+        MemberStorage::wipe(self.h, node, CTX).await?;
         let seed = seeded.seed.display().to_string();
         self.h
             .nodes
@@ -385,13 +384,14 @@ impl<'a> FleetWipe<'a> {
             "{}: {CTX}: a member started from the seed after the seed property was cleared",
             crate::FAIL_PREFIX
         );
-        let leader = self
+        let elected = self
             .h
             .evidence
-            .cluster_leader(FULL_RESTART_ELECTION)
+            .cluster_elected(FULL_RESTART_ELECTION)
             .await?;
         crate::log(format!(
-            "{CTX}: members without the seed elected memberId={leader}"
+            "{CTX}: members without the seed elected memberId={} (term {})",
+            elected.leader, elected.term
         ));
         Ok(())
     }
@@ -399,12 +399,15 @@ impl<'a> FleetWipe<'a> {
     /// Register the seeded cluster job and wait for a leader.
     async fn start_seeded(&self, job: &serde_json::Value) -> anyhow::Result<()> {
         self.jobs.cluster.register(job).await?;
-        let leader = self
+        let elected = self
             .h
             .evidence
-            .cluster_leader(FULL_RESTART_ELECTION)
+            .cluster_elected(FULL_RESTART_ELECTION)
             .await?;
-        crate::log(format!("{CTX}: seeded members elected memberId={leader}"));
+        crate::log(format!(
+            "{CTX}: seeded members elected memberId={} (term {})",
+            elected.leader, elected.term
+        ));
         Ok(())
     }
 
@@ -576,40 +579,6 @@ impl<'a> FleetWipe<'a> {
         if let Err(e) = job.restore().await {
             crate::log(format!("{CTX}: could not start a job again: {e:#}"));
         }
-    }
-}
-
-/// The executor nodes of the case. The stale one keeps the state of the
-/// old chain. The fresh ones resume on the rebuilt image at once.
-struct Executors {
-    /// The container of the stale executor.
-    stale: String,
-    /// The containers of the fresh executors.
-    fresh: Vec<String>,
-    /// The Nomad names of the fresh executor nodes.
-    fresh_nodes: Nodes,
-    /// The count of executor nodes: the fresh ones and the stale one.
-    count: usize,
-}
-
-impl Executors {
-    /// The executor nodes of the contract, by index. The last one is the
-    /// stale one.
-    fn of(h: &Harness) -> anyhow::Result<Self> {
-        let all = h.contract.of_role("executor");
-        let (stale, fresh) = all
-            .split_last()
-            .ok_or_else(|| crate::chaos_fail!("{CTX}: no executor node"))?;
-        let fresh_nodes =
-            Nodes::new(fresh.iter().map(|node| node.name.clone())).ok_or_else(|| {
-                crate::chaos_fail!("{CTX}: the case needs two executor nodes or more")
-            })?;
-        Ok(Self {
-            stale: stale.container.clone(),
-            fresh: fresh.iter().map(|node| node.container.clone()).collect(),
-            fresh_nodes,
-            count: all.len(),
-        })
     }
 }
 

@@ -1,0 +1,41 @@
+---
+- name: Verify prepared node software without network access
+  hosts: all
+  connection: local
+  become: false
+  gather_facts: true
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Check the image against the deploy's software contract
+      ansible.builtin.import_role:
+        name: common
+        tasks_from: image
+
+    - name: Require a prepared image
+      ansible.builtin.assert:
+        that: common_node_software_preinstalled
+
+    - name: Read the installed Docker version
+      ansible.builtin.command: docker --version
+      changed_when: false
+
+    - name: Check the registry's Python Docker client
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_facts.python.executable }}"
+          - -c
+          - import docker
+      changed_when: false
+
+    - name: Read the installed Consul version
+      ansible.builtin.command: consul version
+      register: node_image_consul
+      changed_when: false
+      failed_when: "node_image_consul.stdout_lines[0] != 'Consul v' ~ consul_version"
+
+    - name: Read the installed Nomad version
+      ansible.builtin.command: nomad version
+      register: node_image_nomad
+      changed_when: false
+      failed_when: "node_image_nomad.stdout_lines[0] != 'Nomad v' ~ nomad_version"

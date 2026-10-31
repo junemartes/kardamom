@@ -34,6 +34,13 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 metrics = { workspace = true }
+# The final head: the output oracle on L1.
+alloy-contract = { workspace = true }
+alloy-provider = { workspace = true }
+alloy-rpc-types-eth = { workspace = true }
+alloy-sol-types = { workspace = true }
+# The free disk of the store (statvfs).
+rustix = { version = "1.1", features = ["fs"] }
 # The range read of a peer egress after a start.
 reqwest = { workspace = true }
 thiserror = { workspace = true }
@@ -45,4 +52,4 @@ kardamom-cache = { workspace = true }
 # The format registry: a test checks the layout of the reference mark.
 kardamom-formats = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }

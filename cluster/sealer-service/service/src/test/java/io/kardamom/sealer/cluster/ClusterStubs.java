@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import org.agrona.DirectBuffer;
@@ -93,6 +94,7 @@ final class ClusterStubs {
     }
 
     static final class StubCluster implements Cluster {
+        private final Optional<Aeron> aeron;
         final HashMap<Long, ClientSession> sessions = new HashMap<>();
         final IdleStrategy idleStrategy = new YieldingIdleStrategy();
         /** Every timer the service armed, as {@code (correlationId, deadline)} pairs. */
@@ -103,6 +105,14 @@ final class ClusterStubs {
         final List<byte[]> logOffers = new ArrayList<>();
         /** The role {@link #role()} reports. */
         Role role = Role.LEADER;
+
+        StubCluster() {
+            aeron = Optional.empty();
+        }
+
+        StubCluster(final Aeron aeron) {
+            this.aeron = Optional.of(aeron);
+        }
 
         StubSession addSession(final long id) {
             final StubSession session = new StubSession(id);
@@ -123,11 +133,11 @@ final class ClusterStubs {
         }
 
         public Aeron aeron() {
-            throw new UnsupportedOperationException();
+            return aeron.orElseThrow(UnsupportedOperationException::new);
         }
 
         public io.aeron.cluster.service.ClusteredServiceContainer.Context context() {
-            throw new UnsupportedOperationException();
+            return new io.aeron.cluster.service.ClusteredServiceContainer.Context().clusterId(0);
         }
 
         public ClientSession getClientSession(final long clusterSessionId) {

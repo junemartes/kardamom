@@ -3,6 +3,7 @@ use std::net::Ipv4Addr;
 use kardamom_bench::load::{MetricsTarget, MetricsTargets};
 
 use super::*;
+use crate::load::Latency;
 
 #[test]
 fn raft_faults_cannot_hide_bad_receipts_or_replica_failures() {
@@ -14,6 +15,7 @@ fn raft_faults_cannot_hide_bad_receipts_or_replica_failures() {
         offered: 10,
         accepted: 10,
         seq_dropped: Some(2),
+        latency: Latency::default(),
     };
     assert!(Case::ClusterLeaderKill.judge_load(&verdict).is_err());
     verdict.failures = vec!["executor unreachable".into()];
@@ -37,6 +39,7 @@ fn spec() -> LoadSpec {
         fixed_rate: true,
         duration: PROBE_WINDOW,
         tps: NonZeroU32::MIN,
+        max_in_flight: NonZeroU32::MIN,
         retry_submit: 0,
         pause_wait: PROBE_PAUSE_WAIT,
         max_gap: 0,
@@ -66,13 +69,17 @@ fn a_probe_leg_needs_every_receipt_and_a_rate_and_names_its_meaning() {
         offered: 3000,
         accepted: 3000,
         seq_dropped: None,
+        latency: Latency {
+            lat_p50_us: 19_841_000,
+            ..Latency::default()
+        },
     };
     let case = Case::ClusterTotalLossRecover;
     assert!(leg.judge(case, &verdict).is_ok());
     verdict.accepted = 242;
     let err = leg.judge(case, &verdict).unwrap_err().to_string();
     assert!(
-        err.contains("accepted 242") && err.contains("fresh sender"),
+        err.contains("accepted 242") && err.contains("fresh sender") && err.contains("p50=19841ms"),
         "{err}"
     );
     verdict.accepted = 3000;

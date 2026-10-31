@@ -6,6 +6,7 @@ import io.aeron.cluster.codecs.CloseReason;
 import io.aeron.cluster.service.ClientSession;
 import io.aeron.cluster.service.Cluster;
 import io.aeron.cluster.service.ClusteredService;
+import io.aeron.cluster.service.RecoveryState;
 import io.aeron.logbuffer.Header;
 import io.kardamom.sealer.Boundary;
 import io.kardamom.sealer.CanonicalSealerState;
@@ -17,6 +18,7 @@ import io.kardamom.sealer.OriginOutcome;
 import io.kardamom.sealer.Relayed;
 import io.kardamom.sealer.VersionSwitch;
 import io.kardamom.sealer.RemoteOriginAdvance;
+import io.kardamom.sealer.GenesisFeatures;
 import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.TxOffer;
 import io.kardamom.sealer.VoidLedger;
@@ -29,6 +31,8 @@ import java.util.concurrent.TimeUnit;
 import org.agrona.DirectBuffer;
 import org.agrona.concurrent.AgentTerminationException;
 import org.agrona.concurrent.UnsafeBuffer;
+import org.agrona.concurrent.status.AtomicCounter;
+import org.agrona.concurrent.status.CountersReader;
 
 /**
  * Thin Aeron Cluster {@link ClusteredService} that sends all deterministic
@@ -102,6 +106,13 @@ public final class SealerClusteredService implements ClusteredService {
      * Empty starts it at genesis. A snapshot, when one exists, wins.
      */
     private Optional<SealerSeed> seed = Optional.empty();
+
+    /**
+     * The features that the chain runs from its genesis. Replicated
+     * configuration: a member that starts at genesis takes them, so every
+     * member runs the same set. A restore and a seed bring their own rules.
+     */
+    private GenesisFeatures genesisFeatures = GenesisFeatures.NONE;
 
     /**
      * The retained-file settings, or empty to keep the retained frames on
@@ -344,6 +355,17 @@ public final class SealerClusteredService implements ClusteredService {
         return this;
     }
 
+    /** Start a member at genesis with the rules of {@code features}. Every member must run the same set. */
+    SealerClusteredService genesisFeatures(final GenesisFeatures features) {
+        this.genesisFeatures = features;
+        return this;
+    }
+
+    /** The features that the chain runs from its genesis, for the admin endpoint. */
+    GenesisFeatures genesisFeatures() {
+        return genesisFeatures;
+    }
+
     /**
      * Keep the retained frames in an append-only file, not on the heap.
      * Every member must run the same choice.
@@ -388,8 +410,24 @@ public final class SealerClusteredService implements ClusteredService {
         // An unreadable or empty snapshot image is fatal. Restarting silently
         // at genesis would diverge from the rest of the cluster, which assumes
         // the snapshotted state (and the log replayed after it) is correct.
-        start(cluster, Optional.ofNullable(snapshotImage)
-            .map(image -> SnapshotIo.readSnapshot(image, cluster.idleStrategy())));
+        final Optional<byte[]> snapshot = Optional.ofNullable(snapshotImage)
+            .map(image -> SnapshotIo.readSnapshot(image, cluster.idleStrategy()));
+        start(cluster, snapshot);
+        leadershipTermId = snapshot.isPresent() ? snapshotLeadershipTerm() : -1L;
+    }
+
+    /** The committed term of the loaded snapshot, even when replay contains no new term entry. */
+    private long snapshotLeadershipTerm() {
+        final CountersReader counters = cluster.aeron().countersReader();
+        final int counter = RecoveryState.findCounterId(counters, cluster.context().clusterId());
+        if (counter == CountersReader.NULL_COUNTER_ID) {
+            throw new IllegalStateException("snapshot recovery state counter is missing");
+        }
+        final long term = RecoveryState.getLeadershipTermId(counters, counter);
+        if (term < 0) {
+            throw new IllegalStateException("snapshot recovery state has no committed leadership term");
+        }
+        return term;
     }
 
     /** Start from {@code snapshot} when there is one, else from the seed or at genesis. */
@@ -402,6 +440,7 @@ public final class SealerClusteredService implements ClusteredService {
         this.feed = Feed.open(feedConfig, new MemberFeed.Member(memberId, retained, metrics));
         if (snapshot.isPresent()) {
             restore(snapshot.get());
+            requireGenesisFeatures();
             // The log position of a start from a snapshot is the snapshot's position.
             purgeView = PurgeView.EMPTY
                 .withMark(new PurgeView.Mark(cluster.logPosition(), state.blockNumber()))
@@ -418,8 +457,10 @@ public final class SealerClusteredService implements ClusteredService {
             this.state = new CanonicalSealerState(
                 dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER, remoteOrigins, voids(),
                 inclusionHorizonBlocks, window.capacity(), budgets);
+            state.genesisRules(genesisFeatures);
             openEgress(Optional.empty());
-            System.out.println("sealer state FRESH at genesis memberId=" + memberId);
+            System.out.println("sealer state FRESH at genesis memberId=" + memberId
+                + " genesisFeatures=\"" + genesisFeatures.value() + "\"");
         }
         publishRules();
         System.out.println("sealer decision rules memberId=" + memberId + " version=" + state.decisionVersion()
@@ -551,11 +592,32 @@ public final class SealerClusteredService implements ClusteredService {
                 ? " holds a retained file, and this member keeps the frames on the heap: start it with "
                 : " holds no retained file, and this member keeps the frames in a file: start it without ")
                 + RetainedFile.Config.SETTING + "=true, or start a new chain";
-            System.out.println("sealer RETAINED-FILE FATAL memberId=" + memberId + " " + why);
-            System.out.flush();
-            retained.close();
-            throw new AgentTerminationException(why);
+            fatal("RETAINED-FILE", why);
         }
+    }
+
+    /**
+     * Stop the member when the restored state does not match the genesis
+     * features of this member, in either direction. A member that replays
+     * the log from position 0 starts at genesis with the setting. So a
+     * snapshot that holds other rules than the setting gives would decide
+     * the entries by other rules than that member, and the state would
+     * fork. A running chain with no setting and no genesis activation
+     * passes.
+     */
+    private void requireGenesisFeatures() {
+        if (!state.matchesGenesis(genesisFeatures)) {
+            fatal("GENESIS-FEATURES", genesisFeatures.refusal("snapshot holds the genesis activations of another"
+                + " set of features: start the member with the setting of this chain"));
+        }
+    }
+
+    /** Log {@code why} as the fatal error {@code kind}, close the retained frames, and end the service agent. */
+    private void fatal(final String kind, final String why) {
+        System.out.println("sealer " + kind + " FATAL memberId=" + memberId + " " + why);
+        System.out.flush();
+        retained.close();
+        throw new AgentTerminationException(why);
     }
 
     /**
@@ -1752,9 +1814,10 @@ public final class SealerClusteredService implements ClusteredService {
         return work;
     }
 
-    /** The leadership term whose start this service applied last, or -1 before any. */
-    long leadershipTermId() {
-        return leadershipTermId;
+    /** The committed term when it matches the member's current consensus term, else -1. */
+    long leadershipTermId(final AtomicCounter currentTerm) {
+        final long appliedTerm = leadershipTermId;
+        return !currentTerm.isClosed() && currentTerm.get() == appliedTerm ? appliedTerm : -1L;
     }
 
     /** Whether this member still holds its outputs after its start. */

@@ -151,8 +151,9 @@ final class SealerEgress {
 
     /** Mark a session as a canonical-stream consumer. */
     void addConsumer(final long sessionId) {
-        consumerSessions.add(sessionId);
-        targetsStale = true;
+        if (consumerSessions.add(sessionId)) {
+            targetsStale = true;
+        }
     }
 
     /**

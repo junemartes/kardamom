@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.function.Function;
 import java.util.stream.Stream;
 
@@ -46,7 +47,7 @@ record StateDir(Path root) {
 
     /** The recording log entry of the latest consensus module snapshot, or empty when there is none. */
     Optional<RecordingLog.Entry> latestSnapshot() {
-        return withRecordingLog(log -> Optional.ofNullable(log.getLatestSnapshot(ConsensusModule.Configuration.SERVICE_ID)));
+        return withRecordingLog(StateDir::latestSnapshotIn);
     }
 
     /** The archive recording of the latest snapshot of the sealer service, or empty when there is none. */
@@ -81,6 +82,32 @@ record StateDir(Path root) {
         }
     }
 
+    /**
+     * The commit position that a relaunch of the member reaches, or empty
+     * when the recording log does not fix it. A relaunch loads the latest
+     * snapshot and replays the member's own log to its end. The log has a
+     * fixed end only when its last term is closed: Aeron closes the term
+     * when it truncates the log to the term base of a new leader, and when
+     * the member stops. An open term grows with its recording. A read that
+     * the recording log refuses gives empty, as in {@link #lastTermId()}.
+     */
+    OptionalLong relaunchPosition() {
+        try {
+            return withRecordingLog(log -> Optional.ofNullable(log.findLastTerm())
+                    .filter(term -> term.logPosition != AeronArchive.NULL_POSITION)
+                    .map(term -> OptionalLong.of(Math.max(term.logPosition,
+                            latestSnapshotIn(log).map(entry -> entry.logPosition).orElse(AeronArchive.NULL_POSITION))))
+                    .orElse(OptionalLong.empty()));
+        } catch (final ClusterException e) {
+            return OptionalLong.empty();
+        }
+    }
+
+    /** The copied log boundary required by a stopped peer backup. */
+    Optional<SeedProgress.Floor> seedFloor() {
+        return withRecordingLog(SeedProgress.Floor::of);
+    }
+
     /** The archive recording id of the Raft log. */
     long logRecordingId() {
         return withRecordingLog(RecordingLog::findLastTermRecordingId);
@@ -98,10 +125,20 @@ record StateDir(Path root) {
 
     /** Delete everything under the directory. Create the directory when it is missing. */
     void clear() {
+        clearContents(true);
+    }
+
+    /** Archive segments and metadata are flat. Nested directories hold independent archives. */
+    void clearArchive() {
+        clearContents(false);
+    }
+
+    private void clearContents(final boolean recursive) {
         try {
             Files.createDirectories(root);
-            try (Stream<Path> paths = Files.walk(root)) {
+            try (Stream<Path> paths = Files.walk(root, recursive ? Integer.MAX_VALUE : 1)) {
                 paths.filter(path -> !path.equals(root))
+                        .filter(path -> recursive || !Files.isDirectory(path))
                         .sorted(Comparator.reverseOrder())
                         .forEach(path -> unchecked(() -> Files.delete(path)));
             }
@@ -118,6 +155,10 @@ record StateDir(Path root) {
         } catch (final IOException ex) {
             throw new UncheckedIOException(ex);
         }
+    }
+
+    private static Optional<RecordingLog.Entry> latestSnapshotIn(final RecordingLog log) {
+        return Optional.ofNullable(log.getLatestSnapshot(ConsensusModule.Configuration.SERVICE_ID));
     }
 
     private <T> T withRecordingLog(final Function<RecordingLog, T> read) {

@@ -1,0 +1,5 @@
+---
+route:
+  receiver: nobody
+receivers:
+  - name: nobody

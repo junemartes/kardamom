@@ -30,12 +30,11 @@ use kardamom_log::aeron_live::{
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::bin::wait_for_shutdown;
-use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::fees::FeeGate;
 use kardamom_sequencer::lookup::LookupRequester;
 use kardamom_sequencer::outbound::SideChannels;
 use kardamom_sequencer::sealer_rules::{SealerRules, SealerVersion};
-use kardamom_sequencer::sequencer::Shutdown;
+use kardamom_sequencer::{SequencerConfig, Shutdown};
 
 /// The Aeron subscriptions and publisher this sequencer needs, all opened
 /// on the same runtime `rt`.
@@ -220,8 +219,8 @@ impl ResyncWiring {
         // Three feeds go into the publish loop's ResyncController:
         //  1. The egress-watermark thread. The cluster broadcasts every
         //     boundary to this publisher session. Decode `end_tx_idx` (the
-        //     global canonical count) into the shared watermark, and discard
-        //     the records.
+        //     global canonical count) into the shared watermark. V2 also
+        //     subscribes to canonical records to release sender prefixes.
         //  2. The receipts thread: tx_receipts to per-sender executed-truth
         //     floors (only this shard's senders).
         //  3. The controller itself, handed to the Sequencer through
@@ -232,11 +231,8 @@ impl ResyncWiring {
             answer_tx,
             deadline_tx,
             watermark,
-        } = kardamom_sequencer::resync::ResyncChannel::open(
-            cfg.resync.clone(),
-            cfg.partition_index,
-        )
-        .context("build resync channel")?;
+        } = kardamom_sequencer::resync::ResyncChannel::for_config(cfg)
+            .context("build resync channel")?;
 
         // The epoch lane reads the same egress: the boundaries confirm its
         // epochs, and an origin-gap reject makes it offer them again.
@@ -362,11 +358,10 @@ impl ResyncWiring {
         let task = feeds::AccountLookupFeed::new(
             rx,
             accounts_tx,
-            live,
-            redis,
-            query,
+            feeds::LookupSources { live, redis, query },
             shutdown.clone(),
             cfg.partition_index,
+            feeds::Retries::covering(cfg.tx_ttl()),
         )
         .spawn();
         (
@@ -591,13 +586,17 @@ async fn main() -> anyhow::Result<()> {
     let cluster_rt =
         AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn cluster AeronRuntime")?;
     let mut cluster_cfg = cfg.cluster.to_live();
-    if let Some(endpoints) = plane.cluster_ingress_endpoints().await? {
+    if let Some(endpoints) = plane
+        .cluster_ingress_endpoints(rt.start_open_limit())
+        .await?
+    {
         cluster_cfg.ingress_endpoints = endpoints;
     }
     let (cluster_guard, cluster_pub, cluster_egress) =
         kardamom_sequencer::outbound::cluster::cluster_ref_publisher_with_egress(
             cluster_rt,
             cluster_cfg,
+            &cfg.admission,
         )
         .context("connect cluster ref publisher")?;
     tracing::info!("kardamom-sequencer: tx_ordering via Aeron Cluster");
@@ -635,11 +634,12 @@ async fn main() -> anyhow::Result<()> {
     // Cloning shares the single session thread, and offers serialize
     // through it. All three loops use `cluster_pub` (it implements
     // `TxOrderingRefPublisher`): the canonical `TxRef` loop and the two
-    // origin pumps.
+    // origin pumps. The v2 loop takes a fenced clone: see
+    // `ClusterRefPublisher::for_publish_loop`.
     let (join_main, join_deposits, join_remote_epochs) = PublishLoops {
         cfg: cfg.clone(),
         tx_data: handles.data_subs,
-        main_pub: cluster_pub.clone(),
+        main_pub: cluster_pub.for_publish_loop(cfg.admission.enabled),
         epoch_pub: cluster_pub.clone(),
         remote_epoch_pub: cluster_pub,
         side: handles

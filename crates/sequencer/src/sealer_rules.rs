@@ -4,7 +4,8 @@
 //!
 //! The sealer sends kind 17 to each session when the session opens, and to
 //! each open session at each new term. The session thread puts a
-//! session-start marker on the egress channel when a session opens, and the
+//! session-start marker on the egress channel when a session opens, also
+//! when a new leader confirms the open session again, and the
 //! two can arrive in either order, so each carries the cluster session id:
 //! a kind 17 that arrives before its marker waits for it.
 //!
@@ -15,38 +16,56 @@
 //! a sealer that refuses them.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
+use alloy_primitives::{Address, B256};
 use kardamom_cluster_adapter::wire::{
     RefRefused, SEALER_V4_DECISION_VERSION, SEALER_V5_DECISION_VERSION,
 };
 use kardamom_types::{DropReason, TxDrop};
 
-use crossbeam_channel::TrySendError;
-
 use crate::metrics;
 use crate::outbound::DropPublisher;
 use crate::v2::AccountEvent;
 
-/// The kept decision version of the sealer, shared between the egress feed
-/// thread, which writes it, and the publish loop, which reads it to choose
-/// the shape of each offer. The default starts at 0.
+/// The kept decision version and session generation of the sealer. The
+/// egress feed writes them. The publish loop reads the version to choose
+/// each offer and samples the generation to recover idle offers. Both
+/// values start at zero.
 #[derive(Clone, Default)]
-pub struct SealerVersion(Arc<AtomicU8>);
+pub struct SealerVersion(Arc<KeptRules>);
+
+#[derive(Default)]
+struct KeptRules {
+    version: AtomicU8,
+    sessions: AtomicU64,
+}
 
 impl SealerVersion {
     /// A version that starts at `floor`, before the first report.
     #[must_use]
     pub fn starting_at(floor: u8) -> Self {
-        Self(Arc::new(AtomicU8::new(floor)))
+        Self(Arc::new(KeptRules {
+            version: AtomicU8::new(floor),
+            sessions: AtomicU64::new(0),
+        }))
     }
 
     fn set(&self, version: u8) {
-        self.0.store(version, Ordering::Release);
+        self.0.version.store(version, Ordering::Release);
     }
 
     fn get(&self) -> u8 {
-        self.0.load(Ordering::Acquire)
+        self.0.version.load(Ordering::Acquire)
+    }
+
+    fn session_started(&self) {
+        // Only change detection uses this counter, so wrapping starts a new generation.
+        self.0.sessions.fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn session_generation(&self) -> u64 {
+        self.0.sessions.load(Ordering::Acquire)
     }
 
     /// Whether the kept version is 4 or newer: the sealer then orders a
@@ -66,8 +85,8 @@ impl SealerVersion {
 
 /// The sealer's rules as this process keeps them. One owner: the egress
 /// feed thread. It exports the kept version as a metric, and shares it
-/// through [`SealerVersion`]. It publishes a drop record for each
-/// reference that the sealer refused, and tells the v2 loop.
+/// through [`SealerVersion`]. V1 publishes refused-reference drops here.
+/// V2 checks the held copy in its account-event loop before it drops it.
 pub struct SealerRules<D> {
     partition: u32,
     shared: SealerVersion,
@@ -77,12 +96,53 @@ pub struct SealerRules<D> {
     early: Option<(i64, u8)>,
     /// The `tx_drops` channel of the lane.
     drops: D,
-    /// The account events of the v2 loop, when it runs: each refusal goes
-    /// there, so the filter forgets the refused run.
+    /// V2 controls share the account-event queue. The consumer owns copy
+    /// matching, suffix retention and publication of each terminal drop.
     refusals: Option<crossbeam_channel::Sender<AccountEvent>>,
 }
 
 impl<D: DropPublisher> SealerRules<D> {
+    /// Canonical hashes release a held sender prefix in the positioned loop.
+    /// Other records do not confirm a transaction, and malformed frames do
+    /// not release publication.
+    pub fn on_canonical_frame(&self, frame: &[u8]) -> bool {
+        use kardamom_cluster_adapter::wire::{self, EgressItem};
+        if !matches!(
+            frame.first(),
+            Some(&(wire::EGRESS_KIND_RELAYED | wire::EGRESS_KIND_RELAYED_REF))
+        ) {
+            return false;
+        }
+        if self.refusals.is_none() || !self.shared.orders_by_position() {
+            return true;
+        }
+        match EgressItem::decode(frame) {
+            Ok(EgressItem::RelayedRef(reference)) => {
+                self.canonical_reference(reference.canonical_id, reference.record_type);
+            }
+            Ok(EgressItem::Tx { tx, .. }) => self.canonical_reference(tx.canonical_id, wire::RT_TX),
+            Ok(EgressItem::Record {
+                msg: kardamom_types::TxOrderingMessage::TxRef(reference),
+                ..
+            }) => {
+                self.canonical_reference(reference.tx_hash, wire::RT_TXREF);
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "canonical confirmation does not decode"),
+        }
+        true
+    }
+
+    fn canonical_reference(&self, hash: B256, record_type: u8) {
+        use kardamom_cluster_adapter::wire;
+        if matches!(
+            record_type,
+            wire::RT_TX | wire::RT_TXREF | wire::RT_TXREF_OFFER
+        ) {
+            self.tell_loop(|| AccountEvent::Canonical(hash));
+        }
+    }
+
     /// Rules that keep the version of `shared`, from its start value.
     #[must_use]
     pub fn new(partition: u32, shared: SealerVersion, drops: D) -> Self {
@@ -107,6 +167,13 @@ impl<D: DropPublisher> SealerRules<D> {
 
     /// The session `session_id` starts. A report that came first for it
     /// sets the version. Otherwise the version stays.
+    ///
+    /// Each marker starts a new session generation, also a marker for the
+    /// same session id. A new leader confirms each open session again
+    /// with the same id, and the session thread then puts a marker on the
+    /// channel. An offer that the old leader took but never appended is
+    /// lost, so the publish loop must offer the unconfirmed runs again. A
+    /// repeated offer is safe: the sealer keeps the first copy.
     pub fn on_session_start(&mut self, session_id: i64) {
         self.session = Some(session_id);
         let report = self
@@ -115,6 +182,7 @@ impl<D: DropPublisher> SealerRules<D> {
             .filter(|(id, _)| *id == session_id)
             .map(|(_, version)| version);
         self.publish(report.unwrap_or(self.shared.get()));
+        self.shared.session_started();
     }
 
     /// The sealer reports `version` for the session `session_id`. A report
@@ -130,10 +198,9 @@ impl<D: DropPublisher> SealerRules<D> {
     }
 
     /// The sealer refused a reference without bytes: it runs `refused`'s
-    /// version. Raise the version to it, count the refusal, and publish a
-    /// drop for the hash, so the client sends the transaction again. Tell
-    /// the v2 loop, so it takes the resend. The sequencer offers nothing
-    /// again by itself.
+    /// version. Raise the version and count the refusal. V1 publishes a
+    /// drop. V2 checks the held copy first: a copy with bytes retries, and
+    /// a copy without bytes drops so the client can resubmit it.
     pub fn on_ref_refused(&mut self, refused: &RefRefused) {
         metrics::record_ref_refused(self.partition);
         tracing::warn!(
@@ -142,35 +209,52 @@ impl<D: DropPublisher> SealerRules<D> {
             sender = ?refused.sender,
             nonce = refused.nonce,
             decision_version = refused.decision_version,
-            "sealer refused a reference without bytes; dropping the transaction"
+            "sealer refused a reference without bytes"
         );
         self.publish(self.shared.get().max(refused.decision_version));
-        self.tell_loop(refused);
-        self.drops.publish_drop(TxDrop {
-            tx_hash: refused.canonical_id,
-            sender: refused.sender,
-            nonce: refused.nonce,
-            reason: DropReason::SealerRefusedReference,
-        });
+        if !self.tell_loop(|| AccountEvent::Refused(Box::new(*refused))) {
+            self.drops.publish_drop(TxDrop {
+                tx_hash: refused.canonical_id,
+                sender: refused.sender,
+                nonce: refused.nonce,
+                reason: DropReason::SealerRefusedReference,
+            });
+        }
     }
 
-    /// Put the refusal on the queue of the v2 loop. A full queue loses it:
-    /// the loss window of the filter then frees the nonce, later.
-    fn tell_loop(&self, refused: &RefRefused) {
-        let event = AccountEvent::Refused {
-            sender: refused.sender,
-            nonce: refused.nonce,
+    /// The contiguity guard of the sealer rejected the reference of
+    /// `sender` at `nonce`, because it expects `expected` (egress kind 5).
+    /// Tell the v2 loop, so it offers the run again from the expected
+    /// nonce.
+    pub fn on_contiguity_reject(&self, sender: Address, nonce: u64, expected: u64) -> bool {
+        self.tell_loop(|| AccountEvent::Rejected {
+            sender,
+            nonce,
+            expected,
+        })
+    }
+
+    /// Route a refusal to v2 when its account queue is wired. V1 keeps its
+    /// terminal-refusal channel. The box lives only on this cold path.
+    #[must_use]
+    pub fn on_refusal(&self, refusal: &crate::resync::SealerRefusal) -> bool {
+        self.tell_loop(|| AccountEvent::Refusal(Box::new(refusal.clone())))
+    }
+
+    /// A full sealer window requests replay without freeing any nonce.
+    pub fn on_window_full(&self, sender: Address, nonce: u64) -> bool {
+        self.tell_loop(|| AccountEvent::Retry { sender, nonce })
+    }
+
+    /// Account events drain even while publication pauses. Backpressure
+    /// keeps a refusal until the loop consumes it. A stopped loop drops
+    /// the receiver and releases this producer.
+    fn tell_loop(&self, event: impl FnOnce() -> AccountEvent) -> bool {
+        let Some(tx) = &self.refusals else {
+            return false;
         };
-        let full = self
-            .refusals
-            .as_ref()
-            .is_some_and(|tx| matches!(tx.try_send(event), Err(TrySendError::Full(_))));
-        if full {
-            tracing::warn!(
-                partition = self.partition,
-                "account event queue full; the refusal waits for the loss window"
-            );
-        }
+        let _ = tx.send(event());
+        true
     }
 
     fn publish(&self, version: u8) {
@@ -188,3 +272,7 @@ impl<D: DropPublisher> SealerRules<D> {
 #[cfg(test)]
 #[path = "sealer_rules_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "canonical_feed_tests.rs"]
+mod canonical_feed_tests;

@@ -74,9 +74,38 @@ impl QueryMethod {
 pub struct QueryAnswer {
     pub value: U256,
     pub block: u64,
-    /// The snapshot's end position, as an index. Zero when the executor
-    /// did not send the header.
+    /// The snapshot's end position: the count of canonical records that
+    /// it holds, one past the index of the last one. Zero when the
+    /// executor did not send the header. Compare it with a row only
+    /// through [`Self::last_record`].
     pub tx_idx: u64,
+}
+
+impl QueryAnswer {
+    /// The position of this answer in the convention of the account rows.
+    ///
+    /// Two conventions name a place in the canonical stream:
+    /// - A receipt carries the index of its own record, from 0. So does
+    ///   every account row made from receipts: the live layer, Redis and
+    ///   the rows of the sequencer's v2 loop.
+    /// - An executor answer carries the end of its snapshot (`tx_idx`):
+    ///   the count of records, one past the index of the last one.
+    ///
+    /// So the state after records 0 to k is at k in a row and at k + 1 in
+    /// an answer. This gives k: the count less one, saturating at 0. Zero
+    /// then names both the empty chain and the state after the first
+    /// record, as it does for the rows. [`Self::has_position`] tells an
+    /// answer with no header apart.
+    #[must_use]
+    pub fn last_record(&self) -> u64 {
+        self.tx_idx.saturating_sub(1)
+    }
+
+    /// Whether the executor sent the position header of its snapshot.
+    #[must_use]
+    pub fn has_position(&self) -> bool {
+        self.tx_idx > 0
+    }
 }
 
 /// Why a query gave no answer. Every endpoint failed; the last reason.

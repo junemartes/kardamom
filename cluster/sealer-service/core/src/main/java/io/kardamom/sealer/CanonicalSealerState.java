@@ -613,7 +613,8 @@ public final class CanonicalSealerState {
      * seed's senders in the seed's order, the eldest first, so the guard
      * keeps the most recent senders up to {@code dedupCapacity}. The
      * remote-origin allowlist is empty: the seed carries no peer anchor,
-     * so a seeded state accepts no remote-origin record.</p>
+     * so a seeded state accepts no remote-origin record. The version
+     * switch is a copy of the rules of the seed.</p>
      *
      * @param seed the parsed seed
      * @param dedupCapacity          hard cap on the window
@@ -643,7 +644,30 @@ public final class CanonicalSealerState {
             ByteBuffer.wrap(sender.address().clone()).asReadOnlyBuffer(), sender.nextNonce()));
         state.seedStatus = SeedStatus.PENDING;
         state.seedDigest = seed.digest().clone();
+        state.versions = seed.rules().copy();
         return state;
+    }
+
+    /**
+     * Start the version switch of a state at genesis with the features
+     * that the chain runs from its genesis: see
+     * {@link VersionSwitch#genesis}. Call it before the first entry, and
+     * only on a state that starts at genesis, not on a restore or a seed.
+     */
+    public void genesisRules(final GenesisFeatures features) {
+        versions = VersionSwitch.genesis(features);
+    }
+
+    /**
+     * Whether a member with the setting {@code features} can hold this
+     * state. A state that started at genesis must hold the switch of a
+     * chain that runs exactly these features from its genesis, because a
+     * member that replays the log from position 0 starts with them. A
+     * seeded state takes its switch from the seed, and a replay starts
+     * from the seed again, so the setting does not decide its rules.
+     */
+    public boolean matchesGenesis(final GenesisFeatures features) {
+        return seedStatus != SeedStatus.GENESIS || versions.matchesGenesis(features);
     }
 
     /**

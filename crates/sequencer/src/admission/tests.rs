@@ -42,6 +42,14 @@ fn tx(who: u8, nonce: u64, unit: u64) -> Candidate<u64> {
     }
 }
 
+/// Another transaction of `who` at `nonce`: a hash that [`tx`] never gives.
+fn other(who: u8, nonce: u64, unit: u64) -> Candidate<u64> {
+    Candidate {
+        tx_hash: B256::repeat_byte(0xee),
+        ..tx(who, nonce, unit)
+    }
+}
+
 fn state(nonce: u64, balance: u64, tx_idx: u64) -> AccountState {
     AccountState {
         nonce,
@@ -57,8 +65,10 @@ fn state(nonce: u64, balance: u64, tx_idx: u64) -> AccountState {
 fn names(out: &[Verdict<u64>]) -> Vec<String> {
     out.iter()
         .map(|v| match v {
-            Verdict::Forward(c) => format!("F{}{}", c.nonce, star(c)),
+            Verdict::Forward(c, _) => format!("F{}{}", c.nonce, star(c)),
             Verdict::Reject(c, r) => format!("R{}{}:{r:?}", c.nonce, star(c)),
+            Verdict::SealerRefused(c, r) => format!("S{}{}:{r:?}", c.nonce, star(c)),
+            Verdict::DropReference(c) => format!("D{}{}", c.nonce, star(c)),
             Verdict::Lookup(_) => "L".to_owned(),
             Verdict::Accept(ack) => format!("A{}", ack.nonce),
         })
@@ -150,12 +160,12 @@ fn a_past_nonce_and_a_nonce_in_flight_are_refused() {
     );
     offer(&mut a, tx(1, 5, 2));
     assert_eq!(
-        offer(&mut a, tx(1, 5, 3)),
+        offer(&mut a, other(1, 5, 3)),
         ["R5:InFlight { expected_nonce: 6 }"]
     );
     offer(&mut a, tx(1, 7, 4));
     assert_eq!(
-        offer(&mut a, tx(1, 7, 5)),
+        offer(&mut a, other(1, 7, 5)),
         ["R7:InFlight { expected_nonce: 6 }"]
     );
 }
@@ -202,7 +212,7 @@ fn a_run_that_no_state_confirms_is_lost_after_the_loss_window() {
     a.on_rows(4, [], &mut out);
     a.sweep(Instant::now(), &mut out);
     assert!(
-        offer(&mut a, tx(1, 5, 3))[0].starts_with("R5:InFlight"),
+        offer(&mut a, tx(1, 5, 3))[0].starts_with("R5:Known"),
         "the window of 3 blocks starts at block 2, the first rows after the forward"
     );
     a.on_rows(5, [], &mut out);
@@ -261,6 +271,55 @@ fn a_parked_transaction_expires_when_it_waited_too_long() {
     assert_eq!(names(&out), ["R9*:Expired { expected_nonce: 5 }"]);
 }
 
+/// A lookup that no source answers ends without an event. The expiry of
+/// the parked transaction ends it in the filter too, so the next
+/// transaction of the sender asks again, and a source that returned in
+/// the meantime can answer it.
+#[test]
+fn a_sender_asks_again_after_its_unanswered_lookup_expired() {
+    let start = Instant::now();
+    let mut a: Admission<u64> = Admission::new(cfg(), start);
+    assert_eq!(offer(&mut a, tx(1, 5, 1)), ["L"]);
+    assert_eq!(
+        offer(&mut a, tx(1, 6, 2)),
+        Vec::<String>::new(),
+        "one lookup is out"
+    );
+    let mut out = Vec::new();
+    a.sweep(start + Duration::from_secs(4), &mut out);
+    assert_eq!(
+        out.len(),
+        2,
+        "both parked transactions expire: {:?}",
+        names(&out)
+    );
+    assert_eq!(offer(&mut a, tx(1, 5, 3)), ["L"], "the sender asks again");
+    a.on_lookup(sender(1), state(5, 10 * COST, 1), &mut out);
+    out.clear();
+    assert_eq!(offer(&mut a, tx(1, 6, 4)), ["F6"]);
+}
+
+/// A relook that no source answers ends without an event too. The
+/// expiry of the parked transaction ends it in the filter, so the next
+/// gap park of the sender relooks again.
+#[test]
+fn a_sender_relooks_again_after_its_unanswered_relook_expired() {
+    let start = Instant::now();
+    let mut a: Admission<u64> = Admission::new(cfg(), start);
+    let mut out = Vec::new();
+    a.on_lookup(sender(1), state(48, 10 * COST, 390), &mut out);
+    offer(&mut a, tx(1, 49, 1));
+    a.sweep(start + Duration::from_millis(600), &mut out);
+    assert_eq!(names(&out), ["L"], "the relook asks");
+    out.clear();
+    a.sweep(start + Duration::from_secs(5), &mut out);
+    assert_eq!(out.len(), 1, "the park expires: {:?}", names(&out));
+    out.clear();
+    offer(&mut a, tx(1, 49, 2));
+    a.sweep(start + Duration::from_millis(5600), &mut out);
+    assert_eq!(names(&out), ["L"], "the next gap park relooks again");
+}
+
 #[test]
 fn a_transaction_that_waits_for_a_lookup_gets_its_ack_with_the_state() {
     let mut a: Admission<u64> = Admission::new(cfg(), Instant::now());
@@ -287,7 +346,7 @@ fn the_rows_of_the_first_transaction_replace_an_answer_of_the_empty_chain() {
     f.on_rows(19, [(sender(1), state(1, 9 * COST, 0))], &mut out);
     out.clear();
     f.offer(tx(1, 1, 2), &mut out);
-    assert!(matches!(out.as_slice(), [Verdict::Forward(c)] if c.nonce == 1));
+    assert!(matches!(out.as_slice(), [Verdict::Forward(c, _)] if c.nonce == 1));
 }
 
 /// A transaction forwarded before any rows came is not lost when the
@@ -303,7 +362,7 @@ fn the_loss_window_starts_at_the_first_rows_after_the_forward() {
     f.sweep(Instant::now(), &mut out);
     assert_eq!(
         offer(&mut f, tx(1, 0, 2)),
-        ["R0:InFlight { expected_nonce: 1 }"],
+        ["R0:Known { expected_nonce: 1 }"],
         "still forwarded"
     );
     let window = cfg().loss_blocks.get();
@@ -353,7 +412,7 @@ fn a_gap_over_rows_does_not_ask_again() {
 fn a_refused_transaction_can_be_sent_again_at_once() {
     let mut a = known(state(5, 2 * COST, 1));
     offer(&mut a, tx(1, 5, 1));
-    assert!(offer(&mut a, tx(1, 5, 2))[0].starts_with("R5:InFlight"));
+    assert!(offer(&mut a, tx(1, 5, 2))[0].starts_with("R5:Known"));
     let mut out = Vec::new();
     a.on_refused(sender(1), 5, &mut out);
     assert_eq!(names(&out), [] as [&str; 0]);
@@ -367,5 +426,139 @@ fn a_refusal_of_another_nonce_keeps_the_run() {
     offer(&mut a, tx(1, 5, 1));
     a.on_refused(sender(1), 9, &mut Vec::new());
     a.on_refused(sender(2), 5, &mut Vec::new());
-    assert!(offer(&mut a, tx(1, 5, 2))[0].starts_with("R5:InFlight"));
+    assert!(offer(&mut a, tx(1, 5, 2))[0].starts_with("R5:Known"));
+}
+
+/// The filter keeps each forwarded transaction until a state confirms it.
+/// A lost run keeps nothing.
+#[test]
+fn the_filter_keeps_the_unconfirmed_run_until_a_state_confirms_it() {
+    let mut a = known(state(5, 9 * COST, 1));
+    (5..8).for_each(|n| {
+        offer(&mut a, tx(1, n, n));
+    });
+    let payloads =
+        |a: &Admission<u64>| -> Vec<u64> { a.unconfirmed().map(|c| c.payload).collect() };
+    assert_eq!(payloads(&a), [5, 6, 7]);
+    assert_eq!(a.unconfirmed_at(sender(1), 6).map(|c| c.nonce), Some(6));
+    assert!(a.unconfirmed_at(sender(1), 8).is_none());
+    assert!(a.unconfirmed_at(sender(2), 6).is_none());
+
+    a.on_rows(1, [(sender(1), state(6, 9 * COST, 2))], &mut Vec::new());
+    assert_eq!(payloads(&a), [6, 7]);
+    assert!(a.unconfirmed_at(sender(1), 5).is_none());
+
+    a.on_refused(sender(1), 7, &mut Vec::new());
+    assert_eq!(payloads(&a), [] as [u64; 0]);
+}
+
+/// The executor answers the state after records 0 and 1 (nonce 2) with
+/// the end of its snapshot, the record count 2. The row of record 2
+/// (nonce 3) carries the record's own index, 2. The answer must sit at
+/// record 1, so that the row is newer and frees the transactions parked
+/// behind nonce 2, which executed in record 2.
+#[test]
+fn the_row_of_the_next_record_is_newer_than_an_executor_answer() {
+    let answer = |value: u64| kardamom_cache::QueryAnswer {
+        value: U256::from(value),
+        block: 1,
+        tx_idx: 2,
+    };
+    let state = AccountState::of_answers(&answer(2), &answer(10 * COST)).unwrap();
+    assert_eq!(state.tx_idx, 1, "the answer sits at its last record");
+    let mut a = Admission::new(cfg(), Instant::now());
+    let mut out = Vec::new();
+    assert_eq!(offer(&mut a, tx(1, 3, 1)), ["L"]);
+    offer(&mut a, tx(1, 4, 2));
+    a.on_lookup(sender(1), state, &mut out);
+    assert_eq!(names(&out), ["A3", "A4"], "parked behind nonce 2");
+    out.clear();
+    a.on_rows(1, [(sender(1), self::state(3, 10 * COST, 2))], &mut out);
+    assert_eq!(
+        names(&out),
+        ["F3*", "F4*"],
+        "the row of record 2 frees the run"
+    );
+}
+
+/// A client sends a parked or a forwarded transaction again after a
+/// timeout. The copy is known: the filter holds that very transaction, and
+/// the copy drops nothing. Another transaction at the nonce is in flight,
+/// and its refusal drops it.
+#[test]
+fn a_copy_of_a_held_transaction_is_known_and_drops_nothing() {
+    let mut a = known(state(5, 10 * COST, 1));
+    offer(&mut a, tx(1, 5, 1));
+    offer(&mut a, tx(1, 7, 2));
+    assert_eq!(
+        offer(&mut a, tx(1, 5, 3)),
+        ["R5:Known { expected_nonce: 6 }"],
+        "a copy of the forwarded one"
+    );
+    assert_eq!(
+        offer(&mut a, tx(1, 7, 4)),
+        ["R7:Known { expected_nonce: 6 }"],
+        "a copy of the parked one"
+    );
+    assert!(!super::Refusal::Known { expected_nonce: 6 }.drops());
+    assert!(super::Refusal::InFlight { expected_nonce: 6 }.drops());
+}
+
+/// The floor seam: a row of a sender with no state sets nothing. The
+/// sender keeps its lookup, and a lookup answer sets the first state.
+#[cfg(feature = "floor-seams")]
+#[test]
+fn with_the_floor_seam_a_row_sets_no_first_state_and_only_a_lookup_does() {
+    let mut a = Admission::new(cfg(), Instant::now());
+    let mut out = Vec::new();
+    assert!(
+        a.waits_for_lookup(sender(1), &mut out),
+        "an unknown sender waits"
+    );
+    assert!(out.is_empty(), "a sender with no parked work asks nothing");
+    assert_eq!(offer(&mut a, tx(1, 3, 1)), ["L"]);
+    assert!(a.waits_for_lookup(sender(1), &mut out));
+    assert!(out.is_empty(), "one lookup is out");
+    a.on_lookup(sender(1), state(3, 10 * COST, 1), &mut out);
+    assert_eq!(names(&out), ["F3"]);
+    out.clear();
+    assert!(
+        !a.waits_for_lookup(sender(1), &mut out),
+        "a known sender takes its rows"
+    );
+}
+
+/// The floor seam after a rollback: the cleared sender waits for a lookup
+/// again, and its parked work asks one.
+#[cfg(feature = "floor-seams")]
+#[test]
+fn with_the_floor_seam_a_rollback_makes_the_sender_wait_for_a_lookup_again() {
+    let mut a = known(state(5, 10 * COST, 1));
+    assert_eq!(offer(&mut a, tx(1, 7, 1)), ["A7"]);
+    a.on_rollback();
+    let mut out = Vec::new();
+    assert!(a.waits_for_lookup(sender(1), &mut out));
+    assert_eq!(names(&out), ["L"]);
+}
+
+/// An executor answer with a count of 1 holds record 0 only, so it sits at
+/// record 0. The row of record 0 is the same state and is not newer. The
+/// row of record 1 is newer.
+#[test]
+fn an_answer_of_one_record_sits_at_record_0_and_the_row_of_record_1_is_newer() {
+    let answer = |value: u64| kardamom_cache::QueryAnswer {
+        value: U256::from(value),
+        block: 1,
+        tx_idx: 1,
+    };
+    let held = AccountState::of_answers(&answer(1), &answer(10 * COST)).unwrap();
+    assert_eq!(held.tx_idx, 0);
+    assert!(
+        !state(1, 10 * COST, 0).is_newer_than(&held),
+        "the row of record 0"
+    );
+    assert!(
+        state(2, 10 * COST, 1).is_newer_than(&held),
+        "the row of record 1"
+    );
 }

@@ -68,7 +68,7 @@ pub use envelope::TxEnvelope;
 pub use epoch::{DepositLog, EpochError, EpochRecord, derive_epoch};
 pub use exec_record::ExecTxRecord;
 pub use fees::{BlockFees, FeeSchedule, TxFees};
-pub use genesis::{AllocEntry, Genesis, GenesisError};
+pub use genesis::{AllocEntry, Genesis, GenesisAlloc, GenesisError};
 pub use l1_block::{BatchEntry, L1Block, L1BlockDedup};
 pub use position::{BPosition, TxDataLoc};
 pub use prover::{

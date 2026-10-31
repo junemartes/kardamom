@@ -1,6 +1,6 @@
 //! CLI surface of the executor binary (schema + docs). The runtime wiring
-//! lives in `main.rs`; state recovery in `state.rs`; role adapters in
-//! `wiring.rs`.
+//! lives in `main.rs`; state recovery in `kardamom_executor::state`; role
+//! adapters in `wiring.rs`.
 
 use std::num::{NonZeroU64, NonZeroUsize, ParseIntError};
 use std::path::PathBuf;
@@ -8,6 +8,7 @@ use std::str::FromStr;
 
 use clap::Parser;
 use kardamom_engine::bin_support::StateDurabilityArg;
+use kardamom_executor::state::{BlockLogConfig, StateConfig};
 
 /// Default `--checkpoint-keep`.
 const DEFAULT_CHECKPOINT_KEEP: NonZeroUsize = NonZeroUsize::new(3).unwrap();
@@ -252,6 +253,25 @@ pub(crate) struct Args {
 }
 
 impl Args {
+    /// The settings of the state backend. The block log is on only with
+    /// `--checkpoint-log`.
+    pub(crate) fn state_config(&self) -> StateConfig {
+        StateConfig {
+            state_dir: self.state_dir.clone(),
+            durability: self.state_durability.into(),
+            checkpoint_dir: self.checkpoint_dir.clone(),
+            checkpoint_peers: self.checkpoint_peers.clone(),
+            checkpoint_interval_secs: self.checkpoint_interval_secs.0,
+            checkpoint_keep: self.checkpoint_keep,
+            block_log: self.checkpoint_log.then_some(BlockLogConfig {
+                base_log_percent: self.checkpoint_base_log_percent,
+                base_max_age_secs: self.checkpoint_base_max_age_secs,
+                copy_mib_per_sec: self.checkpoint_copy_mib_per_sec,
+                segment_mib: self.checkpoint_log_segment_mib,
+            }),
+        }
+    }
+
     /// The executor id that the recorded cursor goes out under: the void
     /// voter id with `--exec-cursor` on, `None` with it off.
     ///
@@ -329,13 +349,16 @@ mod tests {
 
     #[test]
     fn the_block_log_is_off_by_default_and_needs_a_checkpoint_dir() {
-        use crate::state::CheckpointLog;
+        use kardamom_executor::state::CheckpointLog;
         use kardamom_state::checkpoint::copy_rate::CopyRate;
         let off = parse(&["--checkpoint-dir", "/c"]);
-        assert!(CheckpointLog::of(&off).unwrap().is_none(), "off by default");
+        assert!(
+            CheckpointLog::of(&off.state_config()).unwrap().is_none(),
+            "off by default"
+        );
         let no_dir = parse(&["--checkpoint-log"]);
         assert!(
-            CheckpointLog::of(&no_dir).unwrap().is_none(),
+            CheckpointLog::of(&no_dir.state_config()).unwrap().is_none(),
             "no directory"
         );
         let on = parse(&[
@@ -345,7 +368,7 @@ mod tests {
             "--checkpoint-copy-mib-per-sec",
             "8",
         ]);
-        let log = CheckpointLog::of(&on).unwrap().expect("on");
+        let log = CheckpointLog::of(&on.state_config()).unwrap().expect("on");
         assert_eq!(log.log.dir, std::path::Path::new("/c/log"));
         assert_eq!(log.log.segment_bytes.get(), 64 << 20);
         assert_eq!(

@@ -305,6 +305,8 @@ pub(crate) struct Compare {
     /// The fingerprint of the first frame of the block that the comparison
     /// reads now.
     head: Option<B256>,
+    /// Checked restart frames wait until the whole comparison succeeds.
+    frames: Vec<Vec<u8>>,
 }
 
 impl Compare {
@@ -316,6 +318,7 @@ impl Compare {
             equal_block: false,
             raised: false,
             head: None,
+            frames: Vec::new(),
         }
     }
 
@@ -342,6 +345,7 @@ impl Compare {
         self.reorder = Self::reorder_at(self.history.floor);
         self.equal_block = false;
         self.head = None;
+        self.frames.clear();
     }
 
     /// The progress of a difference at the floor.
@@ -389,12 +393,19 @@ impl Compare {
     ///
     /// Returns `Err` when the pending set fails: a cursor overflow, or a
     /// boundary that seals below the cursor.
-    pub(crate) fn drain(&mut self) -> Result<Progress, ExecutorError> {
+    pub(crate) fn drain(&mut self, tee: &mut super::Forward) -> Result<Progress, ExecutorError> {
         loop {
-            let Some(progress) = self.step()? else {
+            let Some(progress) = self.step(tee)? else {
                 continue;
             };
             return Ok(progress);
+        }
+    }
+
+    /// The checked history anchors a restarted copy in the existing egress head.
+    pub(crate) fn forward(self, tee: &mut super::Forward) {
+        for frame in self.frames {
+            tee.send(&frame);
         }
     }
 
@@ -414,7 +425,7 @@ impl Compare {
 
     /// Compare one frame. `None` when the frame is equal and the
     /// comparison needs more frames.
-    fn step(&mut self) -> Result<Option<Progress>, ExecutorError> {
+    fn step(&mut self, tee: &mut super::Forward) -> Result<Option<Progress>, ExecutorError> {
         if self.reached() {
             return Ok(Some(Progress::Equal));
         }
@@ -427,6 +438,7 @@ impl Compare {
         }
         let Some((block, index)) = self.check(pos, &item) else {
             self.equal_block |= item.is_boundary();
+            self.frames.extend(tee.take(pos, &item));
             return Ok(None);
         };
         let divergence = Divergence {

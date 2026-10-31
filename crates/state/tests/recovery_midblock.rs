@@ -1,12 +1,5 @@
-//! Recovery. Drop the writer after some commits, reopen the env, and
-//! assert that the recovery point matches the last committed block, and
-//! that the post-recovery snapshot still serves the right values.
-//!
-//! Note: a true mid-block crash is hard to provoke from Rust, because
-//! `mdbx_txn_commit` is atomic. The realistic invariant this test
-//! checks: any uncommitted transaction is discarded, and whichever
-//! block is last committed, the snapshot is internally consistent for
-//! that block.
+//! Graceful recovery. Shutdown drains queued writes before the environment reopens.
+//! The separate `writer_crash` target kills a process at real transaction boundaries.
 
 mod common;
 
@@ -19,7 +12,7 @@ fn recovery_point_matches_last_committed_block() {
     let dir = tempfile::tempdir().unwrap();
     let addr = address!("0x00000000000000000000000000000000000000aa");
 
-    // --- run 1: commit blocks 1..=3, then drop ---
+    // Commit the first three blocks, then drain the fourth during shutdown.
     {
         let env = common::open_env(dir.path());
         let mut writer = StateWriter::spawn(env).unwrap();
@@ -40,37 +33,23 @@ fn recovery_point_matches_last_committed_block() {
         // Wait for block 3, so the three commits landed. Three commits
         // can arrive as fewer than three wakes.
         common::wait_for_block(&writer, 3);
-        // Submit a 4th delta, then immediately shut down. The writer may
-        // or may not have committed it. This test asserts resilience
-        // either way.
-        let _ = writer
+        writer
             .delta_tx
-            .send(common::simple_delta(4, addr, 9999, 7, 9999));
+            .send(common::simple_delta(4, addr, 9999, 7, 9999))
+            .unwrap();
         writer.shutdown().unwrap();
     }
 
-    // --- run 2: reopen, and assert recovery point and snapshot consistency ---
     let env = common::open_env(dir.path());
 
     let rp = read_recovery_point(&env).unwrap();
-    // The writer may have committed block 4 before shutdown. Either 3 or
-    // 4 is acceptable. What matters is internal consistency for that block.
-    assert!(
-        rp.last_committed_block == 3 || rp.last_committed_block == 4,
-        "expected 3 or 4, got {}",
-        rp.last_committed_block
-    );
+    assert_eq!(rp.last_committed_block, 4);
 
     let snap = StateSnapshot::open(&env).unwrap();
     let (_, balance, _) = snap.basic(addr).unwrap().unwrap();
-    // Block 3 gives balance 1003. Block 4 gives balance 9999.
-    let slot = snap.storage(addr, common::slot_key(7)).unwrap();
-    if balance == U256::from(1003u64) {
-        assert_eq!(slot, U256::from(300u64), "block 3 consistency");
-        assert_eq!(rp.last_committed_block, 3);
-    } else {
-        assert_eq!(balance, U256::from(9999u64));
-        assert_eq!(slot, U256::from(9999u64), "block 4 consistency");
-        assert_eq!(rp.last_committed_block, 4);
-    }
+    assert_eq!(balance, U256::from(9999u64));
+    assert_eq!(
+        snap.storage(addr, common::slot_key(7)).unwrap(),
+        U256::from(9999u64)
+    );
 }

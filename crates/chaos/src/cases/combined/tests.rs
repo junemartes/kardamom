@@ -4,11 +4,12 @@ use super::checks::{Lookups, Terms};
 use super::refill::{Refill, RefillWatch, Refills, WatcherRuns};
 use super::*;
 use crate::Shard;
+use crate::probes::Boundaries;
 
 /// Every ordering case, in the shard's run order.
 const ALL: [Combined; 5] = [
-    INGRESS_SEQUENCER,
     INGRESS_SEALER,
+    INGRESS_SEQUENCER,
     SEQUENCER_SEALER,
     ALL_THREE,
     ALL_THREE_REVERSE,
@@ -137,60 +138,112 @@ fn started_nodes_count_as_back_when_their_job_reaches_its_count() {
 #[test]
 fn every_job_that_returned_is_checked_for_a_restart_at_the_end() {
     assert_eq!(
-        ALL_THREE.restart_proofs(),
+        ALL_THREE.placed(ExecutorNodes::Executor).restart_proofs(),
         [Class::Ingress, Class::Sequencer]
     );
-    assert_eq!(INGRESS_SEALER.restart_proofs(), [Class::Ingress]);
     assert_eq!(
-        INGRESS_SEQUENCER.restart_proofs(),
+        INGRESS_SEALER
+            .placed(ExecutorNodes::Executor)
+            .restart_proofs(),
+        [Class::Ingress]
+    );
+    assert_eq!(
+        INGRESS_SEQUENCER
+            .placed(ExecutorNodes::Executor)
+            .restart_proofs(),
         [Class::Ingress, Class::Sequencer]
     );
     // A stopped job is a restored job, so it is checked too; killed
     // nodes are judged by their count.
     assert_eq!(
-        READ_PATH.restart_proofs(),
+        READ_PATH.placed(ExecutorNodes::Executor).restart_proofs(),
         [Class::Executor, Class::Redis, Class::StateMirror]
     );
-    assert_eq!(EXECUTOR_SEALER.restart_proofs(), Vec::<Class>::new());
-    assert_eq!(INGRESS_EXECUTOR.restart_proofs(), [Class::Ingress]);
+    assert_eq!(
+        EXECUTOR_SEALER
+            .placed(ExecutorNodes::Executor)
+            .restart_proofs(),
+        Vec::<Class>::new()
+    );
+    assert_eq!(
+        INGRESS_EXECUTOR
+            .placed(ExecutorNodes::Executor)
+            .restart_proofs(),
+        [Class::Ingress]
+    );
+}
+
+#[test]
+fn on_the_sealer_nodes_the_executors_and_the_members_go_down_by_task() {
+    let carry = |c: Combined| c.placed(ExecutorNodes::Sealer);
+    // The executors return a minute before the members, and wait.
+    let placed = carry(EXECUTOR_SEALER);
+    assert_eq!(placed.down, [Class::Executor, Class::SealerTasks]);
+    assert_eq!(
+        Recovery::Reverse(Duration::from_secs(60))
+            .plan(&placed.down)
+            .into_iter()
+            .flat_map(|w| w.classes)
+            .collect::<Vec<_>>(),
+        [Class::Executor, Class::SealerTasks]
+    );
+    assert_eq!(
+        placed.restart_proofs(),
+        [Class::Executor, Class::SealerTasks]
+    );
+    assert!(placed.executors_down() && placed.sealers_down());
+    assert_eq!(
+        carry(EXECUTOR_SEALER_VALIDATOR).down,
+        [Class::Executor, Class::SealerTasks, Class::Validator]
+    );
+    assert_eq!(
+        carry(INGRESS_EXECUTOR).down,
+        [Class::Executor, Class::Ingress]
+    );
+    // A node kill of the members alone also takes the executors on the
+    // nodes, so the case waits for their exporters.
+    let sealers = carry(INGRESS_SEALER);
+    assert_eq!(sealers.down, [Class::Ingress, Class::Sealer]);
+    assert!(sealers.executors_down());
+    assert!(
+        !INGRESS_SEALER
+            .placed(ExecutorNodes::Executor)
+            .executors_down()
+    );
+    assert_eq!(Class::SealerTasks.job(), "cluster");
+    assert_eq!(Class::SealerTasks.fault_kind(), FaultKind::KillTasks);
+}
+
+/// A reading with no member answer.
+fn progress(block: i64, applied: Option<i64>) -> Progress {
+    Progress {
+        block,
+        boundaries: None,
+        applied,
+    }
 }
 
 #[test]
 fn the_expectations_judge_two_readings() {
-    let flat = Progress {
-        block: 100,
-        applied: Some(5000),
-    };
-    let sealed = Progress {
-        block: 103,
-        applied: Some(5000),
-    };
-    let applied = Progress {
-        block: 103,
-        applied: Some(5010),
-    };
+    let flat = progress(100, Some(5000));
+    let sealed = progress(103, Some(5000));
+    let applied = progress(103, Some(5010));
     // No executor answers: nothing is applied, and the head still tells
     // a stall from a seal.
-    let dark = Progress {
-        block: 103,
-        applied: None,
-    };
+    let dark = progress(103, None);
     assert!(Expect::Stall.judge(flat, flat).is_ok());
     assert!(Expect::SealOnly.judge(flat, dark).is_ok());
     assert!(Expect::Stall.judge(dark, dark).is_ok());
     assert!(Expect::Stall.judge(flat, dark).is_err());
     // A head that reads lower is not a seal: a source of it went dark.
-    let lower = Progress {
-        block: 99,
-        applied: None,
-    };
+    let lower = progress(99, None);
     assert!(
         Expect::SealOnly
             .judge(flat, lower)
             .unwrap_err()
             .contains("no block was sealed")
     );
-    assert_eq!(dark.describe(), "head 103, applied ?");
+    assert_eq!(dark.describe(), "head 103, sealer boundaries ?, applied ?");
     assert!(
         Expect::Stall
             .judge(flat, sealed)
@@ -211,6 +264,43 @@ fn the_expectations_judge_two_readings() {
             .contains("a user transaction was applied")
     );
     assert!(Expect::Stall.observed(flat, flat).contains("STALLED"));
+}
+
+#[test]
+fn a_seal_only_outage_with_no_client_is_judged_by_the_members() {
+    // The executors and the ingresses are down, and the validator reads a
+    // feed that only the executors fill: the head stays flat.
+    let at = |count: Option<i64>| Progress {
+        block: 931,
+        boundaries: count.map(Boundaries::Members),
+        applied: None,
+    };
+    assert!(
+        Expect::SealOnly
+            .judge(at(Some(4810)), at(Some(4870)))
+            .is_ok()
+    );
+    let why = Expect::SealOnly
+        .judge(at(Some(4810)), at(Some(4810)))
+        .unwrap_err();
+    assert_eq!(
+        why,
+        "no block was sealed while the sealers were up (head 931, sealer boundaries 4810, applied ? -> head 931, sealer boundaries 4810, applied ?)"
+    );
+    // One reading with no member answer proves no seal.
+    assert!(Expect::SealOnly.judge(at(None), at(Some(4870))).is_err());
+    assert!(Expect::SealOnly.judge(at(Some(4810)), at(None)).is_err());
+    // A user transaction still fails the case while the members tick.
+    let applied = |boundaries, n| Progress {
+        applied: Some(n),
+        ..at(Some(boundaries))
+    };
+    assert!(
+        Expect::SealOnly
+            .judge(applied(4810, 5000), applied(4870, 5010))
+            .unwrap_err()
+            .contains("a user transaction was applied")
+    );
 }
 
 #[test]
@@ -353,6 +443,40 @@ fn a_restart_is_judged_by_its_driver_loss() {
     assert!(moved.judge(&base).unwrap().is_some());
 }
 
+/// The starts that find no live driver after a driver loss are part of
+/// that loss. With no driver loss, they explain nothing.
+#[test]
+fn a_start_with_no_live_driver_after_a_loss_is_part_of_the_loss() {
+    let alloc = || "c683773a-aac6-9a63-af79-0d4889810fca".to_string();
+    let base = WatcherRuns::new([(alloc(), 0)], "start\n");
+    let loss = exit_line(
+        "08:24:33",
+        "MediaDriver keepalive: age=30009ms > timeout=30000ms",
+    );
+    let no_cnc = "Error: spawn AeronRuntime\n    [aeron_client_connect_to_driver, aeronc.c:59] CnC file not created: /opt/kardamom/aeron-mount/dir/cnc.dat\n";
+    let no_beat = "Error: spawn events runtime\n    [aeron_client_connect_to_driver, aeronc.c:119] no driver heartbeat detected after: 30000ms\n";
+    let after_loss = format!("start\n{loss}\n{no_cnc}{no_cnc}{no_beat}");
+    let note = WatcherRuns::new([(alloc(), 4)], &after_loss)
+        .judge(&base)
+        .unwrap()
+        .unwrap();
+    assert!(note.contains("starts with no live driver: 3"), "{note}");
+    let one_more = WatcherRuns::new([(alloc(), 5)], &after_loss)
+        .judge(&base)
+        .unwrap_err();
+    assert!(
+        one_more.contains("a driver loss explains 4 of the 5 restarts"),
+        "{one_more}"
+    );
+    let no_loss = WatcherRuns::new([(alloc(), 1)], &format!("start\n{no_cnc}"))
+        .judge(&base)
+        .unwrap_err();
+    assert!(
+        no_loss.contains("a driver loss explains 0 of the 1 restarts"),
+        "{no_loss}"
+    );
+}
+
 #[test]
 fn a_floor_is_looked_up_when_a_park_asked_and_a_source_answered() {
     let asked_and_answered = Lookups {
@@ -381,9 +505,31 @@ fn a_floor_is_looked_up_when_a_park_asked_and_a_source_answered() {
 #[test]
 fn the_tables_are_the_shards() {
     let names = |table: &[Combined]| -> Vec<&str> { table.iter().map(|c| c.case.name()).collect() };
-    assert_eq!(names(&ALL), Shard::CombinedOrdering.cases());
-    // The sequencer-and-Redis row runs by name only.
-    assert_eq!(names(&ALL_EXEC[..4]), Shard::CombinedExec.cases());
+    // A table case runs on its shard, in table order, or on the nightly
+    // shard.
+    let on = |table: &[Combined], shard: Shard| -> Vec<&str> {
+        names(table)
+            .into_iter()
+            .filter(|n| shard.cases().contains(n))
+            .collect()
+    };
+    assert_eq!(
+        on(&ALL, Shard::CombinedOrdering),
+        Shard::CombinedOrdering.cases()
+    );
+    assert_eq!(
+        on(&ALL_EXEC, Shard::CombinedExec),
+        Shard::CombinedExec.cases()
+    );
+    assert!(names(&ALL).iter().chain(&names(&ALL_EXEC)).all(|n| {
+        [
+            Shard::CombinedOrdering,
+            Shard::CombinedExec,
+            Shard::Integrity,
+        ]
+        .iter()
+        .any(|shard| shard.cases().contains(n))
+    }));
     for c in ALL.iter().chain(&ALL_EXEC) {
         // A stall needs the sealers down; a seal-only case keeps them.
         assert_eq!(
@@ -413,4 +559,19 @@ fn the_tables_are_the_shards() {
         .map(Class::count),
         [3, 3, 1, 3, 5, 4, 2]
     );
+}
+
+#[test]
+fn floor_answers_include_both_versions_of_the_committed_live_layer() {
+    for source in ["local", "live", "redis", "ok"] {
+        let metrics = format!(
+            "kardamom_sequencer_nonce_lookup_requests_total{{partition=\"0\"}} 2\n\
+             kardamom_sequencer_nonce_lookups_total{{partition=\"0\",outcome=\"{source}\"}} 1\n"
+        );
+        assert!(Lookups::parse(&metrics).looked_up(), "{source}");
+    }
+    let failed = "kardamom_sequencer_nonce_lookup_requests_total 3\n\
+        kardamom_sequencer_nonce_lookups_total{outcome=\"error\"} 2\n\
+        kardamom_sequencer_nonce_lookups_total{outcome=\"timeout\"} 1\n";
+    assert!(!Lookups::parse(failed).looked_up());
 }

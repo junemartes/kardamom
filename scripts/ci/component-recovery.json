@@ -1,0 +1,4612 @@
+{
+  "version": 1,
+  "policy": "A local boundary test is partial evidence for its distributed case. No case is complete until all listed invariants, real dependencies and negative controls are validated. Do not replace final-head chaos qualification with this inventory. The chaos recovery probe at the end of each case (10 s at 50 tx/s per leg, a floor of 125 accepted submits) proves the liveness of both ingresses, not their throughput.",
+  "local_suites": {
+    "sequencer": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-sequencer",
+        "--test",
+        "component_recovery"
+      ],
+      "real": [
+        "AdmissionLoop::run",
+        "ClusterRefPublisher",
+        "SealerRules",
+        "production ingress/egress wire codecs",
+        "two racing AdmissionLoop replicas per lane with per-process metrics",
+        "AccountLookupFeed with the ExecutorQuery HTTP client",
+        "EgressWatermarkFeed over a LiveEgress session channel, with the boundary-freshness metric"
+      ],
+      "controlled": [
+        "bounded tx_data channel",
+        "account lookup replies",
+        "cluster ingress acceptance/disconnect/backpressure",
+        "canonical feed delivery",
+        "sealer with first-seen dedup, contiguity guard and RelayedRef relay to each session",
+        "executor rows per ordered transaction and a loopback executor query that hangs or answers",
+        "replica freeze, graceful stop and hard kill with all ports cut"
+      ],
+      "tests": [
+        "output_backpressure_and_disconnect_recover_without_new_client_input",
+        "lost_offer_on_session_restart_replays_the_exact_prefix_before_its_suffix",
+        "absent_lookup_reply_holds_the_sender_until_the_real_account_event_arrives",
+        "stalled_input_resumes_and_permanent_input_close_stops_the_actor",
+        "delayed_canonical_input_fills_the_outbox_then_resumes_in_order",
+        "a_permanent_output_encoding_failure_is_reported_instead_of_retried",
+        "shutdown_completes_while_output_is_disconnected",
+        "a_graceful_replica_stop_keeps_the_lane_ordering_and_its_restart_rejoins",
+        "a_hard_replica_kill_loses_no_offer_and_its_cold_restart_rejoins",
+        "each_restarted_replica_orders_an_established_sender_while_its_twin_is_frozen",
+        "a_lapsed_replica_publishes_fresh_work_after_thaw_while_its_twin_ordered",
+        "a_lookup_blackout_fails_lookups_while_the_cluster_feed_lives_then_answers"
+      ],
+      "negative_controls": {
+        "lost_session_replay": {
+          "test": "lost_offer_on_session_restart",
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "disconnect_accepted": {
+          "test": "output_backpressure_and_disconnect",
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "permanent_error_retried": {
+          "test": "a_permanent_output_encoding_failure",
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "lookup_request_dropped": {
+          "mutation": "The v2 loop never sends a lookup request.",
+          "tests": [
+            "a_graceful_replica_stop_keeps_the_lane_ordering_and_its_restart_rejoins",
+            "a_hard_replica_kill_loses_no_offer_and_its_cold_restart_rejoins",
+            "each_restarted_replica_orders_an_established_sender_while_its_twin_is_frozen",
+            "a_lapsed_replica_publishes_fresh_work_after_thaw_while_its_twin_ordered"
+          ],
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "lapse_backlog_ignored": {
+          "mutation": "The v2 loop ignores canonical and row events.",
+          "test": "a_lapsed_replica_publishes_fresh_work_after_thaw_while_its_twin_ordered",
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "lookup_answer_not_delivered": {
+          "mutation": "The account lookup task drops each answer.",
+          "test": "a_lookup_blackout_fails_lookups_while_the_cluster_feed_lives_then_answers",
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "boundary_freshness_not_marked": {
+          "mutation": "The egress feed does not set the boundary-freshness metric on a boundary.",
+          "test": "a_lookup_blackout_fails_lookups_while_the_cluster_feed_lives_then_answers",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      },
+      "ci_mode": "in-process"
+    },
+    "sequencer-resize": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-sequencer",
+        "--test",
+        "resize_handoff"
+      ],
+      "real": [
+        "the v1 Sequencer core of each lane replica, with its vslot set, old-lane reads and shadow warm-up",
+        "ShardMap identity and rebalance, and lane_for routing",
+        "the resync controller and its receipt floors",
+        "the signed envelopes of the testkit"
+      ],
+      "controlled": [
+        "the ingress: one map version at a time, routing each sender by ShardMap::lane_for",
+        "the sealer: first-seen dedup of every replica offer",
+        "the executors: every ordered transaction as a receipt floor to every replica, and the committed floors for a started replica",
+        "a 300-ms transaction lifetime and a 500-ms warm-up"
+      ],
+      "tests": [
+        "a_scale_out_and_in_with_a_killed_new_replica_orders_every_nonce_once"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "a replica in shadow mode offers its incoming slots",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "a_scale_out_and_in_with_a_killed_new_replica_orders_every_nonce_once"
+          ]
+        },
+        {
+          "mutation": "a receipt floor does not raise the floor of its sender",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "a_scale_out_and_in_with_a_killed_new_replica_orders_every_nonce_once"
+          ]
+        }
+      ],
+      "limitation": "Replicas are in-process; no Aeron, no Java sealer contiguity guard, no v2 admission loop. The ingress map roll and the Nomad scale steps stay in the chaos shard.",
+      "ci_mode": "in-process"
+    },
+    "executor-commit": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-engine",
+        "--lib",
+        "actor::commit_tests::"
+      ],
+      "real": [
+        "CommitLoop production thread",
+        "must-deliver suffix retry",
+        "publication escalation"
+      ],
+      "controlled": [
+        "receipt publication outcomes",
+        "subscriber visibility",
+        "publication reopen"
+      ],
+      "tests": [
+        "commit_thread_preserves_order",
+        "commit_thread_retries_until_delivered",
+        "commit_thread_batches_queued_receipts_and_flushes_on_boundary",
+        "commit_thread_resumes_batch_at_failed_suffix",
+        "commit_thread_fail_stops_on_a_fatal_error",
+        "commit_thread_reopens_an_unconnected_publication_once_and_delivers",
+        "commit_thread_escalates_only_while_a_subscriber_is_listed",
+        "commit_thread_exits_after_the_total_budget_without_a_subscriber",
+        "the_rollback_goes_out_before_the_first_receipt"
+      ],
+      "limitation": "These existing actor tests do not prove disk durability or process/node recovery. Their blocking joins are bounded by the runner process timeout.",
+      "ci_mode": "in-process"
+    },
+    "executor-pipeline": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-engine",
+        "--lib",
+        "actor::exec_pipeline_tests::"
+      ],
+      "real": [
+        "execution actor",
+        "REVM execution",
+        "pipelined commit settlement"
+      ],
+      "controlled": [
+        "state snapshots",
+        "state-writer durability signal",
+        "reader and commit channels"
+      ],
+      "tests": [
+        "exec_pipelines_commit_and_next_block_reads_parent_layer",
+        "exec_pipelines_k_deep_and_blocks_only_at_capacity",
+        "exec_settles_inflight_commits_while_idle"
+      ],
+      "limitation": "These existing actor tests do not prove disk durability or process/node recovery. Their blocking joins are bounded by the runner process timeout.",
+      "ci_mode": "in-process"
+    },
+    "executor-recovery": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-executor",
+        "--test",
+        "recovery"
+      ],
+      "real": [
+        "kardamom_executor::state: checkpoint restore ladder, env open, resume cursor and checkpoint rounds, shared with the binary",
+        "Executor reader, exec and commit threads with REVM",
+        "StateWriter, block log and durable MDBX in each process",
+        "ClusterTxOrderingSubscription and the production egress codec, replay cursor and replay-unavailable repair",
+        "checkpoint server and peer fetch over real HTTP, nonce and receipt query server over real HTTP",
+        "Prometheus exporter with /metrics and the /ready rule of the binary",
+        "batcher pack_blocks, recon::reconstruct, reconstruct_state and strip_to_executor_image",
+        "three or four executor processes, each a child process with SIGTERM and SIGKILL",
+        "IngressProxy receipt lookup with the executor query client"
+      ],
+      "controlled": [
+        "the sealer: a retained log of production egress frames, read through one replay session per process, with a retention floor and an absent-member switch",
+        "the receipt stream: one line per receipt and boundary in a file",
+        "a 3-transaction-per-block load sealed every 40 ms",
+        "storage on tmpfs when it has room; a process kill keeps the page cache, so the fault is the same",
+        "a bad build: a start whose genesis file is absent"
+      ],
+      "tests": [
+        "a_graceful_stop_resumes_from_the_durable_cursor_without_loss_or_duplicate",
+        "replica::a_killed_replica_resumes_from_its_disk_while_its_peers_progress",
+        "replica::a_blank_replacement_fetches_a_peer_checkpoint_and_catches_up",
+        "replica::a_wiped_replica_restores_a_copied_donor_checkpoint",
+        "replica::a_wiped_replica_behind_the_window_fetches_a_peer_base_and_log",
+        "replica::a_cursor_below_the_retention_floor_stages_a_peer_checkpoint_in_process",
+        "replica::a_failed_start_keeps_the_state_and_a_rolling_heal_converges",
+        "replica::ten_stop_and_start_rounds_advance_every_replica_each_round",
+        "whole::a_whole_fleet_kill_resumes_each_replica_from_its_own_disk",
+        "whole::a_whole_fleet_wipe_restores_each_replica_from_its_local_checkpoint",
+        "whole::a_total_wipe_resumes_every_replica_from_a_rebuilt_da_image",
+        "whole::a_corrupt_local_checkpoint_is_quarantined_before_a_peer_restore",
+        "whole::executors_that_return_before_the_sealers_wait_and_then_catch_up",
+        "replica::a_wiped_replica_restores_a_copied_donor_base_and_log",
+        "whole::returned_ingresses_serve_a_pre_fault_receipt_from_executor_state"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "the restart ignores the persisted cursor and replays from genesis",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "a_graceful_stop_resumes_from_the_durable_cursor_without_loss_or_duplicate",
+            "replica::ten_stop_and_start_rounds_advance_every_replica_each_round",
+            "whole::a_whole_fleet_kill_resumes_each_replica_from_its_own_disk",
+            "replica::a_failed_start_keeps_the_state_and_a_rolling_heal_converges",
+            "replica::a_killed_replica_resumes_from_its_disk_while_its_peers_progress",
+            "whole::executors_that_return_before_the_sealers_wait_and_then_catch_up"
+          ]
+        },
+        {
+          "mutation": "a corrupt local checkpoint is not quarantined",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "whole::a_corrupt_local_checkpoint_is_quarantined_before_a_peer_restore"
+          ]
+        },
+        {
+          "mutation": "a fresh state directory is not restored from a checkpoint",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "replica::a_wiped_replica_restores_a_copied_donor_checkpoint",
+            "replica::a_blank_replacement_fetches_a_peer_checkpoint_and_catches_up",
+            "whole::a_whole_fleet_wipe_restores_each_replica_from_its_local_checkpoint",
+            "replica::a_wiped_replica_behind_the_window_fetches_a_peer_base_and_log",
+            "replica::a_wiped_replica_restores_a_copied_donor_base_and_log"
+          ]
+        },
+        {
+          "mutation": "the replay-unavailable repair stages no peer checkpoint",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "replica::a_cursor_below_the_retention_floor_stages_a_peer_checkpoint_in_process"
+          ]
+        },
+        {
+          "mutation": "the rebuilt image keeps its trie",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "whole::a_total_wipe_resumes_every_replica_from_a_rebuilt_da_image"
+          ]
+        },
+        {
+          "mutation": "the committed-state query answers no receipt",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "whole::returned_ingresses_serve_a_pre_fault_receipt_from_executor_state"
+          ]
+        }
+      ],
+      "limitation": "Each node is a real process with real storage, but the canonical stream comes from a controlled sealer log, not Aeron Cluster members, and the receipts go to a file, not Aeron. No Nomad, Consul, Docker node, image rollout or network identity. The DA image comes from the production batch codec and reconstruction, but not from an L1 scan or the DA HTTP store. A process kill keeps the page cache: no power loss.",
+      "ci_mode": "in-process"
+    },
+    "ingress-sealer-quorum": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-ingress",
+        "--lib",
+        "chain::tests::"
+      ],
+      "real": [
+        "ChainWatch of the ingress: the sealer silence budget and the SealerNoQuorum halt",
+        "the submit root that pauses submits on a sealer halt"
+      ],
+      "controlled": [
+        "the status frames of the cluster session and the clock of each check"
+      ],
+      "tests": [
+        "chain::tests::a_silent_cluster_halts_the_sealer_on_a_lost_quorum_and_a_status_ends_it"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "a silent cluster raises no halt",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "chain::tests::a_silent_cluster_halts_the_sealer_on_a_lost_quorum_and_a_status_ends_it"
+          ]
+        }
+      ],
+      "limitation": "The watch, not a whole ingress process or a real cluster session.",
+      "ci_mode": "in-process"
+    },
+    "executor-driver-late-start": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-executor",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "driver_late_start",
+        "--",
+        "--ignored",
+        "--exact",
+        "an_executor_started_before_its_driver_waits_and_opens_its_streams"
+      ],
+      "real": [
+        "the kardamom-executor binary, started before its media driver",
+        "AeronRuntime start with the wait for an active driver: the CnC file and the driver heartbeat",
+        "the exec stream publication and its local recording on the late driver"
+      ],
+      "controlled": [
+        "the media driver and archive container, started 12 s after the executor",
+        "an unreachable cluster endpoint, so the executor waits in its session loop"
+      ],
+      "tests": [
+        "an_executor_started_before_its_driver_waits_and_opens_its_streams"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "the client start skips the wait for an active driver",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "an_executor_started_before_its_driver_waits_and_opens_its_streams"
+          ]
+        }
+      ],
+      "limitation": "One executor on one host. The Nomad restart of the node and its image pulls stay in the chaos shard.",
+      "ci_mode": "stack"
+    },
+    "executor-exec-stream": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-executor",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "recovery",
+        "--",
+        "--ignored",
+        "--exact",
+        "stream::restarted_replicas_record_new_sessions_and_live_cursors_keep_moving"
+      ],
+      "real": [
+        "the executor-recovery processes",
+        "ExecStream: the recorded IPC publication, the local archive recording and the publisher thread",
+        "Aeron media driver and archive in one disposable container",
+        "exec stream session and recorded-index gauges on /metrics"
+      ],
+      "controlled": [
+        "three executors share one media driver",
+        "one graceful stop and one SIGKILL"
+      ],
+      "tests": [
+        "stream::restarted_replicas_record_new_sessions_and_live_cursors_keep_moving"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "the recorded cursor ignores the archive recording position",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "stream::restarted_replicas_record_new_sessions_and_live_cursors_keep_moving"
+          ]
+        }
+      ],
+      "limitation": "One driver for all executors, not one per node. The recorded cursor goes to /metrics, not to a sealer session; the sealer side is in sealer-record-lag.",
+      "ci_mode": "docker"
+    },
+    "sealer-record-lag": {
+      "command": [
+        "cluster/sealer-service/gradlew",
+        "-p",
+        "cluster/sealer-service",
+        ":core:test",
+        "--tests",
+        "io.kardamom.sealer.RecordLagGuardTest",
+        ":service:test",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerRecordLagTest",
+        "--no-daemon",
+        "--rerun-tasks"
+      ],
+      "junit_reports": [
+        "cluster/sealer-service/core/build/test-results/test/TEST-io.kardamom.sealer.RecordLagGuardTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerRecordLagTest.xml"
+      ],
+      "tests": [
+        "io.kardamom.sealer.RecordLagGuardTest::the_best_cursor_is_the_maximum_over_the_executors()",
+        "io.kardamom.sealer.RecordLagGuardTest::the_guard_resumes_when_the_best_cursor_moves_up()",
+        "io.kardamom.sealer.RecordLagGuardTest::a_cursor_from_a_stranger_or_past_the_head_is_refused()",
+        "io.kardamom.sealer.RecordLagGuardTest::a_version_11_restore_drops_the_cursor_of_a_removed_executor()",
+        "io.kardamom.sealer.RecordLagGuardTest::a_version_11_snapshot_loads_with_its_cursors()",
+        "io.kardamom.sealer.cluster.SealerRecordLagTest::the_recorded_cursor_frame_matches_the_rust_encoder()",
+        "io.kardamom.sealer.cluster.SealerRecordLagTest::a_cursor_that_moves_the_best_up_broadcasts_the_status_tail()",
+        "io.kardamom.sealer.cluster.SealerRecordLagTest::a_move_of_the_best_cursor_prints_the_log_line_at_power_of_two_counts()"
+      ],
+      "real": [
+        "CanonicalSealerState and RecordedCursors",
+        "SealerClusteredService with the recorded-cursor wire frame"
+      ],
+      "controlled": [
+        "stub sessions and direct cursor offers from several executors"
+      ],
+      "limitation": "The best cursor over the executors, without real executors or Aeron Cluster members.",
+      "negative_controls": [
+        {
+          "mutation": "the best cursor follows the last offered cursor instead of the maximum",
+          "exit_code": 1,
+          "compiled": true,
+          "failed_tests": [
+            "io.kardamom.sealer.RecordLagGuardTest::the_best_cursor_is_the_maximum_over_the_executors()",
+            "io.kardamom.sealer.RecordLagGuardTest::a_version_11_snapshot_loads_with_its_cursors()",
+            "io.kardamom.sealer.cluster.SealerRecordLagTest::a_cursor_that_moves_the_best_up_broadcasts_the_status_tail()",
+            "io.kardamom.sealer.cluster.SealerRecordLagTest::a_move_of_the_best_cursor_prints_the_log_line_at_power_of_two_counts()"
+          ]
+        }
+      ],
+      "ci_mode": "gradle"
+    },
+    "executor-checkpoint-enospc": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-executor",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "recovery",
+        "--",
+        "--ignored",
+        "--exact",
+        "disk::a_full_checkpoint_volume_keeps_the_same_executor_committing_and_recovers"
+      ],
+      "real": [
+        "the executor-recovery process in one disposable container",
+        "checkpoint base rounds and the block log thread on a 16-MiB tmpfs",
+        "Linux tmpfs returning ENOSPC",
+        "checkpoint restore with block-log replay",
+        "/metrics block and applied-transaction counters"
+      ],
+      "controlled": [
+        "the filler write that exhausts the tmpfs, and its removal",
+        "the host loader and libraries, mounted read-only",
+        "one base each second"
+      ],
+      "tests": [
+        "disk::a_full_checkpoint_volume_keeps_the_same_executor_committing_and_recovers"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "a failed checkpoint base round ends the process",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "disk::a_full_checkpoint_volume_keeps_the_same_executor_committing_and_recovers"
+          ]
+        }
+      ],
+      "limitation": "One executor; the state stays on the host. No Nomad mount patch, EIO or power loss.",
+      "ci_mode": "docker"
+    },
+    "executor-total-wipe-l1": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-executor",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "recovery",
+        "--",
+        "--ignored",
+        "--exact",
+        "l1::a_total_wipe_resumes_every_replica_from_an_image_rebuilt_from_l1"
+      ],
+      "real": [
+        "Anvil with the deployed KardamomL2Settlement",
+        "the batcher pack and post_batch to L1",
+        "DaStore served over HTTP and DaProxy reads",
+        "read_posted_batches, recover_blocks, Reconstruction and strip_to_executor_image",
+        "the executor-recovery processes"
+      ],
+      "controlled": [
+        "four L2 blocks per posted batch",
+        "no lockbox: the chain has no deposits"
+      ],
+      "tests": [
+        "l1::a_total_wipe_resumes_every_replica_from_an_image_rebuilt_from_l1"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "the BatchPosted scan drops the newest batch",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "l1::a_total_wipe_resumes_every_replica_from_an_image_rebuilt_from_l1"
+          ]
+        }
+      ],
+      "limitation": "The rebuild calls the library functions of kardamom-reconstruct, not its binary. No EigenDA, indexer or lockbox epochs.",
+      "ci_mode": "docker"
+    },
+    "transport-mds-remove": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-log",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "mds_remove_destination",
+        "--",
+        "--ignored",
+        "--exact",
+        "removing_receive_destinations_keeps_the_live_images_and_logs_no_driver_error"
+      ],
+      "real": [
+        "Aeron 1.45 media driver (the deployed version)",
+        "one manual MDS subscription with four dynamic MDC destinations",
+        "destination removal, rejoin and node return while two streams run",
+        "Aeron ErrorStat on the driver error log"
+      ],
+      "controlled": [
+        "four publishers on one host",
+        "400 frames on each live stream"
+      ],
+      "tests": [
+        "removing_receive_destinations_keeps_the_live_images_and_logs_no_driver_error"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "a destination removal detaches every destination of the subscription",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "removing_receive_destinations_keeps_the_live_images_and_logs_no_driver_error"
+          ]
+        }
+      ],
+      "limitation": "One driver on one host; the #545 crash was on Aeron 1.44 across hosts and does not reproduce here.",
+      "ci_mode": "docker"
+    },
+    "state-mirror-total-loss": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-state-mirror",
+        "--features",
+        "docker-e2e",
+        "component_tests::total_loss::",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "Mirror::run and Rebuild with a 1,025-account checkpoint",
+        "AccountCache over Sentinel discovery",
+        "CacheReader degraded reads",
+        "Redis primary, replica and three Sentinels with no persistence",
+        "three mirrors and two CacheReader instances with the production degraded and lookup counters"
+      ],
+      "controlled": [
+        "docker kill of all five containers for 11 s, then a start in the first order",
+        "a newer checkpoint written after the loss, as the executors do"
+      ],
+      "tests": [
+        "mirror::component_tests::total_loss::a_total_loss_rebuilds_every_account_and_the_readers_recover",
+        "mirror::component_tests::total_loss::the_whole_read_path_returns_in_reverse_order_and_every_mirror_rebuilds"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "a write outage past the bound schedules no rebuild",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "mirror::component_tests::total_loss::a_total_loss_rebuilds_every_account_and_the_readers_recover"
+          ]
+        },
+        {
+          "mutation": "a cold Redis does not start a rebuild",
+          "exit_code": 101,
+          "compiled": true,
+          "failed_tests": [
+            "mirror::component_tests::total_loss::the_whole_read_path_returns_in_reverse_order_and_every_mirror_rebuilds"
+          ]
+        }
+      ],
+      "limitation": "The mirrors are fed by encoded frames instead of Aeron, and the executors stand in as a newer checkpoint and a live batch. Fixed host ports stand in for stable service addresses.",
+      "ci_mode": "docker"
+    },
+    "cache-sentinel-total-loss": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-cache",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "sentinel_recovery",
+        "--",
+        "--ignored",
+        "--exact",
+        "a_total_loss_returns_an_empty_group_and_the_same_cache_client_recovers"
+      ],
+      "real": [
+        "production AccountCache and Sentinel discovery",
+        "Redis primary, replica and three Sentinels with no persistence"
+      ],
+      "controlled": [
+        "docker kill and start of all five containers on fixed host ports"
+      ],
+      "tests": [
+        "a_total_loss_returns_an_empty_group_and_the_same_cache_client_recovers"
+      ],
+      "limitation": "Container restart, not Nomad placement.",
+      "ci_mode": "docker"
+    },
+    "ingress-accounts": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-ingress",
+        "--test",
+        "account_cache_test"
+      ],
+      "real": [
+        "IngressProxy admission",
+        "LiveAccounts",
+        "account JSON-RPC handlers"
+      ],
+      "controlled": [
+        "transaction channels",
+        "receipt/account updates",
+        "executor HTTP replies"
+      ],
+      "tests": [
+        "an_unknown_sender_is_admitted",
+        "a_past_nonce_without_a_receipt_publishes",
+        "an_unfunded_sender_is_rejected_and_a_funded_one_admitted",
+        "an_expired_entry_admits",
+        "the_receipt_cache_answers_a_retry_before_the_nonce_check",
+        "a_skip_receipt_leaves_its_nonce_open",
+        "a_burning_skip_receipt_uses_its_nonce",
+        "a_cold_unfunded_sender_is_refused_with_one_query",
+        "a_lagging_executor_answer_admits",
+        "an_answer_before_the_first_head_admits",
+        "a_cold_funded_sender_or_a_failed_query_admits",
+        "checks_off_admits_an_unfunded_sender",
+        "the_account_rpcs_serve_the_local_layer_and_only_the_head",
+        "a_receipt_hash_helper_is_the_keccak_of_the_raw_bytes"
+      ],
+      "limitation": "Redis is off; this does not prove Redis Lua atomicity or partial-cache coverage.",
+      "ci_mode": "in-process"
+    },
+    "ingress-receipts": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-ingress",
+        "--test",
+        "receipt_fallback_test"
+      ],
+      "real": [
+        "IngressProxy receipt lookup",
+        "executor query HTTP client",
+        "receipt codec"
+      ],
+      "controlled": [
+        "egress and executor HTTP endpoints: holds, null, 503, silent"
+      ],
+      "tests": [
+        "an_old_receipt_the_egress_lacks_comes_from_the_executor",
+        "a_new_receipt_comes_from_the_egress_with_no_second_query",
+        "a_hash_that_no_executor_knows_stays_null",
+        "a_failed_egress_falls_back_to_the_executor",
+        "with_no_egress_the_executor_answers_alone"
+      ],
+      "limitation": "These endpoint stubs do not run the egress store or executor state database.",
+      "ci_mode": "in-process"
+    },
+    "ingress-da-halt": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-ingress",
+        "--test",
+        "da_lag_test"
+      ],
+      "real": [
+        "ingress RPC server",
+        "chain status watcher",
+        "halt/pause propagation"
+      ],
+      "controlled": [
+        "cluster status input",
+        "submission transport"
+      ],
+      "tests": [
+        "the_tags_follow_the_posted_head_and_a_halt_refuses_submits"
+      ],
+      "limitation": "Cluster status is controlled; actual sealer posting budget and L1 posting remain unproven here.",
+      "ci_mode": "in-process"
+    },
+    "egress-owner": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-egress",
+        "--lib",
+        "owner::tests::"
+      ],
+      "real": [
+        "Owner",
+        "Merge",
+        "real temporary Store",
+        "retention and restart paths"
+      ],
+      "controlled": [
+        "canonical input copies",
+        "posted/final head inputs",
+        "live publication sink",
+        "10-block retention window and 10-block store segments",
+        "paused clock across two one-hour sync intervals"
+      ],
+      "tests": [
+        "delivered_frames_go_out_live_and_a_read_finds_them_stored",
+        "the_run_ends_when_every_sender_is_gone",
+        "a_drop_that_both_twins_report_is_one_status",
+        "a_receipt_after_a_drop_wins",
+        "a_refused_reference_is_dropped_until_the_receipt_of_the_twin",
+        "a_drop_after_the_receipt_changes_nothing",
+        "the_distance_counts_the_records_above_the_stored_head",
+        "with_no_peer_the_stream_starts_after_a_boundary",
+        "the_frames_of_a_peer_join_the_copies",
+        "a_peer_floor_above_the_head_starts_the_stream_there",
+        "a_peer_floor_raises_the_mark_to_the_mark_of_the_peer",
+        "a_reference_in_the_frames_of_a_peer_raises_the_mark",
+        "after_the_peers_give_up_a_boundary_starts_the_stream",
+        "a_frozen_posted_head_keeps_every_block_above_it_past_the_window",
+        "the_prune_follows_the_lower_of_the_posted_head_and_the_final_head",
+        "unposted_blocks_remain_replayable_after_pruning_and_a_restart",
+        "a_small_retention_window_prunes_only_after_sync_and_segment_boundaries"
+      ],
+      "limitation": "Covers real local storage reopen, not power-loss durability or network deployment.",
+      "negative_controls": [
+        {
+          "mutation": "prune at the maximum posted/final head instead of their minimum",
+          "test": "the_prune_follows_the_lower_of_the_posted_head_and_the_final_head",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      ],
+      "clock_negative_controls": [
+        {
+          "experiment": "mixed_egress_clock",
+          "test": "a_small_retention_window_prunes_only_after_sync_and_segment_boundaries",
+          "exit_code": 101,
+          "assertion_failed": true,
+          "seconds": 1.918
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "egress-catchup": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-egress",
+        "--lib",
+        "catchup::tests::"
+      ],
+      "real": [
+        "CatchUp task",
+        "HTTP client",
+        "Owner"
+      ],
+      "controlled": [
+        "real peer egress HTTP server with canonical history",
+        "unreachable peer endpoint",
+        "late canonical copies"
+      ],
+      "tests": [
+        "a_restarted_egress_joins_the_copies_from_a_peer",
+        "with_no_answer_the_task_gives_up_and_a_boundary_starts_the_stream",
+        "no_peer_makes_no_task",
+        "the_mark_of_a_peer_reads_from_its_headers_and_defaults_to_none"
+      ],
+      "limitation": "Validates exact peer history and resumed live input plus unreachable-peer fallback; does not establish crash durability or all-peer divergence handling.",
+      "ci_mode": "in-process"
+    },
+    "batcher-recovery": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-batcher",
+        "--lib",
+        "live::feed::tests::recovery::"
+      ],
+      "real": [
+        "FeedLoop",
+        "LiveSender",
+        "real temporary Spool and cursor",
+        "DA HTTP client and payload packing"
+      ],
+      "controlled": [
+        "L1 provider replies",
+        "DA HTTP 503 endpoint",
+        "live reader records"
+      ],
+      "tests": [
+        "a_restored_post_is_reconciled_before_live_blocks_can_extend_it",
+        "a_foreign_post_still_stops_recovery_before_any_live_block_is_consumed",
+        "an_exhausted_restored_post_keeps_its_spool_and_does_not_absorb_live_blocks",
+        "an_empty_spool_keeps_the_live_group_together"
+      ],
+      "limitation": "Does not run L1 contracts, consensus retention or a successful DA service.",
+      "ci_mode": "in-process"
+    },
+    "l1-source-quorum": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-da-watcher",
+        "--test",
+        "l1_sources"
+      ],
+      "real": [
+        "L1Sources agreement, rotation and backoff"
+      ],
+      "controlled": [
+        "independent scripted L1 source replies",
+        "paused clock immediately before and at a one-hour backoff deadline"
+      ],
+      "tests": [
+        "two_sources_that_agree_serve_the_block_and_the_lowest_tip",
+        "a_member_without_a_finalized_block_holds_the_tip_back",
+        "one_liar_halts_the_read_with_both_answers_and_the_counter",
+        "a_rate_limited_source_rotates_out_and_the_rest_continue",
+        "one_live_source_of_two_is_short_of_the_quorum",
+        "every_source_out_halts",
+        "a_rotated_source_returns_after_the_backoff",
+        "the_light_client_settles_a_disagreement_and_rotates_the_liar_out",
+        "a_silent_light_client_falls_back_to_the_public_quorum",
+        "a_single_source_is_trusted_alone",
+        "log_queries_are_cross_checked",
+        "a_source_halt_names_its_halt_cause",
+        "a_header_batch_needs_two_agreeing_sources",
+        "an_endpoint_name_never_carries_the_key",
+        "a_rotated_source_waits_until_the_nonzero_backoff_deadline"
+      ],
+      "limitation": "Scripted providers do not prove real HTTP behavior or watcher halt publication.",
+      "clock_negative_controls": [
+        {
+          "experiment": "mixed_backoff_clock",
+          "test": "a_rotated_source_waits_until_the_nonzero_backoff_deadline",
+          "exit_code": 101,
+          "assertion_failed": true,
+          "seconds": 2.525
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "l1-provider-http": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-da-watcher",
+        "--test",
+        "l1_batch_headers"
+      ],
+      "real": [
+        "RpcL1Source HTTP parsing",
+        "L1Sources per-source deadlines"
+      ],
+      "controlled": [
+        "real local HTTP endpoints with batched replies or no response",
+        "paused clock after both real HTTP requests reach the fault proxy, then across the unchanged 30-second read timeout and two-second backoff"
+      ],
+      "tests": [
+        "unresponsive_sources_cannot_hold_the_follower_read_forever",
+        "a_range_of_headers_is_one_request",
+        "a_lie_in_the_batch_reaches_the_header"
+      ],
+      "limitation": "This is provider-boundary evidence; no external L1, consensus or deployment is used.",
+      "negative_controls": [
+        {
+          "mutation": "remove the production per-source read deadline",
+          "test": "unresponsive_sources_cannot_hold_the_follower_read_forever",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      ],
+      "clock_negative_controls": [
+        {
+          "experiment": "missing_request_deadline",
+          "test": "unresponsive_sources_cannot_hold_the_follower_read_forever",
+          "exit_code": 101,
+          "assertion_failed": true,
+          "seconds": 3.582
+        },
+        {
+          "experiment": "shortened_request_deadline",
+          "test": "unresponsive_sources_cannot_hold_the_follower_read_forever",
+          "exit_code": 101,
+          "assertion_failed": true,
+          "seconds": 3.439
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "l1-watcher-recovery": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-da-watcher",
+        "--test",
+        "l1_follow"
+      ],
+      "real": [
+        "L1Watcher processing",
+        "BoundaryFeed",
+        "real CursorFile"
+      ],
+      "controlled": [
+        "scripted archived L1 records",
+        "epoch publisher",
+        "sealer-origin feed"
+      ],
+      "tests": [
+        "the_file_holds_the_confirmed_origin_not_the_last_publish",
+        "a_restart_in_the_publish_to_commit_window_loses_no_epoch",
+        "epochs_no_boundary_confirms_are_published_again_after_the_timeout",
+        "an_origin_that_moves_back_is_followed",
+        "a_start_resumes_after_the_sealer_origin_below_the_file",
+        "an_origin_ahead_of_the_head_is_followed_without_a_republish",
+        "two_watchers_publish_identical_copies_and_follow_one_origin",
+        "a_full_window_stops_new_publishes_and_drops_nothing",
+        "a_spawned_watcher_resumes_after_the_first_boundary",
+        "a_silent_sealer_at_start_falls_back_to_the_file",
+        "the_boundary_feed_sends_each_new_origin"
+      ],
+      "limitation": "Process reconstruction is in-process; no OS crash or real Raft commit is simulated.",
+      "ci_mode": "in-process"
+    },
+    "l1-watcher-pause": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-da-watcher",
+        "--test",
+        "l1_pause"
+      ],
+      "real": [
+        "spawned L1Watcher task",
+        "lifecycle pause propagation",
+        "real CursorFile"
+      ],
+      "controlled": [
+        "archived record availability",
+        "epoch publisher"
+      ],
+      "tests": [
+        "a_watcher_without_its_record_pauses_on_the_follower_and_resumes"
+      ],
+      "limitation": "Validates pause/resume for missing archived records, not transport deployment.",
+      "ci_mode": "in-process"
+    },
+    "state-mirror": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-state-mirror",
+        "--bin",
+        "kardamom-state-mirror",
+        "--features",
+        "docker-e2e",
+        "component_tests::recovery::",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "Mirror::run",
+        "TxReceiptsReceiver production frame decoder",
+        "Rebuild with real 1,025-account MDBX checkpoint",
+        "AccountCache and Redis Lua scripts",
+        "one disposable Redis process from the existing testcontainers fixture"
+      ],
+      "controlled": [
+        "encoded receipt frames instead of Aeron",
+        "Redis ACL refusal after 512 accounts or within a live batch",
+        "actor cancellation and replacement",
+        "SCRIPT FLUSH"
+      ],
+      "tests": [
+        "interrupted_partial_rebuild_restores_untouched_accounts_without_regressing_live_rows",
+        "partial_live_batch_retries_without_new_input_and_publishes_head_last",
+        "script_loss_and_older_replica_frames_preserve_newest_account_state",
+        "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close",
+        "a_transient_head_read_timeout_does_not_end_the_recovery_wait"
+      ],
+      "negative_controls": {
+        "regressing_rows": {
+          "test": "interrupted_partial_rebuild_restores_untouched_accounts_without_regressing_live_rows",
+          "exit_code": 101,
+          "failed_as_expected": true
+        },
+        "premature_head": {
+          "test": "partial_live_batch_retries_without_new_input_and_publishes_head_last",
+          "exit_code": 101,
+          "failed_as_expected": true
+        }
+      },
+      "limitation": "The partial-scan target forces rebuilding; state-mirror-coverage-gap separately proves automatic recovery from a persisted incomplete-rebuild marker. No Sentinel promotion, process kill, disk failure or packet-loss proof.",
+      "ci_mode": "docker"
+    },
+    "state-mirror-coverage-gap": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-state-mirror",
+        "--bin",
+        "kardamom-state-mirror",
+        "--features",
+        "docker-e2e",
+        "component_tests::coverage_gap::",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "same production mirror/checkpoint/Redis fixture as state-mirror"
+      ],
+      "controlled": [
+        "partial scan interrupted after 512 of 1,025 accounts",
+        "another mirror publishes position 30",
+        "automatic replacement without force_rebuild"
+      ],
+      "tests": [
+        "automatic_restart_must_restore_coverage_despite_another_live_head",
+        "persisted_progress_cannot_hide_an_interrupted_rebuild"
+      ],
+      "limitation": "Proves automatic recovery of this mirror after interrupted rebuilding, with or without a persisted head. No claim of shared bucket certification, cache failover durability, or recovery after loss of the mirror data directory.",
+      "ci_mode": "docker"
+    },
+    "checkpoint-copy": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "checkpoint_copy::tests::",
+        "--",
+        "--include-ignored"
+      ],
+      "real": [
+        "StateWriter and MDBX checkpoint",
+        "disposable Docker container with tmpfs",
+        "CheckpointCopy exec/tar transfer",
+        "production checkpoint manifest and image verifier"
+      ],
+      "controlled": [
+        "ordinary rootfs versus tmpfs source path",
+        "removed manifest",
+        "GNU tar read-status and warning contract"
+      ],
+      "tests": [
+        "a_tmpfs_checkpoint_is_copied_and_verified_in_the_container_mount_namespace",
+        "a_live_log_growth_warning_is_the_only_tolerated_archive_read_failure",
+        "missing_files_and_mixed_archive_errors_fail_the_copy"
+      ],
+      "limitation": "Proves the harness can verify a checkpoint on the fault volume. It does not prove executor progress during ENOSPC, disk/power-loss durability, or pruning races. The container starts only a bounded sleep process, not chain services.",
+      "negative_control": "The Docker fixture asserts that the old docker cp path fails on the same tmpfs whose exec/tar copy verifies successfully.",
+      "ci_mode": "docker"
+    },
+    "sealer-actor": {
+      "command": [
+        "cluster/sealer-service/gradlew",
+        "-p",
+        "cluster/sealer-service",
+        ":service:test",
+        "--no-daemon",
+        "--rerun-tasks",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerFanoutTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerCarryWindowTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest"
+      ],
+      "junit_reports": [
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerFanoutTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerSeedServiceTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerCarryWindowTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerCarryActivationTest.xml"
+      ],
+      "tests": [
+        "io.kardamom.sealer.cluster.SealerFanoutTest::batchEntriesProcessLikeIndividualRecords()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::contiguityGapRejectsToOfferingSessionOnly()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::zeroSenderIsGuardExempt()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::broadcastsToAllWhileNoConsumerAnnounced()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::relaysOnlyToAnnouncedConsumers()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::boundariesStayBroadcastToEverySession()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::closedConsumerLeavesTheSetAndEmptySetRestoresBroadcast()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::origin_record_relays_id_and_fields_with_no_trailing_slack()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::origin_record_consumes_its_declared_slot_range()",
+        "io.kardamom.sealer.cluster.SealerFanoutTest::an_origin_gap_is_answered_to_the_offering_session_only()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::a_consumer_at_the_seed_head_resumes_at_e_h_and_h_plus_one()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::the_first_boundary_is_h_plus_one_and_the_first_record_is_e_h()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::each_term_offers_the_seed_record_until_one_confirms_it()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::a_snapshot_keeps_the_seed_and_its_confirmation()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::a_seed_record_with_another_digest_stops_the_member()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::a_member_started_at_genesis_stops_on_the_seed_record()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::a_seed_record_from_a_client_is_dropped()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::a_seed_with_interop_on_is_refused()",
+        "io.kardamom.sealer.cluster.SealerSeedServiceTest::the_node_reads_no_seed_when_the_property_is_unset_and_refuses_a_missing_file()",
+        "io.kardamom.sealer.cluster.SealerCarryWindowTest::below_version_five_the_frames_above_the_posted_head_stay()",
+        "io.kardamom.sealer.cluster.SealerCarryWindowTest::version_five_keeps_only_the_window_at_any_posted_head()",
+        "io.kardamom.sealer.cluster.SealerCarryWindowTest::version_five_refuses_a_replay_below_the_window_and_serves_one_inside_it()",
+        "io.kardamom.sealer.cluster.SealerCarryWindowTest::version_five_keeps_the_da_lag_guard()",
+        "io.kardamom.sealer.cluster.SealerCarryWindowTest::version_five_on_the_heap_keeps_the_frames_above_the_posted_head()",
+        "io.kardamom.sealer.cluster.SealerCarryWindowTest::a_replay_from_a_snapshot_at_any_entry_evicts_alike()",
+        "io.kardamom.sealer.cluster.SealerCarryWindowTest::below_version_five_a_replay_from_a_snapshot_at_any_entry_evicts_alike()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::the_timer_boundary_turns_the_carry_window_on()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::the_forced_boundary_turns_the_carry_window_on()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::the_boundary_of_a_remote_origin_record_turns_the_carry_window_on()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::the_refusal_log_prints_at_most_once_a_second()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::the_window_holds_while_the_carry_window_is_on()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::the_refusal_carries_the_id_the_sender_the_nonce_and_version_five()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::the_gauges_show_the_carry_window_and_the_counters()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::every_member_has_the_same_bytes_after_each_entry()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::a_member_restored_at_any_entry_ends_with_the_bytes_of_its_peer()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::a_member_writes_version_eighteen_only_once_it_holds_the_carry_window()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::a_file_member_answers_the_carry_window_unsupported()",
+        "io.kardamom.sealer.cluster.SealerCarryActivationTest::a_file_member_stops_on_version_eighteen()"
+      ],
+      "real": [
+        "SealerClusteredService",
+        "CanonicalSealerState",
+        "wire parsing and snapshot codec"
+      ],
+      "controlled": [
+        "stub cluster/session outcomes and direct leadership/timer callbacks",
+        "four-frame retention windows",
+        "explicit per-entry leader timestamps and timer callbacks",
+        "snapshot/restore at every log cut and decision-version changes"
+      ],
+      "limitation": "The actor suite mocks consensus. The Raft suite uses real in-JVM members but does not prove OS process loss, network partitions, deployment or disk power-loss durability.",
+      "negative_controls": [
+        {
+          "mutation": "remove seed reoffer on a new leadership term",
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.SealerSeedServiceTest::a_snapshot_keeps_the_seed_and_its_confirmation()",
+            "io.kardamom.sealer.cluster.SealerSeedServiceTest::each_term_offers_the_seed_record_until_one_confirms_it()"
+          ]
+        }
+      ],
+      "ci_mode": "gradle"
+    },
+    "sealer-raft": {
+      "command": [
+        "cluster/sealer-service/gradlew",
+        "-p",
+        "cluster/sealer-service",
+        ":service:test",
+        "--no-daemon",
+        "--rerun-tasks",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerClusterFailoverTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerSeedClusterTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerSnapshotStallClusterTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerReplayTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerCarryClusterTest"
+      ],
+      "junit_reports": [
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerClusterFailoverTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerSeedClusterTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerSnapshotStallClusterTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerReplayTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerCarryClusterTest.xml"
+      ],
+      "tests": [
+        "io.kardamom.sealer.cluster.SealerClusterFailoverTest::egressContinuesGaplesslyAcrossLeaderKill()",
+        "io.kardamom.sealer.cluster.SealerSeedClusterTest::a_seeded_cluster_confirms_relays_from_e_h_and_restarts_from_its_snapshot()",
+        "io.kardamom.sealer.cluster.SealerSnapshotStallClusterTest::theFramesStopForTheSnapshotAndTheNoticeComesFirst()",
+        "io.kardamom.sealer.cluster.SealerReplayTest::reconnectedSessionCatchesUpViaReplay()",
+        "io.kardamom.sealer.cluster.SealerReplayTest::replayDuringLiveTrafficReachesLiveCursorAndCompletes()",
+        "io.kardamom.sealer.cluster.SealerReplayTest::evictedRangeIsRefusedHonestly()",
+        "io.kardamom.sealer.cluster.SealerCarryClusterTest::every_member_orders_each_full_reference_once_with_its_bytes()"
+      ],
+      "real": [
+        "SealerClusteredService",
+        "CanonicalSealerState",
+        "three Aeron consensus members, media drivers, archives and real cluster client"
+      ],
+      "controlled": [
+        "leader stop, whole-group restart and deliberate service snapshot stalls",
+        "client reconnect and small replay retention",
+        "carry-version activation with duplicate references"
+      ],
+      "limitation": "The actor suite mocks consensus. The Raft suite uses real in-JVM members but does not prove OS process loss, network partitions, deployment or disk power-loss durability.",
+      "ci_mode": "gradle"
+    },
+    "sealer-raft-network": {
+      "command": [
+        "cluster/sealer-service/gradlew",
+        "-p",
+        "cluster/sealer-service",
+        ":service:test",
+        "--no-daemon",
+        "--rerun-tasks",
+        "--tests",
+        "io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.RaftLeaderReturnTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.RaftLeaderPacketLossTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.CpuSqueezeTest"
+      ],
+      "test_timeout_s": 120,
+      "test_timeout_reason": "the leader's first log purge pass is a fixed 30 s",
+      "ci_mode": "gradle",
+      "junit_reports": [
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderPacketLossTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.CpuSqueezeTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.RaftLeaderReturnTest.xml"
+      ],
+      "tests": [
+        "io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest::the_peers_of_a_leader_that_cannot_send_elect_a_new_leader_and_the_old_one_stays_up()",
+        "io.kardamom.sealer.cluster.RaftLeaderPacketLossTest::a_lossy_leader_link_keeps_commits_and_one_leader_per_term()",
+        "io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest::a_slow_leader_link_keeps_commits_and_one_leader_per_term()",
+        "io.kardamom.sealer.cluster.CpuSqueezeTest::starved_members_slow_down_but_never_fork_the_canonical_order()",
+        "io.kardamom.sealer.cluster.RaftLeaderReturnTest::a_former_leader_that_wins_again_sends_a_new_leader_event_and_no_session_ok()"
+      ],
+      "real": [
+        "ClusterNode main class in one JVM process per member, with the deployed member settings",
+        "SealerClusteredService, CanonicalSealerState, Aeron consensus module, media driver and archive of each member",
+        "StartMode, PeerSeed, PeerNameResolver, JoinWatchdog, LogPurger, snapshot schedule and admin endpoint",
+        "member feed on a shared driver of each node, and a real Aeron cluster client with the production wire codecs",
+        "the link faults act inside each receiving member driver, on the frames from the selected member to its peers",
+        "a consumer session with the production cursor rules: a replay from its cursor at each new session, frames applied only in order"
+      ],
+      "controlled": [
+        "a one-way cut, 10 % random loss or a 250 ms ordered delay of the frames of the leader to both peers, for 10-15 s",
+        "SIGSTOP/SIGCONT of all members: 15 ms of run in each 100 ms for 20 s",
+        "the deployed 2 s tick and the deployed Raft timeouts",
+        "one-way cuts of the frames of each new leader to its peers, until a member that led before wins a later term in the same process"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "leader failure detection slowed: a 50 s leader heartbeat timeout with a 100 s startup canvass",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest::the_peers_of_a_leader_that_cannot_send_elect_a_new_leader_and_the_old_one_stays_up()",
+            "io.kardamom.sealer.cluster.ClusterLeaderKillTest::a_killed_leader_leaves_a_quorum_that_commits_and_the_member_rejoins()"
+          ],
+          "failed_at": "no new leader within the 45 s leader bound; no commit within 30 s of the leader kill"
+        },
+        {
+          "mutation": "each member stamps its boundaries with its own clock: cluster.time() + 1000 * memberId in onTimer",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.CpuSqueezeTest::starved_members_slow_down_but_never_fork_the_canonical_order()",
+            "io.kardamom.sealer.cluster.RaftLeaderPacketLossTest::a_lossy_leader_link_keeps_commits_and_one_leader_per_term()",
+            "io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest::a_slow_leader_link_keeps_commits_and_one_leader_per_term()"
+          ],
+          "failed_at": "the member feeds differ at a boundary frame: the canonical order forks"
+        }
+      ],
+      "limitation": "The faults act in the receiving driver, not in the kernel: frames from the leader to its clients and kernel queues stay intact. The hold is 10-15 s, not the 30 s of the chaos case. The squeeze stops whole processes; it does not throttle executors or the validator. The squeeze checks the verdict input of the validator: its session stream reaches the live head within 15 blocks, with no gap, and equals the members' order byte for byte. This is the input half of the squeeze verdict. The real validator is missing: its re-execution, the live verification within the lag, validator_divergence_total == 0 and the divergence scan are not run here, so cpu-squeeze stays partial. The loss and delay controls guard the order oracle; Aeron retransmission has no product seam to break."
+    },
+    "sealer-raft-members": {
+      "command": [
+        "cluster/sealer-service/gradlew",
+        "-p",
+        "cluster/sealer-service",
+        ":service:test",
+        "--no-daemon",
+        "--rerun-tasks",
+        "--tests",
+        "io.kardamom.sealer.cluster.ClusterLeaderKillTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.ClusterFollowerKillTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.ClusterMemberRejoinTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.ClusterTwoBlankRecoverTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.NodeReplaceSealerTest"
+      ],
+      "test_timeout_s": 120,
+      "test_timeout_reason": "the leader's first log purge pass is a fixed 30 s",
+      "ci_mode": "gradle",
+      "junit_reports": [
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.ClusterLeaderKillTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.ClusterFollowerKillTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.ClusterMemberRejoinTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.ClusterTwoBlankRecoverTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.NodeReplaceSealerTest.xml"
+      ],
+      "tests": [
+        "io.kardamom.sealer.cluster.ClusterLeaderKillTest::a_killed_leader_leaves_a_quorum_that_commits_and_the_member_rejoins()",
+        "io.kardamom.sealer.cluster.ClusterFollowerKillTest::a_killed_follower_restores_its_snapshot_while_the_quorum_commits()",
+        "io.kardamom.sealer.cluster.ClusterMemberRejoinTest::a_wiped_follower_seeds_from_a_peer_after_the_leader_purged_its_log()",
+        "io.kardamom.sealer.cluster.ClusterTwoBlankRecoverTest::an_offline_copy_of_the_survivor_restores_a_quorum_that_seeds_the_last_blank_member()",
+        "io.kardamom.sealer.cluster.NodeReplaceSealerTest::a_follower_on_a_new_node_seeds_from_a_peer_and_catches_up()"
+      ],
+      "real": [
+        "ClusterNode main class in one JVM process per member, with the deployed member settings",
+        "SealerClusteredService, CanonicalSealerState, Aeron consensus module, media driver and archive of each member",
+        "StartMode, PeerSeed, PeerNameResolver, JoinWatchdog, LogPurger, snapshot schedule and admin endpoint",
+        "member feed on a shared driver of each node, and a real Aeron cluster client with the production wire codecs"
+      ],
+      "controlled": [
+        "SIGKILL of the leader or a follower, a SIGTERM stop of every member, wiped member directories and a hash-checked offline copy",
+        "a log purge after more than one 8 MiB archive segment and a posted head",
+        "a node replacement: a new loopback address, empty volumes and a new shared driver under the same host name",
+        "a test cluster clock that passes the 60 s startup canvass at once in the two-blank case"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "leader failure detection slowed: a 50 s leader heartbeat timeout with a 100 s startup canvass",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest::the_peers_of_a_leader_that_cannot_send_elect_a_new_leader_and_the_old_one_stays_up()",
+            "io.kardamom.sealer.cluster.ClusterLeaderKillTest::a_killed_leader_leaves_a_quorum_that_commits_and_the_member_rejoins()"
+          ],
+          "failed_at": "no new leader within the 45 s leader bound; no commit within 30 s of the leader kill"
+        },
+        {
+          "mutation": "a blank member starts at log position 0 instead of a peer seed: StartMode.of returns GENESIS",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.ClusterMemberRejoinTest::a_wiped_follower_seeds_from_a_peer_after_the_leader_purged_its_log()",
+            "io.kardamom.sealer.cluster.ClusterTwoBlankRecoverTest::an_offline_copy_of_the_survivor_restores_a_quorum_that_seeds_the_last_blank_member()",
+            "io.kardamom.sealer.cluster.NodeReplaceSealerTest::a_follower_on_a_new_node_seeds_from_a_peer_and_catches_up()"
+          ],
+          "failed_at": "no peer seed and no catch-up to the head of the wipe"
+        },
+        {
+          "mutation": "a restarted member ignores its snapshot: onStart skips the snapshot restore",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.ClusterFollowerKillTest::a_killed_follower_restores_its_snapshot_while_the_quorum_commits()",
+            "io.kardamom.sealer.cluster.ClusterTotalLossRecoverTest::every_member_returns_from_its_own_state_and_the_cluster_commits_again()"
+          ],
+          "failed_at": "the restarted member logs no snapshot restore"
+        }
+      ],
+      "limitation": "Member state is on tmpfs, so a kill keeps it as the page cache does; power loss is not covered. A 1 s JVM DNS cache stands in for the minutes that a node replacement takes. Nomad placement, Terraform node replacement and Consul records stay in the cluster suite."
+    },
+    "sealer-raft-fleet": {
+      "command": [
+        "cluster/sealer-service/gradlew",
+        "-p",
+        "cluster/sealer-service",
+        ":service:test",
+        "--no-daemon",
+        "--rerun-tasks",
+        "--tests",
+        "io.kardamom.sealer.cluster.ClusterQuorumLossRecoverTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.ClusterTotalLossRecoverTest",
+        "--tests",
+        "io.kardamom.sealer.cluster.SealerFleetTotalWipeTest"
+      ],
+      "test_timeout_s": 120,
+      "test_timeout_reason": "the leader's first log purge pass is a fixed 30 s",
+      "ci_mode": "gradle",
+      "junit_reports": [
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.ClusterQuorumLossRecoverTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.ClusterTotalLossRecoverTest.xml",
+        "cluster/sealer-service/service/build/test-results/test/TEST-io.kardamom.sealer.cluster.SealerFleetTotalWipeTest.xml"
+      ],
+      "tests": [
+        "io.kardamom.sealer.cluster.ClusterQuorumLossRecoverTest::a_cluster_without_a_quorum_stalls_and_commits_again_when_a_member_returns()",
+        "io.kardamom.sealer.cluster.ClusterTotalLossRecoverTest::every_member_returns_from_its_own_state_and_the_cluster_commits_again()",
+        "io.kardamom.sealer.cluster.SealerFleetTotalWipeTest::a_wiped_fleet_restarts_after_the_posted_head_from_a_seed()"
+      ],
+      "real": [
+        "ClusterNode main class in one JVM process per member, with the deployed member settings",
+        "SealerClusteredService, CanonicalSealerState, Aeron consensus module, media driver and archive of each member",
+        "StartMode, PeerSeed, PeerNameResolver, JoinWatchdog, LogPurger, snapshot schedule and admin endpoint",
+        "member feed on a shared driver of each node, and a real Aeron cluster client with the production wire codecs",
+        "the seed file in the format that kardamom-reconstruct --sealer-seed writes"
+      ],
+      "controlled": [
+        "SIGKILL of two or three members with a 15 s stall window",
+        "a SIGTERM stop and wipe of every member, a start inside the bootstrap from a seed at the posted head, and a restart without the seed",
+        "a stale consumer cursor of the old chain and a fresh consumer at the seed head"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "the sealer ignores a replay request, so a new session cannot resume from its cursor",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.ClusterQuorumLossRecoverTest::a_cluster_without_a_quorum_stalls_and_commits_again_when_a_member_returns()"
+          ],
+          "failed_at": "the record that committed while the old session was gone never reaches the new session"
+        },
+        {
+          "mutation": "a restarted member ignores its snapshot: onStart skips the snapshot restore",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.ClusterTotalLossRecoverTest::every_member_returns_from_its_own_state_and_the_cluster_commits_again()"
+          ],
+          "failed_at": "the restarted member logs no snapshot restore"
+        },
+        {
+          "mutation": "a seeded member ignores the seed and starts at genesis",
+          "compiled": true,
+          "exit_code": 1,
+          "failed_tests": [
+            "io.kardamom.sealer.cluster.SealerFleetTotalWipeTest::a_wiped_fleet_restarts_after_the_posted_head_from_a_seed()"
+          ],
+          "failed_at": "no member logs SEEDED at H"
+        }
+      ],
+      "limitation": "The fleet-wipe test covers the sealer: the wipe, the seeded start, the restart from the seed snapshot, REPLAY_AHEAD for a cursor of the old chain, and the resume at (E_H, H + 1). Linked tests cover the seed rebuilt from L1 (reconstruct-seed), the da-watcher start after the sealer origin (l1-watcher-recovery) and a cold cache rebuild (state-mirror). The executor resume on the rebuilt image, the validator resume on its rebuilt state and a batcher start with no cursor file are not covered locally."
+    },
+    "reconstruct-seed": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-reconstruct",
+        "--test",
+        "reconstruct_l1_e2e",
+        "rebuild_from_l1_writes_the_sealer_seed_at_the_posted_head",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "ci_mode": "docker",
+      "tests": [
+        "rebuild_from_l1_writes_the_sealer_seed_at_the_posted_head"
+      ],
+      "real": [
+        "Anvil L1 with the deployed KardamomL2Settlement",
+        "batcher post_batch, read_posted_batches and recover_blocks",
+        "reconstruct_state and SeedInput, the code of kardamom-reconstruct --sealer-seed"
+      ],
+      "controlled": [
+        "a fake EigenDA proxy",
+        "two blocks of three transfers"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "the seed names the canonical end of the head plus one",
+          "compiled": true,
+          "exit_code": 101,
+          "failed_tests": [
+            "rebuild_from_l1_writes_the_sealer_seed_at_the_posted_head"
+          ],
+          "failed_at": "the seed names (2, 4) instead of the posted head (2, 3)"
+        }
+      ],
+      "limitation": "The L1 holds no epochs, so the seed's L1 origin is 0; the chaos case requires an origin above 0 on a live chain. The Java member tests read the same seed layout (SealerSeedTest golden bytes); the two sides do not run in one process."
+    },
+    "cache-sentinel": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-cache",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "sentinel_recovery",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "production AccountCache and Sentinel discovery/reconnect",
+        "Redis primary and replica",
+        "three Redis Sentinel processes",
+        "real Lua script and WAIT acknowledgements"
+      ],
+      "controlled": [
+        "500ms failure detection and 5s failover interval in test-only Sentinel configuration",
+        "Docker SIGSTOP with /proc stopped-state proof",
+        "Docker SIGKILL and restart of the original primary",
+        "SCRIPT FLUSH on the promoted primary",
+        "replica process stop",
+        "one Sentinel host name that resolves to ::1 and 127.0.0.1, each address forwarded to a different Sentinel, the first in SIGSTOP",
+        "primary SIGSTOP for 300 ms in each second, below the Sentinel down-after bound"
+      ],
+      "tests": [
+        "a_frozen_primary_promotes_a_replica_and_the_same_cache_client_recovers",
+        "a_killed_primary_promotes_a_replica_and_the_same_cache_client_recovers",
+        "replica_loss_reports_zero_acknowledgements_without_stopping_primary_writes",
+        "a_reader_keeps_its_live_connection_while_the_primary_stalls_and_a_sentinel_hangs"
+      ],
+      "limitation": "Requires Linux host routing to Docker bridge addresses. Uses five disposable containers per test and real service clocks. Proves promotion, same-client reconnect, script reload, monotone replay and zero replica acknowledgements. Does not prove whole-chain progress/fallback, CPU-pressure TILT behavior, persistence, total loss or deployment placement.",
+      "negative_controls": [
+        {
+          "mutation": "connection_not_replaced",
+          "exit_code": 101,
+          "failed_at_recovery": true,
+          "compiled": true
+        },
+        {
+          "mutation": "script_loaded_only_once",
+          "exit_code": 101,
+          "failed_at_recovery": true,
+          "compiled": true
+        },
+        {
+          "mutation": "every_timeout_replaces_the_connection",
+          "test": "a_reader_keeps_its_live_connection_while_the_primary_stalls_and_a_sentinel_hangs",
+          "exit_code": 101,
+          "failed_at_recovery": true,
+          "compiled": true
+        }
+      ],
+      "ci_mode": "docker"
+    },
+    "state-writer-crash": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-state",
+        "--test",
+        "writer_crash"
+      ],
+      "real": [
+        "StateWriter thread and production BatchWriter",
+        "durable MDBX transactions and recovery cursors",
+        "state snapshot, account/storage/receipt/hash-index reads",
+        "owned child process killed with SIGKILL"
+      ],
+      "controlled": [
+        "metrics recorder blocks the production writer after account writes before commit",
+        "metrics recorder blocks after successful MDBX commit before snapshot publication",
+        "two-block fixture; parent verifies the selected cut before killing the child"
+      ],
+      "tests": [
+        "process_loss_before_commit_discards_the_entire_uncommitted_block",
+        "process_loss_after_commit_preserves_a_block_without_a_published_snapshot"
+      ],
+      "limitation": "Unix process crash with the host and filesystem alive. Uses existing synchronous metric callbacks, no production hook. Does not simulate power loss, disk ENOSPC/EIO, checkpoint restore, full executor receipt publication, trie mode or whole-chain recovery.",
+      "negative_controls": [
+        {
+          "mutation": "account_rows_not_written",
+          "exit_code": 101,
+          "failed_tests": [
+            "process_loss_before_commit_discards_the_entire_uncommitted_block",
+            "process_loss_after_commit_preserves_a_block_without_a_published_snapshot"
+          ],
+          "compiled": true
+        },
+        {
+          "mutation": "reader_cursor_not_advanced",
+          "exit_code": 101,
+          "failed_tests": [
+            "process_loss_before_commit_discards_the_entire_uncommitted_block",
+            "process_loss_after_commit_preserves_a_block_without_a_published_snapshot"
+          ],
+          "compiled": true
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "state-aux-enospc": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-state",
+        "--features",
+        "docker-e2e",
+        "--lib",
+        "checkpoint::disk_full_tests::auxiliary_enospc_preserves_commits_and_recovers_checkpoint_and_log",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture"
+      ],
+      "real": [
+        "StateWriter and durable MDBX commits",
+        "BlockLogThread and segment files",
+        "checkpoint compaction/publication and manifest verification",
+        "checkpoint restore with block-log replay",
+        "Linux tmpfs returning ENOSPC"
+      ],
+      "controlled": [
+        "isolated eight-MiB container tmpfs for checkpoint/log files",
+        "authoritative state on a separate filesystem",
+        "five small blocks, one-byte segment limit and two-entry log queue",
+        "bounded filler writes and removal after observed failures",
+        "every fixture storage key checked at every commit and restore, including absence of future writes"
+      ],
+      "tests": [
+        "auxiliary_enospc_preserves_commits_and_recovers_checkpoint_and_log"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "checkpoint_visible_before_copy",
+          "exit_code": 101,
+          "compiled": true,
+          "assertion_failed": true
+        },
+        {
+          "mutation": "log_thread_dies_after_write_failure",
+          "exit_code": 101,
+          "compiled": true,
+          "assertion_failed": true
+        },
+        {
+          "mutation": "delete a storage key written during ENOSPC from the restored block5 database",
+          "original_oracle_exit_code": 0,
+          "full_history_oracle_exit_code": 101,
+          "clean_recovery_exit_code": 0,
+          "failed_assertion": "storage written in block 2, slot 0, after block 5"
+        }
+      ],
+      "limitation": "Linux Docker only. Runs the real test binary with its host shared libraries mounted read-only, without network or added capabilities. Proves auxiliary-volume ENOSPC, same-writer progress, no partial checkpoint publication and restored state after the log resumes. Does not prove state-volume ENOSPC, EIO, power loss, checkpointer scheduling, transaction/receipt end-to-end progress, Nomad mounts or deployment recovery.",
+      "ci_mode": "docker"
+    },
+    "state-enospc": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-state",
+        "--features",
+        "docker-e2e",
+        "--lib",
+        "checkpoint::disk_full_tests::state::",
+        "--",
+        "--ignored",
+        "--skip",
+        "state_full_child",
+        "--skip",
+        "unsync_full_child",
+        "--nocapture"
+      ],
+      "real": [
+        "StateWriter and durable MDBX commits",
+        "synchronized and unsynchronized MDBX transactions",
+        "snapshot publication, recovery cursors, accounts, storage, code and receipt indexes",
+        "Linux tmpfs returning ENOSPC"
+      ],
+      "controlled": [
+        "isolated eight-MiB tmpfs for authoritative state",
+        "two blocks and one one-MiB code payload",
+        "bounded filler writes and removal after observed commit failure"
+      ],
+      "tests": [
+        "state_enospc_stops_without_false_publication_and_resumes_after_reopen",
+        "unsynchronized_commit_failure_preserves_data_and_allows_retry"
+      ],
+      "limitation": "Linux Docker only. The synchronized writer regression catches a second abort after a failed commit. The unsynchronized check verifies data preservation and retry, but does not directly observe abort calls. Does not simulate EIO, power loss, trie mode, process supervision, full executor receipt publication or whole-chain recovery.",
+      "negative_controls": [
+        {
+          "mutation": "failed_sync_commit_not_marked_ended",
+          "exit_code": 101,
+          "compiled": true,
+          "bad_txn_panic": true
+        }
+      ],
+      "ci_mode": "docker"
+    },
+    "chaos-election": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "nomad::log::tests::election::"
+      ],
+      "real": [
+        "Evidence::cluster_elected",
+        "Nomad HTTP client, allocation refresh and log retry",
+        "closed-majority parser and complete poll deadline"
+      ],
+      "controlled": [
+        "loopback Nomad HTTP peer with stale then replacement allocations",
+        "200-ms inner log retry budget",
+        "five-second recovery deadline, one-second missing-evidence deadline"
+      ],
+      "tests": [
+        "election_refreshes_allocations_after_a_log_retry_budget_expires",
+        "missing_logs_exhaust_the_election_deadline_with_the_read_cause",
+        "readable_logs_without_a_closed_majority_do_not_certify_recovery"
+      ],
+      "negative_controls": [
+        {
+          "mutation": "return_first_log_budget_failure",
+          "compiled": true,
+          "exit_code": 101,
+          "failed_tests": [
+            "election_refreshes_allocations_after_a_log_retry_budget_expires",
+            "missing_logs_exhaust_the_election_deadline_with_the_read_cause"
+          ]
+        }
+      ],
+      "limitation": "Harness recovery evidence only. Does not run a sealer, Nomad cluster or reproduce election consensus. A readable closed majority is still required; persistent missing logs fail at the complete deadline.",
+      "ci_mode": "in-process"
+    },
+    "checkpoint-fault": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "checkpoint_full::",
+        "--",
+        "--include-ignored",
+        "--nocapture"
+      ],
+      "real": [
+        "shipped checkpoint ENOSPC controller",
+        "Linux tmpfs writes, ENOSPC, file sizes and age",
+        "job patch and checkpoint/block-log/progress proof parser"
+      ],
+      "controlled": [
+        "one network-isolated Python container with read-only root and a fixed 512-MiB tmpfs",
+        "80-MiB baseline and 160-MiB replacement files",
+        "controlled metric/log fixtures and nine Python boundary controls"
+      ],
+      "tests": [
+        "only_the_victim_checkpoint_source_changes",
+        "enospc_proof_needs_both_failures_after_baseline_and_victim_transaction_progress",
+        "exact_fault_script_refuses_unbounded_storage_and_requires_enospc",
+        "large_images_survive_the_exact_controller_enospc_and_release"
+      ],
+      "limitation": "The large files test controller and filesystem behavior; they are not MDBX checkpoints. Real checkpoint/log recovery is covered separately by state-aux-enospc. Deployed process continuity, mounts, transaction progress and restore proof still require the executor shard.",
+      "negative_controls": [
+        {
+          "mutation": "arbitrary_64m_image_limit",
+          "exit_code": 101,
+          "compiled": true,
+          "kernel_probe_failed": true
+        },
+        {
+          "mutation": "enospc_without_exhaustion",
+          "exit_code": 101,
+          "compiled": true,
+          "kernel_probe_failed": true
+        }
+      ],
+      "ci_mode": "docker"
+    },
+    "chaos-alert": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "l1::alert::tests",
+        "--",
+        "--nocapture"
+      ],
+      "real": [
+        "alert hold observer used by the deployed L1 liar case",
+        "shared bounded polling loop"
+      ],
+      "controlled": [
+        "paused Tokio clock",
+        "active, inactive, unknown, failed and delayed alert responses"
+      ],
+      "tests": [
+        "fast_alert_samples_require_the_full_hold_duration",
+        "slow_alert_samples_use_elapsed_time_within_the_original_budget",
+        "inactive_unknown_and_failed_reads_each_reset_the_hold",
+        "first_slow_response_does_not_certify_unobserved_time",
+        "failed_alert_reads_preserve_the_cause_at_the_total_deadline",
+        "hanging_alert_read_cannot_extend_the_total_budget"
+      ],
+      "limitation": "Harness timing only. Does not run Prometheus or certify the alert expression, scrape continuity, product recovery or performance under CPU contention.",
+      "negative_controls": [
+        {
+          "mutation": "Restore prior six-active-sample threshold in the production observer; retain diagnostic-only state tracking.",
+          "exit_code": 101,
+          "failed": [
+            "l1::alert::tests::first_slow_response_does_not_certify_unobserved_time",
+            "l1::alert::tests::fast_alert_samples_require_the_full_hold_duration",
+            "l1::alert::tests::slow_alert_samples_use_elapsed_time_within_the_original_budget",
+            "l1::alert::tests::inactive_unknown_and_failed_reads_each_reset_the_hold"
+          ],
+          "compiled": true
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "transport-pressure": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-log",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "transport_pressure",
+        "--",
+        "--ignored",
+        "--exact",
+        "unavailable_outputs_preserve_live_delivery_and_recover",
+        "--nocapture"
+      ],
+      "real": [
+        "AeronRuntime poll and retry loop",
+        "Aeron C client and Java media driver",
+        "UDP publications, subscriptions and payload delivery"
+      ],
+      "controlled": [
+        "eight runtimes by default with distinct UDP streams and a 64-KiB term length",
+        "absent output subscribers followed by late joins",
+        "one disposable driver; no chain services",
+        "optional bounded runtime and message counts for profiling",
+        "independent publisher runtime; quiet arrivals cannot wake the receiver through its command channel"
+      ],
+      "tests": [
+        "unavailable_outputs_preserve_live_delivery_and_recover"
+      ],
+      "limitation": "Transport-level composition only. Does not run the executor, sequencer, Redis, sealer consensus or cross-host network. CPU samples cover the Rust process, not the Java driver or full cluster. No timing speedup or deployment performance claim follows from this regression.",
+      "negative_controls": [
+        {
+          "mutation": "Do not poll subscriptions while an output is pending.",
+          "exit_code": 101,
+          "compiled": true,
+          "starvation_observed": true
+        }
+      ],
+      "ci_mode": "docker"
+    },
+    "chaos-cache-baseline": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "cases::cache::coverage::tests::"
+      ],
+      "real": [
+        "Distributed cache coverage predicate and recovery wait",
+        "HTTP executor account-query client"
+      ],
+      "controlled": [
+        "Executor HTTP replies",
+        "Malformed account projections and exact baseline agreement"
+      ],
+      "tests": [
+        "a_present_row_does_not_prove_correct_coverage",
+        "untouched_funded_accounts_keep_full_width_balances",
+        "a_receipted_transfer_waits_for_the_lagging_executor_before_comparing_redis",
+        "an_executor_baseline_requires_full_state_agreement_and_the_receipted_nonce"
+      ],
+      "limitation": "Checks exact account predicates and the executor baseline; distributed recovery remains required.",
+      "ci_mode": "in-process"
+    },
+    "chaos-projection": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "cases::cache::coverage::projection::tests"
+      ],
+      "real": [
+        "exact account projection observer",
+        "shared bounded polling loop"
+      ],
+      "controlled": [
+        "paused Tokio clock",
+        "failed, hanging, malformed, partial and complete primary observations"
+      ],
+      "tests": [
+        "a_failed_read_is_retried_and_only_a_complete_fresh_read_passes",
+        "separate_partial_observations_cannot_be_combined_into_a_pass",
+        "persistent_read_failure_preserves_its_cause_at_the_original_deadline",
+        "a_hanging_read_cannot_extend_the_original_deadline",
+        "missing_extra_malformed_and_wrong_rows_cannot_certify_coverage"
+      ],
+      "limitation": "Observer controls do not run Redis, Sentinel or a deployed mirror. Full cache and combined-execution shards remain required.",
+      "negative_controls": [
+        {
+          "mutation": "Propagate a read error immediately instead of retrying within the original budget",
+          "compiled": true,
+          "exit_code": 101,
+          "failed": [
+            "a_failed_read_is_retried_and_only_a_complete_fresh_read_passes",
+            "persistent_read_failure_preserves_its_cause_at_the_original_deadline"
+          ]
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "batcher-null-receipts": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-batcher",
+        "--lib",
+        "live::run::null_receipts_tests::",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "real": [
+        "production startup and shared FeedLoop construction",
+        "LiveSender and production signed L1 provider",
+        "Anvil and deployed settlement contract",
+        "Spool and durable cursor",
+        "payload packing, local DaStore HTTP and payload reconstruction",
+        "L1 fault proxy with null receipts and swallowed settlement logs"
+      ],
+      "controlled": [
+        "bounded reader channel with one-block batches",
+        "Anvil mining at the exact pending-post cut",
+        "actor cancellation before mining and restart from the same disk",
+        "unresponsive indexer endpoint",
+        "10-ms provider polling; production receipt timeout unchanged"
+      ],
+      "tests": [
+        "hidden_mined_receipts_reconcile_without_duplicate_posts_or_early_cursor",
+        "restart_during_hidden_receipts_uses_contract_truth_without_waiting_for_the_indexer"
+      ],
+      "limitation": "No full follower fleet, Prometheus alert, Nomad restart, consensus retention or EigenDA proof. These tests cover null receipt reconciliation and restart, not expiry of the 120-second receipt deadline. Alloy timeout bookkeeping includes the wall clock, so Tokio virtual time alone cannot prove that deadline. The existing local DA helper serves until the test process exits. Payloads contain empty boundary blocks; transaction execution and full-chain transfer progress are outside this fixture.",
+      "ci_mode": "docker"
+    },
+    "batcher-post-age": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-batcher",
+        "--lib",
+        "live::post_age::",
+        "--",
+        "--nocapture"
+      ],
+      "real": [
+        "PostAge::run with its actual timer and state transitions",
+        "IndexerClient and all three HTTP JSON-RPC reads",
+        "archive seed task deadline and ownership",
+        "post-age metric emission and monotone last-post timestamps"
+      ],
+      "controlled": [
+        "two-entry channel of decoded L1 follower records",
+        "loopback archive that accepts a request but never replies",
+        "real JSON-RPC server with explicitly released replies",
+        "task-local metrics recorder",
+        "Tokio time advances only after each real HTTP request reaches its peer"
+      ],
+      "tests": [
+        "the_age_runs_from_the_newest_block_that_carried_a_post",
+        "a_seed_attempt_times_out_and_can_start_again_without_overlapping",
+        "input_close_stops_the_actor_during_an_unresponsive_archive_read",
+        "a_late_archive_seed_cannot_replace_a_newer_live_post",
+        "all_three_archive_requests_share_one_deadline",
+        "closing_the_owner_cancels_the_inflight_archive_task",
+        "an_unresponsive_archive_does_not_hide_a_live_post",
+        "the_complete_archive_seed_publishes_without_waiting_for_another_tick",
+        "a_failed_archive_read_retries_with_the_same_client_and_recovers"
+      ],
+      "limitation": "This adds the stalled archive-seed failure absent from the deployed L1 receipt/log fault. It does not run Aeron discovery, the follower fleet, Prometheus, Nomad, or transaction posting. Wall-clock post age remains real; virtual time controls only actor scheduling and RPC deadlines.",
+      "negative_controls": [
+        {
+          "mutation": "extended_seed_deadline",
+          "test": "all_three_archive_requests_share_one_deadline",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/post-age-extended_seed_deadline-negative-20261028.log"
+        },
+        {
+          "mutation": "overlapping_seed",
+          "test": "a_seed_attempt_times_out_and_can_start_again_without_overlapping",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/post-age-overlapping_seed-negative-20261028.log"
+        },
+        {
+          "mutation": "uncancelled_seed",
+          "test": "closing_the_owner_cancels_the_inflight_archive_task",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/post-age-uncancelled_seed-negative-20261028.log"
+        },
+        {
+          "mutation": "regressing_seed",
+          "test": "a_late_archive_seed_cannot_replace_a_newer_live_post",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/post-age-regressing_seed-negative-20261028.log"
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "chaos-cache-backlog": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "cases::cache::backlog::"
+      ],
+      "real": [
+        "backlog baseline and recovery observation state machine",
+        "Redis client, ROLE check and atomic ROLE/MGET/HMGET command sequence",
+        "shared bounded polling loop and account/head predicates"
+      ],
+      "controlled": [
+        "loopback RESP peer with explicitly released replies",
+        "primary identity changes, failed reads and partial account observations",
+        "Tokio clock pauses after the real EXEC request reaches the silent peer",
+        "fixed mirror heads and exact full-width account balances"
+      ],
+      "tests": [
+        "projection_recovery_requires_a_later_head_from_every_writer",
+        "held_heads_require_three_complete_positive_position_tags",
+        "regressed_or_single_step_counters_cannot_prove_both_fallback_reads",
+        "a_nonce_and_balance_fallback_needs_two_misses_and_no_cache_hit",
+        "a_failed_baseline_read_retries_before_capturing_exact_state",
+        "a_transient_recovery_read_does_not_discard_the_remaining_budget",
+        "persistent_errors_keep_the_cause_at_the_original_recovery_deadline",
+        "a_hanging_snapshot_cannot_extend_the_baseline_deadline",
+        "every_writer_must_advance_twice_with_the_exact_account",
+        "promotion_requires_two_complete_observations_on_the_new_primary",
+        "fixed_held_heads_cannot_prove_recovery_even_with_a_correct_account",
+        "the_real_client_reads_heads_and_account_in_one_primary_transaction",
+        "demotion_after_connect_cannot_certify_the_transaction_snapshot",
+        "a_missing_head_in_the_real_reply_cannot_certify_coverage",
+        "a_silent_exec_reply_expires_the_real_client_read"
+      ],
+      "limitation": "Observer fidelity only. Does not reproduce nested Docker execution latency, Consul DNS, Sentinel elections, running mirrors, executor fallback or ingress restart. The fault writes and cleanup still use the original pinned-primary Docker path. Actual Redis 7 transaction compatibility is checked separately with a disposable container; ordinary tests use controlled peers. Full distributed recovery and performance validation remain required.",
+      "negative_controls": [
+        {
+          "mutation": "cross_primary_progress",
+          "test": "promotion_requires_two_complete_observations_on_the_new_primary",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/backlog-cross_primary_progress-negative-20261028.log"
+        },
+        {
+          "mutation": "ignore_snapshot_role",
+          "test": "demotion_after_connect_cannot_certify_the_transaction_snapshot",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/backlog-ignore_snapshot_role-negative-20261028.log"
+        },
+        {
+          "mutation": "single_writer_progress",
+          "test": "every_writer_must_advance_twice_with_the_exact_account",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/backlog-single_writer_progress-negative-20261028.log"
+        },
+        {
+          "mutation": "ignore_account_row",
+          "test": "a_failed_baseline_read_retries_before_capturing_exact_state",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/backlog-ignore_account_row-negative-20261028.log"
+        },
+        {
+          "mutation": "non_atomic_snapshot",
+          "test": "the_real_client_reads_heads_and_account_in_one_primary_transaction",
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true,
+          "log": "/tmp/backlog-non_atomic_snapshot-negative-20261028.log"
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "chaos-archive-stage": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "cases::archive::staging::tests::"
+      ],
+      "real": [
+        "production segment tar command and unpack path",
+        "GNU tar and local filesystem"
+      ],
+      "controlled": [
+        "selected victim and differently named mirror files",
+        "64MiB unrelated sparse segment and catalog"
+      ],
+      "tests": [
+        "staging_copies_only_the_selected_victim_segment",
+        "staging_reads_the_mirrors_own_recording_name"
+      ],
+      "limitation": "Fixture transport only. Actual Aeron CRC detection, repair, live archive restart and continuous case-owned traffic still require the distributed case. A separate existing repair-tool binary validates selected directories with identical CLI/library source; this does not qualify CRC recovery.",
+      "negative_controls": [
+        {
+          "mutation": "whole_archive_staging",
+          "tests": [
+            "staging_copies_only_the_selected_victim_segment",
+            "staging_reads_the_mirrors_own_recording_name"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "archive-recovery": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-batcher",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "archive_recovery",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "real": [
+        "Aeron media driver and Archive with record/replay CRC32",
+        "TxDataPublisherHandle, TxDataSubscriberHandle and production recorder",
+        "mirror_archive, diff_mirror and heal_from_mirror",
+        "ArchiveTool verify and mark-valid",
+        "ArchiveRefetcher after a daemon restart"
+      ],
+      "controlled": [
+        "12 envelopes with 512-byte payloads in one 64-KiB segment",
+        "offline payload byte corruption",
+        "offline segment and catalog deletion",
+        "saved byte-identical backup of the stopped recording",
+        "owned Docker daemon lifecycle and host file ownership"
+      ],
+      "tests": [
+        "a_corrupt_recording_is_detected_repaired_and_replayed_exactly",
+        "a_wiped_archive_restores_its_catalog_and_replays_the_exact_recording"
+      ],
+      "limitation": "One recording and a saved backup, not two independent peer recordings. Wall-clock Docker, Java and Aeron timing remains real. No distributed tar/catalog transfer, Nomad drain/placement, repair CLI wiring, live-ingress admission, executor progress, multi-segment boundary or distributed load coverage.",
+      "ci_mode": "docker"
+    },
+    "chaos-cache-readers": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-chaos",
+        "--lib",
+        "cases::cache::readers::tests::"
+      ],
+      "real": [
+        "Per-ingress recovery observer",
+        "RPC client and exporter HTTP reader",
+        "Original120-second recovery budget"
+      ],
+      "controlled": [
+        "Two independent HTTP peers and counters",
+        "RPC errors and missing reader observations",
+        "Virtual clock and stalled observation"
+      ],
+      "tests": [
+        "every_reader_must_prove_redis_use_without_degradation",
+        "missing_duplicate_foreign_and_failed_readers_cannot_certify_recovery",
+        "separate_partial_observations_do_not_accumulate_into_recovery",
+        "a_fresh_complete_reading_recovers_after_a_failed_probe",
+        "a_hung_probe_preserves_the_original_recovery_deadline",
+        "both_real_rpc_endpoints_must_prove_their_own_redis_read",
+        "complete_http_recovery_passes_and_rpc_failure_cannot_pass_on_counters"
+      ],
+      "limitation": "Observer controls do not prove Redis, ingress process or full distributed recovery. Existing state and L1 reconstruction assertions remain required.",
+      "negative_controls": [
+        {
+          "mutation": "accept_any_reader",
+          "compiled": true,
+          "failed_tests": 6,
+          "exit_code": 101
+        }
+      ],
+      "ci_mode": "in-process"
+    },
+    "discovery-registration": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-log",
+        "--test",
+        "consul_register_retry"
+      ],
+      "real": [
+        "ConsulClient HTTP requests and typed error classification",
+        "Registration::register",
+        "StartRetry bounded retry"
+      ],
+      "controlled": [
+        "scripted HTTP agent failures and lost TTL checks"
+      ],
+      "tests": [
+        "a_registration_tries_again_until_the_agent_accepts",
+        "a_refused_registration_fails_at_once",
+        "a_registration_gives_up_on_an_agent_that_never_listens",
+        "the_cluster_member_read_tries_again_while_the_agent_has_no_server",
+        "the_cluster_member_read_fails_after_the_limit",
+        "a_lost_check_repeats_the_whole_registration",
+        "a_check_that_keeps_disappearing_exhausts_the_existing_limit",
+        "a_check_pass_acl_denial_remains_permanent",
+        "a_missing_registration_endpoint_remains_permanent",
+        "a_missing_member_query_endpoint_remains_permanent"
+      ],
+      "limitation": "The agent is controlled; real Consul check loss is covered separately. Distributed validator catch-up and control-plane recovery remain required.",
+      "ci_mode": "in-process"
+    },
+    "discovery-check-loss": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-log",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "consul_discovery",
+        "a_check_removed_after_registration_is_recoverable",
+        "--",
+        "--ignored"
+      ],
+      "real": [
+        "Consul agent in Docker",
+        "service and TTL check registration",
+        "HTTP missing-check response and re-registration"
+      ],
+      "controlled": [
+        "explicit deregistration between registration and check pass"
+      ],
+      "tests": [
+        "a_check_removed_after_registration_is_recoverable"
+      ],
+      "limitation": "One isolated Consul agent; this does not qualify fleet rescheduling, validator catch-up or the cause of a distributed catalog deletion.",
+      "ci_mode": "docker"
+    },
+    "validator-recovery": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-validator",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "validator_recovery",
+        "--",
+        "--ignored",
+        "--test-threads=1",
+        "--nocapture"
+      ],
+      "real": [
+        "kardamom-validator binary: startup, revolution loop, pumps, trie-aware MDBX writer, checkpoint adoption and trie bootstrap",
+        "Aeron media driver in Docker with tx_bal, tx_receipts and egress_order IPC streams",
+        "Aeron client timeout and the crate's exit handler",
+        "egress store, owner and HTTP range reads with the carried egress reader",
+        "reference executor: the production engine over a real MDBX writer, with a real checkpoint and peer checkpoint server"
+      ],
+      "controlled": [
+        "one reference chain and one media driver per test process; the lapse tests run to block 150 and the join to block 70, two transfers per block, one block per 100 ms",
+        "SIGSTOP and SIGCONT of the validator process; the test restarts an exited process as the supervisor",
+        "driver client liveness timeout of 3 s; lapses of 1.5 s and 9 s",
+        "one executor replica publishes the reference BAL and receipt frames",
+        "a checkpoint at block 20 on one peer; the join starts 10 blocks past it"
+      ],
+      "tests": [
+        "a_short_lapse_keeps_the_same_process_verifying_past_its_count",
+        "a_long_lapse_ends_the_process_and_the_restart_resumes_from_its_state",
+        "a_fresh_validator_adopts_the_peer_checkpoint_and_verifies_live"
+      ],
+      "limitation": "The validator reads the canonical stream from the egress (--egress), a deployed option; the default deployment reads the Aeron Cluster egress with tx_data joins. The driver liveness timeout is a local driver setting; the deployed freeze length follows the deployed Aeron stall tolerance. Peers are addressed by IP, not by Consul DNS.",
+      "negative_controls": [
+        {
+          "mutation": "BalBuffer::MAX_BUFFERED = 4",
+          "tests": [
+            "a_short_lapse_keeps_the_same_process_verifying_past_its_count"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "failed_assertion": "coverage regressed over the lapse: bal_missing 0 -> 15"
+        },
+        {
+          "mutation": "the restart resumes from ResumePoint::GENESIS, not from the persisted recovery point",
+          "tests": [
+            "a_long_lapse_ends_the_process_and_the_restart_resumes_from_its_state"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "failed_assertion": "missing log line validator resuming from persisted cursor"
+        },
+        {
+          "mutation": "bootstrap_trie_if_adopted returns before the trie bootstrap",
+          "tests": [
+            "a_fresh_validator_adopts_the_peer_checkpoint_and_verifies_live"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "failed_assertion": "missing log line trie bootstrap complete"
+        }
+      ],
+      "ci_mode": "docker"
+    },
+    "pipeline-recovery": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "e2e",
+        "--features",
+        "full-pipeline-e2e,floor-seams",
+        "--test",
+        "pipeline_recovery",
+        "--",
+        "--ignored",
+        "--test-threads=1",
+        "--skip",
+        "sequencer_executor_redis_loss_on_the_v2_loop_looks_every_floor_up"
+      ],
+      "real": [
+        "kardamom-ingress pair, kardamom-sequencer per lane, kardamom-executor and kardamom-validator processes",
+        "Java sealer cluster members (three for the cases that take the sealer down)",
+        "host-native ArchivingMediaDriver and archive with tx_data recording and refetch",
+        "Anvil, the L1 follower and the da-watcher for the epoch checks",
+        "SIGTERM drain and SIGKILL of the service processes, and their start on persisted state"
+      ],
+      "controlled": [
+        "a case load of 1-wei transfers through ingress 0, with resubmits and receipt reads on every ingress",
+        "a recovery probe of the case sender and a fresh sender",
+        "process stops and starts in the order of each chaos case; two replicas of the case lane for the lane loss",
+        "a Redis container with no persistence and a state mirror for the blackout",
+        "sequencers that read that Redis in their nonce lookup, for the sequencer, executor and Redis loss",
+        "a SIGTERM stop of the sealer leader of three members, with the case load flowing"
+      ],
+      "tests": [
+        "ingress_pair_loss_returns_both_replicas",
+        "graceful_sequencer_drains_and_a_cold_start_regains_its_senders",
+        "sequencer_lane_loss_relearns_the_sender_floor",
+        "pipeline_blackout_restarts_every_process_and_reelects",
+        "pipeline_blackout_rebuilds_the_read_path",
+        "sequencer_executor_redis_loss_looks_every_floor_up",
+        "a_sealer_leader_stop_keeps_the_executor_at_the_sealed_head"
+      ],
+      "limitation": "Stack suite, not isolated: each case needs more than one real service. All services share one host and one media driver. The blackout runs one sealer member to stay inside 60 s; the combined suite closes elections of three. The blackout is two tests: one with the L1 stack and the validator, one with Redis and the state mirror. Nomad placement, node power loss and container identity stay with the cluster suite. Needs the service binaries, the sealer jar and the aeron-all jar. The sequencer, executor and Redis loss also needs a debug sequencer with the floor-seams feature; the workspace build of the suite has it. That case runs the v1 loop only; the chaos case runs v2. On the v2 loop, the case load does not land within 30 s of the return in about half the runs, with or without the seam, so the v2 test stays out of the catalog and the suite command skips it. It returns the classes 8 s apart, not 30 s. It reads both replicas of the case lane, not lane 0. The local ingress has no [cache], so it does not check the degraded read of the ingress while Redis is down.",
+      "negative_controls": [
+        {
+          "mutation": "The ingress receipt query skips its egress and executor layers, so a restarted ingress serves no receipt from state.",
+          "tests": [
+            "ingress_pair_loss_returns_both_replicas"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        },
+        {
+          "mutation": "The sequencer nonce lookup sends no query, so a cold replica never learns the floor of an established sender.",
+          "tests": [
+            "graceful_sequencer_drains_and_a_cold_start_regains_its_senders",
+            "sequencer_lane_loss_relearns_the_sender_floor"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        },
+        {
+          "mutation": "The consumer join-miss refetch from the archive is off, so a restarted executor cannot execute replayed records.",
+          "tests": [
+            "pipeline_blackout_restarts_every_process_and_reelects"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        },
+        {
+          "mutation": "The state mirror never rebuilds, so an empty Redis gets only the rows of live traffic.",
+          "tests": [
+            "pipeline_blackout_rebuilds_the_read_path"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        },
+        {
+          "mutation": "A park of a sender with no known floor asks no nonce lookup, so the returned sequencers wait for receipts alone.",
+          "tests": [
+            "sequencer_executor_redis_loss_looks_every_floor_up"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        },
+        {
+          "mutation": "The nonce lookup drops every answer, so with the floor seam no sender gets a first floor after the return.",
+          "tests": [
+            "sequencer_executor_redis_loss_looks_every_floor_up"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        },
+        {
+          "mutation": "The session loop sends no replay request when a new leader confirms the open session again, so a reader that keeps its session holds every record after the session-start marker.",
+          "tests": [
+            "a_sealer_leader_stop_keeps_the_executor_at_the_sealed_head"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        }
+      ],
+      "ci_mode": "stack",
+      "test_timeout_s": 90,
+      "test_timeout_reason": "the sequencer, executor and Redis loss returns its classes 8 s apart and waits up to 30 s for the case load; it runs 44 to 55 s locally"
+    },
+    "sequencer-lapse-stack": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "e2e",
+        "--features",
+        "full-pipeline-e2e",
+        "--test",
+        "sequencer_lapse",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "kardamom-sequencer processes on the v2 loop: the case lane's replica and its twin",
+        "kardamom-ingress pair, kardamom-executor and kardamom-validator processes",
+        "Java sealer member and the host-native ArchivingMediaDriver with its client liveness",
+        "SIGSTOP and SIGCONT of the replica process, its Aeron fail-fast exit and its cold start"
+      ],
+      "controlled": [
+        "a 14-second freeze past the 10-second client liveness of the local driver",
+        "a case load of 1-wei transfers through ingress 0, and the recovery probe of the case sender and a fresh sender"
+      ],
+      "tests": [
+        "a_frozen_sequencer_exits_on_the_client_timeout_and_returns_cold_with_fresh_work"
+      ],
+      "limitation": "Stack suite: every service shares one host and one media driver. Nomad restarts the process in the deployment; here the test starts it after the exit.",
+      "negative_controls": [
+        {
+          "mutation": "The Aeron fail-fast handler logs the client error and does not exit, so the thawed replica keeps a dead client.",
+          "tests": [
+            "a_frozen_sequencer_exits_on_the_client_timeout_and_returns_cold_with_fresh_work"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        }
+      ],
+      "ci_mode": "stack"
+    },
+    "pipeline-combined": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "e2e",
+        "--features",
+        "full-pipeline-e2e",
+        "--test",
+        "pipeline_combined",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "kardamom-ingress pair, kardamom-sequencer per lane, kardamom-executor and kardamom-validator processes",
+        "Java sealer cluster members (three for the cases that take the sealer down)",
+        "host-native ArchivingMediaDriver and archive with tx_data recording and refetch",
+        "Anvil, the L1 follower and the da-watcher for the epoch checks",
+        "SIGTERM drain and SIGKILL of the service processes, and their start on persisted state"
+      ],
+      "controlled": [
+        "a case load of 1-wei transfers through ingress 0, with resubmits and receipt reads on every ingress",
+        "a recovery probe of the case sender and a fresh sender",
+        "class stops and returns in the order of each case, with an eight-second stagger"
+      ],
+      "tests": [
+        "ingress_and_sequencer_loss_return_in_order",
+        "ingress_returns_before_the_sealer_and_waits",
+        "sequencer_and_sealer_loss_stall_then_return_together",
+        "ingress_sequencer_and_sealer_return_in_order",
+        "ingress_sequencer_and_sealer_return_in_reverse_and_wait"
+      ],
+      "limitation": "Stack suite, not isolated: the subject is the interplay of the ingress, sequencer and sealer classes. The stagger and hold are shorter than the deployed ones. Nomad job restore stays with the cluster suite. Needs the service binaries, the sealer jar, the aeron-all jar and Anvil.",
+      "negative_controls": [
+        {
+          "mutation": "The sequencer nonce lookup sends no query, so a cold replica never learns the floor of an established sender.",
+          "tests": [
+            "ingress_and_sequencer_loss_return_in_order"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        },
+        {
+          "mutation": "The cluster client never forces a new session after egress silence, so a client of a lost sealer never reconnects.",
+          "tests": [
+            "ingress_returns_before_the_sealer_and_waits",
+            "sequencer_and_sealer_loss_stall_then_return_together",
+            "ingress_sequencer_and_sealer_return_in_order",
+            "ingress_sequencer_and_sealer_return_in_reverse_and_wait"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        }
+      ],
+      "ci_mode": "stack"
+    },
+    "control-plane-loss": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-log",
+        "--features",
+        "docker-e2e",
+        "--test",
+        "control_plane_loss",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "real": [
+        "ConsulClient, Registration heartbeat, catalog watch and StreamPlane",
+        "Aeron media driver in Docker with a discovered MDC tx_data stream"
+      ],
+      "controlled": [
+        "a Consul-like agent with TTL checks, critical deregistration, blocking health queries and a partition switch",
+        "check TTL 2 s, deregistration after 5 s, partition 9 s, in the deployed order"
+      ],
+      "tests": [
+        "workers_keep_their_data_path_through_a_metadata_partition_and_reregister"
+      ],
+      "limitation": "Isolated suite: the discovery adapter against a controlled agent. The data path is one tx_data stream, not the full client pipeline. Consul DNS, the Nomad API and Nomad placement stay with the cluster suite.",
+      "negative_controls": [
+        {
+          "mutation": "A failed check pass does not repeat the registration.",
+          "tests": [
+            "workers_keep_their_data_path_through_a_metadata_partition_and_reregister"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        }
+      ],
+      "ci_mode": "docker"
+    },
+    "ingress-recovery": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-ingress",
+        "--test",
+        "ingress_recovery",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "real": [
+        "the kardamom-ingress binary as a child process, one replica per node",
+        "a host-native archiving media driver per node, with the ingress tx_data recorders",
+        "UDP MDC tx_data and unicast tx_receipts between the nodes"
+      ],
+      "controlled": [
+        "one stand-in for the sequencer, the sealer and the executor on the second node: first-copy dedup, nonce order, receipt batch frames with account rows",
+        "an HTTP stub of the egress and the executor query that serves rkyv receipts from the stand-in's ledger",
+        "one client per case that resubmits and reads receipts from both ingresses"
+      ],
+      "tests": [
+        "a_graceful_stop_drains_and_the_returned_ingress_serves_every_receipt",
+        "a_hard_killed_case_ingress_returns_with_no_lost_or_doubled_transfer",
+        "a_hard_killed_twin_returns_and_serves_receipts_that_it_never_saw",
+        "a_lost_archiving_driver_ends_its_ingress_while_the_twin_serves"
+      ],
+      "limitation": "Isolated suite: the real ingress against controlled peers. The sequencer, sealer, executor and egress are stand-ins. Needs the ingress binary, Java and the aeron-all jar.",
+      "negative_controls": [
+        {
+          "mutation": "The ingress receipt query skips its egress and executor layers, so a returned ingress serves no receipt from state.",
+          "tests": [
+            "a_graceful_stop_drains_and_the_returned_ingress_serves_every_receipt",
+            "a_hard_killed_case_ingress_returns_with_no_lost_or_doubled_transfer",
+            "a_hard_killed_twin_returns_and_serves_receipts_that_it_never_saw",
+            "a_lost_archiving_driver_ends_its_ingress_while_the_twin_serves"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        },
+        {
+          "mutation": "The Aeron error handler logs and returns, so an ingress that lost its driver does not exit.",
+          "tests": [
+            "a_lost_archiving_driver_ends_its_ingress_while_the_twin_serves"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        }
+      ],
+      "ci_mode": "stack"
+    },
+    "ingress-deadline": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kardamom-ingress",
+        "--test",
+        "inclusion_deadline_test"
+      ],
+      "real": [
+        "IngressProxy submit path and its inclusion deadline"
+      ],
+      "controlled": [
+        "executor block boundaries held far behind the sealed head of the sealer status"
+      ],
+      "tests": [
+        "the_deadline_follows_the_sealed_head_without_executor_boundaries",
+        "a_lagging_executor_head_does_not_age_the_deadline_of_a_new_submit"
+      ],
+      "limitation": "Isolated suite. It shows the ingress stamp; the sealer refusal of a past deadline is not run here.",
+      "negative_controls": [
+        {
+          "mutation": "The deadline base is the executor head alone.",
+          "tests": [
+            "the_deadline_follows_the_sealed_head_without_executor_boundaries",
+            "a_lagging_executor_head_does_not_age_the_deadline_of_a_new_submit"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        }
+      ],
+      "ci_mode": "in-process"
+    }
+  },
+  "families": {
+    "Ingress": {
+      "real_actors": [
+        "ingress",
+        "archive reader/writer"
+      ],
+      "fault_plan": "Stall or close publication, receipt and lookup peers; reopen real temporary archive storage after missing/corrupt records.",
+      "recovery_invariants": "Exact submit hash, bounded fallback/refusal, no invented receipt, replay resumes from the retained cursor.",
+      "remaining_real_dependencies": "Real archive/media-driver integration and process restart remain required."
+    },
+    "Sequencer": {
+      "real_actors": [
+        "sequencer admission",
+        "validator replay"
+      ],
+      "fault_plan": "Stall intake and lookup replies; disconnect or backpressure orderer output; lose acknowledgements and renew sessions; restart replay from real checkpoints.",
+      "recovery_invariants": "Preserve sender order and exact bytes, bound queues, recover without new client input, stop cleanly; validator verifies canonical state.",
+      "remaining_real_dependencies": "Replica racing, process restart, validator checkpoint selection and sustained catch-up are not covered by the first admission fixture."
+    },
+    "Cluster": {
+      "real_actors": [
+        "Java sealer",
+        "Aeron Cluster peers"
+      ],
+      "fault_plan": "Run real consensus members in a small local group; fail transports or members, vary delay/loss, reopen member storage.",
+      "recovery_invariants": "One leader per term, quorum admission, consistent canonical order, replay/catch-up, and bounded recovery.",
+      "remaining_real_dependencies": "Mocking an elected leader or accepted consensus result cannot validate elections, partition safety or primary replacement; real consensus/network scheduling is required."
+    },
+    "Fleet": {
+      "real_actors": [
+        "executor",
+        "state writer",
+        "state mirror",
+        "Redis/Sentinel",
+        "sealer"
+      ],
+      "fault_plan": "Stop and restart the affected real actor group; delete only its owned test storage and feed retained checkpoint/log or authoritative upstream data.",
+      "recovery_invariants": "Exact state and receipt parity, complete rebuild coverage before serving, bounded recovery, no stale balance rejection.",
+      "remaining_real_dependencies": "Redis promotion requires real Redis/Sentinel processes; total consensus/storage loss requires real persistence and quorum members."
+    },
+    "Coordinated": {
+      "real_actors": [
+        "ingress",
+        "sequencer",
+        "executor",
+        "discovery"
+      ],
+      "fault_plan": "Fail role boundaries together and restore dependencies in specified order; run the real discovery adapter against a controlled service.",
+      "recovery_invariants": "Every retained request resolves or fails explicitly; resume with existing senders and no orphaned queues or false readiness.",
+      "remaining_real_dependencies": "Nomad/Consul rescheduling, network identity and all-node power loss still need deployment checks."
+    },
+    "CombinedOrdering": {
+      "real_actors": [
+        "ingress",
+        "sequencer admission",
+        "sealer session adapter"
+      ],
+      "fault_plan": "Cut ingress/orderer boundaries in the case order; return peers in dependency order and reverse order; replay retained offers.",
+      "recovery_invariants": "No lost or reordered sender prefix, no false acknowledgement, no dependency deadlock, exact recovery without new intake.",
+      "remaining_real_dependencies": "The first sequencer fixture covers boundary assumptions only; real ingress composition and real Raft election closure remain pending."
+    },
+    "CombinedExec": {
+      "real_actors": [
+        "executor",
+        "state writer",
+        "validator",
+        "ingress",
+        "state mirror"
+      ],
+      "fault_plan": "Close reader/writer boundaries and remove account sources together; restore state and input in both orders.",
+      "recovery_invariants": "Atomic durable boundary, state-root parity, no unsafe sender-floor assumption or balance rejection, bounded fallback.",
+      "remaining_real_dependencies": "Requires real MDBX/commit actor and combined read-path fixtures; a mocked commit success is insufficient."
+    },
+    "L1": {
+      "real_actors": [
+        "L1 follower",
+        "batcher",
+        "validator"
+      ],
+      "fault_plan": "Serve controlled HTTP lies, missing receipts and retained history gaps; resume posting after upstream blackout.",
+      "recovery_invariants": "Verify headers/receipts, preserve canonical positions, bounded retry, exact contiguous posting and no pruning of needed data.",
+      "remaining_real_dependencies": "Wall-clock outages can be shortened only with a real clock seam or equivalent boundary-crossing evidence; contracts/retention still need integration checks."
+    },
+    "Follower": {
+      "real_actors": [
+        "L1 follower quorum",
+        "provider client"
+      ],
+      "fault_plan": "Run real follower logic against independent controlled HTTP providers; inject timeout/refusal/disagreement and restart one or all actors.",
+      "recovery_invariants": "Independent source deadlines and backoff, no false quorum, halt on disagreement and resume after valid replies.",
+      "remaining_real_dependencies": "Single-provider mocks do not validate provider quorum or process restart; retain real protocol parsers."
+    },
+    "Cache": {
+      "real_actors": [
+        "state mirror",
+        "ingress account/receipt reader",
+        "Redis/Sentinel"
+      ],
+      "fault_plan": "Inject stale rows, partial writes, absent script, lookup timeout, lost connection and interrupted checkpoint scans; retain real checkpoint state.",
+      "recovery_invariants": "Complete coverage before freshness, monotonic account updates, exact receipt identity, bounded executor fallback and rollback-safe rebuild.",
+      "remaining_real_dependencies": "Real Lua/Redis transactions and Sentinel promotion need real local services; an in-memory dictionary cannot establish their semantics."
+    },
+    "Integrity": {
+      "real_actors": [
+        "executor and MDBX writer",
+        "sealer recovery",
+        "sequencer ownership"
+      ],
+      "fault_plan": "Repeat restart sequences against real temporary stores; restore from retained authoritative history; change ownership while traffic is pending.",
+      "recovery_invariants": "Durable state survives restarts, duplicate/replayed data remains idempotent, ownership changes neither lose nor duplicate canonical transactions.",
+      "remaining_real_dependencies": "Unflushed power-loss behavior and full-chain reseeding require real storage and protocol integration."
+    },
+    "Carry": {
+      "real_actors": [
+        "sequencer admission",
+        "sealer rules",
+        "egress",
+        "executor readers"
+      ],
+      "fault_plan": "Drive actual feature/session/retention transitions while offers and reader requests are held; restart readers and outputs at each boundary.",
+      "recovery_invariants": "Correct wire format at each version, retained offers replay safely, exact carry/reference parity and readable retained windows.",
+      "remaining_real_dependencies": "The first admission fixture does not validate Java feature activation, deployed rollout order or complete carry/reference parity."
+    },
+    "Executor": {
+      "real_actors": [
+        "executor",
+        "state writer",
+        "checkpoint restore"
+      ],
+      "fault_plan": "Run real actors with controlled reader/writer failures and temporary MDBX/checkpoint files; interrupt writes, corrupt images and exhaust the checkpoint device.",
+      "recovery_invariants": "No acknowledgement before durable commit, exact replay/state parity, reject corrupt bases, preserve data on failed recovery, remain cancellable.",
+      "remaining_real_dependencies": "ENOSPC/EIO and process crash must be real fault effects; node replacement and image rollout remain deployment checks."
+    },
+    "Retention": {
+      "real_actors": [
+        "egress retention",
+        "batcher",
+        "validator",
+        "DA guard",
+        "canary"
+      ],
+      "fault_plan": "Hold posting or reader cursors beyond actual retention floors, resume requests, and drive halt/canary inputs through real actors.",
+      "recovery_invariants": "No pruning of unposted required data, exact contiguous resumed output, correct halt and alert inhibition, no false healthy state.",
+      "remaining_real_dependencies": "Mocked cursor values alone do not prove persisted coverage, contracts or alert-routing behavior."
+    }
+  },
+  "pending_registration": {},
+  "cases": [
+    {
+      "case": "graceful-ingress",
+      "family": "Ingress",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "ingress-recovery",
+          "test": "a_graceful_stop_drains_and_the_returned_ingress_serves_every_receipt"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts or replaces the stopped task: the test starts the process itself, and placement needs the scheduler"
+      ]
+    },
+    {
+      "case": "hard-ingress",
+      "family": "Ingress",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "ingress-recovery",
+          "test": "a_hard_killed_case_ingress_returns_with_no_lost_or_doubled_transfer"
+        },
+        {
+          "suite": "ingress-recovery",
+          "test": "a_hard_killed_twin_returns_and_serves_receipts_that_it_never_saw"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts or replaces the stopped task: the test starts the process itself, and placement needs the scheduler"
+      ]
+    },
+    {
+      "case": "archive-driver-loss",
+      "family": "Ingress",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "ingress-recovery",
+          "test": "a_lost_archiving_driver_ends_its_ingress_while_the_twin_serves"
+        },
+        {
+          "suite": "pipeline-recovery",
+          "test": "pipeline_blackout_restarts_every_process_and_reelects"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts the driver task and the ingress task: the test starts both itself"
+      ]
+    },
+    {
+      "case": "archive-tx-data-wipe",
+      "family": "Ingress",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "archive-recovery",
+          "test": "a_wiped_archive_restores_its_catalog_and_replays_the_exact_recording"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "archive-corruption",
+      "family": "Ingress",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "chaos-archive-stage",
+          "test": "staging_copies_only_the_selected_victim_segment"
+        },
+        {
+          "suite": "chaos-archive-stage",
+          "test": "staging_reads_the_mirrors_own_recording_name"
+        },
+        {
+          "suite": "archive-recovery",
+          "test": "a_corrupt_recording_is_detected_repaired_and_replayed_exactly"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "graceful-sequencer",
+      "family": "Sequencer",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "pipeline-recovery",
+          "test": "graceful_sequencer_drains_and_a_cold_start_regains_its_senders"
+        },
+        {
+          "suite": "sequencer",
+          "test": "shutdown_completes_while_output_is_disconnected"
+        },
+        {
+          "suite": "sequencer",
+          "test": "a_graceful_replica_stop_keeps_the_lane_ordering_and_its_restart_rejoins"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad replaces the stopped seq-0 allocation within the restart SLO: allocation placement exists only in the deployment"
+      ]
+    },
+    {
+      "case": "hard-sequencer",
+      "family": "Sequencer",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "a_hard_replica_kill_loses_no_offer_and_its_cold_restart_rejoins"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts the killed sequencer-0 task container on its node: task supervision exists only in the deployment"
+      ]
+    },
+    {
+      "case": "sequencer-replica-kill-lane0-node0",
+      "family": "Sequencer",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "sequencer-replica-kill-lane1-node1",
+      "family": "Sequencer",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "sequencer-replica-kill-lane0-node1",
+      "family": "Sequencer",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "sequencer-replica-kill-lane1-node0",
+      "family": "Sequencer",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "each_restarted_replica_orders_an_established_sender_while_its_twin_is_frozen"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts the killed replica and the frozen twin keeps its container id: container identity exists only in the deployment"
+      ]
+    },
+    {
+      "case": "sequencer-lapse",
+      "family": "Sequencer",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "delayed_canonical_input_fills_the_outbox_then_resumes_in_order"
+        },
+        {
+          "suite": "sequencer",
+          "test": "a_lapsed_replica_publishes_fresh_work_after_thaw_while_its_twin_ordered"
+        },
+        {
+          "suite": "sequencer-lapse-stack",
+          "test": "a_frozen_sequencer_exits_on_the_client_timeout_and_returns_cold_with_fresh_work"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the count of PAST-DEADLINE lines in the sealer logs: the case only reports it, from the deployed Java sealer"
+      ]
+    },
+    {
+      "case": "validator-lapse",
+      "family": "Sequencer",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "validator-recovery",
+          "test": "a_short_lapse_keeps_the_same_process_verifying_past_its_count"
+        },
+        {
+          "suite": "validator-recovery",
+          "test": "a_long_lapse_ends_the_process_and_the_restart_resumes_from_its_state"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts the task that exits after the client timeout: the restart policy and the container replacement belong to the deployment; the test starts the same binary on the same state as the supervisor"
+      ]
+    },
+    {
+      "case": "validator-join",
+      "family": "Sequencer",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "validator-recovery",
+          "test": "a_fresh_validator_adopts_the_peer_checkpoint_and_verifies_live"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Consul DNS resolves the executor checkpoint peers: the names exist only in the deployed catalog; the test addresses the peer server by IP",
+        "Nomad restarts the killed task on its wiped volume: the restart policy belongs to the deployment"
+      ]
+    },
+    {
+      "case": "lookup-blackout",
+      "family": "Sequencer",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "absent_lookup_reply_holds_the_sender_until_the_real_account_event_arrives"
+        },
+        {
+          "suite": "sequencer",
+          "test": "a_lookup_blackout_fails_lookups_while_the_cluster_feed_lives_then_answers"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts the lane-0 task and the replacement process stays the same through each proof: task supervision and container identity exist only in the deployment",
+        "iptables drops receipt DATA frames, executor query TCP and Redis TCP on the sequencer node: the kernel packet filter of the deployed node; the local test withholds the rows, holds every executor query and runs without Redis, so the Redis client error path is left to the deployment"
+      ]
+    },
+    {
+      "case": "cluster-leader-kill",
+      "family": "Cluster",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "lost_offer_on_session_restart_replays_the_exact_prefix_before_its_suffix"
+        },
+        {
+          "suite": "sealer-raft",
+          "test": "io.kardamom.sealer.cluster.SealerClusterFailoverTest::egressContinuesGaplesslyAcrossLeaderKill()"
+        },
+        {
+          "suite": "sealer-raft-members",
+          "test": "io.kardamom.sealer.cluster.ClusterLeaderKillTest::a_killed_leader_leaves_a_quorum_that_commits_and_the_member_rejoins()"
+        }
+      ],
+      "full_case_locally_validated": true
+    },
+    {
+      "case": "raft-leader-one-way-partition",
+      "family": "Cluster",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-network",
+          "test": "io.kardamom.sealer.cluster.RaftLeaderOneWayPartitionTest::the_peers_of_a_leader_that_cannot_send_elect_a_new_leader_and_the_old_one_stays_up()"
+        }
+      ],
+      "full_case_locally_validated": true
+    },
+    {
+      "case": "raft-leader-packet-loss",
+      "family": "Cluster",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-network",
+          "test": "io.kardamom.sealer.cluster.RaftLeaderPacketLossTest::a_lossy_leader_link_keeps_commits_and_one_leader_per_term()"
+        }
+      ],
+      "full_case_locally_validated": true
+    },
+    {
+      "case": "cluster-follower-kill",
+      "family": "Cluster",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-members",
+          "test": "io.kardamom.sealer.cluster.ClusterFollowerKillTest::a_killed_follower_restores_its_snapshot_while_the_quorum_commits()"
+        }
+      ],
+      "full_case_locally_validated": true
+    },
+    {
+      "case": "cluster-member-rejoin",
+      "family": "Cluster",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft",
+          "test": "io.kardamom.sealer.cluster.SealerSeedClusterTest::a_seeded_cluster_confirms_relays_from_e_h_and_restarts_from_its_snapshot()"
+        },
+        {
+          "suite": "sealer-raft-members",
+          "test": "io.kardamom.sealer.cluster.ClusterMemberRejoinTest::a_wiped_follower_seeds_from_a_peer_after_the_leader_purged_its_log()"
+        }
+      ],
+      "full_case_locally_validated": true
+    },
+    {
+      "case": "cluster-two-blank-recover",
+      "family": "Cluster",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-members",
+          "test": "io.kardamom.sealer.cluster.ClusterTwoBlankRecoverTest::an_offline_copy_of_the_survivor_restores_a_quorum_that_seeds_the_last_blank_member()"
+        }
+      ],
+      "full_case_locally_validated": true
+    },
+    {
+      "case": "node-replace-sealer",
+      "family": "Cluster",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-members",
+          "test": "io.kardamom.sealer.cluster.NodeReplaceSealerTest::a_follower_on_a_new_node_seeds_from_a_peer_and_catches_up()"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "machine replacement: the Terraform root replaces the node and Nomad places the member on it; only the deployed cluster has them",
+        "address change through the Consul node record: the local test moves the name in a hosts file instead"
+      ]
+    },
+    {
+      "case": "cpu-squeeze",
+      "family": "Cluster",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-network",
+          "test": "io.kardamom.sealer.cluster.CpuSqueezeTest::starved_members_slow_down_but_never_fork_the_canonical_order()"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "executor-fleet-loss-recover",
+      "family": "Fleet",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "whole::a_whole_fleet_kill_resumes_each_replica_from_its_own_disk"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "docker kill and docker start of the executor nodes, or Nomad job stop and restore on the sealer nodes"
+      ]
+    },
+    {
+      "case": "executor-fleet-wipe-recover",
+      "family": "Fleet",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "whole::a_whole_fleet_wipe_restores_each_replica_from_its_local_checkpoint"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad job stop after the kills and restore after the wipe"
+      ]
+    },
+    {
+      "case": "executor-fleet-total-wipe-recover",
+      "family": "Fleet",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "whole::a_total_wipe_resumes_every_replica_from_a_rebuilt_da_image"
+        },
+        {
+          "suite": "executor-total-wipe-l1",
+          "test": "l1::a_total_wipe_resumes_every_replica_from_an_image_rebuilt_from_l1"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad job stop and restore, and the docker cp install with the owner and mode of each node container"
+      ]
+    },
+    {
+      "case": "redis-total-loss-recover",
+      "family": "Fleet",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "state-mirror",
+          "test": "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "a_failed_read_is_retried_and_only_a_complete_fresh_read_passes"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "separate_partial_observations_cannot_be_combined_into_a_pass"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "persistent_read_failure_preserves_its_cause_at_the_original_deadline"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "a_hanging_read_cannot_extend_the_original_deadline"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "missing_extra_malformed_and_wrong_rows_cannot_certify_coverage"
+        },
+        {
+          "suite": "state-mirror-total-loss",
+          "test": "mirror::component_tests::total_loss::a_total_loss_rebuilds_every_account_and_the_readers_recover"
+        },
+        {
+          "suite": "cache-sentinel-total-loss",
+          "test": "a_total_loss_returns_an_empty_group_and_the_same_cache_client_recovers"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad stop and restore of the redis job and its allocation count",
+        "the Sentinel group never restarted: the Nomad allocation restart history"
+      ]
+    },
+    {
+      "case": "cluster-quorum-loss-recover",
+      "family": "Fleet",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-fleet",
+          "test": "io.kardamom.sealer.cluster.ClusterQuorumLossRecoverTest::a_cluster_without_a_quorum_stalls_and_commits_again_when_a_member_returns()"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "power-off of whole sealer nodes with Nomad on them: the local test kills the member processes only"
+      ]
+    },
+    {
+      "case": "cluster-total-loss-recover",
+      "family": "Fleet",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-fleet",
+          "test": "io.kardamom.sealer.cluster.ClusterTotalLossRecoverTest::every_member_returns_from_its_own_state_and_the_cluster_commits_again()"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "power-off of all sealer nodes with their executors and Nomad agents: the local test kills the member processes only"
+      ]
+    },
+    {
+      "case": "ingress-pair-loss-recover",
+      "family": "Coordinated",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "pipeline-recovery",
+          "test": "ingress_pair_loss_returns_both_replicas"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts or replaces the stopped task: the local stack starts the process itself, and placement needs the scheduler"
+      ]
+    },
+    {
+      "case": "sequencer-lane-loss-recover",
+      "family": "Coordinated",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "pipeline-recovery",
+          "test": "sequencer_lane_loss_relearns_the_sender_floor"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts or replaces the stopped task: the local stack starts the process itself, and placement needs the scheduler"
+      ]
+    },
+    {
+      "case": "control-plane-loss-recover",
+      "family": "Coordinated",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "control-plane-loss",
+          "test": "workers_keep_their_data_path_through_a_metadata_partition_and_reregister"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the data nodes lose the Nomad API and RPC and Consul DNS: these are cluster services",
+        "Nomad keeps the workers placed and returns them to their counts: placement needs the scheduler"
+      ]
+    },
+    {
+      "case": "pipeline-blackout-recover",
+      "family": "Coordinated",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "pipeline-recovery",
+          "test": "pipeline_blackout_restarts_every_process_and_reelects"
+        },
+        {
+          "suite": "pipeline-recovery",
+          "test": "pipeline_blackout_rebuilds_the_read_path"
+        },
+        {
+          "suite": "ingress-deadline",
+          "test": "a_lagging_executor_head_does_not_age_the_deadline_of_a_new_submit"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "docker kill and start of every pipeline node container, and Nomad job counts after it: node power loss needs the cluster nodes",
+        "the three-member election after a blackout: both local blackout tests run one sealer member to stay inside 60 s; the combined suite closes three-member elections after a sealer loss"
+      ]
+    },
+    {
+      "case": "ingress-sequencer-loss-recover",
+      "family": "CombinedOrdering",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "pipeline-combined",
+          "test": "ingress_and_sequencer_loss_return_in_order"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restores the stopped jobs and docker starts the sealer nodes: the local stack starts the processes itself"
+      ]
+    },
+    {
+      "case": "ingress-sealer-loss-recover",
+      "family": "CombinedOrdering",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "pipeline-combined",
+          "test": "ingress_returns_before_the_sealer_and_waits"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restores the stopped jobs and docker starts the sealer nodes: the local stack starts the processes itself"
+      ]
+    },
+    {
+      "case": "sequencer-sealer-loss-recover",
+      "family": "CombinedOrdering",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "output_backpressure_and_disconnect_recover_without_new_client_input"
+        },
+        {
+          "suite": "sequencer",
+          "test": "lost_offer_on_session_restart_replays_the_exact_prefix_before_its_suffix"
+        },
+        {
+          "suite": "chaos-election",
+          "test": "election_refreshes_allocations_after_a_log_retry_budget_expires"
+        },
+        {
+          "suite": "chaos-election",
+          "test": "missing_logs_exhaust_the_election_deadline_with_the_read_cause"
+        },
+        {
+          "suite": "chaos-election",
+          "test": "readable_logs_without_a_closed_majority_do_not_certify_recovery"
+        },
+        {
+          "suite": "pipeline-combined",
+          "test": "sequencer_and_sealer_loss_stall_then_return_together"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restores the stopped jobs and docker starts the sealer nodes: the local stack starts the processes itself"
+      ]
+    },
+    {
+      "case": "ingress-sequencer-sealer-loss-recover",
+      "family": "CombinedOrdering",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "pipeline-combined",
+          "test": "ingress_sequencer_and_sealer_return_in_order"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restores the stopped jobs and docker starts the sealer nodes: the local stack starts the processes itself"
+      ]
+    },
+    {
+      "case": "ingress-sequencer-sealer-reverse",
+      "family": "CombinedOrdering",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "pipeline-combined",
+          "test": "ingress_sequencer_and_sealer_return_in_reverse_and_wait"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restores the stopped jobs and docker starts the sealer nodes: the local stack starts the processes itself"
+      ]
+    },
+    {
+      "case": "executor-sealer-loss-recover",
+      "family": "CombinedExec",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "transport-pressure",
+          "test": "unavailable_outputs_preserve_live_delivery_and_recover"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::executors_that_return_before_the_sealers_wait_and_then_catch_up"
+        },
+        {
+          "suite": "sealer-raft-fleet",
+          "test": "io.kardamom.sealer.cluster.ClusterTotalLossRecoverTest::every_member_returns_from_its_own_state_and_the_cluster_commits_again()"
+        },
+        {
+          "suite": "ingress-sealer-quorum",
+          "test": "chain::tests::a_silent_cluster_halts_the_sealer_on_a_lost_quorum_and_a_status_ends_it"
+        },
+        {
+          "suite": "pipeline-recovery",
+          "test": "pipeline_blackout_restarts_every_process_and_reelects"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "node kills of the executor and sealer nodes, Nomad job stops and restores, and the allocation counts that show no failed restart",
+        "the ingress pair live check on deployed ingress processes",
+        "the 60 s reverse stagger of the executors before the sealers on deployed nodes"
+      ]
+    },
+    {
+      "case": "executor-sealer-validator-recover",
+      "family": "CombinedExec",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "whole::executors_that_return_before_the_sealers_wait_and_then_catch_up"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "ingress-executor-loss-recover",
+      "family": "CombinedExec",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_resumes_batch_at_failed_suffix"
+        },
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_fail_stops_on_a_fatal_error"
+        },
+        {
+          "suite": "executor-pipeline",
+          "test": "exec_settles_inflight_commits_while_idle"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::executors_that_return_before_the_sealers_wait_and_then_catch_up"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::returned_ingresses_serve_a_pre_fault_receipt_from_executor_state"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad stop and restore of the ingress job, the node kill of the executor nodes, and the allocation counts"
+      ]
+    },
+    {
+      "case": "read-path-loss-recover",
+      "family": "CombinedExec",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_resumes_batch_at_failed_suffix"
+        },
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_fail_stops_on_a_fatal_error"
+        },
+        {
+          "suite": "executor-pipeline",
+          "test": "exec_settles_inflight_commits_while_idle"
+        },
+        {
+          "suite": "ingress-accounts",
+          "test": "a_lagging_executor_answer_admits"
+        },
+        {
+          "suite": "ingress-receipts",
+          "test": "a_failed_egress_falls_back_to_the_executor"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "a_failed_read_is_retried_and_only_a_complete_fresh_read_passes"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "separate_partial_observations_cannot_be_combined_into_a_pass"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "persistent_read_failure_preserves_its_cause_at_the_original_deadline"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "a_hanging_read_cannot_extend_the_original_deadline"
+        },
+        {
+          "suite": "chaos-projection",
+          "test": "missing_extra_malformed_and_wrong_rows_cannot_certify_coverage"
+        },
+        {
+          "suite": "state-mirror-total-loss",
+          "test": "mirror::component_tests::total_loss::a_total_loss_rebuilds_every_account_and_the_readers_recover"
+        },
+        {
+          "suite": "state-mirror-total-loss",
+          "test": "mirror::component_tests::total_loss::the_whole_read_path_returns_in_reverse_order_and_every_mirror_rebuilds"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::returned_ingresses_serve_a_pre_fault_receipt_from_executor_state"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::a_whole_fleet_kill_resumes_each_replica_from_its_own_disk"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad stop and restore of the executor, redis and state-mirror jobs, and their allocation counts"
+      ]
+    },
+    {
+      "case": "sequencer-executor-redis-loss",
+      "family": "CombinedExec",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "whole::executors_that_return_before_the_sealers_wait_and_then_catch_up"
+        },
+        {
+          "suite": "transport-mds-remove",
+          "test": "removing_receive_destinations_keeps_the_live_images_and_logs_no_driver_error"
+        },
+        {
+          "suite": "state-mirror-total-loss",
+          "test": "mirror::component_tests::total_loss::a_total_loss_rebuilds_every_account_and_the_readers_recover"
+        },
+        {
+          "suite": "pipeline-recovery",
+          "test": "sequencer_executor_redis_loss_looks_every_floor_up"
+        }
+      ],
+      "full_case_locally_validated": false,
+      "cluster_only_checks": [
+        "Nomad restarts the sequencer, executor and Redis jobs, not the test",
+        "no returned job shows a failed exit or a restart in Nomad"
+      ]
+    },
+    {
+      "case": "l1-liar",
+      "family": "L1",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "l1-source-quorum",
+          "test": "one_liar_halts_the_read_with_both_answers_and_the_counter"
+        },
+        {
+          "suite": "chaos-alert",
+          "test": "fast_alert_samples_require_the_full_hold_duration"
+        },
+        {
+          "suite": "chaos-alert",
+          "test": "slow_alert_samples_use_elapsed_time_within_the_original_budget"
+        },
+        {
+          "suite": "chaos-alert",
+          "test": "inactive_unknown_and_failed_reads_each_reset_the_hold"
+        },
+        {
+          "suite": "chaos-alert",
+          "test": "first_slow_response_does_not_certify_unobserved_time"
+        },
+        {
+          "suite": "chaos-alert",
+          "test": "failed_alert_reads_preserve_the_cause_at_the_total_deadline"
+        },
+        {
+          "suite": "chaos-alert",
+          "test": "hanging_alert_read_cannot_extend_the_total_budget"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "l1-null-receipts",
+      "family": "L1",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "batcher-null-receipts",
+          "test": "hidden_mined_receipts_reconcile_without_duplicate_posts_or_early_cursor"
+        },
+        {
+          "suite": "batcher-null-receipts",
+          "test": "restart_during_hidden_receipts_uses_contract_truth_without_waiting_for_the_indexer"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "the_age_runs_from_the_newest_block_that_carried_a_post"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "a_seed_attempt_times_out_and_can_start_again_without_overlapping"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "input_close_stops_the_actor_during_an_unresponsive_archive_read"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "a_late_archive_seed_cannot_replace_a_newer_live_post"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "all_three_archive_requests_share_one_deadline"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "closing_the_owner_cancels_the_inflight_archive_task"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "an_unresponsive_archive_does_not_hide_a_live_post"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "the_complete_archive_seed_publishes_without_waiting_for_another_tick"
+        },
+        {
+          "suite": "batcher-post-age",
+          "test": "a_failed_archive_read_retries_with_the_same_client_and_recovers"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "two-day-outage",
+      "family": "L1",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "batcher-outage-past-retention",
+      "family": "L1",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "egress-owner",
+          "test": "unposted_blocks_remain_replayable_after_pruning_and_a_restart"
+        },
+        {
+          "suite": "batcher-recovery",
+          "test": "a_restored_post_is_reconciled_before_live_blocks_can_extend_it"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "l1-transport-refusals",
+      "family": "Follower",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "l1-source-quorum",
+          "test": "a_rate_limited_source_rotates_out_and_the_rest_continue"
+        },
+        {
+          "suite": "l1-source-quorum",
+          "test": "a_rotated_source_returns_after_the_backoff"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "l1-provider-unresponsive",
+      "family": "Follower",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "l1-provider-http",
+          "test": "unresponsive_sources_cannot_hold_the_follower_read_forever"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "follower-instance-loss",
+      "family": "Follower",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "l1-watcher-recovery",
+          "test": "a_restart_in_the_publish_to_commit_window_loses_no_epoch"
+        },
+        {
+          "suite": "l1-watcher-pause",
+          "test": "a_watcher_without_its_record_pauses_on_the_follower_and_resumes"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "follower-total-loss",
+      "family": "Follower",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "l1-watcher-recovery",
+          "test": "a_restart_in_the_publish_to_commit_window_loses_no_epoch"
+        },
+        {
+          "suite": "l1-watcher-pause",
+          "test": "a_watcher_without_its_record_pauses_on_the_follower_and_resumes"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "follower-disagreement",
+      "family": "Follower",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "l1-source-quorum",
+          "test": "one_liar_halts_the_read_with_both_answers_and_the_counter"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "mirror-backlog-client-restart",
+      "family": "Cache",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "ingress-accounts",
+          "test": "a_lagging_executor_answer_admits"
+        },
+        {
+          "suite": "ingress-receipts",
+          "test": "a_failed_egress_falls_back_to_the_executor"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "projection_recovery_requires_a_later_head_from_every_writer"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "held_heads_require_three_complete_positive_position_tags"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "regressed_or_single_step_counters_cannot_prove_both_fallback_reads"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_nonce_and_balance_fallback_needs_two_misses_and_no_cache_hit"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_failed_baseline_read_retries_before_capturing_exact_state"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_transient_recovery_read_does_not_discard_the_remaining_budget"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "persistent_errors_keep_the_cause_at_the_original_recovery_deadline"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_hanging_snapshot_cannot_extend_the_baseline_deadline"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "every_writer_must_advance_twice_with_the_exact_account"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "promotion_requires_two_complete_observations_on_the_new_primary"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "fixed_held_heads_cannot_prove_recovery_even_with_a_correct_account"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "the_real_client_reads_heads_and_account_in_one_primary_transaction"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "demotion_after_connect_cannot_certify_the_transaction_snapshot"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_missing_head_in_the_real_reply_cannot_certify_coverage"
+        },
+        {
+          "suite": "chaos-cache-backlog",
+          "test": "a_silent_exec_reply_expires_the_real_client_read"
+        },
+        {
+          "suite": "chaos-cache-readers",
+          "test": "every_reader_must_prove_redis_use_without_degradation"
+        },
+        {
+          "suite": "chaos-cache-readers",
+          "test": "missing_duplicate_foreign_and_failed_readers_cannot_certify_recovery"
+        },
+        {
+          "suite": "chaos-cache-readers",
+          "test": "separate_partial_observations_do_not_accumulate_into_recovery"
+        },
+        {
+          "suite": "chaos-cache-readers",
+          "test": "a_fresh_complete_reading_recovers_after_a_failed_probe"
+        },
+        {
+          "suite": "chaos-cache-readers",
+          "test": "a_hung_probe_preserves_the_original_recovery_deadline"
+        },
+        {
+          "suite": "chaos-cache-readers",
+          "test": "both_real_rpc_endpoints_must_prove_their_own_redis_read"
+        },
+        {
+          "suite": "chaos-cache-readers",
+          "test": "complete_http_recovery_passes_and_rpc_failure_cannot_pass_on_counters"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "redis-partition-ingress",
+      "family": "Cache",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "ingress-accounts",
+          "test": "a_lagging_executor_answer_admits"
+        },
+        {
+          "suite": "ingress-receipts",
+          "test": "a_failed_egress_falls_back_to_the_executor"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "redis-primary-kill",
+      "family": "Cache",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "cache-sentinel",
+          "test": "a_killed_primary_promotes_a_replica_and_the_same_cache_client_recovers"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "redis-primary-freeze",
+      "family": "Cache",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "cache-sentinel",
+          "test": "a_frozen_primary_promotes_a_replica_and_the_same_cache_client_recovers"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "mirror-kill-rebuild",
+      "family": "Cache",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "state-mirror",
+          "test": "interrupted_partial_rebuild_restores_untouched_accounts_without_regressing_live_rows"
+        },
+        {
+          "suite": "state-mirror-coverage-gap",
+          "test": "persisted_progress_cannot_hide_an_interrupted_rebuild"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "executor-restart-storm",
+      "family": "Integrity",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "replica::ten_stop_and_start_rounds_advance_every_replica_each_round"
+        },
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_reopens_an_unconnected_publication_once_and_delivers"
+        },
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_exits_after_the_total_budget_without_a_subscriber"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad job stop and restore ten times; the tx_receipts reopen on a new Aeron control port is evidence only, and its escalation is in executor-commit"
+      ]
+    },
+    {
+      "case": "sealer-fleet-total-wipe-recover",
+      "family": "Integrity",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-fleet",
+          "test": "io.kardamom.sealer.cluster.SealerFleetTotalWipeTest::a_wiped_fleet_restarts_after_the_posted_head_from_a_seed()"
+        },
+        {
+          "suite": "reconstruct-seed",
+          "test": "rebuild_from_l1_writes_the_sealer_seed_at_the_posted_head"
+        },
+        {
+          "suite": "l1-watcher-recovery",
+          "test": "a_start_resumes_after_the_sealer_origin_below_the_file"
+        },
+        {
+          "suite": "state-mirror",
+          "test": "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close"
+        },
+        {
+          "suite": "executor-total-wipe-l1",
+          "test": "l1::a_total_wipe_resumes_every_replica_from_an_image_rebuilt_from_l1"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::a_total_wipe_resumes_every_replica_from_a_rebuilt_da_image"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "resize-scale-out-in",
+      "family": "Integrity",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer-resize",
+          "test": "a_scale_out_and_in_with_a_killed_new_replica_orders_every_nonce_once"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the Nomad scale-out and scale-in jobs, and the count of six sequencer allocations during the overlap",
+        "the ingress roll onto each map version: a job update that the ingress map-version gauge shows"
+      ]
+    },
+    {
+      "case": "carry-deposits-provider-fault",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-versions-on",
+      "family": "Carry",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sealer-raft",
+          "test": "io.kardamom.sealer.cluster.SealerCarryClusterTest::every_member_orders_each_full_reference_once_with_its_bytes()"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-held-offer-after-downgrade",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-readers-on-egress",
+      "family": "Carry",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "egress-owner",
+          "test": "the_run_ends_when_every_sender_is_gone"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-window-on",
+      "family": "Carry",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sealer-actor",
+          "test": "io.kardamom.sealer.cluster.SealerCarryWindowTest::version_five_keeps_only_the_window_at_any_posted_head()"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-executor-first",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-executors-rest",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-deposits-all-carry",
+      "family": "Carry",
+      "status": "planned",
+      "local_tests": [],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-window-off-on",
+      "family": "Carry",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sealer-actor",
+          "test": "io.kardamom.sealer.cluster.SealerCarryActivationTest::a_member_restored_at_any_entry_ends_with_the_bytes_of_its_peer()"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-leader-kill-at-switch",
+      "family": "Carry",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "lost_offer_on_session_restart_replays_the_exact_prefix_before_its_suffix"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "carry-egress-restart",
+      "family": "Carry",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "egress-owner",
+          "test": "the_run_ends_when_every_sender_is_gone"
+        },
+        {
+          "suite": "egress-catchup",
+          "test": "a_restarted_egress_joins_the_copies_from_a_peer"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "graceful-executor",
+      "family": "Executor",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_resumes_batch_at_failed_suffix"
+        },
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_fail_stops_on_a_fatal_error"
+        },
+        {
+          "suite": "executor-pipeline",
+          "test": "exec_settles_inflight_commits_while_idle"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "a_graceful_stop_resumes_from_the_durable_cursor_without_loss_or_duplicate"
+        },
+        {
+          "suite": "executor-exec-stream",
+          "test": "stream::restarted_replicas_record_new_sessions_and_live_cursors_keep_moving"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restart and allocation count: the orchestrator brings the task back; the local test starts the process itself"
+      ]
+    },
+    {
+      "case": "hard-executor",
+      "family": "Executor",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_resumes_batch_at_failed_suffix"
+        },
+        {
+          "suite": "executor-commit",
+          "test": "commit_thread_fail_stops_on_a_fatal_error"
+        },
+        {
+          "suite": "executor-pipeline",
+          "test": "exec_settles_inflight_commits_while_idle"
+        },
+        {
+          "suite": "state-writer-crash",
+          "test": "process_loss_before_commit_discards_the_entire_uncommitted_block"
+        },
+        {
+          "suite": "state-writer-crash",
+          "test": "process_loss_after_commit_preserves_a_block_without_a_published_snapshot"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "replica::a_killed_replica_resumes_from_its_disk_while_its_peers_progress"
+        },
+        {
+          "suite": "executor-exec-stream",
+          "test": "stream::restarted_replicas_record_new_sessions_and_live_cursors_keep_moving"
+        },
+        {
+          "suite": "sealer-record-lag",
+          "test": "io.kardamom.sealer.RecordLagGuardTest::the_best_cursor_is_the_maximum_over_the_executors()"
+        },
+        {
+          "suite": "sealer-record-lag",
+          "test": "io.kardamom.sealer.cluster.SealerRecordLagTest::a_cursor_that_moves_the_best_up_broadcasts_the_status_tail()"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restart and allocation count: the orchestrator brings the task back; the local test starts the process itself"
+      ]
+    },
+    {
+      "case": "node-failure-executor",
+      "family": "Executor",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "state-writer-crash",
+          "test": "process_loss_before_commit_discards_the_entire_uncommitted_block"
+        },
+        {
+          "suite": "state-writer-crash",
+          "test": "process_loss_after_commit_preserves_a_block_without_a_published_snapshot"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "replica::a_killed_replica_resumes_from_its_disk_while_its_peers_progress"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::a_whole_fleet_kill_resumes_each_replica_from_its_own_disk"
+        },
+        {
+          "suite": "sealer-raft",
+          "test": "io.kardamom.sealer.cluster.SealerClusterFailoverTest::egressContinuesGaplesslyAcrossLeaderKill()"
+        },
+        {
+          "suite": "sealer-raft-members",
+          "test": "io.kardamom.sealer.cluster.ClusterFollowerKillTest::a_killed_follower_restores_its_snapshot_while_the_quorum_commits()"
+        },
+        {
+          "suite": "executor-driver-late-start",
+          "test": "an_executor_started_before_its_driver_waits_and_opens_its_streams"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "docker kill and docker start of the node container, and Nomad placement of the executor and the member on it",
+        "Nomad restart and allocation count: the orchestrator brings the task back; the local test starts the process itself"
+      ]
+    },
+    {
+      "case": "node-replace-executor",
+      "family": "Executor",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "replica::a_blank_replacement_fetches_a_peer_checkpoint_and_catches_up"
+        },
+        {
+          "suite": "sealer-raft-members",
+          "test": "io.kardamom.sealer.cluster.NodeReplaceSealerTest::a_follower_on_a_new_node_seeds_from_a_peer_and_catches_up()"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "machine replacement: a new container generation, address plan and substrate play",
+        "Consul forgets the old node record and Nomad places the executor and the member on the new client"
+      ]
+    },
+    {
+      "case": "state-checkpoint-restore",
+      "family": "Executor",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "replica::a_wiped_replica_restores_a_copied_donor_checkpoint"
+        },
+        {
+          "suite": "checkpoint-copy",
+          "test": "a_tmpfs_checkpoint_is_copied_and_verified_in_the_container_mount_namespace"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "replica::a_wiped_replica_restores_a_copied_donor_base_and_log"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restart and allocation count: the orchestrator brings the task back; the local test starts the process itself"
+      ]
+    },
+    {
+      "case": "checkpoint-corrupt-recover",
+      "family": "Executor",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "checkpoint-copy",
+          "test": "a_tmpfs_checkpoint_is_copied_and_verified_in_the_container_mount_namespace"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "whole::a_corrupt_local_checkpoint_is_quarantined_before_a_peer_restore"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the Nomad job patch that pauses only the pinned executor-0 group, and its restore"
+      ]
+    },
+    {
+      "case": "checkpoint-disk-full",
+      "family": "Executor",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "checkpoint-copy",
+          "test": "a_tmpfs_checkpoint_is_copied_and_verified_in_the_container_mount_namespace"
+        },
+        {
+          "suite": "state-aux-enospc",
+          "test": "auxiliary_enospc_preserves_commits_and_recovers_checkpoint_and_log"
+        },
+        {
+          "suite": "checkpoint-fault",
+          "test": "only_the_victim_checkpoint_source_changes"
+        },
+        {
+          "suite": "checkpoint-fault",
+          "test": "enospc_proof_needs_both_failures_after_baseline_and_victim_transaction_progress"
+        },
+        {
+          "suite": "checkpoint-fault",
+          "test": "exact_fault_script_refuses_unbounded_storage_and_requires_enospc"
+        },
+        {
+          "suite": "checkpoint-fault",
+          "test": "large_images_survive_the_exact_controller_enospc_and_release"
+        },
+        {
+          "suite": "executor-checkpoint-enospc",
+          "test": "disk::a_full_checkpoint_volume_keeps_the_same_executor_committing_and_recovers"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the Nomad job patch that binds the dedicated tmpfs to the victim, and the restore of the saved job"
+      ]
+    },
+    {
+      "case": "replay-window-resync",
+      "family": "Executor",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft",
+          "test": "io.kardamom.sealer.cluster.SealerReplayTest::evictedRangeIsRefusedHonestly()"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "replica::a_wiped_replica_behind_the_window_fetches_a_peer_base_and_log"
+        },
+        {
+          "suite": "executor-recovery",
+          "test": "replica::a_cursor_below_the_retention_floor_stages_a_peer_checkpoint_in_process"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restart and allocation count: the orchestrator brings the task back; the local test starts the process itself"
+      ]
+    },
+    {
+      "case": "deploy-broken-image",
+      "family": "Executor",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "executor-recovery",
+          "test": "replica::a_failed_start_keeps_the_state_and_a_rolling_heal_converges"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "the deploy role and the image manifest: the broken deploy stops at the executor job and never reaches the later jobs",
+        "Nomad deployment health deadline and the rolling update of pinned groups",
+        "the release gate on the chain status before each deploy"
+      ]
+    },
+    {
+      "case": "retention-overrun",
+      "family": "Retention",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "egress-owner",
+          "test": "unposted_blocks_remain_replayable_after_pruning_and_a_restart"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "retention-overrun-validator",
+      "family": "Retention",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "egress-owner",
+          "test": "unposted_blocks_remain_replayable_after_pruning_and_a_restart"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "prune-floor",
+      "family": "Retention",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "egress-owner",
+          "test": "unposted_blocks_remain_replayable_after_pruning_and_a_restart"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "da-lag-halt",
+      "family": "Retention",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "ingress-da-halt",
+          "test": "the_tags_follow_the_posted_head_and_a_halt_refuses_submits"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "canary-da-lag",
+      "family": "Retention",
+      "status": "partial",
+      "local_tests": [
+        {
+          "suite": "ingress-da-halt",
+          "test": "the_tags_follow_the_posted_head_and_a_halt_refuses_submits"
+        }
+      ],
+      "full_case_locally_validated": false
+    },
+    {
+      "case": "raft-leader-packet-delay",
+      "family": "Cluster",
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sealer-raft-network",
+          "test": "io.kardamom.sealer.cluster.RaftLeaderPacketDelayTest::a_slow_leader_link_keeps_commits_and_one_leader_per_term()"
+        }
+      ],
+      "full_case_locally_validated": true
+    }
+  ]
+}

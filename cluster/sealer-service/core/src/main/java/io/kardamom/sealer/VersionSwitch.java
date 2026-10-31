@@ -3,6 +3,7 @@ package io.kardamom.sealer;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Optional;
+import java.util.stream.Stream;
 
 /**
  * The switch between decision versions 3, 4 and 5. Two members
@@ -70,6 +71,15 @@ import java.util.Optional;
  * boundary by the same rules as a version. Its rules apply only while the
  * flag is on and version 5 runs. When version 5 stops, the flag keeps its
  * value, so its rules come back with version 5.</p>
+ *
+ * <p>A chain can run features from its genesis ({@link GenesisFeatures}).
+ * The switch of such a chain holds one activation of each of these
+ * features at L1 origin 0 with the time {@link #GENESIS_MS}. Such an
+ * activation is visible at every boundary and its time is at or below the
+ * time of every block, so the feature is on from the first block. It
+ * stays until a real activation of the feature becomes visible. The held
+ * activations put the switch in the snapshot, so a member that restores
+ * one keeps the rules.</p>
  */
 public final class VersionSwitch {
 
@@ -106,6 +116,9 @@ public final class VersionSwitch {
     /** The most activations of one feature that a state holds: the visible one and two that wait. */
     static final int MAX_HELD = 3;
 
+    /** The time in ms of an activation at genesis: at or below the time of every block. */
+    static final long GENESIS_MS = 1L;
+
     /** The activations of {@link #FEATURE_SEALER_V4}. */
     private final Schedule v4 = new Schedule();
 
@@ -135,9 +148,71 @@ public final class VersionSwitch {
         this.version = version;
     }
 
-    /** The switch of a state that starts at genesis or from a seed. */
+    /** The switch of a state that starts at genesis with no feature, or from a seed without the rules. */
     static VersionSwitch start() {
         return new VersionSwitch(OFF_VERSION);
+    }
+
+    /**
+     * The switch of a state that starts at genesis with {@code features}:
+     * one held activation of each feature at L1 origin 0 and time
+     * {@link #GENESIS_MS}. The version and the carry window flag come from
+     * the rule of a boundary.
+     */
+    public static VersionSwitch genesis(final GenesisFeatures features) {
+        final VersionSwitch rules = start();
+        rules.schedulesOf(features).forEach(schedule -> schedule.hold(0L, GENESIS_MS));
+        rules.atBoundary(0L, 0L, GENESIS_MS);
+        return rules;
+    }
+
+    /** A copy that changes apart from this switch. */
+    VersionSwitch copy() {
+        final VersionSwitch copy = new VersionSwitch(version);
+        copy.carryWindow = carryWindow;
+        copy.fileStore = fileStore;
+        copy.sealedOrigin = sealedOrigin;
+        copy.v4.copyFrom(v4);
+        copy.carry.copyFrom(carry);
+        copy.window.copyFrom(window);
+        return copy;
+    }
+
+    /**
+     * Whether the switch holds an activation of each feature of
+     * {@code features}. A schedule that holds an activation always keeps
+     * its newest visible one, so the switch of a chain that ran the
+     * features from its genesis holds one of each for all time.
+     */
+    public boolean holdsEach(final GenesisFeatures features) {
+        return schedulesOf(features).allMatch(schedule -> schedule.held > 0);
+    }
+
+    /**
+     * Whether this switch is the switch of a chain that runs exactly
+     * {@code features} from its genesis. It holds an activation of each
+     * feature of the set, and no activation at L1 origin 0 of a feature
+     * outside the set. Only a genesis activation has origin 0: the switch
+     * ignores a record at or below the origin of its newest activation.
+     */
+    public boolean matchesGenesis(final GenesisFeatures features) {
+        return holdsEach(features)
+            && schedulesOutside(features).noneMatch(Schedule::holdsGenesis);
+    }
+
+    /** The schedules of {@code features}: the first of version 4, the carry flag and the carry window. */
+    private Stream<Schedule> schedulesOf(final GenesisFeatures features) {
+        return schedules().limit(features.count());
+    }
+
+    /** The schedules outside {@code features}: the ones that {@link #schedulesOf} leaves out. */
+    private Stream<Schedule> schedulesOutside(final GenesisFeatures features) {
+        return schedules().skip(features.count());
+    }
+
+    /** The schedules in feature id order: version 4, the carry flag and the carry window. */
+    private Stream<Schedule> schedules() {
+        return Stream.of(v4, carry, window);
     }
 
     /** The version of the rules of the open block. */
@@ -165,9 +240,20 @@ public final class VersionSwitch {
         return carryWindow && version == CARRY_VERSION;
     }
 
-    /** Mark the state of a member that keeps its retained frames in a file. Call it before the first entry. */
+    /**
+     * Mark the state of a member that keeps its retained frames in a file.
+     * Call it before the first entry. Such a member holds no activation of
+     * {@link #FEATURE_CARRY_WINDOW}: it answers each one with
+     * {@link Outcome#UNSUPPORTED}. So it drops the schedule and the flag of
+     * the carry window that a seed gives it, and holds what a peer with the
+     * file holds.
+     */
     void fileStore(final boolean file) {
         fileStore = file;
+        if (file) {
+            window.held = 0;
+            carryWindow = false;
+        }
     }
 
     /**
@@ -334,6 +420,17 @@ public final class VersionSwitch {
         return rules;
     }
 
+    /**
+     * Read the rules of a seed: the sections that {@link #writeTo},
+     * {@link #writeCarryTo} and {@link #writeWindowTo} write, in that order.
+     */
+    static VersionSwitch readSeed(final ByteBuffer buf) {
+        final VersionSwitch rules = readFrom(buf);
+        rules.readCarryFrom(buf);
+        rules.readWindowFrom(buf);
+        return rules;
+    }
+
     /** Read the section that {@link #writeCarryTo} wrote. */
     void readCarryFrom(final ByteBuffer buf) {
         carry.readFrom(buf);
@@ -373,6 +470,11 @@ public final class VersionSwitch {
         private final long[] times = new long[MAX_HELD];
 
         private int held;
+
+        /** Whether the oldest held activation is a genesis activation, at L1 origin 0. */
+        boolean holdsGenesis() {
+            return held > 0 && origins[0] == 0L;
+        }
 
         /** The origin of the newest held activation, or 0 when none. */
         long newest() {
@@ -438,6 +540,12 @@ public final class VersionSwitch {
             origins[held] = origin;
             times[held] = time;
             held++;
+        }
+
+        void copyFrom(final Schedule other) {
+            System.arraycopy(other.origins, 0, origins, 0, MAX_HELD);
+            System.arraycopy(other.times, 0, times, 0, MAX_HELD);
+            held = other.held;
         }
 
         int snapshotLen() {

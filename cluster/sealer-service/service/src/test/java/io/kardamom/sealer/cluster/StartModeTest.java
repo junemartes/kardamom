@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -57,6 +58,29 @@ final class StartModeTest {
             log.appendSnapshot(1, 0, 0, 4_096, 0, ConsensusModule.Configuration.SERVICE_ID);
         }
         assertEquals(4_096L, state.latestSnapshotPosition());
+    }
+
+    /**
+     * A relaunch reaches the end of a closed last term, or the latest
+     * snapshot when that is higher. An open term grows with its recording,
+     * so it fixes no position.
+     */
+    @Test
+    void theRelaunchPositionComesFromAClosedLastTerm() {
+        final StateDir state = new StateDir(dir);
+        final int cm = ConsensusModule.Configuration.SERVICE_ID;
+        assertEquals(OptionalLong.empty(), state.relaunchPosition(), "no recording log");
+        try (RecordingLog log = new RecordingLog(dir.toFile(), true)) {
+            log.appendTerm(0, 2, 0, 0);
+            log.appendSnapshot(1, 2, 0, 4_096, 0, cm);
+            assertEquals(OptionalLong.empty(), state.relaunchPosition(), "an open term");
+            log.commitLogPosition(2, 18_338_816L);
+            assertEquals(OptionalLong.of(18_338_816L), state.relaunchPosition(), "a term that a new leader truncated");
+            log.appendSnapshot(2, 2, 0, 20_000_000L, 0, cm);
+            assertEquals(OptionalLong.of(20_000_000L), state.relaunchPosition(), "a snapshot above the log end");
+            log.appendTerm(0, 3, 20_000_000L, 0);
+        }
+        assertEquals(OptionalLong.empty(), state.relaunchPosition(), "the member joined a new term");
     }
 
     @Test
@@ -106,29 +130,29 @@ final class StartModeTest {
     @Test
     void aRoundSeedsAtBackingUp() {
         final SeedWatch watch = new SeedWatch(TIMEOUT_MS, 0);
-        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.BACKUP_QUERY, 10));
-        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.SNAPSHOT_RETRIEVE, 20));
-        assertEquals(SeedWatch.Outcome.SEEDED, watch.observe(State.BACKING_UP, 30));
+        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.BACKUP_QUERY, SeedWatch.Copy.MISSING, 10));
+        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.SNAPSHOT_RETRIEVE, SeedWatch.Copy.MISSING, 20));
+        assertEquals(SeedWatch.Outcome.SEEDED, watch.observe(State.BACKING_UP, new SeedWatch.Copy(0, true), 30));
     }
 
     @Test
     void aRoundWithoutAPeerAnswerEndsAtThePeerTimeout() {
         final SeedWatch watch = new SeedWatch(TIMEOUT_MS, 0);
-        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.BACKUP_QUERY, TIMEOUT_MS - 1));
-        assertEquals(SeedWatch.Outcome.NO_PEER, watch.observe(State.RESET_BACKUP, TIMEOUT_MS));
+        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.BACKUP_QUERY, SeedWatch.Copy.MISSING, TIMEOUT_MS - 1));
+        assertEquals(SeedWatch.Outcome.NO_PEER, watch.observe(State.RESET_BACKUP, SeedWatch.Copy.MISSING, TIMEOUT_MS));
     }
 
     @Test
     void aPeerAnswerRestartsThePeerTimeout() {
         final SeedWatch watch = new SeedWatch(TIMEOUT_MS, 0);
-        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.LIVE_LOG_REPLAY, TIMEOUT_MS - 1));
-        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.RESET_BACKUP, 2 * TIMEOUT_MS - 2));
-        assertEquals(SeedWatch.Outcome.NO_PEER, watch.observe(State.BACKUP_QUERY, 2 * TIMEOUT_MS - 1));
+        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.LIVE_LOG_REPLAY, SeedWatch.Copy.MISSING, TIMEOUT_MS - 1));
+        assertEquals(SeedWatch.Outcome.PENDING, watch.observe(State.RESET_BACKUP, SeedWatch.Copy.MISSING, 2 * TIMEOUT_MS - 2));
+        assertEquals(SeedWatch.Outcome.NO_PEER, watch.observe(State.BACKUP_QUERY, SeedWatch.Copy.MISSING, 2 * TIMEOUT_MS - 1));
     }
 
     @Test
     void aClosedBackupEndsTheRound() {
-        assertEquals(SeedWatch.Outcome.BACKUP_CLOSED, new SeedWatch(TIMEOUT_MS, 0).observe(State.CLOSED, 0));
+        assertEquals(SeedWatch.Outcome.BACKUP_CLOSED, new SeedWatch(TIMEOUT_MS, 0).observe(State.CLOSED, SeedWatch.Copy.MISSING, 0));
     }
 
     @Test

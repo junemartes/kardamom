@@ -92,6 +92,18 @@ variable "priority_fees" {
     error_message = "The priority_fees value must be on or off."
   }
 }
+# The carry from genesis, "on" or "off" (config/genesis/carry.toml): the
+# genesis features 3, 4 and 5. The deploy sets it from
+# KARDAMOM_GENESIS_CARRY, the same value as the sealer members. Only a new
+# chain takes it: an executor refuses a changed genesis.
+variable "genesis_carry" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.genesis_carry)
+    error_message = "The genesis_carry value must be on or off."
+  }
+}
 # The genesis fragment of the local canary, "on" or "off"
 # (config/genesis/canary.toml). The deploy sets it on only for the local
 # canary. A live chain keeps "off": its executors refuse a changed genesis.
@@ -140,6 +152,18 @@ variable "checkpoint_log" {
   validation {
     condition     = contains(["on", "off"], var.checkpoint_log)
     error_message = "The checkpoint_log value must be on or off."
+  }
+}
+
+# The seconds between two checkpoints of an executor
+# (--checkpoint-interval-secs). The deploy passes it from
+# KARDAMOM_CHECKPOINT_INTERVAL_S.
+variable "checkpoint_interval_s" {
+  type    = number
+  default = 20
+  validation {
+    condition     = var.checkpoint_interval_s > 0
+    error_message = "The checkpoint_interval_s value must be above 0."
   }
 }
 
@@ -291,7 +315,14 @@ job "executor" {
       # degrades to 2. On the sealer nodes a group has one node, so a lost
       # replica waits for that node.
       restart {
-        attempts = 3
+        # An Aeron client exits until the media driver of its node runs
+        # again, as after a node restart. Ten attempts at the 5 s delay
+        # cover that start; with three, three fast failures would leave the
+        # rest of the interval without a try. The cost: a task that crashes
+        # in a loop restarts about every 5 s, about three times the load on
+        # its targets of three attempts. A recovery after a node restart that
+        # is up to a minute faster outweighs that load.
+        attempts = 10
         interval = "1m"
         delay    = "5s"
         mode     = "delay"
@@ -433,7 +464,7 @@ job "executor" {
             # only the tail, not from genesis. Write a checkpoint every
             # 20s as the chain advances.
             "--checkpoint-dir", "/opt/kardamom/checkpoints",
-            "--checkpoint-interval-secs", "20",
+            "--checkpoint-interval-secs", format("%d", var.checkpoint_interval_s),
             # Peer checkpoint exchange, a full-resync fallback. Each
             # replica serves its newest checkpoint on 9014, and can
             # fetch one from the others. A node whose replay cursor, or
@@ -491,10 +522,12 @@ job "executor" {
         # It prefunds Anvil accounts #0 through #15 with 1000 ETH each,
         # plus the ERC-7955 factory predeploy. The local canary's accounts
         # and, with priority fees on, the fee schedule fragment follow it;
-        # the validator renders the same.
+        # the validator renders the same. The fragment of the carry from
+        # genesis comes first: its key is a top-level key.
         template {
           destination = "local/genesis.toml"
           data = join("\n", concat(
+            var.genesis_carry == "on" ? [file("config/genesis/carry.toml")] : [],
             [file("config/genesis/dev.toml")],
             var.canary_genesis == "on" ? [file("config/genesis/canary.toml")] : [],
             var.priority_fees == "on" ? [file("config/genesis/fees.toml")] : [],

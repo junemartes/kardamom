@@ -29,13 +29,23 @@ impl RecordedLimit {
                 active: true,
             });
         }
-        let position = archive
+        archive
             .get_stop_position(recording_id)
-            .map_err(|e| LogError::Aeron(format!("get_stop_position: {e}")))?;
-        Ok(Self {
-            position,
-            active: false,
-        })
+            .map(Self::from_stop)
+            .map_err(|e| LogError::Aeron(format!("get_stop_position: {e}")))
+    }
+
+    /// The limit of a recording whose recorded position the archive did
+    /// not give, from its stop position `stop`. The archive gives a
+    /// negative stop position (`NULL_POSITION`) while the recording has
+    /// not stopped. Such a recording is live, and its position is not
+    /// known yet: it reaches no position now, and a later read can find
+    /// the range.
+    pub(super) fn from_stop(stop: i64) -> Self {
+        Self {
+            position: stop,
+            active: stop < 0,
+        }
     }
 
     /// The length of the replay `[from_raw, limit)`. Zero or less means
@@ -80,7 +90,7 @@ impl FoundRecording {
             .map_err(|e| LogError::Aeron(format!("refetch: recording {}: {e}", self.recording_id)))
     }
 
-    fn locate(self, from: BPosition) -> Result<Located, LogError> {
+    pub(super) fn locate(self, from: BPosition) -> Result<Located, LogError> {
         let from_raw = self.raw_position(from)?;
         Ok(Located {
             rec: self,

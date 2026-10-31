@@ -40,13 +40,12 @@ async fn serves_the_committed_nonce_and_balance() {
     let known = Address::repeat_byte(0x11);
     seed_genesis(
         &env,
-        &[AccountChange {
+        &kardamom_types::GenesisAlloc::of_accounts(vec![AccountChange {
             address: known,
             nonce: 7,
             balance: U256::from(0x1f4u64),
             code_hash: keccak256([]),
-        }],
-        &[],
+        }]),
     )
     .unwrap();
     let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env).unwrap();
@@ -89,7 +88,7 @@ fn env_with_receipt(dir: &std::path::Path, receipt: &Receipt) -> StateEnv {
     use kardamom_types::{BPosition, BlockBoundary, BlockDelta};
 
     let env = StateEnvBuilder::new(dir).open().unwrap();
-    seed_genesis(&env, &[], &[]).unwrap();
+    seed_genesis(&env, &kardamom_types::GenesisAlloc::default()).unwrap();
     let mut handle = StateWriter::spawn_with_trie(env.clone(), TrieMode::Off).unwrap();
     let delta = BlockDelta {
         block_number: 1,
@@ -247,7 +246,7 @@ fn env_with_two_blocks_and(dir: &std::path::Path, first_block: FirstBlock) -> St
     use kardamom_types::{BPosition, BlockBoundary, BlockDelta, TxRef};
 
     let env = StateEnvBuilder::new(dir).open().unwrap();
-    seed_genesis(&env, &[], &[]).unwrap();
+    seed_genesis(&env, &kardamom_types::GenesisAlloc::default()).unwrap();
     let mut handle = StateWriter::spawn(env.clone()).unwrap();
     let receipt = |idx: u64, hash: u8, tx_type: u8| Receipt {
         tx_idx: BPosition::from_index(idx),
@@ -386,7 +385,7 @@ async fn a_block_without_references_is_refused_not_shortened() {
 
     let dir = tempfile::tempdir().unwrap();
     let env = StateEnvBuilder::new(dir.path()).open().unwrap();
-    seed_genesis(&env, &[], &[]).unwrap();
+    seed_genesis(&env, &kardamom_types::GenesisAlloc::default()).unwrap();
     let mut handle = StateWriter::spawn(env.clone()).unwrap();
     let delta = BlockDelta {
         block_number: 1,

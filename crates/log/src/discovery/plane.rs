@@ -11,6 +11,7 @@
 //! down when its last owner drops, and the task ends on cancel.
 
 use std::collections::BTreeMap;
+use std::fmt::Display;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,7 @@ use super::endpoint::{MANUAL_SUBSCRIPTION_URI, advertise_ip, publication_uri};
 use super::reconcile::{DestinationPort, Reconciler};
 use super::record::{
     ARCHIVE_SERVICE, CLUSTER_MEMBER_SERVICE, ClusterMemberRecord, PUBLISHER_SERVICE,
-    PublisherRecord, SUBSCRIBER_SERVICE, Scope, ServiceId, SubscriberRecord, Topic,
+    PublisherRecord, SUBSCRIBER_SERVICE, Scope, SubscriberRecord, Topic,
 };
 use super::registration::Registration;
 use super::start_retry::StartRetry;
@@ -118,11 +119,11 @@ struct Discovered {
 }
 
 impl Discovered {
-    /// The retry of the start-up registration of the record `id`, for
-    /// up to `limit`. See [`StartRetry`].
-    fn register_retry(&self, id: &ServiceId, limit: Duration) -> StartRetry {
+    /// The retry of the start-up catalog call on `what`, for up to
+    /// `limit`. See [`StartRetry`].
+    fn start_retry(&self, what: impl Display, limit: Duration) -> StartRetry {
         StartRetry::new(
-            format_args!("record {id}"),
+            what,
             limit,
             WatchTiming::from_config(&self.cfg),
             self.open_stop.clone(),
@@ -164,7 +165,7 @@ impl Discovered {
             deregister_after: self.cfg.deregister_after(),
         };
         let registration = self
-            .register_retry(&spec.entry.id, rt.start_open_limit())
+            .start_retry(format!("record {}", spec.entry.id), rt.start_open_limit())
             .run(|| Registration::register(self.catalog.clone(), spec.clone()))
             .await?;
         info!(topic = %key.topic, stream_id = key.stream_id, %control, "discovery: publication open");
@@ -228,7 +229,7 @@ impl Discovered {
         };
         let held = SubscriberRegistration {
             catalog: self.catalog.clone(),
-            retry: self.register_retry(&record.id, limit),
+            retry: self.start_retry(format!("record {}", record.id), limit),
             spec: RegistrationSpec {
                 entry: record.entry(&self.scope),
                 ttl: self.cfg.check_ttl(),
@@ -268,15 +269,18 @@ impl Discovered {
         membership
     }
 
-    /// One immediate read of the records of `service` in this scope.
-    async fn read_service(&self, service: &str) -> Result<QueryResult, LogError> {
-        self.catalog
-            .query(&Query {
-                service: service.into(),
-                meta_equals: self.scope.meta(),
-                index: 0,
-                wait: Duration::ZERO,
-            })
+    /// One immediate read of the records of `service` in this scope. A
+    /// transient catalog error makes the read try again for up to
+    /// `limit` ([`StartRetry`]).
+    async fn read_service(&self, service: &str, limit: Duration) -> Result<QueryResult, LogError> {
+        let query = Query {
+            service: service.into(),
+            meta_equals: self.scope.meta(),
+            index: 0,
+            wait: Duration::ZERO,
+        };
+        self.start_retry(format!("read {service}"), limit)
+            .run(|| self.catalog.query(&query))
             .await
     }
 
@@ -562,16 +566,25 @@ impl StreamPlane {
     /// member, so the static `[cluster]` endpoints apply. Resolved once:
     /// the client learns later endpoint changes from the cluster itself.
     ///
+    /// A Consul agent that rejoins its servers after a node restart
+    /// answers with a server error for a short time. The read tries again
+    /// on such an error for up to `limit` ([`StartRetry`]). Pass the
+    /// start-up limit of the Aeron runtime
+    /// ([`AeronRuntime::start_open_limit`]), as the registrations use.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the catalog is unreachable or answers with a
-    /// malformed record.
-    pub async fn cluster_ingress_endpoints(&self) -> Result<Option<String>, LogError> {
+    /// Returns an error if the catalog stays unreachable for `limit`,
+    /// refuses the read, or answers with a malformed record.
+    pub async fn cluster_ingress_endpoints(
+        &self,
+        limit: Duration,
+    ) -> Result<Option<String>, LogError> {
         let Some(d) = &self.discovered else {
             return Ok(None);
         };
         let members = d
-            .read_service(CLUSTER_MEMBER_SERVICE)
+            .read_service(CLUSTER_MEMBER_SERVICE, limit)
             .await?
             .entries
             .iter()

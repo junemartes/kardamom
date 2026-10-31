@@ -291,6 +291,18 @@ impl Store {
             .try_for_each(|s| fs::remove_file(&s.path).map_err(io(&s.path)))
     }
 
+    /// The free bytes of the file system of the store, for an
+    /// unprivileged writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file system does not answer.
+    pub fn free_bytes(&self) -> Result<u64, StoreError> {
+        let stat = rustix::fs::statvfs(&self.dir).map_err(|e| io(&self.dir)(e.into()))?;
+        // A product past u64::MAX shows as u64::MAX: no disk is that large.
+        Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+    }
+
     /// Raise the mark to `mark` when it is above the mark. Write the side
     /// file first when `mark` passes it.
     fn raise_mark(&mut self, mark: RefMark) -> Result<(), StoreError> {

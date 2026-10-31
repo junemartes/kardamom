@@ -28,6 +28,21 @@ variable "image_name" {
   default     = "kardamom-node:ci"
 }
 
+variable "prebuilt_node_image" {
+  description = "An already-loaded node image. Empty builds the ordinary node image locally."
+  type        = string
+  default     = ""
+}
+
+# A saved cluster (`just container-save`) keeps one provisioned image per
+# node. A node of generation 0 starts from its image, with the volumes
+# that `just container-restore` recreated.
+variable "node_images" {
+  description = "The provisioned image of a node by name. A node of generation 0 starts from it; a replaced node starts from the plain node image."
+  type        = map(string)
+  default     = {}
+}
+
 variable "docker_dir" {
   description = "The build context with node.Dockerfile. A relative path is resolved from this root."
   type        = string

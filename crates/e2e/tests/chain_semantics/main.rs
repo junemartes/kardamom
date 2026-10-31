@@ -134,3 +134,5 @@ include!("upgrades.rs");
 include!("xchain.rs");
 include!("account_layer.rs");
 include!("fees.rs");
+
+include!("canonical_prefix.rs");

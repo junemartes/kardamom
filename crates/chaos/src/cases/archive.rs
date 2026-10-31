@@ -1,18 +1,26 @@
 //! The Aeron archive cases: substrate loss, data loss with re-replication
 //! from the mirror, and segment corruption with detect-and-heal.
 
-use std::cell::RefCell;
 use std::path::Path;
-use std::time::Duration;
-
-use anyhow::Context;
+use std::time::{Duration, SystemTime};
 
 use crate::harness::Harness;
+use crate::nodes::Pipe;
 use crate::poll::{self, Budget};
+
+mod heal;
+mod segment;
+mod staging;
+
+#[cfg(test)]
+use segment::SegmentHashes;
+use segment::{Segment, pick_clean_segment};
 
 const DRIVER_TASK: &str = "archiving-media-driver";
 const ARCHIVE_DIR: &str = "/opt/kardamom/archive/dir";
 const CRC_VERIFY: &str = "verify -a -checksum io.aeron.archive.checksum.Crc32";
+/// The CRC-armed verify attempts of a restored archive.
+const VERIFY_ATTEMPTS: usize = 3;
 
 /// The running aeron allocation count, required non-zero: a hiccuping
 /// query reads as zero, and injecting anyway would make the post-kill
@@ -72,25 +80,57 @@ pub(crate) async fn tx_data_wipe(h: &mut Harness) -> anyhow::Result<()> {
         "archive-tx-data-wipe: re-replicating archive from {mirror} mirror"
     ));
     copy_stable_catalog(h, &mirror, &victim).await?;
-    let segments = h
-        .nodes
-        .exec_bytes(
-            &mirror,
-            "tar -C /opt/kardamom/archive --warning=no-file-changed --exclude='dir/archive-mark.dat' --exclude='dir/archive.catalog' -cf - dir",
-            1,
-        )
-        .await
-        .map_err(|e| crate::chaos_fail!("archive-tx-data-wipe: re-replication copy failed: {e}"))?;
-    h.nodes
-        .exec_with_stdin(&victim, "tar -C /opt/kardamom/archive -xf -", segments)
-        .await
-        .map_err(|e| crate::chaos_fail!("archive-tx-data-wipe: re-replication copy failed: {e}"))?;
+    copy_segments(h, &mirror, &victim).await?;
     h.assert_progress().await?;
     h.assert_count("aeron", base, h.knobs.driver_restart_slo())
         .await?;
     verify_restored(h, &victim).await?;
     h.assert_count("ingress", 2, h.knobs.reschedule_slo).await?;
     h.assert_ingress_pair_live("archive-tx-data-wipe").await
+}
+
+/// Stream the mirror's segments into the victim's archive directory,
+/// with no copy in memory. The victim's daemon must not start before
+/// the copy ends: it would adopt a partial archive.
+async fn copy_segments(h: &Harness, mirror: &str, victim: &str) -> anyhow::Result<()> {
+    let pipe = Pipe {
+        from: mirror,
+        read: "tar -C /opt/kardamom/archive --sparse --warning=no-file-changed --exclude='dir/archive-mark.dat' --exclude='dir/archive.catalog' -cf - dir",
+        to: victim,
+        write: "tar -C /opt/kardamom/archive -xf -",
+        max_read_status: 1,
+    };
+    let streamed = h.nodes.stream(&pipe).await.map_err(|e| {
+        crate::chaos_fail!("archive-tx-data-wipe: re-replication copy failed: {e:#}")
+    })?;
+    let ended = SystemTime::now();
+    crate::log(format!(
+        "archive-tx-data-wipe: re-replicated {} bytes from {mirror} in {:.1}s",
+        streamed.bytes,
+        streamed.elapsed.as_secs_f64()
+    ));
+    let Some(daemon) = h.nodes.inner_container(victim, DRIVER_TASK).await else {
+        return Ok(());
+    };
+    let started = h
+        .nodes
+        .started_at(victim, &daemon)
+        .await
+        .unwrap_or_default();
+    match humantime::parse_rfc3339_weak(started.trim()) {
+        Ok(at) if at < ended => Err(crate::chaos_fail!(
+            "archive-tx-data-wipe: the {DRIVER_TASK} on {victim} restarted at {started}, before the re-replication copy ended ({} bytes in {:.1}s): its daemon read a partial archive",
+            streamed.bytes,
+            streamed.elapsed.as_secs_f64()
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => {
+            crate::log(format!(
+                "archive-tx-data-wipe: the start time {started:?} of {daemon} does not parse ({e}); the verify judges the archive"
+            ));
+            Ok(())
+        }
+    }
 }
 
 /// Copy the mirror's catalog with a stable read: the mirror's daemon
@@ -140,8 +180,9 @@ async fn catalog_copy_once(h: &Harness, mirror: &str, victim: &str) -> anyhow::R
     Ok((before == catalog_hash(h, mirror).await?).then_some(()))
 }
 
-/// A CRC-armed verify inside the restarted daemon container: every
-/// recording OK, no exception, no other error. Stale catalog entry
+/// Verify a private archive copy inside the restarted daemon container.
+/// The tool writes stop positions and invalidates descriptors, so it
+/// must not open the live catalog or segment files. Stale catalog entry
 /// checksums are tolerated and counted: the daemon's adoption path
 /// rewrites entries without recomputing them.
 async fn verify_restored(h: &Harness, victim: &str) -> anyhow::Result<()> {
@@ -155,32 +196,26 @@ async fn verify_restored(h: &Harness, victim: &str) -> anyhow::Result<()> {
             )
         })?;
     let script = format!(
-        "docker exec {daemon} bash -lc 'java --add-opens java.base/java.util.zip=ALL-UNNAMED -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool {ARCHIVE_DIR} {CRC_VERIFY} 2>&1'"
+        r#"docker exec {daemon} bash -lc 'set -eu; snapshot=$(mktemp -d); trap "rm -rf -- \"$snapshot\"" EXIT; cp -a --reflink=auto --sparse=always {ARCHIVE_DIR}/. "$snapshot/"; rm -f "$snapshot/archive-mark.dat"; java --add-opens java.base/java.util.zip=ALL-UNNAMED -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool "$snapshot" {CRC_VERIFY} 2>&1'"#
     );
-    // Three attempts, as the bash case ran: the verify itself runs
-    // under the streaming bound, since a CRC pass over a large archive
-    // on a slow runner takes well over the command bound.
-    let last = RefCell::new(String::new());
-    let (last_ref, script_ref) = (&last, script.as_str());
-    let outcome = poll::until(Budget::secs(60, 5), |_| async move {
-        let out = h
-            .nodes
-            .exec_long(victim, script_ref)
-            .await
-            .unwrap_or_default();
-        let ok = verify_is_clean(&out);
-        *last_ref.borrow_mut() = out;
-        Ok(ok.then_some(()))
-    })
-    .await?;
-    let last = last.into_inner();
-    if outcome.or_fail(|_| anyhow::anyhow!("verify")).is_err() {
+    // Up to three attempts. Each verify runs under the streaming bound
+    // of the exec, since a CRC pass over a large archive on a slow
+    // runner takes well over the command bound. No poll deadline cancels
+    // an attempt.
+    let mut last = String::new();
+    for _ in 0..VERIFY_ATTEMPTS {
+        last = h.nodes.exec_long(victim, &script).await.unwrap_or_default();
+        if verify_is_clean(&last) {
+            break;
+        }
+    }
+    if !verify_is_clean(&last) {
         crate::log(format!(
             "archive-tx-data-wipe: verify output tail\n{}",
             tail(&last, 20)
         ));
         return Err(crate::chaos_fail!(
-            "archive-tx-data-wipe: restored archive failed CRC-armed verify after retries"
+            "archive-tx-data-wipe: restored archive failed CRC-armed verify after {VERIFY_ATTEMPTS} attempts"
         ));
     }
     let stale = last
@@ -258,68 +293,44 @@ pub(crate) async fn corruption(h: &mut Harness) -> anyhow::Result<()> {
     crate::log(format!(
         "archive-corruption: draining ingress-0 node ({node_id})"
     ));
-    h.nomad
-        .drain(&node_id, true, Duration::from_mins(2))
-        .await
-        .map_err(|e| crate::chaos_fail!("archive-corruption: drain enable failed: {e}"))?;
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    let tool = ArchiveTool {
-        h,
-        node: &victim,
-        image: &image,
+    // The undrain runs on every path after the drain post: a drained
+    // node keeps the ingress job at one replica and the aeron system
+    // job off the node for the rest of the shard.
+    let drained = match h.nomad.drain(&node_id, true, DRAIN_DEADLINE).await {
+        Ok(()) => {
+            ArchiveTool {
+                h,
+                node: &victim,
+                image: &image,
+            }
+            .corrupt_and_heal(&mirror, &rerep)
+            .await
+        }
+        Err(e) => Err(crate::chaos_fail!(
+            "archive-corruption: drain enable failed: {e}"
+        )),
     };
-    let seg = pick_clean_segment(&tool, &mirror).await?;
-    crate::log(format!(
-        "archive-corruption: flipping payload bytes at {} in {} (recording {}; mirror {})",
-        seg.flip_at, seg.name, seg.rid, seg.mirror_name
-    ));
-    h.nodes
-        .exec(
-            &victim,
-            &format!(
-                "printf 'KARDAMOM-CHAOS!!' | dd of={ARCHIVE_DIR}/{} bs=1 seek={} count=16 conv=notrunc status=none",
-                seg.name, seg.flip_at
-            ),
-        )
-        .await
-        .map_err(|e| crate::chaos_fail!("archive-corruption: byte flip failed: {e}"))?;
-    let pre = tool.verify(&seg.rid).await;
-    anyhow::ensure!(
-        !pre.contains("Exception"),
-        "{}: archive-corruption: verify tool crashed (not a detection)\n{}",
-        crate::FAIL_PREFIX,
-        tail(&pre, 20)
-    );
-    anyhow::ensure!(
-        recording_err(&pre, &seg.rid),
-        "{}: archive-corruption: CRC-armed verify did NOT flag recording {} (detection hole)\n{}",
-        crate::FAIL_PREFIX,
-        seg.rid,
-        tail(&pre, 20)
-    );
-    crate::log("archive-corruption: corruption detected by CRC-armed verify");
-    heal_on_runner(h, &rerep, &victim, &mirror, &seg).await?;
-    tool.mark_valid(&seg.rid).await;
-    let post = tool.verify(&seg.rid).await;
-    anyhow::ensure!(
-        !post.contains("Exception")
-            && recording_ok(&post, &seg.rid)
-            && !recording_err(&post, &seg.rid),
-        "{}: archive-corruption: post-heal verify is not clean for recording {}\n{}",
-        crate::FAIL_PREFIX,
-        seg.rid,
-        tail(&post, 20)
-    );
-    crate::log("archive-corruption: healed + CRC verify clean; undraining ingress-0");
-    h.nomad
+    let undrained = h
+        .nomad
         .drain(&node_id, false, Duration::ZERO)
         .await
-        .map_err(|e| crate::chaos_fail!("archive-corruption: drain disable failed: {e}"))?;
+        .map_err(|e| crate::chaos_fail!("archive-corruption: drain disable failed: {e}"));
+    if let Err(e) = &undrained {
+        crate::log(format!("archive-corruption: fault cleanup fails: {e:#}"));
+    }
+    drained?;
+    undrained?;
     h.assert_count("aeron", base, h.knobs.driver_restart_slo())
         .await?;
     h.assert_count("ingress", 2, h.knobs.reschedule_slo).await?;
     h.assert_ingress_pair_live("archive-corruption").await
 }
+
+/// The deadline of the ingress-0 drain. Nomad stops every allocation
+/// of the node by then. The ingress cannot move to another node, so the
+/// drain always runs to its deadline, and only then does Nomad stop the
+/// system jobs of the node, the archive daemon among them.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Aeron's `ArchiveTool` in a one-off container on the node, while the
 /// daemon is down.
@@ -330,6 +341,104 @@ struct ArchiveTool<'a> {
 }
 
 impl ArchiveTool<'_> {
+    /// Wait until the archive daemon of the drained node runs no more,
+    /// flip bytes in a clean segment, prove the detection, heal the
+    /// segment from `mirror` with `rerep`, and prove a clean verify.
+    async fn corrupt_and_heal(&self, mirror: &str, rerep: &Path) -> anyhow::Result<()> {
+        self.await_daemon_down().await?;
+        let seg = pick_clean_segment(self, mirror).await?;
+        crate::log(format!(
+            "archive-corruption: flipping payload bytes at {} in {} (recording {}; mirror {})",
+            seg.flip_at, seg.name, seg.rid, seg.mirror_name
+        ));
+        self.h
+            .nodes
+            .exec(
+                self.node,
+                &format!(
+                    "printf 'KARDAMOM-CHAOS!!' | dd of={ARCHIVE_DIR}/{} bs=1 seek={} count=16 conv=notrunc status=none",
+                    seg.name, seg.flip_at
+                ),
+            )
+            .await
+            .map_err(|e| crate::chaos_fail!("archive-corruption: byte flip failed: {e}"))?;
+        let pre = self.verify(&seg.rid).await;
+        anyhow::ensure!(
+            !pre.contains("Exception"),
+            "{}: archive-corruption: verify tool crashed (not a detection)\n{}",
+            crate::FAIL_PREFIX,
+            tail(&pre, 20)
+        );
+        anyhow::ensure!(
+            recording_err(&pre, &seg.rid),
+            "{}: archive-corruption: CRC-armed verify did NOT flag recording {} (detection hole)\n{}",
+            crate::FAIL_PREFIX,
+            seg.rid,
+            tail(&pre, 20)
+        );
+        crate::log("archive-corruption: corruption detected by CRC-armed verify");
+        heal::Repair {
+            harness: self.h,
+            tool: rerep,
+            victim: self.node,
+            mirror,
+            segment: &seg,
+        }
+        .run()
+        .await?;
+        self.mark_valid(&seg.rid).await;
+        let post = self.verify(&seg.rid).await;
+        anyhow::ensure!(
+            !post.contains("Exception")
+                && recording_ok(&post, &seg.rid)
+                && !recording_err(&post, &seg.rid),
+            "{}: archive-corruption: post-heal verify is not clean for recording {}\n{}",
+            crate::FAIL_PREFIX,
+            seg.rid,
+            tail(&post, 20)
+        );
+        crate::log("archive-corruption: healed + CRC verify clean; undraining ingress-0");
+        Ok(())
+    }
+
+    /// Wait until no archive daemon container runs on the node. The
+    /// drain post only asks Nomad to stop the allocations, and the tool
+    /// must not read or write a live archive.
+    async fn await_daemon_down(&self) -> anyhow::Result<()> {
+        let script = format!(
+            "names=$(docker ps --format '{{{{.Names}}}}') && ! printf '%s\\n' \"$names\" | grep -q '^{DRIVER_TASK}'"
+        );
+        let script = script.as_str();
+        let ((), elapsed) = poll::until(
+            Budget::new(
+                DRAIN_DEADLINE + Duration::from_secs(30),
+                Duration::from_secs(2),
+            ),
+            |_| async move {
+                Ok(self
+                    .h
+                    .nodes
+                    .exec_status(self.node, script)
+                    .await?
+                    .then_some(()))
+            },
+        )
+        .await?
+        .or_fail(|t| {
+            crate::chaos_fail!(
+                "archive-corruption: the {DRIVER_TASK} on {} still runs {}s after the drain",
+                self.node,
+                t.as_secs()
+            )
+        })?;
+        crate::log(format!(
+            "archive-corruption: the {DRIVER_TASK} on {} stopped {}s after the drain",
+            self.node,
+            elapsed.as_secs()
+        ));
+        Ok(())
+    }
+
     async fn run(&self, args: &str) -> String {
         let script = format!(
             "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java {} \
@@ -369,293 +478,5 @@ fn recording_err(out: &str, rid: &str) -> bool {
     })
 }
 
-/// A victim segment: clean at baseline, with a usable data frame to flip
-/// inside, and the name of the mirror segment that holds the same bytes.
-struct Segment {
-    name: String,
-    /// Recording ids are per archive. A recording that started after an
-    /// adoption has a different id on each node, so the mirror can hold
-    /// the victim's bytes under another name.
-    mirror_name: String,
-    rid: String,
-    flip_at: i64,
-}
-
-/// The sha256 and name of archive segments on one node, in listing order.
-struct SegmentHashes(Vec<(String, String)>);
-
-impl SegmentHashes {
-    /// Hash the segments `listing` names, a shell word list run in the
-    /// archive directory. Hashing every preallocated segment takes longer
-    /// than the short exec bound after a few cases (about 25 s for 4.6 GB
-    /// on a host run), so this read uses the long bound.
-    async fn read(h: &Harness, node: &str, listing: &str) -> Self {
-        let script = format!("cd {ARCHIVE_DIR} && {listing} | xargs -r sha256sum");
-        let out = h.nodes.exec_long(node, &script).await.unwrap_or_default();
-        Self::parse(&out)
-    }
-
-    fn parse(out: &str) -> Self {
-        Self(
-            out.lines()
-                .filter_map(|l| l.split_once("  "))
-                .map(|(hash, name)| (hash.to_string(), name.to_string()))
-                .collect(),
-        )
-    }
-
-    /// The name of a segment with `hash`: `name` itself when it matches,
-    /// or else the first other segment with those bytes.
-    fn name_for(&self, hash: &str, name: &str) -> Option<String> {
-        let same: Vec<&String> = self
-            .0
-            .iter()
-            .filter(|(h, _)| h == hash)
-            .map(|(_, n)| n)
-            .collect();
-        let exact = same.iter().find(|n| n.as_str() == name);
-        exact.or(same.first()).map(|n| (*n).clone())
-    }
-}
-
-/// The first victim segment that the mirror holds byte-identical, that
-/// carries a data frame, and that verifies clean. Every segment is a
-/// candidate: all segment files share one preallocated length, and a
-/// restored segment is fully allocated on disk, so neither length nor disk
-/// use ranks the segments that carry data. The mirror match is by content:
-/// an adopted recording keeps its id but its catalog entry checksum is
-/// stale, so it fails verify, and a recording made after the adoption
-/// verifies clean under a different id on each node.
-async fn pick_clean_segment(tool: &ArchiveTool<'_>, mirror: &str) -> anyhow::Result<Segment> {
-    let victim = SegmentHashes::read(tool.h, tool.node, "ls *.rec 2>/dev/null").await;
-    let mirror = SegmentHashes::read(tool.h, mirror, "ls *.rec 2>/dev/null").await;
-    crate::log(format!(
-        "archive-corruption: {} victim candidates, {} mirror segments",
-        victim.0.len(),
-        mirror.0.len()
-    ));
-    for (hash, name) in victim.0 {
-        let Some(mirror_name) = mirror.name_for(&hash, &name) else {
-            continue;
-        };
-        if let Some(seg) = qualify(tool, name, mirror_name).await {
-            return Ok(seg);
-        }
-    }
-    Err(crate::chaos_fail!(
-        "archive-corruption: no recording verifies clean at baseline (inherited catalog damage too broad)"
-    ))
-}
-
-/// Whether one candidate qualifies. Recording ids are per-archive: after
-/// a wipe and a re-replication the mirror's `40-0.rec` can hold another
-/// stream than the victim's, and a heal from it writes foreign frames
-/// (seen in CI: post-heal verify found streamId=2000 where the victim's
-/// recording is stream 2001). So the mirror's segment must be byte-identical
-/// to the victim's before the flip; then the heal restores exactly the bytes
-/// the flip destroyed. A candidate that fails the probe verify gets its
-/// state put back.
-/// `name` as a victim segment, when it carries a data frame and its
-/// recording verifies clean. The frame check runs first: it is a cheap
-/// read, and it skips the idle lanes before a verify starts a JVM.
-async fn qualify(tool: &ArchiveTool<'_>, name: String, mirror_name: String) -> Option<Segment> {
-    let flip_at = frame_payload_offset(tool.h, tool.node, &name).await;
-    if flip_at < 0 {
-        return None;
-    }
-    let rid = name.split('-').next().unwrap_or("").to_string();
-    let out = tool.verify(&rid).await;
-    if !recording_ok(&out, &rid) || out.contains(") ERR") {
-        tool.mark_valid(&rid).await;
-        return None;
-    }
-    Some(Segment {
-        name,
-        mirror_name,
-        rid,
-        flip_at,
-    })
-}
-
-/// A byte offset inside the payload of the largest data frame of a
-/// segment, walking the Aeron frame headers so the flip never lands in
-/// a header. -1 when the segment has no usable frame.
-async fn frame_payload_offset(h: &Harness, node: &str, name: &str) -> i64 {
-    let script = format!(
-        "python3 -c \"
-b = open('{ARCHIVE_DIR}/{name}', 'rb').read()
-pos = 0; best = -1; bestlen = 0
-while pos + 32 <= len(b):
-    ln = int.from_bytes(b[pos:pos+4], 'little', signed=True)
-    if ln <= 0:
-        break
-    typ = int.from_bytes(b[pos+6:pos+8], 'little')
-    if typ == 1 and ln >= 96 and pos + ln <= len(b) and ln > bestlen:
-        best = pos; bestlen = ln
-    pos += (ln + 31) // 32 * 32
-print(best + 40 if best >= 0 else -1)
-\""
-    );
-    h.nodes
-        .exec(node, &script)
-        .await
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(-1)
-}
-
-/// Stage both archives on the runner, require `--diff` to name the
-/// segment, heal it, and write only the healed segment back. The staged
-/// mirror copy holds the mirror's bytes under the victim's name first,
-/// because the heal tool pairs segments by name.
-async fn heal_on_runner(
-    h: &Harness,
-    rerep: &Path,
-    victim: &str,
-    mirror: &str,
-    segment: &Segment,
-) -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir().context("staging dir")?;
-    for (node, sub) in [(victim, "victim"), (mirror, "mirror")] {
-        stage_archive(h, node, &tmp.path().join(sub)).await?;
-    }
-    let source = tmp.path().join("mirror/dir");
-    let dest = tmp.path().join("victim/dir");
-    let seg = segment.name.as_str();
-    if segment.mirror_name != segment.name {
-        std::fs::copy(source.join(&segment.mirror_name), source.join(seg))
-            .context("stage the mirror segment under the victim's name")?;
-    }
-    let diff = run_tool(
-        rerep,
-        &[
-            "--diff",
-            "--source-dir",
-            path(&source),
-            "--dest-dir",
-            path(&dest),
-        ],
-    )
-    .await;
-    anyhow::ensure!(
-        diff.contains(seg),
-        "{}: archive-corruption: --diff did not name the corrupted segment {seg}",
-        crate::FAIL_PREFIX
-    );
-    let heal = run_tool(
-        rerep,
-        &[
-            "--heal",
-            "--segments",
-            seg,
-            "--no-verify",
-            "--source-dir",
-            path(&source),
-            "--dest-dir",
-            path(&dest),
-        ],
-    )
-    .await;
-    anyhow::ensure!(
-        heal.contains("healed segments=1"),
-        "{}: archive-corruption: --heal did not repair the segment\n{}",
-        crate::FAIL_PREFIX,
-        tail(&heal, 20)
-    );
-    let healed = std::fs::read(dest.join(seg)).context("read the healed segment")?;
-    h.nodes
-        .exec_with_stdin(victim, &format!("cat > {ARCHIVE_DIR}/{seg}"), healed)
-        .await
-        .map_err(|e| {
-            crate::chaos_fail!("archive-corruption: writing healed segment back failed: {e}")
-        })
-}
-
-fn path(p: &Path) -> &str {
-    p.to_str().unwrap_or("")
-}
-
-async fn stage_archive(h: &Harness, node: &str, into: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(into).context("create staging dir")?;
-    let tar = h
-        .nodes
-        .exec_bytes(node, "tar -C /opt/kardamom/archive -cf - dir", 1)
-        .await
-        .map_err(|e| {
-            crate::chaos_fail!("archive-corruption: staging copy from {node} failed: {e}")
-        })?;
-    untar_into(into, tar).await
-}
-
-/// Extract a tar stream into a runner directory.
-async fn untar_into(into: &Path, tar: Vec<u8>) -> anyhow::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let mut child = tokio::process::Command::new("tar")
-        .args(["-C", path(into), "-xf", "-"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .context("spawn tar on the runner")?;
-    let mut stdin = child.stdin.take().context("tar stdin")?;
-    stdin.write_all(&tar).await.context("feed tar")?;
-    stdin.shutdown().await.context("close tar stdin")?;
-    let status = child.wait().await.context("wait for tar")?;
-    anyhow::ensure!(
-        status.success(),
-        "tar extraction into {} failed: {status}",
-        into.display()
-    );
-    Ok(())
-}
-
-async fn run_tool(tool: &Path, args: &[&str]) -> String {
-    tokio::process::Command::new(tool)
-        .args(args)
-        .output()
-        .await
-        .map(|o| {
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            )
-        })
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_mirror_segment_is_found_by_its_bytes() {
-        let mirror =
-            SegmentHashes::parse("aaa  0-0.rec\nzero  1-0.rec\nbbb  16-0.rec\nzero  2-0.rec\n");
-        assert_eq!(
-            mirror.name_for("aaa", "0-0.rec").as_deref(),
-            Some("0-0.rec")
-        );
-        assert_eq!(
-            mirror.name_for("bbb", "24-0.rec").as_deref(),
-            Some("16-0.rec")
-        );
-        assert_eq!(
-            mirror.name_for("zero", "2-0.rec").as_deref(),
-            Some("2-0.rec")
-        );
-        assert_eq!(mirror.name_for("ccc", "24-0.rec"), None);
-    }
-
-    #[test]
-    fn a_clean_verify_has_an_ok_recording_and_tolerates_stale_entries() {
-        let out = "recordingId=3 (checksum: Crc32) OK, length=4096\n\
-            ERR: recordingId=4 invalid Catalog checksum\n";
-        assert!(verify_is_clean(out));
-        assert!(!verify_is_clean(
-            "recordingId=3 ... OK\nERR: recordingId=5 file missing\n"
-        ));
-        assert!(!verify_is_clean(
-            "Exception in thread main\nrecordingId=3 OK\n"
-        ));
-        assert!(!verify_is_clean(""));
-    }
-}
+mod tests;

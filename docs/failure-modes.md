@@ -159,15 +159,32 @@ The sealer refuses user records when the batcher falls too far behind on L1. Bel
   - The ingress raises `da_lag` while the frame says halted, and clears it when the frame says not halted.
   - Any status frame ends a `sealer_no_quorum` halt.
   - The status before a Raft snapshot carries the snapshot notice. The consensus module sends nothing until the snapshot is complete, and on a loaded disk that takes many seconds. After the notice, the ingress waits 60 s for the next status, not 10 s.
-- **Retention floor.** Below decision version 5, `kardamom.cluster.retention` is a minimum, not a maximum.
+- **Retention floor.** Below decision version 5, and under version 5 on a heap member before the carry window turns on, `kardamom.cluster.retention` is a minimum, not a maximum.
   - A frame past the window leaves only when its block is at or below the posted head.
   - The batcher can always replay from its cursor.
   - The guard bounds the growth. The stretch is at most the budget plus one flush, in heap.
   - The retained frames are in the snapshot. A restored member keeps the floor of the snapshot.
-- **Replay window.** Under decision version 5 (the carry flag) on members with `kardamom.cluster.carryBytes=true`, `kardamom.cluster.retention` is the exact window. Members that keep the frames on the heap keep the posted rule, because no member feed runs and the egress cannot serve a reference.
+- **Replay window.** Under decision version 5 (the carry flag), `kardamom.cluster.retention` is the exact window on members with `kardamom.cluster.carryBytes=true`, and on heap members while the carry window (`FEATURE_CARRY_WINDOW`, feature 5) is on. A heap member without the carry window keeps the posted rule: a reader can still meet a reference that the egress cannot serve.
   - A frame past the window leaves at once, at any posted head. The retained frames have a fixed bound at any DA lag.
-  - A cursor below the window gets `REPLAY_UNAVAILABLE`, the batcher too. The reader recovers from another source.
+  - A cursor below the window gets `REPLAY_UNAVAILABLE`, the batcher too. The reader recovers from another source: the batcher and the validator from the egress (`--egress`).
   - The guard still refuses user records. It holds no frame.
+- **Egress floor.** The store of each egress instance keeps every block above `min(posted_head, final_head)`. So the batcher finds every block that it did not post in the egress, at any DA lag.
+  - The posted head is the highest `l2_block_end` of a post on the `l1_blocks` stream of the L1 follower. The follower publishes only finalized L1 blocks.
+  - The final head is the newest L2 block of an output whose challenge window ended (`WithdrawalOutputOracle.isFinalizable`). The egress reads it from L1 with `--withdrawal-oracle` and `--l1-rpc-url`, at the finalized L1 block. Without an oracle, the floor is the posted head.
+  - A head that the egress did not read yet is 0: the store keeps every block. After a start, the egress learns the posted head from the next finalized post.
+  - The store also keeps `--keep-blocks` blocks below its head (default 43,200: 1 day at 2 s a block), for the readers that resume. It deletes a segment only when the segment is below both the floor and this window.
+  - A reader further behind than the window and the floor gets `410` with the floor of the store. The executor and the validator then recover from a peer checkpoint (see "Replay-window overrun"). The batcher never reads below the floor: the floor is at or below its posted head.
+  - The prune is local to each instance. It changes no replicated state.
+  - The disk of the store grows with the DA lag and, with an oracle, with the challenge window. `KardamomEgressDiskFillsSoon` fires when the free disk runs out within 6 hours at the rate of the last hour. A full disk stops the instance.
+  - Proof: the unit tests `a_frozen_posted_head_keeps_every_block_above_it_past_the_window` and `the_prune_follows_the_lower_of_the_posted_head_and_the_final_head` in `crates/egress/src/owner_prune_tests.rs`.
+  - A heap member runs the member feed on its heap frames when `kardamom.cluster.feedAeronDir` is set (`KARDAMOM_MEMBER_FEED=on`). The feed needs no retained file. The feed and its gap rule are in "Member feed" in [`../cluster/sealer-service/README.md`](../cluster/sealer-service/README.md).
+- **Carry window (feature 5).** An upgrade transaction turns it on, and it can turn off again. While it and version 5 are on:
+  - The member refuses a transaction reference of record type 0. It answers the offering session with egress kind 18, and counts `kardamom_sealer_ref_refused_total`. The sequencer publishes a drop, and the client sees the provisional status `dropped` (see "The kept sealer version and the refused reference").
+  - A member with the retained file never stores the activation (outcome `UNSUPPORTED`). The upgrade check refuses feature 5 on such a chain.
+  - A member of a release that reads only up to snapshot version 17 stops on version 18. The members write version 18 from the first activation of feature 5, so a rollback of the sealer after it is refused.
+  - Feature 3 or 4 off stops version 5, and with it the rules of feature 5. The sequencers then send type 0 again, and a carry executor stops on the first reference. The upgrade check refuses feature 3 or 4 off while a member holds feature 5.
+  - The rollout and the way back are in [`runbooks/carry-window-rollout.md`](runbooks/carry-window-rollout.md).
+  - Proof: `SealerCarryWindowTest`, `SealerCarryActivationTest`, `SealerCarryClusterTest`, `CarryWindowSwitchTest` and `SealerHeapFeedTest`.
 - **Retained file.** With `kardamom.cluster.carryBytes=true`, the retained frames are in an append-only file on the disk of each member, not on the heap. The default is off.
   - The heap keeps only an index: the end index and the file position of each retained boundary. The heap does not grow with the retained bytes.
   - The member orders a full entry (record type 5) and retains it as a canonical entry with its envelope (record type 6). Each egress session gets the relayed reference (egress kind 15), live and in a replay, never the envelope. The twin copy drops at the dedup, and each refusal is the same as without the file.
@@ -190,7 +207,7 @@ The sealer refuses user records when the batcher falls too far behind on L1. Bel
   - The admin endpoint exports `kardamom_sealer_disk_free_bytes` (`GET /metrics`) and `diskFreeBytes` (`GET /status`).
   - Recovery: free the disk or add disk. The member restarts, truncates its file at its snapshot, and replays its log.
 - The wire layouts are in [`../cluster/sealer-service/README.md`](../cluster/sealer-service/README.md).
-- Proof: `da-lag-halt` and `prune-floor`. Both run by name with `KARDAMOM_CHAOS_CASES`. They are in no shard.
+- Proof: `da-lag-halt` and `prune-floor` run in `chaos-retention` and by name with `KARDAMOM_CHAOS_CASES`. The shard uses separate fresh chains for their distinct DA guard settings. Every snapshot tail replays with its chain's original guard; a live budget change can change canonical decisions.
   - `da-lag-halt` freezes the batcher and lets the sealed head pass the budget. It needs `KARDAMOM_DA_LAG_BUDGET_BLOCKS`, set to the small budget that the cluster runs with.
     - It asserts that the chain refuses a new transaction with the typed error.
     - It asserts that the chain status shows the sealer halted on `da_lag` as the root, and the ingresses paused on it.
@@ -204,14 +221,14 @@ The sealer refuses user records when the batcher falls too far behind on L1. Bel
 Every chaos case ends with a **recovery probe**.
 
 - The case load ended and the executors converged.
-- Two 30 s loads then run at the same time. Each load runs at half the case rate.
+- Two 10 s loads then run at the same time. Each load runs at half the case rate. Each load holds a slot for every submit of its window, so a slow receipt does not lower its rate.
 - Load 1 runs on the account of the case, from its next nonce. It uses the ingress that the case load used. It stands for a sender that had transactions in flight during the outage.
 - Load 2 runs on the account of the smoke gate. No case load spends that account. It uses the other ingress. It stands for a sender with nothing in flight.
 - Each load starts at the next nonce of its account. The harness reads that nonce from the ingress.
   - The read repeats on `account state unavailable` (`-32000`) for at most 60 s. Any other error fails the case at once.
   - The ingress asks every executor before it gives this error. One dead executor therefore does not cause it.
   - A stall of the shared CI runner can delay every executor past the 2 s query timeout at the same time. A wallet retries this error, so the harness retries it too.
-- Every offered transaction of both loads must get a receipt.
+- Every offered transaction of both loads must get a receipt. A submit that parks past the timeout of the ingress gets no receipt, so every receipt arrives inside the park.
 - Each load must be accepted at a quarter of its rate or more.
 - If load 1 alone fails, a sender is stuck.
 - If load 2 fails, the pipeline or an ingress did not recover.
@@ -229,21 +246,25 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
   - Trigger: the leader process dies.
   - Effect: the quorum survives. The members elect a leader. The restarted member can win again, because it has the most up-to-date log.
   - Recovery: clients redirect through `NewLeaderEvent`. The replicated state and the snapshots give the new leader the dedup window, the canonical count and `block_number`. There is no gap and no block-number regress.
+  - The old leader can take offers that it does not order before it dies. The v2 loop of the sequencers offers them again on the new session, before any new offer (see "The v2 loop and a lost offer").
   - Proof: `cluster-leader-kill`. The case asserts that the pipeline keeps committing. It does not assert that the leader changed.
 - **Follower kill**
   - Trigger: one follower dies.
   - Effect: quorum 2 of 3 holds. There is no stall.
   - Recovery: the member restarts and rejoins.
-  - Proof: `cluster-follower-kill`. The case asserts zero stall and an unchanged leader.
+  - Proof: `cluster-follower-kill`. The case requires executor progress, three running members and a snapshot restore on the restarted member. A leadership change is logged and tolerated.
 - **Member state loss**
   - Trigger: a member comes back with no Raft recording log: its directories are wiped, or its node is replaced.
   - Effect: the member must not start at log position 0 in a running cluster. It could not catch up after the leader purges its log. Blank members that elect each other would start a second history.
   - Recovery: before it launches, the member copies the latest snapshot, and the log after it, from a peer (an Aeron ClusterBackup).
+    - `BACKING_UP` alone is not completion. The copied log must reach the snapshot position and last recorded term base. The stopped backup is checked again before startup; an incomplete copy that stops advancing for 20 seconds retries with backoff.
     - It restores the snapshot and catches up from the leader.
     - A blank member starts at position 0 only during the bootstrap of a new cluster (`KARDAMOM_CLUSTER_BOOTSTRAP=1`).
     - Without a peer, the member waits and logs `cluster SEED waiting-for-peer`. It never falls back to position 0.
     - See [Start modes](../cluster/sealer-service/README.md#start-modes).
   - Proof: `cluster-member-rejoin` and `node-replace-sealer`. Each case checks that the member starts blank, then reaches the head that the executors had at the wipe.
+    - The member rejoin drill wipes the cluster directory and the Raft archive root files. The live executor archive in the `dir` child stays intact. The node replacement drill loses all state on the node.
+    - Each peer-seed round clears the Raft archive root files and preserves other archives in child directories.
 - **Raft log purge**
   - Rule: each member purges its own Raft log below a purge point. The purge point is the newest snapshot that obeys two rules:
     - It is older than the 3 newest snapshots (`kardamom.cluster.logPurgeKeepSnapshots`, env `KARDAMOM_CLUSTER_LOG_PURGE_KEEP`). The value 0 turns the purge off.
@@ -264,20 +285,27 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
   - Proof: the in-JVM tests `ClusterLogPurgeTest`, `JoinWatchdogTest` and `PeerProbeTest`.
 - **Election stall after a full restart**
   - Trigger: all members restart together with different log tails. Two members win two different terms. Aeron 1.44 lets a member vote in a higher term, then accept the leader of the lower term in `CANVASS`. So one member can give a quorum to both leaders. The leader of the lower term replays its longer log into its service before it learns of the higher term.
+    - A full stop with an uncommitted tail on the old leader has the same effect. Aeron 1.44 replays the whole local log at a start, the uncommitted tail included. When a member with a shorter log wins, it lacks that tail.
   - Effect: the cluster stays without a closed election, while Nomad sees three live containers.
     - The leader of the higher term waits in `LEADER_READY` for ever: Aeron 1.44 gives that state no timeout, and a member that voted must join.
-    - The old leader cannot join: its service is ahead of the new leader's log. Each join fails at once (`followerLogAwait - joinPosition=... less than logPosition=...`), and each new election takes the position from the commit counter again.
+    - The old leader cannot join: its service is ahead of the new leader's log. The leader's first message makes Aeron truncate the member's log to the leader's term base (`Truncating Cluster Log`), but the service keeps the tail. Each join fails at once (`followerLogAwait - joinPosition=... less than logPosition=...`), and each new election takes the position from the commit counter again.
     - A third member can wait in `FOLLOWER_LOG_REPLICATION` for ever: Aeron 1.44 checks that deadline only after the archive signals both the end of the replication and the stop of the recording, and a replication that fails before its recording starts sends no stop.
-  - Recovery: the join watchdog acts after the stall limit with no progress. The limit is two join attempts of a follower: 2 x (2 x leader heartbeat timeout + archive message timeout + driver timeout). That is 80 s at the defaults and 160 s at the CI stall tolerance of 30 s.
-    - A leader in `LEADER_READY` with no progress on itself or its peers logs `cluster LEADER STALL` and exits with code 7.
+  - Recovery of a truncated log: the join watchdog of the follower acts after 5 s.
+    - The rule compares the commit position with the position that a relaunch reaches. That is the end of the last term in the recording log when that term is closed, or the latest snapshot when that is higher. Aeron closes the last term when it truncates the log. An open term fixes no position.
+    - While the election is open and the commit position stays above that position for 5 s, the member logs `cluster FOLLOWER STALL ... truncated log` and exits with code 8. It keeps its recording log.
+    - The relaunch replays the truncated log up to the leader's position. The member then joins the leader, which still waits in `LEADER_READY` in the same term, and the election closes with no new term.
+    - The follower relaunches, not the leader. Aeron already truncated the follower's log, so no member's log holds the tail. A new election cannot bring it back, and the follower still fails each join until it relaunches.
+    - The 5 s window covers a read of the recording log that meets a half-written entry. In CI a relaunch took 29 s to 58 s, and the wedge ended only at the stall limit of 160 s.
+  - Recovery of the other stalls: the join watchdog acts after the stall limit with no progress. The limit is two join attempts of a follower: 2 x (2 x leader heartbeat timeout + archive message timeout + driver timeout). That is 80 s at the defaults and 160 s at the CI stall tolerance of 30 s.
+    - A leader in `LEADER_READY` with no progress on itself or its peers logs `cluster LEADER STALL` and exits with code 7. It also stays the backstop when a follower with a truncated log does not relaunch, for example a member of an older release.
     - A member that found a leader and makes no progress logs `cluster FOLLOWER STALL` and exits with code 8. It keeps its recording log.
     - Each relaunch starts from the member's own state. A member replays its log after the new leader truncates its log tail, so it joins at the leader's position.
-    - Data: the truncated tail can be committed in the lower term. In #620, member 2 closed term T0 at 15027712 with member 0, and the leader of T1 holds the log only to 15027008. The members then keep the log of T1, and the entries from 15027008 to 15027712 go. This is the behavior of Aeron 1.44 after the double vote, not of the watchdog.
+    - Data: the truncated tail can be committed in the lower term. In #620, member 2 closed term T0 at 15027712 with member 0, and the leader of T1 holds the log only to 15027008. The members then keep the log of T1, and the entries from 15027008 to 15027712 go. This is the behavior of Aeron 1.44 after the double vote, not of the watchdog. The start hold keeps such entries from the clients (see "Quorum loss" and [Start hold](../cluster/sealer-service/README.md#start-hold)).
     - With `adminPort` 0 the leader reads no peer progress. Then the leader stall can also fire while a slow follower replays for longer than the stall limit. The relaunch costs one more election.
     - Not covered: `LEADER_LOG_REPLICATION` also has no timeout in Aeron 1.44, and no rule acts on it.
     - Before each exit, the member prints its Aeron error logs (`cluster ERROR LOG`).
   - Not a stall (with the admin port set): a slow follower that replays or catches up moves its commit position. A waiting leader reads the commit positions of its peers from their admin servers every 5 s, and counts a new highest one as progress. A coordinated restart and a lone member wait in `CANVASS`, which is no follower state. A snapshot runs with a closed election.
-  - Proof: the in-JVM tests `JoinWatchdogTest`, `PeerProbeTest` and `ComponentCloseTest` (the limits follow the member's configured timeouts).
+  - Proof: the in-JVM tests `JoinWatchdogTest`, `PeerProbeTest`, `StartModeTest` (the relaunch position) and `ComponentCloseTest` (the limits follow the member's configured timeouts). `ClusterLogPurgeTest` checks that a follower below the purge point never reads as a truncated log.
 - **Component fails in its start**
   - Trigger: the consensus module or the service container throws while it starts. The usual cause is a slow host at a full restart: the snapshot load waits for the archive past an Aeron timeout.
   - Effect: the component records the error in its error log and closes. Aeron calls no termination hook, and the media driver and the archive keep the process alive. The member never joins and takes no snapshot. At the next restart it restores an old snapshot, and its log can end below the purge point of the leader.
@@ -303,6 +331,8 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
   - Trigger: two members die.
   - Effect: the pipeline must stall. Progress without a quorum would be unreplicated ordering, which is unsafe. Client cluster sessions die, because the outage is longer than the session timeout.
   - Recovery: one member returns and restores the quorum. The cluster elects a leader, the clients open new sessions, and the members replay the log. This takes about 50 s or more (SLO 180 s). The backlog then drains with no gap. The second member returns last, and the pipeline progresses with all three members.
+    - The returned member holds its outputs after its start until the members are stable (see [Start hold](../cluster/sealer-service/README.md#start-hold)). The member that ran on reports `startHold` `false`, and the dead member never answers. So the hold ends as soon as the two members agree on the term, not after the stall limit of 160 s.
+    - When the dead member answers in any round with an open election or another term, the hold waits for all members or for the stall limit. A live member of another term can be the leader of a higher term after a double vote.
   - Proof: `cluster-quorum-loss-recover`. The case asserts that the executor block gauge goes flat.
 - **Total loss**
   - Trigger: all three members die.
@@ -361,7 +391,7 @@ The sealer orders a transaction reference before the archives make its data dura
 
 - A consumer votes (`KIND_VOID_REQUEST`) only after the join budget ends and every archive refuses the range.
   - An archive refuses when it has no recording of the session, when each recording starts after the range, or when the range is in a gap or after an ended recording.
-  - An archive that is down or slow does not refuse. A live recording that does not reach the range yet does not refuse.
+  - An archive that is down or slow does not refuse. A live recording that does not reach the range yet does not refuse. A recording with no stop position (`NULL_POSITION`, -1) is live, so it does not refuse either.
 - A consumer that has the data never votes.
 - The sealer appends the void record only when **every** configured voter has voted for the same `(index, tx_hash)`.
 - One voter that is down blocks the void, and the chain waits for it. This is the safe side, because that voter can be the one that executed the entry.
@@ -411,7 +441,7 @@ The kill-based cases prove the restart logic. They do not prove durability again
 - Level 0 does not sync. Level 1 syncs the data of every write batch. Level 2 is also valid. Any other value refuses to start.
 - The code default and the deploy default are 0 (Nomad variable `cluster_file_sync_level`, env `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL`). A commit waits for no disk sync.
 - At level 0, the kernel writes the log back on its own schedule. With the Linux defaults (`vm.dirty_expire_centisecs=3000`, `vm.dirty_writeback_centisecs=500`), a page reaches the disk within about 35 s.
-- So an entry that a quorum acknowledged can exist only in the page caches of its members for that time. A power loss or a kernel crash on a majority of members in that time drops it. Each member runs on its own machine, so one power loss takes at most one member. `pipeline-blackout-recover` stands for that event.
+- So an entry that a quorum acknowledged can exist only in the page caches of its members for that time. A power loss or a kernel crash on a majority of members in that time can drop it. `pipeline-blackout-recover` kills containers on a live host. It checks restart recovery while the host page cache survives; it does not cover this loss of unsynced writes on a majority of members.
 - Only a test that cuts the power of a VM can prove this end to end.
 - On staging the three sealers are in different data centers (decision of the user, 2026-10-22). So one power event cannot take a majority, and the window above needs power losses in two data centers.
 - The backup sealer (`cluster-backup`, node `backup-0`) is the recovery path for that event. It is outside the quorum and copies each snapshot and the log after it from a follower. It syncs its own copy at level 1 (`kardamom.backup.fileSyncLevel`): its syncs do not delay a commit. See the sealer README, "Backup mode".
@@ -464,7 +494,7 @@ The executors are deterministic state machines. One dead or lagging replica neve
   - Trigger: the state DB is wiped. The process did not only crash.
   - Effect: without a checkpoint, the executor must replay the whole canonical stream from genesis. That cost is unbounded as the chain ages.
   - Recovery: with `--checkpoint-dir`, the executor writes periodic consistent snapshots (`compact_to`, an online read-only copy that never blocks the writer). The writer cuts each image to its used pages, so the manifest hash and a peer transfer read about the size of the state, not the 256 MiB growth step. On a cold start with an empty state directory, it restores the newest checkpoint before it opens the env. The normal resume path then replays only the short tail. The replicas are deterministic at the same block, so the checkpoint of a **peer** is a valid restore source.
-  - Proof: `state-checkpoint-restore`. The case wipes the state of executor-0 and re-replicates the checkpoint of executor-1. It asserts that executor-0 restores from that checkpoint, not from genesis, and rejoins.
+  - Proof: `state-checkpoint-restore`. The case wipes the state of executor-0 and re-replicates the checkpoint of executor-1: the newest base, and with the block log on, the log after it. It asserts that executor-0 restores from that checkpoint, not from genesis, and rejoins.
   - With `--checkpoint-log` (job variable `checkpoint_log`), a checkpoint is a base image and the block log after it: the write batch of each committed block.
     - A restore copies the base and applies the log through the state writer. So each block of the log is a restore point.
     - The executor copies the state only when the base rule asks for a new base: the log after the newest base is larger than that base, the base is old, or the log has a gap. The copy has a rate limit, so it does not take the disk from a sealer on the same host.
@@ -472,7 +502,7 @@ The executors are deterministic state machines. One dead or lagging replica neve
     - A peer serves its log after its base (`GET /checkpoint/log`), so a peer base below a retention floor serves when its log reaches the floor.
     - The writer never waits for the log. A full queue drops the batch (`kardamom_checkpoint_log_dropped_total`), and the gap makes the next base start at once.
 - **Replay-window overrun**
-  - Trigger: the cluster keeps a bounded canonical window (`kardamom.cluster.retention`, default 65,536 frames, about 5 minutes at 200 tps). A `REPLAY_FROM` below the floor of the window is refused with `REPLAY_UNAVAILABLE`. Below decision version 5, the window is a minimum: a frame past it stays until L1 holds its block. Under version 5 with `carryBytes`, the window is exact (see "DA-lag guard and posted-head retention floor"). The retained frames are in the cluster snapshot, so a member that restores from a snapshot keeps the floor of the snapshot. A cursor that is older than the window is the trigger.
+  - Trigger: the cluster keeps a bounded canonical window (`kardamom.cluster.retention`, default 65,536 frames, about 5 minutes at 200 tps). A `REPLAY_FROM` below the floor of the window is refused with `REPLAY_UNAVAILABLE`. Below decision version 5, the window is a minimum: a frame past it stays until L1 holds its block. Under version 5 with `carryBytes`, or with the carry window (feature 5), the window is exact (see "DA-lag guard and posted-head retention floor"). The retained frames are in the cluster snapshot, so a member that restores from a snapshot keeps the floor of the snapshot. A cursor that is older than the window is the trigger.
   - Effect: the refusal is terminal for the local state. A cursor below the floor can never catch up. A fresh or wiped node cannot re-sync from genesis either, because genesis aged out of the window.
   - Recovery with `--carry-bytes` and `--egress`: the executor reads the egress first.
     - The member refuses the cursor. The reader then reads the range read of the egress from the cursor to the head of the store, then the live `egress_order`. It goes back to the member feed when the feed serves the cursor again.
@@ -488,7 +518,7 @@ The executors are deterministic state machines. One dead or lagging replica neve
     - `kardamom_executor_resync_total` counts these repairs by outcome.
   - If no peer offers a checkpoint at or above the floor, the node stays down and says so. The remaining paths are an operator-restored checkpoint or the rebuild from L1 (`kardamom-reconstruct`).
   - A checkpoint of another state schema is skipped. The manifest states `schema_version`, and the peer sends it as `x-checkpoint-schema`. The adopter refuses the image before the copy, logs `checkpoint holds a state schema this release does not read; skipping it`, counts `kardamom_checkpoint_unreadable_schema_skips_total`, and takes the next checkpoint or the next peer. So an executor or a validator of the previous release does not adopt a checkpoint of a release with a newer schema. A manifest without the key passes, and the image says its schema when it opens.
-  - Proof: `replay-window-resync`; the unit tests `restore_skips_a_checkpoint_of_another_schema` and `a_peer_image_of_another_schema_is_skipped`. The `retention-overrun` case (`chaos-retention` shard) freezes one executor past a small retention. The shard deploys that retention. The executor must adopt a peer checkpoint.
+  - Proof: `replay-window-resync`; the unit tests `restore_skips_a_checkpoint_of_another_schema` and `a_peer_image_of_another_schema_is_skipped`. The `retention-overrun` case (`chaos-retention` shard) freezes one executor past a small retention. The shard deploys that retention. In reference mode, the executor must adopt a peer checkpoint. The shard is carry-born, so there the executor must read the range from the egress, with no refused replay and no checkpoint.
 - **Dead `tx_receipts` publication**
   - Trigger: the must-deliver `tx_receipts` publication of an executor has no connected subscriber. Every publish fails with `NOT_CONNECTED`. The causes seen: a restored executor job whose new control port every ingress attached, and a media driver that crashed and restarted under the executor.
   - Effect: the commit thread holds the receipt and retries, so the exec thread blocks and the executor stops at one block. Without a bound, one dead publication held an executor for minutes. `kardamom_publication_connected{topic="tx_receipts"}` reads 0, and `kardamom_publication_not_connected_seconds` grows.
@@ -541,8 +571,16 @@ With `KARDAMOM_EXEC_ON_SEALERS=on` (see [the deploy README](../deploy/cluster/RE
   - Effect: executor `i` gets no entry while its member is down, and its block gauge stops. The other executors carry the chain.
   - Recovery: the member starts again, and the executor asks again from its cursor.
 - **Deploy of the executor job**: Nomad orders no groups, so the role rolls the three executor groups one at a time, and waits for the health check of each group. In a roll of the pinned groups, the other two executors serve the nonce queries during each step. The move from the executor nodes also goes one executor at a time, but the readers already ask the sealer nodes: until the second executor moved, one executor serves the nonce queries.
+- **A reference that no source can join**
+  - Trigger: a transaction reference (record type 0) above the cursor of a carry executor. Only a sequencer of an older release, or a wrong version floor, makes one. The carry window refuses each new one, and the release gate moves an executor only when its committed block, minus 32, is above the block of the last stored reference (R).
+  - Effect: the reader takes the reference as a fault of its source, and reads the same index from the other source. When every source gives a reference at the same index, the executor stops with `UnjoinableReference { index }`.
+  - Recovery: move the executor back to reference mode (leave it out of `KARDAMOM_CARRY_EXECUTORS`). Its cluster session gets the bytes.
+  - Proof: `crates/engine/src/reader/carried/tests_switch.rs` (`references_at_the_same_index_on_both_sources_stop_the_reader`, `a_reference_with_no_second_source_stops_the_reader`).
+- **Rollback of the egress**
+  - Effect: an egress of an older release stores references and does not raise its mark (`ref-mark`). R can then be too low, and a reader past R can still meet a reference.
+  - Prevention: the release gate and the upgrade check refuse while any egress allocation runs a job version without the meta `ref_mark`. The steps after such a rollback are in "After a rollback of the egress" in [`runbooks/carry-window-rollout.md`](runbooks/carry-window-rollout.md).
 - **Wipe of a member**: keep `/opt/kardamom/archive/dir`. It is the archive of the shared driver, with the `exec_txs` recording of the executor, inside the archive directory of the member.
-- Proof: no chaos shard runs carry mode yet.
+- Proof: the `chaos-carry` shard turns on the carry window in the order of the rollout, and moves the executors to carry mode one at a time. Then it kills the leader at the switch, turns feature 5 off and on, and restarts an egress instance. See [chaos-suite.md](chaos-suite.md).
 
 ## Ingress (xN, active/active)
 
@@ -598,6 +636,7 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
   - A lost verdict: the offer of a verdict is best effort. The Aeron thread holds a refused frame until the offer deadline, then drops it and logs `best-effort publish failed`. A full queue of the verdict task also drops verdicts. With no verdict in `--ack-timeout-ms` (default 2 s), the call answers `transaction not acknowledged`. The transaction can still be in a mempool: a resubmit of it answers `already known`. The counters are `kardamom_sequencer_verdicts_total{outcome}` (`sent`, `full`, `closed`, `wide`) and `kardamom_ingress_tx_rejected_total{reason="not-acknowledged"}`.
   - An accepted transaction can still drop later, as in the mempool of an Ethereum node: a parked one expires, a forwarded one is lost, or a lane loses both twins. The call does not tell the client. The status feed and the receipt read do.
   - A second submission of a hash that waits on the same ingress answers `already known` at once.
+  - A resubmit of a transaction that a v2 sequencer holds, forwarded or parked (the same hash at the same nonce), answers `already known`. The sequencer publishes no drop and no rejected status for it, because the held transaction keeps its status and gets its receipt. Another transaction at the same nonce is a `replacement_underpriced` drop. Proof: `v2::tests::a_copy_of_a_parked_transaction_publishes_no_drop`.
   - The local account layer gets no rows, so `--verdicts` needs `--admission-checks false`. The v2 filter checks each sender.
   - Deploy order: the sequencers with `[admission] verdicts` first, then the ingress with `--verdicts`. An ingress with `--verdicts` before its sequencers send verdicts answers every call `transaction not acknowledged`.
   - Proof: `crates/log/tests/discovered_tx_verdicts.rs` (each ingress receives only its own verdicts), `v2::tests::each_transaction_gets_one_verdict_at_admission`, `crates/ingress/src/acks/tests.rs`, `end_to_end_test::the_ack_at_admission_answers_on_the_verdict_of_the_sequencer`, and the chain-semantics suite with `KARDAMOM_E2E_ADMISSION=1 KARDAMOM_E2E_VERDICTS=1`.
@@ -714,25 +753,34 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - A new process starts from `--sealer-version-floor` (env `KARDAMOM_SEALER_VERSION_FLOOR`, from 0 to 5, default 0). The deploy sets the lowest `decisionVersion` of the members. With a floor of 5, the first offers of a new process go out with their bytes (record type 7), so no reference without bytes (record type 0) goes out after a restart.
   - A wrong floor lasts until the first kind 17 of the session, a few milliseconds.
   - A floor above the version of the chain makes type-7 offers below version 5. The sealer orders them. A reader with the decoder of a relayed type 7 runs them.
-  - Set the floor to 0 before a fleet rebuild from a seed. A seeded member runs version 3.
+  - A seeded member runs the decision rules that the seed carries, so the floor can stay at a fleet rebuild from a seed. A seed of version 1, from an older `kardamom-reconstruct`, holds no rules: set the floor to 0 before a rebuild from such a seed, because the member runs version 3.
   - Both loops (v1 and v2) read the kept version.
   - The sequencer sends the activation record (ingress kind 11) of `FEATURE_CARRY_WINDOW` (feature 5) in front of its epoch, as for features 3 and 4. A sealer that does not follow feature 5 ignores it.
   - The sealer can refuse a reference without bytes, and answer the offering session with egress kind 18 (`REF_REFUSED`: the hash, the sender, the nonce and the decision version). The egress feed thread of the sequencer then:
     - raises the kept version to the version of the frame;
     - counts `kardamom_sequencer_ref_refused_total{partition}` and logs `sealer refused a reference without bytes; dropping the transaction`;
     - publishes one `TxDrop` for the hash on `tx_drops`, with the reason `SealerRefusedReference`. It uses a clone of the drop handle of the publish loop: best effort, with no new queue. The drop counts in `kardamom_sequencer_tx_drops_total{reason="sealer_refused_reference"}`.
-  - The sequencer offers nothing again by itself: the v2 loop keeps no transaction after its offer. The client sends the transaction again, and the new offer goes out with its bytes.
+  - The sequencer offers nothing again by itself after a refusal: the v2 loop forgets the run of the sender. The client sends the transaction again, and the new offer goes out with its bytes.
   - The feed thread also puts `AccountEvent::Refused { sender, nonce }` on the account queue of the v2 loop. The filter then forgets the forwarded run of the sender, as for a lost transaction. So the resend at the same nonce goes out at once, with no `already known` refusal and no wait for the loss window (`loss_blocks`, 16 blocks). A full queue loses the event, and the loss window frees the nonce later.
+  - The refusal does not remove the loss mark of the refused forward. When that mark expires, `loss_blocks` after the forward, it can end a new run of the sender that holds the same nonce, before a state confirms it. The sender then sends from its chain nonce again. This is the same as the loss expiry today, which can also end a run whose transaction is still in flight.
   - A kind 18 that does not decode logs `a reference refusal of the sealer does not decode` with the error.
   - The egress then answers `dropped` with the text `transaction dropped by the sealer, send it again` (code -32000). The status is provisional. The twin can offer the same transaction with its bytes, and the sealer orders that copy. Its receipt wins over the drop, and the status becomes `executed`. Client text: safe to send again; the status can still become executed. A copy sent after the twin's copy is ordered gets the nonce guard, and the first hash stays `executed`.
   - A sequencer of an older release drops kind 18 as an unknown kind. Its transaction stays unordered unless its twin offers it with its bytes, and the client sees no receipt.
   - Proof: `crates/sequencer/src/sealer_rules_tests.rs` (`a_new_session_keeps_the_version`, `a_lower_report_of_the_current_session_lowers_the_version`, `a_lower_report_of_an_old_session_does_not_lower_the_version`, `a_new_process_starts_from_the_floor`, `a_refused_reference_raises_the_version_and_drops_the_transaction`, `a_refused_reference_tells_the_loop_once`), `feeds::steps::tests::a_reference_refusal_raises_the_version_and_drops_the_transaction`, `a_reference_refusal_below_the_kept_version_does_not_lower_it`, `crates/sequencer/src/v2/tests.rs` (`a_resend_after_a_sealer_refusal_goes_out`), `crates/sequencer/src/admission/tests.rs` (`a_refused_transaction_can_be_sent_again_at_once`), `publish_drop_counts_the_drop_by_reason`, `a_floor_above_five_is_refused`, `publishes_the_activation_of_the_exact_window_in_front_of_its_epoch`, `crates/egress/src/owner_tests.rs` (`a_refused_reference_is_dropped_until_the_receipt_of_the_twin`), and `tx_drop_of_a_refused_reference_keeps_the_layout`.
+- **The v2 loop and a lost offer**
+  - Under decision versions 4 and 5, the sealer orders a reference by the replay window of its ingress image. No contiguity guard checks the nonce. So the sealer orders a later nonce of a sender also when it lost an earlier one. The executor then skips each later nonce with `nonce_too_high`, and the client gets a failed receipt for each one.
+  - The v2 loop prevents this. The admission filter keeps each forwarded transaction, with its bytes, until a row confirms it or its run is lost. The loop offers the kept transactions again in these cases:
+    - **A new cluster session.** A leader change or a reconnect opens a new session. The old session can have taken offers that the sealer never ordered. The v2 loop offers through a fenced publisher (`LiveIngress::fenced`). The first offer on a new session offers nothing and returns `OfferOutcome::SessionChanged`. The loop then replaces its outbox with every unconfirmed run, each in nonce order, and offers them before any new offer. The sealer absorbs a copy of an ordered offer as a duplicate of its replay window. The loop logs `sequencer v2: the sealer session changed; offering the unconfirmed runs again`.
+    - **A contiguity reject.** The guard of the sealer rejected nonce `n` and expects `E`. The feed thread puts `AccountEvent::Rejected` on the account queue of the loop. When the filter holds the transaction at `E`, the loop offers the transactions at `E` and at `n` again, in that order. Each such reject moves `E` up by one or more, so the offers end. When the filter does not hold `E`, the loop offers nothing, and the loss window frees the run.
+  - The loop builds each offer when the offer goes to the outbox, in the format of the version that the sealer reports at that time. So the offers of one sender change format once, in nonce order, at a version switch. A transaction that waits for a nonce gap gets the format of its release, not of its admission. If it kept the format of its admission, a switch from version 5 to 4 could put a full reference (record type 7) after a reference without bytes (record type 0) of the same sender. Below version 5, the sealer runs a full reference through its contiguity guard, but a reference of type 0 with a position does not touch the guard. So the guard does not know the earlier nonce, and it rejects the later one.
+  - A replay window that dropped a position refuses the copy as expired. Such a transaction stays unordered, and the loss window (`loss_blocks`, 16 blocks) frees the run. The client then sends it again.
+  - Proof: `crates/sequencer/src/v2/resend_tests.rs` (`a_parked_transaction_goes_out_in_the_format_of_its_release`, `a_new_session_offers_the_unconfirmed_run_before_a_new_offer`, `a_new_session_does_not_offer_a_confirmed_transaction_again`, `a_contiguity_reject_offers_the_expected_and_the_rejected_nonce_again`, `a_contiguity_reject_for_a_nonce_out_of_the_run_offers_nothing`), `crates/sequencer/src/admission/tests.rs` (`the_filter_keeps_the_unconfirmed_run_until_a_state_confirms_it`), `crates/cluster-adapter/src/live/mod.rs` (`a_fenced_ingress_reports_a_new_session_once`), `crates/sequencer/src/sealer_rules_tests.rs` (`a_contiguity_reject_tells_the_loop`), and the chaos cases `carry-full-ref-below-v5` and `cluster-leader-kill`.
 - **Nonce lookup path**
-  - A parked sender needs its committed nonce. The sequencer asks the local layer first (outcome `local`). Then it asks Redis (outcome `redis`). Then it asks the executors.
+  - A parked sender needs its committed nonce. The sequencer asks the local layer first (outcome `live` in the v2 loop, `local` in the v1 loop). Then it asks Redis (outcome `redis`). Then it asks the executors.
   - A lookup that misses Redis, or finds Redis degraded, goes to the executors.
-  - Metrics: `kardamom_sequencer_nonce_lookup_requests_total` counts the parks that asked. `kardamom_sequencer_nonce_lookups_total{outcome}` counts the queries by outcome: `ok`, `redis`, `local`, `error`, `timeout`, `shed`. `kardamom_sequencer_nonce_lookups_in_flight` is the gauge of concurrent queries.
+  - Metrics: `kardamom_sequencer_nonce_lookup_requests_total` counts the parks that asked. `kardamom_sequencer_nonce_lookups_total{outcome}` counts the queries by outcome: `ok`, `redis`, `local`, `live`, `miss` (no source holds the account), `error`, `timeout`, `shed`. `kardamom_sequencer_nonce_lookups_in_flight` is the gauge of concurrent queries.
   - A nonce above 0 is floor evidence of the same kind as a receipt.
-  - Proof: `lookup-blackout` (`chaos-sequencer` shard). The case blackholes the executors on a sequencer node. It also drops the TCP traffic to ports 6379 and 26379 there, so Redis cannot answer the lookup. It then hard-kills the lane-0 replica on that node. A second phase drops the UDP of the executors and kills the replica again, so a lookup is answered.
+  - Proof: `lookup-blackout` (`chaos-sequencer` shard). The case blocks receipt DATA stream 1002 and executor nonce-query TCP 9024 on one sequencer node. It also blocks Redis/Sentinel TCP 6379/26379, then hard-kills lane 0 and requires failed lookups with no answered source. The second phase restores query/cache traffic, keeps receipt DATA blocked and kills the replica again; a lookup must answer. Both phases require a received canonical boundary, positive receipt-drop counters and the same replacement process. The rules preserve cluster egress and Aeron control frames from colocated sealers. Both fault chains are cleared after success or failure.
 - **Fee gate**
   - With priority fees on, the sequencer refuses a transaction with `FeeInvalid`, `FeeTooLow` or `InsufficientFunds`. The counter is `kardamom_sequencer_fee_rejected_total{partition}`. See [`priority-fees.md`](priority-fees.md).
 
@@ -749,7 +797,7 @@ The single-replica cases prove that a twin covers a loss. These cases prove the 
 - **A whole sequencer lane**
   - Trigger: both replicas of lane 0 die, one on each sequencer node.
   - Effect: the senders of the lane are unordered until a replica returns with empty state. That replica learns the floor of each sender from the executors.
-  - Recovery: both replicas come back healthy. `kardamom_sequencer_ref_below_floor` reads zero on both.
+  - Recovery: both replicas come back healthy. On the v1 loop, `kardamom_sequencer_ref_below_floor` reads zero on both. The v2 loop cannot strand a reference and does not export the gauge.
   - Proof: `sequencer-lane-loss-recover`.
 - **Pipeline blackout**
   - Trigger: every ingress, sequencer, sealer, executor and aux node dies at once. Only the control node stays, with the orchestrator and the L1. All nodes start in one call, in no set order.
@@ -764,7 +812,7 @@ The coordinated cases take one class down, or every node. These cases take two o
 - **The ingresses and the sequencers**
   - Trigger: both ingress tasks and all four sequencer tasks die, and both jobs stop. The sealers run on.
   - Effect: the sealers seal empty blocks. The executor block gauge advances. The applied-transaction counter stays flat.
-  - Recovery: the sequencers return, then the ingresses. The da-watcher publishes again the epochs that reached no sequencer. The sealer's L1 origin reaches the last published epoch. No lane-0 replica holds a ref below a floor.
+  - Recovery: the sequencers return, then the ingresses. The da-watcher publishes again the epochs that reached no sequencer. The sealer's L1 origin reaches the last published epoch. On the v1 loop, no lane-0 replica holds a ref below a floor.
   - Proof: `ingress-sequencer-loss-recover`.
 - **The ingresses and the sealers**
   - Trigger: both ingress tasks die and the job stops. All three sealer nodes die.
@@ -813,7 +861,7 @@ The ordering shard keeps the executors up. These cases take the executors down w
   - Trigger: the sequencer tasks, the executor tasks and the redis job die, and all three jobs stop. No source of a sender floor is left.
   - Effect: the head advances. A submit parks at the ingress and times out: no sequencer orders it.
   - Recovery: the sequencers return first with no floor. Each established sender parks, and the replica asks for its floor. The lookup misses Redis (down) and fails at the executors (down), so the sender stays parked and the replica asks again on its next park. It never seeds a floor. Redis returns empty 30 s later. The executors return 30 s after that and answer the lookups. The floors rise, the parked transactions drain in nonce order.
-  - Proof: `sequencer-executor-redis-loss`, by name only (see "Known gaps"). Every lane-0 replica shows a lookup request and an answer from an executor or from Redis, `kardamom_sequencer_ref_below_floor` reads zero, and the load verdict proves that no nonce gap remains.
+  - Proof: `sequencer-executor-redis-loss`, the last case of `chaos-combined-exec` (see "Known gaps" for #545). Every lane-0 replica shows a lookup request and an answer from an executor or from Redis, `kardamom_sequencer_ref_below_floor` reads zero on the v1 loop, and the load verdict proves that no nonce gap remains.
 - Every case ends with the common tail. The load verdict proves that no accepted transaction was lost and that the receipts are in nonce order.
 
 ## Validator (off the hot path, halts on divergence)
@@ -897,7 +945,7 @@ A divergence is a state, not a dead process.
 - The validator then resumes verified execution.
 - Blocks through the adopted checkpoint are **unverified by this validator**. `validator_resync_total{outcome="peer-checkpoint"}` counts the adoptions. The divergence latch covers only blocks that the validator re-executed.
 - The trustless alternative is the rebuild from L1 (`kardamom-reconstruct`) into the state directory.
-- Proof: `retention-overrun-validator` (`chaos-retention` shard). The case asserts that the adopted validator resumes verifying (`blocks_verified` rises).
+- Proof: `retention-overrun-validator` (`chaos-retention` shard). In reference mode, the case asserts that the adopted validator resumes verifying (`blocks_verified` rises). The shard is carry-born, and its validator reads the egress. There the case asserts that the validator resumes verifying with no refused replay and no adoption.
 
 **Catch-up semantics.** These rules set the coverage cost.
 
@@ -954,6 +1002,8 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
 - A request goes to the best endpoint first. On an error or an HTTP 429, it falls back to the next endpoint. A failing endpoint ranks last for the requests after it.
 - The batcher reads only what the contract commits to, so it does not cross-check hashes. The followers do (see "DA-watcher").
 - A post that fails on every attempt of `--l1-retries` is the `l1_unreachable` halt. The halt clears by itself when L1 answers.
+- The nonce of each send is the pending transaction count of the batcher key on L1. A send that fails before it reaches L1 (for example, a failed gas estimate during an L1 outage) takes no nonce, so it leaves no nonce gap.
+- A post waits up to 120 s (ten Ethereum blocks) for its receipt. After that, the sender reads `lastBatchIndex`. A transaction that landed counts as the post. The sender sends a transaction that did not land again. When the first one lands later, the contract refuses the second (`StaleBatchIndex`). The read after that refusal confirms the post. So a batch never lands twice.
 
 **Data path.**
 
@@ -983,13 +1033,14 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
 - The validator, the batcher and an executor that reads the cluster egress stop. The executor and the validator exit with status 1.
   - The orchestrator restarts each one. Each restart stops at the same refusal until the sealer serves the stream again.
   - The sealer serves it again after a seeded start from a state rebuilt from L1 (see "Data-availability recovery").
-- An executor that reads the member feed (`--carry-bytes`) does not stop. It waits for the head and compares the stream with its committed history (next section). A divergence rolls it back to a checkpoint below the divergence. With no such checkpoint, it stops as above. The deployed executors read the cluster egress (see "Release gate" in the next section).
+- An executor that reads the member feed (`--carry-bytes`) does not stop. It waits for the head and compares the stream with its committed history (next section). A divergence rolls it back to a checkpoint below the divergence. With no such checkpoint, it stops as above. By default the deployed executors read the cluster egress (see "Release gate" in the next section).
 
 **A power loss on a majority of the sealers rolls the paired executors back.**
 
 - **Release gate.** The automatic rollback runs only in an executor that reads the member feed (`--carry-bytes`).
   - An executor that reads the cluster egress does not compare. It keeps no rollback marker and no receipt ledger, and it publishes no rollback. A power loss on a majority stops it with `ClusterBehindCursor`, as described above. The recovery is a seeded start from a state rebuilt from L1.
-  - The executor job of the deploy does not set `--carry-bytes`. So the deployed executors read the cluster egress, and the automatic rollback is not live on them.
+  - By default `KARDAMOM_CARRY_EXECUTORS` is empty. So the deployed executors read the cluster egress, and the automatic rollback is not live on them.
+  - An executor that `KARDAMOM_CARRY_EXECUTORS` names runs with `--carry-bytes`, and the automatic rollback is live on it.
   - Two upgrade transactions turn on the carried path: feature 4 (`FEATURE_SEALER_V5`, the carry flag), then feature 5 (`FEATURE_CARRY_WINDOW`, the carry window). Start an executor with `--carry-bytes` only after feature 5 is on. Before it, the member feed can hold a reference of record type 0, and the executor can stop with `UnjoinableReference`. See "The carry window (feature 5)" in [`../cluster/sealer-service/README.md`](../cluster/sealer-service/README.md#the-carry-window-feature-5).
   - The sealers run at sync level 0 by default (see "Durability of the Raft log").
 - The cause. A member does not force its log on each append: the kernel writes it back on its own schedule. A power loss on the hosts of a majority loses, on each of them, the entries after the last position that reached the disk. Raft elects the most complete surviving log, and the cluster continues from it. The next entries take the lost indexes.
@@ -1076,9 +1127,10 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
   - A refusal needs a cursor below the floor of the sealer. The batcher then rebuilds the range from references (above).
 - The batcher posts the pending group of the spool first. It does this even when a refusal stops the reader before the group is due. The spool is the only copy of those blocks.
 - Proof: `batcher-outage-past-retention`.
-  - The case freezes the batcher with a non-empty spool. It holds the freeze until the load passes twice the retention and a Raft snapshot lands. It then thaws the batcher.
+  - The case freezes the batcher with a group in its spool that L1 does not hold. Each freeze attempt holds the batcher for 5 s, so a post in flight lands, and then reads the block L1 covers. A spool that ends at or below that block holds only the posted batch, and a restart drops it. The attempt then thaws the batcher and tries again.
+  - It holds the freeze until the load passes twice the retention and a Raft snapshot lands. It then thaws the batcher.
   - It asserts that the frozen group lands right after the covered block.
-  - It asserts that the batcher exits after the thaw and restores the group from its spool. The freeze lasts at least the stall tolerance plus 20 s, so a client times out and ends the process (see "Aeron stall tolerance").
+  - It asserts that the batcher exits after the thaw and restores the group from its spool. The old process can also post the group between the thaw and its exit: its confirmed post of the next block comes before the last start line. The case accepts that end too. The freeze lasts at least the stall tolerance plus 20 s, so a client times out and ends the process (see "Aeron stall tolerance").
   - A batcher that keeps running fails the case. The failure says whether the handler logged `aeron client error; exiting` (the exit hung) or no timeout fired.
   - It then accepts one of two ends. The sealers serve the replay, and L1 covers the head at the thaw with no refusal. This is the expected end. Or the sealers refuse, and the batcher rebuilds the gap and posts past the floor.
   - It asserts that the record on L1 is contiguous.
@@ -1205,7 +1257,7 @@ Remove every copy of the reverted chain. Each copy that stays resumes or publish
 
 ### Proof: `sealer-fleet-total-wipe-recover`
 
-The chaos case `sealer-fleet-total-wipe-recover` proves the procedure end to end. It runs last in the `chaos-fleet` shard. See [`chaos-suite.md`](chaos-suite.md#shards).
+The chaos case `sealer-fleet-total-wipe-recover` proves the procedure end to end. It runs last in the nightly `chaos-integrity` shard, on a reference-born cluster. See [`chaos-suite.md`](chaos-suite.md#shards).
 
 The case does these steps:
 
@@ -1387,8 +1439,7 @@ The notifier is off the hot path by construction. It reads `tx_status`, `tx_rece
 - A back-pressured frame is dropped after a bounded retry. The drop counts in `kardamom_log_best_effort_dropped_total{stream_id="1018"}`.
 - The receipt stream stays the truth. A client that misses a status reads the receipt.
 - A restart loses the in-memory ring. A WebSocket client that reconnects replays what the new ring holds.
-- Webhook subscriptions and their outboxes live on disk. A restart resumes delivery from the persisted cursor, at least once.
-- The two instances shard subscriptions by a rendezvous hash of the id. Both store every registration. The shard of a lost instance moves to the twin when the instance count changes.
+- The notifier keeps no state on disk. The webhooks are removed (2026-10-25); offline delivery comes later through a task queue. A lost instance loses only its ring, and its clients reconnect to another instance.
 - The `Sealed` stage needs an egress channel on the ingress. See [`tx-status-events.md`](tx-status-events.md) for the API, the settings and the metrics.
 
 ## Transaction canary
@@ -1492,6 +1543,15 @@ An **upgrade transaction** turns on a feature flag.
 - An older executor or validator runs the deposit as a call to an empty account. Its state forks at that deposit. The job meta `chain_state_install = "true"` marks the executor and validator jobs of this release, and `just sealer-upgrade-check <env> <feature> <activation_ms>` requires it. The zk guest links the install, so roll the prover's guest and its verifying key before the first upgrade transaction.
 - Proof: `crates/exec-core/src/executor/install_tests.rs`, `crates/engine/src/actor/exec_tests/flag_freeze.rs` (`every_driver_switches_at_the_same_block`), `crates/executor/tests/flag_freeze.rs`, `crates/validator/src/parallel/engine_tests/flag_freeze.rs`, `crates/validator/tests/witness_anchoring.rs` (`the_guest_installs_the_chain_state_code_with_the_first_upgrade`), `crates/deployer/tests/chainstate_genesis_predeploy.rs`, and the S13d cases of the chain-semantics suite on both geneses.
 
+**Features at genesis.** A new chain can start with the sealer features 3, 4 and 5 on, with no upgrade transaction: the genesis TOML key `genesis_features = [3, 4, 5]`.
+
+- Only the prefixes of the activation order are valid: `[]`, `[3]`, `[3, 4]` and `[3, 4, 5]`. The parse refuses any other list.
+- The genesis state holds what the upgrade transactions write on a live chain: the `KardamomChainState` code at `CHAIN_STATE`, and for each feature the activation word `GENESIS_ACTIVATION_MS` (1 ms). An allocation entry at `CHAIN_STATE` keeps its nonce and balance. Other code at `CHAIN_STATE` fails the validation.
+- The key changes the genesis root and the genesis digest. A chain without the key keeps the exact root and digest of its genesis: the storage words add no bytes to the digest, and `crates/engine/src/replay_genesis_tests.rs` pins the roots and digests of the genesis files.
+- Every state consumer seeds from `Genesis::to_alloc`: the executor, the validator, replay and `kardamom-reconstruct`. So all of them must read the same genesis file. A consumer with another file refuses its state (`GenesisMismatch`) or a checkpoint of the chain.
+- The key must match the sealer setting `kardamom.cluster.genesisFeatures` of the same chain. A later upgrade transaction of a feature rewrites its word, as on any chain.
+- Proof: `crates/types/src/genesis_tests.rs`, `crates/state/src/genesis.rs` (the storage tests), `crates/engine/src/replay_genesis_tests.rs` (`a_carry_genesis_holds_the_words_of_the_upgrade_transactions`), and S13g of the chain-semantics suite.
+
 **Mixed-version fleets fail-stop rather than fork.** This happens in two places.
 
 - An **old validator** halts at the epoch that contains the upgrade.
@@ -1527,10 +1587,15 @@ A deploy replaces service instances one at a time under readiness checks. The ch
 - The release gate refuses a release before any job changes: a chain that stands on a halt or a pause, an image that the registry does not hold, a coordinated or an unaccepted one-way format change, a sealer setting that every member must match, and a shard map change. See "The release gate" in [../deploy/cluster/README.md](../deploy/cluster/README.md).
 - The deploy record (the Nomad variable `kardamom/deploys/<env>`) holds the pre-deploy version of every job. `just rollback <env>` reverts every job of the last release to that version, in reverse deploy order, under the same waits. It does not cross a rollback floor. Runbook: [runbooks/deploy-rollback.md](runbooks/deploy-rollback.md).
 - Proof: `deploy-broken-image` (`chaos-executor` shard).
-  - The case deploys a manifest whose executor image is a real image that is not an executor.
-  - The new replica never passes its readiness check. Nomad fails the deployment at its healthy deadline.
-  - The deploy must fail, and at least two old executors must keep running. The chain must keep advancing.
-  - The deploy of the real manifest then heals the job.
+  - The case rolls the executor job in Nomad, without the deploy play. It takes the job as Nomad holds it, and changes the first executor group: its executor image becomes a real image that is not an executor.
+  - The rolled group gets a healthy deadline of 50 s and a progress deadline of 55 s. The rest of the update stanza stays: one instance at a time, no revert.
+  - The new replica never passes its readiness check. Nomad must mark the deployment `failed`, with no healthy replica of the broken image.
+  - At least two executors must keep running the old image. The case reads the image from the job spec of each running allocation. The chain must keep advancing.
+  - The real image under the same deadlines then heals the group, and that deployment must be `successful`. So the deadline is one that a real executor meets. Then the job gets back its own update stanza.
+  - The checks of the deploy play no longer run on a live cluster in this case. They moved to the mock Nomad API of `deploy/cluster/ansible/tests/test_deploy.py`:
+    - the stop of the play at a failed rollout: `DeployTest.test_a_failed_deployment_stops_the_deploy_at_its_job` and `DeployTest.test_a_failed_job_of_a_wave_stops_the_deploy_at_the_end_of_the_wave`;
+    - the release gate on a halted chain: `RecordTest.test_a_halted_chain_refuses_the_release`;
+    - the carry gates of `carry_gate.yml`: `CarryTest.test_the_version_floor_needs_every_reader_of_a_relayed_full_reference`, `CarryTest.test_the_readers_move_to_the_egress_past_the_last_stored_reference` and `CarryTest.test_the_carry_executors_move_one_at_a_time_after_the_switch`.
 - The deploy flow is in [../deploy/cluster/README.md](../deploy/cluster/README.md).
 
 ## Substrate (the shared failure domain)
@@ -1557,6 +1622,7 @@ A deploy replaces service instances one at a time under readiness checks. The ch
     - `mirror_archive` never copies the mark file. The destination daemon creates its own.
     - `mirror_archive` copies the catalog by a **stable read**: two consecutive identical snapshots, catalog before segments. The chaos restore does the same.
     - The post-restore verify of the wipe case is CRC-armed.
+    - `ArchiveTool verify` changes the catalog: it writes stop positions and can mark entries invalid. Run it only on a stopped archive or an isolated copy of its catalog and segments. The wipe drill verifies an isolated copy while the live daemon recovers.
   - One caveat of Aeron 1.45 bounds what that gate can check.
     - Catalog **entry** checksums go stale when a restored archive is adopted. Active recordings get their recovered stop positions patched in with no entry-checksum recompute. `ArchiveTool.verify` does this, and the adoption path shows the same signature.
     - The gate treats per-frame CRC32 failures, missing files and structural errors as fatal.
@@ -1570,17 +1636,25 @@ A deploy replaces service instances one at a time under readiness checks. The ch
     - On the **live** path, the join-miss refetcher of the executor rotates to the mirror archive when a replay produces no fragments. That is the signature of a corrupt recording when replay-side CRC validation is on. A reader never stays pinned to a bad copy.
     - The offline segment reader fail-stops on structural damage. A zeroed or undersized frame header with data behind it is `Corruption`. It is not read as a live tail.
     - Proof: `archive-corruption`.
+- **Canonical subscription lost while boundaries continue**
+  - Trigger: the subscription announcement is lost or not connected while the session receives ordinary egress. Boundaries and status broadcast to unregistered sessions. Even records can arrive through the empty-consumer fallback before another consumer registers.
+  - A received frame does not prove registration. Treating it as an acknowledgement can stop retries while the session remains outside the record fan-out.
+  - Recovery: subscribing clients refresh the existing announcement every three seconds and at each reconnect. Duplicate registration keeps the cached recipient list. Publisher-only clients send no announcement. Replay requests retain their separate acknowledgement rules.
+  - Cost: one small ingress control message and the existing status response per subscribing session per refresh interval. No transaction or stored format changes.
+  - Proof: client controls exercise broadcast traffic after an unconfirmed announcement, the refresh bound, reconnects, publisher-only mode and replay answers. The driverless sealer test proves that fallback records and boundaries reach an unregistered observer, another registration excludes it from records, and a repeated announcement restores exactly one copy of each new record. A live fault run remains required.
 - **Aeron stall tolerance**
   - One deploy value sets how long every Aeron party waits through a stalled peer: `aeron_stall_tolerance_ms` (env `AERON_STALL_TOLERANCE_MS`, workloads role).
   - It sets these timeouts:
     - the driver timeout of every Rust client (`AERON_DRIVER_TIMEOUT`, which the C client reads);
     - the driver timeout of every Java client (`aeron.driver.timeout`), in the `aeron` job and in each sealer member;
     - the client liveness timeout of every media driver (`aeron.client.liveness.timeout`), in the `aeron` job and in the embedded driver of each sealer member. The service interval check of a client uses the same value.
+    - the image liveness timeout of the same media drivers (`aeron.image.liveness.timeout`). A receiving driver keeps the image of a silent publisher this long. A receiver thread that stalls for longer loses the image, and an archive that loses an image leaves a hole in its recording.
   - The publication unblock timeout is 3/2 of the tolerance. Aeron refuses to start a driver whose unblock timeout is not above its client liveness timeout.
   - A client sends its keepalive every 500 ms, far below the tolerance.
   - A Rust service waits for its Aeron client to start for the driver timeout plus 5 s, and at least 10 s. A client that starts while a restarted driver is still in its restart delay therefore waits for the driver, and does not crash-loop.
   - A new driver refuses to start (`active driver detected`) while the heartbeat of a dead predecessor is younger than its driver timeout. So the `aeron` job restarts a failed driver after the tolerance plus 5 s.
   - The default is **10000** ms, the Aeron default. Staging and production keep it. A longer value delays the detection of a dead client or driver by the same time.
+    - A publisher that closes sends an end of stream, and its images go at once. Only the image of a killed publisher or of a dead driver waits for the image liveness timeout. At the CI tolerance, such an image goes after 30 s, not 10 s. The subscribers and the recordings of that image close later by the same time. No chaos budget waits for that close: the Raft election and the cluster sessions use their own heartbeats, and a detached destination of a Rust subscriber lingers for a stall budget, which is longer than the image liveness timeout.
   - The Raft election and leader heartbeat timeouts are separate and do not change.
   - CI sets **30000** ms (the `cluster-e2e` workflow and the container recipes of `deploy/cluster/justfile`). A shared CI runner can stall for more than 10 s. At 10 s, such a stall kills a healthy party: a client exits on `MediaDriver keepalive: age=... > timeout=10000ms` or on `service interval exceeded`.
   - Every Aeron client error ends the process, in every Aeron context of a Rust service. A timeout is the common case.
@@ -1629,8 +1703,10 @@ A deploy replaces service instances one at a time under readiness checks. The ch
     - Only an unavailable agent starts a retry: a connect error, a timeout, a broken transfer, or a 5xx status. A refused permission (a 4xx status, an ACL denial) or a malformed request fails at once.
     - The pauses follow the catalog backoff of `[discovery]` (`backoff_min_ms` to `backoff_max_ms`, doubling).
     - Each failed try logs a WARN line `discovery: start-up open failed; trying again`. The line names the record (`open`) and gives the error.
+  - Consul read of the cluster members (`StreamPlane::cluster_ingress_endpoints`): the same retry, for the same limit. A Consul agent that rejoins its servers after a node restart answers `500 No known Consul servers` for a short time. The WARN line names the read (`open = read kardamom-cluster-member`). Every service that connects to the cluster reads the members once at start-up: the sequencer, the executor, the validator, the batcher, the ingress and the da-watcher.
+  - Archive connect of a discovered recorder (the `tx_data` recorder of the ingress, the `tx_deposits` recorder of the da-watcher, the `l1_blocks` recorder of the L1 follower): a node that restarts can start the archive after the recorder. The connect then ends with `archive connect poll: TimedOut` after 30 s. The recorder tries the connect again, with a pause of 1 s, until the start-up limit passes. Each failed try logs the WARN line `discovered recorder: archive connect failed; trying again`. The readiness wait of the service is the limit, plus one connect of 30 s, plus 60 s for the recordings to go live (`DiscoveredRecorder::ready_budget`). A stop ends the tries.
   - At the end of the limit, the open returns its last error. What happens next depends on the open:
-    - A publication open, a subscription open, or a publisher record registration: the error ends the start-up, and the service exits with the same error as with no wait. Nomad restarts it. A service that cannot open its streams has no state to serve, so the exit does not go through the halt contract.
+    - A publication open, a subscription open, a publisher record registration, a cluster member read, or an archive connect of a recorder: the error ends the start-up, and the service exits with the same error as with no wait. Nomad restarts it. A service that cannot open its streams has no state to serve, so the exit does not go through the halt contract.
     - A subscriber record registration: it runs in a background task, so its last error only logs the WARN line `discovery: subscriber registration failed`, and the service keeps running. The subscription itself is open and attaches its publishers. Without the record, the publishers of the stream treat the stream as one without a subscriber: a must-deliver publisher does not escalate for it.
   - A stop ends the wait of an add and the retries of a registration at once, with the error `stopped during start-up open`.
     - The executor and the validator handle SIGTERM before they open their streams, so they pass the token of that signal to the plane (`StreamPlane::stopping_opens_on`). Without the token, a SIGTERM during a stall waits for the end of the limit, and Nomad sends SIGKILL first.
@@ -1640,7 +1716,8 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - Proof:
     - The `add_wait` unit tests of `kardamom-log`: the start-up wait equals the limit; a wait with no answer times out once and cancels the add; a stop ends the wait at once and cancels the add.
     - The `start_retry` unit tests: the retry succeeds after transient failures, gives up at the limit, fails at once on a refusal, and ends at once on a stop (during a pause, and before a pause).
-    - `consul_register_retry`: a fake Consul agent drops one request and answers 503 once, then accepts.
+    - `consul_register_retry`: a fake Consul agent drops one request and answers 503 once, then accepts. The cluster member read tries again after two 500 answers, and fails with the last error after the limit.
+    - The connect tests of the discovered recorder in `discovery/recording/tests.rs`: the connect tries again within the limit, fails after the limit, and ends on a stop.
     - `a_publication_open_outlasts_a_driver_stall` in `discovered_exec_txs` (docker-e2e): the test freezes the driver for 7 s during a publication open. The open succeeds with one add, and the driver holds one publication.
 - **Catalog flap of a live publisher**
   - Trigger: the Consul catalog misses a live publisher for longer than `removal_grace_ms` (5 s by default) and lists it again. For example, a read that returns a malformed body, or a record whose check is late. The publisher does not restart.
@@ -1669,7 +1746,7 @@ A deploy replaces service instances one at a time under readiness checks. The ch
 - **Combined outages**
   - `chaos-combined-ordering` takes two or three classes down at once and brings them back in dependency order and against it: the ingresses with the sequencers, the ingresses with the sealers, the sequencers with the sealers, and all three (see "Combined outages").
   - `chaos-combined-exec` takes the executors down with the sealers, with the sealers and the validator, with the ingresses, and with Redis and the state mirrors (see "Combined outages with the executors").
-  - `sequencer-executor-redis-loss` (the executors with the sequencers and Redis) exists and runs by name. It is in no shard: the Aeron driver error below (#545) can cut a replica off its stream and fail it.
+  - `sequencer-executor-redis-loss` (the executors with the sequencers and Redis) runs last in `chaos-combined-exec`. The Aeron driver error below (#545) can cut a replica off its stream and fail it.
   - Open: the aux node with the sealers, the media drivers on every driver node, and the two ingress nodes. No case takes them down together yet.
   - Open: no combined case checks that the L1 record stays contiguous through the outage, or that a deposit lands once after it. The suite never deposits.
 - **Executor receipt publication that never connects after a job restart**
@@ -1693,7 +1770,8 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - Open: the followers of that shard read one source, the proxy. This is the wiring of the shard, not a limit of the code. The halt on a swallowed log, the disagreement counter and the self-resume after a wrong hash are therefore not cases yet.
   - Open: the proxy does not serve gas spikes of a real L1.
 - **Carry mode**
-  - Open: no chaos shard deploys carry mode. The node loss that takes a member and its executor together, the feed after a driver loss, and the egress fallback have no case yet. See "Carry mode: the executor next to its member".
+  - The `chaos-carry` shard deploys carry mode: the activation in the order of the rollout, the move of the executors one at a time, a leader kill at the switch, feature 5 off and on, and an egress restart.
+  - Open: the node loss that takes a member and its executor together, the feed after a driver loss, and the egress fallback have no case yet. See "Carry mode: the executor next to its member".
 - **Bridge, injection and DA-parity cases are Target-L only**
   - The `semantics` shard runs nonce ordering, RPC liveness and validator and executor consistency against the real cluster.
   - Open on the deployed cluster: S1 and S2 (bridge) need a contract-deploy phase, the message-passer predeploy and the attester variables in the shared bring-up path.

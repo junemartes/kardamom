@@ -59,6 +59,15 @@ class DnsTokenTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('roles = "aux,redis,redis-primary"', config)
 
+    def test_every_profile_raises_the_connection_limit_of_a_client(self):
+        # Every local process shares the loopback address, so the limit
+        # caps the whole node.
+        for production in (True, False):
+            with self.subTest(production=production):
+                result, config = self.render(production=production, token='dns' if production else '')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('limits {\n  http_max_conns_per_client = 1024\n}', config)
+
     def test_missing_dns_token_fails_before_render(self):
         result, config = self.render(token='')
         self.assertNotEqual(result.returncode, 0)

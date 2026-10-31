@@ -109,6 +109,7 @@ Examples: `kardamom_sequencer_tx_ingested_total`, `kardamom_executor_block_apply
 - The validator metrics start with `validator_`, not `kardamom_validator_`.
   Examples: `validator_committed_block`, `validator_blocks_verified_total`, `validator_bal_missing_total`,
   `validator_receipt_missing_total`, `validator_divergence_total`, `validator_state_root_block`.
+  The exception is `kardamom_validator_egress_cursor_index`, which pairs with `kardamom_batcher_egress_cursor_index`.
 - The executor exports `kardamom_executor_block_number` for the chain head.
 - Each service emits `kardamom_build_info`. It is a gauge with the value 1 and the labels `version` and `sha`.
   Set `KARDAMOM_GIT_SHA` at build time to fill `sha`.
@@ -269,7 +270,7 @@ Each dashboard is a JSON file in `deploy/grafana/provisioning/dashboards-json/`.
 | `kardamom-da-watcher` | The L1 watcher. |
 | `kardamom-validator` | The validator. |
 | `kardamom-state-mirror` | The account-state mirror. |
-| `kardamom-notifier` | The status feed and the webhooks. |
+| `kardamom-notifier` | The status feed. |
 | `kardamom-canary` | The transaction canary: the success ratio per probe and per endpoint, the failures by outcome, the stage latencies, the last success, the balances, the feed gaps and the stalled accounts. |
 | `kardamom-performance` | Throughput and latency against the two load goals: 10,000 tx/s sustained, and 1,000,000 tx/s with a p99 of 1 ms from submit to the executed receipt. It shows the share of each goal, the rate at each pipeline step, the submit-to-sealed and submit-to-executed percentiles, the canary stages, the step times inside the services, the queues and the back pressure. |
 | `kardamom-availability` | The service levels against a 99.9999 % target over the selected range: the canary success and its error budget, the submit success, the chain liveness, the ingress reachability and the validator verdict. Over time: the failures, the head lag of each replica, the scrape targets, the settlement and the sealer leader changes. |
@@ -367,11 +368,6 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
 - `kardamom_egress_rebased_total{reason}` counts the times that the egress started its stream again: after a boundary of a copy with no peer (`boundary`), or at the floor of a peer above its head (`peer-floor`). After a `boundary` start, the store holds no frame before that boundary, and a reader of an older cursor reads another instance.
 - `kardamom_executor_egress_frames_dropped_total` counts the canonical frames that the reader did not forward on `exec_frames`, because the queue to the publication was full.
 
-`kardamom_egress_head_distance_frames` is a gauge of each egress instance. It gives the canonical indexes between the stored head and the newest record that any executor copy sent. The egress sets it after each sync of its store.
-
-- The sealer keeps only its replay window. A reader below the window recovers from the store of the egress, so the distance must stay well inside the window.
-- The egress does not see the sealed head. The distance does not include the lag of every executor behind the sealer.
-- `KardamomEgressHeadNearWindow` in `deploy/alerts.yml` fires when the distance stays above 32,768 for 1 minute: half the default window of 65,536 frames.
   - `peer-checkpoint`: the node fell behind the retention window and repaired itself from a peer checkpoint.
   - `unrecoverable`: the node could not repair itself and waits for an operator.
   - See "Replay-window overrun" in [failure-modes.md](failure-modes.md).
@@ -402,6 +398,18 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
 
 Each service instruments its own hot path. The metrics of a service are the metrics that its dashboard queries.
 The groups that need an explanation follow.
+
+`kardamom_egress_head_distance_frames` is a gauge of each egress instance. It gives the canonical indexes between the stored head and the newest record that any executor copy sent. The egress sets it after each sync of its store.
+
+- The sealer keeps only its replay window. A reader below the window recovers from the store of the egress, so the distance must stay well inside the window.
+- The egress does not see the sealed head. The distance does not include the lag of every executor behind the sealer.
+- `KardamomEgressHeadNearWindow` in `deploy/alerts.yml` fires when the distance stays above 32,768 for 1 minute: half the default window of 65,536 frames.
+
+`kardamom_egress_disk_free_bytes` is a gauge of each egress instance: the free bytes of the file system of its store. The egress sets it after each sync of its store.
+
+- The store keeps every block above the lower of the posted head and the final head, and the window of `--keep-blocks` blocks below its head (default 43,200). Its disk grows with the DA lag.
+- `KardamomEgressDiskFillsSoon` in `deploy/alerts.yml` fires when `predict_linear` over the last hour gives a full disk within 6 hours, for 15 minutes.
+- `kardamom_egress_posted_distance_blocks` and `kardamom_egress_floor_distance_blocks` show why the store grows: the batcher does not post, or the final head does not move.
 
 ### Batcher
 
@@ -481,11 +489,11 @@ Each executor exports these metrics for its executor stream (`exec_txs`). See "T
 
 ### Executor input source
 
-With `--carry-bytes` (`KARDAMOM_CARRY_BYTES`, off by default), the executor reads the canonical entries with their bytes from the feed of its paired sealer member, on `aeron:ipc` of the media driver at `--aeron-dir`.
+With `--carry-bytes`, the executor reads the canonical entries with their bytes from the feed of its paired sealer member, on `aeron:ipc` of the media driver at `--aeron-dir`.
 
 - The executor opens no `tx_data` lane, joins nothing and votes no void.
 - It opens no cluster session and sends no recorded cursor. It refuses to start with `--exec-cursor`.
-- Switch it on only with sealer members that carry the bytes and run the member feed.
+- Switch it on only while the rules of the carry window (feature 5) apply on every member and the member of the executor runs the member feed. The deploy switch is `KARDAMOM_CARRY_EXECUTORS`, and the release gate checks these conditions. See [the carry window runbook](runbooks/carry-window-rollout.md).
 - Off: the executor joins the references of the cluster egress with `tx_data`.
 
 With `--carry-bytes`, `--egress <url>` (`KARDAMOM_EGRESS_URL`, off by default) makes the egress the second source of the executor.
@@ -621,9 +629,19 @@ Each block commit records these steps:
   - It counts the buffered references that are below the floor of their sender.
   - It is 0 unless a rewind or a floor update stranded a reference. Nothing drains such a reference.
   - The sender is then stuck, and the client sees no error. Any value above 0 is a defect.
+  - Only the v1 loop exports it. The v2 loop cannot strand a reference: each parked transaction expires, and a forwarded run that no row confirms is lost after the loss window.
 - `kardamom_sequencer_fee_rejected_total{partition}` counts the envelopes that the fee gate refused.
   Each one gets a `FeeInvalid`, `FeeTooLow`, or `InsufficientFunds` error on `tx_errors`.
   See [priority-fees.md](priority-fees.md).
+
+The egress feed thread keeps the decision version of the sealer and handles the refused references (egress kind 18).
+See "The kept sealer version and the refused reference" in [failure-modes.md](failure-modes.md).
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_sequencer_sealer_version{partition}` | The kept decision version of the sealer: the highest version that a session of the process reported, or the floor `--sealer-version-floor` before the first report. At 5 in the v2 loop, the sequencer offers each transaction with its bytes (record type 7). |
+| `kardamom_sequencer_ref_refused_total{partition}` | The kind-18 frames: the references without bytes that the carry window of the sealer refused. |
+| `kardamom_sequencer_tx_drops_total{reason}` | The drop records on `tx_drops`, by reason. `sealer_refused_reference` counts the drops of a kind-18 frame. |
 
 The epoch lane exports these metrics. See "Sequencer" in [failure-modes.md](failure-modes.md).
 
@@ -789,10 +807,12 @@ Each process has one Aeron thread. It carries the publishes and the subscription
   egress index.
 - A client that is over its rate limit gets `shed`, and the ingress answers `null` without a query.
 - The receipt cache keeps the newest 131072 receipts and evicts the oldest first.
-- `kardamom_cache_reconnects_total` counts the Redis reconnects that a failed command started. One failure burst starts one reconnect.
-- `kardamom_cache_live_evictions_total` counts the entries that the local account layer removed, for the TTL or for the capacity. A high rate means that the layer is too small for the active accounts.
-- `kardamom_cache_reconnects_total` counts the reconnects that a failed Redis command starts. One failure burst starts one reconnect.
-  The readers skip the cache while the reconnect runs.
+- `kardamom_cache_reconnects_total` counts the replacements of the shared Redis connection.
+  - A connection error replaces the connection at once.
+  - A command timeout alone does not. The connection is replaced only after it gives no reply for three command
+    timeouts. Until then, the reads continue on the same connection.
+  - The readers skip the cache while a replacement runs. Each connection attempt ends after the connection bound:
+    ten command timeouts. Through the Sentinels, that bound covers the name lookups and the questions together.
 - `kardamom_cache_live_evictions_total` counts the entries that the `live` layer removes, for the TTL or the capacity.
   A high rate with many `live` misses means that the layer is too small for the active accounts.
 
@@ -818,7 +838,7 @@ All canary metrics start with `kardamom_canary_`. The dashboard is `kardamom-can
 ### Notifier
 
 All notifier metrics start with `kardamom_notifier_`. The dashboard is `kardamom-notifier`.
-See [tx-status-events.md](tx-status-events.md) for the feed and the webhooks.
+See [tx-status-events.md](tx-status-events.md) for the feed.
 
 | Metric | Meaning |
 | --- | --- |
@@ -830,14 +850,6 @@ See [tx-status-events.md](tx-status-events.md) for the feed and the webhooks.
 | `ws_subscriptions` | Open WebSocket subscriptions. |
 | `ws_events_total` | Events sent to WebSocket subscribers. |
 | `ws_lagged_total` | Lag markers sent to slow WebSocket subscribers. |
-| `webhook_subscriptions{owned}` | Webhook subscriptions that this instance holds. |
-| `webhook_feed_lagged_total` | Live events that the webhook fan-out missed. |
-| `webhook_queue_full_total{subscription}` | Events dropped by a full worker queue. |
-| `outbox_appended_total{subscription}` | Events appended to an outbox. |
-| `outbox_delivered_total{subscription,outcome}` | Events finished by a delivery loop. The outcomes are `delivered` and `gave_up`. |
-| `outbox_backlog_bytes{subscription}` | Bytes of an outbox that are not delivered. |
-| `webhook_attempts_total{outcome}` | Webhook POST attempts. The outcomes are `ok`, `status`, and `error`. |
-| `webhook_delivery_seconds` | Histogram of the time from event arrival to delivery. |
 
 ### Egress
 
@@ -849,6 +861,9 @@ The egress (`kardamom-egress`) exports these metrics on `--metrics-addr` (`KARDA
 | `kardamom_egress_waiting_dropped_total` | Times that every copy missed a frame and the merge dropped the frames that waited behind it. |
 | `kardamom_egress_ref_frame_max_index` | R: the highest canonical index of a stored transaction reference (`RT_TXREF`). 0 when the store holds none. |
 | `kardamom_egress_ref_frame_max_block` | The block of R. 0 when the store holds none. |
+| `kardamom_egress_posted_distance_blocks` | Blocks between the stored head and the posted head: the newest L2 block that a finalized post on L1 covers. 0 when the posted head is above the stored head. Before the egress reads a posted head, it is the whole stored range. |
+| `kardamom_egress_floor_distance_blocks` | Blocks between the stored head and the floor of the store: the lower of the posted head and the final head. Without an oracle, the floor is the posted head. |
+| `kardamom_egress_disk_free_bytes` | Free bytes of the file system of the store, for an unprivileged writer. |
 
 - Any increment of `kardamom_egress_copy_mismatch_total` needs an operator.
 - R is durable. The store keeps it in the side file `ref-mark` of its directory (16 bytes: the index, then the block, little endian), and reads it at start.

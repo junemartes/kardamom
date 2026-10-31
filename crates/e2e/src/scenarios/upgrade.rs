@@ -171,18 +171,20 @@ async fn assert_validator_agrees(
 
 /// The executor and the validator hold the canonical code at the
 /// chain-state address: the genesis held it, or the first upgrade deposit
-/// installed it.
+/// installed it. Both snapshots include the upgrade block: execution
+/// receipts can precede the state writer commit.
 ///
 /// # Errors
 /// Returns an error when a state directory cannot be read, when the
-/// validator does not reach the head of the executor, or when a role holds
-/// other code.
+/// executor does not commit the upgrade block, the validator does not
+/// reach that executor snapshot, or either role holds other code.
 pub async fn assert_chain_state_code(
     executor_state_dir: &Path,
     validator_state_dir: &Path,
+    upgrade_block: u64,
 ) -> Result<()> {
     use kardamom_types::upgrades::CHAIN_STATE_CODE_HASH;
-    let executor = read_chain_state(executor_state_dir)?;
+    let executor = state_at_or_past(executor_state_dir, upgrade_block, "executor").await?;
     let validator =
         state_at_or_past(validator_state_dir, executor.block_number, "validator").await?;
     let canonical = Some(CHAIN_STATE_CODE_HASH);
@@ -191,8 +193,8 @@ pub async fn assert_chain_state_code(
         .try_for_each(|(role, v)| {
             anyhow::ensure!(
                 v.code_hash == canonical,
-                "{role}: the chain-state address holds {:?}, not the canonical code",
-                v.code_hash
+                "{role}: the chain-state address at committed block {} holds {:?}, not the canonical code",
+                v.block_number, v.code_hash
             );
             Ok(())
         })
@@ -467,3 +469,7 @@ pub async fn authority_is_enforced(
     );
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "upgrade_tests.rs"]
+mod tests;

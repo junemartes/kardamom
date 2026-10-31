@@ -6,11 +6,9 @@
 //! `KardamomHaltDaLag`. After the thaw the canary's transfers succeed
 //! again.
 //!
-//! The case needs a cluster deployed with a small DA-lag budget
-//! (`KARDAMOM_DA_LAG_BUDGET_BLOCKS`), as `da-lag-halt` does, and with the
-//! local canary (`CANARY_LOCAL=1`). So it runs by name and in no shard: a
-//! small budget for a whole shard refuses the load of the other cases,
-//! and the shards count transactions that the canary's would add to.
+//! The retention shard funds the canary at genesis, stops its job before
+//! other cases, and restores it only for this case. Its chain starts with
+//! a fixed small DA guard. The canary job stops after the fault.
 
 use std::time::Duration;
 
@@ -18,6 +16,9 @@ use super::da_lag::{FrozenBatcher, await_halt};
 use crate::harness::Harness;
 use crate::metrics::Target;
 use crate::poll::{self, Budget};
+
+mod alerts;
+use alerts::Alerts;
 
 /// The canary's exporter on the monitoring node.
 const CANARY_PORT: u16 = 9012;
@@ -28,60 +29,117 @@ const PROBE_TOTAL: &str = "kardamom_canary_probe_total";
 /// Alertmanager evaluation adds a little.
 const PAGE_PATIENCE: Duration = Duration::from_mins(6);
 
-/// The canary's transfer runs whose labels hold `fragment`.
-async fn transfers(h: &Harness, fragment: &str) -> Option<i64> {
-    let target = Target::bridged(
-        h.probes.validator.ip,
-        &h.probes.validator.container,
-        CANARY_PORT,
-    );
-    let body = h.probes.scrape().fetch(&target).await?;
-    Some(
-        body.lines()
-            .filter(|l| l.starts_with(PROBE_TOTAL))
-            .filter(|l| l.contains("probe=\"transfer\"") && l.contains(fragment))
-            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
-            .map(|v| {
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    reason = "a run counter, far under 2^53"
-                )]
-                let n = v as i64;
-                n
-            })
-            .sum(),
-    )
+pub(crate) async fn scheduled_canary(h: &mut Harness) -> anyhow::Result<()> {
+    let started = h.start_case_canary().await;
+    let verdict = match started {
+        Ok(()) => super::da_lag::GuardedCase::Canary.run(h).await,
+        Err(error) => Err(error),
+    };
+    let stopped = h.stop_case_canary().await;
+    if let Err(error) = &stopped {
+        crate::log(format!(
+            "canary-da-lag: stopping the case canary fails: {error:#}"
+        ));
+    }
+    verdict?;
+    stopped
 }
 
-/// Wait until the transfer runs with `fragment` pass `floor`.
-async fn await_runs(
-    h: &Harness,
-    ctx: &str,
-    fragment: &str,
-    floor: i64,
-    patience: Duration,
-) -> anyhow::Result<()> {
-    let outcome =
-        poll::until(
-            Budget::new(patience, Duration::from_secs(5)),
-            |_| async move {
-                Ok::<_, anyhow::Error>(transfers(h, fragment).await.filter(|n| *n > floor))
-            },
+/// The canary's transfer runs, read from its exporter in the case `ctx`.
+#[derive(Clone, Copy)]
+struct Transfers<'a> {
+    h: &'a Harness,
+    ctx: &'a str,
+}
+
+impl Transfers<'_> {
+    /// The canary's transfer runs whose labels hold `fragment`.
+    async fn runs(self, fragment: &str) -> Option<i64> {
+        let h = self.h;
+        let target = Target::bridged(
+            h.probes.validator.ip,
+            &h.probes.validator.container,
+            CANARY_PORT,
+        );
+        let body = h.probes.scrape().fetch(&target).await?;
+        Some(
+            body.lines()
+                .filter(|l| l.starts_with(PROBE_TOTAL))
+                .filter(|l| l.contains("probe=\"transfer\"") && l.contains(fragment))
+                .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+                .map(|v| {
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        reason = "a run counter, far under 2^53"
+                    )]
+                    let n = v as i64;
+                    n
+                })
+                .sum(),
+        )
+    }
+
+    /// The transfer runs with `fragment` as the floor of a later wait. A
+    /// dark scrape is an error: a floor of 0 lets any later count pass.
+    async fn baseline(self, fragment: &str) -> anyhow::Result<i64> {
+        let ctx = self.ctx;
+        self.runs(fragment).await.ok_or_else(|| {
+            crate::chaos_fail!(
+                "{ctx}: the canary exports no transfer runs for the {fragment} baseline"
+            )
+        })
+    }
+
+    /// The first transfer runs with `fragment` of a canary that is still
+    /// starting: its exporter answers once the canary runs. A canary that
+    /// does not answer within `budget` fails the case.
+    async fn first_baseline(self, fragment: &str, budget: Duration) -> anyhow::Result<i64> {
+        let ctx = self.ctx;
+        let outcome = poll::until(
+            Budget::new(budget, Duration::from_secs(2)),
+            |_| async move { Ok::<_, anyhow::Error>(self.runs(fragment).await) },
         )
         .await?;
-    outcome.or_fail(|elapsed| {
-        crate::chaos_fail!(
-            "{ctx}: the canary reported no transfer {fragment} within {}s",
-            elapsed.as_secs()
-        )
-    })?;
-    Ok(())
+        outcome
+            .or_fail(|t| {
+                crate::chaos_fail!(
+                    "{ctx}: the canary exports no transfer runs for the {fragment} baseline within {}s of its start",
+                    t.as_secs()
+                )
+            })
+            .map(|(runs, _)| runs)
+    }
+
+    /// Wait until the transfer runs with `fragment` pass `floor`.
+    async fn await_runs(
+        self,
+        fragment: &str,
+        floor: i64,
+        patience: Duration,
+    ) -> anyhow::Result<()> {
+        let ctx = self.ctx;
+        let outcome =
+            poll::until(
+                Budget::new(patience, Duration::from_secs(5)),
+                |_| async move {
+                    Ok::<_, anyhow::Error>(self.runs(fragment).await.filter(|n| *n > floor))
+                },
+            )
+            .await?;
+        outcome.or_fail(|elapsed| {
+            crate::chaos_fail!(
+                "{ctx}: the canary reported no transfer {fragment} within {}s",
+                elapsed.as_secs()
+            )
+        })?;
+        Ok(())
+    }
 }
 
 /// Wait until Alertmanager holds a canary page inhibited.
 async fn await_inhibited_page(h: &Harness, ctx: &str) -> anyhow::Result<()> {
     let url = format!(
-        "http://{}:{ALERTMANAGER_PORT}/api/v2/alerts?filter=alertname%3D~%22KardamomCanary.%2A%22",
+        "http://{}:{ALERTMANAGER_PORT}/api/v2/alerts",
         h.probes.validator.ip
     );
     let http = reqwest::Client::builder()
@@ -90,24 +148,12 @@ async fn await_inhibited_page(h: &Harness, ctx: &str) -> anyhow::Result<()> {
     let outcome = poll::until(Budget::new(PAGE_PATIENCE, Duration::from_secs(10)), |_| {
         let http = http.clone();
         let url = url.clone();
-        async move {
-            let alerts: serde_json::Value = match http.get(&url).send().await {
-                Ok(r) => r.json().await.unwrap_or_default(),
-                Err(_) => serde_json::Value::Null,
-            };
-            let inhibited = alerts.as_array().into_iter().flatten().find(|a| {
-                a["labels"]["severity"] == "critical"
-                    && a["status"]["inhibitedBy"]
-                        .as_array()
-                        .is_some_and(|by| !by.is_empty())
-            });
-            Ok::<_, anyhow::Error>(inhibited.map(|a| a["labels"]["alertname"].to_string()))
-        }
+        async move { Ok::<_, anyhow::Error>(Alerts::read(&http, &url).await) }
     })
     .await?;
     let (page, _) = outcome.or_fail(|elapsed| {
         crate::chaos_fail!(
-            "{ctx}: no canary page was inhibited within {}s; Alertmanager must mute it behind the halt",
+            "{ctx}: no canary page names an active DA-lag alert as its inhibitor within {}s",
             elapsed.as_secs()
         )
     })?;
@@ -129,16 +175,24 @@ pub(crate) async fn canary_da_lag(h: &mut Harness) -> anyhow::Result<()> {
     .unwrap_or(i64::MAX);
     let refused = "code=\"-32010\"";
     let success = "outcome=\"success\"";
-    let refused_before = transfers(h, refused)
-        .await
-        .ok_or_else(|| crate::chaos_fail!("{ctx}: the canary exports no transfer runs"))?;
+    let transfers = Transfers { h, ctx };
+    let healthy_before = transfers
+        .first_baseline(success, Duration::from_mins(1))
+        .await?;
+    transfers
+        .await_runs(success, healthy_before, Duration::from_mins(2))
+        .await?;
+    let refused_before = transfers.baseline(refused).await?;
     let frozen = FrozenBatcher::freeze(h, ctx).await?;
     let verdict = halted_view(h, ctx, budget, refused, refused_before).await;
     frozen.thaw(h, ctx).await;
     verdict?;
     await_halt(h, ctx, budget, false).await?;
-    let success_after = transfers(h, success).await.unwrap_or(0);
-    await_runs(h, ctx, success, success_after, Duration::from_mins(2)).await?;
+    let transfers = Transfers { h, ctx };
+    let success_after = transfers.baseline(success).await?;
+    transfers
+        .await_runs(success, success_after, Duration::from_mins(2))
+        .await?;
     h.assert_executor_progress(Duration::from_mins(2)).await
 }
 
@@ -152,7 +206,9 @@ async fn halted_view(
     refused_before: i64,
 ) -> anyhow::Result<()> {
     await_halt(h, ctx, budget, true).await?;
-    await_runs(h, ctx, refused, refused_before, Duration::from_mins(2)).await?;
+    Transfers { h, ctx }
+        .await_runs(refused, refused_before, Duration::from_mins(2))
+        .await?;
     crate::log(format!("{ctx}: the canary reports rpc_error -32010"));
     await_inhibited_page(h, ctx).await
 }

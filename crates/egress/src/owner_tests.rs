@@ -254,7 +254,7 @@ fn state(o: &mut Owner<Live>) -> JoinState {
 
 /// What a read from genesis finds: the frames, or the floor.
 fn read_from_genesis(o: &mut Owner<Live>) -> Range {
-    let (reply, answer) = oneshot::channel();
+    let (reply, mut answer) = oneshot::channel();
     o.on(Input::Read(ReadRequest {
         from_index: 0,
         from_block: 1,
@@ -262,7 +262,7 @@ fn read_from_genesis(o: &mut Owner<Live>) -> Range {
         reply,
     }))
     .unwrap();
-    answer.blocking_recv().unwrap().unwrap()
+    answer.try_recv().unwrap().unwrap()
 }
 
 /// With no peer, an empty store on a running chain starts after the first
@@ -396,3 +396,6 @@ fn after_the_peers_give_up_a_boundary_starts_the_stream() {
     assert_eq!(state(&mut o).head.next_block, 32);
     assert!(state(&mut o).joined);
 }
+
+#[path = "owner_prune_tests.rs"]
+mod prune;

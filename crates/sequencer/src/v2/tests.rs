@@ -150,17 +150,12 @@ fn a_sealer_on_version_four_gets_the_tagged_position() {
     );
 }
 
-/// A sealer on decision version 5 takes each offer with the bytes of its
-/// transaction: the archived envelope that the ingress published. The
-/// version comes from the report of the session, through the rules.
-#[test]
-fn a_sealer_on_version_five_gets_the_bytes() {
+/// Offer one transaction of a known sender through a loop that keeps the
+/// version of `shared`. Assert that the offer carries the bytes of the
+/// transaction: the archived envelope that the ingress published.
+fn assert_first_offer_carries_the_bytes(shared: SealerVersion) {
     let s = signer(5);
     let (mut l, accounts, _) = new_loop();
-    let shared = SealerVersion::default();
-    let mut rules = SealerRules::new(0, shared.clone(), InMemorySidePublisher::default());
-    rules.on_session_start(1);
-    rules.on_sealer_info(1, 5);
     l.enable_positioned_refs(shared);
     accounts
         .send(AccountEvent::Rows {
@@ -172,11 +167,37 @@ fn a_sealer_on_version_five_gets_the_bytes() {
     let envelope = signed_envelope(&s, 0, 1);
     rig.push(TxDataLoc::new(7, pos(256)), envelope.clone());
     l.run_once(&mut rig.ports()).unwrap();
-    let carried = rig.offers()[0].envelope.clone().expect("the bytes");
+    let offers = rig.offers();
+    assert_eq!(offers.len(), 1);
+    let carried = offers[0].envelope.clone().expect("the bytes");
     assert_eq!(
         carried.as_ref(),
         kardamom_log::codec::encode(&envelope).unwrap().as_slice()
     );
+}
+
+/// A sealer on decision version 5 takes each offer with the bytes of its
+/// transaction. The version comes from the report of the session, through
+/// the rules.
+#[test]
+fn a_sealer_on_version_five_gets_the_bytes() {
+    let shared = SealerVersion::default();
+    let mut rules = SealerRules::new(0, shared.clone(), InMemorySidePublisher::default());
+    rules.on_session_start(1);
+    rules.on_sealer_info(1, 5);
+    assert_first_offer_carries_the_bytes(shared);
+}
+
+/// A process with the floor 5 sends no reference without bytes before the
+/// first report of the sealer: the session is open, and no kind 17 has
+/// come yet. A chain that runs version 5 from genesis needs this, because
+/// its sealer refuses each reference without bytes.
+#[test]
+fn the_floor_five_offers_the_bytes_before_the_first_report() {
+    let shared = SealerVersion::starting_at(5);
+    let mut rules = SealerRules::new(0, shared.clone(), InMemorySidePublisher::default());
+    rules.on_session_start(1);
+    assert_first_offer_carries_the_bytes(shared);
 }
 
 /// While the sealer takes no offer, the loop takes no envelope: the offer
@@ -389,4 +410,56 @@ fn a_resend_after_a_sealer_refusal_goes_out() {
     l.run_once(&mut rig.ports()).unwrap();
     assert_eq!(rig.offers().len(), 2, "the resend goes out");
     assert!(rig.errors().is_empty(), "no refusal of the resend");
+}
+
+/// A client sends a parked transaction again after a timeout. The copy
+/// drops nothing: the loop publishes no error, no drop and no rejected
+/// status for its hash, because the held transaction still goes out.
+/// Another transaction at the same nonce is a drop of the egress.
+#[test]
+fn a_copy_of_a_parked_transaction_publishes_no_drop() {
+    let s = signer(9);
+    let (mut l, accounts, _) = new_loop();
+    accounts
+        .send(AccountEvent::Rows {
+            block: 1,
+            rows: vec![(s.address(), rich(0, 1))],
+        })
+        .unwrap();
+    let spec = crate::testkit::EnvelopeSpec {
+        real_hash: true,
+        ..crate::testkit::EnvelopeSpec::default()
+    };
+    let mut rig = Rig::default();
+    rig.push(
+        TxDataLoc::new(7, pos(64)),
+        crate::testkit::envelope_with(&s, 1, 1, spec),
+    );
+    rig.push(
+        TxDataLoc::new(7, pos(128)),
+        crate::testkit::envelope_with(&s, 1, 2, spec),
+    );
+    (0..2).for_each(|_| {
+        l.run_once(&mut rig.ports()).unwrap();
+    });
+    assert!(rig.offers().is_empty(), "nonce 1 waits for nonce 0");
+    assert!(rig.errors().is_empty(), "the copy is no error");
+    assert!(rig.drops().is_empty(), "the copy drops nothing");
+    assert!(
+        rig.statuses()
+            .iter()
+            .all(|st| st.kind() != TxStageKind::Rejected)
+    );
+    let other = crate::testkit::EnvelopeSpec {
+        gas_price: spec.gas_price * 2,
+        ..spec
+    };
+    rig.push(
+        TxDataLoc::new(7, pos(192)),
+        crate::testkit::envelope_with(&s, 1, 3, other),
+    );
+    l.run_once(&mut rig.ports()).unwrap();
+    let drops = rig.drops();
+    assert_eq!(drops.len(), 1, "another transaction at the nonce");
+    assert_eq!(drops[0].reason, DropReason::ReplacementUnderpriced);
 }

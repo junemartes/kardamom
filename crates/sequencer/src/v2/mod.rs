@@ -14,15 +14,51 @@
 //! - With verdicts on, the answer to each transaction goes to the ingress
 //!   that published it ([`verdicts`]).
 //!
-//! The loop keeps no ledger of offers and no resync: the sealer orders a
-//! reference once, and the filter forgets a forwarded run that no row
-//! confirms within its loss window. Offers wait in an outbox while the
-//! sealer is back-pressured; a full outbox stops the intake.
+//! From decision version 4, each sender has at most one offer awaiting
+//! canonical confirmation. A guard refusal cannot leave a later nonce
+//! already queued at the sealer. Other senders can publish while it waits.
+//! Canonical proof stays with the retained transaction across reconnects;
+//! only executed rows free its reserved balance. A rollback clears the
+//! proof. The filter forgets a run that no row confirms within its loss
+//! window. Offers wait in an outbox; a full outbox stops the intake.
+//!
+//! The filter keeps each forwarded transaction until a row confirms it.
+//! The loop offers it again after recovery, so the sealer never orders a
+//! later nonce of a sender in place of a lost one:
+//! - The cluster session changed (a leader change or a reconnect). The
+//!   old session can have lost the offers that it took. The publisher
+//!   refuses the first offer on the new session, and the loop then puts
+//!   every unconfirmed run in the outbox again, in nonce order, before any
+//!   new offer. Each turn also observes the session generation, so an idle
+//!   sender needs no new offer to retry. The sealer absorbs a copy of an
+//!   ordered offer.
+//! - The contiguity guard of the sealer rejects a nonce. The loop offers
+//!   the transaction at the expected nonce and the rejected one again,
+//!   when the filter still holds the expected one.
+//! - The lifecycle clears a pause. The sealer can have refused offers
+//!   during its upstream halt. The loop retries its unconfirmed runs
+//!   before it reads new input, also when the whole pause passes between
+//!   turns. Empty blocks during a pause do not expire those runs. Rows
+//!   still confirm them, and recovery starts a new loss window.
+//!
+//! The loop builds each offer when it goes to the outbox, in the format of
+//! the decision version that the sealer reports at that time. So the
+//! offers of one sender change format once, in nonce order, at a version
+//! switch, also for a transaction that waited for a nonce gap.
 //!
 //! The loop records the counters of the v1 loop under the same names, and
 //! the parked depth of each vslot ([`depth`]) at each sweep.
 
+mod canonical;
 mod depth;
+#[cfg(feature = "floor-seams")]
+mod floor_seams;
+mod offers;
+mod publication;
+mod refusals;
+use offers::OfferReplay;
+use refusals::{Notice, Replay};
+mod runner;
 mod verdicts;
 
 pub use verdicts::VerdictOut;
@@ -32,11 +68,9 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, B256};
-use kardamom_cluster_adapter::wire::{GuardHeader, position_deadline};
-use kardamom_log::aeron_live::{IdleBackoff, IdleCap};
 use kardamom_obs::pipeline::Queue;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
-use kardamom_types::{TxDataLoc, TxDrop, TxEnvelope, TxError, TxErrorReason, TxStatus};
+use kardamom_types::{DropReason, TxDataLoc, TxDrop, TxEnvelope};
 
 use crate::admission::{
     AccountState, Ack, Admission, AdmissionConfig, Candidate, ImagePos, Refusal, Verdict,
@@ -45,7 +79,8 @@ use crate::error::SequencerError;
 use crate::fees::FeeGate;
 use crate::inbound::{Inbound, TxDataSubscriber};
 use crate::metrics::HotMetrics;
-use crate::outbound::{RefOffer, SideChannelPublisher, TxOrderingRefPublisher};
+use crate::outbound::{RefOffer, SideChannelPublisher};
+use crate::pause_gate::PauseGate;
 use crate::pipeline::PublishMeters;
 use crate::sealer_rules::SealerVersion;
 use crate::sender::sender_of;
@@ -143,6 +178,8 @@ pub struct V2Config {
 /// One change of the chain state that the filter holds.
 #[derive(Clone, Debug)]
 pub enum AccountEvent {
+    /// The sealer ordered this transaction. Its sender's suffix can follow.
+    Canonical(B256),
     /// The account rows of a block, for the senders of this replica.
     Rows {
         block: u64,
@@ -155,25 +192,46 @@ pub enum AccountEvent {
     },
     /// The executor rolled back.
     Rollback,
-    /// The sealer refused the forwarded transaction of `sender` at `nonce`
-    /// (egress kind 18). The filter forgets the run, so a resend goes out.
-    Refused { sender: Address, nonce: u64 },
+    /// The sealer refused a reference without bytes (egress kind 18).
+    /// A copy with bytes retries. A named copy without bytes leaves and
+    /// its suffix waits for a resend.
+    Refused(Box<kardamom_cluster_adapter::wire::RefRefused>),
+    /// A guard refusal retains the run for replay. A past-deadline refusal
+    /// removes the named copy and parks its suffix behind the missing nonce.
+    Refusal(Box<crate::resync::SealerRefusal>),
+    /// Backpressure at the sealer requests another offer of a held run.
+    Retry { sender: Address, nonce: u64 },
+    /// The contiguity guard of the sealer rejected the forwarded
+    /// transaction of `sender` at `nonce`, because it expects `expected`
+    /// (egress kind 5).
+    Rejected {
+        sender: Address,
+        nonce: u64,
+        expected: u64,
+    },
 }
 
 /// What the loop needs to offer one forwarded transaction.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RefPayload {
     /// The vslot of the sender, for the parked depth.
     vslot: u8,
     lane: u8,
+    /// Canonical proof stays with this copy until rows remove it or a rollback resets it.
+    canonical: bool,
     loc: TxDataLoc,
-    /// The deadline field of the guard header.
-    deadline: u64,
+    /// The deadline of the envelope, for the deadline field below decision
+    /// version 4.
+    max_inclusion_block: u64,
+    /// The position of the transaction in its image, for the deadline field
+    /// from decision version 4 on.
+    stream_position: u64,
     tip: u128,
-    /// The archived envelope, when the sealer carries the bytes. A parked
-    /// transaction keeps it until it goes out: the filter bounds the parked
-    /// transactions of each sender, and the park width and time to live
-    /// bound how long they stay.
+    /// The archived envelope, when the sealer carried the bytes at
+    /// admission. A parked or forwarded transaction keeps it until it goes
+    /// out or a row confirms it: the filter bounds the parked and the
+    /// forwarded transactions of each sender, and the park width, the time
+    /// to live and the loss window bound how long they stay.
     envelope: Option<bytes::Bytes>,
 }
 
@@ -183,11 +241,14 @@ pub struct AdmissionLoop {
     admission: Admission<RefPayload>,
     vslots: VslotSet,
     sealer_version: SealerVersion,
+    session_generation: u64,
     fees: FeeGate,
+    pause: PauseGate,
     accounts: crossbeam_channel::Receiver<AccountEvent>,
     lookups: tokio::sync::mpsc::Sender<Address>,
     verdicts: Vec<Verdict<RefPayload>>,
     outbox: VecDeque<RefOffer>,
+    canonical: canonical::CanonicalGate,
     last_sweep: Instant,
     hot: HotMetrics,
     depth: depth::ParkDepth,
@@ -197,6 +258,10 @@ pub struct AdmissionLoop {
     outbox_depth: Queue,
     /// The account events that wait in `accounts`.
     accounts_depth: Queue,
+    /// The test seam of the `floor-seams` feature: a row sets no first
+    /// state of a sender. See [`Self::enable_first_floor_from_lookup`].
+    #[cfg(feature = "floor-seams")]
+    first_floor_from_lookup: bool,
 }
 
 impl AdmissionLoop {
@@ -212,11 +277,14 @@ impl AdmissionLoop {
             cfg,
             vslots,
             sealer_version: SealerVersion::default(),
+            session_generation: 0,
             fees: FeeGate::off(),
+            pause: PauseGate::default(),
             accounts,
             lookups,
             verdicts: Vec::new(),
             outbox: VecDeque::new(),
+            canonical: canonical::CanonicalGate::new(cfg.outbox_cap),
             last_sweep: Instant::now(),
             hot: HotMetrics::new(cfg.partition),
             depth: depth::ParkDepth::default(),
@@ -224,6 +292,8 @@ impl AdmissionLoop {
             pipeline: PublishMeters::new(),
             outbox_depth: Queue::new("sequencer.outbox"),
             accounts_depth: Queue::new("sequencer.accounts"),
+            #[cfg(feature = "floor-seams")]
+            first_floor_from_lookup: false,
         }
     }
 
@@ -236,6 +306,7 @@ impl AdmissionLoop {
     /// Follow the decision version that the sealer reports. See
     /// [`crate::sequencer::Sequencer::enable_positioned_refs`].
     pub fn enable_positioned_refs(&mut self, version: SealerVersion) {
+        self.session_generation = version.session_generation();
         self.sealer_version = version;
     }
 
@@ -245,8 +316,19 @@ impl AdmissionLoop {
         self.fees = gate;
     }
 
+    /// Offer nothing and leave envelopes in the archive while the
+    /// process follows a lifecycle pause.
+    pub fn enable_pause(
+        &mut self,
+        rx: tokio::sync::watch::Receiver<kardamom_obs::lifecycle::Slots>,
+    ) {
+        self.pause = PauseGate::new(rx);
+    }
+
     /// One turn: apply the account events, sweep when due, publish what
     /// waits, then take one envelope. Returns whether it did any work.
+    /// A lifecycle pause holds publication and intake. Account events
+    /// still drain so the feed never waits on the pause.
     ///
     /// # Errors
     ///
@@ -254,16 +336,32 @@ impl AdmissionLoop {
     /// offer, and the errors of the input and of the decode.
     pub fn run_once<P: SequencerPorts>(&mut self, ports: &mut P) -> Result<bool, SequencerError> {
         let applied = self.apply_accounts();
-        self.sweep_if_due(Instant::now());
         let (input, refs, side) = ports.split();
         side.flush_events();
+        let generation = self.sealer_version.session_generation();
+        let renewed = generation != self.session_generation;
+        if renewed {
+            self.session_generation = generation;
+            self.offer_again_unconfirmed("sealer session changed");
+        }
+        let mut resumed = false;
+        let paused = self.pause.read_with(|paused| resumed = !paused);
+        if resumed {
+            self.resume_unconfirmed("lifecycle resumed");
+        }
+        self.sweep_if_due(Instant::now(), paused);
         self.dispatch(side);
+        if paused {
+            return Ok(applied || renewed);
+        }
+        let queued = self.outbox.len();
         self.flush(refs, side)?;
         if self.outbox.len() >= self.cfg.outbox_cap.get() {
-            return Ok(true);
+            // A full queue can wait for confirmations without doing work.
+            return Ok(applied || renewed || self.outbox.len() < queued);
         }
         let Some(inbound) = input.poll()? else {
-            return Ok(applied);
+            return Ok(applied || renewed);
         };
         self.admit(&inbound, side)?;
         self.dispatch(side);
@@ -271,98 +369,118 @@ impl AdmissionLoop {
         Ok(true)
     }
 
-    /// Run until `shutdown` or until the input closes. An idle turn waits
-    /// with the same backoff as the v1 loop; a back-pressured one waits
-    /// 10 µs.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of [`Self::run_once`] other than back-pressure
-    /// and a closed input.
-    pub fn run<P: SequencerPorts>(
-        &mut self,
-        ports: &mut P,
-        shutdown: &crate::sequencer::Shutdown,
-        idle_cap: IdleCap,
-    ) -> Result<(), SequencerError> {
-        let mut backoff = IdleBackoff::new(Duration::from_micros(1), Duration::from_micros(100), 1)
-            .under(idle_cap, Duration::from_micros(1));
-        while !shutdown.is_signaled() && self.run_tick(ports, &mut backoff)? {}
-        Ok(())
-    }
-
-    /// One turn of [`Self::run`]. Returns whether to go on. The turn, its
-    /// wait included, counts in the state that its outcome names.
-    fn run_tick<P: SequencerPorts>(
-        &mut self,
-        ports: &mut P,
-        backoff: &mut IdleBackoff,
-    ) -> Result<bool, SequencerError> {
-        let outcome = self.run_once(ports);
-        let state = PublishMeters::state_of(&outcome);
-        let next = Self::after_turn(outcome, backoff);
-        if self.pipeline.pass(state, ports.split().0) {
-            self.outbox_depth.set(self.outbox.len());
-            self.accounts_depth.set(self.accounts.len());
-        }
-        next
-    }
-
-    /// The dispatch of [`Self::run_tick`] on the outcome of one turn.
-    fn after_turn(
-        outcome: Result<bool, SequencerError>,
-        backoff: &mut IdleBackoff,
-    ) -> Result<bool, SequencerError> {
-        match outcome {
-            Ok(true) => {
-                backoff.reset();
-                Ok(true)
-            }
-            Ok(false) => {
-                std::thread::sleep(backoff.idle_wait());
-                Ok(true)
-            }
-            Err(SequencerError::Backpressure) => {
-                std::thread::sleep(Duration::from_micros(10));
-                Ok(true)
-            }
-            Err(SequencerError::IngressDisconnected) => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Apply the account events that wait. Returns whether there was one.
     fn apply_accounts(&mut self) -> bool {
         let events: Vec<AccountEvent> = self.accounts.try_iter().collect();
         let applied = !events.is_empty();
-        for event in events {
-            self.apply(event);
-        }
+        // Every event applies, including rows after a replay request.
+        let replay = events.into_iter().fold(Replay::default(), |replay, event| {
+            let from = self.verdicts.len();
+            let notice = self.apply(event);
+            self.track_forwards(from);
+            replay.note(notice)
+        });
+        self.replay_after_refusals(&replay);
         applied
     }
 
-    fn apply(&mut self, event: AccountEvent) {
-        match event {
-            AccountEvent::Rows { block, rows } => {
-                self.admission.on_rows(block, rows, &mut self.verdicts);
+    fn track_forwards(&mut self, from: usize) {
+        if !self.sealer_version.orders_by_position() {
+            return;
+        }
+        self.verdicts[from..].iter().for_each(|verdict| {
+            if let Verdict::Forward(candidate, _) = verdict {
+                self.canonical.track(candidate);
             }
+        });
+    }
+
+    /// Apply one event. A canonical record changes the outbox only when it
+    /// names an offer of this loop, so the gate checks that itself.
+    fn apply(&mut self, event: AccountEvent) -> Notice {
+        if !matches!(event, AccountEvent::Canonical(_)) {
+            self.canonical.changed();
+        }
+        match event {
+            AccountEvent::Canonical(hash) => self.canonical.observe(hash, &mut self.admission),
+            AccountEvent::Rows { block, rows } => self.apply_rows(block, rows),
             AccountEvent::Answer { address, state } => {
                 self.admission.on_lookup(address, state, &mut self.verdicts);
+                self.canonical.confirmed(address, &self.admission);
             }
-            AccountEvent::Rollback => self.admission.on_rollback(),
-            AccountEvent::Refused { sender, nonce } => {
-                self.admission.on_refused(sender, nonce, &mut self.verdicts);
+            AccountEvent::Rollback => {
+                self.canonical.rollback();
+                self.admission
+                    .retained_mut()
+                    .for_each(|candidate| candidate.payload.canonical = false);
+                self.admission.on_rollback();
+                return Notice::All;
             }
+            AccountEvent::Refused(refused) => {
+                let sender = refused.sender;
+                return Notice::named(self.on_reference_refused(*refused), sender);
+            }
+            AccountEvent::Refusal(refusal) => {
+                let sender = refusal.sender;
+                return Notice::named(self.on_sealer_refusal(*refusal), sender);
+            }
+            AccountEvent::Retry { sender, nonce } => {
+                let held = self.admission.unconfirmed_at(sender, nonce).is_some();
+                return Notice::named(held, sender);
+            }
+            AccountEvent::Rejected {
+                sender,
+                nonce,
+                expected,
+            } => self.offer_rejected(sender, nonce, expected),
+        }
+        Notice::Nothing
+    }
+
+    fn apply_rows(&mut self, block: u64, rows: Vec<(Address, AccountState)>) {
+        #[cfg(feature = "floor-seams")]
+        let rows = self.rows_of_known_senders(rows);
+        self.admission
+            .on_rows(block, rows.iter().copied(), &mut self.verdicts);
+        for (address, _) in rows {
+            self.canonical.confirmed(address, &self.admission);
         }
     }
 
-    fn sweep_if_due(&mut self, now: Instant) {
+    fn offer_again_unconfirmed(&mut self, reason: &str) {
+        self.canonical.reset();
+        self.replay().queue(reason);
+    }
+
+    /// Empty blocks while the sealer refused offers do not prove a loss:
+    /// every held run gets a new loss window and goes out again.
+    #[cold]
+    fn resume_unconfirmed(&mut self, reason: &str) {
+        self.admission.resume_loss_window();
+        self.offer_again_unconfirmed(reason);
+    }
+
+    fn replay(&mut self) -> OfferReplay<'_> {
+        OfferReplay::new(
+            &mut self.admission,
+            &mut self.outbox,
+            &self.sealer_version,
+            self.cfg.partition,
+        )
+    }
+
+    fn sweep_if_due(&mut self, now: Instant, paused: bool) {
         if now.duration_since(self.last_sweep) < self.cfg.sweep_every {
             return;
         }
         self.last_sweep = now;
-        self.admission.sweep(now, &mut self.verdicts);
+        if paused {
+            self.admission.sweep_while_paused(now, &mut self.verdicts);
+        } else {
+            self.admission.sweep(now, &mut self.verdicts);
+        }
         self.depth.publish(self.cfg.partition);
+        self.canonical.prune(&self.admission);
     }
 
     /// Guard, decode and check one envelope, and give it to the filter.
@@ -391,14 +509,10 @@ impl AdmissionLoop {
                     tx_hash: inbound.envelope.tx_hash,
                 };
                 self.to_ingress.reject(ack, reason.clone());
-                reject(side, ack.tx_hash, sender, fields.nonce, reason);
+                refusals::reject(side, ack.tx_hash, sender, fields.nonce, reason);
                 return Ok(());
             }
         };
-        let deadline = self.guard_deadline(
-            inbound.envelope.max_inclusion_block,
-            inbound.stream_position,
-        );
         let candidate = Candidate {
             sender,
             nonce: fields.nonce,
@@ -414,8 +528,10 @@ impl AdmissionLoop {
             payload: RefPayload {
                 vslot,
                 lane: inbound.lane,
+                canonical: false,
                 loc: inbound.loc,
-                deadline,
+                max_inclusion_block: inbound.envelope.max_inclusion_block,
+                stream_position: inbound.stream_position,
                 tip,
                 envelope: self.carried(&inbound.envelope)?,
             },
@@ -440,15 +556,6 @@ impl AdmissionLoop {
             .map_err(|e| SequencerError::EncodeFailed(format!("envelope: {e}")))
     }
 
-    /// The deadline field: the tagged position under decision version 4,
-    /// the envelope's deadline otherwise.
-    fn guard_deadline(&self, max_inclusion_block: u64, stream_position: u64) -> u64 {
-        if !self.sealer_version.orders_by_position() {
-            return max_inclusion_block;
-        }
-        position_deadline(stream_position).unwrap_or(max_inclusion_block)
-    }
-
     /// Turn the verdicts into offers, client errors and lookups.
     fn dispatch<R: SideChannelPublisher>(&mut self, side: &mut R) {
         // The vector goes back after the drain, so its capacity stays.
@@ -465,22 +572,43 @@ impl AdmissionLoop {
         side: &mut R,
     ) {
         match verdict {
-            Verdict::Forward(mut c) => {
+            Verdict::Forward(mut c, _) => {
+                if self.sealer_version.orders_by_position() {
+                    self.canonical.track(&c);
+                }
                 self.depth.gave(c.payload.vslot);
                 if let Some(ack) = c.answer() {
                     self.to_ingress.accept(ack);
                 }
-                self.outbox.push_back(offer_of(&c));
+                self.outbox.push_back(c.ref_offer(&self.sealer_version));
+                self.canonical.appended();
             }
             Verdict::Reject(mut c, refusal) => {
                 self.depth.gave(c.payload.vslot);
                 self.count_refusal(refusal);
-                let reason = reason_of(refusal);
+                let reason = refusal.reason();
                 if let Some(ack) = c.answer() {
                     self.to_ingress.reject(ack, reason.clone());
                 }
-                reject(side, c.tx_hash, c.sender, c.nonce, reason);
+                // A copy of a held transaction drops nothing. A drop or a
+                // rejected status of its hash would contradict the held
+                // one, which still gets its status and its receipt.
+                if refusal.drops() {
+                    refusals::reject(side, c.tx_hash, c.sender, c.nonce, reason);
+                }
             }
+            Verdict::SealerRefused(mut c, reason) => {
+                if let Some(ack) = c.answer() {
+                    self.to_ingress.reject(ack, reason.clone());
+                }
+                refusals::reject(side, c.tx_hash, c.sender, c.nonce, reason);
+            }
+            Verdict::DropReference(c) => side.publish_drop(TxDrop {
+                tx_hash: c.tx_hash,
+                sender: c.sender,
+                nonce: c.nonce,
+                reason: DropReason::SealerRefusedReference,
+            }),
             Verdict::Accept(ack) => self.to_ingress.accept(ack),
             Verdict::Lookup(address) => {
                 self.hot.lookup_requests.increment(1);
@@ -492,32 +620,6 @@ impl AdmissionLoop {
         }
     }
 
-    /// Offer what waits in the outbox, in order, and report each offer
-    /// that went out.
-    fn flush<B, R>(&mut self, refs: &mut B, side: &mut R) -> Result<(), SequencerError>
-    where
-        B: TxOrderingRefPublisher,
-        R: SideChannelPublisher,
-    {
-        if self.outbox.is_empty() {
-            return Ok(());
-        }
-        let (published, err) = self.pipeline.offer(refs, self.outbox.make_contiguous());
-        self.hot.publish.increment(published as u64);
-        if matches!(err, Some(SequencerError::Backpressure)) {
-            self.hot.backpressure.increment(1);
-        }
-        for offer in self.outbox.drain(..published) {
-            side.publish_status(TxStatus::offered(
-                offer.tx_ref.tx_hash,
-                offer.guard.sender,
-                offer.guard.nonce,
-            ));
-            side.note_sent(&offer.tx_ref.tx_hash);
-        }
-        err.map_or(Ok(()), Err)
-    }
-
     /// Count the refusals that the v1 loop counts: the parked transactions
     /// that expired, and those that the bound of a sender evicted.
     fn count_refusal(&self, refusal: Refusal) {
@@ -526,68 +628,13 @@ impl AdmissionLoop {
             Refusal::TooManyPending { .. } => self.hot.evictions.increment(1),
             Refusal::NonceTooLow { .. }
             | Refusal::InFlight { .. }
+            | Refusal::Known { .. }
             | Refusal::InsufficientFunds { .. } => {}
         }
     }
 }
 
-fn offer_of(c: &Candidate<RefPayload>) -> RefOffer {
-    RefOffer {
-        tx_ref: kardamom_types::TxRef::new(
-            c.tx_hash,
-            c.payload.lane,
-            c.payload.loc.position,
-            c.payload.loc.session_id,
-        ),
-        guard: GuardHeader {
-            sender: c.sender,
-            nonce: c.nonce,
-            max_inclusion_block: c.payload.deadline,
-            tip: c.payload.tip,
-        },
-        envelope: c.payload.envelope.clone(),
-    }
-}
-
-/// The client error of a refusal of the filter.
-fn reason_of(refusal: Refusal) -> TxErrorReason {
-    match refusal {
-        Refusal::NonceTooLow { chain_nonce } => TxErrorReason::DuplicatedTx {
-            expected_nonce: chain_nonce,
-        },
-        Refusal::InFlight { expected_nonce } => TxErrorReason::AlreadyKnown { expected_nonce },
-        Refusal::InsufficientFunds { available, cost } => TxErrorReason::InsufficientFunds {
-            have: available.saturating_to(),
-            want: cost.saturating_to(),
-        },
-        Refusal::TooManyPending { expected_nonce } => TxErrorReason::Evicted { expected_nonce },
-        Refusal::Expired { expected_nonce } => TxErrorReason::Expired { expected_nonce },
-    }
-}
-
-/// Tell the client on both side channels that its transaction is refused,
-/// and the egress that it dropped.
-fn reject<R: SideChannelPublisher>(
-    side: &mut R,
-    tx_hash: B256,
-    sender: Address,
-    nonce: u64,
-    reason: TxErrorReason,
-) {
-    let err = TxError {
-        sender,
-        nonce,
-        reason,
-    };
-    side.publish_status(TxStatus::rejected(tx_hash, &err));
-    side.publish_drop(TxDrop {
-        tx_hash,
-        sender,
-        nonce,
-        reason: err.reason.drop_reason(),
-    });
-    side.publish_error(err);
-}
-
+#[cfg(test)]
+mod resend_tests;
 #[cfg(test)]
 mod tests;

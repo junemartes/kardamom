@@ -7,7 +7,11 @@
 //! confirms in time. So no chaos step puts the da-watcher at the sealer's
 //! origin by hand: these checks assert that it got there by itself.
 
+use std::time::Duration;
+
+use crate::cases::l1::FINALIZE_HEAD;
 use crate::harness::Harness;
+use crate::l1::L1;
 use crate::poll::{self, Budget};
 use crate::probes::DA_WATCHER_PORT;
 
@@ -19,6 +23,10 @@ const PUBLISHED_ORIGIN: &str = "kardamom_da_watcher_epoch_origin_block_number";
 /// How long the cursor may stand past the sealer's origin after a start:
 /// the start's wait for the first boundary (20 s), then one pass.
 const AHEAD_BUDGET_SECS: u64 = 60;
+/// How long the da-watcher may take to publish an epoch, past a restart
+/// of the media driver on the aux node: a start, its wait for the first
+/// boundary, and one pass.
+const PUBLISH_BUDGET: Duration = Duration::from_secs(AHEAD_BUDGET_SECS);
 
 /// How long the sealer may take to commit every epoch the da-watcher
 /// published: the sequencer's grace before `origin_gap` (90 s), which
@@ -80,11 +88,22 @@ pub(crate) async fn assert_not_past_sealer(h: &Harness, ctx: &str) -> anyhow::Re
 ///
 /// # Errors
 ///
-/// Returns an error when the da-watcher reports no published epoch, or
+/// Returns an error when the da-watcher reports no published epoch
+/// within the restart SLO of a media driver and [`PUBLISH_BUDGET`], or
 /// when the sealer's origin does not reach it within
-/// [`COMMIT_BUDGET_SECS`].
+/// [`COMMIT_BUDGET_SECS`]. A driver loss on the aux node takes the
+/// da-watcher down until the new driver runs.
 pub(crate) async fn assert_no_origin_gap(h: &Harness, ctx: &str) -> anyhow::Result<()> {
-    let outcome = poll::until(Budget::secs(AHEAD_BUDGET_SECS, 2), |_| async {
+    let budget = Budget::new(
+        h.knobs.driver_restart_slo() + PUBLISH_BUDGET,
+        Duration::from_secs(2),
+    );
+    // Anvil mines a block only for a transaction, so while the batcher
+    // posts nothing, the finalized tip stands still and no epoch comes.
+    // Each read mines a few blocks first.
+    let l1 = &L1::new(h).await?;
+    let outcome = poll::until(budget, |_| async move {
+        l1.mine(FINALIZE_HEAD).await?;
         Ok(h.probes
             .aux_metric(DA_WATCHER_PORT, PUBLISHED_ORIGIN)
             .await

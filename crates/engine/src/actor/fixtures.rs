@@ -46,12 +46,14 @@ impl ChainStatePredeploy {
         let genesis: kardamom_types::Genesis =
             toml::from_str(include_str!("../../../../chains/dev-withdrawals.toml"))
                 .expect("parse the genesis");
-        let (alloc, code) = genesis.to_alloc();
+        let alloc = genesis.to_alloc();
         let account = alloc
+            .accounts
             .into_iter()
             .find(|a| a.address == kardamom_types::upgrades::CHAIN_STATE)
             .expect("the genesis holds the chain-state predeploy");
-        let code = code
+        let code = alloc
+            .code
             .into_iter()
             .find(|c| c.code_hash == account.code_hash)
             .expect("the predeploy code");

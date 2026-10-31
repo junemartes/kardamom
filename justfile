@@ -237,6 +237,20 @@ check-formats $base:
 test:
     PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" cargo test --workspace --all-targets --all-features --locked
 
+# Run a real actor against controlled peers without starting the deployed stack.
+test-component component="all":
+    python3 scripts/test-components.py "{{component}}"
+
+# Check the component recovery catalog: fields, local tests and ported cases.
+# Then print the shard plan; it fails when a shard can run over its deadline.
+component-catalog:
+    python3 scripts/ci/component_catalog.py validate
+    python3 scripts/ci/component_tests.py plan
+
+# Print the planned, partial and ported case counts per family.
+component-summary:
+    python3 scripts/ci/component_catalog.py summary
+
 # EEST state-test conformance (docs/agents/l1-client-suite-port-spec.md W1):
 # fetch the pinned fixture release, run the runner against the Osaka posts.
 eest:

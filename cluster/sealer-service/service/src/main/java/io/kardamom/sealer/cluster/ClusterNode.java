@@ -10,6 +10,7 @@ import io.aeron.cluster.service.Cluster;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.LagBudgets;
+import io.kardamom.sealer.GenesisFeatures;
 import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.VoidLedger;
 import java.io.File;
@@ -152,6 +153,13 @@ public final class ClusterNode {
         System.out.println("cluster carry bytes memberId=" + memberId + carryBytes
             .map(c -> " dir=" + c.file().dir() + " segmentBytes=" + c.file().segmentBytes())
             .orElse(" <off: retained frames on the heap>"));
+        // The features that the chain runs from its genesis. Replicated
+        // configuration: a member that starts at genesis takes them, so
+        // every member must run the same set for the life of the chain.
+        final GenesisFeatures genesisFeatures = genesisFeatures(
+            System.getProperty(GenesisFeatures.SETTING), carryBytes.isPresent(), seed);
+        System.out.println("cluster genesis features memberId=" + memberId
+            + " features=\"" + genesisFeatures.value() + "\"");
         // The longest idle park of every hot-path thread of the member.
         // -Dkardamom.cluster.idleCapUs wins over the KARDAMOM_IDLE_CAP_US
         // env var. Unset, the cap is 1 ms, the cap of Aeron's own backoff.
@@ -241,6 +249,7 @@ public final class ClusterNode {
                     inclusionHorizonBlocks, orderingWindow,
                     new LagBudgets(daLagBudgetBlocks, recordLagBudget));
                 seed.ifPresent(service::seededFrom);
+                service.genesisFeatures(genesisFeatures);
                 service.holdAtStart(startHold);
                 final SealerClusteredService built = service;
                 carryBytes.map(CarryBytes::file).ifPresent(built::carryingBytes);
@@ -285,7 +294,8 @@ public final class ClusterNode {
             final JoinWatchdogThread.Member watched = new JoinWatchdogThread.Member(memberId, consensus,
                 container.context(), stop, PeerProbe.forMembers(clusterMembers, memberId, adminPort()));
             new StartHoldThread(new StartHoldThread.Member(memberId, consensus.clusterNodeRoleCounter(),
-                consensus.electionStateCounter(), launched::leadershipTermId,
+                consensus.electionStateCounter(),
+                () -> launched.leadershipTermId(consensus.leadershipTermIdCounter()),
                 PeerProbe.forMembers(clusterMembers, memberId, adminPort()), stop),
                 startHold, watched.timeouts().stallLimitMs()).start();
             // The watchdog starts last. A start-up step that throws before it
@@ -350,6 +360,7 @@ public final class ClusterNode {
             consensus.clusterNodeRoleCounter(),
             consensus.electionStateCounter(),
             consensus.commitPositionCounter(),
+            consensus.leadershipTermIdCounter(),
             service,
             stateDir);
         // The driver created the CnC file before the launch returned.
@@ -379,6 +390,7 @@ public final class ClusterNode {
         private final AtomicCounter role;
         private final AtomicCounter election;
         private final AtomicCounter commitPosition;
+        private final AtomicCounter leadershipTerm;
         private final SealerClusteredService service;
         /** A directory on the disk of the member state: the log and the retained file. */
         private final Path stateDir;
@@ -388,12 +400,14 @@ public final class ClusterNode {
                 final AtomicCounter role,
                 final AtomicCounter election,
                 final AtomicCounter commitPosition,
+                final AtomicCounter leadershipTerm,
                 final SealerClusteredService service,
                 final Path stateDir) {
             this.memberId = memberId;
             this.role = role;
             this.election = election;
             this.commitPosition = commitPosition;
+            this.leadershipTerm = leadershipTerm;
             this.service = service;
             this.stateDir = stateDir;
         }
@@ -408,8 +422,9 @@ public final class ClusterNode {
                 MemberStatus.SnapshotVersions.of(service.latestSnapshotVersion()),
                 service.decisionRules(),
                 diskFreeBytes())
-                .withStart(service.leadershipTermId(), service.holdingAtStart())
-                .withCarry(service.metrics().carry());
+                .withStart(service.leadershipTermId(leadershipTerm), service.holdingAtStart())
+                .withCarry(service.metrics().carry())
+                .withGenesis(service.genesisFeatures());
         }
 
         /**
@@ -602,7 +617,7 @@ public final class ClusterNode {
             final String aeronDir, final String clusterDir, final String clusterMembers,
             final int memberId, final int ingressStreamId, final String[] me,
             final StopRequest stop) {
-        final ConsensusModule.Context ctx = new ConsensusModule.Context()
+        final ConsensusModule.Context ctx = ClockSetting.fromProperties().applyTo(new ConsensusModule.Context())
             .clusterMemberId(memberId)
             .clusterMembers(clusterMembers)
             .aeronDirectoryName(aeronDir)
@@ -801,6 +816,38 @@ public final class ClusterNode {
                 + " writes snapshot version 11 lifts this check.");
         }
         return budget;
+    }
+
+    /**
+     * The features that the chain runs from its genesis, from the setting
+     * {@code value}. A start refuses three cases:
+     * <ul>
+     *   <li>a value that is not {@code ""}, {@code "3"}, {@code "3,4"} or
+     *       {@code "3,4,5"};</li>
+     *   <li>feature 5 with {@code carryBytes}: a member with the retained
+     *       file holds no activation of the carry window, and its snapshot
+     *       has no place for it;</li>
+     *   <li>a seed whose rules do not hold an activation of each feature: a
+     *       chain that ran the features from its genesis holds one of each
+     *       for all time, so the seed came from another genesis.</li>
+     * </ul>
+     *
+     * @throws IllegalArgumentException if the value names no set
+     * @throws IllegalStateException    for the other two cases
+     */
+    static GenesisFeatures genesisFeatures(
+            final String value, final boolean carryBytes, final Optional<SealerSeed> seed) {
+        final GenesisFeatures features = GenesisFeatures.parse(value);
+        if (carryBytes && features.carryWindow()) {
+            throw new IllegalStateException(GenesisFeatures.SETTING + "=" + features.value() + " needs the retained"
+                + " frames on the heap: a member with " + RetainedFile.Config.SETTING + "=true holds no activation"
+                + " of feature 5, and its snapshot has no place for it");
+        }
+        if (seed.filter(s -> !s.rules().holdsEach(features)).isPresent()) {
+            throw new IllegalStateException(features.refusal("seed holds no activation of each of these features:"
+                + " write the seed with the genesis of this chain"));
+        }
+        return features;
     }
 
     private static ClusteredServiceContainer.Context serviceContext(

@@ -7,7 +7,9 @@
   transaction turns on each breaking change. The cut-over and decision version 3 activate by an
   upgrade transaction, not by a chain reset or a coordinated restart (sections 5.4 and 12).
   Partly implemented (section 13). Amended for the user decisions of 2026-10-21 (decisions 34 to
-  43): `docs/specs/2026-10-21-one-way-pipeline.md` wins where the two differ.
+  43): `docs/specs/2026-10-21-one-way-pipeline.md` wins where the two differ. The amendment of
+  that spec of 2026-10-25 (decisions 45 to 54) also wins: receipts and reads only from the egress,
+  `ack=validated` only, no refusal kinds, and no DA-lag guard.
 - Issue: refs #582.
 - Reviewed by dev-32 (the batcher resume and DA side) and kardamom-3-00 (the executor side). Their points are in this version.
 - Decided by the user:
@@ -503,7 +505,8 @@ canonical frame. Its Raft log and its snapshots are its only record of the strea
 - **The earlier rule moves.** The rule "keep the data until L1 holds it, do not halt" now applies
   to the serving service (section 8.1). The DA-lag guard in blocks stays as today
   (`DEFAULT_DA_LAG_BUDGET_BLOCKS = 10_000`, `CanonicalSealerState.java:128`; 60,000 on staging).
-  No byte budget refuses a record or halts the chain (decision 5).
+  No byte budget refuses a record or halts the chain (decision 5). (Superseded by decision 49
+  (2026-10-25): the guard and the posted cursor go. See amendment A.4 of the one-way spec.)
 - **Out of scope: the inclusion cost.** A long DA outage leaves a large backlog above the posted
   head. How the batcher posts that backlog to L1, and at what cost, is a future optimisation. This
   spec does not design it. The batcher posts by its rules of today (#569), and only blocks at or
@@ -738,6 +741,9 @@ Raft.
 | `on-quorum` (default) | Ack after the sealer ordered the hash. | Unchanged meaning. The observer subscribes as today and sees 42-byte kind-15 frames, not the bytes. |
 | `on-local-fsync`, `on-local-fsync-and-quorum` | Wait for the ingress recorder's fsync. | Retired with the recorders. |
 
+> Note of 2026-10-25: decision 47 of the one-way spec amendment supersedes this table.
+> `ack=validated` is the only ack mode. `on-offer`, `on-quorum` and the ingress observer go.
+
 ### 6.5 What the sequencer reads, and `tx_heads`
 
 - The sequencer keeps reading the full envelope on `tx_data`. It needs the bytes, because it
@@ -801,6 +807,10 @@ Raft.
     `leadershipTermId` field, and the peer probe of the join watchdog (`PeerProbe`) reads it.
   - After a full restart, when a peer does not answer, a majority that agrees is enough after the
     stall limit of today (80 s to 160 s). So one dead member does not block the chain.
+  - After a partial restart, a majority that agrees is enough at once when a peer in it reports
+    `startHold` false (it did not restart) and every peer that answered since the start agrees
+    now. A peer that never answered was down for the whole hold. A leader of a higher term is
+    live and answers with an open election, so it holds the member.
   - Until then the member feed sends no frame, the serving service exposes nothing from that
     member, and the leader sends no kind 17. The sequencers wait for kind 17 before they send.
   - The hold changes no decision rule and no Raft log, so it needs no flag (#661).
@@ -1149,6 +1159,11 @@ frame does not state the count. The reader computes it from the payload:
 | Sequencer | `tx_data`; publisher-only session (`crates/sequencer/src/outbound/cluster.rs:121-172`) | `tx_data`, as today. It offers the full entry (section 6.1). |
 | da-watcher, L1 follower | `l1_blocks`, `tx_deposits` | Unchanged. |
 
+> Note of 2026-10-25: decisions 45 to 49 of the one-way spec amendment change four rows. The
+> batcher keeps no cluster session and sends no posted cursor (decision 49). The ingress has no
+> observer and no receipt fallback: every read goes to the egress (decisions 46 and 47). The state
+> mirror reads `egress_receipts` (decision 45).
+
 ### 8.1 Out of scope: the external serving service (separate design)
 
 A member feeds its co-located executor over IPC (decision 7), and it also feeds the serving
@@ -1366,7 +1381,8 @@ a coordinated disk failure with no snapshot left. So:
   Raft log holds them only above the frames-stored head.
 - The batcher keeps its cluster session as a publisher only, for the posted cursor (ingress
   kind 7, `crates/batcher/src/live/posted_cursor.rs`). The DA-lag guard of the sealer needs it.
-  It reads no cluster egress.
+  It reads no cluster egress. (Superseded by decision 49 (2026-10-25): the posted cursor and the
+  guard go, and the batcher keeps no cluster session.)
 - Unaffected: `l1_blocks` and the L1 follower, the DA-lag flush of the batcher (#569), the
   batcher's resume from the contract, its spool and cursor formats.
 
@@ -1485,6 +1501,9 @@ above the last stored head. It does not stop or slow execution:
 | Chaos persisted-state stage, e2e | The state DB files offline (`crates/chaos/src/stages/state.rs`); the ingress RPC (`crates/e2e/src/harness/l2.rs:122-126`) | The compare starts above the output floors. The e2e receipts are recent, so they come from the cache or an executor. |
 
 ### 8.4 The read paths: two tiers
+
+> Note of 2026-10-25: decisions 45 and 46 of the one-way spec amendment supersede this section.
+> No service reads a receipt from an executor, and the egress serves every read.
 
 The user decided on 2026-10-17 how the data is served (decision 11). There are two tiers. The
 hot tier is the executor. The cold tier is the serving service.
@@ -1697,7 +1716,8 @@ Findings from the arithmetic, for the benchmark to confirm:
 - **An outage of the serving service.** The stored head stops. Each member keeps its log, about
   36 GB an hour at the mix, and each executor keeps its receipts, about 5.4 GB an hour. The
   alerts of section 11 fire.
-- **The block guard.** The DA-lag guard in blocks stays as today. At 10,000 blocks of 2 s it
+- **The block guard.** (Superseded by decision 49 (2026-10-25): the guard goes.) The DA-lag
+  guard in blocks stays as today. At 10,000 blocks of 2 s it
   refuses user records after about 5.6 hours without a post. In that time each copy of the
   serving service grows by about 123 GB at the mix. On staging (60,000 blocks, about 33 hours) it
   is about 740 GB. So the disk of the serving service can fill before the block guard refuses, at
@@ -3091,6 +3111,21 @@ each replaced part says so.
     12. D6 replaces the transport of decisions 16 and 27 (the egress reads the executors, not a
     sealer member). D10 replaces the feature id of decision 21. D1 answers 16.1-2, and D5 answers
     16.1-3.
+44. **The sealer replay window (2026-10-23).** D11 of the one-way spec: the sealer keeps only a
+    small replay window, and the egress holds the blocks above the posted head.
+45. to 52. **The amendment of the one-way spec (2026-10-25).** D12 to D19 of
+    `docs/specs/2026-10-21-one-way-pipeline.md`, in that order: the receipts only from the egress
+    (45), every JSON-RPC read on the egress (46), `ack=validated` only (47), no refusal kinds (48),
+    the DA-lag bound by Aeron back-pressure (49), no `tx_errors` and `tx_verdicts` (50), carry as
+    the only mode after the staging activation (51), and a carry-born chain in the target mode
+    from block 1 (52). Decision 45 replaces decision 11. Decision 47 replaces section 6.4.
+    Decision 49 replaces the DA-lag guard of sections 5.5 and 8.2.
+53. **The sequencer reads only the egress.** D20 of the one-way amendment: account rows,
+    lookups and other state reads come from the egress. The sequencer does not query an executor.
+54. **Feature flags for each service.** D21 of the one-way amendment: the sealer and sequencer
+    use separate flag namespaces. The sealer first accepts a new format; a later sequencer
+    activation starts sending it. The sealer keeps accepting the old format until a later code
+    removal, so no switch depends on the lag of the egress.
 
 ### 16.1 Still open
 

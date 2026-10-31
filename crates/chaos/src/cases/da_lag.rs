@@ -5,7 +5,11 @@
 //! by itself once the batcher thaws and posts. `prune-floor` stays under
 //! the budget but runs past the sealer's retention window and a Raft
 //! snapshot, and asserts the sealer still replays from the batcher's
-//! cursor: nothing is pruned below the posted head.
+//! cursor: nothing is pruned below the posted head. On a carry-born
+//! cluster the sealer evicts its old frames. The case instead requires
+//! every durable egress copy to serve identical retained bytes below the
+//! sealer's floor, beyond a scoped short reader window. L1 must cover
+//! the gap after the thaw. The egress's L1 safety floors stay configured.
 //!
 //! Both read the chain status of the service events: `da-lag-halt` sees
 //! the sealer halted on `da_lag` as the root and the ingresses paused on
@@ -16,11 +20,16 @@ use std::time::Duration;
 
 use super::chain_status::ChainView;
 use crate::harness::Harness;
+use crate::l1::L1;
 use crate::metrics::{self, Target};
 use crate::nomad::Streams;
 use crate::poll::{self, Budget};
 use crate::probes::{CLUSTER_TASK, EXECUTOR_BLOCK_METRIC};
-use crate::rpc::{CHAIN_HALTED_CODE, Rpc};
+use crate::rpc::{CHAIN_HALTED_CODE, RecoveryCause, Rpc};
+
+mod carry_floor;
+mod setup;
+pub(crate) use setup::GuardedCase;
 
 /// The batcher's exporter: on the aux node, bound to every interface.
 const BATCHER_PORT: u16 = 9002;
@@ -32,20 +41,15 @@ const POSTED_HEAD: &str = "kardamom_ingress_cluster_posted_head";
 const SEALED_HEAD: &str = "kardamom_ingress_cluster_sealed_head";
 const RETAINED_FRAMES: &str = "kardamom_ingress_cluster_retained_frames";
 const FLOOR_BLOCK: &str = "kardamom_ingress_cluster_floor_block";
-/// The batcher's own view of its last confirmed post.
-const BATCHER_POSTED: &str = "kardamom_batcher_last_posted_block";
 /// The sealer's stdout line for a snapshot taken.
 const SNAPSHOT_TAKEN: &str = "sealer snapshot TAKEN";
 /// The batcher's log line for a refused replay, which must not appear.
 const REPLAY_REFUSED: &str = "cluster replay unavailable";
-/// The batcher's log line for a confirmed post.
-const POST_CONFIRMED: &str = "batch confirmed on L1";
 
-/// The frozen batcher: its node, its inner container, and its exporter.
+/// The frozen batcher: its node and its inner container.
 pub(super) struct FrozenBatcher {
     node: String,
     inner: String,
-    target: Target,
 }
 
 impl FrozenBatcher {
@@ -60,11 +64,7 @@ impl FrozenBatcher {
         let target = Target::bridged(h.probes.validator.ip, &node, BATCHER_PORT);
         crate::log(format!("{ctx}: freezing {inner} on {node}"));
         h.freeze_verified(&node, &inner, &target, ctx).await?;
-        Ok(Self {
-            node,
-            inner,
-            target,
-        })
+        Ok(Self { node, inner })
     }
 
     pub(super) async fn thaw(&self, h: &Harness, ctx: &str) {
@@ -73,12 +73,6 @@ impl FrozenBatcher {
                 "{ctx}: SIGCONT failed (container may have been replaced mid-freeze)"
             ));
         }
-    }
-
-    /// The batcher's last confirmed post, from its exporter.
-    async fn posted(&self, h: &Harness) -> Option<i64> {
-        let body = h.probes.scrape().fetch(&self.target).await?;
-        metrics::first(&body, BATCHER_POSTED)
     }
 }
 
@@ -155,15 +149,20 @@ pub(crate) async fn da_lag_halt(h: &mut Harness) -> anyhow::Result<()> {
     roots?;
 
     let resumed = await_halt(h, ctx, budget, false).await?;
-    let posted = frozen.posted(h).await.unwrap_or(0);
+    let posted = L1::new(h)
+        .await?
+        .posted()
+        .await?
+        .last()
+        .map_or(0, |batch| batch.l2_block_end);
     anyhow::ensure!(
-        posted > before.posted && resumed.posted > before.posted,
+        posted > u64::try_from(before.posted)? && resumed.posted > before.posted,
         "{ctx}: the batcher did not post past the frozen head after the thaw (batcher {posted}, status {})",
         resumed.posted
     );
     let rpc = Rpc::new(&h.rpc_url, h.knobs.chain_id)?;
     let gate = h.knobs.gate_account;
-    rpc.transfer_hash(gate, rpc.nonce_of(gate).await?, Duration::from_secs(60))
+    rpc.transfer_within(gate, Duration::from_secs(60), RecoveryCause::DaLag)
         .await
         .map_err(|e| crate::chaos_fail!("{ctx}: a transfer after the resume failed: {e:#}"))?;
     await_all_running(h, ctx).await?;
@@ -272,21 +271,32 @@ async fn assert_halted_chain(h: &Harness, ctx: &str, halted: &Status) -> anyhow:
         refusal.message
     );
     crate::log(format!("{ctx}: submit refused: {}", refusal.message));
+    // The boundaries go on while the chain is halted. The first read is
+    // a read, not a default: a dark first read must not let any block
+    // pass.
     let first = h
         .probes
         .exec_metric(0, EXECUTOR_BLOCK_METRIC)
         .await
-        .unwrap_or(0);
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    let later = h
-        .probes
-        .exec_metric(0, EXECUTOR_BLOCK_METRIC)
-        .await
-        .unwrap_or(0);
-    anyhow::ensure!(
-        later > first,
-        "{ctx}: the boundaries stopped while halted (executor block {first} then {later})"
-    );
+        .ok_or_else(|| crate::chaos_fail!("{ctx}: executor 0 exports no block while halted"))?;
+    let (later, _) = poll::until(Budget::secs(20, 1), |_| async move {
+        Ok::<_, anyhow::Error>(
+            h.probes
+                .exec_metric(0, EXECUTOR_BLOCK_METRIC)
+                .await
+                .filter(|later| *later > first),
+        )
+    })
+    .await?
+    .or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: the boundaries stopped while halted (executor block {first} for {}s)",
+            t.as_secs()
+        )
+    })?;
+    crate::log(format!(
+        "{ctx}: the boundaries go on while halted (executor block {first} -> {later})"
+    ));
     Ok(())
 }
 
@@ -299,6 +309,9 @@ async fn assert_halted_chain(h: &Harness, ctx: &str, halted: &Status) -> anyhow:
 ///
 /// Returns the first assertion that fails.
 pub(crate) async fn prune_floor(h: &mut Harness) -> anyhow::Result<()> {
+    if h.knobs.genesis_carry {
+        return carry_floor::CarryFloor::run(h).await;
+    }
     let ctx = "prune-floor";
     let retention = i64::try_from(
         h.knobs
@@ -374,7 +387,7 @@ pub(crate) async fn prune_floor(h: &mut Harness) -> anyhow::Result<()> {
         "{ctx}: the sealer refused the batcher's replay {} time(s) after the thaw",
         refusals - refusals_before
     );
-    assert_contiguous_posts(h, ctx).await?;
+    L1::new(h).await?.assert_contiguous(ctx).await?;
     await_all_running(h, ctx).await?;
     h.assert_executor_progress(Duration::from_mins(2)).await
 }
@@ -409,56 +422,4 @@ async fn await_stretched(
         )
     })?;
     Ok(status)
-}
-
-/// Every confirmed post in the batcher's log starts where the one before
-/// it ended.
-async fn assert_contiguous_posts(h: &Harness, ctx: &str) -> anyhow::Result<()> {
-    let logs = h.nomad.job_logs("batcher", Streams::Both).await?;
-    let posts: Vec<(u64, u64)> = logs
-        .lines()
-        .filter(|l| l.contains(POST_CONFIRMED))
-        .filter_map(|l| Some((field(l, "l2_block_start=")?, field(l, "l2_block_end=")?)))
-        .collect();
-    anyhow::ensure!(
-        posts.len() >= 2,
-        "{ctx}: fewer than two confirmed posts in the batcher log"
-    );
-    let gap = posts
-        .windows(2)
-        .find(|w| w[1].0 != w[0].1.saturating_add(1));
-    anyhow::ensure!(
-        gap.is_none(),
-        "{ctx}: the L1 record is not contiguous: {:?} then {:?}",
-        gap.map(|w| w[0]),
-        gap.map(|w| w[1])
-    );
-    crate::log(format!(
-        "{ctx}: {} confirmed posts, contiguous",
-        posts.len()
-    ));
-    Ok(())
-}
-
-/// The integer after `key=` in a log line.
-fn field(line: &str, key: &str) -> Option<u64> {
-    let rest = &line[line.find(key)? + key.len()..];
-    rest.split(|c: char| !c.is_ascii_digit())
-        .next()?
-        .parse()
-        .ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::field;
-
-    #[test]
-    fn a_log_field_parses_up_to_the_next_separator() {
-        let line =
-            "batch confirmed on L1 batch_index=3 l2_block_start=41 l2_block_end=60 payload_bytes=9";
-        assert_eq!(field(line, "l2_block_start="), Some(41));
-        assert_eq!(field(line, "l2_block_end="), Some(60));
-        assert_eq!(field(line, "absent="), None);
-    }
 }

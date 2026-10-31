@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use crate::load::exporter::{ExporterReader, MetricsTarget, MetricsTargets};
 
 // The exact Prometheus metric names each service exposes.
+const M_EXECUTOR_QUERIES: &str = "kardamom_state_nonce_queries_total";
 const M_EXECUTOR_BLOCK: &str = "kardamom_executor_block_number";
 // The clustered sealer has no Prometheus endpoint of its own. Each executor
 // re-exports the sealer's boundary stream as it decodes cluster egress, so
@@ -30,6 +31,8 @@ const M_SERVICE_UP: &str = "kardamom_service_up";
 pub(crate) struct MetricsSnapshot {
     /// `(node, executor_block_number)` for each scraped executor node.
     pub executor_blocks: Vec<(String, Option<u64>)>,
+    /// Total query responses per executor, across methods and outcomes.
+    pub executor_queries: Vec<(String, Option<u64>)>,
     /// The sealer's last sealed block number. This is the most advanced
     /// executor observation of the cluster's boundary stream.
     pub sealer_block: Option<u64>,
@@ -63,6 +66,41 @@ pub(crate) struct MetricsSnapshot {
     /// The reads of this snapshot whose direct read failed and that fell
     /// back to `docker exec`.
     pub fallbacks: u64,
+}
+
+impl MetricsSnapshot {
+    /// Metrics are integer counters below the exact integer limit of an f64.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the parsed counter is a finite nonnegative integer at most 2^53"
+    )]
+    fn queries(body: &str) -> Option<u64> {
+        let count = sum_metric(body, M_EXECUTOR_QUERIES).unwrap_or(0.0);
+        (count.is_finite()
+            && (0.0..=9_007_199_254_740_992.0).contains(&count)
+            && count.fract() == 0.0)
+            .then_some(count as u64)
+    }
+
+    /// A decreasing counter or missing endpoint cannot certify a query delta.
+    /// A restart between snapshots can lose counts without a visible decrease.
+    pub(crate) fn query_deltas(&self, base: &Self) -> Vec<(String, Option<u64>)> {
+        self.executor_queries
+            .iter()
+            .map(|(node, after)| {
+                let before = base
+                    .executor_queries
+                    .iter()
+                    .find(|(name, _)| name == node)
+                    .and_then(|(_, count)| *count);
+                let delta = before
+                    .zip(*after)
+                    .and_then(|(before, after)| after.checked_sub(before));
+                (node.clone(), delta)
+            })
+            .collect()
+    }
 }
 
 /// The services to scrape, and the exporter targets of each.
@@ -149,6 +187,11 @@ impl Scraper {
         };
         snap.executor_blocks
             .push((node.clone(), g(M_EXECUTOR_BLOCK)));
+        snap.executor_queries.push((
+            node.clone(),
+            body.as_deref().and_then(MetricsSnapshot::queries),
+        ));
+
         // This is sealer output, re-exported by this executor from
         // cluster egress.
         snap.sealer_block = snap.sealer_block.max(g(M_SEALER_BLOCK));
@@ -400,5 +443,52 @@ kardamom_executor_block_apply_duration_seconds_count 7
         let mut snap = MetricsSnapshot::default();
         push_up(&mut snap, "executor@n0".to_string(), None);
         assert_eq!(snap.service_up, vec![("executor@n0".to_string(), Some(0))]);
+    }
+    #[test]
+    fn query_deltas_keep_missing_or_decreasing_counters_unknown() {
+        let before = MetricsSnapshot {
+            executor_queries: vec![
+                ("live".into(), Some(10)),
+                ("missing".into(), Some(9)),
+                ("reset".into(), Some(50)),
+                ("cold".into(), None),
+            ],
+            ..MetricsSnapshot::default()
+        };
+        let after = MetricsSnapshot {
+            executor_queries: vec![
+                ("live".into(), Some(25)),
+                ("missing".into(), None),
+                ("reset".into(), Some(2)),
+                ("cold".into(), Some(4)),
+            ],
+            ..MetricsSnapshot::default()
+        };
+        assert_eq!(
+            after.query_deltas(&before),
+            vec![
+                ("live".into(), Some(15)),
+                ("missing".into(), None),
+                ("reset".into(), None),
+                ("cold".into(), None)
+            ]
+        );
+    }
+
+    #[test]
+    fn query_counts_sum_outcomes_and_refuse_invalid_samples() {
+        assert_eq!(
+            MetricsSnapshot::queries(
+                "kardamom_state_nonce_queries_total{method=\"nonce\",outcome=\"ok\"} 3\nkardamom_state_nonce_queries_total{outcome=\"error\"} 2"
+            ),
+            Some(5)
+        );
+        assert_eq!(MetricsSnapshot::queries(""), Some(0));
+        for bad in ["NaN", "-1", "0.5", "100000000000000000000"] {
+            assert_eq!(
+                MetricsSnapshot::queries(&format!("kardamom_state_nonce_queries_total {bad}")),
+                None
+            );
+        }
     }
 }

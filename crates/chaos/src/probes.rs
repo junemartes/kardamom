@@ -1,7 +1,8 @@
-//! Read-only probes over the topology: the executor tier, the ingress
-//! pair, the validator, and the lane-0 sequencer replicas. Every probe
-//! returns `None` when no exporter answers.
+//! Read-only probes over the topology: the sealer members, the executor
+//! tier, the ingress pair, the validator, and the lane-0 sequencer
+//! replicas. Every probe returns `None` when no exporter answers.
 
+use std::fmt;
 use std::net::Ipv4Addr;
 
 use kardamom_bench::load::MetricsTargets;
@@ -14,9 +15,18 @@ use crate::metrics::{self, Scrape, Target};
 pub const EXECUTOR_BLOCK_METRIC: &str = "kardamom_executor_block_number";
 /// The executor counter of applied transactions, by outcome.
 pub const EXECUTOR_TX_APPLIED_METRIC: &str = "kardamom_executor_tx_applied_total";
-/// The sealer boundary counter the executors re-export from cluster
-/// egress; the Java cluster node has no exporter of its own.
+/// The count of the boundaries an executor receives from the sealer.
+/// The executor counts each boundary that its reader delivers.
 pub const SEALER_BOUNDARIES_METRIC: &str = "kardamom_sealer_boundaries_emitted_total";
+/// The admin endpoint of a sealer member (`cluster_ports.admin` in
+/// `group_vars/all.yml`). It serves `/status` and `/metrics`.
+pub const SEALER_ADMIN_PORT: u16 = 40205;
+/// The step histogram of a sealer member. Its `_count` sample with
+/// [`SEALER_BOUNDARY_STEP`] counts the boundaries the member sealed.
+const SEALER_STEP_COUNT_METRIC: &str = "kardamom_step_seconds_count";
+/// The label of the boundary timer step. Every member runs the timer
+/// from the replicated log, so each member counts every boundary.
+const SEALER_BOUNDARY_STEP: &str = "step=\"sealer.boundary\"";
 pub const INGRESS_RECEIVED_METRIC: &str = "kardamom_ingress_tx_received_total";
 /// The sealed head an ingress reads from the sealer's status frames: a
 /// head signal that lives while every executor is dark.
@@ -79,7 +89,10 @@ impl Probed {
 #[derive(Debug, Clone)]
 pub struct Probes {
     scrape: Scrape,
-    /// The executor nodes, by index.
+    /// The sealer member nodes, by member id.
+    sealers: Vec<Probed>,
+    /// The nodes of the executors, by index: the executor nodes, or the
+    /// sealer nodes when the executors run there.
     pub executors: Vec<Probed>,
     /// The ingress nodes, by index.
     pub ingresses: Vec<Probed>,
@@ -101,19 +114,21 @@ fn probed(contract: &NodeContract, role: &str) -> Vec<Probed> {
 }
 
 impl Probes {
-    /// The probes of the cluster the contract describes.
+    /// The probes of the cluster the contract describes, with the
+    /// executors on the nodes of `executor_role`.
     ///
     /// # Errors
     ///
     /// Returns an error if the contract has no aux node.
-    pub fn new(contract: &NodeContract) -> anyhow::Result<Self> {
+    pub fn new(contract: &NodeContract, executor_role: &str) -> anyhow::Result<Self> {
         let validator = probed(contract, "aux")
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("node contract has no aux node for the validator"))?;
         Ok(Self {
             scrape: Scrape::new(),
-            executors: probed(contract, "executor"),
+            sealers: probed(contract, "sealer"),
+            executors: probed(contract, executor_role),
             ingresses: probed(contract, "ingress"),
             validator,
             sequencers: probed(contract, "sequencer"),
@@ -188,6 +203,15 @@ impl Probes {
     pub async fn mirror_metric(&self, i: usize, metric: &str) -> Option<i64> {
         let body = self.scrape.fetch(&self.mirror_target(i)).await?;
         metrics::first(&body, metric)
+    }
+
+    /// The counter `metric` of the mirror on executor node `i`. A counter
+    /// that has not counted yet has no sample, so an exporter that
+    /// answers without it reads 0. `None` when the exporter does not
+    /// answer.
+    pub async fn mirror_counter(&self, i: usize, metric: &str) -> Option<i64> {
+        let body = self.scrape.fetch(&self.mirror_target(i)).await?;
+        metrics::sum_where(&body, metric, "")
     }
 
     /// The validator's loopback target.
@@ -344,10 +368,35 @@ impl Probes {
         self.executor_max(EXECUTOR_BLOCK_METRIC).await
     }
 
-    /// The sealer boundary counter, which ticks about four times a
-    /// second even with no load.
-    pub async fn sealer_boundaries(&self) -> Option<i64> {
-        self.executor_max(SEALER_BOUNDARIES_METRIC).await
+    /// The boundaries that reach an executor: the highest count of the
+    /// executors. It ticks about four times a second even with no load.
+    /// A rise proves that the sealer output reaches an executor, not
+    /// only that the members seal.
+    pub async fn sealer_boundaries(&self) -> Option<Boundaries> {
+        self.executor_max(SEALER_BOUNDARIES_METRIC)
+            .await
+            .map(Boundaries::Executors)
+    }
+
+    /// The highest count of sealed boundaries that a sealer member
+    /// reports on its admin port. A member counts also while no client
+    /// follows it. A member that restarts counts again from zero, so
+    /// the highest count is the signal. `None` when no member answers
+    /// with the counter.
+    pub async fn sealer_member_boundaries(&self) -> Option<Boundaries> {
+        let mut best = None;
+        for node in &self.sealers {
+            best = best.max(self.member_boundaries(node).await);
+        }
+        best.map(Boundaries::Members)
+    }
+
+    async fn member_boundaries(&self, node: &Probed) -> Option<i64> {
+        let body = self
+            .scrape
+            .fetch(&node.metrics_target(SEALER_ADMIN_PORT))
+            .await?;
+        metrics::first_where(&body, SEALER_STEP_COUNT_METRIC, SEALER_BOUNDARY_STEP)
     }
 
     /// The submit counter summed across the ingress pair: the "is load
@@ -435,6 +484,39 @@ impl Probes {
     pub async fn ingress_map_version(&self, node: &Probed) -> Option<i64> {
         let body = self.scrape.fetch(&self.ingress_target(node)).await?;
         metrics::first(&body, "kardamom_ingress_shard_map_version")
+    }
+}
+
+/// One reading of a sealer boundary counter, with its source. The two
+/// sources count from different starts, so only two readings of the
+/// same source compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Boundaries {
+    /// The highest count of the boundaries a sealer member sealed.
+    Members(i64),
+    /// The highest count of the boundaries an executor received.
+    Executors(i64),
+}
+
+impl Boundaries {
+    /// Whether this reading counts more boundaries than `base` from the
+    /// same source.
+    #[must_use]
+    pub fn rose_over(self, base: Self) -> bool {
+        match (base, self) {
+            (Self::Members(b), Self::Members(n)) | (Self::Executors(b), Self::Executors(n)) => {
+                n > b
+            }
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for Boundaries {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Members(n) | Self::Executors(n) => write!(f, "{n}"),
+        }
     }
 }
 
@@ -546,6 +628,40 @@ mod tests {
         let one = counts(&[("ingress-0", Some(10)), ("ingress-1", None)]);
         assert_eq!(one.complete(), None);
         assert_eq!(counts(&[]).complete(), None);
+    }
+
+    /// The boundary lines of a member scrape, with the other steps and
+    /// the bucket samples around them.
+    const MEMBER_BODY: &str = "# TYPE kardamom_step_seconds histogram\n\
+        kardamom_step_seconds_bucket{service=\"sealer\",member_id=\"1\",step=\"sealer.boundary\",le=\"+Inf\"} 4810\n\
+        kardamom_step_seconds_count{service=\"sealer\",member_id=\"1\",step=\"sealer.message\"} 92011\n\
+        kardamom_step_seconds_count{service=\"sealer\",member_id=\"1\",step=\"sealer.boundary\"} 4810\n\
+        kardamom_step_seconds_sum{service=\"sealer\",member_id=\"1\",step=\"sealer.boundary\"} 1.25\n";
+
+    #[test]
+    fn a_member_scrape_yields_its_boundary_count() {
+        assert_eq!(
+            metrics::first_where(MEMBER_BODY, SEALER_STEP_COUNT_METRIC, SEALER_BOUNDARY_STEP),
+            Some(4810)
+        );
+        // A member that has not registered the step reports no count.
+        let other = "kardamom_step_seconds_count{service=\"sealer\",step=\"sealer.message\"} 3\n";
+        assert_eq!(
+            metrics::first_where(other, SEALER_STEP_COUNT_METRIC, SEALER_BOUNDARY_STEP),
+            None
+        );
+    }
+
+    #[test]
+    fn boundaries_rise_only_against_the_same_source() {
+        let members = Boundaries::Members(100);
+        assert!(Boundaries::Members(101).rose_over(members));
+        assert!(!members.rose_over(members));
+        assert!(Boundaries::Executors(5).rose_over(Boundaries::Executors(4)));
+        // The executors count from their own start: no rise over a member.
+        assert!(!Boundaries::Executors(900).rose_over(members));
+        assert!(!Boundaries::Members(900).rose_over(Boundaries::Executors(4)));
+        assert_eq!(Boundaries::Executors(812).to_string(), "812");
     }
 
     #[test]

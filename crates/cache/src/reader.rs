@@ -3,9 +3,10 @@
 //! A reader never stalls on Redis. [`CacheReader::spawn`] returns at once
 //! and one background task connects with a backoff, then polls the mirror
 //! heads every 100 ms into an atomic. Every read before the first
-//! connection, during a reconnect, past the timeout, or on an error
-//! answers `None` and counts a degraded read; the caller admits. So Redis
-//! makes admission faster and never blocks it.
+//! connection, on a lost connection, during a reconnect, past the
+//! timeout, or on an error answers `None` and counts a degraded read;
+//! the caller admits. So Redis makes admission faster and never blocks
+//! it.
 //!
 //! Freshness is a position lag, never wall clock: the newest position the
 //! local layer has seen minus the highest live mirror head. An idle chain
@@ -31,6 +32,11 @@ use crate::metrics;
 const HEAD_INTERVAL: Duration = Duration::from_millis(100);
 /// The pause between two connection attempts.
 const CONNECT_BACKOFF: Duration = Duration::from_secs(1);
+
+/// A Redis read that gave no answer: no connection, a lost connection,
+/// a reconnect, a timeout, or an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Degraded;
 
 /// The Redis read side: the account projection, the receipt index, and
 /// the freshness gate. Cheap to share behind an `Arc`.
@@ -108,17 +114,32 @@ impl CacheReader {
     /// The account's projected state. `None` on a miss and on every
     /// degraded outcome, each counted.
     pub async fn account(&self, address: Address) -> Option<AccountView> {
-        let cache = self.usable()?;
+        self.read_account(address).await.ok().flatten()
+    }
+
+    /// The account's projected state: `Ok(None)` on a miss, and
+    /// [`Degraded`] on every degraded outcome, each counted. A caller that
+    /// asks again only after a failed read tells the two apart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Degraded`] when Redis is not connected, the connection
+    /// is lost or reconnects, or a read times out or fails.
+    pub async fn read_account(&self, address: Address) -> Result<Option<AccountView>, Degraded> {
+        let cache = self.usable().ok_or(Degraded)?;
         match cache.account(address).await {
             Ok(Some(view)) => {
                 metrics::record_lookup("redis", "hit");
-                Some(view)
+                Ok(Some(view))
             }
             Ok(None) => {
                 metrics::record_lookup("redis", "miss");
-                None
+                Ok(None)
             }
-            Err(e) => degrade(&e),
+            Err(e) => {
+                degrade::<()>(&e);
+                Err(Degraded)
+            }
         }
     }
 
@@ -140,8 +161,10 @@ impl CacheReader {
     }
 
     /// The client, when it is connected and not mid-reconnect. A read
-    /// during a reconnect would pay the full timeout for nothing, and
-    /// every cold submit of an outage would pay it: skip and count.
+    /// on a lost connection or during a reconnect fails or pays the full
+    /// timeout for nothing, and every cold submit of an outage would pay
+    /// it: skip and count. A connection that only timed out stays
+    /// usable, because a stalled primary answers on it again.
     fn usable(&self) -> Option<Arc<AccountCache>> {
         let Some(cache) = self.cache.load_full() else {
             metrics::record_degraded("disconnected");

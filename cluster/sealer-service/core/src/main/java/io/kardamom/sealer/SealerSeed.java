@@ -1,6 +1,7 @@
 package io.kardamom.sealer;
 
 import java.io.IOException;
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
@@ -21,22 +22,32 @@ import java.util.stream.IntStream;
  * | stateRoot (32) | senderCount (4) | senderCount * (sender (20) |
  * nextNonce (8)). The senders come eldest first.</p>
  *
+ * <p>Version {@link #RULES_VERSION} adds the decision rules at the head
+ * after the senders: the sections of the version switch in the layout of
+ * the snapshot ({@link VersionSwitch#writeTo},
+ * {@link VersionSwitch#writeCarryTo}, {@link VersionSwitch#writeWindowTo}).
+ * The writer writes it only when the rules hold an activation. A seed of
+ * version {@link #VERSION} holds the rules of {@link VersionSwitch#start}.</p>
+ *
  * <p>{@link #parse} is the one boundary: a seed it returns has a positive
- * block, no negative value, and exactly the bytes its sender count names.
- * The digest is the SHA-256 of the file, so it matches
+ * block, no negative value, and exactly the bytes its sender count and its
+ * rules name. The digest is the SHA-256 of the file, so it matches
  * {@code sha256sum} of the file.</p>
  *
  * @param head      the rebuilt head the sealer starts after
  * @param stateRoot the state root at the head, 32 bytes
  * @param senders   the senders the nonce guard starts with, eldest first
+ * @param rules     the version switch of the state after the boundary of the head; a seeded state takes a copy
  * @param digest    the SHA-256 of the seed file, 32 bytes
  */
-public record SealerSeed(Head head, byte[] stateRoot, List<Sender> senders, byte[] digest) {
+public record SealerSeed(Head head, byte[] stateRoot, List<Sender> senders, VersionSwitch rules, byte[] digest) {
 
     /** The first four bytes of a seed file: {@code "KSED"}. */
     static final int MAGIC = 0x4B53_4544;
-    /** The layout version this sealer reads. */
+    /** The oldest layout version this sealer reads: no decision rules. */
     static final int VERSION = 1;
+    /** The newest layout version this sealer reads: the decision rules after the senders. */
+    static final int RULES_VERSION = 2;
     /** Bytes before the first sender. */
     static final int HEADER_LEN = 4 + 4 + 5 * Long.BYTES + 32 + 4;
     /** Bytes of one sender entry. */
@@ -81,7 +92,7 @@ public record SealerSeed(Head head, byte[] stateRoot, List<Sender> senders, byte
             throw new IllegalArgumentException("bad seed magic: 0x" + Integer.toHexString(magic));
         }
         final int version = buf.getInt();
-        if (version != VERSION) {
+        if (version != VERSION && version != RULES_VERSION) {
             throw new IllegalArgumentException("unsupported seed version: " + version);
         }
         final Head head = new Head(
@@ -98,14 +109,30 @@ public record SealerSeed(Head head, byte[] stateRoot, List<Sender> senders, byte
         final byte[] stateRoot = new byte[HASH_LEN];
         buf.get(stateRoot);
         final long count = Integer.toUnsignedLong(buf.getInt());
-        if (count * SENDER_ENTRY_LEN != buf.remaining()) {
+        final boolean withRules = version == RULES_VERSION;
+        if (withRules ? count * SENDER_ENTRY_LEN > buf.remaining() : count * SENDER_ENTRY_LEN != buf.remaining()) {
             throw new IllegalArgumentException("seed names " + count + " senders, but holds "
                 + buf.remaining() + " bytes after the header");
         }
         final List<Sender> senders = IntStream.range(0, (int) count)
             .mapToObj(i -> sender(buf))
             .toList();
-        return new SealerSeed(head, stateRoot, senders, sha256(file));
+        final VersionSwitch rules = withRules ? rules(buf) : VersionSwitch.start();
+        return new SealerSeed(head, stateRoot, senders, rules, sha256(file));
+    }
+
+    /** The decision rules after the senders: they must end the file. */
+    private static VersionSwitch rules(final ByteBuffer buf) {
+        final VersionSwitch rules;
+        try {
+            rules = VersionSwitch.readSeed(buf);
+        } catch (final BufferUnderflowException e) {
+            throw new IllegalArgumentException("seed rules end early", e);
+        }
+        if (buf.hasRemaining()) {
+            throw new IllegalArgumentException("seed holds " + buf.remaining() + " bytes after its rules");
+        }
+        return rules;
     }
 
     /** The digest as lowercase hex, as {@code sha256sum} prints it. */

@@ -21,7 +21,9 @@ pub(super) struct SeedHead {
 
 impl SeedHead {
     const MAGIC: &'static [u8] = b"KSED";
-    const VERSION: [u8; 4] = 1_u32.to_be_bytes();
+    /// The seed versions: version 2 adds the decision rules after the
+    /// senders, so the head fields are the same in both.
+    const VERSIONS: [[u8; 4]; 2] = [1_u32.to_be_bytes(), 2_u32.to_be_bytes()];
     /// The byte offsets of the big-endian fields: after the magic and
     /// the version come the chain id, H, `E_H`, the timestamp of H and the
     /// L1 origin of H.
@@ -33,11 +35,14 @@ impl SeedHead {
     ///
     /// # Errors
     ///
-    /// Returns an error for a file that is not a version 1 seed.
+    /// Returns an error for a file that is not a version 1 or 2 seed.
     pub(super) fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            bytes.get(..4) == Some(Self::MAGIC) && bytes.get(4..8) == Some(&Self::VERSION[..]),
-            "the file is not a version 1 sealer seed"
+            bytes.get(..4) == Some(Self::MAGIC)
+                && Self::VERSIONS
+                    .iter()
+                    .any(|version| bytes.get(4..8) == Some(&version[..])),
+            "the file is not a version 1 or 2 sealer seed"
         );
         Ok(Self {
             block: Self::word(bytes, Self::BLOCK_AT)?,

@@ -8,9 +8,12 @@ import tempfile
 import time
 import unittest
 
+import yaml
+
 ANSIBLE = Path(__file__).resolve().parents[1]
 SERVICES = ['ingress', 'sequencer', 'executor', 'validator', 'da-watcher', 'batcher', 'state-mirror',
             'l1-indexer', 'da-store', 'l1-fault-proxy', 'notifier', 'canary', 'egress']
+UPSTREAM = yaml.safe_load((ANSIBLE / 'group_vars/all.yml').read_text())['upstream_images']
 
 
 @unittest.skipUnless(shutil.which('ansible-playbook'), 'ansible-playbook required')
@@ -89,13 +92,28 @@ class ImageTest(unittest.TestCase):
         calls = self.calls()
         self.assertEqual(self.bundle.read_text(), self.manifest.read_text())
         signatures = [args for tool, args in calls if tool == 'cosign']
-        # One signature per image (Aeron, Redis, the services, cluster) plus the manifest.
-        self.assertEqual(len(signatures), len(SERVICES) + 5)
+        # One signature per image (Aeron, Redis, the services, cluster, the
+        # light client, the upstream copies) plus the manifest.
+        self.assertEqual(len(signatures), len(SERVICES) + 5 + len(UPSTREAM))
         self.assertTrue(all(args[0] == 'sign' for args in signatures[:-1]))
         self.assertEqual(signatures[-1][0], 'sign-blob')
         self.assertFalse(any(args[0] == 'push' for tool, args in calls))
-        self.assertEqual(sum(args[0] == 'exec' and args[2:4] == ['docker', 'push'] for _, args in calls), len(SERVICES) + 4)
+        self.assertEqual(sum(args[0] == 'exec' and args[2:4] == ['docker', 'push'] for _, args in calls),
+                         len(SERVICES) + 4 + len(UPSTREAM))
         self.assertEqual(list(self.root.glob('kardamom-images-*.tar')), [], 'node archives must be cleaned')
+
+    def test_node_push_copies_each_upstream_image_once(self):
+        self.run_images({'images_push_node': 'control-0'})
+        records = dict(line.split() for line in self.manifest.read_text().splitlines())
+        copies = {name: ref for name, ref in records.items() if name.startswith('upstream-')}
+        self.assertEqual(sorted(copies), sorted('upstream-' + key.replace('_', '-') for key in UPSTREAM))
+        self.assertTrue(all(ref.startswith(f'registry.example:5000/kardamom-{name}:test@sha256:')
+                            for name, ref in copies.items()), copies)
+        # The build of a copy runs in the Docker context of the controller.
+        builds = [args[args.index('buildx'):] for _, args in self.calls() if 'buildx' in args]
+        bases = [args[args.index('--build-arg') + 1] for args in builds
+                 if args[1] == 'build' and Path(args[-1]).name == 'upstream']
+        self.assertEqual(sorted(bases), sorted('BASE=' + ref for ref in UPSTREAM.values()))
 
     def test_failed_digest_preserves_previous_release(self):
         self.run_images(fail='digest', success=False)

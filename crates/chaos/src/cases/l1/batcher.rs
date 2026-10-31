@@ -53,9 +53,12 @@ pub(super) async fn await_posting(
     Ok(now)
 }
 
-/// The batcher is live: it confirms a post within a minute.
+/// The batcher is live: it confirms a post within a minute. The base
+/// is a read: a dark exporter as base 0 lets any later count pass.
 pub(super) async fn require_posting(h: &Harness, ctx: &str) -> anyhow::Result<i64> {
-    let base = h.probes.batcher_posts().await.unwrap_or(0);
+    let base = h.probes.batcher_posts().await.ok_or_else(|| {
+        crate::chaos_fail!("{ctx}: the batcher exporter does not answer the post baseline")
+    })?;
     await_posting(h, base, Duration::from_secs(60), ctx).await
 }
 

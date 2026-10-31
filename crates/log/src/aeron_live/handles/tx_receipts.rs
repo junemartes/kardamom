@@ -492,6 +492,16 @@ pub struct TxReceiptsReceiver {
 }
 
 impl TxReceiptsReceiver {
+    /// Feed encoded frames through the production decoder without an Aeron driver.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn from_test_frames(rx: UnboundedReceiver<RawFrame>) -> Self {
+        Self {
+            rx,
+            pending: VecDeque::new(),
+        }
+    }
+
     pub async fn recv(&mut self) -> Option<(BPosition, Receipt)> {
         while self.pending.is_empty() {
             self.pending = decode_receipt_batch(&self.rx.recv().await?);

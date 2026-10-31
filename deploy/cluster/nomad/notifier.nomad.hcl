@@ -5,14 +5,12 @@
 # cast: a new reader costs the publishers nothing), keeps a ring of the
 # last minutes of events, and serves:
 #
-#   - the WebSocket feed kardamom_subscribeTxStatus(filter) on :8547;
-#   - POST /webhooks on the same port, delivered at least once from a
-#     per-subscription outbox under /opt/kardamom/notifier.
+#   - the WebSocket feed kardamom_subscribeTxStatus(filter) on :8547.
 #
-# Webhook subscriptions are sharded across the instances by a
-# rendezvous hash of the subscription id. A registration that lands on
-# one instance is stored on every instance (the peers list), so another
-# instance can take a shard over when the instance count changes.
+# The notifier keeps no state on disk. The webhooks are removed
+# (2026-10-25); offline delivery comes later through a task queue. So
+# an instance needs no peers, and a change of the instance count moves
+# nothing.
 #
 # The edge forwards the client route to kardamom-notifier.service.consul
 # (:8547), with WebSocket upgrades and long idle timeouts.
@@ -49,12 +47,6 @@ variable "datacenter" {
   default     = "dc1"
 }
 
-variable "ingress_count" {
-  type        = number
-  description = "The ingress node count: the notifier runs one instance per ingress node, and the peers list names them all."
-  default     = 2
-}
-
 variable "executor_count" {
   type        = number
   description = "The executor replica count: sizes the tx_receipts fan-in."
@@ -78,13 +70,6 @@ variable "ring_max_events" {
   default     = 1000000
 }
 
-# A fully delivered outbox longer than this is cut to zero.
-variable "outbox_retain_bytes" {
-  type        = number
-  description = "The retention bound of a webhook outbox, in bytes."
-  default     = 268435456
-}
-
 # The receipts from the egress, "on" or "off" (--receipts-from-egress).
 # On, the notifier reads egress_receipts, each receipt once, in place of
 # the tx_receipts stream of every executor. Ansible deployment passes
@@ -95,6 +80,33 @@ variable "receipts_from_egress" {
   validation {
     condition     = contains(["on", "off"], var.receipts_from_egress)
     error_message = "The receipts_from_egress value must be on or off."
+  }
+}
+
+# The events path, "on" or "off" (--events,
+# docs/specs/2026-10-25-client-events.md). On, the notifier takes the
+# stages from tx_events and the merged receipts of the egress, through its
+# stage table, and keeps only the rejections of tx_status. It needs
+# KARDAMOM_EGRESS=1. Ansible deployment passes -var from
+# KARDAMOM_NOTIFIER_EVENTS.
+variable "events" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.events)
+    error_message = "The events value must be on or off."
+  }
+}
+
+# With the events path on, the executed stage from the tx_receipts of every
+# executor, "on" or "off" (--executed), for the evaluation of the stages.
+# Ansible deployment passes -var from KARDAMOM_NOTIFIER_EXECUTED.
+variable "executed" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.executed)
+    error_message = "The executed value must be on or off."
   }
 }
 
@@ -129,15 +141,13 @@ variable "notifier_count" {
   }
 }
 
-# The placement of each value of notifier_nodes. The peers are the node
-# records of the nodes that run the instances: every node of the class
-# runs one instance (distinct_hosts), so the list is complete before any
-# instance starts.
+# The placement of each value of notifier_nodes: every node of the class
+# runs one instance (distinct_hosts).
 #
 # On a notifier node, the ring keeps at most 250,000 events: about 75 MB,
 # and about 50 seconds at the staging load-test peak of 5,100 events a
-# second (1,700 tx/s, three stages). With the process, the Aeron client
-# and the outboxes, the task stays in its 512 MB.
+# second (1,700 tx/s, three stages). With the process and the Aeron
+# client, the task stays in its 512 MB.
 locals {
   placement = {
     off = {
@@ -146,8 +156,6 @@ locals {
       value      = "ingress"
       count      = 2
       memory     = 1024
-      node_class = "ingress"
-      node_count = var.ingress_count
       ring_max   = var.ring_max_events
     }
     on = {
@@ -156,12 +164,9 @@ locals {
       value      = "notifier"
       count      = var.notifier_count
       memory     = 512
-      node_class = "notifier"
-      node_count = var.notifier_count
       ring_max   = min(var.ring_max_events, 250000)
     }
   }[var.notifier_nodes]
-  peers = join(",", [for i in range(local.placement.node_count) : "http://${local.placement.node_class}-${i}.node.${var.datacenter}.consul:8547"])
 }
 
 job "notifier" {
@@ -184,7 +189,14 @@ job "notifier" {
     }
 
     restart {
-      attempts = 3
+      # An Aeron client exits until the media driver of its node runs
+      # again, as after a node restart. Ten attempts at the 5 s delay
+      # cover that start; with three, three fast failures would leave the
+      # rest of the interval without a try. The cost: a task that crashes
+      # in a loop restarts about every 5 s, about three times the load on
+      # its targets of three attempts. A recovery after a node restart that
+      # is up to a minute faster outweighs that load.
+      attempts = 10
       interval = "1m"
       delay    = "5s"
       mode     = "delay"
@@ -207,7 +219,7 @@ job "notifier" {
 
     network {
       mode = "host"
-      # The client port: the WebSocket feed and POST /webhooks.
+      # The client port: the WebSocket feed.
       port "feed" {
         static = 8547
       }
@@ -231,31 +243,26 @@ job "notifier" {
         # comment. The :dev fallback needs it.
         force_pull = true
         # Read-only rootfs. The notifier writes only the bind-mounted
-        # aeron directory and its own outbox directory.
+        # aeron directory.
         readonly_rootfs = true
         network_mode    = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
-          "/opt/kardamom/notifier:/opt/kardamom/notifier",
         ]
         args = concat([
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
           "--executor-count", "${var.executor_count}",
           "--bind", "0.0.0.0:8547",
-          "--dir", "/opt/kardamom/notifier",
           "--ring-minutes", "${var.ring_minutes}",
           "--ring-max-events", "${local.placement.ring_max}",
-          "--outbox-retain-bytes", "${var.outbox_retain_bytes}",
           "--instance-index", "${NOMAD_ALLOC_INDEX}",
-          "--instance-count", format("%d", local.placement.count),
-          # Every instance, this one included: a registration forwarded
-          # to itself is the same subscription again, a no-op.
-          "--peers", local.peers,
           "--host-id", "notifier-${NOMAD_ALLOC_INDEX}",
           "--metrics-addr", "0.0.0.0:9008",
           ],
           var.receipts_from_egress == "on" ? ["--receipts-from-egress"] : [],
+          # Off renders no flag, so the job stays as before.
+          var.events == "on" ? ["--events", "on", "--executed", var.executed] : [],
         )
       }
 

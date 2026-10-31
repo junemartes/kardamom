@@ -54,9 +54,11 @@ jobs:
       # forge build downloads the pinned solc on a cold host; the cache
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
+      # The dev-profile caches that the CI test job saves on a base branch.
       - uses: ./.github/actions/rust-build-cache
         with:
-          shared-key: docker-e2e
+          shared-key: dev
+          save-if: false
 
       # Sanity: ensure the Docker daemon is reachable (ubuntu-latest runners
       # ship with Docker pre-installed, but it's worth a quick probe so we
@@ -91,6 +93,15 @@ jobs:
             --features 'docker-e2e' \
             --test aeron_live_e2e --test client_timeout_exit -- --ignored --nocapture
 
+      - name: batcher recovery with hidden L1 receipts
+        run: python3 scripts/test-components.py batcher-null-receipts
+
+      - name: archive corruption and wipe recovery
+        run: python3 scripts/test-components.py archive-recovery
+
+      - name: transport recovery with unavailable outputs
+        run: python3 scripts/test-components.py transport-pressure
+
       # The account cache against a real Redis container: the monotone
       # write rule, the account and receipt reads, and the mirror heads.
       - name: kardamom-cache redis round trips
@@ -100,6 +111,26 @@ jobs:
             --features 'docker-e2e' \
             --test redis_e2e -- --ignored --nocapture
 
+      - name: cache Sentinel component recovery
+        run: python3 scripts/test-components.py cache-sentinel
+
+      - name: state mirror component recovery
+        run: |
+          python3 scripts/test-components.py state-mirror
+          python3 scripts/test-components.py state-mirror-coverage-gap
+
+      - name: checkpoint copy across container mounts
+        run: python3 scripts/test-components.py checkpoint-copy
+
+      - name: bounded checkpoint fault controller
+        run: python3 scripts/test-components.py checkpoint-fault
+
+      - name: checkpoint and block-log recovery after ENOSPC
+        run: python3 scripts/test-components.py state-aux-enospc
+
+      - name: state commit recovery after ENOSPC
+        run: python3 scripts/test-components.py state-enospc
+
       # The ingress admission checks and the receipt index with the Redis
       # layer on: the case of an ingress that just restarted.
       - name: kardamom-ingress admission over redis
@@ -108,3 +139,12 @@ jobs:
             -p kardamom-ingress \
             --features 'docker-e2e,test-support' \
             --test account_cache_redis_test -- --ignored --nocapture
+
+      - name: Preserve account cache performance samples
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingress-account-cache-profile
+          path: /tmp/kardamom-ingress-account-profile.jsonl
+          if-no-files-found: ignore
+          retention-days: 14

@@ -57,6 +57,43 @@ class ProfileTest(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which('ansible-playbook'), 'Ansible required')
+class NomadServerTest(unittest.TestCase):
+    """The heartbeat grace of the Nomad servers follows the profile."""
+
+    def render(self, profile, grace=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'nomad.hcl'
+            (Path(tmp) / 'play.yml').write_text(json.dumps([{
+                'hosts': 'localhost', 'gather_facts': False, 'connection': 'local',
+                'vars_files': [str(ANSIBLE / 'group_vars/all.yml')],
+                'vars': {'control_plane': True, 'node_ip': '10.0.0.1',
+                         'role': 'control', 'tier': 'control', 'kardamom_node': 'control-0'},
+                'tasks': [{'ansible.builtin.template': {
+                    'src': str(ANSIBLE / 'roles/nomad/templates/nomad.hcl.j2'), 'dest': str(out), 'mode': '0644'}}],
+            }]))
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith('ANSIBLE_') and k != 'NOMAD_HEARTBEAT_GRACE'}
+            if grace is not None:
+                env['NOMAD_HEARTBEAT_GRACE'] = grace
+            # An extra variable: group_vars/all.yml would override a play variable.
+            result = subprocess.run(['ansible-playbook', '-i', 'localhost,', str(Path(tmp) / 'play.yml'),
+                                     '-e', 'deployment_profile=' + profile],
+                                    env=env, text=True, capture_output=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return out.read_text()
+
+    def test_the_local_profile_waits_out_a_stalled_node(self):
+        self.assertIn('heartbeat_grace = "60s"', self.render('local'))
+
+    def test_production_keeps_the_nomad_default(self):
+        self.assertIn('heartbeat_grace = "10s"', self.render('production'))
+
+    def test_the_chaos_suite_sets_the_grace_of_the_local_profile(self):
+        self.assertIn('heartbeat_grace = "30s"', self.render('local', grace='30s'))
+        self.assertIn('heartbeat_grace = "10s"', self.render('production', grace='30s'))
+
+
+@unittest.skipUnless(shutil.which('ansible-playbook'), 'Ansible required')
 class RedisPrimaryTest(unittest.TestCase):
     """The sentinels name the first catalog node with redis-primary, and the
     primary group places on any node with it: one node must hold it."""

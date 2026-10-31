@@ -20,13 +20,14 @@
 
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{Filter, Log as RpcLog};
 use async_trait::async_trait;
 use futures::future::join_all;
+use tokio::time::Instant;
 use tracing::{error, warn};
 
 use crate::metrics;
@@ -35,6 +36,8 @@ use crate::source::{L1Header, L1Source, L1SourceError, LockboxLog};
 
 /// How long a failed source stays out of the set.
 const DEFAULT_BACKOFF: Duration = Duration::from_secs(30);
+/// A source must return control so the follower can publish its halt and retry.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Why a source set cannot serve a read: the follower's halt cause. The
 /// error the follower reports, its log line and the disagreement counter
@@ -165,6 +168,17 @@ struct Member<S> {
     /// back in the set. Zero means it never left. The trait reads through
     /// `&self` from many tasks, so the state is an atomic, not a lock.
     out_until: AtomicU64,
+}
+
+impl<S> Member<S> {
+    async fn read<T>(
+        &self,
+        request: impl std::future::Future<Output = Result<T, L1SourceError>>,
+    ) -> Result<T, L1SourceError> {
+        tokio::time::timeout(READ_TIMEOUT, request)
+            .await
+            .map_err(|_| L1SourceError::Provider(format!("{}: source read timed out", self.name)))?
+    }
 }
 
 /// The set of sources a follower runs on. See the module docs for the
@@ -390,33 +404,36 @@ impl<S: L1Source> L1Sources<S> {
 impl<S: L1Source> L1Source for L1Sources<S> {
     async fn finalized_block_number(&self) -> Result<u64, L1SourceError> {
         let live = self.live();
-        let results = join_all(live.iter().map(|m| m.source.finalized_block_number()))
-            .await
-            .into_iter()
-            .map(|result| match result {
-                Ok(tip) => Ok(Some(tip)),
-                Err(L1SourceError::NotFinalized) => Ok(None),
-                Err(e) => Err(e),
-            })
-            .collect();
+        let results = join_all(
+            live.iter()
+                .map(|m| m.read(m.source.finalized_block_number())),
+        )
+        .await
+        .into_iter()
+        .map(|result| match result {
+            Ok(tip) => Ok(Some(tip)),
+            Err(L1SourceError::NotFinalized) => Ok(None),
+            Err(e) => Err(e),
+        })
+        .collect();
         self.lowest_tip(Self::answered(live, results))
     }
 
     async fn block_ids(&self, number: u64) -> Result<(B256, B256), L1SourceError> {
         let live = self.live();
-        let results = join_all(live.iter().map(|m| m.source.block_ids(number))).await;
+        let results = join_all(live.iter().map(|m| m.read(m.source.block_ids(number)))).await;
         self.agree(&format!("block {number}"), Self::answered(live, results))
     }
 
     async fn logs(&self, filter: &Filter) -> Result<Vec<RpcLog>, L1SourceError> {
         let live = self.live();
-        let results = join_all(live.iter().map(|m| m.source.logs(filter))).await;
+        let results = join_all(live.iter().map(|m| m.read(m.source.logs(filter)))).await;
         self.agree(&format!("logs {filter:?}"), Self::answered(live, results))
     }
 
     async fn headers(&self, from: u64, to: u64) -> Result<Vec<L1Header>, L1SourceError> {
         let live = self.live();
-        let results = join_all(live.iter().map(|m| m.source.headers(from, to))).await;
+        let results = join_all(live.iter().map(|m| m.read(m.source.headers(from, to)))).await;
         self.agree(
             &format!("headers {from}..={to}"),
             Self::answered(live, results),
@@ -430,8 +447,7 @@ impl<S: L1Source> L1Source for L1Sources<S> {
             return Ok(None);
         };
         light_client
-            .source
-            .block_ids(number)
+            .read(light_client.source.block_ids(number))
             .await
             .map(|(hash, _)| Some(hash))
     }
@@ -445,7 +461,7 @@ impl<S: L1Source> L1Source for L1Sources<S> {
         let live = self.live();
         let results = join_all(
             live.iter()
-                .map(|m| m.source.lockbox_logs(lockbox, from_block, to_block)),
+                .map(|m| m.read(m.source.lockbox_logs(lockbox, from_block, to_block))),
         )
         .await;
         self.agree(
