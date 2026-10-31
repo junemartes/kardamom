@@ -27,7 +27,8 @@ mod node;
 #[path = "ingress_recovery/peer.rs"]
 mod peer;
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use alloy_signer_local::PrivateKeySigner;
@@ -120,7 +121,9 @@ struct Scratch(PathBuf);
 const LOG_TAIL: usize = 80;
 
 impl Scratch {
-    /// Print the last [`LOG_TAIL`] lines of each log in the directory.
+    /// Print the last [`LOG_TAIL`] lines of each log in the directory to
+    /// stderr, then a closing line: a runner that shows only the end of a
+    /// failed suite then still points to the failure message.
     fn print_log_tails(&self) {
         let mut logs: Vec<PathBuf> = std::fs::read_dir(&self.0)
             .into_iter()
@@ -130,11 +133,22 @@ impl Scratch {
             .collect();
         logs.sort();
         for path in &logs {
-            let text = std::fs::read_to_string(path).unwrap_or_default();
-            let lines: Vec<&str> = text.lines().collect();
-            let tail = lines[lines.len().saturating_sub(LOG_TAIL)..].join("\n");
-            println!("==> {}\n{tail}", path.display());
+            Self::print_tail(path);
         }
+        let _ = writeln!(
+            std::io::stderr(),
+            "==> the failure message is above the log tails"
+        );
+    }
+
+    /// Print the last [`LOG_TAIL`] lines of the log at `path`. A write
+    /// error is ignored: a panic in this unwind would abort the process.
+    fn print_tail(path: &Path) {
+        let bytes = std::fs::read(path).unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        let tail = lines[lines.len().saturating_sub(LOG_TAIL)..].join("\n");
+        let _ = writeln!(std::io::stderr(), "==> {}\n{tail}", path.display());
     }
 }
 
