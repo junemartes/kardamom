@@ -411,3 +411,55 @@ fn a_resend_after_a_sealer_refusal_goes_out() {
     assert_eq!(rig.offers().len(), 2, "the resend goes out");
     assert!(rig.errors().is_empty(), "no refusal of the resend");
 }
+
+/// A client sends a parked transaction again after a timeout. The copy
+/// drops nothing: the loop publishes no error, no drop and no rejected
+/// status for its hash, because the held transaction still goes out.
+/// Another transaction at the same nonce is a drop of the egress.
+#[test]
+fn a_copy_of_a_parked_transaction_publishes_no_drop() {
+    let s = signer(9);
+    let (mut l, accounts, _) = new_loop();
+    accounts
+        .send(AccountEvent::Rows {
+            block: 1,
+            rows: vec![(s.address(), rich(0, 1))],
+        })
+        .unwrap();
+    let spec = crate::testkit::EnvelopeSpec {
+        real_hash: true,
+        ..crate::testkit::EnvelopeSpec::default()
+    };
+    let mut rig = Rig::default();
+    rig.push(
+        TxDataLoc::new(7, pos(64)),
+        crate::testkit::envelope_with(&s, 1, 1, spec),
+    );
+    rig.push(
+        TxDataLoc::new(7, pos(128)),
+        crate::testkit::envelope_with(&s, 1, 2, spec),
+    );
+    (0..2).for_each(|_| {
+        l.run_once(&mut rig.ports()).unwrap();
+    });
+    assert!(rig.offers().is_empty(), "nonce 1 waits for nonce 0");
+    assert!(rig.errors().is_empty(), "the copy is no error");
+    assert!(rig.drops().is_empty(), "the copy drops nothing");
+    assert!(
+        rig.statuses()
+            .iter()
+            .all(|st| st.kind() != TxStageKind::Rejected)
+    );
+    let other = crate::testkit::EnvelopeSpec {
+        gas_price: spec.gas_price * 2,
+        ..spec
+    };
+    rig.push(
+        TxDataLoc::new(7, pos(192)),
+        crate::testkit::envelope_with(&s, 1, 3, other),
+    );
+    l.run_once(&mut rig.ports()).unwrap();
+    let drops = rig.drops();
+    assert_eq!(drops.len(), 1, "another transaction at the nonce");
+    assert_eq!(drops[0].reason, DropReason::ReplacementUnderpriced);
+}
