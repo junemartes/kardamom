@@ -51,6 +51,8 @@
 
 mod canonical;
 mod depth;
+#[cfg(feature = "floor-seams")]
+mod floor_seams;
 mod offers;
 mod publication;
 mod refusals;
@@ -256,6 +258,10 @@ pub struct AdmissionLoop {
     outbox_depth: Queue,
     /// The account events that wait in `accounts`.
     accounts_depth: Queue,
+    /// The test seam of the `floor-seams` feature: a row sets no first
+    /// state of a sender. See [`Self::enable_first_floor_from_lookup`].
+    #[cfg(feature = "floor-seams")]
+    first_floor_from_lookup: bool,
 }
 
 impl AdmissionLoop {
@@ -286,6 +292,8 @@ impl AdmissionLoop {
             pipeline: PublishMeters::new(),
             outbox_depth: Queue::new("sequencer.outbox"),
             accounts_depth: Queue::new("sequencer.accounts"),
+            #[cfg(feature = "floor-seams")]
+            first_floor_from_lookup: false,
         }
     }
 
@@ -430,29 +438,13 @@ impl AdmissionLoop {
     }
 
     fn apply_rows(&mut self, block: u64, rows: Vec<(Address, AccountState)>) {
+        #[cfg(feature = "floor-seams")]
+        let rows = self.rows_of_known_senders(rows);
         self.admission
             .on_rows(block, rows.iter().copied(), &mut self.verdicts);
         for (address, _) in rows {
             self.canonical.confirmed(address, &self.admission);
         }
-    }
-
-    /// The guard of the sealer expects `expected` of `sender`, and rejected
-    /// `nonce`. Offer the transactions at both nonces again, when the
-    /// filter holds the one at `expected`. Each such reject moves the
-    /// expected nonce up by at least one, so the offers end. A guard that
-    /// expects a nonce that the filter does not hold changes nothing: the
-    /// loss window frees the run.
-    fn offer_rejected(&mut self, sender: Address, nonce: u64, expected: u64) {
-        if self.admission.unconfirmed_at(sender, expected).is_none() {
-            return;
-        }
-        let offers: Vec<RefOffer> = [expected, nonce]
-            .into_iter()
-            .filter_map(|n| self.admission.unconfirmed_at(sender, n))
-            .map(|c| c.ref_offer(&self.sealer_version))
-            .collect();
-        self.outbox.extend(offers);
     }
 
     fn offer_again_unconfirmed(&mut self, reason: &str) {

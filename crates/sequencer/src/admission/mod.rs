@@ -331,6 +331,17 @@ impl<T: Clone> Admission<T> {
         self.stamped = self.forwards.len();
     }
 
+    /// The test seam of the `floor-seams` feature: whether a row of
+    /// `address` must wait, because the filter holds no state of the
+    /// sender: none came yet, or a rollback cleared it. A sender with
+    /// parked work asks a lookup, once.
+    #[cfg(feature = "floor-seams")]
+    pub(crate) fn waits_for_lookup(&mut self, address: Address, out: &mut Vec<Verdict<T>>) -> bool {
+        self.senders
+            .get_mut(&address)
+            .is_none_or(|sender| sender.waits_for_lookup(address, out))
+    }
+
     /// Apply the state of one account: a row, or the answer of a lookup.
     pub fn on_lookup(&mut self, address: Address, state: AccountState, out: &mut Vec<Verdict<T>>) {
         self.apply_state(address, state, true, out);

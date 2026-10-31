@@ -106,7 +106,7 @@ const ORIGIN: Epochs = Epochs {
 /// must stay up through it while the class it needs is still down: its
 /// cluster client connects with retries, and a failed start exits at
 /// once.
-const STAGGER: Duration = Duration::from_secs(8);
+pub(super) const STAGGER: Duration = Duration::from_secs(8);
 
 /// `ingress-sequencer-loss-recover`.
 pub const INGRESS_SEQUENCER: Combined = Combined {
@@ -164,6 +164,10 @@ pub enum Case {
     /// `pipeline-blackout-recover`: every pipeline process dies at once,
     /// with the media driver, and every one starts again.
     PipelineBlackout,
+    /// `sequencer-executor-redis-loss`: SIGKILL to every sequencer, the
+    /// executor and Redis. They return in reverse order of need: the
+    /// sequencers, Redis (empty), then the executor.
+    SequencerExecutorRedis,
     /// A combined outage of the ingress, sequencer and sealer classes.
     Combined(Combined),
     /// `sealer-leader-loss-recover`: a stop of the sealer leader alone,
@@ -174,13 +178,13 @@ pub enum Case {
 
 /// One reading of the pipeline while classes are down.
 #[derive(Debug, Clone, Copy)]
-struct Reading {
-    block: u64,
+pub(super) struct Reading {
+    pub(super) block: u64,
     applied: u64,
 }
 
 impl Run<'_> {
-    async fn reading(&self) -> Result<Reading> {
+    pub(super) async fn reading(&self) -> Result<Reading> {
         let scrape = metrics::scrape(self.stack.executor_metrics()).await?;
         Ok(Reading {
             block: metric_u64(scrape.value(EXEC_BLOCK_NUMBER).context("executor block")?)?,
@@ -189,7 +193,7 @@ impl Run<'_> {
     }
 
     /// The lane of the case sender.
-    fn case_lane(&self) -> Result<u32> {
+    pub(super) fn case_lane(&self) -> Result<u32> {
         let sender = crate::harness::l2::dev_signers_through(super::CASE_SENDER)?
             .get(super::CASE_SENDER)
             .map(|s| s.address)
@@ -198,7 +202,7 @@ impl Run<'_> {
     }
 
     /// The sequencer processes of `lane`.
-    fn lane_replicas(&self, lane: u32) -> Result<Vec<usize>> {
+    pub(super) fn lane_replicas(&self, lane: u32) -> Result<Vec<usize>> {
         (0..self.stack.sequencer_count())
             .filter_map(|i| match self.stack.sequencer_lane(i) {
                 Ok(l) if l == lane => Some(Ok(i)),
@@ -259,7 +263,7 @@ impl Run<'_> {
     }
 
     /// The case load lands nothing for one second: the outage is real.
-    async fn assert_load_stopped(&self, load: &RunningLoad) -> Result<()> {
+    pub(super) async fn assert_load_stopped(&self, load: &RunningLoad) -> Result<()> {
         let before = load.landed();
         tokio::time::sleep(Duration::from_secs(1)).await;
         // A transfer in flight at the kill can still land once.
@@ -275,7 +279,7 @@ impl Run<'_> {
     }
 
     /// No replica holds a buffered ref below its sender's floor.
-    async fn assert_no_ref_below_floor(&self) -> Result<()> {
+    pub(super) async fn assert_no_ref_below_floor(&self) -> Result<()> {
         let target = self.stack.target(Duration::from_secs(5))?;
         for addr in &target.sequencer_metrics {
             self.assert_no_stranded_ref(*addr).await?;
@@ -340,6 +344,7 @@ impl Case {
             Self::GracefulSequencer => Self::graceful_sequencer(run, load).await,
             Self::SequencerLaneLoss => Self::sequencer_lane(run, load).await,
             Self::PipelineBlackout => Self::blackout(run).await,
+            Self::SequencerExecutorRedis => run.sequencer_executor_redis(load).await,
             Self::Combined(c) => c.run(run, load).await,
             Self::SealerLeaderLoss(stop) => Self::sealer_leader(run, stop).await,
         }
@@ -452,12 +457,17 @@ impl Case {
     }
 
     /// Set the stack up before the case load: the sequencer cases run two
-    /// replicas of the case sender's lane, as the deployment does.
+    /// replicas of the case sender's lane, as the deployment does. So does
+    /// the sequencer, executor and Redis loss: every replica of the lane
+    /// must look its floors up.
     ///
     /// # Errors
     /// Returns an error when the twin replica does not start.
     pub fn prepare(self, run: &mut Run<'_>) -> Result<()> {
-        if matches!(self, Self::SequencerLaneLoss | Self::GracefulSequencer) {
+        if matches!(
+            self,
+            Self::SequencerLaneLoss | Self::GracefulSequencer | Self::SequencerExecutorRedis
+        ) {
             let lane = run.case_lane()?;
             run.stack.add_sequencer_twin(lane)?;
         }
@@ -700,7 +710,7 @@ impl Class {
         }
     }
 
-    fn start(self, run: &mut Run<'_>) -> Result<()> {
+    pub(super) fn start(self, run: &mut Run<'_>) -> Result<()> {
         let stack = &mut *run.stack;
         match self {
             Self::Sealer => stack.start_sealer(),
@@ -713,7 +723,7 @@ impl Class {
 
     /// Every process of the class still runs: it waited for what it
     /// needs, with no exit.
-    fn assert_up(self, run: &mut Run<'_>) -> Result<()> {
+    pub(super) fn assert_up(self, run: &mut Run<'_>) -> Result<()> {
         let stack = &mut *run.stack;
         let down: Vec<usize> = match self {
             Self::Sealer => Vec::new(),
