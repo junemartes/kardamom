@@ -540,3 +540,25 @@ fn with_the_floor_seam_a_rollback_makes_the_sender_wait_for_a_lookup_again() {
     assert!(a.waits_for_lookup(sender(1), &mut out));
     assert_eq!(names(&out), ["L"]);
 }
+
+/// An executor answer with a count of 1 holds record 0 only, so it sits at
+/// record 0. The row of record 0 is the same state and is not newer. The
+/// row of record 1 is newer.
+#[test]
+fn an_answer_of_one_record_sits_at_record_0_and_the_row_of_record_1_is_newer() {
+    let answer = |value: u64| kardamom_cache::QueryAnswer {
+        value: U256::from(value),
+        block: 1,
+        tx_idx: 1,
+    };
+    let held = AccountState::of_answers(&answer(1), &answer(10 * COST)).unwrap();
+    assert_eq!(held.tx_idx, 0);
+    assert!(
+        !state(1, 10 * COST, 0).is_newer_than(&held),
+        "the row of record 0"
+    );
+    assert!(
+        state(2, 10 * COST, 1).is_newer_than(&held),
+        "the row of record 1"
+    );
+}
