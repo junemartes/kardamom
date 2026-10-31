@@ -525,10 +525,12 @@ impl Lifecycle {
         self.contract()
     }
 
-    /// Provision one node with the substrate playbook, limited to that
-    /// node: the play a new machine gets. The workloads are not
-    /// redeployed; Nomad places the lost allocations on the node once
-    /// its client joins.
+    /// Provision one replaced node with `ansible/replace-node.yml`,
+    /// limited to that node. The node starts from the plain prepared node
+    /// image, which holds its software, and joins the host settings of the
+    /// bring-up, so the playbook configures and starts its agents only. The
+    /// workloads are not redeployed; Nomad places the lost allocations on
+    /// the node once its client joins.
     ///
     /// # Errors
     ///
@@ -537,9 +539,9 @@ impl Lifecycle {
         let contract = self.contract()?;
         let nomad_addr = contract.nomad_addr(NOMAD_HTTP_PORT)?;
         let env = vec![("NOMAD_ADDR", nomad_addr)];
-        let mut cmd = self.playbook("ansible/containers.yml", &env);
+        let mut cmd = self.playbook("ansible/replace-node.yml", &env);
         cmd.arg("--limit").arg(format!("localhost,{name}"));
-        run_inheriting(cmd, "ansible-playbook ansible/containers.yml (one node)").await
+        run_inheriting(cmd, "ansible-playbook ansible/replace-node.yml").await
     }
 
     /// Destroy the node containers and their volumes, and remove the

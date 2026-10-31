@@ -211,8 +211,7 @@ class StreakTest(unittest.TestCase):
         ci = next(run for run in runs if run["path"].endswith("/ci.yml"))
         ci["jobs"][-1]["conclusion"] = "skipped"
         self.assertEqual(self.streak.record(runs), "failed")
-        self.assertIn(f"component recovery ({COMPONENT_SHARDS - 1})",
-                      self.streak.state["rounds"][0]["missing_green_coverage"])
+        self.assertIn("component recovery (4)", self.streak.state["rounds"][0]["missing_green_coverage"])
 
     def test_component_jobs_have_a_ten_minute_budget(self):
         for end, expected in [("00:10:00", "green"), ("00:10:01", "failed")]:
@@ -221,6 +220,20 @@ class StreakTest(unittest.TestCase):
             ci["jobs"][-1]["completed_at"] = f"2026-10-01T{end}Z"
             with self.subTest(end=end):
                 self.assertEqual(Streak(HEAD, BRANCH, SHARDS).record(runs), expected)
+
+    def test_the_carry_shard_has_a_twenty_minute_budget(self):
+        for shard, end, expected in [("chaos-carry", "00:20:00", "green"), ("chaos-carry", "00:20:01", "failed"),
+                                     ("chaos-cache", "00:15:01", "failed")]:
+            streak = Streak(HEAD, BRANCH, SHARDS | {"chaos-carry"})
+            runs = self.runs(1)
+            cluster = next(run for run in runs if run["path"].endswith("cluster-e2e.yml"))
+            cluster["jobs"].append({"name": "container cluster e2e (chaos-carry)", "status": "completed",
+                                    "conclusion": "success", "started_at": "2026-10-01T00:00:00Z",
+                                    "completed_at": "2026-10-01T00:10:00Z"})
+            job = next(job for job in cluster["jobs"] if job["name"] == f"container cluster e2e ({shard})")
+            job["completed_at"] = f"2026-10-01T{end}Z"
+            with self.subTest(shard=shard, end=end):
+                self.assertEqual(streak.record(runs), expected)
 
     def test_registry_includes_every_existing_shard(self):
         root = Path(__file__).resolve().parents[3]

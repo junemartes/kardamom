@@ -64,6 +64,19 @@ fn a_report_before_its_session_start_counts() {
     assert_eq!(r.version.get(), 3);
 }
 
+/// A new leader confirms the open session again with the same id. The
+/// marker of that confirmation starts a new generation, so the publish
+/// loop offers the unconfirmed runs again, and the version stays.
+#[test]
+fn a_new_leader_of_the_same_session_starts_a_new_generation() {
+    let mut r = Rig::new();
+    r.session(7, 5);
+    let before = r.version.session_generation();
+    r.rules.on_session_start(7);
+    assert_ne!(r.version.session_generation(), before);
+    assert_eq!(r.version.get(), 5);
+}
+
 #[test]
 fn a_new_session_keeps_the_version() {
     let mut r = Rig::new();
