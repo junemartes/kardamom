@@ -20,6 +20,10 @@ const CARRY_RETENTION: u64 = 16_384;
 /// freeze must pass twice this count to overrun the window: about 45 s
 /// at the steady load, and 85 s at the L1 load.
 const SMALL_RETENTION: u64 = 2048;
+/// The sealer retention of the follower and nightly shards, in frames: a
+/// fault behind a paused batcher must not overrun it, and the floor pass
+/// of the outage cases still comes within minutes.
+const FOLLOWER_RETENTION: u64 = 6144;
 /// The snapshot interval of the retention and L1 shards, in seconds. A
 /// floor pass waits for one snapshot, so the interval bounds that wait.
 const SHORT_SNAPSHOT_S: u64 = 30;
@@ -364,7 +368,7 @@ impl Shard {
             },
             Self::Follower => DeployVars {
                 cluster_snapshot_interval_s: Some(60),
-                cluster_retention: Some(6144),
+                cluster_retention: Some(FOLLOWER_RETENTION),
                 l1_fault_proxy: true,
                 indexer_poll_s: Some(2),
                 da_watcher_silence_s: Some(30),
@@ -392,9 +396,12 @@ impl Shard {
             | Self::CombinedExec => DeployVars::default(),
             // The fault proxy for the L1 cases of the nightly shard: it
             // forwards every read while no fault is set. A snapshot every
-            // 30 s, so the leader purges its log within the rejoin drill.
+            // 30 s, so the leader purges its log within the rejoin drill,
+            // and the retention of the follower shard, so the floor of
+            // two-day-outage is known.
             Self::Integrity => DeployVars {
                 cluster_snapshot_interval_s: Some(SHORT_SNAPSHOT_S),
+                cluster_retention: Some(FOLLOWER_RETENTION),
                 l1_fault_proxy: true,
                 indexer_poll_s: Some(2),
                 da_watcher_silence_s: Some(30),
