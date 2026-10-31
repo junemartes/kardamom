@@ -27,7 +27,8 @@ mod node;
 #[path = "ingress_recovery/peer.rs"]
 mod peer;
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use alloy_signer_local::PrivateKeySigner;
@@ -111,12 +112,51 @@ impl Channels {
     }
 }
 
-/// The scratch directory of one test; removed on drop.
+/// The scratch directory of one test; removed on drop. A failed test
+/// keeps it and prints the tail of each process log, because a CI job
+/// keeps only the output of the test.
 struct Scratch(PathBuf);
+
+/// The lines of each process log that a failed test prints.
+const LOG_TAIL: usize = 80;
+
+impl Scratch {
+    /// Print the last [`LOG_TAIL`] lines of each log in the directory to
+    /// stderr, then a closing line: a runner that shows only the end of a
+    /// failed suite then still points to the failure message.
+    fn print_log_tails(&self) {
+        let mut logs: Vec<PathBuf> = std::fs::read_dir(&self.0)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "log"))
+            .collect();
+        logs.sort();
+        for path in &logs {
+            Self::print_tail(path);
+        }
+        let _ = writeln!(
+            std::io::stderr(),
+            "==> the failure message is above the log tails"
+        );
+    }
+
+    /// Print the last [`LOG_TAIL`] lines of the log at `path`. A write
+    /// error is ignored: a panic in this unwind would abort the process.
+    fn print_tail(path: &Path) {
+        let bytes = std::fs::read(path).unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        let tail = lines[lines.len().saturating_sub(LOG_TAIL)..].join("\n");
+        let _ = writeln!(std::io::stderr(), "==> {}\n{tail}", path.display());
+    }
+}
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        if !std::thread::panicking() {
+        if std::thread::panicking() {
+            self.print_log_tails();
+        } else {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }

@@ -25,6 +25,7 @@ import signal
 import subprocess
 import time
 import tomllib
+import uuid
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,10 +36,13 @@ SEALER_RUNTIME = SEALER / "service/build/component-runtime"
 # The default per-test limit. A suite can raise it to at most 120 s with test_timeout_s and a reason.
 TEST_SECONDS = 60
 SHARD_SECONDS = 6 * 60
-SHARDS = 5
+SHARDS = 6
 CARGO_MODES = ("in-process", "docker", "stack")
 # The modes whose tests can start containers. The shard removes what such a test leaves.
 CONTAINER_MODES = ("docker", "stack")
+# A fixture that creates a Docker network puts the value of this variable in the network name.
+# A killed test runs no Drop, so its runner then removes the networks that carry its owner.
+OWNER_VARIABLE = "KARDAMOM_DOCKER_OWNER"
 # The estimate for a test with no measured runtime yet.
 DEFAULT_SECONDS = {"in-process": 5.0, "docker": 30.0, "gradle": 15.0, "stack": 30.0}
 # A stack test finds the service binaries in the parent of its own directory, as in a Cargo
@@ -85,6 +89,10 @@ class Plan:
         for test in ordered:
             min(shards, key=lambda shard: (self.worst_case(shard + [test]), len(shard))).append(test)
         return [sorted(shard, key=lambda test: (test["mode"], test["suite"], test["test"])) for shard in shards]
+
+    def over(self):
+        """The shards whose worst case does not fit the shard deadline."""
+        return [index for index, shard in enumerate(self.shards()) if self.worst_case(shard) > SHARD_SECONDS]
 
     def describe(self):
         return "\n".join(f"shard {index}: {len(shard)} tests, estimate {sum(map(self.estimate, shard)):.0f}s, "
@@ -373,6 +381,44 @@ class Docker:
         return len(left)
 
     @staticmethod
+    def owner():
+        """A name part that is unique to one test process, so parallel runners never remove each other's networks."""
+        return f"kardamom-test-{uuid.uuid4().hex[:12]}"
+
+    @staticmethod
+    def remove_owned(owner):
+        """Remove the networks that carry the owner, and every container on them first.
+
+        A killed test leaves its containers running, and Docker does not remove a network
+        that a running container uses. The owner is unique to one test, so this is exact.
+        """
+        networks = subprocess.check_output(["docker", "network", "ls", "-q", "--filter", f"name={owner}"],
+                                           text=True).split()
+        if not networks:
+            return 0, 0
+        # Docker joins repeated filters of one key with "or".
+        filters = [argument for network in networks for argument in ("--filter", f"network={network}")]
+        containers = subprocess.check_output(["docker", "ps", "-aq", *filters], text=True).split()
+        if containers:
+            subprocess.run(["docker", "rm", "-f", "-v", *containers], check=False, stdout=subprocess.DEVNULL)
+        subprocess.run(["docker", "network", "rm", *networks], check=False, stdout=subprocess.DEVNULL)
+        return len(containers), len(networks)
+
+    @classmethod
+    def clean(cls, owner, before=None):
+        """Remove what a test left: its owned networks with their containers, and, with a snapshot
+        `before`, every other new container on the host. Only a runner that owns the host passes one.
+
+        The clean-up runs in a `finally`, so a Docker error must not replace the test result or a Ctrl-C.
+        """
+        try:
+            containers, networks = cls.remove_owned(owner)
+            return containers + (cls.remove_new(before) if before is not None else 0), networks
+        except subprocess.CalledProcessError as error:
+            print(f"warning: the Docker clean-up failed: {error}", flush=True)
+            return 0, 0
+
+    @staticmethod
     def unlisted():
         present = set(subprocess.check_output(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
                                               text=True).split())
@@ -382,10 +428,13 @@ class Docker:
 class Shard:
     """One shard job: run the planned tests with a per-test and a per-shard deadline."""
 
-    def __init__(self, bundle, sealer, output):
+    def __init__(self, bundle, sealer, output, owns_host=False):
         self.bundle = bundle
         self.sealer = sealer
         self.output = output
+        # A CI shard runs alone on its runner, so it can also remove every new container
+        # on the host. Shards that share a host remove only what their tests own.
+        self.owns_host = owns_host
 
     @staticmethod
     def execute(command, log, seconds, environment=None):
@@ -427,14 +476,21 @@ class Shard:
                                 else runner.command(entry))
         if entry["mode"] == "stack":
             environment |= self.sealer.stack_environment()
-        before = Docker.containers() if entry["mode"] in CONTAINER_MODES else set()
         limit = entry.get("limit", TEST_SECONDS)
-        code, timed_out, seconds = self.execute(command, log, min(limit, remaining), environment)
-        left = Docker.remove_new(before) if entry["mode"] in CONTAINER_MODES else 0
+        docker = entry["mode"] in CONTAINER_MODES
+        owner = Docker.owner() if docker else None
+        before = Docker.containers() if docker and self.owns_host else None
+        if docker:
+            environment = environment | {OWNER_VARIABLE: owner}
+        # The clean-up also runs on Ctrl-C, which kills the test before its Drop.
+        try:
+            code, timed_out, seconds = self.execute(command, log, min(limit, remaining), environment)
+        finally:
+            containers, networks = Docker.clean(owner, before) if docker else (0, 0)
         success = (code == 0 and not timed_out and seconds <= limit
                    and runner.verdict(entry, log.read_text(errors="replace"), reports))
-        return dict(entry, success=success, exit_code=code, timed_out=timed_out,
-                    seconds=round(seconds, 3), removed_containers=left, log=str(log))
+        return dict(entry, success=success, exit_code=code, timed_out=timed_out, seconds=round(seconds, 3),
+                    removed_containers=containers, removed_networks=networks, log=str(log))
 
     def run(self, index, tests):
         started = time.monotonic()
@@ -512,7 +568,10 @@ def main():
     elif args.mode == "image-names":
         print(" ".join([*IMAGES, *BUILT_IMAGES]))
     elif args.mode == "plan":
-        print(Plan.load().describe())
+        plan = Plan.load()
+        print(plan.describe())
+        if plan.over():
+            raise SystemExit(f"shards {plan.over()} can run over the {SHARD_SECONDS} s deadline")
     elif args.mode == "timings":
         Timings.update(args.results)
     else:
@@ -526,7 +585,8 @@ def run(parser, args):
     if args.mode == "run":
         if args.shard is None or not 0 <= args.shard < SHARDS:
             parser.error(f"run needs --shard in 0..{SHARDS - 1}")
-        return Shard(Bundle(args.bundle), SealerRuntime(args.sealer), args.output).run(args.shard, shards[args.shard])
+        return (Shard(Bundle(args.bundle), SealerRuntime(args.sealer), args.output, owns_host=True)
+                .run(args.shard, shards[args.shard]))
     # Local verification uses the same plan and execution path as CI.
     with ThreadPoolExecutor(max_workers=SHARDS) as pool:
         return all(list(pool.map(

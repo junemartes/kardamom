@@ -18,6 +18,10 @@ use super::ingress::{IngressSlot, SpawnedIngress};
 use super::proc::Proc;
 use super::services::{self, SequencerOptions};
 
+/// How long a sealer member gets to exit after SIGTERM: its shutdown
+/// closes the consensus module, the archive and the media driver.
+const SEALER_GRACE: Duration = Duration::from_secs(20);
+
 /// How a service stops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
@@ -340,6 +344,21 @@ impl LocalStack {
     /// Kill every sealer member at once.
     pub fn kill_sealer(&mut self) {
         self.sealer.kill_all();
+    }
+
+    /// Stop sealer member `id` alone. With three members, the other two
+    /// keep a quorum and elect a new leader when `id` led.
+    ///
+    /// # Errors
+    /// Returns an error when the stack has no member `id`, or when a
+    /// graceful stop overruns its bound.
+    pub fn stop_sealer_member(&mut self, id: usize, stop: Stop) -> Result<()> {
+        let proc = self
+            .sealer
+            .procs
+            .get_mut(id)
+            .with_context(|| format!("no sealer member {id}"))?;
+        stop.apply(proc, SEALER_GRACE)
     }
 
     /// Start every sealer member again on its own snapshot and log. The

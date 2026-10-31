@@ -17,7 +17,8 @@
 #![cfg(feature = "full-pipeline-e2e")]
 
 use e2e::harness::StackConfig;
-use e2e::scenarios::recovery::{Case, run_case, validated, with_l1};
+use e2e::harness::faults::Stop;
+use e2e::scenarios::recovery::{Case, run_case, validated, with_l1, with_quorum};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run the pipeline-recovery component target"]
@@ -128,4 +129,19 @@ fn floor_stack(admission: bool) -> StackConfig {
         admission,
         ..validated()
     }
+}
+
+/// The sealer leader stops on SIGTERM while the load flows. The two
+/// other members elect a new leader within the egress silence window of
+/// the clients, so each session moves to the new leader with no new
+/// session. The executor must reach the sealed head.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack; run the pipeline-recovery component target"]
+async fn a_sealer_leader_stop_keeps_the_executor_at_the_sealed_head() {
+    run_case(
+        "sealer-leader-stop-recover",
+        Case::SealerLeaderLoss(Stop::Graceful),
+        with_quorum(validated()),
+    )
+    .await;
 }

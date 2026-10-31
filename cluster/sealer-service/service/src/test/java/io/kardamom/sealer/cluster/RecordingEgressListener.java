@@ -1,6 +1,7 @@
 package io.kardamom.sealer.cluster;
 
 import io.aeron.cluster.client.EgressListener;
+import io.aeron.cluster.codecs.EventCode;
 import io.aeron.logbuffer.Header;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
@@ -36,8 +37,34 @@ final class RecordingEgressListener implements EgressListener {
     long replayAheadCount = 0;
     /** The {@code [blockNumber, endTxIdx, l2Timestamp]} of every BOUNDARY frame, in arrival order. */
     final List<long[]> boundaries = new ArrayList<>();
+    /** The leadership term of every session OK for our session, in arrival order. */
+    final List<Long> okTerms = new ArrayList<>();
+    /** The leadership term of every new-leader event for our session, in arrival order. */
+    final List<Long> newLeaderTerms = new ArrayList<>();
     long lastUnavailableOldestIndex = -1;
     long lastUnavailableOldestBlock = -1;
+
+    @Override
+    public void onSessionEvent(
+            final long correlationId,
+            final long clusterSessionId,
+            final long leadershipTermId,
+            final int leaderMemberId,
+            final EventCode code,
+            final String detail) {
+        if (code == EventCode.OK) {
+            okTerms.add(leadershipTermId);
+        }
+    }
+
+    @Override
+    public void onNewLeader(
+            final long clusterSessionId,
+            final long leadershipTermId,
+            final int leaderMemberId,
+            final String ingressEndpoints) {
+        newLeaderTerms.add(leadershipTermId);
+    }
 
     @Override
     public void onMessage(

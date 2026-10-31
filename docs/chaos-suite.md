@@ -101,17 +101,36 @@ The CI jobs:
 2. `build sealer tests` compiles the sealer tests once. It packages the classes, the
    dependency jars, the JUnit console launcher, the JVM arguments of the test task and
    the sealer jar.
-3. `component recovery (0)` to `component recovery (4)` run the suite. The shard count
+3. `component recovery (0)` to `component recovery (5)` run the suite. The shard count
    is fixed. A shard compiles nothing. It pulls the docker images once, or loads them
    from the cache that a push saves, then runs its planned tests one at a time.
 
 Each test runs in its own process with a 60-second deadline. A suite can raise
 its deadline to at most 120 seconds with `test_timeout_s`; it then also states
-the reason in `test_timeout_reason`. The plan checks that every shard fits its
-deadline when its slowest-limit test runs to its limit. A shard has a six-minute
-execution deadline in a ten-minute job. The target worst case is about five minutes
-per shard. Add a shard when the plan goes over it; do not raise the deadline.
-After each docker test, the shard removes the containers that the test left.
+the reason in `test_timeout_reason`. A shard has a six-minute execution deadline
+in a ten-minute job. The worst case of a shard is its estimate when its
+slowest-limit test runs to its limit. `just component-catalog` prints the plan and
+fails when a worst case is over the deadline. The `style` job runs it. The target
+worst case is about five minutes per shard. Add a shard when the plan goes over it;
+do not raise the deadline.
+
+A killed test runs no Drop, so its containers and networks stay. Each docker or
+stack test gets a unique owner in `KARDAMOM_DOCKER_OWNER`. A fixture that creates a
+Docker network must put that value in the network name. After the test, also on
+Ctrl-C, the runner removes what the test left:
+
+| Runner | Removes |
+| --- | --- |
+| `component_tests.py run` (one CI shard on its own runner) | The networks of the owner and every container on them, then every other container that is new on the host since the test started. |
+| `component_tests.py run-all` (all shards on one host) | The networks of the owner and every container on them. |
+| `scripts/test-components.py` | The networks of the owner and every container on them. |
+
+Only a runner that owns its host removes new containers by a host-wide snapshot.
+A runner that shares its host, with other shards or other runs, removes only what
+its tests own. So, there, a killed test can leave a container that is not on an
+owner network. A Docker error in the clean-up prints a warning; it does not
+change the test result.
+
 Missing tests, skipped tests, timeouts and mismatched artifact hashes fail the run.
 Each shard prints a timing table and uploads its logs.
 
