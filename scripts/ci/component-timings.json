@@ -159,6 +159,7 @@
   "ingress-recovery::a_graceful_stop_drains_and_the_returned_ingress_serves_every_receipt": 5.2,
   "ingress-recovery::a_hard_killed_case_ingress_returns_with_no_lost_or_doubled_transfer": 5.2,
   "ingress-recovery::a_hard_killed_twin_returns_and_serves_receipts_that_it_never_saw": 4.4,
+  "ingress-recovery::a_late_join_to_a_returned_ingress_refetches_its_first_transfers": 26.0,
   "ingress-recovery::a_lost_archiving_driver_ends_its_ingress_while_the_twin_serves": 25.1,
   "l1-provider-http::a_lie_in_the_batch_reaches_the_header": 0.064,
   "l1-provider-http::a_range_of_headers_is_one_request": 0.064,

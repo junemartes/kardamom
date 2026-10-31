@@ -94,7 +94,7 @@ impl Channels {
     fn subscriber(&self, rt: &AeronRuntime) -> TxDataSubscriberHandle {
         let channels = Self::defaults();
         TxDataSubscriberHandle::from_subscription(
-            rt.open_tx_data_subscription(
+            rt.open_tx_data_subscription_with_joins(
                 &self.tx_data_template.replace("{sid}", "0"),
                 channels.tx_data_stream_id(0),
             )
@@ -188,7 +188,8 @@ impl Fixture {
         ];
         let prefix = 200 + u16::try_from(std::process::id() % 400).unwrap();
         let channels = [Channels::new(prefix, 0), Channels::new(prefix, 1)];
-        let pipeline = Pipeline::start(&drivers[1].aeron_dir(), &channels);
+        let archives: Vec<String> = drivers.iter().map(Driver::archive_endpoint).collect();
+        let pipeline = Pipeline::start(&drivers[1].aeron_dir(), &channels, &archives);
         let stub = QueryStub::start(pipeline.ledger.clone()).await;
         let mut replicas: Vec<Replica> = channels
             .into_iter()
@@ -311,6 +312,54 @@ async fn stop_and_return(name: &str, victim: usize, stop: Stop) {
     ));
     let sender = load.sender.clone();
     let report = load.finish().await;
+    fx.judge(name, &sender, &report).await;
+    println!(
+        "INGRESS_RECOVERY {name} seconds={:.1}",
+        fx.started.elapsed().as_secs_f64()
+    );
+}
+
+/// How long the driver of the pipeline holds before a returned ingress
+/// answers: the ingress publishes its first submits to its own archive
+/// before the pipeline joins its new session.
+const LATE_JOIN_HOLD: Duration = Duration::from_secs(4);
+
+/// `late-join`: the archiving media driver of ingress 0 dies, and ingress
+/// 0 returns on a new driver while the driver of the pipeline holds. The
+/// new publication connects to its own archive first, so the pipeline
+/// joins the new session after its first frames. A client that waits for
+/// its first transfer sends nothing more, so no frame follows the join.
+/// The pipeline must refetch the frames before its join from the archive
+/// of ingress 0: every transfer of the client lands, once.
+///
+/// An ingress process that returns on the same driver keeps its session:
+/// the driver shares the publication between its clients. So only a new
+/// driver gives the race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real ingress processes and drivers; run the ingress-recovery component target"]
+async fn a_late_join_to_a_returned_ingress_refetches_its_first_transfers() {
+    let name = "late-join";
+    let mut fx = Fixture::start(name).await;
+    let case = fx.load(0).await;
+    fx.drivers[0].kill();
+    let exit = fx.replicas[0].await_exit(Duration::from_secs(30));
+    fx.log(&format!("driver A killed; ingress 0 exit: {exit:?}"));
+    let took = fx.drivers[0].restart(Duration::from_secs(60));
+    fx.log(&format!(
+        "driver A returns after {:.1}s",
+        took.as_secs_f64()
+    ));
+    fx.drivers[1].freeze_for(LATE_JOIN_HOLD);
+    fx.log(&format!("driver B holds for {LATE_JOIN_HOLD:?}"));
+    fx.restart(0).await;
+    let landed = case.landed();
+    let again = case.await_above(landed, RESTART_BOUND).await;
+    fx.log(&format!(
+        "the client lands again {:.1}s after the return",
+        again.as_secs_f64()
+    ));
+    let sender = case.sender.clone();
+    let report = case.finish().await;
     fx.judge(name, &sender, &report).await;
     println!(
         "INGRESS_RECOVERY {name} seconds={:.1}",

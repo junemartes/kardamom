@@ -301,6 +301,40 @@ impl AeronRuntime {
         Ok(TxDataSubscription { rx })
     }
 
+    /// [`open_tx_data_subscription`](Self::open_tx_data_subscription) that
+    /// also reports the join of each new image, as a
+    /// [`TxDataItem::Joined`](super::TxDataItem::Joined) of
+    /// [`TxDataSubscription::try_recv_item`](super::TxDataSubscription::try_recv_item).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to add the subscription,
+    /// or to turn on its join reports.
+    pub fn open_tx_data_subscription_with_joins(
+        &self,
+        uri: &str,
+        stream_id: i32,
+    ) -> Result<TxDataSubscription, LogError> {
+        let (sub_id, rx) = self.open_subscription_raw(uri, stream_id)?;
+        self.report_joins(sub_id)?;
+        Ok(TxDataSubscription { rx })
+    }
+
+    /// Report the join of each new image of the subscription `sub_id`, and
+    /// of each of its destinations, as a marker on its frame channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `sub_id` is unknown or closed, or if the command
+    /// round trip times out.
+    pub fn report_joins(&self, sub_id: u32) -> Result<(), LogError> {
+        request(
+            &self.cmd_tx,
+            |ack| RuntimeCmd::SubReportJoins { sub_id, ack },
+            "report_joins",
+        )
+    }
+
     /// [`open_tx_data_subscription`](Self::open_tx_data_subscription),
     /// also returning the `sub_id` that [`close_subscription`](Self::close_subscription)
     /// takes.

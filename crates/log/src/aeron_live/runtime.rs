@@ -142,6 +142,12 @@ pub(super) enum RuntimeCmd {
         sub_id: u32,
         ack: CbSender<Result<Option<i64>, LogError>>,
     },
+    /// Report the joins of new images of a subscription as markers on its
+    /// frame channel, from now on.
+    SubReportJoins {
+        sub_id: u32,
+        ack: CbSender<Result<(), LogError>>,
+    },
     /// Close a subscription: drop its destinations, its handlers, and the
     /// Aeron subscription itself. Its `sub_id` is never reused.
     CloseSubscription {
@@ -388,6 +394,9 @@ fn decode_typed_frame<T>(frame: &RawFrame) -> ControlFlow<(BPosition, T)>
 where
     T: crate::codec::WireMessage,
 {
+    if frame.joined {
+        return ControlFlow::Continue(());
+    }
     match codec::materialize::<T>(&frame.bytes) {
         Ok(v) => ControlFlow::Break((frame.pos, v)),
         Err(e) => {
@@ -445,7 +454,48 @@ impl<T: crate::codec::WireMessage> TypedSubscription<T> {
 pub struct PositionedTxData {
     pub loc: TxDataLoc,
     pub stream_position: u64,
+    /// The position of the first frame of the publisher session: a
+    /// subscriber that joined at a later position missed the frames
+    /// from here to its join.
+    pub session_start: BPosition,
     pub envelope: TxEnvelope,
+}
+
+/// The join of a new image of a `tx_data` subscription: the subscriber
+/// missed the frames of the session from `session_start` to `join`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageJoin {
+    pub session_id: i32,
+    pub join: BPosition,
+    pub stream_position: u64,
+    pub session_start: BPosition,
+}
+
+/// One item of a `tx_data` subscription that reports its joins.
+#[derive(Debug)]
+pub enum TxDataItem {
+    Frame(PositionedTxData),
+    Joined(ImageJoin),
+}
+
+/// [`decode_positioned_tx_data_frame`], with each join marker as a
+/// [`TxDataItem::Joined`].
+fn decode_tx_data_item(frame: &RawFrame) -> ControlFlow<TxDataItem> {
+    if !frame.joined {
+        return decode_positioned_tx_data_frame(frame).map_break(TxDataItem::Frame);
+    }
+    let Ok(stream_position) = u64::try_from(frame.stream_pos) else {
+        return ControlFlow::Continue(());
+    };
+    ControlFlow::Break(TxDataItem::Joined(ImageJoin {
+        session_id: frame.session,
+        join: frame.pos,
+        stream_position,
+        session_start: BPosition {
+            term_id: frame.initial_term_id,
+            term_offset: 0,
+        },
+    }))
 }
 
 /// [`decode_tx_data_frame`] with the stream position of the frame. A
@@ -458,9 +508,14 @@ fn decode_positioned_tx_data_frame(frame: &RawFrame) -> ControlFlow<PositionedTx
         );
         return ControlFlow::Continue(());
     };
+    let session_start = BPosition {
+        term_id: frame.initial_term_id,
+        term_offset: 0,
+    };
     decode_tx_data_frame(frame).map_break(|(loc, envelope)| PositionedTxData {
         loc,
         stream_position,
+        session_start,
         envelope,
     })
 }
@@ -468,6 +523,9 @@ fn decode_positioned_tx_data_frame(frame: &RawFrame) -> ControlFlow<PositionedTx
 /// Decode one `tx_data` fragment as a `TxEnvelope`, pairing it with a
 /// [`TxDataLoc`] built from the frame's position and publisher session.
 fn decode_tx_data_frame(frame: &RawFrame) -> ControlFlow<(TxDataLoc, TxEnvelope)> {
+    if frame.joined {
+        return ControlFlow::Continue(());
+    }
     match codec::materialize::<TxEnvelope>(&frame.bytes) {
         Ok(v) => ControlFlow::Break((TxDataLoc::new(frame.session, frame.pos), v)),
         Err(e) => {
@@ -503,6 +561,13 @@ impl TxDataSubscription {
     /// [`Self::try_recv`] with the stream position of the envelope.
     pub fn try_recv_positioned(&mut self) -> Option<PositionedTxData> {
         try_recv_decoded(&mut self.rx, decode_positioned_tx_data_frame)
+    }
+
+    /// [`Self::try_recv_positioned`], with the join of each new image of a
+    /// subscription opened with
+    /// [`AeronRuntime::open_tx_data_subscription_with_joins`].
+    pub fn try_recv_item(&mut self) -> Option<TxDataItem> {
+        try_recv_decoded(&mut self.rx, decode_tx_data_item)
     }
 
     /// Blocking receive, for a caller off the tokio runtime (for example
@@ -672,6 +737,8 @@ mod tests {
             pos: BPosition::default(),
             session: 0,
             stream_pos: 0,
+            initial_term_id: 0,
+            joined: false,
         })
         .unwrap();
         tx.send(RawFrame {
@@ -679,6 +746,8 @@ mod tests {
             pos: BPosition::default(),
             session: 0,
             stream_pos: 0,
+            initial_term_id: 0,
+            joined: false,
         })
         .unwrap();
 

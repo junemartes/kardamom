@@ -28,6 +28,19 @@ pub(crate) struct Args {
     /// Aeron Media Driver directory (`aeron.dir`).
     #[arg(long)]
     pub(crate) aeron_dir: Option<PathBuf>,
+    /// UDP endpoint (`host:port`) on this node for refetched `tx_data`
+    /// frames. A lane that joins a new ingress session after its first
+    /// frames refetches those frames from the ingress archives
+    /// (`tx_data_archive_endpoints`, or the archive records of the
+    /// discovery plane) onto this endpoint. If unset, the sequencer does
+    /// not repair a late join.
+    #[arg(long, env = "KARDAMOM_REPLAY_DESTINATION")]
+    pub(crate) replay_destination_endpoint: Option<String>,
+    /// UDP endpoint (`host:port`) on this node for the archive-control
+    /// responses of the refetch. Required together with
+    /// `--replay-destination-endpoint` for the repair to run.
+    #[arg(long, env = "KARDAMOM_ARCHIVE_CONTROL_RESPONSE")]
+    pub(crate) archive_control_response_endpoint: Option<String>,
     /// Override the partition index from the config.
     #[arg(long)]
     partition_index: Option<u32>,
@@ -156,6 +169,22 @@ pub(crate) enum TxEventsArg {
 }
 
 impl Args {
+    /// The refetch config of the late-join repair of the `tx_data` lanes,
+    /// or `None` when the repair is off.
+    pub(crate) fn refetch(
+        &self,
+        plane: &mut kardamom_log::discovery::StreamPlane,
+        log_cfg: &kardamom_log::config::LogConfig,
+    ) -> Option<kardamom_log::refetch::RefetchConfig> {
+        kardamom_log::refetch::RefetchConfig::for_plane(
+            plane,
+            &log_cfg.aeron,
+            self.aeron_dir.as_deref(),
+            self.archive_control_response_endpoint.as_deref(),
+            self.replay_destination_endpoint.as_deref(),
+        )
+    }
+
     /// The origin of the `tx_events` frames of this replica: its replica
     /// index in the high byte and its `lane` in the low byte.
     pub(crate) fn tx_events_origin(&self, lane: u8) -> u16 {

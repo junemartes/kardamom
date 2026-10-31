@@ -53,7 +53,9 @@ use crate::error::LogError;
 use crate::recorder::{ArchiveSession, connect_archive_with_timeout};
 use crate::term_layout::TermLayout;
 
+mod join_repair;
 mod recording;
+pub use join_repair::{JOIN_REPAIRS_TOTAL, JoinRepair, RefetchWorker, SessionFetch};
 #[cfg(any(test, feature = "testing"))]
 pub use recording::FakeArchiveCatalog;
 use recording::{FoundRecording, Located, RecordedLimit, Unresolved, Wanted};
@@ -208,6 +210,68 @@ fn spawn_runtime(aeron_dir: Option<&std::path::Path>) -> Result<AeronRuntime, Lo
     match aeron_dir {
         Some(dir) => AeronRuntime::spawn_with_dir(dir),
         None => AeronRuntime::spawn_default(),
+    }
+}
+
+impl RefetchConfig {
+    /// The refetch config of a reader on `plane`, or `None` when no
+    /// durability-archive endpoints are configured (single-host or IPC
+    /// runs), or when the node-local transport endpoints are missing. The
+    /// archive endpoints are the live archive records on a discovered
+    /// plane, else the static lists of `aeron_cfg`.
+    #[must_use]
+    pub fn for_plane(
+        plane: &mut crate::discovery::StreamPlane,
+        aeron_cfg: &AeronConfig,
+        aeron_dir: Option<&std::path::Path>,
+        response_endpoint: Option<&str>,
+        replay_endpoint: Option<&str>,
+    ) -> Option<Self> {
+        let (tx_data_endpoints, tx_deposits_endpoints) = Self::archive_endpoints(plane, aeron_cfg);
+        if !tx_data_endpoints.is_configured() && !tx_deposits_endpoints.is_configured() {
+            return None;
+        }
+        let (Some(response_endpoint), Some(replay_endpoint)) = (response_endpoint, replay_endpoint)
+        else {
+            warn!(
+                "durability-archive endpoints configured but no local refetch endpoints \
+                 (--archive-control-response-endpoint / --replay-destination-endpoint); \
+                 archive refetch DISABLED"
+            );
+            return None;
+        };
+        Some(Self {
+            tx_data_endpoints,
+            tx_deposits_endpoints,
+            response_endpoint: response_endpoint.to_string(),
+            replay_endpoint: replay_endpoint.to_string(),
+            aeron_dir: aeron_dir.map(std::path::Path::to_path_buf),
+            aeron: aeron_cfg.clone(),
+        })
+    }
+
+    /// The archive endpoint sources of the two refetched topics: the live
+    /// archive records on a discovered plane, else the static lists.
+    fn archive_endpoints(
+        plane: &mut crate::discovery::StreamPlane,
+        aeron_cfg: &AeronConfig,
+    ) -> (EndpointSource, EndpointSource) {
+        match plane.watch_archives() {
+            Some(archives) => (
+                EndpointSource::Discovered {
+                    topic: Topic::TxData,
+                    archives: archives.clone(),
+                },
+                EndpointSource::Discovered {
+                    topic: Topic::TxDeposits,
+                    archives,
+                },
+            ),
+            None => (
+                EndpointSource::Static(aeron_cfg.tx_data_archive_endpoints.clone()),
+                EndpointSource::Static(aeron_cfg.tx_deposits_archive_endpoints.clone()),
+            ),
+        }
     }
 }
 

@@ -25,9 +25,10 @@ mod verdicts;
 use std::sync::Arc;
 
 use kardamom_log::aeron_live::{
-    IdleCap, TxDataSubscriberHandle, TxDepositsSubscriberHandle,
+    IdleCap, PositionedTxData, TxDataSubscriberHandle, TxDepositsSubscriberHandle,
     TxReceiptsBoundarySubscriberHandle, TxRemoteEpochsSubscriberHandle,
 };
+use kardamom_log::refetch::{JoinRepair, RefetchWorker};
 use kardamom_obs::lifecycle::process;
 pub(crate) use kardamom_sequencer::account_lookup::{AccountLookupFeed, LookupSources, Retries};
 use kardamom_sequencer::config::SequencerConfig;
@@ -48,10 +49,31 @@ pub(crate) use receipts::{ReceiptFloorFeed, ReceiptSink};
 pub(crate) use verdicts::VerdictFeed;
 
 /// One `tx_data` lane subscription: the lane index the sequencer stamps
-/// into every ref off it, and the handle that reads it.
+/// into every ref off it, the handle that reads it, and the repair of its
+/// late joins, when the sequencer refetches.
 pub(crate) struct LaneSub {
     pub(crate) lane: u8,
     pub(crate) handle: TxDataSubscriberHandle,
+    pub(crate) repair: Option<JoinRepair>,
+}
+
+impl LaneSub {
+    /// The next frame of the lane. A lane with a repair gives the
+    /// refetched frames of a late join before the live ones.
+    fn next(&mut self, refetcher: Option<&mut RefetchWorker>) -> Option<PositionedTxData> {
+        let (Some(repair), Some(refetcher)) = (&mut self.repair, refetcher) else {
+            return self.handle.try_recv_positioned();
+        };
+        while repair.is_empty() {
+            let item = self.handle.try_recv_item()?;
+            repair.take(item, refetcher);
+        }
+        repair.pop()
+    }
+
+    fn queued(&self) -> usize {
+        self.handle.len() + self.repair.as_ref().map_or(0, JoinRepair::len)
+    }
 }
 
 /// The live `tx_data` subscription set: one handle per lane the sequencer
@@ -63,12 +85,19 @@ pub(crate) struct LaneSubscriptions {
     lanes: Vec<LaneSub>,
     /// The lane the next poll tries first.
     next: usize,
+    /// The refetch of every lane's late joins. One client serves all
+    /// lanes: the poll thread owns it, and its Aeron resources are lazy.
+    refetcher: Option<RefetchWorker>,
 }
 
 impl LaneSubscriptions {
-    pub(crate) fn new(own: LaneSub, old: Vec<LaneSub>) -> Self {
+    pub(crate) fn new(own: LaneSub, old: Vec<LaneSub>, refetcher: Option<RefetchWorker>) -> Self {
         let lanes = std::iter::once(own).chain(old).collect();
-        Self { lanes, next: 0 }
+        Self {
+            lanes,
+            next: 0,
+            refetcher,
+        }
     }
 }
 
@@ -78,11 +107,12 @@ impl TxDataSubscriber for LaneSubscriptions {
         // backoff when poll returns None.
         let n = self.lanes.len();
         let lanes = &mut self.lanes;
+        let refetcher = &mut self.refetcher;
         let found = (0..n)
             .map(|i| self.next.saturating_add(i) % n)
             .find_map(|idx| {
                 let sub = &mut lanes[idx];
-                sub.handle.try_recv_positioned().map(|data| {
+                sub.next(refetcher.as_mut()).map(|data| {
                     let inbound = Inbound {
                         lane: sub.lane,
                         loc: data.loc,
@@ -99,7 +129,7 @@ impl TxDataSubscriber for LaneSubscriptions {
     }
 
     fn queued(&self) -> usize {
-        self.lanes.iter().map(|sub| sub.handle.len()).sum()
+        self.lanes.iter().map(LaneSub::queued).sum()
     }
 }
 
