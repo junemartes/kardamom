@@ -2285,6 +2285,7 @@ dependencies = [
  "kardamom-l1-fault-proxy",
  "kardamom-log",
  "kardamom-obs",
+ "kardamom-sequencer",
  "kardamom-state",
  "kardamom-types",
  "libc",

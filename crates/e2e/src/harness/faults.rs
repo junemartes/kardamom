@@ -270,7 +270,7 @@ impl LocalStack {
         Ok(SequencerOptions {
             partition,
             lane,
-            ..SequencerOptions::default()
+            ..self.cfg.sequencer_options(self.read_path.as_ref())
         })
     }
 
@@ -373,6 +373,11 @@ impl LocalStack {
             .to_string();
         // See `restart_driver` for the thread that spawns the members.
         tokio::task::block_in_place(|| self.sealer.start_all(&tag))
+    }
+
+    /// Whether the executor process runs.
+    pub fn executor_alive(&mut self) -> bool {
+        self.executor.proc.is_alive()
     }
 
     /// Whether any sealer member process runs.

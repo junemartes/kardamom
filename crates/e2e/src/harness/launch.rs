@@ -232,10 +232,14 @@ impl<'a> StackLaunch<'a> {
     /// Spawn one sequencer per shard. In carry mode from genesis each one
     /// starts at the floor 5, so that no reference without bytes goes out
     /// before the first report of the sealer.
-    fn spawn_sequencers(&self, spec: &ServiceSpec<'_>) -> Result<Vec<services::Spawned>> {
+    fn spawn_sequencers(
+        &self,
+        spec: &ServiceSpec<'_>,
+        read_path: Option<&super::read_path::ReadPath>,
+    ) -> Result<Vec<services::Spawned>> {
         let opts = services::SequencerOptions {
             sealer_version_floor: if self.cfg.carry_genesis() { 5 } else { 0 },
-            ..services::SequencerOptions::default()
+            ..self.cfg.sequencer_options(read_path)
         };
         (0..self.cfg.shards.get())
             .map(|i| services::spawn_sequencer_with(spec, i, &opts))
@@ -405,7 +409,10 @@ impl LocalStack {
         let log_config = stack_launch.write_archive_log_config()?;
         let spec = stack_launch.assemble_spec(&genesis, log_config.as_deref());
 
-        let sequencers = stack_launch.spawn_sequencers(&spec)?;
+        // The read path starts before the sequencers, so that they can
+        // take its Redis URL.
+        let read_path = super::read_path::ReadPath::start_if(cfg.read_path, &spec)?;
+        let sequencers = stack_launch.spawn_sequencers(&spec, read_path.as_ref())?;
         let egress = cfg.carry.map(|_| spec.spawn_egress(None)).transpose()?;
         let genesis_egress = egress
             .as_ref()
@@ -418,7 +425,6 @@ impl LocalStack {
                 carry_egress: genesis_egress.as_deref(),
             },
         )?;
-        let read_path = super::read_path::ReadPath::start_if(cfg.read_path, &spec)?;
         let wirings = stack_launch.build_l1_wiring(l1.as_ref()).await?;
         let validator = stack_launch.spawn_validator(
             &spec,

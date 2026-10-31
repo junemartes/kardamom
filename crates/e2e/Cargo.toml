@@ -39,6 +39,13 @@ full-pipeline-e2e = [
     "dep:serde_json",
     "dep:tempfile",
 ]
+# The stack test of the sequencer, executor and Redis loss: the sequencers
+# get the `--first-floor-from-lookup` test seam. Debug builds only.
+floor-seams = [
+    "full-pipeline-e2e",
+    "dep:kardamom-sequencer",
+    "kardamom-sequencer/floor-seams",
+]
 
 [lib]
 path = "src/lib.rs"
@@ -74,6 +81,8 @@ alloy-sol-types = { workspace = true, optional = true }
 # validator feed) the xchain scenario drives as its simulated origin.
 kardamom-da-watcher = { path = "../da_watcher", optional = true, features = ["test-support"] }
 kardamom-exec-core = { path = "../exec-core", optional = true }
+# Only for its `floor-seams` feature. The e2e code does not use the crate.
+kardamom-sequencer = { path = "../sequencer", optional = true }
 kardamom-deployer = { path = "../deployer", optional = true, features = ["test-support"] }
 # The metric name `INGRESS_QUEUE_DEPTH` re-exports; e2e itself never
 # drives the ingress binary directly (Target-L/-C spawn it as a process).

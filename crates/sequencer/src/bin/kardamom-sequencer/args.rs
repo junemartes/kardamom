@@ -146,6 +146,12 @@ pub(crate) struct Args {
     /// under two origins and their frame counters do not mix.
     #[arg(long, env = "KARDAMOM_TX_EVENTS_ORIGIN", default_value_t = 0)]
     tx_events_origin: u8,
+    /// A test seam of the stack suite: a receipt (v1 loop) or a row (v2
+    /// loop) sets no first floor of a sender, so the first floor comes only
+    /// from a lookup. Only the `floor-seams` feature compiles this flag.
+    #[cfg(feature = "floor-seams")]
+    #[arg(long)]
+    first_floor_from_lookup: bool,
 }
 
 /// The values of `--tx-events`.
@@ -226,6 +232,10 @@ impl Args {
         cfg.cluster
             .set_egress_endpoint(self.cluster_egress_endpoint.as_deref());
         let resync = &mut cfg.resync;
+        #[cfg(feature = "floor-seams")]
+        {
+            resync.first_floor_from_lookup = self.first_floor_from_lookup;
+        }
         resync.dedup_capacity = self.cluster_dedup_capacity.unwrap_or(resync.dedup_capacity);
         resync.enter_percent = self.resync_enter_percent.unwrap_or(resync.enter_percent);
         resync.boundary_silence_ms = self

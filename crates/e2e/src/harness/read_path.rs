@@ -114,7 +114,7 @@ impl Redis {
         self.await_ping()
     }
 
-    fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         format!("redis://127.0.0.1:{}", self.port)
     }
 }
@@ -191,6 +191,11 @@ impl ReadPath {
         .spawn()
     }
 
+    /// The URL of the Redis of the read path.
+    pub(crate) fn redis_url(&self) -> String {
+        self.redis.url()
+    }
+
     fn metrics(&self) -> SocketAddr {
         self.mirror.metrics_addr
     }
@@ -218,6 +223,40 @@ impl LocalStack {
         };
         path.mirror.proc.kill();
         path.redis.kill()
+    }
+
+    /// SIGKILL Redis alone. The mirror keeps running.
+    ///
+    /// # Errors
+    /// Returns an error when the stack runs no read path, or when Docker
+    /// fails.
+    pub fn kill_redis(&self) -> Result<()> {
+        self.read_path
+            .as_ref()
+            .context("the stack runs no read path")?
+            .redis
+            .kill()
+    }
+
+    /// Start the killed Redis again. It returns empty.
+    ///
+    /// # Errors
+    /// Returns an error when the stack runs no read path, or when Redis
+    /// does not answer.
+    pub fn restart_redis(&self) -> Result<()> {
+        self.read_path
+            .as_ref()
+            .context("the stack runs no read path")?
+            .redis
+            .restart()
+    }
+
+    /// Whether the Redis of the read path answers PING.
+    #[must_use]
+    pub fn redis_alive(&self) -> bool {
+        self.read_path
+            .as_ref()
+            .is_some_and(|path| path.redis.ping())
     }
 
     /// Start Redis empty and the mirror again. The mirror rebuilds Redis

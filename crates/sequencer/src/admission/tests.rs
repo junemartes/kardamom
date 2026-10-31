@@ -443,3 +443,40 @@ fn the_filter_keeps_the_unconfirmed_run_until_a_state_confirms_it() {
     a.on_refused(sender(1), 7, &mut Vec::new());
     assert_eq!(payloads(&a), [] as [u64; 0]);
 }
+
+/// The floor seam: a row of a sender with no state sets nothing. The
+/// sender keeps its lookup, and a lookup answer sets the first state.
+#[cfg(feature = "floor-seams")]
+#[test]
+fn with_the_floor_seam_a_row_sets_no_first_state_and_only_a_lookup_does() {
+    let mut a = Admission::new(cfg(), Instant::now());
+    let mut out = Vec::new();
+    assert!(
+        a.waits_for_lookup(sender(1), &mut out),
+        "an unknown sender waits"
+    );
+    assert!(out.is_empty(), "a sender with no parked work asks nothing");
+    assert_eq!(offer(&mut a, tx(1, 3, 1)), ["L"]);
+    assert!(a.waits_for_lookup(sender(1), &mut out));
+    assert!(out.is_empty(), "one lookup is out");
+    a.on_lookup(sender(1), state(3, 10 * COST, 1), &mut out);
+    assert_eq!(names(&out), ["F3"]);
+    out.clear();
+    assert!(
+        !a.waits_for_lookup(sender(1), &mut out),
+        "a known sender takes its rows"
+    );
+}
+
+/// The floor seam after a rollback: the cleared sender waits for a lookup
+/// again, and its parked work asks one.
+#[cfg(feature = "floor-seams")]
+#[test]
+fn with_the_floor_seam_a_rollback_makes_the_sender_wait_for_a_lookup_again() {
+    let mut a = known(state(5, 10 * COST, 1));
+    assert_eq!(offer(&mut a, tx(1, 7, 1)), ["A7"]);
+    a.on_rollback();
+    let mut out = Vec::new();
+    assert!(a.waits_for_lookup(sender(1), &mut out));
+    assert_eq!(names(&out), ["L"]);
+}
