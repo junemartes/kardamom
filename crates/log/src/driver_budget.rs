@@ -59,6 +59,16 @@ impl DriverBudget {
         Self::from_driver_timeout_ms(ctx.get_driver_timeout_ms())
     }
 
+    /// How long a starting client waits for its media driver: the start
+    /// open limit, two budgets (30 s with the deployed 10 s driver
+    /// timeout). A node that returns starts its driver and its services as
+    /// separate tasks, and pulling and starting the driver image took 13 to
+    /// 24 s in the chaos cases. The wait covers that, and stays far below
+    /// the 150 s return bound of a node.
+    pub(crate) fn driver_wait(self) -> Duration {
+        self.start_open_limit()
+    }
+
     pub(crate) fn duration(self) -> Duration {
         self.0
     }

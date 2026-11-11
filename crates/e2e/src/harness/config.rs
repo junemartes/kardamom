@@ -95,6 +95,9 @@ pub struct StackConfig {
     /// transaction before the sealer, so the sequencers keep the v1 loop
     /// under `KARDAMOM_E2E_ADMISSION=1`.
     pub unpayable_spends: bool,
+    /// The sequencers run the v2 admission loop, as the deployed cluster
+    /// does, also without `KARDAMOM_E2E_ADMISSION=1`.
+    pub admission: bool,
     /// The scenario reads the local account layer of the ingress, which
     /// only the full receipt stream fills. The ingress keeps `tx_receipts`
     /// under `KARDAMOM_E2E_VERDICTS=1`.
@@ -102,6 +105,17 @@ pub struct StackConfig {
     /// The carry window rollout: the member feed, the egress, and the
     /// batcher. `None` runs none of them.
     pub carry: Option<CarryOptions>,
+    /// The read path: a Redis container and a state mirror next to the
+    /// executor, which writes checkpoints for the mirror's rebuild.
+    pub read_path: bool,
+    /// With `read_path`: every sequencer reads that Redis in its nonce
+    /// lookup before it asks the executor, as in the deployment.
+    pub sequencer_cache: bool,
+    /// Every sequencer runs with `--first-floor-from-lookup`: a sender
+    /// gets its first floor only from a lookup. The sequencer binary must
+    /// have the `floor-seams` feature.
+    #[cfg(feature = "floor-seams")]
+    pub first_floor_from_lookup: bool,
 }
 
 /// The parts of the stack that the carry window rollout needs.
@@ -191,6 +205,23 @@ impl StackConfig {
     pub fn carry_genesis(&self) -> bool {
         self.carry.is_some_and(|c| c.genesis)
     }
+
+    /// The options that every sequencer of the stack takes: the Redis of
+    /// `read_path` in its nonce lookup when the stack asks for it, and the
+    /// floor seam. The launch and a restart both start from these.
+    pub(crate) fn sequencer_options(
+        &self,
+        read_path: Option<&super::read_path::ReadPath>,
+    ) -> super::services::SequencerOptions {
+        super::services::SequencerOptions {
+            cache_url: read_path
+                .filter(|_| self.sequencer_cache)
+                .map(super::read_path::ReadPath::redis_url),
+            #[cfg(feature = "floor-seams")]
+            first_floor_from_lookup: self.first_floor_from_lookup,
+            ..super::services::SequencerOptions::default()
+        }
+    }
 }
 
 impl Default for StackConfig {
@@ -214,8 +245,13 @@ impl Default for StackConfig {
             canary_genesis: false,
             notifier: false,
             unpayable_spends: false,
+            admission: false,
             ingress_rows: false,
             carry: None,
+            read_path: false,
+            sequencer_cache: false,
+            #[cfg(feature = "floor-seams")]
+            first_floor_from_lookup: false,
         }
     }
 }

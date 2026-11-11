@@ -139,10 +139,16 @@ impl ColdAccounts {
     /// stale. Before the first receipt frame, this ingress knows no head
     /// to measure the lag against, for example after a restart on an idle
     /// chain, so every answer is stale.
+    ///
+    /// The head of the live layer is the index of the newest row, and
+    /// [`QueryAnswer::last_record`] puts the answer in the same
+    /// convention. So the difference is the count of records that the
+    /// snapshot is behind the rows.
     fn judge(&self, nonce: &QueryAnswer, balance: &QueryAnswer) -> Slot {
-        let tx_idx = nonce.tx_idx.min(balance.tx_idx);
+        let positioned = nonce.has_position() && balance.has_position();
+        let tx_idx = nonce.last_record().min(balance.last_record());
         let head = self.live.head();
-        let fresh = tx_idx > 0 && head > 0 && head.saturating_sub(tx_idx) <= self.max_stale;
+        let fresh = positioned && head > 0 && head.saturating_sub(tx_idx) <= self.max_stale;
         let (Ok(nonce), true) = (u64::try_from(nonce.value), fresh) else {
             cache_metrics::record_lookup("cold", "stale");
             return Slot::Unknown;
@@ -256,5 +262,26 @@ mod tests {
         assert!(matches!(cold.judge(&answer(0), &answer(0)), Slot::Unknown));
         assert!(matches!(cold.judge(&answer(1), &answer(5)), Slot::Unknown));
         assert!(matches!(cold.judge(&answer(5), &answer(5)), Slot::Known(_)));
+    }
+
+    /// The lag counts records in the convention of the rows. The head is
+    /// the newest row, record 10. An answer whose snapshot holds 2 records
+    /// ends at record 1, 9 records behind: past `max_stale` 8. One that
+    /// holds 3 records ends at record 2, 8 behind, and its view is at
+    /// record 2.
+    #[test]
+    fn the_lag_counts_records_in_the_convention_of_the_rows() {
+        let (cold, mut writer) = with_writer();
+        let answer = |tx_idx| QueryAnswer {
+            value: U256::ZERO,
+            block: 0,
+            tx_idx,
+        };
+        writer.apply(kardamom_types::BPosition::from_index(10), &[]);
+        assert!(matches!(cold.judge(&answer(2), &answer(2)), Slot::Unknown));
+        let Slot::Known(view) = cold.judge(&answer(3), &answer(3)) else {
+            panic!("8 records behind is within max_stale");
+        };
+        assert_eq!(view.tx_idx, 2);
     }
 }

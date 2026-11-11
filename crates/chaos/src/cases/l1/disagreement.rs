@@ -62,8 +62,14 @@ pub(crate) async fn follower_disagreement(h: &mut Harness) -> anyhow::Result<()>
         .inner_container(&node, TASK)
         .await
         .ok_or_else(|| crate::chaos_fail!("{ctx}: no follower instance runs on {node}"))?;
-    let faults0 = h.probes.val_metric(EPOCH_FAULTS).await.unwrap_or(0);
-    let verified0 = h.probes.val_metric(EPOCHS_VERIFIED).await.unwrap_or(0);
+    let faults0 = h
+        .probes
+        .val_metric_required(EPOCH_FAULTS, "the epoch fault baseline")
+        .await?;
+    let verified0 = h
+        .probes
+        .val_metric_required(EPOCHS_VERIFIED, "the verified epoch baseline")
+        .await?;
     h.freeze_verified(
         &node,
         &inner,
@@ -196,7 +202,10 @@ async fn assert_validator_clean(
     verified0: i64,
     ctx: &str,
 ) -> anyhow::Result<()> {
-    let faults = h.probes.val_metric(EPOCH_FAULTS).await.unwrap_or(0);
+    let faults = h
+        .probes
+        .val_metric_required(EPOCH_FAULTS, "the epoch fault verdict")
+        .await?;
     anyhow::ensure!(
         faults == faults0,
         "{}: {ctx}: the validator counted {} epoch fault(s): a lie reached the chain",

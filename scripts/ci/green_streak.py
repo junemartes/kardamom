@@ -17,8 +17,12 @@ WORKFLOWS = {
     "chain-semantics-e2e.yml", "cluster-validate.yml",
 }
 REQUIRED = 10
+# The budget of a job: a PR job and a nightly cluster-e2e shard get 15
+# minutes. The carry shard runs a live carry activation and gets 20.
 JOB_BUDGET_SECONDS = 15 * 60
-COMPONENT_JOB_SECONDS = 5 * 60
+COMPONENT_JOB_SECONDS = 10 * 60
+CARRY_JOB_SECONDS = 20 * 60
+CARRY_JOB = "container cluster e2e (chaos-carry)"
 
 
 class GitHub:
@@ -58,9 +62,11 @@ class Streak:
             "required": REQUIRED, "streak": 0, "rounds": [],
             "job_budget_seconds": JOB_BUDGET_SECONDS,
             "component_job_seconds": COMPONENT_JOB_SECONDS,
+            "carry_job_seconds": CARRY_JOB_SECONDS,
         }
         if (self.state.get("job_budget_seconds") != JOB_BUDGET_SECONDS
-                or self.state.get("component_job_seconds") != COMPONENT_JOB_SECONDS):
+                or self.state.get("component_job_seconds") != COMPONENT_JOB_SECONDS
+                or self.state.get("carry_job_seconds") != CARRY_JOB_SECONDS):
             raise ValueError("timing policy changed; retain the old audit and start a new state file")
         if self.state["head"] != head or self.state["branch"] != branch:
             raise ValueError("head or branch changed; retain this audit and start a new state file")
@@ -116,18 +122,27 @@ class Streak:
                 if start.tzinfo is None or end.tzinfo is None or end < start:
                     raise ValueError("job timing needs ordered timestamps with time zones")
                 seconds = (end - start).total_seconds()
-                budget = COMPONENT_JOB_SECONDS if job["name"].startswith("in-process recovery (") else JOB_BUDGET_SECONDS
+                budget = Streak.budget(job["name"])
                 if seconds > budget:
                     slow.append({"workflow": run["path"], "job": job["name"], "seconds": seconds,
                                  "budget_seconds": budget})
         return slow
+
+    @staticmethod
+    def budget(name):
+        """The budget in seconds of the job `name`."""
+        if name.startswith("component recovery ("):
+            return COMPONENT_JOB_SECONDS
+        if name == CARRY_JOB:
+            return CARRY_JOB_SECONDS
+        return JOB_BUDGET_SECONDS
 
     def missing_coverage(self, runs):
         cluster = next(run for run in runs if Path(run["path"]).name == "cluster-e2e.yml")
         green = {job["name"] for job in cluster["jobs"] if job["conclusion"] == "success"}
         expected = {f"container cluster e2e ({shard})" for shard in self.shards}
         ci = next(run for run in runs if Path(run["path"]).name == "ci.yml")
-        components = {f"in-process recovery ({shard})" for shard in range(COMPONENT_SHARDS)}
+        components = {f"component recovery ({shard})" for shard in range(COMPONENT_SHARDS)}
         completed = {job["name"] for job in ci["jobs"] if job["conclusion"] == "success"}
         return sorted((expected - green) | (components - completed))
 
@@ -153,6 +168,7 @@ class Streak:
             ) else [],
             "job_budget_seconds": JOB_BUDGET_SECONDS,
             "component_job_seconds": COMPONENT_JOB_SECONDS,
+            "carry_job_seconds": CARRY_JOB_SECONDS,
         }
         rounds = sorted(previous + [row], key=lambda item: item["started_at"])
         self.validate_order(rounds)

@@ -167,7 +167,11 @@ impl LocalStack {
         let mut respawned = services::spawn_ingress_at(
             &self.service_spec(),
             &self.cfg.ingress,
-            Some(port),
+            &services::IngressSlot {
+                rpc_port: Some(port),
+                log_name: "ingress-restarted".to_string(),
+                ..services::IngressSlot::first()
+            },
             shard_map,
         )?;
         respawned

@@ -189,33 +189,64 @@ fn redirect_repoints_and_reconnects() {
     assert_ne!(corr2, corr);
 }
 
-#[test]
-fn new_leader_event_updates_term_keeps_session() {
-    let (mut d, corr) = connecting();
-    d.on_egress(&ok_event(corr, 5, 9, 0));
-    let nl = encode_new_leader_event(&NewLeaderEvent {
-        leadership_term_id: 10,
-        cluster_session_id: 5,
-        leader_member_id: 2,
+fn new_leader(term: i64, session: i64, leader: i32) -> Vec<u8> {
+    encode_new_leader_event(&NewLeaderEvent {
+        leadership_term_id: term,
+        cluster_session_id: session,
+        leader_member_id: leader,
         ingress_endpoints: "0=h0:9,1=h1:9,2=h2:9".into(),
-    });
-    let evs = d.on_egress(&nl);
+    })
+}
+
+fn reconnect(leader: i32) -> DriverEvent {
+    DriverEvent::Reconnect {
+        leader_member_id: leader,
+        ingress_endpoints: "0=h0:9,1=h1:9,2=h2:9".into(),
+    }
+}
+
+/// A member that led before wins a later term and sends no OK, only the
+/// new-leader event. The driver re-points the ingress and emits
+/// `Connected`, so the transport requests a replay from the new leader.
+#[test]
+fn new_leader_event_with_no_ok_in_its_term_keeps_session_and_connects() {
+    let (mut d, corr) = connecting();
+    d.on_egress(&ok_event(corr, 5, 1, 0));
+    let evs = d.on_egress(&new_leader(2, 5, 2));
     assert_eq!(
         evs,
-        vec![DriverEvent::Reconnect {
-            leader_member_id: 2,
-            ingress_endpoints: "0=h0:9,1=h1:9,2=h2:9".into()
-        }]
+        vec![
+            reconnect(2),
+            DriverEvent::Connected {
+                cluster_session_id: 5
+            }
+        ]
     );
     // Still connected, with the same session, and now offers under the new term.
     assert!(d.is_connected());
     let framed = d.wrap_app(b"y", 0).unwrap();
     match decode_egress(&framed).unwrap() {
-        Egress::SessionMessage(m) => assert_eq!(m.leadership_term_id, 10),
+        Egress::SessionMessage(m) => assert_eq!(m.leadership_term_id, 2),
         other => panic!("expected SessionMessage, got {other:?}"),
     }
     // No reconnect is queued. The session is preserved across the term.
     assert!(d.poll_outbound(1).is_empty());
+}
+
+/// A follower that becomes leader sends an OK for the session, then the
+/// new-leader event of the same term. The OK emitted `Connected`, so the
+/// new-leader event only re-points the ingress.
+#[test]
+fn new_leader_event_after_the_ok_of_its_term_only_repoints() {
+    let (mut d, corr) = connecting();
+    d.on_egress(&ok_event(corr, 5, 1, 0));
+    assert_eq!(
+        d.on_egress(&ok_event(corr, 5, 3, 2)),
+        vec![DriverEvent::Connected {
+            cluster_session_id: 5
+        }]
+    );
+    assert_eq!(d.on_egress(&new_leader(3, 5, 2)), vec![reconnect(2)]);
 }
 
 #[test]

@@ -3,7 +3,6 @@ package io.kardamom.sealer.cluster;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.client.EgressListener;
 import io.aeron.driver.MediaDriver;
-import io.aeron.driver.ThreadingMode;
 import io.aeron.logbuffer.Header;
 import io.kardamom.sealer.CanonicalSealerState;
 import java.nio.ByteOrder;
@@ -45,14 +44,13 @@ final class CanonicalConsumer implements EgressListener, AutoCloseable {
     /** True from a new session until the answer to its replay request. */
     private boolean catchingUp;
     private volatile int sessions;
+    /** A replay request waits for the poll loop: the egress callback never offers. */
+    private boolean requestDue;
+    private long requestedAtNs;
 
-    CanonicalConsumer(final Path aeronDir, final Supplier<String> endpoints) {
-        this.endpoints = endpoints;
-        this.driver = MediaDriver.launch(new MediaDriver.Context()
-            .aeronDirectoryName(aeronDir.toString())
-            .threadingMode(ThreadingMode.SHARED)
-            .dirDeleteOnStart(true)
-            .dirDeleteOnShutdown(true));
+    CanonicalConsumer(final Path aeronDir, final LocalSealers group) {
+        this.endpoints = group::ingressEndpoints;
+        this.driver = group.clientDriver(aeronDir);
         thread.setDaemon(true);
         thread.start();
     }
@@ -89,6 +87,30 @@ final class CanonicalConsumer implements EgressListener, AutoCloseable {
         }
         if (session != null) {
             session.pollEgress();
+            sendDueRequest();
+        }
+    }
+
+    /**
+     * Send the replay request that is due, outside the egress callback. A
+     * request with no answer within {@link #CONNECT_TIMEOUT_NS} is due again:
+     * an offer that the ingress refused, or a request lost in a leader change,
+     * must not leave the consumer waiting forever.
+     */
+    private void sendDueRequest() {
+        final long now = System.nanoTime();
+        if (catchingUp && !requestDue && now - requestedAtNs > CONNECT_TIMEOUT_NS) {
+            requestDue = true;
+        }
+        if (!requestDue) {
+            return;
+        }
+        final byte[] request = IngressFrames.replayRequestFrame(nextIndex, nextBlock);
+        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer(request.length);
+        buf.putBytes(0, request);
+        if (session.offer(buf, 0, request.length) > 0) {
+            requestDue = false;
+            requestedAtNs = now;
         }
     }
 
@@ -132,16 +154,10 @@ final class CanonicalConsumer implements EgressListener, AutoCloseable {
         requestReplay();
     }
 
-    /** Ask the session for the stream from the cursor; frames that are not next wait for the answer. */
+    /** Ask for the stream from the cursor at the next poll; frames that are not next wait for the answer. */
     private void requestReplay() {
         catchingUp = true;
-        final byte[] request = IngressFrames.replayRequestFrame(nextIndex, nextBlock);
-        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer(request.length);
-        buf.putBytes(0, request);
-        final long deadline = System.nanoTime() + CONNECT_TIMEOUT_NS;
-        while (session.offer(buf, 0, request.length) < 0 && System.nanoTime() - deadline < 0) {
-            session.pollEgress();
-        }
+        requestDue = true;
     }
 
     @Override

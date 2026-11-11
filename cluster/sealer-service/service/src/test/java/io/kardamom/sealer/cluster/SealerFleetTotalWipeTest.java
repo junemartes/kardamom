@@ -47,7 +47,7 @@ class SealerFleetTotalWipeTest {
     @InterruptAfter(value = 60, unit = TimeUnit.SECONDS)
     void a_wiped_fleet_restarts_after_the_posted_head_from_a_seed() {
         try (LocalSealers group = new LocalSealers(dir, 3, LocalSealers.Settings.DEFAULT);
-             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints)) {
+             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
             group.awaitLeader(Duration.ofSeconds(20));
             IntStream.range(0, 5).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));
@@ -90,8 +90,8 @@ class SealerFleetTotalWipeTest {
                 "member " + n.id + " started from the seed after the seed property was cleared"));
             Stage.log("fleet-wipe: restored");
 
-            try (CanonicalClient stale = new CanonicalClient(dir.resolve("stale"), group::ingressEndpoints);
-                 CanonicalClient fresh = new CanonicalClient(dir.resolve("fresh"), group::ingressEndpoints)) {
+            try (CanonicalClient stale = new CanonicalClient(dir.resolve("stale"), group);
+                 CanonicalClient fresh = new CanonicalClient(dir.resolve("fresh"), group)) {
                 stale.offer(IngressFrames.replayRequestFrame(oldEnd, h + 2), Duration.ofSeconds(20));
                 stale.pollUntil(Duration.ofSeconds(10), "REPLAY_AHEAD for a cursor of the old chain",
                     () -> stale.egress().replayAheadCount > 0);

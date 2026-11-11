@@ -31,6 +31,7 @@ pub mod codec;
 pub mod config;
 pub mod discovery;
 mod driver_budget;
+mod driver_wait;
 pub mod error;
 mod fail_fast;
 mod ffi;
