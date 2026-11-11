@@ -4,15 +4,13 @@
 
 #[path = "sentinel_recovery/starved.rs"]
 mod starved;
-#[path = "sentinel_recovery/support.rs"]
-mod support;
 
 use std::num::NonZeroU32;
 use std::time::Duration;
 
+use kardamom_cache::testing::sentinel::{Fault, Fixture};
 use kardamom_cache::{CacheConfig, CacheReader, LiveAccounts, LiveAccountsConfig};
 use starved::{Churn, SentinelName, Stalls};
-use support::{Fault, Fixture};
 
 #[tokio::test]
 #[ignore = "requires Linux Docker bridge routing and five disposable containers"]
@@ -24,51 +22,6 @@ async fn a_frozen_primary_promotes_a_replica_and_the_same_cache_client_recovers(
 #[ignore = "requires Linux Docker bridge routing and five disposable containers"]
 async fn a_killed_primary_promotes_a_replica_and_the_same_cache_client_recovers() {
     Fixture::new().await.recover_after(Fault::Kill).await;
-}
-
-impl Fixture {
-    async fn recover_after(&self, fault: Fault) {
-        self.fault(fault).await;
-        assert!(
-            self.cache.account(Fixture::row(1).address).await.is_err(),
-            "the cache output must actually fail before promotion"
-        );
-        Fixture::role(&self.replica, "master").await;
-        let mut promoted = Fixture::raw(&self.replica, 6379).await;
-        redis::cmd("SCRIPT")
-            .arg("FLUSH")
-            .query_async::<()>(&mut promoted)
-            .await
-            .unwrap();
-        let hash = redis::Script::new(kardamom_cache::script::APPLY_ROW)
-            .get_hash()
-            .to_owned();
-        let absent: Vec<bool> = redis::cmd("SCRIPT")
-            .arg("EXISTS")
-            .arg(&hash)
-            .query_async(&mut promoted)
-            .await
-            .unwrap();
-        assert_eq!(absent, [false]);
-        self.write(3, 30).await;
-        self.assert_row(3, 30).await;
-        let loaded: Vec<bool> = redis::cmd("SCRIPT")
-            .arg("EXISTS")
-            .arg(&hash)
-            .query_async(&mut promoted)
-            .await
-            .unwrap();
-        assert_eq!(
-            loaded,
-            [true],
-            "the promoted primary must receive the real script"
-        );
-
-        self.restore(fault).await;
-        Fixture::role(&self.primary, "slave").await;
-        self.write(2, 20).await;
-        self.assert_row(3, 30).await;
-    }
 }
 
 #[tokio::test]

@@ -32,6 +32,8 @@ pub(super) struct Fixture {
     /// Whether the mirror logs in as the ACL user `mirror`, which only
     /// the single Redis of the fixture defines.
     mirror_user: bool,
+    /// The number of mirrors whose heads a starting mirror reads.
+    mirrors: u32,
 }
 
 impl Fixture {
@@ -67,6 +69,7 @@ impl Fixture {
             cfg,
             root: tempfile::tempdir().unwrap(),
             mirror_user: redis.is_some(),
+            mirrors: 2,
             _redis: redis,
         };
         fixture.checkpoint();
@@ -133,6 +136,12 @@ impl Fixture {
         .unwrap();
         live.close().await.unwrap();
         fixture
+    }
+
+    /// Read the heads of `mirrors` mirrors at each start.
+    pub(super) fn with_mirrors(mut self, mirrors: u32) -> Self {
+        self.mirrors = mirrors;
+        self
     }
 
     pub(super) fn head_file(&self, id: u32) -> HeadFile {
@@ -306,6 +315,20 @@ impl Fixture {
     }
 
     pub(super) async fn start(&self, id: u32, force: bool) -> Actor {
+        let cache = AccountCache::connect(&self.mirror_cfg()).await.unwrap();
+        self.actor(id, force, cache)
+    }
+
+    /// Start mirror `id` as the mirror process does: it waits until Redis
+    /// names a primary, so it can start before Redis returns.
+    pub(super) async fn start_waiting(&self, id: u32) -> Actor {
+        let cache = AccountCache::connect_waiting(&self.mirror_cfg(), Duration::from_millis(200))
+            .await
+            .unwrap();
+        self.actor(id, false, cache)
+    }
+
+    fn mirror_cfg(&self) -> CacheConfig {
         let mut cfg = self.cfg.clone();
         if self.mirror_user {
             cfg.username = Some("mirror".into());
@@ -313,14 +336,17 @@ impl Fixture {
                 .url
                 .map(|url| url.replacen("redis://", "redis://mirror:component-test@", 1));
         }
-        let cache = AccountCache::connect(&cfg).await.unwrap();
+        cfg
+    }
+
+    fn actor(&self, id: u32, force: bool, cache: AccountCache) -> Actor {
         let (input, rx) = unbounded_channel();
         let shutdown = CancellationToken::new();
         let mirror = Mirror::new(MirrorInputs {
             cache,
             receipts: TxReceiptsReceiver::from_test_frames(rx),
             id,
-            head_count: 2,
+            head_count: self.mirrors,
             head: self.head_file(id),
             rebuild: Rebuild::new(
                 self.root.path().join("checkpoints"),

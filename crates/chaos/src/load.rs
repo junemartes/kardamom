@@ -16,8 +16,6 @@ use kardamom_bench::load::{
 };
 use serde::Deserialize;
 
-use crate::poll::{self, Budget};
-
 /// The burn address of every load transfer.
 pub const SINK: Address = address!("000000000000000000000000000000000000dEaD");
 
@@ -40,11 +38,44 @@ pub struct Verdict {
     pub accepted: u64,
     #[serde(default)]
     pub seq_dropped: Option<i64>,
+    /// The receipt latency of the run, from the top of the report.
+    #[serde(skip)]
+    pub latency: Latency,
+}
+
+/// The receipt latency percentiles of one run, in microseconds. A
+/// blocking submit parks at the ingress until its receipt, so this is
+/// also the time each submit held its in-flight slot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct Latency {
+    #[serde(default)]
+    pub lat_p50_us: u64,
+    #[serde(default)]
+    pub lat_p95_us: u64,
+    #[serde(default)]
+    pub lat_p99_us: u64,
+    #[serde(default)]
+    pub lat_max_us: u64,
+}
+
+impl std::fmt::Display for Latency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "receipt latency p50={}ms p95={}ms p99={}ms max={}ms",
+            self.lat_p50_us / 1000,
+            self.lat_p95_us / 1000,
+            self.lat_p99_us / 1000,
+            self.lat_max_us / 1000
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct Report {
     verdict: Verdict,
+    #[serde(flatten)]
+    latency: Latency,
 }
 
 /// The inputs of one case's load.
@@ -67,6 +98,10 @@ pub struct LoadSpec {
     pub fixed_rate: bool,
     pub duration: Duration,
     pub tps: NonZeroU32,
+    /// The most blocking submits in flight at once. Each one holds its
+    /// slot until its receipt, so the rate the load reaches is at most
+    /// this count over the receipt latency.
+    pub max_in_flight: NonZeroU32,
     pub retry_submit: u32,
     /// How long one submit waits out the refusals of a paused ingress,
     /// from the first one. Zero turns the wait off.
@@ -98,7 +133,7 @@ impl LoadSpec {
             to: SINK,
             value: U256::from(1),
             gas_price: 1_000_000_000,
-            max_in_flight: NonZeroU32::new(256).context("max in flight")?,
+            max_in_flight: self.max_in_flight,
             max_gap: self.max_gap,
             drain_timeout: self.drain_timeout,
             retry_submit: self.retry_submit,
@@ -170,35 +205,6 @@ impl LoadRun {
             .is_some_and(Progress::is_flowing)
     }
 
-    pub(crate) fn accepted(&self) -> u64 {
-        self.ready.borrow().as_ref().map_or(0, Progress::accepted)
-    }
-
-    pub(crate) async fn await_accepted_after(
-        &self,
-        case: &str,
-        before: u64,
-        budget: Duration,
-    ) -> anyhow::Result<()> {
-        let outcome = poll::until(
-            Budget::new(budget, Duration::from_secs(1)),
-            |_| async move {
-                self.assert_submitting(case)?;
-                let accepted = self.accepted();
-                Ok::<_, anyhow::Error>((accepted > before).then_some(accepted))
-            },
-        )
-        .await?;
-        let (accepted, elapsed) = outcome.or_fail(|_| crate::chaos_fail!(
-            "{case}: the case's own load accepts no transaction after recovery (accepted {before}, budget {}s)", budget.as_secs()
-        ))?;
-        crate::log(format!(
-            "{case}: case-owned accepted traffic {before} -> {accepted} after {}s of recovery observation",
-            elapsed.as_secs()
-        ));
-        Ok(())
-    }
-
     pub(crate) fn assert_submitting(&self, case: &str) -> anyhow::Result<()> {
         let submitting = self
             .ready
@@ -214,9 +220,15 @@ impl LoadRun {
     }
 
     pub(crate) fn finish_submissions(&self) {
-        if let Some(progress) = self.ready.borrow().as_ref() {
+        if let Some(progress) = self.progress() {
             progress.finish_submissions();
         }
+    }
+
+    /// The observer of the signed run, once the load is ready. A case
+    /// body ends the submissions through it.
+    pub(crate) fn progress(&self) -> Option<Progress> {
+        self.ready.borrow().clone()
     }
 
     /// Whether the load task has already ended, which before the window
@@ -252,13 +264,10 @@ impl LoadRun {
             outcome == report.verdict.pass,
             "load return and report verdict disagree"
         );
-        Ok(report.verdict)
-    }
-
-    /// Abort the load, for cleanup after a failed case.
-    pub fn abort(&self) {
-        self.save_incomplete(None);
-        self.task.abort();
+        Ok(Verdict {
+            latency: report.latency,
+            ..report.verdict
+        })
     }
 
     fn save_incomplete(&self, failure: Option<&anyhow::Error>) {
@@ -282,19 +291,36 @@ impl LoadRun {
     }
 }
 
+/// A run that ends before its verdict, on a failed case or a case past
+/// its deadline, stops its load and keeps the evidence of how far it got.
+impl Drop for LoadRun {
+    fn drop(&mut self) {
+        if !self.task.is_finished() {
+            self.save_incomplete(None);
+            self.task.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn the_report_verdict_decodes() {
-        let text = r#"{"mode":"chaos","verdict":{"pass":false,"failures":["x"],"offered":10,
+        let text = r#"{"mode":"chaos","lat_p50_us":19841000,"lat_p95_us":29442000,
+            "lat_p99_us":29540000,"lat_max_us":29655000,
+            "verdict":{"pass":false,"failures":["x"],"offered":10,
             "accepted":10,"receipted":9,"missing":1,"unlanded":0,"bad_status":0,
             "inferred_ingress_drop":null,"seq_dropped":2,"keep_pace":[]}}"#;
         let report: Report = serde_json::from_str(text).unwrap();
         assert!(!report.verdict.pass);
         assert_eq!(report.verdict.missing, 1);
         assert_eq!(report.verdict.seq_dropped, Some(2));
+        assert_eq!(
+            report.latency.to_string(),
+            "receipt latency p50=19841ms p95=29442ms p99=29540ms max=29655ms"
+        );
     }
 
     /// A run whose load task is `task`, for the finish checks.

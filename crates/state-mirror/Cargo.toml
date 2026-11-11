@@ -38,3 +38,5 @@ alloy-primitives = { workspace = true }
 tempfile = { workspace = true }
 redis = { workspace = true }
 testcontainers = { workspace = true }
+# The read-path test reads the reader and mirror counters.
+metrics-exporter-prometheus = { workspace = true }

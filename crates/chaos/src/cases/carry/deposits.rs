@@ -7,6 +7,7 @@ use anyhow::Context;
 use kardamom_l1_fault_proxy::Fault;
 use serde::Serialize;
 
+use super::Run;
 use crate::cases::l1::{Followers, await_followers_halted, await_resume};
 use crate::harness::Harness;
 use crate::l1::{Deposit, L1};
@@ -199,14 +200,16 @@ impl Record {
     }
 }
 
-pub(super) async fn across_provider_fault(
-    h: &mut Harness,
-    context: &'static str,
-) -> anyhow::Result<()> {
-    let l1 = L1::new(h).await?;
-    let mut deposits = Deposits::new(h).await?;
-    let result = deposits.phases(h, &l1).await;
-    let report = deposits.report(context, &result);
-    result?;
-    report
+impl Run<'_> {
+    /// Three native deposits, before, during and after a provider
+    /// outage of every L1 source. The report of the deposits is written
+    /// on both outcomes.
+    pub(super) async fn deposits(&mut self) -> anyhow::Result<()> {
+        let l1 = L1::new(self.h).await?;
+        let mut deposits = Deposits::new(self.h).await?;
+        let result = deposits.phases(self.h, &l1).await;
+        let report = deposits.report(self.ctx, &result);
+        result?;
+        report
+    }
 }

@@ -16,7 +16,15 @@ use network::{Action, Check, NodeView, Step};
 mod tests;
 
 const CTX: &str = "control-plane-loss-recover";
-const HOLD: Duration = Duration::from_secs(75);
+/// The Nomad heartbeat grace of the local profile, in seconds.
+const HEARTBEAT_GRACE_S: u64 = 60;
+/// How long the metadata stays isolated: past the Nomad heartbeat grace,
+/// so the servers mark the isolated clients down, with a margin for the
+/// heartbeat TTL.
+const HOLD: Duration = Duration::from_secs(HEARTBEAT_GRACE_S + 15);
+/// The client transfers during the hold: at its start, in its middle,
+/// and at its end.
+const CLIENT_STEPS: [u64; 3] = [0, 40, HOLD.as_secs()];
 const CLIENT_BOUND: Duration = Duration::from_secs(30);
 
 struct ControlPlane {
@@ -95,11 +103,10 @@ impl ControlPlane {
     }
 
     async fn isolated(&mut self, h: &Harness) -> anyhow::Result<()> {
-        self.views = self.all(Action::Observe).await?;
-        self.all(Action::Arm).await?;
+        self.views = self.all(Action::ObserveAndArm).await?;
         self.since = Some(Instant::now());
         self.all(Action::Isolated).await?;
-        for offset in [0, 40, HOLD.as_secs()] {
+        for offset in CLIENT_STEPS {
             self.client_step(h, Duration::from_secs(offset)).await?;
         }
         self.all(Action::Unchanged).await?;

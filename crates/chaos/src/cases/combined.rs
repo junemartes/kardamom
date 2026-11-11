@@ -29,9 +29,10 @@ pub(crate) use expect::Expect;
 #[cfg(test)]
 use expect::Progress;
 
-/// How long every class stays down before the first one returns. The
-/// expectation while down is checked inside it.
-const HOLD: Duration = Duration::from_secs(60);
+/// How long every class stays down before the first one returns: past
+/// the 30 s Aeron stall tolerance, so every peer of a dead class times
+/// its session out. The expectation while down is checked inside it.
+const HOLD: Duration = Duration::from_secs(35);
 /// The task of each sequencer lane on a sequencer node.
 const LANES: [&str; 2] = ["sequencer-0", "sequencer-1"];
 
@@ -229,14 +230,14 @@ impl Class {
         })
     }
 
-    /// No task of the job failed since its return, other than by a
+    /// No task of the job restarted since its return, other than by a
     /// designed recovery exit: the class waited for what it needs. A
-    /// crash loop shows as a failed exit in the task events, also when
-    /// the class got what it needs since, so the proof holds after the
-    /// pause and again at the end.
+    /// crash loop shows in the restart count and the task events, also
+    /// when the class got what it needs since, so the proof holds after
+    /// the pause and again at the end.
     async fn assert_no_restart(self, h: &Harness, ctx: &str) -> anyhow::Result<()> {
         let allocs = h.nomad.running(self.job()).await?;
-        let failed = h.nomad.unexplained_exits(&allocs).await?;
+        let failed = h.nomad.unexplained_restarts(&allocs).await?;
         anyhow::ensure!(
             allocs.len() == self.count() && failed.is_empty(),
             "{}: {ctx}: the {} job did not wait for the classes it needs: {} of {} running, {}",
@@ -248,7 +249,7 @@ impl Class {
         );
         let restarts: Vec<String> = allocs.iter().filter_map(Alloc::restart_note).collect();
         crate::log(format!(
-            "{ctx}: every {} allocation runs with no failed exit outside a designed recovery; restarts: [{}]",
+            "{ctx}: every {} allocation runs with no restart outside a designed recovery; restarts: [{}]",
             self.job(),
             restarts.join(", ")
         ));
@@ -412,17 +413,17 @@ pub(crate) const INGRESS_SEQUENCER: Combined = Combined {
     case: Case::IngressSequencerLossRecover,
     down: &[Class::Ingress, Class::Sequencer],
     expect: Expect::SealOnly,
-    recovery: Recovery::Ordered(Duration::from_secs(30)),
+    recovery: Recovery::Ordered(Duration::from_secs(15)),
     checks: &[Check::NoOriginGap, Check::NoRefBelowFloor],
 };
 
-/// The ingresses and the sealers die. The ingresses return a minute
-/// before the sealers, and must wait for them.
+/// The ingresses and the sealers die. The ingresses return 35 s before
+/// the sealers, past the Aeron stall tolerance, and must wait for them.
 pub(crate) const INGRESS_SEALER: Combined = Combined {
     case: Case::IngressSealerLossRecover,
     down: &[Class::Ingress, Class::Sealer],
     expect: Expect::Stall,
-    recovery: Recovery::Reverse(Duration::from_secs(60)),
+    recovery: Recovery::Reverse(Duration::from_secs(35)),
     checks: &[Check::OneLeaderPerTerm],
 };
 
@@ -440,72 +441,74 @@ pub(crate) const SEQUENCER_SEALER: Combined = Combined {
     ],
 };
 
-/// All three classes die. They return in dependency order, thirty
+/// All three classes die. They return in dependency order, fifteen
 /// seconds apart.
 pub(crate) const ALL_THREE: Combined = Combined {
     case: Case::IngressSequencerSealerLossRecover,
     down: &[Class::Ingress, Class::Sequencer, Class::Sealer],
     expect: Expect::Stall,
-    recovery: Recovery::Ordered(Duration::from_secs(30)),
+    recovery: Recovery::Ordered(Duration::from_secs(15)),
     checks: &[Check::OneLeaderPerTerm, Check::NoOriginGap],
 };
 
 /// All three classes die. They return against the dependency order,
-/// forty-five seconds apart: each one waits for the next.
+/// 35 s apart, past the Aeron stall tolerance: each one waits for the
+/// next.
 pub(crate) const ALL_THREE_REVERSE: Combined = Combined {
     case: Case::IngressSequencerSealerReverse,
     down: &[Class::Ingress, Class::Sequencer, Class::Sealer],
     expect: Expect::Stall,
-    recovery: Recovery::Reverse(Duration::from_secs(45)),
+    recovery: Recovery::Reverse(Duration::from_secs(35)),
     checks: &[Check::OneLeaderPerTerm, Check::NoOriginGap],
 };
 
-/// The executor nodes and the sealer nodes die. The executors return a
-/// minute before the sealers, and must wait for them. With the executors
+/// The executor nodes and the sealer nodes die. The executors return
+/// 35 s before the sealers, past the Aeron stall tolerance, and must wait
+/// for them. With the executors
 /// on the sealer nodes, the executor tasks and the member tasks die
 /// instead, and return in the same order.
 pub(crate) const EXECUTOR_SEALER: Combined = Combined {
     case: Case::ExecutorSealerLossRecover,
     down: &[Class::ExecutorNodes, Class::Sealer],
     expect: Expect::Stall,
-    recovery: Recovery::Reverse(Duration::from_secs(60)),
+    recovery: Recovery::Reverse(Duration::from_secs(35)),
     checks: &[Check::OneLeaderPerTerm],
 };
 
 /// The executors, the sealers and the validator die. They return in
-/// dependency order, thirty seconds apart: the sealers, the executors,
+/// dependency order, fifteen seconds apart: the sealers, the executors,
 /// then the validator.
 pub(crate) const EXECUTOR_SEALER_VALIDATOR: Combined = Combined {
     case: Case::ExecutorSealerValidatorRecover,
     down: &[Class::Executor, Class::Sealer, Class::Validator],
     expect: Expect::Stall,
-    recovery: Recovery::Ordered(Duration::from_secs(30)),
+    recovery: Recovery::Ordered(Duration::from_secs(15)),
     checks: &[Check::OneLeaderPerTerm],
 };
 
 /// The ingresses and the executor nodes die. The sealers order the
 /// transactions in flight. The executors return first and publish the
 /// receipts of their replay while no ingress listens; the ingresses
-/// return a minute later and must serve those receipts from the state
+/// return 40 s later and must serve those receipts from the state
 /// of an executor. With the executors on the sealer nodes, the executor
 /// tasks die instead of the nodes.
 pub(crate) const INGRESS_EXECUTOR: Combined = Combined {
     case: Case::IngressExecutorLossRecover,
     down: &[Class::ExecutorNodes, Class::Ingress],
     expect: Expect::SealOnly,
-    recovery: Recovery::Ordered(Duration::from_secs(60)),
+    recovery: Recovery::Ordered(Duration::from_secs(40)),
     checks: &[Check::ReceiptFromState],
 };
 
 /// The whole read path dies: the executors, Redis and the state mirrors.
-/// Redis returns empty, the mirrors return and wait for a checkpoint,
-/// and the executors return last. Every mirror must rebuild, and the
-/// readers must use Redis again.
+/// Redis returns empty, the mirrors return and wait 20 s for a
+/// checkpoint, and the executors return last. Every mirror must
+/// rebuild, and the readers must use Redis again.
 pub(crate) const READ_PATH: Combined = Combined {
     case: Case::ReadPathLossRecover,
     down: &[Class::Executor, Class::Redis, Class::StateMirror],
     expect: Expect::SealOnly,
-    recovery: Recovery::Reverse(Duration::from_secs(30)),
+    recovery: Recovery::Reverse(Duration::from_secs(20)),
     checks: &[Check::EveryMirrorRebuilt, Check::ReadersRecovered],
 };
 
@@ -627,11 +630,10 @@ impl Combined {
             class.assert_no_restart(h, ctx).await?;
         }
         if placed.sealers_down() {
-            let elected = h.evidence.cluster_elected(FULL_RESTART_ELECTION).await?;
-            crate::log(format!(
-                "{ctx}: members elected memberId={} (term {} closed on a majority)",
-                elected.leader, elected.term
-            ));
+            h.evidence
+                .cluster_elected(FULL_RESTART_ELECTION)
+                .await?
+                .log(ctx);
         }
         h.assert_ingress_pair_live(ctx).await?;
         if placed.executors_down() {

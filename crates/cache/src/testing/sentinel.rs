@@ -1,7 +1,19 @@
+//! A real Sentinel group for the Docker-gated tests of this crate and of
+//! its users: a primary, a replica and three Sentinels on one Docker
+//! network, each on a host port that the fixture holds for its life.
+#![allow(
+    clippy::missing_panics_doc,
+    reason = "a test fixture: a failed setup step or a failed check panics the test"
+)]
+#![allow(
+    clippy::must_use_candidate,
+    reason = "a test fixture; its callers read every value they need"
+)]
+
 use std::time::{Duration, SystemTime};
 
+use crate::{AccountCache, CacheConfig};
 use alloy_primitives::{Address, U256};
-use kardamom_cache::{AccountCache, CacheConfig};
 use kardamom_types::{AccountRow, BPosition};
 use redis::aio::MultiplexedConnection;
 use testcontainers::core::{ExecCommand, IntoContainerPort, WaitFor};
@@ -12,26 +24,59 @@ const BOUND: Duration = Duration::from_secs(30);
 const PAUSE: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy)]
-pub(super) enum Fault {
+pub enum Fault {
     Freeze,
     Kill,
 }
 
-pub(super) struct Fixture {
-    pub(super) cache: AccountCache,
+pub struct Fixture {
+    pub cache: AccountCache,
     /// The configuration the cache client connected with.
-    #[allow(
-        dead_code,
-        reason = "the state-mirror total-loss test connects its mirror with it"
-    )]
-    pub(super) cfg: CacheConfig,
-    pub(super) primary: ContainerAsync<GenericImage>,
-    pub(super) replica: ContainerAsync<GenericImage>,
+    pub cfg: CacheConfig,
+    pub primary: ContainerAsync<GenericImage>,
+    pub replica: ContainerAsync<GenericImage>,
     sentinels: [ContainerAsync<GenericImage>; 3],
+    /// The host ports of the five containers, held until the fixture
+    /// ends, also while the containers are down.
+    _ports: [PortLease; 5],
+}
+
+/// A host port that this test holds for its whole life. The lock file
+/// keeps a second test run on the same host off the port, also while
+/// the container that maps it is down for a restart.
+pub struct PortLease {
+    port: u16,
+    _lock: std::fs::File,
+}
+
+impl PortLease {
+    /// The reserved range lies below the kernel's ephemeral range, so no
+    /// outgoing connection of another process takes a port in it.
+    const RANGE: std::ops::Range<u16> = 20_000..30_000;
+
+    /// Take the first free port of the range, from a start that differs
+    /// per process.
+    fn take() -> Self {
+        let span = u32::from(Self::RANGE.end - Self::RANGE.start);
+        let start = std::process::id().wrapping_mul(7919) % span;
+        (0..span)
+            .map(|step| (start + step) % span)
+            .find_map(|offset| Self::try_port(Self::RANGE.start + u16::try_from(offset).unwrap()))
+            .expect("a free port in the reserved range")
+    }
+
+    fn try_port(port: u16) -> Option<Self> {
+        let dir = std::env::temp_dir().join("kardamom-test-ports");
+        std::fs::create_dir_all(&dir).ok()?;
+        let lock = std::fs::File::create(dir.join(format!("{port}.lock"))).ok()?;
+        lock.try_lock().ok()?;
+        std::net::TcpListener::bind(("127.0.0.1", port)).ok()?;
+        Some(Self { port, _lock: lock })
+    }
 }
 
 impl Fixture {
-    pub(super) async fn new() -> Self {
+    pub async fn new() -> Self {
         let token = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -42,13 +87,19 @@ impl Fixture {
         let owner = std::env::var("KARDAMOM_DOCKER_OWNER")
             .unwrap_or_else(|_| std::process::id().to_string());
         let network = format!("component-sentinel-{owner}-{token}");
-        let primary = Self::redis(&network, &[]).await;
+        let ports: [PortLease; 5] = std::array::from_fn(|_| PortLease::take());
+        let primary = Self::redis(&network, &[], ports[0].port).await;
         let primary_ip = primary.get_bridge_ip_address().await.unwrap().to_string();
-        let replica = Self::redis(&network, &["--replicaof", &primary_ip, "6379"]).await;
+        let replica = Self::redis(
+            &network,
+            &["--replicaof", &primary_ip, "6379"],
+            ports[1].port,
+        )
+        .await;
         let (a, b, c) = tokio::join!(
-            Self::sentinel(&network, &primary_ip),
-            Self::sentinel(&network, &primary_ip),
-            Self::sentinel(&network, &primary_ip)
+            Self::sentinel(&network, &primary_ip, ports[2].port),
+            Self::sentinel(&network, &primary_ip, ports[3].port),
+            Self::sentinel(&network, &primary_ip, ports[4].port)
         );
         let sentinels = [a, b, c];
         let mut addresses = Vec::new();
@@ -66,6 +117,7 @@ impl Fixture {
             primary,
             replica,
             sentinels,
+            _ports: ports,
         };
         fixture
             .cache
@@ -78,7 +130,7 @@ impl Fixture {
         fixture
     }
 
-    async fn redis(network: &str, extra: &[&str]) -> ContainerAsync<GenericImage> {
+    async fn redis(network: &str, extra: &[&str], host_port: u16) -> ContainerAsync<GenericImage> {
         let mut command = vec![
             "redis-server",
             "--protected-mode",
@@ -93,14 +145,18 @@ impl Fixture {
             .with_exposed_port(6379_u16.tcp())
             .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
             .with_network(network)
-            .with_mapped_port(Self::free_port(), 6379_u16.tcp())
+            .with_mapped_port(host_port, 6379_u16.tcp())
             .with_cmd(command)
             .start()
             .await
             .unwrap()
     }
 
-    async fn sentinel(network: &str, primary: &str) -> ContainerAsync<GenericImage> {
+    async fn sentinel(
+        network: &str,
+        primary: &str,
+        host_port: u16,
+    ) -> ContainerAsync<GenericImage> {
         let script = format!(
             "cat > /tmp/sentinel.conf <<'CONF'\nport 26379\nprotected-mode no\nsentinel monitor kardamom {primary} 6379 2\nsentinel down-after-milliseconds kardamom 500\nsentinel failover-timeout kardamom 5000\nCONF\nexec redis-server /tmp/sentinel.conf --sentinel"
         );
@@ -109,27 +165,16 @@ impl Fixture {
             .with_exposed_port(26379_u16.tcp())
             .with_wait_for(WaitFor::message_on_stdout("+monitor master"))
             .with_network(network)
-            .with_mapped_port(Self::free_port(), 26379_u16.tcp())
+            .with_mapped_port(host_port, 26379_u16.tcp())
             .with_cmd(["-c", &script])
             .start()
             .await
             .unwrap()
     }
 
-    /// A fixed host port for one container port. A restarted container
-    /// keeps it, so the same client reaches the group after a total loss,
-    /// as a deployment reaches it at a stable address.
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
     /// Kill the primary, the replica and every Sentinel at once. No Redis
     /// process keeps data on disk, so the group loses every key.
-    pub(super) async fn lose_everything(&self) {
+    pub async fn lose_everything(&self) {
         let ids: Vec<&str> = self.all().map(ContainerAsync::id).collect();
         let output = tokio::process::Command::new("docker")
             .arg("kill")
@@ -142,7 +187,7 @@ impl Fixture {
 
     /// Start the group again in its first order, and wait until the
     /// Sentinels name a primary that answers as one.
-    pub(super) async fn start_everything(&self) {
+    pub async fn start_everything(&self) {
         for container in self.all() {
             container.start().await.unwrap();
         }
@@ -157,7 +202,7 @@ impl Fixture {
     }
 
     /// The Sentinel at `index`.
-    pub(super) fn sentinel_at(&self, index: usize) -> &ContainerAsync<GenericImage> {
+    pub fn sentinel_at(&self, index: usize) -> &ContainerAsync<GenericImage> {
         &self.sentinels[index]
     }
 
@@ -206,10 +251,7 @@ impl Fixture {
         )
     }
 
-    pub(super) async fn raw(
-        container: &ContainerAsync<GenericImage>,
-        port: u16,
-    ) -> MultiplexedConnection {
+    pub async fn raw(container: &ContainerAsync<GenericImage>, port: u16) -> MultiplexedConnection {
         let url = Self::url(container, port).await;
         tokio::time::timeout(
             Duration::from_secs(3),
@@ -253,7 +295,7 @@ impl Fixture {
                 .is_ok_and(|count| count == 1)
     }
 
-    pub(super) fn row(nonce: u64) -> AccountRow {
+    pub fn row(nonce: u64) -> AccountRow {
         AccountRow {
             address: Address::repeat_byte(0x42),
             nonce,
@@ -261,7 +303,7 @@ impl Fixture {
         }
     }
 
-    pub(super) async fn fault(&self, fault: Fault) {
+    pub async fn fault(&self, fault: Fault) {
         match fault {
             Fault::Freeze => {
                 self.signal("STOP").await;
@@ -271,7 +313,7 @@ impl Fixture {
         }
     }
 
-    pub(super) async fn restore(&self, fault: Fault) {
+    pub async fn restore(&self, fault: Fault) {
         match fault {
             Fault::Freeze => self.signal("CONT").await,
             Fault::Kill => self.primary.start().await.unwrap(),
@@ -283,7 +325,7 @@ impl Fixture {
     }
 
     /// Send `signal` to the main process of the container `id`.
-    pub(super) async fn send(id: &str, signal: &str) {
+    pub async fn send(id: &str, signal: &str) {
         let output = tokio::time::timeout(
             Duration::from_secs(5),
             tokio::process::Command::new("docker")
@@ -308,7 +350,7 @@ impl Fixture {
         assert!(state.contains("State:\tT (stopped)"), "{state}");
     }
 
-    pub(super) async fn role(container: &ContainerAsync<GenericImage>, wanted: &str) {
+    pub async fn role(container: &ContainerAsync<GenericImage>, wanted: &str) {
         tokio::time::timeout(BOUND, async {
             while !Self::is_role(container, wanted).await.unwrap_or(false) {
                 tokio::time::sleep(PAUSE).await;
@@ -332,7 +374,7 @@ impl Fixture {
         Ok(info.lines().any(|line| line == format!("role:{wanted}")))
     }
 
-    pub(super) async fn write(&self, nonce: u64, position: u64) {
+    pub async fn write(&self, nonce: u64, position: u64) {
         tokio::time::timeout(BOUND, async {
             while self
                 .cache
@@ -348,20 +390,72 @@ impl Fixture {
     }
 
     /// Read `address` again after a short pause.
-    pub(super) async fn read_again(
+    ///
+    /// # Errors
+    ///
+    /// Returns the cache error while the group does not answer.
+    pub async fn read_again(
         &self,
         address: Address,
-    ) -> Result<Option<kardamom_cache::AccountView>, kardamom_cache::CacheError> {
+    ) -> Result<Option<crate::AccountView>, crate::CacheError> {
         tokio::time::sleep(PAUSE).await;
         self.cache.account(address).await
     }
 
-    pub(super) async fn assert_row(&self, nonce: u64, position: u64) {
+    pub async fn assert_row(&self, nonce: u64, position: u64) {
         let expected = Self::row(nonce);
         let actual = self.cache.account(expected.address).await.unwrap().unwrap();
         assert_eq!(
             (actual.nonce, actual.balance, actual.tx_idx),
             (nonce, expected.balance, position)
         );
+    }
+}
+
+impl Fixture {
+    /// The primary fails by `fault`: the client fails, the replica is
+    /// promoted, the same client writes through the promoted primary
+    /// with a reloaded script, and the old primary returns as a replica.
+    pub async fn recover_after(&self, fault: Fault) {
+        self.fault(fault).await;
+        assert!(
+            self.cache.account(Fixture::row(1).address).await.is_err(),
+            "the cache output must actually fail before promotion"
+        );
+        Fixture::role(&self.replica, "master").await;
+        let mut promoted = Fixture::raw(&self.replica, 6379).await;
+        redis::cmd("SCRIPT")
+            .arg("FLUSH")
+            .query_async::<()>(&mut promoted)
+            .await
+            .unwrap();
+        let hash = redis::Script::new(crate::script::APPLY_ROW)
+            .get_hash()
+            .to_owned();
+        let absent: Vec<bool> = redis::cmd("SCRIPT")
+            .arg("EXISTS")
+            .arg(&hash)
+            .query_async(&mut promoted)
+            .await
+            .unwrap();
+        assert_eq!(absent, [false]);
+        self.write(3, 30).await;
+        self.assert_row(3, 30).await;
+        let loaded: Vec<bool> = redis::cmd("SCRIPT")
+            .arg("EXISTS")
+            .arg(&hash)
+            .query_async(&mut promoted)
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded,
+            [true],
+            "the promoted primary must receive the real script"
+        );
+
+        self.restore(fault).await;
+        Fixture::role(&self.primary, "slave").await;
+        self.write(2, 20).await;
+        self.assert_row(3, 30).await;
     }
 }

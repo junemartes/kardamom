@@ -8,9 +8,6 @@ use crate::harness::Harness;
 use crate::nomad::{Alloc, Streams};
 use crate::poll::{self, Budget};
 
-mod forced;
-pub(crate) use forced::ForcedRebuild;
-
 #[derive(Debug, Default, serde::Serialize)]
 struct Counts {
     scanning: usize,
@@ -41,8 +38,11 @@ struct Mirror {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) enum RebuildPhase {
+pub(crate) enum RebuildPhase {
+    /// Every mirror completes a rebuild.
     Complete,
+    /// Every mirror scans, and retries a write, with no completed
+    /// rebuild.
     BlockedScan,
 }
 

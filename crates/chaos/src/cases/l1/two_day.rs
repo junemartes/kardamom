@@ -14,27 +14,31 @@ use super::batcher::{
 };
 use super::followers::{Followers, await_archive_complete, await_resume};
 use super::halt::await_followers_halted;
-use super::outage::{MIN_HOLD, hold_until_floor_passes};
+use super::outage::hold_until_floor_passes;
+use super::{ALERT_HOLD, FINALIZE_HEAD};
 use crate::cases::da_watcher::assert_not_past_sealer;
 use crate::harness::Harness;
 use crate::l1::{L1, STALE_POST_ALERT};
 use crate::nomad::{SavedJob, Streams};
 use crate::probes::CLUSTER_TASK;
 
-const ALERT_HOLD: Duration = Duration::from_secs(30);
-
 /// T2: every follower job stops and starts again from its registered
-/// definition, the same images, as a deploy does.
+/// definition, the same images, as a deploy does. The three jobs stop
+/// together and start together. Then the da-watcher stands at or before
+/// the sealer, and the batcher posts again.
 async fn redeploy_followers(h: &Harness, ctx: &str) -> anyhow::Result<()> {
     crate::log(format!(
         "{ctx}: T2: a deploy of the same images (stop and start every follower job)"
     ));
-    for job in ["da-watcher", "l1-indexer", "batcher"] {
-        let saved = SavedJob::capture(&h.nomad, job).await?;
-        saved.stop().await?;
-        saved.restore().await?;
-    }
-    Ok(())
+    let watcher = SavedJob::capture(&h.nomad, "da-watcher").await?;
+    let indexer = SavedJob::capture(&h.nomad, "l1-indexer").await?;
+    let batcher = SavedJob::capture(&h.nomad, "batcher").await?;
+    tokio::try_join!(watcher.stop(), indexer.stop(), batcher.stop())?;
+    tokio::try_join!(watcher.restore(), indexer.restore(), batcher.restore())?;
+    assert_not_past_sealer(h, ctx).await?;
+    await_posting(h, 0, h.knobs.restart_slo + Duration::from_secs(30), ctx)
+        .await
+        .map(|_| ())
 }
 
 pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
@@ -43,7 +47,6 @@ pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
     l1.require_rule_loaded(STALE_POST_ALERT, ctx).await?;
     let base = Followers::ready(h, ctx).await?;
     require_posting(h, ctx).await?;
-    let window = h.knobs.l1_fault;
     // T0: the lies the followers see, and the batcher's view of its own
     // posts. Null receipts stay with `l1-null-receipts`: these two lies
     // are the ones a start dies on, a receipt is not.
@@ -57,6 +60,28 @@ pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
     ];
     crate::log(format!("{ctx}: T0: {faults:?}"));
     l1.set_faults(&faults).await?;
+    l1.mine(FINALIZE_HEAD).await?;
+    // The faults clear on every path, so no lie leaks into the next case.
+    let lied = through_outage(h, &l1, base, ctx).await;
+    // T4: the fault clears. The batcher posts within one flush.
+    crate::log(format!("{ctx}: T4: the fault clears"));
+    let cleared = Followers::at_clear(h, &l1, base).await;
+    let at_t3 = lied?;
+    let stuck = cleared?;
+    await_posting(h, at_t3, Duration::from_secs(30), ctx).await?;
+    await_resume(h, stuck, ctx).await?;
+    await_archive_complete(h, &l1, ctx).await?;
+    l1.assert_contiguous(ctx).await
+}
+
+/// T0 to T3 under the armed faults. Returns the confirmed posts at T3.
+async fn through_outage(
+    h: &mut Harness,
+    l1: &L1,
+    base: Followers,
+    ctx: &str,
+) -> anyhow::Result<i64> {
+    let window = h.knobs.l1_fault;
     await_followers_halted(h, base, ctx).await?;
     // The alert fires before T1.
     l1.await_alert_held(STALE_POST_ALERT, ALERT_HOLD, window, ctx)
@@ -64,44 +89,42 @@ pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
     // T1: the batcher restarts under the lie and resumes from the
     // contract.
     crate::log(format!("{ctx}: T1: batcher restart under the lie"));
-    let before = BeforeRestart::read(h, &l1).await?;
+    let before = BeforeRestart::read(h, l1).await?;
     restart(h, ctx).await?;
-    assert_resumed_from_contract(h, &l1, before, ctx).await?;
-    let after_t1 = await_posting(h, 0, h.knobs.restart_slo, ctx).await?;
+    assert_resumed_from_contract(h, l1, before, ctx).await?;
+    // The frames past the resumed cursor count from here.
     let rx_t1 = h
         .probes
         .ingress_counts()
         .await
         .complete()
         .ok_or_else(|| crate::chaos_fail!("{ctx}: no complete ingress baseline at T1"))?;
-    // T2. The da-watcher's restart resumes after the sealer's origin, and
-    // halts on the lying anchor again. Its cursor file holds the confirmed
-    // origin, so it never stands past the sealer.
-    redeploy_followers(h, ctx).await?;
-    assert_not_past_sealer(h, ctx).await?;
-    await_posting(h, 0, h.knobs.restart_slo + Duration::from_secs(30), ctx).await?;
-    // T3: the floor passes the cursor the batcher resumed at in T1. The
-    // batcher kept posting, so its live cursor moved with the chain.
     let snapshots0 = h
         .evidence
         .count_lines(CLUSTER_TASK, "snapshot TAKEN", Streams::StdoutOnly)
         .await?;
+    let after_t1 = await_posting(h, 0, h.knobs.restart_slo, ctx).await?;
+    // T2: a deploy of the same images. The da-watcher's restart resumes
+    // after the sealer's origin, and halts on the lying anchor again. Its
+    // cursor file holds the confirmed origin, so it never stands past the
+    // sealer. T3 starts after T2: the followers run again, so the batcher
+    // keeps posting, and its live cursor moves with the chain while the
+    // floor passes the cursor the batcher resumed at in T1. The frames
+    // and a new snapshot bound the hold.
+    redeploy_followers(h, ctx).await?;
     crate::log(format!(
         "{ctx}: T3: load until the floor passes the T1 cursor"
     ));
-    let (delta, held) = hold_until_floor_passes(h, rx_t1, snapshots0, MIN_HOLD, ctx).await?;
-    let at_t3 = h.probes.batcher_posts().await.unwrap_or(0);
+    let (delta, held) = hold_until_floor_passes(h, rx_t1, snapshots0, Duration::ZERO, ctx).await?;
+    let at_t3 =
+        h.probes.batcher_posts().await.ok_or_else(|| {
+            crate::chaos_fail!("{ctx}: the batcher exporter does not answer at T3")
+        })?;
     anyhow::ensure!(
         at_t3 > after_t1,
         "{}: {ctx}: the batcher confirmed no post between T1 and T3 ({delta} frames in {}s) — the floor passed its live cursor",
         crate::FAIL_PREFIX,
         held.as_secs()
     );
-    // T4: the fault clears. The batcher posts within one flush.
-    crate::log(format!("{ctx}: T4: the fault clears"));
-    let stuck = Followers::at_clear(h, &l1, base).await?;
-    await_posting(h, at_t3, Duration::from_secs(30), ctx).await?;
-    await_resume(h, stuck, ctx).await?;
-    await_archive_complete(h, &l1, ctx).await?;
-    l1.assert_contiguous(ctx).await
+    Ok(at_t3)
 }

@@ -151,8 +151,10 @@ pub struct Knobs {
     pub chain_id: u64,
     /// The steady load rate of every case.
     pub tps: NonZeroU32,
-    /// The per-case load window. A case with a longer floor widens it.
-    pub case_window: Duration,
+    /// The longest one case may run, from the start of its load to its
+    /// verdict. The case load runs until the case body ends, and at most
+    /// this long.
+    pub case_deadline: Duration,
     /// The keep-pace gap bound of the load verdict.
     pub load_max_gap: u64,
     /// The per-submit retry attempts of the load, outside the resize case.
@@ -378,15 +380,15 @@ impl Knobs {
         let lapse_s = aeron_stall.evicting_freeze().as_secs();
         Ok(Self {
             chain_id: env.u64("CHAIN_ID", 412_346)?,
-            tps: env.nonzero_u32("CHAOS_TPS", 200)?,
-            case_window: env.secs("CHAOS_CASE_S", 120)?,
+            tps: env.nonzero_u32("CHAOS_TPS", 100)?,
+            case_deadline: env.secs("CHAOS_CASE_S", 180)?,
             load_max_gap: env.u64("LOAD_MAX_GAP", 5)?,
             load_retry: env.u32("LOAD_RETRY", 2)?,
             restart_slo: env.secs("CHAOS_RESTART_SLO_S", 60)?,
             reschedule_slo: env.secs("CHAOS_RESCHEDULE_SLO_S", 200)?,
             leader_slo: env.secs("CHAOS_LEADER_SLO_S", 45)?,
             rejoin_slo: env.secs("CLUSTER_REJOIN_SLO_S", 360)?,
-            inject_delay: env.secs("INJECT_DELAY", 10)?,
+            inject_delay: env.secs("INJECT_DELAY", 5)?,
             load_flow_timeout: env.secs("LOAD_FLOW_TIMEOUT_S", 60)?,
             load_ready_timeout: env.secs("LOAD_READY_TIMEOUT_S", 600)?,
             account_base: env.u32("CHAOS_ACCT_BASE", 7)?,

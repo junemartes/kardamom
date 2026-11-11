@@ -5,7 +5,7 @@
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::accounts::{Accounts, Pin};
 use crate::cases::Case;
@@ -16,10 +16,13 @@ use crate::knobs::Knobs;
 use crate::lifecycle::{Lifecycle, NOMAD_HTTP_PORT};
 use crate::load::{LoadRun, LoadSpec, Verdict};
 use crate::rpc::Rpc;
-use kardamom_bench::load::Completeness;
+use kardamom_bench::load::{Completeness, Progress};
+
+/// The recovery probe's window, in seconds.
+const PROBE_SECS: NonZeroU32 = NonZeroU32::new(10).expect("a nonzero probe window");
 
 /// The recovery probe's window.
-const PROBE_WINDOW: Duration = Duration::from_secs(30);
+const PROBE_WINDOW: Duration = Duration::from_secs(PROBE_SECS.get() as u64);
 
 /// How long one probe submit waits out the refusals of a paused ingress:
 /// two times the 10 s sealer silence budget. A `sealer_no_quorum` halt
@@ -41,11 +44,15 @@ struct ProbeLeg {
 
 impl ProbeLeg {
     /// Every offered transaction got a receipt, and the leg was accepted
-    /// at its floor or above.
+    /// at its floor or above. The leg holds a slot for every submit of
+    /// its window, so its rate does not depend on the receipt latency:
+    /// a submit that parks past the ingress timeout is refused, and a
+    /// refused submit fails the first check. The latency is evidence in
+    /// every line.
     fn judge(&self, case: Case, verdict: &Verdict) -> anyhow::Result<()> {
         anyhow::ensure!(
             verdict.pass && verdict.missing == 0,
-            "{}: recovery probe of {} not PASS for case {}: {:?} (missing={} of {} offered, of them unlanded={}: never acked) — {}",
+            "{}: recovery probe of {} not PASS for case {}: {:?} (missing={} of {} offered, of them unlanded={}: never acked; {}) — {}",
             crate::FAIL_PREFIX,
             self.who,
             case.name(),
@@ -53,25 +60,28 @@ impl ProbeLeg {
             verdict.missing,
             verdict.offered,
             verdict.unlanded,
+            verdict.latency,
             self.meaning
         );
         anyhow::ensure!(
             verdict.accepted >= self.floor,
-            "{}: recovery probe of {} for case {} accepted {} submits in {}s, below the floor of {} — {}",
+            "{}: recovery probe of {} for case {} accepted {} submits in {}s, below the floor of {} ({}) — {}",
             crate::FAIL_PREFIX,
             self.who,
             case.name(),
             verdict.accepted,
             PROBE_WINDOW.as_secs(),
             self.floor,
+            verdict.latency,
             self.meaning
         );
         crate::log(format!(
-            "{}: recovery probe PASS for {}: {} offered, {} accepted, all receipted",
+            "{}: recovery probe PASS for {}: {} offered, {} accepted, all receipted, {}",
             case.name(),
             self.who,
             verdict.offered,
-            verdict.accepted
+            verdict.accepted,
+            verdict.latency
         ));
         Ok(())
     }
@@ -81,7 +91,9 @@ use crate::nomad::{Nomad, SavedJob};
 use crate::poll::{self, Budget};
 use crate::probes::{IngressCounts, Probed, Probes};
 
-/// The port of the ingress JSON-RPC.
+/// The most blocking submits of a case load in flight at once.
+const CASE_IN_FLIGHT: NonZeroU32 = NonZeroU32::new(256).expect("a nonzero in-flight cap");
+
 /// The eth JSON-RPC port of every ingress node.
 pub const INGRESS_RPC_PORT: u16 = 8545;
 
@@ -98,6 +110,9 @@ pub struct Harness {
     pub(crate) accounts: Accounts,
     pub(crate) killed: Option<Killed>,
     pub(crate) case_canary: Option<SavedJob>,
+    /// The observer of the running case load, while the case body may
+    /// still end its submissions.
+    case_load: Option<Progress>,
 }
 
 impl Harness {
@@ -120,6 +135,7 @@ impl Harness {
             accounts: Accounts::new(knobs.account_base, knobs.run_load),
             killed: None,
             case_canary: None,
+            case_load: None,
             knobs,
             lifecycle,
             rpc_url,
@@ -156,17 +172,55 @@ impl Harness {
         std::env::temp_dir().join(format!("chaos-{case}.json"))
     }
 
-    /// Run one case: start the load, gate the injection on flowing
-    /// traffic, run the body, then the common tail.
+    /// Run one case within its deadline: start the load, gate the
+    /// injection on flowing traffic, run the body, then the common tail.
     ///
     /// # Errors
     ///
-    /// Returns the first failure, with the load aborted.
+    /// Returns the first failure, with the load aborted, or a failure
+    /// when the case runs past its deadline.
     pub async fn run_case(&mut self, name: &str) -> anyhow::Result<()> {
         let case = Case::parse(name)?;
         crate::log(format!(
             "================= CHAOS CASE: {name} ================="
         ));
+        let started = Instant::now();
+        let missed0 = self.nomad.missed_heartbeats().await.unwrap_or_default();
+        let deadline = case.deadline(&self.knobs);
+        let outcome = tokio::time::timeout(deadline, self.run_within(case)).await;
+        self.case_load = None;
+        self.log_nodes_down(name, &missed0).await;
+        outcome.map_err(|_| {
+            crate::chaos_fail!(
+                "{name}: the case runs past its deadline of {}s; a case must finish within its deadline, so shorten its fault and recovery waits",
+                deadline.as_secs()
+            )
+        })??;
+        crate::log(format!(
+            "CHAOS CASE {name}: PASS in {}s",
+            started.elapsed().as_secs()
+        ));
+        Ok(())
+    }
+
+    /// Log every node that the Nomad servers marked down during the case:
+    /// a node down that the case did not inject is a substrate fault.
+    async fn log_nodes_down(&self, name: &str, before: &[String]) {
+        match self.nomad.missed_heartbeats().await {
+            Ok(now) => {
+                let new: Vec<&String> = now.iter().filter(|m| !before.contains(m)).collect();
+                crate::log(format!(
+                    "{name}: Nomad marked {} node(s) down during the case: {new:?}",
+                    new.len()
+                ));
+            }
+            Err(error) => crate::log(format!("{name}: the node events do not answer: {error:#}")),
+        }
+    }
+
+    /// The case under its deadline. A failure drops the load, which
+    /// aborts it.
+    async fn run_within(&mut self, case: Case) -> anyhow::Result<()> {
         let account = self.pick_account(case)?;
         let window = case.window(&self.knobs);
         let rx0 = self.probes.ingress_counts().await;
@@ -174,22 +228,79 @@ impl Harness {
             .nonce_of(account)
             .await?;
         crate::log(format!(
-            "{name}: the case load spends account #{account} from nonce {nonce}"
+            "{}: the case load spends account #{account} from nonce {nonce}",
+            case.name()
         ));
         let load = LoadRun::start(&self.load_spec(case, account, window, nonce))?;
-        let outcome = self.run_body(case, &load, &rx0).await;
-        if let Err(e) = outcome {
-            load.abort();
-            return Err(e);
-        }
+        self.run_body(case, &load, &rx0).await?;
         load.finish_submissions();
         let verdict = load.finish().await?;
         case.judge_load(&verdict)?;
-        self.assert_executors_converged(case.name()).await?;
-        self.probe_recovery(case, account).await?;
-        self.validator_verdict().await?;
-        crate::log(format!("CHAOS CASE {name}: PASS"));
-        Ok(())
+        if !case.full_tail() {
+            return self.assert_executors_converged(case.name()).await;
+        }
+        // The fleet convergence and the recovery probe read independent
+        // facts, so they run at once. The probe submits through both
+        // ingresses, so it starts once both answer: a restarted ingress
+        // binds its JSON-RPC port after it joins the cluster.
+        tokio::try_join!(self.assert_executors_converged(case.name()), async {
+            self.assert_ingress_pair_live(case.name()).await?;
+            self.probe_recovery(case, account).await
+        })?;
+        self.validator_verdict().await
+    }
+
+    /// End the submissions of the case load before the body ends. A
+    /// case calls this before it measures a catch-up that must not race
+    /// new traffic; the load still drains and gets its verdict.
+    pub(crate) fn end_case_load(&mut self, ctx: &str) {
+        if let Some(progress) = self.case_load.take() {
+            progress.finish_submissions();
+            crate::log(format!("{ctx}: the case load ends its submissions"));
+        }
+    }
+
+    /// End the case load and start a load at the probe rate for a
+    /// catch-up measurement. The catch-up then closes a lag under load,
+    /// not on an idle chain, and the case load no longer holds the lag
+    /// open at its full rate. The load uses the gate account, from its
+    /// next nonce, and every offered transaction must get a receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the nonce read or the load start fails.
+    pub(crate) async fn catch_up_load(&mut self, ctx: &str) -> anyhow::Result<CatchUpLoad> {
+        self.end_case_load(ctx);
+        let account = self.knobs.gate_account;
+        let nonce_start = Rpc::new(&self.rpc_url, self.knobs.chain_id)?
+            .nonce_of(account)
+            .await?;
+        let spec = LoadSpec {
+            rpc_url: self.rpc_url.clone(),
+            receipt_rpcs: self.receipt_rpcs(),
+            chain_id: self.knobs.chain_id,
+            account,
+            nonce_start,
+            completeness: Completeness::Offered,
+            fixed_rate: true,
+            duration: self.knobs.case_deadline,
+            tps: self.probe_tps(),
+            max_in_flight: self.probe_tps().saturating_mul(PROBE_SECS),
+            retry_submit: self.knobs.load_retry,
+            pause_wait: PROBE_PAUSE_WAIT,
+            max_gap: self.knobs.load_max_gap,
+            drain_timeout: self.knobs.converge_slo,
+            report_path: Self::report_path(&format!("{ctx}-catch-up")),
+            metrics: self.probes.load_metrics(&self.probes.ingresses[0]),
+        };
+        crate::log(format!(
+            "{ctx}: the catch-up runs under a load of {} tx/s from account #{account}",
+            spec.tps
+        ));
+        Ok(CatchUpLoad {
+            run: LoadRun::start(&spec)?,
+            ctx: ctx.to_string(),
+        })
     }
 
     /// The recovery probe: two short loads at once, after the case load
@@ -198,15 +309,15 @@ impl Harness {
     /// used: the sender that had transactions in flight during the
     /// outage. The second runs on the gate account, which no case load
     /// spends, through the other ingress: a sender with nothing in
-    /// flight. Every offered transaction of both must get a receipt, and
-    /// each must be accepted at a fraction of its rate. A failure of the
-    /// first alone is a stuck sender; a failure of the second is a
-    /// pipeline, or an ingress, that did not recover. The case load
-    /// cannot prove either: a submit refused during the outage leaves a
-    /// nonce hole, every later submit of the sender then parks and
-    /// fails, and the chaos verdict does not count a failed submit. The
-    /// executor block gauge cannot prove it either: it advances on empty
-    /// blocks.
+    /// flight. Every offered transaction of both must get a receipt
+    /// within the park of the ingress, and each leg must offer at least
+    /// a quarter of its rate. A failure of the first alone is a stuck sender; a
+    /// failure of the second is a pipeline, or an ingress, that did not
+    /// recover. The case load cannot prove either: a submit refused
+    /// during the outage leaves a nonce hole, every later submit of the
+    /// sender then parks and fails, and the chaos verdict does not count a
+    /// failed submit. The executor block gauge cannot prove it either: it
+    /// advances on empty blocks.
     async fn probe_recovery(&self, case: Case, account: u32) -> anyhow::Result<()> {
         let rpc = Rpc::new(&self.rpc_url, self.knobs.chain_id)?;
         let legs = [
@@ -230,12 +341,15 @@ impl Harness {
         NonZeroU32::new(self.knobs.tps.get() / 2).unwrap_or(self.knobs.tps)
     }
 
+    /// A leg holds a slot for every submit of its window, so its rate
+    /// stays the fixed rate while receipts are slow.
     fn probe_spec(&self, case: Case, account: u32, nonce: u64, leg: &str) -> LoadSpec {
         LoadSpec {
             completeness: Completeness::Offered,
             fixed_rate: true,
             duration: PROBE_WINDOW,
             tps: self.probe_tps(),
+            max_in_flight: self.probe_tps().saturating_mul(PROBE_SECS),
             retry_submit: self.knobs.load_retry,
             pause_wait: PROBE_PAUSE_WAIT,
             report_path: Self::report_path(&format!("{}-probe-{leg}", case.name())),
@@ -277,10 +391,12 @@ impl Harness {
         })
     }
 
-    /// The least accepted submits a healthy pipeline lands in one leg's
-    /// window: a quarter of the leg's rate.
+    /// The least accepted submits of one leg: a quarter of what the leg
+    /// offers at its rate. The fixed-rate engine reaches about half of
+    /// its rate on the CI runner, so a leg below a quarter did not run
+    /// its window.
     fn probe_floor(&self) -> u64 {
-        u64::from(self.probe_tps().get()) * PROBE_WINDOW.as_secs() / 4
+        u64::from(self.probe_tps().get()).saturating_mul(PROBE_WINDOW.as_secs()) / 4
     }
 
     async fn run_body(
@@ -290,12 +406,13 @@ impl Harness {
         rx0: &IngressCounts,
     ) -> anyhow::Result<()> {
         self.inject_gate(case, load, rx0).await?;
+        self.case_load = load.progress();
         case.run(self).await?;
-        load.assert_submitting(case.name())?;
-        let accepted = load.accepted();
-        case.assert_recovered_progress(self).await?;
-        load.await_accepted_after(case.name(), accepted, self.knobs.restart_slo)
-            .await
+        // A body that ended the load itself took its observer.
+        if self.case_load.take().is_some() {
+            load.assert_submitting(case.name())?;
+        }
+        case.assert_recovered_progress(self).await
     }
 
     fn pick_account(&mut self, case: Case) -> anyhow::Result<u32> {
@@ -334,6 +451,7 @@ impl Harness {
             fixed_rate: false,
             duration: window,
             tps: case.tps(&self.knobs),
+            max_in_flight: CASE_IN_FLIGHT,
             retry_submit: case.load_retry(&self.knobs),
             pause_wait: window,
             max_gap: self.knobs.load_max_gap,
@@ -419,6 +537,40 @@ impl Harness {
     }
 }
 
+/// The load that runs while a case measures a catch-up.
+pub(crate) struct CatchUpLoad {
+    run: LoadRun,
+    ctx: String,
+}
+
+impl CatchUpLoad {
+    /// End the load after the catch-up and require a receipt for every
+    /// offered transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the load fails or a transaction has no receipt.
+    pub(crate) async fn finish(self) -> anyhow::Result<()> {
+        self.run.finish_submissions();
+        let verdict = self.run.finish().await?;
+        anyhow::ensure!(
+            verdict.pass && verdict.missing == 0,
+            "{}: {}: the load during the catch-up is not PASS: {:?} (missing={} of {} offered; {})",
+            crate::FAIL_PREFIX,
+            self.ctx,
+            verdict.failures,
+            verdict.missing,
+            verdict.offered,
+            verdict.latency
+        );
+        crate::log(format!(
+            "{}: the load during the catch-up: {} offered, all receipted",
+            self.ctx, verdict.offered
+        ));
+        Ok(())
+    }
+}
+
 impl Case {
     /// Every replica must converge and advance after the body. Executor
     /// restarts use that convergence budget directly: a recorded session
@@ -426,17 +578,38 @@ impl Case {
     /// snapshot can pause boundaries beyond the ten-second live probe.
     /// Other cases also require their family-specific progress probe.
     async fn assert_recovered_progress(self, h: &Harness) -> anyhow::Result<()> {
+        // The progress probe and the convergence read independent gauges,
+        // so they run at once.
+        tokio::try_join!(
+            self.assert_family_progress(h),
+            h.assert_executors_converged(self.name())
+        )
+        .map(|_| ())
+    }
+
+    async fn assert_family_progress(self, h: &Harness) -> anyhow::Result<()> {
         match self {
-            Self::GracefulExecutor | Self::HardExecutor => {}
+            Self::GracefulExecutor | Self::HardExecutor => Ok(()),
             _ if self.name().starts_with("cluster-") => {
-                h.assert_executor_progress(Duration::from_mins(1)).await?;
+                h.assert_executor_progress(Duration::from_mins(1)).await
             }
             _ if self.name().starts_with("node-failure-") => {
-                h.assert_executor_progress(Duration::from_mins(3)).await?;
+                h.assert_executor_progress(Duration::from_mins(3)).await
             }
-            _ => h.assert_progress().await?,
+            _ => h.assert_progress().await,
         }
-        h.assert_executors_converged(self.name()).await
+    }
+
+    /// Whether the case ends with the recovery probe and the validator
+    /// verdict. A carry step that injects no fault and is not the last
+    /// one ends with the load verdict and the fleet convergence only: the
+    /// next step that injects a fault, and the last step, run the probe
+    /// and the verdict on a state that holds its change.
+    fn full_tail(self) -> bool {
+        match self {
+            Self::Carry(step) => step.full_tail(),
+            _ => true,
+        }
     }
 
     /// Chaos mode already tolerates duplicate-submit drops. Every other

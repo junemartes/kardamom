@@ -256,6 +256,14 @@ pub struct Elected {
 }
 
 impl Elected {
+    /// Log the leader and the closed term for the case `ctx`.
+    pub(crate) fn log(self, ctx: &str) {
+        crate::log(format!(
+            "{ctx}: members elected memberId={} (term {} closed on a majority)",
+            self.leader, self.term
+        ));
+    }
+
     /// The closed election in the logs of the members, one log for each.
     /// The leader is the member whose last role line says LEADER. The
     /// election is closed when a majority of the members, the leader
