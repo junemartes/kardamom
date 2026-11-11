@@ -72,7 +72,7 @@ impl Fixture {
         let rebuilt = rebuild(&refs, &mut archive).unwrap();
         assert_eq!(rebuilt, blocks, "the rebuild returns the archived bytes");
         assert_eq!(feed.absorb(rebuilt).unwrap().next_block, floor);
-        Self::run_feed(feed, live).finish().await;
+        Self::run_feed(feed, Self::replay(live)).finish().await;
     }
 
     /// L1 holds `batches` posts that cover blocks `1..=through` in order,
