@@ -2449,7 +2449,7 @@
           "failed_assertion": "missing log line trie bootstrap complete"
         }
       ],
-      "ci_mode": "docker"
+      "ci_mode": "stack"
     },
     "pipeline-recovery": {
       "command": [
