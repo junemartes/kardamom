@@ -180,7 +180,7 @@ impl Discovered {
         rt: &AeronRuntime,
         key: StreamKey,
     ) -> Result<TypedSubscription<T>, LogError> {
-        self.open_manual(rt, key, TypedSubscription::new)
+        self.open_manual(rt, key, false, TypedSubscription::new)
     }
 
     /// Open a discovered subscription for `key` delivering raw
@@ -190,16 +190,28 @@ impl Discovered {
         rt: &AeronRuntime,
         key: StreamKey,
     ) -> Result<UnboundedReceiver<RawFrame>, LogError> {
-        self.open_manual(rt, key, std::convert::identity)
+        self.open_manual(rt, key, false, std::convert::identity)
+    }
+
+    /// [`Self::open_raw_subscription`] that also reports the join of each
+    /// new image of each destination.
+    pub(super) fn open_raw_subscription_with_joins(
+        &mut self,
+        rt: &AeronRuntime,
+        key: StreamKey,
+    ) -> Result<UnboundedReceiver<RawFrame>, LogError> {
+        self.open_manual(rt, key, true, std::convert::identity)
     }
 
     /// Open the multi-destination subscription of `key`, wrap its raw
     /// frames with `wrap`, and start its watch, reconcile and record
-    /// tasks. The add waits the start-up limit once ([`AddWait`]).
+    /// tasks. With `report_joins`, the joins of new images come as markers
+    /// too. The add waits the start-up limit once ([`AddWait`]).
     fn open_manual<R>(
         &mut self,
         rt: &AeronRuntime,
         key: StreamKey,
+        report_joins: bool,
         wrap: impl FnOnce(UnboundedReceiver<RawFrame>) -> R,
     ) -> Result<R, LogError> {
         let (sub_id, rx) = rt.open_subscription_raw_within(
@@ -207,6 +219,9 @@ impl Discovered {
             key.stream_id,
             self.start_add(rt),
         )?;
+        if report_joins {
+            rt.report_joins(sub_id)?;
+        }
         self.start_reconcile(rt.destinations(sub_id), key);
         self.hold_subscriber_record(key, rt.start_open_limit());
         Ok(wrap(rx))

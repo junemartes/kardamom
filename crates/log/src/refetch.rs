@@ -53,7 +53,12 @@ use crate::error::LogError;
 use crate::recorder::{ArchiveSession, connect_archive_with_timeout};
 use crate::term_layout::TermLayout;
 
+mod join_repair;
 mod recording;
+pub use join_repair::{
+    FetchAnswer, JOIN_REPAIRS_TOTAL, JoinRepair, REFETCH_BUDGET, RefetchWorker, Refetched,
+    SessionFetch,
+};
 #[cfg(any(test, feature = "testing"))]
 pub use recording::FakeArchiveCatalog;
 use recording::{FoundRecording, Located, RecordedLimit, Unresolved, Wanted};
@@ -123,6 +128,16 @@ impl EndpointSource {
             Self::Discovered { .. } => true,
         }
     }
+}
+
+/// What one `tx_data` refetch replayed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Replayed {
+    /// The frames that the replay delivered.
+    pub delivered: u64,
+    /// The raw end position of the replayed range, or `None` when the
+    /// archive had nothing to replay yet.
+    pub end: Option<i64>,
 }
 
 /// Node-local transport config for the refetch client.
@@ -211,6 +226,68 @@ fn spawn_runtime(aeron_dir: Option<&std::path::Path>) -> Result<AeronRuntime, Lo
     }
 }
 
+impl RefetchConfig {
+    /// The refetch config of a reader on `plane`, or `None` when no
+    /// durability-archive endpoints are configured (single-host or IPC
+    /// runs), or when the node-local transport endpoints are missing. The
+    /// archive endpoints are the live archive records on a discovered
+    /// plane, else the static lists of `aeron_cfg`.
+    #[must_use]
+    pub fn for_plane(
+        plane: &mut crate::discovery::StreamPlane,
+        aeron_cfg: &AeronConfig,
+        aeron_dir: Option<&std::path::Path>,
+        response_endpoint: Option<&str>,
+        replay_endpoint: Option<&str>,
+    ) -> Option<Self> {
+        let (tx_data_endpoints, tx_deposits_endpoints) = Self::archive_endpoints(plane, aeron_cfg);
+        if !tx_data_endpoints.is_configured() && !tx_deposits_endpoints.is_configured() {
+            return None;
+        }
+        let (Some(response_endpoint), Some(replay_endpoint)) = (response_endpoint, replay_endpoint)
+        else {
+            warn!(
+                "durability-archive endpoints configured but no local refetch endpoints \
+                 (--archive-control-response-endpoint / --replay-destination-endpoint); \
+                 archive refetch DISABLED"
+            );
+            return None;
+        };
+        Some(Self {
+            tx_data_endpoints,
+            tx_deposits_endpoints,
+            response_endpoint: response_endpoint.to_string(),
+            replay_endpoint: replay_endpoint.to_string(),
+            aeron_dir: aeron_dir.map(std::path::Path::to_path_buf),
+            aeron: aeron_cfg.clone(),
+        })
+    }
+
+    /// The archive endpoint sources of the two refetched topics: the live
+    /// archive records on a discovered plane, else the static lists.
+    fn archive_endpoints(
+        plane: &mut crate::discovery::StreamPlane,
+        aeron_cfg: &AeronConfig,
+    ) -> (EndpointSource, EndpointSource) {
+        match plane.watch_archives() {
+            Some(archives) => (
+                EndpointSource::Discovered {
+                    topic: Topic::TxData,
+                    archives: archives.clone(),
+                },
+                EndpointSource::Discovered {
+                    topic: Topic::TxDeposits,
+                    archives,
+                },
+            ),
+            None => (
+                EndpointSource::Static(aeron_cfg.tx_data_archive_endpoints.clone()),
+                EndpointSource::Static(aeron_cfg.tx_deposits_archive_endpoints.clone()),
+            ),
+        }
+    }
+}
+
 impl ArchiveRefetcher {
     #[must_use]
     pub fn new(cfg: RefetchConfig) -> Self {
@@ -259,8 +336,26 @@ impl ArchiveRefetcher {
         stream_id: i32,
         session_id: i32,
         from: BPosition,
-        mut sink: impl FnMut(TxDataLoc, TxEnvelope),
+        sink: impl FnMut(TxDataLoc, TxEnvelope),
     ) -> Result<u64, LogError> {
+        self.fetch_tx_data_range(stream_id, session_id, from, sink)
+            .map(|range| range.delivered)
+    }
+
+    /// [`Self::fetch_tx_data`], with the end of the replayed range: a
+    /// caller that needs the range up to one position checks that the
+    /// replay reached it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::fetch_tx_data`].
+    pub fn fetch_tx_data_range(
+        &mut self,
+        stream_id: i32,
+        session_id: i32,
+        from: BPosition,
+        mut sink: impl FnMut(TxDataLoc, TxEnvelope),
+    ) -> Result<Replayed, LogError> {
         let endpoints = self.cfg.tx_data_endpoints.current();
         let recs = self.list_or_rotate(&endpoints, stream_id)?;
         let wanted = Wanted {
@@ -270,7 +365,10 @@ impl ArchiveRefetcher {
         };
         let found = wanted.resolve(recs).map_err(|u| self.refuse(u))?;
         let Some(plan) = self.prepare_replay(&endpoints, &found, wanted)? else {
-            return Ok(0);
+            return Ok(Replayed {
+                delivered: 0,
+                end: None,
+            });
         };
         let rec = &found.rec;
 
@@ -322,7 +420,10 @@ impl ArchiveRefetcher {
             delivered,
             "tx_data refetch drained"
         );
-        Ok(delivered)
+        Ok(Replayed {
+            delivered,
+            end: plan.from_raw.checked_add(plan.len),
+        })
     }
 
     /// Refetch `tx_deposits` from `from`, best effort across all recordings of
