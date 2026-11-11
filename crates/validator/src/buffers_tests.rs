@@ -185,6 +185,77 @@ fn a_timeout_with_inserts_keeps_the_wait() {
     h.join().unwrap();
 }
 
+// A restart under load: the first keys that arrive are near the head,
+// closer than the catch-up horizon, and inserts keep coming, so the
+// buffer is never quiet. A key below every arrival went out before the
+// subscription started, so its take returns at once.
+#[test]
+fn a_key_below_every_arrival_does_not_wait() {
+    let bals = BalBuffer::new();
+    (10..14).for_each(|block| insert(&bals, R1, block, 100));
+    let start = std::time::Instant::now();
+    let got = bals.take(5, Duration::from_secs(5));
+    assert!(got.current.is_empty());
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "a key below the arrival floor must not wait: {:?}",
+        start.elapsed()
+    );
+}
+
+// The same rule holds for the receipts, whose catch-up horizon is 4096
+// records: a restarted validator is closer to the head than that.
+#[test]
+fn a_receipt_below_every_arrival_does_not_wait() {
+    let buf = ReceiptBuffer::new();
+    (100..104).for_each(|idx| {
+        buf.receipts.insert(
+            BPosition::from_index(idx),
+            R1,
+            receipt(idx, true, 21_000, 0xab),
+        );
+    });
+    let start = std::time::Instant::now();
+    let got = buf
+        .receipts
+        .take(BPosition::from_index(50), Duration::from_secs(5));
+    assert!(got.current.is_empty());
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "a receipt below the arrival floor must not wait: {:?}",
+        start.elapsed()
+    );
+}
+
+// A key at or above the arrival floor can still come, so its take waits
+// for it.
+#[test]
+fn a_key_above_the_arrival_floor_waits() {
+    let bals = BalBuffer::new();
+    (10..14).for_each(|block| insert(&bals, R1, block, 100));
+    let bals2 = bals.clone();
+    let h = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        insert(&bals2, R2, 15, 100);
+    });
+    let got = bals.take(15, Duration::from_secs(2));
+    assert_eq!(got.current.len(), 1, "the take must wait above the floor");
+    h.join().unwrap();
+}
+
+// A slow replica sends a key below the floor after the consumer passed
+// it. The key lowers the floor, and the consumer gets it as a late
+// entry with its next take.
+#[test]
+fn a_late_key_below_the_floor_is_handed_over() {
+    let bals = BalBuffer::new();
+    (10..14).for_each(|block| insert(&bals, R1, block, 100));
+    assert!(bals.take(8, Duration::from_secs(5)).current.is_empty());
+    insert(&bals, R2, 8, 100);
+    let got = bals.take(9, Duration::from_millis(10));
+    assert_eq!(got.late.len(), 1, "the late key goes to the consumer");
+}
+
 // One wrong key far ahead is not a live head. It does not turn the
 // catch-up skip on, so the consumer still waits for its own key.
 #[test]
