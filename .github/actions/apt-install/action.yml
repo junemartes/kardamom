@@ -1,9 +1,10 @@
 ---
 name: apt-install
 description: >-
-  Install apt packages. When the install fails, try again with public DNS
-  resolvers: the resolver of a hosted runner can fail for the Ubuntu
-  mirrors for a whole job, while every other name resolves.
+  Install apt packages, with a time bound on each apt call. When the
+  install fails, try again with public DNS resolvers: the resolver of a
+  hosted runner can fail for the Ubuntu mirrors for a whole job, while
+  every other name resolves.
 inputs:
   packages:
     description: The packages, separated by spaces.
@@ -16,16 +17,19 @@ runs:
       env:
         PACKAGES: ${{ inputs.packages }}
       run: |
+        # Each apt call has a time bound: a mirror that accepts a
+        # connection and sends nothing holds apt-get with no output.
         install() {
           # shellcheck disable=SC2086  # PACKAGES is a list of words.
-          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends $PACKAGES
+          sudo timeout 120 apt-get update -qq \
+            && sudo timeout 300 apt-get install -y --no-install-recommends $PACKAGES
         }
         install && exit 0
         echo "::warning::apt failed with the resolver of the runner; the install tries public resolvers"
         sudo cp -L /etc/resolv.conf /tmp/resolv.conf.runner
         printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf > /dev/null
         status=1
-        for attempt in 1 2 3 4 5; do
+        for attempt in 1 2 3; do
           if install; then status=0; break; fi
           echo "attempt $attempt failed"
           sleep 30
