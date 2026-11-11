@@ -49,9 +49,9 @@ jobs:
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
       - name: Install system build deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libbsd-dev uuid-dev
       # The check-profile caches. This job saves them for the style job.
       - uses: ./.github/actions/rust-build-cache
         with:
@@ -76,9 +76,9 @@ jobs:
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
       - name: Install system build deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libbsd-dev uuid-dev
       - uses: ./.github/actions/rust-build-cache
         with:
           shared-key: check
@@ -124,9 +124,9 @@ jobs:
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
       - name: Install system build deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libbsd-dev uuid-dev
       - uses: ./.github/actions/rust-build-cache
         with:
           save-if: ${{ github.event_name == 'push' }}
@@ -355,9 +355,9 @@ jobs:
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
       - name: Install system build deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libbsd-dev uuid-dev
       # The dev-profile caches. This job compiles every target of the
       # workspace, so it saves them for the other dev-profile jobs.
       - uses: ./.github/actions/rust-build-cache
@@ -380,9 +380,9 @@ jobs:
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
       - name: Install system build deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libbsd-dev uuid-dev
       - uses: ./.github/actions/rust-build-cache
         with:
           shared-key: dev
@@ -501,9 +501,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: System deps (Aeron FFI links libbsd/uuid)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libbsd-dev uuid-dev
       - uses: dtolnay/rust-toolchain@stable
       # The DHAT build in the release profile. It saves the release
       # caches, which the EEST job restores too.
