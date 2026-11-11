@@ -36,7 +36,7 @@ class ClusterTotalLossRecoverTest {
         try (LocalSealers group = new LocalSealers(dir, 3, SNAPSHOTS);
              CanonicalClient client = new CanonicalClient(dir.resolve("client"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
-            group.awaitLeader(Duration.ofSeconds(20));
+            group.awaitStarted(Duration.ofSeconds(20));
             IntStream.range(0, 3).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));
             // The second snapshot proves that the consensus module recorded the first one.
             Await.holds(Duration.ofSeconds(10), "two snapshots on every member", () -> group.nodes().stream()

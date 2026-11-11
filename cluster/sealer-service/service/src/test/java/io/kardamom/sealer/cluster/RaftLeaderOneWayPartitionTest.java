@@ -45,7 +45,7 @@ class RaftLeaderOneWayPartitionTest {
         try (LocalSealers group = new LocalSealers(dir, 3, LocalSealers.Settings.DEFAULT);
              CanonicalClient client = new CanonicalClient(dir.resolve("client"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
-            final SealerNode.View before = group.awaitLeader(Duration.ofSeconds(20));
+            final SealerNode.View before = group.awaitStarted(Duration.ofSeconds(20));
             IntStream.range(0, 3).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));
             final SealerNode old = group.node(before.memberId());
             final long pid = old.pid();

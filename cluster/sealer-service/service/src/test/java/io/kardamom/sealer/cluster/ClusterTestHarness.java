@@ -65,6 +65,23 @@ final class ClusterTestHarness {
     }
 
     /**
+     * Shut the cluster down in order. The caller closes it afterwards. A
+     * switch of the rules asks for a snapshot, and a small replay window
+     * makes the members take snapshots often. A member that closes while
+     * its service takes a snapshot logs a failed ack, and the watcher fails
+     * the test. An ordered shutdown lets every member finish its snapshot
+     * first. A pending snapshot request holds the control toggle, so the
+     * shutdown waits until the toggle of the leader is neutral.
+     */
+    static void shutDown(final TestCluster cluster) {
+        final TestNode leader = cluster.awaitLeader();
+        cluster.awaitNeutralControlToggle(leader);
+        cluster.terminationsExpected(true);
+        cluster.shutdownCluster(leader);
+        cluster.awaitNodeTerminations();
+    }
+
+    /**
      * Poll egress until {@code done} holds. This loop only yields; it never
      * calls {@code Thread.sleep}. The test's
      * {@link io.aeron.test.InterruptAfter} bounds it, so a missing event

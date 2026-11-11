@@ -41,7 +41,7 @@ class RaftLeaderPacketDelayTest {
         try (LocalSealers group = new LocalSealers(dir, 3, LocalSealers.Settings.DEFAULT);
              CanonicalClient client = new CanonicalClient(dir.resolve("client"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
-            final SealerNode leader = group.node(group.awaitLeader(Duration.ofSeconds(20)).memberId());
+            final SealerNode leader = group.node(group.awaitStarted(Duration.ofSeconds(20)).memberId());
             IntStream.range(0, 3).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));
             final long pid = leader.pid();
 
