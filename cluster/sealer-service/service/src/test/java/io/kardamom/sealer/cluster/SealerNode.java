@@ -38,7 +38,14 @@ final class SealerNode implements AutoCloseable {
     private static final Pattern FIELD = Pattern.compile("\"(\\w+)\":\"?([^,\"}]*)\"?");
 
     /** The admin status of a member, as {@code /status} answers it. */
-    record View(int memberId, String role, String election, long commitPosition, long servicePosition, long term) {
+    record View(
+            int memberId,
+            String role,
+            String election,
+            long commitPosition,
+            long servicePosition,
+            long term,
+            boolean startHold) {
         boolean isLeader() {
             return "LEADER".equals(role) && "CLOSED".equals(election);
         }
@@ -55,7 +62,7 @@ final class SealerNode implements AutoCloseable {
             }
             return new View(Integer.parseInt(f.get("memberId")), f.get("role"), f.get("election"),
                 Long.parseLong(f.get("commitPosition")), Long.parseLong(f.get("servicePosition")),
-                Long.parseLong(f.get("leadershipTermId")));
+                Long.parseLong(f.get("leadershipTermId")), Boolean.parseBoolean(f.get("startHold")));
         }
     }
 

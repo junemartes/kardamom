@@ -38,7 +38,7 @@ class ClusterQuorumLossRecoverTest {
              CanonicalClient client = new CanonicalClient(dir.resolve("client"), group);
              CanonicalConsumer executor = new CanonicalConsumer(dir.resolve("executor"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
-            group.awaitLeader(Duration.ofSeconds(20));
+            group.awaitStarted(Duration.ofSeconds(20));
             IntStream.range(0, 3).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));
             Stage.log("quorum-loss: leader");
 

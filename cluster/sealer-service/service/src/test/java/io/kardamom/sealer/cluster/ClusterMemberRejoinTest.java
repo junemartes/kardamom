@@ -36,7 +36,7 @@ class ClusterMemberRejoinTest {
         try (LocalSealers group = new LocalSealers(dir, 3, Purged.SETTINGS);
              CanonicalClient client = new CanonicalClient(dir.resolve("client"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
-            final int leader = group.awaitLeader(Duration.ofSeconds(20)).memberId();
+            final int leader = group.awaitStarted(Duration.ofSeconds(20)).memberId();
             Purged.fillAndAwaitPurge(group, client, leader);
 
             final SealerNode follower = group.node((leader + 1) % 3);

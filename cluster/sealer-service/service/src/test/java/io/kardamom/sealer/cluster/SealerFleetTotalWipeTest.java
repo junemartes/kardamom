@@ -49,7 +49,7 @@ class SealerFleetTotalWipeTest {
         try (LocalSealers group = new LocalSealers(dir, 3, LocalSealers.Settings.DEFAULT);
              CanonicalClient client = new CanonicalClient(dir.resolve("client"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
-            group.awaitLeader(Duration.ofSeconds(20));
+            group.awaitStarted(Duration.ofSeconds(20));
             IntStream.range(0, 5).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));
             final long[] posted = Await.until(Duration.ofSeconds(10), "a boundary after the first records", () -> {
                 client.head();

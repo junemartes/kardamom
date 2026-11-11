@@ -265,6 +265,26 @@ final class LocalSealers implements AutoCloseable {
         return Await.until(bound, "one leader with a closed election", this::leader);
     }
 
+    /**
+     * Wait until one member leads and every member is out of its start hold.
+     * Return the leader. A member in its start hold sends nothing to its
+     * clients. A follower that still holds when its leader dies cannot
+     * leave the hold before the stall limit: the dead leader answered it
+     * once, and does not agree now. So a test injects its first fault only
+     * after this wait.
+     */
+    SealerNode.View awaitStarted(final Duration bound) {
+        return Await.until(bound, "one leader, and every member out of its start hold", this::started);
+    }
+
+    /** The one leader, once every member answers and none holds its outputs. */
+    private Optional<SealerNode.View> started() {
+        final List<SealerNode.View> views = views();
+        final List<SealerNode.View> leaders = views.stream().filter(SealerNode.View::isLeader).toList();
+        final boolean out = views.size() == nodes.size() && views.stream().noneMatch(SealerNode.View::startHold);
+        return out && leaders.size() == 1 ? Optional.of(leaders.get(0)) : Optional.empty();
+    }
+
     /** Wait until a leader other than {@code old} leads a term above {@code term}. */
     SealerNode.View awaitNewLeader(final int old, final long term, final Duration bound) {
         return Await.until(bound, "a new leader in a term above " + term, () -> leader()
