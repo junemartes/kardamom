@@ -965,6 +965,7 @@ A divergence is a state, not a dead process.
   - The per-block BALs ride a lossy `tx_bal` multicast. Its term buffer holds only the recent window.
   - A backlog block more than `BACKLOG_LOOKBEHIND` (16) blocks behind the live head has an unrecoverable BAL. The live head is a run of at least 4 buffered blocks beyond that distance, so one wrong block number far ahead does not turn the skip on.
   - The validator **commits such a block unverified at once**. It does not wait the full BAL timeout for each block, because that wait would make the catch-up slower than the chain grows.
+  - A block or a receipt below the first one that the validator got after its start went out before its subscription. It does not come, so the validator commits it unverified at once. This rule needs 4 arrivals. Without it, a restart under load waits for each such key until the head moves on (16 blocks for a BAL, 4096 records for a receipt), so the validator follows the chain at the chain's own rate and does not catch up.
   - Continuous verification is a property of a validator that is caught up, at the head.
 - **Brief lapse** (a pause or stall shorter than the live term buffer)
   - The coverage is complete. The missed BALs are still buffered on resume. Verification continues with no gap.
