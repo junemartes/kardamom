@@ -204,8 +204,21 @@ final class CarryCluster implements AutoCloseable {
         return ((SealerTestService) node.service()).delegate();
     }
 
+    /**
+     * Shut the cluster down in order, then close it. The small replay window
+     * makes the members take snapshots often. A member that closes while its
+     * service takes a snapshot logs a failed ack, and the watcher fails the
+     * test. An ordered shutdown lets every member finish its snapshot first.
+     * A pending snapshot request holds the control toggle, so the shutdown
+     * waits until the toggle of the leader is neutral.
+     */
     @Override
     public void close() {
+        final TestNode leader = cluster.awaitLeader();
+        cluster.awaitNeutralControlToggle(leader);
+        cluster.terminationsExpected(true);
+        cluster.shutdownCluster(leader);
+        cluster.awaitNodeTerminations();
         cluster.close();
         System.clearProperty(RETENTION);
     }
