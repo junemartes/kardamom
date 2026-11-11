@@ -26,12 +26,17 @@
     container_host_prepared: true
 
 # The node contract gives the node address and name. The roles read one
-# gathered fact, the architecture, and only to install software on a node
-# without the prepared image. The minimal subset holds it.
+# gathered fact, the architecture: the fingerprint of the prepared
+# software (node-software.yml) names it. The platform subset holds it, so
+# the play gathers that subset only.
 - name: Configure and start the agents of the replaced node
   hosts: container_nodes
   become: true
-  gather_subset: [min]
+  gather_facts: false
+  pre_tasks:
+    - name: Gather the platform facts of the replaced node
+      ansible.builtin.setup:
+        gather_subset: ['!all', '!min', 'platform']
   roles:
     - common
     - docker
