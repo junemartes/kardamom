@@ -1,0 +1,35 @@
+---
+name: apt-install
+description: >-
+  Install apt packages. When the install fails, try again with public DNS
+  resolvers: the resolver of a hosted runner can fail for the Ubuntu
+  mirrors for a whole job, while every other name resolves.
+inputs:
+  packages:
+    description: The packages, separated by spaces.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install ${{ inputs.packages }}
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        install() {
+          # shellcheck disable=SC2086  # PACKAGES is a list of words.
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends $PACKAGES
+        }
+        install && exit 0
+        echo "::warning::apt failed with the resolver of the runner; the install tries public resolvers"
+        sudo cp -L /etc/resolv.conf /tmp/resolv.conf.runner
+        printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf > /dev/null
+        status=1
+        for attempt in 1 2 3 4 5; do
+          if install; then status=0; break; fi
+          echo "attempt $attempt failed"
+          sleep 30
+        done
+        # The rest of the job uses the resolver of the runner again.
+        sudo cp /tmp/resolv.conf.runner /etc/resolv.conf
+        exit "$status"
