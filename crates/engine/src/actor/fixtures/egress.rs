@@ -2,6 +2,7 @@
 //! with `--egress` opens it.
 
 use std::cell::Cell;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::time::Duration;
@@ -63,6 +64,9 @@ impl TestEgress {
         last: None,
     };
 
+    /// The loopback address on a port that the system picks.
+    const FREE_PORT: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+
     /// Serve on `rt` a store in `dir` that starts at `genesis` and holds
     /// `frames` in order.
     ///
@@ -76,7 +80,24 @@ impl TestEgress {
         genesis: Head,
         frames: &[Vec<u8>],
     ) -> Self {
-        Self::serve_with(rt, dir, genesis, Retention::LONG, frames)
+        Self::serve_at(rt, Self::FREE_PORT, dir, genesis, Retention::LONG, frames)
+    }
+
+    /// [`Self::serve`] on `addr`: a restarted egress keeps the address that
+    /// its readers know.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store does not open or the HTTP side does not bind.
+    #[must_use]
+    pub fn serve_on(
+        rt: &tokio::runtime::Runtime,
+        addr: SocketAddr,
+        dir: &Path,
+        genesis: Head,
+        frames: &[Vec<u8>],
+    ) -> Self {
+        Self::serve_at(rt, addr, dir, genesis, Retention::LONG, frames)
     }
 
     /// Serve on `rt` a store in `dir` that starts at `genesis`, keeps its
@@ -89,6 +110,19 @@ impl TestEgress {
     #[must_use]
     pub fn serve_with(
         rt: &tokio::runtime::Runtime,
+        dir: &Path,
+        genesis: Head,
+        retention: Retention,
+        frames: &[Vec<u8>],
+    ) -> Self {
+        Self::serve_at(rt, Self::FREE_PORT, dir, genesis, retention, frames)
+    }
+
+    /// Serve on `addr`, with the store of `dir` from `genesis`, kept by
+    /// `retention`, that holds `frames` in order.
+    fn serve_at(
+        rt: &tokio::runtime::Runtime,
+        addr: SocketAddr,
         dir: &Path,
         genesis: Head,
         retention: Retention,
@@ -118,9 +152,7 @@ impl TestEgress {
         let owner = Owner::new(cfg, parts);
         let (inputs, rx) = crossbeam_channel::bounded(64);
         std::thread::spawn(move || owner.run(&rx));
-        let http = rt
-            .block_on(Http::bind("127.0.0.1:0".parse().unwrap(), inputs.clone()))
-            .unwrap();
+        let http = rt.block_on(Http::bind(addr, inputs.clone())).unwrap();
         let base = format!("http://{}", http.local_addr().unwrap());
         rt.spawn(http.serve());
         let egress = Self {
@@ -130,12 +162,6 @@ impl TestEgress {
         };
         egress.append(frames);
         egress
-    }
-
-    /// The base URL of the HTTP side, `http://host:port`.
-    #[must_use]
-    pub fn base(&self) -> &str {
-        &self.base
     }
 
     /// Deliver `frames` from the copy, after the frames before them.
@@ -194,6 +220,12 @@ impl TestEgress {
         }
     }
 
+    /// The base URL of this egress, `http://host:port`.
+    #[must_use]
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
     /// A transport of this egress, and the live `egress_order` stream that
     /// it reads after a replay. Its range reads run on `rt`.
     pub(crate) fn transport(
@@ -230,6 +262,23 @@ impl TestEgress {
             envelope: envelope.clone(),
         };
         encode_egress_record(index, &entry.payload().unwrap()).unwrap()
+    }
+
+    /// The frame of `epoch` at the canonical index `index`, as the sealer
+    /// relays an origin record: its id, its record type, and its body.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the epoch does not serialize.
+    pub(super) fn epoch_frame(index: u64, epoch: &kardamom_types::EpochRecord) -> Vec<u8> {
+        let body = rkyv::to_bytes::<rkyv::rancor::Error>(epoch).unwrap();
+        let payload = [
+            epoch.canonical_id().as_slice(),
+            &[kardamom_cluster_adapter::wire::RT_EPOCH],
+            body.as_slice(),
+        ]
+        .concat();
+        encode_egress_record(index, &payload).unwrap()
     }
 
     /// The frame of the boundary `b`.

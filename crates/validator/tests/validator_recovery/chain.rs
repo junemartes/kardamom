@@ -151,6 +151,7 @@ impl Entries {
             .map(|entry| match entry {
                 TestEntry::Tx(envelope) => TestEntry::Tx(envelope.clone()),
                 TestEntry::Boundary(b) => TestEntry::Boundary(b.clone()),
+                TestEntry::Epoch(epoch) => TestEntry::Epoch(epoch.clone()),
             })
             .collect()
     }
@@ -257,8 +258,9 @@ struct Recorded {
 /// The canonical stream as the cluster relays it: the reference of each
 /// transaction on `tx_ordering` and its envelope on `tx_data` lane 0, at
 /// the canonical index of the record. A boundary takes the index of the
-/// next transaction. The egress serves the same records at the same
-/// indexes, so both readers give the engine the same input.
+/// next transaction. An epoch takes one index for its marker and one for
+/// each deposit. The egress serves the same records at the same indexes,
+/// so both readers give the engine the same input.
 struct Cluster;
 
 impl Cluster {
@@ -267,7 +269,7 @@ impl Cluster {
         let (refs, refs_rx) = crossbeam_channel::unbounded();
         let indexed = entries.iter().scan(0u64, |next, entry| {
             let index = *next;
-            *next = index + u64::from(matches!(entry, TestEntry::Tx(_)));
+            *next = index + entry.slots();
             Some((BPosition::from_index(index), entry))
         });
         indexed.for_each(|(position, entry)| {
@@ -277,6 +279,7 @@ impl Cluster {
                     TxOrderingMessage::TxRef(TxRef::new(envelope.tx_hash, 0, position, 0))
                 }
                 TestEntry::Boundary(b) => TxOrderingMessage::BoundaryStart(b.clone()),
+                TestEntry::Epoch(epoch) => TxOrderingMessage::Epoch(epoch.clone()),
             };
             refs.send((position, msg)).unwrap();
         });
