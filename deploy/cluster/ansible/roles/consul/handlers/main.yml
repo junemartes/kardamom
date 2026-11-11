@@ -1,5 +1,10 @@
 ---
+# A service that this play started read the new files at its start, so it
+# needs no restart. The start task reports the state of the unit before
+# the start: only a unit that was active then runs the old files. On a
+# new node the restart cost 10 to 20 s for each service.
 - name: Restart consul
+  when: (consul_start.status | default({})).ActiveState | default('active') == 'active'
   ansible.builtin.systemd:
     name: consul
     state: restarted
