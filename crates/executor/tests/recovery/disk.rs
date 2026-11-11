@@ -335,5 +335,4 @@ fn a_full_checkpoint_volume_keeps_the_same_executor_committing_and_recovers() {
     let reference = world.reference(head);
     victim.assert_matches(&reference, head);
     victim.assert_no_republished();
-    drop(container);
 }

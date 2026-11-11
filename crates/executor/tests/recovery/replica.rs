@@ -75,9 +75,8 @@ fn a_blank_replacement_fetches_a_peer_checkpoint_and_catches_up() {
         fleet.0[0].cfg.serve.to_string(),
         fleet.0[2].cfg.serve.to_string(),
     ];
-    let old = std::mem::replace(&mut fleet.0[1], replacement);
-    assert_ne!(old.cfg.serve, fleet.0[1].cfg.serve, "a new address");
-    drop(old);
+    let old_address = std::mem::replace(&mut fleet.0[1], replacement).cfg.serve;
+    assert_ne!(old_address, fleet.0[1].cfg.serve, "a new address");
     fleet.0[1].start();
     fleet.wait_head(load.sealed() + 5, CATCH_UP);
     let head = load.halt();

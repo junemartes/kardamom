@@ -65,6 +65,13 @@ impl SavedJob {
         self.post(&self.definition).await
     }
 
+    /// Register `definition` under the saved job's id and return at once,
+    /// with the version Nomad gave it. A caller that expects the rollout
+    /// to fail reads the deployment of that version itself.
+    pub(crate) async fn submit(&self, definition: &Value) -> anyhow::Result<Job> {
+        self.post(definition).await
+    }
+
     /// Register `definition` under the saved job's id. Returns the job as
     /// Nomad holds it now, with the version the allocations must reach.
     async fn post(&self, definition: &Value) -> anyhow::Result<Job> {

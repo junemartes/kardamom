@@ -1,5 +1,10 @@
 //! The carry sealer evicts old frames. The durable egress keeps the
 //! unposted range even when it exceeds the readers' retention window.
+//!
+//! The batcher freezes first. The roll of the egress to the short reader
+//! window and the restore of its own window each run beside a wait of
+//! the case: the first beside the sealing past the frozen cursor, the
+//! second beside the posts after the thaw.
 
 use std::time::Duration;
 
@@ -19,9 +24,24 @@ use job::{SEGMENT_BLOCKS, WindowJob};
 use replay::{Copies, Cursor};
 
 const CTX: &str = "prune-floor";
-const KEEP_BLOCKS: u64 = 64;
+/// The reader window of the fault, in blocks. The sealed head must pass
+/// the frozen cursor by the window and one segment, at one block per 2 s
+/// tick, so a short window keeps the fault short.
+const KEEP_BLOCKS: u64 = 12;
+/// The L1 blocks mined on each read of the posts after the thaw. Anvil
+/// mines a block only for a transaction and finalizes two blocks behind
+/// its head, so the last posts confirm only after two more blocks.
+const FINALIZE_HEAD: u64 = 3;
 
 pub(super) struct CarryFloor;
+
+/// The egress job of the fault: as saved, with the short window, and the
+/// copies that ran before the roll.
+struct Window<'a> {
+    saved: &'a SavedJob,
+    job: &'a WindowJob,
+    old: Copies,
+}
 
 #[derive(Debug, Serialize)]
 struct Proof {
@@ -38,11 +58,8 @@ impl CarryFloor {
     pub(super) async fn run(h: &Harness) -> anyhow::Result<()> {
         let saved = SavedJob::capture(&h.nomad, "egress").await?;
         let configured = WindowJob::new(saved.definition(), KEEP_BLOCKS)?;
-        crate::log(format!(
-            "{CTX}: set the egress reader window to {KEEP_BLOCKS} blocks in {SEGMENT_BLOCKS}-block segments for this fault"
-        ));
-        let verdict = Self::configured(h, &saved, &configured).await;
-        let restored = saved.restore().await;
+        let sealed = Self::configured(h, &saved, &configured).await;
+        let (verdict, restored) = tokio::join!(Self::after_thaw(h, sealed), saved.restore());
         if let Err(error) = &restored {
             crate::log(format!("{CTX}: restoring the egress job fails: {error:#}"));
         }
@@ -51,31 +68,46 @@ impl CarryFloor {
         h.assert_executor_progress(Duration::from_mins(2)).await
     }
 
-    async fn configured(h: &Harness, saved: &SavedJob, job: &WindowJob) -> anyhow::Result<()> {
-        saved.register(job.definition()).await?;
-        let copies = Copies::of(h).await?;
-        copies.head().await?;
+    /// The fault with the short reader window: the sealed head at the
+    /// thaw. The batcher thaws on both outcomes.
+    async fn configured(h: &Harness, saved: &SavedJob, job: &WindowJob) -> anyhow::Result<u64> {
+        let old = Copies::of(h).await?;
+        old.head().await?;
         let snapshots = h
             .evidence
             .count_lines(CLUSTER_TASK, SNAPSHOT_TAKEN, Streams::StdoutOnly)
             .await?;
         let frozen = FrozenBatcher::freeze(h, CTX).await?;
-        let verdict = Self::frozen(h, &copies, snapshots).await;
+        let verdict = Self::frozen(h, Window { saved, job, old }, snapshots).await;
         frozen.thaw(h, CTX).await;
         let proof = verdict?;
         std::fs::write(
             "/tmp/chaos-prune-floor-fault.json",
             serde_json::to_vec_pretty(&proof)?,
         )?;
-        Self::posted(h, u64::try_from(proof.sealed)?).await
+        Ok(u64::try_from(proof.sealed)?)
     }
 
-    async fn frozen(h: &Harness, copies: &Copies, snapshots: usize) -> anyhow::Result<Proof> {
-        let cursor = copies.head().await?;
+    /// The posts through the sealed head of the thaw, when the fault
+    /// passed.
+    async fn after_thaw(h: &Harness, sealed: anyhow::Result<u64>) -> anyhow::Result<()> {
+        Self::posted(h, sealed?).await
+    }
+
+    /// Take the frozen cursor from the running copies, roll the egress to
+    /// the short window, and wait until the carry floor and the sealed
+    /// head pass the cursor and a snapshot lands.
+    async fn frozen(h: &Harness, window: Window<'_>, snapshots: usize) -> anyhow::Result<Proof> {
+        let cursor = window.old.head().await?;
+        crate::log(format!(
+            "{CTX}: set the egress reader window to {KEEP_BLOCKS} blocks in {SEGMENT_BLOCKS}-block segments for this fault"
+        ));
+        window.saved.register(window.job.definition()).await?;
+        let copies = Copies::of(h).await?;
         let last = std::cell::Cell::new(None);
         let last_ref = &last;
         let (stretched, _) = poll::until(
-            Budget::new(h.knobs.retention_freeze_cap, Duration::from_secs(10)),
+            Budget::new(h.knobs.retention_freeze_cap, Duration::from_secs(3)),
             |_| async move {
                 let status = require_status(h, CTX).await?;
                 last_ref.set(Some(status));
@@ -138,7 +170,8 @@ impl CarryFloor {
     async fn posted(h: &Harness, sealed: u64) -> anyhow::Result<()> {
         let l1 = L1::new(h).await?;
         let l1_ref = &l1;
-        poll::until(Budget::secs(300, 5), |_| async move {
+        poll::until(Budget::secs(300, 3), |_| async move {
+            l1_ref.mine(FINALIZE_HEAD).await?;
             Ok::<_, anyhow::Error>((l1_ref.covered_through().await? >= sealed).then_some(()))
         })
         .await?

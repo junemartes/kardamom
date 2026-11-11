@@ -177,9 +177,6 @@ impl Partition {
     async fn run(&self, h: &mut Harness) -> anyhow::Result<()> {
         let during = self.exercise(h).await;
         let cleared = h.nodes.exec(&self.node, &Self::clear_script()).await;
-        if let Err(error) = &cleared {
-            crate::log(format!("{CTX}: clearing the partition fails: {error:#}"));
-        }
         let report = serde_json::json!({
             "case": CTX, "direction": "old leader to peers only", "ports": PORTS,
             "old_leader": self.leader, "old_term": self.term, "proof": during.as_ref().ok(),
@@ -188,16 +185,44 @@ impl Partition {
             "failure": during.as_ref().err().map(|error| format!("{error:#}")),
             "cleanup_failure": cleared.as_ref().err().map(|error| format!("{error:#}")),
         });
-        let saved = std::fs::write(
-            "/tmp/chaos-raft-leader-one-way-partition-fault.json",
-            serde_json::to_vec_pretty(&report)?,
-        );
-        during?;
-        cleared?;
+        FaultEnd {
+            ctx: CTX,
+            outcome: during,
+            cleared,
+            path: "/tmp/chaos-raft-leader-one-way-partition-fault.json",
+            report,
+        }
+        .conclude(h)
+        .await
+    }
+}
+
+/// The end of one Raft fault: its result, the result of its cleanup,
+/// and the evidence report with the file it goes to.
+struct FaultEnd<'a, T, C> {
+    ctx: &'a str,
+    outcome: anyhow::Result<T>,
+    cleared: anyhow::Result<C>,
+    path: &'a str,
+    report: serde_json::Value,
+}
+
+impl<T, C> FaultEnd<'_, T, C> {
+    /// Log a failed cleanup and save the report. Then fail on the first
+    /// error of the fault, the cleanup and the save. Else prove that
+    /// every member runs again, the chain progresses, and one leader
+    /// rules each term.
+    async fn conclude(self, h: &mut Harness) -> anyhow::Result<()> {
+        if let Err(error) = &self.cleared {
+            crate::log(format!("{}: cleanup fails: {error:#}", self.ctx));
+        }
+        let saved = std::fs::write(self.path, serde_json::to_vec_pretty(&self.report)?);
+        self.outcome?;
+        self.cleared?;
         saved?;
         h.assert_count(CLUSTER_TASK, 3, h.knobs.rejoin_slo).await?;
         h.assert_progress().await?;
-        Check::assert_one_leader(h, CTX).await
+        Check::assert_one_leader(h, self.ctx).await
     }
 }
 

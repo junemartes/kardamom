@@ -17,6 +17,7 @@
 
 pub mod cases;
 mod epochs;
+mod floors;
 pub mod lapse;
 pub mod load;
 pub mod sealer_logs;

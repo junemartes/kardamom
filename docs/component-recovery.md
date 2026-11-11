@@ -221,7 +221,26 @@ primary, a replica and three Sentinels at once. Fixed host ports stand in for st
 service addresses. While the group is down, the production reader degrades without a
 stall and the mirror marks a rebuild. The group returns empty, the Sentinels name a
 primary, and the mirror rebuilds every account once a checkpoint reaches its first
-live batch.
+live batch. A second check kills three mirrors with the group. Two production
+readers must count a degraded read with no stall. The mirrors return first and
+wait for Redis, Redis returns empty, then a newer checkpoint and a live batch come. Every mirror must rebuild,
+and each reader must count a Redis hit and no degraded read. The fixture takes its
+host ports from 20000-29999 under a lock file, so two runs on one host cannot share
+a port, also while the containers are down.
+
+`just test-component sequencer-resize` scales the real sequencer core from two
+lanes to three and back, with the production shard map. A gaining lane warms its
+incoming slots in shadow mode, reading the old lanes, and must offer nothing until
+the warm-up passes. One replica of the new lane dies during the overlap and returns.
+The ingress then routes by the new map, the old lanes drain, and every lane restarts
+with its final slots. The sealer orders first seen first, and each ordered
+transaction returns to every replica as a receipt floor. Every sender must reach the
+canonical log with every nonce once, in order.
+
+`just test-component ingress-sealer-quorum` checks that the ingress halts on a
+lost sealer quorum once no status frame arrives for the silence budget, and that a
+status ends the halt. With the executor test that waits for absent sealers and the
+sealer total-loss test of `sealer-raft-fleet`, it covers executor-sealer-loss-recover.
 
 `just test-component transport-mds-remove` removes MDS receive destinations while two
 streams run, and returns a node to the same control endpoint three times. Every frame

@@ -13,8 +13,9 @@ use crate::harness::Harness;
 use crate::poll::{self, Budget};
 use crate::probes::Boundaries;
 
-/// The window between the two head readings that judge the expectation.
-const WINDOW: Duration = Duration::from_secs(15);
+/// The window between the two head readings that judge the expectation:
+/// five sealer ticks of 2 s.
+const WINDOW: Duration = Duration::from_secs(10);
 /// How long a live ingress gets to refuse a submit on the lost quorum:
 /// the sealer silence an ingress tolerates, then its next status poll.
 const REFUSAL_BUDGET: Duration = Duration::from_secs(60);
