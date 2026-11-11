@@ -18,16 +18,19 @@ use super::{
     FULL_RESTART_ELECTION, RESUMED, StateOwner, evidence_dir, install_image, install_rebuilt_image,
     sealers, unchecked_target, wipe_node,
 };
-use crate::cases::cache::freeze_and_flush;
+use crate::cases::cache::flush_primary;
 use crate::cases::component::wipe_dirs;
 use crate::cases::member_storage::MemberStorage;
 use crate::evidence::CountWait;
 use crate::harness::Harness;
 use crate::l1::L1;
-use crate::nomad::{Nodes, SavedJob, Streams};
+use crate::nomad::{SavedJob, Streams};
 use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
 use crate::stages::rebuild::{Output, Rebuild, Rebuilt};
+
+mod executors;
+use executors::Executors;
 
 pub(super) const CTX: &str = "sealer-fleet-total-wipe-recover";
 
@@ -330,7 +333,7 @@ impl<'a> FleetWipe<'a> {
         wipe_dirs(self.h, &self.aux, CTX, &owner.wipe_script()).await?;
         install_image(self.h, CTX, &self.aux, &owner, &seeded.validator).await?;
         wipe_dirs(self.h, &self.aux, CTX, BATCHER_WIPE).await?;
-        let primary = freeze_and_flush(self.h, CTX, &[]).await?;
+        let primary = flush_primary(self.h, CTX).await?;
         crate::log(format!(
             "{CTX}: old state wiped; account cache {primary} flushed"
         ));
@@ -576,40 +579,6 @@ impl<'a> FleetWipe<'a> {
         if let Err(e) = job.restore().await {
             crate::log(format!("{CTX}: could not start a job again: {e:#}"));
         }
-    }
-}
-
-/// The executor nodes of the case. The stale one keeps the state of the
-/// old chain. The fresh ones resume on the rebuilt image at once.
-struct Executors {
-    /// The container of the stale executor.
-    stale: String,
-    /// The containers of the fresh executors.
-    fresh: Vec<String>,
-    /// The Nomad names of the fresh executor nodes.
-    fresh_nodes: Nodes,
-    /// The count of executor nodes: the fresh ones and the stale one.
-    count: usize,
-}
-
-impl Executors {
-    /// The executor nodes of the contract, by index. The last one is the
-    /// stale one.
-    fn of(h: &Harness) -> anyhow::Result<Self> {
-        let all = h.contract.of_role("executor");
-        let (stale, fresh) = all
-            .split_last()
-            .ok_or_else(|| crate::chaos_fail!("{CTX}: no executor node"))?;
-        let fresh_nodes =
-            Nodes::new(fresh.iter().map(|node| node.name.clone())).ok_or_else(|| {
-                crate::chaos_fail!("{CTX}: the case needs two executor nodes or more")
-            })?;
-        Ok(Self {
-            stale: stale.container.clone(),
-            fresh: fresh.iter().map(|node| node.container.clone()).collect(),
-            fresh_nodes,
-            count: all.len(),
-        })
     }
 }
 

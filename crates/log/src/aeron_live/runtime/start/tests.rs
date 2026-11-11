@@ -24,11 +24,10 @@ fn a_failed_context_build_fails_the_spawn() {
     assert_eq!(e.to_string(), "aeron: no context");
 }
 
-/// With no media driver, the C client waits its driver timeout for the
-/// `CnC` file, and then fails. A driver timeout above the context budget
-/// must give that error, not a start timeout of the runtime. The C client
-/// measures its timeout on its own coarse clock, so the test asserts only
-/// that the wait passed the context budget, not the full 11 s.
+/// With no media driver, the start waits for an active driver for its
+/// driver wait, and then fails with that error, not with a start timeout
+/// of the runtime. The wait is two budgets: the 10 s floor of a budget
+/// for a 1 s driver timeout, so 20 s, past the context budget.
 #[test]
 fn the_spawn_waits_out_a_driver_timeout_above_ten_seconds() {
     let dir = tempfile::tempdir().unwrap();
@@ -38,13 +37,14 @@ fn the_spawn_waits_out_a_driver_timeout_above_ten_seconds() {
         let ctx = AeronContext::new().map_err(|e| LogError::Aeron(e.to_string()))?;
         ctx.set_dir(dir_c.as_c_str())
             .map_err(|e| LogError::Aeron(e.to_string()))?;
-        ctx.set_driver_timeout_ms(11_000)
+        ctx.set_driver_timeout_ms(1_000)
             .map_err(|e| LogError::Aeron(e.to_string()))?;
         Ok(ctx)
     }) else {
         panic!("the spawn must fail with no media driver");
     };
     let msg = e.to_string();
-    assert!(msg.starts_with("aeron: Aeron::new"), "{msg}");
+    assert!(msg.starts_with("aeron: no active media driver"), "{msg}");
+    assert!(begin.elapsed() >= Duration::from_secs(20), "{msg}");
     assert!(begin.elapsed() > CONTEXT_BUDGET, "{msg}");
 }

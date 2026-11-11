@@ -51,6 +51,8 @@
 
 mod canonical;
 mod depth;
+#[cfg(feature = "floor-seams")]
+mod floor_seams;
 mod offers;
 mod publication;
 mod refusals;
@@ -68,7 +70,7 @@ use std::time::{Duration, Instant};
 use alloy_primitives::{Address, B256};
 use kardamom_obs::pipeline::Queue;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
-use kardamom_types::{DropReason, TxDataLoc, TxDrop, TxEnvelope, TxError, TxErrorReason, TxStatus};
+use kardamom_types::{DropReason, TxDataLoc, TxDrop, TxEnvelope};
 
 use crate::admission::{
     AccountState, Ack, Admission, AdmissionConfig, Candidate, ImagePos, Refusal, Verdict,
@@ -256,6 +258,10 @@ pub struct AdmissionLoop {
     outbox_depth: Queue,
     /// The account events that wait in `accounts`.
     accounts_depth: Queue,
+    /// The test seam of the `floor-seams` feature: a row sets no first
+    /// state of a sender. See [`Self::enable_first_floor_from_lookup`].
+    #[cfg(feature = "floor-seams")]
+    first_floor_from_lookup: bool,
 }
 
 impl AdmissionLoop {
@@ -286,6 +292,8 @@ impl AdmissionLoop {
             pipeline: PublishMeters::new(),
             outbox_depth: Queue::new("sequencer.outbox"),
             accounts_depth: Queue::new("sequencer.accounts"),
+            #[cfg(feature = "floor-seams")]
+            first_floor_from_lookup: false,
         }
     }
 
@@ -430,29 +438,13 @@ impl AdmissionLoop {
     }
 
     fn apply_rows(&mut self, block: u64, rows: Vec<(Address, AccountState)>) {
+        #[cfg(feature = "floor-seams")]
+        let rows = self.rows_of_known_senders(rows);
         self.admission
             .on_rows(block, rows.iter().copied(), &mut self.verdicts);
         for (address, _) in rows {
             self.canonical.confirmed(address, &self.admission);
         }
-    }
-
-    /// The guard of the sealer expects `expected` of `sender`, and rejected
-    /// `nonce`. Offer the transactions at both nonces again, when the
-    /// filter holds the one at `expected`. Each such reject moves the
-    /// expected nonce up by at least one, so the offers end. A guard that
-    /// expects a nonce that the filter does not hold changes nothing: the
-    /// loss window frees the run.
-    fn offer_rejected(&mut self, sender: Address, nonce: u64, expected: u64) {
-        if self.admission.unconfirmed_at(sender, expected).is_none() {
-            return;
-        }
-        let offers: Vec<RefOffer> = [expected, nonce]
-            .into_iter()
-            .filter_map(|n| self.admission.unconfirmed_at(sender, n))
-            .map(|c| c.ref_offer(&self.sealer_version))
-            .collect();
-        self.outbox.extend(offers);
     }
 
     fn offer_again_unconfirmed(&mut self, reason: &str) {
@@ -517,7 +509,7 @@ impl AdmissionLoop {
                     tx_hash: inbound.envelope.tx_hash,
                 };
                 self.to_ingress.reject(ack, reason.clone());
-                reject(side, ack.tx_hash, sender, fields.nonce, reason);
+                refusals::reject(side, ack.tx_hash, sender, fields.nonce, reason);
                 return Ok(());
             }
         };
@@ -594,17 +586,22 @@ impl AdmissionLoop {
             Verdict::Reject(mut c, refusal) => {
                 self.depth.gave(c.payload.vslot);
                 self.count_refusal(refusal);
-                let reason = reason_of(refusal);
+                let reason = refusal.reason();
                 if let Some(ack) = c.answer() {
                     self.to_ingress.reject(ack, reason.clone());
                 }
-                reject(side, c.tx_hash, c.sender, c.nonce, reason);
+                // A copy of a held transaction drops nothing. A drop or a
+                // rejected status of its hash would contradict the held
+                // one, which still gets its status and its receipt.
+                if refusal.drops() {
+                    refusals::reject(side, c.tx_hash, c.sender, c.nonce, reason);
+                }
             }
             Verdict::SealerRefused(mut c, reason) => {
                 if let Some(ack) = c.answer() {
                     self.to_ingress.reject(ack, reason.clone());
                 }
-                reject(side, c.tx_hash, c.sender, c.nonce, reason);
+                refusals::reject(side, c.tx_hash, c.sender, c.nonce, reason);
             }
             Verdict::DropReference(c) => side.publish_drop(TxDrop {
                 tx_hash: c.tx_hash,
@@ -631,49 +628,10 @@ impl AdmissionLoop {
             Refusal::TooManyPending { .. } => self.hot.evictions.increment(1),
             Refusal::NonceTooLow { .. }
             | Refusal::InFlight { .. }
+            | Refusal::Known { .. }
             | Refusal::InsufficientFunds { .. } => {}
         }
     }
-}
-
-/// The client error of a refusal of the filter.
-fn reason_of(refusal: Refusal) -> TxErrorReason {
-    match refusal {
-        Refusal::NonceTooLow { chain_nonce } => TxErrorReason::DuplicatedTx {
-            expected_nonce: chain_nonce,
-        },
-        Refusal::InFlight { expected_nonce } => TxErrorReason::AlreadyKnown { expected_nonce },
-        Refusal::InsufficientFunds { available, cost } => TxErrorReason::InsufficientFunds {
-            have: available.saturating_to(),
-            want: cost.saturating_to(),
-        },
-        Refusal::TooManyPending { expected_nonce } => TxErrorReason::Evicted { expected_nonce },
-        Refusal::Expired { expected_nonce } => TxErrorReason::Expired { expected_nonce },
-    }
-}
-
-/// Tell the client on both side channels that its transaction is refused,
-/// and the egress that it dropped.
-fn reject<R: SideChannelPublisher>(
-    side: &mut R,
-    tx_hash: B256,
-    sender: Address,
-    nonce: u64,
-    reason: TxErrorReason,
-) {
-    let err = TxError {
-        sender,
-        nonce,
-        reason,
-    };
-    side.publish_status(TxStatus::rejected(tx_hash, &err));
-    side.publish_drop(TxDrop {
-        tx_hash,
-        sender,
-        nonce,
-        reason: err.reason.drop_reason(),
-    });
-    side.publish_error(err);
 }
 
 #[cfg(test)]

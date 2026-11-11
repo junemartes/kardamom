@@ -271,21 +271,32 @@ async fn assert_halted_chain(h: &Harness, ctx: &str, halted: &Status) -> anyhow:
         refusal.message
     );
     crate::log(format!("{ctx}: submit refused: {}", refusal.message));
+    // The boundaries go on while the chain is halted. The first read is
+    // a read, not a default: a dark first read must not let any block
+    // pass.
     let first = h
         .probes
         .exec_metric(0, EXECUTOR_BLOCK_METRIC)
         .await
-        .unwrap_or(0);
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    let later = h
-        .probes
-        .exec_metric(0, EXECUTOR_BLOCK_METRIC)
-        .await
-        .unwrap_or(0);
-    anyhow::ensure!(
-        later > first,
-        "{ctx}: the boundaries stopped while halted (executor block {first} then {later})"
-    );
+        .ok_or_else(|| crate::chaos_fail!("{ctx}: executor 0 exports no block while halted"))?;
+    let (later, _) = poll::until(Budget::secs(20, 1), |_| async move {
+        Ok::<_, anyhow::Error>(
+            h.probes
+                .exec_metric(0, EXECUTOR_BLOCK_METRIC)
+                .await
+                .filter(|later| *later > first),
+        )
+    })
+    .await?
+    .or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: the boundaries stopped while halted (executor block {first} for {}s)",
+            t.as_secs()
+        )
+    })?;
+    crate::log(format!(
+        "{ctx}: the boundaries go on while halted (executor block {first} -> {later})"
+    ));
     Ok(())
 }
 

@@ -1,10 +1,8 @@
-use std::time::Duration;
-
 use serde_json::json;
 
 use super::members::Window;
 use super::upgrade::Upgrade;
-use super::{Run, STEPS, Step};
+use super::{Run, STEPS};
 use crate::cases::Case;
 use crate::knobs::Knobs;
 
@@ -19,25 +17,6 @@ fn every_step_is_a_case_of_the_carry_shard_in_run_order() {
             s.name()
         );
     }
-}
-
-#[test]
-fn every_load_window_covers_its_step() {
-    let k = Knobs::read(&[]).unwrap();
-    for s in STEPS {
-        assert!(
-            Case::Carry(*s).window(&k) >= s.floor(&k) && s.floor(&k) > k.inject_delay,
-            "{}",
-            s.name()
-        );
-    }
-    assert!(Step::VersionsOn.floor(&k) >= Duration::from_mins(10));
-    assert!(
-        Step::ExecutorsRest.floor(&k)
-            >= super::super::window::FULL_DEPLOY_LOAD.saturating_mul(2)
-                + Duration::from_mins(20)
-                + k.l1_fault
-    );
 }
 
 #[test]
@@ -97,6 +76,8 @@ fn supported_live_transitions_keep_their_cases_and_mixed_executor_state_audit() 
         "carry-window-on",
         "carry-executor-first",
         "carry-executors-rest",
+        "carry-deposits-provider-fault",
+        "carry-deposits-all-carry",
         "carry-window-off-on",
         "carry-leader-kill-at-switch",
     ] {
@@ -105,4 +86,62 @@ fn supported_live_transitions_keep_their_cases_and_mixed_executor_state_audit() 
     }
     assert!(!shard.carry_born());
     assert!(shard.audits_after("carry-executor-first"));
+}
+
+#[test]
+fn the_steps_run_a_low_load_and_the_outage_steps_keep_their_senders_live() {
+    let k = Knobs::read(crate::Shard::Carry.env()).unwrap();
+    assert_eq!(k.l1_fault, std::time::Duration::from_secs(45));
+    for s in STEPS {
+        assert_eq!(Case::Carry(*s).tps(&k), super::CARRY_TPS, "{}", s.name());
+        assert!(Case::Carry(*s).tps(&k) < k.tps, "{}", s.name());
+    }
+    // Each attempt of a parked submit takes 30 s; the attempts cover the
+    // fault, the 30 s halt detection and a resume of up to a minute.
+    let outage = k.l1_fault.as_secs() + 30 + 60;
+    for s in [
+        super::Step::DepositsProviderFault,
+        super::Step::DepositsAllCarry,
+    ] {
+        assert!(
+            u64::from(Case::Carry(s).load_retry(&k)) * 30 > outage,
+            "{}",
+            s.name()
+        );
+    }
+    assert_eq!(
+        Case::Carry(super::Step::VersionsOn).load_retry(&k),
+        k.load_retry
+    );
+}
+
+#[test]
+fn a_node_clock_stamp_is_an_instant_and_garbage_is_none() {
+    let at = Run::node_instant("1761818000.000000500").unwrap();
+    assert_eq!(
+        at.duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap(),
+        std::time::Duration::new(1_761_818_000, 500)
+    );
+    assert!(Run::node_instant("no such object").is_none());
+}
+
+#[test]
+fn every_fault_step_and_the_last_step_run_the_full_tail() {
+    let full: Vec<&str> = STEPS
+        .iter()
+        .filter(|s| s.full_tail())
+        .map(|s| s.name())
+        .collect();
+    assert_eq!(
+        full,
+        [
+            "carry-deposits-provider-fault",
+            "carry-window-on",
+            "carry-deposits-all-carry",
+            "carry-leader-kill-at-switch",
+            "carry-egress-restart"
+        ]
+    );
+    assert!(STEPS.last().unwrap().full_tail());
 }

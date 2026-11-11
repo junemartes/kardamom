@@ -29,7 +29,8 @@ before recovery. Container and scratch storage owners clean up on test exit.
 regressions. An interrupted scan leaves 512 of 1,025 accounts. Another mirror
 publishes position 30. The replacement must restore every untouched account and
 retain newer live rows before publishing progress, even with a persisted local
-head. Both targets run in the existing Docker CI job. `all` runs 228 checks across 36 targets.
+head. Both targets run in the existing Docker CI job. `just component-summary`
+prints the current counts of the catalog.
 
 The mirror syncs an empty `head.rebuild` marker before a scan or projection clear,
 and when a projection write fails. Its presence requires a checkpoint rebuild on
@@ -220,12 +221,39 @@ primary, a replica and three Sentinels at once. Fixed host ports stand in for st
 service addresses. While the group is down, the production reader degrades without a
 stall and the mirror marks a rebuild. The group returns empty, the Sentinels name a
 primary, and the mirror rebuilds every account once a checkpoint reaches its first
-live batch.
+live batch. A second check kills three mirrors with the group. Two production
+readers must count a degraded read with no stall. The mirrors return first and
+wait for Redis, Redis returns empty, then a newer checkpoint and a live batch come. Every mirror must rebuild,
+and each reader must count a Redis hit and no degraded read. The fixture takes its
+host ports from 20000-29999 under a lock file, so two runs on one host cannot share
+a port, also while the containers are down.
+
+`just test-component sequencer-resize` scales the real sequencer core from two
+lanes to three and back, with the production shard map. A gaining lane warms its
+incoming slots in shadow mode, reading the old lanes, and must offer nothing until
+the warm-up passes. One replica of the new lane dies during the overlap and returns.
+The ingress then routes by the new map, the old lanes drain, and every lane restarts
+with its final slots. The sealer orders first seen first, and each ordered
+transaction returns to every replica as a receipt floor. Every sender must reach the
+canonical log with every nonce once, in order.
+
+`just test-component ingress-sealer-quorum` checks that the ingress halts on a
+lost sealer quorum once no status frame arrives for the silence budget, and that a
+status ends the halt. With the executor test that waits for absent sealers and the
+sealer total-loss test of `sealer-raft-fleet`, it covers executor-sealer-loss-recover.
 
 `just test-component transport-mds-remove` removes MDS receive destinations while two
 streams run, and returns a node to the same control endpoint three times. Every frame
 of the live streams must arrive in order, and the driver must log no error. On the
 deployed Aeron 1.45 driver, this does not reproduce the driver crash of issue 545.
+
+`just test-component executor-driver-late-start` starts the real executor binary
+12 s before its media driver, as a service on a returned node can start. Every Aeron
+client start of `kardamom-log` now waits for an active driver: the `CnC` file exists
+and the driver heartbeat is younger than the driver timeout. It logs the wait every
+5 s. The bound is two driver budgets, 30 s with the deployed 10 s driver timeout;
+past it the start fails as before. The executor must open its publications and its
+local recording with no exit. Without the wait, it exits at once.
 
 `just test-component state-writer-crash` runs two real durable MDBX process-crash
 checks in about 0.3 seconds of test execution. A child runs the production writer.
@@ -269,13 +297,42 @@ falsely acknowledged, a permanent output error is retried, or the egress prunes 
 the higher posted/final head, or the production provider-read deadline is removed. These
 mutations are validation experiments; they are not runtime changes.
 
+The same target runs two production admission loops per lane. Both read
+one `tx_data` stream and offer through the production publisher to a
+controlled sealer. The sealer does first-seen dedup and the contiguity
+guard, relays each ordered reference to every session, and sends the rows of
+each ordered transaction. The tests stop one replica gracefully, kill one
+with every port cut, and freeze one past the loss window. The twin must keep
+the lane ordering. A restarted replica starts empty and must order an
+established sender and a fresh sender alone while its twin is frozen. Each
+load nonce must be ordered once and in order, with the exact offer bytes. A
+lookup blackout runs the production account lookup task against a loopback
+executor query that holds each request. The production egress feed reads
+the session egress of that replica. Lookups must fail at the unchanged
+two-second deadline while the boundary-freshness metric stays current, then
+answer after the next restart. The lookup task and the egress feed live in
+the library for this test; their behavior is unchanged. Negative controls
+fail when the loop sends no lookup, ignores canonical and row events, the
+lookup task drops its answer, or the egress feed does not mark a boundary.
+
+`sequencer-lapse-stack` runs the same lapse with real processes on the local
+stack: the sequencers on the v2 loop, a twin of the case lane, the ingress
+pair, the executor, the validator, a sealer member and the host-native media
+driver. SIGSTOP freezes the case lane's replica for 14 seconds, past the
+10-second client liveness of the driver, while the twin keeps the load
+landing. On SIGCONT the replica must exit through the Aeron fail-fast handler.
+The test then starts it, and the cold process must publish fresh work between
+two readings of its own exporter. The case load and the recovery probe must
+land every transfer, and the validator must agree. A negative control fails
+when the fail-fast handler does not exit. The test takes about 25 seconds.
+
 The [coverage inventory](../scripts/ci/component-recovery.json) names every
 registered chaos case, plus the packet-delay case pending in PR #917. The registry
 test rejects a new chaos case without a corresponding plan. Each family lists the
 real actors, boundary faults, recovery invariants and dependencies that still need
 real integration. `partial` means that named local tests validate some boundary
 assumptions. It does not mean the complete distributed case has passed locally.
-Forty-one cases have partial mappings. No full case is marked locally validated yet.
+`just component-summary` prints the current planned, partial and ported counts.
 
 `just component-catalog` checks the catalog. `just component-summary` prints the
 planned, partial and ported counts for each family. A case is ported when its
@@ -284,11 +341,21 @@ always go together. A ported case needs:
 
 - At least one local test.
 - A local test in a suite with a `ci_mode`, so that CI runs it. The modes are
-  `in-process`, `docker` (a real container dependency) and `gradle` (the Java
-  sealer).
+  `in-process`, `docker` (a real container dependency), `gradle` (the Java
+  sealer) and `stack` (the real service binaries, the sealer jar and the media
+  driver as local processes).
 - A negative control for one of its local tests. A control that names tests
   (`test`, `tests` or `failed_tests`) guards only those tests. A control that
   names no test guards every test of its suite.
+
+Every test of a suite needs a measured runtime in
+`scripts/ci/component-timings.json`, in seconds, keyed `suite::test`. The CI shard
+plan uses it. A port PR adds the runtimes of its new tests; `just component-catalog`
+fails without them.
+
+A suite can have the optional field `test_timeout_s`: the per-test limit in CI, an
+integer from 60 to 120. The default is 60. A value above 60 needs the field
+`test_timeout_reason`.
 
 The optional case field `cluster_only_checks` is a list of strings. Each string
 names a check that needs the deployed cluster, and gives the reason. The cluster
@@ -563,3 +630,111 @@ cannot pass. A successful peer cannot mask an unrecovered peer. The observer kee
 its 120-second budget and reports each reader's latest counters or error. These
 checks validate the observer; distributed Redis recovery and exact final state
 still require the full chaos case.
+
+`just test-component pipeline-recovery` and `just test-component pipeline-combined`
+run chaos cases on the local stack of the chain-semantics suite. These are stack
+suites, not isolated ones: each case needs more than one real service. The real ingress pair, the sequencers, the sealer
+members, the executor and the validator run as processes on one host, with the
+host-native archiving media driver. The cases that read L1 epochs also run Anvil,
+the L1 follower and the da-watcher. Each test injects the fault of its chaos case
+at the same process boundary. A graceful stop is SIGTERM with the job's kill
+bound; a hard stop is SIGKILL. A returned process starts on the state that it
+persisted: the sealer members on their own logs, the executor and the validator on
+their state directories, the driver on its archive. Ingresses and sequencers
+start cold, as in the deployment.
+
+Every test ends with the checks of a chaos case. A case load sends through
+ingress 0 for the whole case, and tries a failed submit again with the same bytes.
+While a submit waits, the load also asks every ingress for the receipt. Every
+offered transfer must land. Every ingress must serve exactly one receipt for each
+transfer, in nonce order. The payee balance must equal the landed count. The load
+must land again within 30 seconds of the return. Then the executor block must
+advance. A recovery probe sends the case sender through ingress 0 and a fresh
+sender through ingress 1. The validator must verify with no divergence.
+
+The combined cases also judge the pipeline while their classes are down. With no
+ingress and no sequencer, empty blocks still seal and no transaction applies.
+With no sealer, every member process is dead, every live ingress refuses a submit
+with `sealer_no_quorum`, and no executor block of the outage may pass the block at
+which the returned members resume. A class that returns before the class that it
+needs must still run after an eight-second stagger. A cluster client starts with retries,
+so a process that cannot wait exits within that time. The cases that take the sealer
+down run three members: the returned members must close an election on a majority,
+and no term may have two leaders. No sequencer may hold a ref below a floor. The
+sealer's L1 origin must reach the last epoch that the da-watcher published. After
+a loss of the sequencers and the sealer, the da-watcher must publish again, and
+the epochs of the outage must reach the chain.
+
+The local stagger and hold are shorter than the deployed ones. The 10-second
+sealer silence budget is crossed where an ingress stays up through the sealer
+loss: the test waits for its `sealer_no_quorum` refusal. A returned ingress has
+no silence clock before its first status frame, so the stagger needs no such
+bound. The lane loss runs two replicas
+of the case lane and kills both: they return cold, learn the same floors, and
+offer the same references, and the sealer keeps the first copy. The graceful
+sequencer case sends SIGTERM to one of the two replicas of the case lane and
+requires its exit within ten seconds, while the twin keeps the lane ordering. The tests need the service
+binaries, the sealer jar and the aeron-all jar, as the chain-semantics job does.
+Each test takes 14 to 50 seconds on a loaded host, including the stack start.
+
+The pipeline blackout also kills the media driver, the L1 follower and the
+da-watcher, or Redis and the state mirror. The killed archive leaves an active mark
+file, so the returned driver starts only after it ages out, as the scheduler's
+restarts of the driver task see. Every process then starts at once. The executor
+and the validator refetch the envelopes of replayed records from the archive; the
+local validator gets the refetch endpoints of the deployed job. Redis returns
+empty, and the state mirror must serve again with keys rebuilt from the
+executor's newest checkpoint, with the row of a funded account that no traffic
+touches: only a rebuild writes it. The blackout runs as two tests, one with the
+L1 stack and the validator, one with Redis and the state mirror, so each stays
+inside 60 seconds. Both run one sealer member; the combined cases close elections
+of three members.
+
+Compiled negative controls fail these tests at recovery: an ingress that serves
+no receipt from state, a sequencer lookup that sends no query, a cluster client
+that never forces a new session after egress silence, and an executor with no
+archive refetch, and a state mirror that never rebuilds.
+
+`just test-component ingress-recovery` runs the single-service ingress cases in
+isolation. Each ingress replica is the real `kardamom-ingress` binary on its own
+host-native archiving media driver, as on its own node; the nodes talk over
+loopback UDP. A controlled stand-in for the sequencer, the sealer and the executor
+runs on the second node. It keeps the first copy of a transaction, runs each
+sender's nonces in order, and sends receipt batch frames with account rows. An
+HTTP stub serves the egress and executor receipt queries from its ledger. Each
+case requires every transfer to land, the stand-in to execute each one once in
+nonce order, and both ingresses, the returned one too, to serve every receipt:
+
+- `graceful-ingress`: SIGTERM must end in a clean exit within the drain bound.
+- `hard-ingress`: SIGKILL, once for each replica. A returned twin serves receipts
+  of transfers that it never saw.
+- `archive-driver-loss`: the driver of ingress 0 dies. Ingress 0 must exit on its
+  own after its driver timeout, while the twin on the other node keeps serving.
+  The driver returns on its archive, and ingress 0 starts with its recorders.
+
+Controls fail the tests when a returned ingress serves no receipt from state, and
+when the Aeron error handler does not end a client that lost its driver.
+
+`just test-component ingress-deadline` holds the executor head far behind the
+sealed head of the sealer's status. The ingress must stamp every new submit from
+the sealed head, so the deadline stays past the sealer's block. A control that
+stamps from the executor head alone fails it. This answers a stall seen in one
+blackout run under a load average of 46: the ingress does not age the deadline.
+That run showed refs that the v1 sequencer offered again after its confirm timeout,
+with their first deadline, which the sealer then refused as past the deadline.
+
+A restart log of the service events board now comes at most once in each expiry
+window for one service. Two processes that publish one key on one shared IPC
+session made every record of the slower counter read as a restart.
+
+`just test-component control-plane-loss` runs the production discovery adapter
+against a Consul-like agent and a real media driver. A publisher and a subscriber
+of `tx_data` find each other through the agent. The agent then partitions from
+both for longer than the check TTL and the deregistration window, and deletes the
+publisher's record. The held data connection must deliver every envelope in order
+through the partition, with no gap above one second. After the partition, the
+publisher must register again with a passing check, and a new subscriber must find
+it. The test scales the TTL, the deregistration window and the hold down in the
+same order as the deployment. A heartbeat that does not register again after a
+failed pass fails the test. Nomad placement after the partition remains a cluster
+check.

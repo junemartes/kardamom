@@ -2,11 +2,11 @@
 
 use std::time::Instant;
 
+use crate::metrics as seq_metrics;
+use crate::outbound::DropPublisher;
 use kardamom_cluster_adapter::wire::{self, EgressItem};
 use kardamom_obs::halt::{HaltCause, HaltRef};
 use kardamom_obs::lifecycle::Lifecycle;
-use kardamom_sequencer::metrics as seq_metrics;
-use kardamom_sequencer::outbound::DropPublisher;
 use kardamom_types::ClusterStatus;
 
 use super::EgressWatermarkFeed;
@@ -73,7 +73,7 @@ impl<D: DropPublisher + 'static> EgressWatermarkFeed<D> {
                 budget_blocks,
                 "sealer DA-lag reject received"
             );
-            self.forward_refusal(kardamom_sequencer::resync::SealerRefusal {
+            self.forward_refusal(crate::resync::SealerRefusal {
                 sender,
                 nonce,
                 reason: kardamom_types::TxErrorReason::DaLag {

@@ -59,13 +59,27 @@ impl Rpc {
         self.await_receipt(&signed.hash, budget).await
     }
 
-    /// The selected halt refusal admits nothing; each retry uses the same signed bytes.
+    /// The selected halt refusal admits nothing; each retry uses the same
+    /// signed bytes. A submit that parks until the timeout of the ingress
+    /// or of the client can still land, so the same bytes go again. A
+    /// resend that finds the first send in the pipeline is accepted: the
+    /// receipt wait proves that the transaction landed.
     async fn recovery_submit(
         &self,
         signed: &Signed,
         cause: RecoveryCause,
     ) -> anyhow::Result<Option<()>> {
-        match self.send_raw(&signed.raw).await? {
+        let answer = match self.send_raw(&signed.raw).await {
+            Err(error) if Self::is_unreachable(&error) => {
+                crate::log(format!(
+                    "fault transfer {}: {error:#}; resending within its deadline",
+                    signed.hash
+                ));
+                return Ok(None);
+            }
+            other => other?,
+        };
+        match answer {
             Ok(hash) => {
                 anyhow::ensure!(
                     hash == signed.hash,
@@ -74,12 +88,19 @@ impl Rpc {
                 );
                 Ok(Some(()))
             }
-            Err(error) if cause.accepts(&error) => {
+            Err(error) if cause.accepts(&error) || error.is_park_timeout() => {
                 crate::log(format!(
                     "fault transfer {}: {}; retrying within its deadline",
                     signed.hash, error.message
                 ));
                 Ok(None)
+            }
+            Err(error) if error.holds_the_transaction() => {
+                crate::log(format!(
+                    "fault transfer {}: {}; the first send is in the pipeline",
+                    signed.hash, error.message
+                ));
+                Ok(Some(()))
             }
             Err(error) => Err(error.into_error("eth_sendRawTransaction")),
         }

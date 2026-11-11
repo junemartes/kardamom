@@ -101,5 +101,4 @@ async fn restarted_replicas_record_new_sessions_and_live_cursors_keep_moving() {
         "stream checks took {:?} after the driver start",
         started.elapsed()
     );
-    drop(cluster);
 }

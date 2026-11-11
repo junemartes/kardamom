@@ -27,6 +27,8 @@ pub mod script;
 pub mod testing;
 
 mod client;
+mod link;
+mod source;
 
 pub use client::{AccountCache, AccountView, BatchWrite, RowsWritten};
 pub use config::{CacheConfig, LiveAccountsConfig};

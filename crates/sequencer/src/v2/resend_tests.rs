@@ -227,8 +227,11 @@ fn a_session_start_recovers_unconfirmed_offers_without_new_client_traffic() {
     assert_eq!(b.offers(), [(0, true), (0, true), (1, true)]);
 }
 
+/// A second marker of session 2 is a new leader that confirms the
+/// session again: the unconfirmed nonce 1 goes out once more, and the
+/// confirmed nonce 0 does not.
 #[test]
-fn an_idle_session_return_preserves_confirmations_and_ignores_duplicate_markers() {
+fn an_idle_session_return_preserves_confirmations_and_a_new_leader_offers_again() {
     let shared = SealerVersion::starting_at(5);
     let mut b = Bench::new(shared.clone());
     let mut rules =
@@ -257,7 +260,7 @@ fn an_idle_session_return_preserves_confirmations_and_ignores_duplicate_markers(
     b.run();
     rules.on_session_start(2);
     b.run();
-    assert_eq!(b.offers(), [(0, true), (1, true), (1, true)]);
+    assert_eq!(b.offers(), [(0, true), (1, true), (1, true), (1, true)]);
 }
 
 /// A row confirms nonce 0. The new session then gets only the unconfirmed

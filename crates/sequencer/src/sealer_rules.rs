@@ -4,7 +4,8 @@
 //!
 //! The sealer sends kind 17 to each session when the session opens, and to
 //! each open session at each new term. The session thread puts a
-//! session-start marker on the egress channel when a session opens, and the
+//! session-start marker on the egress channel when a session opens, also
+//! when a new leader confirms the open session again, and the
 //! two can arrive in either order, so each carries the cluster session id:
 //! a kind 17 that arrives before its marker waits for it.
 //!
@@ -166,8 +167,14 @@ impl<D: DropPublisher> SealerRules<D> {
 
     /// The session `session_id` starts. A report that came first for it
     /// sets the version. Otherwise the version stays.
+    ///
+    /// Each marker starts a new session generation, also a marker for the
+    /// same session id. A new leader confirms each open session again
+    /// with the same id, and the session thread then puts a marker on the
+    /// channel. An offer that the old leader took but never appended is
+    /// lost, so the publish loop must offer the unconfirmed runs again. A
+    /// repeated offer is safe: the sealer keeps the first copy.
     pub fn on_session_start(&mut self, session_id: i64) {
-        let changed = self.session != Some(session_id);
         self.session = Some(session_id);
         let report = self
             .early
@@ -175,9 +182,7 @@ impl<D: DropPublisher> SealerRules<D> {
             .filter(|(id, _)| *id == session_id)
             .map(|(_, version)| version);
         self.publish(report.unwrap_or(self.shared.get()));
-        if changed {
-            self.shared.session_started();
-        }
+        self.shared.session_started();
     }
 
     /// The sealer reports `version` for the session `session_id`. A report

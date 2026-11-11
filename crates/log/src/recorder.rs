@@ -41,6 +41,7 @@ use tracing::{info, warn};
 use crate::archive_catalog::ArchiveCatalog;
 use crate::config::AeronConfig;
 use crate::driver_budget::DriverBudget;
+use crate::driver_wait::DriverWait;
 use crate::error::LogError;
 use crate::fail_fast::FailFast;
 
@@ -99,6 +100,12 @@ pub const ARCHIVE_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// which runs inside a join-timeout budget and must fail over quickly to
 /// another endpoint when an archive node is down.
 ///
+/// One deadline holds for the whole call: `connect_timeout` from its
+/// start. The wait for an active media driver spends part of it, and the
+/// archive connect gets the rest. So a caller that budgets one
+/// `connect_timeout` for this call, as the recorder's ready wait does,
+/// still holds.
+///
 /// # Errors
 ///
 /// Returns an error if `aeron_dir` is not UTF-8 or contains a NUL
@@ -110,6 +117,7 @@ pub fn connect_archive_with_timeout(
     cfg: &AeronConfig,
     connect_timeout: Duration,
 ) -> Result<ArchiveSession, LogError> {
+    let deadline = ConnectDeadline::start(connect_timeout);
     let ctx = rusteron_archive::AeronContext::new()
         .map_err(|e| LogError::Aeron(format!("archive AeronContext::new: {e}")))?;
     let driver_budget = DriverBudget::of_archive_client(&ctx)?;
@@ -119,6 +127,8 @@ pub fn connect_archive_with_timeout(
             .map_err(|e| LogError::Aeron(format!("archive set_dir: {e}")))?;
     }
     ctx.fail_fast()?;
+    // The driver wait spends part of the one deadline of the call.
+    DriverWait::of(&ctx, driver_budget.driver_wait().min(deadline.remaining()))?.wait()?;
     let aeron = rusteron_archive::Aeron::new(&ctx)
         .map_err(|e| LogError::Aeron(format!("archive Aeron::new: {e}")))?;
     aeron
@@ -161,13 +171,34 @@ pub fn connect_archive_with_timeout(
         .map_err(|e| LogError::Aeron(format!("set_message_timeout_ns: {e}")))?;
     let archive = rusteron_archive::AeronArchiveAsyncConnect::new_with_aeron(&actx, &aeron)
         .map_err(|e| LogError::Aeron(format!("archive async connect: {e}")))?
-        .poll_blocking(connect_timeout)
+        .poll_blocking(deadline.remaining())
         .map_err(|e| LogError::Aeron(format!("archive connect poll: {e}")))?;
     Ok(ArchiveSession {
         aeron_client: aeron,
         archive,
         driver_budget,
     })
+}
+
+/// The one deadline of an archive connect: the driver wait and the
+/// connect share it.
+struct ConnectDeadline {
+    started: std::time::Instant,
+    limit: Duration,
+}
+
+impl ConnectDeadline {
+    fn start(limit: Duration) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            limit,
+        }
+    }
+
+    /// The time left before the deadline; zero past it.
+    fn remaining(&self) -> Duration {
+        self.limit.saturating_sub(self.started.elapsed())
+    }
 }
 
 /// Which logical stream a recorder is tailing.
@@ -785,3 +816,7 @@ impl Recorder {
         Ok(latest)
     }
 }
+
+#[cfg(test)]
+#[path = "recorder_tests.rs"]
+mod tests;
