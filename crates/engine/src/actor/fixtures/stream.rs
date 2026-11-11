@@ -34,7 +34,12 @@ pub enum TestEntry {
 
 impl TestEntry {
     /// The canonical indexes of this entry.
-    fn slots(&self) -> u64 {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the deposit count of an epoch does not fit in a `u64`.
+    #[must_use]
+    pub fn slots(&self) -> u64 {
         match self {
             Self::Tx(_) => 1,
             Self::Boundary(_) => 0,
