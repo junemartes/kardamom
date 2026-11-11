@@ -82,6 +82,7 @@
     enabled: true
     state: started
     daemon_reload: true
+  register: consul_start
 
 - name: Apply a changed configuration before the resolver switch
   ansible.builtin.meta: flush_handlers
