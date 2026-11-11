@@ -143,22 +143,23 @@ pub(crate) async fn pipeline_blackout_recover(h: &mut Harness) -> anyhow::Result
     for (job, count) in PIPELINE_JOBS.into_iter().chain(egress) {
         h.assert_count(job, count, h.knobs.reschedule_slo).await?;
     }
-    let elected = h
-        .evidence
+    h.evidence
         .cluster_elected(crate::cases::fleet::FULL_RESTART_ELECTION)
-        .await?;
-    crate::log(format!(
-        "{ctx}: members elected memberId={} (term {} closed on a majority)",
-        elected.leader, elected.term
-    ));
+        .await?
+        .log(ctx);
     await_exporter_back(h, ctx).await?;
-    h.assert_ingress_pair_live(ctx).await?;
-    h.assert_executor_progress(Duration::from_mins(3)).await?;
-    // The da-watcher died with the sealers. An epoch it published but the
-    // sealers never committed is published again: from the sealer's origin
-    // at the restart, or by the re-publish of the unconfirmed epochs. The
-    // sealer's origin then reaches the da-watcher's last publish.
-    assert_no_origin_gap(h, ctx).await?;
+    // The ingresses and the sealer origin recover independently, so the
+    // two waits overlap.
+    let hs: &Harness = h;
+    tokio::try_join!(hs.assert_ingress_pair_live(ctx), async {
+        hs.assert_executor_progress(Duration::from_mins(3)).await?;
+        // The da-watcher died with the sealers. An epoch it published but
+        // the sealers never committed is published again: from the
+        // sealer's origin at the restart, or by the re-publish of the
+        // unconfirmed epochs. The sealer's origin then reaches the
+        // da-watcher's last publish.
+        assert_no_origin_gap(hs, ctx).await
+    })?;
     let voided = h
         .evidence
         .count_lines(

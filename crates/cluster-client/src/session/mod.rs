@@ -121,6 +121,9 @@ pub struct SessionDriver {
     /// redirect-driven connect, which must go to the member the cluster
     /// just named.
     rotate_hint: bool,
+    /// The leadership term of the last OK for our session, or -1 before
+    /// the first OK. A new-leader event for another term had no OK.
+    ok_term: i64,
 }
 
 impl SessionDriver {
@@ -143,6 +146,7 @@ impl SessionDriver {
             last_connect_ms: 0,
             connect_attempts: 0,
             rotate_hint: false,
+            ok_term: -1,
         }
     }
 
@@ -275,6 +279,17 @@ impl SessionDriver {
     /// id stays the same. Foreign-session filter: the shared egress channel
     /// also carries other sessions' `NewLeaderEvent`s. Only our own event
     /// may change our term or re-point our ingress.
+    ///
+    /// A new leader sends an OK for the session again only when it never
+    /// sent one. In Aeron Cluster 1.44, `ClusterSession` sets
+    /// `hasOpenEventPending` only in its constructor, and
+    /// `sendSessionOpenEvent` clears it. `prepareSessionsForNewTerm` sets
+    /// only `hasNewLeaderEventPending`. So a follower that becomes leader
+    /// sends the OK, but a member that led before and wins a later term
+    /// sends only this event. A term with no OK emits `Connected` after
+    /// `Reconnect`, so that the transport requests a replay from the new
+    /// leader, as it does on an OK. A second `Connected` for a term that
+    /// had its OK first is harmless: the replay request repeats.
     fn on_new_leader(&mut self, nl: crate::protocol::NewLeaderEvent) -> Vec<DriverEvent> {
         let SessionState::Connected {
             cluster_session_id,
@@ -290,10 +305,16 @@ impl SessionDriver {
         }
         *leadership_term_id = nl.leadership_term_id;
         *leader_member_id = nl.leader_member_id;
-        vec![DriverEvent::Reconnect {
+        let mut events = vec![DriverEvent::Reconnect {
             leader_member_id: nl.leader_member_id,
             ingress_endpoints: nl.ingress_endpoints,
-        }]
+        }];
+        if nl.leadership_term_id != self.ok_term {
+            events.push(DriverEvent::Connected {
+                cluster_session_id: *cluster_session_id,
+            });
+        }
+        events
     }
 
     /// Handle one session message. Only surface messages for our session.
@@ -343,6 +364,7 @@ impl SessionDriver {
         if !self.event_is_ours(ev) {
             return Vec::new();
         }
+        self.ok_term = ev.leadership_term_id;
         self.state = SessionState::Connected {
             cluster_session_id: ev.cluster_session_id,
             leadership_term_id: ev.leadership_term_id,

@@ -28,13 +28,13 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::admission::AccountState;
+use crate::metrics;
+use crate::sequencer::Shutdown;
+use crate::v2::AccountEvent;
 use alloy_primitives::Address;
-use kardamom_cache::{AccountView, CacheReader, ExecutorQuery, LiveAccounts};
+use kardamom_cache::{AccountView, CacheReader, ExecutorQuery, LiveAccounts, QueryAnswer};
 use kardamom_obs::pipeline::Step;
-use kardamom_sequencer::admission::AccountState;
-use kardamom_sequencer::metrics;
-use kardamom_sequencer::sequencer::Shutdown;
-use kardamom_sequencer::v2::AccountEvent;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 /// The lookups that run at once.
@@ -45,11 +45,12 @@ const RETRY_AFTER: Duration = Duration::from_secs(2);
 /// lifetime of a parked transaction: after it, no parked work waits for
 /// the answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Retries(usize);
+pub struct Retries(usize);
 
 impl Retries {
     /// The retries, `RETRY_AFTER` apart, that cover `park_ttl`, rounded up.
-    pub(crate) fn covering(park_ttl: Duration) -> Self {
+    #[must_use]
+    pub fn covering(park_ttl: Duration) -> Self {
         let count = park_ttl.as_millis().div_ceil(RETRY_AFTER.as_millis());
         // A count above `usize::MAX` retries until the feed stops.
         Self(usize::try_from(count).unwrap_or(usize::MAX))
@@ -57,13 +58,13 @@ impl Retries {
 }
 
 /// The sources of a lookup, in the order of their cost.
-pub(crate) struct LookupSources {
-    pub(crate) live: Arc<LiveAccounts>,
-    pub(crate) redis: Option<Arc<CacheReader>>,
-    pub(crate) query: Option<ExecutorQuery>,
+pub struct LookupSources {
+    pub live: Arc<LiveAccounts>,
+    pub redis: Option<Arc<CacheReader>>,
+    pub query: Option<ExecutorQuery>,
 }
 
-pub(crate) struct AccountLookupFeed {
+pub struct AccountLookupFeed {
     rx: tokio::sync::mpsc::Receiver<Address>,
     answers: crossbeam_channel::Sender<AccountEvent>,
     /// Dropping the feed cancels retries before its sources are released.
@@ -85,7 +86,8 @@ struct Sources {
 }
 
 impl AccountLookupFeed {
-    pub(crate) fn new(
+    #[must_use]
+    pub fn new(
         rx: tokio::sync::mpsc::Receiver<Address>,
         answers: crossbeam_channel::Sender<AccountEvent>,
         sources: LookupSources,
@@ -110,7 +112,8 @@ impl AccountLookupFeed {
         }
     }
 
-    pub(crate) fn spawn(self) -> tokio::task::JoinHandle<()> {
+    #[must_use]
+    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(self.run())
     }
 
@@ -284,13 +287,24 @@ impl Sources {
         let query = self.from.query.as_ref()?;
         let (nonce, balance) = tokio::join!(query.nonce(address), query.balance(address));
         let (nonce, balance) = (nonce.ok()?, balance.ok()?);
-        let state = AccountState {
+        let state = AccountState::of_answers(&nonce, &balance)?;
+        Some((nonce.tx_idx == balance.tx_idx, state))
+    }
+}
+
+impl AccountState {
+    /// The state from a nonce answer and a balance answer of the
+    /// executors, at the older position of the two. The position is in
+    /// the convention of the rows ([`QueryAnswer::last_record`]), so that
+    /// the row of the next record is newer than the answer. `None` when
+    /// the nonce does not fit in a `u64`.
+    pub(crate) fn of_answers(nonce: &QueryAnswer, balance: &QueryAnswer) -> Option<Self> {
+        Some(Self {
             nonce: u64::try_from(nonce.value).ok()?,
             balance: balance.value,
             delegated: false,
-            tx_idx: nonce.tx_idx.min(balance.tx_idx),
-        };
-        Some((nonce.tx_idx == balance.tx_idx, state))
+            tx_idx: nonce.last_record().min(balance.last_record()),
+        })
     }
 }
 

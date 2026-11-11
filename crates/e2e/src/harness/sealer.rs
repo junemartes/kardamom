@@ -94,6 +94,31 @@ impl SealerCluster {
         self.procs[id] = proc;
         Ok(())
     }
+
+    /// Kill every member at once, as a loss of every sealer node does.
+    pub fn kill_all(&mut self) {
+        self.procs.iter_mut().for_each(Proc::kill);
+    }
+
+    /// Start every member again on its own directories, after
+    /// [`Self::kill_all`]. Each member resumes from its own snapshot and
+    /// log, and the members elect a leader among themselves. `log_tag`
+    /// names the new log files, so the logs of the killed members
+    /// survive. The call returns once every member logs "cluster node up".
+    ///
+    /// # Errors
+    /// Returns an error when a member fails to spawn or does not come up
+    /// within 60s.
+    pub fn start_all(&mut self, log_tag: &str) -> Result<()> {
+        let started = (0..self.procs.len())
+            .map(|id| self.launch.spawn_member(id, log_tag))
+            .collect::<Result<Vec<_>>>()?;
+        self.procs = started;
+        self.procs.iter_mut().try_for_each(|proc| {
+            wait_for_log_line(proc, "cluster node up", Duration::from_mins(1))
+                .context("returned sealer member startup")
+        })
+    }
 }
 
 /// Bring-up state for a sealer cluster: the reserved endpoints, the JVM

@@ -36,7 +36,7 @@ class NodeReplaceSealerTest {
     @InterruptAfter(value = 60, unit = TimeUnit.SECONDS)
     void a_follower_on_a_new_node_seeds_from_a_peer_and_catches_up() {
         try (LocalSealers group = new LocalSealers(dir, 3, SNAPSHOTS);
-             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints)) {
+             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
             final int leader = group.awaitLeader(Duration.ofSeconds(20)).memberId();
             IntStream.range(0, 5).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));

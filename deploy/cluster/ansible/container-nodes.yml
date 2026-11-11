@@ -46,8 +46,11 @@
       ansible.builtin.set_fact:
         node_contract_bridge: "{{ node_contract.network.bridge }}"
 
+    # A replaced node joins the bridge that the bring-up prepared
+    # (replace-node.yml), so the host settings are already in place.
     - name: Prepare the host network for Aeron multicast
       ansible.builtin.include_role:
         name: host_prep
       vars:
         host_prep_bridge: "{{ node_contract_bridge }}"
+      when: not (container_host_prepared | default(false) | bool)

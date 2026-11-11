@@ -37,7 +37,7 @@ class ClusterTwoBlankRecoverTest {
     @InterruptAfter(value = 120, unit = TimeUnit.SECONDS)
     void an_offline_copy_of_the_survivor_restores_a_quorum_that_seeds_the_last_blank_member() {
         try (LocalSealers group = new LocalSealers(dir, 3, Purged.SETTINGS);
-             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints)) {
+             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
             final int leader = group.awaitLeader(Duration.ofSeconds(20)).memberId();
             Stage.log("two-blank: leader");

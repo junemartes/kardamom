@@ -32,8 +32,15 @@
 //! fallback path, no `recover_signer()` call, and no paranoid-check mode.
 //! The sequencer does zero secp256k1 work on the hot path.
 
+// The floor seams are a test build only. An optimized build is a release
+// build, so it must not compile them.
+#[cfg(all(feature = "floor-seams", not(debug_assertions)))]
+compile_error!("the floor-seams feature is for test builds; a release build must not enable it");
+
+pub mod account_lookup;
 pub mod admission;
 pub mod config;
+pub mod egress_feed;
 pub mod epoch;
 pub mod error;
 #[cfg(any(test, feature = "testing"))]

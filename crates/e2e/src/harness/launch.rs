@@ -225,16 +225,21 @@ impl<'a> StackLaunch<'a> {
                 && self.cfg.carry.is_none()
                 && std::env::var("KARDAMOM_E2E_VERDICTS").is_ok_and(|v| v == "1"),
             exec_frames: self.cfg.carry.is_some(),
+            checkpoints: self.cfg.read_path,
         }
     }
 
     /// Spawn one sequencer per shard. In carry mode from genesis each one
     /// starts at the floor 5, so that no reference without bytes goes out
     /// before the first report of the sealer.
-    fn spawn_sequencers(&self, spec: &ServiceSpec<'_>) -> Result<Vec<services::Spawned>> {
+    fn spawn_sequencers(
+        &self,
+        spec: &ServiceSpec<'_>,
+        read_path: Option<&super::read_path::ReadPath>,
+    ) -> Result<Vec<services::Spawned>> {
         let opts = services::SequencerOptions {
             sealer_version_floor: if self.cfg.carry_genesis() { 5 } else { 0 },
-            ..services::SequencerOptions::default()
+            ..self.cfg.sequencer_options(read_path)
         };
         (0..self.cfg.shards.get())
             .map(|i| services::spawn_sequencer_with(spec, i, &opts))
@@ -279,6 +284,7 @@ impl<'a> StackLaunch<'a> {
     fn v2_loop(&self) -> bool {
         !self.cfg.unpayable_spends
             && (self.cfg.carry.is_some()
+                || self.cfg.admission
                 || std::env::var("KARDAMOM_E2E_ADMISSION").is_ok_and(|v| v == "1"))
     }
 }
@@ -403,7 +409,10 @@ impl LocalStack {
         let log_config = stack_launch.write_archive_log_config()?;
         let spec = stack_launch.assemble_spec(&genesis, log_config.as_deref());
 
-        let sequencers = stack_launch.spawn_sequencers(&spec)?;
+        // The read path starts before the sequencers, so that they can
+        // take its Redis URL.
+        let read_path = super::read_path::ReadPath::start_if(cfg.read_path, &spec)?;
+        let sequencers = stack_launch.spawn_sequencers(&spec, read_path.as_ref())?;
         let egress = cfg.carry.map(|_| spec.spawn_egress(None)).transpose()?;
         let genesis_egress = egress
             .as_ref()
@@ -446,20 +455,24 @@ impl LocalStack {
         let stack = Self {
             notifier,
             ingress,
+            extra_ingresses: Vec::new(),
             da_watcher,
             l1_follower,
             verified_l1: wirings.verified_l1,
             batcher,
             egress,
+            read_path,
             executor,
             validator,
             sequencers,
+            sequencer_twins: Vec::new(),
             sealer,
             driver,
             _load_sampler: load_sampler,
             l1,
             genesis,
             log_config,
+            follower_l1: wirings.da_watcher,
             validator_l1: wirings.validator,
             executor_query_port,
             root,

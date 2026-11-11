@@ -6,7 +6,7 @@ use alloy_primitives::Address;
 
 use kardamom_cluster_adapter::wire::{GuardHeader, position_deadline};
 
-use super::RefPayload;
+use super::{AdmissionLoop, RefPayload};
 use crate::admission::{Admission, Candidate};
 use crate::outbound::RefOffer;
 use crate::sealer_rules::SealerVersion;
@@ -98,5 +98,25 @@ impl<'a> OfferReplay<'a> {
             senders = senders.len(),
             "sequencer v2: offering the refused runs again"
         );
+    }
+}
+
+impl AdmissionLoop {
+    /// The guard of the sealer expects `expected` of `sender`, and rejected
+    /// `nonce`. Offer the transactions at both nonces again, when the
+    /// filter holds the one at `expected`. Each such reject moves the
+    /// expected nonce up by at least one, so the offers end. A guard that
+    /// expects a nonce that the filter does not hold changes nothing: the
+    /// loss window frees the run.
+    pub(super) fn offer_rejected(&mut self, sender: Address, nonce: u64, expected: u64) {
+        if self.admission.unconfirmed_at(sender, expected).is_none() {
+            return;
+        }
+        let offers: Vec<RefOffer> = [expected, nonce]
+            .into_iter()
+            .filter_map(|n| self.admission.unconfirmed_at(sender, n))
+            .map(|c| c.ref_offer(&self.sealer_version))
+            .collect();
+        self.outbox.extend(offers);
     }
 }

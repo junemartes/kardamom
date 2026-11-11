@@ -200,6 +200,17 @@ impl AeronTestCluster {
         self.nodes[i].archive_dir()
     }
 
+    /// The Docker container id of node `i`, or `None` for an external
+    /// driver. A process-wide fixture uses it to remove the container at
+    /// process exit, where no destructor of a static runs.
+    #[must_use]
+    pub fn container_id(&self, i: usize) -> Option<&str> {
+        match &self.nodes[i] {
+            Node::Container(c) => Some(c.container.id()),
+            Node::External { .. } => None,
+        }
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.nodes.len()
@@ -349,6 +360,43 @@ impl AeronTestCluster {
     }
 }
 
+/// A single node whose directory exists before its media driver does.
+/// A client can point at [`Self::aeron_dir`] first, the way a service on
+/// a restarted node starts before the driver of that node.
+pub struct PendingNode {
+    root: PathBuf,
+}
+
+impl PendingNode {
+    /// Reserve the host directory of one node, with no driver yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created.
+    pub fn reserve() -> anyhow::Result<Self> {
+        Ok(Self {
+            root: prepare_root()?,
+        })
+    }
+
+    /// The `aeron.dir` the driver will create.
+    #[must_use]
+    pub fn aeron_dir(&self) -> PathBuf {
+        self.root.join("dir")
+    }
+
+    /// Start the media driver and archive of the node now.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the image build or the container start fails.
+    pub async fn start(self) -> anyhow::Result<AeronTestCluster> {
+        ensure_image_built().await?;
+        let node = start_node(self.root, None, None).await?;
+        Ok(AeronTestCluster { nodes: vec![node] })
+    }
+}
+
 /// The bring-up [`AeronTestCluster::single_node_runtime`] returns: the
 /// cluster (keep it alive for the test's duration; dropping it tears down
 /// the container), the runtime, and a config already pointed at the
@@ -447,12 +495,16 @@ async fn spawn_node(
     liveness: Option<Duration>,
     archive_length: Option<std::num::NonZeroU32>,
 ) -> anyhow::Result<Node> {
+    start_node(prepare_root()?, liveness, archive_length).await
+}
+
+/// Create the host root of one node, with the permissions the container
+/// user needs, and return it.
+fn prepare_root() -> anyhow::Result<PathBuf> {
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let root = std::path::PathBuf::from(format!("/tmp/kardamom-aeron-{suffix:x}"));
-    let aeron_dir = root.join("dir");
-    let archive_dir = root.join("archive").join("dir");
     std::fs::create_dir_all(root.join("archive"))?;
     for d in [&root, &root.join("archive")] {
         let mut p = std::fs::metadata(d)?.permissions();
@@ -463,6 +515,17 @@ async fn spawn_node(
         }
         std::fs::set_permissions(d, p)?;
     }
+    Ok(root)
+}
+
+/// Start the container of the node whose host root is `root`.
+async fn start_node(
+    root: PathBuf,
+    liveness: Option<Duration>,
+    archive_length: Option<std::num::NonZeroU32>,
+) -> anyhow::Result<Node> {
+    let aeron_dir = root.join("dir");
+    let archive_dir = root.join("archive").join("dir");
 
     let root_str = root
         .to_str()

@@ -204,7 +204,7 @@ async fn await_log_purge(h: &Harness, leader: u32, ctx: &str) -> anyhow::Result<
     let needle = format!("cluster LOG PURGED memberId={leader} ");
     let (hs, needle_ref) = (h, &needle);
     let outcome = poll::until(
-        Budget::new(PURGE_WAIT, Duration::from_secs(10)),
+        Budget::new(PURGE_WAIT, Duration::from_secs(3)),
         |_| async move {
             Ok(hs
                 .evidence
@@ -286,7 +286,7 @@ impl Blank {
         ctx: &'static str,
         start: BlankStart,
     ) -> anyhow::Result<Self> {
-        let before = Self::starts_by_alloc(&h.nomad, member, &start)
+        let before = Self::starts_by_alloc(&h.nomad, &Self::live_addresses(h), member, &start)
             .await?
             .counts();
         let head = h.probes.executor_progress().await.filter(|h| *h > 0).ok_or_else(|| {
@@ -301,17 +301,41 @@ impl Blank {
         })
     }
 
+    /// The addresses of the nodes of the current contract.
+    fn live_addresses(h: &Harness) -> Vec<String> {
+        h.contract
+            .nodes
+            .values()
+            .map(|n| n.ip.to_string())
+            .collect()
+    }
+
     /// Start and snapshot evidence stays in the same allocation. A removed
-    /// node is excluded by its Nomad identity, even while its old
-    /// allocation still reports running or complete.
+    /// node is excluded by its Nomad identity and its status, even while
+    /// its old allocation still reports running or complete.
     async fn starts_by_alloc(
         nomad: &Nomad,
+        live: &[String],
         member: u32,
         start: &BlankStart,
     ) -> anyhow::Result<StartLogs> {
         let allocs = nomad.allocations_with_logs(CLUSTER_TASK).await?;
+        // An allocation on a node that the contract no longer holds, such
+        // as the node a replacement removed, has no agent that serves its
+        // logs. Nomad lists that node as ready until its heartbeat grace
+        // ends, so its address decides.
+        let ready: Vec<String> = nomad
+            .nodes()
+            .await?
+            .into_iter()
+            .filter(|n| n.status == "ready" && live.contains(&n.address))
+            .map(|n| n.id)
+            .collect();
         let mut logs = StartLogs(HashMap::new());
-        for alloc in allocs.iter().filter(|a| a.client_status != "lost") {
+        for alloc in allocs
+            .iter()
+            .filter(|a| a.client_status != "lost" && ready.contains(&a.node_id))
+        {
             let text = nomad.alloc_logs(alloc, Streams::StdoutOnly).await?;
             logs.0.insert(
                 alloc.id.clone(),
@@ -331,7 +355,9 @@ impl Blank {
         let budget = Budget::new(h.knobs.rejoin_slo, Duration::from_secs(10));
         let (track_ref, me) = (&track, &self);
         let outcome = poll::until(budget, |_| async move {
-            let logs = Self::starts_by_alloc(&h.nomad, me.member, &me.start).await?;
+            let logs =
+                Self::starts_by_alloc(&h.nomad, &Self::live_addresses(h), me.member, &me.start)
+                    .await?;
             let block = logs.new_block(&me.before);
             let mut track = track_ref.borrow_mut();
             track.observe(block.unwrap_or(0), block.is_some());
@@ -507,7 +533,8 @@ pub(crate) async fn quorum_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
         victims[0], victims[1]
     ));
     h.kill_nodes(&[&victims[0], &victims[1]]).await?;
-    h.assert_executor_stalled(Duration::from_secs(15)).await?;
+    h.assert_executor_stalled(super::fleet::STALL_WINDOW)
+        .await?;
     crate::log(format!(
         "cluster-quorum-loss-recover: docker start {} (quorum 2/3 returns)",
         victims[0]
@@ -524,9 +551,9 @@ pub(crate) async fn quorum_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
         victims[1]
     ));
     h.nodes.start(&victims[1]).await?;
+    // The common tail proves that the executors advance with three members.
     h.assert_count(CLUSTER_TASK, 3, h.knobs.reschedule_slo)
-        .await?;
-    h.assert_executor_progress(Duration::from_mins(1)).await
+        .await
 }
 
 #[cfg(test)]

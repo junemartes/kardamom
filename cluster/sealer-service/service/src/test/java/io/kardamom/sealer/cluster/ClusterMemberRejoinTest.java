@@ -34,7 +34,7 @@ class ClusterMemberRejoinTest {
     @InterruptAfter(value = 120, unit = TimeUnit.SECONDS)
     void a_wiped_follower_seeds_from_a_peer_after_the_leader_purged_its_log() {
         try (LocalSealers group = new LocalSealers(dir, 3, Purged.SETTINGS);
-             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group::ingressEndpoints)) {
+             CanonicalClient client = new CanonicalClient(dir.resolve("client"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
             final int leader = group.awaitLeader(Duration.ofSeconds(20)).memberId();
             Purged.fillAndAwaitPurge(group, client, leader);

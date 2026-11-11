@@ -493,6 +493,31 @@ impl StreamPlane {
             .map(TxDataSubscriberHandle::from_subscription)
     }
 
+    /// [`Self::tx_data_subscriber`] that also reports the join of each new
+    /// image, for a reader that repairs a late join
+    /// ([`crate::refetch::JoinRepair`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription fails to open.
+    pub fn tx_data_subscriber_with_joins(
+        &mut self,
+        rt: &AeronRuntime,
+        lane: u8,
+    ) -> Result<TxDataSubscriberHandle, LogError> {
+        let key = self.tx_data_key(lane);
+        let sub = match &mut self.discovered {
+            None => rt.open_tx_data_subscription_with_joins(
+                &self.channels.tx_data_channel(lane),
+                self.channels.tx_data_stream_id(lane),
+            ),
+            Some(d) => d
+                .open_raw_subscription_with_joins(rt, key)
+                .map(TxDataSubscription::from_raw),
+        }?;
+        Ok(TxDataSubscriberHandle::from_subscription(sub))
+    }
+
     fn tx_data_key(&self, lane: u8) -> StreamKey {
         StreamKey {
             topic: Topic::TxData,

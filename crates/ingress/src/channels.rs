@@ -227,6 +227,12 @@ impl MockChannels {
     pub fn apply_rows(&self, end: BPosition, rows: &[AccountRow]) -> usize {
         self.live_writer.lock().unwrap().apply(end, rows)
     }
+
+    /// Send an executor block boundary, as the boundary stream of
+    /// `tx_receipts` does. A boundary with no subscriber is dropped.
+    pub fn send_boundary(&self, boundary: BlockBoundary) {
+        let _ = self.block_boundary_bus.send(boundary);
+    }
 }
 
 impl IngressPublication for MockChannels {
