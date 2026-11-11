@@ -8,6 +8,12 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+/// How long the last probe of a hold may run past the end of the hold:
+/// a direct read of an exporter (5 s), its `docker exec` fallback
+/// (10 s), and a margin. The answer of that probe counts. A probe that
+/// runs longer is cancelled.
+const PROBE_GRACE: Duration = Duration::from_secs(20);
+
 /// A wait's budget and cadence.
 #[derive(Debug, Clone, Copy)]
 pub struct Budget {
@@ -57,7 +63,8 @@ impl<T> Outcome<T> {
 
 /// Call `step` with the elapsed time until it yields `Some`, sleeping
 /// `interval` between calls, for at most `timeout`. The first call is
-/// immediate; a step error ends the wait.
+/// immediate; a step error ends the wait. The budget includes the time
+/// of the calls: a call that runs past `timeout` is cancelled.
 ///
 /// # Errors
 ///
@@ -67,16 +74,19 @@ where
     F: FnMut(Duration) -> Fut,
     Fut: Future<Output = anyhow::Result<Option<T>>>,
 {
-    Wait::new(budget, step).run(false).await
+    Wait::new(budget, Duration::ZERO, step).run(false).await
 }
 
 /// Sample a condition that must hold for the whole budget. A step yields
-/// `Some` with the evidence of a break. A step that exceeds the deadline
-/// cannot certify that the condition holds.
+/// `Some` with the evidence of a break. The last step can start inside
+/// the budget and end after it: its answer counts, so a clean hold stays
+/// clean. A step that does not end within [`PROBE_GRACE`] of the end of
+/// the budget cannot certify that the condition holds.
 ///
 /// # Errors
 ///
-/// Returns the step's error, or an error when a probe exceeds the deadline.
+/// Returns the step's error, or an error when a probe does not end
+/// within the grace.
 pub async fn first_break<T, F, Fut>(
     budget: Budget,
     step: F,
@@ -85,13 +95,14 @@ where
     F: FnMut(Duration) -> Fut,
     Fut: Future<Output = anyhow::Result<Option<T>>>,
 {
-    let mut wait = Wait::new(budget, step);
+    let mut wait = Wait::new(budget, PROBE_GRACE, step);
     match wait.run(false).await? {
         Outcome::Ready { value, elapsed } => Ok(Some((value, elapsed))),
         Outcome::TimedOut { .. } => {
             anyhow::ensure!(
                 !wait.probing,
-                "condition probe does not finish within {}s",
+                "condition probe does not finish within {}s of the end of its {}s hold",
+                PROBE_GRACE.as_secs(),
                 budget.timeout.as_secs_f64()
             );
             Ok(None)
@@ -110,20 +121,23 @@ where
     F: FnMut(Duration) -> Fut,
     Fut: Future<Output = anyhow::Result<Option<T>>>,
 {
-    Wait::new(budget, step).run(true).await
+    Wait::new(budget, Duration::ZERO, step).run(true).await
 }
 
 struct Wait<F> {
     budget: Budget,
+    /// How long a probe that started inside the budget may run past it.
+    grace: Duration,
     started: Instant,
     probing: bool,
     step: F,
 }
 
 impl<F> Wait<F> {
-    fn new(budget: Budget, step: F) -> Self {
+    fn new(budget: Budget, grace: Duration, step: F) -> Self {
         Self {
             budget,
+            grace,
             started: Instant::now(),
             probing: false,
             step,
@@ -135,7 +149,8 @@ impl<F> Wait<F> {
         F: FnMut(Duration) -> Fut,
         Fut: Future<Output = anyhow::Result<Option<T>>>,
     {
-        let result = tokio::time::timeout(self.budget.timeout, self.drive(delay)).await;
+        let bound = self.budget.timeout.saturating_add(self.grace);
+        let result = tokio::time::timeout(bound, self.drive(delay)).await;
         let elapsed = self.started.elapsed();
         Ok(match result {
             Ok(Ok(Some(value))) => Outcome::Ready { value, elapsed },
@@ -171,11 +186,8 @@ impl<F> Wait<F> {
         }
         self.probing = true;
         let value = (self.step)(elapsed).await?;
-        if self.started.elapsed() >= self.budget.timeout {
-            return Ok(ControlFlow::Break(None));
-        }
         self.probing = false;
-        if value.is_some() {
+        if value.is_some() || self.started.elapsed() >= self.budget.timeout {
             return Ok(ControlFlow::Break(value));
         }
         self.sleep().await;
@@ -222,6 +234,24 @@ mod tests {
         assert!(
             matches!(outcome, Outcome::TimedOut { elapsed } if elapsed == Duration::from_secs(5))
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_clean_hold_whose_last_probe_straddles_the_deadline_holds() {
+        let mut calls = 0;
+        let held: Option<((), Duration)> = first_break(Budget::secs(20, 2), |_| {
+            calls += 1;
+            let slow = calls == 4;
+            async move {
+                if slow {
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                }
+                Ok(None)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(held, None);
     }
 
     #[tokio::test(start_paused = true)]

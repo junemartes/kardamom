@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use tracing::info;
 
+use super::image_joins::ImageJoins;
 use super::thread::SubEntry;
 
 /// A destination attached to the subscription `sub_id`, keyed by
@@ -30,6 +31,9 @@ pub(super) struct Destination {
     pub(super) entry: SubEntry,
     /// The time of the detach and the linger. `None` while attached.
     leaving: Option<(Instant, Duration)>,
+    /// The images of this destination that the Aeron thread reported,
+    /// when the subscription `sub_id` reports its joins.
+    pub(super) joins: ImageJoins,
 }
 
 impl Destination {
@@ -39,6 +43,7 @@ impl Destination {
             uri: uri.to_string(),
             entry,
             leaving: None,
+            joins: ImageJoins::default(),
         }
     }
 

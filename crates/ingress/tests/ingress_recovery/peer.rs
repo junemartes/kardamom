@@ -8,6 +8,10 @@
 //! wins, and a sender's nonces run in order with no gap. It keeps a
 //! ledger of every executed transfer, so a test can require each one
 //! exactly once.
+//!
+//! The pipeline reads each lane as the sequencer does: a late join of a
+//! new ingress session refetches the frames before the join from the
+//! archive of that ingress ([`JoinRepair`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -15,6 +19,8 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, B256, U256};
 use kardamom_log::aeron_live::{AeronRuntime, PubHandle, TxDataSubscriberHandle};
+use kardamom_log::config::AeronConfig;
+use kardamom_log::refetch::{ArchiveRefetcher, EndpointSource, JoinRepair, RefetchConfig};
 use kardamom_types::{AccountRow, Receipt, ReceiptBatch, TxEnvelope};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -95,9 +101,61 @@ impl Ledger {
 /// The pipeline: the `tx_data` subscriptions of every ingress, and a
 /// receipt publication to every ingress, all on one runtime.
 struct Pump {
-    subs: Vec<TxDataSubscriberHandle>,
+    lanes: Vec<Lane>,
     receipts: Vec<PubHandle>,
     ledger: Arc<Mutex<Ledger>>,
+}
+
+/// The largest late-join gap that the pipeline refetches, as the
+/// sequencer's bound.
+const MAX_JOIN_GAP: u64 = 64 << 20;
+
+/// The `tx_data` lane 0 of one ingress, with the repair of its late joins.
+struct Lane {
+    sub: TxDataSubscriberHandle,
+    repair: JoinRepair,
+    refetcher: ArchiveRefetcher,
+}
+
+impl Lane {
+    /// Lane 0 of `channels`, whose frames the archive at `archive` records.
+    /// The pipeline subscribes before any ingress starts, so it needs no
+    /// start grace.
+    fn open(
+        rt: &AeronRuntime,
+        aeron_dir: &std::path::Path,
+        channels: &Channels,
+        archive: &str,
+    ) -> Self {
+        let free = || format!("127.0.0.1:{}", super::free_udp_port());
+        let refetcher = ArchiveRefetcher::new(RefetchConfig {
+            tx_data_endpoints: EndpointSource::Static(vec![archive.to_owned()]),
+            tx_deposits_endpoints: EndpointSource::Static(Vec::new()),
+            response_endpoint: free(),
+            replay_endpoint: free(),
+            aeron_dir: Some(aeron_dir.to_path_buf()),
+            aeron: AeronConfig::default(),
+        });
+        Self {
+            sub: channels.subscriber(rt),
+            repair: JoinRepair::new(
+                Channels::defaults().tx_data_stream_id(0),
+                Duration::ZERO,
+                MAX_JOIN_GAP,
+            ),
+            refetcher,
+        }
+    }
+
+    /// The envelopes that arrived, after the repair of a late join.
+    fn arrived(&mut self) -> Vec<TxEnvelope> {
+        while let Some(item) = self.sub.try_recv_item() {
+            self.repair.take(item, &mut self.refetcher);
+        }
+        std::iter::from_fn(|| self.repair.pop(&mut self.refetcher))
+            .map(|frame| frame.envelope)
+            .collect()
+    }
 }
 
 impl Pump {
@@ -106,11 +164,7 @@ impl Pump {
     /// an ingress that is down drops the frame and never holds the pump;
     /// the ingress reads that receipt from the query stub.
     fn turn(&mut self) {
-        let arrived: Vec<TxEnvelope> = self
-            .subs
-            .iter_mut()
-            .flat_map(|sub| std::iter::from_fn(|| sub.try_recv().map(|(_, env)| env)))
-            .collect();
+        let arrived: Vec<TxEnvelope> = self.lanes.iter_mut().flat_map(Lane::arrived).collect();
         let frames: Vec<ReceiptBatch> = {
             let mut ledger = self.ledger.lock().unwrap();
             let ran: Vec<TxEnvelope> = arrived.into_iter().flat_map(|e| ledger.take(e)).collect();
@@ -134,16 +188,25 @@ pub(crate) struct Pipeline {
 
 impl Pipeline {
     /// Start the pipeline on the driver at `aeron_dir`, with the channels
-    /// of every ingress.
-    pub(crate) fn start(aeron_dir: &std::path::Path, ingresses: &[Channels]) -> Self {
+    /// of every ingress and the archive control endpoint that records each.
+    pub(crate) fn start(
+        aeron_dir: &std::path::Path,
+        ingresses: &[Channels],
+        archives: &[String],
+    ) -> Self {
         let ledger = Arc::new(Mutex::new(Ledger::default()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (dir, channels) = (aeron_dir.to_path_buf(), ingresses.to_vec());
+        let archives = archives.to_vec();
         let (shared, stopped) = (ledger.clone(), stop.clone());
         let thread = std::thread::spawn(move || {
             let rt = AeronRuntime::spawn_with_dir(&dir).unwrap();
             let mut pump = Pump {
-                subs: channels.iter().map(|c| c.subscriber(&rt)).collect(),
+                lanes: channels
+                    .iter()
+                    .zip(&archives)
+                    .map(|(c, archive)| Lane::open(&rt, &dir, c, archive))
+                    .collect(),
                 receipts: channels.iter().map(|c| c.receipts_publisher(&rt)).collect(),
                 ledger: shared,
             };

@@ -242,8 +242,10 @@ test-component component="all":
     python3 scripts/test-components.py "{{component}}"
 
 # Check the component recovery catalog: fields, local tests and ported cases.
+# Then print the shard plan; it fails when a shard can run over its deadline.
 component-catalog:
     python3 scripts/ci/component_catalog.py validate
+    python3 scripts/ci/component_tests.py plan
 
 # Print the planned, partial and ported case counts per family.
 component-summary:

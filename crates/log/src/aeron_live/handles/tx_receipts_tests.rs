@@ -38,6 +38,8 @@ fn one_batch_frame_fans_out_to_every_receipt_in_order() {
         pos,
         session: 0,
         stream_pos: 0,
+        initial_term_id: 0,
+        joined: false,
     })
     .unwrap();
 
@@ -76,6 +78,8 @@ async fn a_rollback_frame_reads_as_a_rollback_and_batch_readers_skip_it() {
         pos,
         session,
         stream_pos: 0,
+        initial_term_id: 0,
+        joined: false,
     };
     let rollback_bytes = codec::encode(&rollback).unwrap();
     assert_eq!(rollback_bytes.len(), ReceiptFrame::ROLLBACK_LEN);
@@ -124,6 +128,8 @@ async fn recv_batch_keeps_the_rows_and_skips_a_bad_frame() {
         pos,
         session: 0,
         stream_pos: 0,
+        initial_term_id: 0,
+        joined: false,
     })
     .unwrap();
     tx.send(RawFrame {
@@ -131,6 +137,8 @@ async fn recv_batch_keeps_the_rows_and_skips_a_bad_frame() {
         pos,
         session: 41,
         stream_pos: 0,
+        initial_term_id: 0,
+        joined: false,
     })
     .unwrap();
 

@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::AeronConfig;
-use kardamom_log::refetch::{EndpointSource, RefetchConfig};
+use kardamom_log::refetch::RefetchConfig;
 use kardamom_obs::pipeline::Queue;
 use kardamom_state::Durability;
 use kardamom_types::{GenesisAlloc, TxDataLoc, TxEnvelope};
@@ -232,56 +232,18 @@ pub fn archive_join_recovery(
     response_endpoint: Option<&str>,
     replay_endpoint: Option<&str>,
 ) -> Option<JoinRecoveryFactory> {
-    let channels = plane.channels().clone();
-    let (tx_data_endpoints, tx_deposits_endpoints) = archive_endpoints(plane, aeron_cfg);
-    if !tx_data_endpoints.is_configured() && !tx_deposits_endpoints.is_configured() {
-        return None;
-    }
-    let (Some(response_endpoint), Some(replay_endpoint)) = (response_endpoint, replay_endpoint)
-    else {
-        tracing::warn!(
-            "durability-archive endpoints configured but no local refetch endpoints \
-             (--archive-control-response-endpoint / --replay-destination-endpoint); \
-             join-miss refetch DISABLED — a lost envelope will be fatal"
-        );
-        return None;
-    };
-    let cfg = RefetchConfig {
-        tx_data_endpoints,
-        tx_deposits_endpoints,
-        response_endpoint: response_endpoint.to_string(),
-        replay_endpoint: replay_endpoint.to_string(),
-        aeron_dir: aeron_dir.map(std::path::Path::to_path_buf),
-        aeron: aeron_cfg.clone(),
-    };
-    Some(JoinRecoveryFactory {
+    let tx_data_stream_base = plane.channels().tx_data_stream_id_base;
+    RefetchConfig::for_plane(
+        plane,
+        aeron_cfg,
+        aeron_dir,
+        response_endpoint,
+        replay_endpoint,
+    )
+    .map(|cfg| JoinRecoveryFactory {
         cfg,
-        tx_data_stream_base: channels.tx_data_stream_id_base,
+        tx_data_stream_base,
     })
-}
-
-/// The archive endpoint sources of the two refetched topics: the live
-/// archive records on a discovered plane, else the static lists.
-fn archive_endpoints(
-    plane: &mut kardamom_log::discovery::StreamPlane,
-    aeron_cfg: &AeronConfig,
-) -> (EndpointSource, EndpointSource) {
-    match plane.watch_archives() {
-        Some(archives) => (
-            EndpointSource::Discovered {
-                topic: kardamom_log::discovery::Topic::TxData,
-                archives: archives.clone(),
-            },
-            EndpointSource::Discovered {
-                topic: kardamom_log::discovery::Topic::TxDeposits,
-                archives,
-            },
-        ),
-        None => (
-            EndpointSource::Static(aeron_cfg.tx_data_archive_endpoints.clone()),
-            EndpointSource::Static(aeron_cfg.tx_deposits_archive_endpoints.clone()),
-        ),
-    }
 }
 
 // ---------------------------------------------------------------------------

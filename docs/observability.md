@@ -634,6 +634,14 @@ Each block commit records these steps:
   Each one gets a `FeeInvalid`, `FeeTooLow`, or `InsufficientFunds` error on `tx_errors`.
   See [priority-fees.md](priority-fees.md).
 
+- `kardamom_log_tx_data_join_repairs_total{outcome}` counts the late joins of the `tx_data` lanes to a new ingress session, by outcome. See "Late join to a new ingress session" in [failure-modes.md](failure-modes.md).
+  - `repaired`: the refetch from the ingress archives covered the frames from the session start to the join.
+  - `short`: the replay ended before the join, or gave no frame. The rest of the range is lost.
+  - `failed`: the refetch failed or passed its 15 s budget, or a position did not map to the stream. The range is lost.
+  - `start`: the replica saw the session in its first 10 s, so it did not repair it, by design.
+  - `too_large`: the gap was above 64 MiB.
+  - Each outcome but `repaired` also logs a `tx_data late join not repaired` warning with the stream, the session and the gap.
+
 The egress feed thread keeps the decision version of the sealer and handles the refused references (egress kind 18).
 See "The kept sealer version and the refused reference" in [failure-modes.md](failure-modes.md).
 
@@ -807,10 +815,12 @@ Each process has one Aeron thread. It carries the publishes and the subscription
   egress index.
 - A client that is over its rate limit gets `shed`, and the ingress answers `null` without a query.
 - The receipt cache keeps the newest 131072 receipts and evicts the oldest first.
-- `kardamom_cache_reconnects_total` counts the Redis reconnects that a failed command started. One failure burst starts one reconnect.
-- `kardamom_cache_live_evictions_total` counts the entries that the local account layer removed, for the TTL or for the capacity. A high rate means that the layer is too small for the active accounts.
-- `kardamom_cache_reconnects_total` counts the reconnects that a failed Redis command starts. One failure burst starts one reconnect.
-  The readers skip the cache while the reconnect runs.
+- `kardamom_cache_reconnects_total` counts the replacements of the shared Redis connection.
+  - A connection error replaces the connection at once.
+  - A command timeout alone does not. The connection is replaced only after it gives no reply for three command
+    timeouts. Until then, the reads continue on the same connection.
+  - The readers skip the cache while a replacement runs. Each connection attempt ends after the connection bound:
+    ten command timeouts. Through the Sentinels, that bound covers the name lookups and the questions together.
 - `kardamom_cache_live_evictions_total` counts the entries that the `live` layer removes, for the TTL or the capacity.
   A high rate with many `live` misses means that the layer is too small for the active accounts.
 

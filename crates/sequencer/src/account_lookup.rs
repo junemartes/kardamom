@@ -33,7 +33,7 @@ use crate::metrics;
 use crate::sequencer::Shutdown;
 use crate::v2::AccountEvent;
 use alloy_primitives::Address;
-use kardamom_cache::{AccountView, CacheReader, ExecutorQuery, LiveAccounts};
+use kardamom_cache::{AccountView, CacheReader, ExecutorQuery, LiveAccounts, QueryAnswer};
 use kardamom_obs::pipeline::Step;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
@@ -287,13 +287,24 @@ impl Sources {
         let query = self.from.query.as_ref()?;
         let (nonce, balance) = tokio::join!(query.nonce(address), query.balance(address));
         let (nonce, balance) = (nonce.ok()?, balance.ok()?);
-        let state = AccountState {
+        let state = AccountState::of_answers(&nonce, &balance)?;
+        Some((nonce.tx_idx == balance.tx_idx, state))
+    }
+}
+
+impl AccountState {
+    /// The state from a nonce answer and a balance answer of the
+    /// executors, at the older position of the two. The position is in
+    /// the convention of the rows ([`QueryAnswer::last_record`]), so that
+    /// the row of the next record is newer than the answer. `None` when
+    /// the nonce does not fit in a `u64`.
+    pub(crate) fn of_answers(nonce: &QueryAnswer, balance: &QueryAnswer) -> Option<Self> {
+        Some(Self {
             nonce: u64::try_from(nonce.value).ok()?,
             balance: balance.value,
             delegated: false,
-            tx_idx: nonce.tx_idx.min(balance.tx_idx),
-        };
-        Some((nonce.tx_idx == balance.tx_idx, state))
+            tx_idx: nonce.last_record().min(balance.last_record()),
+        })
     }
 }
 

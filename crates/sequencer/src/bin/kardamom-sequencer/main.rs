@@ -29,6 +29,7 @@ use kardamom_log::aeron_live::{
 };
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
+use kardamom_log::refetch::{JoinRepair, RefetchWorker};
 use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_sequencer::fees::FeeGate;
 use kardamom_sequencer::lookup::LookupRequester;
@@ -79,16 +80,20 @@ impl Handles {
         rt: &AeronRuntime,
         plane: &mut StreamPlane,
         cfg: &SequencerConfig,
-        tx_events: bool,
+        args: &Args,
+        log_cfg: &LogConfig,
     ) -> Result<Self> {
-        let own = Self::open_lane(rt, plane, cfg.lane())?;
+        let tx_events = args.tx_events == TxEventsArg::On;
+        let refetch = args.refetch(plane, log_cfg);
+        let repair = refetch.is_some();
+        let own = Self::open_lane(rt, plane, cfg.lane(), repair)?;
         let old = cfg
             .extra_lanes
             .iter()
-            .map(|lane| Self::open_lane(rt, plane, *lane))
+            .map(|lane| Self::open_lane(rt, plane, *lane, repair))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            data_subs: LaneSubscriptions::new(own, old),
+            data_subs: LaneSubscriptions::new(own, old, refetch.map(RefetchWorker::spawn)),
             deposits_sub: plane
                 .subscriber::<TxDepositsSubscriberHandle>(rt)
                 .context("open TxDepositsSubscriberHandle")?,
@@ -123,13 +128,38 @@ impl Handles {
     }
 
     /// Open the `tx_data` subscription of one lane through the plane.
-    fn open_lane(rt: &AeronRuntime, plane: &mut StreamPlane, lane: u8) -> Result<LaneSub> {
-        let handle = plane
-            .tx_data_subscriber(rt, lane)
-            .with_context(|| format!("open TxDataSubscriberHandle lane={lane}"))?;
-        Ok(LaneSub { lane, handle })
+    /// With `repair`, the lane reports the joins of new images and repairs
+    /// a late join ([`JoinRepair`]).
+    fn open_lane(
+        rt: &AeronRuntime,
+        plane: &mut StreamPlane,
+        lane: u8,
+        repair: bool,
+    ) -> Result<LaneSub> {
+        let opened = if repair {
+            plane.tx_data_subscriber_with_joins(rt, lane)
+        } else {
+            plane.tx_data_subscriber(rt, lane)
+        };
+        let handle = opened.with_context(|| format!("open TxDataSubscriberHandle lane={lane}"))?;
+        let stream_id = plane.channels().tx_data_stream_id(lane);
+        Ok(LaneSub {
+            lane,
+            handle,
+            repair: repair.then(|| JoinRepair::new(stream_id, JOIN_REPAIR_GRACE, MAX_JOIN_GAP)),
+        })
     }
 }
+
+/// A lane does not repair the late join of a session that it first sees
+/// this long after its start: at its start the sequencer joins each
+/// running ingress session late, by design.
+const JOIN_REPAIR_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The largest late-join gap that a lane refetches, in bytes. A session
+/// with more bytes before the join ran long before it, so it is not a new
+/// publication.
+const MAX_JOIN_GAP: u64 = 64 << 20;
 
 /// The account events that may wait for the v2 loop: about one for each
 /// receipt batch. A full queue holds the receipts feed back.
@@ -568,7 +598,7 @@ async fn main() -> anyhow::Result<()> {
     let mut plane = StreamPlane::from_config(&log_cfg, &format!("sequencer-{}", cfg.lane()))
         .context("build the stream plane")?;
 
-    let handles = Handles::open(&rt, &mut plane, &cfg, args.tx_events == TxEventsArg::On).await?;
+    let handles = Handles::open(&rt, &mut plane, &cfg, &args, &log_cfg).await?;
     spawn_events_beacon(&mut plane, &rt).await?;
 
     let shutdown = Shutdown::new();

@@ -1,7 +1,9 @@
 use anyhow::Context;
 use serde_json::Value;
 
-pub(super) const SEGMENT_BLOCKS: u64 = 16;
+/// The segment of the short reader window, in blocks: a third of the
+/// window, so the window spans whole segments.
+pub(super) const SEGMENT_BLOCKS: u64 = 4;
 
 /// A short reader window with the registered L1 safety floors intact.
 pub(super) struct WindowJob(Value);

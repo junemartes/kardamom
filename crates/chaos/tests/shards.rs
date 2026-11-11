@@ -105,7 +105,7 @@ async fn run_audited(harness: &mut Harness, case: &str, audit: bool) -> anyhow::
 }
 
 async fn run_shard(shard: Shard) -> anyhow::Result<()> {
-    phases::Phases::read(shard, &case_list(shard), reuse())?
+    phases::Phase::read(shard, &case_list(shard), reuse())?
         .run()
         .await
 }

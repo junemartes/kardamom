@@ -13,9 +13,9 @@ use crate::probes::BATCHER_PORT;
 
 /// The metrics port of an egress instance (`ports.egress_metrics` in
 /// `group_vars/all.yml`).
-const EGRESS_METRICS_PORT: u16 = 9013;
-const REF_MAX_INDEX: &str = "kardamom_egress_ref_frame_max_index";
-const REF_MAX_BLOCK: &str = "kardamom_egress_ref_frame_max_block";
+pub(super) const EGRESS_METRICS_PORT: u16 = 9013;
+pub(super) const REF_MAX_INDEX: &str = "kardamom_egress_ref_frame_max_index";
+pub(super) const REF_MAX_BLOCK: &str = "kardamom_egress_ref_frame_max_block";
 
 /// How long a reader may take to pass a mark.
 const WAIT: Budget = Budget {
@@ -124,8 +124,8 @@ impl Egress {
 /// One gauge of the batcher and one of the validator, on the aux node.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Readers {
-    batcher: &'static str,
-    validator: &'static str,
+    pub(super) batcher: &'static str,
+    pub(super) validator: &'static str,
 }
 
 /// The posted block of the batcher and the committed block of the

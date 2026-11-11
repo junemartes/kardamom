@@ -22,7 +22,10 @@ use crate::harness::Harness;
 use crate::l1::{L1, Posted};
 use crate::nomad::Streams;
 use crate::poll::{self, Budget};
-use crate::probes::{BATCHER_PORT, CLUSTER_TASK};
+use crate::probes::CLUSTER_TASK;
+
+mod freeze;
+use freeze::{Held, freeze_with_spool};
 
 /// The sealer's line for a snapshot, on every member.
 const SNAPSHOT_LINE: &str = "snapshot TAKEN";
@@ -30,13 +33,6 @@ const SNAPSHOT_LINE: &str = "snapshot TAKEN";
 /// references of every block, and the bytes of every transaction from
 /// the archives.
 const REBUILD_BUDGET: Duration = Duration::from_secs(240);
-/// How many times the freeze is retried to land on an unposted group.
-const FREEZE_ATTEMPTS: u32 = 10;
-/// How long a freeze attempt holds the batcher before it reads the
-/// covered block. A post in flight at the freeze lands on L1 in this
-/// time. The attempt then stays under the Aeron client's service
-/// interval (10 s), so a thaw for a retry does not restart the batcher.
-const SETTLE: Duration = Duration::from_secs(5);
 /// The batcher's line for a post that L1 confirmed, with its block
 /// range.
 const CONFIRMED_LINE: &str = "batch confirmed on L1";
@@ -44,259 +40,8 @@ const CONFIRMED_LINE: &str = "batch confirmed on L1";
 /// back: the spool restore after a restart, and one post.
 const SPOOL_POST_BUDGET: Duration = Duration::from_secs(90);
 
-/// The spool root of the batcher on the aux node: its `--spool-dir`.
-const SPOOL_ROOT: &str = "/opt/kardamom/batcher/spool";
-
-/// The format registry of this build. The batcher checks its
-/// `SPOOL_VERSION` against the `batcher-spool` entry, so the directory of
-/// its spool follows from this entry.
-const FORMATS: &str = include_str!("../../../../../formats.toml");
-
-/// One freeze attempt on the aux node: find the running batcher
-/// container, then in one exec SIGSTOP it, read its process state from
-/// `/proc`, list the block files of its spool, and SIGCONT it again
-/// unless it is stopped with a non-empty spool. The exec takes about one
-/// second. A stopped batcher then waits `SETTLE` for the covered block.
-/// A scrape of the frozen exporter waits for its timeout, and does not
-/// fit. Each attempt finds the container again: a restart between two
-/// attempts can replace it.
-struct FreezeAttempt<'a> {
-    aux: &'a str,
-    /// The directory of the spool that the batcher of this build writes.
-    spool: String,
-}
-
-impl<'a> FreezeAttempt<'a> {
-    /// The attempt on the aux node `aux`, against the spool directory of
-    /// this build.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the registry does not load or lists no
-    /// `batcher-spool`.
-    fn new(aux: &'a str) -> anyhow::Result<Self> {
-        let versions = kardamom_formats::Registry::parse(FORMATS)?
-            .versions("batcher-spool")
-            .ok_or_else(|| anyhow::anyhow!("the format registry lists no batcher-spool"))?;
-        Ok(Self {
-            aux,
-            spool: format!("{SPOOL_ROOT}/v{}", versions.writes),
-        })
-    }
-
-    /// The shell command that prints the count of block files in the
-    /// spool directory and the number of the highest block, and `0 0`
-    /// when the directory does not exist. The file names are zero-padded
-    /// block numbers, so `ls` lists them in block order.
-    fn count_command(&self) -> String {
-        format!(
-            "blocks=$(ls {} 2>/dev/null | grep '\\.block$'); last=$(printf '%s\\n' \"$blocks\" | tail -n 1); last=${{last%.block}}; echo \"$(printf '%s' \"$blocks\" | grep -c .) ${{last:-0}}\"",
-            self.spool
-        )
-    }
-
-    /// The shell script of the attempt on the container `inner`. It
-    /// prints the process state, the count of spooled blocks and the
-    /// highest spooled block, or `gone 0 0` when the container is gone
-    /// before the signal.
-    fn script(&self, inner: &str) -> String {
-        let count = self.count_command();
-        format!(
-            "docker kill -s STOP {inner} >/dev/null 2>&1 || {{ echo 'gone 0 0'; exit 0; }}
-pid=$(docker inspect -f '{{{{.State.Pid}}}}' {inner})
-state=?
-for _ in $(seq 1 40); do
-  state=$(sed 's/.*) //' /proc/$pid/stat | cut -d' ' -f1)
-  [ \"$state\" = T ] && break
-  sleep 0.05
-done
-spool=$({count})
-if [ \"$state\" != T ] || [ \"${{spool%% *}}\" = 0 ]; then docker kill -s CONT {inner} >/dev/null; fi
-echo \"$state $spool\""
-        )
-    }
-
-    /// Run the attempt. `Some` when the batcher stays frozen with a
-    /// non-empty spool; `None` when no batcher container runs, or the
-    /// spool was empty and the batcher runs again.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the exec fails, or if the process is not
-    /// stopped after the signal.
-    async fn run(&self, h: &Harness, ctx: &str) -> anyhow::Result<Option<Frozen>> {
-        let Some(inner) = h.nodes.inner_container(self.aux, "batcher").await else {
-            crate::log(format!(
-                "{ctx}: no batcher container runs on {}; the freeze waits for it",
-                self.aux
-            ));
-            return Ok(None);
-        };
-        let out = h.nodes.exec(self.aux, &self.script(&inner)).await?;
-        Frozen::parse(&out, inner, ctx)
-    }
-
-    /// Hold the stopped batcher for `SETTLE`, so a post in flight at the
-    /// freeze lands, then read the block L1 covers. Keep the freeze when
-    /// the spool holds a block past it. Else thaw the batcher for a
-    /// retry: the restart drops a spool that L1 covers, so the thaw has
-    /// no group to recover.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the L1 read fails.
-    async fn settle(
-        &self,
-        h: &Harness,
-        l1: &L1,
-        frozen: Frozen,
-        ctx: &str,
-    ) -> anyhow::Result<Option<Held>> {
-        tokio::time::sleep(SETTLE).await;
-        let covered = l1.covered_through().await?;
-        if frozen.holds_unposted(covered) {
-            return Ok(Some(Held { frozen, covered }));
-        }
-        crate::log(format!(
-            "{ctx}: the spool of {} ends at block {}, and L1 covers through {covered}; thawing to retry",
-            frozen.inner, frozen.last_block
-        ));
-        if h.thaw(self.aux, &frozen.inner).await.is_err() {
-            crate::log(format!(
-                "{ctx}: SIGCONT failed (the task was replaced mid-freeze); the next attempt finds the new container"
-            ));
-        }
-        Ok(None)
-    }
-
-    /// One attempt to the end: freeze, then settle. `None` when the
-    /// batcher runs again.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the exec or the L1 read fails, or if the
-    /// process is not stopped after the signal.
-    async fn hold(&self, h: &Harness, l1: &L1, ctx: &str) -> anyhow::Result<Option<Held>> {
-        match self.run(h, ctx).await? {
-            Some(frozen) => self.settle(h, l1, frozen, ctx).await,
-            None => Ok(None),
-        }
-    }
-}
-
-/// A batcher stopped with a non-empty spool: its container, the count
-/// of spooled blocks, and the highest spooled block.
-struct Frozen {
-    inner: String,
-    blocks: usize,
-    last_block: u64,
-}
-
-impl Frozen {
-    /// Parse the attempt's output, `<state> <blocks> <last block>`.
-    /// `None` when the container was gone or the spool was empty.
-    fn parse(out: &str, inner: String, ctx: &str) -> anyhow::Result<Option<Self>> {
-        let mut words = out.split_whitespace();
-        let (Some(state), Some(blocks), Some(last), None) =
-            (words.next(), words.next(), words.next(), words.next())
-        else {
-            return Err(crate::chaos_fail!(
-                "{ctx}: the freeze attempt printed no state, count and last block: {out:?}"
-            ));
-        };
-        let blocks: usize = blocks
-            .parse()
-            .map_err(|e| crate::chaos_fail!("{ctx}: spool listing is not a count: {e}"))?;
-        let last_block: u64 = last.parse().map_err(|e| {
-            crate::chaos_fail!("{ctx}: the last spooled block is not a number: {e}")
-        })?;
-        match state {
-            "gone" => Ok(None),
-            "T" => Ok((blocks > 0).then_some(Self {
-                inner,
-                blocks,
-                last_block,
-            })),
-            _ => Err(crate::chaos_fail!(
-                "{ctx}: freeze did NOT take effect (process state {state:?} after SIGSTOP, not T)"
-            )),
-        }
-    }
-
-    /// True when the spool holds a block past `covered`: a group that L1
-    /// does not hold. A spool of only the batch in flight at the freeze
-    /// holds none once L1 confirms that batch.
-    fn holds_unposted(&self, covered: u64) -> bool {
-        self.last_block > covered
-    }
-}
-
-/// A frozen batcher whose spool holds an unposted group, and the block
-/// L1 covered while it was frozen.
-struct Held {
-    frozen: Frozen,
-    covered: u64,
-}
-
-/// Freeze the batcher with an unposted group in its spool, so the thaw
-/// has a group to recover. The spool empties for an instant after every
-/// post, and the batch in flight at the freeze can land during it. An
-/// attempt that holds no unposted group thaws the batcher and tries
-/// again.
-async fn freeze_with_spool(h: &Harness, l1: &L1, aux: &str, ctx: &str) -> anyhow::Result<Held> {
-    let attempt = FreezeAttempt::new(aux)?;
-    let attempt = &attempt;
-    let target = h.probes.aux_target(BATCHER_PORT);
-    let target = &target;
-    let outcome = poll::until(
-        Budget::new(
-            (Duration::from_secs(4) + SETTLE + h.knobs.restart_slo) * FREEZE_ATTEMPTS,
-            Duration::from_secs(1),
-        ),
-        |_| async move {
-            let held = attempt.hold(h, l1, ctx).await?;
-            if held.is_none() {
-                await_answering(h, target, ctx).await?;
-            }
-            Ok::<_, anyhow::Error>(held)
-        },
-    )
-    .await?;
-    let (held, _) = outcome.or_fail(|_| {
-        crate::chaos_fail!(
-            "{ctx}: the spool held no block past the covered block, or no batcher ran, on every freeze"
-        )
-    })?;
-    crate::log(format!(
-        "{ctx}: freeze verified (process state T, {} spooled blocks through {} in {})",
-        held.frozen.blocks, held.frozen.last_block, held.frozen.inner
-    ));
-    Ok(held)
-}
-
-/// Wait until the batcher's metrics endpoint answers: after a thaw, the
-/// task can restart, and its container is gone until the new one runs.
-async fn await_answering(
-    h: &Harness,
-    target: &crate::metrics::Target,
-    ctx: &str,
-) -> anyhow::Result<()> {
-    let budget = Budget::new(h.knobs.restart_slo, Duration::from_secs(1));
-    poll::until(budget, |_| async move {
-        Ok::<_, anyhow::Error>(h.probes.scrape().answers(target).await.then_some(()))
-    })
-    .await?
-    .or_fail(|t| {
-        crate::chaos_fail!(
-            "{ctx}: the batcher did not answer within {}s after a thaw",
-            t.as_secs()
-        )
-    })
-    .map(|_| ())
-}
-
 /// The least hold of a floor pass when nothing else bounds it.
-pub(super) const MIN_HOLD: Duration = Duration::from_mins(2);
+pub(super) const MIN_HOLD: Duration = Duration::from_secs(40);
 
 /// Hold until the ingress delta passed twice the retention, `min_hold`
 /// passed, and the sealers took a snapshot; the delta and the time.
@@ -319,7 +64,7 @@ pub(super) async fn hold_until_floor_passes(
     ));
     let delta = Cell::new(0_i64);
     let delta_ref = &delta;
-    let budget = Budget::new(h.knobs.retention_freeze_cap, Duration::from_secs(15));
+    let budget = Budget::new(h.knobs.retention_freeze_cap, Duration::from_secs(5));
     let outcome = poll::after_sleep(budget, |elapsed| async move {
         let d = h
             .probes
@@ -529,43 +274,22 @@ pub(crate) async fn batcher_outage_past_retention(h: &mut Harness) -> anyhow::Re
         .count_lines(CLUSTER_TASK, SNAPSHOT_LINE, Streams::StdoutOnly)
         .await?;
     let Held { frozen, covered } = freeze_with_spool(h, &l1, &aux, ctx).await?;
-    // The baselines follow the freeze: a restart on a retried freeze
-    // logs its own lines, which must not count for the final thaw.
-    let lines = Lines::read(h).await?;
-    let rebuilding0 = count(h, REBUILDING_LINE).await?;
-    let rebuilt0 = count(h, REBUILT_LINE).await?;
-    let at = AtFreeze { covered, lines };
     crate::log(format!(
-        "{ctx}: batcher frozen with {} spooled blocks through {}, L1 covered through {}",
-        frozen.blocks, frozen.last_block, at.covered
+        "{ctx}: batcher frozen with {} spooled blocks through {}, L1 covered through {covered}",
+        frozen.blocks, frozen.last_block
     ));
-    // The freeze must outlast the service interval of the Aeron clients
-    // of the batcher, or the thaw does not end the process.
-    let min_hold = h.knobs.aeron_stall.evicting_freeze().max(MIN_HOLD);
-    let (delta, held) = hold_until_floor_passes(h, rx0, snapshots0, min_hold, ctx).await?;
-    crate::log(format!(
-        "{ctx}: the floor passed ({delta} frames in {}s); thawing",
-        held.as_secs()
-    ));
-    let sealed = h
-        .probes
-        .executor_progress()
-        .await
-        .ok_or_else(|| crate::chaos_fail!("{ctx}: no executor head at the thaw"))?;
-    let sealed = u64::try_from(sealed)
-        .map_err(|e| crate::chaos_fail!("{ctx}: the executor head is not a block: {e}"))?;
+    // The thaw runs on every path: Nomad does not restart a stopped
+    // process, so a failed hold must not leave the batcher frozen.
+    let held = FrozenHold::hold(h, rx0, snapshots0, covered, ctx).await;
     if h.thaw(&aux, &frozen.inner).await.is_err() {
         crate::log(format!(
             "{ctx}: SIGCONT failed (the task was replaced mid-freeze); the log asserts own the verdict"
         ));
     }
+    let FrozenHold { at, lines, sealed } = held?;
     // The time a restart of the batcher after the thaw may take.
     let budget = h.knobs.restart_slo + Duration::from_secs(60);
     await_spool_posted(h, &l1, at, budget, ctx).await?;
-    let lines = Baselines {
-        rebuilding: rebuilding0,
-        rebuilt: rebuilt0,
-    };
     if !await_rebuilt_or_served(h, &l1, lines, sealed, budget + REBUILD_BUDGET, ctx).await? {
         return l1.assert_contiguous(ctx).await;
     }
@@ -580,6 +304,55 @@ pub(crate) async fn batcher_outage_past_retention(h: &mut Harness) -> anyhow::Re
     })?;
     await_covered_through(&l1, floor, ctx).await?;
     l1.assert_contiguous(ctx).await
+}
+
+/// What the frozen half of `batcher-outage-past-retention` hands to the
+/// thaw: the state at the freeze, the rebuild line counts, and the
+/// executor head at the thaw.
+struct FrozenHold {
+    at: AtFreeze,
+    lines: Baselines,
+    sealed: u64,
+}
+
+impl FrozenHold {
+    /// Read the baselines of the frozen batcher, and hold the freeze
+    /// until the floor passes. The baselines follow the freeze: a
+    /// restart on a retried freeze logs its own lines, which must not
+    /// count for the final thaw.
+    async fn hold(
+        h: &Harness,
+        rx0: i64,
+        snapshots0: usize,
+        covered: u64,
+        ctx: &str,
+    ) -> anyhow::Result<Self> {
+        let lines = Lines::read(h).await?;
+        let baselines = Baselines {
+            rebuilding: count(h, REBUILDING_LINE).await?,
+            rebuilt: count(h, REBUILT_LINE).await?,
+        };
+        // The freeze must outlast the service interval of the Aeron
+        // clients of the batcher, or the thaw does not end the process.
+        let min_hold = h.knobs.aeron_stall.evicting_freeze().max(MIN_HOLD);
+        let (delta, held) = hold_until_floor_passes(h, rx0, snapshots0, min_hold, ctx).await?;
+        crate::log(format!(
+            "{ctx}: the floor passed ({delta} frames in {}s); thawing",
+            held.as_secs()
+        ));
+        let sealed = h
+            .probes
+            .executor_progress()
+            .await
+            .ok_or_else(|| crate::chaos_fail!("{ctx}: no executor head at the thaw"))?;
+        let sealed = u64::try_from(sealed)
+            .map_err(|e| crate::chaos_fail!("{ctx}: the executor head is not a block: {e}"))?;
+        Ok(Self {
+            at: AtFreeze { covered, lines },
+            lines: baselines,
+            sealed,
+        })
+    }
 }
 
 /// The batcher log counts before the thaw.
