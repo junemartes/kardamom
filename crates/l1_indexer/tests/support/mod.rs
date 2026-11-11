@@ -8,4 +8,5 @@ pub(crate) mod chain;
 pub(crate) mod check;
 pub(crate) mod child;
 pub(crate) mod rig;
+pub(crate) mod serial;
 pub(crate) mod stream;

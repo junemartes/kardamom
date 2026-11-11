@@ -14,17 +14,18 @@
 //!   liar restarts, the operator clears the halt, and the da-watcher
 //!   publishes only true epochs again.
 //!
-//! The process lifecycle is global, so the binary runs one test at a time.
+//! The process lifecycle is global, so each test takes its turn and the
+//! binary runs one test at a time.
 
 mod support;
 
 use std::time::{Duration, Instant};
 
 use kardamom_l1_fault_proxy::{Fault, FaultProxy};
-use kardamom_obs::lifecycle::process;
 use kardamom_types::service::{HaltCause, HaltRef};
 use support::child::{ChildMain, Hub, Instance, Launch};
 use support::rig::{Rig, wait};
+use support::serial::Turn;
 
 /// The da-watcher's silence window here: short, so a total loss crosses
 /// it in seconds. The chaos shard uses 30 seconds.
@@ -58,12 +59,14 @@ struct Fleet {
     hub: Hub,
     instances: [Option<Instance>; 2],
     next_batch: u64,
+    /// The last field, so it drops last: the next test starts only after
+    /// this one stops its processes and its da-watcher.
+    _turn: Turn,
 }
 
 impl Fleet {
     async fn start() -> Self {
-        process().clear();
-        process().resume();
+        let turn = Turn::take().await;
         let mut rig = Rig::new().await;
         let bind = "127.0.0.1:0".parse().unwrap();
         let c = FaultProxy::spawn(&rig.l1.url(), bind).await.unwrap();
@@ -77,6 +80,7 @@ impl Fleet {
             hub,
             instances: [None, None],
             next_batch: 1,
+            _turn: turn,
         };
         fleet.launch(0);
         fleet.launch(1);

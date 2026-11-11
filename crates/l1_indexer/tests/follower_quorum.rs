@@ -13,7 +13,8 @@
 //!   ends. The stream then carries every true record, the da-watcher
 //!   publishes every epoch once, and the archive holds every batch.
 //!
-//! The process lifecycle is global, so the binary runs one test at a time.
+//! The process lifecycle is global, so each test takes its turn and the
+//! binary runs one test at a time.
 
 mod support;
 
@@ -24,6 +25,7 @@ use kardamom_obs::lifecycle::process;
 use kardamom_types::service::{HaltCause, HaltRef};
 use support::chain::SETTLEMENT;
 use support::rig::{Rig, wait};
+use support::serial::Turn;
 
 /// The production backoff of a source that failed.
 const BACKOFF: Duration = Duration::from_secs(30);
@@ -38,18 +40,24 @@ const LIMIT: Duration = Duration::from_secs(10);
 struct Case {
     rig: Rig,
     next_batch: u64,
+    /// The last field, so it drops last: the next test starts only after
+    /// this one stops its follower and its da-watcher.
+    _turn: Turn,
 }
 
 impl Case {
     /// A rig whose follower and da-watcher run and caught up with one
     /// posted batch.
     async fn start() -> Self {
-        process().clear();
-        process().resume();
+        let turn = Turn::take().await;
         let mut rig = Rig::new().await;
         rig.start_watcher();
         rig.start_follower().await;
-        let mut case = Self { rig, next_batch: 1 };
+        let mut case = Self {
+            rig,
+            next_batch: 1,
+            _turn: turn,
+        };
         case.post().await;
         case.rig.l1.mine(2);
         case.await_caught_up().await;
