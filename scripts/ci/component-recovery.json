@@ -2353,7 +2353,8 @@
         }
       ],
       "limitation": "Harness recovery evidence only. Does not run a sealer, Nomad cluster or reproduce election consensus. A readable closed majority is still required; persistent missing logs fail at the complete deadline.",
-      "ci_mode": "in-process"
+      "ci_mode": "in-process",
+      "subject": "chaos-harness"
     },
     "checkpoint-fault": {
       "command": [
@@ -2399,7 +2400,8 @@
           "kernel_probe_failed": true
         }
       ],
-      "ci_mode": "docker"
+      "ci_mode": "docker",
+      "subject": "chaos-harness"
     },
     "chaos-alert": {
       "command": [
@@ -2443,7 +2445,8 @@
           "compiled": true
         }
       ],
-      "ci_mode": "in-process"
+      "ci_mode": "in-process",
+      "subject": "chaos-harness"
     },
     "transport-pressure": {
       "command": [
@@ -2513,7 +2516,8 @@
         "an_executor_baseline_requires_full_state_agreement_and_the_receipted_nonce"
       ],
       "limitation": "Checks exact account predicates and the executor baseline; distributed recovery remains required.",
-      "ci_mode": "in-process"
+      "ci_mode": "in-process",
+      "subject": "chaos-harness"
     },
     "chaos-projection": {
       "command": [
@@ -2552,7 +2556,8 @@
           ]
         }
       ],
-      "ci_mode": "in-process"
+      "ci_mode": "in-process",
+      "subject": "chaos-harness"
     },
     "batcher-null-receipts": {
       "command": [
@@ -2755,7 +2760,8 @@
           "log": "/tmp/backlog-non_atomic_snapshot-negative-20261028.log"
         }
       ],
-      "ci_mode": "in-process"
+      "ci_mode": "in-process",
+      "subject": "chaos-harness"
     },
     "chaos-archive-stage": {
       "command": [
@@ -2792,7 +2798,8 @@
           "intended_failure": true
         }
       ],
-      "ci_mode": "in-process"
+      "ci_mode": "in-process",
+      "subject": "chaos-harness"
     },
     "archive-recovery": {
       "command": [
@@ -2868,7 +2875,8 @@
           "exit_code": 101
         }
       ],
-      "ci_mode": "in-process"
+      "ci_mode": "in-process",
+      "subject": "chaos-harness"
     },
     "discovery-registration": {
       "command": [
@@ -3830,23 +3838,47 @@
     {
       "case": "sequencer-replica-kill-lane0-node0",
       "family": "Sequencer",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "each_restarted_replica_orders_an_established_sender_while_its_twin_is_frozen"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts the killed replica and the frozen twin keeps its container id: container identity exists only in the deployment"
+      ]
     },
     {
       "case": "sequencer-replica-kill-lane1-node1",
       "family": "Sequencer",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "each_restarted_replica_orders_an_established_sender_while_its_twin_is_frozen"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts the killed replica and the frozen twin keeps its container id: container identity exists only in the deployment"
+      ]
     },
     {
       "case": "sequencer-replica-kill-lane0-node1",
       "family": "Sequencer",
-      "status": "planned",
-      "local_tests": [],
-      "full_case_locally_validated": false
+      "status": "ported",
+      "local_tests": [
+        {
+          "suite": "sequencer",
+          "test": "each_restarted_replica_orders_an_established_sender_while_its_twin_is_frozen"
+        }
+      ],
+      "full_case_locally_validated": true,
+      "cluster_only_checks": [
+        "Nomad restarts the killed replica and the frozen twin keeps its container id: container identity exists only in the deployment"
+      ]
     },
     {
       "case": "sequencer-replica-kill-lane1-node0",
@@ -4726,6 +4758,10 @@
         {
           "suite": "l1-provider-http",
           "test": "unresponsive_sources_cannot_hold_the_follower_read_forever"
+        },
+        {
+          "suite": "l1-follower-quorum",
+          "test": "refused_providers_halt_the_follower_until_the_backoff_returns_them"
         }
       ],
       "full_case_locally_validated": false

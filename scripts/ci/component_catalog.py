@@ -16,6 +16,8 @@ STATUSES = ("planned", "partial", "ported")
 NEGATIVE_CONTROL_KEYS = ("negative_controls", "clock_negative_controls", "negative_control")
 CONTROL_TEST_KEYS = ("test", "tests", "failed_tests")
 CI_MODES = ("in-process", "docker", "gradle", "stack")
+# The optional `subject` of a suite. A suite without it tests production code.
+SUBJECTS = ("chaos-harness",)
 
 
 class Catalog:
@@ -44,6 +46,8 @@ class Catalog:
                 + self.timing_errors()
                 + [f"suite {name}: ci_mode must be one of {list(CI_MODES)}"
                    for name, suite in self.suites.items() if suite.get("ci_mode") not in CI_MODES]
+                + [f"suite {name}: subject must be one of {list(SUBJECTS)}"
+                   for name, suite in self.suites.items() if suite.get("subject", SUBJECTS[0]) not in SUBJECTS]
                 + [f"suite {name}: {error}" for name, suite in self.suites.items()
                    for error in self.timeout_errors(suite)]
                 + [error for case in self.cases for error in self.case_errors(case)])
@@ -102,6 +106,8 @@ class Catalog:
              "a ported case needs a local test in a suite with a ci_mode, so that CI runs it"),
             (not any(self.guards(control, test) for test in tests for control in self.controls(test)),
              "a ported case needs a negative control for one of its local tests"),
+            (all("subject" in self.suites.get(test.get("suite"), {}) for test in tests),
+             "a ported case needs a local test of production code: a suite with no subject"),
         ] if failed]
 
     def controls(self, test):
