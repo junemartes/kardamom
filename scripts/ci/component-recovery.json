@@ -2956,7 +2956,8 @@
         "reference executor: the production engine over a real MDBX writer, with a real checkpoint and peer checkpoint server"
       ],
       "controlled": [
-        "one reference chain and one media driver per test process; the lapse tests run to block 150 and the join to block 70, two transfers per block, one block per 100 ms",
+        "one reference chain and one media driver per test process; the short lapse runs to block 150, the long lapse to block 220 and the join to block 160, ten transfers per block, one block per 100 ms",
+        "a second subscriber on tx_bal and tx_receipts: the chain keeps its pace while the validator is frozen or gone, and a validator that starts joins each stream at its live position",
         "SIGSTOP and SIGCONT of the validator process; the test restarts an exited process as the supervisor",
         "driver client liveness timeout of 3 s; lapses of 1.5 s and 9 s",
         "one executor replica publishes the reference BAL and receipt frames",
@@ -2967,7 +2968,7 @@
         "a_long_lapse_ends_the_process_and_the_restart_resumes_from_its_state",
         "a_fresh_validator_adopts_the_peer_checkpoint_and_verifies_live"
       ],
-      "limitation": "The validator reads the canonical stream from the egress (--egress), a deployed option; the default deployment reads the Aeron Cluster egress with tx_data joins. The driver liveness timeout is a local driver setting; the deployed freeze length follows the deployed Aeron stall tolerance. Peers are addressed by IP, not by Consul DNS.",
+      "limitation": "The validator reads the canonical stream from the egress (--egress), a deployed option; the default deployment reads the Aeron Cluster egress with tx_data joins. The driver liveness timeout is a local driver setting; the deployed freeze length follows the deployed Aeron stall tolerance. Peers are addressed by IP, not by Consul DNS. The result streams are IPC streams of one driver; the deployed streams are UDP streams between nodes.",
       "negative_controls": [
         {
           "mutation": "BalBuffer::MAX_BUFFERED = 4",
@@ -2976,7 +2977,18 @@
           ],
           "exit_code": 101,
           "compiled": true,
-          "failed_assertion": "coverage regressed over the lapse: bal_missing 0 -> 15"
+          "failed_assertion": "coverage regressed over the lapse: bal_missing 2 -> 19"
+        },
+        {
+          "mutation": "KeyedInner::below_arrivals returns false: the buffers have no arrival floor",
+          "tests": [
+            "a_short_lapse_keeps_the_same_process_verifying_past_its_count",
+            "a_long_lapse_ends_the_process_and_the_restart_resumes_from_its_state",
+            "a_fresh_validator_adopts_the_peer_checkpoint_and_verifies_live"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "failed_assertion": "the validator is not level with the chain while it grows"
         },
         {
           "mutation": "the restart resumes from ResumePoint::GENESIS, not from the persisted recovery point",

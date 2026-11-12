@@ -46,9 +46,9 @@ impl Shared {
         let building = std::thread::spawn(move || {
             Chain::build(
                 &dir,
-                crate::BLOCKS,
+                crate::RESTART_BLOCKS,
                 crate::CHECKPOINT_BLOCK,
-                &[crate::JOIN_BLOCKS, crate::BLOCKS],
+                &[crate::BLOCKS, crate::JOIN_BLOCKS, crate::RESTART_BLOCKS],
             )
         });
         let rt = tokio::runtime::Builder::new_multi_thread()

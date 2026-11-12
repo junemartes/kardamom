@@ -242,7 +242,7 @@ impl Node {
             .collect()
     }
 
-    fn log_tail(&self) -> String {
+    pub(crate) fn log_tail(&self) -> String {
         let text = self.log_text();
         let lines: Vec<&str> = text.lines().collect();
         lines[lines.len().saturating_sub(40)..].join("\n")

@@ -344,8 +344,8 @@
   "state-writer-crash::process_loss_before_commit_discards_the_entire_uncommitted_block": 0.032,
   "transport-mds-remove::removing_receive_destinations_keeps_the_live_images_and_logs_no_driver_error": 21.245,
   "transport-pressure::unavailable_outputs_preserve_live_delivery_and_recover": 11.278,
-  "validator-recovery::a_fresh_validator_adopts_the_peer_checkpoint_and_verifies_live": 15.497,
-  "validator-recovery::a_long_lapse_ends_the_process_and_the_restart_resumes_from_its_state": 23.146,
-  "validator-recovery::a_short_lapse_keeps_the_same_process_verifying_past_its_count": 17.202,
+  "validator-recovery::a_fresh_validator_adopts_the_peer_checkpoint_and_verifies_live": 24.2,
+  "validator-recovery::a_long_lapse_ends_the_process_and_the_restart_resumes_from_its_state": 28.3,
+  "validator-recovery::a_short_lapse_keeps_the_same_process_verifying_past_its_count": 22.7,
   "validator-retention::a_validator_held_past_the_posted_head_resumes_inside_the_window_and_verifies_every_block": 0.415
 }
