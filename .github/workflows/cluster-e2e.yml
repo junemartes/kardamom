@@ -612,18 +612,22 @@ jobs:
           while IFS=$'\t' read -r kind job url conclusion title; do
             if [ "$kind" = shard ]; then
               # The failed cases: the cases that the log starts and does
-              # not pass.
-              gh api "repos/$GH_REPO/actions/jobs/$job/logs" > shard.log || true
-              sed -n 's/.*= CHAOS CASE: \([a-z0-9-]*\).*/\1/p' shard.log | sort -u > started
-              sed -n 's/.*CHAOS CASE \([a-z0-9-]*\): PASS.*/\1/p' shard.log | sort -u > passed
-              cases=$(comm -23 started passed | paste -sd, -)
+              # not pass, each with the reason that the log gives. curl
+              # reads the log: `gh api` prints no response that holds
+              # terminal escape sequences, and a shard log holds color
+              # codes.
+              curl --silent --show-error --location --fail \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                "$GITHUB_API_URL/repos/$GH_REPO/actions/jobs/$job/logs" > shard.log || true
+              cases=$(python3 scripts/ci/nightly_report.py cases < shard.log | sed 's/^/  - /')
             else
-              cases="none: the run stopped before the shards"
+              cases="  - none: the run stopped before the shards"
             fi
             {
               echo "The nightly run $RUN_URL ended with \`$conclusion\`: $title."
               echo
-              echo "- Failed cases: ${cases:-none found in the log}"
+              echo "- Failed cases:"
+              echo "${cases:-  - none found in the log}"
               echo "- Job log: $url"
               echo "- The chaos evidence artifacts of the run hold the state files."
               echo
