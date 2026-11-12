@@ -87,11 +87,19 @@ fn report_recorder_outcome(
     let _ = ready_tx.send((sid, outcome));
 }
 
+/// The readiness of the discovered recorder, and how long the start waits
+/// for it ([`DiscoveredRecorder::ready_budget`]).
+pub(crate) struct DiscoveredReady {
+    ready: oneshot::Receiver<RecorderProgress>,
+    budget: Duration,
+}
+
 /// Spawns the one discovery-driven recorder thread: it records every
 /// `tx_data` publisher the catalog lists, this ingress's own lanes and
 /// every other ingress's, on the local archive. Readiness is this
-/// instance's `lanes` publications all recording. Returns `None` on a
-/// static plane, where [`spawn_tx_data_recorders`] applies.
+/// instance's `lanes` publications all recording. The archive connect
+/// tries again for up to `connect_limit`. Returns `None` on a static
+/// plane, where [`spawn_tx_data_recorders`] applies.
 ///
 /// # Errors
 ///
@@ -101,7 +109,8 @@ pub(crate) fn spawn_discovered_tx_data_recorder(
     aeron_cfg: &AeronConfig,
     plane: &mut StreamPlane,
     lanes: NonZeroU8,
-) -> Result<Option<(RecorderThreads, oneshot::Receiver<RecorderProgress>)>> {
+    connect_limit: Duration,
+) -> Result<Option<(RecorderThreads, DiscoveredReady)>> {
     let Some(membership) = plane.watch_topic(Topic::TxData) else {
         return Ok(None);
     };
@@ -116,17 +125,19 @@ pub(crate) fn spawn_discovered_tx_data_recorder(
         own_instance: own_instance.to_string(),
         expected_own: usize::from(lanes.get()),
         removal_grace: plane.removal_grace(),
+        connect_limit,
         membership,
         stop: recorders.stop_token(),
         runtime: tokio::runtime::Handle::current(),
     };
-    let (ready_tx, ready_rx) = oneshot::channel();
+    let budget = recorder.ready_budget();
+    let (ready_tx, ready) = oneshot::channel();
     recorders
         .spawn("ingress-tx-data-recorder".into(), move |_stop| {
             run_discovered_recorder(recorder, ready_tx);
         })
         .context("spawn discovered tx_data recorder thread")?;
-    Ok(Some((recorders, ready_rx)))
+    Ok(Some((recorders, DiscoveredReady { ready, budget })))
 }
 
 /// Runs the discovery-driven recorder on its thread, and reports its
@@ -143,29 +154,30 @@ fn run_discovered_recorder(
     }
 }
 
-/// The barrier of [`spawn_discovered_tx_data_recorder`]: every own lane
-/// records, or the recorder reported a failure, or the budget ran out.
-pub(crate) async fn wait_for_discovered_recorder(
-    ready: oneshot::Receiver<RecorderProgress>,
-) -> Result<()> {
-    const READY_TIMEOUT: Duration = Duration::from_mins(1);
-    match tokio::time::timeout(READY_TIMEOUT, ready).await {
-        Ok(Ok(RecorderProgress::Ready { own_recordings })) => {
-            tracing::info!(
-                own_recordings,
-                "tx_data recordings confirmed active for every lane"
-            );
-            Ok(())
+impl DiscoveredReady {
+    /// The barrier of [`spawn_discovered_tx_data_recorder`]: every own
+    /// lane records, or the recorder reported a failure, or the budget
+    /// ran out.
+    pub(crate) async fn wait(self) -> Result<()> {
+        let budget = self.budget;
+        match tokio::time::timeout(budget, self.ready).await {
+            Ok(Ok(RecorderProgress::Ready { own_recordings })) => {
+                tracing::info!(
+                    own_recordings,
+                    "tx_data recordings confirmed active for every lane"
+                );
+                Ok(())
+            }
+            Ok(Ok(RecorderProgress::Failed(reason))) => {
+                anyhow::bail!("the discovered tx_data recorder failed to start: {reason}")
+            }
+            Ok(Err(_)) => {
+                anyhow::bail!("the discovered tx_data recorder thread exited before readiness")
+            }
+            Err(_) => anyhow::bail!(
+                "timed out ({budget:?}) waiting for every own tx_data recording to become active"
+            ),
         }
-        Ok(Ok(RecorderProgress::Failed(reason))) => {
-            anyhow::bail!("the discovered tx_data recorder failed to start: {reason}")
-        }
-        Ok(Err(_)) => {
-            anyhow::bail!("the discovered tx_data recorder thread exited before readiness")
-        }
-        Err(_) => anyhow::bail!(
-            "timed out ({READY_TIMEOUT:?}) waiting for every own tx_data recording to become active"
-        ),
     }
 }
 

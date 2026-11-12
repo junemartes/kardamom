@@ -33,12 +33,15 @@ fn the_age_is_the_clock_difference_and_a_leader_ahead_reads_zero() {
 #[test]
 fn a_drain_records_the_age_of_its_oldest_message_once() {
     let now = i64::try_from(now_ms()).unwrap();
+    let mut observed = None;
     let text = render(|| {
         let mut meters = SessionMeters::new(false);
         meters.note_egress(now - 20);
         meters.note_egress(now - 2_000);
         meters.note_egress(now - 30);
+        let before = now_ms();
         meters.drain_done();
+        observed = Some((before, now_ms()));
         // A drain with no app message records nothing.
         meters.drain_done();
     });
@@ -47,7 +50,11 @@ fn a_drain_records_the_age_of_its_oldest_message_once() {
         Some(1.0)
     );
     let sum = value(&text, "kardamom_cluster_client_egress_age_seconds_sum").unwrap();
-    assert!((2.0..2.5).contains(&sum), "sum {sum}");
+    let (before, after) = observed.unwrap();
+    let oldest = u64::try_from(now - 2_000).unwrap();
+    let bounds = Duration::from_millis(before.checked_sub(oldest).unwrap()).as_secs_f64()
+        ..=Duration::from_millis(after.checked_sub(oldest).unwrap()).as_secs_f64();
+    assert!(bounds.contains(&sum), "sum {sum}, expected {bounds:?}");
 }
 
 #[test]
@@ -84,10 +91,11 @@ fn a_cycle_splits_its_time_into_busy_and_idle() {
             requests: Some(0),
             egress_out: Some(0),
         };
-        std::thread::sleep(Duration::from_millis(60));
+        // Each charge crosses the 100 ms flush interval by itself. A
+        // delayed first span cannot leave the second charge unpublished.
+        std::thread::sleep(Duration::from_millis(120));
         meters.duties_done(true, &depths);
-        // The meter adds its time to the counters at most every 100 ms.
-        std::thread::sleep(Duration::from_millis(60));
+        std::thread::sleep(Duration::from_millis(120));
         meters.waited();
     });
     let state = |s: &str| {
@@ -99,7 +107,7 @@ fn a_cycle_splits_its_time_into_busy_and_idle() {
         )
         .unwrap()
     };
-    assert!(state("busy") >= 60_000_000.0, "busy {}", state("busy"));
-    assert!(state("idle") >= 60_000_000.0, "idle {}", state("idle"));
+    assert!(state("busy") >= 120_000_000.0, "busy {}", state("busy"));
+    assert!(state("idle") >= 120_000_000.0, "idle {}", state("idle"));
     assert_eq!(state("blocked"), 0.0);
 }

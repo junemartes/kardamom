@@ -69,7 +69,10 @@ async fn cluster_members_resolve_sorted_by_member_id() {
         &[("member_id", "0")],
     );
     let plane = test_plane(&catalog);
-    let endpoints = plane.cluster_ingress_endpoints().await.unwrap();
+    let endpoints = plane
+        .cluster_ingress_endpoints(Duration::ZERO)
+        .await
+        .unwrap();
     assert_eq!(
         endpoints.as_deref(),
         Some("0=10.0.0.5:40200,2=10.0.0.5:40200")
@@ -80,10 +83,19 @@ async fn cluster_members_resolve_sorted_by_member_id() {
 async fn no_cluster_members_leaves_the_static_config_in_place() {
     let catalog = MemoryCatalog::new();
     let plane = test_plane(&catalog);
-    assert_eq!(plane.cluster_ingress_endpoints().await.unwrap(), None);
+    assert_eq!(
+        plane
+            .cluster_ingress_endpoints(Duration::ZERO)
+            .await
+            .unwrap(),
+        None
+    );
     let static_plane = StreamPlane::static_only(LogConfig::default().channels);
     assert_eq!(
-        static_plane.cluster_ingress_endpoints().await.unwrap(),
+        static_plane
+            .cluster_ingress_endpoints(Duration::ZERO)
+            .await
+            .unwrap(),
         None
     );
 }
@@ -99,7 +111,12 @@ async fn a_malformed_member_record_is_an_error_not_a_silent_skip() {
         &[("member_id", "zero")],
     );
     let plane = test_plane(&catalog);
-    assert!(plane.cluster_ingress_endpoints().await.is_err());
+    assert!(
+        plane
+            .cluster_ingress_endpoints(Duration::ZERO)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

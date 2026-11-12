@@ -18,4 +18,4 @@ pub use fakes::*;
 #[cfg(feature = "docker-e2e")]
 mod cluster;
 #[cfg(feature = "docker-e2e")]
-pub use cluster::{AeronTestCluster, SingleNodeRig, recv_within, require_docker};
+pub use cluster::{AeronTestCluster, PendingNode, SingleNodeRig, recv_within, require_docker};

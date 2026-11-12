@@ -1,7 +1,9 @@
 //! The sequencer lapse and the retention-overrun cases: a running
 //! consumer is frozen with SIGSTOP and must repair itself on thaw.
 
+mod heal;
 mod repair;
+use heal::{Heal, assert_no_repair, await_egress_read};
 use repair::Repair;
 
 use std::cell::Cell;
@@ -14,6 +16,8 @@ use crate::probes::EXECUTOR_BLOCK_METRIC;
 const LAG_SUSPECTED: &str = "kardamom_sequencer_resync_lag_suspected_total";
 const RESYNC_ENTERED: &str = "kardamom_sequencer_resync_entered_total";
 const RESYNC_MODE: &str = "kardamom_sequencer_resync_mode";
+
+mod admission;
 
 /// Forensics for a sequencer-lapse failure: container identity, the
 /// resync metrics, and the replica's recent log lines.
@@ -80,12 +84,12 @@ impl LapseSample {
 }
 
 /// Pause lane 0's replica on node 0 for a window under shard-0 load,
-/// then resume. The twin keeps ordering; the lapsed replica must detect
-/// the lapse and engage resync, on the survivor path (counters move
-/// past their baselines or resync mode is active) or on the newborn
-/// path (the freeze got its Aeron client evicted, Nomad restarted it,
-/// and the fresh process entered startup resync). The default window is
-/// the evicting freeze of the deployed Aeron stall tolerance.
+/// then resume. The twin keeps ordering. The receipt-floor loop must
+/// engage its resync guard, or a new process must start with that guard.
+/// The admission loop must publish fresh work between two observations
+/// of the affected replica after thaw. Its legacy resync gauge proves
+/// no recovery. The default window crosses the deployed Aeron stall
+/// tolerance and can replace the process.
 pub(crate) async fn sequencer_lapse(h: &mut Harness) -> anyhow::Result<()> {
     let node = h.probes.sequencers[0].container.clone();
     let inner = h
@@ -111,6 +115,8 @@ pub(crate) async fn sequencer_lapse(h: &mut Harness) -> anyhow::Result<()> {
         h.knobs.seq_lapse.as_secs(),
         started0.as_deref().unwrap_or("?")
     ));
+    // The lapse counts from the SIGSTOP: the freeze check runs inside it.
+    let frozen_at = std::time::Instant::now();
     h.freeze_verified(
         &node,
         &inner,
@@ -118,12 +124,17 @@ pub(crate) async fn sequencer_lapse(h: &mut Harness) -> anyhow::Result<()> {
         "sequencer-lapse",
     )
     .await?;
-    tokio::time::sleep(h.knobs.seq_lapse.saturating_sub(Duration::from_secs(3))).await;
+    tokio::time::sleep(h.knobs.seq_lapse.saturating_sub(frozen_at.elapsed())).await;
     h.thaw(&node, &inner)
         .await
         .map_err(|e| crate::chaos_fail!("sequencer-lapse: SIGCONT failed: {e}"))?;
     crate::log("sequencer-lapse: resumed; twin must have covered (no stall)");
     h.assert_progress().await?;
+    if !h.knobs.sequencer_loop.can_strand_refs() {
+        h.assert_admission_lapse().await?;
+        h.assert_lapse_exporter().await?;
+        return Ok(());
+    }
     let good = Cell::new(0_u32);
     let last = Cell::new(LapseSample::default());
     let (hs, node_ref, started0_ref) = (&*h, node.as_str(), started0.as_deref());
@@ -170,14 +181,20 @@ pub(crate) async fn sequencer_lapse(h: &mut Harness) -> anyhow::Result<()> {
         "sequencer-lapse: lapsed replica engaged resync (baseline lag {l0} entered {r0}; now {})",
         s.show()
     ));
-    let target = h.probes.sequencer_lane0_target(0);
-    h.assert_replica_healthy(&target, Duration::from_secs(90))
-        .await?;
-    report_past_deadline_refusals(h).await?;
+    h.assert_lapse_exporter().await?;
     crate::log(
         "sequencer-lapse PASS: progress held, lag detected, resync engaged, replica healthy",
     );
     Ok(())
+}
+
+impl Harness {
+    async fn assert_lapse_exporter(&self) -> anyhow::Result<()> {
+        let target = self.probes.sequencer_lane0_target(0);
+        self.assert_replica_healthy(&target, Duration::from_secs(90))
+            .await?;
+        report_past_deadline_refusals(self).await
+    }
 }
 
 /// Report how many of a thawed replica's re-offers the sealer refused for
@@ -252,7 +269,7 @@ async fn engaged(
 /// Which consumer the retention overrun freezes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Victim {
-    /// executor-2; nodes 0 and 1 stay untouched as checkpoint donors.
+    /// Executor 2; executors 0 and 1 stay untouched as checkpoint donors.
     Executor,
     Validator,
 }
@@ -277,17 +294,23 @@ impl Victim {
 /// retention rolls past its cursor, so on thaw its replay is refused
 /// and it must repair itself: fetch a peer checkpoint, park the stale
 /// state, restore or adopt it in-process, and rejoin. The repair burns
-/// no orchestrator restart (issue #298): the process that logged the
-/// refusal is the one that logs the restore. The freeze itself does
-/// cost one restart, before the refusal: a SIGSTOP longer than the Aeron
-/// client's service interval makes the client exit on resume, and Nomad
-/// restarts the task. The freeze lasts at least the evicting freeze of
-/// the deployed Aeron stall tolerance, so the restart happens at any
-/// tolerance. The freeze also crosses the cluster session
-/// timeout, so the resume goes through a fresh session.
+/// no orchestrator restart: the process that logged the refusal is the
+/// one that logs the restore. The freeze itself does cost one restart,
+/// before the refusal: a SIGSTOP longer than the Aeron client's service
+/// interval makes the client exit on resume, and Nomad restarts the task.
+/// The freeze lasts at least the evicting freeze of the deployed Aeron
+/// stall tolerance, so the restart happens at any tolerance. On the
+/// repair path the freeze also crosses the cluster session timeout, so
+/// the resume goes through a fresh session.
+///
+/// On a carry-born cluster the sealer keeps the exact window, and the
+/// consumer heals from the egress instead (see [`Heal::Egress`]). It
+/// reads the member feed and the egress, holds no cluster session, and
+/// needs no peer checkpoint.
 pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow::Result<()> {
     let kind = victim.kind();
     let ctx = format!("retention-overrun({kind})");
+    let heal = Heal::of(h.knobs.genesis_carry);
     let retention = h.knobs.cluster_retention.ok_or_else(|| {
         crate::chaos_fail!("{ctx}: KARDAMOM_CLUSTER_RETENTION is not set — this case only means something on a cluster deployed with a small -Dkardamom.cluster.retention")
     })?;
@@ -306,10 +329,12 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
         .inner_container(&node, kind)
         .await
         .ok_or_else(|| crate::chaos_fail!("{ctx}: no inner {kind} container on {node}"))?;
-    let donor = h.container("executor-0")?;
-    super::component::wait_peer_checkpoint(h, &donor, &ctx).await?;
+    if heal.needs_peer_checkpoint() {
+        let donor = h.probes.executors[0].container.clone();
+        super::component::wait_peer_checkpoint(h, &donor, &ctx).await?;
+    }
     require_live_victim(h, victim, &ctx).await?;
-    let repair = Repair::capture(h, victim, &node).await?;
+    let repair = Repair::capture(h, victim, &node, heal.needles(victim)).await?;
     let need = i64::try_from(retention.get().saturating_mul(2)).unwrap_or(i64::MAX);
     let rx_freeze =
         h.probes.ingress_counts().await.complete().ok_or_else(|| {
@@ -320,7 +345,19 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
         h.knobs.retention_freeze_cap.as_secs()
     ));
     h.freeze_verified(&node, &inner, &target, &ctx).await?;
-    let (delta, elapsed) = overrun_window(h, rx_freeze, need, &ctx, &node, &inner).await?;
+    let shortest = heal.shortest_freeze(h);
+    let (delta, elapsed) = overrun_window(
+        h,
+        Overrun {
+            rx_freeze,
+            need,
+            shortest,
+        },
+        &ctx,
+        &node,
+        &inner,
+    )
+    .await?;
     crate::log(format!(
         "{ctx}: window overrun ({delta} frames in {}s ≈ {}tps); thawing",
         elapsed.as_secs(),
@@ -333,10 +370,17 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
             "{ctx}: SIGCONT failed (container may have been replaced mid-freeze); the log asserts below own the verdict"
         ));
     }
-    await_repair_chain(h, victim, &ctx, delta, elapsed, &repair).await?;
+    match heal {
+        Heal::Repair => await_repair_chain(h, victim, &ctx, delta, elapsed, &repair).await?,
+        Heal::Egress => await_egress_read(h, victim, &ctx, &repair).await?,
+    }
     match victim {
-        Victim::Executor => h.assert_executor_progress(Duration::from_mins(3)).await,
-        Victim::Validator => await_verifying_resumed(h).await,
+        Victim::Executor => h.assert_executor_progress(Duration::from_mins(3)).await?,
+        Victim::Validator => await_verifying_resumed(h).await?,
+    }
+    match heal {
+        Heal::Repair => Ok(()),
+        Heal::Egress => assert_no_repair(h, &ctx, &repair).await,
     }
 }
 
@@ -345,7 +389,7 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
 async fn require_live_victim(h: &Harness, victim: Victim, ctx: &str) -> anyhow::Result<()> {
     let prev = Cell::new(None);
     let prev_ref = &prev;
-    let outcome = poll::until(Budget::secs(120, 6), |_| async move {
+    let outcome = poll::until(Budget::secs(120, 2), |_| async move {
         let now = match victim {
             Victim::Executor => h.probes.exec_metric(2, EXECUTOR_BLOCK_METRIC).await,
             Victim::Validator => h.probes.val_metric("validator_committed_block").await,
@@ -360,19 +404,31 @@ async fn require_live_victim(h: &Harness, victim: Victim, ctx: &str) -> anyhow::
         .map(|_| ())
 }
 
+/// What ends an overrun freeze: the ingress count at the freeze, the
+/// frames that must flow past it, and the shortest freeze.
+#[derive(Debug, Clone, Copy)]
+struct Overrun {
+    rx_freeze: i64,
+    need: i64,
+    shortest: Duration,
+}
+
 /// Hold the freeze until enough frames flowed past the frozen cursor
-/// and the cluster session lapsed, within the cap. Frames are counted
+/// and the shortest freeze passed, within the cap. Frames are counted
 /// from observed accepted transactions, not the target rate.
 async fn overrun_window(
     h: &Harness,
-    rx_freeze: i64,
-    need: i64,
+    overrun: Overrun,
     ctx: &str,
     node: &str,
     inner: &str,
 ) -> anyhow::Result<(i64, Duration)> {
-    let budget = Budget::new(h.knobs.retention_freeze_cap, Duration::from_secs(15));
-    let shortest = Duration::from_mins(2).max(h.knobs.aeron_stall.evicting_freeze());
+    let Overrun {
+        rx_freeze,
+        need,
+        shortest,
+    } = overrun;
+    let budget = Budget::new(h.knobs.retention_freeze_cap, Duration::from_secs(5));
     let delta = Cell::new(0_i64);
     let delta_ref = &delta;
     let outcome = poll::after_sleep(budget, |elapsed| async move {

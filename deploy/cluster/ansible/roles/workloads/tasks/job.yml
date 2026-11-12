@@ -33,3 +33,13 @@
     - workloads_job.submit | default(true)
     - workloads_job.wait | default(true)
     - not ansible_check_mode
+    - not (workloads_waves | default(false) and workloads_job.defer | default(false))
+
+- name: Defer to the end of its wave the wait for {{ workloads_job.name }}
+  ansible.builtin.set_fact:
+    workloads_deferred: "{{ workloads_deferred + [workloads_job.name] }}"
+  when:
+    - workloads_job.submit | default(true)
+    - workloads_job.wait | default(true)
+    - workloads_waves | default(false)
+    - workloads_job.defer | default(false)

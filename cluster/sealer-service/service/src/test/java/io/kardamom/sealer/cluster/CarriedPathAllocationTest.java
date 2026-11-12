@@ -52,6 +52,14 @@ final class CarriedPathAllocationTest {
     private static final int MEASURED = 400_000;
     private static final int RECORDS_PER_BLOCK = 2_000;
     private static final long TICK_MS = CanonicalSealerState.TICK_INTERVAL_MS;
+    /**
+     * The sealed blocks that a live feed may hold in its frame ring before the
+     * test waits for the feeder thread. Four blocks of 2,000 references are
+     * about 1 MiB, far below the ring of 16 MiB, so a feeder thread that the
+     * host starves for a while never lets the ring fill. A full ring ends the
+     * live feed with a gap by design.
+     */
+    private static final long FEED_LAG_BLOCKS = 4;
     /** The bytes per record that a measurement may exceed its baseline by: the rounding of the average. */
     private static final double SLACK_BYTES = 0.5;
 
@@ -74,6 +82,8 @@ final class CarriedPathAllocationTest {
     private FeedReader reader;
     /** The work between two measured offers: the duty cycle of the feed and its reader, in a feed case. */
     private Runnable afterOffer = () -> { };
+    /** The work at each block end: the wait for the feeder thread, in a feed case. */
+    private Runnable afterBlock = () -> { };
     /** The id of the newest feed request. */
     private long nextRequest;
     /** The bytes and the duty cycles of the walk case, inside the walk. */
@@ -185,6 +195,21 @@ final class CarriedPathAllocationTest {
             svc.doBackgroundWork(0);
             reader.drain();
         };
+        afterBlock = this::awaitFeeder;
+    }
+
+    /**
+     * Wait while a live feed is more than {@link #FEED_LAG_BLOCKS} blocks
+     * behind the sealed head. Only the feeder thread empties the frame ring,
+     * and this thread fills it, so this thread waits for the feeder. The
+     * sealed head is the tick count (see {@link #tick()}). An idle feed sends
+     * no frame, so it needs no wait.
+     */
+    private void awaitFeeder() {
+        while (svc.metrics().feed() == FeedState.LIVE && ticks - reader.lastBoundary() > FEED_LAG_BLOCKS) {
+            afterOffer.run();
+            Thread.yield();
+        }
     }
 
     /** Send a feed request from {@code (fromIndex, fromBlock)}, and return its id. */
@@ -255,6 +280,7 @@ final class CarriedPathAllocationTest {
         if (i % RECORDS_PER_BLOCK == RECORDS_PER_BLOCK - 1) {
             tick();
             deliver(IngressFrames.postedCursorFrame(ticks));
+            afterBlock.run();
         }
     }
 

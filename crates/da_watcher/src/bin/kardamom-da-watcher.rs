@@ -589,6 +589,7 @@ impl DaWatcherService {
             topic: Topic::TxDeposits,
             aeron_dir: self.aeron_dir.clone(),
             aeron_cfg: self.aeron_cfg.clone(),
+            connect_limit: self.aeron_rt.start_open_limit(),
         };
         if let Some(recorders) = self.plane.record_own(own).await? {
             return Ok(recorders);

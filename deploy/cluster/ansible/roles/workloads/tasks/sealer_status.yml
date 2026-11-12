@@ -48,4 +48,10 @@
   loop_control:
     label: "{{ item.item.TaskGroup }}"
   register: workloads_sealer_status
+  # A new member answers some seconds after it runs. A caller that waits
+  # for it sets workloads_sealer_status_retries; every other read fails at
+  # once.
+  until: workloads_sealer_status.status | default(0) == 200
+  retries: "{{ workloads_sealer_status_retries | default(0) }}"
+  delay: "{{ workloads_poll_delay }}"
   check_mode: false

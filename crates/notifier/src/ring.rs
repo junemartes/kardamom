@@ -89,9 +89,24 @@ impl Ring {
         if entry.seen & kind.bit() != 0 {
             return Insert::Duplicate;
         }
-        let learned = entry.identity.is_none() && status.identity().is_some();
-        entry.identity = entry.identity.or(status.identity());
         entry.seen |= kind.bit();
+        let identity = status.identity();
+        let event = TxStatusEvent::from_status(status, entry.identity.or(identity));
+        Insert::Stored(self.store(event, identity, now))
+    }
+
+    /// Store `event` at `now`, with no check of its stage: the stage table
+    /// of the events path decided it already. `identity` is the sender
+    /// and nonce that the event carries, when it carries them.
+    pub fn store(
+        &mut self,
+        mut event: TxStatusEvent,
+        identity: Option<(Address, u64)>,
+        now: Instant,
+    ) -> Stamped {
+        let entry = self.by_hash.entry(event.tx_hash).or_default();
+        let learned = entry.identity.is_none() && identity.is_some();
+        entry.identity = entry.identity.or(identity);
         let seq = self.next_seq;
         // Saturating: a u64 of sequence numbers never runs out, and a
         // wrap would break the index arithmetic.
@@ -102,15 +117,18 @@ impl Ring {
             self.by_sender
                 .entry(sender)
                 .or_default()
-                .push(status.tx_hash);
+                .push(event.tx_hash);
         }
-        let event = TxStatusEvent::from_status(status, identity);
+        if let Some((sender, nonce)) = identity {
+            event.sender = Some(sender);
+            event.nonce = Some(nonce);
+        }
         self.events.push_back(Entry {
             seq,
             at: now,
             event: event.clone(),
         });
-        Insert::Stored(Stamped { seq, event })
+        Stamped { seq, event }
     }
 
     /// The hash of the transaction `sender` submitted at `nonce`, when the

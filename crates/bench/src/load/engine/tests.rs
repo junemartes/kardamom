@@ -265,7 +265,9 @@ async fn a_paused_refusal_with_no_wait_counts_as_an_attempt() {
 async fn join_submit_tasks_waits_for_in_flight_tasks() {
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(async { tokio::time::sleep(Duration::from_millis(50)).await });
-    join_submit_tasks(&mut tasks, Instant::now() + Duration::from_secs(5)).await;
+    join_submit_tasks(&mut tasks, Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
     assert!(tasks.is_empty());
 }
 
@@ -273,6 +275,64 @@ async fn join_submit_tasks_waits_for_in_flight_tasks() {
 async fn join_submit_tasks_gives_up_at_deadline() {
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(async { tokio::time::sleep(Duration::from_mins(1)).await });
-    join_submit_tasks(&mut tasks, Instant::now() + Duration::from_millis(50)).await;
-    assert_eq!(tasks.len(), 1, "wedged task left behind after the deadline");
+    let error = join_submit_tasks(&mut tasks, Instant::now() + Duration::from_millis(50))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("1 unfinished submit"));
+    tasks.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pending_receipt_read_cannot_extend_the_complete_drain_budget() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let client = Arc::new(
+        HttpClientBuilder::default()
+            .request_timeout(Duration::from_secs(3))
+            .build(format!("http://{address}"))
+            .unwrap(),
+    );
+    let tracker = Arc::new(Tracker::new().unwrap());
+    tracker.insert_pending(B256::ZERO, Instant::now(), true);
+    let drainer = Drainer::new(vec![client], tracker.clone());
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        drainer.drain(Instant::now() + Duration::from_millis(100)),
+    )
+    .await;
+    server.abort();
+    assert!(
+        outcome.is_ok(),
+        "a pending read overruns the whole drain deadline"
+    );
+    assert_eq!(
+        tracker.remaining_pending().missing,
+        1,
+        "an unobserved receipt stays missing"
+    );
+}
+
+#[tokio::test]
+async fn a_panicked_submit_cannot_complete_the_measurement() {
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async {
+        panic!("submit fails before recording its outcome");
+    });
+    let error = join_submit_tasks(&mut tasks, Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("transaction outcome is unknown"));
+}
+
+#[tokio::test]
+async fn completed_submits_can_be_reaped_at_an_expired_deadline() {
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async {});
+    tokio::task::yield_now().await;
+    join_submit_tasks(&mut tasks, Instant::now()).await.unwrap();
+    assert!(tasks.is_empty());
 }

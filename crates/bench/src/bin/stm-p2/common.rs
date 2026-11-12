@@ -101,7 +101,10 @@ pub(crate) fn open_mdbx_env(genesis: &[AccountChange]) -> anyhow::Result<MdbxHan
         .durability(Durability::SafeNoSync)
         .write_map(true)
         .open()?;
-    kardamom_state::seed_genesis(&env, genesis, &[])?;
+    kardamom_state::seed_genesis(
+        &env,
+        &kardamom_types::GenesisAlloc::of_accounts(genesis.to_vec()),
+    )?;
     let env_for_reads = env.clone();
     let writer = StateWriter::spawn(env)?;
     Ok(MdbxHandles {

@@ -21,9 +21,6 @@
 # and runs on bookworm throughout, so it stays self-consistent.)
 FROM ubuntu:24.04
 
-ARG BIN
-ENV SERVICE_BIN=${BIN}
-
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates libbsd0 libuuid1 libstdc++6 && \
@@ -36,14 +33,16 @@ RUN apt-get update && \
 COPY _aeronlibs/ /usr/local/lib/
 RUN ldconfig
 
-# The prebuilt binary (build context = target/release).
-COPY ${BIN} /usr/local/bin/${BIN}
-
 # The world-writable aeron dir: these run with
 # host networking and bind-mount the shared aeron.dir; run as an unprivileged
 # user that can RW the driver's umask-0000 files.
 RUN groupadd --gid 10001 kardamom && \
     useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin kardamom
+# Binary selection follows every shared dependency layer, so another service
+# reuses the package install, Aeron libraries and runtime user.
+ARG BIN
+COPY ${BIN} /usr/local/bin/${BIN}
+ENV SERVICE_BIN=${BIN}
 USER 10001:10001
 
 ENTRYPOINT ["/bin/sh", "-c", "exec /usr/local/bin/${SERVICE_BIN} \"$@\"", "--"]

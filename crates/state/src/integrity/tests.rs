@@ -39,7 +39,11 @@ fn build_db_with(dir: &std::path::Path, writes: [BlockWrite; 2]) {
         balance: U256::from(1_000_000u64),
         code_hash: B256::ZERO,
     }];
-    crate::genesis::seed_genesis(&env, &genesis_accounts, &[]).unwrap();
+    crate::genesis::seed_genesis(
+        &env,
+        &kardamom_types::GenesisAlloc::of_accounts(genesis_accounts.clone()),
+    )
+    .unwrap();
     let mut handle = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
     for (block, write) in (1..=2u64).zip(writes) {
         let receipt = Receipt {
@@ -352,7 +356,7 @@ fn the_index_of_a_repeated_transaction_names_the_receipt_that_used_its_nonce() {
 /// Write blocks 1 and 2 with `blocks`, each receipt with its reference.
 fn write_receipt_blocks(dir: &std::path::Path, blocks: [Vec<Receipt>; 2]) {
     let env = open(dir);
-    crate::genesis::seed_genesis(&env, &[], &[]).unwrap();
+    crate::genesis::seed_genesis(&env, &kardamom_types::GenesisAlloc::default()).unwrap();
     let mut handle = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
     for (block, receipts) in (1..=2u64).zip(blocks) {
         let end = receipts.last().unwrap().tx_idx;

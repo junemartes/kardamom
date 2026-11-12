@@ -231,7 +231,14 @@ job "sequencer" {
       }
 
       restart {
-        attempts = 3
+        # An Aeron client exits until the media driver of its node runs
+        # again, as after a node restart. Ten attempts at the 5 s delay
+        # cover that start; with three, three fast failures would leave the
+        # rest of the interval without a try. The cost: a task that crashes
+        # in a loop restarts about every 5 s, about three times the load on
+        # its targets of three attempts. A recovery after a node restart that
+        # is up to a minute faster outweighs that load.
+        attempts = 10
         interval = "1m"
         delay    = "5s"
         mode     = "delay"
@@ -262,6 +269,11 @@ job "sequencer" {
       network {
         mode = "host"
         port "egress" {}
+        # The late-join repair ports: refetched tx_data frames and archive
+        # control responses. Nomad picks them per allocation, below the
+        # ephemeral range, so no other process on the node holds them.
+        port "replay" {}
+        port "archive_response" {}
         # The exporter, one port per lane, so two lanes share a node.
         port "metrics" {
           static = var.metrics_base + 10 * parseint(group.key, 10)
@@ -328,6 +340,12 @@ job "sequencer" {
             KARDAMOM_METRICS_ADDR  = "0.0.0.0:${var.metrics_base + 10 * parseint(group.key, 10)}"
             KARDAMOM_HOST_ID       = "node${meta.node_index}-seq-${group.key}"
             KARDAMOM_PRIORITY_FEES = var.priority_fees == "on" ? "true" : "false"
+            # The late-join repair of each tx_data lane: a lane that joins a
+            # new ingress session after its first frames refetches them from
+            # the ingress archives. Environment, not flags: a sequencer image
+            # without the repair ignores them, so the job runs both images.
+            KARDAMOM_REPLAY_DESTINATION       = "${meta.node_ip}:${NOMAD_HOST_PORT_replay}"
+            KARDAMOM_ARCHIVE_CONTROL_RESPONSE = "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}"
           }
 
           template {

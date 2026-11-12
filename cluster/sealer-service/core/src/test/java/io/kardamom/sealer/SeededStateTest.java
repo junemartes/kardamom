@@ -38,7 +38,7 @@ class SeededStateTest {
         Arrays.fill(digest, (byte) 0x5E);
         return new SealerSeed(
             new SealerSeed.Head(412_346L, H, E_H, HEAD_TIME, ORIGIN),
-            new byte[SealerSeed.HASH_LEN], List.of(senders), digest);
+            new byte[SealerSeed.HASH_LEN], List.of(senders), VersionSwitch.start(), digest);
     }
 
     private static CanonicalSealerState seeded(int capacity, SealerSeed seed) {
@@ -178,7 +178,7 @@ class SeededStateTest {
         final byte[] digest = new byte[SealerSeed.HASH_LEN];
         final SealerSeed noOrigin = new SealerSeed(
             new SealerSeed.Head(412_346L, H, E_H, HEAD_TIME, 0L),
-            new byte[SealerSeed.HASH_LEN], List.of(), digest);
+            new byte[SealerSeed.HASH_LEN], List.of(), VersionSwitch.start(), digest);
         final CanonicalSealerState state = seeded(64, noOrigin);
 
         assertTrue(state.onOriginRecord(id(1), 5_000L, 1L, payload("e"), 0L).advance.isPresent());

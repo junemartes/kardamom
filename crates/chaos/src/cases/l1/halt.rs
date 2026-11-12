@@ -16,7 +16,7 @@ use crate::poll::{self, Budget};
 const FOLLOWER_HALT_BUDGET: Duration = Duration::from_secs(60);
 
 /// The follower halted and the da-watcher paused on it since `base`.
-pub(super) async fn await_followers_halted(
+pub(crate) async fn await_followers_halted(
     h: &Harness,
     base: Followers,
     ctx: &str,

@@ -9,10 +9,7 @@ output "node_contract" {
       bridge = var.bridge_name
       subnet = var.subnet
     }
-    image = {
-      name = docker_image.node.name
-      id   = docker_image.node.image_id
-    }
+    image = local.node_image
     # The address is the one this root assigned (the subnet, the offset,
     # the name order and the generation), read back from the container
     # after creation. A restart keeps it; a replacement with a higher

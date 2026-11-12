@@ -170,9 +170,12 @@ final class FormatRegistryTest {
         assertEquals(Byte.BYTES + 3 * Long.BYTES, SealerWire.FEED_REQUEST_LEN);
     }
 
+    /** The sealer reads seed versions 1 and 2. The writer writes version 1 unless the rules hold an activation. */
     @Test
     void seedVersionMatchesTheRegistry() {
-        assertExact("sealer-seed", staticInt(SealerSeed.class, "VERSION"));
+        final int plain = staticInt(SealerSeed.class, "VERSION");
+        assertEquals(Map.of("writes", plain, "reads_min", plain, "reads_max",
+            staticInt(SealerSeed.class, "RULES_VERSION")), registry.get("sealer-seed"));
     }
 
     @Test

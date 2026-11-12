@@ -52,6 +52,8 @@ struct MemberCarry {
     feed_dir: PathBuf,
     /// The admin port of each member, in member order.
     admin_ports: Vec<u16>,
+    /// The carry mode from genesis ([`crate::harness::CarryOptions::genesis`]).
+    genesis: bool,
 }
 
 impl SealerCluster {
@@ -92,6 +94,31 @@ impl SealerCluster {
         self.procs[id] = proc;
         Ok(())
     }
+
+    /// Kill every member at once, as a loss of every sealer node does.
+    pub fn kill_all(&mut self) {
+        self.procs.iter_mut().for_each(Proc::kill);
+    }
+
+    /// Start every member again on its own directories, after
+    /// [`Self::kill_all`]. Each member resumes from its own snapshot and
+    /// log, and the members elect a leader among themselves. `log_tag`
+    /// names the new log files, so the logs of the killed members
+    /// survive. The call returns once every member logs "cluster node up".
+    ///
+    /// # Errors
+    /// Returns an error when a member fails to spawn or does not come up
+    /// within 60s.
+    pub fn start_all(&mut self, log_tag: &str) -> Result<()> {
+        let started = (0..self.procs.len())
+            .map(|id| self.launch.spawn_member(id, log_tag))
+            .collect::<Result<Vec<_>>>()?;
+        self.procs = started;
+        self.procs.iter_mut().try_for_each(|proc| {
+            wait_for_log_line(proc, "cluster node up", Duration::from_mins(1))
+                .context("returned sealer member startup")
+        })
+    }
 }
 
 /// Bring-up state for a sealer cluster: the reserved endpoints, the JVM
@@ -126,6 +153,7 @@ impl SealerLaunch {
             admin_ports: (0..cfg.sealer_members.get())
                 .map(|_| free_port().port())
                 .collect(),
+            genesis: c.genesis,
         });
         Ok(Self {
             root: root.to_path_buf(),
@@ -310,7 +338,9 @@ impl SealerLaunch {
 }
 
 impl MemberCarry {
-    /// The carry window settings of member `id`.
+    /// The carry window settings of member `id`. In carry mode from
+    /// genesis, every member takes the same genesis features: the sealer
+    /// requires the setting to match on every member.
     ///
     /// Each member serves its admin endpoint on its own port, because the
     /// members share one host and the endpoint binds every address. The
@@ -325,6 +355,16 @@ impl MemberCarry {
             self.admin_ports[id]
         ))
         .arg(format!("-Dkardamom.cluster.retention={}", self.retention));
+        if self.genesis {
+            cmd.arg(format!(
+                "-Dkardamom.cluster.genesisFeatures={}",
+                super::config::GENESIS_FEATURES
+            ))
+            .arg(format!(
+                "-Dkardamom.cluster.snapshotIntervalS={}",
+                super::config::GENESIS_SNAPSHOT_INTERVAL_S
+            ));
+        }
         if id == 0 {
             cmd.arg(format!(
                 "-Dkardamom.cluster.feedAeronDir={}",

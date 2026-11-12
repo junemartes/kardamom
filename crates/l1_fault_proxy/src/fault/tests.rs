@@ -228,3 +228,19 @@ fn the_second_source_serves_l1_faithfully() {
     assert_eq!(faults.refusal_for(second), None);
     assert_eq!(faults.refusal(), Some(Refusal::Down));
 }
+#[test]
+fn an_unresponsive_provider_includes_the_second_source_only_when_requested() {
+    let first = Caller::default();
+    let second = Caller {
+        second: true,
+        ..first
+    };
+    let one = Faults::one(Fault::Unresponsive { all_sources: false });
+    assert_eq!(one.refusal_for(first), Some(Refusal::Unresponsive));
+    assert_eq!(one.refusal_for(second), None);
+    let all = Faults::one(Fault::Unresponsive { all_sources: true });
+    assert_eq!(all.refusal_for(first), Some(Refusal::Unresponsive));
+    assert_eq!(all.refusal_for(second), Some(Refusal::Unresponsive));
+    let encoded = serde_json::to_string(&all).unwrap();
+    assert_eq!(serde_json::from_str::<Faults>(&encoded).unwrap(), all);
+}

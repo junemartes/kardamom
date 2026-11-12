@@ -29,13 +29,12 @@ fn pooled_with_forks_matches_sequential_on_mdbx() {
     // Fund the sender at genesis so transfers execute.
     kardamom_state::seed_genesis(
         &env_,
-        &[kardamom_types::AccountChange {
+        &kardamom_types::GenesisAlloc::of_accounts(vec![kardamom_types::AccountChange {
             address: from,
             nonce: 0,
             balance: U256::from(10u128.pow(18)),
             code_hash: revm::primitives::KECCAK_EMPTY,
-        }],
-        &[],
+        }]),
     )
     .expect("seed genesis");
     let mut writer = kardamom_state::StateWriter::spawn(env_).expect("spawn writer");

@@ -1,0 +1,158 @@
+{
+  "purpose": "Historical reference/V1 load evidence. This is not the baseline/candidate V2 pause-recovery comparison.",
+  "commit": "5d8ac285a57f3162a2d8bebe2346d9263335c3ab",
+  "workflow_run": 40340203136,
+  "job": 121645723132,
+  "artifact": 12662013798,
+  "url": "https://github.com/junemartes/kardamom/actions/runs/40340203136/job/121645723132",
+  "topology": "reference/V1",
+  "workloads": {
+    "transfers": {
+      "actual_receipts_per_paced_second": 225.5882474989003,
+      "report": {
+        "mode": "fixed",
+        "target_tps": 300,
+        "discovered_max_tps": 300,
+        "soak_rate_tps": 300,
+        "duration_secs": 300.002330575,
+        "ramp": [],
+        "lat_p50_us": 180735,
+        "lat_p95_us": 672767,
+        "lat_p99_us": 970751,
+        "lat_max_us": 1576959,
+        "total_gas": 1421217000,
+        "workload": "transfers",
+        "scrape_fallbacks": 0,
+        "executor_queries_served_delta": [
+          [
+            "kardamom-executor-0",
+            0
+          ],
+          [
+            "kardamom-executor-1",
+            1
+          ],
+          [
+            "kardamom-executor-2",
+            0
+          ]
+        ],
+        "verdict": {
+          "pass": true,
+          "failures": [],
+          "offered": 67677,
+          "accepted": 67677,
+          "receipted": 67677,
+          "missing": 0,
+          "unlanded": 0,
+          "bad_status": 0,
+          "bad_receipt": 0,
+          "inferred_ingress_drop": 0,
+          "seq_dropped": 0,
+          "seq_evicted": 0,
+          "seq_backpressure": 0,
+          "keep_pace": [
+            {
+              "node": "kardamom-executor-0",
+              "base": 255,
+              "final_block": 458,
+              "advanced": 203,
+              "gap": 0,
+              "verdict": "OK"
+            },
+            {
+              "node": "kardamom-executor-1",
+              "base": 255,
+              "final_block": 458,
+              "advanced": 203,
+              "gap": 0,
+              "verdict": "OK"
+            },
+            {
+              "node": "kardamom-executor-2",
+              "base": 255,
+              "final_block": 458,
+              "advanced": 203,
+              "gap": 0,
+              "verdict": "OK"
+            }
+          ]
+        }
+      }
+    },
+    "defi": {
+      "actual_receipts_per_paced_second": 74.81511405486145,
+      "report": {
+        "mode": "fixed",
+        "target_tps": 100,
+        "discovered_max_tps": 100,
+        "soak_rate_tps": 100,
+        "duration_secs": 45.00427544,
+        "ramp": [],
+        "lat_p50_us": 86783,
+        "lat_p95_us": 299775,
+        "lat_p99_us": 412159,
+        "lat_max_us": 546815,
+        "total_gas": 150320256,
+        "workload": "defi",
+        "scrape_fallbacks": 0,
+        "executor_queries_served_delta": [
+          [
+            "kardamom-executor-0",
+            0
+          ],
+          [
+            "kardamom-executor-1",
+            0
+          ],
+          [
+            "kardamom-executor-2",
+            0
+          ]
+        ],
+        "verdict": {
+          "pass": true,
+          "failures": [],
+          "offered": 3367,
+          "accepted": 3367,
+          "receipted": 3367,
+          "missing": 0,
+          "unlanded": 0,
+          "bad_status": 0,
+          "bad_receipt": 0,
+          "inferred_ingress_drop": 0,
+          "seq_dropped": 0,
+          "seq_evicted": 0,
+          "seq_backpressure": 0,
+          "keep_pace": [
+            {
+              "node": "kardamom-executor-0",
+              "base": 459,
+              "final_block": 491,
+              "advanced": 32,
+              "gap": 0,
+              "verdict": "OK"
+            },
+            {
+              "node": "kardamom-executor-1",
+              "base": 459,
+              "final_block": 491,
+              "advanced": 32,
+              "gap": 0,
+              "verdict": "OK"
+            },
+            {
+              "node": "kardamom-executor-2",
+              "base": 459,
+              "final_block": 491,
+              "advanced": 32,
+              "gap": 0,
+              "verdict": "OK"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "interpretation": "The configured target and measured rate differ: transfers achieve about 225.6 receipts/s against target 300, and DeFi about 74.8/s against target 100. Report actual offered, accepted and receipted rates with latency percentiles. These observations do not identify chain capacity or a V2 regression. Both reports have zero unlanded, missing, bad-status and bad-receipt counts."
+}

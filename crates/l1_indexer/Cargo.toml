@@ -37,3 +37,10 @@ testing = []
 kardamom-da-watcher = { path = "../da_watcher", features = ["testing"] }
 kardamom-batcher = { path = "../batcher", features = ["test-support"] }
 tempfile = { workspace = true }
+# The follower-quorum tests: independent fault proxies, the board and the
+# paused clock, and the signals of the follower child processes.
+kardamom-l1-fault-proxy = { path = "../l1_fault_proxy" }
+kardamom-obs = { path = "../obs", features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
+libc.workspace = true
+alloy-consensus.workspace = true

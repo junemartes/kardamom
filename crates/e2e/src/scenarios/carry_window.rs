@@ -36,6 +36,7 @@
 //! uses fixed stream ids on IPC.
 
 mod floor;
+mod genesis;
 mod load;
 mod reads;
 
@@ -47,6 +48,7 @@ use anyhow::{Context, Result};
 use kardamom_types::upgrades::{FEATURE_CARRY_WINDOW, FEATURE_SEALER_V4, FEATURE_SEALER_V5};
 
 pub use floor::wrong_floor;
+pub use genesis::from_genesis;
 use load::Load;
 use reads::{EgressView, FEATURE_ON, Gauge, Members, Reference};
 
@@ -270,33 +272,40 @@ impl<'a> Rollout<'a> {
             .await?;
         self.quiet_restart().await?;
         self.under_load(async |r| {
-            poll_until(
-                "the executor reads the member feed",
-                Duration::from_mins(1),
-                Duration::from_millis(250),
-                || async {
-                    Ok(r.stack
-                        .carry_executor_log()
-                        .filter(|log| log.contains("canonical entries via the member feed"))
-                        .map(|_| ()))
-                },
-            )
-            .await?;
-            let feed = r.members.admin(0);
-            poll_until(
-                "the feed of member 0 serves live",
-                Duration::from_mins(1),
-                Duration::from_millis(250),
-                || async {
-                    let state = Gauge::of(feed, reads::FEED_STATE).read().await?;
-                    Ok((state == reads::FEED_LIVE).then_some(()))
-                },
-            )
-            .await?;
+            r.await_member_feed().await?;
             r.await_progress().await?;
             r.t.assert_validator_verdict("the executor in carry mode")
                 .await
         })
+        .await
+    }
+
+    /// Wait until the executor in carry mode reads the member feed, and the
+    /// feed of member 0 serves it live.
+    async fn await_member_feed(&self) -> Result<()> {
+        poll_until(
+            "the executor reads the member feed",
+            Duration::from_mins(1),
+            Duration::from_millis(250),
+            || async {
+                Ok(self
+                    .stack
+                    .carry_executor_log()
+                    .filter(|log| log.contains("canonical entries via the member feed"))
+                    .map(|_| ()))
+            },
+        )
+        .await?;
+        let feed = self.members.admin(0);
+        poll_until(
+            "the feed of member 0 serves live",
+            Duration::from_mins(1),
+            Duration::from_millis(250),
+            || async {
+                let state = Gauge::of(feed, reads::FEED_STATE).read().await?;
+                Ok((state == reads::FEED_LIVE).then_some(()))
+            },
+        )
         .await
     }
 

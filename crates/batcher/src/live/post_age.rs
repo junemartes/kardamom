@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use kardamom_log::aeron_live::L1BlocksSubscriberHandle;
 use kardamom_obs::events::BoardView;
 use kardamom_obs::follower::FollowerWatch;
-use kardamom_types::L1Block;
+use kardamom_types::{BPosition, L1Block};
 use metrics::gauge;
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -28,6 +28,9 @@ use tracing::warn;
 
 use super::live_metric_names;
 use crate::indexer::IndexerClient;
+
+mod seed;
+use seed::ArchiveSeed;
 
 /// The timestamp of the newest L1 block that carried a post.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -52,19 +55,30 @@ impl LastPost {
     }
 }
 
+/// The follower records consumed by the post-age actor.
+pub(super) trait BlockInput {
+    async fn recv(&mut self) -> Option<(BPosition, L1Block)>;
+}
+
+impl BlockInput for L1BlocksSubscriberHandle {
+    async fn recv(&mut self) -> Option<(BPosition, L1Block)> {
+        self.recv().await
+    }
+}
+
 /// The watch's state: the stream, the start's source, and the newest
 /// post seen.
-pub(crate) struct PostAge {
-    blocks: L1BlocksSubscriberHandle,
-    indexer: Option<IndexerClient>,
+pub(super) struct PostAge<S> {
+    blocks: S,
+    seed: ArchiveSeed,
     follower: FollowerWatch,
     last_post: LastPost,
     every: Duration,
 }
 
-impl PostAge {
-    pub(crate) fn new(
-        blocks: L1BlocksSubscriberHandle,
+impl<S: BlockInput> PostAge<S> {
+    pub(super) fn new(
+        blocks: S,
         board: watch::Receiver<BoardView>,
         indexer: Option<IndexerClient>,
         silence: Duration,
@@ -72,7 +86,7 @@ impl PostAge {
     ) -> Self {
         Self {
             blocks,
-            indexer,
+            seed: ArchiveSeed::new(indexer),
             follower: FollowerWatch::new(silence).with_board(board),
             last_post: LastPost::default(),
             every,
@@ -80,7 +94,7 @@ impl PostAge {
     }
 
     /// Watch until the stream closes.
-    pub(crate) async fn run(mut self) {
+    pub(super) async fn run(mut self) {
         let mut interval = tokio::time::interval(self.every);
         while self.step(&mut interval).await.is_continue() {}
     }
@@ -93,7 +107,8 @@ impl PostAge {
                 Some((_, record)) => self.on_record(&record),
                 None => return ControlFlow::Break(()),
             },
-            _ = interval.tick() => self.tick().await,
+            result = self.seed.next() => self.on_seed(result),
+            _ = interval.tick() => self.tick(),
         }
         ControlFlow::Continue(())
     }
@@ -103,24 +118,25 @@ impl PostAge {
         self.last_post.seen(record);
     }
 
-    async fn tick(&mut self) {
+    fn tick(&mut self) {
         if self.last_post.0.is_none() {
-            self.seed().await;
+            self.seed.start(self.every);
         }
-        self.publish();
-        self.follower.follow(Instant::now(), false);
+        self.report();
     }
 
-    /// The time of the last post the follower's archive holds.
-    async fn seed(&mut self) {
-        let Some(indexer) = &self.indexer else {
-            return;
-        };
-        match indexer.last_post_time().await {
+    fn on_seed(&mut self, result: anyhow::Result<Option<u64>>) {
+        match result {
             Ok(Some(seed)) => self.last_post.at(seed),
             Ok(None) => {}
             Err(error) => warn!(%error, "post age: the follower's archive did not answer"),
         }
+        self.report();
+    }
+
+    fn report(&self) {
+        self.publish();
+        self.follower.follow(Instant::now(), false);
     }
 
     fn publish(&self) {
@@ -179,3 +195,6 @@ mod tests {
         assert_eq!(last.age(150), Some(6));
     }
 }
+
+#[cfg(test)]
+mod component_tests;

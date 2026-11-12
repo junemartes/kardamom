@@ -5,6 +5,9 @@ mock_provider "docker" {
   mock_resource "docker_image" {
     defaults = { image_id = "sha256:0123" }
   }
+  mock_data "docker_image" {
+    defaults = { id = "sha256:4567" }
+  }
   mock_resource "docker_container" {
     defaults = { network_data = [{ network_name = "kardamom-net", ip_address = "10.99.0.7", ip_prefix_length = 24, gateway = "10.99.0.1", global_ipv6_address = "", global_ipv6_prefix_length = 0, ipv6_gateway = "", mac_address = "" }] }
   }
@@ -99,5 +102,24 @@ run "replacement" {
   assert {
     condition     = output.node_contract.nodes["worker-1"].generation == 1 && output.node_contract.nodes["worker-0"].generation == 0
     error_message = "the contract carries the generation"
+  }
+}
+
+run "provisioned" {
+  command = plan
+
+  variables {
+    node_images     = { "worker-0" = "kardamom-node-worker-0:prepared", "worker-1" = "kardamom-node-worker-1:prepared" }
+    node_generation = { "worker-1" = 1 }
+  }
+
+  assert {
+    condition     = docker_container.node["worker-0"].image == "sha256:4567"
+    error_message = "a node of generation 0 starts from its provisioned image"
+  }
+
+  assert {
+    condition     = docker_container.node["worker-1"].image == "sha256:0123" && docker_container.node["worker-2"].image == "sha256:0123"
+    error_message = "a replaced node and a node without a provisioned image start from the plain node image"
   }
 }

@@ -31,7 +31,7 @@ pub enum Stage {
     Receipt = 4,
     Posted = 5,
     Included = 6,
-    /// Terminal: the sequencer never orders the transaction.
+    /// A validation refusal. An execution result takes precedence.
     Rejected = 7,
 }
 
@@ -118,6 +118,18 @@ struct Entry {
 impl Entry {
     const fn is_free(&self) -> bool {
         self.observed == 0
+    }
+
+    /// Execution proves that a validation refusal from a twin is stale.
+    /// A refusal suppresses admission events until execution proves it wrong.
+    fn advances_to(&self, stage: Stage) -> bool {
+        if stage == Stage::Rejected {
+            return self.state < Stage::Executed as u8;
+        }
+        if self.state == Stage::Rejected as u8 {
+            return stage >= Stage::Executed;
+        }
+        stage as u8 > self.state
     }
 }
 
@@ -226,7 +238,7 @@ impl StageTable {
         {
             entry.block = block;
         }
-        if event.stage as u8 > entry.state {
+        if entry.advances_to(event.stage) {
             entry.state = event.stage as u8;
             seen.send = true;
         }

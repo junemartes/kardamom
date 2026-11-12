@@ -4,6 +4,7 @@ import static io.kardamom.sealer.cluster.LogCluster.LOG_BYTES_TAIL;
 import static io.kardamom.sealer.cluster.LogCluster.SEGMENT_LENGTH;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.aeron.cluster.ClusterControl;
@@ -208,9 +209,13 @@ class ClusterLogPurgeTest {
         /** One sample of the member, with a real peer check when the watchdog asks for one. */
         JoinWatchdog.Verdict verdict() {
             final long nowMs = System.currentTimeMillis();
+            final long relaunch = new StateDir(member.consensusModule().context().clusterDir().toPath())
+                    .relaunchPosition().orElse(JoinWatchdog.NO_RELAUNCH_POSITION);
             final JoinWatchdog.Verdict verdict = watchdog.observe(new JoinWatchdog.Sample(
-                    member.electionState(), member.commitPosition(), -1L, 0L,
+                    member.electionState(), member.commitPosition(), -1L, 0L, relaunch,
                     ClusterControl.ToggleState.INACTIVE.code(), nowMs));
+            assertNotEquals(JoinWatchdog.Verdict.LOG_TRUNCATED, verdict,
+                    "a member behind the purge point applied no entry past its own log");
             if (verdict != JoinWatchdog.Verdict.PEER_CHECK) {
                 return verdict;
             }

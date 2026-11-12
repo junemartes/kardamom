@@ -46,7 +46,7 @@ impl DaProxy {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_mins(20))
             .build()
-            .map_err(|e| BatcherError::Da(e.to_string()))?;
+            .map_err(|e| BatcherError::da_transport("build the client", e))?;
         Ok(Self {
             url: url.into().trim_end_matches('/').to_string(),
             client,
@@ -66,7 +66,7 @@ impl DaProxy {
             .body(payload.to_vec())
             .send()
             .await
-            .map_err(|e| BatcherError::Da(format!("put: {e}")))?;
+            .map_err(|e| BatcherError::da_transport("put", e))?;
         let cert = Self::body(response, "put").await?;
         if cert.is_empty() {
             return Err(BatcherError::Da("put returned an empty certificate".into()));
@@ -89,7 +89,7 @@ impl DaProxy {
             .get(&url)
             .send()
             .await
-            .map_err(|e| BatcherError::Da(format!("get: {e}")))?;
+            .map_err(|e| BatcherError::da_transport("get", e))?;
         Self::body(response, "get").await
     }
 
@@ -98,7 +98,7 @@ impl DaProxy {
         let bytes = response
             .bytes()
             .await
-            .map_err(|e| BatcherError::Da(format!("{op}: {e}")))?;
+            .map_err(|e| BatcherError::da_transport(op, e))?;
         if !status.is_success() {
             return Err(BatcherError::Da(format!(
                 "{op}: {status}: {}",
@@ -119,3 +119,6 @@ impl PayloadSource for DaProxy {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

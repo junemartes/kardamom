@@ -23,7 +23,7 @@
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
-use kardamom_types::{AccountChange, BPosition, CodeEntry, Receipt, TxRef};
+use kardamom_types::{AccountChange, BPosition, CodeEntry, Receipt, StorageChange, TxRef};
 
 use crate::error::StateError;
 
@@ -500,6 +500,25 @@ pub(crate) fn write_accounts(
         )?;
     }
     Ok(())
+}
+
+/// Write every storage-slot change with a cursor, as absolute values. The
+/// block-commit writer and genesis seeding share this one write. Sorted
+/// input lets the cursor upsert walk down from its previous position.
+pub(crate) fn write_storage(
+    txn: &signet_libmdbx::tx::aliases::RwTxSync,
+    db: signet_libmdbx::Database,
+    changes: &[StorageChange],
+) -> Result<(), StateError> {
+    let mut cur = txn.cursor(db)?;
+    changes.iter().try_for_each(|change| {
+        cur.put(
+            &encode_storage_key(change.address, change.key),
+            &encode_storage_value(change.value),
+            signet_libmdbx::WriteFlags::UPSERT,
+        )
+        .map_err(StateError::from)
+    })
 }
 
 /// Write every new code entry. Code is content-addressed, so a key that

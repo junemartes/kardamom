@@ -171,3 +171,62 @@ async fn an_unreachable_upstream_is_a_gateway_error_not_a_hang() {
             .starts_with("upstream:")
     );
 }
+#[tokio::test]
+async fn all_provider_timeouts_leave_control_live_and_recover_after_clear() {
+    let proxy = proxy().await;
+    let client = reqwest::Client::new();
+    let (status, _) = rpc(
+        &client,
+        &format!("{}/fault", proxy.url()),
+        serde_json::json!({"kind":"Unresponsive", "all_sources":true}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let first = stalled_call(&client, &proxy.url());
+    let second_url = format!("{}/second", proxy.url());
+    let second = stalled_call(&client, &second_url);
+    let first = tokio::spawn(first.send());
+    let second = tokio::spawn(second.send());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while proxy.served() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let health = client
+        .get(format!("{}/health", proxy.url()))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .unwrap();
+    assert!(health.status().is_success());
+    assert!(first.await.unwrap().unwrap_err().is_timeout());
+    assert!(second.await.unwrap().unwrap_err().is_timeout());
+    let (status, _) = rpc(
+        &client,
+        &format!("{}/fault", proxy.url()),
+        serde_json::json!([]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        rpc(&client, &proxy.url(), call(5, "eth_blockNumber"))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        rpc(&client, &second_url, call(6, "eth_blockNumber"))
+            .await
+            .0,
+        200
+    );
+}
+
+fn stalled_call(client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
+    client
+        .post(url)
+        .json(&call(4, "eth_blockNumber"))
+        .timeout(Duration::from_secs(2))
+}

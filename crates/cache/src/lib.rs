@@ -27,11 +27,13 @@ pub mod script;
 pub mod testing;
 
 mod client;
+mod link;
+mod source;
 
 pub use client::{AccountCache, AccountView, BatchWrite, RowsWritten};
 pub use config::{CacheConfig, LiveAccountsConfig};
 pub use error::CacheError;
 pub use live::{LiveAccounts, LiveAccountsWriter};
 pub use query::{ExecutorQuery, ExecutorQueryConfig, QueryAnswer, QueryError, QueryMethod};
-pub use reader::CacheReader;
+pub use reader::{CacheReader, Degraded};
 pub use rollbacks::AppliedRollbacks;

@@ -68,6 +68,18 @@ variable "lockbox_address" {
   default     = ""
 }
 
+# Pull the image at each start, "on" or "off". A test cluster that starts
+# the canary from its own registry sets off. The deploy passes it from
+# KARDAMOM_CANARY_FORCE_PULL.
+variable "force_pull" {
+  type    = string
+  default = "on"
+  validation {
+    condition     = contains(["on", "off"], var.force_pull)
+    error_message = "The force_pull value must be on or off."
+  }
+}
+
 variable "safe_timeout_ms" {
   type        = string
   description = "The longest wait, in milliseconds, for a sampled transaction to reach the safe head: twice the batcher's idle flush."
@@ -128,7 +140,7 @@ job "canary" {
         image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-canary:dev"
         # force_pull stays on for both paths; see the ingress job's
         # comment. The :dev fallback needs it.
-        force_pull = true
+        force_pull = var.force_pull == "on"
         # Read-only rootfs. The canary writes only its data directory:
         # the nonce journal and the contract addresses.
         readonly_rootfs = true

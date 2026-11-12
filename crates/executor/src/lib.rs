@@ -30,3 +30,6 @@ pub mod bal;
 /// on the local archive and published live.
 pub mod exec_stream;
 pub mod parallel;
+/// The state backend startup that the binary and the recovery tests
+/// share: checkpoint restore, env open, the cursor and the rounds.
+pub mod state;

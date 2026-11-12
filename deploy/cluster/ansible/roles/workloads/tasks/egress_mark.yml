@@ -10,34 +10,47 @@
 # ref_mark, or while an instance does not answer.
 # The results are workloads_ref_index and workloads_ref_block: the highest
 # values of all instances.
-- name: Check that every egress keeps the reference mark
-  ansible.builtin.include_tasks: upgrade_check_job.yml
-  vars:
-    workloads_upgrade_job: "{{ workloads_upgrade_window_jobs | selectattr('name', 'equalto', 'egress') | first }}"
-
-- name: Read the reference mark of every egress instance
-  ansible.builtin.include_tasks: metrics_read.yml
-  vars:
-    workloads_metrics_job: egress
-    workloads_metrics_port: "{{ workloads_metrics_ports.egress }}"
-    workloads_metrics_gauges: [kardamom_egress_ref_frame_max_index, kardamom_egress_ref_frame_max_block]
-
-- name: Refuse while an egress instance does not report its reference mark
-  ansible.builtin.assert:
-    that:
-      - workloads_egress_marks.groups | length > 0
-      - workloads_egress_marks.kardamom_egress_ref_frame_max_index | min >= 0
-      - workloads_egress_marks.kardamom_egress_ref_frame_max_block | min >= 0
-    fail_msg: >-
-      Refused: an egress instance does not report its reference mark
-      (kardamom_egress_ref_frame_max_index and _block of {{ workloads_egress_marks.groups }}:
-      {{ workloads_egress_marks.kardamom_egress_ref_frame_max_index }},
-      {{ workloads_egress_marks.kardamom_egress_ref_frame_max_block }}; -1 is no answer), or no egress runs. The check
-      needs the highest stored reference of every instance. Bring the instance back, then run again.
-  vars:
-    workloads_egress_marks: "{{ workloads_metrics_of.egress }}"
-
-- name: Keep the highest reference mark
+# On a genesis bootstrap no egress runs yet. Every member of the rendered
+# sealer job starts with the carry window, which refuses every reference
+# of record type 0 from the first block. So the egress of the new chain
+# never stores a reference: R is index 0 at block 0.
+- name: Keep the reference mark of a chain that starts with the carry window
   ansible.builtin.set_fact:
-    workloads_ref_index: "{{ workloads_metrics_of.egress.kardamom_egress_ref_frame_max_index | max | int }}"
-    workloads_ref_block: "{{ workloads_metrics_of.egress.kardamom_egress_ref_frame_max_block | max | int }}"
+    workloads_ref_index: 0
+    workloads_ref_block: 0
+  when: workloads_gate_genesis_bootstrap | default(false) | bool and workloads_gate_genesis.carryWindow | bool
+
+- name: Read the reference mark of the egress
+  when: not (workloads_gate_genesis_bootstrap | default(false) | bool and workloads_gate_genesis.carryWindow | bool)
+  block:
+    - name: Check that every egress keeps the reference mark
+      ansible.builtin.include_tasks: upgrade_check_job.yml
+      vars:
+        workloads_upgrade_job: "{{ workloads_upgrade_window_jobs | selectattr('name', 'equalto', 'egress') | first }}"
+
+    - name: Read the reference mark of every egress instance
+      ansible.builtin.include_tasks: metrics_read.yml
+      vars:
+        workloads_metrics_job: egress
+        workloads_metrics_port: "{{ workloads_metrics_ports.egress }}"
+        workloads_metrics_gauges: [kardamom_egress_ref_frame_max_index, kardamom_egress_ref_frame_max_block]
+
+    - name: Refuse while an egress instance does not report its reference mark
+      ansible.builtin.assert:
+        that:
+          - workloads_egress_marks.groups | length > 0
+          - workloads_egress_marks.kardamom_egress_ref_frame_max_index | min >= 0
+          - workloads_egress_marks.kardamom_egress_ref_frame_max_block | min >= 0
+        fail_msg: >-
+          Refused: an egress instance does not report its reference mark
+          (kardamom_egress_ref_frame_max_index and _block of {{ workloads_egress_marks.groups }}:
+          {{ workloads_egress_marks.kardamom_egress_ref_frame_max_index }},
+          {{ workloads_egress_marks.kardamom_egress_ref_frame_max_block }}; -1 is no answer), or no egress runs. The check
+          needs the highest stored reference of every instance. Bring the instance back, then run again.
+      vars:
+        workloads_egress_marks: "{{ workloads_metrics_of.egress }}"
+
+    - name: Keep the highest reference mark
+      ansible.builtin.set_fact:
+        workloads_ref_index: "{{ workloads_metrics_of.egress.kardamom_egress_ref_frame_max_index | max | int }}"
+        workloads_ref_block: "{{ workloads_metrics_of.egress.kardamom_egress_ref_frame_max_block | max | int }}"

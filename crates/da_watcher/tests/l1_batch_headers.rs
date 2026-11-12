@@ -4,12 +4,14 @@
 //! block order with its parent and its timestamp.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use alloy_primitives::B256;
 use alloy_provider::ProviderBuilder;
 use alloy_rpc_types_eth::{Block, BlockNumberOrTag, Header};
 use jsonrpsee::server::{RpcModule, Server, ServerHandle};
-use kardamom_da_watcher::{L1Source, RpcL1Source};
+use kardamom_da_watcher::sources::{L1Endpoints, SourceHalt};
+use kardamom_da_watcher::{L1Source, L1SourceError, RpcL1Source};
 use kardamom_l1_fault_proxy::{Fault, FaultProxy};
 
 fn hash(number: u64) -> B256 {
@@ -41,11 +43,91 @@ async fn fake_l1() -> (SocketAddr, ServerHandle) {
     module
         .register_method("eth_getBlockByNumber", |params, (), _| {
             let (tag, _full): (BlockNumberOrTag, bool) = params.parse().unwrap();
-            let number = tag.as_number().unwrap();
+            let number = tag.as_number().unwrap_or(10);
             serde_json::to_value(block(number)).unwrap()
         })
         .unwrap();
     (addr, server.start(module))
+}
+
+#[tokio::test]
+async fn unresponsive_sources_cannot_hold_the_follower_read_forever() {
+    let (l1, _server) = fake_l1().await;
+    let proxy = FaultProxy::spawn(&format!("http://{l1}"), "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let sources = L1Endpoints {
+        rpcs: vec![proxy.url(), format!("{}/second", proxy.url())],
+        light_client: None,
+    }
+    .connect()
+    .await
+    .unwrap()
+    .backoff(Duration::from_secs(2));
+    assert_eq!(sources.finalized_block_number().await.unwrap(), 10);
+    proxy.set_fault(Fault::Unresponsive { all_sources: true });
+    let result = ReadClock::expire(&proxy, sources.finalized_block_number()).await;
+    assert!(matches!(
+        result,
+        Err(L1SourceError::Halt(SourceHalt::NoQuorum { .. }))
+    ));
+    proxy.set_fault(Fault::None);
+    let requests = proxy.served();
+    assert!(matches!(
+        sources.finalized_block_number().await,
+        Err(L1SourceError::Halt(SourceHalt::NoQuorum { .. }))
+    ));
+    assert_eq!(
+        proxy.served(),
+        requests,
+        "the backoff sends no provider requests"
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(sources.finalized_block_number().await.is_err());
+    assert_eq!(
+        proxy.served(),
+        requests,
+        "the backoff still holds at one second"
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::resume();
+    assert_eq!(sources.finalized_block_number().await.unwrap(), 10);
+}
+
+struct ReadClock;
+
+impl ReadClock {
+    async fn expire<F: std::future::Future>(proxy: &FaultProxy, read: F) -> F::Output {
+        tokio::time::pause();
+        let expected = proxy.served().checked_add(2).unwrap();
+        let started = std::time::Instant::now();
+        tokio::pin!(read);
+        // Yielding stays runnable, so virtual time cannot jump ahead of real socket delivery.
+        while proxy.served() < expected {
+            Self::poll_request(read.as_mut(), started).await;
+        }
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(
+            futures::poll!(read.as_mut()).is_pending(),
+            "the production deadline must not be shortened"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::timeout(Duration::from_secs(1), read)
+            .await
+            .expect("the production deadline must return control to the follower")
+    }
+
+    async fn poll_request<F: std::future::Future>(
+        mut read: std::pin::Pin<&mut F>,
+        started: std::time::Instant,
+    ) {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "both requests must reach the fault proxy"
+        );
+        assert!(futures::poll!(read.as_mut()).is_pending());
+        tokio::task::yield_now().await;
+    }
 }
 
 #[tokio::test]

@@ -9,9 +9,13 @@
 //! and forgets the older ones. So the egress gets each frame once, byte for
 //! byte as the source sent it, in the order that the reader executes.
 //!
-//! Each message is `[seq:u64][frame]`. The sequence counts every frame
-//! that the reader delivers, also one that the tee drops, so the egress
-//! sees a gap in this copy as a jump of the sequence.
+//! After a restart, the tee also forwards the committed history that the
+//! reader checks. It sends this history only after the full comparison
+//! succeeds, so the new copy can chain from a boundary the egress holds.
+//!
+//! Each message is `[seq:u64][frame]`. The sequence counts every forwarded
+//! frame, also one that the tee drops, so the egress sees a gap in this
+//! copy as a jump of the sequence.
 //!
 //! The tee never waits: a full queue drops the frame, and the egress fills
 //! the gap from the copy of another executor.
@@ -70,6 +74,12 @@ impl FrameTee {
     /// the frames of the same kind below it, which the reader delivered or
     /// dropped as copies.
     fn release(&mut self, position: BPosition, item: &Ordered) {
+        if let Some(frame) = self.take(position, item) {
+            self.send(&frame);
+        }
+    }
+
+    fn take(&mut self, position: BPosition, item: &Ordered) -> Option<Vec<u8>> {
         let (held, key) = match item {
             Ordered::Message(TxOrderingMessage::BoundaryStart(b)) => {
                 (&mut self.boundaries, b.block_number)
@@ -79,9 +89,7 @@ impl FrameTee {
         let mut kept = held.split_off(&key);
         let frame = kept.remove(&key);
         *held = kept;
-        if let Some(frame) = frame {
-            self.send(&frame);
-        }
+        frame
     }
 
     /// Send `frame` behind the next sequence number.
@@ -89,7 +97,7 @@ impl FrameTee {
         let mut message = Vec::with_capacity(SEQ_LEN + frame.len());
         message.extend_from_slice(&self.seq.to_le_bytes());
         message.extend_from_slice(frame);
-        // One message for each delivered item: a u64 does not wrap.
+        // One message for each forwarded frame: a u64 does not wrap.
         self.seq += 1;
         if let Err(TrySendError::Full(_)) = self.out.try_send(message) {
             metrics::counter!(crate::metrics::TEE_DROPPED_TOTAL).increment(1);
@@ -110,6 +118,16 @@ impl Forward {
     pub(crate) fn hold(&mut self, frame: &[u8]) {
         if let Some(tee) = self.0.as_mut() {
             tee.hold(frame);
+        }
+    }
+
+    pub(crate) fn take(&mut self, position: BPosition, item: &Ordered) -> Option<Vec<u8>> {
+        self.0.as_mut()?.take(position, item)
+    }
+
+    pub(crate) fn send(&mut self, frame: &[u8]) {
+        if let Some(tee) = self.0.as_mut() {
+            tee.send(frame);
         }
     }
 

@@ -23,6 +23,7 @@ final class JoinWatchdogTest {
     private static final long LIMIT_MS = CI.stallLimitMs();
     private static final long INACTIVE = ClusterControl.ToggleState.INACTIVE.code();
     private static final long NEUTRAL = ClusterControl.ToggleState.NEUTRAL.code();
+    private static final long NO_RELAUNCH = JoinWatchdog.NO_RELAUNCH_POSITION;
     /** A commit position that the samples of one test do not change. */
     private static final long COMMIT = 4_096L;
     /** The samples of a test, one a second. */
@@ -73,10 +74,15 @@ final class JoinWatchdogTest {
 
     private static JoinWatchdog.Sample toggled(
             final ElectionState state, final long commit, final long nowMs, final long toggle) {
-        return new JoinWatchdog.Sample(state, commit, -1L, 0L, toggle, nowMs);
+        return new JoinWatchdog.Sample(state, commit, -1L, 0L, NO_RELAUNCH, toggle, nowMs);
     }
 
     /** The state of a cycle at second {@code t}. */
+    /** A sample of a member whose recording log fixes the position that a relaunch reaches. */
+    private static JoinWatchdog.Sample truncatedAt(final ElectionState state, final long relaunch, final long nowMs) {
+        return new JoinWatchdog.Sample(state, COMMIT, -1L, 0L, relaunch, INACTIVE, nowMs);
+    }
+
     private static ElectionState cycleAt(final List<ElectionState> cycle, final long t) {
         return cycle.get((int) (t % cycle.size()));
     }
@@ -270,7 +276,7 @@ final class JoinWatchdogTest {
         // ever. The leader it waits for has no closed election.
         final JoinWatchdog w = watchdog();
         final Exit exit = firstExit(w, t -> new JoinWatchdog.Sample(
-                ElectionState.FOLLOWER_LOG_REPLICATION, COMMIT, -1L, 0L, INACTIVE, t * 1_000L), PeerElections.NONE_CLOSED);
+                ElectionState.FOLLOWER_LOG_REPLICATION, COMMIT, -1L, 0L, NO_RELAUNCH, INACTIVE, t * 1_000L), PeerElections.NONE_CLOSED);
         assertEquals(Verdict.FOLLOWER_STALL, exit.verdict());
         assertEquals(LIMIT_MS / 1_000L, exit.second());
     }
@@ -281,7 +287,7 @@ final class JoinWatchdogTest {
         // unknown. The member keeps the seed of a member with no probe.
         final JoinWatchdog w = watchdog();
         final Exit exit = firstExit(w, t -> new JoinWatchdog.Sample(
-                ElectionState.FOLLOWER_LOG_REPLICATION, COMMIT, -1L, 0L, INACTIVE, t * 1_000L),
+                ElectionState.FOLLOWER_LOG_REPLICATION, COMMIT, -1L, 0L, NO_RELAUNCH, INACTIVE, t * 1_000L),
                 new PeerProbe.Round(0, List.of()).elections());
         assertEquals(Verdict.CATCHUP_STALL, exit.verdict());
         assertEquals(STALL_MS / 1_000L, exit.second());
@@ -294,7 +300,7 @@ final class JoinWatchdogTest {
         // answers with an open election, the member relaunches and keeps
         // its log. If it never answers, the member seeds at the window.
         final PeerProbe.PeerStatus electing = new PeerProbe.PeerStatus(1, "FOLLOWER", "CANVASS", COMMIT,
-            PeerProbe.PeerStatus.TERM_NOT_STATED);
+            PeerProbe.PeerStatus.TERM_NOT_STATED, true);
         final PeerElections silent = new PeerProbe.Round(2, List.of(electing)).elections();
         final PeerElections answered = new PeerProbe.Round(2, List.of(electing, electing)).elections();
         assertEquals(PeerElections.UNKNOWN, silent);
@@ -332,7 +338,7 @@ final class JoinWatchdogTest {
         // A follower far behind copies the leader's log: the commit position
         // stays, and the position of its log recording grows.
         assertEquals(Exit.NEVER, firstExit(watchdog(), t -> new JoinWatchdog.Sample(
-                ElectionState.FOLLOWER_LOG_REPLICATION, COMMIT, t / 10L, 0L, INACTIVE, t * 1_000L), PeerElections.NONE_CLOSED));
+                ElectionState.FOLLOWER_LOG_REPLICATION, COMMIT, t / 10L, 0L, NO_RELAUNCH, INACTIVE, t * 1_000L), PeerElections.NONE_CLOSED));
     }
 
     @Test
@@ -354,7 +360,7 @@ final class JoinWatchdogTest {
         // reads it every five seconds.
         final JoinWatchdog w = watchdog();
         assertEquals(Exit.NEVER, firstExit(w, t -> new JoinWatchdog.Sample(
-                ElectionState.LEADER_READY, COMMIT, -1L, COMMIT + t / 5L, INACTIVE, t * 1_000L), PeerElections.NONE_CLOSED));
+                ElectionState.LEADER_READY, COMMIT, -1L, COMMIT + t / 5L, NO_RELAUNCH, INACTIVE, t * 1_000L), PeerElections.NONE_CLOSED));
         assertEquals(Verdict.NONE, w.observe(toggled(ElectionState.CLOSED, COMMIT, SECONDS * 1_000L, NEUTRAL)));
     }
 
@@ -422,5 +428,44 @@ final class JoinWatchdogTest {
                     assertEquals(Verdict.LEADER_WEDGE, open.observe(
                             toggled(ElectionState.LEADER_READY, COMMIT, HALF_ELECTED_MS + 1L, toggle.code())));
                 });
+    }
+
+    @Test
+    void aServiceAheadOfItsTruncatedLogRelaunchesAfterTheConfirmWindow() {
+        // A new leader truncated the log below the applied position, and
+        // each join fails at once on the join position. The member does not
+        // wait for the stall limit: the relaunch replays the truncated log.
+        final JoinWatchdog w = watchdog();
+        final long confirmS = JoinWatchdog.TRUNCATED_CONFIRM_MS / 1_000L;
+        final Exit exit = firstExit(w, t -> truncatedAt(cycleAt(JOIN_CYCLE, t), COMMIT - 320L, t * 1_000L),
+                PeerElections.CLOSED);
+        assertEquals(new Exit(Verdict.LOG_TRUNCATED, confirmS + 1L), exit, "the first sample past the confirm window");
+        assertEquals(JoinWatchdog.TRUNCATED_CONFIRM_MS + 1_000L, w.truncatedForMs(exit.second() * 1_000L));
+    }
+
+    @Test
+    void aServiceAtTheRelaunchPositionIsNoTruncatedLog() {
+        // A relaunch that reaches the same position changes nothing: the
+        // member joins, or the other rules act on it.
+        assertEquals(Verdict.FOLLOWER_STALL, firstExit(watchdog(),
+                t -> truncatedAt(cycleAt(JOIN_CYCLE, t), COMMIT, t * 1_000L), PeerElections.CLOSED).verdict());
+        assertEquals(Exit.NEVER, firstExit(watchdog(),
+                t -> truncatedAt(ElectionState.CLOSED, COMMIT - 320L, t * 1_000L), PeerElections.CLOSED),
+                "a closed election joined the leader's log");
+    }
+
+    @Test
+    void oneReadOfAHalfWrittenEntryDoesNotRelaunch() {
+        // The run of samples above the relaunch position breaks on a sample
+        // with no fixed log end, and the confirm window starts again.
+        final JoinWatchdog w = watchdog();
+        final long confirmS = JoinWatchdog.TRUNCATED_CONFIRM_MS / 1_000L;
+        LongStream.rangeClosed(0, confirmS).forEach(t -> assertEquals(Verdict.NONE,
+                w.observe(truncatedAt(ElectionState.FOLLOWER_LOG_AWAIT, t == confirmS ? NO_RELAUNCH : 0L, t * 1_000L))));
+        assertEquals(0L, w.truncatedForMs(confirmS * 1_000L));
+        LongStream.rangeClosed(confirmS + 1, 2 * confirmS + 1).forEach(t -> assertEquals(Verdict.NONE,
+                w.observe(truncatedAt(ElectionState.CANVASS, 0L, t * 1_000L))));
+        assertEquals(Verdict.LOG_TRUNCATED,
+                w.observe(truncatedAt(ElectionState.INIT, 0L, (2 * confirmS + 2) * 1_000L)));
     }
 }

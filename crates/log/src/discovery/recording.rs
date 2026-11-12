@@ -38,6 +38,7 @@ use crate::error::LogError;
 use crate::recorder::connect_archive;
 
 mod archive;
+mod connect;
 use archive::RecorderArchive;
 
 #[cfg(test)]
@@ -90,6 +91,12 @@ pub struct DiscoveredRecorder {
     pub expected_own: usize,
     /// How long a confirmed missing publisher keeps its recording.
     pub removal_grace: Duration,
+    /// How long the start tries the archive connect again after a failed
+    /// try. Pass the start-up limit of the Aeron runtime
+    /// ([`AeronRuntime::start_open_limit`]). See [`Self::ready_budget`].
+    ///
+    /// [`AeronRuntime::start_open_limit`]: crate::aeron_live::AeronRuntime::start_open_limit
+    pub connect_limit: Duration,
     pub membership: watch::Receiver<Membership>,
     pub stop: CancellationToken,
     /// The tokio runtime that drives the waits; the thread itself runs
@@ -130,9 +137,12 @@ impl DiscoveredRecorder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the archive control session fails to connect.
+    /// Returns an error if the archive control session does not connect
+    /// within the connect limit.
     pub fn run(self, ready: impl FnOnce(RecorderProgress)) -> Result<(), LogError> {
-        let session = match connect_archive(self.aeron_dir.as_deref(), &self.aeron_cfg) {
+        let session = match self
+            .connect_with(|| connect_archive(self.aeron_dir.as_deref(), &self.aeron_cfg))
+        {
             Ok(s) => s,
             Err(e) => {
                 ready(RecorderProgress::Failed(format!("connect archive: {e}")));

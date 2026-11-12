@@ -48,6 +48,8 @@ pub enum Fault {
     RateLimit,
     /// Answer HTTP 503 to every call, and close the connection.
     Down,
+    /// Hold JSON-RPC replies until the fault clears. Control and health stay live.
+    Unresponsive { all_sources: bool },
 }
 
 /// Who asks: the peer address, and which of the proxy's two sources. The
@@ -66,6 +68,7 @@ pub struct Caller {
 pub enum Refusal {
     RateLimited,
     Down,
+    Unresponsive,
 }
 
 /// The active faults. Several lies at once model one bad endpoint: one
@@ -95,17 +98,21 @@ impl Faults {
         self.0.is_empty()
     }
 
-    /// The answer that replaces every forwarded call while a `Down` or a
-    /// `RateLimit` fault is active. `Down` wins: an endpoint that is
-    /// down cannot rate-limit.
+    /// An unresponsive endpoint sends no reply. Otherwise `Down` wins
+    /// over `RateLimit`: an endpoint that is down cannot rate-limit.
     #[must_use]
     pub fn refusal(&self) -> Option<Refusal> {
         self.refusal_for(Caller::default())
     }
 
-    /// [`Self::refusal`] for `caller`: the second source refuses nothing.
+    /// The second source stays faithful unless an unresponsive fault includes it.
     #[must_use]
     pub fn refusal_for(&self, caller: Caller) -> Option<Refusal> {
+        if self.0.iter().any(|fault| {
+            matches!(fault, Fault::Unresponsive { all_sources } if *all_sources || !caller.second)
+        }) {
+            return Some(Refusal::Unresponsive);
+        }
         if caller.second {
             return None;
         }

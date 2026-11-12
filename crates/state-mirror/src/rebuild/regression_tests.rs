@@ -19,13 +19,12 @@ impl Fixture {
         let address = Address::repeat_byte(0x42);
         kardamom_state::genesis::seed_genesis(
             &env,
-            &[AccountChange {
+            &kardamom_types::GenesisAlloc::of_accounts(vec![AccountChange {
                 address,
                 nonce: 0,
                 balance: U256::from(100),
                 code_hash: B256::ZERO,
-            }],
-            &[],
+            }]),
         )
         .unwrap();
         Self {

@@ -1,0 +1,48 @@
+---
+name: release-tarball
+description: >-
+  Install a tool from a GitHub release tarball, pinned by SHA-256 and kept
+  in the Actions cache. The download is a plain release asset URL, not the
+  GitHub REST API: the setup actions that resolve a version through the
+  API fail every job while the API is down.
+inputs:
+  name:
+    description: The tool name. It names the install directory and the cache key.
+    required: true
+  url:
+    description: The URL of the release asset, a .tar.gz with the binaries at its root.
+    required: true
+  sha256:
+    description: The SHA-256 of the asset. A new version needs a new URL and hash together.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache@v4
+      id: cache
+      with:
+        path: ~/.cache/release-tarball/${{ inputs.name }}
+        key: release-tarball-${{ inputs.name }}-${{ runner.os }}-${{ inputs.sha256 }}
+    - name: Download the release tarball
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        URL: ${{ inputs.url }}
+        SHA256: ${{ inputs.sha256 }}
+      run: |
+        dir="$HOME/.cache/release-tarball/$NAME"
+        mkdir -p "$dir"
+        # A GitHub outage can last for minutes, so the retries span up to
+        # 15 minutes, not seconds.
+        curl -fsSL --retry 60 --retry-all-errors --retry-delay 15 --retry-max-time 900 \
+          --connect-timeout 20 \
+          -o "$RUNNER_TEMP/$NAME.tar.gz" \
+          "$URL"
+        echo "$SHA256  $RUNNER_TEMP/$NAME.tar.gz" | sha256sum -c -
+        tar -xzf "$RUNNER_TEMP/$NAME.tar.gz" -C "$dir"
+    - name: Put the tool on the PATH
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+      run: echo "$HOME/.cache/release-tarball/$NAME" >> "$GITHUB_PATH"

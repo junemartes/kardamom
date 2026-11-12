@@ -174,3 +174,27 @@ async fn members_join_leave_and_expire_through_consul() {
     reg_other.deregister().await.expect("deregister other");
     cancel.cancel();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker; run with `cargo test -p kardamom-log --features docker-e2e --test consul_discovery -- --ignored`"]
+async fn a_check_removed_after_registration_is_recoverable() {
+    kardamom_log::testing::require_docker().await;
+    let (_container, cfg) = consul().await;
+    let catalog = catalog_from_config(&cfg).expect("consul client");
+    let record = publisher("lost-check", 41000);
+    let spec = spec(&cfg, &record);
+    catalog.register(&spec).await.expect("register");
+    catalog.deregister(&record.id).await.expect("lose check");
+    let error = catalog.pass(&record.id).await.expect_err("check absent");
+    assert!(
+        matches!(error, kardamom_log::error::LogError::CatalogCheckMissing(_)),
+        "{error}"
+    );
+    assert!(error.is_transient());
+    assert!(error.to_string().contains("Unknown check ID"), "{error}");
+    let registration = Registration::register(catalog.clone(), spec)
+        .await
+        .expect("whole registration repairs the check");
+    catalog.pass(&record.id).await.expect("check passes again");
+    registration.deregister().await.expect("deregistered");
+}

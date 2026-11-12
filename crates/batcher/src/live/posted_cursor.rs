@@ -52,6 +52,7 @@ impl PostedCursor {
             }
             refused @ (OfferOutcome::BackPressured
             | OfferOutcome::NotConnected
+            | OfferOutcome::SessionChanged
             | OfferOutcome::TooLarge { .. }) => {
                 warn!(
                     posted_head,

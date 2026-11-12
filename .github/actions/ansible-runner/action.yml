@@ -1,0 +1,45 @@
+---
+name: ansible-runner
+description: >-
+  Prepare the runner's own ansible-core (pipx) for the cluster playbooks:
+  the collections of deploy/cluster/ansible/requirements.yml from a cache,
+  and the Docker API client that community.docker needs.
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache@v4
+      id: collections
+      with:
+        path: ~/.ansible/collections
+        key: ansible-collections-${{ hashFiles('deploy/cluster/ansible/requirements.yml') }}
+
+    # Galaxy resets connections now and then; three tries cover it.
+    - name: Install the Ansible collections
+      if: steps.collections.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        n=0
+        until ansible-galaxy collection install -r deploy/cluster/ansible/requirements.yml; do
+          n=$((n + 1))
+          [ "$n" -ge 3 ] && exit 1
+          sleep 15
+        done
+
+    # The runner image puts pipx's ansible-core first on PATH, and its venv
+    # has no requests. community.docker's container and network modules run
+    # on the controller with that interpreter and need it.
+    - name: Docker API client dependency for the Ansible interpreter
+      shell: bash
+      run: pipx inject ansible-core requests
+
+    # Mitogen runs each module in a kept Python process in place of a new
+    # process for each task: a deploy makes some hundred module calls.
+    # A job turns it on with ANSIBLE_STRATEGY=mitogen_linear; this step
+    # only makes the strategy plugin available.
+    - name: Mitogen strategy plugin for the Ansible interpreter
+      shell: bash
+      run: |
+        pipx inject ansible-core mitogen==0.3.54
+        python="$(pipx environment --value PIPX_LOCAL_VENVS)/ansible-core/bin/python"
+        plugins="$("$python" -c 'import ansible_mitogen, os; print(os.path.dirname(ansible_mitogen.__file__))')/plugins/strategy"
+        echo "ANSIBLE_STRATEGY_PLUGINS=$plugins" >> "$GITHUB_ENV"

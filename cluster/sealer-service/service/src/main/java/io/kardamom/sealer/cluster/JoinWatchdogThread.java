@@ -61,6 +61,11 @@ import org.agrona.concurrent.status.CountersReader;
  *       The member found a leader and cannot join it. The relaunch keeps
  *       the recording log: it replays the member's own log, and its
  *       election starts again from that state.</li>
+ *   <li>A truncated log exits with the same code and keeps the recording
+ *       log. A new leader truncated the member's log below the position
+ *       that its service applied. The relaunch replays the truncated log,
+ *       so the commit position matches the leader's join position, and
+ *       the member joins the leader's term.</li>
  * </ul>
  */
 final class JoinWatchdogThread {
@@ -144,6 +149,8 @@ final class JoinWatchdogThread {
     private ElectionState lastState;
     /** The log recording during the last log replication sample. */
     private Recording lastRecording = Recording.NONE;
+    /** The relaunch position of the last sample. */
+    private long relaunchPosition = JoinWatchdog.NO_RELAUNCH_POSITION;
     /** The last peer commit mark, and the time of the next peer read. */
     private long peerCommitMark = 0L;
     private long nextPeerPollMs = 0L;
@@ -209,7 +216,8 @@ final class JoinWatchdogThread {
         final ElectionState state = ElectionState.get(electionState);
         logStateChange(state, commit);
         final JoinWatchdog.Sample sample = new JoinWatchdog.Sample(
-            state, commit, replicationPosition(state, commit), peerCommitMark(state, nowMs), controlToggle.get(), nowMs);
+            state, commit, replicationPosition(state, commit), peerCommitMark(state, nowMs), relaunchPosition(state),
+            controlToggle.get(), nowMs);
         act(watchdog.observe(sample), commit, nowMs);
     }
 
@@ -219,6 +227,7 @@ final class JoinWatchdogThread {
             case CATCHUP_STALL -> catchupStall(commit, nowMs);
             case LEADER_WEDGE -> leaderWedge(nowMs);
             case LEADER_STALL -> leaderStall(commit, nowMs);
+            case LOG_TRUNCATED -> logTruncated(commit, nowMs);
             case FOLLOWER_STALL -> followerStall(commit, nowMs);
             case PEER_CHECK -> peerCheck(commit, nowMs);
             case NONE -> { }
@@ -279,6 +288,17 @@ final class JoinWatchdogThread {
     }
 
     /**
+     * The commit position that a relaunch reaches, read from the recording
+     * log while the election is open. A closed election needs no read.
+     */
+    private long relaunchPosition(final ElectionState state) {
+        relaunchPosition = state == ElectionState.CLOSED
+            ? JoinWatchdog.NO_RELAUNCH_POSITION
+            : clusterDir.relaunchPosition().orElse(JoinWatchdog.NO_RELAUNCH_POSITION);
+        return relaunchPosition;
+    }
+
+    /**
      * Ask the peers whether one of them has a closed election, and act on
      * the verdict that follows. A seed that waits for a live peer logs once.
      */
@@ -316,6 +336,17 @@ final class JoinWatchdogThread {
             + " a member that voted cannot join this term; exiting for a relaunch from the own state"
             + " so the members elect again");
         exit(LEADER_STALL_EXIT_CODE);
+    }
+
+    private void logTruncated(final long commit, final long nowMs) {
+        System.out.println("cluster FOLLOWER STALL memberId=" + member.memberId()
+            + " commitPosition=" + commit
+            + " state=" + lastState
+            + " truncated log: the service applied the log past " + relaunchPosition
+            + ", the position that a relaunch reaches, for " + watchdog.truncatedForMs(nowMs) / 1000L + "s;"
+            + " a new leader cut the log tail, so no join can succeed;"
+            + " exiting for a relaunch that keeps the recording log");
+        exit(FOLLOWER_STALL_EXIT_CODE);
     }
 
     private void followerStall(final long commit, final long nowMs) {

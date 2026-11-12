@@ -306,7 +306,13 @@ impl Ready {
                                 Streamed {
                                     opened:
                                         Opened {
-                                            base: Startup { rt, plane, .. },
+                                            base:
+                                                Startup {
+                                                    stop_guard,
+                                                    rt,
+                                                    plane,
+                                                    ..
+                                                },
                                             state: OpenedState { start, .. },
                                         },
                                     streams:
@@ -314,7 +320,6 @@ impl Ready {
                                             inbound,
                                             cluster_guard,
                                             divergence,
-                                            stop,
                                             ..
                                         },
                                 },
@@ -373,7 +378,7 @@ impl Ready {
             // their AeronRuntime clones, then the runtime and the cluster
             // session end. The plane deregisters after that, in `wait`.
             streams: bin_support::LiveStreams {
-                stop: stop.drop_guard(),
+                stop: stop_guard,
                 rt,
                 cluster_guard,
             },

@@ -109,7 +109,7 @@ deploy succeeded and the release degrades the chain after it.
    the pre-release definition, and the resume refuses it with `Another
    change moved the job`. Finish the roll by hand: register the pre-release
    definition (`nomad job history -p -version <before> cluster`) one group
-   at a time, as `sealer_step.yml` does, followers first and the leader
+   at a time, as `roll_step.yml` does, followers first and the leader
    last, and wait for each member's `/ready`. Never revert the whole job:
    the members would restart at once. Then run `just rollback <env>` again
    for the jobs that remain.
@@ -159,6 +159,46 @@ Confirm:
 2. `kardamom_chainStatus` shows no root and no pause, and the heads advance.
 3. The next deploy compares its formats with the restored release.
 
+## Rollout
+
+Some releases need steps before or after the deploy. Do them in the order
+below.
+
+### The integration release of 2026-10-26 (#838)
+
+1. Retire the notifier outbox (`[retired.notifier-outbox]` in
+   `formats.toml`).
+   - The release gate refuses the first deploy with
+     `a rolling deploy cannot carry a coordinated format change: notifier-outbox`.
+   - Before the deploy, make sure that the old outbox is empty.
+     `kardamom_notifier_outbox_backlog_bytes` must read 0 for every
+     subscription on every notifier.
+   - The staging deploy workflow of kardamom-infra
+     (`.github/workflows/deploy-staging.yml`) must set
+     `KARDAMOM_ALLOW_RETIRED=notifier-outbox` for this one deploy.
+   - Remove the setting after the deploy. A stale allowance makes the next
+     deploy refuse.
+2. Check the readers of the egress before the deploy.
+   - The default of the egress job variable `keep_blocks` changes from
+     1,000,000 to 43,200 blocks (1 day at 2 s a block). The deploy has no
+     variable for it, so the redeploy of the egress uses the new value.
+   - The egress keeps every block above the posted head, so the batcher is
+     safe.
+   - An executor or a validator that resumes more than 43,200 blocks below
+     the egress head gets `410`. It then recovers from a peer checkpoint.
+   - Before the deploy, make sure that no executor or validator is more
+     than 43,200 blocks behind the egress head.
+3. Deploy the sealer before you use a version-2 sealer seed.
+   - `kardamom-reconstruct --sealer-seed` writes seed version 2 when the
+     rules hold an activation (`crates/reconstruct/src/seed.rs`). No flag
+     holds the writer at version 1. A chain with `genesis_features`
+     (`deploy/cluster/config/genesis/carry.toml`) writes version 2 from the first block.
+   - A sealer of the release before refuses a version-2 seed and does not
+     start.
+   - Upgrade every sealer member to this release before a seeded start
+     (`sealer-fleet-rebuild.md`).
+   - Do not roll the sealer back while a version-2 seed is configured.
+
 ## The refusals of the release gate
 
 A deploy refuses a release before it changes a job. Each message starts
@@ -204,6 +244,10 @@ with `Refused:`.
 | `<executor> moves to carry mode, and its committed block ... minus 32 is not above the block <b>` | At its first carry start the executor compares the stream with its committed blocks of that window, and the window still holds a reference. | Wait until the executor passes the block, then deploy. |
 | `KARDAMOM_MEMBER_FEED and KARDAMOM_EXEC_ON_SEALERS are on, off or empty` | A bad value, the executors on the sealer nodes without the feed, or an executor count other than the sealer count. | Fix the switches. Turn on the feed first. |
 | `KARDAMOM_CARRY_EXECUTORS (...) is empty or a list of distinct member indexes` | A bad list, or a list without `KARDAMOM_EXEC_ON_SEALERS=on` and `KARDAMOM_EGRESS=1`, or with `KARDAMOM_EXEC_CURSOR=on`. | Fix the list or the switches. |
+| `KARDAMOM_SEALER_VERSION_FLOOR (...) is empty or a decision version from 0 to 5` | A bad value. | Set empty, or a value from 0 to 5. |
+| `KARDAMOM_CLUSTER_RETENTION (...) is empty or a frame count from 1 to 131072` | A value above the cap in frames. A replay of the whole window would pass the backlog limit of a cluster session. | Set at most 131072. A higher rate needs the retained file or a change to the replay path. |
+
+The last four rows come from the preflight, before the release gate. Their messages do not start with `Refused:`.
 
 The upgrade check (`just sealer-upgrade-check`) refuses with these messages too:
 
@@ -213,4 +257,8 @@ The upgrade check (`just sealer-upgrade-check`) refuses with these messages too:
 | `the upgrade transaction of FEATURE_CARRY_WINDOW (feature id 5) needs every sealer member to read snapshot version 18` | A member of an older release. | Deploy the release to every member. |
 | `feature 5 needs decision version 5 on every member` | Features 3 and 4 are not on. A member below version 5 ignores the record (`EARLY`). | Activate features 3 and 4 first. |
 | `feature 5 needs the retained frames on the heap of every member` | A member with the retained file never stores the record (`UNSUPPORTED`). | The chain cannot take feature 5. |
+| `the sequencer job does not keep the highest sealer version across its sessions (job meta sealer_version_kept)` | A sequencer of an older release runs. It can send a reference without bytes after a new session. | Deploy the release to every sequencer. |
+| `the <reader> job does not read the canonical stream from the egress (job meta reads_egress)` | The batcher or the validator still reads the cluster egress. Under the carry window it gets `REPLAY_UNAVAILABLE` below the window. | Do step 5 of `carry-window-rollout.md` first. |
+| `the egress job does not keep the mark of the highest stored reference (job meta ref_mark)` | An egress of an older release runs. | Deploy the release of the egress. Then follow "After a rollback of the egress" in `carry-window-rollout.md`. |
+| `an egress instance does not report its reference mark` | An egress instance does not answer on its metrics port. | Bring the instance back, then run the check again. |
 | `the <reader> cursors <cursors> ... are not all above the index <r> of the last stored reference` | A reader cursor at or below R can still meet a reference in the egress range. | Wait until every reader passes R. |

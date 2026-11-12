@@ -29,6 +29,7 @@ const REPLICA_RESULTS_CHECKED_TOTAL: &str = "validator_replica_results_checked_t
 /// is beyond the reach above the cursor). Not a fault.
 const REPLICA_RESULTS_UNCHECKED_TOTAL: &str = "validator_replica_results_unchecked_total";
 pub const COMMITTED_BLOCK: &str = "validator_committed_block";
+pub const PIPELINE_ACTIVE: &str = "validator_pipeline_active";
 /// 1 while a divergence verdict stands in the verdict file beside the
 /// state, 0 otherwise. The readiness rule and the alert read it.
 pub const VERDICT_STANDING: &str = "validator_verdict_standing";
@@ -108,6 +109,10 @@ pub fn describe() {
          a peer-checkpoint increment is one in-process revolution of the pipeline"
     );
     metrics::describe_gauge!(COMMITTED_BLOCK, "Highest block the validator has committed");
+    metrics::describe_gauge!(
+        PIPELINE_ACTIVE,
+        "The validator has an open validation pipeline"
+    );
     metrics::describe_gauge!(
         EGRESS_CURSOR_INDEX,
         "Canonical index of the newest record that the validator took from the egress"
@@ -260,6 +265,10 @@ pub fn counter_fork_fallback(workers: u64) {
 
 pub fn counter_block_verified() {
     metrics::counter!(BLOCKS_VERIFIED_TOTAL).increment(1);
+}
+
+pub fn set_pipeline_active(active: bool) {
+    metrics::gauge!(PIPELINE_ACTIVE).set(f64::from(u8::from(active)));
 }
 
 pub fn counter_bal_missing() {

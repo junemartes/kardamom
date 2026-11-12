@@ -1,0 +1,25 @@
+---
+# The rules of every sealer member for the carry gates.
+# - workloads_gate_members: the rules of each member by task group, with
+#   decisionVersion, carryWindow and feed.
+# - workloads_gate_members_down: the configured members that do not run.
+# On a live chain the rules come from the status of each running member.
+# On a genesis bootstrap no member runs yet. Every member of the rendered
+# sealer job starts at genesis with the rules of that job
+# (workloads_gate_genesis, genesis_gate.yml), and sealer.yml reads the
+# status of the members after they start, before any other job registers.
+# The tasks read only, so they also run in check mode.
+- name: Read the status of every sealer member
+  ansible.builtin.include_tasks: sealer_status.yml
+  vars:
+    workloads_sealer_groups: "{{ workloads_gate_cluster_job.json.TaskGroups | map(attribute='Name') | list }}"
+  when: not workloads_gate_genesis_bootstrap | bool
+
+- name: Keep the rules of every sealer member
+  ansible.builtin.set_fact:
+    workloads_gate_members: >-
+      {{ dict(workloads_gate_genesis_groups | zip([workloads_gate_genesis] * (workloads_gate_genesis_groups | length)))
+         if workloads_gate_genesis_bootstrap | bool else
+         dict(workloads_sealer_status.results | map(attribute='item.item.TaskGroup')
+              | zip(workloads_sealer_status.results | map(attribute='json'))) }}
+    workloads_gate_members_down: "{{ [] if workloads_gate_genesis_bootstrap | bool else workloads_sealer_down }}"

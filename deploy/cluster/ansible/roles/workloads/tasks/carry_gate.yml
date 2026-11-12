@@ -7,6 +7,12 @@
 # b. The batcher or the validator moves to the egress.
 # c. An executor moves to carry mode.
 # d. The sequencers go back to the v1 loop.
+# On a genesis bootstrap no member and no other job of the pipeline runs
+# yet (genesis_gate.yml). Each gate then reads the rules of the members
+# from the rendered sealer job (sealer_rules.yml) and the reference mark
+# from its carry window (egress_mark.yml). A job that Nomad does not know
+# runs no instance of an older release, and the deploy registers it from
+# this release, so each check of a registered job passes it.
 # The tasks read only, so they also run in check mode.
 
 # 8a. The sequencer version floor. A sequencer starts from the floor until
@@ -42,21 +48,20 @@
   block:
     - name: Refuse a version floor without a registered sealer
       ansible.builtin.assert:
-        that: workloads_gate_cluster_job.status == 200
+        that: workloads_gate_cluster_job.status == 200 or workloads_gate_genesis_bootstrap | bool
         fail_msg: >-
           Refused: KARDAMOM_SEALER_VERSION_FLOOR is {{ workloads_gate_floor }}, and Nomad does not know the sealer
-          job. A new chain starts on decision version 3. Deploy it with the floor 0.
+          job. A new chain starts on decision version 3. Deploy it with the floor 0, or start it with
+          KARDAMOM_GENESIS_CARRY=on and KARDAMOM_CLUSTER_BOOTSTRAP=1.
 
-    - name: Read the status of every sealer member for the version floor
-      ansible.builtin.include_tasks: sealer_status.yml
-      vars:
-        workloads_sealer_groups: "{{ workloads_gate_cluster_job.json.TaskGroups | map(attribute='Name') | list }}"
+    - name: Read the rules of every sealer member for the version floor
+      ansible.builtin.include_tasks: sealer_rules.yml
 
     - name: Refuse a version floor while a sealer member does not run
       ansible.builtin.assert:
-        that: workloads_sealer_down | length == 0
+        that: workloads_gate_members_down | length == 0
         fail_msg: >-
-          Refused: the sealer members {{ workloads_sealer_down | join(', ') }} do not run, so the gate cannot read
+          Refused: the sealer members {{ workloads_gate_members_down | join(', ') }} do not run, so the gate cannot read
           their decision version for KARDAMOM_SEALER_VERSION_FLOOR. Start them and let them catch up, then deploy.
 
     - name: Refuse a version floor above the decision version of a member
@@ -68,8 +73,7 @@
           decisionVersion of the members.
       vars:
         workloads_gate_versions: >-
-          {{ workloads_sealer_status.results | map(attribute='json') | map(attribute='decisionVersion', default=0)
-             | map('int') | list }}
+          {{ workloads_gate_members.values() | map(attribute='decisionVersion', default=0) | map('int') | list }}
 
     - name: Refuse a version floor with the v1 loop in the target
       ansible.builtin.assert:
@@ -82,11 +86,15 @@
     - name: Check that the registered sequencers run the v2 loop
       ansible.builtin.include_tasks: upgrade_check_job.yml
       vars:
-        workloads_upgrade_job: "{{ workloads_upgrade_window_jobs | selectattr('metas', 'contains', 'v2_loop') | first }}"
+        workloads_upgrade_job: >-
+          {{ workloads_upgrade_window_jobs | selectattr('metas', 'contains', 'v2_loop') | first
+             | combine({'optional': true} if workloads_gate_genesis_bootstrap | bool else {}) }}
 
     - name: Check the readers of a relayed full reference
       ansible.builtin.include_tasks: upgrade_check_job.yml
-      loop: "{{ workloads_floor_jobs }}"
+      loop: >-
+        {{ workloads_floor_jobs | map('combine', {'optional': true}) | list
+           if workloads_gate_genesis_bootstrap | bool else workloads_floor_jobs }}
       loop_control:
         loop_var: workloads_upgrade_job
         label: "{{ workloads_upgrade_job.name }}"
@@ -207,9 +215,13 @@
 - name: Check the executors that move to carry mode
   when: workloads_gate_moving_executors | length > 0
   block:
+    # On a genesis bootstrap Nomad knows no executor job, and the target
+    # pins executor <i> to sealer-<i> (KARDAMOM_EXEC_ON_SEALERS=on).
     - name: Refuse a carry executor that does not run on the node of its member
       ansible.builtin.assert:
-        that: workloads_gate_moving_executors | difference(workloads_gate_executor_groups) | length == 0
+        that: >-
+          workloads_gate_moving_executors | difference(workloads_gate_executor_groups) | length == 0
+          or (workloads_gate_genesis_bootstrap | bool and workloads_exec_on_sealers == 'on')
         fail_msg: >-
           Refused: the executor groups {{ workloads_gate_moving_executors | difference(workloads_gate_executor_groups)
           | join(', ') }} do not run on the sealer nodes. Deploy with KARDAMOM_EXEC_ON_SEALERS=on first, then move the
@@ -222,44 +234,41 @@
           name: executor
           metas: [carried_ref_fault]
           does: stop on a reference that no source can join
+          optional: "{{ workloads_gate_genesis_bootstrap | bool }}"
 
     - name: Refuse a carry executor without a registered sealer
       ansible.builtin.assert:
-        that: workloads_gate_cluster_job.status == 200
+        that: workloads_gate_cluster_job.status == 200 or workloads_gate_genesis_bootstrap | bool
         fail_msg: >-
           Refused: KARDAMOM_CARRY_EXECUTORS lists {{ workloads_gate_moving_executors | join(', ') }}, and Nomad does
           not know the sealer job. A carry executor needs the carry window on every member.
 
-    - name: Read the status of every sealer member for the carry executors
-      ansible.builtin.include_tasks: sealer_status.yml
-      vars:
-        workloads_sealer_groups: "{{ workloads_gate_cluster_job.json.TaskGroups | map(attribute='Name') | list }}"
+    - name: Read the rules of every sealer member for the carry executors
+      ansible.builtin.include_tasks: sealer_rules.yml
 
     - name: Refuse a carry executor before the carry window applies on every member
       ansible.builtin.assert:
         that:
-          - workloads_sealer_down | length == 0
+          - workloads_gate_members_down | length == 0
           - workloads_gate_windows | reject('equalto', true) | list | length == 0
         fail_msg: >-
           Refused: a carry executor needs the rules of the carry window (feature 5) on every member. The members
-          {{ workloads_sealer_down | join(', ') }} do not run, or a member reports carryWindow false
+          {{ workloads_gate_members_down | join(', ') }} do not run, or a member reports carryWindow false
           ({{ workloads_gate_windows }}). Move the executors after the switch of feature 5.
       vars:
         workloads_gate_windows: >-
-          {{ workloads_sealer_status.results | map(attribute='json') | map(attribute='carryWindow', default=false) | list }}
+          {{ workloads_gate_members.values() | map(attribute='carryWindow', default=false) | map('bool') | list }}
 
     - name: Refuse a carry executor whose member runs no feed
       ansible.builtin.assert:
-        that: workloads_gate_feeds[item | replace('executor-', 'cluster-')] | default('off') != 'off'
+        that: workloads_gate_feed != 'off'
         fail_msg: >-
           Refused: {{ item }} moves to carry mode, and its member {{ item | replace('executor-', 'cluster-') }} reports
-          the feed {{ workloads_gate_feeds[item | replace('executor-', 'cluster-')] | default('off') }}. Deploy with
-          KARDAMOM_MEMBER_FEED=on first.
+          the feed {{ workloads_gate_feed }}. Deploy with KARDAMOM_MEMBER_FEED=on first.
       loop: "{{ workloads_gate_moving_executors }}"
       vars:
-        workloads_gate_feeds: >-
-          {{ dict(workloads_sealer_status.results | map(attribute='item.item.TaskGroup')
-                  | zip(workloads_sealer_status.results | map(attribute='json') | map(attribute='feed', default='off'))) }}
+        workloads_gate_feed: >-
+          {{ (workloads_gate_members[item | replace('executor-', 'cluster-')] | default({})).feed | default('off') }}
 
     - name: Read the reference mark for the carry executors
       ansible.builtin.include_tasks: egress_mark.yml
@@ -271,11 +280,13 @@
         workloads_metrics_port: "{{ workloads_metrics_ports.executor }}"
         workloads_metrics_gauges: [kardamom_executor_block_number]
 
+    # An egress that stored no reference (R index 0) holds none to join.
     - name: Refuse a carry executor that is not past the last stored reference
       ansible.builtin.assert:
         that: >-
-          workloads_gate_executor_blocks[item] | default(-1) | int >= 0
-          and workloads_gate_executor_blocks[item] | int - workloads_carry_compare_blocks | int > workloads_ref_block | int
+          workloads_ref_index | int == 0
+          or (workloads_gate_executor_blocks[item] | default(-1) | int >= 0
+              and workloads_gate_executor_blocks[item] | int - workloads_carry_compare_blocks | int > workloads_ref_block | int)
         fail_msg: >-
           Refused: {{ item }} moves to carry mode, and its committed block
           {{ workloads_gate_executor_blocks[item] | default('none') }} (kardamom_executor_block_number; -1 is no answer)

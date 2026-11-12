@@ -30,6 +30,13 @@ final class AdminServer implements AutoCloseable {
     private static final int OK = 200;
     private static final int NOT_FOUND = 404;
     private static final int UNAVAILABLE = 503;
+    /**
+     * The bind address of the endpoint ({@code -Dkardamom.cluster.adminHost}).
+     * Unset, the endpoint listens on every address. A host with more than one
+     * member gives each member its own address, so every member keeps the
+     * one admin port that its peers ask.
+     */
+    static final String HOST_SETTING = "kardamom.cluster.adminHost";
 
     /**
      * One sample of a node, as the endpoint answers it.
@@ -56,7 +63,7 @@ final class AdminServer implements AutoCloseable {
     }
 
     /**
-     * Bind {@code 0.0.0.0:port} (0 picks a free port) and serve the member
+     * Bind {@code port} on the address of {@link #HOST_SETTING} (0 picks a free port) and serve the member
      * status, with the segments of {@code retained} when it is present. A
      * member is ready within {@code lagBytes} of the commit position.
      *
@@ -72,7 +79,7 @@ final class AdminServer implements AutoCloseable {
     }
 
     /**
-     * Bind {@code 0.0.0.0:port} (0 picks a free port) and serve the reports
+     * Bind {@code port} on the address of {@link #HOST_SETTING} (0 picks a free port) and serve the reports
      * of {@code reports}, with the segments of {@code retained} when it is
      * present.
      *
@@ -83,7 +90,8 @@ final class AdminServer implements AutoCloseable {
             final Supplier<Report> reports,
             final Optional<RetainedEndpoint> retained)
             throws IOException {
-        final HttpServer http = HttpServer.create(new InetSocketAddress("0.0.0.0", port), 0);
+        final HttpServer http = HttpServer.create(
+            new InetSocketAddress(System.getProperty(HOST_SETTING, "0.0.0.0"), port), 0);
         final AdminServer admin = new AdminServer(http, reports, retained);
         http.createContext("/", admin::handle);
         http.setExecutor(Executors.newSingleThreadExecutor(admin::daemonThread));

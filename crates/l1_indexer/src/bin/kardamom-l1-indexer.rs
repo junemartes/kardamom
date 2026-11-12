@@ -174,6 +174,7 @@ async fn serve(args: Args, log_cfg: LogConfig) -> anyhow::Result<()> {
             topic: Topic::L1Blocks,
             aeron_dir: args.aeron_dir.clone(),
             aeron_cfg: log_cfg.aeron.clone(),
+            connect_limit: aeron_rt.start_open_limit(),
         };
         Some(plane.record_own(own).await?.context(
             "--archive-durability records l1_blocks through [discovery]; the log config has it off",

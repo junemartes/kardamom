@@ -18,6 +18,34 @@ const NEXT_NONCE: u64 = 5;
 /// The smoke account of the test.
 const ACCOUNT: u32 = 3;
 
+#[tokio::test]
+async fn an_account_read_keeps_the_full_balance_quantity() {
+    let mut module = RpcModule::new(());
+    module
+        .register_method("eth_getTransactionCount", |_, &(), _| {
+            format!("{NEXT_NONCE:#x}")
+        })
+        .unwrap();
+    module
+        .register_method("eth_getBalance", |_, &(), _| format!("{:#x}", U256::MAX))
+        .unwrap();
+    let server = Server::builder().build("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", server.local_addr().unwrap());
+    let handle = server.start(module);
+    let account = Rpc::new(&url, 1)
+        .unwrap()
+        .account_state(ACCOUNT)
+        .await
+        .unwrap();
+    assert_eq!(
+        account.address,
+        Rpc::genesis_signer(ACCOUNT).unwrap().address
+    );
+    assert_eq!(account.nonce, NEXT_NONCE);
+    assert_eq!(account.balance, U256::MAX);
+    handle.stop().unwrap();
+}
+
 /// A fake ingress answers an account that already sent five transfers.
 /// The smoke signs its transfer at nonce 5, not at nonce 0, so a second
 /// smoke on a used chain is not a duplicate.
@@ -139,4 +167,25 @@ async fn a_nonce_read_fails_at_once_on_another_refusal() {
     assert!(err.to_string().contains("not served"), "{err:#}");
     assert_eq!(ingress.calls(), 1);
     ingress.handle.stop().unwrap();
+}
+
+/// A connection that the ingress refuses is no answer: the read repeats
+/// within its budget, and the error names the ingress.
+#[tokio::test(start_paused = true)]
+async fn a_nonce_read_repeats_through_a_refused_connection() {
+    // The listener closes at the end of the block, so the port refuses.
+    let url = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let err = Rpc::new(&url, 1)
+        .unwrap()
+        .nonce_of(ACCOUNT)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("the ingress did not connect"),
+        "{err:#}"
+    );
+    assert!(err.to_string().contains(&url), "{err:#}");
 }

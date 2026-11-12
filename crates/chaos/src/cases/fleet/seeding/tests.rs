@@ -1,11 +1,13 @@
 use alloy_primitives::{Address, B256};
-use kardamom_reconstruct::{SealerSeed, SeedSender};
+use kardamom_reconstruct::{SealerRules, SealerSeed, SeedSender};
+use kardamom_types::upgrades::GenesisFeatures;
 use serde_json::json;
 
 use super::*;
 
-/// A seed as `kardamom-reconstruct --sealer-seed` writes it.
-fn seed_bytes() -> Vec<u8> {
+/// A seed as `kardamom-reconstruct --sealer-seed` writes it, with the
+/// rules of a chain that runs `features` from its genesis.
+fn seed_bytes_of(features: GenesisFeatures) -> Vec<u8> {
     SealerSeed {
         chain_id: 412_346,
         block: 239,
@@ -17,9 +19,15 @@ fn seed_bytes() -> Vec<u8> {
             address: Address::repeat_byte(0xAA),
             next_nonce: 3,
         }],
+        rules: SealerRules::genesis(features),
     }
     .encode()
     .unwrap()
+}
+
+/// A seed of version 1: its rules hold no activation.
+fn seed_bytes() -> Vec<u8> {
+    seed_bytes_of(GenesisFeatures::None)
 }
 
 #[test]
@@ -37,12 +45,22 @@ fn the_head_parses_from_the_bytes_the_producer_writes() {
 }
 
 #[test]
-fn a_file_that_is_not_a_version_1_seed_is_refused() {
+fn a_seed_with_rules_has_the_same_head() {
+    let bytes = seed_bytes_of(GenesisFeatures::CarryWindow);
+    assert_eq!(bytes[7], 2);
+    assert_eq!(
+        SeedHead::parse(&bytes).unwrap(),
+        SeedHead::parse(&seed_bytes()).unwrap()
+    );
+}
+
+#[test]
+fn a_file_that_is_not_a_version_1_or_2_seed_is_refused() {
     let bytes = seed_bytes();
     let mut magic = bytes.clone();
     magic[0] = b'X';
     let mut version = bytes.clone();
-    version[7] = 2;
+    version[7] = 3;
     assert!(SeedHead::parse(&magic).is_err());
     assert!(SeedHead::parse(&version).is_err());
     assert!(SeedHead::parse(&bytes[..44]).is_err(), "the origin is cut");

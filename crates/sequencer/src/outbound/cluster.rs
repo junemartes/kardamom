@@ -71,6 +71,7 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
             OfferOutcome::BackPressured | OfferOutcome::NotConnected => {
                 Err(SequencerError::Backpressure)
             }
+            OfferOutcome::SessionChanged => Err(SequencerError::SessionChanged),
             OfferOutcome::TooLarge { len } => Err(SequencerError::EncodeFailed(format!(
                 "cluster frame of {len} bytes exceeds one session message"
             ))),
@@ -104,6 +105,25 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
             Ok(()) => (taken, None),
             Err(e) => (0, Some(e)),
         }
+    }
+}
+
+impl ClusterRefPublisher<LiveIngress> {
+    /// A publisher on the same session that offers nothing on a new
+    /// session until it reports [`SequencerError::SessionChanged`] once.
+    /// See [`LiveIngress::fenced`].
+    #[must_use]
+    pub fn fenced(&self) -> Self {
+        Self::new(self.ingress.fenced())
+    }
+
+    /// The publisher of the publish loop. The v2 loop (`v2_loop`) takes a
+    /// fenced clone: it learns of a new session before its first offer
+    /// there, and offers its unconfirmed runs again first. The v1 loop
+    /// takes a plain clone.
+    #[must_use]
+    pub fn for_publish_loop(&self, v2_loop: bool) -> Self {
+        if v2_loop { self.fenced() } else { self.clone() }
     }
 }
 
@@ -188,48 +208,33 @@ pub const PUBLISHER_EGRESS_KINDS: [u8; 11] = [
     wire::EGRESS_KIND_REF_REFUSED,
 ];
 
-/// Connect to the cluster, wrap ingress as a `TxOrderingRefPublisher`, and
-/// keep the egress receiver. The cluster also broadcasts every relayed
-/// record and boundary to publisher sessions; the caller uses this to
-/// drive the lag-resync watermark trigger from the boundary frames'
-/// `end_tx_idx` (the global canonical count).
-///
-/// Keep the returned `LiveCluster` guard alive while the publisher is in
-/// use.
+impl crate::v2::AdmissionSettings {
+    /// V2 needs canonical confirmations to release each sender's suffix.
+    /// V1 reads only boundaries, status, rules and rejection controls.
+    pub(crate) fn cluster_options(&self) -> live::ConnectOptions {
+        let mut kinds = PUBLISHER_EGRESS_KINDS.to_vec();
+        if self.enabled {
+            kinds.extend([wire::EGRESS_KIND_RELAYED, wire::EGRESS_KIND_RELAYED_REF]);
+        }
+        live::ConnectOptions {
+            subscribe: self.enabled,
+            egress_kind_filter: Some(kinds),
+            ..Default::default()
+        }
+    }
+}
+
+/// Connect the publisher and its egress feed using the admission mode.
+/// Keep the returned `LiveCluster` guard alive while the publisher is in use.
 ///
 /// # Errors
-///
 /// Returns an error if the cluster session fails to connect.
 pub fn cluster_ref_publisher_with_egress(
     rt: kardamom_log::aeron_live::AeronRuntime,
     cfg: LiveClusterConfig,
+    admission: &crate::v2::AdmissionSettings,
 ) -> Result<(LiveCluster, ClusterRefPublisher<LiveIngress>, LiveEgress), LiveError> {
-    // Only boundaries and reject frames pass through. Line-rate record
-    // frames are dropped at the session thread, instead of being allocated
-    // and channelled to a receiver that discards them (the session thread
-    // also services the publish offers). A contiguity reject is the sealer
-    // telling this publisher that a known sender's ref would seal a nonce
-    // gap; the watermark thread forwards it into the rewind path. A
-    // remote-origin reject is the sealer refusing a relayed kind-5 record;
-    // the watermark thread logs and counts it. The past-deadline, the
-    // window-full, the DA-lag, the record-lag, and the origin-gap rejects
-    // go to the offering session only, and the feed answers each one. The
-    // boundaries' L1 origin and the origin-gap rejects drive the epoch
-    // lane's confirm and its offer again.
-    let (cluster, ingress, egress) = live::connect_with(
-        rt,
-        cfg,
-        live::ConnectOptions {
-            egress_kind_filter: Some(PUBLISHER_EGRESS_KINDS.to_vec()),
-            // `subscribe` stays at its default (false): no SUBSCRIBE
-            // announcement. Boundaries broadcast to every session (see
-            // SealerClusteredService.offerBoundary), and contiguity
-            // rejects go directly to the offering session. So this feed
-            // needs no consumer registration, and stays out of the
-            // per-record fan-out.
-            ..Default::default()
-        },
-    )?;
+    let (cluster, ingress, egress) = live::connect_with(rt, cfg, admission.cluster_options())?;
     Ok((cluster, ClusterRefPublisher::new(ingress), egress))
 }
 

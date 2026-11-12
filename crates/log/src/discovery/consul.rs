@@ -34,6 +34,32 @@ pub struct ConsulClient {
     request_timeout: Duration,
 }
 
+/// A missing TTL check is repaired by registration. Other missing
+/// endpoints remain permanent errors.
+#[derive(Clone, Copy)]
+enum CatalogCall<'a> {
+    Request(&'a str),
+    CheckPass(&'a str),
+}
+
+impl<'a> CatalogCall<'a> {
+    fn description(self) -> &'a str {
+        match self {
+            Self::Request(what) | Self::CheckPass(what) => what,
+        }
+    }
+
+    fn error(self, status: reqwest::StatusCode, body: &str) -> LogError {
+        let what = self.description();
+        match (self, status) {
+            (Self::CheckPass(_), reqwest::StatusCode::NOT_FOUND) => {
+                LogError::CatalogCheckMissing(format!("{what}: {status}: {body}"))
+            }
+            _ => LogError::catalog_status(what, status, body),
+        }
+    }
+}
+
 /// Consul's service registration body.
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -152,24 +178,26 @@ impl ConsulClient {
         &self,
         req: reqwest::RequestBuilder,
         timeout: Duration,
-        what: &str,
+        call: CatalogCall<'_>,
     ) -> Result<reqwest::Response, LogError> {
         let resp = req
             .timeout(timeout)
             .send()
             .await
-            .map_err(|e| LogError::catalog_send(what, &e))?;
+            .map_err(|e| LogError::catalog_send(call.description(), &e))?;
         let status = resp.status();
         if status.is_success() {
             return Ok(resp);
         }
         let body = resp.text().await.unwrap_or_default();
-        Err(LogError::catalog_status(what, status, &body))
+        Err(call.error(status, &body))
     }
 
     /// Send a request whose only interesting outcome is success.
     async fn send_ok(&self, req: reqwest::RequestBuilder, what: &str) -> Result<(), LogError> {
-        self.send(req, self.request_timeout, what).await.map(|_| ())
+        self.send(req, self.request_timeout, CatalogCall::Request(what))
+            .await
+            .map(|_| ())
     }
 
     /// # Errors
@@ -203,7 +231,13 @@ impl ConsulClient {
     pub async fn pass(&self, service: &ServiceId) -> Result<(), LogError> {
         let path = format!("/v1/agent/check/pass/{}", super::catalog::check_id(service));
         let req = self.request(reqwest::Method::PUT, &path);
-        self.send_ok(req, &format!("pass check of {service}")).await
+        self.send(
+            req,
+            self.request_timeout,
+            CatalogCall::CheckPass(&format!("pass check of {service}")),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// # Errors
@@ -238,7 +272,7 @@ impl ConsulClient {
         let what = format!("query {}", query.service);
         let path = format!("/v1/health/service/{}", query.service);
         let req = self.request(reqwest::Method::GET, &path).query(&params);
-        let resp = self.send(req, timeout, &what).await?;
+        let resp = self.send(req, timeout, CatalogCall::Request(&what)).await?;
         let index = resp
             .headers()
             .get(INDEX_HEADER)

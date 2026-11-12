@@ -29,13 +29,13 @@ use kardamom_log::aeron_live::{
 };
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
+use kardamom_log::refetch::{JoinRepair, RefetchWorker};
 use kardamom_obs::bin::wait_for_shutdown;
-use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::fees::FeeGate;
 use kardamom_sequencer::lookup::LookupRequester;
 use kardamom_sequencer::outbound::SideChannels;
 use kardamom_sequencer::sealer_rules::{SealerRules, SealerVersion};
-use kardamom_sequencer::sequencer::Shutdown;
+use kardamom_sequencer::{SequencerConfig, Shutdown};
 
 /// The Aeron subscriptions and publisher this sequencer needs, all opened
 /// on the same runtime `rt`.
@@ -80,16 +80,20 @@ impl Handles {
         rt: &AeronRuntime,
         plane: &mut StreamPlane,
         cfg: &SequencerConfig,
-        tx_events: bool,
+        args: &Args,
+        log_cfg: &LogConfig,
     ) -> Result<Self> {
-        let own = Self::open_lane(rt, plane, cfg.lane())?;
+        let tx_events = args.tx_events == TxEventsArg::On;
+        let refetch = args.refetch(plane, log_cfg);
+        let repair = refetch.is_some();
+        let own = Self::open_lane(rt, plane, cfg.lane(), repair)?;
         let old = cfg
             .extra_lanes
             .iter()
-            .map(|lane| Self::open_lane(rt, plane, *lane))
+            .map(|lane| Self::open_lane(rt, plane, *lane, repair))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            data_subs: LaneSubscriptions::new(own, old),
+            data_subs: LaneSubscriptions::new(own, old, refetch.map(RefetchWorker::spawn)),
             deposits_sub: plane
                 .subscriber::<TxDepositsSubscriberHandle>(rt)
                 .context("open TxDepositsSubscriberHandle")?,
@@ -124,16 +128,43 @@ impl Handles {
     }
 
     /// Open the `tx_data` subscription of one lane through the plane.
-    fn open_lane(rt: &AeronRuntime, plane: &mut StreamPlane, lane: u8) -> Result<LaneSub> {
-        let handle = plane
-            .tx_data_subscriber(rt, lane)
-            .with_context(|| format!("open TxDataSubscriberHandle lane={lane}"))?;
-        Ok(LaneSub { lane, handle })
+    /// With `repair`, the lane reports the joins of new images and repairs
+    /// a late join ([`JoinRepair`]).
+    fn open_lane(
+        rt: &AeronRuntime,
+        plane: &mut StreamPlane,
+        lane: u8,
+        repair: bool,
+    ) -> Result<LaneSub> {
+        let opened = if repair {
+            plane.tx_data_subscriber_with_joins(rt, lane)
+        } else {
+            plane.tx_data_subscriber(rt, lane)
+        };
+        let handle = opened.with_context(|| format!("open TxDataSubscriberHandle lane={lane}"))?;
+        let stream_id = plane.channels().tx_data_stream_id(lane);
+        Ok(LaneSub {
+            lane,
+            handle,
+            repair: repair.then(|| JoinRepair::new(stream_id, JOIN_REPAIR_GRACE, MAX_JOIN_GAP)),
+        })
     }
 }
 
-/// The account events that may wait for the v2 loop: about one for each
-/// receipt batch. A full queue holds the receipts feed back.
+/// A lane does not repair the late join of a session that it first sees
+/// this long after its start: at its start the sequencer joins each
+/// running ingress session late, by design.
+const JOIN_REPAIR_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The largest late-join gap that a lane refetches, in bytes. A session
+/// with more bytes before the join ran long before it, so it is not a new
+/// publication.
+const MAX_JOIN_GAP: u64 = 64 << 20;
+
+/// The account events that may wait for the v2 loop: one for each
+/// canonical transaction record of the sealer, and one for each receipt
+/// batch, lookup answer and sealer refusal. A full queue holds its
+/// senders back.
 const V2_ACCOUNT_EVENTS: usize = 65_536;
 
 /// The senders that may wait for a lookup of the v2 loop. A full queue
@@ -220,8 +251,8 @@ impl ResyncWiring {
         // Three feeds go into the publish loop's ResyncController:
         //  1. The egress-watermark thread. The cluster broadcasts every
         //     boundary to this publisher session. Decode `end_tx_idx` (the
-        //     global canonical count) into the shared watermark, and discard
-        //     the records.
+        //     global canonical count) into the shared watermark. V2 also
+        //     subscribes to canonical records to release sender prefixes.
         //  2. The receipts thread: tx_receipts to per-sender executed-truth
         //     floors (only this shard's senders).
         //  3. The controller itself, handed to the Sequencer through
@@ -232,11 +263,8 @@ impl ResyncWiring {
             answer_tx,
             deadline_tx,
             watermark,
-        } = kardamom_sequencer::resync::ResyncChannel::open(
-            cfg.resync.clone(),
-            cfg.partition_index,
-        )
-        .context("build resync channel")?;
+        } = kardamom_sequencer::resync::ResyncChannel::for_config(cfg)
+            .context("build resync channel")?;
 
         // The epoch lane reads the same egress: the boundaries confirm its
         // epochs, and an origin-gap reject makes it offer them again.
@@ -362,11 +390,10 @@ impl ResyncWiring {
         let task = feeds::AccountLookupFeed::new(
             rx,
             accounts_tx,
-            live,
-            redis,
-            query,
+            feeds::LookupSources { live, redis, query },
             shutdown.clone(),
             cfg.partition_index,
+            feeds::Retries::covering(cfg.tx_ttl()),
         )
         .spawn();
         (
@@ -573,7 +600,7 @@ async fn main() -> anyhow::Result<()> {
     let mut plane = StreamPlane::from_config(&log_cfg, &format!("sequencer-{}", cfg.lane()))
         .context("build the stream plane")?;
 
-    let handles = Handles::open(&rt, &mut plane, &cfg, args.tx_events == TxEventsArg::On).await?;
+    let handles = Handles::open(&rt, &mut plane, &cfg, &args, &log_cfg).await?;
     spawn_events_beacon(&mut plane, &rt).await?;
 
     let shutdown = Shutdown::new();
@@ -591,13 +618,17 @@ async fn main() -> anyhow::Result<()> {
     let cluster_rt =
         AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn cluster AeronRuntime")?;
     let mut cluster_cfg = cfg.cluster.to_live();
-    if let Some(endpoints) = plane.cluster_ingress_endpoints().await? {
+    if let Some(endpoints) = plane
+        .cluster_ingress_endpoints(rt.start_open_limit())
+        .await?
+    {
         cluster_cfg.ingress_endpoints = endpoints;
     }
     let (cluster_guard, cluster_pub, cluster_egress) =
         kardamom_sequencer::outbound::cluster::cluster_ref_publisher_with_egress(
             cluster_rt,
             cluster_cfg,
+            &cfg.admission,
         )
         .context("connect cluster ref publisher")?;
     tracing::info!("kardamom-sequencer: tx_ordering via Aeron Cluster");
@@ -635,11 +666,12 @@ async fn main() -> anyhow::Result<()> {
     // Cloning shares the single session thread, and offers serialize
     // through it. All three loops use `cluster_pub` (it implements
     // `TxOrderingRefPublisher`): the canonical `TxRef` loop and the two
-    // origin pumps.
+    // origin pumps. The v2 loop takes a fenced clone: see
+    // `ClusterRefPublisher::for_publish_loop`.
     let (join_main, join_deposits, join_remote_epochs) = PublishLoops {
         cfg: cfg.clone(),
         tx_data: handles.data_subs,
-        main_pub: cluster_pub.clone(),
+        main_pub: cluster_pub.for_publish_loop(cfg.admission.enabled),
         epoch_pub: cluster_pub.clone(),
         remote_epoch_pub: cluster_pub,
         side: handles

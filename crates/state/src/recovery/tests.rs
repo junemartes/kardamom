@@ -102,7 +102,13 @@ fn bootstrap_corrects_genesis_stale_mirror_under_newer_state() {
         balance: U256::from(1000u64),
         code_hash: B256::ZERO,
     }];
-    assert!(crate::genesis::seed_genesis(&env, &genesis, &[]).unwrap());
+    assert!(
+        crate::genesis::seed_genesis(
+            &env,
+            &kardamom_types::GenesisAlloc::of_accounts(genesis.to_vec())
+        )
+        .unwrap()
+    );
     assert!(has_trie(&env).unwrap(), "genesis seed builds the mirror");
 
     // Trie-off progress, what an executor does: A changes, and B appears.

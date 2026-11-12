@@ -66,7 +66,6 @@ The layout tests of the frozen formats:
 | `executor-markers` | `kardamom-executor` | the text of a fixed rollback marker, and its parse |
 | `receipt-ledger` | `kardamom-executor` | the slot count and the bytes of a fixed slot, and its decode |
 | `egress-ref-mark` | `kardamom-egress` | the bytes of a fixed mark, and its read |
-| `notifier-outbox` | `kardamom-notifier` | rkyv archived size and alignment of `OutboxRecord` |
 | `redis-cache` | `kardamom-cache` | the keys of fixed samples |
 | `canary-journal`, `canary-store`, `canary-market` | `kardamom-canary` | the JSON of fixed samples |
 
@@ -152,9 +151,11 @@ to a retired format:
   neither shared nor permanent. The rolling deploy then carries the
   change, with no rollback floor. The deploy record keeps the list.
 - Give the allowance only when the release removes the service that
-  owned the format, as the removal of the notifier did for
-  `notifier-outbox`. A rollback then starts the old service on its own
-  file, which no release changed in the meantime.
+  owned the format, or the part of it that used the file, as the removal
+  of the notifier webhooks did for `notifier-outbox`: the service stays,
+  and no release reads or writes the file again. A rollback then starts
+  the old service on its own file, which no release changed in the
+  meantime.
 - Do not give it for a format that a running service renames, for
   example a new layout of a frozen format under a new id (rule 6). The
   new release stops updating the old file, and a rollback starts the old
@@ -213,7 +214,7 @@ proves each one.
 | Sealer snapshot with a retained file | A member with `kardamom.cluster.carryBytes=true` writes version 17: the state of version 16, then the file section. It restores version 17 and version 12, and stops on any other version. A member without the flag stops on both. `SealerVersionFiveTest` restarts a carrying member from version 17 at each entry, and the member decides as its peer. | A restored member runs the decision version, the switch and the schedule of feature 4 of its peers. A member without the flag never writes version 17, so a rolling deploy of a chain without the flag is safe. |
 | Sealer snapshot with the carry window | A heap member that holds an activation of feature 5 writes version 18: the state of version 16, then the carry window section, then the heap section. Before that record, it writes 14, 15 or 16. A member with the retained file answers feature 5 with `UNSUPPORTED` and stops on version 18. `FormatRegistryTest` checks golden version-18 bytes, and `SealerCarryActivationTest` restores a member at each entry of the switch. | A release changes no snapshot byte until the upgrade transaction of feature 5. A release that reads only up to version 17 stops on version 18, so the preflight refuses a rollback after it. |
 | Sealer `/status` | The admin endpoint reports `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, and `snapshotLatest`, the version of the newest snapshot the member restored or took. | The release gate of a deploy and `just rollback` refuse a sealer release whose `reads_max` is below `snapshotLatest` of any member. That member could not restore its own snapshot after the restart. The check reads `formats.toml` at the revision of the sealer release. The gate checks only a release that changes the sealer job. The check skips a sealer job that Nomad does not know, and refuses while a member does not run. |
-| Rust egress reader | A frame of a kind the reader does not know drops with a warning. Kind 17 (the sealer's rules): an older reader drops it, and only the sequencer reads it. | A sealer can send a new egress kind to the clients of the release before. |
+| Rust egress reader | A frame of a kind the reader does not know drops with a warning. Kind 17 (the sealer's rules) and kind 18 (a refused reference): an older reader drops them, and only the sequencer reads them. A reader of this release skips kind 18. | A sealer can send a new egress kind to the clients of the release before. |
 | Batcher spool | The spool of a layout version lives in `spool/v<N>`. A release opens only its own directory. Every other entry of the root, and a spool whose block does not decode, is dropped with a warning and `kardamom_batcher_spool_dropped_total{reason}`. The range is read again from the sealer. | A spool of either release never stops the batcher. A rollback and a roll forward both start, and the sealer, which keeps every frame above the posted head, serves the dropped range. |
 | Checkpoint manifest and peer fetch | The manifest states `schema_version`, and the peer header `x-checkpoint-schema` carries it. An adopter skips an image of a schema it does not read, before the copy, with a log line and `kardamom_checkpoint_unreadable_schema_skips_total`. An image without a stated schema passes, and says its schema when it opens. | After a schema bump, an executor or a validator of the old release does not adopt a checkpoint of the new release, from its own disk or from a peer. It takes the next checkpoint that it reads. |
 | da-watcher L1 cursor | The reader takes the block number and the hash, and ignores any field after the hash. A line with fewer fields, or a field that does not parse, is still the `l1_cursor_unreadable` halt. | A later release can add a field at the tail, and this release still reads the file after a rollback. |

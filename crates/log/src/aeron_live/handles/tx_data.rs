@@ -1,6 +1,6 @@
 //! `TxData`: per-shard envelope channel (proxy → seq/exec/batcher).
 
-use super::super::{AeronRuntime, PositionedTxData, PubHandle, TxDataSubscription};
+use super::super::{AeronRuntime, PositionedTxData, PubHandle, TxDataItem, TxDataSubscription};
 use crate::aeron_live::handles::simple::declare_channel_handles;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
@@ -48,6 +48,12 @@ impl TxDataSubscriberHandle {
     /// image: the position by which racing sequencers name one message.
     pub fn try_recv_positioned(&mut self) -> Option<PositionedTxData> {
         self.rx.try_recv_positioned()
+    }
+
+    /// [`Self::try_recv_positioned`], with the join of each new image of a
+    /// subscription that reports its joins.
+    pub fn try_recv_item(&mut self) -> Option<TxDataItem> {
+        self.rx.try_recv_item()
     }
 
     /// The frames that wait in the receive queue, for a queue-depth gauge.

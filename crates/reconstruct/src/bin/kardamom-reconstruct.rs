@@ -121,8 +121,12 @@ struct Cli {
     through_block: Option<u64>,
 
     /// Write the seed a sealer cluster with no state starts from: the
-    /// rebuilt head, its canonical end, and the next nonce of each
-    /// sender. The sealer reads it at
+    /// rebuilt head, its canonical end, the next nonce of each sender, and
+    /// the decision rules of the sealer at the head. The rules follow the
+    /// `genesis_features` of `--chain` and the upgrade transactions of
+    /// features 3, 4 and 5 in the epochs of every block from block 1.
+    /// Without `--lockbox`, the epochs hold no upgrade transaction, so the
+    /// rules are those of the genesis alone. The sealer reads it at
     /// `-Dkardamom.cluster.seedSnapshot`. Needs a payload that carries
     /// the canonical cursor through the last block.
     #[arg(long)]
@@ -182,6 +186,34 @@ impl Cli {
             .context("derive the L1 epochs")
     }
 
+    /// The seed that `--sealer-seed` asks for, with the senders of
+    /// `blocks` and the sealer rules at their head, or `None` without the
+    /// flag.
+    fn seed_request(
+        &self,
+        genesis: &kardamom_types::Genesis,
+        blocks: &[ReplayBlock],
+    ) -> anyhow::Result<Option<SeedRequest<'_>>> {
+        self.sealer_seed
+            .as_deref()
+            .map(|path| {
+                anyhow::Ok(SeedRequest {
+                    path,
+                    state_dir: &self.state_dir,
+                    chain_id: genesis.chain_id,
+                    senders: kardamom_reconstruct::SenderOrder::of(
+                        blocks.iter().flat_map(|b| b.txs.iter().map(|t| t.sender)),
+                    ),
+                    rules: kardamom_reconstruct::SealerRules::at_head(
+                        genesis.genesis_features,
+                        blocks,
+                    )
+                    .context("derive the sealer rules")?,
+                })
+            })
+            .transpose()
+    }
+
     /// The payload source the flags name. clap guarantees one of the two.
     fn payload_source(&self) -> anyhow::Result<Source> {
         match (&self.da_proxy, &self.indexer_url) {
@@ -193,13 +225,14 @@ impl Cli {
 }
 
 /// The seed `--sealer-seed` asks for: where to write it, the rebuilt
-/// state it reads, and the senders of the rebuilt blocks in the order they
-/// last sent.
+/// state it reads, the senders of the rebuilt blocks in the order they
+/// last sent, and the decision rules of the sealer at their head.
 struct SeedRequest<'a> {
     path: &'a Path,
     state_dir: &'a Path,
     chain_id: u64,
     senders: kardamom_reconstruct::SenderOrder,
+    rules: kardamom_reconstruct::SealerRules,
 }
 
 impl SeedRequest<'_> {
@@ -210,6 +243,7 @@ impl SeedRequest<'_> {
             chain_id: self.chain_id,
             outcome,
             senders: &self.senders,
+            rules: &self.rules,
         }
         .seed()
         .context("build the sealer seed")?;
@@ -220,6 +254,9 @@ impl SeedRequest<'_> {
             end_tx_idx = seed.end_tx_idx,
             l1_origin = seed.l1_origin,
             senders = seed.senders.len(),
+            decision_version = seed.rules.version(),
+            carry_window = seed.rules.carry_window(),
+            rules = seed.rules.holds_activation(),
             "sealer seed written"
         );
         Ok(())
@@ -234,8 +271,7 @@ async fn main() -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(&cli.chain).context("read genesis TOML")?;
     let genesis: kardamom_types::Genesis = toml::from_str(&raw).context("parse genesis TOML")?;
     genesis.validate().context("validate genesis")?;
-    let (accounts, code) = genesis.to_alloc();
-    let replay_genesis = kardamom_engine::ReplayGenesis::of(&genesis, &accounts, &code);
+    let replay_genesis = kardamom_engine::ReplayGenesis::of(&genesis);
 
     let provider = ProviderBuilder::new()
         .connect(&cli.l1_rpc)
@@ -270,15 +306,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // The seed needs the senders of the rebuilt blocks, in canonical
-    // order. Read them before the replay.
-    let seed = cli.sealer_seed.as_deref().map(|path| SeedRequest {
-        path,
-        state_dir: &cli.state_dir,
-        chain_id: genesis.chain_id,
-        senders: kardamom_reconstruct::SenderOrder::of(
-            blocks.iter().flat_map(|b| b.txs.iter().map(|t| t.sender)),
-        ),
-    });
+    // order, and the sealer rules at their head. Read both before the
+    // replay.
+    let seed = cli.seed_request(&genesis, &blocks)?;
 
     let durability = if cli.no_sync {
         Durability::SafeNoSync

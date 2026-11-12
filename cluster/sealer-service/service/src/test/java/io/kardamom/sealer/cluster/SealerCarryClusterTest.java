@@ -81,6 +81,8 @@ class SealerCarryClusterTest {
             assertArrayEquals(b.canonicalPayload(), carried.get(1));
             assertArrayEquals(c.canonicalPayload(), carried.get(2));
             assertEquals(List.of(0L, 1L, 2L, 3L, 4L, 5L, 6L), egress.relayedIndexes);
+            // The two switches of the rules each ask for a snapshot.
+            ClusterTestHarness.shutDown(cluster);
         }
     }
 

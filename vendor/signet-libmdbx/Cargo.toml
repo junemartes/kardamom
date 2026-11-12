@@ -1,0 +1,52 @@
+# The crates.io 0.8.3 manifest without its test, bench, dev-dependency and
+# profile sections. VENDORED.md lists every change against the archive.
+
+[package]
+edition = "2024"
+rust-version = "1.92"
+name = "signet-libmdbx"
+version = "0.8.3"
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Idiomatic and safe MDBX wrapper"
+homepage = "https://github.com/init4tech/mdbx"
+readme = "README.md"
+keywords = [
+    "mdbx",
+    "lmdb",
+    "database",
+    "key-value",
+    "embedded-database",
+]
+categories = ["database-implementations"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/init4tech/mdbx"
+
+[lib]
+name = "signet_libmdbx"
+path = "src/lib.rs"
+
+[dependencies.bitflags]
+version = "2.10.0"
+
+[dependencies.byteorder]
+version = "1.5.0"
+
+[dependencies.parking_lot]
+version = "0.12.5"
+
+[dependencies.signet-mdbx-sys]
+version = "0.1.0"
+
+[dependencies.smallvec]
+version = "1.15.1"
+
+[dependencies.thiserror]
+version = "2.0.18"
+
+[dependencies.tracing]
+version = "0.1.44"

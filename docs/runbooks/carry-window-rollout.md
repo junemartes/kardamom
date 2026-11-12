@@ -36,7 +36,18 @@ Each metrics line carries the labels of its exporter, such as
 `kardamom_executor_block_number{service="executor",host_id="executor-0"} 42`. So match a gauge name with `[{ ]` after
 it.
 `<egress-node>` is a node that runs an egress instance (`nomad job status egress`). Set every switch in the
-environment of the staging deploy, then deploy.
+environment of the staging deploy, then deploy. Each step keeps the switches and the floor of the steps before it.
+
+Each gate of the carry window runs only when the deploy makes its move:
+
+- a new floor above 0;
+- a reader that does not read the egress yet;
+- a new reader job that starts on the egress;
+- an executor that does not carry yet;
+- a sequencer job with the v2 loop that goes back to the v1 loop.
+
+A later deploy with the same values reads nothing. A gate that refuses changes no job. The messages and what to do
+are in [deploy-rollback.md](deploy-rollback.md).
 
 ## Steps
 
@@ -95,8 +106,15 @@ Checks:
 
 ### 3. Set the sequencer version floor
 
-Deploy with `KARDAMOM_SEALER_VERSION_FLOOR=5`, the lowest `decisionVersion` of the members. The release gate refuses
-a floor above that value, and a floor above 0 while a reader job lacks `relayed_full_ref`.
+Deploy with `KARDAMOM_SEALER_VERSION_FLOOR=5`, the lowest `decisionVersion` of the members. The preflight refuses a
+value other than empty or 0 to 5. When the floor changes to a value above 0, the release gate refuses:
+
+- a sealer job that Nomad does not know, or a member that does not run;
+- a floor above the lowest `decisionVersion` of the members;
+- a target without `KARDAMOM_SEQUENCER_ADMISSION=on`, or a sequencer job without the meta `v2_loop`, or a live
+  allocation of an older job version;
+- an executor, validator, batcher or egress job without the meta `relayed_full_ref`, or a live allocation of an older
+  job version. Without the egress job, the egress passes.
 
 Checks:
 
@@ -124,8 +142,17 @@ Before the deploy:
 - `kardamom_batcher_last_posted_block` (batcher, port 9002) and `validator_committed_block` (validator, port 9006)
   are above the highest `kardamom_egress_ref_frame_max_block`.
 
-Deploy with `KARDAMOM_BATCHER_EGRESS=on` and `KARDAMOM_VALIDATOR_EGRESS=on`. The release gate checks the blocks
-above, and refuses while an egress instance runs a release without the reference mark or does not answer.
+Deploy with `KARDAMOM_BATCHER_EGRESS=on` and `KARDAMOM_VALIDATOR_EGRESS=on`. For each reader whose registered job does
+not carry the meta `reads_egress` yet, the release gate refuses:
+
+- an egress job without the meta `ref_mark`, or a live egress allocation of an older job version;
+- an egress instance that does not report `kardamom_egress_ref_frame_max_index` and `kardamom_egress_ref_frame_max_block`;
+- a reader whose block above is not above the highest `kardamom_egress_ref_frame_max_block`. A reader that does not
+  answer counts as `-1`.
+
+For a reader job that Nomad does not know yet, the release gate refuses the start on the egress while an egress
+instance reports a stored reference (`kardamom_egress_ref_frame_max_index` above 0). Deploy it on the cluster egress
+first.
 
 Checks:
 
@@ -136,7 +163,9 @@ Checks:
 ### 6. Apply the infrastructure change, then turn on the member feed
 
 Apply the change of kardamom-infra (see "What staging needs" below). Then deploy with `KARDAMOM_MEMBER_FEED=on`.
-The sealer rolls member by member, and the shared media driver starts on each sealer node.
+The sealer rolls member by member, and the shared media driver starts on each sealer node. The feed is not a setting
+that every member must match, so it needs no `KARDAMOM_ALLOW_MUST_MATCH`. The sealer job changes, so the release gate
+reads every member: each member must run.
 
 Checks:
 
@@ -145,9 +174,10 @@ Checks:
 
 ### 7. Move the executors to the sealer nodes
 
-Deploy with `KARDAMOM_MEMBER_FEED=on` and `KARDAMOM_EXEC_ON_SEALERS=on`. The executor job moves one executor at a
-time: `executor-2`, then `executor-1`, then `executor-0`. Each step waits for the health check of the moved
-executor.
+Deploy with `KARDAMOM_MEMBER_FEED=on` and `KARDAMOM_EXEC_ON_SEALERS=on`. The preflight refuses
+`KARDAMOM_EXEC_ON_SEALERS=on` without `KARDAMOM_MEMBER_FEED=on`, or with an executor count other than the sealer
+count. The executor job moves one executor at a time: `executor-2`, then `executor-1`, then `executor-0`. Each step
+waits for the health check of the moved executor.
 
 A known short window: the sequencers, the ingresses and the batcher already ask `sealer-<i>` for the nonce queries
 and the block references. Until `executor-1` has moved, only `executor-2` answers them. The window lasts one step of
@@ -167,9 +197,15 @@ Pick the activation time: about 30 minutes ahead, at low load. Then run:
 just sealer-upgrade-check staging 5 <activation_ms>
 ```
 
-It must pass. It refuses unless every member reads snapshot version 18, runs decision version 5 and keeps its frames
-on the heap; the sequencer job has `sealer_version_kept` and `v2_loop`, the batcher and the validator jobs have `reads_egress`, and
-the egress job has `ref_mark`; and every reader cursor is above the highest R of the egress instances.
+It must pass. It refuses unless:
+
+- every member runs, reads snapshot version 18, runs decision version 5, and keeps its frames on the heap
+  (`retainedStore` `heap`);
+- the sequencer job has `sealer_version_kept` and `v2_loop`, the batcher and the validator jobs have `reads_egress`,
+  and the egress job has `ref_mark`, each with every live allocation on that job version;
+- every egress instance reports its reference mark;
+- a batcher and a validator run, and every `kardamom_batcher_egress_cursor_index` and
+  `kardamom_validator_egress_cursor_index` is above the highest `kardamom_egress_ref_frame_max_index`.
 
 ### 9. Send the upgrade transaction on Sepolia
 
@@ -198,10 +234,19 @@ Checks:
 
 ### 11. Move the executors to carry mode, one at a time
 
-Deploy with `KARDAMOM_CARRY_EXECUTORS=0`. After its checks pass, deploy with `0,1`, then with `0,1,2`. The release
-gate refuses an executor unless every member reports `carryWindow` true, its member runs the feed, the executor job
-has `carried_ref_fault`, and its `kardamom_executor_block_number` minus 32 is above the highest
-`kardamom_egress_ref_frame_max_block`.
+Deploy with `KARDAMOM_CARRY_EXECUTORS=0`. After its checks pass, deploy with `0,1`, then with `0,1,2`. The preflight
+refuses a list with an index that repeats or has no member, or a list without `KARDAMOM_EXEC_ON_SEALERS=on` and
+`KARDAMOM_EGRESS=1`, or with `KARDAMOM_EXEC_CURSOR=on`. For each listed executor that does not carry yet, the release
+gate refuses:
+
+- a group `executor-<i>` that does not run on the sealer nodes;
+- an executor job without the meta `carried_ref_fault`;
+- a sealer job that Nomad does not know, a member that does not run, or a member that reports `carryWindow` false;
+- the member `cluster-<i>` that reports the feed `off`;
+- an egress job without `ref_mark`, a live egress allocation of an older job version, or an egress instance that does
+  not report its reference mark;
+- a `kardamom_executor_block_number` of the executor, minus 32, that is not above the highest
+  `kardamom_egress_ref_frame_max_block`.
 
 Checks, for each executor that moved:
 
@@ -222,23 +267,22 @@ Run the canary for 24 hours. Record these values, for the trigger of the retaine
 
 Raise `KARDAMOM_CLUSTER_RETENTION` with a rolling deploy. The rule is `retention >= 60 × (planned tx/s + 0.5)`.
 
-- 131,072 frames covers 2,000 tx/s. That is the cap in frames.
-- The release gate also refuses a value whose frames, at the mean frame size of the members, pass 48 MiB. At a mean
-  of 300 bytes, 131,072 frames (about 39.3 MB) fit. A mean above 384 bytes gives a lower value: the refusal names it.
-- The gate refuses a lower value unless `KARDAMOM_ALLOW_MUST_MATCH=retention`.
+- 131,072 frames covers 2,000 tx/s. That is the cap in frames: the preflight refuses a larger value.
+- When the value changes, the release gate also refuses a value whose frames, at the mean frame size of the members,
+  pass 48 MiB. At a mean of 300 bytes, 131,072 frames (about 39.3 MB) fit. A mean above 384 bytes gives a lower value:
+  the refusal names it.
+- The gate refuses a lower value than the registered sealer unless `KARDAMOM_ALLOW_MUST_MATCH=retention`.
 - A rate above about 2,180 tx/s needs the retained file or a change to the replay path.
 
 ### A rollback after step 9
 
 After the first snapshot of version 18, a sealer member of a release that reads only up to version 17 stops at its
-next start. Nothing in the deploy refuses that rollback yet:
+next start. The release gate of a deploy that changes the sealer job, and `just rollback`, refuse such a rollback.
+They read `snapshotLatest` of each member and compare it with `reads_max` of `[format.sealer-snapshot]` in the
+`formats.toml` of the target release. The messages and what to do are in [deploy-rollback.md](deploy-rollback.md).
 
-- `just rollback` (`tasks/revert.yml`) runs no release gate.
-- A deploy of an older manifest from this checkout reads `reads_max` from the `formats.toml` of this checkout, not of
-  the older release.
-
-The snapshot check of the rollback is in work in #783. Until it ships, check by hand before any rollback of the
-sealer:
+A deploy onto a purged sealer skips that check: Nomad does not know the sealer job. Before such a deploy, check by
+hand:
 
 1. Read `snapshotLatest` of each member:
 
@@ -246,17 +290,18 @@ sealer:
    for i in 0 1 2; do curl -s "http://sealer-$i.node.dc1.consul:40205/status" | jq '{memberId, snapshotLatest}'; done
    ```
 
-2. Read `reads_max` of `[format.sealer-snapshot]` in the `formats.toml` of the release to roll back to:
+2. Read `reads_max` of `[format.sealer-snapshot]` in the `formats.toml` of the release to deploy:
    `git show <revision>:formats.toml`.
-3. If a member reports `snapshotLatest` above that `reads_max`, do not roll the sealer back. Fix forward.
+3. If a member reports `snapshotLatest` above that `reads_max`, do not deploy that release. Fix forward.
 
 ### After a rollback of the egress
 
 An egress of an older release stores references but does not raise its reference mark. So after a rollback of the
 egress, the mark can be too low, and R is not true.
 
-1. The release gate refuses the move of a reader to the egress (step 5), and the upgrade check refuses feature 5
-   (step 8), while any egress allocation runs a job version without the meta `ref_mark`.
+1. The release gate refuses the move of a reader to the egress (step 5) and the move of an executor to carry mode
+   (step 11), and the upgrade check refuses feature 5 (step 8), while any egress allocation runs a job version without
+   the meta `ref_mark`.
 2. Deploy the release of the egress again.
 3. Write down B, the highest `kardamom_executor_block_number` at the time of that deploy. Every frame that the older
    egress stored is at or below B.
@@ -293,8 +338,10 @@ The deploy does not change these. Apply them before step 6.
   activation time for feature 5.
 - Feature 3 or 4 off stops decision version 5, and with it the rules of feature 5. The upgrade check refuses it
   while a member holds feature 5. Turn feature 5 off first, and empty `KARDAMOM_CARRY_EXECUTORS`.
-- Before a fleet rebuild from a seed, set `KARDAMOM_SEALER_VERSION_FLOOR=0`, and empty `KARDAMOM_CARRY_EXECUTORS`. A
-  seeded member runs decision version 3 with no feature. Send features 3, 4 and 5 again.
+- A fleet rebuild from a seed keeps the rules: the seed carries the decision rules at its head, and a seeded member
+  runs them. Check that `kardamom-reconstruct` logs `sealer seed written` with `decision_version=5` and
+  `carry_window=true`. A seed of version 1 holds no rules: before a rebuild from such a seed, set
+  `KARDAMOM_SEALER_VERSION_FLOOR=0`, empty `KARDAMOM_CARRY_EXECUTORS`, and send features 3, 4 and 5 again.
 
 ## Clear
 

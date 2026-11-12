@@ -11,6 +11,11 @@
 //! `magic "KSED" (4) | version (4) | chain_id (8) | block (8) |
 //! end_tx_idx (8) | l2_timestamp (8) | l1_origin (8) | state_root (32) |
 //! sender_count (4) | sender_count * (address (20) | next_nonce (8))`.
+//!
+//! Version 2 adds the decision rules of the sealer at `H` after the
+//! senders: see [`SealerRules`]. The writer writes version 2 only when the
+//! rules hold an activation, so the seed of a chain with no feature of the
+//! sealer keeps the bytes of version 1, which every sealer reads.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -21,11 +26,14 @@ use kardamom_state::{StateEnvBuilder, StateError, StateSnapshot};
 use kardamom_types::{BPosition, StateDatabase};
 
 use crate::ReconstructError;
+use crate::rules::SealerRules;
 
 /// The first four bytes of a seed file.
 const MAGIC: [u8; 4] = *b"KSED";
-/// The layout version. The sealer refuses any other.
+/// The layout version of a seed whose rules hold no activation.
 const VERSION: u32 = 1;
+/// The layout version of a seed with the decision rules after the senders.
+const RULES_VERSION: u32 = 2;
 
 /// One sender the sealer's nonce guard tracks, and the nonce its next
 /// transaction must carry.
@@ -50,6 +58,8 @@ pub struct SealerSeed {
     /// sealer's guard keeps the most recent senders up to its capacity,
     /// so this order decides which senders it keeps.
     pub senders: Vec<SeedSender>,
+    /// The decision rules of the sealer after the boundary of `H`.
+    pub rules: SealerRules,
 }
 
 impl SealerSeed {
@@ -62,9 +72,11 @@ impl SealerSeed {
         let count = u32::try_from(self.senders.len()).map_err(|_| {
             ReconstructError(format!("{} senders do not fit a seed", self.senders.len()))
         })?;
+        let with_rules = self.rules.holds_activation();
+        let version = if with_rules { RULES_VERSION } else { VERSION };
         let header: [&[u8]; 9] = [
             &MAGIC,
-            &VERSION.to_be_bytes(),
+            &version.to_be_bytes(),
             &self.chain_id.to_be_bytes(),
             &self.block.to_be_bytes(),
             &self.end_tx_idx.to_be_bytes(),
@@ -77,11 +89,16 @@ impl SealerSeed {
             .senders
             .iter()
             .flat_map(|s| s.address.iter().copied().chain(s.next_nonce.to_be_bytes()));
+        let rules = with_rules
+            .then(|| self.rules.encode())
+            .into_iter()
+            .flatten();
         Ok(header
             .into_iter()
             .flatten()
             .copied()
             .chain(senders)
+            .chain(rules)
             .collect())
     }
 
@@ -120,13 +137,14 @@ impl SenderOrder {
     }
 }
 
-/// What a seed reads: the rebuilt state, its replay outcome, and the
-/// sender order of the rebuilt blocks.
+/// What a seed reads: the rebuilt state, its replay outcome, the sender
+/// order of the rebuilt blocks, and the decision rules at their head.
 pub struct SeedInput<'a> {
     pub state_dir: &'a Path,
     pub chain_id: u64,
     pub outcome: &'a ReplayOutcome,
     pub senders: &'a SenderOrder,
+    pub rules: &'a SealerRules,
 }
 
 impl SeedInput<'_> {
@@ -159,6 +177,7 @@ impl SeedInput<'_> {
             l1_origin: header.l1_origin,
             state_root,
             senders: self.next_nonces(&snapshot)?,
+            rules: self.rules.clone(),
         })
     }
 

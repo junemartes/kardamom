@@ -45,7 +45,7 @@ impl SealerSession {
     ) -> anyhow::Result<(LiveCluster, watch::Receiver<Option<u64>>)> {
         let mut cfg = self.cluster.to_live();
         if let Some(endpoints) = plane
-            .cluster_ingress_endpoints()
+            .cluster_ingress_endpoints(rt.start_open_limit())
             .await
             .context("read the cluster members from discovery")?
         {

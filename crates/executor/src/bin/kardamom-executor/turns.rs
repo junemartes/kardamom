@@ -76,7 +76,7 @@ impl Verdict {
 
 /// The state of one run at its start.
 pub(crate) struct RunStart {
-    pub(crate) prepared: crate::state::PreparedState,
+    pub(crate) prepared: kardamom_executor::state::PreparedState,
     /// The record that the run publishes before its first receipt.
     pub(crate) rollback: Option<ReceiptRollback>,
     /// The receipt ledger, with `--carry-bytes` only.
@@ -233,7 +233,8 @@ impl Boot {
         let args = &self.args;
         if !args.carry_bytes {
             let prepared =
-                crate::state::prepare_state(args, expected_genesis, BlockRange::ANY, shutdown)?;
+                args.state_config()
+                    .prepare(expected_genesis, BlockRange::ANY, shutdown)?;
             return Ok(RunStart {
                 prepared,
                 rollback: None,
@@ -247,7 +248,9 @@ impl Boot {
             max: r.to_block,
             ..BlockRange::ANY
         });
-        let prepared = crate::state::prepare_state(args, expected_genesis, restore, shutdown)?;
+        let prepared = args
+            .state_config()
+            .prepare(expected_genesis, restore, shutdown)?;
         let whole = markers.start_run()?;
         let ledger = ReceiptLedger::open(markers)?;
         let cursor = kardamom_engine::bin_support::cluster_replay_cursor(&prepared.start);

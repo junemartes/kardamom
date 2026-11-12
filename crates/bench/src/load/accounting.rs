@@ -59,20 +59,8 @@ pub(crate) struct EvalInput<'a> {
     pub recheck: Option<&'a MetricsSnapshot>,
     /// The maximum allowed sealer-minus-executor block gap.
     pub max_gap: u64,
-    /// Fail the run if any accepted transaction is missing a receipt.
+    /// Fail when the completeness policy counts an undelivered transaction.
     pub assert_all_delivered: bool,
-    /// In blocking mode, an accepted `eth_sendRawTransaction` parked
-    /// until the serving ingress observed its receipt. So acceptance
-    /// itself proves the receipt existed. An accepted-but-unresolved
-    /// entry then means the receipt later became unservable, for
-    /// example evicted from the bounded ingress cache, with the durable
-    /// copy still in the executor state database, not that it was
-    /// undelivered. With this set, `missing` downgrades to
-    /// a warning, but only if every product drop counter scraped as
-    /// exactly zero; a nonzero or unscraped counter keeps the hard
-    /// failure. Async (subscribe) mode must not set this: its ack
-    /// proves only publication, not a receipt.
-    pub ack_proves_receipt: bool,
     /// Under the chaos framing, a transient gap or service-down blip,
     /// and a sequencer past-nonce drop from submit-retry noise across
     /// an ingress restart, are informational: a killed component is
@@ -348,32 +336,7 @@ fn completeness_failures(input: &EvalInput<'_>, drops: &DropAccounting) -> Vec<S
     }
     let undelivered = input.undelivered();
     if input.assert_all_delivered && undelivered > 0 {
-        // In blocking mode, acceptance proved the receipt existed, because
-        // the submit parked on it. So if the product counters prove nothing
-        // was dropped anywhere, an unresolved entry is a serving-layer
-        // artifact: the bounded ingress cache evicted it before the feed or
-        // sweeper could observe it, and the durable copy is in the executor
-        // state database. Downgrade to a warning only under that full proof.
-        // A nonzero or unscraped counter keeps the hard failure.
-        let drops_proven_zero = drops.inferred_ingress_drop == Some(0)
-            && drops.seq_dropped == Some(0)
-            && drops.seq_evicted == Some(0)
-            && drops.seq_backpressure == Some(0);
-        // The eviction explanation covers only a thin tail. If a material
-        // fraction of accepted traffic is unresolved, "every counter reads
-        // zero" points to a counter blind spot, not cache eviction. That
-        // case must stay a hard failure.
-        let within_eviction_tail = undelivered <= (c.accepted / 100).max(50);
-        if input.ack_proves_receipt && drops_proven_zero && within_eviction_tail {
-            tracing::warn!(
-                unserved = undelivered,
-                "accepted receipts unresolved by feed/refetch (ingress cache \
-                 eviction); delivery proven by blocking ack + zero drop \
-                 counters — not counted as missing"
-            );
-        } else {
-            failures.push(input.undelivered_failure());
-        }
+        failures.push(input.undelivered_failure());
     }
     if c.bad_status > 0 {
         failures.push(format!("{} receipt(s) had non-0x1 status", c.bad_status));

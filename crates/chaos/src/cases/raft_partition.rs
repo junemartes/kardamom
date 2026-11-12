@@ -1,0 +1,243 @@
+//! A live old leader loses only its outbound Raft peer traffic.
+
+use std::time::Duration;
+
+use anyhow::Context;
+use serde::Serialize;
+
+use crate::cases::combined::Check;
+use crate::harness::Harness;
+use crate::poll::{self, Budget};
+use crate::probes::CLUSTER_TASK;
+use crate::rpc::{RecoveryCause, Rpc};
+
+const CTX: &str = "raft-leader-one-way-partition";
+mod delay;
+mod loss;
+mod rules;
+pub(crate) use delay::PacketDelay;
+pub(crate) use loss::PacketLoss;
+use rules::Rules;
+
+const CHAIN: &str = "KDM_CHAOS_RAFT";
+const PORTS: [u16; 4] = [40201, 40202, 40203, 40204];
+const HOLD: Duration = Duration::from_secs(30);
+
+#[derive(Serialize)]
+struct Proof {
+    leader: u32,
+    term: u64,
+    dropped_packets: u64,
+    election_seconds: f64,
+}
+
+struct Partition {
+    leader: u32,
+    term: u64,
+    node: String,
+    inner: String,
+    started: String,
+    peers: Vec<std::net::Ipv4Addr>,
+}
+
+impl Partition {
+    async fn capture(h: &Harness) -> anyhow::Result<Self> {
+        let elected = h.evidence.cluster_elected(h.knobs.leader_slo).await?;
+        let leader = elected.leader;
+        let victim = h.contract.node(&format!("sealer-{leader}"))?;
+        let node = victim.container.clone();
+        let inner = h
+            .nodes
+            .inner_container(&node, CLUSTER_TASK)
+            .await
+            .context("the current leader has no task container")?;
+        let started = h
+            .nodes
+            .started_at(&node, &inner)
+            .await
+            .context("the leader start time is unavailable")?;
+        let peers = h
+            .contract
+            .of_role("sealer")
+            .into_iter()
+            .filter(|peer| peer.name != victim.name)
+            .map(|peer| peer.ip)
+            .collect();
+        Ok(Self {
+            leader,
+            term: elected.term,
+            node,
+            inner,
+            started,
+            peers,
+        })
+    }
+
+    fn arm_script(&self) -> String {
+        Rules::partition(&self.peers).arm()
+    }
+
+    fn clear_script() -> String {
+        Rules::cleanup(CHAIN)
+    }
+
+    async fn exercise(&self, h: &Harness) -> anyhow::Result<Proof> {
+        h.nodes.exec(&self.node, &self.arm_script()).await?;
+        crate::log(format!(
+            "{CTX}: member {} stays live; its UDP Raft traffic to {:?} is dropped",
+            self.leader, self.peers
+        ));
+        let outcome = poll::until(
+            Budget::new(h.knobs.leader_slo, Duration::from_secs(2)),
+            |_| async move {
+                Ok(h.evidence
+                    .election_once()
+                    .await?
+                    .filter(|elected| elected.leader != self.leader && elected.term > self.term))
+            },
+        )
+        .await?;
+        let (new, elapsed) = outcome
+            .or_fail(|_| crate::chaos_fail!("{CTX}: the surviving quorum elects no new leader"))?;
+        self.assert_live(h, CTX).await?;
+        Self::transfer(h, CTX).await?;
+        tokio::time::sleep(HOLD).await;
+        Self::transfer(h, CTX).await?;
+        self.assert_live(h, CTX).await?;
+        let dropped_packets = self.assert_dropped(h).await?;
+        Check::assert_one_leader(h, CTX).await?;
+        crate::log(format!(
+            "{CTX}: member {} closes term {} after {}s; clients receive receipts with the old member still live",
+            new.leader,
+            new.term,
+            elapsed.as_secs()
+        ));
+        Ok(Proof {
+            leader: new.leader,
+            term: new.term,
+            dropped_packets,
+            election_seconds: elapsed.as_secs_f64(),
+        })
+    }
+
+    async fn transfer(h: &Harness, context: &str) -> anyhow::Result<()> {
+        Rpc::new(&h.rpc_url, h.knobs.chain_id)?
+            .transfer_within(
+                h.knobs.gate_account,
+                Duration::from_secs(60),
+                RecoveryCause::NoQuorum,
+            )
+            .await
+            .with_context(|| format!("{context}: fault blocks the client past its bound"))
+    }
+
+    async fn assert_live(&self, h: &Harness, context: &str) -> anyhow::Result<()> {
+        let inner = h.nodes.inner_container(&self.node, CLUSTER_TASK).await;
+        let started = h
+            .nodes
+            .started_at(&self.node, &self.inner)
+            .await
+            .context("the old leader start time is unavailable")?;
+        anyhow::ensure!(
+            inner.as_deref() == Some(&self.inner) && started == self.started,
+            "{context}: the selected member restarted during the network fault"
+        );
+        let admin = "curl -fsS --max-time 3 http://127.0.0.1:40205/status >/dev/null";
+        h.nodes.exec(&self.node, admin).await?;
+        Ok(())
+    }
+
+    async fn assert_dropped(&self, h: &Harness) -> anyhow::Result<u64> {
+        let script = format!("iptables -w 5 -L {CHAIN} -n -v -x");
+        let rules = h.nodes.exec(&self.node, &script).await?;
+        let packets = Self::dropped(&rules);
+        anyhow::ensure!(
+            packets > 0,
+            "{CTX}: no peer-bound packet hits the partition: {rules}"
+        );
+        crate::log(format!(
+            "{CTX}: the one-way drop rules discard {packets} peer-bound Raft packets"
+        ));
+        Ok(packets)
+    }
+
+    /// Only existence matters; the sum caps at the largest packet count.
+    fn dropped(rules: &str) -> u64 {
+        rules
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let packets = fields.next()?.parse::<u64>().ok()?;
+                fields.next()?;
+                (fields.next()? == "DROP").then_some(packets)
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+
+    async fn run(&self, h: &mut Harness) -> anyhow::Result<()> {
+        let during = self.exercise(h).await;
+        let cleared = h.nodes.exec(&self.node, &Self::clear_script()).await;
+        let report = serde_json::json!({
+            "case": CTX, "direction": "old leader to peers only", "ports": PORTS,
+            "old_leader": self.leader, "old_term": self.term, "proof": during.as_ref().ok(),
+            "node": self.node, "container": self.inner, "started": self.started,
+            "peers": self.peers, "hold_secs": HOLD.as_secs(),
+            "failure": during.as_ref().err().map(|error| format!("{error:#}")),
+            "cleanup_failure": cleared.as_ref().err().map(|error| format!("{error:#}")),
+        });
+        FaultEnd {
+            ctx: CTX,
+            outcome: during,
+            cleared,
+            path: "/tmp/chaos-raft-leader-one-way-partition-fault.json",
+            report,
+        }
+        .conclude(h)
+        .await
+    }
+}
+
+/// The end of one Raft fault: its result, the result of its cleanup,
+/// and the evidence report with the file it goes to.
+struct FaultEnd<'a, T, C> {
+    ctx: &'a str,
+    outcome: anyhow::Result<T>,
+    cleared: anyhow::Result<C>,
+    path: &'a str,
+    report: serde_json::Value,
+}
+
+impl<T, C> FaultEnd<'_, T, C> {
+    /// Log a failed cleanup and save the report. Then fail on the first
+    /// error of the fault, the cleanup and the save. Else prove that
+    /// every member runs again, the chain progresses, and one leader
+    /// rules each term.
+    async fn conclude(self, h: &mut Harness) -> anyhow::Result<()> {
+        if let Err(error) = &self.cleared {
+            crate::log(format!("{}: cleanup fails: {error:#}", self.ctx));
+        }
+        let saved = std::fs::write(self.path, serde_json::to_vec_pretty(&self.report)?);
+        self.outcome?;
+        self.cleared?;
+        saved?;
+        h.assert_count(CLUSTER_TASK, 3, h.knobs.rejoin_slo).await?;
+        h.assert_progress().await?;
+        Check::assert_one_leader(h, self.ctx).await
+    }
+}
+
+pub(crate) async fn leader_one_way(h: &mut Harness) -> anyhow::Result<()> {
+    Partition::capture(h).await?.run(h).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Partition;
+
+    #[test]
+    fn only_counted_drop_rules_prove_the_fault_was_exercised() {
+        let rules = "Chain KDM_CHAOS_RAFT (1 references)\n pkts bytes target prot opt in out source destination\n 0 0 DROP udp -- * * 0.0.0.0/0 1.2.3.4 udp dpt:40201\n 2 120 DROP udp -- * * 0.0.0.0/0 1.2.3.4 udp dpt:40202\n 9 540 ACCEPT all -- * * 0.0.0.0/0 0.0.0.0/0\n";
+        assert_eq!(Partition::dropped(rules), 2);
+        assert_eq!(Partition::dropped(""), 0);
+    }
+}

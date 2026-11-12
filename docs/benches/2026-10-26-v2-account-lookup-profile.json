@@ -1,0 +1,24 @@
+{
+  "baseline_commit": "663d25766a02b01c813ff6fc0b2b67054652e741",
+  "candidate_source_sha256": "65bf3afab3b1875b152bb5bc2e08f2bf448639841ad20643aa3cbc0e04e1f64f",
+  "method": "Five alternating-order release repeats per version, pinned to CPU 8, current-thread Tokio runtime, isolated Prometheus recorder. Each repeat requests and checks 20000 sequential healthy account answers from the same local row through the real cold lookup feed. The baseline uses the identical profile fixture with the original production source. A returned answer gates the next request.",
+  "scope": "Cold account lookup worker; excludes the admission filter, network RPC, executor queries, resident admission and full-chain throughput.",
+  "sample_unit": "One complete request-channel to answer-channel lookup including task scheduling, permits and metrics; throughput includes fixture request, validation and sampling work.",
+  "medians": {
+    "baseline": {
+      "p50_ns": 1960,
+      "p95_ns": 2210,
+      "p99_ns": 2480,
+      "lookups_per_second": 502930.10853206593
+    },
+    "candidate": {
+      "p50_ns": 1920,
+      "p95_ns": 2200,
+      "p99_ns": 2510,
+      "lookups_per_second": 520586.63762903813
+    }
+  },
+  "initial_design": "Adding shutdown selection to every permit acquisition adds about 10 percent to this worker microbenchmark. The final design checks shutdown only while saturated and allocates one retry task only after an unsuccessful first attempt. The healthy first attempt keeps its direct state_of await; retry instrumentation shares a synchronous recorder.",
+  "conclusion": "No speedup claim. Final p50/p95/p99 and throughput are close to the baseline with mixed paired differences. This short shared-host microbenchmark cannot establish a full workload performance guarantee. Full cluster workload evidence and ten green rounds remain pending.",
+  "timers_and_tasks": "Healthy first attempt creates no retry task or retry timer. One failed attempt transfers its existing permit to one retry task; later retries reuse that task and permit."
+}

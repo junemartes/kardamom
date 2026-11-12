@@ -1,7 +1,9 @@
 //! The recorded-cursor check of `hard-executor`: while one executor is
 //! down, the sealer's best recorded cursor keeps moving. The sealer takes
 //! the best cursor over the executors, so one dead executor does not stop
-//! the floor of the record-lag guard.
+//! the floor of the record-lag guard. Under decision version 5 the sealer
+//! drops every recorded cursor and runs no record-lag guard, so on a
+//! carry-born cluster the check is that the sealer holds no cursor.
 
 use crate::harness::Harness;
 use crate::metrics;
@@ -53,14 +55,20 @@ pub(crate) struct BestRecorded {
 }
 
 impl BestRecorded {
-    /// Read the cursor before the injection. With `KARDAMOM_EXEC_CURSOR`
-    /// off, the executors send no cursor, and the check does not apply.
+    /// Read the cursor before the injection. On a carry-born cluster, the
+    /// ingress must show no recorded cursor, and the check ends there.
+    /// With `KARDAMOM_EXEC_CURSOR` off, the executors send no cursor, and
+    /// the check does not apply.
     ///
     /// # Errors
     ///
     /// Returns an error when the cursor is on, but the ingress shows no
-    /// recorded cursor.
+    /// recorded cursor, or when a carry-born sealer holds one.
     pub(crate) async fn read(h: &Harness, ctx: &str) -> anyhow::Result<Self> {
+        if h.knobs.genesis_carry {
+            Self::assert_none(h, ctx).await?;
+            return Ok(Self { before: None });
+        }
         if !h.knobs.exec_cursor {
             crate::log(format!(
                 "{ctx}: KARDAMOM_EXEC_CURSOR is off in the deployed cluster; the recorded-cursor check does not apply"
@@ -75,6 +83,21 @@ impl BestRecorded {
         Ok(Self {
             before: Some(before),
         })
+    }
+
+    /// The sealer of a carry-born cluster took no recorded cursor: the
+    /// ingress shows the head -1 and no lag.
+    async fn assert_none(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+        let cursor = Cursor::read(h).await;
+        anyhow::ensure!(
+            cursor.is_some_and(|c| c.head < 0 && c.lag == 0),
+            "{}: {ctx}: the sealer runs decision version 5, but the ingress shows a recorded cursor or no gauge ({RECORDED_HEAD}, {RECORD_LAG}: {cursor:?})",
+            crate::FAIL_PREFIX
+        );
+        crate::log(format!(
+            "{ctx}: the sealer holds no recorded cursor under decision version 5"
+        ));
+        Ok(())
     }
 
     /// After the kill, wait for the best cursor to pass its value before

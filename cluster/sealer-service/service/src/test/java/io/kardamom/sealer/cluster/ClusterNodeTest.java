@@ -9,12 +9,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.aeron.ChannelUri;
 import io.aeron.driver.NameResolver;
+import io.kardamom.sealer.GenesisFeatures;
+import io.kardamom.sealer.SealerSeed;
+import io.kardamom.sealer.VersionSwitch;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.agrona.SystemUtil;
@@ -225,6 +229,38 @@ final class ClusterNodeTest {
      * ({@link SealerDecisionRulesTest}). A job spec that names a version is
      * replaced by a rolling deploy.
      */
+    @Test
+    void theGenesisFeaturesParseAndAnInvalidSetStopsTheStart() {
+        assertEquals(GenesisFeatures.NONE, ClusterNode.genesisFeatures(null, false, Optional.empty()));
+        assertEquals(GenesisFeatures.CARRY_WINDOW, ClusterNode.genesisFeatures("3,4,5", false, Optional.empty()));
+        final IllegalArgumentException e = assertThrows(
+            IllegalArgumentException.class, () -> ClusterNode.genesisFeatures("4,5", false, Optional.empty()));
+        assertTrue(e.getMessage().contains("kardamom.cluster.genesisFeatures"), e.getMessage());
+    }
+
+    /** A member with the retained file holds no carry window, so feature 5 at genesis stops its start. */
+    @Test
+    void theCarryWindowAtGenesisNeedsTheHeap() {
+        final IllegalStateException e = assertThrows(
+            IllegalStateException.class, () -> ClusterNode.genesisFeatures("3,4,5", true, Optional.empty()));
+        assertTrue(e.getMessage().contains("kardamom.cluster.carryBytes"), e.getMessage());
+        assertEquals(GenesisFeatures.SEALER_V5, ClusterNode.genesisFeatures("3,4", true, Optional.empty()));
+    }
+
+    /** A seed of a chain with the genesis features holds an activation of each; any other seed stops the start. */
+    @Test
+    void aSeedMustHoldEachGenesisFeature() {
+        final Optional<SealerSeed> plain = Optional.of(SealerSeedServiceTest.seed());
+        final Optional<SealerSeed> carryBorn = Optional.of(
+            SealerSeedServiceTest.seed(VersionSwitch.genesis(GenesisFeatures.CARRY_WINDOW)));
+        assertEquals(GenesisFeatures.NONE, ClusterNode.genesisFeatures("", false, plain));
+        assertEquals(GenesisFeatures.CARRY_WINDOW, ClusterNode.genesisFeatures("3,4,5", false, carryBorn));
+        assertEquals(GenesisFeatures.NONE, ClusterNode.genesisFeatures("", false, carryBorn));
+        final IllegalStateException e = assertThrows(
+            IllegalStateException.class, () -> ClusterNode.genesisFeatures("3,4,5", false, plain));
+        assertTrue(e.getMessage().contains("write the seed with the genesis of this chain"), e.getMessage());
+    }
+
     @Test
     void theSealerJobNamesNoDecisionVersion() throws IOException {
         final String job = Files.readString(Path.of(System.getProperty("kardamom.sealerJob")));

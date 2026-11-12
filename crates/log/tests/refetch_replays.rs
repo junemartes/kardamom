@@ -76,6 +76,7 @@ fn spawn_recorder(
         own_instance: "alloc-ingress-a".into(),
         expected_own: 1,
         removal_grace: cfg.discovery.removal_grace(),
+        connect_limit: Duration::ZERO,
         membership,
         stop: stop.clone(),
         runtime: tokio::runtime::Handle::current(),

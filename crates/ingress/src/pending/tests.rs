@@ -25,7 +25,7 @@ async fn quorum_parks_until_receipt_and_watermark_both_arrive() {
     assert_eq!(p.len(), 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn tx_error_releases_parked_client_with_duplicate() {
     let p = Arc::new(PendingReceipts::new(AckPolicy::OnQuorum));
     let sender = Address::repeat_byte(0x55);
@@ -178,11 +178,9 @@ async fn success_arriving_within_the_grace_overrides_a_rejection() {
     assert_eq!(p.len(), 0);
 }
 
-#[tokio::test]
-async fn rejection_releases_after_the_grace_when_no_success_arrives() {
-    // A genuine duplicate, where both replicas reject and no receipt
-    // ever arrives, still reaches the client, only delayed by the grace
-    // window.
+#[tokio::test(start_paused = true)]
+async fn duplicate_releases_at_request_deadline_when_no_success_arrives() {
+    // A duplicate without a receipt reaches the client at the request deadline.
     let p = Arc::new(PendingReceipts::with_error_grace(
         AckPolicy::OnOffer,
         Duration::from_millis(50),
@@ -200,8 +198,20 @@ async fn rejection_releases_after_the_grace_when_no_success_arrives() {
         TxErrorReason::DuplicatedTx { expected_nonce: 9 },
     )
     .await;
-    let err = waiter
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(
+        !waiter.is_finished(),
+        "a duplicate must not shorten the deadline"
+    );
+    p.on_tx_error(
+        sender,
+        nonce,
+        TxErrorReason::DuplicatedTx { expected_nonce: 9 },
+    )
+    .await;
+    let err = tokio::time::timeout(Duration::from_secs(1), waiter)
         .await
+        .expect("repeated errors must not extend the deadline")
         .expect("join")
         .expect_err("no success arrived — the rejection must be released");
     assert!(
@@ -468,7 +478,7 @@ async fn grace_task_does_not_keep_a_disconnected_entry_alive() {
     let sender = Address::repeat_byte(0xB6);
     let wait = p.register(sender, 6);
     let weak = Arc::downgrade(&wait.entry);
-    p.on_tx_error(sender, 6, TxErrorReason::DuplicatedTx { expected_nonce: 9 })
+    p.on_tx_error(sender, 6, TxErrorReason::Evicted { expected_nonce: 9 })
         .await;
     drop(wait); // Disconnect mid-grace.
     assert_eq!(

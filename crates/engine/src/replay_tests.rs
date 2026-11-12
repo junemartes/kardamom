@@ -16,15 +16,18 @@ fn transfer(signer: &PrivateKeySigner, to: Address, nonce: u64, value: u64) -> T
     crate::actor::test_support::legacy(signer, to, nonce, value)
 }
 
-/// The replay chain of a test allocation: chain id 1, no code, no
-/// fee schedule.
-fn test_genesis(accounts: &[AccountChange]) -> ReplayGenesis<'_> {
+/// The replay chain of a test allocation: chain id 1, no fee schedule.
+fn test_genesis(alloc: &GenesisAlloc) -> ReplayGenesis {
     ReplayGenesis {
         chain_id: CHAIN_ID,
-        accounts,
-        code: &[],
+        alloc: alloc.clone(),
         fees: None,
     }
+}
+
+/// The allocation of `genesis_for(address)`: one funded account.
+fn funded(address: Address) -> GenesisAlloc {
+    GenesisAlloc::of_accounts(genesis_for(address))
 }
 
 /// Two blocks of transfers: block 1 sends 100 then 50, block 2 sends 25.
@@ -86,7 +89,7 @@ fn a_payload_cursor_gives_the_live_positions_and_the_same_root() {
     let signer = PrivateKeySigner::random();
     let to1 = address!("00000000000000000000000000000000000A0001");
     let to2 = address!("00000000000000000000000000000000000A0002");
-    let genesis = genesis_for(signer.address());
+    let genesis = funded(signer.address());
 
     let (_plain_dir, plain_env) = fresh_env();
     let plain = replay_blocks(
@@ -126,8 +129,7 @@ fn a_cursor_with_no_room_for_the_blocks_items_is_refused() {
         l1_origin: 0,
     });
     let (_dir, env) = fresh_env();
-    let err =
-        replay_blocks(env, &test_genesis(&genesis_for(signer.address())), blocks).unwrap_err();
+    let err = replay_blocks(env, &test_genesis(&funded(signer.address())), blocks).unwrap_err();
     assert!(
         matches!(
             err,
@@ -155,8 +157,7 @@ fn an_epoch_with_more_deposits_than_the_range_holds_is_refused() {
     });
     blocks[0].l1_epochs = vec![deposit_epoch(40, &[to], 1_000)];
     let (_dir, env) = fresh_env();
-    let err =
-        replay_blocks(env, &test_genesis(&genesis_for(signer.address())), blocks).unwrap_err();
+    let err = replay_blocks(env, &test_genesis(&funded(signer.address())), blocks).unwrap_err();
     assert!(
         matches!(
             err,
@@ -181,7 +182,7 @@ fn reconstructs_state_and_balances_from_ordered_blocks() {
     let (_dir, env) = fresh_env();
     let outcome = replay_blocks(
         env.clone(),
-        &test_genesis(&genesis_for(from)),
+        &test_genesis(&funded(from)),
         two_blocks(&signer, to1, to2),
     )
     .unwrap();
@@ -217,13 +218,13 @@ fn reconstruction_is_deterministic() {
     let (_d2, env2) = fresh_env();
     let r1 = replay_blocks(
         env1,
-        &test_genesis(&genesis_for(from)),
+        &test_genesis(&funded(from)),
         two_blocks(&signer, to1, to2),
     )
     .unwrap();
     let r2 = replay_blocks(
         env2,
-        &test_genesis(&genesis_for(from)),
+        &test_genesis(&funded(from)),
         two_blocks(&signer, to1, to2),
     )
     .unwrap();
@@ -239,8 +240,7 @@ fn empty_block_stream_yields_genesis_root() {
     let signer = PrivateKeySigner::random();
     let from = signer.address();
     let (_dir, env) = fresh_env();
-    let outcome =
-        replay_blocks(env.clone(), &test_genesis(&genesis_for(from)), Vec::new()).unwrap();
+    let outcome = replay_blocks(env.clone(), &test_genesis(&funded(from)), Vec::new()).unwrap();
     assert_eq!(outcome.head_block, 0);
     assert_eq!(outcome.blocks_applied, 0);
     // With no blocks, the root is the seeded genesis root.

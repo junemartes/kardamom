@@ -2,6 +2,7 @@ package io.kardamom.sealer.cluster;
 
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.DecisionRules;
+import io.kardamom.sealer.GenesisFeatures;
 import java.util.OptionalLong;
 
 /**
@@ -83,6 +84,8 @@ final class MemberStatus {
     final boolean startHold;
     /** The retained store and the carry window of the member. */
     final Carry carry;
+    /** The features that the chain runs from its genesis: the setting of the member. */
+    final GenesisFeatures genesis;
 
     MemberStatus(
             final int memberId,
@@ -94,7 +97,7 @@ final class MemberStatus {
             final DecisionRules.View rules,
             final OptionalLong diskFreeBytes) {
         this(memberId, role, election, commitPosition, servicePosition, snapshot, rules, diskFreeBytes, -1L, false,
-            Carry.NONE);
+            Carry.NONE, GenesisFeatures.NONE);
     }
 
     private MemberStatus(
@@ -108,7 +111,8 @@ final class MemberStatus {
             final OptionalLong diskFreeBytes,
             final long leadershipTermId,
             final boolean startHold,
-            final Carry carry) {
+            final Carry carry,
+            final GenesisFeatures genesis) {
         this.memberId = memberId;
         this.role = role;
         this.election = election;
@@ -120,18 +124,25 @@ final class MemberStatus {
         this.leadershipTermId = leadershipTermId;
         this.startHold = startHold;
         this.carry = carry;
+        this.genesis = genesis;
     }
 
     /** This sample with the leadership term of the service and the state of the start hold. */
     MemberStatus withStart(final long term, final boolean held) {
         return new MemberStatus(memberId, role, election, commitPosition, servicePosition, snapshot, rules,
-            diskFreeBytes, term, held, carry);
+            diskFreeBytes, term, held, carry, genesis);
     }
 
     /** This sample with the retained store and the carry window of the service. */
     MemberStatus withCarry(final Carry next) {
         return new MemberStatus(memberId, role, election, commitPosition, servicePosition, snapshot, rules,
-            diskFreeBytes, leadershipTermId, startHold, next);
+            diskFreeBytes, leadershipTermId, startHold, next, genesis);
+    }
+
+    /** This sample with the features that the chain runs from its genesis. */
+    MemberStatus withGenesis(final GenesisFeatures features) {
+        return new MemberStatus(memberId, role, election, commitPosition, servicePosition, snapshot, rules,
+            diskFreeBytes, leadershipTermId, startHold, carry, features);
     }
 
     /**
@@ -146,7 +157,7 @@ final class MemberStatus {
             && commitPosition - servicePosition <= lagBytes;
     }
 
-    /** One JSON line. The values are numbers, enum names, and a boolean. */
+    /** One JSON line. The values are numbers, enum names, booleans, and the setting of the genesis features. */
     String toJson(final long lagBytes) {
         return "{\"memberId\":" + memberId
             + ",\"role\":\"" + role + "\""
@@ -160,6 +171,7 @@ final class MemberStatus {
             + ",\"decisionVersion\":" + rules.version()
             + ",\"decisionActivationOrigin\":" + Long.toUnsignedString(rules.activationOrigin())
             + ",\"decisionActivationMs\":" + Long.toUnsignedString(rules.activationMs())
+            + ",\"genesisFeatures\":\"" + genesis.value() + "\""
             + ",\"retainedStore\":\"" + carry.retainedStore() + "\""
             + ",\"carryWindow\":" + carry.carryWindow()
             + ",\"carryWindowActivationOrigin\":" + Long.toUnsignedString(carry.activationOrigin())

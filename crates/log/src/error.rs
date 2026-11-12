@@ -24,6 +24,11 @@ pub enum LogError {
     #[error("discovery: {0}")]
     CatalogUnavailable(String),
 
+    /// The agent lost a TTL check. Repeating the whole registration
+    /// recreates the check before it is passed again.
+    #[error("discovery: {0}")]
+    CatalogCheckMissing(String),
+
     /// An archive answered, and it does not hold the requested range: it
     /// has no recording of the session, each recording of the session
     /// starts after the range, or the recording before the range ended at
@@ -62,10 +67,13 @@ impl LogError {
     }
 
     /// Whether a later try of the same start-up registration can
-    /// succeed: the catalog agent was slow or down, not wrong. A refused
-    /// permission or a malformed request fails every try.
+    /// succeed: the catalog agent was slow, down, or lost the TTL check.
+    /// A refused permission or a malformed request fails every try.
     #[must_use]
     pub fn is_transient(&self) -> bool {
-        matches!(self, Self::CatalogUnavailable(_))
+        matches!(
+            self,
+            Self::CatalogUnavailable(_) | Self::CatalogCheckMissing(_)
+        )
     }
 }

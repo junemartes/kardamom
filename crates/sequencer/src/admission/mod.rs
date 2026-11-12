@@ -11,7 +11,9 @@
 //!   that the executor publishes for each block, or the answer of a
 //!   lookup for a sender that it has not seen;
 //! - the run of transactions that it forwarded and that no state confirmed
-//!   yet, with their summed worst-case cost;
+//!   yet, with their summed worst-case cost. The filter keeps each of them
+//!   until a state confirms it or the run is lost, so the caller can offer
+//!   it again when the sealer can have lost the offer;
 //! - the transactions that wait for a nonce gap to close.
 //!
 //! A transaction at the next nonce goes out when the balance of the state,
@@ -48,6 +50,7 @@
 //! [`AdmissionConfig::max_senders`], a sweep forgets the idle senders: the
 //! next transaction of one asks for a lookup.
 
+mod refusals;
 mod sender;
 
 use std::collections::VecDeque;
@@ -57,6 +60,7 @@ use std::time::{Duration, Instant};
 use alloy_primitives::map::HashMap;
 use alloy_primitives::{Address, B256, U256};
 
+use self::refusals::MarkRetention;
 use self::sender::SenderState;
 
 /// The limits of the filter.
@@ -113,7 +117,7 @@ pub struct ImagePos {
 
 /// One transaction that the filter may forward. `payload` is what the
 /// caller needs to publish it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Candidate<T> {
     pub sender: Address,
     pub nonce: u64,
@@ -165,25 +169,52 @@ pub enum Refusal {
     /// The sender has too many transactions that wait. `expected_nonce`
     /// is the next nonce of the sender, 0 while its state is unknown.
     TooManyPending { expected_nonce: u64 },
-    /// The filter forwarded or holds a transaction at this nonce already.
+    /// The filter forwarded or holds another transaction at this nonce.
     InFlight { expected_nonce: u64 },
+    /// The filter forwarded or holds this very transaction: the same hash
+    /// at the same nonce. A client sends it again after a timeout. The
+    /// copy drops nothing: the held transaction stays, and its status and
+    /// its receipt follow.
+    Known { expected_nonce: u64 },
     /// The image moved too far past the parked transaction.
     Expired { expected_nonce: u64 },
+}
+
+impl Refusal {
+    /// Whether the refusal drops the transaction. A copy of a held
+    /// transaction ([`Self::Known`]) drops nothing.
+    #[must_use]
+    pub fn drops(self) -> bool {
+        !matches!(self, Self::Known { .. })
+    }
 }
 
 /// One outcome of the filter.
 #[derive(Debug)]
 pub enum Verdict<T> {
-    /// Offer the transaction to the sealer.
-    Forward(Candidate<T>),
+    /// Offer the transaction to the sealer. The generation ties its loss
+    /// marker to this forwarded run.
+    Forward(Candidate<T>, RunGeneration),
     /// Tell the client why the filter did not forward it.
     Reject(Candidate<T>, Refusal),
+    /// A terminal refusal identifies a copy that the sealer cannot order.
+    SealerRefused(Candidate<T>, kardamom_types::TxErrorReason),
+    /// The named reference has no bytes that the sealer can order.
+    DropReference(Candidate<T>),
     /// The filter holds no state of the sender: ask Redis, then the
     /// executor, and give the answer to [`Admission::on_lookup`].
     Lookup(Address),
     /// The filter holds the transaction for a nonce gap or a busy run: it is
     /// in the mempool, so tell the client.
     Accept(Ack),
+}
+
+/// The loss-marker tag of a forwarded run. Rollover removes the older
+/// tags of the sender before the first marker of the new run is recorded.
+#[derive(Clone, Copy, Debug)]
+pub struct RunGeneration {
+    value: u32,
+    reset: bool,
 }
 
 /// A forwarded transaction, in forward order, for the loss expiry. `block`
@@ -193,6 +224,7 @@ struct ForwardMark {
     block: u64,
     sender: Address,
     nonce: u64,
+    generation: u32,
 }
 
 /// A parked transaction, in arrival order within its image, for the park expiry.
@@ -234,7 +266,7 @@ pub struct Admission<T> {
     now: Instant,
 }
 
-impl<T> Admission<T> {
+impl<T: Clone> Admission<T> {
     #[must_use]
     pub fn new(cfg: AdmissionConfig, now: Instant) -> Self {
         Self {
@@ -297,6 +329,17 @@ impl<T> Admission<T> {
             .range_mut(self.stamped..)
             .for_each(|mark| mark.block = block);
         self.stamped = self.forwards.len();
+    }
+
+    /// The test seam of the `floor-seams` feature: whether a row of
+    /// `address` must wait, because the filter holds no state of the
+    /// sender: none came yet, or a rollback cleared it. A sender with
+    /// parked work asks a lookup, once.
+    #[cfg(feature = "floor-seams")]
+    pub(crate) fn waits_for_lookup(&mut self, address: Address, out: &mut Vec<Verdict<T>>) -> bool {
+        self.senders
+            .get_mut(&address)
+            .is_none_or(|sender| sender.waits_for_lookup(address, out))
     }
 
     /// Apply the state of one account: a row, or the answer of a lookup.
@@ -362,13 +405,24 @@ impl<T> Admission<T> {
     }
 
     /// Expire the forwarded runs that no state confirmed within the loss
-    /// window, and the parked transactions that their image left behind or
-    /// that waited longer than the time to live at `now`. Forget the idle
-    /// senders above the sender bound.
+    /// window while publication is active. Expire parked transactions past
+    /// their image window or time to live. Forget idle senders above the
+    /// sender bound.
     pub fn sweep(&mut self, now: Instant, out: &mut Vec<Verdict<T>>) {
+        self.sweep_mode::<false>(now, out);
+    }
+
+    /// Keep forwarded runs while an upstream pause prevents publication.
+    /// Parked expiry and account lookups still run.
+    pub(crate) fn sweep_while_paused(&mut self, now: Instant, out: &mut Vec<Verdict<T>>) {
+        self.sweep_mode::<true>(now, out);
+    }
+
+    fn sweep_mode<const HOLD: bool>(&mut self, now: Instant, out: &mut Vec<Verdict<T>>) {
         self.now = now;
         let window = self.cfg.loss_blocks.get();
-        while self.stamped > 0
+        while !HOLD
+            && self.stamped > 0
             && self
                 .forwards
                 .front()
@@ -385,8 +439,45 @@ impl<T> Admission<T> {
         }
         self.relook_due(now, out);
         if self.senders.len() > self.cfg.max_senders.get() {
-            self.senders.retain(|_, s| !s.is_idle());
+            self.evict_idle();
         }
+    }
+
+    /// A recreated sender starts its tags again. Markers of an evicted
+    /// state cannot name that sender's next forwarded run.
+    #[cold]
+    fn evict_idle(&mut self) {
+        let count = self.senders.len();
+        self.senders.retain(|_, sender| !sender.is_idle());
+        if self.senders.len() == count {
+            return;
+        }
+        let senders = &self.senders;
+        MarkRetention {
+            marks: &mut self.forwards,
+            stamped: &mut self.stamped,
+        }
+        .retain(|mark| senders.contains_key(&mark.sender));
+    }
+
+    /// Empty blocks during an upstream pause do not prove offer loss.
+    /// On resume the retained runs get a full loss window for recovery;
+    /// account rows can still confirm them throughout the pause.
+    #[cold]
+    pub(crate) fn resume_loss_window(&mut self) {
+        let senders = &self.senders;
+        MarkRetention {
+            marks: &mut self.forwards,
+            stamped: &mut self.stamped,
+        }
+        .retain(|mark| {
+            senders
+                .get(&mark.sender)
+                .is_some_and(|sender| sender.holds_loss_mark(mark.nonce, mark.generation))
+        });
+        self.forwards
+            .range_mut(..self.stamped)
+            .for_each(|mark| mark.block = self.block);
     }
 
     fn expire_forward(&mut self, out: &mut Vec<Verdict<T>>) {
@@ -394,7 +485,7 @@ impl<T> Admission<T> {
         // The sweep calls this only while a stamped mark is at the front.
         self.stamped -= 1;
         if let Some(mark) = lost {
-            self.lose(mark.sender, mark.nonce, out);
+            self.lose(mark.sender, mark.nonce, Some(mark.generation), out);
         }
     }
 
@@ -402,18 +493,51 @@ impl<T> Admission<T> {
     /// forget the run, as for a lost transaction, so a resend at the nonce
     /// goes out again.
     pub fn on_refused(&mut self, sender: Address, nonce: u64, out: &mut Vec<Verdict<T>>) {
-        self.lose(sender, nonce, out);
+        self.lose(sender, nonce, None, out);
+    }
+
+    /// The forwarded transaction of `sender` at `nonce` that no state
+    /// confirmed.
+    #[must_use]
+    pub fn unconfirmed_at(&self, sender: Address, nonce: u64) -> Option<&Candidate<T>> {
+        self.senders.get(&sender)?.forwarded_at(nonce)
+    }
+
+    pub(crate) fn unconfirmed_at_mut(
+        &mut self,
+        sender: Address,
+        nonce: u64,
+    ) -> Option<&mut Candidate<T>> {
+        self.senders.get_mut(&sender)?.forwarded_at_mut(nonce)
+    }
+
+    pub(crate) fn retained_mut(&mut self) -> impl Iterator<Item = &mut Candidate<T>> {
+        self.senders
+            .values_mut()
+            .flat_map(SenderState::retained_mut)
+    }
+
+    /// Every forwarded transaction that no state confirmed: the run of each
+    /// sender, in nonce order.
+    pub fn unconfirmed(&self) -> impl Iterator<Item = &Candidate<T>> {
+        self.senders.values().flat_map(SenderState::unconfirmed)
     }
 
     /// The forwarded transaction of `sender` at `nonce` is gone. When the
     /// run still holds it, the run ends, and the parked transactions that
     /// go out from the chain nonce get their marks.
-    fn lose(&mut self, sender: Address, nonce: u64, out: &mut Vec<Verdict<T>>) {
+    fn lose(
+        &mut self,
+        sender: Address,
+        nonce: u64,
+        generation: Option<u32>,
+        out: &mut Vec<Verdict<T>>,
+    ) {
         let from = out.len();
         let freed = self
             .senders
             .get_mut(&sender)
-            .is_some_and(|s| s.on_lost(nonce, &self.cfg, out));
+            .is_some_and(|s| s.on_lost(nonce, generation, &self.cfg, out));
         if freed {
             self.record_forwards(&out[from..]);
         }
@@ -422,15 +546,24 @@ impl<T> Admission<T> {
     /// Mark each forward of `verdicts` for the loss expiry.
     /// The next rows stamp the marks with their block.
     fn record_forwards(&mut self, verdicts: &[Verdict<T>]) {
-        self.forwards
-            .extend(verdicts.iter().filter_map(|v| match v {
-                Verdict::Forward(c) => Some(ForwardMark {
-                    block: 0,
-                    sender: c.sender,
-                    nonce: c.nonce,
-                }),
-                Verdict::Reject(..) | Verdict::Lookup(_) | Verdict::Accept(_) => None,
-            }));
+        for verdict in verdicts {
+            self.record_forward(verdict);
+        }
+    }
+
+    fn record_forward(&mut self, verdict: &Verdict<T>) {
+        let Verdict::Forward(c, generation) = verdict else {
+            return;
+        };
+        if generation.reset {
+            self.remove_forward_marks(c.sender, 0);
+        }
+        self.forwards.push_back(ForwardMark {
+            block: 0,
+            sender: c.sender,
+            nonce: c.nonce,
+            generation: generation.value,
+        });
     }
 }
 
@@ -451,7 +584,7 @@ impl ParkLimit {
 impl ImageMarks {
     /// Expire the parked transactions of this image past `limit`. The mark
     /// of a transaction that left the park drops with no verdict.
-    fn expire<T>(
+    fn expire<T: Clone>(
         &mut self,
         limit: ParkLimit,
         senders: &mut HashMap<Address, SenderState<T>>,
@@ -466,15 +599,18 @@ impl ImageMarks {
         }
     }
 
-    fn expire_front<T>(
+    fn expire_front<T: Clone>(
         &mut self,
         senders: &mut HashMap<Address, SenderState<T>>,
         out: &mut Vec<Verdict<T>>,
     ) {
         let expired = self.parked.pop_front().and_then(|mark| {
             senders.get_mut(&mark.sender).and_then(|s| {
-                s.unpark(mark.nonce, mark.unit)
-                    .map(|c| (c, s.expected_nonce()))
+                let expired = s.unpark(mark.nonce, mark.unit);
+                expired.map(|c| {
+                    s.on_expired();
+                    (c, s.expected_nonce())
+                })
             })
         });
         out.extend(

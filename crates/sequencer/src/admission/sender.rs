@@ -5,14 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use alloy_primitives::U256;
 
-use super::{AccountState, AdmissionConfig, Candidate, Refusal, Verdict};
-
-/// One forwarded transaction that no state confirmed yet.
-#[derive(Clone, Copy)]
-struct Forwarded {
-    /// Its worst-case cost.
-    cost: U256,
-}
+use super::{AccountState, AdmissionConfig, Candidate, Refusal, RunGeneration, Verdict};
 
 /// When a parked transaction gets its ack.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -23,6 +16,10 @@ enum Answer {
     /// When the state of the sender comes: a lookup is out.
     Wait,
 }
+
+#[cfg(test)]
+#[path = "sender_loss_tests.rs"]
+mod tests;
 
 pub(super) struct SenderState<T> {
     /// The newest chain state, `None` until a row or a lookup gives one.
@@ -37,8 +34,12 @@ pub(super) struct SenderState<T> {
     relook_due: bool,
     /// The nonce of the first forwarded transaction that no state confirmed.
     first: u64,
-    /// The forwarded run, from `first` on.
-    forwarded: VecDeque<Forwarded>,
+    /// Loss markers identify this run, including after a nonce is reused.
+    generation: u32,
+    /// The forwarded run, from `first` on. The filter keeps each
+    /// transaction until a state confirms it, so the caller can offer the
+    /// run again when the sealer can have lost an offer.
+    forwarded: VecDeque<Candidate<T>>,
     /// The sum of `forwarded`.
     spend: U256,
     /// The transactions that wait for a nonce gap, or for a lookup.
@@ -53,6 +54,7 @@ impl<T> Default for SenderState<T> {
             from_lookup: false,
             relook_due: false,
             first: 0,
+            generation: 0,
             forwarded: VecDeque::new(),
             spend: U256::ZERO,
             parked: BTreeMap::new(),
@@ -60,7 +62,41 @@ impl<T> Default for SenderState<T> {
     }
 }
 
-impl<T> SenderState<T> {
+impl<T: Clone> SenderState<T> {
+    /// Remove only the copy the refusal names. A forwarded suffix leaves
+    /// with it, so the caller parks it behind the missing nonce.
+    pub(super) fn take_refused(
+        &mut self,
+        nonce: u64,
+        named: impl Fn(&Candidate<T>) -> bool,
+    ) -> Option<super::refusals::RefusedRun<T>> {
+        if self.forwarded_at(nonce).is_some_and(&named) {
+            let at = usize::try_from(nonce.checked_sub(self.first)?).ok()?;
+            let mut suffix = self.forwarded.split_off(at);
+            self.spend = suffix
+                .iter()
+                .fold(self.spend, |spend, c| spend.saturating_sub(c.cost));
+            return suffix
+                .pop_front()
+                .map(|candidate| super::refusals::RefusedRun {
+                    candidate,
+                    suffix,
+                    was_parked: false,
+                });
+        }
+        if self.parked.get(&nonce).is_some_and(named) {
+            return self
+                .parked
+                .remove(&nonce)
+                .map(|candidate| super::refusals::RefusedRun {
+                    candidate,
+                    suffix: VecDeque::new(),
+                    was_parked: true,
+                });
+        }
+        None
+    }
+
     /// Decide one transaction of this sender. Returns whether it parked.
     pub(super) fn offer(
         &mut self,
@@ -82,12 +118,8 @@ impl<T> SenderState<T> {
         }
         let next = self.next_nonce(&state);
         if c.nonce < next {
-            out.push(Verdict::Reject(
-                c,
-                Refusal::InFlight {
-                    expected_nonce: next,
-                },
-            ));
+            let refusal = Self::held_at(self.forwarded_at(c.nonce), &c, next);
+            out.push(Verdict::Reject(c, refusal));
             return false;
         }
         if c.nonce > next {
@@ -151,10 +183,15 @@ impl<T> SenderState<T> {
     pub(super) fn on_lost(
         &mut self,
         nonce: u64,
+        generation: Option<u32>,
         cfg: &AdmissionConfig,
         out: &mut Vec<Verdict<T>>,
     ) -> bool {
-        if !self.holds_forwarded(nonce) {
+        let current = generation.map_or_else(
+            || self.forwarded_at(nonce).is_some(),
+            |generation| self.holds_loss_mark(nonce, generation),
+        );
+        if !current {
             return false;
         }
         self.forwarded.clear();
@@ -193,9 +230,18 @@ impl<T> SenderState<T> {
     /// state is still there and no lookup is out.
     pub(super) fn relook(&mut self) -> bool {
         self.relook_due = false;
-        let ask = self.waits_on_lookup_gap() && !self.asked;
-        self.asked |= ask;
-        ask
+        self.waits_on_lookup_gap() && self.ask_once()
+    }
+
+    /// A parked transaction expired. The lookup of a sender retries only
+    /// for the lifetime of a parked transaction, and a lookup that ends
+    /// without an answer sends nothing back. So at the expiry, the lookup
+    /// that was out has ended, the first lookup and a relook alike: the
+    /// next transaction, or the next relook, asks again. Without this, a
+    /// sender whose lookup found no source stays parked until its rows
+    /// come, and no row comes for a sender that nothing forwards.
+    pub(super) fn on_expired(&mut self) {
+        self.asked = false;
     }
 
     /// Forget the chain state: the next transaction asks for a lookup.
@@ -222,8 +268,28 @@ impl<T> SenderState<T> {
         self.first + self.forwarded.len() as u64
     }
 
-    fn holds_forwarded(&self, nonce: u64) -> bool {
-        nonce >= self.first && nonce - self.first < self.forwarded.len() as u64
+    /// The forwarded transaction at `nonce` that no state confirmed.
+    pub(super) fn forwarded_at(&self, nonce: u64) -> Option<&Candidate<T>> {
+        let at = usize::try_from(nonce.checked_sub(self.first)?).ok()?;
+        self.forwarded.get(at)
+    }
+
+    pub(super) fn forwarded_at_mut(&mut self, nonce: u64) -> Option<&mut Candidate<T>> {
+        let at = usize::try_from(nonce.checked_sub(self.first)?).ok()?;
+        self.forwarded.get_mut(at)
+    }
+
+    pub(super) fn retained_mut(&mut self) -> impl Iterator<Item = &mut Candidate<T>> {
+        self.forwarded.iter_mut().chain(self.parked.values_mut())
+    }
+
+    pub(super) fn holds_loss_mark(&self, nonce: u64, generation: u32) -> bool {
+        self.generation == generation && self.forwarded_at(nonce).is_some()
+    }
+
+    /// The forwarded transactions that no state confirmed, in nonce order.
+    pub(super) fn unconfirmed(&self) -> impl Iterator<Item = &Candidate<T>> {
+        self.forwarded.iter()
     }
 
     /// Drop the first forwarded transaction when the chain is past it.
@@ -231,9 +297,40 @@ impl<T> SenderState<T> {
         if self.forwarded.is_empty() || self.first >= chain_nonce {
             return false;
         }
-        let cost = self.forwarded.pop_front().map_or(U256::ZERO, |f| f.cost);
+        let cost = self.forwarded.pop_front().map_or(U256::ZERO, |c| c.cost);
         self.spend = self.spend.saturating_sub(cost);
         self.first += 1;
+        true
+    }
+
+    /// The refusal of `c` at a nonce where the filter forwarded or holds
+    /// `held`: the same transaction is [`Refusal::Known`], another one
+    /// [`Refusal::InFlight`].
+    fn held_at(held: Option<&Candidate<T>>, c: &Candidate<T>, expected_nonce: u64) -> Refusal {
+        if held.is_some_and(|held| held.tx_hash == c.tx_hash) {
+            Refusal::Known { expected_nonce }
+        } else {
+            Refusal::InFlight { expected_nonce }
+        }
+    }
+
+    /// The test seam of the `floor-seams` feature: whether a row must
+    /// wait, because this sender has no state. That is a sender that no
+    /// row or lookup reached yet, and also a sender whose state a rollback
+    /// cleared. With parked work, the sender asks a lookup once, as
+    /// [`Self::park_for_lookup`] does.
+    #[cfg(feature = "floor-seams")]
+    pub(super) fn waits_for_lookup(
+        &mut self,
+        address: alloy_primitives::Address,
+        out: &mut Vec<Verdict<T>>,
+    ) -> bool {
+        if self.state.is_some() {
+            return false;
+        }
+        if !self.parked.is_empty() && self.ask_once() {
+            out.push(Verdict::Lookup(address));
+        }
         true
     }
 
@@ -247,11 +344,16 @@ impl<T> SenderState<T> {
     ) -> bool {
         let sender = c.sender;
         let parked = self.park(c, Answer::Wait, cfg, out);
-        if parked && !self.asked {
-            self.asked = true;
+        if parked && self.ask_once() {
             out.push(Verdict::Lookup(sender));
         }
         parked
+    }
+
+    /// Mark a lookup as out. Returns whether none was out, so that the
+    /// caller asks: a sender has one lookup out at most.
+    fn ask_once(&mut self) -> bool {
+        !std::mem::replace(&mut self.asked, true)
     }
 
     /// Park a transaction. With [`Answer::Accept`] the client gets its ack
@@ -265,8 +367,9 @@ impl<T> SenderState<T> {
         out: &mut Vec<Verdict<T>>,
     ) -> bool {
         let expected_nonce = self.expected_nonce();
-        if self.parked.contains_key(&c.nonce) {
-            out.push(Verdict::Reject(c, Refusal::InFlight { expected_nonce }));
+        if let Some(held) = self.parked.get(&c.nonce) {
+            let refusal = Self::held_at(Some(held), &c, expected_nonce);
+            out.push(Verdict::Reject(c, refusal));
             return false;
         }
         if self.parked.len() >= cfg.max_parked.get() {
@@ -311,12 +414,23 @@ impl<T> SenderState<T> {
             ));
             return false;
         }
-        if self.forwarded.is_empty() {
+        let reset = if self.forwarded.is_empty() {
             self.first = c.nonce;
-        }
-        self.forwarded.push_back(Forwarded { cost: c.cost });
+            // Rollover removes older tags before the first new loss marker.
+            self.generation = self.generation.wrapping_add(1);
+            self.generation == 0
+        } else {
+            false
+        };
         self.spend = self.spend.saturating_add(c.cost);
-        out.push(Verdict::Forward(c));
+        self.forwarded.push_back(c.clone());
+        out.push(Verdict::Forward(
+            c,
+            RunGeneration {
+                value: self.generation,
+                reset,
+            },
+        ));
         false
     }
 

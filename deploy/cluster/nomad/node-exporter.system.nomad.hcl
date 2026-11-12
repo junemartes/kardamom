@@ -28,6 +28,12 @@ variable "host_hardware" {
   }
 }
 
+variable "node_exporter_image" {
+  type        = string
+  description = "The image reference. The default is the pinned upstream image (upstream_images in ansible/group_vars/all.yml). The container path passes the in-cluster copy."
+  default     = "prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0"
+}
+
 locals {
   collectors = {
     # The pseudo file systems and the container layers are not disks.
@@ -73,7 +79,7 @@ job "node-exporter" {
       driver = "docker"
 
       config {
-        image        = "prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0"
+        image        = var.node_exporter_image
         network_mode = "host"
         pid_mode     = "host"
         # The host root, read-only, with the default mount propagation: a

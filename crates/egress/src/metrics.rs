@@ -11,9 +11,41 @@ pub const WAITING_DROPPED_TOTAL: &str = "kardamom_egress_waiting_dropped_total";
 pub const HEAD_DISTANCE_FRAMES: &str = "kardamom_egress_head_distance_frames";
 
 pub(crate) fn set_head_distance(frames: u64) {
-    // A distance past `u32::MAX` shows as `u32::MAX`: far past any replay
-    // window of the sealer.
-    metrics::gauge!(HEAD_DISTANCE_FRAMES).set(u32::try_from(frames).unwrap_or(u32::MAX));
+    set_distance(HEAD_DISTANCE_FRAMES, frames);
+}
+
+fn set_distance(name: &'static str, distance: u64) {
+    // A distance past `u32::MAX` shows as `u32::MAX`: far past the replay
+    // window of the sealer and past any DA lag.
+    metrics::gauge!(name).set(u32::try_from(distance).unwrap_or(u32::MAX));
+}
+
+/// The blocks between the stored head and the posted head: the newest L2
+/// block that a finalized post on L1 covers. 0 when the posted head is
+/// above the stored head.
+pub const POSTED_DISTANCE_BLOCKS: &str = "kardamom_egress_posted_distance_blocks";
+/// The blocks between the stored head and the floor of the store: the
+/// lower of the posted head and the final head. The store keeps every
+/// block above the floor.
+pub const FLOOR_DISTANCE_BLOCKS: &str = "kardamom_egress_floor_distance_blocks";
+/// The free bytes of the file system of the store, for an unprivileged
+/// writer.
+pub const DISK_FREE_BYTES: &str = "kardamom_egress_disk_free_bytes";
+
+pub(crate) fn set_posted_distance(blocks: u64) {
+    set_distance(POSTED_DISTANCE_BLOCKS, blocks);
+}
+
+pub(crate) fn set_floor_distance(blocks: u64) {
+    set_distance(FLOOR_DISTANCE_BLOCKS, blocks);
+}
+
+pub(crate) fn set_disk_free(bytes: u64) {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a disk stays far below 2^53 bytes; f64 represents the value exactly"
+    )]
+    metrics::gauge!(DISK_FREE_BYTES).set(bytes as f64);
 }
 
 /// The frames of a peer egress that filled the place between the head and
@@ -69,6 +101,18 @@ pub fn describe() {
     metrics::describe_gauge!(
         HEAD_DISTANCE_FRAMES,
         "Canonical indexes between the stored head and the newest record that any executor copy sent."
+    );
+    metrics::describe_gauge!(
+        POSTED_DISTANCE_BLOCKS,
+        "Blocks between the stored head and the newest L2 block that a finalized post on L1 covers."
+    );
+    metrics::describe_gauge!(
+        FLOOR_DISTANCE_BLOCKS,
+        "Blocks between the stored head and the floor of the store: the lower of the posted head and the final head."
+    );
+    metrics::describe_gauge!(
+        DISK_FREE_BYTES,
+        "Free bytes of the file system of the store, for an unprivileged writer."
     );
     metrics::describe_counter!(
         CAUGHT_FRAMES_TOTAL,

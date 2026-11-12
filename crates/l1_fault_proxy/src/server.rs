@@ -226,7 +226,7 @@ impl Conn {
         };
         let faults = self.faults.borrow().clone();
         if let Some(refusal) = faults.refusal_for(caller) {
-            return refuse(refusal, &calls);
+            return self.refuse(refusal, &calls, caller).await;
         }
         let mut reply = match self.upstream.forward(body).await {
             Ok(v) => v,
@@ -234,6 +234,28 @@ impl Conn {
         };
         mutate(&faults, caller, &calls, &mut reply);
         Response::json(200, &reply)
+    }
+
+    async fn refuse(&self, refusal: Refusal, calls: &Value, caller: Caller) -> Response {
+        match refusal {
+            Refusal::RateLimited => rpc_error_response(429, &calls["id"], "rate limited"),
+            Refusal::Down => Self::down(calls),
+            Refusal::Unresponsive => {
+                let mut faults = self.faults.subscribe();
+                let _ = faults
+                    .wait_for(|current| current.refusal_for(caller) != Some(Refusal::Unresponsive))
+                    .await;
+                // A timed-out call never reaches L1 after the fault clears.
+                Self::down(calls)
+            }
+        }
+    }
+
+    fn down(calls: &Value) -> Response {
+        Response {
+            close: true,
+            ..rpc_error_response(503, &calls["id"], "the endpoint is down")
+        }
     }
 }
 
@@ -246,17 +268,6 @@ fn parse_faults(body: &[u8]) -> Result<Faults> {
     }
     .context("the body is not a fault or a list of faults")?;
     Ok(faults.without_none())
-}
-
-/// The reply of a `Down` or a `RateLimit` fault.
-fn refuse(refusal: Refusal, calls: &Value) -> Response {
-    match refusal {
-        Refusal::RateLimited => rpc_error_response(429, &calls["id"], "rate limited"),
-        Refusal::Down => Response {
-            close: true,
-            ..rpc_error_response(503, &calls["id"], "the endpoint is down")
-        },
-    }
 }
 
 /// Apply `faults` to a reply: to each element of a batch, matched to its

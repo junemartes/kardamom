@@ -7,7 +7,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.aeron.cluster.service.Cluster;
+import io.kardamom.sealer.GenesisFeatures;
 import io.kardamom.sealer.SealerSeed;
+import io.kardamom.sealer.VersionSwitch;
 import io.kardamom.sealer.cluster.ClusterStubs.StubCluster;
 import io.kardamom.sealer.cluster.ClusterStubs.StubSession;
 import java.nio.ByteBuffer;
@@ -36,14 +38,20 @@ class SealerSeedServiceTest {
     private static final long HEAD_TIME = 1_700_000_000_000L;
     private static final long ORIGIN = 77L;
 
-    /** A seed at {@code (H, E_H)} with one sender whose next nonce is 5. */
+    /** A seed at {@code (H, E_H)} with one sender whose next nonce is 5, and no decision rules. */
     static SealerSeed seed() {
+        return seed(VersionSwitch.genesis(GenesisFeatures.NONE));
+    }
+
+    /** A seed at {@code (H, E_H)} with one sender whose next nonce is 5, and the decision rules {@code rules}. */
+    static SealerSeed seed(final VersionSwitch rules) {
         final byte[] digest = new byte[SealerSeed.HASH_LEN];
         Arrays.fill(digest, (byte) 0x5E);
         return new SealerSeed(
             new SealerSeed.Head(412_346L, H, E_H, HEAD_TIME, ORIGIN),
             new byte[SealerSeed.HASH_LEN],
             List.of(new SealerSeed.Sender(sender(), 5L)),
+            rules,
             digest);
     }
 

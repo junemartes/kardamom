@@ -23,6 +23,10 @@ advertise {
 server {
   enabled          = true
   bootstrap_expect = {{ nomad_server_expect }}
+
+  # The time after a missed client heartbeat before the node is down and
+  # its allocations are replaced (nomad_heartbeat_grace in group_vars).
+  heartbeat_grace = "{{ nomad_heartbeat_grace }}"
 }
 {% endif %}
 

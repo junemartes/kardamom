@@ -7,6 +7,7 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use crate::harness::Harness;
 use crate::nomad::Streams;
@@ -31,6 +32,11 @@ const FAIL_FAST_EXIT: &str = "aeron client error; exiting";
 /// The text of the Aeron client error on the loss of the media driver:
 /// a driver shutdown or a driver keepalive timeout.
 const DRIVER_LOSS: &str = "MediaDriver";
+/// The causes of a start that finds no live media driver: the client
+/// finds no `CnC` file, or no heartbeat in it. The process exits, and
+/// Nomad starts it again until the new driver runs. These exits follow a
+/// driver loss, so they are part of that loss.
+const DRIVER_WAITS: [&str; 2] = ["CnC file not created", "no driver heartbeat detected"];
 /// How long the counters get to show a refill, and the pause between
 /// two readings, in seconds.
 const REFILL_SECS: u64 = 60;
@@ -62,6 +68,32 @@ impl Refills {
             republished: read(EPOCHS_REPUBLISHED).await,
             published: read(EPOCHS_PUBLISHED).await,
         }
+    }
+
+    /// Wait until the exporter answers both counters. A driver loss
+    /// takes the da-watcher down until the driver restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the exporter does not answer within the
+    /// restart SLO of a media driver.
+    async fn await_answering(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+        let budget = Budget::new(
+            h.knobs.driver_restart_slo(),
+            Duration::from_secs(REFILL_EVERY_SECS),
+        );
+        poll::until(budget, |_| async move {
+            let now = Self::read(h).await;
+            Ok(now.republished.zip(now.published).map(|_| ()))
+        })
+        .await?
+        .or_fail(|t| {
+            crate::chaos_fail!(
+                "{ctx}: the da-watcher exporter did not answer within {}s",
+                t.as_secs()
+            )
+        })
+        .map(|_| ())
     }
 
     pub(super) fn describe(self) -> String {
@@ -148,11 +180,19 @@ pub(super) struct WatcherRuns {
     /// The fail-fast exit lines in the logs of the da-watcher. Each line
     /// carries its timestamp, so a line is one exit.
     exits: BTreeSet<String>,
+    /// The count of the starts that found no live media driver. Their
+    /// cause lines carry no timestamp, so the runs count them.
+    driver_waits: u64,
 }
 
 impl WatcherRuns {
     /// The runs from the allocations `(id, restarts)` and the logs.
     pub(super) fn new(allocs: impl IntoIterator<Item = (String, u64)>, logs: &str) -> Self {
+        let driver_waits = logs
+            .lines()
+            .filter(|line| DRIVER_WAITS.iter().any(|cause| line.contains(cause)))
+            .map(|_| 1_u64)
+            .sum();
         Self {
             allocs: allocs.into_iter().collect(),
             exits: logs
@@ -160,6 +200,7 @@ impl WatcherRuns {
                 .filter(|line| line.contains(FAIL_FAST_EXIT))
                 .map(|line| line.trim().to_string())
                 .collect(),
+            driver_waits,
         }
     }
 
@@ -188,6 +229,8 @@ impl WatcherRuns {
 
     /// The verdict on the restarts since `base`: `None` with no restart,
     /// a note when a driver loss explains each restart, else an error.
+    /// A start that found no live driver after a loss is part of that
+    /// loss.
     pub(super) fn judge(&self, base: &Self) -> Result<Option<String>, String> {
         let restarts = self.restarts_since(base);
         let exits: Vec<&str> = self
@@ -195,11 +238,18 @@ impl WatcherRuns {
             .difference(&base.exits)
             .map(String::as_str)
             .collect();
-        let losses: u64 = exits
+        let driver_losses: u64 = exits
             .iter()
             .filter(|line| line.contains(DRIVER_LOSS))
             .map(|_| 1)
             .sum();
+        // Nomad never lowers the counts in one log.
+        let waits = self.driver_waits.saturating_sub(base.driver_waits);
+        let losses = match driver_losses {
+            0 => 0,
+            // A count of log lines never comes near u64::MAX.
+            n => n.saturating_add(waits),
+        };
         let allocs: Vec<String> = self
             .allocs
             .iter()
@@ -207,7 +257,7 @@ impl WatcherRuns {
             .collect();
         let note = format!(
             "the da-watcher restarted {restarts} times during the case, and it is no class of the case \
-             (allocations: {}; fail-fast exits: {})",
+             (allocations: {}; starts with no live driver: {waits}; fail-fast exits: {})",
             allocs.join(", "),
             if exits.is_empty() {
                 "none".to_string()
@@ -242,8 +292,11 @@ impl RefillBaseline {
 
     /// The counters show a refill within the budget, and a driver loss
     /// explains each restart of the da-watcher. A restart is reported as
-    /// a warning.
+    /// a warning. A driver loss on the aux node restarts the da-watcher
+    /// once the new driver runs, so the watch starts when its exporter
+    /// answers.
     pub(super) async fn assert(&self, h: &Harness, ctx: &str) -> anyhow::Result<()> {
+        Refills::await_answering(h, ctx).await?;
         let outcome = RefillWatch::new(self.counters).watch(h).await?;
         let restarts = WatcherRuns::read(h)
             .await?

@@ -5,6 +5,8 @@ use crate::nomad::Streams;
 
 use super::Victim;
 
+/// The log lines of one heal on the victim's node, with their counts
+/// before the injection.
 pub(super) struct Repair {
     node: String,
     job: &'static str,
@@ -13,10 +15,12 @@ pub(super) struct Repair {
 }
 
 impl Repair {
+    /// The counts of `needles` in the logs of the victim on `container`.
     pub(super) async fn capture(
         h: &Harness,
         victim: Victim,
         container: &str,
+        needles: [&'static str; 3],
     ) -> anyhow::Result<Self> {
         let node = h
             .contract
@@ -29,11 +33,7 @@ impl Repair {
         let mut repair = Self {
             node,
             job: victim.kind(),
-            needles: [
-                "cluster replay unavailable",
-                "resync prepared: peer checkpoint staged",
-                victim.restored_needle(),
-            ],
+            needles,
             baseline: [0; 3],
         };
         repair.baseline = repair.counts(h).await?;

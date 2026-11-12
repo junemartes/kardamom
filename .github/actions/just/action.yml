@@ -1,0 +1,16 @@
+---
+name: just
+description: >-
+  Install just 1.49.0 from its release tarball, pinned by SHA-256. The
+  download needs no GitHub REST API: extractions/setup-just reads the
+  releases API, and an outage of that API fails every job that needs it.
+runs:
+  using: composite
+  steps:
+    # The SHA-256 is the line for just-1.49.0-x86_64-unknown-linux-musl.tar.gz
+    # in the SHA256SUMS asset of the release.
+    - uses: ./.github/actions/release-tarball
+      with:
+        name: just
+        url: https://github.com/casey/just/releases/download/1.49.0/just-1.49.0-x86_64-unknown-linux-musl.tar.gz
+        sha256: 05eb2f068b641b06e5b318796c2e27d4dcca608e65b34329a08c1b9f582611bd

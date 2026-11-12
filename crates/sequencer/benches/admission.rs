@@ -75,7 +75,7 @@ impl Lane {
         let forwarded = self
             .out
             .iter()
-            .filter(|v| matches!(v, Verdict::Forward(_)))
+            .filter(|v| matches!(v, Verdict::Forward(..)))
             .count();
         self.block += 1;
         let rows = std::mem::take(&mut self.rows);

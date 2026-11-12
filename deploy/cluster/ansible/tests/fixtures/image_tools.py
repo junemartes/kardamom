@@ -29,9 +29,10 @@ if Path(sys.argv[0]).name == 'cosign':
     fail_at(args[0])
     if args[0] == 'sign-blob':
         manifest = Path(args[-1]).read_text()
-        # One record per image: aeron, redis, the thirteen services of
-        # tests/test_images.py, cluster, the light client.
-        assert len(manifest.splitlines()) == 17, manifest
+        # One record per pushed image.
+        calls = [json.loads(line)[1] for line in (state_dir / 'calls.jsonl').read_text().splitlines()]
+        pushes = [c for c in calls if c[0] == 'push' or c[2:4] == ['docker', 'push']]
+        assert len(manifest.splitlines()) == len(pushes), manifest
         Path(args[args.index('--bundle') + 1]).write_text(manifest)
     sys.exit(0)
 

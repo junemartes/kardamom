@@ -11,6 +11,13 @@ pub enum SequencerError {
     #[error("ingress source disconnected")]
     IngressDisconnected,
 
+    /// The cluster session changed since the last offer of a fenced
+    /// publisher, and the publisher offered nothing. The old session can
+    /// have lost the offers that it took. Only a fenced publisher returns
+    /// it.
+    #[error("the cluster session changed: offer the unconfirmed refs again")]
+    SessionChanged,
+
     #[error("malformed tx frame: {0}")]
     MalformedFrame(String),
 
@@ -55,6 +62,7 @@ impl SequencerError {
             }
             Self::Backpressure
             | Self::IngressDisconnected
+            | Self::SessionChanged
             | Self::MalformedFrame(_)
             | Self::EncodeFailed(_)
             | Self::Config(_) => None,

@@ -196,7 +196,7 @@ impl SkipProbe {
 }
 
 /// A skipped transaction uses its nonce only after the upgrade
-/// transaction of [`FEATURE_SEALER_V3`].
+/// transaction of [`FEATURE_SEALER_V3`]. Returns the block of that upgrade.
 ///
 /// # Errors
 /// Returns an error when a sequencer does not report decision version 3,
@@ -207,7 +207,7 @@ pub async fn skip_uses_its_nonce_only_after_the_upgrade(
     t: &Target,
     l1: &L1,
     p: Params,
-) -> Result<()> {
+) -> Result<u64> {
     let signers = l2::dev_signers_through(p.funder)?;
     let funder = &signers[p.funder];
 
@@ -221,7 +221,7 @@ pub async fn skip_uses_its_nonce_only_after_the_upgrade(
     before.stays_stuck(t, REFUSED_FOR).await?;
 
     // --- The upgrade transaction, active at once. ---------------------------
-    upgrade_and_await(t, l1, FEATURE_SEALER_V3, 0).await?;
+    let upgrade_block = upgrade_and_await(t, l1, FEATURE_SEALER_V3, 0).await?;
 
     // --- After the upgrade: the skip uses its nonce. ------------------------
     let after = SkipProbe::funded(t, funder, 0x72).await?;
@@ -230,5 +230,6 @@ pub async fn skip_uses_its_nonce_only_after_the_upgrade(
         "a skip after the upgrade uses its nonce"
     );
     after.moves_on(t).await?;
-    t.assert_validator_verdict("S13d").await
+    t.assert_validator_verdict("S13d").await?;
+    Ok(upgrade_block)
 }

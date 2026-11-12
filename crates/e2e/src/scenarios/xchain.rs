@@ -343,16 +343,12 @@ impl<'a> DeliveryRun<'a> {
         Ok(())
     }
 
-    /// The durable lane cursor advanced to 3 (seq 3 is still pending: its
-    /// origin block never closed).
-    fn assert_cursor_holds_3(&self) -> Result<()> {
-        let cursor = std::fs::read_to_string(self.cursor_file)
-            .with_context(|| format!("read cursor file {}", self.cursor_file.display()))?;
-        anyhow::ensure!(
-            cursor.trim() == "3",
-            "lane cursor file must hold 3 (one past the last published seq), got {cursor:?}"
-        );
-        Ok(())
+    /// The durable lane cursor advanced to 3, one past the last published
+    /// seq (seq 3 is still pending: its origin block never closed).
+    async fn assert_cursor_holds_3(&self) -> Result<()> {
+        await_cursor(self.cursor_file, "the lane", "3", |c| c == 3)
+            .await
+            .map(|_| ())
     }
 
     /// The watcher's published-record count, and the sequencer relay
@@ -547,24 +543,51 @@ fn assert_delivery_logs(receipts: &[serde_json::Value]) -> Result<()> {
     Ok(())
 }
 
-/// Read a durable lane cursor file, and require it be at least `min`.
-/// `what` names what the cursor tracks, for the error message.
+/// How long a lane cursor file may lag the delivery that it records. The
+/// watcher persists the cursor after its publish returns, with a file and
+/// a directory fsync, while the publish already travels to the sealer and
+/// the executor. On a loaded host the delivery can settle before the
+/// rename, so the file can be missing or stale for a moment.
+const CURSOR_PERSIST_BOUND: Duration = Duration::from_secs(15);
+
+/// The value of a durable lane cursor file, `None` while the file is
+/// missing or does not parse: the watcher has not renamed it into place.
+fn read_cursor(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Wait until a durable lane cursor file holds a value that `accept`
+/// takes, within [`CURSOR_PERSIST_BOUND`]. `what` names what the cursor
+/// tracks, and `want` the accepted values, for the error message.
+async fn await_cursor(
+    path: &Path,
+    what: &str,
+    want: &str,
+    accept: impl Fn(u64) -> bool,
+) -> Result<u64> {
+    crate::harness::metrics::poll_until(
+        &format!("{what} cursor {} holds {want}", path.display()),
+        CURSOR_PERSIST_BOUND,
+        Duration::from_millis(100),
+        async || Ok(read_cursor(path).filter(|c| accept(*c))),
+    )
+    .await
+    // The probe never fails, so an error is the timeout. Read the file
+    // again here, so that the message shows the last value and not the
+    // value before the poll.
+    .with_context(|| format!("last cursor value: {:?}", read_cursor(path)))
+}
+
+/// Wait until a durable lane cursor file is at least `min`. `what` names
+/// what the cursor tracks, for the error message.
 ///
 /// # Errors
-/// Returns an error when the file cannot be read or parsed, or when the
-/// cursor is below `min`.
-pub(crate) fn assert_cursor_at_least(path: &Path, min: u64, what: &str) -> Result<()> {
-    let cursor = std::fs::read_to_string(path)
-        .with_context(|| format!("read {what} cursor {}", path.display()))?;
-    let cursor_seq: u64 = cursor
-        .trim()
-        .parse()
-        .with_context(|| format!("parse {what} cursor {cursor:?}"))?;
-    anyhow::ensure!(
-        cursor_seq >= min,
-        "{what} cursor must be >= {min}, got {cursor_seq}"
-    );
-    Ok(())
+/// Returns an error when the file does not reach `min` within
+/// [`CURSOR_PERSIST_BOUND`].
+pub(crate) async fn assert_cursor_at_least(path: &Path, min: u64, what: &str) -> Result<()> {
+    await_cursor(path, what, &format!(">= {min}"), |c| c >= min)
+        .await
+        .map(|_| ())
 }
 
 /// The happy path: 3 messages across 2 origin blocks, delivered through the
@@ -606,7 +629,7 @@ pub async fn delivery(
     run.nudge_until_settled().await?;
     run.assert_contract_state(receiver, script.payload_word)?;
     run.assert_callback_response(&script.cb)?;
-    run.assert_cursor_holds_3()?;
+    run.assert_cursor_holds_3().await?;
     run.assert_watcher_and_relay_metrics(&baseline).await?;
 
     Ok(DeliveryOutcome {

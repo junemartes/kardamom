@@ -4,7 +4,7 @@
 //! splitters used by tests and the in-Rust service mock. Frame layouts
 //! are documented on the `KIND_*` constants in the parent module.
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::Address;
 #[cfg(any(test, feature = "testing"))]
 use kardamom_types::DepositRef;
 use kardamom_types::TxRef;
@@ -268,17 +268,11 @@ impl FeatureActivation {
     /// call wins on L2. `None` when the epoch schedules no such feature.
     #[must_use]
     pub fn of(epoch: &EpochRecord, feature_id: u64) -> Option<Self> {
-        epoch
-            .deposits
-            .iter()
-            .rev()
-            .filter_map(FeatureSchedule::of_deposit)
-            .find(|schedule| schedule.feature_id == U256::from(feature_id))
-            .map(|schedule| Self {
-                l1_origin: epoch.l1_number,
-                feature_id,
-                activation_ms: schedule.activation_timestamp,
-            })
+        FeatureSchedule::last_in(epoch, feature_id).map(|schedule| Self {
+            l1_origin: epoch.l1_number,
+            feature_id,
+            activation_ms: schedule.activation_timestamp,
+        })
     }
 
     /// The frame `[kind:u8 = 11][l1_origin:u64][feature_id:u64][activation_ms:u64]`.

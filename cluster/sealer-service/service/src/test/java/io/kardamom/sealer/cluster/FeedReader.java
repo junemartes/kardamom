@@ -5,6 +5,7 @@ import io.aeron.ExclusivePublication;
 import io.aeron.FragmentAssembler;
 import io.aeron.Subscription;
 import io.aeron.logbuffer.FragmentHandler;
+import io.aeron.logbuffer.FrameDescriptor;
 import io.aeron.logbuffer.Header;
 import io.aeron.test.Tests;
 import java.nio.ByteOrder;
@@ -18,7 +19,8 @@ import org.agrona.concurrent.UnsafeBuffer;
 /**
  * The executor end of a member feed in a test: a subscription to the feed
  * and a publication on the control stream, on the media driver of one
- * member. It keeps every frame that it polls, in order.
+ * member. It keeps every frame that it polls, in order, and the block of
+ * the last boundary that it polls or drains.
  */
 final class FeedReader implements AutoCloseable {
 
@@ -50,8 +52,10 @@ final class FeedReader implements AutoCloseable {
     private final Subscription feed;
     private final ExclusivePublication control;
     private final FragmentAssembler assembler = new FragmentAssembler(this::onFragment);
-    private final FragmentHandler dropper = (buffer, offset, length, header) -> { };
+    private final FragmentHandler dropper = this::noteBoundary;
     private final List<Frame> frames = new ArrayList<>();
+    /** The block of the last boundary frame so far, 0 before the first. */
+    private long lastBoundary;
 
     FeedReader(final String aeronDir) {
         this.aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(aeronDir));
@@ -85,9 +89,14 @@ final class FeedReader implements AutoCloseable {
         }
     }
 
-    /** Poll once, and drop the frames: a reader that only keeps the feed moving. */
+    /** Poll once, and drop the frames: a reader that only keeps the feed moving. It keeps the last boundary. */
     void drain() {
         feed.poll(dropper, 64);
+    }
+
+    /** The block of the last boundary frame that this reader polled or drained, 0 before the first. */
+    long lastBoundary() {
+        return lastBoundary;
     }
 
     /** The frames so far. */
@@ -99,6 +108,21 @@ final class FeedReader implements AutoCloseable {
         final byte[] bytes = new byte[length];
         buffer.getBytes(offset, bytes);
         frames.add(new Frame(bytes));
+        keepBoundary(buffer, offset);
+    }
+
+    /** Keep the block of a drained frame. Only the first fragment of a frame starts with its kind. */
+    private void noteBoundary(final DirectBuffer buffer, final int offset, final int length, final Header header) {
+        if ((header.flags() & FrameDescriptor.BEGIN_FRAG_FLAG) != 0) {
+            keepBoundary(buffer, offset);
+        }
+    }
+
+    /** Keep the block of the frame at {@code offset} when it is a boundary. */
+    private void keepBoundary(final DirectBuffer buffer, final int offset) {
+        if (buffer.getByte(offset) == SealerWire.EGRESS_KIND_BOUNDARY) {
+            lastBoundary = buffer.getLong(offset + Byte.BYTES, ByteOrder.LITTLE_ENDIAN);
+        }
     }
 
     @Override

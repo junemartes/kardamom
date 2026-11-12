@@ -1,0 +1,35 @@
+---
+- name: Prepare node software without starting or joining any service
+  hosts: all
+  connection: local
+  become: false
+  gather_facts: true
+  vars_files:
+    - group_vars/all.yml
+    - node-software.yml
+  tasks:
+    - name: Install the common packages
+      ansible.builtin.import_role:
+        name: common
+        tasks_from: install
+
+    - name: Install Docker
+      ansible.builtin.import_role:
+        name: docker
+        tasks_from: install
+
+    - name: Install Consul
+      ansible.builtin.import_role:
+        name: consul
+        tasks_from: install
+
+    - name: Install Nomad
+      ansible.builtin.import_role:
+        name: nomad
+        tasks_from: install
+
+    - name: Record the installed software contract
+      ansible.builtin.copy:
+        dest: "{{ node_software_marker_path }}"
+        content: "{{ {'version': 1, 'fingerprint': node_software_fingerprint, 'software': node_software_contract} | to_nice_json }}\n"
+        mode: "0644"

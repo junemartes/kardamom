@@ -96,7 +96,7 @@ where
         if !self.cfg.admission_checks {
             return Ok(());
         }
-        self.cached_view(v.sender)
+        self.cached_view::<false>(v.sender)
             .await
             .map_or(Ok(()), |view| v.check_nonce(&view))
     }

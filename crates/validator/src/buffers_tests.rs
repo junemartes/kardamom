@@ -185,6 +185,77 @@ fn a_timeout_with_inserts_keeps_the_wait() {
     h.join().unwrap();
 }
 
+// A restart under load: the first keys that arrive are near the head,
+// closer than the catch-up horizon, and inserts keep coming, so the
+// buffer is never quiet. A key below every arrival went out before the
+// subscription started, so its take returns at once.
+#[test]
+fn a_key_below_every_arrival_does_not_wait() {
+    let bals = BalBuffer::new();
+    (10..14).for_each(|block| insert(&bals, R1, block, 100));
+    let start = std::time::Instant::now();
+    let got = bals.take(5, Duration::from_secs(5));
+    assert!(got.current.is_empty());
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "a key below the arrival floor must not wait: {:?}",
+        start.elapsed()
+    );
+}
+
+// The same rule holds for the receipts, whose catch-up horizon is 4096
+// records: a restarted validator is closer to the head than that.
+#[test]
+fn a_receipt_below_every_arrival_does_not_wait() {
+    let buf = ReceiptBuffer::new();
+    (100..104).for_each(|idx| {
+        buf.receipts.insert(
+            BPosition::from_index(idx),
+            R1,
+            receipt(idx, true, 21_000, 0xab),
+        );
+    });
+    let start = std::time::Instant::now();
+    let got = buf
+        .receipts
+        .take(BPosition::from_index(50), Duration::from_secs(5));
+    assert!(got.current.is_empty());
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "a receipt below the arrival floor must not wait: {:?}",
+        start.elapsed()
+    );
+}
+
+// A key at or above the arrival floor can still come, so its take waits
+// for it.
+#[test]
+fn a_key_above_the_arrival_floor_waits() {
+    let bals = BalBuffer::new();
+    (10..14).for_each(|block| insert(&bals, R1, block, 100));
+    let bals2 = bals.clone();
+    let h = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        insert(&bals2, R2, 15, 100);
+    });
+    let got = bals.take(15, Duration::from_secs(2));
+    assert_eq!(got.current.len(), 1, "the take must wait above the floor");
+    h.join().unwrap();
+}
+
+// A slow replica sends a key below the floor after the consumer passed
+// it. The key lowers the floor, and the consumer gets it as a late
+// entry with its next take.
+#[test]
+fn a_late_key_below_the_floor_is_handed_over() {
+    let bals = BalBuffer::new();
+    (10..14).for_each(|block| insert(&bals, R1, block, 100));
+    assert!(bals.take(8, Duration::from_secs(5)).current.is_empty());
+    insert(&bals, R2, 8, 100);
+    let got = bals.take(9, Duration::from_millis(10));
+    assert_eq!(got.late.len(), 1, "the late key goes to the consumer");
+}
+
 // One wrong key far ahead is not a live head. It does not turn the
 // catch-up skip on, so the consumer still waits for its own key.
 #[test]
@@ -380,4 +451,96 @@ fn a_rollback_withdraws_every_bal_above_its_block() {
         [(U256::from(10u64), vec![R1])]
     );
     assert_eq!(bals.len(), 0, "block 3 is withdrawn");
+}
+
+/// A discarded tail is unavailable even while unrelated live results arrive.
+#[test]
+fn an_evicted_result_near_the_live_head_does_not_wait_again() {
+    let bals = BalBuffer::with_cap(NonZeroUsize::new(8).unwrap());
+    (0..=12).for_each(|block| insert(&bals, R1, block, block));
+    (0..8).for_each(|block| {
+        assert_eq!(bals.take(block, Duration::ZERO).current.len(), 1);
+    });
+    let producer = Arc::clone(&bals);
+    let thread = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(10));
+        insert(&producer, R1, 13, 13);
+        std::thread::sleep(Duration::from_millis(10));
+        insert(&producer, R1, 14, 14);
+    });
+    let started = std::time::Instant::now();
+    let taken = bals.take(12, Duration::from_secs(2));
+    assert!(
+        taken.current.is_empty(),
+        "the discarded result stays unverified"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "known eviction must not consume its wait window"
+    );
+    thread.join().unwrap();
+}
+
+#[test]
+fn a_reinserted_evicted_result_is_still_checked() {
+    let bals = BalBuffer::with_cap(NonZeroUsize::new(2).unwrap());
+    (1..=3).for_each(|block| insert(&bals, R1, block, block));
+    assert_eq!(bals.take(1, Duration::ZERO).current.len(), 1);
+    insert(&bals, R2, 3, 42);
+    assert_eq!(
+        balances(&bals.take(3, Duration::ZERO)),
+        [(U256::from(42), vec![R2])]
+    );
+}
+
+#[test]
+fn eviction_evidence_is_bounded_and_still_proves_an_older_backlog() {
+    let bals = BalBuffer::with_cap(NonZeroUsize::new(8).unwrap());
+    (0..=100).for_each(|block| insert(&bals, R1, block, block));
+    {
+        let inner = bals.core.inner.lock().unwrap();
+        assert_eq!(inner.map.len(), 8);
+        assert_eq!(inner.evicted.len(), 8);
+    }
+    (0..8).for_each(|block| {
+        assert_eq!(bals.take(block, Duration::ZERO).current.len(), 1);
+    });
+    let started = std::time::Instant::now();
+    assert!(bals.take(20, Duration::from_secs(2)).current.is_empty());
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn a_withdrawal_forgets_evictions_and_waits_for_replacement_data() {
+    let bals = BalBuffer::with_cap(NonZeroUsize::new(2).unwrap());
+    (1..=3).for_each(|block| insert(&bals, R1, block, block));
+    bals.take(1, Duration::ZERO);
+    bals.withdraw(|_, _, _| false);
+    let producer = Arc::clone(&bals);
+    let thread = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        insert(&producer, R2, 3, 42);
+    });
+    assert_eq!(
+        balances(&bals.take(3, Duration::from_secs(2))),
+        [(U256::from(42), vec![R2])]
+    );
+    thread.join().unwrap();
+}
+
+#[test]
+fn one_evicted_key_far_ahead_does_not_skip_a_live_result() {
+    let bals = BalBuffer::with_cap(NonZeroUsize::MIN);
+    insert(&bals, R1, 0, 0);
+    insert(&bals, R1, 10_000, 10_000);
+    let producer = Arc::clone(&bals);
+    let thread = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        insert(&producer, R2, 1, 42);
+    });
+    assert_eq!(
+        balances(&bals.take(1, Duration::from_secs(2))),
+        [(U256::from(42), vec![R2])]
+    );
+    thread.join().unwrap();
 }

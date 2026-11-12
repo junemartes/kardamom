@@ -1,7 +1,7 @@
 //! `kardamom-notifier`: the transaction status fan-out service. It taps
 //! `tx_status`, `tx_receipts` and `tx_errors`, keeps a ring of recent
-//! events, and serves WebSocket subscriptions and webhooks. See the
-//! library docs for the module map.
+//! events, and serves WebSocket subscriptions. See the library docs for
+//! the module map.
 
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -17,10 +17,8 @@ use kardamom_notifier::feed::Feed;
 use kardamom_notifier::hub::{Hub, HubConfig};
 use kardamom_notifier::metrics;
 use kardamom_notifier::ring::RingConfig;
-use kardamom_notifier::server::{Hooks, ListenConfig, serve};
-use kardamom_notifier::shard::InstanceSet;
-use kardamom_notifier::taps::{ReceiptSource, Taps};
-use kardamom_notifier::webhooks::{Webhooks, WebhooksConfig};
+use kardamom_notifier::server::{ListenConfig, serve};
+use kardamom_notifier::taps::{EventTaps, ReceiptSource, Taps};
 use kardamom_obs::bin::wait_for_shutdown;
 
 #[derive(Debug, Parser)]
@@ -49,7 +47,20 @@ struct Args {
         default_value_t = false
     )]
     receipts_from_egress: bool,
-    /// The address of the WebSocket feed and the webhook endpoint.
+    /// The events path (`docs/specs/2026-10-25-client-events.md`): the
+    /// stages from `tx_events`, `egress_receipts` and, with
+    /// `--executed on`, `tx_receipts`, through the stage table. Off, the
+    /// notifier reads its streams as before.
+    #[arg(long, env = "KARDAMOM_NOTIFIER_EVENTS", value_enum, default_value_t = Switch::Off)]
+    events: Switch,
+    /// With the events path on, also read the `tx_receipts` of every
+    /// executor for the `executed` stage, for the evaluation of the stages.
+    #[arg(long, env = "KARDAMOM_NOTIFIER_EXECUTED", value_enum, default_value_t = Switch::Off)]
+    executed: Switch,
+    /// The entries of the stage table.
+    #[arg(long, env = "KARDAMOM_NOTIFIER_STAGE_TABLE", default_value = "250000")]
+    stage_table: NonZeroUsize,
+    /// The address of the WebSocket feed.
     #[arg(long, env = "KARDAMOM_NOTIFIER_BIND", default_value = "127.0.0.1:8547")]
     bind: SocketAddr,
     /// The connection cap of the listener.
@@ -76,43 +87,23 @@ struct Args {
     /// Events per replay page.
     #[arg(long, env = "KARDAMOM_NOTIFIER_REPLAY_PAGE", default_value = "1000")]
     replay_page: NonZeroUsize,
-    /// The directory of the webhook subscriptions, outboxes and cursors.
-    #[arg(
-        long,
-        env = "KARDAMOM_NOTIFIER_DIR",
-        default_value = "/opt/kardamom/notifier"
-    )]
-    dir: PathBuf,
-    /// A fully delivered outbox longer than this many bytes is cut.
-    #[arg(
-        long,
-        env = "KARDAMOM_NOTIFIER_OUTBOX_RETAIN_BYTES",
-        default_value_t = 256 * 1024 * 1024
-    )]
-    outbox_retain_bytes: u64,
-    /// The webhook POST timeout, in milliseconds.
-    #[arg(
-        long,
-        env = "KARDAMOM_NOTIFIER_WEBHOOK_TIMEOUT_MS",
-        default_value_t = 5_000
-    )]
-    webhook_timeout_ms: u64,
-    /// This instance's index in the instance set.
+    /// This instance's index, the Nomad allocation index. It names the
+    /// stream plane of the instance.
     #[arg(long, env = "KARDAMOM_NOTIFIER_INSTANCE_INDEX", default_value_t = 0)]
     instance_index: u32,
-    /// The instance count the subscriptions are sharded across.
-    #[arg(long, env = "KARDAMOM_NOTIFIER_INSTANCE_COUNT", default_value = "1")]
-    instance_count: NonZeroU32,
-    /// The base URLs of the other instances, comma separated. A webhook
-    /// registration is forwarded to each.
-    #[arg(long, env = "KARDAMOM_NOTIFIER_PEERS", value_delimiter = ',')]
-    peers: Vec<String>,
     /// Address for the Prometheus /metrics HTTP listener.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9008")]
     metrics_addr: SocketAddr,
     /// Host identifier. Stamped on every metric.
     #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
     host_id: String,
+}
+
+/// An on/off switch, as the deploy writes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Switch {
+    On,
+    Off,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -122,10 +113,10 @@ async fn main() -> Result<()> {
     kardamom_obs::init_service!("notifier", args.metrics_addr, args.host_id.as_str()).await?;
     metrics::describe();
 
-    let instances = InstanceSet::new(args.instance_index, args.instance_count)?;
     let log_cfg = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
-    let mut plane = StreamPlane::from_config(&log_cfg, &format!("notifier-{}", instances.index()))
-        .context("build the stream plane")?;
+    let mut plane =
+        StreamPlane::from_config(&log_cfg, &format!("notifier-{}", args.instance_index))
+            .context("build the stream plane")?;
     let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
     let executor_count = args
         .executor_count
@@ -136,7 +127,11 @@ async fn main() -> Result<()> {
     } else {
         ReceiptSource::Executors(executor_count)
     };
-    let taps = Taps::open(&rt, &mut plane, source).context("open the taps")?;
+    let events = (args.events == Switch::On).then_some(EventTaps {
+        executed: args.executed == Switch::On,
+        executor_count,
+    });
+    let taps = Taps::open(&rt, &mut plane, source, events).context("open the taps")?;
     let shutdown = plane.cancellation().child_token();
 
     let (hub, handle) = Hub::new(
@@ -147,39 +142,25 @@ async fn main() -> Result<()> {
             },
             feed_buffer: args.feed_buffer,
             ingest_buffer: args.feed_buffer,
+            stage_table: events.map(|_| args.stage_table),
         },
         shutdown.clone(),
     );
-    let (webhooks, registrar) = Webhooks::start(
-        WebhooksConfig {
-            dir: args.dir,
-            instances,
-            retain_bytes: args.outbox_retain_bytes,
-            request_timeout: Duration::from_millis(args.webhook_timeout_ms),
-            queue: args.feed_buffer,
-        },
-        &handle,
-        shutdown.clone(),
-    )
-    .context("start the webhooks")?;
     let hub_task = tokio::spawn(hub.run());
-    let webhooks_task = tokio::spawn(webhooks.run());
-    let tap_tasks = taps.spawn(handle.ingest());
+    let tap_tasks = taps.spawn(&handle.ingest());
     let listener = serve(
         ListenConfig {
             bind: args.bind,
             max_connections: args.max_connections,
         },
         Feed::new(handle, args.replay_page),
-        Hooks::new(registrar, args.peers).context("build the webhook forwarder")?,
         shutdown.clone(),
     )
     .await
     .context("bind the listener")?;
     tracing::info!(
         addr = %listener.addr,
-        instance = instances.index(),
-        instances = instances.count(),
+        instance = args.instance_index,
         "kardamom-notifier starting"
     );
 
@@ -187,7 +168,6 @@ async fn main() -> Result<()> {
     tracing::info!("kardamom-notifier: shutdown signal received");
     shutdown.cancel();
     listener.stop().await;
-    let _ = webhooks_task.await;
     let _ = hub_task.await;
     // The taps end when the runtime closes, after the plane.
     plane.shutdown().await;

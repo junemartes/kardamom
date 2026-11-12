@@ -88,3 +88,6 @@ fn a_frame_that_is_no_record_and_no_boundary_is_not_held() {
     tee.release((BPosition::from_index(5), record_item()));
     assert!(rx.try_recv().is_err());
 }
+
+#[path = "tee_profile_tests.rs"]
+mod profile;

@@ -1,4 +1,22 @@
 ---
+# The chaos knobs change the timing of the sealer members, the canary and
+# the executor checkpoints, for a test cluster. Only the local profile
+# takes them, so an operator shell that holds one cannot apply it to
+# staging or production.
+- name: Refuse a chaos knob outside the local profile
+  vars:
+    workloads_chaos_knobs_set: >-
+      {{ {'KARDAMOM_CHECKPOINT_INTERVAL_S': workloads_checkpoint_interval_s,
+          'KARDAMOM_CLUSTER_JVM_OPTS': workloads_cluster_jvm_opts,
+          'KARDAMOM_CANARY_STALLED_WINDOW': workloads_canary_stalled_window,
+          'KARDAMOM_CANARY_FORCE_PULL': workloads_canary_force_pull}
+         | dict2items | rejectattr('value', 'equalto', '') | map(attribute='key') | list }}
+  ansible.builtin.assert:
+    that:
+      - deployment_profile == 'local' or workloads_chaos_knobs_set | length == 0
+    fail_msg: >-
+      Refused: {{ workloads_chaos_knobs_set | join(', ') }} is set, and the deployment
+      profile is {{ deployment_profile }}. The chaos knobs apply only to the local profile.
 - name: Validate optional L1 light client configuration
   ansible.builtin.assert:
     that:
@@ -35,6 +53,36 @@
       BATCHER_IDLE_FLUSH_MS ({{ workloads_idle_ms }}) must be below the DA-lag budget
       ({{ workloads_budget }} blocks) at one block a second, or the guard halts an idle chain
       between posts. Lower the idle flush or raise KARDAMOM_DA_LAG_BUDGET_BLOCKS.
+
+# The carry from genesis sets every carry switch. A switch with another
+# value leaves a part of the chain on the old path: a reader of a stored
+# reference, a sequencer that offers record type 0, or an executor that
+# is not in carry mode. A carry executor sends no recorded cursor.
+- name: Validate the carry from genesis
+  vars:
+    workloads_genesis_switches_now:
+      KARDAMOM_MEMBER_FEED: "{{ workloads_member_feed }}"
+      KARDAMOM_EXEC_ON_SEALERS: "{{ workloads_exec_on_sealers }}"
+      KARDAMOM_EXEC_FRAMES: "{{ workloads_exec_frames }}"
+      KARDAMOM_EGRESS: "{{ '1' if workloads_egress | bool else '0' }}"
+      KARDAMOM_BATCHER_EGRESS: "{{ workloads_batcher_egress }}"
+      KARDAMOM_VALIDATOR_EGRESS: "{{ workloads_validator_egress }}"
+      KARDAMOM_SEQUENCER_ADMISSION: "{{ workloads_sequencer_admission }}"
+      KARDAMOM_SEALER_VERSION_FLOOR: "{{ workloads_sealer_version_floor }}"
+      KARDAMOM_CARRY_EXECUTORS: "{{ workloads_carry_executor_ids | sort | join(',') }}"
+    workloads_genesis_wrong: >-
+      {{ workloads_genesis_carry_switches | dict2items | difference(workloads_genesis_switches_now | dict2items)
+         | map(attribute='key') | list }}
+  ansible.builtin.assert:
+    that:
+      - workloads_genesis_carry in ['', 'on', 'off']
+      - workloads_genesis_carry != 'on' or (workloads_genesis_wrong | length == 0 and workloads_exec_cursor != 'on')
+    fail_msg: >-
+      KARDAMOM_GENESIS_CARRY ("{{ workloads_genesis_carry }}") is on, off or empty. On, it sets every carry switch and
+      refuses another value: {{ workloads_genesis_wrong }} are
+      {{ workloads_genesis_wrong | map('extract', workloads_genesis_switches_now) | list }}, and the carry from genesis
+      needs {{ workloads_genesis_wrong | map('extract', workloads_genesis_carry_switches) | list }}.
+      KARDAMOM_EXEC_CURSOR ("{{ workloads_exec_cursor }}") must not be on.
 
 # A reader of the egress stops when no egress serves it, and an egress
 # without the executors' frames has nothing to serve.

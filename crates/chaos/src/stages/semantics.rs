@@ -11,14 +11,13 @@ use anyhow::Context;
 use tokio::process::Command;
 
 use crate::harness::Harness;
+use crate::l1::{L1_OWNER, L1_OWNER_KEY};
 use crate::probes::{EXECUTOR_PORT, Probed, SEQUENCER_LANE0_PORT, VALIDATOR_PORT};
 
 /// The in-cluster L1 listens on the control node.
 const L1_RPC_PORT: u16 = 8546;
 /// The second sequencer lane's exporter; lane `n` is `9001 + 10n`.
 const SEQUENCER_LANE1_PORT: u16 = 9011;
-/// The dev L1 owner that deployed the settlement contracts.
-const L1_OWNER: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 
 impl Harness {
     /// Run the chain-semantics suite.
@@ -95,23 +94,36 @@ impl Harness {
         if let Some(explicit) = self.knobs.stages.semantics.settlement.clone() {
             return Ok(explicit);
         }
+        let chain = self.knobs.chain_id.to_string();
+        let listing = self
+            .deploy_cli(&["addresses", "--l2-chain-id", &chain])
+            .await?;
+        settlement_in(&listing)
+            .context("could not resolve the settlement address for the l1-batch case")
+    }
+
+    /// Run the staged `kardamom-deploy` against the in-cluster L1 as the
+    /// dev owner, with `args` after the global flags, and return its
+    /// stdout. A command that signs reads the owner key from
+    /// `KARDAMOM_DEPLOY_OWNER_KEY`.
+    pub(crate) async fn deploy_cli(&self, args: &[&str]) -> anyhow::Result<String> {
         let bin = self.release_binary("kardamom-deploy")?;
         let out = Command::new(&bin)
             .args(["--rpc-url", &self.l1_rpc()?])
             .args(["--owner", L1_OWNER])
-            .arg("addresses")
-            .args(["--l2-chain-id", &self.knobs.chain_id.to_string()])
+            .args(args)
+            .env("KARDAMOM_DEPLOY_OWNER_KEY", L1_OWNER_KEY)
             .stdin(Stdio::null())
             .output()
             .await
             .with_context(|| format!("spawn {}", bin.display()))?;
         anyhow::ensure!(
             out.status.success(),
-            "kardamom-deploy addresses failed: {}",
+            "kardamom-deploy {} failed: {}",
+            args.first().copied().unwrap_or_default(),
             String::from_utf8_lossy(&out.stderr).trim()
         );
-        settlement_in(&String::from_utf8_lossy(&out.stdout))
-            .context("could not resolve the settlement address for the l1-batch case")
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 }
 

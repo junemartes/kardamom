@@ -129,11 +129,14 @@ impl<'a> StateAudit<'a> {
         Ok(())
     }
 
+    /// Copy a state directory out of a node. A copy takes about a
+    /// minute on a CI runner, so it runs under the streaming bound.
     async fn copy(&self, node: &str, source: &str, destination: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(destination)?;
+        let started = std::time::Instant::now();
         self.harness
             .nodes
-            .docker_ok(&[
+            .docker_ok_long(&[
                 "cp",
                 &format!("{node}:{source}/."),
                 destination.to_str().context("state copy path")?,
@@ -143,6 +146,16 @@ impl<'a> StateAudit<'a> {
             destination.join("mdbx.dat").is_file(),
             "missing mdbx.dat from {node}:{source}"
         );
+        let bytes: u64 = std::fs::read_dir(destination)?
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(std::fs::Metadata::is_file)
+            .map(|meta| meta.len())
+            .sum();
+        crate::log(format!(
+            "persisted-state: copied {node}:{source} ({bytes} bytes) in {:.1}s",
+            started.elapsed().as_secs_f64()
+        ));
         Ok(())
     }
 

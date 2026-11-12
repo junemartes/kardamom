@@ -1,0 +1,16 @@
+---
+# Starting inner Docker daemons can enable bridge netfilter again. Reapply
+# host settings after provisioning, before workloads begin sending multicast.
+- name: Restore host multicast settings after Docker startup
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  tasks:
+    - name: Reapply host network settings
+      ansible.builtin.include_role:
+        name: host_prep
+      vars:
+        host_prep_bridge: "{{ node_contract_bridge }}"

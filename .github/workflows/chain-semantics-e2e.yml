@@ -37,10 +37,9 @@ jobs:
       # The rusteron-* crates compile the Aeron C client from source via a
       # cmake build script.
       - name: Install system build deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            cmake uuid-dev libbsd-dev libssl-dev pkg-config build-essential
+        uses: ./.github/actions/apt-install
+        with:
+          packages: cmake uuid-dev libbsd-dev libssl-dev pkg-config build-essential
 
       - uses: dtolnay/rust-toolchain@stable
       # Foundry supplies `forge`: the deployer crate's build script shells
@@ -55,9 +54,11 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+      # The dev-profile caches that the CI test job saves on a base branch.
       - uses: ./.github/actions/rust-build-cache
         with:
-          shared-key: chain-semantics-e2e
+          shared-key: dev
+          save-if: false
 
       - name: Build the sealer jar
         working-directory: cluster/sealer-service
@@ -73,7 +74,7 @@ jobs:
       # Every binary a scenario spawns or shells out to: the pipeline three,
       # the validator (S6/S7), statecheck (S6's CLI check), the da-watcher
       # (S1/S2 bridge), reconstruct (S8's DA-parity gate), and the batcher
-      # and the egress (S13e/S13f, the carry window).
+      # and the egress (S13e/S13f/S13g, the carry window).
       - name: Build service binaries
         run: |
           cargo build --locked --bins \

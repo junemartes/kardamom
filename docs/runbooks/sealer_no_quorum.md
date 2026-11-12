@@ -22,6 +22,9 @@ quorum of members to commit one. Nothing is ordered while it lasts.
 2. Start a member that is gone (`nomad job status cluster`). A member whose
    disk is lost replays the log from the leader. See the section "Sealer: the Aeron Cluster (Raft)" in
    [`failure-modes.md`](../failure-modes.md#sealer-the-aeron-cluster-raft). The case `cluster-member-rejoin` tests this.
+   If two members lost their Raft data, follow
+   [sealer-two-blank-members.md](sealer-two-blank-members.md). Peer seeding alone
+   cannot recover a quorum from one survivor.
 3. If every member runs but none leads, read the members' logs for a clock or
    network fault between the sealer nodes, and fix it.
 

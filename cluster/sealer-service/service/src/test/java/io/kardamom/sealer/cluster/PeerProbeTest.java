@@ -1,6 +1,7 @@
 package io.kardamom.sealer.cluster;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -112,7 +113,7 @@ final class PeerProbeTest {
     void parsesTheStatusJsonOfThisRelease() {
         final MemberStatus sample = status(2, "LEADER", "LEADER_READY", 15_027_008L);
         final Optional<PeerProbe.PeerStatus> parsed = PeerProbe.PeerStatus.parse(sample.toJson(LAG));
-        assertEquals(Optional.of(new PeerProbe.PeerStatus(2, "LEADER", "LEADER_READY", 15_027_008L, -1L)), parsed);
+        assertEquals(Optional.of(new PeerProbe.PeerStatus(2, "LEADER", "LEADER_READY", 15_027_008L, -1L, false)), parsed);
         assertTrue(PeerProbe.PeerStatus.parse("{\"error\":\"x\"}").isEmpty());
     }
 
@@ -125,5 +126,16 @@ final class PeerProbeTest {
         assertEquals(PeerProbe.PeerStatus.TERM_NOT_STATED,
             PeerProbe.PeerStatus.parse(older).orElseThrow().leadershipTermId(),
             "a peer of an older release states no term");
+    }
+
+    /** The start hold of a peer reads whether the other member still holds its outputs. */
+    @Test
+    void parsesTheStartHoldOfThePeer() {
+        final MemberStatus sample = status(1, "FOLLOWER", "CLOSED", 9L);
+        assertTrue(PeerProbe.PeerStatus.parse(sample.withStart(7L, true).toJson(LAG)).orElseThrow().startHold());
+        assertFalse(PeerProbe.PeerStatus.parse(sample.withStart(7L, false).toJson(LAG)).orElseThrow().startHold());
+        final String older = "{\"memberId\":1,\"role\":\"FOLLOWER\",\"election\":\"CLOSED\",\"commitPosition\":9}";
+        assertTrue(PeerProbe.PeerStatus.parse(older).orElseThrow().startHold(),
+            "a peer of an older release states no hold, so it reads as held");
     }
 }

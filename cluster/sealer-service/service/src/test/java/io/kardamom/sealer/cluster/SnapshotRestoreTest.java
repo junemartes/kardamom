@@ -8,9 +8,11 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.aeron.Aeron;
+import io.aeron.Counter;
 import io.aeron.ExclusivePublication;
 import io.aeron.Image;
 import io.aeron.Subscription;
+import io.aeron.cluster.service.RecoveryState;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
 import io.kardamom.sealer.CanonicalSealerState;
@@ -112,7 +114,7 @@ class SnapshotRestoreTest {
     }
 
     @Test
-    void restoredMemberRefusesPreSnapshotReplay() {
+    void restoredMemberKeepsTheSnapshotTermAndReplayFloor() {
         // Snapshot a state that has ordered 10 records across 3 sealed blocks.
         final CanonicalSealerState original = new CanonicalSealerState(64);
         for (int i = 0; i < 10; i++) {
@@ -125,14 +127,23 @@ class SnapshotRestoreTest {
         final long block = original.blockNumber(); // 4 (next to stamp)
 
         try (Subscription sub = aeron.addSubscription(CHANNEL, 1003);
-             ExclusivePublication pub = aeron.addExclusivePublication(CHANNEL, 1003)) {
+             ExclusivePublication pub = aeron.addExclusivePublication(CHANNEL, 1003);
+             Counter recovery = RecoveryState.allocate(aeron, 5, 0, 750, 0, 1);
+             Counter currentTerm = aeron.addCounter(0, "test leadership term")) {
             final Image image = awaitImage(sub, pub);
             SnapshotIo.writeSnapshot(pub, original.takeSnapshot(), IDLE);
             pub.close();
 
-            final StubCluster cluster = new StubCluster();
+            final StubCluster cluster = new StubCluster(aeron);
             final SealerClusteredService service = new SealerClusteredService(64, 250, 0);
             service.onStart(cluster, image);
+            currentTerm.set(5);
+            assertEquals(5, service.leadershipTermId(currentTerm),
+                "the snapshot term is committed even when no new leadership event is replayed");
+            assertEquals(5, RecoveryState.getLeadershipTermId(aeron.countersReader(), recovery.id()));
+            currentTerm.set(6);
+            assertEquals(-1, service.leadershipTermId(currentTerm),
+                "a restored term must not release the hold through an unapplied election term");
 
             // A cursor before the restore point must be refused: the snapshot
             // carries no retention, so a DONE here would hide a gap.
@@ -154,6 +165,9 @@ class SnapshotRestoreTest {
             assertEquals(1, caughtUpControl.size(), "exactly one control frame");
             assertEquals(SealerWire.EGRESS_KIND_REPLAY_DONE, caughtUpControl.get(0)[0],
                     "replay from the restore point itself must complete");
+            service.onNewLeadershipTermEvent(6, 0, 1000, 0, 0, 0, TimeUnit.MILLISECONDS, 0);
+            assertEquals(6, service.leadershipTermId(currentTerm),
+                "the new consensus term is visible once its committed entry is applied");
         }
     }
 

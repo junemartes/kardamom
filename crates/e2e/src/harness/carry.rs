@@ -51,6 +51,9 @@ pub struct CarrySeams {
     pub batcher_metrics: Option<SocketAddr>,
     /// The admin endpoint of each member, in member order.
     pub sealer_admin: Vec<SocketAddr>,
+    /// The base URL of the fake DA proxy that keeps the payloads of the
+    /// batcher. Present when the stack runs a batcher.
+    pub da_proxy: Option<String>,
 }
 
 impl ServiceSpec<'_> {
@@ -152,12 +155,12 @@ impl ServiceSpec<'_> {
 }
 
 impl BatcherSide {
-    /// Start the fake DA proxy and the first batcher, on the cluster
-    /// egress.
+    /// Start the fake DA proxy and the first batcher: on the egress at
+    /// `egress` when present, otherwise on the cluster egress.
     ///
     /// # Errors
     /// Returns an error when the batcher fails to spawn.
-    pub(super) fn launch(spec: &ServiceSpec<'_>, l1: &L1) -> Result<Self> {
+    pub(super) fn launch(spec: &ServiceSpec<'_>, l1: &L1, egress: Option<&str>) -> Result<Self> {
         let mut side = Self {
             process: None,
             metrics_port: free_port().port(),
@@ -165,7 +168,7 @@ impl BatcherSide {
             settlement: l1.settlement.to_string(),
             da: FakeDaProxy::start(),
         };
-        side.process = Some(spec.spawn_batcher(&side, None)?);
+        side.process = Some(spec.spawn_batcher(&side, egress)?);
         Ok(side)
     }
 
@@ -188,6 +191,7 @@ impl LocalStack {
             egress_metrics: egress.service.metrics_addr,
             batcher_metrics: self.batcher.as_ref().map(BatcherSide::metrics_addr),
             sealer_admin: self.sealer.admin.clone(),
+            da_proxy: self.batcher.as_ref().map(|b| b.da.url()),
         })
     }
 
@@ -324,6 +328,37 @@ impl LocalStack {
     /// Returns an error when the member does not come up within 60s.
     pub fn restart_sealer_member(&mut self, id: usize) -> Result<()> {
         self.sealer.restart_member(id)
+    }
+
+    /// The logs of every sealer process of the stack, as `(file name,
+    /// text)`. Unlike [`Self::sealer_logs`], this includes the log of each
+    /// process that a restart replaced.
+    ///
+    /// # Errors
+    /// Returns an error when the stack root or a log cannot be read.
+    pub fn every_sealer_log(&self) -> Result<Vec<(String, String)>> {
+        let names = std::fs::read_dir(self.root.path())?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<Vec<String>>>()?;
+        names
+            .into_iter()
+            .filter(|name| {
+                name.starts_with("sealer-")
+                    && std::path::Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext == "log")
+            })
+            .map(|name| {
+                let text = std::fs::read_to_string(self.root.path().join(&name))?;
+                Ok((name, text))
+            })
+            .collect()
+    }
+
+    /// The genesis TOML that every service of the stack reads.
+    #[must_use]
+    pub fn genesis_path(&self) -> &std::path::Path {
+        &self.genesis
     }
 
     /// The tail of the log of the executor in carry mode.

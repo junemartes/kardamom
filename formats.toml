@@ -210,15 +210,22 @@ code = [
 ]
 
 # The seed file that kardamom-reconstruct writes and an empty sealer
-# cluster starts from. The sealer refuses any other version.
+# cluster starts from. Version 2 adds the decision rules of the sealer
+# after the senders. The writer writes version 2 only when the rules hold
+# an activation of feature 3, 4 or 5: at genesis or by an upgrade
+# transaction. A sealer that reads only version 1 refuses version 2 and
+# does not start, so it never runs a seeded chain with the wrong rules.
 [format.sealer-seed]
 writes = 1
 reads_min = 1
-reads_max = 1
+reads_max = 2
 shared = true
+activation = { feature = 3, writes = 2 }
 code = [
     "crates/reconstruct/src/seed.rs#const VERSION",
+    "crates/reconstruct/src/seed.rs#const RULES_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/SealerSeed.java#int VERSION",
+    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/SealerSeed.java#int RULES_VERSION",
 ]
 
 # The major part of the Aeron Cluster app version. Aeron refuses a session
@@ -449,17 +456,6 @@ code = ["crates/egress/src/ref_mark.rs#pub struct RefMark"]
 [format.egress-ref-mark.layout]
 RefMark = "09000000000000000300000000000000"
 
-# Frozen layout. The notifier outbox: rkyv OutboxRecord frames. An unknown
-# stage code reads as no stage.
-[format.notifier-outbox]
-writes = 1
-reads_min = 1
-reads_max = 1
-shared = false
-code = ["crates/notifier/src/outbox.rs#pub struct OutboxRecord"]
-[format.notifier-outbox.layout]
-OutboxRecord = "rkyv size 120 align 8"
-
 # Frozen layout. The Redis cache keys and values. Redis keeps no data on
 # disk, and the cache is advisory. A new layout uses a new key prefix.
 [format.redis-cache]
@@ -499,6 +495,10 @@ code = ["crates/log/src/discovery/record.rs#DISCOVERY_VERSION"]
 
 [retired]
 
+[retired.notifier-outbox]
+version = 1
+reason = "The notifier webhooks are removed (2026-10-25), so the notifier keeps no outbox. No running service reads the old files, and a rollback starts the old notifier on its own files. Deploy with KARDAMOM_ALLOW_RETIRED=notifier-outbox."
+
 # Frozen layout. The canary's nonce journal: one serde JSON file per ring
 # account. A file that does not parse stops the canary at start; the
 # operator removes it after checking the account's nonce.
@@ -534,3 +534,14 @@ shared = false
 code = ["crates/canary/src/store.rs#pub struct Market"]
 [format.canary-market.layout]
 Market = '{"rwa":"0x0606060606060606060606060606060606060606","pool":"0x0707070707070707070707070707070707070707","setup":8,"supply":"0x9","pending":{"Burn":"0x1"},"shares":"0x2"}'
+
+# The empty head.rebuild file beside a mirror's numeric head is a durable
+# local recovery obligation. Only a complete scan removes it. Older binaries
+# ignore it and retain their prior resume rule; an interrupted recovery needs
+# an explicit rebuild when rolling back to such a binary.
+[format.state-mirror-rebuild]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = false
+code = ["crates/state-mirror/src/head.rs#begin_rebuild"]

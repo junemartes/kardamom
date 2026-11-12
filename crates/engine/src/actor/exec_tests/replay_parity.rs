@@ -6,7 +6,7 @@
 use alloy_primitives::{Address, B256, U256, address};
 use alloy_signer_local::PrivateKeySigner;
 use kardamom_state::{StateEnv, StateSnapshot, StateWriter, TrieMode, seed_genesis};
-use kardamom_types::{AccountChange, BPosition, EpochRecord, StateDatabase};
+use kardamom_types::{AccountChange, BPosition, EpochRecord, GenesisAlloc, StateDatabase};
 
 use crate::actor::StateWriterSignal;
 use crate::actor::test_support::{
@@ -134,7 +134,7 @@ impl Scenario {
     /// trie-on state DB.
     fn live(&self) -> Rebuilt {
         let (_dir, env) = fresh_env();
-        seed_genesis(&env, &self.genesis, &[]).unwrap();
+        seed_genesis(&env, &GenesisAlloc::of_accounts(self.genesis.clone())).unwrap();
         let handle = StateWriter::spawn_with_trie(env.clone(), TrieMode::Incremental).unwrap();
         let rig = ExecRig::new(
             MdbxSnapshotSource::new(handle.snapshot_rx.clone()),
@@ -153,8 +153,7 @@ impl Scenario {
         let (_dir, env) = fresh_env();
         let genesis = ReplayGenesis {
             chain_id: 1,
-            accounts: &self.genesis,
-            code: &[],
+            alloc: GenesisAlloc::of_accounts(self.genesis.clone()),
             fees: None,
         };
         replay_blocks(env.clone(), &genesis, self.replay_blocks()).unwrap();

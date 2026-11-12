@@ -56,13 +56,13 @@ async fn s13d_on(genesis: e2e::harness::Genesis) {
     upgrade_case(
         unpayable_stack_config(genesis),
         async |t, l1, exec_dir, val_dir| {
-            sealer_upgrade::skip_uses_its_nonce_only_after_the_upgrade(
+            let upgrade_block = sealer_upgrade::skip_uses_its_nonce_only_after_the_upgrade(
                 t,
                 l1,
                 sealer_upgrade::Params::default(),
             )
             .await?;
-            upgrade::assert_chain_state_code(exec_dir, val_dir).await
+            upgrade::assert_chain_state_code(exec_dir, val_dir, upgrade_block).await
         },
         "S13d",
     )
@@ -144,12 +144,15 @@ async fn s13c_upgrade_authority_is_enforced() {
 }
 
 /// The stack of the carry window: `members` sealer members with the
-/// member feed, the egress and a live batcher, on the staging genesis.
+/// member feed, the egress and a live batcher, on the staging genesis. The
+/// chain starts on the reference rules: these scenarios test the live
+/// upgrade path.
 fn carry_stack_config(members: std::num::NonZeroUsize, park: ParkTimeout) -> StackConfig {
     StackConfig {
         sealer_members: members,
         carry: Some(e2e::harness::CarryOptions {
             retention: std::num::NonZeroU32::new(512).unwrap(),
+            genesis: false,
         }),
         ingress: IngressOptions {
             pending_receipt_timeout: park,
@@ -180,8 +183,8 @@ async fn s13e_carry_window_rollout() {
 }
 
 /// S13f: a sequencer floor above the version of the chain. The floor 5
-/// on a chain at version 4 costs no stall, and a full reference that the
-/// sealer orders below version 5 runs on every reader.
+/// on a chain at version 4 costs no stall. A transaction parked at version
+/// 5 leaves in version-4 format after a downgrade, and every reader agrees.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s13f_a_wrong_floor_costs_no_stall() {
@@ -193,4 +196,58 @@ async fn s13f_a_wrong_floor_costs_no_stall() {
     )
     .await
     .expect("S13f");
+    let exec_dir = stack.executor_state_dir().expect("executor state dir");
+    let val_dir = stack.validator_state_dir().expect("validator state dir");
+    stack.shutdown_graceful().await.expect("graceful shutdown");
+    consistency::verify_state_dirs(&exec_dir, &val_dir).expect("S13f persisted state");
+}
+
+/// S13g: the carry mode from genesis on a new chain. Every member starts at
+/// decision version 5 with the carry window, the executor reads the member
+/// feed from its first block, and the readers read the egress. A follower
+/// restarts before the first snapshot and from a snapshot, under load.
+/// The L2 genesis holds the feature words, and feature 5 turns off and on
+/// by upgrade transaction. Then the persisted state of the executor and
+/// the validator matches, and a rebuild from L1 and the DA proxy alone
+/// gives the root of the executor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s13g_carry_from_genesis() {
+    let three = std::num::NonZeroUsize::new(3).unwrap();
+    let park = IngressOptions::default().pending_receipt_timeout;
+    let base = carry_stack_config(three, park);
+    let mut stack = launch_l1_or_skip!(StackConfig {
+        carry: base.carry.map(|c| e2e::harness::CarryOptions {
+            genesis: true,
+            ..c
+        }),
+        ..base
+    });
+    e2e::scenarios::carry_window::from_genesis(
+        &mut stack,
+        e2e::scenarios::carry_window::Params::default(),
+    )
+    .await
+    .expect("S13g");
+    let exec_dir = stack.executor_state_dir().expect("executor state dir");
+    let val_dir = stack.validator_state_dir().expect("validator state dir");
+    stack.shutdown_graceful().await.expect("graceful shutdown");
+    consistency::verify_state_dirs(&exec_dir, &val_dir).expect("S13g persisted state");
+
+    let root = e2e::scenarios::xchain_da_parity::executor_state_root(&exec_dir)
+        .expect("root the executor state");
+    let l1 = stack.l1().expect("l1");
+    let seams = stack.carry_seams().expect("carry seams");
+    let da_proxy = seams.da_proxy.expect("the batcher's DA proxy");
+    let l1_rpc = l1.rpc_url();
+    let recon_dir = tempfile::tempdir().expect("recon dir");
+    da_parity::Reconstruct {
+        l1_rpc: &l1_rpc,
+        settlement: l1.settlement,
+        lockbox: l1.lockbox,
+        da_proxy: &da_proxy,
+        genesis: stack.genesis_path(),
+    }
+    .compare(&recon_dir.path().join("state"), root)
+    .expect("S13g rebuild from L1");
 }

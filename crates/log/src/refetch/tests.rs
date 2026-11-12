@@ -66,6 +66,25 @@ fn a_live_recording_short_of_the_range_can_still_reach_it() {
 }
 
 #[test]
+fn a_recording_with_no_stop_position_is_live_not_ended() {
+    // An unstopped recording with no readable recorded position reads
+    // as a stop position of -1 (`NULL_POSITION`).
+    let unstopped = RecordedLimit::from_stop(-1);
+    assert!(!unstopped.ended_before(332_416));
+    let located = FoundRecording::fake(106, 0, None)
+        .locate(at(332_416))
+        .unwrap();
+    assert!(matches!(located.replay_len(unstopped), Ok(None)));
+}
+
+#[test]
+fn a_stopped_recording_ends_at_its_stop_position() {
+    let stopped = RecordedLimit::from_stop(2_994_688);
+    assert!(stopped.ended_before(2_994_688));
+    assert!(!stopped.ended_before(2_994_656));
+}
+
+#[test]
 fn the_replay_runs_from_the_position_to_the_limit() {
     let live = RecordedLimit {
         position: 4096,

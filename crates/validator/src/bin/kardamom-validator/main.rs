@@ -46,11 +46,8 @@ async fn main() -> Result<()> {
         return wiring::clear_verdict(&args.state_dir);
     }
     let boot = Boot::init(args).await?;
-    // Each turn runs the whole pipeline once. A refused replay stages a
-    // peer checkpoint and comes back here for the next turn, which
-    // adopts it; every other end leaves the loop.
-    let mut revolutions = 0u32;
-    while wiring::turn(&boot, &mut revolutions).await?.is_continue() {}
+    let mut process = wiring::Process::default();
+    while process.turn(&boot).await?.is_continue() {}
     boot.close().await;
     Ok(())
 }

@@ -74,6 +74,23 @@ class CarriedRefTest {
         assertTrue(state.onCarriedRef(0, 7, 10 * UNIT) >= 0);
     }
 
+    /** Clearing the guard does not fence offers already queued behind a refused position. */
+    @Test
+    void a_queued_higher_position_can_precede_the_refused_prefix_after_guard_clear() {
+        final CanonicalSealerState state = onVersionFive(new LagBudgets(1, 0), VoidLedger.Config.DISABLED);
+        state.onTick(1_500L);
+        state.onTick(1_750L);
+        assertTrue(state.daLagHalted());
+        assertEquals(CanonicalSealerState.REF_DA_LAG, state.onCarriedRef(0, 7, 10 * UNIT));
+
+        state.onPostedCursor(state.sealedHead());
+        final long queuedHigher = state.onCarriedRef(0, 7, 11 * UNIT);
+        final long replayedLower = state.onCarriedRef(0, 7, 10 * UNIT);
+        assertTrue(queuedHigher >= 0);
+        assertEquals(queuedHigher + 1, replayedLower);
+        assertEquals(CanonicalSealerState.REF_DUPLICATE, state.onCarriedRef(0, 7, 11 * UNIT));
+    }
+
     /** The void ledger holds no full reference, so no vote can remove one. */
     @Test
     void no_vote_removes_a_full_reference() {

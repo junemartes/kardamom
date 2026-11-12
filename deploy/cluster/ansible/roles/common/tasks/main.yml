@@ -1,29 +1,10 @@
 ---
-# Base packages, Aeron-friendly sysctls, on-node directory layout, and the
-# tmpfs aeron.dir mount. Values derive from group_vars/all.yml.
+- name: Check prepared node software
+  ansible.builtin.import_tasks: image.yml
 
-# No blanket `upgrade:` here — provisioning should be fast and deterministic;
-# base-image currency is the box's concern, not the playbook's.
-- name: Update apt cache
-  ansible.builtin.apt:
-    update_cache: true
-    cache_valid_time: 3600
-
-- name: Install base packages
-  ansible.builtin.apt:
-    name:
-      - curl
-      - unzip
-      - gnupg
-      - ca-certificates
-    state: present
-
-# HashiCorp publishes linux_amd64 + linux_arm64; pick the one matching this
-# host so the consul/nomad roles download a binary that actually execs (amd64
-# VMs/runners and arm64 containers/dev machines alike).
-- name: Resolve HashiCorp release architecture
-  ansible.builtin.set_fact:
-    common_hashicorp_arch: "{{ 'arm64' if ansible_architecture in ['aarch64', 'arm64'] else 'amd64' }}"
+- name: Install common software on an unprepared node
+  ansible.builtin.import_tasks: install.yml
+  when: not (common_node_software_preinstalled | default(false) | bool)
 
 # The sysctl module both persists each entry to sysctl_file and applies it
 # immediately (reload: true) — one mechanism, one place for the values.

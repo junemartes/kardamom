@@ -36,6 +36,7 @@ receipt fields, the errors and the limits.
   - A DA-lag reject from the sealer also ends the wait. The error is `-32010`, with the cause `da_lag` at the service `sealer`.
   - A record-lag reject from the sealer also ends the wait. The error is `-32010`, with the cause `record_lag` at the service `sealer`. The record-lag guard is off by default until a later release.
   - The timeout is 30 seconds. The `--pending-receipt-timeout-ms` flag (env `KARDAMOM_PENDING_RECEIPT_TIMEOUT_MS`) sets it.
+  - A sequencer duplicate rejection can race the receipt for the submitted transaction. The call keeps waiting until the receipt satisfies its ack policy or the existing timeout expires. With no receipt, it returns the duplicate error at that deadline. A receipt still waiting for its durability gate returns a timeout. A duplicate already proved by the receipt cache can still return at once.
 - With `--verdicts` (the ack at admission), `eth_sendRawTransaction` has the semantics of Ethereum. It returns the hash when the sequencer that owns the sender takes the transaction into its mempool: it forwards it to the sealer, or it holds it for a nonce gap. It does not wait for the sealer or the receipt.
   - The errors use the text of geth: `nonce too low: address <a>, tx: <n> state: <m>`, `already known`, `txpool is full`, `insufficient funds for gas * price + value: ...`, `max fee per gas less than block base fee: ...`.
   - With no answer of a sequencer in 2 seconds, the error is `transaction not acknowledged`. The `--ack-timeout-ms` flag (env `KARDAMOM_INGRESS_ACK_TIMEOUT_MS`) sets the time. A resubmit of the same transaction can answer `already known`: the first copy is in a mempool.
@@ -304,7 +305,7 @@ An error `-32010` means that the chain, or this ingress, does not take submits n
 
 ## Further reading
 
-- [Transaction status events](tx-status-events.md): the notifier feed and the webhooks.
+- [Transaction status events](tx-status-events.md): the notifier feed.
 - [Priority fees](priority-fees.md): the fee rules, the admission checks and the settlement.
 - [Failure modes](failure-modes.md): how the ingress behaves when other actors fail. The section [halts and service events](failure-modes.md#halts-and-service-events) has the halt model.
 - [Runbooks](runbooks/README.md): one runbook for each halt cause.

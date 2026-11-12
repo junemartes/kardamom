@@ -71,7 +71,15 @@
     - name: Register the sealer
       ansible.builtin.include_tasks: job.yml
       vars:
-        workloads_job: "{{ workloads_sealer_job }}"
+        workloads_job: "{{ workloads_sealer_job | combine({'defer': workloads_waves | default(false) | bool}) }}"
+
+    # In the waves of a new cluster, the wait for the deployment of the
+    # sealer moves to the end of the next wave. Each member reads the
+    # bootstrap flag once, at its start, so the bootstrap closes only when
+    # every new member runs and answers its admin status.
+    - name: Wait for every new sealer member to answer
+      ansible.builtin.include_tasks: sealer_started.yml
+      when: workloads_waves | default(false) | bool
   always:
     - name: Close the cluster bootstrap
       ansible.builtin.uri:
@@ -81,6 +89,46 @@
           X-Nomad-Token: "{{ workloads_nomad_token }}"
         status_code: [200, 204]
       when: workloads_sealer_bootstrap | bool
+
+# The release gate read the rules of the members of a genesis bootstrap
+# from the rendered sealer job (genesis_gate.yml). A sealer image that
+# does not take genesisFeatures starts the new chain on decision version
+# 3. So after the new members start, and before any other job registers,
+# each member must report the genesis rules of the rendered job.
+- name: Check the members of a genesis bootstrap
+  when:
+    - workloads_sealer_bootstrap | bool
+    - workloads_gate_genesis_bootstrap | bool
+  block:
+    - name: Read the status of every new sealer member
+      ansible.builtin.include_tasks: sealer_status.yml
+      vars:
+        workloads_sealer_groups: "{{ workloads_gate_genesis_groups }}"
+
+    - name: Refuse a new sealer member without the genesis rules
+      ansible.builtin.assert:
+        that:
+          - workloads_sealer_down | length == 0
+          - workloads_genesis_members | length == workloads_gate_genesis_groups | length
+        fail_msg: >-
+          Refused: the new sealer members do not all report the genesis rules of the rendered sealer job:
+          decisionVersion {{ workloads_gate_genesis.decisionVersion }}, carryWindow {{ workloads_gate_genesis.carryWindow }}
+          and genesisFeatures "{{ workloads_gate_genesis.features }}". The members
+          {{ workloads_sealer_status.results | map(attribute='item.item.TaskGroup') | list }} report decisionVersion
+          {{ workloads_sealer_status.results | map(attribute='json') | map(attribute='decisionVersion', default='missing') | list }}, carryWindow
+          {{ workloads_sealer_status.results | map(attribute='json') | map(attribute='carryWindow', default='missing') | list }} and
+          genesisFeatures {{ workloads_sealer_status.results | map(attribute='json') | map(attribute='genesisFeatures', default='missing') | list }},
+          and {{ workloads_sealer_down }} do not run. The sealer image does not take kardamom.cluster.genesisFeatures, or
+          a member did not start at genesis. The deploy stops before any other job. Purge the new cluster, wipe its
+          member state, and deploy a release whose sealer takes the setting.
+      vars:
+        workloads_genesis_members: >-
+          {{ workloads_sealer_status.results | map(attribute='json')
+             | selectattr('decisionVersion', 'defined')
+             | selectattr('decisionVersion', 'equalto', workloads_gate_genesis.decisionVersion | int)
+             | selectattr('carryWindow', 'defined') | selectattr('carryWindow', 'equalto', workloads_gate_genesis.carryWindow | bool)
+             | selectattr('genesisFeatures', 'defined') | selectattr('genesisFeatures', 'equalto', workloads_gate_genesis.features)
+             | list }}
 
 - name: Order the members for the staged roll
   ansible.builtin.include_tasks: sealer_order.yml

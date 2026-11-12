@@ -25,6 +25,35 @@ impl HeadFile {
             .and_then(|s| s.trim().parse().ok())
     }
 
+    /// A partial projection write or scan requires a full rebuild after restart.
+    pub(crate) fn rebuild_pending(&self) -> Result<bool> {
+        self.path
+            .with_extension("rebuild")
+            .try_exists()
+            .context("read the mirror rebuild marker")
+    }
+
+    /// Persist the recovery obligation before changing the projection.
+    pub(crate) fn begin_rebuild(&self) -> Result<()> {
+        let dir = self.path.parent().context("head file has no parent")?;
+        std::fs::create_dir_all(dir).context("create the mirror dir")?;
+        std::fs::File::create(self.path.with_extension("rebuild"))
+            .context("create the mirror rebuild marker")?
+            .sync_all()
+            .context("sync the mirror rebuild marker")?;
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Only a completed checkpoint scan discharges the recovery obligation.
+    pub(crate) fn finish_rebuild(&self) -> Result<()> {
+        std::fs::remove_file(self.path.with_extension("rebuild"))
+            .context("remove the mirror rebuild marker")?;
+        let dir = self.path.parent().context("head file has no parent")?;
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    }
+
     /// Persist `head`.
     pub(crate) fn write(&self, head: u64) -> Result<()> {
         let dir = self.path.parent().context("head file has no parent")?;
@@ -50,5 +79,35 @@ mod tests {
         file.write(43).unwrap();
         assert_eq!(file.read(), Some(43));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unfinished_rebuild_survives_reopen_and_later_head_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("head");
+        let head = HeadFile::new(path.clone());
+        head.write(10).unwrap();
+        head.begin_rebuild().unwrap();
+        assert!(
+            std::fs::read(dir.path().join("head.rebuild"))
+                .unwrap()
+                .is_empty()
+        );
+        let restarted = HeadFile::new(path);
+        assert!(restarted.rebuild_pending().unwrap());
+        assert_eq!(restarted.read(), Some(10));
+        restarted.write(30).unwrap();
+        assert!(restarted.rebuild_pending().unwrap());
+        restarted.finish_rebuild().unwrap();
+        assert!(!restarted.rebuild_pending().unwrap());
+        assert_eq!(restarted.read(), Some(30));
+    }
+
+    #[test]
+    fn an_unwritable_marker_refuses_the_recovery_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("file");
+        std::fs::write(&parent, b"not a directory").unwrap();
+        assert!(HeadFile::new(parent.join("head")).begin_rebuild().is_err());
     }
 }

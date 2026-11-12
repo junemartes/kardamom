@@ -9,6 +9,8 @@
 # 5. No sealer setting that every member must match changes in the
 #    rolling path.
 # 5a. The registered sealer job does not name decisionVersion=3.
+# 5c. The genesis features only on a new chain, or on a sealer job that
+#     already carries them (genesis_gate.yml).
 # 6. The shard map does not change in the rolling path.
 # 7. When the sealer job changes, the target reads the newest snapshot
 #    of every sealer member.
@@ -389,6 +391,9 @@
     workloads_gate_new: >-
       {{ workloads_job_definition.TaskGroups[0].Tasks[0].Env.JAVA_TOOL_OPTIONS
          | regex_findall(workloads_gate_pattern) | map('join', '=') | list }}
+
+- name: Gate the genesis features
+  ansible.builtin.import_tasks: genesis_gate.yml
 
 - name: Refuse a rolling change of a sealer setting that every member must match
   ansible.builtin.assert:

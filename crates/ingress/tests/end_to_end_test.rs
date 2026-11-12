@@ -306,11 +306,11 @@ async fn mds_duplicate_receipts_dedup_resolves_submit_once() {
 /// executor's receipt lands shortly after. The client must get the
 /// receipt: the dedup drops the duplicate rejections, and the success
 /// overrides the earlier rejection. This drives the full proxy watcher
-/// pipeline, `tx_errors` bus to dedup to pending grace to receipt bus
+/// pipeline, `tx_errors` bus to dedup to pending wait to receipt bus
 /// release, which is what the live ingress uses.
 /// Fans out two duplicate rejections for `envelope`, a 2x fan-out from
 /// both racing replicas, then lands the twin's receipt after a short
-/// delay, well inside the rejection-release grace.
+/// delay beyond the non-duplicate rejection grace but inside the request deadline.
 async fn race_rejection_then_receipt(
     envelope: &kardamom_types::TxEnvelope,
     pos: BPosition,
@@ -327,7 +327,7 @@ async fn race_rejection_then_receipt(
             },
         });
     });
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    tokio::time::sleep(Duration::from_millis(750)).await;
     let _ = receipt_bus.send(
         Receipt {
             tx_idx: pos,
@@ -373,20 +373,23 @@ async fn racing_replica_rejection_is_overridden_by_twin_success() {
 
     let signer = signer_for_shard(0, TWO_SHARDS);
     let raw = sign_legacy(&signer, 0);
+    let expected_hash = alloy_primitives::keccak256(&raw);
     let resp = proxy
         .submit_raw("127.0.0.1".parse().unwrap(), raw)
         .await
         .expect("success must override the racing replica's rejection");
     assert!(resp.receipt.status);
     assert_eq!(resp.receipt.from, signer.address());
+    assert_eq!(resp.receipt.tx_hash, expected_hash);
+    assert_eq!(resp.receipt.nonce, 0);
+    assert_eq!(resp.receipt.tx_idx, pos);
 
     h.abort();
 }
 
 /// Companion test. A genuine duplicate, where both replicas
 /// reject and no receipt ever arrives, must still reach the client as a
-/// Duplicate error. The dedup drops the twin's copy, and the grace only
-/// delays the release.
+/// Duplicate error at the request deadline. The dedup drops the twin's copy.
 #[tokio::test(flavor = "multi_thread")]
 async fn genuine_rejection_from_both_replicas_reaches_the_client_once() {
     let cfg = IngressConfig {

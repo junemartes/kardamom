@@ -20,16 +20,15 @@ use crate::config::AeronConfig;
 use crate::error::LogError;
 use crate::recorder::RecorderThreads;
 
-/// How long a start waits for its own recording. One catalog poll is
-/// about 500 ms; the budget only bounds a stuck or unreachable archive.
-const READY_BUDGET: Duration = Duration::from_mins(1);
-
 /// What the recorder of one topic needs from the process.
 pub struct OwnRecording {
     pub topic: Topic,
     /// The media driver directory the archive session connects through.
     pub aeron_dir: Option<PathBuf>,
     pub aeron_cfg: AeronConfig,
+    /// How long the start tries the archive connect again. See
+    /// [`DiscoveredRecorder::connect_limit`].
+    pub connect_limit: Duration,
 }
 
 impl StreamPlane {
@@ -42,8 +41,8 @@ impl StreamPlane {
     /// # Errors
     ///
     /// Returns an error when the thread cannot be spawned, when the
-    /// recorder fails, or when the own recording is not live within one
-    /// minute.
+    /// recorder fails, or when the own recording is not live within the
+    /// ready budget ([`DiscoveredRecorder::ready_budget`]).
     pub async fn record_own(
         &mut self,
         rec: OwnRecording,
@@ -63,16 +62,18 @@ impl StreamPlane {
             own_instance,
             expected_own: 1,
             removal_grace: self.removal_grace(),
+            connect_limit: rec.connect_limit,
             membership,
             stop: recorders.stop_token(),
             runtime: tokio::runtime::Handle::current(),
         };
         let topic = rec.topic;
+        let budget = recorder.ready_budget();
         let (ready_tx, ready_rx) = oneshot::channel::<RecorderProgress>();
         recorders.spawn(format!("{topic}-recorder"), move |_stop| {
             Self::run_own_recorder(recorder, topic, ready_tx);
         })?;
-        Self::await_own(topic, ready_rx).await?;
+        Self::await_own(topic, ready_rx, budget).await?;
         Ok(Some(recorders))
     }
 
@@ -91,12 +92,13 @@ impl StreamPlane {
         }
     }
 
-    /// Wait for the own recording of `topic` to go live.
+    /// Wait up to `budget` for the own recording of `topic` to go live.
     async fn await_own(
         topic: Topic,
         ready_rx: oneshot::Receiver<RecorderProgress>,
+        budget: Duration,
     ) -> Result<(), LogError> {
-        match tokio::time::timeout(READY_BUDGET, ready_rx).await {
+        match tokio::time::timeout(budget, ready_rx).await {
             Ok(Ok(RecorderProgress::Ready { .. })) => {
                 tracing::info!("{topic} recording confirmed active");
                 Ok(())
@@ -110,7 +112,7 @@ impl StreamPlane {
             ))),
             Err(_) => Err(LogError::Aeron(format!(
                 "archive durability requested but the {topic} recording did not become active \
-                 within 60s"
+                 within {budget:?}"
             ))),
         }
     }

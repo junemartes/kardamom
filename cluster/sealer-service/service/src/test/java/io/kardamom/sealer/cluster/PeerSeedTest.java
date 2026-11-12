@@ -1,5 +1,6 @@
 package io.kardamom.sealer.cluster;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -12,6 +13,8 @@ import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
 import io.aeron.test.InterruptAfter;
 import io.aeron.test.InterruptingTestCallback;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
@@ -46,12 +49,13 @@ final class PeerSeedTest {
 
     @Test
     @InterruptAfter(value = 30, unit = TimeUnit.SECONDS)
-    void aBlankMemberWithoutPeersKeepsWaiting() throws InterruptedException {
-        final MemberContexts contexts = new MemberContexts(
-                dir.resolve("aeron").toString(),
-                dir.resolve("cluster").toString(),
-                dir.resolve("archive").toString(),
-                ClusterNode.memberEndpoints(MEMBERS, MEMBER_ID));
+    void aBlankMemberWithoutPeersKeepsWaitingAndPreservesOtherArchives() throws IOException, InterruptedException {
+        final Path executor = Files.createDirectories(dir.resolve("archive/dir"));
+        Files.writeString(executor.resolve("archive.catalog"), "live executor catalog");
+        Files.writeString(executor.resolve("0-0.rec"), "live executor recording");
+        final Path stale = dir.resolve("archive/99999-0.rec");
+        Files.writeString(stale, "stale Raft recording");
+        final MemberContexts contexts = contexts();
         final PeerSeed seed = new PeerSeed(
                 MEMBER_ID, ClusterNode.peerConsensusEndpoints(MEMBERS, MEMBER_ID), contexts, FAST,
                 Optional.empty());
@@ -65,6 +69,9 @@ final class PeerSeedTest {
 
         assertTrue(stillSeeding, "the seed must not return without a peer");
         assertFalse(contexts.clusterState().holdsRecordingLog(), "the member must stay blank");
+        assertFalse(Files.exists(stale), "the seed clears the old Raft recording");
+        assertEquals("live executor catalog", Files.readString(executor.resolve("archive.catalog")));
+        assertEquals("live executor recording", Files.readString(executor.resolve("0-0.rec")));
     }
 
     private MemberContexts contexts() {

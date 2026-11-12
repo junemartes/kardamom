@@ -1,0 +1,13 @@
+---
+node_software_marker_path: /etc/kardamom-node-software.json
+node_software_contract:
+  architecture: "{{ ansible_facts.architecture }}"
+  consul: "{{ consul_version }}"
+  nomad: "{{ nomad_version }}"
+  docker_channel: "{{ docker_apt_channel }}"
+  ubuntu: "{{ ubuntu_codename }}"
+  common_tasks: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/roles/common/tasks/install.yml') | hash('sha256') }}"
+  docker_tasks: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/roles/docker/tasks/install.yml') | hash('sha256') }}"
+  consul_tasks: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/roles/consul/tasks/install.yml') | hash('sha256') }}"
+  nomad_tasks: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/roles/nomad/tasks/install.yml') | hash('sha256') }}"
+node_software_fingerprint: "{{ node_software_contract | to_json(sort_keys=true) | hash('sha256') }}"

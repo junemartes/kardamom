@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::B256;
+use anyhow::Context;
 use futures::StreamExt;
 use jsonrpsee::http_client::HttpClient;
 
@@ -19,41 +20,37 @@ use crate::load::tracker::ReceiptStatus;
 /// overruns the deadline by the whole sweep.
 const SWEEP_CONCURRENCY: usize = 64;
 
-/// Join one queued task, or time out at `deadline`. Returns
-/// [`ControlFlow::Break`] once the deadline hits with tasks still
-/// outstanding.
+/// Join one queued task before the deadline. An unfinished or failed
+/// task leaves its transaction outcome unknown, so the measurement fails.
 async fn join_one_or_timeout(
     tasks: &mut tokio::task::JoinSet<()>,
     deadline: Instant,
-) -> ControlFlow<()> {
+) -> anyhow::Result<()> {
     let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero()
-        || tokio::time::timeout(remaining, tasks.join_next())
-            .await
-            .is_err()
-    {
-        tracing::warn!(
-            outstanding = tasks.len(),
-            "drain deadline hit with submit task(s) still in flight; \
-             their txs are counted offered but not accepted/missing/unlanded"
-        );
-        return ControlFlow::Break(());
+    let result = tokio::time::timeout(remaining, tasks.join_next())
+        .await
+        .with_context(|| format!("drain deadline with {} unfinished submit task(s); transaction outcomes are unknown", tasks.len()))?;
+    if let Some(joined) = result {
+        joined.context("load submit task fails; its transaction outcome is unknown")?;
     }
-    ControlFlow::Continue(())
+    Ok(())
 }
 
 /// Await every spawned submit task. Each task is bounded internally by
 /// the client's request timeout. This function gives up at `deadline`,
-/// so a wedged task cannot stall the verdict forever. Run this before
-/// [`drain`] and the final counts read: an in-flight task is counted
+/// so a wedged task cannot stall the verdict forever. An unfinished or
+/// failed task fails the measurement. Run this before the final counts
+/// read: an in-flight task is counted
 /// `offered` but is not yet `accepted`, `missing`, or `unlanded`, so
 /// evaluating early misclassifies the tail.
-pub(crate) async fn join_submit_tasks(tasks: &mut tokio::task::JoinSet<()>, deadline: Instant) {
+pub(crate) async fn join_submit_tasks(
+    tasks: &mut tokio::task::JoinSet<()>,
+    deadline: Instant,
+) -> anyhow::Result<()> {
     while !tasks.is_empty() {
-        let ControlFlow::Continue(()) = join_one_or_timeout(tasks, deadline).await else {
-            return;
-        };
+        join_one_or_timeout(tasks, deadline).await?;
     }
+    Ok(())
 }
 
 /// The client and tracker every drain or sweep operation shares.
@@ -129,8 +126,13 @@ impl Drainer {
     }
 
     /// Poll outstanding, un-confirmed transactions until they receipt
-    /// or `deadline` passes.
+    /// or `deadline` passes. Pending reads consume the same budget.
     pub(crate) async fn drain(&self, deadline: Instant) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let _ = tokio::time::timeout(remaining, self.drain_pending(deadline)).await;
+    }
+
+    async fn drain_pending(&self, deadline: Instant) {
         loop {
             let ControlFlow::Continue(()) = self.drain_tick_or_wait(deadline).await else {
                 return;

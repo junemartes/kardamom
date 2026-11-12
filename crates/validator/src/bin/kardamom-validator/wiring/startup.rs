@@ -48,6 +48,7 @@ impl Boot {
             args.metrics_addr,
             &args.host_id,
             kardamom_obs::Readiness::up()
+                .equals(kardamom_validator::metrics::PIPELINE_ACTIVE, 1.0)
                 .equals(kardamom_validator::metrics::VERDICT_STANDING, 0.0)
                 .within(
                     kardamom_validator::metrics::COMMITTED_BLOCK,
@@ -58,6 +59,7 @@ impl Boot {
         .await?;
         kardamom_engine::metrics::describe();
         kardamom_validator::metrics::describe();
+        kardamom_validator::metrics::set_pipeline_active(false);
 
         // The TOML supplies the `[cluster]` section. The canonical
         // tx_ordering stream is always the Aeron Cluster egress; all other
@@ -115,6 +117,10 @@ impl Boot {
 /// the once-only [`Boot`]. The first phase: nothing has opened state or
 /// streams yet.
 pub(crate) struct Startup {
+    /// Field order is drop order. A failed open cancels discovery and
+    /// pumps before the runtime waits for their runtime clones to close.
+    pub(super) stop_guard: tokio_util::sync::DropGuard,
+    pub(super) stop: tokio_util::sync::CancellationToken,
     pub(super) args: Args,
     pub(super) file_cfg: ValidatorFileConfig,
     pub(super) aeron_cfg: AeronConfig,
@@ -145,7 +151,10 @@ impl Startup {
             aeron_cfg.aeron_dir.clone_from(dir);
         }
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
+        let stop = plane.cancellation();
         Ok(Self {
+            stop_guard: stop.clone().drop_guard(),
+            stop,
             args,
             file_cfg: boot.file_cfg.clone(),
             aeron_cfg,
@@ -261,7 +270,12 @@ impl Opened {
     pub(crate) async fn open_streams(mut self) -> Result<Streamed> {
         let args = &self.base.args;
         let mut cluster_cfg = self.base.file_cfg.cluster.to_live();
-        if let Some(endpoints) = self.base.plane.cluster_ingress_endpoints().await? {
+        if let Some(endpoints) = self
+            .base
+            .plane
+            .cluster_ingress_endpoints(self.base.rt.start_open_limit())
+            .await?
+        {
             cluster_cfg.ingress_endpoints = endpoints;
         }
         // The kardamom_sealer_* re-export is the executor's job. A
@@ -308,8 +322,7 @@ impl Opened {
         // one stop guard in `run` ends the discovery tasks and the pumps
         // together. A static plane hands out a private parent nothing
         // else listens to.
-        let stop = self.base.plane.cancellation();
-        let pump_shutdown = stop.child_token();
+        let pump_shutdown = self.base.stop.child_token();
 
         // Flight ring: recent block inputs for the receipt-divergence
         // dump. Always on, since the receipt check runs on the sequential
@@ -326,7 +339,6 @@ impl Opened {
                 claims,
                 receipts,
                 interop_serve,
-                stop,
                 pump_shutdown,
                 flight,
             },
@@ -382,9 +394,6 @@ pub(crate) struct StreamsState {
     pub(super) claims: Arc<ClaimBuffer>,
     pub(super) receipts: Arc<ReceiptBuffer>,
     pub(super) interop_serve: Option<InteropServe>,
-    /// The parent of `pump_shutdown`: the plane's discovery token. The
-    /// stop guard in `run` cancels it, and the pumps stop with it.
-    pub(super) stop: tokio_util::sync::CancellationToken,
     pub(super) pump_shutdown: tokio_util::sync::CancellationToken,
     pub(super) flight: Arc<FlightRing>,
 }

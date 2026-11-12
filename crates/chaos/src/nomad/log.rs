@@ -81,13 +81,13 @@ impl Nomad {
     /// own log files persist across in-place restarts of the same
     /// allocation, so lines from a dead task generation are still here
     /// after the docker driver garbage-collected its container. A log
-    /// that the agent does not have (404) yields an empty string: an
-    /// allocation that Nomad collected, or a task that never started.
+    /// that no agent has (404) is empty only for a terminal allocation.
+    /// A missing live log is failed evidence and retries on both agents.
     ///
     /// # Errors
     ///
     /// Returns an error if the control agent fails the request for a
-    /// reason other than a 5xx, or if the control agent and the node's
+    /// reason other than a 404 or 5xx, or if the control agent and the node's
     /// agent both fail it for the whole retry budget.
     pub(crate) async fn task_log(
         &self,
@@ -168,7 +168,7 @@ impl Nomad {
         Ok(format!("{scheme}://{}", node.http_addr))
     }
 
-    /// One read of a task log from one agent. A 404 reads as empty text.
+    /// One read of a task log from one agent. A 404 is a missing log.
     /// A 5xx that says the log directory is gone is `Gone`; any other 5xx
     /// is a failed read. Both carry the body: the body names the cause,
     /// and the status alone does not.
@@ -181,7 +181,7 @@ impl Nomad {
             .with_context(|| format!("GET {url}"))?;
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
-            return Ok(LogRead::Text(String::new()));
+            return Ok(LogRead::Gone(format!("{status}: task log not found")));
         }
         if status.is_server_error() {
             let body = response.text().await.unwrap_or_default();

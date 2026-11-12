@@ -8,6 +8,11 @@ images_services: [ingress, sequencer, executor, validator, da-watcher, batcher, 
 images_release_dir: "{{ images_root }}/target/release"
 images_cluster_jar: "{{ images_root }}/cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar"
 images_push_node: "{{ lookup('env', 'REGISTRY_PUSH_NODE') }}" # e.g. control-0; empty pushes directly
+# The upstream images that the container path copies into the in-cluster
+# registry: every entry of upstream_images when the registry runs in a node
+# container (images_push_node), else none. A release for a real registry
+# copies none, and its jobs pull the upstream references.
+images_upstream: "{{ upstream_images if images_push_node | length > 0 else {} }}"
 images_docker_binary: docker
 images_sign: "{{ lookup('env', 'ACTIONS_ID_TOKEN_REQUEST_URL') | length > 0 }}"
 # Per-image helpers evaluated inside the image loop.

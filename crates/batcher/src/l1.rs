@@ -14,6 +14,8 @@
 //! decodes it back into the ordered [`BlockFrame`] stream, the input the
 //! `kardamom-reconstruct` crate re-executes to rebuild L2 state.
 
+use std::time::Duration;
+
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{Address, Bytes};
 use alloy_provider::Provider;
@@ -26,6 +28,13 @@ use crate::error::BatcherError;
 use crate::frame::BlockFrame;
 use crate::recon::reconstruct;
 use crate::settlement::IKardamomL2Settlement;
+
+/// How long a post waits for the receipt of its `postBatch` transaction.
+/// Ethereum adds a block every 12 s, so the wait covers ten blocks. A
+/// transaction that L1 does not mine in that time ends the post with an
+/// error. The sender then reads `lastBatchIndex` and finds out whether
+/// the transaction landed ([`crate::live::LiveSender`]).
+const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One posted batch as recovered from an on-chain `BatchPosted` event,
 /// or as the inbox indexer serves it (its JSON carries these fields and
@@ -50,7 +59,8 @@ pub struct BatchDescriptor {
 ///
 /// # Errors
 /// Returns an error when the dispersal fails, the transaction fails to
-/// send or reverts, or the receipt cannot be fetched.
+/// send or reverts, or the receipt does not arrive within
+/// [`RECEIPT_TIMEOUT`].
 pub async fn post_batch<P: Provider>(
     provider: &P,
     settlement: Address,
@@ -79,6 +89,7 @@ pub async fn post_batch<P: Provider>(
         .send_transaction(tx)
         .await
         .map_err(|e| BatcherError::L1(format!("send postBatch: {e}")))?
+        .with_timeout(Some(RECEIPT_TIMEOUT))
         .get_receipt()
         .await
         .map_err(|e| BatcherError::L1(format!("await postBatch receipt: {e}")))?;

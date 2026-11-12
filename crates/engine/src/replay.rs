@@ -32,8 +32,8 @@ use alloy_primitives::B256;
 use kardamom_state::{StateEnv, StateSnapshot, StateWriter, TrieMode, seed_genesis};
 use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage};
 use kardamom_types::{
-    AccountChange, BPosition, BlockBoundary, BlockFees, CodeEntry, Deposit, EpochRecord,
-    FeeSchedule, Receipt, SnapshotSource, TxEnvelope,
+    BPosition, BlockBoundary, BlockFees, Deposit, EpochRecord, FeeSchedule, GenesisAlloc, Receipt,
+    SnapshotSource, TxEnvelope,
 };
 
 use crate::actor::StateWriterSignal;
@@ -227,29 +227,24 @@ impl Counters {
     }
 }
 
-/// The chain a replay rebuilds: its id, its genesis allocation, and its
-/// fee schedule. Every value feeds the state roots, so a replay with the
+/// The chain a replay rebuilds: its id, its genesis state, and its fee
+/// schedule. Every value feeds the state roots, so a replay with the
 /// wrong one silently produces a different, wrong, root.
-#[derive(Debug, Clone, Copy)]
-pub struct ReplayGenesis<'a> {
+#[derive(Debug, Clone)]
+pub struct ReplayGenesis {
     pub chain_id: u64,
-    pub accounts: &'a [AccountChange],
-    pub code: &'a [CodeEntry],
+    pub alloc: GenesisAlloc,
     pub fees: Option<FeeSchedule>,
 }
 
-impl<'a> ReplayGenesis<'a> {
-    /// The replay chain of a parsed genesis file and its allocation.
+impl ReplayGenesis {
+    /// The replay chain of a parsed genesis file: its id, the state that
+    /// [`kardamom_types::Genesis::to_alloc`] builds, and its fee schedule.
     #[must_use]
-    pub fn of(
-        genesis: &kardamom_types::Genesis,
-        accounts: &'a [AccountChange],
-        code: &'a [CodeEntry],
-    ) -> Self {
+    pub fn of(genesis: &kardamom_types::Genesis) -> Self {
         Self {
             chain_id: genesis.chain_id,
-            accounts,
-            code,
+            alloc: genesis.to_alloc(),
             fees: genesis.fees,
         }
     }
@@ -274,7 +269,7 @@ impl<'a> ReplayGenesis<'a> {
 /// no state root (an internal invariant break: see [`ReplayError::NoStateRoot`]).
 pub fn replay_blocks<I>(
     env: StateEnv,
-    genesis: &ReplayGenesis<'_>,
+    genesis: &ReplayGenesis,
     blocks: I,
 ) -> Result<ReplayOutcome, ReplayError>
 where
@@ -282,7 +277,7 @@ where
 {
     // Genesis must be in place before the writer publishes its initial
     // snapshot. Then block 1 already has accounts to debit.
-    seed_genesis(&env, genesis.accounts, genesis.code)?;
+    seed_genesis(&env, &genesis.alloc)?;
 
     let handle = StateWriter::spawn_with_trie(env, TrieMode::Incremental)?;
 
@@ -451,7 +446,7 @@ impl<'a> Replay<'a> {
         queue: &'a mut MdbxWriterQueue,
         signal: &'a mut MdbxWriterSignal,
         source: &'a MdbxSnapshotSource,
-        genesis: &ReplayGenesis<'_>,
+        genesis: &ReplayGenesis,
     ) -> Self {
         Self {
             queue,
@@ -543,3 +538,7 @@ impl<'a> Replay<'a> {
 #[cfg(test)]
 #[path = "replay_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "replay_genesis_tests.rs"]
+mod genesis_tests;

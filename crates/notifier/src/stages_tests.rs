@@ -96,7 +96,7 @@ fn a_skipped_stage_is_not_filled_in() {
 }
 
 #[test]
-fn a_rejection_is_terminal() {
+fn a_rejection_suppresses_late_admission_events() {
     let start = Instant::now();
     let mut table = StageTable::new(64, start);
     let hash = B256::repeat_byte(4);

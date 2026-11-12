@@ -99,6 +99,15 @@ variable "prometheus_retention_size" {
   default = "0B"
 }
 
+# The window of KardamomCanaryStalled in deploy/alerts.yml: no successful
+# canary transfer for this long fires the alert. The job renders the rule
+# of that file with this window. The deploy passes it from
+# KARDAMOM_CANARY_STALLED_WINDOW.
+variable "canary_stalled_window" {
+  type    = string
+  default = "5m"
+}
+
 # The scrape of the egress (nomad/egress.nomad.hcl), "on" or "off". The
 # workloads role sets it on with the egress job (KARDAMOM_EGRESS=1).
 variable "egress" {
@@ -116,7 +125,33 @@ variable "grafana_admin_password" {
   default     = "kardamom"
 }
 
+variable "prometheus_image" {
+  type        = string
+  description = "The image reference. The default is the pinned upstream image (upstream_images in ansible/group_vars/all.yml). The container path passes the in-cluster copy."
+  default     = "prom/prometheus:v3.5.1@sha256:38c3b05c3bc744ff1b0b7b4eb82196026442845e62a1e2073795565da506d7a2"
+}
+
+variable "alertmanager_image" {
+  type        = string
+  description = "The image reference. The default is the pinned upstream image (upstream_images in ansible/group_vars/all.yml). The container path passes the in-cluster copy."
+  default     = "prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a"
+}
+
+variable "grafana_image" {
+  type        = string
+  description = "The image reference. The default is the pinned upstream image (upstream_images in ansible/group_vars/all.yml). The container path passes the in-cluster copy."
+  default     = "grafana/grafana:12.1.1@sha256:a1701c2180249361737a99a01bc770db39381640e4d631825d38ff4535efa47d"
+}
+
 locals {
+  # deploy/alerts.yml with the window of KardamomCanaryStalled. With the
+  # default window, the file renders unchanged.
+  alert_rules = replace(
+    file("../alerts.yml"),
+    "[5m])) == 0\n          and sum by (host_id) (increase(kardamom_canary_probe_total{probe=\"transfer\",outcome!=\"unfunded\"}[5m]))",
+    "[${var.canary_stalled_window}])) == 0\n          and sum by (host_id) (increase(kardamom_canary_probe_total{probe=\"transfer\",outcome!=\"unfunded\"}[${var.canary_stalled_window}]))",
+  )
+
   dc = var.datacenter
   # The admin endpoint of a sealer member (admin_port in nomad/cluster.nomad.hcl).
   sealer_admin_port = 40205
@@ -317,7 +352,7 @@ job "monitoring" {
       driver = "docker"
 
       config {
-        image        = "prom/prometheus:v3.5.1@sha256:38c3b05c3bc744ff1b0b7b4eb82196026442845e62a1e2073795565da506d7a2"
+        image        = var.prometheus_image
         network_mode = "host"
         # The CA of the Nomad agents, when the API speaks TLS: the scrape
         # of the Nomad metrics verifies the agent certificate against it.
@@ -364,7 +399,7 @@ job "monitoring" {
       # consul-template delimiters move out of their way.
       template {
         destination     = "local/alerts.yml"
-        data            = file("../alerts.yml")
+        data            = local.alert_rules
         left_delimiter  = "[[["
         right_delimiter = "]]]"
       }
@@ -395,7 +430,7 @@ job "monitoring" {
       driver = "docker"
 
       config {
-        image        = "prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a"
+        image        = var.alertmanager_image
         network_mode = "host"
         args = [
           "--config.file=/secrets/alertmanager.yml",
@@ -437,7 +472,7 @@ job "monitoring" {
       driver = "docker"
 
       config {
-        image        = "grafana/grafana:12.1.1@sha256:a1701c2180249361737a99a01bc770db39381640e4d631825d38ff4535efa47d"
+        image        = var.grafana_image
         network_mode = "host"
         volumes = [
           "local/provisioning:/etc/grafana/provisioning:ro",

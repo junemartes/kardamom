@@ -7,12 +7,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use crate::cases::cache::{mirror_rebuilds, wait_every_mirror_rebuilt, wait_readers_recovered};
+use crate::cases::cache::{CacheRecovery, RebuildPhase, wait_readers_recovered};
 use crate::cases::coordinated::assert_no_ref_below_floor;
 use crate::cases::da_watcher::assert_no_origin_gap;
-use crate::evidence::number_after;
+use crate::cases::lookup_blackout::{ANSWERED, LOOKUPS};
+use crate::evidence::{SEALER_MEMBERS, number_after};
 use crate::harness::Harness;
-use crate::poll::{self, Budget};
+use crate::poll::{self, Budget, Outcome};
 use crate::probes::Probed;
 use crate::rpc::Rpc;
 
@@ -23,16 +24,14 @@ use super::refill::RefillBaseline;
 /// comes from an executor's state DB.
 const CACHE_LOOKUPS: &str = "kardamom_cache_lookups_total";
 const STATE_HIT: &str = "outcome=\"state_hit\"";
-/// The sequencer's count of parks that asked for a floor, and its count
-/// of lookups by outcome. `ok` is an executor's answer, `redis` the
-/// projection's.
+/// The sequencer's count of parks that asked for a floor.
 const LOOKUP_REQUESTS: &str = "kardamom_sequencer_nonce_lookup_requests_total";
-const LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
-const FROM_EXECUTOR: &str = "outcome=\"ok\"";
-const FROM_REDIS: &str = "outcome=\"redis\"";
-/// The Raft members. Every one is live after the return, and every one
-/// must log a leadership term.
-const SEALER_MEMBERS: u64 = 3;
+/// How long the state-hit count of a restarted ingress may take to
+/// answer: a few scrapes past one that fails.
+const HITS_BUDGET: Budget = Budget {
+    timeout: Duration::from_secs(15),
+    interval: Duration::from_secs(3),
+};
 /// How long a receipted transfer gets to execute before the fault.
 const TRANSFER_BUDGET: Duration = Duration::from_secs(60);
 
@@ -42,8 +41,8 @@ pub(super) struct Baseline {
     /// The counters and the runs of the da-watcher, when a check asks
     /// for a refill.
     refill: Option<RefillBaseline>,
-    /// The finished rebuilds in the state-mirror logs.
-    rebuilds: usize,
+    /// Per-mirror rebuild evidence and exact idle account values.
+    rebuilds: Option<CacheRecovery>,
     /// A transfer receipted through ingress-0 before the fault. Its
     /// receipt lives in the memory caches of the ingresses, which their
     /// restart empties, so a restarted ingress can serve it only from an
@@ -66,9 +65,14 @@ impl Baseline {
         } else {
             None
         };
+        let rebuilds = if checks.contains(&Check::EveryMirrorRebuilt) {
+            Some(CacheRecovery::capture(h).await?)
+        } else {
+            None
+        };
         Ok(Self {
             refill,
-            rebuilds: mirror_rebuilds(h).await?,
+            rebuilds,
             receipted,
         })
     }
@@ -120,13 +124,29 @@ struct ReceiptProbe<'a> {
 impl ReceiptProbe<'_> {
     /// The receipts the ingress on `node` served from an executor's state
     /// DB. The counter lives in the ingress process, so it starts at zero
-    /// with a restarted ingress. An ingress that does not answer counts as
-    /// zero.
-    async fn state_hits(&self, node: &Probed) -> i64 {
+    /// with a restarted ingress. `None` when the ingress does not answer.
+    async fn state_hits(&self, node: &Probed) -> Option<i64> {
         let probes = &self.h.probes;
         let body = probes.scrape().fetch(&probes.ingress_target(node)).await;
         body.and_then(|b| crate::metrics::sum_where(&b, CACHE_LOOKUPS, STATE_HIT))
-            .unwrap_or(0)
+    }
+
+    /// The state hits of the ingress on `node`, from the first scrape
+    /// that answers. A failed scrape is no answer, so the probe scrapes
+    /// again, for at most `HITS_BUDGET`. `None` when no scrape answered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the wait fails.
+    async fn await_state_hits(&self, node: &Probed) -> anyhow::Result<Option<i64>> {
+        let outcome = poll::until(HITS_BUDGET, |_| async move {
+            Ok::<_, anyhow::Error>(self.state_hits(node).await)
+        })
+        .await?;
+        Ok(match outcome {
+            Outcome::Ready { value, .. } => Some(value),
+            Outcome::TimedOut { .. } => None,
+        })
     }
 
     /// The restarted ingress on `node` serves a receipt with status `0x1`
@@ -153,7 +173,13 @@ impl ReceiptProbe<'_> {
             crate::FAIL_PREFIX,
             node.container
         );
-        let hits = self.state_hits(node).await;
+        let hits = self.await_state_hits(node).await?.ok_or_else(|| {
+            crate::chaos_fail!(
+                "{ctx}: {} serves {hash}, and its exporter did not answer within {}s",
+                node.container,
+                HITS_BUDGET.timeout.as_secs()
+            )
+        })?;
         anyhow::ensure!(
             hits > 0,
             "{}: {ctx}: {} serves {hash} with no state query since its restart: its empty memory cache cannot hold that receipt",
@@ -262,15 +288,21 @@ impl Lookups {
             .scrape()
             .fetch(&h.probes.sequencer_lane0_target(i))
             .await?;
-        let count = |label| crate::metrics::sum_where(&body, LOOKUPS, label).unwrap_or(0);
-        Some(Self {
-            asked: crate::metrics::sum_where(&body, LOOKUP_REQUESTS, "").unwrap_or(0),
-            answered: count(FROM_EXECUTOR).saturating_add(count(FROM_REDIS)),
-        })
+        Some(Self::parse(&body))
+    }
+
+    pub(super) fn parse(body: &str) -> Self {
+        Self {
+            asked: crate::metrics::sum_where(body, LOOKUP_REQUESTS, "").unwrap_or(0),
+            // The answer count is an existence check. Saturation keeps it positive.
+            answered: ANSWERED.into_iter().fold(0i64, |total, label| {
+                total.saturating_add(crate::metrics::sum_where(body, LOOKUPS, label).unwrap_or(0))
+            }),
+        }
     }
 
     /// A replica that restarted with no floor parked a sender and asked
-    /// for its floor, and a source answered: the floor was looked up,
+    /// for its floor, and a committed source answered: the floor was looked up,
     /// not guessed.
     pub(super) fn looked_up(self) -> bool {
         self.asked > 0 && self.answered > 0
@@ -297,9 +329,10 @@ impl Lookups {
             Ok::<_, anyhow::Error>(all.then_some(lanes))
         })
         .await?;
+        let last = Self::read_lanes(h).await;
         let (lanes, elapsed) = outcome.or_fail(|t| {
             crate::chaos_fail!(
-                "{ctx}: a lane-0 replica did not look a floor up within {}s of its return: it guessed one, or its sender never parked",
+                "{ctx}: a lane-0 replica did not look a floor up within {}s of its return (last {last:?}): the case has no proof of a park and a committed answer",
                 t.as_secs()
             )
         })?;
@@ -335,6 +368,10 @@ pub(crate) enum Check {
 }
 
 impl Check {
+    pub(crate) async fn assert_one_leader(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+        Terms::parse(&h.evidence.cluster_logs().await?).assert_one_leader(ctx, SEALER_MEMBERS)
+    }
+
     pub(super) async fn assert(
         self,
         h: &Harness,
@@ -343,12 +380,18 @@ impl Check {
     ) -> anyhow::Result<()> {
         match self {
             Self::NoOriginGap => assert_no_origin_gap(h, ctx).await,
-            Self::OneLeaderPerTerm => Terms::parse(&h.evidence.cluster_logs().await?)
-                .assert_one_leader(ctx, SEALER_MEMBERS),
+            Self::OneLeaderPerTerm => Self::assert_one_leader(h, ctx).await,
             Self::NoRefBelowFloor => assert_no_ref_below_floor(h, ctx).await,
             Self::EpochRefill => baseline.assert_refill(h, ctx).await,
             Self::ReceiptFromState => baseline.assert_receipt_from_state(h, ctx).await,
-            Self::EveryMirrorRebuilt => wait_every_mirror_rebuilt(h, ctx, baseline.rebuilds).await,
+            Self::EveryMirrorRebuilt => {
+                baseline
+                    .rebuilds
+                    .as_ref()
+                    .ok_or_else(|| crate::chaos_fail!("{ctx}: no cache recovery baseline"))?
+                    .await_restored(h, ctx, RebuildPhase::Complete)
+                    .await
+            }
             Self::ReadersRecovered => wait_readers_recovered(h, ctx).await,
             Self::FloorsLookedUp => Lookups::assert_every_lane(h, ctx).await,
         }
