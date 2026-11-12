@@ -65,7 +65,7 @@ Every shard runs these stages in this order.
 
 ### Chaos case spine
 
-Every chaos case follows the same steps, within the case deadline (`CHAOS_CASE_S`, 180 s). A case that runs past its deadline fails at once, with the deadline in the failure text. Every case of the nightly shard `chaos-integrity` has a 60 min deadline.
+Every chaos case follows the same steps, within the case deadline (`CHAOS_CASE_S`, 300 s). A case that runs past its deadline fails at once, with the deadline in the failure text. Every case of the nightly shard `chaos-integrity` has a 60 min deadline.
 
 1. Pick a funded account and start the case load. The load window is the deadline. The load ends its submissions when the case body ends. A case that measures a catch-up (`validator-lapse`, `validator-join`) replaces the case load with a load at the probe rate before the measurement: the catch-up runs under load, and every transaction of that load must get a receipt.
 2. Wait for the injection gate. See [Gates](#gates).
@@ -661,7 +661,7 @@ A value that does not parse fails the run at start. A zero value fails for a kno
 |---|---|---|
 | `CHAIN_ID` | `412346` | The L2 chain id. |
 | `CHAOS_TPS` | `100` | The steady load rate of every case, in tx/s. The cluster and the load share one 4-vCPU runner, and 200 tx/s starves the recovery of every case. |
-| `CHAOS_CASE_S` | `180` | The deadline of a case, in seconds, from the start of its load to its verdict. The case load window is the deadline. The nightly cases have a 60 min deadline. |
+| `CHAOS_CASE_S` | `300` | The deadline of a case, in seconds, from the start of its load to its verdict. The case load window is the deadline. The slowest regular cases need about 210 s on a CI runner. The nightly cases have a 60 min deadline. |
 | `LOAD_MAX_GAP` | `5` | The keep-pace bound: sealer block minus executor block. |
 | `LOAD_RETRY` | `2` | The per-submit retry attempts of the load. Some cases set their own value. |
 | `CHAOS_RESTART_SLO_S` | `60` | The restart SLO of a task on the same node. |
