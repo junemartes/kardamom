@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import os
+import pickle
 import re
 from pathlib import Path
 import shutil
@@ -437,6 +438,19 @@ class Dependency(Deployment):
         return super().state(poll)
 
 
+class ProcessDirectory:
+    """The test directory of this process: the same name in each test, and
+    empty at the start of each test."""
+
+    def __init__(self):
+        self.name = str(Path(tempfile.gettempdir()) / f'kardamom-deploy-test-{os.getpid()}')
+        self.cleanup()
+        Path(self.name).mkdir()
+
+    def cleanup(self):
+        shutil.rmtree(self.name, ignore_errors=True)
+
+
 @unittest.skipUnless(shutil.which('nomad') and shutil.which('ansible-playbook'),
                      'nomad and ansible-playbook required')
 class Deploys(unittest.TestCase):
@@ -444,14 +458,23 @@ class Deploys(unittest.TestCase):
     operator binary. The test classes below split the suite so CI runs them
     in parallel processes."""
 
+    # The deploys of this process, by the hash of their inputs: the exit
+    # status, the output, and the state of the fake API and the files of
+    # the test directory after the deploy.
+    runs = {}
+    # The port of the fake API. Each test of the process binds the same
+    # port, so that the same inputs give the same command in each test.
+    port = 0
+
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix='kardamom-deploy-test-')
+        self.tmp = ProcessDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.manifest = Path(self.tmp.name) / 'images.digests'
         self.manifest.write_text(''.join(
             f'{s} registry.example:5000/kardamom-{s}:test@sha256:{"a" * 64}\n' for s in MANIFEST))
         # Every loopback address, so the sealer nodes' 127.0.0.<n> resolve here.
-        self.api = ThreadingHTTPServer(('0.0.0.0', 0), NomadAPI)
+        self.api = ThreadingHTTPServer(('0.0.0.0', Deploys.port), NomadAPI)
+        Deploys.port = self.api.server_port
         self.api.state = {'jobs': {}, 'writes': [], 'deployments': {}, 'roles': {},
                           'variables': {}, 'variable_writes': [], 'records': {}, 'record_index': {},
                           'record_writes': [],
@@ -489,6 +512,8 @@ class Deploys(unittest.TestCase):
         self.thread.start()
         self.addCleanup(self.api.server_close)
         self.addCleanup(self.api.shutdown)
+        # The fixture of `deploy`: none before its first call in the test.
+        self.fixture = None
 
     def git(self, *args):
         # A fixed date gives each commit the same hash in every test.
@@ -538,10 +563,68 @@ class Deploys(unittest.TestCase):
         env.update(environ or {})
         cmd = ['ansible-playbook', '-i', inventory, str(ANSIBLE / playbook),
                '-e', json.dumps(variables)] + (['--check'] if check else [])
-        result = subprocess.run(cmd, cwd=ANSIBLE.parent, env=env, text=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
-        self.assertEqual(result.returncode == 0, success, result.stdout)
-        return result.stdout
+        # A deploy reads only the command, the environment, the state of the
+        # fake API, the files of the test directory and the commits of the
+        # target tree. The first deploy of some inputs runs; a later deploy of
+        # the same inputs, in this test or another, gets its result and its
+        # effects. A deploy writes a timestamp in each record, so two deploys
+        # in sequence give the same key only when the first one did too. The
+        # command names an outside process, such as an anvil, by its port.
+        key = hashlib.sha256(pickle.dumps((cmd, sorted(env.items()), self.api.state, self.files(),
+                                           self.git('rev-parse', 'HEAD')))).hexdigest()
+        if key in Deploys.runs:
+            returncode, stdout, state, files = Deploys.runs[key]
+            self.api.state = copy.deepcopy(state)
+            self.restore(files)
+        else:
+            result = subprocess.run(cmd, cwd=ANSIBLE.parent, env=env, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
+            returncode, stdout = result.returncode, result.stdout
+            Deploys.runs[key] = (returncode, stdout, copy.deepcopy(self.api.state), self.files())
+        self.assertEqual(returncode == 0, success, stdout)
+        return stdout
+
+    def files(self):
+        """The files of the test directory by relative path (see `content`).
+        The Ansible temporary files and the git store are not part of it; the
+        HEAD of the target tree names its commits."""
+        root = Path(self.tmp.name)
+        return {str(path.relative_to(root)): self.content(path) for path in sorted(root.rglob('*'))
+                if path.relative_to(root).parts[0] != 'ansible'
+                and path.relative_to(root).parts[:2] != ('repo', '.git')}
+
+    @staticmethod
+    def content(path):
+        """The content and the mode of a file, None for a directory."""
+        if path.is_dir():
+            return None
+        return path.read_bytes(), path.stat().st_mode
+
+    def restore(self, files):
+        """Make the test directory hold `files` (see `files`)."""
+        root = Path(self.tmp.name)
+        current = self.files()
+        for relative in sorted(current.keys() - files.keys(), reverse=True):
+            self.remove(root / relative, current[relative])
+        for relative, content in files.items():
+            self.write(root / relative, content)
+
+    @staticmethod
+    def remove(path, content):
+        """Remove a file, or a directory that holds no file any more."""
+        if content is None:
+            path.rmdir()
+        else:
+            path.unlink()
+
+    @staticmethod
+    def write(path, content):
+        """Make `path` hold `content` (see `content`)."""
+        if content is None:
+            path.mkdir(exist_ok=True)
+        else:
+            path.write_bytes(content[0])
+            path.chmod(content[1])
 
     # The jobs a manifest with new digests changes, in deploy order: every
     # pinned image, and not anvil or the monitoring. The data directory job
@@ -574,38 +657,30 @@ class Deploys(unittest.TestCase):
     def run_rollback(self, success=True, environ=None):
         return self.run_deploy(playbook='rollback.yml', success=success, environ=environ)
 
-    # The results of the deploys on a fresh fixture, kept per test class and
-    # per deploy setting: the state of the fake API, and a directory with a
-    # copy of the record directory.
-    deployed = None
     # The environment of the default deploy.
     DEPLOY_ENVIRON = {}
 
     def deploy(self, extra=None, environ=None):
-        """Run a deploy on the fresh fixture of this test: the default deploy,
-        or the one of the extra vars `extra` and the environment `environ`.
+        """Run a deploy on the fixture of this test: the default deploy of the
+        class, or the one of the extra vars `extra` and the environment
+        `environ`. The first call keeps the state of the fake API and the
+        record directory as the fixture. Each later call in the test starts
+        from that fixture again, so that each call deploys the same release on
+        the same chain. A deploy of the whole pipeline takes minutes, and
+        `run_deploy` runs a deploy of the same inputs only once in a process."""
+        if self.fixture is None:
+            self.fixture = (copy.deepcopy(self.api.state), self.records())
+        self.api.state = copy.deepcopy(self.fixture[0])
+        shutil.rmtree(self.record_dir, ignore_errors=True)
+        for relative, content in self.fixture[1].items():
+            self.write(Path(self.tmp.name) / relative, content)
+        self.run_deploy(extra, environ=self.DEPLOY_ENVIRON if environ is None else environ)
 
-        A deploy of the whole pipeline takes minutes on a loaded runner. The
-        first test of a class runs it. Every later test restores the state
-        and the files that it left. The copy is valid only while the first
-        deploy gives the same result in every test: the same fixtures, the
-        same revision, and no `.calls` file of a stub.
-        """
-        cls = type(self)
-        if cls.deployed is None:
-            cls.deployed = {}
-        environ = self.DEPLOY_ENVIRON if environ is None else environ
-        key = json.dumps([extra, environ], sort_keys=True)
-        if key not in cls.deployed:
-            self.run_deploy(extra, environ=environ)
-            files = tempfile.TemporaryDirectory(prefix='kardamom-deploy-snapshot-')
-            cls.addClassCleanup(files.cleanup)
-            shutil.copytree(self.record_dir, Path(files.name) / 'deployed')
-            cls.deployed[key] = (copy.deepcopy(self.api.state), files)
-            return
-        state, files = cls.deployed[key]
-        self.api.state = copy.deepcopy(state)
-        shutil.copytree(Path(files.name) / 'deployed', self.record_dir, dirs_exist_ok=True)
+    def records(self):
+        """The record directory in the form of `files`."""
+        name = self.record_dir.name
+        return {relative: content for relative, content in self.files().items()
+                if Path(relative).parts[0] == name}
 
     def gate_formats(self, findings):
         """Deploy once, give the accepted release the formats text that the
