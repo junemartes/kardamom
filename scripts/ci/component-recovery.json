@@ -3032,16 +3032,16 @@
         "pipeline_recovery",
         "--",
         "--ignored",
-        "--test-threads=1",
-        "--skip",
-        "sequencer_executor_redis_loss_on_the_v2_loop_looks_every_floor_up"
+        "--test-threads=1"
       ],
       "real": [
         "kardamom-ingress pair, kardamom-sequencer per lane, kardamom-executor and kardamom-validator processes",
+        "a carry-born chain, as the regular chaos shards run it: sealer members on decision version 5 with the carry window from genesis, sequencers on the v2 loop, the executor on the member feed, the validator on the egress service, and the egress service fed by the executor",
         "Java sealer cluster members (three for the cases that take the sealer down)",
         "host-native ArchivingMediaDriver and archive with tx_data recording and refetch",
         "Anvil, the L1 follower and the da-watcher for the epoch checks",
-        "SIGTERM drain and SIGKILL of the service processes, and their start on persisted state"
+        "SIGTERM drain and SIGKILL of the service processes, and their start on persisted state",
+        "a reference-born chain with the v1 loop for the sealer leader stop and for the v1 run of the sequencer, executor and Redis loss"
       ],
       "controlled": [
         "a case load of 1-wei transfers through ingress 0, with resubmits and receipt reads on every ingress",
@@ -3049,7 +3049,8 @@
         "process stops and starts in the order of each chaos case; two replicas of the case lane for the lane loss",
         "a Redis container with no persistence and a state mirror for the blackout",
         "sequencers that read that Redis in their nonce lookup, for the sequencer, executor and Redis loss",
-        "a SIGTERM stop of the sealer leader of three members, with the case load flowing"
+        "a SIGTERM stop of the sealer leader of three members, with the case load flowing",
+        "a check at the start of each carry-born case that every sealer member reports decision version 5, the carry window and the genesis features"
       ],
       "tests": [
         "ingress_pair_loss_returns_both_replicas",
@@ -3058,9 +3059,10 @@
         "pipeline_blackout_restarts_every_process_and_reelects",
         "pipeline_blackout_rebuilds_the_read_path",
         "sequencer_executor_redis_loss_looks_every_floor_up",
+        "sequencer_executor_redis_loss_on_the_v1_loop_looks_every_floor_up",
         "a_sealer_leader_stop_keeps_the_executor_at_the_sealed_head"
       ],
-      "limitation": "Stack suite, not isolated: each case needs more than one real service. All services share one host and one media driver. The blackout runs one sealer member to stay inside 60 s; the combined suite closes elections of three. The blackout is two tests: one with the L1 stack and the validator, one with Redis and the state mirror. Nomad placement, node power loss and container identity stay with the cluster suite. Needs the service binaries, the sealer jar and the aeron-all jar. The sequencer, executor and Redis loss also needs a debug sequencer with the floor-seams feature; the workspace build of the suite has it. That case runs the v1 loop only; the chaos case runs v2. On the v2 loop, the case load does not land within 30 s of the return in about half the runs, with or without the seam, so the v2 test stays out of the catalog and the suite command skips it. It returns the classes 8 s apart, not 30 s. It reads both replicas of the case lane, not lane 0. The local ingress has no [cache], so it does not check the degraded read of the ingress while Redis is down.",
+      "limitation": "Stack suite, not isolated: each case needs more than one real service. All services share one host and one media driver. The blackout runs one sealer member to stay inside 60 s; the combined suite closes elections of three. The blackout is two tests: one with the L1 stack and the validator, one with Redis and the state mirror. Nomad placement, node power loss and container identity stay with the cluster suite. Needs the service binaries, the sealer jar and the aeron-all jar. The sequencer, executor and Redis loss also needs a debug sequencer with the floor-seams feature; the workspace build of the suite has it. That case runs two times: on the v2 loop of a carry-born chain, as the chaos case, and on the v1 loop of a reference-born chain. It returns the classes 8 s apart, not 30 s. It reads both replicas of the case lane, not lane 0. The local ingress has no [cache], so it does not check the degraded read of the ingress while Redis is down. The local stack has one executor, on the feed of sealer member 0. On a carry-born chain, an executor whose member stops reads the egress service, and only the other executors feed that service. So the sealer leader stop runs on a reference-born chain. No negative control fails the graceful sequencer test after its fault on the v2 loop: the test also passes when the lookup hides each established sender. The blackout test passes, with the case load 28 s later, when a restarted sequencer starts below the decision version of the sealer.",
       "negative_controls": [
         {
           "mutation": "The ingress receipt query skips its egress and executor layers, so a restarted ingress serves no receipt from state.",
@@ -3072,17 +3074,17 @@
           "intended_failure": true
         },
         {
-          "mutation": "The sequencer nonce lookup sends no query, so a cold replica never learns the floor of an established sender.",
+          "mutation": "The account lookup of the sequencer reports each established sender as missing, so a cold replica never learns the floor of an established sender.",
           "tests": [
-            "graceful_sequencer_drains_and_a_cold_start_regains_its_senders",
-            "sequencer_lane_loss_relearns_the_sender_floor"
+            "sequencer_lane_loss_relearns_the_sender_floor",
+            "sequencer_executor_redis_loss_looks_every_floor_up"
           ],
           "exit_code": 101,
           "compiled": true,
           "intended_failure": true
         },
         {
-          "mutation": "The consumer join-miss refetch from the archive is off, so a restarted executor cannot execute replayed records.",
+          "mutation": "The member feed reader of the executor sends no request from a cursor above 0, so a restarted executor gets no entry after its cursor.",
           "tests": [
             "pipeline_blackout_restarts_every_process_and_reelects"
           ],
@@ -3102,7 +3104,7 @@
         {
           "mutation": "A park of a sender with no known floor asks no nonce lookup, so the returned sequencers wait for receipts alone.",
           "tests": [
-            "sequencer_executor_redis_loss_looks_every_floor_up"
+            "sequencer_executor_redis_loss_on_the_v1_loop_looks_every_floor_up"
           ],
           "exit_code": 101,
           "compiled": true,
@@ -3111,7 +3113,7 @@
         {
           "mutation": "The nonce lookup drops every answer, so with the floor seam no sender gets a first floor after the return.",
           "tests": [
-            "sequencer_executor_redis_loss_looks_every_floor_up"
+            "sequencer_executor_redis_loss_on_the_v1_loop_looks_every_floor_up"
           ],
           "exit_code": 101,
           "compiled": true,
@@ -3125,11 +3127,20 @@
           "exit_code": 101,
           "compiled": true,
           "intended_failure": true
+        },
+        {
+          "mutation": "The stack starts the sealer members without their genesis features, so the chain is not carry-born and the mode check of the case fails.",
+          "tests": [
+            "ingress_pair_loss_returns_both_replicas"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
         }
       ],
       "ci_mode": "stack",
       "test_timeout_s": 90,
-      "test_timeout_reason": "the sequencer, executor and Redis loss returns its classes 8 s apart and waits up to 30 s for the case load; it runs 44 to 55 s locally"
+      "test_timeout_reason": "the sequencer, executor and Redis loss returns its classes 8 s apart and waits up to 30 s for the case load; its v1 run takes 44 to 55 s locally"
     },
     "sequencer-lapse-stack": {
       "command": [
@@ -3148,6 +3159,7 @@
       ],
       "real": [
         "kardamom-sequencer processes on the v2 loop: the case lane's replica and its twin",
+        "a carry-born chain, as the regular chaos shards run it: sealer members on decision version 5 with the carry window from genesis, sequencers on the v2 loop, the executor on the member feed, the validator on the egress service, and the egress service fed by the executor",
         "kardamom-ingress pair, kardamom-executor and kardamom-validator processes",
         "Java sealer member and the host-native ArchivingMediaDriver with its client liveness",
         "SIGSTOP and SIGCONT of the replica process, its Aeron fail-fast exit and its cold start"
@@ -3163,6 +3175,15 @@
       "negative_controls": [
         {
           "mutation": "The Aeron fail-fast handler logs the client error and does not exit, so the thawed replica keeps a dead client.",
+          "tests": [
+            "a_frozen_sequencer_exits_on_the_client_timeout_and_returns_cold_with_fresh_work"
+          ],
+          "exit_code": 101,
+          "compiled": true,
+          "intended_failure": true
+        },
+        {
+          "mutation": "The stack starts the sealer members without their genesis features, so the chain is not carry-born and the mode check of the case fails.",
           "tests": [
             "a_frozen_sequencer_exits_on_the_client_timeout_and_returns_cold_with_fresh_work"
           ],
@@ -3190,6 +3211,7 @@
       ],
       "real": [
         "kardamom-ingress pair, kardamom-sequencer per lane, kardamom-executor and kardamom-validator processes",
+        "a carry-born chain, as the regular chaos shards run it: sealer members on decision version 5 with the carry window from genesis, sequencers on the v2 loop, the executor on the member feed, the validator on the egress service, and the egress service fed by the executor; the two cases of the nightly shard chaos-integrity run on a reference-born chain with the v1 loop, as that shard",
         "Java sealer cluster members (three for the cases that take the sealer down)",
         "host-native ArchivingMediaDriver and archive with tx_data recording and refetch",
         "Anvil, the L1 follower and the da-watcher for the epoch checks",
@@ -3198,7 +3220,8 @@
       "controlled": [
         "a case load of 1-wei transfers through ingress 0, with resubmits and receipt reads on every ingress",
         "a recovery probe of the case sender and a fresh sender",
-        "class stops and returns in the order of each case, with an eight-second stagger"
+        "class stops and returns in the order of each case, with an eight-second stagger",
+        "a check at the start of each carry-born case that every sealer member reports decision version 5, the carry window and the genesis features"
       ],
       "tests": [
         "ingress_and_sequencer_loss_return_in_order",
@@ -3207,12 +3230,13 @@
         "ingress_sequencer_and_sealer_return_in_order",
         "ingress_sequencer_and_sealer_return_in_reverse_and_wait"
       ],
-      "limitation": "Stack suite, not isolated: the subject is the interplay of the ingress, sequencer and sealer classes. The stagger and hold are shorter than the deployed ones. Nomad job restore stays with the cluster suite. Needs the service binaries, the sealer jar, the aeron-all jar and Anvil.",
+      "limitation": "Stack suite, not isolated: the subject is the interplay of the ingress, sequencer and sealer classes. The stagger and hold are shorter than the deployed ones. Nomad job restore stays with the cluster suite. Needs the service binaries, the sealer jar, the aeron-all jar and Anvil. On the carry-born chain, the control of the forced session does not fail ingress_sequencer_and_sealer_return_in_order: every client of the sealer starts again in that case, and the executor reads the member feed, so no checked client keeps an old session. The lookup control fails it.",
       "negative_controls": [
         {
-          "mutation": "The sequencer nonce lookup sends no query, so a cold replica never learns the floor of an established sender.",
+          "mutation": "The account lookup of the sequencer reports each established sender as missing, so a cold replica never learns the floor of an established sender.",
           "tests": [
-            "ingress_and_sequencer_loss_return_in_order"
+            "ingress_and_sequencer_loss_return_in_order",
+            "ingress_sequencer_and_sealer_return_in_order"
           ],
           "exit_code": 101,
           "compiled": true,
@@ -3223,7 +3247,6 @@
           "tests": [
             "ingress_returns_before_the_sealer_and_waits",
             "sequencer_and_sealer_loss_stall_then_return_together",
-            "ingress_sequencer_and_sealer_return_in_order",
             "ingress_sequencer_and_sealer_return_in_reverse_and_wait"
           ],
           "exit_code": 101,

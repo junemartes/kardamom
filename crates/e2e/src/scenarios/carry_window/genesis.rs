@@ -39,9 +39,6 @@ use crate::harness::LocalStack;
 use crate::harness::metrics::poll_until;
 use crate::scenarios::metric_u64;
 
-/// The `genesisFeatures` value of `/status` on every member.
-const GENESIS_FEATURES: &str = "3,4,5";
-
 /// `kardamom_sealer_snapshot_version` of a snapshot that holds the switch
 /// section: the held activations of the genesis features.
 const SWITCH_SNAPSHOT: u64 = 18;
@@ -93,13 +90,7 @@ impl Rollout<'_> {
     /// Wait until every member runs the genesis rules: decision version 5,
     /// the carry window, the genesis features, and each carry feature on.
     async fn await_genesis_rules(&self) -> Result<()> {
-        poll_until("the genesis rules on every member", WAIT, POLL, || async {
-            let statuses = self.members.statuses().await.ok();
-            Ok(statuses
-                .filter(|all| all.iter().all(Self::runs_genesis_rules))
-                .map(|_| ()))
-        })
-        .await?;
+        self.members.await_genesis_rules().await?;
         futures::future::try_join_all(SEALER_FEATURES.iter().map(|id| async move {
             let label = format!("feature=\"{id}\"");
             self.members
@@ -108,13 +99,6 @@ impl Rollout<'_> {
         }))
         .await
         .map(|_| ())
-    }
-
-    /// Whether the `/status` of a member shows the genesis rules.
-    fn runs_genesis_rules(status: &serde_json::Value) -> bool {
-        status["decisionVersion"].as_u64() == Some(5)
-            && status["carryWindow"].as_bool() == Some(true)
-            && status["genesisFeatures"].as_str() == Some(GENESIS_FEATURES)
     }
 
     /// No sealer process of the stack logged a switch of the decision

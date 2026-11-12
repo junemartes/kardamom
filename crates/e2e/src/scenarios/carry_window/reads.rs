@@ -7,6 +7,7 @@ use std::time::Duration;
 use alloy_primitives::B256;
 use anyhow::{Context, Result};
 
+use crate::harness::GENESIS_FEATURES;
 use crate::harness::l2::L2Client;
 use crate::harness::metrics::{self, poll_until};
 use crate::scenarios::metric_u64;
@@ -90,13 +91,35 @@ impl<'a> Gauge<'a> {
 }
 
 /// The admin endpoints of the sealer members.
-pub(super) struct Members {
+pub(crate) struct Members {
     admin: Vec<SocketAddr>,
 }
 
 impl Members {
-    pub(super) fn new(admin: Vec<SocketAddr>) -> Self {
+    pub(crate) fn new(admin: Vec<SocketAddr>) -> Self {
         Self { admin }
+    }
+
+    /// Wait until every member reports the genesis rules on `/status`:
+    /// decision version 5, the carry window and the genesis features.
+    ///
+    /// # Errors
+    /// Returns an error when the wait ends first.
+    pub(crate) async fn await_genesis_rules(&self) -> Result<()> {
+        poll_until("the genesis rules on every member", WAIT, POLL, || async {
+            let statuses = self.statuses().await.ok();
+            Ok(statuses
+                .filter(|all| all.iter().all(Self::runs_genesis_rules))
+                .map(|_| ()))
+        })
+        .await
+    }
+
+    /// Whether the `/status` of a member shows the genesis rules.
+    fn runs_genesis_rules(status: &serde_json::Value) -> bool {
+        status["decisionVersion"].as_u64() == Some(5)
+            && status["carryWindow"].as_bool() == Some(true)
+            && status["genesisFeatures"].as_str() == Some(GENESIS_FEATURES)
     }
 
     /// The admin endpoint of member `id`.

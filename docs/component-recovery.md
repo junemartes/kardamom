@@ -357,7 +357,7 @@ fail when the loop sends no lookup, ignores canonical and row events, the
 lookup task drops its answer, or the egress feed does not mark a boundary.
 
 `sequencer-lapse-stack` runs the same lapse with real processes on the local
-stack: the sequencers on the v2 loop, a twin of the case lane, the ingress
+stack, on a carry-born chain: the sequencers on the v2 loop, a twin of the case lane, the ingress
 pair, the executor, the validator, a sealer member and the host-native media
 driver. SIGSTOP freezes the case lane's replica for 14 seconds, past the
 10-second client liveness of the driver, while the twin keeps the load
@@ -749,6 +749,24 @@ persisted: the sealer members on their own logs, the executor and the validator 
 their state directories, the driver on its archive. Ingresses and sequencers
 start cold, as in the deployment.
 
+Each test runs the mode of the shard of its chaos case, and prints it:
+
+- The cases of the regular chaos shards run on a carry-born chain. The sealer
+  members run decision version 5 with the carry window from genesis. The
+  sequencers run the v2 loop and start at the version floor 5, also after a
+  restart. The executor reads the member feed, and the validator reads the egress
+  service. Each of these cases first requires that every sealer member reports
+  these rules.
+- The two cases of the nightly shard `chaos-integrity`
+  (`sequencer-sealer-loss-recover`, `ingress-sequencer-sealer-reverse`) run on a
+  reference-born chain with the v1 loop, as that shard does.
+- The sequencer, executor and Redis loss runs two times: on the v2 loop of a
+  carry-born chain, and on the v1 loop of a reference-born chain.
+- The sealer leader stop runs on a reference-born chain. The local stack has one
+  executor, on the feed of sealer member 0. On a carry-born chain, an executor
+  whose member stops reads the egress service, and only the other executors feed
+  that service.
+
 Every test ends with the checks of a chaos case. A case load sends through
 ingress 0 for the whole case, and tries a failed submit again with the same bytes.
 While a submit waits, the load also asks every ingress for the receipt. Every
@@ -786,9 +804,9 @@ Each test takes 14 to 50 seconds on a loaded host, including the stack start.
 The pipeline blackout also kills the media driver, the L1 follower and the
 da-watcher, or Redis and the state mirror. The killed archive leaves an active mark
 file, so the returned driver starts only after it ages out, as the scheduler's
-restarts of the driver task see. Every process then starts at once. The executor
-and the validator refetch the envelopes of replayed records from the archive; the
-local validator gets the refetch endpoints of the deployed job. Redis returns
+restarts of the driver task see. Every process then starts at once. On the
+carry-born chain, the executor asks the member feed for the entries after its
+cursor, and the validator reads the egress service. Redis returns
 empty, and the state mirror must serve again with keys rebuilt from the
 executor's newest checkpoint, with the row of a funded account that no traffic
 touches: only a rebuild writes it. The blackout runs as two tests, one with the
@@ -796,10 +814,17 @@ L1 stack and the validator, one with Redis and the state mirror, so each stays
 inside 60 seconds. Both run one sealer member; the combined cases close elections
 of three members.
 
-Compiled negative controls fail these tests at recovery: an ingress that serves
-no receipt from state, a sequencer lookup that sends no query, a cluster client
-that never forces a new session after egress silence, and an executor with no
-archive refetch, and a state mirror that never rebuilds.
+Compiled negative controls fail these tests at recovery, each one measured in the
+mode of its test: an ingress that serves no receipt from state, a sequencer lookup
+that reports each established sender as missing, a cluster client that never
+forces a new session after egress silence, a member feed reader that sends no
+request from a cursor above 0, a state mirror that never rebuilds, and a stack
+that starts the sealer members without their genesis features. Three limits
+remain, and the catalog states them. No control fails the graceful sequencer test
+after its fault on the v2 loop. The control of the forced session does not fail
+`ingress_sequencer_and_sealer_return_in_order` on the carry-born chain. The
+blackout test passes, with the case load 28 seconds later, when a restarted
+sequencer starts below the decision version of the sealer.
 
 `just test-component ingress-recovery` runs the single-service ingress cases in
 isolation. Each ingress replica is the real `kardamom-ingress` binary on its own

@@ -229,18 +229,13 @@ impl<'a> StackLaunch<'a> {
         }
     }
 
-    /// Spawn one sequencer per shard. In carry mode from genesis each one
-    /// starts at the floor 5, so that no reference without bytes goes out
-    /// before the first report of the sealer.
+    /// Spawn one sequencer per shard.
     fn spawn_sequencers(
         &self,
         spec: &ServiceSpec<'_>,
         read_path: Option<&super::read_path::ReadPath>,
     ) -> Result<Vec<services::Spawned>> {
-        let opts = services::SequencerOptions {
-            sealer_version_floor: if self.cfg.carry_genesis() { 5 } else { 0 },
-            ..self.cfg.sequencer_options(read_path)
-        };
+        let opts = self.cfg.sequencer_options(read_path);
         (0..self.cfg.shards.get())
             .map(|i| services::spawn_sequencer_with(spec, i, &opts))
             .collect()

@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 
 use super::load::RunningLoad;
 use super::{CASE_SENDER, RESTART_BOUND, Run};
-use crate::harness::{LocalStack, StackConfig, l2, metrics};
+use crate::harness::{LocalStack, l2, metrics};
 
 /// The freeze. The local media driver times a client out after 10 s
 /// without a keepalive; the deployed freeze crosses the same liveness.
@@ -98,6 +98,7 @@ impl Run<'_> {
     /// # Errors
     /// Returns the first failed check.
     pub async fn sequencer_lapse(mut self) -> Result<()> {
+        self.assert_deployed_mode().await?;
         let lane = self.lapse_lane()?;
         let victim = usize::try_from(lane)?;
         let twin = self.stack.add_sequencer_twin(lane)?;
@@ -143,21 +144,16 @@ impl Run<'_> {
     }
 }
 
-/// Launch a stack whose sequencers run the v2 loop, with a validator, and
-/// run the lapse on it. A failure dumps the process logs.
+/// Launch the stack of the deployed mode ([`super::validated`]): a
+/// carry-born chain, whose sequencers run the v2 loop, with a validator.
+/// Run the lapse on it. A failure dumps the process logs.
 ///
 /// # Panics
 /// Panics when the stack does not start or the case fails.
 pub async fn run_lapse() {
     let name = "sequencer-lapse";
     let started = Instant::now();
-    let mut stack = LocalStack::launch(StackConfig {
-        validator: true,
-        admission: true,
-        ..StackConfig::default()
-    })
-    .await
-    .expect("stack");
+    let mut stack = LocalStack::launch(super::validated()).await.expect("stack");
     let outcome = match Run::new(&mut stack, name) {
         Ok(run) => run.sequencer_lapse().await,
         Err(e) => Err(e),
