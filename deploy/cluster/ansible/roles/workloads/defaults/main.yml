@@ -517,6 +517,9 @@ workloads_sealer_admin_port: "{{ cluster_ports.admin }}"
 # The sealer job of the deploy (nomad/cluster.nomad.hcl). The release gate
 # compiles it before any job changes and compares its member settings
 # with the registered cluster.
+# The seconds that a new sealer member of a container cluster may stay in
+# its image download before the deploy stops it once (sealer_started.yml).
+workloads_sealer_pull_s: 120
 workloads_sealer_job:
   name: cluster
   # The allocation wait of the sealer: 300 polls of 1 s are 5 minutes.

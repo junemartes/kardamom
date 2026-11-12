@@ -25,6 +25,11 @@ path = "src/bin/kardamom-sequencer/main.rs"
 testing = ["dep:alloy-network", "dep:alloy-signer-local"]
 # Real-Aeron Docker e2e test gate. Implies `testing` for the harness import.
 docker-e2e = ["testing", "kardamom-log/docker-e2e"]
+# The test seams of the floor sources, for the stack suite. It adds the
+# `--first-floor-from-lookup` flag. The release builds never enable it, so
+# a release binary has neither the flag nor the code behind it. An
+# optimized build with this feature fails to compile (see `lib.rs`).
+floor-seams = []
 
 [dependencies]
 crossbeam-channel.workspace = true

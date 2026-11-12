@@ -3,8 +3,6 @@
 //! a kill, the doomed allocation can still report running on the first
 //! poll, and a bare count would pass instantly against it.
 
-use std::time::Duration;
-
 use crate::harness::Harness;
 use crate::nomad::SavedJob;
 use crate::poll::{self, Budget};
@@ -125,11 +123,33 @@ impl Harness {
         tasks: &[(String, &'static str)],
     ) -> anyhow::Result<SavedJob> {
         let saved = SavedJob::capture(&self.nomad, job).await?;
-        for (node, task) in tasks {
-            self.inject_hard(&[node], task).await?;
-        }
+        // The kills of one class run at once: the class is down from the
+        // first kill, so a serial kill only stretches the fault.
+        let this = &*self;
+        futures::future::try_join_all(tasks.iter().map(|(node, task)| this.kill_inner(node, task)))
+            .await?;
         saved.stop().await?;
         Ok(saved)
+    }
+
+    /// Hard-kill the inner container of `task` on `node`. No container
+    /// running it is a loud failure.
+    async fn kill_inner(&self, node: &str, task: &str) -> anyhow::Result<Killed> {
+        let cid = self.nodes.inner_cid(node, task).await.ok_or_else(|| {
+            crate::chaos_fail!("no running {task} container to hard-kill on {node}")
+        })?;
+        crate::log(format!(
+            "hard: docker kill inner {task} container {cid} on {node}"
+        ));
+        self.nodes
+            .inner_kill(node, &cid)
+            .await
+            .map_err(|e| crate::chaos_fail!("could not hard-kill {task} ({cid}) on {node}: {e}"))?;
+        Ok(Killed::Inner {
+            node: node.to_string(),
+            task: task.to_string(),
+            cid,
+        })
     }
 
     /// `docker kill` every node of one role, with the progress line.
@@ -209,16 +229,16 @@ impl Harness {
         Ok(())
     }
 
-    /// Freeze an inner container with SIGSTOP and verify it: a frozen
-    /// process cannot answer HTTP, so a metrics endpoint that still
-    /// answers means the freeze did not take, and the case fails loudly
-    /// instead of asserting against a replica that never lapsed.
-    /// `docker pause` is not used: the nested freezer of a privileged
-    /// node can silently no-op.
+    /// Freeze an inner container with SIGSTOP and verify it: the kernel
+    /// must report the process stopped. A process that does not stop
+    /// means the freeze did not take, and the case fails loudly instead
+    /// of asserting against a replica that never lapsed. `docker pause`
+    /// is not used: the nested freezer of a privileged node can silently
+    /// no-op.
     ///
     /// # Errors
     ///
-    /// Returns an error if the signal fails or the endpoint stays up.
+    /// Returns an error if the signal fails or the process does not stop.
     pub async fn freeze_verified(
         &self,
         node: &str,
@@ -226,18 +246,22 @@ impl Harness {
         target: &crate::metrics::Target,
         ctx: &str,
     ) -> anyhow::Result<()> {
-        self.nodes
-            .inner_signal(node, inner, crate::nodes::Signal::Stop)
+        let stopped = self
+            .nodes
+            .inner_freeze(node, inner)
             .await
             .map_err(|e| crate::chaos_fail!("{ctx}: SIGSTOP failed: {e}"))?;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        if self.probes.scrape().answers(target).await {
+        if !stopped {
             let _ = self.thaw(node, inner).await;
             return Err(crate::chaos_fail!(
-                "{ctx}: freeze did NOT take effect (metrics endpoint still answering mid-freeze)"
+                "{ctx}: freeze did NOT take effect (the process of {} is not stopped)",
+                target.name
             ));
         }
-        crate::log(format!("{ctx}: freeze verified (metrics endpoint dark)"));
+        crate::log(format!(
+            "{ctx}: freeze verified (the process of {} is stopped)",
+            target.name
+        ));
         Ok(())
     }
 

@@ -48,7 +48,7 @@ impl Executor {
             .unwrap();
         let log = root.join("executor.log");
         let out = std::fs::File::create(&log).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kardamom-executor"));
+        let mut command = Command::new(Self::binary());
         command
             .arg("--config")
             .arg(&config)
@@ -79,6 +79,27 @@ impl Executor {
             child: command.spawn().unwrap(),
             log,
         }
+    }
+
+    /// The executor binary in the parent of the directory of this test.
+    /// Cargo puts a test in `target/<profile>/deps` and the binary in
+    /// `target/<profile>`, and the CI bundle of a stack suite keeps that
+    /// layout: `stack/deps/<test>` and `stack/kardamom-executor`. The path
+    /// that Cargo compiles in (`CARGO_BIN_EXE_*`) names the build host, so
+    /// a CI shard on another host does not find it.
+    fn binary() -> std::path::PathBuf {
+        let test = std::env::current_exe().unwrap();
+        let binary = test
+            .parent()
+            .and_then(std::path::Path::parent)
+            .unwrap()
+            .join("kardamom-executor");
+        assert!(
+            binary.is_file(),
+            "no executor binary at {}: build it with `cargo build --bins -p kardamom-executor`",
+            binary.display()
+        );
+        binary
     }
 
     fn log(&self) -> String {

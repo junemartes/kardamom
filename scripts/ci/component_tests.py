@@ -466,6 +466,20 @@ class Shard:
         cargo = self.bundle.load() if any(test["mode"] in CARGO_MODES for test in tests) else {}
         return [dict(test, **cargo.get((test["suite"], test["test"]), {})) for test in tests]
 
+    @staticmethod
+    def keep_member_logs(text, directory):
+        """Copy the logs of the sealer members of a failed test into the results.
+
+        A sealer test prints its group directory and keeps it when it fails. The directory stays on
+        the runner, and the upload takes only the results."""
+        groups = [Path(group) for group in re.findall(r"^sealer group directory: (\S+)$", text, re.MULTILINE)]
+        logs = [(group, log) for group in groups for log in sorted(group.rglob("start-*.log"))]
+        for group, log in logs:
+            target = directory / group.name / log.relative_to(group)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(log, target)
+        return len(logs)
+
     def run_test(self, index, entry, remaining):
         log = self.output / f"{index:03}.log"
         if remaining <= 0:
@@ -487,8 +501,10 @@ class Shard:
             code, timed_out, seconds = self.execute(command, log, min(limit, remaining), environment)
         finally:
             containers, networks = Docker.clean(owner, before) if docker else (0, 0)
-        success = (code == 0 and not timed_out and seconds <= limit
-                   and runner.verdict(entry, log.read_text(errors="replace"), reports))
+        text = log.read_text(errors="replace")
+        success = code == 0 and not timed_out and seconds <= limit and runner.verdict(entry, text, reports)
+        if not success:
+            self.keep_member_logs(text, self.output / f"{index:03}-members")
         return dict(entry, success=success, exit_code=code, timed_out=timed_out, seconds=round(seconds, 3),
                     removed_containers=containers, removed_networks=networks, log=str(log))
 

@@ -36,7 +36,7 @@ class ClusterFollowerKillTest {
         try (LocalSealers group = new LocalSealers(dir, 3, SNAPSHOTS);
              CanonicalClient client = new CanonicalClient(dir.resolve("client"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
-            final SealerNode.View leader = group.awaitLeader(Duration.ofSeconds(20));
+            final SealerNode.View leader = group.awaitStarted(Duration.ofSeconds(20));
             IntStream.range(0, 5).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));
             Await.holds(Duration.ofSeconds(20), "a recorded cluster snapshot: the second one proves the first",
                 () -> group.count(leader.memberId(), 0, "snapshot TAKEN") > 1);

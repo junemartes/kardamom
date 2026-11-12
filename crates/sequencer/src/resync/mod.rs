@@ -144,6 +144,15 @@ pub struct ResyncConfig {
     /// still execute and raise the receipt floor. Sized as the confirm
     /// timeout: past it, the receipts of every ordered ref have arrived.
     pub nonce_ahead_settle_ms: u64,
+    /// A test seam of the stack suite. With it, a receipt sets no first
+    /// floor of a sender: the controller asks a lookup for the sender
+    /// instead. So the first floor comes only from a lookup. The receipt
+    /// still confirms the published refs. The v2 loop reads the same flag:
+    /// a row sets no first state there. Only the `floor-seams` feature
+    /// compiles this field, and no TOML key sets it.
+    #[cfg(feature = "floor-seams")]
+    #[serde(skip)]
+    pub first_floor_from_lookup: bool,
 }
 
 /// [`ResyncConfig::default`]'s dedup ring capacity: `2^17` entries.
@@ -162,6 +171,8 @@ impl Default for ResyncConfig {
             exit_hold_ms: 2_000,
             confirm_timeout_ms: 15_000,
             nonce_ahead_settle_ms: 15_000,
+            #[cfg(feature = "floor-seams")]
+            first_floor_from_lookup: false,
         }
     }
 }
@@ -553,6 +564,17 @@ impl ResyncController {
         let Some(floor) = u.outcome.floor() else {
             return drain;
         };
+        // The test seam: the sender gets its first floor from a lookup.
+        // The lookup requests go out through the same list as the stale
+        // lookup answers.
+        #[cfg(feature = "floor-seams")]
+        if self.cfg.first_floor_from_lookup
+            && known.is_none()
+            && matches!(u.evidence, Evidence::Receipt { .. })
+        {
+            drain.stale_lookups.push(u.sender);
+            return drain;
+        }
         let e = self.floors.entry(u.sender).or_insert(Floor {
             nonce: 0,
             evidence: u.evidence,

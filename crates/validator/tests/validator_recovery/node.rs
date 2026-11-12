@@ -90,12 +90,26 @@ pub(crate) struct Node {
 }
 
 impl Node {
+    /// The binary next to the test executable, else the path that Cargo
+    /// built. Cargo puts a test in `target/<profile>/deps` and the binary
+    /// in `target/<profile>`. The CI bundle of a stack suite keeps that
+    /// layout. The path that Cargo compiles in names the build host, so a
+    /// CI shard on another host does not find it.
+    fn binary() -> PathBuf {
+        let test = std::env::current_exe().unwrap();
+        test.parent()
+            .and_then(Path::parent)
+            .map(|dir| dir.join("kardamom-validator"))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_kardamom-validator")))
+    }
+
     /// Start the binary with `settings`. Its output goes to `log`.
     pub(crate) fn start(settings: &Settings, log: &Path) -> Self {
         let config = settings.state_dir.with_extension("toml");
         std::fs::write(&config, "").unwrap();
         let metrics = kardamom_obs::testkit::free_port();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_kardamom-validator"));
+        let mut cmd = Command::new(Self::binary());
         cmd.arg("--config")
             .arg(&config)
             .arg("--aeron-dir")

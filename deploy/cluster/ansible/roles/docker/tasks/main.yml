@@ -17,3 +17,4 @@
     name: docker
     enabled: true
     state: started
+  register: docker_start

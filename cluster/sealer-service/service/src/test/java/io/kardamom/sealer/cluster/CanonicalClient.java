@@ -112,9 +112,15 @@ final class CanonicalClient implements AutoCloseable {
         offer(IngressFrames.postedCursorFrame(block), Duration.ofSeconds(10));
     }
 
-    /** The highest boundary block of the egress so far. */
+    /**
+     * The highest boundary block of the egress so far. The first call waits
+     * for the first boundary: before it, the listener holds no block, and a
+     * caller that computes with its start value gets a block that no
+     * consumer can reach.
+     */
     long head() {
-        poll();
+        pollUntil(Duration.ofSeconds(10), "a first boundary on the egress of the client",
+            () -> egress.maxBoundaryBlockNumber != Long.MIN_VALUE);
         return egress.maxBoundaryBlockNumber;
     }
 

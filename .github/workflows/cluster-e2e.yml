@@ -117,10 +117,9 @@ jobs:
       - uses: ./.github/actions/just
 
       - name: Install system build deps (Aeron C client)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            cmake uuid-dev libbsd-dev libssl-dev pkg-config build-essential
+        uses: ./.github/actions/apt-install
+        with:
+          packages: cmake uuid-dev libbsd-dev libssl-dev pkg-config build-essential
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: ./.github/actions/foundry
@@ -528,6 +527,21 @@ jobs:
         run: just --justfile deploy/cluster/justfile container-diagnostics
         env:
           KARDAMOM_STAGED: "1"
+
+      # The inner engine of every node: its state, its images, and the
+      # journal of Docker and containerd. A hung image pull shows its cause
+      # here.
+      - name: Collect the inner Docker state of every node
+        if: failure()
+        run: |
+          mkdir -p /tmp/chaos-diagnostics/nodes
+          for node in $(docker ps --filter label=io.kardamom.cluster --format '{{ .Names }}'); do
+            out="/tmp/chaos-diagnostics/nodes/$node"
+            timeout 30s docker exec "$node" docker info > "$out-docker-info.log" 2>&1 || true
+            timeout 30s docker exec "$node" docker image ls --all > "$out-images.log" 2>&1 || true
+            timeout 30s docker exec "$node" docker ps --all > "$out-containers.log" 2>&1 || true
+            timeout 60s docker exec "$node" journalctl --no-pager --since "-2h" -u docker -u containerd > "$out-engine-journal.log" 2>&1 || true
+          done
 
       - name: Preserve load, latency and runner resource reports
         if: always()

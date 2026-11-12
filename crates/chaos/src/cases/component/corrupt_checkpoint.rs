@@ -4,6 +4,7 @@ use anyhow::Context;
 use serde_json::Value;
 use std::time::Duration;
 
+use super::checkpoint::VictimStop;
 use crate::harness::Harness;
 use crate::nodes::RunningProcess;
 use crate::nomad::SavedJob;
@@ -31,8 +32,7 @@ impl CorruptCheckpoint {
             victim,
         };
         let saved = SavedJob::capture(&h.nomad, "executor").await?;
-        let paused = Self::paused(saved.definition())?;
-        let armed = fault.arm(h, &saved, &paused).await;
+        let armed = fault.arm(h, &saved).await;
         let restored = saved.restore().await;
         let recovered = match (&armed, &restored) {
             (Ok(evidence), Ok(())) => {
@@ -79,42 +79,13 @@ impl CorruptCheckpoint {
         Ok(())
     }
 
-    /// The carry deployment pins one executor per group. Only its victim stops.
-    fn paused(saved: &Value) -> anyhow::Result<Value> {
-        let mut paused = saved.clone();
-        let group = paused["TaskGroups"]
-            .as_array_mut()
-            .and_then(|groups| {
-                groups
-                    .iter_mut()
-                    .find(|group| group["Name"] == "executor-0")
-            })
-            .context("checkpoint fault needs the pinned executor-0 group")?;
-        anyhow::ensure!(
-            group["Count"] == 1,
-            "checkpoint victim must have one allocation"
-        );
-        group["Count"] = 0.into();
-        Ok(paused)
-    }
-
-    async fn arm(&self, h: &Harness, saved: &SavedJob, paused: &Value) -> anyhow::Result<Value> {
-        saved.register(paused).await?;
-        poll::until(Budget::secs(120, 2), |_| async {
-            let allocs = h.nomad.allocations("executor").await?;
-            let stopped = allocs
-                .iter()
-                .filter(|a| a.task_group == "executor-0")
-                .all(crate::nomad::Alloc::is_terminal);
-            Ok((stopped
-                && h.nodes
-                    .running_process(&self.victim, "executor")
-                    .await
-                    .is_none())
-            .then_some(()))
-        })
-        .await?
-        .or_fail(|_| anyhow::anyhow!("{CTX}: victim still runs; refusing to change its files"))?;
+    async fn arm(&self, h: &Harness, saved: &SavedJob) -> anyhow::Result<Value> {
+        VictimStop {
+            victim: &self.victim,
+        }
+        .stop(h, saved)
+        .await
+        .with_context(|| format!("{CTX}: stop the victim"))?;
         let baseline = tokio::time::timeout(Duration::from_secs(120), self.baseline(h))
             .await
             .context("checkpoint baseline verification exceeds 120s")??;

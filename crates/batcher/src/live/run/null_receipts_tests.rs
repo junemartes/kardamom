@@ -14,7 +14,7 @@ use crate::testkit_da::FakeDaProxy;
 
 const OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
 
-struct Post(JoinHandle<Result<()>>);
+pub(super) struct Post(JoinHandle<Result<()>>);
 
 impl Post {
     async fn finish(mut self) {
@@ -25,7 +25,7 @@ impl Post {
             .unwrap();
     }
 
-    async fn cancel(mut self) {
+    pub(super) async fn cancel(mut self) {
         self.0.abort();
         assert!((&mut self.0).await.as_ref().unwrap_err().is_cancelled());
     }
@@ -37,19 +37,19 @@ impl Drop for Post {
     }
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     proxy: FaultProxy,
-    rig: AnvilRig,
-    da: FakeDaProxy,
+    pub(super) rig: AnvilRig,
+    pub(super) da: FakeDaProxy,
     disk: tempfile::TempDir,
     indexer: TcpListener,
     key: String,
-    settlement: Address,
+    pub(super) settlement: Address,
     batcher: Address,
 }
 
 impl Fixture {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let rig = AnvilRig::spawn(Anvil::new(), &[(OWNER, Funding::FundAndImpersonate)])
             .await
             .expect("this component test requires a working Anvil; it must not skip");
@@ -74,7 +74,7 @@ impl Fixture {
         }
     }
 
-    fn args(&self) -> LiveArgs {
+    pub(super) fn args(&self) -> LiveArgs {
         LiveArgs {
             rpcs: vec![self.proxy.url()],
             key: self.key.clone(),
@@ -183,6 +183,16 @@ impl Fixture {
         resumed: L1Side<P>,
         blocks: std::ops::RangeInclusive<u64>,
     ) -> Post {
+        self.feed_from(resumed, Self::replay(blocks))
+    }
+
+    /// Run the real feed from the cursor of `resumed` over the reader
+    /// channel `records`. The post ends when the channel closes.
+    pub(super) fn feed_from<P: Provider + 'static>(
+        &self,
+        resumed: L1Side<P>,
+        records: tokio::sync::mpsc::Receiver<kardamom_engine::reader::ReaderToExec>,
+    ) -> Post {
         resumed
             .provider
             .client()
@@ -191,15 +201,35 @@ impl Fixture {
         let spool = Spool::open(&args.spool_dir).unwrap();
         let (restored, resume) =
             continue_from_spool(&spool, resumed.cursor, resumed.skip_through_block).unwrap();
-        let mut feed = resumed.feed(&args, spool, restored, resume);
+        let feed = resumed.feed(&args, spool, restored, resume);
+        Self::run_feed(feed, records)
+    }
+
+    /// Run `feed` over the reader channel `records` until the channel
+    /// closes.
+    fn run_feed<P: Provider + 'static>(
+        mut feed: FeedLoop<P>,
+        records: tokio::sync::mpsc::Receiver<kardamom_engine::reader::ReaderToExec>,
+    ) -> Post {
         Post(tokio::spawn(async move {
-            let error = feed.run(Self::replay(blocks)).await;
+            let error = feed.run(records).await;
             anyhow::ensure!(
                 error.to_string().contains("reader channel closed"),
                 "{error:#}"
             );
             Ok(())
         }))
+    }
+
+    /// Start the batcher under `lies`, as a restart under them does, and
+    /// post `blocks` through them: each post confirms one block, and the
+    /// durable cursor follows the last.
+    async fn post_through(&self, lies: &[Fault], blocks: std::ops::RangeInclusive<u64>) {
+        self.proxy
+            .set_faults(serde_json::from_value(serde_json::json!(lies)).unwrap());
+        let last = *blocks.end();
+        self.start(blocks).await.finish().await;
+        self.assert_cursor(Self::cursor(last, last));
     }
 
     fn hide_receipts_and_logs(&self) {
@@ -214,7 +244,7 @@ impl Fixture {
         );
     }
 
-    async fn await_landed(&self, index: u64) {
+    pub(super) async fn await_landed(&self, index: u64) {
         tokio::time::timeout(Duration::from_secs(10), async {
             while L1Truth::read(&self.rig.provider, self.settlement)
                 .await
@@ -357,3 +387,88 @@ async fn restart_during_hidden_receipts_uses_contract_truth_without_waiting_for_
     fixture.assert_history(3).await;
     fixture.assert_spooled(&[]);
 }
+
+#[tokio::test]
+#[ignore = "requires Anvil and the compiled settlement contract"]
+async fn every_lie_lets_a_restarted_batcher_post_and_confirm_three_batches() {
+    let fixture = Fixture::new().await;
+    fixture.start(1..=1).await.finish().await;
+    let settlement = fixture.settlement;
+    let lies = [
+        vec![Fault::WrongBlockHash { from_block: 0 }],
+        vec![Fault::BrokenParentChain { from_block: 0 }],
+        vec![Fault::SwallowLogs {
+            address: settlement,
+        }],
+        vec![
+            Fault::WrongBlockHash { from_block: 0 },
+            Fault::SwallowLogs {
+                address: settlement,
+            },
+        ],
+    ];
+    // The reader channel holds two blocks, so three posts are two starts.
+    for (first, lie) in (2_u64..).step_by(3).zip(lies) {
+        fixture.post_through(&lie, first..=first + 1).await;
+        fixture.post_through(&lie, first + 2..=first + 2).await;
+    }
+    fixture.proxy.set_fault(Fault::None);
+    fixture.assert_history(13).await;
+    fixture.assert_spooled(&[]);
+}
+
+#[tokio::test]
+#[ignore = "requires Anvil and the compiled settlement contract"]
+async fn a_refusing_provider_fail_stops_the_post_and_a_restart_posts_it_once() {
+    let fixture = Fixture::new().await;
+    fixture.start(1..=1).await.finish().await;
+    for (block, refusal) in [(2, Fault::Down), (3, Fault::RateLimit)] {
+        fixture.post_after_refusal(refusal, block).await;
+    }
+    fixture.assert_history(3).await;
+    fixture.assert_spooled(&[]);
+}
+
+impl Fixture {
+    /// Start the batcher, then refuse every call while it posts `block`.
+    /// The bounded retries end in a fail-stop: no batch lands, the cursor
+    /// stays and the spool keeps the block. Once the provider answers, the
+    /// restart posts the block exactly once.
+    async fn post_after_refusal(&self, refusal: Fault, block: u64) {
+        let resumed = self
+            .args()
+            .start_l1_side()
+            .await
+            .unwrap_or_else(|_| panic!("start"));
+        self.proxy.set_fault(refusal);
+        self.feed(resumed, block..=block).fail_stop().await;
+        let truth = L1Truth::read(&self.rig.provider, self.settlement)
+            .await
+            .unwrap();
+        assert_eq!(
+            truth.last_batch_index,
+            block - 1,
+            "{refusal:?}: no post lands"
+        );
+        self.assert_cursor(Self::cursor(block - 1, block - 1));
+        self.assert_spooled(&[block]);
+        self.proxy.set_fault(Fault::None);
+        self.start(block..=block).await.finish().await;
+        self.assert_cursor(Self::cursor(block, block));
+    }
+}
+
+impl Post {
+    /// The run ends with the error of a post that failed every attempt.
+    async fn fail_stop(mut self) {
+        let error = tokio::time::timeout(Duration::from_secs(10), &mut self.0)
+            .await
+            .expect("the bounded retries must end the run")
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("post batch"), "{error:#}");
+    }
+}
+
+#[path = "outage_tests.rs"]
+mod outage;

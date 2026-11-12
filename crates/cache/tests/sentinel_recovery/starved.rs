@@ -10,7 +10,7 @@ use testcontainers::{ContainerAsync, GenericImage};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-use super::support::Fixture;
+use kardamom_cache::testing::sentinel::Fixture;
 
 /// A host name that the system resolver expands to `::1` and
 /// `127.0.0.1`.

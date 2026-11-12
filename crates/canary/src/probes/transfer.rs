@@ -123,3 +123,7 @@ impl Probe for Transfer {
         outcome.record(NAME, &rpc.endpoint.name);
     }
 }
+
+#[cfg(test)]
+#[path = "transfer_tests.rs"]
+mod tests;

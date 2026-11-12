@@ -593,3 +593,5 @@ mod tests;
 
 #[cfg(test)]
 mod null_receipts_tests;
+#[cfg(test)]
+mod prune_floor_tests;

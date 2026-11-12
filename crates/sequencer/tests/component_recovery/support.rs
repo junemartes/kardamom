@@ -222,23 +222,38 @@ impl Actor {
             })
     }
 
+    /// Wait for offer `index`, and require the full reference of `nonce`:
+    /// the format of decision version 5, with the bytes.
     pub(super) fn expect_offer(&self, index: usize, nonce: u64) -> Vec<u8> {
+        self.expect_frame(index, nonce, true)
+    }
+
+    /// Wait for offer `index`, and require the exact frame of `nonce`: the
+    /// full reference with its bytes when `carried`, else the positioned
+    /// reference of decision version 4.
+    pub(super) fn expect_frame(&self, index: usize, nonce: u64, carried: bool) -> Vec<u8> {
         Self::wait_for(|| self.peer.accepted().len() > index);
         let frame = self.peer.accepted()[index].clone();
         let envelope = Self::envelope(nonce);
         let position = pos(i32::try_from((nonce + 1) * 64).unwrap());
         let bytes = kardamom_log::codec::encode(&envelope).unwrap();
-        let expected = TxRefOffer {
-            guard: GuardHeader {
-                sender: envelope.sender,
-                nonce,
-                max_inclusion_block: wire::POSITION_TAG | position.as_index(),
-                tip: 0,
-            },
-            reference: TxRef::new(envelope.tx_hash, 0, position, 7),
-            envelope: &bytes,
-        }
-        .encode();
+        let guard = GuardHeader {
+            sender: envelope.sender,
+            nonce,
+            max_inclusion_block: wire::POSITION_TAG | position.as_index(),
+            tip: 0,
+        };
+        let reference = TxRef::new(envelope.tx_hash, 0, position, 7);
+        let expected = if carried {
+            TxRefOffer {
+                guard,
+                reference,
+                envelope: &bytes,
+            }
+            .encode()
+        } else {
+            wire::encode_ingress_txref(&reference, guard)
+        };
         assert_eq!(frame, expected);
         frame
     }

@@ -17,7 +17,7 @@ async fn killed_endpoints_cannot_discard_a_survivor_in_any_position() {
             ));
         });
         assert_eq!(samples.maximum().await, Some(622));
-        assert_eq!(started.elapsed(), Duration::from_secs(12));
+        assert_eq!(started.elapsed(), Duration::from_secs(1) + SETTLE);
     }
 }
 
@@ -48,4 +48,13 @@ async fn an_observation_never_reuses_a_previous_survivor_value() {
     let mut after = Samples::default();
     after.start(reading(30, Some(622)));
     assert_eq!(after.maximum().await, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reading_after_the_settle_does_not_count() {
+    let mut samples = Samples::default();
+    for (delay, value) in [(1, Some(622)), (2, Some(623)), (8, Some(900))] {
+        samples.start(reading(delay, value));
+    }
+    assert_eq!(samples.maximum().await, Some(623));
 }

@@ -115,6 +115,47 @@ These reuse the existing Java fixtures and start no chain stack. The Raft group
 still uses real scheduling and local Aeron transport; the actor clock does not accelerate
 its consensus protocol.
 
+`just test-component sealer-carry` runs four Java checks of the carry rollout on three
+real in-JVM Aeron consensus members. The members take the same feature activation
+frames as on the deployed chain, and only epochs force a boundary. The checks are:
+
+- Feature 4 turns off. Every member goes back to decision version 4 and reports it to
+  the session. Two references without bytes, released after the downgrade, are ordered
+  in nonce order. Feature 4 turns on again.
+- Feature 5 turns on while a follower is down. The follower starts again, replays the
+  log and ends with the state bytes, the rules and the exact window of its peers.
+- Feature 5 turns off and on. Off, every unposted frame stays. On, every member drains
+  to the window at the same entry.
+- The leader stops less than two seconds after it switches. A new leader keeps the
+  canonical stream going, and the old leader starts again with the exact window.
+
+Each check also requires the exact canonical payloads, contiguous indexes and no
+refused reference. Two negative controls fail these checks: no window rule at the
+switch, and no version report to the sessions.
+
+`just test-component sequencer-carry` runs the real v2 admission loop. It holds a
+nonce gap under version 5. The sealer then reports version 4, and the loop releases
+both offers in nonce order, each in the exact format of version 4. Version 5 brings
+the bytes back. The negative control lets a report of the current session only raise
+the version.
+
+`just test-component egress-carry` runs the real egress store, owner and HTTP side in
+a child process. The first blocks hold references, so R is the last of them; the later
+blocks hold entries with their bytes. Two real carried readers start past R. A reader
+below R meets a reference and stops. The parent kills the child with SIGKILL, so the
+side file of the mark keeps its lead. A new child opens the same store on the same
+address. R must not change, and both readers must read on past a hole through it. The
+negative control takes R from the side file.
+
+`just test-component executor-carry` runs the real executor pipeline. An executor runs
+by reference, stops after a committed block, and starts again in carry mode on an egress
+that serves the entries with their bytes. Three L1 epochs credit deposits before, across
+and after the move. Each moved executor must match the receipts, boundaries and accounts
+of an executor that never moves, and each deposit must credit once, in L1 order. The
+negative control drops the record at the cursor of the carried reader. These checks use
+the egress as the carried source. The member feed over Aeron IPC has its own checks in
+the Java feed tests and the Docker feed reader test.
+
 `just test-component sealer-raft-network`, `sealer-raft-members` and
 `sealer-raft-fleet` run twelve checks on three real member processes. Each
 member runs the production `ClusterNode` main class in its own JVM, with the
@@ -221,7 +262,26 @@ primary, a replica and three Sentinels at once. Fixed host ports stand in for st
 service addresses. While the group is down, the production reader degrades without a
 stall and the mirror marks a rebuild. The group returns empty, the Sentinels name a
 primary, and the mirror rebuilds every account once a checkpoint reaches its first
-live batch.
+live batch. A second check kills three mirrors with the group. Two production
+readers must count a degraded read with no stall. The mirrors return first and
+wait for Redis, Redis returns empty, then a newer checkpoint and a live batch come. Every mirror must rebuild,
+and each reader must count a Redis hit and no degraded read. The fixture takes its
+host ports from 20000-29999 under a lock file, so two runs on one host cannot share
+a port, also while the containers are down.
+
+`just test-component sequencer-resize` scales the real sequencer core from two
+lanes to three and back, with the production shard map. A gaining lane warms its
+incoming slots in shadow mode, reading the old lanes, and must offer nothing until
+the warm-up passes. One replica of the new lane dies during the overlap and returns.
+The ingress then routes by the new map, the old lanes drain, and every lane restarts
+with its final slots. The sealer orders first seen first, and each ordered
+transaction returns to every replica as a receipt floor. Every sender must reach the
+canonical log with every nonce once, in order.
+
+`just test-component ingress-sealer-quorum` checks that the ingress halts on a
+lost sealer quorum once no status frame arrives for the silence budget, and that a
+status ends the halt. With the executor test that waits for absent sealers and the
+sealer total-loss test of `sealer-raft-fleet`, it covers executor-sealer-loss-recover.
 
 `just test-component transport-mds-remove` removes MDS receive destinations while two
 streams run, and returns a node to the same control endpoint three times. Every frame
@@ -397,6 +457,38 @@ compares every retained frame. L1 watcher tests also use a paused clock for
 republish and startup deadlines. Other actors and external service clocks still
 need individual review; virtual time does not prove operating-system scheduling.
 
+The retention family runs its real actors on a carry-born chain:
+
+- `executor-retention` resumes the real executor pipeline after a stop.
+  The member feed refuses the cursor below its window. The reader then
+  reads the range from a real egress store over HTTP. The executor must
+  publish the receipts of a run that never stopped and ask for no peer
+  checkpoint. With its cursor in the window, the reader goes back to the
+  feed.
+- `validator-retention` runs the real validator seams on the pipeline. The
+  batcher posts past the cursor of the stopped validator, and the egress
+  prunes below its reader window. The validator must verify every later
+  block against the write-sets and receipts of the executor.
+- `batcher-prune-floor` stops the real batcher feed while three egress
+  copies take blocks past their reader window. Each copy must keep the
+  unposted range and serve the same bytes from the batcher cursor. The
+  restarted batcher posts that range to the settlement contract on Anvil,
+  contiguously and once per block. Then the copies prune back inside the
+  window.
+- `sealer-da-lag` runs the DA-lag guard on three real Raft members. The
+  guard refuses transactions past the budget, keeps the halt across a
+  leader kill, and resumes on a posted cursor. `ingress-da-observer` feeds
+  the status frames through the real egress observer into the ingress,
+  and reads the halt gauge on its metrics page.
+- `canary-transfer` runs the real transfer probe while the ingress refuses
+  submits with the code -32010. `alert-rules-retention` runs the alert
+  rules in `promtool test rules`, and the deployed inhibit rules in a real
+  Alertmanager. Each check uses one container with no network.
+
+Each suite has a negative control in the catalog. The SIGSTOP of a
+container, the Nomad restart that follows it, and the scrape targets of
+the monitoring job stay in the cluster chaos suite.
+
 `just test-component chaos-alert` runs six paused-clock checks for the alert hold
 observer used by `l1-liar`. A 30-second hold starts at the first completed active
 read. Later consecutive active reads must span that duration. Inactive, unknown
@@ -404,6 +496,67 @@ or failed reads reset it. A slow first read cannot certify earlier time, and a
 hanging read cannot extend the 60-second total budget. Failure evidence reports
 the last completed observation and the longest observed active span. These checks
 do not run Prometheus or establish alert behavior under runner contention.
+
+`just test-component l1-follower-quorum` runs the production L1 follower
+(`Follower::run`) over the production source set (`L1Endpoints::connect`,
+`RpcL1Source` over HTTP). Two independent fault proxies stand in front of one
+controlled JSON-RPC L1, which serves real `BatchPosted` and `DepositInitiated`
+logs. The real da-watcher reads the follower's records in the production wire
+codec. A production `Beacon` publishes the follower's lifecycle to the board of
+the da-watcher and of the batcher's `FollowerWatch`. The four checks cover:
+
+- A down, rate-limited or unresponsive provider halts the follower on
+  `l1_unreachable`. The paused clock crosses the unchanged 30-second read
+  deadline and the 30-second backoff. The refused proxy serves no request
+  until the backoff ends.
+- A wrong hash, a broken parent chain, swallowed settlement logs, and null
+  receipts with swallowed logs each halt the follower on
+  `l1_source_disagreement`. No record past the blocks that L1 held before the
+  lie reaches the stream.
+- In each case, the da-watcher and the batcher pause with the follower as their
+  root, and all of them resume by themselves. Every record on the stream is the
+  chain's record, each epoch is published once, and the archive holds every
+  batch with its payload.
+- A lie that lasts two days of the paused clock holds the follower through
+  a redeploy of the follower and the da-watcher. The da-watcher's cursor file
+  holds the last published block. The follower runs on its production
+  12-second slot, and each jump of the clock waits until the woken tick ends,
+  so no jump lands inside a read. The chain grows by 2,400 blocks, not the
+  14,400 of two real days: the full backlog takes over a minute to catch up
+  in a debug build.
+
+`just test-component l1-follower-instances` runs the two follower instances
+as child processes of the test binary, each over its own two providers. The
+children send their records and lifecycle events to the parent in the
+production codec. SIGSTOP of one instance for 20 seconds, past the board's
+expiry, must not pause the da-watcher. SIGKILL of both instances past the
+silence window must pause it on the stream, and the restarted processes must
+resume it from their archives with each epoch once. An instance that reads
+a fork must halt the da-watcher on `l1_follower_disagreement`. The runbook
+then heals it: the fault ends, the liar's archive is wiped, the liar
+restarts and the operator clears the halt. The da-watcher's silence window
+is three seconds here; the chaos shard uses 30.
+
+`just test-component alert-rules-l1` runs `promtool test rules` on
+`deploy/alerts_tests/l1.yml` in the Prometheus image of the monitoring job.
+The stale-post alert must fire after its 10-minute hold on a growing post age
+and resolve when the posts show again. The follower and da-watcher halts must
+page with their causes. The batcher suite adds two Anvil checks: a restarted
+batcher posts and confirms through each lie of its endpoint, and a refusing
+endpoint fail-stops a post that a restart then posts once.
+
+A third Anvil check models a batcher frozen past the sealers' floor. The
+freeze leaves a signed post off L1 and its block in the spool. The restart
+must post that group first, right after the covered block. It then rebuilds
+the refused gap from the block references and the archived bytes, posts it,
+and posts the live blocks from the floor on. Every block lands once, in
+order, with one transaction per post. `just test-component
+aeron-client-timeout-exit` adds the exit itself. A child process holds the
+batcher's two Aeron contexts, the runtime and the archive session, against
+one disposable media driver with a one-second client liveness timeout.
+After SIGSTOP and SIGCONT, the child must exit through the fail-fast
+handler. The egress keeps every block above a frozen posted head, and a
+real sealer group refuses an evicted range with its oldest block.
 
 `just test-component transport-pressure` runs eight real Aeron runtimes against
 one disposable media driver. Independent output streams lack subscribers while a

@@ -202,9 +202,29 @@ struct KeyedInner<K, S> {
     /// wait. The producer is idle or gone, so a missing key does not
     /// come: a take for it returns at once. The next insert clears it.
     quiet: bool,
+    /// The lowest key that ever arrived, and how many keys arrived. Each
+    /// producer publishes its keys in increasing order, so a key below
+    /// the lowest one went out before the subscription of this process
+    /// started. It does not come. See [`KeyedInner::below_arrivals`].
+    lowest: Option<K>,
+    arrivals: usize,
 }
 
 impl<K: BufKey, S: Slot> KeyedInner<K, S> {
+    /// Record the arrival of `key`, taken or refused.
+    fn arrived(&mut self, key: K) {
+        self.lowest = Some(self.lowest.map_or(key, |lowest| lowest.min(key)));
+        self.arrivals = self.arrivals.saturating_add(1);
+    }
+
+    /// Whether `key` is below every key that arrived. The floor needs
+    /// [`SKIP_EVIDENCE`] arrivals: one wrong key far ahead, with no other
+    /// arrival, is not a floor. A key that a slow producer still sends
+    /// below the floor goes to the consumer as a late entry.
+    fn below_arrivals(&self, key: &K) -> bool {
+        self.arrivals >= SKIP_EVIDENCE && self.lowest.is_some_and(|lowest| *key < lowest)
+    }
+
     /// Keep the nearest values and bounded evidence of discarded tail keys.
     fn evict(&mut self, cap: NonZeroUsize) -> usize {
         let Some((key, slot)) = (self.map.len() > cap.get())
@@ -261,6 +281,8 @@ impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
                 cursor: None,
                 inserts: 0,
                 quiet: false,
+                lowest: None,
+                arrivals: 0,
             }),
             cv: Condvar::new(),
             bounds,
@@ -285,6 +307,7 @@ impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
             .inner
             .lock()
             .expect("verification buffer lock poisoned");
+        g.arrived(key);
         let refused =
             g.cursor
                 .and_then(|c| self.outside(key, c))
@@ -373,9 +396,10 @@ impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
         }
     }
 
-    /// One wait cycle of [`Self::take`]: try the value, then the
-    /// catch-up check, then the quiet check, then wait out the remaining
-    /// deadline (or take the final value at the deadline). `Done`
+    /// One wait cycle of [`Self::take`]: try the value, then the arrival
+    /// floor, then the catch-up check, then the quiet check, then wait
+    /// out the remaining deadline (or take the final value at the
+    /// deadline). `Done`
     /// carries the result to return; `Retry` carries the guard for
     /// another cycle.
     fn take_step<'a>(
@@ -388,6 +412,14 @@ impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
             return TakeStep::Done(Some(v));
         }
         if g.evicted.remove(key) {
+            return TakeStep::Done(None);
+        }
+        // Arrival floor: the producers sent this key before the first
+        // key that this process got from them. After a restart under
+        // load, neither the catch-up check nor the quiet check fires for
+        // the keys near the head: each one would wait until the head
+        // moves on, so the consumer could not go faster than the chain.
+        if g.below_arrivals(key) {
             return TakeStep::Done(None);
         }
         // Catch-up check: if the live head (a run of buffered keys) is

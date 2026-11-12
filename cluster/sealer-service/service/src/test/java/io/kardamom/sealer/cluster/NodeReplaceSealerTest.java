@@ -38,7 +38,7 @@ class NodeReplaceSealerTest {
         try (LocalSealers group = new LocalSealers(dir, 3, SNAPSHOTS);
              CanonicalClient client = new CanonicalClient(dir.resolve("client"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
-            final int leader = group.awaitLeader(Duration.ofSeconds(20)).memberId();
+            final int leader = group.awaitStarted(Duration.ofSeconds(20)).memberId();
             IntStream.range(0, 5).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));
             Await.holds(Duration.ofSeconds(20), "a cluster snapshot",
                 () -> group.count(leader, 0, "snapshot TAKEN") > 0);

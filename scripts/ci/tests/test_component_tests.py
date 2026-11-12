@@ -154,6 +154,19 @@ class ComponentTests(unittest.TestCase):
         self.assertTrue(report["tests"][0]["timed_out"])
         self.assertLess(report["seconds"], 2)
 
+    def test_a_failed_sealer_test_leaves_its_member_logs_in_the_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "group/sealer-1").mkdir(parents=True)
+            (root / "group/sealer-1/start-0.log").write_text("member 1\n")
+            (root / "group/hosts").write_text("not a log\n")
+            text = f"sealer group directory: {root / 'group'}\nFailures (1):\n"
+            self.assertEqual(component.Shard.keep_member_logs(text, root / "results/000-members"), 1)
+            kept = root / "results/000-members/group/sealer-1/start-0.log"
+            self.assertEqual(kept.read_text(), "member 1\n")
+            self.assertEqual(component.Shard.keep_member_logs("no group\n", root / "results/001-members"), 0)
+            self.assertFalse((root / "results/001-members").exists())
+
     def test_a_junit_method_passes_only_as_the_one_clean_testcase(self):
         entry = {"test": "io.kardamom.Actor::recovers()"}
         cases = {

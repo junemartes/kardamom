@@ -221,14 +221,14 @@ The sealer refuses user records when the batcher falls too far behind on L1. Bel
 Every chaos case ends with a **recovery probe**.
 
 - The case load ended and the executors converged.
-- Two 30 s loads then run at the same time. Each load runs at half the case rate.
+- Two 10 s loads then run at the same time. Each load runs at half the case rate. Each load holds a slot for every submit of its window, so a slow receipt does not lower its rate.
 - Load 1 runs on the account of the case, from its next nonce. It uses the ingress that the case load used. It stands for a sender that had transactions in flight during the outage.
 - Load 2 runs on the account of the smoke gate. No case load spends that account. It uses the other ingress. It stands for a sender with nothing in flight.
 - Each load starts at the next nonce of its account. The harness reads that nonce from the ingress.
   - The read repeats on `account state unavailable` (`-32000`) for at most 60 s. Any other error fails the case at once.
   - The ingress asks every executor before it gives this error. One dead executor therefore does not cause it.
   - A stall of the shared CI runner can delay every executor past the 2 s query timeout at the same time. A wallet retries this error, so the harness retries it too.
-- Every offered transaction of both loads must get a receipt.
+- Every offered transaction of both loads must get a receipt. A submit that parks past the timeout of the ingress gets no receipt, so every receipt arrives inside the park.
 - Each load must be accepted at a quarter of its rate or more.
 - If load 1 alone fails, a sender is stuck.
 - If load 2 fails, the pipeline or an ingress did not recover.
@@ -636,6 +636,7 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
   - A lost verdict: the offer of a verdict is best effort. The Aeron thread holds a refused frame until the offer deadline, then drops it and logs `best-effort publish failed`. A full queue of the verdict task also drops verdicts. With no verdict in `--ack-timeout-ms` (default 2 s), the call answers `transaction not acknowledged`. The transaction can still be in a mempool: a resubmit of it answers `already known`. The counters are `kardamom_sequencer_verdicts_total{outcome}` (`sent`, `full`, `closed`, `wide`) and `kardamom_ingress_tx_rejected_total{reason="not-acknowledged"}`.
   - An accepted transaction can still drop later, as in the mempool of an Ethereum node: a parked one expires, a forwarded one is lost, or a lane loses both twins. The call does not tell the client. The status feed and the receipt read do.
   - A second submission of a hash that waits on the same ingress answers `already known` at once.
+  - A resubmit of a transaction that a v2 sequencer holds, forwarded or parked (the same hash at the same nonce), answers `already known`. The sequencer publishes no drop and no rejected status for it, because the held transaction keeps its status and gets its receipt. Another transaction at the same nonce is a `replacement_underpriced` drop. Proof: `v2::tests::a_copy_of_a_parked_transaction_publishes_no_drop`.
   - The local account layer gets no rows, so `--verdicts` needs `--admission-checks false`. The v2 filter checks each sender.
   - Deploy order: the sequencers with `[admission] verdicts` first, then the ingress with `--verdicts`. An ingress with `--verdicts` before its sequencers send verdicts answers every call `transaction not acknowledged`.
   - Proof: `crates/log/tests/discovered_tx_verdicts.rs` (each ingress receives only its own verdicts), `v2::tests::each_transaction_gets_one_verdict_at_admission`, `crates/ingress/src/acks/tests.rs`, `end_to_end_test::the_ack_at_admission_answers_on_the_verdict_of_the_sequencer`, and the chain-semantics suite with `KARDAMOM_E2E_ADMISSION=1 KARDAMOM_E2E_VERDICTS=1`.
@@ -666,6 +667,18 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - Proof: `sequencer-lapse`.
 - **Sequencer node loss**
   - Cross-placement keeps one replica of every shard. Redundancy degrades, not availability, until the node returns.
+- **Late join to a new ingress session**
+  - Cause: an ingress returns on a new media driver (a driver loss or a node loss). Its new `tx_data` publication connects as soon as its own archive joins, so its first offers succeed at once. A replica on another node that joins the new publication later starts at the tail and misses the first frames.
+  - Effect without repair: the client of a missed transaction waits for its receipt and sends nothing more, so no frame follows the join. The transaction waits for the 30 s receipt timeout of the ingress. With `ack=validated`, the client gets a success, and the transaction is lost.
+  - Repair: each lane reports the join of each new image. A join after the start of its session refetches the frames from the session start to the join from the ingress archives (`JoinRepair` in `kardamom_log::refetch`). While the refetch runs, the lane holds its own live frames, and the replica keeps polling its other lanes.
+  - The repair runs only with `--replay-destination-endpoint` and `--archive-control-response-endpoint` (the Nomad job sets them as `KARDAMOM_REPLAY_DESTINATION` and `KARDAMOM_ARCHIVE_CONTROL_RESPONSE`).
+  - Bounds:
+    - A session that a replica first sees in its first 10 s is not repaired. At its start, a replica joins each running session late, by design. So an ingress and a replica that restart together lose the first frames of the new session to that replica. The twin replica, if it runs, has them.
+    - A gap above 64 MiB is not repaired: such a session is not a new publication.
+    - A refetch that gets no answer in 15 s ends. The lane then gives its held frames, and the missed frames stay lost, as without the repair.
+  - An ingress process that restarts on the same driver keeps its session (the driver shares the publication), so it does not cause a late join.
+  - Signal: `kardamom_log_tx_data_join_repairs_total{outcome}`. Any `failed` or `short` is a lost range. See [observability.md](observability.md).
+  - Proof: `ingress-recovery::a_late_join_to_a_returned_ingress_refetches_its_first_transfers`.
 - **Both replicas of one shard down**
   - That shard stalls. This is the double-failure case. Proof: `sequencer-lane-loss-recover` (see "Coordinated failures").
 - **Backpressure, not loss**
@@ -952,6 +965,7 @@ A divergence is a state, not a dead process.
   - The per-block BALs ride a lossy `tx_bal` multicast. Its term buffer holds only the recent window.
   - A backlog block more than `BACKLOG_LOOKBEHIND` (16) blocks behind the live head has an unrecoverable BAL. The live head is a run of at least 4 buffered blocks beyond that distance, so one wrong block number far ahead does not turn the skip on.
   - The validator **commits such a block unverified at once**. It does not wait the full BAL timeout for each block, because that wait would make the catch-up slower than the chain grows.
+  - A block or a receipt below the first one that the validator got after its start went out before its subscription. It does not come, so the validator commits it unverified at once. This rule needs 4 arrivals. Without it, a restart under load waits for each such key until the head moves on (16 blocks for a BAL, 4096 records for a receipt), so the validator follows the chain at the chain's own rate and does not catch up.
   - Continuous verification is a property of a validator that is caught up, at the head.
 - **Brief lapse** (a pause or stall shorter than the live term buffer)
   - The coverage is complete. The missed BALs are still buffered on resume. Verification continues with no gap.
@@ -1586,11 +1600,15 @@ A deploy replaces service instances one at a time under readiness checks. The ch
 - The release gate refuses a release before any job changes: a chain that stands on a halt or a pause, an image that the registry does not hold, a coordinated or an unaccepted one-way format change, a sealer setting that every member must match, and a shard map change. See "The release gate" in [../deploy/cluster/README.md](../deploy/cluster/README.md).
 - The deploy record (the Nomad variable `kardamom/deploys/<env>`) holds the pre-deploy version of every job. `just rollback <env>` reverts every job of the last release to that version, in reverse deploy order, under the same waits. It does not cross a rollback floor. Runbook: [runbooks/deploy-rollback.md](runbooks/deploy-rollback.md).
 - Proof: `deploy-broken-image` (`chaos-executor` shard).
-  - The case deploys a manifest whose executor image is a real image that is not an executor.
-  - The new replica never passes its readiness check. Nomad fails the deployment at its healthy deadline.
-  - Each deploy waits until the release gate shows no root and no pause, so the gate does not refuse it.
-  - The deploy must fail at the executor rollout: the executor job has a new version. At least two executors must keep running the old image. The case reads the image from the job spec of each running allocation, not from its job version. On the sealer nodes the deploy rolls one pinned group at a time, and Nomad moves an unchanged group to the new job version in place. The chain must keep advancing.
-  - The deploy of the real manifest then heals the job.
+  - The case rolls the executor job in Nomad, without the deploy play. It takes the job as Nomad holds it, and changes the first executor group: its executor image becomes a real image that is not an executor.
+  - The rolled group gets a healthy deadline of 50 s and a progress deadline of 55 s. The rest of the update stanza stays: one instance at a time, no revert.
+  - The new replica never passes its readiness check. Nomad must mark the deployment `failed`, with no healthy replica of the broken image.
+  - At least two executors must keep running the old image. The case reads the image from the job spec of each running allocation. The chain must keep advancing.
+  - The real image under the same deadlines then heals the group, and that deployment must be `successful`. So the deadline is one that a real executor meets. Then the job gets back its own update stanza.
+  - The checks of the deploy play no longer run on a live cluster in this case. They moved to the mock Nomad API of `deploy/cluster/ansible/tests/test_deploy.py`:
+    - the stop of the play at a failed rollout: `DeployTest.test_a_failed_deployment_stops_the_deploy_at_its_job` and `DeployTest.test_a_failed_job_of_a_wave_stops_the_deploy_at_the_end_of_the_wave`;
+    - the release gate on a halted chain: `RecordTest.test_a_halted_chain_refuses_the_release`;
+    - the carry gates of `carry_gate.yml`: `CarryTest.test_the_version_floor_needs_every_reader_of_a_relayed_full_reference`, `CarryTest.test_the_readers_move_to_the_egress_past_the_last_stored_reference` and `CarryTest.test_the_carry_executors_move_one_at_a_time_after_the_switch`.
 - The deploy flow is in [../deploy/cluster/README.md](../deploy/cluster/README.md).
 
 ## Substrate (the shared failure domain)

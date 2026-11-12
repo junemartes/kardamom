@@ -47,7 +47,7 @@ class RaftLeaderReturnTest {
         try (LocalSealers group = new LocalSealers(dir, 3, LocalSealers.Settings.DEFAULT);
              CanonicalClient client = new CanonicalClient(dir.resolve("client"), group)) {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
-            SealerNode.View leader = group.awaitLeader(Duration.ofSeconds(20));
+            SealerNode.View leader = group.awaitStarted(Duration.ofSeconds(20));
             client.transfer(0, Duration.ofSeconds(10));
             final int sessions = client.reconnects();
             final Map<Integer, Long> ledByPid = new HashMap<>();

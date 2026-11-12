@@ -44,9 +44,9 @@ jobs:
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
       - name: Install system build deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libbsd-dev uuid-dev
       - uses: ./.github/actions/rust-build-cache
         with:
           shared-key: check
@@ -98,9 +98,9 @@ jobs:
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
       - name: Install system build deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libbsd-dev uuid-dev
       - uses: ./.github/actions/rust-build-cache
         with:
           save-if: ${{ github.event_name == 'push' }}
@@ -270,6 +270,16 @@ jobs:
           path: |
             cluster/sealer-service/core/build/reports/tests
             cluster/sealer-service/service/build/reports/tests/test
+      # A failed sealer test keeps its group directory under /tmp, with
+      # the start log of each member. The reports do not hold those logs.
+      - name: Upload the member logs of the failed sealer tests
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sealer-member-logs
+          path: /tmp/junit*/**/start-*.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   # EEST state-test conformance against the pinned fixture release
   # (docs/agents/l1-client-suite-port-spec.md, W1). Latest fork only; the
@@ -360,9 +370,9 @@ jobs:
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
       - name: Install system build deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libbsd-dev uuid-dev
       # The dev-profile caches. This job compiles the libraries and the
       # benches of the workspace, so it saves them for the other
       # dev-profile jobs.
@@ -440,9 +450,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: System deps (Aeron FFI links libbsd/uuid)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libbsd-dev uuid-dev
       - uses: dtolnay/rust-toolchain@stable
       # The DHAT build in the release profile. It saves the release
       # caches, which the EEST job restores too.

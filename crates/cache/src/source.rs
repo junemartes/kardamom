@@ -1,6 +1,7 @@
 //! Where a fresh Redis connection comes from: one URL, or the primary
 //! that the Sentinels name.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -58,14 +59,15 @@ impl Source {
         )?))
     }
 
-    /// The bound of one connection attempt per `cfg`, Sentinel lookup
-    /// included.
+    /// The bound of one connection attempt per `cfg`. Through the
+    /// Sentinels, it covers the name lookups and the questions together.
     pub(crate) fn bound(cfg: &CacheConfig) -> Duration {
         cfg.timeout().saturating_mul(CONNECT_TIMEOUTS)
     }
 
-    /// One connection. Each attempt, to the URL or through one Sentinel,
-    /// ends after `bound`.
+    /// One connection attempt. It ends after `bound`, also through the
+    /// Sentinels, where the bound covers the name lookups and the
+    /// questions together.
     pub(crate) async fn connect(
         &self,
         bound: Duration,
@@ -87,33 +89,64 @@ impl Source {
                     node,
                     bound,
                 };
-                ask.any(&Self::expand(sentinels).await).await
+                ask.through(sentinels, Self::lookup).await
             }
         }
     }
 
+    /// The addresses of `host` from the system resolver.
+    async fn lookup(host: String, port: u16) -> std::io::Result<std::vec::IntoIter<SocketAddr>> {
+        let found = tokio::net::lookup_host((host.as_str(), port)).await?;
+        Ok(found.collect::<Vec<_>>().into_iter())
+    }
+
     /// Every address of every configured Sentinel, in resolver order,
-    /// each once. A deployment names its Sentinels with one service
-    /// name that has one DNS record for each Sentinel. The client
-    /// library connects to the first record only, so one hung Sentinel
-    /// at that record would hide the others. The names resolve again at
-    /// each connection, so a moved Sentinel is found.
-    async fn expand(sentinels: &[ConnectionInfo]) -> Vec<ConnectionInfo> {
-        let mut expanded = Vec::new();
-        for info in sentinels {
-            Self::add_new(&mut expanded, Self::resolve(info).await);
-        }
-        expanded
+    /// each once, with the address lookup `lookup`. A deployment names its
+    /// Sentinels with one service name that has one DNS record for each
+    /// Sentinel. The client library connects to the first record only, so
+    /// one hung Sentinel at that record would hide the others. The names
+    /// resolve again at each connection, so a moved Sentinel is found. The
+    /// lookups run at once, and each ends after `budget`: a slow DNS server
+    /// must not hold the reconnect, and with it the reads that skip Redis
+    /// meanwhile. Tests give a lookup that never answers.
+    async fn expand_by<F, A>(
+        sentinels: &[ConnectionInfo],
+        budget: Duration,
+        lookup: impl Fn(String, u16) -> F,
+    ) -> Vec<ConnectionInfo>
+    where
+        F: Future<Output = std::io::Result<A>>,
+        A: Iterator<Item = SocketAddr>,
+    {
+        let lookups = sentinels
+            .iter()
+            .map(|info| Self::resolve(info, budget, &lookup));
+        futures::future::join_all(lookups).await.into_iter().fold(
+            Vec::new(),
+            |mut expanded, resolved| {
+                Self::add_new(&mut expanded, resolved);
+                expanded
+            },
+        )
     }
 
     /// One configured Sentinel as one entry for each address of its
-    /// host. A name that does not resolve stays as it is, so the
-    /// connection attempt reports the error.
-    async fn resolve(info: &ConnectionInfo) -> Vec<ConnectionInfo> {
+    /// host. A name that does not resolve within `budget` stays as it is,
+    /// so the connection attempt reports the error. A lookup that times
+    /// out counts as one that failed.
+    async fn resolve<F, A>(
+        info: &ConnectionInfo,
+        budget: Duration,
+        lookup: &impl Fn(String, u16) -> F,
+    ) -> Vec<ConnectionInfo>
+    where
+        F: Future<Output = std::io::Result<A>>,
+        A: Iterator<Item = SocketAddr>,
+    {
         let ConnectionAddr::Tcp(host, port) = info.addr() else {
             return vec![info.clone()];
         };
-        let Ok(found) = tokio::net::lookup_host((host.as_str(), *port)).await else {
+        let Ok(Ok(found)) = tokio::time::timeout(budget, lookup(host.clone(), *port)).await else {
             return vec![info.clone()];
         };
         let at = |addr: SocketAddr| {
@@ -144,6 +177,27 @@ struct Ask<'a> {
 }
 
 impl Ask<'_> {
+    /// One attempt through the Sentinels in `sentinels`, with the address
+    /// lookup `lookup`. The whole attempt ends after the bound. The name
+    /// lookups get half of it, so a hung lookup still leaves time for the
+    /// questions to the names as they are.
+    async fn through<F, A>(
+        &self,
+        sentinels: &[ConnectionInfo],
+        lookup: impl Fn(String, u16) -> F,
+    ) -> Result<MultiplexedConnection, CacheError>
+    where
+        F: Future<Output = std::io::Result<A>>,
+        A: Iterator<Item = SocketAddr>,
+    {
+        tokio::time::timeout(self.bound, async {
+            let expanded = Source::expand_by(sentinels, self.bound / 2, lookup).await;
+            self.any(&expanded).await
+        })
+        .await
+        .map_err(|_| CacheError::Timeout)?
+    }
+
     /// The primary as the first sentinel that names a live one sees it.
     ///
     /// The client library asks the sentinels in order and keeps the
