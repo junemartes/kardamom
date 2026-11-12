@@ -388,6 +388,10 @@ always go together. A ported case needs:
 - A negative control for one of its local tests. A control that names tests
   (`test`, `tests` or `failed_tests`) guards only those tests. A control that
   names no test guards every test of its suite.
+- A local test of production code. A suite with `"subject": "chaos-harness"`
+  tests code of the chaos suite itself: an observer, a parser or a fault
+  controller. Such a test shows that the cluster case measures correctly. It
+  does not show that the product recovers, so it does not make a case ported.
 
 Every test of a suite needs a measured runtime in
 `scripts/ci/component-timings.json`, in seconds, keyed `suite::test`. The CI shard

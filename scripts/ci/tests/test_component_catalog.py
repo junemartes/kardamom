@@ -71,6 +71,20 @@ class CatalogTests(unittest.TestCase):
         self.assert_error(lambda d: d["cases"][0].update(local_tests=[{"suite": "guarded", "test": "restarts"}]),
                           "negative control")
 
+    def test_a_ported_case_needs_a_test_of_production_code(self):
+        self.assert_error(lambda d: d["local_suites"]["guarded"].update(subject="chaos-harness"),
+                          "ported-case: a ported case needs a local test of production code")
+
+    def test_a_harness_suite_beside_a_production_suite_is_allowed(self):
+        def add_harness_test(document):
+            document["local_suites"]["unguarded"]["subject"] = "chaos-harness"
+            document["cases"][0]["local_tests"].append({"suite": "unguarded", "test": "observes"})
+        self.assertEqual(self.catalog(add_harness_test).errors(), [])
+
+    def test_an_unknown_subject_is_rejected(self):
+        self.assert_error(lambda d: d["local_suites"]["guarded"].update(subject="mock"),
+                          "suite guarded: subject must be one of")
+
     def test_a_ported_case_needs_a_suite_that_ci_runs(self):
         def unrun(document):
             document["local_suites"]["unrun"].pop("ci_mode")
