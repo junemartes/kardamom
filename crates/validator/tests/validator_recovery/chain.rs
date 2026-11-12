@@ -33,8 +33,12 @@ use kardamom_types::{Genesis, GenesisAlloc, ReceiptBatch, ReceiptRollback, Recei
 pub(crate) const CHAIN_ID: u64 = 412_346;
 /// Every transfer pays this account.
 const RECIPIENT: Address = address!("000000000000000000000000000000000000c0de");
-/// The transfers in each block.
-const TXS_PER_BLOCK: u64 = 2;
+/// The transfers in each block. The receipt buffer of the validator
+/// looks 4096 records behind, which is more than this chain holds. So
+/// its catch-up rule releases no wait here: a restarted validator gets
+/// past the blocks of its outage only by the arrival floor, or, after
+/// the chain ends, by the quiet rule.
+const TXS_PER_BLOCK: u64 = 10;
 /// The timestamp of block 0.
 const T0: u64 = 1_700_000_000;
 /// The longest wait for the reference writer.

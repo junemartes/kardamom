@@ -3,6 +3,13 @@
 //! `tx_bal` and `tx_receipts` publications of one executor replica. A
 //! feeder thread publishes one block of the chain at a time, at a fixed
 //! pace, up to a target that the test moves.
+//!
+//! The feed has a subscriber of its own on each result stream. A deployed
+//! executor does not wait for the validator: the ingresses and the
+//! sequencers also read its receipts, and its BAL thread drops a frame
+//! that has no subscriber. So the chain here keeps its pace while the
+//! validator is frozen or gone, and a validator that starts joins each
+//! stream at its live position: the results of the outage are lost to it.
 
 use std::num::NonZeroU16;
 use std::path::Path;
@@ -11,7 +18,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use kardamom_log::aeron_live::{AeronRuntime, PubHandle, TxReceiptsPublisherHandle};
+use tokio::sync::mpsc::UnboundedReceiver;
+
+use kardamom_log::aeron_live::{AeronRuntime, PubHandle, RawFrame, TxReceiptsPublisherHandle};
 use kardamom_log::config::ChannelsConfig;
 use kardamom_types::BalFrame;
 
@@ -50,6 +59,31 @@ impl Outputs {
     }
 }
 
+/// The other subscribers of the result streams. Nothing reads the
+/// frames: the subscriptions only keep each publication connected and
+/// its position at the live end.
+struct Taps {
+    _bal: UnboundedReceiver<RawFrame>,
+    _receipts: UnboundedReceiver<RawFrame>,
+}
+
+impl Taps {
+    fn open(rt: &AeronRuntime, channels: &ChannelsConfig) -> Self {
+        Self {
+            _bal: Self::tap(rt, &channels.tx_bal_channel, channels.tx_bal_stream_id),
+            _receipts: Self::tap(
+                rt,
+                &channels.tx_receipts_channel,
+                channels.tx_receipts_stream_id,
+            ),
+        }
+    }
+
+    fn tap(rt: &AeronRuntime, channel: &str, stream: i32) -> UnboundedReceiver<RawFrame> {
+        rt.open_subscription_raw(channel, stream).unwrap().1
+    }
+}
+
 /// The running feed.
 pub(crate) struct Feed {
     target: Arc<AtomicU64>,
@@ -57,6 +91,8 @@ pub(crate) struct Feed {
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     pub(crate) egress_base: String,
+    /// They close before the client of the test.
+    _taps: Taps,
     /// The client of the test; it closes when the feeder has stopped.
     aeron: Option<AeronRuntime>,
     /// The runtime of the egress HTTP side; held for its life.
@@ -80,6 +116,7 @@ impl Feed {
                 channels.egress_order_stream_id,
             )
             .unwrap();
+        let taps = Taps::open(&rt, &channels);
         let egress = Egress::start(&http, &dir.join("egress"), Live::Aeron(live));
         let egress_base = egress.base.clone();
         let outputs = Outputs {
@@ -106,6 +143,7 @@ impl Feed {
             stop,
             worker: Some(worker),
             egress_base,
+            _taps: taps,
             aeron: Some(rt),
             _http: http,
         }

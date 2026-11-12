@@ -14,6 +14,12 @@
 //! validator, wipes its state, and requires the new process to adopt the
 //! peer checkpoint, bootstrap its trie and verify live. Every path must
 //! end with zero divergence and the state root of the reference chain.
+//!
+//! The chain does not wait for the validator, and it still grows when
+//! each test requires the validator to be level with it, as the chain of
+//! the deployed case does under its load. A validator that is level with
+//! a chain that ended shows nothing about its catch-up: with no new
+//! frame, its buffers turn quiet and release every wait at once.
 
 #![cfg(all(feature = "docker-e2e", target_os = "linux"))]
 
@@ -37,11 +43,18 @@ use feed::Feed;
 use node::{Node, Sample, Settings};
 use shared::Shared;
 
-/// The blocks of the shared chain, and the head of the lapse tests. At the pace of the feed they span 15 s:
-/// the long lapse and the restart fit before the chain ends.
+/// The head of the short lapse test. At the pace of the feed the chain
+/// spans 15 s: the lapse and the recovery end before the chain does.
 pub(crate) const BLOCKS: u64 = 150;
-/// The head of the join test: the join needs no long lapse.
-pub(crate) const JOIN_BLOCKS: u64 = 70;
+/// The blocks of the shared chain, and the head of the long lapse test.
+/// The lapse and the restart take about 12 s. The chain then grows for
+/// about 10 s more, while the restarted validator overtakes it.
+pub(crate) const RESTART_BLOCKS: u64 = 220;
+/// The head of the join test: the join needs no long lapse. The commit
+/// of the validator can run about 95 blocks ahead of its receipt checks,
+/// so a validator whose checks wait is level with the chain for that
+/// long. The chain grows for 130 blocks after the join starts.
+pub(crate) const JOIN_BLOCKS: u64 = 160;
 /// The block after which the reference executor copies its checkpoint.
 pub(crate) const CHECKPOINT_BLOCK: u64 = 20;
 /// The blocks the chain runs past the checkpoint before the join, so the
@@ -61,6 +74,12 @@ const WARM_LAG: u64 = 15;
 const WARM_BLOCK: u64 = 20;
 /// The lag bound of the recovery, as the chaos case sets it.
 const RECOVERED_LAG: u64 = 25;
+/// The blocks before the end of the chain at which a test requires the
+/// validator to be level with it: one second of the feed.
+const LIVE_MARGIN: u64 = 10;
+/// The least blocks the chain grows during the long lapse. The feed
+/// publishes about 90 in the 9 s.
+const OUTAGE_BLOCKS: u64 = 60;
 /// The most BALs a survivor may miss over the lapse.
 const SURVIVOR_MISSING: u64 = 5;
 /// The handler line of a client timeout.
@@ -137,6 +156,30 @@ impl Rig {
         })
     }
 
+    /// Wait until the chain is [`LIVE_MARGIN`] blocks from its end, then
+    /// require `node` to be within [`RECOVERED_LAG`] blocks of the head.
+    /// The feed still publishes then. A validator that waits for results
+    /// that do not come is level with the chain only after its end, when
+    /// its buffers turn quiet.
+    fn assert_level_with_growing_chain(&self, node: &Node) {
+        let near_end = self.blocks - LIVE_MARGIN;
+        kardamom_obs::testkit::poll_sync(
+            "the chain nears its end",
+            Duration::from_secs(40),
+            Duration::from_millis(10),
+            || Ok((self.feed.head() >= near_end).then_some(())),
+        )
+        .unwrap();
+        let sample = node.sample().expect("the validator answers a scrape");
+        let head = self.feed.head();
+        assert!(
+            head < self.blocks && sample.verifies_after(0, head, RECOVERED_LAG),
+            "the validator is not level with the chain while it grows: head {head} of {}, {sample:?}\n{}",
+            self.blocks,
+            node.log_tail()
+        );
+    }
+
     /// Let the chain end, require the node to commit its last block with
     /// zero divergence, stop it, and compare its state root with the
     /// root of the reference chain.
@@ -199,17 +242,20 @@ fn a_short_lapse_keeps_the_same_process_verifying_past_its_count() {
         recovered.bal_missing
     );
     assert!(!node.log_text().contains(CLIENT_TIMEOUT_LINE));
+    rig.assert_level_with_growing_chain(&node);
     rig.assert_final_state(&mut node);
 }
 
 /// The newborn path: a freeze beyond the liveness timeout. The driver
 /// times the client out, the process exits with status 1, and the
 /// restarted process resumes from its persisted cursor and verifies live
-/// from a fresh counter.
+/// from a fresh counter. The results of the blocks of the outage are
+/// lost to the newborn, so it verifies those blocks without them, and it
+/// must do so faster than the chain grows.
 #[test]
 #[ignore = "requires Docker; run the validator-recovery component target"]
 fn a_long_lapse_ends_the_process_and_the_restart_resumes_from_its_state() {
-    let rig = Rig::start(BLOCKS);
+    let rig = Rig::start(RESTART_BLOCKS);
     let settings = rig.settings(None);
     let mut node = rig.first_node(&settings);
     let warm = rig.warm(&node);
@@ -221,13 +267,22 @@ fn a_long_lapse_ends_the_process_and_the_restart_resumes_from_its_state() {
         .expect("the client timeout ends the process");
     assert_eq!(status.code(), Some(1), "{}", node.log_text());
     require_line(&node, CLIENT_TIMEOUT_LINE);
+    let outage = rig.feed.head().saturating_sub(warm.committed);
+    assert!(
+        outage >= OUTAGE_BLOCKS,
+        "the chain grew only {outage} blocks during the lapse: the feed waited for the validator"
+    );
     let mut newborn = Node::start(&settings, &rig.path("validator-restarted.log"));
     let recovered = rig.verifying(&newborn, "newborn recovery", 0, RECOVERED_LAG);
     assert_eq!(recovered.divergence, 0, "{recovered:?}");
+    rig.assert_level_with_growing_chain(&newborn);
     rig.assert_final_state(&mut newborn);
     require_line(&newborn, "validator resuming from persisted cursor");
     assert!(
-        recovered.verified < BLOCKS.saturating_sub(warm.committed).saturating_add(1),
+        recovered.verified
+            < RESTART_BLOCKS
+                .saturating_sub(warm.committed)
+                .saturating_add(1),
         "the newborn verified blocks below its persisted cursor again: {recovered:?}, warm {warm:?}"
     );
 }
@@ -254,6 +309,7 @@ fn a_fresh_validator_adopts_the_peer_checkpoint_and_verifies_live() {
     let mut newborn = Node::start(&settings, &rig.path("validator-joined.log"));
     let joined = rig.verifying(&newborn, "join", 0, RECOVERED_LAG);
     assert_eq!(joined.divergence, 0, "{joined:?}");
+    rig.assert_level_with_growing_chain(&newborn);
     rig.assert_final_state(&mut newborn);
     require_line(&newborn, "adopted state from checkpoint");
     require_line(&newborn, "trie bootstrap complete");
