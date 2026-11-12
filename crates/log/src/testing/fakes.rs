@@ -514,7 +514,6 @@ impl FakeFsyncWatermarkStream {
     pub fn drain(&self, recorder_id: u8) -> Vec<FsyncWatermark> {
         let mut g = self.inner.borrow_mut();
         g.get_mut(&recorder_id)
-            .map(|q| q.drain(..).collect())
-            .unwrap_or_default()
+            .map_or_default(|q| q.drain(..).collect())
     }
 }

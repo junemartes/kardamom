@@ -17,5 +17,8 @@ sol!(
     /// The L2 predeploy at `kardamom_types::withdrawals::MESSAGE_PASSER`.
     #[sol(rpc)]
     L2ToL1MessagePasser,
-    concat!(env!("CARGO_WORKSPACE_DIR"), "/contracts/abi/L2ToL1MessagePasser.json")
+    concat!(
+        env!("CARGO_WORKSPACE_DIR"),
+        "/contracts/abi/L2ToL1MessagePasser.json"
+    )
 );

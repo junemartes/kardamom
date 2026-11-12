@@ -619,8 +619,7 @@ impl ReceiptFrame {
 fn decode_receipt_batch(frame: &RawFrame) -> VecDeque<(BPosition, Receipt)> {
     ReceiptFrame::decode(frame)
         .and_then(ReceiptFrame::into_batch)
-        .map(|b| b.receipts.into_iter().map(|r| (frame.pos, r)).collect())
-        .unwrap_or_default()
+        .map_or_default(|b| b.receipts.into_iter().map(|r| (frame.pos, r)).collect())
 }
 
 impl MdsSubscriber for TxReceiptsSubscriberHandle {

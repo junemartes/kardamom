@@ -69,7 +69,7 @@ impl FleetSample {
     /// `Stalled`, not as recovered.
     fn standings(&self, nodes: &[String], lag: i64, base: Option<&Self>) -> Vec<Standing> {
         let head = self.head();
-        let floors = base.map(|b| b.blocks.as_slice()).unwrap_or_default();
+        let floors = base.map_or_default(|b| b.blocks.as_slice());
         self.blocks
             .iter()
             .zip(nodes)

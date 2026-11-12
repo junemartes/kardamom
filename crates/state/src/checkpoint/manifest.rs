@@ -117,8 +117,7 @@ impl CheckpointManifest {
         let schema = self
             .schema_version
             .stated()
-            .map(|schema| format!("schema_version={schema}\n"))
-            .unwrap_or_default();
+            .map_or_default(|schema| format!("schema_version={schema}\n"));
         format!(
             "version={MANIFEST_VERSION}\nblock={}\nimage_keccak={:#x}\ngenesis_digest={:#x}\n{schema}",
             self.block, self.image_keccak, self.genesis_digest

@@ -373,7 +373,7 @@ impl Wave {
         before: Option<&Self>,
     ) -> anyhow::Result<()> {
         tokio::time::sleep(self.after).await;
-        for class in before.map(|w| w.classes.as_slice()).unwrap_or_default() {
+        for class in before.map_or_default(|w| w.classes.as_slice()) {
             taken[class].assert_waited(h, ctx, *class).await?;
         }
         let mut pending = Vec::with_capacity(self.classes.len());
