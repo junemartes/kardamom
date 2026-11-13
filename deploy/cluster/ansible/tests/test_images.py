@@ -174,6 +174,24 @@ class ImageTest(unittest.TestCase):
         self.assertNotIn('rusteron-archive-aaaa/out/build/lib/libaeron.so', output.split('Stage Aeron runtime libraries')[1])
         self.assertNotIn('rusteron-client', output.split('Stage Aeron runtime libraries')[1])
 
+    def test_the_archive_build_is_preferred_in_the_cargo_1_100_layout(self):
+        # Cargo 1.100 names a build directory <package>/<hash>. The newer
+        # tree of the client crate must not replace the tree of the archive
+        # crate.
+        archive = self.release / 'build/rusteron-archive/bbbb/out/build/lib'
+        client = self.release / 'build/rusteron-client/cccc/out/build/lib'
+        for path in (archive, client):
+            path.mkdir(parents=True)
+            for name in ('libaeron.so', 'libaeron_archive_c_client.so'):
+                (path / name).write_text(path.parts[-5])
+        now = time.time()
+        for path, age in ((archive, 100), (client, 0)):
+            for lib in path.iterdir():
+                os.utime(lib, (now - age, now - age))
+        staged = self.run_images().split('Stage Aeron runtime libraries')[1]
+        self.assertIn('rusteron-archive/bbbb/out/build/lib/libaeron.so', staged)
+        self.assertNotIn('rusteron-client', staged)
+
     def test_missing_library_fails_before_building(self):
         (self.libs / 'libaeron.so').unlink()
         self.run_images(success=False)

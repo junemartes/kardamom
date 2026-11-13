@@ -442,12 +442,9 @@ impl Reply {
 
     /// Write the HTTP/1.0 response and close.
     async fn write<W: AsyncWriteExt + Unpin>(&self, wr: &mut W) -> std::io::Result<()> {
-        let state_headers = self
-            .state
-            .map(|(block, tx_idx)| {
-                format!("x-state-block: {block}\r\nx-state-tx-idx: {tx_idx}\r\n")
-            })
-            .unwrap_or_default();
+        let state_headers = self.state.map_or_default(|(block, tx_idx)| {
+            format!("x-state-block: {block}\r\nx-state-tx-idx: {tx_idx}\r\n")
+        });
         let head = format!(
             "HTTP/1.0 {}\r\ncontent-type: application/json\r\n{state_headers}\
              content-length: {}\r\nconnection: close\r\n\r\n",

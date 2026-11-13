@@ -219,10 +219,7 @@ impl Ring {
     }
 
     fn seqs_of(&self, hash: &B256) -> Vec<u64> {
-        self.by_hash
-            .get(hash)
-            .map(|e| e.seqs.clone())
-            .unwrap_or_default()
+        self.by_hash.get(hash).map_or_default(|e| e.seqs.clone())
     }
 
     fn replay_all(&self, after_seq: u64, limit: usize) -> Vec<Stamped> {

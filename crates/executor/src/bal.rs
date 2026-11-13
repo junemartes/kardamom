@@ -176,8 +176,7 @@ impl BalPublisher {
             .unwrap_or(DEFAULT_GRANULARITY);
         let measure: Vec<u16> = std::env::var("KARDAMOM_BAL_MEASURE")
             .ok()
-            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
-            .unwrap_or_default();
+            .map_or_default(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
         Self {
             rx,
             pubh,

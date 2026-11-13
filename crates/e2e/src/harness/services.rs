@@ -1,8 +1,8 @@
 //! Spawners for the Rust service binaries.
 //!
-//! Binaries are found in the same cargo target directory the test
-//! executable ran from (`target/<profile>/deps/<test>` leads to
-//! `target/<profile>/`). So the whole contract is: run `cargo build
+//! Binaries are found in the cargo target directory the test executable
+//! ran from: the nearest `target/<profile>/` above it. So the whole
+//! contract is: run `cargo build
 //! --bins -p kardamom-{ingress,sequencer,executor,validator,state,
 //! da-watcher}` before `cargo test -p e2e`. (`just test-e2e-local` and
 //! the chain-semantics CI job build exactly that set.) Services attach
@@ -62,23 +62,23 @@ pub(super) fn common_service_env(cmd: &mut Command) {
     cmd.env("AERON_DRIVER_TIMEOUT", driver_timeout_ms());
 }
 
-/// `target/<profile>` directory containing the prebuilt service binaries.
-fn bin_dir() -> Result<PathBuf> {
-    let exe = std::env::current_exe().context("current_exe")?;
-    // target/<profile>/deps/<test-bin> leads to target/<profile>
-    let dir = exe
-        .parent() // deps
-        .and_then(|p| p.parent()) // <profile>
-        .map(Path::to_path_buf)
-        .context("derive target dir from test executable path")?;
-    Ok(dir)
-}
-
+/// The prebuilt service binary `name`: the nearest one in a directory
+/// above the test executable. The binaries are in `target/<profile>`. The
+/// depth of the test below it depends on the Cargo version: Cargo up to
+/// 1.99 builds a test in `target/<profile>/deps`, and Cargo 1.100 builds
+/// it in `target/<profile>/build/<package>/<hash>/out`.
+///
 /// # Errors
 /// Returns an error when the binary is not built yet.
 pub fn bin(name: &str) -> Result<ExistingFile> {
+    let exe = std::env::current_exe().context("current_exe")?;
+    let built = exe
+        .ancestors()
+        .skip(1)
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file());
     ExistingFile::new(
-        bin_dir()?.join(name),
+        built.unwrap_or_else(|| exe.with_file_name(name)),
         "build the service binaries first: `cargo build --bins -p kardamom-ingress \
          -p kardamom-sequencer -p kardamom-executor -p kardamom-validator -p kardamom-state \
          -p kardamom-da-watcher -p kardamom-l1-indexer -p kardamom-reconstruct -p kardamom-notifier -p kardamom-canary \

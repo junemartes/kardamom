@@ -86,7 +86,7 @@ pub fn vslot_for(sender: Address) -> u8 {
 pub fn partition_for(sender: Address, m: NonZeroU32) -> u32 {
     if VSLOT_COUNT_U32.is_multiple_of(m.get()) {
         // Map v0: lane = vslot % m.
-        return u32::from(vslot_for(sender)) % m.get();
+        return u32::from(vslot_for(sender)) % m;
     }
     #[allow(
         clippy::cast_possible_truncation,

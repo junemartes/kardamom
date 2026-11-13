@@ -109,13 +109,11 @@ fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Address) -
         // right rule.
         blob_hashes: alloy_env
             .blob_versioned_hashes()
-            .map(<[B256]>::to_vec)
-            .unwrap_or_default(),
+            .map_or_default(<[B256]>::to_vec),
         max_fee_per_blob_gas: alloy_env.max_fee_per_blob_gas().unwrap_or_default(),
         authorization_list: alloy_env
             .authorization_list()
-            .map(|l| l.iter().cloned().map(Either::Left).collect())
-            .unwrap_or_default(),
+            .map_or_default(|l| l.iter().cloned().map(Either::Left).collect()),
     }
 }
 

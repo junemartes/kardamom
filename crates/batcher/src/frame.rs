@@ -377,7 +377,7 @@ impl<'a> Reader<'a> {
     /// left to read bounds the hint by what could possibly still decode,
     /// while `read_bytes` below still catches the real short-read case.
     fn capacity_hint(&self, n: u32, min_elem_bytes: NonZeroUsize) -> usize {
-        (n as usize).min(self.buf.len() / min_elem_bytes.get())
+        (n as usize).min(self.buf.len() / min_elem_bytes)
     }
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], BatcherError> {
         let (s, rest) = self.buf.split_at_checked(n).ok_or_else(|| {
