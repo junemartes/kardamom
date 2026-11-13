@@ -22,6 +22,10 @@ impl MemberStorage {
     /// All member tasks stay stopped through the copy. The survivor's
     /// recording log and archive form one immutable recovery image.
     /// Node-local process marks and the shared executor archive stay out.
+    ///
+    /// The manifest hashes every file of that image, so it runs under the
+    /// streaming bound, as the copy does: after a long case the archive is
+    /// gigabytes, and its hashes take longer than the bound of one command.
     pub(super) async fn copy_stopped(
         h: &Harness,
         donor: &str,
@@ -30,15 +34,16 @@ impl MemberStorage {
     ) -> anyhow::Result<()> {
         let manifest = h
             .nodes
-            .exec(
+            .exec_bytes(
                 donor,
                 &format!(
                     "cd /opt/kardamom && test -s cluster/recording.log && {}",
                     Self::MANIFEST
                 ),
+                0,
             )
             .await?;
-        let copied = Self::transfer(h, donor, victim, &manifest).await;
+        let copied = Self::transfer(h, donor, victim, manifest).await;
         if copied.is_err() {
             Self::wipe(h, victim, ctx).await?;
         }
@@ -49,7 +54,7 @@ impl MemberStorage {
         h: &Harness,
         donor: &str,
         victim: &str,
-        manifest: &str,
+        manifest: Vec<u8>,
     ) -> anyhow::Result<()> {
         let read = format!("cd /opt/kardamom && {}", Self::COPY);
         let copied = h
@@ -62,17 +67,20 @@ impl MemberStorage {
                 max_read_status: 0,
             })
             .await?;
+        let files = manifest
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .count();
         h.nodes
             .exec_with_stdin(
                 victim,
                 "cd /opt/kardamom && sha256sum --quiet -c -",
-                manifest.as_bytes().to_vec(),
+                manifest,
             )
             .await?;
         crate::log(format!(
-            "offline member copy: {donor} -> {victim}, {} bytes; all {} file hashes match",
+            "offline member copy: {donor} -> {victim}, {} bytes; all {files} file hashes match",
             copied.bytes,
-            manifest.lines().count(),
         ));
         Ok(())
     }
