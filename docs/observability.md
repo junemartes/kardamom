@@ -686,6 +686,13 @@ They use the names of the shared pipeline metrics, so one dashboard shows whethe
 The service thread writes the pipeline series. It allocates nothing for them and uses no map.
 A ClusteredService cannot see its idle time, so the loop exports busy time only. The Aeron cycle-time series below show the duty cycle.
 
+The two wait steps give the time of a log entry inside the member, which the busy time does not show. The consensus thread keeps the time of each change of the append position and the commit position, one sample at each duty cycle. The service thread reads the waits of each session message from these samples. Notes on the two steps:
+
+- The resolution is one duty cycle of the consensus thread: at most the idle cap of the member while the thread is idle. A wait shorter than that reads as zero.
+- The commit wait starts when this member recorded the entry. It does not hold the time from the arrival of the offer at the member to that record.
+- On the leader, the commit wait is the round trip to the fastest follower and the record there. On a follower, it is the time until the follower learns the commit.
+- A replayed entry gives no sample: the member has no time of its record.
+
 | Metric | Meaning |
 | --- | --- |
 | `kardamom_loop_nanoseconds_total{loop="sealer.service",state="busy"}` | The time of the service thread in the session messages, the timers, the snapshots, and the member feed passes that did work. |
@@ -694,6 +701,8 @@ A ClusteredService cannot see its idle time, so the loop exports busy time only.
 | `kardamom_step_seconds{step="sealer.boundary"}` | The work of one boundary timer: the flush, the boundary, the status, and the timer re-arm. |
 | `kardamom_step_seconds{step="sealer.snapshot"}` | One snapshot: the window flush and the snapshot write. |
 | `kardamom_step_seconds{step="sealer.egress_offer"}` | One offer of a relayed frame to the consumer sessions. It samples one offer in 64. |
+| `kardamom_step_seconds{step="sealer.commit_wait"}` | The wait of one session message for the replication quorum on this member: from the first duty cycle of the consensus thread that sees the entry in the recorded log, to the first one that sees it committed. |
+| `kardamom_step_seconds{step="sealer.apply_wait"}` | The wait of one session message for the service thread: from the duty cycle that sees the entry committed, to the start of the session message. |
 | `kardamom_batch_items{batch="sealer.ingress_batch"}` | The entries of one batch message (kind 3). |
 | `kardamom_queue_depth{queue="sealer.egress_backlog"}` | The bytes that the egress backlogs hold, after the last drain. |
 | `kardamom_queue_depth{queue="sealer.ordering_window"}` | The records that the ordering window holds. |

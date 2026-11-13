@@ -229,6 +229,10 @@ public final class ClusterNode {
         // leader's log fills the gap on rejoin, as on any intact-directory
         // restart. So the repair runs in-process, then the launch retries.
         final StopRequest stop = new StopRequest();
+        // The consensus thread samples the log positions, and the service
+        // thread reads the waits of each log entry from them. The timeline
+        // outlives a launch retry.
+        final LogTimeline timeline = new LogTimeline();
         // One hold for the whole start: a launch retry gets a fresh service,
         // and the hold thread watches the one that runs.
         final StartHold startHold = new StartHold();
@@ -241,7 +245,7 @@ public final class ClusterNode {
                     contexts.driver(),
                     contexts.archive(),
                     consensusContext(aeronDir, clusterDir, clusterMembers, memberId, ingressStreamId, me, stop)
-                        .idleStrategySupplier(idleCap::strategy));
+                        .idleStrategySupplier(() -> timeline.sampling(idleCap.strategy())));
                 // Aeron contexts are single-use, and so is the service they
                 // launch: a retry gets a fresh instance.
                 service = new SealerClusteredService(
@@ -251,6 +255,7 @@ public final class ClusterNode {
                 seed.ifPresent(service::seededFrom);
                 service.genesisFeatures(genesisFeatures);
                 service.holdAtStart(startHold);
+                service.observing(timeline);
                 final SealerClusteredService built = service;
                 carryBytes.map(CarryBytes::file).ifPresent(built::carryingBytes);
                 feed.ifPresent(built::feeding);
@@ -284,6 +289,11 @@ public final class ClusterNode {
         }
 
         final ConsensusModule.Context consensus = driver.consensusModule().context();
+        // The driver created the CnC file and the consensus module created
+        // its counters before the launch returned.
+        timeline.follow(
+            CncCounters.map(consensus.aeronDirectoryName(), consensus.logStreamId()).logRecordingPosition(),
+            consensus.commitPositionCounter()::get);
         final SealerClusteredService launched = service;
         try (ClusteredMediaDriver ignored = driver;
              ClusteredServiceContainer ignored2 = container;

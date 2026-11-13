@@ -7,7 +7,9 @@ package io.kardamom.sealer.cluster;
  *
  * <p>The three positions show where the log waits. Append minus commit is
  * the wait for the replication quorum. Commit minus service is the wait
- * for the service thread to apply the log.</p>
+ * for the service thread to apply the log. The steps
+ * {@code sealer.commit_wait} and {@code sealer.apply_wait} of the pipeline
+ * metrics give these two waits as times ({@link LogTimeline}).</p>
  */
 final class MetricsPage {
     private final int memberId;

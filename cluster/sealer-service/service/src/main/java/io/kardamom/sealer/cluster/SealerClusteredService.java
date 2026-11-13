@@ -171,6 +171,10 @@ public final class SealerClusteredService implements ClusteredService {
      * log lines print them at power-of-two counts.
      */
     private final SealerMetrics metrics = new SealerMetrics();
+    /** The log positions of this member over time. The default follows no position and gives no waits. */
+    private LogTimeline timeline = new LogTimeline();
+    /** The receiver of the waits of a log entry. A field, so a session message allocates nothing for it. */
+    private final LogTimeline.Waits logWaits = metrics::logWaits;
 
     /**
      * The version of the newest snapshot this member restored or took, or
@@ -372,6 +376,16 @@ public final class SealerClusteredService implements ClusteredService {
      */
     SealerClusteredService carryingBytes(final RetainedFile.Config config) {
         this.retainedFile = Optional.of(config);
+        return this;
+    }
+
+    /**
+     * Record the waits of each session message from {@code log}: for the
+     * replication quorum, and then for this thread. The values are local
+     * to this member.
+     */
+    SealerClusteredService observing(final LogTimeline log) {
+        this.timeline = log;
         return this;
     }
 
@@ -746,6 +760,7 @@ public final class SealerClusteredService implements ClusteredService {
             final int length,
             final Header header) {
         final long startedNs = System.nanoTime();
+        timeline.waitsOf(cluster.logPosition(), startedNs, logWaits);
         // Every log-driven callback first sends what the egress backlogs
         // hold, so a back-pressured session catches up between frames, and
         // the stall deadline is checked at least once per tick.

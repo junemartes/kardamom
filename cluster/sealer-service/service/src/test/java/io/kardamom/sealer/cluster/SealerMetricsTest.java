@@ -99,7 +99,7 @@ class SealerMetricsTest {
         final String text = render();
         assertEquals(1L, lines(text, "# HELP kardamom_step_seconds "));
         assertEquals(1L, lines(text, "# TYPE kardamom_step_seconds histogram"));
-        assertEquals(5L, lines(text, "kardamom_step_seconds_count{"));
+        assertEquals(7L, lines(text, "kardamom_step_seconds_count{"));
         assertEquals(1L, lines(text, "# TYPE kardamom_queue_depth gauge"));
     }
 

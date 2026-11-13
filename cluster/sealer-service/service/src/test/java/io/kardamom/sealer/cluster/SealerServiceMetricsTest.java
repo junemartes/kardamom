@@ -11,6 +11,7 @@ import java.nio.ByteOrder;
 import java.util.Arrays;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import org.agrona.ExpandableArrayBuffer;
 import org.junit.jupiter.api.Test;
 
@@ -81,5 +82,37 @@ class SealerServiceMetricsTest {
         assertEquals(1.0, value(text, "kardamom_batch_items_bucket", "batch=\"sealer.ingress_batch\",le=\"2\""));
         assertEquals(0.0, value(text, "kardamom_queue_depth", "queue=\"sealer.ordering_window\""));
         assertEquals(1L, svc.droppedUnknownKindCount());
+        assertEquals(0.0, value(text, "kardamom_step_seconds_count", "step=\"sealer.commit_wait\""),
+            "a service with no timeline records no wait");
+    }
+
+    @Test
+    void aSessionMessageRecordsItsWaitsOnThisMember() {
+        final AtomicLong clock = new AtomicLong();
+        final AtomicLong append = new AtomicLong(4096);
+        final AtomicLong commit = new AtomicLong(4096);
+        final LogTimeline timeline = new LogTimeline(clock::get);
+        timeline.follow(append::get, commit::get);
+        final SealerClusteredService svc = new SealerClusteredService(16, 250, 1, Set.of(), VoidLedger.Config.DISABLED,
+            CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS, WINDOW).observing(timeline);
+        svc.start(cluster, Optional.empty());
+        timeline.sample();
+        // The member records the entry, and 300 µs later the quorum commits it.
+        clock.set(System.nanoTime() - 400_000);
+        append.set(4224);
+        timeline.sample();
+        clock.addAndGet(300_000);
+        commit.set(4224);
+        timeline.sample();
+        cluster.logPosition = 4224;
+        deliver(svc, sequencer, IngressFrames.subscribeFrame());
+
+        final String text = render(svc);
+        assertEquals(1.0, value(text, "kardamom_step_seconds_count", "step=\"sealer.commit_wait\""));
+        assertEquals(1.0, value(text, "kardamom_step_seconds_bucket", "step=\"sealer.commit_wait\",le=\"0.0005\""));
+        assertEquals(0.0, value(text, "kardamom_step_seconds_bucket", "step=\"sealer.commit_wait\",le=\"0.00025\""));
+        assertEquals(1.0, value(text, "kardamom_step_seconds_count", "step=\"sealer.apply_wait\""));
+        assertEquals(0.0, value(text, "kardamom_step_seconds_bucket", "step=\"sealer.apply_wait\",le=\"0.00005\""),
+            "the service applied the entry at least 100 µs after the commit");
     }
 }

@@ -82,6 +82,8 @@ final class SealerMetrics {
     private final Histogram boundary = new Histogram(Histogram.Layout.STEP);
     private final Histogram snapshot = new Histogram(Histogram.Layout.STEP);
     private final Histogram egressOffer = new Histogram(Histogram.Layout.STEP);
+    private final Histogram commitWait = new Histogram(Histogram.Layout.STEP);
+    private final Histogram applyWait = new Histogram(Histogram.Layout.STEP);
     private final Histogram ingressBatch = new Histogram(Histogram.Layout.COUNT);
     private final AtomicLong egressBacklogBytes = new AtomicLong();
     private final AtomicLong orderingWindow = new AtomicLong();
@@ -140,6 +142,15 @@ final class SealerMetrics {
         message.record(elapsed);
         busyNs.lazySet(busyNs.getPlain() + elapsed);
         orderingWindow.lazySet(windowSize);
+    }
+
+    /**
+     * Record the waits of one log entry on this member ({@link LogTimeline#waitsOf}):
+     * for the replication quorum, and then for the service thread.
+     */
+    void logWaits(final long commitWaitNs, final long applyWaitNs) {
+        commitWait.record(commitWaitNs);
+        applyWait.record(applyWaitNs);
     }
 
     /** Add the time from {@code startedNs} to now to the busy time. */
@@ -270,6 +281,8 @@ final class SealerMetrics {
         boundary.renderTo(text, "kardamom_step_seconds", "step=\"sealer.boundary\"");
         snapshot.renderTo(text, "kardamom_step_seconds", "step=\"sealer.snapshot\"");
         egressOffer.renderTo(text, "kardamom_step_seconds", "step=\"sealer.egress_offer\"");
+        commitWait.renderTo(text, "kardamom_step_seconds", "step=\"sealer.commit_wait\"");
+        applyWait.renderTo(text, "kardamom_step_seconds", "step=\"sealer.apply_wait\"");
         text.family("kardamom_batch_items", "histogram", "The items in one batch.");
         ingressBatch.renderTo(text, "kardamom_batch_items", "batch=\"sealer.ingress_batch\"");
         text.family("kardamom_queue_depth", "gauge", "The items that wait in a queue.")

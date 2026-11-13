@@ -105,6 +105,8 @@ final class ClusterStubs {
         final List<byte[]> logOffers = new ArrayList<>();
         /** The role {@link #role()} reports. */
         Role role = Role.LEADER;
+        /** The log position of the current log entry: a test sets it before the entry. */
+        long logPosition;
 
         StubCluster() {
             aeron = Optional.empty();
@@ -129,7 +131,7 @@ final class ClusterStubs {
         }
 
         public long logPosition() {
-            return 0;
+            return logPosition;
         }
 
         public Aeron aeron() {
