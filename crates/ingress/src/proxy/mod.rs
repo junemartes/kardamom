@@ -401,12 +401,7 @@ where
     /// other from the board. Empty when the record is gone.
     fn root_detail(&self, root: &HaltRef) -> String {
         if root.is_sealer() {
-            return self
-                .sealer
-                .slots()
-                .halt
-                .map(|h| h.detail)
-                .unwrap_or_default();
+            return self.sealer.slots().halt.map_or_default(|h| h.detail);
         }
         self.subscription
             .service_board()

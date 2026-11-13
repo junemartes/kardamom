@@ -96,13 +96,12 @@ impl Repair<'_> {
             .args(args)
             .output()
             .await
-            .map(|o| {
+            .map_or_default(|o| {
                 format!(
                     "{}{}",
                     String::from_utf8_lossy(&o.stdout),
                     String::from_utf8_lossy(&o.stderr)
                 )
             })
-            .unwrap_or_default()
     }
 }

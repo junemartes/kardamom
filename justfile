@@ -380,13 +380,27 @@ stage-dist dist:
     for bin in ingress sequencer executor validator da-watcher batcher state-mirror l1-indexer da-store l1-fault-proxy notifier canary egress reconstruct deploy semantics cluster archive-rereplicate; do
         cp "$rel/kardamom-$bin" "$dist/$rel/"
     done
-    # The shard test executable carries a build hash; the newest one is this build's.
-    shards=$(ls -t "$rel"/deps/shards-* | grep -v '\.d$' | head -n 1)
+    # The shard test executable carries a build hash; the newest one is this
+    # build's. Cargo chooses its directory below target/release, and Cargo
+    # 1.100 changed it, so the search covers the whole directory.
+    shards=$(find "$rel" -type f -name 'shards-*' ! -name '*.d' -executable -printf '%T@ %p\n' \
+        | sort -rn | head -n 1 | cut -d' ' -f2-)
+    if [ -z "$shards" ]; then
+        echo "no shard test executable below $rel: build it with cargo test --release -p kardamom-chaos --test shards --no-run" >&2
+        exit 1
+    fi
     cp "$shards" "$dist/$rel/kardamom-chaos-shards"
-    for lib in "$rel"/build/rusteron-archive-*/out/build/lib; do
-        build=$(basename "$(dirname "$(dirname "$(dirname "$lib")")")")
-        mkdir -p "$dist/$rel/build/$build/out/build/lib"
-        cp "$lib"/libaeron*.so "$dist/$rel/build/$build/out/build/lib/"
+    # The dist keeps the path of each library directory below target/release.
+    # Cargo up to 1.99 names the build directory rusteron-archive-<hash>, and
+    # Cargo 1.100 names it rusteron-archive/<hash>.
+    libs=$(find "$rel/build" -type d -path '*/rusteron-archive*/out/build/lib')
+    if [ -z "$libs" ]; then
+        echo "no Aeron library directory of rusteron-archive below $rel/build" >&2
+        exit 1
+    fi
+    for lib in $libs; do
+        mkdir -p "$dist/$lib"
+        cp "$lib"/libaeron*.so "$dist/$lib/"
     done
     cp cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar "$dist/cluster/sealer-service/service/build/libs/"
     find "$dist" -type f | sort

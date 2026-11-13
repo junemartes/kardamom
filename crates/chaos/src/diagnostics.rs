@@ -472,8 +472,7 @@ async fn host_cmd(program: &str, args: &[&str]) -> String {
         .stderr(Stdio::null())
         .output()
         .await
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
-        .unwrap_or_default()
+        .map_or_default(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
 }
 
 /// The 239.x addresses of an `ip maddr` listing, one per line.

@@ -81,25 +81,24 @@ impl Executor {
         }
     }
 
-    /// The executor binary in the parent of the directory of this test.
-    /// Cargo puts a test in `target/<profile>/deps` and the binary in
-    /// `target/<profile>`, and the CI bundle of a stack suite keeps that
-    /// layout: `stack/deps/<test>` and `stack/kardamom-executor`. The path
-    /// that Cargo compiles in (`CARGO_BIN_EXE_*`) names the build host, so
-    /// a CI shard on another host does not find it.
+    /// The nearest executor binary in a directory above this test. Cargo
+    /// puts the binary in `target/<profile>` and the test below it, at a
+    /// depth that depends on the Cargo version. The CI bundle of a stack
+    /// suite has `stack/deps/<test>` and `stack/kardamom-executor`. The
+    /// path that Cargo compiles in (`CARGO_BIN_EXE_*`) names the build
+    /// host, so a CI shard on another host does not find it.
     fn binary() -> std::path::PathBuf {
         let test = std::env::current_exe().unwrap();
-        let binary = test
-            .parent()
-            .and_then(std::path::Path::parent)
-            .unwrap()
-            .join("kardamom-executor");
-        assert!(
-            binary.is_file(),
-            "no executor binary at {}: build it with `cargo build --bins -p kardamom-executor`",
-            binary.display()
-        );
-        binary
+        test.ancestors()
+            .skip(1)
+            .map(|dir| dir.join("kardamom-executor"))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| {
+                panic!(
+                    "no executor binary above {}: build it with `cargo build --bins -p kardamom-executor`",
+                    test.display()
+                )
+            })
     }
 
     fn log(&self) -> String {

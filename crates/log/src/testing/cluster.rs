@@ -125,7 +125,7 @@ impl AeronTestCluster {
         length: std::num::NonZeroU32,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            length.get().is_power_of_two() && (65_536..=1_073_741_824).contains(&length.get()),
+            length.is_power_of_two() && (65_536..=1_073_741_824).contains(&length.get()),
             "Aeron term length must be a power of two between 64 KiB and 1 GiB"
         );
         Self::container_node(None, Some(length)).await

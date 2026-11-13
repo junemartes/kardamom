@@ -523,7 +523,7 @@ impl<K: BufKey, V: PartialEq> ReplicaBuffer<K, V> {
         let took = self.core.take(key, timeout);
         metrics::counter_replica_unchecked(self.check, Skip::Ahead, took.beyond);
         Taken {
-            current: took.current.map(|r| r.0).unwrap_or_default(),
+            current: took.current.map_or_default(|r| r.0),
             late: took.below.into_iter().map(|(k, r)| (k, r.0)).collect(),
         }
     }

@@ -280,8 +280,7 @@ impl<'a> JoinWait<'a> {
         let archives = self
             .recovery
             .as_ref()
-            .map(JoinRecovery::tx_data_archives)
-            .unwrap_or_default();
+            .map_or_default(JoinRecovery::tx_data_archives);
         if self.refused.covers(&archives) {
             JoinOutcome::Unjoinable
         } else {

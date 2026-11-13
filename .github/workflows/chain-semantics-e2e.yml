@@ -89,10 +89,11 @@ jobs:
             --no-run --message-format=json-render-diagnostics | tee /tmp/suite.jsonl \
             | jq -r 'select(.reason == "compiler-message") | .message.rendered'
 
-      # The harness finds the service binaries next to the test executable
-      # (target/debug), so the bundle keeps the paths of the build. Cargo
-      # gives a test the native library paths of the build scripts; a shard
-      # gets the Aeron libraries from target/debug/native instead.
+      # The harness finds the service binaries in a directory above the
+      # test executable (target/debug), so the bundle keeps the paths of
+      # the build. Cargo gives a test the native library paths of the build
+      # scripts; a shard gets the Aeron libraries from target/debug/native
+      # instead.
       - name: Pack the suite
         run: |
           set -euo pipefail
@@ -165,7 +166,14 @@ jobs:
         run: |
           set -euo pipefail
           export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/target/debug/native"
-          suite="$(ls "$GITHUB_WORKSPACE"/target/debug/deps/chain_semantics-*)"
+          # Cargo chooses the directory of a test executable below
+          # target/debug, and Cargo 1.100 changed it. The bundle holds one
+          # file with this name.
+          suite="$(find "$GITHUB_WORKSPACE/target/debug" -type f -name 'chain_semantics-*')"
+          if [ ! -x "$suite" ]; then
+            echo "the bundle does not hold exactly one chain_semantics executable: '$suite'" >&2
+            exit 1
+          fi
           "$suite" --ignored --list --format terse | sed -n 's/: test$//p' | sort \
             | awk -v n="$SHARDS" -v i="$SHARD" '(NR - 1) % n == i' > /tmp/tests
           echo "shard $SHARD of $SHARDS: $(wc -l < /tmp/tests) tests"

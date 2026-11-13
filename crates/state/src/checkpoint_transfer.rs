@@ -263,8 +263,7 @@ fn prepare_response(
     let schema = manifest
         .schema_version
         .stated()
-        .map(|schema| format!("{}: {schema}\r\n", framing::HDR_SCHEMA))
-        .unwrap_or_default();
+        .map_or_default(|schema| format!("{}: {schema}\r\n", framing::HDR_SCHEMA));
     let log_end = LogReplay::new(&ckpt.path, manifest.genesis_digest, request.range.max)
         .reach(ckpt.block)
         .unwrap_or(ckpt.block);
