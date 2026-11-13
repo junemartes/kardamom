@@ -7,6 +7,7 @@ import java.io.File;
 import java.nio.MappedByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.function.LongSupplier;
 import org.agrona.DirectBuffer;
 import org.agrona.IoUtil;
 import org.agrona.concurrent.UnsafeBuffer;
@@ -118,6 +119,9 @@ final class CncCounters {
         LOG_RECORDING
     }
 
+    /** The least time between two scans of {@link #logRecordingPosition} for a counter that is gone. */
+    private static final long RESCAN_NS = 100_000_000L;
+
     private final CountersReader reader;
     /** The stream id of the cluster log, as a recording label shows it. */
     private final String logStreamId;
@@ -173,6 +177,60 @@ final class CncCounters {
     private boolean logStreamOf(final String label) {
         final String[] fields = label.split(" ", 5);
         return fields.length == 5 && fields[3].equals(logStreamId);
+    }
+
+    /**
+     * The recording position of the cluster log, for one thread that reads
+     * it at each duty cycle. The reader keeps the id of the counter, so a
+     * read is one load. The archive makes a new counter when it starts the
+     * recording again, after an election. The reader then scans for it, at
+     * most once per {@link #RESCAN_NS}, and gives the last position until it
+     * finds the counter. Before the first recording the position is -1.
+     */
+    LongSupplier logRecordingPosition() {
+        return new LogRecording();
+    }
+
+    /** The reader of {@link #logRecordingPosition}. One thread owns it. */
+    private final class LogRecording implements LongSupplier {
+        private int counterId = CountersReader.NULL_COUNTER_ID;
+        /** The registration of the counter, which tells it from a later counter with the same id. */
+        private long registrationId;
+        private long nextScanNs = System.nanoTime();
+        private long position = -1L;
+
+        @Override
+        public long getAsLong() {
+            if (allocated() || found()) {
+                position = reader.getCounterValue(counterId);
+            }
+            return position;
+        }
+
+        private boolean allocated() {
+            return counterId != CountersReader.NULL_COUNTER_ID
+                && reader.getCounterState(counterId) == CountersReader.RECORD_ALLOCATED
+                && reader.getCounterRegistrationId(counterId) == registrationId;
+        }
+
+        /** Scan for the counter when a scan is due, and return whether the reader has it. */
+        private boolean found() {
+            final long now = System.nanoTime();
+            if (now - nextScanNs < 0) {
+                return false;
+            }
+            nextScanNs = now + RESCAN_NS;
+            counterId = CountersReader.NULL_COUNTER_ID;
+            reader.forEach(this::take);
+            return counterId != CountersReader.NULL_COUNTER_ID;
+        }
+
+        private void take(final int id, final int typeId, final DirectBuffer key, final String label) {
+            if (typeId == AeronCounters.ARCHIVE_RECORDING_POSITION_TYPE_ID && logStreamOf(label)) {
+                counterId = id;
+                registrationId = reader.getCounterRegistrationId(id);
+            }
+        }
     }
 
     /** Scan the counters, and write each probe that a counter matched. */

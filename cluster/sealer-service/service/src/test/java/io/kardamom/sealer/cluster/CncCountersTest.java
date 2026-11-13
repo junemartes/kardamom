@@ -40,6 +40,29 @@ class CncCountersTest {
     }
 
     @Test
+    void theLogRecordingReaderFollowsTheCounterOfTheLogStream() throws InterruptedException {
+        final var position = new CncCounters(counters, LOG_STREAM).logRecordingPosition();
+        assertEquals(-1L, position.getAsLong(), "before the first recording");
+        counter("rec-pos: 8 12 106 aeron:ipc", AeronCounters.ARCHIVE_RECORDING_POSITION_TYPE_ID, 999_999L);
+        final int first = counters.allocate(
+            "rec-pos: 7 11 " + LOG_STREAM + " aeron:udp?endpoint=a:1", AeronCounters.ARCHIVE_RECORDING_POSITION_TYPE_ID);
+        counters.setCounterValue(first, 4096L);
+        // A scan for a missing counter is due once per 100 ms.
+        Thread.sleep(120);
+        assertEquals(4096L, position.getAsLong());
+        counters.setCounterValue(first, 4224L);
+        assertEquals(4224L, position.getAsLong());
+
+        // The archive starts the recording again: the old counter goes, and a new one comes.
+        counters.free(first);
+        assertEquals(4224L, position.getAsLong(), "the last position, until a scan finds the new counter");
+        counter("rec-pos: 7 13 " + LOG_STREAM + " aeron:udp?endpoint=a:1", AeronCounters.ARCHIVE_RECORDING_POSITION_TYPE_ID,
+            4480L);
+        Thread.sleep(120);
+        assertEquals(4480L, position.getAsLong());
+    }
+
+    @Test
     void theAppendPositionIsTheRecordingOfTheLogStream() {
         counter("rec-pos: 7 11 " + LOG_STREAM + " aeron:udp?endpoint=a:1", AeronCounters.ARCHIVE_RECORDING_POSITION_TYPE_ID,
             4096L);

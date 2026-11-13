@@ -1,6 +1,7 @@
 package io.kardamom.sealer.cluster;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.aeron.test.InterruptAfter;
 import io.aeron.test.InterruptingTestCallback;
@@ -36,6 +37,12 @@ class ClusterLeaderKillTest {
             group.startAll(List.of("-Dkardamom.cluster.bootstrap=true"));
             final SealerNode.View leader = group.awaitStarted(Duration.ofSeconds(20));
             IntStream.range(0, 5).forEach(n -> client.transfer(n, Duration.ofSeconds(10)));
+            // Each transfer is one log entry. The leader recorded it, the
+            // quorum committed it, and the service thread applied it: the
+            // member has the two waits of each one.
+            final SealerNode first = group.node(leader.memberId());
+            assertTrue(first.steps("sealer.commit_wait") >= 5, "commit waits: " + first.steps("sealer.commit_wait"));
+            assertTrue(first.steps("sealer.apply_wait") >= 5, "apply waits: " + first.steps("sealer.apply_wait"));
 
             final SealerNode victim = group.node(leader.memberId());
             victim.kill();

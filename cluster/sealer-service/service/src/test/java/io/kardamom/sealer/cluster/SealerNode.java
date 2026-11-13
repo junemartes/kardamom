@@ -302,11 +302,30 @@ final class SealerNode implements AutoCloseable {
 
     /** The status of the member, or empty when its admin endpoint does not answer. */
     Optional<View> view() {
+        return get("/status").map(View::parse);
+    }
+
+    /**
+     * How many times the member recorded {@code step}: the count of
+     * {@code kardamom_step_seconds} on {@code /metrics}. It is 0 when the
+     * admin endpoint does not answer.
+     */
+    long steps(final String step) {
+        final String label = "step=\"" + step + "\"";
+        return get("/metrics").stream()
+            .flatMap(String::lines)
+            .filter(line -> line.startsWith("kardamom_step_seconds_count{") && line.contains(label))
+            .mapToLong(line -> (long) Double.parseDouble(line.substring(line.lastIndexOf(' ') + 1)))
+            .sum();
+    }
+
+    /** The body of {@code path} on the admin endpoint, or empty when it does not answer with 200. */
+    private Optional<String> get(final String path) {
         try {
             final HttpResponse<String> answer = HTTP.send(HttpRequest.newBuilder(
-                    URI.create("http://" + ip + ":" + group.adminPort() + "/status"))
+                    URI.create("http://" + ip + ":" + group.adminPort() + path))
                 .timeout(Duration.ofSeconds(1)).build(), HttpResponse.BodyHandlers.ofString());
-            return answer.statusCode() == 200 ? Optional.of(View.parse(answer.body())) : Optional.empty();
+            return answer.statusCode() == 200 ? Optional.of(answer.body()) : Optional.empty();
         } catch (final IOException e) {
             return Optional.empty();
         } catch (final InterruptedException e) {
