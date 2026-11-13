@@ -18,7 +18,7 @@
 
 use e2e::harness::StackConfig;
 use e2e::harness::faults::Stop;
-use e2e::scenarios::recovery::{Case, run_case, validated, with_l1, with_quorum};
+use e2e::scenarios::recovery::{Case, reference_born, run_case, validated, with_l1, with_quorum};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run the pipeline-recovery component target"]
@@ -56,7 +56,7 @@ async fn pipeline_blackout_restarts_every_process_and_reelects() {
         Case::PipelineBlackout,
         StackConfig {
             archive_durability: true,
-            ..with_l1()
+            ..with_l1(validated())
         },
     )
     .await;
@@ -75,7 +75,8 @@ async fn pipeline_blackout_rebuilds_the_read_path() {
         StackConfig {
             archive_durability: true,
             read_path: true,
-            ..StackConfig::default()
+            validator: false,
+            ..validated()
         },
     )
     .await;
@@ -85,8 +86,9 @@ async fn pipeline_blackout_rebuilds_the_read_path() {
 /// left. The sequencers read Redis in their nonce lookup, as deployed,
 /// and the case lane runs two replicas. With `--first-floor-from-lookup`
 /// (the `floor-seams` feature), a replayed receipt sets no first floor,
-/// so the floor comes only from a lookup. This test runs the v1 loop. The
-/// chaos case runs the v2 loop: see the next test.
+/// so the floor comes only from a lookup. This test runs the v2 loop on a
+/// carry-born chain, as the shard of the chaos case does: a row of an
+/// unknown sender sets no first state.
 #[cfg(feature = "floor-seams")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run the pipeline-recovery component target"]
@@ -94,24 +96,22 @@ async fn sequencer_executor_redis_loss_looks_every_floor_up() {
     run_case(
         "sequencer-executor-redis-loss",
         Case::SequencerExecutorRedis,
-        floor_stack(false),
+        floor_stack(validated()),
     )
     .await;
 }
 
-/// The same case on the v2 loop, which the deployed shard of the chaos
-/// case runs: a row of an unknown sender sets no first state. The catalog
-/// does not list this test, so CI does not run it: on the v2 loop, the
-/// case load does not land within 30 s of the return in about half the
-/// runs, also without the seam.
+/// The same case on the v1 loop of a reference-born chain. The nightly
+/// shard `chaos-integrity` and the lane resize run the v1 loop, and its
+/// floor comes from the same lookup.
 #[cfg(feature = "floor-seams")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run the pipeline-recovery component target"]
-async fn sequencer_executor_redis_loss_on_the_v2_loop_looks_every_floor_up() {
+async fn sequencer_executor_redis_loss_on_the_v1_loop_looks_every_floor_up() {
     run_case(
-        "sequencer-executor-redis-loss-v2",
+        "sequencer-executor-redis-loss-v1",
         Case::SequencerExecutorRedis,
-        floor_stack(true),
+        floor_stack(reference_born()),
     )
     .await;
 }
@@ -120,14 +120,13 @@ async fn sequencer_executor_redis_loss_on_the_v2_loop_looks_every_floor_up() {
 /// executor replays the references of the outage, so the archive must
 /// keep their transaction data.
 #[cfg(feature = "floor-seams")]
-fn floor_stack(admission: bool) -> StackConfig {
+fn floor_stack(cfg: StackConfig) -> StackConfig {
     StackConfig {
         archive_durability: true,
         read_path: true,
         sequencer_cache: true,
         first_floor_from_lookup: true,
-        admission,
-        ..validated()
+        ..cfg
     }
 }
 
@@ -135,13 +134,18 @@ fn floor_stack(admission: bool) -> StackConfig {
 /// other members elect a new leader within the egress silence window of
 /// the clients, so each session moves to the new leader with no new
 /// session. The executor must reach the sealed head.
+///
+/// The chain is reference-born. On a carry-born chain, the executor reads
+/// the feed of its own member. When that member stops, the executor reads
+/// the egress, and only the other executors feed the egress. The local
+/// stack has one executor, so it would wait for its member.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run the pipeline-recovery component target"]
 async fn a_sealer_leader_stop_keeps_the_executor_at_the_sealed_head() {
     run_case(
         "sealer-leader-stop-recover",
         Case::SealerLeaderLoss(Stop::Graceful),
-        with_quorum(validated()),
+        with_quorum(reference_born()),
     )
     .await;
 }

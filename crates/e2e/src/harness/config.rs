@@ -209,6 +209,12 @@ impl StackConfig {
     /// The options that every sequencer of the stack takes: the Redis of
     /// `read_path` in its nonce lookup when the stack asks for it, and the
     /// floor seam. The launch and a restart both start from these.
+    ///
+    /// In carry mode from genesis each sequencer starts at the version
+    /// floor 5, as the deployment sets it. So no reference without bytes
+    /// goes out before the first report of the sealer, also after a
+    /// restart: the sealer refuses such a reference, and its sender then
+    /// waits for the receipt timeout of the ingress.
     pub(crate) fn sequencer_options(
         &self,
         read_path: Option<&super::read_path::ReadPath>,
@@ -219,6 +225,7 @@ impl StackConfig {
                 .map(super::read_path::ReadPath::redis_url),
             #[cfg(feature = "floor-seams")]
             first_floor_from_lookup: self.first_floor_from_lookup,
+            sealer_version_floor: if self.carry_genesis() { 5 } else { 0 },
             ..super::services::SequencerOptions::default()
         }
     }

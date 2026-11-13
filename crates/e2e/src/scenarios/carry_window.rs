@@ -50,7 +50,8 @@ use kardamom_types::upgrades::{FEATURE_CARRY_WINDOW, FEATURE_SEALER_V4, FEATURE_
 pub use floor::wrong_floor;
 pub use genesis::from_genesis;
 use load::Load;
-use reads::{EgressView, FEATURE_ON, Gauge, Members, Reference};
+pub(crate) use reads::Members;
+use reads::{EgressView, FEATURE_ON, Gauge, Reference};
 
 use super::upgrade::upgrade_and_await;
 use super::{EXEC_BLOCK_NUMBER, Target, VALIDATOR_COMMITTED_BLOCK, metric_u64};

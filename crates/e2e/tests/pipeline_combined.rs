@@ -10,7 +10,9 @@
 
 #![cfg(feature = "full-pipeline-e2e")]
 
-use e2e::scenarios::recovery::{Case, cases, run_case, validated, with_l1, with_quorum};
+use e2e::scenarios::recovery::{
+    Case, cases, reference_born, run_case, validated, with_l1, with_quorum,
+};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run the pipeline-combined component target"]
@@ -18,7 +20,7 @@ async fn ingress_and_sequencer_loss_return_in_order() {
     run_case(
         "ingress-sequencer-loss-recover",
         Case::Combined(cases::INGRESS_SEQUENCER),
-        with_l1(),
+        with_l1(validated()),
     )
     .await;
 }
@@ -34,13 +36,14 @@ async fn ingress_returns_before_the_sealer_and_waits() {
     .await;
 }
 
+/// The chain is reference-born, as the nightly shard of the chaos case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run the pipeline-combined component target"]
 async fn sequencer_and_sealer_loss_stall_then_return_together() {
     run_case(
         "sequencer-sealer-loss-recover",
         Case::Combined(cases::SEQUENCER_SEALER),
-        with_quorum(with_l1()),
+        with_quorum(with_l1(reference_born())),
     )
     .await;
 }
@@ -51,18 +54,19 @@ async fn ingress_sequencer_and_sealer_return_in_order() {
     run_case(
         "ingress-sequencer-sealer-loss-recover",
         Case::Combined(cases::ALL_THREE),
-        with_quorum(with_l1()),
+        with_quorum(with_l1(validated())),
     )
     .await;
 }
 
+/// The chain is reference-born, as the nightly shard of the chaos case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run the pipeline-combined component target"]
 async fn ingress_sequencer_and_sealer_return_in_reverse_and_wait() {
     run_case(
         "ingress-sequencer-sealer-reverse",
         Case::Combined(cases::ALL_THREE_REVERSE),
-        with_quorum(with_l1()),
+        with_quorum(with_l1(reference_born())),
     )
     .await;
 }

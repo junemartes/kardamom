@@ -22,7 +22,7 @@ pub mod lapse;
 pub mod load;
 pub mod sealer_logs;
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
@@ -30,7 +30,8 @@ use anyhow::{Context, Result};
 
 use crate::harness::l2::{self, L2Client};
 use crate::harness::metrics;
-use crate::harness::{LocalStack, StackConfig};
+use crate::harness::{CarryOptions, LocalStack, StackConfig};
+use crate::scenarios::carry_window::Members;
 pub use cases::Case;
 use load::{LoadPlan, LoadReport, RunningLoad};
 
@@ -139,6 +140,7 @@ impl<'a> Run<'a> {
     /// # Errors
     /// Returns the first failed check.
     pub async fn run(mut self, case: Case) -> Result<()> {
+        self.assert_deployed_mode().await?;
         case.prepare(&mut self)?;
         let plan = self
             .plan(CASE_SENDER, 0, Address::repeat_byte(0xc1))
@@ -163,6 +165,27 @@ impl<'a> Run<'a> {
         self.assert_executor_progress().await?;
         self.probe(report.end_nonce()).await?;
         self.validator_verdict().await
+    }
+
+    /// On a carry-born stack, every sealer member reports the rules of the
+    /// deployment: decision version 5, the carry window and the genesis
+    /// features. Without this check, a stack that does not give the members
+    /// their genesis features passes each case on the reference rules.
+    async fn assert_deployed_mode(&self) -> Result<()> {
+        let carry_born = self.stack.cfg.carry_genesis();
+        eprintln!(
+            "{}: the chain is {}",
+            self.at(),
+            if carry_born {
+                "carry-born"
+            } else {
+                "reference-born"
+            }
+        );
+        let Some(seams) = self.stack.carry_seams().filter(|_| carry_born) else {
+            return Ok(());
+        };
+        Members::new(seams.sealer_admin).await_genesis_rules().await
     }
 
     /// The executor block rises twice within ten seconds: the pipeline
@@ -272,23 +295,43 @@ impl<'a> Run<'a> {
     }
 }
 
-/// The stack of a case: a validator, whose verdict ends the case.
+/// The sealer retention of the deployment, in frames: the default of
+/// `kardamom.cluster.retention`.
+const DEPLOYED_RETENTION: NonZeroU32 = NonZeroU32::new(65_536).unwrap();
+
+/// The stack of a case, in the mode of the deployment: a carry-born chain
+/// and a validator, whose verdict ends the case. The regular chaos shards
+/// run this mode. The sealer members run decision version 5 with the carry
+/// window from genesis, the sequencers run the v2 loop, the executor reads
+/// the member feed, and the validator reads the egress.
 #[must_use]
 pub fn validated() -> StackConfig {
+    StackConfig {
+        carry: Some(CarryOptions {
+            retention: DEPLOYED_RETENTION,
+            genesis: true,
+        }),
+        ..reference_born()
+    }
+}
+
+/// The stack of a case on a reference-born chain, with a validator: the
+/// sealer members run decision version 3, the sequencers run the v1 loop,
+/// and the executor reads the cluster egress. The nightly chaos shard
+/// `chaos-integrity` runs this mode, so its cases run it here.
+#[must_use]
+pub fn reference_born() -> StackConfig {
     StackConfig {
         validator: true,
         ..StackConfig::default()
     }
 }
 
-/// The stack of a case whose checks read the L1 epochs: Anvil, the
-/// bridge, the L1 follower and the da-watcher.
+/// `cfg` for a case whose checks read the L1 epochs: Anvil, the bridge,
+/// the L1 follower and the da-watcher.
 #[must_use]
-pub fn with_l1() -> StackConfig {
-    StackConfig {
-        l1: true,
-        ..validated()
-    }
+pub fn with_l1(cfg: StackConfig) -> StackConfig {
+    StackConfig { l1: true, ..cfg }
 }
 
 /// The stack of a case that takes the sealer down: three members, so the
