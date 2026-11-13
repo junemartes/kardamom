@@ -13,7 +13,7 @@ pub(crate) const COMMITTED: &str = "validator_committed_block";
 pub(crate) const DIVERGENCE: &str = "validator_divergence_total";
 const BAL_MISSING: &str = "validator_bal_missing_total";
 /// How long a lapsed or joining validator may take to verify live and
-/// close its lag, in seconds: inside the 180 s case deadline, after the
+/// close its lag, in seconds: inside the 300 s case deadline, after the
 /// freeze or the wipe.
 const CATCH_UP_SECS: u64 = 120;
 

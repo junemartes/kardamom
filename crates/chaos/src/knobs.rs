@@ -153,7 +153,9 @@ pub struct Knobs {
     pub tps: NonZeroU32,
     /// The longest one case may run, from the start of its load to its
     /// verdict. The case load runs until the case body ends, and at most
-    /// this long.
+    /// this long. The default is 300 s: the slowest regular cases need
+    /// about 210 s on a CI runner, and the suite runs only once a day, so
+    /// a wide margin costs nothing.
     pub case_deadline: Duration,
     /// The keep-pace gap bound of the load verdict.
     pub load_max_gap: u64,
@@ -381,7 +383,7 @@ impl Knobs {
         Ok(Self {
             chain_id: env.u64("CHAIN_ID", 412_346)?,
             tps: env.nonzero_u32("CHAOS_TPS", 100)?,
-            case_deadline: env.secs("CHAOS_CASE_S", 180)?,
+            case_deadline: env.secs("CHAOS_CASE_S", 300)?,
             load_max_gap: env.u64("LOAD_MAX_GAP", 5)?,
             load_retry: env.u32("LOAD_RETRY", 2)?,
             restart_slo: env.secs("CHAOS_RESTART_SLO_S", 60)?,
