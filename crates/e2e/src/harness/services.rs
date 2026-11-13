@@ -1,8 +1,8 @@
 //! Spawners for the Rust service binaries.
 //!
-//! Binaries are found in the same cargo target directory the test
-//! executable ran from (`target/<profile>/deps/<test>` leads to
-//! `target/<profile>/`). So the whole contract is: run `cargo build
+//! Binaries are found in the cargo target directory the test executable
+//! ran from: the nearest `target/<profile>/` above it. So the whole
+//! contract is: run `cargo build
 //! --bins -p kardamom-{ingress,sequencer,executor,validator,state,
 //! da-watcher}` before `cargo test -p e2e`. (`just test-e2e-local` and
 //! the chain-semantics CI job build exactly that set.) Services attach

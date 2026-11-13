@@ -27,11 +27,13 @@
 # target holds one archive build per feature set (the services, the load
 # harness and the semantics runner build it separately), so take the most
 # recent build of each library: the binaries carry no runpath, and every
-# build compiles the same pinned Aeron version.
+# build compiles the same pinned Aeron version. Cargo up to 1.99 names the
+# build directory rusteron-archive-<hash>, and Cargo 1.100 names it
+# rusteron-archive/<hash>.
 - name: Collect Aeron build outputs
   ansible.builtin.set_fact:
     images_library_candidates: >-
-      {{ (images_library_found | selectattr('path', 'search', '/rusteron-archive-') | list)
+      {{ (images_library_found | selectattr('path', 'search', '/rusteron-archive[-/]') | list)
          or images_library_found }}
   vars:
     images_library_found: >-
