@@ -10,6 +10,7 @@
 use std::future::Future;
 use std::num::{NonZeroU8, NonZeroU32};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::{broadcast, watch};
 
@@ -91,6 +92,7 @@ impl IngressPublication for LiveIngressPublication {
         &self,
         shard: usize,
         envelope: TxEnvelope,
+        arrived: Instant,
     ) -> Result<(), IngressError> {
         let pub_handle = self
             .tx_data
@@ -98,7 +100,7 @@ impl IngressPublication for LiveIngressPublication {
             .ok_or_else(|| IngressError::Internal(format!("shard {shard} out of range")))?;
         // The stamp comes before the publish, so the egress tap and the
         // receipt pump always have it when the seal and the receipt arrive.
-        self.stamps.stamp(envelope.tx_hash);
+        self.stamps.stamp(envelope.tx_hash, arrived);
         // The task awaits the ack of the Aeron thread, so no thread blocks
         // and the publish costs no hop to the blocking pool.
         let tx_hash = envelope.tx_hash;
@@ -661,7 +663,7 @@ mod tests {
             accepted: None,
         };
         let err = publication
-            .publish_tx_data(0, TxEnvelope::default())
+            .publish_tx_data(0, TxEnvelope::default(), Instant::now())
             .await
             .unwrap_err();
         assert!(

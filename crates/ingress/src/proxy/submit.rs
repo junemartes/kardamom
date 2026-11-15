@@ -232,9 +232,9 @@ where
         client_ip: IpAddr,
         raw_tx: &AlloyBytes,
     ) -> Result<ValidatedSubmission, IngressError> {
-        let _timing = Timing::start(&self.steps.validate);
+        let timing = Timing::start(&self.steps.validate);
         self.check_intake(client_ip, raw_tx)?;
-        self.recover_submission(raw_tx).await
+        self.recover_submission(raw_tx, timing.started()).await
     }
 
     /// The checks before the decode: the overload valve, the drain, the
@@ -285,10 +285,11 @@ where
     }
 
     /// The decode, the protocol limits, the sender recovery, and the
-    /// receipt-cache lookup.
+    /// receipt-cache lookup, of a submit that arrived at `arrived`.
     pub(super) async fn recover_submission(
         &self,
         raw_tx: &AlloyBytes,
+        arrived: Instant,
     ) -> Result<ValidatedSubmission, IngressError> {
         let env = ConsensusEnvelope::decode(&mut raw_tx.as_ref()).map_err(|e| {
             count_reject("decode-error");
@@ -322,6 +323,7 @@ where
 
         let cached = self.cache.lookup(sender, nonce);
         Ok(ValidatedSubmission {
+            arrived,
             sender,
             nonce,
             tx_hash,
@@ -457,6 +459,7 @@ where
                     tx_hash: v.tx_hash,
                     max_inclusion_block: self.cfg.inclusion_deadline(self.deadline_clock()),
                 },
+                v.arrived,
             )
             .await;
         self.steps.publish_round_trip.since(started);

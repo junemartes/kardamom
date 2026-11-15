@@ -6,6 +6,7 @@ use std::time::Duration;
 
 const CANONICAL: &str = "kardamom_ingress_seal_latency_seconds";
 const RECEIPT: &str = "kardamom_ingress_execute_latency_seconds";
+const END_TO_END: &str = "kardamom_ingress_end_to_end_latency_seconds";
 
 struct Scrape(String);
 
@@ -14,6 +15,7 @@ impl Scrape {
         let seconds = Duration::from_nanos(ns).as_secs_f64();
         metrics::histogram!(CANONICAL).record(seconds);
         metrics::histogram!(RECEIPT).record(seconds);
+        metrics::histogram!(END_TO_END).record(seconds);
     }
 
     fn count(&self, metric: &str, upper: &str) -> u64 {
@@ -57,6 +59,8 @@ async fn canonical_targets_keep_exact_boundaries_and_the_slow_tail() {
     assert_eq!(scrape.count(CANONICAL, "0.001"), 7);
     assert_eq!(scrape.count(CANONICAL, "5"), 9);
     assert_eq!(scrape.count(CANONICAL, "+Inf"), 10);
+    assert_eq!(scrape.count(END_TO_END, "0.000999"), 5);
+    assert_eq!(scrape.count(END_TO_END, "0.001"), 7);
     assert_eq!(scrape.count(RECEIPT, "0.0001"), 0);
     assert_eq!(scrape.count(RECEIPT, "0.00025"), 3);
     assert_eq!(scrape.count(RECEIPT, "+Inf"), 10);

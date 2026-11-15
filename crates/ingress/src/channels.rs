@@ -13,6 +13,7 @@
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tokio::sync::{broadcast, mpsc, watch};
 
@@ -55,11 +56,13 @@ pub trait IngressPublication: Send + Sync + 'static {
     /// Publishes `envelope` onto `channel_A[shard]`. Multiple proxies can
     /// publish to the same shard's A stream at the same time. Aeron's
     /// shared publication semantics put them into one canonical byte
-    /// order.
+    /// order. `arrived` is when the submit of the transaction arrived at
+    /// this ingress, for the end-to-end latency.
     fn publish_tx_data(
         &self,
         shard: usize,
         envelope: TxEnvelope,
+        arrived: Instant,
     ) -> impl Future<Output = Result<(), IngressError>> + Send;
 }
 
@@ -244,6 +247,7 @@ impl IngressPublication for MockChannels {
         &self,
         shard: usize,
         envelope: TxEnvelope,
+        _arrived: Instant,
     ) -> impl Future<Output = Result<(), IngressError>> + Send {
         std::future::ready(
             self.tx_data_tx
@@ -308,7 +312,9 @@ mod tests {
             tx_hash: B256::ZERO,
             max_inclusion_block: u64::MAX,
         };
-        mock.publish_tx_data(2, env.clone()).await.unwrap();
+        mock.publish_tx_data(2, env.clone(), Instant::now())
+            .await
+            .unwrap();
         let received = rx[2].recv().await.unwrap();
         assert_eq!(received.correlation_id, 1);
         // The other shards stay empty.
