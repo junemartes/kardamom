@@ -71,6 +71,8 @@ pub(crate) struct SubmitOpts {
     pub(crate) pause_wait: Duration,
     pub(crate) mode: SubmitMode,
     pub(crate) feed_confirm: bool,
+    /// The tick of the pacer. See `LoadConfig::pace_tick`.
+    pub(crate) pace_tick: Duration,
 }
 
 /// One [`run_retries`] loop's final state.
@@ -318,11 +320,11 @@ pub(crate) async fn pacer(
     dur: Duration,
     opts: SubmitOpts,
 ) -> anyhow::Result<()> {
-    let tick_len = Duration::from_millis(10);
+    let tick_len = opts.pace_tick;
     let mut ticker = tokio::time::interval(tick_len);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let rate = rate.get();
-    // The credit cap is 40ms of traffic (4 ticks). This bounds the burst
+    // The credit cap is 40ms of traffic, for each tick. This bounds the burst
     // at the start of each step, so pacing cannot blow through a
     // sender's sequencer reorder window (max_pending_per_sender) before
     // it begins, while still absorbing scheduler hiccups.

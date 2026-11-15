@@ -141,6 +141,7 @@ async fn accepted_but_unreceipted_tx_counts_missing_and_fires_must_deliver() {
             pause_wait: Duration::ZERO,
             mode: SubmitMode::Blocking,
             feed_confirm: false,
+            pace_tick: crate::load::DEFAULT_PACE_TICK,
         },
     )
     .await;
@@ -194,6 +195,7 @@ async fn landed_tx_is_not_resubmitted_after_submit_error() {
             pause_wait: Duration::ZERO,
             mode: SubmitMode::Blocking,
             feed_confirm: false,
+            pace_tick: crate::load::DEFAULT_PACE_TICK,
         },
     )
     .await;
@@ -227,6 +229,7 @@ async fn a_paused_refusal_waits_out_the_pause_with_the_same_nonce() {
             pause_wait: Duration::from_secs(30),
             mode: SubmitMode::Blocking,
             feed_confirm: false,
+            pace_tick: crate::load::DEFAULT_PACE_TICK,
         },
     )
     .await;
@@ -251,6 +254,7 @@ async fn a_paused_refusal_with_no_wait_counts_as_an_attempt() {
             pause_wait: Duration::ZERO,
             mode: SubmitMode::Blocking,
             feed_confirm: false,
+            pace_tick: crate::load::DEFAULT_PACE_TICK,
         },
     )
     .await;

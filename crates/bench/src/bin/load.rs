@@ -91,6 +91,12 @@ struct Args {
     #[arg(long = "max-in-flight", default_value_t = DEFAULT_MAX_IN_FLIGHT)]
     max_in_flight: NonZeroU32,
 
+    /// The tick of the pacer, in milliseconds. The pacer sends the
+    /// transactions of one tick together: 10 gives a burst each 10 ms,
+    /// and 1 gives a stream that is close to even.
+    #[arg(long = "pace-tick-ms", default_value_t = NonZeroU32::new(10).unwrap())]
+    pace_tick_ms: NonZeroU32,
+
     /// The maximum allowed gap between the sealer and executor block.
     #[arg(long = "max-gap", default_value_t = 5)]
     max_gap: u64,
@@ -249,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
         value: U256::from(args.value),
         gas_price: args.gas_price,
         max_in_flight: args.max_in_flight,
+        pace_tick: std::time::Duration::from_millis(u64::from(args.pace_tick_ms.get())),
         max_gap: args.max_gap,
         drain_timeout: args.drain_timeout,
         retry_submit: args.retry_submit,

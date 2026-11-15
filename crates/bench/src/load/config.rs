@@ -99,6 +99,9 @@ impl SenderRange {
     }
 }
 
+/// The default tick of the pacer.
+pub const DEFAULT_PACE_TICK: Duration = Duration::from_millis(10);
+
 /// The full harness configuration, built by the CLI.
 #[derive(Debug, Clone)]
 #[allow(
@@ -147,6 +150,11 @@ pub struct LoadConfig {
     /// pressure. Non-zero: `Semaphore::new` with 0 permits would never
     /// admit a submit.
     pub max_in_flight: NonZeroU32,
+    /// The tick of the pacer: it sends the transactions of one tick
+    /// together. The default of 10 ms sends a burst of `rate / 100`
+    /// transactions each 10 ms. A tick of 1 ms sends `rate / 1000` each
+    /// millisecond, which is close to an even stream.
+    pub pace_tick: Duration,
     /// The maximum allowed gap between the sealer and the executor block.
     pub max_gap: u64,
     /// How long to keep draining receipts after the send window ends.
@@ -251,6 +259,7 @@ impl Default for LoadConfig {
             calldata: CalldataMix::default(),
             gas_price: 1_000_000_000,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            pace_tick: DEFAULT_PACE_TICK,
             max_gap: 5,
             drain_timeout: Duration::from_secs(90),
             retry_submit: 2,

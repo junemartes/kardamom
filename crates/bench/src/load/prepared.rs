@@ -137,6 +137,7 @@ impl Prepared {
                 pause_wait: cfg.pause_wait,
                 mode,
                 feed_confirm,
+                pace_tick: cfg.pace_tick,
             },
         }
         .run()
