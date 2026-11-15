@@ -26,7 +26,11 @@ use crate::probes::CLUSTER_TASK;
 /// definition, the same images, as a deploy does. The three jobs stop
 /// together and start together. Then the da-watcher stands at or before
 /// the sealer, and the batcher posts again.
-async fn redeploy_followers(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+///
+/// Returns the confirmed posts of the new batcher process. The post
+/// counter is in the memory of the process, so it starts at 0 again: a
+/// count from before T2 is not a base for a later read.
+async fn redeploy_followers(h: &Harness, ctx: &str) -> anyhow::Result<i64> {
     crate::log(format!(
         "{ctx}: T2: a deploy of the same images (stop and start every follower job)"
     ));
@@ -36,9 +40,7 @@ async fn redeploy_followers(h: &Harness, ctx: &str) -> anyhow::Result<()> {
     tokio::try_join!(watcher.stop(), indexer.stop(), batcher.stop())?;
     tokio::try_join!(watcher.restore(), indexer.restore(), batcher.restore())?;
     assert_not_past_sealer(h, ctx).await?;
-    await_posting(h, 0, h.knobs.restart_slo + Duration::from_secs(30), ctx)
-        .await
-        .map(|_| ())
+    await_posting(h, 0, h.knobs.restart_slo + Duration::from_secs(30), ctx).await
 }
 
 pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
@@ -103,7 +105,7 @@ async fn through_outage(
         .evidence
         .count_lines(CLUSTER_TASK, "snapshot TAKEN", Streams::StdoutOnly)
         .await?;
-    let after_t1 = await_posting(h, 0, h.knobs.restart_slo, ctx).await?;
+    await_posting(h, 0, h.knobs.restart_slo, ctx).await?;
     // T2: a deploy of the same images. The da-watcher's restart resumes
     // after the sealer's origin, and halts on the lying anchor again. Its
     // cursor file holds the confirmed origin, so it never stands past the
@@ -111,7 +113,7 @@ async fn through_outage(
     // keeps posting, and its live cursor moves with the chain while the
     // floor passes the cursor the batcher resumed at in T1. The frames
     // and a new snapshot bound the hold.
-    redeploy_followers(h, ctx).await?;
+    let after_t2 = redeploy_followers(h, ctx).await?;
     crate::log(format!(
         "{ctx}: T3: load until the floor passes the T1 cursor"
     ));
@@ -121,8 +123,8 @@ async fn through_outage(
             crate::chaos_fail!("{ctx}: the batcher exporter does not answer at T3")
         })?;
     anyhow::ensure!(
-        at_t3 > after_t1,
-        "{}: {ctx}: the batcher confirmed no post between T1 and T3 ({delta} frames in {}s) — the floor passed its live cursor",
+        at_t3 > after_t2,
+        "{}: {ctx}: the batcher confirmed no post between T2 and T3 ({after_t2} -> {at_t3}, {delta} frames in {}s) — the floor passed its live cursor",
         crate::FAIL_PREFIX,
         held.as_secs()
     );

@@ -104,6 +104,7 @@ impl CarryFloor {
         ));
         window.saved.register(window.job.definition()).await?;
         let copies = Copies::of(h).await?;
+        copies.await_serving().await?;
         let last = std::cell::Cell::new(None);
         let last_ref = &last;
         let (stretched, _) = poll::until(
