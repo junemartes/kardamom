@@ -124,3 +124,34 @@ fn an_admitted_transaction_reads_only_the_fresh_offers() {
     assert!(b.l.outbox.is_empty());
     assert_eq!(b.offers().len(), 33);
 }
+
+/// The samples of the step `step` in the rendered metrics `text`. A step
+/// with no sample has no series.
+fn samples(text: &str, step: &str) -> f64 {
+    let series = format!(r#"kardamom_step_seconds_count{{step="{step}"}}"#);
+    text.lines()
+        .find(|line| line.starts_with(&series))
+        .and_then(|line| line.rsplit(' ').next())
+        .map_or(0.0, |count| count.parse().unwrap())
+}
+
+/// An offer gives one sample of its wait in the outbox when it goes out,
+/// and one sample of its flight when its canonical record arrives. The
+/// offers at nonce 1 and 2 wait behind the flight of nonce 0, so they give
+/// no sample before the record of nonce 0.
+#[test]
+fn an_offer_records_its_wait_in_the_outbox_and_its_flight() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    metrics::with_local_recorder(&recorder, || {
+        let mut b = Bench::new(SealerVersion::starting_at(5));
+        b.l.cfg.sweep_every = Duration::from_secs(3600);
+        (0..3).for_each(|nonce| b.send(nonce));
+        let text = recorder.handle().render();
+        assert_eq!(samples(&text, "sequencer.offer_wait"), 1.0, "{text}");
+        assert_eq!(samples(&text, "sequencer.canonical_wait"), 0.0, "{text}");
+        (0..3).for_each(|nonce| b.canonical(nonce));
+    });
+    let text = recorder.handle().render();
+    assert_eq!(samples(&text, "sequencer.offer_wait"), 3.0, "{text}");
+    assert_eq!(samples(&text, "sequencer.canonical_wait"), 3.0, "{text}");
+}
