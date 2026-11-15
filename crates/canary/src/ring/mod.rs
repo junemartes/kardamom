@@ -142,8 +142,17 @@ enum Miss {
 struct Misses(Vec<Miss>);
 
 impl Misses {
-    fn all_busy(&self) -> bool {
-        self.0.iter().all(|m| *m == Miss::Busy)
+    /// Whether a wait can end these misses: an account with funds is in
+    /// use by another probe, and each other account is in use or has no
+    /// funds yet. The balance task marks the accounts funded one at a
+    /// time, so at the start one probe can hold the only funded account
+    /// while the others are not read yet. That is a wait, not a stall.
+    fn wait_for_busy(&self) -> bool {
+        self.0.contains(&Miss::Busy)
+            && self
+                .0
+                .iter()
+                .all(|m| matches!(m, Miss::Busy | Miss::Unfunded))
     }
 
     fn with(mut self, miss: Miss) -> Self {
@@ -239,8 +248,9 @@ impl Ring {
 
     /// Lease the first account, in turn from a rotating start, that is
     /// funded, free, and holds no unresolved transaction. The checks of
-    /// an account call `rpc`. While every miss is an account in use by
-    /// another probe, the lease waits for one, up to `wait`.
+    /// an account call `rpc`. While an account with funds is in use by
+    /// another probe, and each other account is in use or has no funds
+    /// yet, the lease waits for one, up to `wait`.
     ///
     /// # Errors
     ///
@@ -248,7 +258,7 @@ impl Ring {
     pub async fn lease(&self, rpc: &Rpc, wait: Poll) -> Result<Lease, Outcome> {
         wait.until(|| async {
             match self.lease_once(rpc).await {
-                Err(misses) if misses.all_busy() => None,
+                Err(misses) if misses.wait_for_busy() => None,
                 tried => Some(tried.map_err(Misses::outcome)),
             }
         })

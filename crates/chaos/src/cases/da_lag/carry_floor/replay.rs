@@ -75,17 +75,38 @@ impl Copies {
     /// A cursor above every stored frame reads only the current head.
     pub(super) async fn head(&self) -> anyhow::Result<Cursor> {
         poll::until(Budget::secs(60, 1), |_| async {
-            Ok::<_, anyhow::Error>(self.head_once().await.ok())
+            Ok::<_, anyhow::Error>(self.head_of(&self.first).await.ok())
         })
         .await?
         .or_fail(|_| anyhow::anyhow!("prune-floor: the egress does not serve its head"))
         .map(|(head, _)| head)
     }
 
-    async fn head_once(&self) -> anyhow::Result<Cursor> {
+    /// Wait until every copy serves its head. A new allocation has the
+    /// running state before its HTTP port listens. So a read right after
+    /// a roll of the job can meet a refused connection, and the replay
+    /// reads each copy with no retry.
+    pub(super) async fn await_serving(&self) -> anyhow::Result<()> {
+        poll::until(Budget::secs(60, 1), |_| async {
+            Ok::<_, anyhow::Error>(self.heads().await.ok())
+        })
+        .await?
+        .or_fail(|_| anyhow::anyhow!("prune-floor: an egress copy does not serve its head"))
+        .map(|_| ())
+    }
+
+    /// One read of the head of each copy.
+    async fn heads(&self) -> anyhow::Result<()> {
+        for url in std::iter::once(&self.first).chain(&self.rest) {
+            self.head_of(url).await?;
+        }
+        Ok(())
+    }
+
+    async fn head_of(&self, url: &str) -> anyhow::Result<Cursor> {
         Ok(self
             .page(
-                &self.first,
+                url,
                 Cursor {
                     index: u64::MAX,
                     block: u64::MAX,
@@ -106,7 +127,8 @@ impl Copies {
                 ("limit", limit.to_string()),
             ])
             .send()
-            .await?;
+            .await
+            .with_context(|| format!("prune-floor: the read of {url} from {cursor:?}"))?;
         anyhow::ensure!(
             response.status() == reqwest::StatusCode::OK,
             "prune-floor: {url} refuses retained cursor {cursor:?}: {}",

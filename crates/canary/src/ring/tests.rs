@@ -79,3 +79,24 @@ async fn an_account_serves_no_lease_before_its_first_balance_read() {
     assert_eq!(leased.err(), Some(Outcome::Unfunded));
     assert_eq!(ingress.chain.lock().unwrap().sends, 0);
 }
+
+/// The balance task marks the accounts funded one at a time. A probe that
+/// meets one funded account in use, and the others not read yet, waits
+/// for the account. Without a funded account there is nothing to wait
+/// for, and a blocked account is a stall.
+#[test]
+fn a_lease_waits_for_a_busy_account_while_the_others_have_no_funds_yet() {
+    let misses = |all: &[Miss]| Misses(all.to_vec());
+    assert!(misses(&[Miss::Busy]).wait_for_busy());
+    assert!(misses(&[Miss::Busy, Miss::Unfunded, Miss::Unfunded]).wait_for_busy());
+    assert!(!misses(&[Miss::Unfunded, Miss::Unfunded]).wait_for_busy());
+    assert!(!misses(&[Miss::Busy, Miss::Blocked]).wait_for_busy());
+    assert_eq!(
+        misses(&[Miss::Unfunded, Miss::Unfunded]).outcome(),
+        Outcome::Unfunded
+    );
+    assert_eq!(
+        misses(&[Miss::Busy, Miss::Blocked]).outcome(),
+        Outcome::AccountStalled
+    );
+}
