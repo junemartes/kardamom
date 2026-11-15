@@ -68,6 +68,12 @@ pub const SEAL_STAMPS_DROPPED_TOTAL: &str = "kardamom_ingress_seal_stamps_droppe
 /// executor receipt for it, in seconds. Only the ingress that published
 /// the transaction records it.
 pub const EXECUTE_LATENCY_SECONDS: &str = "kardamom_ingress_execute_latency_seconds";
+/// The time from the arrival of a submit at this ingress to the first
+/// executor receipt for its transaction, in seconds: the whole path on
+/// the server side, on the clock of this ingress. Only the ingress that
+/// took the submit records it. It has a sample when the execute latency
+/// has one.
+pub const END_TO_END_LATENCY_SECONDS: &str = "kardamom_ingress_end_to_end_latency_seconds";
 /// The publish stamps that no receipt matched within the age bound of the
 /// executed clock. A non-zero rate under load means that the histogram
 /// undercounts the tail.
@@ -141,6 +147,11 @@ pub fn describe() {
         EXECUTE_LATENCY_SECONDS,
         metrics::Unit::Seconds,
         "time from the tx_data publish to the first executor receipt for the transaction"
+    );
+    metrics::describe_histogram!(
+        END_TO_END_LATENCY_SECONDS,
+        metrics::Unit::Seconds,
+        "time from the arrival of the submit at this ingress to the first executor receipt for the transaction"
     );
     metrics::describe_counter!(
         EXECUTE_STAMPS_DROPPED_TOTAL,
@@ -270,6 +281,7 @@ mod tests {
             SEAL_STAMPS_EXPIRED_TOTAL,
             SEAL_STAMPS_DROPPED_TOTAL,
             EXECUTE_LATENCY_SECONDS,
+            END_TO_END_LATENCY_SECONDS,
             EXECUTE_STAMPS_EXPIRED_TOTAL,
             EXECUTE_STAMPS_DROPPED_TOTAL,
         ] {

@@ -121,6 +121,9 @@ const DURATION_BUCKETS: &[f64] = &[
 /// below 1 ms. The longer buckets retain slow samples and the original
 /// boundaries, so a tail outside the targets remains visible.
 const SEAL_LATENCY_SECONDS: &str = "kardamom_ingress_seal_latency_seconds";
+/// The end-to-end latency of the ingress has the same targets, so it has
+/// the same buckets.
+const END_TO_END_LATENCY_SECONDS: &str = "kardamom_ingress_end_to_end_latency_seconds";
 const SEAL_LATENCY_BUCKETS: &[f64] = &[
     0.000_05, 0.000_075, 0.000_1, 0.000_125, 0.000_15, 0.000_175, 0.000_2, 0.000_25, 0.000_5,
     0.000_75, 0.000_9, 0.000_95, 0.000_999, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
@@ -219,6 +222,8 @@ impl Exporter {
             .context("set the canary buckets")?
             .set_buckets_for_metric(full(SEAL_LATENCY_SECONDS), SEAL_LATENCY_BUCKETS)
             .context("set the canonical latency buckets")?
+            .set_buckets_for_metric(full(END_TO_END_LATENCY_SECONDS), SEAL_LATENCY_BUCKETS)
+            .context("set the end-to-end latency buckets")?
             .set_buckets_for_metric(full(pipeline::STEP_SECONDS), pipeline::STEP_BUCKETS)
             .context("set the step buckets")?
             .set_buckets_for_metric(full(pipeline::BATCH_ITEMS), pipeline::COUNT_BUCKETS)

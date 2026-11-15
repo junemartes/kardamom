@@ -51,6 +51,13 @@ impl<'a> Timing<'a> {
     }
 }
 
+impl Timing<'_> {
+    /// When the step started.
+    pub(crate) fn started(&self) -> Instant {
+        self.started
+    }
+}
+
 impl Drop for Timing<'_> {
     fn drop(&mut self) {
         self.step.since(self.started);

@@ -22,7 +22,7 @@ pub use accounts::AccountField;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_eth::BlockNumberOrTag;
@@ -106,6 +106,8 @@ where
 /// verified submission, plus a receipt-cache hit if this is a
 /// resubmission, and the tx's worst-case cost for the balance check.
 struct ValidatedSubmission {
+    /// When the submit arrived: the start of its validate step.
+    arrived: Instant,
     sender: Address,
     nonce: u64,
     tx_hash: B256,

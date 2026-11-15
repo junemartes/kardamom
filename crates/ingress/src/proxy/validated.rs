@@ -77,7 +77,7 @@ where
         client_ip: IpAddr,
         raw_tx: &AlloyBytes,
     ) -> Result<ControlFlow<B256, ValidatedSubmission>, IngressError> {
-        let _timing = Timing::start(&self.steps.validate);
+        let timing = Timing::start(&self.steps.validate);
         self.check_intake(client_ip, raw_tx)?;
         let tx_hash = keccak256(raw_tx);
         if let Some(sender) = self.seen.get(&tx_hash) {
@@ -85,7 +85,7 @@ where
             tracing::debug!(%sender, %tx_hash, "submit answered from the duplicate cache");
             return Ok(ControlFlow::Break(tx_hash));
         }
-        self.recover_submission(raw_tx)
+        self.recover_submission(raw_tx, timing.started())
             .await
             .map(ControlFlow::Continue)
     }
