@@ -134,6 +134,7 @@ impl LoadSpec {
             value: U256::from(1),
             gas_price: 1_000_000_000,
             max_in_flight: self.max_in_flight,
+            pace_tick: kardamom_bench::load::DEFAULT_PACE_TICK,
             max_gap: self.max_gap,
             drain_timeout: self.drain_timeout,
             retry_submit: self.retry_submit,

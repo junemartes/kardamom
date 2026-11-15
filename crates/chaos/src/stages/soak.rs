@@ -125,6 +125,7 @@ impl Harness {
             value: U256::from(1),
             gas_price: GAS_PRICE,
             max_in_flight: MAX_IN_FLIGHT,
+            pace_tick: kardamom_bench::load::DEFAULT_PACE_TICK,
             max_gap: self.knobs.load_max_gap,
             drain_timeout: DRAIN_TIMEOUT,
             retry_submit: RETRY_SUBMIT,

@@ -49,8 +49,8 @@ use crate::load::scrape::{MetricsSnapshot, ScrapeSet, Scraper};
 use crate::signers::{DerivedSigner, SignerSet};
 
 pub use config::{
-    ANVIL_MNEMONIC, CalldataMix, CalldataPart, Completeness, LoadConfig, LoadReport, NonceStart,
-    RampStep, SenderRange, Workload,
+    ANVIL_MNEMONIC, CalldataMix, CalldataPart, Completeness, DEFAULT_PACE_TICK, LoadConfig,
+    LoadReport, NonceStart, RampStep, SenderRange, Workload,
 };
 pub use exporter::{ExporterRead, ExporterReader, MetricsTarget, MetricsTargets};
 
@@ -569,6 +569,7 @@ impl RampRun<'_> {
                 pause_wait: self.cfg.pause_wait,
                 mode: self.mode,
                 feed_confirm: self.cfg.feed_confirm_on(),
+                pace_tick: self.cfg.pace_tick,
             },
         )
         .await?;
