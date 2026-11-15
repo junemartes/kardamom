@@ -8,6 +8,9 @@
 //! - The step `sequencer.offer_round_trip` is one offer to the sealer: the
 //!   request to the session thread, the Aeron publish there, and the
 //!   reply.
+//! - The steps `sequencer.offer_wait` and `sequencer.canonical_wait` are
+//!   the waits of one offer of the v2 loop, before and after its publish.
+//!   The canonical gate records them. See `crate::v2::canonical`.
 //! - The batch `sequencer.offer_refs` is the refs that one offer took.
 //! - The queue `sequencer.tx_data` is the envelopes that wait in the
 //!   `tx_data` lanes.

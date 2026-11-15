@@ -1,22 +1,51 @@
 //! A sender's next offer waits until its preceding offer is canonical.
+//!
+//! The gate records the two waits of an offer, as steps of
+//! `kardamom_step_seconds`:
+//!
+//! - `sequencer.offer_wait`: from the first sight of the offer by the gate
+//!   to a publish of the offer to the sealer. It is the time that the offer
+//!   waits in the outbox for the preceding offer of its sender, or for a
+//!   sealer that takes no offer. An offer that goes out again after a
+//!   refusal or a new session gives one more sample, from its first sight.
+//! - `sequencer.canonical_wait`: from the publish of the offer to the apply
+//!   of its canonical record in the loop. It is the hop to the sealer, the
+//!   wait for the replication quorum there, the hop back, and the wait of
+//!   the record for the loop. The offer of a replica that lost the race to
+//!   its twin gives a sample too: its hash is canonical.
+//!
+//! An offer that is canonical before it goes out gives no sample.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
+use std::time::Instant;
 
 use alloy_primitives::{Address, B256};
+use kardamom_obs::pipeline::Step;
 
 use super::RefPayload;
 use crate::admission::{Admission, Candidate};
 use crate::outbound::RefOffer;
 
+/// The offer of a sender that is at the sealer and not canonical yet.
 struct Flight {
     nonce: u64,
     hash: B256,
+    /// When the offer went to the sealer.
+    sent: Instant,
+}
+
+/// A queued offer of this loop that is not canonical yet.
+struct Held {
+    address: Address,
+    nonce: u64,
+    /// When the gate first saw the offer.
+    since: Instant,
 }
 
 pub(super) struct CanonicalGate {
     flights: HashMap<Address, Flight>,
-    held: HashMap<B256, (Address, u64)>,
+    held: HashMap<B256, Held>,
     seen: HashSet<B256>,
     history: VecDeque<B256>,
     history_cap: NonZeroUsize,
@@ -27,6 +56,10 @@ pub(super) struct CanonicalGate {
     /// The reused buffer of a scan of the fresh offers.
     tail: Vec<RefOffer>,
     changed: bool,
+    /// The step `sequencer.offer_wait`. See the module text.
+    offer_wait: Step,
+    /// The step `sequencer.canonical_wait`. See the module text.
+    canonical_wait: Step,
     #[cfg(test)]
     pub(super) scans: usize,
 }
@@ -44,6 +77,8 @@ impl CanonicalGate {
             fresh: 0,
             tail: Vec::new(),
             changed: true,
+            offer_wait: Step::new("sequencer.offer_wait"),
+            canonical_wait: Step::new("sequencer.canonical_wait"),
             #[cfg(test)]
             scans: 0,
         }
@@ -52,9 +87,9 @@ impl CanonicalGate {
     /// Every queued offer is in `held`. So a record of another hash leaves
     /// the outbox as it is, and the next flush does not scan it.
     pub(super) fn observe(&mut self, hash: B256, admission: &mut Admission<RefPayload>) {
-        if let Some((address, nonce)) = self.held.remove(&hash) {
+        if let Some(held) = self.held.remove(&hash) {
             self.changed();
-            self.confirm_hash(address, nonce, hash, admission);
+            self.confirm_hash(held.address, held.nonce, hash, admission);
         }
         if !self.seen.insert(hash) {
             return;
@@ -83,14 +118,21 @@ impl CanonicalGate {
             .flights
             .get(&address)
             .is_some_and(|flight| flight.hash == hash)
+            && let Some(flight) = self.flights.remove(&address)
         {
-            self.flights.remove(&address);
+            self.canonical_wait.since(flight.sent);
         }
     }
 
+    /// Hold the offer of `candidate` until it is canonical. A hash names
+    /// one sender and one nonce, so an offer that the gate already holds
+    /// keeps its entry and the time of its first sight.
     pub(super) fn track(&mut self, candidate: &Candidate<RefPayload>) {
-        self.held
-            .insert(candidate.tx_hash, (candidate.sender, candidate.nonce));
+        self.held.entry(candidate.tx_hash).or_insert_with(|| Held {
+            address: candidate.sender,
+            nonce: candidate.nonce,
+            since: Instant::now(),
+        });
     }
 
     pub(super) fn confirmed(&mut self, address: Address, admission: &Admission<RefPayload>) {
@@ -123,9 +165,9 @@ impl CanonicalGate {
                 .unconfirmed_at(*address, flight.nonce)
                 .is_some_and(|c| c.tx_hash == flight.hash)
         });
-        self.held.retain(|hash, (address, nonce)| {
+        self.held.retain(|hash, held| {
             admission
-                .unconfirmed_at(*address, *nonce)
+                .unconfirmed_at(held.address, held.nonce)
                 .is_some_and(|c| c.tx_hash == *hash && !c.payload.canonical)
         });
     }
@@ -216,14 +258,20 @@ impl CanonicalGate {
         false
     }
 
+    /// The sealer took `offer`. Its flight starts now, and its wait in the
+    /// outbox ends.
     pub(super) fn published(&mut self, offer: &RefOffer) {
         let address = offer.guard.sender;
         let hash = offer.tx_ref.tx_hash;
+        if let Some(held) = self.held.get(&hash) {
+            self.offer_wait.since(held.since);
+        }
         self.flights.insert(
             address,
             Flight {
                 nonce: offer.guard.nonce,
                 hash,
+                sent: Instant::now(),
             },
         );
     }
