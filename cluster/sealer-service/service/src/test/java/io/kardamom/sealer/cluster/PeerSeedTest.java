@@ -33,11 +33,17 @@ import org.junit.jupiter.api.io.TempDir;
 @ExtendWith(InterruptingTestCallback.class)
 final class PeerSeedTest {
 
-    /** Three members on loopback ports that no process uses. */
+    /**
+     * Three members on loopback ports that no process uses. The ports are
+     * below the ephemeral range of Linux (32768 and up by default), so the
+     * kernel never gives one of them to an outgoing socket. A port in that
+     * range can be taken by any socket of the host, and the backup of a
+     * round then fails to bind with "Address already in use".
+     */
     private static final String MEMBERS =
-            "0,localhost:47100,localhost:47101,localhost:47102,localhost:47103,localhost:47104"
-            + "|1,localhost:47110,localhost:47111,localhost:47112,localhost:47113,localhost:47114"
-            + "|2,localhost:47120,localhost:47121,localhost:47122,localhost:47123,localhost:47124";
+            "0,localhost:23100,localhost:23101,localhost:23102,localhost:23103,localhost:23104"
+            + "|1,localhost:23110,localhost:23111,localhost:23112,localhost:23113,localhost:23114"
+            + "|2,localhost:23120,localhost:23121,localhost:23122,localhost:23123,localhost:23124";
     private static final int MEMBER_ID = 0;
     private static final PeerSeed.Timing FAST = new PeerSeed.Timing(500, 100, 200);
     /** Long enough for several rounds of FAST. */
