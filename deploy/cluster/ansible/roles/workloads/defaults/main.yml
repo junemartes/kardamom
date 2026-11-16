@@ -412,6 +412,10 @@ workloads_canary_force_pull: "{{ lookup('env', 'KARDAMOM_CANARY_FORCE_PULL') }}"
 # When eth_sendRawTransaction answers (nomad/ingress.nomad.hcl): "receipt"
 # or "validated". Empty keeps "receipt".
 workloads_ingress_ack: "{{ lookup('env', 'KARDAMOM_INGRESS_ACK') }}"
+# The allocation indexes of the ingress that run the verify agent
+# (nomad/ingress.nomad.hcl, verify_agent_allocs): a comma-separated list
+# such as "1". Empty runs none. The agent needs KARDAMOM_INGRESS_ACK=validated.
+workloads_ingress_verify_agent_allocs: "{{ lookup('env', 'KARDAMOM_INGRESS_VERIFY_AGENT_ALLOCS') }}"
 # The Aeron stall tolerance, in milliseconds (nomad/aeron.system.nomad.hcl).
 # 10000 is Aeron's default, and production keeps it: a longer value delays
 # the detection of a dead process. CI raises it, so a host stall does not

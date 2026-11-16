@@ -1452,6 +1452,17 @@ class DeployTest(Deploys):
                 args = self.api.state['plans']['ingress']['TaskGroups'][0]['Tasks'][0]['Config']['args']
                 self.assertEqual(args[args.index('--ack') + 1], expected)
 
+    def test_the_verify_agent_runs_on_the_named_allocations_only(self):
+        on_one = ('KARDAMOM_INGRESS_VERIFY_AGENT={{ if or (eq (env "NOMAD_ALLOC_INDEX") "1") }}'
+                  'on{{ else }}off{{ end }}\n')
+        for switch, expected in (('', []), ('1', [(on_one, True)])):
+            with self.subTest(switch=switch):
+                self.run_deploy({'workloads_ingress_verify_agent_allocs': switch}, check=True)
+                task = self.api.state['plans']['ingress']['TaskGroups'][0]['Tasks'][0]
+                agent = [(t['EmbeddedTmpl'], t['Envvars']) for t in task['Templates']
+                         if t['DestPath'] == 'local/verify-agent.env']
+                self.assertEqual(agent, expected)
+
     # The jobs that the switches of the carry window change.
     CARRY_JOBS = ('aeron', 'cluster', 'executor', 'state-mirror', 'sequencer', 'ingress', 'batcher',
                   'validator', 'monitoring')

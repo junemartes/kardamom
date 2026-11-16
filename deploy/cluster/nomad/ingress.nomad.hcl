@@ -51,6 +51,19 @@ variable "ack" {
   }
 }
 
+variable "verify_agent_allocs" {
+  type        = string
+  description = "The allocation indexes of the ingress that run the verify agent (--verify-agent on), as a comma-separated list such as 1 or 0,1. Empty runs none. An entry that names no allocation index turns no agent on. The agent needs ack=validated: an ingress with the agent and another ack refuses to start. One index gives the side-by-side comparison of docs/specs/2026-10-23-hot-path-agents.md, section 9."
+  default     = ""
+}
+
+locals {
+  # The Go template test of the allocation index against each index of
+  # verify_agent_allocs. Nomad renders it per allocation, so one job can
+  # run the agent on one replica and the tokio path on the other.
+  verify_agent_test = join(" ", [for i in compact(split(",", var.verify_agent_allocs)) : format("(eq (env \"NOMAD_ALLOC_INDEX\") \"%s\")", i)])
+}
+
 # Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests), so the task runs exactly the bytes
@@ -363,6 +376,18 @@ job "ingress" {
         # job scrapes it off-node. The port is the ingress convention,
         # 9006 (the validator uses the same number on the aux node).
         KARDAMOM_METRICS_ADDR = "0.0.0.0:9006"
+      }
+
+      # --verify-agent of this allocation (variable verify_agent_allocs).
+      # With no index named, the job has no such template, so it compiles
+      # as before, and the ingress keeps its default, off.
+      dynamic "template" {
+        for_each = local.verify_agent_test == "" ? [] : [local.verify_agent_test]
+        content {
+          destination = "local/verify-agent.env"
+          env         = true
+          data        = "KARDAMOM_INGRESS_VERIFY_AGENT={{ if or ${template.value} }}on{{ else }}off{{ end }}\n"
+        }
       }
 
       # Presence-checked config. Content lives in config/ingress.toml.
