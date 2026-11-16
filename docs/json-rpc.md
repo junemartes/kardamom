@@ -49,6 +49,7 @@ receipt fields, the errors and the limits.
   - An accepted transaction can still drop later in the sequencer. Read the result with `eth_getTransactionReceipt`, or follow the status feed.
   - `kardamom_sendRawTransactionAsync` is another name of `eth_sendRawTransaction` in this mode.
   - `--ack validated` takes no `--verdicts`.
+  - `--verify-agent on` (env `KARDAMOM_INGRESS_VERIFY_AGENT`) recovers, checks and publishes each transaction on one thread with no task hop. The answers are the same, with two differences: a full ring of the agent answers `txpool is full` at once, and the nonce check reads only the local account layer, so a sender with no local row goes on with no Redis read. The default is `off`. `--verify-agent on` needs `--ack validated`.
 - `kardamom_sendRawTransactionAsync` validates the transaction and publishes it. It returns the hash at once.
   - Use it to keep many transactions in flight on one connection.
   - A rejection by the sequencer does not reach this call. It reaches the client through the receipt subscription or the status feed.

@@ -26,13 +26,18 @@
 
 use std::net::IpAddr;
 use std::ops::ControlFlow;
+use std::time::Instant;
+
+use tokio::sync::oneshot;
 
 use alloy_primitives::{B256, Bytes as AlloyBytes, keccak256};
 use kardamom_cache::AccountView;
 
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::error::IngressError;
+use crate::metrics::count_reject;
 use crate::submit_steps::Timing;
+use crate::verify_agent::{Answer, VerifyAgentHandle, VerifyItem};
 
 use super::{IngressProxy, ValidatedSubmission};
 
@@ -55,6 +60,9 @@ where
         raw_tx: AlloyBytes,
     ) -> Result<B256, IngressError> {
         let _timing = Timing::start(&self.steps.submit);
+        if let Some(agent) = &self.agent {
+            return self.submit_on_agent(agent, client_ip, raw_tx).await;
+        }
         let v = match self.validate_unseen(client_ip, &raw_tx).await? {
             ControlFlow::Break(tx_hash) => return Ok(tx_hash),
             ControlFlow::Continue(v) => v,
@@ -88,6 +96,63 @@ where
         self.recover_submission(raw_tx, timing.started())
             .await
             .map(ControlFlow::Continue)
+    }
+
+    /// The validated submit on the verify agent. The handler does the intake
+    /// checks, the hash, the duplicate cache and the decode, as the tokio
+    /// path does, then gives the rest to the agent and awaits its answer.
+    async fn submit_on_agent(
+        &self,
+        agent: &VerifyAgentHandle,
+        client_ip: IpAddr,
+        raw_tx: AlloyBytes,
+    ) -> Result<B256, IngressError> {
+        let (item, answer) = match self.agent_item(client_ip, raw_tx)? {
+            ControlFlow::Break(tx_hash) => return Ok(tx_hash),
+            ControlFlow::Continue(item) => item,
+        };
+        agent.submit(item).map_err(|_| {
+            count_reject("ring-full");
+            IngressError::PoolFull
+        })?;
+        let admitted = answer
+            .await
+            .map_err(|_| IngressError::Internal("the verify agent is gone".into()))??;
+        self.seen.insert(admitted.tx_hash, admitted.sender);
+        self.publication.note_published(admitted.tx_hash);
+        metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
+        Ok(admitted.tx_hash)
+    }
+
+    /// The head of a submit on the agent: the intake checks, the hash, the
+    /// duplicate cache and the decode, under the step `ingress.validate`.
+    /// `Break` carries the hash of a transaction that the duplicate cache
+    /// holds.
+    #[allow(clippy::type_complexity)]
+    fn agent_item(
+        &self,
+        client_ip: IpAddr,
+        raw_tx: AlloyBytes,
+    ) -> Result<ControlFlow<B256, (VerifyItem, oneshot::Receiver<Answer>)>, IngressError> {
+        let timing = Timing::start(&self.steps.validate);
+        self.check_intake(client_ip, &raw_tx)?;
+        let tx_hash = keccak256(&raw_tx);
+        if self.seen.get(&tx_hash).is_some() {
+            metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
+            return Ok(ControlFlow::Break(tx_hash));
+        }
+        let envelope = Self::decode_submission(&raw_tx)?;
+        let (answer, rx) = oneshot::channel();
+        let item = VerifyItem {
+            raw_tx,
+            envelope,
+            arrived: timing.started(),
+            correlation_id: self.next_correlation_id(),
+            max_inclusion_block: self.cfg.inclusion_deadline(self.deadline_clock()),
+            answer,
+            queued: Instant::now(),
+        };
+        Ok(ControlFlow::Continue((item, rx)))
     }
 
     /// The nonce check against the account view. Off with

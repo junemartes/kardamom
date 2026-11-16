@@ -284,6 +284,16 @@ where
         self.cfg.check_tx_size(raw_tx)
     }
 
+    /// The decode of a submit. A refusal counts `decode-error`.
+    pub(super) fn decode_submission(
+        raw_tx: &AlloyBytes,
+    ) -> Result<ConsensusEnvelope, IngressError> {
+        ConsensusEnvelope::decode(&mut raw_tx.as_ref()).map_err(|e| {
+            count_reject("decode-error");
+            IngressError::Decode(e.to_string())
+        })
+    }
+
     /// The decode, the protocol limits, the sender recovery, and the
     /// receipt-cache lookup, of a submit that arrived at `arrived`.
     pub(super) async fn recover_submission(
@@ -291,10 +301,7 @@ where
         raw_tx: &AlloyBytes,
         arrived: Instant,
     ) -> Result<ValidatedSubmission, IngressError> {
-        let env = ConsensusEnvelope::decode(&mut raw_tx.as_ref()).map_err(|e| {
-            count_reject("decode-error");
-            IngressError::Decode(e.to_string())
-        })?;
+        let env = Self::decode_submission(raw_tx)?;
 
         // Protocol-limit checks run before sig-verify, to save a
         // recovery: a tx that can never execute gets a clear error
@@ -417,7 +424,7 @@ where
     /// tick, so the value moves while every executor is down. A deadline
     /// from the executor boundaries alone stops at the outage, and the
     /// sealer then refuses every new transaction as past its deadline.
-    fn deadline_clock(&self) -> u64 {
+    pub(super) fn deadline_clock(&self) -> u64 {
         self.latest_block_number()
             .max(self.cluster_status().sealed_head)
     }
@@ -472,7 +479,7 @@ where
 /// is foreign, so this attaches the check as a local extension trait
 /// instead of a free function taking the envelope as a loose parameter.
 /// The worst-case cost lives here for the same reason.
-trait CheckProtocolLimits {
+pub(crate) trait CheckProtocolLimits {
     fn check_protocol_limits(&self) -> Result<(), IngressError>;
     /// `gas_limit * max_fee_per_gas + value`, the most the tx can take
     /// from the sender. `max_fee_per_gas` is `gas_price` on a legacy

@@ -119,6 +119,11 @@ jobs:
           fi
           cargo nextest archive --workspace --locked --features "$features" \
             --zstd-level 1 --archive-file /tmp/workspace-tests.tar.zst
+      # The wake handshake of the verify agent in each interleaving of a
+      # loom model. The `loom` feature switches only the doorbell, so the
+      # dependencies of the build above stay; about 10 s of model time.
+      - name: Model-check the doorbell of the verify agent (loom)
+        run: cargo test -p kardamom-ingress --locked --features loom --test doorbell_loom
       - name: Package the component recovery tests
         run: |
           logs=(--artifacts /tmp/workspace-build.jsonl)

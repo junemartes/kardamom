@@ -23,4 +23,14 @@ impl Rendered {
             .parse()
             .unwrap()
     }
+
+    /// The value of `series`, or 0 when the page has no such series: a
+    /// counter or a step that never moved has none.
+    pub(crate) fn value_or_zero(&self, series: &str) -> f64 {
+        self.0
+            .lines()
+            .find(|line| line.starts_with(series))
+            .and_then(|line| line.rsplit(' ').next())
+            .map_or(0.0, |value| value.parse().unwrap())
+    }
 }

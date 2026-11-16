@@ -19,6 +19,10 @@ docker-e2e = ["kardamom-log/docker-e2e", "kardamom-cache/docker-e2e"]
 # through the [dev-dependencies] self-reference below), and jsonrpsee's
 # `http-client` gates on here instead of only in [dev-dependencies].
 test-support = ["dep:alloy-signer-local", "dep:k256", "jsonrpsee/http-client"]
+# The atomics and the park of `verify_agent::doorbell` from `loom`, for
+# `tests/doorbell_loom.rs`. Never on in a build that runs: the doorbell
+# then only works inside a `loom` model.
+loom = ["dep:loom"]
 
 [dependencies]
 alloy-primitives.workspace = true
@@ -31,6 +35,10 @@ async-trait = "0.1"
 bytes.workspace = true
 clap.workspace = true
 crossbeam-queue = "0.3"
+loom = { version = "0.7", optional = true }
+# The bytes of an encoded envelope that waits in the retry queue of the
+# verify agent (`kardamom_log::codec::encode` gives an `AlignedVec`).
+rkyv = { workspace = true }
 dashmap = "6"
 governor = "0.10"
 hyper = { version = "1", features = ["http1", "server"] }

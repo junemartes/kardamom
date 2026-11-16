@@ -12,6 +12,7 @@ mod accounts;
 #[cfg(test)]
 mod rollback_tests;
 mod submit;
+pub(crate) use submit::CheckProtocolLimits;
 mod validated;
 #[cfg(test)]
 mod validated_tests;
@@ -48,6 +49,7 @@ use crate::recent::RecentMap;
 use crate::sig_verify::BatchVerifier;
 use crate::submit_steps::SubmitSteps;
 use crate::tx_error_dedup::TxErrorDedup;
+use crate::verify_agent::{VerifyAgent, VerifyAgentHandle};
 
 /// One stream watcher's per-item step. Each watcher in `watchers` holds
 /// its own state and folds one item into it here.
@@ -217,7 +219,16 @@ where
     pub(crate) sealer: SealerLifecycle,
     /// The step times of the submit path.
     pub(crate) steps: SubmitSteps,
+    /// The verify agent of the validated ack, after
+    /// [`Self::with_verify_agent`] with `cfg.verify_agent` on. `None`
+    /// keeps the tokio path.
+    pub(crate) agent: Option<Arc<VerifyAgentHandle>>,
 }
+
+/// The submits that wait in the ring of the verify agent. A full ring
+/// answers `txpool is full` at once. 4096 is about 1 s of traffic at
+/// 4,000 tx/s; the agent takes a submit in some microseconds.
+const VERIFY_RING_CAPACITY: usize = 4096;
 
 /// Capacity of the deduped receipt and error re-broadcast feeds. A
 /// subscriber that lags more than this many items gets a `Lagged`
@@ -262,6 +273,7 @@ where
             cluster_status: self.cluster_status.clone(),
             sealer: self.sealer.clone(),
             steps: self.steps.clone(),
+            agent: self.agent.clone(),
         }
     }
 }
@@ -331,6 +343,7 @@ where
             cluster_status,
             sealer: Arc::new(Lifecycle::new(Some(crate::chain::SEALER))),
             steps: SubmitSteps::new(),
+            agent: None,
         };
         me.spawn_tx_receipts_watcher(applied_tx);
         me.spawn_tx_errors_watcher();
@@ -458,6 +471,31 @@ where
     /// wrapping, and a wrap is harmless. The `(replica, sequence)` pair
     /// is globally unique.
     #[inline]
+    /// Start the verify agent when `cfg.verify_agent` is on: it takes the
+    /// `tx_data` lanes of the publication, and the validated submits go to
+    /// it. With the flag off, this returns the proxy as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lanes cannot go to the agent, or its
+    /// thread does not start.
+    pub fn with_verify_agent(mut self) -> Result<Self, IngressError> {
+        if !self.cfg.verify_agent {
+            return Ok(self);
+        }
+        let lanes = self.publication.agent_lanes()?;
+        let agent = VerifyAgent::new(
+            lanes,
+            self.cfg.clone(),
+            self.live.clone(),
+            VERIFY_RING_CAPACITY,
+        );
+        let handle = VerifyAgentHandle::spawn(agent)
+            .map_err(|e| IngressError::internal("spawn the verify agent", e))?;
+        self.agent = Some(Arc::new(handle));
+        Ok(self)
+    }
+
     pub fn next_correlation_id(&self) -> u64 {
         let seq = self.correlation_seq.fetch_add(1, Ordering::Relaxed);
         TxEnvelope::pack_correlation_id(self.cfg.ingress_id, seq)

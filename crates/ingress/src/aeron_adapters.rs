@@ -14,11 +14,12 @@ use std::time::Instant;
 
 use tokio::sync::{broadcast, watch};
 
+use alloy_primitives::B256;
 use kardamom_cache::{LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
 use kardamom_log::aeron_live::{
-    AeronRuntime, FsyncWatermarkSubscriberHandle, ReceiptFrame, ServiceEventsSubscriberHandle,
-    TxDataPublisherHandle, TxErrorsSubscriberHandle, TxReceiptsBoundarySubscriberHandle,
-    TxReceiptsReceiver, TxStatusSubscriberHandle,
+    AeronRuntime, FsyncWatermarkSubscriberHandle, LentPublication, ReceiptFrame,
+    ServiceEventsSubscriberHandle, TxDataPublisherHandle, TxErrorsSubscriberHandle,
+    TxReceiptsBoundarySubscriberHandle, TxReceiptsReceiver, TxStatusSubscriberHandle,
 };
 use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::events::BoardView;
@@ -33,6 +34,7 @@ use crate::error::IngressError;
 use crate::rollback_log::RollbackLog;
 use crate::stage_latency::{StageClock, StageStamps};
 use crate::tx_events::AcceptedQueue;
+use crate::verify_agent::AgentLanes;
 
 // ---------------------------------------------------------------------------
 // IngressPublication adapter over M TxDataPublisherHandle.
@@ -45,6 +47,9 @@ use crate::tx_events::AcceptedQueue;
 pub struct LiveIngressPublication {
     tx_data: Vec<TxDataPublisherHandle>,
     stamps: StageStamps,
+    /// The time cap of an idle park of the verify agent: the idle cap of
+    /// the Aeron runtime (`KARDAMOM_IDLE_CAP_US`), or 1 ms without one.
+    idle_cap: std::time::Duration,
     /// The `accepted` records of `tx_events`, with `KARDAMOM_TX_EVENTS=on`.
     accepted: Option<AcceptedQueue>,
 }
@@ -74,6 +79,10 @@ impl LiveIngressPublication {
         Ok(Self {
             tx_data,
             stamps,
+            idle_cap: rt
+                .idle_cap()
+                .duration()
+                .unwrap_or(std::time::Duration::from_millis(1)),
             accepted: None,
         })
     }
@@ -108,10 +117,36 @@ impl IngressPublication for LiveIngressPublication {
             .publish_async(&envelope)
             .await
             .map_err(|e| IngressError::internal("publish_tx_data", e))?;
+        self.note_published(tx_hash);
+        Ok(())
+    }
+
+    type Lane = LentPublication;
+
+    /// The lent publication of each lane. While the agent holds them, a
+    /// publish on the handles of this publication fails at once.
+    fn agent_lanes(&self) -> Result<AgentLanes<LentPublication>, IngressError> {
+        let lanes = self
+            .tx_data
+            .iter()
+            .enumerate()
+            .map(|(lane, handle)| {
+                handle
+                    .lend()
+                    .map_err(|e| IngressError::internal(format!("lend tx_data[{lane}]"), e))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AgentLanes {
+            lanes,
+            stamps: Some(self.stamps.clone()),
+            idle_cap: self.idle_cap,
+        })
+    }
+
+    fn note_published(&self, tx_hash: B256) {
         if let Some(accepted) = &self.accepted {
             accepted.note(tx_hash);
         }
-        Ok(())
     }
 }
 
@@ -660,6 +695,7 @@ mod tests {
         let publication = LiveIngressPublication {
             tx_data: Vec::new(),
             stamps: StageClock::pair().0,
+            idle_cap: std::time::Duration::from_micros(50),
             accepted: None,
         };
         let err = publication

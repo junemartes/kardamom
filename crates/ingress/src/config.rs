@@ -114,6 +114,10 @@ pub struct IngressConfig {
     /// The hashes that the duplicate cache of the validated ack holds. The
     /// oldest hash goes when the cache is full.
     pub duplicate_cache_capacity: NonZeroUsize,
+    /// With the validated ack, the verify agent recovers, checks and
+    /// publishes each transaction, on one thread with no task hop. See
+    /// [`crate::verify_agent`]. Off keeps the tokio path.
+    pub verify_agent: bool,
 }
 
 /// When `eth_sendRawTransaction` answers.
@@ -263,6 +267,7 @@ impl Default for IngressConfig {
             pending_shed_depth: 16_384,
             live_accounts: LiveAccountsConfig::default(),
             admission_checks: true,
+            verify_agent: false,
             executor_query: ExecutorQueryConfig::default(),
             receipt_query: ExecutorQueryConfig::default(),
             cache: CacheConfig::default(),
