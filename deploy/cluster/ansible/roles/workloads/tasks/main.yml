@@ -124,6 +124,7 @@
       defer: true
       vars:
         ack: "{{ workloads_ingress_ack | default('receipt', true) }}"
+        verify_agent_allocs: "{{ workloads_ingress_verify_agent_allocs }}"
     - name: executor
       tasks: executor.yml
       wait: false
