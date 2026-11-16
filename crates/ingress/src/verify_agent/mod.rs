@@ -18,17 +18,20 @@
 //!   the answer wakes the handler. The tokio path has four.
 //! - A refused offer waits in a [`kardamom_log::parked::ParkedQueue`] with
 //!   the deadline of the Aeron thread, then answers `txpool is full`.
-//! - A local miss admits. The agent never waits for Redis.
+//! - A local miss admits. The agent never waits for Redis: the filler
+//!   reads the row of a missed sender in the background (`fill`).
 //! - The agent offers on lent publications (`LentPublication`), so it
 //!   needs no hop to the Aeron thread.
 
 mod agent;
 mod doorbell;
+mod fill;
 mod lane;
 
 pub use agent::VerifyItem;
 pub(crate) use agent::{VerifyAgent, VerifyAgentHandle};
 pub use doorbell::Doorbell;
+pub(crate) use fill::{AccountFiller, MISS_CAPACITY};
 pub use lane::{Admitted, AgentLanes, Answer, LaneOffer};
 
 #[cfg(all(test, not(feature = "loom")))]

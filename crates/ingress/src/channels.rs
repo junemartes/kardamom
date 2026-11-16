@@ -17,8 +17,8 @@ use std::time::Instant;
 
 use tokio::sync::{broadcast, mpsc, watch};
 
-use alloy_primitives::B256;
-use kardamom_cache::{LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
+use alloy_primitives::{Address, B256};
+use kardamom_cache::{AccountView, LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
 use kardamom_log::parked::Offered;
 use kardamom_obs::events::BoardView;
 use kardamom_types::{
@@ -131,6 +131,12 @@ pub trait IngressSubscription: Send + Sync + 'static {
     /// The latest state of every service on the `events` stream: the
     /// board the chain status and the submit pause read.
     fn service_board(&self) -> watch::Receiver<BoardView>;
+    /// Give the one writer of [`Self::live_accounts`] the row of `address`
+    /// that a reader fetched: the Redis row of a sender that the verify
+    /// agent missed. The writer applies it through the monotone rule, and
+    /// it moves no head. It never waits: with no room, the row drops, and
+    /// the next miss asks again.
+    fn fill_account(&self, address: Address, view: AccountView);
 }
 
 /// One name for the `(publisher, subscriber)` pair that every proxy
@@ -343,6 +349,14 @@ impl IngressSubscription for MockChannels {
     }
     fn service_board(&self) -> watch::Receiver<BoardView> {
         self.service_board_bus.subscribe()
+    }
+    fn fill_account(&self, address: Address, view: AccountView) {
+        let row = AccountRow {
+            address,
+            nonce: view.nonce,
+            balance: view.balance,
+        };
+        self.live_writer.lock().unwrap().fill(&row, view.tx_idx);
     }
 }
 

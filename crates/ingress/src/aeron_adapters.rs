@@ -12,10 +12,10 @@ use std::num::{NonZeroU8, NonZeroU32};
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
-use alloy_primitives::B256;
-use kardamom_cache::{LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
+use alloy_primitives::{Address, B256};
+use kardamom_cache::{AccountView, LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
 use kardamom_log::aeron_live::{
     AeronRuntime, FsyncWatermarkSubscriberHandle, LentPublication, ReceiptFrame,
     ServiceEventsSubscriberHandle, TxDataPublisherHandle, TxErrorsSubscriberHandle,
@@ -25,7 +25,7 @@ use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::events::BoardView;
 use kardamom_obs::pipeline::{Batch, LoopMeter, LoopState};
 use kardamom_types::{
-    BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, Receipt,
+    AccountRow, BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, Receipt,
     ReceiptBatch, ReceiptRollback, TxEnvelope, TxError, TxStatus,
 };
 
@@ -234,6 +234,12 @@ impl_pump_source!(TxStatusSubscriberHandle, TxStatus);
 /// log, which a reader that lags on the bus reads. `TxReceiptsReceiver` has
 /// no constructor outside the log crate, so [`Self::on_frame`] is the
 /// testable step.
+/// One input of the receipt pump.
+enum PumpInput {
+    Frame(ReceiptFrame),
+    Fill(Address, AccountView),
+}
+
 struct ReceiptBatchPump {
     writer: LiveAccountsWriter,
     tx: broadcast::Sender<ReceiptItem>,
@@ -264,14 +270,42 @@ impl ReceiptBatchPump {
 
     /// Start the pump on the runtime. It ends when the source closes, on
     /// `AeronRuntime` shutdown.
-    fn spawn(self, rx: TxReceiptsReceiver) {
-        tokio::spawn(self.run(rx));
+    fn spawn(self, rx: TxReceiptsReceiver, fills: mpsc::Receiver<AccountFill>) {
+        tokio::spawn(self.run(rx, fills));
     }
 
-    async fn run(mut self, mut rx: TxReceiptsReceiver) {
-        while let Some((_, frame)) = rx.recv_frame().await {
-            self.on_received(frame);
+    /// Take the frames of `rx` and the fetched rows of `fills`, in the
+    /// order they come. A row applies between two frames.
+    async fn run(mut self, mut rx: TxReceiptsReceiver, mut fills: mpsc::Receiver<AccountFill>) {
+        while let Some(input) = Self::next(&mut rx, &mut fills).await {
+            match input {
+                PumpInput::Frame(frame) => self.on_received(frame),
+                PumpInput::Fill(address, view) => self.on_fill(address, &view),
+            }
         }
+    }
+
+    /// The next input. `None` when the frame source closes. A closed fill
+    /// channel only leaves the frames.
+    async fn next(
+        rx: &mut TxReceiptsReceiver,
+        fills: &mut mpsc::Receiver<AccountFill>,
+    ) -> Option<PumpInput> {
+        tokio::select! {
+            frame = rx.recv_frame() => frame.map(|(_, frame)| PumpInput::Frame(frame)),
+            Some((address, view)) = fills.recv() => Some(PumpInput::Fill(address, view)),
+        }
+    }
+
+    /// Apply one fetched row, through the monotone rule. See
+    /// `LiveAccountsWriter::fill`.
+    fn on_fill(&mut self, address: Address, view: &AccountView) {
+        let row = AccountRow {
+            address,
+            nonce: view.nonce,
+            balance: view.balance,
+        };
+        self.writer.fill(&row, view.tx_idx);
     }
 
     /// Handle one frame that the wait received, and meter the wait and
@@ -352,7 +386,17 @@ pub struct LiveIngressSubscription {
     /// The board of every service's latest state, fed by the `events`
     /// subscription.
     service_board: watch::Receiver<BoardView>,
+    /// The rows that a reader fetched, to the receipt pump, the one writer
+    /// of the local layer. With no receipt pump (the verdicts of the
+    /// ingress) nothing reads them, and a send fails.
+    fills: mpsc::Sender<AccountFill>,
 }
+
+/// A row that a reader fetched for the local account layer.
+type AccountFill = (Address, AccountView);
+
+/// The fetched rows that wait for the receipt pump.
+const FILL_CAPACITY: usize = 1024;
 
 impl LiveIngressSubscription {
     /// Open the five subscriber handles through `plane`: `tx_errors`,
@@ -407,6 +451,7 @@ impl LiveIngressSubscription {
         // to the egress, and the verdicts of its own transactions come on
         // its `tx_verdicts` stream.
         let (rollback_log, rollbacks) = watch::channel(RollbackLog::default());
+        let (fills, fill_rx) = mpsc::channel(FILL_CAPACITY);
         match verdicts {
             None => {
                 let receipts_sub = plane
@@ -416,7 +461,7 @@ impl LiveIngressSubscription {
                 // `AeronRuntime` clone. Holding one would keep the runtime
                 // alive forever; see `TxReceiptsSubscriberHandle::into_receiver`.
                 ReceiptBatchPump::new(live_writer, receipts_tx.clone(), rollback_log, executed)
-                    .spawn(receipts_sub.into_receiver());
+                    .spawn(receipts_sub.into_receiver(), fill_rx);
             }
             Some(own) => {
                 tracing::info!(
@@ -471,6 +516,7 @@ impl LiveIngressSubscription {
             verdicts: verdicts_tx,
             cluster_status: cluster_status_tx,
             service_board,
+            fills,
         })
     }
 
@@ -522,6 +568,9 @@ impl IngressSubscription for LiveIngressSubscription {
     }
     fn service_board(&self) -> watch::Receiver<BoardView> {
         self.service_board.clone()
+    }
+    fn fill_account(&self, address: Address, view: AccountView) {
+        let _ = self.fills.try_send((address, view));
     }
 }
 
@@ -660,6 +709,31 @@ mod tests {
             sub.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    // A fetched row applies through the monotone rule, between two frames:
+    // a newer frame row wins over it, and it moves no head.
+    #[tokio::test]
+    async fn receipt_pump_applies_a_fill_by_the_monotone_rule() {
+        let (live, writer) = LiveAccounts::new(&LiveAccountsConfig::default());
+        let (bus, _sub) = broadcast::channel::<ReceiptItem>(16);
+        let log = watch::channel(RollbackLog::default()).0;
+        let mut pump = ReceiptBatchPump::new(writer, bus, log, StageClock::pair().1.executed);
+        let address = Address::repeat_byte(0x11);
+        let view = |nonce, tx_idx| AccountView {
+            nonce,
+            balance: alloy_primitives::U256::ZERO,
+            tx_idx,
+        };
+        pump.on_fill(address, &view(4, 30));
+        assert_eq!(live.get(address).map(|v| v.nonce), Some(4));
+        assert_eq!(live.head(), 0, "a fill moves no head");
+        pump.on_fill(address, &view(2, 10));
+        assert_eq!(
+            live.get(address).map(|v| v.nonce),
+            Some(4),
+            "an older fill loses"
+        );
     }
 
     // The receipt batch histogram takes one sample for each batch with a

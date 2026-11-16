@@ -298,3 +298,60 @@ fn the_drop_answers_each_held_submit_then_joins() {
     }
     assert_eq!(lane.nonces(), (0..50).collect::<Vec<_>>());
 }
+
+/// A sender that misses the local layer goes to the filler, with no wait.
+/// A sender that the layer holds goes nowhere.
+#[test]
+fn a_miss_goes_to_the_filler_and_a_hit_does_not() {
+    let mut b = Bench::new(FakeLane::default());
+    let (misses, mut rx) = tokio::sync::mpsc::channel(4);
+    b.agent = b.agent.with_misses(misses);
+    let mut first = b.push(0);
+    b.poll(Duration::ZERO);
+    assert!(answered(&mut first).is_ok(), "a miss admits");
+    assert_eq!(rx.try_recv().ok(), Some(b.signer.address()));
+    b.known_at(1);
+    let mut second = b.push(1);
+    b.poll(Duration::ZERO);
+    assert!(answered(&mut second).is_ok());
+    assert!(rx.try_recv().is_err(), "a hit asks for no fill");
+}
+
+/// A source that answers each read with nonce 7, and counts its reads.
+#[derive(Default)]
+struct CountingSource {
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl super::fill::AccountSource for CountingSource {
+    fn account(
+        &self,
+        _address: alloy_primitives::Address,
+    ) -> impl std::future::Future<Output = Option<kardamom_cache::AccountView>> + Send {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::future::ready(Some(kardamom_cache::AccountView {
+            nonce: 7,
+            balance: U256::MAX,
+            tx_idx: 3,
+        }))
+    }
+}
+
+/// The filler reads each missed sender once per burst, and the row lands
+/// in the local layer of the subscription.
+#[tokio::test]
+async fn the_filler_reads_a_sender_once_and_fills_the_local_layer() {
+    let (mock, _lanes) = crate::channels::MockChannels::new(std::num::NonZeroUsize::MIN);
+    let source = Arc::new(CountingSource::default());
+    let (misses, rx) = tokio::sync::mpsc::channel(8);
+    let sender = PrivateKeySigner::random().address();
+    (0..5).for_each(|_| misses.try_send(sender).unwrap());
+    drop(misses);
+    super::fill::AccountFiller::new(rx, source.clone(), mock.clone())
+        .run()
+        .await;
+    assert_eq!(source.reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+    let live = crate::channels::IngressSubscription::live_accounts(&mock);
+    assert_eq!(live.get(sender).map(|view| view.nonce), Some(7));
+}

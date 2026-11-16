@@ -108,6 +108,17 @@ impl LiveAccountsWriter {
         applied
     }
 
+    /// Apply one row that a reader fetched, such as a Redis row, at the
+    /// position `tx_idx` of the batch that wrote it, through the monotone
+    /// rule. The row is no frame of the stream, so the head stays where the
+    /// frames put it. Returns whether the row applied.
+    pub fn fill(&mut self, row: &AccountRow, tx_idx: u64) -> bool {
+        let now = Instant::now();
+        let applied = self.apply_one(row, tx_idx, now);
+        self.evict(now);
+        applied
+    }
+
     /// Drop every resident entry and set the head to zero. A rollback of
     /// an executor calls this: the rows of the lost blocks carry positions
     /// above the new stream, so the monotone rule would keep them. A
@@ -208,6 +219,23 @@ mod tests {
         assert_eq!(live.head(), 20);
         writer.apply(BPosition::from_index(15), &[]);
         assert_eq!(live.head(), 20);
+    }
+
+    /// A fetched row applies by the same rule as a frame row, and leaves the
+    /// head of the frames.
+    #[test]
+    fn a_fill_keeps_the_newest_position_and_leaves_the_head() {
+        let (live, mut writer) = LiveAccounts::new(&cfg(16, 60_000));
+        writer.apply(BPosition::from_index(10), &[row(0xaa, 1)]);
+        assert!(
+            !writer.fill(&row(0xaa, 9), 5),
+            "an older row does not overwrite"
+        );
+        assert!(writer.fill(&row(0xbb, 3), 40), "a new address fills");
+        assert!(writer.fill(&row(0xaa, 2), 20), "a newer row overwrites");
+        assert_eq!(live.get(Address::repeat_byte(0xaa)).unwrap().nonce, 2);
+        assert_eq!(live.get(Address::repeat_byte(0xbb)).unwrap().nonce, 3);
+        assert_eq!(live.head(), 10, "a fill moves no head");
     }
 
     #[test]
