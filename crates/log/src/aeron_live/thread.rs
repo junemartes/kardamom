@@ -4,13 +4,13 @@
 //! one `kardamom-aeron` OS thread; the rest of the module talks to it
 //! exclusively through [`RuntimeCmd`]s.
 
-use std::collections::VecDeque;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver as CbReceiver, TryRecvError};
+use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, TryRecvError};
 use tracing::warn;
 
 use super::add_wait::{AddWait, PubAdd, SubAdd};
@@ -19,6 +19,7 @@ use super::destination::Destination;
 use super::idle::{IdleBackoff, IdleCap};
 use super::image_joins::ImageJoins;
 use super::image_log::ImageHandlers;
+use super::lent::Lent;
 use super::meter::{Backlog, ThreadMeter};
 use super::pending::{PendingPublish, PubEntry, PublishAck, drain_pending};
 use super::runtime::{OpenedPub, RuntimeCmd};
@@ -26,6 +27,7 @@ use super::table_pub::TablePub;
 use super::{ADD_PUB_TIMEOUT, ADD_SUB_TIMEOUT, AeronClient, FrameSink, Header, RawFrame, Sub};
 use crate::error::LogError;
 use crate::offer_retry::OFFER_TIMEOUT;
+use crate::parked::ParkedQueue;
 use crate::term_layout::TermLayout;
 use kardamom_types::BPosition;
 
@@ -202,6 +204,10 @@ struct AeronThread {
     /// Indexed by `pub_id`. A closed publication leaves a `None` slot,
     /// so the ids of the open ones stay valid.
     pubs: Vec<Option<PubEntry>>,
+    /// The ids of the publications on loan. Their rows are `None` until
+    /// the lease ends. A close during a lease removes the id, so the
+    /// return drops the publication.
+    lent: HashSet<u32>,
     /// The attached destinations of the rows in `subs`, and the detached
     /// ones that linger.
     dests: Vec<Destination>,
@@ -213,7 +219,7 @@ struct AeronThread {
     /// Indexed by `sub_id`. A closed subscription leaves a `None` slot,
     /// so the ids of the open ones stay valid.
     subs: Vec<Option<SubRow>>,
-    pending: VecDeque<PendingPublish>,
+    pending: ParkedQueue<PendingPublish>,
     /// The image log handlers of every subscription. They live as long
     /// as the process (see [`ImageHandlers`]).
     image_log: ImageHandlers,
@@ -244,8 +250,9 @@ impl AeronThread {
             cmd_rx,
             linger,
             pubs: Vec::new(),
+            lent: HashSet::new(),
             subs: Vec::new(),
-            pending: VecDeque::new(),
+            pending: ParkedQueue::new(),
             dests: Vec::new(),
             image_log: ImageHandlers::leak(),
             backoff: IdleBackoff::new(Duration::from_micros(100), Duration::from_millis(1), 10)
@@ -447,7 +454,7 @@ impl AeronThread {
         bytes: rkyv::util::AlignedVec,
         ack: Option<PublishAck>,
     ) {
-        self.pending.push_back(PendingPublish {
+        self.pending.push(PendingPublish {
             stream_id: self.pub_entry(pub_id).map(|e| e.stream_id),
             pub_id,
             bytes,
@@ -477,9 +484,84 @@ impl AeronThread {
         self.pubs.get(pub_id as usize).and_then(Option::as_ref)
     }
 
+    /// Answer a lend of `pub_id` on `ack`. A caller that gave up dropped
+    /// its receiver. The lease then comes back here, and the publication
+    /// returns to its row.
+    fn reply_lend(&mut self, pub_id: u32, ack: &CbSender<Result<(Lent, i32), LogError>>) {
+        let Err(unsent) = ack.send(self.cmd_lend_publication(pub_id)) else {
+            return;
+        };
+        if let Ok((lent, _)) = unsent.into_inner() {
+            self.return_publication(pub_id, lent);
+        }
+    }
+
+    /// Move the shared publication `pub_id` out of its row, with its
+    /// session id. See [`super::LentPublication`].
+    fn cmd_lend_publication(&mut self, pub_id: u32) -> Result<(Lent, i32), LogError> {
+        if self.pending.iter().any(|frame| frame.pub_id == pub_id) {
+            return Err(LogError::Aeron(format!(
+                "lend publication: pub_id {pub_id} has a parked frame"
+            )));
+        }
+        let slot = self
+            .pubs
+            .get_mut(pub_id as usize)
+            .ok_or_else(|| LogError::Aeron(format!("lend publication: unknown pub_id {pub_id}")))?;
+        let session_id = slot
+            .as_ref()
+            .ok_or_else(|| {
+                LogError::Aeron(format!(
+                    "lend publication: pub_id {pub_id} is closed or on loan"
+                ))
+            })?
+            .publication
+            .constants()?
+            .session_id();
+        let Some(PubEntry {
+            publication: TablePub::Shared(publication),
+            layout,
+            stream_id,
+        }) = slot.take_if(|entry| matches!(entry.publication, TablePub::Shared(_)))
+        else {
+            return Err(LogError::Aeron(format!(
+                "lend publication: pub_id {pub_id} is exclusive"
+            )));
+        };
+        self.lent.insert(pub_id);
+        Ok((
+            Lent {
+                publication,
+                layout,
+                stream_id,
+            },
+            session_id,
+        ))
+    }
+
+    /// Put a publication back in its row when its lease ends. A row that
+    /// closed during the lease drops the publication here, on this thread.
+    fn return_publication(&mut self, pub_id: u32, lent: Lent) {
+        if !self.lent.remove(&pub_id) {
+            return;
+        }
+        let Some(slot) = self.pubs.get_mut(pub_id as usize) else {
+            return;
+        };
+        *slot = Some(PubEntry {
+            publication: TablePub::Shared(lent.publication),
+            layout: lent.layout,
+            stream_id: lent.stream_id,
+        });
+    }
+
     /// Close a publication: drop the row, which closes the Aeron
-    /// publication. The slot stays `None`.
+    /// publication. The slot stays `None`. A publication on loan closes
+    /// when its lease ends.
     fn cmd_close_publication(&mut self, pub_id: u32) -> Result<(), LogError> {
+        if self.lent.remove(&pub_id) {
+            return Ok(());
+        }
         let slot = self.pubs.get_mut(pub_id as usize).ok_or_else(|| {
             LogError::Aeron(format!("close publication: unknown pub_id {pub_id}"))
         })?;
@@ -700,6 +782,12 @@ impl AeronThread {
             }
             RuntimeCmd::ClosePublication { pub_id, ack } => {
                 let _ = ack.send(self.cmd_close_publication(pub_id));
+            }
+            RuntimeCmd::LendPublication { pub_id, ack } => {
+                self.reply_lend(pub_id, &ack);
+            }
+            RuntimeCmd::ReturnPublication { pub_id, lent } => {
+                self.return_publication(pub_id, lent);
             }
             RuntimeCmd::Shutdown => {}
         }

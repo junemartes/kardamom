@@ -100,6 +100,20 @@ impl TermLayout {
             term_offset,
         })
     }
+
+    /// The outcome of an offer that returned `code`: a negative code is
+    /// Aeron's refusal, any other code is the new position. A position
+    /// that does not decode is still a delivered frame, so it is an error
+    /// of the ack and never a reason for a retry.
+    pub(crate) fn offered(self, code: i64) -> crate::parked::Offered {
+        if code < 0 {
+            return crate::parked::Offered::Refused(code);
+        }
+        crate::parked::Offered::Delivered(
+            self.decode(code)
+                .map_err(|e| LogError::Aeron(format!("aeron offer: {e}"))),
+        )
+    }
 }
 
 #[cfg(test)]

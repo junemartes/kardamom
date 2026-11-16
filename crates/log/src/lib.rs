@@ -36,6 +36,7 @@ pub mod error;
 mod fail_fast;
 mod ffi;
 mod offer_retry;
+pub mod parked;
 pub mod recorder;
 pub mod refetch;
 mod term_layout;

@@ -56,8 +56,10 @@
 //!   publication/subscription tables.
 //! - `bound`: the read of the control address the driver bound for a
 //!   dynamic MDC publication on port 0.
-//! - `pending`: the parked-publish retry scheduler (`drain_pending`) and
-//!   its unit tests.
+//! - `pending`: the parked publishes of the Aeron thread, as frames of
+//!   [`crate::parked::ParkedQueue`] (`drain_pending`).
+//! - `lent`: [`LentPublication`], a publication on loan to another
+//!   thread, which offers on it with no hop to the Aeron thread.
 //! - `meter`: the pipeline metrics of the Aeron thread: its loop time,
 //!   its two queues, and the refused offers.
 //! - `idle`: the idle wait of a hot-path poll loop ([`IdleCap`],
@@ -74,6 +76,7 @@ mod handles;
 mod idle;
 mod image_joins;
 mod image_log;
+mod lent;
 mod meter;
 mod pending;
 mod runtime;
@@ -97,6 +100,7 @@ pub use handles::tx_receipts::{
 };
 pub use handles::tx_verdicts::TxVerdictsPublisherHandle;
 pub use idle::{IdleBackoff, IdleCap};
+pub use lent::LentPublication;
 pub use pending::BEST_EFFORT_DROPPED_TOTAL;
 pub use runtime::{
     AeronRuntime, Destinations, ImageJoin, PollRecv, PositionedTxData, PubHandle, TxDataItem,

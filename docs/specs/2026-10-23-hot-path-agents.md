@@ -340,3 +340,28 @@ Each later stage gets its own section and its own PR, in the order that stage 0 
 | F12, `drain_pending` is not callable | Section 5.4 names the log-crate PR that lifts its pure core into a `pub` generic type. |
 | F13, Redis in the pump | Section 5.5: a spawned task reads Redis and sends the row back; the pump never awaits Redis. |
 | F14, the order in the handler | Section 5.2: hash, duplicate cache, then decode, as today. |
+
+## 12. Implementation notes
+
+The implementation follows this spec with these deviations.
+
+- **The publication of the agent (5.4).** The spec gives the agent its own clone of the concurrent
+  publication of each lane, with no `unsafe`. That is not sound with `rusteron` 0.1.163:
+  - The wrapper of a publication holds its C resource, and a link to the client, in `std::rc::Rc`
+    counts. The type is marked `Send + Sync`, but the counts are not atomic.
+  - The offer itself changes no count and is safe from any thread. A clone or a drop changes the
+    counts. A clone on one thread and a drop on another is a data race.
+  - A second registration of the same channel does not help either: a `tx_data` lane is a dynamic
+    MDC publication on control port 0, so a second add binds a new port and is a new session that
+    no sequencer discovered.
+
+  So the agent takes the one publication of each lane on loan (`PubHandle::lend`,
+  `LentPublication`). The Aeron thread moves the publication out of its table, and the drop of the
+  lease sends it back, so only the Aeron thread drops it. The session, the bound port and the
+  discovery record stay the same. While a lease lasts, a publish through a `PubHandle` of that
+  publication fails at once. A lease is refused while a frame of the publication is parked on the
+  Aeron thread. If the Aeron thread ended before the lease, the lease leaks the publication and
+  does not drop it.
+- **The pending rule (5.4).** The pure core of `drain_pending` is now `kardamom_log::parked`
+  (`ParkedQueue`, the trait `Parked`, `Offered`). The Aeron thread and the agent use the same
+  queue.
