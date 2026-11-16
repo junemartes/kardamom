@@ -8,6 +8,7 @@ use rkyv::util::AlignedVec;
 
 use super::{ACK_TIMEOUT, AeronRuntime, PublishAck, RuntimeCmd, request, request_within};
 use crate::aeron_live::ADD_PUB_TIMEOUT;
+use crate::aeron_live::LentPublication;
 use crate::aeron_live::add_wait::AddWait;
 use crate::codec;
 use crate::error::LogError;
@@ -146,6 +147,32 @@ impl PubHandle {
     #[must_use]
     pub fn session_id(&self) -> i32 {
         self.session_id
+    }
+
+    /// Take the publication on loan for the thread of the caller, which
+    /// then offers on it with no hop to the Aeron thread. Only a shared
+    /// publication can go on loan, and only with no frame of it parked on
+    /// the Aeron thread: a parked frame would fail while the publication is
+    /// out. See [`LentPublication`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publication is closed, on loan already,
+    /// exclusive, or has a parked frame, or if the command round trip to
+    /// the Aeron thread times out.
+    pub fn lend(&self) -> Result<LentPublication, LogError> {
+        let pub_id = self.pub_id;
+        let (lent, session_id) = request(
+            &self.cmd_tx,
+            |ack| RuntimeCmd::LendPublication { pub_id, ack },
+            "lend_publication",
+        )?;
+        Ok(LentPublication::new(
+            lent,
+            pub_id,
+            session_id,
+            self.cmd_tx.clone(),
+        ))
     }
 
     /// Close the publication on the Aeron thread. The driver releases the

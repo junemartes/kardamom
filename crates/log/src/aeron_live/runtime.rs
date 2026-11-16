@@ -17,6 +17,7 @@ use tracing::error;
 
 use super::add_wait::AddWait;
 use super::idle::IdleCap;
+use super::lent::Lent;
 use super::pending::PublishAck;
 use super::thread::run_aeron_thread;
 use super::{ACK_TIMEOUT, AeronClient, FrameSink, RawFrame};
@@ -161,6 +162,15 @@ pub(super) enum RuntimeCmd {
         pub_id: u32,
         ack: CbSender<Result<(), LogError>>,
     },
+    /// Lend the shared publication `pub_id` to the caller: the publication
+    /// leaves its row until the lease ends. See [`super::LentPublication`].
+    LendPublication {
+        pub_id: u32,
+        ack: CbSender<Result<(Lent, i32), LogError>>,
+    },
+    /// The lease of `pub_id` ended. The publication goes back to its row,
+    /// or drops here when its row closed during the lease.
+    ReturnPublication { pub_id: u32, lent: Lent },
     /// Stop the loop, drop everything.
     Shutdown,
 }
