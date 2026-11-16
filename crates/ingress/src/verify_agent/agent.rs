@@ -16,7 +16,7 @@ use kardamom_log::parked::{OFFER_DEADLINE, Offered, Parked, ParkedQueue};
 use kardamom_obs::pipeline::{LoopMeter, LoopState, Queue, Step};
 use kardamom_types::TxEnvelope;
 use metrics::Counter;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use super::doorbell::Doorbell;
 use super::lane::{Admitted, AgentLanes, Answer, LaneFrame, LaneOffer};
@@ -126,6 +126,9 @@ pub(crate) struct VerifyAgent<L> {
     parked: ParkedQueue<LaneFrame>,
     cfg: IngressConfig,
     live: Arc<LiveAccounts>,
+    /// The senders that missed the local layer, to the filler. `None` with
+    /// no Redis layer: nothing can fill the miss.
+    misses: Option<mpsc::Sender<Address>>,
     meters: AgentMeters,
 }
 
@@ -142,8 +145,16 @@ impl<L: LaneOffer> VerifyAgent<L> {
             parked: ParkedQueue::new(),
             cfg,
             live,
+            misses: None,
             meters: AgentMeters::new(),
         }
+    }
+
+    /// Send each sender that misses the local layer to `misses`, for the
+    /// filler. See [`super::fill`].
+    pub(crate) fn with_misses(mut self, misses: mpsc::Sender<Address>) -> Self {
+        self.misses = Some(misses);
+        self
     }
 
     pub(crate) fn input(&self) -> Arc<AgentInput> {
@@ -200,13 +211,18 @@ impl<L: LaneOffer> VerifyAgent<L> {
 
     /// A nonce below the known nonce of `sender` is `nonce too low`. The
     /// agent reads the local account layer only: a sender with no local
-    /// row admits, and the sequencer orders it or drops it.
+    /// row admits, and the sequencer orders it or drops it. A miss goes to
+    /// the filler with no wait, so the next submit of the sender can find
+    /// its row.
     fn check_nonce(&self, sender: Address, nonce: u64) -> Result<(), IngressError> {
         if !self.cfg.admission_checks {
             return Ok(());
         }
         let Some(view) = self.live.get(sender) else {
             cache_metrics::record_lookup("live", "miss");
+            if let Some(misses) = &self.misses {
+                let _ = misses.try_send(sender);
+            }
             return Ok(());
         };
         cache_metrics::record_lookup("live", "hit");

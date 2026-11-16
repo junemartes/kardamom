@@ -49,7 +49,7 @@ use crate::recent::RecentMap;
 use crate::sig_verify::BatchVerifier;
 use crate::submit_steps::SubmitSteps;
 use crate::tx_error_dedup::TxErrorDedup;
-use crate::verify_agent::{VerifyAgent, VerifyAgentHandle};
+use crate::verify_agent::{AccountFiller, MISS_CAPACITY, VerifyAgent, VerifyAgentHandle};
 
 /// One stream watcher's per-item step. Each watcher in `watchers` holds
 /// its own state and folds one item into it here.
@@ -484,12 +484,17 @@ where
             return Ok(self);
         }
         let lanes = self.publication.agent_lanes()?;
-        let agent = VerifyAgent::new(
+        let mut agent = VerifyAgent::new(
             lanes,
             self.cfg.clone(),
             self.live.clone(),
             VERIFY_RING_CAPACITY,
         );
+        if let Some(redis) = &self.redis {
+            let (misses, rx) = tokio::sync::mpsc::channel(MISS_CAPACITY);
+            AccountFiller::new(rx, redis.clone(), self.subscription.clone()).spawn();
+            agent = agent.with_misses(misses);
+        }
         let handle = VerifyAgentHandle::spawn(agent)
             .map_err(|e| IngressError::internal("spawn the verify agent", e))?;
         self.agent = Some(Arc::new(handle));
