@@ -56,6 +56,7 @@ pub(crate) mod sync_util;
 pub mod test_support;
 pub(crate) mod tx_error_dedup;
 pub mod tx_events;
+pub mod verify_agent;
 
 pub use channels::{IngressPublication, IngressSubscription, MockChannels, ReceiptItem};
 pub use config::IngressConfig;

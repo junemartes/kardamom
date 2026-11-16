@@ -40,7 +40,7 @@ use recorders::{
     DiscoveredReady, spawn_discovered_tx_data_recorder, spawn_tx_data_recorders, wait_for_recorders,
 };
 pub use settings::IngressSettings;
-use settings::{AckArg, TxEventsArg};
+use settings::{AckArg, TxEventsArg, VerifyAgentArg};
 
 /// What [`IngressService::spawn_recorders`] returns: the threads, the
 /// per-lane readiness receivers of the static recorders, and the one
@@ -98,6 +98,10 @@ impl IngressService {
         if args.verdicts && args.ack == AckArg::Validated {
             anyhow::bail!("--ack validated takes no --verdicts: it waits for no verdict");
         }
+        let verify_agent = args.verify_agent == VerifyAgentArg::On;
+        if verify_agent && args.ack != AckArg::Validated {
+            anyhow::bail!("--verify-agent on needs --ack validated");
+        }
         let mut cfg = IngressConfig {
             jsonrpc_bind: args.jsonrpc_bind,
             partition_count_m: NonZeroU32::from(args.shards),
@@ -125,6 +129,7 @@ impl IngressService {
             max_tx_bytes: args.max_tx_bytes,
             ack: self.ack_mode(),
             duplicate_cache_capacity: args.duplicate_cache_entries,
+            verify_agent,
             ..IngressConfig::default()
         };
         cfg.binary_tcp_bind = None;
@@ -459,7 +464,9 @@ impl IngressService {
         };
 
         let drain_timeout = cfg.pending_receipt_timeout;
-        let proxy = IngressProxy::new(cfg, opened.publication, opened.subscription);
+        let proxy = IngressProxy::new(cfg, opened.publication, opened.subscription)
+            .with_verify_agent()
+            .context("start the verify agent")?;
         Self::spawn_beacons(&mut opened.plane, &opened.rt, &proxy).await?;
         let drainer = proxy.clone();
         let handle = proxy.start().await.context("IngressProxy::start")?;
@@ -520,3 +527,7 @@ impl RunningIngress {
         self.plane.shutdown().await;
     }
 }
+
+#[cfg(test)]
+#[path = "service/build_config_tests.rs"]
+mod build_config_tests;

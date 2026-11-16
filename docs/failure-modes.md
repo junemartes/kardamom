@@ -647,7 +647,12 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
   - The ingress checks no balance. The sequencer drops an unfunded transaction after the answer.
   - The duplicate cache holds the newest `--duplicate-cache-entries` hashes (default 65,536), with the recovered sender. A copy of a held hash answers its hash with no recovery and no publication. Only a published hash enters the cache. A hash that the sequencer dropped stays in the cache until it is evicted, so a copy of it in that time does not publish again. A cache miss costs one more recovery and publication, and the window of the sealer drops the second copy.
   - An accepted transaction can still drop later. The client reads the result through the egress: the receipt read or the status feed.
-  - Proof: `crates/ingress/src/proxy/validated_tests.rs`.
+  - With `--verify-agent on`, one agent thread recovers, checks and publishes each submit (see `crates/ingress/src/verify_agent`). The answers are the same, with these differences:
+    - The nonce check reads the local account layer only. A sender with no local row admits with no Redis read, so after a restart a stale nonce can pass the ingress. The sequencer drops it with `nonce too low`, and the `dropped` status reports it.
+    - A full ring answers `txpool is full` at once and counts `ring-full`.
+    - The agent holds the `tx_data` publications on loan. A refused offer waits in its retry queue with the deadline of the Aeron thread (5 s), in the order of its lane.
+    - A stop answers each held submit first. A panic of the agent thread ends the process.
+  - Proof: `crates/ingress/src/proxy/validated_tests.rs` (each case on both paths), `crates/ingress/src/verify_agent/tests.rs`, `crates/ingress/tests/doorbell_loom.rs`.
 - The JSON-RPC surface is in [`json-rpc.md`](json-rpc.md).
 
 ## Sequencer (2 shards x 2 racing replicas)

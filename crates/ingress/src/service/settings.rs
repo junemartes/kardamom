@@ -211,6 +211,16 @@ pub struct IngressSettings {
         default_value_t = DEFAULT_DUPLICATE_CACHE_CAPACITY
     )]
     pub(crate) duplicate_cache_entries: NonZeroUsize,
+    /// With `--ack validated`, `on` recovers, checks and publishes each
+    /// transaction on the verify agent: one thread with no task hop
+    /// (`docs/specs/2026-10-23-hot-path-agents.md`). `off` keeps the tokio
+    /// path.
+    #[arg(
+        long = "verify-agent",
+        env = "KARDAMOM_INGRESS_VERIFY_AGENT",
+        default_value = "off"
+    )]
+    pub(crate) verify_agent: VerifyAgentArg,
 }
 
 impl IngressSettings {
@@ -230,6 +240,13 @@ impl IngressSettings {
 /// The values of `--tx-events`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum TxEventsArg {
+    On,
+    Off,
+}
+
+/// The values of `--verify-agent`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum VerifyAgentArg {
     On,
     Off,
 }

@@ -17,7 +17,9 @@ use std::time::Instant;
 
 use tokio::sync::{broadcast, mpsc, watch};
 
+use alloy_primitives::B256;
 use kardamom_cache::{LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
+use kardamom_log::parked::Offered;
 use kardamom_obs::events::BoardView;
 use kardamom_types::{
     AccountRow, BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, Receipt,
@@ -26,6 +28,7 @@ use kardamom_types::{
 
 use crate::error::IngressError;
 use crate::rollback_log::RollbackLog;
+use crate::verify_agent::{AgentLanes, LaneOffer};
 
 /// One item of the ordered `tx_receipts` bus. The bus keeps the order of
 /// the stream, so a rollback applies after every receipt before it and
@@ -64,6 +67,23 @@ pub trait IngressPublication: Send + Sync + 'static {
         envelope: TxEnvelope,
         arrived: Instant,
     ) -> impl Future<Output = Result<(), IngressError>> + Send;
+
+    /// A `tx_data` lane as the verify agent offers on it.
+    type Lane: LaneOffer;
+
+    /// The lanes of the verify agent, one for each `tx_data` lane, in lane
+    /// order. Each publish of [`Self::publish_tx_data`] fails while the
+    /// agent holds its lanes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a lane cannot go to the agent.
+    fn agent_lanes(&self) -> Result<AgentLanes<Self::Lane>, IngressError>;
+
+    /// The verify agent published `tx_hash`: the publication notes it as
+    /// [`Self::publish_tx_data`] does (the `accepted` record of
+    /// `tx_events`). Nothing by default.
+    fn note_published(&self, _tx_hash: B256) {}
 }
 
 /// Subscriber surface. The proxy subscribes to the `tx_receipts` `Receipt`
@@ -260,6 +280,36 @@ impl IngressPublication for MockChannels {
                         .map_err(|e| IngressError::PartitionUnavailable(e.to_string()))
                 }),
         )
+    }
+
+    type Lane = MockLane;
+
+    /// The in-memory lanes: each takes a frame at once, while its receiver
+    /// lives.
+    fn agent_lanes(&self) -> Result<AgentLanes<MockLane>, IngressError> {
+        Ok(AgentLanes {
+            lanes: self.tx_data_tx.iter().cloned().map(MockLane).collect(),
+            stamps: None,
+            idle_cap: std::time::Duration::from_micros(50),
+        })
+    }
+}
+
+/// One in-memory `tx_data` lane of the verify agent. It decodes each
+/// frame back into its envelope and sends it to the receiver of the lane.
+pub struct MockLane(mpsc::UnboundedSender<TxEnvelope>);
+
+impl LaneOffer for MockLane {
+    fn offer(&self, bytes: &[u8]) -> Offered {
+        let Ok(envelope) = kardamom_log::codec::materialize::<TxEnvelope>(bytes) else {
+            return Offered::Delivered(Err(kardamom_log::LogError::Aeron(
+                "mock lane: the frame does not decode".into(),
+            )));
+        };
+        match self.0.send(envelope) {
+            Ok(()) => Offered::Delivered(Ok(BPosition::default())),
+            Err(_) => Offered::Refused(-1 /* NOT_CONNECTED */),
+        }
     }
 }
 

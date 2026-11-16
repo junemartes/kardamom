@@ -11,11 +11,16 @@
 //! so the rule is testable with no media driver.
 
 use std::collections::{HashSet, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kardamom_types::BPosition;
 
 use crate::error::LogError;
+
+/// The deadline of a parked publish of the Aeron thread. A thread that
+/// offers on a publication of its own gives its frames the same bound, so
+/// a caller waits as long on either path.
+pub const OFFER_DEADLINE: Duration = crate::offer_retry::OFFER_TIMEOUT;
 
 /// A frame in a [`ParkedQueue`].
 pub trait Parked {

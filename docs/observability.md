@@ -762,6 +762,7 @@ the replay retention of the sealer, and the record-lag guard. See [l1-data-path.
 | `kardamom_ingress_tx_rejected_total{reason="too-large"}` | Submits above the size cap, `--max-tx-bytes`. |
 | `kardamom_ingress_tx_rejected_total{reason="nonce-too-low"}` | With `--ack validated`, submits with a nonce below the account view of the sender. |
 | `kardamom_ingress_tx_rejected_total{reason="txpool-full"}` | With `--ack validated`, submits whose `tx_data` offer failed. |
+| `kardamom_ingress_tx_rejected_total{reason="ring-full"}` | With `--verify-agent on`, submits that found the ring of the verify agent full. They answer `txpool is full` at once. |
 | `kardamom_ingress_seal_latency_seconds` | A histogram: the time from the `tx_data` publish of a transaction to the egress frame that gives it a canonical index. Only the ingress that published the transaction records it. A seal later than 180 s gives no sample. The buckets are the shared service buckets of 100 µs to 5 s. Above 10 ms their bounds are 25, 50, 100, 250 and 500 ms, then 1, 2.5 and 5 s. |
 | `kardamom_ingress_seal_stamps_expired_total` | The publish stamps that no seal matched within 180 s. Most are of refused transactions. A non-zero rate under load means that the seal latency histogram undercounts the tail. |
 | `kardamom_ingress_seal_stamps_dropped_total` | The publish stamps that the submit path dropped because the channel to the seal clock (65,536 stamps) was full. Each one is a seal with no latency sample. |
@@ -782,18 +783,22 @@ The ingress records these names of the pipeline metrics (see "Pipeline metrics")
 | --- | --- | --- |
 | `ingress.submit` | step | The whole submit on the server, from the call to the answer, on each return path. With the receipt wait (no ack at admission), it includes the wait for the receipt. |
 | `ingress.validate` | step | The shared head of the submit: the shed, drain, pause and rate checks, the decode, and the sender recovery. It includes `ingress.recover`. |
-| `ingress.recover` | step | The sender recovery of one submit: the wait for a slot in the verifier intake, the batch window, and the recovery. |
+| `ingress.recover` | step | The sender recovery of one submit: the wait for a slot in the verifier intake, the batch window, and the recovery. With `--verify-agent on`, the recovery alone, on the agent thread. |
 | `ingress.publish_round_trip` | step | The `tx_data` publish: the hop to the blocking pool and the round trip to the Aeron thread up to its ack. |
 | `ingress.recover_batch` | step | The recovery of one verifier batch on the blocking pool, up to the end of its last worker. |
 | `ingress.recover_batch` | batch | The requests in each verifier batch. |
 | `ingress.recover_intake` | queue | The requests that queued in the verifier intake while the batch before ran, read when the flush task comes back for the next batch. While the verifier is idle, the gauge holds the last backlog that it read (sample and hold), not a live depth. The intake holds four times the batch depth; a full intake makes a submit wait. |
 | `ingress.recover_wait` | step | The wait of each request from its submit to the take of its batch: the flush window plus the time behind the batch before it. |
+| `ingress.verify_agent` | loop | With `--verify-agent on`, the verify agent thread. A pass that took a submit or moved a parked frame is busy. The park of an idle pass counts as idle. |
+| `ingress.verify_wait` | step | With `--verify-agent on`, the wait of each submit in the ring of the agent, from the push of the handler to the take of the agent. |
+| `ingress.verify_ring` | queue | With `--verify-agent on`, the submits that wait in the ring of the agent, set once for each pass. |
 | `ingress.ack_waiters` | queue | The submissions that wait for the verdict of the sequencer (ack at admission). The shed check counts them with `kardamom_ingress_queue_depth`. |
 | `ingress.watermark` | loop | The cluster egress thread. Idle while it waits for an egress event (the receive and the decode), busy while it handles the event. |
 | `ingress.receipt_pump` | loop | The `tx_receipts` pump task. Idle while it waits for a frame, busy while it applies the rows and fans out the receipts. |
 | `ingress.receipt_batch` | batch | The receipts in each `tx_receipts` batch frame. A boundary-only frame adds no sample. |
 
 - A high `ingress.recover` with a low `ingress.recover_batch` step means that submits wait for the intake or the batch window, not for the recovery. `ingress.recover_wait` shows that wait directly.
+- With `--verify-agent on`, the agent offers on its lanes itself, so `ingress.publish_round_trip` has no sample, and the verifier steps (`ingress.recover_batch`, `ingress.recover_intake`, `ingress.recover_wait`) have none either.
 - A busy share of `ingress.watermark` near 1 means that the egress frames queue in the cluster client before the thread reads them.
 
 ### Aeron thread

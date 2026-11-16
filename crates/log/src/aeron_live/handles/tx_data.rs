@@ -26,6 +26,17 @@ declare_channel_handles! {
         pub async fn publish_async(&self, env: &TxEnvelope) -> Result<BPosition, LogError> {
             self.inner.publish_async(env).await
         }
+
+        /// Take the publication of this lane on loan, for a thread that
+        /// offers on it with no hop to the Aeron thread (the verify agent
+        /// of the ingress). See [`crate::aeron_live::LentPublication`].
+        ///
+        /// # Errors
+        ///
+        /// Returns an error as `PubHandle::lend` does.
+        pub fn lend(&self) -> Result<crate::aeron_live::LentPublication, LogError> {
+            self.inner.lend()
+        }
     }
     /// Per-shard `TxData` subscriber. Yields `(TxDataLoc, TxEnvelope)`: the
     /// envelope paired with its publisher `session_id` and `BPosition`, so
