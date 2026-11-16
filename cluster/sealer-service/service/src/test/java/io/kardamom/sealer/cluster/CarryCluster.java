@@ -96,7 +96,12 @@ final class CarryCluster implements AutoCloseable {
         offerFrame(client, frame);
     }
 
-    /** Offer {@code count} full references, each in its own block, and wait for their relay. */
+    /**
+     * Offer {@code count} full references, each in its own block, and wait for their relay. The wait
+     * counts the relayed transactions, not every relayed frame: an epoch of an earlier switch can reach
+     * the client after the start of this call, and a count of every frame would then end the wait
+     * before the last reference.
+     */
     List<FullRef> blocks(final int count) {
         final int relayed = egress.relayedPayloads.size();
         final List<FullRef> refs = IntStream.range(0, count).mapToObj(i -> {
@@ -104,8 +109,15 @@ final class CarryCluster implements AutoCloseable {
             epoch();
             return ref;
         }).toList();
-        awaitRelayed(relayed + 2 * count);
+        awaitCondition(client, () -> relayedTransactions(relayed).size() >= count);
         return refs;
+    }
+
+    /** The relayed transaction payloads after the first {@code from} relayed frames, in order. */
+    List<byte[]> relayedTransactions(final int from) {
+        return egress.relayedPayloads.subList(from, egress.relayedPayloads.size()).stream()
+            .filter(p -> p[CanonicalSealerState.CANONICAL_ID_LEN] == SealerWire.RT_TX)
+            .toList();
     }
 
     /** Wait until the client got {@code count} relayed frames. */
@@ -183,9 +195,7 @@ final class CarryCluster implements AutoCloseable {
 
     /** The relayed payloads after {@code from} are the canonical entries of {@code refs} and the epochs, in order. */
     void assertRelayed(final int from, final List<FullRef> refs) {
-        final List<byte[]> carried = egress.relayedPayloads.subList(from, egress.relayedPayloads.size()).stream()
-            .filter(p -> p[CanonicalSealerState.CANONICAL_ID_LEN] == SealerWire.RT_TX)
-            .toList();
+        final List<byte[]> carried = relayedTransactions(from);
         assertEquals(refs.size(), carried.size(), () -> "each full reference once: " + egress.relayedIndexes);
         IntStream.range(0, refs.size()).forEach(i -> assertArrayEquals(refs.get(i).canonicalPayload(), carried.get(i)));
         final List<Long> indexes = egress.relayedIndexes.subList(from, egress.relayedIndexes.size());
