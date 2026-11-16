@@ -35,8 +35,13 @@ import org.junit.jupiter.api.io.TempDir;
 @ExtendWith(InterruptingTestCallback.class)
 final class ComponentCloseTest {
 
+    /**
+     * One member on loopback ports below the ephemeral range of Linux, so
+     * the kernel never gives one of them to another socket (see
+     * {@code PeerSeedTest}).
+     */
     private static final String MEMBERS =
-            "0,localhost:47200,localhost:47201,localhost:47202,localhost:47203,localhost:47204";
+            "0,localhost:23200,localhost:23201,localhost:23202,localhost:23203,localhost:23204";
     private static final int MEMBER_ID = 0;
     /** A local archive control stream that no archive serves. */
     private static final int NO_ARCHIVE_STREAM_ID = 4_242;
