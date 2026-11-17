@@ -10,6 +10,7 @@
 //! - track every transaction by hash to a receipt, independent of the
 //!   submit response.
 
+use std::borrow::Borrow;
 use std::num::NonZeroU64;
 
 use alloy_consensus::TxLegacy;
@@ -45,6 +46,35 @@ pub struct PlannedTx {
     pub sender: usize,
     /// This transaction's nonce.
     pub nonce: u64,
+    /// The kind of this transaction. The report shows the latency and
+    /// the failed receipts of each kind.
+    pub class: TxClass,
+}
+
+/// The kind of a planned transaction.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum TxClass {
+    /// A value transfer to an account, with or without calldata.
+    Transfer,
+    /// A token swap through the Uniswap v2 router.
+    Swap,
+    /// Any other contract call or contract creation.
+    Call,
+}
+
+impl TxClass {
+    /// The lowercase name this class serializes as.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Transfer => "transfer",
+            Self::Swap => "swap",
+            Self::Call => "call",
+        }
+    }
 }
 
 impl PlannedTx {
@@ -74,25 +104,52 @@ const TRANSFER_GAS: u64 = 21_000;
 /// of 16 gas, so it sets the intrinsic gas of a calldata-only transfer.
 const CALLDATA_FLOOR_GAS_PER_BYTE: u64 = 40;
 
-/// The fields of each transfer a run signs: the sink, the value, the
-/// calldata, and a gas limit that covers the calldata.
+/// The fields of each transaction a run signs: the target, the value,
+/// the calldata, a gas limit that covers the calldata, and the class.
 #[derive(Debug, Clone)]
-pub struct TransferShape {
-    to: Address,
+pub struct TxShape {
+    to: TxKind,
     value: U256,
     input: Bytes,
     gas_limit: u64,
+    class: TxClass,
 }
 
-impl TransferShape {
+impl TxShape {
     /// A plain value transfer with no calldata.
     #[must_use]
     pub fn plain(to: Address, value: U256) -> Self {
         Self {
-            to,
+            to: TxKind::Call(to),
             value,
             input: Bytes::new(),
             gas_limit: TRANSFER_GAS,
+            class: TxClass::Transfer,
+        }
+    }
+
+    /// A contract call with no value.
+    #[must_use]
+    pub fn call(to: Address, input: Bytes, gas_limit: u64, class: TxClass) -> Self {
+        Self {
+            to: TxKind::Call(to),
+            value: U256::ZERO,
+            input,
+            gas_limit,
+            class,
+        }
+    }
+
+    /// A contract creation with no value. `init` is the creation code
+    /// and the encoded constructor arguments.
+    #[must_use]
+    pub fn create(init: Bytes, gas_limit: u64) -> Self {
+        Self {
+            to: TxKind::Create,
+            value: U256::ZERO,
+            input: init,
+            gas_limit,
+            class: TxClass::Call,
         }
     }
 
@@ -113,21 +170,22 @@ impl TransferShape {
         // The byte value cycles through 1..=255, so no byte is zero.
         let input = (1..=255u8).cycle().take(bytes).collect();
         Ok(Self {
-            to,
+            to: TxKind::Call(to),
             value,
             input,
             gas_limit,
+            class: TxClass::Transfer,
         })
     }
 
-    /// Sign this transfer for one sender at one nonce.
+    /// Sign this transaction for one sender at one nonce.
     fn sign(&self, slot: Slot<'_>, params: TxPlanParams) -> anyhow::Result<PlannedTx> {
         let tx = TxLegacy {
             chain_id: Some(params.chain_id),
             nonce: slot.nonce,
             gas_price: params.gas_price,
             gas_limit: self.gas_limit,
-            to: TxKind::Call(self.to),
+            to: self.to,
             value: self.value,
             input: self.input.clone(),
         };
@@ -140,6 +198,7 @@ impl TransferShape {
             hash: signed.hash,
             sender: slot.sender,
             nonce: slot.nonce,
+            class: self.class,
         })
     }
 }
@@ -149,7 +208,7 @@ impl TransferShape {
 /// end of its places, so a large weight costs no memory.
 #[derive(Debug, Clone)]
 pub struct TransferMix {
-    shapes: Vec<TransferShape>,
+    shapes: Vec<TxShape>,
     /// The end of the places of each shape: the sum of the weights up to
     /// and including it. It increases strictly.
     ends: Vec<NonZeroU64>,
@@ -160,7 +219,7 @@ pub struct TransferMix {
 impl TransferMix {
     /// A mix of one shape.
     #[must_use]
-    pub fn single(shape: TransferShape) -> Self {
+    pub fn single(shape: TxShape) -> Self {
         Self {
             shapes: vec![shape],
             ends: vec![NonZeroU64::MIN],
@@ -178,7 +237,7 @@ impl TransferMix {
     pub fn calldata(to: Address, value: U256, mix: &CalldataMix) -> anyhow::Result<Self> {
         let shapes = mix
             .parts()
-            .map(|part| TransferShape::with_calldata(to, value, part.bytes))
+            .map(|part| TxShape::with_calldata(to, value, part.bytes))
             .collect::<anyhow::Result<Vec<_>>>()?;
         // The fold starts at the weight of the first part, so every end,
         // and the total, is non-zero.
@@ -219,28 +278,19 @@ impl TransferMix {
             .iter()
             .zip(starts)
             .enumerate()
-            .map(|(sender, (signer, &start))| {
-                (0..per_sender)
-                    .map(|i| {
-                        let nonce = start
-                            .checked_add(i as u64)
-                            .ok_or_else(|| anyhow::anyhow!("nonce {start} + {i} overflows u64"))?;
-                        self.shape(sender, i).sign(
-                            Slot {
-                                signer,
-                                sender,
-                                nonce,
-                            },
-                            params,
-                        )
-                    })
-                    .collect::<anyhow::Result<Vec<PlannedTx>>>()
+            .map(|(sender, (signer, &first))| {
+                SenderNonces {
+                    signer,
+                    sender,
+                    first,
+                }
+                .sign_all((0..per_sender).map(|i| self.shape(sender, i)), params)
             })
             .collect()
     }
 
     /// The shape of transfer `i` of `sender`.
-    fn shape(&self, sender: usize, i: usize) -> &TransferShape {
+    fn shape(&self, sender: usize, i: usize) -> &TxShape {
         // The place wraps on purpose: the cycle repeats.
         let place = (sender as u64).wrapping_add(i as u64) % self.total;
         // `place < total`, the last end, so the index is in range.
@@ -255,6 +305,47 @@ struct Slot<'a> {
     signer: &'a DerivedSigner,
     sender: usize,
     nonce: u64,
+}
+
+/// One sender, and the nonce of the first transaction it signs.
+#[derive(Clone, Copy)]
+pub(crate) struct SenderNonces<'a> {
+    pub(crate) signer: &'a DerivedSigner,
+    /// The index into the signer set.
+    pub(crate) sender: usize,
+    pub(crate) first: u64,
+}
+
+impl SenderNonces<'_> {
+    /// Sign `shapes` at the nonces `first`, `first + 1`, and so on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a nonce overflows or signing fails.
+    pub(crate) fn sign_all<S: Borrow<TxShape>>(
+        &self,
+        shapes: impl IntoIterator<Item = S>,
+        params: TxPlanParams,
+    ) -> anyhow::Result<Vec<PlannedTx>> {
+        shapes
+            .into_iter()
+            .enumerate()
+            .map(|(i, shape)| {
+                let nonce = self
+                    .first
+                    .checked_add(i as u64)
+                    .ok_or_else(|| anyhow::anyhow!("nonce {} + {i} overflows u64", self.first))?;
+                shape.borrow().sign(
+                    Slot {
+                        signer: self.signer,
+                        sender: self.sender,
+                        nonce,
+                    },
+                    params,
+                )
+            })
+            .collect()
+    }
 }
 
 /// The error for a failed presign at `(sender, nonce)`.
@@ -277,7 +368,7 @@ mod tests {
             nonce_start: 7,
             gas_price: 1_000_000_000,
         };
-        let q = TransferMix::single(TransferShape::plain(to, U256::from(1u64)))
+        let q = TransferMix::single(TxShape::plain(to, U256::from(1u64)))
             .pregenerate(&signers, 4, params, &[7; 3])
             .unwrap();
         assert_eq!(q.len(), 3, "one queue per signer");
@@ -303,7 +394,7 @@ mod tests {
             nonce_start: 0,
             gas_price: 1_000_000_000,
         };
-        let q = TransferMix::single(TransferShape::plain(to, U256::from(1u64)))
+        let q = TransferMix::single(TxShape::plain(to, U256::from(1u64)))
             .pregenerate(&signers, 3, params, &[0; 2])
             .unwrap();
         let mut seen = std::collections::HashSet::new();
@@ -321,7 +412,7 @@ mod tests {
             nonce_start: 0,
             gas_price: 1,
         };
-        let q = TransferMix::single(TransferShape::plain(Address::ZERO, U256::ZERO))
+        let q = TransferMix::single(TxShape::plain(Address::ZERO, U256::ZERO))
             .pregenerate(&signers, 2, params, &[3, 9])
             .unwrap();
         let nonces: Vec<Vec<u64>> = q
@@ -343,7 +434,7 @@ mod tests {
             gas_price: 1_000_000_000,
         };
         let mix = TransferMix::single(
-            TransferShape::with_calldata(Address::ZERO, U256::from(1u64), 2_000).unwrap(),
+            TxShape::with_calldata(Address::ZERO, U256::from(1u64), 2_000).unwrap(),
         );
         let q = mix.pregenerate(&signers, 1, params, &[0]).unwrap();
         let tx = alloy_consensus::TxEnvelope::decode_2718(&mut q[0][0].raw.as_ref()).unwrap();
@@ -399,7 +490,7 @@ mod tests {
 
     #[test]
     fn calldata_gas_overflow_is_an_error() {
-        assert!(TransferShape::with_calldata(Address::ZERO, U256::ZERO, usize::MAX).is_err());
+        assert!(TxShape::with_calldata(Address::ZERO, U256::ZERO, usize::MAX).is_err());
     }
 
     #[test]

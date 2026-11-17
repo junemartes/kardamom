@@ -1,15 +1,22 @@
 //! This module has the harness configuration, built by the CLI, and the
 //! serialized report types.
 
+use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use alloy_primitives::{Address, U256, address};
+use jsonrpsee::core::client::ClientT;
+use jsonrpsee::http_client::HttpClient;
 use serde::Serialize;
 
 use crate::load::accounting::Verdict;
 use crate::load::exporter::MetricsTargets;
+use crate::load::hex_u64;
+use crate::load::plan::TxClass;
+use crate::load::uniswap::UniswapMix;
+use crate::signers::SignerSet;
 
 /// [`LoadConfig::default`]'s `target_tps`.
 const DEFAULT_TARGET_TPS: NonZeroU32 = NonZeroU32::new(200).unwrap();
@@ -144,6 +151,9 @@ pub struct LoadConfig {
     /// The calldata sizes of the calldata workload, with their weights.
     /// The other workloads do not read it.
     pub calldata: CalldataMix,
+    /// The swap share and the pair count of the uniswap workload. The
+    /// other workloads do not read it.
+    pub uniswap: UniswapMix,
     /// The legacy gas price, in wei.
     pub gas_price: u128,
     /// The limit on outstanding submits. This bounds open-loop back
@@ -257,6 +267,7 @@ impl Default for LoadConfig {
             value: U256::from(1u64),
             workload: Workload::default(),
             calldata: CalldataMix::default(),
+            uniswap: UniswapMix::default(),
             gas_price: 1_000_000_000,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             pace_tick: DEFAULT_PACE_TICK,
@@ -301,6 +312,9 @@ pub enum Workload {
     /// of [`LoadConfig::calldata`]. The size is the only value that
     /// differs from a plain transfer.
     Calldata,
+    /// Uniswap v2 router swaps mixed with plain transfers, in the shares
+    /// of [`LoadConfig::uniswap`]. See `load::uniswap`.
+    Uniswap,
 }
 
 impl Workload {
@@ -311,6 +325,7 @@ impl Workload {
             Self::Transfers => "transfers",
             Self::Defi => "defi",
             Self::Calldata => "calldata",
+            Self::Uniswap => "uniswap",
         }
     }
 }
@@ -328,7 +343,8 @@ impl std::str::FromStr for Workload {
             "transfers" => Ok(Self::Transfers),
             "defi" => Ok(Self::Defi),
             "calldata" => Ok(Self::Calldata),
-            other => anyhow::bail!("unknown workload {other:?} (transfers|defi|calldata)"),
+            "uniswap" => Ok(Self::Uniswap),
+            other => anyhow::bail!("unknown workload {other:?} (transfers|defi|calldata|uniswap)"),
         }
     }
 }
@@ -352,6 +368,37 @@ impl std::str::FromStr for NonceStart {
         s.parse()
             .map(Self::Fixed)
             .map_err(|e| anyhow::anyhow!("nonce start {s:?} is not `chain` or a u64: {e}"))
+    }
+}
+
+impl NonceStart {
+    /// The first nonce of each signer, in signer order.
+    pub(crate) async fn per_sender(
+        self,
+        client: &HttpClient,
+        signers: &SignerSet,
+    ) -> anyhow::Result<Vec<u64>> {
+        match self {
+            Self::Fixed(nonce) => Ok(vec![nonce; signers.len()]),
+            Self::Chain => {
+                futures::future::try_join_all(
+                    signers.iter().map(|s| Self::chain_nonce(client, s.address)),
+                )
+                .await
+            }
+        }
+    }
+
+    /// The nonce of `address` at the head of the chain.
+    async fn chain_nonce(client: &HttpClient, address: Address) -> anyhow::Result<u64> {
+        let nonce: String = client
+            .request(
+                "eth_getTransactionCount",
+                jsonrpsee::rpc_params![address, "latest"],
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("eth_getTransactionCount {address}: {e}"))?;
+        hex_u64(&nonce).ok_or_else(|| anyhow::anyhow!("nonce {nonce:?} of {address} is not hex"))
     }
 }
 
@@ -461,6 +508,23 @@ pub struct RampStep {
     pub lat_p99_us: u64,
 }
 
+/// The receipts and the receipt latency of one transaction class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct ClassReport {
+    /// The transactions of this class confirmed by a receipt.
+    pub receipted: u64,
+    /// The receipts of this class with a status other than `0x1`.
+    pub failed: u64,
+    /// The receipt latency p50, in microseconds.
+    pub lat_p50_us: u64,
+    /// The receipt latency p95, in microseconds.
+    pub lat_p95_us: u64,
+    /// The receipt latency p99, in microseconds.
+    pub lat_p99_us: u64,
+    /// The receipt latency maximum, in microseconds.
+    pub lat_max_us: u64,
+}
+
 /// The serialized harness report.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct LoadReport {
@@ -489,9 +553,14 @@ pub struct LoadReport {
     /// The total gas used by receipted transactions over the soak window.
     #[serde(default)]
     pub total_gas: u64,
-    /// The workload the run drove: `transfers` or `defi`.
+    /// The workload the run drove, for example `transfers` or `uniswap`.
     #[serde(default)]
     pub workload: String,
+    /// The receipts, failed receipts, and receipt latency of each
+    /// transaction class that got a receipt. Absent from a report of an
+    /// older harness.
+    #[serde(default)]
+    pub classes: BTreeMap<TxClass, ClassReport>,
     /// The reads of the verdict's metric snapshots whose direct read
     /// failed and that fell back to `docker exec`. Absent from a report
     /// of an older harness.

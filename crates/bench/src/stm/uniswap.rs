@@ -16,6 +16,7 @@ use std::num::NonZeroUsize;
 use alloy_consensus::TxLegacy;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, keccak256};
 
+use crate::load::uniswap::{Reserves, UniswapPair};
 use crate::signers::DerivedSigner;
 use kardamom_types::TxEnvelope;
 
@@ -65,18 +66,6 @@ struct PairState {
     token1: Address,
     reserve0: U256,
     reserve1: U256,
-}
-
-/// The constant-product swap formula, with a 0.3% fee. `U256`'s `*`/`+`
-/// operators wrap on overflow (never panic; `ruint` backs them with
-/// `wrapping_mul`/`wrapping_add`), so this is a proven-bound plain
-/// computation, not a checked one: every synthetic reserve here starts
-/// at `10u128.pow(21)`-scale and grows by `10u128.pow(18)`-scale
-/// increments over a CLI-bounded (`--blocks`) number of simulated
-/// swaps, staying many orders of magnitude under `U256::MAX` (`~2^256`).
-fn get_amount_out(amount_in: U256, reserve_in: U256, reserve_out: U256) -> U256 {
-    let with_fee = amount_in * U256::from(997u64);
-    (with_fee * reserve_out) / (reserve_in * U256::from(1000u64) + with_fee)
 }
 
 struct Signer<'a> {
@@ -257,18 +246,13 @@ fn create_one_pair(
     tokens: &[Address],
     p: usize,
 ) -> CreatedPair {
-    let (a, b) = (tokens[p * 2], tokens[p * 2 + 1]);
-    let (t0, t1) = if a < b { (a, b) } else { (b, a) };
-    let mut salt_buf = [0u8; 40];
-    salt_buf[..20].copy_from_slice(t0.as_slice());
-    salt_buf[20..].copy_from_slice(t1.as_slice());
-    let salt = keccak256(salt_buf);
-    let mut c2 = Vec::with_capacity(85);
-    c2.push(0xff);
-    c2.extend_from_slice(ctx.factory.as_slice());
-    c2.extend_from_slice(salt.as_slice());
-    c2.extend_from_slice(ctx.pair_init_hash.as_slice());
-    let pair_addr = Address::from_slice(&keccak256(c2)[12..]);
+    let pair = UniswapPair::new(
+        ctx.factory,
+        ctx.pair_init_hash,
+        tokens[p * 2],
+        tokens[p * 2 + 1],
+    );
+    let (t0, t1) = (pair.token0, pair.token1);
     let tx = dep.sign(
         ctx.chain_id,
         TxKind::Call(ctx.factory),
@@ -279,7 +263,7 @@ fn create_one_pair(
         ),
     );
     let state = PairState {
-        addr: pair_addr,
+        addr: pair.address,
         token0: t0,
         token1: t1,
         reserve0: U256::ZERO,
@@ -480,13 +464,24 @@ impl FlowGen<'_, '_> {
         let zero_for_one = r & 1 == 0;
         let amount_in = U256::from(10u128.pow(18) + u128::from(r % 1000) * 10u128.pow(15));
         let ps = &mut self.pair_states[pi];
+        // The synthetic reserves start at the 1e24 scale and grow by the
+        // 1e18 scale over a `--blocks`-bounded number of swaps, so they
+        // stay far below the `uint112` bound of `Reserves::amount_out`.
         let (tin, out0, out1) = if zero_for_one {
-            let out = get_amount_out(amount_in, ps.reserve0, ps.reserve1);
+            let out = Reserves {
+                input: ps.reserve0,
+                output: ps.reserve1,
+            }
+            .amount_out(amount_in);
             ps.reserve0 += amount_in;
             ps.reserve1 -= out;
             (ps.token0, U256::ZERO, out)
         } else {
-            let out = get_amount_out(amount_in, ps.reserve1, ps.reserve0);
+            let out = Reserves {
+                input: ps.reserve1,
+                output: ps.reserve0,
+            }
+            .amount_out(amount_in);
             ps.reserve1 += amount_in;
             ps.reserve0 -= out;
             (ps.token1, out, U256::ZERO)

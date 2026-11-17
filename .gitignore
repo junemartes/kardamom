@@ -7,6 +7,9 @@ contracts/cache/
 contracts/out/
 contracts/lib/
 contracts/foundry.lock
+# The router build output; `just bench-embed` embeds what the bench needs.
+uniswap-v2-contracts/periphery/cache/
+uniswap-v2-contracts/periphery/out/
 
 # benchmark and profiling artifacts
 flame.folded

@@ -21,7 +21,11 @@ library UniswapV2Library {
                 hex'ff',
                 factory,
                 keccak256(abi.encodePacked(token0, token1)),
-                hex'96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f' // init code hash
+                // The init code hash is keccak256 of the UniswapV2Pair creation code
+                // in uniswap-v2-contracts/core/out. The vendored core build has other
+                // compiler metadata than the mainnet build, so the mainnet hash
+                // 96e8ac42... gives wrong pair addresses here.
+                hex'766906c1650813e1a510297f462a383f1f49948bfd2919659e8436b2a0aaf9af' // init code hash
             ))));
     }
 

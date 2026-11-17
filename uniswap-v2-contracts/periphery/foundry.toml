@@ -1,8 +1,15 @@
 # VENDORED Uniswap v2-periphery Router02 (+deps), canonical solc 0.6.6.
+# The remappings point the npm import paths at the vendored v2-core sources
+# and at the vendored TransferHelper of @uniswap/lib 1.1.1.
 [profile.default]
 src = "src"
 out = "out"
 libs = []
+remappings = [
+    "@uniswap/v2-core/contracts/=../core/src/",
+    "@uniswap/lib/=../lib/",
+]
+allow_paths = ["../core", "../lib"]
 solc = "0.6.6"
 optimizer = true
 optimizer_runs = 999999

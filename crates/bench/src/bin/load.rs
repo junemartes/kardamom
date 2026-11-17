@@ -7,7 +7,7 @@
 //! with a non-zero code on a failing verdict. See
 //! `kardamom_bench::load` for the algorithm.
 
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -17,7 +17,7 @@ use clap::Parser;
 
 use kardamom_bench::load::{
     self, ANVIL_MNEMONIC, CalldataMix, Completeness, LoadConfig, MetricsTargets, NonceStart,
-    SenderRange,
+    SenderRange, SwapShare, UniswapMix,
 };
 
 /// Default `--target-tps`.
@@ -117,8 +117,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     feed_confirm: bool,
     /// The workload family: plain transfers, the `DeFi` mix of a CLOB, a
-    /// swap pool, and a vault, with gas-centric reporting, or calldata:
-    /// transfers with `--calldata-bytes` of calldata each.
+    /// swap pool, and a vault, with gas-centric reporting, calldata:
+    /// transfers with `--calldata-bytes` of calldata each, or uniswap:
+    /// Uniswap v2 router swaps mixed with plain transfers.
     #[arg(long, default_value = "transfers", value_parser = clap::builder::ValueParser::new(|s: &str| s.parse::<kardamom_bench::load::Workload>().map_err(|e| e.to_string())))]
     workload: kardamom_bench::load::Workload,
 
@@ -126,6 +127,16 @@ struct Args {
     /// `N`, or a weighted mix such as `0:16,1938:3,8082:1`.
     #[arg(long = "calldata-bytes", default_value = "0", value_parser = clap::builder::ValueParser::new(|s: &str| s.parse::<CalldataMix>().map_err(|e| e.to_string())))]
     calldata_bytes: CalldataMix,
+
+    /// The percentage of swaps in the uniswap workload, 0 to 100. The
+    /// other transactions are plain transfers.
+    #[arg(long = "swap-share-pct", default_value = "50", value_parser = clap::builder::ValueParser::new(|s: &str| s.parse::<SwapShare>().map_err(|e| e.to_string())))]
+    swap_share_pct: SwapShare,
+
+    /// The number of Uniswap v2 pairs of the uniswap workload. Sender
+    /// `s` swaps on pair `s % pairs`.
+    #[arg(long = "uniswap-pairs", default_value_t = UniswapMix::default().pairs)]
+    uniswap_pairs: NonZeroUsize,
 
     /// The number of per-submit retry attempts on a transient failure.
     #[arg(long = "retry-submit", default_value_t = 2)]
@@ -243,6 +254,10 @@ async fn main() -> anyhow::Result<()> {
     let cfg = LoadConfig {
         workload: args.workload,
         calldata: args.calldata_bytes,
+        uniswap: UniswapMix {
+            swap_share: args.swap_share_pct,
+            pairs: args.uniswap_pairs,
+        },
         rpc: args.rpc,
         receipt_rpcs: Vec::new(),
         chain_id: args.chain_id,

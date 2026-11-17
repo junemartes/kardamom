@@ -542,6 +542,7 @@ fn print_counts(r: &LoadReport) {
         r.lat_p99_us / 1000,
         r.lat_max_us / 1000
     );
+    r.classes.iter().for_each(|(class, c)| c.print(*class));
 }
 
 /// One line per node's keep-pace verdict.

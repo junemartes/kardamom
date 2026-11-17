@@ -21,18 +21,11 @@
 //! round trip, and sender 0's operation queue simply starts three
 //! nonces later.
 
-use std::ops::ControlFlow;
-use std::time::{Duration, Instant};
-
 use alloy_consensus::TxLegacy;
 use alloy_primitives::{Address, Bytes, TxKind, U256, keccak256};
 use anyhow::Context as _;
-use jsonrpsee::core::client::ClientT;
-use jsonrpsee::http_client::HttpClient;
-use jsonrpsee::rpc_params;
 
-use crate::load::hex_u64;
-use crate::load::plan::{PlannedTx, TxPlanParams};
+use crate::load::plan::{PlannedTx, TxClass, TxPlanParams};
 use crate::signers::{DerivedSigner, SignerSet};
 
 include!("defi_bytecode.rs");
@@ -215,6 +208,7 @@ fn sign(s: &DerivedSigner, chain_id: u64, spec: SignSpec) -> anyhow::Result<Plan
         hash: signed.hash,
         sender,
         nonce,
+        class: TxClass::Call,
     })
 }
 
@@ -265,144 +259,6 @@ pub fn deployment_txs(signers: &SignerSet, params: TxPlanParams) -> anyhow::Resu
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(Deployment { txs, contracts })
-}
-
-// This is a liveness bound, expressed as one. `deploy_and_confirm`'s
-// wait stage starts the moment the transfer soak's verdict lands, so
-// the chain is still draining that backlog, with the deploy queued
-// behind it. How long that takes is a property of the runner, not of
-// the code under test. A fixed wall-clock deadline would race the
-// drain instead.
-//
-// So `deploy_and_confirm` waits as long as the chain is advancing, and
-// fails only when it stops. A stalled pipeline is caught in seconds; a
-// merely slow one is waited out. The overall cap stays as a backstop
-// against waiting forever on a chain that advances but never includes
-// the transaction.
-const STALL_LIMIT: Duration = Duration::from_mins(1);
-const HARD_CAP: Duration = Duration::from_mins(10);
-
-async fn head_block(client: &HttpClient) -> Option<u64> {
-    client
-        .request::<String, _>("eth_blockNumber", rpc_params![])
-        .await
-        .ok()
-        .and_then(|h| hex_u64(&h))
-}
-
-/// Submit the deployment transactions and wait until each is mined
-/// successfully. Land these before any load starts: every workload
-/// call targets their computed addresses, so a call that arrives
-/// before its contract exists would revert and spoil the verdict.
-///
-/// # Errors
-/// Returns an error if a submit is rejected, a deployment reverts, the
-/// chain stops advancing while a deployment is unmined, or an accepted
-/// deployment is never included within the hard cap.
-pub(crate) async fn deploy_and_confirm(
-    client: &HttpClient,
-    deploys: &[PlannedTx],
-) -> anyhow::Result<()> {
-    for d in deploys {
-        let _: alloy_primitives::B256 = client
-            .request("eth_sendRawTransaction", rpc_params![d.raw.clone()])
-            .await
-            .map_err(|e| anyhow::anyhow!("defi deploy submit (nonce {}): {e}", d.nonce))?;
-    }
-    let started = Instant::now();
-    for d in deploys {
-        confirm_deploy(client, d, started).await?;
-    }
-    tracing::info!("defi contracts deployed + confirmed");
-    Ok(())
-}
-
-/// [`confirm_deploy`]'s carried state across polls: the last seen head
-/// block, and when it last changed.
-struct ConfirmState {
-    last_block: Option<u64>,
-    last_progress: Instant,
-}
-
-/// Poll until `d`'s receipt lands, or fail if the chain stalls or the
-/// deploy takes too long overall from `started`.
-async fn confirm_deploy(
-    client: &HttpClient,
-    d: &PlannedTx,
-    started: Instant,
-) -> anyhow::Result<()> {
-    let mut state = ConfirmState {
-        last_block: head_block(client).await,
-        last_progress: Instant::now(),
-    };
-    loop {
-        let ControlFlow::Continue(()) =
-            confirm_tick_or_wait(client, d, started, &mut state).await?
-        else {
-            return Ok(());
-        };
-    }
-}
-
-/// One [`confirm_deploy`] poll. Returns [`ControlFlow::Break`] once
-/// [`confirm_tick`] sees the receipt land; otherwise sleeps the poll
-/// interval and returns [`ControlFlow::Continue`], so the caller's loop
-/// tries again.
-async fn confirm_tick_or_wait(
-    client: &HttpClient,
-    d: &PlannedTx,
-    started: Instant,
-    state: &mut ConfirmState,
-) -> anyhow::Result<ControlFlow<()>> {
-    let cf = confirm_tick(client, d, started, state).await?;
-    if cf.is_continue() {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    Ok(cf)
-}
-
-/// One [`confirm_tick_or_wait`] poll: check for a landed receipt, else
-/// update the stall clock and check both deadlines.
-async fn confirm_tick(
-    client: &HttpClient,
-    d: &PlannedTx,
-    started: Instant,
-    state: &mut ConfirmState,
-) -> anyhow::Result<ControlFlow<()>> {
-    let v: Option<serde_json::Value> = client
-        .request("eth_getTransactionReceipt", rpc_params![d.hash])
-        .await
-        .unwrap_or(None);
-    if let Some(r) = v {
-        anyhow::ensure!(
-            r["status"].as_str() == Some("0x1"),
-            "defi deploy reverted (nonce {}): {r}",
-            d.nonce
-        );
-        return Ok(ControlFlow::Break(()));
-    }
-    let now = head_block(client).await;
-    if now.is_some() && now != state.last_block {
-        state.last_block = now;
-        state.last_progress = Instant::now();
-    }
-    anyhow::ensure!(
-        state.last_progress.elapsed() < STALL_LIMIT,
-        "defi deploy not mined (nonce {}): chain STOPPED advancing — no new \
-         block for {}s while waiting (head {:?})",
-        d.nonce,
-        STALL_LIMIT.as_secs(),
-        state.last_block
-    );
-    anyhow::ensure!(
-        started.elapsed() < HARD_CAP,
-        "defi deploy not mined (nonce {}) within {}s although the chain kept \
-         advancing to {:?} — the tx was accepted but never included",
-        d.nonce,
-        HARD_CAP.as_secs(),
-        state.last_block
-    );
-    Ok(ControlFlow::Continue(()))
 }
 
 /// Pre-sign per-sender queues of `DeFi` calls. Sender 0's nonces start

@@ -23,10 +23,12 @@ mod prepared;
 mod progress;
 mod report;
 pub(crate) mod scrape;
+mod setup;
 mod stream;
 #[cfg(test)]
 mod tests;
 mod tracker;
+pub mod uniswap;
 
 pub use prepared::Prepared;
 pub use progress::{Progress, ProgressSnapshot};
@@ -35,7 +37,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
-use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClient;
 
 use crate::config::{MAX_IN_FLIGHT_SLACK, preflight_chain_id, rpc_client};
@@ -44,8 +45,10 @@ use crate::load::engine::{
     Queues, RunHandles, SubmitMode, SubmitOpts, Tracker, join_submit_tasks, pacer,
 };
 use crate::load::feed::receipt_feed_task;
-use crate::load::plan::{PlannedTx, TransferMix, TransferShape, TxPlanParams};
+use crate::load::plan::{PlannedTx, TransferMix, TxPlanParams, TxShape};
 use crate::load::scrape::{MetricsSnapshot, ScrapeSet, Scraper};
+use crate::load::setup::Setup;
+use crate::load::uniswap::UniswapPlan;
 use crate::signers::{DerivedSigner, SignerSet};
 
 pub use config::{
@@ -53,6 +56,7 @@ pub use config::{
     LoadReport, NonceStart, RampStep, SenderRange, Workload,
 };
 pub use exporter::{ExporterRead, ExporterReader, MetricsTarget, MetricsTargets};
+pub use uniswap::{SwapShare, UniswapMix};
 
 /// Parse a `0x`-prefixed JSON-RPC hex quantity into a `u64`.
 pub(crate) fn hex_u64(s: &str) -> Option<u64> {
@@ -66,11 +70,10 @@ pub(crate) fn json_hex_u64(v: &serde_json::Value) -> Option<u64> {
 }
 
 /// [`LoadConfig::build_queues`]'s result: the presigned per-sender
-/// submit queues, plus any `DeFi` deployment transactions to land
-/// first.
+/// submit queues, and the setup to land first.
 struct BuiltQueues {
     queues: Queues,
-    defi_deploys: Option<Vec<PlannedTx>>,
+    setup: Setup,
 }
 
 /// The open files a run needs beyond its client connections: the log,
@@ -161,25 +164,19 @@ impl LoadConfig {
     }
 
     /// Build the presigned per-sender queues for `self.workload`, and
-    /// the `DeFi` deployment transactions to land first, if the
-    /// workload needs them.
+    /// the setup to land first, if the workload needs one.
     fn build_queues(&self, signers: &SignerSet, plan: &QueuePlan) -> anyhow::Result<BuiltQueues> {
-        let params = |nonce_start| TxPlanParams {
-            chain_id: plan.chain_id,
-            nonce_start,
-            gas_price: self.gas_price,
-        };
         // A transfer queue reads the nonce of each sender from `starts`.
-        let transfer_params = params(0);
-        let (queues_vec, defi_deploys) = match self.workload {
+        let transfer_params = plan.params(self, 0);
+        let (queues_vec, setup) = match self.workload {
             Workload::Transfers => (
-                TransferMix::single(TransferShape::plain(self.to, self.value)).pregenerate(
+                TransferMix::single(TxShape::plain(self.to, self.value)).pregenerate(
                     signers,
                     plan.per_sender,
                     transfer_params,
                     &plan.starts,
                 )?,
-                None,
+                Setup::default(),
             ),
             Workload::Calldata => (
                 TransferMix::calldata(self.to, self.value, &self.calldata)?.pregenerate(
@@ -188,31 +185,49 @@ impl LoadConfig {
                     transfer_params,
                     &plan.starts,
                 )?,
-                None,
+                Setup::default(),
             ),
-            Workload::Defi => {
-                let NonceStart::Fixed(nonce_start) = self.nonce_start else {
-                    anyhow::bail!("the defi workload needs a fixed --nonce-start");
-                };
-                let plan_params = params(nonce_start);
-                let dep = defi::deployment_txs(signers, plan_params)?;
-                tracing::info!(
-                    pool = %dep.contracts.pool,
-                    vault = %dep.contracts.vault,
-                    clob = %dep.contracts.clob,
-                    "defi workload: deploying bench contracts"
-                );
-                let queues =
-                    defi::pregenerate_defi(signers, &dep.contracts, plan.per_sender, plan_params)?;
-                (queues, Some(dep.txs))
-            }
+            Workload::Uniswap => self.uniswap_queues(signers, plan)?,
+            Workload::Defi => self.defi_queues(signers, plan)?,
         };
         Ok(BuiltQueues {
             queues: Queues::new(queues_vec),
-            defi_deploys,
+            setup,
         })
     }
+
+    /// The uniswap queues, and the two setup phases: the deploys of the
+    /// first sender, then the setup of each sender.
+    fn uniswap_queues(&self, signers: &SignerSet, plan: &QueuePlan) -> anyhow::Result<Signed> {
+        let run = UniswapPlan::new(signers, &plan.starts, plan.params(self, 0), self.uniswap)?
+            .sign(&TxShape::plain(self.to, self.value), plan.per_sender)?;
+        let setup = Setup::default()
+            .phase(vec![run.deploys])
+            .phase(run.sender_setup);
+        Ok((run.queues, setup))
+    }
+
+    /// The `DeFi` queues, and the deploys of the first sender as the
+    /// setup.
+    fn defi_queues(&self, signers: &SignerSet, plan: &QueuePlan) -> anyhow::Result<Signed> {
+        let NonceStart::Fixed(nonce_start) = self.nonce_start else {
+            anyhow::bail!("the defi workload needs a fixed --nonce-start");
+        };
+        let plan_params = plan.params(self, nonce_start);
+        let dep = defi::deployment_txs(signers, plan_params)?;
+        tracing::info!(
+            pool = %dep.contracts.pool,
+            vault = %dep.contracts.vault,
+            clob = %dep.contracts.clob,
+            "defi workload: deploying bench contracts"
+        );
+        let queues = defi::pregenerate_defi(signers, &dep.contracts, plan.per_sender, plan_params)?;
+        Ok((queues, Setup::default().phase(vec![dep.txs])))
+    }
 }
+
+/// The signed queue of each sender, and the setup to land first.
+type Signed = (Vec<Vec<PlannedTx>>, Setup);
 
 /// What [`LoadConfig::build_queues`] signs: the chain, the queue depth
 /// of each sender, and the first nonce of each sender.
@@ -222,34 +237,14 @@ struct QueuePlan {
     starts: Vec<u64>,
 }
 
-impl NonceStart {
-    /// The first nonce of each signer, in signer order.
-    async fn per_sender(
-        self,
-        client: &HttpClient,
-        signers: &SignerSet,
-    ) -> anyhow::Result<Vec<u64>> {
-        match self {
-            Self::Fixed(nonce) => Ok(vec![nonce; signers.len()]),
-            Self::Chain => {
-                futures::future::try_join_all(
-                    signers.iter().map(|s| Self::chain_nonce(client, s.address)),
-                )
-                .await
-            }
+impl QueuePlan {
+    /// The transaction fields of this plan, with the gas price of `cfg`.
+    fn params(&self, cfg: &LoadConfig, nonce_start: u64) -> TxPlanParams {
+        TxPlanParams {
+            chain_id: self.chain_id,
+            nonce_start,
+            gas_price: cfg.gas_price,
         }
-    }
-
-    /// The nonce of `address` at the head of the chain.
-    async fn chain_nonce(client: &HttpClient, address: Address) -> anyhow::Result<u64> {
-        let nonce: String = client
-            .request(
-                "eth_getTransactionCount",
-                jsonrpsee::rpc_params![address, "latest"],
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("eth_getTransactionCount {address}: {e}"))?;
-        hex_u64(&nonce).ok_or_else(|| anyhow::anyhow!("nonce {nonce:?} of {address} is not hex"))
     }
 }
 
@@ -450,8 +445,8 @@ impl LoadRun<'_> {
 }
 
 /// What `run` needs before the ramp and soak: a connected client, the
-/// validated sender set, and the pre-signed submit queues, with any
-/// `DeFi` setup already landed.
+/// validated sender set, and the pre-signed submit queues, with the
+/// setup of the workload already landed.
 struct RunSetup {
     client: Arc<HttpClient>,
     signers: SignerSet,
@@ -459,10 +454,7 @@ struct RunSetup {
 }
 
 /// Connect, derive signers, pre-generate the submit queues, and land
-/// any `DeFi` setup transactions before any load starts. Every
-/// workload call targets their computed addresses; a call that
-/// arrives before its contract exists would revert and spoil the
-/// verdict.
+/// the setup transactions of the workload before any load starts.
 async fn prepare_run(cfg: &LoadConfig) -> anyhow::Result<RunSetup> {
     cfg.raise_open_files()?;
     let client = Arc::new(rpc_client(&cfg.rpc, cfg.max_in_flight.get())?);
@@ -504,9 +496,7 @@ async fn prepare_run(cfg: &LoadConfig) -> anyhow::Result<RunSetup> {
     })
     .await
     .map_err(|e| anyhow::anyhow!("join the pre-generation: {e}"))??;
-    if let Some(deploys) = built.defi_deploys {
-        defi::deploy_and_confirm(&client, &deploys).await?;
-    }
+    built.setup.land(&client).await?;
 
     Ok(RunSetup {
         client,
