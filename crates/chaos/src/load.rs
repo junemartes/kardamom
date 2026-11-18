@@ -12,7 +12,7 @@ use anyhow::Context;
 use kardamom_bench::ANVIL_MNEMONIC;
 use kardamom_bench::load::{
     self, CalldataMix, Completeness, LoadConfig, MetricsTargets, NonceStart, Progress, SenderRange,
-    Workload,
+    UniswapMix, Workload,
 };
 use serde::Deserialize;
 
@@ -122,6 +122,7 @@ impl LoadSpec {
         Ok(LoadConfig {
             workload: Workload::Transfers,
             calldata: CalldataMix::default(),
+            uniswap: UniswapMix::default(),
             rpc: self.rpc_url.clone(),
             receipt_rpcs: self.receipt_rpcs.clone(),
             chain_id: Some(self.chain_id),

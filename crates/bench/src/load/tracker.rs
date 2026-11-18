@@ -6,6 +6,8 @@
 //! accepted but never receipted, or `unlanded`, meaning the submit
 //! failed and never landed.
 
+mod classes;
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -15,9 +17,12 @@ use alloy_primitives::{Address, B256};
 use hdrhistogram::Histogram;
 
 use crate::config::{HIST_HIGH_US, HIST_LOW_US};
+use crate::load::config::ClassReport;
 use crate::load::json_hex_u64;
-use crate::load::plan::PlannedTx;
+use crate::load::plan::{PlannedTx, TxClass};
 use crate::signers::DerivedSigner;
+
+use classes::ClassTallies;
 
 /// How many contradicting receipts get a full warning line. Past
 /// this, only the counter moves: one bad block wrongs every sender at
@@ -69,11 +74,13 @@ impl ReceiptStatus {
 
 /// What the receipt of a planned transaction must say: the signer,
 /// and the nonce the signer spent, which orders its block against the
-/// signer's other transactions.
+/// signer's other transactions. The class selects the tally of the
+/// receipt.
 #[derive(Debug, Clone, Copy)]
 struct Expected {
     sender: Address,
     nonce: u64,
+    class: TxClass,
 }
 
 /// The blocks every confirmed transaction landed in, per sender by
@@ -206,6 +213,9 @@ pub(crate) struct Tracker {
     /// the cumulative histogram would blend early clean steps with
     /// later ones.
     step_lat_us: Mutex<Histogram<u64>>,
+    /// The receipts, failed receipts, and latency of each class. A
+    /// receipt of a hash with no expectation counts in no class.
+    classes: ClassTallies,
     pending: Mutex<HashMap<B256, Pending>>,
     /// In subscribe mode only: a receipt whose feed notification
     /// arrived before its submit task registered in `pending`. This
@@ -232,6 +242,7 @@ impl Tracker {
             step_gas: AtomicU64::new(0),
             lat_us: Mutex::new(crate::config::new_latency_hist()?),
             step_lat_us: Mutex::new(crate::config::new_latency_hist()?),
+            classes: ClassTallies::new()?,
             pending: Mutex::new(HashMap::new()),
             early: Mutex::new(HashMap::new()),
         })
@@ -252,6 +263,7 @@ impl Tracker {
                 Expected {
                     sender,
                     nonce: tx.nonce,
+                    class: tx.class,
                 },
             ))
         }));
@@ -268,6 +280,7 @@ impl Tracker {
                 Expected {
                     sender: signers[tx.sender].address,
                     nonce: tx.nonce,
+                    class: tx.class,
                 },
             )
         }));
@@ -433,6 +446,12 @@ impl Tracker {
         }
     }
 
+    /// The receipts, failed receipts, and latency of each class that
+    /// got a receipt.
+    pub(crate) fn class_report(&self) -> BTreeMap<TxClass, ClassReport> {
+        self.classes.report()
+    }
+
     /// Drain the per-step latency histogram: the percentiles, in
     /// microseconds, for everything confirmed since the previous call.
     /// Resets the histogram.
@@ -454,24 +473,29 @@ impl Tracker {
         if receipt.status != 1 {
             self.bad_status.fetch_add(1, Ordering::Relaxed);
         }
-        if let Some(why) = self.contradiction(hash, receipt) {
+        let expected = self.expectation(&hash);
+        if let Some(why) = expected.and_then(|e| self.contradiction(e, receipt)) {
             let seen = self.bad_receipt.fetch_add(1, Ordering::Relaxed);
             if seen < CONTRADICTION_SAMPLES {
                 tracing::warn!(%hash, "receipt contradicts its transaction: {why}");
             }
         }
-        let us = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
-        let _ = lock(&self.lat_us).record(us.clamp(HIST_LOW_US, HIST_HIGH_US));
-        let _ = lock(&self.step_lat_us).record(us.clamp(HIST_LOW_US, HIST_HIGH_US));
+        let us = u64::try_from(latency.as_micros())
+            .unwrap_or(u64::MAX)
+            .clamp(HIST_LOW_US, HIST_HIGH_US);
+        let _ = lock(&self.lat_us).record(us);
+        let _ = lock(&self.step_lat_us).record(us);
+        if let Some(e) = expected {
+            self.classes.record(e.class, receipt.status, us);
+        }
     }
 
-    /// Why `receipt` cannot be the receipt of `hash`: it names another
-    /// sender, it names no block, or its block is out of order with the
-    /// sender's other nonces. `None` for a receipt that fits, or for a
-    /// hash with no expectation. A skip receipt does not take a place in
-    /// the nonce order, because its nonce stays unspent.
-    fn contradiction(&self, hash: B256, receipt: &ReceiptStatus) -> Option<String> {
-        let e = self.expectation(&hash)?;
+    /// Why `receipt` cannot be the receipt of the planned transaction
+    /// `e`: it names another sender, it names no block, or its block is
+    /// out of order with the sender's other nonces. `None` for a receipt
+    /// that fits. A skip receipt does not take a place in the nonce
+    /// order, because its nonce stays unspent.
+    fn contradiction(&self, e: Expected, receipt: &ReceiptStatus) -> Option<String> {
         if receipt.from != Some(e.sender) {
             return Some(format!(
                 "from {:?}, signed by {} nonce {}",
@@ -496,134 +520,4 @@ impl Tracker {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    use crate::signers::SignerSet;
-
-    /// Every accessor reads through the poison-tolerant `lock()` helper,
-    /// so a poisoned mutex still records the sample.
-    #[test]
-    fn confirm_with_gas_records_through_a_poisoned_mutex() {
-        let tracker = Tracker::new().expect("tracker");
-        // Poison the latency mutex, the way a panicking submit task would.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = tracker.lat_us.lock().unwrap();
-            panic!("simulated submit-task panic while holding the lock");
-        }));
-        assert!(tracker.lat_us.is_poisoned());
-
-        tracker.confirm(
-            B256::ZERO,
-            &ReceiptStatus::ok(21_000),
-            Duration::from_micros(500),
-        );
-
-        let lat = tracker.latency_us();
-        assert!(lat.p50 > 0, "sample was dropped: p50 is 0");
-        assert!(lat.max > 0, "sample was dropped: max is 0");
-    }
-
-    /// A tracker that expects two senders with two nonces each, and
-    /// the hash of `(sender, nonce)`.
-    fn expecting() -> (Tracker, SignerSet, impl Fn(usize, u64) -> B256) {
-        let signers = SignerSet::derive(crate::ANVIL_MNEMONIC, 2).expect("signers");
-        let hash = |sender: usize, nonce: u64| {
-            let slot =
-                u8::try_from(sender).expect("small") * 10 + u8::try_from(nonce).expect("small");
-            B256::with_last_byte(slot)
-        };
-        let planned: Vec<PlannedTx> = (0..2)
-            .flat_map(|s| (0..2).map(move |n| (s, n)))
-            .map(|(sender, nonce)| PlannedTx {
-                raw: alloy_primitives::Bytes::new(),
-                hash: hash(sender, nonce),
-                sender,
-                nonce,
-            })
-            .collect();
-        let mut tracker = Tracker::new().expect("tracker");
-        tracker.expect(&signers, planned.iter());
-        (tracker, signers, hash)
-    }
-
-    fn mined(from: Address, block: u64) -> ReceiptStatus {
-        ReceiptStatus {
-            status: 1,
-            gas: 21_000,
-            from: Some(from),
-            block: Some(block),
-        }
-    }
-
-    #[test]
-    fn a_receipt_of_another_sender_or_without_a_block_is_a_bad_receipt() {
-        let (tracker, signers, hash) = expecting();
-        let latency = Duration::from_millis(1);
-        tracker.confirm(hash(0, 0), &mined(signers[1].address, 5), latency);
-        tracker.confirm(hash(0, 1), &ReceiptStatus::ok(21_000), latency);
-        tracker.confirm(hash(1, 0), &mined(signers[1].address, 5), latency);
-        let c = tracker.counts();
-        assert_eq!((c.receipted, c.bad_status, c.bad_receipt), (3, 0, 2));
-    }
-
-    #[test]
-    fn a_lower_nonce_in_a_later_block_is_a_bad_receipt_whichever_confirms_first() {
-        let (tracker, signers, hash) = expecting();
-        let latency = Duration::from_millis(1);
-        let me = signers[0].address;
-        tracker.confirm(hash(0, 1), &mined(me, 7), latency);
-        tracker.confirm(hash(0, 0), &mined(me, 9), latency);
-        assert_eq!(tracker.counts().bad_receipt, 1, "nonce 0 after nonce 1");
-        let other = signers[1].address;
-        tracker.confirm(hash(1, 0), &mined(other, 9), latency);
-        tracker.confirm(hash(1, 1), &mined(other, 9), latency);
-        assert_eq!(
-            tracker.counts().bad_receipt,
-            1,
-            "one block holds both nonces"
-        );
-    }
-
-    #[test]
-    fn a_skip_receipt_takes_no_place_in_the_nonce_order() {
-        let (tracker, signers, hash) = expecting();
-        let latency = Duration::from_millis(1);
-        let me = signers[0].address;
-        let skip = ReceiptStatus {
-            status: 0,
-            gas: 0,
-            ..mined(me, 9)
-        };
-        tracker.confirm(hash(0, 0), &skip, latency);
-        tracker.confirm(hash(0, 1), &mined(me, 7), latency);
-        let c = tracker.counts();
-        assert_eq!((c.bad_status, c.bad_receipt), (1, 0));
-    }
-
-    #[test]
-    fn a_hash_without_an_expectation_is_never_checked() {
-        let (tracker, _, _) = expecting();
-        tracker.confirm(
-            B256::repeat_byte(0xEE),
-            &ReceiptStatus::ok(0),
-            Duration::ZERO,
-        );
-        assert_eq!(tracker.counts().bad_receipt, 0);
-    }
-
-    #[test]
-    fn the_feed_path_checks_the_receipt_on_both_sides_of_the_race() {
-        let (tracker, signers, hash) = expecting();
-        let wrong = mined(signers[1].address, 3);
-        // The feed first, then the submit task registers.
-        tracker.confirm_from_feed(hash(0, 0), &wrong);
-        tracker.await_feed(hash(0, 0), Instant::now());
-        // The submit task first, then the feed.
-        tracker.await_feed(hash(0, 1), Instant::now());
-        tracker.confirm_from_feed(hash(0, 1), &wrong);
-        let c = tracker.counts();
-        assert_eq!((c.receipted, c.bad_receipt), (2, 2));
-        assert_eq!(tracker.pending_len(), 0);
-    }
-}
+mod tests;

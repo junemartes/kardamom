@@ -1,5 +1,7 @@
 //! Final load reports retain the duration of the paced window.
 
+use super::config::ClassReport;
+use super::plan::TxClass;
 use super::{LoadReport, LoadRun, RampStep, accounting};
 use std::time::Duration;
 
@@ -47,9 +49,27 @@ impl LoadRun<'_> {
             lat_max_us: lat.max,
             total_gas: self.tracker.total_gas(),
             workload: self.cfg.workload.to_string(),
+            classes: self.tracker.class_report(),
             scrape_fallbacks,
             executor_queries_served_delta,
             verdict,
         }
+    }
+}
+
+impl ClassReport {
+    /// Print one line for `class`: the receipts, the failed receipts,
+    /// and the receipt latency in microseconds.
+    pub(super) fn print(&self, class: TxClass) {
+        println!(
+            "  {:<8} receipted={}  failed={}  p50={}us p95={}us p99={}us max={}us",
+            class.as_str(),
+            self.receipted,
+            self.failed,
+            self.lat_p50_us,
+            self.lat_p95_us,
+            self.lat_p99_us,
+            self.lat_max_us
+        );
     }
 }

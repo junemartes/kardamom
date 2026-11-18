@@ -33,7 +33,7 @@ impl SignedBatches {
         tokio::task::spawn_blocking(move || producer.run());
         Ok(BuiltQueues {
             queues: initial.queues.with_refill(Self { receiver, signers }),
-            defi_deploys: None,
+            setup: super::Setup::default(),
         })
     }
 

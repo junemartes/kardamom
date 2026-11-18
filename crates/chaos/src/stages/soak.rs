@@ -11,7 +11,7 @@ use std::time::Duration;
 use alloy_primitives::U256;
 use kardamom_bench::ANVIL_MNEMONIC;
 use kardamom_bench::load::{
-    CalldataMix, Completeness, LoadConfig, NonceStart, SenderRange, Workload,
+    CalldataMix, Completeness, LoadConfig, NonceStart, SenderRange, UniswapMix, Workload,
 };
 
 use crate::harness::Harness;
@@ -113,6 +113,7 @@ impl Harness {
         Ok(LoadConfig {
             workload: run.workload,
             calldata: CalldataMix::default(),
+            uniswap: UniswapMix::default(),
             rpc: self.rpc_url.clone(),
             receipt_rpcs: self.receipt_rpcs(),
             chain_id: Some(self.knobs.chain_id),

@@ -1,7 +1,7 @@
 use super::*;
 use crate::load::accounting::tests::base_input;
 use crate::load::accounting::{EvalInput, evaluate};
-use crate::load::plan::PlannedTx;
+use crate::load::plan::{PlannedTx, TxClass};
 use crate::load::scrape::MetricsSnapshot;
 use crate::load::tracker::PendingCounts;
 use alloy_primitives::Bytes;
@@ -17,6 +17,7 @@ fn tx(sender: usize, nonce: u64) -> PlannedTx {
         hash: B256::with_last_byte(u8::try_from(nonce).unwrap_or(0)),
         sender,
         nonce,
+        class: TxClass::Transfer,
     }
 }
 

@@ -49,6 +49,7 @@ alloy-rlp.workspace = true
 alloy-network.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-eips.workspace = true
+alloy-sol-types.workspace = true
 alloy-signer-local = { workspace = true, features = ["mnemonic"] }
 
 rand = "0.8"
