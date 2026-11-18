@@ -8,6 +8,7 @@ use kardamom_egress::merge::Head;
 use super::EgressTransport;
 use crate::ExecutorError;
 use crate::actor::fixtures::TestEgress;
+use crate::reader::TxOrderingSubscription;
 use crate::reader::carried::answer::Timing;
 use crate::reader::carried::memory::{MemoryRemote, MemoryTransport};
 use crate::reader::carried::tests::{TIMING, boundary, label, tx_at, unavailable};
@@ -255,5 +256,32 @@ fn a_cursor_past_an_undelivered_boundary_restarts_the_run() {
             next_block,
         } => assert_eq!((next_index, next_block), (2, 1)),
         other => panic!("expected a restart from the state DB, got {other:?}"),
+    }
+}
+
+/// A reader that reads the egress only up to its head, as an executor
+/// reads it for a cursor below the window of the sealer: it delivers the
+/// stored blocks from the cursor, and ends the run at the head.
+#[test]
+fn a_reader_up_to_the_head_delivers_the_range_and_ends_at_the_head() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let stored = [tx_at(0), boundary(1, 1), tx_at(1), boundary(2, 2)];
+    let egress = TestEgress::serve(&rt, dir.path(), TestEgress::GENESIS, &stored);
+    let (transport, _live) = egress.transport(&rt);
+    let mut sub =
+        CarriedSubscription::with_timing(transport, NoSource, ReplayCursor::new(0, 1), TIMING)
+            .until_head();
+    let got = std::iter::repeat_with(|| sub.next().map(label))
+        .take(4)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("the stored range");
+    assert_eq!(got, ["t0", "b1", "t1", "b2"]);
+    match sub.next() {
+        Err(ExecutorError::HeadReached {
+            next_index,
+            next_block,
+        }) => assert_eq!((next_index, next_block), (2, 3), "the head of the egress"),
+        other => panic!("expected the end at the head, got {other:?}"),
     }
 }

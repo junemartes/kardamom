@@ -17,6 +17,7 @@ use crate::Boot;
 use crate::ledger::ReceiptLedger;
 use crate::marker::Markers;
 use crate::rollback::RollbackRepair;
+use crate::source::Source;
 
 /// The widest comparison window. A divergence below it needs the operator.
 const MAX_COMPARE_BLOCKS: NonZeroU64 = NonZeroU64::new(4096).unwrap();
@@ -32,6 +33,9 @@ const MAX_DOUBLINGS: u32 = 5;
 /// A run that lasts this long ends the series of restarts: the next pause
 /// is the first one again.
 const STABLE_RUN: Duration = Duration::from_secs(60);
+/// The resync outcome of a cursor that the sealer refused, when the next
+/// run reads the range read of the egress.
+const EGRESS_OUTCOME: &str = "egress";
 
 /// What the process does after one run of the pipeline.
 #[derive(Debug)]
@@ -42,9 +46,13 @@ pub(crate) enum Verdict {
     /// checkpoint of a rollback, waits with the stale state parked, and the
     /// next run restores it.
     Revolve,
-    /// The stream source restarted: run the pipeline again from the state
-    /// DB as it is, after a pause.
+    /// The stream source restarted, or a read of the egress reached its
+    /// head: run the pipeline again from the state DB as it is, after a
+    /// pause.
     Restart,
+    /// The sealer refused the cursor below its window: run the pipeline
+    /// again at once, on the range read of the egress up to its head.
+    ReadEgress,
     /// The divergence can be below the comparison window: run again with a
     /// wider window.
     Widen(ExecutorError),
@@ -65,11 +73,24 @@ impl Verdict {
         match (engine_error, repaired, staged) {
             (None, _, _) => Self::Done,
             (Some(_), _, true) | (Some(_), Some("peer-checkpoint"), false) => Self::Revolve,
-            (Some(ExecutorError::SourceRestarted { .. }), _, false) => Self::Restart,
+            (Some(_), Some(EGRESS_OUTCOME), false) => Self::ReadEgress,
+            (
+                Some(ExecutorError::SourceRestarted { .. } | ExecutorError::HeadReached { .. }),
+                _,
+                false,
+            ) => Self::Restart,
             (Some(e @ ExecutorError::DivergedBelowWindow { widen: true, .. }), _, false) => {
                 Self::Widen(e)
             }
             (Some(e), _, false) => Self::Failed(e),
+        }
+    }
+
+    /// The source of the next run.
+    fn source(&self) -> Source {
+        match self {
+            Self::ReadEgress => Source::Egress,
+            _ => Source::Cluster,
         }
     }
 }
@@ -94,6 +115,8 @@ pub(crate) struct RunEnd {
     pub(crate) ledger: Option<ReceiptLedger>,
     pub(crate) checkpointer: Option<tokio::task::JoinHandle<()>>,
     pub(crate) expected_genesis: Option<alloy_primitives::B256>,
+    /// The source of the canonical stream of the run.
+    pub(crate) source: Source,
 }
 
 /// The state that passes from one run of the process loop to the next.
@@ -107,6 +130,8 @@ pub(crate) struct Turns {
     /// The window of the configuration. A run after a widened run that
     /// did not end below the window compares this window again.
     base: NonZeroU64,
+    /// The source of the canonical stream of the next run.
+    source: Source,
 }
 
 impl Turns {
@@ -116,6 +141,7 @@ impl Turns {
             restarts: 0,
             window,
             base: window,
+            source: Source::Cluster,
         }
     }
 
@@ -127,14 +153,15 @@ impl Turns {
     /// loop relies on.
     pub(crate) async fn turn(&mut self, boot: &Boot) -> Result<ControlFlow<()>> {
         let started = Instant::now();
-        let verdict = Box::pin(crate::run_once(boot, self.window)).await?;
+        let verdict = Box::pin(crate::run_once(boot, self.window, self.source)).await?;
         self.settle(&verdict);
+        self.source = verdict.source();
         match verdict {
             Verdict::Done => return Ok(ControlFlow::Break(())),
             Verdict::Failed(e) => {
                 return Err(anyhow::Error::new(e).context("executor pipeline failed"));
             }
-            Verdict::Revolve => {}
+            Verdict::Revolve | Verdict::ReadEgress => {}
             Verdict::Restart => self.pause(boot, started).await,
             Verdict::Widen(e) => self.widen(e)?,
         }
@@ -271,7 +298,9 @@ impl Boot {
     /// - The checkpoint task ends before a repair touches the checkpoints.
     /// - A replay-window overrun stages a peer checkpoint, so the next run
     ///   restores it instead of re-requesting the same refused
-    ///   `REPLAY_FROM`. See `bin_support::replay_unavailable_fallback`.
+    ///   `REPLAY_FROM`. An executor that reads the cluster egress and has
+    ///   `--egress` first reads the range read of the egress in the next
+    ///   run. See [`Self::repair_refused`].
     /// - A divergence of the canonical stream stages a rollback. See
     ///   [`RollbackRepair`].
     ///
@@ -291,14 +320,8 @@ impl Boot {
         if let Some(checkpointer) = end.checkpointer {
             checkpointer.await?;
         }
-        let repaired = bin_support::replay_unavailable_fallback(
-            end.engine_error.as_ref(),
-            args.checkpoint_dir.as_deref(),
-            &args.checkpoint_peers,
-            &args.state_dir,
-            end.expected_genesis,
-            false,
-        )?;
+        let repaired =
+            self.repair_refused(end.source, end.engine_error.as_ref(), end.expected_genesis)?;
         if let Some(outcome) = repaired {
             metrics::counter!(kardamom_engine::metrics::RESYNC_TOTAL, "outcome" => outcome)
                 .increment(1);
@@ -319,6 +342,40 @@ impl Boot {
             .transpose()?
             .unwrap_or(false);
         Ok(Verdict::of(end.engine_error, repaired, staged))
+    }
+
+    /// The repair of a cursor that the sealer refused below its window, at
+    /// the end of a run of `source` with `error`. A cluster run of an
+    /// executor with `--egress` reads the range read of the egress next,
+    /// and moves no checkpoint. Every other refusal stages a peer
+    /// checkpoint (see `bin_support::replay_unavailable_fallback`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a staged checkpoint exists but the stale state
+    /// fails to park.
+    fn repair_refused(
+        &self,
+        source: Source,
+        error: Option<&ExecutorError>,
+        expected_genesis: Option<alloy_primitives::B256>,
+    ) -> Result<Option<&'static str>> {
+        let args = &self.args;
+        if source.egress_next(error, args.egress_after_refusal()) {
+            tracing::warn!(
+                error = ?error,
+                "the sealer refused the cursor; the next run reads the range read of the egress"
+            );
+            return Ok(Some(EGRESS_OUTCOME));
+        }
+        bin_support::replay_unavailable_fallback(
+            error,
+            args.checkpoint_dir.as_deref(),
+            &args.checkpoint_peers,
+            &args.state_dir,
+            expected_genesis,
+            false,
+        )
     }
 }
 

@@ -84,6 +84,8 @@ pub struct CarriedSubscription<F, S> {
     /// reader delivered, when the binary names one.
     cursor_gauge: Option<metrics::Gauge>,
     watch: Watch,
+    /// End the run when a replay reaches the head of the source.
+    until_head: bool,
 }
 
 /// The progress of the cursor, for the stall window.
@@ -184,7 +186,18 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
             woke_at: now,
             tee: Forward::default(),
             cursor_gauge: None,
+            until_head: false,
         }
+    }
+
+    /// End the run with [`ExecutorError::HeadReached`] when the replay of
+    /// a request reaches the head of the source. An executor reads the range read of the
+    /// egress this way for a cursor below the window of the sealer, and
+    /// then reads the cluster egress again.
+    #[must_use]
+    pub fn until_head(mut self) -> Self {
+        self.until_head = true;
+        self
     }
 
     /// Set the gauge `name` to the canonical index of each record that the
@@ -245,7 +258,7 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
             } => {
                 self.end_replay(up_to_index, up_to_block)?;
                 self.switch.live();
-                Ok(())
+                self.stop_at_head()
             }
             Step::Drop => Ok(()),
             Step::Ask => {
@@ -297,6 +310,26 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
             next_index,
             next_block,
         }
+    }
+
+    /// End the run at the head of the source, when the reader reads only
+    /// up to the head. The reader delivers each item before it reads the
+    /// next frame. So at the end of the replay, the reader has delivered
+    /// every whole block below the head.
+    fn stop_at_head(&self) -> Result<(), ExecutorError> {
+        if !self.until_head {
+            return Ok(());
+        }
+        let (next_index, next_block) = self.reorder.next();
+        tracing::info!(
+            next_index,
+            next_block,
+            "the reader reached the head of the source; ending the run"
+        );
+        Err(ExecutorError::HeadReached {
+            next_index,
+            next_block,
+        })
     }
 
     /// The replay of the newest request reached the head of the source. A

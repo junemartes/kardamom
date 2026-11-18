@@ -370,6 +370,7 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
 
   - `peer-checkpoint`: the node fell behind the retention window and repaired itself from a peer checkpoint.
   - `unrecoverable`: the node could not repair itself and waits for an operator.
+  - `egress`: an executor that reads the cluster egress fell behind the retention window. Its next run reads the range read of the egress (`--egress`).
   - See "Replay-window overrun" in [failure-modes.md](failure-modes.md).
   - The validator counter is `validator_resync_total`. A `peer-checkpoint` increment there means the validator did not verify the blocks up to the adopted checkpoint.
 - `kardamom_executor_rollback_total{outcome}` counts the rollbacks of an executor that reads the member feed, after the canonical stream diverged from its committed history (`local-checkpoint`, `peer-checkpoint`, `no-checkpoint`), or from the receipts that it published above that history (`receipts-only`).
@@ -502,6 +503,12 @@ With `--carry-bytes`, `--egress <url>` (`KARDAMOM_EGRESS_URL`, off by default) m
 - The executor goes back to the feed by the same rule as from the serving service.
 - A cursor below the floor of the egress store too stages a peer checkpoint (`kardamom_executor_resync_total`).
 - Off: a cursor below the window stages a peer checkpoint at once.
+
+Without `--carry-bytes`, `--egress <url>` serves a cursor that the sealer refuses below its window.
+
+- The run ends, and the next run reads the range read of the egress from the cursor. It opens no cluster session and no `tx_data` lane.
+- That run ends at the head of the store, with the log line `the reader reached the head of the source; ending the run`. The run after it reads the cluster egress again.
+- A cursor below the floor of the egress store too stages a peer checkpoint.
 
 | Metric | Meaning |
 | --- | --- |

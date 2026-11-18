@@ -103,3 +103,29 @@ fn the_pause_doubles_up_to_its_limit() {
     let pauses: Vec<u64> = (0..8).map(|_| turns.next_pause().as_secs()).collect();
     assert_eq!(pauses, [1, 2, 4, 8, 16, 30, 30, 30]);
 }
+
+/// A cursor that the sealer refused, with the egress as the repair, runs
+/// the next run on the egress at once. A run of the egress that reached
+/// its head runs again on the cluster egress after the restart pause.
+#[test]
+fn a_refused_cursor_reads_the_egress_and_the_head_goes_back_to_the_cluster() {
+    let refused = ExecutorError::ClusterReplayUnavailable {
+        from_index: 10,
+        oldest_index: 500,
+        oldest_block: 7,
+    };
+    let egress = Verdict::of(Some(refused), Some(EGRESS_OUTCOME), false);
+    assert!(matches!(egress, Verdict::ReadEgress));
+    assert_eq!(egress.source(), Source::Egress);
+    let head = Verdict::of(
+        Some(ExecutorError::HeadReached {
+            next_index: 40,
+            next_block: 9,
+        }),
+        None,
+        false,
+    );
+    assert!(matches!(head, Verdict::Restart));
+    assert_eq!(head.source(), Source::Cluster);
+    assert_eq!(Verdict::Revolve.source(), Source::Cluster);
+}

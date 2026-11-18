@@ -22,13 +22,14 @@
 //! restore and serve, env open, resume decision) is in
 //! [`kardamom_executor::state`]. Role
 //! adapters (wiring, receipts publication, the opt-in Block-STM strategy)
-//! are in [`wiring`]. This file is the driver: open streams, wire, run,
-//! tear down.
+//! are in [`wiring`]. The source of the canonical stream of each run is in
+//! [`source`]. This file is the driver: open streams, wire, run, tear down.
 
 mod args;
 mod ledger;
 mod marker;
 mod rollback;
+mod source;
 mod turns;
 mod wiring;
 
@@ -50,9 +51,11 @@ use kardamom_log::discovery::StreamPlane;
 use kardamom_state::seed_genesis;
 
 use args::Args;
+use kardamom_engine::Either;
 use ledger::ReceiptLedger;
+use source::{ReaderStart, Source};
 use turns::{RunEnd, Turns, Verdict};
-use wiring::{ExecutorOrdering, ExecutorWiring};
+use wiring::{ExecutorWiring, NoReceipts, ReceiptsOut};
 
 /// The state writer and the adapters built from its handle, plus the
 /// BAL and footprint-shadow capture handoffs.
@@ -213,124 +216,10 @@ fn open_transport(args: &Args) -> Result<Transport> {
     })
 }
 
-/// What the reader of one run starts from.
-struct ReaderStart<'a> {
-    /// The runtime of the live `egress_order` frames, with `--egress`.
-    rt: &'a AeronRuntime,
-    state: &'a PreparedState,
-    history: Option<kardamom_engine::reader::carried::LocalHistory>,
-    stop: &'a tokio_util::sync::CancellationToken,
-}
-
-impl<'a> ReaderStart<'a> {
-    fn new(
-        rt: &'a AeronRuntime,
-        state: &'a PreparedState,
-        history: Option<kardamom_engine::reader::carried::LocalHistory>,
-        stop: &'a tokio_util::sync::CancellationToken,
-    ) -> Self {
-        Self {
-            rt,
-            state,
-            history,
-            stop,
-        }
-    }
-
-    /// The one `tx_ordering` subscription, always the Aeron Cluster (Raft)
-    /// egress. The cluster has already deduped and totally ordered the
-    /// stream, and exposes a blocking `next()`, so no async-to-sync bridge is
-    /// needed. Leader failover and reconnect, including crash-recovery replay
-    /// of the canonical stream, are handled inside the cluster client, so the
-    /// reader never sees an image rotation. The subscription's canonical-index
-    /// cursor drops any reconnect overlap. The cluster-session guard (`LiveCluster`) must outlive the executor loop,
-    /// so [`bin_support::LiveStreams`] holds it. It drops only after the
-    /// shutdown wait ends. With `--carry-bytes` the executor reads the member
-    /// feed and opens no cluster session.
-    ///
-    /// The member ingress endpoints come from the catalog when discovery
-    /// lists them, else from the static `[cluster]` section. The executor is
-    /// the chosen emitter of the `kardamom_sealer_*` re-export, on by default
-    /// in the shared subscription.
-    ///
-    /// With `--egress`, the reader of the member feed has the egress as its
-    /// second source. A cursor below the replay window of the member then
-    /// reads the egress, and only a cursor below the floor of the egress too
-    /// ends the run with the refused replay that stages a peer checkpoint.
-    async fn connect(
-        self,
-        boot: &Boot,
-        plane: &mut StreamPlane,
-    ) -> Result<(
-        Option<kardamom_cluster_adapter::LiveCluster>,
-        ExecutorOrdering,
-    )> {
-        let (args, file_cfg) = (&boot.args, &boot.file_cfg);
-        let cursor = bin_support::cluster_replay_cursor(&self.state.start);
-        let aeron_dir = args.aeron_dir.as_deref();
-        if args.carry_bytes {
-            let egress = args
-                .egress
-                .clone()
-                .map(|base| bin_support::open_egress_transport(self.rt, plane, base))
-                .transpose()?;
-            let sub = bin_support::open_member_feed(bin_support::MemberFeed {
-                aeron_dir,
-                cursor,
-                history: self.history,
-                egress,
-                stop: self.stop.clone(),
-            })?;
-            tracing::info!(
-                egress = args.egress.as_deref(),
-                "kardamom-executor: canonical entries via the member feed"
-            );
-            return Ok((None, ExecutorOrdering::Carried(Box::new(sub))));
-        }
-        let mut cluster_cfg = file_cfg.cluster.to_live();
-        if let Some(endpoints) = plane
-            .cluster_ingress_endpoints(self.rt.start_open_limit())
-            .await?
-        {
-            cluster_cfg.ingress_endpoints = endpoints;
-        }
-        let (guard, sub) = bin_support::connect_cluster_ordering(aeron_dir, cluster_cfg, cursor)?;
-        tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");
-        Ok((Some(guard), ExecutorOrdering::Refs(sub)))
-    }
-}
-
-/// The `tx_data` lanes and their join-miss refetch. The member feed carries
-/// the bytes, so with `--carry-bytes` the executor opens no lane and
-/// refetches nothing.
-fn open_lanes(
-    args: &Args,
-    rt: &AeronRuntime,
-    plane: &mut StreamPlane,
-    aeron_cfg: &kardamom_log::config::AeronConfig,
-) -> Result<(
-    Vec<bin_support::LiveTxDataSub>,
-    Option<kardamom_engine::reader::JoinRecoveryFactory>,
-)> {
-    if args.carry_bytes {
-        return Ok((Vec::new(), None));
-    }
-    Ok((
-        bin_support::open_tx_data_subs(rt, plane)?,
-        bin_support::archive_join_recovery(
-            plane,
-            aeron_cfg,
-            args.aeron_dir.as_deref(),
-            args.archive_control_response_endpoint.as_deref(),
-            args.replay_destination_endpoint.as_deref(),
-        ),
-    ))
-}
-
 /// The streams this replica writes besides the BAL: the receipts, the
 /// lifecycle beacon on `events`, and the executor stream.
 struct Outputs {
-    tx_receipts_pub: wiring::LiveTxReceiptsPub,
+    tx_receipts_pub: ReceiptsOut,
     exec_stream: kardamom_executor::exec_stream::ExecStream,
     /// The tee of the canonical frames for the egress, with
     /// `--exec-frames`.
@@ -364,14 +253,12 @@ impl Outputs {
             stop,
             ledger,
         } = cfg;
-        let tx_receipts_pub = wiring::open_tx_receipts_pub(rt_pub, plane, args, ledger).await?;
-        // This replica's lifecycle on the `events` stream: the ingress pauses
-        // submits once every executor is halted.
-        plane
-            .publisher::<ServiceEventsPublisherHandle>(rt_pub)
-            .await
-            .context("open events")?
-            .spawn_process_beacon();
+        let tx_receipts_pub = if args.publish_receipts {
+            Self::open_receipts(rt_pub, plane, args, ledger).await?
+        } else {
+            tracing::info!("kardamom-executor: no receipts and no lifecycle beacon");
+            Either::Right(NoReceipts)
+        };
         let exec_stream = kardamom_executor::exec_stream::ExecStream::open(
             kardamom_executor::exec_stream::ExecStreamConfig {
                 rt_pub,
@@ -393,6 +280,25 @@ impl Outputs {
             exec_stream,
             frames,
         })
+    }
+
+    /// Open the `tx_receipts` publication, and this replica's lifecycle on
+    /// the `events` stream. The ingress pauses submits once every
+    /// executor that serves receipts is halted, so only such an executor
+    /// sends the beacon.
+    async fn open_receipts(
+        rt_pub: &AeronRuntime,
+        plane: &mut StreamPlane,
+        args: &Args,
+        ledger: Option<ReceiptLedger>,
+    ) -> Result<ReceiptsOut> {
+        let live = wiring::open_tx_receipts_pub(rt_pub, plane, args, ledger).await?;
+        plane
+            .publisher::<ServiceEventsPublisherHandle>(rt_pub)
+            .await
+            .context("open events")?
+            .spawn_process_beacon();
+        Ok(Either::Left(live))
     }
 
     /// Open the `exec_frames` publication and its forwarder thread. The
@@ -480,6 +386,7 @@ impl Boot {
         kardamom_executor::exec_stream::ExecStreamMetrics::describe();
         let file_cfg = load_file_config(&args)?;
         let cursor_id = args.recorded_cursor_id()?;
+        args.check_receipts()?;
         tracing::info!(
             lanes = kardamom_types::shard_map::LANE_COUNT,
             chain_id = args.chain_id,
@@ -549,7 +456,7 @@ async fn run() -> Result<()> {
 /// its end, repair a refused replay, and return the verdict. Every
 /// handle, the nonce query server's clone of the state env included, is
 /// gone before the repair parks the state.
-async fn run_once(boot: &Boot, window: std::num::NonZeroU64) -> Result<Verdict> {
+async fn run_once(boot: &Boot, window: std::num::NonZeroU64, source: Source) -> Result<Verdict> {
     let args = &boot.args;
     let Transport {
         aeron_cfg,
@@ -581,7 +488,8 @@ async fn run_once(boot: &Boot, window: std::num::NonZeroU64) -> Result<Verdict> 
     // stay live always: the reader's join-miss refetch recovers any
     // down-window or lapse gap in-band, against the remote durability
     // archives.
-    let (tx_data_subs, join_recovery) = open_lanes(args, &rt, &mut plane, &aeron_cfg)?;
+    let reader = ReaderStart::new(&rt, &prepared, history, &shutdown, source);
+    let (tx_data_subs, join_recovery) = reader.open_lanes(boot, &mut plane, &aeron_cfg)?;
 
     let outputs = Outputs::open(OutputsConfig {
         args,
@@ -594,7 +502,6 @@ async fn run_once(boot: &Boot, window: std::num::NonZeroU64) -> Result<Verdict> 
     .await?;
     let exec_stream_threads = outputs.exec_stream.threads;
 
-    let reader = ReaderStart::new(&rt, &prepared, history, &shutdown);
     let (cluster_guard, tx_ordering_sub) = reader.connect(boot, &mut plane).await?;
     let tx_ordering_sub = tx_ordering_sub.with_tee(outputs.frames);
     let PreparedState {
@@ -695,6 +602,7 @@ async fn run_once(boot: &Boot, window: std::num::NonZeroU64) -> Result<Verdict> 
         ledger,
         checkpointer,
         expected_genesis,
+        source,
     })
     .await
 }

@@ -115,7 +115,7 @@ Each service publishes its lifecycle state on the `events` stream. The stream gi
 | Sealer `sealer_no_quorum` | The ingress sets the root after 10 s with no status frame. It pauses submits. The sequencer pauses after 10 s with no boundary. Its publish loop offers nothing until a boundary returns. After a status with the snapshot notice, both wait 60 s: a Raft snapshot stops the frames until it is complete. |
 | Sealer `da_lag` | The ingress pauses submits. Deposits and boundaries continue. |
 | Sealer `record_lag` | The ingress pauses submits. Deposits and boundaries continue. |
-| Every executor halted | The ingress pauses submits. |
+| Every executor halted | The ingress pauses submits. An executor with `--publish-receipts false` sends no lifecycle record, so it does not count. |
 | Validator `validator_divergence` | The attester pauses while any live validator is halted on this cause. |
 | Batcher halted | The chain status shows `batcher_halted`. |
 | da-watcher halted | The chain status shows `deposits_delayed`. |
@@ -510,6 +510,13 @@ The executors are deterministic state machines. One dead or lagging replica neve
     - A cursor below the floor of the egress store too (`410`) ends the run with the refusal. The executor then repairs itself with peer state, as below, at or above the lower floor.
     - While the egress does not answer, the executor fetches no peer checkpoint. It tries the feed and the egress again.
     - Proof: the unit tests `a_cursor_below_the_window_recovers_from_the_egress` and `a_cursor_below_the_floor_of_the_egress_goes_to_a_peer_checkpoint`.
+  - Recovery with `--egress` on an executor that reads the cluster egress (no `--carry-bytes`): the next run reads the egress.
+    - The sealer refuses the cursor, and the run ends. The executor moves no checkpoint. `kardamom_executor_resync_total{outcome="egress"}` counts the refusal.
+    - The next run opens no cluster session and no `tx_data` lane. It reads the range read of the egress from its cursor, and ends at the head of the store.
+    - The run after it reads the cluster egress again from the state DB, after the restart pause. A cursor that the sealer refuses again repeats the steps.
+    - A cursor below the floor of the egress store too ends the egress run with the refusal. The executor then repairs itself with peer state, as below.
+    - The checkpoint executor of the backup machine uses this path: it has no member on its machine, and no peer makes a newer checkpoint.
+    - Proof: `a_refused_cursor_reads_the_egress_up_to_its_head_then_the_cluster_again` (`crates/executor/tests/carry_move.rs`) and `a_reader_up_to_the_head_delivers_the_range_and_ends_at_the_head`.
   - Recovery: the executor repairs itself with peer state.
     - Each replica serves its newest checkpoint over `--checkpoint-serve-addr` (`:9014`).
     - A node that hits the refusal, or cold-starts with no checkpoint, fetches the newest qualifying peer checkpoint (`--checkpoint-peers`).
@@ -529,6 +536,12 @@ The executors are deterministic state machines. One dead or lagging replica neve
   - The clock runs only while discovery lists a subscriber of the stream. Every discovered subscription registers a `kardamom-mdc-subscriber` record (see [aeron-discovery.md](aeron-discovery.md#service-records)), and the executor watches the records of `tx_receipts`. Without one, a `NOT_CONNECTED` publish retries without a bound, as before: at a cluster bootstrap where the executor comes up before any ingress, and while an ingress pair is down, there is nothing to reopen for, and an exit would restart the executor against the same empty stream. A static plane names its subscribers in its config, so it always counts one.
   - The alert is `KardamomPublicationNotConnected`.
   - Proof: `executor-restart-storm` (the nightly `chaos-integrity` shard) stops and restores the executor job ten times under load. Every round, every executor must advance within the convergence SLO. The unit tests of the escalation clock prove the thresholds, the one reopen, and the exit after the total.
+- **Executor with `--publish-receipts false`** (`KARDAMOM_PUBLISH_RECEIPTS`, on by default)
+  - Use: an executor that only makes checkpoints. It can lag, and a late copy of a receipt can fall outside the dedup window of the readers (`tx_receipts_executor_count`).
+  - Effect: the executor opens no `tx_receipts` publication. No receipt, account row, block boundary or rollback record leaves it. It sends no lifecycle record on `events`, so the ingress halt gate counts only the executors that serve receipts.
+  - It still executes and commits every block, and it publishes its BAL on `tx_bal`. The validator compares that BAL with its own result, so a divergence of this executor still shows.
+  - The executor refuses to start with `--carry-bytes`: the receipt ledger of a carry executor records the published receipts.
+  - Proof: `an_executor_with_the_receipts_off_publishes_nothing`.
 - **Wedged executor**
   - Trigger: the block gauge of an executor is flat while the sealer boundaries keep advancing.
   - Effect: this contrast is the FROZEN verdict of the load harness. It tells a wedged replica from a quiescent chain. Absolute progress does not.

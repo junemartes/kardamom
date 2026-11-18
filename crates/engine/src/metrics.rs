@@ -81,8 +81,9 @@ pub(crate) const TX_DATA_QUEUE_DEPTH: &str = "kardamom_executor_tx_data_queue_de
 
 // Full-resync fallback, for a replay-window overrun. The executor binary
 // bumps this when the cluster refuses REPLAY_FROM (`REPLAY_UNAVAILABLE`) and
-// the node repairs itself with a peer checkpoint, or fails to repair itself.
-// The label is `outcome=peer-checkpoint` or `outcome=unrecoverable`. This
+// the node repairs itself with a peer checkpoint, fails to repair itself, or
+// reads the range read of the egress in the next run. The label is
+// `outcome=peer-checkpoint`, `outcome=unrecoverable`, or `outcome=egress`. This
 // event is rare by design. Any non-zero rate is worth an alert. It means a
 // node fell behind the retention window.
 pub const RESYNC_TOTAL: &str = "kardamom_executor_resync_total";

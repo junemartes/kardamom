@@ -1,5 +1,6 @@
 //! Role-specific adapters and construction: the executor's `EngineWiring`,
-//! the live `tx_receipts` publication, and the opt-in Block-STM strategy.
+//! the live `tx_receipts` publication or its absence, and the opt-in
+//! Block-STM strategy.
 
 use std::num::NonZeroUsize;
 
@@ -10,7 +11,7 @@ use kardamom_engine::reader::cluster::RecordedCursorPublisher;
 use kardamom_engine::reader::{FrameTee, Ordered};
 use kardamom_engine::{BPosition, TxOrderingSubscription};
 use kardamom_engine::{
-    CMessage, EngineWiring, ExecPorts, ExecutorError, MdbxSnapshotSource, MdbxWriterQueue,
+    CMessage, Either, EngineWiring, ExecPorts, ExecutorError, MdbxSnapshotSource, MdbxWriterQueue,
     MdbxWriterSignal, NoEpochCheck, NoRemoteEpochCheck, NoTxHook, TxReceiptsPublication,
 };
 use kardamom_executor::parallel::StmBlockExec;
@@ -21,6 +22,9 @@ use kardamom_types::VoidRecord;
 
 use crate::args::Args;
 use crate::ledger::ReceiptLedger;
+
+/// The receipt output of this executor: the live publication, or none.
+pub(crate) type ReceiptsOut = Either<LiveTxReceiptsPub, NoReceipts>;
 
 /// `tx_receipts` publication: the receipt stream and the boundary
 /// side-stream, opened through the stream plane. With discovery, this
@@ -115,7 +119,7 @@ impl ExecPorts for ExecutorWiring {
 impl EngineWiring for ExecutorWiring {
     type TxData = bin_support::LiveTxDataSub;
     type TxOrdering = ExecutorOrdering;
-    type TxReceipts = LiveTxReceiptsPub;
+    type TxReceipts = ReceiptsOut;
     type ExecStream = crossbeam_channel::Sender<kardamom_engine::ExecStreamItem>;
 }
 
@@ -127,6 +131,10 @@ pub(crate) enum ExecutorOrdering {
     /// The entries with their bytes, from the member feed. It is boxed: it
     /// is far larger than the reference subscription.
     Carried(Box<bin_support::LiveCarriedSub>),
+    /// The entries with their bytes, from the range read of the egress up
+    /// to its head, for a cursor that the sealer refused below its window.
+    /// It is boxed for the same reason.
+    Egress(Box<bin_support::LiveEgressSub>),
 }
 
 impl ExecutorOrdering {
@@ -138,7 +146,7 @@ impl ExecutorOrdering {
     ) -> Option<RecordedCursorPublisher<LiveIngress>> {
         match self {
             Self::Refs(sub) => Some(sub.recorded_cursor_publisher(executor_id)),
-            Self::Carried(_) => None,
+            Self::Carried(_) | Self::Egress(_) => None,
         }
     }
 }
@@ -153,6 +161,7 @@ impl ExecutorOrdering {
         match self {
             Self::Refs(sub) => Self::Refs(sub.with_tee(tee)),
             Self::Carried(sub) => Self::Carried(Box::new(sub.with_tee(tee))),
+            Self::Egress(sub) => Self::Egress(Box::new(sub.with_tee(tee))),
         }
     }
 }
@@ -162,16 +171,42 @@ impl TxOrderingSubscription for ExecutorOrdering {
         match self {
             Self::Refs(sub) => sub.next(),
             Self::Carried(sub) => sub.next(),
+            Self::Egress(sub) => sub.next(),
         }
     }
 
-    /// Only the reference stream has entries to void. The carried stream
-    /// has no join, so it never votes.
+    /// Only the reference stream has entries to void. The carried streams
+    /// have no join, so they never vote.
     fn vote(&mut self, voter_id: u8, void: &VoidRecord) -> OfferOutcome {
         match self {
             Self::Refs(sub) => sub.vote(voter_id, void),
-            Self::Carried(_) => OfferOutcome::NotConnected,
+            Self::Carried(_) | Self::Egress(_) => OfferOutcome::NotConnected,
         }
+    }
+}
+
+/// The receipt output of an executor with `--publish-receipts false`: no
+/// publication. Every item counts as delivered, so the commit thread never
+/// waits on it, and nothing leaves the process.
+pub(crate) struct NoReceipts;
+
+impl TxReceiptsPublication for NoReceipts {
+    fn publish(&mut self, _msg: CMessage) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
+    fn publish_receipts(
+        &mut self,
+        items: &[kardamom_types::ReceiptRows],
+    ) -> (usize, Option<ExecutorError>) {
+        (items.len(), None)
+    }
+
+    fn publish_rollback(
+        &mut self,
+        _rollback: kardamom_types::ReceiptRollback,
+    ) -> Result<(), ExecutorError> {
+        Ok(())
     }
 }
 
@@ -309,3 +344,7 @@ impl TxReceiptsPublication for LiveTxReceiptsPub {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "wiring_tests.rs"]
+mod tests;
