@@ -11,8 +11,10 @@
 //! the block cursor, because genesis is "block 0". `last_committed_block`
 //! stays 0 until the first real block commits.
 
+use std::path::Path;
+
 use alloy_primitives::{B256, keccak256};
-use kardamom_types::{AccountChange, GenesisAlloc, StorageChange};
+use kardamom_types::{AccountChange, Genesis, GenesisAlloc, StorageChange};
 use signet_libmdbx::WriteFlags;
 
 use crate::env::StateEnv;
@@ -57,6 +59,27 @@ pub fn genesis_digest(alloc: &GenesisAlloc) -> B256 {
         buf.extend_from_slice(&w.value.to_be_bytes::<32>());
     }
     keccak256(&buf)
+}
+
+/// Load a genesis TOML, and run its semantic validation: `chain_id` must
+/// not be 0, and alloc addresses must not repeat.
+///
+/// # Errors
+///
+/// Returns [`StateError::GenesisFile`] when the file does not read, parse,
+/// or validate.
+pub fn load_genesis(path: &Path) -> Result<Genesis, StateError> {
+    let fail = |step: &'static str, detail: String| StateError::GenesisFile {
+        path: path.display().to_string(),
+        step,
+        detail,
+    };
+    let raw = std::fs::read_to_string(path).map_err(|e| fail("read", e.to_string()))?;
+    let genesis: Genesis = toml::from_str(&raw).map_err(|e| fail("parse", e.to_string()))?;
+    genesis
+        .validate()
+        .map_err(|e| fail("validate", e.to_string()))?;
+    Ok(genesis)
 }
 
 /// Returns true if genesis has already been seeded into this env. This

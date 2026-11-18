@@ -1524,6 +1524,12 @@ Redis is a cache with no persistence. The state of the executors is the truth. T
   - Recovery: each mirror rebuilds the projection from the newest checkpoint of its executor. The mirror head advances again. The projection holds the accounts of the checkpoint, not only the live rows.
   - Proof: `mirror-kill-rebuild`. The case counts `rebuild: done` lines in the `state-mirror` job log. It does not use the rebuild counter, because a new process starts that counter at zero.
 - A state mirror waits for Redis at start. It retries the connection every 2 s. A missing address or an unset password variable still ends the start at once.
+- A state mirror with `--checkpoint-peers` (`KARDAMOM_CHECKPOINT_PEERS`) also takes the checkpoints of its peers for a rebuild. The switch is off by default.
+  - Each rebuild attempt fetches the newest peer checkpoint, and the block log after it, into `peer-checkpoints` in the mirror directory. It then restores the newest restore point of that copy and of the executor directory.
+  - The order does not change the result. Every source is a verified checkpoint of the chain, and a checkpoint below the first live batch is refused from any source.
+  - The fetch verifies the image keccak, the schema, and the genesis digest of `--chain` (`KARDAMOM_CHAIN`), which the switch requires. A refused image never becomes visible, and the rebuild waits for the next attempt.
+  - The mirror never writes to the checkpoint directory of its executor. A done rebuild removes the fetched copy.
+  - Without the switch, the rebuild reads the executor directory only.
 - The readers ask every sentinel for the primary and keep the first connection that a primary accepts.
 - A sentinel keeps the config that Sentinel rewrote (it holds `sentinel myid`) across a restart in place: its id, the config epoch and the current primary. So a restarted sentinel does not count as a new sentinel, and it follows the last failover. A sentinel without a rewritten config starts from the seed.
 - Known gap: a sentinel in a new allocation gets a new id. The other sentinels keep the old id as a known sentinel and never drop it. A failover needs the votes of a majority of all known sentinels. With one stale id, a failover needs all three live sentinels. With three stale ids, no failover can win. The remedy is `SENTINEL RESET kardamom` on each sentinel, one at a time, after the reschedule.

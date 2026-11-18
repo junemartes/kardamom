@@ -6,10 +6,11 @@
 //! the same values; the rule makes the order irrelevant.
 //!
 //! On start the mirror decides whether Redis can be resumed or must be
-//! rebuilt. A rebuild scans the co-located executor's newest checkpoint
-//! and never replays history: the mirror subscribes first, then waits
-//! for a checkpoint at or beyond the first live position, then scans.
-//! Live rows after the checkpoint win by position.
+//! rebuilt. A rebuild scans the newest checkpoint of the co-located
+//! executor, or of a checkpoint peer with `--checkpoint-peers`, and never
+//! replays history: the mirror subscribes first, then waits for a
+//! checkpoint at or beyond the first live position, then scans. Live rows
+//! after the checkpoint win by position.
 //!
 //! Structure: the CLI in this file, the actor in [`mirror`], the rebuild
 //! in [`rebuild`], the local head file in [`head`].
@@ -34,7 +35,7 @@ use kardamom_obs::bin::wait_for_shutdown;
 
 use head::HeadFile;
 use mirror::{Mirror, MirrorInputs};
-use rebuild::Rebuild;
+use rebuild::{PeerFetch, Rebuild};
 
 /// How long the mirror waits between connection attempts at start. The
 /// sentinels can name no primary for minutes after a failover, and an
@@ -80,14 +81,32 @@ struct Args {
         default_value = "/opt/kardamom/checkpoints"
     )]
     checkpoints_dir: PathBuf,
-    /// This mirror's own directory: the local head file and the rebuild
-    /// scratch copy of a checkpoint.
+    /// This mirror's own directory: the local head file, the rebuild
+    /// scratch copy of a checkpoint, and the checkpoints fetched from the
+    /// peers (`peer-checkpoints`).
     #[arg(
         long,
         env = "KARDAMOM_MIRROR_DIR",
         default_value = "/opt/kardamom/mirror"
     )]
     mirror_dir: PathBuf,
+    /// Comma-separated executor checkpoint servers (`host:port`). A
+    /// rebuild fetches the newest checkpoint of these peers into the
+    /// mirror directory. It then restores the newest of that copy and the
+    /// checkpoints of `--checkpoints-dir`. Empty: the rebuild reads
+    /// `--checkpoints-dir` only. Requires `--chain`.
+    #[arg(
+        long,
+        env = "KARDAMOM_CHECKPOINT_PEERS",
+        value_delimiter = ',',
+        requires = "chain"
+    )]
+    checkpoint_peers: Vec<String>,
+    /// The genesis TOML of the chain (schema: `kardamom_types::Genesis`).
+    /// With `--checkpoint-peers`, a rebuild refuses a checkpoint of
+    /// another genesis. Ignored without `--checkpoint-peers`.
+    #[arg(long, env = "KARDAMOM_CHAIN")]
+    chain: Option<PathBuf>,
     /// Force a rebuild on this start.
     #[arg(long, env = "KARDAMOM_MIRROR_REBUILD", default_value_t = false)]
     rebuild: bool,
@@ -100,6 +119,23 @@ struct Args {
     /// Host identifier. Stamped on every metric.
     #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
     host_id: String,
+}
+
+impl Args {
+    /// The checkpoint peers of a rebuild, when the flags name any.
+    fn peer_fetch(&self) -> Result<Option<PeerFetch>> {
+        self.chain
+            .as_deref()
+            .filter(|_| !self.checkpoint_peers.is_empty())
+            .map(|chain| {
+                PeerFetch::new(
+                    self.checkpoint_peers.clone(),
+                    chain,
+                    self.mirror_dir.join("peer-checkpoints"),
+                )
+            })
+            .transpose()
+    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -145,6 +181,7 @@ async fn main() -> Result<()> {
         .context("open tx_receipts")?
         .into_receiver();
     let shutdown = plane.cancellation().child_token();
+    let peers = args.peer_fetch()?;
 
     let mirror = Mirror::new(MirrorInputs {
         cache,
@@ -152,12 +189,17 @@ async fn main() -> Result<()> {
         id: args.mirror_id,
         head_count: executor_count.map_or(1, NonZeroU32::get),
         head: HeadFile::new(args.mirror_dir.join("head")),
-        rebuild: Rebuild::new(args.checkpoints_dir, args.mirror_dir.join("rebuild")),
+        rebuild: Rebuild::new(args.checkpoints_dir, args.mirror_dir.join("rebuild"))
+            .with_peers(peers),
         force_rebuild: args.rebuild,
         audit_hours: args.audit_hours,
         shutdown: shutdown.clone(),
     });
-    tracing::info!(id = args.mirror_id, "kardamom-state-mirror starting");
+    tracing::info!(
+        id = args.mirror_id,
+        checkpoint_peers = args.checkpoint_peers.len(),
+        "kardamom-state-mirror starting"
+    );
     let task = tokio::spawn(mirror.run());
 
     wait_for_shutdown().await;
@@ -167,4 +209,28 @@ async fn main() -> Result<()> {
     plane.shutdown().await;
     drop(rt);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Args;
+
+    /// A peer list without the genesis of the chain cannot verify an
+    /// image, so the CLI refuses it.
+    #[test]
+    fn checkpoint_peers_require_the_chain() {
+        let peers = [
+            "kardamom-state-mirror",
+            "--config",
+            "mirror.toml",
+            "--checkpoint-peers",
+            "a:9014,b:9014",
+        ];
+        assert!(Args::try_parse_from(peers).is_err());
+        let args =
+            Args::try_parse_from(peers.into_iter().chain(["--chain", "genesis.toml"])).unwrap();
+        assert_eq!(args.checkpoint_peers, ["a:9014", "b:9014"]);
+    }
 }

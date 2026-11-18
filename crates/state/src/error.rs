@@ -69,6 +69,12 @@ pub enum StateError {
         stored: alloy_primitives::B256,
         supplied: alloy_primitives::B256,
     },
+    #[error("{step} genesis TOML {path}: {detail}")]
+    GenesisFile {
+        path: String,
+        step: &'static str,
+        detail: String,
+    },
     #[error(
         "trie shadow-check mismatch at block {block}: incremental {incremental} != rebuilt {rebuilt}"
     )]
