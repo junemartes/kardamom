@@ -30,7 +30,7 @@ pub use checkpoint_transfer::{CheckpointServer, fetch_best_checkpoint, serve_che
 pub use compaction::compact_to;
 pub use env::{Durability, StateEnv, StateEnvBuilder};
 pub use error::{NoRefsCause, StateError};
-pub use genesis::{genesis_applied, genesis_digest, seed_genesis};
+pub use genesis::{genesis_applied, genesis_digest, load_genesis, seed_genesis};
 pub use integrity::{IntegrityReport, deep_compare, deep_compare_to, sweep};
 pub use nonce_query::{
     CommittedAccount, CommittedReceipt, CommittedRefs, NonceQueryServer, committed_account,

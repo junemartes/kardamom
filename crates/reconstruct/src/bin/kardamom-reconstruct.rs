@@ -268,9 +268,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let cli = Cli::parse();
 
-    let raw = std::fs::read_to_string(&cli.chain).context("read genesis TOML")?;
-    let genesis: kardamom_types::Genesis = toml::from_str(&raw).context("parse genesis TOML")?;
-    genesis.validate().context("validate genesis")?;
+    let genesis = kardamom_state::load_genesis(&cli.chain)?;
     let replay_genesis = kardamom_engine::ReplayGenesis::of(&genesis);
 
     let provider = ProviderBuilder::new()

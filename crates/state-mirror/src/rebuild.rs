@@ -1,5 +1,5 @@
-//! The rebuild: scan the co-located executor's newest checkpoint into
-//! Redis, tagged with the last included transaction position.
+//! The rebuild: scan the newest checkpoint into Redis, tagged with the
+//! last included transaction position.
 //!
 //! The mirror is already subscribed and applying live batches when this
 //! runs, so nothing is replayed. The rebuild waits for a checkpoint whose
@@ -7,9 +7,20 @@
 //! the mirror's scratch directory (never the live env), opens it read
 //! only, and streams the accounts table to Redis in chunks. A live row
 //! for the same account wins by position.
+//!
+//! The checkpoints come from the directory of the co-located executor.
+//! The mirror reads that directory and never writes to it. With checkpoint
+//! peers ([`PeerFetch`]), each attempt first fetches the newest peer
+//! checkpoint into a directory that the mirror owns. The attempt then
+//! restores the newest restore point of the two directories. The order
+//! does not change the result: every source is a verified checkpoint of
+//! the same chain, and a checkpoint that does not reach the first live
+//! position is refused, whatever its source. The order changes only the
+//! wait, and the newest point waits least. Without peers, the rebuild
+//! reads the local directory only.
 
 use std::ops::ControlFlow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -21,6 +32,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+pub(crate) use peers::PeerFetch;
+
+mod peers;
+
 /// Rows per Redis pipeline during a scan.
 const CHUNK: usize = 512;
 /// How long to wait between checks for a new checkpoint. The executor
@@ -29,11 +44,28 @@ const CHECKPOINT_POLL: Duration = Duration::from_secs(5);
 /// How long to wait after a failed Redis write before the retry.
 const WRITE_RETRY: Duration = Duration::from_millis(200);
 
-/// The rebuild inputs: where the checkpoints are, and where to restore.
+/// The rebuild inputs: where the checkpoints are, the optional peers to
+/// fetch them from, and where to restore.
 #[derive(Clone)]
 pub(crate) struct Rebuild {
     checkpoints_dir: PathBuf,
+    peers: Option<PeerFetch>,
     scratch: PathBuf,
+}
+
+/// The newest restore point of one checkpoint directory.
+struct Newest {
+    dir: PathBuf,
+    point: RestorePoint,
+}
+
+impl Newest {
+    fn of(dir: &Path) -> Result<Option<Self>> {
+        Ok(RestorePoint::newest(dir)?.map(|point| Self {
+            dir: dir.to_path_buf(),
+            point,
+        }))
+    }
 }
 
 /// The restore point a rebuild already restored. A restore copies and
@@ -84,8 +116,15 @@ impl Rebuild {
     pub(crate) fn new(checkpoints_dir: PathBuf, scratch: PathBuf) -> Self {
         Self {
             checkpoints_dir,
+            peers: None,
             scratch,
         }
+    }
+
+    /// Fetch the checkpoints of `peers` too. `None` keeps the local
+    /// directory as the only source.
+    pub(crate) fn with_peers(self, peers: Option<PeerFetch>) -> Self {
+        Self { peers, ..self }
     }
 
     /// Run one rebuild. `first_live` is the first live batch end this
@@ -110,7 +149,7 @@ impl Rebuild {
         let written = write_chunks(cache, end, rx, shutdown).await;
         scan.await.context("join the scan")??;
         let written = written?;
-        let _ = std::fs::remove_dir_all(&self.scratch);
+        self.clear();
         info!(
             rows = written,
             seconds = started.elapsed().as_secs_f64(),
@@ -135,28 +174,60 @@ impl Rebuild {
         }
     }
 
-    /// One attempt at the newest checkpoint, on a blocking thread. The
-    /// restore copies and hashes the whole image, so it must not run on
-    /// an async worker. A restore point this rebuild already restored is
-    /// skipped: only a newer base, or more log after the same base, can
-    /// carry the first live batch.
+    /// Remove the scratch copy and the fetched checkpoints. Only the
+    /// rebuild reads them.
+    fn clear(&self) {
+        let fetched = self.peers.as_ref().map(PeerFetch::dir);
+        std::iter::once(self.scratch.as_path())
+            .chain(fetched)
+            .for_each(|dir| {
+                let _ = std::fs::remove_dir_all(dir);
+            });
+    }
+
+    /// One attempt at the newest checkpoint, on blocking threads. The
+    /// peer fetch and the restore copy and hash the whole image, so they
+    /// must not run on an async worker. A restore point this rebuild
+    /// already restored is skipped: only a newer base, or more log after
+    /// the same base, can carry the first live batch.
     async fn try_newest(
         &self,
         first_live: BPosition,
         tried: &mut TriedCheckpoint,
     ) -> Result<Option<RebuildSnapshot>> {
-        let Some(newest) = RestorePoint::newest(&self.checkpoints_dir)? else {
+        let this = self.clone();
+        let newest = tokio::task::spawn_blocking(move || this.newest())
+            .await
+            .context("join the checkpoint lookup")??;
+        let Some(newest) = newest else {
             warn!(dir = %self.checkpoints_dir.display(), "rebuild: no checkpoint yet");
             return Ok(None);
         };
-        if !tried.is_new(newest) {
+        if !tried.is_new(newest.point) {
             return Ok(None);
         }
-        tried.mark(newest);
+        tried.mark(newest.point);
         let this = self.clone();
-        tokio::task::spawn_blocking(move || this.open_newest(newest.base, first_live))
+        tokio::task::spawn_blocking(move || this.open_newest(&newest, first_live))
             .await
             .context("join the checkpoint restore")?
+    }
+
+    /// The newest restore point of the sources. With peers, the newest
+    /// peer checkpoint is fetched first. `max_by_key` keeps the last of
+    /// equal keys, so a tie restores the copy of the executor. Runs on a
+    /// blocking thread.
+    fn newest(&self) -> Result<Option<Newest>> {
+        let fetched = self.peers.as_ref().map(PeerFetch::fetch);
+        let found = fetched
+            .into_iter()
+            .chain(std::iter::once(self.checkpoints_dir.as_path()))
+            .map(Newest::of)
+            .filter_map(Result::transpose)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(found
+            .into_iter()
+            .max_by_key(|n| (n.point.base, n.point.log_bytes)))
     }
 
     /// The newest checkpoint as a read-only snapshot, when it reaches
@@ -166,9 +237,15 @@ impl Rebuild {
     /// This reads the executor's directory and never writes to it. The
     /// executor prunes its old checkpoints, so one can vanish between
     /// the listing and the read; `restore_newest_readable` skips such a
-    /// checkpoint instead of renaming it out of the executor's way.
-    fn open_newest(&self, newest: u64, first_live: BPosition) -> Result<Option<RebuildSnapshot>> {
-        let restored = restore_newest_readable(&self.checkpoints_dir, &self.scratch, None)?;
+    /// checkpoint instead of renaming it out of the executor's way. With
+    /// peers, the restore also refuses an image of another genesis.
+    fn open_newest(
+        &self,
+        newest: &Newest,
+        first_live: BPosition,
+    ) -> Result<Option<RebuildSnapshot>> {
+        let genesis = self.peers.as_ref().map(PeerFetch::genesis);
+        let restored = restore_newest_readable(&newest.dir, &self.scratch, genesis)?;
         let Some((block, _)) = restored else {
             warn!("rebuild: no restorable checkpoint");
             return Ok(None);
@@ -183,7 +260,8 @@ impl Rebuild {
             info!(
                 block,
                 first_live = first_live.as_index(),
-                "rebuild: newest checkpoint {newest} is behind the first live batch; waiting"
+                "rebuild: newest checkpoint {} is behind the first live batch; waiting",
+                newest.point.base
             );
         }
         Ok(restored)
@@ -258,6 +336,8 @@ async fn write_chunk(
     }
 }
 
+#[cfg(test)]
+mod peer_tests;
 #[cfg(test)]
 mod regression_tests;
 

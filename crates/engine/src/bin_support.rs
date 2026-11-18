@@ -45,15 +45,6 @@ impl From<StateDurabilityArg> for Durability {
     }
 }
 
-/// Load a kardamom genesis TOML, and run its semantic validation:
-/// `chain_id` must not be 0, and alloc addresses must not repeat.
-fn load_genesis(path: &Path) -> Result<kardamom_types::Genesis> {
-    let raw = std::fs::read_to_string(path).context("read genesis TOML")?;
-    let genesis: kardamom_types::Genesis = toml::from_str(&raw).context("parse genesis TOML")?;
-    genesis.validate().context("validate genesis")?;
-    Ok(genesis)
-}
-
 /// Resolve the effective genesis and chain id from the `--chain` and
 /// `--chain-id` flags. If a genesis file is present, its chain id applies,
 /// and it must agree with an explicit `--chain-id`.
@@ -69,7 +60,7 @@ pub fn resolve_genesis(
     chain_id_flag: u64,
 ) -> Result<(Option<kardamom_types::Genesis>, std::num::NonZeroU64)> {
     let genesis = match chain {
-        Some(path) => Some(load_genesis(path)?),
+        Some(path) => Some(kardamom_state::load_genesis(path)?),
         None => None,
     };
     let chain_id = genesis.as_ref().map_or(chain_id_flag, |g| g.chain_id);

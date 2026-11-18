@@ -42,6 +42,8 @@ rkyv.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# `load_genesis`: the genesis TOML of a node.
+toml.workspace = true
 # Checkpoint peer server (`checkpoint_transfer`): tokio listener + per-connection tasks.
 tokio = { workspace = true, features = ["net", "rt", "io-util", "macros", "time", "fs", "sync"] }
 tracing.workspace = true

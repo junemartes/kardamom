@@ -7,8 +7,8 @@ publish = false
 
 # The state mirror: subscribes to `tx_receipts` on an executor node and
 # projects every batch's account rows and receipts into Redis, through
-# the monotone write rule. It rebuilds the projection from the executor's
-# newest checkpoint when it cannot resume. See
+# the monotone write rule. It rebuilds the projection from the newest
+# checkpoint of the executor, or of a checkpoint peer, when it cannot resume. See
 # docs/specs/2026-09-13-redis-account-cache-design.md.
 
 [[bin]]
@@ -19,6 +19,7 @@ path = "src/main.rs"
 docker-e2e = ["kardamom-cache/docker-e2e", "kardamom-log/testing"]
 
 [dependencies]
+alloy-primitives = { workspace = true }
 kardamom-cache = { workspace = true }
 kardamom-log = { workspace = true }
 kardamom-state = { path = "../state" }
@@ -34,7 +35,6 @@ toml = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-alloy-primitives = { workspace = true }
 tempfile = { workspace = true }
 redis = { workspace = true }
 testcontainers = { workspace = true }
