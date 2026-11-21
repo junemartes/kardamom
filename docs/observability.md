@@ -386,7 +386,7 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
 - `kardamom_sequencer_receipt_floors_forgotten_total` counts the nonce floors that a rollback of an executor reset to unknown.
 - `validator_replica_results_unchecked_total{reason="withdrawn"}` counts the buffered receipts, rows and BALs that a rollback of an executor withdrew.
 - `kardamom_checkpoint_log_dropped_total` counts the committed blocks that the state writer did not give to the block log of the checkpoints, because the queue to the log thread was full. Each one is a gap in the log.
-- `kardamom_checkpoint_log_failed_total{step}` counts the appends and syncs of the block log that failed (`step` is `append` or `sync`). The next block then starts a new segment.
+- `kardamom_checkpoint_log_failed_total{step}` counts the appends, flushes and syncs of the block log that failed (`step` is `append`, `flush` or `sync`). The next block then starts a new segment.
 - `kardamom_checkpoint_copy_unlimited_total` counts the base copies that libmdbx refused into the pipe of the rate limit. Such a copy then ran with no limit.
 - `kardamom_checkpoint_unreadable_schema_skips_total` counts the checkpoints an executor, a validator or a state mirror skipped because the image holds a state schema the release does not read.
   - An increment after a rollback is expected: the newest checkpoint comes from the newer release.
@@ -498,19 +498,19 @@ Each executor exports these metrics for its executor stream (`exec_txs`). See "T
 
 Each executor with `--checkpoint-dir` shows the newest restore point of its checkpoint directory. A restore reaches that point.
 
-- The point is the end of the block log when the log continues the newest base with no gap.
-- Otherwise the point is the newest base.
+- The point is the last block of the block log after the newest base, up to the first gap of the log.
+- With no log block after the base, the point is the newest base.
 
 | Metric | Meaning |
 | --- | --- |
 | `kardamom_checkpoint_newest_block` | The last block that a restore of the newest checkpoint reaches: the block of the newest base, or the last block of the block log after it. |
-| `kardamom_checkpoint_newest_timestamp_seconds` | The unix time, in seconds, at which the directory got that block. For a base, it is the modification time of the base. For the log, it is the time of the sync that made the block durable. Compute the age as `time() - kardamom_checkpoint_newest_timestamp_seconds`, so the age also grows while the process is down. |
+| `kardamom_checkpoint_newest_timestamp_seconds` | The unix time, in seconds, at which the directory got that block. For a base, it is the modification time of the base. For a log block that the log thread synced, it is the time of that sync. For any other log block, it is the time of the base, which is older than the true time. Compute the age as `time() - kardamom_checkpoint_newest_timestamp_seconds`, so the age also grows while the process is down. |
 
 - The executor sets the two gauges at each start from the disk, so a restart shows an old checkpoint as old.
   - With the block log, the log thread sets them after each sync (once a second). At its start, it takes the time of the last write to the log on disk.
   - With no block log, each checkpoint round sets them.
 - A process with no base exports no sample. A base that a restore fetched from a peer shows the time of the fetch.
-- The gap rule is the rule of a new base. A log segment that ended before it was full, and that another segment follows, ended at a gap. Then the gauges show the base.
+- The reach is the reach of `RestorePoint` that the state mirror also reads. It reads the record heads of the log, and no image.
 - A hot executor in the restore-only mode (`--checkpoint-interval-secs 0`, no block log) makes no checkpoint.
   - It shows the newest base that it holds and serves to its peers. That is a base that it fetched, or one that it made before the switch.
   - The value changes only at a start, and its age grows. No alert reads it.

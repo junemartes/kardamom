@@ -2866,6 +2866,8 @@ class CarryTest(Deploys):
         self.assertEqual(args[args.index('--publish-receipts') + 1], 'false')
         self.assertEqual(args[args.index('--egress') + 1], DeployTest.EGRESS_URL)
         self.assertEqual(args[args.index('--checkpoint-interval-secs') + 1], '20')
+        # A base of the checkpoint executor is a compacted copy with no rate limit.
+        self.assertEqual(args[args.index('--checkpoint-copy-mib-per-sec') + 1], '0')
         self.assertEqual({'--void-voter-id', '--nonce-query-addr', '--carry-bytes', '--exec-frames'} & set(args),
                          set())
         self.assertEqual({k: task['Env'][k] for k in ('KARDAMOM_HOST_ID', 'KARDAMOM_EXEC_CURSOR',
@@ -2886,7 +2888,7 @@ class CarryTest(Deploys):
             self.assertEqual(hot['Update']['HealthCheck'], 'checks')
             self.assertEqual(args[args.index('--checkpoint-interval-secs') + 1], '20')
             self.assertEqual(args[args.index('--checkpoint-peers') + 1], peers)
-            self.assertEqual({'--publish-receipts', '--egress'} & set(args), set())
+            self.assertEqual({'--publish-receipts', '--egress', '--checkpoint-copy-mib-per-sec'} & set(args), set())
             self.assertIn('--exec-frames', args)
             self.assertEqual(hot['Tasks'][0]['Env']['KARDAMOM_EXEC_CURSOR'], 'true')
             self.assertEqual(hot['Tasks'][0]['Services'][0]['Name'], 'kardamom-executor')

@@ -17,8 +17,9 @@ const DEFAULT_CHECKPOINT_KEEP: NonZeroUsize = NonZeroUsize::new(3).unwrap();
 /// power loss on a majority of the members loses about 1 s of entries.
 const DEFAULT_ROLLBACK_COMPARE_BLOCKS: NonZeroU64 = NonZeroU64::new(32).unwrap();
 
-/// `checkpoint_interval_secs`'s parsed value: `None` (from `"0"`) means
-/// checkpointing is disabled. A newtype, not `Option<NonZeroU64>`
+/// A whole number where 0 means off: `None` (from `"0"`) turns the
+/// setting off. `--checkpoint-interval-secs 0` makes no checkpoint, and
+/// `--checkpoint-copy-mib-per-sec 0` copies with no rate limit. A newtype, not `Option<NonZeroU64>`
 /// directly, because clap-derive's special-cased handling of an
 /// `Option<T>` field expects `T` to come back from its value parser,
 /// not `Option<T>`; wrapping it in a struct with its own `FromStr`
@@ -26,9 +27,9 @@ const DEFAULT_ROLLBACK_COMPARE_BLOCKS: NonZeroU64 = NonZeroU64::new(32).unwrap()
 /// the parser return the `None`-means-disabled value clap otherwise
 /// reserves for "argument absent".
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CheckpointInterval(pub(crate) Option<NonZeroU64>);
+pub(crate) struct ZeroIsOff(pub(crate) Option<NonZeroU64>);
 
-impl FromStr for CheckpointInterval {
+impl FromStr for ZeroIsOff {
     type Err = ParseIntError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         s.parse::<u64>().map(|n| Self(NonZeroU64::new(n)))
@@ -214,7 +215,7 @@ pub(crate) struct Args {
     /// Interval, in seconds, between periodic state checkpoints. 0 disables
     /// checkpoint creation (restore-only). Ignored unless `checkpoint_dir` is set.
     #[arg(long, default_value = "0")]
-    pub(crate) checkpoint_interval_secs: CheckpointInterval,
+    pub(crate) checkpoint_interval_secs: ZeroIsOff,
     /// Number of newest checkpoints to keep. Each checkpoint round
     /// deletes all older checkpoints, whatever their block spacing. The
     /// oldest kept checkpoint is at least (`--checkpoint-keep` - 1) times
@@ -239,9 +240,11 @@ pub(crate) struct Args {
     #[arg(long, default_value = "21600")]
     pub(crate) checkpoint_base_max_age_secs: NonZeroU64,
     /// With `--checkpoint-log`: the rate limit of the copy of a base, in
-    /// MiB a second.
+    /// MiB a second. 0 has no limit: the base is a compacted copy at the
+    /// speed of the disk, so the copy holds its read snapshot for a short
+    /// time and the image holds only the used pages.
     #[arg(long, default_value = "16")]
-    pub(crate) checkpoint_copy_mib_per_sec: NonZeroU64,
+    pub(crate) checkpoint_copy_mib_per_sec: ZeroIsOff,
     /// With `--checkpoint-log`: the size of one segment of the log, in MiB.
     #[arg(long, default_value = "64")]
     pub(crate) checkpoint_log_segment_mib: NonZeroU64,
@@ -290,7 +293,7 @@ impl Args {
             block_log: self.checkpoint_log.then_some(BlockLogConfig {
                 base_log_percent: self.checkpoint_base_log_percent,
                 base_max_age_secs: self.checkpoint_base_max_age_secs,
-                copy_mib_per_sec: self.checkpoint_copy_mib_per_sec,
+                copy_mib_per_sec: self.checkpoint_copy_mib_per_sec.0,
                 segment_mib: self.checkpoint_log_segment_mib,
             }),
         }
@@ -464,7 +467,34 @@ mod tests {
         assert_eq!(log.round.rule.max_age.as_secs(), 21_600);
     }
 
-    /// `CheckpointInterval` gives clap one concrete type for this
+    /// A copy rate of 0 has no limit: the base is a compacted copy at the
+    /// speed of the disk.
+    #[test]
+    fn a_copy_rate_of_zero_has_no_limit() {
+        use kardamom_executor::state::CheckpointLog;
+        use kardamom_state::checkpoint::copy_rate::CopyRate;
+        let args = parse(&[
+            "--checkpoint-dir",
+            "/c",
+            "--checkpoint-log",
+            "--checkpoint-copy-mib-per-sec",
+            "0",
+        ]);
+        let log = CheckpointLog::of(&args.state_config())
+            .unwrap()
+            .expect("on");
+        assert_eq!(log.round.rate, CopyRate::Unlimited);
+        let default = parse(&["--checkpoint-dir", "/c", "--checkpoint-log"]);
+        let log = CheckpointLog::of(&default.state_config())
+            .unwrap()
+            .expect("on");
+        assert_eq!(
+            log.round.rate,
+            CopyRate::Limited(std::num::NonZeroU64::new(16 << 20).unwrap())
+        );
+    }
+
+    /// `ZeroIsOff` gives clap one concrete type for this
     /// field. This test parses a real command line, so a clap
     /// definition-versus-access mismatch fails here.
     #[test]

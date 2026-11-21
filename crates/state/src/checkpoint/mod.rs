@@ -60,6 +60,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use alloy_primitives::B256;
+use kardamom_types::BPosition;
 
 use tracing::{info, warn};
 
@@ -317,18 +318,26 @@ pub fn latest_checkpoint(
 }
 
 /// The newest restore point of a checkpoint directory, as a reader can
-/// compare it across polls: the block of the newest base, and the bytes of
-/// the chain of log segments that a restore of it reads. The log grows after the base, so a restore of
-/// the same base reaches further when its log has more bytes. The bytes
-/// come from the sizes of the segments, so a poll reads no record.
+/// compare it across polls: the block of the newest base, and the last
+/// block that a restore of it reaches with the block log. A restore stops
+/// at the first gap of the log, so a log that grows after a gap does not
+/// move the point. The reach comes from the record heads of the log and
+/// one record, so a poll reads no image and almost no batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RestorePoint {
     pub base: u64,
-    pub log_bytes: u64,
+    /// The last block that a restore reaches: the last block of the log
+    /// chain after the base, or the base itself.
+    pub reach: u64,
+    /// The end position of the block `reach`, when the log holds that
+    /// block. `None` when the log adds no block to the base: then only
+    /// the image holds the position.
+    pub end: Option<BPosition>,
 }
 
 impl RestorePoint {
-    /// The restore point of `checkpoints_dir`. `None` with no base.
+    /// The restore point of `checkpoints_dir`. `None` with no base. A base
+    /// whose manifest does not read reaches only its own block.
     ///
     /// # Errors
     ///
@@ -337,24 +346,26 @@ impl RestorePoint {
         let Some(base) = latest_checkpoint(checkpoints_dir, BlockRange::ANY)? else {
             return Ok(None);
         };
-        let segments = block_log::SegmentSize::list(&checkpoints_dir.join(replay::LOG_DIR))?;
-        let log_bytes = block_log::SegmentSize::chain_after(&segments, base.block)
-            .unwrap_or_default()
-            .iter()
-            .map(|s| s.bytes)
-            .sum();
+        let last = match read_manifest(&base.path) {
+            Ok(m) => LogReplay::new(&base.path, m.genesis_digest, u64::MAX).last(base.block)?,
+            Err(_) => None,
+        };
         Ok(Some(Self {
             base: base.block,
-            log_bytes,
+            reach: last.as_ref().map_or(base.block, |record| record.block),
+            end: last
+                .and_then(|record| record.batch().ok())
+                .map(|batch| batch.boundary.end_tx_idx),
         }))
     }
 
     /// Whether a restore at this point may reach further than one at
-    /// `tried`: its base is newer, or the log after the same base changed.
-    /// A log that the writer cut and wrote again counts as changed.
+    /// `tried`: its base is newer, or the reach after the same base
+    /// changed. A log that the writer cut and wrote again to another
+    /// block counts as changed.
     #[must_use]
     pub fn is_after(&self, tried: &Self) -> bool {
-        self.base > tried.base || (self.base == tried.base && self.log_bytes != tried.log_bytes)
+        self.base > tried.base || (self.base == tried.base && self != tried)
     }
 }
 

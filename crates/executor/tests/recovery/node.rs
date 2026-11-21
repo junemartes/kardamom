@@ -62,7 +62,7 @@ impl NodeConfig {
             block_log: self.block_log.then_some(BlockLogConfig {
                 base_log_percent: NonZeroU64::new(100).unwrap(),
                 base_max_age_secs: self.base_max_age_secs,
-                copy_mib_per_sec: NonZeroU64::new(16).unwrap(),
+                copy_mib_per_sec: NonZeroU64::new(16),
                 segment_mib: NonZeroU64::MIN,
             }),
         }

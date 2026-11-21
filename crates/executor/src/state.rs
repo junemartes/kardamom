@@ -54,8 +54,9 @@ pub struct BlockLogConfig {
     pub base_log_percent: NonZeroU64,
     /// A new base when the newest base is older than this, in seconds.
     pub base_max_age_secs: NonZeroU64,
-    /// The rate limit of the copy of a base, in MiB a second.
-    pub copy_mib_per_sec: NonZeroU64,
+    /// The rate limit of the copy of a base, in MiB a second. `None` has
+    /// no limit: a compacted copy at the speed of the disk.
+    pub copy_mib_per_sec: Option<NonZeroU64>,
     /// The size of one segment of the log, in MiB.
     pub segment_mib: NonZeroU64,
 }
@@ -116,7 +117,7 @@ impl StateConfig {
             // The gauges start from the disk, so a restart shows an old
             // checkpoint as old. In the restore-only mode no round runs,
             // and they keep the checkpoint that the node holds and serves.
-            NewestCheckpoint::publish_base(ckpt_dir);
+            NewestCheckpoint::publish_on_disk(ckpt_dir);
         }
 
         // Open the libmdbx state env and read the durable cursor.
@@ -246,7 +247,11 @@ impl CheckpointLog {
             return Ok(None);
         };
         let segment_bytes = Self::bytes(settings.segment_mib)?;
-        let rate = Self::bytes(settings.copy_mib_per_sec)?;
+        let rate = settings
+            .copy_mib_per_sec
+            .map(Self::bytes)
+            .transpose()?
+            .map_or(CopyRate::Unlimited, CopyRate::Limited);
         Ok(Some(Self {
             log: LogConfig {
                 dir: dir.join(LOG_DIR),
@@ -260,15 +265,15 @@ impl CheckpointLog {
                     max_age: std::time::Duration::from_secs(settings.base_max_age_secs.get()),
                     segment_bytes,
                 },
-                rate: CopyRate::Limited(rate),
+                rate,
                 keep: cfg.checkpoint_keep,
             },
         }))
     }
 
     /// Spawn the state writer of `env`, with the block log thread behind
-    /// it when `cfg` asks for the log. The log thread ends after the
-    /// writer, when the writer's feed is gone, so nothing joins it.
+    /// it when `cfg` asks for the log. The stop of the writer joins the
+    /// log thread after the writer thread.
     ///
     /// # Errors
     ///
@@ -278,9 +283,8 @@ impl CheckpointLog {
         let Some(log) = Self::of(cfg)? else {
             return StateWriter::spawn(env).context("spawn state writer");
         };
-        let (feed, _detached) =
-            BlockLogThread::spawn(&env, &log.log).context("start the block log thread")?;
-        StateWriter::spawn_with_log(env, feed).context("spawn state writer")
+        let log = BlockLogThread::spawn(&env, &log.log).context("start the block log thread")?;
+        StateWriter::spawn_with_log(env, log).context("spawn state writer")
     }
 
     fn bytes(mib: NonZeroU64) -> Result<NonZeroU64> {
@@ -331,7 +335,7 @@ impl CheckpointRound {
             Ok(_) => self.prune_stale(),
             Err(e) => tracing::warn!(error = %e, "checkpoint creation failed"),
         }
-        NewestCheckpoint::publish_base(&self.dir);
+        NewestCheckpoint::publish_on_disk(&self.dir);
     }
 
     /// Prunes all checkpoints except the newest `self.keep`, whatever

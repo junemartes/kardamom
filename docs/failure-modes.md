@@ -498,9 +498,14 @@ The executors are deterministic state machines. One dead or lagging replica neve
   - With `--checkpoint-log` (job variable `checkpoint_log`), a checkpoint is a base image and the block log after it: the write batch of each committed block.
     - A restore copies the base and applies the log through the state writer. So each block of the log is a restore point.
     - The executor copies the state only when the base rule asks for a new base: the log after the newest base is larger than that base, the base is old, or the log has a gap. The copy has a rate limit, so it does not take the disk from a sealer on the same host.
+    - The limited copy holds one read snapshot for its whole time, and it copies the free pages too. So under load the state file grows during each copy, and the next copy is longer. The file never gives the free pages back. The checkpoint executor copies with no limit (`--checkpoint-copy-mib-per-sec 0`): a compacted copy, whose image holds only the used pages. A restore of such a base gives a compacted state file.
+    - Proof: `a_slow_copy_under_load_grows_the_file_and_the_next_image` and `a_copy_with_no_limit_under_load_holds_only_the_used_pages`.
     - A rollback restores the block just before the divergence, and cuts the log there.
     - A peer serves its log after its base (`GET /checkpoint/log`), so a peer base below a retention floor serves when its log reaches the floor.
     - The writer never waits for the log. A full queue drops the batch (`kardamom_checkpoint_log_dropped_total`), and the gap makes the next base start at once.
+    - A restart leaves no gap in the log. The stop of the state writer waits for the log thread, which takes the last batches and syncs. The log thread also writes its records into the file each time its queue is empty. So the exit of the Aeron error handler (`_exit`, no drop) after the loss of the media driver keeps every block that the writer committed before it went idle.
+    - A gap after a restart remains possible after a loss of power, or after a hard kill while batches wait in the queue. The database syncs each commit, and the log syncs once a second, so the database is then ahead of the log. The next base starts at once (`kardamom_checkpoint_bases_total{reason="gap"}`), and no restore point is newer than the gap until that base ends.
+    - Proof: `an_exit_after_the_stop_of_the_writer_keeps_every_committed_block` and `an_exit_after_the_writer_is_idle_keeps_every_committed_block`. Each test runs a child process that commits 50 blocks and exits with no drop.
 - **Replay-window overrun**
   - Trigger: the cluster keeps a bounded canonical window (`kardamom.cluster.retention`, default 65,536 frames, about 5 minutes at 200 tps). A `REPLAY_FROM` below the floor of the window is refused with `REPLAY_UNAVAILABLE`. Below decision version 5, the window is a minimum: a frame past it stays until L1 holds its block. Under version 5 with `carryBytes`, or with the carry window (feature 5), the window is exact (see "DA-lag guard and posted-head retention floor"). The retained frames are in the cluster snapshot, so a member that restores from a snapshot keeps the floor of the snapshot. A cursor that is older than the window is the trigger.
   - Effect: the refusal is terminal for the local state. A cursor below the floor can never catch up. A fresh or wiped node cannot re-sync from genesis either, because genesis aged out of the window.
@@ -1559,6 +1564,17 @@ Redis is a cache with no persistence. The state of the executors is the truth. T
   - Effect: the restarted mirrors find Redis cold.
   - Recovery: each mirror rebuilds the projection from the newest checkpoint of its executor. The mirror head advances again. The projection holds the accounts of the checkpoint, not only the live rows.
   - Proof: `mirror-kill-rebuild`. The case counts `rebuild: done` lines in the `state-mirror` job log. It does not use the rebuild counter, because a new process starts that counter at zero.
+- **All state mirrors restarted, Redis intact**
+  - Trigger: every mirror stops for longer than the TTL of the live heads (5 s), for example when a deploy restarts the media driver of every node.
+  - Effect: no live `head:<id>` key is left. The `durable_head:<id>` key of each mirror has no TTL, and Redis keeps it.
+  - Recovery: when the durable head is at or beyond the local head file, the mirror checks the first live batch. A first receipt at or below the position after the durable head proves that no batch is missing, and the mirror resumes. A later first receipt can be a hole: the mirror rebuilds from a checkpoint with the reason `hole`. A durable head below the head file is a failover regression, and the mirror rebuilds. A Redis that lost its data has no durable head, and the start is cold.
+  - Limit: positions are not dense, so a stop with only markers after the head also rebuilds.
+  - Proof: the component tests `a_restart_of_all_mirrors_on_an_intact_redis_resumes`, `a_restart_of_all_mirrors_with_a_hole_rebuilds`, `an_empty_redis_with_a_local_head_is_cold` and `a_durable_head_below_the_local_head_is_a_regression`.
+- **A gap in the block log during a mirror rebuild**
+  - Trigger: an executor restart leaves a gap in its block log. The newest restore point stops at the block before the gap until the next base.
+  - Effect: the log after the gap grows, and the restore point stays.
+  - Recovery: the mirror restores each restore point once. When the last log record before the gap already ends below the first live batch, the mirror does not restore that point at all. The next base gives a new point.
+  - Proof: `a_point_behind_the_first_live_batch_is_not_restored` and `a_growing_tail_after_a_gap_is_not_a_new_restore_point`.
 - A state mirror waits for Redis at start. It retries the connection every 2 s. A missing address or an unset password variable still ends the start at once.
 - A state mirror with `--checkpoint-peers` (`KARDAMOM_CHECKPOINT_PEERS`) also takes the checkpoints of its peers for a rebuild. The switch is off by default.
   - Each rebuild attempt fetches the newest peer checkpoint, and the block log after it, into `peer-checkpoints` in the mirror directory. It then restores the newest restore point of that copy and of the executor directory.

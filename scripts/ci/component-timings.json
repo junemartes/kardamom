@@ -145,7 +145,7 @@
   "executor-recovery::replica::a_wiped_replica_restores_a_copied_donor_base_and_log": 2.169,
   "executor-recovery::replica::a_wiped_replica_restores_a_copied_donor_checkpoint": 1.868,
   "executor-recovery::replica::ten_stop_and_start_rounds_advance_every_replica_each_round": 1.469,
-  "executor-recovery::replica::the_checkpoint_gauges_follow_the_log_and_a_restore_only_replica_shows_its_fetched_base": 3.4,
+  "executor-recovery::replica::the_checkpoint_gauges_follow_the_log_and_a_restore_only_replica_shows_its_fetched_checkpoint": 3.4,
   "executor-recovery::whole::a_corrupt_local_checkpoint_is_quarantined_before_a_peer_restore": 1.618,
   "executor-recovery::whole::a_total_wipe_resumes_every_replica_from_a_rebuilt_da_image": 1.172,
   "executor-recovery::whole::a_whole_fleet_kill_resumes_each_replica_from_its_own_disk": 1.166,

@@ -244,7 +244,7 @@
         "whole::executors_that_return_before_the_sealers_wait_and_then_catch_up",
         "replica::a_wiped_replica_restores_a_copied_donor_base_and_log",
         "whole::returned_ingresses_serve_a_pre_fault_receipt_from_executor_state",
-        "replica::the_checkpoint_gauges_follow_the_log_and_a_restore_only_replica_shows_its_fetched_base"
+        "replica::the_checkpoint_gauges_follow_the_log_and_a_restore_only_replica_shows_its_fetched_checkpoint"
       ],
       "negative_controls": [
         {

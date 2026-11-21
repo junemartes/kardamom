@@ -55,6 +55,12 @@ impl LogReplay {
         Ok(log.after(base, self.to).last().map_or(base, |r| r.block))
     }
 
+    /// The last record that a restore of `base` applies, found from the
+    /// record heads. See [`BlockLog::last_after`].
+    pub(crate) fn last(&self, base: u64) -> Result<Option<Record>, StateError> {
+        Ok(BlockLog::open(&self.log_dir, self.identity)?.last_after(base))
+    }
+
     /// Open the restored database in `state_dir`, apply the log after its
     /// block, and sync. Returns the last committed block.
     ///

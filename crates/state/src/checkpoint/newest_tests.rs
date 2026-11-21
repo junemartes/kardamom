@@ -1,4 +1,3 @@
-use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -9,19 +8,16 @@ use super::{LogEnd, NEWEST_BLOCK, NEWEST_TIMESTAMP, NewestCheckpoint};
 use crate::env::StateEnv;
 use crate::writer::StateWriter;
 
-/// The segment size of `commit_logged`.
-const SEGMENT: NonZeroU64 = NonZeroU64::new(1 << 20).unwrap();
-
 /// The time of the last sync of the log in these tests.
 fn synced_at() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(1_800_000_007)
 }
 
+/// The end of the log at `block`, as the log thread synced it.
 fn end(block: u64) -> LogEnd {
     LogEnd {
         block,
         written: synced_at(),
-        segment_bytes: SEGMENT,
     }
 }
 
@@ -48,8 +44,11 @@ fn a_directory_with_no_base_has_no_newest_checkpoint() {
     let ckpt = tempfile::tempdir().unwrap();
     let env = seeded_env(state.path());
     commit_logged(&env, &ckpt.path().join(LOG_DIR), 1..=3);
-    assert_eq!(NewestCheckpoint::base(ckpt.path()).unwrap(), None);
-    assert_eq!(end(3).newest(ckpt.path()).unwrap(), None);
+    assert_eq!(NewestCheckpoint::on_disk(ckpt.path()).unwrap(), None);
+    assert_eq!(
+        NewestCheckpoint::read(ckpt.path(), Some(end(3))).unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -60,7 +59,7 @@ fn the_newest_base_is_the_point_at_the_time_of_its_copy() {
     commit_unlogged(&env, 1..=3);
     create_checkpoint(&env, ckpt.path()).unwrap();
     assert_eq!(
-        NewestCheckpoint::base(ckpt.path()).unwrap(),
+        NewestCheckpoint::on_disk(ckpt.path()).unwrap(),
         Some(base_point(ckpt.path(), 3))
     );
 }
@@ -75,16 +74,25 @@ fn a_log_that_continues_the_base_moves_the_point_to_its_end() {
     create_checkpoint(&env, ckpt.path()).unwrap();
     commit_logged(&env, &log, 4..=6);
     assert_eq!(
-        end(6).newest(ckpt.path()).unwrap(),
+        NewestCheckpoint::read(ckpt.path(), Some(end(6))).unwrap(),
         Some(NewestCheckpoint {
             block: 6,
             written: synced_at(),
         })
     );
+    let at_base_time = NewestCheckpoint {
+        block: 6,
+        ..base_point(ckpt.path(), 3)
+    };
     assert_eq!(
-        end(3).newest(ckpt.path()).unwrap(),
-        Some(base_point(ckpt.path(), 3)),
-        "a log that ends at the base adds nothing"
+        NewestCheckpoint::on_disk(ckpt.path()).unwrap(),
+        Some(at_base_time),
+        "with no log thread, the reach takes the time of the base"
+    );
+    assert_eq!(
+        NewestCheckpoint::read(ckpt.path(), Some(end(5))).unwrap(),
+        Some(at_base_time),
+        "a sync of another block gives no time for the reach"
     );
 }
 
@@ -101,7 +109,7 @@ fn a_gap_after_the_base_keeps_the_point_at_the_base() {
     commit_unlogged(&env, 3..=4);
     commit_logged(&env, &log, 5..=6);
     assert_eq!(
-        end(6).newest(ckpt.path()).unwrap(),
+        NewestCheckpoint::read(ckpt.path(), Some(end(6))).unwrap(),
         Some(base_point(ckpt.path(), 2))
     );
 }

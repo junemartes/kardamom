@@ -1,22 +1,24 @@
 //! [`NewestCheckpoint`]: the newest restore point of a checkpoint
 //! directory, and the two gauges that show it.
 //!
-//! A restore copies the newest base, then applies the block log after
-//! it. So the newest restore point is the end of the log when the log
-//! continues the base with no gap, and the base otherwise. The gauges
-//! hold its block and the unix time at which the directory got it. An
-//! alert computes the age as `time()` minus that time, so the age also
-//! grows while the process is down.
+//! A restore copies the newest base, then applies the block log after it
+//! up to the first gap. [`RestorePoint`] gives that reach. The gauges hold
+//! the reach and the unix time at which the directory got it. An alert
+//! computes the age as `time()` minus that time, so the age also grows
+//! while the process is down.
+//!
+//! The time of the base is the modification time of its directory. The
+//! time of a reach past the base is the time of the sync that made it
+//! durable, when the log thread knows it. Otherwise the gauges take the
+//! time of the base: an older time than the true one, so the age never
+//! hides an old checkpoint.
 
-use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing::warn;
 
-use super::block_log::SegmentSize;
-use super::replay::LOG_DIR;
-use super::{BlockRange, CheckpointInfo, latest_checkpoint};
+use super::{RestorePoint, checkpoint_name};
 use crate::error::StateError;
 
 /// The last block that a restore of the newest checkpoint reaches.
@@ -41,8 +43,6 @@ pub(crate) struct LogEnd {
     pub(crate) block: u64,
     /// The time of the sync that made that block durable.
     pub(crate) written: SystemTime,
-    /// The size at which the writer ends a segment.
-    pub(crate) segment_bytes: NonZeroU64,
 }
 
 impl NewestCheckpoint {
@@ -58,21 +58,50 @@ impl NewestCheckpoint {
         );
     }
 
-    /// The newest base of `checkpoints_dir`, with no block log. `None`
-    /// with no base.
+    /// The newest restore point of `checkpoints_dir`. `end` is the end of
+    /// the log that the log thread synced, when one runs. `None` with no
+    /// base.
     ///
     /// # Errors
     ///
-    /// Returns an error when the directory or the base does not read.
-    pub fn base(checkpoints_dir: &Path) -> Result<Option<Self>, StateError> {
-        latest_checkpoint(checkpoints_dir, BlockRange::ANY)?
-            .map(|base| Self::of(&base))
-            .transpose()
+    /// Returns an error when the directory, the log or the base does not
+    /// read.
+    pub(crate) fn read(
+        checkpoints_dir: &Path,
+        end: Option<LogEnd>,
+    ) -> Result<Option<Self>, StateError> {
+        let Some(point) = RestorePoint::newest(checkpoints_dir)? else {
+            return Ok(None);
+        };
+        let synced = end
+            .filter(|end| point.reach > point.base && end.block == point.reach)
+            .map(|end| end.written);
+        let written = match synced {
+            Some(written) => written,
+            None => {
+                std::fs::metadata(checkpoints_dir.join(checkpoint_name(point.base)))?.modified()?
+            }
+        };
+        Ok(Some(Self {
+            block: point.reach,
+            written,
+        }))
     }
 
-    /// Show the newest base of `checkpoints_dir` in the gauges.
-    pub fn publish_base(checkpoints_dir: &Path) {
-        Self::show(Self::base(checkpoints_dir));
+    /// The newest restore point of `checkpoints_dir`, with no log thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory, the log or the base does not
+    /// read.
+    pub fn on_disk(checkpoints_dir: &Path) -> Result<Option<Self>, StateError> {
+        Self::read(checkpoints_dir, None)
+    }
+
+    /// Show the newest restore point of `checkpoints_dir` in the gauges,
+    /// with no log thread.
+    pub fn publish_on_disk(checkpoints_dir: &Path) {
+        Self::show(Self::on_disk(checkpoints_dir));
     }
 
     /// Show `found` in the gauges. With no base, or with a directory
@@ -102,48 +131,6 @@ impl NewestCheckpoint {
             .as_secs_f64();
         metrics::gauge!(NEWEST_BLOCK).set(self.block as f64);
         metrics::gauge!(NEWEST_TIMESTAMP).set(written);
-    }
-
-    /// The point of `base`: its block, and the modification time of its
-    /// directory. The copy writes the manifest into it as its last step.
-    fn of(base: &CheckpointInfo) -> Result<Self, StateError> {
-        Ok(Self {
-            block: base.block,
-            written: std::fs::metadata(&base.path)?.modified()?,
-        })
-    }
-}
-
-impl LogEnd {
-    /// The newest restore point of `checkpoints_dir`: the end of the log
-    /// when the log continues the newest base with no gap, and that base
-    /// otherwise. `None` with no base.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the directory, the log or the base does not
-    /// read.
-    pub(crate) fn newest(
-        &self,
-        checkpoints_dir: &Path,
-    ) -> Result<Option<NewestCheckpoint>, StateError> {
-        let Some(base) = latest_checkpoint(checkpoints_dir, BlockRange::ANY)? else {
-            return Ok(None);
-        };
-        if self.block > base.block && self.continues(checkpoints_dir, base.block)? {
-            return Ok(Some(NewestCheckpoint {
-                block: self.block,
-                written: self.written,
-            }));
-        }
-        NewestCheckpoint::of(&base).map(Some)
-    }
-
-    /// Whether the log holds each block after `base`, by the gap rule of
-    /// the sizes of its segments.
-    fn continues(&self, checkpoints_dir: &Path, base: u64) -> Result<bool, StateError> {
-        let segments = SegmentSize::list(&checkpoints_dir.join(LOG_DIR))?;
-        Ok(!segments.is_empty() && !SegmentSize::gap_after(&segments, base, self.segment_bytes))
     }
 }
 

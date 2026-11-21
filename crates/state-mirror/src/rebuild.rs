@@ -66,14 +66,51 @@ impl Newest {
             point,
         }))
     }
+
+    /// Whether the point is behind `first_live` before a restore: the
+    /// block log states the end position of the block that the restore
+    /// reaches. With no such position, only a restore can tell.
+    fn known_behind(&self, first_live: FirstLive) -> bool {
+        self.point
+            .end
+            .is_some_and(|end| first_live.last_included(end).is_none())
+    }
+
+    /// The log line of a point that is behind the first live batch.
+    fn log_behind(&self, block: u64, first_live: FirstLive) {
+        info!(
+            block,
+            first_live = first_live.0.as_index(),
+            "rebuild: newest checkpoint {} is behind the first live batch; waiting",
+            self.point.base
+        );
+    }
 }
 
-/// The restore point a rebuild already restored. A restore copies and
+/// The first live batch end that a rebuild must reach.
+#[derive(Clone, Copy)]
+struct FirstLive(BPosition);
+
+impl FirstLive {
+    /// The last position that a state with the end `end` includes, when
+    /// it includes the first live position. A state end is an exclusive
+    /// record count. Receipt positions are zero-based, so an end equal to
+    /// the first live position excludes that receipt.
+    fn last_included(self, end: BPosition) -> Option<BPosition> {
+        end.as_index()
+            .checked_sub(1)
+            .filter(|last| *last >= self.0.as_index())
+            .map(BPosition::from_index)
+    }
+}
+
+/// The restore point a rebuild already tried. A restore copies and
 /// hashes the whole state image, which costs seconds to minutes with
 /// three mirrors on one disk. Restoring the same point again on every
 /// poll gains nothing, and the work starves the restores that would make
 /// progress. With the block log of the checkpoints, the same base reaches
-/// further as its log grows, so a grown log is a new point.
+/// further as its log grows, so a further reach is a new point. A log
+/// that grows after a gap does not move the reach.
 struct TriedCheckpoint {
     point: Option<RestorePoint>,
 }
@@ -100,15 +137,8 @@ struct RebuildSnapshot {
 
 impl RebuildSnapshot {
     fn new(snapshot: StateSnapshot, first_live: BPosition) -> Result<Option<Self>> {
-        // A checkpoint end is an exclusive record count. Receipt positions
-        // are zero-based, so a count equal to first_live excludes that receipt.
-        let last = snapshot.end_tx_position()?.as_index().checked_sub(1);
-        Ok(last
-            .filter(|last| *last >= first_live.as_index())
-            .map(|last| Self {
-                snapshot,
-                end: BPosition::from_index(last),
-            }))
+        let last = FirstLive(first_live).last_included(snapshot.end_tx_position()?);
+        Ok(last.map(|end| Self { snapshot, end }))
     }
 }
 
@@ -188,8 +218,9 @@ impl Rebuild {
     /// One attempt at the newest checkpoint, on blocking threads. The
     /// peer fetch and the restore copy and hash the whole image, so they
     /// must not run on an async worker. A restore point this rebuild
-    /// already restored is skipped: only a newer base, or more log after
-    /// the same base, can carry the first live batch.
+    /// already tried is skipped: only a newer base, or a further reach
+    /// after the same base, can carry the first live batch. A point that
+    /// the block log shows behind the first live batch is not restored.
     async fn try_newest(
         &self,
         first_live: BPosition,
@@ -207,6 +238,10 @@ impl Rebuild {
             return Ok(None);
         }
         tried.mark(newest.point);
+        if newest.known_behind(FirstLive(first_live)) {
+            newest.log_behind(newest.point.reach, FirstLive(first_live));
+            return Ok(None);
+        }
         let this = self.clone();
         tokio::task::spawn_blocking(move || this.open_newest(&newest, first_live))
             .await
@@ -227,7 +262,7 @@ impl Rebuild {
             .collect::<Result<Vec<_>>>()?;
         Ok(found
             .into_iter()
-            .max_by_key(|n| (n.point.base, n.point.log_bytes)))
+            .max_by_key(|n| (n.point.base, n.point.reach)))
     }
 
     /// The newest checkpoint as a read-only snapshot, when it reaches
@@ -257,12 +292,7 @@ impl Rebuild {
         let snapshot = StateSnapshot::open(&env)?;
         let restored = RebuildSnapshot::new(snapshot, first_live)?;
         if restored.is_none() {
-            info!(
-                block,
-                first_live = first_live.as_index(),
-                "rebuild: newest checkpoint {} is behind the first live batch; waiting",
-                newest.point.base
-            );
+            newest.log_behind(block, FirstLive(first_live));
         }
         Ok(restored)
     }
@@ -337,6 +367,8 @@ async fn write_chunk(
 }
 
 #[cfg(test)]
+mod log_tests;
+#[cfg(test)]
 mod peer_tests;
 #[cfg(test)]
 mod regression_tests;
@@ -344,15 +376,20 @@ mod regression_tests;
 #[cfg(test)]
 mod tests {
     use kardamom_state::checkpoint::RestorePoint;
+    use kardamom_types::BPosition;
 
-    use super::TriedCheckpoint;
+    use super::{FirstLive, TriedCheckpoint};
 
     /// A restore copies and hashes the whole state image. The wait loop
     /// polls every five seconds, so it must restore one point once and
     /// then wait for a newer one.
     #[test]
     fn a_restore_point_is_tried_once_until_a_newer_one_appears() {
-        let point = |base, log_bytes| RestorePoint { base, log_bytes };
+        let point = |base, reach| RestorePoint {
+            base,
+            reach,
+            end: None,
+        };
         let mut tried = TriedCheckpoint::new();
         assert!(tried.is_new(point(683, 0)), "the first point is always new");
         tried.mark(point(683, 0));
@@ -361,7 +398,7 @@ mod tests {
             "the same point must not restore twice"
         );
         assert!(
-            !tried.is_new(point(680, 9)),
+            !tried.is_new(point(680, 690)),
             "an older base carries less, not more"
         );
         assert!(
@@ -374,15 +411,28 @@ mod tests {
     /// rebuild that waited for a newer base would wait for the next base
     /// round, which the log makes rare.
     #[test]
-    fn more_log_after_the_same_base_is_a_new_point() {
+    fn a_further_reach_after_the_same_base_is_a_new_point() {
         let mut tried = TriedCheckpoint::new();
-        tried.mark(RestorePoint {
+        let point = |reach| RestorePoint {
             base: 85,
-            log_bytes: 4096,
-        });
-        assert!(tried.is_new(RestorePoint {
-            base: 85,
-            log_bytes: 8192
-        }));
+            reach,
+            end: Some(BPosition::from_index(reach)),
+        };
+        tried.mark(point(90));
+        assert!(!tried.is_new(point(90)), "the same reach restores once");
+        assert!(tried.is_new(point(97)));
+    }
+
+    /// A state with the end `n` holds the receipts below `n`. So the
+    /// first live batch at `n` needs an end above `n`.
+    #[test]
+    fn an_end_must_pass_the_first_live_position() {
+        let first_live = FirstLive(BPosition::from_index(10));
+        assert_eq!(first_live.last_included(BPosition::from_index(10)), None);
+        assert_eq!(
+            first_live.last_included(BPosition::from_index(11)),
+            Some(BPosition::from_index(10))
+        );
+        assert_eq!(first_live.last_included(BPosition::from_index(0)), None);
     }
 }

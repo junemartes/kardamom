@@ -322,10 +322,11 @@ fn ten_stop_and_start_rounds_advance_every_replica_each_round() {
 /// The gauges of the newest checkpoint. A node with the block log shows
 /// the end of its log past its newest base, at the time of its last sync.
 /// A blank replica in the restore-only mode makes no checkpoint: it shows
-/// the base that it fetched and serves. That value stays while its head
-/// moves on, and a restart shows it again from the disk.
+/// the reach of the base and the log that it fetched and serves. That
+/// value stays while its head moves on, and a restart shows it again from
+/// the disk.
 #[test]
-fn the_checkpoint_gauges_follow_the_log_and_a_restore_only_replica_shows_its_fetched_base() {
+fn the_checkpoint_gauges_follow_the_log_and_a_restore_only_replica_shows_its_fetched_checkpoint() {
     use kardamom_state::checkpoint::newest::{NEWEST_BLOCK, NEWEST_TIMESTAMP};
 
     let world = World::new();
@@ -355,13 +356,15 @@ fn the_checkpoint_gauges_follow_the_log_and_a_restore_only_replica_shows_its_fet
     hot.cfg.peers = vec![donor.cfg.serve.to_string()];
     hot.start();
     hot.wait_head(load.sealed() + 5, CATCH_UP);
-    let (held, _) = hot.newest_checkpoint().expect("the fetched base");
+    let held = kardamom_state::checkpoint::RestorePoint::newest(&hot.cfg.checkpoint_dir)
+        .unwrap()
+        .expect("the fetched base");
     let shown = |n: &NodeHandle| n.gauge(NEWEST_BLOCK).zip(n.gauge(NEWEST_TIMESTAMP));
     let first = shown(&hot).expect("the gauges of the fetched base");
     assert_eq!(
         first.0,
-        f64::from(u32::try_from(held).unwrap()),
-        "the fetched base"
+        f64::from(u32::try_from(held.reach).unwrap()),
+        "the reach of the fetched base and log"
     );
     hot.wait_head(load.sealed() + 5, CATCH_UP);
     assert_eq!(shown(&hot), Some(first), "no round moves the gauges");

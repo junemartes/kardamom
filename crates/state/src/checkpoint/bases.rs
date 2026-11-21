@@ -78,16 +78,26 @@ impl BaseRule {
         };
         let segments = SegmentSize::list(&checkpoints_dir.join(LOG_DIR))?;
         let due = [
-            (
-                SegmentSize::gap_after(&segments, base.block, self.segment_bytes),
-                BaseDue::Gap,
-            ),
+            (self.has_gap(&segments, base.block), BaseDue::Gap),
             (self.log_too_large(&segments, &base)?, BaseDue::LogSize),
             (self.too_old(&base)?, BaseDue::Age),
         ]
         .into_iter()
         .find_map(|(due, why)| due.then_some(why));
         Ok(due)
+    }
+
+    /// Whether the log has a gap after `base`: no segment holds the block
+    /// after it while later segments exist, or a segment of the chain
+    /// after it ended before it was full.
+    fn has_gap(&self, segments: &[SegmentSize], base: u64) -> bool {
+        let Some(chain) = SegmentSize::chain_after(segments, base) else {
+            return !segments.is_empty();
+        };
+        chain
+            .iter()
+            .take(chain.len().saturating_sub(1))
+            .any(|s| s.bytes < self.segment_bytes.get())
     }
 
     /// Whether the segments after `base` hold more bytes than the rule

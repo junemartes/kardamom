@@ -288,7 +288,7 @@ locals {
       )
   })]
   # The checkpoint executor always makes checkpoints, with the block log,
-  # every 20 s.
+  # every 20 s, and copies a base with no rate limit (see the args).
   checkpoint_groups = local.checkpoint ? [{
     hot                   = false
     checkpoint_interval_s = 20
@@ -549,6 +549,13 @@ job "executor" {
             # (ports.executor_nonce_query in group_vars/all.yml). The
             # sequencers ask only the hot executors.
             group.value.hot ? ["--nonce-query-addr", "${meta.node_ip}:${var.executor_query_port}"] : [],
+            # The checkpoint executor copies a base with no rate limit: a
+            # compacted copy at the speed of its disk. No sealer commit
+            # waits on the disk of the backup node. So the copy holds its
+            # read snapshot for a short time, the state file does not grow
+            # with each base, and the base holds only the used pages. The
+            # hot executors keep the default limit (16 MiB/s).
+            group.value.hot ? [] : ["--checkpoint-copy-mib-per-sec", "0"],
             [
               "--checkpoint-peers", local.checkpoint_peers,
               # Bind the Prometheus exporter on all interfaces; the

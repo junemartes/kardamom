@@ -78,11 +78,19 @@ The short period exists for two of these uses:
 - The writer never waits for the log. When the channel is full, the writer drops the batch, and
   the log has a gap. The executor counts `kardamom_checkpoint_log_dropped_total`, and the next
   base starts at once. A slow disk then costs restore points, but never slows the state commit.
+- The log thread writes its buffered records into the file each time the channel is empty, with
+  no sync. A record in the file outlives an exit of the process that runs no drop, such as the
+  exit of the Aeron error handler after the loss of the media driver. Only a loss of power or of
+  the kernel loses it.
+- The stop of the state writer joins the log thread after the writer thread. The log thread takes
+  the last batches, syncs, and ends. So a graceful stop, and an end of the run after an error,
+  leave no gap.
 - At start, the log thread compares the end of the log with `last_committed_block` of the state
   database:
   - The log ends at the database block: the log continues.
-  - The log ends below the database block (a crash between two syncs): the blocks between are a
-    gap. A new base starts at once.
+  - The log ends below the database block: the blocks between are a gap. A new base starts at
+    once. The database syncs each commit, and the log syncs once a second, so a loss of power or a
+    batch that was still in the channel at a hard kill causes this case.
   - The log ends above the database block: the log thread cuts the records above the database
     block. The executor executes those blocks again.
 
@@ -108,6 +116,20 @@ The short period exists for two of these uses:
   limit, and counts `kardamom_checkpoint_copy_unlimited_total`.
 - A long read transaction keeps old pages alive in the database, so the rate limit has a lower
   bound: the copy of a base must end before the next base starts.
+- **The limited copy makes the state file grow, in a loop.** The writer cannot reuse a page that
+  the read snapshot of the copy holds, so the file grows by the pages that the load writes during
+  the copy. The file never gives the free pages back, because they are not at its end. The next
+  limited copy holds those free pages too, so it takes longer and lets the file grow more. On
+  staging the state of executor-0 grew from 9 GB to 45 GB in five days, with 363 accounts. The
+  test `a_slow_copy_under_load_grows_the_file_and_the_next_image` shows the loop: one copy of
+  2 MiB of used pages at 4 MiB/s let the file grow from 795 to 9,165 pages, and the next image
+  was 150 MB, against 2 MB compacted.
+- **A rate of 0 has no limit** (`--checkpoint-copy-mib-per-sec 0`). The base is then a compacted
+  copy at the speed of the disk. Its read snapshot lives only for the time of one compacted copy,
+  which depends on the used pages, not on the size of the file. Its image holds only the used
+  pages, so a restore of it gives a compacted state file. This breaks the loop. The checkpoint
+  executor on the backup machine copies with no limit, because no sealer commit waits on that
+  disk.
 
 Estimate for staging at 1,000 tx/s:
 
@@ -159,7 +181,7 @@ once and renames the directory into place. A crash during the restore leaves no 
 | `--checkpoint-log` | `false` | Write the block log and make bases by the rule of section 3.4. `false` keeps the full copy each `--checkpoint-interval-secs`. |
 | `--checkpoint-base-log-percent` | `100` | A new base when the log after the newest base is larger than this percent of the size of that base. |
 | `--checkpoint-base-max-age-secs` | `21600` | A new base when the newest base is older than this. |
-| `--checkpoint-copy-mib-per-sec` | `16` | The rate limit of a base copy. |
+| `--checkpoint-copy-mib-per-sec` | `16` | The rate limit of a base copy. `0` has no limit: a compacted copy. |
 | `--checkpoint-log-segment-mib` | `64` | The size of one log segment. |
 | `--checkpoint-keep` | `2` with the log | The bases to keep, with their log. |
 
