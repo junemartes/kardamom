@@ -1,6 +1,8 @@
 # The checkpoint executor on the backup node
 
-- Status: decided by the user on 2026-11-17 (section 8). Not implemented yet.
+- Status: decided by the user on 2026-11-17 (section 8). Rollout steps 1 (the code) and 2 (the
+  deploy) are done. Steps 3 to 5 (staging and the chaos cases) are open. The metrics of section 7
+  are open: the executor exports no age and no block of its newest checkpoint.
 - Reason: the 8-9 ms p99 tails of the staging benchmarks of 2026-11-16.
 - Decision of the user on 2026-11-17: the checkpoint writes move to the backup machine. A slower
   recovery is acceptable, because a checkpoint matters only when a node or the cluster recovers.

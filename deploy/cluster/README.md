@@ -199,7 +199,7 @@ The `update` stanza of each job:
 | `ingress`, `sequencer` | 1 | `checks` | 15s | `true` | `canary = var.canary`, `auto_promote = false` |
 | `cluster` (sealer) | 1 | `checks` | 60s | `false` | One task group for each member |
 | `cluster-backup` | 1 | `task_states` | 30s | `false` | Only with a node in the group `backup`. The deploy does not wait for it. |
-| `executor`, `validator`, `batcher`, `state-mirror` | 1 | `checks` | 15s | `false` | |
+| `executor`, `validator`, `batcher`, `state-mirror` | 1 | `checks` | 15s | `false` | The group `executor-checkpoint` uses `task_states`: the checkpoint executor may lag, and a lag must not hold a deployment. |
 | `notifier`, `canary`, `egress` | 1 | `checks` | 10s | `false` | |
 | `da-watcher`, `l1-indexer`, `l1-light-client`, `da-proxy`, `da-store` | 1 | `task_states` | 10s | `false` | |
 | `aeron` (system job) | 1 | `task_states` | 15s | not set | `stagger = "30s"` |
@@ -481,6 +481,49 @@ The infrastructure of an environment sets these. The deploy does not change them
 - The fixed ports of the executor (9004, 9014, 9024) and of the state mirror (9007) are free on a sealer node and open between the nodes.
 - The executor nodes stay: they run the egress.
 
+### The checkpoint executor
+
+The checkpoint executor moves the checkpoint writes off the sealer machines (`docs/specs/2026-11-17-checkpoint-executor.md`). Two switches do it. Each is off by default. With each one off, the deploy renders every job as before.
+
+| Switch | What it renders | When |
+|---|---|---|
+| `KARDAMOM_CHECKPOINT_EXECUTOR=on` | The group `executor-checkpoint` in the executor job, on the node of role `backup`. The checkpoint peers of the executors, the validator and the state mirrors name it first (`kardamom-executor-checkpoint.service.<dc>.consul:9014`). The state mirror gets `--checkpoint-peers` and `--chain`. Prometheus scrapes it as the job `kardamom-executor-checkpoint`. | Staging step 1. The hot executors keep their checkpoints. |
+| `KARDAMOM_EXEC_RESTORE_ONLY=on` | `--checkpoint-interval-secs 0` and the block log off on the hot executors. They still restore a peer checkpoint. | Staging step 2, after step 1 shows that the checkpoint executor keeps the average rate of the chain. |
+
+The checkpoint executor:
+
+- It runs `--publish-receipts false`, with no `--void-voter-id`, no recorded cursor, no `--carry-bytes`, no `--exec-frames` and no `--nonce-query-addr`. No reader, no sealer and no sequencer waits for it.
+- It reads the cluster egress, and the range read of the egress (`--egress`) for a cursor below the sealer window.
+- It always makes checkpoints with the block log, every 20 s, whatever the hot executors use.
+- Its recorder id is 255, outside the ids of the hot executors. It names no `tx_receipts` endpoint, because the executor publishes no receipts. Its host id is `executor-checkpoint`.
+- It registers the Consul service `kardamom-executor-checkpoint` with a TCP check, not `kardamom-executor` with `/ready`. So the record resolves while the process runs, also when it lags. No client finds the hot executors through a Consul service: each one names them by their node records.
+- Its deployment waits only for its task to run (`task_states`). In the staged roll of the executor job, it rolls after the hot executors.
+- With `KARDAMOM_EXEC_ON_SEALERS` off, the role constraint of the hot executors moves from the job into their group.
+
+The preflight refuses:
+
+- `KARDAMOM_CHECKPOINT_EXECUTOR=on` without a node in the inventory group `backup`, or without `KARDAMOM_EGRESS=1`.
+- `KARDAMOM_EXEC_RESTORE_ONLY=on`, or a checkpoint interval of 0, without the checkpoint executor and a backup node.
+
+The backup node needs:
+
+- the media driver of the `aeron` job, which runs on every node outside the control tier and, without the member feed, outside the sealer nodes;
+- `/opt/kardamom/state` and `/opt/kardamom/checkpoints`, which the `data-dirs` job makes on every node;
+- the memory of the backup sealer (heap plus 640 MB), the shared driver (768 MB) and the executor (1536 MB), plus the page cache of the state database;
+- the disk of the state database, the checkpoints and the `exec_txs` recording of the executor;
+- the fixed ports 9004 and 9014 free. No other executor runs on that node.
+
+The lag of the checkpoint executor behind the sealed head, in blocks:
+
+```promql
+max(kardamom_sealer_block_number{job="kardamom-executor"})
+  - max(kardamom_executor_block_number{job="kardamom-executor-checkpoint"})
+```
+
+No metric gives the age of the newest checkpoint yet, so no alert fires on it.
+
+To go back, switch `KARDAMOM_EXEC_RESTORE_ONLY` off first, then `KARDAMOM_CHECKPOINT_EXECUTOR`.
+
 ### The notifier nodes
 
 The notifier (`nomad/notifier.nomad.hcl`) runs on the ingress nodes by default. The switch `KARDAMOM_NOTIFIER_NODES=on` moves it to its own nodes:
@@ -644,7 +687,9 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Notifier | `KARDAMOM_NOTIFIER_EXECUTED` (job variable `executed` of the notifier) | empty (`off` in the job) | `on` or `off`. With `KARDAMOM_NOTIFIER_EVENTS=on`, the notifier also reads the `tx_receipts` of every executor for the `executed` stage and the latencies of each executor. For the evaluation of the stages. |
 | Notifier | `KARDAMOM_NOTIFIER_NODES` (job variable `notifier_nodes` of the notifier and the aeron jobs) | empty (`off` in the jobs) | `on` or `off`. On, the notifier runs on the nodes of role `notifier`, and their media drivers idle at 1000 µs. Off, it runs on the ingress nodes. See [The notifier nodes](#the-notifier-nodes). |
 | Notifier | `KARDAMOM_NOTIFIER_COUNT` (job variable `notifier_count` of the notifier) | empty (`1` in the job) | The notifier instance count with `KARDAMOM_NOTIFIER_NODES=on`: the count of the notifier nodes. The preflight refuses a count above the count of the ready notifier nodes. |
-| Executor | `KARDAMOM_CHECKPOINT_LOG` (job variable `checkpoint_log`) | empty (`off` in the job) | `on` or `off`. On, each executor keeps the block log of its checkpoints and copies the state only when the base rule asks for a new base, at 16 MiB/s. Off, it copies the whole state each 20 s. Each release reads the bases of both modes. See [`../../docs/specs/2026-10-22-incremental-checkpoints.md`](../../docs/specs/2026-10-22-incremental-checkpoints.md). |
+| Executor | `KARDAMOM_CHECKPOINT_LOG` (job variable `checkpoint_log`) | empty (`off` in the job) | `on` or `off`. On, each hot executor keeps the block log of its checkpoints and copies the state only when the base rule asks for a new base, at 16 MiB/s. Off, it copies the whole state each 20 s. In the restore-only mode, the hot executors keep no block log. Each release reads the bases of both modes. See [`../../docs/specs/2026-10-22-incremental-checkpoints.md`](../../docs/specs/2026-10-22-incremental-checkpoints.md). |
+| Executor | `KARDAMOM_CHECKPOINT_EXECUTOR` (job variable `checkpoint_executor` of the executor, validator, state-mirror and monitoring jobs) | empty (`off` in the jobs) | `on` or `off`. On, the checkpoint executor runs on the node of role `backup`, and every list of checkpoint peers names it. It needs a backup node and `KARDAMOM_EGRESS=1`. See [The checkpoint executor](#the-checkpoint-executor). |
+| Executor | `KARDAMOM_EXEC_RESTORE_ONLY` (job variable `checkpoint_interval_s` = 0) | empty (`off`) | `on` or `off`. On, the hot executors make no checkpoint and no block log. They still restore a peer checkpoint. It needs `KARDAMOM_CHECKPOINT_EXECUTOR=on` and a backup node. |
 | Fees | `PRIORITY_FEES` | empty (`off`) | `on` or `off`. One value sets the sequencer tip, the sealer ordering window and the executor and validator fee schedule. Turning it on for an existing chain is a chain upgrade. See [`../../docs/priority-fees.md`](../../docs/priority-fees.md). |
 | Aeron | `KARDAMOM_AERON_THREADING_MODE` | empty (`SHARED` in the job) | The threading mode of the media driver of each node: `SHARED` (one thread), `SHARED_NETWORK` (the sender and the receiver on one thread, the conductor on its own) or `DEDICATED` (three threads). `SHARED` costs the least CPU, but at a high message rate its one thread saturates and every stream of the node waits. |
 | Aeron | `KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL` | empty (`1` in the job) | The sync level of the `tx_data`, `tx_deposits` and `exec_txs` recordings and of the archive catalog (job variable `archive_file_sync_level`). `0` leaves a write in the page cache. `1` syncs the data of each write batch. `2` also syncs the metadata. Level 1 costs throughput on the recording path. |

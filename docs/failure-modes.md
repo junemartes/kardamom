@@ -542,6 +542,19 @@ The executors are deterministic state machines. One dead or lagging replica neve
   - It still executes and commits every block, and it publishes its BAL on `tx_bal`. The validator compares that BAL with its own result, so a divergence of this executor still shows.
   - The executor refuses to start with `--carry-bytes`: the receipt ledger of a carry executor records the published receipts.
   - Proof: `an_executor_with_the_receipts_off_publishes_nothing`.
+- **The checkpoint executor on the backup machine** (`KARDAMOM_CHECKPOINT_EXECUTOR=on`, group `executor-checkpoint`)
+  - Use: it makes the checkpoints and the block log, so the hot executors on the sealer machines need not copy a base on the commit path of the sealer. See `deploy/cluster/README.md`, "The checkpoint executor".
+  - It publishes no receipts, votes no void and sends no cursor. A lag of this executor holds no reader, no sealer and no deployment: its group is healthy when its task runs.
+  - A lag only makes its checkpoints older. A cursor below the sealer window reads the range read of the egress (above). A cursor below the floor of the egress too needs a newer peer checkpoint. In the restore-only mode, no hot executor has one.
+  - Its Consul record (`kardamom-executor-checkpoint`) has a TCP check. A peer reaches its checkpoints while the process runs, also when it lags.
+  - The backup machine is down: no node makes a new checkpoint. The hot executors run on. A node that must restore waits for the backup machine, or for the rebuild from L1.
+  - The checkpoint executor diverges: it stops, as every executor does. The validator compares its BAL, so the divergence shows. The hot executors are not touched.
+  - Not covered: no CI profile has a node of role `backup`, so no chaos case runs the checkpoint executor yet. The deploy tests render its group and refuse an incomplete setting.
+- **Hot executors in the restore-only mode** (`KARDAMOM_EXEC_RESTORE_ONLY=on`)
+  - The hot executors run with `--checkpoint-interval-secs 0` and no block log. They keep `--checkpoint-dir` and `--checkpoint-peers`, so a cold start, a refused cursor and a rollback restore a peer checkpoint.
+  - The checkpoint executor is then the one source of new checkpoints (no second source). A rollback of a hot executor always takes the checkpoint of the backup machine.
+  - The checkpoints that a hot executor made before the switch stay in its directory and serve to its peers. Every list of peers names the checkpoint executor first. A fetch keeps the newest checkpoint, and skips a later peer with nothing newer without a download, so an old checkpoint of a hot executor is read only when the checkpoint executor has none that qualifies.
+  - A state mirror rebuild fetches the newest checkpoint of the checkpoint executor (`--checkpoint-peers`) into `/opt/kardamom/mirror/peer-checkpoints`. It restores the newest of that copy and of the local directory.
 - **Wedged executor**
   - Trigger: the block gauge of an executor is flat while the sealer boundaries keep advancing.
   - Effect: this contrast is the FROZEN verdict of the load harness. It tells a wedged replica from a quiescent chain. Absolute progress does not.

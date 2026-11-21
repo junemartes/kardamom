@@ -676,6 +676,12 @@ class Deploys(unittest.TestCase):
             self.write(Path(self.tmp.name) / relative, content)
         self.run_deploy(extra, environ=self.DEPLOY_ENVIRON if environ is None else environ)
 
+    def backup_inventory(self):
+        """An inventory with a node in the group backup, and return its path."""
+        inventory = Path(self.tmp.name) / 'backup-hosts.ini'
+        inventory.write_text('localhost ansible_connection=local\n[backup]\nbackup-0 ansible_connection=local\n')
+        return str(inventory)
+
     def records(self):
         """The record directory in the form of `files`."""
         name = self.record_dir.name
@@ -981,9 +987,7 @@ class DeployTest(Deploys):
         self.deploy()
         self.assertNotIn('cluster-backup', self.api.state['plans'])
         # With one, it registers the job on the sealer image, as a backup.
-        inventory = Path(self.tmp.name) / 'backup-hosts.ini'
-        inventory.write_text('localhost ansible_connection=local\n[backup]\nbackup-0 ansible_connection=local\n')
-        self.run_deploy({'workloads_backup_file_sync_level': '1'}, inventory=str(inventory))
+        self.run_deploy({'workloads_backup_file_sync_level': '1'}, inventory=self.backup_inventory())
         plans = self.api.state['plans']
         self.assertIn('cluster-backup', plans)
         task = plans['cluster-backup']['TaskGroups'][0]['Tasks'][0]
@@ -2824,6 +2828,138 @@ class CarryTest(Deploys):
                   for job in self.api.state['registrations'] if job['ID'] == 'executor']
         self.assertEqual(rolled, [['executor-0'], ['executor-0', 'executor-1'],
                                   ['executor-0', 'executor-1', 'executor-2']])
+
+    # The checkpoint executor on the backup node, beside the hot executors
+    # on the sealer nodes.
+    CHECKPOINT = ON_SEALERS | {'KARDAMOM_CHECKPOINT_EXECUTOR': 'on'}
+    CHECKPOINT_PEER = 'kardamom-executor-checkpoint.service.dc1.consul:9014'
+
+    @staticmethod
+    def group_task(job, name):
+        """The task of the group `name` of `job`."""
+        return next(g for g in job['TaskGroups'] if g['Name'] == name)['Tasks'][0]
+
+    @staticmethod
+    def checkpoint_setting(task):
+        """The checkpoint interval and the block log switch of an executor task."""
+        args = task['Config']['args']
+        return args[args.index('--checkpoint-interval-secs') + 1], task['Env']['KARDAMOM_CHECKPOINT_LOG']
+
+    def test_the_checkpoint_executor_runs_on_the_backup_node_beside_the_hot_executors(self):
+        """Staging step 1: the checkpoint executor makes checkpoints, and
+        the hot executors keep their interval. Every list of checkpoint
+        peers names the checkpoint executor."""
+        environ = self.CHECKPOINT | {'KARDAMOM_EXEC_CURSOR': 'on', 'KARDAMOM_CHECKPOINT_LOG': 'on'}
+        self.run_deploy(check=True, environ=environ, inventory=self.backup_inventory())
+        plans = self.api.state['plans']
+        executor = plans['executor']
+        groups = {g['Name']: g for g in executor['TaskGroups']}
+        self.assertEqual(list(groups), ['executor-0', 'executor-1', 'executor-2', 'executor-checkpoint'])
+        checkpoint = groups['executor-checkpoint']
+        self.assertEqual(checkpoint['Count'], 1)
+        self.assertEqual(checkpoint['Constraints'], [{'LTarget': '${meta.role}', 'RTarget': 'backup', 'Operand': '='}])
+        # A lag never holds a deployment: the task state decides the health.
+        self.assertEqual(checkpoint['Update']['HealthCheck'], 'task_states')
+        task = checkpoint['Tasks'][0]
+        args = task['Config']['args']
+        self.assertEqual(args[args.index('--recorder-id') + 1], '255')
+        self.assertEqual(args[args.index('--publish-receipts') + 1], 'false')
+        self.assertEqual(args[args.index('--egress') + 1], DeployTest.EGRESS_URL)
+        self.assertEqual(args[args.index('--checkpoint-interval-secs') + 1], '20')
+        self.assertEqual({'--void-voter-id', '--nonce-query-addr', '--carry-bytes', '--exec-frames'} & set(args),
+                         set())
+        self.assertEqual({k: task['Env'][k] for k in ('KARDAMOM_HOST_ID', 'KARDAMOM_EXEC_CURSOR',
+                                                      'KARDAMOM_CHECKPOINT_LOG')},
+                         {'KARDAMOM_HOST_ID': 'executor-checkpoint', 'KARDAMOM_EXEC_CURSOR': 'false',
+                          'KARDAMOM_CHECKPOINT_LOG': 'true'})
+        service = task['Services'][0]
+        self.assertEqual((service['Name'], [c['Type'] for c in service['Checks']]),
+                         ('kardamom-executor-checkpoint', ['tcp']))
+        # The checkpoint executor comes first, so a fetch reads no older
+        # checkpoint of a hot executor.
+        peers = ','.join([self.CHECKPOINT_PEER] + [f'sealer-{i}.node.dc1.consul:9014' for i in range(3)]
+                         + [f'executor-{i}.node.dc1.consul:9014' for i in range(3)])
+        self.assertEqual(args[args.index('--checkpoint-peers') + 1], peers)
+        for i in range(3):
+            hot = groups[f'executor-{i}']
+            args = hot['Tasks'][0]['Config']['args']
+            self.assertEqual(hot['Update']['HealthCheck'], 'checks')
+            self.assertEqual(args[args.index('--checkpoint-interval-secs') + 1], '20')
+            self.assertEqual(args[args.index('--checkpoint-peers') + 1], peers)
+            self.assertEqual({'--publish-receipts', '--egress'} & set(args), set())
+            self.assertIn('--exec-frames', args)
+            self.assertEqual(hot['Tasks'][0]['Env']['KARDAMOM_EXEC_CURSOR'], 'true')
+            self.assertEqual(hot['Tasks'][0]['Services'][0]['Name'], 'kardamom-executor')
+        validator = DeployTest.job_args(plans['validator'])
+        self.assertEqual(validator[validator.index('--checkpoint-peers') + 1].split(',')[0], self.CHECKPOINT_PEER)
+        # The state mirror fetches from the checkpoint executor, and checks
+        # the genesis of the executors.
+        mirror = DeployTest.job_args(plans['state-mirror'])
+        self.assertEqual(mirror[mirror.index('--checkpoint-peers') + 1], self.CHECKPOINT_PEER)
+        self.assertEqual(mirror[mirror.index('--chain') + 1], '/local/genesis.toml')
+        genesis = [{t['DestPath']: t['EmbeddedTmpl'] for t in self.group_task(job, name)['Templates']}
+                   ['local/genesis.toml'] for job, name in ((plans['state-mirror'], 'mirror'), (executor, 'executor-0'))]
+        self.assertEqual(genesis[0], genesis[1])
+        self.assertIn('kardamom-executor-checkpoint|any', json.dumps(plans['monitoring']))
+
+    def test_the_restore_only_mode_stops_the_checkpoints_of_the_hot_executors(self):
+        """Staging step 2: the hot executors make no checkpoint and no block
+        log. The checkpoint executor keeps both."""
+        environ = self.CHECKPOINT | {'KARDAMOM_EXEC_RESTORE_ONLY': 'on', 'KARDAMOM_CHECKPOINT_LOG': 'on'}
+        self.run_deploy(check=True, environ=environ, inventory=self.backup_inventory())
+        settings = {g['Name']: self.checkpoint_setting(g['Tasks'][0])
+                    for g in self.api.state['plans']['executor']['TaskGroups']}
+        self.assertEqual(settings, {'executor-0': ('0', 'false'), 'executor-1': ('0', 'false'),
+                                    'executor-2': ('0', 'false'), 'executor-checkpoint': ('20', 'true')})
+
+    def test_the_checkpoint_executor_on_the_executor_nodes_moves_the_role_into_the_group(self):
+        """With the executors on the executor nodes, the role constraint
+        moves from the job into the group, because the checkpoint group
+        runs on another role."""
+        self.run_deploy(check=True, environ=self.DEPLOY_ENVIRON | {'KARDAMOM_CHECKPOINT_EXECUTOR': 'on'},
+                        inventory=self.backup_inventory())
+        executor = self.api.state['plans']['executor']
+        self.assertIsNone(executor['Constraints'])
+        self.assertEqual([(g['Name'], g['Constraints']) for g in executor['TaskGroups']], [
+            ('executor', [{'LTarget': '', 'RTarget': 'true', 'Operand': 'distinct_hosts'},
+                          {'LTarget': '${meta.role}', 'RTarget': 'executor', 'Operand': '='}]),
+            ('executor-checkpoint', [{'LTarget': '${meta.role}', 'RTarget': 'backup', 'Operand': '='}])])
+
+    def test_the_checkpoint_switches_refuse_an_incomplete_setting(self):
+        backup = self.backup_inventory()
+        cases = (
+            ('a switch value that is not on or off', {'KARDAMOM_CHECKPOINT_EXECUTOR': 'yes'}, backup),
+            ('the checkpoint executor without a backup node', self.CHECKPOINT, 'localhost,'),
+            ('the checkpoint executor without the egress', DeployTest.ON_SEALERS
+             | {'KARDAMOM_CHECKPOINT_EXECUTOR': 'on'}, backup),
+            ('the restore-only mode without the checkpoint executor',
+             self.ON_SEALERS | {'KARDAMOM_EXEC_RESTORE_ONLY': 'on'}, backup),
+            ('the restore-only mode without a backup node', self.CHECKPOINT | {'KARDAMOM_EXEC_RESTORE_ONLY': 'on'},
+             'localhost,'),
+            ('a checkpoint interval of 0 without the checkpoint executor',
+             self.ON_SEALERS | {'KARDAMOM_CHECKPOINT_INTERVAL_S': '0'}, backup),
+        )
+        for name, environ, inventory in cases:
+            with self.subTest(name):
+                output = self.run_deploy(check=True, success=False, environ=environ, inventory=inventory)
+                self.assertIn('KARDAMOM_CHECKPOINT_EXECUTOR=on needs a node in the inventory group backup', output)
+                self.assertNotIn('plans', self.api.state)
+
+    def test_the_checkpoint_executor_rolls_after_the_move_to_the_sealer_nodes(self):
+        """The move to the sealer nodes keeps its order, one executor at a
+        time, and the checkpoint group starts last."""
+        self.deploy()
+        self.api.state['registrations'] = []
+        self.run_deploy(environ=self.CHECKPOINT, inventory=self.backup_inventory())
+        pinned = [('executor-0', 1), ('executor-1', 1), ('executor-2', 1)]
+        self.assertEqual(self.executor_steps(), [
+            [('executor', 2)],
+            [('executor-2', 1), ('executor', 2)],
+            [('executor-2', 1), ('executor', 1)],
+            [('executor-1', 1), ('executor-2', 1), ('executor', 1)],
+            [('executor-1', 1), ('executor-2', 1)],
+            pinned,
+            pinned + [('executor-checkpoint', 1)]])
 
     def test_the_version_floor_needs_every_reader_of_a_relayed_full_reference(self):
         self.deploy()

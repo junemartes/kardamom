@@ -1,8 +1,11 @@
 # kardamom-state-mirror projects every receipt batch's account rows and
 # receipts into Redis. One mirror runs next to each executor, on the
 # executor-class nodes: a rebuild reads the co-located executor's newest
-# checkpoint from /opt/kardamom/checkpoints. See
-# docs/specs/2026-09-13-redis-account-cache-design.md, sections 5.6 and 6.
+# checkpoint from /opt/kardamom/checkpoints. With the checkpoint executor,
+# a rebuild also fetches the newest checkpoint of the checkpoint executor
+# into /opt/kardamom/mirror/peer-checkpoints, and restores the newest of
+# the two. See docs/specs/2026-09-13-redis-account-cache-design.md,
+# sections 5.6 and 6.
 #
 # The mirror subscribes to tx_receipts and writes to Redis. It publishes
 # nothing on the L2 streams. Three mirrors write the same values through
@@ -55,6 +58,53 @@ variable "executor_count" {
   type        = number
   description = "The executor node count (node_classes.executor.count): the number of mirrors and of tx_receipts publishers."
   default     = 3
+}
+
+# The checkpoint executor, "on" or "off" (executor.nomad.hcl). On, a
+# rebuild fetches its newest checkpoint (--checkpoint-peers), because the
+# hot executors in restore-only mode make none. The fetch refuses a
+# checkpoint of another genesis, so the mirror then reads the genesis of
+# the chain (--chain). The deploy passes it from
+# KARDAMOM_CHECKPOINT_EXECUTOR.
+variable "checkpoint_executor" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.checkpoint_executor)
+    error_message = "The checkpoint_executor value must be on or off."
+  }
+}
+
+# The fragments of the genesis, as on the executor (executor.nomad.hcl):
+# the carry from genesis, the local canary and the priority fees. The
+# mirror renders the genesis only with the checkpoint executor.
+variable "genesis_carry" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.genesis_carry)
+    error_message = "The genesis_carry value must be on or off."
+  }
+}
+variable "canary_genesis" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.canary_genesis)
+    error_message = "The canary_genesis value must be on or off."
+  }
+}
+variable "priority_fees" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.priority_fees)
+    error_message = "The priority_fees value must be on or off."
+  }
+}
+
+locals {
+  checkpoint = var.checkpoint_executor == "on"
 }
 
 job "state-mirror" {
@@ -135,7 +185,7 @@ job "state-mirror" {
           # The local head file and the rebuild scratch copy.
           "/opt/kardamom/mirror:/opt/kardamom/mirror",
         ]
-        args = [
+        args = concat([
           "--config", "/local/state-mirror.toml",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
@@ -148,13 +198,35 @@ job "state-mirror" {
           # Bind the exporter on all interfaces; the chaos suite probes
           # it over the cluster bridge (ports.state_mirror_metrics).
           "--metrics-addr", "0.0.0.0:9007",
-        ]
+          ],
+          # The checkpoint executor by its Consul service, as on the
+          # executors (executor.nomad.hcl).
+          local.checkpoint ? [
+            "--checkpoint-peers", "kardamom-executor-checkpoint.service.${var.datacenter}.consul:9014",
+            "--chain", "/local/genesis.toml",
+          ] : [],
+        )
       }
 
       template {
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")
         change_mode = "noop"
+      }
+
+      # The chain genesis, the same file as the executor renders. A fetch
+      # refuses a peer checkpoint whose genesis digest differs.
+      dynamic "template" {
+        for_each = local.checkpoint ? ["local/genesis.toml"] : []
+        content {
+          destination = template.value
+          data = join("\n", concat(
+            var.genesis_carry == "on" ? [file("config/genesis/carry.toml")] : [],
+            [file("config/genesis/dev.toml")],
+            var.canary_genesis == "on" ? [file("config/genesis/canary.toml")] : [],
+            var.priority_fees == "on" ? [file("config/genesis/fees.toml")] : [],
+          ))
+        }
       }
 
       # The [cache] section: the three sentinels by their node records.

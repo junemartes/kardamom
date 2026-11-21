@@ -151,6 +151,18 @@ variable "executor_count" {
   default     = 3
 }
 
+# The checkpoint executor, "on" or "off" (executor.nomad.hcl). On, the
+# checkpoint peers also name the checkpoint executor by its Consul
+# service. The deploy passes it from KARDAMOM_CHECKPOINT_EXECUTOR.
+variable "checkpoint_executor" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.checkpoint_executor)
+    error_message = "The checkpoint_executor value must be on or off."
+  }
+}
+
 job "validator" {
   # The validator of this release re-executes the nonce of a skipped
   # transaction as the executor does once FEATURE_SEALER_V3 is active. An
@@ -341,7 +353,11 @@ job "validator" {
           # the executors' serve endpoints, and adopt it on restart,
           # the same as the executors' recovery-D loop.
           "--checkpoint-dir", "/opt/kardamom/checkpoints",
-          "--checkpoint-peers", join(",", [for i in range(var.executor_count) : "${var.exec_on_sealers == "on" ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:9014"]),
+          # The checkpoint executor comes first, as on the executors.
+          "--checkpoint-peers", join(",", concat(
+            var.checkpoint_executor == "on" ? ["kardamom-executor-checkpoint.service.${var.datacenter}.consul:9014"] : [],
+            [for i in range(var.executor_count) : "${var.exec_on_sealers == "on" ? "sealer" : "executor"}-${i}.node.${var.datacenter}.consul:9014"],
+          )),
           # Shadow-check the node-incremental state trie against a
           # full rebuild every 8th block. A walker bug fail-stops the
           # validator (a dead alloc is a verdict failure), and bumps
