@@ -71,9 +71,8 @@ fn chain_logged(state_dir: &Path, ckpt_dir: &Path, upto: u64, checkpoints: &[u64
         queue: std::num::NonZeroUsize::new(64).unwrap(),
         sync_every: std::time::Duration::from_millis(10),
     };
-    let (feed, log_thread) =
-        kardamom_state::checkpoint::log_thread::BlockLogThread::spawn(&env, &cfg).unwrap();
-    let mut writer = StateWriter::spawn_with_log(env.clone(), feed).unwrap();
+    let log = kardamom_state::checkpoint::log_thread::BlockLogThread::spawn(&env, &cfg).unwrap();
+    let mut writer = StateWriter::spawn_with_log(env.clone(), log).unwrap();
     for block in 1..=upto {
         commit_on(&mut writer, block);
         if checkpoints.contains(&block) {
@@ -81,7 +80,6 @@ fn chain_logged(state_dir: &Path, ckpt_dir: &Path, upto: u64, checkpoints: &[u64
         }
     }
     writer.shutdown().unwrap();
-    log_thread.join().unwrap();
 }
 
 /// The blocks of the checkpoints in `dir`, oldest first.

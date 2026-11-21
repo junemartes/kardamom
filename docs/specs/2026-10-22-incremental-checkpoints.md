@@ -78,11 +78,19 @@ The short period exists for two of these uses:
 - The writer never waits for the log. When the channel is full, the writer drops the batch, and
   the log has a gap. The executor counts `kardamom_checkpoint_log_dropped_total`, and the next
   base starts at once. A slow disk then costs restore points, but never slows the state commit.
+- The log thread writes its buffered records into the file each time the channel is empty, with
+  no sync. A record in the file outlives an exit of the process that runs no drop, such as the
+  exit of the Aeron error handler after the loss of the media driver. Only a loss of power or of
+  the kernel loses it.
+- The stop of the state writer joins the log thread after the writer thread. The log thread takes
+  the last batches, syncs, and ends. So a graceful stop, and an end of the run after an error,
+  leave no gap.
 - At start, the log thread compares the end of the log with `last_committed_block` of the state
   database:
   - The log ends at the database block: the log continues.
-  - The log ends below the database block (a crash between two syncs): the blocks between are a
-    gap. A new base starts at once.
+  - The log ends below the database block: the blocks between are a gap. A new base starts at
+    once. The database syncs each commit, and the log syncs once a second, so a loss of power or a
+    batch that was still in the channel at a hard kill causes this case.
   - The log ends above the database block: the log thread cuts the records above the database
     block. The executor executes those blocks again.
 

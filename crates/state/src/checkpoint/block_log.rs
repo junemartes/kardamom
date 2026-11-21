@@ -446,6 +446,18 @@ impl BlockLogWriter {
         self.open.as_mut().map_or(Ok(()), OpenSegment::sync)
     }
 
+    /// Write the buffered records into the file, with no sync. A record in
+    /// the file outlives an exit of the process, but not a loss of power.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails.
+    pub fn flush(&mut self) -> Result<(), StateError> {
+        self.open
+            .as_mut()
+            .map_or(Ok(()), |s| s.writer.flush().map_err(StateError::from))
+    }
+
     /// The open segment that `block` continues, or a new one that starts
     /// at `block`.
     fn segment_for(&mut self, block: u64) -> Result<&mut OpenSegment, StateError> {

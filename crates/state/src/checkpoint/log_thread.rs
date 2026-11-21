@@ -8,6 +8,18 @@
 //! period. The state database stays the source of truth: the log is
 //! durable only so that a restore after a crash finds it.
 //!
+//! The state database syncs each commit, and the log syncs on its period.
+//! So the database is ahead of the log after every end of the process that
+//! loses a batch. Two rules keep the log level with the database:
+//!
+//! - The thread writes its buffered records into the file each time the
+//!   queue is empty. A record in the file outlives an exit of the process
+//!   that runs no drop, such as the exit of the Aeron error handler. Only a
+//!   loss of power or of the kernel loses it.
+//! - The stop of the state writer joins this thread after the writer
+//!   thread. The thread takes the last batches, syncs, and ends, so the
+//!   process can exit at once after the stop.
+//!
 //! At start the thread matches the log to the last committed block of the
 //! state database. It cuts the records above that block, because the
 //! executor executes those blocks again. A log that ends below that block
@@ -32,7 +44,7 @@ use crate::writer::WriteBatch;
 
 /// The batches that the full queue dropped.
 const LOG_DROPPED: &str = "kardamom_checkpoint_log_dropped_total";
-/// The appends and syncs of the log that failed.
+/// The appends, flushes and syncs of the log that failed.
 const LOG_FAILED: &str = "kardamom_checkpoint_log_failed_total";
 
 /// The settings of the block log.
@@ -46,6 +58,13 @@ pub struct LogConfig {
     pub queue: NonZeroUsize,
     /// The period of the sync.
     pub sync_every: Duration,
+}
+
+/// A started log thread: the feed for the state writer, and the thread
+/// that the stop of the writer joins.
+pub struct LogThread {
+    pub(crate) feed: LogFeed,
+    pub(crate) join: JoinHandle<()>,
 }
 
 /// The side of the block log that the state writer holds.
@@ -79,7 +98,7 @@ impl BlockLogThread {
     ///
     /// Returns an error when `env` has no genesis digest, or when the log
     /// does not open or cut.
-    pub fn spawn(env: &StateEnv, cfg: &LogConfig) -> Result<(LogFeed, JoinHandle<()>), StateError> {
+    pub fn spawn(env: &StateEnv, cfg: &LogConfig) -> Result<LogThread, StateError> {
         let identity = LogIdentity {
             genesis: stored_genesis_digest(env)?,
             schema: SCHEMA_VERSION,
@@ -97,7 +116,10 @@ impl BlockLogThread {
         let join = thread::Builder::new()
             .name("kardamom-block-log".into())
             .spawn(move || thread.run())?;
-        Ok((LogFeed { tx }, join))
+        Ok(LogThread {
+            feed: LogFeed { tx },
+            join,
+        })
     }
 
     fn run(mut self) {
@@ -109,7 +131,7 @@ impl BlockLogThread {
     /// batches are synced.
     fn step(&mut self) -> ControlFlow<()> {
         match self.rx.recv_timeout(self.sync_every) {
-            Ok(batch) => self.append(&batch),
+            Ok(batch) => self.take(&batch),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 self.sync();
@@ -122,9 +144,15 @@ impl BlockLogThread {
         ControlFlow::Continue(())
     }
 
-    fn append(&mut self, batch: &WriteBatch) {
+    /// Append `batch`. When no batch waits behind it, write the buffered
+    /// records into the file, so an exit with no drop keeps them.
+    fn take(&mut self, batch: &WriteBatch) {
         let result = self.log.append(batch);
         self.on_failure(result, "append");
+        if self.rx.is_empty() {
+            let result = self.log.flush();
+            self.on_failure(result, "flush");
+        }
     }
 
     fn sync(&mut self) {

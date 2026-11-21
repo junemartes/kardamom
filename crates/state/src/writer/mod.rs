@@ -26,7 +26,7 @@ use kardamom_obs::pipeline::{LoopMeter, LoopState};
 use kardamom_types::{BlockBoundary, BlockDelta, TxRef};
 use tracing::{debug, error, info, warn};
 
-use crate::checkpoint::log_thread::LogFeed;
+use crate::checkpoint::log_thread::{LogFeed, LogThread};
 use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::snapshot::StateSnapshot;
@@ -114,11 +114,16 @@ pub struct WriterHandle {
     pub delta_tx: Sender<WriteBatch>,
     pub snapshot_rx: SnapshotReceiver,
     join: Option<JoinHandle<Result<(), StateError>>>,
+    /// The block log thread behind the writer, when one runs. It ends
+    /// after the writer thread, when the feed of the writer is gone.
+    log_join: Option<JoinHandle<()>>,
 }
 
 impl WriterHandle {
-    /// Stop the writer and wait for its thread to exit. Returns the writer's
-    /// final result.
+    /// Stop the writer and wait for its thread to exit, then wait for the
+    /// block log thread to take the last batches and sync. Returns the
+    /// writer's final result. The process may exit at once after this call
+    /// and keep every committed block in the log.
     ///
     /// The writer thread exits when the delta channel closes, so this handle's
     /// sender is replaced with a disconnected one before the join. Any OTHER
@@ -132,15 +137,19 @@ impl WriterHandle {
     ///
     /// # Panics
     ///
-    /// Panics if the writer thread itself panicked, by propagating that
-    /// panic into the caller.
+    /// Panics if the writer thread or the block log thread panicked, by
+    /// propagating that panic into the caller.
     pub fn shutdown(&mut self) -> Result<(), StateError> {
         let (closed_tx, _) = crossbeam_channel::bounded(0);
         drop(std::mem::replace(&mut self.delta_tx, closed_tx));
-        match self.join.take() {
-            Some(j) => j.join().expect("writer thread panicked"),
-            None => Ok(()),
+        let result = self
+            .join
+            .take()
+            .map_or(Ok(()), |j| j.join().expect("writer thread panicked"));
+        if let Some(log) = self.log_join.take() {
+            log.join().expect("block log thread panicked");
         }
+        result
     }
 }
 
@@ -199,13 +208,13 @@ impl StateWriter {
     }
 
     /// Spawn the plain writer, and offer each committed batch to the block
-    /// log of the checkpoints on `log`.
+    /// log thread `log`. The stop of the writer joins `log`.
     ///
     /// # Errors
     ///
     /// Returns [`StateError`] if the schema-version check fails, or if the
     /// writer thread or its initial snapshot cannot be created.
-    pub fn spawn_with_log(env: StateEnv, log: LogFeed) -> Result<WriterHandle, StateError> {
+    pub fn spawn_with_log(env: StateEnv, log: LogThread) -> Result<WriterHandle, StateError> {
         Self::spawn_inner(env, TrieMode::Off, Some(log))
     }
 
@@ -239,7 +248,7 @@ impl StateWriter {
     fn spawn_inner(
         env: StateEnv,
         trie_mode: TrieMode,
-        log: Option<LogFeed>,
+        log: Option<LogThread>,
     ) -> Result<WriterHandle, StateError> {
         // This channel is bounded, HORIZON_BLOCKS deep. If the writer falls
         // behind by more than the version horizon, the executor blocks
@@ -257,6 +266,7 @@ impl StateWriter {
         // Publish an initial snapshot at the current cursors.
         let initial = StateSnapshot::open(&env)?;
         snapshot_handle.publish(initial);
+        let (feed, log_join) = log.map(|l| (l.feed, l.join)).unzip();
 
         let writer = StateWriter {
             env,
@@ -265,7 +275,7 @@ impl StateWriter {
             trie_mode,
             meter: LoopMeter::new("state.writer"),
             steps: apply::CommitSteps::new(),
-            log,
+            log: feed,
         };
 
         let join = thread::Builder::new()
@@ -276,6 +286,7 @@ impl StateWriter {
             delta_tx,
             snapshot_rx,
             join: Some(join),
+            log_join,
         })
     }
 
