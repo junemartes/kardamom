@@ -9,6 +9,11 @@
 //! executor that moves must end with the receipts, the boundaries and the
 //! accounts of an executor that never moves, and every deposit must
 //! credit exactly once, in L1 order.
+//!
+//! An executor that reads the cluster egress, with `--egress`, takes the
+//! same detour through the egress when the sealer refuses its cursor below
+//! the window: one run on the range read of the egress up to its head, then
+//! the cluster egress again.
 
 #[path = "carry_move/chain.rs"]
 mod chain;
@@ -36,4 +41,15 @@ fn the_other_executors_move_one_at_a_time_and_match_the_reference() {
     for cut in [2, 6] {
         chain.moving(cut).assert_matches(&reference, &chain);
     }
+}
+
+/// A cursor that the sealer refuses after block 2: the next run reads the
+/// range read of the egress through block 5, across the second deposit,
+/// and ends at the head. The run after it reads the cluster egress again.
+/// The executor ends with the state of the executor that never moves.
+#[test]
+fn a_refused_cursor_reads_the_egress_up_to_its_head_then_the_cluster_again() {
+    let chain = Chain::new();
+    let reference = chain.reference();
+    chain.detour(2, 5).assert_matches(&reference, &chain);
 }

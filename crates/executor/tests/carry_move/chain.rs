@@ -2,8 +2,8 @@
 
 use alloy_primitives::{Address, B256, U256, keccak256};
 use kardamom_engine::actor::fixtures::{
-    ChannelHarness, HarnessInput, HarnessOutcome, HarnessSetup, LegacyTx, TestEgress, TestEntry,
-    TestStream, byte_signer,
+    ChannelHarness, EgressReader, HarnessInput, HarnessOutcome, HarnessSetup, LegacyTx, TestEgress,
+    TestEntry, TestStream, byte_signer,
 };
 use kardamom_engine::reader::cluster::ReplayCursor;
 use kardamom_engine::{
@@ -145,10 +145,21 @@ impl Chain {
             .build()
     }
 
-    /// Run the blocks to `last` in reference mode: the records and the
-    /// boundaries on the cluster egress, the envelopes on lane 0.
-    fn by_reference(&self, last: u64) -> HarnessOutcome {
-        let part = || self.entries.iter().filter(move |(b, ..)| *b <= last);
+    /// Run the blocks after `start` to `last` in reference mode, on the
+    /// state `snap`: the records and the boundaries on the cluster egress,
+    /// the envelopes on lane 0.
+    fn by_reference(
+        &self,
+        start: ResumePoint,
+        snap: MockStateDatabase,
+        last: u64,
+    ) -> HarnessOutcome {
+        let first = start.block;
+        let part = || {
+            self.entries
+                .iter()
+                .filter(move |(b, ..)| *b > first && *b <= last)
+        };
         let tx_data = part()
             .filter_map(|(_, index, kind)| match kind {
                 Kind::Tx(tx) => Some((BPosition::from_index(*index), tx.clone())),
@@ -169,7 +180,7 @@ impl Chain {
             })
             .collect();
         ChannelHarness::run(
-            Self::setup(ResumePoint::GENESIS, self.genesis()),
+            Self::setup(start, snap),
             HarnessInput {
                 tx_data: vec![tx_data],
                 tx_ordering,
@@ -181,9 +192,23 @@ impl Chain {
     /// before committed: a reader of an egress that serves every entry
     /// with its bytes, from the cursor after the committed block.
     fn carried(&self, start: ResumePoint, snap: MockStateDatabase) -> HarnessOutcome {
+        self.on_egress(start, snap, BLOCKS, |reader| reader)
+    }
+
+    /// Run on an egress that stores the blocks to `last`, from the cursor
+    /// after `start`, on the state `snap`. `open` makes the reader of the
+    /// run from the reader as a binary with `--egress` opens it.
+    fn on_egress(
+        &self,
+        start: ResumePoint,
+        snap: MockStateDatabase,
+        last: u64,
+        open: impl FnOnce(EgressReader) -> EgressReader,
+    ) -> HarnessOutcome {
         let frames = TestStream(
             self.entries
                 .iter()
+                .filter(|(b, ..)| *b <= last)
                 .map(|(.., kind)| Self::entry(kind))
                 .collect(),
         )
@@ -192,21 +217,53 @@ impl Chain {
         let dir = tempfile::tempdir().unwrap();
         let egress = TestEgress::serve(&rt, dir.path(), TestEgress::GENESIS, &frames);
         let cursor = ReplayCursor::new(start.record_count, start.block + 1);
-        ChannelHarness::run_on_egress(Self::setup(start, snap), egress.reader(&rt, cursor))
+        ChannelHarness::run_on_egress(Self::setup(start, snap), open(egress.reader(&rt, cursor)))
+    }
+
+    /// Run the blocks after `start` from the range read of an egress that
+    /// stores the blocks to `head`, up to its head, on the state `snap`. The
+    /// run ends at the head of the egress.
+    fn up_to_head(&self, start: ResumePoint, snap: MockStateDatabase, head: u64) -> HarnessOutcome {
+        let outcome = self.on_egress(start, snap, head, |reader| EgressReader {
+            sub: reader.sub.until_head(),
+            live: reader.live,
+        });
+        assert!(
+            matches!(outcome.result, Err(ExecutorError::HeadReached { .. })),
+            "the run ends at the head of the egress: {:?}",
+            outcome.result
+        );
+        HarnessOutcome {
+            result: Ok(()),
+            ..outcome
+        }
     }
 
     /// The executor that never moves.
     pub(super) fn reference(&self) -> Run {
-        Run::of(self.by_reference(BLOCKS))
+        Run::of(self.by_reference(ResumePoint::GENESIS, self.genesis(), BLOCKS))
     }
 
     /// An executor that moves to carry mode after block `cut`: it runs the
     /// blocks to `cut` by reference, stops, and runs the rest in carry mode
     /// from the state that it committed.
     pub(super) fn moving(&self, cut: u64) -> Run {
-        let head = Run::of(self.by_reference(cut));
+        let head = Run::of(self.by_reference(ResumePoint::GENESIS, self.genesis(), cut));
         let tail = Run::of(self.carried(head.resume(), head.state.clone()));
         head.then(tail)
+    }
+
+    /// An executor that reads the cluster egress, and whose cursor the
+    /// sealer refuses after block `cut`. It runs the blocks to `cut` by
+    /// reference. The next run reads the range read of an egress that
+    /// stores the blocks to `head`, and ends at the head. The run after it
+    /// runs the rest by reference again. Each run starts from the state
+    /// that the run before committed.
+    pub(super) fn detour(&self, cut: u64, head: u64) -> Run {
+        let before = Run::of(self.by_reference(ResumePoint::GENESIS, self.genesis(), cut));
+        let egress = Run::of(self.up_to_head(before.resume(), before.state.clone(), head));
+        let after = Run::of(self.by_reference(egress.resume(), egress.state.clone(), BLOCKS));
+        before.then(egress).then(after)
     }
 
     /// The source hash of each deposit, in L1 order.

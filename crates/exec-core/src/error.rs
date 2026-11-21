@@ -132,6 +132,15 @@ pub enum ExecutorError {
     )]
     SourceRestarted { next_index: u64, next_block: u64 },
 
+    /// A reader that reads a source only up to its head reached that head.
+    /// An executor reads the range read of the egress this way, for a
+    /// cursor below the window of the sealer. The run ends, and the next
+    /// run reads the cluster egress from the state DB.
+    #[error(
+        "the source reached its head (delivery cursor index {next_index}, block {next_block}): read the cluster egress again"
+    )]
+    HeadReached { next_index: u64, next_block: u64 },
+
     /// Every source of the carried reader holds a transaction reference at
     /// `index`, and the reader has no `tx_data` lane to join it. Another
     /// source or a restart gets the same reference, so the consumer stops.

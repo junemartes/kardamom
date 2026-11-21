@@ -113,15 +113,39 @@ pub(crate) struct Args {
     /// the egress. Off: the executor publishes no frame.
     #[arg(long, env = "KARDAMOM_EXEC_FRAMES", default_value_t = false)]
     pub(crate) exec_frames: bool,
-    /// With `--carry-bytes`: the egress at this base URL
-    /// (`http://host:port`). A cursor below the replay window of the member
-    /// reads the range read of the egress up to its head, then the live
-    /// `egress_order`, and goes back to the member feed once the feed
-    /// serves the cursor again. A cursor below the floor of the egress too
-    /// goes to a peer checkpoint. Off: a cursor below the window goes to a
-    /// peer checkpoint at once.
-    #[arg(long, env = "KARDAMOM_EGRESS_URL", requires = "carry_bytes")]
+    /// The egress at this base URL (`http://host:port`), the second source
+    /// of the canonical stream.
+    ///
+    /// - With `--carry-bytes`: a cursor below the replay window of the
+    ///   member reads the range read of the egress up to its head, then the
+    ///   live `egress_order`, and goes back to the member feed once the
+    ///   feed serves the cursor again.
+    /// - Without it: a cursor that the sealer refuses below its window
+    ///   ends the run. The next run reads the range read of the egress up
+    ///   to its head, and the run after it reads the cluster egress again.
+    ///
+    /// A cursor below the floor of the egress too goes to a peer
+    /// checkpoint. Off: a cursor below the window goes to a peer checkpoint
+    /// at once.
+    #[arg(long, env = "KARDAMOM_EGRESS_URL")]
     pub(crate) egress: Option<String>,
+    /// Publish the receipts, the block boundaries and the rollback records
+    /// of this executor on `tx_receipts`, and its lifecycle on `events`.
+    /// Off: the executor opens no `tx_receipts` publication and no
+    /// lifecycle beacon. It still executes and commits every block, and
+    /// publishes its BAL. An executor that only makes checkpoints runs with
+    /// this off: a late copy of a receipt from an executor that lags can
+    /// fall outside the dedup window of the readers, and the ingress pauses
+    /// submits only when every executor that serves receipts is halted.
+    /// Off is refused with `--carry-bytes`: the receipt ledger of a carry
+    /// executor records the published receipts.
+    #[arg(
+        long,
+        env = "KARDAMOM_PUBLISH_RECEIPTS",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub(crate) publish_receipts: bool,
     /// With `--carry-bytes`: how many committed blocks below its cursor the
     /// executor compares with the member feed at each start, before it
     /// executes a frame. A difference rolls the state back to a checkpoint
@@ -293,6 +317,31 @@ impl Args {
             (true, false, None) => anyhow::bail!("--exec-cursor needs --void-voter-id"),
         }
     }
+
+    /// Check the receipt switch against the input source, once at start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `--publish-receipts false` comes with
+    /// `--carry-bytes`: the receipt ledger and the rollback marker of a
+    /// carry executor follow the published receipts.
+    pub(crate) fn check_receipts(&self) -> anyhow::Result<()> {
+        if !self.publish_receipts && self.carry_bytes {
+            anyhow::bail!(
+                "--publish-receipts false does not go with --carry-bytes: the receipt \
+                 ledger of a carry executor records the published receipts"
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether a cursor that the sealer refuses below its window reads the
+    /// range read of the egress in the next run: `--egress` on an executor
+    /// that reads the cluster egress. A carry executor reads the egress
+    /// inside its run.
+    pub(crate) fn egress_after_refusal(&self) -> bool {
+        self.egress.is_some() && !self.carry_bytes
+    }
 }
 
 #[cfg(test)]
@@ -333,18 +382,54 @@ mod tests {
     }
 
     #[test]
-    fn the_egress_needs_carry_bytes() {
-        let refused = Args::try_parse_from([
-            "kardamom-executor",
-            "--config",
-            "executor.toml",
+    fn the_egress_goes_with_and_without_carry_bytes() {
+        let url = "http://127.0.0.1:8548";
+        let cluster = parse(&["--egress", url]);
+        assert_eq!(cluster.egress.as_deref(), Some(url));
+        assert!(
+            cluster.egress_after_refusal(),
+            "a reader of the cluster egress reads the egress in the next run"
+        );
+        let carried = parse(&["--carry-bytes", "--egress", url]);
+        assert_eq!(carried.egress.as_deref(), Some(url));
+        assert!(
+            !carried.egress_after_refusal(),
+            "a carry executor reads the egress inside its run"
+        );
+        assert_eq!(parse(&["--carry-bytes"]).egress, None, "off by default");
+        assert!(!parse(&[]).egress_after_refusal());
+    }
+
+    #[test]
+    fn the_receipts_are_on_by_default_and_off_needs_the_cluster_egress() {
+        assert!(parse(&[]).publish_receipts, "on by default");
+        assert!(parse(&["--publish-receipts", "true"]).publish_receipts);
+        let off = parse(&["--publish-receipts", "false"]);
+        assert!(!off.publish_receipts);
+        off.check_receipts().expect("valid");
+        let carried = parse(&["--publish-receipts", "false", "--carry-bytes"]);
+        let error = carried.check_receipts().expect_err("refused");
+        assert!(error.to_string().contains("--carry-bytes"), "{error}");
+        parse(&["--publish-receipts", "true", "--carry-bytes"])
+            .check_receipts()
+            .expect("valid");
+    }
+
+    /// The checkpoint executor of the backup machine: no void voter, no
+    /// recorded cursor, no receipts, and the egress for a refused cursor.
+    #[test]
+    fn the_checkpoint_executor_has_no_voter_no_cursor_and_no_receipts() {
+        let args = parse(&[
+            "--publish-receipts",
+            "false",
             "--egress",
             "http://127.0.0.1:8548",
         ]);
-        assert!(refused.is_err(), "the egress serves only the carried bytes");
-        let on = parse(&["--carry-bytes", "--egress", "http://127.0.0.1:8548"]);
-        assert_eq!(on.egress.as_deref(), Some("http://127.0.0.1:8548"));
-        assert_eq!(parse(&["--carry-bytes"]).egress, None, "off by default");
+        assert_eq!(args.void_voter_id, None, "no void voter");
+        assert_eq!(args.recorded_cursor_id().expect("valid"), None, "no cursor");
+        args.check_receipts().expect("valid");
+        assert!(!args.publish_receipts, "no receipts");
+        assert!(args.egress_after_refusal());
     }
 
     #[test]
