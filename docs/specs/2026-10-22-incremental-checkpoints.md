@@ -108,6 +108,20 @@ The short period exists for two of these uses:
   limit, and counts `kardamom_checkpoint_copy_unlimited_total`.
 - A long read transaction keeps old pages alive in the database, so the rate limit has a lower
   bound: the copy of a base must end before the next base starts.
+- **The limited copy makes the state file grow, in a loop.** The writer cannot reuse a page that
+  the read snapshot of the copy holds, so the file grows by the pages that the load writes during
+  the copy. The file never gives the free pages back, because they are not at its end. The next
+  limited copy holds those free pages too, so it takes longer and lets the file grow more. On
+  staging the state of executor-0 grew from 9 GB to 45 GB in five days, with 363 accounts. The
+  test `a_slow_copy_under_load_grows_the_file_and_the_next_image` shows the loop: one copy of
+  2 MiB of used pages at 4 MiB/s let the file grow from 795 to 9,165 pages, and the next image
+  was 150 MB, against 2 MB compacted.
+- **A rate of 0 has no limit** (`--checkpoint-copy-mib-per-sec 0`). The base is then a compacted
+  copy at the speed of the disk. Its read snapshot lives only for the time of one compacted copy,
+  which depends on the used pages, not on the size of the file. Its image holds only the used
+  pages, so a restore of it gives a compacted state file. This breaks the loop. The checkpoint
+  executor on the backup machine copies with no limit, because no sealer commit waits on that
+  disk.
 
 Estimate for staging at 1,000 tx/s:
 
@@ -159,7 +173,7 @@ once and renames the directory into place. A crash during the restore leaves no 
 | `--checkpoint-log` | `false` | Write the block log and make bases by the rule of section 3.4. `false` keeps the full copy each `--checkpoint-interval-secs`. |
 | `--checkpoint-base-log-percent` | `100` | A new base when the log after the newest base is larger than this percent of the size of that base. |
 | `--checkpoint-base-max-age-secs` | `21600` | A new base when the newest base is older than this. |
-| `--checkpoint-copy-mib-per-sec` | `16` | The rate limit of a base copy. |
+| `--checkpoint-copy-mib-per-sec` | `16` | The rate limit of a base copy. `0` has no limit: a compacted copy. |
 | `--checkpoint-log-segment-mib` | `64` | The size of one log segment. |
 | `--checkpoint-keep` | `2` with the log | The bases to keep, with their log. |
 

@@ -496,6 +496,7 @@ The checkpoint executor:
 - It runs `--publish-receipts false`, with no `--void-voter-id`, no recorded cursor, no `--carry-bytes`, no `--exec-frames` and no `--nonce-query-addr`. No reader, no sealer and no sequencer waits for it.
 - It reads the cluster egress, and the range read of the egress (`--egress`) for a cursor below the sealer window.
 - It always makes checkpoints with the block log, every 20 s, whatever the hot executors use.
+- It copies a base with no rate limit (`--checkpoint-copy-mib-per-sec 0`): a compacted copy at the speed of its disk. The hot executors keep 16 MiB/s. A limited copy lets the state file grow with each base, and its image holds the free pages too.
 - Its recorder id is 255, outside the ids of the hot executors. It names no `tx_receipts` endpoint, because the executor publishes no receipts. Its host id is `executor-checkpoint`.
 - It registers the Consul service `kardamom-executor-checkpoint` with a TCP check, not `kardamom-executor` with `/ready`. So the record resolves while the process runs, also when it lags. No client finds the hot executors through a Consul service: each one names them by their node records.
 - Its deployment waits only for its task to run (`task_states`). In the staged roll of the executor job, it rolls after the hot executors.

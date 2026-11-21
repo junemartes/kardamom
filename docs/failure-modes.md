@@ -498,6 +498,8 @@ The executors are deterministic state machines. One dead or lagging replica neve
   - With `--checkpoint-log` (job variable `checkpoint_log`), a checkpoint is a base image and the block log after it: the write batch of each committed block.
     - A restore copies the base and applies the log through the state writer. So each block of the log is a restore point.
     - The executor copies the state only when the base rule asks for a new base: the log after the newest base is larger than that base, the base is old, or the log has a gap. The copy has a rate limit, so it does not take the disk from a sealer on the same host.
+    - The limited copy holds one read snapshot for its whole time, and it copies the free pages too. So under load the state file grows during each copy, and the next copy is longer. The file never gives the free pages back. The checkpoint executor copies with no limit (`--checkpoint-copy-mib-per-sec 0`): a compacted copy, whose image holds only the used pages. A restore of such a base gives a compacted state file.
+    - Proof: `a_slow_copy_under_load_grows_the_file_and_the_next_image` and `a_copy_with_no_limit_under_load_holds_only_the_used_pages`.
     - A rollback restores the block just before the divergence, and cuts the log there.
     - A peer serves its log after its base (`GET /checkpoint/log`), so a peer base below a retention floor serves when its log reaches the floor.
     - The writer never waits for the log. A full queue drops the batch (`kardamom_checkpoint_log_dropped_total`), and the gap makes the next base start at once.

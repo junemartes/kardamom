@@ -53,8 +53,9 @@ pub struct BlockLogConfig {
     pub base_log_percent: NonZeroU64,
     /// A new base when the newest base is older than this, in seconds.
     pub base_max_age_secs: NonZeroU64,
-    /// The rate limit of the copy of a base, in MiB a second.
-    pub copy_mib_per_sec: NonZeroU64,
+    /// The rate limit of the copy of a base, in MiB a second. `None` has
+    /// no limit: a compacted copy at the speed of the disk.
+    pub copy_mib_per_sec: Option<NonZeroU64>,
     /// The size of one segment of the log, in MiB.
     pub segment_mib: NonZeroU64,
 }
@@ -241,7 +242,11 @@ impl CheckpointLog {
             return Ok(None);
         };
         let segment_bytes = Self::bytes(settings.segment_mib)?;
-        let rate = Self::bytes(settings.copy_mib_per_sec)?;
+        let rate = settings
+            .copy_mib_per_sec
+            .map(Self::bytes)
+            .transpose()?
+            .map_or(CopyRate::Unlimited, CopyRate::Limited);
         Ok(Some(Self {
             log: LogConfig {
                 dir: dir.join(LOG_DIR),
@@ -255,7 +260,7 @@ impl CheckpointLog {
                     max_age: std::time::Duration::from_secs(settings.base_max_age_secs.get()),
                     segment_bytes,
                 },
-                rate: CopyRate::Limited(rate),
+                rate,
                 keep: cfg.checkpoint_keep,
             },
         }))

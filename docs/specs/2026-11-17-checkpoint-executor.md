@@ -26,13 +26,18 @@
   about 4 ms to 8-9 ms. The copies on the two follower machines caused no tail.
 - The copy keeps the free pages, and its read snapshot makes the database file grow
   (`crates/state/src/checkpoint/copy_rate.rs`). The bases grew from 9 GB to about 30 GB in one
-  day, so each copy now takes 30 minutes or more.
+  day, so each copy now takes 30 minutes or more. A longer copy lets the file grow more, so the
+  growth is a loop: 45 GB after five days.
 
 ## 2. The design
 
 - **The checkpoint executor.** A fourth executor runs on the node of role `backup` (the backup
   sealer machine, outside the quorum). It executes every block, and it writes the bases and the
   block log. It serves them on `:9014`, as the other executors do.
+- **Its bases have no rate limit** (`--checkpoint-copy-mib-per-sec 0`). A base is a compacted
+  copy at the speed of its disk. No sealer commit waits on that disk. So the read snapshot of the
+  copy is short, the state file does not grow with each base, and each base holds only the used
+  pages.
 - **The hot executors.** The three executors on the sealer machines make no checkpoint
   (`--checkpoint-interval-secs 0`, `--checkpoint-log` off). They keep `--checkpoint-dir` and
   `--checkpoint-peers`, so a cold start and a repair still restore a peer checkpoint. The

@@ -1,14 +1,19 @@
 //! [`CopyRate`]: the copy of a checkpoint, at full speed or at a rate
 //! limit.
 //!
-//! With no limit, libmdbx writes a compacted copy to the image file.
+//! With no limit, libmdbx writes a compacted copy to the image file. The
+//! copy holds its read snapshot only for the time of a compacted copy,
+//! and the image holds only the used pages.
 //!
 //! With a limit, libmdbx writes the copy into a pipe, and a thread writes
 //! the pipe to the image file at the limit. So the copy of a large state
 //! does not take the whole disk from the processes that share it. The copy
 //! still reads an online read-only snapshot, so it never blocks the
 //! writer. That snapshot keeps the pages that it reads, so the database
-//! file can grow during a slow copy.
+//! file grows during a slow copy under load, and it never gives the free
+//! pages back. The next copy of the pages holds those free pages too, so
+//! it takes longer, and the file grows more. Only a copy with no limit
+//! ends this loop.
 //!
 //! The copy into a pipe keeps the pages as they are, with no compaction.
 //! A compacted copy into a pipe writes the meta pages first, with a root
