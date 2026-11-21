@@ -140,6 +140,28 @@
       below {{ node_classes.sealer.count }}, such as 0,1. A list needs KARDAMOM_EXEC_ON_SEALERS=on, KARDAMOM_EGRESS=1
       with the egress URL of the executors, and KARDAMOM_EXEC_CURSOR not on.
 
+# The checkpoint executor runs on the node of role backup, and it reads
+# the egress for a cursor below the sealer window. The hot executors make
+# no checkpoint in the restore-only mode (interval 0), so the checkpoint
+# executor must then run: else no node makes a new checkpoint.
+- name: Validate the checkpoint executor and the restore-only mode
+  vars:
+    workloads_backup_nodes: "{{ groups['backup'] | default([]) }}"
+  ansible.builtin.assert:
+    that:
+      - workloads_checkpoint_executor in ['', 'on', 'off']
+      - workloads_exec_restore_only in ['', 'on', 'off']
+      - workloads_checkpoint_executor != 'on' or (workloads_backup_nodes | length > 0 and workloads_egress | bool)
+      - >-
+        workloads_hot_checkpoint_interval_s | string != '0'
+        or (workloads_checkpoint_executor == 'on' and workloads_backup_nodes | length > 0)
+    fail_msg: >-
+      KARDAMOM_CHECKPOINT_EXECUTOR ("{{ workloads_checkpoint_executor }}") and KARDAMOM_EXEC_RESTORE_ONLY
+      ("{{ workloads_exec_restore_only }}") are on, off or empty. KARDAMOM_CHECKPOINT_EXECUTOR=on needs a node in the
+      inventory group backup ({{ workloads_backup_nodes }}) and KARDAMOM_EGRESS=1. The restore-only mode of the hot
+      executors (checkpoint interval {{ workloads_hot_checkpoint_interval_s | default('20', true) }}) needs
+      KARDAMOM_CHECKPOINT_EXECUTOR=on and a backup node.
+
 - name: Validate the sequencer version floor
   ansible.builtin.assert:
     that: workloads_sealer_version_floor | string is match('^[0-5]?$')

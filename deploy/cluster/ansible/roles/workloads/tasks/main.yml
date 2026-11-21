@@ -131,7 +131,7 @@
       vars:
         exec_cursor: "{{ workloads_exec_cursor }}"
         checkpoint_log: "{{ workloads_checkpoint_log }}"
-        checkpoint_interval_s: "{{ workloads_checkpoint_interval_s }}"
+        checkpoint_interval_s: "{{ workloads_hot_checkpoint_interval_s }}"
     # The egress after the executors that it reads, before the readers
     # after it: the notifier here, the validator and the batcher below.
     # A healthy egress answers /health. It needs no executor up to start.

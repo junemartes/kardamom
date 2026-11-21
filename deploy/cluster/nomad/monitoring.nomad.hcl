@@ -119,6 +119,19 @@ variable "egress" {
   }
 }
 
+# The scrape of the checkpoint executor (nomad/executor.nomad.hcl), "on"
+# or "off". Its own job label keeps it out of the queries of the hot
+# executors (job="kardamom-executor"). The deploy passes it from
+# KARDAMOM_CHECKPOINT_EXECUTOR.
+variable "checkpoint_executor" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.checkpoint_executor)
+    error_message = "The checkpoint_executor value must be on or off."
+  }
+}
+
 variable "grafana_admin_password" {
   type        = string
   description = "The Grafana admin password. The local profile keeps the development default."
@@ -174,7 +187,10 @@ locals {
           - targets: ${jsonencode(local.sequencer_targets)}
       - job_name: kardamom-executor
         static_configs:
-          - targets: ${jsonencode(local.executor_targets)}
+          - targets: ${jsonencode(local.executor_targets)}%{if var.checkpoint_executor == "on"}
+      - job_name: kardamom-executor-checkpoint
+        static_configs:
+          - targets: [{{ range $i, $s := service "kardamom-executor-checkpoint|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]%{endif}
       - job_name: kardamom-ingress
         static_configs:
           - targets: ${jsonencode(local.ingress_targets)}
