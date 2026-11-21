@@ -162,6 +162,18 @@
       executors (checkpoint interval {{ workloads_hot_checkpoint_interval_s | default('20', true) }}) needs
       KARDAMOM_CHECKPOINT_EXECUTOR=on and a backup node.
 
+# The audit mirror reads the checkpoints that the checkpoint executor
+# writes on the node of role backup. Without that executor, the node has
+# no checkpoint, and no mirror would do the audit.
+- name: Validate the audit mirror
+  ansible.builtin.assert:
+    that:
+      - workloads_audit_mirror in ['', 'on', 'off']
+      - workloads_audit_mirror != 'on' or workloads_checkpoint_executor == 'on'
+    fail_msg: >-
+      KARDAMOM_MIRROR_AUDIT_ON_BACKUP ("{{ workloads_audit_mirror }}") is on, off or empty.
+      KARDAMOM_MIRROR_AUDIT_ON_BACKUP=on needs KARDAMOM_CHECKPOINT_EXECUTOR=on.
+
 - name: Validate the sequencer version floor
   ansible.builtin.assert:
     that: workloads_sealer_version_floor | string is match('^[0-5]?$')

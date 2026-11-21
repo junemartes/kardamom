@@ -2897,6 +2897,9 @@ class CarryTest(Deploys):
         mirror = DeployTest.job_args(plans['state-mirror'])
         self.assertEqual(mirror[mirror.index('--checkpoint-peers') + 1], self.CHECKPOINT_PEER)
         self.assertEqual(mirror[mirror.index('--chain') + 1], '/local/genesis.toml')
+        # Without the audit mirror, the hot mirrors keep the default audit.
+        self.assertNotIn('--audit-hours', mirror)
+        self.assertEqual([g['Name'] for g in plans['state-mirror']['TaskGroups']], ['mirror'])
         genesis = [{t['DestPath']: t['EmbeddedTmpl'] for t in self.group_task(job, name)['Templates']}
                    ['local/genesis.toml'] for job, name in ((plans['state-mirror'], 'mirror'), (executor, 'executor-0'))]
         self.assertEqual(genesis[0], genesis[1])
@@ -2943,6 +2946,60 @@ class CarryTest(Deploys):
             with self.subTest(name):
                 output = self.run_deploy(check=True, success=False, environ=environ, inventory=inventory)
                 self.assertIn('KARDAMOM_CHECKPOINT_EXECUTOR=on needs a node in the inventory group backup', output)
+                self.assertNotIn('plans', self.api.state)
+
+    # The audit mirror on the backup node, beside the checkpoint executor.
+    AUDIT = CHECKPOINT | {'KARDAMOM_MIRROR_AUDIT_ON_BACKUP': 'on'}
+
+    def test_the_audit_mirror_runs_on_the_backup_node_and_the_hot_mirrors_skip_the_audit(self):
+        """The audit mirror does the daily audit from the local checkpoints
+        of the checkpoint executor. Its head id is outside the ids that the
+        readers poll. The hot mirrors run with the audit off."""
+        self.run_deploy(check=True, environ=self.AUDIT, inventory=self.backup_inventory())
+        plans = self.api.state['plans']
+        job = plans['state-mirror']
+        self.assertIsNone(job['Constraints'])
+        groups = {g['Name']: g for g in job['TaskGroups']}
+        self.assertEqual(list(groups), ['mirror', 'mirror-audit'])
+        hot, audit = groups['mirror'], groups['mirror-audit']
+        self.assertEqual((hot['Count'], hot['Update']['HealthCheck']), (3, 'checks'))
+        self.assertEqual(hot['Constraints'], [{'LTarget': '', 'RTarget': 'true', 'Operand': 'distinct_hosts'},
+                                              {'LTarget': '${meta.role}', 'RTarget': 'sealer', 'Operand': '='}])
+        # A slow audit never holds a deployment of the hot mirrors.
+        self.assertEqual((audit['Count'], audit['Update']['HealthCheck']), (1, 'task_states'))
+        self.assertEqual(audit['Constraints'], [{'LTarget': '${meta.role}', 'RTarget': 'backup', 'Operand': '='}])
+        args = hot['Tasks'][0]['Config']['args']
+        self.assertEqual(args[args.index('--audit-hours') + 1], '0')
+        self.assertEqual(args[args.index('--checkpoint-peers') + 1], self.CHECKPOINT_PEER)
+        self.assertEqual(args[args.index('--mirror-id') + 1], '${NOMAD_ALLOC_INDEX}')
+        task = audit['Tasks'][0]
+        args = task['Config']['args']
+        self.assertEqual({k: args[args.index(k) + 1] for k in ('--mirror-id', '--host-id', '--executor-count',
+                                                              '--checkpoints-dir')},
+                         {'--mirror-id': '255', '--host-id': 'state-mirror-audit', '--executor-count': 3,
+                          '--checkpoints-dir': '/opt/kardamom/checkpoints'})
+        # The local directory of the backup node holds the newest checkpoint.
+        self.assertEqual({'--audit-hours', '--checkpoint-peers', '--chain'} & set(args), set())
+        self.assertNotIn('local/genesis.toml', [t['DestPath'] for t in task['Templates']])
+        self.assertIn('/opt/kardamom/checkpoints:/opt/kardamom/checkpoints:ro', task['Config']['volumes'])
+        service = task['Services'][0]
+        self.assertEqual((service['Name'], [c['Type'] for c in service['Checks']]),
+                         ('kardamom-state-mirror-audit', ['tcp']))
+        self.assertEqual(hot['Tasks'][0]['Services'][0]['Name'], 'kardamom-state-mirror')
+        monitoring = json.dumps(plans['monitoring'])
+        self.assertIn('kardamom-state-mirror-audit|any', monitoring)
+
+    def test_the_audit_mirror_refuses_an_incomplete_setting(self):
+        backup = self.backup_inventory()
+        cases = (
+            ('a switch value that is not on or off', self.CHECKPOINT | {'KARDAMOM_MIRROR_AUDIT_ON_BACKUP': 'yes'}),
+            ('the audit mirror without the checkpoint executor',
+             self.ON_SEALERS | {'KARDAMOM_MIRROR_AUDIT_ON_BACKUP': 'on'}),
+        )
+        for name, environ in cases:
+            with self.subTest(name):
+                output = self.run_deploy(check=True, success=False, environ=environ, inventory=backup)
+                self.assertIn('KARDAMOM_MIRROR_AUDIT_ON_BACKUP=on needs KARDAMOM_CHECKPOINT_EXECUTOR=on', output)
                 self.assertNotIn('plans', self.api.state)
 
     def test_the_checkpoint_executor_rolls_after_the_move_to_the_sealer_nodes(self):

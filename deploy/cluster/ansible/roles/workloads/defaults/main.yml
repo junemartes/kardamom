@@ -83,6 +83,10 @@ workloads_common_vars:
   # executor job, the checkpoint peers of the executors, the validator and
   # the state mirrors, and its scrape. Empty leaves every job at "off".
   checkpoint_executor: "{{ workloads_checkpoint_executor }}"
+  # The audit mirror: "on" or "off". One value for its group in the
+  # state-mirror job, the audit off on the hot mirrors, and its scrape.
+  # Empty leaves every job at "off".
+  audit_mirror: "{{ workloads_audit_mirror }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
 # workloads_l1_rpc_given keeps the given value: anvil.yml overwrites
@@ -418,6 +422,12 @@ workloads_checkpoint_executor: "{{ lookup('env', 'KARDAMOM_CHECKPOINT_EXECUTOR')
 # log (checkpoint interval 0). They still restore a peer checkpoint. It
 # needs the checkpoint executor, the one source of new checkpoints.
 workloads_exec_restore_only: "{{ lookup('env', 'KARDAMOM_EXEC_RESTORE_ONLY') }}"
+# The audit mirror (nomad/state-mirror.nomad.hcl, audit_mirror): "on" or
+# "off". On, a fourth state mirror runs on the node of role backup and
+# does the daily audit rebuild from the checkpoints of the checkpoint
+# executor. The hot mirrors then run with the audit off. It needs
+# KARDAMOM_CHECKPOINT_EXECUTOR=on. Empty keeps the job's "off" default.
+workloads_audit_mirror: "{{ lookup('env', 'KARDAMOM_MIRROR_AUDIT_ON_BACKUP') }}"
 # The checkpoint interval of the hot executors: 0 in the restore-only
 # mode, else the chaos knob, else the job's 20.
 workloads_hot_checkpoint_interval_s: "{{ '0' if workloads_exec_restore_only == 'on' else workloads_checkpoint_interval_s }}"
