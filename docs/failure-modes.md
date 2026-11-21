@@ -555,6 +555,16 @@ The executors are deterministic state machines. One dead or lagging replica neve
   - The checkpoint executor is then the one source of new checkpoints (no second source). A rollback of a hot executor always takes the checkpoint of the backup machine.
   - The checkpoints that a hot executor made before the switch stay in its directory and serve to its peers. Every list of peers names the checkpoint executor first. A fetch keeps the newest checkpoint, and skips a later peer with nothing newer without a download, so an old checkpoint of a hot executor is read only when the checkpoint executor has none that qualifies.
   - A state mirror rebuild fetches the newest checkpoint of the checkpoint executor (`--checkpoint-peers`) into `/opt/kardamom/mirror/peer-checkpoints`. It restores the newest of that copy and of the local directory.
+- **The audit mirror on the backup machine** (`KARDAMOM_MIRROR_AUDIT_ON_BACKUP=on`, group `mirror-audit` of the state-mirror job)
+  - Use: it does the daily audit rebuild of the Redis projection from the local checkpoints of the checkpoint executor. The hot mirrors on the sealer machines run with `--audit-hours 0`, so no audit reads or writes the disk of a sealer machine. See `deploy/cluster/README.md`, "The audit mirror".
+  - Its mirror id is 255. The ingress and the sequencer poll only the heads of the ids 0 to `executor_count - 1`. A late, stopped or auditing audit mirror never changes the head that they read, so it never makes them see a stale head.
+  - During its audit, the mirror applies no live batch, and its `/ready` check fails. The batches wait in its queue in memory and apply after the audit. The write rule discards each row that a hot mirror already wrote at a newer position. Its Consul check is TCP, and its deployment waits only for its task to run, so no deploy gate waits for it.
+  - The audit waits until a local checkpoint reaches the first live batch. A lag of the checkpoint executor makes the audit wait longer, and the queue grows.
+  - A rollback during its audit: the audit mirror clears the projection after its audit ends, some minutes after the hot mirrors cleared it. The accounts and receipts that the hot mirrors wrote in that time go, and the hot mirrors do not rebuild them. The readers then miss in Redis and admit, by the fallback rule. The rollback rebuild of the audit mirror, which follows its clear, writes every account again.
+  - The backup machine is down: no audit runs. A missed live row then stays wrong until the account is touched again or the backup machine returns.
+  - A loss of Redis: the hot mirrors still do a cold rebuild on the sealer machines.
+  - A restart starts the audit interval again. A deploy each day can delay the audit for as long as the deploys continue.
+  - Not covered: no CI profile has a node of role `backup`, so no chaos case runs the audit mirror. The deploy tests render its group and refuse the switch without the checkpoint executor.
 - **Wedged executor**
   - Trigger: the block gauge of an executor is flat while the sealer boundaries keep advancing.
   - Effect: this contrast is the FROZEN verdict of the load harness. It tells a wedged replica from a quiescent chain. Absolute progress does not.

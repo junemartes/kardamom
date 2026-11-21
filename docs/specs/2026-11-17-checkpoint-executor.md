@@ -1,9 +1,12 @@
 # The checkpoint executor on the backup node
 
-- Status: decided by the user on 2026-11-17 (section 8). Rollout steps 1 (the code) and 2 (the
-  deploy) are done. Steps 3 to 5 (staging and the chaos cases) are open. The metrics of section 7
-  are open: the executor exports no age and no block of its newest checkpoint.
-- Reason: the 8-9 ms p99 tails of the staging benchmarks of 2026-11-16.
+- Status: decided by the user on 2026-11-17 and 2026-11-21 (section 8). Rollout step 1 (the code)
+  is done: the Rust switches came with #1062 and #1063. Step 2 (the deploy) is done by #1066. The
+  audit mirror (section 4, decision 5) is in the deploy behind its own switch. Steps 3 to 5
+  (staging and the chaos cases) are open. The metrics of section 7 are open: the executor exports
+  no age and no block of its newest checkpoint.
+- Reason: the 8-9 ms p99 tails of the staging benchmarks of 2026-11-16, and the commit tails of the
+  daily audit of the state mirrors on 2026-11-21 (section 4).
 - Decision of the user on 2026-11-17: the checkpoint writes move to the backup machine. A slower
   recovery is acceptable, because a checkpoint matters only when a node or the cluster recovers.
 
@@ -67,8 +70,31 @@
   directory holds no new checkpoint.
 - Change: the state mirror fetches the newest checkpoint from a peer (`GET /checkpoint/latest`),
   with the fetch code of the executor. Its list of peers names the checkpoint executor.
-- A rebuild still writes the restored copy on the machine of the mirror. A rebuild happens only
-  after a loss of Redis, so it does not touch a normal benchmark.
+- A rebuild still writes the restored copy on the machine of the mirror. A cold rebuild happens
+  only after a loss of Redis, so it does not touch a normal benchmark.
+
+### 4.1 The audit mirror (decision 5)
+
+- **The measurement.** Each state mirror also rewrites every account from a checkpoint into Redis
+  once every 24 hours (the audit rebuild, `KARDAMOM_MIRROR_AUDIT_HOURS`, default 24). On staging on
+  2026-11-21, the three mirrors on the sealer machines audited at the same time, from 08:46 to
+  08:54 UTC. Each sealer machine read up to 600 MB/s and wrote up to 1,000 MB/s. The three mirrors
+  did not serve for 4 to 8 minutes. 17 to 23 % of the sealer commits waited more than 5 ms. The
+  audit shares the NVMe with the archive of the sealer leader, which is on the commit path.
+- **The audit mirror.** A fourth state mirror runs on the node of role `backup`, beside the
+  checkpoint executor (`KARDAMOM_MIRROR_AUDIT_ON_BACKUP=on`, group `mirror-audit`). It applies the
+  live batches, and it does the daily audit from the checkpoints of the checkpoint executor in the
+  local `/opt/kardamom/checkpoints`. It needs no checkpoint peer: in the restore-only mode, the
+  checkpoint executor makes every new checkpoint.
+- **The hot mirrors.** The three mirrors on the sealer machines run with the audit off
+  (`--audit-hours 0`). They apply the live batches, and they rebuild only for a cold start, a
+  regression, an outage or a rollback.
+- **One audit is enough.** Every mirror writes the same values through the monotone write rule.
+- **The head rule does not change.** The ingress and the sequencer poll the heads of the ids 0 to
+  `executor_count - 1`. The audit mirror has the id 255, so its head is never in the max. A late
+  or auditing audit mirror cannot make a reader see a stale or missing head.
+- **No gate waits for it.** Its deployment is healthy when its task runs, and its Consul check is
+  TCP: its `/ready` check fails during each audit, by design.
 
 ## 5. Failure rules
 
@@ -82,6 +108,10 @@
   peer, because a hot executor has no local checkpoint.
 - **No second source (decision 3).** The hot executors make no base. A loss of the backup
   machine leaves no new checkpoint until it returns.
+- **No audit while the backup machine is down (decision 5).** The hot mirrors run with the audit
+  off, so no mirror audits the projection until the backup machine returns.
+- **A loss of Redis still rebuilds on the sealer machines (decision 5).** The hot mirrors still do
+  a cold rebuild. That rebuild reads and writes the disk of each sealer machine.
 
 ## 6. Rollout
 
@@ -104,7 +134,7 @@
   executor. An alert fires when the newest checkpoint is older than 12 hours.
 - The lag of the checkpoint executor behind the sealed head, in blocks.
 
-## 8. Decisions of the user (2026-11-17)
+## 8. Decisions of the user (2026-11-17 and 2026-11-21)
 
 1. Rule 4: a checkpoint executor that reads the cluster egress reads the range read of the egress
    for a cursor below the sealer window. `--egress` no longer needs `--carry-bytes`.
@@ -112,3 +142,7 @@
    because it runs under constant load.
 3. No second source for now: the hot executors make no base.
 4. The state mirrors fetch the newest checkpoint from a peer (section 4).
+5. On 2026-11-21: the audit moves to the backup machine (section 4.1). A fourth state mirror on
+   the backup machine does the daily audit from the local checkpoints of the checkpoint executor.
+   The three mirrors on the sealer machines run with the audit off. The two limits of section 5
+   are accepted.
