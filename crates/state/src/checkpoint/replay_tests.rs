@@ -110,17 +110,45 @@ fn a_base_with_no_log_restores_at_its_block() {
     assert_eq!(source.restore(BlockRange::ANY).1, Some(3));
 }
 
-/// The restore point of a directory counts the log segment that holds the
-/// block after the base, so a log that grows in that one segment is a new
-/// point. A reader that waits for a restore to reach a block polls it.
+/// The restore point of a directory is the last block that the log after
+/// the base reaches, so a log that grows after the base is a new point. A
+/// reader that waits for a restore to reach a block polls it.
 #[test]
 fn the_restore_point_moves_when_the_log_after_the_base_grows() {
     let source = Source::new(5, 10);
     let before = RestorePoint::newest(source.ckpt.path()).unwrap().unwrap();
     assert_eq!(before.base, 5);
-    assert!(before.log_bytes > 0, "{before:?}");
+    assert_eq!(before.reach, 10, "{before:?}");
     commit_logged(&source.env, &source.ckpt.path().join(LOG_DIR), 11..=12);
     let after = RestorePoint::newest(source.ckpt.path()).unwrap().unwrap();
     assert!(after.is_after(&before), "{before:?} -> {after:?}");
     assert!(!before.is_after(&before));
+}
+
+/// After a gap, the log writer starts a new segment, and that segment
+/// grows. A restore still stops at the block before the gap, so the
+/// growing tail must not make a new restore point.
+#[test]
+fn a_growing_tail_after_a_gap_is_not_a_new_restore_point() {
+    let state = tempfile::tempdir().unwrap();
+    let ckpt = tempfile::tempdir().unwrap();
+    let env = seeded_env(state.path());
+    let log = ckpt.path().join(LOG_DIR);
+    commit_logged(&env, &log, 1..=3);
+    create_checkpoint(&env, ckpt.path()).unwrap();
+    commit_logged(&env, &log, 4..=5);
+    super::super::tests::commit_through(
+        crate::writer::StateWriter::spawn(env.clone()).unwrap(),
+        std::iter::once(block_batch(ADDR, 6, 2)),
+    );
+    commit_logged(&env, &log, 7..=8);
+    let before = RestorePoint::newest(ckpt.path()).unwrap().unwrap();
+    commit_logged(&env, &log, 9..=12);
+    let after = RestorePoint::newest(ckpt.path()).unwrap().unwrap();
+    assert!(!after.is_after(&before), "{before:?} -> {after:?}");
+    assert_eq!(after.reach, 5);
+    assert_eq!(after.end, Some(kardamom_types::BPosition::from_index(5)));
+    let dst = tempfile::tempdir().unwrap();
+    let restored = restore_best_checkpoint(ckpt.path(), dst.path(), BlockRange::ANY, None).unwrap();
+    assert_eq!(restored.map(|(block, _)| block), Some(5));
 }

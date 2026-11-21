@@ -56,34 +56,36 @@ impl Fixture {
             .path
     }
 
+    /// Commit the block `count`.
     pub(super) fn commit(&self, count: u64) {
-        {
-            let mut writer = StateWriter::spawn(self.env.clone()).unwrap();
-            writer
-                .delta_tx
-                .send(WriteBatch::new(
-                    BlockBoundary {
-                        block_number: count,
-                        end_tx_idx: BPosition::from_index(count),
-                        l2_timestamp: count,
-                        l1_origin: 0,
-                        base_fee: 0,
-                        gas_used: 0,
-                    },
-                    BlockDelta {
-                        block_number: count,
-                        accounts: vec![AccountChange {
-                            address: self.address,
-                            nonce: count,
-                            balance: U256::from(100 - count),
-                            code_hash: B256::ZERO,
-                        }],
-                        ..BlockDelta::default()
-                    },
-                ))
-                .unwrap();
-            writer.shutdown().unwrap();
-        }
+        let mut writer = StateWriter::spawn(self.env.clone()).unwrap();
+        writer.delta_tx.send(self.batch(count)).unwrap();
+        writer.shutdown().unwrap();
+    }
+
+    /// The batch of the block `count`: one transaction, and the account
+    /// at the nonce `count`.
+    pub(super) fn batch(&self, count: u64) -> WriteBatch {
+        WriteBatch::new(
+            BlockBoundary {
+                block_number: count,
+                end_tx_idx: BPosition::from_index(count),
+                l2_timestamp: count,
+                l1_origin: 0,
+                base_fee: 0,
+                gas_used: 0,
+            },
+            BlockDelta {
+                block_number: count,
+                accounts: vec![AccountChange {
+                    address: self.address,
+                    nonce: count,
+                    balance: U256::from(100 - count),
+                    code_hash: B256::ZERO,
+                }],
+                ..BlockDelta::default()
+            },
+        )
     }
 
     fn restore(&self, first_live: BPosition) -> Option<RebuildSnapshot> {
