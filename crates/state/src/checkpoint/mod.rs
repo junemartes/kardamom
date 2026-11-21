@@ -37,6 +37,7 @@ pub mod copy_rate;
 mod image;
 pub mod log_thread;
 mod manifest;
+pub mod newest;
 pub mod replay;
 
 #[cfg(test)]

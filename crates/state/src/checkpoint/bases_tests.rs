@@ -30,21 +30,13 @@ const DAY: Duration = Duration::from_hours(24);
 
 #[test]
 fn a_segment_that_ended_before_it_was_full_is_a_gap() {
-    let r = rule(100, DAY);
-    assert!(r.has_gap(&sizes(&[(1, 10), (5, 10)]), 0), "1..4, then 5..");
-    assert!(
-        !r.has_gap(&sizes(&[(1, FULL), (5, 10)]), 0),
-        "1..4 was full"
-    );
-    assert!(
-        !r.has_gap(&sizes(&[(1, 10), (5, 10)]), 6),
-        "the gap is before the base"
-    );
-    assert!(
-        r.has_gap(&sizes(&[(10, 10)]), 3),
-        "no segment holds block 4"
-    );
-    assert!(!r.has_gap(&[], 3), "an empty log has no gap");
+    let full = NonZeroU64::new(FULL).unwrap();
+    let gap = |parts: &[(u64, u64)], base| SegmentSize::gap_after(&sizes(parts), base, full);
+    assert!(gap(&[(1, 10), (5, 10)], 0), "1..4, then 5..");
+    assert!(!gap(&[(1, FULL), (5, 10)], 0), "1..4 was full");
+    assert!(!gap(&[(1, 10), (5, 10)], 6), "the gap is before the base");
+    assert!(gap(&[(10, 10)], 3), "no segment holds block 4");
+    assert!(!gap(&[], 3), "an empty log has no gap");
 }
 
 #[test]

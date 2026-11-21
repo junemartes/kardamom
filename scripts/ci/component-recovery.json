@@ -243,7 +243,8 @@
         "whole::a_corrupt_local_checkpoint_is_quarantined_before_a_peer_restore",
         "whole::executors_that_return_before_the_sealers_wait_and_then_catch_up",
         "replica::a_wiped_replica_restores_a_copied_donor_base_and_log",
-        "whole::returned_ingresses_serve_a_pre_fault_receipt_from_executor_state"
+        "whole::returned_ingresses_serve_a_pre_fault_receipt_from_executor_state",
+        "replica::the_checkpoint_gauges_follow_the_log_and_a_restore_only_replica_shows_its_fetched_base"
       ],
       "negative_controls": [
         {
@@ -1097,11 +1098,13 @@
       ],
       "controlled": [
         "input series of a DA-lag halt and refused canary transfers on the promtool virtual clock",
-        "alerts sent with amtool in place of Prometheus"
+        "alerts sent with amtool in place of Prometheus",
+        "input series of the checkpoint gauges and the up series of the executor jobs on the promtool virtual clock"
       ],
       "tests": [
         "promtool_pages_the_da_lag_halt_and_the_canary_pages_that_it_explains",
-        "the_deployed_inhibit_rules_mute_the_canary_page_only_while_the_da_lag_halt_pages"
+        "the_deployed_inhibit_rules_mute_the_canary_page_only_while_the_da_lag_halt_pages",
+        "promtool_pages_an_old_or_absent_checkpoint_of_the_checkpoint_executor_only"
       ],
       "limitation": "One container for each check, with no network. Does not scrape exporters or send alerts from Prometheus to Alertmanager.",
       "negative_controls": [

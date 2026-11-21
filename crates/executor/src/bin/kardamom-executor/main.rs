@@ -384,6 +384,7 @@ impl Boot {
         .await?;
         kardamom_engine::metrics::describe();
         kardamom_executor::exec_stream::ExecStreamMetrics::describe();
+        kardamom_state::checkpoint::newest::NewestCheckpoint::describe();
         let file_cfg = load_file_config(&args)?;
         let cursor_id = args.recorded_cursor_id()?;
         args.check_receipts()?;

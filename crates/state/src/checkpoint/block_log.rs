@@ -22,6 +22,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use alloy_primitives::B256;
 use rkyv::util::AlignedVec;
@@ -260,6 +261,35 @@ impl SegmentSize {
         let next = base.saturating_add(1);
         let start = segments.iter().rposition(|s| s.first_block <= next)?;
         Some(&segments[start..])
+    }
+
+    /// Whether the log of `segments` has a gap after `base`: no segment
+    /// holds the block after it while later segments exist, or a segment
+    /// of the chain after it ended before it held `segment_bytes`. The
+    /// writer ends a segment when it is full or at a gap, so the sizes
+    /// show a gap with no read of a record. An empty log has no gap.
+    #[must_use]
+    pub fn gap_after(segments: &[Self], base: u64, segment_bytes: NonZeroU64) -> bool {
+        let Some(chain) = Self::chain_after(segments, base) else {
+            return !segments.is_empty();
+        };
+        chain
+            .iter()
+            .take(chain.len().saturating_sub(1))
+            .any(|s| s.bytes < segment_bytes.get())
+    }
+
+    /// The time of the last write to the last segment in `dir`. `None`
+    /// with no segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory or the segment does not read.
+    pub fn last_write(dir: &Path) -> Result<Option<SystemTime>, StateError> {
+        Segment::list(dir)?
+            .last()
+            .map(|s| Ok(fs::metadata(&s.path)?.modified()?))
+            .transpose()
     }
 
     /// Delete each segment in `dir` whose blocks are all at or below

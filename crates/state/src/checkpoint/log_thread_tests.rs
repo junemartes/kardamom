@@ -93,3 +93,38 @@ fn a_full_queue_drops_the_batch() {
     let queued: Vec<u64> = rx.try_iter().map(|b| b.boundary.block_number).collect();
     assert_eq!(queued, [1]);
 }
+
+/// A restart must not hide an old log: the open and the cut of the writer
+/// touch the last segment, so the gauges take its time before them.
+#[test]
+fn the_gauges_take_the_time_of_the_log_on_disk_before_the_writer_opens_it() {
+    let state = tempfile::tempdir().unwrap();
+    let ckpt = tempfile::tempdir().unwrap();
+    let env = seeded_env(state.path());
+    let dir = ckpt.path().join(super::super::replay::LOG_DIR);
+    commit_logged(&env, &dir, 1..=2);
+    super::super::create_checkpoint(&env, ckpt.path()).unwrap();
+    commit_logged(&env, &dir, 3..=4);
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .try_for_each(|segment| {
+            std::fs::File::options()
+                .write(true)
+                .open(segment)?
+                .set_modified(old)
+        })
+        .unwrap();
+    let cfg = super::LogConfig {
+        dir: dir.clone(),
+        segment_bytes: NonZeroU64::new(1 << 20).unwrap(),
+        queue: std::num::NonZeroUsize::new(1).unwrap(),
+        sync_every: std::time::Duration::from_secs(1),
+    };
+    let gauges = super::NewestGauges::new(&cfg).unwrap();
+    let mut writer = BlockLogWriter::open(&dir, identity(&env), cfg.segment_bytes).unwrap();
+    writer.cut_after(4).unwrap();
+    let newest = gauges.newest(&writer).unwrap().unwrap();
+    assert_eq!((newest.block, newest.written), (4, old));
+}

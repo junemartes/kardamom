@@ -283,7 +283,7 @@ Each dashboard is a JSON file in `deploy/grafana/provisioning/dashboards-json/`.
 
 ## Alerts
 
-`deploy/alerts.yml` holds 25 Prometheus alert rules. The monitoring job loads them as `rule_files`.
+`deploy/alerts.yml` holds 36 Prometheus alert rules. The monitoring job loads them as `rule_files`.
 Check the file with `promtool check rules deploy/alerts.yml`.
 
 - The monitoring job runs Prometheus and Alertmanager in one allocation.
@@ -338,6 +338,8 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 | `KardamomHaltL1FollowerDisagreement` | critical | `kardamom_halt{cause="l1_follower_disagreement"} == 1`. |
 | `KardamomPublicationNotConnected` | warning | `kardamom_publication_connected == 0` for 1 minute. A must-deliver publication has no connected subscriber. The publisher holds its receipts. While discovery lists a subscriber, it reopens the publication after one stall budget and exits with code 3 after five. See "Publications". |
 | `KardamomServicePaused` | info | `kardamom_paused == 1` for 1 minute. |
+| `KardamomCheckpointStale` | warning | The newest checkpoint of the checkpoint executor (job `kardamom-executor-checkpoint`) is older than 12 hours for 5 minutes. See "Checkpoints". |
+| `KardamomCheckpointExecutorDown` | warning | The checkpoint executor shows no newest checkpoint for 15 minutes, and Prometheus scraped its job in the last day. See "Checkpoints". |
 
 - A validator that diverges stays up and keeps `up == 1`.
   The pages for a divergence are `KardamomValidatorDivergence` and `KardamomHaltValidatorDivergence`.
@@ -349,6 +351,10 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 - `KardamomServicePaused` is an info alert. A paused service waits on a halt upstream or on an operator.
   - The root halt pages once. The pause does not page again.
   - The `reason` label is `upstream` or `operator`.
+- The two checkpoint rules read the job `kardamom-executor-checkpoint` only.
+  - A cluster without the checkpoint executor has no series of that job, so neither rule fires. The switch `KARDAMOM_CHECKPOINT_EXECUTOR` is off by default.
+  - A hot executor shows the checkpoint that it holds. No rule reads it.
+  - The two rules never fire together. While the checkpoint executor shows no sample, the age rule has no series. So no inhibit rule pairs them.
 
 ### The inhibit file
 
@@ -487,6 +493,53 @@ Each executor exports these metrics for its executor stream (`exec_txs`). See "T
 
 - The live publication counts its dropped records in `kardamom_log_best_effort_dropped_total{stream_id="1005"}`. A drop is normal while no consumer subscribes.
 - With `--exec-cursor` on (`KARDAMOM_EXEC_CURSOR`), the publisher sends the recorded cursor to the sealer. It sends a cursor that moved when 100 ms passed, or at once when it moved by 1024 records. A sent cursor never moves down. The ingress shows the best cursor of the executors in `kardamom_ingress_cluster_recorded_head`.
+
+### Checkpoints
+
+Each executor with `--checkpoint-dir` shows the newest restore point of its checkpoint directory. A restore reaches that point.
+
+- The point is the end of the block log when the log continues the newest base with no gap.
+- Otherwise the point is the newest base.
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_checkpoint_newest_block` | The last block that a restore of the newest checkpoint reaches: the block of the newest base, or the last block of the block log after it. |
+| `kardamom_checkpoint_newest_timestamp_seconds` | The unix time, in seconds, at which the directory got that block. For a base, it is the modification time of the base. For the log, it is the time of the sync that made the block durable. Compute the age as `time() - kardamom_checkpoint_newest_timestamp_seconds`, so the age also grows while the process is down. |
+
+- The executor sets the two gauges at each start from the disk, so a restart shows an old checkpoint as old.
+  - With the block log, the log thread sets them after each sync (once a second). At its start, it takes the time of the last write to the log on disk.
+  - With no block log, each checkpoint round sets them.
+- A process with no base exports no sample. A base that a restore fetched from a peer shows the time of the fetch.
+- The gap rule is the rule of a new base. A log segment that ended before it was full, and that another segment follows, ended at a gap. Then the gauges show the base.
+- A hot executor in the restore-only mode (`--checkpoint-interval-secs 0`, no block log) makes no checkpoint.
+  - It shows the newest base that it holds and serves to its peers. That is a base that it fetched, or one that it made before the switch.
+  - The value changes only at a start, and its age grows. No alert reads it.
+- The time is the time of the write, not the time of the block. A checkpoint executor that lags writes new checkpoints of old blocks. The block gauge shows that lag, see below.
+- The alerts `KardamomCheckpointStale` and `KardamomCheckpointExecutorDown` read the checkpoint executor (see "Alerts").
+  - The base rule makes a new base at least every 6 hours (`--checkpoint-base-max-age-secs`), and the log moves each second. An age above 12 hours means that no restore point was made for that long.
+  - `KardamomCheckpointExecutorDown` remembers the `up` series of the job for one day.
+  - It fires when the target does not answer, when Nomad removed its service, or when the process has no checkpoint.
+  - After the switch of the checkpoint executor goes off, it fires for one day. Silence it for that day.
+
+The lag of the checkpoint executor behind the sealed head, in blocks:
+
+```promql
+max(kardamom_sealer_block_number{job="kardamom-executor"})
+  - max(kardamom_executor_block_number{job="kardamom-executor-checkpoint"})
+```
+
+The distance of its newest checkpoint from the sealed head, in blocks:
+
+```promql
+max(kardamom_sealer_block_number{job="kardamom-executor"})
+  - max(kardamom_checkpoint_newest_block{job="kardamom-executor-checkpoint"})
+```
+
+No rule alerts on the lag, for these reasons:
+
+- The checkpoint executor may lag. It is no void voter and sends no cursor, so its lag holds no reader and no sealer.
+- A lag only makes its checkpoints older in blocks. A restore then replays more blocks.
+- The rate of the backup disks is not measured yet, so no block count is a sound threshold. The first staging step of the rollout measures the lag at 2,000 and 4,000 tx/s.
 
 ### Executor input source
 
