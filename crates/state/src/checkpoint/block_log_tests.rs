@@ -210,3 +210,52 @@ fn a_cut_drops_the_records_after_the_block() {
     let read = BlockLog::open(dir.path(), ID).unwrap();
     assert_eq!(read.after(3, 4).next().unwrap().batch().unwrap(), replaced);
 }
+
+fn last_after(dir: &Path, base: u64) -> Option<u64> {
+    let log = BlockLog::open(dir, ID).unwrap();
+    log.last_after(base).map(|r| r.block)
+}
+
+/// The walk over the record heads ends where the records end: at a gap,
+/// and across full segments.
+#[test]
+fn the_last_record_from_the_heads_is_the_last_record_of_the_chain() {
+    let gap = tempfile::tempdir().unwrap();
+    write(gap.path(), LARGE, [1, 2, 5, 6]);
+    assert_eq!(last_after(gap.path(), 0), Some(2));
+    assert_eq!(last_after(gap.path(), 3), None);
+    assert_eq!(last_after(gap.path(), 4), Some(6));
+    let full = tempfile::tempdir().unwrap();
+    write(full.path(), NonZeroU64::new(1).unwrap(), 1..=4);
+    assert_eq!(last_after(full.path(), 0), Some(4));
+    assert_eq!(last_after(full.path(), 4), None);
+    let log = BlockLog::open(full.path(), ID).unwrap();
+    assert_eq!(log.last_after(1).unwrap().batch().unwrap(), batch(4, 3));
+}
+
+/// The writer appends while a reader walks. A record that the file does
+/// not hold whole is not in the walk.
+#[test]
+fn the_walk_over_the_heads_stops_before_a_torn_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), LARGE, 1..=3);
+    let path = Segment::list(dir.path()).unwrap()[0].path.clone();
+    let len = std::fs::metadata(&path).unwrap().len();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_len(len - 5).unwrap();
+    assert_eq!(last_after(dir.path(), 0), Some(2));
+}
+
+/// The walk does not check the CRC of each record. It checks the last
+/// record, and a bad last record gives no answer.
+#[test]
+fn a_bad_last_record_gives_no_last_record() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), LARGE, 1..=3);
+    let path = Segment::list(dir.path()).unwrap()[0].path.clone();
+    let len = std::fs::metadata(&path).unwrap().len();
+    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.seek(SeekFrom::Start(len - 1)).unwrap();
+    file.write_all(&[0xFF]).unwrap();
+    assert_eq!(last_after(dir.path(), 0), None);
+}

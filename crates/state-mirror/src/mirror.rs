@@ -43,6 +43,7 @@ enum RebuildReason {
     Audit,
     Rollback,
     Interrupted,
+    Hole,
 }
 
 impl RebuildReason {
@@ -55,6 +56,7 @@ impl RebuildReason {
             Self::Audit => "audit",
             Self::Rollback => "rollback",
             Self::Interrupted => "interrupted",
+            Self::Hole => "hole",
         }
     }
 }
@@ -110,7 +112,8 @@ impl Mirror {
     /// Run until shutdown or the subscription closes.
     pub(crate) async fn run(mut self) -> Result<()> {
         if self.progress.pending_rebuild.is_none() {
-            self.progress.pending_rebuild = self.resume_or_rebuild().await?;
+            let start = self.resume_or_rebuild().await?;
+            self.progress.begin(start);
         }
         crate::metrics::set_serving(true);
         loop {
@@ -181,28 +184,30 @@ impl Mirror {
     }
 
     /// An unfinished recovery cannot resume from another writer's head.
-    /// Otherwise resume when Redis carries a live head at or beyond
-    /// this mirror's persisted head, rebuild otherwise. A cold Redis (no
-    /// live head from any mirror) rebuilds. A Redis head below the local
-    /// head is a failover regression and rebuilds.
-    async fn resume_or_rebuild(&self) -> Result<Option<RebuildReason>> {
+    /// Otherwise the start follows [`StartHeads::start`].
+    async fn resume_or_rebuild(&self) -> Result<Start> {
         if self.head.rebuild_pending()? {
-            return Ok(Some(RebuildReason::Interrupted));
+            return Ok(Start::Rebuild(RebuildReason::Interrupted));
         }
-        let ids: Vec<u32> = (0..self.head_count).collect();
-        let heads = match self.cache.heads(&ids).await {
-            Ok(heads) => heads,
-            Err(e) => {
-                warn!(error = %e, "start: heads unreadable; rebuilding");
-                return Ok(Some(RebuildReason::Cold));
-            }
+        let Ok(heads) = self
+            .start_heads()
+            .await
+            .inspect_err(|e| warn!(error = %e, "start: heads unreadable; rebuilding"))
+        else {
+            return Ok(Start::Rebuild(RebuildReason::Cold));
         };
-        let redis_head = heads.iter().flatten().max().copied();
-        let local_head = self.head.read();
-        Ok(match (redis_head, local_head) {
-            (None, _) => Some(RebuildReason::Cold),
-            (Some(redis), Some(local)) if redis < local => Some(RebuildReason::Regression),
-            _ => None,
+        Ok(heads.start())
+    }
+
+    /// The live heads of all mirrors, the durable head of this mirror,
+    /// and the local head file.
+    async fn start_heads(&self) -> Result<StartHeads, kardamom_cache::CacheError> {
+        let ids: Vec<u32> = (0..self.head_count).collect();
+        let live = self.cache.heads(&ids).await?.into_iter().flatten().max();
+        Ok(StartHeads {
+            live,
+            durable: self.cache.durable_head(self.id).await?,
+            local: self.head.read(),
         })
     }
 
@@ -214,6 +219,9 @@ impl Mirror {
         let (Some(&first), Some(&end)) = (ends.first(), ends.iter().max()) else {
             return Ok(());
         };
+        if let Some(start) = group.iter().find_map(|b| b.receipts.first()) {
+            self.progress.check_follows(start.tx_idx);
+        }
         if let Some(reason) = self.progress.pending_rebuild.take() {
             self.run_rebuild(reason, first).await?;
         }
@@ -347,6 +355,49 @@ impl Mirror {
     }
 }
 
+/// What a start owes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Start {
+    /// A live mirror applied the batches while this one was down.
+    Resume,
+    /// Redis holds the rows up to this head, and no live mirror covers
+    /// the stop. The first live batch must follow the head.
+    Unproven(u64),
+    Rebuild(RebuildReason),
+}
+
+/// The heads that decide a start: the max of the live heads of all
+/// mirrors, the durable head of this mirror, and the head of the local
+/// head file.
+struct StartHeads {
+    live: Option<u64>,
+    durable: Option<u64>,
+    local: Option<u64>,
+}
+
+impl StartHeads {
+    /// The Redis head is the max of the live heads and the durable head.
+    /// A Redis with no head is cold. A Redis head below the local head is
+    /// a failover regression. A live head at or beyond the local head
+    /// resumes: that mirror applied the batches of the stop. In all other
+    /// cases, the resume is valid only when the first live batch follows
+    /// the Redis head.
+    fn start(self) -> Start {
+        let redis = self.live.max(self.durable);
+        let live_covers = self
+            .live
+            .is_some_and(|live| self.local.is_none_or(|local| live >= local));
+        match (redis, self.local) {
+            (None, _) => Start::Rebuild(RebuildReason::Cold),
+            (Some(redis), Some(local)) if redis < local => {
+                Start::Rebuild(RebuildReason::Regression)
+            }
+            _ if live_covers => Start::Resume,
+            (Some(redis), _) => Start::Unproven(redis),
+        }
+    }
+}
+
 /// One Redis write of the mirror, retried as a unit.
 enum Write<'a> {
     /// The rows and receipts of a group of batches, each row at the end
@@ -373,6 +424,9 @@ struct Progress {
     applied: u64,
     /// The rebuild that runs on the next batch, if any.
     pending_rebuild: Option<RebuildReason>,
+    /// The Redis head that the first live batch must follow, when no live
+    /// mirror covered the stop of this one.
+    unproven: Option<u64>,
     /// The rollback events applied in this process.
     rollbacks: AppliedRollbacks,
 }
@@ -382,8 +436,41 @@ impl Progress {
         Self {
             applied: 0,
             pending_rebuild,
+            unproven: None,
             rollbacks: AppliedRollbacks::default(),
         }
+    }
+
+    /// Take the decision of the start.
+    fn begin(&mut self, start: Start) {
+        match start {
+            Start::Resume => {}
+            Start::Unproven(head) => self.unproven = Some(head),
+            Start::Rebuild(reason) => self.pending_rebuild = Some(reason),
+        }
+    }
+
+    /// Check the first live receipt `first` against the unproven Redis
+    /// head. Positions are not dense, because a marker takes a position
+    /// with no receipt. So a first receipt at or below the position after
+    /// the head proves that no batch is missing. A later first receipt
+    /// can be a hole, and a hole rebuild runs.
+    fn check_follows(&mut self, first: BPosition) {
+        let Some(head) = self.unproven.take() else {
+            return;
+        };
+        if head
+            .checked_add(1)
+            .is_some_and(|next| first.as_index() <= next)
+        {
+            return;
+        }
+        warn!(
+            head,
+            first = first.as_index(),
+            "start: the first live batch does not follow the Redis head; rebuilding"
+        );
+        self.pending_rebuild.get_or_insert(RebuildReason::Hole);
     }
 
     /// Take a batch end into the head, and return the head.
@@ -402,6 +489,7 @@ impl Progress {
             return false;
         }
         self.applied = 0;
+        self.unproven = None;
         self.pending_rebuild = Some(RebuildReason::Rollback);
         true
     }
@@ -409,7 +497,7 @@ impl Progress {
 
 #[cfg(test)]
 mod tests {
-    use super::{Progress, RebuildReason};
+    use super::{Progress, RebuildReason, Start, StartHeads};
     use alloy_primitives::B256;
     use kardamom_types::{BPosition, ReceiptRollback};
 
@@ -461,5 +549,72 @@ mod tests {
         assert_eq!(progress.pending_rebuild, None);
         assert_eq!(progress.advance(BPosition::from_index(10)).as_index(), 40);
         assert!(progress.roll_back(&rollback(8)), "a new event applies");
+    }
+
+    fn start(live: Option<u64>, durable: Option<u64>, local: Option<u64>) -> Start {
+        StartHeads {
+            live,
+            durable,
+            local,
+        }
+        .start()
+    }
+
+    /// A live head at or beyond the local head resumes. A durable head
+    /// alone needs the first live batch to follow it. A Redis head below
+    /// the local head is a failover regression. A Redis with no head is
+    /// cold, whatever the local head is.
+    #[test]
+    fn the_start_rule_covers_each_case_of_the_heads() {
+        let rebuild = Start::Rebuild;
+        assert_eq!(start(Some(20), None, Some(20)), Start::Resume);
+        assert_eq!(start(Some(30), Some(20), None), Start::Resume);
+        assert_eq!(start(None, Some(20), Some(20)), Start::Unproven(20));
+        assert_eq!(start(None, Some(30), None), Start::Unproven(30));
+        assert_eq!(start(Some(10), Some(30), Some(20)), Start::Unproven(30));
+        assert_eq!(
+            start(None, Some(10), Some(20)),
+            rebuild(RebuildReason::Regression)
+        );
+        assert_eq!(
+            start(Some(10), None, Some(20)),
+            rebuild(RebuildReason::Regression)
+        );
+        assert_eq!(start(None, None, Some(20)), rebuild(RebuildReason::Cold));
+        assert_eq!(start(None, None, None), rebuild(RebuildReason::Cold));
+    }
+
+    /// A first live receipt right after the unproven head resumes. A later
+    /// first receipt can be a hole, and rebuilds. Only the first batch
+    /// counts.
+    #[test]
+    fn only_a_first_batch_that_follows_the_head_resumes() {
+        let mut follows = Progress::new(None);
+        follows.begin(Start::Unproven(20));
+        follows.check_follows(BPosition::from_index(21));
+        assert_eq!(follows.pending_rebuild, None);
+        follows.check_follows(BPosition::from_index(90));
+        assert_eq!(follows.pending_rebuild, None, "only the first batch counts");
+
+        let mut overlaps = Progress::new(None);
+        overlaps.begin(Start::Unproven(20));
+        overlaps.check_follows(BPosition::from_index(15));
+        assert_eq!(overlaps.pending_rebuild, None);
+
+        let mut hole = Progress::new(None);
+        hole.begin(Start::Unproven(20));
+        hole.check_follows(BPosition::from_index(22));
+        assert_eq!(hole.pending_rebuild, Some(RebuildReason::Hole));
+        assert_eq!(RebuildReason::Hole.label(), "hole");
+    }
+
+    /// A rollback clears the projection, so the unproven head means
+    /// nothing after it.
+    #[test]
+    fn a_rollback_drops_the_unproven_head() {
+        let mut progress = Progress::new(None);
+        progress.begin(Start::Unproven(20));
+        assert!(progress.roll_back(&rollback(2)));
+        assert_eq!(progress.unproven, None);
     }
 }

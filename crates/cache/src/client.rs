@@ -469,20 +469,42 @@ impl AccountCache {
             .collect())
     }
 
-    /// Publish this mirror's head with the liveness TTL.
+    /// Publish this mirror's head with the liveness TTL, and its durable
+    /// head with no TTL, in one pipeline. The two writes follow the rows
+    /// of the head on the same connection, so a replica that holds a head
+    /// holds those rows too.
     ///
     /// # Errors
     ///
     /// Returns the Redis error or [`CacheError::Timeout`].
     pub async fn set_head(&self, id: u32, head: BPosition) -> Result<(), CacheError> {
-        self.run(
-            redis::cmd("SET")
-                .arg(keys::head(id))
-                .arg(keys::position_tag(head))
-                .arg("EX")
-                .arg(self.head_ttl.as_secs()),
-        )
-        .await
+        let tag = keys::position_tag(head);
+        let mut pipe = redis::pipe();
+        pipe.cmd("SET")
+            .arg(keys::head(id))
+            .arg(&tag)
+            .arg("EX")
+            .arg(self.head_ttl.as_secs())
+            .ignore()
+            .cmd("SET")
+            .arg(keys::durable_head(id))
+            .arg(&tag)
+            .ignore();
+        self.run_pipe(&pipe).await
+    }
+
+    /// The durable head of the mirror `id`, as a canonical index. `None`
+    /// when Redis holds none: Redis lost its data, or the mirror never
+    /// published a head.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Redis error or [`CacheError::Timeout`].
+    pub async fn durable_head(&self, id: u32) -> Result<Option<u64>, CacheError> {
+        let tag: Option<String> = self
+            .run(redis::cmd("GET").arg(keys::durable_head(id)))
+            .await?;
+        Ok(tag.as_deref().and_then(keys::parse_tag))
     }
 
     /// Publish the sequencer's optimistic floor of `address`. Informational.

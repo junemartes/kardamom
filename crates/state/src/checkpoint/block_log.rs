@@ -216,12 +216,102 @@ impl Segment {
     /// segment that does not open, or that has another head, holds none
     /// for this log.
     fn records(&self, identity: LogIdentity) -> Option<Records<BufReader<File>>> {
+        self.body(identity).map(|reader| Records { reader })
+    }
+
+    /// The record heads of the segment, when its head is of `identity`.
+    /// The walk reads no batch.
+    fn heads(&self, identity: LogIdentity) -> Option<RecordHeads> {
+        let file = self.body(identity)?.into_inner();
+        let len = file.metadata().ok()?.len();
+        Some(RecordHeads {
+            file,
+            len,
+            offset: SEGMENT_HEAD as u64,
+        })
+    }
+
+    /// The one record that starts at `offset`. `None` when it is torn or
+    /// bad.
+    fn record_at(&self, offset: u64) -> Option<Record> {
+        let mut file = File::open(&self.path).ok()?;
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset)).ok()?;
+        Records::new(BufReader::new(file)).next()
+    }
+
+    /// The reader of the segment after its head, when the head is of
+    /// `identity`.
+    fn body(&self, identity: LogIdentity) -> Option<BufReader<File>> {
         let mut reader = File::open(&self.path).map(BufReader::new).ok()?;
         let mut head = [0u8; SEGMENT_HEAD];
         reader.read_exact(&mut head).ok()?;
         SegmentHead::decode(&head)
             .filter(|h| h.identity == identity && h.first_block == self.first_block)
-            .map(|_| Records { reader })
+            .map(|_| reader)
+    }
+}
+
+/// The block of one record and the offset of the record in its segment.
+#[derive(Clone, Copy, Debug)]
+struct RecordHead {
+    block: u64,
+    offset: u64,
+}
+
+/// The record heads of one segment, in order. Each step reads the 16
+/// bytes of a record head at its offset and skips the batch. The walk
+/// ends at a record that the file does not hold whole, so a torn tail of
+/// the open segment is not in it. The walk does not check the CRC.
+struct RecordHeads {
+    file: File,
+    /// The bytes in the file when the walk started.
+    len: u64,
+    /// The offset of the next record head.
+    offset: u64,
+}
+
+impl Iterator for RecordHeads {
+    type Item = RecordHead;
+
+    fn next(&mut self) -> Option<RecordHead> {
+        let mut head = [0u8; RECORD_HEAD];
+        std::os::unix::fs::FileExt::read_exact_at(&self.file, &mut head, self.offset).ok()?;
+        let (len, rest) = head.split_first_chunk::<4>()?;
+        let block = u64::from_le_bytes(*rest.first_chunk::<8>()?);
+        let end = self
+            .offset
+            .checked_add(RECORD_HEAD as u64)?
+            .checked_add(u64::from(u32::from_le_bytes(*len)))?;
+        let found = (end <= self.len).then_some(RecordHead {
+            block,
+            offset: self.offset,
+        })?;
+        self.offset = end;
+        Some(found)
+    }
+}
+
+/// The blocks that a restore of a base applies: the block after the base,
+/// then each next block, up to a last block. The first block that does
+/// not follow ends the chain.
+struct Chain {
+    expected: Option<u64>,
+    to: u64,
+}
+
+impl Chain {
+    fn new(base: u64, to: u64) -> Self {
+        Self {
+            expected: base.checked_add(1),
+            to,
+        }
+    }
+
+    /// Whether `block` continues the chain. A `false` ends it.
+    fn takes(&mut self, block: u64) -> bool {
+        let next = self.expected.filter(|e| block == *e && block <= self.to);
+        self.expected = next.and_then(|e| e.checked_add(1));
+        next.is_some()
     }
 }
 
@@ -306,21 +396,44 @@ impl BlockLog {
     /// records stop at the first block that is missing: a gap, a torn
     /// record, or a segment that is gone or of another identity.
     pub fn after(&self, base: u64, to: u64) -> impl Iterator<Item = Record> + '_ {
+        let mut chain = Chain::new(base, to);
+        self.chain_from(base)
+            .iter()
+            .flat_map(|s| s.records(self.identity).into_iter().flatten())
+            .skip_while(move |r| r.block <= base)
+            .take_while(move |r| chain.takes(r.block))
+    }
+
+    /// The last record that [`Self::after`] gives for `base` with no upper
+    /// block, found cheaply: the walk reads the record heads only, and
+    /// reads and checks the last record alone. A bad record inside the
+    /// chain can make this record later than the one that a replay
+    /// reaches, never earlier. `None` when the log holds no block after
+    /// `base`, or the last record is bad.
+    #[must_use]
+    pub fn last_after(&self, base: u64) -> Option<Record> {
+        let mut chain = Chain::new(base, u64::MAX);
+        let (segment, head) = self
+            .chain_from(base)
+            .iter()
+            .flat_map(|s| {
+                let heads = s.heads(self.identity).into_iter().flatten();
+                heads.map(move |h| (s, h))
+            })
+            .skip_while(|(_, h)| h.block <= base)
+            .take_while(|(_, h)| chain.takes(h.block))
+            .last()?;
+        segment.record_at(head.offset)
+    }
+
+    /// The segments from the one that holds the block after `base`.
+    fn chain_from(&self, base: u64) -> &[Segment] {
         let start = self
             .segments
             .iter()
             .rposition(|s| s.first_block <= base.saturating_add(1))
             .unwrap_or(self.segments.len());
-        let mut expected = base.checked_add(1);
-        self.segments[start..]
-            .iter()
-            .flat_map(|s| s.records(self.identity).into_iter().flatten())
-            .skip_while(move |r| r.block <= base)
-            .take_while(move |r| {
-                let next = expected.filter(|e| r.block == *e && r.block <= to);
-                expected = next.and_then(|e| e.checked_add(1));
-                next.is_some()
-            })
+        &self.segments[start..]
     }
 }
 
