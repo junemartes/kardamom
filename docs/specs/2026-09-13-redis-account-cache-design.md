@@ -202,9 +202,11 @@ One struct in `kardamom-cache`, owned by the ingress proxy and by each sequencer
 | `acct:<addr>` | hash `{nonce, balance, tx_idx}` | mirror | none |
 | `rcpt:<addr>:<nonce>` | rkyv `Receipt` bytes + `tx_hash` | mirror | receipt horizon (10 min) |
 | `head:<mirror_id>` | `{tx_idx, applied_at}` | that mirror | liveness TTL (5 s) |
+| `durable_head:<mirror_id>` | the tag of `head:<mirror_id>` | that mirror | none |
 | `pending:<addr>` | u64 optimistic floor | sequencer, informational | 60 s |
 
-The reader's head is the max over live `head:*` keys. Each mirror advances its head to its
+The reader's head is the max over live `head:*` keys. The readers never read
+`durable_head:*`. Only the start of the same mirror reads it (see the failover rule). Each mirror advances its head to its
 receipt watermark (5.2): the highest position P such that it has applied every receipt at or
 below P. Receipts are must-deliver from every executor replica, so a stalled watermark means
 a lost subscription, and the head stalls until it resumes. Cross-account atomicity is not
@@ -243,14 +245,25 @@ needed: admission reads one sender.
 - **Rebuild rule.** A rebuild never replays history:
   1. Subscribe to `tx_receipts` and apply live rows from the first batch seen, position E.
   2. Wait until the co-located executor's newest checkpoint in `/opt/kardamom/checkpoints`
-     has `last_committed_end_tx_position >= E`.
+     has `last_committed_end_tx_position >= E`. A restore point is the newest base and the
+     last block that the block log after it reaches. The log stops at its first gap, so a
+     log that grows after a gap does not move the point. The mirror restores each point
+     once. It does not restore a point when the end position of the last log record is
+     already below E. These reads take the record heads of the log and one record only.
   3. Open that checkpoint read-only, never the live env. Scan `accounts`. Write every value
      tagged with the checkpoint's end position through the write rule. Live rows after it win.
   A rebuild is mandatory on a non-contiguous resume, a detected head regression, an
   operator-declared restore or reconstruct, and a daily audit schedule.
 - **Failover rule.** Async replication can lose the tail. The mirror persists its applied head
   in a local file (`/opt/kardamom/mirror/head`). On start or reconnect, if the Redis head is
-  below the local head, the mirror runs a full rebuild. The mirror ends each batch pipeline
+  below the local head, the mirror runs a full rebuild. On start, the Redis head is the max
+  of the live heads of all mirrors and the durable head of this mirror. The mirror writes
+  both heads in one pipeline after the rows, on one connection. So a replica that holds a
+  durable head at P holds every row of this mirror up to P. A Redis that lost its data
+  holds no durable head, and the start is cold. A Redis that kept its data resumes after a
+  restart of all mirrors, also when every live head aged out. The batches that no mirror
+  applied in that restart stay missing until a later write or the audit rebuild. This hole
+  is of the same kind as a frame whose three copies are lost (see the PR 2b note). The mirror ends each batch pipeline
   with `WAIT 1 <timeout>`. That cost lands on the mirror only. A `WAIT` timeout (a dead or
   lagging replica) is counted and the mirror proceeds. It never stalls on `WAIT`.
 - **Trust rule.** Redis is reachable only from cluster nodes, with `requirepass` and an ACL.
@@ -510,9 +523,9 @@ Deviations from the design above, recorded as they land.
   `tx_receipts` and applies each batch: rows and receipts in one pipeline each, then the
   head, then `WAIT` for one replica. A failed batch write retries until it lands; an outage
   past 10 s schedules a rebuild, because frames may have been lost behind the mirror. On
-  start the mirror resumes when any live head is at or beyond its local head file, and
-  rebuilds when Redis carries no live head (cold) or a head below the local one
-  (regression). A daily audit rebuild is the default. The rebuild restores the executor's
+  start the mirror resumes when any live head, or its own durable head, is at or beyond
+  its local head file. It rebuilds when Redis carries none of these heads (cold) or only
+  heads below the local one (regression). A daily audit rebuild is the default. The rebuild restores the executor's
   newest checkpoint into the mirror's own directory with the same verified path the
   executor uses, and opens that copy read only; the checkpoints mount is read only. The
   Redis image, primary, replica, and sentinels ship without `requirepass` or ACLs in the

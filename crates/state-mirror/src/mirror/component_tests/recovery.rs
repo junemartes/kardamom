@@ -127,3 +127,52 @@ async fn a_transient_head_read_timeout_does_not_end_the_recovery_wait() {
     fixture.head(0, 20).await;
     assert!(started.elapsed() >= std::time::Duration::from_millis(200));
 }
+
+/// All mirrors stop for longer than the TTL of the live heads, and Redis
+/// keeps its data. The durable head is at the local head, so the mirror
+/// resumes: no rebuild writes the checkpoint rows.
+#[tokio::test]
+#[ignore = "requires one disposable Redis container"]
+async fn a_restart_of_all_mirrors_on_an_intact_redis_resumes() {
+    let mut fixture = Fixture::new().await;
+    fixture.permit_all().await;
+    fixture.all_mirrors_stopped_after(0, 20).await;
+    let actor = fixture.start(0, false).await;
+    actor.send(&Fixture::batch(0, 2, 30));
+    fixture.head(0, 30).await;
+    fixture.assert_row(0, 2, 30).await;
+    fixture.assert_no_checkpoint_rows(1).await;
+    assert_eq!(fixture.cache.durable_head(0).await.unwrap(), Some(30));
+    actor.close().await.unwrap();
+}
+
+/// A Redis that lost its data holds no durable head. The local head file
+/// is still there, and the start is cold.
+#[tokio::test]
+#[ignore = "requires one disposable Redis container"]
+async fn an_empty_redis_with_a_local_head_is_cold() {
+    let mut fixture = Fixture::new().await;
+    fixture.permit_all().await;
+    fixture.head_file(0).write(20).unwrap();
+    let actor = fixture.start(0, false).await;
+    actor.send(&Fixture::batch(0, 1, 20));
+    fixture.head(0, 20).await;
+    fixture.assert_checkpoint_suffix(1).await;
+    actor.close().await.unwrap();
+}
+
+/// A failover lost the tail: the durable head is below the local head
+/// file. The start rebuilds.
+#[tokio::test]
+#[ignore = "requires one disposable Redis container"]
+async fn a_durable_head_below_the_local_head_is_a_regression() {
+    let mut fixture = Fixture::new().await;
+    fixture.permit_all().await;
+    fixture.all_mirrors_stopped_after(0, 10).await;
+    fixture.head_file(0).write(20).unwrap();
+    let actor = fixture.start(0, false).await;
+    actor.send(&Fixture::batch(0, 1, 20));
+    fixture.head(0, 20).await;
+    fixture.assert_checkpoint_suffix(1).await;
+    actor.close().await.unwrap();
+}

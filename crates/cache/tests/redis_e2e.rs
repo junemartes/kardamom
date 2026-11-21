@@ -264,6 +264,7 @@ async fn a_clear_deletes_the_projection_and_keeps_the_heads() {
     assert_eq!(cache.account(Address::repeat_byte(7)).await.unwrap(), None);
     assert_eq!(cache.receipt(sender, 1_499).await.unwrap(), None);
     assert_eq!(cache.heads(&[0]).await.unwrap(), vec![Some(50)]);
+    assert_eq!(cache.durable_head(0).await.unwrap(), Some(50));
     assert_eq!(cache.pending(pending).await.unwrap(), Some(8));
     let lower = cache
         .write_rows(BPosition::from_index(10), &[row(7, 3, 3)])
@@ -339,4 +340,27 @@ async fn reader_connects_lazily_and_gates_freshness_on_the_head() {
         .unwrap();
     assert_eq!(reader.receipt(a, 4).await, Some(receipt));
     assert!(reader.receipt(a, 5).await.is_none());
+}
+
+/// The live head ages out with its TTL. The durable head stays, with the
+/// same position, and the readers' heads do not see it.
+#[tokio::test]
+#[ignore = "requires Docker; run with `cargo test --features docker-e2e -- --ignored`"]
+async fn the_durable_head_outlives_the_live_head() {
+    let (_container, mut cfg) = kardamom_cache::testing::redis().await;
+    cfg.head_ttl_secs = std::num::NonZeroU64::MIN;
+    let cache = AccountCache::connect(&cfg).await.expect("connect");
+    assert_eq!(cache.durable_head(1).await.unwrap(), None);
+    cache.set_head(1, BPosition::from_index(70)).await.unwrap();
+    assert_eq!(cache.heads(&[1]).await.unwrap(), vec![Some(70)]);
+    assert_eq!(cache.durable_head(1).await.unwrap(), Some(70));
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    assert_eq!(cache.heads(&[1]).await.unwrap(), vec![None]);
+    assert_eq!(cache.durable_head(1).await.unwrap(), Some(70));
+    cache.set_head(1, BPosition::from_index(40)).await.unwrap();
+    assert_eq!(
+        cache.durable_head(1).await.unwrap(),
+        Some(40),
+        "the durable head follows a lower head after a rollback"
+    );
 }

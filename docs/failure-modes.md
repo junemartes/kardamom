@@ -1549,6 +1549,17 @@ Redis is a cache with no persistence. The state of the executors is the truth. T
   - Effect: the restarted mirrors find Redis cold.
   - Recovery: each mirror rebuilds the projection from the newest checkpoint of its executor. The mirror head advances again. The projection holds the accounts of the checkpoint, not only the live rows.
   - Proof: `mirror-kill-rebuild`. The case counts `rebuild: done` lines in the `state-mirror` job log. It does not use the rebuild counter, because a new process starts that counter at zero.
+- **All state mirrors restarted, Redis intact**
+  - Trigger: every mirror stops for longer than the TTL of the live heads (5 s), for example when a deploy restarts the media driver of every node.
+  - Effect: no live `head:<id>` key is left. The `durable_head:<id>` key of each mirror has no TTL, and Redis keeps it.
+  - Recovery: each mirror resumes when its durable head is at or beyond its local head file. A durable head below the head file is a failover regression, and the mirror rebuilds. A Redis that lost its data has no durable head, and the start is cold.
+  - Limit: the batches that no mirror applied while all were down stay missing until a later write of the account or the audit rebuild.
+  - Proof: the component tests `a_restart_of_all_mirrors_on_an_intact_redis_resumes`, `an_empty_redis_with_a_local_head_is_cold` and `a_durable_head_below_the_local_head_is_a_regression`.
+- **A gap in the block log during a mirror rebuild**
+  - Trigger: an executor restart leaves a gap in its block log. The newest restore point stops at the block before the gap until the next base.
+  - Effect: the log after the gap grows, and the restore point stays.
+  - Recovery: the mirror restores each restore point once. When the last log record before the gap already ends below the first live batch, the mirror does not restore that point at all. The next base gives a new point.
+  - Proof: `a_point_behind_the_first_live_batch_is_not_restored` and `a_growing_tail_after_a_gap_is_not_a_new_restore_point`.
 - A state mirror waits for Redis at start. It retries the connection every 2 s. A missing address or an unset password variable still ends the start at once.
 - A state mirror with `--checkpoint-peers` (`KARDAMOM_CHECKPOINT_PEERS`) also takes the checkpoints of its peers for a rebuild. The switch is off by default.
   - Each rebuild attempt fetches the newest peer checkpoint, and the block log after it, into `peer-checkpoints` in the mirror directory. It then restores the newest restore point of that copy and of the executor directory.

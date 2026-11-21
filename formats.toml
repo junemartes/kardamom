@@ -471,6 +471,18 @@ head = "head:3"
 pending = "pending:0x0000000000000000000000000000000000000000"
 index_tag = "00000000000000000007"
 
+# The durable head of each state mirror: the tag of `head:<id>` with no
+# TTL. Only the start of that mirror reads it. A Redis that lost its data
+# has no such key, so the mirror rebuilds.
+[format.redis-durable-head]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = true
+code = ["crates/cache/src/keys.rs#pub fn durable_head"]
+[format.redis-durable-head.layout]
+durable_head = "durable_head:3"
+
 # The service discovery records in Consul. A runtime ignores a record of
 # another version, so a mixed fleet does not find its peers. The version
 # covers both runtime-owned record kinds: kardamom-mdc-publisher and

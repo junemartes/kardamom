@@ -266,6 +266,7 @@ impl Fixture {
             .arg("+@all")
             .arg("resetkeys")
             .arg("~head:*")
+            .arg("~durable_head:*")
             .arg("~rcpt:*")
             .arg(patterns)
             .query_async::<()>(&mut self.admin)
@@ -403,6 +404,32 @@ impl Fixture {
             (expected.nonce, expected.balance, position),
             "account {index}"
         );
+    }
+
+    /// Mirror `id` published `position` as its head before all mirrors
+    /// stopped, and its live head aged out. Redis keeps the rows and the
+    /// durable head.
+    pub(super) async fn all_mirrors_stopped_after(&mut self, id: u32, position: u64) {
+        self.head_file(id).write(position).unwrap();
+        self.cache
+            .set_head(id, BPosition::from_index(position))
+            .await
+            .unwrap();
+        let live: Vec<String> = (0..self.mirrors).map(keys::head).collect();
+        redis::cmd("DEL")
+            .arg(live)
+            .query_async::<()>(&mut self.admin)
+            .await
+            .unwrap();
+        assert_eq!(self.cache.heads(&[id]).await.unwrap(), [None]);
+    }
+
+    /// No rebuild wrote the checkpoint rows from `from` on.
+    pub(super) async fn assert_no_checkpoint_rows(&self, from: u64) {
+        for index in from..ACCOUNTS {
+            let row = self.cache.account(Self::row(index, 1).address).await;
+            assert!(row.unwrap().is_none(), "account {index}");
+        }
     }
 
     pub(super) async fn assert_checkpoint_suffix(&self, from: u64) {

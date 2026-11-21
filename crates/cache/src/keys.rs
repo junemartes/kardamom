@@ -5,6 +5,7 @@
 //! | `acct:<addr>` | hash `{nonce, balance, tx_idx}` | mirror |
 //! | `rcpt:<addr>:<nonce>` | rkyv `Receipt` | mirror |
 //! | `head:<mirror_id>` | position tag | that mirror |
+//! | `durable_head:<mirror_id>` | position tag | that mirror |
 //! | `pending:<addr>` | u64 optimistic floor | sequencer |
 //!
 //! A position tag is the canonical index (`BPosition::as_index`) as a
@@ -40,6 +41,14 @@ pub fn receipt(sender: Address, nonce: u64) -> String {
 #[must_use]
 pub fn head(mirror_id: u32) -> String {
     format!("head:{mirror_id}")
+}
+
+/// The durable head of one mirror: the same tag as [`head`], with no
+/// TTL. Only the start of that mirror reads it, to tell a Redis that kept
+/// its data from one that lost it.
+#[must_use]
+pub fn durable_head(mirror_id: u32) -> String {
+    format!("durable_head:{mirror_id}")
 }
 
 /// The sequencer's optimistic floor of `address`. Informational only.
@@ -81,6 +90,7 @@ mod tests {
         check(id, "head", &head(3));
         check(id, "pending", &pending(Address::ZERO));
         check(id, "index_tag", &index_tag(7));
+        check("redis-durable-head", "durable_head", &durable_head(3));
     }
 
     /// The scan patterns match the keys that the writers make.
@@ -90,6 +100,8 @@ mod tests {
         assert!(account(Address::ZERO).starts_with(&prefix(ACCOUNT_PATTERN)));
         assert!(receipt(Address::ZERO, 5).starts_with(&prefix(RECEIPT_PATTERN)));
         assert!(!head(3).starts_with(&prefix(ACCOUNT_PATTERN)));
+        assert!(!durable_head(3).starts_with(&prefix(ACCOUNT_PATTERN)));
+        assert!(!durable_head(3).starts_with(&prefix(RECEIPT_PATTERN)));
         assert!(!pending(Address::ZERO).starts_with(&prefix(RECEIPT_PATTERN)));
     }
 
@@ -109,6 +121,7 @@ mod tests {
         assert_eq!(account(a), format!("acct:{a}"));
         assert_eq!(receipt(a, 7), format!("rcpt:{a}:7"));
         assert_eq!(head(2), "head:2");
+        assert_eq!(durable_head(2), "durable_head:2");
         assert_eq!(pending(a), format!("pending:{a}"));
     }
 }

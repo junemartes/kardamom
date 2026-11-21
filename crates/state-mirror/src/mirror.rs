@@ -181,29 +181,37 @@ impl Mirror {
     }
 
     /// An unfinished recovery cannot resume from another writer's head.
-    /// Otherwise resume when Redis carries a live head at or beyond
-    /// this mirror's persisted head, rebuild otherwise. A cold Redis (no
-    /// live head from any mirror) rebuilds. A Redis head below the local
-    /// head is a failover regression and rebuilds.
+    /// Otherwise resume when the Redis head is at or beyond this mirror's
+    /// persisted head, and rebuild otherwise. The Redis head is the max of
+    /// the live heads of all mirrors and the durable head of this mirror.
+    /// So a restart of all mirrors resumes on a Redis that kept its data.
+    /// A cold Redis (no live head, no durable head) rebuilds. A Redis head
+    /// below the local head is a failover regression and rebuilds.
     async fn resume_or_rebuild(&self) -> Result<Option<RebuildReason>> {
         if self.head.rebuild_pending()? {
             return Ok(Some(RebuildReason::Interrupted));
         }
-        let ids: Vec<u32> = (0..self.head_count).collect();
-        let heads = match self.cache.heads(&ids).await {
-            Ok(heads) => heads,
+        let redis_head = match self.redis_head().await {
+            Ok(head) => head,
             Err(e) => {
                 warn!(error = %e, "start: heads unreadable; rebuilding");
                 return Ok(Some(RebuildReason::Cold));
             }
         };
-        let redis_head = heads.iter().flatten().max().copied();
-        let local_head = self.head.read();
-        Ok(match (redis_head, local_head) {
-            (None, _) => Some(RebuildReason::Cold),
-            (Some(redis), Some(local)) if redis < local => Some(RebuildReason::Regression),
-            _ => None,
-        })
+        Ok(StartHeads {
+            redis: redis_head,
+            local: self.head.read(),
+        }
+        .owed_rebuild())
+    }
+
+    /// The max of the live heads of all mirrors and the durable head of
+    /// this mirror. `None` when Redis holds none of them.
+    async fn redis_head(&self) -> Result<Option<u64>, kardamom_cache::CacheError> {
+        let ids: Vec<u32> = (0..self.head_count).collect();
+        let live = self.cache.heads(&ids).await?;
+        let durable = self.cache.durable_head(self.id).await?;
+        Ok(live.into_iter().chain([durable]).flatten().max())
     }
 
     /// Apply a group of batches: their rows and receipts through the write
@@ -347,6 +355,24 @@ impl Mirror {
     }
 }
 
+/// The heads that decide a start: the Redis head, and the head of the
+/// local head file.
+struct StartHeads {
+    redis: Option<u64>,
+    local: Option<u64>,
+}
+
+impl StartHeads {
+    /// The rebuild that the start owes. `None` resumes.
+    fn owed_rebuild(self) -> Option<RebuildReason> {
+        match (self.redis, self.local) {
+            (None, _) => Some(RebuildReason::Cold),
+            (Some(redis), Some(local)) if redis < local => Some(RebuildReason::Regression),
+            _ => None,
+        }
+    }
+}
+
 /// One Redis write of the mirror, retried as a unit.
 enum Write<'a> {
     /// The rows and receipts of a group of batches, each row at the end
@@ -409,7 +435,7 @@ impl Progress {
 
 #[cfg(test)]
 mod tests {
-    use super::{Progress, RebuildReason};
+    use super::{Progress, RebuildReason, StartHeads};
     use alloy_primitives::B256;
     use kardamom_types::{BPosition, ReceiptRollback};
 
@@ -461,5 +487,22 @@ mod tests {
         assert_eq!(progress.pending_rebuild, None);
         assert_eq!(progress.advance(BPosition::from_index(10)).as_index(), 40);
         assert!(progress.roll_back(&rollback(8)), "a new event applies");
+    }
+
+    fn owed(redis: Option<u64>, local: Option<u64>) -> Option<RebuildReason> {
+        StartHeads { redis, local }.owed_rebuild()
+    }
+
+    /// A Redis head at or beyond the local head resumes. A Redis head
+    /// below it is a failover regression. A Redis with no head is cold,
+    /// whatever the local head is.
+    #[test]
+    fn the_start_rebuilds_only_a_cold_or_regressed_redis() {
+        assert_eq!(owed(Some(20), Some(20)), None);
+        assert_eq!(owed(Some(30), Some(20)), None);
+        assert_eq!(owed(Some(30), None), None);
+        assert_eq!(owed(Some(10), Some(20)), Some(RebuildReason::Regression));
+        assert_eq!(owed(None, Some(20)), Some(RebuildReason::Cold));
+        assert_eq!(owed(None, None), Some(RebuildReason::Cold));
     }
 }
