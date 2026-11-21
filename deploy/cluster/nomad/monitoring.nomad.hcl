@@ -132,6 +132,19 @@ variable "checkpoint_executor" {
   }
 }
 
+# The scrape of the audit mirror (nomad/state-mirror.nomad.hcl), "on" or
+# "off". Its own job label keeps it out of the queries of the hot
+# mirrors (job="kardamom-state-mirror"): it is not serving during its
+# daily audit. The deploy passes it from KARDAMOM_MIRROR_AUDIT_ON_BACKUP.
+variable "audit_mirror" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.audit_mirror)
+    error_message = "The audit_mirror value must be on or off."
+  }
+}
+
 variable "grafana_admin_password" {
   type        = string
   description = "The Grafana admin password. The local profile keeps the development default."
@@ -196,7 +209,10 @@ locals {
           - targets: ${jsonencode(local.ingress_targets)}
       - job_name: kardamom-state-mirror
         static_configs:
-          - targets: ${jsonencode(local.state_mirror_targets)}
+          - targets: ${jsonencode(local.state_mirror_targets)}%{if var.audit_mirror == "on"}
+      - job_name: kardamom-state-mirror-audit
+        static_configs:
+          - targets: [{{ range $i, $s := service "kardamom-state-mirror-audit|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]%{endif}
       - job_name: kardamom-validator
         static_configs:
           - targets: [{{ range $i, $s := service "kardamom-validator|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]

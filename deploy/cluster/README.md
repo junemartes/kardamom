@@ -199,7 +199,7 @@ The `update` stanza of each job:
 | `ingress`, `sequencer` | 1 | `checks` | 15s | `true` | `canary = var.canary`, `auto_promote = false` |
 | `cluster` (sealer) | 1 | `checks` | 60s | `false` | One task group for each member |
 | `cluster-backup` | 1 | `task_states` | 30s | `false` | Only with a node in the group `backup`. The deploy does not wait for it. |
-| `executor`, `validator`, `batcher`, `state-mirror` | 1 | `checks` | 15s | `false` | The group `executor-checkpoint` uses `task_states`: the checkpoint executor may lag, and a lag must not hold a deployment. |
+| `executor`, `validator`, `batcher`, `state-mirror` | 1 | `checks` | 15s | `false` | The groups `executor-checkpoint` and `mirror-audit` use `task_states`: the checkpoint executor may lag, the audit mirror is not ready during its audit, and neither must hold a deployment. |
 | `notifier`, `canary`, `egress` | 1 | `checks` | 10s | `false` | |
 | `da-watcher`, `l1-indexer`, `l1-light-client`, `da-proxy`, `da-store` | 1 | `task_states` | 10s | `false` | |
 | `aeron` (system job) | 1 | `task_states` | 15s | not set | `stagger = "30s"` |
@@ -483,12 +483,13 @@ The infrastructure of an environment sets these. The deploy does not change them
 
 ### The checkpoint executor
 
-The checkpoint executor moves the checkpoint writes off the sealer machines (`docs/specs/2026-11-17-checkpoint-executor.md`). Two switches do it. Each is off by default. With each one off, the deploy renders every job as before.
+The checkpoint executor moves the checkpoint writes off the sealer machines (`docs/specs/2026-11-17-checkpoint-executor.md`). Three switches do it. Each is off by default. With each one off, the deploy renders every job as before.
 
 | Switch | What it renders | When |
 |---|---|---|
 | `KARDAMOM_CHECKPOINT_EXECUTOR=on` | The group `executor-checkpoint` in the executor job, on the node of role `backup`. The checkpoint peers of the executors, the validator and the state mirrors name it first (`kardamom-executor-checkpoint.service.<dc>.consul:9014`). The state mirror gets `--checkpoint-peers` and `--chain`. Prometheus scrapes it as the job `kardamom-executor-checkpoint`. | Staging step 1. The hot executors keep their checkpoints. |
 | `KARDAMOM_EXEC_RESTORE_ONLY=on` | `--checkpoint-interval-secs 0` and the block log off on the hot executors. They still restore a peer checkpoint. | Staging step 2, after step 1 shows that the checkpoint executor keeps the average rate of the chain. |
+| `KARDAMOM_MIRROR_AUDIT_ON_BACKUP=on` | The group `mirror-audit` in the state-mirror job, on the node of role `backup`. The hot mirrors get `--audit-hours 0`. Prometheus scrapes the audit mirror as the job `kardamom-state-mirror-audit`. See [The audit mirror](#the-audit-mirror). | With the checkpoint executor. It does not need the restore-only mode. |
 
 The checkpoint executor:
 
@@ -522,7 +523,37 @@ max(kardamom_sealer_block_number{job="kardamom-executor"})
 
 No metric gives the age of the newest checkpoint yet, so no alert fires on it.
 
-To go back, switch `KARDAMOM_EXEC_RESTORE_ONLY` off first, then `KARDAMOM_CHECKPOINT_EXECUTOR`.
+To go back, switch `KARDAMOM_MIRROR_AUDIT_ON_BACKUP` and `KARDAMOM_EXEC_RESTORE_ONLY` off first, then `KARDAMOM_CHECKPOINT_EXECUTOR`.
+
+#### The audit mirror
+
+Each state mirror rewrites every account from a checkpoint into Redis once each `KARDAMOM_MIRROR_AUDIT_HOURS` (default 24). On staging on 2026-11-21, the three mirrors on the sealer machines audited at the same time. Each sealer machine read up to 600 MB/s and wrote up to 1,000 MB/s for 8 minutes. That disk also holds the archive of the sealer leader, which is on the commit path. 17 to 23 % of the commits waited more than 5 ms.
+
+With `KARDAMOM_MIRROR_AUDIT_ON_BACKUP=on`, a fourth mirror, the audit mirror, does the audit on the backup machine:
+
+- It runs in the group `mirror-audit` of the state-mirror job, on the node of role `backup`, beside the checkpoint executor. It applies the live batches of `tx_receipts`, as the hot mirrors do.
+- It keeps the default audit interval. It restores the newest checkpoint from `/opt/kardamom/checkpoints` of its own node, where the checkpoint executor writes them. It has no `--checkpoint-peers` and no `--chain`. In the restore-only mode, the checkpoint executor makes every new checkpoint, so no peer has a newer one. Before that mode, a hot executor can have a newer one, but a fetch of it reads the disk of a sealer machine. The audit can wait for the next local checkpoint instead.
+- The hot mirrors run with `--audit-hours 0`. They apply the live batches, and they still rebuild after a loss of Redis, a regression or a rollback.
+- One audit is enough: every mirror writes the same values through the monotone write rule.
+- Its mirror id is 255. The ingress and the sequencer poll only the heads `head:0` to `head:<executor_count - 1>`, so the head of the audit mirror never changes their freshness rule. A late audit mirror writes rows that the write rule discards, because the hot mirrors wrote newer rows first.
+- Its host id is `state-mirror-audit`. It registers the Consul service `kardamom-state-mirror-audit` with a TCP check: its `/ready` check fails during each audit, by design. No alert reads `kardamom_state_mirror_serving`.
+- Its deployment waits only for its task to run (`task_states`). A slow audit mirror does not hold a deployment of the hot mirrors.
+- With the switch on, the role constraint of the hot mirrors moves from the job into their group.
+
+The preflight refuses `KARDAMOM_MIRROR_AUDIT_ON_BACKUP=on` without `KARDAMOM_CHECKPOINT_EXECUTOR=on`.
+
+The backup node also needs:
+
+- `/opt/kardamom/mirror`, which the `data-dirs` job makes on every node, and the disk for one restored checkpoint in it;
+- 4096 MB of memory for the mirror. An audit restores a whole checkpoint, and the live batches wait in memory until the audit ends;
+- the fixed port 9007 free, and the Redis primary (6379) and the sentinels (26379) reachable;
+- the receive path of `tx_receipts` from the hot executors: the dynamic MDC ports of the node, as for every subscriber.
+
+The limits:
+
+- While the backup machine is down, no audit runs.
+- After a loss of Redis, the hot mirrors still do a cold rebuild on the sealer machines.
+- A restart of a mirror starts its audit interval again. A deploy every day restarts the audit mirror, so its audit can then wait for a day without a deploy.
 
 ### The notifier nodes
 
@@ -690,6 +721,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Executor | `KARDAMOM_CHECKPOINT_LOG` (job variable `checkpoint_log`) | empty (`off` in the job) | `on` or `off`. On, each hot executor keeps the block log of its checkpoints and copies the state only when the base rule asks for a new base, at 16 MiB/s. Off, it copies the whole state each 20 s. In the restore-only mode, the hot executors keep no block log. Each release reads the bases of both modes. See [`../../docs/specs/2026-10-22-incremental-checkpoints.md`](../../docs/specs/2026-10-22-incremental-checkpoints.md). |
 | Executor | `KARDAMOM_CHECKPOINT_EXECUTOR` (job variable `checkpoint_executor` of the executor, validator, state-mirror and monitoring jobs) | empty (`off` in the jobs) | `on` or `off`. On, the checkpoint executor runs on the node of role `backup`, and every list of checkpoint peers names it. It needs a backup node and `KARDAMOM_EGRESS=1`. See [The checkpoint executor](#the-checkpoint-executor). |
 | Executor | `KARDAMOM_EXEC_RESTORE_ONLY` (job variable `checkpoint_interval_s` = 0) | empty (`off`) | `on` or `off`. On, the hot executors make no checkpoint and no block log. They still restore a peer checkpoint. It needs `KARDAMOM_CHECKPOINT_EXECUTOR=on` and a backup node. |
+| State mirror | `KARDAMOM_MIRROR_AUDIT_ON_BACKUP` (job variable `audit_mirror` of the state-mirror and monitoring jobs) | empty (`off` in the jobs) | `on` or `off`. On, the audit mirror runs on the node of role `backup` and does the daily audit rebuild. The hot mirrors run with `--audit-hours 0`. It needs `KARDAMOM_CHECKPOINT_EXECUTOR=on`. See [The audit mirror](#the-audit-mirror). |
 | Fees | `PRIORITY_FEES` | empty (`off`) | `on` or `off`. One value sets the sequencer tip, the sealer ordering window and the executor and validator fee schedule. Turning it on for an existing chain is a chain upgrade. See [`../../docs/priority-fees.md`](../../docs/priority-fees.md). |
 | Aeron | `KARDAMOM_AERON_THREADING_MODE` | empty (`SHARED` in the job) | The threading mode of the media driver of each node: `SHARED` (one thread), `SHARED_NETWORK` (the sender and the receiver on one thread, the conductor on its own) or `DEDICATED` (three threads). `SHARED` costs the least CPU, but at a high message rate its one thread saturates and every stream of the node waits. |
 | Aeron | `KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL` | empty (`1` in the job) | The sync level of the `tx_data`, `tx_deposits` and `exec_txs` recordings and of the archive catalog (job variable `archive_file_sync_level`). `0` leaves a write in the page cache. `1` syncs the data of each write batch. `2` also syncs the metadata. Level 1 costs throughput on the recording path. |
