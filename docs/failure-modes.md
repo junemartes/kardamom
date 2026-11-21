@@ -1552,9 +1552,9 @@ Redis is a cache with no persistence. The state of the executors is the truth. T
 - **All state mirrors restarted, Redis intact**
   - Trigger: every mirror stops for longer than the TTL of the live heads (5 s), for example when a deploy restarts the media driver of every node.
   - Effect: no live `head:<id>` key is left. The `durable_head:<id>` key of each mirror has no TTL, and Redis keeps it.
-  - Recovery: each mirror resumes when its durable head is at or beyond its local head file. A durable head below the head file is a failover regression, and the mirror rebuilds. A Redis that lost its data has no durable head, and the start is cold.
-  - Limit: the batches that no mirror applied while all were down stay missing until a later write of the account or the audit rebuild.
-  - Proof: the component tests `a_restart_of_all_mirrors_on_an_intact_redis_resumes`, `an_empty_redis_with_a_local_head_is_cold` and `a_durable_head_below_the_local_head_is_a_regression`.
+  - Recovery: when the durable head is at or beyond the local head file, the mirror checks the first live batch. A first receipt at or below the position after the durable head proves that no batch is missing, and the mirror resumes. A later first receipt can be a hole: the mirror rebuilds from a checkpoint with the reason `hole`. A durable head below the head file is a failover regression, and the mirror rebuilds. A Redis that lost its data has no durable head, and the start is cold.
+  - Limit: positions are not dense, so a stop with only markers after the head also rebuilds.
+  - Proof: the component tests `a_restart_of_all_mirrors_on_an_intact_redis_resumes`, `a_restart_of_all_mirrors_with_a_hole_rebuilds`, `an_empty_redis_with_a_local_head_is_cold` and `a_durable_head_below_the_local_head_is_a_regression`.
 - **A gap in the block log during a mirror rebuild**
   - Trigger: an executor restart leaves a gap in its block log. The newest restore point stops at the block before the gap until the next base.
   - Effect: the log after the gap grows, and the restore point stays.

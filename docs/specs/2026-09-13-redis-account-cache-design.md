@@ -260,10 +260,13 @@ needed: admission reads one sender.
   of the live heads of all mirrors and the durable head of this mirror. The mirror writes
   both heads in one pipeline after the rows, on one connection. So a replica that holds a
   durable head at P holds every row of this mirror up to P. A Redis that lost its data
-  holds no durable head, and the start is cold. A Redis that kept its data resumes after a
-  restart of all mirrors, also when every live head aged out. The batches that no mirror
-  applied in that restart stay missing until a later write or the audit rebuild. This hole
-  is of the same kind as a frame whose three copies are lost (see the PR 2b note). The mirror ends each batch pipeline
+  holds no durable head, and the start is cold. A live head at or beyond the local head
+  resumes at once: that mirror applied the batches of the stop. When no live head covers
+  the stop (for example, all mirrors restarted), the resume must be contiguous. The first
+  live receipt must be at or below the position after the Redis head. Positions are not
+  dense (see the PR 2b note), so a later first receipt can be a hole or only markers. The
+  mirror cannot tell the two apart, so it runs a rebuild with the reason `hole`. This is
+  the rebuild rule for a non-contiguous resume. The mirror ends each batch pipeline
   with `WAIT 1 <timeout>`. That cost lands on the mirror only. A `WAIT` timeout (a dead or
   lagging replica) is counted and the mirror proceeds. It never stalls on `WAIT`.
 - **Trust rule.** Redis is reachable only from cluster nodes, with `requirepass` and an ACL.
@@ -523,9 +526,10 @@ Deviations from the design above, recorded as they land.
   `tx_receipts` and applies each batch: rows and receipts in one pipeline each, then the
   head, then `WAIT` for one replica. A failed batch write retries until it lands; an outage
   past 10 s schedules a rebuild, because frames may have been lost behind the mirror. On
-  start the mirror resumes when any live head, or its own durable head, is at or beyond
-  its local head file. It rebuilds when Redis carries none of these heads (cold) or only
-  heads below the local one (regression). A daily audit rebuild is the default. The rebuild restores the executor's
+  start the mirror resumes when a live head is at or beyond its local head file. With its
+  own durable head at or beyond the head file, it resumes only when the first live batch
+  follows that head, and it rebuilds the hole otherwise. It rebuilds when Redis carries
+  none of these heads (cold) or only heads below the local one (regression). A daily audit rebuild is the default. The rebuild restores the executor's
   newest checkpoint into the mirror's own directory with the same verified path the
   executor uses, and opens that copy read only; the checkpoints mount is read only. The
   Redis image, primary, replica, and sentinels ship without `requirepass` or ACLs in the
