@@ -155,15 +155,32 @@ variable "checkpoint_log" {
   }
 }
 
-# The seconds between two checkpoints of an executor
-# (--checkpoint-interval-secs). The deploy passes it from
-# KARDAMOM_CHECKPOINT_INTERVAL_S.
+# The seconds between two checkpoints of a hot executor
+# (--checkpoint-interval-secs). 0 is the restore-only mode: the hot
+# executor makes no checkpoint and no block log, and it restores a peer
+# checkpoint when it must. The deploy passes it from
+# KARDAMOM_CHECKPOINT_INTERVAL_S, or 0 with KARDAMOM_EXEC_RESTORE_ONLY=on.
 variable "checkpoint_interval_s" {
   type    = number
   default = 20
   validation {
-    condition     = var.checkpoint_interval_s > 0
-    error_message = "The checkpoint_interval_s value must be above 0."
+    condition     = var.checkpoint_interval_s >= 0 && floor(var.checkpoint_interval_s) == var.checkpoint_interval_s
+    error_message = "The checkpoint_interval_s value must be a whole number of seconds, 0 or above."
+  }
+}
+
+# The checkpoint executor, "on" or "off". On, one more executor runs on
+# the node of role backup, in the group executor-checkpoint. It executes
+# every block and makes the checkpoints and the block log. It publishes
+# no receipts, votes no void and sends no cursor, so no reader and no
+# sealer waits for it. Every list of checkpoint peers names it. The
+# deploy passes it from KARDAMOM_CHECKPOINT_EXECUTOR.
+variable "checkpoint_executor" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.checkpoint_executor)
+    error_message = "The checkpoint_executor value must be on or off."
   }
 }
 
@@ -196,8 +213,10 @@ variable "carry_executors" {
   default = ""
 }
 
-# The egress base URL (--egress) of the carry executors. A carry executor
-# reads a cursor below the replay window of its member from the egress.
+# The egress base URL (--egress) of the carry executors and of the
+# checkpoint executor. A carry executor reads a cursor below the replay
+# window of its member from the egress. The checkpoint executor reads a
+# cursor below the window of the sealer from the egress.
 variable "egress_url" {
   type    = string
   default = ""
@@ -219,34 +238,79 @@ variable "executor_query_port" {
 #
 # The role constraint of a pinned group is in the group, not in the job.
 # So during the staged move (tasks/executor.yml) a step can hold the
-# group of the executor nodes and the pinned groups in one job.
+# group of the executor nodes and the pinned groups in one job. With the
+# checkpoint executor, the group of the executor nodes also takes its
+# role constraint in the group, because the checkpoint group runs on
+# another role.
+#
+# Each group is hot or not. A hot executor serves the chain: it publishes
+# the receipts, votes voids, sends the cursor and answers the nonce
+# queries, and its /ready check gates its deployment. The checkpoint
+# executor (group executor-checkpoint, on the node of role backup) is
+# not hot: it only executes and makes checkpoints, and it may lag. Its
+# deployment waits only for its task to run, so a lag never holds a
+# deployment of the hot executors. Its id names only its host id. Its
+# recorder id names no tx_receipts endpoint, because it publishes no
+# receipts. That id stays outside the ids of the hot executors, so its
+# discovery label is its own.
 locals {
   on_sealers = var.exec_on_sealers == "on"
+  checkpoint = var.checkpoint_executor == "on"
   carry_ids  = split(",", var.carry_executors)
-  executor_groups = local.on_sealers ? [
-    for i in range(var.sealer_count) : {
-      label = "executor-${i}"
-      count = 1
-      id    = format("%d", i)
-      carry = contains(local.carry_ids, format("%d", i))
+  # A hot executor makes checkpoints at the interval of the deploy. At
+  # interval 0 it is restore-only: no checkpoint and no block log.
+  hot = {
+    hot                   = true
+    checkpoint_interval_s = var.checkpoint_interval_s
+    checkpoint_log        = var.checkpoint_log == "on" && var.checkpoint_interval_s > 0
+  }
+  hot_groups = local.on_sealers ? [
+    for i in range(var.sealer_count) : merge(local.hot, {
+      label       = "executor-${i}"
+      count       = 1
+      id          = format("%d", i)
+      recorder_id = format("%d", i)
+      carry       = contains(local.carry_ids, format("%d", i))
       constraints = [
         { attribute = "${meta.node_index}", operator = "=", value = format("%d", i) },
         { attribute = "${meta.role}", operator = "=", value = "sealer" },
       ]
-    }
-    ] : [{
+    })
+    ] : [merge(local.hot, {
       label       = "executor"
       count       = 3
       id          = "${NOMAD_ALLOC_INDEX}"
+      recorder_id = "${NOMAD_ALLOC_INDEX}"
       carry       = false
-      constraints = [{ attribute = "", operator = "distinct_hosts", value = "true" }]
-  }]
+      constraints = concat(
+        [{ attribute = "", operator = "distinct_hosts", value = "true" }],
+        local.checkpoint ? [{ attribute = "${meta.role}", operator = "=", value = "executor" }] : [],
+      )
+  })]
+  # The checkpoint executor always makes checkpoints, with the block log,
+  # every 20 s.
+  checkpoint_groups = local.checkpoint ? [{
+    hot                   = false
+    checkpoint_interval_s = 20
+    checkpoint_log        = true
+    label                 = "executor-checkpoint"
+    count                 = 1
+    id                    = "checkpoint"
+    recorder_id           = "255"
+    carry                 = false
+    constraints           = [{ attribute = "${meta.role}", operator = "=", value = "backup" }]
+  }] : []
+  executor_groups = concat(local.hot_groups, local.checkpoint_groups)
   # The nodes of the checkpoint peers: the nodes that run the executors.
   # On the sealer nodes, the list also names the executor nodes. The first
   # executor of the staged move starts with no state, and only the
   # executors on the executor nodes hold a checkpoint then. A fetch skips
-  # a peer that does not answer.
+  # a peer that does not answer. The checkpoint executor is a peer by its
+  # Consul service, so no job names the backup node. It comes first: a
+  # fetch skips a later peer that has no newer checkpoint without a
+  # download, so the old checkpoints of the hot executors stay unread.
   checkpoint_peers = join(",", concat(
+    local.checkpoint ? ["kardamom-executor-checkpoint.service.${var.datacenter}.consul:9014"] : [],
     local.on_sealers ? [
       for i in range(var.sealer_count) : "sealer-${i}.node.${var.datacenter}.consul:9014"
     ] : [],
@@ -283,7 +347,7 @@ job "executor" {
   type        = "service"
 
   dynamic "constraint" {
-    for_each = local.on_sealers ? [] : ["executor"]
+    for_each = local.on_sealers || local.checkpoint ? [] : ["executor"]
     content {
       attribute = "${meta.role}"
       value     = constraint.value
@@ -339,9 +403,10 @@ job "executor" {
       # block is within the lag budget of the sealer's head, so a restarted
       # replica has caught up before the next one stops. No revert: a
       # replica carries its state, and the role's rollback is the path.
+      # The checkpoint executor is healthy when its task runs: it may lag.
       update {
         max_parallel      = 1
-        health_check      = "checks"
+        health_check      = group.value.hot ? "checks" : "task_states"
         min_healthy_time  = "15s"
         healthy_deadline  = "5m"
         progress_deadline = "10m"
@@ -394,9 +459,10 @@ job "executor" {
           # run), at zero parallelism cost under seeded execution.
           KARDAMOM_BAL_GRANULARITY = "20"
           # The recorded cursor to the sealer, under the void voter id.
-          KARDAMOM_EXEC_CURSOR = var.exec_cursor == "on" ? "true" : "false"
+          # Only a hot executor has a void voter id, so only it sends one.
+          KARDAMOM_EXEC_CURSOR = group.value.hot && var.exec_cursor == "on" ? "true" : "false"
           # The block log of the checkpoints.
-          KARDAMOM_CHECKPOINT_LOG = var.checkpoint_log == "on" ? "true" : "false"
+          KARDAMOM_CHECKPOINT_LOG = group.value.checkpoint_log ? "true" : "false"
           # KARDAMOM_BAL_MEASURE stays unset in deployed profiles. The
           # K-ladder measure mode re-encodes every frame 4 times, on the
           # publisher thread. Under DeFi loads, that saturated the
@@ -436,61 +502,69 @@ job "executor" {
             # plus id). The id is stable: the allocation index of the
             # count-based group, or the member index on the sealer nodes. It
             # matches the co-located recorder's id.
-            "--recorder-id", group.value.id,
-            # The void voter id: the same stable id. The sealer's voter
-            # list (cluster.nomad.hcl) names every executor id.
-            "--void-voter-id", group.value.id,
-            # Cluster mode only: this allocation's cluster-egress
-            # (response) endpoint. The cluster client's egress_channel is
-            # per allocation (the node IP and the dynamic port are known
-            # only at placement), so it is injected here instead of baked
-            # into config/executor.toml.
-            "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
-            "--chain-id", "412346",
-            "--chain", "/local/genesis.toml",
-            # Join-miss archive refetch (tx_data and tx_deposits). When
-            # the live multicast misses a canonical ref's envelope
-            # (down-window, image lapse, blackout), it replays in-band
-            # from the durability archives listed in channels.toml
-            # (ingress .31/.32; aux .61). Replayed fragments and
-            # archive-control responses land on this node's cluster NIC
-            # (${meta.node_ip}), on the allocation's dynamic ports.
-            # tx_ordering recovery goes through the Aeron Cluster
-            # client's REPLAY_FROM.
-            "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
-            "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
-            # Fast cold-start recovery: restore the newest checkpoint
-            # into a wiped or empty state_dir before startup, replaying
-            # only the tail, not from genesis. Write a checkpoint every
-            # 20s as the chain advances.
-            "--checkpoint-dir", "/opt/kardamom/checkpoints",
-            "--checkpoint-interval-secs", format("%d", var.checkpoint_interval_s),
-            # Peer checkpoint exchange, a full-resync fallback. Each
-            # replica serves its newest checkpoint on 9014, and can
-            # fetch one from the others. A node whose replay cursor, or
-            # genesis join, fell below the cluster's bounded retention
-            # floor gets REPLAY_UNAVAILABLE, and can only be repaired
-            # with peer state. Deterministic replicas make any peer's
-            # checkpoint a valid restore source. Including self in the
-            # peer list is harmless; its own checkpoint never satisfies
-            # the floor.
-            "--checkpoint-serve-addr", "${meta.node_ip}:9014",
-            # The account nonce query for the sequencers
-            # (ports.executor_nonce_query in group_vars/all.yml).
-            "--nonce-query-addr", "${meta.node_ip}:${var.executor_query_port}",
-            "--checkpoint-peers", local.checkpoint_peers,
-            # Bind the Prometheus exporter on all interfaces; the
-            # default is loopback. The chaos suite probes it directly
-            # over the cluster bridge (http://<node_ip>:9004/metrics),
-            # which keeps dockerd out of the observation path. A docker
-            # kill of a privileged sibling node can stall docker exec
-            # runner-wide for minutes, which reads as "block 0 -> 0"
-            # while executors were healthy. The bridge is the isolated
-            # cluster network; loopback scrapes (docker exec
-            # curl 127.0.0.1:9004) keep working too.
-            "--metrics-addr", "0.0.0.0:9004",
+            "--recorder-id", group.value.recorder_id,
             ],
-            var.exec_frames == "on" ? ["--exec-frames"] : [],
+            # The void voter id of a hot executor: the same stable id. The
+            # sealer's voter list (cluster.nomad.hcl) names every hot
+            # executor id.
+            group.value.hot ? ["--void-voter-id", group.value.id] : [],
+            [
+              # Cluster mode only: this allocation's cluster-egress
+              # (response) endpoint. The cluster client's egress_channel is
+              # per allocation (the node IP and the dynamic port are known
+              # only at placement), so it is injected here instead of baked
+              # into config/executor.toml.
+              "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
+              "--chain-id", "412346",
+              "--chain", "/local/genesis.toml",
+              # Join-miss archive refetch (tx_data and tx_deposits). When
+              # the live multicast misses a canonical ref's envelope
+              # (down-window, image lapse, blackout), it replays in-band
+              # from the durability archives listed in channels.toml
+              # (ingress .31/.32; aux .61). Replayed fragments and
+              # archive-control responses land on this node's cluster NIC
+              # (${meta.node_ip}), on the allocation's dynamic ports.
+              # tx_ordering recovery goes through the Aeron Cluster
+              # client's REPLAY_FROM.
+              "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
+              "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
+              # Fast cold-start recovery: restore the newest checkpoint
+              # into a wiped or empty state_dir before startup, replaying
+              # only the tail, not from genesis. Write a checkpoint at the
+              # interval of the group as the chain advances: none at 0.
+              "--checkpoint-dir", "/opt/kardamom/checkpoints",
+              "--checkpoint-interval-secs", format("%d", group.value.checkpoint_interval_s),
+              # Peer checkpoint exchange, a full-resync fallback. Each
+              # replica serves its newest checkpoint on 9014, and can
+              # fetch one from the others. A node whose replay cursor, or
+              # genesis join, fell below the cluster's bounded retention
+              # floor gets REPLAY_UNAVAILABLE, and can only be repaired
+              # with peer state. Deterministic replicas make any peer's
+              # checkpoint a valid restore source. Including self in the
+              # peer list is harmless; its own checkpoint never satisfies
+              # the floor.
+              "--checkpoint-serve-addr", "${meta.node_ip}:9014",
+            ],
+            # The account nonce query of a hot executor for the sequencers
+            # (ports.executor_nonce_query in group_vars/all.yml). The
+            # sequencers ask only the hot executors.
+            group.value.hot ? ["--nonce-query-addr", "${meta.node_ip}:${var.executor_query_port}"] : [],
+            [
+              "--checkpoint-peers", local.checkpoint_peers,
+              # Bind the Prometheus exporter on all interfaces; the
+              # default is loopback. The chaos suite probes it directly
+              # over the cluster bridge (http://<node_ip>:9004/metrics),
+              # which keeps dockerd out of the observation path. A docker
+              # kill of a privileged sibling node can stall docker exec
+              # runner-wide for minutes, which reads as "block 0 -> 0"
+              # while executors were healthy. The bridge is the isolated
+              # cluster network; loopback scrapes (docker exec
+              # curl 127.0.0.1:9004) keep working too.
+              "--metrics-addr", "0.0.0.0:9004",
+            ],
+            # Only the hot executors feed the egress: the checkpoint
+            # executor may lag, and it reads the egress itself.
+            group.value.hot && var.exec_frames == "on" ? ["--exec-frames"] : [],
             # Carry mode: the member feed on the shared driver of this node
             # (--aeron-dir above), and the egress as the second source.
             # Without a URL a carry executor has no egress source: a cursor
@@ -498,6 +572,11 @@ job "executor" {
             # deploy refuses a carry executor without the URL.
             group.value.carry ? ["--carry-bytes"] : [],
             group.value.carry && var.egress_url != "" ? ["--egress", var.egress_url] : [],
+            # The checkpoint executor reads the cluster egress, and the
+            # range read of the egress for a cursor below the sealer window.
+            # It publishes no receipts: a late copy from a lagging executor
+            # could fall outside the dedup window of the readers.
+            group.value.hot ? [] : ["--publish-receipts", "false", "--egress", var.egress_url],
           )
         }
 
@@ -534,14 +613,18 @@ job "executor" {
           ))
         }
 
+        # A hot executor registers kardamom-executor with its /ready check.
+        # The checkpoint executor registers kardamom-executor-checkpoint
+        # with a TCP check: its record resolves while the process runs, so
+        # the peers reach its checkpoints also when it lags.
         service {
-          name     = "kardamom-executor"
+          name     = group.value.hot ? "kardamom-executor" : "kardamom-executor-checkpoint"
           port     = "metrics"
           provider = "consul"
           tags     = ["metrics"]
           check {
-            type     = "http"
-            path     = "/ready"
+            type     = group.value.hot ? "http" : "tcp"
+            path     = group.value.hot ? "/ready" : ""
             interval = "10s"
             timeout  = "2s"
           }

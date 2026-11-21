@@ -15,6 +15,9 @@
 #   first, and that index is the id of the executor.
 # - A new job, or a move back to the executor nodes, registers in one
 #   step.
+# - The group of the checkpoint executor (executor-checkpoint) rolls
+#   last. In a move, each step before it stops one executor of the
+#   executor nodes, and the last such step ends that group.
 - name: Keep the executor job of the deploy
   ansible.builtin.set_fact:
     workloads_executor_job: "{{ workloads_job }}"
@@ -57,10 +60,13 @@
     loop_var: workloads_roll_group
     index_var: workloads_roll_index
   vars:
+    workloads_executor_names: "{{ workloads_executor_new.TaskGroups | map(attribute='Name') | list }}"
+    workloads_executor_hot: "{{ workloads_executor_names | reject('equalto', 'executor-checkpoint') | list }}"
     workloads_executor_order: >-
-      {{ workloads_executor_new.TaskGroups | map(attribute='Name') | list
-         | reverse | list if 'executor' in workloads_executor_current.json.TaskGroups | map(attribute='Name')
-         else workloads_executor_new.TaskGroups | map(attribute='Name') | list }}
+      {{ (workloads_executor_hot | reverse | list
+          if 'executor' in workloads_executor_current.json.TaskGroups | map(attribute='Name')
+          else workloads_executor_hot)
+         + workloads_executor_names | select('equalto', 'executor-checkpoint') | list }}
     workloads_roll_job: executor
     workloads_roll_new: "{{ workloads_executor_new }}"
     workloads_roll_current: "{{ workloads_executor_current }}"

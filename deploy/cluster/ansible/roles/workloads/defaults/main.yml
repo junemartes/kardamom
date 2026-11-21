@@ -79,6 +79,10 @@ workloads_common_vars:
   # members (genesisFeatures) and the genesis of the executors and the
   # validator. Empty leaves every job at its "off" default.
   genesis_carry: "{{ 'on' if workloads_genesis_carry == 'on' else '' }}"
+  # The checkpoint executor: "on" or "off". One value for its group in the
+  # executor job, the checkpoint peers of the executors, the validator and
+  # the state mirrors, and its scrape. Empty leaves every job at "off".
+  checkpoint_executor: "{{ workloads_checkpoint_executor }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
 # workloads_l1_rpc_given keeps the given value: anvil.yml overwrites
@@ -372,8 +376,11 @@ workloads_egress_job_vars:
   executor:
     exec_frames: "{{ workloads_exec_frames }}"
     carry_executors: "{{ workloads_carry_executors }}"
-    # The egress is the second source of a carry executor.
-    egress_url: "{{ workloads_egress_url if workloads_carry_executor_ids | length > 0 else '' }}"
+    # The egress is the second source of a carry executor and of the
+    # checkpoint executor.
+    egress_url: >-
+      {{ workloads_egress_url if workloads_carry_executor_ids | length > 0 or workloads_checkpoint_executor == 'on'
+         else '' }}
   validator:
     egress_url: "{{ workloads_egress_url if workloads_validator_egress == 'on' else '' }}"
   batcher:
@@ -400,6 +407,20 @@ workloads_checkpoint_log: "{{ lookup('env', 'KARDAMOM_CHECKPOINT_LOG') }}"
 # The seconds between two executor checkpoints
 # (nomad/executor.nomad.hcl). Empty keeps the job's 20.
 workloads_checkpoint_interval_s: "{{ lookup('env', 'KARDAMOM_CHECKPOINT_INTERVAL_S') }}"
+# The checkpoint executor (nomad/executor.nomad.hcl, checkpoint_executor):
+# "on" or "off". On, one more executor runs on the node of role backup.
+# It makes the checkpoints and publishes nothing that a reader waits for.
+# It needs a backup node and the egress (KARDAMOM_EGRESS=1). Empty keeps
+# the job's "off" default.
+workloads_checkpoint_executor: "{{ lookup('env', 'KARDAMOM_CHECKPOINT_EXECUTOR') }}"
+# The restore-only mode of the hot executors (KARDAMOM_EXEC_RESTORE_ONLY):
+# "on" or "off". On, the hot executors make no checkpoint and no block
+# log (checkpoint interval 0). They still restore a peer checkpoint. It
+# needs the checkpoint executor, the one source of new checkpoints.
+workloads_exec_restore_only: "{{ lookup('env', 'KARDAMOM_EXEC_RESTORE_ONLY') }}"
+# The checkpoint interval of the hot executors: 0 in the restore-only
+# mode, else the chaos knob, else the job's 20.
+workloads_hot_checkpoint_interval_s: "{{ '0' if workloads_exec_restore_only == 'on' else workloads_checkpoint_interval_s }}"
 # More JVM options for every sealer member (nomad/cluster.nomad.hcl), for
 # a test cluster. Empty adds none.
 workloads_cluster_jvm_opts: "{{ lookup('env', 'KARDAMOM_CLUSTER_JVM_OPTS') }}"
