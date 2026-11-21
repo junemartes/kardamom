@@ -93,3 +93,97 @@ fn a_full_queue_drops_the_batch() {
     let queued: Vec<u64> = rx.try_iter().map(|b| b.boundary.block_number).collect();
     assert_eq!(queued, [1]);
 }
+
+/// A sync period that no test reaches, so only a flush or a sync at the end
+/// puts a record in the file.
+const NEVER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The child process of the exit tests reads its directories and its end
+/// from this variable.
+const CHILD: &str = "KARDAMOM_LOG_EXIT_CHILD";
+
+fn never_synced(dir: &Path) -> super::LogConfig {
+    super::LogConfig {
+        dir: dir.to_path_buf(),
+        segment_bytes: NonZeroU64::new(1 << 20).unwrap(),
+        queue: std::num::NonZeroUsize::new(64).unwrap(),
+        sync_every: NEVER,
+    }
+}
+
+/// Run [`exit_child`] in a new process with the end `end`, then return
+/// the last committed block of its state and the blocks of its log.
+fn after_child_exit(end: &str) -> (u64, Vec<u64>) {
+    let state = tempfile::tempdir().unwrap();
+    let log = tempfile::tempdir().unwrap();
+    {
+        let _seeded = seeded_env(state.path());
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "checkpoint::log_thread::tests::exit_child",
+            "--nocapture",
+        ])
+        .env(
+            CHILD,
+            format!(
+                "{end}\n{}\n{}",
+                state.path().display(),
+                log.path().display()
+            ),
+        )
+        .status()
+        .unwrap();
+    assert!(status.success(), "the child exits with 0: {status}");
+    let env = crate::env::StateEnvBuilder::new(state.path())
+        .open()
+        .unwrap();
+    let committed = crate::recovery::read_recovery_point(&env)
+        .unwrap()
+        .last_committed_block;
+    (committed, logged_blocks(&env, log.path()))
+}
+
+/// A process that stops the state writer and then exits at once, as the
+/// executor does at the end of `main`, keeps every committed block in the
+/// log.
+#[test]
+fn an_exit_after_the_stop_of_the_writer_keeps_every_committed_block() {
+    assert_eq!(after_child_exit("stop"), (50, (1..=50).collect()));
+}
+
+/// An exit that runs no drop, such as the exit of the Aeron error handler,
+/// keeps every block that the writer committed before it went idle.
+#[test]
+fn an_exit_after_the_writer_is_idle_keeps_every_committed_block() {
+    assert_eq!(after_child_exit("idle"), (50, (1..=50).collect()));
+}
+
+/// The child of the exit tests: commit blocks 1 to 50, then end as the
+/// variable says, and exit with no drop. Without the variable it does
+/// nothing.
+#[test]
+fn exit_child() {
+    let Ok(spec) = std::env::var(CHILD) else {
+        return;
+    };
+    let mut parts = spec.split('\n');
+    let (end, state, log) = (
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+    );
+    let env = crate::env::StateEnvBuilder::new(state).open().unwrap();
+    let log = super::BlockLogThread::spawn(&env, &never_synced(Path::new(log))).unwrap();
+    let mut writer = StateWriter::spawn_with_log(env, log).unwrap();
+    (1..=50).for_each(|b| writer.delta_tx.send(block_batch(ADDR, b, 2)).unwrap());
+    std::iter::from_fn(|| writer.snapshot_rx.recv())
+        .find(|s| s.block_number() == 50)
+        .unwrap();
+    match end {
+        "stop" => writer.shutdown().unwrap(),
+        _ => std::thread::sleep(std::time::Duration::from_millis(200)),
+    }
+    std::process::exit(0);
+}

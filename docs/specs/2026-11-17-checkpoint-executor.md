@@ -103,6 +103,11 @@
   The alert on the age of the newest checkpoint fires (new, section 7).
 - **The checkpoint executor diverges.** It stops, as every executor does. The hot executors
   are not touched.
+- **The checkpoint executor restarts.** A graceful stop, an end of the run after an error, and the
+  exit after the loss of the media driver leave no gap in its block log. So the restore points
+  continue across the restart, and no base is due for a gap. A loss of power, or a hard kill
+  while batches wait for the log thread, can still leave a gap
+  (`docs/failure-modes.md`, "State-DB volume loss").
 - **A hot executor diverges.** Its rollback takes the newest peer checkpoint below the divergence
   (`GET /checkpoint/latest?max_block=<block - 1>`). This path exists. It now always goes to the
   peer, because a hot executor has no local checkpoint.

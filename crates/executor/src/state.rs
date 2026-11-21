@@ -262,8 +262,8 @@ impl CheckpointLog {
     }
 
     /// Spawn the state writer of `env`, with the block log thread behind
-    /// it when `cfg` asks for the log. The log thread ends after the
-    /// writer, when the writer's feed is gone, so nothing joins it.
+    /// it when `cfg` asks for the log. The stop of the writer joins the
+    /// log thread after the writer thread.
     ///
     /// # Errors
     ///
@@ -273,9 +273,8 @@ impl CheckpointLog {
         let Some(log) = Self::of(cfg)? else {
             return StateWriter::spawn(env).context("spawn state writer");
         };
-        let (feed, _detached) =
-            BlockLogThread::spawn(&env, &log.log).context("start the block log thread")?;
-        StateWriter::spawn_with_log(env, feed).context("spawn state writer")
+        let log = BlockLogThread::spawn(&env, &log.log).context("start the block log thread")?;
+        StateWriter::spawn_with_log(env, log).context("spawn state writer")
     }
 
     fn bytes(mib: NonZeroU64) -> Result<NonZeroU64> {

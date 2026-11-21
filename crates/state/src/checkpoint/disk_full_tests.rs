@@ -7,7 +7,6 @@ use std::fs::File;
 use std::io::Write;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{B256, U256};
@@ -77,7 +76,6 @@ fn disk_full_child() {
     fixture.commit(5);
     fixture.wait_for_log(4, 5);
     fixture.writer.shutdown().unwrap();
-    fixture.log.take().unwrap().join().unwrap();
     fixture.restore("after-release", 5);
     println!("ENOSPC proof: checkpoint=28 block_log=28 committed_during=3 restored=5");
 }
@@ -85,7 +83,6 @@ fn disk_full_child() {
 struct Fixture {
     env: StateEnv,
     writer: WriterHandle,
-    log: Option<JoinHandle<()>>,
     checkpoints: PathBuf,
     identity: LogIdentity,
     metrics: PrometheusHandle,
@@ -115,12 +112,11 @@ impl Fixture {
             genesis: super::manifest::stored_genesis_digest(&env).unwrap(),
             schema: crate::meta::SCHEMA_VERSION,
         };
-        let (feed, log) = BlockLogThread::spawn(&env, &cfg).unwrap();
-        let writer = StateWriter::spawn_with_log(env.clone(), feed).unwrap();
+        let log = BlockLogThread::spawn(&env, &cfg).unwrap();
+        let writer = StateWriter::spawn_with_log(env.clone(), log).unwrap();
         Self {
             env,
             writer,
-            log: Some(log),
             checkpoints,
             identity,
             metrics,

@@ -73,7 +73,7 @@ pub(crate) fn commit_through(
 pub(crate) const ADDR: Address = Address::repeat_byte(0x31);
 
 /// Commit `blocks` of [`ADDR`] through a writer that feeds a log thread
-/// in `log_dir`, and wait for both threads to end.
+/// in `log_dir`. The stop of the writer ends both threads.
 pub(crate) fn commit_logged(
     env: &StateEnv,
     log_dir: &std::path::Path,
@@ -85,10 +85,9 @@ pub(crate) fn commit_logged(
         queue: NonZeroUsize::new(64).unwrap(),
         sync_every: std::time::Duration::from_millis(10),
     };
-    let (feed, log_thread) = log_thread::BlockLogThread::spawn(env, &cfg).unwrap();
-    let writer = StateWriter::spawn_with_log(env.clone(), feed).unwrap();
+    let log = log_thread::BlockLogThread::spawn(env, &cfg).unwrap();
+    let writer = StateWriter::spawn_with_log(env.clone(), log).unwrap();
     commit_through(writer, blocks.map(|b| block_batch(ADDR, b, 2)));
-    log_thread.join().unwrap();
 }
 
 /// Every real env is genesis-seeded at startup. Checkpoints inherit
