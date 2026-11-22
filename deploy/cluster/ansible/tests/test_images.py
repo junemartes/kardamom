@@ -115,6 +115,22 @@ class ImageTest(unittest.TestCase):
                  if args[1] == 'build' and Path(args[-1]).name == 'upstream']
         self.assertEqual(sorted(bases), sorted('BASE=' + ref for ref in UPSTREAM.values()))
 
+    def test_push_runs_again_after_a_registry_fault(self):
+        self.run_images({'images_push_retry_delay_s': 0, 'images_sign': True}, fail='push-once')
+        records = self.manifest.read_text().splitlines()
+        pushes = [args[-1] for tool, args in self.calls() if args[0] == 'push']
+        # The first push fails one time. The second push of that image gives its record.
+        self.assertEqual(pushes[0], pushes[1])
+        self.assertEqual(pushes[1:], [r.split()[1].split('@')[0] for r in records])
+        self.assertEqual(self.bundle.read_text(), self.manifest.read_text())
+
+    def test_push_stops_after_its_last_retry(self):
+        self.run_images({'images_push_retry_delay_s': 0}, fail='push', success=False)
+        pushes = [args[-1] for tool, args in self.calls() if args[0] == 'push']
+        self.assertEqual(len(pushes), 4)
+        self.assertEqual(len(set(pushes)), 1)
+        self.assertEqual(self.manifest.read_text(), 'previous complete manifest\n')
+
     def test_failed_digest_preserves_previous_release(self):
         self.run_images(fail='digest', success=False)
         self.assertEqual(self.manifest.read_text(), 'previous complete manifest\n')

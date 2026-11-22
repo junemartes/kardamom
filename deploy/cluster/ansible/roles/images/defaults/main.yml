@@ -14,6 +14,8 @@ images_push_node: "{{ lookup('env', 'REGISTRY_PUSH_NODE') }}" # e.g. control-0; 
 # copies none, and its jobs pull the upstream references.
 images_upstream: "{{ upstream_images if images_push_node | length > 0 else {} }}"
 images_docker_binary: docker
+# The wait before a failed push runs again, in seconds.
+images_push_retry_delay_s: 15
 images_sign: "{{ lookup('env', 'ACTIONS_ID_TOKEN_REQUEST_URL') | length > 0 }}"
 # Per-image helpers evaluated inside the image loop.
 images_ref: "{{ images_registry }}/kardamom-{{ images_item.name }}:{{ images_tag }}"

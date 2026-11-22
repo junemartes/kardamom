@@ -25,13 +25,22 @@ def fail_at(stage):
         sys.exit(1)
 
 
+def fail_once(stage):
+    """Fail the first call of a stage as a registry does; each later call passes."""
+    marker = state_dir / (stage + '.failed')
+    if os.environ.get('KARDAMOM_IMAGE_TEST_FAIL') == stage and not marker.exists():
+        marker.touch()
+        print('unknown blob', file=sys.stderr)
+        sys.exit(1)
+
+
 if Path(sys.argv[0]).name == 'cosign':
     fail_at(args[0])
     if args[0] == 'sign-blob':
         manifest = Path(args[-1]).read_text()
-        # One record per pushed image.
+        # One record per pushed image. A push that ran again names the same image.
         calls = [json.loads(line)[1] for line in (state_dir / 'calls.jsonl').read_text().splitlines()]
-        pushes = [c for c in calls if c[0] == 'push' or c[2:4] == ['docker', 'push']]
+        pushes = {c[-1] for c in calls if c[0] == 'push' or c[2:4] == ['docker', 'push']}
         assert len(manifest.splitlines()) == len(pushes), manifest
         Path(args[args.index('--bundle') + 1]).write_text(manifest)
     sys.exit(0)
@@ -81,6 +90,7 @@ elif args[0] == 'exec' and args[2] == 'rm':
     (state_dir / Path(args[-1]).name).unlink(missing_ok=True)
 elif args[0] == 'push' or (args[0] == 'exec' and args[2:4] == ['docker', 'push']):
     fail_at('push')
+    fail_once('push-once')
     ref = args[-1]
     key = 'node:' + ref if args[0] == 'exec' else ref
     assert key in state, ('pushing image missing from engine', key)
