@@ -15,6 +15,7 @@ use kardamom_engine::reader::carried::LocalHistory;
 use kardamom_state::checkpoint::bases::{BaseRound, BaseRule};
 use kardamom_state::checkpoint::copy_rate::CopyRate;
 use kardamom_state::checkpoint::log_thread::{BlockLogThread, LogConfig};
+use kardamom_state::checkpoint::newest::NewestCheckpoint;
 use kardamom_state::checkpoint::replay::LOG_DIR;
 use kardamom_state::checkpoint::{create_checkpoint, prune_checkpoints};
 use kardamom_state::{
@@ -113,6 +114,10 @@ impl StateConfig {
     ) -> Result<PreparedState> {
         if let Some(ckpt_dir) = self.checkpoint_dir.as_ref() {
             self.restore_if_fresh(ckpt_dir, restore, expected_genesis)?;
+            // The gauges start from the disk, so a restart shows an old
+            // checkpoint as old. In the restore-only mode no round runs,
+            // and they keep the checkpoint that the node holds and serves.
+            NewestCheckpoint::publish_on_disk(ckpt_dir);
         }
 
         // Open the libmdbx state env and read the durable cursor.
@@ -323,11 +328,14 @@ impl CheckpointRound {
     }
 
     /// One checkpoint + prune round; failures are logged, never fatal.
+    /// With the block log, the log thread shows the newest checkpoint in
+    /// the gauges; with no log, this round does.
     fn full(&self) {
         match create_checkpoint(&self.env, &self.dir) {
             Ok(_) => self.prune_stale(),
             Err(e) => tracing::warn!(error = %e, "checkpoint creation failed"),
         }
+        NewestCheckpoint::publish_on_disk(&self.dir);
     }
 
     /// Prunes all checkpoints except the newest `self.keep`, whatever

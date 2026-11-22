@@ -22,6 +22,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use alloy_primitives::B256;
 use rkyv::util::AlignedVec;
@@ -350,6 +351,19 @@ impl SegmentSize {
         let next = base.saturating_add(1);
         let start = segments.iter().rposition(|s| s.first_block <= next)?;
         Some(&segments[start..])
+    }
+
+    /// The time of the last write to the last segment in `dir`. `None`
+    /// with no segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory or the segment does not read.
+    pub fn last_write(dir: &Path) -> Result<Option<SystemTime>, StateError> {
+        Segment::list(dir)?
+            .last()
+            .map(|s| Ok(fs::metadata(&s.path)?.modified()?))
+            .transpose()
     }
 
     /// Delete each segment in `dir` whose blocks are all at or below

@@ -190,6 +190,7 @@ impl Node {
         .await?;
         kardamom_engine::metrics::describe();
         kardamom_executor::exec_stream::ExecStreamMetrics::describe();
+        kardamom_state::checkpoint::newest::NewestCheckpoint::describe();
         let _server =
             kardamom_state::serve_checkpoints(self.cfg.serve, self.cfg.checkpoint_dir.clone())
                 .context("bind checkpoint serve address")?;

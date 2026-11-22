@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use super::chain::Chain;
-use super::fleet::World;
+use super::fleet::{NodeHandle, Wait, World};
 use super::verdict::{CATCH_UP, Stream};
 use super::{BLOCK_EVERY, FETCHED, GENESIS_REPLAY, RESTORED, RESUMED};
 
@@ -317,4 +317,60 @@ fn ten_stop_and_start_rounds_advance_every_replica_each_round() {
         .0
         .iter()
         .for_each(super::fleet::NodeHandle::assert_no_republished);
+}
+
+/// The gauges of the newest checkpoint. A node with the block log shows
+/// the end of its log past its newest base, at the time of its last sync.
+/// A blank replica in the restore-only mode makes no checkpoint: it shows
+/// the reach of the base and the log that it fetched and serves. That
+/// value stays while its head moves on, and a restart shows it again from
+/// the disk.
+#[test]
+fn the_checkpoint_gauges_follow_the_log_and_a_restore_only_replica_shows_its_fetched_checkpoint() {
+    use kardamom_state::checkpoint::newest::{NEWEST_BLOCK, NEWEST_TIMESTAMP};
+
+    let world = World::new();
+    world.seal_through(5);
+    let load = world.load(5, LAST, BLOCK_EVERY);
+    let mut donor = world.node("executor-checkpoint");
+    donor.cfg.block_log = true;
+    donor.start();
+    donor.wait_head(15, CATCH_UP);
+    let (base, _) = donor.wait_checkpoint(1, CATCH_UP);
+    let base = f64::from(u32::try_from(base).unwrap());
+    let (logged, _) = donor.wait_for(Wait::new(CATCH_UP, "the log end in the gauge"), |n| {
+        n.gauge(NEWEST_BLOCK).filter(|block| *block > base)
+    });
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let synced = donor.gauge(NEWEST_TIMESTAMP).unwrap();
+    assert!(
+        (now - 10.0..=now + 1.0).contains(&synced),
+        "the log end at block {logged} was synced at {synced}, now is {now}"
+    );
+
+    let mut hot = world.node("executor-0");
+    hot.cfg.checkpoints = false;
+    hot.cfg.peers = vec![donor.cfg.serve.to_string()];
+    hot.start();
+    hot.wait_head(load.sealed() + 5, CATCH_UP);
+    let held = kardamom_state::checkpoint::RestorePoint::newest(&hot.cfg.checkpoint_dir)
+        .unwrap()
+        .expect("the fetched base");
+    let shown = |n: &NodeHandle| n.gauge(NEWEST_BLOCK).zip(n.gauge(NEWEST_TIMESTAMP));
+    let first = shown(&hot).expect("the gauges of the fetched base");
+    assert_eq!(
+        first.0,
+        f64::from(u32::try_from(held.reach).unwrap()),
+        "the reach of the fetched base and log"
+    );
+    hot.wait_head(load.sealed() + 5, CATCH_UP);
+    assert_eq!(shown(&hot), Some(first), "no round moves the gauges");
+    hot.stop();
+    hot.start();
+    let (again, _) = hot.wait_for(Wait::new(CATCH_UP, "the gauges after a restart"), shown);
+    assert_eq!(again, first, "a restart shows the base on the disk");
+    load.halt();
 }

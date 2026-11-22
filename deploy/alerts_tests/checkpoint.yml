@@ -1,0 +1,113 @@
+# promtool unit tests for the checkpoint rules of deploy/alerts.yml. Run
+# them with:
+#   promtool test rules deploy/alerts_tests/checkpoint.yml
+#
+# The series are the gauges that the executors export, and the `up` series
+# of their scrape jobs. On the virtual clock of promtool, time() at the
+# minute m is 60 * m, so a timestamp of 0 is m minutes old.
+rule_files:
+  - ../alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # The checkpoint executor makes no new restore point for 13 hours, then
+  # a new base lands. A hot executor in the restore-only mode holds an old
+  # checkpoint all the time, and no rule reads it.
+  - interval: 1m
+    input_series:
+      - series: 'kardamom_checkpoint_newest_timestamp_seconds{job="kardamom-executor-checkpoint",instance="ckpt:9004",host_id="executor-checkpoint"}'
+        values: '0x780 46800x30'
+      - series: 'up{job="kardamom-executor-checkpoint",instance="ckpt:9004"}'
+        values: '1x810'
+      - series: 'kardamom_checkpoint_newest_timestamp_seconds{job="kardamom-executor",instance="sealer-0:9004",host_id="executor-0"}'
+        values: '0x810'
+      - series: 'up{job="kardamom-executor",instance="sealer-0:9004"}'
+        values: '1x810'
+    alert_rule_test:
+      # 12 hours and 1 minute old: the hold of 5 minutes runs.
+      - eval_time: 12h5m
+        alertname: KardamomCheckpointStale
+        exp_alerts: []
+      - eval_time: 12h6m
+        alertname: KardamomCheckpointStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: kardamom-executor-checkpoint
+            exp_annotations:
+              summary: "the newest checkpoint of the checkpoint executor is 12h 6m 0s old"
+              description: "The newest restore point of the checkpoint executor (its base and the block log after it) is older than 12 hours. A node that restores now replays every block after it. Check the log of the checkpoint executor for `checkpoint base round failed` and `the block log failed`, kardamom_checkpoint_log_failed_total, and the free disk of the backup node."
+              runbook: "docs/failure-modes.md#executor"
+      # The new base resolves the alert at once.
+      - eval_time: 13h1m
+        alertname: KardamomCheckpointStale
+        exp_alerts: []
+      - eval_time: 13h1m
+        alertname: KardamomCheckpointExecutorDown
+        exp_alerts: []
+
+  # The backup node goes down at minute 11: the scrape fails, and the
+  # gauge has no sample. The alert fires after its hold of 15 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'kardamom_checkpoint_newest_timestamp_seconds{job="kardamom-executor-checkpoint",instance="ckpt:9004",host_id="executor-checkpoint"}'
+        values: '0x10 stale'
+      - series: 'up{job="kardamom-executor-checkpoint",instance="ckpt:9004"}'
+        values: '1x10 0x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KardamomCheckpointExecutorDown
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: KardamomCheckpointExecutorDown
+        exp_alerts: []
+      - eval_time: 26m
+        alertname: KardamomCheckpointExecutorDown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: kardamom-executor-checkpoint
+            exp_annotations: &down
+              summary: "the checkpoint executor exports no checkpoint"
+              description: "Prometheus scraped the checkpoint executor (job kardamom-executor-checkpoint) in the last day, and it shows no newest checkpoint for 15 minutes: it is down, Nomad does not run it, or it has no checkpoint. No new checkpoint is made while it is down, and a node that must restore waits for it or rebuilds from L1. Check the group executor-checkpoint on the backup node. After the switch of the checkpoint executor goes off, this alert fires for one day: silence it."
+              runbook: "docs/failure-modes.md#executor"
+
+  # Nomad stops the group at minute 11 and removes its service, so the
+  # target and all its series go away. The alert fires from the memory of
+  # the last day of `up`.
+  - interval: 1m
+    input_series:
+      - series: 'kardamom_checkpoint_newest_timestamp_seconds{job="kardamom-executor-checkpoint",instance="ckpt:9004",host_id="executor-checkpoint"}'
+        values: '0x10'
+      - series: 'up{job="kardamom-executor-checkpoint",instance="ckpt:9004"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: KardamomCheckpointExecutorDown
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: KardamomCheckpointExecutorDown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: kardamom-executor-checkpoint
+            exp_annotations: *down
+
+  # A cluster with no checkpoint executor: the switch is off. The hot
+  # executors show old checkpoints or none, and no rule fires.
+  - interval: 1m
+    input_series:
+      - series: 'kardamom_checkpoint_newest_timestamp_seconds{job="kardamom-executor",instance="sealer-0:9004",host_id="executor-0"}'
+        values: '0x900'
+      - series: 'up{job="kardamom-executor",instance="sealer-0:9004"}'
+        values: '1x900'
+      - series: 'up{job="kardamom-executor",instance="sealer-1:9004"}'
+        values: '1x900'
+    alert_rule_test:
+      - eval_time: 15h
+        alertname: KardamomCheckpointStale
+        exp_alerts: []
+      - eval_time: 15h
+        alertname: KardamomCheckpointExecutorDown
+        exp_alerts: []

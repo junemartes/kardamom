@@ -2,11 +2,13 @@
 //! Prometheus rule engine and the real Alertmanager.
 //!
 //! - `promtool test rules` evaluates `deploy/alerts.yml` on the series of a
-//!   DA-lag halt: the ingress exports the halt of the sealer, and each
-//!   canary transfer gets the code -32010. The halt pages at once, the
-//!   canary pages after its own windows, and the halt page clears after
-//!   the batcher posts again. The rule engine runs on its own virtual
-//!   clock, so the windows of minutes take no wall time.
+//!   DA-lag halt, and on the series of `deploy/alerts_tests/checkpoint.yml`
+//!   for the checkpoint rules. In the DA-lag halt, the ingress exports the
+//!   halt of the sealer, and each canary transfer gets the code -32010.
+//!   The halt pages at once, the canary pages after its own windows, and
+//!   the halt page clears after the batcher posts again. The rule engine
+//!   runs on its own virtual clock, so the windows of minutes and hours
+//!   take no wall time.
 //! - Alertmanager runs with the configuration that the deploy writes: the
 //!   routes of the environment, then `deploy/alertmanager-inhibit.yml`.
 //!   While the halt pages, each canary page and the pause of the ingress
@@ -53,32 +55,51 @@ fn text(output: &Output) -> String {
     )
 }
 
+/// Run `promtool test rules` on `file`, in `/rules` of a container with
+/// the `mounts` (`host:container` pairs), and require that every test of
+/// the file passes.
+fn promtool(mounts: &[(PathBuf, &str)], file: &str) {
+    let volumes: Vec<String> = mounts
+        .iter()
+        .map(|(host, at)| format!("{}:{at}:ro", host.display()))
+        .collect();
+    let mut args = vec!["run", "--rm", "--network", "none"];
+    args.extend(volumes.iter().flat_map(|v| ["-v", v.as_str()]));
+    args.extend(["-w", "/rules", "--entrypoint", "promtool", PROMETHEUS]);
+    args.extend(["test", "rules", file]);
+    let output = docker(&args);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(text(&output).contains("SUCCESS"), "{}", text(&output));
+}
+
 #[test]
 #[ignore = "needs Docker"]
 fn promtool_pages_the_da_lag_halt_and_the_canary_pages_that_it_explains() {
     let root = repo();
-    let tests = root.join("crates/obs/tests/alert_rules/da_lag.test.yml");
-    let rules = root.join("deploy/alerts.yml");
-    let output = docker(&[
-        "run",
-        "--rm",
-        "--network",
-        "none",
-        "-v",
-        &format!("{}:/rules/da_lag.test.yml:ro", tests.display()),
-        "-v",
-        &format!("{}:/rules/alerts.yml:ro", rules.display()),
-        "-w",
-        "/rules",
-        "--entrypoint",
-        "promtool",
-        PROMETHEUS,
-        "test",
-        "rules",
+    promtool(
+        &[
+            (
+                root.join("crates/obs/tests/alert_rules/da_lag.test.yml"),
+                "/rules/da_lag.test.yml",
+            ),
+            (root.join("deploy/alerts.yml"), "/rules/alerts.yml"),
+        ],
         "da_lag.test.yml",
-    ]);
-    assert!(output.status.success(), "{}", text(&output));
-    assert!(text(&output).contains("SUCCESS"), "{}", text(&output));
+    );
+}
+
+/// The checkpoint rules on the series of `deploy/alerts_tests/checkpoint.yml`:
+/// an old newest checkpoint of the checkpoint executor pages after its
+/// hold, a down checkpoint executor pages after its own, and neither
+/// fires on the series of a hot executor or of a cluster without the
+/// checkpoint executor.
+#[test]
+#[ignore = "needs Docker"]
+fn promtool_pages_an_old_or_absent_checkpoint_of_the_checkpoint_executor_only() {
+    promtool(
+        &[(repo().join("deploy"), "/rules")],
+        "alerts_tests/checkpoint.yml",
+    );
 }
 
 /// One Alertmanager container. It is removed when the value ends.

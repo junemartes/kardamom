@@ -453,3 +453,46 @@ groups:
         annotations:
           summary: "egress disk full within 6 h ({{ $labels.host_id }})"
           description: "At the rate of the last hour, the disk of the store of this egress instance is full within 6 hours. The store keeps every block above the lower of the posted head and the final head. Check kardamom_egress_posted_distance_blocks (the batcher does not post) and kardamom_egress_floor_distance_blocks (the final head does not move). Then make the disk larger, or bring the batcher or the oracle reads back. Do not delete segments above the floor: the batcher reads them to post."
+
+  # The checkpoint executor on the backup node makes the checkpoints of
+  # the cluster: the hot executors on the sealer machines can run in the
+  # restore-only mode and make none. A node that must restore takes the
+  # newest checkpoint of the checkpoint executor, and replays the blocks
+  # after it. The rules select the job of the checkpoint executor only.
+  # A cluster without it has no series of that job, and no rule fires.
+  # A hot executor shows the checkpoint that it holds, and no rule reads
+  # it.
+  - name: kardamom-checkpoints
+    rules:
+      - alert: KardamomCheckpointStale
+        # The timestamp is the time at which the checkpoint directory got
+        # the newest restore point: the base, or the end of the block log
+        # after it. The base rule makes a new base at least every 6 hours,
+        # and the log moves each second, so 12 hours means that no
+        # restore point was made for that long.
+        expr: >-
+          time() - max by (job) (kardamom_checkpoint_newest_timestamp_seconds{job="kardamom-executor-checkpoint"})
+          > 12 * 3600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "the newest checkpoint of the checkpoint executor is {{ $value | humanizeDuration }} old"
+          description: "The newest restore point of the checkpoint executor (its base and the block log after it) is older than 12 hours. A node that restores now replays every block after it. Check the log of the checkpoint executor for `checkpoint base round failed` and `the block log failed`, kardamom_checkpoint_log_failed_total, and the free disk of the backup node."
+          runbook: "docs/failure-modes.md#executor"
+
+      - alert: KardamomCheckpointExecutorDown
+        # No sample of the timestamp, while Prometheus scraped the job in
+        # the last day: the target does not answer, Nomad removed its
+        # service, or the process has no checkpoint. The lookback keeps a
+        # cluster that never ran the checkpoint executor silent.
+        expr: >-
+          absent(kardamom_checkpoint_newest_timestamp_seconds{job="kardamom-executor-checkpoint"})
+          and on () present_over_time(up{job="kardamom-executor-checkpoint"}[1d:1m])
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "the checkpoint executor exports no checkpoint"
+          description: "Prometheus scraped the checkpoint executor (job kardamom-executor-checkpoint) in the last day, and it shows no newest checkpoint for 15 minutes: it is down, Nomad does not run it, or it has no checkpoint. No new checkpoint is made while it is down, and a node that must restore waits for it or rebuilds from L1. Check the group executor-checkpoint on the backup node. After the switch of the checkpoint executor goes off, this alert fires for one day: silence it."
+          runbook: "docs/failure-modes.md#executor"

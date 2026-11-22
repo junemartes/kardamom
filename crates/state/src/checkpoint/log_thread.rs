@@ -24,18 +24,23 @@
 //! state database. It cuts the records above that block, because the
 //! executor executes those blocks again. A log that ends below that block
 //! continues after a gap.
+//!
+//! The thread also shows the newest restore point of the checkpoint
+//! directory in the gauges of [`super::newest`], at start and after each
+//! sync.
 
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::ControlFlow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use tracing::warn;
 
-use super::block_log::{BlockLogWriter, LogIdentity};
+use super::block_log::{BlockLogWriter, LogIdentity, SegmentSize};
 use super::manifest::stored_genesis_digest;
+use super::newest::{LogEnd, NewestCheckpoint};
 use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::meta::SCHEMA_VERSION;
@@ -88,6 +93,18 @@ pub struct BlockLogThread {
     rx: Receiver<WriteBatch>,
     sync_every: Duration,
     synced_at: Instant,
+    newest: NewestGauges,
+}
+
+/// What the gauges of the newest checkpoint need from the log thread.
+pub(crate) struct NewestGauges {
+    /// The checkpoint directory: the parent of the log directory.
+    checkpoints_dir: PathBuf,
+    /// The time of the sync that made the last block of the log durable.
+    /// At start, the time of the last write to the log on disk.
+    written: Option<SystemTime>,
+    /// Whether a block was appended after the last sync.
+    appended: bool,
 }
 
 impl BlockLogThread {
@@ -104,6 +121,9 @@ impl BlockLogThread {
             schema: SCHEMA_VERSION,
         };
         let committed = read_recovery_point(env)?.last_committed_block;
+        // The open and the cut change the modification time of the last
+        // segment, so the gauges read it first.
+        let newest = NewestGauges::new(cfg)?;
         let mut log = BlockLogWriter::open(&cfg.dir, identity, cfg.segment_bytes)?;
         log.cut_after(committed)?;
         let (tx, rx) = crossbeam_channel::bounded(cfg.queue.get());
@@ -112,6 +132,7 @@ impl BlockLogThread {
             rx,
             sync_every: cfg.sync_every,
             synced_at: Instant::now(),
+            newest,
         };
         let join = thread::Builder::new()
             .name("kardamom-block-log".into())
@@ -123,6 +144,7 @@ impl BlockLogThread {
     }
 
     fn run(mut self) {
+        self.newest.publish(&self.log);
         while self.step().is_continue() {}
     }
 
@@ -148,6 +170,7 @@ impl BlockLogThread {
     /// records into the file, so an exit with no drop keeps them.
     fn take(&mut self, batch: &WriteBatch) {
         let result = self.log.append(batch);
+        self.newest.appended |= result.is_ok();
         self.on_failure(result, "append");
         if self.rx.is_empty() {
             let result = self.log.flush();
@@ -158,6 +181,9 @@ impl BlockLogThread {
     fn sync(&mut self) {
         let result = self.log.sync();
         self.synced_at = Instant::now();
+        if result.is_ok() {
+            self.newest.synced(&self.log);
+        }
         self.on_failure(result, "sync");
     }
 
@@ -169,6 +195,49 @@ impl BlockLogThread {
             metrics::counter!(LOG_FAILED, "step" => step).increment(1);
             self.log.abandon();
         }
+    }
+}
+
+impl NewestGauges {
+    /// The gauges of the log in `cfg.dir`, before the writer opens it.
+    pub(crate) fn new(cfg: &LogConfig) -> Result<Self, StateError> {
+        // The log directory is `<checkpoints>/log`, as a restore reads it.
+        let checkpoints_dir = cfg
+            .dir
+            .parent()
+            .map_or_else(|| cfg.dir.clone(), Path::to_path_buf);
+        Ok(Self {
+            checkpoints_dir,
+            written: SegmentSize::last_write(&cfg.dir)?,
+            appended: false,
+        })
+    }
+
+    /// A sync of `log` succeeded: the blocks appended before it are
+    /// durable now.
+    fn synced(&mut self, log: &BlockLogWriter) {
+        if std::mem::take(&mut self.appended) {
+            self.written = Some(SystemTime::now());
+        }
+        self.publish(log);
+    }
+
+    fn publish(&self, log: &BlockLogWriter) {
+        NewestCheckpoint::show(self.newest(log));
+    }
+
+    /// The newest restore point of the checkpoint directory, with the
+    /// time of the last sync of `log` for its end.
+    pub(crate) fn newest(
+        &self,
+        log: &BlockLogWriter,
+    ) -> Result<Option<NewestCheckpoint>, StateError> {
+        let end = log
+            .next_block()
+            .and_then(|next| next.checked_sub(1))
+            .zip(self.written)
+            .map(|(block, written)| LogEnd { block, written });
+        NewestCheckpoint::read(&self.checkpoints_dir, end)
     }
 }
 
