@@ -53,6 +53,12 @@
     argv: "{{ (images_node_command + ['docker'] if images_push_node | length > 0 else [images_docker_binary]) + ['push', images_ref] }}"
   register: images_push
   changed_when: true
+  # A registry can answer "unknown blob" for a layer that it reported as
+  # present a moment before. That is a transient fault of the registry. A
+  # push is idempotent, and the digest comes from the push that completes.
+  until: images_push is succeeded
+  retries: 3
+  delay: "{{ images_push_retry_delay_s }}"
 
 - name: Capture the digest reported by the push
   ansible.builtin.set_fact:

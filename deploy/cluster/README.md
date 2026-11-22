@@ -835,6 +835,7 @@ Settings are in `roles/images/defaults/main.yml`.
 - `REGISTRY`, `TAG` and `DIGEST_MANIFEST` are environment variables. A relative `DIGEST_MANIFEST` resolves against `deploy/cluster/` in both the image and the workload playbooks.
 - `REGISTRY_PUSH_NODE=control-0` (the default) keeps the host daemon out of the push. Ansible exports an image archive, copies it into `kardamom-control-0`, loads it into the Docker engine of that node, and pushes from there. It removes the temporary archive even when the load fails. It needs temporary disk space for one image archive on each side.
 - Pushes use the Docker CLI through Ansible `command.argv`, without a shell. This keeps the digest of the exact push: the Docker push module returns a pre-push inspection and does not expose that digest.
+- A failed push runs again, up to 3 times, with 15 s between the pushes (`images_push_retry_delay_s`). A registry can answer `unknown blob` for a short time for a layer that it holds.
 - Each manifest entry has the form `repo:tag@sha256:...` that the Nomad jobs need.
 - Upstream copies: with `REGISTRY_PUSH_NODE` set (the container path), the playbook also copies each image of `upstream_images` into the in-cluster registry.
   - The copy is a build `FROM` the pinned reference (`docker/upstream/Dockerfile`). The host pulls each image one time, with the retries of the build, and the copy takes the transfer and the push of the kardamom images.
