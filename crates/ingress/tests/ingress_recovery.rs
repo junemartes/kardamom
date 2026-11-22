@@ -62,6 +62,55 @@ pub(crate) fn free_tcp_port() -> u16 {
         .port()
 }
 
+/// The leading digits of the fixed `tx_data` control ports of one test
+/// process. The control port of lane `l` of replica `r` is
+/// `prefix * 100 + l * 10 + r`.
+///
+/// The kernel binds each socket that asks for port 0 to a free port of
+/// its ephemeral range (`ip_local_port_range`). A fixed port inside that
+/// range can thus belong to another socket before the driver binds it.
+/// The driver binds a publication's control port on its sender thread,
+/// after the add returns, so a failed bind is only an entry in the
+/// driver's error log. The publication then never connects, its lane
+/// never records, and the ingress waits at its recorder barrier. Every
+/// prefix keeps its ports below the ephemeral range.
+#[derive(Clone, Copy, Debug)]
+struct ControlPrefix(u16);
+
+impl ControlPrefix {
+    /// The lowest prefix: port 10000, above the well-known ports.
+    const FIRST: u16 = 100;
+    /// The ports of one prefix: ten lanes of ten replicas.
+    const SPAN: u16 = 100;
+
+    /// The first port of the kernel's ephemeral range.
+    fn ephemeral_floor() -> u16 {
+        let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+        range.split_whitespace().next().unwrap().parse().unwrap()
+    }
+
+    /// The prefix of `slot`. Two processes whose slots differ by less
+    /// than the prefix count get different ports.
+    fn of_slot(slot: u32) -> Self {
+        let count = (Self::ephemeral_floor() / Self::SPAN)
+            .checked_sub(Self::FIRST)
+            .filter(|count| *count > 0)
+            .expect("the ephemeral range starts above port 10100");
+        let offset = u16::try_from(slot % u32::from(count)).unwrap();
+        Self(Self::FIRST + offset)
+    }
+
+    /// The prefix of this test process: two runs on one host stay apart.
+    fn of_process() -> Self {
+        Self::of_slot(std::process::id())
+    }
+
+    /// The highest control port of this prefix.
+    fn last_port(self) -> u16 {
+        self.0 * Self::SPAN + Self::SPAN - 1
+    }
+}
+
 /// The UDP channels of one ingress replica: a dynamic MDC publication of
 /// each lane, on a control port of its own, and its receipt endpoint.
 #[derive(Clone, Debug)]
@@ -73,7 +122,8 @@ pub(crate) struct Channels {
 impl Channels {
     /// The channels of replica `id`. The lane id fills one digit of each
     /// control port; `prefix` keeps two runs apart.
-    fn new(prefix: u16, id: u16) -> Self {
+    fn new(prefix: ControlPrefix, id: u16) -> Self {
+        let ControlPrefix(prefix) = prefix;
         Self {
             tx_data_template: format!(
                 "aeron:udp?control=127.0.0.1:{prefix}{{sid}}{id}|control-mode=dynamic"
@@ -186,7 +236,7 @@ impl Fixture {
             Driver::start(&root, "node-a"),
             Driver::start(&root, "node-b"),
         ];
-        let prefix = 200 + u16::try_from(std::process::id() % 400).unwrap();
+        let prefix = ControlPrefix::of_process();
         let channels = [Channels::new(prefix, 0), Channels::new(prefix, 1)];
         let archives: Vec<String> = drivers.iter().map(Driver::archive_endpoint).collect();
         let pipeline = Pipeline::start(&drivers[1].aeron_dir(), &channels, &archives);
@@ -430,5 +480,20 @@ async fn a_lost_archiving_driver_ends_its_ingress_while_the_twin_serves() {
     println!(
         "INGRESS_RECOVERY archive-driver-loss seconds={:.1}",
         fx.started.elapsed().as_secs_f64()
+    );
+}
+
+/// No process id gives a control port inside the ephemeral range, where
+/// a port-0 socket can hold it before the driver binds it.
+#[test]
+fn every_control_port_lies_below_the_ephemeral_range() {
+    let floor = ControlPrefix::ephemeral_floor();
+    let inside: Vec<u32> = (0..=u32::from(u16::MAX))
+        .filter(|slot| ControlPrefix::of_slot(*slot).last_port() >= floor)
+        .collect();
+    assert_eq!(
+        inside,
+        Vec::<u32>::new(),
+        "these slots give control ports at or above port {floor}"
     );
 }
