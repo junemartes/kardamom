@@ -81,7 +81,8 @@ struct Ticks {
 
 impl Ticks {
     /// The timers of `ctx`. The first `liquidity` run waits one swap
-    /// interval, so a swap shows the reserves first.
+    /// interval, so a swap shows the reserves first. When that swap
+    /// fails, the `liquidity` run makes its own swap.
     fn new(ctx: &Context) -> Self {
         let timer = |every, first: Instant| {
             let mut t = tokio::time::interval_at(first, every);
@@ -160,7 +161,7 @@ impl MarketTask {
     async fn probe(&mut self, job: Job, rpc: &Rpc, token: Rwa, pool: Pool) -> Outcome {
         let done = match job {
             Job::Rwa => self.rwa(rpc, token).await,
-            Job::Swap => self.swap(rpc, pool).await,
+            Job::Swap => self.swap(rpc, pool).await.map(|_reserves| ()),
             Job::Liquidity => self.liquidity(rpc, pool).await,
         };
         done.err().unwrap_or(Outcome::Success)

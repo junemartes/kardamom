@@ -1,4 +1,7 @@
+use alloy_primitives::Address;
+
 use super::*;
+use crate::test_support::FakeIngress;
 
 /// A landed swap in direction `eth_in` that returns `amount_out`.
 fn landed(eth_in: bool, amount_out: u64) -> SwapEvent {
@@ -40,4 +43,20 @@ fn a_buy_of_zero_tokens_gives_a_buy_next() {
     let mut bought = Bought::default();
     bought.note_swap(&landed(true, 0));
     assert_eq!(bought.next_swap(), Side::Buy);
+}
+
+#[tokio::test]
+async fn a_liquidity_run_with_no_reserves_gives_the_outcome_of_its_swap() {
+    let ingress = FakeIngress::start().await;
+    let ring = ingress.ring().await;
+    // The canary has no funds, so its first swap fails before a send.
+    ring.set_funded(0, false);
+    let mut task = MarketTask::new(ingress.context(ring)).await.unwrap();
+    let pool = Pool(Address::repeat_byte(7));
+
+    let outcome = task.liquidity(&ingress.rpc, pool).await;
+
+    // No reserves are known. That is not a wrong result of the pool.
+    assert_eq!(outcome, Err(Outcome::Unfunded));
+    assert_eq!(ingress.chain.lock().unwrap().sends, 0);
 }

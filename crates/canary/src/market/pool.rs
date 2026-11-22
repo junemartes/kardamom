@@ -58,7 +58,8 @@ impl Bought {
 }
 
 impl MarketTask {
-    pub(super) async fn swap(&mut self, rpc: &Rpc, pool: Pool) -> Result<(), Outcome> {
+    /// Make one swap, check it, and return the reserves after it.
+    pub(super) async fn swap(&mut self, rpc: &Rpc, pool: Pool) -> Result<Reserves, Outcome> {
         let (value, input) = match self.bought.next_swap() {
             Side::Buy => (U256::from(SWAP_WEI), Pool::swap_eth_for_token()),
             Side::Sell(tokens) => (U256::ZERO, Pool::swap_token_for_eth(tokens)),
@@ -71,14 +72,25 @@ impl MarketTask {
         self.observe(event.before, event.after, event.seq);
         self.bought.note_swap(&event);
         event.check()?;
-        self.balance_holds(rpc, pool, event.after).await
+        self.balance_holds(rpc, pool, event.after).await?;
+        Ok(event.after)
     }
 
+    /// Add liquidity, or remove the shares of the last run.
+    ///
+    /// The amounts of an add come from the reserves after the last canary
+    /// call. A canary that saw no call since its start makes a swap first,
+    /// and the event of that swap reports the reserves. A swap that fails
+    /// gives its own outcome: a canary with no funds is not a wrong result
+    /// of the pool.
     pub(super) async fn liquidity(&mut self, rpc: &Rpc, pool: Pool) -> Result<(), Outcome> {
         if let Some(shares) = self.state.shares {
             return self.remove_liquidity(rpc, pool, shares).await;
         }
-        let (reserves, _) = self.last.ok_or(Outcome::LiquidityMismatch)?;
+        let reserves = match self.last {
+            Some((reserves, _)) => reserves,
+            None => self.swap(rpc, pool).await?,
+        };
         let eth = U256::from(LIQUIDITY_WEI);
         let token = eth
             .checked_mul(reserves.token)
