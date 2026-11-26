@@ -45,6 +45,15 @@
 //! checkpoints are visible under `checkpoint-*` names, because each one is
 //! built in a temp directory and then renamed into place. So a served image
 //! is always a full, consistent snapshot.
+//!
+//! A fetch over a list of peers downloads one image. First it probes each
+//! peer: it sends the same request, reads the response head, and closes
+//! the connection before the body. Then it downloads from the peer with
+//! the furthest restore point, and takes the next one when that download
+//! fails. A probe is an ordinary request, so a server of any release
+//! answers it. The server takes a client that closes early as a normal
+//! end of the transfer, and logs it at the info level. A server of an
+//! older release logs a warning for each probe.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -66,6 +75,7 @@ use crate::checkpoint::{
 use crate::error::StateError;
 
 mod log_fetch;
+mod peer_scan;
 
 /// The read/write timeout for each socket. Transfers stream in bounded
 /// chunks, so this caps per-syscall stalls, such as a dead peer. It does
@@ -75,6 +85,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The maximum size for a request or response head. No legitimate one
 /// comes close to this limit.
 const MAX_HEAD: usize = 4096;
+/// The write errors of a server whose client closed the connection.
+const PEER_CLOSED: [std::io::ErrorKind; 3] = [
+    std::io::ErrorKind::BrokenPipe,
+    std::io::ErrorKind::ConnectionReset,
+    std::io::ErrorKind::ConnectionAborted,
+];
 
 /// The `x-checkpoint-*` header names, shared between `prepare_response`
 /// (which writes them) and `PeerResponse::parse_headers` (which reads
@@ -207,13 +223,25 @@ async fn accept_logged(listener: &TcpListener) -> Option<tokio::net::TcpStream> 
 
 /// Serve one accepted connection on its own task, logging a transfer
 /// failure instead of propagating it: one peer's failure must not affect
-/// any other.
+/// any other. A client that closes the connection early is no failure: a
+/// probe reads the response head only.
 fn spawn_serve(stream: tokio::net::TcpStream, dir: PathBuf) {
-    tokio::spawn(async move {
-        if let Err(e) = serve_one(stream, &dir).await {
-            warn!(error = %e, "checkpoint transfer to peer failed");
+    tokio::spawn(async move { ServeEnd(serve_one(stream, &dir).await).log() });
+}
+
+/// How the serve of one connection ended.
+struct ServeEnd(std::io::Result<()>);
+
+impl ServeEnd {
+    fn log(self) {
+        match self.0 {
+            Ok(()) => {}
+            Err(e) if PEER_CLOSED.contains(&e.kind()) => {
+                info!(error = %e, "peer closed the checkpoint transfer early");
+            }
+            Err(e) => warn!(error = %e, "checkpoint transfer to peer failed"),
         }
-    });
+    }
 }
 
 /// Response head + open image file for the newest checkpoint in the range
@@ -337,18 +365,9 @@ pub(crate) fn fetch_latest_checkpoint(
 ) -> Result<Option<CheckpointInfo>, StateError> {
     let request = FetchRequest { range }.line();
     let mut fetch = CheckpointFetch::connect(peer, &request, expected_genesis)?;
-    let head = match fetch.response()? {
-        PeerResponse::NotFound => return Ok(None),
-        PeerResponse::Image(head) => head,
-    };
-    if !head.reaches(range) {
-        // Too old to be useful, for example below the cluster's retention
-        // floor with a log that does not reach it, or above the cap from a
-        // server that ignores it. Do not download the body.
+    let Some(head) = fetch.offer(range)? else {
         return Ok(None);
-    }
-    // An image this release cannot open is refused before the download.
-    head.schema.check(&format!("from peer {peer}"))?;
+    };
 
     std::fs::create_dir_all(checkpoints_dir)?;
     let dest = checkpoints_dir.join(checkpoint_name(head.block));
@@ -399,12 +418,13 @@ pub(crate) fn fetch_latest_checkpoint(
     }))
 }
 
-/// Fetch from each peer in turn, and keep the newest checkpoint in
-/// `range`.
+/// Fetch the checkpoint in `range` with the furthest restore point that
+/// any of `peers` offers, and the block log after it.
 ///
-/// This function logs and skips individual peer failures; one live peer
-/// is enough. As the best-so-far block rises, later peers with nothing
-/// newer are skipped without a download.
+/// The fetch probes every peer first and downloads one image only. When
+/// that download, its verification, or its log fails to reach `range`,
+/// the fetch takes the next best peer. This function logs and skips
+/// individual peer failures; one live peer is enough.
 #[must_use]
 pub fn fetch_best_checkpoint(
     peers: &[String],
@@ -412,36 +432,13 @@ pub fn fetch_best_checkpoint(
     range: BlockRange,
     expected_genesis: Option<B256>,
 ) -> Option<CheckpointInfo> {
-    peers.iter().fold(None, |best, peer| {
-        // A peer advertising `u64::MAX` must not wrap the floor back to 0
-        // and disable the "newer only" filter for every later peer.
-        let min = best
-            .as_ref()
-            .map_or(range.min, |b: &CheckpointInfo| b.block.saturating_add(1));
-        let rest = BlockRange { min, ..range };
-        fetch_one_peer(peer, checkpoints_dir, rest, expected_genesis).or(best)
-    })
-}
-
-/// Fetch from one peer, logging and swallowing a failure: one bad peer
-/// must not stop the scan of the rest.
-fn fetch_one_peer(
-    peer: &str,
-    checkpoints_dir: &Path,
-    range: BlockRange,
-    expected_genesis: Option<B256>,
-) -> Option<CheckpointInfo> {
-    let base = match fetch_latest_checkpoint(peer, checkpoints_dir, range, expected_genesis) {
-        Ok(c) => c?,
-        Err(e) => {
-            warn!(peer, error = %e, "checkpoint fetch from peer failed");
-            return None;
-        }
-    };
-    if let Err(e) = log_fetch::fetch_log(peer, checkpoints_dir, &base, range.max) {
-        warn!(peer, error = %e, "the block log fetch from peer failed; the base restores alone");
+    peer_scan::PeerScan {
+        peers,
+        checkpoints_dir,
+        range,
+        expected_genesis,
     }
-    Some(base)
+    .best()
 }
 
 /// One step of [`CheckpointFetch::read_head_line`].
@@ -505,6 +502,25 @@ impl<'a> CheckpointFetch<'a> {
     fn response(&mut self) -> Result<PeerResponse, StateError> {
         let head = self.read_head_text()?;
         PeerResponse::parse(&head, self.peer)
+    }
+
+    /// Read the response head, and return the image that it offers for
+    /// `range`. `None` when the peer has no image that serves the range:
+    /// for example one below the retention floor with a log that does not
+    /// reach it, or one above the cap from a server that ignores the cap.
+    /// An image of another state schema or another chain is an error.
+    /// This reads no byte of the body.
+    fn offer(&mut self, range: BlockRange) -> Result<Option<CheckpointHead>, StateError> {
+        let PeerResponse::Image(head) = self.response()? else {
+            return Ok(None);
+        };
+        if !head.reaches(range) {
+            return Ok(None);
+        }
+        let image = format!("from peer {}", self.peer);
+        head.schema.check(&image)?;
+        crate::checkpoint::check_image_chain(&image, head.genesis, self.expected_genesis)?;
+        Ok(Some(head))
     }
 
     /// Read the raw head, line by line, up to the blank line that ends it.

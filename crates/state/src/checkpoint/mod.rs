@@ -53,7 +53,9 @@ pub(crate) use manifest::{CheckpointManifest, read_manifest, verify_checkpoint};
 use copy_rate::CopyRate;
 use image::CompactedImage;
 use manifest::stored_genesis_digest;
-pub(crate) use manifest::{ImageSchema, check_image_identity, file_keccak, publish_checkpoint};
+pub(crate) use manifest::{
+    ImageSchema, check_image_chain, check_image_identity, file_keccak, publish_checkpoint,
+};
 use replay::LogReplay;
 
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -566,7 +568,7 @@ impl CheckpointInfo {
     /// Whether a restore of this checkpoint reaches `range`: its block is
     /// in the range, or the block log after it reaches the lower end. A
     /// checkpoint whose manifest does not read reaches only by its block.
-    fn reaches(&self, range: BlockRange) -> bool {
+    pub(crate) fn reaches(&self, range: BlockRange) -> bool {
         if self.block > range.max {
             return false;
         }

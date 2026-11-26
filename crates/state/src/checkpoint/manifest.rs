@@ -278,16 +278,25 @@ pub(crate) fn check_image_identity(
             want: want_keccak,
         });
     }
-    if let Some(want) = expected_genesis
-        && want != image_genesis
-    {
-        return Err(StateError::ForeignChainCheckpoint {
+    check_image_chain(image, image_genesis, expected_genesis)
+}
+
+/// The chain identity check of [`check_image_identity`] alone: the image
+/// belongs to `expected_genesis`, when the node knows its chain. The
+/// peer fetch also runs it on the response head, before the download.
+pub(crate) fn check_image_chain(
+    image: &str,
+    image_genesis: B256,
+    expected_genesis: Option<B256>,
+) -> Result<(), StateError> {
+    match expected_genesis {
+        Some(want) if want != image_genesis => Err(StateError::ForeignChainCheckpoint {
             image: image.into(),
             image_genesis,
             expected: want,
-        });
+        }),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Publish a staged checkpoint. Write the manifest inside the temp

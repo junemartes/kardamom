@@ -25,13 +25,18 @@ impl Peer {
     }
 
     fn with_head(head: u64) -> Self {
+        Self::with_base_and_head(3, head)
+    }
+
+    /// A peer with a base at block `base` and the block log to `head`.
+    fn with_base_and_head(base: u64, head: u64) -> Self {
         let state = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let env = seeded_env(state.path());
         let log = dir.path().join(LOG_DIR);
-        commit_logged(&env, &log, 1..=3);
+        commit_logged(&env, &log, 1..=base);
         create_checkpoint(&env, dir.path()).unwrap();
-        commit_logged(&env, &log, 4..=head);
+        commit_logged(&env, &log, base + 1..=head);
         let addr = serve_checkpoints("127.0.0.1:0".parse().unwrap(), dir.path().to_path_buf())
             .unwrap()
             .addr;
@@ -130,19 +135,21 @@ async fn a_peer_with_no_log_serves_the_base_alone() {
     assert_eq!(restored, Some(3));
 }
 
-/// A node fetches from each peer in turn, and its peer list may name the
-/// node itself with a stale log. A later peer with a shorter log of the
-/// same base must not cut the log that an earlier peer gave.
+/// A node may fetch from several peers in turn, for example on each
+/// rebuild attempt of a state mirror, and its peer list may name the node
+/// itself with a stale log. A later fetch from a peer with a shorter log
+/// of the same base must not cut the log that an earlier fetch gave.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_peer_with_a_shorter_log_does_not_shorten_the_local_log() {
     let full = Peer::new();
     let short = Peer::with_head(5);
     let local = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
-    let peers = [full.addr.to_string(), short.addr.to_string()];
+    let (full, short) = (full.addr.to_string(), short.addr.to_string());
     let (dir, into) = (local.path().to_path_buf(), state.path().to_path_buf());
     let restored = tokio::task::spawn_blocking(move || {
-        fetch_best_checkpoint(&peers, &dir, BlockRange::ANY, None)?;
+        fetch_best_checkpoint(&[full], &dir, BlockRange::ANY, None)?;
+        fetch_best_checkpoint(&[short], &dir, BlockRange::ANY, None)?;
         restore_best_checkpoint(&dir, &into, BlockRange::ANY, None)
             .unwrap()
             .map(|(block, _)| block)
@@ -150,6 +157,32 @@ async fn a_peer_with_a_shorter_log_does_not_shorten_the_local_log() {
     .await
     .unwrap();
     assert_eq!(restored, Some(8));
+}
+
+/// The fetch orders the peers by restore point, the end of the log after
+/// the image. An older image with a longer log wins over a newer image
+/// with a shorter log, and the newer image is not downloaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_furthest_restore_point_wins_over_the_newest_image() {
+    let newer = Peer::with_base_and_head(5, 5);
+    let further = Peer::new();
+    let local = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let peers = [newer.addr.to_string(), further.addr.to_string()];
+    let (dir, into) = (local.path().to_path_buf(), state.path().to_path_buf());
+    let (fetched, restored) = tokio::task::spawn_blocking(move || {
+        let fetched = fetch_best_checkpoint(&peers, &dir, BlockRange::ANY, None).map(|c| c.block);
+        let restored = restore_best_checkpoint(&dir, &into, BlockRange::ANY, None)
+            .unwrap()
+            .map(|(block, _)| block);
+        (fetched, restored)
+    })
+    .await
+    .unwrap();
+    assert_eq!(fetched, Some(3), "the base of the further restore point");
+    assert_eq!(restored, Some(8));
+    let bases = crate::checkpoint::checkpoints_newest_first(local.path()).unwrap();
+    assert_eq!(bases.len(), 1, "one download");
 }
 
 #[test]

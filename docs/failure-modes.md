@@ -525,6 +525,9 @@ The executors are deterministic state machines. One dead or lagging replica neve
   - Recovery: the executor repairs itself with peer state.
     - Each replica serves its newest checkpoint over `--checkpoint-serve-addr` (`:9014`).
     - A node that hits the refusal, or cold-starts with no checkpoint, fetches the newest qualifying peer checkpoint (`--checkpoint-peers`).
+    - The fetch reads the response head of every peer first, with no body. It then downloads one image: from the peer with the furthest restore point (the end of the block log after the image, then the image block). When that download, its verification, or its log does not reach the range, the fetch takes the next best peer. A peer that does not answer is skipped.
+    - The same fetch serves the cold start, the repair, the rollback (`?max_block=`), the validator, and the state mirror rebuild.
+    - Proof: the unit tests `three_peers_with_rising_blocks_give_one_download_from_the_newest`, `a_best_peer_that_fails_its_download_falls_back_to_the_next`, `a_peer_that_does_not_answer_is_skipped`, `the_cap_holds_over_every_peer`, and `the_furthest_restore_point_wins_over_the_newest_image`.
     - It parks the stale DB under `<state_dir>/stale/`, restores, and resumes from the cursor of the checkpoint.
     - All of this runs in the same process. The cost is one fetch and one restore. It burns no restart attempt of the orchestrator.
     - `kardamom_executor_resync_total` counts these repairs by outcome.
@@ -558,7 +561,7 @@ The executors are deterministic state machines. One dead or lagging replica neve
 - **Hot executors in the restore-only mode** (`KARDAMOM_EXEC_RESTORE_ONLY=on`)
   - The hot executors run with `--checkpoint-interval-secs 0` and no block log. They keep `--checkpoint-dir` and `--checkpoint-peers`, so a cold start, a refused cursor and a rollback restore a peer checkpoint.
   - The checkpoint executor is then the one source of new checkpoints (no second source). A rollback of a hot executor always takes the checkpoint of the backup machine.
-  - The checkpoints that a hot executor made before the switch stay in its directory and serve to its peers. Every list of peers names the checkpoint executor first. A fetch keeps the newest checkpoint, and skips a later peer with nothing newer without a download, so an old checkpoint of a hot executor is read only when the checkpoint executor has none that qualifies.
+  - The checkpoints that a hot executor made before the switch stay in its directory and serve to its peers. Every list of peers names the checkpoint executor first. A fetch probes every peer and downloads only from the peer with the furthest restore point. The checkpoint executor wins a tie. So a hot executor sends an old checkpoint only when the checkpoint executor offers no restore point that is as far.
   - A state mirror rebuild fetches the newest checkpoint of the checkpoint executor (`--checkpoint-peers`) into `/opt/kardamom/mirror/peer-checkpoints`. It restores the newest of that copy and of the local directory.
 - **The audit mirror on the backup machine** (`KARDAMOM_MIRROR_AUDIT_ON_BACKUP=on`, group `mirror-audit` of the state-mirror job)
   - Use: it does the daily audit rebuild of the Redis projection from the local checkpoints of the checkpoint executor. The hot mirrors on the sealer machines run with `--audit-hours 0`, so no audit reads or writes the disk of a sealer machine. See `deploy/cluster/README.md`, "The audit mirror".

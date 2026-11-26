@@ -153,9 +153,9 @@ impl LogRequest {
 /// local reach of the base, and cuts the local log there, so the records
 /// of the peer follow the last good local record. A fetch never shortens
 /// the local log: a peer with a shorter log sends no record. This matters
-/// because a node fetches from each peer in turn, and the peer list may
-/// name the node itself, with its own stale log. Returns the last block
-/// that the local log now holds after the base.
+/// because a node may fetch from several peers in turn, and the peer list
+/// may name the node itself, with its own stale log. Returns the last
+/// block that the local log now holds after the base.
 ///
 /// # Errors
 ///
