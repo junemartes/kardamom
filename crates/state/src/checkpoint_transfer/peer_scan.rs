@@ -23,16 +23,19 @@ pub(super) struct PeerScan<'a> {
 struct PeerOffer<'a> {
     peer: &'a str,
     head: CheckpointHead,
+    /// The last block that a restore of the offer reaches: the end of the
+    /// log of the peer after its image, at most the top of the range. The
+    /// restore applies the log up to the top of the range only.
+    restore_point: u64,
 }
 
 impl PeerOffer<'_> {
     /// The rank of the offer. A higher rank is a better offer. The first
-    /// key is the restore point: the end of the log of the peer after its
-    /// image. The restore applies that log, and the range check reads the
-    /// same end. The second key is the image block: of two equal restore
-    /// points, the newer image leaves less log to fetch and apply.
+    /// key is the restore point. The second key is the image block: of
+    /// two equal restore points, the newer image leaves less log to fetch
+    /// and apply.
     fn rank(&self) -> (u64, u64) {
-        (self.head.log_end, self.head.block)
+        (self.restore_point, self.head.block)
     }
 }
 
@@ -63,7 +66,11 @@ impl<'a> PeerScan<'a> {
             log_end = head.log_end,
             "checkpoint peer offers an image"
         );
-        Some(PeerOffer { peer, head })
+        Some(PeerOffer {
+            peer,
+            restore_point: head.log_end.min(self.range.max),
+            head,
+        })
     }
 
     /// Fetch the checkpoint of `offer`, and the block log after it.

@@ -185,6 +185,34 @@ async fn the_furthest_restore_point_wins_over_the_newest_image() {
     assert_eq!(bases.len(), 1, "one download");
 }
 
+/// With a cap, the restore point of an offer ends at the cap. Two offers
+/// that both reach the cap tie, and the newer image wins: it leaves less
+/// log to apply. The peer with the longer log comes first in the list, so
+/// the list order alone does not decide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn under_a_cap_the_newer_image_wins_a_tie_of_restore_points() {
+    let longer = Peer::new();
+    let newer = Peer::with_base_and_head(6, 7);
+    let local = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let peers = [longer.addr.to_string(), newer.addr.to_string()];
+    let (dir, into) = (local.path().to_path_buf(), state.path().to_path_buf());
+    let cap = BlockRange::below(8).unwrap();
+    let (fetched, restored) = tokio::task::spawn_blocking(move || {
+        let fetched = fetch_best_checkpoint(&peers, &dir, cap, None).map(|c| c.block);
+        let restored = restore_best_checkpoint(&dir, &into, cap, None)
+            .unwrap()
+            .map(|(block, _)| block);
+        (fetched, restored)
+    })
+    .await
+    .unwrap();
+    assert_eq!(fetched, Some(6), "the newer image of the tie");
+    assert_eq!(restored, Some(7));
+    let bases = crate::checkpoint::checkpoints_newest_first(local.path()).unwrap();
+    assert_eq!(bases.len(), 1, "one download");
+}
+
 #[test]
 fn a_log_request_reads_back() {
     let request = LogRequest {
