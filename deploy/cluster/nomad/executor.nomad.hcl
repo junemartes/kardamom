@@ -309,12 +309,15 @@ locals {
   # Consul service, so no job names the backup node. It comes first: a
   # fetch skips a later peer that has no newer checkpoint without a
   # download, so the old checkpoints of the hot executors stay unread.
-  checkpoint_peers = join(",", concat(
-    local.checkpoint ? ["kardamom-executor-checkpoint.service.${var.datacenter}.consul:9014"] : [],
+  hot_peers = concat(
     local.on_sealers ? [
       for i in range(var.sealer_count) : "sealer-${i}.node.${var.datacenter}.consul:9014"
     ] : [],
     [for i in range(var.executor_count) : "executor-${i}.node.${var.datacenter}.consul:9014"],
+  )
+  checkpoint_peers = join(",", concat(
+    local.checkpoint ? ["kardamom-executor-checkpoint.service.${var.datacenter}.consul:9014"] : [],
+    local.hot_peers,
   ))
 }
 
@@ -557,7 +560,10 @@ job "executor" {
             # hot executors keep the default limit (16 MiB/s).
             group.value.hot ? [] : ["--checkpoint-copy-mib-per-sec", "0"],
             [
-              "--checkpoint-peers", local.checkpoint_peers,
+              # The checkpoint executor does not name its own service: a
+              # start would ask itself first, and it has no checkpoint to
+              # serve before its own restore.
+              "--checkpoint-peers", group.value.hot ? local.checkpoint_peers : join(",", local.hot_peers),
               # Bind the Prometheus exporter on all interfaces; the
               # default is loopback. The chaos suite probes it directly
               # over the cluster bridge (http://<node_ip>:9004/metrics),
