@@ -561,7 +561,7 @@ The executors are deterministic state machines. One dead or lagging replica neve
 - **Hot executors in the restore-only mode** (`KARDAMOM_EXEC_RESTORE_ONLY=on`)
   - The hot executors run with `--checkpoint-interval-secs 0` and no block log. They keep `--checkpoint-dir` and `--checkpoint-peers`, so a cold start, a refused cursor and a rollback restore a peer checkpoint.
   - The checkpoint executor is then the one source of new checkpoints (no second source). A rollback of a hot executor always takes the checkpoint of the backup machine.
-  - The checkpoints that a hot executor made before the switch stay in its directory and serve to its peers. Every list of peers names the checkpoint executor first. A fetch probes every peer and downloads only from the peer with the furthest restore point. The checkpoint executor wins a tie. So a hot executor sends an old checkpoint only when the checkpoint executor offers no restore point that is as far.
+  - The checkpoints that a hot executor made before the switch stay in its directory and serve to its peers. The peer list of each hot executor names the checkpoint executor first. The checkpoint executor lists the hot executors only, not its own service. A fetch probes every peer and downloads only from the peer with the furthest restore point. The checkpoint executor wins a tie. So a hot executor sends an old checkpoint only when the checkpoint executor offers no restore point that is as far.
   - A state mirror rebuild fetches the newest checkpoint of the checkpoint executor (`--checkpoint-peers`) into `/opt/kardamom/mirror/peer-checkpoints`. It restores the newest of that copy and of the local directory.
 - **The audit mirror on the backup machine** (`KARDAMOM_MIRROR_AUDIT_ON_BACKUP=on`, group `mirror-audit` of the state-mirror job)
   - Use: it does the daily audit rebuild of the Redis projection from the local checkpoints of the checkpoint executor. The hot mirrors on the sealer machines run with `--audit-hours 0`, so no audit reads or writes the disk of a sealer machine. See `deploy/cluster/README.md`, "The audit mirror".
@@ -571,7 +571,10 @@ The executors are deterministic state machines. One dead or lagging replica neve
   - A rollback during its audit: the audit mirror clears the projection after its audit ends, some minutes after the hot mirrors cleared it. The accounts and receipts that the hot mirrors wrote in that time go, and the hot mirrors do not rebuild them. The readers then miss in Redis and admit, by the fallback rule. The rollback rebuild of the audit mirror, which follows its clear, writes every account again.
   - The backup machine is down: no audit runs. A missed live row then stays wrong until the account is touched again or the backup machine returns.
   - A loss of Redis: the hot mirrors still do a cold rebuild on the sealer machines.
-  - A restart starts the audit interval again. A deploy each day can delay the audit for as long as the deploys continue.
+  - The audit interval counts from the last completed rebuild of any reason, cold, regression, rollback or audit. Each rebuild rewrites every account. The mirror keeps the UNIX time of that rebuild in `/opt/kardamom/mirror/last-rebuild`, so a restart or a deploy does not start the interval again.
+  - No file, or a file that does not parse: no rebuild is on record, and the audit runs on the first live batch after the start. A fresh audit mirror on a cold Redis does a cold rebuild first. That rebuild counts, so no second rewrite follows.
+  - A time after now, from a clock step, counts as now. The audit is then due one interval after the start.
+  - The gauge `kardamom_state_mirror_last_rebuild_timestamp_seconds` shows the time of the last rebuild, 0 when none is on record. No alert reads it yet.
   - Not covered: no CI profile has a node of role `backup`, so no chaos case runs the audit mirror. The deploy tests render its group and refuse the switch without the checkpoint executor.
 - **Wedged executor**
   - Trigger: the block gauge of an executor is flat while the sealer boundaries keep advancing.

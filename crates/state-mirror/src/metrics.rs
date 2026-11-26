@@ -9,6 +9,7 @@ const REBUILD_SECONDS: &str = "kardamom_state_mirror_rebuild_seconds";
 const REBUILDS_TOTAL: &str = "kardamom_state_mirror_rebuilds_total";
 const WRITE_RETRIES_TOTAL: &str = "kardamom_state_mirror_write_retries_total";
 const WAIT_REPLICA_ZERO_TOTAL: &str = "kardamom_state_mirror_wait_replica_zero_total";
+const LAST_REBUILD_TIMESTAMP_SECONDS: &str = "kardamom_state_mirror_last_rebuild_timestamp_seconds";
 /// 1 while the mirror applies batches as they come: after its start
 /// decision and outside a rebuild. The readiness rule requires 1. The
 /// executors publish no batch for an empty block, so an idle chain gives
@@ -38,6 +39,10 @@ pub(crate) fn describe() {
         "batches no replica acknowledged within the wait"
     );
     metrics::describe_gauge!(
+        LAST_REBUILD_TIMESTAMP_SECONDS,
+        "the UNIX time of the last completed rebuild of any reason, persisted across restarts; 0 when no rebuild is on record"
+    );
+    metrics::describe_gauge!(
         SERVING,
         "1 while the mirror applies batches: started, and not in a rebuild"
     );
@@ -56,6 +61,12 @@ pub(crate) fn set_head(tx_idx: u64) {
     // A gauge is an f64. A position beyond 2^53 is not a real value.
     #[allow(clippy::cast_precision_loss)]
     metrics::gauge!(HEAD_TX_IDX).set(tx_idx as f64);
+}
+
+pub(crate) fn set_last_rebuild(unix_secs: u64) {
+    // A gauge is an f64. A UNIX time in seconds is far below 2^53.
+    #[allow(clippy::cast_precision_loss)]
+    metrics::gauge!(LAST_REBUILD_TIMESTAMP_SECONDS).set(unix_secs as f64);
 }
 
 pub(crate) fn record_rebuild(reason: &'static str, seconds: f64) {

@@ -1,6 +1,7 @@
 use kardamom_types::BPosition;
 
-use super::support::{ACCOUNTS, Fixture};
+use super::support::{ACCOUNTS, Actor, Fixture};
+use crate::audit::AuditClock;
 
 #[tokio::test]
 #[ignore = "requires one disposable Redis container"]
@@ -193,4 +194,79 @@ async fn a_durable_head_below_the_local_head_is_a_regression() {
     fixture.head(0, 20).await;
     fixture.assert_checkpoint_suffix(1).await;
     actor.close().await.unwrap();
+}
+
+/// The audit interval counts from the persisted time of the last
+/// rebuild. A restart before the interval ends does not audit. A start
+/// after the persisted time plus the interval audits. An audit rewrites
+/// the checkpoint rows at the end of the newer checkpoint, 40. Each batch
+/// waits for the head of the one before it, so that each is its own
+/// group: a due audit runs on the group after the one that found it due.
+#[tokio::test]
+#[ignore = "requires one disposable Redis container"]
+async fn a_restart_keeps_the_audit_interval_of_the_persisted_rebuild() {
+    let mut fixture = Fixture::new().await.with_audit_hours(1);
+    fixture.permit_all().await;
+    let rebuilt = AuditClock::unix_now();
+    let first = fixture.start(0, true).await;
+    fixture.apply(&first, &[(1, 20)]).await;
+    first.close().await.unwrap();
+    let persisted = fixture
+        .head_file(0)
+        .last_rebuild()
+        .expect("a rebuild persists its time");
+    assert!((rebuilt..=AuditClock::unix_now()).contains(&persisted));
+    fixture.checkpoint_at(2, 41, &[]);
+
+    let restarted = fixture.start(0, false).await;
+    fixture.apply(&restarted, &[(2, 30), (3, 31)]).await;
+    restarted.close().await.unwrap();
+    fixture.assert_rows_at(1, 20).await;
+    assert_eq!(fixture.head_file(0).last_rebuild(), Some(persisted));
+
+    fixture
+        .head_file(0)
+        .record_rebuild(persisted.checked_sub(3_600).unwrap())
+        .unwrap();
+    let due = fixture.start(0, false).await;
+    fixture.apply(&due, &[(4, 32), (5, 33)]).await;
+    due.close().await.unwrap();
+    fixture.assert_rows_at(1, 40).await;
+    assert!(fixture.head_file(0).last_rebuild() >= Some(persisted));
+}
+
+/// A persisted rebuild time after now, from a clock step, does not
+/// audit at once, and the mirror keeps the file as it is.
+#[tokio::test]
+#[ignore = "requires one disposable Redis container"]
+async fn a_persisted_rebuild_time_in_the_future_does_not_audit_at_once() {
+    let mut fixture = Fixture::new().await.with_audit_hours(1);
+    fixture.permit_all().await;
+    fixture
+        .cache
+        .set_head(0, BPosition::from_index(20))
+        .await
+        .unwrap();
+    let future = AuditClock::unix_now().checked_add(10 * 24 * 3_600).unwrap();
+    fixture.head_file(0).record_rebuild(future).unwrap();
+    let actor = fixture.start(0, false).await;
+    fixture.apply(&actor, &[(2, 21), (3, 22)]).await;
+    actor.close().await.unwrap();
+    fixture.assert_no_checkpoint_rows(1).await;
+    assert_eq!(fixture.head_file(0).last_rebuild(), Some(future));
+}
+
+impl Fixture {
+    /// Send a batch of account 0 for each `(nonce, position)` to mirror
+    /// 0, each after the head of the one before it.
+    async fn apply(&self, actor: &Actor, batches: &[(u64, u64)]) {
+        for &(nonce, position) in batches {
+            self.send_and_wait(actor, nonce, position).await;
+        }
+    }
+
+    async fn send_and_wait(&self, actor: &Actor, nonce: u64, position: u64) {
+        actor.send(&Self::batch(0, nonce, position));
+        self.head(0, position).await;
+    }
 }

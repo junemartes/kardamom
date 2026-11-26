@@ -1354,14 +1354,17 @@
         "encoded receipt frames instead of Aeron",
         "Redis ACL refusal after 512 accounts or within a live batch",
         "actor cancellation and replacement",
-        "SCRIPT FLUSH"
+        "SCRIPT FLUSH",
+        "a persisted rebuild time written one interval back or ten days ahead, in place of the passage of time"
       ],
       "tests": [
         "interrupted_partial_rebuild_restores_untouched_accounts_without_regressing_live_rows",
         "partial_live_batch_retries_without_new_input_and_publishes_head_last",
         "script_loss_and_older_replica_frames_preserve_newest_account_state",
         "a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close",
-        "a_transient_head_read_timeout_does_not_end_the_recovery_wait"
+        "a_transient_head_read_timeout_does_not_end_the_recovery_wait",
+        "a_restart_keeps_the_audit_interval_of_the_persisted_rebuild",
+        "a_persisted_rebuild_time_in_the_future_does_not_audit_at_once"
       ],
       "negative_controls": {
         "regressing_rows": {

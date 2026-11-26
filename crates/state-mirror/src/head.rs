@@ -1,33 +1,67 @@
-//! The local head file: the highest batch end position this mirror has
-//! applied, persisted so a restart can tell a Redis regression from a
-//! resume. See the failover rule in the spec.
+//! The local files of the mirror: the head file, the rebuild marker, and
+//! the time of the last completed rebuild. The head lets a restart tell a
+//! Redis regression from a resume. See the failover rule in the spec. The
+//! rebuild time lets the audit interval count across a restart.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-/// The head file. Written through a temporary file and a rename, so a
-/// crash mid-write leaves the old value.
-pub(crate) struct HeadFile {
+/// A file that holds one decimal number. Written through a temporary
+/// file and a rename, so a crash mid-write leaves the old value.
+struct NumberFile {
     path: PathBuf,
 }
 
-impl HeadFile {
-    pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    /// The persisted head, as a canonical index. `None` when no head was
-    /// ever written or the file does not parse.
-    pub(crate) fn read(&self) -> Option<u64> {
+impl NumberFile {
+    /// The number. `None` when no number was ever written or the file
+    /// does not parse.
+    fn read(&self) -> Option<u64> {
         std::fs::read_to_string(&self.path)
             .ok()
             .and_then(|s| s.trim().parse().ok())
     }
 
+    /// Persist `value`.
+    fn write(&self, value: u64) -> Result<()> {
+        let dir = self.path.parent().context("head file has no parent")?;
+        std::fs::create_dir_all(dir).context("create the mirror dir")?;
+        let tmp = self.path.with_extension("tmp");
+        std::fs::write(&tmp, format!("{value}\n"))
+            .with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("rename {}", self.path.display()))?;
+        Ok(())
+    }
+}
+
+/// The head file, and the files beside it.
+pub(crate) struct HeadFile {
+    head: NumberFile,
+    /// The UNIX time in seconds at which the last rebuild completed.
+    last_rebuild: NumberFile,
+}
+
+impl HeadFile {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self {
+            last_rebuild: NumberFile {
+                path: path.with_file_name("last-rebuild"),
+            },
+            head: NumberFile { path },
+        }
+    }
+
+    /// The persisted head, as a canonical index. `None` when no head was
+    /// ever written or the file does not parse.
+    pub(crate) fn read(&self) -> Option<u64> {
+        self.head.read()
+    }
+
     /// A partial projection write or scan requires a full rebuild after restart.
     pub(crate) fn rebuild_pending(&self) -> Result<bool> {
-        self.path
+        self.head
+            .path
             .with_extension("rebuild")
             .try_exists()
             .context("read the mirror rebuild marker")
@@ -35,9 +69,9 @@ impl HeadFile {
 
     /// Persist the recovery obligation before changing the projection.
     pub(crate) fn begin_rebuild(&self) -> Result<()> {
-        let dir = self.path.parent().context("head file has no parent")?;
+        let dir = self.head.path.parent().context("head file has no parent")?;
         std::fs::create_dir_all(dir).context("create the mirror dir")?;
-        std::fs::File::create(self.path.with_extension("rebuild"))
+        std::fs::File::create(self.head.path.with_extension("rebuild"))
             .context("create the mirror rebuild marker")?
             .sync_all()
             .context("sync the mirror rebuild marker")?;
@@ -47,21 +81,27 @@ impl HeadFile {
 
     /// Only a completed checkpoint scan discharges the recovery obligation.
     pub(crate) fn finish_rebuild(&self) -> Result<()> {
-        std::fs::remove_file(self.path.with_extension("rebuild"))
+        std::fs::remove_file(self.head.path.with_extension("rebuild"))
             .context("remove the mirror rebuild marker")?;
-        let dir = self.path.parent().context("head file has no parent")?;
+        let dir = self.head.path.parent().context("head file has no parent")?;
         std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     }
 
     /// Persist `head`.
     pub(crate) fn write(&self, head: u64) -> Result<()> {
-        let dir = self.path.parent().context("head file has no parent")?;
-        std::fs::create_dir_all(dir).context("create the mirror dir")?;
-        let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, format!("{head}\n")).context("write the head file")?;
-        std::fs::rename(&tmp, &self.path).context("rename the head file")?;
-        Ok(())
+        self.head.write(head)
+    }
+
+    /// The UNIX time in seconds at which the last rebuild completed.
+    /// `None` when no rebuild was recorded or the file does not parse.
+    pub(crate) fn last_rebuild(&self) -> Option<u64> {
+        self.last_rebuild.read()
+    }
+
+    /// Persist `unix_secs` as the time of the last completed rebuild.
+    pub(crate) fn record_rebuild(&self, unix_secs: u64) -> Result<()> {
+        self.last_rebuild.write(unix_secs)
     }
 }
 
@@ -79,6 +119,20 @@ mod tests {
         file.write(43).unwrap();
         assert_eq!(file.read(), Some(43));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_rebuild_time_survives_reopen_beside_the_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = HeadFile::new(dir.path().join("mirror/head"));
+        assert_eq!(file.last_rebuild(), None);
+        file.write(10).unwrap();
+        file.record_rebuild(1_764_000_000).unwrap();
+        let restarted = HeadFile::new(dir.path().join("mirror/head"));
+        assert_eq!(restarted.last_rebuild(), Some(1_764_000_000));
+        assert_eq!(restarted.read(), Some(10));
+        std::fs::write(dir.path().join("mirror/last-rebuild"), b"not a time").unwrap();
+        assert_eq!(restarted.last_rebuild(), None);
     }
 
     #[test]

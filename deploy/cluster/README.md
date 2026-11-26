@@ -487,7 +487,7 @@ The checkpoint executor moves the checkpoint writes off the sealer machines (`do
 
 | Switch | What it renders | When |
 |---|---|---|
-| `KARDAMOM_CHECKPOINT_EXECUTOR=on` | The group `executor-checkpoint` in the executor job, on the node of role `backup`. The checkpoint peers of the executors, the validator and the state mirrors name it first (`kardamom-executor-checkpoint.service.<dc>.consul:9014`). The state mirror gets `--checkpoint-peers` and `--chain`. Prometheus scrapes it as the job `kardamom-executor-checkpoint`. | Staging step 1. The hot executors keep their checkpoints. |
+| `KARDAMOM_CHECKPOINT_EXECUTOR=on` | The group `executor-checkpoint` in the executor job, on the node of role `backup`. The checkpoint peers of the hot executors, the validator and the state mirrors name it first (`kardamom-executor-checkpoint.service.<dc>.consul:9014`). Its own peers are the hot executors only. The state mirror gets `--checkpoint-peers` and `--chain`. Prometheus scrapes it as the job `kardamom-executor-checkpoint`. | Staging step 1. The hot executors keep their checkpoints. |
 | `KARDAMOM_EXEC_RESTORE_ONLY=on` | `--checkpoint-interval-secs 0` and the block log off on the hot executors. They still restore a peer checkpoint. | Staging step 2, after step 1 shows that the checkpoint executor keeps the average rate of the chain. |
 | `KARDAMOM_MIRROR_AUDIT_ON_BACKUP=on` | The group `mirror-audit` in the state-mirror job, on the node of role `backup`. The hot mirrors get `--audit-hours 0`. Prometheus scrapes the audit mirror as the job `kardamom-state-mirror-audit`. See [The audit mirror](#the-audit-mirror). | With the checkpoint executor. It does not need the restore-only mode. |
 
@@ -528,7 +528,7 @@ To go back, switch `KARDAMOM_MIRROR_AUDIT_ON_BACKUP` and `KARDAMOM_EXEC_RESTORE_
 
 #### The audit mirror
 
-Each state mirror rewrites every account from a checkpoint into Redis once each `KARDAMOM_MIRROR_AUDIT_HOURS` (default 24). On staging on 2026-11-21, the three mirrors on the sealer machines audited at the same time. Each sealer machine read up to 600 MB/s and wrote up to 1,000 MB/s for 8 minutes. That disk also holds the archive of the sealer leader, which is on the commit path. 17 to 23 % of the commits waited more than 5 ms.
+Each state mirror rewrites every account from a checkpoint into Redis once each `KARDAMOM_MIRROR_AUDIT_HOURS` (default 24). The interval counts from the last completed rebuild of any reason. The mirror keeps its time in `/opt/kardamom/mirror/last-rebuild`, so a restart does not start the interval again. On staging on 2026-11-21, the three mirrors on the sealer machines audited at the same time. Each sealer machine read up to 600 MB/s and wrote up to 1,000 MB/s for 8 minutes. That disk also holds the archive of the sealer leader, which is on the commit path. 17 to 23 % of the commits waited more than 5 ms.
 
 With `KARDAMOM_MIRROR_AUDIT_ON_BACKUP=on`, a fourth mirror, the audit mirror, does the audit on the backup machine:
 
@@ -554,7 +554,8 @@ The limits:
 
 - While the backup machine is down, no audit runs.
 - After a loss of Redis, the hot mirrors still do a cold rebuild on the sealer machines.
-- A restart of a mirror starts its audit interval again. A deploy every day restarts the audit mirror, so its audit can then wait for a day without a deploy.
+- A mirror with no `last-rebuild` file audits at once, on the first live batch after its start. The first deploy of a release that writes the file thus starts one audit on each mirror with the audit on.
+- The gauge `kardamom_state_mirror_last_rebuild_timestamp_seconds` gives the time of the last rebuild. No alert reads it yet.
 
 ### The notifier nodes
 

@@ -2877,11 +2877,13 @@ class CarryTest(Deploys):
         service = task['Services'][0]
         self.assertEqual((service['Name'], [c['Type'] for c in service['Checks']]),
                          ('kardamom-executor-checkpoint', ['tcp']))
-        # The checkpoint executor comes first, so a fetch reads no older
-        # checkpoint of a hot executor.
-        peers = ','.join([self.CHECKPOINT_PEER] + [f'sealer-{i}.node.dc1.consul:9014' for i in range(3)]
-                         + [f'executor-{i}.node.dc1.consul:9014' for i in range(3)])
-        self.assertEqual(args[args.index('--checkpoint-peers') + 1], peers)
+        # The checkpoint executor comes first for the hot executors, so a
+        # fetch reads no older checkpoint of a hot executor. The checkpoint
+        # executor does not name itself.
+        hot_peers = ([f'sealer-{i}.node.dc1.consul:9014' for i in range(3)]
+                     + [f'executor-{i}.node.dc1.consul:9014' for i in range(3)])
+        self.assertEqual(args[args.index('--checkpoint-peers') + 1], ','.join(hot_peers))
+        peers = ','.join([self.CHECKPOINT_PEER] + hot_peers)
         for i in range(3):
             hot = groups[f'executor-{i}']
             args = hot['Tasks'][0]['Config']['args']

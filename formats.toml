@@ -557,3 +557,15 @@ reads_min = 1
 reads_max = 1
 shared = false
 code = ["crates/state-mirror/src/head.rs#begin_rebuild"]
+
+# The last-rebuild file beside a mirror's numeric head: the UNIX time in
+# seconds of the last completed rebuild, as one decimal line. The audit
+# interval counts from it across restarts. A missing or unparsable file
+# makes the audit due at once. Older binaries ignore it and count the
+# interval from their start.
+[format.state-mirror-last-rebuild]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = false
+code = ["crates/state-mirror/src/head.rs#record_rebuild"]

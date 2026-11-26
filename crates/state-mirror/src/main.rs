@@ -13,8 +13,10 @@
 //! after the checkpoint win by position.
 //!
 //! Structure: the CLI in this file, the actor in [`mirror`], the rebuild
-//! in [`rebuild`], the local head file in [`head`].
+//! in [`rebuild`], the local head file in [`head`], the audit schedule in
+//! [`audit`].
 
+mod audit;
 mod head;
 mod metrics;
 mod mirror;
@@ -81,9 +83,10 @@ struct Args {
         default_value = "/opt/kardamom/checkpoints"
     )]
     checkpoints_dir: PathBuf,
-    /// This mirror's own directory: the local head file, the rebuild
-    /// scratch copy of a checkpoint, and the checkpoints fetched from the
-    /// peers (`peer-checkpoints`).
+    /// This mirror's own directory: the local head file, the time of the
+    /// last completed rebuild (`last-rebuild`), the rebuild scratch copy of
+    /// a checkpoint, and the checkpoints fetched from the peers
+    /// (`peer-checkpoints`).
     #[arg(
         long,
         env = "KARDAMOM_MIRROR_DIR",
@@ -110,7 +113,9 @@ struct Args {
     /// Force a rebuild on this start.
     #[arg(long, env = "KARDAMOM_MIRROR_REBUILD", default_value_t = false)]
     rebuild: bool,
-    /// Hours between audit rebuilds. `0` disables the audit.
+    /// Hours from the last completed rebuild to the next audit rebuild.
+    /// The interval counts across restarts: the mirror keeps the time of
+    /// the last rebuild in `--mirror-dir`. `0` disables the audit.
     #[arg(long, env = "KARDAMOM_MIRROR_AUDIT_HOURS", default_value_t = 24)]
     audit_hours: u64,
     /// Address for the Prometheus /metrics HTTP listener.
