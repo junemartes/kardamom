@@ -68,11 +68,26 @@ impl Node {
 /// Reusable Aeron e2e harness. Each instance owns one or more real
 /// Aeron containers and exposes the host ports the Rust code should
 /// connect to.
+///
+/// Field order is drop order: in a panic, the error log of each driver
+/// prints before its container stops.
 pub struct AeronTestCluster {
+    _error_logs: Vec<super::DriverErrorLog>,
     nodes: Vec<Node>,
 }
 
 impl AeronTestCluster {
+    /// The cluster of `nodes`, with the error log of each driver.
+    fn new(nodes: Vec<Node>) -> Self {
+        Self {
+            _error_logs: nodes
+                .iter()
+                .map(|node| super::DriverErrorLog::new(node.aeron_dir()))
+                .collect(),
+            nodes,
+        }
+    }
+
     /// Bring up a single Aeron node. If the env var
     /// `KARDAMOM_AERON_DIR` is set, adopt the already-running Media
     /// Driver that owns that directory instead. This env path lets a
@@ -92,12 +107,10 @@ impl AeronTestCluster {
             let archive_dir = aeron_dir
                 .parent()
                 .map_or_else(|| aeron_dir.clone(), |p| p.join("archive"));
-            return Ok(Self {
-                nodes: vec![Node::External {
-                    aeron_dir,
-                    archive_dir,
-                }],
-            });
+            return Ok(Self::new(vec![Node::External {
+                aeron_dir,
+                archive_dir,
+            }]));
         }
         Self::container_node(None, None).await
     }
@@ -139,7 +152,7 @@ impl AeronTestCluster {
     ) -> anyhow::Result<Self> {
         ensure_image_built().await?;
         let node = spawn_node(liveness, archive_length).await?;
-        Ok(Self { nodes: vec![node] })
+        Ok(Self::new(vec![node]))
     }
     /// "host:port" the test should pass as the Aeron Archive control
     /// channel endpoint for node `i`. Container mode resolves the
@@ -393,7 +406,7 @@ impl PendingNode {
     pub async fn start(self) -> anyhow::Result<AeronTestCluster> {
         ensure_image_built().await?;
         let node = start_node(self.root, None, None).await?;
-        Ok(AeronTestCluster { nodes: vec![node] })
+        Ok(AeronTestCluster::new(vec![node]))
     }
 }
 

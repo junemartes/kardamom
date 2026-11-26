@@ -24,12 +24,15 @@ use std::time::{Duration, Instant};
 use kardamom_log::aeron_live::{AeronRuntime, PubHandle, RawFrame};
 use kardamom_log::recorder::{Recorder, RecorderKind, connect_archive};
 use kardamom_log::testing::{AeronTestCluster, SingleNodeRig};
+use kardamom_obs::testkit::PortBlock;
 use rkyv::util::AlignedVec;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
 /// Stream ids 4501 to 4513 keep this test apart from the other e2e tests.
 const STREAM: i32 = 4501;
+/// The fixed control ports of publishers a, b and c: offsets 0, 1 and 2.
+const PORTS: PortBlock = PortBlock::MdcTransport;
 const FRAMES: usize = 20;
 
 fn frame(fill: u8) -> AlignedVec {
@@ -107,7 +110,7 @@ fn record_publisher_a(
         let session = connect_archive(Some(&aeron_dir), &aeron_cfg).expect("archive");
         let recorder = Recorder::start_stream(
             session.archive,
-            &destination(41000),
+            &destination(PORTS.port(0)),
             STREAM,
             RecorderKind::TxData { sequencer_id: 0 },
             &stop,
@@ -127,10 +130,10 @@ async fn manual_subscription_joins_and_leaves_dynamic_mdc_publishers() {
     let aeron_dir = cluster.aeron_dir_host(0).to_path_buf();
 
     let pub_a = rt
-        .open_publication(&control_uri(41000), STREAM)
+        .open_publication(&control_uri(PORTS.port(0)), STREAM)
         .expect("publisher a");
     let pub_b = rt
-        .open_publication(&control_uri(41001), STREAM)
+        .open_publication(&control_uri(PORTS.port(1)), STREAM)
         .expect("publisher b");
 
     // The recording starts before any live subscriber joins.
@@ -140,9 +143,9 @@ async fn manual_subscription_joins_and_leaves_dynamic_mdc_publishers() {
     let (sub_id, mut rx) = rt
         .open_subscription_raw("aeron:udp?control-mode=manual", STREAM)
         .expect("manual subscription");
-    rt.add_destination(sub_id, &destination(41000))
+    rt.add_destination(sub_id, &destination(PORTS.port(0)))
         .expect("destination a");
-    rt.add_destination(sub_id, &destination(41001))
+    rt.add_destination(sub_id, &destination(PORTS.port(1)))
         .expect("destination b");
 
     let a = tokio::task::spawn_blocking({
@@ -172,7 +175,7 @@ async fn manual_subscription_joins_and_leaves_dynamic_mdc_publishers() {
 
     // The detached destination of a live publisher lingers for one stall
     // budget, then closes.
-    rt.remove_destination(sub_id, &destination(41001))
+    rt.remove_destination(sub_id, &destination(PORTS.port(1)))
         .expect("remove b");
     tokio::time::sleep(rt.stall_budget() + Duration::from_secs(1)).await;
     let _ = tokio::task::spawn_blocking(move || pub_b.publish_bytes(frame(0xBB)))
@@ -228,10 +231,10 @@ async fn port_zero_publications_report_their_bound_ports(
 async fn two_streams_share_one_control_endpoint(rt: &AeronRuntime, aeron_dir: &std::path::Path) {
     let rt_c = AeronRuntime::spawn_with_dir(aeron_dir).expect("publisher runtime");
     let pub_c1 = rt_c
-        .open_publication(&control_uri(41002), STREAM + 10)
+        .open_publication(&control_uri(PORTS.port(2)), STREAM + 10)
         .expect("publisher c1");
     let pub_c2 = rt_c
-        .open_publication(&control_uri(41002), STREAM + 11)
+        .open_publication(&control_uri(PORTS.port(2)), STREAM + 11)
         .expect("publisher c2");
     let (s1, mut rx1) = rt
         .open_subscription_raw("aeron:udp?control-mode=manual", STREAM + 10)
@@ -239,9 +242,9 @@ async fn two_streams_share_one_control_endpoint(rt: &AeronRuntime, aeron_dir: &s
     let (s2, mut rx2) = rt
         .open_subscription_raw("aeron:udp?control-mode=manual", STREAM + 11)
         .expect("subscription c2");
-    rt.add_destination(s1, &destination(41002))
+    rt.add_destination(s1, &destination(PORTS.port(2)))
         .expect("destination c1");
-    rt.add_destination(s2, &destination(41002))
+    rt.add_destination(s2, &destination(PORTS.port(2)))
         .expect("destination c2");
     let c1 = tokio::task::spawn_blocking(move || publish_frames(&pub_c1, 0xC1));
     let c2 = tokio::task::spawn_blocking(move || publish_frames(&pub_c2, 0xC2));

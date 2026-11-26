@@ -35,7 +35,11 @@ use kardamom_log::discovery::{
 };
 use kardamom_log::recorder::connect_archive;
 use kardamom_log::testing::{AeronTestCluster, SingleNodeRig};
+use kardamom_obs::testkit::PortBlock;
 use tokio_util::sync::CancellationToken;
+
+/// The fixed control ports of the restart cases: offsets 0 and 10.
+const PORTS: PortBlock = PortBlock::DiscoveredTxData;
 
 fn config(base: &LogConfig) -> LogConfig {
     let mut cfg = base.clone();
@@ -184,12 +188,10 @@ async fn publish_until_connected(publisher: &TxDataPublisherHandle, id: u64) {
     let deadline = Instant::now() + Duration::from_secs(10);
     let p = publisher.clone();
     let connected = tokio::task::spawn_blocking(move || {
-        while Instant::now() < deadline {
-            if p.publish(&common::tx_envelope(id, 1, 32)).is_ok() {
-                return true;
-            }
-        }
-        false
+        std::iter::from_fn(|| {
+            (Instant::now() < deadline).then(|| p.publish(&common::tx_envelope(id, 1, 32)).is_ok())
+        })
+        .any(|accepted| accepted)
     })
     .await
     .expect("publish task");
@@ -474,11 +476,11 @@ async fn restart_on_same_port(stream_id_base: i32, port: u16, archive_sub: Archi
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker; run with `cargo test -p kardamom-log --features docker-e2e --test discovered_tx_data -- --ignored`"]
 async fn a_restarted_publisher_is_adopted_under_the_archive_s_live_subscription() {
-    restart_on_same_port(4900, 47100, ArchiveSubscription::Kept).await;
+    restart_on_same_port(4900, PORTS.port(0), ArchiveSubscription::Kept).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker; run with `cargo test -p kardamom-log --features docker-e2e --test discovered_tx_data -- --ignored`"]
 async fn a_restarted_publisher_never_adopts_the_earlier_incarnation_s_recording() {
-    restart_on_same_port(5000, 47110, ArchiveSubscription::Stopped).await;
+    restart_on_same_port(5000, PORTS.port(10), ArchiveSubscription::Stopped).await;
 }

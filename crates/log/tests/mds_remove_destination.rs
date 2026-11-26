@@ -13,12 +13,14 @@ use std::time::{Duration, Instant};
 
 use kardamom_log::aeron_live::{AeronRuntime, PubHandle, RawFrame};
 use kardamom_log::testing::{AeronTestCluster, SingleNodeRig};
+use kardamom_obs::testkit::PortBlock;
 use rkyv::util::AlignedVec;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Stream id 4601 keeps this test apart from the other e2e tests.
 const STREAM: i32 = 4601;
-const FIRST_PORT: u16 = 41_100;
+/// The fixed control ports of the publishers: offset `i` for publisher `i`.
+const PORTS: PortBlock = PortBlock::MdsRemoveDestination;
 const PUBLISHERS: u16 = 4;
 /// The frames each live publisher sends: half before the removal, half
 /// after it.
@@ -113,7 +115,7 @@ impl Rig {
         let SingleNodeRig { cluster, rt, .. } = AeronTestCluster::single_node_runtime(4600).await;
         let publishers = (0..PUBLISHERS)
             .map(|i| {
-                rt.open_publication(&control_uri(FIRST_PORT + i), STREAM)
+                rt.open_publication(&control_uri(PORTS.port(i)), STREAM)
                     .expect("publisher")
             })
             .collect();
@@ -147,13 +149,13 @@ impl Rig {
 
     fn add(&self, i: u16) {
         self.rt
-            .add_destination(self.sub_id, &destination(FIRST_PORT + i))
+            .add_destination(self.sub_id, &destination(PORTS.port(i)))
             .expect("add");
     }
 
     fn remove(&self, i: u16) {
         self.rt
-            .remove_destination(self.sub_id, &destination(FIRST_PORT + i))
+            .remove_destination(self.sub_id, &destination(PORTS.port(i)))
             .expect("remove");
     }
 
@@ -164,7 +166,7 @@ impl Rig {
         let dir = self.cluster.aeron_dir_host(0).to_path_buf();
         let node = AeronRuntime::spawn_with_dir(&dir).expect("node runtime");
         let publisher = node
-            .open_publication(&control_uri(FIRST_PORT + 1), STREAM)
+            .open_publication(&control_uri(PORTS.port(1)), STREAM)
             .expect("returned publisher");
         self.add(1);
         let _ = publisher.publish_bytes(frame(40 + round, 0));

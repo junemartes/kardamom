@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use kardamom_log::aeron_live::{AeronRuntime, PubHandle, RawFrame};
 use kardamom_log::testing::AeronTestCluster;
+use kardamom_obs::testkit::PortBlock;
 use rkyv::util::AlignedVec;
 use serde_json::json;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -25,7 +26,7 @@ impl Actor {
     fn new(dir: &str, index: usize, peer: &AeronRuntime) -> Self {
         let runtime = AeronRuntime::spawn_with_dir(dir).unwrap();
         let stream = 9000_i32.checked_add(i32::try_from(index).unwrap()).unwrap();
-        let port = 19000_usize.checked_add(index).unwrap();
+        let port = PortBlock::TransportPressure.port(u16::try_from(index).unwrap());
         let channel = format!("aeron:udp?endpoint=127.0.0.1:{port}|term-length=65536");
         let (_, input) = runtime.open_subscription_raw(&channel, stream).unwrap();
         let live = peer.open_publication(&channel, stream).unwrap();

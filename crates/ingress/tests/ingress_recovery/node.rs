@@ -36,8 +36,6 @@ pub(crate) enum Stop {
 pub(crate) struct Replica {
     pub(crate) id: u16,
     pub(crate) channels: Channels,
-    pub(crate) rpc_port: u16,
-    metrics_port: u16,
     root: PathBuf,
     query: String,
     child: Option<Child>,
@@ -50,8 +48,6 @@ impl Replica {
         Self {
             id,
             channels,
-            rpc_port: super::free_tcp_port(),
-            metrics_port: super::free_tcp_port(),
             root: root.to_path_buf(),
             query: query.to_string(),
             child: None,
@@ -60,7 +56,7 @@ impl Replica {
     }
 
     pub(crate) fn url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.rpc_port)
+        format!("http://127.0.0.1:{}", self.channels.rpc_port)
     }
 
     /// The log config of this replica: its UDP channels, and the archive
@@ -99,10 +95,13 @@ impl Replica {
             .arg(self.log_config(driver))
             .arg("--aeron-dir")
             .arg(driver.aeron_dir())
-            .args(["--jsonrpc-bind", &format!("127.0.0.1:{}", self.rpc_port)])
+            .args([
+                "--jsonrpc-bind",
+                &format!("127.0.0.1:{}", self.channels.rpc_port),
+            ])
             .args([
                 "--metrics-addr",
-                &format!("127.0.0.1:{}", self.metrics_port),
+                &format!("127.0.0.1:{}", self.channels.metrics_port),
             ])
             .args(["--ingress-id", &self.id.to_string()])
             .args(["--host-id", &format!("ingress-{}", self.id)])
@@ -127,18 +126,24 @@ impl Replica {
     pub(crate) fn stop(&mut self, stop: Stop) -> ExitStatus {
         let mut child = self.child.take().expect("the replica runs");
         match stop {
-            Stop::Hard => {
-                child.kill().unwrap();
-                child.wait().unwrap()
-            }
-            Stop::Graceful => {
-                let pid = i32::try_from(child.id()).unwrap();
-                // SAFETY: `kill` sends one signal to the child's pid.
-                unsafe { libc::kill(pid, libc::SIGTERM) };
-                Self::wait(&mut child, Duration::from_secs(40))
-                    .expect("the replica exits within its drain bound")
-            }
+            Stop::Hard => Self::kill(&mut child),
+            Stop::Graceful => Self::drain(&mut child),
         }
+    }
+
+    /// SIGKILL the replica and reap it.
+    fn kill(child: &mut Child) -> ExitStatus {
+        child.kill().unwrap();
+        child.wait().unwrap()
+    }
+
+    /// SIGTERM the replica and wait until its drain ends.
+    fn drain(child: &mut Child) -> ExitStatus {
+        let pid = i32::try_from(child.id()).unwrap();
+        // SAFETY: `kill` sends one signal to the child's pid.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        Self::wait(child, Duration::from_secs(40))
+            .expect("the replica exits within its drain bound")
     }
 
     /// Wait for the replica to exit on its own within `bound`, as after a

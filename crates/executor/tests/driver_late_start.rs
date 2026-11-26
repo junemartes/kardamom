@@ -42,10 +42,7 @@ impl Executor {
             "[cluster]\ningress_endpoints = \"0=127.0.0.1:20999\"\negress_channel = \"aeron:udp?endpoint=127.0.0.1:0\"\n",
         )
         .unwrap();
-        let metrics = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        let metrics = kardamom_obs::testkit::free_port();
         let log = root.join("executor.log");
         let out = std::fs::File::create(&log).unwrap();
         let mut command = Command::new(Self::binary());
@@ -68,11 +65,9 @@ impl Executor {
         unsafe {
             command.pre_exec(|| {
                 // The executor ends with the test, also when CI kills it.
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
+                (libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0)
+                    .then_some(())
+                    .ok_or_else(std::io::Error::last_os_error)
             });
         }
         Self {

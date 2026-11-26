@@ -1,7 +1,7 @@
 //! The chain, the egress child process and the readers of the egress
 //! restart test.
 
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -220,10 +220,7 @@ impl EgressChild {
     /// phase takes the address of the first.
     pub(super) fn start(root: &Path, phase: Phase) -> Self {
         let addr = match phase {
-            Phase::First => TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap(),
+            Phase::First => kardamom_obs::testkit::free_port(),
             Phase::Second => std::fs::read_to_string(root.join("addr"))
                 .unwrap()
                 .parse()

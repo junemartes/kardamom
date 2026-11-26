@@ -13,13 +13,19 @@ use std::time::{Duration, Instant};
 use kardamom_cluster_client::message::MAX_SESSION_MESSAGE_LEN;
 use kardamom_log::aeron_live::PubHandle;
 use kardamom_log::testing::{AeronTestCluster, SingleNodeRig};
+use kardamom_obs::testkit::PortBlock;
 use rkyv::util::AlignedVec;
 
 use super::SessionTerm;
 
 const STREAM_ID: i32 = 5_586;
-/// The deployed MTU (`aeron.mtu.length`), so that each message fragments.
-const CHANNEL: &str = "aeron:udp?endpoint=localhost:24586|mtu=1344";
+/// The channel at the deployed MTU (`aeron.mtu.length`), so that each
+/// message fragments. Its endpoint is a fixed port of the block of this
+/// test.
+fn channel() -> String {
+    let port = PortBlock::FragmentedControl.port(0);
+    format!("aeron:udp?endpoint=localhost:{port}|mtu=1344")
+}
 
 /// A message of `len` bytes, with a pattern that differs for each `tag`.
 fn message(tag: u8, len: usize) -> AlignedVec {
@@ -52,7 +58,7 @@ async fn a_control_channel_carries_messages_up_to_one_mib_whole_and_in_order() {
         rt,
         cfg: _cfg,
     } = AeronTestCluster::single_node_runtime(STREAM_ID).await;
-    let uri = SessionTerm::Large.channel(CHANNEL);
+    let uri = SessionTerm::Large.channel(&channel());
     let (_sub_id, frames) = rt
         .open_subscription_raw_crossbeam(&uri, STREAM_ID)
         .expect("subscription");
