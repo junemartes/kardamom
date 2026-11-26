@@ -279,3 +279,159 @@ fn the_request_line_carries_the_cap() {
     );
     assert_eq!(FetchRequest::parse("GET /other HTTP/1.0\r\n"), None);
 }
+
+/// The names of the checkpoints in `dir`.
+fn local_checkpoints(dir: &Path) -> Vec<u64> {
+    crate::checkpoint::checkpoints_newest_first(dir)
+        .unwrap()
+        .iter()
+        .map(|c| c.block)
+        .collect()
+}
+
+/// Run [`fetch_best_checkpoint`] off the runtime, so the server tasks run.
+async fn fetch_best(peers: Vec<String>, local: PathBuf, range: BlockRange) -> Option<u64> {
+    tokio::task::spawn_blocking(move || fetch_best_checkpoint(&peers, &local, range, None))
+        .await
+        .unwrap()
+        .map(|c| c.block)
+}
+
+/// A peer with one checkpoint at each of `blocks`. The temp directory
+/// lives as long as the peer.
+struct FakePeer {
+    dir: tempfile::TempDir,
+    addr: SocketAddr,
+}
+
+impl FakePeer {
+    fn new(blocks: &[u64]) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        for &block in blocks {
+            write_checkpoint(dir.path(), block, format!("image {block}").as_bytes());
+        }
+        let addr = serve_ephemeral(dir.path().to_path_buf());
+        Self { dir, addr }
+    }
+
+    fn name(&self) -> String {
+        self.addr.to_string()
+    }
+}
+
+/// The list order puts the oldest peer first. The fetch still downloads
+/// one image only, from the newest peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn three_peers_with_rising_blocks_give_one_download_from_the_newest() {
+    let peers = [
+        FakePeer::new(&[5]),
+        FakePeer::new(&[7]),
+        FakePeer::new(&[9]),
+    ];
+    let local = tempfile::tempdir().unwrap();
+    let names = peers.iter().map(FakePeer::name).collect();
+    let best = fetch_best(names, local.path().to_path_buf(), BlockRange::ANY).await;
+    assert_eq!(best, Some(9));
+    assert_eq!(local_checkpoints(local.path()), [9]);
+}
+
+/// The best peer serves an image that fails its keccak check. The fetch
+/// takes the next best peer, and leaves no part of the bad image behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_best_peer_that_fails_its_download_falls_back_to_the_next() {
+    let peers = [
+        FakePeer::new(&[5]),
+        FakePeer::new(&[9]),
+        FakePeer::new(&[7]),
+    ];
+    let bad = peers[1]
+        .dir
+        .path()
+        .join(checkpoint_name(9))
+        .join("mdbx.dat");
+    std::fs::write(bad, b"rotted bytes").unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let names = peers.iter().map(FakePeer::name).collect();
+    let best = fetch_best(names, local.path().to_path_buf(), BlockRange::ANY).await;
+    assert_eq!(best, Some(7));
+    assert_eq!(local_checkpoints(local.path()), [7]);
+    let tmp = std::fs::read_dir(local.path())
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        })
+        .count();
+    assert_eq!(tmp, 0, "no temp entry remains");
+}
+
+/// A peer that refuses the connection, and a peer that closes it with no
+/// answer, are skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_that_does_not_answer_is_skipped() {
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent_addr = silent.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let _ = silent.accept().await;
+        }
+    });
+    let live = FakePeer::new(&[4]);
+    let local = tempfile::tempdir().unwrap();
+    let names = vec![
+        "127.0.0.1:1".to_string(),
+        silent_addr.to_string(),
+        live.name(),
+    ];
+    let best = fetch_best(names, local.path().to_path_buf(), BlockRange::ANY).await;
+    assert_eq!(best, Some(4));
+    assert_eq!(local_checkpoints(local.path()), [4]);
+}
+
+/// A capped fetch takes the newest checkpoint at or below the cap over
+/// every peer. A peer with a newer image serves an older one in the cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_cap_holds_over_every_peer() {
+    let peers = [
+        FakePeer::new(&[3, 9]),
+        FakePeer::new(&[7]),
+        FakePeer::new(&[11]),
+    ];
+    let local = tempfile::tempdir().unwrap();
+    let names = peers.iter().map(FakePeer::name).collect();
+    let cap = BlockRange::below(8).unwrap();
+    let best = fetch_best(names, local.path().to_path_buf(), cap).await;
+    assert_eq!(best, Some(7));
+    assert_eq!(local_checkpoints(local.path()), [7]);
+}
+
+/// A probe reads the response head and closes the connection. The server
+/// sees the write error of a closed peer, which it logs as a normal end,
+/// and not as a failed transfer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probe_that_closes_early_ends_the_serve_as_a_closed_peer() {
+    let served = tempfile::tempdir().unwrap();
+    // The image is larger than the socket buffers, so the server is still
+    // writing when the probe closes.
+    write_checkpoint(served.path(), 6, &vec![0x5A; 64 << 20]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = listener.local_addr().unwrap().to_string();
+    let probe = tokio::task::spawn_blocking(move || {
+        let request = FetchRequest {
+            range: BlockRange::ANY,
+        }
+        .line();
+        let mut fetch = CheckpointFetch::connect(&peer, &request, None).unwrap();
+        fetch.offer(BlockRange::ANY).unwrap().map(|head| head.block)
+    });
+    let (stream, _) = listener.accept().await.unwrap();
+    let served = serve_one(stream, served.path()).await;
+    assert_eq!(probe.await.unwrap(), Some(6));
+    let kind = served
+        .expect_err("the probe closes before the body ends")
+        .kind();
+    assert!(PEER_CLOSED.contains(&kind), "{kind:?}");
+}

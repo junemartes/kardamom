@@ -306,9 +306,13 @@ locals {
   # executor of the staged move starts with no state, and only the
   # executors on the executor nodes hold a checkpoint then. A fetch skips
   # a peer that does not answer. The checkpoint executor is a peer by its
-  # Consul service, so no job names the backup node. It comes first: a
-  # fetch skips a later peer that has no newer checkpoint without a
-  # download, so the old checkpoints of the hot executors stay unread.
+  # Consul service, so no job names the backup node. A fetch reads the
+  # response head of every peer and downloads one image: from the peer
+  # with the furthest restore point. The checkpoint executor comes first
+  # in the peer list of the hot executors, so it wins a tie. So a hot
+  # executor sends an old checkpoint only when the checkpoint executor
+  # offers no restore point that is as far. The checkpoint executor
+  # itself takes `hot_peers` only: it does not list its own service.
   hot_peers = concat(
     local.on_sealers ? [
       for i in range(var.sealer_count) : "sealer-${i}.node.${var.datacenter}.consul:9014"
