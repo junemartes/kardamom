@@ -34,6 +34,8 @@ pub(super) struct Fixture {
     mirror_user: bool,
     /// The number of mirrors whose heads a starting mirror reads.
     mirrors: u32,
+    /// The audit interval of each started mirror. `0` turns the audit off.
+    audit_hours: u64,
 }
 
 impl Fixture {
@@ -70,6 +72,7 @@ impl Fixture {
             root: tempfile::tempdir().unwrap(),
             mirror_user: redis.is_some(),
             mirrors: 2,
+            audit_hours: 0,
             _redis: redis,
         };
         fixture.checkpoint();
@@ -141,6 +144,12 @@ impl Fixture {
     /// Read the heads of `mirrors` mirrors at each start.
     pub(super) fn with_mirrors(mut self, mirrors: u32) -> Self {
         self.mirrors = mirrors;
+        self
+    }
+
+    /// Start each mirror with an audit every `hours` hours.
+    pub(super) fn with_audit_hours(mut self, hours: u64) -> Self {
+        self.audit_hours = hours;
         self
     }
 
@@ -354,7 +363,7 @@ impl Fixture {
                 self.root.path().join(format!("scratch-{id}")),
             ),
             force_rebuild: force,
-            audit_hours: 0,
+            audit_hours: self.audit_hours,
             shutdown: shutdown.clone(),
         });
         Actor {

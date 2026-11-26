@@ -373,6 +373,7 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
 - `kardamom_egress_caught_frames_total` counts the frames that a peer egress gave after a start, to fill the place between the head and the executor copies.
 - `kardamom_egress_rebased_total{reason}` counts the times that the egress started its stream again: after a boundary of a copy with no peer (`boundary`), or at the floor of a peer above its head (`peer-floor`). After a `boundary` start, the store holds no frame before that boundary, and a reader of an older cursor reads another instance.
 - `kardamom_executor_egress_frames_dropped_total` counts the canonical frames that the reader did not forward on `exec_frames`, because the queue to the publication was full.
+- `kardamom_state_mirror_last_rebuild_timestamp_seconds` is the UNIX time of the last completed rebuild of a state mirror. For the audit mirror (job `kardamom-state-mirror-audit`), `time() - kardamom_state_mirror_last_rebuild_timestamp_seconds > 36 * 3600` means that no audit ran for 36 hours.
 
   - `peer-checkpoint`: the node fell behind the retention window and repaired itself from a peer checkpoint.
   - `unrecoverable`: the node could not repair itself and waits for an operator.
@@ -964,7 +965,9 @@ The egress (`kardamom-egress`) exports these metrics on `--metrics-addr` (`KARDA
 ### State mirror
 
 The state mirror exports `kardamom_state_mirror_serving`, `_batches_applied_total`, `_producer_disagreement_total`,
-`_head_tx_idx`, `_rebuilds_total`, `_rebuild_seconds`, `_write_retries_total`, and `_wait_replica_zero_total`.
+`_head_tx_idx`, `_rebuilds_total`, `_rebuild_seconds`, `_write_retries_total`, `_wait_replica_zero_total`, and
+`_last_rebuild_timestamp_seconds`. The last gauge is the UNIX time of the last completed rebuild of any reason. It
+survives a restart, and it is 0 when no rebuild is on record. The audit interval counts from this time.
 
 The mirror writes the waiting receipt batches as a group. It records these [pipeline metrics](#pipeline-metrics), once per group:
 
