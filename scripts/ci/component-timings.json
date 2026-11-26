@@ -339,6 +339,8 @@
   "state-mirror-total-loss::mirror::component_tests::total_loss::a_total_loss_rebuilds_every_account_and_the_readers_recover": 21.159,
   "state-mirror-total-loss::mirror::component_tests::total_loss::the_whole_read_path_returns_in_reverse_order_and_every_mirror_rebuilds": 11.491,
   "state-mirror::a_cold_mirror_restores_all_accounts_before_advancing_and_stops_on_input_close": 0.715,
+  "state-mirror::a_persisted_rebuild_time_in_the_future_does_not_audit_at_once": 0.8,
+  "state-mirror::a_restart_keeps_the_audit_interval_of_the_persisted_rebuild": 1.5,
   "state-mirror::a_transient_head_read_timeout_does_not_end_the_recovery_wait": 1.017,
   "state-mirror::interrupted_partial_rebuild_restores_untouched_accounts_without_regressing_live_rows": 1.117,
   "state-mirror::partial_live_batch_retries_without_new_input_and_publishes_head_last": 0.766,

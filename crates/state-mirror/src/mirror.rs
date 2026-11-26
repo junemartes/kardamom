@@ -12,6 +12,7 @@ use kardamom_types::{BPosition, ReceiptBatch, ReceiptRollback};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::audit::AuditClock;
 use crate::head::HeadFile;
 use crate::metrics::MirrorSteps;
 use crate::rebuild::Rebuild;
@@ -82,28 +83,27 @@ pub(crate) struct Mirror {
     head_count: u32,
     head: HeadFile,
     rebuild: Rebuild,
-    audit_every: Option<Duration>,
     shutdown: CancellationToken,
     progress: Progress,
-    last_rebuild: Instant,
+    audit: AuditClock,
     head_persisted: Instant,
     steps: MirrorSteps,
 }
 
 impl Mirror {
     pub(crate) fn new(inputs: MirrorInputs) -> Self {
+        let audit_every = (inputs.audit_hours > 0)
+            .then(|| Duration::from_secs(inputs.audit_hours.saturating_mul(3_600)));
         Self {
+            audit: AuditClock::start(audit_every, inputs.head.last_rebuild()),
             cache: inputs.cache,
             receipts: inputs.receipts,
             id: inputs.id,
             head_count: inputs.head_count,
             head: inputs.head,
             rebuild: inputs.rebuild,
-            audit_every: (inputs.audit_hours > 0)
-                .then(|| Duration::from_secs(inputs.audit_hours.saturating_mul(3_600))),
             shutdown: inputs.shutdown,
             progress: Progress::new(inputs.force_rebuild.then_some(RebuildReason::Forced)),
-            last_rebuild: Instant::now(),
             head_persisted: Instant::now(),
             steps: MirrorSteps::new(),
         }
@@ -248,7 +248,9 @@ impl Mirror {
         self.head.finish_rebuild()?;
         crate::metrics::record_rebuild(reason.label(), started.elapsed().as_secs_f64());
         crate::metrics::set_serving(true);
-        self.last_rebuild = Instant::now();
+        self.head
+            .record_rebuild(self.audit.rebuilt())
+            .context("persist the rebuild time")?;
         Ok(())
     }
 
@@ -345,10 +347,7 @@ impl Mirror {
                 .context("persist the head")?;
             self.head_persisted = Instant::now();
         }
-        if self
-            .audit_every
-            .is_some_and(|every| self.last_rebuild.elapsed() >= every)
-        {
+        if self.audit.audit_due() {
             self.progress.pending_rebuild = Some(RebuildReason::Audit);
         }
         Ok(())
