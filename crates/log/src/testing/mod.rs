@@ -11,8 +11,12 @@
 //! - `cluster` ([`AeronTestCluster`]): a real Aeron Media Driver and
 //!   Archive in a Docker container, for integration tests that must run
 //!   against the genuine transport. Requires the `docker-e2e` feature.
+//! - [`DriverErrorLog`]: the error log of a media driver, which a fixture
+//!   prints when its test panics.
 
+mod driver_log;
 mod fakes;
+pub use driver_log::DriverErrorLog;
 pub use fakes::*;
 
 #[cfg(feature = "docker-e2e")]

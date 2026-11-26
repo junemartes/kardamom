@@ -12,6 +12,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use kardamom_log::testing::DriverErrorLog;
 use kardamom_obs::testkit::free_udp_port;
 
 use super::proc::{ExistingFile, Proc, resolve_artifact, wait_for_file};
@@ -29,7 +30,11 @@ fn aeron_all_jar() -> Result<ExistingFile> {
     )
 }
 
+/// One host-native driver. Field order is drop order: in a panic, the
+/// error log of the driver prints before the process ends.
 pub struct MediaDriver {
+    /// Held for its drop.
+    _error_log: DriverErrorLog,
     pub proc: Proc,
     pub aeron_dir: PathBuf,
     pub(crate) archive_dir: PathBuf,
@@ -148,6 +153,7 @@ impl MediaDriver {
         std::fs::create_dir_all(&launch.archive_dir)?;
         let proc = launch.spawn("media-driver")?;
         Ok(Self {
+            _error_log: DriverErrorLog::new(&launch.aeron_dir),
             proc,
             aeron_dir: launch.aeron_dir.clone(),
             archive_dir: launch.archive_dir.clone(),

@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use kardamom_log::testing::DriverErrorLog;
+
 /// The aeron-all jar: `KARDAMOM_AERON_ALL_JAR`, else the cache path of
 /// `just aeron-driver-up`.
 fn jar() -> PathBuf {
@@ -18,23 +20,32 @@ fn jar() -> PathBuf {
 }
 
 /// One driver process and its directories. The process is killed on drop.
+/// In a panic, the error log of the driver then prints.
 pub(crate) struct Driver {
     root: PathBuf,
     name: String,
+    aeron_dir: PathBuf,
     child: Option<Child>,
     archive_port: u16,
     ports: [u16; 2],
+    /// Held for its drop.
+    _error_log: DriverErrorLog,
 }
 
 impl Driver {
-    /// Start a driver named `name` under `root`.
-    pub(crate) fn start(root: &Path, name: &str) -> Self {
+    /// Start a driver named `name` under `root`, with its archive
+    /// control, response and replication ports.
+    pub(crate) fn start(root: &Path, name: &str, ports: [u16; 3]) -> Self {
+        let [archive_port, response, replication] = ports;
+        let aeron_dir = root.join(format!("{name}-aeron"));
         let mut driver = Self {
             root: root.to_path_buf(),
             name: name.to_string(),
             child: None,
-            archive_port: super::free_udp_port(),
-            ports: [super::free_udp_port(), super::free_udp_port()],
+            archive_port,
+            ports: [response, replication],
+            _error_log: DriverErrorLog::new(&aeron_dir),
+            aeron_dir,
         };
         std::fs::create_dir_all(driver.archive_dir()).unwrap();
         driver.child = Some(
@@ -46,7 +57,7 @@ impl Driver {
     }
 
     pub(crate) fn aeron_dir(&self) -> PathBuf {
-        self.root.join(format!("{}-aeron", self.name))
+        self.aeron_dir.clone()
     }
 
     pub(crate) fn archive_dir(&self) -> PathBuf {

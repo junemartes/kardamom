@@ -1,13 +1,14 @@
 //! The parent's side: the executor processes, the sealer load, and the
 //! waits and verdicts on them.
 
-use std::net::SocketAddr;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use kardamom_obs::testkit::free_port;
 
 use super::chain::Chain;
 use super::node::NodeConfig;
@@ -27,24 +28,6 @@ pub(crate) const CHILD_ARGS: [&str; 5] = [
 ];
 /// The pause of each wait poll.
 const POLL: Duration = Duration::from_millis(20);
-
-/// The ports this test process handed out. Tests run in parallel, and
-/// the kernel can give a released port to the next bind of another test
-/// before the child binds it.
-static HANDED_OUT: std::sync::Mutex<std::collections::BTreeSet<u16>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
-
-/// A free loopback address that no other test of this process holds.
-fn free_addr() -> SocketAddr {
-    std::iter::repeat_with(|| {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-    })
-    .find(|addr| HANDED_OUT.lock().unwrap().insert(addr.port()))
-    .unwrap()
-}
 
 /// The name prefix of the storage of one test process. The process id
 /// follows, so a later run can remove the storage of a killed run.
@@ -197,15 +180,15 @@ impl World {
                 state_dir: dir.join("state"),
                 checkpoint_dir: dir.join("checkpoints"),
                 peers: Vec::new(),
-                serve: free_addr(),
-                rpc: free_addr(),
+                serve: free_port(),
+                rpc: free_port(),
                 checkpoints: true,
                 block_log: false,
                 base_max_age_secs: std::num::NonZeroU64::new(21_600).unwrap(),
                 sealer: self.sealer.dir().to_path_buf(),
                 genesis: self.genesis.clone(),
                 receipts: dir.join("receipts.log"),
-                metrics: free_addr(),
+                metrics: free_port(),
                 aeron_dir: None,
             },
             dir,
@@ -352,11 +335,9 @@ impl NodeHandle {
         unsafe {
             command.pre_exec(|| {
                 // The child ends with the test binary, also when CI kills it.
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
+                (libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0)
+                    .then_some(())
+                    .ok_or_else(std::io::Error::last_os_error)
             });
         }
         command

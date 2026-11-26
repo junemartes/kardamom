@@ -23,17 +23,20 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use kardamom_log::aeron_live::{PubHandle, RawFrame};
-use kardamom_log::testing::{AeronTestCluster, SingleNodeRig};
+use kardamom_log::testing::{AeronTestCluster, DriverErrorLog, SingleNodeRig};
+use kardamom_obs::testkit::PortBlock;
 use rkyv::util::AlignedVec;
 use rusteron_client::AeronCnc;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const STREAM: i32 = 4521;
 const FRAMES: usize = 20;
-const PORT_A: u16 = 41010;
-const PORT_B: u16 = 41011;
-const PORT_C: u16 = 41012;
-const PORT_D: u16 = 41013;
+/// The fixed control ports of publishers a to d, at the offsets below.
+const PORTS: PortBlock = PortBlock::MdsDestinationRemoval;
+const A: u16 = 0;
+const B: u16 = 1;
+const C: u16 = 2;
+const D: u16 = 3;
 
 fn frame(fill: u8) -> AlignedVec {
     let mut v = AlignedVec::new();
@@ -100,14 +103,6 @@ fn receive_channels(aeron_dir: &std::path::Path, port: u16) -> usize {
     count
 }
 
-/// Every distinct error in the error log of the driver at `aeron_dir`.
-fn driver_errors(aeron_dir: &std::path::Path) -> Vec<String> {
-    let cnc = AeronCnc::new_on_heap(&aeron_dir.to_string_lossy()).expect("open cnc");
-    let mut errors = Vec::new();
-    cnc.error_log_read_once(|_, _, _, error: &str| errors.push(error.to_string()), 0);
-    errors
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker; run with `cargo test -p kardamom-log --features docker-e2e --test mds_destination_removal -- --ignored`"]
 async fn removing_a_destination_after_its_images_form_keeps_the_driver_clean() {
@@ -120,15 +115,15 @@ async fn removing_a_destination_after_its_images_form_keeps_the_driver_clean() {
     let (sub_id, mut rx) = rt
         .open_subscription_raw("aeron:udp?control-mode=manual", STREAM)
         .expect("manual subscription");
-    rt.add_destination(sub_id, &destination(PORT_A))
+    rt.add_destination(sub_id, &destination(PORTS.port(A)))
         .expect("destination a");
-    rt.add_destination(sub_id, &destination(PORT_B))
+    rt.add_destination(sub_id, &destination(PORTS.port(B)))
         .expect("destination b");
     let pub_a = rt
-        .open_publication(&control_uri(PORT_A), STREAM)
+        .open_publication(&control_uri(PORTS.port(A)), STREAM)
         .expect("publisher a");
     let pub_b = rt
-        .open_publication(&control_uri(PORT_B), STREAM)
+        .open_publication(&control_uri(PORTS.port(B)), STREAM)
         .expect("publisher b");
     publish(&pub_a, 0xAA).await;
     let session_a = exactly_once(&drain(&mut rx).await, 0xAA, "a");
@@ -136,19 +131,19 @@ async fn removing_a_destination_after_its_images_form_keeps_the_driver_clean() {
     let session_b = exactly_once(&drain(&mut rx).await, 0xBB, "b");
     assert_ne!(session_a, session_b, "two publishers are two sessions");
 
-    rt.remove_destination(sub_id, &destination(PORT_B))
+    rt.remove_destination(sub_id, &destination(PORTS.port(B)))
         .expect("remove b");
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     publish(&pub_a, 0xA1).await;
     let again_a = exactly_once(&drain(&mut rx).await, 0xA1, "a after the removal of b");
     assert_eq!(again_a, session_a, "a keeps its session");
-    rt.add_destination(sub_id, &destination(PORT_B))
+    rt.add_destination(sub_id, &destination(PORTS.port(B)))
         .expect("destination b again");
     publish(&pub_b, 0xB1).await;
     exactly_once(&drain(&mut rx).await, 0xB1, "b after a new attach");
 
-    let errors = driver_errors(&aeron_dir);
+    let errors = DriverErrorLog::new(&aeron_dir).errors().expect("open cnc");
     assert!(
         errors.iter().all(|e| !e.contains("removeDestination")),
         "the driver logs no destination removal error: {errors:#?}"
@@ -164,32 +159,32 @@ async fn a_detach_and_attach_keep_one_image_with_no_gap() {
     let (sub_id, mut rx) = rt
         .open_subscription_raw("aeron:udp?control-mode=manual", STREAM + 10)
         .expect("manual subscription");
-    rt.add_destination(sub_id, &destination(PORT_C))
+    rt.add_destination(sub_id, &destination(PORTS.port(C)))
         .expect("destination c");
     let pub_c = rt
-        .open_publication(&control_uri(PORT_C), STREAM + 10)
+        .open_publication(&control_uri(PORTS.port(C)), STREAM + 10)
         .expect("publisher c");
     publish(&pub_c, 0xC0).await;
     let session = exactly_once(&drain(&mut rx).await, 0xC0, "c");
 
     // A catalog flap: the destination detaches, the publisher keeps
     // publishing, and the destination attaches again.
-    rt.remove_destination(sub_id, &destination(PORT_C))
+    rt.remove_destination(sub_id, &destination(PORTS.port(C)))
         .expect("detach c");
     publish(&pub_c, 0xC1).await;
     let during = exactly_once(&drain(&mut rx).await, 0xC1, "c during the detach");
     assert_eq!(
-        receive_channels(&aeron_dir, PORT_C),
+        receive_channels(&aeron_dir, PORTS.port(C)),
         1,
         "the detached subscription stays open"
     );
-    rt.add_destination(sub_id, &destination(PORT_C))
+    rt.add_destination(sub_id, &destination(PORTS.port(C)))
         .expect("attach c again");
     publish(&pub_c, 0xC2).await;
     let after = exactly_once(&drain(&mut rx).await, 0xC2, "c after the attach");
     assert_eq!([during, after], [session; 2], "c keeps one image");
     assert_eq!(
-        receive_channels(&aeron_dir, PORT_C),
+        receive_channels(&aeron_dir, PORTS.port(C)),
         1,
         "one subscription joins c"
     );
@@ -204,28 +199,32 @@ async fn a_detached_destination_closes_once_its_publisher_stops() {
     let (sub_id, mut rx) = rt
         .open_subscription_raw("aeron:udp?control-mode=manual", STREAM + 20)
         .expect("manual subscription");
-    rt.add_destination(sub_id, &destination(PORT_D))
+    rt.add_destination(sub_id, &destination(PORTS.port(D)))
         .expect("destination d");
     let pub_d = rt
-        .open_publication(&control_uri(PORT_D), STREAM + 20)
+        .open_publication(&control_uri(PORTS.port(D)), STREAM + 20)
         .expect("publisher d");
     publish(&pub_d, 0xD0).await;
     exactly_once(&drain(&mut rx).await, 0xD0, "d");
 
-    rt.remove_destination(sub_id, &destination(PORT_D))
+    rt.remove_destination(sub_id, &destination(PORTS.port(D)))
         .expect("detach d");
-    assert_eq!(receive_channels(&aeron_dir, PORT_D), 1, "d keeps its image");
+    assert_eq!(
+        receive_channels(&aeron_dir, PORTS.port(D)),
+        1,
+        "d keeps its image"
+    );
     pub_d.close().expect("close d");
 
     // The linger is the stall budget of the runtime, at least 10 s. The
     // image of a closed publication goes at once, so the subscription
     // closes well before the linger ends.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while receive_channels(&aeron_dir, PORT_D) > 0 && Instant::now() < deadline {
+    while receive_channels(&aeron_dir, PORTS.port(D)) > 0 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(
-        receive_channels(&aeron_dir, PORT_D),
+        receive_channels(&aeron_dir, PORTS.port(D)),
         0,
         "the subscription of d closes once its image goes"
     );

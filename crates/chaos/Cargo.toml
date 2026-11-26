@@ -43,6 +43,8 @@ tempfile.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# `testkit::free_port`: the ports of the Nomad dev agent of the saved-job tests.
+kardamom-obs = { path = "../obs", features = ["test-support"] }
 jsonrpsee.workspace = true
 # The seed parser's tests read the bytes the producer writes.
 kardamom-reconstruct = { path = "../reconstruct" }

@@ -83,7 +83,8 @@ jobs:
             --tests
 
       # Per-component docker_e2e smoke: tx_data publish → record → subscribe over
-      # a real Aeron container, and a publication on loan to another thread.
+      # a real Aeron container, a publication on loan to another thread, and
+      # the driver error log that a failed test prints.
       # (tx_ordering is the cluster's job now; the legacy tx_ordering Aeron
       # docker_e2e was removed with the single-sealer path.)
       - name: per-component docker_e2e smoke
@@ -92,6 +93,7 @@ jobs:
             -p kardamom-log \
             --features 'docker-e2e' \
             --test aeron_live_e2e --test client_timeout_exit --test lent_publication \
+            --test driver_error_log \
             -- --ignored --nocapture
 
       # The account cache against a real Redis container: the monotone

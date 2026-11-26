@@ -3917,6 +3917,7 @@ dependencies = [
  "kardamom-bench",
  "kardamom-formats",
  "kardamom-l1-fault-proxy",
+ "kardamom-obs",
  "kardamom-reconstruct",
  "kardamom-state",
  "kardamom-types",

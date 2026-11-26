@@ -127,12 +127,12 @@ impl Lane {
         channels: &Channels,
         archive: &str,
     ) -> Self {
-        let free = || format!("127.0.0.1:{}", super::free_udp_port());
+        let [response_endpoint, replay_endpoint] = channels.refetch_endpoints();
         let refetcher = ArchiveRefetcher::new(RefetchConfig {
             tx_data_endpoints: EndpointSource::Static(vec![archive.to_owned()]),
             tx_deposits_endpoints: EndpointSource::Static(Vec::new()),
-            response_endpoint: free(),
-            replay_endpoint: free(),
+            response_endpoint,
+            replay_endpoint,
             aeron_dir: Some(aeron_dir.to_path_buf()),
             aeron: AeronConfig::default(),
         });

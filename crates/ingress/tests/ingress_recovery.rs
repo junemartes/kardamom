@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use alloy_signer_local::PrivateKeySigner;
 use kardamom_log::aeron_live::{AeronRuntime, PubHandle, TxDataSubscriberHandle};
 use kardamom_log::config::ChannelsConfig;
+use kardamom_obs::testkit::{PortBlock, PortSlot};
 
 use driver::Driver;
 use load::{Load, Report};
@@ -46,90 +47,70 @@ const CHAIN_ID: u64 = 1;
 /// restart.
 const RESTART_BOUND: Duration = Duration::from_secs(30);
 
-pub(crate) fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-pub(crate) fn free_tcp_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-/// The leading digits of the fixed `tx_data` control ports of one test
-/// process. The control port of lane `l` of replica `r` is
-/// `prefix * 100 + l * 10 + r`.
+/// The fixed ports of this test process: its slot of
+/// [`PortBlock::IngressRecovery`], below the ephemeral range. No port-0
+/// socket can take a port of the slot, and a replica or a driver keeps
+/// its ports across a restart.
 ///
-/// The kernel binds each socket that asks for port 0 to a free port of
-/// its ephemeral range (`ip_local_port_range`). A fixed port inside that
-/// range can thus belong to another socket before the driver binds it.
-/// The driver binds a publication's control port on its sender thread,
-/// after the add returns, so a failed bind is only an entry in the
-/// driver's error log. The publication then never connects, its lane
-/// never records, and the ingress waits at its recorder barrier. Every
-/// prefix keeps its ports below the ephemeral range.
+/// | offset | port |
+/// |---|---|
+/// | `10 * l + r` | the `tx_data` control port of lane `l` of replica `r` |
+/// | `2 + r` | the RPC port (TCP) of replica `r` |
+/// | `4 + r` | the metrics port (TCP) of replica `r` |
+/// | `6 + r` | the receipt endpoint of replica `r` |
+/// | `12 + 3 * d` to `14 + 3 * d` | the archive control, response and replication ports of driver `d` |
+/// | `22 + 2 * r`, `23 + 2 * r` | the refetch response and replay endpoints of the pipeline lane of replica `r` |
+///
+/// A control port ends in the digit of its replica, 0 or 1. So every
+/// other port ends in a digit from 2 to 9.
 #[derive(Clone, Copy, Debug)]
-struct ControlPrefix(u16);
+struct Ports(PortSlot);
 
-impl ControlPrefix {
-    /// The lowest prefix: port 10000, above the well-known ports.
-    const FIRST: u16 = 100;
-    /// The ports of one prefix: ten lanes of ten replicas.
-    const SPAN: u16 = 100;
-
-    /// The first port of the kernel's ephemeral range.
-    fn ephemeral_floor() -> u16 {
-        let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
-        range.split_whitespace().next().unwrap().parse().unwrap()
-    }
-
-    /// The prefix of `slot`. Two processes whose slots differ by less
-    /// than the prefix count get different ports.
-    fn of_slot(slot: u32) -> Self {
-        let count = (Self::ephemeral_floor() / Self::SPAN)
-            .checked_sub(Self::FIRST)
-            .filter(|count| *count > 0)
-            .expect("the ephemeral range starts above port 10100");
-        let offset = u16::try_from(slot % u32::from(count)).unwrap();
-        Self(Self::FIRST + offset)
-    }
-
-    /// The prefix of this test process: two runs on one host stay apart.
+impl Ports {
     fn of_process() -> Self {
-        Self::of_slot(std::process::id())
+        Self(PortBlock::IngressRecovery.of_process())
     }
 
-    /// The highest control port of this prefix.
-    fn last_port(self) -> u16 {
-        self.0 * Self::SPAN + Self::SPAN - 1
+    /// The archive control, response and replication ports of driver `d`.
+    fn archive(self, d: u16) -> [u16; 3] {
+        [12, 13, 14].map(|offset| self.0.port(offset + 3 * d))
     }
 }
 
-/// The UDP channels of one ingress replica: a dynamic MDC publication of
-/// each lane, on a control port of its own, and its receipt endpoint.
+/// The ports and the UDP channels of one ingress replica: a dynamic MDC
+/// publication of each lane, on a control port of its own, its receipt
+/// endpoint, its RPC and metrics ports, and the refetch endpoints of the
+/// pipeline lane that reads it.
 #[derive(Clone, Debug)]
 pub(crate) struct Channels {
     tx_data_template: String,
     receipts_port: u16,
+    pub(crate) rpc_port: u16,
+    pub(crate) metrics_port: u16,
+    refetch_ports: [u16; 2],
 }
 
 impl Channels {
-    /// The channels of replica `id`. The lane id fills one digit of each
-    /// control port; `prefix` keeps two runs apart.
-    fn new(prefix: ControlPrefix, id: u16) -> Self {
-        let ControlPrefix(prefix) = prefix;
+    /// The ports and channels of replica `id`. The lane id fills one
+    /// digit of each control port. See [`Ports`].
+    fn new(ports: Ports, id: u16) -> Self {
+        let Ports(slot) = ports;
+        let hundreds = slot.hundreds();
         Self {
             tx_data_template: format!(
-                "aeron:udp?control=127.0.0.1:{prefix}{{sid}}{id}|control-mode=dynamic"
+                "aeron:udp?control=127.0.0.1:{hundreds}{{sid}}{id}|control-mode=dynamic"
             ),
-            receipts_port: free_udp_port(),
+            receipts_port: slot.port(6 + id),
+            rpc_port: slot.port(2 + id),
+            metrics_port: slot.port(4 + id),
+            refetch_ports: [22, 23].map(|offset| slot.port(offset + 2 * id)),
         }
+    }
+
+    /// The refetch response and replay endpoints of the pipeline lane
+    /// that reads this replica.
+    fn refetch_endpoints(&self) -> [String; 2] {
+        self.refetch_ports.map(|port| format!("127.0.0.1:{port}"))
     }
 
     fn defaults() -> ChannelsConfig {
@@ -232,12 +213,12 @@ impl Fixture {
             .join(format!("ingress-recovery-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let ports = Ports::of_process();
         let drivers = vec![
-            Driver::start(&root, "node-a"),
-            Driver::start(&root, "node-b"),
+            Driver::start(&root, "node-a", ports.archive(0)),
+            Driver::start(&root, "node-b", ports.archive(1)),
         ];
-        let prefix = ControlPrefix::of_process();
-        let channels = [Channels::new(prefix, 0), Channels::new(prefix, 1)];
+        let channels = [Channels::new(ports, 0), Channels::new(ports, 1)];
         let archives: Vec<String> = drivers.iter().map(Driver::archive_endpoint).collect();
         let pipeline = Pipeline::start(&drivers[1].aeron_dir(), &channels, &archives);
         let stub = QueryStub::start(pipeline.ledger.clone()).await;
@@ -483,17 +464,27 @@ async fn a_lost_archiving_driver_ends_its_ingress_while_the_twin_serves() {
     );
 }
 
-/// No process id gives a control port inside the ephemeral range, where
-/// a port-0 socket can hold it before the driver binds it.
+/// No two ports of the fixture share an offset of its slot, for up to
+/// ten lanes.
 #[test]
-fn every_control_port_lies_below_the_ephemeral_range() {
-    let floor = ControlPrefix::ephemeral_floor();
-    let inside: Vec<u32> = (0..=u32::from(u16::MAX))
-        .filter(|slot| ControlPrefix::of_slot(*slot).last_port() >= floor)
-        .collect();
-    assert_eq!(
-        inside,
-        Vec::<u32>::new(),
-        "these slots give control ports at or above port {floor}"
-    );
+fn the_ports_of_the_fixture_do_not_overlap() {
+    let ports = Ports::of_process();
+    let Ports(slot) = ports;
+    let controls = (0..10).flat_map(|lane| (0..2).map(move |r| slot.port(10 * lane + r)));
+    let replicas = (0..2).map(|id| Channels::new(ports, id)).flat_map(|c| {
+        let [response, replay] = c.refetch_ports;
+        [
+            c.receipts_port,
+            c.rpc_port,
+            c.metrics_port,
+            response,
+            replay,
+        ]
+    });
+    let drivers = (0..2).flat_map(|d| ports.archive(d));
+    let all: Vec<u16> = controls.chain(replicas).chain(drivers).collect();
+    let mut unique = all.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), all.len(), "two ports overlap: {all:?}");
 }

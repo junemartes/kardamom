@@ -1,18 +1,11 @@
 use super::*;
-use std::net::TcpListener;
 use std::process::Stdio;
 
 /// An isolated Nomad dev agent on free local ports, and a client of it.
 /// The agent stops when the child drops.
 async fn dev_agent() -> (tempfile::TempDir, tokio::process::Child, Nomad) {
     let directory = tempfile::tempdir().unwrap();
-    let port = || {
-        TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    };
+    let port = || kardamom_obs::testkit::free_port().port();
     let http = port();
     let config = directory.path().join("agent.hcl");
     std::fs::write(&config, format!(
@@ -51,13 +44,16 @@ async fn dev_agent() -> (tempfile::TempDir, tokio::process::Child, Nomad) {
     (directory, agent, nomad)
 }
 
+/// One raw-exec task that sleeps, as the job that the audit saves.
+const AUDIT_JOB: &str = r#"{"ID":"audit-test","Name":"audit-test","Type":"service","Datacenters":["dc1"],"TaskGroups":[{
+    "Name":"workers","Count":1,"Tasks":[{"Name":"sleep","Driver":"raw_exec","Config":{"command":"/bin/sleep","args":["300"]},"Resources":{"CPU":20,"MemoryMB":16}}]
+}]}"#;
+
 #[tokio::test]
 #[ignore = "starts an isolated local Nomad dev agent; requires the nomad binary"]
 async fn stopped_jobs_restore_their_definition_and_allocations() {
     let (_directory, mut agent, nomad) = dev_agent().await;
-    let job = serde_json::json!({"ID":"audit-test","Name":"audit-test","Type":"service","Datacenters":["dc1"],"TaskGroups":[{
-        "Name":"workers","Count":1,"Tasks":[{"Name":"sleep","Driver":"raw_exec","Config":{"command":"/bin/sleep","args":["300"]},"Resources":{"CPU":20,"MemoryMB":16}}]
-    }]});
+    let job: serde_json::Value = serde_json::from_str(AUDIT_JOB).unwrap();
     nomad
         .http
         .post(nomad.url("/v1/jobs"))
