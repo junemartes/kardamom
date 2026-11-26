@@ -487,7 +487,7 @@ The checkpoint executor moves the checkpoint writes off the sealer machines (`do
 
 | Switch | What it renders | When |
 |---|---|---|
-| `KARDAMOM_CHECKPOINT_EXECUTOR=on` | The group `executor-checkpoint` in the executor job, on the node of role `backup`. The checkpoint peers of the executors, the validator and the state mirrors name it first (`kardamom-executor-checkpoint.service.<dc>.consul:9014`). The state mirror gets `--checkpoint-peers` and `--chain`. Prometheus scrapes it as the job `kardamom-executor-checkpoint`. | Staging step 1. The hot executors keep their checkpoints. |
+| `KARDAMOM_CHECKPOINT_EXECUTOR=on` | The group `executor-checkpoint` in the executor job, on the node of role `backup`. The checkpoint peers of the hot executors, the validator and the state mirrors name it first (`kardamom-executor-checkpoint.service.<dc>.consul:9014`). Its own peers are the hot executors only. The state mirror gets `--checkpoint-peers` and `--chain`. Prometheus scrapes it as the job `kardamom-executor-checkpoint`. | Staging step 1. The hot executors keep their checkpoints. |
 | `KARDAMOM_EXEC_RESTORE_ONLY=on` | `--checkpoint-interval-secs 0` and the block log off on the hot executors. They still restore a peer checkpoint. | Staging step 2, after step 1 shows that the checkpoint executor keeps the average rate of the chain. |
 | `KARDAMOM_MIRROR_AUDIT_ON_BACKUP=on` | The group `mirror-audit` in the state-mirror job, on the node of role `backup`. The hot mirrors get `--audit-hours 0`. Prometheus scrapes the audit mirror as the job `kardamom-state-mirror-audit`. See [The audit mirror](#the-audit-mirror). | With the checkpoint executor. It does not need the restore-only mode. |
 
